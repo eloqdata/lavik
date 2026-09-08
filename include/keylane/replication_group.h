@@ -83,13 +83,26 @@ struct RebuildIdentity {
   std::uint64_t directive_revision_ = 0;
   std::string authority_id_;
   std::string source_node_id_;
+  // Membership incarnation of the exporting source. It is distinct from
+  // assignment_id_, which always names the rebuild target.
+  std::string source_assignment_id_;
   std::string source_boot_id_;
   std::string source_history_id_;
   std::string target_node_id_;
   std::string target_boot_id_;
   std::string operation_id_;
+  // Stable Meta-owned identity of the directive. Retries may use a fresh
+  // attempt ID, but they must not silently rebind work to another directive.
+  std::string directive_id_;
   std::string attempt_id_;
+  // Monotonic Meta revision pairs with the digest so an A -> B -> A manifest
+  // sequence cannot make a later population look identical to an earlier one.
+  std::uint64_t manifest_revision_ = 0;
   PopulationManifestId manifest_id_;
+  // Meta-owned population generation. This is distinct from each target
+  // partition's storage-local replication epoch and invalidates a proof even
+  // when the immutable manifest is unchanged.
+  std::uint64_t partition_replication_epoch_ = 0;
 
   bool operator==(const RebuildIdentity&) const = default;
 };

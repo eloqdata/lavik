@@ -17,7 +17,6 @@ using keylane::test::PortReservation;
 using keylane::test::RespClient;
 using keylane::test::TempDirectory;
 using keylane::test::WaitUntil;
-using keylane::test::WriteFile;
 
 std::string g_keylane_binary;
 
@@ -30,14 +29,10 @@ TEST(PopulationIntegrationTest,
   CreateDataFile(data, 128ULL * 1024 * 1024);
   PortReservation reservation;
   const std::uint16_t port = reservation.ReleaseForSpawn();
-  const std::filesystem::path nodes = directory.path() / "nodes.conf";
-  WriteFile(nodes, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 127.0.0.1:" +
-                       std::to_string(port) +
-                       "@0 master - 0 0 1 connected 0-16383\n"
-                       "vars currentEpoch 1 lastVoteEpoch 0\n");
   ChildProcess process(
       {g_keylane_binary, "--cluster-enabled", "--port", std::to_string(port),
-       "--cluster-static-nodes-file", nodes.string(), "--threads", "1",
+       "--cluster-node-id", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "--cluster-meta-seed", "127.0.0.1:1", "--threads", "1",
        "--no-pin-workers", "--logtostderr", "--recv-buffers-per-worker", "0",
        "--data-file", data.string()},
       log);

@@ -3,13 +3,13 @@
 // Cluster owner-side authority re-check plumbing shared by command.cpp and the
 // per-type multi-key executors (invariant 1 choke point 2).
 //
-// The dispatch gate captures the ServingState a request was admitted against
-// on CommandRequest (cluster_admitted_state_ / ClusterSlots()). A topology
-// reload (SIGHUP) can fence that admission while a command suspends on
-// scheduling or I/O, so every mutation path re-checks the captured per-group
-// authority tokens against the current cache right before writing. The
-// tx::Transaction hook covers shard-callback executors; executors whose
-// mutation runs in a bare SubmitTaskTo hop use the one-shot re-check.
+// The dispatch gate captures AuthorityGuard's complete admission proof on
+// CommandRequest (cluster_authority_admission_ / ClusterSlots()). A topology,
+// session, lease, or fence change can invalidate that proof while a command
+// suspends, so every mutation path asks the same guard to re-check it right
+// before writing. The tx::Transaction hook covers shard-callback executors;
+// executors whose mutation runs in a bare SubmitTaskTo hop use the one-shot
+// re-check.
 //
 // Every entry point is a no-op in standalone mode, for replication replay, and
 // for requests without a captured admission, so non-cluster behavior is
@@ -34,14 +34,13 @@ namespace keylane {
 // threads and lets the command layer tell a fence abort apart from an
 // ordinary storage failure.
 struct ClusterShardValidatorContext {
-  std::shared_ptr<const cluster::ServingState> admitted_;
-  std::span<const std::uint16_t> slots_;
+  std::shared_ptr<const cluster::AuthorityAdmission> admission_;
   std::atomic<bool> tripped_{false};
 };
 
-// tx::ShardValidator implementation: compares the captured per-group authority
-// tokens against the current cache. Runs on the owner shard before the shard
-// callback; must not suspend.
+// tx::ShardValidator implementation: re-checks the captured topology and
+// finite-lease proof. Runs on the owner shard before the shard callback; must
+// not suspend.
 absl::Status ValidateClusterShardAuthority(void* ctx, unsigned shard);
 
 // Installs the per-shard re-check on a write transaction when the request was

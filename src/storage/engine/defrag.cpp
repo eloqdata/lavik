@@ -22,7 +22,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimExtentsCounted(
     // Most callers detach this task and have nobody to receive its result; the
     // failure must therefore fail-stop storage rather than masquerade as
     // reusable capacity.
-    store->write_failed_ = true;
+    LatchRuntimeFailure(*store);
     spdlog::error("worker[{}] extent reclaim failed: {}", store->worker_->id(),
                   status.message());
   }
@@ -546,10 +546,15 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
     grouped_descriptor.publication_ = &*grouped_publication;
   }
   RecordLocation relocated;
+  // Foreground allocation can wait for this defrag pass to reclaim a block
+  // while holding the foreground-allocation gate. Relocation must therefore
+  // keep the store writer locked and allocate from the defrag reserve instead
+  // of waiting behind that gate, which would deadlock both sides.
   absl::Status written = co_await WriteRecordLocked(
       key_store, record.db_id_, key, value, record.kind_, record.value_type_,
       record.expire_at_ms_, digest, clear_txid ? 0 : record.txid_,
-      record.mutation_sequence_, true, true, record.external_,
+      record.mutation_sequence_, /*for_defrag=*/true,
+      /*unlock_writer_while_waiting=*/false, record.external_,
       record.key_external_, record.logical_size_,
       ExtentsFor(key_store, current), &relocated, &source, nullptr, nullptr,
       nullptr, nullptr, nullptr, &partition,
@@ -606,7 +611,7 @@ Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
       } else {
         RequestFlush(store, fence.block_id_);
       }
-      failed = store.write_failed_;
+      failed = store.write_failed_ || RuntimeFailureLatched();
     }
     if (failed) {
       co_return absl::Status(
@@ -951,8 +956,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
           key_owner,
           [this, key_owner, key, value, record, source_location,
            promote = committed_txids != nullptr]() mutable
-              -> Task<
-                  absl::StatusOr<std::optional<RelocationDurabilityFence>>> {
+          -> Task<absl::StatusOr<std::optional<RelocationDurabilityFence>>> {
             co_return co_await RelocateIfCurrent(key_owner, key, value, record,
                                                  source_location, promote);
           });

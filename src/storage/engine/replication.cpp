@@ -36,6 +36,9 @@ Task<absl::Status> StorageEngine::Impl::PinFullSyncExtents(
   if (extents == nullptr) {
     co_return absl::InvalidArgumentError("full-sync value has no extents");
   }
+  // Keep same-worker and cross-worker suspensions in separate statements.
+  // GCC 13 can reuse the wrong coroutine-frame slot for co_await in both ?:
+  // arms.
   std::size_t pinned = 0;
   for (const ExtentRef& ref : *extents) {
     const unsigned owner = BlockOwner(ref.block_id_);
@@ -54,9 +57,12 @@ Task<absl::Status> StorageEngine::Impl::PinFullSyncExtents(
       ++state->pins_;
       co_return absl::OkStatus();
     };
-    absl::Status status = owner == celer::ThisWorker().id_
-                              ? co_await pin()
-                              : co_await celer::SubmitTaskTo(owner, pin);
+    absl::Status status;
+    if (owner == celer::ThisWorker().id_) {
+      status = co_await pin();
+    } else {
+      status = co_await celer::SubmitTaskTo(owner, pin);
+    }
     if (!status.ok()) break;
     ++pinned;
   }
@@ -87,9 +93,12 @@ Task<absl::Status> StorageEngine::Impl::ReleaseFullSyncExtents(
       }
       co_return absl::OkStatus();
     };
-    absl::Status status = owner == celer::ThisWorker().id_
-                              ? co_await release()
-                              : co_await celer::SubmitTaskTo(owner, release);
+    absl::Status status;
+    if (owner == celer::ThisWorker().id_) {
+      status = co_await release();
+    } else {
+      status = co_await celer::SubmitTaskTo(owner, release);
+    }
     if (!status.ok()) co_return status;
   }
   co_return absl::OkStatus();
@@ -1062,9 +1071,14 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::ReadFullSyncValueChunk(
           *stores_[owner], ref, static_cast<std::uint32_t>(index),
           source_offset, std::span(destination, slice));
     };
-    absl::Status status = owner == store.worker_->id()
-                              ? co_await read()
-                              : co_await celer::SubmitTaskTo(owner, read);
+    // This is the same GCC 13 coroutine-frame invariant as extent pin/release
+    // above; do not fold these suspension points back into a conditional.
+    absl::Status status;
+    if (owner == store.worker_->id()) {
+      status = co_await read();
+    } else {
+      status = co_await celer::SubmitTaskTo(owner, read);
+    }
     if (!status.ok()) co_return status;
     written += slice;
     absolute += slice;
@@ -2066,7 +2080,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicaRootWritesLocal(
       co_await store.store_state_mutex_.Lock();
       UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
       done = !store.flush_running_ && store.flush_queue_.empty();
-      failed = store.write_failed_;
+      failed = store.write_failed_ || RuntimeFailureLatched();
     }
     if (failed) {
       co_return absl::InternalError(
@@ -2127,9 +2141,16 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
     auto drain = [this, target]() {
       return DrainReplicaRootWritesLocal(*stores_[target]);
     };
-    absl::Status drained = target == 0
-                               ? co_await drain()
-                               : co_await celer::SubmitTaskTo(target, drain);
+    // Keep owner selection outside a conditional expression with two
+    // co_await operands. GCC 13 can reuse the prior iteration's awaiter when
+    // lowering that shape in this coroutine, causing worker zero to be drained
+    // or published twice while another worker is skipped.
+    absl::Status drained;
+    if (target == 0) {
+      drained = co_await drain();
+    } else {
+      drained = co_await celer::SubmitTaskTo(target, drain);
+    }
     if (!drained.ok()) co_return drained;
   }
 
@@ -2137,9 +2158,12 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
     auto settle = [this, target]() {
       return AwaitDetachedReclaim(*stores_[target]);
     };
-    absl::Status settled = target == 0
-                               ? co_await settle()
-                               : co_await celer::SubmitTaskTo(target, settle);
+    absl::Status settled;
+    if (target == 0) {
+      settled = co_await settle();
+    } else {
+      settled = co_await celer::SubmitTaskTo(target, settle);
+    }
     if (!settled.ok()) co_return settled;
   }
 
@@ -2182,9 +2206,12 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
       }
       co_return absl::OkStatus();
     };
-    absl::Status published =
-        target == 0 ? co_await publish()
-                    : co_await celer::SubmitTaskTo(target, publish);
+    absl::Status published;
+    if (target == 0) {
+      published = co_await publish();
+    } else {
+      published = co_await celer::SubmitTaskTo(target, publish);
+    }
     if (!published.ok()) co_return published;
   }
   std::array<std::byte, 2 * kLogicalDatabaseCount * sizeof(std::uint64_t)>
@@ -2237,9 +2264,13 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     auto drain = [this, target]() {
       return DrainReplicaRootWritesLocal(*stores_[target]);
     };
-    absl::Status drained = target == 0
-                               ? co_await drain()
-                               : co_await celer::SubmitTaskTo(target, drain);
+    // Same GCC 13 double-co_await workaround as PromoteReplicaRoot above.
+    absl::Status drained;
+    if (target == 0) {
+      drained = co_await drain();
+    } else {
+      drained = co_await celer::SubmitTaskTo(target, drain);
+    }
     if (!drained.ok()) co_return drained;
   }
   for (unsigned target = 0; target < worker_count_; ++target) {
@@ -2286,9 +2317,12 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
       // old index arenas or unsettled record-block accounting.
       co_return co_await AwaitDetachedReclaim(store);
     };
-    absl::Status discarded =
-        target == 0 ? co_await discard()
-                    : co_await celer::SubmitTaskTo(target, discard);
+    absl::Status discarded;
+    if (target == 0) {
+      discarded = co_await discard();
+    } else {
+      discarded = co_await celer::SubmitTaskTo(target, discard);
+    }
     if (!discarded.ok()) co_return discarded;
   }
   co_return absl::OkStatus();

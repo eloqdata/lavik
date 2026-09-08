@@ -9,8 +9,28 @@
 #include <vector>
 
 #include "keylane/meta/encoding.h"
+#include "keylane/meta/hash.h"
 
 namespace keylane::meta {
+
+MetaEvidenceSummary SummarizeOperationEvidence(
+    const MetaOperationEvidenceObs& evidence,
+    const MetaHash256& population_manifest_digest) {
+  MetaEvidenceSummary summary;
+  summary.node_id_ = evidence.node_id_;
+  summary.group_id_ = evidence.group_id_;
+  summary.assignment_id_ = evidence.assignment_id_;
+  summary.boot_incarnation_ = evidence.boot_incarnation_;
+  summary.group_term_ = evidence.group_term_;
+  summary.population_manifest_revision_ =
+      evidence.population_manifest_revision_;
+  summary.population_manifest_digest_ = population_manifest_digest;
+  summary.partition_replication_epoch_ = evidence.partition_replication_epoch_;
+  summary.replication_history_id_ = evidence.replication_history_id_;
+  summary.operation_id_ = evidence.operation_id_;
+  summary.kind_hash_ = evidence.evidence_hash_;
+  return summary;
+}
 
 namespace {
 
@@ -30,15 +50,14 @@ std::string BoundedDetail(std::string detail) {
   return detail;
 }
 
-// The freshness verdict of the term/manifest anchor shared by candidate and
-// evidence observations. group_term 0 can never anchor either: a group's term
-// only begins via BeginGroupTerm(T >= 1), and MetaCommittedFacts reports 0
-// for a group that does not exist at all — accepting term 0 would admit
-// observations about nonexistent groups (the facts contract's "unknown
-// answers reject" only works when term-bound observations carry T >= 1).
-absl::Status CheckTermAnchor(std::string_view group_id, std::uint64_t term,
-                             std::uint64_t manifest,
-                             const MetaCommittedFacts& facts) {
+// The freshness verdict of the committed population anchor shared by
+// candidate and evidence observations. group_term 0 can never anchor either:
+// a group's term only begins via BeginGroupTerm(T >= 1), and
+// MetaCommittedFacts reports 0 for a group that does not exist at all.
+absl::Status CheckPopulationAnchor(std::string_view group_id,
+                                   std::uint64_t term, std::uint64_t manifest,
+                                   std::uint64_t partition_epoch,
+                                   const MetaCommittedFacts& facts) {
   if (group_id.empty() || group_id.size() > kMaxMetaGroupIdBytes) {
     return MetaDomainRejectError("bad-group-id");
   }
@@ -51,10 +70,16 @@ absl::Status CheckTermAnchor(std::string_view group_id, std::uint64_t term,
                                  std::to_string(committed_term));
   }
   const std::uint64_t committed_manifest =
-      facts.CurrentPopulationManifestId(group_id);
+      facts.CurrentPopulationManifestRevision(group_id);
   if (manifest != committed_manifest) {
     return MetaDomainRejectError("manifest-mismatch:committed=" +
                                  std::to_string(committed_manifest));
+  }
+  const std::uint64_t committed_partition_epoch =
+      facts.CurrentPartitionReplicationEpoch(group_id);
+  if (partition_epoch != committed_partition_epoch) {
+    return MetaDomainRejectError("partition-epoch-mismatch:committed=" +
+                                 std::to_string(committed_partition_epoch));
   }
   return absl::OkStatus();
 }
@@ -141,11 +166,23 @@ struct MetaObservationStore::Impl {
     }
     if (const auto* candidate =
             std::get_if<MetaCandidateProgressObs>(&payload)) {
+      if (candidate->node_id_ != observation.identity_.node_id_) {
+        return MetaDomainRejectError("candidate-reporter-mismatch");
+      }
+      if (candidate->boot_incarnation_ !=
+          observation.identity_.boot_incarnation_) {
+        return MetaDomainRejectError("candidate-boot-mismatch");
+      }
       const absl::Status anchor =
-          CheckTermAnchor(candidate->group_id_, candidate->group_term_,
-                          candidate->population_manifest_id_, facts);
+          CheckPopulationAnchor(candidate->group_id_, candidate->group_term_,
+                                candidate->population_manifest_revision_,
+                                candidate->partition_replication_epoch_, facts);
       if (!anchor.ok()) {
         return anchor;
+      }
+      if (!facts.AssignmentMatches(candidate->group_id_, candidate->node_id_,
+                                   candidate->assignment_id_)) {
+        return MetaDomainRejectError("assignment-mismatch");
       }
       // GroupRecord deliberately carries no history id because replication
       // history is scoped to a data-plane boot. A bare candidate therefore
@@ -164,14 +201,25 @@ struct MetaObservationStore::Impl {
       return CheckFieldSize(candidate->readiness_, "readiness");
     }
     const auto& evidence = std::get<MetaOperationEvidenceObs>(payload);
+    if (evidence.node_id_ != observation.identity_.node_id_) {
+      return MetaDomainRejectError("evidence-reporter-mismatch");
+    }
+    if (evidence.boot_incarnation_ != observation.identity_.boot_incarnation_) {
+      return MetaDomainRejectError("evidence-boot-mismatch");
+    }
     if (!facts.OperationNonTerminal(evidence.operation_id_)) {
       return MetaDomainRejectError("operation-unknown-or-terminal");
     }
     const absl::Status anchor =
-        CheckTermAnchor(evidence.group_id_, evidence.group_term_,
-                        evidence.population_manifest_id_, facts);
+        CheckPopulationAnchor(evidence.group_id_, evidence.group_term_,
+                              evidence.population_manifest_revision_,
+                              evidence.partition_replication_epoch_, facts);
     if (!anchor.ok()) {
       return anchor;
+    }
+    if (!facts.AssignmentMatches(evidence.group_id_, evidence.node_id_,
+                                 evidence.assignment_id_)) {
+      return MetaDomainRejectError("assignment-mismatch");
     }
     if (!facts.HistoryBoundToOperation(evidence.operation_id_,
                                        evidence.replication_history_id_)) {
@@ -182,7 +230,15 @@ struct MetaObservationStore::Impl {
         !size.ok()) {
       return size;
     }
-    return CheckFieldSize(evidence.evidence_, "evidence");
+    if (const absl::Status size =
+            CheckFieldSize(evidence.evidence_, "evidence");
+        !size.ok()) {
+      return size;
+    }
+    if (evidence.evidence_hash_ != MetaSha256(evidence.evidence_)) {
+      return MetaDomainRejectError("evidence-hash-mismatch");
+    }
+    return absl::OkStatus();
   }
 
   void Audit(MetaObsAuditKind kind, const std::string& node_id,
@@ -254,6 +310,7 @@ struct MetaObservationStore::Impl {
   // FIFO overwrite-oldest ring; debugging surface, not the durable audit
   // trail (that is MetaAuditStore).
   std::deque<MetaObsAuditEvent> audit_ring_;
+  std::optional<std::int64_t> last_periodic_sweep_unix_ms_;
 };
 
 MetaObservationStore::MetaObservationStore(Limits limits)
@@ -400,7 +457,8 @@ void MetaObservationStore::RevalidateAll(const MetaCommittedFacts& facts,
   std::lock_guard<std::mutex> lock(mutex_);
   Impl& impl = *impl_;
   // Committed state moved under stored observations (term promoted, manifest
-  // swapped, operation terminated, node retired): anything that no longer
+  // or partition epoch changed, operation terminated, node retired): anything
+  // that no longer
   // passes the full admission check is actively purged. Read paths re-filter
   // independently, so a purge miss here could
   // never leak stale data — this pass is what bounds memory instead.
@@ -456,6 +514,32 @@ void MetaObservationStore::RevalidateAll(const MetaCommittedFacts& facts,
 
 void MetaObservationStore::SweepExpired(int64_t now_unix_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
+  impl_->last_periodic_sweep_unix_ms_ = now_unix_ms;
+  SweepExpiredLocked(now_unix_ms);
+}
+
+bool MetaObservationStore::MaybeSweepExpired(int64_t now_unix_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  Impl& impl = *impl_;
+  // Keep periodic cleanup well below the observation TTL without turning N
+  // node heartbeats into N complete map scans. A backwards wall-clock step
+  // starts a new cadence epoch; expiry itself remains conservative because
+  // SweepExpiredLocked uses the caller's current wall time.
+  const std::int64_t interval_ms =
+      std::max<std::int64_t>(
+          1, std::min<std::int64_t>(1000, std::max<std::int64_t>(
+                                                1, limits_.ttl_ms_ / 4)));
+  if (impl.last_periodic_sweep_unix_ms_.has_value() &&
+      now_unix_ms >= *impl.last_periodic_sweep_unix_ms_ &&
+      now_unix_ms - *impl.last_periodic_sweep_unix_ms_ < interval_ms) {
+    return false;
+  }
+  impl.last_periodic_sweep_unix_ms_ = now_unix_ms;
+  SweepExpiredLocked(now_unix_ms);
+  return true;
+}
+
+void MetaObservationStore::SweepExpiredLocked(int64_t now_unix_ms) {
   Impl& impl = *impl_;
   // An entry exactly ttl_ms_ old still survives: expiry is strictly older
   // than the TTL so a sweep tick at the boundary never races a report.

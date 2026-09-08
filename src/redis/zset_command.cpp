@@ -2872,13 +2872,16 @@ Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
                            request.kind_ == CommandKind::kGeoSearchStore ||
                            request.kind_ == CommandKind::kGeoRadius ||
                            request.kind_ == CommandKind::kGeoRadiusByMember;
-    auto input =
-        zset_only ? co_await ReadZSetOnlyLocked(
-                        request.db_id_, request.args_[key.arg_index_],
-                        key.digest_, &context->input_charges_[key.arg_index_])
-                  : co_await ReadAggregateInputLocked(
-                        request.db_id_, request.args_[key.arg_index_],
-                        key.digest_, &context->input_charges_[key.arg_index_]);
+    absl::StatusOr<ZSet> input;
+    if (zset_only) {
+      input = co_await ReadZSetOnlyLocked(
+          request.db_id_, request.args_[key.arg_index_], key.digest_,
+          &context->input_charges_[key.arg_index_]);
+    } else {
+      input = co_await ReadAggregateInputLocked(
+          request.db_id_, request.args_[key.arg_index_], key.digest_,
+          &context->input_charges_[key.arg_index_]);
+    }
     if (!input.ok()) co_return input.status();
     context->inputs_[key.arg_index_] = std::move(*input);
   }
@@ -3399,19 +3402,26 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
                              request.kind_ == CommandKind::kGeoSearchStore ||
                              request.kind_ == CommandKind::kGeoRadius ||
                              request.kind_ == CommandKind::kGeoRadiusByMember;
-      auto input = zset_only ? co_await ReadZSetOnlyLocked(
-                                   request.db_id_, args[argument], key->digest_,
-                                   &context.input_charges_[argument])
-                             : co_await ReadAggregateInputLocked(
-                                   request.db_id_, args[argument], key->digest_,
-                                   &context.input_charges_[argument]);
+      absl::StatusOr<ZSet> input;
+      if (zset_only) {
+        input = co_await ReadZSetOnlyLocked(request.db_id_, args[argument],
+                                            key->digest_,
+                                            &context.input_charges_[argument]);
+      } else {
+        input = co_await ReadAggregateInputLocked(request.db_id_,
+                                                  args[argument], key->digest_,
+                                                  &context.input_charges_[argument]);
+      }
       if (!input.ok()) co_return input.status();
       context.inputs_[argument] = std::move(*input);
       co_return absl::OkStatus();
     };
-    absl::Status status = key->owner_ == celer::ThisWorker().id_
-                              ? co_await read()
-                              : co_await celer::SubmitTaskTo(key->owner_, read);
+    absl::Status status;
+    if (key->owner_ == celer::ThisWorker().id_) {
+      status = co_await read();
+    } else {
+      status = co_await celer::SubmitTaskTo(key->owner_, read);
+    }
     if (!status.ok()) {
       co_return std::string(StorageError(builder, status));
     }
@@ -3441,10 +3451,12 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
       co_return co_await ReplaceMultiDestination(
           &context, destination->digest_, &tx_writes[destination->owner_]);
     };
-    absl::Status status =
-        destination->owner_ == celer::ThisWorker().id_
-            ? co_await write()
-            : co_await celer::SubmitTaskTo(destination->owner_, write);
+    absl::Status status;
+    if (destination->owner_ == celer::ThisWorker().id_) {
+      status = co_await write();
+    } else {
+      status = co_await celer::SubmitTaskTo(destination->owner_, write);
+    }
     destination_writes.collect_undo_ = false;
     if (!status.ok()) ClearMultiPayloads(&context);
     absl::Status undo_finished = co_await celer::SubmitTaskTo(
@@ -3522,9 +3534,16 @@ Task<std::string> ExecuteZSetMultiPopLocked(
                            key->digest_, shape.maximum_, shape.count_,
                            &tx_writes[key->owner_], &request);
     };
-    auto popped = key->owner_ == celer::ThisWorker().id_
-                      ? co_await pop()
-                      : co_await celer::SubmitTaskTo(key->owner_, pop);
+    // Keep worker selection outside a conditional expression containing two
+    // co_await operands. GCC 13 can alias their coroutine-frame slots and
+    // resume the local pop on the caller after selecting the remote branch,
+    // violating PartitionFor's worker-affinity invariant.
+    absl::StatusOr<std::vector<Element>> popped;
+    if (key->owner_ == celer::ThisWorker().id_) {
+      popped = co_await pop();
+    } else {
+      popped = co_await celer::SubmitTaskTo(key->owner_, pop);
+    }
     if (!popped.ok()) {
       co_return std::string(StorageError(builder, popped.status()));
     }

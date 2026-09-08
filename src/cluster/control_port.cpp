@@ -340,8 +340,8 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
     if (!node.is_primary_ || node.slots_.empty()) continue;
     GroupView group;
     // The static adapter defines its opaque group id as the primary's Redis
-    // node id. Keep GroupId textual because a future Meta adapter may assign
-    // ids from a different namespace.
+    // node id. Keep GroupId textual because Meta-controlled groups use their
+    // committed group namespace instead.
     group.group_id_ = node.node_.node_id_.ToHexString();
     group.primary_node_index_ = static_cast<NodeIndex>(node_index);
     for (std::size_t replica_index = 0; replica_index < nodes.size();
@@ -379,12 +379,26 @@ void StaticClusterControl::SetStorageReady(bool ready) {
   storage_ready_.store(ready, std::memory_order_release);
 }
 
-absl::Status StaticClusterControl::RefreshTarget(TopologyCache& cache) {
+celer::Task<absl::Status>
+StaticClusterControl::LoseStorageReadinessTransition(
+    NodeControlInstaller& installer) {
+  std::unique_lock lock(refresh_mutex_);
+  // Never let a reload parsed after terminal storage failure carry the old
+  // startup-ready bit. Keeping the writer lock until NodeControl has joined
+  // every capability also prevents a parse begun earlier from publishing
+  // stale readiness behind the failure barrier.
+  storage_ready_.store(false, std::memory_order_release);
+  co_return co_await installer.LoseStorageReadinessTransition();
+}
+
+absl::Status StaticClusterControl::RefreshTarget(
+    NodeControlInstaller& installer) {
+  std::lock_guard lock(refresh_mutex_);
   // Any failure returns before Publish, so the cache keeps the previously
   // published state (fencing transitions are only ever published complete).
-  // The class needs no lock around the file IO: path_/self_/cluster_tls_port_
-  // and worker_count_ are immutable after construction and storage_ready_ is
-  // atomic.
+  // Holding the static-adapter writer lock across file IO and installation is
+  // intentional: reload is rare, and it prevents a stale parse from being
+  // published after worker 0 has announced storage readiness.
   std::ifstream input(path_, std::ios::binary);
   if (!input.is_open()) {
     return absl::NotFoundError(
@@ -400,8 +414,24 @@ absl::Status StaticClusterControl::RefreshTarget(TopologyCache& cache) {
       Parse(content, self_, cluster_tls_port_,
             storage_ready_.load(std::memory_order_acquire), worker_count_);
   if (!state.ok()) return state.status();
-  cache.Publish(std::move(*state));
-  return absl::OkStatus();
+  const absl::Status readiness =
+      installer.SetStorageReady(storage_ready_.load(std::memory_order_acquire));
+  if (!readiness.ok()) return readiness;
+  Sha256Digest semantic_hash{};
+  std::uint64_t content_hash = (*state)->content_hash();
+  for (std::size_t i = 0; i < sizeof(content_hash); ++i) {
+    semantic_hash[i] = static_cast<std::uint8_t>(content_hash & 0xff);
+    content_hash >>= 8;
+  }
+  const ProjectionBasis basis{
+      .source_meta_applied_index_ = ++refresh_revision_,
+      .projection_hash_ = semantic_hash,
+  };
+  return installer.InstallFullState(
+      PreparedFullState{.serving_state_ = std::move(*state),
+                        .object_hash_ = semantic_hash,
+                        .control_groups_ = {}},
+      basis);
 }
 
 void InMemoryClusterControl::SetTarget(
@@ -409,12 +439,23 @@ void InMemoryClusterControl::SetTarget(
   pending_ = std::move(state);
 }
 
-absl::Status InMemoryClusterControl::RefreshTarget(TopologyCache& cache) {
+absl::Status InMemoryClusterControl::RefreshTarget(
+    NodeControlInstaller& installer) {
   // Nothing pending is a no-op, not an error: the last published state stays
   // in effect until the test installs a new target.
   if (pending_ == nullptr) return absl::OkStatus();
-  cache.Publish(std::move(pending_));
-  return absl::OkStatus();
+  Sha256Digest semantic_hash{};
+  std::uint64_t content_hash = pending_->content_hash();
+  for (std::size_t i = 0; i < sizeof(content_hash); ++i) {
+    semantic_hash[i] = static_cast<std::uint8_t>(content_hash & 0xff);
+    content_hash >>= 8;
+  }
+  return installer.InstallFullState(
+      PreparedFullState{.serving_state_ = std::move(pending_),
+                        .object_hash_ = semantic_hash,
+                        .control_groups_ = {}},
+      ProjectionBasis{.source_meta_applied_index_ = ++refresh_revision_,
+                      .projection_hash_ = semantic_hash});
 }
 
 }  // namespace keylane::cluster

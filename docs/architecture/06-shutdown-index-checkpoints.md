@@ -17,15 +17,20 @@ server is online, `CONFIG SET shutdown-checkpoint yes|no` atomically changes
 whether the next clean shutdown creates a checkpoint; `CONFIG GET` reports the
 current process-local value.
 
-Checkpoint construction starts only after request admission has stopped and
-every worker has sealed and flushed its record streams, drained storage
-maintenance, and reached the shutdown barrier. Worker 0 then runs transaction
-cleaning to a fixed point regardless of the online cleaner cooldown: committed
-transaction-tagged winners are relocated to durable ordinary records and the
-old transaction generations are retired before any index shard is frozen.
-There is no online checkpoint flow. The build is therefore O(current index
-entries), including reading complete keys that are not retained inline; it
-does not scan obsolete record versions.
+Checkpoint construction starts only after request admission has stopped,
+accepted requests have drained, and the control and replication layers have
+joined every task that can mutate storage. Each worker first resets every
+active stream (including an otherwise empty header), seals and flushes its
+records, drains storage maintenance, and reaches a shutdown barrier. Worker 0
+then runs transaction cleaning to a fixed point regardless of the online
+cleaner cooldown: committed transaction-tagged winners are relocated to
+durable ordinary records and the old transaction generations are retired.
+That work can create new staged records, so all workers perform a second
+seal/drain round and meet a second barrier. A final locked check rejects the
+checkpoint if expiration, flush work, or a runtime storage failure appeared
+behind either freeze. There is no online checkpoint flow. The build is
+therefore O(current index entries), including reading complete keys that are
+not retained inline; it does not scan obsolete record versions.
 
 After request admission is closed and all accepted requests have drained, the
 shutdown thread snapshots the runtime atomic once before publishing the flush

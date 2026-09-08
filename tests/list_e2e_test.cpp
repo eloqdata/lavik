@@ -766,6 +766,9 @@ class ServerProcess {
   void Pause() {
     ASSERT_GT(pid_, 0);
     ASSERT_EQ(::kill(pid_, SIGSTOP), 0);
+    int status = 0;
+    ASSERT_EQ(::waitpid(pid_, &status, WUNTRACED), pid_);
+    ASSERT_TRUE(WIFSTOPPED(status));
   }
 
   void Resume() {
@@ -2464,6 +2467,196 @@ TEST(ListE2eTest, SortsCollectionsAndStoresResultsAtomically) {
   EXPECT_EQ(client.Command({"LRANGE", "sort-wakeup", "0", "-1"}),
             BulkArray({"2", "3", "10"}));
   server.Stop();
+}
+
+TEST(ListE2eTest, NativeFlowCapabilityRejectsSessionHijack) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-replication-flow-capability-e2e-" +
+      std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int data_fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(data_fd, 0);
+  ASSERT_EQ(::posix_fallocate(data_fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(data_fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  ServerProcess server(g_keylane_binary, port, data_path, log_path, 1);
+  RespClient client(port);
+  const auto ready_deadline = std::chrono::steady_clock::now() + 30s;
+  while (std::chrono::steady_clock::now() < ready_deadline &&
+         client.Command({"SET", "flow-capability-ready", "1"}) != "+OK") {
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_EQ(client.Command({"GET", "flow-capability-ready"}), Bulk("1"));
+
+  const int control = ConnectSocket(port);
+  ASSERT_GE(control, 0);
+  const std::string target_identity =
+      "?" + std::string(40, 'a') + ":12345";
+  SendAll(control,
+          EncodeCommand({"KLPSYNC", "1", target_identity, "?", "?",
+                         std::string(40, 'b'), std::string(40, 'c'), "?"}));
+  const std::string resync = ReadRespLine(control);
+  const std::string_view resync_view(resync);
+  std::vector<std::string_view> words;
+  for (std::size_t begin = 0; begin < resync_view.size();) {
+    const std::size_t end = resync_view.find(' ', begin);
+    words.push_back(resync_view.substr(
+        begin, end == std::string::npos ? resync_view.size() - begin
+                                        : end - begin));
+    if (end == std::string::npos) break;
+    begin = end + 1;
+  }
+  ASSERT_EQ(words.size(), 8U) << resync;
+  ASSERT_EQ(words[0], "+KLFULLRESYNC");
+  ASSERT_EQ(words[6], "1");
+  ASSERT_EQ(words[7].size(), 40U);
+  const std::string session_id(words[1]);
+  const std::string capability(words[7]);
+  std::string wrong_capability = capability;
+  wrong_capability.front() = wrong_capability.front() == '0' ? '1' : '0';
+
+  const int hijack = ConnectSocket(port);
+  ASSERT_GE(hijack, 0);
+  SendAll(hijack,
+          EncodeCommand({"KLFLOW", "1", session_id, "0", "1", "0",
+                         wrong_capability}));
+  EXPECT_THROW((void)ReadRespLine(hijack), std::runtime_error);
+  ASSERT_EQ(::close(hijack), 0);
+
+  const int authorized = ConnectSocket(port);
+  ASSERT_GE(authorized, 0);
+  SendAll(authorized,
+          EncodeCommand({"KLFLOW", "1", session_id, "0", "1", "0",
+                         capability}));
+  EXPECT_EQ(ReadRespLine(authorized),
+            "+KLFLOW " + session_id + " 0 FULL");
+  ASSERT_EQ(::close(authorized), 0);
+  ASSERT_EQ(::close(control), 0);
+
+  // Keep a source control handshake alive without opening its flow. Graceful
+  // shutdown must cancel and join this handler rather than checkpointing while
+  // it can still enable source history (or waiting for its stall timeout).
+  const int shutdown_control = ConnectSocket(port);
+  ASSERT_GE(shutdown_control, 0);
+  SendAll(shutdown_control,
+          EncodeCommand({"KLPSYNC", "1", target_identity, "?", "?",
+                         std::string(40, 'd'), std::string(40, 'e'), "?"}));
+  ASSERT_TRUE(ReadRespLine(shutdown_control).starts_with("+KLFULLRESYNC "));
+  server.Stop();
+  ASSERT_EQ(::close(shutdown_control), 0);
+}
+
+TEST(ListE2eTest, GracefulShutdownCancelsBackpressuredNativeSource) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-native-source-shutdown-e2e-" +
+      std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data), replica_cleanup(replica_data),
+      source_log_cleanup(source_log), replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 512ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  std::future<std::string> blocked_write;
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t metrics_port = FindFreePort();
+  while (metrics_port == source_port) metrics_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port || replica_port == metrics_port) {
+    replica_port = FindFreePort();
+  }
+  ServerProcess source(
+      g_keylane_binary, source_port, source_data, source_log, 1, {},
+      {"--repl-backlog-size", "8388608",
+       "--replication-publish-queue-mb-per-worker", "1", "--metrics-port",
+       std::to_string(metrics_port)});
+  ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                        replica_log, 1);
+  RespClient source_client(source_port);
+  RespClient replica_client(replica_port);
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  const auto online_deadline = std::chrono::steady_clock::now() + 60s;
+  std::string replica_info;
+  do {
+    replica_info = replica_client.Command({"INFO", "replication"});
+    if (replica_info.find("keylane_replication_state:online") !=
+        std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < online_deadline);
+  ASSERT_NE(replica_info.find("keylane_replication_state:online"),
+            std::string::npos)
+      << replica_info;
+
+  ASSERT_EQ(source_client.Command({"SET", "shutdown-ack-baseline", "ready"}),
+            "+OK");
+  ASSERT_EQ(source_client.Command({"WAIT", "1", "5000"}), ":1");
+
+  // Stop the target process without closing its sockets. The source can fill
+  // the kernel send window, after which its one-block replication history
+  // remains pinned because no command ACK can advance retention.
+  replica.Pause();
+  const std::string payload(4 * 1024 * 1024, 'x');
+  ASSERT_EQ(source_client.Command({"SET", "shutdown-backpressure", payload}),
+            "+OK");
+  ASSERT_EQ(source_client.Command({"SET", "shutdown-backpressure", payload}),
+            "+OK");
+
+  const std::string backpressured_metric =
+      "keylane_replication_backlog_backpressured{worker=\"0\"} 1";
+  const auto blocked_deadline = std::chrono::steady_clock::now() + 15s;
+  bool observed_backpressure = false;
+  while (std::chrono::steady_clock::now() < blocked_deadline) {
+    if (HttpGet(metrics_port, "/metrics").find(backpressured_metric) !=
+        std::string::npos) {
+      observed_backpressure = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(observed_backpressure)
+      << "source never reached replication backlog backpressure";
+
+  blocked_write = std::async(std::launch::async, [source_port] {
+    try {
+      RespClient client(source_port);
+      return client.Command({"SET", "shutdown-blocked-writer", "value"});
+    } catch (const std::exception& error) {
+      return std::string("closed: ") + error.what();
+    }
+  });
+  ASSERT_EQ(blocked_write.wait_for(500ms), std::future_status::timeout);
+  RespClient probe(source_port);
+  ASSERT_EQ(probe.Command({"PING"}), "+PONG");
+
+  // SIGINT must close source-flow sockets before waiting for this admitted
+  // writer. Flow teardown releases the retention cursor and lets the request
+  // finish, so graceful shutdown remains bounded even though the target is
+  // still stopped and cannot ACK.
+  const auto shutdown_started = std::chrono::steady_clock::now();
+  source.Stop();
+  EXPECT_LT(std::chrono::steady_clock::now() - shutdown_started, 10s);
+  ASSERT_EQ(blocked_write.wait_for(2s), std::future_status::ready);
+  (void)blocked_write.get();
+  replica.Resume();
+  replica.Stop();
 }
 
 TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {

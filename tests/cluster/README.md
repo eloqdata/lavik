@@ -54,22 +54,25 @@ Population observations in this matrix are protocol-independent reference
 model fields. In particular, `staging-hidden` and `atomic-activation` name an
 abstract exposure boundary; they do not imply that production keeps a second
 staging root or performs a physical root swap. Native production full sync is
-a destructive in-place reset hidden by LOADING. The cluster-managed production
+a destructive in-place reset hidden by LOADING. The Meta-managed production
 path starts fail-closed and exposes callable manager APIs to apply a complete
 rebuild directive, query boot-scoped status, and authorize or revoke an exact
 source export. That adapter drives `ReplicationGroup` through the existing
 native reset/snapshot/tail/promote/abort path. Status exposes `NOT_READY` and
 `REBUILDING` while no population is published, then may expose a ready token or
-a group-identity-bound terminal `FAILED_STOPPED` result. There is no in-process
-Meta transport yet; #20 must call this boundary, so the process tests cannot
-currently inject a real Meta message.
+a group-identity-bound terminal `FAILED_STOPPED` result. #20 connects that
+boundary to the authenticated Meta transport; focused tests inject full-state
+projections, leases, and rebuild directives through that control plane.
 
 Runtime reset still spans all 16,384 physical partitions; an authorized source
 scans baseline data only for manifest members and sends empty handoffs for
 non-members.
 The Function-catalog row proves completion at the current native cut and uses
-the durable catalog generation installed by storage. Population readiness is
-still boot-scoped, so every restarted cluster process begins `NOT_READY`.
+the durable catalog generation installed by storage. Meta-managed population
+readiness is boot-scoped, so every restarted Meta-managed process begins
+`NOT_READY`. Static-file readiness follows storage recovery and can reuse a
+fully promoted population; a durable incomplete-full-sync fence still prevents
+that population from being exposed.
 
 | Safety claim | Stable invariant | Fast model coverage |
 |---|---|---|
@@ -77,7 +80,7 @@ still boot-scoped, so every restarted cluster process begins `NOT_READY`.
 | Candidate selection is separate from durable activation | `promotion.safe-activation`, `promotion.durable-before-write-authority` | snapshot assertions and composed failover scenario |
 | Promotion binds the durable base to the validated population and current durable Function catalog generation | `promotion.durable-base-before-activation`, `promotion.catalog-token-current` | snapshot assertions and stale-catalog-promotion KFT1 regression |
 | Other replicas remain intact until activation and child history is ready before writes | `promotion.keep-replicas-until-activation`, `history.child-ready-before-write` | snapshot assertions |
-| Restart invalidates old partial-sync and population-readiness evidence | `replication.restart-invalidates-evidence` | stale-evidence KFT1 regression, group-API reconstruction checks at each rebuild boundary, and real-process recovery of partial and promoted SSD images |
+| Restart invalidates old partial-sync and Meta population-readiness evidence | `replication.restart-invalidates-evidence` | stale-evidence KFT1 regression, group-API reconstruction checks at each rebuild boundary, and real-process recovery of a partial SSD image |
 | Live reparent requires compatible domains, an exact cursor, contiguous retained events, and a complete transaction boundary | `replication.compatible-resume-domain`, `replication.reparent-requires-complete-history` | vector tests and history-gap KFT1 regression |
 | A crashed rebuild cannot expose staging or a half-active population | `population.staging-hidden`, `population.atomic-activation` | storage controls and partial-activation KFT1 regression |
 | Function mutations keep staging hidden and make the complete catalog durable and installed before publication, cursor advancement, or ACK | `function.catalog-staging-hidden`, `function.catalog-durable-before-visible`, `function.catalog-installed-before-progress`, `function.catalog-durable-before-ack` | snapshot assertions and catalog-ack-before-durable KFT1 regression |
@@ -109,10 +112,12 @@ all-flow cuts, ready/fail-stop publication, proof invalidation, and a fresh
 `NOT_READY` group after API reconstruction at each rebuild boundary.
 `rebuild_protocol_integration_test.cpp` also kills a real target after an
 acknowledged partial handoff, proves recovery rejects the mixed SSD population,
-performs a fresh full sync, and proves a post-promotion restart still begins
-cluster-managed service in LOADING. The production
-manager consumes that API, but a real-process Meta-to-adapter test remains
-blocked on the #20 transport rather than on the rebuild seam itself.
+performs a fresh full sync, and proves the static adapter can recover the fully
+promoted population while retaining the durable incomplete-sync fence. The
+production manager consumes that API through `NodeControlInstaller`; the Meta
+integration suites cover authenticated transport, lease, projection, and
+directive delivery, while the native manager suite covers the real storage
+transition.
 `replication_manager_integration_test.cpp` calls that manager seam directly in
 a real single-worker storage/runtime service. A stalling loopback native peer
 keeps attempts deterministic while the test proves that cluster startup ignores

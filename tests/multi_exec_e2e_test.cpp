@@ -166,7 +166,8 @@ class RespClient {
       const ssize_t received = ::recv(fd_, output, size, 0);
       if (received < 0) {
         if (errno == EINTR) continue;
-        Fail("recv failed: " + std::string(std::strerror(errno)));
+        Fail("recv failed while reading " + last_command_ + ": " +
+             std::string(std::strerror(errno)));
       }
       if (received == 0) {
         Fail("server closed the connection while reading " + last_command_);
@@ -330,6 +331,37 @@ void ExpectContains(std::string_view actual, std::string_view expected,
     Fail(std::string(operation) + " returned '" + std::string(actual) +
          "', expected it to contain '" + std::string(expected) + "'");
   }
+}
+
+void WaitForBusyScript(RespClient& client, std::string_view operation) {
+  constexpr std::string_view kBusy = "-BUSY Redis is busy running a script";
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  std::string reply;
+  while (std::chrono::steady_clock::now() < deadline) {
+    reply = client.Command({"PING"});
+    if (reply.find(kBusy) != std::string::npos) return;
+    if (reply != "+PONG") {
+      Fail(std::string(operation) + " returned unexpected readiness reply '" +
+           reply + "'");
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  Fail(std::string(operation) + " timed out waiting for BUSY; last reply '" +
+       reply + "'");
+}
+
+std::string WaitForCommandContains(RespClient& client,
+                                   const std::vector<std::string_view>& command,
+                                   std::string_view expected,
+                                   std::string_view operation) {
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  std::string reply;
+  while (std::chrono::steady_clock::now() < deadline) {
+    reply = client.Command(command);
+    if (reply.find(expected) != std::string::npos) return reply;
+    std::this_thread::sleep_for(10ms);
+  }
+  Fail(std::string(operation) + " timed out; last reply '" + reply + "'");
 }
 
 std::string Bulk(std::string_view value) {
@@ -520,11 +552,11 @@ int main(int argc, char** argv) {
     looping_script.SendCommand({"EVAL",
                                 "while true do redis.call('GET',KEYS[1]) end",
                                 "1", "lua:kill-loop"});
-    std::this_thread::sleep_for(100ms);
+    WaitForBusyScript(client, "busy script command gate");
+    // Connect only after the looping script has executed. SO_REUSEPORT can
+    // otherwise accept these two new sockets out of connect order and place
+    // the persistent killer on the same worker as later looping functions.
     RespClient script_killer = Connect(port);
-    ExpectContains(client.Command({"PING"}),
-                   "-BUSY Redis is busy running a script",
-                   "busy script command gate");
     Expect(script_killer.Command({"SCRIPT", "KILL"}), "+OK", "SCRIPT KILL");
     ExpectContains(looping_script.ReadPush(),
                    "Script killed by user with SCRIPT KILL",
@@ -540,10 +572,9 @@ int main(int argc, char** argv) {
     RespClient looping_function = Connect(port);
     looping_function.SendCommand(
         {"FCALL", "keylane_loop", "1", "lua:function-kill-loop"});
-    std::this_thread::sleep_for(100ms);
     const std::string function_stats =
-        script_killer.Command({"FUNCTION", "STATS"});
-    ExpectContains(function_stats, "keylane_loop", "FUNCTION STATS name");
+        WaitForCommandContains(script_killer, {"FUNCTION", "STATS"},
+                               "keylane_loop", "FUNCTION STATS name");
     ExpectContains(function_stats, "duration_ms", "FUNCTION STATS duration");
     ExpectContains(script_killer.Command({"SCRIPT", "KILL"}),
                    "You can only call FUNCTION KILL",
@@ -564,7 +595,7 @@ int main(int argc, char** argv) {
          "local f=function() while true do redis.call('PING') end end "
          "while true do pcall(f) end",
          "0"});
-    std::this_thread::sleep_for(100ms);
+    WaitForBusyScript(client, "pcall script command gate");
     Expect(script_killer.Command({"SCRIPT", "KILL"}), "+OK",
            "SCRIPT KILL escapes pcall");
     ExpectContains(pcall_script.ReadPush(),
@@ -580,7 +611,7 @@ int main(int argc, char** argv) {
            Bulk("pcall_kill_library"), "load pcall kill function");
     RespClient pcall_function = Connect(port);
     pcall_function.SendCommand({"FCALL", "pcall_kill", "0"});
-    std::this_thread::sleep_for(100ms);
+    WaitForBusyScript(client, "pcall function command gate");
     Expect(script_killer.Command({"FUNCTION", "KILL"}), "+OK",
            "FUNCTION KILL escapes pcall");
     ExpectContains(pcall_function.ReadPush(),

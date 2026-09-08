@@ -415,7 +415,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
       // lose the same bytes as the block's ordinary live-byte accounting.
       if (delta.tagged_bytes_ != 0 && delta.tagged_bytes_ != delta.bytes_)
           [[unlikely]] {
-        store.write_failed_ = true;
+        LatchRuntimeFailure(store);
         co_return absl::InternalError(
             "detached index mixed tagged and untagged records in one block");
       }
@@ -436,7 +436,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
       };
       absl::Status dead = co_await MarkRecordDead(aggregate);
       if (!dead.ok()) {
-        store.write_failed_ = true;
+        LatchRuntimeFailure(store);
         co_return dead;
       }
     }
@@ -488,7 +488,8 @@ Task<absl::Status> StorageEngine::Impl::AwaitDetachedReclaim(
     // A reclaimer that died mid-stream never empties the queue and nothing
     // restarts it; fall through to the fail-stop report instead of
     // spinning forever.
-    if (!store.detached_reclaim_running_ && store.write_failed_) {
+    if (!store.detached_reclaim_running_ &&
+        (store.write_failed_ || RuntimeFailureLatched())) {
       break;
     }
     absl::Status waited =
@@ -497,7 +498,7 @@ Task<absl::Status> StorageEngine::Impl::AwaitDetachedReclaim(
       co_return waited;
     }
   }
-  if (store.write_failed_) {
+  if (store.write_failed_ || RuntimeFailureLatched()) {
     co_return absl::Status(
         absl::StatusCode::kInternal,
         "storage writer stopped while reclaiming detached indexes");

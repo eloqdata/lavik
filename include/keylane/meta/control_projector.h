@@ -1,0 +1,36 @@
+#pragma once
+
+// Pure committed-state projection for the Meta -> Data control plane.
+//
+// This module deliberately stops before transport/session concerns: callers
+// give it one atomic MetaCommittedView and receive canonical FullDesiredState
+// bytes that can be published or chunked later. It performs no I/O and owns
+// no mutable state.
+
+#include <string>
+#include <string_view>
+
+#include "absl/status/statusor.h"
+#include "keylane/cluster/control_protocol.h"
+#include "keylane/meta/coordinator.h"
+
+namespace keylane::meta {
+
+struct NodeControlBatch {
+  cluster::control::FullDesiredState full_state;
+  std::string encoded_full_state;
+
+  bool operator==(const NodeControlBatch&) const = default;
+};
+
+class MetaControlProjector {
+ public:
+  // Produces the complete deterministic projection for one active data node.
+  // A publisher can derive lease-challenge candidates without another Meta
+  // read: they are exactly the active groups whose owner_node_id equals the
+  // requested node, using that group's owner assignment and grant duration.
+  static absl::StatusOr<NodeControlBatch> ProjectNode(
+      const MetaCommittedView& view, std::string_view node_id);
+};
+
+}  // namespace keylane::meta

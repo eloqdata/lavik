@@ -21,10 +21,25 @@ namespace {
   std::abort();
 }
 
+bool LeaseDurationIsWireRepresentable(std::uint64_t lease_duration_ms) {
+  return lease_duration_ms != 0 &&
+         lease_duration_ms <= std::numeric_limits<std::uint32_t>::max();
+}
+
+absl::Status ValidateLeaseDuration(std::uint64_t lease_duration_ms) {
+  if (!LeaseDurationIsWireRepresentable(lease_duration_ms)) {
+    return MetaDomainRejectError(
+        "lease duration must fit the nonzero control-protocol u32 domain");
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 bool MetaGrantStore::GrantMatches(const Entry& entry,
-                                  const ActivateAuthority& command) {
+                                  const ActivateAuthority& command,
+                                  std::uint64_t committed_index) {
+  (void)committed_index;
   return !entry.fenced_ && entry.grant_.has_value() &&
          entry.grant_->owner_ == command.new_owner_ &&
          entry.grant_->term_ == command.expected_term_ &&
@@ -88,7 +103,13 @@ absl::Status MetaGrantStore::BeginGroupTerm(
 }
 
 absl::Status MetaGrantStore::GrantAuthority(
-    const keylane::meta::GrantAuthority& command) {
+    const keylane::meta::GrantAuthority& command,
+    std::uint64_t committed_index) {
+  if (absl::Status lease =
+          ValidateLeaseDuration(command.grant_.lease_duration_ms_);
+      !lease.ok()) {
+    return lease;
+  }
   const auto it = groups_.find(command.group_id_);
   if (it == groups_.end()) {
     return MetaDomainRejectError("unknown group");
@@ -106,15 +127,32 @@ absl::Status MetaGrantStore::GrantAuthority(
     return MetaDomainRejectError(
         "grant CAS token (term/authority_version) mismatch");
   }
-  // Same-owner renewal: only the lease parameters and policy reference move.
-  // Naturally replay-idempotent: term/authority_version do not change, so a
-  // replay installs the same spec again.
+  if (grant.spec_ == command.grant_) {
+    // A replay of the committed spec change or a semantically redundant
+    // command must not create a new authority anchor.
+    return absl::OkStatus();
+  }
+  if (committed_index == 0 || committed_index <= entry.last_grant_revision_) {
+    return MetaDomainRejectError("grant revision must strictly increase");
+  }
   grant.spec_ = command.grant_;
+  grant.grant_revision_ = committed_index;
+  entry.last_grant_revision_ = committed_index;
   return absl::OkStatus();
 }
 
 absl::Status MetaGrantStore::ValidateActivate(
-    const keylane::meta::ActivateAuthority& command) const {
+    const keylane::meta::ActivateAuthority& command,
+    std::uint64_t committed_index) const {
+  if (absl::Status lease =
+          ValidateLeaseDuration(command.grant_.lease_duration_ms_);
+      !lease.ok()) {
+    return lease;
+  }
+  if (command.expected_term_ == 0) {
+    return MetaDomainRejectError(
+        "authority activation requires a nonzero group term");
+  }
   const auto it = groups_.find(command.group_id_);
   if (it == groups_.end()) {
     return MetaDomainRejectError("unknown group");
@@ -125,31 +163,45 @@ absl::Status MetaGrantStore::ValidateActivate(
   if (command.expected_term_ != entry.group_term_) {
     return MetaDomainRejectError("expected term does not match current term");
   }
-  if (GrantMatches(entry, command)) {
+  if (GrantMatches(entry, command, committed_index)) {
     return absl::OkStatus();  // replay: already installed, idempotent accept
   }
   if (command.new_authority_version_ <= entry.last_authority_version_) {
     return MetaDomainRejectError("authority version must strictly increase");
   }
+  if (committed_index == 0 || committed_index <= entry.last_grant_revision_) {
+    return MetaDomainRejectError("grant revision must strictly increase");
+  }
   return absl::OkStatus();
 }
 
 absl::Status MetaGrantStore::ApplyGrantPart(
-    const keylane::meta::ActivateAuthority& command) {
+    const keylane::meta::ActivateAuthority& command,
+    std::uint64_t committed_index) {
   const auto it = groups_.find(command.group_id_);
-  if (it == groups_.end() || command.expected_term_ != it->second.group_term_) {
+  if (it == groups_.end() || command.expected_term_ == 0 ||
+      command.expected_term_ != it->second.group_term_) {
     FatalGrantContractViolation("term mismatch", command.group_id_);
   }
+  if (!LeaseDurationIsWireRepresentable(command.grant_.lease_duration_ms_)) {
+    FatalGrantContractViolation("lease duration is not wire-representable",
+                                command.group_id_);
+  }
   Entry& entry = it->second;
-  if (GrantMatches(entry, command)) {
+  if (GrantMatches(entry, command, committed_index)) {
     return absl::OkStatus();  // replay no-op
+  }
+  if (committed_index == 0 || committed_index <= entry.last_grant_revision_) {
+    FatalGrantContractViolation("grant revision mismatch", command.group_id_);
   }
   MetaGroupGrant grant;
   grant.owner_ = command.new_owner_;
   grant.term_ = entry.group_term_;  // activate never moves the term
   grant.authority_version_ = command.new_authority_version_;
+  grant.grant_revision_ = committed_index;
   grant.spec_ = command.grant_;
   entry.last_authority_version_ = command.new_authority_version_;
+  entry.last_grant_revision_ = committed_index;
   entry.grant_ = std::move(grant);
   entry.fenced_ = false;
   return absl::OkStatus();
@@ -195,6 +247,7 @@ std::optional<MetaGroupGrantState> MetaGrantStore::GroupState(
   MetaGroupGrantState state;
   state.group_term_ = entry.group_term_;
   state.last_authority_version_ = entry.last_authority_version_;
+  state.last_grant_revision_ = entry.last_grant_revision_;
   state.grant_ = entry.grant_;
   state.fenced_ = entry.fenced_;
   return state;
@@ -224,14 +277,22 @@ absl::StatusOr<std::string> MetaGrantStore::Serialize() const {
   w.WriteU16(kMetaFormatVersion);
   w.WriteCount(static_cast<std::uint32_t>(groups_.size()));
   for (const auto& [group_id, entry] : groups_) {
+    if (entry.grant_.has_value() &&
+        !LeaseDurationIsWireRepresentable(
+            entry.grant_->spec_.lease_duration_ms_)) {
+      return MetaDomainRejectError(
+          "grant store contains an unprojectable lease duration");
+    }
     w.WriteString(group_id);
     w.WriteU64(entry.group_term_);
     w.WriteU64(entry.last_authority_version_);
+    w.WriteU64(entry.last_grant_revision_);
     w.WriteBool(entry.fenced_);
     w.WriteOptional(entry.grant_, [](MetaWriter& ww, const MetaGroupGrant& g) {
       ww.WriteString(g.owner_);
       ww.WriteU64(g.term_);
       ww.WriteU64(g.authority_version_);
+      ww.WriteU64(g.grant_revision_);
       ww.WriteU64(g.spec_.lease_duration_ms_);
       ww.WriteString(g.spec_.policy_id_);
       ww.WriteU64(g.spec_.policy_version_);
@@ -262,6 +323,9 @@ absl::StatusOr<MetaGrantStore> MetaGrantStore::Deserialize(
     auto last_av = r.ReadU64();
     if (!last_av.ok()) return last_av.status();
     entry.last_authority_version_ = *last_av;
+    auto last_grant_revision = r.ReadU64();
+    if (!last_grant_revision.ok()) return last_grant_revision.status();
+    entry.last_grant_revision_ = *last_grant_revision;
     auto fenced = r.ReadBool("fenced tag must be 0 or 1");
     if (!fenced.ok()) return fenced.status();
     entry.fenced_ = *fenced;
@@ -276,6 +340,11 @@ absl::StatusOr<MetaGrantStore> MetaGrantStore::Deserialize(
       auto av = rr.ReadU64();
       if (!av.ok()) return absl::StatusOr<MetaGroupGrant>(av.status());
       g.authority_version_ = *av;
+      auto grant_revision = rr.ReadU64();
+      if (!grant_revision.ok()) {
+        return absl::StatusOr<MetaGroupGrant>(grant_revision.status());
+      }
+      g.grant_revision_ = *grant_revision;
       auto lease = rr.ReadU64();
       if (!lease.ok()) return absl::StatusOr<MetaGroupGrant>(lease.status());
       g.spec_.lease_duration_ms_ = *lease;
@@ -299,9 +368,20 @@ absl::StatusOr<MetaGrantStore> MetaGrantStore::Deserialize(
       return MetaFailStopError("fenced/no-grant invariant violated");
     }
     if (entry.grant_.has_value() &&
-        (entry.grant_->term_ != entry.group_term_ ||
+        (entry.grant_->term_ == 0 || entry.grant_->term_ != entry.group_term_ ||
          entry.grant_->authority_version_ != entry.last_authority_version_)) {
       return MetaFailStopError("grant term/version inconsistent with entry");
+    }
+    if (entry.grant_.has_value() &&
+        (entry.grant_->grant_revision_ == 0 ||
+         entry.grant_->grant_revision_ != entry.last_grant_revision_)) {
+      return MetaFailStopError("grant revision inconsistent with entry");
+    }
+    if (entry.grant_.has_value() &&
+        !LeaseDurationIsWireRepresentable(
+            entry.grant_->spec_.lease_duration_ms_)) {
+      return MetaFailStopError(
+          "grant lease duration is not control-wire representable");
     }
     if (!store.groups_.emplace(std::string(*group_id), std::move(entry))
              .second) {

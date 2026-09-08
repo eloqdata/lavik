@@ -561,7 +561,9 @@ int main(int argc, char** argv) {
         RespClient client = Connect(port);
         constexpr unsigned kExpiringKeys = 7;
         for (unsigned i = 0; i < kExpiringKeys; ++i) {
-          const std::string key = "full-expiring-" + std::to_string(i);
+          // Keep the keys in one low-numbered partition so the assertion
+          // measures retirement and reclaim, not a complete partition sweep.
+          const std::string key = "{expiry-387}" + std::to_string(i);
           Expect(client.Command({"SET", key, value, "PX", "5000"}), "+OK",
                  "full-device expiring SET");
         }
@@ -608,7 +610,7 @@ int main(int argc, char** argv) {
         std::vector<std::string> expiring_names;
         expiring_names.reserve(kExpiringKeys);
         for (unsigned i = 0; i < kExpiringKeys; ++i) {
-          expiring_names.push_back("full-expiring-" + std::to_string(i));
+          expiring_names.push_back("{expiry-387}" + std::to_string(i));
         }
         for (const std::string& key : expiring_names) exists.push_back(key);
         Expect(client.Command(exists), ":0", "full-device expired EXISTS");
@@ -617,7 +619,7 @@ int main(int argc, char** argv) {
       {
         ServerProcess server(argv[1], port, {expiry_full_path}, log_path);
         RespClient client = Connect(port);
-        Expect(client.Command({"EXISTS", "full-expiring-0"}), ":0",
+        Expect(client.Command({"EXISTS", "{expiry-387}0"}), ":0",
                "full-device expired key after restart");
         Expect(client.Command({"EXISTS", "after-full-expiry"}), ":1",
                "full-device recovered write after restart");

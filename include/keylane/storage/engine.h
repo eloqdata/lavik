@@ -996,6 +996,11 @@ class StorageEngine {
   // mutation can no longer be reconciled with its replication history.
   // Recovery is the only authority that may choose the valid durable state.
   void FenceRequestServingUntilRestart() noexcept;
+  // True after storage IO, fixed metadata, or durable-state/replication
+  // divergence has made further mutation unsafe. The latch is process-wide
+  // and irreversible; the server uses it to drive the cluster storage-loss
+  // barrier while the immediate request fence is already closed.
+  bool RuntimeFailureLatched() const noexcept;
 
   unsigned OwnerForKey(std::string_view key) const noexcept;
   unsigned worker_count() const noexcept;

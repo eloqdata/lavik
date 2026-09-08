@@ -952,6 +952,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       std::make_unique<CoroutineBarrier>(worker_count);
   shutdown_checkpoint_tx_cleaned_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
+  shutdown_checkpoint_refrozen_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
   shutdown_checkpoint_built_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
   shutdown_checkpoint_published_barrier_ =
@@ -1365,9 +1367,11 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
 
   // Winner selection must see expired values so a newer expired version
   // still suppresses every older version. Keep every expired winner charged
-  // until recovery can publish a durable tombstone: dropping an unshielded
-  // winner only in memory is also unsafe if a later boot observes a clock
-  // rollback.
+  // until an expiration authority can publish a durable tombstone: dropping
+  // an unshielded winner only in memory is also unsafe if a later boot
+  // observes a clock rollback. Without authority recovery leaves the winner
+  // indexed (ordinary reads still hide it), so a later authority grant can
+  // let active expiration retire it safely.
   struct RecoveryExpiredTombstone {
     std::uint8_t db_id_ = 0;
     Digest digest_{};
@@ -1391,45 +1395,48 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           recovery_now_ms = overridden;
         }
       });
-  for (auto& partition : store.partitions_) {
-    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      // Recovery rebuilds this count alongside every winning index entry.
-      // A zero count proves that no value in this index carries an expiry, so
-      // scanning all buckets cannot discover work. This matters especially
-      // for large persistent datasets without TTLs, while preserving the
-      // durable-tombstone treatment below for every index that can expire.
-      if (partition.expiring_key_count_[db_id] == 0) continue;
-      auto& index = partition.indexes_[db_id];
-      index.ForEach([&](RecordIndex::Entry& entry) {
-        if (entry.value_.kind() == RecordKind::kValue &&
-            IsExpired(entry, recovery_now_ms)) {
-          std::string key;
-          Digest digest;
-          if (entry.key_complete()) {
-            key = std::string(entry.key());
-            digest = ComputeDigest(key);
-          } else {
-            const auto recovered_key =
-                store.recovery_external_keys_.find(&entry);
-            if (recovered_key == store.recovery_external_keys_.end()) {
-              status = absl::InternalError(
-                  "expired recovered winner has no complete key");
-              return;
+  if (expiration_authority_.load(std::memory_order_acquire)) {
+    for (auto& partition : store.partitions_) {
+      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+        // Recovery rebuilds this count alongside every winning index entry.
+        // A zero count proves that no value in this index carries an expiry,
+        // so scanning all buckets cannot discover work. This matters
+        // especially for large persistent datasets without TTLs, while
+        // preserving the durable-tombstone treatment below for every index
+        // that can expire.
+        if (partition.expiring_key_count_[db_id] == 0) continue;
+        auto& index = partition.indexes_[db_id];
+        index.ForEach([&](RecordIndex::Entry& entry) {
+          if (entry.value_.kind() == RecordKind::kValue &&
+              IsExpired(entry, recovery_now_ms)) {
+            std::string key;
+            Digest digest;
+            if (entry.key_complete()) {
+              key = std::string(entry.key());
+              digest = ComputeDigest(key);
+            } else {
+              const auto recovered_key =
+                  store.recovery_external_keys_.find(&entry);
+              if (recovered_key == store.recovery_external_keys_.end()) {
+                status = absl::InternalError(
+                    "expired recovered winner has no complete key");
+                return;
+              }
+              key = recovered_key->second;
+              digest = entry.external_key_digest();
             }
-            key = recovered_key->second;
-            digest = entry.external_key_digest();
+            expired_tombstones.push_back(RecoveryExpiredTombstone{
+                .db_id_ = db_id,
+                .digest_ = digest,
+                .key_ = std::move(key),
+                .shielding_ = entry.value_.shielding(),
+            });
           }
-          expired_tombstones.push_back(RecoveryExpiredTombstone{
-              .db_id_ = db_id,
-              .digest_ = digest,
-              .key_ = std::move(key),
-              .shielding_ = entry.value_.shielding(),
-          });
+        });
+        if (!status.ok()) {
+          Fail(status);
+          co_return status;
         }
-      });
-      if (!status.ok()) {
-        Fail(status);
-        co_return status;
       }
     }
   }
@@ -1814,7 +1821,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       if (value_extents != nullptr) SpawnExtentReclaim(store, value_extents);
       absl::Status dead = co_await MarkRecordDead(*retired);
       if (!dead.ok()) {
-        store.write_failed_ = true;
+        LatchRuntimeFailure(store);
         Fail(dead);
         co_return dead;
       }
@@ -1867,6 +1874,10 @@ bool StorageEngine::Impl::AbandonWorkerStateForProcessExit() noexcept {
 }
 
 absl::Status StorageEngine::Impl::FlushForShutdown() {
+  if (RuntimeFailureLatched()) {
+    return absl::FailedPreconditionError(
+        "runtime storage failure forbids a clean-shutdown checkpoint");
+  }
   // Give in-flight commit chains a chance to append their commit records
   // before the flush order freezes the append streams: an acknowledged
   // multi-key write whose commit misses the shutdown flush is dropped whole
@@ -1894,6 +1905,10 @@ absl::Status StorageEngine::Impl::FlushForShutdown() {
     return absl::Status(absl::StatusCode::kInternal,
                         "one or more workers failed to flush during shutdown");
   }
+  if (RuntimeFailureLatched()) {
+    return absl::FailedPreconditionError(
+        "runtime storage failure raced the shutdown flush");
+  }
   return absl::OkStatus();
 }
 
@@ -1914,6 +1929,7 @@ void StorageEngine::Impl::Fail(const absl::Status& status) {
   orphan_extent_barrier_->Abort(status);
   shutdown_checkpoint_ready_barrier_->Abort(status);
   shutdown_checkpoint_tx_cleaned_barrier_->Abort(status);
+  shutdown_checkpoint_refrozen_barrier_->Abort(status);
   shutdown_checkpoint_built_barrier_->Abort(status);
   shutdown_checkpoint_published_barrier_->Abort(status);
 }
@@ -2116,6 +2132,17 @@ absl::Status StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
 
 Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
     WorkerStore* store) {
+  // shutdown_flush_requested_ prevents a new cycle from beginning, but one
+  // cycle may already have crossed that check and be suspended in a delete.
+  // Join it locally before freezing append streams; doing this through the
+  // global QuiesceExpiration helper would make workers submit to and wait on
+  // themselves while every periodic flush owns the same shutdown barrier.
+  while (store->expiry_cycle_running_) {
+    absl::Status status =
+        co_await celer::SleepFor(*store->worker_, std::chrono::milliseconds(1));
+    if (!status.ok()) co_return status;
+  }
+
   while (active_defrags_.load(std::memory_order_acquire) != 0) {
     absl::Status status =
         co_await celer::SleepFor(*store->worker_, std::chrono::milliseconds(1));
@@ -2182,7 +2209,7 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
       done = !store->flush_running_ && store->flush_queue_.empty() &&
              active_extent_reclaims_.load(std::memory_order_acquire) == 0 &&
              active_settlements_.load(std::memory_order_acquire) == 0;
-      failed = store->write_failed_;
+      failed = store->write_failed_ || RuntimeFailureLatched();
     }
     if (failed) {
       co_return absl::Status(

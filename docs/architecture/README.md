@@ -16,8 +16,8 @@ references rather than current architecture.
 | Transaction coordination | Per-worker intent arbitration, cross-worker scheduling, multi-hop execution, WATCH, and transaction completion | [Transaction coordination](03-transaction-coordination.md) |
 | Storage and recovery | Logical indexes, append/read paths, durable format, devices, recovery, shutdown checkpoints, flushing, expiry, and reclamation | [Storage and recovery](04-storage-and-recovery.md), [Grouped collections](09-grouped-collections.md), [Shutdown index checkpoints](06-shutdown-index-checkpoints.md) |
 | Replication | Native Keylane replication, Redis PSYNC interoperability, destructive full sync, online logs, Sentinel role changes, replay, and the fail-closed single-group cluster boundary | [Replication](05-replication.md) |
-| Cluster data plane | Slot-ownership routing, authority admission and fencing, and Redis Cluster discovery and redirect compatibility | [Cluster data plane](06-cluster-data-plane.md) |
-| Meta control plane | NuRaft-backed committed metadata, leader-local observations and coordination, authenticated administration, membership identity, and WAL/snapshot recovery; linked only into `keylane-meta` | [Meta control plane](08-meta-control-plane.md) |
+| Cluster data plane | Slot routing, finite authority admission, node-local control installation, Meta discovery/session handling, and Redis Cluster compatibility | [Cluster data plane](06-cluster-data-plane.md) |
+| Meta control plane | NuRaft-backed committed metadata, projection and Data-session publishing, leader-local observations, authenticated administration, membership identity, and WAL/snapshot recovery | [Meta control plane](08-meta-control-plane.md) |
 
 Metrics, memory accounting, logging, configuration, and the Celer runtime cross
 several subsystems and are summarized in the system overview rather than
@@ -77,6 +77,6 @@ architecture update.
 | Storage exposes a durable engine boundary with focused implementation units | `include/keylane/storage/`, `src/storage/` |
 | Shutdown checkpoints are optional one-shot recovery accelerators published through fixed metadata | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/recovery.cpp` |
 | Replication has manager, boot-scoped single-group coordination, a callable cluster-rebuild adapter behind fail-closed admission, Sentinel-compatible configuration, and storage-log integration boundaries | `include/keylane/replication.h`, `include/keylane/replication_group.h`, `src/config.cpp`, `src/replication/`, `src/storage/engine/replication_log.cpp`, `tests/replication_group_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/rebuild_protocol_integration_test.cpp` |
-| Cluster data plane has topology, authority, control-port, and Redis gate boundaries | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_command.cpp`, `src/redis/command.cpp` |
-| Meta control plane separates deterministic committed state, volatile observations, leader-only proposal coordination, authenticated administration, and NuRaft integration | `include/keylane/meta/`, `src/meta/`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp` |
+| Cluster data plane has topology, authority, node-controller, static-control, Meta-client/session, and Redis gate boundaries | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_command.cpp`, `src/redis/command.cpp`, `src/redis/server.cpp` |
+| Meta control plane separates deterministic committed state, pure node projection, volatile observations, leader-scoped Data publishing, authenticated administration, and NuRaft integration | `include/keylane/meta/`, `src/meta/`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp` |
 | Celer is a pinned runtime submodule | `.gitmodules`, `CMakeLists.txt`, `celer/include/celer/`, `celer/src/` |

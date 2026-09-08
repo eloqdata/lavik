@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -10,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "../src/redis/cluster_gate.h"
 #include "absl/strings/str_cat.h"
 #include "keylane/cluster/runtime.h"
 #include "keylane/cluster/topology.h"
@@ -472,6 +475,91 @@ TEST(ClusterCommandTest, NodesIsEmptyWithoutState) {
   ClusterRuntimeGuard guard(MakeRuntime(nullptr));
   EXPECT_EQ(RunClusterCommand(MakeRequest({"CLUSTER", "NODES"})),
             keylane::EncodeBulkString(""));
+}
+
+TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
+  const std::shared_ptr<const cluster::ServingState> state =
+      BuildThreeNodeState(false);
+  ASSERT_NE(state, nullptr);
+
+  auto runtime = std::make_unique<cluster::ClusterRuntime>(
+      cluster::AuthorityGuard::LeaseMode::kFinite);
+  ASSERT_TRUE(runtime->node_control_installer_.SetStorageReady(true).ok());
+  cluster::Sha256Digest projection_hash{};
+  projection_hash.fill(0x11);
+  cluster::Sha256Digest object_hash{};
+  object_hash.fill(0x22);
+  const cluster::ProjectionBasis projection{
+      .source_meta_applied_index_ = 7,
+      .projection_hash_ = projection_hash,
+  };
+  ASSERT_TRUE(runtime->node_control_installer_
+                  .InstallFullState(
+                      cluster::PreparedFullState{
+                          .serving_state_ = state,
+                          .object_hash_ = object_hash,
+                          .control_groups_ = {},
+                      },
+                      projection)
+                  .ok());
+  const std::shared_ptr<const cluster::ServingState> installed =
+      runtime->topology_cache_.Current();
+  ASSERT_NE(installed, nullptr);
+  const cluster::GroupView* group = installed->FindGroup("group-a");
+  ASSERT_NE(group, nullptr);
+
+  std::array<std::uint8_t, cluster::SessionId::kByteSize> session_bytes{};
+  session_bytes.back() = 1;
+  const cluster::SessionIdentity session{
+      .session_id_ = cluster::SessionId::FromBytes(session_bytes),
+      .generation_ = 1,
+      .data_boot_id_ = ParseNodeId(kNodeR),
+  };
+  const cluster::AuthorityAnchor anchor{
+      .group_id_ = group->group_id_,
+      .assignment_id_ = group->assignment_id_,
+      .group_term_ = group->group_term_,
+      .authority_version_ = group->authority_version_,
+      .grant_revision_ = group->grant_revision_,
+  };
+  const auto now = std::chrono::steady_clock::now();
+  ASSERT_TRUE(runtime->node_control_installer_
+                  .ApplyAuthority({
+                      .kind_ = cluster::AuthorityMessage::Kind::kLeaseGrant,
+                      .session_ = session,
+                      .projection_ = projection,
+                      .anchor_ = anchor,
+                      .sent_at_ = now,
+                      .granted_duration_ = std::chrono::hours(1),
+                  })
+                  .ok());
+
+  keylane::CommandRequest request;
+  request.AddClusterSlot(42);
+  const cluster::RequestView view{
+      .slots_ = request.ClusterSlots(),
+      .is_write_ = true,
+  };
+  request.cluster_authority_admission_ =
+      std::make_shared<const cluster::AuthorityAdmission>(
+          runtime->authority_guard_.CaptureAndAdmit(view, now));
+  ASSERT_EQ(request.cluster_authority_admission_->decision().kind_,
+            cluster::Decision::Kind::kServe);
+
+  ClusterRuntimeGuard runtime_guard(std::move(runtime));
+  EXPECT_TRUE(keylane::RecheckClusterRequestAuthority(request).ok());
+  ASSERT_TRUE(
+      cluster::GetClusterRuntime()
+          ->node_control_installer_.LoseSession(session, "test disconnect")
+          .ok());
+  EXPECT_TRUE(keylane::IsClusterAuthorityChanged(
+      keylane::RecheckClusterRequestAuthority(request)));
+
+  keylane::ReplyBuilder reply_builder(keylane::RespVersion::k2);
+  const keylane::CommandReply reply = keylane::ClusterAuthorityChangedReply(
+      request.ClusterSlots(), /*connection_tls=*/false, reply_builder);
+  EXPECT_FALSE(reply.close_connection_);
+  EXPECT_EQ(reply.encoded_, "-CLUSTERDOWN Hash slot not served\r\n");
 }
 
 }  // namespace

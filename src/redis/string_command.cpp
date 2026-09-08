@@ -1480,6 +1480,9 @@ celer::Task<std::string> ExecuteBitOpLocked(
     }
     return nullptr;
   };
+  // Keep same-worker and cross-worker suspensions in separate statements.
+  // GCC 13 can reuse the wrong coroutine-frame slot for co_await in both ?:
+  // arms.
   for (std::size_t argument = 3; argument < request.args_.size(); ++argument) {
     const StringExecKey* key = find_key(argument);
     if (key == nullptr)
@@ -1488,9 +1491,13 @@ celer::Task<std::string> ExecuteBitOpLocked(
       return ReadOptionalStringLocked(request.db_id_, request.args_[argument],
                                       key->digest_);
     };
-    auto value = key->owner_ == celer::ThisWorker().id_
-                     ? co_await read()
-                     : co_await celer::SubmitTaskTo(key->owner_, read);
+    absl::StatusOr<std::optional<storage::RawValue>> value{
+        absl::UnknownError("BITOP source read was not dispatched")};
+    if (key->owner_ == celer::ThisWorker().id_) {
+      value = co_await read();
+    } else {
+      value = co_await celer::SubmitTaskTo(key->owner_, read);
+    }
     if (!value.ok()) co_return StorageError(value.status());
     context.inputs_[argument] =
         value->has_value() ? std::move((**value).encoded_) : std::string{};
@@ -1503,10 +1510,12 @@ celer::Task<std::string> ExecuteBitOpLocked(
     return WriteBitOpDestination(&context, destination->digest_,
                                  &tx_writes[destination->owner_]);
   };
-  absl::Status status =
-      destination->owner_ == celer::ThisWorker().id_
-          ? co_await write()
-          : co_await celer::SubmitTaskTo(destination->owner_, write);
+  absl::Status status;
+  if (destination->owner_ == celer::ThisWorker().id_) {
+    status = co_await write();
+  } else {
+    status = co_await celer::SubmitTaskTo(destination->owner_, write);
+  }
   if (!status.ok()) co_return StorageError(status);
   CaptureReplicationCommand(
       request,
@@ -1552,6 +1561,8 @@ celer::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
 celer::Task<std::string> ExecuteLcsLocked(
     const CommandRequest& request, std::span<const StringExecKey> locked_keys) {
   std::string values[2];
+  // Preserve the GCC 13 coroutine-frame invariant from BITOP: each possible
+  // suspension remains in its own statement instead of a ?: expression.
   for (std::size_t argument = 1; argument <= 2; ++argument) {
     const StringExecKey* key = nullptr;
     for (const StringExecKey& candidate : locked_keys) {
@@ -1565,9 +1576,13 @@ celer::Task<std::string> ExecuteLcsLocked(
       return ReadOptionalStringLocked(request.db_id_, request.args_[argument],
                                       key->digest_);
     };
-    auto value = key->owner_ == celer::ThisWorker().id_
-                     ? co_await read()
-                     : co_await celer::SubmitTaskTo(key->owner_, read);
+    absl::StatusOr<std::optional<storage::RawValue>> value{
+        absl::UnknownError("LCS source read was not dispatched")};
+    if (key->owner_ == celer::ThisWorker().id_) {
+      value = co_await read();
+    } else {
+      value = co_await celer::SubmitTaskTo(key->owner_, read);
+    }
     if (!value.ok()) {
       if (value.status().message().starts_with("WRONGTYPE ")) {
         co_return EncodeError(

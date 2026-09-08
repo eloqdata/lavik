@@ -32,7 +32,7 @@
 //     the command cannot move, or are skipped once the effect is in place).
 //
 // Cross-store invariants enforced HERE (the stores expose fact queries; this
-// layer is the only place that sees all six stores):
+// layer is the only place that sees all seven stores):
 //   1. principal vs grant: the target node of AssignNodeToGroup,
 //      GrantAuthority, and ActivateAuthority must be a registered, non-retired
 //      node (identity store).
@@ -60,10 +60,25 @@
 //      in the stores; RetireNode is additionally rejected while the node
 //      still holds group membership (which, by the invariant in (4), also
 //      covers an active grant).
+//   7. TransitionOperationPhase is applied to a candidate operation store and
+//      the exact FullDesiredState for every old/new directive recipient is
+//      projected and encoded before commit. This aggregate check prevents
+//      individually valid operations from making a node's projection exceed
+//      protocol count, field, or total-object limits; rejection leaves the
+//      operation store unchanged.
+//   8. Live directives remain valid after later committed mutations. After
+//      every accepted command, apply rechecks their exact source/target
+//      assignments, active term/authority/grant revision, and population
+//      identity, removes stale attempts, and bumps each affected operation's
+//      CAS revision once. CommitDirectiveResult repeats the same check before
+//      first commit; snapshot recovery and projection reject any stale entry
+//      that bypassed this invariant.
 //
 // MetaStores is the committed aggregate that snapshots serialize as one
 // versioned envelope: per-store length-prefixed versioned blobs in a fixed
-// order. Deserialize is strict; every failure is
+// order. Deserialize is strict and revalidates the cross-store group set,
+// authority anchors, active identities/policies, and retained manifest
+// documents before exposing any decoded store; every failure is
 // MetaFailureClass::kFailStop — the same bytes fail
 // identically on every node.
 
@@ -78,11 +93,12 @@
 #include "keylane/meta/identity_store.h"
 #include "keylane/meta/operation_store.h"
 #include "keylane/meta/policy_store.h"
+#include "keylane/meta/population_manifest_store.h"
 #include "keylane/meta/topology_store.h"
 
 namespace keylane::meta {
 
-// The six committed stores. Store constructor knobs (audit window capacity,
+// The seven committed stores. Store constructor knobs (audit window capacity,
 // group/operation caps) are deployment constants: snapshots do not carry
 // them and Deserialize restores defaults.
 struct MetaStores {
@@ -91,6 +107,7 @@ struct MetaStores {
   MetaPolicyStore policy_;
   MetaGrantStore grant_;
   MetaOperationStore operation_;
+  MetaPopulationManifestStore population_manifest_;
   MetaAuditStore audit_;
 
   // One versioned envelope for snapshots: u16 schema_version, then a u32
@@ -102,6 +119,15 @@ struct MetaStores {
   // Strict decode of the Serialize envelope; every failure is fail-stop.
   static absl::StatusOr<MetaStores> Deserialize(std::string_view bytes);
 };
+
+// Validates one durable directive against the exact currently committed
+// source/target memberships, active authority, and population identity. Boot
+// incarnations are intentionally absent: they are session/observation facts,
+// not Meta durable state. Transition apply, result commit, snapshot recovery,
+// and wire projection share this predicate so none can accept or expose a
+// directive after its authority anchor has gone stale.
+absl::Status ValidateCommittedDirectiveAnchor(
+    const MetaStores& stores, const MetaDirectiveSpec& directive);
 
 // The outcome of applying one committed command. verdict_ reuses the audit
 // schema's enum so the apply result and the persisted audit verdict can never

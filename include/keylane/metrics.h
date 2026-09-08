@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -60,6 +61,33 @@ struct WorkerMetricsSnapshot {
 
   std::uint64_t TotalCalls() const noexcept;
 };
+
+// Process-level Meta control-session metrics. The client is owned by worker 0,
+// while the HTTP renderer may run on any worker, so these values use atomics
+// instead of per-worker shards. Deliberately no node, session, assignment, or
+// group labels are exposed: those identities are high-cardinality and belong
+// in structured logs rather than Prometheus series.
+struct ClusterControlMetricsSnapshot {
+  std::uint64_t connected_ = 0;
+  std::uint64_t reconnects_ = 0;
+  std::uint64_t protocol_errors_ = 0;
+  std::uint64_t full_states_applied_ = 0;
+  std::uint64_t lease_grants_ = 0;
+  std::uint64_t lease_denials_ = 0;
+  std::uint64_t lease_expirations_ = 0;
+  std::uint64_t directive_successes_ = 0;
+  std::uint64_t directive_failures_ = 0;
+};
+
+void SetClusterControlConnected(bool connected) noexcept;
+void RecordClusterControlReconnect() noexcept;
+void RecordClusterControlProtocolError() noexcept;
+void RecordClusterControlFullStateApplied() noexcept;
+void RecordClusterControlLeaseGrant() noexcept;
+void RecordClusterControlLeaseDenial() noexcept;
+void RecordClusterControlLeaseExpiration() noexcept;
+void RecordClusterControlDirectiveResult(bool succeeded) noexcept;
+ClusterControlMetricsSnapshot GetClusterControlMetrics() noexcept;
 
 void InitWorkerMetrics(unsigned worker_count);
 void RecordCommandMetric(CommandKind kind,

@@ -8,7 +8,8 @@
 // the fenced flag. INVARIANT: fenced_ == (no grant). A group is created
 // fenced and grantless; BeginGroupTerm(T) is the only term-advancing command
 // and re-enters the fenced/grantless state; ActivateAuthority installs a grant
-// under the CURRENT term (it deliberately carries no new term) and unfences;
+// under the CURRENT nonzero term (it deliberately carries no new term) and
+// unfences;
 // RevokeGrant/FenceGroup drop the grant and fence.
 //
 // authority_version strictly increases per group across activations and
@@ -67,6 +68,9 @@ struct MetaGroupGrant {
   std::string owner_;  // node_id
   std::uint64_t term_ = 0;
   std::uint64_t authority_version_ = 0;
+  // Raft apply index of the activation or last committed spec change.
+  // Heartbeat lease renewal is ephemeral and never changes this value.
+  std::uint64_t grant_revision_ = 0;
   MetaGrantSpec spec_;  // lease parameters + committed policy reference
   bool operator==(const MetaGroupGrant&) const = default;
 };
@@ -76,6 +80,9 @@ struct MetaGroupGrantState {
   std::uint64_t group_term_ = 0;
   // Survives revocation; strictly increases on each ActivateAuthority.
   std::uint64_t last_authority_version_ = 0;
+  // Retained while fenced so any later activation must advance beyond the
+  // rejected authority anchor.
+  std::uint64_t last_grant_revision_ = 0;
   std::optional<MetaGroupGrant> grant_;  // absent == fenced (invariant)
   bool fenced_ = true;
   bool operator==(const MetaGroupGrantState&) const = default;
@@ -94,13 +101,16 @@ class MetaGrantStore {
   absl::Status RemoveGroup(std::string_view group_id);
 
   absl::Status BeginGroupTerm(const BeginGroupTerm& command);
-  absl::Status GrantAuthority(const GrantAuthority& command);
+  absl::Status GrantAuthority(const GrantAuthority& command,
+                              std::uint64_t committed_index);
   // Pure validation of ActivateAuthority; every rejection lives here.
-  absl::Status ValidateActivate(const ActivateAuthority& command) const;
+  absl::Status ValidateActivate(const ActivateAuthority& command,
+                                std::uint64_t committed_index) const;
   // Installs the grant part of ActivateAuthority. Caller must have run
   // ValidateActivate successfully for the same command against the current
   // state; a term mismatch here is an apply-layer bug and fails stop.
-  absl::Status ApplyGrantPart(const ActivateAuthority& command);
+  absl::Status ApplyGrantPart(const ActivateAuthority& command,
+                              std::uint64_t committed_index);
   absl::Status RevokeGrant(const RevokeGrant& command);
   absl::Status FenceGroup(const FenceGroup& command);
 
@@ -122,14 +132,15 @@ class MetaGrantStore {
   struct Entry {
     std::uint64_t group_term_ = 0;
     std::uint64_t last_authority_version_ = 0;
+    std::uint64_t last_grant_revision_ = 0;
     std::optional<MetaGroupGrant> grant_;
     bool fenced_ = true;
   };
 
   // The already-applied check of ActivateAuthority: the installed grant is
   // exactly what the command asks for.
-  static bool GrantMatches(const Entry& entry,
-                           const ActivateAuthority& command);
+  static bool GrantMatches(const Entry& entry, const ActivateAuthority& command,
+                           std::uint64_t committed_index);
 
   std::uint32_t max_groups_;
   std::map<std::string, Entry> groups_;

@@ -1140,7 +1140,7 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
                            .controller_id_ = device->controller_id_,
                            .io_queue_count_ = device->io_queue_count_};
   }
-  struct stat file_info{};
+  struct stat file_info {};
   if (::stat(path.c_str(), &file_info) != 0) {
     return absl::Status(
         absl::StatusCode::kInternal,
@@ -2515,7 +2515,22 @@ class StorageEngine::Impl {
                                                 std::memory_order_release);
     replica_recovery_fenced_.store(true, std::memory_order_release);
     replica_loading_.store(true, std::memory_order_release);
+    // Publish the monitor notification last. Its acquire load then proves the
+    // immediate request/replication fence was already visible before worker
+    // zero begins the asynchronous NodeControl barrier.
+    runtime_failure_latched_.store(true, std::memory_order_release);
   }
+  bool RuntimeFailureLatched() const noexcept {
+    return runtime_failure_latched_.load(std::memory_order_acquire);
+  }
+  // Worker-local write_failed_ preserves existing shutdown/drain diagnostics;
+  // the process-wide latch closes every request path and lets worker zero join
+  // NodeControl cleanup. Both are irreversible for this process.
+  void LatchRuntimeFailure(WorkerStore& store) noexcept {
+    store.write_failed_ = true;
+    LatchRuntimeFailure();
+  }
+  void LatchRuntimeFailure() noexcept { FenceRequestServingUntilRestart(); }
 
  private:
   struct DurableSystemState {
@@ -3550,6 +3565,7 @@ class StorageEngine::Impl {
   std::atomic<bool> shutdown_checkpoint_published_{false};
   std::atomic<bool> abandon_worker_state_on_finalize_{false};
   std::atomic<bool> epoch_metadata_failed_{false};
+  std::atomic<bool> runtime_failure_latched_{false};
   // Cold branch on every logical write. It is set only while this node is
   // destructively rebuilding its single data root; foreground commands are
   // rejected above the engine, while tail commands stamp the pending epochs.
@@ -3624,6 +3640,7 @@ class StorageEngine::Impl {
   std::unique_ptr<CoroutineBarrier> orphan_extent_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_tx_cleaned_barrier_;
+  std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_refrozen_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_built_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_published_barrier_;
   std::atomic<std::uint64_t> recovery_scanned_blocks_{0};

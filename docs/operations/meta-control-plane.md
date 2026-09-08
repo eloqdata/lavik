@@ -13,6 +13,9 @@ A cluster normally has three `keylane-meta` processes. Every process needs:
 - A positive, cluster-unique `--id` that never changes for that member.
 - A numeric IPv4 or IPv6 `--addr` used both as its Raft listener and advertised
   endpoint. For IPv6, use the form accepted by `keylane-meta --help`.
+- A distinct numeric `--data-control-addr` for the process-lifetime listener
+  used by Data nodes. This endpoint is committed with membership and returned
+  by every Meta seed; it must remain stable across restart.
 - A private `--data-dir`. Never share a directory between members or reuse it
   with another id.
 - A local administrative Unix socket, defaulting to
@@ -56,6 +59,7 @@ TLS arguments:
 
 ```sh
 keylane-meta --id 1 --addr 10.0.0.11:7100 \
+  --data-control-addr 10.0.0.11:7300 \
   --data-dir /var/lib/keylane/meta-1 --bootstrap \
   --ctl-addr 10.0.0.11:7200
 
@@ -82,14 +86,17 @@ install -d -m 0700 "$META_ROOT" \
   "$META_ROOT/node1" "$META_ROOT/node2" "$META_ROOT/node3"
 
 "$META_BIN" --id 1 --addr 127.0.0.1:7101 \
+  --data-control-addr 127.0.0.1:7301 \
   --data-dir "$META_ROOT/node1" --bootstrap \
   >"$META_ROOT/node1.log" 2>&1 &
 
 "$META_BIN" --id 2 --addr 127.0.0.1:7102 \
+  --data-control-addr 127.0.0.1:7302 \
   --data-dir "$META_ROOT/node2" \
   >"$META_ROOT/node2.log" 2>&1 &
 
 "$META_BIN" --id 3 --addr 127.0.0.1:7103 \
+  --data-control-addr 127.0.0.1:7303 \
   --data-dir "$META_ROOT/node3" \
   >"$META_ROOT/node3.log" 2>&1 &
 ```
@@ -99,12 +106,12 @@ Wait until node 1 reports `leader=1`, then add one waiting member at a time:
 ```sh
 keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" status
 keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
-  addsrv 2 127.0.0.1:7102
+  addsrv 2 127.0.0.1:7102 127.0.0.1:7302
 
 keylane-meta-ctl --socket "$META_ROOT/node2/meta-admin.sock" status
 
 keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
-  addsrv 3 127.0.0.1:7103
+  addsrv 3 127.0.0.1:7103 127.0.0.1:7303
 
 keylane-meta-ctl --socket "$META_ROOT/node3/meta-admin.sock" status
 ```
@@ -125,10 +132,10 @@ routing are already trusted.
 
 mTLS uses one CA trusted by the whole Meta cluster and a distinct certificate
 and private key for every member. Member `N` must have exactly one recognized
-Keylane URI SAN, `keylane://meta/N`, plus an IP or DNS SAN matching the endpoint
-given to its peers. The certificate must be usable for both TLS server and TLS
-client authentication. Never copy one member's certificate or key to another
-member.
+Keylane URI SAN, `keylane://meta/N`, plus IP or DNS SANs covering both its Raft
+and Data-control advertised hosts (one SAN suffices when they share a host).
+The certificate must be usable for both TLS server and TLS client
+authentication. Never copy one member's certificate or key to another member.
 
 Use an organization-managed CA in production. The following OpenSSL commands
 show the required certificate shape for a disposable development cluster:
@@ -173,6 +180,7 @@ and the shared CA, for example member 1:
 ```sh
 keylane-meta \
   --id 1 --addr 10.0.0.11:7100 --data-dir /var/lib/keylane/meta-1 \
+  --data-control-addr 10.0.0.11:7300 \
   --bootstrap \
   --tls-ca /etc/keylane/meta/ca.crt \
   --tls-cert /etc/keylane/meta/meta-1.crt \
@@ -180,16 +188,85 @@ keylane-meta \
 ```
 
 Use the equivalent member-specific certificate and omit `--bootstrap` for
-members 2 and 3, then join them with the same `addsrv` procedure as the
-plaintext example. `--tls-ca`, `--tls-cert`, and `--tls-key` are all-or-nothing;
-partial TLS configuration fails startup. Start the joiner with mTLS before
-issuing `addsrv`, and ensure its URI SAN matches the id in that command.
+members 2 and 3, then join them with both their Raft and Data-control endpoints.
+The Data-control listener reuses the same CA, certificate, and key; there is no
+second Data-control TLS option set. `--tls-ca`, `--tls-cert`, and `--tls-key`
+are all-or-nothing; partial TLS configuration fails startup. Start the joiner
+with mTLS before issuing `addsrv`, and ensure its URI SAN matches the id in that
+command.
 
 Do not mix plaintext and mTLS members. Enabling or disabling Raft TLS on an
 existing cluster requires a coordinated restart of all members; it does not
 change the WAL or snapshot format. `--raft-io-threads` sizes NuRaft's native
 Asio pool (default 2); it does not change the single Celer control-session
 worker or make WAL synchronization asynchronous.
+
+## Configure Data nodes
+
+A Meta-managed Data process needs its committed 40-character lowercase hex
+node id and one or more numeric Data-control seeds. Static topology and Meta
+control are mutually exclusive. Before starting a new Data process, register
+that identity and its client endpoint on the Meta leader. The endpoint is
+tagged `tcp://` or `tls://`; a dual-listener node may supply one of each, using
+the same numeric host:
+
+```sh
+keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  registernode 0123456789abcdef0123456789abcdef01234567 \
+  keylane://node/0123456789abcdef0123456789abcdef01234567 \
+  primary tcp://10.0.1.11:6379
+```
+
+The role here is registered identity metadata, not a lease or current group
+ownership. Registration alone therefore lets the node authenticate and receive
+an empty-topology full state, but it remains fenced/LOADING until later
+committed topology, population, and grant state make it ready.
+
+After creating a group, add membership with `assignnode <group-id> <node-id>
+<primary|replica>`. The command deliberately has no assignment-id argument:
+the trusted Meta proposer generates a fresh nonzero 128-bit value from the OS
+CSPRNG for that membership incarnation. Repeating the same desired membership
+is idempotent; removing and later re-adding it generates another identity.
+
+For a plaintext development deployment, start the registered node with:
+
+```sh
+keylane --cluster-enabled \
+  --cluster-node-id 0123456789abcdef0123456789abcdef01234567 \
+  --cluster-meta-seed 10.0.0.11:7300 \
+  --cluster-meta-seed 10.0.0.12:7300 \
+  --cluster-meta-seed 10.0.0.13:7300 \
+  --data-file /var/lib/keylane/data-1/keylane.data
+```
+
+The client first tries its volatile accepted-leader hint, then the latest
+committed in-memory Meta directory, then these seeds. It does not persist that
+directory, a lease, a term floor, or desired state. Every restart creates a new
+boot identity and begins fenced/LOADING until a leader supplies and accepts a
+complete projection and finite authority.
+
+To enable mTLS, the Data client reuses the existing replication TLS settings;
+there are no separate Meta-control certificate flags. Its certificate must
+have exactly one Keylane URI SAN, `keylane://node/<node-id>`, an IP SAN for the
+Data endpoint, and both client/server usages. The URI must equal the active
+Meta identity binding for that node. For example:
+
+```sh
+keylane --cluster-enabled \
+  --cluster-node-id 0123456789abcdef0123456789abcdef01234567 \
+  --cluster-meta-seed 10.0.0.11:7300 \
+  --cluster-meta-seed 10.0.0.12:7300 \
+  --tls-port 6380 --tls-auth-clients yes --tls-replication \
+  --tls-ca-cert-file /etc/keylane/data/ca.crt \
+  --tls-cert-file /etc/keylane/data/node-01234567.crt \
+  --tls-key-file /etc/keylane/data/node-01234567.key \
+  --data-file /var/lib/keylane/data-1/keylane.data
+```
+
+All Data and Meta certificates used for this connection must chain to the
+configured trust roots. Partial TLS inputs fail startup; neither side falls
+back to plaintext. In plaintext mode, protect both Raft and Data-control ports
+with the same private-network assumptions as the replication path.
 
 Remote administration configures its server certificate independently with
 `--ctl-tls-ca`, `--ctl-tls-cert`, and `--ctl-tls-key`. It may reuse that Meta
@@ -236,10 +313,12 @@ keylane-meta-ctl --addr 10.0.0.11:7200 \
 Membership commands are accepted only by the current leader and only one
 change may be active at a time. To add a peer:
 
-1. Allocate a never-before-used positive id, private data directory, and Raft
-   endpoint. With mTLS, issue its matching certificate first.
+1. Allocate a never-before-used positive id, private data directory, Raft
+   endpoint, and distinct Data-control endpoint. With mTLS, issue its matching
+   certificate first.
 2. Start the new `keylane-meta` process without `--bootstrap`.
-3. On the current leader, run `addsrv <id> <endpoint>`. A third principal
+3. On the current leader, run
+   `addsrv <id> <raft-endpoint> <data-control-endpoint>`. A fourth principal
    argument is accepted but may only be the matching canonical
    `keylane://meta/<id>`; omitting it selects that value automatically.
 4. Poll the joiner's `status` and verify replicated progress before adding
@@ -249,7 +328,7 @@ For example:
 
 ```sh
 keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
-  addsrv 4 10.0.0.14:7100
+  addsrv 4 10.0.0.14:7100 10.0.0.14:7300
 ```
 
 The leader first commits and audits the member identity binding, then invokes
@@ -339,20 +418,69 @@ Strict-export is the fail-safe retention mode. Before selecting it, ensure the
 window has room for the policy-change record. Choose an index still in the
 window and request `exportaudit <through-index>`. Decode and verify the
 versioned hash-chain blob and its drop watermarks in the external archival
-system, store it durably, and deduplicate with cluster identity, Raft log
-index, and record hash. Only after that acknowledgement should an operator issue
-`pruneaudit <through-index>`. The prune is replicated and advances the chain
-anchor; there is no in-process record of the external acknowledgement. At a
-full window, overlapping prune attempts are rejected until the outstanding
+system, store it durably under an archive-defined deployment namespace, and
+deduplicate by Raft log index and record hash. Keylane does not persist a
+separate cluster identity. Only after that acknowledgement should an operator
+issue `pruneaudit <through-index>`. The prune is replicated and advances the
+chain anchor; there is no in-process record of the external acknowledgement.
+At a full window, overlapping prune attempts are rejected until the outstanding
 prune's Raft outcome resolves, including when its client has already timed out.
 
-Terminal operations may be moved into bounded archive summaries by the model's
-archive command. `exportoperations` returns all current summaries as a
-versioned hex blob. After durable external storage, `pruneoperations <seq>...`
-removes exactly the listed summaries through a replicated command. Pruning a
-summary ends the local late-retry tombstone window for that operation id, so
-retention must cover the clients' documented retry horizon.
+Terminal operations may be moved into bounded archive summaries with
+`archiveoperations <seq>...`. `exportoperations` returns all current summaries
+as a versioned hex blob. After durable external storage, `pruneoperations
+<seq>...` removes exactly the listed summaries through a replicated command.
+Pruning a summary ends the local late-retry tombstone window for that operation
+id, so retention must cover the clients' documented retry horizon.
 
 The current line protocol returns export bytes as hexadecimal on one line.
 Protect these responses as audit data and avoid terminal logging that could
 copy principals or operation results into an ungoverned sink.
+
+## Recover from the durability fail-safe
+
+Repeated snapshot failure or excessive uncompacted WAL puts the leader into a
+durability fail-safe. Ordinary proposals then return `ERR
+resource-exhausted`; Data nodes retain no local authority that can bypass this
+gate. Stop automated mutators, identify the current leader with `status`, and
+correct the underlying disk, permission, or size problem first.
+
+The gate accepts one effect-producing recovery proposal at a time. It rejects a
+stale or no-op command before Raft append, even when the command's verb is on
+the recovery allowlist. A client timeout does not release the reservation: the
+next recovery proposal remains rejected until NuRaft resolves the first one's
+actual outcome. Reconcile that outcome from the leader's committed view before
+moving to the next step.
+
+If strict-export audit retention is also full, export and durably acknowledge a
+large enough prefix first, then run `pruneaudit <through-index>`. The proposed
+prune must make the serialized audit window smaller after accounting for the
+prune command's own audit record.
+
+For retained live operations, use this bounded sequence. Keep the original
+operation id and sequence returned by `submitop`; `getop` does not return the
+sequence and is not a linearizable read on a follower.
+
+```sh
+keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  abortop 00000001000000000000000000000001
+keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  archiveoperations 12345
+keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  exportoperations
+# Verify and durably store the exported blob before removing its retry tombstone.
+keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  pruneoperations 12345
+```
+
+The empty `abortop` reason is intentional; `completeop <id>` with an empty
+result is the equivalent successful terminalization path. Nonempty result or
+reason payloads are rejected while the fail-safe is active. Each command above
+must change the named committed record: repeating an already-applied archive or
+prune does not consume another log or audit slot.
+
+After enough aggregate state has been removed, run `snapshot` and wait for
+`snapshot_idx` to advance. A successful snapshot compacts the WAL and clears
+the durability pressure on that member; if the guard remains active, continue
+with another known, effect-producing recovery item rather than sending dummy
+prunes.

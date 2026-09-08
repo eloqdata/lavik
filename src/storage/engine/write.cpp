@@ -747,17 +747,21 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
               state->allocation_epoch_ == fence.allocation_epoch_) {
             RequestFlush(owner, fence.block_id_);
           }
-          co_return owner.write_failed_
+          co_return owner.write_failed_ || RuntimeFailureLatched()
               ? absl::InternalError(
                     "storage write failed while starting "
                     "transaction batch flush")
               : absl::OkStatus();
         };
-        absl::Status requested =
-            fence.block_owner_ == celer::ThisWorker().id_
-                ? co_await request()
-                : co_await celer::SubmitTaskTo(fence.block_owner_,
-                                               std::move(request));
+        // Keep the two suspension paths as statements: GCC 13 can alias their
+        // coroutine-frame slots when both are operands of one conditional.
+        absl::Status requested;
+        if (fence.block_owner_ == celer::ThisWorker().id_) {
+          requested = co_await request();
+        } else {
+          requested = co_await celer::SubmitTaskTo(fence.block_owner_,
+                                                   std::move(request));
+        }
         if (!requested.ok()) {
           batch_status = std::move(requested);
           break;
@@ -829,7 +833,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
           store, MaterializeIndexLocation(*current), ExtentsFor(store, current),
           current->logical_key_size());
       if (!key.ok()) {
-        store.write_failed_ = true;
+        LatchRuntimeFailure(store);
         co_return key.status();
       }
       loaded_key = std::move(*key);
@@ -882,7 +886,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
             *entry.previous_, entry.previous_extents_, nullptr,
             entry.previous_grouped_);
         if (!loaded.ok()) {
-          store.write_failed_ = true;
+          LatchRuntimeFailure(store);
           co_return loaded.status();
         }
         restored.emplace(std::move(*loaded));
@@ -912,7 +916,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
           /*trace=*/nullptr,
           /*capture_fullsync=*/true, &undo);
       if (!appended.ok()) {
-        store.write_failed_ = true;
+        LatchRuntimeFailure(store);
         co_return appended;
       }
       continue;
@@ -936,7 +940,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
           /*replication=*/nullptr, /*trace=*/nullptr,
           /*capture_fullsync=*/false, &undo);
       if (!tombstone.ok()) {
-        store.write_failed_ = true;
+        LatchRuntimeFailure(store);
         co_return tombstone;
       }
       continue;
@@ -980,7 +984,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         ReplaceIndexLocation(store, partition.indexes_[entry.db_id_], current,
                              undo_digest, *entry.previous_, &undo);
     if (!restored.ok()) {
-      store.write_failed_ = true;
+      LatchRuntimeFailure(store);
       co_return restored.status();
     }
     current = *restored;
@@ -1015,7 +1019,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         store.worker_->id(),
         RetiredRecordOf(applied, applied_dependent_extents));
     if (!dead.ok()) {
-      store.write_failed_ = true;
+      LatchRuntimeFailure(store);
       co_return dead;
     }
     // Child epochs were captured before restoring/publishing either view.
@@ -1201,7 +1205,7 @@ Task<absl::Status> StorageEngine::Impl::MarkRetiredRecordsDead(
       // there is no client left to tell, so fail-stop the writer the same way
       // a flush IO error does.
       spdlog::error("retiring superseded record failed: {}", dead.message());
-      store->write_failed_ = true;
+      LatchRuntimeFailure(*store);
       co_return dead;
     }
   }
@@ -1263,7 +1267,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
   if (unlock_writer) {
     co_await store.store_state_mutex_.Lock();
   }
-  if (allocated.ok() && store.write_failed_) {
+  if (allocated.ok() && (store.write_failed_ || RuntimeFailureLatched())) {
     // The writer fail-stopped while the allocation waited; report that
     // instead of appending into a stream that will never flush.
     if (unlock_writer) {
@@ -1301,7 +1305,7 @@ void StorageEngine::Impl::EnsureStandbyBlock(WorkerStore& store) {
   if (!store.active_block_.has_value() || store.standby_block_.has_value() ||
       store.standby_prefetch_pending_ ||
       store.standby_prefetch_for_block_ == store.active_block_->block_id_ ||
-      store.write_failed_ ||
+      store.write_failed_ || RuntimeFailureLatched() ||
       shutdown_flush_requested_.load(std::memory_order_acquire)) {
     return;
   }
@@ -1331,7 +1335,7 @@ Task<absl::Status> StorageEngine::Impl::PrefetchStandbyBlock(
       !store->standby_block_.has_value() && store->active_block_.has_value() &&
       store->active_block_->block_id_ == source_block_id &&
       store->active_block_->allocation_epoch_ == source_epoch &&
-      !store->write_failed_ &&
+      !store->write_failed_ && !RuntimeFailureLatched() &&
       !shutdown_flush_requested_.load(std::memory_order_acquire);
   store->store_state_mutex_.Unlock(*store->worker_);
 
@@ -1374,7 +1378,7 @@ Task<absl::Status> StorageEngine::Impl::PrefetchStandbyBlock(
       !store->standby_block_.has_value() && store->active_block_.has_value() &&
       store->active_block_->block_id_ == source_block_id &&
       store->active_block_->allocation_epoch_ == source_epoch &&
-      !store->write_failed_ &&
+      !store->write_failed_ && !RuntimeFailureLatched() &&
       !shutdown_flush_requested_.load(std::memory_order_acquire);
   if (publish) {
     store->standby_block_ = *allocated;
@@ -1594,7 +1598,7 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
     }
     release_buffer();
     if (!write_status.ok()) {
-      store.write_failed_ = true;
+      LatchRuntimeFailure(store);
       reclaim_allocated();
       co_return write_status;
     }
@@ -1626,6 +1630,10 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     std::uint64_t* committed_sequence, ReplicationCommandAppend* replication,
     SetLatencyTrace* trace, bool capture_fullsync, TxUndoLog* replacement_undo,
     GroupMutationWrite* grouped) {
+  if (RuntimeFailureLatched()) {
+    co_return absl::FailedPreconditionError(
+        "storage writer is stopped after an IO failure");
+  }
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
   }
@@ -2179,7 +2187,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     SetLatencyTrace* trace, const ExplicitWriteRoot* explicit_root,
     TxUndoLog* replacement_undo, WorkerStore::PartitionStore* known_partition,
     const GroupRecordWrite* group) {
-  if (store.write_failed_ ||
+  if (store.write_failed_ || RuntimeFailureLatched() ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                            "storage writer is stopped after an IO failure");
@@ -2996,7 +3004,7 @@ acquire_active_stream:
       auto replaced = ReplaceIndexLocation(store, *index_ptr, previous_entry,
                                            digest, location, current_tx_undo);
       if (!replaced.ok()) {
-        store.write_failed_ = true;
+        LatchRuntimeFailure(store);
         co_return replaced.status();
       }
       inserted_entry = *replaced;
@@ -3004,7 +3012,7 @@ acquire_active_stream:
       inserted_entry =
           index_ptr->InsertNew(digest, key, location, !key_external);
       if (inserted_entry == nullptr) {
-        store.write_failed_ = true;
+        LatchRuntimeFailure(store);
         co_return absl::ResourceExhaustedError(
             "record index entry capacity exhausted");
       }
@@ -3204,7 +3212,7 @@ acquire_active_stream:
   if (for_defrag && !defer_defrag_retirement && previous.has_value()) {
     absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(*previous));
     if (!dead.ok()) {
-      store.write_failed_ = true;
+      LatchRuntimeFailure(store);
       co_return dead;
     }
   }
@@ -3225,9 +3233,11 @@ acquire_active_stream:
 
 void StorageEngine::Impl::SealActiveBlocks(WorkerStore& store) {
   auto seal = [&](std::optional<ActiveBlock>& active) {
-    if (!active.has_value() || active->committed_bytes_ <= kBlockHeaderBytes) {
-      return;
-    }
+    if (!active.has_value()) return;
+    // An allocation can install an empty stream and then lose revalidation
+    // before its first append. It still has to be detached at a freeze
+    // boundary: leaving it active lets a stale replication/apply coroutine
+    // reuse the allocation after shutdown has closed AcquireWriteBlock.
     RequestFlush(store, active->block_id_);
     active.reset();
   };

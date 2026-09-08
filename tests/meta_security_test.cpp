@@ -158,11 +158,13 @@ TEST(MetaIdentitySecurity,
   keylane::meta::BindMetaMember bind;
   bind.server_id_ = 7;
   bind.principal_ = "keylane://meta/7";
+  bind.data_control_endpoint_ = "10.0.0.7:7100";
   ASSERT_TRUE(store.Apply(bind).ok());
 
   auto member = store.FindMetaMember(7);
   ASSERT_TRUE(member.has_value());
   EXPECT_EQ(member->principal_, "keylane://meta/7");
+  EXPECT_EQ(member->data_control_endpoint_, "10.0.0.7:7100");
   EXPECT_FALSE(member->retired_);
   EXPECT_TRUE(store.Apply(bind).ok());
 
@@ -185,6 +187,7 @@ TEST(MetaIdentitySecurity, MetaMemberBindingSurvivesSnapshotRoundTrip) {
   keylane::meta::BindMetaMember bind;
   bind.server_id_ = 3;
   bind.principal_ = "keylane://meta/3";
+  bind.data_control_endpoint_ = "10.0.0.3:7100";
   ASSERT_TRUE(store.Apply(bind).ok());
 
   auto restored =

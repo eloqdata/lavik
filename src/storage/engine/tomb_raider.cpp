@@ -757,7 +757,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
     absl::Status dead = co_await MarkRecordDead(
         RetiredRecordOf(dropped, dropped_dependent_extents));
     if (!dead.ok()) {
-      store.write_failed_ = true;
+      LatchRuntimeFailure(store);
       co_return dead;
     }
     ++reaped;

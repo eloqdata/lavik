@@ -653,6 +653,24 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_EQ(MetricValue(body, "keylane_blocked_clients"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_replication_control_connections"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_replication_flow_connections"), 0);
+  EXPECT_EQ(MetricValue(body, "keylane_cluster_control_connected"), 0);
+  EXPECT_EQ(MetricValue(body, "keylane_cluster_control_reconnects_total"), 0);
+  EXPECT_EQ(MetricValue(body, "keylane_cluster_control_protocol_errors_total"),
+            0);
+  EXPECT_EQ(
+      MetricValue(body, "keylane_cluster_control_full_states_applied_total"),
+      0);
+  EXPECT_EQ(MetricValue(body,
+                        "keylane_cluster_control_lease_decisions_total{"
+                        "decision=\"granted\"}"),
+            0);
+  EXPECT_EQ(
+      MetricValue(
+          body,
+          "keylane_cluster_control_lease_decisions_total{decision=\"denied\"}"),
+      0);
+  EXPECT_EQ(
+      MetricValue(body, "keylane_cluster_control_lease_expirations_total"), 0);
   // The lazy shared backlog is enabled on the first downstream handshake.
   EXPECT_EQ(MetricValue(body, "keylane_replication_backlog_capacity_bytes"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_replication_backlog_pinned_cursors"), 0);

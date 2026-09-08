@@ -617,6 +617,77 @@ TEST(RedisConfigTest, AppliesClusterDirectives) {
   EXPECT_FALSE(options.cluster_enabled_);
 }
 
+TEST(RedisConfigTest, AppliesMetaControlledClusterDirectives) {
+  ServerOptions options;
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"cluster-enabled", "yes"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective(
+          {"cluster-node-id", "0123456789abcdef0123456789abcdef01234567"},
+          &options)
+          .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"cluster-meta-seed", "127.0.0.1:17001"}, &options)
+                  .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"cluster-meta-seed", "[::1]:17002"}, &options)
+          .ok());
+
+  EXPECT_EQ(options.cluster_node_id_,
+            "0123456789abcdef0123456789abcdef01234567");
+  EXPECT_EQ(options.cluster_meta_seeds_,
+            (std::vector<std::string>{"127.0.0.1:17001", "[::1]:17002"}));
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+}
+
+TEST(RedisConfigTest, ValidatesExactlyOneClusterControlSource) {
+  ServerOptions options;
+  options.cluster_enabled_ = true;
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+
+  options.cluster_meta_seeds_.push_back("127.0.0.1:17001");
+  EXPECT_FALSE(ValidateServerOptions(options).ok());  // node id required
+  options.cluster_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+
+  options.cluster_static_nodes_file_ = "/etc/keylane/nodes.conf";
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  options.cluster_meta_seeds_.clear();
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+}
+
+TEST(RedisConfigTest, RejectsMalformedMetaNodeIdentityAndSeeds) {
+  ServerOptions options;
+  options.cluster_enabled_ = true;
+  options.cluster_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+
+  for (const std::string seed : {"localhost:17001", "127.0.0.1", "::1",
+                                 "::1:17001", "127.0.0.1:0", "[::1]:70000"}) {
+    options.cluster_meta_seeds_ = {seed};
+    EXPECT_FALSE(ValidateServerOptions(options).ok()) << seed;
+  }
+  options.cluster_meta_seeds_ = {"127.0.0.1:17001"};
+  for (const std::string node_id :
+       {"short", "0123456789ABCDEF0123456789abcdef01234567",
+        "g123456789abcdef0123456789abcdef01234567"}) {
+    options.cluster_node_id_ = node_id;
+    EXPECT_FALSE(ValidateServerOptions(options).ok()) << node_id;
+  }
+}
+
+TEST(RedisConfigTest, MetaControlMtlsRequiresCompleteClientIdentity) {
+  ServerOptions options;
+  options.cluster_enabled_ = true;
+  options.cluster_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  options.cluster_meta_seeds_ = {"127.0.0.1:17001"};
+  options.tls_replication_ = true;
+  options.tls_ca_cert_file_ = "ca.crt";
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  options.tls_cert_file_ = "node.crt";
+  options.tls_key_file_ = "node.key";
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+}
+
 TEST(RedisConfigTest, RejectsInvalidClusterDirectives) {
   ServerOptions options;
   EXPECT_FALSE(

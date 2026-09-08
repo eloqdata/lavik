@@ -1,6 +1,12 @@
 #include "keylane/cluster/authority.h"
 
+#include <algorithm>
+#include <limits>
 #include <utility>
+
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "keylane/metrics.h"
 
 namespace keylane::cluster {
 
@@ -49,10 +55,12 @@ Decision Admit(const ServingState* state, const RequestView& request) {
     return decision;
   }
 
-  // No-key commands admit locally; readiness above is the only gate. Callers
-  // report key-extraction failure as an empty slot set, so such commands land
-  // here as well and produce their own argument error — the same treatment
-  // Redis gives zero-key commands in getNodeByQuery.
+  // No-key commands admit locally; readiness above is the only generic gate.
+  // The Redis adapter either binds an eligible static global mutation to one
+  // representative owner slot or rejects it, because an empty slot set cannot
+  // name authority or a drain cell. Callers also report key-extraction failure
+  // as empty so malformed commands reach their own argument error, matching
+  // Redis getNodeByQuery.
   if (request.slots_.empty()) {
     decision.kind_ = Decision::Kind::kServe;
     return decision;
@@ -149,6 +157,255 @@ bool AuthorityUnchanged(const ServingState& admitted,
     }
   }
   return true;
+}
+
+AuthorityGuard::AuthorityGuard(TopologyCache& topology, LeaseMode lease_mode)
+    : topology_(topology), lease_mode_(lease_mode) {}
+
+std::optional<AuthorityAnchor> AuthorityGuard::LocalPrimaryAnchor(
+    const ServingState& state, std::string_view group_id) {
+  const GroupView* group = state.FindGroup(group_id);
+  if (group == nullptr || state.SelfNodeIndex() == kNoNodeIndex ||
+      group->primary_node_index_ != state.SelfNodeIndex() || !group->granted_ ||
+      !group->population_ready_ || !group->storage_ready_) {
+    return std::nullopt;
+  }
+  return AuthorityAnchor{
+      .group_id_ = group->group_id_,
+      .assignment_id_ = group->assignment_id_,
+      .group_term_ = group->group_term_,
+      .authority_version_ = group->authority_version_,
+      .grant_revision_ = group->grant_revision_,
+  };
+}
+
+bool AuthorityGuard::LeaseCoversLocked(const ServingState& state,
+                                       std::span<const std::uint16_t> slots,
+                                       MonotonicTime now) const {
+  if (lease_mode_ == LeaseMode::kPermanent) return true;
+  if (!session_.has_value()) return false;
+
+  // Redis admits only same-slot requests, but keeping this loop general makes
+  // the lease proof fail closed if a future caller reaches the seam before
+  // applying the cross-slot verdict.
+  std::string_view checked_group;
+  for (const std::uint16_t slot : slots) {
+    const GroupView* group = state.GroupForSlot(slot);
+    if (group == nullptr || group->group_id_ == checked_group) continue;
+    checked_group = group->group_id_;
+    if (group->primary_node_index_ != state.SelfNodeIndex()) continue;
+    const auto lease = leases_.find(group->group_id_);
+    if (lease == leases_.end() || lease->second.session_ != *session_) {
+      return false;
+    }
+    if (lease->second.deadline_ <= now) {
+      if (!lease->second.expiration_recorded_) {
+        lease->second.expiration_recorded_ = true;
+        RecordClusterControlLeaseExpiration();
+      }
+      return false;
+    }
+    const std::optional<AuthorityAnchor> current =
+        LocalPrimaryAnchor(state, group->group_id_);
+    if (!current.has_value() || lease->second.anchor_ != *current) return false;
+  }
+  return true;
+}
+
+AuthorityAdmission AuthorityGuard::CaptureAndAdmit(const RequestView& request,
+                                                   MonotonicTime now) const {
+  AuthorityAdmission admission;
+  admission.state_ = topology_.Current();
+  admission.slots_.assign(request.slots_.begin(), request.slots_.end());
+  admission.decision_ = Admit(admission.state_.get(), request);
+
+  if (admission.decision_.kind_ != Decision::Kind::kServe ||
+      admission.state_ == nullptr || admission.slots_.empty()) {
+    return admission;
+  }
+
+  // Only an owner serving its own group consumes Meta authority. Replica
+  // READONLY decisions use kServeStaleRead and redirects carry no admission.
+  const GroupView* group =
+      admission.state_->GroupForSlot(admission.slots_.front());
+  if (group == nullptr ||
+      group->primary_node_index_ != admission.state_->SelfNodeIndex()) {
+    return admission;
+  }
+
+  const std::lock_guard lock(mutex_);
+  admission.gate_generation_ = generation_;
+  admission.lease_checked_ = true;
+  if (!LeaseCoversLocked(*admission.state_, admission.slots_, now)) {
+    admission.decision_.kind_ = Decision::Kind::kClusterDownUnbound;
+  }
+  return admission;
+}
+
+RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
+                                      MonotonicTime now) const {
+  if (admission.decision_.kind_ != Decision::Kind::kServe &&
+      admission.decision_.kind_ != Decision::Kind::kServeStaleRead) {
+    return RecheckResult::kReject;
+  }
+  if (admission.state_ == nullptr) {
+    // Loading-allowlisted no-key commands carry no authority and are safe to
+    // complete even before the first control snapshot arrives.
+    return admission.slots_.empty() ? RecheckResult::kOk
+                                    : RecheckResult::kReject;
+  }
+
+  if (admission.lease_checked_) {
+    const std::lock_guard lock(mutex_);
+    if (admission.gate_generation_ != generation_ ||
+        !LeaseCoversLocked(*admission.state_, admission.slots_, now)) {
+      return RecheckResult::kReject;
+    }
+  }
+  return AuthorityUnchanged(*admission.state_, topology_.Current().get(),
+                            admission.slots_)
+             ? RecheckResult::kOk
+             : RecheckResult::kReject;
+}
+
+RecheckResult AuthorityGuard::RegisterAndRecheck(
+    const AuthorityAdmission& admission, std::size_t worker_stripe,
+    MonotonicTime now, AuthorityInFlightGuards* guards) const {
+  guards->clear();
+
+  // CurrentCachedWithVersion spins through an odd sequence and returns only
+  // after observing one completed publication. The snapshot itself is not
+  // used here: Recheck is the sole authority comparator, while the sequence
+  // brackets registration against a concurrent publisher's drain.
+  std::uint64_t unused_version = 0;
+  std::uint64_t publication_before = 0;
+  (void)CurrentCachedWithVersion(topology_, &unused_version,
+                                 &publication_before);
+
+  const std::shared_ptr<const ServingState>& admitted_state = admission.state();
+  if (admitted_state == nullptr) return RecheckResult::kReject;
+  for (const std::uint16_t slot : admission.slots()) {
+    GroupInFlight* cell = admitted_state->InFlightCellForSlot(slot);
+    if (cell == nullptr) continue;
+    const bool already_registered = std::any_of(
+        guards->begin(), guards->end(),
+        [cell](const InFlightGuard& guard) { return guard.cell() == cell; });
+    if (!already_registered) guards->emplace_back(*cell, worker_stripe);
+  }
+
+  if (topology_.publication_sequence() == publication_before &&
+      Recheck(admission, now) == RecheckResult::kOk) {
+    return RecheckResult::kOk;
+  }
+  guards->clear();
+  return RecheckResult::kReject;
+}
+
+absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
+                                        const AuthorityAnchor& anchor,
+                                        MonotonicTime deadline) {
+  if (lease_mode_ != LeaseMode::kFinite) {
+    return absl::FailedPreconditionError(
+        "a permanent/static authority guard does not accept lease grants");
+  }
+  if (!session.complete()) {
+    return absl::InvalidArgumentError("lease session identity is incomplete");
+  }
+  const std::lock_guard lock(mutex_);
+  if (!session_.has_value() || *session_ != session) {
+    leases_.clear();
+    session_ = session;
+    ++generation_;
+  }
+
+  const auto existing = leases_.find(anchor.group_id_);
+  if (existing != leases_.end() && existing->second.session_ == session &&
+      existing->second.anchor_ == anchor) {
+    // Deadline-only renewal is deliberately invisible to already admitted
+    // work. Replacing generation here would turn a healthy heartbeat into a
+    // spurious write abort.
+    existing->second.deadline_ = deadline;
+    existing->second.expiration_recorded_ = false;
+    return absl::OkStatus();
+  }
+  leases_.insert_or_assign(anchor.group_id_,
+                           Lease{session, anchor, deadline, false});
+  ++generation_;
+  return absl::OkStatus();
+}
+
+bool AuthorityGuard::ExpireLease(const SessionIdentity& session,
+                                 const AuthorityAnchor& anchor,
+                                 MonotonicTime deadline, MonotonicTime now) {
+  if (lease_mode_ != LeaseMode::kFinite || now < deadline) return false;
+  const std::lock_guard lock(mutex_);
+  if (!session_.has_value() || *session_ != session) return false;
+  const auto lease = leases_.find(anchor.group_id_);
+  if (lease == leases_.end() || lease->second.session_ != session ||
+      lease->second.anchor_ != anchor || lease->second.deadline_ != deadline) {
+    return false;
+  }
+  const bool already_recorded = lease->second.expiration_recorded_;
+  leases_.erase(lease);
+  ++generation_;
+  if (!already_recorded) RecordClusterControlLeaseExpiration();
+  return true;
+}
+
+void AuthorityGuard::InvalidateSession(const SessionIdentity& session) {
+  if (lease_mode_ != LeaseMode::kFinite) return;
+  const std::lock_guard lock(mutex_);
+  if (!session_.has_value() || *session_ != session) return;
+  session_.reset();
+  leases_.clear();
+  ++generation_;
+}
+
+void AuthorityGuard::InvalidateAnchorsChanged(const ServingState* before,
+                                              const ServingState& after) {
+  if (lease_mode_ != LeaseMode::kFinite) return;
+  const std::lock_guard lock(mutex_);
+  bool invalidated = false;
+  for (auto it = leases_.begin(); it != leases_.end();) {
+    const std::optional<AuthorityAnchor> current =
+        LocalPrimaryAnchor(after, it->first);
+    if (!current.has_value() || *current != it->second.anchor_) {
+      it = leases_.erase(it);
+      invalidated = true;
+    } else {
+      ++it;
+    }
+  }
+  // `before` documents the sequencing contract: callers invoke this before
+  // publishing `after`. Existing leases are enough to identify admissions
+  // that can be live, so no generation churn is needed without one.
+  (void)before;
+  if (invalidated) ++generation_;
+}
+
+void AuthorityGuard::Fence(const AuthorityAnchor& anchor) {
+  if (lease_mode_ != LeaseMode::kFinite) return;
+  const std::lock_guard lock(mutex_);
+  const auto lease = leases_.find(anchor.group_id_);
+  if (lease == leases_.end()) return;
+  leases_.erase(lease);
+  ++generation_;
+}
+
+void AuthorityGuard::InvalidateLeases() {
+  if (lease_mode_ != LeaseMode::kFinite) return;
+  const std::lock_guard lock(mutex_);
+  if (leases_.empty()) return;
+  leases_.clear();
+  ++generation_;
+}
+
+void AuthorityGuard::InvalidateAll() {
+  if (lease_mode_ != LeaseMode::kFinite) return;
+  const std::lock_guard lock(mutex_);
+  session_.reset();
+  leases_.clear();
+  ++generation_;
 }
 
 }  // namespace keylane::cluster

@@ -8,7 +8,7 @@
 //   - main thread: CLI parse, assembly, startup waits, signal polling, and
 //     the ordered teardown. raft_server construction/teardown happen here;
 //     NuRaft's public API is thread-safe.
-//   - one celer Runtime worker: ctl/future Data Node control transport, with
+//   - one celer Runtime worker: ctl/Data Node control transports, with
 //     authentication determined by the selected listener mode.
 //   - one bounded proposal-executor thread: synchronous entry into NuRaft's
 //     mutation/snapshot APIs, keeping their locks and WAL IO off Celer.
@@ -17,9 +17,10 @@
 //     return to Celer through the Runtime's foreign executor mailbox.
 //
 // Teardown order (main thread, on SIGTERM/SIGINT):
-//   ctl Shutdown() -> proposal executor drain -> raft_launcher::shutdown()
-//   -> MetaStateMachine::WaitForSnapshotWriterIdle() -> release Raft ref ->
-//   Celer Runtime stop + join -> coordinator release.
+//   Data control Shutdown() -> ctl Shutdown() -> coordinator demotion ->
+//   proposal executor drain -> raft_launcher::shutdown() ->
+//   MetaStateMachine::WaitForSnapshotWriterIdle() -> release Raft ref -> Celer
+//   Runtime stop + join -> coordinator release.
 // shutdown() joins the commit thread — the only producer of automatic
 // snapshot jobs — and the writer drain lets an in-flight when_done reach the
 // still-alive core before reset (the shutdown contract in
@@ -29,10 +30,10 @@
 // nuraft::context through a unique_ptr member — the caller must never delete
 // the context itself.
 
-#include <arpa/inet.h>
 #include <signal.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -71,6 +72,7 @@
 
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/ctl_server.h"
+#include "keylane/meta/data_control_server.h"
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/nuraft_asio_transport.h"
 #include "keylane/meta/nuraft_log_store.h"
@@ -78,6 +80,7 @@
 #include "keylane/meta/observation_store.h"
 #include "keylane/meta/proposal_executor.h"
 #include "keylane/meta/state_machine.h"
+#include "keylane/numeric_endpoint.h"
 #include "keylane/version.h"
 
 namespace {
@@ -87,6 +90,9 @@ using keylane::meta::MetaCoordinator;
 using keylane::meta::MetaCoordinatorOptions;
 using keylane::meta::MetaCtlServer;
 using keylane::meta::MetaCtlServerOptions;
+using keylane::meta::MetaDataControlServer;
+using keylane::meta::MetaDataControlServerOptions;
+using keylane::meta::MetaLeadershipRelay;
 using keylane::meta::MetaMembershipGate;
 using keylane::meta::MetaProposalExecutor;
 using keylane::meta::MetaStateMachine;
@@ -100,6 +106,9 @@ struct CliOptions {
   int id_ = 0;
   bool has_id_ = false;
   std::string raft_addr_;  // "ip:port": raft bind AND advertised endpoint
+  // Kept distinct from the NuRaft endpoint: data nodes neither speak nor
+  // discover through the Raft transport.
+  std::string data_control_addr_;
   std::string data_dir_;
   std::string ctl_addr_;    // optional remote "ip:port" control surface
   std::string ctl_socket_;  // default: <data-dir>/meta-admin.sock
@@ -133,7 +142,8 @@ struct EndpointParts {
 void PrintUsage(const char* program) {
   std::fprintf(
       stderr,
-      "usage: %s --id N --addr ip:port --data-dir PATH "
+      "usage: %s --id N --addr ip:port --data-control-addr ip:port "
+      "--data-dir PATH "
       "[--ctl-socket PATH | --ctl-addr ip:port] "
       "[--bootstrap]\n"
       "          [--tls-ca F --tls-cert F --tls-key F]\n"
@@ -167,26 +177,13 @@ bool ParseInt(std::string_view text, int min_value, int max_value, int* out) {
 
 // "ip:port" with a numeric IPv4/IPv6 host (the celer transport does no DNS).
 absl::StatusOr<EndpointParts> ParseEndpointArg(std::string_view text) {
-  const std::size_t colon = text.rfind(':');
-  if (colon == std::string_view::npos || colon == 0 ||
-      colon + 1 == text.size()) {
-    return absl::Status(absl::StatusCode::kInvalidArgument, "expected ip:port");
+  auto endpoint = keylane::ParseNumericEndpoint(text);
+  if (!endpoint.has_value()) {
+    return absl::InvalidArgumentError(
+        "expected numeric IPv4:port or [IPv6]:port");
   }
-  EndpointParts parts;
-  parts.host_ = std::string(text.substr(0, colon));
-  int port = 0;
-  if (!ParseInt(text.substr(colon + 1), 1, 65535, &port)) {
-    return absl::Status(absl::StatusCode::kInvalidArgument, "invalid port");
-  }
-  in_addr addr4{};
-  in6_addr addr6{};
-  if (::inet_pton(AF_INET, parts.host_.c_str(), &addr4) != 1 &&
-      ::inet_pton(AF_INET6, parts.host_.c_str(), &addr6) != 1) {
-    return absl::Status(absl::StatusCode::kInvalidArgument,
-                        "host is not a numeric IPv4/IPv6 address");
-  }
-  parts.port_ = static_cast<std::uint16_t>(port);
-  return parts;
+  return EndpointParts{.host_ = std::move(endpoint->host_),
+                       .port_ = endpoint->port_};
 }
 
 // Compact standalone parsing: every option is "--name value", "--name=value",
@@ -240,6 +237,8 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
       options.has_id_ = true;
     } else if (name == "--addr") {
       options.raft_addr_ = std::string(value);
+    } else if (name == "--data-control-addr") {
+      options.data_control_addr_ = std::string(value);
     } else if (name == "--data-dir") {
       options.data_dir_ = std::string(value);
     } else if (name == "--ctl-addr") {
@@ -321,6 +320,10 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
   if (options.raft_addr_.empty()) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "--addr is required");
+  }
+  if (options.data_control_addr_.empty()) {
+    return absl::Status(absl::StatusCode::kInvalidArgument,
+                        "--data-control-addr is required");
   }
   if (options.data_dir_.empty()) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
@@ -512,7 +515,7 @@ void ShutdownSignalHandler(int signal) {
 }
 
 absl::Status InstallShutdownSignalHandlers() {
-  struct sigaction action{};
+  struct sigaction action {};
   sigemptyset(&action.sa_mask);
   action.sa_handler = ShutdownSignalHandler;
   if (::sigaction(SIGINT, &action, nullptr) != 0 ||
@@ -559,6 +562,12 @@ int main(int argc, char** argv) {
   if (!raft_endpoint.ok()) {
     std::fprintf(stderr, "keylane-meta: --addr: %s\n",
                  std::string(raft_endpoint.status().message()).c_str());
+    return 1;
+  }
+  auto data_control_endpoint = ParseEndpointArg(options.data_control_addr_);
+  if (!data_control_endpoint.ok()) {
+    std::fprintf(stderr, "keylane-meta: --data-control-addr: %s\n",
+                 std::string(data_control_endpoint.status().message()).c_str());
     return 1;
   }
   std::optional<EndpointParts> ctl_endpoint;
@@ -623,7 +632,7 @@ int main(int argc, char** argv) {
   nuraft::asio_service::options asio_options = std::move(*asio_options_or);
 
   // --- Celer runtime ---
-  // One worker owns ctl/future Data Node transport. Runtime owns its thread,
+  // One worker owns ctl/Data Node transport. Runtime owns its thread,
   // MPSC mailbox, and wake eventfd. NuRaft posts typed notifications directly
   // through the worker's foreign executor without touching Celer TLS.
   celer::Runtime celer_runtime;
@@ -660,6 +669,11 @@ int main(int argc, char** argv) {
   params.with_election_timeout_lower(options.election_ms_low_);
   params.with_election_timeout_upper(options.election_ms_high_);
   params.with_hb_interval(options.heartbeat_ms_);
+  // Data-control leases are never allowed to outlive NuRaft's own belief in
+  // leadership. NuRaft's zero default expands to 20 heartbeats, which is
+  // longer than this deployment's election lower bound and can overlap a new
+  // leader; pin expiry to that lower bound explicitly.
+  params.with_leadership_expiry(options.election_ms_low_);
   params.with_snapshot_enabled(options.snapshot_distance_);
   params.with_reserved_log_items(options.reserved_log_items_);
   params.with_client_req_timeout(options.client_req_timeout_ms_);
@@ -679,14 +693,13 @@ int main(int argc, char** argv) {
   nuraft::raft_server::init_options init_opts;
   init_opts.skip_initial_election_timeout_ = !options.bootstrap_;
   // Construction necessarily precedes MetaCoordinator assembly because the
-  // coordinator needs the raft_server. Remember the latest role edge so an
-  // election racing that short window is replayed immediately on attach.
-  auto coordinator_target =
-      std::make_shared<std::atomic<MetaCoordinator*>>(nullptr);
-  auto pending_role = std::make_shared<std::atomic<int>>(-1);
-  init_opts.raft_callback_ = [foreign_executor, coordinator_target,
-                              pending_role](nuraft::cb_func::Type type,
-                                            nuraft::cb_func::Param* param) {
+  // coordinator needs the raft_server. The relay retains every role edge
+  // from that window and remains the shutdown lifetime barrier for callbacks
+  // already accepted by Celer's foreign mailbox.
+  auto leadership_relay = std::make_shared<MetaLeadershipRelay>();
+  init_opts.raft_callback_ = [foreign_executor, leadership_relay](
+                                 nuraft::cb_func::Type type,
+                                 nuraft::cb_func::Param* param) {
     const nuraft::cb_func::ReturnCode logged = RaftEventCallback(type, param);
     int role = -1;
     if (type == nuraft::cb_func::BecomeLeader) {
@@ -695,17 +708,14 @@ int main(int argc, char** argv) {
       role = 0;
     }
     if (role != -1) {
-      pending_role->store(role, std::memory_order_release);
-      // NuRaft/Asio threads never call coordinator/Celer-owned state
-      // directly. Stale queued edges read the latest role when drained.
+      // Record this exact edge before deferring delivery. Reading a shared
+      // "latest role" in the worker would collapse Leader -> Follower ->
+      // Leader and skip the authority-revocation barrier; recording before
+      // Notify also preserves callback order if mailbox producers interleave.
+      role == 1 ? leadership_relay->RecordLeaderEdge()
+                : leadership_relay->RecordFollowerEdge();
       const bool accepted = foreign_executor.Notify(
-          [coordinator_target, pending_role]() noexcept {
-            MetaCoordinator* target =
-                coordinator_target->load(std::memory_order_acquire);
-            if (target == nullptr) return;
-            const int current = pending_role->load(std::memory_order_acquire);
-            current == 1 ? target->BecomeLeader() : target->BecomeFollower();
-          });
+          [leadership_relay]() noexcept { leadership_relay->Drain(); });
       if (!accepted) {
         // This path is quiesced before Runtime shutdown. Losing a role edge
         // here would leave leader-only control logic in the wrong state.
@@ -729,7 +739,13 @@ int main(int argc, char** argv) {
 
   int exit_code = 0;
   std::shared_ptr<MetaCtlServer> ctl;
-  auto obs_store = std::make_shared<keylane::meta::MetaObservationStore>();
+  std::shared_ptr<MetaDataControlServer> data_control;
+  const std::uint32_t observation_ttl_ms = static_cast<std::uint32_t>(
+      std::max(options.election_ms_high_, options.heartbeat_ms_ * 3));
+  keylane::meta::MetaObservationStore::Limits observation_limits;
+  observation_limits.ttl_ms_ = observation_ttl_ms;
+  auto obs_store =
+      std::make_shared<keylane::meta::MetaObservationStore>(observation_limits);
   auto proposal_executor = std::make_unique<MetaProposalExecutor>();
   auto membership_gate = std::make_shared<MetaMembershipGate>();
   nuraft::ptr<nuraft::log_store> raft_log_store = state_mgr->load_log_store();
@@ -740,16 +756,47 @@ int main(int argc, char** argv) {
   std::shared_ptr<MetaCoordinator> coordinator =
       std::make_shared<MetaCoordinator>(server, *state_machine, *wal,
                                         *obs_store, coordinator_options);
-  coordinator_target->store(coordinator.get(), std::memory_order_release);
-  const int role_before_attach = pending_role->load(std::memory_order_acquire);
-  if (role_before_attach == 1) {
-    coordinator->BecomeLeader();
-  } else if (role_before_attach == 0) {
-    coordinator->BecomeFollower();
+  leadership_relay->Attach(*coordinator);
+
+  if (exit_code == 0) {
+    MetaDataControlServerOptions control_options;
+    control_options.server_id_ = static_cast<std::uint32_t>(options.id_);
+    control_options.bind_host_ = data_control_endpoint->host_;
+    control_options.port_ = data_control_endpoint->port_;
+    control_options.tls_ca_cert_file_ = options.tls_ca_;
+    control_options.tls_cert_file_ = options.tls_cert_;
+    control_options.tls_key_file_ = options.tls_key_;
+    // Couple transport cadence and authority lifetime to the configured Raft
+    // liveness bounds instead of introducing unrelated control-plane knobs.
+    control_options.heartbeat_interval_ms_ =
+        static_cast<std::uint32_t>(options.heartbeat_ms_);
+    control_options.observation_ttl_ms_ = observation_ttl_ms;
+    control_options.leadership_validity_ms_ =
+        static_cast<std::uint32_t>(options.election_ms_low_);
+    auto control_or =
+        MetaDataControlServer::Create(foreign_executor, server, *coordinator,
+                                      obs_store, std::move(control_options));
+    if (!control_or.ok()) {
+      spdlog::critical("data-control server create failed: {}",
+                       control_or.status().message());
+      exit_code = 1;
+    } else {
+      data_control = *control_or;
+      coordinator->RunAsLeader(data_control);
+      data_control->StartListener();
+      const absl::Status control_bound =
+          WaitForBound([&data_control] { return data_control->status(); });
+      if (!control_bound.ok()) {
+        spdlog::critical("data-control listener bind failed: {}",
+                         control_bound.message());
+        exit_code = 1;
+      }
+    }
   }
 
   if (exit_code == 0) {
     MetaCtlServerOptions ctl_options;
+    ctl_options.local_data_control_endpoint_ = options.data_control_addr_;
     if (ctl_endpoint.has_value()) {
       ctl_options.transport_ =
           options.ctl_tls_ca_.empty()
@@ -787,10 +834,12 @@ int main(int argc, char** argv) {
   if (exit_code == 0) {
     const std::string ctl_display =
         !options.ctl_socket_.empty() ? options.ctl_socket_ : options.ctl_addr_;
-    spdlog::info("node {} up: raft={} ctl={} data-dir={} bootstrap={} tls={}",
-                 options.id_, options.raft_addr_, ctl_display,
-                 options.data_dir_, options.bootstrap_,
-                 transport_config.TlsEnabled());
+    spdlog::info(
+        "node {} up: raft={} data-control={} ctl={} data-dir={} bootstrap={} "
+        "tls={}",
+        options.id_, options.raft_addr_, options.data_control_addr_,
+        ctl_display, options.data_dir_, options.bootstrap_,
+        transport_config.TlsEnabled());
     while (g_shutdown_requested == 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
@@ -798,13 +847,21 @@ int main(int argc, char** argv) {
                  static_cast<int>(g_last_shutdown_signal));
   }
 
-  // Stop ctl ingress first, then quiesce NuRaft/Asio while the Celer worker
-  // mailbox and snapshot writer remain alive.
+  // Stop both ingress surfaces first, then synchronously revoke the
+  // leader-scoped publisher before quiescing NuRaft/Asio while the Celer
+  // worker mailbox and snapshot writer remain alive.
+  if (data_control != nullptr) {
+    data_control->Shutdown();
+  }
   if (ctl != nullptr) {
     ctl->Shutdown();
   }
+  // Detach first so callbacks racing shutdown cannot enqueue a later Leader
+  // edge behind this final demotion. Coordinator teardown independently
+  // cancels any reconciler still running if it reaches destruction before
+  // this queued edge is consumed.
+  leadership_relay->DetachAndStop();
   coordinator->BecomeFollower();
-  coordinator_target->store(nullptr, std::memory_order_release);
   // No new Celer ingress or leader work is accepted. Drain queued NuRaft
   // mutation/snapshot entry before stopping its Asio service; cmd_result
   // completions can still use the live foreign executor while shutdown

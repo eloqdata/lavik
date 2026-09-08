@@ -10,6 +10,7 @@
 // access, no IO.
 
 #include <cstdint>
+#include <limits>
 #include <string>
 
 #include "absl/status/status.h"
@@ -18,6 +19,7 @@
 #include "keylane/meta/commands.h"
 #include "keylane/meta/encoding.h"
 #include "keylane/meta/grant_store.h"
+#include "keylane/meta/hash.h"
 #include "keylane/meta/operation_store.h"
 
 namespace {
@@ -180,8 +182,8 @@ TEST(MetaAuditStore, ExportDrainsRecordsWithTheirChainContext) {
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   ASSERT_EQ(decoded->records_.size(), 2);
   // The export chains from the genesis anchor and carries per-record hashes,
-  // so an external archive can verify continuity and deduplicate by
-  // (cluster_id, raft_log_index, record_hash).
+  // so an external archive can verify continuity and, within its own
+  // deployment namespace, deduplicate by (raft_log_index, record_hash).
   EXPECT_EQ(decoded->anchor_before_, MetaHash256{});
   EXPECT_EQ(decoded->records_[0], *store.Find(1));
   EXPECT_EQ(decoded->records_[1], *store.Find(2));
@@ -355,11 +357,11 @@ TEST(MetaGrantStore, CommandsOnUnknownGroupReject) {
   EXPECT_EQ(MetaFailureClassOf(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1))),
             MetaFailureClass::kDomainReject);
   ActivateAuthority activate = MakeActivate("g1", 0, "node-a", 1);
-  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate)),
+  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate, 1)),
             MetaFailureClass::kDomainReject);
   GrantAuthority grant;
   grant.group_id_ = "g1";
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(grant)),
+  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(grant, 1)),
             MetaFailureClass::kDomainReject);
   RevokeGrant revoke;
   revoke.group_id_ = "g1";
@@ -418,8 +420,8 @@ TEST(MetaGrantStore, ActivateInstallsGrantWithoutMovingTerm) {
   const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
   // The split primitives: the dispatcher validates, writes the topology part,
   // then applies the grant part atomically.
-  ASSERT_TRUE(store.ValidateActivate(activate).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
+  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
   const auto state = store.GroupState("g1");
   ASSERT_TRUE(state.has_value());
   EXPECT_EQ(state->group_term_, 1);  // unchanged by activation
@@ -428,8 +430,54 @@ TEST(MetaGrantStore, ActivateInstallsGrantWithoutMovingTerm) {
   EXPECT_EQ(state->grant_->owner_, "node-a");
   EXPECT_EQ(state->grant_->term_, 1);
   EXPECT_EQ(state->grant_->authority_version_, 1);
+  EXPECT_EQ(state->grant_->grant_revision_, 10);
   EXPECT_EQ(state->grant_->spec_, MakeSpec());
   EXPECT_EQ(state->last_authority_version_, 1);
+  EXPECT_EQ(state->last_grant_revision_, 10);
+}
+
+TEST(MetaGrantStore, RejectsLeaseDurationOutsideControlWireDomain) {
+  MetaGrantStore store;
+  ASSERT_TRUE(store.AddGroup("g1").ok());
+  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
+
+  ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
+  activate.grant_.lease_duration_ms_ = 0;
+  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate, 10)),
+            MetaFailureClass::kDomainReject);
+  activate.grant_.lease_duration_ms_ =
+      static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1;
+  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate, 10)),
+            MetaFailureClass::kDomainReject);
+
+  activate.grant_.lease_duration_ms_ =
+      std::numeric_limits<std::uint32_t>::max();
+  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
+
+  GrantAuthority renew;
+  renew.group_id_ = "g1";
+  renew.node_id_ = "node-a";
+  renew.term_ = 1;
+  renew.authority_version_ = 1;
+  renew.grant_ = MakeSpec(/*lease_ms=*/0);
+  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(renew, 11)),
+            MetaFailureClass::kDomainReject);
+  renew.grant_.lease_duration_ms_ =
+      static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1;
+  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(renew, 11)),
+            MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaGrantStore, ActivateRejectsZeroServingTerm) {
+  MetaGrantStore store;
+  ASSERT_TRUE(store.AddGroup("g1").ok());
+
+  const ActivateAuthority activate = MakeActivate("g1", 0, "node-a", 1);
+  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate, 10)),
+            MetaFailureClass::kDomainReject);
+  EXPECT_TRUE(store.GroupState("g1")->fenced_);
+  EXPECT_FALSE(store.GroupState("g1")->grant_.has_value());
 }
 
 TEST(MetaGrantStore, ActivateWithStaleTermRejects) {
@@ -437,13 +485,13 @@ TEST(MetaGrantStore, ActivateWithStaleTermRejects) {
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   // A candidate from the previous term can never activate.
-  EXPECT_EQ(
-      MetaFailureClassOf(store.ValidateActivate(MakeActivate("g1", 0, "n", 1))),
-      MetaFailureClass::kDomainReject);
+  EXPECT_EQ(MetaFailureClassOf(
+                store.ValidateActivate(MakeActivate("g1", 0, "n", 1), 10)),
+            MetaFailureClass::kDomainReject);
   // A future term equally cannot.
-  EXPECT_EQ(
-      MetaFailureClassOf(store.ValidateActivate(MakeActivate("g1", 2, "n", 1))),
-      MetaFailureClass::kDomainReject);
+  EXPECT_EQ(MetaFailureClassOf(
+                store.ValidateActivate(MakeActivate("g1", 2, "n", 1), 10)),
+            MetaFailureClass::kDomainReject);
   EXPECT_TRUE(store.GroupState("g1")->fenced_);
 }
 
@@ -452,26 +500,26 @@ TEST(MetaGrantStore, ActivateReplayIdempotentAndVersionConflictRejected) {
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
+  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
   // Replay of the same activation: identical content already installed —
   // idempotent no-op accept through both primitives.
-  ASSERT_TRUE(store.ValidateActivate(activate).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
+  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
   EXPECT_EQ(store.GroupState("g1")->grant_->owner_, "node-a");
   // Same term, same authority version, different content: conflict reject.
   ActivateAuthority conflict = MakeActivate("g1", 1, "node-b", 1);
-  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(conflict)),
+  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(conflict, 11)),
             MetaFailureClass::kDomainReject);
   // An older authority version never installs.
   EXPECT_EQ(MetaFailureClassOf(
-                store.ValidateActivate(MakeActivate("g1", 1, "node-b", 0))),
+                store.ValidateActivate(MakeActivate("g1", 1, "node-b", 0), 11)),
             MetaFailureClass::kDomainReject);
   // A newer authority version in the same term replaces the grant (planned
   // migration commits through the same atomic point).
   const ActivateAuthority migration = MakeActivate("g1", 1, "node-b", 2);
-  ASSERT_TRUE(store.ValidateActivate(migration).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(migration).ok());
+  ASSERT_TRUE(store.ValidateActivate(migration, 11).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(migration, 11).ok());
   const auto state = store.GroupState("g1");
   EXPECT_EQ(state->grant_->owner_, "node-b");
   EXPECT_EQ(state->grant_->authority_version_, 2);
@@ -489,31 +537,33 @@ TEST(MetaGrantStore, GrantAuthorityRenewsLeaseForSameOwnerOnly) {
   renew.term_ = 1;
   renew.authority_version_ = 1;
   renew.grant_ = MakeSpec(/*lease_ms=*/60000);
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(renew)),
+  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(renew, 11)),
             MetaFailureClass::kDomainReject);
 
   const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
-  ASSERT_TRUE(store.GrantAuthority(renew).ok());
+  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
+  ASSERT_TRUE(store.GrantAuthority(renew, 11).ok());
   auto state = store.GroupState("g1");
   EXPECT_EQ(state->grant_->spec_.lease_duration_ms_, 60000);
   EXPECT_EQ(state->grant_->term_, 1);               // unchanged
   EXPECT_EQ(state->grant_->authority_version_, 1);  // unchanged
+  EXPECT_EQ(state->grant_->grant_revision_, 11);
   // Replay installs the same spec again: idempotent.
-  ASSERT_TRUE(store.GrantAuthority(renew).ok());
+  ASSERT_TRUE(store.GrantAuthority(renew, 11).ok());
+  EXPECT_EQ(store.GroupState("g1")->grant_->grant_revision_, 11);
   // Owner/term/authority_version are CAS tokens; each mismatch rejects.
   GrantAuthority wrong_owner = renew;
   wrong_owner.node_id_ = "node-b";
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(wrong_owner)),
+  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(wrong_owner, 12)),
             MetaFailureClass::kDomainReject);
   GrantAuthority wrong_term = renew;
   wrong_term.term_ = 2;
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(wrong_term)),
+  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(wrong_term, 12)),
             MetaFailureClass::kDomainReject);
   GrantAuthority wrong_version = renew;
   wrong_version.authority_version_ = 2;
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(wrong_version)),
+  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(wrong_version, 12)),
             MetaFailureClass::kDomainReject);
   EXPECT_EQ(store.GroupState("g1")->grant_->spec_.lease_duration_ms_, 60000);
 }
@@ -523,8 +573,8 @@ TEST(MetaGrantStore, RevokeAndFenceDropTheGrant) {
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
+  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
 
   RevokeGrant revoke;
   revoke.group_id_ = "g1";
@@ -538,6 +588,7 @@ TEST(MetaGrantStore, RevokeAndFenceDropTheGrant) {
   // The authority version survives revocation so a stale activation still
   // cannot install (checked against last_authority_version_).
   EXPECT_EQ(store.GroupState("g1")->last_authority_version_, 1);
+  EXPECT_EQ(store.GroupState("g1")->last_grant_revision_, 10);
   // Replay: already revoked — idempotent no-op accept.
   ASSERT_TRUE(store.RevokeGrant(revoke).ok());
 
@@ -557,8 +608,8 @@ TEST(MetaGrantStore, FactQueriesTrackGrantState) {
   EXPECT_EQ(store.CurrentGroupTerm("g1"), 1);
   EXPECT_FALSE(store.PolicyInUse("policy/leader-lease", 7));
   const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
+  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
   // PolicyInUse feeds the RetirePolicy guard.
   EXPECT_TRUE(store.PolicyInUse("policy/leader-lease", 7));
   EXPECT_FALSE(store.PolicyInUse("policy/leader-lease", 8));
@@ -575,8 +626,8 @@ TEST(MetaGrantStore, RemoveGroupLifecycle) {
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
+  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
   // A live grant must be revoked before the group record can go.
   EXPECT_EQ(MetaFailureClassOf(store.RemoveGroup("g1")),
             MetaFailureClass::kDomainReject);
@@ -604,8 +655,10 @@ TEST(MetaGrantStore, ApplyGrantPartWithoutValidateFailsStop) {
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   // Applying the grant part against a term the validation could not have
   // accepted is an apply-layer contract violation: fail-stop.
-  EXPECT_DEATH(store.ApplyGrantPart(MakeActivate("g1", 2, "node-a", 1)), "");
-  EXPECT_DEATH(store.ApplyGrantPart(MakeActivate("g9", 1, "node-a", 1)), "");
+  EXPECT_DEATH(store.ApplyGrantPart(MakeActivate("g1", 2, "node-a", 1), 10),
+               "");
+  EXPECT_DEATH(store.ApplyGrantPart(MakeActivate("g9", 1, "node-a", 1), 10),
+               "");
 }
 
 TEST(MetaGrantStore, SerializationRoundTripPreservesState) {
@@ -614,8 +667,8 @@ TEST(MetaGrantStore, SerializationRoundTripPreservesState) {
   ASSERT_TRUE(store.AddGroup("g2").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
+  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g2", 0, 1)).ok());
 
   const auto bytes = store.Serialize();
@@ -628,7 +681,7 @@ TEST(MetaGrantStore, SerializationRoundTripPreservesState) {
   EXPECT_TRUE(restored->PolicyInUse("policy/leader-lease", 7));
   // Behavior continues identically after restore: replay idempotency and CAS
   // checks are unaffected by a snapshot round-trip.
-  ASSERT_TRUE(restored->ValidateActivate(activate).ok());  // replay no-op
+  ASSERT_TRUE(restored->ValidateActivate(activate, 10).ok());  // replay no-op
   ASSERT_TRUE(restored->BeginGroupTerm(MakeBeginTerm("g2", 1, 2)).ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g2", 1, 2)).ok());
   // Replay of that same command against the restored state: idempotent.
@@ -649,6 +702,30 @@ TEST(MetaGrantStore, DeserializeRejectsCorruption) {
   const std::string trailing = *bytes + '\x00';
   EXPECT_EQ(MetaFailureClassOf(MetaGrantStore::Deserialize(trailing).status()),
             MetaFailureClass::kFailStop);
+}
+
+TEST(MetaGrantStore, DeserializeRejectsUnprojectableLeaseDuration) {
+  keylane::meta::MetaWriter writer;
+  writer.WriteU16(keylane::meta::kMetaFormatVersion);
+  writer.WriteCount(1);
+  writer.WriteString("g1");
+  writer.WriteU64(1);   // group term
+  writer.WriteU64(1);   // last authority version
+  writer.WriteU64(10);  // last grant revision
+  writer.WriteBool(false);
+  writer.WriteU8(1);  // active grant present
+  writer.WriteString("node-a");
+  writer.WriteU64(1);   // grant term
+  writer.WriteU64(1);   // authority version
+  writer.WriteU64(10);  // grant revision
+  writer.WriteU64(0);   // lease duration cannot be projected to the wire
+  writer.WriteString("policy/leader-lease");
+  writer.WriteU64(7);
+
+  const std::string bytes = writer.TakeBuffer();
+  const auto restored = MetaGrantStore::Deserialize(bytes);
+  ASSERT_FALSE(restored.ok());
+  EXPECT_EQ(MetaFailureClassOf(restored.status()), MetaFailureClass::kFailStop);
 }
 
 // ---------------------------------------------------------------------------
@@ -685,7 +762,7 @@ SubmitOperation MakeSubmit(const MetaOperationId& id, std::uint8_t intent_tag,
   cmd.kind_ = std::move(kind);
   cmd.intent_ = "intent-bytes";
   cmd.intent_hash_ = MakeIntentHash(intent_tag);
-  cmd.replication_history_id_ = 22;
+  cmd.replication_history_id_.fill(22);
   cmd.actor_.principal_ = "keylane://operator/alice";
   cmd.actor_.readable_time_ = "2026-09-04T17:00:00Z";
   return cmd;
@@ -695,9 +772,14 @@ MetaEvidenceSummary MakeEvidence(std::string node_id, std::uint64_t term,
                                  MetaOperationId operation_id = {}) {
   MetaEvidenceSummary evidence;
   evidence.node_id_ = std::move(node_id);
+  evidence.group_id_ = "group-a";
+  evidence.assignment_id_.fill(21);
+  evidence.boot_incarnation_.fill(20);
   evidence.group_term_ = term;
-  evidence.population_manifest_id_ = 11;
-  evidence.replication_history_id_ = 22;
+  evidence.population_manifest_revision_ = 11;
+  evidence.population_manifest_digest_.fill(19);
+  evidence.partition_replication_epoch_ = 12;
+  evidence.replication_history_id_.fill(22);
   evidence.operation_id_ = operation_id;
   return evidence;
 }
@@ -716,6 +798,7 @@ TEST(MetaOperationStore, SubmitCreatesSubmittedRecordKeyedByClientId) {
   EXPECT_EQ(record->operation_id_, id);
   EXPECT_EQ(record->operation_seq_, 100);  // the submit command's log index
   EXPECT_EQ(record->kind_, "failover");
+  EXPECT_EQ(record->intent_, "intent-bytes");
   EXPECT_EQ(record->intent_hash_, MakeIntentHash(42));
   EXPECT_EQ(record->lifecycle_, MetaOperationLifecycle::kSubmitted);
   EXPECT_EQ(record->revision_, 0);
@@ -748,6 +831,288 @@ TEST(MetaOperationStore, DuplicateSubmitIsIdempotentOnlyForSameIntent) {
   EXPECT_EQ(store.LiveCount(), 1);
 }
 
+TEST(MetaOperationStore, DirectiveRevisionTracksOnlySemanticChanges) {
+  MetaOperationStore store;
+  const MetaOperationId id = MakeOperationId(1);
+  ASSERT_TRUE(store.SubmitOperation(MakeSubmit(id, 42), 100).ok());
+
+  keylane::meta::MetaDirectiveSpec directive;
+  directive.directive_id_.fill(1);
+  directive.attempt_id_.fill(2);
+  directive.assignment_id_.fill(3);
+  directive.recipient_node_id_ = std::string(40, 'a');
+  directive.target_node_id_ = std::string(40, 'a');
+  directive.target_boot_id_.fill(4);
+  directive.source_node_id_ = std::string(40, 'b');
+  directive.source_assignment_id_.fill(7);
+  directive.source_boot_id_.fill(5);
+  directive.source_replication_history_id_.fill(6);
+  directive.group_id_ = "g1";
+  directive.group_term_ = 7;
+  directive.authority_version_ = 8;
+  directive.grant_revision_ = 9;
+  directive.partition_replication_epoch_ = 10;
+  directive.kind_ = "rebuild";
+  directive.payload_ = "v1";
+  directive.storage_mutating_ = true;
+
+  TransitionOperationPhase first;
+  first.operation_id_ = id;
+  keylane::meta::MetaDirectiveSpec ambiguous = directive;
+  ambiguous.directive_id_.fill(10);
+  first.current_directives_ = {directive, ambiguous};
+  EXPECT_EQ(MetaFailureClassOf(store.TransitionOperationPhase(first, 101)),
+            MetaFailureClass::kDomainReject);
+  keylane::meta::MetaDirectiveSpec misrouted = directive;
+  misrouted.recipient_node_id_ = misrouted.source_node_id_;
+  first.current_directives_ = {misrouted};
+  EXPECT_EQ(MetaFailureClassOf(store.TransitionOperationPhase(first, 101)),
+            MetaFailureClass::kDomainReject);
+  first.current_directives_ = {directive};
+  ASSERT_TRUE(store.TransitionOperationPhase(first, 101).ok());
+  ASSERT_EQ(store.FindOperation(id)->current_directives_.size(), 1u);
+  EXPECT_EQ(store.FindOperation(id)->current_directives_[0].directive_revision_,
+            101u);
+
+  TransitionOperationPhase unchanged = first;
+  unchanged.expected_revision_ = 1;
+  ASSERT_TRUE(store.TransitionOperationPhase(unchanged, 102).ok());
+  EXPECT_EQ(store.FindOperation(id)->current_directives_[0].directive_revision_,
+            101u);
+
+  TransitionOperationPhase changed = unchanged;
+  changed.expected_revision_ = 2;
+  changed.current_directives_[0].payload_ = "v2";
+  ASSERT_TRUE(store.TransitionOperationPhase(changed, 103).ok());
+  EXPECT_EQ(store.FindOperation(id)->current_directives_[0].directive_revision_,
+            103u);
+
+  const auto bytes = store.Serialize();
+  ASSERT_TRUE(bytes.ok()) << bytes.status();
+  const auto restored = MetaOperationStore::Deserialize(*bytes);
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->FindOperation(id)->current_directives_,
+            store.FindOperation(id)->current_directives_);
+}
+
+TEST(MetaOperationStore,
+     TerminalReceiptSurvivesLostAckReplayArchiveAndSnapshot) {
+  MetaOperationStore store;
+  const MetaOperationId id = MakeOperationId(1);
+  ASSERT_TRUE(store.SubmitOperation(MakeSubmit(id, 42), 100).ok());
+
+  keylane::meta::MetaDirectiveSpec directive;
+  directive.directive_id_.fill(1);
+  directive.attempt_id_.fill(2);
+  directive.recipient_node_id_ = std::string(40, 'b');
+  // A stable node can reappear under another boot. Kind, not node-id equality,
+  // selects the source incarnation that must sign an authorize result.
+  directive.target_node_id_ = directive.recipient_node_id_;
+  directive.target_boot_id_.fill(3);
+  directive.assignment_id_.fill(4);
+  directive.source_node_id_ = std::string(40, 'b');
+  directive.source_assignment_id_.fill(7);
+  directive.source_boot_id_.fill(5);
+  directive.source_replication_history_id_.fill(6);
+  directive.group_id_ = "g1";
+  directive.group_term_ = 7;
+  directive.authority_version_ = 8;
+  directive.grant_revision_ = 9;
+  directive.partition_replication_epoch_ = 10;
+  directive.kind_ = "authorize-source";
+  TransitionOperationPhase transition;
+  transition.operation_id_ = id;
+  transition.current_directives_ = {directive};
+  ASSERT_TRUE(store.TransitionOperationPhase(transition, 101).ok());
+
+  keylane::meta::CommitDirectiveResult commit;
+  commit.operation_id_ = id;
+  commit.directive_id_ = directive.directive_id_;
+  commit.attempt_id_ = directive.attempt_id_;
+  commit.directive_revision_ = 101;
+  commit.recipient_node_id_ = directive.recipient_node_id_;
+  commit.recipient_boot_id_ = directive.source_boot_id_;
+  commit.assignment_id_ = directive.assignment_id_;
+  commit.status_ = keylane::meta::MetaDirectiveResultStatus::kSucceeded;
+  commit.result_ = "installed";
+  commit.result_hash_ = keylane::meta::MetaSha256(commit.result_);
+  auto wrong_role_boot = commit;
+  wrong_role_boot.recipient_boot_id_ = directive.target_boot_id_;
+  EXPECT_EQ(keylane::meta::MetaFailureClassOf(
+                store.CommitDirectiveResult(wrong_role_boot, 102)),
+            keylane::meta::MetaFailureClass::kDomainReject);
+  ASSERT_TRUE(store.CommitDirectiveResult(commit, 102).ok());
+  ASSERT_EQ(store.FindOperation(id)->revision_, 2u);
+
+  // A reconciler that built its next phase from revision 1 before the result
+  // committed must reload the authoritative receipt instead of overwriting
+  // it with a stale transition.
+  TransitionOperationPhase stale_transition = transition;
+  stale_transition.expected_revision_ = 1;
+  stale_transition.kind_phase_blob_ = "stale-after-result";
+  EXPECT_EQ(
+      MetaFailureClassOf(store.TransitionOperationPhase(stale_transition, 103)),
+      MetaFailureClass::kDomainReject);
+
+  const keylane::meta::MetaTerminalReceiptKey key{id, directive.directive_id_,
+                                                  directive.attempt_id_, 101};
+  auto receipt = store.FindTerminalReceipt(key);
+  ASSERT_TRUE(receipt.has_value());
+  EXPECT_EQ(receipt->committed_index_, 102u);
+  EXPECT_EQ(receipt->result_, "installed");
+
+  // The data node did not receive ResultCommitted and sends the same result
+  // again through a later proposal. It resolves to the first receipt.
+  ASSERT_TRUE(store.CommitDirectiveResult(commit, 110).ok());
+  EXPECT_EQ(store.FindTerminalReceipt(key)->committed_index_, 102u);
+  EXPECT_EQ(store.FindOperation(id)->revision_, 2u);
+
+  CompleteOperation complete;
+  complete.operation_id_ = id;
+  complete.expected_revision_ = 2;
+  ASSERT_TRUE(store.CompleteOperation(complete).ok());
+  ArchiveOperations archive;
+  archive.operation_seqs_ = {100};
+  ASSERT_TRUE(store.ArchiveOperations(archive).ok());
+  EXPECT_EQ(store.FindTerminalReceipt(key)->committed_index_, 102u);
+
+  const auto bytes = store.Serialize();
+  ASSERT_TRUE(bytes.ok()) << bytes.status();
+  const auto restored = MetaOperationStore::Deserialize(*bytes);
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->FindTerminalReceipt(key), store.FindTerminalReceipt(key));
+}
+
+TEST(MetaOperationStore,
+     TerminalReceiptRejectsConflictAndPruneMeansNoLongerTracked) {
+  MetaOperationStore store;
+  const MetaOperationId id = MakeOperationId(1);
+  ASSERT_TRUE(store.SubmitOperation(MakeSubmit(id, 42), 100).ok());
+
+  keylane::meta::MetaDirectiveSpec directive;
+  directive.directive_id_.fill(1);
+  directive.attempt_id_.fill(2);
+  directive.recipient_node_id_ = std::string(40, 'a');
+  directive.target_node_id_ = std::string(40, 'a');
+  directive.target_boot_id_.fill(3);
+  directive.assignment_id_.fill(4);
+  directive.source_node_id_ = std::string(40, 'b');
+  directive.source_assignment_id_.fill(7);
+  directive.source_boot_id_.fill(5);
+  directive.source_replication_history_id_.fill(6);
+  directive.group_id_ = "g1";
+  directive.group_term_ = 7;
+  directive.authority_version_ = 8;
+  directive.grant_revision_ = 9;
+  directive.partition_replication_epoch_ = 10;
+  directive.kind_ = "rebuild";
+  TransitionOperationPhase transition;
+  transition.operation_id_ = id;
+  transition.current_directives_ = {directive};
+  ASSERT_TRUE(store.TransitionOperationPhase(transition, 101).ok());
+
+  keylane::meta::CommitDirectiveResult commit;
+  commit.operation_id_ = id;
+  commit.directive_id_ = directive.directive_id_;
+  commit.attempt_id_ = directive.attempt_id_;
+  commit.directive_revision_ = 101;
+  commit.recipient_node_id_ = directive.recipient_node_id_;
+  commit.recipient_boot_id_ = directive.target_boot_id_;
+  commit.assignment_id_ = directive.assignment_id_;
+  commit.status_ = keylane::meta::MetaDirectiveResultStatus::kSucceeded;
+  commit.result_ = "installed";
+  commit.result_hash_ = keylane::meta::MetaSha256(commit.result_);
+  ASSERT_TRUE(store.CommitDirectiveResult(commit, 102).ok());
+  EXPECT_EQ(store.FindOperation(id)->revision_, 2u);
+
+  keylane::meta::CommitDirectiveResult conflict = commit;
+  conflict.status_ = keylane::meta::MetaDirectiveResultStatus::kFailed;
+  EXPECT_EQ(keylane::meta::MetaFailureClassOf(
+                store.CommitDirectiveResult(conflict, 103)),
+            keylane::meta::MetaFailureClass::kDomainReject);
+
+  const keylane::meta::MetaTerminalReceiptKey key{id, directive.directive_id_,
+                                                  directive.attempt_id_, 101};
+  keylane::meta::PruneTerminalReceipts prune;
+  prune.receipts_ = {key};
+  keylane::meta::PruneTerminalReceipts missing_directive = prune;
+  missing_directive.receipts_[0].directive_id_.fill(0);
+  EXPECT_EQ(keylane::meta::MetaFailureClassOf(
+                store.PruneTerminalReceipts(missing_directive)),
+            keylane::meta::MetaFailureClass::kDomainReject);
+  EXPECT_EQ(
+      keylane::meta::MetaFailureClassOf(store.PruneTerminalReceipts(prune)),
+      keylane::meta::MetaFailureClass::kDomainReject);
+  EXPECT_TRUE(store.FindTerminalReceipt(key).has_value());
+
+  CompleteOperation complete;
+  complete.operation_id_ = id;
+  complete.expected_revision_ = 2;
+  ASSERT_TRUE(store.CompleteOperation(complete).ok());
+  ArchiveOperations archive;
+  archive.operation_seqs_ = {100};
+  ASSERT_TRUE(store.ArchiveOperations(archive).ok());
+  ASSERT_TRUE(store.PruneTerminalReceipts(prune).ok());
+  EXPECT_FALSE(store.FindTerminalReceipt(key).has_value());
+  const absl::Status replay = store.CommitDirectiveResult(commit, 104);
+  EXPECT_EQ(keylane::meta::MetaFailureClassOf(replay),
+            keylane::meta::MetaFailureClass::kDomainReject);
+  EXPECT_NE(replay.message().find("no longer tracked"), std::string_view::npos);
+  ASSERT_TRUE(store.PruneTerminalReceipts(prune).ok());
+}
+
+TEST(MetaOperationStore, TerminalReceiptRetentionIsBoundedPerOperation) {
+  MetaOperationStore store(/*max_active=*/4, /*max_archived=*/4,
+                           /*max_terminal_receipts_per_operation=*/1);
+  const MetaOperationId id = MakeOperationId(1);
+  ASSERT_TRUE(store.SubmitOperation(MakeSubmit(id, 42), 100).ok());
+
+  keylane::meta::MetaDirectiveSpec first;
+  first.directive_id_.fill(1);
+  first.attempt_id_.fill(2);
+  first.recipient_node_id_ = std::string(40, 'a');
+  first.target_node_id_ = std::string(40, 'a');
+  first.target_boot_id_.fill(3);
+  first.assignment_id_.fill(4);
+  first.source_node_id_ = std::string(40, 'b');
+  first.source_assignment_id_.fill(7);
+  first.source_boot_id_.fill(5);
+  first.source_replication_history_id_.fill(6);
+  first.group_id_ = "g1";
+  first.group_term_ = 7;
+  first.authority_version_ = 8;
+  first.grant_revision_ = 9;
+  first.partition_replication_epoch_ = 10;
+  first.kind_ = "rebuild";
+  keylane::meta::MetaDirectiveSpec second = first;
+  second.directive_id_.fill(10);
+  second.attempt_id_.fill(11);
+
+  TransitionOperationPhase transition;
+  transition.operation_id_ = id;
+  transition.current_directives_ = {first, second};
+  ASSERT_TRUE(store.TransitionOperationPhase(transition, 101).ok());
+
+  const auto make_result = [&](const keylane::meta::MetaDirectiveSpec& spec) {
+    keylane::meta::CommitDirectiveResult result;
+    result.operation_id_ = id;
+    result.directive_id_ = spec.directive_id_;
+    result.attempt_id_ = spec.attempt_id_;
+    result.directive_revision_ = 101;
+    result.recipient_node_id_ = spec.recipient_node_id_;
+    result.recipient_boot_id_ = spec.target_boot_id_;
+    result.assignment_id_ = spec.assignment_id_;
+    result.result_hash_ = keylane::meta::MetaSha256(result.result_);
+    return result;
+  };
+  ASSERT_TRUE(store.CommitDirectiveResult(make_result(first), 102).ok());
+  EXPECT_EQ(keylane::meta::MetaFailureClassOf(
+                store.CommitDirectiveResult(make_result(second), 103)),
+            keylane::meta::MetaFailureClass::kDomainReject);
+  EXPECT_TRUE(store.CommitDirectiveResult(make_result(first), 104)
+                  .ok());  // replay bypasses capacity
+}
+
 TransitionOperationPhase MakeTransition(const MetaOperationId& id,
                                         std::uint64_t expected_revision,
                                         std::string blob = "phase-1") {
@@ -755,7 +1120,7 @@ TransitionOperationPhase MakeTransition(const MetaOperationId& id,
   cmd.operation_id_ = id;
   cmd.expected_revision_ = expected_revision;
   cmd.kind_phase_blob_ = std::move(blob);
-  cmd.evidence_.push_back(MakeEvidence("node-a", 3, id));
+  cmd.evidence_.push_back(MakeEvidence(std::string(40, 'a'), 3, id));
   return cmd;
 }
 
@@ -789,7 +1154,7 @@ TEST(MetaOperationStore, TransitionRunsWithRevisionCasAndEvidence) {
   EXPECT_EQ(record->revision_, 1);  // expected + 1
   EXPECT_EQ(record->kind_phase_blob_, "phase-1");
   ASSERT_EQ(record->evidence_.size(), 1);
-  EXPECT_EQ(record->evidence_[0], MakeEvidence("node-a", 3, id));
+  EXPECT_EQ(record->evidence_[0], MakeEvidence(std::string(40, 'a'), 3, id));
   EXPECT_EQ(record->kind_, "failover");  // immutable across transitions
 
   // Replay of the same command: post-effect already present with identical
@@ -1054,7 +1419,7 @@ TEST(MetaOperationStore, PerRecordEvidenceCapEnforced) {
   transition.expected_revision_ = 0;
   transition.evidence_.assign(
       keylane::meta::kMaxMetaOperationEvidencePerRecord + 1,
-      MakeEvidence("node-a", 3));
+      MakeEvidence(std::string(40, 'a'), 3));
   EXPECT_EQ(MetaFailureClassOf(store.TransitionOperationPhase(transition)),
             MetaFailureClass::kDomainReject);
   EXPECT_EQ(store.FindOperation(id)->lifecycle_,
@@ -1108,6 +1473,11 @@ TEST(MetaOperationStore, SerializationRoundTripPreservesJournal) {
   auto restored = MetaOperationStore::Deserialize(*bytes);
   ASSERT_TRUE(restored.ok()) << restored.status();
   EXPECT_EQ(restored->FindOperation(id_live), store.FindOperation(id_live));
+  ASSERT_EQ(restored->FindOperation(id_live)->evidence_.size(), 1u);
+  EXPECT_EQ(restored->FindOperation(id_live)->evidence_.front().group_id_,
+            "group-a");
+  EXPECT_EQ(restored->FindOperation(id_live)->evidence_.front().assignment_id_,
+            MakeEvidence(std::string(40, 'a'), 3, id_live).assignment_id_);
   EXPECT_EQ(restored->FindOperation(id_done), store.FindOperation(id_done));
   EXPECT_EQ(restored->FindArchived(id_archived),
             store.FindArchived(id_archived));

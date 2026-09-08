@@ -16,8 +16,9 @@
 // Pruning a prefix does not break verification of what remains: the store
 // keeps the hash of the last pruned record as the new anchor, and exported
 // bytes carry the anchor they chain from, so an external archive can verify
-// continuity across exports. External archives deduplicate by
-// (cluster_id, raft_log_index, record_hash).
+// continuity across exports. Keylane deliberately has no persisted cluster
+// identity; an external archive supplies its own deployment namespace and
+// deduplicates records within it by (raft_log_index, record_hash).
 //
 // Replay idempotency: appending an index already in the window with identical
 // content is a no-op. Append of an existing index with DIFFERENT content, an

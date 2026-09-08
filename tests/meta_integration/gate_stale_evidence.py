@@ -11,9 +11,9 @@ One 3-node cluster; serial phases:
    and visible through the facts-filtered query path.
 3. Forgery matrix, every entry rejected AND written to the obs audit ring:
    stale session generation (after the generation advanced), future group
-   term, old boot incarnation under the current generation, and an
-   unregistered node. The generation bump itself purged the earlier
-   candidate (superseded-by-generation audit event).
+   term, stale partition replication epoch, old boot incarnation under the
+   current generation, and an unregistered node. The generation bump itself
+   purged the earlier candidate (superseded-by-generation audit event).
 4. Operation evidence lifecycle: a history binding committed via
    transitionop lets evidence be ACCEPTED while the operation is live;
    forged evidence (unbound history) is rejected and the operation never
@@ -35,11 +35,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness as H  # noqa: E402
 
 # Data-plane node id (40 lowercase hex chars, the topology convention) and
-# boot incarnations (32 hex chars = 16 bytes, opaque, never ordered).
+# Boot incarnations (40 hex chars = 20 bytes, opaque, never ordered).
 DATA_NODE = "dd" * 20
 GHOST_NODE = "ee" * 20
-BOOT_A = "a1" * 16
-BOOT_B = "b2" * 16
+BOOT_A = "a1" * 20
+BOOT_B = "b2" * 20
 GROUP = "g1"
 
 
@@ -70,11 +70,13 @@ def main():
 
         # --- phase 1: committed anchors ----------------------------------
         expect_ok(leader.registernode(DATA_NODE, f"keylane://node/{DATA_NODE}",
-                                      "primary"),
+                                      "primary",
+                                      endpoints=("tcp://127.0.0.1:6379",)),
                   "registernode")
         expect_ok(leader.creategroup(GROUP), "creategroup")
+        expect_ok(leader.assignnode(GROUP, DATA_NODE), "assignnode")
         expect_ok(leader.begingroupterm(GROUP, 0, 1), "begingroupterm 0->1")
-        H.log("phase 1: node registered, group g1 at committed term 1")
+        H.log("phase 1: node registered and assigned, group g1 at term 1")
 
         # --- phase 2: valid candidate accepted ---------------------------
         expect_ok(leader.adoptsession(DATA_NODE, BOOT_A, 1), "adoptsession 1")
@@ -106,6 +108,11 @@ def main():
                                  term=2, manifest=0, history=7),
             "future-term candidate", "term-mismatch")
         expect_err(
+            leader.obs_candidate(DATA_NODE, BOOT_A, 2, GROUP,
+                                 term=1, manifest=0, history=7,
+                                 partition_epoch=1),
+            "stale-population-epoch candidate", "partition-epoch-mismatch")
+        expect_err(
             leader.obs_candidate(DATA_NODE, BOOT_B, 2, GROUP,
                                  term=1, manifest=0, history=7),
             "old-boot candidate", "boot-mismatch")
@@ -115,11 +122,13 @@ def main():
         audit = leader.obsaudit()
         for needle in ("detail=superseded-by-generation:2",
                        "detail=stale-generation",
-                       "detail=term-mismatch", "detail=boot-mismatch",
+                       "detail=term-mismatch",
+                       "detail=partition-epoch-mismatch",
+                       "detail=boot-mismatch",
                        "detail=node-not-active"):
             if needle not in audit:
                 raise H.Failure(f"obsaudit missing {needle!r}: {audit}")
-        H.log("phase 3: forged generation/term/boot/node all rejected "
+        H.log("phase 3: forged generation/term/epoch/boot/node all rejected "
               "and audited")
 
         # --- phase 4: operation evidence lifecycle ------------------------
@@ -140,6 +149,11 @@ def main():
         # The submit committed history 55; well-formed evidence is accepted
         # after the operation enters its running phase.
         expect_ok(leader.transitionop(op_id, "phase1", 55), "transitionop")
+        expect_err(
+            leader.obs_evidence(DATA_NODE, BOOT_A, 2, op_id, "phase1",
+                                "old-generation", GROUP, term=1, manifest=0,
+                                history=55, partition_epoch=1),
+            "wrong-population-epoch evidence", "partition-epoch-mismatch")
         expect_ok(
             leader.obs_evidence(DATA_NODE, BOOT_A, 2, op_id, "phase1",
                                 "proof", GROUP, term=1, manifest=0,
@@ -164,6 +178,7 @@ def main():
             "evidence after terminal", "operation-unknown-or-terminal")
         audit = leader.obsaudit()
         for needle in ("detail=history-not-bound",
+                       "detail=partition-epoch-mismatch",
                        "detail=commit-stale:operation-unknown-or-terminal",
                        "detail=operation-unknown-or-terminal"):
             if needle not in audit:

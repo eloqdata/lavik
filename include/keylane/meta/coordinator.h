@@ -91,6 +91,7 @@
 #include <condition_variable>
 #include <coroutine>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -126,7 +127,7 @@ class MetaCoordinator;
 // Opaque propose-timeout machinery (coordinator.cpp); see
 // MetaCoordinatorOptions::propose_timeout_ms_.
 class MetaProposeTimer;
-class MetaAuditProposalGate;
+class MetaProposalGate;
 
 // ---------------------------------------------------------------------------
 // Trust boundary: passkey + transport-authorized principal (see the file
@@ -199,11 +200,16 @@ class MetaStoresFacts : public MetaCommittedFacts {
 
   bool IsActiveNode(std::string_view node_id) const override;
   uint64_t CurrentGroupTerm(std::string_view group_id) const override;
-  uint64_t CurrentPopulationManifestId(
+  uint64_t CurrentPopulationManifestRevision(
       std::string_view group_id) const override;
+  uint64_t CurrentPartitionReplicationEpoch(
+      std::string_view group_id) const override;
+  bool AssignmentMatches(std::string_view group_id, std::string_view node_id,
+                         const MetaAssignmentId& assignment_id) const override;
   bool OperationNonTerminal(const MetaOperationId& id) const override;
-  bool HistoryBoundToOperation(const MetaOperationId& id,
-                               uint64_t history_id) const override;
+  bool HistoryBoundToOperation(
+      const MetaOperationId& id,
+      const MetaReplicationHistoryId& history_id) const override;
 
  private:
   const MetaStores& stores_;
@@ -428,6 +434,13 @@ class MetaCoordinator {
   // One atomic read of the committed aggregate (see MetaCommittedView).
   MetaCommittedView CommittedView();
 
+  // O(1) MetaStores-change watermark published synchronously by command apply
+  // and snapshot install. Unlike last_commit_index this excludes Raft
+  // configuration entries, which cannot change a Data projection. Session
+  // lease gates use it to detect a committed store change before an
+  // asynchronous subscription callback reaches their worker.
+  std::uint64_t CommittedHighWater() const;
+
   // See MetaSubscriptionStart for the delivery contract. queue_capacity == 0
   // selects options_.default_subscription_capacity_.
   MetaSubscriptionStart SubscribeCommitted(MetaCommitCallback callback,
@@ -444,10 +457,12 @@ class MetaCoordinator {
 
   // Raft role edges, wired from NuRaft's init_options::raft_callback_
   // (BecomeLeader/BecomeFollower). O(1), non-blocking, safe from NuRaft
-  // callback threads; redundant edges are coalesced. The seam relies on
-  // transition EVENTS, not state polling: wire the callback before the server
-  // can win an election (a coordinator constructed after the fact does not
-  // retroactively observe leadership).
+  // callback threads. Every edge is queued in arrival order: in particular, a
+  // Follower edge is an uncancellable barrier whose CancelAndWait and volatile
+  // observation reset finish before a later Leader edge may restart work. The
+  // seam relies on transition EVENTS, not state polling; process assembly uses
+  // MetaLeadershipRelay below so edges racing coordinator attachment are not
+  // lost.
   void BecomeLeader();
   void BecomeFollower();
 
@@ -484,12 +499,13 @@ class MetaCoordinator {
 
   std::vector<MetaValidateHook> hooks_;  // assembly-time only
 
-  // Coroutine lifetime accounting for teardown. Audit headroom has a
-  // separate shared gate whose reservations follow the Raft completion.
+  // Coroutine lifetime accounting for teardown. Proposal headroom and
+  // fail-safe recovery have a separate shared gate whose reservations follow
+  // the Raft completion, including after a caller-visible timeout.
   std::mutex gate_mu_;
   std::condition_variable gate_cv_;
   std::uint64_t in_flight_ = 0;
-  std::shared_ptr<MetaAuditProposalGate> audit_gate_;
+  std::shared_ptr<MetaProposalGate> proposal_gate_;
 
   std::atomic<bool> stopping_{false};
 
@@ -503,11 +519,22 @@ class MetaCoordinator {
   std::shared_ptr<MetaSubscriptionCore> sub_core_;
   std::thread dispatch_thread_;
 
-  // Leadership state: the leadership thread owns every Start/CancelAndWait
-  // call, serialized.
+  // Leadership state: callers only append to the event queue. The leadership
+  // thread owns reconcilers_ and applied_leader_, and performs every
+  // Start/CancelAndWait call without holding leadership_mu_. This keeps Raft
+  // callbacks O(1) even while a reconciler is draining.
+  enum class LeadershipEventKind : std::uint8_t {
+    kRegister,
+    kBecomeLeader,
+    kBecomeFollower,
+  };
+  struct LeadershipEvent {
+    LeadershipEventKind kind_;
+    std::shared_ptr<MetaReconciler> reconciler_;
+  };
   std::mutex leadership_mu_;
   std::condition_variable leadership_cv_;
-  bool desired_leader_ = false;
+  std::deque<LeadershipEvent> leadership_events_;
   bool applied_leader_ = false;
   struct ReconcilerEntry {
     std::shared_ptr<MetaReconciler> reconciler_;
@@ -516,6 +543,37 @@ class MetaCoordinator {
   std::vector<ReconcilerEntry> reconcilers_;
   std::thread leadership_thread_;
   MetaLeaderContext leader_context_;
+};
+
+// Process-wiring bridge between NuRaft role callbacks and MetaCoordinator.
+// The callback records its exact edge synchronously, then asks the Celer worker
+// to Drain; this preserves callback order even if worker notifications are
+// delayed or coalesced. NuRaft can emit edges before the coordinator is
+// assembled, so Attach drains the retained prefix too. DetachAndStop is a
+// lifetime/order barrier: after it returns no callback can enqueue into the old
+// coordinator. Its target is non-owning and must remain alive from Attach
+// through DetachAndStop.
+class MetaLeadershipRelay {
+ public:
+  void RecordLeaderEdge() noexcept;
+  void RecordFollowerEdge() noexcept;
+  // Worker-side drain; a pre-attach call leaves the events retained.
+  void Drain() noexcept;
+  void Attach(MetaCoordinator& coordinator);
+  void DetachAndStop() noexcept;
+
+ private:
+  enum class Role : std::uint8_t { kLeader, kFollower };
+  void Record(Role role) noexcept;
+  static void Forward(MetaCoordinator& coordinator, Role role);
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<Role> pending_;
+  MetaCoordinator* target_ = nullptr;
+  bool attached_once_ = false;
+  bool draining_ = false;
+  bool stopped_ = false;
 };
 
 }  // namespace keylane::meta

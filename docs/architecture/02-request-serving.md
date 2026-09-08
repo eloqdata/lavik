@@ -285,8 +285,13 @@ preventing scripts from probing disabled libraries. Ordinary commands do not
 take this worker-local Lua gate. Once an invocation exceeds
 `lua-time-limit`, however, a process-wide busy flag makes ordinary non-replay
 commands return `BUSY`; the matching `SCRIPT KILL` or `FUNCTION KILL` and
-`FUNCTION STATS` remain available. An invocation that has written or came from
-replication cannot be killed in a way that would expose partial effects.
+`FUNCTION STATS` bypass the ordinary execution gates and remain admissible.
+Lua 5.1 cannot yield across a protected-call C boundary, however, so a script
+that repeatedly catches its instruction-hook error can monopolize its worker.
+A kill connection accepted by that same worker cannot be read until the
+invocation yields; callers must retry through another connection while this
+worker-affinity limitation remains. An invocation that has written or came
+from replication cannot be killed in a way that would expose partial effects.
 
 ## Pub/Sub mode
 

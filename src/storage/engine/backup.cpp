@@ -197,6 +197,9 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
         "RDB snapshot has no captured physical pin list");
   const auto& blocks = value->block_pins_->blocks_;
 
+  // Keep same-worker and cross-worker suspensions in separate statements.
+  // GCC 13 can reuse the wrong coroutine-frame slot for co_await in both ?:
+  // arms.
   auto pin_one = [this](BlockPin pin) -> Task<absl::Status> {
     const unsigned owner = BlockOwner(pin.block_id_);
     if (owner >= worker_count_) {
@@ -218,9 +221,13 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
       ++state->pins_;
       co_return absl::OkStatus();
     };
-    co_return owner == celer::ThisWorker().id_
-        ? co_await on_owner()
-        : co_await celer::SubmitTaskTo(owner, on_owner);
+    absl::Status status;
+    if (owner == celer::ThisWorker().id_) {
+      status = co_await on_owner();
+    } else {
+      status = co_await celer::SubmitTaskTo(owner, on_owner);
+    }
+    co_return status;
   };
 
   auto release_one = [this](BlockPin pin) -> Task<absl::Status> {
@@ -241,9 +248,13 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
       }
       co_return absl::OkStatus();
     };
-    co_return owner == celer::ThisWorker().id_
-        ? co_await on_owner()
-        : co_await celer::SubmitTaskTo(owner, on_owner);
+    absl::Status status;
+    if (owner == celer::ThisWorker().id_) {
+      status = co_await on_owner();
+    } else {
+      status = co_await celer::SubmitTaskTo(owner, on_owner);
+    }
+    co_return status;
   };
 
   std::size_t pinned = 0;
@@ -288,9 +299,13 @@ Task<absl::Status> StorageEngine::Impl::ReleaseRdbSnapshotValue(
       }
       co_return absl::OkStatus();
     };
-    absl::Status released = owner == celer::ThisWorker().id_
-                                ? co_await on_owner()
-                                : co_await celer::SubmitTaskTo(owner, on_owner);
+    // Preserve the GCC 13 coroutine-frame invariant from the pin path above.
+    absl::Status released;
+    if (owner == celer::ThisWorker().id_) {
+      released = co_await on_owner();
+    } else {
+      released = co_await celer::SubmitTaskTo(owner, on_owner);
+    }
     if (!released.ok()) co_return released;
   }
   value->block_pins_.reset();

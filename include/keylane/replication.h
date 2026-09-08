@@ -6,6 +6,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -25,6 +26,10 @@ class StorageEngine;
 
 namespace keylane {
 
+namespace detail {
+class ClusterRebuildCompletionState;
+}  // namespace detail
+
 struct ReplicaOfConfig {
   std::string host_;
   std::uint16_t port_ = 0;
@@ -33,10 +38,18 @@ struct ReplicaOfConfig {
 };
 
 struct ReplicationOptions {
-  // Cluster-managed replication is fail-closed and assigns this process to at
-  // most one replication group. The manager must not infer standalone
-  // REPLICAOF or import state as an activated cluster population.
+  // Any Redis Cluster data plane disables standalone upstream control and
+  // every Redis PSYNC export. Static topology also disables native export;
+  // Meta-managed native export instead requires an exact population grant.
   bool cluster_enabled_ = false;
+  // Meta-managed replication is fail-closed and assigns this process to at
+  // most one replication group. It must not infer recovered storage as an
+  // activated population; only NodeControl may install the boot-local proof.
+  bool cluster_population_managed_ = false;
+  // Set only by the Meta control adapter to its validated 160-bit data-node
+  // identity. A missing value keeps standalone and static-file deployments on
+  // a fresh CSPRNG identity for each process boot.
+  std::optional<std::string> node_id_override_;
   // Consulted only while this node has an upstream. REPLICAOF NO ONE opens
   // writes only after the shared promotion durability path succeeds.
   bool replica_read_only_ = true;
@@ -133,7 +146,7 @@ struct ReplicationStatus {
   std::string failure_reason_;
 };
 
-// Typed current-boot result exposed to the future Meta control adapter. A
+// Typed current-boot result exposed to the Data-side node controller. A
 // missing ready token means the population must not be reported as readable
 // or candidate-eligible even if partial records exist on disk.
 struct ClusterPopulationStatus {
@@ -146,6 +159,51 @@ struct ClusterPopulationStatus {
   std::optional<ReadyToken> ready_token_;
   // Nonempty exactly while state_ is kFailedStopped.
   std::string failure_reason_;
+};
+
+// FDS-owned subset of population identity. Assignment and immutable manifest
+// plus the Meta partition-replication epoch decide whether a completed local
+// population still belongs to the group; a term additionally scopes an
+// in-progress attempt. BeginGroupTerm fences authority but does not mutate
+// bytes, so a completed population may be re-anchored to a later committed
+// term without another destructive rebuild.
+struct DesiredClusterPopulation {
+  std::string group_id_;
+  std::string assignment_id_;
+  std::uint64_t term_ = 0;
+  std::uint64_t manifest_revision_ = 0;
+  PopulationManifestId manifest_id_;
+  std::uint64_t partition_replication_epoch_ = 0;
+  // False means the FDS removed the live rebuild directive: an in-progress
+  // attempt must retire even when its population identity still matches.
+  bool rebuild_expected_ = false;
+
+  friend bool operator==(const DesiredClusterPopulation&,
+                         const DesiredClusterPopulation&) = default;
+};
+
+// A boot-local handle for one exact Meta rebuild attempt. Starting a rebuild
+// and observing its terminal outcome are separate so reconciliation may
+// supersede an in-progress attempt without treating admission as completion.
+// Await() is repeatable and returns only after the attempt is Ready or after
+// cancellation/failure cleanup has made its partial storage effects unusable.
+class ClusterRebuildCompletion {
+ public:
+  ClusterRebuildCompletion() = default;
+
+  celer::Task<absl::Status> Await() const;
+  // Lock-safe nonblocking observation used by a control session whose wire
+  // lifetime may end before the underlying rebuild attempt does.
+  std::optional<absl::Status> result() const;
+  bool valid() const noexcept { return state_ != nullptr; }
+
+ private:
+  explicit ClusterRebuildCompletion(
+      std::shared_ptr<detail::ClusterRebuildCompletionState> state)
+      : state_(std::move(state)) {}
+
+  friend class ReplicationManager;
+  std::shared_ptr<detail::ClusterRebuildCompletionState> state_;
 };
 
 // A source-history-local cut across Keylane's worker replication logs. Native
@@ -198,26 +256,67 @@ class ReplicationManager {
   celer::Task<absl::Status> ApplyDirective(ReplicationDirective directive);
   celer::Task<ReplicationStatus> Observe() const;
 
-  // Applies one already-validated Meta full-rebuild directive to the single
-  // local replication group. This is the #16 runtime orchestration seam: it
-  // validates the complete identity and safe-source capability, forces a
-  // fresh native FULL, and drives the existing reset/snapshot/tail/promote/
-  // abort path. #20 supplies the control transport and calls this method.
+  // Starts one already-validated Meta full-rebuild directive and returns the
+  // exact attempt's boot-local completion. Admission is not a terminal result:
+  // callers that acknowledge a directive must Await() the returned handle.
+  // Exact replay shares the original completion, while supersession resolves
+  // the older handle only after cancellation/join/abort has finished.
+  celer::Task<absl::StatusOr<ClusterRebuildCompletion>>
+  StartClusterRebuildDirective(ReplicaOfConfig upstream,
+                               RebuildDirective directive,
+                               PopulationManifest manifest);
+
+  // Starts and awaits one full rebuild. This is the NodeControl action seam;
+  // success means the exact attempt published its ReadyToken after storage
+  // promotion, not merely that a coordinator was launched.
   celer::Task<absl::Status> ApplyClusterRebuildDirective(
       ReplicaOfConfig upstream, RebuildDirective directive,
       PopulationManifest manifest);
 
-  // Returns one coherent boot-scoped population snapshot for the future
-  // control adapter.
+  // Process-shutdown barrier for Meta-managed target rebuilds. It closes the
+  // native session immediately on worker zero, then returns only after the
+  // coordinator has joined its flows and retired any partial candidate root.
+  // This must run while the Celer runtime and StorageEngine are still alive.
+  celer::Task<absl::Status> CancelClusterRebuildForShutdown();
+
+  // Thread-safe first half of process shutdown. It closes outbound target
+  // handshakes/sessions and inbound native/Redis source sockets immediately.
+  // Source flow teardown releases retained backlog cursors, so callers must
+  // invoke this before waiting for admitted client writes to drain.
+  void RequestShutdown() noexcept;
+
+  // Process-wide replication shutdown barrier. Prevents native and Redis
+  // targets from reconnecting, joins their active apply flows, aborts an
+  // incomplete replacement root, and retires source egress/history before
+  // storage freezes its index. RequestShutdown must be called first by a
+  // non-runtime waiter; calling this coroutine also performs it idempotently.
+  celer::Task<absl::Status> QuiesceForShutdown();
+
+  // Reconciles the runtime-only target population with an installed FDS.
+  // A mismatch (or null desired identity) closes serving immediately, joins
+  // native flows, aborts a partial root, retires the ReadyToken/attempt, and
+  // resolves its completion. Unlike shutdown cancellation, later directives
+  // remain admissible.
+  celer::Task<absl::Status> ReconcileClusterPopulation(
+      std::optional<DesiredClusterPopulation> desired);
+
+  // Transport loss cannot leave an unobserved destructive attempt running.
+  // A completed Ready population is retained so reconnecting with the same
+  // FDS does not force another full rebuild.
+  celer::Task<absl::Status> CancelInProgressClusterPopulation();
+
+  // Returns one coherent boot-scoped population snapshot for heartbeat
+  // candidate reporting and directive validation.
   celer::Task<ClusterPopulationStatus> cluster_population_status() const;
 
-  // Installs one safe-source authorization delivered by the future Meta
-  // adapter. A cluster node exports a population only when it is itself ready
-  // and activated as the local primary with no upstream, and the incoming
+  // Installs one safe-source authorization delivered through the node
+  // controller. A cluster node exports a population only when it is itself
+  // ready and activated as the local primary with no upstream, and the incoming
   // native handshake presents this exact rebuild identity. Revisions are
   // monotonic: a newer one revokes and joins older exports before becoming
-  // active, and a revoked version cannot be replayed. #21 supplies the
-  // primary-activation transition and its authority fence.
+  // active, and a revoked version cannot be replayed. Until a committed
+  // primary-activation transition supplies its authority fence, export stays
+  // fail-closed.
   celer::Task<absl::Status> AuthorizeClusterRebuildSource(
       RebuildDirective directive);
 
@@ -228,6 +327,13 @@ class ReplicationManager {
   // managers reject this cluster-only transition without disturbing ordinary
   // downstream replication sessions.
   celer::Task<absl::Status> RevokeClusterRebuildSourceAuthorizations();
+
+  // Joins capabilities inherited from a disconnected Meta control session
+  // without advancing the committed revoke floor. The replacement session
+  // may replay the exact current FDS only after the caller has prevented every
+  // continuation from the old session from dispatching more directives.
+  celer::Task<absl::Status>
+  ClearClusterRebuildSourceAuthorizationsForSessionReplacement();
 
   // Current runtime settings; all mutations enter through ApplyDirective.
   unsigned snapshot_read_concurrency() const noexcept;

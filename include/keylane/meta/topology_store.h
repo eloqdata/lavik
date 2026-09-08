@@ -27,7 +27,8 @@
 //     clears the map. config_epoch values are absolute assignments, no
 //     ordering enforced here.
 //   - MetaGroupRecord fields (owner, group_term, authority_version,
-//     population_manifest_id, partition_replication_epoch) and per-group
+//     population manifest revision/digest, partition_replication_epoch) and
+//     per-group
 //     config_epoch change ONLY through the granular primitives below: the
 //     term/grant semantics and the atomicity of owner switches (failover /
 //     ActivateAuthority) span the grant store and are orchestrated by the
@@ -76,6 +77,7 @@ namespace keylane::meta {
 // One member of a group. Query results are sorted by node_id.
 struct MetaGroupMember {
   std::string node_id_;
+  MetaAssignmentId assignment_id_{};
   MetaNodeRole role_ = MetaNodeRole::kPrimary;
   bool operator==(const MetaGroupMember&) const = default;
 };
@@ -113,8 +115,10 @@ class MetaTopologyStore {
   absl::Status SetGroupTerm(const std::string& group_id, std::uint64_t term);
   absl::Status SetAuthorityVersion(const std::string& group_id,
                                    std::uint64_t authority_version);
-  absl::Status SetPopulationManifestId(const std::string& group_id,
-                                       std::uint64_t manifest_id);
+  absl::Status SetPopulationManifest(const std::string& group_id,
+                                     std::uint64_t manifest_revision,
+                                     const MetaHash256& manifest_digest);
+  bool PopulationManifestInUse(const MetaHash256& manifest_digest) const;
   absl::Status SetPartitionReplicationEpoch(const std::string& group_id,
                                             std::uint64_t epoch);
   absl::Status SetGroupConfigEpoch(const std::string& group_id,
@@ -133,6 +137,7 @@ class MetaTopologyStore {
   // Owning group of a slot; nullopt when unassigned or slot out of range.
   std::optional<std::string> SlotOwner(std::uint32_t slot) const;
   bool GroupExists(const std::string& group_id) const;
+  std::vector<MetaTopologyGroupView> Groups() const;
   std::size_t GroupCount() const { return groups_.size(); }
 
   // Snapshot support: u16 schema_version envelope, deterministic bytes.
@@ -148,12 +153,22 @@ class MetaTopologyStore {
     MetaGroupRecord record_;
     std::uint64_t config_epoch_ = 0;
     std::uint64_t revision_ = 0;
-    std::map<std::string, MetaNodeRole> members_;  // node_id -> role, sorted
+    struct MemberState {
+      MetaAssignmentId assignment_id_{};
+      MetaNodeRole role_ = MetaNodeRole::kPrimary;
+      bool operator==(const MemberState&) const = default;
+    };
+    std::map<std::string, MemberState> members_;  // node_id -> state, sorted
   };
 
   std::map<std::string, GroupState> groups_;  // by group_id, sorted
   // node_id -> group_id reverse index enforcing one-node-one-group.
   std::map<std::string, std::string> group_of_node_;
+  // Retained after removal to reject direct replay of the most recent
+  // membership identity across snapshot/restart. Assignment ids are globally
+  // unique by proposer contract; this bounded index is not an unbounded
+  // history of every prior incarnation.
+  std::map<std::string, MetaAssignmentId> last_assignment_by_node_;
   // Slot -> owning group_id; empty string = unassigned.
   std::array<std::string, kMetaSlotCount> slots_;
   std::uint64_t topology_epoch_ = 0;

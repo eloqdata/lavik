@@ -1,7 +1,7 @@
 #pragma once
 
 // MetaStateMachine is the metadata control plane's NuRaft `state_machine`.
-// It owns the committed aggregate `MetaStores` (six stores) and applies every
+// It owns the committed aggregate `MetaStores` (seven stores) and applies every
 // committed entry through
 // the deterministic pure function ApplyCommitted (see state_apply.h).
 //
@@ -157,7 +157,7 @@ class MetaStateMachine : public nuraft::state_machine {
       const MetaCommand& command);
 
   // Atomic copy of the whole committed aggregate (the CommittedView
-  // building block; KB-scale). All six stores move together — readers never
+  // building block; KB-scale). All seven stores move together — readers never
   // observe a cross-store tear.
   MetaStores StoresSnapshot() const;
 
@@ -205,6 +205,12 @@ class MetaStateMachine : public nuraft::state_machine {
                      nuraft::ptr<nuraft::cluster_config>& new_conf) override;
   nuraft::ptr<nuraft::snapshot> last_snapshot() override;
   nuraft::ulong last_commit_index() override;
+  // Highest log index that replaced or applied MetaStores. Raft membership
+  // configuration entries advance last_commit_index() but not this cursor,
+  // because they cannot change a Data node projection.
+  nuraft::ulong state_change_index() const noexcept {
+    return last_state_change_idx_.load(std::memory_order_acquire);
+  }
   void create_snapshot(
       nuraft::snapshot& s,
       nuraft::async_result<bool>::handler_type& when_done) override;
@@ -279,6 +285,7 @@ class MetaStateMachine : public nuraft::state_machine {
   uint64_t receiving_next_obj_ = 0;
 
   std::atomic<uint64_t> last_committed_idx_{0};
+  std::atomic<uint64_t> last_state_change_idx_{0};
   std::atomic<uint64_t> consecutive_snapshot_failures_{0};
 
   // Serializes snapshot file IO between the writer thread and the

@@ -85,20 +85,47 @@ enum class MetaOperationLifecycle : std::uint8_t {
   kAborted = 4,    // terminal
 };
 
-// A live operation record. The full intent blob is deliberately NOT retained:
-// the record carries the intent_hash only (see the task field list; the log
-// holds the original command).
+struct MetaCurrentDirective {
+  MetaDirectiveSpec spec_;
+  std::uint64_t directive_revision_ = 0;  // transition Raft apply index
+  bool operator==(const MetaCurrentDirective&) const = default;
+};
+
+// Durable proof that Meta committed one exact data-node result. It is kept
+// with the operation across live and archive state so a data node can replay
+// after losing ResultCommitted and receive the original committed index.
+struct MetaTerminalReceipt {
+  MetaTerminalReceiptKey key_;
+  std::string recipient_node_id_;
+  MetaBootIncarnation recipient_boot_id_{};
+  MetaAssignmentId assignment_id_{};
+  MetaDirectiveResultStatus status_ = MetaDirectiveResultStatus::kSucceeded;
+  MetaHash256 result_hash_{};
+  std::string result_;
+  std::uint64_t committed_index_ = 0;
+  bool operator==(const MetaTerminalReceipt&) const = default;
+};
+
+// A live operation record. The canonical intent is retained because Raft log
+// compaction removes the submit command; recovery and a new leader must still
+// be able to reconstruct the operation without consulting old log entries.
 struct MetaOperationRecord {
   MetaOperationId operation_id_{};
   std::uint64_t operation_seq_ = 0;  // raft log index of the submit
   std::string kind_;
+  std::string intent_;
   MetaHash256 intent_hash_{};
-  std::uint64_t replication_history_id_ = 0;
+  MetaReplicationHistoryId replication_history_id_{};
   std::vector<MetaPolicyReference> policy_references_;
   MetaOperationLifecycle lifecycle_ = MetaOperationLifecycle::kSubmitted;
   // Opaque to committed apply; operation-specific coordinators own the schema.
   std::string kind_phase_blob_;
-  std::uint64_t revision_ = 0;  // CAS token; bumps on every accepted mutation
+  std::vector<MetaCurrentDirective> current_directives_;
+  std::vector<MetaTerminalReceipt> terminal_receipts_;
+  // Phase CAS token; bumps on every accepted mutation, including the first
+  // commit of each authoritative directive result (exact receipt replay does
+  // not bump it again).
+  std::uint64_t revision_ = 0;
   std::vector<MetaEvidenceSummary> evidence_;  // persisted summaries, in order
   std::string terminal_result_;  // Completed: result; Aborted: reason
   bool data_loss_possible_ = false;
@@ -106,9 +133,9 @@ struct MetaOperationRecord {
   bool operator==(const MetaOperationRecord&) const = default;
 };
 
-// Tombstone of an archived terminal operation. Kept
-// for the retention window so late duplicate submissions resolve
-// deterministically.
+// Tombstone of an archived terminal operation. Kept for the retention window
+// so late duplicate submissions resolve deterministically and lost result
+// acknowledgements can replay their original TerminalReceipt.
 struct MetaOperationArchiveSummary {
   MetaOperationId operation_id_{};
   std::uint64_t operation_seq_ = 0;
@@ -118,6 +145,7 @@ struct MetaOperationArchiveSummary {
       MetaOperationLifecycle::kCompleted;  // kCompleted or kAborted only
   std::string terminal_result_;
   bool data_loss_possible_ = false;
+  std::vector<MetaTerminalReceipt> terminal_receipts_;
   bool operator==(const MetaOperationArchiveSummary&) const = default;
 };
 
@@ -133,20 +161,38 @@ class MetaOperationStore {
  public:
   explicit MetaOperationStore(
       std::uint32_t max_active = kMaxMetaActiveOperations,
-      std::uint32_t max_archived = kMaxMetaArchivedOperationSummaries)
-      : max_active_(max_active), max_archived_(max_archived) {}
+      std::uint32_t max_archived = kMaxMetaArchivedOperationSummaries,
+      std::uint32_t max_terminal_receipts_per_operation =
+          kMaxMetaTerminalReceiptsPerOperation)
+      : max_active_(max_active),
+        max_archived_(max_archived),
+        max_terminal_receipts_per_operation_(
+            max_terminal_receipts_per_operation) {}
 
   // operation_seq is the raft log index of this very command, supplied by the
   // apply caller. See the file header for the idempotency and fail-stop
   // semantics.
   absl::StatusOr<MetaSubmitResult> SubmitOperation(
       const SubmitOperation& command, std::uint64_t operation_seq);
-  absl::Status TransitionOperationPhase(
-      const TransitionOperationPhase& command);
+  absl::Status TransitionOperationPhase(const TransitionOperationPhase& command,
+                                        std::uint64_t committed_index = 1);
   absl::Status CompleteOperation(const CompleteOperation& command);
   absl::Status AbortOperation(const AbortOperation& command);
+  absl::Status CommitDirectiveResult(const CommitDirectiveResult& command,
+                                     std::uint64_t committed_index);
   absl::Status ArchiveOperations(const ArchiveOperations& command);
   absl::Status PruneArchive(const PruneOperationArchive& command);
+  absl::Status PruneTerminalReceipts(
+      const keylane::meta::PruneTerminalReceipts& command);
+
+  // Removes exact live directive attempts whose committed cross-store anchor
+  // is no longer valid. The caller supplies full receipt keys so a later
+  // attempt reusing a directive id cannot be removed accidentally. Every
+  // affected operation advances its phase CAS revision once, regardless of
+  // how many of its directives are cleared; replay with already-absent keys
+  // is a deterministic no-op. Revision saturation never wraps.
+  void InvalidateCurrentDirectives(
+      const std::vector<MetaTerminalReceiptKey>& directive_keys);
 
   // Fact queries. Archived ids/seqs resolve to their terminal summary —
   // "already done" — while unknown ones return nullopt.
@@ -158,6 +204,11 @@ class MetaOperationStore {
       const MetaOperationId& id) const;
   std::optional<MetaOperationArchiveSummary> FindArchivedBySeq(
       std::uint64_t seq) const;
+  // Absence has the wire-level meaning ResultNoLongerTracked. A tracked
+  // receipt always returns its first commit index, including after archival.
+  std::optional<MetaTerminalReceipt> FindTerminalReceipt(
+      const MetaTerminalReceiptKey& key) const;
+  std::vector<MetaOperationRecord> LiveOperations() const;
   bool OperationKnown(const MetaOperationId& id) const {
     return live_.contains(id) || archived_.contains(id);
   }
@@ -169,6 +220,9 @@ class MetaOperationStore {
   // True only for a live Submitted/Running operation. Terminal records no
   // longer block retirement even before archival.
   bool PolicyInUse(std::string_view policy_id, std::uint64_t version) const;
+  // Active operation evidence/directives retain manifest documents needed to
+  // validate or resume their current phase.
+  bool PopulationManifestInUse(const MetaHash256& digest) const;
   std::size_t ActiveCount() const { return active_count_; }  // non-terminal
   std::size_t LiveCount() const { return live_.size(); }
   std::size_t ArchivedCount() const { return archived_.size(); }
@@ -184,11 +238,14 @@ class MetaOperationStore {
   static absl::StatusOr<MetaOperationStore> Deserialize(
       std::string_view bytes,
       std::uint32_t max_active = kMaxMetaActiveOperations,
-      std::uint32_t max_archived = kMaxMetaArchivedOperationSummaries);
+      std::uint32_t max_archived = kMaxMetaArchivedOperationSummaries,
+      std::uint32_t max_terminal_receipts_per_operation =
+          kMaxMetaTerminalReceiptsPerOperation);
 
  private:
   std::uint32_t max_active_;
   std::uint32_t max_archived_;
+  std::uint32_t max_terminal_receipts_per_operation_;
   std::map<MetaOperationId, MetaOperationRecord> live_;
   std::map<std::uint64_t, MetaOperationId> live_by_seq_;
   std::map<MetaOperationId, MetaOperationArchiveSummary> archived_;

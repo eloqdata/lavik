@@ -512,31 +512,26 @@ unsigned ShardForKey(std::string_view key) {
   return g_storage->OwnerForKey(key);
 }
 
-// Re-admission for blocking commands. A blocking command was
-// admitted at dispatch time, but a topology reload may have fenced its slot
-// while it waited; every attempt re-runs the admission gate against the
-// current ServingState before touching storage. Every user of
-// ExecuteBlockingWaitLoop is a write (blocking pops and moves), so the view
-// is evaluated as a write. Returns the standard wire error to terminate the
-// wait with, or std::nullopt when the attempt may proceed.
+// Re-admission for blocking commands. A blocking command was admitted at
+// dispatch time, but its topology, session, or finite lease may be revoked
+// while it waits; every attempt asks AuthorityGuard for a fresh proof before
+// touching storage. Every user of ExecuteBlockingWaitLoop is a write, so the
+// view is evaluated as a write. Returns the standard wire error to terminate
+// the wait with, or std::nullopt when the attempt may proceed.
 std::optional<CommandReply> ClusterBlockingAdmissionError(
     std::span<const std::uint16_t> slots) {
   if (slots.empty()) return std::nullopt;
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
-  // A slightly stale cached snapshot is fine: an attempt admitted under it is
-  // re-gated on the next wakeup, and the final mutation still passes the
-  // owner-side re-check before executing.
-  std::uint64_t unused_version = 0;
-  const std::shared_ptr<const cluster::ServingState>& state =
-      cluster::CurrentCachedWithVersion(runtime->topology_cache_,
-                                        &unused_version);
   const cluster::RequestView view{
       .slots_ = slots,
       .is_write_ = true,
       .connection_readonly_ = false,
       .loading_allowed_ = false,
   };
-  const cluster::Decision decision = cluster::Admit(state.get(), view);
+  const cluster::AuthorityAdmission admission =
+      runtime->authority_guard_.CaptureAndAdmit(
+          view, std::chrono::steady_clock::now());
+  const cluster::Decision& decision = admission.decision();
   std::string message;
   switch (decision.kind_) {
     case cluster::Decision::Kind::kServe:

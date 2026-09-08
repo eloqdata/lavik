@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -21,6 +22,7 @@
 #include "keylane/meta/encoding.h"
 #include "keylane/meta/identity_store.h"
 #include "keylane/meta/policy_store.h"
+#include "keylane/meta/population_manifest_store.h"
 #include "keylane/meta/topology_store.h"
 
 namespace {
@@ -538,7 +540,7 @@ TEST(MetaTopologyStore, CreateGroupCreatesQueryableGroup) {
   EXPECT_EQ(view->record_.owner_, "");
   EXPECT_EQ(view->record_.group_term_, 0u);
   EXPECT_EQ(view->record_.authority_version_, 0u);
-  EXPECT_EQ(view->record_.population_manifest_id_, 0u);
+  EXPECT_EQ(view->record_.population_manifest_revision_, 0u);
   EXPECT_EQ(view->record_.partition_replication_epoch_, 0u);
 
   EXPECT_FALSE(store.FindGroup("group-b").has_value());
@@ -611,6 +613,7 @@ AssignNodeToGroup MakeAssign(const std::string& group_id, std::uint8_t seed,
   cmd.request_id_ = MakeRequestId(seed);
   cmd.group_id_ = group_id;
   cmd.node_id_ = MakeNodeId(seed);
+  cmd.assignment_id_.fill(seed);
   cmd.role_ = role;
   cmd.expected_revision_ = expected_revision;
   cmd.new_topology_epoch_ =
@@ -644,9 +647,36 @@ TEST(MetaTopologyStore, AssignNodeToGroupAddsMember) {
   EXPECT_EQ(view->revision_, 2u);
   ASSERT_EQ(view->members_.size(), 1u);
   EXPECT_EQ(view->members_[0],
-            (MetaGroupMember{MakeNodeId(0x10), MetaNodeRole::kPrimary}));
+            (MetaGroupMember{MakeNodeId(0x10),
+                             [] {
+                               keylane::meta::MetaAssignmentId id{};
+                               id.fill(0x10);
+                               return id;
+                             }(),
+                             MetaNodeRole::kPrimary}));
   EXPECT_EQ(store.FindGroupOfNode(MakeNodeId(0x10)),
             std::optional<std::string>("group-a"));
+}
+
+TEST(MetaTopologyStore, RemoveAndReaddRequiresANewAssignmentIdentity) {
+  MetaTopologyStore store;
+  ASSERT_TRUE(store.Apply(MakeCreateGroup("group-a", 1)).ok());
+  const AssignNodeToGroup first =
+      MakeAssign("group-a", 0x10, MetaNodeRole::kReplica, 1);
+  ASSERT_TRUE(store.Apply(first).ok());
+  ASSERT_TRUE(store.Apply(MakeRemove("group-a", 0x10, 2)).ok());
+
+  AssignNodeToGroup stale_readd =
+      MakeAssign("group-a", 0x10, MetaNodeRole::kReplica, 3);
+  stale_readd.assignment_id_ = first.assignment_id_;
+  ExpectDomainReject(store.Apply(stale_readd));
+
+  AssignNodeToGroup fresh_readd = stale_readd;
+  fresh_readd.assignment_id_.fill(0x11);
+  ASSERT_TRUE(store.Apply(fresh_readd).ok());
+  ASSERT_EQ(store.FindGroup("group-a")->members_.size(), 1u);
+  EXPECT_EQ(store.FindGroup("group-a")->members_[0].assignment_id_,
+            fresh_readd.assignment_id_);
 }
 
 TEST(MetaTopologyStore, AssignNodeToGroupUnknownGroupRejected) {
@@ -719,6 +749,9 @@ TEST(MetaTopologyStore, AssignNodeEnforcesMemberCap) {
     cmd.group_id_ = "group-a";
     std::snprintf(hex4, sizeof(hex4), "%04x", i);
     cmd.node_id_ = MakeNodeId(0x20).substr(0, 36) + hex4;
+    cmd.assignment_id_[0] = static_cast<std::uint8_t>(i);
+    cmd.assignment_id_[1] = static_cast<std::uint8_t>(i >> 8);
+    cmd.assignment_id_[15] = 1;
     cmd.role_ = MetaNodeRole::kReplica;
     cmd.expected_revision_ = revision;
     cmd.new_topology_epoch_ = revision + 1;
@@ -729,6 +762,7 @@ TEST(MetaTopologyStore, AssignNodeEnforcesMemberCap) {
   over.request_id_ = MakeRequestId(0x21);
   over.group_id_ = "group-a";
   over.node_id_ = MakeNodeId(0x21);
+  over.assignment_id_.fill(0x21);
   over.expected_revision_ = revision;
   over.new_topology_epoch_ = revision + 1;
   ExpectDomainReject(store.Apply(over));
@@ -929,7 +963,10 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   ASSERT_TRUE(store.SetOwner("group-a", MakeNodeId(0x30)).ok());
   ASSERT_TRUE(store.SetGroupTerm("group-a", 7).ok());
   ASSERT_TRUE(store.SetAuthorityVersion("group-a", 3).ok());
-  ASSERT_TRUE(store.SetPopulationManifestId("group-a", 555).ok());
+  keylane::meta::MetaHash256 manifest_digest{};
+  manifest_digest.fill(0x55);
+  ASSERT_TRUE(
+      store.SetPopulationManifest("group-a", 555, manifest_digest).ok());
   ASSERT_TRUE(store.SetPartitionReplicationEpoch("group-a", 2).ok());
   ASSERT_TRUE(store.SetGroupConfigEpoch("group-a", 9).ok());
 
@@ -937,7 +974,8 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   EXPECT_EQ(view->record_.owner_, MakeNodeId(0x30));
   EXPECT_EQ(view->record_.group_term_, 7u);
   EXPECT_EQ(view->record_.authority_version_, 3u);
-  EXPECT_EQ(view->record_.population_manifest_id_, 555u);
+  EXPECT_EQ(view->record_.population_manifest_revision_, 555u);
+  EXPECT_EQ(view->record_.population_manifest_digest_, manifest_digest);
   EXPECT_EQ(view->record_.partition_replication_epoch_, 2u);
   EXPECT_EQ(view->config_epoch_, 9u);
   // Membership CAS revision untouched by record-field changes.
@@ -947,7 +985,8 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   ASSERT_TRUE(store.SetOwner("group-a", MakeNodeId(0x30)).ok());
   ASSERT_TRUE(store.SetGroupTerm("group-a", 7).ok());
   ASSERT_TRUE(store.SetAuthorityVersion("group-a", 3).ok());
-  ASSERT_TRUE(store.SetPopulationManifestId("group-a", 555).ok());
+  ASSERT_TRUE(
+      store.SetPopulationManifest("group-a", 555, manifest_digest).ok());
   ASSERT_TRUE(store.SetPartitionReplicationEpoch("group-a", 2).ok());
   ASSERT_TRUE(store.SetGroupConfigEpoch("group-a", 9).ok());
 
@@ -955,7 +994,8 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   ExpectDomainReject(store.SetOwner("group-ghost", MakeNodeId(0x30)));
   ExpectDomainReject(store.SetGroupTerm("group-ghost", 7));
   ExpectDomainReject(store.SetAuthorityVersion("group-ghost", 3));
-  ExpectDomainReject(store.SetPopulationManifestId("group-ghost", 555));
+  ExpectDomainReject(
+      store.SetPopulationManifest("group-ghost", 555, manifest_digest));
   ExpectDomainReject(store.SetPartitionReplicationEpoch("group-ghost", 2));
   ExpectDomainReject(store.SetGroupConfigEpoch("group-ghost", 9));
 }
@@ -1017,7 +1057,10 @@ MetaTopologyStore MakePopulatedTopology() {
   EXPECT_TRUE(store.SetOwner("group-a", MakeNodeId(0x10)).ok());
   EXPECT_TRUE(store.SetGroupTerm("group-a", 7).ok());
   EXPECT_TRUE(store.SetAuthorityVersion("group-a", 3).ok());
-  EXPECT_TRUE(store.SetPopulationManifestId("group-a", 555).ok());
+  keylane::meta::MetaHash256 manifest_digest{};
+  manifest_digest.fill(0x55);
+  EXPECT_TRUE(
+      store.SetPopulationManifest("group-a", 555, manifest_digest).ok());
   EXPECT_TRUE(store.SetPartitionReplicationEpoch("group-a", 2).ok());
   EXPECT_TRUE(
       store
@@ -1123,15 +1166,28 @@ std::string MakeTopologyBlob(
     w.WriteString(group.owner);
     w.WriteU64(0);  // group_term
     w.WriteU64(0);  // authority_version
-    w.WriteU64(0);  // population_manifest_id
+    w.WriteU64(0);  // population_manifest_revision
+    keylane::meta::WriteFixedArray(w, keylane::meta::MetaHash256{});
     w.WriteU64(0);  // partition_replication_epoch
     w.WriteU64(0);  // config_epoch
     w.WriteU64(group.revision);
     w.WriteList(group.members, [](keylane::meta::MetaWriter& ww,
                                   const MetaGroupMember& member) {
       ww.WriteString(member.node_id_);
+      keylane::meta::WriteFixedArray(ww, member.assignment_id_);
       ww.WriteU8(static_cast<std::uint8_t>(member.role_));
     });
+  }
+  std::map<std::string, keylane::meta::MetaAssignmentId> assignment_history;
+  for (const TopologyBlobGroup& group : groups) {
+    for (const MetaGroupMember& member : group.members) {
+      assignment_history.emplace(member.node_id_, member.assignment_id_);
+    }
+  }
+  w.WriteCount(static_cast<std::uint32_t>(assignment_history.size()));
+  for (const auto& [node_id, assignment_id] : assignment_history) {
+    w.WriteString(node_id);
+    keylane::meta::WriteFixedArray(w, assignment_id);
   }
   w.WriteList(runs, [](keylane::meta::MetaWriter& ww,
                        const keylane::meta::MetaSlotAssignment& run) {
@@ -1144,22 +1200,26 @@ std::string MakeTopologyBlob(
 
 TEST(MetaTopologyStore, DeserializeRejectsInvariantViolations) {
   const std::string node_a = MakeNodeId(0x40);
+  keylane::meta::MetaAssignmentId assignment_a{};
+  assignment_a.fill(0x40);
+  keylane::meta::MetaAssignmentId assignment_b{};
+  assignment_b.fill(0x41);
 
   // A node appearing in two groups breaks one-node-one-group.
   ExpectStoreFailStop(
       MetaTopologyStore::Deserialize(
           MakeTopologyBlob(
               2,
-              {TopologyBlobGroup{
-                   "group-a",
-                   "",
-                   1,
-                   {MetaGroupMember{node_a, MetaNodeRole::kPrimary}}},
-               TopologyBlobGroup{
-                   "group-b",
-                   "",
-                   1,
-                   {MetaGroupMember{node_a, MetaNodeRole::kReplica}}}},
+              {TopologyBlobGroup{"group-a",
+                                 "",
+                                 1,
+                                 {MetaGroupMember{node_a, assignment_a,
+                                                  MetaNodeRole::kPrimary}}},
+               TopologyBlobGroup{"group-b",
+                                 "",
+                                 1,
+                                 {MetaGroupMember{node_a, assignment_a,
+                                                  MetaNodeRole::kReplica}}}},
               {}))
           .status());
   // Duplicate group_id.
@@ -1174,12 +1234,13 @@ TEST(MetaTopologyStore, DeserializeRejectsInvariantViolations) {
       MetaTopologyStore::Deserialize(
           MakeTopologyBlob(
               1,
-              {TopologyBlobGroup{
-                  "group-a",
-                  "",
-                  1,
-                  {MetaGroupMember{node_a, MetaNodeRole::kPrimary},
-                   MetaGroupMember{node_a, MetaNodeRole::kReplica}}}},
+              {TopologyBlobGroup{"group-a",
+                                 "",
+                                 1,
+                                 {MetaGroupMember{node_a, assignment_a,
+                                                  MetaNodeRole::kPrimary},
+                                  MetaGroupMember{node_a, assignment_b,
+                                                  MetaNodeRole::kReplica}}}},
               {}))
           .status());
   // Revision 0 (revisions start at 1).
@@ -1632,6 +1693,68 @@ TEST(MetaPolicyStore, DeserializeRejectsInvariantViolations) {
     ExpectStoreFailStop(
         MetaPolicyStore::Deserialize(MakePolicyBlob(policies)).status());
   }
+}
+
+TEST(MetaPopulationManifestStore,
+     StoresCanonicalImmutableDocumentsAndRoundTrips) {
+  using keylane::meta::MetaPopulationManifestEntry;
+  using keylane::meta::MetaPopulationManifestStore;
+  using keylane::meta::PutPopulationManifest;
+
+  PutPopulationManifest put;
+  put.entries_ = {MetaPopulationManifestEntry{1, 10},
+                  MetaPopulationManifestEntry{7, 22}};
+  put.manifest_digest_ =
+      MetaPopulationManifestStore::CanonicalDigest(put.entries_);
+
+  MetaPopulationManifestStore store;
+  ASSERT_TRUE(store.Put(put).ok());
+  ASSERT_TRUE(store.Put(put).ok());
+  ASSERT_EQ(store.Size(), 1u);
+  EXPECT_EQ(store.Find(put.manifest_digest_)->entries_, put.entries_);
+
+  auto restored = MetaPopulationManifestStore::Deserialize(store.Serialize());
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->Find(put.manifest_digest_),
+            store.Find(put.manifest_digest_));
+}
+
+TEST(MetaPopulationManifestStore, RejectsNonCanonicalOrMismatchedContent) {
+  using keylane::meta::MetaPopulationManifestEntry;
+  using keylane::meta::MetaPopulationManifestStore;
+  using keylane::meta::PutPopulationManifest;
+
+  MetaPopulationManifestStore store;
+  PutPopulationManifest unsorted;
+  unsorted.entries_ = {MetaPopulationManifestEntry{7, 22},
+                       MetaPopulationManifestEntry{1, 10}};
+  unsorted.manifest_digest_ =
+      MetaPopulationManifestStore::CanonicalDigest(unsorted.entries_);
+  ExpectDomainReject(store.Put(unsorted));
+
+  PutPopulationManifest duplicate;
+  duplicate.entries_ = {MetaPopulationManifestEntry{1, 10},
+                        MetaPopulationManifestEntry{1, 11}};
+  duplicate.manifest_digest_ =
+      MetaPopulationManifestStore::CanonicalDigest(duplicate.entries_);
+  ExpectDomainReject(store.Put(duplicate));
+
+  PutPopulationManifest mismatched;
+  mismatched.entries_ = {MetaPopulationManifestEntry{1, 10}};
+  ExpectDomainReject(store.Put(mismatched));
+
+  PutPopulationManifest out_of_range;
+  out_of_range.entries_ = {
+      MetaPopulationManifestEntry{keylane::meta::kMetaSlotCount, 1}};
+  out_of_range.manifest_digest_ =
+      MetaPopulationManifestStore::CanonicalDigest(out_of_range.entries_);
+  ExpectDomainReject(store.Put(out_of_range));
+
+  PutPopulationManifest zero_epoch;
+  zero_epoch.entries_ = {MetaPopulationManifestEntry{1, 0}};
+  zero_epoch.manifest_digest_ =
+      MetaPopulationManifestStore::CanonicalDigest(zero_epoch.entries_);
+  ExpectDomainReject(store.Put(zero_epoch));
 }
 
 }  // namespace

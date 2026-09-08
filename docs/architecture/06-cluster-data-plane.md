@@ -8,7 +8,7 @@ the owning node, or must refuse it with a standard cluster error. Ordinary
 requests never consult an external control plane; each node answers from its
 locally committed view of slot ownership, authority, and readiness.
 
-The module under `include/keylane/cluster/` and `src/cluster/` exposes four
+The module under `include/keylane/cluster/` and `src/cluster/` exposes six
 seams:
 
 - `TopologyCache` holds the committed `ServingState` and publishes it
@@ -17,11 +17,16 @@ seams:
   owner-side authority re-check (`AuthorityUnchanged`).
 - `ClusterRouter` is a set of pure functions over a committed state: slot to
   owning node, MOVED target, and client-facing endpoint selection.
-- `ClusterControlPort` is the interface through which a control plane supplies
-  target state. The static file adapter and an in-memory test adapter ship
-  with the data plane; a Meta/Raft adapter implements the same interface
-  without the data plane learning about consensus phases, transport, or
-  licensing.
+- `NodeControlInstaller` is the only state-changing seam. It validates and
+  atomically publishes full state, installs finite leases and fences, drains
+  retired request generations, revokes source capabilities, and dispatches
+  typed replication directives.
+- `ClusterControlPort` supplies complete target state for the static-file
+  adapter and in-memory tests.
+- `MetaControlClientService` owns leader discovery and the one outbound
+  Meta-to-Data control session. It maps authenticated wire values into the
+  node controller; neither it nor replication writes `TopologyCache`
+  directly.
 
 The module is free of Redis wire concerns. Wire mapping (error texts,
 discovery reply shapes) lives in the Redis serving layer, and internal
@@ -35,7 +40,8 @@ own arbitration boundary — the cluster layer reaches it only through a
 generic per-shard validator hook that knows nothing about clusters.
 
 Cluster mode is a startup-only, process-wide choice. The runtime
-(`ClusterRuntime`: topology cache, resolved announce addresses) is installed
+(`ClusterRuntime`: topology cache, authority guard, node controller, action
+adapter, and resolved announce addresses) is installed
 before any listener accepts a client; in standalone mode it is null and every
 cluster code path is inert.
 
@@ -164,16 +170,223 @@ counter and fencing drains the replaced snapshot's. Registration is bracketed
 by publication-sequence loads — an odd sequence covers the state/version
 update and a completed publication changes the even token — so a drain either
 observes a concurrent registration or the registrant observes the sequence
-change and rolls back. Draining
-those executions before issuing a new grant is the control plane's contract
-(planned follow-up work); the data plane provides the mechanism and does not
-itself wait.
+change and rolls back.
+
+The node controller retains the replaced immutable snapshot as a drain token.
+A new lease, source authorization, or destructive rebuild for that group is
+refused until the old counter reaches zero. An explicit Fence is acknowledged
+only after the local fence is published, source export capabilities are
+revoked and joined, and the old request generation has drained. This makes the
+acknowledgement a usable old-authority exclusion proof rather than a transport
+receipt.
+
+## Meta control session and finite authority
+
+A Meta-managed node starts fenced after every process restart. It restores no
+serving checkpoint, lease, term floor, directive outcome, leader directory, or
+other positive authority from local storage. The only durable authority is the
+Meta Raft state; boot, replication-history, session, challenge, and lease state
+are process memory. A fresh 160-bit boot identity prevents messages for a prior
+process from becoming current even though the durable data files remain.
+
+The Data process connects outward from configured numeric seed endpoints. It
+tries the accepted leader hint, the latest in-memory committed directory, then
+the static seeds, with full-jitter exponential backoff from one to ten seconds.
+An unresolved seed remains a fallback even when a learned member currently
+announces the same endpoint, because endpoint ownership can legitimately change
+across reconfiguration. A response replaces the in-memory directory atomically
+only after its member identities and the peer's authenticated URI principal
+agree. The hint and directory are intentionally not persisted. Connect, TLS,
+Hello, read progress, and write progress each have a ten-second bound; backoff
+resets only after an accepted session has produced a valid `HeartbeatAck`.
+
+The session protocol is versioned and framed independently of TCP packets. A
+fixed header carries type, length, per-direction sequence, and CRC32C. Frames
+are at most 16 KiB. Complete objects that exceed one frame use
+Start/Chunk/End plus total length and SHA-256; chunks stream without per-frame
+application acknowledgements and only the complete object is acknowledged.
+The complete desired-state cap is 512 MiB, while each opaque directive,
+result, or operation-evidence field is capped at 256 KiB. These are abuse
+ceilings, not normal sizing goals:
+16 KiB keeps one authority frame cheap and indivisible; 256 KiB matches the
+durable Meta payload-field bound; 512 MiB matches Meta's snapshot hard ceiling;
+and the 64 KiB writer budget provides one frame of headroom for each priority
+class while a large object streams one chunk at a time. One reader and one
+serialized writer own each direction, read-ahead is disabled, and a ten-second
+progress deadline closes a stuck session. That deadline is deliberately much
+longer than the default Raft heartbeat/election cadence but still bounds failed
+peer detection. Authority and reliable messages take precedence between bulk
+frames; priority cannot interrupt bytes already handed to the kernel. Only one
+complete-object transfer may be active at a time, so Start/Chunk/End sequences
+cannot interleave. Queued transfers retain shared ownership of their encoded
+bytes until completion or failure.
+
+Protocol v1 has no delta format. Initial connection, reconnection, and every
+semantic projection change transfer a complete `FullDesiredState`. The object
+contains global topology plus each group's partition replication epoch and the
+receiving node's policies, immutable population manifests, and current
+directives. The source applied index is a
+diagnostic/order watermark; the projection SHA-256 is the semantic dependency
+for leases and directives. A higher index with identical semantic content is
+therefore harmless. Lower indexes reject, exact index/object replays are
+idempotent, and one index naming different bytes invalidates memory authority
+and closes the session. Installation validates and builds the entire immutable
+state before one publication; partial transfer never changes serving state. A
+group's partition replication epoch cannot regress even when the global
+topology epoch advances.
+Membership entries carry node and assignment identities only. The committed
+group owner and matching owner assignment are the sole serving-role truth;
+protocol v1 has no redundant member-role field that could disagree with them.
+
+Heartbeat carries health, the latest boot-scoped candidate progress when a
+ready population exists, and at most one lease challenge. Candidate progress
+includes the exact local membership assignment, manifest, and partition
+replication epoch under which the population became ready. Candidate and health
+are volatile Meta observations, not Raft commands. The challenge names the
+exact projection and complete group authority anchor. `sent_at` is captured
+immediately before the first socket write, and the granted duration is applied
+to that monotonic timestamp, so a delayed response cannot extend authority.
+Business heartbeat sequences accept only the next message or an exact replay
+of the preceding message; the latter receives the cached exact ack. Invalid
+challenge content changes only the lease decision and cannot suppress the
+independent health/progress observation.
+
+An FDS replacement quiesces the heartbeat producer before publishing the new
+controller projection. A heartbeat already written under the old projection
+is detached from lease authority; its exact ack may still be consumed for wire
+progress, but its lease decision is ignored. Heartbeats resume only after the
+new desired object is installed and `FullStateApplied` is written, so an old
+Ready proof cannot be evaluated against a new assignment, manifest, or
+population epoch.
+
+Directive execution also emits typed, volatile `OperationEvidence` for the
+started and completed phases. Each report is bound to the current session and
+boot, authenticated reporter, exact local assignment, operation, population
+anchor, and replication history, and carries a SHA-256 of its bounded evidence
+body. Reports that fit one frame use the soft-message lane; larger reports use
+the same Start/Chunk/End object-transfer machinery under an evidence-specific
+cap and are admitted only after whole-object hash and schema validation. Meta
+audits and discards a well-formed report that has become stale without closing
+the authority session; malformed session, boot, framing, or content-hash data
+fails the session.
+Meta's typed candidate/evidence query results retain that authenticated boot
+beside the reporter and assignment, so later directive/evidence construction
+never has to race a second session lookup.
+
+Finite leases are required only for a Meta-managed local primary. Admission
+and the final mutation recheck both prove the current session, group
+assignment, term, authority/grant revision, projection, and unexpired
+monotonic deadline. Session loss, expiry, committed authority change, local
+storage loss, or an explicit fence invalidates memory authority immediately.
+Startup-not-ready and runtime storage loss are distinct controller states:
+startup may later publish ready, while runtime loss latches the current boot
+failed, publishes storage-unready, joins older directive admission and every
+control transition already across the loss cut, then performs a final source
+revocation and target-population cancellation and drains retired requests.
+Storage writers set a process-wide latch and close the request gate
+immediately; worker zero drives this asynchronous controller barrier. An
+uncertain cleanup result stops the server without a clean checkpoint. Neither
+a later FDS nor a population proof can clear the latch; recovery requires
+process restart.
+Meta's leadership expiry and every granted lease are bounded by the Raft
+election lower bound, and a leader stops sessions synchronously on demotion.
+Before issuing the first otherwise-valid lease for each group, boot, authority
+anchor, and leadership generation, Meta waits that entire bound on a monotonic
+clock. The leader-local evidence resets on leadership or process restart, so a
+later owner cannot overlap a predecessor even when no Fence acknowledgement is
+available.
+
+Graceful Data shutdown stops new client and control-message admission, then
+immediately cancels replication target and source transports. In particular,
+closing source flows releases retained backlog cursors before request drain, so
+a stopped downstream cannot make shutdown wait forever on an admitted write.
+The control session reader observes its stop after the current socket operation
+(bounded by the normal progress deadline), synchronously invalidates the
+session's memory lease, closes the stream on its owning worker, and joins the
+short directive admission lane plus the final fail-closed session-loss
+transition. Terminal rebuild observation is separately session-scoped, so
+abandoning a dead wire cannot block reconnection; shutdown still cancels and
+joins the underlying native attempt before storage teardown.
+Only after the control barrier may the process finish draining client requests.
+It then joins the already-cancelled replication work and creates its storage
+shutdown checkpoint. This ordering prevents a completed control-side mutation
+from landing after the checkpoint that is supposed to describe the clean
+shutdown. If native-flow cancellation, source revocation, or candidate root
+retirement has an uncertain outcome, the barrier returns that failure; the
+process skips the normal checkpoint and exits unsuccessfully rather than
+recording an unsafe state as a clean shutdown.
+
+Directives carry distinct 128-bit operation, directive, attempt, target
+assignment, and source assignment identities. The common assignment field
+continues to denote the target membership incarnation; the explicit source
+assignment denotes the exporting membership incarnation. The proposer never
+reuses either membership id for a later incarnation, while Meta durably retains
+only the current or most recent value per node to catch direct replay.
+The other IDs distinguish workflow, durable command, and execution attempt.
+The wire recipient is separate from the rebuild target: rebuild runs at the
+target, while authorize/revoke runs at the source without rewriting the common
+source/target identity used by native replication. The node controller checks
+the exact installed projection, full authority anchor, recipient boot, exact
+target and source member assignments, local source/target role, manifest
+revision/digest/content, partition replication epoch, and one-group constraint
+before calling `ReplicationManager`. A directive that passes the first check
+holds an admission token across readiness publication and the possibly
+suspending `ReplicationManager` registration, then rechecks its generation and
+all anchors immediately before crossing that action seam. FDS replacement,
+fencing, session invalidation, lease expiry, and externally observed population
+proof loss advance the generation before publishing their invalidating
+boundary. Their async transition waits for every older token to reject or
+finish registration and only then performs its final revoke/cancel pass. Thus a
+directive cannot appear behind the cleanup represented by `FullStateApplied` or
+`FenceAck` even when its action adapter suspended after validation. A boot-local
+fence floor also rejects directives through the fenced counter tuple: rebuilds
+compare the local target assignment, while source authorize/revoke compares the
+local source assignment. A fresh assignment or a strictly newer committed
+counter tuple is therefore distinguishable from replay of fenced authority.
+
+Receipt stages distinguish acceptance, execution start, and completion. A
+controller rejection moves directly from
+`Accepted` to `Completed` and reports a rejected result without started
+evidence; admitted work emits `Started`, and any later non-success is a failed
+execution. For admitted work, completed evidence is written after `Completed`
+but before the terminal result, while the operation is still live at Meta.
+Rebuild admission returns before readiness so a newer current rebuild can enter
+ReplicationManager and supersede the old attempt; an exact completion observer
+alone emits `Completed` and the result. The rebuild's own transition to
+not-ready does not invalidate its admission token; concurrent external control
+transitions still do. FDS then cancels prior completion observers and reconciles
+the native target population before its applied acknowledgement; a fence also
+cancels any in-progress target attempt and joins its completion observer before
+`FenceAck`. A lease grant is admitted only after these cleanup counters clear
+and does not disturb a still-current directive. The result reports a truthful
+success, precondition rejection, or runtime failure. Meta durably commits the
+exact
+terminal receipt before returning `ResultCommitted`. With no Data-side journal,
+a lost acknowledgement causes the committed directive to be replayed and its
+idempotent replication identity to resolve the work again; no local record can
+reopen authority after restart.
+
+A completed population is content-scoped by group, membership assignment,
+immutable manifest, and partition replication epoch. `BeginGroupTerm` fences
+authority but does not mutate that content, so FDS reconciliation preserves a
+matching Ready population across a term-only change only when the epoch remains
+unchanged, and reports its candidate proof under the newer committed term. An
+epoch-only change first revokes Ready and serving eligibility and requires a
+new rebuild before another lease can be granted. In-progress rebuilds remain
+term-scoped and are cancelled unless the FDS
+still carries their exact term and a rebuild successor. Grantless groups have
+no `ServingState` owner or bound slots, but their committed membership remains
+in the controller identity view so this preservation is possible. Once Meta
+activates the candidate, the next FDS can publish the retained proof; if no
+proof survived (for example after a reboot), the granted-but-unready target may
+run a rebuild while it remains unable to serve or obtain a lease.
 
 ## Redis wire contract
 
-All cluster errors are simple error lines with texts verbatim from Redis 7.2;
-clients dispatch on the first token, and the encodings are identical under
-RESP2 and RESP3.
+Cluster routing errors are simple error lines with Redis 7.2 texts; clients
+dispatch on the first token, and the encodings are identical under RESP2 and
+RESP3. Deliberately unsupported administrative mutations use stable Keylane
+`ERR` replies.
 
 | Condition | Reply |
 |---|---|
@@ -186,6 +399,7 @@ RESP2 and RESP3.
 | `SELECT` with a nonzero index | `-ERR SELECT is not allowed in cluster mode` |
 | `COPY` with a `DB` option | `-ERR Copying to another database is not allowed in cluster mode` |
 | `REPLICAOF` / `ADDREPLICAOF` | `-ERR REPLICAOF not allowed in cluster mode.` |
+| Unauthorised `FLUSHDB`, `FLUSHALL`, or catalog-changing `FUNCTION` subcommands | `-ERR <command> is not allowed in cluster mode` |
 | Unknown `CLUSTER` subcommand or wrong arity | `-ERR Unknown CLUSTER subcommand or wrong number of arguments for '<sub>'` |
 | Execution outcome undeterminable | No reply; the connection is closed |
 
@@ -202,9 +416,22 @@ with EXECABORT as in Redis. `EVAL`/`EVALSHA`/`FCALL` are treated as writes for
 admission — a script that only reads still redirects to the primary — while
 their `_RO` variants are treated as reads; declared keys must hash to one
 slot, and `redis.call` access outside the admitted slot set is rejected with
-Redis's non-local-key error. Global and administrative commands
-(INFO, CONFIG, DBSIZE, FLUSHDB, SCAN, script catalog management, and similar)
-keep node-local semantics and are governed only by readiness.
+Redis's non-local-key error. Read-only global commands and process-local
+administration (INFO, CONFIG, DBSIZE, SCAN, SCRIPT cache management, and
+similar) keep node-local semantics and are governed only by readiness.
+Meta-managed nodes reject `FLUSHDB`, `FLUSHALL`, and catalog-changing
+`FUNCTION LOAD`, `DELETE`, `FLUSH`, and `RESTORE`: they mutate durable
+process-wide state but carry no slot from which finite authority can derive a
+group lease and drain cell. Static compatibility mode permits them only when
+this process is the sole granted local slot-owning primary group. It binds the
+request to that group's first slot, so the ordinary generation recheck and
+in-flight drain protect an SIGHUP role change. Static replicas, slotless
+primaries, and ambiguous multi-group configurations reject them because they
+cannot supply that drain proof. Queued Function catalog mutations contribute
+the representative slot to an `EXEC` union and pass through the same final
+recheck. `FUNCTION KILL` and `FUNCTION STATS` remain available while loading
+so an executing Function can be stopped or inspected; they do not mutate the
+catalog.
 
 ## CLUSTER subcommands and discovery surface
 
@@ -227,10 +454,12 @@ in cluster mode because the two topology sources are mutually exclusive.
 
 ## Control ports and configuration
 
-`ClusterControlPort::RefreshTarget` reads the control source's target state
-and publishes it only when the content changed; on any error the previously
-published state stays in effect, so a fencing transition is only ever
-published complete.
+`ClusterControlPort::RefreshTarget` is the synchronous static-control path. It
+reads the file adapter's target and asks `NodeControlInstaller` to publish only
+a complete, validated state; on error the previous state stays in effect.
+Meta-controlled state enters through the asynchronous client/session path and
+the same installer, which can wait for replication revocation and request
+drain before acknowledging a transition.
 
 `StaticClusterControl` loads a Redis `nodes.conf`-format file shared by every
 node. The file carries no `myself` mark; the local entry is identified by
@@ -244,6 +473,15 @@ slot-owning primaries form groups, with the primary's node id as the group
 id, and statically configured primaries hold a permanent grant. Readiness
 follows storage recovery: the first publication is not ready, so the gate
 answers LOADING until recovery (and any startup RDB import) completes.
+Static topology does not wire a replication role lifecycle, so every static
+node starts without durable expiration authority and rejects both native and
+Redis replication export. Read paths still hide values after their absolute
+deadline. Recovery retains an expired winning record in the index and does not
+append a tombstone or reclaim it while authority is withheld; this preserves
+its suppression of older versions without creating a local durable mutation.
+Meta-managed mode authorizes native population transfer only through its
+fenced lifecycle. When an authoritative promotion later grants expiration,
+the ordinary active-expiration loop can durably retire those retained winners.
 
 The static adapter loads once at startup — a first-load failure is fatal —
 and reloads on SIGHUP, which wakes the main loop through its own eventfd
@@ -256,38 +494,52 @@ publishes programmatically built states — including fenced or not-ready
 states the static adapter never produces — through the same seam for
 in-process tests.
 
-Five startup-only directives configure the subsystem: `cluster-enabled`
-(default `no`), `cluster-static-nodes-file`, `cluster-announce-ip`,
-`cluster-announce-port`, and `cluster-announce-tls-port`. Announce values
+Startup-only directives configure the subsystem: `cluster-enabled` (default
+`no`); exactly one of `cluster-static-nodes-file` or repeatable
+`cluster-meta-seed`; `cluster-node-id` for Meta mode; and
+`cluster-announce-ip`, `cluster-announce-port`, and
+`cluster-announce-tls-port`. Announce values
 default to the first non-wildcard bind address and the corresponding listen
 ports; a wildcard bind leaves the announce host empty so discovery self
-entries keep the startup-node convention. Validation requires a nodes file
-when cluster mode is enabled, refuses coexistence with either replication
-upstream directive (two topology sources never mix; runtime `REPLICAOF` is
-rejected separately at the command layer), and requires at least one
-reachable announced client port so MOVED and discovery can always name an
+entries keep the startup-node convention. Meta mode requires a canonical
+40-character lowercase node id and at least one numeric seed. Static and Meta
+control are mutually exclusive. Both modes refuse coexistence with either
+replication upstream directive (two topology sources never mix; runtime
+`REPLICAOF` is rejected separately at the command layer), and require at least
+one reachable announced client port so MOVED and discovery can always name an
 endpoint — a TLS-only deployment is valid.
+
+Data-to-Meta mTLS is optional and all-or-none. When enabled, the Data client
+reuses its existing replication TLS CA/certificate/key and presents the
+committed `keylane://node/<node-id>` identity. A Meta listener reuses that
+member's existing Raft TLS CA/certificate/key and presents its sole
+`keylane://meta/<server-id>` URI SAN. Plaintext mode treats network isolation
+as its trust boundary; neither side silently falls back when a TLS identity is
+partially configured.
 
 ## Current scope limits
 
 The data plane deliberately excludes: ASK/ASKING and the
-importing/migrating compatibility flow, the gossip bus protocol,
-Meta-driven control (planned follow-up work, over the same control-port seam),
-drain-before-new-grant enforcement (planned follow-up work consuming the
-in-flight counters here), shard Pub/Sub, non-uniform TLS ports, dynamic
-node-id allocation, and the remaining `CLUSTER` management subcommands
+importing/migrating compatibility flow, the gossip bus protocol, protocol
+deltas, Data-side durable control journals, shard Pub/Sub, non-uniform TLS
+ports, dynamic node-id allocation, group-scoped authority for persistent
+no-key mutations, and the remaining `CLUSTER` management subcommands
 (`SETSLOT`, `MEET`, `FAILOVER`, `ADDSLOTS`, and similar).
 
 ## Verification
 
 The admission decision matrix, builder and parser validation, content-hash
-publication semantics, TLS-aware endpoint selection, in-flight counter
-concurrency and cell sharing, and the CLUSTER wire texts and reply shapes are
-unit-tested offline through the pure seams and the in-memory adapter. The
-three-node
-static-cluster end-to-end binary is registered but currently a placeholder;
-multi-process discovery, redirect, and SIGHUP-driven fence coverage is
-pending.
+publication semantics, finite lease lifecycle, frame and complete-object
+codecs, projection validation, drain behavior, TLS-aware endpoint selection,
+in-flight counter concurrency and cell sharing, and the CLUSTER wire texts and
+reply shapes are unit-tested through pure seams and the in-memory adapter. The
+three-node static-cluster end-to-end suite verifies routing, redirects,
+read-only replica admission, cluster-mode command restrictions, static export
+denial, expiration-authority state, INFO/CLUSTER replies, and topology reload.
+A separate real-process Data-control gate starts three Meta
+members and a Data node, exercises follower-seed redirect, full-state install,
+heartbeat observation, leader failure and reconnect, stale-member restart,
+plaintext and mTLS identity checks, and graceful shutdown.
 
 ## Source map
 
@@ -295,6 +547,9 @@ pending.
 |---|---|
 | ServingState model, builder validation, topology cache, content hash, striped in-flight cells, and routing functions | `include/keylane/cluster/topology.h`, `src/cluster/topology.cpp` |
 | Admission decision and owner-side authority re-check | `include/keylane/cluster/authority.h`, `src/cluster/authority.cpp` |
+| Meta/Data protocol framing, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
+| Node controller, full-state validation, finite authority, drain, and typed replication adaptation | `include/keylane/cluster/node_control.h`, `include/keylane/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp` |
+| Meta discovery and outbound Data control session | `include/keylane/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
 | Control-port seam, nodes.conf adapter, and in-memory adapter | `include/keylane/cluster/control_port.h`, `src/cluster/control_port.cpp` |
 | Process-wide runtime installation | `include/keylane/cluster/runtime.h`, `src/cluster/runtime.cpp` |
 | Cluster admission gate, owner re-check choke points, EXEC/Lua/blocking integration, and mode-restricted command policies | `src/redis/command.cpp`, `src/redis/blocking_wait.cpp` |
@@ -304,4 +559,5 @@ pending.
 | Startup wiring, storage-ready publication, and SIGHUP reload | `src/redis/server.cpp` |
 | Cluster configuration directives and validation | `include/keylane/server.h`, `src/config.cpp`, `app/keylane.cpp` |
 | Decision matrix, parser, publication, and concurrency unit tests | `tests/cluster_authority_test.cpp`, `tests/cluster_control_port_test.cpp`, `tests/cluster_topology_test.cpp`, `tests/cluster_command_test.cpp` |
-| Static-cluster end-to-end binary (registered placeholder; suite pending) | `tests/cluster_e2e_test.cpp` |
+| Real-process Meta/Data discovery, failover, mTLS, and shutdown gate | `tests/meta_integration/gate_data_control.py` |
+| Static-cluster routing, admission, policy, and reload end-to-end suite | `tests/cluster_e2e_test.cpp` |

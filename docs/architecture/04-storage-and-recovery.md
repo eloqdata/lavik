@@ -556,19 +556,30 @@ child-before-root ordering.
 An ordinary successful command is therefore not necessarily crash-durable at
 reply time. `StorageDurabilityStats` reports dirty staging bytes, pending
 flushes, and pending transaction decisions for operators and tests that need a
-durability fence. Graceful shutdown gives accepted queued and explicitly
-background transaction commits up to five seconds to append their decisions,
-then seals every active stream and drains flushes, extent reclaims, and
-retirement accounting. If `shutdown-checkpoint yes` is configured, every
-worker first reaches a shutdown barrier, then worker 0 forces transaction
-cleaning to promote all committed tagged winners into durable ordinary records.
-After every worker observes that result, each serializes its frozen index shard
-and worker 0 publishes their discovery bitmap and generation root through fixed
-metadata. Transaction cleanup or checkpoint failure is best effort: it leaves
-the previous generation consumed and shutdown continues with authoritative
-ordinary and transaction records durable. An I/O failure fail-stops further
-writes and retains staging buffers so already staged reads do not follow
-recycled memory.
+durability fence. Graceful shutdown closes request admission and all
+replication target/source transports first; source flow teardown releases
+retained backlog cursors that could otherwise keep an accepted publisher
+suspended. It then joins the Meta control client when configured, drains
+accepted requests, joins target apply work, aborts partial replacement roots,
+and drains source handshakes, exports, and history. No accepted directive,
+replication apply, or source-log transition can therefore mutate storage behind
+the checkpoint boundary. Accepted queued and explicitly background transaction
+commits still receive up to five seconds to append their decisions.
+
+Storage then performs two freeze-and-drain rounds around transaction cleaning.
+The first resets even header-only active streams and drains flushes, extent
+reclaims, expiration, and retirement accounting. Worker 0 next forces
+transaction cleaning to promote all committed tagged winners into durable
+ordinary records. Because that cleaner may append or retire records itself,
+every worker seals and drains once more and reaches a second barrier. Only
+after a locked check proves that no mutator, queued flush, or runtime failure
+remains may each worker serialize its frozen index shard; worker 0 publishes
+their discovery bitmap and generation root through fixed metadata when
+`shutdown-checkpoint yes` is configured. Transaction cleanup or checkpoint
+failure leaves the previous generation consumed and shutdown continues with
+authoritative ordinary and transaction records durable. An I/O failure
+fail-stops further writes, rejects the clean checkpoint, and retains staging
+buffers so already staged reads do not follow recycled memory.
 
 ## Allocation and maintenance lifecycles
 
@@ -653,8 +664,8 @@ record blocks. A shielding value cannot use this escape valve because an
 older durable value could reappear.
 
 Tomb Raider is a separate, optional cleanup loop launched at worker startup
-only when the node is then the expiration authority. Cluster-managed startup
-does not grant that authority and therefore does not launch the loop. Once
+only when the node is then the expiration authority. Cluster startup does not
+grant that authority and therefore does not launch the loop. Once
 launched, the loop does not recheck authority on its own; the standalone
 `REPLICAOF` transition therefore explicitly quiesces it before installing an
 upstream. Native FULL mode also quiesces it at the session-wide boundary before
@@ -707,6 +718,10 @@ Epoch invalidation is durable, but cluster readiness is not a storage property.
 After restart, storage may recover records from the latest local epochs while
 the replication layer constructs a new boot-scoped `NOT_READY` group and keeps
 serving closed until a fresh directive proves a complete population.
+The target-local epoch persisted here is distinct from both a manifest entry's
+logical partition epoch and Meta's committed group-level partition replication
+epoch. The latter two fence control-plane population identity; neither can
+substitute for the storage epoch used by recovery.
 
 Transaction cleaning rotates record-bearing generations, seals and flushes
 their blocks, collects committed decisions, and relocates current committed
@@ -745,8 +760,15 @@ failure skips the checkpoint rather than weakening cold recovery.
   cleanup cannot remove its suppression while an older live record remains.
 - Allocation epochs accompany physical references, reads, accounting, and
   relocations so delayed work cannot affect a later incarnation of one block.
-- Fixed-metadata and storage write ambiguity is fail-stop. The engine does not
-  continue allocating or appending after it can no longer prove durable state.
+- Fixed-metadata and storage write ambiguity is fail-stop. The first worker or
+  node-global writer failure sets one process-wide, irreversible latch and
+  immediately fences request serving; no worker continues foreground
+  allocation or append after observing it. Worker zero reports that latch to
+  the cluster node controller, which withdraws storage readiness and joins
+  replication capabilities before the process can claim a completed loss
+  barrier. An uncertain cleanup result stops the server without writing a
+  clean-shutdown checkpoint. Restart recovery is the only path that can select
+  and reopen a provably valid durable state.
 - Checkpoint blocks become reachable only after all index chunks and their
   discovery bitmap are durable and the generation root is published. Startup
   consumes a generation before using it, so a later crash cannot reuse a
@@ -801,13 +823,17 @@ Current test evidence includes:
   property matters.
 - Tomb Raider does not recheck replication authority independently. Supported
   standalone role transition and the callable cluster rebuild adapter both
-  reach its quiesce boundary through native FULL, while cluster-managed startup
+  reach its quiesce boundary through native FULL, while Meta-managed startup
   withholds authority from the outset. Any authority transition that bypasses
   those replication paths must invoke the same boundary.
-- Storage persists partition and database epochs, not the cluster
-  `ReplicationGroup`, its ready token, or the process-global Function catalog
-  proof. There is no built-in Meta transport or durable Function-catalog
-  recovery proof, so recovered records alone never authorize cluster serving.
+- Storage persists partition and database epochs, not the Meta-managed
+  `ReplicationGroup`, its ready token, Data control state, or the process-global
+  Function catalog proof. Meta control reconnects after every boot, but neither
+  its full desired state nor its leases are restored from the data device;
+  recovered records alone never authorize Meta-managed cluster serving. The
+  static-file adapter instead supplies permanent local grant authority and
+  follows storage recovery, while still honoring a durable incomplete-full-sync
+  fence.
 - The `tx-commit-append` crash hook exists to isolate a transaction after all
   tagged data is durable but before its decision is appended, but no current
   test arms that named hook directly.

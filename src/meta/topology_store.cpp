@@ -24,6 +24,16 @@ absl::Status CheckNodeId(const std::string& node_id) {
   return absl::OkStatus();
 }
 
+bool IsZero(const MetaAssignmentId& id) {
+  return std::all_of(id.begin(), id.end(),
+                     [](std::uint8_t byte) { return byte == 0; });
+}
+
+bool IsZero(const MetaHash256& hash) {
+  return std::all_of(hash.begin(), hash.end(),
+                     [](std::uint8_t byte) { return byte == 0; });
+}
+
 // The epoch rule: absolute values, strictly monotonic and gap-free —
 // the command must carry exactly current+1. Saturating at u64 max is a
 // rejection, never a wrap.
@@ -72,6 +82,9 @@ absl::Status MetaTopologyStore::Apply(const CreateGroup& cmd) {
 absl::Status MetaTopologyStore::Apply(const AssignNodeToGroup& cmd) {
   if (auto st = CheckGroupId(cmd.group_id_); !st.ok()) return st;
   if (auto st = CheckNodeId(cmd.node_id_); !st.ok()) return st;
+  if (IsZero(cmd.assignment_id_)) {
+    return MetaDomainRejectError("assignment_id must not be zero");
+  }
   const auto it = groups_.find(cmd.group_id_);
   if (it == groups_.end()) {
     return MetaDomainRejectError(absl::StrCat("unknown group ", cmd.group_id_));
@@ -80,7 +93,9 @@ absl::Status MetaTopologyStore::Apply(const AssignNodeToGroup& cmd) {
   const auto member = group.members_.find(cmd.node_id_);
   // Replay: the member already sits in this group with the same role and the
   // record at the revision this command produces -> idempotent accept.
-  if (member != group.members_.end() && member->second == cmd.role_ &&
+  if (member != group.members_.end() &&
+      member->second.assignment_id_ == cmd.assignment_id_ &&
+      member->second.role_ == cmd.role_ &&
       group.revision_ == cmd.expected_revision_ + 1 &&
       topology_epoch_ == cmd.new_topology_epoch_) {
     return absl::OkStatus();
@@ -101,6 +116,11 @@ absl::Status MetaTopologyStore::Apply(const AssignNodeToGroup& cmd) {
     return MetaDomainRejectError(absl::StrCat(
         "node already a member of ", prior->second, " (one-node-one-group)"));
   }
+  if (const auto prior = last_assignment_by_node_.find(cmd.node_id_);
+      prior != last_assignment_by_node_.end() &&
+      prior->second == cmd.assignment_id_) {
+    return MetaDomainRejectError("remove/re-add must use a new assignment_id");
+  }
   if (group.members_.size() >= kMaxMetaNodes) {
     return MetaDomainRejectError("group member cap reached");
   }
@@ -109,8 +129,10 @@ absl::Status MetaTopologyStore::Apply(const AssignNodeToGroup& cmd) {
       !st.ok()) {
     return st;
   }
-  group.members_.emplace(cmd.node_id_, cmd.role_);
+  group.members_.emplace(
+      cmd.node_id_, GroupState::MemberState{cmd.assignment_id_, cmd.role_});
   group_of_node_.emplace(cmd.node_id_, cmd.group_id_);
+  last_assignment_by_node_[cmd.node_id_] = cmd.assignment_id_;
   group.revision_ = cmd.expected_revision_ + 1;
   topology_epoch_ = cmd.new_topology_epoch_;
   return absl::OkStatus();
@@ -255,13 +277,19 @@ absl::Status MetaTopologyStore::Apply(const SetGroupReplicationState& cmd) {
   }
   GroupState& group = it->second;
   const MetaGroupRecord& record = group.record_;
-  if (record.population_manifest_id_ == cmd.new_population_manifest_id_ &&
+  if (record.population_manifest_revision_ ==
+          cmd.new_population_manifest_revision_ &&
+      record.population_manifest_digest_ ==
+          cmd.new_population_manifest_digest_ &&
       record.partition_replication_epoch_ ==
           cmd.new_partition_replication_epoch_ &&
       topology_epoch_ == cmd.new_topology_epoch_) {
     return absl::OkStatus();
   }
-  if (record.population_manifest_id_ != cmd.expected_population_manifest_id_ ||
+  if (record.population_manifest_revision_ !=
+          cmd.expected_population_manifest_revision_ ||
+      record.population_manifest_digest_ !=
+          cmd.expected_population_manifest_digest_ ||
       record.partition_replication_epoch_ !=
           cmd.expected_partition_replication_epoch_) {
     return MetaDomainRejectError("group replication-state CAS conflict");
@@ -270,14 +298,29 @@ absl::Status MetaTopologyStore::Apply(const SetGroupReplicationState& cmd) {
                                           std::uint64_t next) {
     return next == expected || (expected != UINT64_MAX && next == expected + 1);
   };
-  if (!advances_by_at_most_one(cmd.expected_population_manifest_id_,
-                               cmd.new_population_manifest_id_) ||
+  if (!advances_by_at_most_one(cmd.expected_population_manifest_revision_,
+                               cmd.new_population_manifest_revision_) ||
       !advances_by_at_most_one(cmd.expected_partition_replication_epoch_,
                                cmd.new_partition_replication_epoch_)) {
     return MetaDomainRejectError(
         "group replication fields must stay unchanged or advance by one");
   }
-  if (cmd.new_population_manifest_id_ == cmd.expected_population_manifest_id_ &&
+  if ((cmd.expected_population_manifest_revision_ == 0) !=
+          IsZero(cmd.expected_population_manifest_digest_) ||
+      (cmd.new_population_manifest_revision_ == 0) !=
+          IsZero(cmd.new_population_manifest_digest_)) {
+    return MetaDomainRejectError(
+        "manifest revision zero must have the zero digest and vice versa");
+  }
+  if (cmd.new_population_manifest_revision_ ==
+          cmd.expected_population_manifest_revision_ &&
+      cmd.new_population_manifest_digest_ !=
+          cmd.expected_population_manifest_digest_) {
+    return MetaDomainRejectError(
+        "manifest digest cannot change without a revision advance");
+  }
+  if (cmd.new_population_manifest_revision_ ==
+          cmd.expected_population_manifest_revision_ &&
       cmd.new_partition_replication_epoch_ ==
           cmd.expected_partition_replication_epoch_) {
     return MetaDomainRejectError("group replication update has no effect");
@@ -287,7 +330,10 @@ absl::Status MetaTopologyStore::Apply(const SetGroupReplicationState& cmd) {
       !st.ok()) {
     return st;
   }
-  group.record_.population_manifest_id_ = cmd.new_population_manifest_id_;
+  group.record_.population_manifest_revision_ =
+      cmd.new_population_manifest_revision_;
+  group.record_.population_manifest_digest_ =
+      cmd.new_population_manifest_digest_;
   group.record_.partition_replication_epoch_ =
       cmd.new_partition_replication_epoch_;
   topology_epoch_ = cmd.new_topology_epoch_;
@@ -327,14 +373,26 @@ absl::Status MetaTopologyStore::SetAuthorityVersion(
   return absl::OkStatus();
 }
 
-absl::Status MetaTopologyStore::SetPopulationManifestId(
-    const std::string& group_id, std::uint64_t manifest_id) {
+absl::Status MetaTopologyStore::SetPopulationManifest(
+    const std::string& group_id, std::uint64_t manifest_revision,
+    const MetaHash256& manifest_digest) {
   const auto it = groups_.find(group_id);
   if (it == groups_.end()) {
     return MetaDomainRejectError(absl::StrCat("unknown group ", group_id));
   }
-  it->second.record_.population_manifest_id_ = manifest_id;
+  it->second.record_.population_manifest_revision_ = manifest_revision;
+  it->second.record_.population_manifest_digest_ = manifest_digest;
   return absl::OkStatus();
+}
+
+bool MetaTopologyStore::PopulationManifestInUse(
+    const MetaHash256& manifest_digest) const {
+  return std::any_of(
+      groups_.begin(), groups_.end(), [&manifest_digest](const auto& item) {
+        const MetaGroupRecord& record = item.second.record_;
+        return record.population_manifest_revision_ != 0 &&
+               record.population_manifest_digest_ == manifest_digest;
+      });
 }
 
 absl::Status MetaTopologyStore::SetPartitionReplicationEpoch(
@@ -386,8 +444,9 @@ std::optional<MetaTopologyGroupView> MetaTopologyStore::FindGroup(
   view.config_epoch_ = group.config_epoch_;
   view.revision_ = group.revision_;
   view.members_.reserve(group.members_.size());
-  for (const auto& [node_id, role] : group.members_) {
-    view.members_.push_back(MetaGroupMember{node_id, role});
+  for (const auto& [node_id, member] : group.members_) {
+    view.members_.push_back(
+        MetaGroupMember{node_id, member.assignment_id_, member.role_});
   }
   return view;
 }
@@ -410,6 +469,16 @@ bool MetaTopologyStore::GroupExists(const std::string& group_id) const {
   return groups_.contains(group_id);
 }
 
+std::vector<MetaTopologyGroupView> MetaTopologyStore::Groups() const {
+  std::vector<MetaTopologyGroupView> result;
+  result.reserve(groups_.size());
+  for (const auto& [group_id, state] : groups_) {
+    (void)state;
+    result.push_back(*FindGroup(group_id));
+  }
+  return result;
+}
+
 // Envelope: schema_version u16 | topology_epoch u64 | group count u32 |
 // sorted group records | slot run count u32 | sorted runs. See the header
 // for the convention and the strictness contract.
@@ -423,15 +492,22 @@ std::string MetaTopologyStore::Serialize() const {
     w.WriteString(group.record_.owner_);
     w.WriteU64(group.record_.group_term_);
     w.WriteU64(group.record_.authority_version_);
-    w.WriteU64(group.record_.population_manifest_id_);
+    w.WriteU64(group.record_.population_manifest_revision_);
+    WriteFixedArray(w, group.record_.population_manifest_digest_);
     w.WriteU64(group.record_.partition_replication_epoch_);
     w.WriteU64(group.config_epoch_);
     w.WriteU64(group.revision_);
     w.WriteCount(static_cast<std::uint32_t>(group.members_.size()));
-    for (const auto& [node_id, role] : group.members_) {
+    for (const auto& [node_id, member] : group.members_) {
       w.WriteString(node_id);
-      w.WriteU8(static_cast<std::uint8_t>(role));
+      WriteFixedArray(w, member.assignment_id_);
+      w.WriteU8(static_cast<std::uint8_t>(member.role_));
     }
+  }
+  w.WriteCount(static_cast<std::uint32_t>(last_assignment_by_node_.size()));
+  for (const auto& [node_id, assignment_id] : last_assignment_by_node_) {
+    w.WriteString(node_id);
+    WriteFixedArray(w, assignment_id);
   }
   // The slot map as maximal runs of consecutive slots owned by one group.
   // Two passes over the fixed 16384-entry array: count, then emit.
@@ -481,8 +557,10 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     if (!group_term.ok()) return group_term.status();
     auto authority_version = r.ReadU64();
     if (!authority_version.ok()) return authority_version.status();
-    auto manifest_id = r.ReadU64();
-    if (!manifest_id.ok()) return manifest_id.status();
+    auto manifest_revision = r.ReadU64();
+    if (!manifest_revision.ok()) return manifest_revision.status();
+    auto manifest_digest = ReadFixedArray<32>(r);
+    if (!manifest_digest.ok()) return manifest_digest.status();
     auto partition_epoch = r.ReadU64();
     if (!partition_epoch.ok()) return partition_epoch.status();
     auto config_epoch = r.ReadU64();
@@ -493,13 +571,15 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
         kMaxMetaNodes, [](MetaReader& rr) -> absl::StatusOr<MetaGroupMember> {
           auto node_id = rr.ReadString(kMetaNodeIdBytes);
           if (!node_id.ok()) return node_id.status();
+          auto assignment_id = ReadFixedArray<16>(rr);
+          if (!assignment_id.ok()) return assignment_id.status();
           auto role = rr.ReadU8();
           if (!role.ok()) return role.status();
           if (*role != static_cast<std::uint8_t>(MetaNodeRole::kPrimary) &&
               *role != static_cast<std::uint8_t>(MetaNodeRole::kReplica)) {
             return MetaFailStopError("unknown node role");
           }
-          return MetaGroupMember{std::string(*node_id),
+          return MetaGroupMember{std::string(*node_id), *assignment_id,
                                  static_cast<MetaNodeRole>(*role)};
         });
     if (!members.ok()) return members.status();
@@ -519,15 +599,26 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     group.record_.owner_ = std::string(*owner);
     group.record_.group_term_ = *group_term;
     group.record_.authority_version_ = *authority_version;
-    group.record_.population_manifest_id_ = *manifest_id;
+    group.record_.population_manifest_revision_ = *manifest_revision;
+    group.record_.population_manifest_digest_ = *manifest_digest;
     group.record_.partition_replication_epoch_ = *partition_epoch;
     group.config_epoch_ = *config_epoch;
     group.revision_ = *revision;
+    if ((group.record_.population_manifest_revision_ == 0) !=
+        IsZero(group.record_.population_manifest_digest_)) {
+      return MetaFailStopError(
+          "manifest revision/digest invariant violated in snapshot");
+    }
     for (const MetaGroupMember& member : *members) {
-      if (member.node_id_.empty()) {
-        return MetaFailStopError("empty member node_id in snapshot");
+      if (member.node_id_.empty() || IsZero(member.assignment_id_)) {
+        return MetaFailStopError(
+            "empty member node_id or zero assignment_id in snapshot");
       }
-      if (!group.members_.emplace(member.node_id_, member.role_).second) {
+      if (!group.members_
+               .emplace(
+                   member.node_id_,
+                   GroupState::MemberState{member.assignment_id_, member.role_})
+               .second) {
         return MetaFailStopError("duplicate member in snapshot");
       }
       // One-node-one-group must hold in the decoded state too.
@@ -537,6 +628,37 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
       }
     }
     store.groups_.emplace(std::string(*group_id), std::move(group));
+  }
+
+  auto assignment_history =
+      r.ReadList<std::pair<std::string, MetaAssignmentId>>(
+          kMaxMetaNodes,
+          [](MetaReader& rr)
+              -> absl::StatusOr<std::pair<std::string, MetaAssignmentId>> {
+            auto node_id = rr.ReadString(kMetaNodeIdBytes);
+            if (!node_id.ok()) return node_id.status();
+            auto assignment_id = ReadFixedArray<16>(rr);
+            if (!assignment_id.ok()) return assignment_id.status();
+            return std::pair<std::string, MetaAssignmentId>{
+                std::string(*node_id), *assignment_id};
+          });
+  if (!assignment_history.ok()) return assignment_history.status();
+  for (const auto& [node_id, assignment_id] : *assignment_history) {
+    if (node_id.empty() || IsZero(assignment_id) ||
+        !store.last_assignment_by_node_.emplace(node_id, assignment_id)
+             .second) {
+      return MetaFailStopError("invalid assignment history in snapshot");
+    }
+  }
+  for (const auto& [node_id, group_id] : store.group_of_node_) {
+    const auto history = store.last_assignment_by_node_.find(node_id);
+    const auto group = store.groups_.find(group_id);
+    const auto member = group->second.members_.find(node_id);
+    if (history == store.last_assignment_by_node_.end() ||
+        history->second != member->second.assignment_id_) {
+      return MetaFailStopError(
+          "active membership does not match assignment history");
+    }
   }
 
   auto runs = r.ReadList<MetaSlotAssignment>(

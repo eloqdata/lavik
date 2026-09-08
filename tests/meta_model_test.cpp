@@ -15,6 +15,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "gtest/gtest.h"
+#include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/encoding.h"
 #include "keylane/meta/hash.h"
@@ -508,6 +509,7 @@ TEST(MetaModelCommands, AssignNodeToGroupRoundTrip) {
   cmd.request_id_ = MakeRequestId(0x31);
   cmd.group_id_ = "0123456789abcdef0123456789abcdef01234567";
   cmd.node_id_ = "89abcdef0123456789abcdef0123456789abcdef";
+  cmd.assignment_id_.fill(0x31);
   cmd.role_ = keylane::meta::MetaNodeRole::kReplica;
   cmd.expected_revision_ = 7;
   ExpectRoundTrip(cmd);
@@ -540,14 +542,16 @@ TEST(MetaModelCommands, SetSlotMapRoundTrip) {
 
 TEST(MetaModelCommands, GroupRecordRoundTrip) {
   // The per-group committed record contains owner, group_term,
-  // authority_version, population_manifest_id, partition_replication_epoch.
+  // authority_version, population_manifest_revision, and
+  // partition_replication_epoch.
   // replication_history_id is deliberately absent because it is scoped to a
   // data-plane boot. The record codec is defined here.
   keylane::meta::MetaGroupRecord record;
   record.owner_ = "0123456789abcdef0123456789abcdef01234567";
   record.group_term_ = 9;
   record.authority_version_ = 4;
-  record.population_manifest_id_ = 777;
+  record.population_manifest_revision_ = 777;
+  record.population_manifest_digest_.fill(0x77);
   record.partition_replication_epoch_ = 3;
 
   const auto encoded = keylane::meta::EncodeMetaGroupRecord(record);
@@ -688,12 +692,16 @@ keylane::meta::MetaOperationId MakeOperationId(std::uint8_t seed) {
 keylane::meta::MetaEvidenceSummary MakeEvidence(std::uint8_t seed) {
   keylane::meta::MetaEvidenceSummary ev;
   ev.node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  ev.group_id_ = "group-a";
+  ev.assignment_id_.fill(static_cast<std::uint8_t>(seed + 1));
   for (std::size_t i = 0; i < ev.boot_incarnation_.size(); ++i) {
     ev.boot_incarnation_[i] = static_cast<std::uint8_t>(seed + 7 * i);
   }
   ev.group_term_ = 42;
-  ev.population_manifest_id_ = 777;
-  ev.replication_history_id_ = 555;
+  ev.population_manifest_revision_ = 777;
+  ev.population_manifest_digest_ = MakeHash(seed + 1);
+  ev.partition_replication_epoch_ = 778;
+  ev.replication_history_id_.fill(seed);
   ev.operation_id_ = MakeOperationId(seed);
   ev.kind_hash_ = MakeHash(seed);
   return ev;
@@ -706,6 +714,7 @@ TEST(MetaModelCommands, SubmitOperationRoundTrip) {
   cmd.kind_ = "migration";
   cmd.intent_ = "{\"slot\":42,\"to\":\"group-b\"}";
   cmd.intent_hash_ = MakeHash(0x11);
+  cmd.replication_history_id_.fill(0x12);
   ExpectRoundTrip(cmd);
 }
 
@@ -715,6 +724,29 @@ TEST(MetaModelCommands, TransitionOperationPhaseRoundTrip) {
   cmd.operation_id_ = MakeOperationId(0x02);
   cmd.expected_revision_ = 3;
   cmd.kind_phase_blob_ = "{\"phase\":\"cutover\"}";
+  keylane::meta::MetaDirectiveSpec directive;
+  directive.directive_id_.fill(0x10);
+  directive.attempt_id_.fill(0x11);
+  directive.recipient_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  directive.target_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  directive.target_boot_id_.fill(0x12);
+  directive.assignment_id_.fill(0x13);
+  directive.source_node_id_ = "89abcdef0123456789abcdef0123456789abcdef";
+  directive.source_assignment_id_.fill(0x17);
+  directive.source_boot_id_.fill(0x14);
+  directive.source_replication_history_id_.fill(0x15);
+  directive.group_id_ = "group-a";
+  directive.group_term_ = 42;
+  directive.authority_version_ = 7;
+  directive.grant_revision_ = 101;
+  directive.population_manifest_revision_ = 777;
+  directive.population_manifest_digest_ = MakeHash(0x16);
+  directive.partition_replication_epoch_ = 778;
+  directive.kind_ = "rebuild";
+  directive.payload_ = "{\"partition\":5}";
+  directive.preconditions_ = "{\"source_caught_up\":true}";
+  directive.storage_mutating_ = true;
+  cmd.current_directives_ = {directive};
   cmd.evidence_ = {MakeEvidence(0x01), MakeEvidence(0x02)};
   ExpectRoundTrip(cmd);
 }
@@ -747,6 +779,28 @@ TEST(MetaModelCommands, ArchiveOperationsRoundTrip) {
   ExpectRoundTrip(cmd);
 }
 
+TEST(MetaModelCommands, DirectiveResultReceiptCommandsRoundTrip) {
+  keylane::meta::CommitDirectiveResult commit;
+  commit.request_id_ = MakeRequestId(0x65);
+  commit.operation_id_ = MakeOperationId(0x05);
+  commit.directive_id_.fill(0x20);
+  commit.attempt_id_.fill(0x21);
+  commit.directive_revision_ = 88;
+  commit.recipient_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  commit.recipient_boot_id_.fill(0x22);
+  commit.assignment_id_.fill(0x23);
+  commit.status_ = keylane::meta::MetaDirectiveResultStatus::kFailed;
+  commit.result_ = "source rejected the replication handshake";
+  commit.result_hash_ = keylane::meta::MetaSha256(commit.result_);
+  ExpectRoundTrip(commit);
+
+  keylane::meta::PruneTerminalReceipts prune;
+  prune.request_id_ = MakeRequestId(0x66);
+  prune.receipts_ = {{commit.operation_id_, commit.directive_id_,
+                      commit.attempt_id_, commit.directive_revision_}};
+  ExpectRoundTrip(prune);
+}
+
 TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
   keylane::meta::PruneAudit audit;
   audit.through_log_index_ = 42;
@@ -759,6 +813,7 @@ TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
   keylane::meta::BindMetaMember bind;
   bind.server_id_ = 7;
   bind.principal_ = "keylane://meta/7";
+  bind.data_control_endpoint_ = "10.0.0.7:7100";
   ExpectRoundTrip(bind);
 
   keylane::meta::RetireMetaMember retire;
@@ -778,8 +833,10 @@ TEST(MetaModelCommands, SetGroupReplicationStateRoundTrip) {
   keylane::meta::SetGroupReplicationState command;
   command.request_id_ = MakeRequestId(0x75);
   command.group_id_ = "g1";
-  command.expected_population_manifest_id_ = 7;
-  command.new_population_manifest_id_ = 8;
+  command.expected_population_manifest_revision_ = 7;
+  command.new_population_manifest_revision_ = 8;
+  command.expected_population_manifest_digest_.fill(0x70);
+  command.new_population_manifest_digest_.fill(0x80);
   command.expected_partition_replication_epoch_ = 10;
   command.new_partition_replication_epoch_ = 11;
   command.new_topology_epoch_ = 12;
@@ -946,6 +1003,15 @@ std::string MustSerialize(const MetaStores& stores) {
   return bytes.value_or("");
 }
 
+void ExpectAggregateSnapshotFailStop(const MetaStores& stores) {
+  const auto bytes = stores.Serialize();
+  ASSERT_TRUE(bytes.ok()) << bytes.status();
+  const auto restored = MetaStores::Deserialize(*bytes);
+  ASSERT_FALSE(restored.ok());
+  EXPECT_EQ(keylane::meta::MetaFailureClassOf(restored.status()),
+            keylane::meta::MetaFailureClass::kFailStop);
+}
+
 // The committed DOMAIN state (everything but the audit window): a rejected
 // command must leave this unchanged, while the audit trail still grows by the
 // rejection record; the index is consumed and state otherwise remains
@@ -956,6 +1022,7 @@ std::string DomainStateBytes(const MetaStores& stores) {
   out += stores.policy_.Serialize();
   out += stores.grant_.Serialize().value_or("!");
   out += stores.operation_.Serialize().value_or("!");
+  out += stores.population_manifest_.Serialize();
   return out;
 }
 
@@ -1198,6 +1265,7 @@ keylane::meta::AssignNodeToGroup MakeAssign(const std::string& group_id,
   cmd.request_id_ = MakeRequestId(0x31);
   cmd.group_id_ = group_id;
   cmd.node_id_ = MakeNodeId(node);
+  cmd.assignment_id_.fill(static_cast<std::uint8_t>(node));
   cmd.role_ = keylane::meta::MetaNodeRole::kPrimary;
   cmd.expected_revision_ = expected_revision;
   cmd.new_topology_epoch_ =
@@ -1479,7 +1547,7 @@ TEST(MetaStateApply, TransitionEvidenceMustMatchCommittedAnchors) {
   submit.kind_ = "migration";
   submit.intent_ = "history-bound";
   submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
-  submit.replication_history_id_ = 55;
+  submit.replication_history_id_.fill(55);
   ApplyOk(stores, 6, submit);
 
   keylane::meta::TransitionOperationPhase transition;
@@ -1488,9 +1556,12 @@ TEST(MetaStateApply, TransitionEvidenceMustMatchCommittedAnchors) {
   transition.kind_phase_blob_ = "prepare";
   keylane::meta::MetaEvidenceSummary evidence;
   evidence.node_id_ = MakeNodeId(1);
+  evidence.group_id_ = "g1";
+  evidence.assignment_id_.fill(1);
+  evidence.boot_incarnation_.fill(1);
   evidence.group_term_ = 1;
-  evidence.population_manifest_id_ = 0;
-  evidence.replication_history_id_ = 55;
+  evidence.population_manifest_revision_ = 0;
+  evidence.replication_history_id_.fill(55);
   evidence.operation_id_ = submit.operation_id_;
   evidence.kind_hash_ = keylane::meta::MetaSha256("proof");
   transition.evidence_ = {evidence};
@@ -1505,46 +1576,213 @@ TEST(MetaStateApply, TransitionEvidenceMustMatchCommittedAnchors) {
   EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
             1u);
 
+  keylane::meta::PutPopulationManifest put_manifest;
+  put_manifest.request_id_ = MakeRequestId(0x77);
+  put_manifest.entries_ = {{1, 11}};
+  put_manifest.manifest_digest_ =
+      keylane::meta::MetaPopulationManifestStore::CanonicalDigest(
+          put_manifest.entries_);
+  ApplyOk(stores, 9, put_manifest);
   keylane::meta::SetGroupReplicationState manifest;
   manifest.request_id_ = MakeRequestId(0x77);
   manifest.group_id_ = "g1";
-  manifest.new_population_manifest_id_ = 1;
+  manifest.new_population_manifest_revision_ = 1;
+  manifest.new_population_manifest_digest_ = put_manifest.manifest_digest_;
+  manifest.new_partition_replication_epoch_ = 1;
   manifest.new_topology_epoch_ = 3;
-  ApplyOk(stores, 9, manifest);
+  ApplyOk(stores, 10, manifest);
+
+  keylane::meta::TransitionOperationPhase wrong_partition_epoch = transition;
+  wrong_partition_epoch.request_id_ = MakeRequestId(0x7a);
+  wrong_partition_epoch.expected_revision_ = 1;
+  wrong_partition_epoch.kind_phase_blob_ = "commit";
+  wrong_partition_epoch.evidence_[0].population_manifest_revision_ = 1;
+  wrong_partition_epoch.evidence_[0].population_manifest_digest_ =
+      put_manifest.manifest_digest_;
+  ApplyRejected(stores, 11, wrong_partition_epoch);
+  EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
+            1u);
+
+  keylane::meta::TransitionOperationPhase wrong_manifest = transition;
+  wrong_manifest.request_id_ = MakeRequestId(0x79);
+  wrong_manifest.expected_revision_ = 1;
+  wrong_manifest.kind_phase_blob_ = "commit";
+  wrong_manifest.evidence_[0].population_manifest_revision_ = 1;
+  wrong_manifest.evidence_[0].population_manifest_digest_.fill(0x7f);
+  ApplyRejected(stores, 12, wrong_manifest);
+  EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
+            1u);
+
   keylane::meta::BeginGroupTerm next_term;
   next_term.request_id_ = MakeRequestId(0x78);
   next_term.group_id_ = "g1";
   next_term.expected_term_ = 1;
   next_term.new_term_ = 2;
-  ApplyOk(stores, 10, next_term);
+  ApplyOk(stores, 13, next_term);
 
   // Evidence is checked against committed anchors on first application, but
   // an exact replay stays accepted after those anchors legitimately advance.
   ApplyOk(stores, 7, transition);
-  EXPECT_EQ(stores.audit_.size(), 10u);
+  EXPECT_EQ(stores.audit_.size(), 13u);
+}
+
+TEST(MetaStateApply,
+     TransitionEvidenceRejectsProposalToApplyMembershipIncarnationRaces) {
+  const auto make_submit = [] {
+    keylane::meta::SubmitOperation submit;
+    submit.operation_id_.fill(0x43);
+    submit.kind_ = "migration";
+    submit.intent_ = "membership-bound";
+    submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
+    submit.replication_history_id_.fill(55);
+    return submit;
+  };
+  const auto make_transition =
+      [](const keylane::meta::MetaOperationId& operation_id) {
+        keylane::meta::TransitionOperationPhase transition;
+        transition.operation_id_ = operation_id;
+        transition.kind_phase_blob_ = "prepare";
+        keylane::meta::MetaEvidenceSummary evidence;
+        evidence.node_id_ = MakeNodeId(1);
+        evidence.group_id_ = "g1";
+        evidence.assignment_id_.fill(1);
+        evidence.boot_incarnation_.fill(2);
+        evidence.group_term_ = 1;
+        evidence.replication_history_id_.fill(55);
+        evidence.operation_id_ = operation_id;
+        evidence.kind_hash_ = keylane::meta::MetaSha256("proof");
+        transition.evidence_ = {evidence};
+        return transition;
+      };
+
+  {
+    MetaStores stores;
+    SetupActivatedGroupPrerequisites(stores, 1, "g1");
+    const keylane::meta::SubmitOperation submit = make_submit();
+    ApplyOk(stores, 6, submit);
+    // Model a leader that validated and baked evidence before the membership
+    // commands below committed, but whose transition reaches apply afterward.
+    const keylane::meta::TransitionOperationPhase proposed =
+        make_transition(submit.operation_id_);
+
+    keylane::meta::RemoveNodeFromGroup remove;
+    remove.group_id_ = "g1";
+    remove.node_id_ = MakeNodeId(1);
+    remove.expected_revision_ = 2;
+    remove.new_topology_epoch_ = 3;
+    ApplyOk(stores, 7, remove);
+    keylane::meta::AssignNodeToGroup readd = MakeAssign("g1", 1, 3, 4);
+    readd.assignment_id_.fill(0x21);
+    ApplyOk(stores, 8, readd);
+
+    ApplyRejected(stores, 9, proposed);
+    EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
+              0u);
+  }
+
+  {
+    MetaStores stores;
+    SetupActivatedGroupPrerequisites(stores, 1, "g1");
+    ApplyOk(stores, 6, MakeCreateGroup("g2", 3));
+    keylane::meta::BeginGroupTerm begin_g2;
+    begin_g2.group_id_ = "g2";
+    begin_g2.new_term_ = 1;
+    ApplyOk(stores, 7, begin_g2);
+    const keylane::meta::SubmitOperation submit = make_submit();
+    ApplyOk(stores, 8, submit);
+    const keylane::meta::TransitionOperationPhase proposed =
+        make_transition(submit.operation_id_);
+
+    keylane::meta::RemoveNodeFromGroup remove;
+    remove.group_id_ = "g1";
+    remove.node_id_ = MakeNodeId(1);
+    remove.expected_revision_ = 2;
+    remove.new_topology_epoch_ = 4;
+    ApplyOk(stores, 9, remove);
+    keylane::meta::AssignNodeToGroup move = MakeAssign("g2", 1, 1, 5);
+    move.assignment_id_.fill(0x31);
+    ApplyOk(stores, 10, move);
+
+    ApplyRejected(stores, 11, proposed);
+    EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
+              0u);
+  }
 }
 
 TEST(MetaStateApply, GroupReplicationStateAdvancesWithTopologyEpoch) {
   MetaStores stores;
   ApplyOk(stores, 1, MakeCreateGroup("g1", 1));
+  keylane::meta::PutPopulationManifest put;
+  put.entries_ = {{1, 1}};
+  put.manifest_digest_ =
+      keylane::meta::MetaPopulationManifestStore::CanonicalDigest(put.entries_);
+  ApplyOk(stores, 2, put);
   keylane::meta::SetGroupReplicationState update;
   update.request_id_ = MakeRequestId(0x79);
   update.group_id_ = "g1";
-  update.new_population_manifest_id_ = 1;
+  update.new_population_manifest_revision_ = 1;
+  update.new_population_manifest_digest_ = put.manifest_digest_;
   update.new_partition_replication_epoch_ = 1;
   update.new_topology_epoch_ = 2;
-  ApplyOk(stores, 2, update);
+  ApplyOk(stores, 3, update);
   const auto group = stores.topology_.FindGroup("g1");
   ASSERT_TRUE(group.has_value());
-  EXPECT_EQ(group->record_.population_manifest_id_, 1u);
+  EXPECT_EQ(group->record_.population_manifest_revision_, 1u);
   EXPECT_EQ(group->record_.partition_replication_epoch_, 1u);
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 2u);
 
   keylane::meta::SetGroupReplicationState stale = update;
   stale.request_id_ = MakeRequestId(0x7a);
-  stale.new_population_manifest_id_ = 2;
+  stale.new_population_manifest_revision_ = 2;
   stale.new_topology_epoch_ = 3;
-  ApplyRejected(stores, 3, stale);
+  ApplyRejected(stores, 4, stale);
+}
+
+TEST(MetaStateApply, ManifestRevisionDistinguishesAtoBtoAAndGuardsPrune) {
+  MetaStores stores;
+  ApplyOk(stores, 1, MakeCreateGroup("g1", 1));
+
+  keylane::meta::PutPopulationManifest a;
+  a.entries_ = {{1, 10}};
+  a.manifest_digest_ =
+      keylane::meta::MetaPopulationManifestStore::CanonicalDigest(a.entries_);
+  keylane::meta::PutPopulationManifest b;
+  b.entries_ = {{1, 11}};
+  b.manifest_digest_ =
+      keylane::meta::MetaPopulationManifestStore::CanonicalDigest(b.entries_);
+  ApplyOk(stores, 2, a);
+  ApplyOk(stores, 3, b);
+
+  keylane::meta::SetGroupReplicationState set;
+  set.group_id_ = "g1";
+  set.new_population_manifest_revision_ = 1;
+  set.new_population_manifest_digest_ = a.manifest_digest_;
+  set.new_topology_epoch_ = 2;
+  ApplyOk(stores, 4, set);
+  set.expected_population_manifest_revision_ = 1;
+  set.expected_population_manifest_digest_ = a.manifest_digest_;
+  set.new_population_manifest_revision_ = 2;
+  set.new_population_manifest_digest_ = b.manifest_digest_;
+  set.new_topology_epoch_ = 3;
+  ApplyOk(stores, 5, set);
+  set.expected_population_manifest_revision_ = 2;
+  set.expected_population_manifest_digest_ = b.manifest_digest_;
+  set.new_population_manifest_revision_ = 3;
+  set.new_population_manifest_digest_ = a.manifest_digest_;
+  set.new_topology_epoch_ = 4;
+  ApplyOk(stores, 6, set);
+
+  const auto group = stores.topology_.FindGroup("g1");
+  ASSERT_TRUE(group.has_value());
+  EXPECT_EQ(group->record_.population_manifest_revision_, 3u);
+  EXPECT_EQ(group->record_.population_manifest_digest_, a.manifest_digest_);
+
+  keylane::meta::PrunePopulationManifest prune;
+  prune.manifest_digest_ = a.manifest_digest_;
+  ApplyRejected(stores, 7, prune);
+  prune.manifest_digest_ = b.manifest_digest_;
+  ApplyOk(stores, 8, prune);
+  EXPECT_FALSE(stores.population_manifest_.Contains(b.manifest_digest_));
 }
 
 TEST(MetaStateApply, SetSlotMapThroughDispatcher) {
@@ -1575,6 +1813,20 @@ TEST(MetaStateApply, SetSlotMapThroughDispatcher) {
   bad.ranges_ = {{0, 1, "g-unknown"}};
   ApplyRejected(stores, 8, bad);
   EXPECT_EQ(stores.topology_.SlotOwner(0), std::optional<std::string>("g1"));
+}
+
+TEST(MetaStateApply, SetSlotMapCannotClearAnActiveGrantConfigEpoch) {
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 7)});
+
+  keylane::meta::SetSlotMap clear_config;
+  clear_config.request_id_ = MakeRequestId(0x83);
+  clear_config.new_topology_epoch_ = 4;
+  clear_config.config_epochs_ = {{"g1", 0}};
+  ApplyRejected(stores, 7, MetaCommand{clear_config});
+  EXPECT_EQ(stores.topology_.FindGroup("g1")->config_epoch_, 7u);
+  EXPECT_EQ(stores.topology_.TopologyEpoch(), 3u);
 }
 
 // ---------------------------------------------------------------------------
@@ -1628,6 +1880,27 @@ TEST(MetaStateApply, ActivateAuthorityRejectionLeavesBothHalvesUntouched) {
   expect_rejected_untouched(MakeActivate("g1", 1, 1, 1, 3, 1, "p", 99));
   // authority_version not strictly increasing.
   expect_rejected_untouched(MakeActivate("g1", 1, 1, 0, 3, 1));
+  // A serving owner must have a nonzero configuration epoch on the wire.
+  expect_rejected_untouched(MakeActivate("g1", 1, 1, 1, 3, 0));
+}
+
+TEST(MetaStateApply, ActivateAuthorityRequiresABegunNonzeroTerm) {
+  MetaStores stores;
+  ApplyOk(stores, 1, MakeRegisterFor(1));
+  ApplyOk(stores, 2, MakeCreateGroup("g1", 1));
+  ApplyOk(stores, 3, MakeAssign("g1", 1, 1));
+  ApplyOk(stores, 4, MakePutPolicy("p", 1, "lease-policy"));
+
+  ApplyRejected(stores, 5, MetaCommand{MakeActivate("g1", 0, 1, 1, 3, 1)});
+  const auto grant = stores.grant_.GroupState("g1");
+  ASSERT_TRUE(grant.has_value());
+  EXPECT_EQ(grant->group_term_, 0u);
+  EXPECT_TRUE(grant->fenced_);
+  EXPECT_FALSE(grant->grant_.has_value());
+  const auto topology = stores.topology_.FindGroup("g1");
+  ASSERT_TRUE(topology.has_value());
+  EXPECT_TRUE(topology->record_.owner_.empty());
+  EXPECT_EQ(stores.topology_.TopologyEpoch(), 2u);
 }
 
 TEST(MetaStateApply, ActivateAuthorityAcceptedWritesBothHalvesAtomically) {
@@ -1705,6 +1978,76 @@ keylane::meta::SubmitOperation MakeSubmit(std::uint8_t seed,
   cmd.intent_ = absl::StrCat("{\"slot\":", static_cast<int>(intent_seed), "}");
   cmd.intent_hash_ = MakeHash(intent_seed);
   return cmd;
+}
+
+TEST(MetaStateApply, MetaStoresDeserializeRejectsGroupStoreDrift) {
+  {
+    MetaStores stores;
+    ASSERT_TRUE(stores.topology_.Apply(MakeCreateGroup("g1", 1)).ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+  {
+    MetaStores stores;
+    ASSERT_TRUE(stores.grant_.AddGroup("g1").ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+}
+
+TEST(MetaStateApply,
+     MetaStoresDeserializeRejectsInactiveMembershipAndAnchorDrift) {
+  {
+    MetaStores stores;
+    ApplyOk(stores, 1, MakeCreateGroup("g1", 1));
+    ASSERT_TRUE(stores.topology_.Apply(MakeAssign("g1", 9, 1)).ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+  {
+    MetaStores stores;
+    ApplyOk(stores, 1, MakeCreateGroup("g1", 1));
+    ASSERT_TRUE(stores.topology_.SetGroupTerm("g1", 1).ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+}
+
+TEST(MetaStateApply, MetaStoresDeserializeRejectsDanglingActiveReferences) {
+  {
+    MetaStores stores;
+    SetupActivatedGroupPrerequisites(stores, 1, "g1");
+    ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 1)});
+    keylane::meta::RetirePolicy retire;
+    retire.policy_id_ = "p";
+    retire.version_ = 1;
+    ASSERT_TRUE(stores.policy_.Apply(retire).ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+  {
+    MetaStores stores;
+    ApplyOk(stores, 1, MakeCreateGroup("g1", 1));
+    ASSERT_TRUE(
+        stores.topology_.SetPopulationManifest("g1", 1, MakeHash(0x91)).ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+  {
+    MetaStores stores;
+    ApplyOk(stores, 1, MakePutPolicy("p", 1, "operation-policy"));
+    keylane::meta::SubmitOperation submit = MakeSubmit(0x91, 0x92);
+    submit.policy_references_ = {{"p", 1}};
+    ApplyOk(stores, 2, MetaCommand{submit});
+    keylane::meta::RetirePolicy retire;
+    retire.policy_id_ = "p";
+    retire.version_ = 1;
+    ASSERT_TRUE(stores.policy_.Apply(retire).ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+}
+
+TEST(MetaStateApply,
+     MetaStoresDeserializeRejectsUnprojectableActiveGrantAnchors) {
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 1)});
+  ASSERT_TRUE(stores.topology_.SetGroupConfigEpoch("g1", 0).ok());
+  ExpectAggregateSnapshotFailStop(stores);
 }
 
 TEST(MetaStateApply, SubmitOperationSeqIsLogIndexAndActorPersisted) {
@@ -1786,6 +2129,516 @@ TEST(MetaStateApply, OperationLifecycleAndArchiveThroughDispatcher) {
   ApplyOk(stores, 6, MetaCommand{submit});
   EXPECT_EQ(stores.operation_.LiveCount(), 0u);
   EXPECT_EQ(stores.operation_.ArchivedCount(), 1u);
+}
+
+TEST(MetaStateApply, DirectiveResultCommitUsesFirstRaftIndexOnReplay) {
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MakeRegisterFor(2));
+  ApplyOk(stores, 7, MakeAssign("g1", 2, 2, 3));
+  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 1, 4, 1)});
+  const keylane::meta::SubmitOperation submit = MakeSubmit(0x68, 0x41);
+  ApplyOk(stores, 9, MetaCommand{submit});
+
+  keylane::meta::MetaDirectiveSpec directive;
+  directive.directive_id_.fill(1);
+  directive.attempt_id_.fill(2);
+  directive.recipient_node_id_ = MakeNodeId(1);
+  directive.target_node_id_ = MakeNodeId(1);
+  directive.target_boot_id_.fill(3);
+  directive.assignment_id_.fill(1);
+  directive.source_node_id_ = MakeNodeId(2);
+  directive.source_assignment_id_.fill(2);
+  directive.source_boot_id_.fill(5);
+  directive.source_replication_history_id_.fill(6);
+  directive.group_id_ = "g1";
+  directive.group_term_ = 1;
+  directive.authority_version_ = 1;
+  directive.grant_revision_ = 8;
+  directive.kind_ = "rebuild";
+  directive.storage_mutating_ = true;
+  keylane::meta::TransitionOperationPhase transition;
+  transition.operation_id_ = submit.operation_id_;
+  transition.current_directives_ = {directive};
+  ApplyOk(stores, 10, MetaCommand{transition});
+
+  keylane::meta::CommitDirectiveResult commit;
+  commit.operation_id_ = submit.operation_id_;
+  commit.directive_id_ = directive.directive_id_;
+  commit.attempt_id_ = directive.attempt_id_;
+  commit.directive_revision_ = 10;
+  commit.recipient_node_id_ = directive.recipient_node_id_;
+  commit.recipient_boot_id_ = directive.target_boot_id_;
+  commit.assignment_id_ = directive.assignment_id_;
+  commit.result_ = "installed";
+  commit.result_hash_ = keylane::meta::MetaSha256(commit.result_);
+
+  const auto applied = ApplyOk(stores, 11, MetaCommand{commit});
+  EXPECT_EQ(applied.command_tag_,
+            keylane::meta::MetaCommandTag::kCommitDirectiveResult);
+  const keylane::meta::MetaTerminalReceiptKey key{
+      submit.operation_id_, directive.directive_id_, directive.attempt_id_, 10};
+  ASSERT_TRUE(stores.operation_.FindTerminalReceipt(key).has_value());
+  EXPECT_EQ(stores.operation_.FindTerminalReceipt(key)->committed_index_, 11u);
+  EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
+            2u);
+
+  keylane::meta::CompleteOperation stale_complete;
+  stale_complete.operation_id_ = submit.operation_id_;
+  stale_complete.expected_revision_ = 1;
+  ApplyRejected(stores, 12, MetaCommand{stale_complete});
+
+  ApplyOk(stores, 13, MetaCommand{commit});
+  EXPECT_EQ(stores.operation_.FindTerminalReceipt(key)->committed_index_, 11u);
+  EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
+            2u);
+}
+
+TEST(MetaStateApply, DirectiveIntentMustMatchCommittedAuthorityAndAssignment) {
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MakeRegisterFor(2));
+  ApplyOk(stores, 7, MakeAssign("g1", 2, 2, 3));
+  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 1, 4, 1)});
+  const keylane::meta::SubmitOperation submit = MakeSubmit(0x69, 0x42);
+  ApplyOk(stores, 9, MetaCommand{submit});
+
+  keylane::meta::MetaDirectiveSpec directive;
+  directive.directive_id_.fill(1);
+  directive.attempt_id_.fill(2);
+  directive.recipient_node_id_ = MakeNodeId(2);
+  directive.target_node_id_ = MakeNodeId(2);
+  directive.target_boot_id_.fill(3);
+  directive.assignment_id_.fill(2);
+  directive.source_node_id_ = MakeNodeId(1);
+  directive.source_assignment_id_.fill(1);
+  directive.source_boot_id_.fill(4);
+  directive.source_replication_history_id_.fill(5);
+  directive.group_id_ = "g1";
+  directive.group_term_ = 1;
+  directive.authority_version_ = 1;
+  directive.grant_revision_ = 8;
+  directive.partition_replication_epoch_ = 0;
+  directive.kind_ = "rebuild";
+  directive.storage_mutating_ = true;
+
+  keylane::meta::TransitionOperationPhase transition;
+  transition.operation_id_ = submit.operation_id_;
+  transition.current_directives_ = {directive};
+  transition.current_directives_[0].grant_revision_ = 7;
+  ApplyRejected(stores, 10, MetaCommand{transition});
+  EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
+            0u);
+
+  transition.current_directives_[0] = directive;
+  transition.current_directives_[0].partition_replication_epoch_ = 1;
+  ApplyRejected(stores, 11, MetaCommand{transition});
+  transition.current_directives_[0] = directive;
+  ApplyOk(stores, 12, MetaCommand{transition});
+  const auto installed = stores.operation_.FindOperation(submit.operation_id_)
+                             ->current_directives_;
+  ASSERT_EQ(installed.size(), 1u);
+  EXPECT_EQ(installed[0].spec_, directive);
+  EXPECT_EQ(installed[0].directive_revision_, 12u);
+}
+
+struct InstalledDirectiveFixture {
+  MetaStores stores;
+  keylane::meta::SubmitOperation submit;
+  keylane::meta::MetaDirectiveSpec directive;
+  std::uint64_t directive_revision = 12;
+};
+
+// Builds a three-member group whose owner is separate from the directive's
+// source and target. This lets membership tests remove either endpoint while
+// leaving the active grant itself valid.
+InstalledDirectiveFixture MakeInstalledDirectiveFixture() {
+  InstalledDirectiveFixture fixture;
+  SetupActivatedGroupPrerequisites(fixture.stores, 1, "g1");
+  ApplyOk(fixture.stores, 6, MakeRegisterFor(2));
+  ApplyOk(fixture.stores, 7, MakeAssign("g1", 2, 2, 3));
+  ApplyOk(fixture.stores, 8, MakeRegisterFor(3));
+  ApplyOk(fixture.stores, 9, MakeAssign("g1", 3, 3, 4));
+  ApplyOk(fixture.stores, 10, MetaCommand{MakeActivate("g1", 1, 3, 1, 5, 1)});
+
+  fixture.submit = MakeSubmit(0x6d, 0x44);
+  ApplyOk(fixture.stores, 11, MetaCommand{fixture.submit});
+
+  fixture.directive.directive_id_.fill(1);
+  fixture.directive.attempt_id_.fill(2);
+  fixture.directive.recipient_node_id_ = MakeNodeId(2);
+  fixture.directive.target_node_id_ = MakeNodeId(2);
+  fixture.directive.target_boot_id_.fill(3);
+  fixture.directive.assignment_id_.fill(2);
+  fixture.directive.source_node_id_ = MakeNodeId(1);
+  fixture.directive.source_assignment_id_.fill(1);
+  fixture.directive.source_boot_id_.fill(4);
+  fixture.directive.source_replication_history_id_.fill(5);
+  fixture.directive.group_id_ = "g1";
+  fixture.directive.group_term_ = 1;
+  fixture.directive.authority_version_ = 1;
+  fixture.directive.grant_revision_ = 10;
+  fixture.directive.kind_ = "rebuild";
+  fixture.directive.storage_mutating_ = true;
+
+  keylane::meta::TransitionOperationPhase transition;
+  transition.operation_id_ = fixture.submit.operation_id_;
+  transition.current_directives_ = {fixture.directive};
+  ApplyOk(fixture.stores, fixture.directive_revision, MetaCommand{transition});
+  return fixture;
+}
+
+keylane::meta::CommitDirectiveResult MakeDirectiveResult(
+    const InstalledDirectiveFixture& fixture) {
+  keylane::meta::CommitDirectiveResult result;
+  result.operation_id_ = fixture.submit.operation_id_;
+  result.directive_id_ = fixture.directive.directive_id_;
+  result.attempt_id_ = fixture.directive.attempt_id_;
+  result.directive_revision_ = fixture.directive_revision;
+  result.recipient_node_id_ = fixture.directive.recipient_node_id_;
+  result.recipient_boot_id_ = fixture.directive.target_boot_id_;
+  result.assignment_id_ = fixture.directive.assignment_id_;
+  result.result_ = "installed";
+  result.result_hash_ = keylane::meta::MetaSha256(result.result_);
+  return result;
+}
+
+void ExpectDirectiveInvalidated(const InstalledDirectiveFixture& fixture,
+                                std::uint64_t expected_revision = 2) {
+  const auto operation =
+      fixture.stores.operation_.FindOperation(fixture.submit.operation_id_);
+  ASSERT_TRUE(operation.has_value());
+  EXPECT_TRUE(operation->current_directives_.empty());
+  // Clearing a live directive is a durable operation-record mutation. The
+  // revision bump forces a reconciler holding the prior phase CAS to re-read.
+  EXPECT_EQ(operation->revision_, expected_revision);
+}
+
+TEST(MetaStateApply,
+     RemovingSourceOrTargetInvalidatesDirectiveAcrossReplayAndRestart) {
+  for (const std::uint32_t removed_node : {1u, 2u}) {
+    SCOPED_TRACE("removed_node=" + std::to_string(removed_node));
+    InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+
+    keylane::meta::RemoveNodeFromGroup remove;
+    remove.request_id_ = MakeRequestId(0x6e);
+    remove.group_id_ = "g1";
+    remove.node_id_ = MakeNodeId(removed_node);
+    remove.expected_revision_ = 4;
+    remove.new_topology_epoch_ = 6;
+    ApplyOk(fixture.stores, 13, MetaCommand{remove});
+    ExpectDirectiveInvalidated(fixture);
+
+    const std::string after_first_apply = DomainStateBytes(fixture.stores);
+    ApplyOk(fixture.stores, 13, MetaCommand{remove});
+    EXPECT_EQ(DomainStateBytes(fixture.stores), after_first_apply);
+
+    auto restored = MetaStores::Deserialize(MustSerialize(fixture.stores));
+    ASSERT_TRUE(restored.ok()) << restored.status();
+    EXPECT_EQ(MustSerialize(*restored), MustSerialize(fixture.stores));
+
+    // Reusing the stable node id with a fresh membership incarnation cannot
+    // revive work authorized for the removed assignment.
+    keylane::meta::AssignNodeToGroup readd =
+        MakeAssign("g1", removed_node, 5, 7);
+    readd.assignment_id_.fill(static_cast<std::uint8_t>(0x20 + removed_node));
+    ApplyOk(fixture.stores, 14, MetaCommand{readd});
+    ExpectDirectiveInvalidated(fixture);
+
+    const auto result = MakeDirectiveResult(fixture);
+    ApplyRejected(fixture.stores, 15, MetaCommand{result});
+    const keylane::meta::MetaTerminalReceiptKey key{
+        result.operation_id_, result.directive_id_, result.attempt_id_,
+        result.directive_revision_};
+    EXPECT_FALSE(
+        fixture.stores.operation_.FindTerminalReceipt(key).has_value());
+  }
+}
+
+TEST(MetaStateApply, AuthorityAnchorMutationsInvalidateLiveDirectives) {
+  {
+    InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+    keylane::meta::BeginGroupTerm begin;
+    begin.group_id_ = "g1";
+    begin.expected_term_ = 1;
+    begin.new_term_ = 2;
+    ApplyOk(fixture.stores, 13, MetaCommand{begin});
+    ExpectDirectiveInvalidated(fixture);
+  }
+  {
+    InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+    keylane::meta::GrantAuthority renew;
+    renew.group_id_ = "g1";
+    renew.node_id_ = MakeNodeId(3);
+    renew.term_ = 1;
+    renew.authority_version_ = 1;
+    renew.grant_.lease_duration_ms_ = 9000;
+    renew.grant_.policy_id_ = "p";
+    renew.grant_.policy_version_ = 1;
+    ApplyOk(fixture.stores, 13, MetaCommand{renew});
+    ExpectDirectiveInvalidated(fixture);
+  }
+  {
+    InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+    ApplyOk(fixture.stores, 13, MetaCommand{MakeActivate("g1", 1, 3, 2, 6, 2)});
+    ExpectDirectiveInvalidated(fixture);
+  }
+  {
+    InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+    keylane::meta::RevokeGrant revoke;
+    revoke.group_id_ = "g1";
+    revoke.expected_term_ = 1;
+    ApplyOk(fixture.stores, 13, MetaCommand{revoke});
+    ExpectDirectiveInvalidated(fixture);
+  }
+  {
+    InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+    keylane::meta::FenceGroup fence;
+    fence.group_id_ = "g1";
+    fence.expected_term_ = 1;
+    ApplyOk(fixture.stores, 13, MetaCommand{fence});
+    ExpectDirectiveInvalidated(fixture);
+  }
+}
+
+TEST(MetaStateApply, PopulationAnchorMutationsInvalidateLiveDirectives) {
+  {
+    InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+    keylane::meta::PutPopulationManifest put;
+    put.entries_ = {{1, 11}};
+    put.manifest_digest_ =
+        keylane::meta::MetaPopulationManifestStore::CanonicalDigest(
+            put.entries_);
+    ApplyOk(fixture.stores, 13, MetaCommand{put});
+    EXPECT_EQ(
+        fixture.stores.operation_.FindOperation(fixture.submit.operation_id_)
+            ->current_directives_.size(),
+        1u);
+
+    keylane::meta::SetGroupReplicationState update;
+    update.group_id_ = "g1";
+    update.new_population_manifest_revision_ = 1;
+    update.new_population_manifest_digest_ = put.manifest_digest_;
+    update.new_topology_epoch_ = 6;
+    ApplyOk(fixture.stores, 14, MetaCommand{update});
+    ExpectDirectiveInvalidated(fixture);
+  }
+  {
+    InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+    keylane::meta::SetGroupReplicationState update;
+    update.group_id_ = "g1";
+    update.new_partition_replication_epoch_ = 1;
+    update.new_topology_epoch_ = 6;
+    ApplyOk(fixture.stores, 13, MetaCommand{update});
+    ExpectDirectiveInvalidated(fixture);
+  }
+}
+
+TEST(MetaStateApply, RejectedAnchorMutationDoesNotInvalidateDirective) {
+  InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+  keylane::meta::RemoveNodeFromGroup remove;
+  remove.group_id_ = "g1";
+  remove.node_id_ = fixture.directive.target_node_id_;
+  remove.expected_revision_ = 99;
+  remove.new_topology_epoch_ = 6;
+  ApplyRejected(fixture.stores, 13, MetaCommand{remove});
+
+  const auto operation =
+      fixture.stores.operation_.FindOperation(fixture.submit.operation_id_);
+  ASSERT_TRUE(operation.has_value());
+  ASSERT_EQ(operation->current_directives_.size(), 1u);
+  EXPECT_EQ(operation->current_directives_.front().spec_, fixture.directive);
+  EXPECT_EQ(operation->revision_, 1u);
+}
+
+TEST(MetaStateApply, DirectiveResultRevalidatesCurrentAggregateAnchor) {
+  InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+  keylane::meta::RemoveNodeFromGroup remove;
+  remove.group_id_ = "g1";
+  remove.node_id_ = fixture.directive.target_node_id_;
+  remove.expected_revision_ = 4;
+  remove.new_topology_epoch_ = 6;
+  // Deliberately bypass ApplyCommitted to model a stale/inconsistent current
+  // directive. The result ingress must defend itself even if an invalidation
+  // hook is missed by a future mutation path.
+  ASSERT_TRUE(fixture.stores.topology_.Apply(remove).ok());
+  ASSERT_EQ(
+      fixture.stores.operation_.FindOperation(fixture.submit.operation_id_)
+          ->current_directives_.size(),
+      1u);
+  ExpectAggregateSnapshotFailStop(fixture.stores);
+
+  const auto result = MakeDirectiveResult(fixture);
+  ApplyRejected(fixture.stores, 13, MetaCommand{result});
+  const keylane::meta::MetaTerminalReceiptKey key{
+      result.operation_id_, result.directive_id_, result.attempt_id_,
+      result.directive_revision_};
+  EXPECT_FALSE(fixture.stores.operation_.FindTerminalReceipt(key).has_value());
+}
+
+TEST(MetaStateApply,
+     CommittedDirectiveResultRemainsReplayableAfterInvalidation) {
+  InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
+  const auto result = MakeDirectiveResult(fixture);
+  ApplyOk(fixture.stores, 13, MetaCommand{result});
+
+  keylane::meta::RemoveNodeFromGroup remove;
+  remove.group_id_ = "g1";
+  remove.node_id_ = fixture.directive.target_node_id_;
+  remove.expected_revision_ = 4;
+  remove.new_topology_epoch_ = 6;
+  ApplyOk(fixture.stores, 14, MetaCommand{remove});
+  ExpectDirectiveInvalidated(fixture, 3);
+
+  ApplyOk(fixture.stores, 15, MetaCommand{result});
+  const keylane::meta::MetaTerminalReceiptKey key{
+      result.operation_id_, result.directive_id_, result.attempt_id_,
+      result.directive_revision_};
+  const auto receipt = fixture.stores.operation_.FindTerminalReceipt(key);
+  ASSERT_TRUE(receipt.has_value());
+  EXPECT_EQ(receipt->committed_index_, 13u);
+}
+
+TEST(MetaStateApply, DirectiveRejectsSourceAssignmentFromBeforeRemoveAndReadd) {
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MakeRegisterFor(2));
+  ApplyOk(stores, 7, MakeAssign("g1", 2, 2, 3));
+  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 1, 4, 1)});
+  const keylane::meta::SubmitOperation submit = MakeSubmit(0x6a, 0x43);
+  ApplyOk(stores, 9, MetaCommand{submit});
+
+  keylane::meta::RemoveNodeFromGroup remove;
+  remove.request_id_ = MakeRequestId(0x6b);
+  remove.group_id_ = "g1";
+  remove.node_id_ = MakeNodeId(2);
+  remove.expected_revision_ = 3;
+  remove.new_topology_epoch_ = 5;
+  ApplyOk(stores, 10, MetaCommand{remove});
+
+  keylane::meta::AssignNodeToGroup readd = MakeAssign("g1", 2, 4, 6);
+  readd.request_id_ = MakeRequestId(0x6c);
+  readd.assignment_id_.fill(0x22);
+  ApplyOk(stores, 11, MetaCommand{readd});
+
+  keylane::meta::MetaDirectiveSpec directive;
+  directive.directive_id_.fill(1);
+  directive.attempt_id_.fill(2);
+  directive.recipient_node_id_ = MakeNodeId(2);
+  directive.target_node_id_ = MakeNodeId(1);
+  directive.target_boot_id_.fill(3);
+  directive.assignment_id_.fill(1);
+  directive.source_node_id_ = MakeNodeId(2);
+  directive.source_assignment_id_.fill(2);  // removed incarnation
+  directive.source_boot_id_.fill(4);
+  directive.source_replication_history_id_.fill(5);
+  directive.group_id_ = "g1";
+  directive.group_term_ = 1;
+  directive.authority_version_ = 1;
+  directive.grant_revision_ = 8;
+  directive.kind_ = "authorize-source";
+
+  keylane::meta::TransitionOperationPhase transition;
+  transition.operation_id_ = submit.operation_id_;
+  transition.current_directives_ = {directive};
+  ApplyRejected(stores, 12, MetaCommand{transition});
+  EXPECT_EQ(stores.operation_.FindOperation(submit.operation_id_)->revision_,
+            0u);
+
+  transition.current_directives_[0].source_assignment_id_ =
+      readd.assignment_id_;
+  ApplyOk(stores, 13, MetaCommand{transition});
+}
+
+TEST(MetaStateApply,
+     TransitionRejectsAggregateRecipientProjectionOverDirectiveCapAtomically) {
+  namespace control = keylane::cluster::control;
+  static_assert(control::kMaxProjectedDirectives %
+                    keylane::meta::kMaxMetaDirectivesPerOperation ==
+                0);
+
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 1)});
+
+  const auto make_directive = [](std::size_t ordinal) {
+    keylane::meta::MetaDirectiveSpec directive;
+    directive.directive_id_.fill(static_cast<std::uint8_t>(ordinal + 1));
+    directive.attempt_id_.fill(static_cast<std::uint8_t>(ordinal + 65));
+    directive.recipient_node_id_ = MakeNodeId(1);
+    directive.target_node_id_ = MakeNodeId(1);
+    directive.target_boot_id_.fill(1);
+    directive.assignment_id_.fill(1);
+    directive.source_node_id_ = MakeNodeId(1);
+    directive.source_assignment_id_.fill(1);
+    directive.source_boot_id_.fill(2);
+    directive.source_replication_history_id_.fill(3);
+    directive.group_id_ = "g1";
+    directive.group_term_ = 1;
+    directive.authority_version_ = 1;
+    directive.grant_revision_ = 6;
+    directive.kind_ = "authorize-source";
+    return directive;
+  };
+
+  std::uint64_t log_index = 7;
+  const std::size_t full_operation_count =
+      control::kMaxProjectedDirectives /
+      keylane::meta::kMaxMetaDirectivesPerOperation;
+  for (std::size_t operation_ordinal = 0;
+       operation_ordinal < full_operation_count; ++operation_ordinal) {
+    keylane::meta::SubmitOperation submit =
+        MakeSubmit(static_cast<std::uint8_t>(operation_ordinal + 1),
+                   static_cast<std::uint8_t>(operation_ordinal + 101));
+    submit.replication_history_id_.fill(3);
+    ASSERT_TRUE(stores.operation_.SubmitOperation(submit, log_index++).ok());
+
+    keylane::meta::TransitionOperationPhase transition;
+    transition.operation_id_ = submit.operation_id_;
+    transition.kind_phase_blob_ = "dispatch";
+    transition.current_directives_.reserve(
+        keylane::meta::kMaxMetaDirectivesPerOperation);
+    for (std::size_t directive_ordinal = 0;
+         directive_ordinal < keylane::meta::kMaxMetaDirectivesPerOperation;
+         ++directive_ordinal) {
+      transition.current_directives_.push_back(
+          make_directive(directive_ordinal));
+    }
+    ASSERT_TRUE(
+        stores.operation_.TransitionOperationPhase(transition, log_index++)
+            .ok());
+  }
+
+  keylane::meta::SubmitOperation overflow = MakeSubmit(0x70, 0x71);
+  overflow.replication_history_id_.fill(3);
+  ASSERT_TRUE(stores.operation_.SubmitOperation(overflow, log_index++).ok());
+
+  keylane::meta::TransitionOperationPhase transition;
+  transition.operation_id_ = overflow.operation_id_;
+  transition.kind_phase_blob_ = "would-overflow";
+  transition.current_directives_ = {make_directive(0)};
+  const std::string domain_before = DomainStateBytes(stores);
+  const std::size_t audit_size_before = stores.audit_.size();
+
+  const MetaApplyResult first =
+      ApplyRejected(stores, log_index, MetaCommand{transition});
+  EXPECT_NE(first.detail_.find("current directives exceeds its entry cap"),
+            std::string::npos)
+      << first.detail_;
+  EXPECT_EQ(DomainStateBytes(stores), domain_before);
+  const auto record = stores.operation_.FindOperation(overflow.operation_id_);
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(record->revision_, 0u);
+  EXPECT_TRUE(record->current_directives_.empty());
+  EXPECT_EQ(stores.audit_.size(), audit_size_before + 1);
+
+  // Replaying the rejected log entry produces the same rejection and cannot
+  // append another audit record or partially install the candidate phase.
+  const MetaApplyResult replay =
+      ApplyRejected(stores, log_index, MetaCommand{transition});
+  EXPECT_EQ(replay, first);
+  EXPECT_EQ(DomainStateBytes(stores), domain_before);
+  EXPECT_EQ(stores.audit_.size(), audit_size_before + 1);
 }
 
 TEST(MetaStateApply, ArchiveOperationsRejectsNonTerminal) {
@@ -1948,10 +2801,19 @@ std::vector<ScriptedCommand> MakeCommandScript() {
     push(slots, accept);
   }
   {
+    keylane::meta::PutPopulationManifest put;
+    put.request_id_ = MakeRequestId(0x34);
+    put.entries_ = {{1, 1}};
+    put.manifest_digest_ =
+        keylane::meta::MetaPopulationManifestStore::CanonicalDigest(
+            put.entries_);
+    push(put, accept);
+
     keylane::meta::SetGroupReplicationState replication;
     replication.request_id_ = MakeRequestId(0x35);
     replication.group_id_ = "g1";
-    replication.new_population_manifest_id_ = 1;
+    replication.new_population_manifest_revision_ = 1;
+    replication.new_population_manifest_digest_ = put.manifest_digest_;
     replication.new_partition_replication_epoch_ = 1;
     replication.new_topology_epoch_ = 7;
     push(replication, accept);

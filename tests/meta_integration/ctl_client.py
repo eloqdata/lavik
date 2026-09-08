@@ -59,8 +59,23 @@ def unix_gate(workdir):
                      "ctl-gate", "unix"])
         if not reply.startswith("OK "):
             raise H.Failure(f"Unix submitop: {reply}")
+        operation_seq = reply.split()[1]
         if run(["--socket", node.ctl_path, "getop", op_id]) != "OK submitted":
             raise H.Failure("Unix getop did not observe the committed command")
+        aborted = run(["--socket", node.ctl_path, "abortop", op_id])
+        if not aborted.startswith("OK "):
+            raise H.Failure(f"Unix abortop: {aborted}")
+        archived = run(["--socket", node.ctl_path, "archiveoperations",
+                        operation_seq])
+        if not archived.startswith("OK "):
+            raise H.Failure(f"Unix archiveoperations: {archived}")
+        pruned = run(["--socket", node.ctl_path, "pruneoperations",
+                      operation_seq])
+        if not pruned.startswith("OK "):
+            raise H.Failure(f"Unix pruneoperations: {pruned}")
+        if run(["--socket", node.ctl_path, "getop", op_id], expected=2) != \
+                "ERR not-found":
+            raise H.Failure("operation recovery sequence did not prune state")
 
         if run(["--socket", node.ctl_path, "unknown"], expected=2) != \
                 "ERR unknown-command":
@@ -75,11 +90,13 @@ def plaintext_gate(workdir):
     data_dir = os.path.join(directory, "node1")
     os.makedirs(data_dir, mode=0o700, exist_ok=True)
     raft_port = H.free_port()
+    data_control_port = H.free_port()
     ctl_port = H.free_port()
     log_path = os.path.join(directory, "node1.log")
     log_file = open(log_path, "wb")
     server = subprocess.Popen(
         [META, "--id", "1", "--addr", f"127.0.0.1:{raft_port}",
+         "--data-control-addr", f"127.0.0.1:{data_control_port}",
          "--data-dir", data_dir, "--bootstrap",
          "--ctl-addr", f"127.0.0.1:{ctl_port}"] + H.raft_args(),
         stdout=log_file, stderr=subprocess.STDOUT)
@@ -146,11 +163,13 @@ def mtls_gate(workdir):
         directory, ca_crt, ca_key, "operator",
         "URI:keylane://operator/ctl-gate")
     raft_port = H.free_port()
+    data_control_port = H.free_port()
     ctl_port = H.free_port()
     log_path = os.path.join(directory, "node1.log")
     log_file = open(log_path, "wb")
     server = subprocess.Popen(
         [META, "--id", "1", "--addr", f"127.0.0.1:{raft_port}",
+         "--data-control-addr", f"127.0.0.1:{data_control_port}",
          "--data-dir", data_dir, "--bootstrap",
          "--ctl-addr", f"127.0.0.1:{ctl_port}",
          "--ctl-tls-ca", ca_crt, "--ctl-tls-cert", server_cert,

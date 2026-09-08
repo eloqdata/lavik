@@ -1,20 +1,22 @@
 #pragma once
 
-// ClusterControlPort: the seam through which a control plane
-// supplies the target serving state. The static file adapter and the
-// in-memory test adapter ship with the open-source data plane; the Meta/Raft
-// adapter (follow-up work) implements the same interface without the data plane
-// ever learning about Raft phases, transport, or licensing.
+// ClusterControlPort is the synchronous target-state source used by the static
+// file and in-memory test adapters. Both hand complete states to the shared
+// NodeControlInstaller. Meta control has an asynchronous session lifecycle and
+// therefore calls that installer directly after decoding its wire projection;
+// neither path exposes Raft phases to request routing.
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "keylane/cluster/node_control.h"
 #include "keylane/cluster/topology.h"
 
 namespace keylane::cluster {
@@ -23,11 +25,11 @@ class ClusterControlPort {
  public:
   virtual ~ClusterControlPort() = default;
 
-  // Reads the current target state from the control source and publishes it
-  // into `cache` when the content changed. On any error the previously
-  // published state stays in effect (fencing transitions are only ever
-  // published complete).
-  virtual absl::Status RefreshTarget(TopologyCache& cache) = 0;
+  // Reads the current target state from the control source and hands it to the
+  // unique installer. On any source/parse error the previously published
+  // state stays in effect (fencing transitions are only ever installed
+  // complete).
+  virtual absl::Status RefreshTarget(NodeControlInstaller& installer) = 0;
 };
 
 // Loads a Redis nodes.conf-format file as the static topology:
@@ -61,10 +63,17 @@ class StaticClusterControl final : public ClusterControlPort {
                        std::uint16_t cluster_tls_port,
                        std::size_t worker_count = 1);
 
-  absl::Status RefreshTarget(TopologyCache& cache) override;
+  absl::Status RefreshTarget(NodeControlInstaller& installer) override;
 
   // Marks storage readiness; takes effect on the next RefreshTarget.
   void SetStorageReady(bool ready);
+
+  // Serializes terminal storage loss with SIGHUP/startup RefreshTarget across
+  // the whole asynchronous NodeControl transition. The mutex is intentionally
+  // held across suspension: reload runs on the process main thread, while the
+  // transition and every continuation run on worker zero.
+  celer::Task<absl::Status> LoseStorageReadinessTransition(
+      NodeControlInstaller& installer);
 
   // Parses nodes.conf content into a ServingState without touching any cache.
   // Exposed for unit tests and for startup validation (fail fast on a file
@@ -80,6 +89,12 @@ class StaticClusterControl final : public ClusterControlPort {
   std::uint16_t cluster_tls_port_;
   std::size_t worker_count_;
   std::atomic<bool> storage_ready_{false};
+  // Startup readiness is published by worker 0, while SIGHUP reload runs on
+  // the process main thread. Serialize the complete parse/install boundary so
+  // an older not-ready parse cannot overtake the readiness publication and so
+  // NodeControlInstaller remains a single-writer seam in static mode.
+  std::mutex refresh_mutex_;
+  std::uint64_t refresh_revision_ = 0;
 };
 
 // Test adapter: tests build ServingStates directly (including fenced or
@@ -88,10 +103,11 @@ class StaticClusterControl final : public ClusterControlPort {
 class InMemoryClusterControl final : public ClusterControlPort {
  public:
   void SetTarget(std::shared_ptr<const ServingState> state);
-  absl::Status RefreshTarget(TopologyCache& cache) override;
+  absl::Status RefreshTarget(NodeControlInstaller& installer) override;
 
  private:
   std::shared_ptr<const ServingState> pending_;
+  std::uint64_t refresh_revision_ = 0;
 };
 
 }  // namespace keylane::cluster

@@ -83,6 +83,10 @@ void StorageEngine::FenceRequestServingUntilRestart() noexcept {
   impl_->FenceRequestServingUntilRestart();
 }
 
+bool StorageEngine::RuntimeFailureLatched() const noexcept {
+  return impl_->RuntimeFailureLatched();
+}
+
 unsigned StorageEngine::OwnerForKey(std::string_view key) const noexcept {
   return impl_->OwnerForKey(key);
 }

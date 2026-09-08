@@ -1581,10 +1581,111 @@ class ReplicationLogService final : public celer::Service {
     co_return co_await storage_->SetReplicationBacklogBackpressure(true);
   }
 
-  celer::Task<absl::Status> Exercise() {
-    absl::Status status = co_await ExerciseFullSyncOverrides();
+  // Keep the FLUSH control-barrier phase independent so failures leave the
+  // surrounding replication-log exercise at a clear lifecycle boundary.
+  celer::Task<absl::Status> ExerciseFlushControlBarriers() {
+    auto flush_victim = co_await storage_->Set(2, "flush-victim", "gone", {});
+    auto flush_survivor =
+        co_await storage_->Set(3, "flush-survivor", "kept", {});
+    if (!flush_victim.ok()) co_return flush_victim.status();
+    if (!flush_survivor.ok()) co_return flush_survivor.status();
+    absl::Status status = co_await storage_->EnableReplicationLog(21, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    std::vector<std::string> flush_args{"FLUSHDB"};
+    status = co_await ExecuteClientCommand(2, std::move(flush_args), "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await WaitForReplicationTail(1);
+    if (!status.ok()) co_return status;
+    Check(!co_await storage_->Exists(2, "flush-victim") &&
+              co_await storage_->Exists(3, "flush-survivor"),
+          "source FLUSHDB affected the wrong database");
+    auto flush_batch = co_await storage_->ReadReplicationLog({}, kMiB, 1);
+    if (!flush_batch.ok()) co_return flush_batch.status();
+    Check(flush_batch->frames_.size() == 1 && flush_batch->at_tail_ &&
+              flush_batch->frames_.front().header_.kind_ ==
+                  ReplicationEventKind::kControl,
+          "FLUSHDB did not produce one control frame");
+    auto flush_command = keylane::DecodeReplicationCommand(
+        flush_batch->frames_.front().payload_);
+    if (!flush_command.ok()) co_return flush_command.status();
+    Check(flush_command->db_id_ == 2 && flush_command->args_.size() == 3 &&
+              flush_command->args_[0] == "FLUSHDB" &&
+              flush_command->args_[1] != "0" &&
+              flush_command->args_[2] == std::to_string(storage_->DbEpoch(2)),
+          "FLUSHDB barrier did not carry its installed database epoch");
+    status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
 
+    auto replica_victim =
+        co_await storage_->Set(2, "replica-flush-victim", "gone", {});
+    if (!replica_victim.ok()) co_return replica_victim.status();
+    flush_command->args_[2] = std::to_string(storage_->DbEpoch(2) + 1);
+    status = co_await keylane::ApplyReplicatedCommand(*flush_command);
+    if (!status.ok()) co_return status;
+    Check(!co_await storage_->Exists(2, "replica-flush-victim") &&
+              co_await storage_->Exists(3, "flush-survivor"),
+          "replica FLUSHDB barrier affected the wrong database");
+
+    for (const std::uint8_t db_id :
+         {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{15}}) {
+      auto seeded = co_await storage_->Set(
+          db_id, "flushall-victim-" + std::to_string(db_id), "gone", {});
+      if (!seeded.ok()) co_return seeded.status();
+    }
+    status = co_await storage_->EnableReplicationLog(26, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(0, {"FLUSHALL"}, "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await WaitForReplicationTail(1);
+    if (!status.ok()) co_return status;
+    auto flushall_batch = co_await storage_->ReadReplicationLog({}, kMiB, 1);
+    if (!flushall_batch.ok()) co_return flushall_batch.status();
+    Check(flushall_batch->frames_.size() == 1 && flushall_batch->at_tail_ &&
+              flushall_batch->frames_.front().header_.kind_ ==
+                  ReplicationEventKind::kControl,
+          "FLUSHALL did not produce one control frame");
+    auto flushall_command = keylane::DecodeReplicationCommand(
+        flushall_batch->frames_.front().payload_);
+    if (!flushall_command.ok()) co_return flushall_command.status();
+    Check(flushall_command->db_id_ == 0 &&
+              flushall_command->args_.size() ==
+                  2 + keylane::storage::kLogicalDatabaseCount &&
+              flushall_command->args_[0] == "FLUSHALL" &&
+              flushall_command->args_[1] != "0",
+          "FLUSHALL barrier did not carry one complete epoch vector");
+    for (std::uint8_t db_id = 0;
+         db_id < keylane::storage::kLogicalDatabaseCount; ++db_id) {
+      Check(flushall_command->args_[2 + db_id] ==
+                std::to_string(storage_->DbEpoch(db_id)),
+            "FLUSHALL barrier epoch vector changed");
+    }
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
+    for (const std::uint8_t db_id :
+         {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{15}}) {
+      auto seeded = co_await storage_->Set(
+          db_id, "replica-flushall-victim-" + std::to_string(db_id), "gone",
+          {});
+      if (!seeded.ok()) co_return seeded.status();
+    }
+    for (std::uint8_t db_id = 0;
+         db_id < keylane::storage::kLogicalDatabaseCount; ++db_id) {
+      flushall_command->args_[2 + db_id] =
+          std::to_string(storage_->DbEpoch(db_id) + 1);
+    }
+    status = co_await keylane::ApplyReplicatedCommand(*flushall_command);
+    if (!status.ok()) co_return status;
+    for (const std::uint8_t db_id :
+         {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{15}}) {
+      Check(!co_await storage_->Exists(
+                db_id, "replica-flushall-victim-" + std::to_string(db_id)),
+            "replica FLUSHALL left one database visible");
+    }
+    co_return absl::OkStatus();
+  }
+
+  void CheckOrderingAdmission() {
     // Snapshot handoff closes every worker's transaction admission word while
     // retaining the count that was already admitted on that worker.
     Check(keylane::TryBeginSnapshotTransaction(),
@@ -1645,7 +1746,10 @@ class ReplicationLogService final : public celer::Service {
     Check(!keylane::RequestSpansMultipleShards(
               admission_request({"mset", "a", "1", "b", "2"})),
           "single-shard MSET still took the replication order gate");
+  }
 
+  celer::Task<absl::Status> ExercisePublisherTransactionAdmission() {
+    absl::Status status;
     keylane::RefreshMemoryStats();
     const std::uint64_t retained_before_publisher =
         keylane::GetMemoryStats().used_bytes_;
@@ -1660,21 +1764,23 @@ class ReplicationLogService final : public celer::Service {
           "backlog block");
 
     const std::string oversized_transaction_key(kMiB, 'T');
-    status = co_await ExerciseTransactionGuardAdmission(
-        {"LMPOP", "2", oversized_transaction_key, "list-other", "LEFT"});
-    if (!status.ok()) co_return status;
-    status = co_await ExerciseTransactionGuardAdmission(
-        {"SUNIONSTORE", "set-destination", oversized_transaction_key});
-    if (!status.ok()) co_return status;
-    status = co_await ExerciseTransactionGuardAdmission(
-        {"ZUNIONSTORE", "zset-destination", "1", oversized_transaction_key});
-    if (!status.ok()) co_return status;
-    status = co_await ExerciseTransactionGuardAdmission(
-        {"SORT", oversized_transaction_key, "STORE", "sort-destination"});
-    if (!status.ok()) co_return status;
+    std::vector<std::vector<std::string>> transaction_commands{
+        {"LMPOP", "2", oversized_transaction_key, "list-other", "LEFT"},
+        {"SUNIONSTORE", "set-destination", oversized_transaction_key},
+        {"ZUNIONSTORE", "zset-destination", "1", oversized_transaction_key},
+        {"SORT", oversized_transaction_key, "STORE", "sort-destination"},
+    };
+    for (auto& args : transaction_commands) {
+      status = co_await ExerciseTransactionGuardAdmission(std::move(args));
+      if (!status.ok()) co_return status;
+    }
     status = co_await ExerciseBitOpPayloadAdmission();
     if (!status.ok()) co_return status;
+    co_return absl::OkStatus();
+  }
 
+  celer::Task<absl::Status> ExerciseReplicationCopyOom() {
+    absl::Status status;
     // The parsed request already owns this value. Leave enough headroom for
     // command dispatch itself but not the replication journal's second copy;
     // SET must fail before publishing either durable state or a log event.
@@ -1696,9 +1802,26 @@ class ReplicationLogService final : public celer::Service {
           "rejected replication copy still mutated storage");
     status = keylane::InitMemoryLimit(512 * kMiB, 1);
     if (!status.ok()) co_return status;
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> ExerciseAdmissionAndOrdering() {
+    absl::Status status = co_await ExerciseFullSyncOverrides();
+    if (!status.ok()) co_return status;
+
+    CheckOrderingAdmission();
+    status = co_await ExercisePublisherTransactionAdmission();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseReplicationCopyOom();
+    if (!status.ok()) co_return status;
 
     status = co_await ExercisePartitionHandoff();
     if (!status.ok()) co_return status;
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> ExerciseBacklogStorage() {
+    absl::Status status;
     const auto before_oversized = storage_->LocalReplicationLogInfo();
     RepeatedByteSource too_large(9 * kMiB, 'x');
     auto oversized =
@@ -1975,7 +2098,11 @@ class ReplicationLogService final : public celer::Service {
 
     status = co_await ExerciseCanonicalTransactionGrowth();
     if (!status.ok()) co_return status;
+    co_return absl::OkStatus();
+  }
 
+  celer::Task<absl::Status> ExercisePublishedStringCommands() {
+    absl::Status status;
     // Client command dispatch transfers committed writes to the asynchronous
     // publisher. Large arguments may span replication frames, but decode and
     // apply still see one command and one LSN.
@@ -2062,7 +2189,7 @@ class ReplicationLogService final : public celer::Service {
     if (!status.ok()) co_return status;
 
     std::vector<ReplicatedCommand> commands;
-    cursor = {};
+    ReplicationLogCursor cursor{};
     while (cursor.lsn_ <= 2) {
       const std::uint64_t command_lsn = cursor.lsn_;
       std::string encoded;
@@ -2168,7 +2295,11 @@ class ReplicationLogService final : public celer::Service {
     if (!status.ok()) co_return status;
     Check(!co_await storage_->Exists(2, "replication-set"),
           "replica DEL did not remove the key");
+    co_return absl::OkStatus();
+  }
 
+  celer::Task<absl::Status> ExercisePublishedCollectionCommands() {
+    absl::Status status;
     // Single-key writes from every value family are journaled at the storage
     // mutation ordering point and replay through the normal command path.
     status = co_await storage_->EnableReplicationLog(22, 8 * kMiB);
@@ -2198,7 +2329,7 @@ class ReplicationLogService final : public celer::Service {
           "publisher fence did not separate prior and future commands");
 
     std::vector<ReplicatedCommand> family_commands;
-    cursor = {};
+    ReplicationLogCursor cursor{};
     while (cursor.lsn_ <= 6) {
       const std::uint64_t lsn = cursor.lsn_;
       std::string encoded;
@@ -2323,105 +2454,24 @@ class ReplicationLogService final : public celer::Service {
     status = co_await ExecuteClientCommand(6, {"GET", "strict-counter"},
                                            "$1\r\n1\r\n");
     if (!status.ok()) co_return status;
+    co_return absl::OkStatus();
+  }
 
-    auto flush_victim = co_await storage_->Set(2, "flush-victim", "gone", {});
-    auto flush_survivor =
-        co_await storage_->Set(3, "flush-survivor", "kept", {});
-    if (!flush_victim.ok()) co_return flush_victim.status();
-    if (!flush_survivor.ok()) co_return flush_survivor.status();
-    status = co_await storage_->EnableReplicationLog(21, 8 * kMiB);
-    if (!status.ok()) co_return status;
-    std::vector<std::string> flush_args{"FLUSHDB"};
-    status = co_await ExecuteClientCommand(2, std::move(flush_args), "+OK\r\n");
-    if (!status.ok()) co_return status;
-    status = co_await WaitForReplicationTail(1);
-    if (!status.ok()) co_return status;
-    Check(!co_await storage_->Exists(2, "flush-victim") &&
-              co_await storage_->Exists(3, "flush-survivor"),
-          "source FLUSHDB affected the wrong database");
-    auto flush_batch = co_await storage_->ReadReplicationLog({}, kMiB, 1);
-    if (!flush_batch.ok()) co_return flush_batch.status();
-    Check(flush_batch->frames_.size() == 1 && flush_batch->at_tail_ &&
-              flush_batch->frames_.front().header_.kind_ ==
-                  ReplicationEventKind::kControl,
-          "FLUSHDB did not produce one control frame");
-    auto flush_command = keylane::DecodeReplicationCommand(
-        flush_batch->frames_.front().payload_);
-    if (!flush_command.ok()) co_return flush_command.status();
-    Check(flush_command->db_id_ == 2 && flush_command->args_.size() == 3 &&
-              flush_command->args_[0] == "FLUSHDB" &&
-              flush_command->args_[1] != "0" &&
-              flush_command->args_[2] == std::to_string(storage_->DbEpoch(2)),
-          "FLUSHDB barrier did not carry its installed database epoch");
-    status = co_await storage_->DisableReplicationLog();
+  celer::Task<absl::Status> Exercise() {
+    absl::Status status = co_await ExerciseAdmissionAndOrdering();
     if (!status.ok()) co_return status;
 
-    auto replica_victim =
-        co_await storage_->Set(2, "replica-flush-victim", "gone", {});
-    if (!replica_victim.ok()) co_return replica_victim.status();
-    flush_command->args_[2] = std::to_string(storage_->DbEpoch(2) + 1);
-    status = co_await keylane::ApplyReplicatedCommand(*flush_command);
-    if (!status.ok()) co_return status;
-    Check(!co_await storage_->Exists(2, "replica-flush-victim") &&
-              co_await storage_->Exists(3, "flush-survivor"),
-          "replica FLUSHDB barrier affected the wrong database");
-
-    for (const std::uint8_t db_id :
-         {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{15}}) {
-      auto seeded = co_await storage_->Set(
-          db_id, "flushall-victim-" + std::to_string(db_id), "gone", {});
-      if (!seeded.ok()) co_return seeded.status();
-    }
-    status = co_await storage_->EnableReplicationLog(26, 8 * kMiB);
-    if (!status.ok()) co_return status;
-    status = co_await ExecuteClientCommand(0, {"FLUSHALL"}, "+OK\r\n");
-    if (!status.ok()) co_return status;
-    status = co_await WaitForReplicationTail(1);
-    if (!status.ok()) co_return status;
-    auto flushall_batch = co_await storage_->ReadReplicationLog({}, kMiB, 1);
-    if (!flushall_batch.ok()) co_return flushall_batch.status();
-    Check(flushall_batch->frames_.size() == 1 && flushall_batch->at_tail_ &&
-              flushall_batch->frames_.front().header_.kind_ ==
-                  ReplicationEventKind::kControl,
-          "FLUSHALL did not produce one control frame");
-    auto flushall_command = keylane::DecodeReplicationCommand(
-        flushall_batch->frames_.front().payload_);
-    if (!flushall_command.ok()) co_return flushall_command.status();
-    Check(flushall_command->db_id_ == 0 &&
-              flushall_command->args_.size() ==
-                  2 + keylane::storage::kLogicalDatabaseCount &&
-              flushall_command->args_[0] == "FLUSHALL" &&
-              flushall_command->args_[1] != "0",
-          "FLUSHALL barrier did not carry one complete epoch vector");
-    for (std::uint8_t db_id = 0;
-         db_id < keylane::storage::kLogicalDatabaseCount; ++db_id) {
-      Check(flushall_command->args_[2 + db_id] ==
-                std::to_string(storage_->DbEpoch(db_id)),
-            "FLUSHALL barrier epoch vector changed");
-    }
-    status = co_await storage_->DisableReplicationLog();
+    status = co_await ExerciseBacklogStorage();
     if (!status.ok()) co_return status;
 
-    for (const std::uint8_t db_id :
-         {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{15}}) {
-      auto seeded = co_await storage_->Set(
-          db_id, "replica-flushall-victim-" + std::to_string(db_id), "gone",
-          {});
-      if (!seeded.ok()) co_return seeded.status();
-    }
-    for (std::uint8_t db_id = 0;
-         db_id < keylane::storage::kLogicalDatabaseCount; ++db_id) {
-      flushall_command->args_[2 + db_id] =
-          std::to_string(storage_->DbEpoch(db_id) + 1);
-    }
-    status = co_await keylane::ApplyReplicatedCommand(*flushall_command);
+    status = co_await ExercisePublishedStringCommands();
     if (!status.ok()) co_return status;
-    for (const std::uint8_t db_id :
-         {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{15}}) {
-      Check(!co_await storage_->Exists(
-                db_id, "replica-flushall-victim-" + std::to_string(db_id)),
-            "replica FLUSHALL left one database visible");
-    }
+
+    status = co_await ExercisePublishedCollectionCommands();
+    if (!status.ok()) co_return status;
+
+    status = co_await ExerciseFlushControlBarriers();
+    if (!status.ok()) co_return status;
 
     // The backlog is process memory only. Restart recovers primary records and
     // establishes a fresh replication history without any backlog cleanup.

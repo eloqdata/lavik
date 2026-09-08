@@ -14,6 +14,13 @@
 //     CAS token; a mismatch is a domain rejection.
 //   - Retired is terminal: no command reactivates a node, and UpdateNode on a
 //     retired node is rejected.
+//   - Active Data-node client endpoints are one or two numeric addresses on
+//     one host. Tagged tcp:// and tls:// forms cannot be mixed with the legacy
+//     positional form, and a tagged transport cannot appear twice.
+//   - Active Meta-member Data-control endpoints are numeric, unique after IP
+//     normalization, and their complete directory must fit one protocol
+//     ServerHello frame. These conditions are checked before mutation so a
+//     committed binding cannot make all future Data sessions unpublishable.
 //   - State is size-bounded: total records (active + retired
 //     tombstones) never exceed kMaxMetaNodes; over-cap applies are rejected,
 //     never silently truncated.
@@ -73,6 +80,7 @@ struct MetaNodeRecord {
 struct MetaMemberRecord {
   std::uint32_t server_id_ = 0;
   std::string principal_;
+  std::string data_control_endpoint_;
   bool retired_ = false;
   bool operator==(const MetaMemberRecord&) const = default;
 };
@@ -98,6 +106,8 @@ class MetaIdentityStore {
   std::optional<MetaMemberRecord> FindMetaMember(std::uint32_t server_id) const;
   bool IsActiveMetaMember(std::uint32_t server_id,
                           std::string_view principal) const;
+  std::vector<MetaNodeRecord> Nodes() const;
+  std::vector<MetaMemberRecord> MetaMembers() const;
   // Registered records including retired tombstones (tombstones keep the
   // principal binding, so they occupy the cap).
   std::size_t NodeCount() const { return nodes_.size(); }

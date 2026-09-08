@@ -87,7 +87,10 @@ inline constexpr std::uint64_t kMaxMetaUncompactedWalBytes = 1ull
 // pre-release data directories must be recreated instead of migrated.
 // ---------------------------------------------------------------------------
 
-inline constexpr std::uint16_t kMetaFormatVersion = 1;
+// v2 adds membership incarnation identities, content-addressed population
+// manifests, grant revisions, and complete operation intent/directive state.
+// There is intentionally no v1 migration path for pre-release data dirs.
+inline constexpr std::uint16_t kMetaFormatVersion = 2;
 
 // ---------------------------------------------------------------------------
 // Failure classification. See the file header for the two classes.

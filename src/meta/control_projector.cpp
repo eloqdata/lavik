@@ -1,0 +1,514 @@
+#include "keylane/meta/control_projector.h"
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "keylane/cluster/control_protocol.h"
+#include "keylane/meta/commands.h"
+#include "keylane/meta/policy_store.h"
+#include "keylane/meta/population_manifest_store.h"
+#include "keylane/meta/state_apply.h"
+#include "keylane/numeric_endpoint.h"
+
+namespace keylane::meta {
+namespace {
+
+namespace control = keylane::cluster::control;
+
+struct HostPort {
+  std::string host;
+  std::uint16_t port = 0;
+};
+
+enum class DataEndpointKind { kLegacy, kTcp, kTls };
+
+struct TaggedDataEndpoint {
+  DataEndpointKind kind = DataEndpointKind::kLegacy;
+  HostPort endpoint;
+};
+
+template <std::size_t N>
+bool IsZero(const std::array<std::uint8_t, N>& value) {
+  return std::all_of(value.begin(), value.end(),
+                     [](std::uint8_t byte) { return byte == 0; });
+}
+
+absl::Status Invalid(std::string message) {
+  return absl::InvalidArgumentError(
+      absl::StrCat("cannot project Meta committed state: ", message));
+}
+
+absl::Status Inconsistent(std::string message) {
+  return absl::FailedPreconditionError(absl::StrCat(
+      "cannot project inconsistent Meta committed state: ", message));
+}
+
+absl::StatusOr<HostPort> ParseNumericHostPort(std::string_view encoded,
+                                              std::string_view field) {
+  auto endpoint = keylane::ParseNumericEndpoint(encoded);
+  if (!endpoint.has_value()) {
+    return Invalid(absl::StrCat(
+        field, " must be numeric IPv4:port or bracketed [IPv6]:port"));
+  }
+  return HostPort{std::move(endpoint->host_), endpoint->port_};
+}
+
+absl::StatusOr<TaggedDataEndpoint> ParseDataEndpoint(std::string_view encoded) {
+  TaggedDataEndpoint result;
+  constexpr std::string_view kTcpPrefix = "tcp://";
+  constexpr std::string_view kTlsPrefix = "tls://";
+  if (encoded.starts_with(kTcpPrefix)) {
+    result.kind = DataEndpointKind::kTcp;
+    encoded.remove_prefix(kTcpPrefix.size());
+  } else if (encoded.starts_with(kTlsPrefix)) {
+    result.kind = DataEndpointKind::kTls;
+    encoded.remove_prefix(kTlsPrefix.size());
+  }
+  auto endpoint = ParseNumericHostPort(encoded, "data endpoint");
+  if (!endpoint.ok()) return endpoint.status();
+  result.endpoint = std::move(*endpoint);
+  return result;
+}
+
+absl::StatusOr<control::WireDataEndpoint> ProjectDataEndpoint(
+    const MetaNodeRecord& node) {
+  if (!control::IsCanonicalIdentity160(node.node_id_)) {
+    return Invalid(
+        absl::StrCat("data node ", node.node_id_, " has a non-canonical id"));
+  }
+  if (node.endpoints_.empty() || node.endpoints_.size() > 2) {
+    return Invalid(absl::StrCat("active data node ", node.node_id_,
+                                " must have one or two endpoints"));
+  }
+
+  std::vector<TaggedDataEndpoint> parsed;
+  parsed.reserve(node.endpoints_.size());
+  bool has_explicit = false;
+  bool has_legacy = false;
+  for (const std::string& encoded : node.endpoints_) {
+    auto endpoint = ParseDataEndpoint(encoded);
+    if (!endpoint.ok()) return endpoint.status();
+    has_explicit |= endpoint->kind != DataEndpointKind::kLegacy;
+    has_legacy |= endpoint->kind == DataEndpointKind::kLegacy;
+    parsed.push_back(std::move(*endpoint));
+  }
+  if (has_explicit && has_legacy) {
+    return Invalid(absl::StrCat("active data node ", node.node_id_,
+                                " mixes explicit and legacy endpoints"));
+  }
+
+  control::WireDataEndpoint result;
+  result.node_id = node.node_id_;
+  result.host = parsed.front().endpoint.host;
+  for (const TaggedDataEndpoint& endpoint : parsed) {
+    if (endpoint.endpoint.host != result.host) {
+      return Invalid(absl::StrCat("active data node ", node.node_id_,
+                                  " endpoints use different hosts"));
+    }
+  }
+
+  if (!has_explicit) {
+    result.port = parsed[0].endpoint.port;
+    if (parsed.size() == 2) result.tls_port = parsed[1].endpoint.port;
+    return result;
+  }
+  for (const TaggedDataEndpoint& endpoint : parsed) {
+    std::uint16_t* destination = endpoint.kind == DataEndpointKind::kTcp
+                                     ? &result.port
+                                     : &result.tls_port;
+    if (*destination != 0) {
+      return Invalid(absl::StrCat("active data node ", node.node_id_,
+                                  " repeats an endpoint transport"));
+    }
+    *destination = endpoint.endpoint.port;
+  }
+  return result;
+}
+
+template <std::size_t N>
+std::string Hex(const std::array<std::uint8_t, N>& bytes) {
+  constexpr std::string_view kHex = "0123456789abcdef";
+  std::string result(bytes.size() * 2, '\0');
+  for (std::size_t i = 0; i < bytes.size(); ++i) {
+    result[i * 2] = kHex[bytes[i] >> 4];
+    result[i * 2 + 1] = kHex[bytes[i] & 0x0f];
+  }
+  return result;
+}
+
+absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
+    const MetaDirectiveSpec& directive) {
+  if (directive.kind_ == "rebuild") {
+    if (!directive.storage_mutating_) {
+      return Invalid("rebuild directive must be storage-mutating");
+    }
+    return control::WireDirectiveKind::kRebuild;
+  }
+  if (directive.kind_ == "authorize-source") {
+    if (directive.storage_mutating_) {
+      return Invalid("authorize-source directive must not be storage-mutating");
+    }
+    return control::WireDirectiveKind::kAuthorizeSource;
+  }
+  if (directive.kind_ == "revoke-sources") {
+    if (directive.storage_mutating_) {
+      return Invalid("revoke-sources directive must not be storage-mutating");
+    }
+    return control::WireDirectiveKind::kRevokeSources;
+  }
+  return Invalid(absl::StrCat("unknown directive kind ", directive.kind_));
+}
+
+using ManifestReference = std::pair<std::uint64_t, MetaHash256>;
+using PolicyReference = std::pair<std::string, std::uint64_t>;
+
+absl::Status AddManifestReference(std::uint64_t revision,
+                                  const MetaHash256& digest,
+                                  std::set<ManifestReference>* references) {
+  if ((revision == 0) != IsZero(digest)) {
+    return Inconsistent("manifest revision and digest presence disagree");
+  }
+  if (revision != 0) references->emplace(revision, digest);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
+    const MetaOperationRecord& operation, const MetaCurrentDirective& current) {
+  const MetaDirectiveSpec& source = current.spec_;
+  if (IsZero(operation.operation_id_) || IsZero(source.directive_id_) ||
+      IsZero(source.attempt_id_) || IsZero(source.assignment_id_) ||
+      IsZero(source.source_assignment_id_) || IsZero(source.target_boot_id_) ||
+      IsZero(source.source_boot_id_) ||
+      IsZero(source.source_replication_history_id_) ||
+      current.directive_revision_ == 0) {
+    return Inconsistent("current directive contains an empty identity");
+  }
+  if (!control::IsCanonicalIdentity160(source.recipient_node_id_) ||
+      !control::IsCanonicalIdentity160(source.target_node_id_) ||
+      !control::IsCanonicalIdentity160(source.source_node_id_)) {
+    return Inconsistent("current directive contains a non-canonical node id");
+  }
+  auto kind = ProjectDirectiveKind(source);
+  if (!kind.ok()) return kind.status();
+  const bool executes_on_target = *kind == control::WireDirectiveKind::kRebuild;
+  const std::string& expected_recipient =
+      executes_on_target ? source.target_node_id_ : source.source_node_id_;
+  if (source.recipient_node_id_ != expected_recipient) {
+    return Inconsistent(
+        "current directive recipient does not match its execution kind");
+  }
+
+  control::WireProjectedDirective result;
+  result.authority.group_id = source.group_id_;
+  result.authority.assignment_id = source.assignment_id_;
+  result.authority.group_term = source.group_term_;
+  result.authority.authority_version = source.authority_version_;
+  result.authority.grant_revision = source.grant_revision_;
+  result.identity.operation_id = operation.operation_id_;
+  result.identity.directive_id = source.directive_id_;
+  result.identity.attempt_id = source.attempt_id_;
+  result.identity.directive_revision = current.directive_revision_;
+  result.recipient_node_id = source.recipient_node_id_;
+  result.recipient_boot_id =
+      Hex(executes_on_target ? source.target_boot_id_ : source.source_boot_id_);
+  result.target_node_id = source.target_node_id_;
+  result.target_boot_id = Hex(source.target_boot_id_);
+  result.source_node_id = source.source_node_id_;
+  result.source_assignment_id = source.source_assignment_id_;
+  result.source_boot_id = Hex(source.source_boot_id_);
+  result.source_replication_history_id =
+      Hex(source.source_replication_history_id_);
+  result.manifest_revision = source.population_manifest_revision_;
+  result.manifest_digest = source.population_manifest_digest_;
+  result.partition_replication_epoch = source.partition_replication_epoch_;
+  result.kind = *kind;
+  result.payload = source.payload_;
+  result.preconditions = source.preconditions_;
+  result.storage_mutating = source.storage_mutating_;
+  result.force = source.force_;
+  return result;
+}
+
+}  // namespace
+
+absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
+    const MetaCommittedView& view, std::string_view node_id) {
+  if (!control::IsCanonicalIdentity160(node_id)) {
+    return Invalid("requested data node id is not canonical");
+  }
+  if (!view.identity().IsActiveNode(std::string(node_id))) {
+    return absl::NotFoundError("requested data node is not active");
+  }
+  if (view.applied_index() == 0) {
+    return Inconsistent("committed view has applied index zero");
+  }
+  control::FullDesiredState state;
+  state.source_meta_applied_index = view.applied_index();
+  state.topology_epoch = view.topology().TopologyEpoch();
+
+  for (const MetaMemberRecord& member : view.identity().MetaMembers()) {
+    if (member.retired_) continue;
+    auto endpoint = ParseNumericHostPort(member.data_control_endpoint_,
+                                         "Meta data-control endpoint");
+    if (!endpoint.ok()) return endpoint.status();
+    state.meta_directory.push_back(
+        control::WireMetaEndpoint{member.server_id_, std::move(endpoint->host),
+                                  endpoint->port, member.principal_});
+  }
+
+  std::set<std::string> active_nodes;
+  for (const MetaNodeRecord& node : view.identity().Nodes()) {
+    if (node.retired_) continue;
+    auto endpoint = ProjectDataEndpoint(node);
+    if (!endpoint.ok()) return endpoint.status();
+    if (!active_nodes.insert(node.node_id_).second) {
+      return Inconsistent(
+          absl::StrCat("duplicate active node ", node.node_id_));
+    }
+    state.nodes.push_back(std::move(*endpoint));
+  }
+
+  std::set<ManifestReference> manifest_references;
+  std::set<PolicyReference> policy_references;
+  std::map<std::string, std::size_t> group_indices;
+  for (const MetaTopologyGroupView& source : view.topology().Groups()) {
+    const auto grant = view.grant().GroupState(source.group_id_);
+    if (!grant.has_value()) {
+      return Inconsistent(
+          absl::StrCat("group ", source.group_id_, " has no grant state"));
+    }
+    if (source.record_.group_term_ != grant->group_term_ ||
+        source.record_.authority_version_ != grant->last_authority_version_) {
+      return Inconsistent(absl::StrCat("group ", source.group_id_,
+                                       " topology/grant anchors disagree"));
+    }
+
+    control::WireDesiredGroup projected;
+    projected.group_id = source.group_id_;
+    projected.group_term = source.record_.group_term_;
+    projected.authority_version = source.record_.authority_version_;
+    projected.grant_revision = grant->last_grant_revision_;
+    projected.config_epoch = source.config_epoch_;
+    projected.manifest_revision = source.record_.population_manifest_revision_;
+    projected.manifest_digest = source.record_.population_manifest_digest_;
+    projected.partition_replication_epoch =
+        source.record_.partition_replication_epoch_;
+
+    for (const MetaGroupMember& member : source.members_) {
+      if (!active_nodes.contains(member.node_id_)) {
+        return Inconsistent(absl::StrCat("group ", source.group_id_,
+                                         " names an inactive member"));
+      }
+      // Meta may retain role intent for later workflows, but protocol v1
+      // derives the Data serving role solely from the committed grant owner.
+      projected.members.push_back({member.node_id_, member.assignment_id_});
+    }
+
+    if (grant->grant_.has_value()) {
+      const MetaGroupGrant& active = *grant->grant_;
+      if (grant->fenced_ || source.record_.owner_.empty() ||
+          active.owner_ != source.record_.owner_ ||
+          active.term_ != source.record_.group_term_ ||
+          active.authority_version_ != source.record_.authority_version_ ||
+          active.grant_revision_ != grant->last_grant_revision_) {
+        return Inconsistent(absl::StrCat("group ", source.group_id_,
+                                         " active grant is inconsistent"));
+      }
+      if (source.record_.group_term_ == 0 ||
+          source.record_.authority_version_ == 0 ||
+          active.grant_revision_ == 0 || source.config_epoch_ == 0) {
+        return Inconsistent(
+            absl::StrCat("group ", source.group_id_,
+                         " active grant has incomplete serving authority"));
+      }
+      if (!active_nodes.contains(source.record_.owner_)) {
+        return Inconsistent(absl::StrCat("group ", source.group_id_,
+                                         " names an inactive owner"));
+      }
+      const auto owner =
+          std::find_if(source.members_.begin(), source.members_.end(),
+                       [&source](const MetaGroupMember& member) {
+                         return member.node_id_ == source.record_.owner_;
+                       });
+      if (owner == source.members_.end() || IsZero(owner->assignment_id_)) {
+        return Inconsistent(absl::StrCat("group ", source.group_id_,
+                                         " owner has no live assignment"));
+      }
+      if (active.spec_.lease_duration_ms_ == 0 ||
+          active.spec_.lease_duration_ms_ >
+              std::numeric_limits<std::uint32_t>::max()) {
+        return Invalid(
+            absl::StrCat("group ", source.group_id_,
+                         " lease duration is not wire-representable"));
+      }
+      projected.grant_active = true;
+      projected.grant_revision = active.grant_revision_;
+      projected.grant_duration_ms =
+          static_cast<std::uint32_t>(active.spec_.lease_duration_ms_);
+      projected.grant_policy_id = active.spec_.policy_id_;
+      projected.grant_policy_version = active.spec_.policy_version_;
+      // Topology retains the last owner as durable history after fencing.
+      // Only an active grant turns that fact into a serving owner/assignment
+      // on the Data-control wire.
+      projected.owner_node_id = source.record_.owner_;
+      projected.owner_assignment_id = owner->assignment_id_;
+      policy_references.emplace(active.spec_.policy_id_,
+                                active.spec_.policy_version_);
+    } else if (!grant->fenced_) {
+      return Inconsistent(absl::StrCat("group ", source.group_id_,
+                                       " is grantless but not fenced"));
+    }
+
+    if (absl::Status status = AddManifestReference(projected.manifest_revision,
+                                                   projected.manifest_digest,
+                                                   &manifest_references);
+        !status.ok()) {
+      return status;
+    }
+    if (!group_indices.emplace(projected.group_id, state.groups.size())
+             .second) {
+      return Inconsistent(absl::StrCat("duplicate group ", projected.group_id));
+    }
+    state.groups.push_back(std::move(projected));
+  }
+
+  // Reconstruct canonical ranges from the authoritative slot table. The
+  // committed SetSlotMap command shape is not retained, so adjacent runs are
+  // intentionally coalesced here.
+  std::optional<std::string> previous_group;
+  for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
+    const std::optional<std::string> owner = view.topology().SlotOwner(slot);
+    if (!owner.has_value()) {
+      previous_group.reset();
+      continue;
+    }
+    const auto group = group_indices.find(*owner);
+    if (group == group_indices.end()) {
+      return Inconsistent(
+          absl::StrCat("slot ", slot, " names unknown group ", *owner));
+    }
+    std::vector<control::WireSlotRange>& ranges =
+        state.groups[group->second].slot_ranges;
+    if (previous_group.has_value() && *previous_group == *owner) {
+      ranges.back().last = static_cast<std::uint16_t>(slot);
+    } else {
+      ranges.push_back(
+          {static_cast<std::uint16_t>(slot), static_cast<std::uint16_t>(slot)});
+    }
+    previous_group = *owner;
+  }
+
+  for (const MetaOperationRecord& operation :
+       view.operation().LiveOperations()) {
+    bool has_directive_for_requested_node = false;
+    for (const MetaCurrentDirective& current : operation.current_directives_) {
+      if (current.spec_.recipient_node_id_ != node_id) continue;
+      has_directive_for_requested_node = true;
+      if (const absl::Status anchor =
+              ValidateCommittedDirectiveAnchor(view.stores(), current.spec_);
+          !anchor.ok()) {
+        return Inconsistent(
+            absl::StrCat("stale current directive anchor: ", anchor.message()));
+      }
+      auto directive = ProjectDirective(operation, current);
+      if (!directive.ok()) return directive.status();
+      if (absl::Status status = AddManifestReference(
+              directive->manifest_revision, directive->manifest_digest,
+              &manifest_references);
+          !status.ok()) {
+        return status;
+      }
+      state.current_directives.push_back(std::move(*directive));
+    }
+    if (has_directive_for_requested_node) {
+      for (const MetaPolicyReference& reference :
+           operation.policy_references_) {
+        policy_references.emplace(reference.policy_id_, reference.version_);
+      }
+    }
+  }
+  std::sort(
+      state.current_directives.begin(), state.current_directives.end(),
+      [](const control::WireProjectedDirective& left,
+         const control::WireProjectedDirective& right) {
+        return std::tie(left.identity.operation_id, left.identity.directive_id,
+                        left.identity.attempt_id,
+                        left.identity.directive_revision) <
+               std::tie(right.identity.operation_id,
+                        right.identity.directive_id, right.identity.attempt_id,
+                        right.identity.directive_revision);
+      });
+
+  for (const auto& [revision, digest] : manifest_references) {
+    const auto document = view.stores().population_manifest_.Find(digest);
+    if (!document.has_value()) {
+      return Inconsistent(absl::StrCat("referenced population manifest at ",
+                                       "revision ", revision, " is missing"));
+    }
+    if (MetaPopulationManifestStore::CanonicalDigest(document->entries_) !=
+        digest) {
+      return Inconsistent("population manifest content digest is invalid");
+    }
+    control::WireManifestDocument projected;
+    projected.revision = revision;
+    projected.digest = digest;
+    for (const MetaPopulationManifestEntry& entry : document->entries_) {
+      if (entry.partition_id_ >= kMetaSlotCount) {
+        return Inconsistent("population manifest partition is out of range");
+      }
+      projected.entries.push_back(
+          {static_cast<std::uint16_t>(entry.partition_id_),
+           entry.logical_epoch_});
+    }
+    state.manifests.push_back(std::move(projected));
+  }
+
+  for (const auto& [policy_id, version] : policy_references) {
+    const auto policy = view.policy().FindVersion(policy_id, version);
+    if (!policy.has_value() || policy->retired_) {
+      return Inconsistent(absl::StrCat("referenced policy ", policy_id,
+                                       " version ", version,
+                                       " is missing or retired"));
+    }
+    if (MetaPolicyStore::ContentHash(policy->content_) !=
+        policy->content_hash_) {
+      return Inconsistent("policy content hash is invalid");
+    }
+    state.policies.push_back({policy->policy_id_, policy->version_,
+                              policy->content_hash_, policy->content_});
+  }
+
+  auto directive_digest =
+      control::ComputeDirectiveSetDigest(state.current_directives);
+  if (!directive_digest.ok()) return directive_digest.status();
+  state.directive_set_digest = *directive_digest;
+
+  auto projection_hash = control::ComputeProjectionHash(state);
+  if (!projection_hash.ok()) return projection_hash.status();
+  state.projection_hash = *projection_hash;
+  for (control::WireProjectedDirective& directive : state.current_directives) {
+    directive.basis.source_meta_applied_index = view.applied_index();
+    directive.basis.projection_hash = state.projection_hash;
+  }
+
+  auto encoded = control::EncodeFullDesiredState(state);
+  if (!encoded.ok()) return encoded.status();
+  state.object_hash = control::ComputeSha256(*encoded);
+  return NodeControlBatch{std::move(state), std::move(*encoded)};
+}
+
+}  // namespace keylane::meta

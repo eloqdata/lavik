@@ -4,7 +4,8 @@
 // log. These tests drive only the public surface against a fake
 // MetaCommittedFacts and cover the freshness matrix: unregistered
 // nodes, stale/future session generations, boot mismatch, old/future/exact
-// group terms, manifest mismatch, unbound history, unknown/terminal
+// group terms, manifest or partition-replication-epoch mismatch, unbound
+// history, unknown/terminal
 // operations, generation-adoption purge, commit-driven revalidation with
 // read-path re-filtering, TTL expiry, capacity bounds, and the audit ring.
 
@@ -20,10 +21,12 @@
 #include "absl/status/status.h"
 #include "gtest/gtest.h"
 #include "keylane/meta/encoding.h"
+#include "keylane/meta/hash.h"
 #include "keylane/meta/observation_store.h"
 
 namespace {
 
+using keylane::meta::MetaAssignmentId;
 using keylane::meta::MetaBootIncarnation;
 using keylane::meta::MetaCandidateProgressObs;
 using keylane::meta::MetaCommittedFacts;
@@ -38,6 +41,7 @@ using keylane::meta::MetaObservationIdentity;
 using keylane::meta::MetaObservationStore;
 using keylane::meta::MetaOperationEvidenceObs;
 using keylane::meta::MetaOperationId;
+using keylane::meta::MetaReplicationHistoryId;
 
 // Scripted committed state: the conservative-answer contract (unknown -> 0 /
 // false) is honored by the fake the same way the real projection does, so
@@ -51,16 +55,28 @@ class FakeCommittedFacts : public MetaCommittedFacts {
     const auto it = group_terms_.find(std::string(group_id));
     return it != group_terms_.end() ? it->second : 0;
   }
-  std::uint64_t CurrentPopulationManifestId(
+  std::uint64_t CurrentPopulationManifestRevision(
       std::string_view group_id) const override {
     const auto it = group_manifests_.find(std::string(group_id));
     return it != group_manifests_.end() ? it->second : 0;
   }
+  std::uint64_t CurrentPartitionReplicationEpoch(
+      std::string_view group_id) const override {
+    const auto it = group_partition_epochs_.find(std::string(group_id));
+    return it != group_partition_epochs_.end() ? it->second : 0;
+  }
+  bool AssignmentMatches(std::string_view group_id, std::string_view node_id,
+                         const MetaAssignmentId& assignment_id) const override {
+    const auto it =
+        assignments_.find({std::string(group_id), std::string(node_id)});
+    return it != assignments_.end() && it->second == assignment_id;
+  }
   bool OperationNonTerminal(const MetaOperationId& id) const override {
     return nonterminal_ops_.contains(id);
   }
-  bool HistoryBoundToOperation(const MetaOperationId& id,
-                               std::uint64_t history_id) const override {
+  bool HistoryBoundToOperation(
+      const MetaOperationId& id,
+      const MetaReplicationHistoryId& history_id) const override {
     const auto it = bound_histories_.find(id);
     return it != bound_histories_.end() && it->second.contains(history_id);
   }
@@ -68,8 +84,11 @@ class FakeCommittedFacts : public MetaCommittedFacts {
   std::set<std::string> active_nodes_;
   std::map<std::string, std::uint64_t> group_terms_;
   std::map<std::string, std::uint64_t> group_manifests_;
+  std::map<std::string, std::uint64_t> group_partition_epochs_;
+  std::map<std::pair<std::string, std::string>, MetaAssignmentId> assignments_;
   std::set<MetaOperationId> nonterminal_ops_;
-  std::map<MetaOperationId, std::set<std::uint64_t>> bound_histories_;
+  std::map<MetaOperationId, std::set<MetaReplicationHistoryId>>
+      bound_histories_;
 };
 
 MetaBootIncarnation Boot(std::uint8_t tag) {
@@ -80,6 +99,18 @@ MetaBootIncarnation Boot(std::uint8_t tag) {
 
 MetaOperationId OpId(std::uint8_t tag) {
   MetaOperationId id{};
+  id.fill(tag);
+  return id;
+}
+
+MetaReplicationHistoryId History(std::uint8_t tag) {
+  MetaReplicationHistoryId id{};
+  id.fill(tag);
+  return id;
+}
+
+MetaAssignmentId Assignment(std::uint8_t tag) {
+  MetaAssignmentId id{};
   id.fill(tag);
   return id;
 }
@@ -112,14 +143,20 @@ MetaObservation HealthObs(MetaObservationIdentity identity,
 
 MetaObservation CandidateObs(MetaObservationIdentity identity,
                              std::string group_id, std::uint64_t term,
-                             std::uint64_t manifest, std::uint64_t history) {
+                             std::uint64_t manifest, std::uint8_t history,
+                             std::uint64_t partition_epoch = 11,
+                             std::uint8_t assignment = 0x31) {
   MetaObservation observation;
   observation.identity_ = std::move(identity);
   MetaCandidateProgressObs payload;
+  payload.node_id_ = observation.identity_.node_id_;
+  payload.boot_incarnation_ = observation.identity_.boot_incarnation_;
   payload.group_id_ = std::move(group_id);
+  payload.assignment_id_ = Assignment(assignment);
   payload.group_term_ = term;
-  payload.population_manifest_id_ = manifest;
-  payload.replication_history_id_ = history;
+  payload.population_manifest_revision_ = manifest;
+  payload.partition_replication_epoch_ = partition_epoch;
+  payload.replication_history_id_ = History(history);
   payload.applied_flow_vector_ = "flow";
   payload.backlog_coverage_ = "backlog";
   payload.readiness_ = "ready";
@@ -130,17 +167,24 @@ MetaObservation CandidateObs(MetaObservationIdentity identity,
 MetaObservation EvidenceObs(MetaObservationIdentity identity,
                             MetaOperationId operation_id, std::string phase,
                             std::string group_id, std::uint64_t term,
-                            std::uint64_t manifest, std::uint64_t history) {
+                            std::uint64_t manifest, std::uint8_t history,
+                            std::uint64_t partition_epoch = 11,
+                            std::uint8_t assignment = 0x31) {
   MetaObservation observation;
   observation.identity_ = std::move(identity);
   MetaOperationEvidenceObs payload;
+  payload.node_id_ = observation.identity_.node_id_;
+  payload.boot_incarnation_ = observation.identity_.boot_incarnation_;
+  payload.assignment_id_ = Assignment(assignment);
   payload.operation_id_ = operation_id;
   payload.kind_phase_ = std::move(phase);
   payload.evidence_ = "evidence-bytes";
+  payload.evidence_hash_ = keylane::meta::MetaSha256(payload.evidence_);
   payload.group_id_ = std::move(group_id);
   payload.group_term_ = term;
-  payload.population_manifest_id_ = manifest;
-  payload.replication_history_id_ = history;
+  payload.population_manifest_revision_ = manifest;
+  payload.partition_replication_epoch_ = partition_epoch;
+  payload.replication_history_id_ = History(history);
   observation.payload_ = std::move(payload);
   return observation;
 }
@@ -154,8 +198,12 @@ FakeCommittedFacts MakeFreshFacts() {
   facts.active_nodes_.insert("n3");
   facts.group_terms_["g1"] = 3;
   facts.group_manifests_["g1"] = 7;
+  facts.group_partition_epochs_["g1"] = 11;
+  for (const char* node : {"n1", "n2", "n3"}) {
+    facts.assignments_[{"g1", node}] = Assignment(0x31);
+  }
   facts.nonterminal_ops_.insert(OpId(0x51));
-  facts.bound_histories_[OpId(0x51)].insert(42);
+  facts.bound_histories_[OpId(0x51)].insert(History(42));
   return facts;
 }
 
@@ -290,7 +338,22 @@ TEST(MetaObservationStore, NewGenerationAtomicallyPurgesOldObservations) {
   // The old generation stays rejected; the new one ingests.
   ExpectDomainReject(store.Ingest(BootObs(Ident("n1", 0x0a, 1)), facts, 2001));
   ASSERT_TRUE(store.Ingest(BootObs(Ident("n1", 0x0b, 2)), facts, 2001).ok());
-  EXPECT_EQ(store.size(), 1);
+  ASSERT_TRUE(store
+                  .Ingest(CandidateObs(Ident("n1", 0x0b, 2), "g1", 3, 7, 42),
+                          facts, 2002)
+                  .ok());
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n1", 0x0b, 2), OpId(0x51), "p1",
+                                      "g1", 3, 7, 42),
+                          facts, 2003)
+                  .ok());
+  const auto candidates = store.CandidateProgressFor("g1", facts);
+  ASSERT_EQ(candidates.size(), 1u);
+  EXPECT_EQ(candidates.front().boot_incarnation_, Boot(0x0b));
+  const auto evidence = store.EvidenceForOperation(OpId(0x51), facts);
+  ASSERT_EQ(evidence.size(), 1u);
+  EXPECT_EQ(evidence.front().boot_incarnation_, Boot(0x0b));
+  EXPECT_EQ(store.size(), 3);
 }
 
 TEST(MetaObservationStore, LeadershipChangeDropsSessionsAndAllSoftState) {
@@ -355,6 +418,109 @@ TEST(MetaObservationStore, CandidateRequiresManifestMatch) {
   ASSERT_TRUE(store
                   .Ingest(CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42),
                           facts, 1000)
+                  .ok());
+}
+
+TEST(MetaObservationStore, CandidateRequiresPartitionReplicationEpochMatch) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+
+  ExpectDomainReject(
+      store.Ingest(CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42,
+                                /*partition_epoch=*/10),
+                   facts, 1000));
+  EXPECT_TRUE(
+      RingHas(store, MetaObsAuditKind::kRejected, "partition-epoch-mismatch"));
+}
+
+TEST(MetaObservationStore,
+     CandidateRequiresExactReporterMembershipAndAssignment) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  facts.group_terms_["g2"] = 3;
+  facts.group_manifests_["g2"] = 7;
+  facts.group_partition_epochs_["g2"] = 11;
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+
+  // Being an active, authenticated node is insufficient: n1 is not a member
+  // of g2 and cannot report itself as a candidate for that group.
+  ExpectDomainReject(store.Ingest(
+      CandidateObs(Ident("n1", 0x0a, 1), "g2", 3, 7, 42), facts, 1000));
+
+  MetaObservation forged_boot =
+      CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42);
+  std::get<MetaCandidateProgressObs>(forged_boot.payload_).boot_incarnation_ =
+      Boot(0x0b);
+  ExpectDomainReject(store.Ingest(std::move(forged_boot), facts, 1001));
+  EXPECT_TRUE(
+      RingHas(store, MetaObsAuditKind::kRejected, "candidate-boot-mismatch"));
+
+  // A removed-and-readded member cannot reuse its prior assignment proof.
+  ExpectDomainReject(
+      store.Ingest(CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42,
+                                /*partition_epoch=*/11, /*assignment=*/0x32),
+                   facts, 1002));
+
+  ASSERT_TRUE(store
+                  .Ingest(CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42),
+                          facts, 1003)
+                  .ok());
+  const auto candidates = store.CandidateProgressFor("g1", facts);
+  ASSERT_EQ(candidates.size(), 1u);
+  EXPECT_EQ(candidates.front().node_id_, "n1");
+  EXPECT_EQ(candidates.front().assignment_id_, Assignment(0x31));
+  EXPECT_TRUE(
+      RingHas(store, MetaObsAuditKind::kRejected, "assignment-mismatch"));
+}
+
+TEST(MetaObservationStore,
+     CandidateReassignmentPurgesOldProofAndReconnectUsesNewAssignment) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+  ASSERT_TRUE(store
+                  .Ingest(CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42),
+                          facts, 1001)
+                  .ok());
+
+  facts.assignments_[{"g1", "n1"}] = Assignment(0x32);
+  EXPECT_TRUE(store.CandidateProgressFor("g1", facts).empty());
+  store.RevalidateAll(facts, 1002);
+  EXPECT_EQ(store.size(), 0u);
+
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 2), 1003).ok());
+  ExpectDomainReject(
+      store.Ingest(CandidateObs(Ident("n1", 0x0a, 2), "g1", 3, 7, 42,
+                                /*partition_epoch=*/11, /*assignment=*/0x31),
+                   facts, 1004));
+  ASSERT_TRUE(store
+                  .Ingest(CandidateObs(Ident("n1", 0x0a, 2), "g1", 3, 7, 42,
+                                       /*partition_epoch=*/11,
+                                       /*assignment=*/0x32),
+                          facts, 1005)
+                  .ok());
+  const auto latest = store.LatestCandidateProgress("g1", facts);
+  ASSERT_TRUE(latest.has_value());
+  EXPECT_EQ(latest->node_id_, "n1");
+  EXPECT_EQ(latest->assignment_id_, Assignment(0x32));
+}
+
+TEST(MetaObservationStore, ZeroPartitionReplicationEpochIsAValidAnchor) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  facts.group_partition_epochs_["g1"] = 0;
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+
+  ASSERT_TRUE(store
+                  .Ingest(CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42,
+                                       /*partition_epoch=*/0),
+                          facts, 1000)
+                  .ok());
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1",
+                                      "g1", 3, 7, 42, /*partition_epoch=*/0),
+                          facts, 1001)
                   .ok());
 }
 
@@ -432,7 +598,7 @@ TEST(MetaObservationStore, EvidenceRequiresKnownNonTerminalOperation) {
       facts, 1000));
   // Known but terminal (the fake only reports non-terminal ids as live).
   facts.nonterminal_ops_.insert(OpId(0x52));
-  facts.bound_histories_[OpId(0x52)].insert(42);
+  facts.bound_histories_[OpId(0x52)].insert(History(42));
   ASSERT_TRUE(store
                   .Ingest(EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x52), "p1",
                                       "g1", 3, 7, 42),
@@ -464,6 +630,48 @@ TEST(MetaObservationStore, EvidenceRequiresBoundHistory) {
                   .ok());
 }
 
+TEST(MetaObservationStore,
+     EvidenceRequiresAuthenticatedReporterAssignmentAndContentHash) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+
+  MetaObservation forged_reporter =
+      EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 7, 42);
+  std::get<MetaOperationEvidenceObs>(forged_reporter.payload_).node_id_ = "n2";
+  ExpectDomainReject(store.Ingest(std::move(forged_reporter), facts, 1000));
+  EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kRejected,
+                      "evidence-reporter-mismatch"));
+
+  MetaObservation forged_boot =
+      EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 7, 42);
+  std::get<MetaOperationEvidenceObs>(forged_boot.payload_).boot_incarnation_ =
+      Boot(0x0b);
+  ExpectDomainReject(store.Ingest(std::move(forged_boot), facts, 1001));
+  EXPECT_TRUE(
+      RingHas(store, MetaObsAuditKind::kRejected, "evidence-boot-mismatch"));
+
+  ExpectDomainReject(store.Ingest(
+      EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 7, 42,
+                  /*partition_epoch=*/11, /*assignment=*/0x32),
+      facts, 1002));
+  EXPECT_TRUE(
+      RingHas(store, MetaObsAuditKind::kRejected, "assignment-mismatch"));
+
+  MetaObservation bad_hash =
+      EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 7, 42);
+  std::get<MetaOperationEvidenceObs>(bad_hash.payload_).evidence_hash_.fill(0);
+  ExpectDomainReject(store.Ingest(std::move(bad_hash), facts, 1003));
+  EXPECT_TRUE(
+      RingHas(store, MetaObsAuditKind::kRejected, "evidence-hash-mismatch"));
+
+  EXPECT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1",
+                                      "g1", 3, 7, 42),
+                          facts, 1004)
+                  .ok());
+}
+
 TEST(MetaObservationStore, EvidenceRequiresCurrentTermAndManifest) {
   MetaObservationStore store;
   FakeCommittedFacts facts = MakeFreshFacts();
@@ -477,6 +685,10 @@ TEST(MetaObservationStore, EvidenceRequiresCurrentTermAndManifest) {
       facts, 1000));
   ExpectDomainReject(store.Ingest(
       EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 8, 42),
+      facts, 1000));
+  ExpectDomainReject(store.Ingest(
+      EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 7, 42,
+                  /*partition_epoch=*/10),
       facts, 1000));
   ASSERT_TRUE(store
                   .Ingest(EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1",
@@ -503,7 +715,10 @@ TEST(MetaObservationStore, EvidenceLatestWinsPerNodeAndPhase) {
                   .ok());
   MetaObservation replaced =
       EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 7, 42);
-  std::get<MetaOperationEvidenceObs>(replaced.payload_).evidence_ = "v2";
+  auto& replaced_evidence =
+      std::get<MetaOperationEvidenceObs>(replaced.payload_);
+  replaced_evidence.evidence_ = "v2";
+  replaced_evidence.evidence_hash_ = keylane::meta::MetaSha256("v2");
   ASSERT_TRUE(store.Ingest(replaced, facts, 1002).ok());
   ASSERT_TRUE(store
                   .Ingest(EvidenceObs(Ident("n2", 0x0a, 1), OpId(0x51), "p1",
@@ -517,6 +732,17 @@ TEST(MetaObservationStore, EvidenceLatestWinsPerNodeAndPhase) {
   // (node, phase)-sorted: (n1,p1) first, carrying the replacement payload.
   EXPECT_EQ(evidence[0].kind_phase_, "p1");
   EXPECT_EQ(evidence[0].evidence_, "v2");
+  EXPECT_EQ(evidence[0].boot_incarnation_, Boot(0x0a));
+  keylane::meta::MetaHash256 manifest_digest{};
+  manifest_digest.fill(0x44);
+  const keylane::meta::MetaEvidenceSummary summary =
+      keylane::meta::SummarizeOperationEvidence(evidence[0], manifest_digest);
+  EXPECT_EQ(summary.node_id_, evidence[0].node_id_);
+  EXPECT_EQ(summary.boot_incarnation_, evidence[0].boot_incarnation_);
+  EXPECT_EQ(summary.group_id_, evidence[0].group_id_);
+  EXPECT_EQ(summary.assignment_id_, evidence[0].assignment_id_);
+  EXPECT_EQ(summary.population_manifest_digest_, manifest_digest);
+  EXPECT_EQ(summary.kind_hash_, evidence[0].evidence_hash_);
   EXPECT_EQ(store.EvidenceForOperation(OpId(0x77), facts).size(), 0);
   EXPECT_EQ(store.size(), 3);
 }
@@ -617,6 +843,35 @@ TEST(MetaObservationStore, ReadPathsRefilterEvenWithoutRevalidate) {
   EXPECT_EQ(store.size(), 0);
 }
 
+TEST(MetaObservationStore,
+     EpochOnlyCommitRefiltersThenPurgesCandidateAndEvidence) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+  ASSERT_TRUE(store
+                  .Ingest(CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42),
+                          facts, 1000)
+                  .ok());
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1",
+                                      "g1", 3, 7, 42),
+                          facts, 1001)
+                  .ok());
+
+  // The manifest and term are intentionally unchanged: the population epoch
+  // alone invalidates every proof from the previous replication generation.
+  facts.group_partition_epochs_["g1"] = 12;
+  EXPECT_EQ(store.size(), 2);
+  EXPECT_TRUE(store.CandidateProgressFor("g1", facts).empty());
+  EXPECT_FALSE(store.LatestCandidateProgress("g1", facts).has_value());
+  EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts).empty());
+
+  store.RevalidateAll(facts, 2000);
+  EXPECT_EQ(store.size(), 0);
+  EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kStalePurged,
+                      "commit-stale:partition-epoch-mismatch"));
+}
+
 TEST(MetaObservationStore, SweepExpiredDropsEntriesOlderThanTtl) {
   MetaObservationStore::Limits limits;
   limits.ttl_ms_ = 1000;
@@ -634,6 +889,31 @@ TEST(MetaObservationStore, SweepExpiredDropsEntriesOlderThanTtl) {
   const auto latest = store.LatestForNode("n1", facts);
   ASSERT_TRUE(latest.has_value());
   EXPECT_TRUE(std::holds_alternative<MetaNodeHealthObs>(latest->payload_));
+}
+
+TEST(MetaObservationStore, PeriodicSweepAmortizesHeartbeatScans) {
+  MetaObservationStore::Limits limits;
+  limits.ttl_ms_ = 1000;
+  MetaObservationStore store(limits);
+  FakeCommittedFacts facts = MakeFreshFacts();
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 0).ok());
+  ASSERT_TRUE(store.Ingest(BootObs(Ident("n1", 0x0a, 1)), facts, 1000).ok());
+
+  EXPECT_TRUE(store.MaybeSweepExpired(2000));
+  EXPECT_EQ(store.size(), 1);  // exact TTL boundary still survives
+  std::size_t scans = 1;
+  for (std::int64_t now = 2000; now < 2250; ++now) {
+    scans += store.MaybeSweepExpired(now) ? 1 : 0;
+  }
+  EXPECT_EQ(scans, 1u);
+  EXPECT_TRUE(store.MaybeSweepExpired(2250));
+  EXPECT_EQ(store.size(), 0);
+
+  // The force API remains exact and also advances the periodic cadence.
+  ASSERT_TRUE(store.Ingest(BootObs(Ident("n1", 0x0a, 1)), facts, 3000).ok());
+  store.SweepExpired(4001);
+  EXPECT_EQ(store.size(), 0);
+  EXPECT_FALSE(store.MaybeSweepExpired(4002));
 }
 
 TEST(MetaObservationStore, TotalCapacityRejectsNewKeys) {

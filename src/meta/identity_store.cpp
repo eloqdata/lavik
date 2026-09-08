@@ -1,12 +1,17 @@
 #include "keylane/meta/identity_store.h"
 
 #include <limits>
+#include <set>
 
 #include "absl/strings/str_cat.h"
+#include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/identity_verifier.h"
+#include "keylane/numeric_endpoint.h"
 
 namespace keylane::meta {
 namespace {
+
+namespace control = keylane::cluster::control;
 
 // Field-cap re-validation at the store boundary: commands normally arrive via
 // the strict decoder (which enforces caps), but the store keeps its own
@@ -29,11 +34,143 @@ absl::Status CheckNodeFields(const std::string& node_id,
   return absl::OkStatus();
 }
 
+enum class DataEndpointKind { kLegacy, kTcp, kTls };
+
+struct ParsedDataEndpoint {
+  DataEndpointKind kind_ = DataEndpointKind::kLegacy;
+  std::string host_;
+  std::uint16_t port_ = 0;
+};
+
+absl::StatusOr<ParsedDataEndpoint> ParseDataEndpoint(std::string_view encoded) {
+  ParsedDataEndpoint result;
+  if (encoded.starts_with("tcp://")) {
+    result.kind_ = DataEndpointKind::kTcp;
+    encoded.remove_prefix(6);
+  } else if (encoded.starts_with("tls://")) {
+    result.kind_ = DataEndpointKind::kTls;
+    encoded.remove_prefix(6);
+  }
+
+  auto endpoint = keylane::ParseNumericEndpoint(encoded);
+  if (!endpoint.has_value()) {
+    return absl::InvalidArgumentError(
+        "Data endpoint must be numeric IPv4:port or [IPv6]:port");
+  }
+  result.host_ = std::move(endpoint->host_);
+  result.port_ = endpoint->port_;
+  return result;
+}
+
+absl::Status ValidateDataEndpoints(
+    const std::vector<std::string>& encoded_endpoints) {
+  if (encoded_endpoints.empty() ||
+      encoded_endpoints.size() > kMaxMetaEndpointsPerNode) {
+    return absl::InvalidArgumentError(
+        "active Data node must have one or two client endpoints");
+  }
+  std::vector<ParsedDataEndpoint> endpoints;
+  endpoints.reserve(encoded_endpoints.size());
+  bool has_legacy = false;
+  bool has_explicit = false;
+  for (const std::string& encoded : encoded_endpoints) {
+    auto endpoint = ParseDataEndpoint(encoded);
+    if (!endpoint.ok()) return endpoint.status();
+    has_legacy |= endpoint->kind_ == DataEndpointKind::kLegacy;
+    has_explicit |= endpoint->kind_ != DataEndpointKind::kLegacy;
+    endpoints.push_back(std::move(*endpoint));
+  }
+  if (has_legacy && has_explicit) {
+    return absl::InvalidArgumentError(
+        "Data endpoints cannot mix tagged and legacy forms");
+  }
+  if (std::any_of(endpoints.begin() + 1, endpoints.end(),
+                  [&](const ParsedDataEndpoint& endpoint) {
+                    return endpoint.host_ != endpoints.front().host_;
+                  })) {
+    return absl::InvalidArgumentError(
+        "Data endpoints must use one numeric host");
+  }
+  if (has_explicit && endpoints.size() == 2 &&
+      endpoints[0].kind_ == endpoints[1].kind_) {
+    return absl::InvalidArgumentError(
+        "Data endpoints repeat the same transport");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> CanonicalMetaControlEndpoint(
+    std::string_view encoded) {
+  auto endpoint = keylane::ParseNumericEndpoint(encoded);
+  if (!endpoint.has_value()) {
+    return absl::InvalidArgumentError(
+        "Meta data-control endpoint must be numeric IPv4:port or [IPv6]:port");
+  }
+  return keylane::FormatNumericEndpoint(*endpoint);
+}
+
+absl::StatusOr<control::WireMetaEndpoint> ParseMetaControlEndpoint(
+    const MetaMemberRecord& member) {
+  auto endpoint = keylane::ParseNumericEndpoint(member.data_control_endpoint_);
+  if (!endpoint.has_value()) {
+    return absl::InvalidArgumentError(
+        "Meta data-control endpoint must be numeric IPv4:port or [IPv6]:port");
+  }
+  return control::WireMetaEndpoint{
+      .server_id = member.server_id_,
+      .host = std::move(endpoint->host_),
+      .port = endpoint->port_,
+      .principal = member.principal_,
+  };
+}
+
+// ServerHello is intentionally a single frame. Keep that wire invariant in
+// the durable state transition as well as at publication time, otherwise one
+// legal Raft entry could permanently make every Data connection fail closed.
+absl::Status ValidateActiveMetaDirectory(
+    const std::vector<MetaMemberRecord>& members) {
+  std::vector<control::WireMetaEndpoint> directory;
+  directory.reserve(members.size());
+  std::set<std::pair<std::string, std::uint16_t>> endpoints;
+  for (const MetaMemberRecord& member : members) {
+    if (member.retired_) continue;
+    auto endpoint = ParseMetaControlEndpoint(member);
+    if (!endpoint.ok()) return endpoint.status();
+    if (!endpoints.emplace(endpoint->host, endpoint->port).second) {
+      return absl::InvalidArgumentError(
+          "active Meta data-control endpoints must be unique");
+    }
+    directory.push_back(std::move(*endpoint));
+  }
+  control::ServerHello probe{
+      .disposition = control::ServerHelloDisposition::kAccepted,
+      .negotiated_version = control::kProtocolVersion,
+      .meta_server_id = 1,
+      .raft_term = 1,
+      .session_id = {},
+      .session_generation = 1,
+      .leader_id = 1,
+      .directory = std::move(directory),
+      .heartbeat_interval_ms = 1,
+      .observation_ttl_ms = 1,
+      .session_progress_timeout_ms = 1,
+  };
+  auto encoded = control::EncodeMessage(control::WireMessage(std::move(probe)));
+  if (!encoded.ok() || encoded->size() > control::kMaxFramePayloadBytes) {
+    return absl::ResourceExhaustedError(
+        "active Meta directory cannot fit in one ServerHello frame");
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 absl::Status MetaIdentityStore::Apply(const RegisterNode& cmd) {
   if (auto st = CheckNodeFields(cmd.node_id_, cmd.endpoints_); !st.ok()) {
     return st;
+  }
+  if (auto st = ValidateDataEndpoints(cmd.endpoints_); !st.ok()) {
+    return MetaDomainRejectError(st.message());
   }
   if (auto st = ValidateDataNodePrincipal(cmd.node_id_, cmd.principal_);
       !st.ok()) {
@@ -78,6 +215,9 @@ absl::Status MetaIdentityStore::Apply(const RegisterNode& cmd) {
 absl::Status MetaIdentityStore::Apply(const UpdateNode& cmd) {
   if (auto st = CheckNodeFields(cmd.node_id_, cmd.endpoints_); !st.ok()) {
     return st;
+  }
+  if (auto st = ValidateDataEndpoints(cmd.endpoints_); !st.ok()) {
+    return MetaDomainRejectError(st.message());
   }
   const auto it = nodes_.find(cmd.node_id_);
   if (it == nodes_.end()) {
@@ -143,16 +283,27 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
           static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
     return MetaDomainRejectError("meta server_id must be a positive int");
   }
+  if (cmd.data_control_endpoint_.empty() ||
+      cmd.data_control_endpoint_.size() > kMaxMetaEndpointBytes) {
+    return MetaDomainRejectError(
+        "data_control_endpoint is empty or exceeds its cap");
+  }
   const MetaMemberIdentity descriptor{static_cast<int>(cmd.server_id_),
                                       cmd.principal_};
   if (auto checked = MetaMemberIdentity::DecodeAux(descriptor.EncodeAux());
       !checked.ok()) {
     return MetaDomainRejectError(checked.status().message());
   }
+  auto canonical_endpoint =
+      CanonicalMetaControlEndpoint(cmd.data_control_endpoint_);
+  if (!canonical_endpoint.ok()) {
+    return MetaDomainRejectError(canonical_endpoint.status().message());
+  }
   if (const auto existing = meta_members_.find(cmd.server_id_);
       existing != meta_members_.end()) {
     const MetaMemberRecord& record = existing->second;
-    if (!record.retired_ && record.principal_ == cmd.principal_) {
+    if (!record.retired_ && record.principal_ == cmd.principal_ &&
+        record.data_control_endpoint_ == *canonical_endpoint) {
       return absl::OkStatus();
     }
     return MetaDomainRejectError("meta server_id already bound");
@@ -164,9 +315,13 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
   if (meta_members_.size() >= kMaxMetaNodes) {
     return MetaDomainRejectError("meta member cap reached");
   }
-  MetaMemberRecord record;
-  record.server_id_ = cmd.server_id_;
-  record.principal_ = cmd.principal_;
+  MetaMemberRecord record{cmd.server_id_, cmd.principal_,
+                          std::move(*canonical_endpoint), false};
+  std::vector<MetaMemberRecord> candidate = MetaMembers();
+  candidate.push_back(record);
+  if (auto status = ValidateActiveMetaDirectory(candidate); !status.ok()) {
+    return MetaDomainRejectError(status.message());
+  }
   meta_members_.emplace(cmd.server_id_, record);
   meta_server_id_by_principal_.emplace(cmd.principal_, cmd.server_id_);
   return absl::OkStatus();
@@ -215,6 +370,26 @@ bool MetaIdentityStore::IsActiveMetaMember(std::uint32_t server_id,
          it->second.principal_ == principal;
 }
 
+std::vector<MetaNodeRecord> MetaIdentityStore::Nodes() const {
+  std::vector<MetaNodeRecord> result;
+  result.reserve(nodes_.size());
+  for (const auto& [node_id, record] : nodes_) {
+    (void)node_id;
+    result.push_back(record);
+  }
+  return result;
+}
+
+std::vector<MetaMemberRecord> MetaIdentityStore::MetaMembers() const {
+  std::vector<MetaMemberRecord> result;
+  result.reserve(meta_members_.size());
+  for (const auto& [server_id, record] : meta_members_) {
+    (void)server_id;
+    result.push_back(record);
+  }
+  return result;
+}
+
 // Envelope: schema_version u16 | node count u32 | sorted records. See the
 // header for the convention and the strictness contract.
 std::string MetaIdentityStore::Serialize() const {
@@ -236,6 +411,7 @@ std::string MetaIdentityStore::Serialize() const {
   for (const auto& [server_id, record] : meta_members_) {
     w.WriteU32(server_id);
     w.WriteString(record.principal_);
+    w.WriteString(record.data_control_endpoint_);
     w.WriteBool(record.retired_);
   }
   return w.TakeBuffer();
@@ -291,6 +467,10 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
         !principal_status.ok()) {
       return MetaFailStopError("non-canonical node principal in snapshot");
     }
+    if (auto endpoint_status = ValidateDataEndpoints(*endpoints);
+        !endpoint_status.ok()) {
+      return MetaFailStopError(endpoint_status.message());
+    }
     if (*revision == 0) {
       return MetaFailStopError("revision 0 in snapshot");
     }
@@ -319,10 +499,14 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     if (!server_id.ok()) return server_id.status();
     auto principal = r.ReadString(kMaxMetaPrincipalBytes);
     if (!principal.ok()) return principal.status();
+    auto data_control_endpoint = r.ReadString(kMaxMetaEndpointBytes);
+    if (!data_control_endpoint.ok()) return data_control_endpoint.status();
     auto retired = r.ReadBool("invalid meta member in snapshot");
     if (!retired.ok()) return retired.status();
-    if (*server_id == 0 || *server_id > static_cast<std::uint32_t>(
-                                            std::numeric_limits<int>::max())) {
+    if (*server_id == 0 ||
+        *server_id >
+            static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+        data_control_endpoint->empty()) {
       return MetaFailStopError("invalid meta member in snapshot");
     }
     const MetaMemberIdentity descriptor{static_cast<int>(*server_id),
@@ -330,15 +514,27 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     if (!MetaMemberIdentity::DecodeAux(descriptor.EncodeAux()).ok()) {
       return MetaFailStopError("invalid meta member descriptor in snapshot");
     }
+    auto canonical_endpoint =
+        CanonicalMetaControlEndpoint(*data_control_endpoint);
+    if (!canonical_endpoint.ok() ||
+        *canonical_endpoint != *data_control_endpoint) {
+      return MetaFailStopError(
+          "non-canonical Meta data-control endpoint in snapshot");
+    }
     if (store.meta_members_.contains(*server_id) ||
         store.node_id_by_principal_.contains(std::string(*principal)) ||
         store.meta_server_id_by_principal_.contains(std::string(*principal))) {
       return MetaFailStopError("duplicate meta member binding in snapshot");
     }
-    MetaMemberRecord record{*server_id, std::string(*principal), *retired};
+    MetaMemberRecord record{*server_id, std::string(*principal),
+                            std::move(*canonical_endpoint), *retired};
     store.meta_server_id_by_principal_.emplace(record.principal_,
                                                record.server_id_);
     store.meta_members_.emplace(record.server_id_, std::move(record));
+  }
+  if (auto status = ValidateActiveMetaDirectory(store.MetaMembers());
+      !status.ok()) {
+    return MetaFailStopError(status.message());
   }
   if (auto st = r.Finish(); !st.ok()) return st;
   return store;

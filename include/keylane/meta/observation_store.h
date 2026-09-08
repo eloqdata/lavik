@@ -22,9 +22,10 @@
 //     actively purged when committed state changes (RevalidateAll), and
 //     re-filtered at every read (Latest*/List* take facts and filter again),
 //     so a commit landing between ingest and query cannot leak stale data.
-//   - Term-bound observations require group_term == committed current term
-//     (older is stale, newer is forged: both rejected). Manifest/history ids
-//     must match committed values or operation-committed bindings.
+//   - Group-bound observations require the authenticated node's exact current
+//     membership assignment and group_term == committed current term (older is
+//     stale, newer is forged: both rejected). Manifest/history ids must match
+//     committed values or operation-committed bindings.
 //
 // Rejections and evictions are appended to a bounded audit ring buffer for
 // operators (MetaObsAuditEvent); this ring is debugging surface, not the
@@ -68,10 +69,17 @@ struct MetaNodeHealthObs {
 };
 
 struct MetaCandidateProgressObs {
+  // Copied from the authenticated observation identity so group queries keep
+  // the complete reporter incarnation instead of returning an anonymous
+  // proof that a reconciler would have to join against another query.
+  std::string node_id_;
+  MetaBootIncarnation boot_incarnation_{};
   std::string group_id_;
+  MetaAssignmentId assignment_id_{};
   uint64_t group_term_ = 0;
-  uint64_t population_manifest_id_ = 0;
-  uint64_t replication_history_id_ = 0;
+  uint64_t population_manifest_revision_ = 0;
+  uint64_t partition_replication_epoch_ = 0;
+  MetaReplicationHistoryId replication_history_id_{};
   std::string applied_flow_vector_;  // opaque and bounded
   std::string backlog_coverage_;     // opaque, bounded
   std::string readiness_;            // opaque, bounded
@@ -79,17 +87,31 @@ struct MetaCandidateProgressObs {
 };
 
 struct MetaOperationEvidenceObs {
+  // Bound to the authenticated reporter and its exact current membership
+  // incarnation; neither field is accepted as an independent identity claim.
+  std::string node_id_;
+  MetaBootIncarnation boot_incarnation_{};
+  MetaAssignmentId assignment_id_{};
   MetaOperationId operation_id_;
   std::string kind_phase_;  // bounded; the phase this evidence supports
   MetaHash256 evidence_hash_;
   std::string evidence_;  // bounded normalized evidence payload
-  // Term/history anchors of the evidence (checked against committed state):
+  // Committed population and operation-history anchors for this evidence:
   std::string group_id_;
   uint64_t group_term_ = 0;
-  uint64_t population_manifest_id_ = 0;
-  uint64_t replication_history_id_ = 0;
+  uint64_t population_manifest_revision_ = 0;
+  uint64_t partition_replication_epoch_ = 0;
+  MetaReplicationHistoryId replication_history_id_{};
   bool operator==(const MetaOperationEvidenceObs&) const = default;
 };
+
+// Canonical conversion used after EvidenceForOperation returns a validated,
+// self-contained observation. The manifest digest comes from the same
+// committed view used for that query; every observation/session anchor is
+// copied without a second lookup that could race session supersession.
+MetaEvidenceSummary SummarizeOperationEvidence(
+    const MetaOperationEvidenceObs& evidence,
+    const MetaHash256& population_manifest_digest);
 
 using MetaObservationPayload =
     std::variant<MetaNodeBootObs, MetaNodeHealthObs, MetaCandidateProgressObs,
@@ -115,15 +137,26 @@ class MetaCommittedFacts {
   // 0 when the group does not exist.
   virtual uint64_t CurrentGroupTerm(std::string_view group_id) const = 0;
   // 0 when the group does not exist.
-  virtual uint64_t CurrentPopulationManifestId(
+  virtual uint64_t CurrentPopulationManifestRevision(
       std::string_view group_id) const = 0;
+  // 0 when the group does not exist. Zero may also be the initial committed
+  // epoch; term matching distinguishes a real group from unknown state.
+  virtual uint64_t CurrentPartitionReplicationEpoch(
+      std::string_view group_id) const = 0;
+  // True only for the exact current membership incarnation. An active node
+  // outside the group, or a removed-and-readded node using an old assignment,
+  // must not contribute candidate or operation evidence.
+  virtual bool AssignmentMatches(
+      std::string_view group_id, std::string_view node_id,
+      const MetaAssignmentId& assignment_id) const = 0;
   // True when the operation exists (including archived summaries) and is not
   // in a terminal lifecycle state.
   virtual bool OperationNonTerminal(const MetaOperationId& id) const = 0;
   // True when `history_id` is bound to the operation by a committed journal
   // record (the history anchor for evidence freshness).
-  virtual bool HistoryBoundToOperation(const MetaOperationId& id,
-                                       uint64_t history_id) const = 0;
+  virtual bool HistoryBoundToOperation(
+      const MetaOperationId& id,
+      const MetaReplicationHistoryId& history_id) const = 0;
 };
 
 // ------------------------------------------------------------ event auditing
@@ -181,13 +214,17 @@ class MetaObservationStore {
   absl::Status Ingest(MetaObservation observation,
                       const MetaCommittedFacts& facts, int64_t now_unix_ms);
 
-  // Commit-driven invalidation: drop observations whose term/manifest/history
-  // bindings no longer match committed state (events audited). Callers run
-  // this after each committed batch.
+  // Commit-driven invalidation: drop observations whose
+  // term/manifest/partition-epoch/history bindings no longer match committed
+  // state (events audited). Callers run this after each committed batch.
   void RevalidateAll(const MetaCommittedFacts& facts, int64_t now_unix_ms);
 
   // TTL sweep (events audited).
   void SweepExpired(int64_t now_unix_ms);
+  // Amortized ingest-path sweep. Returns true only when this call performed a
+  // full scan. At the default TTL the scan runs at most once per second;
+  // explicit query paths retain SweepExpired's exact boundary semantics.
+  bool MaybeSweepExpired(int64_t now_unix_ms);
 
   // Read paths re-filter against current facts and never return stale data.
   std::optional<MetaCandidateProgressObs> LatestCandidateProgress(
@@ -205,6 +242,8 @@ class MetaObservationStore {
   size_t size() const;
 
  private:
+  void SweepExpiredLocked(int64_t now_unix_ms);
+
   Limits limits_;
   // Defined in the .cpp: per-node current generation; per-(node, kind)
   // latest observations; per-group bounded candidate sets; audit ring.

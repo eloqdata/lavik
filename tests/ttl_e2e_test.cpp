@@ -23,6 +23,13 @@
 #include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "celer/net/server.h"
+#include "keylane/memory.h"
+#include "keylane/metrics.h"
+#include "keylane/storage/engine.h"
+#include "keylane/tx/tx_shard.h"
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -167,7 +174,8 @@ RespClient Connect(std::uint16_t port) {
 class ServerProcess {
  public:
   ServerProcess(const std::string& binary, std::uint16_t port,
-                const std::string& data_path, const std::string& log_path) {
+                const std::string& data_path, const std::string& log_path,
+                std::vector<std::string> extra_arguments = {}) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -192,6 +200,9 @@ class ServerProcess {
           "--data-file",
           data_path,
       };
+      arguments.insert(arguments.end(),
+                       std::make_move_iterator(extra_arguments.begin()),
+                       std::make_move_iterator(extra_arguments.end()));
       std::vector<char*> child_argv;
       for (std::string& argument : arguments) {
         child_argv.push_back(argument.data());
@@ -287,6 +298,122 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
+void WriteFile(const std::string& path, std::string_view contents) {
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output << contents;
+  output.flush();
+  if (!output) Fail("failed to write test file");
+}
+
+class ExpirationAuthorityService final : public celer::Service {
+ public:
+  explicit ExpirationAuthorityService(
+      keylane::storage::StorageEngine* storage)
+      : storage_(storage) {}
+
+  void Prepare(unsigned thread_count) override {
+    if (thread_count != 1) {
+      Fail("expiration authority test requires one worker");
+    }
+  }
+
+  celer::Task<absl::Status> Run(celer::Worker& worker,
+                                celer::ServiceContext) override {
+    keylane::BindMemoryAccountingShard(worker.id());
+    keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
+    result_ = co_await storage_->InitializeWorker(worker);
+    if (!result_.ok()) {
+      worker.RequestStop();
+      co_return result_;
+    }
+    if (storage_->LocalSize(0) != 1) {
+      result_ = absl::FailedPreconditionError(
+          "recovery without authority did not retain the expired winner");
+    }
+    if (result_.ok()) {
+      auto hidden = co_await storage_->Get(0, "authority-deferred");
+      if (hidden.ok() ||
+          hidden.status().code() != absl::StatusCode::kNotFound) {
+        result_ = absl::FailedPreconditionError(
+            "read exposed the expired winner without authority");
+      }
+    }
+    if (result_.ok()) {
+      result_ = co_await celer::SleepFor(worker, 100ms);
+    }
+    if (result_.ok() && storage_->LocalSize(0) != 1) {
+      result_ = absl::FailedPreconditionError(
+          "active expiration ran without authority");
+    }
+
+    if (result_.ok()) {
+      storage_->SetExpirationAuthority(true);
+      // The read remains logically absent but now queues the recovered winner
+      // for the already-running active-expiration worker.
+      auto hidden = co_await storage_->Get(0, "authority-deferred");
+      if (hidden.ok() ||
+          hidden.status().code() != absl::StatusCode::kNotFound) {
+        result_ = absl::FailedPreconditionError(
+            "read exposed the expired winner after authority grant");
+      }
+    }
+    for (unsigned attempt = 0;
+         result_.ok() && storage_->LocalSize(0) != 0 && attempt < 5'000;
+         ++attempt) {
+      result_ = co_await celer::SleepFor(worker, 1ms);
+    }
+    if (result_.ok() && storage_->LocalSize(0) != 0) {
+      result_ = absl::DeadlineExceededError(
+          "active expiration did not retire the recovered winner");
+    }
+    worker.RequestStop();
+    co_return result_;
+  }
+
+  void Stop() noexcept override {}
+
+  void FinalizeWorker(celer::Worker& worker) noexcept override {
+    storage_->FinalizeWorker(worker);
+  }
+
+  const absl::Status& result() const noexcept { return result_; }
+
+ private:
+  keylane::storage::StorageEngine* storage_ = nullptr;
+  absl::Status result_ =
+      absl::UnknownError("expiration authority test did not run");
+};
+
+void VerifyDeferredExpirationAuthority(const std::string& data_path) {
+  keylane::storage::StorageEngineOptions options;
+  options.data_files_ = {data_path};
+  options.buffers_.registered_bytes_ = 64ULL * 1024 * 1024;
+  options.expiration_authority_ = false;
+  options.tomb_raider_interval_ms_ = 0;
+  options.tx_cleaner_cooldown_ms_ = 0;
+  keylane::storage::StorageEngine storage(std::move(options));
+  keylane::InitWorkerMetrics(1);
+  absl::Status status = keylane::InitMemoryLimit(512ULL * 1024 * 1024, 1);
+  if (!status.ok()) Fail(std::string(status.message()));
+  status = storage.Prepare(1);
+  if (!status.ok()) Fail(std::string(status.message()));
+  keylane::tx::TxRuntime::Create(1);
+
+  ExpirationAuthorityService service(&storage);
+  celer::Server server;
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  status = server.Start(runtime);
+  if (!status.ok()) Fail(std::string(status.message()));
+  server.WaitUntilStopped();
+  if (!service.result().ok()) {
+    Fail(std::string(service.result().message()));
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -297,8 +424,14 @@ int main(int argc, char** argv) {
   const std::string prefix = "/tmp/keylane-ttl-" + std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
+  const std::string no_authority_data_path = prefix + "-no-authority.data";
+  const std::string no_authority_log_path = prefix + "-no-authority.log";
+  const std::string static_nodes_path = prefix + "-nodes.conf";
   (void)::unlink(data_path.c_str());
   (void)::unlink(log_path.c_str());
+  (void)::unlink(no_authority_data_path.c_str());
+  (void)::unlink(no_authority_log_path.c_str());
+  (void)::unlink(static_nodes_path.c_str());
 
   try {
     const std::uint16_t port = FindFreePort();
@@ -593,8 +726,57 @@ int main(int argc, char** argv) {
       server.Stop();
     }
 
+    // Recovery without expiration authority must keep the expired winner on
+    // disk and in the index. Reads still hide it by its absolute deadline, but
+    // only a later authority grant may mint the durable tombstone. A static
+    // cluster primary gives this test a serving data plane while deliberately
+    // withholding that authority.
+    const std::uint16_t no_authority_port = FindFreePort();
+    CreateDataFile(no_authority_data_path, 192ULL * 1024 * 1024);
+    {
+      ServerProcess server(argv[1], no_authority_port, no_authority_data_path,
+                           no_authority_log_path);
+      RespClient client = Connect(no_authority_port);
+      Expect(client.Command({"SET", "authority-deferred", "value", "PX",
+                             "3000"}),
+             "+OK", "no-authority recovery seed");
+      server.Stop();
+    }
+    std::this_thread::sleep_for(3100ms);
+    constexpr std::string_view kStaticNodeId =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    WriteFile(static_nodes_path,
+              std::string(kStaticNodeId) + " 127.0.0.1:" +
+                  std::to_string(no_authority_port) +
+                  "@0 master - 0 0 1 connected 0-16383\n"
+                  "vars currentEpoch 1 lastVoteEpoch 0\n");
+    {
+      ServerProcess server(
+          argv[1], no_authority_port, no_authority_data_path,
+          no_authority_log_path,
+          {"--cluster-enabled", "--cluster-static-nodes-file",
+           static_nodes_path});
+      RespClient client = Connect(no_authority_port);
+      const auto ready_deadline = std::chrono::steady_clock::now() + 30s;
+      std::string size;
+      do {
+        size = client.Command({"DBSIZE"});
+        if (size == ":1") break;
+        if (!size.starts_with("-LOADING")) break;
+        std::this_thread::sleep_for(20ms);
+      } while (std::chrono::steady_clock::now() < ready_deadline);
+      Expect(client.Command({"GET", "authority-deferred"}), "$-1",
+             "expired value hidden without authority");
+      Expect(size, ":1", "expired winner retained without authority");
+      server.Stop();
+    }
+    VerifyDeferredExpirationAuthority(no_authority_data_path);
+
     (void)::unlink(data_path.c_str());
     (void)::unlink(log_path.c_str());
+    (void)::unlink(no_authority_data_path.c_str());
+    (void)::unlink(no_authority_log_path.c_str());
+    (void)::unlink(static_nodes_path.c_str());
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
@@ -602,6 +784,9 @@ int main(int argc, char** argv) {
     if (!log.empty()) std::cerr << "--- Keylane log ---\n" << log;
     (void)::unlink(data_path.c_str());
     (void)::unlink(log_path.c_str());
+    (void)::unlink(no_authority_data_path.c_str());
+    (void)::unlink(no_authority_log_path.c_str());
+    (void)::unlink(static_nodes_path.c_str());
     return 1;
   }
 }

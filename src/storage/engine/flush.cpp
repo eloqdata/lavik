@@ -32,10 +32,31 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
               *store->worker_);
         }
         if (barrier.ok()) {
+          // The transaction cleaner can promote tagged winners by appending
+          // ordinary records and can therefore reopen an append stream after
+          // the first freeze. Seal and drain that tail on every owner before
+          // any shard starts traversing its supposedly stable index.
+          absl::Status refrozen = co_await FlushWorkerForShutdown(store);
+          if (status.ok() && !refrozen.ok()) status = std::move(refrozen);
+          barrier = co_await shutdown_checkpoint_refrozen_barrier_->Wait(
+              *store->worker_);
+        }
+        if (barrier.ok()) {
           const std::uint64_t generation = checkpoint_root_.generation_ + 1;
           CheckpointShardResult& shard =
               checkpoint_shards_[store->worker_->id()];
-          if (!status.ok()) {
+          bool frozen = false;
+          co_await store->store_state_mutex_.Lock();
+          {
+            UnlockGuard guard(&store->store_state_mutex_, store->worker_);
+            frozen = !store->expiry_cycle_running_ && !store->flush_running_ &&
+                     store->flush_queue_.empty() &&
+                     !RuntimeFailureLatched();
+          }
+          if (!frozen) {
+            shard.status_ = absl::FailedPreconditionError(
+                "storage index was not frozen before shutdown checkpoint");
+          } else if (!status.ok()) {
             shard.status_ = status;
           } else if (!checkpoint_tx_cleanup_status_.ok()) {
             shard.status_ = checkpoint_tx_cleanup_status_;
@@ -192,7 +213,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       if (buffer.data_ == nullptr || buffer.size_ < padded ||
           staging_state.durable_bytes_ > state->committed_bytes_) {
         state->flush_queued_ = false;
-        store->write_failed_ = true;
+        LatchRuntimeFailure(*store);
         store->flush_running_ = false;
         co_return absl::Status(absl::StatusCode::kInternal,
                                "invalid pending flush staging buffer");
@@ -311,7 +332,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         state->flush_in_progress_ = false;
         state->flush_queued_ = false;
       }
-      store->write_failed_ = true;
+      LatchRuntimeFailure(*store);
       store->flush_running_ = false;
       co_return absl::Status(absl::StatusCode::kInternal,
                              "invalid pending flush staging buffer");
@@ -334,7 +355,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           state->flush_in_progress_ = false;
           state->flush_queued_ = false;
         }
-        store->write_failed_ = true;
+        LatchRuntimeFailure(*store);
         store->flush_running_ = false;
         if (!written.ok()) {
           co_return written.status();
@@ -355,7 +376,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         state->flush_in_progress_ = false;
         state->flush_queued_ = false;
       }
-      store->write_failed_ = true;
+      LatchRuntimeFailure(*store);
       store->flush_running_ = false;
       co_return status;
     };

@@ -685,11 +685,12 @@ Task<std::optional<std::string>> ReplicaMovedError(
 
 // ---- Redis Cluster data-plane gate ----
 //
-// When cluster mode is enabled, admission is decided by cluster::Admit
-// against the latest committed ServingState, and the legacy replica-MOVED
-// shim above never runs. Cluster mode forbids standalone REPLICAOF control but
-// the replication manager may still have a Meta-authorized population source;
-// that source never supplies client redirection authority.
+// When cluster mode is enabled, admission is decided by the process-wide
+// AuthorityGuard against the latest committed ServingState and (in Meta mode)
+// its in-memory lease. The legacy replica-MOVED shim above never runs. Cluster
+// mode forbids standalone REPLICAOF control but the replication manager may
+// still have a Meta-authorized population source; that source never supplies
+// client redirection authority.
 //
 // The replication LOADING gate (DispatchCommandImpl) and the cluster gate
 // share the whitelist below but prove different facts. In cluster mode the
@@ -702,8 +703,16 @@ Task<std::optional<std::string>> ReplicaMovedError(
 // ADDREPLICAOF stay whitelisted so their cluster-mode rejection is produced by
 // the command itself (Redis aligns the error text) instead of being masked by
 // LOADING.
-bool LoadingAllowedCommandKind(CommandKind kind) {
-  switch (kind) {
+bool LoadingAllowedCommand(const CommandRequest& request) {
+  if (request.kind_ == CommandKind::kFunction && request.args_.size() == 2) {
+    // FUNCTION KILL must be able to release a function that itself keeps the
+    // population transition from draining. STATS is the matching read-only
+    // observation surface. No other FUNCTION subcommand is safe while the
+    // dataset is fenced.
+    return CmpCaseInsensitive(request.args_[1], "KILL") ||
+           CmpCaseInsensitive(request.args_[1], "STATS");
+  }
+  switch (request.kind_) {
     case CommandKind::kPing:
     case CommandKind::kEcho:
     case CommandKind::kAuth:
@@ -787,6 +796,96 @@ std::uint16_t ClusterDecisionClientPort(const cluster::Decision& decision,
   return decision.moved_port_;
 }
 
+// These commands mutate process-wide durable state but carry no key from
+// which the cluster gate can derive an owner, lease, or in-flight drain cell.
+// Meta-managed nodes therefore reject them. Static compatibility mode permits
+// them only when one local primary group supplies a representative slot and
+// thus the ordinary owner re-check and in-flight drain proof.
+std::string_view UnscopedClusterMutation(const CommandRequest& request) {
+  switch (request.kind_) {
+    case CommandKind::kFlushDb:
+      return "FLUSHDB";
+    case CommandKind::kFlushAll:
+      return "FLUSHALL";
+    case CommandKind::kFunction:
+      if (request.args_.size() < 2) return {};
+      if (CmpCaseInsensitive(request.args_[1], "LOAD")) return "FUNCTION LOAD";
+      if (CmpCaseInsensitive(request.args_[1], "DELETE")) {
+        return "FUNCTION DELETE";
+      }
+      if (CmpCaseInsensitive(request.args_[1], "FLUSH")) {
+        return "FUNCTION FLUSH";
+      }
+      if (CmpCaseInsensitive(request.args_[1], "RESTORE")) {
+        return "FUNCTION RESTORE";
+      }
+      return {};
+    default:
+      return {};
+  }
+}
+
+// Bind a static global mutation to the sole local primary group before
+// admission. The representative slot makes the ordinary write recheck and
+// in-flight cell cover SIGHUP role changes while the command is suspended.
+// A topology race is harmless: CaptureAndAdmit reads the then-current state
+// and either validates this slot there or rejects/redirects it.
+void BindStaticGlobalMutationSlot(cluster::ClusterRuntime& runtime,
+                                  CommandRequest& request) {
+  if (runtime.authority_guard_.lease_mode() !=
+          cluster::AuthorityGuard::LeaseMode::kPermanent ||
+      !request.ClusterSlots().empty()) {
+    return;
+  }
+  const std::shared_ptr<const cluster::ServingState> state =
+      runtime.topology_cache_.Current();
+  if (state == nullptr || state->Self() == nullptr ||
+      !state->Self()->is_primary()) {
+    return;
+  }
+  const cluster::NodeIndex self = state->SelfNodeIndex();
+  const cluster::GroupView* local = nullptr;
+  for (const cluster::GroupView& group : state->Groups()) {
+    if (group.primary_node_index_ != self) continue;
+    if (local != nullptr || !group.granted_) return;
+    local = &group;
+  }
+  if (local != nullptr && !local->slot_ranges_.empty()) {
+    request.AddClusterSlot(local->slot_ranges_.front().first_);
+  }
+}
+
+// Static compatibility mode has no expiring Meta authority, but a global
+// mutation still needs an exact group owner and in-flight cell. A slotless
+// primary, replica, or node owning more than one group cannot supply that
+// proof and is rejected.
+bool StaticPrimaryOwnsGlobalMutation(
+    const cluster::ClusterRuntime& runtime,
+    const cluster::AuthorityAdmission& admission) {
+  if (runtime.authority_guard_.lease_mode() !=
+      cluster::AuthorityGuard::LeaseMode::kPermanent) {
+    return false;
+  }
+  const std::shared_ptr<const cluster::ServingState>& state = admission.state();
+  if (state == nullptr || state->Self() == nullptr ||
+      !state->Self()->is_primary()) {
+    return false;
+  }
+  const cluster::NodeIndex self = state->SelfNodeIndex();
+  std::size_t local_group_count = 0;
+  for (const cluster::GroupView& group : state->Groups()) {
+    if (group.primary_node_index_ != self) continue;
+    ++local_group_count;
+    if (!group.granted_) return false;
+  }
+  if (admission.slots().size() != 1 || local_group_count != 1) return false;
+  const cluster::GroupView* representative =
+      state->GroupForSlot(admission.slots().front());
+  return representative != nullptr &&
+         representative->primary_node_index_ == self &&
+         representative->granted_;
+}
+
 // Maps a non-serving admission decision to its wire reply.
 // Returns true when the decision produced a terminal reply; false when it
 // admits local execution. kCloseConnection yields an empty reply with the
@@ -823,68 +922,44 @@ bool EmitClusterDecision(const cluster::Decision& decision, bool connection_tls,
 }
 
 // Runs the cluster admission gate for one dispatched command. Returns true
-// when the request was answered terminally; otherwise the request carries the
-// ServingState snapshot it was admitted against (used by the owner-side
-// re-check) and execution may proceed.
+// when the request was answered terminally; otherwise a write carries the
+// guard-issued admission proof used by every owner-side re-check.
 bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
                        ReplyBuilder& reply_builder, CommandReply* reply) {
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
   PopulateClusterSlots(request);
-  // A slightly stale cached snapshot is fine here: admission under it can at
-  // worst produce a standard redirect, and the owner-side re-check
-  // backstops writes.
-  std::uint64_t gate_snapshot_version = 0;  // the gate needs no handshake
-  const std::shared_ptr<const cluster::ServingState>& state =
-      cluster::CurrentCachedWithVersion(runtime->topology_cache_,
-                                        &gate_snapshot_version);
+  request.cluster_authority_admission_.reset();
+  const std::string_view unscoped_mutation = UnscopedClusterMutation(request);
+  if (!unscoped_mutation.empty()) {
+    BindStaticGlobalMutationSlot(*runtime, request);
+  }
   const bool is_write = ClusterRequestIsWrite(request);
   const cluster::RequestView view{
       .slots_ = request.ClusterSlots(),
       .is_write_ = is_write,
       .connection_readonly_ = ctx.cluster_readonly_,
-      .loading_allowed_ = LoadingAllowedCommandKind(request.kind_),
+      .loading_allowed_ = LoadingAllowedCommand(request),
   };
-  const cluster::Decision decision = cluster::Admit(state.get(), view);
-  if (!EmitClusterDecision(decision, request.connection_tls_, reply_builder,
-                           reply)) {
-    // Reads intentionally have no owner-side fence re-check, so retaining the
-    // snapshot would only bounce its shared reference-count cacheline between
-    // workers. Writes keep ownership because they may suspend before their
-    // authority re-check and in-flight registration.
-    if (is_write) request.cluster_admitted_state_ = state;
+  auto admission = std::make_shared<const cluster::AuthorityAdmission>(
+      runtime->authority_guard_.CaptureAndAdmit(
+          view, std::chrono::steady_clock::now()));
+  if (admission->decision().kind_ == cluster::Decision::Kind::kServe &&
+      !unscoped_mutation.empty() &&
+      !StaticPrimaryOwnsGlobalMutation(*runtime, *admission)) {
+    reply->encoded_ = reply_builder.AppendError(absl::StrCat(
+        "ERR ", unscoped_mutation, " is not allowed in cluster mode"));
+    return true;
+  }
+  if (!EmitClusterDecision(admission->decision(), request.connection_tls_,
+                           reply_builder, reply)) {
+    // Reads intentionally have no owner-side re-check, so retaining their
+    // proof would only bounce a shared reference-count cacheline between
+    // workers. Writes must retain the lease generation and deadline captured
+    // together with their committed topology.
+    if (is_write) request.cluster_authority_admission_ = std::move(admission);
     return false;
   }
   return true;
-}
-
-// Registers every distinct admitted group of the request's slots in the
-// in-flight cells carried by the ServingState (the fencing seam the control
-// plane drains on). The guards live in the caller's coroutine frame and
-// release when the execution completes. Registration is one atomic increment
-// per group on the calling thread's stripe — no lock, no allocation.
-void RegisterClusterInFlight(
-    const cluster::ServingState& state, std::span<const std::uint16_t> slots,
-    absl::InlinedVector<cluster::InFlightGuard, 4>* guards) {
-  // Requests execute on stable Celer workers, so the worker id is already the
-  // exact per-thread stripe identity needed here. Passing it into the cluster
-  // model keeps that lower layer independent of the runtime and avoids a
-  // second thread-local identity allocator.
-  const std::size_t stripe = celer::ThisWorker().id_;
-  for (const std::uint16_t slot : slots) {
-    cluster::GroupInFlight* cell = state.InFlightCellForSlot(slot);
-    if (cell == nullptr) continue;
-    // An admitted request has at most a handful of slots (the gate rejects
-    // cross-slot requests), so a linear dedupe over the guards beats a hash
-    // set here.
-    bool seen = false;
-    for (const cluster::InFlightGuard& guard : *guards) {
-      if (guard.cell() == cell) {
-        seen = true;
-        break;
-      }
-    }
-    if (!seen) guards->emplace_back(*cell, stripe);
-  }
 }
 
 // Owner-side authority re-check for non-transactional writes, called from
@@ -895,62 +970,62 @@ void RegisterClusterInFlight(
 // reply when authority changed; std::nullopt when the write may proceed.
 std::optional<CommandReply> RecheckClusterWriteAuthority(
     const CommandRequest& request, ReplyBuilder& reply_builder,
-    absl::InlinedVector<cluster::InFlightGuard, 4>* in_flights) {
+    cluster::AuthorityInFlightGuards* in_flights) {
+  const std::string_view unscoped_mutation = UnscopedClusterMutation(request);
   if (!cluster::ClusterEnabled() || request.replication_origin_ ||
-      request.cluster_admitted_state_ == nullptr ||
-      request.ClusterSlots().empty() || !ClusterRequestIsWrite(request)) {
+      request.cluster_authority_admission_ == nullptr ||
+      (request.ClusterSlots().empty() && unscoped_mutation.empty()) ||
+      !ClusterRequestIsWrite(request)) {
     return std::nullopt;
   }
-  cluster::TopologyCache& cache = cluster::GetClusterRuntime()->topology_cache_;
+  cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
   for (;;) {
-    // The snapshot arrives with a completed publication sequence; that
-    // pairing is what makes the handshake below airtight.
-    std::uint64_t version_before = 0;
-    std::uint64_t publication_before = 0;
-    const std::shared_ptr<const cluster::ServingState>& current =
-        cluster::CurrentCachedWithVersion(cache, &version_before,
-                                          &publication_before);
-    if (!cluster::AuthorityUnchanged(*request.cluster_admitted_state_,
-                                     current.get(), request.ClusterSlots())) {
-      // Nothing has executed yet, so the request can safely be re-admitted
-      // against the current snapshot. Writes are never on the loading
-      // whitelist, so a current snapshot that lost readiness answers LOADING
-      // honestly rather than serving through the authority change that
-      // carried it.
-      const cluster::RequestView view{
-          .slots_ = request.ClusterSlots(),
-          .is_write_ = true,
-          .connection_readonly_ = false,
-          .loading_allowed_ = false,
-      };
-      const cluster::Decision decision = cluster::Admit(current.get(), view);
+    const std::shared_ptr<const cluster::AuthorityAdmission> admission =
+        request.cluster_authority_admission_;
+    if (request.ClusterSlots().empty()) {
+      // Dispatch must have rejected an unscoped mutation that could not bind
+      // one static owner group. Keep this owner-side seam fail-closed if a
+      // future queue/EXEC path reaches it without that proof.
       CommandReply reply;
-      if (EmitClusterDecision(decision, request.connection_tls_, reply_builder,
-                              &reply)) {
-        return reply;
-      }
-      // A benign republish (same serving verdict, refreshed token): re-arm
-      // the request with the current snapshot so the transaction hook
-      // (choke point 2) compares against it and the registration below lands
-      // on the cells the next publisher drains.
-      request.cluster_admitted_state_ = current;
+      reply.encoded_ = reply_builder.AppendError(absl::StrCat(
+          "ERR ", unscoped_mutation, " is not allowed in cluster mode"));
+      return reply;
     }
-    // Publication-race handshake: the sequence is odd across the state and
-    // logical-version update. A publication either happened entirely before
-    // publication_before (then `current` above is the new state and the
-    // authority check answered it) or changes the final sequence read (then
-    // the registration is rolled back and the loop retries). A
-    // registration therefore can never slip past a drain unseen.
-    // Registration targets the admitted snapshot the request holds for its
-    // whole lifetime, which keeps the cell handles alive behind the guards'
-    // raw pointers; token-equal snapshots share the same stripe allocations,
-    // so the publisher's drain sees these guards regardless.
-    RegisterClusterInFlight(*request.cluster_admitted_state_,
-                            request.ClusterSlots(), in_flights);
-    if (cache.publication_sequence() == publication_before) {
+    // Requests execute on stable Celer workers, so the worker id is the exact
+    // stripe identity required by the admitted ServingState.
+    if (runtime->authority_guard_.RegisterAndRecheck(
+            *admission, celer::ThisWorker().id_,
+            std::chrono::steady_clock::now(),
+            in_flights) == cluster::RecheckResult::kOk) {
       return std::nullopt;
     }
-    in_flights->clear();
+
+    // Nothing has executed yet, so acquire a fresh complete proof. Writes are
+    // never loading-whitelisted; a lost lease, session, readiness bit, or
+    // owner therefore maps to the current honest redirect/error. A serve
+    // result means only an unrelated generation changed, so re-arm and retry
+    // the publication/registration handshake.
+    const cluster::RequestView view{
+        .slots_ = request.ClusterSlots(),
+        .is_write_ = true,
+        .connection_readonly_ = false,
+        .loading_allowed_ = false,
+    };
+    auto fresh = std::make_shared<const cluster::AuthorityAdmission>(
+        runtime->authority_guard_.CaptureAndAdmit(
+            view, std::chrono::steady_clock::now()));
+    CommandReply reply;
+    if (EmitClusterDecision(fresh->decision(), request.connection_tls_,
+                            reply_builder, &reply)) {
+      return reply;
+    }
+    if (!unscoped_mutation.empty() &&
+        !StaticPrimaryOwnsGlobalMutation(*runtime, *fresh)) {
+      reply.encoded_ = reply_builder.AppendError(absl::StrCat(
+          "ERR ", unscoped_mutation, " is not allowed in cluster mode"));
+      return reply;
+    }
+    request.cluster_authority_admission_ = std::move(fresh);
   }
 }
 
@@ -2353,9 +2428,14 @@ struct WorkerJoin {
 // worker's own reply lane.
 template <typename Step>
 Task<absl::Status> RunJoinedStep(unsigned worker, Step step, WorkerJoin* join) {
-  absl::Status status = worker == ThisWorker().id_
-                            ? co_await step()
-                            : co_await SubmitTaskTo(worker, std::move(step));
+  absl::Status status;
+  // GCC 13 can reuse the coroutine-frame slot incorrectly when both arms of a
+  // conditional expression suspend, so keep the two awaiters disjoint.
+  if (worker == ThisWorker().id_) {
+    status = co_await step();
+  } else {
+    status = co_await SubmitTaskTo(worker, std::move(step));
+  }
   join->Complete(std::move(status));
   co_return absl::OkStatus();
 }
@@ -2378,9 +2458,10 @@ Task<absl::Status> ForEachParticipantParallel(std::size_t count,
     // A spawn and a join to make one call is a net loss, and single-key
     // writes reach these loops with exactly one participant.
     auto [worker, step] = step_at(std::size_t{0});
-    co_return worker == ThisWorker().id_
-        ? co_await step()
-        : co_await SubmitTaskTo(worker, std::move(step));
+    if (worker == ThisWorker().id_) {
+      co_return co_await step();
+    }
+    co_return co_await SubmitTaskTo(worker, std::move(step));
   }
   WorkerJoin join;
   join.pending_ = count;
@@ -2554,7 +2635,6 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
             [](const WorkerScope& left, const WorkerScope& right) {
               return left.worker_ < right.worker_;
             });
-
   if (parallel_fanout && scopes.size() > 1) {
     // The caller owns the cross-flow transaction-order slot, so no second
     // multi-worker acquisition can hold a conflicting subset while this
@@ -2575,7 +2655,7 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
                     ReplicationPublisherAdmission::WorkerToken{
                         .worker_ = scope.worker_,
                         .token_ = std::move(*token),
-                };
+                    };
                 co_return absl::OkStatus();
               }};
         });
@@ -2604,20 +2684,22 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
                     target = scope.target_]() {
       return g_storage->AcquireReplicationPublisherAdmission(bytes, target);
     };
-    absl::StatusOr<storage::ReplicationPublisherAdmission> token =
-        target_worker == ThisWorker().id_
-            ? co_await acquire()
-            : co_await SubmitTaskTo(target_worker, acquire);
-    if (!token.ok()) {
+    std::optional<absl::StatusOr<storage::ReplicationPublisherAdmission>> token;
+    if (target_worker == ThisWorker().id_) {
+      token.emplace(co_await acquire());
+    } else {
+      token.emplace(co_await SubmitTaskTo(target_worker, acquire));
+    }
+    if (!token->ok()) {
       // worker_tokens_ holds exactly what was taken, so releasing the whole
       // admission gives back precisely those reservations.
       (void)co_await ReleaseReplicationPublisherAdmission(admission);
-      co_return token.status();
+      co_return token->status();
     }
     admission.worker_tokens_.push_back(
         ReplicationPublisherAdmission::WorkerToken{
             .worker_ = target_worker,
-            .token_ = std::move(*token),
+            .token_ = std::move(**token),
         });
   }
   co_return admission;
@@ -2823,6 +2905,16 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
     if (const char* error = CommandServingGenerationError(request);
         error != nullptr) [[unlikely]] {
       co_return BuiltReply(reply_builder.AppendError(error));
+    }
+    // FLUSH owns its database gates and therefore returns before the generic
+    // command-body authority choke point. Recheck here after every gate wait
+    // and retain the representative static group guard through
+    // detach/publication.
+    cluster::AuthorityInFlightGuards cluster_in_flights;
+    if (std::optional<CommandReply> fenced = RecheckClusterWriteAuthority(
+            request, reply_builder, &cluster_in_flights);
+        fenced.has_value()) {
+      co_return std::move(*fenced);
     }
 
     if (request.kind_ == CommandKind::kFlushAll) {
@@ -5358,9 +5450,14 @@ Task<absl::Status> RenameSingleShardCallback(void* opaque,
   if (written.ok()) {
     g_storage->PublishCommittedFullSyncEffects(&writes);
   }
-  absl::Status finished =
-      written.ok() ? co_await g_storage->DiscardTxUndoLocal(writes.txid_)
-                   : co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
+  // Keep each await in its own statement. GCC 13 can reuse the coroutine-frame
+  // slot incorrectly when both arms of a conditional expression suspend.
+  absl::Status finished;
+  if (written.ok()) {
+    finished = co_await g_storage->DiscardTxUndoLocal(writes.txid_);
+  } else {
+    finished = co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
+  }
   co_return written.ok() ? finished : (finished.ok() ? written : finished);
 }
 
@@ -5566,9 +5663,12 @@ Task<absl::Status> CopySingleShardCallback(void* opaque,
   if (status.ok()) {
     g_storage->PublishCommittedFullSyncEffects(&writes);
   }
-  absl::Status finished =
-      status.ok() ? co_await g_storage->DiscardTxUndoLocal(writes.txid_)
-                  : co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
+  absl::Status finished;
+  if (status.ok()) {
+    finished = co_await g_storage->DiscardTxUndoLocal(writes.txid_);
+  } else {
+    finished = co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
+  }
   co_return status.ok() ? finished : (finished.ok() ? status : finished);
 }
 
@@ -5699,9 +5799,12 @@ Task<absl::Status> MSetNxSingleShardCallback(void* opaque,
   if (written.ok()) {
     g_storage->PublishCommittedFullSyncEffects(&writes);
   }
-  absl::Status finished =
-      written.ok() ? co_await g_storage->DiscardTxUndoLocal(writes.txid_)
-                   : co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
+  absl::Status finished;
+  if (written.ok()) {
+    finished = co_await g_storage->DiscardTxUndoLocal(writes.txid_);
+  } else {
+    finished = co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
+  }
   co_return written.ok() ? finished : (finished.ok() ? written : finished);
 }
 
@@ -6452,9 +6555,12 @@ Task<std::string> ExecuteExecSequentialStringMulti(
                      digest = key->digest_]() {
         return g_storage->ExistsLocked(db, name, digest);
       };
-      const bool present = key->owner_ == ThisWorker().id_
-                               ? co_await exists()
-                               : co_await SubmitTaskTo(key->owner_, exists);
+      bool present;
+      if (key->owner_ == ThisWorker().id_) {
+        present = co_await exists();
+      } else {
+        present = co_await SubmitTaskTo(key->owner_, exists);
+      }
       if (present) co_return EncodeInteger(0);
     }
   }
@@ -6482,9 +6588,12 @@ Task<std::string> ExecuteExecSequentialStringMulti(
                   digest = key->digest_, writes = &tx_writes[key->owner_]]() {
       return g_storage->SetLocked(db, name, digest, value, {}, writes);
     };
-    auto result = key->owner_ == ThisWorker().id_
-                      ? co_await write()
-                      : co_await SubmitTaskTo(key->owner_, write);
+    absl::StatusOr<storage::SetResult> result;
+    if (key->owner_ == ThisWorker().id_) {
+      result = co_await write();
+    } else {
+      result = co_await SubmitTaskTo(key->owner_, write);
+    }
     if (!result.ok()) {
       absl::Status rolled_back =
           co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
@@ -7446,12 +7555,8 @@ Task<std::string> ExecuteLuaRedisCall(
   // mutate through SubmitTaskTo inside the already-armed transaction and rely
   // on this pre-dispatch check.
   if (write && !command.replication_origin_ &&
-      eval_request.cluster_admitted_state_ != nullptr) {
-    const std::shared_ptr<const cluster::ServingState> current =
-        cluster::GetClusterRuntime()->topology_cache_.Current();
-    if (!cluster::AuthorityUnchanged(*eval_request.cluster_admitted_state_,
-                                     current.get(),
-                                     eval_request.ClusterSlots())) {
+      eval_request.cluster_authority_admission_ != nullptr) {
+    if (!RecheckClusterRequestAuthority(eval_request).ok()) {
       co_return EncodeError(
           "ERR Script attempted to access a non local key in a cluster node");
     }
@@ -7501,14 +7606,9 @@ Task<std::string> ExecuteLuaRedisCall(
       co_await SubmitTaskTo(owner, [&]() -> Task<absl::Status> {
         // The per-call hop bypasses tx::Transaction, so re-check the
         // admission on the owner right before mutating.
-        if (write && eval_request.cluster_admitted_state_ != nullptr) {
-          const std::shared_ptr<const cluster::ServingState> current =
-              cluster::GetClusterRuntime()->topology_cache_.Current();
-          if (!cluster::AuthorityUnchanged(
-                  *eval_request.cluster_admitted_state_, current.get(),
-                  eval_request.ClusterSlots())) {
-            co_return ClusterAuthorityChangedStatus();
-          }
+        if (write && eval_request.cluster_authority_admission_ != nullptr &&
+            !RecheckClusterRequestAuthority(eval_request).ok()) {
+          co_return ClusterAuthorityChangedStatus();
         }
         storage::TxShardWrites* writes =
             tx_writes == nullptr ? nullptr : &(*tx_writes)[owner];
@@ -7649,8 +7749,8 @@ PrepareFunctionMutationPublication(const CommandRequest& request) {
   co_return co_await SubmitTaskTo(
       0,
       [admission = std::move(admission), args = std::move(args)]() mutable
-          -> Task<absl::StatusOr<
-              std::optional<PreparedFunctionMutationPublication>>> {
+      -> Task<
+          absl::StatusOr<std::optional<PreparedFunctionMutationPublication>>> {
         auto publication = g_storage->PrepareAdmittedReplicationCommand(
             admission, storage::ReplicationEventKind::kCatalogMutation, 0,
             std::move(args), std::vector<std::string>{});
@@ -9179,13 +9279,27 @@ Task<CommandReply> ExecuteExecBody(
   // fails as a whole with CROSSSLOT, and a slot now owned elsewhere redirects
   // the whole EXEC with MOVED.
   std::vector<std::uint16_t> exec_cluster_slots;
-  std::shared_ptr<const cluster::ServingState> exec_admitted_state;
-  absl::InlinedVector<cluster::InFlightGuard, 4> exec_in_flights;
+  std::shared_ptr<const cluster::AuthorityAdmission> exec_admission;
+  cluster::AuthorityInFlightGuards exec_in_flights;
   if (cluster::ClusterEnabled() && !ctx.strict_replication_apply_) {
     for (std::size_t i = 0; i < queued.size(); ++i) {
       const CommandRequest& cmd = queued[i];
-      if (cmd.spec_ == nullptr || (cmd.spec_->flags_ & kCmdNoKeys) != 0 ||
-          !key_errors[i].empty()) {
+      if (cmd.spec_ == nullptr || !key_errors[i].empty()) {
+        continue;
+      }
+      if ((cmd.spec_->flags_ & kCmdNoKeys) != 0) {
+        // Static FUNCTION catalog mutations carry the representative group
+        // slot attached at queue-time admission. Re-admit that proof for EXEC
+        // so a SIGHUP demotion between QUEUED and EXEC cannot run keyless
+        // catalog work under obsolete primary authority.
+        if (IsFunctionCatalogMutation(cmd)) {
+          for (const std::uint16_t slot : cmd.ClusterSlots()) {
+            if (std::find(exec_cluster_slots.begin(), exec_cluster_slots.end(),
+                          slot) == exec_cluster_slots.end()) {
+              exec_cluster_slots.push_back(slot);
+            }
+          }
+        }
         continue;
       }
       const absl::StatusOr<KeyIndexView> keys =
@@ -9205,8 +9319,7 @@ Task<CommandReply> ExecuteExecBody(
       co_return BuiltReply(AppendCrossSlotError(reply_builder));
     }
     if (!exec_cluster_slots.empty() && has_write) {
-      cluster::TopologyCache& cache =
-          cluster::GetClusterRuntime()->topology_cache_;
+      cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
       const cluster::RequestView view{
           .slots_ = exec_cluster_slots,
           .is_write_ = true,
@@ -9215,34 +9328,38 @@ Task<CommandReply> ExecuteExecBody(
           // answer LOADING rather than serve the write.
           .loading_allowed_ = false,
       };
-      // Same publication-race handshake as RecheckClusterWriteAuthority: the
-      // snapshot arrives paired with a completed publication sequence, and a
-      // sequence change across registration means the guards may be invisible
-      // to a concurrent drain — roll back and re-admit.
       for (;;) {
-        std::uint64_t version_before = 0;
-        std::uint64_t publication_before = 0;
-        const std::shared_ptr<const cluster::ServingState>& current =
-            cluster::CurrentCachedWithVersion(cache, &version_before,
-                                              &publication_before);
-        const cluster::Decision decision = cluster::Admit(current.get(), view);
+        auto candidate = std::make_shared<const cluster::AuthorityAdmission>(
+            runtime->authority_guard_.CaptureAndAdmit(
+                view, std::chrono::steady_clock::now()));
         CommandReply redirect;
-        if (EmitClusterDecision(decision, queued.front().connection_tls_,
-                                reply_builder, &redirect)) {
+        if (EmitClusterDecision(candidate->decision(),
+                                queued.front().connection_tls_, reply_builder,
+                                &redirect)) {
           co_await DropWatches(ctx);
           co_return redirect;
         }
-        exec_admitted_state = current;
-        // Align every queued command's captured state with the EXEC-time
-        // admission so per-command re-checks (e.g. Lua redis.call) compare
-        // against the same snapshot.
-        for (CommandRequest& cmd : queued) {
-          cmd.cluster_admitted_state_ = exec_admitted_state;
+        if (candidate->state() == nullptr) {
+          // CaptureAndAdmit cannot serve a keyed write without a state. Keep
+          // this defensive branch fail closed if that invariant regresses.
+          co_await DropWatches(ctx);
+          CommandReply reply;
+          reply.close_connection_ = true;
+          co_return reply;
         }
-        RegisterClusterInFlight(*exec_admitted_state, exec_cluster_slots,
-                                &exec_in_flights);
-        if (cache.publication_sequence() == publication_before) break;
-        exec_in_flights.clear();
+        if (runtime->authority_guard_.RegisterAndRecheck(
+                *candidate, celer::ThisWorker().id_,
+                std::chrono::steady_clock::now(),
+                &exec_in_flights) != cluster::RecheckResult::kOk) {
+          continue;
+        }
+        exec_admission = std::move(candidate);
+        // Align every queued command with the EXEC-time proof so per-command
+        // re-checks (notably Lua redis.call) retain the same lease and anchor.
+        for (CommandRequest& cmd : queued) {
+          cmd.cluster_authority_admission_ = exec_admission;
+        }
+        break;
       }
     }
   }
@@ -9586,15 +9703,13 @@ Task<CommandReply> ExecuteExecBody(
             auto guard = co_await tx::CurrentTxShard().AcquireKeys(
                 std::span<const tx::KeyRef>(refs));
             if (replication != nullptr) replication->EnterCurrentShard();
-            if (exec_admitted_state != nullptr) {
+            if (exec_admission != nullptr) {
               // Choke point 2 for the single-shard fast path (which never
-              // builds a tx::Transaction): re-check the EXEC's authority after
-              // the key guard and before the first mutation.
-              const std::shared_ptr<const cluster::ServingState> current =
-                  cluster::GetClusterRuntime()->topology_cache_.Current();
-              if (!cluster::AuthorityUnchanged(*exec_admitted_state,
-                                               current.get(),
-                                               exec_cluster_slots)) {
+              // builds a tx::Transaction): re-check the complete EXEC proof
+              // after the key guard and before the first mutation.
+              if (cluster::GetClusterRuntime()->authority_guard_.Recheck(
+                      *exec_admission, std::chrono::steady_clock::now()) !=
+                  cluster::RecheckResult::kOk) {
                 co_return ClusterAuthorityChangedStatus();
               }
             }
@@ -9713,9 +9828,8 @@ Task<CommandReply> ExecuteExecBody(
       }
       txn.Seal();
       ClusterShardValidatorContext cluster_validator;
-      if (exec_admitted_state != nullptr) {
-        cluster_validator.admitted_ = exec_admitted_state;
-        cluster_validator.slots_ = exec_cluster_slots;
+      if (exec_admission != nullptr) {
+        cluster_validator.admission_ = exec_admission;
         txn.SetShardValidator(&ValidateClusterShardAuthority,
                               &cluster_validator);
       }
@@ -11300,8 +11414,6 @@ CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
                                           bool connection_tls,
                                           ReplyBuilder& reply_builder) {
   CommandReply reply;
-  const std::shared_ptr<const cluster::ServingState> current =
-      cluster::GetClusterRuntime()->topology_cache_.Current();
   const cluster::RequestView view{
       .slots_ = slots,
       .is_write_ = true,
@@ -11310,8 +11422,15 @@ CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
       // snapshot that lost readiness maps to LOADING instead of serving.
       .loading_allowed_ = false,
   };
-  const cluster::Decision decision = cluster::Admit(current.get(), view);
-  if (!EmitClusterDecision(decision, connection_tls, reply_builder, &reply)) {
+  cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
+  const cluster::AuthorityAdmission fresh =
+      runtime->authority_guard_.CaptureAndAdmit(
+          view, std::chrono::steady_clock::now());
+  if (!EmitClusterDecision(fresh.decision(), connection_tls, reply_builder,
+                           &reply)) {
+    // Authority became serveable again after the failed proof. We cannot
+    // infer whether an earlier irreversible step ran, so never manufacture a
+    // success or redirect from that race.
     reply.close_connection_ = true;
   }
   return reply;
@@ -11319,11 +11438,10 @@ CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
 
 absl::Status ValidateClusterShardAuthority(void* opaque, unsigned /*shard*/) {
   auto* context = static_cast<ClusterShardValidatorContext*>(opaque);
-  const std::shared_ptr<const cluster::ServingState> current =
-      cluster::GetClusterRuntime()->topology_cache_.Current();
-  if (context->admitted_ != nullptr &&
-      cluster::AuthorityUnchanged(*context->admitted_, current.get(),
-                                  context->slots_)) {
+  if (context->admission_ != nullptr &&
+      cluster::GetClusterRuntime()->authority_guard_.Recheck(
+          *context->admission_, std::chrono::steady_clock::now()) ==
+          cluster::RecheckResult::kOk) {
     return absl::OkStatus();
   }
   context->tripped_.store(true, std::memory_order_relaxed);
@@ -11334,25 +11452,23 @@ void InstallClusterShardValidator(tx::Transaction& transaction,
                                   const CommandRequest& request,
                                   ClusterShardValidatorContext& context) {
   if (!cluster::ClusterEnabled() || request.replication_origin_ ||
-      request.cluster_admitted_state_ == nullptr ||
+      request.cluster_authority_admission_ == nullptr ||
       request.ClusterSlots().empty()) {
     return;
   }
-  context.admitted_ = request.cluster_admitted_state_;
-  context.slots_ = request.ClusterSlots();
+  context.admission_ = request.cluster_authority_admission_;
   transaction.SetShardValidator(&ValidateClusterShardAuthority, &context);
 }
 
 absl::Status RecheckClusterRequestAuthority(const CommandRequest& request) {
   if (!cluster::ClusterEnabled() || request.replication_origin_ ||
-      request.cluster_admitted_state_ == nullptr ||
+      request.cluster_authority_admission_ == nullptr ||
       request.ClusterSlots().empty()) {
     return absl::OkStatus();
   }
-  const std::shared_ptr<const cluster::ServingState> current =
-      cluster::GetClusterRuntime()->topology_cache_.Current();
-  if (cluster::AuthorityUnchanged(*request.cluster_admitted_state_,
-                                  current.get(), request.ClusterSlots())) {
+  if (cluster::GetClusterRuntime()->authority_guard_.Recheck(
+          *request.cluster_authority_admission_,
+          std::chrono::steady_clock::now()) == cluster::RecheckResult::kOk) {
     return absl::OkStatus();
   }
   return ClusterAuthorityChangedStatus();
@@ -11367,8 +11483,10 @@ CommandReply ClusterValidatorFailureReply(
     reply.close_connection_ = true;
     return reply;
   }
-  return ClusterAuthorityChangedReply(context.slots_, connection_tls,
-                                      reply_builder);
+  const std::span<const std::uint16_t> slots =
+      context.admission_ == nullptr ? std::span<const std::uint16_t>{}
+                                    : context.admission_->slots();
+  return ClusterAuthorityChangedReply(slots, connection_tls, reply_builder);
 }
 
 const char* CommandServingGenerationError(
@@ -11421,11 +11539,27 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
             : "BUSY Redis is busy running a script. You can only call SCRIPT "
               "KILL or SHUTDOWN NOSAVE."));
   }
+  if (cluster::ClusterEnabled()) {
+    const std::string_view unscoped_mutation =
+        UnscopedClusterMutation(request);
+    cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
+    if (!unscoped_mutation.empty() &&
+        runtime->authority_guard_.lease_mode() ==
+            cluster::AuthorityGuard::LeaseMode::kFinite) {
+      // Meta authority is deliberately finite per group and can never prove a
+      // process-wide durable mutation. Reject that permanent policy before
+      // the transient population LOADING gate so an unassigned/fenced node
+      // cannot make the command appear potentially valid after recovery.
+      if (ctx.in_multi_) ctx.multi_dirty_ = true;
+      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+          "ERR ", unscoped_mutation, " is not allowed in cluster mode")));
+    }
+  }
   if (g_replication != nullptr && g_replication->is_loading()) [[unlikely]] {
     // The whitelist is shared verbatim with the cluster gate. In cluster mode
     // this is the target-side population fence; ClusterGateReject below still
     // performs the independent topology/authority admission.
-    if (!LoadingAllowedCommandKind(kind)) {
+    if (!LoadingAllowedCommand(request)) {
       co_return BuiltReply(reply_builder.AppendError(
           "LOADING Keylane is loading the dataset from the primary"));
     }
@@ -11545,6 +11679,15 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
     request.blocking_wake_cascade_ = nullptr;
     ctx.queued_.push_back(std::move(request));
     co_return BuiltReply(reply_builder.AppendSimpleString("QUEUED"));
+  }
+
+  // These are the observation/cancellation controls for an active function.
+  // They must not wait behind the DB, snapshot, publisher, or cross-flow order
+  // gates held by that same function, or FUNCTION KILL can never reach the
+  // run-control flag needed to release those gates. Keep MULTI queue semantics
+  // above, and retain the busy/loading/cluster policy checks already applied.
+  if (function_kill || function_stats) {
+    co_return co_await ExecuteFunction(request, reply_builder);
   }
 
   switch (kind) {
@@ -11810,7 +11953,7 @@ Task<CommandReply> ExecuteCommandBody(
   // above. Nothing has executed yet, so a changed authority is safely answered
   // with a fresh redirect. Transaction-based writes re-check per shard via the
   // tx validator hook (choke point 2).
-  absl::InlinedVector<cluster::InFlightGuard, 4> cluster_in_flights;
+  cluster::AuthorityInFlightGuards cluster_in_flights;
   if (std::optional<CommandReply> fenced = RecheckClusterWriteAuthority(
           request, reply_builder, &cluster_in_flights);
       fenced.has_value()) {

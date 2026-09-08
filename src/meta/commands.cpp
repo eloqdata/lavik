@@ -1,5 +1,6 @@
 #include "keylane/meta/commands.h"
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -276,6 +277,10 @@ absl::StatusOr<CreateGroup> ReadCreateGroupBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const AssignNodeToGroup& cmd) {
+  if (std::all_of(cmd.assignment_id_.begin(), cmd.assignment_id_.end(),
+                  [](std::uint8_t byte) { return byte == 0; })) {
+    return MetaDomainRejectError("assignment_id must not be zero");
+  }
   if (auto st = WriteCommandHeader(w, MetaCommandTag::kAssignNodeToGroup,
                                    cmd.request_id_, cmd.actor_);
       !st.ok()) {
@@ -283,6 +288,7 @@ absl::Status WriteCommandBody(MetaWriter& w, const AssignNodeToGroup& cmd) {
   }
   if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
   if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
+  WriteFixedArray(w, cmd.assignment_id_);
   if (auto st = WriteRole(w, cmd.role_); !st.ok()) return st;
   w.WriteU64(cmd.expected_revision_);
   w.WriteU64(cmd.new_topology_epoch_);
@@ -296,6 +302,8 @@ absl::StatusOr<AssignNodeToGroup> ReadAssignNodeToGroupBody(MetaReader& r) {
   if (!group_id.ok()) return group_id.status();
   auto node_id = ReadNodeId(r);
   if (!node_id.ok()) return node_id.status();
+  auto assignment_id = ReadFixedArray<16>(r);
+  if (!assignment_id.ok()) return assignment_id.status();
   auto role = ReadRole(r);
   if (!role.ok()) return role.status();
   auto expected_revision = r.ReadU64();
@@ -307,6 +315,7 @@ absl::StatusOr<AssignNodeToGroup> ReadAssignNodeToGroupBody(MetaReader& r) {
   cmd.actor_ = std::move(header->actor_);
   cmd.group_id_ = std::move(*group_id);
   cmd.node_id_ = std::move(*node_id);
+  cmd.assignment_id_ = *assignment_id;
   cmd.role_ = *role;
   cmd.expected_revision_ = *expected_revision;
   cmd.new_topology_epoch_ = *topology_epoch;
@@ -451,8 +460,10 @@ absl::Status WriteCommandBody(MetaWriter& w,
     return st;
   }
   if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
-  w.WriteU64(cmd.expected_population_manifest_id_);
-  w.WriteU64(cmd.new_population_manifest_id_);
+  w.WriteU64(cmd.expected_population_manifest_revision_);
+  WriteFixedArray(w, cmd.expected_population_manifest_digest_);
+  w.WriteU64(cmd.new_population_manifest_revision_);
+  WriteFixedArray(w, cmd.new_population_manifest_digest_);
   w.WriteU64(cmd.expected_partition_replication_epoch_);
   w.WriteU64(cmd.new_partition_replication_epoch_);
   w.WriteU64(cmd.new_topology_epoch_);
@@ -467,8 +478,12 @@ absl::StatusOr<SetGroupReplicationState> ReadSetGroupReplicationStateBody(
   if (!group_id.ok()) return group_id.status();
   auto expected_manifest = r.ReadU64();
   if (!expected_manifest.ok()) return expected_manifest.status();
+  auto expected_manifest_digest = ReadFixedArray<32>(r);
+  if (!expected_manifest_digest.ok()) return expected_manifest_digest.status();
   auto new_manifest = r.ReadU64();
   if (!new_manifest.ok()) return new_manifest.status();
+  auto new_manifest_digest = ReadFixedArray<32>(r);
+  if (!new_manifest_digest.ok()) return new_manifest_digest.status();
   auto expected_partition = r.ReadU64();
   if (!expected_partition.ok()) return expected_partition.status();
   auto new_partition = r.ReadU64();
@@ -479,8 +494,10 @@ absl::StatusOr<SetGroupReplicationState> ReadSetGroupReplicationStateBody(
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.group_id_ = std::move(*group_id);
-  cmd.expected_population_manifest_id_ = *expected_manifest;
-  cmd.new_population_manifest_id_ = *new_manifest;
+  cmd.expected_population_manifest_revision_ = *expected_manifest;
+  cmd.expected_population_manifest_digest_ = *expected_manifest_digest;
+  cmd.new_population_manifest_revision_ = *new_manifest;
+  cmd.new_population_manifest_digest_ = *new_manifest_digest;
   cmd.expected_partition_replication_epoch_ = *expected_partition;
   cmd.new_partition_replication_epoch_ = *new_partition;
   cmd.new_topology_epoch_ = *topology_epoch;
@@ -753,6 +770,14 @@ absl::Status WriteEvidenceSummary(MetaWriter& w,
       !st.ok()) {
     return st;
   }
+  if (ev.group_id_.empty()) {
+    return MetaDomainRejectError("evidence group_id is empty");
+  }
+  if (auto st = CheckCap("evidence group_id", ev.group_id_.size(),
+                         kMaxMetaGroupIdBytes);
+      !st.ok()) {
+    return st;
+  }
   WriteMetaEvidenceSummary(w, ev);
   return absl::OkStatus();
 }
@@ -798,7 +823,7 @@ absl::Status WriteCommandBody(MetaWriter& w, const SubmitOperation& cmd) {
   w.WriteString(cmd.kind_);
   w.WriteString(cmd.intent_);
   WriteFixedArray(w, cmd.intent_hash_);
-  w.WriteU64(cmd.replication_history_id_);
+  WriteFixedArray(w, cmd.replication_history_id_);
   w.WriteList(cmd.policy_references_,
               [](MetaWriter& ww, const MetaPolicyReference& reference) {
                 (void)WritePolicyReference(ww, reference);
@@ -817,7 +842,7 @@ absl::StatusOr<SubmitOperation> ReadSubmitOperationBody(MetaReader& r) {
   if (!intent.ok()) return intent.status();
   auto intent_hash = ReadFixedArray<32>(r);
   if (!intent_hash.ok()) return intent_hash.status();
-  auto replication_history = r.ReadU64();
+  auto replication_history = ReadFixedArray<kMetaReplicationHistoryIdBytes>(r);
   if (!replication_history.ok()) return replication_history.status();
   auto policy_references = r.ReadList<MetaPolicyReference>(
       kMaxMetaPolicyReferencesPerOperation,
@@ -847,9 +872,38 @@ absl::Status WriteCommandBody(MetaWriter& w,
       !st.ok()) {
     return st;
   }
+  if (auto st = CheckCap("current_directives", cmd.current_directives_.size(),
+                         kMaxMetaDirectivesPerOperation);
+      !st.ok()) {
+    return st;
+  }
+  for (const MetaDirectiveSpec& directive : cmd.current_directives_) {
+    if (directive.recipient_node_id_.empty() ||
+        directive.recipient_node_id_.size() > kMetaNodeIdBytes ||
+        directive.target_node_id_.empty() ||
+        directive.target_node_id_.size() > kMetaNodeIdBytes ||
+        directive.source_node_id_.empty() ||
+        directive.source_node_id_.size() > kMetaNodeIdBytes ||
+        directive.group_id_.empty() ||
+        directive.group_id_.size() > kMaxMetaGroupIdBytes ||
+        directive.kind_.empty() ||
+        directive.kind_.size() > kMaxMetaDirectiveKindBytes ||
+        directive.payload_.size() > kMaxMetaPayloadBytes ||
+        directive.preconditions_.size() > kMaxMetaDirectivePreconditionsBytes) {
+      return MetaDomainRejectError("invalid directive field size");
+    }
+  }
   for (const MetaEvidenceSummary& ev : cmd.evidence_) {
     if (auto st =
             CheckCap("evidence node_id", ev.node_id_.size(), kMetaNodeIdBytes);
+        !st.ok()) {
+      return st;
+    }
+    if (ev.group_id_.empty()) {
+      return MetaDomainRejectError("evidence group_id is empty");
+    }
+    if (auto st = CheckCap("evidence group_id", ev.group_id_.size(),
+                           kMaxMetaGroupIdBytes);
         !st.ok()) {
       return st;
     }
@@ -862,6 +916,7 @@ absl::Status WriteCommandBody(MetaWriter& w,
   WriteFixedArray(w, cmd.operation_id_);
   w.WriteU64(cmd.expected_revision_);
   w.WriteString(cmd.kind_phase_blob_);
+  w.WriteList(cmd.current_directives_, WriteMetaDirectiveSpec);
   w.WriteList(cmd.evidence_, [](MetaWriter& ww, const MetaEvidenceSummary& ev) {
     // Element bounds were validated above, so this cannot fail.
     (void)WriteEvidenceSummary(ww, ev);
@@ -879,6 +934,10 @@ absl::StatusOr<TransitionOperationPhase> ReadTransitionOperationPhaseBody(
   if (!expected_revision.ok()) return expected_revision.status();
   auto blob = ReadBoundedString(r, kMaxMetaPayloadBytes);
   if (!blob.ok()) return blob.status();
+  auto directives = r.ReadList<MetaDirectiveSpec>(
+      kMaxMetaDirectivesPerOperation,
+      [](MetaReader& reader) { return ReadMetaDirectiveSpec(reader); });
+  if (!directives.ok()) return directives.status();
   auto evidence = r.ReadList<MetaEvidenceSummary>(
       kMaxMetaEvidenceSummariesPerCommand,
       [](MetaReader& rr) { return ReadMetaEvidenceSummary(rr); });
@@ -889,7 +948,106 @@ absl::StatusOr<TransitionOperationPhase> ReadTransitionOperationPhaseBody(
   cmd.operation_id_ = *operation_id;
   cmd.expected_revision_ = *expected_revision;
   cmd.kind_phase_blob_ = std::move(*blob);
+  cmd.current_directives_ = std::move(*directives);
   cmd.evidence_ = std::move(*evidence);
+  return cmd;
+}
+
+void WriteTerminalReceiptKey(MetaWriter& w, const MetaTerminalReceiptKey& key) {
+  WriteFixedArray(w, key.operation_id_);
+  WriteFixedArray(w, key.directive_id_);
+  WriteFixedArray(w, key.attempt_id_);
+  w.WriteU64(key.directive_revision_);
+}
+
+absl::StatusOr<MetaTerminalReceiptKey> ReadTerminalReceiptKey(MetaReader& r) {
+  auto operation_id = ReadFixedArray<16>(r);
+  if (!operation_id.ok()) return operation_id.status();
+  auto directive_id = ReadFixedArray<16>(r);
+  if (!directive_id.ok()) return directive_id.status();
+  auto attempt_id = ReadFixedArray<16>(r);
+  if (!attempt_id.ok()) return attempt_id.status();
+  auto directive_revision = r.ReadU64();
+  if (!directive_revision.ok()) return directive_revision.status();
+  return MetaTerminalReceiptKey{*operation_id, *directive_id, *attempt_id,
+                                *directive_revision};
+}
+
+absl::Status WriteCommandBody(MetaWriter& w, const CommitDirectiveResult& cmd) {
+  const auto status = static_cast<std::uint8_t>(cmd.status_);
+  if (status <
+          static_cast<std::uint8_t>(MetaDirectiveResultStatus::kSucceeded) ||
+      status >
+          static_cast<std::uint8_t>(MetaDirectiveResultStatus::kRejected)) {
+    return MetaDomainRejectError("unknown directive result status");
+  }
+  if (cmd.recipient_node_id_.empty() ||
+      cmd.recipient_node_id_.size() > kMetaNodeIdBytes ||
+      cmd.result_.size() > kMaxMetaPayloadBytes) {
+    return MetaDomainRejectError("invalid directive result field size");
+  }
+  if (auto st = WriteCommandHeader(w, MetaCommandTag::kCommitDirectiveResult,
+                                   cmd.request_id_, cmd.actor_);
+      !st.ok()) {
+    return st;
+  }
+  WriteFixedArray(w, cmd.operation_id_);
+  WriteFixedArray(w, cmd.directive_id_);
+  WriteFixedArray(w, cmd.attempt_id_);
+  w.WriteU64(cmd.directive_revision_);
+  w.WriteString(cmd.recipient_node_id_);
+  WriteFixedArray(w, cmd.recipient_boot_id_);
+  WriteFixedArray(w, cmd.assignment_id_);
+  w.WriteU8(status);
+  WriteFixedArray(w, cmd.result_hash_);
+  w.WriteString(cmd.result_);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<CommitDirectiveResult> ReadCommitDirectiveResultBody(
+    MetaReader& r) {
+  auto header = ReadCommandHeader(r);
+  if (!header.ok()) return header.status();
+  auto operation_id = ReadFixedArray<16>(r);
+  if (!operation_id.ok()) return operation_id.status();
+  auto directive_id = ReadFixedArray<16>(r);
+  if (!directive_id.ok()) return directive_id.status();
+  auto attempt_id = ReadFixedArray<16>(r);
+  if (!attempt_id.ok()) return attempt_id.status();
+  auto directive_revision = r.ReadU64();
+  if (!directive_revision.ok()) return directive_revision.status();
+  auto recipient_node = ReadBoundedString(r, kMetaNodeIdBytes);
+  if (!recipient_node.ok()) return recipient_node.status();
+  auto recipient_boot = ReadFixedArray<kMetaBootIncarnationBytes>(r);
+  if (!recipient_boot.ok()) return recipient_boot.status();
+  auto assignment_id = ReadFixedArray<16>(r);
+  if (!assignment_id.ok()) return assignment_id.status();
+  auto status = r.ReadU8();
+  if (!status.ok()) return status.status();
+  if (*status <
+          static_cast<std::uint8_t>(MetaDirectiveResultStatus::kSucceeded) ||
+      *status >
+          static_cast<std::uint8_t>(MetaDirectiveResultStatus::kRejected)) {
+    return MetaFailStopError("unknown directive result status");
+  }
+  auto result_hash = ReadFixedArray<32>(r);
+  if (!result_hash.ok()) return result_hash.status();
+  auto result = ReadBoundedString(r, kMaxMetaPayloadBytes);
+  if (!result.ok()) return result.status();
+
+  CommitDirectiveResult cmd;
+  cmd.request_id_ = header->request_id_;
+  cmd.actor_ = std::move(header->actor_);
+  cmd.operation_id_ = *operation_id;
+  cmd.directive_id_ = *directive_id;
+  cmd.attempt_id_ = *attempt_id;
+  cmd.directive_revision_ = *directive_revision;
+  cmd.recipient_node_id_ = std::move(*recipient_node);
+  cmd.recipient_boot_id_ = *recipient_boot;
+  cmd.assignment_id_ = *assignment_id;
+  cmd.status_ = static_cast<MetaDirectiveResultStatus>(*status);
+  cmd.result_hash_ = *result_hash;
+  cmd.result_ = std::move(*result);
   return cmd;
 }
 
@@ -1087,11 +1245,46 @@ absl::StatusOr<PruneOperationArchive> ReadPruneOperationArchiveBody(
   return cmd;
 }
 
+absl::Status WriteCommandBody(MetaWriter& w, const PruneTerminalReceipts& cmd) {
+  if (auto st = CheckCap("terminal receipts", cmd.receipts_.size(),
+                         kMaxMetaTerminalReceiptPrunesPerCommand);
+      !st.ok()) {
+    return st;
+  }
+  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPruneTerminalReceipts,
+                                   cmd.request_id_, cmd.actor_);
+      !st.ok()) {
+    return st;
+  }
+  w.WriteList(cmd.receipts_, WriteTerminalReceiptKey);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<PruneTerminalReceipts> ReadPruneTerminalReceiptsBody(
+    MetaReader& r) {
+  auto header = ReadCommandHeader(r);
+  if (!header.ok()) return header.status();
+  auto receipts = r.ReadList<MetaTerminalReceiptKey>(
+      kMaxMetaTerminalReceiptPrunesPerCommand,
+      [](MetaReader& reader) { return ReadTerminalReceiptKey(reader); });
+  if (!receipts.ok()) return receipts.status();
+  PruneTerminalReceipts cmd;
+  cmd.request_id_ = header->request_id_;
+  cmd.actor_ = std::move(header->actor_);
+  cmd.receipts_ = std::move(*receipts);
+  return cmd;
+}
+
 absl::Status WriteCommandBody(MetaWriter& w, const BindMetaMember& cmd) {
   if (auto st =
           CheckCap("principal", cmd.principal_.size(), kMaxMetaPrincipalBytes);
       !st.ok()) {
     return st;
+  }
+  if (cmd.data_control_endpoint_.empty() ||
+      cmd.data_control_endpoint_.size() > kMaxMetaEndpointBytes) {
+    return MetaDomainRejectError(
+        "data_control_endpoint is empty or exceeds its cap");
   }
   if (auto st = WriteCommandHeader(w, MetaCommandTag::kBindMetaMember,
                                    cmd.request_id_, cmd.actor_);
@@ -1100,6 +1293,7 @@ absl::Status WriteCommandBody(MetaWriter& w, const BindMetaMember& cmd) {
   }
   w.WriteU32(cmd.server_id_);
   w.WriteString(cmd.principal_);
+  w.WriteString(cmd.data_control_endpoint_);
   return absl::OkStatus();
 }
 
@@ -1110,11 +1304,14 @@ absl::StatusOr<BindMetaMember> ReadBindMetaMemberBody(MetaReader& r) {
   if (!server_id.ok()) return server_id.status();
   auto principal = ReadBoundedString(r, kMaxMetaPrincipalBytes);
   if (!principal.ok()) return principal.status();
+  auto data_control_endpoint = ReadBoundedString(r, kMaxMetaEndpointBytes);
+  if (!data_control_endpoint.ok()) return data_control_endpoint.status();
   BindMetaMember cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.server_id_ = *server_id;
   cmd.principal_ = std::move(*principal);
+  cmd.data_control_endpoint_ = std::move(*data_control_endpoint);
   return cmd;
 }
 
@@ -1137,6 +1334,72 @@ absl::StatusOr<RetireMetaMember> ReadRetireMetaMemberBody(MetaReader& r) {
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.server_id_ = *server_id;
+  return cmd;
+}
+
+absl::Status WriteCommandBody(MetaWriter& w, const PutPopulationManifest& cmd) {
+  if (cmd.entries_.size() > kMetaSlotCount) {
+    return MetaDomainRejectError("population manifest entry cap exceeded");
+  }
+  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPutPopulationManifest,
+                                   cmd.request_id_, cmd.actor_);
+      !st.ok()) {
+    return st;
+  }
+  WriteFixedArray(w, cmd.manifest_digest_);
+  w.WriteList(cmd.entries_,
+              [](MetaWriter& writer, const MetaPopulationManifestEntry& entry) {
+                writer.WriteU32(entry.partition_id_);
+                writer.WriteU64(entry.logical_epoch_);
+              });
+  return absl::OkStatus();
+}
+
+absl::StatusOr<PutPopulationManifest> ReadPutPopulationManifestBody(
+    MetaReader& r) {
+  auto header = ReadCommandHeader(r);
+  if (!header.ok()) return header.status();
+  auto digest = ReadFixedArray<32>(r);
+  if (!digest.ok()) return digest.status();
+  auto entries = r.ReadList<MetaPopulationManifestEntry>(
+      kMetaSlotCount,
+      [](MetaReader& reader) -> absl::StatusOr<MetaPopulationManifestEntry> {
+        auto partition_id = reader.ReadU32();
+        if (!partition_id.ok()) return partition_id.status();
+        auto logical_epoch = reader.ReadU64();
+        if (!logical_epoch.ok()) return logical_epoch.status();
+        return MetaPopulationManifestEntry{*partition_id, *logical_epoch};
+      });
+  if (!entries.ok()) return entries.status();
+  PutPopulationManifest cmd;
+  cmd.request_id_ = header->request_id_;
+  cmd.actor_ = std::move(header->actor_);
+  cmd.manifest_digest_ = *digest;
+  cmd.entries_ = std::move(*entries);
+  return cmd;
+}
+
+absl::Status WriteCommandBody(MetaWriter& w,
+                              const PrunePopulationManifest& cmd) {
+  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPrunePopulationManifest,
+                                   cmd.request_id_, cmd.actor_);
+      !st.ok()) {
+    return st;
+  }
+  WriteFixedArray(w, cmd.manifest_digest_);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<PrunePopulationManifest> ReadPrunePopulationManifestBody(
+    MetaReader& r) {
+  auto header = ReadCommandHeader(r);
+  if (!header.ok()) return header.status();
+  auto digest = ReadFixedArray<32>(r);
+  if (!digest.ok()) return digest.status();
+  PrunePopulationManifest cmd;
+  cmd.request_id_ = header->request_id_;
+  cmd.actor_ = std::move(header->actor_);
+  cmd.manifest_digest_ = *digest;
   return cmd;
 }
 
@@ -1322,6 +1585,30 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
       command = std::move(*body);
       break;
     }
+    case MetaCommandTag::kPutPopulationManifest: {
+      auto body = ReadPutPopulationManifestBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kPrunePopulationManifest: {
+      auto body = ReadPrunePopulationManifestBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kCommitDirectiveResult: {
+      auto body = ReadCommitDirectiveResultBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kPruneTerminalReceipts: {
+      auto body = ReadPruneTerminalReceiptsBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
     default:
       return MetaFailStopError("unknown command tag");
   }
@@ -1335,12 +1622,20 @@ absl::StatusOr<std::string> EncodeMetaGroupRecord(
       !st.ok()) {
     return st;
   }
+  const bool zero_digest =
+      std::all_of(record.population_manifest_digest_.begin(),
+                  record.population_manifest_digest_.end(),
+                  [](std::uint8_t byte) { return byte == 0; });
+  if ((record.population_manifest_revision_ == 0) != zero_digest) {
+    return MetaDomainRejectError("manifest revision/digest invariant violated");
+  }
   MetaWriter w;
   w.WriteU16(kMetaFormatVersion);
   w.WriteString(record.owner_);
   w.WriteU64(record.group_term_);
   w.WriteU64(record.authority_version_);
-  w.WriteU64(record.population_manifest_id_);
+  w.WriteU64(record.population_manifest_revision_);
+  WriteFixedArray(w, record.population_manifest_digest_);
   w.WriteU64(record.partition_replication_epoch_);
   return w.TakeBuffer();
 }
@@ -1362,9 +1657,22 @@ absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes) {
   auto authority_version = r.ReadU64();
   if (!authority_version.ok()) return authority_version.status();
   record.authority_version_ = *authority_version;
-  auto population_manifest_id = r.ReadU64();
-  if (!population_manifest_id.ok()) return population_manifest_id.status();
-  record.population_manifest_id_ = *population_manifest_id;
+  auto population_manifest_revision = r.ReadU64();
+  if (!population_manifest_revision.ok()) {
+    return population_manifest_revision.status();
+  }
+  record.population_manifest_revision_ = *population_manifest_revision;
+  auto population_manifest_digest = ReadFixedArray<32>(r);
+  if (!population_manifest_digest.ok())
+    return population_manifest_digest.status();
+  record.population_manifest_digest_ = *population_manifest_digest;
+  const bool zero_digest =
+      std::all_of(record.population_manifest_digest_.begin(),
+                  record.population_manifest_digest_.end(),
+                  [](std::uint8_t byte) { return byte == 0; });
+  if ((record.population_manifest_revision_ == 0) != zero_digest) {
+    return MetaFailStopError("manifest revision/digest invariant violated");
+  }
   auto partition_replication_epoch = r.ReadU64();
   if (!partition_replication_epoch.ok()) {
     return partition_replication_epoch.status();

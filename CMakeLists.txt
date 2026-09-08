@@ -308,9 +308,48 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   endforeach()
 endif()
 
+add_library(keylane_control_protocol STATIC
+  src/cluster/control_protocol.cpp
+)
+add_library(keylane::control_protocol ALIAS keylane_control_protocol)
+target_include_directories(keylane_control_protocol PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_compile_features(keylane_control_protocol PUBLIC cxx_std_23)
+target_link_libraries(keylane_control_protocol PUBLIC
+  absl::status
+  absl::statusor
+)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(keylane_control_protocol PRIVATE
+    -Wall -Wextra -Wpedantic)
+endif()
+
+add_library(keylane_control_transport STATIC
+  src/cluster/control_transport.cpp
+)
+add_library(keylane::control_transport ALIAS keylane_control_transport)
+target_include_directories(keylane_control_transport PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_compile_features(keylane_control_transport PUBLIC cxx_std_23)
+target_link_libraries(keylane_control_transport PUBLIC
+  keylane::control_protocol
+  celer::core
+  absl::status
+  absl::statusor
+)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(keylane_control_transport PRIVATE
+    -Wall -Wextra -Wpedantic)
+endif()
+
 add_library(keylane_module
   src/cluster/authority.cpp
   src/cluster/control_port.cpp
+  src/cluster/meta_client.cpp
+  src/cluster/meta_control.cpp
+  src/cluster/node_control.cpp
   src/cluster/runtime.cpp
   src/cluster/topology.cpp
   src/config.cpp
@@ -416,6 +455,8 @@ target_compile_definitions(keylane_module PUBLIC
   KEYLANE_ENABLE_TEST_FAULTS=$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>
 )
 target_link_libraries(keylane_module PUBLIC
+  keylane::control_transport
+  keylane::control_protocol
   celer::core
   celer::rpc
   absl::crc32c
@@ -471,6 +512,8 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         absl_crc32c
         celer
         celer_rpc
+        keylane_control_protocol
+        keylane_control_transport
         keylane_module
         keylane)
     if (TARGET keylane_fault_server)
@@ -514,8 +557,10 @@ if (KEYLANE_BUILD_META)
   set(KEYLANE_META_CORE_SOURCES
     src/meta/audit_store.cpp
     src/meta/commands.cpp
+    src/meta/control_projector.cpp
     src/meta/coordinator.cpp
     src/meta/ctl_server.cpp
+    src/meta/data_control_server.cpp
     src/meta/encoding.cpp
     src/meta/grant_store.cpp
     src/meta/identity_verifier.cpp
@@ -523,6 +568,7 @@ if (KEYLANE_BUILD_META)
     src/meta/observation_store.cpp
     src/meta/operation_store.cpp
     src/meta/policy_store.cpp
+    src/meta/population_manifest_store.cpp
     src/meta/proposal_executor.cpp
     src/meta/state_apply.cpp
     src/meta/state_machine.cpp
@@ -537,6 +583,8 @@ if (KEYLANE_BUILD_META)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(keylane_meta_core PUBLIC
+    keylane::control_transport
+    keylane::control_protocol
     NuRaft::static_lib
     celer::core
   )
@@ -568,6 +616,7 @@ if (KEYLANE_BUILD_META)
   )
   target_include_directories(keylane-meta-ctl PRIVATE
     ${KEYLANE_GENERATED_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(keylane-meta-ctl PRIVATE
     OpenSSL::SSL
@@ -694,10 +743,13 @@ if (BUILD_TESTING)
   )
 
   if (KEYLANE_BUILD_META)
-    # Meta-plane tests. Links keylane_meta_core (NuRaft); the data-plane
-    # unit test binary stays Raft-free, so meta tests get their own binary.
+    # Meta-plane tests. Links keylane_meta_core (NuRaft); the data-plane unit
+    # test binary stays Raft-free, while this binary also links the data module
+    # for explicit Meta-projection-to-Data-validation contract tests.
     add_executable(keylane_meta_tests
       tests/meta_coordinator_test.cpp
+      tests/meta_control_projector_test.cpp
+      tests/meta_data_control_server_test.cpp
       tests/meta_journal_test.cpp
       tests/meta_model_test.cpp
       tests/meta_observation_test.cpp
@@ -708,6 +760,7 @@ if (BUILD_TESTING)
     )
     target_link_libraries(keylane_meta_tests PRIVATE
       keylane_meta_core
+      keylane_module
       GTest::gtest_main
     )
     target_compile_definitions(keylane_meta_tests PRIVATE
@@ -780,6 +833,21 @@ if (BUILD_TESTING)
           RUN_SERIAL TRUE
         )
       endforeach()
+
+      # Real-process Meta <-> Data control gate.  It needs both executables,
+      # unlike the Meta-only fault gates above.
+      add_test(
+        NAME meta_integration.gate_data_control
+        COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_data_control.py
+                $<TARGET_FILE:keylane-meta>
+                $<TARGET_FILE:keylane>
+      )
+      set_tests_properties(meta_integration.gate_data_control PROPERTIES
+        LABELS meta-integration
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+      )
     else()
       message(STATUS "python3 not found; meta integration tests are disabled")
     endif()
@@ -963,6 +1031,8 @@ if (BUILD_TESTING)
     tests/cluster_control_port_test.cpp
     tests/cluster_topology_test.cpp
     tests/config_test.cpp
+    tests/control_protocol_test.cpp
+    tests/control_transport_test.cpp
     tests/cross_core_active_sender_test.cpp
     tests/cross_worker_mutex_test.cpp
     tests/device_affinity_test.cpp
@@ -980,6 +1050,9 @@ if (BUILD_TESTING)
     tests/logging_test.cpp
     tests/lua_eval_test.cpp
     tests/memory_test.cpp
+    tests/meta_control_test.cpp
+    tests/meta_client_test.cpp
+    tests/node_control_test.cpp
     tests/resp_test.cpp
     tests/scan_hash_map_test.cpp
     tests/source_authorization_test.cpp
@@ -1180,6 +1253,9 @@ if (BUILD_TESTING)
 
     add_executable(keylane_ttl_e2e_test
       tests/ttl_e2e_test.cpp
+    )
+    target_link_libraries(keylane_ttl_e2e_test
+      PRIVATE keylane::module
     )
     add_test(
       NAME keylane_ttl_e2e
