@@ -146,6 +146,16 @@ Commands needing atomic access to several keys build a `tx::Transaction` and
 execute one or more shard callbacks. Global commands explicitly collect from or
 coordinate all workers.
 
+`KEYLANE.HREPLACE key field value [field value ...]` is a Keylane-only RESP
+extension: it atomically replaces the entire field set of an existing Hash,
+preserves the absolute key expiry, and returns `OK`. Missing/expired keys return
+RESP null without a write; another live type returns `WRONGTYPE`. At least one
+field/value pair is required, duplicate fields use the last supplied value,
+and field/value limits match HSET. It participates in ordinary key routing,
+memory admission, WATCH, EXEC/Lua and replication. HSET/HMSET retain their
+standard merge semantics. Redis SDKs can invoke the extension through a raw
+command API; ordinary Redis does not recognize the command.
+
 When cluster mode is enabled, the same hash slot is also a node-level routing
 decision made before any worker routing: every key of a request must hash to
 one slot (hashtags keep multi-key commands usable), that slot must belong to a

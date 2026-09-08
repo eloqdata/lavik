@@ -668,6 +668,13 @@ floor is disconnected and must full-sync again. With it enabled, the exporter
 pins its cursors; pressure from those pins follows the global
 `replication-backlog-backpressure` wait-or-full-sync policy.
 
+`KEYLANE.HREPLACE` uses the native command stream between Keylane nodes.
+Redis export lowers each successful replacement to `DEL` followed by `HSET`
+inside the enclosing `MULTI`/`EXEC`; source-captured `PERSIST`/`PEXPIREAT`
+effects preserve the final absolute expiry. Failed existence conditions do
+not publish a replacement. Standard Redis replicas never receive the extension
+command, and replacement does not require reading old fields for export.
+
 ### Sentinel-managed failover
 
 Keylane exposes the Redis-shaped status surface Sentinel uses. `ROLE` reports

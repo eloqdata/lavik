@@ -27,6 +27,7 @@ bool EntryLess(const HashEntry& left, const HashEntry& right) {
 
 bool IsWrite(const HashOperation& operation) {
   return operation.kind_ == HashOperationKind::kSet ||
+         operation.kind_ == HashOperationKind::kReplaceOnly ||
          operation.kind_ == HashOperationKind::kSetIfAbsent ||
          operation.kind_ == HashOperationKind::kDelete ||
          operation.kind_ == HashOperationKind::kPopRandom ||
@@ -53,7 +54,8 @@ bool IsPointOperation(HashOperationKind kind) {
 
 bool NeedsGroupedHash(const HashValue& value) {
   // Small hashes keep the compact path. Crossing the threshold publishes a
-  // complete grouped graph atomically; later writes never demote that graph.
+  // complete grouped graph atomically; incremental writes never demote it.
+  // An explicit whole-Hash replacement may choose a compact new value.
   std::uint64_t bytes = kHashValueHeaderBytes;
   for (const auto& entry : value.entries_) {
     bytes += 8 + entry.field_.size() + entry.value_.size();
@@ -77,6 +79,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     const HashOperation& operation, ValueType value_type, TxShardWrites* tx,
     ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
+  const bool replace = operation.kind_ == HashOperationKind::kReplaceOnly;
+  if (replace && (value_type != ValueType::kHash || operation.fields_.empty() ||
+                  operation.fields_.size() != operation.values_.size())) {
+    co_return absl::InvalidArgumentError("invalid Hash replacement fields");
+  }
   if (operation.kind_ == HashOperationKind::kScan &&
       operation.scan_count_ == 0) {
     co_return absl::InvalidArgumentError(
@@ -108,6 +115,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     co_return absl::InvalidArgumentError(
         "WRONGTYPE Operation against a key holding the wrong kind of value");
   }
+  if (replace && !exists) co_return HashResult{};
   const bool read_only = !IsWrite(operation);
   // Exercise the command's storage-error reply path independently of the
   // outer maxmemory preflight. No mutation has been staged at this boundary.
@@ -144,6 +152,10 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
              });
     if (!view.ok()) co_return view.status();
     grouped = std::move(*view);
+    // Validate the preceding decision, but never inherit its fields/pages.
+    // Append/CommitGroupedHashMutation still find and retire the old side
+    // view; a null mutation predecessor creates a fresh incarnation.
+    if (replace) grouped.reset();
   }
 
   HashResult result;
@@ -168,7 +180,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   // kPopRandom stays on its original selection/replication path.
   const bool prepare_operation =
       (value_type == ValueType::kHash &&
-       operation.kind_ == HashOperationKind::kSet) ||
+       (operation.kind_ == HashOperationKind::kSet || replace)) ||
       (value_type == ValueType::kSet &&
        (operation.kind_ == HashOperationKind::kSet ||
         operation.kind_ == HashOperationKind::kDelete));
@@ -297,7 +309,24 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   // peak before any leaf allocations, including copies made by the planner.
   std::set<HashGroupId> selected;
   std::optional<MemoryReservation> grouped_scratch;
-  if (grouped != nullptr) {
+  if (replace) {
+    // Bound owned field copies, sorting and encoding before allocating them.
+    // Request bytes have their separate client-buffer admission already.
+    GroupedScratchBudget budget;
+    for (std::size_t i = 0; i < operation.fields_.size(); ++i) {
+      if (operation.fields_[i].size() > kMaxStringBytes ||
+          operation.values_[i].size() > kMaxStringBytes)
+        co_return absl::OutOfRangeError("Hash field or value exceeds 512 MiB");
+      for (const auto bytes : {operation.fields_[i].size(),
+                               operation.values_[i].size(), std::size_t{256}}) {
+        const auto added = budget.AddBytes(bytes);
+        if (!added.ok()) co_return added;
+      }
+    }
+    auto admitted = budget.Reserve(4);
+    if (!admitted.ok()) co_return admitted.status();
+    grouped_scratch.emplace(std::move(*admitted));
+  } else if (grouped != nullptr) {
     GroupedScratchBudget budget;
     if (IsPointOperation(operation.kind_)) {
       for (const auto field : operation.fields_) {
@@ -357,7 +386,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       }
       compact = std::move(*loaded);
     }
-  } else if (exists) {
+  } else if (exists && !replace) {
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                      location, extents);
     if (!loaded.ok()) {
@@ -501,6 +530,32 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   };
 
   switch (operation.kind_) {
+    case HashOperationKind::kReplaceOnly: {
+      // Sort request positions, not owned values: duplicate fields use the
+      // last argument, in O(n log n) without reading any old Hash payload.
+      std::vector<std::size_t> order(operation.fields_.size());
+      for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+      std::sort(order.begin(), order.end(), [&](auto a, auto b) {
+        return operation.fields_[a] == operation.fields_[b]
+                   ? a < b
+                   : operation.fields_[a] < operation.fields_[b];
+      });
+      compact.entries_.reserve(order.size());
+      for (std::size_t i = 0; i < order.size(); ++i) {
+        const auto position = order[i];
+        const auto field = operation.fields_[position];
+        if (i + 1 < order.size() && field == operation.fields_[order[i + 1]])
+          continue;
+        compact.entries_.push_back(
+            HashEntry{.digest_ = ComputeDigest(field),
+                      .field_ = std::string(field),
+                      .value_ = std::string(operation.values_[position])});
+      }
+      // Identical replacements still write and invalidate WATCH. Comparing
+      // old values would defeat the explicit read-free replacement contract.
+      result.changed_ = true;
+      break;
+    }
     case HashOperationKind::kSet:
     case HashOperationKind::kSetIfAbsent: {
       if (operation.fields_.size() != operation.values_.size())

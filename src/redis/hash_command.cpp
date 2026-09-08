@@ -62,12 +62,15 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
   switch (request.kind_) {
     case CommandKind::kHSet:
     case CommandKind::kHMSet:
+    case CommandKind::kHReplace:
       if ((args.size() - 2) % 2 != 0) {
         co_return BuiltReply(
             reply_builder.AppendError("ERR wrong number of arguments for '" +
                                       args.front() + "' command"));
       }
-      operation.kind_ = storage::HashOperationKind::kSet;
+      operation.kind_ = request.kind_ == CommandKind::kHReplace
+                            ? storage::HashOperationKind::kReplaceOnly
+                            : storage::HashOperationKind::kSet;
       for (std::size_t i = 2; i < args.size(); i += 2) {
         operation.fields_.push_back(args[i]);
         operation.values_.push_back(args[i + 1]);
@@ -195,6 +198,12 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
   if (!result.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
   }
+  if (request.kind_ == CommandKind::kHReplace && !result->key_exists_) {
+    // A failed existence condition is a successful no-op, not an effect to
+    // replay later when another command may have created the key.
+    MarkReplicationCommandHandled(request);
+    co_return BuiltReply(reply_builder.AppendNull());
+  }
   if (request.kind_ == CommandKind::kHIncrBy) {
     CaptureReplicationCommand(
         request,
@@ -209,6 +218,7 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
     case CommandKind::kHDel:
       co_return BuiltReply(reply_builder.AppendInteger(result->integer_));
     case CommandKind::kHMSet:
+    case CommandKind::kHReplace:
       co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
     case CommandKind::kHLen:
       co_return BuiltReply(reply_builder.AppendInteger(result->length_));

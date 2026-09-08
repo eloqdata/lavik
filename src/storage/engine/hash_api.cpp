@@ -6,6 +6,7 @@ namespace {
 
 bool IsHashLikeWrite(const HashOperation& operation) {
   return operation.kind_ == HashOperationKind::kSet ||
+         operation.kind_ == HashOperationKind::kReplaceOnly ||
          operation.kind_ == HashOperationKind::kSetIfAbsent ||
          operation.kind_ == HashOperationKind::kDelete ||
          operation.kind_ == HashOperationKind::kPopRandom ||

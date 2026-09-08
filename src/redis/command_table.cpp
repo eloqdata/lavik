@@ -143,6 +143,7 @@ constexpr CommandSpec kCommandTable[] = {
          kCmdMayBlock},
     {"hset", CommandKind::kHSet, 4, 0, 1, 1, 1, kKeyedWrite},
     {"hmset", CommandKind::kHMSet, 4, 0, 1, 1, 1, kKeyedWrite},
+    {"keylane.hreplace", CommandKind::kHReplace, 4, 0, 1, 1, 1, kKeyedWrite},
     {"hsetnx", CommandKind::kHSetNx, 4, 4, 1, 1, 1, kKeyedWrite},
     {"hget", CommandKind::kHGet, 3, 3, 1, 1, 1, kKeyedRead},
     {"hmget", CommandKind::kHMGet, 3, 0, 1, 1, 1, kKeyedRead},

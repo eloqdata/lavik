@@ -177,6 +177,12 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("get", CommandKind::kGet);
   CheckKind("GeT", CommandKind::kGet);
   CheckKind("SET", CommandKind::kSet);
+  CheckKind("KEYLANE.HREPLACE", CommandKind::kHReplace);
+  CheckKind("Keylane.HReplace", CommandKind::kHReplace);
+  CheckArity("keylane.hreplace", 3, false);
+  CheckArity("keylane.hreplace", 4, true);
+  EXPECT_TRUE(FindCommand("keylane.hreplace")->flags_ & keylane::kCmdWrite);
+  EXPECT_EQ(Keys("keylane.hreplace", 6).count(), 1);
   CheckKind("SCRIPT", CommandKind::kScript);
   CheckKind("EVAL_RO", CommandKind::kEvalRo);
   CheckKind("EVALSHA_RO", CommandKind::kEvalShaRo);

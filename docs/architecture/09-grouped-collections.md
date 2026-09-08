@@ -125,6 +125,14 @@ cleaner disabling or the allocator's authoritative capacity checks.
 
 ## Command access paths
 
+Whole-Hash replacement (`KEYLANE.HREPLACE`) checks existing key/type/expiry and
+the preceding grouped decision, but does not load old field payloads. Its
+after-image comes entirely from admitted request data. A large replacement
+publishes a fresh incarnation through the grouped command decision; a small
+replacement may demote to a compact record. The append funnel retires the old
+graph after publication while preserving transaction/snapshot ownership. This
+does not change the durable format or the incremental HSET/HMSET path.
+
 Hash/Set point operations load each affected prefix group once. Their writes
 replace only changed complete groups and any split-parent retirement records.
 HSCAN/SSCAN consume one routing leaf per call and use field digests under the

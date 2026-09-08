@@ -689,6 +689,9 @@ struct ListResult {
 
 enum class HashOperationKind : std::uint8_t {
   kSet,
+  // Replace an existing Hash's complete field set, preserving its absolute
+  // expiry. Missing/expired keys return key_exists_=false without a write.
+  kReplaceOnly,
   kSetIfAbsent,
   kGet,
   kGetMany,
@@ -707,8 +710,8 @@ enum class HashOperationKind : std::uint8_t {
 };
 
 // Views remain owned by the command request for the lifetime of the awaited
-// call. Set operations use parallel fields_/values_ arrays; all other
-// operations use fields_ only.
+// call. Writes with values (set, replace and increment) use parallel
+// fields_/values_ arrays; field-only operations leave values_ empty.
 struct HashOperation {
   HashOperationKind kind_ = HashOperationKind::kLength;
   std::vector<std::string_view> fields_;

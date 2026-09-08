@@ -1387,6 +1387,19 @@ absl::StatusOr<std::string> EncodeRedisExportCommand(
     children.push_back(Child{.db_ = command.db_id_, .args_ = command.args_});
   }
 
+  // Redis does not know Keylane extensions. Export a successful whole-Hash
+  // replacement as DEL + HSET inside the enclosing atomic envelope. Source
+  // append/transaction settlement already supplies the final absolute expiry
+  // effect, so this neither reads old fields nor extends the key's lifetime.
+  for (const auto& child : children) {
+    if (!child.args_.empty() &&
+        EqualCaseInsensitive(child.args_[0], "KEYLANE.HREPLACE")) {
+      if (child.args_.size() < 4 || child.args_.size() % 2 != 0)
+        return absl::InvalidArgumentError("malformed Hash replacement export");
+      transactional = true;
+    }
+  }
+
   std::string output;
   std::uint8_t current_db = *selected_db;
   if (current_db != children.front().db_) {
@@ -1397,11 +1410,16 @@ absl::StatusOr<std::string> EncodeRedisExportCommand(
   if (transactional) {
     output += EncodeRespCommand(std::vector<std::string>{"MULTI"});
   }
-  for (const Child& child : children) {
+  for (Child& child : children) {
     if (current_db != child.db_) {
       output += EncodeRespCommand(
           std::vector<std::string>{"SELECT", std::to_string(child.db_)});
       current_db = child.db_;
+    }
+    if (!child.args_.empty() &&
+        EqualCaseInsensitive(child.args_[0], "KEYLANE.HREPLACE")) {
+      output += EncodeRespCommand(std::vector<std::string>{"DEL", child.args_[1]});
+      child.args_[0] = "HSET";
     }
     output += EncodeRespCommand(child.args_);
   }

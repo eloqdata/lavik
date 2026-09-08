@@ -123,6 +123,30 @@ done
 [[ $("${redis_cli}" -p "${redis_port}" mget '{a}exec' '{b}exec' | \
   tr '\n' ' ') == 'first second ' ]]
 
+# A Keylane-only replacement must export standard Redis commands atomically,
+# including source absolute TTL. Redis itself must never see the extension.
+"${redis_cli}" -p "${keylane_port}" hset replace-hash old value retained old >/dev/null
+"${redis_cli}" -p "${keylane_port}" expire replace-hash 3600 >/dev/null
+replace_expiry=$("${redis_cli}" -p "${keylane_port}" pexpiretime replace-hash)
+[[ $("${redis_cli}" -p "${keylane_port}" KEYLANE.HREPLACE replace-hash only new) == OK ]]
+for _ in {1..200}; do
+  [[ $("${redis_cli}" -p "${redis_port}" hget replace-hash only) == new ]] && break
+  sleep 0.05
+done
+[[ $("${redis_cli}" -p "${redis_port}" hget replace-hash only) == new ]]
+[[ $("${redis_cli}" -p "${redis_port}" hlen replace-hash) == 1 ]]
+[[ $("${redis_cli}" -p "${redis_port}" pexpiretime replace-hash) == "$replace_expiry" ]]
+printf 'MULTI\nKEYLANE.HREPLACE replace-hash final image\nHMSET replace-hash tail value\nEXEC\n' | \
+  "${redis_cli}" -p "${keylane_port}" >/dev/null
+for _ in {1..200}; do
+  [[ $("${redis_cli}" -p "${redis_port}" hget replace-hash tail) == value ]] && break
+  sleep 0.05
+done
+[[ $("${redis_cli}" -p "${redis_port}" hget replace-hash final) == image ]]
+[[ $("${redis_cli}" -p "${redis_port}" hget replace-hash tail) == value ]]
+[[ $("${redis_cli}" -p "${redis_port}" hlen replace-hash) == 2 ]]
+[[ $("${redis_cli}" -p "${redis_port}" pexpiretime replace-hash) == "$replace_expiry" ]]
+
 # Keep the link online long enough for Redis to send periodic REPLCONF ACKs.
 sleep 3
 "${redis_cli}" -p "${redis_port}" info replication | tr -d '\r' | \

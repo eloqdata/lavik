@@ -205,6 +205,7 @@ enum class CommandKind {
   kBLMPop,
   kHSet,
   kHMSet,
+  kHReplace,
   kHSetNx,
   kHGet,
   kHMGet,
