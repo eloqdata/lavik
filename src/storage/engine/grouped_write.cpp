@@ -54,7 +54,8 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const HashGroupSnapshot& snapshot, std::uint64_t sequence,
     TxShardWrites& tx, ValueType value_type, std::uint64_t batch_txid) {
-  if (value_type != ValueType::kHash && value_type != ValueType::kSet) {
+  if (value_type != ValueType::kHash && value_type != ValueType::kSet &&
+      value_type != ValueType::kSortedSet) {
     co_return absl::InvalidArgumentError(
         "invalid prefix-group collection type");
   }

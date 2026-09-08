@@ -1903,6 +1903,19 @@ class StorageEngine::Impl {
       GroupedHashObject::Handle previous, OrderedCollectionMutationPlan plan,
       std::uint64_t expire_at_ms, TxShardWrites* tx,
       ReplicationCommandAppend* replication = nullptr);
+  struct SortedSetMemberMutation {
+    MemoryReservation scratch_;
+    MemoryReservation leaves_;
+    HashGroupMutationPlan plan_;
+  };
+  // Derives member-index changes from complete ordered before/after pages so
+  // every typed, callback and ingest writer shares the same atomic boundary.
+  // Only touched prefix leaves are decoded; all retained scratch is admitted.
+  Task<absl::StatusOr<SortedSetMemberMutation>> PrepareSortedSetMembers(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle previous,
+      const OrderedCollectionMutationPlan& ordered);
   Task<absl::Status> UpdateGroupedExpirationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

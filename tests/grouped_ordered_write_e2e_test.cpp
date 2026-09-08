@@ -1,7 +1,11 @@
 #include <algorithm>
 #include <cmath>
+#include <tuple>
 
 #include "grouped_write_e2e_support.h"
+#include "keylane/rdb.h"
+#include "keylane/storage/detail/hash_codec.h"
+#include "keylane/storage/detail/ordered_compact_codec.h"
 
 namespace {
 using namespace grouped_e2e;
@@ -354,6 +358,154 @@ TEST(GroupedOrderedWriteE2e, ExpirationOnlyChangesRootsForAllCollectionTypes) {
   EXPECT_EQ(client.Command({"LINDEX", "list", "0"}).text_, members[0]);
   EXPECT_EQ(client.Command({"ZSCORE", "zset", members[0]}).text_, "0");
 }
+
+class GroupedFullDiskExpirationE2e
+    : public ::testing::TestWithParam<std::tuple<ValueType, bool>> {};
+
+TEST_P(GroupedFullDiskExpirationE2e, ReclaimsGraphAndRecovers) {
+  const auto [type, external_key] = GetParam();
+  // Inline groups occupy the only foreground block on the minimum device.
+  // Oversized groups instead consume two extents each; external parent keys
+  // make those extents depend on retirement of their transaction record block.
+  // Indexed Sorted Sets persist the member in two graphs. Keep inline bytes
+  // per key unchanged, and give the external case its six extra extent blocks;
+  // the final 1 MiB/9 MiB SET below must still prove the device is actually
+  // full.
+  const bool indexed = type == ValueType::kSortedSet;
+  PrivateDisk disk((external_key ? (indexed ? 176ULL : 128ULL) : 80ULL) * 1024 *
+                   1024);
+  const std::string member(
+      external_key ? 9 * 1024 * 1024 : (indexed ? 512 : 1024) * 1024, 'v');
+  absl::StatusOr<std::string> compact;
+  if (type == ValueType::kHash || type == ValueType::kSet) {
+    HashValue value;
+    value.entries_.push_back(
+        {.field_ = type == ValueType::kHash ? "f" : member,
+         .value_ = type == ValueType::kHash ? member : ""});
+    compact = EncodeHashValue(value);
+  } else {
+    const std::vector<OrderedCollectionEntry> entries{{.value_ = member}};
+    compact = EncodeOrderedCompactValue(type == ValueType::kList
+                                            ? OrderedCollectionKind::kList
+                                            : OrderedCollectionKind::kSortedSet,
+                                        entries);
+  }
+  ASSERT_TRUE(compact.ok()) << compact.status();
+  auto dump = keylane::rdb::EncodeDump(RawValue{.encoded_ = std::move(*compact),
+                                                .logical_size_ = 1,
+                                                .value_type_ = type});
+  ASSERT_TRUE(dump.ok()) << dump.status();
+  std::vector<std::string> expired_keys;
+  const auto key_count = external_key ? 3 : 7;
+  for (int i = 0; i < key_count; ++i) {
+    auto key = "expiring:" + std::to_string(i);
+    if (external_key) key.resize(32 * 1024, 'k');
+    expired_keys.push_back(std::move(key));
+  }
+  const std::string replacement = external_key ? member : "space reclaimed";
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(
+        client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}).text_,
+        "OK");
+    const auto deadline =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            (std::chrono::system_clock::now() + 10s).time_since_epoch())
+            .count();
+    for (const auto& key : expired_keys) {
+      // RESTORE creates a grouped root with its final TTL in one publication.
+      // Adding TTL afterward would create a shielding successor, which must
+      // never take the full-disk, non-durable expiration escape valve.
+      ASSERT_EQ(client
+                    .Command({"RESTORE", key, std::to_string(deadline), *dump,
+                              "ABSTTL"})
+                    .text_,
+                "OK");
+    }
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(
+        client
+            .Command({"SET", "cannot-fit",
+                      external_key ? member : std::string(1024 * 1024, 'v')})
+            .text_,
+        "QUEUED");
+    const auto exhausted = client.Command({"EXEC"});
+    ASSERT_EQ(exhausted.items_.size(), 1);
+    ASSERT_EQ(exhausted.items_[0].kind_, '-');
+    ASSERT_NE(exhausted.items_[0].text_.find("out of disk space"),
+              std::string::npos);
+    std::vector<std::string> exists{"EXISTS"};
+    exists.insert(exists.end(), expired_keys.begin(), expired_keys.end());
+    ASSERT_EQ(client.Command(exists).text_, std::to_string(key_count));
+
+    const auto expiry_timeout = std::chrono::steady_clock::now() + 20s;
+    while (client.Command({"DBSIZE"}).text_ != "0" &&
+           std::chrono::steady_clock::now() < expiry_timeout) {
+      (void)client.Command(exists);  // Also exercise lazy candidate enqueueing.
+      std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_EQ(client.Command({"DBSIZE"}).text_, "0") << server.Log();
+    ASSERT_EQ(client.Command(exists).text_, "0");
+
+    ASSERT_EQ(
+        client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "1"}).text_,
+        "OK");
+    const auto stat = [](const std::string& info, std::string_view name) {
+      const auto offset = info.find(std::string(name) + ':');
+      Check(offset != std::string::npos, "missing cleaner statistic");
+      return std::stoull(info.substr(offset + name.size() + 1));
+    };
+    std::string stats;
+    const auto reclaim_timeout = std::chrono::steady_clock::now() + 10s;
+    do {
+      stats = client.Command({"INFO", "STATS"}).text_;
+      if (stat(stats, "tx_cleaner_retired_blocks") != 0) break;
+      std::this_thread::sleep_for(20ms);
+    } while (std::chrono::steady_clock::now() < reclaim_timeout);
+    ASSERT_GT(stat(stats, "tx_cleaner_retired_blocks"), 0)
+        << stats << server.Log();
+    ASSERT_EQ(stat(stats, "tx_cleaner_failures"), 0) << stats << server.Log();
+
+    // Extent debt settles asynchronously after its source block retires.
+    Reply written;
+    const auto write_timeout = std::chrono::steady_clock::now() + 10s;
+    do {
+      written = client.Command({"SET", "after-expiry", replacement});
+      if (written.text_ == "OK") break;
+      ASSERT_NE(written.text_.find("out of disk space"), std::string::npos)
+          << written.text_ << server.Log();
+      std::this_thread::sleep_for(20ms);
+    } while (std::chrono::steady_clock::now() < write_timeout);
+    ASSERT_EQ(written.text_, "OK") << server.Log();
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"DBSIZE"}).text_, "1");
+  for (const auto& key : expired_keys)
+    EXPECT_EQ(client.Command({"EXISTS", key}).text_, "0");
+  EXPECT_EQ(client.Command({"GET", "after-expiry"}).text_, replacement);
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllTypes, GroupedFullDiskExpirationE2e,
+    ::testing::Combine(::testing::Values(ValueType::kHash, ValueType::kSet,
+                                         ValueType::kList,
+                                         ValueType::kSortedSet),
+                       ::testing::Bool()),
+    [](const ::testing::TestParamInfo<GroupedFullDiskExpirationE2e::ParamType>&
+           info) {
+      const auto type = std::get<0>(info.param);
+      const auto external = std::get<1>(info.param);
+      std::string name = type == ValueType::kHash   ? "Hash"
+                         : type == ValueType::kSet  ? "Set"
+                         : type == ValueType::kList ? "List"
+                                                    : "SortedSet";
+      return name + (external ? "External" : "Inline");
+    });
 
 TEST(GroupedOrderedWriteE2e, SortedSetRemovalPopAndStoreCommandSurface) {
   PrivateDisk disk;

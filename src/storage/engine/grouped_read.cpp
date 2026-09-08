@@ -10,6 +10,8 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedHashObject::Handle object, HashGroupId id, bool pinned) {
   if (object == nullptr) co_return absl::DataLossError("missing grouped view");
+  if (object->is_ordered() && !object->has_member_index())
+    co_return absl::DataLossError("ordered view has no prefix groups");
   const auto original = object->version();
   const auto root_identity = object->directory().root();
   const auto incarnation = root_identity.incarnation_;
@@ -41,7 +43,8 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
                    .index_generation_ = original.index_generation_,
                });
       if (!current.ok()) co_return current.status();
-      if (*current == nullptr || (*current)->is_ordered() ||
+      if (*current == nullptr ||
+          ((*current)->is_ordered() && !(*current)->has_member_index()) ||
           (*current)->directory().root() != root_identity) {
         co_return absl::NotFoundError(
             "grouped logical version changed during read");
@@ -129,7 +132,8 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
                  .index_generation_ = original.index_generation_,
              });
     if (!current.ok()) co_return current.status();
-    if (*current == nullptr || (*current)->is_ordered() ||
+    if (*current == nullptr ||
+        ((*current)->is_ordered() && !(*current)->has_member_index()) ||
         (*current)->directory().root() != root_identity) {
       co_return absl::NotFoundError(
           "grouped logical version changed during read");

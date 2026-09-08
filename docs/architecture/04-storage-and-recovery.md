@@ -27,8 +27,10 @@ top-level index marks a grouped representation. Their serving, transaction,
 recovery and graph-lifecycle boundaries are described in
 [Grouped collections](09-grouped-collections.md). Collection writes promote
 automatically at the compact-size threshold, while streaming imports construct
-grouped graphs directly. Hash/Set use prefix routing; List/Sorted Set use
-ordered page directories. Explicit full-image callbacks retain aggregate
+grouped graphs directly. Hash/Set use prefix routing; List uses ordered pages.
+Newly built Sorted Sets combine ordered pages with a member-to-score prefix
+index under one atomic root; legacy ordered-only roots remain supported.
+Explicit full-image callbacks retain aggregate
 materialization limits; grouped key transfers and collection snapshot streams
 instead consume admitted pages.
 
@@ -175,9 +177,12 @@ Its identity is available without reading an external value; group payloads
 retain complete snapshots, not read-time mutation logs. The group payload
 envelope leaves framing space within the 1 GiB record-payload limit while
 preserving the independent 512 MiB limit for each field and value. Hash and Set
-use persisted-seed hash prefixes; List and Sorted Set use stable ordered page
-identities. Roots preserve an independent group revision, distinct from the
-source command sequence shared by mutations in a replay envelope.
+use persisted-seed hash prefixes; List uses stable ordered page identities.
+Indexed Sorted Sets use both disjoint identity spaces under their collection
+type. Their version-2 ordered-root payload appends the member Hash root, while
+version-1 ordered-only payloads remain readable. Roots preserve an independent
+group revision, distinct from the source command sequence shared by mutations
+in a replay envelope.
 Header length is derived from
 those flags and key length; total record length is derived from header and
 payload length. Neither derived length is stored. The decoded `RecordHeader`
@@ -641,8 +646,11 @@ The preferred deletion is a durable tombstone, which remains safe if the wall
 clock later moves backward. If foreground space is completely exhausted, an
 unshielded expired value can be removed only from memory and physical live-byte
 accounting; its on-disk deadline still makes it expired at ordinary recovery
-time, and the freed block can restore write capacity. A shielding value cannot
-use this escape valve because an older durable value could reappear.
+time, and the freed blocks can restore write capacity. For grouped values,
+the root and side view leave the indexes together and the complete auxiliary
+graph is retired; external-key extents remain dependencies of their source
+record blocks. A shielding value cannot use this escape valve because an
+older durable value could reappear.
 
 Tomb Raider is a separate, optional cleanup loop launched at worker startup
 only when the node is then the expiration authority. Cluster-managed startup

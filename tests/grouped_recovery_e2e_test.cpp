@@ -594,6 +594,107 @@ TEST(GroupedRecoveryE2e, RejectsCommittedRootWithMissingGroup) {
   EXPECT_NE(server.Log().find("Hash"), std::string::npos);
 }
 
+TEST(GroupedRecoveryE2e, LegacySortedSetCanStillMutateAndRecover) {
+  RecordImage image;
+  OrderedGroupSnapshot page{.kind_ = OrderedCollectionKind::kSortedSet,
+                            .incarnation_ = 17,
+                            .id_ = 1,
+                            .entries_ = {{"original", 3.5}}};
+  image.OrderedGroup("legacy", page, 1);
+  image.OrderedRoot(
+      "legacy",
+      OrderedCollectionRoot{.kind_ = OrderedCollectionKind::kSortedSet,
+                            .incarnation_ = 17,
+                            .item_count_ = 1,
+                            .first_group_ = 1,
+                            .last_group_ = 1,
+                            .next_group_id_ = 2,
+                            .group_count_ = 1,
+                            .revision_ = 1},
+      1);
+  image.Finish();
+  {
+    ChildServer server(image);
+    EXPECT_EQ(server.Command({"ZSCORE", "legacy", "original"}), "3.5");
+    EXPECT_EQ(server.Command({"ZINCRBY", "legacy", "2", "original"}), "5.5");
+    EXPECT_EQ(server.Command({"ZADD", "legacy", "-1", "new"}), ":1");
+    EXPECT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ChildServer recovered(image);
+  EXPECT_EQ(recovered.Command({"ZCARD", "legacy"}), ":2");
+  EXPECT_EQ(recovered.Command({"ZSCORE", "legacy", "original"}), "5.5");
+  EXPECT_EQ(recovered.Command({"ZSCORE", "legacy", "new"}), "-1");
+  EXPECT_EQ(recovered.Command({"ZREM", "legacy", "original"}), ":1");
+  EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedRecoveryE2e, IndexedSortedSetRequiresAndChecksMemberGraph) {
+  for (const int mode : {0, 1, 2}) {
+    SCOPED_TRACE(mode);
+    RecordImage image;
+    const std::string member(9 * 1024 * 1024, 'D');
+    OrderedGroupSnapshot page{.kind_ = OrderedCollectionKind::kSortedSet,
+                              .incarnation_ = 17,
+                              .id_ = 1,
+                              .entries_ = {{member, 3.5}}};
+    image.OrderedGroup("indexed", page, 1, 0, true);
+    OrderedCollectionRoot root{
+        .kind_ = OrderedCollectionKind::kSortedSet,
+        .incarnation_ = 17,
+        .item_count_ = 1,
+        .first_group_ = 1,
+        .last_group_ = 1,
+        .next_group_id_ = 2,
+        .group_count_ = 1,
+        .revision_ = 1,
+        .member_index_ = GroupedHashRoot{.incarnation_ = 17,
+                                         .field_count_ = 1,
+                                         .group_count_ = 1,
+                                         .revision_ = 1}};
+    image.OrderedRoot("indexed", root, 1);
+    std::vector<ExtentRef> member_extents;
+    if (mode != 1) {
+      HashGroupSnapshot prefix{.incarnation_ = 17};
+      prefix.value_.entries_.push_back(
+          {.digest_ = ComputeDigest(member),
+           .field_ = member,
+           .value_ = EncodeSortedSetMemberScore(3.5)});
+      auto encoded = EncodeHashGroup(prefix);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      RecordHeader header{.value_type_ = ValueType::kSortedSet,
+                          .external_ = true,
+                          .hash_group_ = true,
+                          .group_incarnation_ = 17,
+                          .logical_size_ = 1,
+                          .mutation_sequence_ = 1};
+      member_extents = image.GroupPayload("indexed", *encoded, header);
+      // A newer, committed but root-unreachable member version must not win.
+      prefix.value_.entries_[0].value_ = EncodeSortedSetMemberScore(99);
+      encoded = EncodeHashGroup(prefix);
+      ASSERT_TRUE(encoded.ok());
+      header.mutation_sequence_ = 2;
+      image.GroupPayload("indexed", *encoded, header);
+    }
+    image.Finish();
+    if (mode == 2) {
+      ASSERT_GE(member_extents.size(), 2);
+      image.CorruptExtentBody(member_extents.back());
+    }
+    ChildServer server(image);
+    if (mode != 0) {
+      EXPECT_NE(server.Wait(), 0) << server.Log();
+      continue;
+    }
+    EXPECT_EQ(server.Command({"ZCARD", "indexed"}), ":1");
+    EXPECT_EQ(server.Command({"ZSCORE", "indexed", member}), "3.5");
+    EXPECT_EQ(server.Command({"DBSIZE"}), ":1");
+    EXPECT_EQ(server.Wait(true), 0) << server.Log();
+    ChildServer recovered(image);
+    EXPECT_EQ(recovered.Command({"ZSCORE", "indexed", member}), "3.5");
+    EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+  }
+}
+
 TEST(GroupedRecoveryE2e, RetainsSplitParentRetirementEvidence) {
   RecordImage image;
   auto group = SingleGroup();

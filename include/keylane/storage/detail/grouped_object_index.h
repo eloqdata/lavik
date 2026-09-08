@@ -77,8 +77,9 @@ class GroupedHashObject {
       HashGroupDirectory directory,
       std::span<const HashGroupLocation> changed_locations);
 
-  // Ordered collections share the same bounded physical RecordIndex pages;
-  // only their resident routing metadata differs from Hash/Set prefixes.
+  // Ordered collections share the same bounded physical RecordIndex pages.
+  // For indexed Sorted Sets, locations include BOTH the ordered graph and
+  // member-prefix graph; either incomplete graph rejects publication.
   static absl::StatusOr<Handle> CreateOrdered(
       GroupedObjectVersion version, OrderedGroupDirectory directory,
       std::span<const HashGroupLocation> locations,
@@ -124,7 +125,14 @@ class GroupedHashObject {
   // has fail-stopped before it could restore its predecessor. Retained page
   // readers must check this again after every suspension.
   absl::Status ReadStatus() const;
-  const HashGroupDirectory& directory() const noexcept { return *directory_; }
+  // Requires a Hash/Set object or has_member_index(). In the latter case this
+  // is the Sorted Set's member-to-score directory, not its ordered pages.
+  const HashGroupDirectory& directory() const noexcept {
+    return is_ordered() ? *ordered_directory_->member_directory() : *directory_;
+  }
+  bool has_member_index() const noexcept {
+    return is_ordered() && ordered_directory_->member_directory() != nullptr;
+  }
   bool is_ordered() const noexcept { return ordered_directory_ != nullptr; }
   const OrderedGroupDirectory& ordered_directory() const noexcept {
     return *ordered_directory_;
@@ -148,6 +156,8 @@ class GroupedHashObject {
   // and its side-index entry have been reclaimed.
   std::shared_ptr<const std::vector<ExtentRef>> ExtentsFor(
       HashGroupId id) const;
+  // Logical streaming-page count. Sorted Set streams traverse only ordered
+  // pages; physical lifecycle code must use ForEachRecord for both graphs.
   std::size_t group_count() const noexcept {
     return is_ordered() ? ordered_directory_->root().group_count_
                         : directory_->root().group_count_;
@@ -156,8 +166,9 @@ class GroupedHashObject {
   using RecordVisitor = std::function<void(
       HashGroupId, const RecordIndex::Entry&,
       const std::shared_ptr<const std::vector<ExtentRef>>&, bool)>;
-  // Includes active leaves AND retired parent markers. The callback borrows
-  // compact entries and must materialize block epoch/owner before suspension.
+  // Includes active leaves AND retired parent markers in both identity spaces.
+  // The callback borrows compact entries and must materialize block epoch/owner
+  // before suspension.
   void ForEachRecord(const RecordVisitor& visitor) const;
 
  private:

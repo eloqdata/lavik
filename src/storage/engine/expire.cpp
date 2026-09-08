@@ -88,10 +88,12 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
     co_return resolved.status();
   }
   auto* current = *resolved;
-  if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
-      current->value_.mutation_sequence_ != candidate.mutation_sequence_ ||
-      ExpireAt(*current) != candidate.expire_at_ms_ ||
-      !IsExpiredNow(*current)) {
+  const auto matches_candidate = [&candidate](const RecordIndex::Entry* entry) {
+    return entry != nullptr && entry->value_.kind() == RecordKind::kValue &&
+           entry->value_.mutation_sequence_ == candidate.mutation_sequence_ &&
+           ExpireAt(*entry) == candidate.expire_at_ms_ && IsExpiredNow(*entry);
+  };
+  if (!matches_candidate(current)) {
     co_return absl::OkStatus();
   }
   // Prefer a durable delete so a later wall-clock rollback cannot expose the
@@ -103,17 +105,56 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   absl::Status durable = co_await AppendLocked(
       store, partition, candidate.db_id_, candidate.key_, candidate.digest_, {},
       RecordKind::kTombstone, ValueType::kNone, 0, nullptr, 0);
-  if (durable.ok() || durable.code() != absl::StatusCode::kResourceExhausted ||
-      current->value_.shielding()) {
+  if (durable.ok() || durable.code() != absl::StatusCode::kResourceExhausted) {
     co_return durable;
   }
 
-  tx::CurrentTxShard().MarkWatched(candidate.db_id_,
-                                   tx::FingerprintOf(candidate.digest_));
+  // Append may release store_state_mutex_ while acquiring space or pinning
+  // transaction dependencies. The key hold excludes logical writes, but GC
+  // may replace the index entry and the group's physical coordinates.
+  resolved =
+      co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
+                                 candidate.digest_, candidate.key_);
+  if (!resolved.ok()) co_return resolved.status();
+  current = *resolved;
+  if (!matches_candidate(current)) co_return absl::OkStatus();
+  if (current->value_.shielding()) co_return durable;
+
   const RecordLocation dropped = MaterializeIndexLocation(*current);
   const ExtentManifest dropped_extents = ExtentsFor(store, current);
   const ExtentManifest dropped_dependent_extents =
       DependentExtentsFor(store, current);
+  GroupedHashObject::Handle grouped;
+  std::vector<RetiredRecord> grouped_retirements;
+  if (dropped.grouped()) {
+    try {
+      auto view = partition.grouped_objects_[candidate.db_id_].Lookup(
+          candidate.key_,
+          GroupedObjectVersion{
+              .root_ = dropped,
+              .db_epoch_ = EffectiveRecordDbEpoch(partition, candidate.db_id_),
+              .replication_epoch_ = partition.replication_epoch_,
+              .index_generation_ =
+                  partition.grouped_generations_[candidate.db_id_]});
+      if (!view.ok()) co_return view.status();
+      if (*view == nullptr)
+        co_return absl::DataLossError("missing expired grouped view");
+      grouped = std::move(*view);
+      // Prepare the complete graph before detaching either index, without
+      // allocating disk space or decoding values. This includes split-parent
+      // retirement records and preserves external parent-key extent debt.
+      // Admission failure leaves the expired key indexed for a later retry.
+      auto retired = CollectGroupedRetirements(grouped, nullptr);
+      if (!retired.ok()) co_return retired.status();
+      grouped_retirements = std::move(*retired);
+    } catch (const std::bad_alloc&) {
+      co_return absl::ResourceExhaustedError(
+          "OOM preparing expired grouped retirements");
+    }
+  }
+
+  tx::CurrentTxShard().MarkWatched(candidate.db_id_,
+                                   tx::FingerprintOf(candidate.digest_));
   const std::uint64_t sequence = ++partition.mutation_sequence_;
   if (!partition.fullsync_subscribers_.empty()) [[unlikely]] {
     FullSyncOnCommit(store, partition,
@@ -128,6 +169,17 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
                          .value_ = {},
                      },
                      candidate.digest_);
+  }
+  // No suspension separates physical capture, side-view removal and root
+  // removal. Once detached, GC cannot relocate these records; their live-byte
+  // charges keep their blocks allocated until settlement on each owner.
+  if (grouped != nullptr) {
+    const auto removed = partition.grouped_objects_[candidate.db_id_].Erase(
+        candidate.key_, grouped);
+    if (!removed.ok()) {
+      store.write_failed_ = true;
+      co_return removed;
+    }
   }
   --partition.live_key_count_[candidate.db_id_];
   --store.live_key_count_[candidate.db_id_];
@@ -144,6 +196,10 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   }
   absl::Status dead = co_await MarkRecordDead(
       RetiredRecordOf(dropped, dropped_dependent_extents));
+  for (const auto& record : grouped_retirements) {
+    if (!dead.ok()) break;
+    dead = co_await MarkRecordDead(record);
+  }
   if (!dead.ok()) store.write_failed_ = true;
   co_return dead;
 }

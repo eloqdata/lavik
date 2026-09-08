@@ -11,6 +11,7 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
+#include "keylane/storage/detail/grouped_hash.h"
 #include "keylane/storage/format.h"
 
 namespace keylane::storage {
@@ -38,6 +39,10 @@ struct OrderedCollectionRoot {
   // independent revision so repeated mutations in one replayed command are
   // distinguishable. Zero denotes the command sequence for standalone codecs.
   std::uint64_t revision_ = 0;
+  // Version 2 Sorted Set roots bind a second, prefix-routed member -> score
+  // graph. Its revision may lag when only ordered links changed. Version 1
+  // roots remain readable/writable without silently inventing an index.
+  std::optional<GroupedHashRoot> member_index_ = std::nullopt;
   bool operator==(const OrderedCollectionRoot&) const noexcept = default;
 };
 
@@ -56,6 +61,8 @@ struct OrderedGroupSnapshot {
 
 inline constexpr std::size_t kOrderedGroupHeaderBytes = 64;
 inline constexpr std::size_t kOrderedCollectionRootBytes = 72;
+inline constexpr std::size_t kIndexedSortedSetRootBytes =
+    kOrderedCollectionRootBytes + kGroupedHashRootBytes;
 inline constexpr std::size_t kOrderedGroupTargetBytes = 8192;
 
 struct OrderedGroupMetadata {
@@ -106,6 +113,10 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(std::string_view bytes);
 // valid. Equal -0/+0 scores have the same order, matching Redis numeric order.
 bool OrderedEntryLess(const OrderedCollectionEntry& left,
                       const OrderedCollectionEntry& right) noexcept;
+// Member-index values are exact little-endian IEEE-754 scores, not textual
+// round trips. Callers validate scores before encoding; decoding rejects NaN.
+std::string EncodeSortedSetMemberScore(double score);
+absl::StatusOr<double> DecodeSortedSetMemberScore(std::string_view bytes);
 absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
                                           const OrderedGroupSnapshot& right);
 
@@ -133,11 +144,14 @@ class OrderedGroupDirectory {
   // The caller first adjudicates the root's transaction. Only committed
   // candidates at/before that root sequence can participate; missing links,
   // cycles, disconnected pages and aggregate count mismatches are corruption.
+  // Indexed roots additionally require an already-recovered member directory
+  // matching their embedded Hash root exactly; legacy/List roots forbid it.
   static absl::StatusOr<OrderedGroupDirectory> Recover(
       const OrderedCollectionRoot& root, std::uint64_t root_sequence,
       std::span<const RecoveredOrderedGroup> candidates,
       const absl::flat_hash_set<std::uint64_t>& committed_txids,
-      std::uint64_t command_sequence = 0);
+      std::uint64_t command_sequence = 0,
+      std::optional<HashGroupDirectory> members = std::nullopt);
 
   // Complete after-image metadata, not value deltas. Existing adjudicated
   // pages and retirement evidence remain candidates; only changed ids replace
@@ -145,7 +159,13 @@ class OrderedGroupDirectory {
   absl::StatusOr<OrderedGroupDirectory> Apply(
       const OrderedCollectionRoot& root, std::uint64_t revision,
       std::span<const RecoveredOrderedGroup> changed,
-      std::uint64_t command_sequence) const;
+      std::uint64_t command_sequence,
+      std::span<const RecoveredHashGroup> member_changes = {}) const;
+
+  // Present only for dual-index Sorted Sets; its lifetime is this view's.
+  const HashGroupDirectory* member_directory() const noexcept {
+    return members_ ? &*members_ : nullptr;
+  }
 
   struct Position {
     std::size_t group_index_;
@@ -181,7 +201,17 @@ class OrderedGroupDirectory {
   std::vector<RecoveredOrderedGroup> retired_;
   std::vector<std::pair<std::uint64_t, std::size_t>> ids_;
   std::vector<std::uint64_t> ends_;
+  // The inline directory shares owner-local AVL nodes; those nodes account
+  // their own allocations and must not be charged again by RetainedBytes().
+  std::optional<HashGroupDirectory> members_;
 };
+
+// Ordered ids are nonzero opaque integers with zero prefix bits. Hash range
+// ids have either a nonzero bit count or the unique {0, 0} root range, so the
+// two graphs share one physical index without overlapping identities.
+inline bool IsOrderedPageId(HashGroupId id) noexcept {
+  return id.bits_ == 0 && id.prefix_ != 0;
+}
 
 struct OrderedGroupSplit {
   std::uint64_t next_group_id_ = 0;

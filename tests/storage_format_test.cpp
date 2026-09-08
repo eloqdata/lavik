@@ -269,9 +269,13 @@ TEST(StorageFormatTest, CollectionGroupHeadersKeepTypeAndRoutingSemantics) {
           EXPECT_EQ(decoded.group_prefix_bits_, header.group_prefix_bits_);
           if (ordered) {
             header.group_prefix_ = 0;
-            EXPECT_FALSE(EncodeRecordHeader(header, key, bytes));
+            EXPECT_EQ(EncodeRecordHeader(header, key, bytes),
+                      type == ValueType::kSortedSet);
             header.group_prefix_ = std::uint64_t{1} << 63;
             header.group_prefix_bits_ = 1;
+            EXPECT_EQ(EncodeRecordHeader(header, key, bytes),
+                      type == ValueType::kSortedSet);
+            header.group_prefix_ = 123;  // Not a canonical high-bit prefix.
             EXPECT_FALSE(EncodeRecordHeader(header, key, bytes));
           } else {
             header.group_prefix_ = 123;

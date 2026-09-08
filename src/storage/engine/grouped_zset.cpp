@@ -701,6 +701,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       LoadedOrderedGroup page_;
     };
     auto read_page = [&](std::size_t i) -> Task<absl::StatusOr<ScanPage>> {
+      KEYLANE_FAULT_INJECT(
+          if (KEYLANE_FAULT_MATCHES("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY",
+                                    key)) co_return absl::
+              UnavailableError("injected ordered-page read failure"););
       if (ReadOnly(operation)) {
         co_await celer::Yield(*store.worker_);
         if (shutdown_flush_requested_)
@@ -865,22 +869,85 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       }
       co_return result;
     }
-    // No resident member index: locate only requested members, retaining no
-    // unrelated page. The key hold protects logical membership across passes.
-    for (std::size_t i = 0; i < metadata.size(); ++i) {
+    const bool indexed = object->has_member_index();
+    std::size_t remaining_sources = 0;
+    if (indexed) {
+      // Prefix routing retains only per-group metadata. Exact members and
+      // scores are decoded from the selected Hash leaves, never trusted from
+      // a digest alone. Batch requests read each selected leaf just once.
+      std::set<HashGroupId> selected;
+      for (const auto& [member, state] : members) {
+        const auto* route = object->directory().Find(member);
+        if (!route)
+          co_return absl::DataLossError("missing member prefix route");
+        selected.insert(route->id_);
+      }
+      for (const auto id : selected) {
+        if (ReadOnly(operation)) {
+          co_await celer::Yield(*store.worker_);
+          if (shutdown_flush_requested_)
+            co_return absl::CancelledError("member read cancelled by shutdown");
+        }
+        const auto current =
+            partition.grouped_objects_[db_id].CurrentForMutation(key);
+        if (!current || !current->SameLogicalRoot(*object) ||
+            current->version().db_epoch_ != object->version().db_epoch_ ||
+            current->version().replication_epoch_ !=
+                object->version().replication_epoch_ ||
+            current->version().index_generation_ !=
+                object->version().index_generation_)
+          co_return absl::NotFoundError("member-index population changed");
+        const auto* physical = current->FindGroup(id);
+        if (!physical)
+          co_return absl::DataLossError("missing member prefix page");
+        GroupedScratchBudget budget;
+        auto checked = budget.AddGroup(physical->value_,
+                                       current->ExtentsFor(id), key.size());
+        if (!checked.ok()) co_return checked;
+        auto admission = budget.Reserve(2);
+        if (!admission.ok()) co_return admission.status();
+        auto leaf = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
+                                                   digest, object, id);
+        if (!leaf.ok()) co_return leaf.status();
+        for (const auto& entry : leaf->snapshot_.value_.entries_) {
+          const auto requested = members.find(entry.field_);
+          if (requested == members.end()) continue;
+          auto score = DecodeSortedSetMemberScore(entry.value_);
+          if (!score.ok()) co_return score.status();
+          requested->second.before_ = requested->second.after_ = *score;
+          ++remaining_sources;
+        }
+      }
+      if (operation.kind_ == SortedSetOperationKind::kScores) {
+        status = ApplyInputs(operation, &members, &result);
+        if (!status.ok()) co_return status;
+        co_return result;
+      }
+    }
+    // Legacy roots still discover membership pagewise. Indexed mutations
+    // already know old scores, but retain the existing ordered-page locator;
+    // adding a score-boundary seek index is an independent optimization.
+    for (std::size_t i = 0;
+         i < metadata.size() && (!indexed || remaining_sources != 0); ++i) {
       auto page = co_await read_page(i);
       if (!page.ok()) co_return page.status();
       for (const auto& entry : page->page_.snapshot_.entries_) {
         auto member = members.find(entry.value_);
         if (member == members.end()) continue;
         auto& state = member->second;
-        if (state.before_)
+        if ((!indexed && state.before_) || state.source_ != kNoPage)
           co_return absl::DataLossError(
               "duplicate persisted Sorted Set member");
+        if (indexed && (!state.before_ || *state.before_ != entry.score_))
+          co_return absl::DataLossError("member-index/ordered score mismatch");
         state.before_ = state.after_ = entry.score_;
         state.source_ = i;
+        if (indexed) --remaining_sources;
       }
     }
+    if (indexed && remaining_sources != 0)
+      co_return absl::DataLossError(
+          "member index refers to missing ordered member");
     status = ApplyInputs(operation, &members, &result);
     if (!status.ok()) co_return status;
     if (ReadOnly(operation) || result.changed_ == 0) co_return result;

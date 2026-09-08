@@ -2203,15 +2203,16 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         value_type != ValueType::kList &&
         value_type != ValueType::kSortedSet) ||
        mutation_sequence == 0 ||
-       (auxiliary && (group->incarnation_ == 0 ||
-                      ((value_type == ValueType::kList ||
-                        value_type == ValueType::kSortedSet)
-                           ? (group->id_.prefix_ == 0 || group->id_.bits_ != 0)
-                           : !group->id_.valid()) ||
-                      expire_at_ms != 0 || explicit_root != nullptr ||
-                      (group->retired_ && logical_size != 0) ||
-                      (group->batch_txid_ != 0 && txid == 0) ||
-                      (tx == nullptr && !for_defrag))) ||
+       (auxiliary &&
+        (group->incarnation_ == 0 ||
+         ((value_type == ValueType::kList ||
+           (value_type == ValueType::kSortedSet && IsOrderedPageId(group->id_)))
+              ? (group->id_.prefix_ == 0 || group->id_.bits_ != 0)
+              : !group->id_.valid()) ||
+         expire_at_ms != 0 || explicit_root != nullptr ||
+         (group->retired_ && logical_size != 0) ||
+         (group->batch_txid_ != 0 && txid == 0) ||
+         (tx == nullptr && !for_defrag))) ||
        (grouped_root &&
         (logical_size == 0 || group->incarnation_ != 0 ||
          group->id_ != HashGroupId{} || group->retired_ ||

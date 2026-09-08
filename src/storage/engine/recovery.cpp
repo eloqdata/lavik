@@ -646,7 +646,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             const std::string_view encoded(
                 reinterpret_cast<const char*>(payload) + key_prefix,
                 record.payload_bytes_ - key_prefix);
-            if (ordered) {
+            if (ordered && IsOrderedPageId(hash_group->id_)) {
               auto decoded = DecodeOrderedGroup(encoded);
               if (!decoded.ok()) co_return decoded.status();
               if (decoded->kind_ != ordered_kind ||
@@ -701,11 +701,12 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               co_return absl::DataLossError("recovered group key is truncated");
             }
             encoded_bytes -= key_prefix;
-            // Roots are fixed-size. External roots carry large parent keys,
-            // whose source-dependent extent lifetime still protects reads of
-            // older root versions before the top-level merge is complete.
+            // Root size is fixed by its payload version. External roots carry
+            // large parent keys, whose source-dependent extent lifetime
+            // protects reads of older root versions before the top-level merge
+            // is complete.
             const std::size_t metadata_size = encoded_bytes;
-            if (metadata_size > (ordered ? kOrderedCollectionRootBytes
+            if (metadata_size > (ordered ? kIndexedSortedSetRootBytes
                                          : kGroupedHashRootBytes)) {
               co_return absl::DataLossError(
                   "recovered grouped root is too large");
@@ -1191,6 +1192,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
   const auto revision =
       root.revision_ == 0 ? version.root_.mutation_sequence_ : root.revision_;
   std::map<std::uint64_t, std::size_t> winners;
+  std::vector<RecoveredHashGroup> member_candidates;
   for (std::size_t i = 0; i < records.size(); ++i) {
     const auto& candidate = *records[i].hash_group_;
     if (candidate.incarnation_ != root.incarnation_ ||
@@ -1200,9 +1202,16 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
         (candidate.batch_txid_ != 0 &&
          !recovery_committed_txids_.contains(candidate.batch_txid_)))
       continue;
-    if (records[i].location_.value_type() != version.root_.value_type() ||
-        candidate.id_.bits_ != 0) {
+    if (records[i].location_.value_type() != version.root_.value_type()) {
       co_return absl::DataLossError("ordered candidate has a different type");
+    }
+    if (!IsOrderedPageId(candidate.id_)) {
+      if (!candidate.id_.valid())
+        co_return absl::DataLossError("invalid member group identity");
+      auto member = candidate;
+      member.record_token_ = i;
+      member_candidates.push_back(member);
+      continue;
     }
     auto [position, inserted] = winners.emplace(candidate.id_.prefix_, i);
     if (inserted) continue;
@@ -1276,9 +1285,17 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
     }
     candidates.push_back(candidate);
   }
+  std::optional<HashGroupDirectory> members;
+  if (root.member_index_) {
+    auto recovered = HashGroupDirectory::Recover(
+        *root.member_index_, version.root_.mutation_sequence_,
+        member_candidates, recovery_committed_txids_);
+    if (!recovered.ok()) co_return recovered.status();
+    members = std::move(*recovered);
+  }
   auto directory = OrderedGroupDirectory::Recover(
       root, revision, candidates, recovery_committed_txids_,
-      version.root_.mutation_sequence_);
+      version.root_.mutation_sequence_, std::move(members));
   if (!directory.ok()) co_return directory.status();
   std::vector<HashGroupLocation> locations;
   locations.reserve(candidates.size());
@@ -1294,6 +1311,20 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
   };
   for (const auto& candidate : directory->groups()) append(candidate);
   for (const auto& candidate : directory->retired_groups()) append(candidate);
+  if (const auto* member_directory = directory->member_directory()) {
+    auto append_member = [&](const RecoveredHashGroup& candidate) {
+      auto& physical = records[candidate.record_token_];
+      physical.grouped_reachable_ = true;
+      locations.push_back({.id_ = candidate.id_,
+                           .location_ = physical.location_,
+                           .extents_ = physical.extents_,
+                           .retired_ = candidate.retired_});
+    };
+    for (const auto& [prefix, member] : member_directory->groups())
+      append_member(member);
+    for (const auto& [id, member] : member_directory->retired_groups())
+      append_member(member);
+  }
   co_return GroupedHashObject::CreateOrdered(version, std::move(*directory),
                                              locations,
                                              store.record_index_entry_arena_);
@@ -1305,8 +1336,9 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroups(
     if (!record.grouped_reachable_ || !record.location_.external()) continue;
     // Ordered winners were fully checksummed while resolving their links;
     // there is no reason to read their potentially huge bodies twice.
-    if (record.location_.value_type() == ValueType::kList ||
-        record.location_.value_type() == ValueType::kSortedSet)
+    if ((record.location_.value_type() == ValueType::kList ||
+         record.location_.value_type() == ValueType::kSortedSet) &&
+        IsOrderedPageId(record.hash_group_->id_))
       continue;
     if (record.extents_ == nullptr) {
       co_return absl::DataLossError(

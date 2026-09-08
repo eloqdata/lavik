@@ -103,6 +103,60 @@ TEST(GroupedCollectionTest, RootAndPageRoundTripBothKinds) {
   }
 }
 
+TEST(GroupedCollectionTest, IndexedSortedSetRootBindsBothGraphsAndKeepsV1) {
+  auto root = Root({Page(1, 3, OrderedCollectionKind::kSortedSet)}, 2);
+  root.revision_ = 9;
+  const auto legacy = EncodeOrderedCollectionRoot(root);
+  ASSERT_TRUE(legacy.ok());
+  EXPECT_EQ(legacy->size(), kOrderedCollectionRootBytes);
+  root.member_index_ = GroupedHashRoot{.incarnation_ = root.incarnation_,
+                                       .field_count_ = 3,
+                                       .group_count_ = 1,
+                                       .revision_ = 7};
+  auto bytes = EncodeOrderedCollectionRoot(root);
+  ASSERT_TRUE(bytes.ok()) << bytes.status();
+  EXPECT_EQ(bytes->size(), kIndexedSortedSetRootBytes);
+  auto decoded = DecodeOrderedCollectionRoot(*bytes);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, root);
+  for (std::size_t n = 0; n < bytes->size(); ++n)
+    EXPECT_FALSE(DecodeOrderedCollectionRoot(bytes->substr(0, n)).ok()) << n;
+  EXPECT_FALSE(DecodeOrderedCollectionRoot(*bytes + "x").ok());
+  auto malformed = *bytes;
+  malformed[8] = 1;
+  EXPECT_FALSE(DecodeOrderedCollectionRoot(malformed).ok());
+  root.member_index_->field_count_ = 2;
+  EXPECT_FALSE(EncodeOrderedCollectionRoot(root).ok());
+  root.member_index_->field_count_ = 3;
+  root.member_index_->revision_ = 10;
+  EXPECT_FALSE(EncodeOrderedCollectionRoot(root).ok());
+  root.member_index_->revision_ = 7;
+  root.kind_ = OrderedCollectionKind::kList;
+  EXPECT_FALSE(EncodeOrderedCollectionRoot(root).ok());
+}
+
+TEST(GroupedCollectionTest, MemberScoresAreExactAndRejectMalformedValues) {
+  for (const double score :
+       {0.0, -0.0, 0.1, -19.5, std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity()}) {
+    auto bytes = EncodeSortedSetMemberScore(score);
+    ASSERT_EQ(bytes.size(), 8);
+    auto decoded = DecodeSortedSetMemberScore(bytes);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    EXPECT_EQ(std::bit_cast<std::uint64_t>(*decoded),
+              std::bit_cast<std::uint64_t>(score));
+  }
+  EXPECT_FALSE(DecodeSortedSetMemberScore("1").ok());
+  EXPECT_FALSE(
+      DecodeSortedSetMemberScore(
+          EncodeSortedSetMemberScore(std::numeric_limits<double>::quiet_NaN()))
+          .ok());
+  EXPECT_FALSE(IsOrderedPageId({0, 0}));
+  EXPECT_FALSE(IsOrderedPageId({0, 1}));
+  EXPECT_FALSE(IsOrderedPageId({std::uint64_t{1} << 63, 1}));
+  EXPECT_TRUE(IsOrderedPageId({1, 0}));
+}
+
 TEST(GroupedCollectionTest,
      CodecsRejectTruncationReservedBitsAndInvalidIdentity) {
   auto page = Page();

@@ -17,6 +17,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "keylane/local_shared_ptr.h"
 #include "keylane/memory.h"
 #include "keylane/storage/detail/hash_codec.h"
 #include "keylane/storage/scan_hash_map.h"
@@ -149,10 +150,13 @@ struct RecoveredHashGroup {
 // update allocates only the logarithmic search path. Nodes are admitted and
 // charged independently, so old snapshot readers retain exactly the nodes
 // they still own; no mutation log is replayed by a later read.
+// All node references and destruction stay on the key owner. Cross-worker
+// readers send physical identities or owner-routed stream handles, not these
+// links, so persistent sharing does not require atomic reference counts.
 template <typename Key>
 class HashGroupMap {
   struct Node;
-  using Link = std::shared_ptr<const Node>;
+  using Link = LocalSharedPtr<const Node>;
   struct Node {
     std::pair<const Key, RecoveredHashGroup> entry_;
     Link left_, right_;
@@ -271,9 +275,9 @@ class HashGroupMap {
         .owner_shard_ = CurrentMemoryAccountingShard(),
         .externally_admitted_ = true,
         .externally_accounted_ = false};
-    return Link(std::allocate_shared<Node>(RetainedAllocator<Node>(domain), key,
-                                           value, std::move(left),
-                                           std::move(right)));
+    return Link(AllocateLocalShared<Node>(RetainedAllocator<Node>(domain), key,
+                                          value, std::move(left),
+                                          std::move(right)));
   }
   static absl::StatusOr<Link> Balance(Key key, RecoveredHashGroup value,
                                       Link left, Link right) {

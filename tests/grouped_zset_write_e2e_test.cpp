@@ -1,3 +1,6 @@
+#include <cstdlib>
+#include <optional>
+
 #include "grouped_write_e2e_support.h"
 
 namespace {
@@ -37,6 +40,105 @@ std::vector<std::string> ZSetSeed(std::string key) {
     command.push_back(std::to_string(i) + std::string(128, 'm'));
   }
   return command;
+}
+
+TEST(GroupedSortedSetWriteE2e, MemberScoresUsePrefixPagesWithoutOrderedReads) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires ordered-read failure injection";
+#endif
+  PrivateDisk disk;
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed("indexed")).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto records = disk.Auxiliaries("indexed");
+  ASSERT_FALSE(records.empty());
+  std::size_t ordered = 0, prefixes = 0;
+  for (const auto& [id, bits] : records.rbegin()->second)
+    (bits == 0 && id != 0 ? ordered : prefixes)++;
+  EXPECT_GT(ordered, 1);
+  EXPECT_GT(prefixes, 1);
+
+  struct Fault {
+    std::optional<std::string> previous_;
+    Fault() {
+      if (const char* value = std::getenv("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY"))
+        previous_ = value;
+      ::setenv("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY", "indexed", 1);
+    }
+    ~Fault() {
+      if (previous_)
+        ::setenv("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY", previous_->c_str(), 1);
+      else
+        ::unsetenv("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY");
+    }
+  } fault;
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  const auto member = "128" + std::string(128, 'm');
+  EXPECT_EQ(client.Command({"ZSCORE", "indexed", member}).text_, "128");
+  auto scores =
+      client.Command({"ZMSCORE", "indexed", member, "missing", member});
+  ASSERT_EQ(scores.items_.size(), 3);
+  EXPECT_EQ(scores.items_[0].text_, "128");
+  EXPECT_EQ(scores.items_[1].text_, "-1");
+  EXPECT_EQ(scores.items_[2].text_, "128");
+  const auto range = client.Command({"ZRANGE", "indexed", "0", "0"});
+  EXPECT_EQ(range.kind_, '-');
+  EXPECT_NE(range.text_.find("injected ordered-page"), std::string::npos);
+  EXPECT_EQ(client.Command({"ZCARD", "indexed"}).text_, "256");
+  EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e, FailedMemberWriteCannotCommitOrderedHalf) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires auxiliary-write failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string member(9 * 1024 * 1024, 'I');
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"ZADD", "indexed{undo}", "1", member}).text_,
+              "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    // One ordered page is staged first. Fail on the member-index page, then
+    // commit a later EXEC command: the staged half must never become visible.
+    Server server(disk, 3, {}, "indexed{undo}", false, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"ZINCRBY", "indexed{undo}", "10", member}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"SET", "guard{undo}", "after"}).text_, "QUEUED");
+    auto reply = client.Command({"EXEC"});
+    ASSERT_EQ(reply.items_.size(), 2) << reply.text_ << server.Log();
+    EXPECT_EQ(reply.items_[0].kind_, '-');
+    EXPECT_TRUE(reply.items_[0].text_.starts_with("OOM"));
+    EXPECT_EQ(reply.items_[1].text_, "OK");
+    EXPECT_EQ(client.Command({"ZSCORE", "indexed{undo}", member}).text_, "1");
+    auto range =
+        client.Command({"ZRANGE", "indexed{undo}", "0", "0", "WITHSCORES"});
+    ASSERT_EQ(range.items_.size(), 2);
+    EXPECT_EQ(range.items_[0].text_, member);
+    EXPECT_EQ(range.items_[1].text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 4);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZSCORE", "indexed{undo}", member}).text_, "1");
+  EXPECT_EQ(client.Command({"GET", "guard{undo}"}).text_, "after");
+  EXPECT_EQ(client.Command({"ZREM", "indexed{undo}", member}).text_, "1");
+  EXPECT_EQ(client.Command({"ZADD", "indexed{undo}", "2", "replacement"}).text_,
+            "1");
+  EXPECT_EQ(client.Command({"ZSCORE", "indexed{undo}", member}).text_, "-1");
+  EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
 TEST(GroupedSortedSetWriteE2e, PointFlagsDuplicatesScoresAndAtomicNan) {
@@ -416,7 +518,7 @@ TEST(GroupedSortedSetWriteE2e,
 
 TEST(GroupedSortedSetWriteE2e, AggregateAbove512MiBRemainsBoundedAndRecovers) {
   // A private, RAII-owned sparse file, never an existing user device.
-  PrivateDisk disk(4ULL * 1024 * 1024 * 1024, "/mnt/dev");
+  PrivateDisk disk(4ULL * 1024 * 1024 * 1024);
   disk.PreserveOnFailure();
   auto member = [](unsigned i) {
     return std::to_string(i) + ":" + std::string(9 * 1024 * 1024, 'L');

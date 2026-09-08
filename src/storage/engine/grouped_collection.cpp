@@ -36,6 +36,13 @@ bool ValidKind(OrderedCollectionKind kind) {
 }
 
 bool ValidRoot(const OrderedCollectionRoot& root) {
+  if (root.member_index_ &&
+      (root.kind_ != OrderedCollectionKind::kSortedSet ||
+       root.member_index_->incarnation_ != root.incarnation_ ||
+       root.member_index_->field_count_ != root.item_count_ ||
+       root.member_index_->revision_ == 0 ||
+       root.member_index_->revision_ > root.revision_))
+    return false;
   return ValidKind(root.kind_) && root.incarnation_ != 0 &&
          root.item_count_ != 0 &&
          root.item_count_ <= std::numeric_limits<std::uint32_t>::max() &&
@@ -117,13 +124,28 @@ bool OrderedEntryLess(const OrderedCollectionEntry& left,
          (left.score_ == right.score_ && left.value_ < right.value_);
 }
 
+std::string EncodeSortedSetMemberScore(double score) {
+  std::string bytes(8, '\0');
+  Store(bytes, 0, std::bit_cast<std::uint64_t>(score), 8);
+  return bytes;
+}
+
+absl::StatusOr<double> DecodeSortedSetMemberScore(std::string_view bytes) {
+  if (bytes.size() != 8)
+    return absl::DataLossError("invalid Sorted Set member score size");
+  const auto score = std::bit_cast<double>(Load(bytes, 0, 8));
+  if (std::isnan(score))
+    return absl::DataLossError("NaN in Sorted Set member index");
+  return score;
+}
+
 absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
     const OrderedCollectionRoot& root) {
   if (!ValidRoot(root))
     return absl::InvalidArgumentError("invalid ordered collection root");
   std::string bytes(kRootBytes, '\0');
   bytes.replace(0, kRootMagic.size(), kRootMagic);
-  Store(bytes, 8, 1, 4);
+  Store(bytes, 8, root.member_index_ ? 2 : 1, 4);
   Store(bytes, 12, static_cast<unsigned>(root.kind_), 1);
   Store(bytes, 16, root.incarnation_, 8);
   Store(bytes, 24, root.item_count_, 8);
@@ -132,14 +154,21 @@ absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
   Store(bytes, 48, root.next_group_id_, 8);
   Store(bytes, 56, root.group_count_, 4);
   Store(bytes, 64, root.revision_, 8);
+  if (root.member_index_) {
+    auto members = EncodeGroupedHashRoot(*root.member_index_);
+    if (!members.ok()) return members.status();
+    bytes.append(*members);
+  }
   return bytes;
 }
 
 absl::StatusOr<OrderedCollectionRoot> DecodeOrderedCollectionRoot(
     std::string_view bytes) {
-  if (bytes.size() != kRootBytes || !bytes.starts_with(kRootMagic) ||
-      Load(bytes, 8, 4) != 1 || Load(bytes, 13, 3) != 0 ||
-      Load(bytes, 60, 4) != 0) {
+  if ((bytes.size() != kRootBytes &&
+       bytes.size() != kIndexedSortedSetRootBytes) ||
+      !bytes.starts_with(kRootMagic) ||
+      Load(bytes, 8, 4) != (bytes.size() == kRootBytes ? 1 : 2) ||
+      Load(bytes, 13, 3) != 0 || Load(bytes, 60, 4) != 0) {
     return absl::DataLossError("invalid ordered root encoding");
   }
   OrderedCollectionRoot root{
@@ -151,6 +180,11 @@ absl::StatusOr<OrderedCollectionRoot> DecodeOrderedCollectionRoot(
       .next_group_id_ = Load(bytes, 48, 8),
       .group_count_ = static_cast<std::uint32_t>(Load(bytes, 56, 4)),
       .revision_ = Load(bytes, 64, 8)};
+  if (bytes.size() == kIndexedSortedSetRootBytes) {
+    auto members = DecodeGroupedHashRoot(bytes.substr(kRootBytes));
+    if (!members.ok()) return members.status();
+    root.member_index_ = *members;
+  }
   if (!ValidRoot(root)) return absl::DataLossError("invalid ordered root");
   return root;
 }
@@ -297,7 +331,10 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
     const OrderedCollectionRoot& root, std::uint64_t root_sequence,
     std::span<const RecoveredOrderedGroup> candidates,
     const absl::flat_hash_set<std::uint64_t>& committed_txids,
-    std::uint64_t command_sequence) {
+    std::uint64_t command_sequence, std::optional<HashGroupDirectory> members) {
+  if (root.member_index_.has_value() != members.has_value() ||
+      (members && members->root() != *root.member_index_))
+    return absl::DataLossError("Sorted Set member directory/root mismatch");
   if (!ValidRoot(root) || root_sequence == 0 ||
       (root.revision_ != 0 && root.revision_ != root_sequence))
     return absl::DataLossError("invalid ordered root recovery identity");
@@ -330,6 +367,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
       winner = candidate;
   }
   OrderedGroupDirectory result;
+  result.members_ = std::move(members);
   for (auto it = winners.begin(); it != winners.end();) {
     if (it->second.retired_) {
       result.retired_.push_back(it->second);
@@ -394,7 +432,8 @@ const RecoveredOrderedGroup* OrderedGroupDirectory::FindRecord(
 absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     const OrderedCollectionRoot& root, std::uint64_t revision,
     std::span<const RecoveredOrderedGroup> changed,
-    std::uint64_t command_sequence) const {
+    std::uint64_t command_sequence,
+    std::span<const RecoveredHashGroup> member_changes) const {
   if (root.kind_ != root_.kind_ || root.incarnation_ != root_.incarnation_ ||
       revision <= sequence_ || command_sequence < command_sequence_ ||
       root.next_group_id_ < root_.next_group_id_) {
@@ -420,7 +459,19 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     }
     append(item);
   }
-  return Recover(root, revision, candidates, {}, command_sequence);
+  auto members = members_;
+  if (root.member_index_.has_value() != members.has_value())
+    return absl::FailedPreconditionError("cannot change member index format");
+  if (members && members->root() != *root.member_index_) {
+    auto updated =
+        members->Apply(*root.member_index_, command_sequence, member_changes);
+    if (!updated.ok()) return updated.status();
+    members = std::move(*updated);
+  } else if (!member_changes.empty()) {
+    return absl::DataLossError("member writes without a new member revision");
+  }
+  return Recover(root, revision, candidates, {}, command_sequence,
+                 std::move(members));
 }
 
 std::optional<OrderedGroupDirectory::Position> OrderedGroupDirectory::FindRank(

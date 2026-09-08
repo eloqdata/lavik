@@ -285,8 +285,11 @@ bool ValidHashGroupHeader(const RecordHeader& header) noexcept {
       header.expire_at_ms_ != 0)
     return false;
   // Ordered page ids are opaque, monotonic identities, not hash ranges. A
-  // zero-bit hash mask would reject every valid ordered page id.
-  if (ordered)
+  // zero-bit hash mask would reject every valid ordered page id. Sorted Set
+  // member pages instead use canonical Hash prefixes, a disjoint namespace.
+  if (ordered &&
+      (header.value_type_ == ValueType::kList ||
+       (header.group_prefix_bits_ == 0 && header.group_prefix_ != 0)))
     return header.group_prefix_ != 0 && header.group_prefix_bits_ == 0;
   // Avoid a full-width shift for the root range and the deepest leaf.
   const auto mask = header.group_prefix_bits_ == 0

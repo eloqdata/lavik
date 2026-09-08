@@ -10,10 +10,11 @@ grouped representation remains in use until the key is deleted or replaced.
 Streaming collection imports construct grouped graphs directly. Both ordinary
 and Debug builds use the same read, mutation, recovery and maintenance adapters.
 
-Hash/Set use a persisted-seed prefix directory. List and Sorted Set use a
-separate ordered-page directory; a hash-prefix directory does not supply list
-rank or score/member ordering. These representations share the sparse object
-index, physical record pages, extent ownership and transaction lifecycle.
+Hash/Set use a persisted-seed prefix directory; List uses an ordered-page
+directory. Newly built Sorted Sets combine ordered `(score, member)` pages
+with a prefix directory mapping each member to its score. Both directories
+belong to one object and share its physical index and transaction lifecycle.
+A prefix directory alone does not supply rank or score/member ordering.
 
 ## Identity and ownership
 
@@ -39,6 +40,14 @@ live extent checksum while retaining only routing envelopes. Full-page
 decoding validates local item ordering; Sorted Set materialization also checks
 score/binary-member ordering across adjacent pages.
 
+Indexed Sorted Sets persist each member twice: once in an ordered page and
+once as a Hash field whose value is an eight-byte little-endian IEEE-754
+score. The member index records scores, not ordered page identifiers, so
+ordered splits do not invalidate member routing. Neither directory retains
+members or scores in memory. Both graphs have the same incarnation and
+cardinality. Their revisions need not match: an ordered-only topology change
+or compensating root may retain an older, unchanged member graph.
+
 The outer root record retains source command order; its payload separately
 persists a local group revision. One native replay envelope may therefore
 change the same key repeatedly without treating distinct group versions as
@@ -61,12 +70,16 @@ tombstone/graph retirement path.
 
 Views share unchanged physical index pages across mutations. Hash routing
 nodes are persistent; the ordered rank directory owns admitted metadata
-vectors and reconstructs them for page-content or topology changes. Retained
+vectors and reconstructs them for page-content or topology changes. Routing
+and physical-index node references, including final destruction, remain on
+the key owner. Cross-worker readers exchange physical identities or stream
+handles that route metadata access and cleanup back to that owner. Retained
 directories, index pages, manifests, publication reservations, retirement
 receipts and snapshot pin lists participate in memory admission and accounting.
-Admission failures before root publication preserve the previous logical view. A handle retains
-metadata only: physical coordinates and allocation epochs are captured before
-suspension, and snapshot readers additionally pin the complete captured graph.
+Admission failures before root publication preserve the previous logical view.
+A handle retains metadata only: physical coordinates and allocation epochs are
+captured before suspension, and snapshot readers additionally pin the complete
+captured graph.
 
 View population generations are scoped to one partition and logical database.
 Detaching that population advances its generation; resetting another partition
@@ -82,6 +95,20 @@ incarnation, group identity, field count, retirement state and a nested batch
 decision when present. Auxiliary records never enter the user-key winner merge
 or Redis key/expiry counts.
 
+The ordered-root payload has two checked versions: version 1 is 72 bytes and
+describes only the ordered graph; version 2 is 136 bytes and appends the
+64-byte Hash root for an indexed Sorted Set. Ordered auxiliary identifiers
+have zero prefix bits and a nonzero opaque page number. Member auxiliaries
+use canonical Hash prefixes (including the unsplit `{0, 0}` root), a disjoint
+identity space under the same Sorted Set type and incarnation. Recovery
+bounds each graph by its own root revision.
+
+Version-1 Sorted Sets remain readable and writable through the scan-based
+member path. New keys, compact promotions and streaming imports build
+version-2 roots; startup does not rewrite legacy objects. Older binaries
+cannot read the new dual-index format; logical export/import is required to
+move such data back to an older format.
+
 Each group contains a complete snapshot, not a mutation log requiring read-time
 replay or compaction. An indivisible large field, list item or sorted-set
 member occupies an oversized group;
@@ -94,6 +121,12 @@ storage waits, root preparation refreshes current GC coordinates and admits
 metadata before staging root bytes. Root index replacement and side-view
 publication then occur without suspension. Physical auxiliary writes alone
 make no user-visible mutation.
+
+Sorted Set mutation planning derives member-index changes from complete
+ordered before/after pages, including full-image callback and import paths.
+Changed ordered pages, prefix snapshots and split retirements share the same
+command-local decision and publish through one root. Failure cannot expose
+only one half of the update.
 
 A standalone grouped command uses one transaction decision. A command inside
 EXEC/Lua additionally tags its auxiliaries with a command-local batch decision;
@@ -170,21 +203,25 @@ contents before forming a replacement interval. Only changed snapshots enter
 the writer, and admitted reply buffers retain their charge across owner hops.
 
 Sorted Set operations use a typed storage interface. Cardinality reads root
-metadata; score/rank lookups and range counts scan admitted pages. Rank ranges
-start at the directory's selected pages; score ranges follow physical order.
-Range replies retain only admitted output members. Mixed-score BYLEX preserves
-global member ordering without a resident member index by repeatedly selecting
+metadata. Indexed score lookups read only the selected member-prefix pages;
+legacy score lookups, member ranks and range counts scan admitted ordered
+pages. Rank ranges start at the directory's selected pages; score ranges
+follow physical order. Range replies retain only admitted output members.
+Mixed-score BYLEX preserves global member ordering without a resident member
+index by repeatedly selecting
 the next member: its work can scale with the collection size times the offset
 and result count. Read-only scans retain shared key intent, yield between pages
 and revalidate their population without retaining the store mutex. Add, increment,
-remove and GEOADD first locate requested members, then route their final scores
-against old page boundaries. Only changed pages and structural link neighbours
-remain decoded during publication; a score moving across the set does not
-retain or rewrite its intervening values. There is no resident member index:
-lookup CPU and I/O can still scale with the collection, while scratch scales
-with requested members, selected pages and routing metadata. Repeated input
-members and conditional updates are evaluated in request order before any
-physical write. Endpoint pops share the typed sparse mutation path across
+remove and GEOADD use the member index, when present, to resolve old scores
+before locating ordered source pages and routing final scores against old page
+boundaries. Those ordered-page searches remain sequential. Only changed pages
+and structural link neighbours remain decoded during publication; a score
+moving across the set does not retain or rewrite its intervening values.
+There is no resident per-member
+index: ordered lookup CPU and I/O can still scale with the collection, while
+scratch scales with requested members, selected pages and routing metadata.
+Repeated input members and conditional updates are evaluated in request order
+before any physical write. Endpoint pops share the typed sparse mutation path across
 single-key, multi-key and blocking commands. ZSCAN uses two pagewise passes and
 a bounded digest-prefix selection heap, retaining whole collision buckets and
 the requested output rather than all members. Range-removal, random and other GEO commands retain
@@ -203,6 +240,12 @@ reclaimed while its records block is still scannable. External parent-key
 extents instead remain source-block dependencies because classification still
 requires the full key. Every live group, root and extent joins physical-owner
 accounting before orphan reclamation.
+
+For indexed Sorted Sets, reconstruction requires both complete directories
+and validates reachable member snapshots and extent checksums as well as the
+ordered graph. GC, deletion and snapshot pins cover both identity spaces.
+Logical collection streams traverse only ordered pages, emitting each member
+once; ingestion reconstructs the destination's member index from those pages.
 
 Native full-sync records and their side views use the candidate partition's
 locally mapped database epoch before that epoch becomes globally served.
@@ -310,5 +353,6 @@ API. Their implementation units remain under `src/storage/engine/`.
 | Incremental RDB collection parsing, preflight validation and import consumers | `include/keylane/rdb.h`, `src/redis/rdb.cpp`, `src/redis/rdb_import.cpp`, `src/redis/server.cpp`, `src/redis/command.cpp`, `src/replication/replication.cpp` |
 | Native compact wire streaming and transactional grouped ingestion | `include/keylane/storage/detail/collection_compact_stream.h`, `replica_collection_stage.h`; `src/storage/engine/collection_compact_stream.cpp`, `grouped_replication_source.cpp`, `replica_collection.cpp`, `replication.cpp` |
 | Ordered pages, rank routing and collection command adapters | `include/keylane/storage/sorted_set.h`; `include/keylane/storage/detail/grouped_collection.h`, `grouped_sorted_rewrite.h`; `src/storage/engine/grouped_collection.cpp`, `grouped_sorted_rewrite.cpp`, `grouped_ordered_io.cpp`, `grouped_ordered_mutation.cpp`, `grouped_list.cpp`, `grouped_zset.cpp`, `sorted_set_api.cpp`, `list_tree.cpp`, `compact_api.cpp` |
+| Sorted Set member-prefix reads and atomic dual-index planning | `src/storage/engine/grouped_zset.cpp`, `grouped_zset_members.cpp`, `grouped_ordered_mutation.cpp` |
 | Retirement, undo and database detach | `src/storage/engine/grouped_lifecycle.cpp`, `write.cpp`, `flush_db.cpp`, `replication.cpp` |
 | Recovery, GC and historical snapshots | `src/storage/engine/recovery.cpp`, `init.cpp`, `defrag.cpp`, `backup.cpp` |

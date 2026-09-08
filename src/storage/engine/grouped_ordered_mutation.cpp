@@ -69,7 +69,11 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     for (const auto& page : plan.writes_) {
       append_bytes += kBlockHeaderSlotBytes;
       for (const auto& entry : page.entries_)
-        append_bytes += entry.value_.size() + 16;
+        append_bytes += (entry.value_.size() + 16) *
+                        (value_type == ValueType::kSortedSet &&
+                                 (!previous || previous->has_member_index())
+                             ? 2
+                             : 1);
     }
     // A borrowed outer transaction must never wait on its own generation.
     // Only standalone admission coordinates reclaim before taking its lease.
@@ -152,6 +156,15 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     co_return absl::InvalidArgumentError(
         "ordered mutation changes incarnation");
   }
+  // Derive both graphs before staging either one. This shared writer also
+  // covers full-image callbacks and import, not only ZADD's typed fast path.
+  auto member_mutation = co_await PrepareSortedSetMembers(
+      store, partition, db_id, key, digest, previous, plan);
+  if (!member_mutation.ok()) co_return member_mutation.status();
+  auto& member_plan = member_mutation->plan_;
+  if (value_type == ValueType::kSortedSet &&
+      (!previous || previous->has_member_index()))
+    plan.root_.member_index_ = member_plan.root_;
   auto root_payload = EncodeOrderedCollectionRoot(plan.root_);
   if (!root_payload.ok()) co_return root_payload.status();
   // Validate every indivisible field/envelope before the first disk write.
@@ -168,6 +181,14 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           "group snapshot and parent key exceed payload limit");
     }
   }
+  for (const auto& snapshot : member_plan.writes_) {
+    const auto encoder = HashGroupEncoder::Create(snapshot);
+    if (!encoder.ok()) co_return encoder.status();
+    if (external_key &&
+        key.size() > kMaxRecordPayloadBytes - encoder->encoded_bytes())
+      co_return absl::OutOfRangeError(
+          "member snapshot and parent key exceed payload limit");
+  }
   auto decision = PrepareGroupedDecision(*tx);
   if (!decision.ok()) co_return decision.status();
   if (outer_transaction) {
@@ -177,12 +198,15 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     auto batch_decision = PrepareGroupedDecision(batch);
     if (!batch_decision.ok()) co_return batch_decision.status();
   }
+  if (!SameLogicalView(source_side, side.CurrentForMutation(key)))
+    co_return absl::AbortedError("member-index source changed during prepare");
+  source_side = side.CurrentForMutation(key);
   auto reserved = side.PreparePublish(key, source_side);
   if (!reserved.ok()) co_return reserved.status();
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
   std::vector<HashGroupLocation> written;
-  written.reserve(plan.writes_.size());
+  written.reserve(plan.writes_.size() + member_plan.writes_.size());
   // A failed batch in an outer transaction retains its staged bytes until the
   // outer commit retires them. Its existing fence must not point at a block we
   // recycled early; the absent batch decision makes those bytes invisible.
@@ -216,7 +240,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     }
     co_return absl::OkStatus();
   };
-  for (const auto& snapshot : plan.writes_) {
+  for (std::size_t i = 0; i < plan.writes_.size() + member_plan.writes_.size();
+       ++i) {
     // Fail before the selected auxiliary begins. Already staged earlier
     // auxiliaries exercise command-local batch abort inside an outer EXEC.
     // The key is explicit so unrelated client/maintenance writes are untouched.
@@ -229,9 +254,17 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           co_return absl::ResourceExhaustedError(
               "OOM injected grouped auxiliary admission failure");
         });
-    auto group = co_await WriteOrderedGroupRecordLocked(
-        store, partition, db_id, key, digest, snapshot, revision, *tx,
-        command_batch);
+    absl::StatusOr<HashGroupLocation> group;
+    if (i < plan.writes_.size()) {
+      group = co_await WriteOrderedGroupRecordLocked(
+          store, partition, db_id, key, digest, plan.writes_[i], revision, *tx,
+          command_batch);
+    } else {
+      group = co_await WriteHashGroupRecordLocked(
+          store, partition, db_id, key, digest,
+          member_plan.writes_[i - plan.writes_.size()], revision, *tx,
+          ValueType::kSortedSet, command_batch);
+    }
     if (!group.ok()) {
       const auto original = group.status();
       const auto abandoned = co_await abandon();
@@ -240,13 +273,26 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     written.push_back(std::move(*group));
   }
   std::vector<RecoveredOrderedGroup> candidates;
+  std::vector<RecoveredHashGroup> member_candidates;
   std::vector<HashGroupId> written_ids;
   candidates.reserve(written.size());
   written_ids.reserve(written.size());
   for (std::size_t i = 0; i < written.size(); ++i) {
     const auto& group = written[i];
-    const auto& page = plan.writes_[i];
     written_ids.push_back(group.id_);
+    if (i >= plan.writes_.size()) {
+      member_candidates.push_back(
+          {.incarnation_ = plan.root_.incarnation_,
+           .id_ = group.id_,
+           .sequence_ = revision,
+           .lsn_ = revision,
+           .txid_ = tx->txid_,
+           .batch_txid_ = command_batch,
+           .field_count_ = group.location_.logical_size_,
+           .retired_ = group.retired_});
+      continue;
+    }
+    const auto& page = plan.writes_[i];
     candidates.push_back({.incarnation_ = plan.root_.incarnation_,
                           .id_ = page.id_,
                           .previous_ = page.previous_,
@@ -279,14 +325,23 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         }
         GroupedObjectVersion version = physical;
         version.decision_ = *decision;
+        std::optional<HashGroupDirectory> members;
+        if (!previous && plan.root_.member_index_) {
+          auto recovered = HashGroupDirectory::Recover(
+              *plan.root_.member_index_, sequence, member_candidates,
+              absl::flat_hash_set<std::uint64_t>{tx->txid_, command_batch});
+          if (!recovered.ok()) return recovered.status();
+          members = std::move(*recovered);
+        }
         absl::StatusOr<OrderedGroupDirectory> directory =
             previous ? current->ordered_directory().Apply(plan.root_, revision,
-                                                          candidates, sequence)
+                                                          candidates, sequence,
+                                                          member_candidates)
                      : OrderedGroupDirectory::Recover(
                            plan.root_, revision, candidates,
                            absl::flat_hash_set<std::uint64_t>{tx->txid_,
                                                               command_batch},
-                           sequence);
+                           sequence, std::move(members));
         if (!directory.ok()) return directory.status();
         auto prepared =
             previous ? GroupedHashObject::PrepareUpdateOrdered(

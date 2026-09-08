@@ -5,6 +5,8 @@
 #include <bit>
 #include <tuple>
 
+#include "keylane/local_shared_ptr.h"
+
 namespace keylane::storage {
 namespace {
 
@@ -101,6 +103,20 @@ absl::StatusOr<std::shared_ptr<T>> AllocateObject(
       RetainedAllocator<T>(arena->allocation_domain()));
 }
 
+template <typename T>
+absl::StatusOr<LocalSharedPtr<T>> AllocateLocalObject(
+    const std::shared_ptr<ScanHashMapEntryArena>& arena) {
+  auto reservation =
+      TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(T) + 1024));
+  if (!reservation) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "OOM grouped metadata exceeds maxmemory");
+  }
+  return AllocateLocalShared<T>(
+      RetainedAllocator<T>(arena->allocation_domain()));
+}
+
 struct OwnedDirectory {
   HashGroupDirectory directory_;
 };
@@ -150,7 +166,16 @@ absl::Status ValidateRoot(const GroupedObjectVersion& version,
 
 absl::Status ValidateLocation(const HashGroupLocation& group,
                               const GroupedObjectVersion& version,
+                              const HashGroupDirectory& directory);
+
+absl::Status ValidateLocation(const HashGroupLocation& group,
+                              const GroupedObjectVersion& version,
                               const OrderedGroupDirectory& directory) {
+  if (!IsOrderedPageId(group.id_)) {
+    if (const auto* members = directory.member_directory())
+      return ValidateLocation(group, version, *members);
+    return absl::DataLossError("member page without a member index");
+  }
   const auto& location = group.location_;
   const auto* route = directory.FindRecord(group.id_.prefix_);
   if (group.id_.prefix_ == 0 || group.id_.bits_ != 0 ||
@@ -285,18 +310,21 @@ struct GroupIndexPage {
 };
 
 struct GroupIndexNode {
-  std::shared_ptr<const GroupIndexPage> page_;
-  std::shared_ptr<const GroupIndexNode> children_[2];
+  // Like routing nodes, these links never leave the key owner, even when the
+  // indexed physical blocks belong to other workers. Outer transfer handles
+  // route final metadata cleanup back here; manifests may still cross workers.
+  LocalSharedPtr<const GroupIndexPage> page_;
+  LocalSharedPtr<const GroupIndexNode> children_[2];
   std::size_t size_ = 0;
 };
 
-using NodeHandle = std::shared_ptr<const GroupIndexNode>;
+using NodeHandle = LocalSharedPtr<const GroupIndexNode>;
 
 absl::StatusOr<NodeHandle> BuildPhysical(
     std::span<const HashGroupLocation> records, unsigned depth,
     const std::shared_ptr<ScanHashMapEntryArena>& arena) {
   if (records.empty()) return NodeHandle{};
-  auto node = AllocateObject<GroupIndexNode>(arena);
+  auto node = AllocateLocalObject<GroupIndexNode>(arena);
   if (!node.ok()) return node.status();
   (*node)->size_ = records.size();
   if (records.size() > kGroupIndexPageEntries) {
@@ -314,7 +342,7 @@ absl::StatusOr<NodeHandle> BuildPhysical(
     }
     return NodeHandle(std::move(*node));
   }
-  auto page = AllocateObject<GroupIndexPage>(arena);
+  auto page = AllocateLocalObject<GroupIndexPage>(arena);
   if (!page.ok()) return page.status();
   const auto ids_bytes =
       AllocatorUsableSizeForRequest(records.size() * sizeof(HashGroupId));
@@ -361,9 +389,13 @@ absl::StatusOr<NodeHandle> BuildPhysical(
   return NodeHandle(std::move(*node));
 }
 
-const GroupIndexPage* FindPage(NodeHandle node, HashGroupId id) {
+const GroupIndexPage* FindPage(const NodeHandle& root, HashGroupId id) {
+  // The immutable root keeps the whole path alive during this non-suspending
+  // lookup; walking borrowed pointers need not touch even the local counts.
+  const auto* node = root.get();
   unsigned depth = 0;
-  while (node && !node->page_) node = node->children_[IdentityBit(id, depth++)];
+  while (node && !node->page_)
+    node = node->children_[IdentityBit(id, depth++)].get();
   return node ? node->page_.get() : nullptr;
 }
 
@@ -405,7 +437,7 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
     for (auto& [id, record] : records) merged.push_back(std::move(record));
     return BuildPhysical(merged, depth, arena);
   }
-  auto replacement = AllocateObject<GroupIndexNode>(arena);
+  auto replacement = AllocateLocalObject<GroupIndexNode>(arena);
   if (!replacement.ok()) return replacement.status();
   const auto middle = std::partition_point(
       changed.begin(), changed.end(),
@@ -697,8 +729,12 @@ GroupedHashObject::PrepareCreateOrdered(
       record.extents_ = std::move(*owned);
     }
   }
-  if (active != directory.root().group_count_ ||
-      records.size() - active != directory.retired_groups().size()) {
+  const auto* members = directory.member_directory();
+  if (active != static_cast<std::uint64_t>(directory.root().group_count_) +
+                    (members ? members->root().group_count_ : 0) ||
+      records.size() - active !=
+          directory.retired_groups().size() +
+              (members ? members->retired_groups().size() : 0)) {
     return absl::DataLossError("grouped object has missing active locations");
   }
   for (const auto block : extent_blocks) {
@@ -746,14 +782,25 @@ GroupedHashObject::PrepareUpdateOrdered(
   }
   const auto valid_root = ValidateRoot(provisional_version, directory);
   if (!valid_root.ok()) return valid_root;
+  if (expected->has_member_index() && directory.member_directory() &&
+      expected->directory().root() != directory.member_directory()->root() &&
+      std::none_of(
+          changed_locations.begin(), changed_locations.end(),
+          [](const auto& record) { return !IsOrderedPageId(record.id_); }))
+    return absl::DataLossError(
+        "member revision changed without physical writes");
   auto arena = expected->physical_->arena_;
   std::vector<HashGroupLocation> changed(changed_locations.begin(),
                                          changed_locations.end());
   std::sort(changed.begin(), changed.end(),
             [](const auto& a, const auto& b) { return a.id_ < b.id_; });
   std::optional<HashGroupId> previous;
-  std::int64_t active = expected->group_count();
-  std::int64_t fields = expected->ordered_directory().root().item_count_;
+  std::int64_t active =
+      expected->group_count() + (expected->has_member_index()
+                                     ? expected->directory().root().group_count_
+                                     : 0);
+  std::int64_t fields = expected->ordered_directory().root().item_count_ *
+                        (expected->has_member_index() ? 2 : 1);
   for (auto& record : changed) {
     const auto valid = ValidateLocation(record, provisional_version, directory);
     if (!valid.ok()) return valid;
@@ -772,8 +819,11 @@ GroupedHashObject::PrepareUpdateOrdered(
       record.extents_ = std::move(*owned);
     }
   }
-  if (active != directory.root().group_count_ ||
-      fields != static_cast<std::int64_t>(directory.root().item_count_)) {
+  const auto* members = directory.member_directory();
+  if (active != static_cast<std::int64_t>(directory.root().group_count_) +
+                    (members ? members->root().group_count_ : 0) ||
+      fields != static_cast<std::int64_t>(directory.root().item_count_) *
+                    (members ? 2 : 1)) {
     return absl::DataLossError(
         "group update omits a split retirement or child");
   }
@@ -957,25 +1007,27 @@ absl::StatusOr<GroupedHashObject::Handle> GroupedHashObject::RelocateGroup(
 
 const RecordIndex::Entry* GroupedHashObject::FindGroup(
     std::string_view field) const {
-  if (is_ordered()) return nullptr;
-  const auto* route = directory_->Find(field);
+  if (is_ordered() && !has_member_index()) return nullptr;
+  const auto* route = directory().Find(field);
   return route == nullptr ? nullptr : FindRecord(route->id_);
 }
 
 const RecordIndex::Entry* GroupedHashObject::FindGroup(HashGroupId id) const {
-  if (is_ordered()) {
+  if (is_ordered() && IsOrderedPageId(id)) {
     return id.bits_ == 0 && ordered_directory_->Find(id.prefix_) != nullptr
                ? FindRecord(id)
                : nullptr;
   }
-  const auto route = directory_->groups().find(id.prefix_);
-  if (route == directory_->groups().end() || route->second.id_ != id)
+  if (is_ordered() && !has_member_index()) return nullptr;
+  const auto route = directory().groups().find(id.prefix_);
+  if (route == directory().groups().end() || route->second.id_ != id)
     return nullptr;
   return FindRecord(id);
 }
 
 const RecordIndex::Entry* GroupedHashObject::FindRecord(HashGroupId id) const {
-  if (is_ordered() ? (id.prefix_ == 0 || id.bits_ != 0) : !id.valid())
+  if (!(is_ordered() && IsOrderedPageId(id)) &&
+      (!id.valid() || (is_ordered() && !has_member_index())))
     return nullptr;
   const auto* page = FindPage(physical_->root_, id);
   if (!page) return nullptr;
@@ -986,7 +1038,8 @@ const RecordIndex::Entry* GroupedHashObject::FindRecord(HashGroupId id) const {
 
 std::shared_ptr<const std::vector<ExtentRef>> GroupedHashObject::ExtentsFor(
     HashGroupId id) const {
-  if (is_ordered() ? (id.prefix_ == 0 || id.bits_ != 0) : !id.valid())
+  if (!(is_ordered() && IsOrderedPageId(id)) &&
+      (!id.valid() || (is_ordered() && !has_member_index())))
     return nullptr;
   const auto* page = FindPage(physical_->root_, id);
   return page ? ManifestFor(*page, id) : nullptr;

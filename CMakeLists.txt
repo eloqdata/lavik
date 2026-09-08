@@ -338,6 +338,7 @@ add_library(keylane_module
   src/storage/engine/grouped_ordered_io.cpp
   src/storage/engine/grouped_list.cpp
   src/storage/engine/grouped_zset.cpp
+  src/storage/engine/grouped_zset_members.cpp
   src/storage/engine/grouped_hash_random.cpp
   src/storage/engine/sorted_set_api.cpp
   src/storage/engine/transfer_api.cpp
@@ -975,6 +976,7 @@ if (BUILD_TESTING)
     tests/grouped_ordered_object_test.cpp
     tests/record_payload_cursor_test.cpp
     tests/grouped_object_index_test.cpp
+    tests/local_shared_ptr_test.cpp
     tests/logging_test.cpp
     tests/lua_eval_test.cpp
     tests/memory_test.cpp
