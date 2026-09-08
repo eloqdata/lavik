@@ -356,10 +356,15 @@ state, before engine-wide storage objects are released.
 
 Logical mutations funnel through `AppendLocked`. The partition's mutation
 sequence advances, external payloads are prepared if required, and a record is
-appended to the current worker's ordinary or transaction-generation staging
-block. The in-memory index is updated immediately and may point at staged bytes
-that have not crossed a crash-durability boundary. Staged reads use that buffer
-directly.
+prepared for the current worker's ordinary or transaction-generation staging
+block. Client writes may carry a transport-neutral `MutationPrecondition`;
+after every potentially suspending lock, read, snapshot, extent, and block-
+allocation step, `WriteRecordLocked` validates it synchronously immediately
+before WATCH invalidation and staging/index publication. Background work,
+replica replay, and rollback do not depend on client authority. Once admitted,
+the record is appended and the in-memory index is updated immediately; it may
+point at staged bytes that have not crossed a crash-durability boundary. Staged
+reads use that buffer directly.
 
 Opted-in single-key writes to existing small inline Hash, Set, List and Sorted
 Set records retain exclusive key intent but release worker store state while
@@ -881,7 +886,7 @@ current source code are authoritative for present storage behavior.
 | Storage-path probing, device-set validation and expansion, controller/qpair affinity, metadata load, worker initialization and native-thread finalization, recovery barriers, and shutdown flush | `src/storage/engine/init.cpp`, `src/storage/engine/device_affinity.h`, `src/storage/engine/impl.h` |
 | Device-owner allocation, bitmap activation and cold-free retirement, epoch mirroring, reserves, and allocator fail-stop behavior | `src/storage/engine/alloc.cpp` |
 | Parallel scans, block reassignment, epoch filtering, transaction decision collection, winner selection, and recovery accounting | `src/storage/engine/recovery.cpp`, `src/storage/engine/init.cpp` |
-| Append streams, extent construction, index publication, replacement accounting, transaction fences, commit batching and backpressure, commit decisions, caller wait policy, and rollback | `src/storage/engine/write.cpp`, `src/redis/command.cpp`, `src/redis/list_command.cpp`, `src/redis/sort_command.cpp` |
+| Append streams, mutation precondition, extent construction, WATCH/index publication, replacement accounting, transaction fences, commit batching and backpressure, commit decisions, caller wait policy, and rollback | `include/keylane/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp`, `src/redis/command.cpp`, `src/redis/list_command.cpp`, `src/redis/sort_command.cpp` |
 | Worker-sharded retained-memory admission and ownership, detached-index reclaim, client-buffer quotas, full-sync reservations, and RDB snapshot admission failure | `include/keylane/memory.h`, `src/memory.cpp`, `include/keylane/storage/scan_hash_map.h`, `src/storage/engine/replication.cpp`, `src/storage/engine/backup.cpp` |
 | Staged and disk reads, bounded BatchGet waves, validation, pins, relocation retry, external-value assembly, and disk-backed reply leases | `src/storage/engine/read.cpp`, `include/keylane/storage/engine.h` |
 | Periodic flush snapshots, data-before-header ordering, alternating header commits, dirty-tail ordering, and retirement settlement | `src/storage/engine/flush.cpp` |

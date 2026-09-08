@@ -41,6 +41,7 @@ struct PreparedGroupControlIdentity {
   std::uint64_t group_term_ = 0;
   std::uint64_t authority_version_ = 0;
   std::uint64_t grant_revision_ = 0;
+  std::uint64_t config_epoch_ = 0;
   std::uint64_t manifest_revision_ = 0;
   Sha256Digest manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
@@ -128,9 +129,15 @@ struct NodeDirective {
   Sha256Digest manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
   std::vector<NodeManifestEntry> manifest_entries_;
+  // Reserved wire-schema fields. V1 rejects non-empty values before entering
+  // NodeControlActions because the native replication adapter has no
+  // operation-kind interpreter for them.
   std::string payload_;
   std::string preconditions_;
+  // Active V1 classification: only rebuild directives may set this. It drives
+  // non-serving-target admission and cross-operation mutation exclusion.
   bool storage_mutating_ = false;
+  // Reserved in V1 and rejected when true before entering NodeControlActions.
   bool force_ = false;
 
   friend bool operator==(const NodeDirective&, const NodeDirective&) = default;
@@ -251,21 +258,29 @@ class NodeControlInstaller {
   // adapter that never receives directives. Directive-capable adapters must
   // use InstallFullStateTransition(), even when a particular snapshot appears
   // to require no cleanup: concurrent admission is what makes the synchronous
-  // path unsafe. Calls are serialized on worker 0. Lower
-  // source indices and same-assignment counter regressions fail closed; same
+  // path unsafe. The adapter owns serialization: Meta transitions run on
+  // worker 0, while static startup/reload holds StaticClusterControl's refresh
+  // mutex across this call and worker-0 readiness changes. Lower source
+  // indices and same-assignment counter regressions fail closed; same
   // index/hash replay is idempotent.
   absl::Status InstallFullState(PreparedFullState prepared_state,
                                 ProjectionBasis projection_basis);
 
-  // Applies a live lease, or a committed fence only for a static adapter that
-  // never receives directives. ReplicationManager-backed Meta fences must use
-  // ApplyFenceTransition(). In either case the projection and complete
-  // authority anchor must still match the installed state.
-  absl::Status ApplyAuthority(const AuthorityMessage& authority_message);
+  // Applies a live lease at the caller's suspend-aware clock cut, or a
+  // committed fence only for a static adapter that never receives directives.
+  // Requiring `now` prevents a delayed caller from reviving an already-expired
+  // same-anchor lease. ReplicationManager-backed Meta grants/fences use the
+  // asynchronous transitions below so cleanup is joined. In every case the
+  // projection and complete authority anchor must still match installed state.
+  absl::Status ApplyAuthority(const AuthorityMessage& authority_message,
+                              MonotonicTime now);
 
-  // Meta-only grant boundary. Installs the grant and arms a worker-local
-  // exact-deadline timer. On expiry the timer invalidates only that lease
-  // instance and joins source authorization revocation before completing.
+  // Meta-only grant boundary. Installs the grant and schedules expiry with
+  // bounded relative waits that repeatedly check its suspend-aware deadline.
+  // Admission and renewal also compare that clock at their own cut, so a
+  // delayed worker timer cannot revive an expired lease. Expiry invalidates
+  // only that lease instance and joins source-authorization revocation before
+  // completing.
   celer::Task<absl::Status> ApplyLeaseGrantTransition(
       const AuthorityMessage& authority_message);
 
@@ -390,6 +405,7 @@ class NodeControlInstaller {
     SessionIdentity session_;
     AuthorityAnchor anchor_;
     MonotonicTime deadline_;
+    MonotonicDuration recheck_interval_;
     std::uint64_t timer_generation_ = 1;
     bool active_ = true;
   };
@@ -432,6 +448,11 @@ class NodeControlInstaller {
       std::shared_ptr<LeaseExpirySchedule> schedule,
       std::uint64_t timer_generation,
       std::shared_ptr<const LeaseTimerLifetime> lifetime);
+  // Completes one exact due schedule before any replacement grant is installed.
+  // It invalidates the old lease generation synchronously, retires the timer,
+  // and joins source/directive cleanup; callers remain fail-closed on failure.
+  celer::Task<absl::Status> FinishExpiredLeaseTransition(
+      std::shared_ptr<LeaseExpirySchedule> schedule, MonotonicTime now);
   void RememberDrain(std::shared_ptr<const ServingState> state,
                      const AuthorityAnchor& anchor);
   std::vector<AuthorityAnchor> RememberCurrentLocalDrains();

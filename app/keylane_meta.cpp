@@ -773,6 +773,11 @@ int main(int argc, char** argv) {
     control_options.observation_ttl_ms_ = observation_ttl_ms;
     control_options.leadership_validity_ms_ =
         static_cast<std::uint32_t>(options.election_ms_low_);
+    // Retain one additional full maximum-lease window after the theoretical
+    // prior expiry. The margin is derived from the same Raft leadership bound
+    // rather than an unrelated wall-clock constant.
+    control_options.lease_handoff_safety_margin_ms_ =
+        control_options.leadership_validity_ms_;
     auto control_or =
         MetaDataControlServer::Create(foreign_executor, server, *coordinator,
                                       obs_store, std::move(control_options));

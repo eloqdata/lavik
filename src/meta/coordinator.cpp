@@ -1122,8 +1122,9 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   InFlightGuard in_flight(*this);
 
   // One atomic committed view serves the fail-safe gates AND the validate
-  // hooks (KB-scale copy at control-plane proposal rates; cheaper than
-  // letting each hook snapshot independently, and consistent across them).
+  // hooks. This bounded aggregate copy may be large and contributes to
+  // proposal latency, but copying once is cheaper than letting each hook
+  // snapshot independently and keeps every validation on one exact cut.
   std::uint64_t applied_index = 0;
   std::uint64_t high_water = 0;
   MetaCommittedView view(AtomicStoresSnapshot(applied_index, high_water),

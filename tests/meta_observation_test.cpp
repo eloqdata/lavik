@@ -7,7 +7,8 @@
 // group terms, manifest or partition-replication-epoch mismatch, unbound
 // history, unknown/terminal
 // operations, generation-adoption purge, commit-driven revalidation with
-// read-path re-filtering, TTL expiry, capacity bounds, and the audit ring.
+// read-path re-filtering, TTL expiry, entry/domain/byte capacity bounds, exact
+// resource accounting across every removal path, and the audit ring.
 
 #include <cstdint>
 #include <map>
@@ -324,10 +325,14 @@ TEST(MetaObservationStore, NewGenerationAtomicallyPurgesOldObservations) {
                           facts, 1003)
                   .ok());
   ASSERT_EQ(store.size(), 4);
+  ASSERT_GT(store.retained_bytes(), 0u);
+  EXPECT_EQ(store.retained_bytes(), store.retained_bytes_for_node("n1"));
 
   // Adopting generation 2 atomically drops every generation-1 observation.
   ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0b, 2), 2000).ok());
   EXPECT_EQ(store.size(), 0);
+  EXPECT_EQ(store.retained_bytes(), 0u);
+  EXPECT_EQ(store.retained_bytes_for_node("n1"), 0u);
   EXPECT_FALSE(store.LatestForNode("n1", facts).has_value());
   EXPECT_TRUE(store.CandidateProgressFor("g1", facts).empty());
   EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts).empty());
@@ -363,10 +368,13 @@ TEST(MetaObservationStore, LeadershipChangeDropsSessionsAndAllSoftState) {
   ASSERT_TRUE(store.Ingest(BootObs(Ident("n1", 0x0a, 7)), facts, 1000).ok());
   ASSERT_TRUE(store.Ingest(HealthObs(Ident("n1", 0x0a, 7)), facts, 1001).ok());
   ASSERT_EQ(store.size(), 2);
+  ASSERT_GT(store.retained_bytes(), 0u);
 
   store.ResetForLeadershipChange();
 
   EXPECT_EQ(store.size(), 0);
+  EXPECT_EQ(store.retained_bytes(), 0u);
+  EXPECT_EQ(store.retained_bytes_for_node("n1"), 0u);
   EXPECT_FALSE(store.CurrentGeneration("n1").has_value());
   EXPECT_TRUE(store.AuditRing().empty());
   // A session from the previous leader epoch cannot continue writing even if
@@ -747,6 +755,107 @@ TEST(MetaObservationStore, EvidenceLatestWinsPerNodeAndPhase) {
   EXPECT_EQ(store.size(), 3);
 }
 
+TEST(MetaObservationStore,
+     EvidencePhaseCapacityIsPerNodeAcrossOperationDomains) {
+  MetaObservationStore::Limits limits;
+  limits.max_evidence_phases_per_node_ = 2;
+  limits.max_evidence_per_operation_ = 10;
+  MetaObservationStore store(limits);
+  FakeCommittedFacts facts = MakeFreshFacts();
+  facts.nonterminal_ops_.insert(OpId(0x52));
+  facts.bound_histories_[OpId(0x52)].insert(History(42));
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1",
+                                      "g1", 3, 7, 42),
+                          facts, 1000)
+                  .ok());
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x52), "p1",
+                                      "g1", 3, 7, 42),
+                          facts, 1001)
+                  .ok());
+  const std::uint64_t before_reject = store.retained_bytes();
+  ExpectDomainReject(store.Ingest(
+      EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p2", "g1", 3, 7, 42),
+      facts, 1002));
+  EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kRejected,
+                      "evidence-phase-set-full:node"));
+  EXPECT_EQ(store.size(), 2u);
+  EXPECT_EQ(store.retained_bytes(), before_reject);
+
+  // A latest-wins replacement consumes no additional phase slot and updates
+  // the exact byte charge. Generation adoption then releases both slots.
+  MetaObservation replacement =
+      EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 7, 42);
+  auto& payload = std::get<MetaOperationEvidenceObs>(replacement.payload_);
+  payload.evidence_ = "replacement-is-longer";
+  payload.evidence_hash_ = keylane::meta::MetaSha256(payload.evidence_);
+  ASSERT_TRUE(store.Ingest(std::move(replacement), facts, 1003).ok());
+  EXPECT_EQ(store.size(), 2u);
+  EXPECT_GT(store.retained_bytes(), before_reject);
+
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0b, 2), 1004).ok());
+  EXPECT_EQ(store.size(), 0u);
+  EXPECT_EQ(store.retained_bytes(), 0u);
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n1", 0x0b, 2), OpId(0x51), "p2",
+                                      "g1", 3, 7, 42),
+                          facts, 1005)
+                  .ok());
+}
+
+TEST(MetaObservationStore, EvidenceCapacityIsBoundedPerOperationDomain) {
+  MetaObservationStore::Limits limits;
+  limits.max_evidence_phases_per_node_ = 10;
+  limits.max_evidence_per_operation_ = 2;
+  limits.ttl_ms_ = 10;
+  MetaObservationStore store(limits);
+  FakeCommittedFacts facts = MakeFreshFacts();
+  for (const char* node : {"n1", "n2", "n3"}) {
+    ASSERT_TRUE(store.AdoptSession(Ident(node, 0x0a, 1), 1000).ok());
+  }
+
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1",
+                                      "g1", 3, 7, 42),
+                          facts, 1000)
+                  .ok());
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n2", 0x0a, 1), OpId(0x51), "p1",
+                                      "g1", 3, 7, 42),
+                          facts, 1001)
+                  .ok());
+  const std::uint64_t before_reject = store.retained_bytes();
+  ExpectDomainReject(store.Ingest(
+      EvidenceObs(Ident("n3", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 7, 42),
+      facts, 1002));
+  EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kRejected,
+                      "evidence-set-full:operation"));
+  EXPECT_EQ(store.size(), 2u);
+  EXPECT_EQ(store.retained_bytes(), before_reject);
+
+  // Purging one reporter decrements the operation-domain count exactly.
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0b, 2), 1003).ok());
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n3", 0x0a, 1), OpId(0x51), "p1",
+                                      "g1", 3, 7, 42),
+                          facts, 1004)
+                  .ok());
+  EXPECT_EQ(store.size(), 2u);
+
+  // TTL removal releases both the per-operation and per-reporter accounting.
+  store.SweepExpired(1015);
+  EXPECT_EQ(store.size(), 0u);
+  EXPECT_EQ(store.retained_bytes(), 0u);
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n1", 0x0b, 2), OpId(0x51), "p2",
+                                      "g1", 3, 7, 42),
+                          facts, 1016)
+                  .ok());
+}
+
 TEST(MetaObservationStore, LatestForNodePicksNewestAcrossKinds) {
   MetaObservationStore store;
   FakeCommittedFacts facts = MakeFreshFacts();
@@ -770,6 +879,25 @@ TEST(MetaObservationStore, LatestForNodePicksNewestAcrossKinds) {
 // Slice C: commit-driven revalidation, read re-filtering, TTL, total
 // capacity, and the audit ring.
 // ---------------------------------------------------------------------------
+
+TEST(MetaObservationStore, DefaultResourceLimitsTrackWireAndDomainCaps) {
+  const MetaObservationStore::Limits limits;
+  EXPECT_EQ(limits.max_sessions_total_, keylane::meta::kMaxMetaNodes);
+  EXPECT_EQ(limits.max_candidates_per_group_, keylane::meta::kMaxMetaNodes);
+  EXPECT_EQ(limits.max_evidence_phases_per_node_,
+            keylane::meta::kMaxMetaOperationEvidencePerRecord);
+  EXPECT_EQ(limits.max_evidence_per_operation_,
+            keylane::meta::kMaxMetaOperationEvidencePerRecord);
+  EXPECT_EQ(
+      limits.max_retained_bytes_total_,
+      static_cast<std::uint64_t>(keylane::meta::kMaxMetaNodes) *
+          (keylane::cluster::control::kMaxFrameBytes +
+           keylane::cluster::control::kMaxIdentifierBytes));
+  EXPECT_EQ(limits.max_retained_bytes_per_node_,
+            keylane::cluster::control::kMaxOperationEvidenceTransferBytes +
+                keylane::cluster::control::kMaxFrameBytes +
+                keylane::cluster::control::kMaxIdentifierBytes);
+}
 
 TEST(MetaObservationStore, RevalidateAllPurgesCommitStaleObservations) {
   MetaObservationStore store;
@@ -798,6 +926,9 @@ TEST(MetaObservationStore, RevalidateAllPurgesCommitStaleObservations) {
 
   store.RevalidateAll(facts, 2000);
   EXPECT_EQ(store.size(), 1);  // only n1's boot survives
+  EXPECT_EQ(store.retained_bytes(), 4u);  // identity and boot index: 2 + 2
+  EXPECT_EQ(store.retained_bytes_for_node("n1"), 4u);
+  EXPECT_EQ(store.retained_bytes_for_node("n2"), 0u);
   const auto latest = store.LatestForNode("n1", facts);
   ASSERT_TRUE(latest.has_value());
   EXPECT_TRUE(std::holds_alternative<MetaNodeBootObs>(latest->payload_));
@@ -885,6 +1016,8 @@ TEST(MetaObservationStore, SweepExpiredDropsEntriesOlderThanTtl) {
   EXPECT_EQ(store.size(), 2);  // ages 1000 and 500: boundary survives
   store.SweepExpired(2001);
   EXPECT_EQ(store.size(), 1);  // the boot (age 1001 > ttl) is gone
+  EXPECT_EQ(store.retained_bytes(), 6u);  // n1 identity/index + "ok"
+  EXPECT_EQ(store.retained_bytes_for_node("n1"), 6u);
   EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kTtlExpired, "ttl-expired"));
   const auto latest = store.LatestForNode("n1", facts);
   ASSERT_TRUE(latest.has_value());
@@ -945,6 +1078,88 @@ TEST(MetaObservationStore, TotalCapacityRejectsNewKeys) {
   EXPECT_EQ(store.size(), 3);
 }
 
+TEST(MetaObservationStore,
+     GlobalByteCapacityHasExactBoundaryAndReplacementIsAtomic) {
+  MetaObservationStore::Limits limits;
+  limits.max_retained_bytes_total_ = 5;
+  limits.max_retained_bytes_per_node_ = 100;
+  MetaObservationStore store(limits);
+  FakeCommittedFacts facts = MakeFreshFacts();
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+  ASSERT_TRUE(store.AdoptSession(Ident("n2", 0x0a, 1), 1000).ok());
+
+  // health "x" charges identity + map key + payload = 2 + 2 + 1 bytes.
+  ASSERT_TRUE(
+      store.Ingest(HealthObs(Ident("n1", 0x0a, 1), "x"), facts, 1000).ok());
+  EXPECT_EQ(store.retained_bytes(), 5u);
+  EXPECT_EQ(store.retained_bytes_for_node("n1"), 5u);
+
+  // A larger replacement and a new key both reject without losing or
+  // modifying the prior latest-wins value or any accounting.
+  ExpectDomainReject(
+      store.Ingest(HealthObs(Ident("n1", 0x0a, 1), "xx"), facts, 1001));
+  ExpectDomainReject(store.Ingest(BootObs(Ident("n2", 0x0a, 1)), facts, 1001));
+  EXPECT_TRUE(
+      RingHas(store, MetaObsAuditKind::kRejected, "store-bytes-full"));
+  EXPECT_EQ(store.size(), 1u);
+  EXPECT_EQ(store.retained_bytes(), 5u);
+  const auto latest = store.LatestForNode("n1", facts);
+  ASSERT_TRUE(latest.has_value());
+  EXPECT_EQ(std::get<MetaNodeHealthObs>(latest->payload_).health_, "x");
+
+  // Shrinking and then returning to the exact limit are both legal.
+  ASSERT_TRUE(
+      store.Ingest(HealthObs(Ident("n1", 0x0a, 1), ""), facts, 1002).ok());
+  EXPECT_EQ(store.retained_bytes(), 4u);
+  ASSERT_TRUE(
+      store.Ingest(HealthObs(Ident("n1", 0x0a, 1), "x"), facts, 1003).ok());
+  EXPECT_EQ(store.retained_bytes(), 5u);
+
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0b, 2), 1004).ok());
+  EXPECT_EQ(store.retained_bytes(), 0u);
+  ASSERT_TRUE(store.Ingest(BootObs(Ident("n2", 0x0a, 1)), facts, 1005).ok());
+  EXPECT_EQ(store.retained_bytes(), 4u);
+  store.ResetForLeadershipChange();
+  EXPECT_EQ(store.retained_bytes(), 0u);
+}
+
+TEST(MetaObservationStore, PerNodeByteCapacityDoesNotPenalizeOtherNodes) {
+  MetaObservationStore::Limits limits;
+  limits.max_retained_bytes_total_ = 100;
+  limits.max_retained_bytes_per_node_ = 5;
+  MetaObservationStore store(limits);
+  FakeCommittedFacts facts = MakeFreshFacts();
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+  ASSERT_TRUE(store.AdoptSession(Ident("n2", 0x0a, 1), 1000).ok());
+  ASSERT_TRUE(
+      store.Ingest(HealthObs(Ident("n1", 0x0a, 1), "x"), facts, 1000).ok());
+  ASSERT_TRUE(
+      store.Ingest(HealthObs(Ident("n2", 0x0a, 1), "x"), facts, 1000).ok());
+  EXPECT_EQ(store.retained_bytes(), 10u);
+
+  ExpectDomainReject(
+      store.Ingest(HealthObs(Ident("n1", 0x0a, 1), "xx"), facts, 1001));
+  EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kRejected, "node-bytes-full"));
+  EXPECT_EQ(store.retained_bytes(), 10u);
+  EXPECT_EQ(store.retained_bytes_for_node("n1"), 5u);
+  EXPECT_EQ(store.retained_bytes_for_node("n2"), 5u);
+}
+
+TEST(MetaObservationStore, SessionCapacityRejectsOnlyNewNodeKeys) {
+  MetaObservationStore::Limits limits;
+  limits.max_sessions_total_ = 1;
+  MetaObservationStore store(limits);
+
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+  ExpectDomainReject(store.AdoptSession(Ident("n2", 0x0a, 1), 1001));
+  EXPECT_TRUE(
+      RingHas(store, MetaObsAuditKind::kRejected, "session-store-full"));
+  EXPECT_FALSE(store.CurrentGeneration("n2").has_value());
+  // Replacing the existing node's generation cannot grow the session map.
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0b, 2), 1002).ok());
+  EXPECT_EQ(store.CurrentGeneration("n1"), std::optional<std::uint64_t>(2));
+}
+
 TEST(MetaObservationStore, OversizedPayloadFieldRejects) {
   MetaObservationStore store;
   FakeCommittedFacts facts = MakeFreshFacts();
@@ -955,6 +1170,15 @@ TEST(MetaObservationStore, OversizedPayloadFieldRejects) {
       .health_.assign(keylane::meta::kMaxMetaPayloadBytes + 1, 'x');
   ExpectDomainReject(store.Ingest(observation, facts, 1000));
   EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kRejected, "field-too-large"));
+  EXPECT_EQ(store.size(), 0);
+
+  MetaObservation evidence = EvidenceObs(
+      Ident("n1", 0x0a, 1), OpId(0x51),
+      std::string(keylane::cluster::control::kMaxIdentifierBytes + 1, 'p'),
+      "g1", 3, 7, 42);
+  ExpectDomainReject(store.Ingest(std::move(evidence), facts, 1001));
+  EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kRejected,
+                      "field-too-large:kind_phase"));
   EXPECT_EQ(store.size(), 0);
 }
 

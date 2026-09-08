@@ -183,6 +183,9 @@ class MetaCommittedView {
   const MetaPolicyStore& policy() const { return stores_.policy_; }
   const MetaGrantStore& grant() const { return stores_.grant_; }
   const MetaOperationStore& operation() const { return stores_.operation_; }
+  const MetaPopulationManifestStore& population_manifest() const {
+    return stores_.population_manifest_;
+  }
   const MetaAuditStore& audit() const { return stores_.audit_; }
 
  private:

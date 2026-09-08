@@ -23,10 +23,15 @@
 //     trusted ctl/coordinator entries can construct commands). External
 //     callers cannot supply actor fields; the ctl text-protocol entry injects
 //     them before using this internal encoding.
-//   - Mutations of mutable records carry expected_revision (CAS; conflict is
-//     a domain rejection, not a decode failure).
-//   - All changes are absolute values written by the proposer; there are no
-//     "+1"-style relative mutations.
+//   - Mutations that require optimistic concurrency carry expected_revision
+//     (CAS; conflict is a domain rejection, not a decode failure). A directive
+//     result instead identifies an exact live attempt and replays by exact
+//     identity/content; apply records its committed index and increments the
+//     containing operation revision so an older phase CAS cannot overwrite
+//     the new authoritative receipt.
+//   - Proposer-authored state changes use absolute values. The receipt-driven
+//     operation revision increment above is the deliberate apply-owned
+//     exception, derived solely from the committed command and prior state.
 //   - Unknown schema versions and unknown command tags are decode failures
 //     (fail-stop class); domain validation belongs to the apply layer.
 //
@@ -104,9 +109,10 @@ inline constexpr std::uint32_t kMaxMetaOperationKindBytes = 64;
 inline constexpr std::uint32_t kMaxMetaEvidenceSummariesPerCommand = 64;
 inline constexpr std::uint32_t kMaxMetaDirectivesPerOperation = 64;
 inline constexpr std::uint32_t kMaxMetaDirectiveKindBytes = 64;
-// Preconditions are an opaque operation-kind document, kept separate from
-// the execution payload so data nodes can reject a stale premise without
-// interpreting or partially applying the requested action.
+// Payload and preconditions retain separate bounded schema slots for a future
+// operation-kind interpreter. Control protocol v1 rejects non-empty values
+// (and force=true) at Meta transition apply and again at Data admission rather
+// than silently treating an unknown execution contract as satisfied.
 inline constexpr std::uint32_t kMaxMetaDirectivePreconditionsBytes =
     kMaxMetaPayloadBytes;
 // Receipt retention shares the operation evidence horizon: both are
@@ -266,6 +272,8 @@ struct MetaGroupConfigEpoch {
 struct SetSlotMap {
   MetaRequestId request_id_{};
   ActorContext actor_;
+  // Absolute replacement. MetaStateApply requires every group whose slot
+  // coverage or config epoch changes to be fenced before this can commit.
   std::vector<MetaSlotAssignment> ranges_;
   std::uint64_t new_topology_epoch_ = 0;  // absolute
   std::vector<MetaGroupConfigEpoch> config_epochs_;
@@ -316,11 +324,12 @@ absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes);
 
 // ---------------------------------------------------------------------------
 // term/grant: BeginGroupTerm(T) raises group_term exactly once and enters the
-// no-grant/fenced state; GrantAuthority renews the
-// same owner's lease without moving owner/term; ActivateAuthority is the
+// no-grant/fenced state; GrantAuthority updates the same owner's committed
+// grant specification and revision without moving owner/term (runtime lease
+// renewal remains heartbeat/session state); ActivateAuthority is the
 // failover/migration atomic commit point — it validates expected_term and
-// atomically sets owner + grant + authority_version + epochs, and
-// deliberately carries NO new term.
+// atomically sets owner + grant + authority_version + epochs, and deliberately
+// carries NO new term.
 // ---------------------------------------------------------------------------
 
 // Lease parameters plus the committed policy-version reference every grant
@@ -492,12 +501,15 @@ struct MetaDirectiveSpec {
   MetaHash256 population_manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
   std::string kind_;
+  // Reserved v1 schema strings. Codecs preserve them for fail-loud future
+  // format evolution, but executable v1 directives require both empty.
   std::string payload_;
-  // Canonical, operation-kind-specific execution predicates. These are
-  // durable intent and must be projected verbatim; reconstructing them from
-  // current stores after a restart could silently weaken the original guard.
   std::string preconditions_;
+  // Active classification used to exclude concurrent mutations of the same
+  // target assignment. The executable V1 projector requires it for rebuild
+  // and forbids it for source authorization or revocation.
   bool storage_mutating_ = false;
+  // Reserved execution override; executable V1 directives require false.
   bool force_ = false;
   bool operator==(const MetaDirectiveSpec&) const = default;
 };

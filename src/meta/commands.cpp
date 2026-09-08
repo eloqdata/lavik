@@ -26,7 +26,6 @@ absl::Status CheckCap(std::string_view field, std::size_t size,
 // The actor fields are ordinary bounded strings on the wire so a follower's
 // apply can persist the trusted entry's injected ActorContext into
 // audit/journal (see commands.h).
-// its frozen layout has its own header below.
 absl::Status WriteCommandHeader(MetaWriter& w, MetaCommandTag tag,
                                 const MetaRequestId& request_id,
                                 const ActorContext& actor) {

@@ -836,6 +836,45 @@ struct TransferValue {
   CollectionPageReader reader_;
 };
 
+// Optional, transport-agnostic guard evaluated at the storage mutation
+// linearization seam after all potentially suspending lock, allocation, and
+// read work. The owning command supplies an immutable shared context so the
+// check remains valid across worker hops and coroutine suspension. Background
+// maintenance and replica replay leave it empty. A pointer passed to any
+// Task-returning StorageEngine API must remain alive until that Task completes;
+// transaction initialization instead copies the value into each shard receipt.
+// Validators run synchronously while the owning shard holds its key and store
+// locks, and one shared context may be checked concurrently by several shards;
+// they must be nonblocking, thread-safe, and must not re-enter StorageEngine.
+// The non-default constructor requires both its context and validator to be
+// non-null; use the default constructor to represent no precondition.
+class MutationPrecondition {
+ public:
+  using Validator = absl::Status (*)(const void* context);
+
+  MutationPrecondition() = default;
+  MutationPrecondition(std::shared_ptr<const void> context, Validator validator)
+      : context_(std::move(context)), validator_(validator) {
+    assert(context_ != nullptr && validator_ != nullptr);
+  }
+
+  absl::Status Validate() const {
+    if (context_ == nullptr && validator_ == nullptr) return absl::OkStatus();
+    if (context_ == nullptr || validator_ == nullptr) {
+      return absl::FailedPreconditionError(
+          "mutation precondition is incompletely configured");
+    }
+    return validator_(context_.get());
+  }
+  explicit operator bool() const noexcept {
+    return context_ != nullptr || validator_ != nullptr;
+  }
+
+ private:
+  std::shared_ptr<const void> context_;
+  Validator validator_ = nullptr;
+};
+
 // Per-owning-shard accumulator for one multi-key atomic write. The
 // coordinator owns one per shard; each shard writes only its own entry, so
 // no synchronization is needed.
@@ -848,6 +887,10 @@ struct TxShardWrites {
   // destroyed after commit or rollback processing.
   std::uint64_t generation_ = 0;
   std::shared_ptr<void> generation_lease_;
+  // Client transactions carry the same final mutation check on every shard.
+  // It is deliberately not consulted for the later durability-only commit
+  // record: each keyspace publication already linearized under this check.
+  MutationPrecondition mutation_precondition_;
   struct FullSyncEffect {
     std::uint16_t partition_id_ = 0;
     SnapshotRecord record_;
@@ -1268,42 +1311,51 @@ class StorageEngine {
       SetLatencyTrace* trace = nullptr,
       // Source command dispatch may carry the already validated Redis slot.
       // When present it must equal RedisSlot(key) and belong to this worker.
-      std::optional<std::uint16_t> routed_partition_id = std::nullopt);
+      std::optional<std::uint16_t> routed_partition_id = std::nullopt,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
       std::span<const std::string_view> values,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<ListResult>> ExecuteList(
       std::uint8_t db_id, std::string_view key, const ListOperation& operation,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSet(
       std::uint8_t db_id, std::string_view key,
       const SortedSetOperation& operation,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<HashResult>> ExecuteHash(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<HashResult>> ExecuteSet(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::Status> ExecuteCompact(
       std::uint8_t db_id, std::string_view key, ValueType value_type,
       bool read_only, const CompactValueCallback& callback,
-      std::uint64_t now_ms = 0,
-      ReplicationCommandAppend* replication = nullptr);
+      std::uint64_t now_ms = 0, ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                             std::string_view key);
   celer::Task<absl::StatusOr<bool>> UpdateExpiration(
       std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
       ExpirationCondition condition,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<bool>> Delete(
       std::uint8_t db_id, std::string_view key,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<bool> Exists(std::uint8_t db_id, std::string_view key);
 
   // Pre-locked variants for the transaction layer. The caller must already
@@ -1332,29 +1384,34 @@ class StorageEngine {
       std::string_view value, SetOptions options = {},
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      SetLatencyTrace* trace = nullptr);
+      SetLatencyTrace* trace = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::span<const std::string_view> values, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<ListResult>> ExecuteListLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const ListOperation& operation, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<HashResult>> ExecuteHashLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<HashResult>> ExecuteSetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::Status> ExecuteCompactLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ValueType value_type, bool read_only,
       const CompactValueCallback& callback, TxShardWrites* tx = nullptr,
-      std::uint64_t now_ms = 0,
-      ReplicationCommandAppend* replication = nullptr);
+      std::uint64_t now_ms = 0, ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest);
@@ -1375,10 +1432,12 @@ class StorageEngine {
   celer::Task<absl::Status> WriteValueForTransferLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const TransferValue& value, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<RestoreRawResult>> RestoreRawValue(
       std::uint8_t db_id, std::string_view key, const RawValue& value,
-      bool replace, ReplicationCommandAppend* replication = nullptr);
+      bool replace, ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   // Atomically replaces a collection from bounded pages, accepting arbitrary
   // Sorted Set input order while rejecting duplicate fields/members. No
   // aggregate compact value is built. A busy result does not consume reader.
@@ -1388,7 +1447,8 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, ValueType type,
       std::uint64_t expire_at_ms, bool replace,
       std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   // Borrows the caller's exclusive key lock and optional outer transaction.
   // Its independent command decision is committed only at complete EOF.
   celer::Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValueLocked(
@@ -1396,24 +1456,29 @@ class StorageEngine {
       ValueType type, std::uint64_t expire_at_ms, bool replace,
       std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
       TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<RestoreRawResult>> RestoreRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const RawValue& value, bool replace, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::Status> WriteRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const RawValue& value, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::uint64_t expire_at_ms, ExpirationCondition condition,
       TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<absl::StatusOr<bool>> DeleteLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   celer::Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                                  const Digest& digest);
 
@@ -1447,7 +1512,9 @@ class StorageEngine {
 
   // Binds every shard receipt of one storage transaction to the current
   // transaction generation and holds one shared generation lease.
-  void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes);
+  void InitializeTxWrites(
+      std::uint64_t txid, std::span<TxShardWrites> writes,
+      MutationPrecondition mutation_precondition = MutationPrecondition{});
 
   // Bracket a queued commit: graceful shutdown waits for every accepted
   // transaction to leave the worker-local coordinator.
@@ -1474,6 +1541,14 @@ class StorageEngine {
   // caller must already exclude client writes (closed database gate).
   celer::Task<absl::Status> QuiesceExpiration();
   void ResumeExpiration() noexcept;
+  // Enables or disables admission of active-expiration mutations. This is a
+  // non-blocking switch: disabling prevents later cycles from entering but
+  // does not drain a cycle already in progress. Before replacing or detaching
+  // a population, callers must either set replica loading first (so an
+  // already-entered expiration append is rejected) or successfully quiesce
+  // expiration and keep it paused across the transition. Re-enable only after
+  // the stable local population is authoritative and its recovery fence is
+  // clear; this call never grants client mutation authority by itself.
   void SetExpirationAuthority(bool authority) noexcept;
   std::uint32_t ExpirationPauseCount() const noexcept;
 

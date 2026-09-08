@@ -536,12 +536,12 @@ std::optional<CommandReply> RegisterClusterBlockingWriteAttemptImpl(
   for (;;) {
     auto admission = std::make_shared<const cluster::AuthorityAdmission>(
         runtime->authority_guard_.CaptureAndAdmit(
-            view, std::chrono::steady_clock::now()));
+            view, cluster::LeaseClockNow()));
     const cluster::Decision& decision = admission->decision();
     if (decision.kind_ == cluster::Decision::Kind::kServe) {
       if (runtime->authority_guard_.RegisterAndRecheck(
               *admission, celer::ThisWorker().id_,
-              std::chrono::steady_clock::now(),
+              cluster::LeaseClockNow(),
               guards) == cluster::RecheckResult::kOk) {
         // Per-type mutation callbacks still perform their owner-side recheck;
         // point them at the same fresh proof protected by `guards`.

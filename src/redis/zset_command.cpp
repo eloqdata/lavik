@@ -430,9 +430,12 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
                          ? PrepareReplicationCommand(request)
                          : std::nullopt;
   if (digest == nullptr) {
+    const storage::MutationPrecondition mutation_precondition =
+        ClusterMutationPrecondition(request);
     co_return co_await g_storage->ExecuteCompact(
         request.db_id_, key, storage::ValueType::kSortedSet, read_only,
-        callback, 0, replication ? &*replication : nullptr);
+        callback, 0, replication ? &*replication : nullptr,
+        &mutation_precondition);
   }
   co_return co_await g_storage->ExecuteCompactLocked(
       request.db_id_, key, *digest, storage::ValueType::kSortedSet, read_only,
@@ -449,10 +452,13 @@ Task<absl::StatusOr<storage::SortedSetResult>> RunSortedSet(
   auto replication = tx == nullptr && !read_only
                          ? PrepareReplicationCommand(request)
                          : std::nullopt;
-  if (digest == nullptr)
+  if (digest == nullptr) {
+    const storage::MutationPrecondition mutation_precondition =
+        ClusterMutationPrecondition(request);
     co_return co_await g_storage->ExecuteSortedSet(
         request.db_id_, request.args_[1], operation,
-        replication ? &*replication : nullptr);
+        replication ? &*replication : nullptr, &mutation_precondition);
+  }
   co_return co_await g_storage->ExecuteSortedSetLocked(
       request.db_id_, request.args_[1], *digest, operation, tx,
       replication ? &*replication : nullptr);
@@ -543,13 +549,19 @@ Task<absl::StatusOr<storage::SortedSetResult>> PopZSetLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
     bool maximum, std::uint64_t count, storage::TxShardWrites* tx = nullptr,
     const CommandRequest* request = nullptr) {
+  const storage::MutationPrecondition mutation_precondition =
+      tx == nullptr && request != nullptr
+          ? ClusterMutationPrecondition(*request)
+          : storage::MutationPrecondition{};
+  const storage::MutationPrecondition* mutation_precondition_ptr =
+      tx == nullptr && request != nullptr ? &mutation_precondition : nullptr;
   auto popped = co_await g_storage->ExecuteSortedSetLocked(
       db_id, key, digest,
       storage::SortedSetOperation{
           .kind_ = storage::SortedSetOperationKind::kPop,
           .reverse_ = maximum,
           .pop_count_ = count},
-      tx);
+      tx, nullptr, mutation_precondition_ptr);
   if (!popped.ok()) co_return popped.status();
   if (!popped->members_.empty() && popped->length_ != 0) {
     if (request != nullptr) {
@@ -3177,7 +3189,8 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   if (context.store_) {
     txid = storage::StorageEngine::AllocateWriteTxid();
     context.writes_.resize(g_storage->worker_count());
-    g_storage->InitializeTxWrites(txid, context.writes_);
+    g_storage->InitializeTxWrites(txid, context.writes_,
+                                  ClusterMutationPrecondition(request));
     for (auto& write : context.writes_) {
       write.collect_undo_ = true;
     }
@@ -3538,7 +3551,7 @@ Task<std::string> ExecuteZSetMultiPopLocked(
     // co_await operands. GCC 13 can alias their coroutine-frame slots and
     // resume the local pop on the caller after selecting the remote branch,
     // violating PartitionFor's worker-affinity invariant.
-    absl::StatusOr<std::vector<Element>> popped;
+    absl::StatusOr<storage::SortedSetResult> popped;
     if (key->owner_ == celer::ThisWorker().id_) {
       popped = co_await pop();
     } else {

@@ -58,7 +58,7 @@ keylane-meta Raft leader <-- framed control session --> Data NodeControl
 | Storage and recovery | Own logical indexes and physical blocks, execute reads and appends, recover durable state, and reclaim obsolete data | `storage::StorageEngine` |
 | Function catalog | Stage one complete process-global Function definition set on every worker, commit its existing `FUNCTION DUMP` encoding, swap runtimes, and recover it before service readiness | `FunctionCatalog` |
 | Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
-| Cluster data plane | Admit, redirect, or refuse requests by slot ownership and finite authority; install static or Meta control; serve Redis Cluster discovery | `cluster::Admit`, `cluster::TopologyCache`, `cluster::NodeControlInstaller`, `cluster::MetaControlClientService` |
+| Cluster data plane | Admit, redirect, or refuse requests by slot ownership and finite authority; install static or Meta control; serve Redis Cluster discovery | `cluster::AuthorityGuard::CaptureAndAdmit` / `RegisterAndRecheck`, `cluster::TopologyCache`, `cluster::NodeControlInstaller`, `cluster::MetaControlClientService` |
 | Meta control plane | Replicate metadata commands, project node-specific desired state, publish leader-scoped Data sessions, admit fresh observations, and expose authenticated administration | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
@@ -181,8 +181,10 @@ state explicitly.
   silently drop an already accepted logical write.
 - Meta decisions derive from one committed view plus observations accepted by
   the current leader session generation. Observations are never Raft state and
-  are purged on role changes or when their committed term, manifest, partition
-  replication epoch, history, operation, or node identity anchor becomes stale.
+  are purged on role changes or when their committed node, assignment, term,
+  manifest, or partition replication epoch anchor becomes stale. Operation
+  evidence additionally binds committed operation/history state; candidate
+  history is instead checked against the authenticated `ClientHello` session.
 - Data nodes restore no positive serving authority, desired-state checkpoint,
   or directive outcome from their data files. Each restart begins fenced with
   a new boot identity; only a current Meta session and unexpired in-memory

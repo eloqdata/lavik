@@ -13,8 +13,11 @@ seams:
 
 - `TopologyCache` holds the committed `ServingState` and publishes it
   atomically.
-- `AuthorityGuard` is the admission decision point (`Admit`) plus the
-  owner-side authority re-check (`AuthorityUnchanged`).
+- `AuthorityGuard` is the request-path authority boundary:
+  `CaptureAndAdmit` records the routing and finite-lease proof, while
+  `RegisterAndRecheck` atomically registers in-flight work and closes the
+  publication race. Free `Admit` and `AuthorityUnchanged` are pure routing
+  helpers, not request-path substitutes.
 - `ClusterRouter` is a set of pure functions over a committed state: slot to
   owning node, MOVED target, and client-facing endpoint selection.
 - `NodeControlInstaller` is the only state-changing seam. It validates and
@@ -27,6 +30,12 @@ seams:
   Meta-to-Data control session. It maps authenticated wire values into the
   node controller; neither it nor replication writes `TopologyCache`
   directly.
+
+The Redis/storage boundary adds a transport-neutral final seam:
+`storage::MutationPrecondition` carries the captured admission through every
+suspending storage preparation step and validates it at logical publication.
+Storage depends only on a callback and opaque shared context, not on cluster
+types.
 
 The module is free of Redis wire concerns. Wire mapping (error texts,
 discovery reply shapes) lives in the Redis serving layer, and internal
@@ -114,9 +123,8 @@ commands.
 
 Admission alone cannot fence writes: a request admitted just before a
 topology change could mutate afterwards. Two owner-side re-check choke points
-close that window, both placed after every suspending admission (publisher
-admission, database gate waits, snapshot/order gates) and immediately before
-mutation:
+close the outer dispatch and transaction-scheduling races after publisher,
+database, snapshot, and order-gate waits:
 
 1. Non-transactional writes re-check in `ExecuteCommandBody` after the
    database gate is held. A changed authority means nothing has executed yet,
@@ -130,6 +138,26 @@ mutation:
    answer; a multi-shard transaction may have mutated a shard whose check
    raced the fence, so its outcome is undeterminable and the connection
    closes without a fabricated reply.
+
+Handlers can still suspend after either choke point while acquiring key/store
+locks, reading an old value, or allocating storage. Every client keyspace write
+therefore carries the same admission as a `storage::MutationPrecondition`.
+Transactions copy it into each `TxShardWrites` receipt; direct handlers keep it
+alive until their storage task completes. `WriteRecordLocked` evaluates the
+nonblocking callback on the owning shard after all potentially suspending
+preparation and immediately before WATCH invalidation and staging/index
+publication. The hash no-op path performs the same check before its observable
+WATCH invalidation. Internal rollback explicitly bypasses the inherited check
+so it can restore an already-started transaction; background expiration,
+maintenance, and replica replay carry no client precondition.
+
+The shared admission records whether any storage publication began and whether
+a later final check failed. If the first attempted mutation is rejected, the
+command discards its prepared reply, re-admits against current state, and sends
+that fresh redirect or error. If an earlier participant already began and a
+later one is rejected, the aggregate outcome is indeterminate and the server
+closes the connection without fabricating a retryable result. This finalizer
+also covers errors swallowed inside Lua and the single-shard EXEC fast path.
 
 `EXEC` re-evaluates the union of its queued commands' slots at execution
 time: spanning slots fails the whole transaction with CROSSSLOT, and a write
@@ -152,9 +180,9 @@ semantics.
 Reads are intentionally not re-checked. A read gated at admission may observe
 data committed before a concurrent fence — the same staleness window Redis
 Cluster clients accept across failover. Writes have no such window: the
-combination of admission, the two choke points, and per-group tokens
-guarantees a stale topology causes redirection or temporary unavailability,
-never a second writer.
+combination of admission, the owner-side choke points, the final storage
+precondition, and per-group tokens guarantees a stale topology causes
+redirection or temporary unavailability, never a second writer.
 
 Only writes retain ownership of the admitted snapshot across suspension
 points. Reads finish their decision while the thread-local cache keeps the
@@ -207,7 +235,9 @@ An unresolved seed remains a fallback even when a learned member currently
 announces the same endpoint, because endpoint ownership can legitimately change
 across reconfiguration. A response replaces the in-memory directory atomically
 only after its member identities and the peer's authenticated URI principal
-agree. The hint and directory are intentionally not persisted. Connect, TLS,
+agree. A learned dial target pins that exact prior committed principal against
+the new `ServerHello`; only an unresolved static seed may bootstrap its binding
+from the authenticated Hello. The hint and directory are intentionally not persisted. Connect, TLS,
 Hello, read progress, and write progress each have a ten-second bound; backoff
 resets only after an accepted session has produced a valid `HeartbeatAck`.
 
@@ -216,7 +246,9 @@ fixed header carries type, length, per-direction sequence, and CRC32C. Frames
 are at most 16 KiB. A frame-sized `FullDesiredState` is sent directly as one
 typed frame. Complete objects that exceed one frame use Start/Chunk/End plus
 total length and SHA-256; chunks stream without per-frame application
-acknowledgements and only the complete object is acknowledged.
+acknowledgements. A complete FDS gets `FullStateApplied`, directives get typed
+receipt stages, and terminal results get `ResultCommitted` or
+`NoLongerTracked`; soft `OperationEvidence` has no application ack.
 The complete desired-state cap is 512 MiB, while each opaque directive,
 result, or operation-evidence field is capped at 256 KiB. These are abuse
 ceilings, not normal sizing goals:
@@ -232,6 +264,15 @@ frames; priority cannot interrupt bytes already handed to the kernel. Only one
 complete-object transfer may be active at a time, so Start/Chunk/End sequences
 cannot interleave. Queued transfers retain shared ownership of their encoded
 bytes until completion or failure.
+Meta also accounts every retained node projection by the capacities of its
+encoded string and decoded owning graph under one 2 GiB worker-local budget
+(`4 * 512 MiB`). A build first reserves 1 GiB (`2 * 512 MiB`) and then adjusts
+to its measured weight; the permit follows the shared batch through initial
+send, live installation, and replacement. The two-generation budget is derived
+from an installed/replacement overlap, not the 4096 session count. A highly
+structural object can therefore be rejected below its wire cap, and aggregate
+normal projections cannot multiply the global topology into TiB-scale output
+ownership.
 
 Protocol v1 has no delta format. Initial connection, reconnection, and every
 semantic projection change transfer a complete `FullDesiredState`. The object
@@ -285,6 +326,14 @@ Meta's typed candidate/evidence query results retain that authenticated boot
 beside the reporter and assignment, so later directive/evidence construction
 never has to race a second session lookup.
 
+A committed slot-map cut cannot reuse an existing grant. Meta rejects a slot
+ownership or config-epoch change while any affected source or destination
+group still has an active grant. The controller must fence all affected
+groups, commit the complete replacement map, and then activate fresh
+authorities. This committed-state precondition complements the per-session
+Fence/FDS drain: a source that has not consumed the replacement can never keep
+an old lease while the destination begins serving the same slot.
+
 Finite leases are required only for a Meta-managed local primary. Admission
 and the final mutation recheck both prove the current session, group
 assignment, term, authority/grant revision, projection, and unexpired
@@ -300,13 +349,36 @@ immediately; worker zero drives this asynchronous controller barrier. An
 uncertain cleanup result stops the server without a clean checkpoint. Neither
 a later FDS nor a population proof can clear the latch; recovery requires
 process restart.
+
 Meta's leadership expiry and every granted lease are bounded by the Raft
-election lower bound, and a leader stops sessions synchronously on demotion.
+election lower bound `D`, and a leader stops sessions synchronously on
+demotion. Data constructs and rechecks lease deadlines with Linux
+`CLOCK_BOOTTIME`, so suspend time consumes rather than preserves authority.
+The worker's relative timer rechecks that suspend-aware deadline in slices no
+larger than 25 ms or one quarter of the granted duration, whichever is
+smaller. Request admission therefore rejects at the first post-resume touch,
+while source-capability invalidation begins within one bounded slice rather
+than waiting out the pre-suspend remainder of a long lease. Tying the slice to
+the grant avoids imposing a fixed 25 ms lag on deliberately short leases.
 Before issuing the first otherwise-valid lease for each group, boot, authority
-anchor, and leadership generation, Meta waits that entire bound on a monotonic
-clock. The leader-local evidence resets on leadership or process restart, so a
-later owner cannot overlap a predecessor even when no Fence acknowledgement is
-available.
+anchor, and leadership generation, Meta waits `2D` on the same suspend-aware
+clock: one maximum prior lease plus a second `D` safety margin. This remains
+safe under the deliberately loose assumption that the Meta host's elapsed-time
+clock advances no more than twice as fast as the prior Data host's; scheduling
+delay can only postpone a grant. The leader-local evidence resets on leadership
+or process restart, so a later owner cannot overlap a predecessor even when no
+Fence acknowledgement is available.
+
+NuRaft's peer-liveness timer uses active `CLOCK_MONOTONIC` time, which does not
+advance while a Meta host is suspended. Data control therefore also compares
+that clock with `CLOCK_BOOTTIME`. Once their accumulated divergence reaches
+`D`, it closes the leadership generation's authority sessions and requests an
+immediate NuRaft resignation. A sole member, for which resignation is a no-op,
+must run for another full `D` of active monotonic time before authority can be
+eligible; a further suspend extends that wait. All FDS boundaries, directives,
+results, and lease grants pass this gate. Thus an old multi-member leader
+cannot resume after a replacement election and refresh the same stale identity
+through a handoff entry that had already matured before suspension.
 
 Graceful Data shutdown stops new client and control-message admission, then
 immediately cancels replication target and source transports. In particular,
@@ -355,6 +427,20 @@ fence floor also rejects directives through the fenced counter tuple: rebuilds
 compare the local target assignment, while source authorize/revoke compares the
 local source assignment. A fresh assignment or a strictly newer committed
 counter tuple is therefore distinguishable from replay of fenced authority.
+The bounded worker timer may still be queued briefly after a host resume, so a
+renewal also compares the old deadline with `CLOCK_BOOTTIME` synchronously. If
+the old lease is already due, the renewal path runs that exact expiration
+transition first: it advances the authority generation, retires the stale
+timer, and joins source/directive cleanup before considering the replacement
+grant. A same-anchor heartbeat can extend only a lease that never expired, so
+pre-expiry admissions cannot be revived by a delayed timer.
+
+The encoded directive schema retains bounded `payload`, `preconditions`, and
+`force` fields for a future operation-kind interpreter. V1 defines no such
+semantics: Meta rejects a phase transition carrying non-empty strings or
+`force=true`, and NodeControl repeats that check before the action seam. The
+native adapter therefore never silently treats an unknown predicate or forced
+operation as satisfied.
 
 Receipt stages distinguish acceptance, execution start, and completion. A
 controller rejection moves directly from
@@ -388,7 +474,12 @@ new rebuild before another lease can be granted. In-progress rebuilds remain
 term-scoped and are cancelled unless the FDS
 still carries their exact term and a rebuild successor. Grantless groups have
 no `ServingState` owner or bound slots, but their committed membership remains
-in the controller identity view so this preservation is possible. Once Meta
+in the controller identity view so this preservation is possible. For any
+member incarnation retained across projections, NodeControl also requires the
+group's config epoch, term, authority version, grant revision, manifest
+revision/digest, and partition replication epoch to be monotonic even while
+the group is ownerless; a full remove-and-reassign identity is the explicit
+boundary at which a new incarnation may reset those counters. Once Meta
 activates the candidate, the next FDS can publish the retained proof; if no
 proof survived (for example after a reboot), the granted-but-unready target may
 run a rebuild while it remains unable to serve or obtain a lease.
@@ -534,7 +625,8 @@ partially configured.
 The data plane deliberately excludes: ASK/ASKING and the
 importing/migrating compatibility flow, the gossip bus protocol, protocol
 deltas, Data-side durable control journals, shard Pub/Sub, non-uniform TLS
-ports, dynamic node-id allocation, group-scoped authority for persistent
+ports in static `nodes.conf` mode, dynamic node-id allocation, group-scoped
+authority for persistent
 no-key mutations, and the remaining `CLUSTER` management subcommands
 (`SETSLOT`, `MEET`, `FAILOVER`, `ADDSLOTS`, and similar).
 
@@ -548,10 +640,11 @@ reply shapes are unit-tested through pure seams and the in-memory adapter. The
 three-node static-cluster end-to-end suite verifies routing, redirects,
 read-only replica admission, cluster-mode command restrictions, static export
 denial, expiration-authority state, INFO/CLUSTER replies, and topology reload.
-A separate real-process Data-control gate starts three Meta
-members and a Data node, exercises follower-seed redirect, full-state install,
-heartbeat observation, leader failure and reconnect, stale-member restart,
-plaintext and mTLS identity checks, and graceful shutdown.
+A real-process plaintext Data-control gate starts three Meta members and a Data
+node, exercising follower-seed redirect, full-state install, heartbeat
+observation, leader failure and reconnect, stale-member restart, and graceful
+shutdown. Separate single-Meta gates cover mTLS identity and TLS/plaintext mode
+selection.
 
 ## Source map
 
@@ -559,12 +652,13 @@ plaintext and mTLS identity checks, and graceful shutdown.
 |---|---|
 | ServingState model, builder validation, topology cache, content hash, striped in-flight cells, and routing functions | `include/keylane/cluster/topology.h`, `src/cluster/topology.cpp` |
 | Admission decision and owner-side authority re-check | `include/keylane/cluster/authority.h`, `src/cluster/authority.cpp` |
+| Final logical-mutation precondition and WATCH/publication seam | `include/keylane/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp` |
 | Meta/Data protocol framing, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Node controller, full-state validation, finite authority, drain, and typed replication adaptation | `include/keylane/cluster/node_control.h`, `include/keylane/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp` |
 | Meta discovery and outbound Data control session | `include/keylane/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
 | Control-port seam, nodes.conf adapter, and in-memory adapter | `include/keylane/cluster/control_port.h`, `src/cluster/control_port.cpp` |
 | Process-wide runtime installation | `include/keylane/cluster/runtime.h`, `src/cluster/runtime.cpp` |
-| Cluster admission gate, owner re-check choke points, EXEC/Lua/blocking integration, and mode-restricted command policies | `src/redis/command.cpp`, `src/redis/blocking_wait.cpp` |
+| Cluster admission gate, owner/final re-check plumbing, outcome finalization, EXEC/Lua/blocking integration, and mode-restricted command policies | `src/redis/command.cpp`, `src/redis/cluster_gate.h`, `src/redis/blocking_wait.cpp` |
 | CLUSTER subcommands and discovery replies | `src/redis/cluster_command.cpp`, `src/redis/cluster_command.h` |
 | Cluster wire error texts | `include/keylane/resp.h`, `src/redis/resp.cpp` |
 | Per-shard transaction validator hook | `include/keylane/tx/transaction.h`, `src/tx/transaction.cpp` |

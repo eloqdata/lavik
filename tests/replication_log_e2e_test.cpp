@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -50,6 +51,19 @@ void Check(bool condition, std::string_view message) {
   if (!condition) {
     throw std::runtime_error(std::string(message));
   }
+}
+
+struct MutationPreconditionProbe {
+  bool allow_ = false;
+  mutable unsigned calls_ = 0;
+};
+
+absl::Status ValidateMutationPreconditionProbe(const void* opaque) {
+  const auto* probe = static_cast<const MutationPreconditionProbe*>(opaque);
+  ++probe->calls_;
+  return probe->allow_
+             ? absl::OkStatus()
+             : absl::FailedPreconditionError("test mutation rejected");
 }
 
 std::vector<std::string> ReplicatedEffectAt(const ReplicatedCommand& command,
@@ -196,6 +210,42 @@ class ReplicationLogService final : public celer::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
+  celer::Task<absl::Status> ExerciseMutationPrecondition() {
+    auto rejected_probe = std::make_shared<MutationPreconditionProbe>();
+    const keylane::storage::MutationPrecondition rejected_precondition(
+        std::shared_ptr<const void>(rejected_probe),
+        &ValidateMutationPreconditionProbe);
+    auto rejected_write = co_await storage_->Set(
+        15, "mutation-precondition", "blocked", {}, nullptr, nullptr,
+        std::nullopt, &rejected_precondition);
+    if (rejected_write.ok() ||
+        !absl::IsFailedPrecondition(rejected_write.status())) {
+      co_return absl::FailedPreconditionError(
+          "storage mutation precondition did not reject SET");
+    }
+    if (rejected_probe->calls_ != 1 ||
+        co_await storage_->Exists(15, "mutation-precondition")) {
+      co_return absl::FailedPreconditionError(
+          "rejected storage mutation changed the keyspace");
+    }
+
+    auto accepted_probe = std::make_shared<MutationPreconditionProbe>();
+    accepted_probe->allow_ = true;
+    const keylane::storage::MutationPrecondition accepted_precondition(
+        std::shared_ptr<const void>(accepted_probe),
+        &ValidateMutationPreconditionProbe);
+    auto accepted_write = co_await storage_->Set(
+        15, "mutation-precondition", "accepted", {}, nullptr, nullptr,
+        std::nullopt, &accepted_precondition);
+    if (!accepted_write.ok() || !accepted_write->applied_ ||
+        accepted_probe->calls_ != 1 ||
+        !co_await storage_->Exists(15, "mutation-precondition")) {
+      co_return absl::FailedPreconditionError(
+          "accepted storage mutation precondition did not publish SET");
+    }
+    co_return absl::OkStatus();
+  }
+
   celer::Task<absl::Status> ExecuteClientCommand(
       std::uint8_t db_id, std::vector<std::string> args,
       std::string_view expected_reply) {
@@ -228,15 +278,16 @@ class ReplicationLogService final : public celer::Service {
           "cannot construct transaction-guard admission test limit");
     }
     const std::uint64_t steady_target = used + kAdmissionHeadroom;
-    const std::uint64_t steady_allowance = steady_target / 19 + 1;
+    const std::uint64_t steady_allowance = steady_target / 9 + 1;
     if (steady_target >
         std::numeric_limits<std::uint64_t>::max() - steady_allowance) {
       return absl::ResourceExhaustedError(
           "transaction-guard admission test limit overflows");
     }
-    // InitMemoryLimit withholds five percent. Choose a configured limit whose
-    // steady portion leaves a small positive margin, then bypass top-level
-    // dispatch so this specifically exercises each handler's guard check.
+    // Retained allocations use ninety percent of the configured limit. Choose
+    // a limit whose retained portion leaves a small positive margin, then
+    // bypass top-level dispatch so this specifically exercises each handler's
+    // guard check rather than an earlier scratch-allocation admission.
     return keylane::InitMemoryLimit(steady_target + steady_allowance, 1);
   }
 
@@ -276,9 +327,9 @@ class ReplicationLogService final : public celer::Service {
     constexpr std::string_view kExpected =
         "-OOM command not allowed when used memory > 'maxmemory'.\r\n";
     if (reply.encoded_ != kExpected) {
-      co_return absl::FailedPreconditionError("transaction guard returned '" +
-                                              std::string(reply.encoded_) +
-                                              "' instead of a Redis OOM error");
+      co_return absl::FailedPreconditionError(
+          request->args_.front() + " transaction guard returned '" +
+          std::string(reply.encoded_) + "' instead of a Redis OOM error");
     }
     co_return absl::OkStatus();
   }
@@ -2458,7 +2509,10 @@ class ReplicationLogService final : public celer::Service {
   }
 
   celer::Task<absl::Status> Exercise() {
-    absl::Status status = co_await ExerciseAdmissionAndOrdering();
+    absl::Status status = co_await ExerciseMutationPrecondition();
+    if (!status.ok()) co_return status;
+
+    status = co_await ExerciseAdmissionAndOrdering();
     if (!status.ok()) co_return status;
 
     status = co_await ExerciseBacklogStorage();

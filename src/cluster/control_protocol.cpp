@@ -51,33 +51,54 @@ absl::Status ResourceLimit(std::string_view message) {
 
 class Writer {
  public:
-  void U8(std::uint8_t value) { bytes_.push_back(static_cast<char>(value)); }
+  class Sink {
+   public:
+    virtual ~Sink() = default;
+    virtual void Append(std::string_view bytes) noexcept = 0;
+  };
+
+  Writer() = default;
+  explicit Writer(Sink& sink) : sink_(&sink) {}
+
+  void U8(std::uint8_t value) {
+    const char byte = static_cast<char>(value);
+    Append(std::string_view(&byte, 1));
+  }
 
   void U16(std::uint16_t value) {
-    bytes_.push_back(static_cast<char>(value >> 8));
-    bytes_.push_back(static_cast<char>(value));
+    std::array<char, 2> bytes{};
+    bytes[0] = static_cast<char>(value >> 8);
+    bytes[1] = static_cast<char>(value);
+    Append(std::string_view(bytes.data(), bytes.size()));
   }
 
   void U32(std::uint32_t value) {
+    std::array<char, 4> bytes{};
+    std::size_t offset = 0;
     for (int shift = 24; shift >= 0; shift -= 8) {
-      bytes_.push_back(static_cast<char>(value >> shift));
+      bytes[offset++] = static_cast<char>(value >> shift);
     }
+    Append(std::string_view(bytes.data(), bytes.size()));
   }
 
   void U64(std::uint64_t value) {
+    std::array<char, 8> bytes{};
+    std::size_t offset = 0;
     for (int shift = 56; shift >= 0; shift -= 8) {
-      bytes_.push_back(static_cast<char>(value >> shift));
+      bytes[offset++] = static_cast<char>(value >> shift);
     }
+    Append(std::string_view(bytes.data(), bytes.size()));
   }
 
   void Bool(bool value) { U8(value ? 1 : 0); }
 
   template <std::size_t N>
   void Fixed(const std::array<std::uint8_t, N>& value) {
-    bytes_.append(reinterpret_cast<const char*>(value.data()), value.size());
+    Append(std::string_view(reinterpret_cast<const char*>(value.data()),
+                            value.size()));
   }
 
-  void Raw(std::string_view value) { bytes_.append(value); }
+  void Raw(std::string_view value) { Append(value); }
 
   absl::Status String(std::string_view value, std::size_t cap,
                       std::string_view field) {
@@ -91,9 +112,21 @@ class Writer {
   }
 
   std::string Take() { return std::move(bytes_); }
+  std::size_t size() const noexcept { return size_; }
 
  private:
+  void Append(std::string_view value) {
+    size_ += value.size();
+    if (sink_ != nullptr) {
+      sink_->Append(value);
+    } else {
+      bytes_.append(value);
+    }
+  }
+
   std::string bytes_;
+  Sink* sink_ = nullptr;
+  std::size_t size_ = 0;
 };
 
 class Reader {
@@ -381,6 +414,20 @@ class Sha256 {
   std::array<std::uint8_t, 64> block_{};
   std::size_t buffered_ = 0;
   std::uint64_t total_bytes_ = 0;
+};
+
+class Sha256WriterSink final : public Writer::Sink {
+ public:
+  void Append(std::string_view bytes) noexcept override { sha_.Update(bytes); }
+  WireHash256 Final() noexcept { return sha_.Final(); }
+
+ private:
+  Sha256 sha_;
+};
+
+class DiscardWriterSink final : public Writer::Sink {
+ public:
+  void Append(std::string_view /*bytes*/) noexcept override {}
 };
 
 absl::Status ValidateIdentity(std::string_view value, std::string_view field) {
@@ -802,27 +849,27 @@ absl::Status LeaseChallengeTracker::Begin(WireId128 session_id,
   pending_ = Pending{.session_id = session_id,
                      .data_boot_id = std::move(data_boot_id),
                      .challenge = std::move(challenge),
-                     .sent_at_ms = std::nullopt};
+                     .lease_sent_at_ms = std::nullopt};
   return absl::OkStatus();
 }
 
 absl::Status LeaseChallengeTracker::MarkWritten(const WireId128& nonce,
-                                                std::int64_t monotonic_now_ms) {
+                                                std::int64_t lease_now_ms) {
   if (!pending_.has_value() || pending_->challenge.nonce != nonce) {
     return absl::FailedPreconditionError("lease challenge is not pending");
   }
-  if (pending_->sent_at_ms.has_value()) {
+  if (pending_->lease_sent_at_ms.has_value()) {
     return absl::FailedPreconditionError(
         "lease challenge send time is already fixed");
   }
-  pending_->sent_at_ms = monotonic_now_ms;
+  pending_->lease_sent_at_ms = lease_now_ms;
   return absl::OkStatus();
 }
 
 absl::StatusOr<std::int64_t> LeaseChallengeTracker::AcceptGrant(
     const WireId128& session_id, const LeaseGranted& grant,
-    std::int64_t monotonic_now_ms) {
-  if (!pending_.has_value() || !pending_->sent_at_ms.has_value()) {
+    std::int64_t lease_now_ms) {
+  if (!pending_.has_value() || !pending_->lease_sent_at_ms.has_value()) {
     return absl::FailedPreconditionError(
         "lease grant has no written pending challenge");
   }
@@ -840,17 +887,18 @@ absl::StatusOr<std::int64_t> LeaseChallengeTracker::AcceptGrant(
         "lease grant does not exactly match the pending challenge");
   }
   if (grant.granted_duration_ms == 0 ||
-      *pending.sent_at_ms >
+      *pending.lease_sent_at_ms >
           std::numeric_limits<std::int64_t>::max() -
               static_cast<std::int64_t>(grant.granted_duration_ms)) {
     last_nonce_ = pending.challenge.nonce;
     pending_.reset();
     return ProtocolError("lease grant duration is invalid");
   }
-  const std::int64_t deadline = *pending.sent_at_ms + grant.granted_duration_ms;
+  const std::int64_t deadline =
+      *pending.lease_sent_at_ms + grant.granted_duration_ms;
   last_nonce_ = pending.challenge.nonce;
   pending_.reset();  // exact grants are consumed even when already expired
-  if (monotonic_now_ms >= deadline) {
+  if (lease_now_ms >= deadline) {
     return absl::DeadlineExceededError(
         "lease grant arrived after its deadline");
   }
@@ -2395,8 +2443,14 @@ absl::StatusOr<WirePolicy> ReadPolicy(Reader& reader) {
 }
 
 absl::Status WriteProjectedDirective(Writer& writer,
-                                     const WireProjectedDirective& directive) {
-  WriteProjectionBasis(writer, directive.basis);
+                                     const WireProjectedDirective& directive,
+                                     bool normalize_basis = false) {
+  if (normalize_basis) {
+    writer.U64(0);
+    writer.Fixed(WireHash256{});
+  } else {
+    WriteProjectionBasis(writer, directive.basis);
+  }
   if (absl::Status status = WriteAuthorityAnchor(writer, directive.authority);
       !status.ok()) {
     return status;
@@ -2526,6 +2580,104 @@ absl::StatusOr<WireProjectedDirective> ReadProjectedDirective(Reader& reader) {
   return directive;
 }
 
+template <typename T>
+int CompareScalar(T left, T right) noexcept {
+  if (left < right) return -1;
+  if (right < left) return 1;
+  return 0;
+}
+
+int CompareRawBytes(std::string_view left, std::string_view right) noexcept {
+  const std::size_t common = std::min(left.size(), right.size());
+  for (std::size_t i = 0; i < common; ++i) {
+    const auto lhs = static_cast<unsigned char>(left[i]);
+    const auto rhs = static_cast<unsigned char>(right[i]);
+    if (const int order = CompareScalar(lhs, rhs); order != 0) return order;
+  }
+  return CompareScalar(left.size(), right.size());
+}
+
+// Writer::String puts its big-endian length before the bytes, so canonical
+// ordering compares lengths first rather than using ordinary string ordering.
+int CompareEncodedString(std::string_view left,
+                         std::string_view right) noexcept {
+  if (const int order = CompareScalar(left.size(), right.size()); order != 0) {
+    return order;
+  }
+  return CompareRawBytes(left, right);
+}
+
+template <std::size_t N>
+int CompareFixed(const std::array<std::uint8_t, N>& left,
+                 const std::array<std::uint8_t, N>& right) noexcept {
+  return CompareRawBytes(
+      std::string_view(reinterpret_cast<const char*>(left.data()), left.size()),
+      std::string_view(reinterpret_cast<const char*>(right.data()),
+                       right.size()));
+}
+
+// This is the field order emitted by WriteProjectedDirective after its basis
+// is normalized. Comparing the domain object directly lets the digest retain
+// its v1 byte-for-byte definition without retaining every encoded directive.
+bool CanonicalProjectedDirectiveLess(
+    const WireProjectedDirective& left,
+    const WireProjectedDirective& right) noexcept {
+#define KEYLANE_COMPARE_DIRECTIVE(call) \
+  if (const int order = (call); order != 0) return order < 0
+  KEYLANE_COMPARE_DIRECTIVE(CompareEncodedString(left.authority.group_id,
+                                                 right.authority.group_id));
+  KEYLANE_COMPARE_DIRECTIVE(CompareFixed(left.authority.assignment_id,
+                                         right.authority.assignment_id));
+  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.group_term,
+                                          right.authority.group_term));
+  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.authority_version,
+                                          right.authority.authority_version));
+  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.grant_revision,
+                                          right.authority.grant_revision));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareFixed(left.identity.operation_id, right.identity.operation_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareFixed(left.identity.directive_id, right.identity.directive_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareFixed(left.identity.attempt_id, right.identity.attempt_id));
+  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.identity.directive_revision,
+                                          right.identity.directive_revision));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareRawBytes(left.recipient_node_id, right.recipient_node_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareRawBytes(left.recipient_boot_id, right.recipient_boot_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareRawBytes(left.target_node_id, right.target_node_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareRawBytes(left.target_boot_id, right.target_boot_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareRawBytes(left.source_node_id, right.source_node_id));
+  KEYLANE_COMPARE_DIRECTIVE(CompareFixed(left.source_assignment_id,
+                                         right.source_assignment_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareRawBytes(left.source_boot_id, right.source_boot_id));
+  KEYLANE_COMPARE_DIRECTIVE(CompareRawBytes(
+      left.source_replication_history_id,
+      right.source_replication_history_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareScalar(left.manifest_revision, right.manifest_revision));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareFixed(left.manifest_digest, right.manifest_digest));
+  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.partition_replication_epoch,
+                                          right.partition_replication_epoch));
+  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(static_cast<std::uint8_t>(left.kind),
+                                          static_cast<std::uint8_t>(right.kind)));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareEncodedString(left.payload, right.payload));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareEncodedString(left.preconditions, right.preconditions));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareScalar(left.storage_mutating, right.storage_mutating));
+  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.force, right.force));
+#undef KEYLANE_COMPARE_DIRECTIVE
+  return false;
+}
+
 }  // namespace
 
 absl::StatusOr<WireHash256> ComputeDirectiveSetDigest(
@@ -2534,69 +2686,70 @@ absl::StatusOr<WireHash256> ComputeDirectiveSetDigest(
     return ResourceLimit("current directives exceeds its entry cap");
   }
 
-  std::vector<std::string> entries;
+  struct Entry {
+    const WireProjectedDirective* directive = nullptr;
+    std::uint32_t encoded_size = 0;
+  };
+  std::vector<Entry> entries;
   entries.reserve(directives.size());
   constexpr std::size_t kDigestEnvelopeBytes = 6 + 2 + 4;
-  std::size_t total_size = kDigestEnvelopeBytes;
+  std::uint64_t total_size = kDigestEnvelopeBytes;
+  DiscardWriterSink discard;
   for (const WireProjectedDirective& source : directives) {
-    WireProjectedDirective normalized = source;
-    normalized.basis.source_meta_applied_index = 0;
-    normalized.basis.projection_hash = {};
-    Writer entry_writer;
-    if (absl::Status status = WriteProjectedDirective(entry_writer, normalized);
+    Writer entry_writer(discard);
+    if (absl::Status status =
+            WriteProjectedDirective(entry_writer, source, true);
         !status.ok()) {
       return status;
     }
-    std::string entry = std::move(entry_writer).Take();
-    if (entry.size() > std::numeric_limits<std::uint32_t>::max() ||
-        entry.size() + 4 > kMaxFullDesiredStateBytes - total_size) {
+    if (entry_writer.size() > std::numeric_limits<std::uint32_t>::max() ||
+        total_size > kMaxFullDesiredStateBytes ||
+        entry_writer.size() + 4 > kMaxFullDesiredStateBytes - total_size) {
       return ResourceLimit("directive set exceeds 512 MiB");
     }
-    total_size += 4 + entry.size();
-    entries.push_back(std::move(entry));
+    total_size += 4 + entry_writer.size();
+    entries.push_back(
+        Entry{.directive = &source,
+              .encoded_size = static_cast<std::uint32_t>(entry_writer.size())});
   }
   // A directive set is semantic, not transport ordering. Sorting the complete
-  // canonical entries also avoids choosing one identity field as an implicit
-  // uniqueness key. Duplicate entries remain visible through the count.
+  // canonical field sequence also avoids choosing one identity field as an
+  // implicit uniqueness key. Only references and encoded lengths are kept;
+  // retaining each encoded entry would add another projection-sized buffer.
   std::sort(entries.begin(), entries.end(),
-            [](const std::string& left, const std::string& right) {
-              return std::lexicographical_compare(
-                  left.begin(), left.end(), right.begin(), right.end(),
-                  [](char lhs, char rhs) {
-                    return static_cast<unsigned char>(lhs) <
-                           static_cast<unsigned char>(rhs);
-                  });
+            [](const Entry& left, const Entry& right) {
+              return CanonicalProjectedDirectiveLess(*left.directive,
+                                                     *right.directive);
             });
 
-  Writer writer;
+  Sha256WriterSink sink;
+  Writer writer(sink);
   writer.Raw("KLDSET");  // Domain-separate this digest from other wire hashes.
   writer.U16(1);         // Directive-set digest schema version.
   writer.U32(static_cast<std::uint32_t>(entries.size()));
-  for (const std::string& entry : entries) {
-    writer.U32(static_cast<std::uint32_t>(entry.size()));
-    writer.Raw(entry);
+  for (const Entry& entry : entries) {
+    writer.U32(entry.encoded_size);
+    if (absl::Status status =
+            WriteProjectedDirective(writer, *entry.directive, true);
+        !status.ok()) {
+      return status;
+    }
   }
-  return ComputeSha256(std::move(writer).Take());
+  return sink.Final();
 }
 
 namespace {
 
-absl::StatusOr<std::string> EncodeFullDesiredStateImpl(
-    const FullDesiredState& state, bool validate_projection) {
-  auto expected_directive_digest =
-      ComputeDirectiveSetDigest(state.current_directives);
-  if (!expected_directive_digest.ok()) {
-    return expected_directive_digest.status();
-  }
-  if (*expected_directive_digest != state.directive_set_digest) {
-    return ProtocolError(
-        "FullDesiredState directive-set digest is inconsistent");
-  }
-  Writer writer;
+absl::Status WriteFullDesiredStateBody(
+    Writer& writer, const FullDesiredState& state,
+    std::uint64_t source_meta_applied_index,
+    const WireHash256& projection_hash,
+    const WireHash256& directive_set_digest,
+    bool normalize_directive_basis) {
   writer.U16(kProtocolVersion);
-  writer.U64(state.source_meta_applied_index);
+  writer.U64(source_meta_applied_index);
   writer.U64(state.topology_epoch);
-  writer.Fixed(state.projection_hash);
+  writer.Fixed(projection_hash);
 
   if (absl::Status status = WriteCount(writer, state.meta_directory.size(),
                                        kMaxDirectoryEntries, "Meta directory");
@@ -2661,47 +2814,89 @@ absl::StatusOr<std::string> EncodeFullDesiredStateImpl(
     return status;
   }
   for (const WireProjectedDirective& directive : state.current_directives) {
-    if (absl::Status status = WriteProjectedDirective(writer, directive);
+    if (absl::Status status = WriteProjectedDirective(
+            writer, directive, normalize_directive_basis);
         !status.ok()) {
       return status;
     }
   }
-  writer.Fixed(state.directive_set_digest);
-  std::string encoded = std::move(writer).Take();
-  if (encoded.size() > kMaxFullDesiredStateBytes) {
+  writer.Fixed(directive_set_digest);
+  if (writer.size() > kMaxFullDesiredStateBytes) {
     return ResourceLimit("FullDesiredState exceeds 512 MiB");
   }
-  if (validate_projection) {
-    if (IsZeroHash(state.projection_hash)) {
-      return ProtocolError("FullDesiredState projection hash is empty");
-    }
-    for (const WireProjectedDirective& directive : state.current_directives) {
-      if (directive.basis.source_meta_applied_index !=
-              state.source_meta_applied_index ||
-          directive.basis.projection_hash != state.projection_hash) {
-        return ProtocolError(
-            "projected directive does not carry the enclosing projection "
-            "basis");
-      }
-    }
-    auto expected_projection = ComputeProjectionHash(state);
-    if (!expected_projection.ok()) return expected_projection.status();
-    if (*expected_projection != state.projection_hash) {
-      return ProtocolError("FullDesiredState projection hash is inconsistent");
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFullDesiredStateProjectionBasis(
+    const FullDesiredState& state) {
+  if (IsZeroHash(state.projection_hash)) {
+    return ProtocolError("FullDesiredState projection hash is empty");
+  }
+  for (const WireProjectedDirective& directive : state.current_directives) {
+    if (directive.basis.source_meta_applied_index !=
+            state.source_meta_applied_index ||
+        directive.basis.projection_hash != state.projection_hash) {
+      return ProtocolError(
+          "projected directive does not carry the enclosing projection "
+          "basis");
     }
   }
-  const WireHash256 object_hash = ComputeSha256(encoded);
-  if (!IsZeroHash(state.object_hash) && state.object_hash != object_hash) {
-    return ProtocolError("FullDesiredState object hash is inconsistent");
+  return absl::OkStatus();
+}
+
+absl::StatusOr<WireHash256> ComputeProjectionHashImpl(
+    const FullDesiredState& state,
+    const WireHash256& normalized_directive_digest) {
+  // Projection hashing streams the canonical body into SHA-256. At the
+  // protocol maximum, materializing this normalized encoding would otherwise
+  // temporarily duplicate the complete decoded projection.
+  Sha256WriterSink sink;
+  Writer writer(sink);
+  if (absl::Status status = WriteFullDesiredStateBody(
+          writer, state, 0, WireHash256{}, normalized_directive_digest, true);
+      !status.ok()) {
+    return status;
   }
-  return encoded;
+  return sink.Final();
 }
 
 }  // namespace
 
 absl::StatusOr<std::string> EncodeFullDesiredState(
     const FullDesiredState& state) {
-  return EncodeFullDesiredStateImpl(state, true);
+  auto expected_directive_digest =
+      ComputeDirectiveSetDigest(state.current_directives);
+  if (!expected_directive_digest.ok()) {
+    return expected_directive_digest.status();
+  }
+  if (*expected_directive_digest != state.directive_set_digest) {
+    return ProtocolError(
+        "FullDesiredState directive-set digest is inconsistent");
+  }
+  if (absl::Status status = ValidateFullDesiredStateProjectionBasis(state);
+      !status.ok()) {
+    return status;
+  }
+  auto expected_projection =
+      ComputeProjectionHashImpl(state, *expected_directive_digest);
+  if (!expected_projection.ok()) return expected_projection.status();
+  if (*expected_projection != state.projection_hash) {
+    return ProtocolError("FullDesiredState projection hash is inconsistent");
+  }
+
+  Writer writer;
+  if (absl::Status status = WriteFullDesiredStateBody(
+          writer, state, state.source_meta_applied_index,
+          state.projection_hash, state.directive_set_digest, false);
+      !status.ok()) {
+    return status;
+  }
+  std::string encoded = std::move(writer).Take();
+  const WireHash256 object_hash = ComputeSha256(encoded);
+  if (!IsZeroHash(state.object_hash) && state.object_hash != object_hash) {
+    return ProtocolError("FullDesiredState object hash is inconsistent");
+  }
+  return encoded;
 }
 
 absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
@@ -2794,15 +2989,12 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
     return ProtocolError(
         "FullDesiredState directive-set digest is inconsistent");
   }
-  for (const WireProjectedDirective& directive : state.current_directives) {
-    if (directive.basis.source_meta_applied_index !=
-            state.source_meta_applied_index ||
-        directive.basis.projection_hash != state.projection_hash) {
-      return ProtocolError(
-          "projected directive does not carry the enclosing projection basis");
-    }
+  if (absl::Status status = ValidateFullDesiredStateProjectionBasis(state);
+      !status.ok()) {
+    return status;
   }
-  auto expected_projection = ComputeProjectionHash(state);
+  auto expected_projection =
+      ComputeProjectionHashImpl(state, *expected_directive_digest);
   if (!expected_projection.ok()) return expected_projection.status();
   if (*expected_projection != state.projection_hash) {
     return ProtocolError("FullDesiredState projection hash is inconsistent");
@@ -2811,23 +3003,23 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
   return state;
 }
 
+absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
+    std::string&& encoded) {
+  auto decoded = DecodeFullDesiredState(std::string_view(encoded));
+  // A transferred FDS is already duplicated by its decoded owning strings.
+  // Release the contiguous wire allocation before returning it to callers so
+  // installation cannot retain both complete representations across awaits.
+  std::string released;
+  encoded.swap(released);
+  return decoded;
+}
+
 absl::StatusOr<WireHash256> ComputeProjectionHash(
     const FullDesiredState& state) {
-  FullDesiredState normalized = state;
-  normalized.source_meta_applied_index = 0;
-  normalized.projection_hash = {};
-  normalized.object_hash = {};
-  for (WireProjectedDirective& directive : normalized.current_directives) {
-    directive.basis.source_meta_applied_index = 0;
-    directive.basis.projection_hash = {};
-  }
   auto directive_digest =
-      ComputeDirectiveSetDigest(normalized.current_directives);
+      ComputeDirectiveSetDigest(state.current_directives);
   if (!directive_digest.ok()) return directive_digest.status();
-  normalized.directive_set_digest = *directive_digest;
-  auto encoded = EncodeFullDesiredStateImpl(normalized, false);
-  if (!encoded.ok()) return encoded.status();
-  return ComputeSha256(*encoded);
+  return ComputeProjectionHashImpl(state, *directive_digest);
 }
 
 }  // namespace keylane::cluster::control

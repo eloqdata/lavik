@@ -308,6 +308,19 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   endforeach()
 endif()
 
+add_library(keylane_lease_clock STATIC
+  src/cluster/lease_clock.cpp
+)
+add_library(keylane::lease_clock ALIAS keylane_lease_clock)
+target_include_directories(keylane_lease_clock PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_compile_features(keylane_lease_clock PUBLIC cxx_std_23)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(keylane_lease_clock PRIVATE
+    -Wall -Wextra -Wpedantic)
+endif()
+
 add_library(keylane_control_protocol STATIC
   src/cluster/control_protocol.cpp
 )
@@ -455,6 +468,7 @@ target_compile_definitions(keylane_module PUBLIC
   KEYLANE_ENABLE_TEST_FAULTS=$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>
 )
 target_link_libraries(keylane_module PUBLIC
+  keylane::lease_clock
   keylane::control_transport
   keylane::control_protocol
   celer::core
@@ -514,6 +528,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         celer_rpc
         keylane_control_protocol
         keylane_control_transport
+        keylane_lease_clock
         keylane_module
         keylane)
     if (TARGET keylane_fault_server)
@@ -583,6 +598,7 @@ if (KEYLANE_BUILD_META)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(keylane_meta_core PUBLIC
+    keylane::lease_clock
     keylane::control_transport
     keylane::control_protocol
     NuRaft::static_lib

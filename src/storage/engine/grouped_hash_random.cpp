@@ -14,7 +14,8 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const HashOperation& operation, GroupedHashObject::Handle object,
     ValueType value_type, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   try {
     const bool pop = operation.kind_ == HashOperationKind::kPopRandom;
     if (!object || object->is_ordered() ||
@@ -204,10 +205,12 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
                   store, partition, db_id, key, digest, object,
                   std::move(remaining), std::move(changed), result.length_,
                   value_type, object->version().root_.expire_at_ms_, tx,
-                  replication)
+                  replication, mutation_precondition)
             : co_await AppendLocked(store, partition, db_id, key, digest, {},
                                     RecordKind::kTombstone, ValueType::kNone, 0,
-                                    tx, 0, nullptr, nullptr, replication);
+                                    tx, 0, nullptr, nullptr, replication,
+                                    nullptr, true, nullptr,
+                                    mutation_precondition);
     if (!status.ok()) co_return status;
     co_return result;
   } catch (const std::bad_alloc&) {

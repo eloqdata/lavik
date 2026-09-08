@@ -73,6 +73,10 @@
 //      CAS revision once. CommitDirectiveResult repeats the same check before
 //      first commit; snapshot recovery and projection reject any stale entry
 //      that bypassed this invariant.
+//   9. SetSlotMap first constructs the complete candidate topology and rejects
+//      any slot-ownership or config-epoch change that affects a group with an
+//      active grant. Source and destination groups must be fenced before the
+//      cut, so no lease issued for the old projection can span a slot move.
 //
 // MetaStores is the committed aggregate that snapshots serialize as one
 // versioned envelope: per-store length-prefixed versioned blobs in a fixed
@@ -122,10 +126,11 @@ struct MetaStores {
 
 // Validates one durable directive against the exact currently committed
 // source/target memberships, active authority, and population identity. Boot
-// incarnations are intentionally absent: they are session/observation facts,
-// not Meta durable state. Transition apply, result commit, snapshot recovery,
-// and wire projection share this predicate so none can accept or expose a
-// directive after its authority anchor has gone stale.
+// incarnations are durable intent anchors, but the committed identity registry
+// has no boot lifecycle against which to validate them; authenticated sessions
+// and observations supply that independent check. Transition apply, result
+// commit, snapshot recovery, and wire projection share this predicate so none
+// can accept or expose a directive after its committed anchor has gone stale.
 absl::Status ValidateCommittedDirectiveAnchor(
     const MetaStores& stores, const MetaDirectiveSpec& directive);
 

@@ -1,9 +1,11 @@
 #include "keylane/cluster/control_protocol.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -36,6 +38,70 @@ WireId128 Id(std::uint8_t last) {
 
 WireHash256 Sha256(std::string_view bytes) {
   return control::ComputeSha256(bytes);
+}
+
+void AppendBe16(std::string* bytes, std::uint16_t value) {
+  bytes->push_back(static_cast<char>(value >> 8));
+  bytes->push_back(static_cast<char>(value));
+}
+
+void AppendBe32(std::string* bytes, std::uint32_t value) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    bytes->push_back(static_cast<char>(value >> shift));
+  }
+}
+
+absl::StatusOr<WireHash256> LegacyDirectiveSetDigest(
+    const std::vector<control::WireProjectedDirective>& directives) {
+  std::vector<std::string> entries;
+  entries.reserve(directives.size());
+  for (const control::WireProjectedDirective& source : directives) {
+    control::Directive directive{
+        .basis = source.basis,
+        .authority = source.authority,
+        .identity = source.identity,
+        .recipient_node_id = source.recipient_node_id,
+        .recipient_boot_id = source.recipient_boot_id,
+        .target_node_id = source.target_node_id,
+        .target_boot_id = source.target_boot_id,
+        .source_node_id = source.source_node_id,
+        .source_assignment_id = source.source_assignment_id,
+        .source_boot_id = source.source_boot_id,
+        .source_replication_history_id =
+            source.source_replication_history_id,
+        .manifest_revision = source.manifest_revision,
+        .manifest_digest = source.manifest_digest,
+        .partition_replication_epoch = source.partition_replication_epoch,
+        .kind = source.kind,
+        .payload = source.payload,
+        .preconditions = source.preconditions,
+        .storage_mutating = source.storage_mutating,
+        .force = source.force,
+    };
+    directive.basis = {};
+    auto encoded =
+        control::EncodeMessage(control::WireMessage(std::move(directive)));
+    if (!encoded.ok()) return encoded.status();
+    constexpr std::size_t kSessionIdBytes = 16;
+    entries.push_back(encoded->substr(kSessionIdBytes));
+  }
+  std::sort(entries.begin(), entries.end(),
+            [](const std::string& left, const std::string& right) {
+              return std::lexicographical_compare(
+                  left.begin(), left.end(), right.begin(), right.end(),
+                  [](char lhs, char rhs) {
+                    return static_cast<unsigned char>(lhs) <
+                           static_cast<unsigned char>(rhs);
+                  });
+            });
+  std::string canonical = "KLDSET";
+  AppendBe16(&canonical, 1);
+  AppendBe32(&canonical, static_cast<std::uint32_t>(entries.size()));
+  for (const std::string& entry : entries) {
+    AppendBe32(&canonical, static_cast<std::uint32_t>(entry.size()));
+    canonical.append(entry);
+  }
+  return Sha256(canonical);
 }
 
 std::string Hex(const WireHash256& bytes) {
@@ -539,6 +605,46 @@ TEST(ControlProtocolFullStateTest, RoundTripsEmptyTopologyAtEpochZero) {
 }
 
 TEST(ControlProtocolFullStateTest,
+     ConsumingDecodeReleasesTransferredWireStorage) {
+  control::FullDesiredState state;
+  state.source_meta_applied_index = 1;
+  control::WirePolicy policy{.policy_id = "large-enough-to-own-storage",
+                             .version = 1,
+                             .content = std::string(64 * 1024, 'p')};
+  policy.content_hash = Sha256(policy.content);
+  state.policies.push_back(std::move(policy));
+  auto directives =
+      control::ComputeDirectiveSetDigest(state.current_directives);
+  ASSERT_TRUE(directives.ok()) << directives.status();
+  state.directive_set_digest = *directives;
+  auto projection = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(projection.ok()) << projection.status();
+  state.projection_hash = *projection;
+
+  auto encoded = control::EncodeFullDesiredState(state);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  std::string transfer = std::move(*encoded);
+  const std::size_t empty_capacity = std::string{}.capacity();
+  ASSERT_GT(transfer.capacity(), empty_capacity);
+  auto decoded = control::DecodeFullDesiredState(std::move(transfer));
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_TRUE(transfer.empty());
+  EXPECT_EQ(transfer.capacity(), empty_capacity);
+  ASSERT_EQ(decoded->policies.size(), 1U);
+  EXPECT_EQ(decoded->policies.front().content.size(), 64U * 1024U);
+
+  auto invalid_encoded = control::EncodeFullDesiredState(state);
+  ASSERT_TRUE(invalid_encoded.ok()) << invalid_encoded.status();
+  invalid_encoded->front() = static_cast<char>(0xff);
+  std::string invalid_transfer = std::move(*invalid_encoded);
+  ASSERT_GT(invalid_transfer.capacity(), empty_capacity);
+  EXPECT_FALSE(
+      control::DecodeFullDesiredState(std::move(invalid_transfer)).ok());
+  EXPECT_TRUE(invalid_transfer.empty());
+  EXPECT_EQ(invalid_transfer.capacity(), empty_capacity);
+}
+
+TEST(ControlProtocolFullStateTest,
      FrameSizedProjectionRoundTripsAsTypedMessage) {
   control::FullDesiredState state;
   state.source_meta_applied_index = 1;
@@ -653,6 +759,12 @@ TEST(ControlProtocolFullStateTest,
   ASSERT_TRUE(reversed.ok()) << reversed.status();
   EXPECT_EQ(*reversed, *original);
 
+  // Pin the streaming implementation to the original v1 definition, which
+  // sorted complete canonical entries before hashing them.
+  auto legacy = LegacyDirectiveSetDigest(std::vector{second, first});
+  ASSERT_TRUE(legacy.ok()) << legacy.status();
+  EXPECT_EQ(*legacy, *original);
+
   first.basis.source_meta_applied_index = 99;
   first.basis.projection_hash = Sha256("new projection");
   auto rebased = control::ComputeDirectiveSetDigest(std::vector{second, first});
@@ -678,6 +790,86 @@ TEST(ControlProtocolFullStateTest,
       control::ComputeDirectiveSetDigest(std::vector{second, first});
   ASSERT_TRUE(semantic_change.ok()) << semantic_change.status();
   EXPECT_NE(*semantic_change, *original);
+}
+
+TEST(ControlProtocolFullStateTest,
+     StreamingDirectiveDigestMatchesV1ByteSortAcrossFieldsAndPermutations) {
+  const control::WireProjectedDirective base{
+      .basis = {.source_meta_applied_index = 1,
+                .projection_hash = Sha256("projection")},
+      .authority = {.group_id = "group-a",
+                    .assignment_id = Id(1),
+                    .group_term = 2,
+                    .authority_version = 3,
+                    .grant_revision = 4},
+      .identity = {.operation_id = Id(5),
+                   .directive_id = Id(6),
+                   .attempt_id = Id(7),
+                   .directive_revision = 8},
+      .recipient_node_id = std::string(40, 'a'),
+      .recipient_boot_id = std::string(40, 'b'),
+      .target_node_id = std::string(40, 'c'),
+      .target_boot_id = std::string(40, 'd'),
+      .source_node_id = std::string(40, 'e'),
+      .source_assignment_id = Id(9),
+      .source_boot_id = std::string(40, 'f'),
+      .source_replication_history_id = std::string(40, '1'),
+      .manifest_revision = 10,
+      .manifest_digest = Sha256("manifest"),
+      .partition_replication_epoch = 11,
+      .kind = control::WireDirectiveKind::kRebuild,
+      .payload = "payload",
+      .preconditions = "preconditions",
+      .storage_mutating = true,
+      .force = false};
+
+  std::vector<control::WireProjectedDirective> directives{base};
+  const auto add = [&](auto mutate) {
+    control::WireProjectedDirective candidate = base;
+    mutate(candidate);
+    directives.push_back(std::move(candidate));
+  };
+  add([](auto& value) { value.basis.source_meta_applied_index = 99; });
+  add([](auto& value) { value.authority.group_id = "z"; });
+  add([](auto& value) { value.authority.assignment_id = Id(2); });
+  add([](auto& value) { value.authority.group_term = 12; });
+  add([](auto& value) { value.authority.authority_version = 13; });
+  add([](auto& value) { value.authority.grant_revision = 14; });
+  add([](auto& value) { value.identity.operation_id = Id(15); });
+  add([](auto& value) { value.identity.directive_id = Id(16); });
+  add([](auto& value) { value.identity.attempt_id = Id(17); });
+  add([](auto& value) { value.identity.directive_revision = 18; });
+  add([](auto& value) { value.recipient_node_id = std::string(40, '2'); });
+  add([](auto& value) { value.recipient_boot_id = std::string(40, '3'); });
+  add([](auto& value) { value.target_node_id = std::string(40, '4'); });
+  add([](auto& value) { value.target_boot_id = std::string(40, '5'); });
+  add([](auto& value) { value.source_node_id = std::string(40, '6'); });
+  add([](auto& value) { value.source_assignment_id = Id(19); });
+  add([](auto& value) { value.source_boot_id = std::string(40, '7'); });
+  add([](auto& value) {
+    value.source_replication_history_id = std::string(40, '8');
+  });
+  add([](auto& value) { value.manifest_revision = 20; });
+  add([](auto& value) { value.manifest_digest = Sha256("other manifest"); });
+  add([](auto& value) { value.partition_replication_epoch = 21; });
+  add([](auto& value) {
+    value.kind = control::WireDirectiveKind::kRevokeSources;
+  });
+  add([](auto& value) { value.payload = "z"; });
+  add([](auto& value) { value.payload = std::string(7, '\xff'); });
+  add([](auto& value) { value.preconditions = "x"; });
+  add([](auto& value) { value.storage_mutating = false; });
+  add([](auto& value) { value.force = true; });
+
+  std::mt19937_64 random(0x4b4c4350);
+  for (int permutation = 0; permutation < 16; ++permutation) {
+    auto streamed = control::ComputeDirectiveSetDigest(directives);
+    auto legacy = LegacyDirectiveSetDigest(directives);
+    ASSERT_TRUE(streamed.ok()) << streamed.status();
+    ASSERT_TRUE(legacy.ok()) << legacy.status();
+    EXPECT_EQ(*streamed, *legacy) << "permutation " << permutation;
+    std::shuffle(directives.begin(), directives.end(), random);
+  }
 }
 
 TEST(ControlProtocolFullStateTest, RoundTripsCommittedGrantlessGroup) {

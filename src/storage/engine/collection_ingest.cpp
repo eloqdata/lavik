@@ -48,10 +48,11 @@ Task<absl::StatusOr<RestoreRawResult>> StorageEngine::RestoreCollectionValue(
     std::uint8_t db_id, std::string_view key, ValueType type,
     std::uint64_t expire_at_ms, bool replace,
     std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   return impl_->RestoreCollectionValue(db_id, key, type, expire_at_ms, replace,
                                        expected_items, std::move(reader),
-                                       replication);
+                                       replication, mutation_precondition);
 }
 
 Task<absl::StatusOr<RestoreRawResult>>
@@ -59,10 +60,11 @@ StorageEngine::RestoreCollectionValueLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     ValueType type, std::uint64_t expire_at_ms, bool replace,
     std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
-    TxShardWrites* tx, ReplicationCommandAppend* replication) {
+    TxShardWrites* tx, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   return impl_->RestoreCollectionValueLocked(
       db_id, key, digest, type, expire_at_ms, replace, expected_items,
-      std::move(reader), tx, replication);
+      std::move(reader), tx, replication, mutation_precondition);
 }
 
 Task<absl::StatusOr<RestoreRawResult>>
@@ -70,13 +72,14 @@ StorageEngine::Impl::RestoreCollectionValue(
     std::uint8_t db_id, std::string_view key, ValueType type,
     std::uint64_t expire_at_ms, bool replace,
     std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   const auto digest = ComputeDigest(key);
   auto hold = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
   co_return co_await RestoreCollectionValueLocked(
       db_id, key, digest, type, expire_at_ms, replace, expected_items,
-      std::move(reader), nullptr, replication);
+      std::move(reader), nullptr, replication, mutation_precondition);
 }
 
 Task<absl::StatusOr<RestoreRawResult>>
@@ -84,7 +87,8 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     ValueType type, std::uint64_t expire_at_ms, bool replace,
     std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
-    TxShardWrites* outer, ReplicationCommandAppend* replication) {
+    TxShardWrites* outer, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   if (db_id >= kLogicalDatabaseCount || digest != ComputeDigest(key) ||
       !reader ||
       (type != ValueType::kHash && type != ValueType::kSet &&
@@ -98,8 +102,8 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
   if (exists && !replace) co_return RestoreRawResult{.busy_ = true};
   if (expire_at_ms != 0 && expire_at_ms <= UnixTimeMillis()) {
     if (!exists) co_return RestoreRawResult{};
-    auto deleted =
-        co_await DeleteLocked(db_id, key, digest, outer, replication);
+    auto deleted = co_await DeleteLocked(db_id, key, digest, outer,
+                                         replication, mutation_precondition);
     if (!deleted.ok()) co_return deleted.status();
     co_return RestoreRawResult{.changed_ = *deleted, .deleted_ = *deleted};
   }
@@ -142,6 +146,9 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     // return on abort; no vector merge may allocate on an OOM rollback path.
     // Page readers must not reenter this same owner/transaction accumulator.
     writes = std::move(*outer);
+    if (mutation_precondition != nullptr) {
+      writes.mutation_precondition_ = *mutation_precondition;
+    }
   } else {
     // The key intent is held, but no transaction lease or store mutex is held
     // yet. Ingest batches later borrow this accumulator and must not attempt
@@ -155,7 +162,10 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     if (!space.ok()) co_return space;
     InitializeTxWrites(tx::TxRuntime::Get()->next_txid_.fetch_add(
                            1, std::memory_order_relaxed),
-                       std::span(&writes, 1));
+                       std::span(&writes, 1),
+                       mutation_precondition != nullptr
+                           ? *mutation_precondition
+                           : MutationPrecondition{});
   }
   // Even an unexpected allocator exception in compensation must return the
   // borrowed accumulator. Such an exception is fail-stop, not a successful

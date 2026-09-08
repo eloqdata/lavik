@@ -108,7 +108,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     GroupedHashObject::Handle previous, HashValue after_image,
     std::vector<HashGroupId> changed_groups, std::uint64_t field_count,
     ValueType value_type, std::uint64_t expire_at_ms, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   if (field_count == 0 ||
       field_count > std::numeric_limits<std::uint32_t>::max() ||
       (value_type != ValueType::kHash && value_type != ValueType::kSet)) {
@@ -152,7 +153,10 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     if (!space.ok()) co_return space;
     InitializeTxWrites(tx::TxRuntime::Get()->next_txid_.fetch_add(
                            1, std::memory_order_relaxed),
-                       std::span(&standalone, 1));
+                       std::span(&standalone, 1),
+                       mutation_precondition != nullptr
+                           ? *mutation_precondition
+                           : MutationPrecondition{});
     tx = &standalone;
   }
   const auto dependency =
@@ -367,7 +371,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   const auto appended = co_await AppendLocked(
       store, partition, db_id, key, digest, *root_payload, RecordKind::kValue,
       value_type, expire_at_ms, tx, field_count, nullptr, nullptr, replication,
-      nullptr, true, nullptr, &mutation);
+      nullptr, true, nullptr, mutation_precondition, &mutation);
   if (!appended.ok()) {
     if (store.write_failed_) {
       // A root may already be staged/published on a fail-stopped path. Its

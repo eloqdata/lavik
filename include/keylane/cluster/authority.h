@@ -1,14 +1,18 @@
 #pragma once
 
-// AuthorityGuard: the single admission decision point for the
-// cluster data plane, plus the owner-side re-check that keeps a stale
-// admission from mutating after a fence.
+// AuthorityGuard: the single request-path authority boundary for the cluster
+// data plane. CaptureAndAdmit records routing plus finite-lease state;
+// RegisterAndRecheck closes the publication race and keeps a stale admission
+// from overtaking a fence, and RecheckAtMutation enforces the same proof at
+// the storage publication cut after intervening suspension.
 //
-// Admit() is a pure function over one committed ServingState — no Redis wire
-// concerns, no globals — so the full decision matrix is testable offline.
-// Wire mapping (MOVED/CLUSTERDOWN/CROSSSLOT/LOADING text) lives in the Redis
-// layer. Internal state (term, grant, fence reason) never crosses into RESP.
+// Admit() and AuthorityUnchanged() remain pure routing/test helpers over
+// committed ServingState values; they do not carry a lease generation,
+// deadline, or in-flight registration and therefore are not safe substitutes
+// for AuthorityGuard on a request path. Wire mapping
+// (MOVED/CLUSTERDOWN/CROSSSLOT/LOADING text) lives in the Redis layer.
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -22,6 +26,7 @@
 
 #include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
+#include "keylane/cluster/lease_clock.h"
 #include "keylane/cluster/topology.h"
 
 namespace keylane::cluster {
@@ -72,10 +77,9 @@ struct Decision {
 // bit is only consumed by the node holding it.
 Decision Admit(const ServingState* state, const RequestView& request);
 
-// Owner-side authority re-check. The admission side captures the snapshot it
-// admitted against; immediately before mutation (after every suspending
-// admission), the executing worker compares per-group authority tokens for
-// the request's slots between the admitted and the current snapshot.
+// Owner-side authority re-check result. The request path first registers its
+// in-flight cells and rechecks, holds those guards across execution, then
+// rechecks the captured proof once more at the storage mutation cut.
 enum class RecheckResult : std::uint8_t {
   kOk,         // authority unchanged; proceed
   kReject,     // nothing executed yet; safe to answer with redirect/error
@@ -90,8 +94,8 @@ bool AuthorityUnchanged(const ServingState& admitted,
                         const ServingState* current,
                         std::span<const std::uint16_t> slots);
 
-using MonotonicTime = std::chrono::steady_clock::time_point;
-using MonotonicDuration = std::chrono::steady_clock::duration;
+using MonotonicTime = LeaseTime;
+using MonotonicDuration = LeaseDuration;
 
 // Node-specific semantic basis of a projected Meta state. The Raft applied
 // index orders observations and detects rollback; the SHA-256 projection hash
@@ -139,11 +143,26 @@ struct AuthorityAnchor {
 // ServingState; that would omit the lease generation and deadline proof.
 class AuthorityAdmission {
  public:
+  AuthorityAdmission() = default;
+  AuthorityAdmission(const AuthorityAdmission&) = delete;
+  AuthorityAdmission& operator=(const AuthorityAdmission&) = delete;
+  AuthorityAdmission(AuthorityAdmission&& other) noexcept;
+  AuthorityAdmission& operator=(AuthorityAdmission&& other) noexcept;
+
   const Decision& decision() const noexcept { return decision_; }
   const std::shared_ptr<const ServingState>& state() const noexcept {
     return state_;
   }
   std::span<const std::uint16_t> slots() const noexcept { return slots_; }
+  // A final storage check records whether any mutation in this admission has
+  // linearized and whether a later one was rejected. Callers use the pair to
+  // distinguish a safe fresh redirect from an indeterminate partial result.
+  bool mutation_started() const noexcept {
+    return mutation_started_.load(std::memory_order_acquire);
+  }
+  bool final_recheck_failed() const noexcept {
+    return final_recheck_failed_.load(std::memory_order_acquire);
+  }
 
  private:
   friend class AuthorityGuard;
@@ -152,6 +171,8 @@ class AuthorityAdmission {
   absl::InlinedVector<std::uint16_t, 4> slots_;
   std::uint64_t gate_generation_ = 0;
   bool lease_checked_ = false;
+  mutable std::atomic<bool> mutation_started_{false};
+  mutable std::atomic<bool> final_recheck_failed_{false};
 };
 
 // Guards held from the final authority check until the admitted mutation has
@@ -180,17 +201,27 @@ class AuthorityGuard {
 
   // Captures a coherent serving verdict and lease generation at `now`.
   // Meta-managed local-primary requests fail closed when no exact unexpired
-  // lease exists. The returned record must be passed to Recheck immediately
-  // before a side effect.
+  // lease exists. A mutating request must retain the returned record and pass
+  // it through RegisterAndRecheck while holding the resulting guards across
+  // execution. Storage writes additionally carry it to RecheckAtMutation at
+  // their publication seam.
   AuthorityAdmission CaptureAndAdmit(const RequestView& request,
                                      MonotonicTime now) const;
 
-  // Verifies topology, session generation, and lease deadline captured at
-  // admission. kReject means no side effect may begin; the caller alone knows
-  // whether an already-started irreversible operation instead requires
-  // kUncertain/connection close handling.
+  // Lower-level verification of topology, session generation, and lease
+  // deadline captured at admission. This call does not enter an in-flight cell
+  // and is not by itself a safe request-mutation boundary; request paths use
+  // RegisterAndRecheck plus RecheckAtMutation. kReject means the caller must
+  // not begin a new side effect.
   RecheckResult Recheck(const AuthorityAdmission& admission,
                         MonotonicTime now) const;
+
+  // Final non-suspending check at the storage publication seam. On success it
+  // records that this shared admission has begun a mutation; on rejection it
+  // records the failure so aggregate commands never return a falsely certain
+  // result after an earlier participant already changed state.
+  RecheckResult RecheckAtMutation(const AuthorityAdmission& admission,
+                                  MonotonicTime now) const;
 
   // Atomically closes the publication/fence race around the owner-side
   // recheck: enter every distinct admitted group's in-flight cell, then prove
@@ -218,8 +249,8 @@ class AuthorityGuard {
                          std::span<const std::uint16_t> slots,
                          MonotonicTime now) const;
   absl::Status RenewLease(const SessionIdentity& session,
-                          const AuthorityAnchor& anchor,
-                          MonotonicTime deadline);
+                          const AuthorityAnchor& anchor, MonotonicTime deadline,
+                          MonotonicTime now);
   // Removes only the exact lease instance named by its original deadline.
   // A renewal changes that deadline, so a stale timer cannot revoke the
   // replacement lease. Returns true exactly once for a due lease.

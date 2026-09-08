@@ -31,6 +31,10 @@ inline constexpr std::size_t kMaxFramePayloadBytes =
     kMaxFrameBytes - kFrameHeaderBytes;
 // This is a cap for each opaque schema field, not for an entire message.
 inline constexpr std::size_t kMaxOpaqueFieldBytes = 256u * 1024u;
+// This caps canonical wire bytes, not the decoded object graph. Decode must
+// temporarily retain the input plus its owning fields; digest/projection
+// validation is therefore required to use only O(directive-count) references
+// and constant-size hashing state, never another projection-sized buffer.
 inline constexpr std::uint64_t kMaxFullDesiredStateBytes = 512ull << 20;
 // A streamed Directive contains two independently bounded opaque fields plus
 // fixed and identifier envelopes that themselves fit in one frame.
@@ -229,7 +233,9 @@ class LargeObjectSink {
 };
 
 // One instance belongs to one transport direction and permits one in-progress
-// object.  Small control frames can still be decoded and handled around it.
+// object. Small control frames can still be decoded and handled around it. The
+// referenced sink must outlive the reassembler; destruction aborts any active
+// object through that sink.
 class LargeObjectReassembler {
  public:
   explicit LargeObjectReassembler(LargeObjectSink& sink);
@@ -437,18 +443,20 @@ class HeartbeatSequenceWindow {
   WireHash256 last_hash_{};
 };
 
-// Pure client-side challenge state.  MarkWritten must be called immediately
-// before the first WriteAll.  A grant's deadline is derived from that original
-// monotonic timestamp, never from arrival time.
+// Pure client-side challenge state. MarkWritten must be called immediately
+// before the first WriteAll. Its timestamp and AcceptGrant's receive cut must
+// come from the same suspend-aware lease-clock domain (production uses
+// LeaseClockMillis/CLOCK_BOOTTIME). A grant's deadline is derived from that
+// original send timestamp, never from arrival time.
 class LeaseChallengeTracker {
  public:
   absl::Status Begin(WireId128 session_id, std::string data_boot_id,
                      LeaseChallenge challenge);
   absl::Status MarkWritten(const WireId128& nonce,
-                           std::int64_t monotonic_now_ms);
+                           std::int64_t lease_now_ms);
   absl::StatusOr<std::int64_t> AcceptGrant(const WireId128& session_id,
                                            const LeaseGranted& grant,
-                                           std::int64_t monotonic_now_ms);
+                                           std::int64_t lease_now_ms);
   void Cancel() noexcept;
   bool pending() const noexcept { return pending_.has_value(); }
 
@@ -457,7 +465,7 @@ class LeaseChallengeTracker {
     WireId128 session_id{};
     std::string data_boot_id;
     LeaseChallenge challenge;
-    std::optional<std::int64_t> sent_at_ms;
+    std::optional<std::int64_t> lease_sent_at_ms;
   };
   std::optional<Pending> pending_;
   std::optional<WireId128> last_nonce_;
@@ -514,9 +522,14 @@ struct Directive {
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
+  // Reserved in v1: codecs preserve these strings, but admission requires both
+  // empty until their execution semantics exist.
   std::string payload;
   std::string preconditions;
+  // Active V1 classification: rebuild must set it; source authorization and
+  // revocation must not. Data admission enforces the distinction.
   bool storage_mutating = false;
+  // Reserved execution override; Data admission requires false in V1.
   bool force = false;
 
   friend bool operator==(const Directive&, const Directive&) = default;
@@ -678,9 +691,14 @@ struct WireProjectedDirective {
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
+  // Reserved in v1: codecs preserve these strings, but admission requires both
+  // empty until their execution semantics exist.
   std::string payload;
   std::string preconditions;
+  // Active V1 classification: rebuild must set it; source authorization and
+  // revocation must not. Data admission enforces the distinction.
   bool storage_mutating = false;
+  // Reserved execution override; Data admission requires false in V1.
   bool force = false;
 
   friend bool operator==(const WireProjectedDirective&,
@@ -715,6 +733,10 @@ absl::StatusOr<std::string> EncodeFullDesiredState(
     const FullDesiredState& state);
 absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
     std::string_view encoded);
+// Consuming transfer overload. It releases the contiguous wire allocation on
+// every return path so a decoded owning projection does not keep a second
+// complete representation alive during installation.
+absl::StatusOr<FullDesiredState> DecodeFullDesiredState(std::string&& encoded);
 // Hashes only node-specific semantic content. Diagnostic applied indices,
 // derived hashes, and directive projection-basis copies are normalized out,
 // so an unrelated Raft commit cannot invalidate an installed projection.

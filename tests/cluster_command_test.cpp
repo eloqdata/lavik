@@ -523,7 +523,7 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
       .authority_version_ = group->authority_version_,
       .grant_revision_ = group->grant_revision_,
   };
-  const auto now = std::chrono::steady_clock::now();
+  const auto now = cluster::LeaseClockNow();
   ASSERT_TRUE(runtime->node_control_installer_
                   .ApplyAuthority({
                       .kind_ = cluster::AuthorityMessage::Kind::kLeaseGrant,
@@ -532,7 +532,7 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
                       .anchor_ = anchor,
                       .sent_at_ = now,
                       .granted_duration_ = std::chrono::hours(1),
-                  })
+                  }, now)
                   .ok());
 
   keylane::CommandRequest request;

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -36,6 +37,109 @@ class MetaObservationStore;
 class MetaCommittedFacts;
 
 namespace detail {
+
+// Worker-local admission gate for sockets that have not yet authenticated and
+// supplied a valid ClientHello. A permit is move-only and releases itself on
+// every coroutine exit path. Followers retain it through their redirect
+// write; leaders retain it until the connection has claimed its committed
+// node's single post-authentication session slot.
+class PendingHandshakeLimiter {
+ public:
+  class Permit {
+   public:
+    Permit(Permit&& other) noexcept;
+    Permit& operator=(Permit&& other) noexcept;
+    ~Permit();
+
+    Permit(const Permit&) = delete;
+    Permit& operator=(const Permit&) = delete;
+
+    void Release() noexcept;
+
+   private:
+    friend class PendingHandshakeLimiter;
+    explicit Permit(PendingHandshakeLimiter* owner) : owner_(owner) {}
+    PendingHandshakeLimiter* owner_ = nullptr;
+  };
+
+  explicit PendingHandshakeLimiter(std::size_t limit) : limit_(limit) {}
+
+  PendingHandshakeLimiter(const PendingHandshakeLimiter&) = delete;
+  PendingHandshakeLimiter& operator=(const PendingHandshakeLimiter&) = delete;
+  PendingHandshakeLimiter(PendingHandshakeLimiter&&) = delete;
+  PendingHandshakeLimiter& operator=(PendingHandshakeLimiter&&) = delete;
+
+  std::optional<Permit> TryAcquire();
+  std::size_t pending() const noexcept { return pending_; }
+  std::size_t limit() const noexcept { return limit_; }
+
+ private:
+  void Release() noexcept;
+
+  const std::size_t limit_;
+  std::size_t pending_ = 0;
+};
+
+// Worker-local first-owner registry for post-authentication leader sessions.
+// Callers claim only after validating a committed active node binding. That
+// makes the number of projection/FDS holders no larger than the committed
+// node domain, while exact-owner release prevents a rejected duplicate from
+// erasing the incumbent's slot during coroutine cleanup.
+class BoundNodeSessionRegistry {
+ public:
+  bool TryClaim(std::string_view node_id, celer::Connection* connection);
+  void Release(std::string_view node_id,
+               celer::Connection* connection) noexcept;
+  std::size_t size() const noexcept { return sessions_.size(); }
+
+ private:
+  std::map<std::string, celer::Connection*, std::less<>> sessions_;
+};
+
+// Worker-local weighted budget for decoded-plus-encoded node projections.
+// Unlike a session-count cap, charging retained capacities prevents a small
+// number of maximum-sized FDS owners from multiplying memory without bound.
+class RetainedProjectionLimiter {
+ public:
+  class Permit {
+   public:
+    Permit(Permit&& other) noexcept;
+    Permit& operator=(Permit&& other) noexcept;
+    ~Permit();
+
+    Permit(const Permit&) = delete;
+    Permit& operator=(const Permit&) = delete;
+
+    absl::Status Resize(std::size_t bytes);
+    void Release() noexcept;
+    std::size_t bytes() const noexcept { return bytes_; }
+
+   private:
+    friend class RetainedProjectionLimiter;
+    Permit(RetainedProjectionLimiter* owner, std::size_t bytes)
+        : owner_(owner), bytes_(bytes) {}
+    RetainedProjectionLimiter* owner_ = nullptr;
+    std::size_t bytes_ = 0;
+  };
+
+  explicit RetainedProjectionLimiter(std::size_t limit) : limit_(limit) {}
+
+  RetainedProjectionLimiter(const RetainedProjectionLimiter&) = delete;
+  RetainedProjectionLimiter& operator=(const RetainedProjectionLimiter&) =
+      delete;
+
+  std::optional<Permit> TryAcquire(std::size_t bytes);
+  std::size_t retained_bytes() const noexcept { return retained_bytes_; }
+  std::size_t limit() const noexcept { return limit_; }
+
+ private:
+  friend class Permit;
+  bool Resize(Permit& permit, std::size_t bytes) noexcept;
+  void Release(std::size_t bytes) noexcept;
+
+  const std::size_t limit_;
+  std::size_t retained_bytes_ = 0;
+};
 
 // Worker-local immutable view cache shared by all Data sessions. A Meta
 // commit may wake thousands of sessions, but the seven committed stores are
@@ -113,10 +217,33 @@ struct MetaDataControlServerOptions {
   // Upper bound supplied by process assembly from NuRaft's configured
   // leadership-expiry window. A committed grant may request less.
   std::uint32_t leadership_validity_ms_ = 0;
+  // Added to the maximum prior lease before a replacement authority may be
+  // granted. Process assembly supplies at least one full maximum-lease window,
+  // making quarantine Q >= 2D for maximum lease D. Thus an old Data clock has
+  // advanced at least D when the Meta clock has advanced Q, provided Meta's
+  // suspend-aware clock runs no more than twice as fast as Data's. Scheduling
+  // can only delay a grant, and Data rechecks the same suspend-aware deadline
+  // synchronously before every client mutation. The deliberately loose 2:1
+  // rate bound is derived from D rather than an unrelated millisecond guess.
+  std::uint32_t lease_handoff_safety_margin_ms_ = 0;
+  // Before a leader claims a committed node's single session slot (or a
+  // follower finishes its redirect), there is no durable owner with which to
+  // deduplicate a socket. The default equals the maximum projected Data-node
+  // population, and validation forbids raising it beyond that domain cap.
+  std::size_t max_pending_handshakes_ =
+      cluster::control::kMaxProjectedNodes;
   // Four frame-sized lanes: authority, reliable, bulk, and soft. Large
   // objects stream one frame at a time and do not consume an object-sized
   // allocation here.
   std::size_t max_write_queue_bytes_ = 4 * cluster::control::kMaxFrameBytes;
+  // Two projection generations may coexist during atomic replacement. Each
+  // gets two canonical-FDS size classes: one for encoded bytes and one for
+  // the owning decoded graph. Exact retained capacities are charged, so a
+  // pathologically structural object may still be rejected below its wire
+  // cap instead of escaping this process-wide bound.
+  std::size_t max_retained_projection_bytes_ =
+      4 * static_cast<std::size_t>(
+              cluster::control::kMaxFullDesiredStateBytes);
 };
 
 struct MetaDataControlMetricsSnapshot {
@@ -167,9 +294,10 @@ cluster::control::LeaseDecision EvaluateLeaseChallenge(
 
 // Volatile leader-local exclusion barrier between successive authority
 // holders. The first otherwise-valid grant for a group/boot/anchor identity
-// starts a full maximum-lease quarantine; only the same identity observed at
-// or after that monotonic deadline may pass. Resetting leadership clears all
-// evidence and therefore conservatively starts a fresh quarantine.
+// starts a maximum prior lease plus explicit safety-margin quarantine; only
+// the same identity observed at or after that suspend-aware deadline may pass.
+// Resetting leadership clears all evidence and therefore conservatively starts
+// a fresh quarantine.
 //
 // This state is deliberately not durable: after process or leader restart a
 // full new wait is safer than recovering a wall-clock deadline whose elapsed
@@ -177,12 +305,14 @@ cluster::control::LeaseDecision EvaluateLeaseChallenge(
 // worker.
 class MetaLeaseHandoffGuard {
  public:
-  explicit MetaLeaseHandoffGuard(std::uint32_t maximum_prior_lease_ms)
-      : maximum_prior_lease_ms_(maximum_prior_lease_ms) {}
+  MetaLeaseHandoffGuard(std::uint32_t maximum_prior_lease_ms,
+                        std::uint32_t safety_margin_ms)
+      : quarantine_ms_(static_cast<std::uint64_t>(maximum_prior_lease_ms) +
+                       safety_margin_ms) {}
 
   cluster::control::LeaseDecision Enforce(
       cluster::control::LeaseDecision decision, std::string_view node_id,
-      std::int64_t now_monotonic_ms);
+      std::int64_t now_lease_clock_ms);
   void Reset() noexcept { entries_.clear(); }
 
  private:
@@ -194,8 +324,46 @@ class MetaLeaseHandoffGuard {
     std::int64_t eligible_after_ms_ = 0;
   };
 
-  std::uint32_t maximum_prior_lease_ms_ = 0;
+  std::uint64_t quarantine_ms_ = 0;
   std::vector<Entry> entries_;
+};
+
+enum class MetaLeaderRuntimeDisposition : std::uint8_t {
+  kEligible,
+  kQuarantined,
+  kQuarantineStarted,
+};
+
+// Suspend-aware validity barrier layered over NuRaft's active-monotonic
+// leadership expiry. A host pause can let another Meta member win an election
+// while the old process's CLOCK_MONOTONIC-based peer timers stand still. Once
+// CLOCK_BOOTTIME has advanced by one leadership-validity window beyond the
+// active clock, authority remains quarantined until the old process itself has
+// run for one full validity window. That active interval gives NuRaft's peer
+// liveness check time to expire or observe the newer term before this process
+// can issue another authority-bearing message.
+//
+// Callers serialize this volatile state on the Meta control worker. Clock
+// values need only share their own domains; neither epoch is compared with the
+// other. Reset begins a new genuine leadership generation.
+class MetaLeaderRuntimeGuard {
+ public:
+  explicit MetaLeaderRuntimeGuard(std::uint32_t leadership_validity_ms)
+      : leadership_validity_ms_(leadership_validity_ms) {}
+
+  void Reset(std::int64_t now_suspend_clock_ms,
+             std::int64_t now_active_clock_ms) noexcept;
+  MetaLeaderRuntimeDisposition Observe(
+      std::int64_t now_suspend_clock_ms,
+      std::int64_t now_active_clock_ms) noexcept;
+
+ private:
+  std::uint64_t leadership_validity_ms_ = 0;
+  std::int64_t baseline_suspend_clock_ms_ = 0;
+  std::int64_t baseline_active_clock_ms_ = 0;
+  std::int64_t eligible_active_clock_ms_ = 0;
+  bool initialized_ = false;
+  bool quarantined_ = false;
 };
 
 // Builds the redirect/Hello directory solely from committed, active Meta
@@ -301,31 +469,40 @@ class MetaDataControlServer final : public MetaReconciler {
   static absl::Status ValidateOptions(
       const MetaDataControlServerOptions& options);
 
+  // The coordinator is retained by reference and must outlive every session
+  // and leader task, through a completed Shutdown/CancelAndWait drain.
   static absl::StatusOr<std::shared_ptr<MetaDataControlServer>> Create(
       celer::ForeignExecutor foreign_executor,
       nuraft::ptr<nuraft::raft_server> server, MetaCoordinator& coordinator,
       std::shared_ptr<MetaObservationStore> observations,
       MetaDataControlServerOptions options);
 
+  // Destruction performs the same blocking drain as Shutdown. Unless a prior
+  // Shutdown completed, destroy this object outside its owning Celer worker
+  // while that worker's executor can still make progress.
   ~MetaDataControlServer() override;
   MetaDataControlServer(const MetaDataControlServer&) = delete;
   MetaDataControlServer& operator=(const MetaDataControlServer&) = delete;
 
   // Listener lifecycle. Start binds once and accepts on leaders and
-  // followers; Shutdown synchronously closes ingress and live sessions. An
-  // executor rejection before that drain completes is fail-stop because
-  // returning would falsely advertise a safe process-teardown boundary.
+  // followers; Shutdown synchronously closes ingress and live sessions. It
+  // must run outside the owning Celer worker while that worker's executor can
+  // still make progress. An executor rejection before the drain completes is
+  // fail-stop because returning would falsely advertise a safe process-
+  // teardown boundary.
   void StartListener();
   void Shutdown();
   absl::Status status() const;
   MetaDataControlMetricsSnapshot metrics() const noexcept;
 
   // MetaReconciler: Start is called only after leader state-machine catch-up.
-  // CancelAndWait does not return until the worker has revoked the context and
-  // begun closing every authority-bearing session from that leadership epoch.
-  // Failure to deliver either leader edge is fail-stop; after a completed full
-  // Shutdown the cancellation barrier is already satisfied and becomes a
-  // no-op.
+  // CancelAndWait does not return until the worker has revoked the context,
+  // closed and joined every authority-bearing session from that leadership
+  // epoch, and joined its leader-scoped tasks.
+  // It blocks and must run outside the owning Celer worker while that worker's
+  // executor can still make progress. Failure to deliver either leader edge is
+  // fail-stop; after a completed full Shutdown the cancellation barrier is
+  // already satisfied and becomes a no-op.
   void Start(MetaLeaderContext& context) override;
   void CancelAndWait() override;
 
@@ -349,7 +526,9 @@ class MetaDataControlServer final : public MetaReconciler {
   static celer::Task<absl::Status> AcceptLoop(CorePtr core);
   static celer::Task<absl::Status> SessionLoop(CorePtr core,
                                                celer::TcpStream stream,
-                                               celer::Connection* connection);
+                                               celer::Connection* connection,
+                                               detail::PendingHandshakeLimiter::Permit
+                                                   handshake_permit);
 
   CorePtr core_;
 };

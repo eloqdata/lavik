@@ -1,19 +1,20 @@
 #pragma once
 
-// MetaIdentityStore is the metadata control plane's committed node registry:
-// node_id -> MetaNodeRecord.
+// MetaIdentityStore is the metadata control plane's committed Data-node and
+// Meta-member identity registry.
 //
 // Invariants:
 //   - Principal binding is globally one-to-one:
-//     a principal can be bound to at most one node_id, ever. Retired nodes
-//     keep their binding as tombstones, so a principal is never rebound
-//     because rotation is unimplemented; re-registering a retired node_id is
-//     likewise rejected.
-//   - revision_ is the CAS token: 1 at registration, expected_revision+1 after
-//     each applied mutation. Mutations carry expected_revision as an absolute
-//     CAS token; a mismatch is a domain rejection.
-//   - Retired is terminal: no command reactivates a node, and UpdateNode on a
-//     retired node is rejected.
+//     a principal can be bound to at most one Data node or Meta member, ever.
+//     Retired records keep their binding as tombstones, so a principal is never
+//     rebound because rotation is unimplemented; re-registering a retired
+//     node_id or server_id is likewise rejected.
+//   - A Data node's revision_ is its CAS token: 1 at registration,
+//     expected_revision+1 after each applied mutation. Those mutations carry
+//     expected_revision as an absolute CAS token; a mismatch is a domain
+//     rejection.
+//   - Retired is terminal for both registries: no command reactivates a Data
+//     node or Meta member, and UpdateNode on a retired Data node is rejected.
 //   - Active Data-node client endpoints are one or two numeric addresses on
 //     one host. Tagged tcp:// and tls:// forms cannot be mixed with the legacy
 //     positional form, and a tagged transport cannot appear twice.
@@ -21,9 +22,10 @@
 //     normalization, and their complete directory must fit one protocol
 //     ServerHello frame. These conditions are checked before mutation so a
 //     committed binding cannot make all future Data sessions unpublishable.
-//   - State is size-bounded: total records (active + retired
-//     tombstones) never exceed kMaxMetaNodes; over-cap applies are rejected,
-//     never silently truncated.
+//   - State is size-bounded independently by registry: Data-node records
+//     (active + retired tombstones) never exceed kMaxMetaNodes, and Meta-member
+//     records independently never exceed kMaxMetaNodes. Over-cap applies are
+//     rejected, never silently truncated.
 //
 // Replay idempotency: re-applying a command
 // whose exact post-effect is already present — same content, and for CAS
@@ -44,7 +46,8 @@
 // exposes fact queries and the apply dispatcher orchestrates.
 //
 // Serialization: u16 schema_version envelope (same convention as
-// meta_commands), then the sorted registry; byte output is deterministic so
+// meta_commands), then Data-node records sorted by node_id, followed by
+// Meta-member records sorted by server_id. Byte output is deterministic so
 // equal states serialize to equal bytes.
 
 #include <cstdint>
@@ -112,18 +115,21 @@ class MetaIdentityStore {
   // principal binding, so they occupy the cap).
   std::size_t NodeCount() const { return nodes_.size(); }
 
-  // Snapshot support: u16 schema_version envelope + sorted records.
+  // Snapshot support: u16 schema_version envelope + Data-node count/records
+  // + Meta-member count/records. A Meta-member record is
+  // (server_id, principal, Data-control endpoint, retired flag).
   // Serialize cannot fail: the state is bounded and codec-valid by
   // construction (field caps are enforced at apply time). Deserialize is
   // strict and every failure is the fail-stop class, including invariant
-  // violations inside the bytes (duplicate node_id, duplicate principal,
-  // revision 0) — a corrupt snapshot fails identically on every node.
+  // violations inside the bytes (duplicate node/server id, duplicate
+  // principal, Data-node revision 0) — a corrupt snapshot fails identically
+  // on every node.
   std::string Serialize() const;
   static absl::StatusOr<MetaIdentityStore> Deserialize(std::string_view bytes);
 
  private:
   std::map<std::string, MetaNodeRecord> nodes_;  // by node_id, sorted
-  // principal -> node_id reverse index enforcing the global 1:1 binding.
+  // Registry-specific reverse indexes jointly enforce the global 1:1 binding.
   std::map<std::string, std::string> node_id_by_principal_;
   std::map<std::uint32_t, MetaMemberRecord> meta_members_;
   std::map<std::string, std::uint32_t> meta_server_id_by_principal_;

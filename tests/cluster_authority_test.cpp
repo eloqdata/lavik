@@ -484,6 +484,38 @@ TEST(AuthorityGuardTest, RejectedRegistrationReleasesItsGuard) {
   EXPECT_EQ(admission.state()->GroupInFlightCount(kGroupA), 0U);
 }
 
+TEST(AuthorityGuardTest, FinalMutationRecheckTracksAggregateOutcome) {
+  keylane::cluster::TopologyCache cache;
+  cache.Publish(BuildState(kNodeA));
+  AuthorityGuard authority(cache, AuthorityGuard::LeaseMode::kPermanent);
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto started = authority.CaptureAndAdmit(
+      MakeRequest(slots, /*is_write=*/true), keylane::cluster::MonotonicTime{});
+  const auto rejected = authority.CaptureAndAdmit(
+      MakeRequest(slots, /*is_write=*/true), keylane::cluster::MonotonicTime{});
+
+  EXPECT_EQ(
+      authority.RecheckAtMutation(started, keylane::cluster::MonotonicTime{}),
+      RecheckResult::kOk);
+  EXPECT_TRUE(started.mutation_started());
+  EXPECT_FALSE(started.final_recheck_failed());
+
+  GroupView fenced = GroupA();
+  fenced.granted_ = false;
+  cache.Publish(BuildState(kNodeA, std::move(fenced), GroupB()));
+  EXPECT_EQ(
+      authority.RecheckAtMutation(started, keylane::cluster::MonotonicTime{}),
+      RecheckResult::kReject);
+  EXPECT_TRUE(started.mutation_started());
+  EXPECT_TRUE(started.final_recheck_failed());
+
+  EXPECT_EQ(
+      authority.RecheckAtMutation(rejected, keylane::cluster::MonotonicTime{}),
+      RecheckResult::kReject);
+  EXPECT_FALSE(rejected.mutation_started());
+  EXPECT_TRUE(rejected.final_recheck_failed());
+}
+
 TEST(GroupInFlightTest, ConcurrentEnterExit) {
   const auto state = BuildState(kNodeA);
   const std::array<std::uint16_t, 3> slots{kSlotInA, kOtherSlotInA, kSlotInB};

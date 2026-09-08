@@ -468,9 +468,10 @@ absl::StatusOr<bool> ParseBitmapUnit(std::string_view unit) {
   return absl::InvalidArgumentError("syntax error");
 }
 
-celer::Task<std::string> RunBitmapLocked(const CommandRequest& request,
-                                         const storage::Digest& digest,
-                                         storage::TxShardWrites* tx) {
+celer::Task<std::string> RunBitmapLocked(
+    const CommandRequest& request, const storage::Digest& digest,
+    storage::TxShardWrites* tx,
+    const storage::MutationPrecondition* mutation_precondition) {
   auto replication =
       tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
   const auto& args = request.args_;
@@ -657,13 +658,14 @@ celer::Task<std::string> RunBitmapLocked(const CommandRequest& request,
 
   const absl::Status status = co_await g_storage->ExecuteCompactLocked(
       db, key, digest, storage::ValueType::kString, read_only, callback, tx, 0,
-      replication ? &*replication : nullptr);
+      replication ? &*replication : nullptr, mutation_precondition);
   co_return status.ok() ? reply : StorageError(status);
 }
 
-celer::Task<std::string> RunStringLocked(const CommandRequest& request,
-                                         const storage::Digest& digest,
-                                         storage::TxShardWrites* tx) {
+celer::Task<std::string> RunStringLocked(
+    const CommandRequest& request, const storage::Digest& digest,
+    storage::TxShardWrites* tx,
+    const storage::MutationPrecondition* mutation_precondition) {
   switch (request.kind_) {
     case CommandKind::kSetEx:
     case CommandKind::kPSetEx:
@@ -716,9 +718,9 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
     }
     storage::SetOptions options;
     options.expire_at_ms_ = *expire_at;
-    auto result =
-        co_await g_storage->SetLocked(db, key, digest, args[3], options, tx,
-                                      replication ? &*replication : nullptr);
+    auto result = co_await g_storage->SetLocked(
+        db, key, digest, args[3], options, tx,
+        replication ? &*replication : nullptr, nullptr, mutation_precondition);
     if (result.ok() && result->applied_) {
       CaptureReplicationCommand(request, {"SET", args[1], args[3], "PXAT",
                                           std::to_string(*expire_at)});
@@ -730,9 +732,9 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
   if (request.kind_ == CommandKind::kSetNx) {
     storage::SetOptions options;
     options.condition_ = storage::SetCondition::kIfAbsent;
-    auto result =
-        co_await g_storage->SetLocked(db, key, digest, args[2], options, tx,
-                                      replication ? &*replication : nullptr);
+    auto result = co_await g_storage->SetLocked(
+        db, key, digest, args[2], options, tx,
+        replication ? &*replication : nullptr, nullptr, mutation_precondition);
     if (result.ok() && result->applied_) {
       CaptureReplicationCommand(request, {"SET", args[1], args[2]});
     }
@@ -743,9 +745,9 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
   if (request.kind_ == CommandKind::kGetSet) {
     storage::SetOptions options;
     options.return_old_value_ = true;
-    auto result =
-        co_await g_storage->SetLocked(db, key, digest, args[2], options, tx,
-                                      replication ? &*replication : nullptr);
+    auto result = co_await g_storage->SetLocked(
+        db, key, digest, args[2], options, tx,
+        replication ? &*replication : nullptr, nullptr, mutation_precondition);
     if (!result.ok()) co_return StorageError(result.status());
     CaptureReplicationCommand(request, {"SET", args[1], args[2]});
     if (!result->old_value_)
@@ -967,7 +969,7 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
 
   const absl::Status status = co_await g_storage->ExecuteCompactLocked(
       db, key, digest, storage::ValueType::kString, false, callback, tx, 0,
-      replication ? &*replication : nullptr);
+      replication ? &*replication : nullptr, mutation_precondition);
   if (status.ok() && !captured_args.empty()) {
     CaptureReplicationCommand(request, std::move(captured_args));
   }
@@ -1234,6 +1236,7 @@ struct BitOpContext {
   BitOp operation_ = BitOp::kAnd;
   std::vector<std::string> inputs_;
   std::string output_;
+  storage::MutationPrecondition mutation_precondition_;
   ReplicationTransactionGuard* replication_ = nullptr;
 };
 
@@ -1285,13 +1288,17 @@ celer::Task<absl::Status> WriteBitOpDestination(BitOpContext* context,
                                                 const storage::Digest& digest,
                                                 storage::TxShardWrites* tx) {
   const auto& request = *context->request_;
+  const storage::MutationPrecondition* mutation_precondition =
+      tx == nullptr ? &context->mutation_precondition_ : nullptr;
   if (context->output_.empty()) {
     auto deleted = co_await g_storage->DeleteLocked(
-        request.db_id_, request.args_[2], digest, tx);
+        request.db_id_, request.args_[2], digest, tx, nullptr,
+        mutation_precondition);
     co_return deleted.ok() ? absl::OkStatus() : deleted.status();
   }
   auto written = co_await g_storage->SetLocked(
-      request.db_id_, request.args_[2], digest, context->output_, {}, tx);
+      request.db_id_, request.args_[2], digest, context->output_, {}, tx,
+      nullptr, nullptr, mutation_precondition);
   co_return written.ok() ? absl::OkStatus() : written.status();
 }
 
@@ -1336,13 +1343,16 @@ celer::Task<CommandReply> ExecuteStringCommand(const CommandRequest& request,
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       request.db_id_, tx::FingerprintOf(digest),
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
-  co_return co_await ExecuteStringCommandLocked(request, digest, nullptr,
-                                                reply_builder);
+  const storage::MutationPrecondition mutation_precondition =
+      ClusterMutationPrecondition(request);
+  co_return co_await ExecuteStringCommandLocked(
+      request, digest, nullptr, reply_builder, &mutation_precondition);
 }
 
 celer::Task<CommandReply> ExecuteStringCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,
-    storage::TxShardWrites* tx, ReplyBuilder& reply_builder) {
+    storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
+    const storage::MutationPrecondition* mutation_precondition) {
   if (request.kind_ == CommandKind::kGetRange ||
       request.kind_ == CommandKind::kSubstr) {
     std::int64_t start = 0;
@@ -1361,7 +1371,8 @@ celer::Task<CommandReply> ExecuteStringCommandLocked(
         current->has_value() ? (**current).encoded_ : std::string_view{};
     co_return Built(reply_builder.AppendBulkString(Range(value, start, stop)));
   }
-  std::string encoded = co_await RunStringLocked(request, digest, tx);
+  std::string encoded =
+      co_await RunStringLocked(request, digest, tx, mutation_precondition);
   co_return Built(reply_builder.AppendRaw(encoded));
 }
 
@@ -1373,14 +1384,18 @@ celer::Task<CommandReply> ExecuteBitmapCommand(const CommandRequest& request,
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       request.db_id_, tx::FingerprintOf(digest),
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
-  co_return co_await ExecuteBitmapCommandLocked(request, digest, nullptr,
-                                                reply_builder);
+  const storage::MutationPrecondition mutation_precondition =
+      ClusterMutationPrecondition(request);
+  co_return co_await ExecuteBitmapCommandLocked(
+      request, digest, nullptr, reply_builder, &mutation_precondition);
 }
 
 celer::Task<CommandReply> ExecuteBitmapCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,
-    storage::TxShardWrites* tx, ReplyBuilder& reply_builder) {
-  std::string encoded = co_await RunBitmapLocked(request, digest, tx);
+    storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
+    const storage::MutationPrecondition* mutation_precondition) {
+  std::string encoded =
+      co_await RunBitmapLocked(request, digest, tx, mutation_precondition);
   co_return Built(reply_builder.AppendRaw(encoded));
 }
 
@@ -1402,9 +1417,10 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
         static_cast<std::uint32_t>(argument), tx::LockMode::kShared);
   }
   transaction.Seal();
-  // Cluster owner-side re-check: BITOP always writes its
-  // destination; the validator fires before the mutating shard callback on
-  // every hop (single-shard combined callback, or the multi-shard write hop).
+  // The transaction validator rejects stale authority before each mutating
+  // shard callback. The destination storage call also carries the admission
+  // proof so a suspension inside that callback cannot cross the final
+  // keyspace-publication check.
   ClusterShardValidatorContext cluster_validator;
   InstallClusterShardValidator(transaction, request, cluster_validator);
   ReplicationTransactionGuard replication(request, &transaction);
@@ -1422,6 +1438,7 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
       .operation_ = *operation,
       .inputs_ = std::vector<std::string>(request.args_.size()),
       .output_ = {},
+      .mutation_precondition_ = ClusterMutationPrecondition(request),
       .replication_ = &replication,
   };
   if (transaction.single_shard()) {
@@ -1473,6 +1490,7 @@ celer::Task<std::string> ExecuteBitOpLocked(
       .operation_ = *operation,
       .inputs_ = std::vector<std::string>(request.args_.size()),
       .output_ = {},
+      .mutation_precondition_ = {},
   };
   auto find_key = [&](std::size_t argument) -> const StringExecKey* {
     for (const StringExecKey& key : locked_keys) {

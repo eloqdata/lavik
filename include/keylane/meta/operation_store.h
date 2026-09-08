@@ -22,10 +22,14 @@
 //   Submitted -> Running -> Completed | Aborted (terminal states are
 //   irreversible; Completed/Aborted are also reachable directly from
 //   Submitted). kind and intent_hash are immutable after submit (the
-//   transition commands do not even carry them). Mutation commands carry
-//   expected_revision as the CAS token; on accept the revision becomes
-//   expected_revision + 1 — the command schema has no new_revision field, so
-//   the CAS pins the post-value deterministically.
+//   transition commands do not even carry them). Phase/terminal mutation
+//   commands carry expected_revision as the CAS token; on accept the revision
+//   becomes expected_revision + 1 — the command schema has no new_revision
+//   field, so the CAS pins the post-value deterministically. A first
+//   CommitDirectiveResult has no client CAS: after validating the exact live
+//   directive identity it appends the durable receipt and increments the
+//   operation revision internally, preventing an older reconciler decision
+//   from committing over newly authoritative workflow input.
 //
 // Replay idempotency: re-applying a command at the same log index
 // reproduces the same verdict and state. Each mutation first checks whether
@@ -38,9 +42,10 @@
 // live terminal record or an already-archived summary (idempotent no-op), or
 // the whole command rejects. Tombstone summaries keep
 // (operation_id, operation_seq, intent_hash, actor, terminal state,
-// data_loss_possible) so a late duplicate submit deterministically resolves
-// as "already done" during the retention window. Non-terminal operations are
-// never archivable. References to unknown ids/seqs reject.
+// data_loss_possible, terminal receipts) so a late duplicate submit or
+// directive-result replay deterministically resolves during the retention
+// window. Non-terminal operations are never archivable. References to unknown
+// ids/seqs reject.
 //
 // Bounded state: live non-terminal operations are capped by
 // max_active (SubmitOperation creating beyond it rejects; terminal records
@@ -49,9 +54,11 @@
 // (SubmitOperation rejects at the joint bound; ArchiveOperations is the
 // escape valve, keeping every collection bounded), archive summaries
 // by max_archived (ArchiveOperations rejects at the cap; the operator exports
-// via ctl — ExportArchive drains the summaries as versioned bytes), and a
+// a read-only versioned snapshot via ctl and then explicitly prunes the
+// externally retained summaries), and a
 // record's accumulated evidence summaries by
-// kMaxMetaOperationEvidencePerRecord.
+// kMaxMetaOperationEvidencePerRecord. Live records and archive summaries each
+// retain at most max_terminal_receipts_per_operation exact result receipts.
 //
 // Apply is a pure in-memory function: no IO, no locks, NO CLOCK (the stored
 // actor context is command-carried text), no observation access; evidence
@@ -75,7 +82,7 @@
 
 namespace keylane::meta {
 
-// Per-record accumulated evidence cap (v1 policy value; bounded state).
+// Per-record accumulated evidence cap (deployment policy; bounded state).
 inline constexpr std::uint32_t kMaxMetaOperationEvidencePerRecord = 1024;
 
 enum class MetaOperationLifecycle : std::uint8_t {
@@ -174,10 +181,14 @@ class MetaOperationStore {
   // semantics.
   absl::StatusOr<MetaSubmitResult> SubmitOperation(
       const SubmitOperation& command, std::uint64_t operation_seq);
+  // committed_index becomes each newly installed directive's
+  // directive_revision; exact phase-transition replay preserves it.
   absl::Status TransitionOperationPhase(const TransitionOperationPhase& command,
                                         std::uint64_t committed_index = 1);
   absl::Status CompleteOperation(const CompleteOperation& command);
   absl::Status AbortOperation(const AbortOperation& command);
+  // committed_index is retained in the first exact terminal receipt. Exact
+  // result replay returns that receipt unchanged and does not bump revision.
   absl::Status CommitDirectiveResult(const CommitDirectiveResult& command,
                                      std::uint64_t committed_index);
   absl::Status ArchiveOperations(const ArchiveOperations& command);
@@ -227,8 +238,9 @@ class MetaOperationStore {
   std::size_t LiveCount() const { return live_.size(); }
   std::size_t ArchivedCount() const { return archived_.size(); }
 
-  // Versioned byte drain of all archive summaries for ctl export. At the cap,
-  // the operator must export before ArchiveOperations accepts.
+  // Read-only versioned encoding of all archive summaries for ctl export. At
+  // the cap, retain this result externally and then submit a replicated
+  // PruneOperationArchive command; export alone does not remove summaries.
   absl::StatusOr<std::string> ExportArchive() const;
 
   // Snapshot serialization: versioned strict encoding; decode enforces caps

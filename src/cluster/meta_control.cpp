@@ -240,6 +240,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
         .group_term_ = source.group_term,
         .authority_version_ = source.authority_version,
         .grant_revision_ = source.grant_revision,
+        .config_epoch_ = source.config_epoch,
         .manifest_revision_ = source.manifest_revision,
         .manifest_digest_ = source.manifest_digest,
         .partition_replication_epoch_ = source.partition_replication_epoch,

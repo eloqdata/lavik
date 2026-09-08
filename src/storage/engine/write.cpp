@@ -99,7 +99,8 @@ ExtentManifest ExtentsNotReferencedBy(ExtentManifest previous,
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(
     std::uint8_t db_id, std::string_view key, std::string_view value,
     SetOptions options, ReplicationCommandAppend* replication,
-    SetLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id) {
+    SetLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   if (trace != nullptr) trace->key_lock_start_ns_ = SetTraceNowNanos();
@@ -107,14 +108,16 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
   if (trace != nullptr) trace->key_lock_acquired_ns_ = SetTraceNowNanos();
   co_return co_await SetLocked(db_id, key, digest, value, options, nullptr,
-                               replication, trace, routed_partition_id);
+                               replication, trace, routed_partition_id,
+                               mutation_precondition);
 }
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::string_view value, SetOptions options, TxShardWrites* tx,
     ReplicationCommandAppend* replication, SetLatencyTrace* trace,
-    std::optional<std::uint16_t> routed_partition_id) {
+    std::optional<std::uint16_t> routed_partition_id,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   // The route hint is produced from this exact key immediately before the
@@ -186,7 +189,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
       store, partition, db_id, key, digest, value, RecordKind::kValue,
       ValueType::kString, expire_at_ms, tx,
       std::numeric_limits<std::uint64_t>::max(), nullptr, nullptr, replication,
-      trace);
+      trace, true, nullptr, mutation_precondition);
   if (trace != nullptr) trace->append_done_ns_ = SetTraceNowNanos();
   if (!status.ok()) co_return status;
   result.applied_ = true;
@@ -196,19 +199,22 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
 
 Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpiration(
     std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
-    ExpirationCondition condition, ReplicationCommandAppend* replication) {
+    ExpirationCondition condition, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
   co_return co_await UpdateExpirationLocked(db_id, key, digest, expire_at_ms,
-                                            condition, nullptr, replication);
+                                            condition, nullptr, replication,
+                                            mutation_precondition);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::uint64_t expire_at_ms, ExpirationCondition condition,
-    TxShardWrites* tx, ReplicationCommandAppend* replication) {
+    TxShardWrites* tx, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -254,7 +260,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   if (expire_at_ms != 0 && expire_at_ms <= now_ms) {
     absl::Status status = co_await AppendLocked(
         store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
-        ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication);
+        ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, nullptr,
+        true, nullptr, mutation_precondition);
     if (!status.ok()) co_return status;
     co_return true;
   }
@@ -270,7 +277,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
     if (!view.ok()) co_return view.status();
     const auto updated = co_await UpdateGroupedExpirationLocked(
         store, partition, db_id, key, digest, *view, expire_at_ms, tx,
-        replication);
+        replication, mutation_precondition);
     if (!updated.ok()) co_return updated;
     co_return true;
   }
@@ -285,7 +292,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest, value, RecordKind::kValue,
       previous.value_type(), expire_at_ms, tx, previous.logical_size_, nullptr,
-      nullptr, replication);
+      nullptr, replication, nullptr, true, nullptr, mutation_precondition);
   if (!status.ok()) {
     co_return status;
   }
@@ -294,17 +301,20 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
 
 Task<absl::StatusOr<bool>> StorageEngine::Impl::Delete(
     std::uint8_t db_id, std::string_view key,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
-  co_return co_await DeleteLocked(db_id, key, digest, nullptr, replication);
+  co_return co_await DeleteLocked(db_id, key, digest, nullptr, replication,
+                                  mutation_precondition);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    TxShardWrites* tx, ReplicationCommandAppend* replication) {
+    TxShardWrites* tx, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -326,7 +336,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
   const bool expired = IsExpiredNow(*found);
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
-      ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication);
+      ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, nullptr, true,
+      nullptr, mutation_precondition);
   if (!status.ok()) co_return status;
   co_return !expired;
 }
@@ -334,7 +345,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
 Task<absl::Status> StorageEngine::Impl::WriteRawValueLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const RawValue& value, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   if (digest != ComputeDigest(key)) {
     co_return absl::InvalidArgumentError("raw value digest mismatch");
@@ -349,35 +361,39 @@ Task<absl::Status> StorageEngine::Impl::WriteRawValueLocked(
   co_return co_await AppendLocked(
       store, partition, db_id, key, digest, value.encoded_, RecordKind::kValue,
       value.value_type_, value.expire_at_ms_, tx, value.logical_size_, nullptr,
-      nullptr, replication);
+      nullptr, replication, nullptr, true, nullptr, mutation_precondition);
 }
 
 Task<absl::StatusOr<RestoreRawResult>> StorageEngine::Impl::RestoreRawValue(
     std::uint8_t db_id, std::string_view key, const RawValue& value,
-    bool replace, ReplicationCommandAppend* replication) {
+    bool replace, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
   co_return co_await RestoreRawValueLocked(db_id, key, digest, value, replace,
-                                           nullptr, replication);
+                                           nullptr, replication,
+                                           mutation_precondition);
 }
 
 Task<absl::StatusOr<RestoreRawResult>>
 StorageEngine::Impl::RestoreRawValueLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const RawValue& value, bool replace, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   const bool exists = co_await ExistsLocked(db_id, key, digest);
   if (exists && !replace) co_return RestoreRawResult{.busy_ = true};
   if (value.expire_at_ms_ != 0 && value.expire_at_ms_ <= UnixTimeMillis()) {
     if (!exists) co_return RestoreRawResult{};
-    auto deleted = co_await DeleteLocked(db_id, key, digest, tx, replication);
+    auto deleted = co_await DeleteLocked(db_id, key, digest, tx, replication,
+                                         mutation_precondition);
     if (!deleted.ok()) co_return deleted.status();
     co_return RestoreRawResult{.changed_ = *deleted, .deleted_ = *deleted};
   }
-  absl::Status written =
-      co_await WriteRawValueLocked(db_id, key, digest, value, tx, replication);
+  absl::Status written = co_await WriteRawValueLocked(
+      db_id, key, digest, value, tx, replication, mutation_precondition);
   if (!written.ok()) co_return written;
   co_return RestoreRawResult{.changed_ = true};
 }
@@ -821,6 +837,9 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
   else
     store.tx_undo_.erase(found);
   assert(!discard_uncommitted_absent || compensation == nullptr);
+  // Compensation must restore the pre-command state even when the authority
+  // precondition that admitted the failed transaction is now stale.
+  const MutationPrecondition bypass_mutation_precondition;
   // Reverse order: a key written twice in one transaction unwinds through
   // its intermediate version back to the original.
   for (auto it = undo.entries_.rbegin(); it != undo.entries_.rend(); ++it) {
@@ -914,7 +933,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
           /*committed_sequence=*/nullptr,
           /*replication=*/nullptr,
           /*trace=*/nullptr,
-          /*capture_fullsync=*/true, &undo);
+          /*capture_fullsync=*/true, &undo, &bypass_mutation_precondition);
       if (!appended.ok()) {
         LatchRuntimeFailure(store);
         co_return appended;
@@ -1629,6 +1648,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
     std::uint64_t* committed_sequence, ReplicationCommandAppend* replication,
     SetLatencyTrace* trace, bool capture_fullsync, TxUndoLog* replacement_undo,
+    const MutationPrecondition* mutation_precondition,
     GroupMutationWrite* grouped) {
   if (RuntimeFailureLatched()) {
     co_return absl::FailedPreconditionError(
@@ -1686,10 +1706,6 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
           std::make_shared<ReplicationCommandAppend>(*replication);
     }
   }
-  // Every real keyspace modification funnels through here (client writes,
-  // deletes, expiration rewrites, active expiry). Replication-copy admission
-  // happens first so a rejected write does not spuriously invalidate WATCH.
-  tx::CurrentTxShard().MarkWatched(db_id, tx::FingerprintOf(digest));
   absl::Status status = absl::OkStatus();
   const bool key_external = key.size() > options_.inline_key_max_bytes_;
   const std::uint64_t logical_payload_bytes =
@@ -1716,7 +1732,9 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         std::move(commit_retirements), trace,
         replica_write_root.has_value() ? &*replica_write_root : nullptr,
         replacement_undo, &partition,
-        grouped != nullptr ? grouped->root_ : nullptr);
+        grouped != nullptr ? grouped->root_ : nullptr,
+        /*mark_watched=*/true,
+        mutation_precondition);
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -1728,7 +1746,9 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         std::move(commit_retirements), trace,
         replica_write_root.has_value() ? &*replica_write_root : nullptr,
         replacement_undo, &partition,
-        grouped != nullptr ? grouped->root_ : nullptr);
+        grouped != nullptr ? grouped->root_ : nullptr,
+        /*mark_watched=*/true,
+        mutation_precondition);
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
@@ -2186,7 +2206,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
     SetLatencyTrace* trace, const ExplicitWriteRoot* explicit_root,
     TxUndoLog* replacement_undo, WorkerStore::PartitionStore* known_partition,
-    const GroupRecordWrite* group) {
+    const GroupRecordWrite* group, bool mark_watched,
+    const MutationPrecondition* mutation_precondition) {
   if (store.write_failed_ || RuntimeFailureLatched() ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -2836,6 +2857,24 @@ acquire_active_stream:
         spdlog::info("record publication test type={} lsn={}",
                      static_cast<unsigned>(value_type), lsn);
       });
+  // This is the last no-await cut before the staging buffer and key index can
+  // change. An explicit empty precondition is meaningful: rollback uses it to
+  // bypass the stale admission inherited from its TxShardWrites receipt.
+  const MutationPrecondition* effective_precondition = mutation_precondition;
+  if (effective_precondition == nullptr && tx != nullptr) {
+    effective_precondition = &tx->mutation_precondition_;
+  }
+  if (index_ptr != nullptr && effective_precondition != nullptr &&
+      static_cast<bool>(*effective_precondition)) {
+    absl::Status admissible = effective_precondition->Validate();
+    if (!admissible.ok()) co_return admissible;
+  }
+  // WATCH invalidation belongs to the same linearization cut as publication:
+  // rejected authority checks must not invalidate it, while an observer must
+  // never see the new index value before the watch fingerprint changes.
+  if (index_ptr != nullptr && mark_watched) {
+    tx::CurrentTxShard().MarkWatched(db_id, tx::FingerprintOf(digest));
+  }
   // The encoder overwrites the complete header and the copies below overwrite
   // the complete payload. Preserve deterministic on-disk padding without
   // clearing those bytes twice on every append.

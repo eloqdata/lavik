@@ -480,8 +480,9 @@ std::vector<MetaTopologyGroupView> MetaTopologyStore::Groups() const {
 }
 
 // Envelope: schema_version u16 | topology_epoch u64 | group count u32 |
-// sorted group records | slot run count u32 | sorted runs. See the header
-// for the convention and the strictness contract.
+// sorted group records | retained-assignment count u32 | sorted
+// (node_id, assignment_id) entries | slot run count u32 | sorted runs. See
+// the header for the convention and the strictness contract.
 std::string MetaTopologyStore::Serialize() const {
   MetaWriter w;
   w.WriteU16(kMetaFormatVersion);

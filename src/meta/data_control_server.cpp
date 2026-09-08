@@ -39,6 +39,7 @@
 #include "celer/runtime/sync.h"
 #include "celer/runtime/worker.h"
 #include "keylane/cluster/control_transport.h"
+#include "keylane/cluster/lease_clock.h"
 #include "keylane/meta/control_projector.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/identity_verifier.h"
@@ -62,6 +63,14 @@ using namespace std::chrono_literals;
 
 constexpr auto kHandshakeTimeout = 10s;
 constexpr std::uint32_t kMaxSessionProgressTimeoutMs = 10'000;
+constexpr std::size_t kProjectionBuildReservationBytes =
+    2 * static_cast<std::size_t>(control::kMaxFullDesiredStateBytes);
+
+std::int64_t ActiveClockMillis() noexcept {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 absl::Status DeferInbound(std::deque<control::WireMessage>* deferred,
                           control::WireMessage message,
@@ -180,12 +189,6 @@ class ViewFacts final : public MetaCommittedFacts {
 std::int64_t NowUnixMillis() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
-std::int64_t NowMonotonicMillis() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
 
@@ -1131,7 +1134,7 @@ control::LeaseDecision EvaluateLeaseChallenge(
 
 control::LeaseDecision MetaLeaseHandoffGuard::Enforce(
     control::LeaseDecision decision, std::string_view node_id,
-    std::int64_t now_monotonic_ms) {
+    std::int64_t now_lease_clock_ms) {
   const auto* grant = std::get_if<control::LeaseGranted>(&decision);
   if (grant == nullptr) return decision;
 
@@ -1168,12 +1171,13 @@ control::LeaseDecision MetaLeaseHandoffGuard::Enforce(
     entry->leadership_generation_ = grant->leadership_generation;
     const std::int64_t max_time = std::numeric_limits<std::int64_t>::max();
     entry->eligible_after_ms_ =
-        now_monotonic_ms >
-                max_time - static_cast<std::int64_t>(maximum_prior_lease_ms_)
+        quarantine_ms_ > static_cast<std::uint64_t>(max_time) ||
+                now_lease_clock_ms >
+                    max_time - static_cast<std::int64_t>(quarantine_ms_)
             ? max_time
-            : now_monotonic_ms + maximum_prior_lease_ms_;
+            : now_lease_clock_ms + static_cast<std::int64_t>(quarantine_ms_);
   }
-  if (now_monotonic_ms < entry->eligible_after_ms_) {
+  if (now_lease_clock_ms < entry->eligible_after_ms_) {
     return control::LeaseDenied{
         .nonce = grant->nonce,
         .reason = control::LeaseDenialReason::kAuthorityHandoffPending,
@@ -1181,6 +1185,71 @@ control::LeaseDecision MetaLeaseHandoffGuard::Enforce(
     };
   }
   return decision;
+}
+
+void MetaLeaderRuntimeGuard::Reset(
+    std::int64_t now_suspend_clock_ms,
+    std::int64_t now_active_clock_ms) noexcept {
+  baseline_suspend_clock_ms_ = now_suspend_clock_ms;
+  baseline_active_clock_ms_ = now_active_clock_ms;
+  eligible_active_clock_ms_ = now_active_clock_ms;
+  initialized_ = true;
+  quarantined_ = false;
+}
+
+MetaLeaderRuntimeDisposition MetaLeaderRuntimeGuard::Observe(
+    std::int64_t now_suspend_clock_ms,
+    std::int64_t now_active_clock_ms) noexcept {
+  if (!initialized_) {
+    Reset(now_suspend_clock_ms, now_active_clock_ms);
+    return MetaLeaderRuntimeDisposition::kEligible;
+  }
+
+  const bool clock_regressed =
+      now_suspend_clock_ms < baseline_suspend_clock_ms_ ||
+      now_active_clock_ms < baseline_active_clock_ms_;
+  const std::uint64_t suspend_elapsed =
+      clock_regressed
+          ? 0
+          : static_cast<std::uint64_t>(now_suspend_clock_ms -
+                                       baseline_suspend_clock_ms_);
+  const std::uint64_t active_elapsed =
+      clock_regressed
+          ? 0
+          : static_cast<std::uint64_t>(now_active_clock_ms -
+                                       baseline_active_clock_ms_);
+  const bool suspend_gap =
+      clock_regressed ||
+      (suspend_elapsed >= active_elapsed &&
+       suspend_elapsed - active_elapsed >= leadership_validity_ms_);
+  if (suspend_gap) {
+    const std::int64_t max_time = std::numeric_limits<std::int64_t>::max();
+    eligible_active_clock_ms_ =
+        leadership_validity_ms_ > static_cast<std::uint64_t>(max_time) ||
+                now_active_clock_ms >
+                    max_time -
+                        static_cast<std::int64_t>(leadership_validity_ms_)
+            ? max_time
+            : now_active_clock_ms +
+                  static_cast<std::int64_t>(leadership_validity_ms_);
+    baseline_suspend_clock_ms_ = now_suspend_clock_ms;
+    baseline_active_clock_ms_ = now_active_clock_ms;
+    quarantined_ = true;
+    return MetaLeaderRuntimeDisposition::kQuarantineStarted;
+  }
+
+  if (quarantined_ && now_active_clock_ms < eligible_active_clock_ms_) {
+    return MetaLeaderRuntimeDisposition::kQuarantined;
+  }
+  if (quarantined_) {
+    // Active runtime has now supplied the liveness interval that did not pass
+    // during suspend. Start measuring any later accumulated suspend from this
+    // proven cut rather than repeatedly charging the completed quarantine.
+    baseline_suspend_clock_ms_ = now_suspend_clock_ms;
+    baseline_active_clock_ms_ = now_active_clock_ms;
+    quarantined_ = false;
+  }
+  return MetaLeaderRuntimeDisposition::kEligible;
 }
 
 struct MetaDataControlServer::Core {
@@ -1194,6 +1263,9 @@ struct MetaDataControlServer::Core {
   MetaDataControlServerOptions options_;
   std::shared_ptr<celer::TlsContext> tls_context_;
   std::unique_ptr<MetaLeaseHandoffGuard> lease_handoff_guard_;
+  std::unique_ptr<MetaLeaderRuntimeGuard> leader_runtime_guard_;
+  std::unique_ptr<detail::PendingHandshakeLimiter> pending_handshakes_;
+  std::unique_ptr<detail::RetainedProjectionLimiter> projection_limiter_;
 
   mutable std::mutex status_mu_;
   absl::Status status_ =
@@ -1238,7 +1310,7 @@ struct MetaDataControlServer::Core {
   std::map<std::uint64_t, std::vector<std::shared_ptr<std::promise<void>>>>
       generation_drain_waiters_;
   std::vector<std::shared_ptr<std::promise<void>>> shutdown_drain_waiters_;
-  std::map<std::string, celer::Connection*> session_by_node_;
+  detail::BoundNodeSessionRegistry bound_node_sessions_;
   std::map<std::string, std::uint64_t> next_session_generation_;
 };
 
@@ -1405,11 +1477,7 @@ void RemoveSession(MetaDataControlServer::Core& core,
     }
   }
   if (!node_id.empty()) {
-    const auto by_node = core.session_by_node_.find(std::string(node_id));
-    if (by_node != core.session_by_node_.end() &&
-        by_node->second == connection) {
-      core.session_by_node_.erase(by_node);
-    }
+    core.bound_node_sessions_.Release(node_id, connection);
   }
   NotifyShutdownDrained(core);
 }
@@ -1424,6 +1492,82 @@ void CloseConnectionNow(celer::Worker& worker, celer::Connection* connection,
   }
   worker.BeginClose(connection, std::move(status),
                     celer::CloseMode::kLocalClose);
+}
+
+bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
+                              std::uint64_t generation) {
+  if (!StillLeader(core, generation) || !core.server_->is_leader_alive()) {
+    return false;
+  }
+  const MetaLeaderRuntimeDisposition runtime =
+      core.leader_runtime_guard_->Observe(cluster::LeaseClockMillis(),
+                                          ActiveClockMillis());
+  if (runtime == MetaLeaderRuntimeDisposition::kQuarantineStarted) {
+    spdlog::warn(
+        "Meta data-control detected a suspend gap; quarantining authority "
+        "for {} ms of active runtime",
+        core.options_.leadership_validity_ms_);
+    // NuRaft's cached live-leader flag may itself be stale after suspend.
+    // Immediate resignation is synchronous for a multi-member cluster, so
+    // this generation cannot become eligible merely because the Celer worker
+    // runs before NuRaft's next heartbeat timer. NuRaft intentionally keeps a
+    // sole member leader; the active-time guard safely covers that case.
+    core.server_->yield_leadership(/*immediate_yield=*/true);
+    if (core.worker_ != nullptr) {
+      std::vector<celer::Connection*> sessions;
+      for (const auto& [connection, session_generation] :
+           core.authority_session_generation_) {
+        if (session_generation == generation) sessions.push_back(connection);
+      }
+      for (celer::Connection* connection : sessions) {
+        CloseConnectionNow(
+            *core.worker_, connection,
+            absl::UnavailableError(
+                "Meta authority is quarantined after host suspend"));
+      }
+    }
+  }
+  return runtime == MetaLeaderRuntimeDisposition::kEligible;
+}
+
+struct BudgetedNodeControlBatch final : NodeControlBatch {
+  BudgetedNodeControlBatch(
+      NodeControlBatch batch,
+      detail::RetainedProjectionLimiter::Permit permit)
+      : NodeControlBatch(std::move(batch)), permit_(std::move(permit)) {}
+
+  BudgetedNodeControlBatch(BudgetedNodeControlBatch&&) noexcept = default;
+  BudgetedNodeControlBatch& operator=(BudgetedNodeControlBatch&&) noexcept =
+      default;
+
+  detail::RetainedProjectionLimiter::Permit permit_;
+};
+
+absl::StatusOr<BudgetedNodeControlBatch> ProjectNodeBounded(
+    MetaDataControlServer::Core& core, const MetaCommittedView& view,
+    std::string_view node_id) {
+  auto permit =
+      core.projection_limiter_->TryAcquire(kProjectionBuildReservationBytes);
+  if (!permit.has_value()) {
+    return absl::ResourceExhaustedError(
+        "Meta retained-projection byte budget cannot admit another build");
+  }
+  auto projected = MetaControlProjector::ProjectNode(view, node_id);
+  if (!projected.ok()) return projected.status();
+  if (absl::Status charged =
+          permit->Resize(NodeControlBatchRetainedBytes(*projected));
+      !charged.ok()) {
+    return charged;
+  }
+  return BudgetedNodeControlBatch(std::move(*projected), std::move(*permit));
+}
+
+std::shared_ptr<const NodeControlBatch> RetainProjection(
+    BudgetedNodeControlBatch projection) {
+  auto owner =
+      std::make_shared<BudgetedNodeControlBatch>(std::move(projection));
+  const NodeControlBatch* batch = owner.get();
+  return std::shared_ptr<const NodeControlBatch>(std::move(owner), batch);
 }
 
 void FailLiveSession(const std::shared_ptr<LiveSessionState>& state,
@@ -1716,9 +1860,9 @@ celer::Task<absl::Status> EnsureCurrentBeforeDirectiveDispatch(
     std::deque<control::WireMessage>* deferred,
     std::size_t max_deferred_messages,
     std::vector<control::WireAuthorityAnchor>* fenced) {
-  if (!StillLeader(*core, leadership_generation)) {
+  if (!AuthoritySessionsAllowed(*core, leadership_generation)) {
     co_return absl::CancelledError(
-        "Meta leadership changed before directive dispatch");
+        "Meta authority is unavailable before directive dispatch");
   }
   if (commit_signal.delivery_failed_.load(std::memory_order_acquire) ||
       commit_subscription.needs_resync()) {
@@ -1734,7 +1878,7 @@ celer::Task<absl::Status> EnsureCurrentBeforeDirectiveDispatch(
   auto cached_view = CommittedViewAtLeast(*core, high_water);
   if (!cached_view.ok()) co_return cached_view.status();
   const MetaCommittedView& view = **cached_view;
-  auto latest = MetaControlProjector::ProjectNode(view, node_id);
+  auto latest = ProjectNodeBounded(*core, view, node_id);
   const control::FullDesiredState* latest_state =
       latest.ok() ? &latest->full_state : nullptr;
   control::ControlDeadlineWatchdog fence_ack_deadline(
@@ -1851,6 +1995,11 @@ celer::Task<absl::Status> FenceSupersededAuthorityLive(
       installed.full_state, latest, state->node_id_,
       state->fenced_authorities_);
   for (const control::WireAuthorityAnchor& anchor : superseded) {
+    if (!AuthoritySessionsAllowed(*state->core_,
+                                  state->leadership_generation_)) {
+      co_return absl::CancelledError(
+          "Meta authority is unavailable before Fence publication");
+    }
     if (state->expected_fence_.has_value()) {
       co_return absl::InternalError(
           "publisher attempted overlapping FenceAck handshakes");
@@ -1879,6 +2028,11 @@ celer::Task<absl::Status> FenceSupersededAuthorityLive(
       ClearPublisherFence(state);
       co_return acknowledged;
     }
+    if (!AuthoritySessionsAllowed(*state->core_,
+                                  state->leadership_generation_)) {
+      co_return absl::CancelledError(
+          "Meta authority became unavailable during Fence publication");
+    }
     state->fenced_authorities_.push_back(anchor);
   }
   co_return absl::OkStatus();
@@ -1888,9 +2042,10 @@ celer::Task<absl::StatusOr<MetaReplacementDisposition>>
 CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
                           const NodeControlBatch& installed,
                           const NodeControlBatch& replacement) {
-  if (!StillLeader(*state->core_, state->leadership_generation_)) {
+  if (!AuthoritySessionsAllowed(*state->core_,
+                                state->leadership_generation_)) {
     co_return absl::CancelledError(
-        "Meta leadership changed during FullDesiredState publication");
+        "Meta authority is unavailable during FullDesiredState publication");
   }
   if (state->commit_signal_->delivery_failed_.load(std::memory_order_acquire) ||
       state->commit_subscription_->needs_resync()) {
@@ -1911,7 +2066,7 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
   auto cached_view = CommittedViewAtLeast(*state->core_, high_water);
   if (!cached_view.ok()) co_return cached_view.status();
   const MetaCommittedView& view = **cached_view;
-  auto latest = MetaControlProjector::ProjectNode(view, state->node_id_);
+  auto latest = ProjectNodeBounded(*state->core_, view, state->node_id_);
   const control::FullDesiredState* latest_state =
       latest.ok() ? &latest->full_state : nullptr;
   if (absl::Status fenced =
@@ -2076,7 +2231,10 @@ celer::Task<absl::Status> RunDirectiveSender(
       *state->io_, *batch, state->session_id_, state->node_id_, state->boot_id_,
       state->receipt_tracker_,
       [state, batch] {
-        return !state->closing_ && ProjectionCurrent(*state) &&
+        return !state->closing_ &&
+               AuthoritySessionsAllowed(*state->core_,
+                                        state->leadership_generation_) &&
+               ProjectionCurrent(*state) &&
                state->installed_ == batch;
       },
       [state](bool active) { state->directive_transfer_active_ = active; });
@@ -2096,6 +2254,8 @@ celer::Task<absl::Status> RunDirectiveSender(
 
 void StartDirectiveSender(const std::shared_ptr<LiveSessionState>& state) {
   if (state->closing_ || state->directive_sender_running_ ||
+      !AuthoritySessionsAllowed(*state->core_,
+                                state->leadership_generation_) ||
       !ProjectionCurrent(*state) ||
       state->installed_->full_state.current_directives.empty() ||
       !state->receipt_tracker_.HasUndispatched()) {
@@ -2109,7 +2269,8 @@ void StartDirectiveSender(const std::shared_ptr<LiveSessionState>& state) {
 celer::Task<absl::Status> SessionPublisherBody(
     const std::shared_ptr<LiveSessionState>& state) {
   while (!state->closing_ &&
-         StillLeader(*state->core_, state->leadership_generation_)) {
+         AuthoritySessionsAllowed(*state->core_,
+                                  state->leadership_generation_)) {
     if (state->commit_signal_->delivery_failed_.load(
             std::memory_order_acquire) ||
         state->commit_subscription_->needs_resync()) {
@@ -2128,8 +2289,8 @@ celer::Task<absl::Status> SessionPublisherBody(
     auto cached_view = CommittedViewAtLeast(*state->core_, high_water);
     if (!cached_view.ok()) co_return cached_view.status();
     const MetaCommittedView& view = **cached_view;
-    auto latest = MetaControlProjector::ProjectNode(view, state->node_id_);
-    const std::shared_ptr<const NodeControlBatch> installed = state->installed_;
+    auto latest = ProjectNodeBounded(*state->core_, view, state->node_id_);
+    std::shared_ptr<const NodeControlBatch> installed = state->installed_;
     const control::FullDesiredState* latest_state =
         latest.ok() ? &latest->full_state : nullptr;
     if (!latest.ok() || EvaluateReplacementDisposition(installed->full_state,
@@ -2181,7 +2342,12 @@ celer::Task<absl::Status> SessionPublisherBody(
       co_return sent;
     }
     state->core_->full_states_sent_.fetch_add(1, std::memory_order_relaxed);
-    state->installed_ = std::make_shared<NodeControlBatch>(std::move(*latest));
+    state->installed_ = RetainProjection(std::move(*latest));
+    // The live installation now owns the replacement. Drop the publisher's
+    // old-generation snapshot before reserving the stable-check build, or a
+    // coroutine-local reference would turn the intended two-generation bound
+    // into three simultaneous projection charges.
+    installed.reset();
 
     // Data has applied this object, but a commit may have landed behind its
     // End/Ack exchange. Re-enter the publisher before rebuilding receipt
@@ -2193,7 +2359,7 @@ celer::Task<absl::Status> SessionPublisherBody(
     if (!cached_stable_view.ok()) co_return cached_stable_view.status();
     const MetaCommittedView& stable_view = **cached_stable_view;
     auto stable =
-        MetaControlProjector::ProjectNode(stable_view, state->node_id_);
+        ProjectNodeBounded(*state->core_, stable_view, state->node_id_);
     if (!stable.ok() ||
         EvaluateReplacementDisposition(state->installed_->full_state,
                                        stable->full_state) ==
@@ -2301,9 +2467,9 @@ celer::Task<absl::Status> HandleDirectiveResult(
     co_return absl::PermissionDeniedError(
         "directive result does not match its recipient or authority anchor");
   }
-  if (!StillLeader(*core, leadership_generation)) {
+  if (!AuthoritySessionsAllowed(*core, leadership_generation)) {
     co_return absl::FailedPreconditionError(
-        "leadership changed before directive result proposal");
+        "Meta authority is unavailable before directive result proposal");
   }
   auto request_id = control::GenerateId128();
   if (!request_id.ok()) co_return request_id.status();
@@ -2367,13 +2533,21 @@ celer::Task<absl::Status> RunEstablishedSession(
   control::LargeObjectReassembler client_reassembler(client_transfer_sink);
 
   while (!state->closing_ &&
-         StillLeader(*state->core_, state->leadership_generation_)) {
+         AuthoritySessionsAllowed(*state->core_,
+                                  state->leadership_generation_)) {
     absl::StatusOr<control::WireMessage> incoming =
         deferred.empty()
             ? co_await state->io_->Read()
             : absl::StatusOr<control::WireMessage>(std::move(deferred.front()));
     if (!deferred.empty()) deferred.pop_front();
     if (!incoming.ok()) co_return incoming.status();
+    // The read may have spanned host suspend. Recheck before replaying a
+    // cached lease Ack or consuming any authority-bearing client message.
+    if (!AuthoritySessionsAllowed(*state->core_,
+                                  state->leadership_generation_)) {
+      co_return absl::UnavailableError(
+          "Meta authority became unavailable while awaiting session input");
+    }
     if (state->commit_signal_->delivery_failed_.load(
             std::memory_order_acquire) ||
         state->commit_subscription_->needs_resync()) {
@@ -2504,8 +2678,8 @@ celer::Task<absl::Status> RunEstablishedSession(
       const std::shared_ptr<const NodeControlBatch> installed =
           state->installed_;
       const bool leader_valid =
-          StillLeader(*state->core_, state->leadership_generation_) &&
-          state->core_->server_->is_leader_alive() &&
+          AuthoritySessionsAllowed(*state->core_,
+                                   state->leadership_generation_) &&
           !CommitPending(*state->commit_signal_,
                          state->validated_committed_high_water_) &&
           !state->projection_superseded_ &&
@@ -2527,7 +2701,7 @@ celer::Task<absl::Status> RunEstablishedSession(
                           installed->full_state.projection_hash,
                       .desired_ = &installed->full_state,
                   }),
-              state->node_id_, NowMonotonicMillis());
+              state->node_id_, cluster::LeaseClockMillis());
       if (std::holds_alternative<control::LeaseGranted>(lease)) {
         state->core_->lease_grants_.fetch_add(1, std::memory_order_relaxed);
       } else if (!std::holds_alternative<control::NoChallenge>(lease)) {
@@ -2611,6 +2785,109 @@ celer::Task<absl::Status> RunEstablishedSession(
 
 }  // namespace
 
+detail::PendingHandshakeLimiter::Permit::Permit(Permit&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)) {}
+
+detail::PendingHandshakeLimiter::Permit&
+detail::PendingHandshakeLimiter::Permit::operator=(Permit&& other) noexcept {
+  if (this == &other) return *this;
+  Release();
+  owner_ = std::exchange(other.owner_, nullptr);
+  return *this;
+}
+
+detail::PendingHandshakeLimiter::Permit::~Permit() { Release(); }
+
+void detail::PendingHandshakeLimiter::Permit::Release() noexcept {
+  if (owner_ == nullptr) return;
+  PendingHandshakeLimiter* owner = std::exchange(owner_, nullptr);
+  owner->Release();
+}
+
+std::optional<detail::PendingHandshakeLimiter::Permit>
+detail::PendingHandshakeLimiter::TryAcquire() {
+  if (pending_ >= limit_) return std::nullopt;
+  ++pending_;
+  return Permit(this);
+}
+
+void detail::PendingHandshakeLimiter::Release() noexcept {
+  if (pending_ == 0) std::terminate();
+  --pending_;
+}
+
+detail::RetainedProjectionLimiter::Permit::Permit(Permit&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)),
+      bytes_(std::exchange(other.bytes_, 0)) {}
+
+detail::RetainedProjectionLimiter::Permit&
+detail::RetainedProjectionLimiter::Permit::operator=(Permit&& other) noexcept {
+  if (this == &other) return *this;
+  Release();
+  owner_ = std::exchange(other.owner_, nullptr);
+  bytes_ = std::exchange(other.bytes_, 0);
+  return *this;
+}
+
+detail::RetainedProjectionLimiter::Permit::~Permit() { Release(); }
+
+absl::Status detail::RetainedProjectionLimiter::Permit::Resize(
+    std::size_t bytes) {
+  if (owner_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "retained-projection permit has already been released");
+  }
+  if (!owner_->Resize(*this, bytes)) {
+    return absl::ResourceExhaustedError(
+        "Meta retained-projection byte budget is exhausted");
+  }
+  return absl::OkStatus();
+}
+
+void detail::RetainedProjectionLimiter::Permit::Release() noexcept {
+  if (owner_ == nullptr) return;
+  RetainedProjectionLimiter* owner = std::exchange(owner_, nullptr);
+  owner->Release(std::exchange(bytes_, 0));
+}
+
+std::optional<detail::RetainedProjectionLimiter::Permit>
+detail::RetainedProjectionLimiter::TryAcquire(std::size_t bytes) {
+  if (bytes > limit_ - retained_bytes_) return std::nullopt;
+  retained_bytes_ += bytes;
+  return Permit(this, bytes);
+}
+
+bool detail::RetainedProjectionLimiter::Resize(Permit& permit,
+                                               std::size_t bytes) noexcept {
+  if (bytes > permit.bytes_) {
+    const std::size_t increase = bytes - permit.bytes_;
+    if (increase > limit_ - retained_bytes_) return false;
+    retained_bytes_ += increase;
+  } else {
+    retained_bytes_ -= permit.bytes_ - bytes;
+  }
+  permit.bytes_ = bytes;
+  return true;
+}
+
+void detail::RetainedProjectionLimiter::Release(std::size_t bytes) noexcept {
+  if (bytes > retained_bytes_) std::terminate();
+  retained_bytes_ -= bytes;
+}
+
+bool detail::BoundNodeSessionRegistry::TryClaim(
+    std::string_view node_id, celer::Connection* connection) {
+  return sessions_.emplace(node_id, connection).second;
+}
+
+void detail::BoundNodeSessionRegistry::Release(
+    std::string_view node_id, celer::Connection* connection) noexcept {
+  const auto session = sessions_.find(node_id);
+  if (session != sessions_.end() && session->second == connection) {
+    sessions_.erase(session);
+  }
+}
+
 absl::Status MetaDataControlServer::ValidateOptions(
     const MetaDataControlServerOptions& options) {
   if (options.server_id_ == 0 || options.bind_host_.empty() ||
@@ -2638,9 +2915,16 @@ absl::Status MetaDataControlServer::ValidateOptions(
       options.session_progress_timeout_ms_ > kMaxSessionProgressTimeoutMs ||
       options.heartbeat_interval_ms_ >= options.session_progress_timeout_ms_ ||
       options.leadership_validity_ms_ == 0 ||
-      options.max_write_queue_bytes_ < control::kMaxFrameBytes) {
+      options.lease_handoff_safety_margin_ms_ <
+          options.leadership_validity_ms_ ||
+      options.max_pending_handshakes_ == 0 ||
+      options.max_pending_handshakes_ > control::kMaxProjectedNodes ||
+      options.max_write_queue_bytes_ < control::kMaxFrameBytes ||
+      options.max_retained_projection_bytes_ <
+          kProjectionBuildReservationBytes) {
     return absl::InvalidArgumentError(
-        "data-control timing or writer bound is invalid");
+        "data-control timing, handoff, handshake, writer, or projection "
+        "bound is invalid");
   }
   return absl::OkStatus();
 }
@@ -2667,7 +2951,16 @@ MetaDataControlServer::Create(
   core->observations_ = std::move(observations);
   core->options_ = std::move(options);
   core->lease_handoff_guard_ = std::make_unique<MetaLeaseHandoffGuard>(
+      core->options_.leadership_validity_ms_,
+      core->options_.lease_handoff_safety_margin_ms_);
+  core->leader_runtime_guard_ = std::make_unique<MetaLeaderRuntimeGuard>(
       core->options_.leadership_validity_ms_);
+  core->pending_handshakes_ =
+      std::make_unique<detail::PendingHandshakeLimiter>(
+          core->options_.max_pending_handshakes_);
+  core->projection_limiter_ =
+      std::make_unique<detail::RetainedProjectionLimiter>(
+          core->options_.max_retained_projection_bytes_);
   if (!core->options_.tls_ca_cert_file_.empty()) {
     auto tls = celer::TlsContext::CreateServer(celer::TlsServerOptions{
         .cert_file_ = core->options_.tls_cert_file_,
@@ -2846,6 +3139,8 @@ void MetaDataControlServer::StartOnExecutor(MetaLeaderContext* context) {
         ++core->leadership_generation_;
         if (core->leadership_generation_ == 0) ++core->leadership_generation_;
         core->lease_handoff_guard_->Reset();
+        core->leader_runtime_guard_->Reset(cluster::LeaseClockMillis(),
+                                           ActiveClockMillis());
         core->leader_context_ = context;
         core->leader_active_ = true;
         core->leader_ready_for_data_ = false;
@@ -2923,10 +3218,20 @@ celer::Task<absl::Status> MetaDataControlServer::AcceptLoop(CorePtr core) {
       (void)core->listener_.Close();
       break;
     }
+    auto handshake_permit = core->pending_handshakes_->TryAcquire();
+    if (!handshake_permit.has_value()) {
+      core->rejected_sessions_.fetch_add(1, std::memory_order_relaxed);
+      CloseConnectionNow(
+          *core->worker_, connection,
+          absl::ResourceExhaustedError(
+              "too many pending data-control handshakes"));
+      continue;
+    }
     core->sessions_.push_back(connection);
     core->live_session_tasks_.fetch_add(1, std::memory_order_relaxed);
-    core->worker_->Spawn(
-        SessionLoop(core, celer::TcpStream(connection), connection));
+    core->worker_->Spawn(SessionLoop(core, celer::TcpStream(connection),
+                                     connection,
+                                     std::move(*handshake_permit)));
   }
   if (core->shutdown_accept_wake_fd_ >= 0) {
     (void)::shutdown(core->shutdown_accept_wake_fd_, SHUT_RDWR);
@@ -2940,7 +3245,8 @@ celer::Task<absl::Status> MetaDataControlServer::AcceptLoop(CorePtr core) {
 }
 
 celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
-    CorePtr core, celer::TcpStream stream, celer::Connection* connection) {
+    CorePtr core, celer::TcpStream stream, celer::Connection* connection,
+    detail::PendingHandshakeLimiter::Permit handshake_permit) {
   std::string node_id;
   bool accepted_session = false;
   bool redirected_session = false;
@@ -2953,13 +3259,18 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     celer::Connection* connection_;
     std::string* node_id_;
     bool* accepted_;
+    detail::PendingHandshakeLimiter::Permit* handshake_permit_;
     ~SessionCompletionGuard() {
+      // Release while core_ still pins the limiter. The ordinary authenticated
+      // path released earlier; Permit::Release is intentionally idempotent.
+      handshake_permit_->Release();
       if (*accepted_) {
         core_->active_sessions_.fetch_sub(1, std::memory_order_relaxed);
       }
       RemoveSession(*core_, connection_, *node_id_);
     }
-  } completion{core, connection, &node_id, &accepted_session};
+  } completion{core, connection, &node_id, &accepted_session,
+               &handshake_permit};
   SessionIo io(
       *core->worker_, connection, stream, core->options_.max_write_queue_bytes_,
       std::chrono::milliseconds(core->options_.session_progress_timeout_ms_));
@@ -3035,13 +3346,11 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     co_return finish(absl::PermissionDeniedError(
         "data-node certificate does not match its committed binding"));
   }
-
   auto directory = BuildCommittedMetaDirectory(*view);
   if (!directory.ok()) co_return finish(directory.status());
   const bool accepted_leader =
-      core->leader_active_ && core->leader_ready_for_data_ &&
-      core->leader_context_ != nullptr && core->server_->is_leader() &&
-      core->server_->is_leader_sm_fully_caught_up();
+      core->leader_ready_for_data_ &&
+      AuthoritySessionsAllowed(*core, core->leadership_generation_);
   if (!accepted_leader) {
     const absl::Status sent =
         co_await io.Send(control::MessagePriority::kReliable,
@@ -3049,6 +3358,8 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
                              *core, std::move(*directory), false)));
     core->redirected_sessions_.fetch_add(1, std::memory_order_relaxed);
     redirected_session = true;
+    // The completion guard releases the permit only after the bounded write
+    // completes, so repeated valid Hellos cannot accumulate redirect tasks.
     co_return finish(sent);
   }
 
@@ -3086,10 +3397,34 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   }
   directory = BuildCommittedMetaDirectory(*view);
   if (!directory.ok()) co_return finish(directory.status());
+  auto boot_id = ParseIdentity<20>(hello->boot_id, "data boot id");
+  if (!boot_id.ok()) co_return finish(boot_id.status(), true);
+  auto replication_history_id = ParseIdentity<20>(
+      hello->replication_history_id, "data replication history id");
+  if (!replication_history_id.ok()) {
+    co_return finish(replication_history_id.status(), true);
+  }
+  // A committed node owns at most one leader-session setup or live session.
+  // First-owner semantics keep a stalled incumbent bounded; the Data client
+  // retries after the incumbent exits under its progress deadline.
+  if (!core->bound_node_sessions_.TryClaim(node_id, connection)) {
+    co_return finish(absl::AlreadyExistsError(
+        "data node already has a bound control session"));
+  }
+  if (absl::Status bound =
+          BindAuthoritySession(*core, connection, leadership_generation);
+      !bound.ok()) {
+    co_return finish(bound);
+  }
+  // From this point the per-node slot, leadership-generation registry, and
+  // completion guard bound all projection/FDS ownership, so anonymous setup
+  // capacity can be reused safely.
+  handshake_permit.Release();
 
-  auto projected = MetaControlProjector::ProjectNode(*view, node_id);
+  auto projected = ProjectNodeBounded(*core, *view, node_id);
   if (!projected.ok()) co_return finish(projected.status());
-  auto batch = std::make_shared<NodeControlBatch>(std::move(*projected));
+  std::shared_ptr<const NodeControlBatch> batch =
+      RetainProjection(std::move(*projected));
   view.reset();
   auto session_id = control::GenerateId128();
   if (!session_id.ok()) co_return finish(session_id.status());
@@ -3099,25 +3434,6 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
         "data-node session generation is exhausted"));
   }
   const std::uint64_t session_generation = ++next_generation;
-  auto boot_id = ParseIdentity<20>(hello->boot_id, "data boot id");
-  if (!boot_id.ok()) co_return finish(boot_id.status(), true);
-  auto replication_history_id = ParseIdentity<20>(
-      hello->replication_history_id, "data replication history id");
-  if (!replication_history_id.ok()) {
-    co_return finish(replication_history_id.status(), true);
-  }
-  if (absl::Status bound =
-          BindAuthoritySession(*core, connection, leadership_generation);
-      !bound.ok()) {
-    co_return finish(bound);
-  }
-
-  if (const auto old = core->session_by_node_.find(node_id);
-      old != core->session_by_node_.end() && old->second != connection) {
-    CloseConnectionNow(*core->worker_, old->second,
-                       absl::CancelledError("superseded data-node session"));
-  }
-  core->session_by_node_[node_id] = connection;
   const absl::Status adopted = core->observations_->AdoptSession(
       MetaObservationIdentity{node_id, *boot_id, session_generation},
       NowUnixMillis());
@@ -3163,7 +3479,10 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   live->boot_id_ = hello->boot_id;
   live->session_id_ = *session_id;
   live->leadership_generation_ = leadership_generation;
-  live->installed_ = batch;
+  // Transfer the sole retained-projection owner into live session state. The
+  // SessionLoop coroutine frame outlives the publisher, so copying here would
+  // pin the initial generation after every later replacement.
+  live->installed_ = std::move(batch);
   live->validated_committed_high_water_ = validated_committed_high_water;
   live->fenced_authorities_ = std::move(fenced_authorities);
   const std::weak_ptr<LiveSessionState> weak_live = live;

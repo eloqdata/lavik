@@ -23,7 +23,8 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedHashObject::Handle previous, std::uint64_t expire_at_ms,
-    TxShardWrites* tx, ReplicationCommandAppend* replication) {
+    TxShardWrites* tx, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   auto& side = partition.grouped_objects_[db_id];
   if (!SameMetadataSource(previous, side.CurrentForMutation(key)))
     co_return absl::AbortedError("grouped expiration source changed");
@@ -36,7 +37,10 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
   if (!tx) {
     InitializeTxWrites(tx::TxRuntime::Get()->next_txid_.fetch_add(
                            1, std::memory_order_relaxed),
-                       std::span(&standalone, 1));
+                       std::span(&standalone, 1),
+                       mutation_precondition != nullptr
+                           ? *mutation_precondition
+                           : MutationPrecondition{});
     tx = &standalone;
   }
   // No auxiliary is rewritten, but a new independent root cannot inherit
@@ -115,7 +119,7 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
       store, partition, db_id, key, digest, *payload, RecordKind::kValue,
       previous->version().root_.value_type(), expire_at_ms, tx,
       previous->version().root_.logical_size_, nullptr, nullptr, replication,
-      nullptr, true, nullptr, &mutation);
+      nullptr, true, nullptr, mutation_precondition, &mutation);
   if (!appended.ok()) {
     if (store.write_failed_) (*decision)->FailPending();
     co_return appended;

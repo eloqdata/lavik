@@ -68,12 +68,6 @@ bool IsZero(const control::WireId128& value) {
                      [](std::uint8_t byte) { return byte == 0; });
 }
 
-std::int64_t MonotonicMillis() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
 absl::StatusOr<std::uint64_t> Entropy64() {
   auto generated = control::GenerateId128();
   if (!generated.ok()) return generated.status();
@@ -413,6 +407,31 @@ absl::Status ValidateUniqueControlPrincipal(
   if (uri_sans.front() != expected) {
     return absl::PermissionDeniedError(
         "control peer URI SAN does not match its protocol identity");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateDialedMetaIdentity(
+    const MetaControlEndpoint& dialed,
+    const control::WireMetaEndpoint& hello_member) {
+  if (dialed.server_id_ == 0) {
+    if (dialed.principal_.has_value()) {
+      return absl::InvalidArgumentError(
+          "unresolved Meta seed unexpectedly has a pinned principal");
+    }
+    return absl::OkStatus();
+  }
+  if (dialed.server_id_ != hello_member.server_id) {
+    return absl::FailedPreconditionError(
+        "ServerHello member does not match the learned dial target");
+  }
+  if (!dialed.principal_.has_value() || !hello_member.principal.has_value()) {
+    return absl::FailedPreconditionError(
+        "learned Meta identity binding is incomplete");
+  }
+  if (*dialed.principal_ != *hello_member.principal) {
+    return absl::PermissionDeniedError(
+        "ServerHello principal differs from the learned identity binding");
   }
   return absl::OkStatus();
 }
@@ -1032,7 +1051,7 @@ struct MetaControlClientService::Impl {
       co_return absl::InvalidArgumentError(
           "expected initial FullDesiredState transfer");
     }
-    co_return control::DecodeFullDesiredState(transfer->bytes_);
+    co_return control::DecodeFullDesiredState(std::move(transfer->bytes_));
   }
 
   celer::Task<absl::Status> Install(const control::FullDesiredState& desired,
@@ -1794,7 +1813,7 @@ struct MetaControlClientService::Impl {
           control::MessagePriority::kAuthority, control::WireMessage(heartbeat),
           [state, sent_at_ms, challenge_nonce] {
             if (!challenge_nonce.has_value()) return;
-            *sent_at_ms = MonotonicMillis();
+            *sent_at_ms = LeaseClockMillis();
             if (!state->challenge_tracker_
                      .MarkWritten(*challenge_nonce, **sent_at_ms)
                      .ok()) {
@@ -1887,7 +1906,7 @@ struct MetaControlClientService::Impl {
             "lease grant does not match the accepted leader or policy");
       }
       auto deadline_ms = state->challenge_tracker_.AcceptGrant(
-          state->session_.session_id_.bytes(), *grant, MonotonicMillis());
+          state->session_.session_id_.bytes(), *grant, LeaseClockMillis());
       if (!deadline_ms.ok()) co_return deadline_ms.status();
       const std::int64_t grant_ms = grant->granted_duration_ms;
       const auto grant_sent_at =
@@ -2066,6 +2085,11 @@ struct MetaControlClientService::Impl {
       co_return absl::InvalidArgumentError(
           "ServerHello identity is absent from the committed directory");
     }
+    if (absl::Status pinned =
+            ValidateDialedMetaIdentity(endpoint, *hello_member);
+        !pinned.ok()) {
+      co_return pinned;
+    }
     if (hello->negotiated_version != control::kProtocolVersion ||
         hello->raft_term == 0) {
       co_return absl::InvalidArgumentError(
@@ -2074,8 +2098,11 @@ struct MetaControlClientService::Impl {
     if (options_.tls_context_ != nullptr) {
       auto sans = stream.PeerCertificateUriSans();
       if (!sans.ok()) co_return sans.status();
+      const std::string& expected_principal =
+          endpoint.principal_.has_value() ? *endpoint.principal_
+                                          : *hello_member->principal;
       if (absl::Status identity =
-              ValidateUniqueControlPrincipal(*sans, *hello_member->principal);
+              ValidateUniqueControlPrincipal(*sans, expected_principal);
           !identity.ok()) {
         co_return identity;
       }
@@ -2236,12 +2263,13 @@ struct MetaControlClientService::Impl {
             co_return absl::InternalError(
                 "committed inbound transfer has no kind");
           }
-          const ReceivedTransfer transfer{
+          ReceivedTransfer transfer{
               .kind_ = *transfer_sink.kind(),
               .bytes_ = transfer_sink.TakeBytes(),
           };
           if (transfer.kind_ == control::TransferKind::kFullDesiredState) {
-            auto replacement = control::DecodeFullDesiredState(transfer.bytes_);
+            auto replacement =
+                control::DecodeFullDesiredState(std::move(transfer.bytes_));
             if (!replacement.ok()) co_return replacement.status();
             if (absl::Status applied = co_await ApplyFullStateReplacement(
                     state, writer, std::move(*replacement));

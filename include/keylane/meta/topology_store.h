@@ -1,16 +1,18 @@
 #pragma once
 
 // MetaTopologyStore is the metadata control plane's committed topology store.
-// It holds three things: the group table (group_id ->
-// GroupState), the 16384-entry slot map, and the cluster-wide
-// topology_epoch.
+// It holds four kinds of state: the group table (group_id -> GroupState), the
+// retained last-assignment identity per node, the 16384-entry slot map, and
+// the cluster-wide topology_epoch.
 //
 // Invariants:
 //   - One-node-one-group: a node_id is a member of at most one group.
 //     AssignNodeToGroup to the same group with the same role replays as an
-//     idempotent accept; a different role or a different group is a domain
-//     rejection (membership change requires an explicit RemoveNodeFromGroup
-//     first). Whether the node's old authority/obligations were cleared is a
+//     idempotent accept only when assignment_id and the command's
+//     expected/current membership revisions also identify that exact applied
+//     transition; a different identity, role, or group is a domain rejection
+//     (membership change requires an explicit RemoveNodeFromGroup first).
+//     Whether the node's old authority/obligations were cleared is a
 //     CROSS-STORE question: this store only exposes the facts
 //     (FindGroupOfNode, FindGroup) and lets the apply dispatcher enforce.
 //   - revision_ is the membership CAS token of a group: 1 at creation,
@@ -25,12 +27,13 @@
 //     referenced group (ranges and config_epochs) must exist. Partial
 //     coverage is legal (unassigned slots have no owner); an empty range list
 //     clears the map. config_epoch values are absolute assignments, no
-//     ordering enforced here.
+//     ordering enforced here. Whether a changed slot owner or config epoch is
+//     covered by an active grant is a cross-store fact: MetaStateApply rejects
+//     that transition until every affected group is fenced.
 //   - MetaGroupRecord fields (owner, group_term, authority_version,
 //     population manifest revision/digest, partition_replication_epoch) and
-//     per-group
-//     config_epoch change ONLY through the granular primitives below: the
-//     term/grant semantics and the atomicity of owner switches (failover /
+//     per-group config_epoch change ONLY through the granular primitives below.
+//     The term/grant semantics and the atomicity of owner switches (failover /
 //     ActivateAuthority) span the grant store and are orchestrated by the
 //     apply dispatcher. The primitives therefore validate group existence and
 //     absolute-value/idempotency only; ordering rules (term raised once via
@@ -57,8 +60,9 @@
 // registration is the identity store's fact, cross-checked by the dispatcher.
 //
 // Serialization: u16 schema_version envelope; groups sorted by group_id,
-// members sorted by node_id, the slot map as sorted runs; byte output is
-// deterministic so equal states serialize to equal bytes.
+// members sorted by node_id; the retained last-assignment index sorted by
+// node_id; then the slot map as sorted runs. Byte output is deterministic so
+// equal states serialize to equal bytes.
 
 #include <array>
 #include <cstdint>

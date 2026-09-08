@@ -97,8 +97,9 @@ static_assert(kSlotCount < kNoGroupIndex);
 
 // One cluster node as the data plane sees it. Static mode builds this from its
 // topology file; Meta-managed mode builds it from an authenticated complete
-// desired state. `tls_port_` is the cluster-wide TLS port (uniform-port
-// assumption, see control_port.h).
+// desired state. Static mode applies the cluster-wide uniform TLS-port
+// assumption documented by control_port.h; Meta mode preserves each node's
+// committed endpoint independently.
 struct alignas(64) NodeDescriptor {
   NodeId node_id_;              // stable across restarts
   bool link_connected_ = true;  // parsed from the file; not consulted in v1

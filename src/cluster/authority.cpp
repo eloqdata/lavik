@@ -36,6 +36,34 @@ bool InvolvedGroupsReady(const ServingState& state,
 
 }  // namespace
 
+AuthorityAdmission::AuthorityAdmission(AuthorityAdmission&& other) noexcept
+    : decision_(std::move(other.decision_)),
+      state_(std::move(other.state_)),
+      slots_(std::move(other.slots_)),
+      gate_generation_(other.gate_generation_),
+      lease_checked_(other.lease_checked_),
+      mutation_started_(
+          other.mutation_started_.load(std::memory_order_relaxed)),
+      final_recheck_failed_(
+          other.final_recheck_failed_.load(std::memory_order_relaxed)) {}
+
+AuthorityAdmission& AuthorityAdmission::operator=(
+    AuthorityAdmission&& other) noexcept {
+  if (this == &other) return *this;
+  decision_ = std::move(other.decision_);
+  state_ = std::move(other.state_);
+  slots_ = std::move(other.slots_);
+  gate_generation_ = other.gate_generation_;
+  lease_checked_ = other.lease_checked_;
+  mutation_started_.store(
+      other.mutation_started_.load(std::memory_order_relaxed),
+      std::memory_order_relaxed);
+  final_recheck_failed_.store(
+      other.final_recheck_failed_.load(std::memory_order_relaxed),
+      std::memory_order_relaxed);
+  return *this;
+}
+
 Decision Admit(const ServingState* state, const RequestView& request) {
   Decision decision;
 
@@ -268,6 +296,17 @@ RecheckResult AuthorityGuard::Recheck(const AuthorityAdmission& admission,
              : RecheckResult::kReject;
 }
 
+RecheckResult AuthorityGuard::RecheckAtMutation(
+    const AuthorityAdmission& admission, MonotonicTime now) const {
+  const RecheckResult result = Recheck(admission, now);
+  if (result == RecheckResult::kOk) {
+    admission.mutation_started_.store(true, std::memory_order_release);
+  } else {
+    admission.final_recheck_failed_.store(true, std::memory_order_release);
+  }
+  return result;
+}
+
 RecheckResult AuthorityGuard::RegisterAndRecheck(
     const AuthorityAdmission& admission, std::size_t worker_stripe,
     MonotonicTime now, AuthorityInFlightGuards* guards) const {
@@ -303,13 +342,18 @@ RecheckResult AuthorityGuard::RegisterAndRecheck(
 
 absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
                                         const AuthorityAnchor& anchor,
-                                        MonotonicTime deadline) {
+                                        MonotonicTime deadline,
+                                        MonotonicTime now) {
   if (lease_mode_ != LeaseMode::kFinite) {
     return absl::FailedPreconditionError(
         "a permanent/static authority guard does not accept lease grants");
   }
   if (!session.complete()) {
     return absl::InvalidArgumentError("lease session identity is incomplete");
+  }
+  if (deadline <= now) {
+    return absl::DeadlineExceededError(
+        "lease grant expired before authority installation");
   }
   const std::lock_guard lock(mutex_);
   if (!session_.has_value() || *session_ != session) {
@@ -321,6 +365,14 @@ absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
   const auto existing = leases_.find(anchor.group_id_);
   if (existing != leases_.end() && existing->second.session_ == session &&
       existing->second.anchor_ == anchor) {
+    if (existing->second.deadline_ <= now) {
+      // Extending this object would preserve generation_ and retroactively
+      // validate work admitted before expiry. NodeControl must first run the
+      // exact expiration cleanup transition, which removes this lease and
+      // advances the generation before a later grant can be installed.
+      return absl::FailedPreconditionError(
+          "expired lease requires cleanup before renewal");
+    }
     // Deadline-only renewal is deliberately invisible to already admitted
     // work. Replacing generation here would turn a healthy heartbeat into a
     // spurious write abort.

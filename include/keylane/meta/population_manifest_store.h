@@ -56,6 +56,12 @@ class MetaPopulationManifestStore {
   std::vector<MetaPopulationManifestDocument> Documents() const;
   std::size_t Size() const { return documents_.size(); }
 
+  // Snapshot v2: schema_version u16, document count u32, then documents
+  // sorted by digest. Each document stores its digest and sorted entries of
+  // (partition u32, logical epoch u64). This store envelope is distinct from
+  // the domain-separated canonical entry encoding hashed by CanonicalDigest.
+  // Deserialize strictly enforces aggregate bytes, entry caps, sorting,
+  // uniqueness, and digest agreement; violations fail stop.
   std::string Serialize() const;
   static absl::StatusOr<MetaPopulationManifestStore> Deserialize(
       std::string_view bytes);

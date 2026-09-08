@@ -941,8 +941,8 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
       .loading_allowed_ = LoadingAllowedCommand(request),
   };
   auto admission = std::make_shared<const cluster::AuthorityAdmission>(
-      runtime->authority_guard_.CaptureAndAdmit(
-          view, std::chrono::steady_clock::now()));
+      runtime->authority_guard_.CaptureAndAdmit(view,
+                                                cluster::LeaseClockNow()));
   if (admission->decision().kind_ == cluster::Decision::Kind::kServe &&
       !unscoped_mutation.empty() &&
       !StaticPrimaryOwnsGlobalMutation(*runtime, *admission)) {
@@ -994,8 +994,7 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
     // Requests execute on stable Celer workers, so the worker id is the exact
     // stripe identity required by the admitted ServingState.
     if (runtime->authority_guard_.RegisterAndRecheck(
-            *admission, celer::ThisWorker().id_,
-            std::chrono::steady_clock::now(),
+            *admission, celer::ThisWorker().id_, cluster::LeaseClockNow(),
             in_flights) == cluster::RecheckResult::kOk) {
       return std::nullopt;
     }
@@ -1012,8 +1011,8 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
         .loading_allowed_ = false,
     };
     auto fresh = std::make_shared<const cluster::AuthorityAdmission>(
-        runtime->authority_guard_.CaptureAndAdmit(
-            view, std::chrono::steady_clock::now()));
+        runtime->authority_guard_.CaptureAndAdmit(view,
+                                                  cluster::LeaseClockNow()));
     CommandReply reply;
     if (EmitClusterDecision(fresh->decision(), request.connection_tls_,
                             reply_builder, &reply)) {
@@ -3993,14 +3992,17 @@ Task<absl::StatusOr<storage::RestoreRawResult>> ApplyPreparedRestore(
     PreparedRestoreValue& value, std::uint8_t db, std::string_view key,
     bool replace, const storage::Digest* digest = nullptr,
     storage::TxShardWrites* tx = nullptr,
-    storage::ReplicationCommandAppend* replication = nullptr) {
+    storage::ReplicationCommandAppend* replication = nullptr,
+    const storage::MutationPrecondition* mutation_precondition = nullptr) {
   if (!value.collection_) {
     value.raw_.expire_at_ms_ = value.expire_at_ms_;
     co_return digest != nullptr
         ? co_await g_storage->RestoreRawValueLocked(
-              db, key, *digest, value.raw_, replace, tx, replication)
+              db, key, *digest, value.raw_, replace, tx, replication,
+              mutation_precondition)
         : co_await g_storage->RestoreRawValue(db, key, value.raw_, replace,
-                                              replication);
+                                              replication,
+                                              mutation_precondition);
   }
   storage::CollectionPageReader next =
       [&value]() -> Task<absl::StatusOr<storage::CollectionPage>> {
@@ -4010,10 +4012,11 @@ Task<absl::StatusOr<storage::RestoreRawResult>> ApplyPreparedRestore(
       ? co_await g_storage->RestoreCollectionValueLocked(
             db, key, *digest, value.value_type_, value.expire_at_ms_, replace,
             value.collection_->expected_items(), std::move(next), tx,
-            replication)
+            replication, mutation_precondition)
       : co_await g_storage->RestoreCollectionValue(
             db, key, value.value_type_, value.expire_at_ms_, replace,
-            value.collection_->expected_items(), std::move(next), replication);
+            value.collection_->expected_items(), std::move(next), replication,
+            mutation_precondition);
 }
 
 std::vector<std::string> CanonicalRestoreCommand(std::string_view key,
@@ -4156,9 +4159,11 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       auto replication = PrepareReplicationCommand(
           request,
           CanonicalRestoreCommand(args[1], args[3], options->expire_at_ms_));
+      const storage::MutationPrecondition mutation_precondition =
+          ClusterMutationPrecondition(request);
       auto restored = co_await ApplyPreparedRestore(
           *value, request.db_id_, args[1], options->replace_, nullptr, nullptr,
-          replication ? &*replication : nullptr);
+          replication ? &*replication : nullptr, &mutation_precondition);
       if (!restored.ok()) {
         reply.encoded_ = AppendStorageError(reply_builder, restored.status());
       } else if (restored->busy_) {
@@ -4201,12 +4206,15 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       if (set_trace != nullptr) {
         set_trace->replication_ = replication.has_value();
       }
+      const storage::MutationPrecondition mutation_precondition =
+          ClusterMutationPrecondition(request);
       auto result = co_await g_storage->Set(
           request.db_id_, args[1], args[2], *options,
           replication ? &*replication : nullptr, set_trace,
           request.HasRoutedPartitionFor(1)
               ? std::optional<std::uint16_t>(request.RoutedPartitionId())
-              : std::nullopt);
+              : std::nullopt,
+          &mutation_precondition);
       if (!result.ok()) {
         reply.encoded_ = AppendStorageError(reply_builder, result.status());
         co_return reply;
@@ -4434,9 +4442,11 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       }
       auto replication = PrepareReplicationCommand(
           request, {"PEXPIREAT", args[1], std::to_string(*expire_at_ms)});
+      const storage::MutationPrecondition mutation_precondition =
+          ClusterMutationPrecondition(request);
       auto updated = co_await g_storage->UpdateExpiration(
           request.db_id_, args[1], *expire_at_ms, *condition,
-          replication ? &*replication : nullptr);
+          replication ? &*replication : nullptr, &mutation_precondition);
       reply.encoded_ =
           updated.ok() ? reply_builder.AppendInteger(*updated ? 1 : 0)
                        : AppendStorageError(reply_builder, updated.status());
@@ -4450,10 +4460,12 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
         co_return reply;
       }
       auto replication = PrepareReplicationCommand(request);
+      const storage::MutationPrecondition mutation_precondition =
+          ClusterMutationPrecondition(request);
       auto updated = co_await g_storage->UpdateExpiration(
           request.db_id_, args[1], 0,
           storage::ExpirationCondition::kIfHasExpiration,
-          replication ? &*replication : nullptr);
+          replication ? &*replication : nullptr, &mutation_precondition);
       reply.encoded_ =
           updated.ok() ? reply_builder.AppendInteger(*updated ? 1 : 0)
                        : AppendStorageError(reply_builder, updated.status());
@@ -5261,6 +5273,9 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
 // before the hop barrier; the coordinator assembles the reply afterwards.
 struct MultiKeyContext {
   const CommandRequest* request_ = nullptr;
+  // Single-key MSET/DEL use an untagged transaction callback, so they cannot
+  // inherit the final authority check from a TxShardWrites receipt.
+  storage::MutationPrecondition mutation_precondition_;
   std::vector<std::optional<std::string>>
       frames_;                      // MGET: encoded bulk per slot
   std::atomic<long long> hits_{0};  // DEL / EXISTS
@@ -5311,15 +5326,17 @@ Task<absl::Status> TwoPhaseFinishCallback(void* opaque, const tx::ShardSlice&) {
 
 template <typename Context, typename ShouldSkip>
 Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
-    tx::Transaction& transaction, Context* context,
-    TwoPhaseCallback read_callback, TwoPhaseCallback write_callback,
-    TwoPhaseCallback single_shard_callback, ShouldSkip should_skip) {
+    tx::Transaction& transaction, const CommandRequest& request,
+    Context* context, TwoPhaseCallback read_callback,
+    TwoPhaseCallback write_callback, TwoPhaseCallback single_shard_callback,
+    ShouldSkip should_skip) {
   absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) co_return TwoPhaseResult{std::move(status)};
 
   const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
   context->writes_.resize(g_storage->worker_count());
-  g_storage->InitializeTxWrites(txid, context->writes_);
+  g_storage->InitializeTxWrites(txid, context->writes_,
+                                ClusterMutationPrecondition(request));
   for (storage::TxShardWrites& writes : context->writes_) {
     writes.collect_undo_ = true;
   }
@@ -5533,7 +5550,7 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
   RenameContext context;
   context.request_ = &request;
   TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
-      transaction, &context, &RenameReadCallback, &RenameWriteCallback,
+      transaction, request, &context, &RenameReadCallback, &RenameWriteCallback,
       &RenameSingleShardCallback, [nx](const RenameContext& value) {
         return nx && value.destination_exists_;
       });
@@ -5719,7 +5736,7 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
   context.request_ = &request;
   context.options_ = *options;
   TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
-      transaction, &context, &CopyReadCallback, &CopyWriteCallback,
+      transaction, request, &context, &CopyReadCallback, &CopyWriteCallback,
       &CopySingleShardCallback, [](const CopyContext& value) {
         return !value.source_.has_value() ||
                (value.destination_exists_ && !value.options_.replace_);
@@ -5833,8 +5850,9 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
   MSetNxContext context;
   context.request_ = &request;
   TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
-      transaction, &context, &MSetNxCheckCallback, &MSetNxWriteCallback,
-      &MSetNxSingleShardCallback, [](const MSetNxContext& value) {
+      transaction, request, &context, &MSetNxCheckCallback,
+      &MSetNxWriteCallback, &MSetNxSingleShardCallback,
+      [](const MSetNxContext& value) {
         return value.exists_.load(std::memory_order_relaxed);
       });
   absl::Status status = std::move(execution.status_);
@@ -5894,7 +5912,8 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
             {},
             ctx->tx_writes_.empty() ? nullptr
                                     : &ctx->tx_writes_[ThisWorker().id_],
-            replication ? &*replication : nullptr);
+            replication ? &*replication : nullptr, nullptr,
+            &ctx->mutation_precondition_);
         if (!result.ok()) {
           if (!ctx->tx_writes_.empty()) {
             (void)co_await g_storage->RollbackTxLocal(
@@ -5916,7 +5935,8 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
             ctx->request_->db_id_, name, key.digest_,
             ctx->tx_writes_.empty() ? nullptr
                                     : &ctx->tx_writes_[ThisWorker().id_],
-            replication ? &*replication : nullptr);
+            replication ? &*replication : nullptr,
+            &ctx->mutation_precondition_);
         if (!deleted.ok()) {
           if (!ctx->tx_writes_.empty()) {
             (void)co_await g_storage->RollbackTxLocal(
@@ -6007,6 +6027,7 @@ Task<CommandReply> ExecuteMultiKey(
 
   MultiKeyContext ctx;
   ctx.request_ = &request;
+  ctx.mutation_precondition_ = ClusterMutationPrecondition(request);
   if (request.kind_ == CommandKind::kMGet) {
     ctx.frames_.resize(keys->count());
   }
@@ -6014,7 +6035,8 @@ Task<CommandReply> ExecuteMultiKey(
   if (write && keys->count() > 1) {
     write_txid = storage::StorageEngine::AllocateWriteTxid();
     ctx.tx_writes_.resize(g_storage->worker_count());
-    g_storage->InitializeTxWrites(write_txid, ctx.tx_writes_);
+    g_storage->InitializeTxWrites(write_txid, ctx.tx_writes_,
+                                  ClusterMutationPrecondition(request));
     for (auto& shard : ctx.tx_writes_) {
       shard.collect_undo_ = true;
     }
@@ -8017,7 +8039,8 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
     if (!read_only) {
       const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
       tx_writes.resize(g_storage->worker_count());
-      g_storage->InitializeTxWrites(txid, tx_writes);
+      g_storage->InitializeTxWrites(txid, tx_writes,
+                                    ClusterMutationPrecondition(request));
     }
   }
 
@@ -9331,7 +9354,7 @@ Task<CommandReply> ExecuteExecBody(
       for (;;) {
         auto candidate = std::make_shared<const cluster::AuthorityAdmission>(
             runtime->authority_guard_.CaptureAndAdmit(
-                view, std::chrono::steady_clock::now()));
+                view, cluster::LeaseClockNow()));
         CommandReply redirect;
         if (EmitClusterDecision(candidate->decision(),
                                 queued.front().connection_tls_, reply_builder,
@@ -9348,8 +9371,7 @@ Task<CommandReply> ExecuteExecBody(
           co_return reply;
         }
         if (runtime->authority_guard_.RegisterAndRecheck(
-                *candidate, celer::ThisWorker().id_,
-                std::chrono::steady_clock::now(),
+                *candidate, celer::ThisWorker().id_, cluster::LeaseClockNow(),
                 &exec_in_flights) != cluster::RecheckResult::kOk) {
           continue;
         }
@@ -9384,7 +9406,8 @@ Task<CommandReply> ExecuteExecBody(
   bool close_after_exec = false;
   auto finalize_exec_reply = [&](CommandReply reply) {
     reply.close_connection_ = reply.close_connection_ || close_after_exec;
-    return reply;
+    return FinalizeClusterMutationReply(queued.front(), reply_builder,
+                                        std::move(reply));
   };
   auto run_keyless = [&](const CommandRequest& cmd) -> Task<std::string> {
     if (IsLuaInvocationCommand(cmd)) {
@@ -9480,7 +9503,13 @@ Task<CommandReply> ExecuteExecBody(
     // Read-only transactions collect no fences and append no commit.
     const std::uint64_t exec_txid = storage::StorageEngine::AllocateWriteTxid();
     std::vector<storage::TxShardWrites> tx_writes(g_storage->worker_count());
-    g_storage->InitializeTxWrites(exec_txid, tx_writes);
+    const auto write_request =
+        std::find_if(queued.begin(), queued.end(), ExecCommandMayWrite);
+    g_storage->InitializeTxWrites(
+        exec_txid, tx_writes,
+        write_request == queued.end()
+            ? storage::MutationPrecondition{}
+            : ClusterMutationPrecondition(*write_request));
 
     // Every read and write owner participates in the replication barrier.
     // Any command that has not yet been reduced to an independent after-image
@@ -9708,7 +9737,7 @@ Task<CommandReply> ExecuteExecBody(
               // builds a tx::Transaction): re-check the complete EXEC proof
               // after the key guard and before the first mutation.
               if (cluster::GetClusterRuntime()->authority_guard_.Recheck(
-                      *exec_admission, std::chrono::steady_clock::now()) !=
+                      *exec_admission, cluster::LeaseClockNow()) !=
                   cluster::RecheckResult::kOk) {
                 co_return ClusterAuthorityChangedStatus();
               }
@@ -11410,6 +11439,56 @@ bool IsClusterAuthorityChanged(const absl::Status& status) {
          status.message() == "cluster authority changed";
 }
 
+namespace {
+
+absl::Status ValidateClusterStorageMutation(const void* opaque) {
+  const auto* admission =
+      static_cast<const cluster::AuthorityAdmission*>(opaque);
+  if (admission != nullptr &&
+      cluster::GetClusterRuntime()->authority_guard_.RecheckAtMutation(
+          *admission, cluster::LeaseClockNow()) ==
+          cluster::RecheckResult::kOk) {
+    return absl::OkStatus();
+  }
+  return ClusterAuthorityChangedStatus();
+}
+
+}  // namespace
+
+storage::MutationPrecondition ClusterMutationPrecondition(
+    const CommandRequest& request) {
+  if (!cluster::ClusterEnabled() || request.replication_origin_ ||
+      request.cluster_authority_admission_ == nullptr ||
+      request.ClusterSlots().empty() || !ClusterRequestIsWrite(request)) {
+    return {};
+  }
+  return storage::MutationPrecondition(
+      std::shared_ptr<const void>(request.cluster_authority_admission_),
+      &ValidateClusterStorageMutation);
+}
+
+CommandReply FinalizeClusterMutationReply(const CommandRequest& request,
+                                          ReplyBuilder& reply_builder,
+                                          CommandReply reply) {
+  const auto& admission = request.cluster_authority_admission_;
+  if (admission == nullptr || !admission->final_recheck_failed()) return reply;
+  if (!admission->mutation_started()) {
+    // ReplyBuilder returns a view of its whole buffer, not only the most recent
+    // frame. Discard the stale handler answer before constructing the fresh
+    // redirect/LOADING response.
+    reply_builder.Reset();
+    return ClusterAuthorityChangedReply(admission->slots(),
+                                        request.connection_tls_, reply_builder);
+  }
+  // At least one participant linearized before another failed its final
+  // check. Its aggregate outcome cannot be represented as a retryable error.
+  reply.encoded_ = {};
+  reply.disk_value_ = storage::DiskValue{};
+  reply.chunks_.reset();
+  reply.close_connection_ = true;
+  return reply;
+}
+
 CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
                                           bool connection_tls,
                                           ReplyBuilder& reply_builder) {
@@ -11424,8 +11503,7 @@ CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
   };
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
   const cluster::AuthorityAdmission fresh =
-      runtime->authority_guard_.CaptureAndAdmit(
-          view, std::chrono::steady_clock::now());
+      runtime->authority_guard_.CaptureAndAdmit(view, cluster::LeaseClockNow());
   if (!EmitClusterDecision(fresh.decision(), connection_tls, reply_builder,
                            &reply)) {
     // Authority became serveable again after the failed proof. We cannot
@@ -11440,7 +11518,7 @@ absl::Status ValidateClusterShardAuthority(void* opaque, unsigned /*shard*/) {
   auto* context = static_cast<ClusterShardValidatorContext*>(opaque);
   if (context->admission_ != nullptr &&
       cluster::GetClusterRuntime()->authority_guard_.Recheck(
-          *context->admission_, std::chrono::steady_clock::now()) ==
+          *context->admission_, cluster::LeaseClockNow()) ==
           cluster::RecheckResult::kOk) {
     return absl::OkStatus();
   }
@@ -11467,8 +11545,8 @@ absl::Status RecheckClusterRequestAuthority(const CommandRequest& request) {
     return absl::OkStatus();
   }
   if (cluster::GetClusterRuntime()->authority_guard_.Recheck(
-          *request.cluster_authority_admission_,
-          std::chrono::steady_clock::now()) == cluster::RecheckResult::kOk) {
+          *request.cluster_authority_admission_, cluster::LeaseClockNow()) ==
+      cluster::RecheckResult::kOk) {
     return absl::OkStatus();
   }
   return ClusterAuthorityChangedStatus();
@@ -11540,8 +11618,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
               "KILL or SHUTDOWN NOSAVE."));
   }
   if (cluster::ClusterEnabled()) {
-    const std::string_view unscoped_mutation =
-        UnscopedClusterMutation(request);
+    const std::string_view unscoped_mutation = UnscopedClusterMutation(request);
     cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
     if (!unscoped_mutation.empty() &&
         runtime->authority_guard_.lease_mode() ==
@@ -12432,11 +12509,21 @@ Task<CommandReply> ExecuteAdmittedWriteCommand(CommandRequest& request,
   absl::Status released =
       co_await ReleaseReplicationPublisherAdmission(*admission);
   if (!released.ok()) {
-    co_return BuiltReply(reply_builder.AppendError(
+    reply = BuiltReply(reply_builder.AppendError(
         absl::StrCat("ERR replication publisher admission release failed: ",
                      released.message())));
   }
-  co_return reply;
+  co_return FinalizeClusterMutationReply(request, reply_builder,
+                                         std::move(reply));
+}
+
+Task<CommandReply> ExecuteClusterFinalizedCommand(
+    CommandRequest& request, ReplyBuilder& reply_builder,
+    std::uint64_t client_id, ConnectionContext* connection) {
+  CommandReply reply = co_await ExecuteCommandBody(request, reply_builder,
+                                                   client_id, connection);
+  co_return FinalizeClusterMutationReply(request, reply_builder,
+                                         std::move(reply));
 }
 
 Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
@@ -12447,11 +12534,15 @@ Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
       !request.replication_origin_ && request.spec_ != nullptr &&
       (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
       g_storage != nullptr && g_storage->ReplicationLogActive();
-  // Keep this wrapper non-coroutine. Reads and replica-applied writes need no
-  // publisher admission, so returning the body task directly avoids a second
-  // coroutine frame and resume on every such command. The write-only child
-  // owns all state that must survive its admission suspension.
+  // Keep this wrapper non-coroutine. Reads, standalone requests, and
+  // replica-applied writes need neither publisher admission nor final storage
+  // outcome reconciliation, so they avoid a second coroutine frame.
   if (!source_write) [[likely]] {
+    if (request.cluster_authority_admission_ != nullptr &&
+        ClusterRequestIsWrite(request) && !request.replication_origin_) {
+      return ExecuteClusterFinalizedCommand(request, reply_builder, client_id,
+                                            connection);
+    }
     return ExecuteCommandBody(request, reply_builder, client_id, connection);
   }
   return ExecuteAdmittedWriteCommand(request, reply_builder, client_id,

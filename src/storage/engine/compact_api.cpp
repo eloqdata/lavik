@@ -8,7 +8,8 @@ namespace keylane::storage {
 Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
     std::uint8_t db_id, std::string_view key, ValueType value_type,
     bool read_only, const CompactValueCallback& callback, std::uint64_t now_ms,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
@@ -16,14 +17,17 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
   co_return co_await ExecuteCompactLocked(db_id, key, digest, value_type,
                                           read_only, callback, nullptr, now_ms,
-                                          replication);
+                                          replication, false,
+                                          mutation_precondition);
 }
 
 Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     ValueType value_type, bool read_only, const CompactValueCallback& callback,
     TxShardWrites* tx, std::uint64_t now_ms,
-    ReplicationCommandAppend* replication, bool prepare_unlocked) {
+    ReplicationCommandAppend* replication,
+    bool prepare_unlocked,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   if (value_type != ValueType::kString && value_type != ValueType::kSortedSet &&
       value_type != ValueType::kStream) {
@@ -274,13 +278,13 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       }
       co_return co_await CommitGroupedOrderedMutationLocked(
           store, partition, db_id, key, digest, grouped, std::move(plan),
-          expire_at_ms, tx, replication);
+          expire_at_ms, tx, replication, mutation_precondition);
     }
     absl::Status status = co_await AppendLocked(
         store, partition, db_id, key, digest,
         update->erase_ ? std::string_view{} : encoded, kind, published_type,
         expire_at_ms, tx, update->erase_ ? 0 : logical_size, nullptr, nullptr,
-        replication);
+        replication, nullptr, true, nullptr, mutation_precondition);
     co_return status;
   } catch (const std::bad_alloc&) {
     if (value_type != ValueType::kSortedSet) throw;

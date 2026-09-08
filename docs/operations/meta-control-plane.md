@@ -131,9 +131,10 @@ routing are already trusted.
 ## Configure Raft mTLS
 
 mTLS uses one CA trusted by the whole Meta cluster and a distinct certificate
-and private key for every member. Member `N` must have exactly one recognized
-Keylane URI SAN, `keylane://meta/N`, plus IP or DNS SANs covering both its Raft
-and Data-control advertised hosts (one SAN suffices when they share a host).
+and private key for every member. Member `N` must have exactly one URI SAN in
+total, the canonical `keylane://meta/N` principal, plus IP or DNS SANs covering
+both its Raft and Data-control advertised hosts (one SAN suffices when they
+share a host).
 The certificate must be usable for both TLS server and TLS client
 authentication. Never copy one member's certificate or key to another member.
 
@@ -245,7 +246,10 @@ fencegroup <group-id> <expected-term>
 `content` is one non-empty, whitespace-free token. `setslotmap` replaces the
 entire slot map with one inclusive range—it is not an incremental assignment
 command—and sets the named group's absolute config epoch. Both slot endpoints
-must be within 0–16383.
+must be within 0–16383. If the replacement changes a group's slot coverage or
+config epoch, every affected source and destination group must first be
+fenced; apply rejects the whole map while any such group has an active grant.
+Activate fresh authorities only after the complete replacement commits.
 
 `activateauthority` is the atomic owner/grant commit. The term must already
 have been established with `begingroupterm`, the owner must hold a current
@@ -284,11 +288,36 @@ directory, a lease, a term floor, or desired state. Every restart creates a new
 boot identity and begins fenced/LOADING until a leader supplies and accepts a
 complete projection and finite authority.
 
+Lease expiry is suspend-aware: Data checks deadlines with Linux
+`CLOCK_BOOTTIME`, and a new Meta leader or authority identity waits twice the
+configured Raft election lower bound before its first otherwise-valid grant.
+The second interval is an internally derived cross-host clock margin, not a
+separate operator setting. A host suspend therefore consumes an existing lease
+instead of extending it. Meta additionally detects suspend against NuRaft's
+active clock, closes authority sessions, logs a quarantine warning, and
+requests immediate resignation; a sole member must run for one election-lower-
+bound interval before accepting authority again. Repeated client reconnects
+during that interval are expected and must not be worked around by relaxing
+the timing bound. The Meta listener also admits at most 4096 sockets
+that have not yet completed TLS/`ClientHello` and either finished a follower
+redirect or claimed a leader-side node session slot. A committed node has only
+one such leader slot, including while its initial full-state transfer is
+stalled; duplicates are rejected until the incumbent exits. Excess sockets are
+closed and should be investigated as connection storms or untrusted-network
+exposure.
+Decoded-plus-encoded projections share a 2 GiB retained-capacity budget, with
+1 GiB reserved while each FDS is built. These values are derived from the
+512 MiB object cap and the old/new generation overlap. Budget exhaustion closes
+the affected setup or publisher session; investigate an abuse-sized committed
+projection or excessive concurrent FDS ownership rather than retrying without
+first reducing that state.
+
 To enable mTLS, the Data client reuses the existing replication TLS settings;
 there are no separate Meta-control certificate flags. Its certificate must
-have exactly one Keylane URI SAN, `keylane://node/<node-id>`, an IP SAN for the
-Data endpoint, and both client/server usages. The URI must equal the active
-Meta identity binding for that node. For example:
+have exactly one URI SAN in total, the canonical
+`keylane://node/<node-id>` principal, an IP SAN for the Data endpoint, and both
+client/server usages. The URI must equal the active Meta identity binding for
+that node. For example:
 
 ```sh
 keylane --cluster-enabled \

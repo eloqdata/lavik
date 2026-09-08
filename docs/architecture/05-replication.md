@@ -142,9 +142,10 @@ at process start instead.
 `ReplicationManager` exposes a callable boundary to the Data-side node
 controller: `cluster_population_status()` reports the local node/boot and the
 boot-scoped state or ready/failure evidence,
-`ApplyClusterRebuildDirective()` starts one authorized rebuild and waits for
-its exact attempt to publish `ReadyToken` or finish cancellation/failure
-cleanup; its separate start handle supports reconciliation and exact replay.
+`StartClusterRebuildDirective()` admits one authorized rebuild and returns its
+exact completion handle. NodeControl observes that handle later to distinguish
+wire admission from `ReadyToken`, cancellation, or failure; exact replay shares
+the same attempt.
 FDS reconciliation retains an in-progress attempt only while a current rebuild
 directive still names the same local assignment, term, manifest, and partition
 replication epoch. Removing
@@ -220,7 +221,7 @@ immutable stable cut for every declared source flow, and storage finalization
 before publishing a boot-scoped ready token. A sparse manifest never permits a
 sparse physical reset.
 
-`ApplyClusterRebuildDirective()` consumes this contract in production. It
+`StartClusterRebuildDirective()` consumes this contract in production. It
 calls `BeginRebuild`, retains the resulting destructive-reset capability, and
 revalidates that capability immediately before each storage reset batch. The
 native flows feed reset epochs and manifest handoffs into the same
@@ -776,7 +777,7 @@ reattachment.
 | Setting or command | Current scope and behavior |
 |---|---|
 | `cluster-enabled` / `--cluster-enabled` | One-node-one-group, fail-closed startup; incompatible with startup `replicaof`, `redis-replicaof`, and `load-rdb`; the public manager also ignores a standalone initial upstream supplied by a direct embedder |
-| Cluster control adapter | Node-controller-only `ApplyClusterRebuildDirective`, population status, and source authorize/revoke APIs; Meta transport remains outside `ReplicationManager` |
+| Cluster control adapter | Node-controller-only `StartClusterRebuildDirective` admission/completion handle, population status, and source authorize/revoke APIs; Meta transport remains outside `ReplicationManager` |
 | `replicaof host port` / `REPLICAOF` | Standalone Redis-style config or runtime role change with native-first discovery; rejected in cluster-managed mode |
 | `redis-replicaof host port` / `--redis-replicaof` | Explicit standalone startup Redis PSYNC source; rejected in cluster-managed mode |
 | `ADDREPLICAOF host port` | Standalone runtime addition of a disjoint master from the active Redis Cluster; rejected in cluster-managed mode |

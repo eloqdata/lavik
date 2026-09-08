@@ -454,7 +454,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
       });
 
   for (const auto& [revision, digest] : manifest_references) {
-    const auto document = view.stores().population_manifest_.Find(digest);
+    const auto document = view.population_manifest().Find(digest);
     if (!document.has_value()) {
       return Inconsistent(absl::StrCat("referenced population manifest at ",
                                        "revision ", revision, " is missing"));
@@ -509,6 +509,86 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
   if (!encoded.ok()) return encoded.status();
   state.object_hash = control::ComputeSha256(*encoded);
   return NodeControlBatch{std::move(state), std::move(*encoded)};
+}
+
+std::size_t NodeControlBatchRetainedBytes(
+    const NodeControlBatch& batch) noexcept {
+  std::size_t total = sizeof(NodeControlBatch);
+  const auto add = [&](std::size_t bytes) {
+    if (bytes > std::numeric_limits<std::size_t>::max() - total) {
+      total = std::numeric_limits<std::size_t>::max();
+    } else {
+      total += bytes;
+    }
+  };
+  const auto add_array = [&](std::size_t count, std::size_t width) {
+    if (width != 0 && count > std::numeric_limits<std::size_t>::max() / width) {
+      total = std::numeric_limits<std::size_t>::max();
+    } else {
+      add(count * width);
+    }
+  };
+  const auto add_string = [&](const std::string& value) {
+    // Counting SSO capacity again is deliberately conservative and also
+    // covers the implementation's trailing NUL without allocator knowledge.
+    add(value.capacity());
+    add(1);
+  };
+
+  add_string(batch.encoded_full_state);
+  const control::FullDesiredState& state = batch.full_state;
+
+  add_array(state.meta_directory.capacity(), sizeof(control::WireMetaEndpoint));
+  for (const control::WireMetaEndpoint& endpoint : state.meta_directory) {
+    add_string(endpoint.host);
+    if (endpoint.principal.has_value()) add_string(*endpoint.principal);
+  }
+
+  add_array(state.nodes.capacity(), sizeof(control::WireDataEndpoint));
+  for (const control::WireDataEndpoint& node : state.nodes) {
+    add_string(node.node_id);
+    add_string(node.host);
+  }
+
+  add_array(state.groups.capacity(), sizeof(control::WireDesiredGroup));
+  for (const control::WireDesiredGroup& group : state.groups) {
+    add_string(group.group_id);
+    add_array(group.members.capacity(), sizeof(control::WireDesiredMember));
+    for (const control::WireDesiredMember& member : group.members) {
+      add_string(member.node_id);
+    }
+    if (group.owner_node_id.has_value()) add_string(*group.owner_node_id);
+    add_array(group.slot_ranges.capacity(), sizeof(control::WireSlotRange));
+    add_string(group.grant_policy_id);
+  }
+
+  add_array(state.manifests.capacity(), sizeof(control::WireManifestDocument));
+  for (const control::WireManifestDocument& manifest : state.manifests) {
+    add_array(manifest.entries.capacity(), sizeof(control::WireManifestEntry));
+  }
+
+  add_array(state.policies.capacity(), sizeof(control::WirePolicy));
+  for (const control::WirePolicy& policy : state.policies) {
+    add_string(policy.policy_id);
+    add_string(policy.content);
+  }
+
+  add_array(state.current_directives.capacity(),
+            sizeof(control::WireProjectedDirective));
+  for (const control::WireProjectedDirective& directive :
+       state.current_directives) {
+    add_string(directive.authority.group_id);
+    add_string(directive.recipient_node_id);
+    add_string(directive.recipient_boot_id);
+    add_string(directive.target_node_id);
+    add_string(directive.target_boot_id);
+    add_string(directive.source_node_id);
+    add_string(directive.source_boot_id);
+    add_string(directive.source_replication_history_id);
+    add_string(directive.payload);
+    add_string(directive.preconditions);
+  }
+  return total;
 }
 
 }  // namespace keylane::meta

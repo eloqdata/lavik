@@ -390,8 +390,9 @@ std::vector<MetaMemberRecord> MetaIdentityStore::MetaMembers() const {
   return result;
 }
 
-// Envelope: schema_version u16 | node count u32 | sorted records. See the
-// header for the convention and the strictness contract.
+// Envelope: schema_version u16 | Data-node count u32 | sorted Data-node
+// records | Meta-member count u32 | sorted (server_id, principal,
+// data_control_endpoint, retired) records. See the header for strictness.
 std::string MetaIdentityStore::Serialize() const {
   MetaWriter w;
   w.WriteU16(kMetaFormatVersion);

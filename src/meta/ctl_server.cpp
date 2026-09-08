@@ -332,9 +332,10 @@ std::int64_t NowUnixMs() {
 
 // MetaCommittedFacts over ONE committed MetaStores snapshot, so every
 // freshness check of a single obs command sees one consistent cut instead of
-// tearing across per-call reads. StoresSnapshot() deep-copies the aggregate —
-// KB-scale and fine at ctl command frequency; high-frequency coordinator
-// callers must build their facts from a CommittedView instead.
+// tearing across per-call reads. StoresSnapshot() deep-copies the bounded but
+// potentially large aggregate; this low-frequency administrative path accepts
+// that latency, while high-frequency coordinator callers reuse a
+// CommittedView instead.
 class SnapshotCommittedFacts : public MetaCommittedFacts {
  public:
   explicit SnapshotCommittedFacts(MetaStores stores)
@@ -1088,7 +1089,7 @@ celer::Task<std::string> HandleConfigChange(
     bind.principal_ = descriptor->principal_;
     if (member->get_id() != server->get_id() ||
         local_data_control_endpoint.empty()) {
-      // Members added through the v1 command already have a durable record.
+      // Members added through `addsrv` already have a durable record.
       // The only record that may be absent is the bootstrap member, whose
       // advertised endpoint comes from this process's mandatory option.
       co_return "ERR missing-data-control-endpoint";
@@ -1640,11 +1641,12 @@ celer::Task<std::string> DispatchCommand(
     // A manual snapshot must serialize against the commit
     // thread — serialize_commit_ blocks the background commit until the
     // state machine's exact-cut capture returns (NuRaft semantics per
-    // raft_server.hxx create_snapshot_options). The capture is synchronous
-    // and KB-scale on the proposal executor; the durability write is handed
-    // to the state machine's writer thread, so the reply only guarantees the
-    // cut point, and compaction completes asynchronously. A round already
-    // in flight fails fast (returns 0).
+    // raft_server.hxx create_snapshot_options). The capture is synchronous on
+    // the proposal executor, bounded by kMaxMetaSnapshotBytes, and can add
+    // substantial proposal latency near that cap. The durability write is
+    // handed to the state machine's writer thread, so the reply only
+    // guarantees the cut point, and compaction completes asynchronously. A
+    // round already in flight fails fast (returns 0).
     std::shared_ptr<AsyncReply> state = std::make_shared<AsyncReply>();
     const absl::Status submitted =
         proposal_executor.Submit([server, foreign_executor, state]() mutable {

@@ -123,6 +123,12 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
          directive.payload_.size() <= kMaxMetaPayloadBytes &&
          directive.preconditions_.size() <=
              kMaxMetaDirectivePreconditionsBytes &&
+         // The fields remain in the durable/wire schema for a future
+         // operation-kind interpreter. V1 has no semantics for them, so
+         // admitting a non-default value would let the production action
+         // adapter silently weaken requested execution behavior.
+         directive.payload_.empty() && directive.preconditions_.empty() &&
+         !directive.force_ &&
          RecipientMatchesKind(directive);
 }
 

@@ -52,6 +52,44 @@ TEST(MetaControlIdentityTest, RequiresExactlyOneMatchingUriSan) {
       absl::StatusCode::kUnauthenticated);
 }
 
+TEST(MetaControlIdentityTest, LearnedDialTargetPinsItsExactPrincipal) {
+  const MetaControlEndpoint learned{
+      .host_ = "127.0.0.1",
+      .port_ = 7107,
+      .server_id_ = 7,
+      .principal_ = "keylane://meta/7",
+  };
+  control::WireMetaEndpoint hello_member{
+      .server_id = 7,
+      .host = "127.0.0.1",
+      .port = 7107,
+      .principal = "keylane://meta/7",
+  };
+  EXPECT_TRUE(ValidateDialedMetaIdentity(learned, hello_member).ok());
+
+  hello_member.principal = "keylane://meta/8";
+  EXPECT_EQ(ValidateDialedMetaIdentity(learned, hello_member).code(),
+            absl::StatusCode::kPermissionDenied);
+  hello_member.principal = "keylane://meta/7";
+  hello_member.server_id = 8;
+  EXPECT_EQ(ValidateDialedMetaIdentity(learned, hello_member).code(),
+            absl::StatusCode::kFailedPrecondition);
+}
+
+TEST(MetaControlIdentityTest, UnresolvedSeedBootstrapsFromServerHello) {
+  const MetaControlEndpoint seed{
+      .host_ = "127.0.0.1",
+      .port_ = 7107,
+  };
+  const control::WireMetaEndpoint hello_member{
+      .server_id = 7,
+      .host = "127.0.0.1",
+      .port = 7107,
+      .principal = "keylane://meta/7",
+  };
+  EXPECT_TRUE(ValidateDialedMetaIdentity(seed, hello_member).ok());
+}
+
 TEST(MetaReconnectBackoffTest, UsesFullJitterAndResetsOnlyExplicitly) {
   MetaReconnectBackoff backoff;
   EXPECT_EQ(backoff.window(), std::chrono::milliseconds(1000));

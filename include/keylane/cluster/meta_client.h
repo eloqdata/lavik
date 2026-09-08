@@ -59,6 +59,14 @@ absl::StatusOr<MetaControlEndpoint> ParseNumericControlEndpoint(
 absl::Status ValidateUniqueControlPrincipal(
     std::span<const std::string> uri_sans, std::string_view expected);
 
+// Pins a learned dial target to the exact committed member identity retained
+// from the previous directory. An unresolved static seed may bootstrap from
+// the authenticated ServerHello member; a learned endpoint may not replace
+// its principal merely by echoing a different value in that Hello.
+absl::Status ValidateDialedMetaIdentity(
+    const MetaControlEndpoint& dialed,
+    const control::WireMetaEndpoint& hello_member);
+
 // Validates the local recipient/incarnation, the directive-kind role, and an
 // exact field-for-field match with the installed FDS directive set. The live
 // session id is intentionally excluded because FDS is session independent.
@@ -208,6 +216,8 @@ struct MetaControlClientOptions {
 
 class MetaControlClientService final : public celer::Service {
  public:
+  // The installer, topology cache, and replication manager are retained by
+  // reference and must outlive Run, Stop, and the final WaitUntilQuiesced.
   static absl::StatusOr<std::unique_ptr<MetaControlClientService>> Create(
       MetaControlClientOptions options, NodeControlInstaller& installer,
       TopologyCache& topology, ReplicationManager& replication);
@@ -223,7 +233,8 @@ class MetaControlClientService final : public celer::Service {
 
   // Joins the worker-0 session, including any directive execution and the
   // final fail-closed NodeControl transition. Call after Stop() and before a
-  // graceful storage checkpoint; the hosting Runtime must still be running.
+  // graceful storage checkpoint. This call blocks and must run outside worker
+  // 0 while that worker and the hosting Runtime can still make progress.
   // Failure means native replication cleanup is uncertain and the caller must
   // not publish a normal shutdown checkpoint.
   absl::Status WaitUntilQuiesced();

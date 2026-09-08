@@ -248,10 +248,7 @@ Fixture CompleteFixture() {
   directive.population_manifest_digest_ = fixture.manifest_digest;
   directive.partition_replication_epoch_ = 1;
   directive.kind_ = "rebuild";
-  directive.payload_ = "partition=7";
-  directive.preconditions_ = "source-caught-up";
   directive.storage_mutating_ = true;
-  directive.force_ = true;
 
   keylane::meta::TransitionOperationPhase transition;
   transition.request_id_ = Bytes<16>(0x1d);
@@ -381,10 +378,10 @@ TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   EXPECT_EQ(directive.manifest_digest, fixture.manifest_digest);
   EXPECT_EQ(directive.partition_replication_epoch, 1u);
   EXPECT_EQ(directive.kind, control::WireDirectiveKind::kRebuild);
-  EXPECT_EQ(directive.payload, "partition=7");
-  EXPECT_EQ(directive.preconditions, "source-caught-up");
+  EXPECT_TRUE(directive.payload.empty());
+  EXPECT_TRUE(directive.preconditions.empty());
   EXPECT_TRUE(directive.storage_mutating);
-  EXPECT_TRUE(directive.force);
+  EXPECT_FALSE(directive.force);
 
   EXPECT_TRUE(NonZero(state.directive_set_digest));
   EXPECT_TRUE(NonZero(state.projection_hash));

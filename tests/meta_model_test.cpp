@@ -1830,6 +1830,93 @@ TEST(MetaStateApply, SetSlotMapCannotClearAnActiveGrantConfigEpoch) {
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 3u);
 }
 
+TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MakeRegisterFor(2));
+  ApplyOk(stores, 7, MakeCreateGroup("g2", 3));
+  ApplyOk(stores, 8, MakeAssign("g2", 2, 1, 4));
+
+  keylane::meta::BeginGroupTerm begin_g2;
+  begin_g2.request_id_ = MakeRequestId(0x84);
+  begin_g2.group_id_ = "g2";
+  begin_g2.expected_term_ = 0;
+  begin_g2.new_term_ = 1;
+  ApplyOk(stores, 9, MetaCommand{begin_g2});
+
+  keylane::meta::SetSlotMap initial;
+  initial.request_id_ = MakeRequestId(0x85);
+  initial.ranges_ = {{0, 8191, "g1"}, {8192, 16383, "g2"}};
+  initial.new_topology_epoch_ = 5;
+  initial.config_epochs_ = {{"g1", 1}, {"g2", 1}};
+  ApplyOk(stores, 10, MetaCommand{initial});
+  ApplyOk(stores, 11, MetaCommand{MakeActivate("g1", 1, 1, 1, 6, 1)});
+  ApplyOk(stores, 12, MetaCommand{MakeActivate("g2", 1, 2, 1, 7, 1)});
+
+  keylane::meta::SetSlotMap moved = initial;
+  moved.request_id_ = MakeRequestId(0x86);
+  moved.ranges_ = {{0, 4095, "g1"}, {4096, 16383, "g2"}};
+  moved.new_topology_epoch_ = 8;
+  moved.config_epochs_ = {{"g1", 2}, {"g2", 2}};
+  const std::string before = DomainStateBytes(stores);
+  MetaApplyResult source_live =
+      ApplyRejected(stores, 13, MetaCommand{moved});
+  EXPECT_NE(source_live.detail_.find("fenced"), std::string::npos);
+  EXPECT_EQ(DomainStateBytes(stores), before);
+
+  keylane::meta::FenceGroup fence_g1;
+  fence_g1.request_id_ = MakeRequestId(0x87);
+  fence_g1.group_id_ = "g1";
+  fence_g1.expected_term_ = 1;
+  ApplyOk(stores, 14, MetaCommand{fence_g1});
+
+  // Fencing only the source is insufficient: the destination's old lease was
+  // issued for a different slot/config projection and must not span the cut.
+  MetaApplyResult destination_live =
+      ApplyRejected(stores, 15, MetaCommand{moved});
+  EXPECT_NE(destination_live.detail_.find("g2"), std::string::npos);
+  EXPECT_EQ(stores.topology_.SlotOwner(5000),
+            std::optional<std::string>("g1"));
+  EXPECT_EQ(stores.topology_.TopologyEpoch(), 7u);
+
+  keylane::meta::FenceGroup fence_g2;
+  fence_g2.request_id_ = MakeRequestId(0x88);
+  fence_g2.group_id_ = "g2";
+  fence_g2.expected_term_ = 1;
+  ApplyOk(stores, 16, MetaCommand{fence_g2});
+  ApplyOk(stores, 17, MetaCommand{moved});
+  EXPECT_EQ(stores.topology_.SlotOwner(5000),
+            std::optional<std::string>("g2"));
+  EXPECT_EQ(stores.topology_.FindGroup("g1")->config_epoch_, 2u);
+  EXPECT_EQ(stores.topology_.FindGroup("g2")->config_epoch_, 2u);
+  EXPECT_EQ(stores.topology_.TopologyEpoch(), 8u);
+}
+
+TEST(MetaStateApply, SetSlotMapCannotChangeActiveGrantConfigEpoch) {
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 7)});
+
+  keylane::meta::SetSlotMap change_config;
+  change_config.request_id_ = MakeRequestId(0x89);
+  change_config.new_topology_epoch_ = 4;
+  change_config.config_epochs_ = {{"g1", 8}};
+  const std::string before = DomainStateBytes(stores);
+  MetaApplyResult active =
+      ApplyRejected(stores, 7, MetaCommand{change_config});
+  EXPECT_NE(active.detail_.find("fenced"), std::string::npos);
+  EXPECT_EQ(DomainStateBytes(stores), before);
+
+  keylane::meta::FenceGroup fence;
+  fence.request_id_ = MakeRequestId(0x8a);
+  fence.group_id_ = "g1";
+  fence.expected_term_ = 1;
+  ApplyOk(stores, 8, MetaCommand{fence});
+  ApplyOk(stores, 9, MetaCommand{change_config});
+  EXPECT_EQ(stores.topology_.FindGroup("g1")->config_epoch_, 8u);
+  EXPECT_EQ(stores.topology_.TopologyEpoch(), 4u);
+}
+
 // ---------------------------------------------------------------------------
 // ActivateAuthority: the atomic failover/migration commit point.
 // ---------------------------------------------------------------------------
@@ -2831,9 +2918,9 @@ TEST(MetaStateApply, AuditPruneIsReplicatedAndAudited) {
 }
 
 // ---------------------------------------------------------------------------
-// Full-matrix replay: a scripted
-// log mixing all 20 command types, accepted and rejected. The apply layer
-// locks the semantics the recovery path relies on.
+// Scripted replay across the main identity, topology, authority, policy, and
+// operation lifecycles, mixing accepted and rejected commands. The apply
+// layer locks the semantics the recovery path relies on.
 // ---------------------------------------------------------------------------
 
 struct ScriptedCommand {
@@ -2841,9 +2928,7 @@ struct ScriptedCommand {
   MetaAuditVerdict expected;
 };
 
-// The script covers every command tag at least once, interleaving
-// accepts and rejects. Revision/epoch/term tokens are pinned to the state the
-// prefix produces.
+// Revision/epoch/term tokens are pinned to the state the prefix produces.
 std::vector<ScriptedCommand> MakeCommandScript() {
   std::vector<ScriptedCommand> script;
   const auto accept = MetaAuditVerdict::kAccepted;
@@ -2945,6 +3030,16 @@ std::vector<ScriptedCommand> MakeCommandScript() {
     push(archive, accept);
     push(archive, accept);  // already archived: idempotent
   }
+  // Fence the current authority before changing its slot/config projection.
+  // RevokeGrant and FenceGroup have the same grant-store fencing effect; this
+  // placement also proves the accepted SetSlotMap path in the full matrix.
+  {
+    keylane::meta::RevokeGrant revoke;
+    revoke.request_id_ = MakeRequestId(0x43);
+    revoke.group_id_ = "g1";
+    revoke.expected_term_ = 1;
+    push(revoke, accept);
+  }
   // slot map
   {
     keylane::meta::SetSlotMap slots;
@@ -2995,13 +3090,9 @@ std::vector<ScriptedCommand> MakeCommandScript() {
     push(retire, accept);
     push(MakeAssign("g2", 2, 1), reject);  // retired node
   }
-  // grant teardown, then the policy reference clears
+  // The grant was revoked before the topology cut, so its policy reference is
+  // clear. FenceGroup remains replay-idempotent on the already-fenced group.
   {
-    keylane::meta::RevokeGrant revoke;
-    revoke.request_id_ = MakeRequestId(0x43);
-    revoke.group_id_ = "g1";
-    revoke.expected_term_ = 1;
-    push(revoke, accept);
     keylane::meta::RetirePolicy retire;
     retire.request_id_ = MakeRequestId(0x52);
     retire.policy_id_ = "p";

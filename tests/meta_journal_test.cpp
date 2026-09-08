@@ -853,7 +853,6 @@ TEST(MetaOperationStore, DirectiveRevisionTracksOnlySemanticChanges) {
   directive.grant_revision_ = 9;
   directive.partition_replication_epoch_ = 10;
   directive.kind_ = "rebuild";
-  directive.payload_ = "v1";
   directive.storage_mutating_ = true;
 
   TransitionOperationPhase first;
@@ -880,12 +879,19 @@ TEST(MetaOperationStore, DirectiveRevisionTracksOnlySemanticChanges) {
   EXPECT_EQ(store.FindOperation(id)->current_directives_[0].directive_revision_,
             101u);
 
+  TransitionOperationPhase unsupported = unchanged;
+  unsupported.expected_revision_ = 2;
+  unsupported.current_directives_[0].payload_ = "not-interpreted-in-v1";
+  EXPECT_EQ(MetaFailureClassOf(
+                store.TransitionOperationPhase(unsupported, 103)),
+            MetaFailureClass::kDomainReject);
+
   TransitionOperationPhase changed = unchanged;
   changed.expected_revision_ = 2;
-  changed.current_directives_[0].payload_ = "v2";
-  ASSERT_TRUE(store.TransitionOperationPhase(changed, 103).ok());
+  changed.current_directives_[0].target_boot_id_.fill(9);
+  ASSERT_TRUE(store.TransitionOperationPhase(changed, 104).ok());
   EXPECT_EQ(store.FindOperation(id)->current_directives_[0].directive_revision_,
-            103u);
+            104u);
 
   const auto bytes = store.Serialize();
   ASSERT_TRUE(bytes.ok()) << bytes.status();
@@ -1380,7 +1386,8 @@ TEST(MetaOperationStore, ArchiveSummaryCapEnforced) {
         store.CompleteOperation(MakeComplete(MakeOperationId(i), 0)).ok());
   }
   ASSERT_TRUE(store.ArchiveOperations(MakeArchive({101})).ok());
-  // At the cap ArchiveOperations rejects until the operator exports.
+  // At the cap ArchiveOperations rejects until the operator exports and
+  // prunes a retained summary.
   EXPECT_EQ(MetaFailureClassOf(store.ArchiveOperations(MakeArchive({102}))),
             MetaFailureClass::kDomainReject);
   // Re-archiving the already-archived seq is still an idempotent no-op.

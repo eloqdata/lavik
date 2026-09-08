@@ -99,6 +99,9 @@ MetaPopulationManifestStore::Documents() const {
   return result;
 }
 
+// Snapshot envelope described on the public API. WriteEntries is also the
+// entry layout used by the canonical digest, but that digest prepends its own
+// domain separator rather than hashing this store envelope.
 std::string MetaPopulationManifestStore::Serialize() const {
   MetaWriter writer;
   writer.WriteU16(kMetaFormatVersion);

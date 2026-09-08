@@ -327,6 +327,46 @@ bool NodeHoldsActiveGrant(const MetaStores& stores,
          state->grant_->owner_ == node_id;
 }
 
+bool GroupHasActiveGrant(const MetaStores& stores,
+                         std::string_view group_id) {
+  const auto state = stores.grant_.GroupState(group_id);
+  return state.has_value() && !state->fenced_ && state->grant_.has_value();
+}
+
+// A live lease names the projection that granted it. Moving a slot into or
+// out of that projection, or changing its config epoch, cannot ride the same
+// authority: the old and new owners could otherwise accept the same slot
+// until both sessions consume their replacement FullDesiredState. Build the
+// complete candidate first so malformed absolute maps are rejected without
+// duplicating topology-store validation, then require every affected group to
+// be grantless/fenced before publishing any part of the replacement.
+absl::Status ValidateSlotMapAuthorityTransition(
+    const MetaStores& current, const MetaTopologyStore& candidate) {
+  std::set<std::string> affected_groups;
+  for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
+    const auto before = current.topology_.SlotOwner(slot);
+    const auto after = candidate.SlotOwner(slot);
+    if (before == after) continue;
+    if (before.has_value()) affected_groups.insert(*before);
+    if (after.has_value()) affected_groups.insert(*after);
+  }
+  for (const MetaTopologyGroupView& before : current.topology_.Groups()) {
+    const auto after = candidate.FindGroup(before.group_id_);
+    if (after.has_value() &&
+        before.config_epoch_ != after->config_epoch_) {
+      affected_groups.insert(before.group_id_);
+    }
+  }
+  for (const std::string& group_id : affected_groups) {
+    if (GroupHasActiveGrant(current, group_id)) {
+      return MetaDomainRejectError(absl::StrCat(
+          "slot ownership or config epoch change for group ", group_id,
+          " requires its active grant to be fenced first"));
+    }
+  }
+  return absl::OkStatus();
+}
+
 // The replay predicate of ActivateAuthority: BOTH halves already carry
 // exactly this command's post-effect (grant half: the same predicate the
 // grant store's GrantMatches uses; topology half: owner, authority_version,
@@ -511,18 +551,17 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       absl::StrCat("SetSlotMap ranges=", cmd.ranges_.size(),
                    " topology_epoch=", cmd.new_topology_epoch_,
                    " config_epochs=", cmd.config_epochs_.size());
-  for (const MetaGroupConfigEpoch& entry : cmd.config_epochs_) {
-    const auto grant = stores.grant_.GroupState(entry.group_id_);
-    if (entry.config_epoch_ == 0 && grant.has_value() &&
-        grant->grant_.has_value()) {
-      return Rejected(absl::StrCat("active grant for group ", entry.group_id_,
-                                   " requires a nonzero config epoch"),
-                      std::move(summary));
-    }
+  MetaTopologyStore candidate = stores.topology_;
+  if (const absl::Status applied = candidate.Apply(cmd); !applied.ok()) {
+    return Rejected(applied, std::move(summary));
   }
-  // Remaining checks are store-internal (range structure, group references,
-  // epoch rule): the slot map references only groups, which topology owns.
-  return FromStatus(stores.topology_.Apply(cmd), std::move(summary));
+  if (const absl::Status safe =
+          ValidateSlotMapAuthorityTransition(stores, candidate);
+      !safe.ok()) {
+    return Rejected(safe, std::move(summary));
+  }
+  stores.topology_ = std::move(candidate);
+  return Accepted(std::move(summary));
 }
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,

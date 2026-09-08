@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -212,6 +213,7 @@ PreparedFullState FullState(
         .group_term_ = group->group_term_,
         .authority_version_ = group->authority_version_,
         .grant_revision_ = group->grant_revision_,
+        .config_epoch_ = group->config_epoch_,
         .manifest_revision_ = group->manifest_revision_,
         .manifest_digest_ = Digest(4),
         .partition_replication_epoch_ = kPartitionReplicationEpoch,
@@ -240,6 +242,7 @@ PreparedFullState LocalSourceFullState(
         .group_term_ = group->group_term_,
         .authority_version_ = group->authority_version_,
         .grant_revision_ = group->grant_revision_,
+        .config_epoch_ = group->config_epoch_,
         .manifest_revision_ = group->manifest_revision_,
         .manifest_digest_ = Digest(4),
         .partition_replication_epoch_ = kPartitionReplicationEpoch,
@@ -523,7 +526,7 @@ class LeaseExpiryService final : public celer::Service {
         .session_ = Session(1),
         .projection_ = Basis(10, 2),
         .anchor_ = Anchor(*state),
-        .sent_at_ = std::chrono::steady_clock::now(),
+        .sent_at_ = LeaseClockNow(),
         .granted_duration_ = 100ms,
     };
     expirations_before_ = GetClusterControlMetrics().lease_expirations_;
@@ -540,7 +543,7 @@ class LeaseExpiryService final : public celer::Service {
       server_->RequestStop();
       co_return result_;
     }
-    grant.sent_at_ = std::chrono::steady_clock::now();
+    grant.sent_at_ = LeaseClockNow();
     grant.granted_duration_ = 150ms;
     result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
     if (!result_.ok()) {
@@ -559,8 +562,7 @@ class LeaseExpiryService final : public celer::Service {
     constexpr std::array<std::uint16_t, 1> slots{12};
     old_timer_preserved_lease_ =
         control_.guard
-                .CaptureAndAdmit(WriteRequest(slots),
-                                 std::chrono::steady_clock::now())
+                .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
                 .decision()
                 .kind_ == Decision::Kind::kServe &&
         control_.actions.async_revocations_ == 0;
@@ -572,11 +574,10 @@ class LeaseExpiryService final : public celer::Service {
       co_return result_;
     }
     expired_ = control_.guard
-                   .CaptureAndAdmit(WriteRequest(slots),
-                                    std::chrono::steady_clock::now())
+                   .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
                    .decision()
                    .kind_ == Decision::Kind::kClusterDownUnbound;
-    grant.sent_at_ = std::chrono::steady_clock::now();
+    grant.sent_at_ = LeaseClockNow();
     grant.granted_duration_ = 100ms;
     renewal_blocked_during_expiry_ =
         (co_await control_.installer.ApplyLeaseGrantTransition(grant)).code() ==
@@ -588,7 +589,7 @@ class LeaseExpiryService final : public celer::Service {
     while (!control_.actions.revocation_exited_) {
       co_await celer::Yield(worker);
     }
-    grant.sent_at_ = std::chrono::steady_clock::now();
+    grant.sent_at_ = LeaseClockNow();
     renewal_succeeded_after_expiry_ =
         (co_await control_.installer.ApplyLeaseGrantTransition(grant)).ok();
     revocations_ = control_.actions.async_revocations_;
@@ -612,6 +613,97 @@ class LeaseExpiryService final : public celer::Service {
   std::uint64_t expirations_before_ = 0;
   std::uint64_t expirations_after_ = 0;
   absl::Status result_ = absl::UnknownError("lease expiry service did not run");
+};
+
+// Blocks the sole worker across the first deadline so the ordinary timer
+// cannot run before a renewal is delivered. This models a host resume or an
+// event-loop stall without requiring a privileged suspend operation.
+class DelayedLeaseExpiryRenewalService final : public celer::Service {
+ public:
+  explicit DelayedLeaseExpiryRenewalService(celer::Server* server)
+      : server_(server) {}
+
+  void Prepare(unsigned thread_count) override {
+    prepared_ = thread_count == 1;
+  }
+
+  celer::Task<absl::Status> Run(celer::Worker& /*worker*/,
+                                celer::ServiceContext) override {
+    if (!prepared_) {
+      result_ = absl::FailedPreconditionError(
+          "delayed lease expiry test requires one worker");
+      server_->RequestStop();
+      co_return result_;
+    }
+    if (absl::Status ready = control_.installer.SetStorageReady(true);
+        !ready.ok()) {
+      result_ = ready;
+      server_->RequestStop();
+      co_return result_;
+    }
+    if (absl::Status installed = control_.installer.InstallFullState(
+            FullState(MakeState(), 3), Basis(10, 2));
+        !installed.ok()) {
+      result_ = installed;
+      server_->RequestStop();
+      co_return result_;
+    }
+
+    const auto state = control_.cache.Current();
+    AuthorityMessage grant{
+        .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+        .session_ = Session(1),
+        .projection_ = Basis(10, 2),
+        .anchor_ = Anchor(*state),
+        .sent_at_ = LeaseClockNow(),
+        .granted_duration_ = 20ms,
+    };
+    result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
+    if (!result_.ok()) {
+      server_->RequestStop();
+      co_return result_;
+    }
+
+    constexpr std::array<std::uint16_t, 1> slots{12};
+    old_admission_ =
+        control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow());
+    old_admitted_ =
+        old_admission_->decision().kind_ == Decision::Kind::kServe;
+    expirations_before_ = GetClusterControlMetrics().lease_expirations_;
+
+    // Do not yield: the deadline passes while the timer remains queued.
+    std::this_thread::sleep_for(40ms);
+    grant.sent_at_ = LeaseClockNow();
+    grant.granted_duration_ = 1s;
+    result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
+    if (result_.ok()) {
+      old_rejected_after_renewal_ =
+          control_.guard.Recheck(*old_admission_, LeaseClockNow()) ==
+          RecheckResult::kReject;
+      new_admission_serves_ =
+          control_.guard
+                  .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
+                  .decision()
+                  .kind_ == Decision::Kind::kServe;
+    }
+    expirations_after_ = GetClusterControlMetrics().lease_expirations_;
+    server_->RequestStop();
+    co_return result_;
+  }
+
+  void Stop() noexcept override {}
+
+  celer::Server* server_;
+  DynamicControl control_;
+  bool prepared_ = false;
+  bool old_admitted_ = false;
+  bool old_rejected_after_renewal_ = false;
+  bool new_admission_serves_ = false;
+  std::optional<AuthorityAdmission> old_admission_;
+  std::uint64_t expirations_before_ = 0;
+  std::uint64_t expirations_after_ = 0;
+  absl::Status result_ =
+      absl::UnknownError("delayed lease expiry renewal service did not run");
 };
 
 class FenceDirectiveAdmissionService final : public celer::Service {
@@ -1067,12 +1159,48 @@ TEST(NodeControlInstallerTest, FiniteAuthorityRequiresAnExactLeaseGrant) {
       .sent_at_ = now,
       .granted_duration_ = 5s,
   };
-  ASSERT_TRUE(control.installer.ApplyAuthority(grant).ok());
+  ASSERT_TRUE(control.installer.ApplyAuthority(grant, now).ok());
 
   const AuthorityAdmission admission =
       control.guard.CaptureAndAdmit(WriteRequest(slots), now + 1s);
   EXPECT_EQ(admission.decision().kind_, Decision::Kind::kServe);
   EXPECT_EQ(control.guard.Recheck(admission, now + 2s), RecheckResult::kOk);
+}
+
+TEST(NodeControlInstallerTest,
+     SuspendAwareLeaseClockJumpRejectsOldAuthoritySynchronously) {
+  DynamicControl control;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(control.installer
+                  .InstallFullState(FullState(MakeState(), 3), Basis(10, 2))
+                  .ok());
+  const MonotonicTime before_suspend{};
+  const auto state = control.cache.Current();
+  ASSERT_TRUE(control.installer
+                  .ApplyAuthority(AuthorityMessage{
+                      .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+                      .session_ = Session(1),
+                      .projection_ = Basis(10, 2),
+                      .anchor_ = Anchor(*state),
+                      .sent_at_ = before_suspend,
+                      .granted_duration_ = 5s,
+                  }, before_suspend)
+                  .ok());
+
+  constexpr std::array<std::uint16_t, 1> slots{12};
+  EXPECT_EQ(control.guard
+                .CaptureAndAdmit(WriteRequest(slots), before_suspend + 1s)
+                .decision()
+                .kind_,
+            Decision::Kind::kServe);
+  // Production supplies this value from CLOCK_BOOTTIME. A host suspend can
+  // jump it past the deadline even when Celer's CLOCK_MONOTONIC timer has not
+  // resumed yet, so the request path itself must fail closed.
+  EXPECT_EQ(control.guard
+                .CaptureAndAdmit(WriteRequest(slots), before_suspend + 20s)
+                .decision()
+                .kind_,
+            Decision::Kind::kClusterDownUnbound);
 }
 
 TEST(NodeControlInstallerTest,
@@ -1091,14 +1219,17 @@ TEST(NodeControlInstallerTest,
       .sent_at_ = MonotonicTime{},
       .granted_duration_ = 5s,
   };
-  ASSERT_TRUE(control.installer.ApplyAuthority(grant).ok());
+  ASSERT_TRUE(
+      control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
 
   constexpr std::array<std::uint16_t, 1> slots{12};
   const AuthorityAdmission before =
       control.guard.CaptureAndAdmit(WriteRequest(slots), MonotonicTime{} + 1s);
   grant.sent_at_ = MonotonicTime{} + 4s;
   grant.granted_duration_ = 10s;
-  ASSERT_TRUE(control.installer.ApplyAuthority(grant).ok());
+  ASSERT_TRUE(control.installer
+                  .ApplyAuthority(grant, MonotonicTime{} + 4s)
+                  .ok());
 
   EXPECT_EQ(control.guard.Recheck(before, MonotonicTime{} + 8s),
             RecheckResult::kOk);
@@ -1123,7 +1254,7 @@ TEST(NodeControlInstallerTest,
                       .anchor_ = anchor,
                       .sent_at_ = MonotonicTime{},
                       .granted_duration_ = 5s,
-                  })
+                  }, MonotonicTime{})
                   .ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
   EXPECT_EQ(
@@ -1179,7 +1310,7 @@ TEST(NodeControlInstallerTest, CountsOneLocalExpirationPerExpiredLease) {
                       .anchor_ = Anchor(*state),
                       .sent_at_ = MonotonicTime{},
                       .granted_duration_ = 1s,
-                  })
+                  }, MonotonicTime{})
                   .ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
   const std::uint64_t before = GetClusterControlMetrics().lease_expirations_;
@@ -1208,7 +1339,8 @@ TEST(NodeControlInstallerTest,
                                    .projection_ = Basis(10, 2),
                                    .anchor_ = Anchor(*state),
                                    .sent_at_ = MonotonicTime{},
-                                   .granted_duration_ = 10s})
+                                   .granted_duration_ = 10s},
+                                  MonotonicTime{})
                   .ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
   const AuthorityAdmission admission =
@@ -1238,14 +1370,16 @@ TEST(NodeControlInstallerTest,
       .sent_at_ = MonotonicTime{},
       .granted_duration_ = 10s,
   };
-  ASSERT_TRUE(control.installer.ApplyAuthority(grant).ok());
+  ASSERT_TRUE(
+      control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
   const AuthorityAdmission admission =
       control.guard.CaptureAndAdmit(WriteRequest(slots), MonotonicTime{} + 1s);
 
   AuthorityMessage fence = grant;
   fence.kind_ = AuthorityMessage::Kind::kFence;
-  ASSERT_TRUE(control.installer.ApplyAuthority(fence).ok());
+  ASSERT_TRUE(
+      control.installer.ApplyAuthority(fence, MonotonicTime{}).ok());
 
   EXPECT_EQ(control.guard.Recheck(admission, MonotonicTime{} + 2s),
             RecheckResult::kReject);
@@ -1255,7 +1389,7 @@ TEST(NodeControlInstallerTest,
   EXPECT_EQ(control.actions.revocations_, 1);
   ASSERT_EQ(control.actions.drained_.size(), 1U);
   EXPECT_EQ(control.actions.drained_.front(), fence.anchor_);
-  EXPECT_EQ(control.installer.ApplyAuthority(grant).code(),
+  EXPECT_EQ(control.installer.ApplyAuthority(grant, MonotonicTime{}).code(),
             absl::StatusCode::kFailedPrecondition);
 }
 
@@ -1449,6 +1583,27 @@ TEST(NodeControlInstallerTest,
 }
 
 TEST(NodeControlInstallerTest,
+     ExpiredLeaseCannotBeRevivedBeforeDelayedTimerRuns) {
+  celer::Server server;
+  DelayedLeaseExpiryRenewalService service(&server);
+  server.AddService(&service);
+  celer::ServerOptions options;
+  options.thread_count_ = 1;
+  options.pin_workers_ = false;
+  options.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(options).ok());
+  server.WaitUntilStopped();
+
+  EXPECT_TRUE(service.result_.ok()) << service.result_;
+  EXPECT_TRUE(service.old_admitted_);
+  EXPECT_TRUE(service.old_rejected_after_renewal_);
+  EXPECT_TRUE(service.new_admission_serves_);
+  EXPECT_EQ(service.control_.actions.async_revocations_, 1);
+  EXPECT_EQ(service.control_.actions.drained_.size(), 1u);
+  EXPECT_EQ(service.expirations_after_, service.expirations_before_ + 1);
+}
+
+TEST(NodeControlInstallerTest,
      FullStateIsIdempotentAndSameIndexEquivocationLosesTheSession) {
   DynamicControl control;
   ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
@@ -1503,12 +1658,13 @@ TEST(NodeControlInstallerTest,
       .sent_at_ = MonotonicTime{},
       .granted_duration_ = 10s,
   };
-  ASSERT_TRUE(control.installer.ApplyAuthority(grant).ok());
+  ASSERT_TRUE(
+      control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
   control.actions.receives_directives_ = true;
 
   AuthorityMessage fence = grant;
   fence.kind_ = AuthorityMessage::Kind::kFence;
-  EXPECT_EQ(control.installer.ApplyAuthority(fence).code(),
+  EXPECT_EQ(control.installer.ApplyAuthority(fence, MonotonicTime{}).code(),
             absl::StatusCode::kFailedPrecondition);
   EXPECT_TRUE(control.cache.Current()->FindGroup("group-a")->granted_);
 
@@ -1557,6 +1713,65 @@ TEST(NodeControlInstallerTest, FullStateRejectsIndexAndDomainRegressions) {
           .InstallFullState(FullState(MakeState(Assignment(2), 2, 1, 1, 0), 6),
                             Basis(12, 6))
           .ok());
+}
+
+TEST(NodeControlInstallerTest,
+     OwnerlessGroupRejectsSameMembershipControlCounterRegression) {
+  DynamicControl control;
+  PreparedFullState ownerless{
+      .serving_state_ = MakeOwnerlessState(),
+      .object_hash_ = Digest(3),
+      .control_groups_ = {{.group_id_ = "group-a",
+                           .group_term_ = 5,
+                           .authority_version_ = 5,
+                           .grant_revision_ = 5,
+                           .config_epoch_ = 5,
+                           .manifest_revision_ = 5,
+                           .manifest_digest_ = Digest(4),
+                           .partition_replication_epoch_ = 5,
+                           .members_ = {{.node_id_ = *NodeId::Parse(kNodeA),
+                                         .assignment_id_ = Assignment(1)},
+                                        {.node_id_ = *NodeId::Parse(kNodeB),
+                                         .assignment_id_ = Assignment(2)}}}},
+  };
+  ASSERT_TRUE(control.installer
+                  .InstallFullState(ownerless, Basis(10, 2))
+                  .ok());
+
+  const auto expect_rejected = [&](PreparedFullState candidate,
+                                   std::uint8_t hash) {
+    candidate.object_hash_ = Digest(hash);
+    EXPECT_EQ(control.installer
+                  .InstallFullState(std::move(candidate), Basis(11, hash))
+                  .code(),
+              absl::StatusCode::kFailedPrecondition);
+  };
+  PreparedFullState candidate = ownerless;
+  candidate.control_groups_[0].group_term_ = 4;
+  expect_rejected(std::move(candidate), 3);
+  candidate = ownerless;
+  candidate.control_groups_[0].authority_version_ = 4;
+  expect_rejected(std::move(candidate), 4);
+  candidate = ownerless;
+  candidate.control_groups_[0].grant_revision_ = 4;
+  expect_rejected(std::move(candidate), 5);
+  candidate = ownerless;
+  candidate.control_groups_[0].config_epoch_ = 4;
+  expect_rejected(std::move(candidate), 6);
+  candidate = ownerless;
+  candidate.control_groups_[0].manifest_revision_ = 4;
+  expect_rejected(std::move(candidate), 7);
+  candidate = ownerless;
+  candidate.control_groups_[0].partition_replication_epoch_ = 4;
+  expect_rejected(std::move(candidate), 8);
+
+  candidate = ownerless;
+  candidate.object_hash_ = Digest(9);
+  candidate.control_groups_[0].manifest_digest_ = Digest(9);
+  EXPECT_EQ(control.installer
+                .InstallFullState(std::move(candidate), Basis(11, 9))
+                .code(),
+            absl::StatusCode::kDataLoss);
 }
 
 TEST(NodeControlInstallerTest,
@@ -1610,11 +1825,12 @@ TEST(NodeControlInstallerTest,
       .sent_at_ = MonotonicTime{},
       .granted_duration_ = 5s,
   };
-  EXPECT_EQ(control.installer.ApplyAuthority(grant).code(),
+  EXPECT_EQ(control.installer.ApplyAuthority(grant, MonotonicTime{}).code(),
             absl::StatusCode::kUnavailable);
 
   in_flight.reset();
-  EXPECT_TRUE(control.installer.ApplyAuthority(grant).ok());
+  EXPECT_TRUE(
+      control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
 }
 
 TEST(NodeControlInstallerTest,
@@ -1772,22 +1988,20 @@ TEST(NodeControlInstallerTest,
                       .session_ = session,
                       .projection_ = Basis(10, 2),
                       .anchor_ = Anchor(*current),
-                      .sent_at_ = std::chrono::steady_clock::now(),
+                      .sent_at_ = LeaseClockNow(),
                       .granted_duration_ = 1h,
-                  })
+                  }, LeaseClockNow())
                   .ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
   EXPECT_EQ(control.guard
-                .CaptureAndAdmit(WriteRequest(slots),
-                                 std::chrono::steady_clock::now())
+                .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
                 .decision()
                 .kind_,
             Decision::Kind::kServe);
 
   ASSERT_TRUE(control.installer.InvalidateSessionNow(session).ok());
   EXPECT_NE(control.guard
-                .CaptureAndAdmit(WriteRequest(slots),
-                                 std::chrono::steady_clock::now())
+                .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
                 .decision()
                 .kind_,
             Decision::Kind::kServe);
@@ -1813,7 +2027,7 @@ TEST(NodeControlInstallerTest,
                       .anchor_ = Anchor(*state),
                       .sent_at_ = MonotonicTime{},
                       .granted_duration_ = 5s,
-                  })
+                  }, MonotonicTime{})
                   .ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
   const AuthorityAdmission admitted =
@@ -1862,11 +2076,20 @@ TEST(NodeControlInstallerTest, DirectiveRequiresCurrentProjectionAndAuthority) {
       .manifest_revision_ = 1,
       .manifest_digest_ = Digest(4),
       .partition_replication_epoch_ = kPartitionReplicationEpoch,
-      .payload_ = "opaque",
       .storage_mutating_ = true,
   };
   EXPECT_TRUE(RunTaskSync(control.installer.ApplyDirective(directive)).ok());
   ASSERT_EQ(control.actions.directives_.size(), 1U);
+
+  for (int reserved_field = 0; reserved_field != 3; ++reserved_field) {
+    NodeDirective unsupported = directive;
+    if (reserved_field == 0) unsupported.payload_ = "opaque";
+    if (reserved_field == 1) unsupported.preconditions_ = "source-ready";
+    if (reserved_field == 2) unsupported.force_ = true;
+    EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(unsupported)).code(),
+              absl::StatusCode::kInvalidArgument);
+    EXPECT_EQ(control.actions.directives_.size(), 1U);
+  }
 
   directive.source_assignment_id_ = Assignment(2);
   EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(directive)).code(),

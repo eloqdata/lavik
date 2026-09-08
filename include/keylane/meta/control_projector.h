@@ -7,6 +7,7 @@
 // bytes that can be published or chunked later. It performs no I/O and owns
 // no mutable state.
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -22,6 +23,12 @@ struct NodeControlBatch {
 
   bool operator==(const NodeControlBatch&) const = default;
 };
+
+// Conservatively counts the batch object and the capacities of every owned
+// string/vector. Allocator metadata is outside the C++ object model; callers
+// use this retained-capacity weight rather than the canonical wire length.
+std::size_t NodeControlBatchRetainedBytes(
+    const NodeControlBatch& batch) noexcept;
 
 class MetaControlProjector {
  public:

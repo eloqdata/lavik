@@ -266,9 +266,10 @@ class ReplicationManager {
                                RebuildDirective directive,
                                PopulationManifest manifest);
 
-  // Starts and awaits one full rebuild. This is the NodeControl action seam;
-  // success means the exact attempt published its ReadyToken after storage
-  // promotion, not merely that a coordinator was launched.
+  // Convenience wrapper that starts and awaits one full rebuild. Production
+  // NodeControl uses StartClusterRebuildDirective so wire admission and later
+  // terminal observation remain distinct; this wrapper returns success only
+  // after the exact attempt publishes its ReadyToken following promotion.
   celer::Task<absl::Status> ApplyClusterRebuildDirective(
       ReplicaOfConfig upstream, RebuildDirective directive,
       PopulationManifest manifest);

@@ -171,7 +171,7 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
         store, partition, db_id, key, digest, *payload, RecordKind::kValue,
         old_version.root_.value_type(), old_version.root_.expire_at_ms_,
         compensation, old_version.root_.logical_size_, nullptr, nullptr,
-        nullptr, nullptr, true, replacement_undo, &mutation);
+        nullptr, nullptr, true, replacement_undo, nullptr, &mutation);
   } catch (const std::bad_alloc&) {
     // A compensation failure is reported to the ingest driver, which must
     // poison the outer decision rather than commit a partially restored key.

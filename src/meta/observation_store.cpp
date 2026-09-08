@@ -1,5 +1,6 @@
 #include "keylane/meta/observation_store.h"
 
+#include <cassert>
 #include <deque>
 #include <map>
 #include <optional>
@@ -84,11 +85,55 @@ absl::Status CheckPopulationAnchor(std::string_view group_id,
   return absl::OkStatus();
 }
 
-absl::Status CheckFieldSize(std::string_view field, std::string_view name) {
-  if (field.size() > kMaxObsFieldBytes) {
+absl::Status CheckFieldSize(std::string_view field, std::size_t max_bytes,
+                            std::string_view name) {
+  if (field.size() > max_bytes) {
     return MetaDomainRejectError("field-too-large:" + std::string(name));
   }
   return absl::OkStatus();
+}
+
+// Logical charged bytes conservatively cover every variable-length string
+// retained by an observation and its lookup indexes. Candidate group keys are
+// charged once per entry even though the outer map shares one key; this keeps
+// replacement/removal accounting local and never undercounts allocations.
+// Fixed-size identities, map nodes, and string objects are bounded by the
+// independent entry/session/domain count limits.
+std::uint64_t ChargedBytes(const MetaObservation& observation) {
+  const auto bytes = [](std::string_view value) -> std::uint64_t {
+    return static_cast<std::uint64_t>(value.size());
+  };
+  const std::uint64_t identity_node = bytes(observation.identity_.node_id_);
+  if (std::holds_alternative<MetaNodeBootObs>(observation.payload_)) {
+    return 2 * identity_node;  // identity plus boot_by_node_ key
+  }
+  if (const auto* health =
+          std::get_if<MetaNodeHealthObs>(&observation.payload_)) {
+    return 2 * identity_node + bytes(health->health_);
+  }
+  if (const auto* candidate =
+          std::get_if<MetaCandidateProgressObs>(&observation.payload_)) {
+    return identity_node + bytes(candidate->node_id_) +
+           2 * bytes(candidate->group_id_) +
+           bytes(candidate->applied_flow_vector_) +
+           bytes(candidate->backlog_coverage_) +
+           bytes(candidate->readiness_) + identity_node;
+  }
+  const auto& evidence =
+      std::get<MetaOperationEvidenceObs>(observation.payload_);
+  return identity_node + bytes(evidence.node_id_) +
+         2 * bytes(evidence.kind_phase_) + bytes(evidence.evidence_) +
+         bytes(evidence.group_id_) + identity_node;
+}
+
+bool ExceedsReplacementBudget(std::uint64_t current,
+                              std::uint64_t replaced,
+                              std::uint64_t incoming,
+                              std::uint64_t limit) {
+  assert(current >= replaced);
+  // Written without addition so a caller-supplied UINT64_MAX limit cannot
+  // turn an overflowing sum into an admission.
+  return incoming > limit || current - replaced > limit - incoming;
 }
 
 }  // namespace
@@ -114,15 +159,81 @@ struct MetaObservationStore::Impl {
     }
   };
 
-  std::size_t TotalObservations() const {
-    std::size_t total = boot_by_node_.size() + health_by_node_.size();
-    for (const auto& [group_id, by_node] : candidates_by_group_) {
-      total += by_node.size();
+  struct NodeUsage {
+    std::size_t observations_ = 0;
+    std::size_t evidence_phases_ = 0;
+    std::uint64_t retained_bytes_ = 0;
+  };
+
+  std::size_t TotalObservations() const { return total_observations_; }
+
+  std::uint64_t NodeRetainedBytes(std::string_view node_id) const {
+    const auto it = usage_by_node_.find(std::string(node_id));
+    return it == usage_by_node_.end() ? 0 : it->second.retained_bytes_;
+  }
+
+  std::size_t NodeEvidencePhases(std::string_view node_id) const {
+    const auto it = usage_by_node_.find(std::string(node_id));
+    return it == usage_by_node_.end() ? 0 : it->second.evidence_phases_;
+  }
+
+  absl::Status CheckByteBudget(const MetaObservation& observation,
+                               const MetaObservation* replaced,
+                               const Limits& limits) const {
+    const std::string& node_id = observation.identity_.node_id_;
+    const std::uint64_t incoming = ChargedBytes(observation);
+    const std::uint64_t old = replaced == nullptr ? 0 : ChargedBytes(*replaced);
+    if (ExceedsReplacementBudget(retained_bytes_, old, incoming,
+                                 limits.max_retained_bytes_total_)) {
+      return MetaDomainRejectError("store-bytes-full");
     }
-    for (const auto& [operation_id, by_key] : evidence_by_operation_) {
-      total += by_key.size();
+    if (ExceedsReplacementBudget(NodeRetainedBytes(node_id), old, incoming,
+                                 limits.max_retained_bytes_per_node_)) {
+      return MetaDomainRejectError("node-bytes-full");
     }
-    return total;
+    return absl::OkStatus();
+  }
+
+  void AccountInsert(const MetaObservation& observation, bool evidence) {
+    const std::string& node_id = observation.identity_.node_id_;
+    const std::uint64_t charged = ChargedBytes(observation);
+    NodeUsage& usage = usage_by_node_[node_id];
+    ++usage.observations_;
+    usage.evidence_phases_ += evidence ? 1 : 0;
+    usage.retained_bytes_ += charged;
+    ++total_observations_;
+    retained_bytes_ += charged;
+  }
+
+  void AccountReplace(std::string_view node_id, std::uint64_t old_bytes,
+                      std::uint64_t new_bytes) {
+    NodeUsage& usage = usage_by_node_.at(std::string(node_id));
+    assert(usage.retained_bytes_ >= old_bytes);
+    assert(retained_bytes_ >= old_bytes);
+    usage.retained_bytes_ = usage.retained_bytes_ - old_bytes + new_bytes;
+    retained_bytes_ = retained_bytes_ - old_bytes + new_bytes;
+  }
+
+  void AccountErase(const MetaObservation& observation, bool evidence) {
+    const std::string& node_id = observation.identity_.node_id_;
+    const std::uint64_t charged = ChargedBytes(observation);
+    auto usage_it = usage_by_node_.find(node_id);
+    assert(usage_it != usage_by_node_.end());
+    NodeUsage& usage = usage_it->second;
+    assert(usage.observations_ != 0 && total_observations_ != 0);
+    assert(usage.retained_bytes_ >= charged && retained_bytes_ >= charged);
+    if (evidence) {
+      assert(usage.evidence_phases_ != 0);
+      --usage.evidence_phases_;
+    }
+    --usage.observations_;
+    --total_observations_;
+    usage.retained_bytes_ -= charged;
+    retained_bytes_ -= charged;
+    if (usage.observations_ == 0) {
+      assert(usage.evidence_phases_ == 0 && usage.retained_bytes_ == 0);
+      usage_by_node_.erase(usage_it);
+    }
   }
 
   // Identity gate shared by ingest, commit-driven revalidation, and read
@@ -162,7 +273,7 @@ struct MetaObservationStore::Impl {
       return absl::OkStatus();
     }
     if (const auto* health = std::get_if<MetaNodeHealthObs>(&payload)) {
-      return CheckFieldSize(health->health_, "health");
+      return CheckFieldSize(health->health_, kMaxObsFieldBytes, "health");
     }
     if (const auto* candidate =
             std::get_if<MetaCandidateProgressObs>(&payload)) {
@@ -189,16 +300,19 @@ struct MetaObservationStore::Impl {
       // has no committed history anchor; operation-specific comparison rules
       // consume the value as opaque payload.
       if (const absl::Status size =
-              CheckFieldSize(candidate->applied_flow_vector_, "flow");
+              CheckFieldSize(candidate->applied_flow_vector_,
+                             kMaxObsFieldBytes, "flow");
           !size.ok()) {
         return size;
       }
       if (const absl::Status size =
-              CheckFieldSize(candidate->backlog_coverage_, "backlog");
+              CheckFieldSize(candidate->backlog_coverage_, kMaxObsFieldBytes,
+                             "backlog");
           !size.ok()) {
         return size;
       }
-      return CheckFieldSize(candidate->readiness_, "readiness");
+      return CheckFieldSize(candidate->readiness_, kMaxObsFieldBytes,
+                            "readiness");
     }
     const auto& evidence = std::get<MetaOperationEvidenceObs>(payload);
     if (evidence.node_id_ != observation.identity_.node_id_) {
@@ -226,12 +340,14 @@ struct MetaObservationStore::Impl {
       return MetaDomainRejectError("history-not-bound");
     }
     if (const absl::Status size =
-            CheckFieldSize(evidence.kind_phase_, "kind_phase");
+            CheckFieldSize(evidence.kind_phase_,
+                           cluster::control::kMaxIdentifierBytes,
+                           "kind_phase");
         !size.ok()) {
       return size;
     }
     if (const absl::Status size =
-            CheckFieldSize(evidence.evidence_, "evidence");
+            CheckFieldSize(evidence.evidence_, kMaxObsFieldBytes, "evidence");
         !size.ok()) {
       return size;
     }
@@ -250,25 +366,35 @@ struct MetaObservationStore::Impl {
     while (audit_ring_.size() >= ring_capacity) {
       audit_ring_.pop_front();  // bounded ring: the oldest event is sacrificed
     }
-    audit_ring_.push_back(MetaObsAuditEvent{
-        kind, node_id, BoundedDetail(std::move(detail)), now_unix_ms});
+    audit_ring_.push_back(
+        MetaObsAuditEvent{kind, BoundedDetail(node_id),
+                          BoundedDetail(std::move(detail)), now_unix_ms});
   }
 
   // Drops every observation of one node from all four buckets, auditing each
   // drop. Buckets left empty are erased so TotalObservations stays exact.
   void PurgeNode(const std::string& node_id, const std::string& detail,
                  std::int64_t now_unix_ms, std::size_t ring_capacity) {
-    if (boot_by_node_.erase(node_id) != 0) {
+    if (const auto it = boot_by_node_.find(node_id);
+        it != boot_by_node_.end()) {
+      AccountErase(it->second, false);
+      boot_by_node_.erase(it);
       Audit(MetaObsAuditKind::kStalePurged, node_id, detail, now_unix_ms,
             ring_capacity);
     }
-    if (health_by_node_.erase(node_id) != 0) {
+    if (const auto it = health_by_node_.find(node_id);
+        it != health_by_node_.end()) {
+      AccountErase(it->second, false);
+      health_by_node_.erase(it);
       Audit(MetaObsAuditKind::kStalePurged, node_id, detail, now_unix_ms,
             ring_capacity);
     }
     for (auto it = candidates_by_group_.begin();
          it != candidates_by_group_.end();) {
-      if (it->second.erase(node_id) != 0) {
+      if (const auto node_it = it->second.find(node_id);
+          node_it != it->second.end()) {
+        AccountErase(node_it->second, false);
+        it->second.erase(node_it);
         Audit(MetaObsAuditKind::kStalePurged, node_id, detail, now_unix_ms,
               ring_capacity);
       }
@@ -282,6 +408,7 @@ struct MetaObservationStore::Impl {
          it != evidence_by_operation_.end();) {
       for (auto key_it = it->second.begin(); key_it != it->second.end();) {
         if (key_it->first.node_id_ == node_id) {
+          AccountErase(key_it->second, true);
           key_it = it->second.erase(key_it);
           Audit(MetaObsAuditKind::kStalePurged, node_id, detail, now_unix_ms,
                 ring_capacity);
@@ -295,6 +422,7 @@ struct MetaObservationStore::Impl {
         ++it;
       }
     }
+    assert(!usage_by_node_.contains(node_id));
   }
 
   std::map<std::string, Session> sessions_;
@@ -311,6 +439,9 @@ struct MetaObservationStore::Impl {
   // trail (that is MetaAuditStore).
   std::deque<MetaObsAuditEvent> audit_ring_;
   std::optional<std::int64_t> last_periodic_sweep_unix_ms_;
+  std::map<std::string, NodeUsage> usage_by_node_;
+  std::size_t total_observations_ = 0;
+  std::uint64_t retained_bytes_ = 0;
 };
 
 MetaObservationStore::MetaObservationStore(Limits limits)
@@ -327,6 +458,12 @@ absl::Status MetaObservationStore::AdoptSession(
     const MetaObservationIdentity& identity, int64_t now_unix_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
   Impl& impl = *impl_;
+  if (identity.node_id_.empty() || identity.node_id_.size() > kMetaNodeIdBytes) {
+    const std::string detail = "bad-node-id";
+    impl.Audit(MetaObsAuditKind::kRejected, identity.node_id_, detail,
+               now_unix_ms, limits_.audit_ring_capacity_);
+    return MetaDomainRejectError(detail);
+  }
   const auto it = impl.sessions_.find(identity.node_id_);
   if (it != impl.sessions_.end() &&
       identity.session_generation_ <= it->second.generation_) {
@@ -337,6 +474,13 @@ absl::Status MetaObservationStore::AdoptSession(
         "stale-session-generation:current=" +
         std::to_string(it->second.generation_) +
         ",got=" + std::to_string(identity.session_generation_);
+    impl.Audit(MetaObsAuditKind::kRejected, identity.node_id_, detail,
+               now_unix_ms, limits_.audit_ring_capacity_);
+    return MetaDomainRejectError(detail);
+  }
+  if (it == impl.sessions_.end() &&
+      impl.sessions_.size() >= limits_.max_sessions_total_) {
+    const std::string detail = "session-store-full";
     impl.Audit(MetaObsAuditKind::kRejected, identity.node_id_, detail,
                now_unix_ms, limits_.audit_ring_capacity_);
     return MetaDomainRejectError(detail);
@@ -366,32 +510,77 @@ absl::Status MetaObservationStore::Ingest(MetaObservation observation,
   }
   observation.received_unix_ms_ = now_unix_ms;  // volatile-local TTL clock
   const std::string& node_id = observation.identity_.node_id_;
+  const auto reject = [&](std::string detail) -> absl::Status {
+    impl.Audit(MetaObsAuditKind::kRejected, node_id, detail, now_unix_ms,
+               limits_.audit_ring_capacity_);
+    return MetaDomainRejectError(detail);
+  };
+  const auto check_budget = [&](const MetaObservation* replaced) {
+    return impl.CheckByteBudget(observation, replaced, limits_);
+  };
+  const auto store_latest =
+      [&](std::map<std::string, MetaObservation>& bucket) -> absl::Status {
+    const auto existing = bucket.find(node_id);
+    if (existing == bucket.end() &&
+        impl.TotalObservations() >= limits_.max_observations_total_) {
+      return reject("store-full");
+    }
+    const absl::Status budget =
+        check_budget(existing == bucket.end() ? nullptr : &existing->second);
+    if (!budget.ok()) {
+      return reject(std::string(budget.message()));
+    }
+    if (existing == bucket.end()) {
+      // The map key must not alias the observation string being moved: C++
+      // does not order emplace argument evaluation.
+      std::string node_key = node_id;
+      const auto inserted =
+          bucket.emplace(std::move(node_key), std::move(observation));
+      assert(inserted.second);
+      impl.AccountInsert(inserted.first->second, false);
+    } else {
+      const std::uint64_t old_bytes = ChargedBytes(existing->second);
+      const std::uint64_t new_bytes = ChargedBytes(observation);
+      existing->second = std::move(observation);
+      impl.AccountReplace(existing->first, old_bytes, new_bytes);
+    }
+    return absl::OkStatus();
+  };
 
   if (std::holds_alternative<MetaNodeBootObs>(observation.payload_)) {
-    if (!impl.boot_by_node_.contains(node_id) &&
-        impl.TotalObservations() >= limits_.max_observations_total_) {
-      const std::string detail = "store-full";
-      impl.Audit(MetaObsAuditKind::kRejected, node_id, detail, now_unix_ms,
-                 limits_.audit_ring_capacity_);
-      return MetaDomainRejectError(detail);
-    }
-    impl.boot_by_node_[node_id] = std::move(observation);
-    return absl::OkStatus();
+    return store_latest(impl.boot_by_node_);
   }
   if (std::holds_alternative<MetaNodeHealthObs>(observation.payload_)) {
-    if (!impl.health_by_node_.contains(node_id) &&
-        impl.TotalObservations() >= limits_.max_observations_total_) {
-      const std::string detail = "store-full";
-      impl.Audit(MetaObsAuditKind::kRejected, node_id, detail, now_unix_ms,
-                 limits_.audit_ring_capacity_);
-      return MetaDomainRejectError(detail);
-    }
-    impl.health_by_node_[node_id] = std::move(observation);
-    return absl::OkStatus();
+    return store_latest(impl.health_by_node_);
   }
   if (const auto* candidate =
           std::get_if<MetaCandidateProgressObs>(&observation.payload_)) {
     auto group_it = impl.candidates_by_group_.find(candidate->group_id_);
+    auto existing = group_it == impl.candidates_by_group_.end()
+                        ? std::map<std::string, MetaObservation>::iterator{}
+                        : group_it->second.find(node_id);
+    const bool is_new = group_it == impl.candidates_by_group_.end() ||
+                        existing == group_it->second.end();
+    if (is_new) {
+      // Hard caps fail safe: a NEW node beyond the bounded
+      // per-group candidate set or the total cap is rejected, never silently
+      // squeezed in; refreshing an existing key never grows the state.
+      const std::size_t group_size =
+          group_it == impl.candidates_by_group_.end()
+              ? 0
+              : group_it->second.size();
+      if (group_size >= limits_.max_candidates_per_group_) {
+        return reject("candidate-set-full:group=" + candidate->group_id_);
+      }
+      if (impl.TotalObservations() >= limits_.max_observations_total_) {
+        return reject("store-full");
+      }
+    }
+    const MetaObservation* replaced = is_new ? nullptr : &existing->second;
+    const absl::Status budget = check_budget(replaced);
+    if (!budget.ok()) {
+      return reject(std::string(budget.message()));
+    }
     if (group_it == impl.candidates_by_group_.end()) {
       group_it = impl.candidates_by_group_
                      .emplace(candidate->group_id_,
@@ -399,37 +588,52 @@ absl::Status MetaObservationStore::Ingest(MetaObservation observation,
                      .first;
     }
     std::map<std::string, MetaObservation>& by_node = group_it->second;
-    if (!by_node.contains(node_id)) {
-      // Hard caps fail safe: a NEW node beyond the bounded
-      // per-group candidate set or the total cap is rejected, never silently
-      // squeezed in; refreshing an existing key never grows the state.
-      if (by_node.size() >= limits_.max_candidates_per_group_) {
-        const std::string detail =
-            "candidate-set-full:group=" + candidate->group_id_;
-        impl.Audit(MetaObsAuditKind::kRejected, node_id, detail, now_unix_ms,
-                   limits_.audit_ring_capacity_);
-        if (by_node.empty()) {
-          impl.candidates_by_group_.erase(group_it);
-        }
-        return MetaDomainRejectError(detail);
-      }
-      if (impl.TotalObservations() >= limits_.max_observations_total_) {
-        const std::string detail = "store-full";
-        impl.Audit(MetaObsAuditKind::kRejected, node_id, detail, now_unix_ms,
-                   limits_.audit_ring_capacity_);
-        if (by_node.empty()) {
-          impl.candidates_by_group_.erase(group_it);
-        }
-        return MetaDomainRejectError(detail);
-      }
+    if (is_new) {
+      std::string node_key = node_id;
+      const auto inserted =
+          by_node.emplace(std::move(node_key), std::move(observation));
+      assert(inserted.second);
+      impl.AccountInsert(inserted.first->second, false);
+    } else {
+      // `existing` belongs to by_node because a missing group always implies
+      // is_new. Capture its charge before move-assignment replaces the value.
+      const std::uint64_t old_bytes = ChargedBytes(existing->second);
+      const std::uint64_t new_bytes = ChargedBytes(observation);
+      existing->second = std::move(observation);
+      impl.AccountReplace(existing->first, old_bytes, new_bytes);
     }
-    by_node[node_id] = std::move(observation);
     return absl::OkStatus();
   }
 
   const auto& evidence =
       std::get<MetaOperationEvidenceObs>(observation.payload_);
   auto op_it = impl.evidence_by_operation_.find(evidence.operation_id_);
+  const Impl::EvidenceKey key{node_id, evidence.kind_phase_};
+  auto existing =
+      op_it == impl.evidence_by_operation_.end()
+          ? std::map<Impl::EvidenceKey, MetaObservation>::iterator{}
+          : op_it->second.find(key);
+  const bool is_new = op_it == impl.evidence_by_operation_.end() ||
+                      existing == op_it->second.end();
+  if (is_new) {
+    if (impl.NodeEvidencePhases(node_id) >=
+        limits_.max_evidence_phases_per_node_) {
+      return reject("evidence-phase-set-full:node");
+    }
+    const std::size_t operation_size =
+        op_it == impl.evidence_by_operation_.end() ? 0 : op_it->second.size();
+    if (operation_size >= limits_.max_evidence_per_operation_) {
+      return reject("evidence-set-full:operation");
+    }
+    if (impl.TotalObservations() >= limits_.max_observations_total_) {
+      return reject("store-full");
+    }
+  }
+  const MetaObservation* replaced = is_new ? nullptr : &existing->second;
+  const absl::Status budget = check_budget(replaced);
+  if (!budget.ok()) {
+    return reject(std::string(budget.message()));
+  }
   if (op_it == impl.evidence_by_operation_.end()) {
     op_it = impl.evidence_by_operation_
                 .emplace(evidence.operation_id_,
@@ -437,18 +641,16 @@ absl::Status MetaObservationStore::Ingest(MetaObservation observation,
                 .first;
   }
   std::map<Impl::EvidenceKey, MetaObservation>& by_key = op_it->second;
-  const Impl::EvidenceKey key{node_id, evidence.kind_phase_};
-  if (!by_key.contains(key) &&
-      impl.TotalObservations() >= limits_.max_observations_total_) {
-    const std::string detail = "store-full";
-    impl.Audit(MetaObsAuditKind::kRejected, node_id, detail, now_unix_ms,
-               limits_.audit_ring_capacity_);
-    if (by_key.empty()) {
-      impl.evidence_by_operation_.erase(op_it);
-    }
-    return MetaDomainRejectError(detail);
+  if (is_new) {
+    const auto inserted = by_key.emplace(key, std::move(observation));
+    assert(inserted.second);
+    impl.AccountInsert(inserted.first->second, true);
+  } else {
+    const std::uint64_t old_bytes = ChargedBytes(existing->second);
+    const std::uint64_t new_bytes = ChargedBytes(observation);
+    existing->second = std::move(observation);
+    impl.AccountReplace(existing->first.node_id_, old_bytes, new_bytes);
   }
-  by_key[key] = std::move(observation);
   return absl::OkStatus();
 }
 
@@ -469,6 +671,7 @@ void MetaObservationStore::RevalidateAll(const MetaCommittedFacts& facts,
         const std::string detail =
             "commit-stale:" + std::string(valid.message());
         const std::string node_id = it->first;
+        impl.AccountErase(it->second, false);
         it = by_node.erase(it);
         impl.Audit(MetaObsAuditKind::kStalePurged, node_id, detail, now_unix_ms,
                    limits_.audit_ring_capacity_);
@@ -497,6 +700,7 @@ void MetaObservationStore::RevalidateAll(const MetaCommittedFacts& facts,
         const std::string detail =
             "commit-stale:" + std::string(valid.message());
         const std::string node_id = key_it->first.node_id_;
+        impl.AccountErase(key_it->second, true);
         key_it = by_key.erase(key_it);
         impl.Audit(MetaObsAuditKind::kStalePurged, node_id, detail, now_unix_ms,
                    limits_.audit_ring_capacity_);
@@ -553,6 +757,7 @@ void MetaObservationStore::SweepExpiredLocked(int64_t now_unix_ms) {
             "ttl-expired:age_ms=" +
             std::to_string(now_unix_ms - it->second.received_unix_ms_);
         const std::string node_id = it->first;
+        impl.AccountErase(it->second, false);
         it = by_node.erase(it);
         impl.Audit(MetaObsAuditKind::kTtlExpired, node_id, detail, now_unix_ms,
                    limits_.audit_ring_capacity_);
@@ -581,6 +786,7 @@ void MetaObservationStore::SweepExpiredLocked(int64_t now_unix_ms) {
             "ttl-expired:age_ms=" +
             std::to_string(now_unix_ms - key_it->second.received_unix_ms_);
         const std::string node_id = key_it->first.node_id_;
+        impl.AccountErase(key_it->second, true);
         key_it = by_key.erase(key_it);
         impl.Audit(MetaObsAuditKind::kTtlExpired, node_id, detail, now_unix_ms,
                    limits_.audit_ring_capacity_);
@@ -723,6 +929,17 @@ std::vector<MetaObsAuditEvent> MetaObservationStore::AuditRing() const {
 size_t MetaObservationStore::size() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return impl_->TotalObservations();
+}
+
+std::uint64_t MetaObservationStore::retained_bytes() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return impl_->retained_bytes_;
+}
+
+std::uint64_t MetaObservationStore::retained_bytes_for_node(
+    std::string_view node_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return impl_->NodeRetainedBytes(node_id);
 }
 
 }  // namespace keylane::meta

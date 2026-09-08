@@ -124,9 +124,14 @@ racing closure is either rejected or remains visible to the drain.
    manages database and replication gates, then calls the relevant local,
    storage, transaction, blocking, RDB, or administrative handler. In cluster
    mode, admitted writes re-check their authority against the current
-   `ServingState` after these suspending admissions and before the handler
-   runs; transactional writes re-check per shard through a validator hook on
-   `tx::Transaction` instead.
+   `ServingState` after these outer admissions and before the handler runs;
+   transactional writes also re-check per shard through a validator hook on
+   `tx::Transaction`. Because a handler can still suspend on key/store locks,
+   reads, or block allocation, every logical keyspace write carries a
+   storage-neutral `MutationPrecondition`. `StorageEngine` evaluates it after
+   that preparation and immediately before invalidating WATCH or changing the
+   staging buffer/index; rollback, background maintenance, and replica replay
+   do not depend on client authority.
 7. The service writes a normal encoded reply, a direct storage-backed value, or
    bounded chunks. Small pipeline replies are coalesced up to 64 KiB.
 
@@ -392,6 +397,7 @@ real server executable.
 | Static command classification and key extraction | `include/keylane/command_table.h`, `src/redis/command_table.cpp` |
 | Admission, role checks, database/replication gates, transaction integration, routing, and replay | `src/redis/command.cpp` |
 | Cluster admission gate, CLUSTER subcommands, and discovery replies | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_command.cpp` |
+| Final logical-mutation precondition and WATCH/publication seam | `include/keylane/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp` |
 | Type-family command handlers | `src/redis/string_command.cpp`, `src/redis/list_command.cpp`, `src/redis/hash_command.cpp`, `src/redis/set_command.cpp`, `src/redis/zset_command.cpp`, `src/redis/stream_command.cpp`, `src/redis/sort_command.cpp` |
 | Blocking waiter ownership and wakeups | `src/redis/blocking_wait.h`, `src/redis/blocking_wait.cpp` |
 | Worker-local Lua VM, script cache, Function runtime staging, invocation state, and command re-entry | `src/redis/lua_eval.h`, `src/redis/lua_eval.cpp`, `src/redis/command.cpp` |

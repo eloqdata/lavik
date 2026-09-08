@@ -25,6 +25,20 @@
 namespace keylane::cluster {
 namespace {
 
+// Celer's relative sleep uses CLOCK_MONOTONIC, which pauses across host
+// suspend. Rechecking a CLOCK_BOOTTIME deadline in short slices bounds the
+// post-resume source-capability cleanup delay instead of preserving the
+// remainder of an arbitrarily long lease. Request admission itself checks
+// CLOCK_BOOTTIME synchronously and has no such delay.
+constexpr auto kLeaseExpiryRecheckInterval = std::chrono::milliseconds(25);
+
+MonotonicDuration LeaseExpiryRecheckInterval(MonotonicDuration grant) {
+  const MonotonicDuration quarter = std::max(grant / 4, MonotonicDuration{1});
+  return std::min(quarter,
+                  std::chrono::duration_cast<MonotonicDuration>(
+                      kLeaseExpiryRecheckInterval));
+}
+
 AuthorityAnchor AnchorFor(const GroupView& group) {
   return AuthorityAnchor{
       .group_id_ = group.group_id_,
@@ -332,6 +346,12 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
   if (source_revocation_transitions_ != 0) {
     return absl::UnavailableError(
         "source authority cleanup is still in progress");
+  }
+  if (!directive.payload_.empty() || !directive.preconditions_.empty() ||
+      directive.force_) {
+    return absl::InvalidArgumentError(
+        "directive payload, preconditions, and force are reserved in "
+        "control protocol v1");
   }
   if (const absl::Status projection = ValidateProjection(directive.projection_);
       !projection.ok()) {
@@ -646,6 +666,7 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
            serving_group->authority_version_ !=
                control_group.authority_version_ ||
            serving_group->grant_revision_ != control_group.grant_revision_ ||
+           serving_group->config_epoch_ != control_group.config_epoch_ ||
            serving_group->manifest_revision_ !=
                control_group.manifest_revision_)) {
         return absl::InvalidArgumentError(
@@ -707,12 +728,39 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
           [&old_group](const PreparedGroupControlIdentity& candidate) {
             return candidate.group_id_ == old_group.group_id_;
           });
-      if (new_group != prepared_state.control_groups_.end() &&
-          new_group->partition_replication_epoch_ <
-              old_group.partition_replication_epoch_) {
-        return absl::FailedPreconditionError(
-            absl::StrCat("partition replication epoch regressed for group '",
-                         old_group.group_id_, "'"));
+      if (new_group == prepared_state.control_groups_.end()) continue;
+      if (new_group->partition_replication_epoch_ <
+          old_group.partition_replication_epoch_) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "partition replication epoch regressed for group '",
+            old_group.group_id_, "'"));
+      }
+      const bool shares_member_incarnation =
+          std::any_of(old_group.members_.begin(), old_group.members_.end(),
+                      [&](const PreparedMemberAssignment& old_member) {
+                        return std::any_of(
+                            new_group->members_.begin(),
+                            new_group->members_.end(),
+                            [&](const PreparedMemberAssignment& new_member) {
+                              return old_member == new_member;
+                            });
+                      });
+      if (shares_member_incarnation &&
+          (new_group->config_epoch_ < old_group.config_epoch_ ||
+           new_group->group_term_ < old_group.group_term_ ||
+           new_group->authority_version_ < old_group.authority_version_ ||
+           new_group->grant_revision_ < old_group.grant_revision_ ||
+           new_group->manifest_revision_ < old_group.manifest_revision_)) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "same-membership control counter regressed for group '",
+            old_group.group_id_, "'"));
+      }
+      if (shares_member_incarnation &&
+          new_group->manifest_revision_ == old_group.manifest_revision_ &&
+          new_group->manifest_digest_ != old_group.manifest_digest_) {
+        return absl::DataLossError(absl::StrCat(
+            "same manifest revision changed digest for group '",
+            old_group.group_id_, "'"));
       }
     }
     for (const GroupView& old_group : before->Groups()) {
@@ -835,7 +883,7 @@ celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
 }
 
 absl::Status NodeControlInstaller::ApplyAuthority(
-    const AuthorityMessage& message) {
+    const AuthorityMessage& message, MonotonicTime now) {
   if (const absl::Status projection = ValidateProjection(message.projection_);
       !projection.ok()) {
     return projection;
@@ -872,7 +920,8 @@ absl::Status NodeControlInstaller::ApplyAuthority(
           "lease grant targets an unready or fenced assignment");
     }
     const MonotonicTime deadline = SaturatingLeaseDeadline(message);
-    return authority_.RenewLease(message.session_, message.anchor_, deadline);
+    return authority_.RenewLease(message.session_, message.anchor_, deadline,
+                                 now);
   }
 
   if (actions_.ReceivesDirectives()) {
@@ -903,11 +952,34 @@ celer::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
         "Meta lease transition requires a Celer worker");
   }
   const MonotonicTime deadline = SaturatingLeaseDeadline(message);
-  if (deadline <= std::chrono::steady_clock::now()) {
+  MonotonicTime now = LeaseClockNow();
+  if (deadline <= now) {
     co_return absl::DeadlineExceededError(
         "lease grant expired before it could be installed");
   }
-  if (absl::Status installed = ApplyAuthority(message); !installed.ok()) {
+
+  // A CLOCK_MONOTONIC-backed worker timer may still be asleep after host
+  // suspend even though CLOCK_BOOTTIME says the lease is already due. Finish
+  // that exact expiration transition here before renewal can preserve the old
+  // generation and revive pre-expiry admissions.
+  if (const auto existing =
+          lease_expiry_schedules_.find(message.anchor_.group_id_);
+      existing != lease_expiry_schedules_.end() && existing->second->active_ &&
+      existing->second->deadline_ <= now) {
+    if (absl::Status expired =
+            co_await FinishExpiredLeaseTransition(existing->second, now);
+        !expired.ok()) {
+      co_return expired;
+    }
+    now = LeaseClockNow();
+    if (deadline <= now) {
+      co_return absl::DeadlineExceededError(
+          "lease grant expired during prior-authority cleanup");
+    }
+  }
+
+  if (absl::Status installed = ApplyAuthority(message, LeaseClockNow());
+      !installed.ok()) {
     co_return installed;
   }
   if (deadline != MonotonicTime::max()) {
@@ -921,6 +993,8 @@ celer::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
           .session_ = message.session_,
           .anchor_ = message.anchor_,
           .deadline_ = deadline,
+          .recheck_interval_ =
+              LeaseExpiryRecheckInterval(message.granted_duration_),
       });
       lease_expiry_schedules_.insert_or_assign(message.anchor_.group_id_,
                                                schedule);
@@ -928,10 +1002,16 @@ celer::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
     } else {
       schedule = existing->second;
       const MonotonicTime old_deadline = schedule->deadline_;
+      const MonotonicDuration old_recheck_interval =
+          schedule->recheck_interval_;
+      const MonotonicDuration recheck_interval =
+          LeaseExpiryRecheckInterval(message.granted_duration_);
       schedule->session_ = message.session_;
       schedule->anchor_ = message.anchor_;
       schedule->deadline_ = deadline;
-      if (deadline < old_deadline) {
+      schedule->recheck_interval_ = recheck_interval;
+      if (deadline < old_deadline ||
+          recheck_interval < old_recheck_interval) {
         ++schedule->timer_generation_;
         spawn_timer = true;
       }
@@ -963,10 +1043,10 @@ celer::Task<absl::Status> NodeControlInstaller::ExpireLeaseAt(
   }
   while (schedule->active_ && schedule->timer_generation_ == timer_generation) {
     const MonotonicTime deadline = schedule->deadline_;
-    const MonotonicTime now = std::chrono::steady_clock::now();
+    const MonotonicTime now = LeaseClockNow();
     if (now < deadline) {
-      const absl::Status slept =
-          co_await celer::SleepFor(*worker, deadline - now);
+      const absl::Status slept = co_await celer::SleepFor(
+          *worker, std::min(deadline - now, schedule->recheck_interval_));
       if (!slept.ok()) co_return slept;
       continue;
     }
@@ -975,12 +1055,23 @@ celer::Task<absl::Status> NodeControlInstaller::ExpireLeaseAt(
   if (!schedule->active_ || schedule->timer_generation_ != timer_generation) {
     co_return absl::OkStatus();
   }
-  // Renewal updates the shared schedule. An extension keeps this one timer
-  // and makes it sleep again; a shortening replaces its generation and makes
-  // this stale task exit without touching the replacement lease.
+  // Renewal updates the shared schedule. An extension keeps this timer unless
+  // the new grant requires a shorter recheck slice; a deadline shortening or
+  // smaller slice replaces its generation, so this stale task cannot touch
+  // the replacement lease.
+  co_return co_await FinishExpiredLeaseTransition(schedule, LeaseClockNow());
+}
+
+celer::Task<absl::Status>
+NodeControlInstaller::FinishExpiredLeaseTransition(
+    std::shared_ptr<LeaseExpirySchedule> schedule, MonotonicTime now) {
+  if (!schedule->active_) co_return absl::OkStatus();
+  if (now < schedule->deadline_) {
+    co_return absl::FailedPreconditionError(
+        "lease expiration transition ran before its exact deadline");
+  }
   const bool expired = authority_.ExpireLease(
-      schedule->session_, schedule->anchor_, schedule->deadline_,
-      std::chrono::steady_clock::now());
+      schedule->session_, schedule->anchor_, schedule->deadline_, now);
   schedule->active_ = false;
   const auto installed =
       lease_expiry_schedules_.find(schedule->anchor_.group_id_);

@@ -6,8 +6,10 @@
 #include <string>
 #include <utility>
 
+#include "celer/net/connection.h"
 #include "gtest/gtest.h"
 #include "keylane/cluster/control_protocol.h"
+#include "keylane/meta/control_projector.h"
 #include "keylane/meta/data_control_server.h"
 #include "keylane/meta/observation_store.h"
 
@@ -50,6 +52,8 @@ using keylane::meta::MetaDirectiveDelivery;
 using keylane::meta::MetaDirectiveReceiptTracker;
 using keylane::meta::MetaLeaseEvaluation;
 using keylane::meta::MetaLeaseHandoffGuard;
+using keylane::meta::MetaLeaderRuntimeDisposition;
+using keylane::meta::MetaLeaderRuntimeGuard;
 using keylane::meta::MetaLocalMemberBindingDisposition;
 using keylane::meta::MetaNodeHealthObs;
 using keylane::meta::MetaObservationStore;
@@ -57,7 +61,10 @@ using keylane::meta::MetaOperationEvidenceObs;
 using keylane::meta::MetaReplacementDisposition;
 using keylane::meta::MetaStores;
 using keylane::meta::UnfencedSupersededAuthorities;
+using keylane::meta::detail::BoundNodeSessionRegistry;
 using keylane::meta::detail::MetaCommittedViewCache;
+using keylane::meta::detail::PendingHandshakeLimiter;
+using keylane::meta::detail::RetainedProjectionLimiter;
 using keylane::meta::detail::RecordEquivalentTransferBoundary;
 using keylane::meta::detail::TransferBoundaryNeedsProjectionValidation;
 
@@ -75,7 +82,8 @@ TEST(MetaCommittedViewCacheTest, CopiesOncePerNewAppliedHighWater) {
   std::size_t loads = 0;
   MetaCommittedViewCache cache([&] {
     ++loads;
-    return MetaCommittedView(MetaStores{}, next_index);
+    MetaStores stores;
+    return MetaCommittedView(std::move(stores), next_index);
   });
 
   auto first = cache.Get(1);
@@ -93,7 +101,9 @@ TEST(MetaCommittedViewCacheTest, CopiesOncePerNewAppliedHighWater) {
   ASSERT_TRUE(cache.Get(7).ok());
   EXPECT_EQ(loads, 2u);
 
-  auto adopted = cache.Adopt(MetaCommittedView(MetaStores{}, 9));
+  MetaStores adopted_stores;
+  auto adopted =
+      cache.Adopt(MetaCommittedView(std::move(adopted_stores), 9));
   ASSERT_NE(adopted, nullptr);
   EXPECT_EQ(adopted->applied_index(), 9u);
   ASSERT_TRUE(cache.Get(9).ok());
@@ -235,12 +245,106 @@ TEST(MetaDataControlLifecycleDeathTest,
       "");
 }
 
+TEST(MetaDataControlHandshakeLimitTest,
+     RejectsAtDomainCapAndReusesReleasedPermit) {
+  PendingHandshakeLimiter limiter(/*limit=*/2);
+  auto first = limiter.TryAcquire();
+  auto second = limiter.TryAcquire();
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(limiter.pending(), 2u);
+  EXPECT_FALSE(limiter.TryAcquire().has_value());
+
+  first->Release();
+  EXPECT_EQ(limiter.pending(), 1u);
+  auto replacement = limiter.TryAcquire();
+  ASSERT_TRUE(replacement.has_value());
+  EXPECT_EQ(limiter.pending(), 2u);
+
+  replacement.reset();
+  second.reset();
+  EXPECT_EQ(limiter.pending(), 0u);
+}
+
+TEST(MetaDataControlHandshakeLimitTest,
+     FollowerRetainsPermitUntilRedirectCompletion) {
+  PendingHandshakeLimiter limiter(/*limit=*/1);
+  auto redirect = limiter.TryAcquire();
+  ASSERT_TRUE(redirect.has_value());
+
+  // A committed binding alone is insufficient on a follower: the bounded
+  // redirect write still owns this permit, so stalled writers cannot recycle
+  // capacity into an unbounded task/descriptor population.
+  EXPECT_FALSE(limiter.TryAcquire().has_value());
+  redirect.reset();
+  EXPECT_EQ(limiter.pending(), 0u);
+  EXPECT_TRUE(limiter.TryAcquire().has_value());
+}
+
+TEST(MetaDataControlHandshakeLimitTest,
+     LeaderReleasesPermitOnlyAfterClaimingOneNodeSlot) {
+  PendingHandshakeLimiter limiter(/*limit=*/1);
+  BoundNodeSessionRegistry slots;
+  auto handshake = limiter.TryAcquire();
+  ASSERT_TRUE(handshake.has_value());
+  celer::Connection first;
+  celer::Connection duplicate;
+
+  ASSERT_TRUE(slots.TryClaim("node-a", &first));
+  handshake->Release();
+  auto next_handshake = limiter.TryAcquire();
+  ASSERT_TRUE(next_handshake.has_value());
+  EXPECT_FALSE(slots.TryClaim("node-a", &duplicate));
+  EXPECT_EQ(slots.size(), 1u);
+
+  // Cleanup by a rejected duplicate must not release the incumbent's slot.
+  slots.Release("node-a", &duplicate);
+  EXPECT_EQ(slots.size(), 1u);
+  slots.Release("node-a", &first);
+  EXPECT_EQ(slots.size(), 0u);
+  EXPECT_TRUE(slots.TryClaim("node-a", &duplicate));
+}
+
+TEST(MetaDataControlProjectionLimitTest, ChargesResizesMovesAndReleases) {
+  RetainedProjectionLimiter limiter(/*limit=*/100);
+  auto first = limiter.TryAcquire(60);
+  auto second = limiter.TryAcquire(30);
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(limiter.retained_bytes(), 90U);
+  EXPECT_FALSE(limiter.TryAcquire(11).has_value());
+
+  EXPECT_TRUE(first->Resize(70).ok());
+  EXPECT_EQ(limiter.retained_bytes(), 100U);
+  EXPECT_EQ(first->Resize(71).code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(first->bytes(), 70U);
+  EXPECT_EQ(limiter.retained_bytes(), 100U);
+
+  RetainedProjectionLimiter::Permit moved = std::move(*first);
+  first.reset();
+  EXPECT_EQ(limiter.retained_bytes(), 100U);
+  moved.Release();
+  EXPECT_EQ(limiter.retained_bytes(), 30U);
+  second.reset();
+  EXPECT_EQ(limiter.retained_bytes(), 0U);
+}
+
+TEST(MetaDataControlProjectionLimitTest, BatchWeightIncludesOwnedCapacities) {
+  keylane::meta::NodeControlBatch batch;
+  const std::size_t empty = keylane::meta::NodeControlBatchRetainedBytes(batch);
+  batch.encoded_full_state.reserve(1024);
+  batch.full_state.nodes.push_back({Identity('1'), "127.0.0.1", 7000, 0});
+  batch.full_state.nodes.front().host.reserve(512);
+  EXPECT_GT(keylane::meta::NodeControlBatchRetainedBytes(batch), empty + 1400);
+}
+
 TEST(MetaDataControlOptionsTest, TlsIsAllOrNone) {
   MetaDataControlServerOptions options;
   options.server_id_ = 1;
   options.bind_host_ = "127.0.0.1";
   options.port_ = 7000;
   options.leadership_validity_ms_ = 300;
+  options.lease_handoff_safety_margin_ms_ = 300;
   EXPECT_TRUE(MetaDataControlServer::ValidateOptions(options).ok());
 
   options.tls_ca_cert_file_ = "ca.pem";
@@ -250,11 +354,29 @@ TEST(MetaDataControlOptionsTest, TlsIsAllOrNone) {
   options.tls_key_file_ = "key.pem";
   EXPECT_TRUE(MetaDataControlServer::ValidateOptions(options).ok());
 
+  options.lease_handoff_safety_margin_ms_ = 299;
+  EXPECT_EQ(MetaDataControlServer::ValidateOptions(options).code(),
+            absl::StatusCode::kInvalidArgument);
+  options.lease_handoff_safety_margin_ms_ = 300;
+  options.max_pending_handshakes_ = 0;
+  EXPECT_EQ(MetaDataControlServer::ValidateOptions(options).code(),
+            absl::StatusCode::kInvalidArgument);
+  options.max_pending_handshakes_ = control::kMaxProjectedNodes + 1;
+  EXPECT_EQ(MetaDataControlServer::ValidateOptions(options).code(),
+            absl::StatusCode::kInvalidArgument);
+  options.max_pending_handshakes_ = control::kMaxProjectedNodes;
+  EXPECT_TRUE(MetaDataControlServer::ValidateOptions(options).ok());
+
   options.heartbeat_interval_ms_ = 10'000;
   EXPECT_EQ(MetaDataControlServer::ValidateOptions(options).code(),
             absl::StatusCode::kInvalidArgument);
   options.heartbeat_interval_ms_ = 1000;
   options.session_progress_timeout_ms_ = 10'001;
+  EXPECT_EQ(MetaDataControlServer::ValidateOptions(options).code(),
+            absl::StatusCode::kInvalidArgument);
+  options.session_progress_timeout_ms_ = 10'000;
+  options.max_retained_projection_bytes_ =
+      2 * static_cast<std::size_t>(control::kMaxFullDesiredStateBytes) - 1;
   EXPECT_EQ(MetaDataControlServer::ValidateOptions(options).code(),
             absl::StatusCode::kInvalidArgument);
 }
@@ -445,7 +567,7 @@ TEST(MetaDataControlLeaseTest, ExactCommittedAnchorGetsBoundedGrant) {
 }
 
 TEST(MetaDataControlLeaseTest,
-     NewAuthorityWaitsOutMaximumPriorLeaseBeforeGrant) {
+     NewAuthorityWaitsOutPriorLeaseAndEqualSafetyMarginBeforeGrant) {
   const control::FullDesiredState desired = Desired();
   const MetaLeaseEvaluation evaluation{
       .leader_valid_ = true,
@@ -460,12 +582,13 @@ TEST(MetaDataControlLeaseTest,
   };
   const control::HeartbeatHealth health{.storage_ready = true,
                                         .population_ready = true};
-  MetaLeaseHandoffGuard guard(/*maximum_prior_lease_ms=*/250);
+  MetaLeaseHandoffGuard guard(/*maximum_prior_lease_ms=*/250,
+                              /*safety_margin_ms=*/250);
 
   auto decision =
       guard.Enforce(EvaluateLeaseChallenge(Challenge(), health, evaluation),
                     evaluation.node_id_,
-                    /*now_monotonic_ms=*/10'000);
+                    /*now_lease_clock_ms=*/10'000);
   const auto* denied = std::get_if<control::LeaseDenied>(&decision);
   ASSERT_NE(denied, nullptr);
   EXPECT_EQ(denied->reason,
@@ -474,13 +597,13 @@ TEST(MetaDataControlLeaseTest,
   decision =
       guard.Enforce(EvaluateLeaseChallenge(Challenge(), health, evaluation),
                     evaluation.node_id_,
-                    /*now_monotonic_ms=*/10'249);
+                    /*now_lease_clock_ms=*/10'499);
   EXPECT_NE(std::get_if<control::LeaseDenied>(&decision), nullptr);
 
   decision =
       guard.Enforce(EvaluateLeaseChallenge(Challenge(), health, evaluation),
                     evaluation.node_id_,
-                    /*now_monotonic_ms=*/10'250);
+                    /*now_lease_clock_ms=*/10'500);
   EXPECT_NE(std::get_if<control::LeaseGranted>(&decision), nullptr);
 }
 
@@ -499,32 +622,97 @@ TEST(MetaDataControlLeaseTest, NewBootAndLeaderResetRestartHandoffWait) {
   };
   const control::HeartbeatHealth health{.storage_ready = true,
                                         .population_ready = true};
-  MetaLeaseHandoffGuard guard(/*maximum_prior_lease_ms=*/250);
+  MetaLeaseHandoffGuard guard(/*maximum_prior_lease_ms=*/250,
+                              /*safety_margin_ms=*/250);
   auto candidate = [&] {
     return EvaluateLeaseChallenge(Challenge(), health, evaluation);
   };
 
   (void)guard.Enforce(candidate(), evaluation.node_id_, 10'000);
   EXPECT_TRUE(std::holds_alternative<control::LeaseGranted>(
-      guard.Enforce(candidate(), evaluation.node_id_, 10'250)));
+      guard.Enforce(candidate(), evaluation.node_id_, 10'500)));
 
   evaluation.boot_id_ = Identity('3');
   EXPECT_TRUE(std::holds_alternative<control::LeaseDenied>(
-      guard.Enforce(candidate(), evaluation.node_id_, 10'251)));
-  EXPECT_TRUE(std::holds_alternative<control::LeaseGranted>(
       guard.Enforce(candidate(), evaluation.node_id_, 10'501)));
+  EXPECT_TRUE(std::holds_alternative<control::LeaseGranted>(
+      guard.Enforce(candidate(), evaluation.node_id_, 11'001)));
 
   ++evaluation.leadership_generation_;
   EXPECT_TRUE(std::holds_alternative<control::LeaseDenied>(
-      guard.Enforce(candidate(), evaluation.node_id_, 10'502)));
+      guard.Enforce(candidate(), evaluation.node_id_, 11'002)));
   EXPECT_TRUE(std::holds_alternative<control::LeaseGranted>(
-      guard.Enforce(candidate(), evaluation.node_id_, 10'752)));
+      guard.Enforce(candidate(), evaluation.node_id_, 11'502)));
 
   guard.Reset();
   EXPECT_TRUE(std::holds_alternative<control::LeaseDenied>(
-      guard.Enforce(candidate(), evaluation.node_id_, 10'753)));
+      guard.Enforce(candidate(), evaluation.node_id_, 11'503)));
   EXPECT_TRUE(std::holds_alternative<control::LeaseGranted>(
-      guard.Enforce(candidate(), evaluation.node_id_, 11'003)));
+      guard.Enforce(candidate(), evaluation.node_id_, 12'003)));
+}
+
+TEST(MetaDataControlLeaseTest,
+     MetaLeaderSuspendRequiresAFullActiveLivenessWindow) {
+  MetaLeaderRuntimeGuard guard(/*leadership_validity_ms=*/250);
+  guard.Reset(/*now_suspend_clock_ms=*/10'000,
+              /*now_active_clock_ms=*/20'000);
+
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/10'249,
+                          /*now_active_clock_ms=*/20'000),
+            MetaLeaderRuntimeDisposition::kEligible);
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/10'250,
+                          /*now_active_clock_ms=*/20'000),
+            MetaLeaderRuntimeDisposition::kQuarantineStarted);
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/10'250,
+                          /*now_active_clock_ms=*/20'249),
+            MetaLeaderRuntimeDisposition::kQuarantined);
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/10'250,
+                          /*now_active_clock_ms=*/20'250),
+            MetaLeaderRuntimeDisposition::kEligible);
+
+  // Equal progress after the proven active cut is ordinary runtime, not a
+  // second suspension event.
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/10'500,
+                          /*now_active_clock_ms=*/20'500),
+            MetaLeaderRuntimeDisposition::kEligible);
+}
+
+TEST(MetaDataControlLeaseTest,
+     MetaLeaderSuspendAccumulatesAndExtendsAnActiveQuarantine) {
+  MetaLeaderRuntimeGuard guard(/*leadership_validity_ms=*/250);
+  guard.Reset(/*now_suspend_clock_ms=*/1'000,
+              /*now_active_clock_ms=*/2'000);
+
+  // Individually smaller pauses remain accumulated until an active liveness
+  // window proves this leadership generation again.
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/1'200,
+                          /*now_active_clock_ms=*/2'050),
+            MetaLeaderRuntimeDisposition::kEligible);
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/1'320,
+                          /*now_active_clock_ms=*/2'070),
+            MetaLeaderRuntimeDisposition::kQuarantineStarted);
+
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/1'520,
+                          /*now_active_clock_ms=*/2'120),
+            MetaLeaderRuntimeDisposition::kQuarantined);
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/1'650,
+                          /*now_active_clock_ms=*/2'130),
+            MetaLeaderRuntimeDisposition::kQuarantineStarted);
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/1'650,
+                          /*now_active_clock_ms=*/2'379),
+            MetaLeaderRuntimeDisposition::kQuarantined);
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/1'650,
+                          /*now_active_clock_ms=*/2'380),
+            MetaLeaderRuntimeDisposition::kEligible);
+}
+
+TEST(MetaDataControlLeaseTest, MetaLeaderClockRegressionFailsClosed) {
+  MetaLeaderRuntimeGuard guard(/*leadership_validity_ms=*/250);
+  guard.Reset(/*now_suspend_clock_ms=*/1'000,
+              /*now_active_clock_ms=*/2'000);
+  EXPECT_EQ(guard.Observe(/*now_suspend_clock_ms=*/999,
+                          /*now_active_clock_ms=*/2'001),
+            MetaLeaderRuntimeDisposition::kQuarantineStarted);
 }
 
 TEST(MetaDataControlLeaseTest, StaleProjectionIsOutOfDate) {

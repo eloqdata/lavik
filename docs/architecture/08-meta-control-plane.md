@@ -14,8 +14,9 @@ Raft-free. Followers keep accepting Data connections long enough to return the
 committed member directory and leader hint. Only a caught-up leader installs
 the publisher that may create sessions, project desired state, evaluate lease
 challenges, or accept results. Demotion cancels that publisher and begins
-closing all sessions from its leadership generation before the coordinator
-reports the transition complete. Shutdown first quiesces those sessions and
+closing, then joins, all sessions and leader-scoped tasks from its leadership
+generation before the coordinator reports the transition complete. Shutdown
+first quiesces those sessions and
 all NuRaft/proposal-executor producers, waits for the foreign executor's
 accepted prefix to reach the Meta worker, and only then stops the generic Celer
 runtime. An active demotion or first shutdown drain is fail-stop if the worker
@@ -42,7 +43,11 @@ revision-checked commands and enforces cross-store invariants such as unique
 principals, one data group per node, monotonic terms and epochs, and valid
 policy/grant/operation references. Group membership, owner, slot, population-
 manifest, partition-replication, and `UpdateNode` endpoint changes advance the
-cluster topology epoch. Initial identity registration can be projected at
+cluster topology epoch. `SetSlotMap` validates a complete candidate before
+publication and rejects any ownership or config-epoch change involving an
+active grant. Every affected source and destination group must first be
+fenced, preventing a lease for the old projection from spanning the cut.
+Initial identity registration can be projected at
 epoch zero before any group exists. The administrative membership proposer,
 not operator input or deterministic apply, generates each assignment
 incarnation from the OS CSPRNG; the topology store's bounded last-value index
@@ -159,9 +164,35 @@ and disabled socket read-ahead keep each session's memory ownership explicit.
 Only one complete-object transfer is active in a direction at a time; queued
 transfers retain shared ownership of their encoded bytes, so Start/Chunk/End
 sequences cannot interleave or outlive their payload storage.
+Projection and directive-set validation stream their canonical encodings into
+SHA-256 and retain only a bounded vector of directive references; they never
+materialize a normalized FDS or one encoded buffer per directive. Receive-side
+parsing necessarily overlaps the accumulated wire bytes with the owning
+decoded fields, so the 512 MiB value is a protocol abuse ceiling rather than a
+512 MiB process-memory promise. The consuming decoder releases the wire buffer
+on success or failure before installation can suspend, bounding that overlap
+to parsing instead of retaining it across the atomic replacement.
 Connect, handshake, session progress, and individual socket writes are bounded
 at ten seconds; this is well above the default 100 ms heartbeat and 300--600 ms
 election cadence while still turning a stuck peer into a finite failure.
+Sockets that have not completed TLS when enabled, a valid `ClientHello`, and a
+committed active node/certificate binding also consume one of 4096 pending-
+handshake permits. The listener closes excess sockets before starting their
+session coroutine. A follower retains its permit through the bounded redirect
+write. A leader releases it only after the connection has atomically claimed
+the committed node's single post-authentication slot and joined the current
+leadership generation; duplicates are rejected until that exact owner exits.
+Consequently anonymous/redirect work is capped at 4096, and projection/FDS
+holders are capped at one per committed node-record slot (validated active at
+claim time) even when a peer stalls or that record retires before session
+cleanup.
+Those per-node objects also share one weighted 2 GiB projection budget derived
+as two overlapping generations times encoded-plus-decoded 512 MiB size
+classes. Each build reserves the encoded/decoded pair before projection and
+then adjusts to the batch's actual retained string/vector capacities. The
+permit follows shared ownership through transfer and live installation, so
+4096 small sessions remain possible while a few abuse-sized projections cannot
+multiply common topology and manifest data into a TiB-scale allocation.
 
 Heartbeat is the periodic Data-to-Meta observation message. It contains
 health, optional boot-scoped candidate progress, and at most one lease
@@ -182,11 +213,26 @@ Challenges name the exact projection and complete group authority anchor.
 Meta grants only while it remains the caught-up leader, and caps duration at
 both committed policy and the configured leadership-validity bound. An
 otherwise-valid first grant for a new group/boot/anchor/leadership identity is
-held behind a leader-local monotonic quarantine for that full bound; losing
-volatile quarantine evidence restarts the wait rather than recovering an
-unsafe wall-clock deadline. Data measures a granted duration from the
-monotonic instant immediately before its first heartbeat write, not from ack
-receipt.
+held behind a leader-local `2D` quarantine on Linux `CLOCK_BOOTTIME`, where `D`
+is the maximum prior lease and the second `D` is a safety margin derived from
+the same Raft election lower bound. Data measures and synchronously rechecks
+the lease on that suspend-aware clock, starting immediately before its first
+heartbeat write rather than at ack receipt. The `2D` interval tolerates the
+Meta clock advancing up to twice as fast as the prior Data clock; scheduling
+can only extend the wait. Losing volatile quarantine evidence restarts the
+whole interval rather than recovering an unsafe wall-clock deadline.
+
+NuRaft's peer-response expiry uses active `CLOCK_MONOTONIC` time, so a Meta
+host suspend can otherwise preserve an old process's cached leader verdict
+while other members elect a replacement. The Data-control worker compares
+that clock with `CLOCK_BOOTTIME`; accumulated suspend divergence of at least
+`D` closes the leadership generation's authority sessions and synchronously
+requests immediate NuRaft resignation. In a multi-member cluster the old
+generation cannot become eligible again. NuRaft intentionally keeps a sole
+member leader, so that case must instead run for another full `D` of active
+time; a further suspend restarts the wait. Live FDS boundaries, directives,
+result proposals, and grants all pass this barrier. It covers the same-identity
+case whose ordinary `2D` handoff entry matured before suspension.
 
 Directives separate the wire recipient from the rebuild target: rebuild is
 delivered to the target, while authorize/revoke is delivered to the source.
@@ -194,6 +240,11 @@ The common assignment field always names the target membership incarnation;
 the durable directive carries a separate source assignment and the committed
 partition replication epoch. Both must exactly match committed topology and
 the installed group view.
+The durable and wire codecs reserve bounded `payload`, `preconditions`, and
+`force` fields for future operation-kind semantics. V1 executable directives
+require the strings to be empty and `force=false`; Meta transition apply and
+Data admission both reject any other value, so the replication adapter cannot
+silently ignore a requested predicate or override.
 Operation, durable directive, execution attempt, and assignment-incarnation
 identities remain distinct. Assignment ids are proposer-generated
 128-bit values that are never reused across incarnations; the topology store
@@ -232,14 +283,15 @@ leader-local evidence and is never encoded into a command, WAL, snapshot, or
 committed subscription. Admission authenticates the tuple `(node identity,
 boot incarnation, controller-local session generation)` and accepts only the
 current generation. A new generation atomically removes the node's older
-observations. Candidate and operation evidence must equal the current
-committed node/group/assignment membership, term, manifest, partition
-replication epoch, history, operation, and registration anchors. The
+observations. Candidate progress must match committed node/group/assignment,
+term, manifest, and partition replication epoch state, while its history is
+bound to the authenticated session's `ClientHello`. Operation evidence also
+matches the committed operation and its replication-history binding. The
 typed candidate/evidence query results include the authenticated reporter boot
 alongside node and assignment, so a reconciler never joins a payload to a
 second session lookup that could cross a reconnect. The canonical evidence-
-summary conversion copies that complete reporter incarnation. The same
-committed anchors are rechecked deterministically when evidence is embedded in
+summary conversion copies that complete reporter incarnation. Operation
+evidence's committed anchors are rechecked deterministically when embedded in
 an operation-phase command, closing the race between leader-local validation
 and Raft apply. A committed epoch-only change therefore invalidates old
 candidate and operation evidence even when term and manifest do not move.
@@ -248,6 +300,20 @@ and queries filter again against one current committed snapshot. Startup and
 each entered leader epoch clear soft state; every observed follower edge clears
 sessions, observations, and their local diagnostic ring even when another
 leader edge is already waiting behind it.
+
+Soft-state memory is bounded independently of its field validators. The store
+admits at most the committed node-domain cap of 4096 session keys and candidate
+reporters per group, at most 1024 evidence phases per reporter and per operation
+(the durable operation-evidence cap), and at most 65,536 total observations.
+Using the full node-domain bound for candidates avoids making report arrival
+order an implicit member-selection policy. Exact logical byte accounting covers
+retained variable fields and their lookup-key copies: the global 68 MiB budget
+is one direct frame plus identifier allowance per maximum node, while a node's
+289 KiB share holds one maximum streamed evidence object, one heartbeat frame,
+and its index allowance. Replacement, generation purge, revalidation, TTL
+expiry, and leader reset update the same counters. A capacity rejection keeps
+the previous latest-wins value and can delay reconciliation, but soft state
+cannot grant or restore authority.
 
 ## Durability and recovery
 
@@ -303,9 +369,11 @@ Raft transport is plaintext by default, matching the data-plane deployment
 model. It still checks claimed source and destination ids against NuRaft
 configuration descriptors and committed identity-store bindings, but those
 claims are not cryptographically authenticated; deployments whose network is
-not fully trusted enable optional mutual TLS. With mTLS, every member
-certificate has exactly one canonical `keylane://meta/<server-id>` URI SAN and
-an IP or DNS SAN covering its advertised endpoint. The NuRaft configuration
+not fully trusted enable optional mutual TLS. The Raft verifier requires
+exactly one recognized canonical `keylane://meta/<server-id>` URI SAN but
+ignores unrelated URI SANs; certificates reused by Data control are subject to
+the stricter total-URI rule below. An IP or DNS SAN covers the advertised Raft
+endpoint. The NuRaft configuration
 identity descriptor, the CA-authenticated certificate, and the committed
 identity-store binding must all match the claimed source id; neither the
 configuration nor the store binding grants membership alone. With mTLS, a
