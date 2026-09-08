@@ -139,8 +139,12 @@ after taking the key guard. Lua `redis.call` writes re-check before
 dispatch and again on the owner hop; script key access is additionally
 confined to the slot set the script was admitted with. Invoking a Function
 loaded with the `no-cluster` flag is refused in cluster mode, with Redis's
-exact error text. Blocking commands
-re-run admission on every attempt after reacquiring the database gate.
+exact error text. Top-level blocking writes (List and Sorted Set operations and
+`XREADGROUP`) re-run admission on every attempt after reacquiring the database
+gate. Each concrete storage attempt registers a fresh in-flight authority guard
+and releases it before entering the waiter registry or sleeping; a dormant
+client therefore cannot delay an authority drain. Read-only `XREAD` and the
+keyless `WAIT` carry no mutation authority and register no such guard.
 Replication replay is exempt from every re-check: applied commands are
 already ordered by the replication stream and carry no client fencing
 semantics.
@@ -172,6 +176,13 @@ update and a completed publication changes the even token — so a drain either
 observes a concurrent registration or the registrant observes the sequence
 change and rolls back.
 
+Ordinary writes retain that registration through their handler. Top-level
+blocking List and Sorted Set writes and `XREADGROUP` instead retain it only
+across one concrete mutation attempt, because time spent waiting for data
+performs no mutation and must not pin the replaced authority generation. Their
+immediate EXEC and Lua forms never enter the waiter registry and remain inside
+the enclosing transaction or script authority window.
+
 The node controller retains the replaced immutable snapshot as a drain token.
 A new lease, source authorization, or destructive rebuild for that group is
 refused until the old counter reaches zero. An explicit Fence is acknowledged
@@ -202,9 +213,10 @@ resets only after an accepted session has produced a valid `HeartbeatAck`.
 
 The session protocol is versioned and framed independently of TCP packets. A
 fixed header carries type, length, per-direction sequence, and CRC32C. Frames
-are at most 16 KiB. Complete objects that exceed one frame use
-Start/Chunk/End plus total length and SHA-256; chunks stream without per-frame
-application acknowledgements and only the complete object is acknowledged.
+are at most 16 KiB. A frame-sized `FullDesiredState` is sent directly as one
+typed frame. Complete objects that exceed one frame use Start/Chunk/End plus
+total length and SHA-256; chunks stream without per-frame application
+acknowledgements and only the complete object is acknowledged.
 The complete desired-state cap is 512 MiB, while each opaque directive,
 result, or operation-evidence field is capped at 256 KiB. These are abuse
 ceilings, not normal sizing goals:

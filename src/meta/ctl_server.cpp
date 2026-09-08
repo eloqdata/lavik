@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <ctime>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -724,6 +725,134 @@ celer::Task<std::string> HandleBeginGroupTerm(
   co_return reply;
 }
 
+// These topology/authority verbs intentionally expose the typed domain
+// operations instead of a generic command-encoding escape hatch. Absolute
+// CAS values remain operator input; only the cluster-wide topology epoch is
+// derived from one committed snapshot because no external caller can safely
+// guess commits in unrelated groups.
+celer::Task<std::string> HandlePutPolicy(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, const std::string& policy_id,
+    std::uint64_t version, const std::string& content) {
+  PutPolicy command;
+  command.request_id_ = MakeRequestId();
+  command.policy_id_ = policy_id;
+  command.version_ = version;
+  command.content_ = content;
+  command.content_hash_ = MetaPolicyStore::ContentHash(content);
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) co_return reply;
+
+  const auto installed =
+      state_machine->StoresSnapshot().policy_.FindVersion(policy_id, version);
+  if (!installed.has_value() || installed->retired_ ||
+      installed->content_ != content ||
+      installed->content_hash_ != command.content_hash_) {
+    co_return "ERR rejected";
+  }
+  co_return reply;
+}
+
+celer::Task<std::string> HandleSetSlotMap(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, std::uint16_t first_slot,
+    std::uint16_t last_slot, const std::string& group_id,
+    std::uint64_t config_epoch) {
+  const MetaStores before = state_machine->StoresSnapshot();
+  SetSlotMap command;
+  command.request_id_ = MakeRequestId();
+  command.ranges_.push_back({first_slot, last_slot, group_id});
+  command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
+  command.config_epochs_.push_back({group_id, config_epoch});
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) co_return reply;
+
+  const MetaStores after = state_machine->StoresSnapshot();
+  const auto group = after.topology_.FindGroup(group_id);
+  if (!group.has_value() || group->config_epoch_ != config_epoch ||
+      after.topology_.TopologyEpoch() != command.new_topology_epoch_) {
+    co_return "ERR rejected";
+  }
+  for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
+    const std::optional<std::string> owner = after.topology_.SlotOwner(slot);
+    const bool assigned = slot >= first_slot && slot <= last_slot;
+    if ((assigned && owner != std::optional<std::string>(group_id)) ||
+        (!assigned && owner.has_value())) {
+      co_return "ERR rejected";
+    }
+  }
+  co_return reply;
+}
+
+celer::Task<std::string> HandleActivateAuthority(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, const std::string& group_id,
+    std::uint64_t expected_term, const std::string& owner_node_id,
+    std::uint64_t lease_duration_ms, const std::string& policy_id,
+    std::uint64_t policy_version, std::uint64_t authority_version,
+    std::uint64_t config_epoch) {
+  const MetaStores before = state_machine->StoresSnapshot();
+  ActivateAuthority command;
+  command.request_id_ = MakeRequestId();
+  command.group_id_ = group_id;
+  command.expected_term_ = expected_term;
+  command.new_owner_ = owner_node_id;
+  command.grant_.lease_duration_ms_ = lease_duration_ms;
+  command.grant_.policy_id_ = policy_id;
+  command.grant_.policy_version_ = policy_version;
+  command.new_authority_version_ = authority_version;
+  command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
+  command.new_config_epoch_ = config_epoch;
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) co_return reply;
+
+  const MetaStores after = state_machine->StoresSnapshot();
+  const auto topology = after.topology_.FindGroup(group_id);
+  const auto grant = after.grant_.GroupState(group_id);
+  if (!topology.has_value() || !grant.has_value() || grant->fenced_ ||
+      !grant->grant_.has_value() ||
+      grant->grant_->owner_ != owner_node_id ||
+      grant->grant_->term_ != expected_term ||
+      grant->grant_->authority_version_ != authority_version ||
+      grant->grant_->spec_ != command.grant_ ||
+      topology->record_.owner_ != owner_node_id ||
+      topology->record_.group_term_ != expected_term ||
+      topology->record_.authority_version_ != authority_version ||
+      topology->config_epoch_ != config_epoch ||
+      after.topology_.TopologyEpoch() != command.new_topology_epoch_) {
+    co_return "ERR rejected";
+  }
+  co_return reply;
+}
+
+celer::Task<std::string> HandleFenceGroup(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, const std::string& group_id,
+    std::uint64_t expected_term) {
+  FenceGroup command;
+  command.request_id_ = MakeRequestId();
+  command.group_id_ = group_id;
+  command.expected_term_ = expected_term;
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) co_return reply;
+
+  const auto state =
+      state_machine->StoresSnapshot().grant_.GroupState(group_id);
+  if (!state.has_value() || state->group_term_ != expected_term ||
+      !state->fenced_ || state->grant_.has_value()) {
+    co_return "ERR rejected";
+  }
+  co_return reply;
+}
+
 // transitionop <id32hex> <phase> <history>: moves the operation to Running.
 // The history argument must match the anchor committed by submitop; it is a
 // ctl-side consistency check and is not fabricated into evidence.
@@ -1170,6 +1299,67 @@ celer::Task<std::string> DispatchMutationVerb(
         coordinator, std::move(state_machine), std::move(principal), tokens[1],
         expected, next);
   }
+  if (command == "putpolicy") {
+    std::uint64_t version = 0;
+    if (tokens.size() != 4 || tokens[1].empty() ||
+        tokens[1].size() > kMaxMetaPolicyIdBytes ||
+        !ParseU64(tokens[2], version) || version == 0 || tokens[3].empty() ||
+        tokens[3].size() > kMaxMetaPayloadBytes) {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandlePutPolicy(
+        coordinator, std::move(state_machine), std::move(principal), tokens[1],
+        version, tokens[3]);
+  }
+  if (command == "setslotmap") {
+    std::uint64_t first = 0;
+    std::uint64_t last = 0;
+    std::uint64_t config_epoch = 0;
+    if (tokens.size() != 5 || !ParseU64(tokens[1], first) ||
+        !ParseU64(tokens[2], last) || first > last ||
+        last >= kMetaSlotCount || tokens[3].empty() ||
+        tokens[3].size() > kMaxMetaGroupIdBytes ||
+        !ParseU64(tokens[4], config_epoch)) {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandleSetSlotMap(
+        coordinator, std::move(state_machine), std::move(principal),
+        static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last),
+        tokens[3], config_epoch);
+  }
+  if (command == "activateauthority") {
+    std::uint64_t expected_term = 0;
+    std::uint64_t lease_duration_ms = 0;
+    std::uint64_t policy_version = 0;
+    std::uint64_t authority_version = 0;
+    std::uint64_t config_epoch = 0;
+    if (tokens.size() != 9 || tokens[1].empty() ||
+        tokens[1].size() > kMaxMetaGroupIdBytes ||
+        !ParseU64(tokens[2], expected_term) || !IsNodeId(tokens[3]) ||
+        !ParseU64(tokens[4], lease_duration_ms) || lease_duration_ms == 0 ||
+        lease_duration_ms > std::numeric_limits<std::uint32_t>::max() ||
+        tokens[5].empty() || tokens[5].size() > kMaxMetaPolicyIdBytes ||
+        !ParseU64(tokens[6], policy_version) || policy_version == 0 ||
+        !ParseU64(tokens[7], authority_version) || authority_version == 0 ||
+        !ParseU64(tokens[8], config_epoch) || config_epoch == 0) {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandleActivateAuthority(
+        coordinator, std::move(state_machine), std::move(principal), tokens[1],
+        expected_term, tokens[3], lease_duration_ms, tokens[5], policy_version,
+        authority_version, config_epoch);
+  }
+  if (command == "fencegroup") {
+    std::uint64_t expected_term = 0;
+    if (tokens.size() != 3 || tokens[1].empty() ||
+        tokens[1].size() > kMaxMetaGroupIdBytes ||
+        !ParseU64(tokens[2], expected_term)) {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandleFenceGroup(
+        coordinator, std::move(state_machine), std::move(principal), tokens[1],
+        expected_term);
+  }
   if (command == "transitionop") {
     if (tokens.size() != 4) {
       co_return "ERR bad-request";
@@ -1286,6 +1476,8 @@ celer::Task<std::string> DispatchCommand(
       command == "abortop" || command == "archiveoperations" ||
       command == "registernode" || command == "creategroup" ||
       command == "assignnode" || command == "begingroupterm" ||
+      command == "putpolicy" || command == "setslotmap" ||
+      command == "activateauthority" || command == "fencegroup" ||
       command == "transitionop" || command == "pruneaudit" ||
       command == "setauditpolicy" || command == "pruneoperations") {
     std::string reply = co_await DispatchMutationVerb(

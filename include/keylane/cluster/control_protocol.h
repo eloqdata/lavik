@@ -82,6 +82,9 @@ enum class MessageType : std::uint16_t {
   kResultCommitted = 15,
   kResultNoLongerTracked = 16,
   kOperationEvidence = 17,
+  // Frame-sized canonical FullDesiredState. Larger projections use the
+  // existing TransferKind::kFullDesiredState Start/Chunk/End form.
+  kFullDesiredState = 18,
 };
 
 struct Frame {
@@ -684,10 +687,11 @@ struct WireProjectedDirective {
                          const WireProjectedDirective&) = default;
 };
 
-// Complete node-specific semantic projection sent as a FullDesiredState
-// large object after each accepted session. `object_hash` is derived from the
-// canonical bytes: it is not encoded (which would be self-referential), is
-// ignored when encoding, and is populated by DecodeFullDesiredState.
+// Complete node-specific semantic projection sent either as one typed frame
+// or as a FullDesiredState large object after each accepted session.
+// `object_hash` is derived from the canonical bytes: it is not encoded (which
+// would be self-referential), is ignored when encoding, and is populated by
+// DecodeFullDesiredState.
 struct FullDesiredState {
   std::uint64_t source_meta_applied_index = 0;
   std::uint64_t topology_epoch = 0;
@@ -727,7 +731,7 @@ using WireMessage =
                  TransferEnd, TransferAbort, FullStateApplied, Heartbeat,
                  HeartbeatAck, OperationEvidence, Fence, FenceAck, Directive,
                  DirectiveReceipt, DirectiveResult, ResultCommitted,
-                 ResultNoLongerTracked>;
+                 ResultNoLongerTracked, FullDesiredState>;
 
 MessageType MessageTypeOf(const WireMessage& message) noexcept;
 
@@ -739,8 +743,10 @@ absl::StatusOr<WireMessage> DecodeMessage(MessageType type,
                                           std::string_view payload);
 
 // Heartbeat and HeartbeatAck (which carries a lease grant) are never eligible
-// for Start/Chunk/End fragmentation.  All v1 frames still obey the global
-// 16-KiB frame cap.
+// for Start/Chunk/End fragmentation. The typed FullDesiredState alternative
+// is likewise frame-only; its sender selects the transfer form before creating
+// a message when the canonical bytes are larger. All v1 frames still obey the
+// global 16-KiB frame cap.
 bool RequiresSingleFrame(MessageType type) noexcept;
 
 }  // namespace keylane::cluster::control

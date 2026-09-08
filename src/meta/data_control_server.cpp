@@ -355,6 +355,11 @@ class SessionIo {
                                              std::move(bytes));
   }
 
+  celer::Task<absl::Status> SendFullDesiredState(
+      std::shared_ptr<const std::string> encoded) {
+    co_return co_await writer_.WriteFullDesiredState(std::move(encoded));
+  }
+
   void FailDeadline(std::string_view operation) {
     worker_.BeginClose(
         connection_,
@@ -1681,8 +1686,7 @@ celer::Task<absl::Status> SendFullState(
   const std::string* encoded_member = &batch->encoded_full_state;
   auto encoded =
       std::shared_ptr<const std::string>(std::move(batch), encoded_member);
-  co_return co_await io.SendTransfer(control::TransferKind::kFullDesiredState,
-                                     std::move(encoded));
+  co_return co_await io.SendFullDesiredState(std::move(encoded));
 }
 
 celer::Task<absl::Status> AbortSupersededReplacement(
@@ -1937,12 +1941,55 @@ celer::Task<absl::Status> SendReplacementFullStateLive(
     co_return absl::ResourceExhaustedError(
         "FullDesiredState transfer exceeds its object-size limit");
   }
-  auto object_id = control::GenerateId128();
-  if (!object_id.ok()) co_return object_id.status();
   if (state->expected_applied_.has_value()) {
     co_return absl::InternalError(
         "publisher attempted overlapping FullStateApplied handshakes");
   }
+
+  if (bytes.size() <= control::kMaxFramePayloadBytes) {
+    auto boundary =
+        co_await CheckLiveTransferBoundary(state, installed, replacement);
+    if (!boundary.ok()) co_return boundary.status();
+    if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
+      co_return absl::AbortedError(
+          "FullDesiredState was superseded before its direct frame");
+    }
+
+    // Arm before the single frame for the same reason the streamed path arms
+    // before TransferEnd: the reader may observe an immediate Applied while
+    // this producer is still returning from the socket write.
+    state->expected_applied_ = AppliedReceipt(replacement);
+    state->applied_received_ = false;
+    if (absl::Status armed = state->applied_ack_deadline_->Arm(
+            std::chrono::milliseconds(
+                state->core_->options_.session_progress_timeout_ms_));
+        !armed.ok()) {
+      ClearPublisherApplied(state);
+      co_return armed;
+    }
+    if (absl::Status sent = co_await state->io_->Send(
+            control::MessagePriority::kReliable,
+            control::WireMessage(replacement.full_state));
+        !sent.ok()) {
+      ClearPublisherApplied(state);
+      co_return sent;
+    }
+    boundary =
+        co_await CheckLiveTransferBoundary(state, installed, replacement);
+    if (!boundary.ok()) {
+      ClearPublisherApplied(state);
+      co_return boundary.status();
+    }
+    if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
+      ClearPublisherApplied(state);
+      co_return absl::AbortedError(
+          "FullDesiredState was superseded after its direct frame");
+    }
+    co_return co_await AwaitPublisherApplied(state);
+  }
+
+  auto object_id = control::GenerateId128();
+  if (!object_id.ok()) co_return object_id.status();
   const control::TransferStart start{
       .kind = control::TransferKind::kFullDesiredState,
       .object_id = *object_id,

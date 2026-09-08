@@ -174,10 +174,16 @@ releases all leases before relocation retries or the next wave, while external,
 in-memory, remote-owner, or stale-location cases use the complete single-key
 fallback path.
 
-Blocking List, Sorted Set, and Stream commands release database admission while
-waiting and reacquire it for each concrete attempt. Their waiter registry and
-readiness events are implemented in the Redis subsystem, while storage remains
-the source of truth checked after wakeup.
+Top-level blocking List and Sorted Set writes and `XREADGROUP` release database
+admission while waiting and reacquire it for each concrete attempt. In cluster
+mode they also re-admit and register a fresh authority in-flight guard for that
+attempt, then release the guard before waiter registration or sleep. Immediate
+EXEC and Lua forms do not wait and stay within their enclosing authority
+window. Read-only `XREAD` and keyless `WAIT` register no mutation guard. The
+waiter registry and readiness events are implemented in the Redis subsystem,
+while storage remains the source of truth checked after wakeup. This
+attempt-scoped ownership lets fencing drain promptly even when a client waits
+without a timeout.
 
 External data commands capture the replication manager's packed
 serving-generation/open token at dispatch and revalidate it after obtaining

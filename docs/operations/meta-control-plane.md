@@ -228,6 +228,45 @@ the trusted Meta proposer generates a fresh nonzero 128-bit value from the OS
 CSPRNG for that membership incarnation. Repeating the same desired membership
 is idempotent; removing and later re-adding it generates another identity.
 
+The authenticated operator surface also exposes the typed commits needed to
+assemble or revoke finite authority. These are low-level, absolute-state
+operations intended for controlled bootstrap and recovery workflows:
+
+```text
+putpolicy <policy-id> <version> <content>
+setslotmap <first> <last> <group-id> <config-epoch>
+activateauthority <group-id> <expected-term> <owner-node-id> <lease-ms> \
+                  <policy-id> <policy-version> \
+                  <new-authority-version> <new-config-epoch>
+fencegroup <group-id> <expected-term>
+```
+
+`putpolicy` computes the content hash inside the trusted Meta proposer;
+`content` is one non-empty, whitespace-free token. `setslotmap` replaces the
+entire slot map with one inclusive range—it is not an incremental assignment
+command—and sets the named group's absolute config epoch. Both slot endpoints
+must be within 0–16383.
+
+`activateauthority` is the atomic owner/grant commit. The term must already
+have been established with `begingroupterm`, the owner must hold a current
+assignment, and the policy version must already be committed and active. Term,
+authority version, config epoch, policy version, and lease duration are
+absolute values, not increments. Raft apply checks them against committed
+state, rejects stale or conflicting transitions without changing authority,
+and may accept an identical domain effect idempotently. Only the cluster-wide
+topology epoch is derived by the leader from its committed snapshot.
+`fencegroup` removes the grant under the explicit expected-term CAS. Treat
+`setslotmap`, `activateauthority`, and `fencegroup` as dangerous: verify the
+current leader and intended group/owner before issuing them, and do not retry
+an uncertain result with newly invented version values until the committed
+state has been checked.
+
+These commits alone do not make a newly assigned Data node population-ready.
+Until a reconciliation workflow installs a matching ReadyToken, heartbeats
+challenge the committed grant but receive a node-not-ready denial and the Data
+node remains fenced/LOADING. Never interpret `activateauthority` returning
+`OK` as proof that client writes are enabled.
+
 For a plaintext development deployment, start the registered node with:
 
 ```sh

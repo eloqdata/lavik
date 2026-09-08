@@ -167,6 +167,14 @@ class ControlSessionWriter {
       MessagePriority priority, WireMessage message,
       std::function<void()> before_write = std::function<void()>{});
 
+  // Sends canonical EncodeFullDesiredState output through the reliable lane
+  // when it fits one frame. Only an oversized object enters the serialized
+  // Start/Chunk/End transfer path, where bulk chunks remain preemptible by
+  // authority and reliable frames. Direct decode derives the same object hash
+  // that the transfer envelope protects for streamed objects.
+  celer::Task<absl::Status> WriteFullDesiredState(
+      std::shared_ptr<const std::string> encoded);
+
   // The immutable owner is retained by the scheduled request. This keeps a
   // queued transfer valid even if its producer coroutine is cancelled, while
   // allowing FullDesiredState to use an aliasing shared_ptr without copying a

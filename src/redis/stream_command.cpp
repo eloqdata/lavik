@@ -1015,6 +1015,21 @@ Task<CommandReply> ExecuteRead(
         error != nullptr) [[unlikely]] {
       co_return Built(builder.AppendError(error));
     }
+    // A top-level XREADGROUP can remain dormant indefinitely but mutates
+    // consumer/PENDING state on each concrete read attempt. Its assignment
+    // guard covers only those owner hops, not waiter registration or sleep
+    // below. EXEC/Lua locked execution already retains its enclosing
+    // transaction/script authority window and must not re-admit one child
+    // against a newer projection midway through that atomic operation.
+    cluster::AuthorityInFlightGuards attempt_authority;
+    if (group_read && owns_attempt_gate) {
+      if (std::optional<CommandReply> fenced =
+              RegisterClusterBlockingWriteAttempt(
+                  attempt_request, builder, &attempt_authority);
+          fenced.has_value()) {
+        co_return std::move(*fenced);
+      }
+    }
     std::vector<std::pair<std::string, std::vector<ReadOneResult::Item>>> found;
     for (std::size_t k = 0; k < key_count; ++k) {
       std::string key = a[first_key + k];
@@ -1070,6 +1085,9 @@ Task<CommandReply> ExecuteRead(
         found.emplace_back(a[first_key + k], std::move(one->entries_));
       }
     }
+    // The awaited owner hops above contain every mutation from this attempt.
+    // Release before the code can register or enter a dormant wait.
+    attempt_authority.clear();
     initialized_dollars = true;
     if (!found.empty()) {
       if (builder.version() == RespVersion::k3)

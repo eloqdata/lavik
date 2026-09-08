@@ -17,6 +17,7 @@
 #include "gtest/gtest.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/commands.h"
+#include "keylane/meta/control_projector.h"
 #include "keylane/meta/encoding.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/state_apply.h"
@@ -2585,8 +2586,11 @@ TEST(MetaStateApply,
   const std::size_t full_operation_count =
       control::kMaxProjectedDirectives /
       keylane::meta::kMaxMetaDirectivesPerOperation;
+  // Seed all but the last per-operation block through the store seam to keep
+  // this cap test linear. The final block and the one-over command below go
+  // through ApplyCommitted, which is the behavior under test.
   for (std::size_t operation_ordinal = 0;
-       operation_ordinal < full_operation_count; ++operation_ordinal) {
+       operation_ordinal + 1 < full_operation_count; ++operation_ordinal) {
     keylane::meta::SubmitOperation submit =
         MakeSubmit(static_cast<std::uint8_t>(operation_ordinal + 1),
                    static_cast<std::uint8_t>(operation_ordinal + 101));
@@ -2609,9 +2613,31 @@ TEST(MetaStateApply,
             .ok());
   }
 
+  keylane::meta::SubmitOperation boundary_operation = MakeSubmit(0x6f, 0x70);
+  boundary_operation.replication_history_id_.fill(3);
+  ApplyOk(stores, log_index++, MetaCommand{boundary_operation});
+  keylane::meta::TransitionOperationPhase boundary_transition;
+  boundary_transition.operation_id_ = boundary_operation.operation_id_;
+  boundary_transition.kind_phase_blob_ = "dispatch";
+  boundary_transition.current_directives_.reserve(
+      keylane::meta::kMaxMetaDirectivesPerOperation);
+  for (std::size_t directive_ordinal = 0;
+       directive_ordinal < keylane::meta::kMaxMetaDirectivesPerOperation;
+       ++directive_ordinal) {
+    boundary_transition.current_directives_.push_back(
+        make_directive(directive_ordinal));
+  }
+  ApplyOk(stores, log_index++, MetaCommand{boundary_transition});
+
+  const auto boundary = keylane::meta::MetaControlProjector::ProjectNode(
+      keylane::meta::MetaCommittedView(stores, log_index - 1), MakeNodeId(1));
+  ASSERT_TRUE(boundary.ok()) << boundary.status();
+  EXPECT_EQ(boundary->full_state.current_directives.size(),
+            control::kMaxProjectedDirectives);
+
   keylane::meta::SubmitOperation overflow = MakeSubmit(0x70, 0x71);
   overflow.replication_history_id_.fill(3);
-  ASSERT_TRUE(stores.operation_.SubmitOperation(overflow, log_index++).ok());
+  ApplyOk(stores, log_index++, MetaCommand{overflow});
 
   keylane::meta::TransitionOperationPhase transition;
   transition.operation_id_ = overflow.operation_id_;
@@ -2638,6 +2664,134 @@ TEST(MetaStateApply,
       ApplyRejected(stores, log_index, MetaCommand{transition});
   EXPECT_EQ(replay, first);
   EXPECT_EQ(DomainStateBytes(stores), domain_before);
+  EXPECT_EQ(stores.audit_.size(), audit_size_before + 1);
+}
+
+TEST(MetaStateApply,
+     TransitionRejectsAggregateRecipientProjectionOverPolicyCapAtomically) {
+  namespace control = keylane::cluster::control;
+
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 1)});
+
+  // The active grant contributes p@1 to every node projection. Build exactly
+  // the remaining number of distinct policy references across operations;
+  // every individual operation remains within its own reference cap.
+  constexpr std::size_t kOperationPolicyCount =
+      control::kMaxProjectedPolicies - 1;
+  std::vector<std::string> policy_ids;
+  policy_ids.reserve(kOperationPolicyCount + 1);
+  std::uint64_t log_index = 7;
+  for (std::size_t ordinal = 0; ordinal <= kOperationPolicyCount; ++ordinal) {
+    policy_ids.push_back(absl::StrCat("projection-policy-", ordinal));
+    ASSERT_TRUE(
+        stores.policy_.Apply(MakePutPolicy(policy_ids.back(), 1, "x")).ok());
+  }
+
+  const auto make_operation_id = [](std::size_t ordinal) {
+    keylane::meta::MetaOperationId id{};
+    for (std::size_t byte = 0; byte < sizeof(ordinal); ++byte) {
+      id[byte] = static_cast<std::uint8_t>(ordinal >> (byte * 8));
+    }
+    id.back() = 0xa5;
+    return id;
+  };
+  const auto make_directive = [] {
+    keylane::meta::MetaDirectiveSpec directive;
+    directive.directive_id_.fill(1);
+    directive.attempt_id_.fill(2);
+    directive.recipient_node_id_ = MakeNodeId(1);
+    directive.target_node_id_ = MakeNodeId(1);
+    directive.target_boot_id_.fill(1);
+    directive.assignment_id_.fill(1);
+    directive.source_node_id_ = MakeNodeId(1);
+    directive.source_assignment_id_.fill(1);
+    directive.source_boot_id_.fill(2);
+    directive.source_replication_history_id_.fill(3);
+    directive.group_id_ = "g1";
+    directive.group_term_ = 1;
+    directive.authority_version_ = 1;
+    directive.grant_revision_ = 6;
+    directive.kind_ = "authorize-source";
+    return directive;
+  };
+
+  std::size_t policy_cursor = 0;
+  std::size_t operation_ordinal = 1;
+  const std::size_t directly_seeded_policy_count =
+      kOperationPolicyCount -
+      keylane::meta::kMaxMetaPolicyReferencesPerOperation;
+  // As above, direct store setup avoids repeatedly encoding a growing FDS.
+  // The transition that reaches the exact boundary still uses ApplyCommitted.
+  while (policy_cursor < directly_seeded_policy_count) {
+    keylane::meta::SubmitOperation submit = MakeSubmit(0x70, 0x71);
+    submit.operation_id_ = make_operation_id(operation_ordinal++);
+    submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
+    submit.replication_history_id_.fill(3);
+    const std::size_t end = std::min(
+        policy_cursor + keylane::meta::kMaxMetaPolicyReferencesPerOperation,
+        directly_seeded_policy_count);
+    for (; policy_cursor < end; ++policy_cursor) {
+      submit.policy_references_.push_back({policy_ids[policy_cursor], 1});
+    }
+    ASSERT_TRUE(stores.operation_.SubmitOperation(submit, log_index++).ok());
+
+    keylane::meta::TransitionOperationPhase transition;
+    transition.operation_id_ = submit.operation_id_;
+    transition.kind_phase_blob_ = "dispatch";
+    transition.current_directives_ = {make_directive()};
+    ASSERT_TRUE(
+        stores.operation_.TransitionOperationPhase(transition, log_index++)
+            .ok());
+  }
+
+  keylane::meta::SubmitOperation boundary_operation = MakeSubmit(0x74, 0x75);
+  boundary_operation.operation_id_ = make_operation_id(operation_ordinal++);
+  boundary_operation.intent_hash_ =
+      keylane::meta::MetaSha256(boundary_operation.intent_);
+  boundary_operation.replication_history_id_.fill(3);
+  for (; policy_cursor < kOperationPolicyCount; ++policy_cursor) {
+    boundary_operation.policy_references_.push_back(
+        {policy_ids[policy_cursor], 1});
+  }
+  ApplyOk(stores, log_index++, MetaCommand{boundary_operation});
+  keylane::meta::TransitionOperationPhase boundary_transition;
+  boundary_transition.operation_id_ = boundary_operation.operation_id_;
+  boundary_transition.kind_phase_blob_ = "dispatch";
+  boundary_transition.current_directives_ = {make_directive()};
+  ApplyOk(stores, log_index++, MetaCommand{boundary_transition});
+
+  const auto boundary = keylane::meta::MetaControlProjector::ProjectNode(
+      keylane::meta::MetaCommittedView(stores, log_index - 1), MakeNodeId(1));
+  ASSERT_TRUE(boundary.ok()) << boundary.status();
+  EXPECT_EQ(boundary->full_state.policies.size(),
+            control::kMaxProjectedPolicies);
+
+  keylane::meta::SubmitOperation overflow = MakeSubmit(0x72, 0x73);
+  overflow.operation_id_ = make_operation_id(operation_ordinal);
+  overflow.intent_hash_ = keylane::meta::MetaSha256(overflow.intent_);
+  overflow.replication_history_id_.fill(3);
+  overflow.policy_references_ = {{policy_ids.back(), 1}};
+  ApplyOk(stores, log_index++, MetaCommand{overflow});
+
+  keylane::meta::TransitionOperationPhase transition;
+  transition.operation_id_ = overflow.operation_id_;
+  transition.kind_phase_blob_ = "would-overflow";
+  transition.current_directives_ = {make_directive()};
+  const std::string domain_before = DomainStateBytes(stores);
+  const std::size_t audit_size_before = stores.audit_.size();
+
+  const MetaApplyResult rejected =
+      ApplyRejected(stores, log_index, MetaCommand{transition});
+  EXPECT_NE(rejected.detail_.find("policies exceeds its entry cap"),
+            std::string::npos)
+      << rejected.detail_;
+  EXPECT_EQ(DomainStateBytes(stores), domain_before);
+  const auto record = stores.operation_.FindOperation(overflow.operation_id_);
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(record->revision_, 0u);
+  EXPECT_TRUE(record->current_directives_.empty());
   EXPECT_EQ(stores.audit_.size(), audit_size_before + 1);
 }
 

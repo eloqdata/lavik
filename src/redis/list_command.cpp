@@ -994,6 +994,11 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
 
   auto attempt =
       [&](BlockingWakeCascade* cascade) -> Task<BlockingAttemptResult> {
+    // ExecuteBlockingWaitLoop may have re-armed the original request after an
+    // authority publication. The rewritten non-blocking form must carry that
+    // exact protected proof into its transaction validators.
+    nonblocking.cluster_authority_admission_ =
+        request.cluster_authority_admission_;
     nonblocking.blocking_wake_cascade_ = cascade;
     ReplyBuilder attempt_builder(nonblocking.resp_version_);
     bool unavailable = false;

@@ -14,9 +14,19 @@ the same FDS/heartbeat flow.  A certificate signed by the same CA but naming a
 different Data principal must remain connected to neither control authority
 nor FDS while the process itself stays healthy.
 
-No group is assigned in this gate.  Heartbeats therefore exercise the merged
-message's explicit NoChallenge path; owner/grant challenge policy and the full
-failover workflow require separate reconciliation coverage.
+The plaintext scenario commits one assigned slot-owning group and active
+authority.  A fresh Meta-managed Data node intentionally has no ReadyToken
+until a later reconciliation workflow populates it, so its merged heartbeat
+must carry a lease challenge and receive a typed node-not-ready denial.  This
+gate also drives a committed fence: the replacement FDS can arrive only after
+the Data node has fenced locally, drained, and returned FenceAck.
+
+The mTLS scenario remains grantless and therefore retains explicit
+NoChallenge coverage independently of the authority-bearing plaintext path.
+Without that first ReadyToken no keyed write can be admitted, so an
+indefinitely blocked write cannot exercise a non-empty process-level drain in
+this gate; the request/NodeControl drain seams cover that ordering in unit
+tests until reconciliation can bootstrap the population.
 
 Usage: gate_data_control.py /path/to/keylane-meta /path/to/keylane [workdir]
 """
@@ -36,12 +46,21 @@ import harness as H  # noqa: E402
 DATA_NODE = "1111111111111111111111111111111111111111"
 BAD_DATA_NODE = "2222222222222222222222222222222222222222"
 OTHER_DATA_NODE = "3333333333333333333333333333333333333333"
+GROUP = "gate-group"
+POLICY = "gate-lease"
 DATA_FILE_BYTES = 128 * 1024 * 1024
 
 
 def expect_ok(reply, label):
     if not reply.startswith("OK"):
         raise H.Failure(f"{label}: {reply}")
+
+
+def expect_commit(reply, label):
+    match = re.fullmatch(r"OK (\d+)", reply)
+    if match is None:
+        raise H.Failure(f"{label}: {reply}")
+    return int(match.group(1))
 
 
 def allocate_data_file(path):
@@ -234,7 +253,22 @@ def register_data_node(leader, data):
     expect_ok(reply, f"register Data node {data.node_id[:8]}")
 
 
-def assert_healthy_session(data, leader, minimum_fds=1):
+def seed_assigned_authority(leader, data):
+    expect_commit(leader.creategroup(GROUP), "create assigned group")
+    expect_commit(leader.assignnode(GROUP, data.node_id),
+                  "assign Data node")
+    expect_commit(leader.begingroupterm(GROUP, 0, 1), "begin group term")
+    expect_commit(leader.putpolicy(POLICY, 1, "lease-v1"),
+                  "commit lease policy")
+    expect_commit(leader.setslotmap(0, 16383, GROUP, 1),
+                  "assign all slots")
+    return expect_commit(
+        leader.activateauthority(GROUP, 1, data.node_id, 5000,
+                                 POLICY, 1, 1, 1),
+        "activate authority")
+
+
+def assert_grantless_session(data, leader, minimum_fds=1):
     data.wait_metric(
         "keylane_cluster_control_connected", lambda value: value == 1,
         f"Data node {data.node_id[:8]} accepts Meta leader")
@@ -257,6 +291,42 @@ def assert_healthy_session(data, leader, minimum_fds=1):
         raise H.Failure("NoChallenge heartbeat was counted as a lease denial")
 
 
+def assert_authority_challenge_denied(data, leader, minimum_fds=1,
+                                      prior_denials=0):
+    data.wait_metric(
+        "keylane_cluster_control_connected", lambda value: value == 1,
+        f"Data node {data.node_id[:8]} accepts Meta leader")
+    data.wait_metric(
+        "keylane_cluster_control_full_states_applied_total",
+        lambda value: value >= minimum_fds,
+        f"Data node {data.node_id[:8]} applies authority FDS #{minimum_fds}")
+    data.wait_metric(
+        "keylane_cluster_control_lease_decisions_total",
+        lambda value: value > prior_denials,
+        "assigned owner challenges authority and decodes LeaseDenied",
+        labels='{decision="denied"}')
+    # This scenario commits the exact owner/term/version anchor while the real
+    # Data process has no ReadyToken. The server's typed policy unit test pins
+    # that unique denial branch to LeaseDenialReason::kNodeNotReady.
+    H.wait_until(
+        f"Meta leader {leader.id} ingests assigned Data heartbeat", 15,
+        lambda: observation_count(leader) >= 2)
+    if data.metric(
+            "keylane_cluster_control_lease_decisions_total",
+            '{decision="granted"}') != 0:
+        raise H.Failure(
+            "unpopulated assignment unexpectedly received a live lease")
+    if data.metric("keylane_cluster_control_protocol_errors_total") != 0:
+        raise H.Failure("authority denial recorded a protocol error")
+
+
+def assert_keyed_write_fenced(data, label):
+    reply = data.command_head(["SET", "{gate}key", "value"])
+    if not (reply.startswith("-LOADING") or
+            reply.startswith("-CLUSTERDOWN")):
+        raise H.Failure(f"{label}: keyed write was not fenced: {reply}")
+
+
 def run_plaintext(meta_binary, data_binary, workdir):
     scenario = os.path.join(workdir, "plaintext")
     os.makedirs(scenario, exist_ok=True)
@@ -270,12 +340,14 @@ def run_plaintext(meta_binary, data_binary, workdir):
         data = DataProcess(data_binary, os.path.join(scenario, "data"),
                            DATA_NODE, follower.data_control_endpoint)
         register_data_node(leader, data)
+        seeded_through = seed_assigned_authority(leader, data)
         H.wait_until(
-            "Data registration reaches the follower seed", 15,
-            lambda: follower.getnode(DATA_NODE).startswith("OK "))
+            "assigned authority reaches the follower seed", 15,
+            lambda: int(follower.status()["committed"]) >= seeded_through)
 
         data.start()
-        assert_healthy_session(data, leader)
+        assert_authority_challenge_denied(data, leader)
+        assert_keyed_write_fenced(data, "unready assignment")
         # Meta mode has only finite group authority. Process-wide mutations
         # have no group proof and remain rejected, while FUNCTION KILL/STATS
         # must bypass both loading fences so a running function cannot
@@ -306,10 +378,17 @@ def run_plaintext(meta_binary, data_binary, workdir):
                 "follower-only seed did not produce a redirect/reconnect")
         first_fds = data.metric(
             "keylane_cluster_control_full_states_applied_total")
-        H.log("plaintext: follower redirect, FDS, and heartbeat verified")
+        denials_before_loss = data.metric(
+            "keylane_cluster_control_lease_decisions_total",
+            '{decision="denied"}')
+        H.log("plaintext: assigned authority challenge/denial verified")
 
         old_leader = leader
         old_leader.kill9()
+        data.wait_metric(
+            "keylane_cluster_control_connected", lambda value: value == 0,
+            "Data node observes authority-session loss", timeout=5)
+        assert_keyed_write_fenced(data, "lost authority session")
         survivors = [node for node in nodes if node.id != old_leader.id]
         leader = H.find_leader(survivors, timeout=15)
         data.wait_metric(
@@ -324,12 +403,26 @@ def run_plaintext(meta_binary, data_binary, workdir):
             "keylane_cluster_control_reconnects_total")
         if current_reconnects <= redirected_reconnects:
             raise H.Failure("leader death did not advance reconnect attempts")
-        H.wait_until(
-            "replacement leader ingests a fresh heartbeat", 15,
-            lambda: observation_count(leader) >= 2)
+        assert_authority_challenge_denied(
+            data, leader, minimum_fds=first_fds + 1,
+            prior_denials=denials_before_loss)
+        H.log("plaintext: session loss remains fail-closed and reconnects")
+
+        before_fence_fds = data.metric(
+            "keylane_cluster_control_full_states_applied_total")
+        expect_commit(leader.fencegroup(GROUP, 1), "fence active group")
+        # Meta does not publish the grantless replacement until the Data node
+        # has closed admission, run the superseded-anchor drain barrier, and
+        # returned FenceAck. Observing that replacement is therefore the
+        # process-level proof of the whole Fence/FenceAck barrier.
+        data.wait_metric(
+            "keylane_cluster_control_full_states_applied_total",
+            lambda value: value > before_fence_fds,
+            "Data FenceAck releases grantless replacement FDS", timeout=15)
         if data.metric("keylane_cluster_control_protocol_errors_total") != 0:
-            raise H.Failure("leader change recorded a protocol error")
-        H.log("plaintext: leader replacement and full re-sync verified")
+            raise H.Failure("Fence/FenceAck recorded a protocol error")
+        assert_keyed_write_fenced(data, "committed group fence")
+        H.log("plaintext: Fence/FenceAck replacement ordering verified")
 
         old_leader.start(bootstrap=False)
         H.wait_until(
@@ -462,7 +555,7 @@ def run_mtls(meta_binary, data_binary, workdir):
             tls=(ca_cert, good_cert, good_key))
         register_data_node(meta, good_data)
         good_data.start()
-        assert_healthy_session(good_data, meta)
+        assert_grantless_session(good_data, meta)
         good_data.terminate()
         meta.terminate()
         H.log("mTLS: matching Meta/Data URI SAN session verified")

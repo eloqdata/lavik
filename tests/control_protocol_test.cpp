@@ -539,6 +539,44 @@ TEST(ControlProtocolFullStateTest, RoundTripsEmptyTopologyAtEpochZero) {
 }
 
 TEST(ControlProtocolFullStateTest,
+     FrameSizedProjectionRoundTripsAsTypedMessage) {
+  control::FullDesiredState state;
+  state.source_meta_applied_index = 1;
+  auto directives =
+      control::ComputeDirectiveSetDigest(state.current_directives);
+  ASSERT_TRUE(directives.ok()) << directives.status();
+  state.directive_set_digest = *directives;
+  auto projection = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(projection.ok()) << projection.status();
+  state.projection_hash = *projection;
+
+  control::WireMessage message = state;
+  EXPECT_EQ(control::MessageTypeOf(message),
+            control::MessageType::kFullDesiredState);
+  auto encoded = control::EncodeMessage(message);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  ASSERT_LE(encoded->size(), control::kMaxFramePayloadBytes);
+
+  control::FrameEncoder frame_encoder;
+  auto framed = frame_encoder.Encode(control::MessageTypeOf(message), *encoded);
+  ASSERT_TRUE(framed.ok()) << framed.status();
+  EXPECT_EQ(framed->size(), control::kFrameHeaderBytes + encoded->size());
+  control::FrameDecoder frame_decoder;
+  auto frame = frame_decoder.Decode(*framed);
+  ASSERT_TRUE(frame.ok()) << frame.status();
+  EXPECT_EQ(frame->type, control::MessageType::kFullDesiredState);
+
+  auto decoded = control::DecodeMessage(
+      control::MessageType::kFullDesiredState, frame->payload);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  const auto* full_state =
+      std::get_if<control::FullDesiredState>(&*decoded);
+  ASSERT_NE(full_state, nullptr);
+  state.object_hash = Sha256(*encoded);
+  EXPECT_EQ(*full_state, state);
+}
+
+TEST(ControlProtocolFullStateTest,
      ProjectionHashExcludesAppliedIndexButCoversSemantics) {
   control::FullDesiredState state;
   state.source_meta_applied_index = 10;

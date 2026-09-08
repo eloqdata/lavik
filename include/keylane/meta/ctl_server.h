@@ -57,6 +57,26 @@
 //   getnode <node_id>      -> "OK principal=<p> role=<primary|replica>
 //                             revision=<n> retired=<0|1>" / "ERR not-found";
 //                             same non-linearizable read semantics as getop.
+//   putpolicy <policy_id> <version> <content>
+//                          -> commit one immutable policy version; content is
+//                             a whitespace-free token and its SHA-256 is
+//                             computed by this trusted proposer.
+//   setslotmap <first> <last> <group_id> <config_epoch>
+//                          -> replace the absolute slot map with one inclusive
+//                             range and set that group's absolute config
+//                             epoch. This deliberately narrow bootstrap form
+//                             does not imply incremental slot mutation.
+//   activateauthority <group_id> <expected_term> <owner_node_id>
+//                     <lease_ms> <policy_id> <policy_version>
+//                     <new_authority_version> <new_config_epoch>
+//                          -> atomically activate the committed owner/grant;
+//                             the topology epoch is derived from the local
+//                             committed snapshot and every other CAS/absolute
+//                             value remains explicit operator input.
+//   fencegroup <group_id> <expected_term>
+//                          -> commit FenceGroup under the current term. Data
+//                             sessions fence and drain the superseded anchor
+//                             before acknowledging its replacement FDS.
 //   status                 -> "OK leader=<0|1> id=<n> committed=<idx>
 //                             snapshot_idx=<idx> term=<n>".
 //   addsrv <id> <raft-ip:port> <data-control-ip:port>
@@ -88,18 +108,15 @@
 //                             a later asynchronous write failure only skips
 //                             this compaction round.
 //
-// Observation surface: MetaObservationStore is volatile and
-// leader-local, so this whole verb family manipulates process-local state —
-// nothing here is replicated:
-//   creategroup <group_id> / begingroupterm <group_id> <expected> <new> /
-//   transitionop <id32hex> <phase> <history40hex>
-//                          -> committed-state drivers so the gates can build
-//                             the population/history anchors observation
-//                             freshness checks match against; same propose +
-//                             effect-verification reply shape as submitop.
-//                             transitionop appends an evidence summary whose
-//                             replication_history_id is what later anchors
-//                             `obs evidence` (HistoryBoundToOperation).
+// creategroup, assignnode, begingroupterm, and transitionop are also typed,
+// committed-state drivers used by operators and gates to build the anchors
+// against which observation freshness is checked. transitionop appends an
+// evidence summary whose replication_history_id is what later anchors
+// `obs evidence` (HistoryBoundToOperation).
+//
+// Observation surface: MetaObservationStore is volatile and leader-local, so
+// this whole verb family manipulates process-local state — nothing here is
+// replicated:
 //   adoptsession <node_id> <boot_hex40> <gen>
 //                          -> MetaObservationStore::AdoptSession with the
 //                             transport-authorized session identity; "OK" /

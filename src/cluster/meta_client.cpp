@@ -1016,6 +1016,15 @@ struct MetaControlClientService::Impl {
       control::ControlFrameStream& frames, SocketDeadline& deadline,
       std::chrono::milliseconds progress_timeout,
       std::optional<control::WireMessage> first = std::nullopt) {
+    if (!first.has_value()) {
+      auto read = co_await ReadWithDeadline(
+          frames, deadline, progress_timeout, "initial FullDesiredState");
+      if (!read.ok()) co_return read.status();
+      first = std::move(*read);
+    }
+    if (auto* direct = std::get_if<control::FullDesiredState>(&*first)) {
+      co_return std::move(*direct);
+    }
     auto transfer = co_await ReceiveTransfer(frames, deadline, progress_timeout,
                                              std::move(first));
     if (!transfer.ok()) co_return transfer.status();
@@ -1488,6 +1497,49 @@ struct MetaControlClientService::Impl {
     if (state->terminal_error_.has_value()) {
       co_return *state->terminal_error_;
     }
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> ApplyFullStateReplacement(
+      const std::shared_ptr<SessionState>& state,
+      control::ControlSessionWriter& writer,
+      control::FullDesiredState replacement) {
+    DisableDirectiveDispatch(state);
+    RequestHeartbeatPause(state);
+    if (absl::Status quiesced = co_await WaitForHeartbeatQuiesced(state);
+        !quiesced.ok()) {
+      co_return quiesced;
+    }
+    if (absl::Status joined = co_await WaitForDirectiveExecutor(state);
+        !joined.ok()) {
+      co_return joined;
+    }
+    // Completion belongs to the projection under which its directive was
+    // accepted. Stop only the wire observers here; the FDS transition below
+    // either preserves the matching native population or retires it before
+    // FullStateApplied.
+    if (absl::Status cancelled =
+            co_await CancelAndWaitForDirectiveCompletions(state);
+        !cancelled.ok()) {
+      co_return cancelled;
+    }
+    if (absl::Status installed = co_await Install(replacement, state->boot_id_);
+        !installed.ok()) {
+      co_return installed;
+    }
+    state->desired_ = std::make_shared<control::FullDesiredState>(
+        std::move(replacement));
+    state->accepted_directives_.clear();
+    state->challenge_rotation_.Reset();
+    if (absl::Status applied = co_await SendApplied(writer, *state->desired_);
+        !applied.ok()) {
+      co_return applied;
+    }
+    // Both producers resume only after the replacement acknowledgement is
+    // completely written. Every subsequent admission, readiness proof, and
+    // challenge then derives from the same desired object.
+    state->directive_dispatch_enabled_ = true;
+    ResumeHeartbeat(state);
     co_return absl::OkStatus();
   }
 
@@ -2191,45 +2243,11 @@ struct MetaControlClientService::Impl {
           if (transfer.kind_ == control::TransferKind::kFullDesiredState) {
             auto replacement = control::DecodeFullDesiredState(transfer.bytes_);
             if (!replacement.ok()) co_return replacement.status();
-            DisableDirectiveDispatch(state);
-            RequestHeartbeatPause(state);
-            if (absl::Status quiesced =
-                    co_await WaitForHeartbeatQuiesced(state);
-                !quiesced.ok()) {
-              co_return quiesced;
-            }
-            if (absl::Status joined = co_await WaitForDirectiveExecutor(state);
-                !joined.ok()) {
-              co_return joined;
-            }
-            // Completion belongs to the projection under which its directive
-            // was accepted. Stop only the wire observers here; the FDS
-            // transition below either preserves the matching native
-            // population or retires it before FullStateApplied.
-            if (absl::Status cancelled =
-                    co_await CancelAndWaitForDirectiveCompletions(state);
-                !cancelled.ok()) {
-              co_return cancelled;
-            }
-            if (absl::Status installed =
-                    co_await Install(*replacement, replication_status.boot_id_);
-                !installed.ok()) {
-              co_return installed;
-            }
-            state->desired_ = std::make_shared<control::FullDesiredState>(
-                std::move(*replacement));
-            state->accepted_directives_.clear();
-            state->challenge_rotation_.Reset();
-            if (absl::Status applied =
-                    co_await SendApplied(writer, *state->desired_);
+            if (absl::Status applied = co_await ApplyFullStateReplacement(
+                    state, writer, std::move(*replacement));
                 !applied.ok()) {
               co_return applied;
             }
-            // Both producers resume only after the replacement acknowledgement
-            // is completely written. Every subsequent admission, readiness
-            // proof, and challenge then derives from the same desired object.
-            state->directive_dispatch_enabled_ = true;
-            ResumeHeartbeat(state);
             continue;
           }
           if (transfer.kind_ == control::TransferKind::kDirectivePayload) {
@@ -2255,6 +2273,22 @@ struct MetaControlClientService::Impl {
         // Ordinary control messages are dispatched even while a large object
         // is being reassembled. The one reader therefore never makes an
         // authority frame wait behind every bulk chunk.
+        if (auto* replacement =
+                std::get_if<control::FullDesiredState>(&*incoming)) {
+          // Meta serializes complete-object senders. A direct projection in
+          // the middle of another object would otherwise publish new control
+          // state while retaining an incomplete old payload, so fail closed.
+          if (transfer_active) {
+            co_return absl::FailedPreconditionError(
+                "direct FullDesiredState interrupted an inbound transfer");
+          }
+          if (absl::Status applied = co_await ApplyFullStateReplacement(
+                  state, writer, std::move(*replacement));
+              !applied.ok()) {
+            co_return applied;
+          }
+          continue;
+        }
         if (const auto* ack = std::get_if<control::HeartbeatAck>(&*incoming)) {
           if (absl::Status handled = co_await HandleHeartbeatAck(state, *ack);
               !handled.ok()) {

@@ -285,6 +285,27 @@ class Node:
         return self.ctl(f"begingroupterm {group_id} {expected} {new}",
                         timeout=timeout)
 
+    def putpolicy(self, policy_id, version, content, timeout=5.0):
+        return self.ctl(f"putpolicy {policy_id} {version} {content}",
+                        timeout=timeout)
+
+    def setslotmap(self, first, last, group_id, config_epoch, timeout=5.0):
+        return self.ctl(
+            f"setslotmap {first} {last} {group_id} {config_epoch}",
+            timeout=timeout)
+
+    def activateauthority(self, group_id, expected_term, owner_node_id,
+                          lease_ms, policy_id, policy_version,
+                          authority_version, config_epoch, timeout=5.0):
+        return self.ctl(
+            f"activateauthority {group_id} {expected_term} {owner_node_id} "
+            f"{lease_ms} {policy_id} {policy_version} "
+            f"{authority_version} {config_epoch}", timeout=timeout)
+
+    def fencegroup(self, group_id, expected_term, timeout=5.0):
+        return self.ctl(f"fencegroup {group_id} {expected_term}",
+                        timeout=timeout)
+
     def transitionop(self, op_id, phase, history, timeout=5.0):
         return self.ctl(
             f"transitionop {op_id} {phase} {self._history_id(history)}",

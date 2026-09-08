@@ -618,6 +618,29 @@ celer::Task<absl::Status> ControlSessionWriter::Write(
   co_return request->result_;
 }
 
+celer::Task<absl::Status> ControlSessionWriter::WriteFullDesiredState(
+    std::shared_ptr<const std::string> encoded) {
+  if (encoded == nullptr) {
+    co_return absl::InvalidArgumentError(
+        "FullDesiredState requires an immutable encoded payload owner");
+  }
+  if (encoded->size() > kMaxFullDesiredStateBytes) {
+    co_return absl::ResourceExhaustedError(
+        "FullDesiredState exceeds its object-size limit");
+  }
+  if (encoded->size() <= kMaxFramePayloadBytes) {
+    auto desired = DecodeFullDesiredState(*encoded);
+    if (!desired.ok()) co_return desired.status();
+    co_return co_await Write(MessagePriority::kReliable,
+                             WireMessage(std::move(*desired)));
+  }
+
+  auto object_id = GenerateId128();
+  if (!object_id.ok()) co_return object_id.status();
+  co_return co_await WriteTransfer(TransferKind::kFullDesiredState, *object_id,
+                                   std::move(encoded));
+}
+
 celer::Task<absl::Status> ControlSessionWriter::WriteTransfer(
     TransferKind kind, WireId128 object_id,
     std::shared_ptr<const std::string> bytes) {

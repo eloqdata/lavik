@@ -3589,6 +3589,11 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
   CommandRequest nonblocking = request;
   auto attempt =
       [&](BlockingWakeCascade* cascade) -> Task<BlockingAttemptResult> {
+    // The wait loop re-admits the original request for every attempt. Keep
+    // this rewritten request on the same proof so its shard validators do not
+    // reject a legitimately refreshed authority generation.
+    nonblocking.cluster_authority_admission_ =
+        request.cluster_authority_admission_;
     nonblocking.blocking_wake_cascade_ = cascade;
     ReplyBuilder attempt_builder(nonblocking.resp_version_);
     bool empty = false;

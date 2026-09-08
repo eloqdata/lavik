@@ -228,7 +228,7 @@ std::uint32_t Crc32c(std::string_view bytes) noexcept {
 
 bool IsKnownMessageType(std::uint16_t raw) noexcept {
   return raw >= static_cast<std::uint16_t>(MessageType::kClientHello) &&
-         raw <= static_cast<std::uint16_t>(MessageType::kOperationEvidence);
+         raw <= static_cast<std::uint16_t>(MessageType::kFullDesiredState);
 }
 
 bool IsZeroHash(const WireHash256& hash) noexcept {
@@ -1996,9 +1996,11 @@ MessageType MessageTypeOf(const WireMessage& message) noexcept {
           return MessageType::kDirectiveResult;
         } else if constexpr (std::is_same_v<T, ResultCommitted>) {
           return MessageType::kResultCommitted;
-        } else {
-          static_assert(std::is_same_v<T, ResultNoLongerTracked>);
+        } else if constexpr (std::is_same_v<T, ResultNoLongerTracked>) {
           return MessageType::kResultNoLongerTracked;
+        } else {
+          static_assert(std::is_same_v<T, FullDesiredState>);
+          return MessageType::kFullDesiredState;
         }
       },
       message);
@@ -2007,7 +2009,12 @@ MessageType MessageTypeOf(const WireMessage& message) noexcept {
 absl::StatusOr<std::string> EncodeMessage(const WireMessage& message) {
   auto encoded = std::visit(
       [](const auto& value) -> absl::StatusOr<std::string> {
-        return Encode(value);
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, FullDesiredState>) {
+          return EncodeFullDesiredState(value);
+        } else {
+          return Encode(value);
+        }
       },
       message);
   if (!encoded.ok()) return encoded.status();
@@ -2058,6 +2065,11 @@ absl::StatusOr<WireMessage> DecodeMessage(MessageType type,
       return DecodeResultNoLongerTracked(payload);
     case MessageType::kOperationEvidence:
       return DecodeOperationEvidence(payload);
+    case MessageType::kFullDesiredState: {
+      auto desired = DecodeFullDesiredState(payload);
+      if (!desired.ok()) return desired.status();
+      return WireMessage(std::move(*desired));
+    }
   }
   return ProtocolError("unknown message type");
 }
@@ -2068,6 +2080,7 @@ bool RequiresSingleFrame(MessageType type) noexcept {
     case MessageType::kHeartbeatAck:  // contains the authority grant
     case MessageType::kFence:
     case MessageType::kFenceAck:
+    case MessageType::kFullDesiredState:
       return true;
     default:
       return false;

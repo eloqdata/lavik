@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "../src/redis/cluster_gate.h"
+#include "../src/redis/blocking_wait.h"
 #include "absl/strings/str_cat.h"
 #include "keylane/cluster/runtime.h"
 #include "keylane/cluster/topology.h"
@@ -560,6 +561,32 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
       request.ClusterSlots(), /*connection_tls=*/false, reply_builder);
   EXPECT_FALSE(reply.close_connection_);
   EXPECT_EQ(reply.encoded_, "-CLUSTERDOWN Hash slot not served\r\n");
+}
+
+TEST(ClusterRequestAuthorityTest,
+     BlockingAttemptRegistersOnlyItsConcreteMutationWindow) {
+  const std::shared_ptr<const cluster::ServingState> state =
+      BuildThreeNodeState(false);
+  ASSERT_NE(state, nullptr);
+  ClusterRuntimeGuard runtime_guard(MakeRuntime(state));
+
+  keylane::CommandRequest request;
+  request.kind_ = keylane::CommandKind::kBLPop;
+  request.AddClusterSlot(42);
+  keylane::ReplyBuilder reply_builder(keylane::RespVersion::k2);
+  cluster::AuthorityInFlightGuards guards;
+
+  const std::optional<keylane::CommandReply> rejected =
+      keylane::RegisterClusterBlockingWriteAttempt(request, reply_builder,
+                                                   &guards);
+  ASSERT_FALSE(rejected.has_value());
+  EXPECT_EQ(guards.size(), 1u);
+  EXPECT_EQ(state->GroupInFlightCount("group-a"), 1u);
+
+  // ExecuteBlockingWaitLoop destroys this attempt-local guard before it
+  // registers or sleeps as a dormant waiter.
+  guards.clear();
+  EXPECT_EQ(state->GroupInFlightCount("group-a"), 0u);
 }
 
 }  // namespace

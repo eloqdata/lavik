@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "celer/runtime/runtime.h"
 #include "celer/runtime/worker.h"
 #include "gtest/gtest.h"
@@ -55,6 +56,26 @@ control::WireMessage OversizedDirective() {
       .kind = control::WireDirectiveKind::kRebuild,
       .payload = std::string(control::kMaxFramePayloadBytes, 'x'),
   };
+}
+
+absl::StatusOr<std::string> FullStatePayload(std::size_t policy_bytes) {
+  control::FullDesiredState state;
+  state.source_meta_applied_index = 1;
+  if (policy_bytes != 0) {
+    std::string content(policy_bytes, 'p');
+    state.policies.push_back({.policy_id = "policy",
+                              .version = 1,
+                              .content_hash = control::ComputeSha256(content),
+                              .content = std::move(content)});
+  }
+  auto directives =
+      control::ComputeDirectiveSetDigest(state.current_directives);
+  if (!directives.ok()) return directives.status();
+  state.directive_set_digest = *directives;
+  auto projection = control::ComputeProjectionHash(state);
+  if (!projection.ok()) return projection.status();
+  state.projection_hash = *projection;
+  return control::EncodeFullDesiredState(state);
 }
 
 using WriterScenario = std::function<celer::Task<absl::Status>(celer::Worker&)>;
@@ -417,6 +438,47 @@ struct OversizedWriterScenario {
   bool failed_ = true;
 };
 
+struct FullStateWriterScenario {
+  celer::Task<absl::Status> WriteFrame(
+      control::WireMessage message, std::function<void()> before_write) {
+    if (before_write) before_write();
+    frames_.push_back(std::move(message));
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> Run(celer::Worker&) {
+    auto small = FullStatePayload(0);
+    if (!small.ok()) co_return small.status();
+    auto large = FullStatePayload(control::kMaxFramePayloadBytes);
+    if (!large.ok()) co_return large.status();
+    if (small->size() > control::kMaxFramePayloadBytes ||
+        large->size() <= control::kMaxFramePayloadBytes) {
+      co_return absl::InternalError(
+          "test fixtures do not straddle the frame payload limit");
+    }
+    small_bytes_ = *small;
+    large_bytes_ = *large;
+
+    control::ControlSessionWriter writer(
+        [this](control::WireMessage message,
+               std::function<void()> before_write) {
+          return WriteFrame(std::move(message), std::move(before_write));
+        },
+        4 * control::kMaxFrameBytes);
+    small_status_ = co_await writer.WriteFullDesiredState(
+        std::make_shared<const std::string>(std::move(*small)));
+    large_status_ = co_await writer.WriteFullDesiredState(
+        std::make_shared<const std::string>(std::move(*large)));
+    co_return absl::OkStatus();
+  }
+
+  std::vector<control::WireMessage> frames_;
+  std::string small_bytes_;
+  std::string large_bytes_;
+  absl::Status small_status_ = absl::UnknownError("not run");
+  absl::Status large_status_ = absl::UnknownError("not run");
+};
+
 TEST(ControlWriteQueueTest, AuthorityOvertakesEarlierBulkAndSoftWork) {
   control::ControlWriteQueue queue(4096);
   ASSERT_TRUE(queue.Enqueue(control::MessagePriority::kSoft, Hello('1')).ok());
@@ -565,6 +627,37 @@ TEST(ControlSessionWriterTest,
   EXPECT_EQ(scenario->status_.code(), absl::StatusCode::kResourceExhausted);
   EXPECT_EQ(scenario->sink_calls_, 0u);
   EXPECT_FALSE(scenario->failed_);
+}
+
+TEST(ControlSessionWriterTest,
+     FullDesiredStateUsesOneFrameUntilItsPayloadRequiresStreaming) {
+  auto scenario = std::make_shared<FullStateWriterScenario>();
+  const absl::Status run = RunWriterScenario(
+      [scenario](celer::Worker& worker) { return scenario->Run(worker); });
+  ASSERT_TRUE(run.ok()) << run;
+  ASSERT_TRUE(scenario->small_status_.ok()) << scenario->small_status_;
+  ASSERT_TRUE(scenario->large_status_.ok()) << scenario->large_status_;
+
+  ASSERT_GE(scenario->frames_.size(), 5u);
+  const auto* direct =
+      std::get_if<control::FullDesiredState>(&scenario->frames_.front());
+  ASSERT_NE(direct, nullptr);
+  EXPECT_EQ(direct->object_hash,
+            control::ComputeSha256(scenario->small_bytes_));
+
+  const auto* start =
+      std::get_if<control::TransferStart>(&scenario->frames_[1]);
+  ASSERT_NE(start, nullptr);
+  EXPECT_EQ(start->kind, control::TransferKind::kFullDesiredState);
+  EXPECT_EQ(start->total_length, scenario->large_bytes_.size());
+  EXPECT_EQ(start->sha256, control::ComputeSha256(scenario->large_bytes_));
+  EXPECT_TRUE(std::holds_alternative<control::TransferEnd>(
+      scenario->frames_.back()));
+  EXPECT_TRUE(std::all_of(
+      scenario->frames_.begin() + 2, scenario->frames_.end() - 1,
+      [](const control::WireMessage& frame) {
+        return std::holds_alternative<control::TransferChunk>(frame);
+      }));
 }
 
 }  // namespace

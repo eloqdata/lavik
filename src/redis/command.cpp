@@ -11952,12 +11952,17 @@ Task<CommandReply> ExecuteCommandBody(
   // reload may have fenced while this request suspended on the admissions
   // above. Nothing has executed yet, so a changed authority is safely answered
   // with a fresh redirect. Transaction-based writes re-check per shard via the
-  // tx validator hook (choke point 2).
+  // tx validator hook (choke point 2). Blocking writes deliberately skip this
+  // command-lifetime guard: their per-attempt path registers only while it is
+  // touching storage, so an unbounded dormant wait cannot pin an old
+  // assignment through a Meta fence.
   cluster::AuthorityInFlightGuards cluster_in_flights;
-  if (std::optional<CommandReply> fenced = RecheckClusterWriteAuthority(
-          request, reply_builder, &cluster_in_flights);
-      fenced.has_value()) {
-    co_return std::move(*fenced);
+  if ((cmd_flags & kCmdMayBlock) == 0) {
+    if (std::optional<CommandReply> fenced = RecheckClusterWriteAuthority(
+            request, reply_builder, &cluster_in_flights);
+        fenced.has_value()) {
+      co_return std::move(*fenced);
+    }
   }
 
   if (random_stream.has_value()) {
