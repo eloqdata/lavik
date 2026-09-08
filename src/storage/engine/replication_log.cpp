@@ -1096,7 +1096,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
             "history");
         break;
       }
-#ifndef NDEBUG
+#if KEYLANE_FAULTS_ENABLED
       static std::atomic<bool> catalog_transaction_publish_failed{false};
       const char* failure_marker =
           std::getenv("KEYLANE_FAIL_REPLICATION_TRANSACTION_CONTAINING_ONCE");

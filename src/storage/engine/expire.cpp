@@ -166,9 +166,9 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
       bool* running_;
       ~CycleGuard() { *running_ = false; }
     } cycle_guard{&store->expiry_cycle_running_};
-#ifndef NDEBUG
+#if KEYLANE_FAULTS_ENABLED
     // Deterministic coverage for lazy-expiration replacement. Production
-    // builds never expose a switch that can disable active expiration.
+    // builds without explicit test faults never expose an expiration switch.
     if (std::getenv("KEYLANE_DISABLE_ACTIVE_EXPIRATION") != nullptr) continue;
 #endif
     if (expiration_pause_count_.load(std::memory_order_acquire) != 0) {

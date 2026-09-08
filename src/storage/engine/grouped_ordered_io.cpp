@@ -1,0 +1,225 @@
+#include "impl.h"
+
+namespace keylane::storage {
+
+Task<absl::StatusOr<HashGroupLocation>>
+StorageEngine::Impl::WriteOrderedGroupRecordLocked(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const OrderedGroupSnapshot& snapshot, std::uint64_t revision,
+    TxShardWrites& tx, std::uint64_t batch_txid) {
+  auto encoder = OrderedGroupEncoder::Create(snapshot);
+  if (!encoder.ok()) co_return encoder.status();
+  // A page owns a complete snapshot. Its cursor borrows the entries until
+  // every extent is durable; only then may the manifest enter the root batch.
+  // In particular a single large List item is never split into a read-time
+  // operation log, nor copied into another equally large serialization buffer.
+  const bool key_external = key.size() > options_.inline_key_max_bytes_ ||
+                            RecordHeaderBytes(key.size(), false, true, false,
+                                              true) > kBlockHeaderSlotBytes;
+  const std::size_t prefix_bytes = key_external ? key.size() : 0;
+  if (!ValidRecordKeySize(key.size()) ||
+      prefix_bytes > kMaxRecordPayloadBytes - encoder->encoded_bytes()) {
+    co_return absl::OutOfRangeError(
+        "ordered page and external key exceed record payload limit");
+  }
+  const std::size_t inline_bytes = AlignRecord(
+      RecordHeaderBytes(key.size(), key_external, true, false, true) +
+      prefix_bytes + encoder->encoded_bytes());
+  const bool external = inline_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
+                        inline_bytes > options_.buffers_.write_buffer_bytes_;
+  ExtentManifest extents;
+  std::string payload;
+  if (external) {
+    RecordPayloadCursor cursor(*encoder,
+                               key_external ? key : std::string_view{});
+    auto written = co_await WriteExtentValueLocked(store, {}, {}, &cursor);
+    if (!written.ok()) co_return written.status();
+    extents = std::move(*written);
+    payload = EncodeManifest(*extents);
+    KEYLANE_MAYBE_CRASH_AT("group-extents-durable-before-record");
+  } else {
+    payload.resize(encoder->encoded_bytes());
+    RecordPayloadCursor cursor(*encoder);
+    auto status = cursor.Read(std::as_writable_bytes(std::span(payload)));
+    if (status.ok()) status = cursor.Finish();
+    if (!status.ok()) co_return status;
+  }
+  const HashGroupId id{snapshot.id_, 0};
+  const GroupRecordWrite identity{
+      .auxiliary_ = true,
+      .incarnation_ = snapshot.incarnation_,
+      .id_ = id,
+      .retired_ = snapshot.retired_,
+      .batch_txid_ = batch_txid,
+      .prepare_root_ = {},
+      .changed_groups_ = {},
+  };
+  const ValueType type = snapshot.kind_ == OrderedCollectionKind::kList
+                             ? ValueType::kList
+                             : ValueType::kSortedSet;
+  RecordLocation location;
+  auto status = co_await WriteRecordLocked(
+      store, db_id, key, payload, RecordKind::kValue, type, 0, digest, tx.txid_,
+      revision, false, true, external, key_external, snapshot.entries_.size(),
+      extents, &location, nullptr, &tx, nullptr, nullptr, nullptr, nullptr,
+      &partition, &identity);
+  if (!status.ok()) {
+    if (extents != nullptr) SpawnExtentReclaim(store, extents);
+    co_return status;
+  }
+  KEYLANE_MAYBE_CRASH_AT("group-record-staged-before-root");
+  co_return HashGroupLocation{.id_ = id,
+                              .location_ = location,
+                              .extents_ = std::move(extents),
+                              .retired_ = snapshot.retired_};
+}
+
+Task<absl::StatusOr<LoadedOrderedGroup>>
+StorageEngine::Impl::LoadOrderedGroupSnapshot(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedHashObject::Handle object, std::uint64_t page_id, bool pinned) {
+  if (object == nullptr || !object->is_ordered()) {
+    co_return absl::DataLossError("missing ordered collection view");
+  }
+  const auto original = object->version();
+  const auto root = object->ordered_directory().root();
+  const HashGroupId id{page_id, 0};
+  for (;;) {
+    const auto readable = object->ReadStatus();
+    if (!readable.ok()) co_return readable;
+    if (EffectiveRecordDbEpoch(partition, db_id) != original.db_epoch_ ||
+        partition.replication_epoch_ != original.replication_epoch_ ||
+        partition.grouped_generations_[db_id] != original.index_generation_) {
+      co_return absl::NotFoundError("ordered population changed before read");
+    }
+    if (!pinned) {
+      auto resolved = co_await FindVerifiedEntry(
+          store, partition.indexes_[db_id], digest, key);
+      if (!resolved.ok()) co_return resolved.status();
+      if (*resolved == nullptr || !(*resolved)->value_.grouped() ||
+          (*resolved)->value_.mutation_sequence_ !=
+              original.root_.mutation_sequence_) {
+        co_return absl::NotFoundError("ordered root changed during read");
+      }
+      auto current = partition.grouped_objects_[db_id].Lookup(
+          key, GroupedObjectVersion{
+                   .root_ = MaterializeIndexLocation(**resolved),
+                   .db_epoch_ = original.db_epoch_,
+                   .replication_epoch_ = original.replication_epoch_,
+                   .index_generation_ = original.index_generation_});
+      if (!current.ok()) co_return current.status();
+      if (*current == nullptr || !(*current)->is_ordered() ||
+          (*current)->ordered_directory().root() != root) {
+        co_return absl::NotFoundError("ordered logical version changed");
+      }
+      object = std::move(*current);
+    }
+    const auto* entry = object->FindGroup(id);
+    if (entry == nullptr) co_return absl::DataLossError("missing ordered page");
+    // A retained side view owns metadata, not allocation lifetime. Capture the
+    // current physical epoch before suspending, and retry a GC move only while
+    // the logical root is unchanged. Historical snapshots instead own pins.
+    const auto location = MaterializeIndexLocation(*entry);
+    const auto extents = object->ExtentsFor(id);
+    absl::StatusOr<LoadedValue> loaded;
+    if (location.external()) {
+      loaded = co_await LoadExternalValueLocal(store, location, extents,
+                                               key.size(), nullptr);
+    } else if (location.block_owner() == store.worker_->id()) {
+      loaded = co_await LoadValueLocal(store, db_id, key, location,
+                                       original.replication_epoch_, nullptr,
+                                       original.db_epoch_);
+    } else {
+      const unsigned owner = location.block_owner();
+      loaded = co_await celer::SubmitTaskTo(
+          owner,
+          [this, owner, db_id, owned_key = std::string(key), location,
+           epoch = original.replication_epoch_,
+           db_epoch =
+               original.db_epoch_]() -> Task<absl::StatusOr<LoadedValue>> {
+            co_return co_await LoadValueLocal(*stores_[owner], db_id, owned_key,
+                                              location, epoch, nullptr,
+                                              db_epoch);
+          });
+    }
+    if (EffectiveRecordDbEpoch(partition, db_id) != original.db_epoch_ ||
+        partition.replication_epoch_ != original.replication_epoch_ ||
+        partition.grouped_generations_[db_id] != original.index_generation_) {
+      co_return absl::NotFoundError("ordered population changed during read");
+    }
+    const auto after_io = object->ReadStatus();
+    if (!after_io.ok()) co_return after_io;
+    if (loaded.ok()) {
+      const auto bytes = loaded->value();
+      const std::string_view payload(
+          reinterpret_cast<const char*>(bytes.data()), bytes.size());
+      const auto envelope = DecodeOrderedGroupMetadata(payload, payload.size());
+      if (!envelope.ok()) co_return envelope.status();
+      // The external page admission uses the captured count; validate it
+      // before decoding can reserve storage from untrusted payload metadata.
+      const auto* route = object->ordered_directory().Find(page_id);
+      if (envelope->kind_ != root.kind_ ||
+          envelope->incarnation_ != root.incarnation_ ||
+          envelope->id_ != page_id || envelope->retired_ ||
+          envelope->item_count_ != location.logical_size_ || route == nullptr ||
+          envelope->previous_ != route->previous_ ||
+          envelope->next_ != route->next_) {
+        co_return absl::DataLossError(
+            "ordered page physical identity mismatch");
+      }
+      auto decoded = DecodeOrderedGroup(payload);
+      if (!decoded.ok()) co_return decoded.status();
+      co_return LoadedOrderedGroup{.sequence_ = location.mutation_sequence_,
+                                   .snapshot_ = std::move(*decoded)};
+    }
+    if (pinned || !absl::IsAborted(loaded.status())) co_return loaded.status();
+    // The next iteration refreshes the view before materializing an entry.
+    // A persistent IO abort without relocation is corruption, not a spin.
+    const auto current =
+        partition.grouped_objects_[db_id].CurrentForMutation(key);
+    const auto* moved = current == nullptr ? nullptr : current->FindGroup(id);
+    if (moved == nullptr ||
+        MaterializeIndexLocation(*moved).SamePhysicalRecord(location)) {
+      co_return absl::DataLossError(loaded.status().message());
+    }
+  }
+}
+
+Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
+StorageEngine::Impl::LoadGroupedOrderedValue(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedHashObject::Handle object, bool pinned) {
+  if (object == nullptr || !object->is_ordered()) {
+    co_return absl::DataLossError("missing ordered collection view");
+  }
+  std::vector<OrderedCollectionEntry> result;
+  for (const auto& metadata : object->ordered_directory().groups()) {
+    auto page = co_await LoadOrderedGroupSnapshot(
+        store, partition, db_id, key, digest, object, metadata.id_, pinned);
+    if (!page.ok()) co_return page.status();
+    if (page->snapshot_.previous_ != metadata.previous_ ||
+        page->snapshot_.next_ != metadata.next_ ||
+        page->snapshot_.entries_.size() != metadata.item_count_) {
+      co_return absl::DataLossError(
+          "ordered page links disagree with directory");
+    }
+    if (!result.empty() &&
+        object->ordered_directory().root().kind_ ==
+            OrderedCollectionKind::kSortedSet &&
+        !OrderedEntryLess(result.back(), page->snapshot_.entries_.front())) {
+      co_return absl::DataLossError("Sorted Set page boundary is unordered");
+    }
+    for (auto& entry : page->snapshot_.entries_) {
+      result.push_back(std::move(entry));
+    }
+  }
+  if (result.size() != object->ordered_directory().root().item_count_) {
+    co_return absl::DataLossError("ordered collection aggregate mismatch");
+  }
+  co_return result;
+}
+
+}  // namespace keylane::storage

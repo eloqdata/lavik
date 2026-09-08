@@ -618,6 +618,61 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
   co_return found->value_.logical_size();
 }
 
+Task<absl::StatusOr<ExpirationInfo>> StorageEngine::ReadKeyMetadata(
+    std::uint8_t db_id, std::string_view key) {
+  return impl_->ReadKeyMetadata(db_id, key);
+}
+
+Task<absl::StatusOr<ExpirationInfo>> StorageEngine::ReadKeyMetadataLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest) {
+  return impl_->ReadKeyMetadataLocked(db_id, key, digest);
+}
+
+Task<absl::StatusOr<ExpirationInfo>> StorageEngine::Impl::ReadKeyMetadata(
+    std::uint8_t db_id, std::string_view key) {
+  if (db_id >= kLogicalDatabaseCount)
+    co_return absl::InvalidArgumentError("invalid logical database");
+  const auto digest = ComputeDigest(key);
+  auto hold = co_await tx::CurrentTxShard().AcquireKey(
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+  co_return co_await ReadKeyMetadataLocked(db_id, key, digest);
+}
+
+Task<absl::StatusOr<ExpirationInfo>> StorageEngine::Impl::ReadKeyMetadataLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest) {
+  if (db_id >= kLogicalDatabaseCount || digest != ComputeDigest(key))
+    co_return absl::InvalidArgumentError("invalid metadata key identity");
+  auto& store = CurrentStore();
+  auto& partition = PartitionForKey(store, key);
+  auto& index = partition.indexes_[db_id];
+  auto* found = index.Find(digest, key);
+  if (found != nullptr && !found->key_complete()) [[unlikely]] {
+    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+    if (!resolved.ok()) co_return resolved.status();
+    found = *resolved;
+  }
+  if (found == nullptr || found->value_.kind() != RecordKind::kValue)
+    co_return ExpirationInfo{};
+  if (found->value_.grouped()) {
+    // Check before applying the tentative root's TTL: a failed replacement
+    // cannot disguise itself as an expired/missing predecessor either.
+    auto readable = partition.grouped_objects_[db_id].Lookup(
+        key, GroupedObjectVersion{
+                 .root_ = MaterializeIndexLocation(*found),
+                 .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+                 .replication_epoch_ = partition.replication_epoch_,
+                 .index_generation_ = partition.grouped_generations_[db_id]});
+    if (!readable.ok()) co_return readable.status();
+  }
+  if (IsExpiredNow(*found)) {
+    QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
+    co_return ExpirationInfo{};
+  }
+  co_return ExpirationInfo{.exists_ = true,
+                           .expire_at_ms_ = ExpireAt(*found),
+                           .value_type_ = found->value_.value_type()};
+}
+
 Task<ExpirationInfo> StorageEngine::Impl::GetExpiration(std::uint8_t db_id,
                                                         std::string_view key) {
   assert(db_id < kLogicalDatabaseCount);
@@ -669,6 +724,10 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
     auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
     if (!resolved.ok()) co_return resolved.status();
     found = *resolved;
+  }
+  if (found != nullptr && found->value_.grouped() && IsExpiredNow(*found)) {
+    auto metadata = co_await ReadKeyMetadataLocked(db_id, key, digest);
+    if (!metadata.ok()) co_return metadata.status();
   }
   if (found == nullptr || found->value_.kind() != RecordKind::kValue ||
       IsExpiredNow(*found)) {
@@ -815,11 +874,22 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
                                WorkerStore::PartitionStore& partition,
                                std::uint8_t db_id, std::string_view key,
                                const Digest& digest, RecordLocation location,
-                               ExtentManifest extents,
-                               ReadLatencyTrace* trace) {
+                               ExtentManifest extents, ReadLatencyTrace* trace,
+                               GroupedHashObject::Handle grouped_snapshot) {
+  if (location.grouped()) {
+    co_return co_await LoadGroupedValue(key_store, partition, db_id, key,
+                                        digest, location,
+                                        std::move(grouped_snapshot));
+  }
   // The caller already resolved the key's partition for the index lookup.
   // Reuse it across retries instead of recomputing the Redis slot.
   const std::uint64_t replication_epoch = partition.replication_epoch_;
+  // Candidate populations use a locally mapped epoch until promotion. Capture
+  // it on the key owner; the physical block owner may own another partition.
+  const std::optional<std::uint64_t> db_epoch =
+      partition.replica_sync_
+          ? std::make_optional(EffectiveRecordDbEpoch(partition, db_id))
+          : std::nullopt;
   while (true) {
     assert(location.block_owner() < worker_count_);
     // Every branch below assigns `loaded` before it is observed. Keep the
@@ -837,24 +907,26 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
           key_store, location, std::move(extents), key.size(), trace);
     } else if (location.block_owner() == key_store.worker_->id()) {
       loaded = co_await LoadValueLocal(key_store, db_id, key, location,
-                                       replication_epoch, trace);
+                                       replication_epoch, trace, db_epoch);
     } else {
       const unsigned owner = location.block_owner();
       std::string owned_key(key);
       loaded = co_await celer::SubmitTaskTo(
           owner,
           [this, owner, db_id, key = std::move(owned_key), location,
-           replication_epoch,
+           replication_epoch, db_epoch,
            trace]() mutable -> Task<absl::StatusOr<LoadedValue>> {
             co_return co_await LoadValueLocal(*stores_[owner], db_id, key,
                                               location, replication_epoch,
-                                              trace);
+                                              trace, db_epoch);
           });
     }
     // Replica reset is partition-wide and does not take each key lock. Reject
     // a result that crossed an epoch change, including a successful extent
     // read, rather than returning a value from the retired generation.
-    if (partition.replication_epoch_ != replication_epoch) [[unlikely]] {
+    if (partition.replication_epoch_ != replication_epoch ||
+        (db_epoch && EffectiveRecordDbEpoch(partition, db_id) != *db_epoch))
+        [[unlikely]] {
       co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
     }
     if (loaded.ok() || loaded.status().code() != absl::StatusCode::kAborted) {
@@ -1516,11 +1588,10 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
-StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
-                                    std::string_view key,
-                                    RecordLocation location,
-                                    std::uint64_t replication_epoch,
-                                    ReadLatencyTrace* trace) {
+StorageEngine::Impl::LoadValueLocal(
+    WorkerStore& store, std::uint8_t db_id, std::string_view key,
+    RecordLocation location, std::uint64_t replication_epoch,
+    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch) {
   if (location.external()) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external value was dispatched as inline");
@@ -1598,7 +1669,7 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
                             &record, &disk_key) ||
         record.db_id_ != db_id || (!record.key_external_ && disk_key != key) ||
         record.kind_ != RecordKind::kValue ||
-        record.db_epoch_ != DbEpoch(db_id) ||
+        record.db_epoch_ != expected_db_epoch.value_or(DbEpoch(db_id)) ||
         record.mutation_sequence_ != location.mutation_sequence_ ||
         record.replication_epoch_ != replication_epoch ||
         record.allocation_epoch_ != location.allocation_epoch() ||
@@ -1693,7 +1764,7 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
   if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
       record.db_id_ != db_id || (!record.key_external_ && disk_key != key) ||
       record.kind_ != RecordKind::kValue ||
-      record.db_epoch_ != DbEpoch(db_id) ||
+      record.db_epoch_ != expected_db_epoch.value_or(DbEpoch(db_id)) ||
       record.mutation_sequence_ != location.mutation_sequence_ ||
       record.replication_epoch_ != replication_epoch ||
       record.allocation_epoch_ != location.allocation_epoch() ||

@@ -28,6 +28,10 @@ struct FileEntry {
   std::string key_;
   storage::RawValue value_;
   std::string function_code_;
+  // A streaming collection has metadata only in value_. The caller must
+  // drain ReadCollectionPage() through done_ before advancing the file.
+  bool collection_stream_ = false;
+  std::optional<std::uint64_t> expected_items_{};
 };
 
 // Memory-maps and validates one complete Redis RDB file. Files produced by
@@ -45,15 +49,53 @@ class FileReader {
   ~FileReader();
 
   absl::StatusOr<std::optional<FileEntry>> Next();
+  // Unlike Next(), this does not assemble a collection's aggregate payload.
+  // Duplicate identity validation remains active across pages, including the
+  // validation pass that must precede destructive load-rdb replacement.
+  absl::StatusOr<std::optional<FileEntry>> NextStreaming();
+  // Pages of one collection stay on one memory-accounting owner. A failed
+  // read is terminal for that import attempt; rewind before trying again.
+  absl::StatusOr<storage::CollectionPage> ReadCollectionPage();
+  absl::Status DrainCollection();
   void Rewind();
   unsigned version() const noexcept;
 
  private:
   struct Impl;
   explicit FileReader(std::unique_ptr<Impl> impl);
+  absl::StatusOr<std::optional<FileEntry>> NextImpl(bool stream_collections);
 
   std::unique_ptr<Impl> impl_;
 };
+
+// Borrowed value-only RDB input for RESTORE. Open validates the complete
+// checksum before decoding; the caller keeps payload alive until this reader
+// is destroyed. Collection pages follow the same admitted/duplicate-checked
+// protocol as FileReader, while other value types retain the raw-value path.
+class DumpReader {
+ public:
+  static absl::StatusOr<DumpReader> Open(std::string_view payload);
+  DumpReader(DumpReader&&) noexcept;
+  DumpReader& operator=(DumpReader&&) noexcept;
+  ~DumpReader();
+  bool collection() const noexcept;
+  storage::ValueType value_type() const noexcept;
+  std::optional<std::uint64_t> expected_items() const noexcept;
+  absl::StatusOr<storage::CollectionPage> ReadCollectionPage();
+  absl::StatusOr<storage::RawValue> ReadRawValue();
+  absl::Status Rewind();
+
+ private:
+  struct Impl;
+  explicit DumpReader(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+};
+
+// Applies a streamed or ordinary file entry on its key owner. The reader and
+// entry are borrowed until completion; a collection import is atomic at EOF.
+celer::Task<absl::StatusOr<storage::RestoreRawResult>> RestoreFileEntry(
+    storage::StorageEngine* storage, FileReader* reader, const FileEntry& entry,
+    bool replace = false);
 
 // Encodes and decodes the value-only payload used by Redis DUMP/RESTORE.
 // Expiration is deliberately supplied by RESTORE and is not part of payload.

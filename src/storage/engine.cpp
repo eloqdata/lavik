@@ -110,6 +110,16 @@ Task<absl::Status> StorageEngine::EndRdbSnapshot(std::uint64_t session_id) {
   return impl_->EndRdbSnapshot(session_id);
 }
 
+Task<absl::StatusOr<CollectionPage>> StorageEngine::ReadRdbCollectionPage(
+    std::uint64_t session_id, std::uint64_t token, std::uint64_t cursor) {
+  return impl_->ReadRdbCollectionPage(session_id, token, cursor);
+}
+
+Task<absl::Status> StorageEngine::FinishRdbCollection(std::uint64_t session_id,
+                                                      std::uint64_t token) {
+  return impl_->FinishRdbCollection(session_id, token);
+}
+
 Task<absl::StatusOr<std::optional<std::string>>> StorageEngine::RandomKeyLocal(
     std::uint8_t db_id) {
   return impl_->RandomKeyLocal(db_id);
@@ -685,6 +695,18 @@ Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id, std::string_view key,
 Task<absl::Status> StorageEngine::CommitTxWrites(
     std::uint64_t txid, std::vector<TxShardWrites*> shards) {
   return impl_->CommitTxWrites(txid, std::move(shards));
+}
+
+absl::Status StorageEngine::ValidateTxCommit(
+    std::span<const TxShardWrites> writes) {
+  for (const auto& shard : writes) {
+    if (shard.grouped_decision_ != nullptr &&
+        shard.grouped_decision_->state_.load(std::memory_order_acquire) ==
+            GroupedCommitDecision::State::kFailed) {
+      return absl::FailedPreconditionError("grouped transaction was abandoned");
+    }
+  }
+  return absl::OkStatus();
 }
 
 bool StorageEngine::EnqueueTxCommit(std::uint64_t txid,

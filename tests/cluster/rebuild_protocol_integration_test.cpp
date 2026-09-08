@@ -60,6 +60,10 @@ std::size_t CountOccurrences(std::string_view text, std::string_view needle) {
 
 TEST(RebuildProtocolIntegrationTest,
      SourceCannotPublishOnlineBeforeTargetFlowProof) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP()
+      << "requires a Debug/fault server for premature online injection";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   TempDirectory directory("cluster-early-online");
   const std::filesystem::path source_data = directory.path() / "source.data";
@@ -104,6 +108,9 @@ TEST(RebuildProtocolIntegrationTest,
 
 TEST(RebuildProtocolIntegrationTest,
      PostCutResetCannotDetachThePromotedPopulation) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug/fault server for post-cut reset injection";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   TempDirectory directory("cluster-post-cut-reset");
   const std::filesystem::path source_data = directory.path() / "source.data";
@@ -149,6 +156,9 @@ TEST(RebuildProtocolIntegrationTest,
 
 TEST(RebuildProtocolIntegrationTest,
      DivergentOnlineTailInvalidatesEveryContinuationCursor) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug/fault server for divergent tail injection";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   TempDirectory directory("cluster-divergent-tail");
   const std::filesystem::path source_data = directory.path() / "source.data";
@@ -203,6 +213,9 @@ TEST(RebuildProtocolIntegrationTest,
 
 TEST(RebuildProtocolIntegrationTest,
      CorruptFullSyncFrameRequiresAFreshFullSync) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug/fault server for corrupt frame injection";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   TempDirectory directory("cluster-full-sync-checksum");
   const std::filesystem::path source_data = directory.path() / "source.data";
@@ -252,6 +265,9 @@ TEST(RebuildProtocolIntegrationTest,
 
 TEST(RebuildProtocolIntegrationTest,
      TargetCrashDiscardsPartialAndBootScopedReadinessProof) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug/fault server for the partial handoff pause";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   TempDirectory directory("cluster-target-crash");
   const std::filesystem::path source_data = directory.path() / "source.data";
@@ -355,6 +371,9 @@ TEST(RebuildProtocolIntegrationTest,
 
 TEST(RebuildProtocolIntegrationTest,
      PeerFlowCancellationAfterCommittedCommandResumesFromAppliedCursor) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug/fault server for peer-flow cancellation";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   TempDirectory directory("cluster-cancel-after-command-apply");
   const std::filesystem::path source_data = directory.path() / "source.data";
@@ -429,6 +448,9 @@ TEST(RebuildProtocolIntegrationTest,
 
 TEST(RebuildProtocolIntegrationTest,
      FullSyncCutInstallsResumeVectorBeforeAcknowledgement) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug/fault server for cut pause and disconnect";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   TempDirectory directory("cluster-full-sync-cut");
   const std::filesystem::path source_data = directory.path() / "source.data";

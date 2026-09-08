@@ -57,6 +57,20 @@ emit_named_sets() {
   done
 }
 
+emit_hash_fields() {
+  local key=$1
+  local count=$2
+  local value=$3
+  local i field
+  printf '*%d\r\n$4\r\nHSET\r\n$%d\r\n%s\r\n' \
+    "$((2 + count * 2))" "${#key}" "${key}"
+  for ((i = 0; i < count; ++i)); do
+    field="field-${i}"
+    printf '$%d\r\n%s\r\n$%d\r\n%s\r\n' \
+      "${#field}" "${field}" "${#value}" "${value}"
+  done
+}
+
 source_port=16479
 import_port=16480
 truncate -s 1G "${case_dir}/source.data"
@@ -74,6 +88,17 @@ function_code=$'#!lua name=rdb_library\nredis.register_function{function_name="r
 emit_sets key: 1 5000 OLD | "${redis_cli}" -p "${source_port}" --pipe >/dev/null
 head -c 10485760 /dev/zero | tr '\0' A |
   "${redis_cli}" -p "${source_port}" -x set external-big >/dev/null
+# Large Hashes and an indivisible extent-backed field participate in the same
+# snapshot cut. This also exercises grouped pages once serving promotes these
+# values; the test does not infer the physical representation from their size.
+hash_value=$(head -c 512 /dev/zero | tr '\0' H)
+emit_hash_fields grouped-hash 256 "${hash_value}" |
+  "${redis_cli}" -p "${source_port}" --pipe >/dev/null
+head -c 9437184 /dev/zero | tr '\0' V |
+  "${redis_cli}" -p "${source_port}" -x hset grouped-hash huge >/dev/null
+"${redis_cli}" -p "${source_port}" pexpire grouped-hash 3600000 >/dev/null
+emit_hash_fields deleted-grouped-hash 256 "${hash_value}" |
+  "${redis_cli}" -p "${source_port}" --pipe >/dev/null
 "${redis_cli}" -p "${source_port}" mset tx-left OLD tx-right OLD >/dev/null
 "${redis_cli}" -p "${source_port}" set race-trigger OLD >/dev/null
 race_value=$(head -c 1048576 /dev/zero | tr '\0' R)
@@ -94,6 +119,9 @@ previous=$("${redis_cli}" -p "${source_port}" lastsave)
 # and the two-key transaction must appear entirely on one side of the cut.
 "${redis_cli}" -p "${source_port}" set race-trigger NEW >/dev/null &
 race_trigger_pid=$!
+"${redis_cli}" -p "${source_port}" hset grouped-hash field-0 NEW after-cut ABSENT >/dev/null
+"${redis_cli}" -p "${source_port}" hdel grouped-hash huge >/dev/null
+"${redis_cli}" -p "${source_port}" del deleted-grouped-hash >/dev/null
 sleep 0.05
 emit_named_sets "${race_value}" "${race_keys[@]}" |
   "${redis_cli}" -p "${source_port}" --pipe >/dev/null
@@ -121,7 +149,7 @@ stop_server "${source_pid}"
 source_pid=
 
 truncate -s 1G "${case_dir}/import.data"
-"${keylane_bin}" --logtostderr --port "${import_port}" --threads 4 --no-pin-workers \
+"${keylane_bin}" --logtostderr --port "${import_port}" --threads 3 --no-pin-workers \
   --recv-buffers-per-worker 0 --data-file "${case_dir}/import.data" \
   --load-rdb "${case_dir}/dump.rdb" --rdb-dir "${case_dir}" \
   --dbfilename imported.rdb >"${case_dir}/import.log" 2>&1 &
@@ -131,7 +159,7 @@ import_dirty=$("${redis_cli}" -p "${import_port}" info persistence |
   awk -F: '/^rdb_changes_since_last_save:/ {gsub("\r", "", $2); print $2}')
 [[ ${import_dirty} == 0 ]]
 
-[[ $("${redis_cli}" -p "${import_port}" dbsize) == 5016 ]]
+[[ $("${redis_cli}" -p "${import_port}" dbsize) == 5018 ]]
 [[ $("${redis_cli}" -p "${import_port}" --scan --pattern 'after:*' | wc -l) == 0 ]]
 values=$("${redis_cli}" -p "${import_port}" --scan --pattern 'key:*' |
   xargs -r -n 200 "${redis_cli}" -p "${import_port}" mget | sort | uniq -c)
@@ -139,6 +167,19 @@ values=$("${redis_cli}" -p "${import_port}" --scan --pattern 'key:*' |
 [[ $("${redis_cli}" -p "${import_port}" strlen external-big) == 10485760 ]]
 [[ $("${redis_cli}" -p "${import_port}" getrange external-big 0 0) == A ]]
 [[ $("${redis_cli}" -p "${import_port}" getrange external-big -1 -1) == A ]]
+[[ $("${redis_cli}" -p "${import_port}" hlen grouped-hash) == 257 ]]
+[[ $("${redis_cli}" -p "${import_port}" hlen deleted-grouped-hash) == 256 ]]
+[[ $("${redis_cli}" -p "${import_port}" hget grouped-hash field-0) == "${hash_value}" ]]
+[[ $("${redis_cli}" -p "${import_port}" hget grouped-hash field-255) == "${hash_value}" ]]
+[[ $("${redis_cli}" -p "${import_port}" hget deleted-grouped-hash field-0) == "${hash_value}" ]]
+[[ $("${redis_cli}" -p "${import_port}" hget deleted-grouped-hash field-255) == "${hash_value}" ]]
+[[ $("${redis_cli}" -p "${import_port}" hexists grouped-hash after-cut) == 0 ]]
+[[ $("${redis_cli}" -p "${import_port}" hstrlen grouped-hash huge) == 9437184 ]]
+# --raw adds one newline. HSTRLEN fixes the exact payload length above; every
+# byte of that payload must be V, excluding the CLI presentation terminator.
+[[ $("${redis_cli}" -p "${import_port}" --raw hget grouped-hash huge |
+  tr -cd V | wc -c) == 9437184 ]]
+(( $("${redis_cli}" -p "${import_port}" pttl grouped-hash) > 0 ))
 [[ $("${redis_cli}" -p "${import_port}" get tx-left) == OLD ]]
 [[ $("${redis_cli}" -p "${import_port}" get tx-right) == OLD ]]
 [[ $("${redis_cli}" -p "${import_port}" get race-trigger) == OLD ]]

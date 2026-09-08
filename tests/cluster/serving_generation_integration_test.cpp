@@ -49,6 +49,9 @@ void WaitForStartup(std::string_view label, std::uint16_t port) {
 
 TEST(ServingGenerationIntegrationTest,
      AdmittedCommandsCannotConsumeAReplacementDataset) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "database admission pause requires Debug or fault server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   TempDirectory directory("serving-generation");
   const std::filesystem::path source_data = directory.path() / "source.data";
@@ -155,6 +158,9 @@ TEST(ServingGenerationIntegrationTest,
 }
 
 TEST(ServingGenerationIntegrationTest, WatchIsBoundToItsServingGeneration) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "database admission pause requires Debug or fault server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   TempDirectory directory("watch-serving-generation");
   const std::filesystem::path source_data = directory.path() / "source.data";

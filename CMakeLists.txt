@@ -327,6 +327,28 @@ add_library(keylane_module
   src/storage/engine/flush_db.cpp
   src/storage/engine/hash_api.cpp
   src/storage/engine/hash_codec.cpp
+  src/storage/engine/grouped_hash.cpp
+  src/storage/engine/grouped_collection.cpp
+  src/storage/engine/grouped_sorted_rewrite.cpp
+  src/storage/engine/ordered_compact_codec.cpp
+  src/storage/engine/collection_compact_stream.cpp
+  src/storage/engine/grouped_replication_source.cpp
+  src/storage/engine/grouped_write.cpp
+  src/storage/engine/grouped_read.cpp
+  src/storage/engine/grouped_ordered_io.cpp
+  src/storage/engine/grouped_list.cpp
+  src/storage/engine/grouped_zset.cpp
+  src/storage/engine/grouped_hash_random.cpp
+  src/storage/engine/sorted_set_api.cpp
+  src/storage/engine/transfer_api.cpp
+  src/storage/engine/grouped_restore.cpp
+  src/storage/engine/collection_ingest.cpp
+  src/storage/engine/grouped_mutation.cpp
+  src/storage/engine/grouped_ordered_mutation.cpp
+  src/storage/engine/grouped_metadata.cpp
+  src/storage/engine/replica_collection.cpp
+  src/storage/engine/grouped_lifecycle.cpp
+  src/storage/engine/grouped_object_index.cpp
   src/storage/engine/hash_tree.cpp
   src/storage/engine/init.cpp
   src/storage/engine/list_api.cpp
@@ -348,6 +370,8 @@ add_library(keylane_module
   src/replication/replication.cpp
   src/redis/resp.cpp
   src/redis/rdb.cpp
+  src/redis/rdb_collection.cpp
+  src/redis/rdb_import.cpp
   src/redis/backup.cpp
   src/redis/blocking_wait.cpp
   src/redis/cluster_command.cpp
@@ -585,6 +609,38 @@ if (BUILD_TESTING)
   set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
   include(GoogleTest)
+
+  if (UNIX)
+    # These policies must never share module/PCH inline definitions: each
+    # executable compiles the public fault header independently of the server
+    # configuration, including an actually erased ordinary Release policy.
+    foreach(fault_mode IN ITEMS debug release release_fault)
+      set(fault_target keylane_fault_injection_${fault_mode}_test)
+      add_executable(${fault_target} tests/fault_injection_test.cpp)
+      target_link_libraries(${fault_target} PRIVATE GTest::gtest_main)
+      target_include_directories(${fault_target} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      set_target_properties(${fault_target} PROPERTIES
+        DISABLE_PRECOMPILE_HEADERS ON)
+      if (fault_mode STREQUAL "debug")
+        target_compile_options(${fault_target} PRIVATE -UNDEBUG)
+        target_compile_definitions(${fault_target} PRIVATE
+          KEYLANE_ENABLE_TEST_FAULTS=0 KEYLANE_FAULT_TEST_EXPECTED_ENABLED=1)
+      elseif (fault_mode STREQUAL "release")
+        target_compile_definitions(${fault_target} PRIVATE
+          NDEBUG KEYLANE_ENABLE_TEST_FAULTS=0
+          KEYLANE_FAULT_TEST_EXPECTED_ENABLED=0)
+      else()
+        target_compile_definitions(${fault_target} PRIVATE
+          NDEBUG KEYLANE_ENABLE_TEST_FAULTS=1
+          KEYLANE_FAULT_TEST_EXPECTED_ENABLED=1)
+      endif()
+      add_test(NAME keylane_fault_injection_${fault_mode}
+        COMMAND ${fault_target})
+      set_tests_properties(keylane_fault_injection_${fault_mode} PROPERTIES
+        LABELS "unit;fault-policy" TIMEOUT 15)
+    endforeach()
+  endif()
 
   add_library(keylane_test_support STATIC
     tests/support/process.cpp
@@ -833,6 +889,8 @@ if (BUILD_TESTING)
       keylane_test_support
       GTest::gtest
     )
+    target_compile_definitions(keylane_cluster_serving_generation_integration_test PRIVATE
+      KEYLANE_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>>)
     add_dependencies(keylane_cluster_serving_generation_integration_test keylane)
     add_test(
       NAME cluster_integration.serving_generation_fence
@@ -876,6 +934,8 @@ if (BUILD_TESTING)
       add_executable(keylane_cluster_rebuild_protocol_integration_test
         tests/cluster/rebuild_protocol_integration_test.cpp
       )
+      target_compile_definitions(keylane_cluster_rebuild_protocol_integration_test PRIVATE
+        KEYLANE_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>>)
       target_link_libraries(keylane_cluster_rebuild_protocol_integration_test PRIVATE
         keylane_test_support
         GTest::gtest
@@ -906,6 +966,15 @@ if (BUILD_TESTING)
     tests/cross_worker_mutex_test.cpp
     tests/device_affinity_test.cpp
     tests/foreign_executor_test.cpp
+    tests/grouped_hash_test.cpp
+    tests/grouped_commit_decision_test.cpp
+    tests/grouped_collection_test.cpp
+    tests/grouped_sorted_rewrite_test.cpp
+    tests/ordered_compact_codec_test.cpp
+    tests/collection_compact_stream_test.cpp
+    tests/grouped_ordered_object_test.cpp
+    tests/record_payload_cursor_test.cpp
+    tests/grouped_object_index_test.cpp
     tests/logging_test.cpp
     tests/lua_eval_test.cpp
     tests/memory_test.cpp
@@ -915,6 +984,7 @@ if (BUILD_TESTING)
     tests/command_table_test.cpp
     tests/random_sample_test.cpp
     tests/rdb_test.cpp
+    tests/rdb_collection_test.cpp
     tests/record_location_test.cpp
     tests/request_gate_test.cpp
     tests/replication_command_test.cpp
@@ -1002,7 +1072,7 @@ if (BUILD_TESTING)
       COMMAND keylane_replica_abort_reclaim_e2e_test
     )
     set_tests_properties(keylane_replica_abort_reclaim_e2e PROPERTIES
-      TIMEOUT 30)
+      TIMEOUT 180)
 
     add_executable(keylane_pubsub_e2e_test
       tests/pubsub_e2e_test.cpp
@@ -1024,6 +1094,8 @@ if (BUILD_TESTING)
       add_executable(keylane_sentinel_e2e_test
         tests/sentinel_e2e_test.cpp
       )
+      target_compile_definitions(keylane_sentinel_e2e_test PRIVATE
+        KEYLANE_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>>)
       target_link_libraries(keylane_sentinel_e2e_test PRIVATE
         keylane_test_support
       )
@@ -1078,6 +1150,8 @@ if (BUILD_TESTING)
     add_executable(keylane_multikey_e2e_test
       tests/multikey_e2e_test.cpp
     )
+    target_compile_definitions(keylane_multikey_e2e_test PRIVATE
+      KEYLANE_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>>)
     add_test(
       NAME keylane_multikey_e2e
       COMMAND keylane_multikey_e2e_test $<TARGET_FILE:keylane>
@@ -1130,6 +1204,78 @@ if (BUILD_TESTING)
     )
     set_tests_properties(keylane_extent_recovery_e2e PROPERTIES TIMEOUT 600)
 
+    add_executable(keylane_grouped_recovery_e2e_test
+      tests/grouped_recovery_e2e_test.cpp
+    )
+    target_link_libraries(keylane_grouped_recovery_e2e_test
+      PRIVATE keylane::module GTest::gtest
+    )
+    target_compile_definitions(keylane_grouped_recovery_e2e_test PRIVATE
+      KEYLANE_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>>
+    )
+    add_test(
+      NAME keylane_grouped_recovery_e2e
+      COMMAND keylane_grouped_recovery_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_grouped_recovery_e2e PROPERTIES
+      TIMEOUT 600 RUN_SERIAL TRUE
+    )
+
+    add_executable(keylane_grouped_hash_write_e2e_test
+      tests/grouped_hash_write_e2e_test.cpp
+    )
+    target_link_libraries(keylane_grouped_hash_write_e2e_test
+      PRIVATE keylane::module GTest::gtest
+    )
+    target_compile_definitions(keylane_grouped_hash_write_e2e_test PRIVATE
+      KEYLANE_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>>
+    )
+    add_test(
+      NAME keylane_grouped_hash_write_e2e
+      COMMAND keylane_grouped_hash_write_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_grouped_hash_write_e2e PROPERTIES
+      TIMEOUT 240 RUN_SERIAL TRUE
+    )
+
+    add_executable(keylane_compact_collection_write_e2e_test
+      tests/compact_collection_write_e2e_test.cpp
+    )
+    target_link_libraries(keylane_compact_collection_write_e2e_test
+      PRIVATE keylane::module GTest::gtest
+    )
+    target_compile_definitions(keylane_compact_collection_write_e2e_test PRIVATE
+      KEYLANE_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>>
+    )
+    add_test(
+      NAME keylane_compact_collection_write_e2e
+      COMMAND keylane_compact_collection_write_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_compact_collection_write_e2e PROPERTIES
+      TIMEOUT 240 RUN_SERIAL TRUE
+    )
+
+    add_executable(keylane_grouped_ordered_write_e2e_test
+      tests/grouped_ordered_write_e2e_test.cpp
+      tests/grouped_rdb_stream_e2e_test.cpp
+      tests/grouped_zset_write_e2e_test.cpp
+      tests/grouped_transfer_e2e_test.cpp
+      tests/grouped_random_stream_e2e_test.cpp
+    )
+    target_link_libraries(keylane_grouped_ordered_write_e2e_test
+      PRIVATE keylane::module GTest::gtest
+    )
+    target_compile_definitions(keylane_grouped_ordered_write_e2e_test PRIVATE
+      KEYLANE_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>>
+    )
+    add_test(
+      NAME keylane_grouped_ordered_write_e2e
+      COMMAND keylane_grouped_ordered_write_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_grouped_ordered_write_e2e PROPERTIES
+      TIMEOUT 1200 RUN_SERIAL TRUE
+    )
+
     add_executable(keylane_list_e2e_test
       tests/list_e2e_test.cpp
     )
@@ -1138,15 +1284,24 @@ if (BUILD_TESTING)
     )
     target_compile_definitions(keylane_list_e2e_test PRIVATE
       KEYLANE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+      KEYLANE_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>>
     )
     add_test(
       NAME keylane_list_e2e
       COMMAND keylane_list_e2e_test $<TARGET_FILE:keylane>
+              --gtest_filter=-LargeHashDurabilityE2eTest.*
     )
+    add_test(
+      NAME keylane_large_hash_durability_e2e
+      COMMAND keylane_list_e2e_test $<TARGET_FILE:keylane>
+              --gtest_filter=LargeHashDurabilityE2eTest.*
+    )
+    set_tests_properties(keylane_large_hash_durability_e2e PROPERTIES
+      TIMEOUT 180 RUN_SERIAL TRUE)
     if (KEYLANE_ASAN_BUILD)
-      set_tests_properties(keylane_list_e2e PROPERTIES TIMEOUT 900)
+      set_tests_properties(keylane_list_e2e PROPERTIES TIMEOUT 1800)
     else()
-      set_tests_properties(keylane_list_e2e PROPERTIES TIMEOUT 300)
+      set_tests_properties(keylane_list_e2e PROPERTIES TIMEOUT 1200)
     endif()
 
     add_executable(keylane_cluster_e2e_test

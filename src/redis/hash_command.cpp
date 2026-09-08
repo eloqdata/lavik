@@ -19,6 +19,13 @@ CommandReply BuiltReply(std::string_view encoded) {
 
 std::string_view AppendStorageError(ReplyBuilder& builder,
                                     const absl::Status& status) {
+  // Storage-side admission can fail after the command-level preflight. Keep
+  // its Redis error class; not every ResourceExhausted status is memory OOM
+  // (disk/index namespace exhaustion must retain its ordinary ERR reply).
+  if (absl::IsResourceExhausted(status) &&
+      status.message().starts_with("OOM ")) {
+    return builder.AppendError(status.message());
+  }
   if (status.message().starts_with("WRONGTYPE ")) {
     return builder.AppendError(status.message());
   }

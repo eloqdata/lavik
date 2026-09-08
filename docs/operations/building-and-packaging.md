@@ -42,6 +42,119 @@ a different build directory. It enables the non-packageable fault-server
 variant so crash-safety hooks remain available even though RelWithDebInfo may
 define `NDEBUG`.
 
+The focused large-Hash durability suite uses its own temporary 128 MiB files
+and local child servers. Run it against a Debug build or a build configured
+with `KEYLANE_BUILD_FAULT_SERVER=ON` to exercise the crash injections:
+
+```bash
+cmake --build bld-clang18-debug --target keylane keylane_list_e2e_test -j 8
+ctest --test-dir bld-clang18-debug -R '^keylane_large_hash_durability_e2e$' --output-on-failure
+```
+
+Substitute your configured build directory. This suite covers large Hash
+command compatibility, extent durability, grouped writes and bounded-device
+reclamation. The dedicated grouped-storage suites cover additional graph
+publication, relocation and snapshot boundaries.
+Crash cases require exit code 86 at their armed boundary; ordinary
+release builds without test instrumentation skip those cases and the injected
+storage-admission failure case. Bounded-device reclamation and command-level
+RESP OOM cases run without fault instrumentation. The grouped side-index
+memory/admission tests are part of `keylane_unit_tests`.
+
+The grouped-storage recovery suite constructs its own temporary disk images
+and starts local child servers. It exercises actual group-record recovery,
+transaction decisions, GC and snapshot lifetimes without touching configured
+benchmark devices:
+
+```bash
+cmake --build bld-clang18-debug --target keylane keylane_grouped_recovery_e2e_test -j 8
+ctest --test-dir bld-clang18-debug -R '^keylane_grouped_recovery_e2e$' --output-on-failure
+```
+
+Finish linking the child server before running either integration suite; do
+not rebuild that executable while its test fixture starts server processes.
+The foreground suites use the actual command handlers and their own temporary
+devices, including oversized elements, transaction failure and cold restart:
+
+```bash
+cmake --build bld-clang18-debug --target keylane keylane_grouped_hash_write_e2e_test keylane_grouped_ordered_write_e2e_test -j 8
+ctest --test-dir bld-clang18-debug -R '^keylane_grouped_(hash|ordered)_write_e2e$' --output-on-failure
+```
+
+The compact collection write suite uses cold records and deterministic Debug
+pauses to verify that unrelated keys progress while the same key stays locked.
+It also checks command semantics, TTL, WATCH, cold recovery and grouped promotion:
+
+```bash
+cmake --build bld-clang18-debug --target keylane keylane_compact_collection_write_e2e_test -j 8
+ctest --test-dir bld-clang18-debug -R '^keylane_compact_collection_write_e2e$' --output-on-failure
+```
+
+Hash, Set, List and Sorted Set automatically promote to grouped storage at
+16 KiB of encoded collection data in both ordinary and Debug builds. Promotion
+does not need an environment switch. Debug/fault builds additionally provide
+the crash and admission hooks exercised by the integration tests.
+The current adapter and integration limits are documented in
+[Grouped collections](../architecture/09-grouped-collections.md).
+
+### Adding deterministic fault sites
+
+Use `include/keylane/fault_injection.h` for internal crash, allocation-failure
+and scheduling hooks. Its single build policy enables hooks in Debug or with
+`KEYLANE_BUILD_FAULT_SERVER=ON`; ordinary Release builds erase the hook bodies
+and their arguments, including environment lookups and injected suspension
+points. Set fault environment variables before launching the server, not
+concurrently with its workers.
+
+```cpp
+KEYLANE_FAULT_BAD_ALLOC("KEYLANE_FAIL_GROUP_HANDOFF_KEY", key);
+KEYLANE_MAYBE_CRASH_AT("group-batch-before-root");
+KEYLANE_FAULT_INJECT(
+    if (KEYLANE_FAULT_MATCHES("KEYLANE_TEST_PAUSE_KEY", key)) {
+      // Keep the existing coroutine, lock ownership and error handling.
+      auto status = co_await celer::SleepFor(worker, delay);
+      if (!status.ok()) co_return status;
+    });
+```
+
+Use `KEYLANE_FAULT_MATCHES_NTH` for an exact key plus a one-based position
+within the current operation. It does not introduce a shared hit counter.
+Keep fault effects inside the existing rollback/commit boundary.
+`KEYLANE_FAULT_INJECT` introduces a block, not a coroutine or lambda;
+cross-scope diagnostic declarations and outer-loop `break`/`continue` need
+the central `#if KEYLANE_FAULTS_ENABLED` guard instead. The crash selector
+`KEYLANE_CRASH_POINT` is cached on first use and terminates with exit code 86
+without flushing or unwinding.
+
+The `keylane_fault_injection_*` CTest cases independently compile the helper
+in Debug, ordinary Release and fault-enabled Release modes. Integration
+fixtures that require a hook must skip against ordinary Release servers.
+
+### Large collection stress tests
+
+The opt-in aggregate-size tests exercise collections whose encoded contents
+exceed 1 GiB, without a single aggregate import or COPY buffer:
+
+```bash
+cmake --build bld-clang18-debug --target keylane_replica_abort_reclaim_e2e_test keylane_grouped_ordered_write_e2e_test keylane -j 8
+bld-clang18-debug/keylane_replica_abort_reclaim_e2e_test --large-list
+bld-clang18-debug/keylane_replica_abort_reclaim_e2e_test --large-hash
+KEYLANE_RUN_LARGE_RDB=1 bld-clang18-debug/keylane_grouped_ordered_write_e2e_test \
+  bld-clang18-debug/keylane \
+  --gtest_filter=GroupedRdbStreamE2e.LargeListOverOneGiBImportsAndExportsWithoutAggregate
+```
+
+These are correctness tests, not throughput benchmarks. They use temporary
+files under `/mnt/dev`, require several GiB of free space per concurrent test,
+and can take tens of minutes with Debug instrumentation. The native tests use
+8 GiB sparse device files. The RDB test additionally retains input and output
+files, validates every exported item, and performs a cold restart; its longer
+startup/shutdown deadlines apply only to this opt-in case. A failed large RDB
+case preserves its files and phase logs for diagnosis. Do not point these
+fixtures at an existing database or benchmark block device.
+
+### Cluster fault tests
+
 Cluster fault tests use a dedicated build and bounded tier runner:
 
 ```bash

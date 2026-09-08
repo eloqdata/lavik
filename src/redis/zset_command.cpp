@@ -1,6 +1,7 @@
 #include "zset_command.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <charconv>
 #include <chrono>
@@ -438,6 +439,25 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
       callback, tx, 0, replication ? &*replication : nullptr);
 }
 
+Task<absl::StatusOr<storage::SortedSetResult>> RunSortedSet(
+    const CommandRequest& request, const storage::Digest* digest,
+    storage::TxShardWrites* tx, const storage::SortedSetOperation& operation) {
+  const bool read_only =
+      operation.kind_ != storage::SortedSetOperationKind::kAdd &&
+      operation.kind_ != storage::SortedSetOperationKind::kRemove &&
+      operation.kind_ != storage::SortedSetOperationKind::kPop;
+  auto replication = tx == nullptr && !read_only
+                         ? PrepareReplicationCommand(request)
+                         : std::nullopt;
+  if (digest == nullptr)
+    co_return co_await g_storage->ExecuteSortedSet(
+        request.db_id_, request.args_[1], operation,
+        replication ? &*replication : nullptr);
+  co_return co_await g_storage->ExecuteSortedSetLocked(
+      request.db_id_, request.args_[1], *digest, operation, tx,
+      replication ? &*replication : nullptr);
+}
+
 struct MultiPopShape {
   std::vector<std::size_t> key_args_;
   bool maximum_ = false;
@@ -519,39 +539,19 @@ ParseBlockingZSetDeadline(const CommandRequest& request) {
   return BlockingDeadlineFromSeconds(timeout_seconds);
 }
 
-Task<absl::StatusOr<std::vector<Element>>> PopZSetLocked(
+Task<absl::StatusOr<storage::SortedSetResult>> PopZSetLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
     bool maximum, std::uint64_t count, storage::TxShardWrites* tx = nullptr,
     const CommandRequest* request = nullptr) {
-  std::vector<Element> popped;
-  bool has_remaining = false;
-  auto callback = [&](std::optional<storage::CompactValueView> value)
-      -> absl::StatusOr<storage::CompactValueUpdate> {
-    auto decoded = Decode(value);
-    if (!decoded.ok()) return decoded.status();
-    ZSet set = std::move(*decoded);
-    const std::uint64_t wanted = std::min<std::uint64_t>(count, set.size());
-    popped.reserve(static_cast<std::size_t>(wanted));
-    if (maximum) {
-      for (std::uint64_t i = 0; i < wanted; ++i) {
-        popped.push_back(std::move(set[set.size() - 1 - i]));
-      }
-      set.erase(set.end() - static_cast<std::ptrdiff_t>(wanted), set.end());
-    } else {
-      for (std::uint64_t i = 0; i < wanted; ++i) {
-        popped.push_back(std::move(set[static_cast<std::size_t>(i)]));
-      }
-      set.erase(set.begin(), set.begin() + static_cast<std::ptrdiff_t>(wanted));
-    }
-    has_remaining = !set.empty();
-    return popped.empty()
-               ? absl::StatusOr<storage::CompactValueUpdate>(NoChange())
-               : ChangedSorted(std::move(set));
-  };
-  absl::Status status = co_await g_storage->ExecuteCompactLocked(
-      db_id, key, digest, storage::ValueType::kSortedSet, false, callback, tx);
-  if (!status.ok()) co_return status;
-  if (!popped.empty() && has_remaining) {
+  auto popped = co_await g_storage->ExecuteSortedSetLocked(
+      db_id, key, digest,
+      storage::SortedSetOperation{
+          .kind_ = storage::SortedSetOperationKind::kPop,
+          .reverse_ = maximum,
+          .pop_count_ = count},
+      tx);
+  if (!popped.ok()) co_return popped.status();
+  if (!popped->members_.empty() && popped->length_ != 0) {
     if (request != nullptr) {
       NotifyZSetBlockingKey(*request, key);
     } else {
@@ -569,7 +569,7 @@ struct SingleShardPopContext {
   const CommandRequest* request_ = nullptr;
   const MultiPopShape* shape_ = nullptr;
   std::size_t selected_arg_ = 0;
-  std::vector<Element> popped_;
+  storage::SortedSetResult popped_;
 };
 
 Task<absl::Status> SingleShardPopCallback(void* opaque,
@@ -591,7 +591,7 @@ Task<absl::Status> SingleShardPopCallback(void* opaque,
         locked->digest_, context->shape_->maximum_, context->shape_->count_,
         nullptr, context->request_);
     if (!popped.ok()) co_return popped.status();
-    if (!popped->empty()) {
+    if (!popped->members_.empty()) {
       context->selected_arg_ = argument;
       context->popped_ = std::move(*popped);
       break;
@@ -601,7 +601,9 @@ Task<absl::Status> SingleShardPopCallback(void* opaque,
 }
 
 void AppendMultiPopReply(ReplyBuilder& builder, std::string_view key,
-                         const std::vector<Element>& popped, bool flat_reply) {
+                         const storage::SortedSetResult& result,
+                         bool flat_reply) {
+  const auto& popped = result.members_;
   if (flat_reply) {
     builder.AppendArrayHeader(3);
     builder.AppendBulkString(key);
@@ -612,7 +614,7 @@ void AppendMultiPopReply(ReplyBuilder& builder, std::string_view key,
   builder.AppendArrayHeader(2);
   builder.AppendBulkString(key);
   builder.AppendArrayHeader(popped.size());
-  for (const Element& element : popped) {
+  for (const auto& element : popped) {
     builder.AppendArrayHeader(2);
     builder.AppendBulkString(element.member_);
     AppendScore(builder, element.score_);
@@ -687,13 +689,13 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
       }
       co_return Built(StorageError(builder, status));
     }
-    if (context.popped_.empty()) {
+    if (context.popped_.members_.empty()) {
       if (empty != nullptr) *empty = true;
       co_return Built(builder.AppendNullArray());
     }
-    replication.SetCommandArgs(
-        CanonicalSelectedZSetPop(request.args_[context.selected_arg_],
-                                 shape.maximum_, context.popped_.size()));
+    replication.SetCommandArgs(CanonicalSelectedZSetPop(
+        request.args_[context.selected_arg_], shape.maximum_,
+        context.popped_.members_.size()));
     replication.Commit();
     AppendMultiPopReply(builder, request.args_[context.selected_arg_],
                         context.popped_, shape.flat_reply_);
@@ -731,11 +733,11 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
       (void)co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
       co_return Built(StorageError(builder, popped.status()));
     }
-    if (!popped->empty()) {
+    if (!popped->members_.empty()) {
       status = co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
       if (!status.ok()) co_return Built(StorageError(builder, status));
-      replication.SetCommandArgs(
-          CanonicalSelectedZSetPop(key, shape.maximum_, popped->size()));
+      replication.SetCommandArgs(CanonicalSelectedZSetPop(
+          key, shape.maximum_, popped->members_.size()));
       replication.Commit();
       AppendMultiPopReply(builder, key, *popped, shape.flat_reply_);
       co_return Built(builder.View());
@@ -881,7 +883,12 @@ bool IsRangeCommand(CommandKind kind) {
   }
 }
 
-absl::Status ValidateRangeSyntax(const CommandRequest& request) {
+// The bounded storage path consumes the same parser as syntax validation;
+// do not let legacy aliases, endpoint reversal or LIMIT semantics drift.
+absl::Status ValidateRangeSyntax(
+    const CommandRequest& request,
+    storage::SortedSetOperation* normalized = nullptr,
+    bool* with_scores = nullptr) {
   const auto& args = request.args_;
   RangeOptions options;
   std::string_view min_text = args[2], max_text = args[3];
@@ -935,6 +942,7 @@ absl::Status ValidateRangeSyntax(const CommandRequest& request) {
           return absl::InvalidArgumentError(
               "syntax error, WITHSCORES not supported in combination with "
               "BYLEX");
+        options.with_scores_ = true;
         ++i;
       } else if (EqualCi(args[i], "limit")) {
         absl::Status parsed = ParseRangeLimit(args, i, &options);
@@ -949,7 +957,16 @@ absl::Status ValidateRangeSyntax(const CommandRequest& request) {
         (args.size() == 5 && !EqualCi(args[4], "withscores"))) {
       return absl::InvalidArgumentError("syntax error");
     }
+    options.with_scores_ = args.size() == 5;
   }
+  if (normalized) {
+    normalized->kind_ = storage::SortedSetOperationKind::kRange;
+    normalized->reverse_ = options.reverse_;
+    normalized->limit_ = options.limit_;
+    normalized->offset_ = options.offset_;
+    normalized->count_ = options.count_;
+  }
+  if (with_scores) *with_scores = options.with_scores_;
   if (options.reverse_ && options.mode_ != RangeOptions::Mode::kRank)
     std::swap(min_text, max_text);
   if (options.mode_ == RangeOptions::Mode::kRank) {
@@ -957,14 +974,29 @@ absl::Status ValidateRangeSyntax(const CommandRequest& request) {
     if (!ParseInt(min_text, &start) || !ParseInt(max_text, &stop))
       return absl::InvalidArgumentError(
           "value is not an integer or out of range");
+    if (normalized) {
+      normalized->range_mode_ = storage::SortedSetRangeMode::kRank;
+      normalized->first_ = start;
+      normalized->last_ = stop;
+    }
   } else if (options.mode_ == RangeOptions::Mode::kScore) {
     auto min = ParseScoreBound(min_text), max = ParseScoreBound(max_text);
     if (!min.ok()) return min.status();
     if (!max.ok()) return max.status();
+    if (normalized) {
+      normalized->range_mode_ = storage::SortedSetRangeMode::kScore;
+      normalized->minimum_score_ = {min->value_, min->exclusive_};
+      normalized->maximum_score_ = {max->value_, max->exclusive_};
+    }
   } else {
     auto min = ParseLexBound(min_text), max = ParseLexBound(max_text);
     if (!min.ok()) return min.status();
     if (!max.ok()) return max.status();
+    if (normalized) {
+      normalized->range_mode_ = storage::SortedSetRangeMode::kLex;
+      normalized->minimum_lex_ = {min->value_, min->infinity_, min->exclusive_};
+      normalized->maximum_lex_ = {max->value_, max->infinity_, max->exclusive_};
+    }
   }
   return absl::OkStatus();
 }
@@ -1100,11 +1132,15 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     if ((nx && xx) || (incr && (a.size() - index) != tuple)) {
       co_return Built(builder.AppendError("ERR syntax error"));
     }
-    struct Input {
-      double score_;
-      std::string_view member_;
-    };
-    std::vector<Input> inputs;
+    const auto input_count = (a.size() - index) / tuple;
+    auto input_admission =
+        TryReserveMemory(input_count * sizeof(storage::ScoredMemberView));
+    if (!input_admission) {
+      RecordMemoryRejection();
+      co_return Built(builder.AppendError("OOM Sorted Set input admission"));
+    }
+    std::vector<storage::ScoredMemberView> inputs;
+    inputs.reserve(input_count);
     for (; index < a.size(); index += tuple) {
       double score = 0;
       std::string_view member;
@@ -1125,58 +1161,30 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         }
         member = a[index + 1];
       }
-      inputs.push_back({score, member});
+      inputs.push_back({member, score});
     }
-    long long added = 0, changed = 0;
-    std::optional<double> incremented;
-    auto callback = [&](std::optional<storage::CompactValueView> value)
-        -> absl::StatusOr<storage::CompactValueUpdate> {
-      auto decoded = Decode(value);
-      if (!decoded.ok()) return decoded.status();
-      ZSet set = std::move(*decoded);
-      for (const Input& input : inputs) {
-        Element* current = Find(&set, input.member_);
-        if (current == nullptr) {
-          if (xx) continue;
-          set.push_back({std::string(input.member_), input.score_});
-          ++added;
-          ++changed;
-          if (incr) incremented = input.score_;
-          continue;
-        }
-        if (nx) {
-          if (incr) incremented.reset();
-          continue;
-        }
-        double next = incr ? current->score_ + input.score_ : input.score_;
-        if (std::isnan(next))
-          return absl::InvalidArgumentError(
-              "resulting score is not a number (NaN)");
-        if ((gt && next <= current->score_) ||
-            (lt && next >= current->score_)) {
-          if (incr) incremented.reset();
-          continue;
-        }
-        if (next != current->score_) {
-          current->score_ = next;
-          ++changed;
-        }
-        if (incr) incremented = next;
-      }
-      return changed == 0
-                 ? absl::StatusOr<storage::CompactValueUpdate>(NoChange())
-                 : Changed(std::move(set));
-    };
-    absl::Status status =
-        co_await RunCompact(request, digest, tx, false, callback);
-    if (!status.ok()) co_return Built(StorageError(builder, status));
-    if (changed != 0) NotifyZSetBlockingKey(request, a[1]);
+    storage::SortedSetOperation operation{
+        .kind_ = storage::SortedSetOperationKind::kAdd,
+        .entries_ = inputs,
+        .members_ = {},
+        .nx_ = nx,
+        .xx_ = xx,
+        .gt_ = gt,
+        .lt_ = lt,
+        .increment_ = incr,
+        .prepare_unlocked_ = request.kind_ == CommandKind::kZAdd ||
+                             request.kind_ == CommandKind::kZIncrBy};
+    auto result = co_await RunSortedSet(request, digest, tx, operation);
+    if (!result.ok()) co_return Built(StorageError(builder, result.status()));
+    if (result->changed_ != 0) NotifyZSetBlockingKey(request, a[1]);
     if (incr) {
-      co_return Built(incremented.has_value()
-                          ? builder.AppendDoubleText(FormatDouble(*incremented))
-                          : builder.AppendNull());
+      co_return Built(
+          result->incremented_.has_value()
+              ? builder.AppendDoubleText(FormatDouble(*result->incremented_))
+              : builder.AppendNull());
     }
-    co_return Built(builder.AppendInteger(ch ? changed : added));
+    co_return Built(
+        builder.AppendInteger(ch ? result->changed_ : result->added_));
   }
 
   if (request.kind_ == CommandKind::kGeoDist ||
@@ -1465,6 +1473,162 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     co_return Built(builder.View());
   }
 
+  if (request.kind_ == CommandKind::kZCard ||
+      request.kind_ == CommandKind::kZScore ||
+      request.kind_ == CommandKind::kZMScore ||
+      request.kind_ == CommandKind::kZRem) {
+    auto member_admission =
+        TryReserveMemory((a.size() - 2) * sizeof(std::string_view));
+    if (!member_admission) {
+      RecordMemoryRejection();
+      co_return Built(builder.AppendError("OOM Sorted Set input admission"));
+    }
+    std::vector<std::string_view> members;
+    members.reserve(a.size() - 2);
+    for (std::size_t i = 2; i < a.size(); ++i) members.push_back(a[i]);
+    storage::SortedSetOperation operation{
+        .kind_ = request.kind_ == CommandKind::kZCard
+                     ? storage::SortedSetOperationKind::kLength
+                 : request.kind_ == CommandKind::kZRem
+                     ? storage::SortedSetOperationKind::kRemove
+                     : storage::SortedSetOperationKind::kScores,
+        .entries_ = {},
+        .members_ = members,
+        .prepare_unlocked_ = request.kind_ == CommandKind::kZRem};
+    auto result = co_await RunSortedSet(request, digest, tx, operation);
+    if (!result.ok()) co_return Built(StorageError(builder, result.status()));
+    if (request.kind_ == CommandKind::kZCard)
+      co_return Built(builder.AppendInteger(result->length_));
+    if (request.kind_ == CommandKind::kZRem)
+      co_return Built(builder.AppendInteger(result->changed_));
+    if (request.kind_ == CommandKind::kZMScore)
+      builder.AppendArrayHeader(result->scores_.size());
+    for (const auto score : result->scores_) {
+      if (score)
+        builder.AppendDoubleText(FormatDouble(*score));
+      else
+        builder.AppendNull();
+    }
+    co_return Built(builder.View());
+  }
+
+  if (request.kind_ == CommandKind::kZPopMin ||
+      request.kind_ == CommandKind::kZPopMax ||
+      request.kind_ == CommandKind::kZScan) {
+    storage::SortedSetOperation operation;
+    if (request.kind_ == CommandKind::kZScan) {
+      operation.kind_ = storage::SortedSetOperationKind::kScan;
+      if (!ParseInt(a[2], &operation.scan_cursor_))
+        co_return Built(builder.AppendError("ERR invalid cursor"));
+      for (std::size_t i = 3; i < a.size();) {
+        if (EqualCi(a[i], "match") && i + 1 < a.size()) {
+          operation.scan_pattern_ = a[i + 1];
+          i += 2;
+        } else if (EqualCi(a[i], "count") && i + 1 < a.size() &&
+                   ParseInt(a[i + 1], &operation.scan_count_) &&
+                   operation.scan_count_ != 0) {
+          i += 2;
+        } else {
+          co_return Built(builder.AppendError("ERR syntax error"));
+        }
+      }
+    } else {
+      std::int64_t count = 1;
+      if (a.size() == 3 && (!ParseInt(a[2], &count) || count < 0))
+        co_return Built(
+            builder.AppendError("ERR value is out of range, must be positive"));
+      operation.kind_ = storage::SortedSetOperationKind::kPop;
+      operation.reverse_ = request.kind_ == CommandKind::kZPopMax;
+      operation.pop_count_ = count;
+    }
+    auto result = co_await RunSortedSet(request, digest, tx, operation);
+    if (!result.ok()) co_return Built(StorageError(builder, result.status()));
+    const bool scan = operation.kind_ == storage::SortedSetOperationKind::kScan;
+    if (!scan && result->changed_ != 0 && result->length_ != 0)
+      NotifyZSetBlockingKey(request, a[1]);
+    const bool nested =
+        !scan && builder.version() == RespVersion::k3 && a.size() == 3;
+    if (scan) {
+      builder.AppendArrayHeader(2);
+      builder.AppendBulkString(std::to_string(result->next_cursor_));
+    }
+    builder.AppendArrayHeader(result->members_.size() * (nested ? 1 : 2));
+    for (const auto& member : result->members_) {
+      if (nested) builder.AppendArrayHeader(2);
+      builder.AppendBulkString(member.member_);
+      if (scan)
+        builder.AppendBulkString(FormatDouble(member.score_));
+      else
+        AppendScore(builder, member.score_);
+    }
+    co_return Built(builder.View());
+  }
+
+  const bool range_read = IsRangeCommand(request.kind_) &&
+                          request.kind_ != CommandKind::kZRemRangeByRank &&
+                          request.kind_ != CommandKind::kZRemRangeByScore &&
+                          request.kind_ != CommandKind::kZRemRangeByLex;
+  if (range_read || request.kind_ == CommandKind::kZRank ||
+      request.kind_ == CommandKind::kZRevRank ||
+      request.kind_ == CommandKind::kZCount ||
+      request.kind_ == CommandKind::kZLexCount) {
+    storage::SortedSetOperation operation;
+    bool with_scores = false;
+    std::array<std::string_view, 1> wanted{a[2]};
+    if (range_read) {
+      auto normalized = ValidateRangeSyntax(request, &operation, &with_scores);
+      if (!normalized.ok()) co_return Built(StorageError(builder, normalized));
+    } else if (request.kind_ == CommandKind::kZRank ||
+               request.kind_ == CommandKind::kZRevRank) {
+      operation.kind_ = storage::SortedSetOperationKind::kRank;
+      operation.members_ = wanted;
+      operation.reverse_ = request.kind_ == CommandKind::kZRevRank;
+    } else {
+      operation.kind_ = storage::SortedSetOperationKind::kCount;
+      if (request.kind_ == CommandKind::kZCount) {
+        auto low = ParseScoreBound(a[2]), high = ParseScoreBound(a[3]);
+        if (!low.ok()) co_return Built(StorageError(builder, low.status()));
+        if (!high.ok()) co_return Built(StorageError(builder, high.status()));
+        operation.range_mode_ = storage::SortedSetRangeMode::kScore;
+        operation.minimum_score_ = {low->value_, low->exclusive_};
+        operation.maximum_score_ = {high->value_, high->exclusive_};
+      } else {
+        auto low = ParseLexBound(a[2]), high = ParseLexBound(a[3]);
+        if (!low.ok()) co_return Built(StorageError(builder, low.status()));
+        if (!high.ok()) co_return Built(StorageError(builder, high.status()));
+        operation.range_mode_ = storage::SortedSetRangeMode::kLex;
+        operation.minimum_lex_ = {low->value_, low->infinity_, low->exclusive_};
+        operation.maximum_lex_ = {high->value_, high->infinity_,
+                                  high->exclusive_};
+      }
+    }
+    auto result = co_await RunSortedSet(request, digest, tx, operation);
+    if (!result.ok()) co_return Built(StorageError(builder, result.status()));
+    if (operation.kind_ == storage::SortedSetOperationKind::kCount)
+      co_return Built(builder.AppendInteger(result->count_));
+    if (operation.kind_ == storage::SortedSetOperationKind::kRank) {
+      if (!result->rank_)
+        co_return Built(a.size() == 4 ? builder.AppendNullArray()
+                                      : builder.AppendNull());
+      if (a.size() == 4) {
+        builder.AppendArrayHeader(2);
+        builder.AppendInteger(*result->rank_);
+        AppendScore(builder, *result->rank_score_);
+        co_return Built(builder.View());
+      }
+      co_return Built(builder.AppendInteger(*result->rank_));
+    }
+    const bool nested = with_scores && builder.version() == RespVersion::k3;
+    builder.AppendArrayHeader(result->members_.size() *
+                              (with_scores && !nested ? 2 : 1));
+    for (const auto& member : result->members_) {
+      if (nested) builder.AppendArrayHeader(2);
+      builder.AppendBulkString(member.member_);
+      if (with_scores) AppendScore(builder, member.score_);
+    }
+    co_return Built(builder.View());
+  }
+
   bool read_only = true;
   switch (request.kind_) {
     case CommandKind::kZPopMax:
@@ -1481,6 +1645,9 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
 
   long long integer = 0;
   std::optional<std::string> scalar;
+  // Callback output outlives the engine's full-image scratch reservation.
+  // Keep repeated random replies charged until ReplyBuilder has copied them.
+  RetainedMemoryCharge random_reply_charge;
   std::vector<std::optional<std::string>> output;
   std::uint64_t next_cursor = 0;
   const bool reply_with_scores = std::any_of(
@@ -1596,30 +1763,56 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           return absl::InvalidArgumentError("value is out of range");
         }
         if (set.empty()) return NoChange();
+        const std::uint64_t requested =
+            count < 0 ? static_cast<std::uint64_t>(-count)
+                      : std::min<std::uint64_t>(count, set.size());
+        constexpr auto limit = std::numeric_limits<std::size_t>::max();
+        constexpr auto slot_bytes = sizeof(decltype(output)::value_type);
+        const std::uint64_t multiplier = with_scores ? 2 : 1;
+        if (requested > limit / sizeof(std::uint64_t) ||
+            requested > output.max_size() / multiplier ||
+            requested > limit / (multiplier * slot_bytes * 2))
+          return absl::ResourceExhaustedError(
+              "OOM Sorted Set random reply size overflow");
+        const auto index_bytes = requested * sizeof(std::uint64_t);
+        auto index_admission = TryReserveMemory(index_bytes);
+        if (!index_admission) {
+          RecordMemoryRejection();
+          return absl::ResourceExhaustedError(
+              "OOM Sorted Set random rank admission");
+        }
+        // Draw first, then admit the actual chosen strings. A single huge
+        // member must not charge every small draw as if it selected that item.
         std::vector<std::uint64_t> indexes;
         if (count >= 0) {
-          if (static_cast<std::uint64_t>(count) >= set.size()) {
-            for (const Element& element : set) {
-              output.push_back(element.member_);
-              if (with_scores) output.push_back(FormatDouble(element.score_));
-            }
-            integer = count_given ? 1 : 0;
-            return NoChange();
-          }
-          indexes = SampleUniqueRandomRanks(set.size(),
-                                            static_cast<std::uint64_t>(count),
-                                            true, RandomSampleGenerator());
+          indexes = SampleUniqueRandomRanks(set.size(), requested, true,
+                                            RandomSampleGenerator());
         } else {
-          const std::uint64_t requested = static_cast<std::uint64_t>(-count);
-          for (std::uint64_t i = 0; i < requested; ++i) {
-            const Element& element =
-                set[RandomRank(set.size(), RandomSampleGenerator())];
-            output.push_back(element.member_);
-            if (with_scores) output.push_back(FormatDouble(element.score_));
-          }
-          integer = count_given ? 1 : 0;
-          return NoChange();
+          indexes.reserve(requested);
+          for (std::uint64_t i = 0; i < requested; ++i)
+            indexes.push_back(RandomRank(set.size(), RandomSampleGenerator()));
         }
+        const auto slots = requested * multiplier;
+        std::size_t output_bytes = slots * slot_bytes * 2;
+        for (const auto at : indexes) {
+          // Include SSO capacity and the bounded score text, even when no
+          // separate heap allocation happens for those strings.
+          const auto bytes = std::max<std::size_t>(set[at].member_.size() + 1,
+                                                   sizeof(std::string)) +
+                             (with_scores ? 64 : 0);
+          if (bytes > limit - output_bytes)
+            return absl::ResourceExhaustedError(
+                "OOM Sorted Set random reply size overflow");
+          output_bytes += bytes;
+        }
+        auto output_admission = TryReserveMemory(output_bytes);
+        if (!output_admission) {
+          RecordMemoryRejection();
+          return absl::ResourceExhaustedError(
+              "OOM Sorted Set random reply admission");
+        }
+        output.reserve(slots);
+        random_reply_charge.Adopt(&*output_admission, output_bytes);
         for (std::uint64_t at : indexes) {
           output.push_back(set[at].member_);
           if (with_scores) output.push_back(FormatDouble(set[at].score_));
@@ -2215,10 +2408,53 @@ absl::Status ComputeGeoStore(const ZSet& source, GeoStoreQuery query,
   return absl::OkStatus();
 }
 
+struct ZSetInputCharge {
+  RetainedMemoryCharge decoded_;
+  RetainedMemoryCharge inherited_;
+};
+
+absl::StatusOr<MemoryReservation> ReserveZSetScratch(std::size_t bytes,
+                                                     std::size_t count,
+                                                     std::size_t copies = 1) {
+  constexpr auto limit = std::numeric_limits<std::size_t>::max();
+  if (copies == 0 || bytes > limit - 4096 ||
+      count > (limit - bytes - 4096) / 512 ||
+      bytes + 4096 + count * 512 > limit / copies)
+    return absl::ResourceExhaustedError(
+        "OOM Sorted Set aggregate size overflow");
+  auto admission = TryReserveMemory((bytes + 4096 + count * 512) * copies);
+  if (!admission) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM Sorted Set aggregate admission");
+  }
+  return std::move(*admission);
+}
+
+absl::StatusOr<std::size_t> ZSetRetainedBytes(const ZSet& value) {
+  constexpr auto limit = std::numeric_limits<std::size_t>::max();
+  if (value.capacity() > limit / sizeof(Element))
+    return absl::ResourceExhaustedError("OOM Sorted Set vector size overflow");
+  std::size_t bytes = value.capacity() * sizeof(Element);
+  for (const auto& element : value) {
+    if (element.member_.capacity() >= limit - bytes)
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set string size overflow");
+    bytes += element.member_.capacity() + 1;
+  }
+  return bytes;
+}
+
 struct MultiContext {
+  // These owners can be populated on source/destination workers and destroyed
+  // by the coordinator. A local MemoryReservation cannot cross that boundary.
+  RetainedMemoryCharge metadata_charge_;
+  RetainedMemoryCharge output_charge_;
+  std::vector<ZSetInputCharge> input_charges_;
   const CommandRequest* request_ = nullptr;
   std::vector<ZSet> inputs_;
   ZSet output_;
+  std::vector<CapturedReplicationCommand> replacement_effects_;
+  std::vector<std::string> replacement_args_;
   std::vector<double> weights_;
   std::vector<storage::TxShardWrites> writes_;
   MultiAggregate aggregate_ = MultiAggregate::kUnion;
@@ -2228,8 +2464,76 @@ struct MultiContext {
   bool store_ = false;
   bool single_shard_ = false;
   bool rollback_ = false;
+  bool rollback_failed_ = false;
+  bool borrowed_tx_ = false;
   std::optional<StoreShape> store_shape_;
 };
+
+absl::Status PrepareMultiContext(MultiContext* context, std::size_t arguments) {
+  try {
+    constexpr auto slot_bytes =
+        sizeof(ZSet) + sizeof(ZSetInputCharge) + sizeof(double);
+    const auto workers = g_storage->worker_count();
+    constexpr auto limit = std::numeric_limits<std::size_t>::max();
+    if (arguments > limit / slot_bytes ||
+        workers >
+            (limit - arguments * slot_bytes) / sizeof(storage::TxShardWrites))
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set context size overflow");
+    auto admission = ReserveZSetScratch(
+        arguments * slot_bytes + workers * sizeof(storage::TxShardWrites), 0,
+        2);
+    if (!admission.ok()) return admission.status();
+    context->inputs_.resize(arguments);
+    context->input_charges_.resize(arguments);
+    context->weights_.reserve(arguments);
+    context->writes_.reserve(workers);
+    context->metadata_charge_.Adopt(
+        &*admission,
+        context->inputs_.capacity() * sizeof(ZSet) +
+            context->input_charges_.capacity() * sizeof(ZSetInputCharge) +
+            context->weights_.capacity() * sizeof(double) +
+            context->writes_.capacity() * sizeof(storage::TxShardWrites));
+    return absl::OkStatus();
+  } catch (const std::bad_alloc&) {
+    return absl::ResourceExhaustedError("OOM Sorted Set context allocation");
+  }
+}
+
+void ClearMultiPayloads(MultiContext* context) noexcept {
+  // Called only after shard work joins, never concurrently by finish hops.
+  // Undo may need admission on the same worker that held these large copies.
+  for (auto& input : context->inputs_) ZSet{}.swap(input);
+  for (auto& charge : context->input_charges_) {
+    charge.decoded_.Reset();
+    charge.inherited_.Reset();
+  }
+  ZSet{}.swap(context->output_);
+  std::vector<CapturedReplicationCommand>{}.swap(context->replacement_effects_);
+  std::vector<std::string>{}.swap(context->replacement_args_);
+  context->output_charge_.Reset();
+}
+
+absl::Status PrepareMultiCapture(const MultiContext& context) {
+  const auto& capture = context.request_->replication_capture_;
+  if (!capture) return absl::OkStatus();
+  std::size_t bytes = 0;
+  constexpr auto limit = std::numeric_limits<std::size_t>::max();
+  for (const auto& effect : context.replacement_effects_) {
+    if (effect.args_.capacity() > (limit - bytes) / sizeof(std::string))
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set capture size overflow");
+    bytes += effect.args_.capacity() * sizeof(std::string);
+    for (const auto& argument : effect.args_) {
+      if (argument.capacity() >= limit - bytes)
+        return absl::ResourceExhaustedError(
+            "OOM Sorted Set capture size overflow");
+      bytes += argument.capacity() + 1;
+    }
+  }
+  return capture->ReserveAdditionalCommands(context.replacement_effects_.size(),
+                                            bytes);
+}
 
 std::vector<CapturedReplicationCommand> BuildZSetReplacement(
     const CommandRequest& request, std::size_t destination_arg,
@@ -2256,7 +2560,7 @@ storage::TxShardWrites* LocalWrites(MultiContext& context) {
                                  : &context.writes_[celer::ThisWorker().id_];
 }
 
-absl::Status ComputeMulti(MultiContext* context) {
+absl::Status ComputeMultiUnchecked(MultiContext* context) {
   context->output_.clear();
   if (context->request_->kind_ == CommandKind::kZRangeStore) {
     return ComputeRangeStore(*context->request_,
@@ -2345,75 +2649,216 @@ absl::Status ComputeMulti(MultiContext* context) {
   return absl::OkStatus();
 }
 
-Task<absl::Status> ReplaceMultiDestination(MultiContext* context,
-                                           const storage::Digest& digest) {
-  const auto& request = *context->request_;
-  const std::size_t destination_arg =
-      context->store_shape_ ? context->store_shape_->destination_arg_ : 1;
-  const std::string& destination = request.args_[destination_arg];
-  auto deleted = co_await g_storage->DeleteLocked(
-      request.db_id_, destination, digest, LocalWrites(*context));
-  if (!deleted.ok()) co_return deleted.status();
-  if (context->output_.empty()) co_return absl::OkStatus();
-  auto callback = [&](std::optional<storage::CompactValueView> value)
-      -> absl::StatusOr<storage::CompactValueUpdate> {
-    if (value) {
-      return absl::InternalError(
-          "sorted-set STORE destination was not replaced");
+absl::Status ComputeMulti(MultiContext* context) {
+  try {
+    std::size_t bytes = 0, count = 0;
+    constexpr auto limit = std::numeric_limits<std::size_t>::max();
+    for (const auto& input : context->inputs_) {
+      const auto retained = ZSetRetainedBytes(input);
+      if (!retained.ok()) return retained.status();
+      if (*retained > limit - bytes || input.size() > limit - count)
+        return absl::ResourceExhaustedError(
+            "OOM Sorted Set aggregate size overflow");
+      bytes += *retained;
+      count += input.size();
     }
-    return Changed(context->output_);
-  };
-  co_return co_await g_storage->ExecuteCompactLocked(
-      request.db_id_, destination, digest, storage::ValueType::kSortedSet,
-      false, callback, LocalWrites(*context));
+    // Covers score-map keys/nodes, selection indexes, output copies and
+    // canonical replication effects before any destination is deleted.
+    auto admission = ReserveZSetScratch(bytes, count, 4);
+    if (!admission.ok()) return admission.status();
+    struct ClearOnFailure {
+      MultiContext* context_;
+      bool published_ = false;
+      ~ClearOnFailure() {
+        if (published_) return;
+        ZSet{}.swap(context_->output_);
+        std::vector<CapturedReplicationCommand>{}.swap(
+            context_->replacement_effects_);
+        std::vector<std::string>{}.swap(context_->replacement_args_);
+      }
+    } cleanup{context};
+    auto computed = ComputeMultiUnchecked(context);
+    if (!computed.ok()) return computed;
+    if (context->store_) {
+      auto effects = BuildZSetReplacement(
+          *context->request_, context->store_shape_->destination_arg_,
+          context->output_);
+      if (context->borrowed_tx_)
+        context->replacement_effects_ = std::move(effects);
+      else
+        context->replacement_args_ =
+            EncodeReplicationCommandEffects(std::move(effects));
+    }
+    auto retained = ZSetRetainedBytes(context->output_);
+    if (!retained.ok()) return retained.status();
+    auto add_strings = [&](const std::vector<std::string>& strings) {
+      if (strings.capacity() > (limit - *retained) / sizeof(std::string))
+        return false;
+      *retained += strings.capacity() * sizeof(std::string);
+      for (const auto& string : strings) {
+        if (string.capacity() >= limit - *retained) return false;
+        *retained += string.capacity() + 1;
+      }
+      return true;
+    };
+    if (!add_strings(context->replacement_args_))
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set replication size overflow");
+    if (context->replacement_effects_.capacity() >
+        (limit - *retained) / sizeof(CapturedReplicationCommand))
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set replication size overflow");
+    *retained += context->replacement_effects_.capacity() *
+                 sizeof(CapturedReplicationCommand);
+    for (const auto& effect : context->replacement_effects_)
+      if (!add_strings(effect.args_))
+        return absl::ResourceExhaustedError(
+            "OOM Sorted Set replication size overflow");
+    if (admission->bytes() && *retained > admission->bytes())
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set output exceeds admission");
+    context->output_charge_.Adopt(&*admission, *retained);
+    cleanup.published_ = true;
+    return absl::OkStatus();
+  } catch (const std::bad_alloc&) {
+    return absl::ResourceExhaustedError("OOM Sorted Set aggregate allocation");
+  }
+}
+
+Task<absl::Status> ReplaceMultiDestination(
+    MultiContext* context, const storage::Digest& digest,
+    storage::TxShardWrites* writes = nullptr) {
+  try {
+    const auto& request = *context->request_;
+    const std::size_t destination_arg =
+        context->store_shape_ ? context->store_shape_->destination_arg_ : 1;
+    const std::string& destination = request.args_[destination_arg];
+    if (writes == nullptr) writes = LocalWrites(*context);
+    const auto bytes = ZSetRetainedBytes(context->output_);
+    if (!bytes.ok()) co_return bytes.status();
+    auto admission = ReserveZSetScratch(*bytes, context->output_.size(), 6);
+    if (!admission.ok()) co_return admission.status();
+    // Encode and admit destination-local decode/planner headroom before DEL.
+    // Errors after DEL are returned to the existing transaction undo owner.
+    auto encoded = Encode(context->output_);
+    if (!encoded.ok()) co_return encoded.status();
+    auto deleted = co_await g_storage->DeleteLocked(request.db_id_, destination,
+                                                    digest, writes);
+    if (!deleted.ok()) co_return deleted.status();
+    if (context->output_.empty()) co_return absl::OkStatus();
+    auto callback = [&](std::optional<storage::CompactValueView> value)
+        -> absl::StatusOr<storage::CompactValueUpdate> {
+      if (value) {
+        return absl::InternalError(
+            "sorted-set STORE destination was not replaced");
+      }
+      return storage::CompactValueUpdate{
+          .changed_ = true,
+          .encoded_ = std::move(*encoded),
+          .logical_size_ = context->output_.size(),
+          .expire_at_ms_ = std::nullopt};
+    };
+    co_return co_await g_storage->ExecuteCompactLocked(
+        request.db_id_, destination, digest, storage::ValueType::kSortedSet,
+        false, callback, writes);
+  } catch (const std::bad_alloc&) {
+    co_return absl::ResourceExhaustedError("OOM Sorted Set STORE allocation");
+  }
+}
+
+absl::Status DecodeRetainedInput(std::optional<storage::CompactValueView> value,
+                                 ZSet* input, ZSetInputCharge* charge) {
+  auto admission = ReserveZSetScratch(value ? value->encoded_.size() : 0,
+                                      value ? value->logical_size_ : 0);
+  if (!admission.ok()) return admission.status();
+  auto decoded = Decode(value);
+  if (!decoded.ok()) return decoded.status();
+  const auto retained = ZSetRetainedBytes(*decoded);
+  if (!retained.ok()) return retained.status();
+  if (admission->bytes() && *retained > admission->bytes())
+    return absl::ResourceExhaustedError(
+        "OOM Sorted Set input exceeds admission");
+  *input = std::move(*decoded);
+  charge->decoded_.Adopt(&*admission, *retained);
+  return absl::OkStatus();
 }
 
 Task<absl::StatusOr<ZSet>> ReadAggregateInputLocked(
-    std::uint8_t db_id, std::string_view key, const storage::Digest& digest) {
-  ZSet input;
-  auto callback = [&](std::optional<storage::CompactValueView> value)
-      -> absl::StatusOr<storage::CompactValueUpdate> {
-    auto decoded = Decode(value);
-    if (!decoded.ok()) return decoded.status();
-    input = std::move(*decoded);
-    return NoChange();
-  };
-  absl::Status status = co_await g_storage->ExecuteCompactLocked(
-      db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
-  if (status.ok()) co_return input;
-  if (!status.message().starts_with("WRONGTYPE ")) co_return status;
+    std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
+    ZSetInputCharge* charge) {
+  try {
+    ZSet input;
+    auto callback = [&](std::optional<storage::CompactValueView> value)
+        -> absl::StatusOr<storage::CompactValueUpdate> {
+      auto decoded = DecodeRetainedInput(value, &input, charge);
+      if (!decoded.ok()) return decoded;
+      return NoChange();
+    };
+    absl::Status status = co_await g_storage->ExecuteCompactLocked(
+        db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
+    if (status.ok()) co_return input;
+    if (!status.message().starts_with("WRONGTYPE ")) co_return status;
 
-  // Redis ZUNION/ZINTER/ZDIFF accept Set inputs and assign every Set member
-  // the implicit score 1.0.
-  storage::HashOperation operation;
-  operation.kind_ = storage::HashOperationKind::kKeys;
-  auto members =
-      co_await g_storage->ExecuteSetLocked(db_id, key, digest, operation);
-  if (!members.ok()) co_return members.status();
-  input.reserve(members->values_.size());
-  for (auto& member : members->values_) {
-    if (!member.has_value())
-      co_return absl::InternalError("Set aggregate source has missing member");
-    input.push_back(Element{std::move(*member), 1.0});
+    // Redis ZUNION/ZINTER/ZDIFF accept Set inputs and assign every Set member
+    // the implicit score 1.0.
+    storage::HashOperation operation;
+    operation.kind_ = storage::HashOperationKind::kKeys;
+    auto members =
+        co_await g_storage->ExecuteSetLocked(db_id, key, digest, operation);
+    if (!members.ok()) co_return members.status();
+    std::size_t string_bytes = 0;
+    for (const auto& member : members->values_) {
+      if (!member)
+        co_return absl::InternalError(
+            "Set aggregate source has missing member");
+      if (member->capacity() >=
+          std::numeric_limits<std::size_t>::max() - string_bytes)
+        co_return absl::ResourceExhaustedError(
+            "OOM Set aggregate size overflow");
+      string_bytes += member->capacity() + 1;
+    }
+    const bool transfer = members->retained_charge_.bytes() >= string_bytes;
+    auto admission = ReserveZSetScratch(transfer ? 0 : string_bytes,
+                                        members->values_.size());
+    if (!admission.ok()) co_return admission.status();
+    input.reserve(members->values_.size());
+    for (auto& member : members->values_) {
+      if (!member.has_value())
+        co_return absl::InternalError(
+            "Set aggregate source has missing member");
+      input.push_back(Element{std::move(*member), 1.0});
+    }
+    if (transfer) charge->inherited_ = std::move(members->retained_charge_);
+    charge->decoded_.Adopt(&*admission, input.capacity() * sizeof(Element) +
+                                            (transfer ? 0 : string_bytes));
+    co_return input;
+  } catch (const std::bad_alloc&) {
+    co_return absl::ResourceExhaustedError(
+        "OOM Sorted Set aggregate input allocation");
   }
-  co_return input;
 }
 
-Task<absl::StatusOr<ZSet>> ReadZSetOnlyLocked(std::uint8_t db_id,
-                                              std::string_view key,
-                                              const storage::Digest& digest) {
-  ZSet input;
-  auto callback = [&](std::optional<storage::CompactValueView> value)
-      -> absl::StatusOr<storage::CompactValueUpdate> {
-    auto decoded = Decode(value);
-    if (!decoded.ok()) return decoded.status();
-    input = std::move(*decoded);
-    return NoChange();
-  };
-  absl::Status status = co_await g_storage->ExecuteCompactLocked(
-      db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
-  if (!status.ok()) co_return status;
-  co_return input;
+Task<absl::StatusOr<ZSet>> ReadZSetOnlyLocked(
+    std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
+    ZSetInputCharge* retained = nullptr) {
+  try {
+    ZSetInputCharge local_charge;
+    auto* charge = retained ? retained : &local_charge;
+    ZSet input;
+    auto callback = [&](std::optional<storage::CompactValueView> value)
+        -> absl::StatusOr<storage::CompactValueUpdate> {
+      auto decoded = DecodeRetainedInput(value, &input, charge);
+      if (!decoded.ok()) return decoded;
+      return NoChange();
+    };
+    absl::Status status = co_await g_storage->ExecuteCompactLocked(
+        db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
+    if (!status.ok()) co_return status;
+    co_return input;
+  } catch (const std::bad_alloc&) {
+    co_return absl::ResourceExhaustedError(
+        "OOM Sorted Set aggregate input allocation");
+  }
 }
 
 Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
@@ -2428,11 +2873,12 @@ Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
                            request.kind_ == CommandKind::kGeoRadius ||
                            request.kind_ == CommandKind::kGeoRadiusByMember;
     auto input =
-        zset_only
-            ? co_await ReadZSetOnlyLocked(
-                  request.db_id_, request.args_[key.arg_index_], key.digest_)
-            : co_await ReadAggregateInputLocked(
-                  request.db_id_, request.args_[key.arg_index_], key.digest_);
+        zset_only ? co_await ReadZSetOnlyLocked(
+                        request.db_id_, request.args_[key.arg_index_],
+                        key.digest_, &context->input_charges_[key.arg_index_])
+                  : co_await ReadAggregateInputLocked(
+                        request.db_id_, request.args_[key.arg_index_],
+                        key.digest_, &context->input_charges_[key.arg_index_]);
     if (!input.ok()) co_return input.status();
     context->inputs_[key.arg_index_] = std::move(*input);
   }
@@ -2444,9 +2890,15 @@ Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
     absl::Status replaced =
         co_await ReplaceMultiDestination(context, destination);
     if (!replaced.ok()) {
-      if (!context->writes_.empty())
-        (void)co_await g_storage->RollbackTxLocal(
-            context->writes_.front().txid_);
+      ClearMultiPayloads(context);
+      if (!context->writes_.empty()) {
+        const auto rolled_back =
+            co_await g_storage->RollbackTxLocal(context->writes_.front().txid_);
+        if (!rolled_back.ok()) {
+          context->rollback_failed_ = true;
+          co_return rolled_back;
+        }
+      }
       co_return replaced;
     }
     if (!context->writes_.empty())
@@ -2496,27 +2948,49 @@ void InitZSetCommandStorage(storage::StorageEngine* engine) {
 Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
     bool with_scores, storage::TxShardWrites* tx, std::uint64_t now_ms) {
-  storage::HashResult result;
-  auto callback = [&](std::optional<storage::CompactValueView> value)
-      -> absl::StatusOr<storage::CompactValueUpdate> {
-    auto decoded = Decode(value);
-    if (!decoded.ok()) return decoded.status();
-    result.key_exists_ = value.has_value();
-    result.length_ = decoded->size();
-    result.values_.reserve(decoded->size() * (with_scores ? 2 : 1));
-    for (const Element& element : *decoded) {
-      result.values_.emplace_back(element.member_);
-      if (with_scores) {
-        result.values_.emplace_back(FormatDouble(element.score_));
+  try {
+    storage::HashResult result;
+    auto callback = [&](std::optional<storage::CompactValueView> value)
+        -> absl::StatusOr<storage::CompactValueUpdate> {
+      auto admission = ReserveZSetScratch(value ? value->encoded_.size() : 0,
+                                          value ? value->logical_size_ : 0, 2);
+      if (!admission.ok()) return admission.status();
+      auto decoded = Decode(value);
+      if (!decoded.ok()) return decoded.status();
+      result.key_exists_ = value.has_value();
+      result.length_ = decoded->size();
+      result.values_.reserve(decoded->size() * (with_scores ? 2 : 1));
+      for (const Element& element : *decoded) {
+        result.values_.emplace_back(element.member_);
+        if (with_scores) {
+          result.values_.emplace_back(FormatDouble(element.score_));
+        }
       }
-    }
-    return NoChange();
-  };
-  absl::Status status = co_await g_storage->ExecuteCompactLocked(
-      db_id, key, digest, storage::ValueType::kSortedSet, true, callback, tx,
-      now_ms);
-  if (!status.ok()) co_return status;
-  co_return result;
+      std::size_t retained =
+          result.values_.capacity() * sizeof(result.values_[0]);
+      for (const auto& item : result.values_) {
+        if (!item) continue;
+        if (item->capacity() >=
+            std::numeric_limits<std::size_t>::max() - retained)
+          return absl::ResourceExhaustedError(
+              "OOM Sorted Set random snapshot size overflow");
+        retained += item->capacity() + 1;
+      }
+      if (admission->bytes() && retained > admission->bytes())
+        return absl::ResourceExhaustedError(
+            "OOM Sorted Set random snapshot exceeds admission");
+      result.retained_charge_.Adopt(&*admission, retained);
+      return NoChange();
+    };
+    absl::Status status = co_await g_storage->ExecuteCompactLocked(
+        db_id, key, digest, storage::ValueType::kSortedSet, true, callback, tx,
+        now_ms);
+    if (!status.ok()) co_return status;
+    co_return result;
+  } catch (const std::bad_alloc&) {
+    co_return absl::ResourceExhaustedError(
+        "OOM Sorted Set random snapshot allocation");
+  }
 }
 
 Task<CommandReply> ExecuteZSetCommand(const CommandRequest& request,
@@ -2586,7 +3060,9 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
 
   MultiContext context;
   context.request_ = &request;
-  context.inputs_.resize(args.size());
+  const auto prepared_context = PrepareMultiContext(&context, args.size());
+  if (!prepared_context.ok())
+    co_return Built(StorageError(builder, prepared_context));
   context.store_shape_ = std::move(*parsed_store);
   const bool aggregate_store = request.kind_ == CommandKind::kZDiffStore ||
                                request.kind_ == CommandKind::kZInterStore ||
@@ -2713,15 +3189,21 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     if (status.ok())
       status = co_await transaction.Execute(&MultiWriteShard, &context, false);
     context.rollback_ = !status.ok();
+    if (context.rollback_) ClearMultiPayloads(&context);
     // The finish hop settles (or rolls back) what the write hop did; it must
     // not be fenced off by an authority change the write hop already beat.
     transaction.SetShardValidator(nullptr, nullptr);
     absl::Status finished =
         co_await transaction.Execute(&MultiFinishShard, &context, true);
-    if (status.ok() && !finished.ok()) status = finished;
+    if (!finished.ok()) {
+      context.rollback_failed_ = context.rollback_;
+      status = finished;
+    }
   }
   if (!status.ok()) {
-    if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
+    ClearMultiPayloads(&context);
+    if (!context.rollback_failed_ &&
+        cluster_validator.tripped_.load(std::memory_order_relaxed)) {
       if (context.store_ && !context.single_shard_ &&
           !transaction.releasing()) {
         (void)co_await transaction.Release();
@@ -2734,9 +3216,7 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     co_return Built(StorageError(builder, status));
   }
   if (context.store_) {
-    replication.SetCommandArgs(
-        EncodeReplicationCommandEffects(BuildZSetReplacement(
-            request, context.store_shape_->destination_arg_, context.output_)));
+    replication.SetCommandArgs(std::move(context.replacement_args_));
     replication.SetFinalExpirations(context.writes_);
     replication.Commit();
     g_storage->NoteTxCommitStarted();
@@ -2817,7 +3297,10 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
 
   MultiContext context;
   context.request_ = &request;
-  context.inputs_.resize(args.size());
+  context.borrowed_tx_ = true;
+  const auto prepared_context = PrepareMultiContext(&context, args.size());
+  if (!prepared_context.ok())
+    co_return std::string(StorageError(builder, prepared_context));
   context.store_shape_ = std::move(*parsed_store);
   const bool aggregate_store = request.kind_ == CommandKind::kZDiffStore ||
                                request.kind_ == CommandKind::kZInterStore ||
@@ -2916,11 +3399,12 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
                              request.kind_ == CommandKind::kGeoSearchStore ||
                              request.kind_ == CommandKind::kGeoRadius ||
                              request.kind_ == CommandKind::kGeoRadiusByMember;
-      auto input = zset_only
-                       ? co_await ReadZSetOnlyLocked(
-                             request.db_id_, args[argument], key->digest_)
-                       : co_await ReadAggregateInputLocked(
-                             request.db_id_, args[argument], key->digest_);
+      auto input = zset_only ? co_await ReadZSetOnlyLocked(
+                                   request.db_id_, args[argument], key->digest_,
+                                   &context.input_charges_[argument])
+                             : co_await ReadAggregateInputLocked(
+                                   request.db_id_, args[argument], key->digest_,
+                                   &context.input_charges_[argument]);
       if (!input.ok()) co_return input.status();
       context.inputs_[argument] = std::move(*input);
       co_return absl::OkStatus();
@@ -2936,6 +3420,9 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
   absl::Status computed = ComputeMulti(&context);
   if (!computed.ok()) co_return std::string(StorageError(builder, computed));
   if (context.store_) {
+    const auto capture_ready = PrepareMultiCapture(context);
+    if (!capture_ready.ok())
+      co_return std::string(StorageError(builder, capture_ready));
     const std::size_t destination_arg = context.store_shape_->destination_arg_;
     const ZSetExecKey* destination = find_key(destination_arg);
     if (destination == nullptr) {
@@ -2951,28 +3438,15 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
       co_return std::string(StorageError(builder, undo_ready));
     destination_writes.collect_undo_ = true;
     auto write = [&]() -> Task<absl::Status> {
-      auto deleted = co_await g_storage->DeleteLocked(
-          request.db_id_, args[destination_arg], destination->digest_,
-          &tx_writes[destination->owner_]);
-      if (!deleted.ok()) co_return deleted.status();
-      if (context.output_.empty()) co_return absl::OkStatus();
-      auto callback = [&](std::optional<storage::CompactValueView> value)
-          -> absl::StatusOr<storage::CompactValueUpdate> {
-        if (value)
-          return absl::InternalError(
-              "sorted-set STORE destination was not replaced");
-        return Changed(context.output_);
-      };
-      co_return co_await g_storage->ExecuteCompactLocked(
-          request.db_id_, args[destination_arg], destination->digest_,
-          storage::ValueType::kSortedSet, false, callback,
-          &tx_writes[destination->owner_]);
+      co_return co_await ReplaceMultiDestination(
+          &context, destination->digest_, &tx_writes[destination->owner_]);
     };
     absl::Status status =
         destination->owner_ == celer::ThisWorker().id_
             ? co_await write()
             : co_await celer::SubmitTaskTo(destination->owner_, write);
     destination_writes.collect_undo_ = false;
+    if (!status.ok()) ClearMultiPayloads(&context);
     absl::Status undo_finished = co_await celer::SubmitTaskTo(
         destination->owner_,
         [txid = destination_writes.txid_, rollback = !status.ok(),
@@ -2986,8 +3460,7 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
     }
     if (!undo_finished.ok())
       co_return std::string(StorageError(builder, undo_finished));
-    for (auto& effect :
-         BuildZSetReplacement(request, destination_arg, context.output_)) {
+    for (auto& effect : context.replacement_effects_) {
       CaptureReplicationCommand(request, effect.db_id_,
                                 std::move(effect.args_));
     }
@@ -3055,10 +3528,11 @@ Task<std::string> ExecuteZSetMultiPopLocked(
     if (!popped.ok()) {
       co_return std::string(StorageError(builder, popped.status()));
     }
-    if (!popped->empty()) {
+    if (!popped->members_.empty()) {
       CaptureReplicationCommand(
-          request, CanonicalSelectedZSetPop(request.args_[argument],
-                                            shape.maximum_, popped->size()));
+          request,
+          CanonicalSelectedZSetPop(request.args_[argument], shape.maximum_,
+                                   popped->members_.size()));
       AppendMultiPopReply(builder, request.args_[argument], *popped,
                           shape.flat_reply_);
       co_return std::string(builder.View());

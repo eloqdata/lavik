@@ -1,3 +1,5 @@
+#include <tuple>
+
 #include "impl.h"
 
 namespace keylane::storage {
@@ -50,7 +52,10 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
 
 Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
     WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-    std::span<std::byte> destination) {
+    std::span<std::byte> destination, std::size_t payload_offset) {
+  if (payload_offset > ref.payload_bytes_) {
+    co_return absl::DataLossError("recovered extent slice is out of bounds");
+  }
   const std::size_t read_bytes =
       AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
   auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
@@ -83,9 +88,70 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
   if (Crc32c(payload) != ref.payload_checksum_) {
     co_return absl::InternalError("recovered key extent checksum mismatch");
   }
-  std::memcpy(destination.data(), payload.data(),
-              std::min(payload.size(), destination.size()));
+  if (!destination.empty()) {
+    std::memcpy(destination.data(), payload.data() + payload_offset,
+                std::min(payload.size() - payload_offset, destination.size()));
+  }
   co_return absl::OkStatus();
+}
+
+Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadRecoveryPayloadSlice(
+    WorkerStore& store, ExtentManifest extents, std::size_t offset,
+    std::size_t bytes) {
+  if (extents == nullptr || bytes > kMaxRecordPayloadBytes) {
+    co_return absl::DataLossError("recovered payload slice has no manifest");
+  }
+  std::string result(bytes, '\0');
+  std::size_t copied = 0;
+  for (std::size_t index = 0; index < extents->size(); ++index) {
+    const ExtentRef ref = extents->at(index);
+    std::size_t slice_offset = offset;
+    std::size_t count = 0;
+    if (offset >= ref.payload_bytes_) {
+      offset -= ref.payload_bytes_;
+      slice_offset = 0;
+    } else {
+      count =
+          std::min<std::size_t>(bytes - copied, ref.payload_bytes_ - offset);
+      offset = 0;
+    }
+    // The envelope is small, but every extent still crosses checksum and
+    // identity validation before this graph can become recovery authority.
+    // Empty destinations validate the remaining payload without retaining it.
+    const auto destination = std::span<std::byte>(
+        reinterpret_cast<std::byte*>(result.data() + copied), count);
+    absl::Status read;
+#ifdef CELER_WITH_SPDK_STORAGE
+    // Scan-time extent owners may not be published yet. Use an eligible
+    // device reader, exactly as external-key recovery does.
+    const auto& owners = device_owners_[DeviceIndexForBlock(ref.block_id_)];
+    const unsigned owner = owners[ref.block_id_ % owners.size()];
+    if (owner != store.worker_->id()) {
+      read = co_await celer::SubmitTaskTo(
+          owner,
+          [this, owner, ref, index, destination,
+           slice_offset]() -> Task<absl::Status> {
+            co_return co_await ReadRecoveryExtentInto(
+                *stores_[owner], ref, static_cast<std::uint32_t>(index),
+                destination, slice_offset);
+          });
+    } else {
+      read = co_await ReadRecoveryExtentInto(store, ref,
+                                             static_cast<std::uint32_t>(index),
+                                             destination, slice_offset);
+    }
+#else
+    read = co_await ReadRecoveryExtentInto(store, ref,
+                                           static_cast<std::uint32_t>(index),
+                                           destination, slice_offset);
+#endif
+    if (!read.ok()) co_return read;
+    copied += count;
+  }
+  if (copied != bytes) {
+    co_return absl::DataLossError("recovered payload slice is truncated");
+  }
+  co_return result;
 }
 
 std::uint16_t StorageEngine::Impl::RecoveredBlockOwner(
@@ -443,6 +509,16 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         }
         AtomicMax(&recovery_max_lsn_, record.lsn_);
         AtomicMax(&recovery_max_txid_, record.txid_);
+        // A batch prepare can survive without its decision. Never reuse that
+        // id on the next boot and accidentally commit old prepared groups.
+        AtomicMax(&recovery_max_txid_, record.group_batch_txid_);
+        if (record.hash_group_) {
+          // Cleaner promotion clears transaction tags, not the independent
+          // object revision. Its globally allocated id must remain reserved
+          // even when this is the only surviving physical record carrying it.
+          AtomicMax(&recovery_max_txid_, record.mutation_sequence_);
+          AtomicMax(&recovery_max_txid_, record.group_incarnation_);
+        }
         if ((block.kind_ == BlockKind::kTransaction) != (record.txid_ != 0)) {
           co_return absl::Status(
               absl::StatusCode::kInternal,
@@ -537,6 +613,143 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           ++records;
           continue;
         }
+        const bool ordered = record.value_type_ == ValueType::kList ||
+                             record.value_type_ == ValueType::kSortedSet;
+        const auto ordered_kind = record.value_type_ == ValueType::kList
+                                      ? OrderedCollectionKind::kList
+                                      : OrderedCollectionKind::kSortedSet;
+        std::optional<RecoveredGroupedRoot> grouped_root;
+        std::optional<RecoveredHashGroup> hash_group;
+        std::optional<RecoveredOrderedGroup> ordered_group;
+        if (record.hash_group_) {
+          // Value-only extents of an obsolete group may already have been
+          // reclaimed while other live records retain this source block.
+          // Its checked header contains all winner-selection metadata; touch
+          // external values only after the complete root graph is selected.
+          hash_group = RecoveredHashGroup{
+              .incarnation_ = record.group_incarnation_,
+              .id_ = {.prefix_ = record.group_prefix_,
+                      .bits_ = record.group_prefix_bits_},
+              .sequence_ = record.mutation_sequence_,
+              .lsn_ = record.lsn_,
+              .txid_ = record.txid_,
+              .batch_txid_ = record.group_batch_txid_,
+              .field_count_ = record.logical_size_,
+              .retired_ = record.group_retired_,
+          };
+          if (!record.external_) {
+            const std::size_t key_prefix =
+                record.key_external_ ? record.key_bytes_ : 0;
+            if (record.payload_bytes_ < key_prefix) {
+              co_return absl::DataLossError("recovered group key is truncated");
+            }
+            const std::string_view encoded(
+                reinterpret_cast<const char*>(payload) + key_prefix,
+                record.payload_bytes_ - key_prefix);
+            if (ordered) {
+              auto decoded = DecodeOrderedGroup(encoded);
+              if (!decoded.ok()) co_return decoded.status();
+              if (decoded->kind_ != ordered_kind ||
+                  decoded->incarnation_ != hash_group->incarnation_ ||
+                  decoded->id_ != hash_group->id_.prefix_ ||
+                  decoded->retired_ != hash_group->retired_ ||
+                  decoded->entries_.size() != hash_group->field_count_) {
+                co_return absl::DataLossError(
+                    "ordered page disagrees with its record identity");
+              }
+              ordered_group = RecoveredOrderedGroup{
+                  .incarnation_ = decoded->incarnation_,
+                  .id_ = decoded->id_,
+                  .previous_ = decoded->previous_,
+                  .next_ = decoded->next_,
+                  .sequence_ = record.mutation_sequence_,
+                  .lsn_ = record.lsn_,
+                  .txid_ = record.txid_,
+                  .batch_txid_ = record.group_batch_txid_,
+                  .item_count_ = record.logical_size_,
+                  .retired_ = record.group_retired_,
+              };
+            } else {
+              auto decoded = DecodeHashGroup(encoded);
+              if (!decoded.ok()) co_return decoded.status();
+              if (decoded->incarnation_ != hash_group->incarnation_ ||
+                  decoded->id_ != hash_group->id_ ||
+                  decoded->retired_ != hash_group->retired_ ||
+                  decoded->value_.entries_.size() != hash_group->field_count_) {
+                co_return absl::DataLossError(
+                    "Hash group payload disagrees with its record identity");
+              }
+            }
+          }
+        }
+        if (record.grouped_) {
+          const std::size_t key_prefix =
+              record.key_external_ ? record.key_bytes_ : 0;
+          std::size_t encoded_bytes = record.payload_bytes_;
+          std::string metadata_bytes;
+          std::string_view encoded;
+          if (record.external_) {
+            encoded_bytes = 0;
+            for (const ExtentRef& ref : *extents) {
+              if (encoded_bytes > kMaxRecordPayloadBytes - ref.payload_bytes_) {
+                co_return absl::DataLossError(
+                    "recovered group extent payload exceeds its limit");
+              }
+              encoded_bytes += ref.payload_bytes_;
+            }
+            if (encoded_bytes < key_prefix) {
+              co_return absl::DataLossError("recovered group key is truncated");
+            }
+            encoded_bytes -= key_prefix;
+            // Roots are fixed-size. External roots carry large parent keys,
+            // whose source-dependent extent lifetime still protects reads of
+            // older root versions before the top-level merge is complete.
+            const std::size_t metadata_size = encoded_bytes;
+            if (metadata_size > (ordered ? kOrderedCollectionRootBytes
+                                         : kGroupedHashRootBytes)) {
+              co_return absl::DataLossError(
+                  "recovered grouped root is too large");
+            }
+            auto loaded = co_await LoadRecoveryPayloadSlice(
+                store, extents, key_prefix, metadata_size);
+            if (!loaded.ok()) co_return loaded.status();
+            metadata_bytes = std::move(*loaded);
+            encoded = metadata_bytes;
+          } else {
+            if (encoded_bytes < key_prefix) {
+              co_return absl::DataLossError("recovered group key is truncated");
+            }
+            encoded_bytes -= key_prefix;
+            encoded = std::string_view(
+                reinterpret_cast<const char*>(payload) + key_prefix,
+                encoded_bytes);
+          }
+          if (ordered) {
+            auto decoded = DecodeOrderedCollectionRoot(encoded);
+            if (!decoded.ok()) co_return decoded.status();
+            if (decoded->revision_ == 0) {
+              decoded->revision_ = record.mutation_sequence_;
+            }
+            if (decoded->kind_ != ordered_kind ||
+                decoded->item_count_ != record.logical_size_) {
+              co_return absl::DataLossError(
+                  "ordered root disagrees with its record header");
+            }
+            grouped_root = *decoded;
+            AtomicMax(&recovery_max_txid_, decoded->revision_);
+            AtomicMax(&recovery_max_txid_, decoded->incarnation_);
+          } else {
+            auto decoded = DecodeGroupedHashRoot(encoded);
+            if (!decoded.ok()) co_return decoded.status();
+            if (decoded->field_count_ != record.logical_size_) {
+              co_return absl::DataLossError(
+                  "grouped root count disagrees with its record header");
+            }
+            grouped_root = *decoded;
+            AtomicMax(&recovery_max_txid_, decoded->revision_);
+            AtomicMax(&recovery_max_txid_, decoded->incarnation_);
+          }
+        }
         RecoveryRecord recovered{
             .digest_ = digest,
             .key_ = record.key_external_ && record.external_
@@ -553,8 +766,12 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 RecordLocation::PackedMetadata::Encode(
                     record_offset, record.total_disk_bytes_, block_owner, false,
                     record.external_, record.key_external_, false, false,
-                    record.txid_ != 0, record.kind_, record.value_type_)),
-            .extents_ = extents};
+                    record.txid_ != 0, record.kind_, record.value_type_,
+                    record.expire_at_ms_ != 0, record.grouped_)),
+            .extents_ = extents,
+            .hash_group_ = hash_group,
+            .ordered_group_ = ordered_group,
+            .grouped_root_ = grouped_root};
         buffered_bytes += sizeof(RecoveryRecord) + recovered.key_.capacity();
         if (recovered.extents_ != nullptr) {
           buffered_bytes += recovered.extents_->capacity() * sizeof(ExtentRef);
@@ -623,6 +840,13 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
   }
 
   for (const RecoveryRecord& recovered : batch.records_) {
+    if (recovered.hash_group_.has_value()) {
+      // Auxiliaries are not user-key versions. Keep committed and prepared
+      // candidates separate from the root index until the global decision
+      // barrier can adjudicate the entire graph together.
+      store.recovery_hash_groups_.push_back(recovered);
+      continue;
+    }
     if (recovered.txid_ != 0) {
       // Whether this record's transaction committed is only decidable once
       // every worker's scan has fed the committed set; park it until after
@@ -667,6 +891,9 @@ absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
       .replication_epoch_ = recovered.replication_epoch_,
       .location_ = recovered.location_,
       .extents_ = &recovered.extents_,
+      .grouped_root_ = recovered.grouped_root_.has_value()
+                           ? &*recovered.grouped_root_
+                           : nullptr,
       .checkpoint_snapshot_ = recovered.checkpoint_snapshot_,
   };
   return ApplyRecoveredRecord(store, partition, view);
@@ -714,13 +941,38 @@ absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
         current_lsn = std::numeric_limits<std::uint64_t>::max();
       }
     }
+    bool equal_command_newer = recovered.lsn_ > current_lsn;
+    if (found != nullptr && recovered.grouped_root_ != nullptr &&
+        found->value_.grouped() &&
+        recovered.location_.mutation_sequence_ ==
+            found->value_.mutation_sequence_) {
+      const auto current_root = store.recovery_grouped_roots_.find(found);
+      if (current_root == store.recovery_grouped_roots_.end()) {
+        return absl::DataLossError("grouped winner has no revision metadata");
+      }
+      // One replay envelope can modify the same Hash several times while
+      // retaining its outer command sequence. The independent root revision
+      // orders those mutations; a later physical GC copy is not a newer value.
+      const auto revision = [](const auto& root) { return root.revision_; };
+      const auto incoming_revision =
+          std::visit(revision, *recovered.grouped_root_);
+      const auto current_revision = std::visit(revision, current_root->second);
+      if (incoming_revision != current_revision) {
+        equal_command_newer = incoming_revision > current_revision;
+      }
+    }
     const bool candidate_newer = found == nullptr ||
                                  recovered.location_.mutation_sequence_ >
                                      found->value_.mutation_sequence_ ||
                                  (recovered.location_.mutation_sequence_ ==
                                       found->value_.mutation_sequence_ &&
-                                  recovered.lsn_ > current_lsn);
+                                  equal_command_newer);
     if (candidate_newer) {
+      if (recovered.location_.grouped() !=
+          (recovered.grouped_root_ != nullptr)) {
+        return absl::DataLossError(
+            "recovered grouped winner has no root metadata");
+      }
       const bool was_live =
           found != nullptr && found->value_.kind() == RecordKind::kValue;
       const bool is_live = recovered.location_.kind() == RecordKind::kValue;
@@ -757,6 +1009,12 @@ absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
       }
       if (!recovered.checkpoint_snapshot_) {
         store.recovery_lsns_.insert_or_assign(winner_entry, recovered.lsn_);
+      }
+      if (recovered.grouped_root_ != nullptr) {
+        store.recovery_grouped_roots_.insert_or_assign(
+            winner_entry, *recovered.grouped_root_);
+      } else {
+        store.recovery_grouped_roots_.erase(winner_entry);
       }
       if (recovered.txid_ != 0) {
         store.recovery_txids_.insert_or_assign(winner_entry, recovered.txid_);
@@ -801,6 +1059,291 @@ absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
     }
   }
   return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
+    WorkerStore& store) {
+  auto& records = store.recovery_hash_groups_;
+  // Group candidates by logical key once. Recovery memory is proportional to
+  // scanned auxiliary metadata, never to retained field/value bodies; a root
+  // examines only its own candidates rather than rescanning all large keys.
+  std::sort(records.begin(), records.end(),
+            [](const RecoveryRecord& left, const RecoveryRecord& right) {
+              return std::tie(left.db_id_, left.key_) <
+                     std::tie(right.db_id_, right.key_);
+            });
+  for (const auto& [entry, root] : store.recovery_grouped_roots_) {
+    const RecordLocation location = MaterializeIndexLocation(*entry);
+    if (!location.grouped()) {
+      co_return absl::DataLossError(
+          "grouped recovery metadata names a compact root");
+    }
+    std::string_view key;
+    if (entry->key_complete()) {
+      key = entry->key();
+    } else {
+      const auto found = store.recovery_external_keys_.find(entry);
+      if (found == store.recovery_external_keys_.end()) {
+        co_return absl::DataLossError(
+            "grouped recovery root has no complete key");
+      }
+      key = found->second;
+    }
+    auto& partition = PartitionForKey(store, key);
+    std::optional<std::uint8_t> root_db;
+    // The transient metadata key is an entry address, not a persisted DB.
+    // Resolve it against the small, owner-local index array exactly once per
+    // grouped key. Physical identity disambiguates a reused name across DBs.
+    const Digest digest = ComputeDigest(key);
+    for (std::uint8_t db = 0; db < kLogicalDatabaseCount; ++db) {
+      for (const auto* candidate :
+           partition.indexes_[db].FindCandidates(digest, key)) {
+        if (candidate == entry) {
+          root_db = db;
+          break;
+        }
+      }
+      if (root_db.has_value()) break;
+    }
+    if (!root_db.has_value()) {
+      co_return absl::DataLossError(
+          "grouped recovery root is not a key winner");
+    }
+    const auto lower = std::lower_bound(
+        records.begin(), records.end(), std::pair(*root_db, key),
+        [](const RecoveryRecord& record, const auto& target) {
+          return std::pair(record.db_id_, std::string_view(record.key_)) <
+                 target;
+        });
+    const GroupedObjectVersion version{
+        .root_ = location,
+        .db_epoch_ = DbEpoch(*root_db),
+        .replication_epoch_ = partition.replication_epoch_,
+        .index_generation_ = partition.grouped_generations_[*root_db],
+    };
+    if (const auto* ordered = std::get_if<OrderedCollectionRoot>(&root)) {
+      auto end = lower;
+      while (end != records.end() && end->db_id_ == *root_db &&
+             end->key_ == key)
+        ++end;
+      auto object = co_await RecoverOrderedObject(
+          store, *ordered, version,
+          std::span(records).subspan(lower - records.begin(), end - lower));
+      if (!object.ok()) co_return object.status();
+      auto published = partition.grouped_objects_[*root_db].Publish(
+          key, nullptr, std::move(*object));
+      if (!published.ok()) co_return published;
+      continue;
+    }
+    std::vector<RecoveredHashGroup> candidates;
+    for (auto it = lower;
+         it != records.end() && it->db_id_ == *root_db && it->key_ == key;
+         ++it) {
+      auto candidate = *it->hash_group_;
+      candidate.record_token_ =
+          static_cast<std::uint64_t>(it - records.begin());
+      candidates.push_back(candidate);
+    }
+    auto directory = HashGroupDirectory::Recover(
+        std::get<GroupedHashRoot>(root), location.mutation_sequence_,
+        candidates, recovery_committed_txids_);
+    if (!directory.ok()) co_return directory.status();
+    std::vector<HashGroupLocation> locations;
+    locations.reserve(directory->groups().size() +
+                      directory->retired_groups().size());
+    auto append_location = [&](const RecoveredHashGroup& selected) {
+      RecoveryRecord& physical = records.at(selected.record_token_);
+      physical.grouped_reachable_ = true;
+      locations.push_back(HashGroupLocation{
+          .id_ = selected.id_,
+          .location_ = physical.location_,
+          .extents_ = physical.extents_,
+          .retired_ = selected.retired_,
+      });
+    };
+    for (const auto& [prefix, selected] : directory->groups()) {
+      append_location(selected);
+    }
+    // A split's retired parent remains live evidence while old parent bytes
+    // can still be scanned. Forgetting it makes a later boot resurrect an
+    // overlapping routing leaf even though the visible root did not change.
+    for (const auto& [id, selected] : directory->retired_groups()) {
+      append_location(selected);
+    }
+    auto object =
+        GroupedHashObject::Create(version, std::move(*directory), locations,
+                                  store.record_index_entry_arena_);
+    if (!object.ok()) co_return object.status();
+    auto published = partition.grouped_objects_[*root_db].Publish(
+        key, nullptr, std::move(*object));
+    if (!published.ok()) co_return published;
+  }
+  store.recovery_grouped_roots_.clear();
+  store.recovery_grouped_roots_.rehash(0);
+  co_return absl::OkStatus();
+}
+
+Task<absl::StatusOr<GroupedHashObject::Handle>>
+StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
+                                          const OrderedCollectionRoot& root,
+                                          GroupedObjectVersion version,
+                                          std::span<RecoveryRecord> records) {
+  const auto revision =
+      root.revision_ == 0 ? version.root_.mutation_sequence_ : root.revision_;
+  std::map<std::uint64_t, std::size_t> winners;
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    const auto& candidate = *records[i].hash_group_;
+    if (candidate.incarnation_ != root.incarnation_ ||
+        candidate.sequence_ > revision ||
+        (candidate.txid_ != 0 &&
+         !recovery_committed_txids_.contains(candidate.txid_)) ||
+        (candidate.batch_txid_ != 0 &&
+         !recovery_committed_txids_.contains(candidate.batch_txid_)))
+      continue;
+    if (records[i].location_.value_type() != version.root_.value_type() ||
+        candidate.id_.bits_ != 0) {
+      co_return absl::DataLossError("ordered candidate has a different type");
+    }
+    auto [position, inserted] = winners.emplace(candidate.id_.prefix_, i);
+    if (inserted) continue;
+    const auto& previous = *records[position->second].hash_group_;
+    if (candidate.sequence_ == previous.sequence_ &&
+        (candidate.field_count_ != previous.field_count_ ||
+         candidate.retired_ != previous.retired_)) {
+      co_return absl::DataLossError("conflicting ordered page header copies");
+    }
+    if (candidate.sequence_ > previous.sequence_ ||
+        (candidate.sequence_ == previous.sequence_ &&
+         candidate.lsn_ > previous.lsn_)) {
+      position->second = i;
+    }
+  }
+  std::vector<RecoveredOrderedGroup> candidates;
+  candidates.reserve(winners.size());
+  for (const auto& [id, token] : winners) {
+    auto& physical = records[token];
+    const auto& header = *physical.hash_group_;
+    RecoveredOrderedGroup candidate{
+        .incarnation_ = header.incarnation_,
+        .id_ = id,
+        .sequence_ = header.sequence_,
+        .lsn_ = header.lsn_,
+        .txid_ = header.txid_,
+        .batch_txid_ = header.batch_txid_,
+        .item_count_ = header.field_count_,
+        // The standalone ordered codec reserves zero as an invalid token.
+        .record_token_ = token + 1,
+        .retired_ = header.retired_,
+    };
+    if (physical.location_.external()) {
+      if (physical.extents_ == nullptr) {
+        co_return absl::DataLossError("ordered page has no extent manifest");
+      }
+      std::size_t bytes = 0;
+      for (const auto& extent : *physical.extents_) {
+        if (bytes > kMaxRecordPayloadBytes - extent.payload_bytes_)
+          co_return absl::DataLossError("ordered page payload is too large");
+        bytes += extent.payload_bytes_;
+      }
+      const std::size_t key_bytes =
+          physical.location_.key_external() ? physical.key_.size() : 0;
+      if (bytes < key_bytes)
+        co_return absl::DataLossError("ordered page parent key is truncated");
+      // Only the highest committed revision of each stable id reaches IO.
+      // Superseded value-only extents may already be recycled. The selected
+      // page is checked completely, but only its 64-byte routing envelope is
+      // retained, even when one indivisible item spans many extents.
+      auto prefix = co_await LoadRecoveryPayloadSlice(
+          store, physical.extents_, key_bytes, kOrderedGroupHeaderBytes);
+      if (!prefix.ok()) co_return prefix.status();
+      auto metadata = DecodeOrderedGroupMetadata(*prefix, bytes - key_bytes);
+      if (!metadata.ok()) co_return metadata.status();
+      if (metadata->kind_ != root.kind_ ||
+          metadata->incarnation_ != candidate.incarnation_ ||
+          metadata->id_ != candidate.id_ ||
+          metadata->retired_ != candidate.retired_ ||
+          metadata->item_count_ != candidate.item_count_) {
+        co_return absl::DataLossError(
+            "ordered page envelope disagrees with its record identity");
+      }
+      candidate.previous_ = metadata->previous_;
+      candidate.next_ = metadata->next_;
+    } else {
+      if (!physical.ordered_group_.has_value())
+        co_return absl::DataLossError("ordered inline page has no metadata");
+      candidate.previous_ = physical.ordered_group_->previous_;
+      candidate.next_ = physical.ordered_group_->next_;
+    }
+    candidates.push_back(candidate);
+  }
+  auto directory = OrderedGroupDirectory::Recover(
+      root, revision, candidates, recovery_committed_txids_,
+      version.root_.mutation_sequence_);
+  if (!directory.ok()) co_return directory.status();
+  std::vector<HashGroupLocation> locations;
+  locations.reserve(candidates.size());
+  const auto append = [&](const RecoveredOrderedGroup& candidate) {
+    auto& physical = records[candidate.record_token_ - 1];
+    physical.grouped_reachable_ = true;
+    locations.push_back(HashGroupLocation{
+        .id_ = {.prefix_ = candidate.id_, .bits_ = 0},
+        .location_ = physical.location_,
+        .extents_ = physical.extents_,
+        .retired_ = candidate.retired_,
+    });
+  };
+  for (const auto& candidate : directory->groups()) append(candidate);
+  for (const auto& candidate : directory->retired_groups()) append(candidate);
+  co_return GroupedHashObject::CreateOrdered(version, std::move(*directory),
+                                             locations,
+                                             store.record_index_entry_arena_);
+}
+
+Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroups(
+    WorkerStore& store) {
+  for (const RecoveryRecord& record : store.recovery_hash_groups_) {
+    if (!record.grouped_reachable_ || !record.location_.external()) continue;
+    // Ordered winners were fully checksummed while resolving their links;
+    // there is no reason to read their potentially huge bodies twice.
+    if (record.location_.value_type() == ValueType::kList ||
+        record.location_.value_type() == ValueType::kSortedSet)
+      continue;
+    if (record.extents_ == nullptr) {
+      co_return absl::DataLossError(
+          "live recovered group has no extent manifest");
+    }
+    std::size_t encoded_bytes = 0;
+    for (const ExtentRef& ref : *record.extents_) {
+      if (encoded_bytes > kMaxRecordPayloadBytes - ref.payload_bytes_) {
+        co_return absl::DataLossError(
+            "live recovered group payload is too large");
+      }
+      encoded_bytes += ref.payload_bytes_;
+    }
+    const std::size_t key_prefix =
+        record.location_.key_external() ? record.key_.size() : 0;
+    if (encoded_bytes < key_prefix) {
+      co_return absl::DataLossError("live recovered group key is truncated");
+    }
+    encoded_bytes -= key_prefix;
+    // This retains only a bounded envelope, but checks every byte of every
+    // selected extent. Unreachable groups never reach this read: a freed or
+    // reused obsolete extent cannot make an otherwise valid startup fail.
+    auto prefix = co_await LoadRecoveryPayloadSlice(
+        store, record.extents_, key_prefix, kHashGroupHeaderBytes);
+    if (!prefix.ok()) co_return prefix.status();
+    auto decoded = DecodeHashGroupMetadata(*prefix, encoded_bytes);
+    if (!decoded.ok()) co_return decoded.status();
+    const RecoveredHashGroup& expected = *record.hash_group_;
+    if (decoded->incarnation_ != expected.incarnation_ ||
+        decoded->id_ != expected.id_ ||
+        decoded->field_count_ != expected.field_count_ ||
+        decoded->retired_ != expected.retired_) {
+      co_return absl::DataLossError(
+          "live Hash group envelope disagrees with its record identity");
+    }
+  }
+  co_return absl::OkStatus();
 }
 
 }  // namespace keylane::storage

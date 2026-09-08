@@ -136,14 +136,112 @@ absl::Status StorageEngine::Impl::ConfigureTxCleanerCooldown(
   return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner() {
+Task<absl::Status> StorageEngine::Impl::BeforeGroupedTransaction(
+    WorkerStore& store, std::uint64_t append_bytes) {
+  // Ordinary grouped snapshots can fill transaction blocks long before the
+  // periodic cooldown expires. Cleaning after this command has acquired the
+  // same generation would leave its own lease preventing reclamation.
+  if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
+    co_return absl::OkStatus();  // Preserve explicit maintenance disabling.
+  constexpr std::uint64_t payload = kStorageBlockBytes - kBlockHeaderBytes;
+  const auto needed = append_bytes / payload + (append_bytes % payload != 0);
+  const auto deadline = MonotonicMillis() + 1000;
+  unsigned rounds = 0;
+  try {
+    for (;;) {
+      if (shutdown_flush_requested_.load(std::memory_order_acquire))
+        co_return absl::UnavailableError("storage is shutting down");
+      // Observe only on this stream's owner, without suspension. Small
+      // successors can reuse the current generation's staging capacity even
+      // when every free foreground block is occupied. Forcing a rotation in
+      // that case would discard usable space and require a fresh tx block:
+      // a snapshot may retain the old extents until it obtains the key intent
+      // this very writer holds. This is not append admission; WriteRecord
+      // still validates the stream and remaining bytes after its own waits.
+      const auto generation =
+          current_tx_generation_.load(std::memory_order_acquire);
+      const auto active = store.active_tx_blocks_.find(generation);
+      if (active != store.active_tx_blocks_.end() && active->second) {
+        const auto& stream = *active->second;
+        const auto* state = FindBlockState(store, stream.block_id_);
+        if (state != nullptr && state->allocated_ && state->in_memory_ &&
+            !state->freeing_ && !state->release_pending_ &&
+            state->allocation_epoch_ == stream.allocation_epoch_ &&
+            state->kind_ == BlockKind::kTransaction) {
+          const auto used =
+              std::max(stream.committed_bytes_, state->committed_bytes_);
+          // An in-flight flush owns only its captured prefix, so still-open
+          // staging bytes remain reusable; the writer rechecks after waiting.
+          if (used <= kStorageBlockBytes &&
+              append_bytes <= kStorageBlockBytes - used)
+            co_return absl::OkStatus();
+        }
+      }
+      std::uint64_t free = 0;
+      std::uint64_t capacity = 0;
+      for (std::size_t index = 0; index < devices_.size(); ++index) {
+#ifdef CELER_WITH_SPDK_STORAGE
+        if (std::find(store.home_devices_.begin(), store.home_devices_.end(),
+                      index) == store.home_devices_.end())
+          continue;
+#endif
+        const auto available = co_await celer::SubmitTo(
+            device_allocators_[index]->owner_, [this, index] {
+              const auto& allocator = *device_allocators_[index];
+              const auto& device = devices_[index];
+              const auto pristine =
+                  allocator.next_pristine_ < device.capacity_blocks_
+                      ? device.capacity_blocks_ - allocator.next_pristine_
+                      : 0;
+              return pristine + allocator.ready_blocks_.size() +
+                     allocator.cold_free_.size();
+            });
+        const auto reserve = DefragReserveForDevice(index);
+        free += available > reserve ? available - reserve : 0;
+        capacity += ForegroundBlocksForDevice(index);
+      }
+      // Include staging/fragmentation headroom, but do not reject a write
+      // based on this approximate snapshot. The allocator remains
+      // authoritative.
+      if (free > std::max(needed + 2, capacity / 8)) co_return absl::OkStatus();
+      if (MonotonicMillis() >= deadline || rounds == 4)
+        co_return absl::OkStatus();
+      if (!tx_cleaner_running_.load(std::memory_order_acquire)) {
+        const auto cleaned = co_await MaybeRunTxCleaner(true);
+        if (!cleaned.ok()) {
+          // Maintenance admission/pin races are not evidence that the user's
+          // append cannot fit. The elected coordinator has rearmed dirty
+          // state; let the ordinary allocator make the final capacity choice.
+          // Corruption and I/O errors must not become a successful write.
+          if (!store.write_failed_ &&
+              !epoch_metadata_failed_.load(std::memory_order_acquire) &&
+              (absl::IsResourceExhausted(cleaned) || absl::IsAborted(cleaned) ||
+               absl::IsFailedPrecondition(cleaned)))
+            co_return absl::OkStatus();
+          co_return cleaned;
+        }
+        ++rounds;
+      }
+      const auto waited = co_await celer::SleepFor(
+          *store.worker_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError(
+        "OOM grouped space-pressure cleanup");
+  }
+}
+
+Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner(bool force) {
   const std::uint32_t cooldown =
       tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
-  if (cooldown == 0 || !tx_cleaner_dirty_.load(std::memory_order_acquire)) {
+  if (cooldown == 0 ||
+      (!force && !tx_cleaner_dirty_.load(std::memory_order_acquire))) {
     co_return absl::OkStatus();
   }
   const std::int64_t now = MonotonicMillis();
-  if (now < tx_cleaner_next_run_ms_.load(std::memory_order_acquire)) {
+  if (!force && now < tx_cleaner_next_run_ms_.load(std::memory_order_acquire)) {
     co_return absl::OkStatus();
   }
   bool expected = false;
@@ -162,22 +260,20 @@ Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner() {
                                 std::memory_order_release);
   tx_cleaner_rounds_.fetch_add(1, std::memory_order_relaxed);
   absl::Status status = absl::OkStatus();
-#ifndef NDEBUG
-  static std::atomic<bool> cleaner_failure_claimed = false;
-  bool expected_failure = false;
-  if (std::getenv("KEYLANE_FAIL_TX_CLEANER_ONCE") != nullptr &&
-      cleaner_failure_claimed.compare_exchange_strong(
-          expected_failure, true, std::memory_order_acq_rel)) {
-    status = absl::FailedPreconditionError(
-        "injected retryable transaction cleaner failure");
-  } else {
-    status = co_await RunTxCleaner();
-  }
-#else
-  status = co_await RunTxCleaner();
-#endif
+  KEYLANE_FAULT_INJECT(
+      static std::atomic<bool> cleaner_failure_claimed = false;
+      bool expected_failure = false;
+      if (std::getenv("KEYLANE_FAIL_TX_CLEANER_ONCE") != nullptr &&
+          cleaner_failure_claimed.compare_exchange_strong(
+              expected_failure, true, std::memory_order_acq_rel)) {
+        status = absl::FailedPreconditionError(
+            "injected retryable transaction cleaner failure");
+      });
+  if (status.ok()) status = co_await RunTxCleaner();
   if (!status.ok()) {
-    tx_cleaner_failures_.fetch_add(1, std::memory_order_relaxed);
+    if (!(absl::IsCancelled(status) &&
+          shutdown_flush_requested_.load(std::memory_order_acquire)))
+      tx_cleaner_failures_.fetch_add(1, std::memory_order_relaxed);
     tx_cleaner_dirty_.store(true, std::memory_order_release);
   }
   co_return status;
@@ -286,10 +382,18 @@ Task<absl::Status> StorageEngine::Impl::ForgetTxGenerationLocal(
 
 Task<absl::Status> StorageEngine::Impl::PromoteTxGenerationLocal(
     WorkerStore& store, std::uint64_t generation,
-    std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed) {
+    std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed,
+    bool shutdown_drain) {
   auto inspected = co_await InspectTxGenerationLocal(store, generation, false);
   if (!inspected.ok()) co_return inspected.status();
   for (const TxGenerationBlock& block : inspected->blocks_) {
+    // Previous block relocations have reached their durability fences. Keep
+    // all generation decisions/source allocations intact when an online round
+    // yields to shutdown; the explicit checkpoint drain may finish the round.
+    if (!shutdown_drain &&
+        shutdown_flush_requested_.load(std::memory_order_acquire))
+      co_return absl::CancelledError(
+          "online transaction cleaner yielding to shutdown");
     if (block.live_tagged_bytes_ == 0) continue;
 
     co_await store.store_state_mutex_.Lock();
@@ -391,7 +495,11 @@ Task<absl::Status> StorageEngine::Impl::RetireTxGenerationLocal(
   co_return returned;
 }
 
-Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
+Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
+  if (!shutdown_drain &&
+      shutdown_flush_requested_.load(std::memory_order_acquire))
+    co_return absl::CancelledError(
+        "online transaction cleaner yielding to shutdown");
   // Close the current generation only after it has actually received a
   // record. Empty current generations are left in place, so repeated retries
   // of an older blocked generation do not manufacture unbounded empty ones.
@@ -448,6 +556,10 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
                     generations.end());
 
   for (std::uint64_t generation : generations) {
+    if (!shutdown_drain &&
+        shutdown_flush_requested_.load(std::memory_order_acquire))
+      co_return absl::CancelledError(
+          "online transaction cleaner yielding to shutdown");
     auto committed = std::make_shared<absl::flat_hash_set<std::uint64_t>>();
     std::uint64_t active_transactions = 0;
     for (unsigned owner = 0; owner < worker_count_; ++owner) {
@@ -505,12 +617,13 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
       absl::Status promoted;
       if (owner == coordinator) {
         promoted = co_await PromoteTxGenerationLocal(
-            *stores_[owner], generation, frozen_committed);
+            *stores_[owner], generation, frozen_committed, shutdown_drain);
       } else {
         promoted = co_await celer::SubmitTaskTo(
-            owner, [this, owner, generation, frozen_committed]() {
+            owner,
+            [this, owner, generation, frozen_committed, shutdown_drain]() {
               return PromoteTxGenerationLocal(*stores_[owner], generation,
-                                              frozen_committed);
+                                              frozen_committed, shutdown_drain);
             });
       }
       if (!promoted.ok()) co_return promoted;
@@ -603,7 +716,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCleanerForShutdown() {
   for (unsigned round = 0; round < kMaxShutdownCleanerRounds; ++round) {
     tx_cleaner_dirty_.store(false, std::memory_order_release);
     tx_cleaner_rounds_.fetch_add(1, std::memory_order_relaxed);
-    absl::Status status = co_await RunTxCleaner();
+    absl::Status status = co_await RunTxCleaner(true);
     if (!status.ok()) {
       tx_cleaner_failures_.fetch_add(1, std::memory_order_relaxed);
       tx_cleaner_dirty_.store(true, std::memory_order_release);

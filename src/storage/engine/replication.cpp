@@ -127,6 +127,11 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
         "full-sync capture ended while pinning value");
   }
   const std::uint64_t id = capture->second.next_pinned_value_id_;
+  auto prepared = PrepareFullSyncPinnedValueInsert(capture->second);
+  if (!prepared.ok()) {
+    store.worker_->Spawn(ReleaseFullSyncExtents(std::move(extents)));
+    co_return prepared;
+  }
   auto [_, inserted] = capture->second.pinned_values_.emplace(
       id, WorkerStore::FullSyncCapture::PinnedValue{
               .extents_ = extents,
@@ -224,10 +229,19 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
                     std::min<std::uint64_t>(value_bytes, key->size());
               }
             }
-            if (location.external() &&
-                value_bytes > kReplicationTransferBytes) {
-              auto source_id = co_await PinFullSyncValue(
-                  store, session_id, partition, location, extents, key->size());
+            if (location.grouped() ||
+                (location.external() &&
+                 value_bytes > kReplicationTransferBytes)) {
+              absl::StatusOr<std::uint64_t> source_id;
+              if (location.grouped()) {
+                source_id = co_await PinFullSyncCollection(
+                    store, session_id, partition, db_id, *key, digest, location,
+                    extents, &value_bytes);
+              } else {
+                source_id =
+                    co_await PinFullSyncValue(store, session_id, partition,
+                                              location, extents, key->size());
+              }
               if (!source_id.ok()) {
                 status = source_id.status();
               } else {
@@ -351,9 +365,18 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
           std::min<std::uint64_t>(value_bytes, requested.key_.size());
     }
   }
-  if (location.external() && value_bytes > kReplicationTransferBytes) {
-    auto source_id = co_await PinFullSyncValue(
-        store, session_id, partition, location, extents, requested.key_.size());
+  if (location.grouped() ||
+      (location.external() && value_bytes > kReplicationTransferBytes)) {
+    absl::StatusOr<std::uint64_t> source_id;
+    if (location.grouped()) {
+      source_id = co_await PinFullSyncCollection(
+          store, session_id, partition, requested.db_id_, requested.key_,
+          digest, location, extents, &value_bytes);
+    } else {
+      source_id =
+          co_await PinFullSyncValue(store, session_id, partition, location,
+                                    extents, requested.key_.size());
+    }
     if (!source_id.ok()) co_return source_id.status();
     key_lock.Reset();
     co_return SnapshotRecord{
@@ -1002,6 +1025,11 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::ReadFullSyncValueChunk(
       offset >= pinned->second.value_bytes_) {
     co_return absl::OutOfRangeError("full-sync value chunk is out of range");
   }
+  if (pinned->second.collection_ != nullptr) {
+    auto collection = pinned->second.collection_;
+    co_return co_await ReadFullSyncCollectionChunk(std::move(collection),
+                                                   offset, max_bytes);
+  }
   const ExtentManifest extents = pinned->second.extents_;
   const std::size_t key_bytes = pinned->second.key_bytes_;
   const std::size_t count = static_cast<std::size_t>(
@@ -1058,9 +1086,15 @@ void StorageEngine::Impl::ReleaseFullSyncValue(std::uint64_t session_id,
   if (capture == partition.fullsync_subscribers_.end()) return;
   auto pinned = capture->second.pinned_values_.find(source_id);
   if (pinned == capture->second.pinned_values_.end()) return;
+  auto collection = std::move(pinned->second.collection_);
   ExtentManifest extents = std::move(pinned->second.extents_);
   capture->second.pinned_values_.erase(pinned);
-  store.worker_->Spawn(ReleaseFullSyncExtents(std::move(extents)));
+  if (collection != nullptr) {
+    active_settlements_.fetch_add(1, std::memory_order_acq_rel);
+    store.worker_->Spawn(ReleaseFullSyncCollection(std::move(collection)));
+  } else {
+    store.worker_->Spawn(ReleaseFullSyncExtents(std::move(extents)));
+  }
 }
 
 void StorageEngine::Impl::AcknowledgePartitionFullSyncOverrides(
@@ -1328,6 +1362,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "partition replication epoch exhausted");
   }
+  const auto aborted_stage = co_await AbortReplicaValueStage(store, partition);
+  if (!aborted_stage.ok()) co_return aborted_stage;
   // Stop this worker's append stream before making the new epoch durable.
   // Otherwise a concurrent command could append an old-epoch record after
   // the metadata commit and receive OK even though restart must discard it.
@@ -1493,7 +1529,9 @@ StorageEngine::Impl::ResetReplicaPartitions(
     sync->source_db_epochs_ = reset.db_epochs_;
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
       sync->local_db_epochs_[db_id] = local_db_epochs[db_id];
-      QueueDetachedIndex(store, partition.indexes_[db_id], db_id);
+      ++partition.grouped_generations_[db_id];
+      QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
+                         &partition.grouped_objects_[db_id]);
       partition.fullsync_coverage_bytes_[db_id] = 0;
       if (store.live_key_count_[db_id] < partition.live_key_count_[db_id])
           [[unlikely]] {
@@ -1597,7 +1635,9 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
   for (std::size_t i = 0; i < partition_ids.size(); ++i) {
     auto& partition = PartitionFor(store, partition_ids[i]);
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      QueueDetachedIndex(store, partition.indexes_[db_id], db_id);
+      ++partition.grouped_generations_[db_id];
+      QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
+                         &partition.grouped_objects_[db_id]);
       partition.fullsync_coverage_bytes_[db_id] = 0;
       if (store.live_key_count_[db_id] < partition.live_key_count_[db_id]) {
         co_return absl::InternalError(
@@ -1660,7 +1700,7 @@ Task<absl::Status> StorageEngine::Impl::HandoffReplicaPartition(
       sync->replication_epoch_ != replication_epoch) {
     co_return absl::FailedPreconditionError("stale replica partition handoff");
   }
-  if (partition.replica_value_stage_.has_value()) {
+  if (sync->stream_failed_ || partition.replica_value_stage_.has_value()) {
     co_return absl::FailedPreconditionError(
         "replica partition handoff interrupted a large value");
   }
@@ -1682,7 +1722,8 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaTailCommand(
   auto& partition = PartitionFor(store, partition_id);
   auto* sync = partition.replica_sync_.get();
   if (sync == nullptr || sync->session_id_ != session_id ||
-      sync->command_sequence_.has_value()) {
+      sync->command_sequence_.has_value() || sync->stream_failed_ ||
+      partition.replica_value_stage_.has_value()) {
     co_return absl::FailedPreconditionError(
         "replica command is outside its apply window");
   }
@@ -1711,12 +1752,39 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     std::uint64_t session_id, std::uint16_t partition_id,
     std::uint64_t replication_epoch, std::span<const SnapshotRecord> records) {
   WorkerStore& store = CurrentStore();
+  if (partition_id >= kLogicalStorageShards ||
+      partition_id % worker_count_ != store.worker_->id())
+    co_return absl::InvalidArgumentError(
+        "invalid replica apply partition owner");
   co_await store.replica_apply_mutex_.Lock();
   UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
+  absl::Status status;
+  try {
+    status = co_await ApplyReplicaRecordsLocked(session_id, partition_id,
+                                                replication_epoch, records);
+  } catch (const std::bad_alloc&) {
+    status =
+        absl::ResourceExhaustedError("replica collection allocation failed");
+  }
+  auto& partition = PartitionFor(store, partition_id);
+  auto* sync = partition.replica_sync_.get();
+  if (!status.ok() && sync && sync->session_id_ == session_id &&
+      sync->replication_epoch_ == replication_epoch) {
+    sync->stream_failed_ = true;
+    const auto aborted = co_await AbortReplicaValueStage(store, partition);
+    if (!aborted.ok()) co_return aborted;
+  }
+  co_return status;
+}
+
+Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::uint64_t replication_epoch, std::span<const SnapshotRecord> records) {
+  WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, partition_id);
   auto* sync = partition.replica_sync_.get();
   if (sync == nullptr || sync->session_id_ != session_id ||
-      replication_epoch != sync->replication_epoch_) {
+      replication_epoch != sync->replication_epoch_ || sync->stream_failed_) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                            "stale partition replication epoch");
   }
@@ -1760,11 +1828,11 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
           (record.value_type_ == ValueType::kString &&
            value_logical_size != record.logical_size_) ||
           value_logical_size > std::numeric_limits<std::uint32_t>::max() ||
-          record.logical_size_ == 0 || record.logical_size_ > kMaxBitmapBytes ||
+          record.logical_size_ == 0 ||
+          (!nonempty_collection && record.logical_size_ > kMaxBitmapBytes) ||
           record.chunk_count_ == 0 ||
           record.chunk_count_ !=
-              (record.logical_size_ + kReplicationTransferBytes - 1) /
-                  kReplicationTransferBytes) {
+              (record.logical_size_ - 1) / kReplicationTransferBytes + 1) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "invalid replicated large value begin frame");
       }
@@ -1772,13 +1840,15 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
       std::size_t stage_bytes = kReplicaStageBookkeepingAllowance;
       if (record.key_.size() >
               std::numeric_limits<std::size_t>::max() - stage_bytes ||
-          record.logical_size_ > std::numeric_limits<std::size_t>::max() -
-                                     stage_bytes - record.key_.size()) {
+          (!nonempty_collection &&
+           record.logical_size_ > std::numeric_limits<std::size_t>::max() -
+                                      stage_bytes - record.key_.size())) {
         co_return absl::ResourceExhaustedError(
             "replica large-value staging size overflow");
       }
-      stage_bytes +=
-          record.key_.size() + static_cast<std::size_t>(record.logical_size_);
+      stage_bytes += record.key_.size();
+      if (!nonempty_collection)
+        stage_bytes += static_cast<std::size_t>(record.logical_size_);
       auto stage_reservation = TryReserveMemory(stage_bytes);
       if (!stage_reservation.has_value()) {
         RecordMemoryRejection();
@@ -1798,15 +1868,22 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
           .value_type_ = record.value_type_,
           .key_ = record.key_,
           .value_ = {},
+          .collection_ = nullptr,
           .memory_charge_ = {},
       };
       // Reserve once while the memory permit is live. Chunks append within
       // this capacity, so a peer cannot create an unaccounted allocation at
       // an arbitrary point later in the stream.
-      partition.replica_value_stage_->value_.reserve(
-          static_cast<std::size_t>(record.logical_size_));
       partition.replica_value_stage_->memory_charge_.Adopt(&*stage_reservation,
                                                            stage_bytes);
+      if (nonempty_collection) {
+        const auto started = co_await BeginReplicaCollection(
+            store, partition, *partition.replica_value_stage_);
+        if (!started.ok()) co_return started;
+      } else {
+        partition.replica_value_stage_->value_.reserve(
+            static_cast<std::size_t>(record.logical_size_));
+      }
       continue;
     }
     if (record.kind_ == SnapshotRecord::Kind::kValueChunk) {
@@ -1819,11 +1896,19 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
           stage->chunk_count_ != record.chunk_count_ || record.value_.empty() ||
           record.value_.size() > kReplicationTransferBytes ||
           record.value_.size() > stage->encoded_size_ ||
-          stage->value_.size() > stage->encoded_size_ - record.value_.size()) {
+          (stage->collection_ ? stage->collection_->received_bytes_
+                              : stage->value_.size()) >
+              stage->encoded_size_ - record.value_.size()) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "invalid replicated large value chunk frame");
       }
-      stage->value_.append(record.value_);
+      if (stage->collection_) {
+        const auto consumed = co_await ConsumeReplicaCollection(
+            store, partition, *stage, record.value_, false);
+        if (!consumed.ok()) co_return consumed;
+      } else {
+        stage->value_.append(record.value_);
+      }
       ++stage->next_chunk_;
       continue;
     }
@@ -1835,9 +1920,17 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
           stage->key_ != record.key_ || !record.value_.empty() ||
           stage->next_chunk_ != stage->chunk_count_ ||
           record.chunk_index_ != stage->chunk_count_ ||
-          stage->value_.size() != stage->encoded_size_) {
+          (stage->collection_ ? stage->collection_->received_bytes_
+                              : stage->value_.size()) != stage->encoded_size_) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "invalid replicated large value commit frame");
+      }
+      if (stage->collection_) {
+        const auto complete = co_await ConsumeReplicaCollection(
+            store, partition, *stage, {}, true);
+        if (!complete.ok()) co_return complete;
+        stage.reset();
+        continue;
       }
       materialized.emplace(SnapshotRecord{
           .kind_ = SnapshotRecord::Kind::kValue,
@@ -2013,6 +2106,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
         if (partition.replica_sync_ == nullptr ||
             partition.replica_sync_->session_id_ != session_id ||
             !partition.replica_sync_->tailing_ ||
+            partition.replica_sync_->stream_failed_ ||
             partition.replica_value_stage_.has_value()) {
           return absl::FailedPreconditionError(
               "replica synchronization is incomplete");
@@ -2070,7 +2164,10 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
       co_await store.store_state_mutex_.Lock();
       UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
       for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-        ++store.index_generations_[db_id];
+        // Promotion changes visibility, not this candidate's index identity.
+        // Reset already advanced the generation when it detached the old
+        // population. Advancing again would invalidate every grouped view
+        // built in the candidate despite retaining its exact physical root.
         tx::CurrentTxShard().MarkAllWatched(db_id);
       }
       for (auto& partition : store.partitions_) {
@@ -2115,6 +2212,27 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     co_return co_await celer::SubmitTaskTo(
         0, [this, session_id]() { return AbortReplicaRoot(session_id); });
   }
+  // A stream can own an uncommitted grouped root and a cross-frame key hold.
+  // Settle it before draining: a post-root writer failure makes drain fail,
+  // but must not strand its undo journal, dependency pins or generation lease.
+  for (unsigned target = 0; target < worker_count_; ++target) {
+    auto cancel = [this, target, session_id]() -> Task<absl::Status> {
+      auto& store = *stores_[target];
+      co_await store.replica_apply_mutex_.Lock();
+      UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
+      for (auto& partition : store.partitions_) {
+        if (!partition.replica_sync_ ||
+            partition.replica_sync_->session_id_ != session_id)
+          continue;
+        const auto aborted = co_await AbortReplicaValueStage(store, partition);
+        if (!aborted.ok()) co_return aborted;
+      }
+      co_return absl::OkStatus();
+    };
+    auto cancelled = target == 0 ? co_await cancel()
+                                 : co_await celer::SubmitTaskTo(target, cancel);
+    if (!cancelled.ok()) co_return cancelled;
+  }
   for (unsigned target = 0; target < worker_count_; ++target) {
     auto drain = [this, target]() {
       return DrainReplicaRootWritesLocal(*stores_[target]);
@@ -2138,7 +2256,9 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
           if (sync == nullptr || sync->session_id_ != session_id) continue;
           discarded_any = true;
           for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-            QueueDetachedIndex(store, partition.indexes_[db_id], db_id);
+            ++partition.grouped_generations_[db_id];
+            QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
+                               &partition.grouped_objects_[db_id]);
             partition.fullsync_coverage_bytes_[db_id] = 0;
             if (store.live_key_count_[db_id] < partition.live_key_count_[db_id])
                 [[unlikely]] {

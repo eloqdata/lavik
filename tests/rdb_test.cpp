@@ -477,6 +477,23 @@ TEST(RdbTest, AcceptsRedis72PackedFixturesAndEmitsVersionEleven) {
     EXPECT_EQ(decoded->value_type_, fixture.type_);
     EXPECT_EQ(decoded->logical_size_, fixture.size_);
 
+    // DumpReader borrows its payload, including during every page decode.
+    const auto source = Hex(fixture.hex_);
+    auto streaming = DumpReader::Open(source);
+    ASSERT_TRUE(streaming.ok()) << streaming.status();
+    EXPECT_EQ(streaming->value_type(), fixture.type_);
+    if (streaming->collection()) {
+      std::uint64_t count = 0;
+      for (;;) {
+        auto page = streaming->ReadCollectionPage();
+        ASSERT_TRUE(page.ok()) << page.status();
+        EXPECT_EQ(page->value_type_, fixture.type_);
+        count += page->size();
+        if (page->done_) break;
+      }
+      EXPECT_EQ(count, fixture.size_);
+    }
+
     auto encoded = EncodeDump(*decoded);
     ASSERT_TRUE(encoded.ok()) << encoded.status();
     ASSERT_GE(encoded->size(), 11);
@@ -525,6 +542,19 @@ TEST(RdbTest, AcceptsHistoricalCollectionEncodings) {
     EXPECT_EQ(decoded->value_type_, fixture.type_);
     EXPECT_EQ(decoded->logical_size_, fixture.size_);
     EXPECT_TRUE(EncodeDump(*decoded).ok());
+    auto streaming = DumpReader::Open(fixture.payload_);
+    ASSERT_TRUE(streaming.ok()) << streaming.status();
+    if (streaming->collection()) {
+      std::uint64_t count = 0;
+      for (;;) {
+        auto page = streaming->ReadCollectionPage();
+        ASSERT_TRUE(page.ok()) << page.status();
+        EXPECT_EQ(page->value_type_, fixture.type_);
+        count += page->size();
+        if (page->done_) break;
+      }
+      EXPECT_EQ(count, fixture.size_);
+    }
   }
 }
 

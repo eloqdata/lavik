@@ -7,7 +7,94 @@
 #include <string>
 #include <vector>
 
+#include "keylane/command.h"
+#include "keylane/memory.h"
+
 namespace {
+
+class CaptureMemoryScope {
+ public:
+  CaptureMemoryScope() : previous_(keylane::CurrentMemoryAccountingShard()) {
+    EXPECT_TRUE(keylane::InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+    keylane::BindMemoryAccountingShard(0);
+  }
+  ~CaptureMemoryScope() {
+    EXPECT_TRUE(keylane::InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+    keylane::BindMemoryAccountingShard(
+        previous_ == 0 ? keylane::kMaxMemoryWorkers : previous_ - 1);
+  }
+
+ private:
+  unsigned previous_;
+};
+
+TEST(ReplicationCommandTest, PreparedCaptureChargeFollowsMovedEffects) {
+  CaptureMemoryScope memory;
+  const auto baseline = keylane::WorkerMemoryAccountingBytes(0);
+  {
+    std::vector<keylane::CapturedReplicationCommand> pending;
+    {
+      keylane::ReplicationCommandCapture capture;
+      ASSERT_TRUE(capture.ReserveAdditionalCommands(2, 4096).ok());
+      capture.Record(0, {"DEL", "destination"});
+      capture.Record(0, {"SADD", "destination", std::string(2048, 'v')});
+      auto effects = capture.Take();
+      pending = std::move(effects.commands_);
+    }
+    ASSERT_EQ(pending.size(), 2);
+    ASSERT_NE(pending[0].retained_charge_, nullptr);
+    EXPECT_EQ(pending[0].retained_charge_, pending[1].retained_charge_);
+    EXPECT_GE(keylane::WorkerMemoryAccountingBytes(0) - baseline, 4096);
+    EXPECT_EQ(pending[1].args_.back(), std::string(2048, 'v'));
+  }
+  EXPECT_EQ(keylane::WorkerMemoryAccountingBytes(0), baseline);
+}
+
+TEST(ReplicationCommandTest, CapturePreparationOomPreservesEarlierEffects) {
+  CaptureMemoryScope memory;
+  const auto baseline = keylane::WorkerMemoryAccountingBytes(0);
+  {
+    keylane::ReplicationCommandCapture capture;
+    ASSERT_TRUE(capture.ReserveAdditionalCommands(1, 1024).ok());
+    capture.Record(0, {"SET", "prefix", "kept"});
+    const auto charged = keylane::WorkerMemoryAccountingBytes(0);
+    EXPECT_EQ(
+        capture.ReserveAdditionalCommands(1, 1024ULL * 1024 * 1024).code(),
+        absl::StatusCode::kResourceExhausted);
+    EXPECT_EQ(
+        capture
+            .ReserveAdditionalCommands(std::numeric_limits<std::size_t>::max())
+            .code(),
+        absl::StatusCode::kResourceExhausted);
+    EXPECT_EQ(keylane::WorkerMemoryAccountingBytes(0), charged);
+    auto effects = capture.Take();
+    ASSERT_EQ(effects.commands_.size(), 1);
+    EXPECT_EQ(effects.commands_[0].args_,
+              (std::vector<std::string>{"SET", "prefix", "kept"}));
+  }
+  EXPECT_EQ(keylane::WorkerMemoryAccountingBytes(0), baseline);
+}
+
+TEST(ReplicationCommandTest, UnusedCapturePreparationDoesNotBurdenNextCommand) {
+  CaptureMemoryScope memory;
+  const auto baseline = keylane::WorkerMemoryAccountingBytes(0);
+  keylane::ReplicationCommandCapture capture;
+  ASSERT_TRUE(capture.ReserveAdditionalCommands(2, 4096).ok());
+  capture.MarkHandled();
+  ASSERT_GT(keylane::WorkerMemoryAccountingBytes(0), baseline);
+  capture.ReleaseUnusedPreparation();
+  EXPECT_EQ(keylane::WorkerMemoryAccountingBytes(0), baseline);
+  auto empty = capture.Take();
+  EXPECT_TRUE(empty.handled_);
+  EXPECT_TRUE(empty.commands_.empty());
+
+  ASSERT_TRUE(capture.ReserveAdditionalCommands(1, 1024).ok());
+  capture.Record(0, {"SET", "kept", "value"});
+  const auto charged = keylane::WorkerMemoryAccountingBytes(0);
+  capture.ReleaseUnusedPreparation();
+  EXPECT_EQ(keylane::WorkerMemoryAccountingBytes(0), charged);
+  EXPECT_EQ(capture.Take().commands_.size(), 1);
+}
 
 TEST(ReplicationCommandTest, SetAlreadyCarriesFinalExpirationSemantics) {
   std::vector<std::string> plain{"SET", "key", "value"};

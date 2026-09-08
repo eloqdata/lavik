@@ -276,25 +276,24 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
             : FixedBuffer{.data_ = pending->heap_data_,
                           .size_ = pending->heap_data_size_,
                           .index_ = 0};
-#ifndef NDEBUG
-    // Deterministic regression hook for the dirty-tail ordering window: let a
-    // command append beyond this immutable flush snapshot and roll to a later
-    // block before the snapshot completes. Only the first flush in the
-    // process pauses, and release builds contain no hook.
-    static std::atomic<bool> pause_claimed = false;
-    const char* pause_text = std::getenv("KEYLANE_FLUSH_SNAPSHOT_PAUSE_MS");
-    bool expected_pause = false;
-    if (pause_text != nullptr &&
-        pause_claimed.compare_exchange_strong(expected_pause, true)) {
-      char* end = nullptr;
-      const unsigned long pause_ms = std::strtoul(pause_text, &end, 10);
-      if (end != pause_text && *end == '\0' && pause_ms != 0) {
-        absl::Status paused = co_await celer::SleepFor(
-            *store->worker_, std::chrono::milliseconds(pause_ms));
-        if (!paused.ok()) co_return paused;
-      }
-    }
-#endif
+    KEYLANE_FAULT_INJECT(
+        // Deterministic regression hook for the dirty-tail ordering window: let
+        // a command append beyond this immutable flush snapshot and roll to a
+        // later block before the snapshot completes. Only the first flush in
+        // the process pauses; ordinary release builds contain no hook.
+        static std::atomic<bool> pause_claimed = false;
+        const char* pause_text = std::getenv("KEYLANE_FLUSH_SNAPSHOT_PAUSE_MS");
+        bool expected_pause = false;
+        if (pause_text != nullptr &&
+            pause_claimed.compare_exchange_strong(expected_pause, true)) {
+          char* end = nullptr;
+          const unsigned long pause_ms = std::strtoul(pause_text, &end, 10);
+          if (end != pause_text && *end == '\0' && pause_ms != 0) {
+            absl::Status paused = co_await celer::SleepFor(
+                *store->worker_, std::chrono::milliseconds(pause_ms));
+            if (!paused.ok()) co_return paused;
+          }
+        });
     // The first flush of a block starts at the unused header slot, which is
     // still zero in staging. That makes the slot durably zero before the
     // first header lands in the other one, so a torn first header cannot
@@ -415,8 +414,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         retired_records.push_back(identity.retired_record_.Materialize());
       }
       if (identity.tx_retirements_ != nullptr) {
-        // A commit record just became durable: its transaction's superseded
-        // versions can finally leave their blocks' accounting.
+        // The publication boundary is durable: either a transaction's commit
+        // record or an ordinary root replacing a grouped graph. Its retained
+        // child receipts can now leave physical accounting with that boundary.
         retired_records.insert(retired_records.end(),
                                identity.tx_retirements_->begin(),
                                identity.tx_retirements_->end());

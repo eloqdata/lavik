@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "absl/status/statusor.h"
@@ -38,6 +39,14 @@ class ReplicationManager;
 using celer::Task;
 
 struct CapturedReplicationCommand {
+  CapturedReplicationCommand() = default;
+  CapturedReplicationCommand(std::uint8_t db_id, std::vector<std::string> args)
+      : db_id_(db_id), args_(std::move(args)) {}
+
+  // Shared capture admission follows commands through EXEC/Lua's intermediate
+  // vectors until encoding transfers ownership to the replication envelope.
+  // Declared first so argument buffers die before their allowance is released.
+  std::shared_ptr<RetainedMemoryCharge> retained_charge_;
   std::uint8_t db_id_ = 0;
   std::vector<std::string> args_;
 };
@@ -53,11 +62,23 @@ struct CapturedReplicationEffects {
 // several owners, so recording is safe from any participant worker.
 class ReplicationCommandCapture {
  public:
+  // Reserve every outcome-dependent effect before the first mutation. The
+  // coordinator supplies the retained capacity of its prepared arguments;
+  // subsequent Record calls only move those arguments into preallocated slots.
+  // Repeated preparation must use the same coordinator accounting owner.
+  absl::Status ReserveAdditionalCommands(std::size_t count,
+                                         std::size_t payload_bytes = 0);
+  // After a prepared command finishes without effects, release its unused
+  // slots and allowance before the next EXEC command. Recorded effects retain
+  // their shared charge until the replication envelope takes ownership.
+  void ReleaseUnusedPreparation();
   void MarkHandled();
   void Record(std::uint8_t db_id, std::vector<std::string> args);
   CapturedReplicationEffects Take();
 
  private:
+  std::shared_ptr<RetainedMemoryCharge> prepared_charge_;
+  unsigned preparation_owner_ = 0;
   mutable std::mutex mutex_;
   bool handled_ = false;
   std::vector<CapturedReplicationCommand> commands_;

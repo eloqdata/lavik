@@ -404,6 +404,15 @@ struct LpValue {
   }
 };
 
+struct PackedMeasurement {
+  std::uint64_t count = 0;
+  std::uint64_t strings = 0;
+  void Add(std::size_t bytes) {
+    ++count;
+    strings += std::max<std::size_t>(bytes, 32) + 1;
+  }
+};
+
 unsigned BackLengthBytes(std::uint64_t length) {
   return length <= 127        ? 1
          : length < 16383     ? 2
@@ -422,7 +431,8 @@ void AppendBackLength(std::string* out, std::uint64_t length) {
   }
 }
 
-absl::StatusOr<std::vector<LpValue>> DecodeListpack(std::string_view input) {
+absl::StatusOr<std::vector<LpValue>> DecodeListpack(
+    std::string_view input, PackedMeasurement* measured = nullptr) {
   if (input.size() < 7 || input.size() > storage::kMaxStringBytes)
     return Bad("invalid listpack size");
   Reader header(input);
@@ -433,6 +443,7 @@ absl::StatusOr<std::vector<LpValue>> DecodeListpack(std::string_view input) {
     return Bad("invalid listpack header");
   std::size_t at = 6;
   std::vector<LpValue> values;
+  std::uint64_t actual_count = 0;
   while (at < input.size() - 1) {
     const std::size_t start = at;
     const auto byte = static_cast<std::uint8_t>(input[at++]);
@@ -485,7 +496,7 @@ absl::StatusOr<std::vector<LpValue>> DecodeListpack(std::string_view input) {
         byte == 0xf0) {
       if (payload > input.size() - 1 - at)
         return Bad("truncated listpack string");
-      value.text.assign(input.substr(at, payload));
+      if (measured == nullptr) value.text.assign(input.substr(at, payload));
       at += payload;
     } else if (integer_bits != 0) {
       value.integer = true;
@@ -506,10 +517,14 @@ absl::StatusOr<std::vector<LpValue>> DecodeListpack(std::string_view input) {
       back = (back << 7) | (item & 0x7f);
     }
     if (back != encoded) return Bad("listpack back length mismatch");
-    values.push_back(std::move(value));
+    ++actual_count;
+    if (measured != nullptr)
+      measured->Add(value.integer ? 32 : payload);
+    else
+      values.push_back(std::move(value));
   }
   if (at != input.size() - 1 ||
-      (declared != UINT16_MAX && declared != values.size()))
+      (declared != UINT16_MAX && declared != actual_count))
     return Bad("listpack count mismatch");
   return values;
 }
@@ -556,7 +571,8 @@ std::string FinishListpack(std::string body, std::size_t count) {
   return output;
 }
 
-absl::StatusOr<std::vector<std::string>> DecodeZiplist(std::string_view input) {
+absl::StatusOr<std::vector<std::string>> DecodeZiplist(
+    std::string_view input, PackedMeasurement* measured = nullptr) {
   if (input.size() < 11 || input.size() > storage::kMaxStringBytes)
     return Bad("invalid ziplist size");
   Reader header(input);
@@ -568,6 +584,7 @@ absl::StatusOr<std::vector<std::string>> DecodeZiplist(std::string_view input) {
     return Bad("invalid ziplist header");
   std::size_t at = 10, previous = 0;
   std::vector<std::string> values;
+  std::uint64_t actual_count = 0;
   while (at < input.size() - 1) {
     const std::size_t start = at;
     std::uint32_t prev = static_cast<unsigned char>(input[at++]);
@@ -634,21 +651,30 @@ absl::StatusOr<std::vector<std::string>> DecodeZiplist(std::string_view input) {
           raw |= ~std::uint64_t{0} << bits;
         number = static_cast<std::int64_t>(raw);
       }
-      values.push_back(std::to_string(number));
+      ++actual_count;
+      if (measured != nullptr)
+        measured->Add(32);
+      else
+        values.push_back(std::to_string(number));
       previous = at - start;
       continue;
     }
     if (length > input.size() - 1 - at) return Bad("truncated ziplist string");
-    values.emplace_back(input.substr(at, length));
+    ++actual_count;
+    if (measured != nullptr)
+      measured->Add(length);
+    else
+      values.emplace_back(input.substr(at, length));
     at += length;
     previous = at - start;
   }
-  if (at != input.size() - 1 || (count != UINT16_MAX && count != values.size()))
+  if (at != input.size() - 1 || (count != UINT16_MAX && count != actual_count))
     return Bad("ziplist count mismatch");
   return values;
 }
 
-absl::StatusOr<std::vector<std::string>> DecodeIntset(std::string_view input) {
+absl::StatusOr<std::vector<std::string>> DecodeIntset(
+    std::string_view input, PackedMeasurement* measured = nullptr) {
   Reader reader(input);
   std::uint32_t width = 0, count = 0;
   if (!reader.Le32(&width) || !reader.Le32(&count) ||
@@ -657,7 +683,7 @@ absl::StatusOr<std::vector<std::string>> DecodeIntset(std::string_view input) {
       reader.remaining() != static_cast<std::size_t>(count) * width)
     return Bad("invalid intset");
   std::vector<std::string> output;
-  output.reserve(count);
+  if (measured == nullptr) output.reserve(count);
   std::int64_t previous = std::numeric_limits<std::int64_t>::min();
   for (std::uint32_t i = 0; i < count; ++i) {
     std::string_view bytes;
@@ -672,12 +698,16 @@ absl::StatusOr<std::vector<std::string>> DecodeIntset(std::string_view input) {
     const auto value = static_cast<std::int64_t>(raw);
     if (i != 0 && value <= previous) return Bad("unordered intset");
     previous = value;
-    output.push_back(std::to_string(value));
+    if (measured != nullptr)
+      measured->Add(32);
+    else
+      output.push_back(std::to_string(value));
   }
   return output;
 }
 
-absl::StatusOr<std::vector<std::string>> DecodeZipmap(std::string_view input) {
+absl::StatusOr<std::vector<std::string>> DecodeZipmap(
+    std::string_view input, PackedMeasurement* measured = nullptr) {
   if (input.size() < 2) return Bad("invalid zipmap");
   std::size_t at = 1;
   auto length = [&](std::uint32_t* value) -> bool {
@@ -704,18 +734,24 @@ absl::StatusOr<std::vector<std::string>> DecodeZipmap(std::string_view input) {
     std::uint32_t key_size = 0, value_size = 0;
     if (!length(&key_size) || key_size > input.size() - at)
       return Bad("truncated zipmap key");
-    output.emplace_back(input.substr(at, key_size));
+    if (measured != nullptr)
+      measured->Add(key_size);
+    else
+      output.emplace_back(input.substr(at, key_size));
     at += key_size;
     if (!length(&value_size) || at == input.size())
       return Bad("truncated zipmap value");
     const std::uint8_t free = static_cast<std::uint8_t>(input[at++]);
     if (value_size > input.size() - at || free > input.size() - at - value_size)
       return Bad("truncated zipmap value");
-    output.emplace_back(input.substr(at, value_size));
+    if (measured != nullptr)
+      measured->Add(value_size);
+    else
+      output.emplace_back(input.substr(at, value_size));
     at += value_size + free;
   }
   if (at + 1 != input.size() || static_cast<unsigned char>(input[at]) != 255 ||
-      output.empty())
+      (measured != nullptr ? measured->count == 0 : output.empty()))
     return Bad("invalid zipmap terminator");
   return output;
 }
@@ -1180,6 +1216,308 @@ absl::StatusOr<LogicalValue> DecodeRdbObject(Reader* reader,
     return Bad("Redis Module values are unsupported");
   return Bad("unknown object type");
 }
+
+storage::ValueType CollectionType(std::uint8_t type) {
+  using storage::ValueType;
+  switch (type) {
+    case kHash:
+    case kHashZipmap:
+    case kHashZiplist:
+    case kHashListpack:
+      return ValueType::kHash;
+    case kSet:
+    case kSetIntset:
+    case kSetListpack:
+      return ValueType::kSet;
+    case kList:
+    case kListZiplist:
+    case kListQuicklist:
+    case kListQuicklist2:
+      return ValueType::kList;
+    case kZSet:
+    case kZSet2:
+    case kZSetZiplist:
+    case kZSetListpack:
+      return ValueType::kSortedSet;
+    default:
+      return ValueType::kNone;
+  }
+}
+
+// Inspect encoded lengths without constructing a string. A decompressed
+// string is still bounded individually; the collection has no aggregate
+// string limit. The actual decode below validates the LZF contents.
+absl::StatusOr<std::size_t> MeasureString(Reader* reader) {
+  auto length = ReadLength(reader);
+  if (!length.ok()) return length.status();
+  std::uint64_t encoded = length->value;
+  std::uint64_t decoded = encoded;
+  if (length->encoded) {
+    if (length->value <= 2) {
+      encoded = length->value == 0 ? 1 : length->value == 1 ? 2 : 4;
+      decoded = 32;
+    } else if (length->value == 3) {
+      auto input = ReadLength(reader);
+      auto output = ReadLength(reader);
+      if (!input.ok()) return input.status();
+      if (!output.ok()) return output.status();
+      if (input->encoded || output->encoded) return Bad("invalid LZF lengths");
+      encoded = input->value;
+      decoded = output->value;
+    } else
+      return Bad("unknown encoded string");
+  }
+  std::string_view ignored;
+  if (decoded > storage::kMaxStringBytes || encoded > reader->remaining() ||
+      !reader->Bytes(static_cast<std::size_t>(encoded), &ignored))
+    return Bad("string length exceeds payload");
+  return static_cast<std::size_t>(decoded);
+}
+
+absl::StatusOr<double> ReadCollectionScore(Reader* reader, std::uint8_t type) {
+  double score = 0;
+  if (type == kZSet2) {
+    std::uint64_t bits = 0;
+    if (!reader->Le64(&bits)) return Bad("truncated Zset score");
+    score = std::bit_cast<double>(bits);
+  } else {
+    std::uint8_t size = 0;
+    if (!reader->Byte(&size)) return Bad("truncated Zset score");
+    if (size == 253) return Bad("invalid Zset score");
+    if (size == 254) return std::numeric_limits<double>::infinity();
+    if (size == 255) return -std::numeric_limits<double>::infinity();
+    std::string_view text;
+    if (!reader->Bytes(size, &text)) return Bad("truncated Zset score");
+    auto parsed =
+        std::from_chars(text.data(), text.data() + text.size(), score);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+      return Bad("invalid Zset score");
+  }
+  if (std::isnan(score)) return Bad("invalid Zset score");
+  return score;
+}
+
+class CollectionInput {
+ public:
+  static absl::StatusOr<std::unique_ptr<CollectionInput>> Open(
+      Reader* reader, std::uint8_t type) try {
+    auto result = std::unique_ptr<CollectionInput>(new CollectionInput(type));
+    if (result->plain_ || result->quick_) {
+      auto count = ReadLength(reader);
+      if (!count.ok()) return count.status();
+      if (count->encoded || count->value == 0)
+        return Bad("invalid collection length");
+      result->remaining_ = count->value;
+      if (result->plain_) result->expected_ = count->value;
+    }
+    return result;
+  } catch (const std::bad_alloc&) {
+    return Oom();
+  }
+  storage::ValueType type() const { return CollectionType(type_); }
+  std::optional<std::uint64_t> expected() const { return expected_; }
+
+  absl::StatusOr<storage::CollectionPage> Next(Reader* input) try {
+    if (done_) return Bad("collection stream is complete");
+    if (!owner_) {
+      owner_ = CurrentMemoryAccountingShard();
+      identities_charge_.Account(*owner_, 0);
+    } else if (*owner_ != CurrentMemoryAccountingShard()) {
+      return absl::FailedPreconditionError("RDB collection changed page owner");
+    }
+    if (!plain_) return Packed(input);
+    Reader measure = *input;
+    std::size_t bytes = 4096;
+    std::size_t count = 0;
+    do {
+      auto first = MeasureString(&measure);
+      if (!first.ok()) return first.status();
+      bytes += *first + 256;
+      if (type_ == kHash) {
+        auto second = MeasureString(&measure);
+        if (!second.ok()) return second.status();
+        bytes += *second;
+      } else if (type() == storage::ValueType::kSortedSet) {
+        auto score = ReadCollectionScore(&measure, type_);
+        if (!score.ok()) return score.status();
+      }
+      ++count;
+    } while (count < remaining_ && bytes < 1024 * 1024);
+    auto reservation = TryReserveMemory(bytes);
+    if (!reservation) return Oom();
+    storage::CollectionPage page{.value_type_ = type()};
+    if (type_ == kHash)
+      page.fields_.reserve(count);
+    else if (type() == storage::ValueType::kSortedSet)
+      page.scored_members_.reserve(count);
+    else
+      page.elements_.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      Reader origin = *input;
+      input->ResetExpandedAccounting();
+      auto first = ReadString(input);
+      if (!first.ok()) return first.status();
+      if (type_ != kList) {
+        auto unique = Remember(*first, origin);
+        if (!unique.ok()) return unique;
+      }
+      if (type_ == kHash) {
+        input->ResetExpandedAccounting();
+        auto second = ReadString(input);
+        if (!second.ok()) return second.status();
+        page.fields_.push_back({std::move(*first), std::move(*second)});
+      } else if (type() == storage::ValueType::kSortedSet) {
+        auto score = ReadCollectionScore(input, type_);
+        if (!score.ok()) return score.status();
+        page.scored_members_.push_back({std::move(*first), *score});
+      } else
+        page.elements_.push_back(std::move(*first));
+    }
+    remaining_ -= count;
+    page.done_ = done_ = remaining_ == 0;
+    page.next_cursor_ = ++cursor_;
+    if (page.RetainedBytes() > bytes) return Bad("RDB page budget mismatch");
+    page.retained_charge_.Adopt(&*reservation, page.RetainedBytes());
+    return page;
+  } catch (const std::bad_alloc&) {
+    return Oom();
+  } catch (const std::length_error&) {
+    return Oom();
+  }
+
+ private:
+  explicit CollectionInput(std::uint8_t type)
+      : type_(type),
+        plain_(type <= kZSet2),
+        quick_(type == kListQuicklist || type == kListQuicklist2) {}
+  static absl::Status Oom() {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM RDB collection decode admission");
+  }
+  absl::Status Remember(std::string_view member, Reader origin) {
+    const auto digest = storage::ComputeDigest(member).value_;
+    const auto range = identities_.equal_range(digest);
+    for (auto it = range.first; it != range.second; ++it) {
+      Reader original = it->second;
+      Reader measure = original;
+      auto size = MeasureString(&measure);
+      if (!size.ok()) return size.status();
+      auto reservation = TryReserveMemory(*size + 64);
+      if (!reservation) return Oom();
+      original.ResetExpandedAccounting();
+      auto old = ReadString(&original);
+      if (!old.ok()) return old.status();
+      if (*old == member) return Bad("duplicate collection member or field");
+    }
+    // Keep only digest+borrowed input position, not another copy of every
+    // member. A collision re-decodes the original string before comparison.
+    constexpr std::size_t node_budget = sizeof(Reader) + 8 * sizeof(void*) + 32;
+    auto reservation = TryReserveMemory(node_budget);
+    if (!reservation) return Oom();
+    identities_.emplace(digest, origin);
+    identities_charge_.Resize(identities_charge_.bytes() + node_budget);
+    return absl::OkStatus();
+  }
+  absl::StatusOr<storage::CollectionPage> Packed(Reader* input) {
+    std::uint64_t container = 2;
+    if (type_ == kListQuicklist2) {
+      auto flag = ReadLength(input);
+      if (!flag.ok()) return flag.status();
+      if (flag->encoded || (flag->value != 1 && flag->value != 2))
+        return Bad("invalid quicklist container");
+      container = flag->value;
+    }
+    Reader measure = *input;
+    auto expanded = MeasureString(&measure);
+    if (!expanded.ok()) return expanded.status();
+    auto blob_reservation = TryReserveMemory(*expanded + 64);
+    if (!blob_reservation) return Oom();
+    Reader origin = *input;
+    input->ResetExpandedAccounting();
+    auto blob = ReadString(input);
+    if (!blob.ok()) return blob.status();
+    // The allocation-free measurement pass checks every packed entry rather
+    // than trusting a possibly saturated/corrupt count in the packed header.
+    // Only then reserve decoded vectors, string expansion and duplicate-check
+    // scratch. Long strings no longer imply a worst-case entry per byte.
+    PackedMeasurement measured;
+    absl::Status measured_status;
+    if (quick_ && container == 1)
+      measured.Add(blob->size());
+    else if (type_ == kSetIntset)
+      measured_status = DecodeIntset(*blob, &measured).status();
+    else if (type_ == kHashZipmap)
+      measured_status = DecodeZipmap(*blob, &measured).status();
+    else if (type_ == kListZiplist || type_ == kHashZiplist ||
+             type_ == kZSetZiplist || type_ == kListQuicklist)
+      measured_status = DecodeZiplist(*blob, &measured).status();
+    else
+      measured_status = DecodeListpack(*blob, &measured).status();
+    if (!measured_status.ok()) return measured_status;
+    if (measured.count > (SIZE_MAX - *expanded - 4096) / 192) return Oom();
+    const auto headers = measured.count * 192 + *expanded + 4096;
+    if (measured.strings > (SIZE_MAX - headers) / 3) return Oom();
+    const auto budget = headers + measured.strings * 3;
+    auto reservation = TryReserveMemory(budget);
+    if (!reservation) return Oom();
+    storage::CollectionPage page{.value_type_ = type()};
+    if (quick_) {
+      if (container == 1)
+        page.elements_.push_back(std::move(*blob));
+      else if (type_ == kListQuicklist) {
+        auto values = DecodeZiplist(*blob);
+        if (!values.ok()) return values.status();
+        page.elements_ = std::move(*values);
+      } else {
+        auto values = DecodeListpack(*blob);
+        if (!values.ok()) return values.status();
+        page.elements_.reserve(values->size());
+        for (auto& value : *values) page.elements_.push_back(value.String());
+      }
+      --remaining_;
+    } else {
+      origin.ResetExpandedAccounting();
+      auto logical = DecodeRdbObject(&origin, type_);
+      if (!logical.ok()) return logical.status();
+      if (type() == storage::ValueType::kHash) {
+        auto& pairs = std::get<Pairs>(logical->value);
+        page.fields_.reserve(pairs.size());
+        for (auto& pair : pairs)
+          page.fields_.push_back(
+              {std::move(pair.first), std::move(pair.second)});
+      } else if (type() == storage::ValueType::kSortedSet) {
+        auto& members = std::get<ZElements>(logical->value);
+        page.scored_members_.reserve(members.size());
+        for (auto& member : members)
+          page.scored_members_.push_back(
+              {std::move(member.member), member.score});
+      } else
+        page.elements_ = std::move(std::get<Strings>(logical->value));
+      remaining_ = 0;
+    }
+    page.done_ = done_ = remaining_ == 0;
+    page.next_cursor_ = ++cursor_;
+    if (page.size() > UINT64_MAX - total_items_)
+      return Bad("collection count overflow");
+    total_items_ += page.size();
+    if (page.done_ && total_items_ == 0) return Bad("empty collection");
+    if (page.RetainedBytes() > budget)
+      return Bad("packed RDB page budget mismatch");
+    page.retained_charge_.Adopt(&*reservation, page.RetainedBytes());
+    return page;
+  }
+  RetainedMemoryCharge identities_charge_;
+  std::multimap<std::uint64_t, Reader> identities_;
+  std::optional<unsigned> owner_;
+  std::uint8_t type_;
+  bool plain_;
+  bool quick_;
+  bool done_ = false;
+  std::uint64_t remaining_ = 1;
+  std::uint64_t cursor_ = 0;
+  std::uint64_t total_items_ = 0;
+  std::optional<std::uint64_t> expected_;
+};
 
 absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
   const std::string_view input = raw.encoded_;
@@ -1653,6 +1991,7 @@ struct FileReader::Impl {
   }
 
   void Rewind() {
+    collection_.reset();
     reader_ = Reader(input_.substr(9));
     db_id_ = 0;
     expire_at_ms_.reset();
@@ -1669,6 +2008,7 @@ struct FileReader::Impl {
   std::optional<std::uint64_t> expire_at_ms_;
   bool entry_metadata_ = false;
   bool finished_ = false;
+  std::unique_ptr<CollectionInput> collection_;
 };
 
 FileReader::FileReader(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -1745,10 +2085,44 @@ absl::StatusOr<FileReader> FileReader::Open(const std::string& path) {
     }
   }
 
-  return FileReader(std::make_unique<Impl>(mapping, size, version));
+  try {
+    return FileReader(std::make_unique<Impl>(mapping, size, version));
+  } catch (const std::bad_alloc&) {
+    unmap_on_error();
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM RDB file reader");
+  }
 }
 
 absl::StatusOr<std::optional<FileEntry>> FileReader::Next() {
+  return NextImpl(false);
+}
+
+absl::StatusOr<std::optional<FileEntry>> FileReader::NextStreaming() try {
+  return NextImpl(true);
+} catch (const std::bad_alloc&) {
+  RecordMemoryRejection();
+  return absl::ResourceExhaustedError("OOM RDB file entry");
+}
+
+absl::StatusOr<storage::CollectionPage> FileReader::ReadCollectionPage() {
+  if (!impl_->collection_) return Bad("no active RDB collection");
+  auto page = impl_->collection_->Next(&impl_->reader_);
+  if (page.ok() && page->done_) impl_->collection_.reset();
+  return page;
+}
+
+absl::Status FileReader::DrainCollection() {
+  while (impl_->collection_) {
+    auto page = ReadCollectionPage();
+    if (!page.ok()) return page.status();
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::optional<FileEntry>> FileReader::NextImpl(
+    bool stream_collections) {
+  if (impl_->collection_) return Bad("RDB collection must be drained first");
   if (impl_->finished_) return std::optional<FileEntry>();
 
   while (true) {
@@ -1887,6 +2261,28 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::Next() {
       return Bad("RDB key exceeds Keylane limits");
     }
     impl_->reader_.ResetExpandedAccounting();
+    if (stream_collections &&
+        CollectionType(type) != storage::ValueType::kNone) {
+      auto collection = CollectionInput::Open(&impl_->reader_, type);
+      if (!collection.ok()) return collection.status();
+      impl_->collection_ = std::move(*collection);
+      FileEntry entry{
+          .kind_ = FileEntryKind::kValue,
+          .db_id_ = impl_->db_id_,
+          .key_ = std::move(*key),
+          .value_ =
+              storage::RawValue{
+                  .encoded_ = {},
+                  .logical_size_ = impl_->collection_->expected().value_or(0),
+                  .expire_at_ms_ = impl_->expire_at_ms_.value_or(0),
+                  .value_type_ = impl_->collection_->type()},
+          .function_code_ = {},
+          .collection_stream_ = true,
+          .expected_items_ = impl_->collection_->expected()};
+      impl_->expire_at_ms_.reset();
+      impl_->entry_metadata_ = false;
+      return std::optional<FileEntry>(std::move(entry));
+    }
     auto logical = DecodeRdbObject(&impl_->reader_, type);
     if (!logical.ok()) return logical.status();
     auto value = EncodeRaw(std::move(*logical));
@@ -2190,5 +2586,87 @@ absl::StatusOr<storage::RawValue> DecodeDump(std::string_view payload) {
   if (!reader.done()) return Bad("trailing object data");
   return EncodeRaw(std::move(*logical));
 }
+
+struct DumpReader::Impl {
+  explicit Impl(std::string_view input) : input_(input), reader_(input) {}
+  absl::Status Initialize() {
+    reader_ = Reader(input_);
+    if (!reader_.Byte(&type_)) return Bad();
+    collection_.reset();
+    if (CollectionType(type_) != storage::ValueType::kNone) {
+      auto opened = CollectionInput::Open(&reader_, type_);
+      if (!opened.ok()) return opened.status();
+      collection_ = std::move(*opened);
+    }
+    complete_ = false;
+    return absl::OkStatus();
+  }
+  std::string_view input_;
+  Reader reader_;
+  std::uint8_t type_ = 0;
+  bool complete_ = false;
+  std::unique_ptr<CollectionInput> collection_;
+};
+
+DumpReader::DumpReader(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+DumpReader::DumpReader(DumpReader&&) noexcept = default;
+DumpReader& DumpReader::operator=(DumpReader&&) noexcept = default;
+DumpReader::~DumpReader() = default;
+
+absl::StatusOr<DumpReader> DumpReader::Open(std::string_view payload) try {
+  if (payload.size() < 10)
+    return absl::InvalidArgumentError(
+        "DUMP payload version or checksum are wrong");
+  Reader footer(payload.substr(payload.size() - 10));
+  std::uint16_t version = 0;
+  std::uint64_t expected = 0;
+  if (!footer.Le16(&version) || !footer.Le64(&expected) || version > kVersion ||
+      Crc64(payload.substr(0, payload.size() - 8)) != expected)
+    return absl::InvalidArgumentError(
+        "DUMP payload version or checksum are wrong");
+  auto impl = std::make_unique<Impl>(payload.substr(0, payload.size() - 10));
+  auto status = impl->Initialize();
+  if (!status.ok()) return status;
+  return DumpReader(std::move(impl));
+} catch (const std::bad_alloc&) {
+  RecordMemoryRejection();
+  return absl::ResourceExhaustedError("OOM DUMP reader");
+}
+
+bool DumpReader::collection() const noexcept {
+  return CollectionType(impl_->type_) != storage::ValueType::kNone;
+}
+storage::ValueType DumpReader::value_type() const noexcept {
+  const auto collection = CollectionType(impl_->type_);
+  if (collection != storage::ValueType::kNone) return collection;
+  if (impl_->type_ == kString) return storage::ValueType::kString;
+  if (impl_->type_ == kStreamListpacks || impl_->type_ == kStreamListpacks2 ||
+      impl_->type_ == kStreamListpacks3)
+    return storage::ValueType::kStream;
+  return storage::ValueType::kNone;
+}
+std::optional<std::uint64_t> DumpReader::expected_items() const noexcept {
+  return impl_->collection_ ? impl_->collection_->expected() : std::nullopt;
+}
+absl::StatusOr<storage::CollectionPage> DumpReader::ReadCollectionPage() {
+  if (!impl_->collection_ || impl_->complete_)
+    return Bad("no active DUMP collection");
+  auto page = impl_->collection_->Next(&impl_->reader_);
+  if (page.ok() && page->done_) {
+    if (!impl_->reader_.done()) return Bad("trailing object data");
+    impl_->complete_ = true;
+  }
+  return page;
+}
+absl::StatusOr<storage::RawValue> DumpReader::ReadRawValue() {
+  if (collection() || impl_->complete_)
+    return Bad("DUMP raw value is not active");
+  auto logical = DecodeRdbObject(&impl_->reader_, impl_->type_);
+  if (!logical.ok()) return logical.status();
+  if (!impl_->reader_.done()) return Bad("trailing object data");
+  impl_->complete_ = true;
+  return EncodeRaw(std::move(*logical));
+}
+absl::Status DumpReader::Rewind() { return impl_->Initialize(); }
 
 }  // namespace keylane::rdb

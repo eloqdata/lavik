@@ -47,6 +47,7 @@ absl::StatusOr<RecordIndex::Entry*> StorageEngine::Impl::ReplaceIndexLocation(
   move_pointer_key(store.recovery_external_keys_);
   move_pointer_key(store.recovery_lsns_);
   move_pointer_key(store.recovery_txids_);
+  move_pointer_key(store.recovery_grouped_roots_);
 
   index.DestroyDetached(replaced);
   return current;
@@ -259,6 +260,20 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   }
 
   const RecordLocation previous = MaterializeIndexLocation(*found);
+  if (previous.grouped()) {
+    auto view = partition.grouped_objects_[db_id].Lookup(
+        key, GroupedObjectVersion{
+                 .root_ = previous,
+                 .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+                 .replication_epoch_ = partition.replication_epoch_,
+                 .index_generation_ = partition.grouped_generations_[db_id]});
+    if (!view.ok()) co_return view.status();
+    const auto updated = co_await UpdateGroupedExpirationLocked(
+        store, partition, db_id, key, digest, *view, expire_at_ms, tx,
+        replication);
+    if (!updated.ok()) co_return updated;
+    co_return true;
+  }
   auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                    previous, ExtentsFor(store, found));
   if (!loaded.ok()) {
@@ -476,6 +491,18 @@ Task<absl::Status> StorageEngine::Impl::MarkRecordDead(
 
 Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
     std::uint64_t txid, std::vector<TxShardWrites*> shards) {
+  struct FailUncommittedDependencies {
+    const std::vector<TxShardWrites*>& shards_;
+    bool completed_ = false;
+    ~FailUncommittedDependencies() {
+      if (completed_) return;
+      for (auto* shard : shards_) {
+        if (shard != nullptr && shard->grouped_decision_ != nullptr) {
+          shard->grouped_decision_->FailPending();
+        }
+      }
+    }
+  } dependency_guard{shards};
   // The commit record must land strictly after every tagged data record is
   // durable: recovery treats "commit without data" as impossible, and
   // "data without commit" as an aborted transaction.
@@ -484,6 +511,12 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   for (TxShardWrites* shard : shards) {
     if (shard == nullptr) {
       continue;
+    }
+    if (shard->grouped_decision_ != nullptr &&
+        shard->grouped_decision_->state_.load(std::memory_order_acquire) ==
+            GroupedCommitDecision::State::kFailed) {
+      co_return absl::FailedPreconditionError(
+          "grouped transaction was abandoned");
     }
     if (generation_receipt == nullptr) {
       generation_receipt = shard;
@@ -518,6 +551,7 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
           .dependent_extents_ = retired.dependent_extents_,
           .immediate_extents_ = retired.immediate_extents_,
           .extra_dependent_extents_ = nullptr,
+          .retained_owner_ = retired.retained_owner_,
       });
     }
   }
@@ -547,6 +581,29 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   // drops the whole (acknowledged but never durability-promised)
   // transaction.
   RequestFlush(store, commit_location.block_id());
+  const bool grouped =
+      std::any_of(shards.begin(), shards.end(), [](auto* shard) {
+        return shard != nullptr && shard->grouped_decision_ != nullptr;
+      });
+  if (grouped) {
+    unlock.Unlock();
+    auto durable = co_await AwaitRelocationDurable(RelocationDurabilityFence{
+        .block_id_ = commit_location.block_id(),
+        .allocation_epoch_ = commit_location.allocation_epoch(),
+        .block_owner_ = commit_location.block_owner(),
+        .committed_bytes_ =
+            static_cast<std::uint32_t>(commit_location.record_offset() +
+                                       commit_location.total_disk_bytes()),
+    });
+    if (!durable.ok()) co_return durable;
+    for (auto* shard : shards) {
+      if (shard != nullptr && shard->grouped_decision_ != nullptr) {
+        shard->grouped_decision_->state_.store(
+            GroupedCommitDecision::State::kDurable, std::memory_order_release);
+      }
+    }
+  }
+  dependency_guard.completed_ = true;
   co_return absl::OkStatus();
 }
 
@@ -586,11 +643,13 @@ bool StorageEngine::Impl::EnqueueTxCommit(std::uint64_t txid,
   }
 #endif
   WorkerStore& store = CurrentStore();
-  NoteTxCommitStarted();
   store.tx_commit_queue_.push_back(WorkerStore::PendingTxCommit{
       .txid_ = txid,
       .writes_ = std::move(writes),
   });
+  // A deque allocation may fail. Count a commit only after the queue owns
+  // it, otherwise shutdown would wait forever for a nonexistent pending item.
+  NoteTxCommitStarted();
   const std::uint64_t depth =
       tx_commit_queue_depth_.fetch_add(1, std::memory_order_acq_rel) + 1;
   std::uint64_t peak = tx_commit_queue_peak_.load(std::memory_order_relaxed);
@@ -599,8 +658,22 @@ bool StorageEngine::Impl::EnqueueTxCommit(std::uint64_t txid,
                              std::memory_order_relaxed)) {
   }
   if (!store.tx_commit_runner_) {
-    store.tx_commit_runner_ = true;
-    store.worker_->Spawn(DrainTxCommitQueue(&store));
+    try {
+      // Allocate the coroutine before claiming its runner slot. A failed
+      // launch must release this queue/count ownership as well as poisoning
+      // the grouped decision in the foreground handoff guard.
+      auto runner = DrainTxCommitQueue(&store);
+      store.tx_commit_runner_ = true;
+      store.worker_->Spawn(std::move(runner));
+    } catch (const std::bad_alloc&) {
+      store.tx_commit_runner_ = false;
+      for (auto& shard : store.tx_commit_queue_.back().writes_)
+        if (shard.grouped_decision_) shard.grouped_decision_->FailPending();
+      store.tx_commit_queue_.pop_back();
+      tx_commit_queue_depth_.fetch_sub(1, std::memory_order_acq_rel);
+      NoteTxCommitFinished();
+      throw;
+    }
   }
   if (store.tx_commit_queue_.size() < kTxCommitQueueHighWatermark) {
     return true;
@@ -711,6 +784,11 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
       } else {
         spdlog::warn("transaction {} batch durability failed: {}",
                      pending.txid_, batch_status.message());
+        for (auto& shard : pending.writes_) {
+          if (shard.grouped_decision_ != nullptr) {
+            shard.grouped_decision_->FailPending();
+          }
+        }
       }
       NoteTxCommitFinished();
     }
@@ -720,7 +798,9 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
 }
 
 Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
-    std::uint64_t txid, TxShardWrites* compensation) {
+    std::uint64_t txid, TxShardWrites* compensation,
+    bool discard_uncommitted_absent, TxUndoLog* retained_prefix,
+    bool grouped_root_only) {
   WorkerStore& store = CurrentStore();
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
@@ -729,7 +809,14 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     co_return absl::OkStatus();
   }
   TxUndoLog undo = std::move(found->second);
-  store.tx_undo_.erase(found);
+  // A pull-based restore isolates only its suffix. Return the retained prefix
+  // to this already allocated map slot before any awaited rollback work;
+  // inserting a new journal on an OOM abort path would itself require memory.
+  if (retained_prefix != nullptr)
+    found->second = std::move(*retained_prefix);
+  else
+    store.tx_undo_.erase(found);
+  assert(!discard_uncommitted_absent || compensation == nullptr);
   // Reverse order: a key written twice in one transaction unwinds through
   // its intermediate version back to the original.
   for (auto it = undo.entries_.rbegin(); it != undo.entries_.rend(); ++it) {
@@ -751,7 +838,36 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         current->key_complete() ? current->key() : std::string_view(loaded_key);
     const Digest undo_digest = ComputeDigest(undo_key);
     auto& partition = PartitionForKey(store, undo_key);
+    GroupedHashObject::Handle applied_grouped;
+    if (applied.grouped()) {
+      auto view = partition.grouped_objects_[entry.db_id_].Lookup(
+          undo_key,
+          GroupedObjectVersion{
+              .root_ = applied,
+              .db_epoch_ = EffectiveRecordDbEpoch(partition, entry.db_id_),
+              .replication_epoch_ = partition.replication_epoch_,
+              .index_generation_ = partition.grouped_generations_[entry.db_id_],
+          },
+          /*allow_failed=*/true);
+      if (!view.ok()) {
+        store.write_failed_ = true;
+        co_return view.status();
+      }
+      applied_grouped = std::move(*view);
+    }
     if (compensation != nullptr) {
+      if (grouped_root_only && entry.previous_grouped_ != nullptr) {
+        // The isolated restore driver cancels old-graph physical retirements
+        // separately. Never materialize a potentially multi-GiB predecessor.
+        const auto restored = co_await RestoreGroupedViewLocked(
+            store, partition, entry.db_id_, undo_key, undo_digest,
+            entry.previous_grouped_, compensation, &undo);
+        if (!restored.ok()) {
+          store.write_failed_ = true;
+          co_return restored;
+        }
+        continue;
+      }
       // Do not merely rewind the in-memory index: EXEC will later commit this
       // txid, so recovery would accept the failed half-write again. Append a
       // later record in the same transaction that represents the restored
@@ -763,7 +879,8 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
           entry.previous_->kind() == RecordKind::kValue) {
         auto loaded = co_await LoadValue(
             store, partition, entry.db_id_, undo_key, undo_digest,
-            *entry.previous_, entry.previous_extents_);
+            *entry.previous_, entry.previous_extents_, nullptr,
+            entry.previous_grouped_);
         if (!loaded.ok()) {
           store.write_failed_ = true;
           co_return loaded.status();
@@ -801,6 +918,13 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       continue;
     }
     if (!entry.previous_.has_value()) {
+      if (discard_uncommitted_absent) {
+        // The target stream holds this key and will never commit its outer
+        // decision. Keep its handle alive until every reverse-undo and slot
+        // lookup has finished, then restore absence without writing to a
+        // possibly fail-stopped device. No ordinary transaction uses this path.
+        continue;
+      }
       // The key did not exist: append a tombstone to restore runtime and
       // recovery state. The aborted transaction was never published to a
       // full-sync session, so this internal rollback must not publish either.
@@ -810,12 +934,22 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
           /*tx=*/nullptr, /*logical_size=*/0,
           /*commit_retirements=*/nullptr, /*committed_sequence=*/nullptr,
           /*replication=*/nullptr, /*trace=*/nullptr,
-          /*capture_fullsync=*/false);
+          /*capture_fullsync=*/false, &undo);
       if (!tombstone.ok()) {
         store.write_failed_ = true;
         co_return tombstone;
       }
       continue;
+    }
+    std::optional<GroupedObjectIndex::Publication> restored_group_slot;
+    if (entry.previous_grouped_ != nullptr) {
+      auto reserved = partition.grouped_objects_[entry.db_id_].PreparePublish(
+          undo_key, applied_grouped);
+      if (!reserved.ok()) {
+        store.write_failed_ = true;
+        co_return reserved.status();
+      }
+      restored_group_slot.emplace(std::move(*reserved));
     }
     // Mirror the append-time counter math in reverse.
     const ExtentManifest applied_extents = ExtentsFor(store, current);
@@ -850,6 +984,22 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       co_return restored.status();
     }
     current = *restored;
+    if (restored_group_slot.has_value()) {
+      auto published = restored_group_slot->Commit(entry.previous_grouped_);
+      if (!published.ok()) {
+        store.write_failed_ = true;
+        co_return published;
+      }
+    } else if (applied_grouped != nullptr) {
+      // A still-earlier undo entry can need this same slot. Keep it until
+      // the entire reverse journal has settled, not just this one rewind.
+      auto cleared = partition.grouped_objects_[entry.db_id_].ClearKeepingSlot(
+          undo_key, applied_grouped);
+      if (!cleared.ok()) {
+        store.write_failed_ = true;
+        co_return cleared;
+      }
+    }
     if (entry.previous_->external()) {
       store.external_manifests_.insert_or_assign(current,
                                                  entry.previous_extents_);
@@ -868,8 +1018,140 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       store.write_failed_ = true;
       co_return dead;
     }
-    UnpinTxDependencyLocal(store, entry.previous_->block_id(),
-                           entry.previous_->allocation_epoch());
+    // Child epochs were captured before restoring/publishing either view.
+    // Only new physical children leave accounting; old shared groups remain
+    // authoritative and must never be retired by an aborted replacement.
+    if (entry.applied_grouped_retirements_ != nullptr) {
+      for (const auto& group : *entry.applied_grouped_retirements_) {
+        if (group.block_owner_ == store.worker_->id()) {
+          dead = MarkRecordDeadLocal(store.worker_->id(), group);
+        } else {
+          unlock.Unlock();
+          dead = co_await MarkRecordDead(group);
+          co_await store.store_state_mutex_.Lock();
+          unlock.Adopt();
+        }
+        if (!dead.ok()) {
+          store.write_failed_ = true;
+          co_return dead;
+        }
+      }
+    }
+    if (entry.previous_grouped_retirements_ != nullptr) {
+      for (const auto& group : *entry.previous_grouped_retirements_) {
+        if (!group.dependency_pinned_) continue;
+        if (group.block_owner_ == store.worker_->id()) {
+          UnpinTxDependencyLocal(store, group.block_id_,
+                                 group.allocation_epoch_);
+        } else {
+          unlock.Unlock();
+          (void)co_await celer::SubmitTo(group.block_owner_, [this, group] {
+            UnpinTxDependencyLocal(*stores_[group.block_owner_],
+                                   group.block_id_, group.allocation_epoch_);
+            return true;
+          });
+          co_await store.store_state_mutex_.Lock();
+          unlock.Adopt();
+        }
+      }
+    }
+    if (entry.previous_dependency_pinned_) {
+      const auto previous = *entry.previous_;
+      if (previous.block_owner() == store.worker_->id()) {
+        UnpinTxDependencyLocal(store, previous.block_id(),
+                               previous.allocation_epoch());
+      } else {
+        // The exact root pin was acquired on its physical owner before
+        // publication. Abort must release that same receipt, not inspect the
+        // logical key owner's unrelated transaction-block table.
+        unlock.Unlock();
+        (void)co_await celer::SubmitTo(
+            previous.block_owner(), [this, previous] {
+              UnpinTxDependencyLocal(*stores_[previous.block_owner()],
+                                     previous.block_id(),
+                                     previous.allocation_epoch());
+              return true;
+            });
+        co_await store.store_state_mutex_.Lock();
+        unlock.Adopt();
+      }
+    }
+  }
+  auto cleared = co_await ClearGroupedUndoSlots(store, undo);
+  if (!cleared.ok()) {
+    store.write_failed_ = true;
+    co_return cleared;
+  }
+  for (const auto& candidate : undo.entries_) {
+    if (!discard_uncommitted_absent || candidate.previous_.has_value())
+      continue;
+    const auto* entry = &candidate;
+    auto* current = undo.Current(entry->entry_handle_);
+    const auto applied = MaterializeIndexLocation(*current);
+    std::string external_key;
+    if (!current->key_complete()) {
+      auto loaded =
+          co_await LoadOutOfIndexKey(store, applied, ExtentsFor(store, current),
+                                     current->logical_key_size());
+      if (!loaded.ok()) co_return loaded.status();
+      external_key = std::move(*loaded);
+    }
+    const auto key = current->key_complete() ? current->key()
+                                             : std::string_view(external_key);
+    auto& partition = PartitionForKey(store, key);
+    auto root_retirement = RetiredRecordOf(
+        applied,
+        applied.key_external() ? DependentExtentsFor(store, current) : nullptr);
+    if (applied.external() && !applied.key_external())
+      root_retirement.immediate_extents_ = ExtentsFor(store, current);
+    auto grouped =
+        partition.grouped_objects_[entry->db_id_].CurrentForMutation(key);
+    if (grouped) {
+      const auto removed =
+          partition.grouped_objects_[entry->db_id_].Erase(key, grouped);
+      if (!removed.ok()) co_return removed;
+    }
+    if (applied.kind() == RecordKind::kValue) {
+      --partition.live_key_count_[entry->db_id_];
+      --store.live_key_count_[entry->db_id_];
+      if (applied.expire_at_ms_ != 0)
+        --partition.expiring_key_count_[entry->db_id_];
+    }
+    const auto key_bytes = current->logical_key_size();
+    store.external_manifests_.erase(current);
+    if (!partition.indexes_[entry->db_id_].Erase(current))
+      co_return absl::InternalError("replica absence undo lost its entry");
+    RemoveFullSyncCoverageEntry(partition, entry->db_id_, key_bytes);
+    unlock.Unlock();
+    auto dead = co_await MarkRecordDead(root_retirement);
+    if (dead.ok() && entry->applied_grouped_retirements_) {
+      for (const auto& child : *entry->applied_grouped_retirements_) {
+        dead = co_await MarkRecordDead(child);
+        if (!dead.ok()) break;
+      }
+    }
+    if (dead.ok() && entry->previous_grouped_retirements_) {
+      // A squashed stream keeps intermediate-root/child pins here even when
+      // the original predecessor was absent. They are release-only receipts.
+      for (const auto& pin : *entry->previous_grouped_retirements_) {
+        if (!pin.dependency_pinned_) continue;
+        auto release = [this, pin]() -> Task<absl::Status> {
+          auto& owner = *stores_[pin.block_owner_];
+          co_await owner.store_state_mutex_.Lock();
+          UnlockGuard pin_unlock(&owner.store_state_mutex_, owner.worker_);
+          UnpinTxDependencyLocal(owner, pin.block_id_, pin.allocation_epoch_);
+          co_return absl::OkStatus();
+        };
+        if (pin.block_owner_ == store.worker_->id())
+          dead = co_await release();
+        else
+          dead = co_await celer::SubmitTaskTo(pin.block_owner_, release);
+        if (!dead.ok()) break;
+      }
+    }
+    co_await store.store_state_mutex_.Lock();
+    unlock.Adopt();
+    if (!dead.ok()) co_return dead;
   }
   co_return absl::OkStatus();
 }
@@ -878,7 +1160,18 @@ Task<absl::Status> StorageEngine::Impl::DiscardTxUndoLocal(std::uint64_t txid) {
   WorkerStore& store = CurrentStore();
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-  store.tx_undo_.erase(txid);
+  if (auto found = store.tx_undo_.find(txid); found != store.tx_undo_.end()) {
+    // Resolving an external key may suspend. Keep neither an unordered-map
+    // iterator nor a reference to its element across that suspension: another
+    // transaction can grow the map while this coroutine is waiting for IO.
+    TxUndoLog undo = std::move(found->second);
+    store.tx_undo_.erase(found);
+    auto cleared = co_await ClearGroupedUndoSlots(store, undo);
+    if (!cleared.ok()) {
+      store.write_failed_ = true;
+      co_return cleared;
+    }
+  }
   co_return absl::OkStatus();
 }
 
@@ -925,37 +1218,37 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
   if (unlock_writer) {
     store.store_state_mutex_.Unlock(*store.worker_);
   }
-#ifndef NDEBUG
-  // Deterministically hold the elected foreground allocator after it releases
-  // store_state_mutex_. Tests use this to prove that a peer for the same
-  // stream waits on the allocation gate instead of allocating a spare block.
-  // Only the first foreground allocation pauses.
-  static std::atomic<bool> tx_active_pause_claimed = false;
-  const char* tx_active_pause_text =
-      std::getenv("KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS");
-  bool expected_tx_active_pause = false;
-  if (!for_defrag && unlock_writer && tx_active_pause_text != nullptr &&
-      tx_active_pause_claimed.compare_exchange_strong(
-          expected_tx_active_pause, true, std::memory_order_acq_rel)) {
-    char* end = nullptr;
-    const unsigned long pause_ms = std::strtoul(tx_active_pause_text, &end, 10);
-    if (end != tx_active_pause_text && *end == '\0' && pause_ms != 0) {
-      // Test-only observability: e2e fixtures poll the server log for this
-      // marker to confirm the pause is actually in effect instead of guessing
-      // with sleeps.
-      spdlog::warn(
-          "KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS pausing foreground allocation "
-          "for {} ms",
-          pause_ms);
-      absl::Status paused = co_await celer::SleepFor(
-          *store.worker_, std::chrono::milliseconds(pause_ms));
-      if (!paused.ok()) {
-        co_await store.store_state_mutex_.Lock();
-        co_return paused;
-      }
-    }
-  }
-#endif
+  KEYLANE_FAULT_INJECT(
+      // Deterministically hold the elected foreground allocator after it
+      // releases store_state_mutex_. Tests use this to prove that a peer for
+      // the same stream waits on the allocation gate instead of allocating a
+      // spare block. Only the first foreground allocation pauses.
+      static std::atomic<bool> tx_active_pause_claimed = false;
+      const char* tx_active_pause_text =
+          std::getenv("KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS");
+      bool expected_tx_active_pause = false;
+      if (!for_defrag && unlock_writer && tx_active_pause_text != nullptr &&
+          tx_active_pause_claimed.compare_exchange_strong(
+              expected_tx_active_pause, true, std::memory_order_acq_rel)) {
+        char* end = nullptr;
+        const unsigned long pause_ms =
+            std::strtoul(tx_active_pause_text, &end, 10);
+        if (end != tx_active_pause_text && *end == '\0' && pause_ms != 0) {
+          // Test-only observability: e2e fixtures poll the server log for this
+          // marker to confirm the pause is actually in effect instead of
+          // guessing with sleeps.
+          spdlog::warn(
+              "KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS pausing foreground allocation "
+              "for {} ms",
+              pause_ms);
+          absl::Status paused = co_await celer::SleepFor(
+              *store.worker_, std::chrono::milliseconds(pause_ms));
+          if (!paused.ok()) {
+            co_await store.store_state_mutex_.Lock();
+            co_return paused;
+          }
+        }
+      });
   absl::StatusOr<ReservedBlock> allocated{
       absl::Status(absl::StatusCode::kUnavailable, "storage is shutting down")};
   // A writer racing shutdown must not park behind an allocation the shutdown
@@ -1046,26 +1339,26 @@ Task<absl::Status> StorageEngine::Impl::PrefetchStandbyBlock(
       absl::CancelledError("standby prefetch is no longer needed")};
   if (should_allocate) {
     absl::Status pause_status = absl::OkStatus();
-#ifndef NDEBUG
-    static std::atomic<bool> standby_pause_claimed = false;
-    const char* standby_pause_text =
-        std::getenv("KEYLANE_STANDBY_PREFETCH_PAUSE_MS");
-    bool expected_standby_pause = false;
-    if (standby_pause_text != nullptr &&
-        standby_pause_claimed.compare_exchange_strong(
-            expected_standby_pause, true, std::memory_order_acq_rel)) {
-      char* end = nullptr;
-      const unsigned long pause_ms = std::strtoul(standby_pause_text, &end, 10);
-      if (end != standby_pause_text && *end == '\0' && pause_ms != 0) {
-        spdlog::warn(
-            "KEYLANE_STANDBY_PREFETCH_PAUSE_MS pausing standby prefetch "
-            "for {} ms",
-            pause_ms);
-        pause_status = co_await celer::SleepFor(
-            *store->worker_, std::chrono::milliseconds(pause_ms));
-      }
-    }
-#endif
+    KEYLANE_FAULT_INJECT(
+        static std::atomic<bool> standby_pause_claimed = false;
+        const char* standby_pause_text =
+            std::getenv("KEYLANE_STANDBY_PREFETCH_PAUSE_MS");
+        bool expected_standby_pause = false;
+        if (standby_pause_text != nullptr &&
+            standby_pause_claimed.compare_exchange_strong(
+                expected_standby_pause, true, std::memory_order_acq_rel)) {
+          char* end = nullptr;
+          const unsigned long pause_ms =
+              std::strtoul(standby_pause_text, &end, 10);
+          if (end != standby_pause_text && *end == '\0' && pause_ms != 0) {
+            spdlog::warn(
+                "KEYLANE_STANDBY_PREFETCH_PAUSE_MS pausing standby prefetch "
+                "for {} ms",
+                pause_ms);
+            pause_status = co_await celer::SleepFor(
+                *store->worker_, std::chrono::milliseconds(pause_ms));
+          }
+        });
     if (pause_status.ok()) {
       allocated =
           co_await AllocateBlock(*store, AllocationPurpose::kForeground);
@@ -1105,9 +1398,16 @@ Task<absl::Status> StorageEngine::Impl::PrefetchStandbyBlock(
 Task<absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
 StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
                                             std::string_view first,
-                                            std::string_view second) {
+                                            std::string_view second,
+                                            RecordPayloadCursor* cursor) {
+  if (cursor != nullptr && (!first.empty() || !second.empty())) {
+    co_return absl::InvalidArgumentError(
+        "extent writer requires either spans or a payload cursor");
+  }
   const std::uint64_t logical_bytes =
-      static_cast<std::uint64_t>(first.size()) + second.size();
+      cursor != nullptr
+          ? cursor->encoded_bytes()
+          : static_cast<std::uint64_t>(first.size()) + second.size();
   if (logical_bytes == 0 || logical_bytes > kMaxRecordPayloadBytes) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "record payload exceeds the 1 GiB limit");
@@ -1182,6 +1482,16 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
     }
     std::fill_n(staging.data_, kStorageBlockBytes, std::byte{0});
     std::size_t copied = 0;
+    if (cursor != nullptr) {
+      auto copied_status = cursor->Read(std::span<std::byte>(
+          staging.data_ + kBlockHeaderBytes, payload_bytes));
+      if (!copied_status.ok()) {
+        release_buffer();
+        reclaim_allocated();
+        co_return copied_status;
+      }
+      copied = payload_bytes;
+    }
     while (copied < payload_bytes) {
       const std::uint64_t logical_offset = payload_offset + copied;
       const std::string_view source =
@@ -1288,8 +1598,21 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
       reclaim_allocated();
       co_return write_status;
     }
+    // The first extent has a durable header and allocation bit, but the
+    // remaining payload and keyed manifest have not been published. Recovery
+    // must reclaim this orphan without losing the previous complete value.
+    if (payload_offset == 0 && payload_bytes < logical_bytes) {
+      KEYLANE_MAYBE_CRASH_AT("extent-first-part-durable");
+    }
     payload_offset += payload_bytes;
     ++extent_index;
+  }
+  if (cursor != nullptr) {
+    auto finished = cursor->Finish();
+    if (!finished.ok()) {
+      reclaim_allocated();
+      co_return finished;
+    }
   }
   co_return std::shared_ptr<const std::vector<ExtentRef>>(std::move(refs));
 }
@@ -1301,8 +1624,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     std::uint64_t expire_at_ms, TxShardWrites* tx, std::uint64_t logical_size,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
     std::uint64_t* committed_sequence, ReplicationCommandAppend* replication,
-    SetLatencyTrace* trace, bool capture_fullsync,
-    TxUndoLog* replacement_undo) {
+    SetLatencyTrace* trace, bool capture_fullsync, TxUndoLog* replacement_undo,
+    GroupMutationWrite* grouped) {
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
   }
@@ -1326,10 +1649,18 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         .replication_epoch_ = sync->replication_epoch_,
         .db_epoch_ = sync->local_db_epochs_[db_id],
         .reject_older_sequence_ = true,
+        .allow_equal_sequence_ = true,
     });
   }
-  const std::uint64_t mutation_sequence = replica_mutation_sequence.has_value()
-                                              ? *replica_mutation_sequence
+  if (grouped != nullptr &&
+      (grouped->sequence_ == 0 || grouped->root_ == nullptr ||
+       (replica_mutation_sequence.has_value() &&
+        *replica_mutation_sequence != grouped->sequence_))) {
+    co_return absl::InvalidArgumentError("invalid grouped mutation sequence");
+  }
+  const std::uint64_t mutation_sequence =
+      grouped != nullptr                      ? grouped->sequence_
+      : replica_mutation_sequence.has_value() ? *replica_mutation_sequence
                                               : ++partition.mutation_sequence_;
   std::shared_ptr<const ReplicationCommandAppend> fullsync_command;
   if (replication != nullptr) {
@@ -1366,6 +1697,9 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     if (!extents.ok()) {
       co_return extents.status();
     }
+    if (value_type == ValueType::kHash) {
+      KEYLANE_MAYBE_CRASH_AT("hash-extents-durable-before-root");
+    }
     const std::string manifest = EncodeManifest(**extents);
     status = co_await WriteRecordLocked(
         store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
@@ -1373,7 +1707,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         logical_size, *extents, nullptr, nullptr, tx,
         std::move(commit_retirements), trace,
         replica_write_root.has_value() ? &*replica_write_root : nullptr,
-        replacement_undo, &partition);
+        replacement_undo, &partition,
+        grouped != nullptr ? grouped->root_ : nullptr);
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -1384,7 +1719,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         logical_size, nullptr, nullptr, nullptr, tx,
         std::move(commit_retirements), trace,
         replica_write_root.has_value() ? &*replica_write_root : nullptr,
-        replacement_undo, &partition);
+        replacement_undo, &partition,
+        grouped != nullptr ? grouped->root_ : nullptr);
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
@@ -1572,10 +1908,17 @@ void StorageEngine::Impl::ClearFullSyncCapture(
     WorkerStore& store, std::uint64_t session_id,
     WorkerStore::FullSyncCapture& capture) {
   for (auto& [_, pinned] : capture.pinned_values_) {
-    store.worker_->Spawn(ReleaseFullSyncExtents(std::move(pinned.extents_)));
+    if (pinned.collection_ != nullptr) {
+      active_settlements_.fetch_add(1, std::memory_order_acq_rel);
+      store.worker_->Spawn(
+          ReleaseFullSyncCollection(std::move(pinned.collection_)));
+    } else {
+      store.worker_->Spawn(ReleaseFullSyncExtents(std::move(pinned.extents_)));
+    }
   }
   capture.pinned_values_.clear();
   capture.pinned_values_.rehash(0);
+  capture.pinned_values_charge_.Reset();
   capture.overrides_.clear();
   for (auto& latest : capture.latest_by_key_) {
     latest.clear();
@@ -1834,7 +2177,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     TxShardWrites* tx,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
     SetLatencyTrace* trace, const ExplicitWriteRoot* explicit_root,
-    TxUndoLog* replacement_undo, WorkerStore::PartitionStore* known_partition) {
+    TxUndoLog* replacement_undo, WorkerStore::PartitionStore* known_partition,
+    const GroupRecordWrite* group) {
   if (store.write_failed_ ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -1851,6 +2195,46 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                              "injected transaction write fault");
     }
   }
+  const bool auxiliary = group != nullptr && group->auxiliary_;
+  const bool grouped_root = group != nullptr && !group->auxiliary_;
+  if (group != nullptr &&
+      (kind != RecordKind::kValue ||
+       (value_type != ValueType::kHash && value_type != ValueType::kSet &&
+        value_type != ValueType::kList &&
+        value_type != ValueType::kSortedSet) ||
+       mutation_sequence == 0 ||
+       (auxiliary && (group->incarnation_ == 0 ||
+                      ((value_type == ValueType::kList ||
+                        value_type == ValueType::kSortedSet)
+                           ? (group->id_.prefix_ == 0 || group->id_.bits_ != 0)
+                           : !group->id_.valid()) ||
+                      expire_at_ms != 0 || explicit_root != nullptr ||
+                      (group->retired_ && logical_size != 0) ||
+                      (group->batch_txid_ != 0 && txid == 0) ||
+                      (tx == nullptr && !for_defrag))) ||
+       (grouped_root &&
+        (logical_size == 0 || group->incarnation_ != 0 ||
+         group->id_ != HashGroupId{} || group->retired_ ||
+         group->batch_txid_ != 0 || group->prepared_root_ == nullptr ||
+         group->publication_ == nullptr)))) {
+    co_return absl::InvalidArgumentError("invalid grouped record write");
+  }
+  struct FailIncompleteGroupedRoot {
+    WorkerStore& store_;
+    TxShardWrites* tx_;
+    bool armed_ = false;
+    bool completed_ = false;
+    ~FailIncompleteGroupedRoot() {
+      if (!armed_ || completed_) return;
+      // A staged root carries the outer transaction's publication decision.
+      // No later command may commit that decision after this command failed,
+      // including when its coordinator lives on another healthy worker.
+      store_.write_failed_ = true;
+      if (tx_ != nullptr && tx_->grouped_decision_ != nullptr) {
+        tx_->grouped_decision_->FailPending();
+      }
+    }
+  } grouped_root_guard{store, tx};
   if ((txid != 0 && (tx == nullptr || for_defrag)) ||
       (kind == RecordKind::kTxCommit && txid == 0)) {
     co_return absl::InvalidArgumentError(
@@ -1898,8 +2282,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "inline string length mismatch");
   }
-  const std::size_t record_header_bytes =
-      RecordHeaderBytes(key.size(), key_external, txid != 0, expire_at_ms != 0);
+  const std::size_t record_header_bytes = RecordHeaderBytes(
+      key.size(), key_external, txid != 0, expire_at_ms != 0, auxiliary);
   const std::size_t payload_bytes =
       value.size() + (key_external && !external ? key.size() : 0);
   const std::size_t total_disk_bytes =
@@ -1924,16 +2308,11 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                                         : &PartitionForKey(store, key));
   assert(known_partition == nullptr || known_partition->id_ == RedisSlot(key));
   RecordIndex* index_ptr =
-      explicit_root != nullptr
+      auxiliary ? nullptr
+      : explicit_root != nullptr
           ? explicit_root->index_
           : (partition_ptr == nullptr ? nullptr
                                       : &partition_ptr->indexes_[db_id]);
-  auto allocated_lsn = AllocateLsn(store);
-  if (!allocated_lsn.ok()) {
-    co_return allocated_lsn.status();
-  }
-  const std::uint64_t lsn = *allocated_lsn;
-
   const bool transaction_append = txid != 0;
   const std::uint64_t tx_generation =
       transaction_append && tx != nullptr ? tx->generation_ : 0;
@@ -1943,6 +2322,18 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   }
   const BlockKind append_block_kind =
       transaction_append ? BlockKind::kTransaction : BlockKind::kRecords;
+  KEYLANE_FAULT_INJECT(
+      if (!for_defrag && !key.empty() &&
+          KEYLANE_FAULT_MATCHES("KEYLANE_RECORD_WRITE_PAUSE_KEY", key)) {
+        // A deterministic publication-order race: let GC publish the previous
+        // value while this foreground append has not acquired its final stream.
+        spdlog::info("record write publication pause armed");
+        store.store_state_mutex_.Unlock(*store.worker_);
+        auto paused = co_await celer::SleepFor(*store.worker_,
+                                               std::chrono::milliseconds(1000));
+        co_await store.store_state_mutex_.Lock();
+        if (!paused.ok()) co_return paused;
+      });
   // Never keep a flat_hash_map value reference across an await that can
   // release store_state_mutex_. Another transaction may install a different
   // generation and rehash active_tx_blocks_ while block allocation is in
@@ -1971,6 +2362,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     }
     co_return returned;
   };
+  std::unique_ptr<GroupedRetirementPins> grouped_dependency_pins;
 acquire_active_stream:
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
   while (!active_stream().has_value() ||
@@ -2149,8 +2541,8 @@ acquire_active_stream:
       previous_entry = *resolved;
     }
   }
-  if (relocation != nullptr && partition_ptr != nullptr &&
-      (DbEpoch(db_id) != relocation->db_epoch_ ||
+  if (!auxiliary && relocation != nullptr && partition_ptr != nullptr &&
+      (EffectiveRecordDbEpoch(*partition_ptr, db_id) != relocation->db_epoch_ ||
        partition_ptr->replication_epoch_ != relocation->replication_epoch_ ||
        store.index_generations_[db_id] != relocation->index_generation_ ||
        previous_entry == nullptr ||
@@ -2160,10 +2552,12 @@ acquire_active_stream:
   }
   if (explicit_root != nullptr && explicit_root->reject_older_sequence_ &&
       previous_entry != nullptr &&
-      previous_entry->value_.mutation_sequence_ >= mutation_sequence) {
+      (previous_entry->value_.mutation_sequence_ > mutation_sequence ||
+       (!explicit_root->allow_equal_sequence_ &&
+        previous_entry->value_.mutation_sequence_ == mutation_sequence))) {
     co_return absl::OkStatus();
   }
-  if (!for_defrag && partition_ptr != nullptr &&
+  if (!auxiliary && !for_defrag && partition_ptr != nullptr &&
       partition_ptr->rdb_snapshot_.has_value()) [[unlikely]] {
     // The capture stores only physical metadata and pins. It may release the
     // store mutex while pinning a block owned by another worker, so resolve
@@ -2181,9 +2575,60 @@ acquire_active_stream:
     }
     if (explicit_root != nullptr && explicit_root->reject_older_sequence_ &&
         previous_entry != nullptr &&
-        previous_entry->value_.mutation_sequence_ >= mutation_sequence) {
+        (previous_entry->value_.mutation_sequence_ > mutation_sequence ||
+         (!explicit_root->allow_equal_sequence_ &&
+          previous_entry->value_.mutation_sequence_ == mutation_sequence))) {
       co_return absl::OkStatus();
     }
+  }
+  if (!for_defrag && previous_entry != nullptr &&
+      previous_entry->value_.grouped()) {
+    auto old_view = partition_ptr->grouped_objects_[db_id].Lookup(
+        key,
+        GroupedObjectVersion{
+            .root_ = MaterializeIndexLocation(*previous_entry),
+            .db_epoch_ = EffectiveRecordDbEpoch(*partition_ptr, db_id),
+            .replication_epoch_ = partition_ptr->replication_epoch_,
+            .index_generation_ = partition_ptr->grouped_generations_[db_id],
+        },
+        /*allow_failed=*/replacement_undo != nullptr);
+    if (!old_view.ok()) co_return old_view.status();
+    auto pinned = co_await PrepinGroupedRetirementsLocked(
+        store, *old_view,
+        grouped_root && group->root_incarnation_ == (*old_view)->incarnation()
+            ? std::optional(group->changed_groups_)
+            : std::nullopt,
+        tx != nullptr, &grouped_dependency_pins);
+    if (!pinned.ok()) {
+      if (absl::IsAborted(pinned)) goto acquire_active_stream;
+      co_return pinned;
+    }
+    KEYLANE_FAULT_INJECT(if (KEYLANE_FAULT_MATCHES(
+                                 "KEYLANE_GROUP_ROOT_PIN_PAUSE_KEY", key) &&
+                             tx != nullptr) {
+      static std::atomic<bool> root_pin_pause_claimed{false};
+      if (!root_pin_pause_claimed.exchange(true, std::memory_order_relaxed)) {
+        const RecordLocation root = (*old_view)->version().root_;
+        const bool retained =
+            grouped_dependency_pins != nullptr &&
+            grouped_dependency_pins->Contains(RetiredRecordOf(root));
+        // Unlike a changed-page pin in the same transaction block, this must
+        // also hold for a metadata-only root update with zero touched pages.
+        if (!root.tx_tagged() || !retained)
+          co_return absl::InternalError("test root dependency was not pinned");
+        spdlog::info(
+            "group root dependency pause owner={} key-owner={} pinned=1",
+            root.block_owner(), store.worker_->id());
+        store.store_state_mutex_.Unlock(*store.worker_);
+        auto paused = co_await celer::SleepFor(*store.worker_,
+                                               std::chrono::milliseconds(1000));
+        co_await store.store_state_mutex_.Lock();
+        if (!paused.ok()) co_return paused;
+      }
+    });
+    auto resolved = co_await FindVerifiedEntry(store, *index_ptr, digest, key);
+    if (!resolved.ok()) co_return resolved.status();
+    previous_entry = *resolved;
   }
   // FindVerifiedEntry and the RDB old-value capture may release the store
   // mutex. Another writer can fill and seal this worker's append stream while
@@ -2207,7 +2652,7 @@ acquire_active_stream:
     co_return absl::ResourceExhaustedError(
         "record index entry page capacity exhausted");
   }
-  if (tx != nullptr && tx->collect_undo_) {
+  if (!auxiliary && tx != nullptr && tx->collect_undo_) {
     const auto undo = store.tx_undo_.find(txid);
     if (undo != store.tx_undo_.end() &&
         !undo->second.CanTrack(previous_entry)) {
@@ -2227,7 +2672,8 @@ acquire_active_stream:
       if (!index_memory_reservation.has_value()) {
         RecordMemoryRejection();
         co_return absl::ResourceExhaustedError(
-            "record index allocation exceeds this worker's maxmemory share");
+            "OOM record index allocation exceeds this worker's maxmemory "
+            "share");
       }
     }
   }
@@ -2245,7 +2691,6 @@ acquire_active_stream:
   const std::uint32_t record_offset = updated.committed_bytes_;
   updated.committed_bytes_ += static_cast<std::uint32_t>(total_disk_bytes);
   ++updated.record_count_;
-  updated.max_lsn_ = std::max(updated.max_lsn_, lsn);
 
   BlockState* state_ptr = FindBlockState(store, updated.block_id_);
   if (state_ptr == nullptr) {
@@ -2269,10 +2714,124 @@ acquire_active_stream:
     co_return absl::Status(absl::StatusCode::kInternal,
                            "invalid active staging block");
   }
+  if (grouped_root && group->prepare_root_) {
+    const RecordLocation provisional(
+        updated.block_id_, mutation_sequence, updated.allocation_epoch_,
+        expire_at_ms, static_cast<std::uint32_t>(logical_size),
+        RecordLocation::PackedMetadata::Encode(
+            record_offset, static_cast<std::uint32_t>(total_disk_bytes),
+            writer_id, true, external, key_external, false, false, txid != 0,
+            kind, value_type, expire_at_ms != 0, true));
+    const auto prepared = group->prepare_root_(GroupedObjectVersion{
+        .root_ = provisional,
+        .db_epoch_ = explicit_root != nullptr
+                         ? explicit_root->db_epoch_
+                         : EffectiveRecordDbEpoch(*partition_ptr, db_id),
+        .replication_epoch_ = explicit_root != nullptr
+                                  ? explicit_root->replication_epoch_
+                                  : partition_ptr->replication_epoch_,
+        .index_generation_ = partition_ptr->grouped_generations_[db_id],
+    });
+    if (!prepared.ok()) co_return prepared;
+  }
+  GroupedHashObject::Handle previous_grouped;
+  std::shared_ptr<std::vector<RetiredRecord>> grouped_retirements;
+  std::shared_ptr<std::vector<RetiredRecord>> grouped_abort_retirements;
+  GroupedHashObject::Handle replacement_grouped =
+      grouped_root ? GroupedHashObject::Handle(*group->prepared_root_)
+                   : nullptr;
+  auto touched_groups =
+      grouped_root ? std::optional(group->changed_groups_) : std::nullopt;
+  if (!for_defrag && previous && previous->grouped()) {
+    auto old_view = partition_ptr->grouped_objects_[db_id].Lookup(
+        key,
+        GroupedObjectVersion{
+            .root_ = *previous,
+            .db_epoch_ = EffectiveRecordDbEpoch(*partition_ptr, db_id),
+            .replication_epoch_ = partition_ptr->replication_epoch_,
+            .index_generation_ = partition_ptr->grouped_generations_[db_id],
+        },
+        /*allow_failed=*/replacement_undo != nullptr);
+    if (!old_view.ok()) co_return old_view.status();
+    previous_grouped = std::move(*old_view);
+    if (tx != nullptr && previous->tx_tagged() &&
+        (grouped_dependency_pins == nullptr ||
+         !grouped_dependency_pins->Contains(RetiredRecordOf(*previous)))) {
+      // The physical root can move independently of every unchanged child,
+      // including during a TTL-only write. Re-enter the pre-stage owner-hop
+      // protocol instead of borrowing the new block's transaction identity.
+      goto acquire_active_stream;
+    }
+    if (tx != nullptr) {
+      // Replacing a grouped graph also needs a shared failure decision: the
+      // top-level root may be compact, but its old graph is still atomic.
+      auto decision = PrepareGroupedDecision(*tx);
+      if (!decision.ok()) co_return decision.status();
+    }
+    if (replacement_grouped != nullptr &&
+        previous_grouped->incarnation() != replacement_grouped->incarnation())
+      touched_groups.reset();
+    auto retired = CollectGroupedRetirements(
+        previous_grouped, replacement_grouped, touched_groups);
+    if (!retired.ok()) co_return retired.status();
+    for (const auto& child : *retired) {
+      if (child.tx_tagged_ && (grouped_dependency_pins == nullptr ||
+                               !grouped_dependency_pins->Contains(child))) {
+        // A physical-only relocation won during pinning/index resolution.
+        // Nothing is staged yet; re-pin the new identity before re-entering
+        // this non-suspending root publication section.
+        goto acquire_active_stream;
+      }
+    }
+    if (!retired->empty())
+      grouped_retirements =
+          std::make_shared<std::vector<RetiredRecord>>(std::move(*retired));
+  }
+  if (!for_defrag && tx != nullptr && tx->collect_undo_ &&
+      replacement_grouped != nullptr) {
+    auto discarded = CollectGroupedRetirements(
+        replacement_grouped, previous_grouped, touched_groups);
+    if (!discarded.ok()) co_return discarded.status();
+    if (!discarded->empty())
+      grouped_abort_retirements =
+          std::make_shared<std::vector<RetiredRecord>>(std::move(*discarded));
+  }
+  if (grouped_retirements != nullptr) {
+    // Capacity is admitted before the first staged byte. All later routing
+    // consists only of moves/copies into these preallocated receipt vectors.
+    if (tx != nullptr) {
+      tx->retirements_.reserve(tx->retirements_.size() +
+                               grouped_retirements->size() + 1);
+    } else {
+      if (commit_retirements == nullptr)
+        commit_retirements = std::make_unique<std::vector<RetiredRecord>>();
+      commit_retirements->reserve(commit_retirements->size() +
+                                  grouped_retirements->size());
+    }
+  }
+  // FinalizeRoot requires exclusive ownership of its unpublished builder.
+  // These temporary const aliases were used only for fallible preparation.
+  replacement_grouped.reset();
+  // Assign the physical tie-breaker only after the final suspension/retry.
+  // In particular, GC may publish the old value while a foreground replay
+  // write waits for allocation. Reserving this LSN before that wait would let
+  // the old GC copy outrank the later publication at the same command seq.
+  // From here through index/side publication the owner never yields.
+  auto allocated_lsn = AllocateLsn(store);
+  if (!allocated_lsn.ok()) co_return allocated_lsn.status();
+  const std::uint64_t lsn = *allocated_lsn;
+  updated.max_lsn_ = std::max(updated.max_lsn_, lsn);
+  KEYLANE_FAULT_INJECT(
+      if (!auxiliary &&
+          KEYLANE_FAULT_MATCHES("KEYLANE_RECORD_WRITE_PAUSE_KEY", key)) {
+        spdlog::info("record publication test type={} lsn={}",
+                     static_cast<unsigned>(value_type), lsn);
+      });
   // The encoder overwrites the complete header and the copies below overwrite
   // the complete payload. Preserve deterministic on-disk padding without
   // clearing those bytes twice on every append.
   const std::size_t encoded_record_bytes = record_header_bytes + payload_bytes;
+  grouped_root_guard.armed_ = grouped_root || previous_grouped != nullptr;
   std::fill_n(staging.data_ + record_offset + encoded_record_bytes,
               total_disk_bytes - encoded_record_bytes, std::byte{0});
   RecordHeader record{
@@ -2282,6 +2841,13 @@ acquire_active_stream:
       .value_type_ = value_type,
       .external_ = external,
       .key_external_ = key_external,
+      .grouped_ = grouped_root,
+      .hash_group_ = auxiliary,
+      .group_retired_ = auxiliary && group->retired_,
+      .group_incarnation_ = auxiliary ? group->incarnation_ : 0,
+      .group_prefix_ = auxiliary ? group->id_.prefix_ : 0,
+      .group_prefix_bits_ = auxiliary ? group->id_.bits_ : std::uint8_t{0},
+      .group_batch_txid_ = auxiliary ? group->batch_txid_ : 0,
       .key_bytes_ = static_cast<std::uint32_t>(key.size()),
       .logical_size_ = static_cast<std::uint32_t>(logical_size),
       .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
@@ -2296,10 +2862,14 @@ acquire_active_stream:
       // fresh read: worker 0 publishes a FLUSHDB epoch concurrently, and a
       // fresh read here could adopt it mid-append — turning a record
       // recovery must drop into one it must keep.
-      .db_epoch_ = explicit_root != nullptr
-                       ? explicit_root->db_epoch_
-                       : (relocation != nullptr ? relocation->db_epoch_
-                                                : DbEpoch(db_id)),
+      .db_epoch_ =
+          explicit_root != nullptr
+              ? explicit_root->db_epoch_
+              : (relocation != nullptr
+                     ? relocation->db_epoch_
+                     : (partition_ptr != nullptr
+                            ? EffectiveRecordDbEpoch(*partition_ptr, db_id)
+                            : DbEpoch(db_id))),
       .mutation_sequence_ = mutation_sequence,
       .expire_at_ms_ = expire_at_ms,
       .lsn_ = lsn,
@@ -2362,10 +2932,10 @@ acquire_active_stream:
           // Commit records never enter the key index. Their temporary
           // RecordLocation is used only to request the destination block's
           // flush, so encode the packed, index-only type state as its empty
-          // default rather than spending one of the four remaining reserve
+          // default rather than spending one of the remaining reserve
           // bits.
-          kind == RecordKind::kTxCommit ? RecordKind::kValue : kind,
-          value_type));
+          kind == RecordKind::kTxCommit ? RecordKind::kValue : kind, value_type,
+          expire_at_ms != 0, grouped_root));
   if (transaction_append) {
     NoteTxRecordLocal(store, updated.block_id_, updated.allocation_epoch_,
                       tx_generation, txid, location.total_disk_bytes(),
@@ -2376,6 +2946,42 @@ acquire_active_stream:
   const bool is_live = kind == RecordKind::kValue;
   const bool was_expiring = was_live && previous->expire_at_ms_ != 0;
   const bool is_expiring = is_live && expire_at_ms != 0;
+  if (grouped_root) {
+    GroupedObjectVersion version{
+        .root_ = location,
+        .db_epoch_ = record.db_epoch_,
+        .replication_epoch_ = record.replication_epoch_,
+        .index_generation_ = partition_ptr->grouped_generations_[db_id],
+        .decision_ = tx != nullptr ? tx->grouped_decision_ : nullptr,
+    };
+    absl::Status finalized;
+    if (for_defrag) {
+      auto current = partition_ptr->grouped_objects_[db_id].Lookup(
+          key,
+          GroupedObjectVersion{
+              .root_ = *previous,
+              .db_epoch_ = record.db_epoch_,
+              .replication_epoch_ = record.replication_epoch_,
+              .index_generation_ = partition_ptr->grouped_generations_[db_id],
+          });
+      if (current.ok()) version.decision_ = (*current)->version().decision_;
+      finalized = current.ok() ? GroupedHashObject::FinalizeRootRelocation(
+                                     *group->prepared_root_, *current, version)
+                               : current.status();
+      if (finalized.ok()) {
+        finalized = group->publication_->RefreshExpected(*current);
+      }
+    } else {
+      finalized =
+          GroupedHashObject::FinalizeRoot(*group->prepared_root_, version);
+    }
+    if (!finalized.ok()) {
+      // This can only be an internal contract violation after the validated
+      // builder was admitted. Never acknowledge a root without its view.
+      store.write_failed_ = true;
+      co_return finalized;
+    }
+  }
   RecordIndex::Entry* inserted_entry = nullptr;
   if (index_ptr != nullptr) {
     if (previous_entry != nullptr) {
@@ -2410,11 +3016,57 @@ acquire_active_stream:
       store.external_manifests_.erase(inserted_entry);
     }
   }
+  if (grouped_root) {
+    auto published = group->publication_->Commit(*group->prepared_root_);
+    if (!published.ok()) {
+      store.write_failed_ = true;
+      co_return published;
+    }
+  } else if (previous_grouped != nullptr) {
+    const bool retain_undo_slot =
+        (tx != nullptr && tx->collect_undo_) || replacement_undo != nullptr;
+    auto removed =
+        retain_undo_slot
+            ? partition_ptr->grouped_objects_[db_id].ClearKeepingSlot(
+                  key, previous_grouped)
+            : partition_ptr->grouped_objects_[db_id].Erase(key,
+                                                           previous_grouped);
+    if (!removed.ok()) {
+      store.write_failed_ = true;
+      co_return removed;
+    }
+  }
   const bool route_to_commit = tx != nullptr && previous.has_value();
   const bool dependency_pinned =
-      route_to_commit && PinTxDependencyLocal(store, *previous);
+      route_to_commit &&
+      (previous_grouped != nullptr
+           ? (grouped_dependency_pins != nullptr &&
+              grouped_dependency_pins->Take(RetiredRecordOf(*previous)))
+           : PinTxDependencyLocal(store, *previous));
   const bool defer_defrag_retirement =
       for_defrag && commit_retirements != nullptr;
+  if (grouped_retirements != nullptr) {
+    for (auto& child : *grouped_retirements) {
+      child.dependency_pinned_ = grouped_dependency_pins != nullptr &&
+                                 grouped_dependency_pins->Take(child);
+      if (tx != nullptr) {
+        tx->retirements_.push_back(TxShardWrites::Retired{
+            .block_id_ = child.block_id_,
+            .allocation_epoch_ = child.allocation_epoch_,
+            .total_disk_bytes_ = child.total_disk_bytes_,
+            .block_owner_ = child.block_owner_,
+            .record_offset_ = child.record_offset_,
+            .tx_tagged_ = child.tx_tagged_,
+            .dependency_pinned_ = child.dependency_pinned_,
+            .dependent_extents_ = child.dependent_extents_,
+            .immediate_extents_ = child.immediate_extents_,
+            .retained_owner_ = child.retained_owner_,
+        });
+      } else {
+        commit_retirements->push_back(child);
+      }
+    }
+  }
   store.staged_records_[updated.block_id_].push_back(RecordIdentity{
       .entry_address_ = reinterpret_cast<std::uintptr_t>(inserted_entry),
       .retired_extents_ = (!for_defrag || defer_defrag_retirement) &&
@@ -2448,6 +3100,10 @@ acquire_active_stream:
         .entry_handle_ = *entry_handle,
         .previous_ = previous,
         .previous_extents_ = previous_extents,
+        .previous_grouped_ = previous_grouped,
+        .previous_dependency_pinned_ = dependency_pinned,
+        .previous_grouped_retirements_ = grouped_retirements,
+        .applied_grouped_retirements_ = grouped_abort_retirements,
         .db_id_ = db_id,
     });
   }
@@ -2491,7 +3147,7 @@ acquire_active_stream:
       });
     }
   }
-  if (was_live != is_live) {
+  if (!auxiliary && was_live != is_live) {
     if (is_live) {
       if (explicit_root != nullptr) {
         ++*explicit_root->live_key_count_;
@@ -2514,7 +3170,7 @@ acquire_active_stream:
       }
     }
   }
-  if (was_expiring != is_expiring) {
+  if (!auxiliary && was_expiring != is_expiring) {
     if (is_expiring) {
       if (explicit_root != nullptr) {
         ++*explicit_root->expiring_key_count_;
@@ -2562,6 +3218,7 @@ acquire_active_stream:
     *written_location = location;
   }
   if (trace != nullptr) trace->index_done_ns_ = SetTraceNowNanos();
+  grouped_root_guard.completed_ = true;
   co_return absl::OkStatus();
 }
 

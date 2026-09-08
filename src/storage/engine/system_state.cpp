@@ -460,35 +460,37 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
     co_return absl::FailedPreconditionError(
         "system-state root write ran on the wrong worker");
   }
-  // Deterministically exercise the multi-device ambiguous-commit branch.
-  // Format: <device-index>:<root-generation>, consumed at most once.
-  if (const char* configured =
-          std::getenv("KEYLANE_FAIL_SYSTEM_STATE_ROOT_ONCE");
-      configured != nullptr) {
-    const std::string_view value(configured);
-    const std::size_t separator = value.find(':');
-    std::size_t configured_device = 0;
-    std::uint64_t configured_generation = 0;
-    const auto device = std::from_chars(
-        value.data(), value.data() + std::min(separator, value.size()),
-        configured_device);
-    const char* generation_begin = separator == std::string_view::npos
-                                       ? value.data() + value.size()
-                                       : value.data() + separator + 1;
-    const auto generation = std::from_chars(
-        generation_begin, value.data() + value.size(), configured_generation);
-    if (separator != std::string_view::npos && device.ec == std::errc{} &&
-        device.ptr == value.data() + separator &&
-        generation.ec == std::errc{} &&
-        generation.ptr == value.data() + value.size() &&
-        configured_device == device_index &&
-        configured_generation == root.generation_ &&
-        !system_state_root_failure_injected_.exchange(
-            true, std::memory_order_acq_rel)) {
-      co_return absl::UnavailableError(
-          "injected system-state root write failure");
-    }
-  }
+  KEYLANE_FAULT_INJECT(
+      // Deterministically exercise the multi-device ambiguous-commit branch.
+      // Format: <device-index>:<root-generation>, consumed at most once.
+      if (const char* configured =
+              std::getenv("KEYLANE_FAIL_SYSTEM_STATE_ROOT_ONCE");
+          configured != nullptr) {
+        const std::string_view value(configured);
+        const std::size_t separator = value.find(':');
+        std::size_t configured_device = 0;
+        std::uint64_t configured_generation = 0;
+        const auto device = std::from_chars(
+            value.data(), value.data() + std::min(separator, value.size()),
+            configured_device);
+        const char* generation_begin = separator == std::string_view::npos
+                                           ? value.data() + value.size()
+                                           : value.data() + separator + 1;
+        const auto generation =
+            std::from_chars(generation_begin, value.data() + value.size(),
+                            configured_generation);
+        if (separator != std::string_view::npos && device.ec == std::errc{} &&
+            device.ptr == value.data() + separator &&
+            generation.ec == std::errc{} &&
+            generation.ptr == value.data() + value.size() &&
+            configured_device == device_index &&
+            configured_generation == root.generation_ &&
+            !system_state_root_failure_injected_.exchange(
+                true, std::memory_order_acq_rel)) {
+          co_return absl::UnavailableError(
+              "injected system-state root write failure");
+        }
+      });
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
   if (!acquired.ok()) co_return acquired.status();

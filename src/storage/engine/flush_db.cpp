@@ -284,7 +284,8 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
   ++store.index_generations_[db_id];
   for (auto& partition : store.partitions_) {
     auto& index = partition.indexes_[db_id];
-    QueueDetachedIndex(store, index, db_id);
+    ++partition.grouped_generations_[db_id];
+    QueueDetachedIndex(store, index, db_id, &partition.grouped_objects_[db_id]);
     partition.fullsync_coverage_bytes_[db_id] = 0;
     partition.live_key_count_[db_id] = 0;
     partition.expiring_key_count_[db_id] = 0;
@@ -300,11 +301,16 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
 
 void StorageEngine::Impl::QueueDetachedIndex(WorkerStore& store,
                                              RecordIndex& index,
-                                             std::uint8_t db_id) {
-  if (!index.has_allocated_storage()) return;
+                                             std::uint8_t db_id,
+                                             GroupedObjectIndex* grouped) {
+  const bool has_groups = grouped != nullptr && !grouped->empty();
+  if (!index.has_allocated_storage() && !has_groups) return;
   store.detached_indexes_.push_back(DetachedIndex{
       .index_ = index.Detach(),
       .db_id_ = db_id,
+      .grouped_ = has_groups
+                      ? std::optional<GroupedObjectIndex>(grouped->Detach())
+                      : std::nullopt,
   });
 }
 
@@ -333,7 +339,8 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     // released as a unit, so they are collected per record rather than
     // folded into the per-block totals.
     std::vector<std::shared_ptr<const std::vector<ExtentRef>>> dead_extents;
-    detached.index_.ForEach([&](const RecordIndex::Entry& entry) {
+    const auto accumulate_record = [&](const RecordIndex::Entry& entry,
+                                       const ExtentManifest& manifest) {
       const RecordLocation location = MaterializeIndexLocation(entry);
       BlockDelta& delta = dead_by_block[std::pair(location.block_id(),
                                                   location.allocation_epoch())];
@@ -342,18 +349,57 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
       if (entry.value_.tx_tagged()) {
         delta.tagged_bytes_ += entry.value_.total_disk_bytes();
       }
-      if (entry.value_.external()) {
-        auto manifest = store.external_manifests_.find(&entry);
-        if (manifest != store.external_manifests_.end()) {
-          if (entry.value_.key_external()) [[unlikely]] {
-            delta.dependent_extents_.push_back(std::move(manifest->second));
-          } else {
-            dead_extents.push_back(std::move(manifest->second));
-          }
-          store.external_manifests_.erase(manifest);
+      if (manifest) {
+        // External parent-key bytes are needed to decode surviving source
+        // records during a cold scan, even after their logical population is
+        // detached. Keep their entire manifest dependent on source retirement.
+        // Value-only children can enter the ordinary pinned extent reclaim.
+        if (entry.value_.key_external()) [[unlikely]] {
+          delta.dependent_extents_.push_back(manifest);
+        } else {
+          dead_extents.push_back(manifest);
         }
       }
+    };
+    detached.index_.ForEach([&](const RecordIndex::Entry& entry) {
+      if (!entry.value_.external()) {
+        accumulate_record(entry, nullptr);
+        return;
+      }
+      auto manifest = store.external_manifests_.find(&entry);
+      accumulate_record(entry, manifest == store.external_manifests_.end()
+                                   ? nullptr
+                                   : manifest->second);
+      if (manifest != store.external_manifests_.end()) {
+        store.external_manifests_.erase(manifest);
+      }
     });
+    absl::Status grouped_status = absl::OkStatus();
+    if (detached.grouped_) {
+      detached.grouped_->ForEach([&](std::string_view, const auto& object) {
+        if (!object) {
+          // Undo may retain an admitted empty slot after grouped->compact
+          // replacement. The root and its journal own all physical records;
+          // a null reservation contributes metadata capacity, not a graph.
+          return;
+        }
+        object->ForEachRecord([&](HashGroupId, const RecordIndex::Entry& entry,
+                                  const ExtentManifest& manifest, bool) {
+          if (entry.value_.external() != static_cast<bool>(manifest)) {
+            grouped_status = absl::InternalError(
+                "detached group lost its external extent manifest");
+            return;
+          }
+          // Retired parent markers are physical live records too. Omitting
+          // them leaks both block live bytes and transaction-generation tags.
+          accumulate_record(entry, manifest);
+        });
+      });
+    }
+    if (!grouped_status.ok()) {
+      store.write_failed_ = true;
+      co_return grouped_status;
+    }
 
     for (const auto& extents : dead_extents) {
       SpawnExtentReclaim(store, extents);

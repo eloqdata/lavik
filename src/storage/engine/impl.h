@@ -30,6 +30,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "../ring_buffer.h"
@@ -41,7 +42,14 @@
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/sync.h"
 #include "celer/runtime/worker.h"
+#include "keylane/fault_injection.h"
 #include "keylane/memory.h"
+#include "keylane/storage/detail/compact_write.h"
+#include "keylane/storage/detail/grouped_object_index.h"
+#include "keylane/storage/detail/hash_codec.h"
+#include "keylane/storage/detail/record_index.h"
+#include "keylane/storage/detail/record_payload_cursor.h"
+#include "keylane/storage/detail/replica_collection_stage.h"
 #include "keylane/storage/format.h"
 #include "keylane/storage/scan_hash_map.h"
 #include "keylane/storage/tx_cleaner.h"
@@ -83,576 +91,7 @@ class UnlockGuard {
 
 using ExtentManifest = std::shared_ptr<const std::vector<ExtentRef>>;
 
-struct HashEntry {
-  Digest digest_{};
-  std::string field_;
-  std::string value_;
-};
-
-struct HashValue {
-  std::vector<HashEntry> entries_;
-};
-absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload);
-absl::StatusOr<std::string> EncodeHashValue(const HashValue& bucket);
-
-class RecordIndexValue;
-
-struct RecordLocationCore {
-  // Runtime block identities need only the 27-bit local block id plus the
-  // 16-bit configured device id. Pairing those 43 bits with a 53-bit
-  // allocation epoch removes four bytes without weakening any practical
-  // reuse horizon: at 8 MiB per allocation, the epoch spans 64 ZiB per
-  // device. The durable format retains both original 64-bit fields.
-  static constexpr unsigned kBlockIdBits = kLocalBlockIdBits + 16;
-  static constexpr unsigned kAllocationEpochBits = 53;
-  static constexpr unsigned kAllocationEpochLowBits = 64 - kBlockIdBits;
-  static constexpr std::uint64_t kBlockIdMask =
-      (std::uint64_t{1} << kBlockIdBits) - 1;
-  static constexpr std::uint64_t kAllocationEpochMask =
-      (std::uint64_t{1} << kAllocationEpochBits) - 1;
-
-  static_assert(kBlockIdBits == 43);
-  static_assert(kAllocationEpochLowBits == 21);
-  static_assert(kAllocationEpochBits - kAllocationEpochLowBits == 32);
-
-  // Offsets and record lengths are always 8-byte aligned inside an 8 MiB
-  // block, so storing their alignment units preserves their complete range in
-  // 20 bits each. The owner is process-local and InitMemoryLimit caps a
-  // process at 1024 workers. Keep this as an explicitly masked runtime word,
-  // rather than C++ bit-fields, so layout and overflow behavior are auditable.
-  // One of the former five reserve bits discriminates the optional expiring
-  // entry subtype. Four high bits remain for future hot-path state; uncommon
-  // state should use a sparse side table instead of widening every key.
-  class PackedMetadata {
-   public:
-    static constexpr unsigned kOffsetBits = 20;
-    static constexpr unsigned kLengthBits = 20;
-    static constexpr unsigned kOwnerBits = 10;
-    static constexpr unsigned kStateBits = 10;
-    static constexpr unsigned kReservedBits = 4;
-
-    static constexpr unsigned kLengthShift = kOffsetBits;
-    static constexpr unsigned kOwnerShift = kLengthShift + kLengthBits;
-    static constexpr unsigned kInMemoryShift = kOwnerShift + kOwnerBits;
-    static constexpr unsigned kExternalShift = kInMemoryShift + 1;
-    static constexpr unsigned kKeyExternalShift = kExternalShift + 1;
-    static constexpr unsigned kShieldingShift = kKeyExternalShift + 1;
-    static constexpr unsigned kUnclaimedShift = kShieldingShift + 1;
-    static constexpr unsigned kTxTaggedShift = kUnclaimedShift + 1;
-    static constexpr unsigned kTypeCodeShift = kTxTaggedShift + 1;
-    static constexpr unsigned kHasExpiryShift = kTypeCodeShift + 3;
-
-    static constexpr std::uint64_t kOffsetMask =
-        (std::uint64_t{1} << kOffsetBits) - 1;
-    static constexpr std::uint64_t kLengthMask =
-        (std::uint64_t{1} << kLengthBits) - 1;
-    static constexpr std::uint64_t kOwnerMask =
-        (std::uint64_t{1} << kOwnerBits) - 1;
-    static constexpr std::uint64_t kTypeCodeMask = 0x7;
-    static constexpr std::uint8_t kTombstoneTypeCode = 0x7;
-
-    static_assert(kStorageBlockBytes / kRecordAlignment - 1 <= kOffsetMask);
-    static_assert((kStorageBlockBytes - kBlockHeaderBytes) / kRecordAlignment <=
-                  kLengthMask);
-    static_assert(kMaxMemoryWorkers <= (std::uint64_t{1} << kOwnerBits));
-
-    static PackedMetadata Encode(std::uint32_t record_offset,
-                                 std::uint32_t total_disk_bytes,
-                                 std::uint16_t block_owner, bool in_memory,
-                                 bool external, bool key_external,
-                                 bool shielding, bool unclaimed, bool tx_tagged,
-                                 RecordKind kind, ValueType value_type,
-                                 bool has_expiry = false) noexcept {
-      assert(record_offset % kRecordAlignment == 0);
-      assert(total_disk_bytes % kRecordAlignment == 0);
-      assert((record_offset / kRecordAlignment) <= kOffsetMask);
-      assert((total_disk_bytes / kRecordAlignment) <= kLengthMask);
-      assert(block_owner < kMaxMemoryWorkers);
-      assert(kind == RecordKind::kValue || kind == RecordKind::kTombstone);
-      assert(kind != RecordKind::kValue ||
-             static_cast<std::uint8_t>(value_type) < kTombstoneTypeCode);
-      assert(kind != RecordKind::kTombstone || value_type == ValueType::kNone);
-
-      const std::uint8_t type_code =
-          kind == RecordKind::kTombstone
-              ? kTombstoneTypeCode
-              : static_cast<std::uint8_t>(value_type);
-      std::uint64_t bits =
-          static_cast<std::uint64_t>(record_offset / kRecordAlignment) |
-          (static_cast<std::uint64_t>(total_disk_bytes / kRecordAlignment)
-           << kLengthShift) |
-          (static_cast<std::uint64_t>(block_owner) << kOwnerShift) |
-          (static_cast<std::uint64_t>(type_code) << kTypeCodeShift);
-      SetBit(&bits, kInMemoryShift, in_memory);
-      SetBit(&bits, kExternalShift, external);
-      SetBit(&bits, kKeyExternalShift, key_external);
-      SetBit(&bits, kShieldingShift, shielding);
-      SetBit(&bits, kUnclaimedShift, unclaimed);
-      SetBit(&bits, kTxTaggedShift, tx_tagged);
-      SetBit(&bits, kHasExpiryShift, has_expiry);
-      return PackedMetadata(bits);
-    }
-
-    std::uint32_t record_offset() const noexcept {
-      return static_cast<std::uint32_t>(bits_ & kOffsetMask) * kRecordAlignment;
-    }
-    std::uint32_t total_disk_bytes() const noexcept {
-      return static_cast<std::uint32_t>((bits_ >> kLengthShift) & kLengthMask) *
-             kRecordAlignment;
-    }
-    std::uint16_t block_owner() const noexcept {
-      return static_cast<std::uint16_t>((bits_ >> kOwnerShift) & kOwnerMask);
-    }
-    bool in_memory() const noexcept { return Bit(kInMemoryShift); }
-    bool external() const noexcept { return Bit(kExternalShift); }
-    bool key_external() const noexcept { return Bit(kKeyExternalShift); }
-    bool shielding() const noexcept { return Bit(kShieldingShift); }
-    bool unclaimed() const noexcept { return Bit(kUnclaimedShift); }
-    bool tx_tagged() const noexcept { return Bit(kTxTaggedShift); }
-    bool has_expiry() const noexcept { return Bit(kHasExpiryShift); }
-    RecordKind kind() const noexcept {
-      return type_code() == kTombstoneTypeCode ? RecordKind::kTombstone
-                                               : RecordKind::kValue;
-    }
-    ValueType value_type() const noexcept {
-      return type_code() == kTombstoneTypeCode
-                 ? ValueType::kNone
-                 : static_cast<ValueType>(type_code());
-    }
-
-    void set_in_memory(bool value) noexcept {
-      SetBit(&bits_, kInMemoryShift, value);
-    }
-    void set_shielding(bool value) noexcept {
-      SetBit(&bits_, kShieldingShift, value);
-    }
-    void set_unclaimed(bool value) noexcept {
-      SetBit(&bits_, kUnclaimedShift, value);
-    }
-    void set_tx_tagged(bool value) noexcept {
-      SetBit(&bits_, kTxTaggedShift, value);
-    }
-    void set_has_expiry(bool value) noexcept {
-      SetBit(&bits_, kHasExpiryShift, value);
-    }
-
-   private:
-    friend class RecordIndexValue;
-
-    explicit constexpr PackedMetadata(std::uint64_t bits) noexcept
-        : bits_(bits) {}
-
-    static void SetBit(std::uint64_t* bits, unsigned shift,
-                       bool value) noexcept {
-      const std::uint64_t mask = std::uint64_t{1} << shift;
-      *bits = value ? (*bits | mask) : (*bits & ~mask);
-    }
-    bool Bit(unsigned shift) const noexcept {
-      return (bits_ & (std::uint64_t{1} << shift)) != 0;
-    }
-    std::uint8_t type_code() const noexcept {
-      return static_cast<std::uint8_t>((bits_ >> kTypeCodeShift) &
-                                       kTypeCodeMask);
-    }
-
-    std::uint64_t bits_ = 0;
-  };
-
-  static_assert(PackedMetadata::kOffsetBits + PackedMetadata::kLengthBits +
-                    PackedMetadata::kOwnerBits + PackedMetadata::kStateBits +
-                    PackedMetadata::kReservedBits ==
-                64);
-
-  RecordLocationCore() noexcept = default;
-
-  RecordLocationCore(std::uint64_t block_id, std::uint64_t mutation_sequence,
-                     std::uint64_t allocation_epoch, std::uint32_t logical_size,
-                     PackedMetadata metadata) noexcept
-      : mutation_sequence_(mutation_sequence),
-        block_and_epoch_low_(
-            EncodeBlockAndEpochLow(block_id, allocation_epoch)),
-        allocation_epoch_high_(EncodeAllocationEpochHigh(allocation_epoch)),
-        logical_size_(logical_size),
-        metadata_(metadata) {
-    assert(CanEncodeBlockIdentity(block_id, allocation_epoch));
-  }
-
-  static constexpr bool CanEncodeBlockIdentity(
-      std::uint64_t block_id, std::uint64_t allocation_epoch) noexcept {
-    return block_id <= kBlockIdMask && allocation_epoch <= kAllocationEpochMask;
-  }
-
-  std::uint64_t mutation_sequence_ = 0;
-  // Low word: block id in bits [0, 42], low allocation-epoch bits in
-  // [43, 63]. The remaining 32 epoch bits sit beside logical_size_, filling
-  // what would otherwise be alignment padding before metadata_.
-  std::uint64_t block_and_epoch_low_ = 0;
-  std::uint32_t allocation_epoch_high_ = 0;
-  // Exact Redis-visible bytes/cardinality.
-  std::uint32_t logical_size_ = 0;
-  PackedMetadata metadata_ =
-      PackedMetadata::Encode(0, 0, 0, false, false, false, false, false, false,
-                             RecordKind::kValue, ValueType::kNone);
-
-  std::uint64_t block_id() const noexcept {
-    return block_and_epoch_low_ & kBlockIdMask;
-  }
-  std::uint64_t allocation_epoch() const noexcept {
-    return (block_and_epoch_low_ >> kBlockIdBits) |
-           (static_cast<std::uint64_t>(allocation_epoch_high_)
-            << kAllocationEpochLowBits);
-  }
-
-  std::uint32_t record_offset() const noexcept {
-    return metadata_.record_offset();
-  }
-  std::uint32_t total_disk_bytes() const noexcept {
-    return metadata_.total_disk_bytes();
-  }
-  std::uint16_t block_owner() const noexcept { return metadata_.block_owner(); }
-  bool in_memory() const noexcept { return metadata_.in_memory(); }
-  bool external() const noexcept { return metadata_.external(); }
-  bool key_external() const noexcept { return metadata_.key_external(); }
-  // True while an older, still-unexpired value of this key may survive on
-  // disk. Erasing this entry then would un-suppress that copy: recovery
-  // picks the newest surviving record, so the key would resurrect with the
-  // stale value. Propagates through every overwrite — tombstones included,
-  // since a superseded tombstone leaves the disk like any dead record — and
-  // is rebuilt exactly during recovery, which sees every surviving record.
-  bool shielding() const noexcept { return metadata_.shielding(); }
-  // Tomb-raider round state: set on candidates (tombstones, shielded values)
-  // when a round begins, cleared when the sweep finds an older on-disk
-  // record the entry still suppresses. Whatever survives the sweep
-  // unclaimed proved nothing on disk needs it. False outside rounds, and
-  // any overwrite resets it, exempting concurrently-touched keys.
-  bool unclaimed() const noexcept { return metadata_.unclaimed(); }
-  // The on-disk record carries a nonzero transaction id. Retirement uses the
-  // bit to remove its bytes from transaction-generation accounting; the
-  // 32-byte index core deliberately does not retain the full txid.
-  bool tx_tagged() const noexcept { return metadata_.tx_tagged(); }
-  bool has_expiry() const noexcept { return metadata_.has_expiry(); }
-  RecordKind kind() const noexcept { return metadata_.kind(); }
-  ValueType value_type() const noexcept { return metadata_.value_type(); }
-
-  void set_in_memory(bool value) noexcept { metadata_.set_in_memory(value); }
-  void set_shielding(bool value) noexcept { metadata_.set_shielding(value); }
-  void set_unclaimed(bool value) noexcept { metadata_.set_unclaimed(value); }
-  void set_tx_tagged(bool value) noexcept { metadata_.set_tx_tagged(value); }
-
-  bool SamePhysicalRecord(const RecordLocationCore& other) const noexcept {
-    return block_id() == other.block_id() &&
-           record_offset() == other.record_offset() &&
-           allocation_epoch() == other.allocation_epoch();
-  }
-
- private:
-  static constexpr std::uint64_t EncodeBlockAndEpochLow(
-      std::uint64_t block_id, std::uint64_t allocation_epoch) noexcept {
-    return (block_id & kBlockIdMask) |
-           ((allocation_epoch &
-             ((std::uint64_t{1} << kAllocationEpochLowBits) - 1))
-            << kBlockIdBits);
-  }
-
-  static constexpr std::uint32_t EncodeAllocationEpochHigh(
-      std::uint64_t allocation_epoch) noexcept {
-    return static_cast<std::uint32_t>(allocation_epoch >>
-                                      kAllocationEpochLowBits);
-  }
-};
-
-struct RecordLocation final : RecordLocationCore {
-  RecordLocation() noexcept = default;
-
-  RecordLocation(std::uint64_t block_id, std::uint64_t mutation_sequence,
-                 std::uint64_t allocation_epoch, std::uint64_t expire_at_ms,
-                 std::uint32_t logical_size, PackedMetadata metadata) noexcept
-      : RecordLocationCore(block_id, mutation_sequence, allocation_epoch,
-                           logical_size, metadata),
-        expire_at_ms_(expire_at_ms) {
-    metadata_.set_has_expiry(expire_at_ms != 0);
-  }
-
-  RecordLocation(const RecordLocationCore& core,
-                 std::uint64_t expire_at_ms) noexcept
-      : RecordLocationCore(core), expire_at_ms_(expire_at_ms) {
-    assert(has_expiry() == (expire_at_ms != 0));
-  }
-
-  std::uint64_t expire_at_ms_ = 0;
-};
-
-// The index retains only key-specific location state. A block's allocation
-// epoch and runtime owner are already stored once in its dense BlockState;
-// repeating them in every record from the same 8 MiB allocation would cost
-// another word per key. Callers materialize a full RecordLocation from this
-// value and the current BlockState before carrying the identity across an
-// await. Live-byte accounting keeps the allocation live while a current index
-// entry references one of its records, so the shared identity remains stable
-// for that operation.
-class RecordIndexValue {
- public:
-  static constexpr unsigned kBlockIdBits = RecordLocation::kBlockIdBits;
-  static constexpr unsigned kLogicalSizeBits = 30;
-  static constexpr unsigned kLogicalSizeLowBits = 64 - kBlockIdBits;
-  static constexpr unsigned kLogicalSizeHighBits =
-      kLogicalSizeBits - kLogicalSizeLowBits;
-  static constexpr unsigned kOffsetBits = 20;
-  static constexpr unsigned kLengthBits = 20;
-  static constexpr unsigned kStateBits = 10;
-  static constexpr unsigned kReservedBits =
-      64 - kLogicalSizeHighBits - kOffsetBits - kLengthBits - kStateBits;
-
-  static constexpr unsigned kOffsetShift = kLogicalSizeHighBits;
-  static constexpr unsigned kLengthShift = kOffsetShift + kOffsetBits;
-  static constexpr unsigned kInMemoryShift = kLengthShift + kLengthBits;
-  static constexpr unsigned kExternalShift = kInMemoryShift + 1;
-  static constexpr unsigned kKeyExternalShift = kExternalShift + 1;
-  static constexpr unsigned kShieldingShift = kKeyExternalShift + 1;
-  static constexpr unsigned kUnclaimedShift = kShieldingShift + 1;
-  static constexpr unsigned kTxTaggedShift = kUnclaimedShift + 1;
-  static constexpr unsigned kTypeCodeShift = kTxTaggedShift + 1;
-  static constexpr unsigned kHasExpiryShift = kTypeCodeShift + 3;
-
-  static constexpr std::uint64_t kBlockIdMask =
-      (std::uint64_t{1} << kBlockIdBits) - 1;
-  static constexpr std::uint64_t kLogicalSizeMask =
-      (std::uint64_t{1} << kLogicalSizeBits) - 1;
-  static constexpr std::uint64_t kLogicalSizeLowMask =
-      (std::uint64_t{1} << kLogicalSizeLowBits) - 1;
-  static constexpr std::uint64_t kLogicalSizeHighMask =
-      (std::uint64_t{1} << kLogicalSizeHighBits) - 1;
-  static constexpr std::uint64_t kOffsetMask =
-      (std::uint64_t{1} << kOffsetBits) - 1;
-  static constexpr std::uint64_t kLengthMask =
-      (std::uint64_t{1} << kLengthBits) - 1;
-  static constexpr std::uint8_t kTypeCodeMask = 0x7;
-  static constexpr std::uint8_t kTombstoneTypeCode = 0x7;
-
-  static_assert(kBlockIdBits == 43);
-  static_assert(kLogicalSizeLowBits == 21);
-  static_assert(kLogicalSizeHighBits == 9);
-  static_assert(kReservedBits == 5);
-  static_assert(kMaxBitmapBytes <= kLogicalSizeMask);
-  static_assert(kStorageBlockBytes / kRecordAlignment - 1 <= kOffsetMask);
-  static_assert((kStorageBlockBytes - kBlockHeaderBytes) / kRecordAlignment <=
-                kLengthMask);
-
-  RecordIndexValue() noexcept = default;
-  explicit RecordIndexValue(const RecordLocation& value) noexcept
-      : mutation_sequence_(value.mutation_sequence_),
-        block_and_logical_low_(
-            (value.block_id() & kBlockIdMask) |
-            ((static_cast<std::uint64_t>(value.logical_size_) &
-              kLogicalSizeLowMask)
-             << kBlockIdBits)),
-        metadata_(EncodeMetadata(value)) {
-    assert(value.logical_size_ <= kLogicalSizeMask);
-  }
-
-  std::uint64_t mutation_sequence_ = 0;
-
-  std::uint64_t block_id() const noexcept {
-    return block_and_logical_low_ & kBlockIdMask;
-  }
-  std::uint32_t logical_size() const noexcept {
-    const std::uint64_t low = block_and_logical_low_ >> kBlockIdBits;
-    const std::uint64_t high = metadata_ & kLogicalSizeHighMask;
-    return static_cast<std::uint32_t>(low | (high << kLogicalSizeLowBits));
-  }
-  std::uint32_t record_offset() const noexcept {
-    return static_cast<std::uint32_t>((metadata_ >> kOffsetShift) &
-                                      kOffsetMask) *
-           kRecordAlignment;
-  }
-  std::uint32_t total_disk_bytes() const noexcept {
-    return static_cast<std::uint32_t>((metadata_ >> kLengthShift) &
-                                      kLengthMask) *
-           kRecordAlignment;
-  }
-  bool in_memory() const noexcept { return Bit(kInMemoryShift); }
-  bool external() const noexcept { return Bit(kExternalShift); }
-  bool key_external() const noexcept { return Bit(kKeyExternalShift); }
-  bool shielding() const noexcept { return Bit(kShieldingShift); }
-  bool unclaimed() const noexcept { return Bit(kUnclaimedShift); }
-  bool tx_tagged() const noexcept { return Bit(kTxTaggedShift); }
-  bool has_expiry() const noexcept { return Bit(kHasExpiryShift); }
-  RecordKind kind() const noexcept {
-    return type_code() == kTombstoneTypeCode ? RecordKind::kTombstone
-                                             : RecordKind::kValue;
-  }
-  ValueType value_type() const noexcept {
-    return type_code() == kTombstoneTypeCode
-               ? ValueType::kNone
-               : static_cast<ValueType>(type_code());
-  }
-
-  // Rebuilds runtime metadata without expanding and repacking each state bit.
-  // The compact and runtime layouts deliberately keep the physical fields and
-  // ten state bits contiguous; only the logical-size prefix and owner slot
-  // differ. Static assertions below make a future layout change fail here
-  // instead of silently corrupting a materialized location.
-  RecordLocation::PackedMetadata MaterializeMetadata(
-      std::uint16_t block_owner) const noexcept {
-    using Runtime = RecordLocation::PackedMetadata;
-    static_assert(kLengthShift - kOffsetShift == Runtime::kLengthShift);
-    static_assert(kInMemoryShift + 1 == Runtime::kInMemoryShift);
-    static_assert(kExternalShift + 1 == Runtime::kExternalShift);
-    static_assert(kKeyExternalShift + 1 == Runtime::kKeyExternalShift);
-    static_assert(kShieldingShift + 1 == Runtime::kShieldingShift);
-    static_assert(kUnclaimedShift + 1 == Runtime::kUnclaimedShift);
-    static_assert(kTxTaggedShift + 1 == Runtime::kTxTaggedShift);
-    static_assert(kTypeCodeShift + 1 == Runtime::kTypeCodeShift);
-    static_assert(kHasExpiryShift + 1 == Runtime::kHasExpiryShift);
-    static_assert(kTypeCodeMask == Runtime::kTypeCodeMask);
-    static_assert(kTombstoneTypeCode == Runtime::kTombstoneTypeCode);
-    assert(block_owner < kMaxMemoryWorkers);
-
-    constexpr std::uint64_t kPhysicalMask =
-        ((std::uint64_t{1} << (kOffsetBits + kLengthBits)) - 1) << kOffsetShift;
-    constexpr std::uint64_t kStateMask = ((std::uint64_t{1} << kStateBits) - 1)
-                                         << kInMemoryShift;
-    const std::uint64_t runtime_bits =
-        ((metadata_ & kPhysicalMask) >> kOffsetShift) |
-        (static_cast<std::uint64_t>(block_owner) << Runtime::kOwnerShift) |
-        ((metadata_ & kStateMask) << 1);
-    return Runtime(runtime_bits);
-  }
-
-  void set_in_memory(bool value) noexcept {
-    SetBit(&metadata_, kInMemoryShift, value);
-  }
-  void set_shielding(bool value) noexcept {
-    SetBit(&metadata_, kShieldingShift, value);
-  }
-  void set_unclaimed(bool value) noexcept {
-    SetBit(&metadata_, kUnclaimedShift, value);
-  }
-  void set_tx_tagged(bool value) noexcept {
-    SetBit(&metadata_, kTxTaggedShift, value);
-  }
-
- private:
-  static std::uint64_t EncodeMetadata(const RecordLocation& value) noexcept {
-    assert(value.record_offset() % kRecordAlignment == 0);
-    assert(value.total_disk_bytes() % kRecordAlignment == 0);
-    std::uint64_t bits =
-        (static_cast<std::uint64_t>(value.logical_size_) >>
-         kLogicalSizeLowBits) |
-        (static_cast<std::uint64_t>(value.record_offset() / kRecordAlignment)
-         << kOffsetShift) |
-        (static_cast<std::uint64_t>(value.total_disk_bytes() / kRecordAlignment)
-         << kLengthShift) |
-        (static_cast<std::uint64_t>(
-             value.kind() == RecordKind::kTombstone
-                 ? kTombstoneTypeCode
-                 : static_cast<std::uint8_t>(value.value_type()))
-         << kTypeCodeShift);
-    SetBit(&bits, kInMemoryShift, value.in_memory());
-    SetBit(&bits, kExternalShift, value.external());
-    SetBit(&bits, kKeyExternalShift, value.key_external());
-    SetBit(&bits, kShieldingShift, value.shielding());
-    SetBit(&bits, kUnclaimedShift, value.unclaimed());
-    SetBit(&bits, kTxTaggedShift, value.tx_tagged());
-    SetBit(&bits, kHasExpiryShift, value.has_expiry());
-    return bits;
-  }
-
-  static void SetBit(std::uint64_t* bits, unsigned shift, bool value) noexcept {
-    const std::uint64_t mask = std::uint64_t{1} << shift;
-    *bits = value ? (*bits | mask) : (*bits & ~mask);
-  }
-  bool Bit(unsigned shift) const noexcept {
-    return (metadata_ & (std::uint64_t{1} << shift)) != 0;
-  }
-  std::uint8_t type_code() const noexcept {
-    return static_cast<std::uint8_t>((metadata_ >> kTypeCodeShift) &
-                                     kTypeCodeMask);
-  }
-
-  std::uint64_t block_and_logical_low_ = 0;
-  std::uint64_t metadata_ = 0;
-};
-
-static_assert(sizeof(RecordIndexValue) == 24);
-
-// Record-index entries use a 24-byte common object for ordinary keys and a
-// derived 32-byte object only when an expiration timestamp exists. The
-// has-expiry bit is part of the compact common value, so checking it before
-// the downcast makes the concrete type an explicit allocation invariant.
-struct RecordIndexEntryPolicy {
-  using StoredValue = RecordIndexValue;
-  using Extra = std::uint64_t;
-
-  static bool HasExtraValue(const RecordLocation& value) noexcept {
-    return value.expire_at_ms_ != 0;
-  }
-  static bool HasExtraStored(const StoredValue& value) noexcept {
-    return value.has_expiry();
-  }
-  static StoredValue Store(const RecordLocation& value) noexcept {
-    return StoredValue(value);
-  }
-  static Extra StoreExtra(const RecordLocation& value) noexcept {
-    return value.expire_at_ms_;
-  }
-  static RecordLocation Load(const StoredValue& value, const Extra* extra,
-                             std::uint64_t allocation_epoch,
-                             std::uint16_t block_owner) noexcept {
-    assert(value.has_expiry() == (extra != nullptr));
-    RecordLocationCore core(value.block_id(), value.mutation_sequence_,
-                            allocation_epoch, value.logical_size(),
-                            value.MaterializeMetadata(block_owner));
-    // MaterializeMetadata already carries the trusted subtype discriminator;
-    // this constructor validates it instead of clearing and setting the same
-    // bit again on every lookup.
-    return RecordLocation(core, extra == nullptr ? 0 : *extra);
-  }
-  static void Assign(StoredValue* stored, Extra* extra,
-                     const RecordLocation& value) noexcept {
-    *stored = StoredValue(value);
-    assert(stored->has_expiry() == (extra != nullptr));
-    if (extra != nullptr) {
-      *extra = value.expire_at_ms_;
-    }
-  }
-};
-
-using RecordIndex =
-    ScanHashMap<RecordLocation, std::numeric_limits<std::uint32_t>::digits,
-                RecordIndexEntryPolicy>;
-
-static_assert(static_cast<std::uint8_t>(ValueType::kStream) < (1U << 3));
-static_assert(sizeof(RecordLocationCore) == 32);
-static_assert(sizeof(RecordLocation) == 40);
-static_assert(alignof(RecordLocation) == 8);
-static_assert(sizeof(RecordIndex::Entry) == 24);
-static_assert(sizeof(RecordIndex::ExtendedEntry) == 32);
-
-inline bool IsNewer(const RecordLocation& candidate,
-                    const RecordLocation& current) noexcept {
-  if (candidate.mutation_sequence_ != current.mutation_sequence_) {
-    return candidate.mutation_sequence_ > current.mutation_sequence_;
-  }
-  return false;
-}
-
-// Deterministic fault injection for crash-safety tests. Arming is naming the
-// point in the KEYLANE_CRASH_POINT environment variable; execution reaching
-// that point then kills the process on the spot — no flush, no destructors —
-// as if power had been cut, with exit code 86 so the test harness can tell a
-// fired crash point from an accidental death. Ordinary optimized builds
-// compile the mechanism away; the explicitly non-packageable fault-server
-// build keeps it available under NDEBUG for sanitizer/integration coverage.
-#if !defined(NDEBUG) || KEYLANE_ENABLE_TEST_FAULTS
-inline void MaybeCrashAt(const char* point) noexcept {
-  static const char* const armed = std::getenv("KEYLANE_CRASH_POINT");
-  if (armed != nullptr && std::strcmp(armed, point) == 0) {
-    std::_Exit(86);
-  }
-}
-#define KEYLANE_MAYBE_CRASH_AT(point) ::keylane::storage::MaybeCrashAt(point)
-
+#if KEYLANE_FAULTS_ENABLED
 // Deterministic write-fault injection for rollback tests: a tagged write of
 // the key named in KEYLANE_FAIL_TX_WRITE fails instead of appending.
 inline bool MaybeFailTxWrite(std::string_view key) noexcept {
@@ -675,7 +114,6 @@ inline bool MaybeFailTxWrite(std::string_view key) noexcept {
 #define KEYLANE_MAYBE_FAIL_TX_WRITE(key) \
   ::keylane::storage::MaybeFailTxWrite(key)
 #else
-#define KEYLANE_MAYBE_CRASH_AT(point) ((void)0)
 #define KEYLANE_MAYBE_FAIL_TX_WRITE(key) false
 #endif
 
@@ -901,6 +339,9 @@ struct ExtentIdentity {
   std::uint32_t payload_checksum_ = 0;
 };
 
+using RecoveredGroupedRoot =
+    std::variant<GroupedHashRoot, OrderedCollectionRoot>;
+
 struct RecoveryRecord {
   Digest digest_{};
   std::string key_;
@@ -917,6 +358,15 @@ struct RecoveryRecord {
   std::uint64_t replication_epoch_ = 1;
   RecordLocation location_{};
   ExtentManifest extents_;
+  // Auxiliary records share their user key with the root, but must never
+  // enter the top-level winner merge. Keep only checked routing metadata;
+  // complete group values remain on disk throughout index reconstruction.
+  std::optional<RecoveredHashGroup> hash_group_;
+  std::optional<RecoveredOrderedGroup> ordered_group_;
+  std::optional<RecoveredGroupedRoot> grouped_root_;
+  // Set only by complete graph reconstruction, then consumed by the bounded
+  // physical-accounting pass. A prepared/orphan auxiliary never owns bytes.
+  bool grouped_reachable_ = false;
   // A validated checkpoint entry already names the winner selected at clean
   // shutdown. Successful checkpoint recovery must not retain a second
   // pointer-to-LSN hash table for every key merely to protect that winner
@@ -939,6 +389,7 @@ struct RecoveryRecordView {
   std::uint64_t replication_epoch_ = 1;
   RecordLocation location_{};
   const ExtentManifest* extents_ = nullptr;
+  const RecoveredGroupedRoot* grouped_root_ = nullptr;
   bool checkpoint_snapshot_ = false;
 };
 
@@ -1024,6 +475,10 @@ struct RetiredRecord {
   ExtentManifest dependent_extents_;
   ExtentManifest immediate_extents_;
   std::shared_ptr<const std::vector<ExtentManifest>> extra_dependent_extents_;
+  // New grouped batches carry their retained allocation charge through the
+  // undo, transaction receipt and final flush copies without growing the
+  // ordinary per-staged-record identity.
+  std::shared_ptr<const void> retained_owner_ = nullptr;
 };
 
 // Ordinary writes only need one dependent extent owner while waiting for the
@@ -1141,10 +596,25 @@ struct TxUndoEntry {
   std::uint32_t entry_handle_ = 0;
   std::optional<RecordLocation> previous_;
   ExtentManifest previous_extents_;
+  GroupedHashObject::Handle previous_grouped_ = nullptr;
+  bool previous_dependency_pinned_ = false;
+  std::shared_ptr<const std::vector<RetiredRecord>>
+      previous_grouped_retirements_ = nullptr;
+  // Prepared before root publication so an OOM-triggered abort never needs
+  // fresh graph-retirement allocation merely to restore the previous view.
+  std::shared_ptr<const std::vector<RetiredRecord>>
+      applied_grouped_retirements_ = nullptr;
   std::uint8_t db_id_ = 0;
 };
 
 struct TxUndoLog {
+  // Pull-based restore admits and reserves this before replacing any record,
+  // so joining its one squashed entry back to a suspended prefix cannot OOM.
+  void ReserveOneEntry() {
+    entries_.reserve(entries_.size() + 1);
+    current_entries_.reserve(current_entries_.size() + 1);
+    handle_by_address_.reserve(current_entries_.size() + 1);
+  }
   // Production callers hold the worker store mutex. Replace retargets the
   // stable slot before the old Entry is destroyed, so current_entries_ never
   // exposes a stale pointer to rollback even when the allocator later reuses
@@ -1154,6 +624,10 @@ struct TxUndoLog {
         handle_by_address_.contains(reinterpret_cast<std::uintptr_t>(entry))) {
       return true;
     }
+    if (entry != nullptr &&
+        std::find(current_entries_.begin(), current_entries_.end(), entry) !=
+            current_entries_.end())
+      return true;
     return current_entries_.size() < std::numeric_limits<std::uint32_t>::max();
   }
 
@@ -1165,6 +639,17 @@ struct TxUndoLog {
     if (auto found = handle_by_address_.find(address);
         found != handle_by_address_.end()) {
       return found->second;
+    }
+    // An isolated ingest can retarget a suspended prefix without allocating
+    // while aborting. Its reverse-address cache is rebuilt only on this miss;
+    // the stable handle is unchanged for every earlier undo record.
+    if (auto found =
+            std::find(current_entries_.begin(), current_entries_.end(), entry);
+        found != current_entries_.end()) {
+      const auto handle =
+          static_cast<std::uint32_t>(found - current_entries_.begin());
+      handle_by_address_.emplace(address, handle);
+      return handle;
     }
     if (current_entries_.size() >= std::numeric_limits<std::uint32_t>::max()) {
       return std::nullopt;
@@ -1190,6 +675,8 @@ struct TxUndoLog {
         reinterpret_cast<std::uintptr_t>(previous);
     auto found = handle_by_address_.find(previous_address);
     if (found == handle_by_address_.end()) {
+      for (auto& entry : current_entries_)
+        if (entry == previous) entry = current;
       return;
     }
     const std::uint32_t handle = found->second;
@@ -1203,12 +690,24 @@ struct TxUndoLog {
     assert(inserted);
   }
 
+  // Prefix restoration runs on error paths where no new metadata may be
+  // allocated. Drop only the address cache; Track's miss path recovers it.
+  void NoAllocReplace(RecordIndex::Entry* previous,
+                      RecordIndex::Entry* current) noexcept {
+    assert(current != nullptr);
+    for (auto& entry : current_entries_)
+      if (entry == previous) entry = current;
+    handle_by_address_.erase(reinterpret_cast<std::uintptr_t>(previous));
+  }
+
   std::vector<TxUndoEntry> entries_;
 
  private:
   std::vector<RecordIndex::Entry*> current_entries_;
   absl::flat_hash_map<std::uintptr_t, std::uint32_t> handle_by_address_;
 };
+
+struct ReplicaCollectionStage;
 
 struct ReplicaValueStage {
   std::uint8_t db_id_ = 0;
@@ -1224,6 +723,11 @@ struct ReplicaValueStage {
   ValueType value_type_ = ValueType::kNone;
   std::string key_;
   std::string value_;
+  // Collection frames are decoded and persisted page by page. The separate
+  // state owns their transaction/key hold and must be explicitly settled
+  // before this stage is destroyed; ordinary String/Stream framing is
+  // unchanged.
+  std::shared_ptr<ReplicaCollectionStage> collection_;
   // The staged key/value survives multiple received frames, so its
   // conservative reservation becomes retained ownership until commit, abort,
   // or session teardown destroys this object.
@@ -1237,6 +741,10 @@ struct ReplicaValueStage {
 struct DetachedIndex {
   RecordIndex index_;
   std::uint8_t db_id_ = 0;
+  // Sparse collection metadata follows the same detached population. Retain
+  // the complete graph until its records/extents have been subtracted; an
+  // ordinary String-only population allocates no grouped side index here.
+  std::optional<GroupedObjectIndex> grouped_;
 };
 
 inline bool IsZero(std::span<const std::byte> bytes) noexcept {
@@ -1699,6 +1207,32 @@ inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
   co_return co_await celer::Write(worker, file, buffer, offset);
 }
 
+#if KEYLANE_FAULTS_ENABLED
+// Runs in the original write's key-lock lifetime, after store state is
+// released. The whole call site is erased in Release, including the extra
+// coroutine.
+inline Task<absl::Status> PauseCompactWriteForTest(Worker& worker,
+                                                   std::string_view key) {
+  if (!KEYLANE_FAULT_MATCHES("KEYLANE_COMPACT_WRITE_PAUSE_KEY", key))
+    co_return absl::OkStatus();
+  const char* configured = std::getenv("KEYLANE_COMPACT_WRITE_PAUSE_MS");
+  if (configured == nullptr) co_return absl::OkStatus();
+  std::uint64_t milliseconds = 0;
+  const char* end = configured + std::strlen(configured);
+  const auto parsed = std::from_chars(configured, end, milliseconds);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || milliseconds == 0 ||
+      milliseconds > 60000)
+    co_return absl::OkStatus();
+  spdlog::info("compact collection write pause armed key={} milliseconds={}",
+               key, milliseconds);
+  auto status =
+      co_await celer::SleepFor(worker, std::chrono::milliseconds(milliseconds));
+  if (!status.ok()) co_return status;
+  spdlog::info("compact collection write pause complete key={}", key);
+  co_return absl::OkStatus();
+}
+#endif
+
 class StorageEngine::Impl {
  public:
   explicit Impl(StorageEngineOptions options) : options_(std::move(options)) {
@@ -1744,6 +1278,7 @@ class StorageEngine::Impl {
   std::size_t direct_io_alignment_ = kDirectIoAlignment;
 
  public:
+  struct FullSyncCollection;
   struct TxGenerationRuntime {
     std::atomic<std::uint64_t> active_transactions_{0};
     absl::flat_hash_set<std::uint64_t> committed_txids_;
@@ -1898,9 +1433,13 @@ class StorageEngine::Impl {
       std::uint64_t pending_snapshot_cursor_ = 0;
       struct PinnedValue {
         ExtentManifest extents_;
+        std::shared_ptr<FullSyncCollection> collection_;
         std::size_t key_bytes_ = 0;
         std::uint64_t value_bytes_ = 0;
       };
+      // Native grouped-source map capacity survives individual source ACKs.
+      // Return its admission only when the capture releases the table itself.
+      RetainedMemoryCharge pinned_values_charge_;
       absl::flat_hash_map<std::uint64_t, PinnedValue> pinned_values_;
       std::uint64_t next_pinned_value_id_ = 1;
       std::array<DbPhase, kLogicalDatabaseCount> db_phases_{};
@@ -1949,6 +1488,21 @@ class StorageEngine::Impl {
 
         RecordLocation location_{};
         ExtentManifest extents_;
+        GroupedHashObject::Handle grouped_;
+        struct BlockPin {
+          std::uint64_t block_id_ = 0;
+          std::uint64_t allocation_epoch_ = 0;
+          bool extent_ = false;
+        };
+        struct BlockPins {
+          RetainedMemoryCharge charge_;
+          std::vector<BlockPin> blocks_;
+        };
+        // Captured while the grouped view is current, before any suspension.
+        // Compact child entries omit allocation epochs; re-materializing an
+        // old view after GC could accidentally pin a reused block incarnation.
+        // The admitted list also makes release allocation-free at maxmemory.
+        std::shared_ptr<const BlockPins> block_pins_;
         Phase phase_ = Phase::kAbsent;
         bool pins_held_ = false;
       };
@@ -1969,10 +1523,22 @@ class StorageEngine::Impl {
         std::uint64_t replication_epoch_ = 0;
         std::optional<std::uint64_t> command_sequence_;
         bool tailing_ = false;
+        // A malformed/failed collection stream cannot become a promotable
+        // candidate even after its in-memory stage has been rolled back.
+        bool stream_failed_ = false;
       };
 
       std::uint16_t id_ = 0;
       std::array<RecordIndex, kLogicalDatabaseCount> indexes_;
+      // Sparse second-level metadata: ordinary String and compact collection
+      // keys never consult this table. Its population follows the top-level
+      // index through detach/reset; handles alone do not pin physical data.
+      std::array<GroupedObjectIndex, kLogicalDatabaseCount> grouped_objects_;
+      // A grouped view belongs to one partition/DB population. The worker's
+      // broader index_generations_ invalidates ordinary suspended IO, but a
+      // reset of an unrelated partition must not invalidate retained views
+      // in this one. Advance only alongside this population's index detach.
+      std::array<std::uint64_t, kLogicalDatabaseCount> grouped_generations_{};
       // Conservative full-sync coverage ownership for each index. The owner
       // worker updates this only when an index identity is created or erased;
       // value and TTL replacements leave it unchanged. Keeping the aggregate
@@ -2024,10 +1590,26 @@ class StorageEngine::Impl {
     // cross-thread reads of ScanHashMap state.
     std::vector<std::array<std::uint64_t, kLogicalDatabaseCount>>
         checkpoint_index_capacities_;
+    struct RdbCollectionReadState {
+      RetainedMemoryCharge charge_;
+      PartitionStore* partition_ = nullptr;
+      PartitionStore::RdbSnapshotValue* saved_ = nullptr;
+      std::string key_;
+      HashGroupMap<std::uint64_t>::const_iterator hash_cursor_;
+      std::uint64_t token_ = 0;
+      std::uint64_t cursor_ = 0;
+      std::uint64_t emitted_ = 0;
+      std::uint8_t db_id_ = 0;
+      bool reading_ = false;
+      bool done_ = false;
+    };
     struct RdbSnapshotSession {
       std::uint64_t id_ = 0;
       std::uint64_t snapshot_time_ms_ = 0;
       bool invalidated_ = false;
+      bool ending_ = false;
+      std::uint32_t readers_ = 0;
+      std::unique_ptr<RdbCollectionReadState> collection_;
     };
     std::optional<RdbSnapshotSession> rdb_snapshot_;
     // Serializes replica apply/reset work on this worker across sessions. A
@@ -2117,6 +1699,12 @@ class StorageEngine::Impl {
     // txid-tagged records parked by ApplyRecovery until the committed-txid set
     // is complete (after the recovery barrier).
     std::vector<RecoveryRecord> recovery_tx_records_;
+    // Root and auxiliary scans can arrive in any physical order. Resolve
+    // their graph only after the shared transaction decision barrier and
+    // top-level winner selection, before live-byte accounting frees orphans.
+    std::vector<RecoveryRecord> recovery_hash_groups_;
+    absl::flat_hash_map<const RecordIndex::Entry*, RecoveredGroupedRoot>
+        recovery_grouped_roots_;
     // Undo journals of in-flight multi-key writes on this shard, keyed by
     // txid; written and consumed under store_state_mutex.
     absl::flat_hash_map<std::uint64_t, TxUndoLog> tx_undo_;
@@ -2253,6 +1841,14 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<HashResult>> ExecuteHash(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
       ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSet(
+      std::uint8_t db_id, std::string_view key,
+      const SortedSetOperation& operation,
+      ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSetLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
 
   Task<absl::StatusOr<HashResult>> ExecuteHashLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -2277,8 +1873,8 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ValueType value_type, bool read_only,
       const CompactValueCallback& callback, TxShardWrites* tx = nullptr,
-      std::uint64_t now_ms = 0,
-      ReplicationCommandAppend* replication = nullptr);
+      std::uint64_t now_ms = 0, ReplicationCommandAppend* replication = nullptr,
+      bool prepare_unlocked = false);
 
   Task<absl::StatusOr<HashResult>> ExecuteHashLikeLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -2286,9 +1882,63 @@ class StorageEngine::Impl {
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr);
 
+  // The caller retains the ordinary exclusive key hold and store lock. The
+  // after-image contains only loaded groups for point operations, or every
+  // group for full-collection operations. Only changed_groups are rewritten.
+  // A null previous view promotes an ordinary compact Hash/Set.
+  Task<absl::Status> CommitGroupedHashMutationLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle previous, HashValue after_image,
+      std::vector<HashGroupId> changed_groups, std::uint64_t field_count,
+      ValueType value_type, std::uint64_t expire_at_ms, TxShardWrites* tx,
+      ReplicationCommandAppend* replication);
+
+  // The plan contains complete changed ordered pages, not an append-only
+  // mutation log. Null previous promotes a compact collection; the adapter
+  // assigns its fresh incarnation/revision before staging any auxiliary.
+  Task<absl::Status> CommitGroupedOrderedMutationLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle previous, OrderedCollectionMutationPlan plan,
+      std::uint64_t expire_at_ms, TxShardWrites* tx,
+      ReplicationCommandAppend* replication = nullptr);
+  Task<absl::Status> UpdateGroupedExpirationLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle previous, std::uint64_t expire_at_ms,
+      TxShardWrites* tx, ReplicationCommandAppend* replication);
+  // Publishes a new root revision over an already retained predecessor graph;
+  // the caller separately cancels retirements for reused physical groups.
+  Task<absl::Status> RestoreGroupedViewLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle previous, TxShardWrites* compensation,
+      TxUndoLog* replacement_undo);
+  Task<absl::StatusOr<ListResult>> ExecuteGroupedListLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const ListOperation& operation, GroupedHashObject::Handle previous,
+      TxShardWrites* tx, ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<SortedSetResult>> ExecuteGroupedSortedSetLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation, GroupedHashObject::Handle previous,
+      TxShardWrites* tx, ReplicationCommandAppend* replication);
+
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 
   // Caller holds the key lock (shared); see GetLocked.
+  Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadata(std::uint8_t db_id,
+                                                       std::string_view key);
+  Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadataLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest);
+  Task<absl::StatusOr<HashResult>> ExecuteGroupedHashRandomLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const HashOperation& operation, GroupedHashObject::Handle object,
+      ValueType value_type, TxShardWrites* tx,
+      ReplicationCommandAppend* replication);
   Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                            std::string_view key,
                                            const Digest& digest);
@@ -2298,9 +1948,25 @@ class StorageEngine::Impl {
                                                     const Digest& digest);
   Task<absl::StatusOr<RawValue>> ReadRawValue(std::uint8_t db_id,
                                               std::string_view key);
+  Task<absl::StatusOr<TransferValue>> ReadValueForTransferLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest);
+  Task<absl::Status> WriteValueForTransferLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const TransferValue& value, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   Task<absl::StatusOr<RestoreRawResult>> RestoreRawValue(
       std::uint8_t db_id, std::string_view key, const RawValue& value,
       bool replace, ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValue(
+      std::uint8_t db_id, std::string_view key, ValueType type,
+      std::uint64_t expire_at_ms, bool replace,
+      std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
+      ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValueLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      ValueType type, std::uint64_t expire_at_ms, bool replace,
+      std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
+      TxShardWrites* tx, ReplicationCommandAppend* replication);
   Task<absl::StatusOr<RestoreRawResult>> RestoreRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const RawValue& value, bool replace, TxShardWrites* tx,
@@ -2476,7 +2142,10 @@ class StorageEngine::Impl {
   }
 
   Task<absl::Status> RollbackTxLocal(std::uint64_t txid,
-                                     TxShardWrites* compensation = nullptr);
+                                     TxShardWrites* compensation = nullptr,
+                                     bool discard_uncommitted_absent = false,
+                                     TxUndoLog* retained_prefix = nullptr,
+                                     bool grouped_root_only = false);
 
   Task<absl::Status> DiscardTxUndoLocal(std::uint64_t txid);
 
@@ -2490,9 +2159,85 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<std::optional<std::string>>> RandomKeyLocal(
       std::uint8_t db_id);
 
+  // These helpers never suspend. Call with store state held, before borrowing
+  // any index entry across a wait. Eligibility does not infer single-key
+  // intent: the command adapter must opt in only where its lifetime contract is
+  // known.
+  bool CanPrepareCompactWriteUnlocked(
+      const WorkerStore& store, const WorkerStore::PartitionStore& partition,
+      const RecordIndex::Entry* entry, const RecordLocation& location,
+      const TxShardWrites* tx) const noexcept {
+    (void)store;
+    return tx == nullptr && entry != nullptr && entry->key_complete() &&
+           location.kind() == RecordKind::kValue && !location.grouped() &&
+           !location.external() && !location.key_external() &&
+           location.total_disk_bytes() < kGroupedHashPromotionBytes &&
+           !partition.replica_sync_ &&
+           !replica_loading_.load(std::memory_order_acquire);
+  }
+
+  CompactWriteSnapshot CaptureCompactWriteSnapshot(
+      const WorkerStore& store, const WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id) const noexcept {
+    return {.index_generation_ = store.index_generations_[db_id],
+            .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+            .replication_epoch_ = partition.replication_epoch_};
+  }
+
+  // Reacquire store state before validating, even for successful no-ops. This
+  // is not a general-purpose DB-epoch CAS: command database admission must also
+  // cover AppendLocked's later allocation waits. No callback is retried here,
+  // since its reply/canonical replication effect may already have been built.
+  absl::Status ValidateCompactWriteSnapshot(
+      const WorkerStore& store, const WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const RecordLocation& location,
+      const CompactWriteSnapshot& snapshot) const {
+    if (store.index_generations_[db_id] != snapshot.index_generation_ ||
+        EffectiveRecordDbEpoch(partition, db_id) != snapshot.db_epoch_ ||
+        partition.replication_epoch_ != snapshot.replication_epoch_ ||
+        partition.replica_sync_ ||
+        replica_loading_.load(std::memory_order_acquire))
+      return absl::AbortedError(
+          "compact collection population changed while preparing update");
+    if (store.write_failed_ ||
+        epoch_metadata_failed_.load(std::memory_order_acquire))
+      return absl::FailedPreconditionError(
+          "storage writer is stopped after an IO failure");
+    const auto* current = partition.indexes_[db_id].Find(digest, key);
+    if (current == nullptr || !current->key_complete() ||
+        current->value_.kind() != RecordKind::kValue ||
+        current->value_.value_type() != location.value_type() ||
+        current->value_.grouped() ||
+        current->value_.mutation_sequence_ != location.mutation_sequence_ ||
+        current->value_.logical_size() != location.logical_size_ ||
+        ExpireAt(*current) != location.expire_at_ms_)
+      return absl::AbortedError(
+          "compact collection logical version changed while preparing update");
+    // Ignore GC/cleaner changes to block coordinates, staging flags and tx
+    // tags. AppendLocked resolves its current physical predecessor after
+    // allocation waits. Preserve command-time expiry rather than checking the
+    // clock again.
+    return absl::OkStatus();
+  }
+
   std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept {
     assert(db_id < kLogicalDatabaseCount);
     return db_epochs_[db_id].load(std::memory_order_acquire);
+  }
+
+  // A native replica builds its candidate partition under locally mapped
+  // database epochs before those epochs become the globally served ones.
+  // Physical records and the grouped side view must name that same population.
+  std::uint64_t EffectiveRecordDbEpoch(
+      const WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id) const noexcept {
+    assert(db_id < kLogicalDatabaseCount);
+    if (replica_loading_.load(std::memory_order_acquire) &&
+        partition.replica_sync_ != nullptr) {
+      return partition.replica_sync_->local_db_epochs_[db_id];
+    }
+    return DbEpoch(db_id);
   }
 
   Task<absl::Status> FlushDbDetach(std::uint8_t db_id);
@@ -2575,6 +2320,10 @@ class StorageEngine::Impl {
       std::uint64_t session_id, RdbSnapshotCursor cursor, std::size_t count,
       std::size_t max_bytes);
   Task<absl::Status> EndRdbSnapshot(std::uint64_t session_id);
+  Task<absl::StatusOr<CollectionPage>> ReadRdbCollectionPage(
+      std::uint64_t session_id, std::uint64_t token, std::uint64_t cursor);
+  Task<absl::Status> FinishRdbCollection(std::uint64_t session_id,
+                                         std::uint64_t token);
 
   absl::StatusOr<FullSyncSessionStart> BeginFullSyncSession(
       std::uint64_t session_id);
@@ -2705,6 +2454,23 @@ class StorageEngine::Impl {
   Task<absl::Status> ApplyReplicaRecords(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t replication_epoch, std::span<const SnapshotRecord> records);
+  // The outer apply mutex spans validation, page writes, and abort settlement.
+  Task<absl::Status> ApplyReplicaRecordsLocked(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t replication_epoch, std::span<const SnapshotRecord> records);
+  Task<absl::Status> BeginReplicaCollection(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      ReplicaValueStage& stage);
+  Task<absl::Status> ConsumeReplicaCollection(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      ReplicaValueStage& stage, std::string_view input, bool finish);
+  Task<absl::Status> WriteReplicaCollectionPage(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      ReplicaValueStage& stage, CollectionPage page);
+  absl::Status SquashReplicaCollectionUndo(WorkerStore& store,
+                                           ReplicaCollectionStage& state);
+  Task<absl::Status> AbortReplicaValueStage(
+      WorkerStore& store, WorkerStore::PartitionStore& partition);
   Task<absl::Status> PromoteReplicaRoot(std::uint64_t session_id);
   Task<absl::Status> AbortReplicaRoot(std::uint64_t session_id);
   void SetReplicaLoading(bool loading) noexcept {
@@ -3013,7 +2779,8 @@ class StorageEngine::Impl {
   Task<absl::Status> ReclaimDetachedIndexes(WorkerStore& store);
 
   void QueueDetachedIndex(WorkerStore& store, RecordIndex& index,
-                          std::uint8_t db_id);
+                          std::uint8_t db_id,
+                          GroupedObjectIndex* grouped = nullptr);
 
   // At most one reclaimer runs per store, so background and synchronous callers
   // cannot split the detached-index FIFO between them. Whichever runs picks up
@@ -3101,6 +2868,13 @@ class StorageEngine::Impl {
   absl::Status ApplyRecoveredRecord(WorkerStore& store,
                                     WorkerStore::PartitionStore& partition,
                                     const RecoveryRecordView& record);
+  Task<absl::Status> RecoverGroupedObjects(WorkerStore& store);
+  Task<absl::StatusOr<GroupedHashObject::Handle>> RecoverOrderedObject(
+      WorkerStore& store, const OrderedCollectionRoot& root,
+      GroupedObjectVersion version, std::span<RecoveryRecord> candidates);
+  // Validate only root-selected external groups. Obsolete value-only extents
+  // can already be gone while their containing records block remains live.
+  Task<absl::Status> ValidateRecoveredGroups(WorkerStore& store);
 
   static ExtentManifest ExtentsFor(const WorkerStore& store,
                                    const RecordIndex::Entry* entry) {
@@ -3134,7 +2908,14 @@ class StorageEngine::Impl {
       WorkerStore& store, ExtentManifest extents, std::size_t key_bytes);
   Task<absl::Status> ReadRecoveryExtentInto(WorkerStore& store, ExtentRef ref,
                                             std::uint32_t extent_index,
-                                            std::span<std::byte> destination);
+                                            std::span<std::byte> destination,
+                                            std::size_t payload_offset = 0);
+  // Read a bounded slice while validating every extent in the manifest. Used
+  // for group envelopes so an indivisible large field does not become a large
+  // recovery allocation merely to reconstruct resident routing metadata.
+  Task<absl::StatusOr<std::string>> LoadRecoveryPayloadSlice(
+      WorkerStore& store, ExtentManifest extents, std::size_t offset,
+      std::size_t bytes);
 
   Task<absl::StatusOr<bool>> VerifyExternalKey(WorkerStore& store,
                                                const RecordIndex::Entry& entry,
@@ -3155,7 +2936,23 @@ class StorageEngine::Impl {
       WorkerStore& key_store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       RecordLocation location, ExtentManifest extents,
-      ReadLatencyTrace* trace = nullptr);
+      ReadLatencyTrace* trace = nullptr,
+      GroupedHashObject::Handle grouped_snapshot = nullptr);
+
+  // The optional snapshot view must already own physical pins. Ordinary
+  // reads instead retry GC relocation against the same logical root version.
+  Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupSnapshot(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, HashGroupId id, bool pinned = false);
+  Task<absl::StatusOr<HashValue>> LoadGroupedHashValue(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, bool pinned = false);
+  Task<absl::StatusOr<LoadedValue>> LoadGroupedValue(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      RecordLocation location, GroupedHashObject::Handle snapshot);
 
   // Reads one extent block's payload into `destination`. Runs on the worker
   // that owns that block, which is not necessarily the one holding the
@@ -3175,7 +2972,8 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<LoadedValue>> LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       RecordLocation location, std::uint64_t replication_epoch,
-      ReadLatencyTrace* trace = nullptr);
+      ReadLatencyTrace* trace = nullptr,
+      std::optional<std::uint64_t> expected_db_epoch = std::nullopt);
 
   std::uint64_t ForegroundBlocksForDevice(
       std::size_t device_index) const noexcept {
@@ -3205,6 +3003,39 @@ class StorageEngine::Impl {
 
   Task<absl::Status> MarkRetiredRecordsDead(WorkerStore* store,
                                             std::vector<RetiredRecord> records);
+
+  // Captures child physical epochs synchronously while old/replacement views
+  // are current or protected by pending transaction retirement. The root's
+  // existing receipt is separate; unchanged groups and reused extents never
+  // enter this child-only batch. The admitted shared charge follows copies
+  // through undo/transaction/flush receipts via retained_owner_.
+  absl::StatusOr<std::vector<RetiredRecord>> CollectGroupedRetirements(
+      const GroupedHashObject::Handle& previous,
+      const GroupedHashObject::Handle& replacement,
+      std::optional<std::span<const HashGroupId>> touched = std::nullopt);
+  Task<absl::Status> ClearGroupedUndoSlots(WorkerStore& store,
+                                           const TxUndoLog& undo);
+  struct GroupedRetirementPins {
+    GroupedRetirementPins(Impl* engine, WorkerStore* store)
+        : engine_(engine), store_(store) {}
+    ~GroupedRetirementPins();
+    GroupedRetirementPins(const GroupedRetirementPins&) = delete;
+    GroupedRetirementPins& operator=(const GroupedRetirementPins&) = delete;
+    void Sort();
+    bool Contains(const RetiredRecord& record) const;
+    bool Take(const RetiredRecord& record);
+    Impl* engine_;
+    WorkerStore* store_;
+    RetainedMemoryCharge charge_;
+    std::vector<RetiredRecord> pins_;
+    std::size_t sorted_count_ = 0;
+  };
+  Task<absl::Status> PrepinGroupedRetirementsLocked(
+      WorkerStore& store, const GroupedHashObject::Handle& previous,
+      std::optional<std::span<const HashGroupId>> touched, bool include_root,
+      std::unique_ptr<GroupedRetirementPins>* pins);
+  Task<absl::Status> ReleaseGroupedRetirementPins(
+      WorkerStore* store, std::vector<RetiredRecord> pins);
 
   static RetiredRecord RetiredRecordOf(const RecordLocation& location,
                                        ExtentManifest dependent_extents = {}) {
@@ -3252,8 +3083,10 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
   WriteExtentValueLocked(WorkerStore& store, std::string_view first,
-                         std::string_view second = {});
+                         std::string_view second = {},
+                         RecordPayloadCursor* cursor = nullptr);
 
+  struct GroupMutationWrite;
   Task<absl::Status> AppendLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -3264,12 +3097,18 @@ class StorageEngine::Impl {
       std::uint64_t* committed_sequence = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       SetLatencyTrace* trace = nullptr, bool capture_fullsync = true,
-      TxUndoLog* replacement_undo = nullptr);
+      TxUndoLog* replacement_undo = nullptr,
+      GroupMutationWrite* grouped = nullptr);
 
   Task<absl::Status> CaptureRdbSnapshotBeforeWriteLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest);
   Task<absl::Status> PinRdbSnapshotValue(
+      WorkerStore::PartitionStore::RdbSnapshotValue* value);
+  // Capture compact child epochs before suspension while the view is current.
+  // PinRdbSnapshotValue validates this admitted list; it never lazily creates
+  // identities from a potentially stale retained metadata view.
+  absl::Status PrepareGroupedSnapshotPins(
       WorkerStore::PartitionStore::RdbSnapshotValue* value);
   Task<absl::Status> ReleaseRdbSnapshotValue(
       WorkerStore::PartitionStore::RdbSnapshotValue* value);
@@ -3313,6 +3152,22 @@ class StorageEngine::Impl {
                             WorkerStore::FullSyncCapture& capture);
   Task<absl::Status> PinFullSyncExtents(ExtentManifest extents);
   Task<absl::Status> ReleaseFullSyncExtents(ExtentManifest extents);
+  absl::Status PrepareFullSyncPinnedValueInsert(
+      WorkerStore::FullSyncCapture& capture);
+  Task<absl::StatusOr<std::uint64_t>> PinFullSyncCollection(
+      WorkerStore& store, std::uint64_t session_id,
+      WorkerStore::PartitionStore& partition, std::uint8_t db_id,
+      std::string_view key, const Digest& digest, RecordLocation location,
+      ExtentManifest root_extents, std::uint64_t* encoded_bytes);
+  Task<absl::StatusOr<std::string>> ReadFullSyncCollectionChunk(
+      std::shared_ptr<FullSyncCollection> collection, std::uint64_t offset,
+      std::size_t max_bytes);
+  // Register active_settlements_ before spawning this release. It cancels and
+  // joins an in-flight reader before unpinning its exact captured graph.
+  Task<absl::Status> ReleaseFullSyncCollection(
+      std::shared_ptr<FullSyncCollection> collection);
+  Task<absl::StatusOr<CollectionPage>> NextFullSyncCollectionPage(
+      std::shared_ptr<FullSyncCollection> collection);
   Task<absl::StatusOr<std::uint64_t>> PinFullSyncValue(
       WorkerStore& store, std::uint64_t session_id,
       WorkerStore::PartitionStore& partition, RecordLocation location,
@@ -3340,7 +3195,79 @@ class StorageEngine::Impl {
     std::uint64_t replication_epoch_ = 0;
     std::uint64_t db_epoch_ = 0;
     bool reject_older_sequence_ = false;
+    // Snapshot records reject equal sequence duplicates. A serialized replay
+    // command envelope may intentionally mutate one key repeatedly at the
+    // same sequence, and uses physical publication LSN to order those writes.
+    bool allow_equal_sequence_ = false;
   };
+
+  // Auxiliary snapshots share the parent's durable key/epochs, but never
+  // compete in its top-level RecordIndex or affect Redis key/expiry counts.
+  // The caller owns their publication and retirement through the grouped
+  // object view. All foreground auxiliaries require a transaction receipt.
+  struct GroupRecordWrite {
+    bool auxiliary_ = false;
+    std::uint64_t incarnation_ = 0;
+    HashGroupId id_{};
+    bool retired_ = false;
+    std::uint64_t batch_txid_ = 0;
+    // Pre-admitted before any durable root write. The root and its side view
+    // become visible in one non-suspending publication section.
+    GroupedHashObject::PreparedHandle* prepared_root_ = nullptr;
+    GroupedObjectIndex::Publication* publication_ = nullptr;
+    // Invoked after the last possible storage/index wait but before staging
+    // any root bytes. It rebuilds against current physical GC locations and
+    // performs all remaining fallible metadata admission.
+    std::function<absl::Status(const GroupedObjectVersion&)> prepare_root_;
+    // Every complete page or split marker written by this mutation. Borrowed
+    // for this call; only these prior ids need dependency pins/retirement.
+    std::span<const HashGroupId> changed_groups_;
+    // Foreground root after-image identity, known before the late builder.
+    // A new incarnation replaces the complete prior graph, even when its
+    // newly written ids happen to match a subset of the old directory.
+    std::uint64_t root_incarnation_ = 0;
+  };
+
+  struct GroupMutationWrite {
+    std::uint64_t sequence_ = 0;
+    GroupRecordWrite* root_ = nullptr;
+  };
+
+  absl::StatusOr<std::shared_ptr<GroupedCommitDecision>> PrepareGroupedDecision(
+      TxShardWrites& tx);
+  // Retains the existing store mutex contract: releases it only while
+  // awaiting a prior independent transaction's durable commit, then restores
+  // ownership on every return. Caller revalidates key/population afterward.
+  Task<absl::Status> AwaitGroupedDependencyLocked(
+      WorkerStore& store, const GroupedHashObject::Handle& object,
+      std::uint64_t successor_txid);
+
+  // Writes one unpublished complete group snapshot. The receipt prevents its
+  // transaction generation from retiring; the caller must either publish it
+  // with the root's decision or reclaim it when that batch is abandoned.
+  Task<absl::StatusOr<HashGroupLocation>> WriteHashGroupRecordLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const HashGroupSnapshot& snapshot, std::uint64_t sequence,
+      TxShardWrites& tx, ValueType value_type = ValueType::kHash,
+      std::uint64_t batch_txid = 0);
+
+  Task<absl::StatusOr<LoadedOrderedGroup>> LoadOrderedGroupSnapshot(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedHashObject::Handle object, std::uint64_t id, bool pinned = false);
+  Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
+  LoadGroupedOrderedValue(WorkerStore& store,
+                          WorkerStore::PartitionStore& partition,
+                          std::uint8_t db_id, std::string_view key,
+                          const Digest& digest,
+                          GroupedHashObject::Handle object,
+                          bool pinned = false);
+  Task<absl::StatusOr<HashGroupLocation>> WriteOrderedGroupRecordLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const OrderedGroupSnapshot& snapshot, std::uint64_t revision,
+      TxShardWrites& tx, std::uint64_t batch_txid = 0);
 
   Task<absl::Status> WriteRecordLocked(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
@@ -3357,7 +3284,8 @@ class StorageEngine::Impl {
       SetLatencyTrace* trace = nullptr,
       const ExplicitWriteRoot* explicit_root = nullptr,
       TxUndoLog* replacement_undo = nullptr,
-      WorkerStore::PartitionStore* known_partition = nullptr);
+      WorkerStore::PartitionStore* known_partition = nullptr,
+      const GroupRecordWrite* group = nullptr);
 
   absl::StatusOr<RecordIndex::Entry*> ReplaceIndexLocation(
       WorkerStore& store, RecordIndex& index, RecordIndex::Entry* entry,
@@ -3443,8 +3371,14 @@ class StorageEngine::Impl {
 
   Task<absl::Status> PeriodicFlush(WorkerStore* store);
 
-  Task<absl::Status> MaybeRunTxCleaner();
-  Task<absl::Status> RunTxCleaner();
+  // Called before acquiring a standalone grouped transaction's generation
+  // lease, with no store mutex held. A borrowed EXEC lease must never wait for
+  // its own generation to become reclaimable. The estimate is only a pressure
+  // signal, not a reservation or a second disk-capacity admission policy.
+  Task<absl::Status> BeforeGroupedTransaction(WorkerStore& store,
+                                              std::uint64_t append_bytes);
+  Task<absl::Status> MaybeRunTxCleaner(bool force = false);
+  Task<absl::Status> RunTxCleaner(bool shutdown_drain = false);
 
   // Shutdown has stopped new transaction admission and drained commit chains.
   // Force generation promotion regardless of the online cooldown so a
@@ -3463,7 +3397,8 @@ class StorageEngine::Impl {
                                              std::uint64_t generation);
   Task<absl::Status> PromoteTxGenerationLocal(
       WorkerStore& store, std::uint64_t generation,
-      std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed);
+      std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed,
+      bool shutdown_drain);
   Task<absl::Status> RetireTxGenerationLocal(WorkerStore& store,
                                              std::uint64_t generation);
 

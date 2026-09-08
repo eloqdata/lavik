@@ -174,6 +174,15 @@ bool IsReadOnly(const ListOperation& operation) {
          operation.kind_ == ListOperationKind::kPosition;
 }
 
+bool NeedsGroupedList(std::span<const std::string> elements) {
+  std::size_t bytes = kListHeaderBytes;
+  for (const auto& element : elements) {
+    bytes += sizeof(std::uint32_t) + element.size();
+    if (bytes >= kGroupedHashPromotionBytes) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
@@ -196,6 +205,10 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   const bool stored_value =
       found != nullptr && found->value_.kind() == RecordKind::kValue;
   const bool exists = stored_value && !IsExpiredNow(*found);
+  if (!exists && stored_value && found->value_.grouped()) {
+    auto metadata = co_await ReadKeyMetadataLocked(db_id, key, digest);
+    if (!metadata.ok()) co_return metadata.status();
+  }
   if (exists && found->value_.value_type() != ValueType::kList) {
     co_return absl::InvalidArgumentError(
         "WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -220,11 +233,41 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   ListResult result;
   result.key_exists_ = exists;
   result.length_ = exists ? location.logical_size_ : 0;
-  if (operation.kind_ == ListOperationKind::kLength) co_return result;
 
-  if (read_only) unlock.Unlock();
-#ifndef NDEBUG
-  if (read_only) {
+  if (exists && location.grouped()) {
+    auto object = partition.grouped_objects_[db_id].Lookup(
+        key, GroupedObjectVersion{
+                 .root_ = location,
+                 .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+                 .replication_epoch_ = observed_replication_epoch,
+                 .index_generation_ = partition.grouped_generations_[db_id]});
+    if (!object.ok()) co_return object.status();
+    if (operation.kind_ == ListOperationKind::kLength) co_return result;
+    co_return co_await ExecuteGroupedListLocked(
+        store, partition, db_id, key, digest, operation, std::move(*object), tx,
+        replication);
+  }
+
+  if (operation.kind_ == ListOperationKind::kLength) co_return result;
+  // The explicit single-key opt-in excludes multi-key pop/move callers that
+  // legitimately pass no durable transaction. Keep the caller's exclusive key
+  // intent while preparing private bytes; only worker-wide store state yields.
+  const bool unlocked_compact_write =
+      !read_only && operation.prepare_unlocked_ && exists &&
+      CanPrepareCompactWriteUnlocked(store, partition, found, location, tx);
+  const CompactWriteSnapshot write_snapshot =
+      unlocked_compact_write
+          ? CaptureCompactWriteSnapshot(store, partition, db_id)
+          : CompactWriteSnapshot{};
+  if (read_only || unlocked_compact_write) {
+    found = nullptr;
+    unlock.Unlock();
+  }
+  KEYLANE_FAULT_INJECT(if (unlocked_compact_write) {
+    auto paused = co_await PauseCompactWriteForTest(*store.worker_, key);
+    if (!paused.ok()) co_return paused;
+  });
+  KEYLANE_FAULT_INJECT(if (read_only) {
     if (const char* configured = std::getenv("KEYLANE_LIST_READ_PAUSE_MS");
         configured != nullptr) {
       std::uint64_t milliseconds = 0;
@@ -236,8 +279,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
         if (!paused.ok()) co_return paused;
       }
     }
-  }
-#endif
+  });
 
   std::vector<std::string> elements;
   if (exists) {
@@ -327,7 +369,9 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       auto it = std::find(elements.begin(), elements.end(), operation.pivot_);
       if (it == elements.end()) {
         result.integer_ = -1;
-        co_return result;
+        // A successful no-op still has to validate the captured population
+        // after an unlocked read, just like a replacement or final-element pop.
+        break;
       }
       if (operation.kind_ == ListOperationKind::kInsertAfter) ++it;
       elements.insert(it, std::string(operation.value_));
@@ -412,7 +456,61 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   }
 
   result.length_ = elements.size();
+  std::optional<std::string> prepared_compact_payload;
+  bool compact_write_promotes = false;
+  if (unlocked_compact_write) {
+    if (result.changed_ && !elements.empty()) {
+      compact_write_promotes = NeedsGroupedList(elements);
+      if (!compact_write_promotes) {
+        auto encoded = EncodeList(elements);
+        if (!encoded.ok()) co_return encoded.status();
+        prepared_compact_payload.emplace(std::move(*encoded));
+      }
+    }
+    co_await store.store_state_mutex_.Lock();
+    unlock.Adopt();
+    const absl::Status validated = ValidateCompactWriteSnapshot(
+        store, partition, db_id, key, digest, location, write_snapshot);
+    if (!validated.ok()) co_return validated;
+    // Same-version GC movement is permitted. AppendLocked resolves its current
+    // physical predecessor; the replacement keeps the command-time deadline.
+    // Group promotion and empty-list deletion remain on their locked funnels.
+  }
   if (!result.changed_) co_return result;
+
+  if (!elements.empty() &&
+      (unlocked_compact_write ? compact_write_promotes
+                              : NeedsGroupedList(elements))) {
+    // The commit adapter assigns the real incarnation only after admitting
+    // the command's unique durable revision. Splitting here borrows no old
+    // physical pages and leaves the compact root unchanged on failure.
+    OrderedGroupSnapshot initial{.kind_ = OrderedCollectionKind::kList,
+                                 .incarnation_ = 1,
+                                 .id_ = 1,
+                                 .entries_ = {}};
+    initial.entries_.reserve(elements.size());
+    for (auto& element : elements) {
+      initial.entries_.push_back({.value_ = std::move(element)});
+    }
+    auto split = SplitOrderedGroup(std::move(initial), 2);
+    if (!split.ok()) co_return split.status();
+    OrderedCollectionMutationPlan plan{
+        .root_ = {.kind_ = OrderedCollectionKind::kList,
+                  .incarnation_ = 1,
+                  .item_count_ = result.length_,
+                  .first_group_ = split->groups_.front().id_,
+                  .last_group_ = split->groups_.back().id_,
+                  .next_group_id_ = split->next_group_id_,
+                  .group_count_ =
+                      static_cast<std::uint32_t>(split->groups_.size())},
+        .changed_ = true,
+        .writes_ = std::move(split->groups_)};
+    auto written = co_await CommitGroupedOrderedMutationLocked(
+        store, partition, db_id, key, digest, nullptr, std::move(plan),
+        expire_at_ms, tx, replication);
+    if (!written.ok()) co_return written;
+    co_return result;
+  }
 
   RecordKind kind = RecordKind::kValue;
   ValueType type = ValueType::kList;
@@ -420,6 +518,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   if (elements.empty()) {
     kind = RecordKind::kTombstone;
     type = ValueType::kNone;
+  } else if (prepared_compact_payload.has_value()) {
+    payload = std::move(*prepared_compact_payload);
   } else {
     auto encoded = EncodeList(elements);
     if (!encoded.ok()) co_return encoded.status();

@@ -10,6 +10,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <future>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -27,11 +30,16 @@ std::string g_keylane_binary;
 
 class FileCleanup {
  public:
-  explicit FileCleanup(std::string path) : path_(std::move(path)) {}
-  ~FileCleanup() { (void)::unlink(path_.c_str()); }
+  explicit FileCleanup(std::string path, bool preserve_on_failure = false)
+      : path_(std::move(path)), preserve_on_failure_(preserve_on_failure) {}
+  ~FileCleanup() {
+    if (!preserve_on_failure_ || !::testing::Test::HasFailure())
+      (void)::unlink(path_.c_str());
+  }
 
  private:
   std::string path_;
+  bool preserve_on_failure_ = false;
 };
 
 void SendAll(int fd, std::string_view bytes) {
@@ -219,7 +227,7 @@ class ServerProcess {
  public:
   ServerProcess(std::string_view binary, std::uint16_t redis_port,
                 std::uint16_t metrics_port, std::string_view data_path,
-                std::string_view log_path) {
+                std::string_view log_path, unsigned workers = 2) {
     pid_ = ::fork();
     if (pid_ < 0) {
       throw std::runtime_error("fork failed");
@@ -241,7 +249,7 @@ class ServerProcess {
           "--metrics-port",
           std::to_string(metrics_port),
           "--threads",
-          "2",
+          std::to_string(workers),
           "--recv-buffers-per-worker",
           "0",
           "--max-memory",
@@ -344,6 +352,131 @@ std::uint64_t MetricValue(std::string_view body, std::string_view name) {
   const std::size_t end = body.find('\n', value_begin);
   return std::stoull(
       std::string(body.substr(value_begin + 1, end - value_begin - 1)));
+}
+
+TEST(MetricsE2eTest, ConcurrentInfoAndScrapesSurviveWorkerAllocationReuse) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-metrics-reuse-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path, true);
+  const int fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+  const auto redis_port = FindFreePort();
+  auto metrics_port = FindFreePort();
+  while (metrics_port == redis_port) metrics_port = FindFreePort();
+  constexpr unsigned kWorkers = 4, kWriters = 4, kWrites = 64, kRounds = 16;
+  ServerProcess server(g_keylane_binary, redis_port, metrics_port, data_path,
+                       log_path, kWorkers);
+  RespClient control(redis_port);
+  ASSERT_EQ(control.Command({"PING"}), "+PONG");
+  auto require = [](bool ok, std::string_view message) {
+    if (!ok) throw std::runtime_error(std::string(message));
+  };
+
+  // Futures propagate a crashed server's socket errors to this test instead
+  // of terminating in a std::thread destructor. Declaring the gate after the
+  // futures also unblocks already-created tasks if later task creation throws.
+  std::vector<std::future<void>> jobs;
+  jobs.reserve(kWriters + 3);
+  std::promise<void> release;
+  const auto start = release.get_future().share();
+  for (unsigned writer = 0; writer < kWriters; ++writer) {
+    jobs.push_back(std::async(std::launch::async, [&, writer, start] {
+      start.get();
+      RespClient client(redis_port);
+      constexpr std::size_t sizes[]{0,   7,   63,  64,   65,   127,
+                                    128, 255, 511, 1023, 2047, 4095};
+      for (unsigned i = 0; i < kWrites; ++i) {
+        const auto key = "metrics-reuse:" + std::to_string(writer) + ":" +
+                         std::to_string(i % 16);
+        const auto hash = key + ":hash";
+        const std::string value(sizes[(i + writer) % std::size(sizes)],
+                                static_cast<char>('a' + i % 26));
+        const auto bulk = "$" + std::to_string(value.size()) + "\r\n" + value;
+        require(client.Command({"SET", key, value}) == "+OK", "SET failed");
+        require(client.Command({"GET", key}) == bulk, "GET lost bytes");
+        require(client.Command({"HSET", hash, "field", value}) ==
+                    (i < 16 ? ":1" : ":0"),
+                "HSET count mismatch");
+        require(client.Command({"HGET", hash, "field"}) == bulk,
+                "HGET lost bytes");
+      }
+    }));
+  }
+  for (unsigned reader = 0; reader < 2; ++reader) {
+    jobs.push_back(std::async(std::launch::async, [&, reader, start] {
+      start.get();
+      constexpr std::string_view sections[]{
+          "", "ALL", "STATS", "CLIENTS", "PERSISTENCE", "COMMANDSTATS"};
+      constexpr std::string_view headers[]{
+          "# Server\r\n",  "# Server\r\n",      "# Stats\r\n",
+          "# Clients\r\n", "# Persistence\r\n", "# Commandstats\r\n"};
+      for (unsigned round = 0; round < kRounds; ++round) {
+        // Reconnect and vary reply sizes so the metrics coroutine shares
+        // allocation reuse with connection, command and response frames.
+        RespClient client(redis_port);
+        const std::string echo(17 + round * 67 + reader, 'e');
+        require(client.Command({"ECHO", echo}) ==
+                    "$" + std::to_string(echo.size()) + "\r\n" + echo,
+                "ECHO failed");
+        for (unsigned offset = 0; offset < std::size(sections); ++offset) {
+          const auto selected = (offset + round + reader) % std::size(sections);
+          const auto info = sections[selected].empty()
+                                ? client.Command({"INFO"})
+                                : client.Command({"INFO", sections[selected]});
+          require(info.find(headers[selected]) != std::string::npos,
+                  "INFO response omitted requested section");
+        }
+      }
+    }));
+  }
+  jobs.push_back(std::async(std::launch::async, [&, start] {
+    start.get();
+    std::uint64_t previous_commands = 0;
+    for (unsigned round = 0; round < kRounds; ++round) {
+      const auto response = HttpGet(metrics_port, "/metrics");
+      require(response.starts_with("HTTP/1.1 200 OK\r\n"), "scrape failed");
+      require(MetricValue(response, "keylane_server_ready") == 1,
+              "server stopped being ready");
+      const auto commands = MetricValue(response, "keylane_commands_total");
+      require(commands >= previous_commands, "command counter went backwards");
+      previous_commands = commands;
+      for (unsigned worker = 0; worker < kWorkers; ++worker)
+        require(
+            response.find("keylane_worker_memory_limit_bytes{worker=\"" +
+                          std::to_string(worker) + "\"}") != std::string::npos,
+            "scrape omitted worker");
+    }
+  }));
+  release.set_value();
+  for (auto& job : jobs) {
+    try {
+      job.get();
+    } catch (const std::exception& error) {
+      std::ifstream log(log_path);
+      ADD_FAILURE() << error.what() << "\nserver log retained at " << log_path
+                    << "\n"
+                    << std::string(std::istreambuf_iterator<char>(log), {});
+    }
+  }
+  if (::testing::Test::HasFailure()) return;
+  EXPECT_EQ(control.Command({"PING"}), "+PONG");
+  const auto final_metrics = HttpGet(metrics_port, "/metrics");
+  for (const auto* command : {"set", "get", "hset", "hget"})
+    EXPECT_EQ(
+        MetricValue(final_metrics, "keylane_command_calls_total{command=\"" +
+                                       std::string(command) + "\"}"),
+        kWriters * kWrites)
+        << command;
+  EXPECT_GE(MetricValue(final_metrics, "keylane_commands_total"),
+            kWriters * kWrites * 4 + 2 * kRounds * 6);
+  server.Stop();
 }
 
 TEST(MetricsE2eTest, ConfigResetstatClearsCommandCountersOnly) {

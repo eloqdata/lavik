@@ -76,6 +76,48 @@ TEST(RecordLocationTest, DefaultLocationRetainsEmptyValueSemantics) {
   EXPECT_EQ(location.block_owner(), 0);
   EXPECT_EQ(location.kind(), RecordKind::kValue);
   EXPECT_EQ(location.value_type(), ValueType::kNone);
+  EXPECT_FALSE(location.grouped());
+}
+
+TEST(RecordLocationTest, GroupedRepresentationSurvivesIndexAndExpiryChanges) {
+  RecordIndex index;
+  const auto digest = ComputeDigest("grouped-hash");
+  for (bool external : {false, true}) {
+    for (bool key_external : {false, true}) {
+      for (std::uint64_t expiry : {0ULL, 123456789ULL, 0ULL}) {
+        const RecordLocation location(
+            17, 91, 83, expiry, 1200,
+            RecordLocation::PackedMetadata::Encode(
+                kBlockHeaderBytes, 256, 7, true, external, key_external, true,
+                false, true, RecordKind::kValue, ValueType::kHash, false,
+                true));
+        auto* entry = index.Find(digest, "grouped-hash");
+        if (entry == nullptr) {
+          entry = index.InsertNew(digest, "grouped-hash", location);
+        } else {
+          RecordIndex::Entry* detached = nullptr;
+          entry = index.ReplaceValue(entry, location, digest, &detached);
+          if (detached != nullptr) index.DestroyDetached(detached);
+        }
+        ASSERT_NE(entry, nullptr);
+        EXPECT_TRUE(entry->value_.grouped());
+        entry->value_.set_in_memory(false);
+        entry->value_.set_tx_tagged(false);
+        const auto restored = RecordIndexEntryPolicy::Load(
+            entry->value_, entry->optional_extra(), 83, 7);
+        EXPECT_TRUE(restored.grouped());
+        EXPECT_EQ(restored.value_type(), ValueType::kHash);
+        EXPECT_EQ(restored.external(), external);
+        EXPECT_EQ(restored.key_external(), key_external);
+        EXPECT_EQ(restored.expire_at_ms_, expiry);
+        EXPECT_EQ(restored.mutation_sequence_, 91);
+        EXPECT_EQ(restored.block_id(), 17);
+        EXPECT_EQ(restored.block_owner(), 7);
+        EXPECT_FALSE(restored.in_memory());
+        EXPECT_FALSE(restored.tx_tagged());
+      }
+    }
+  }
 }
 
 TEST(RecordLocationTest, PackedBlockIdentityRoundTripsMaximumValues) {
@@ -103,11 +145,11 @@ TEST(RecordLocationTest, PackedBlockIdentityRoundTripsMaximumValues) {
 }
 
 static_assert(sizeof(RecordLocation::PackedMetadata) == sizeof(std::uint64_t));
-static_assert(RecordLocation::PackedMetadata::kReservedBits == 4);
+static_assert(RecordLocation::PackedMetadata::kReservedBits == 3);
 static_assert(sizeof(RecordLocationCore) == 32);
 static_assert(sizeof(RecordLocation) == 40);
 static_assert(sizeof(RecordIndexValue) == 24);
-static_assert(RecordIndexValue::kReservedBits == 5);
+static_assert(RecordIndexValue::kReservedBits == 4);
 static_assert(sizeof(RecordIndex::Entry) == 24);
 static_assert(sizeof(RecordIndex::ExtendedEntry) == 32);
 
@@ -296,6 +338,43 @@ TEST(RecordLocationTest, TxUndoLogRetargetsSharedHandleInConstantTime) {
 
   EXPECT_EQ(undo.Current(*key_handle), ordinary);
   EXPECT_EQ(undo.Track(ordinary), key_handle);
+}
+
+TEST(RecordLocationTest, TxUndoPrefixRetargetDoesNotRequireAddressCache) {
+  const auto metadata = RecordLocation::PackedMetadata::Encode(
+      kBlockHeaderBytes, kRecordAlignment, 0, true, false, false, false, false,
+      true, RecordKind::kValue, ValueType::kString);
+  RecordIndex index;
+  auto* first = index.InsertNew(ComputeDigest("key"), "key",
+                                RecordLocation(1, 2, 3, 1234, 4, metadata));
+  auto* other = index.InsertNew(ComputeDigest("other"), "other",
+                                RecordLocation(5, 6, 7, 0, 8, metadata));
+  TxUndoLog undo;
+  const auto handle = undo.Track(first);
+  const auto other_handle = undo.Track(other);
+  ASSERT_TRUE(handle);
+  ASSERT_TRUE(other_handle);
+  undo.ReserveOneEntry();
+  RecordIndex::Entry* detached = nullptr;
+  auto* second =
+      index.ReplaceValue(first, RecordLocation(9, 10, 11, 0, 12, metadata),
+                         ComputeDigest("key"), &detached);
+  ASSERT_EQ(detached, first);
+  undo.NoAllocReplace(first, second);
+  index.DestroyDetached(detached);
+  ASSERT_TRUE(undo.CanTrack(second));
+  // A compensating root can replace the physical Entry again before the
+  // resumed outer command ever rebuilds its reverse-address cache.
+  auto* third =
+      index.ReplaceValue(second, RecordLocation(13, 14, 15, 5678, 16, metadata),
+                         ComputeDigest("key"), &detached);
+  ASSERT_EQ(detached, second);
+  undo.Replace(second, third);
+  index.DestroyDetached(detached);
+  EXPECT_EQ(undo.Current(*handle), third);
+  EXPECT_EQ(undo.Track(third), handle);
+  EXPECT_EQ(undo.Current(*other_handle), other);
+  EXPECT_EQ(undo.Track(other), other_handle);
 }
 
 TEST(RecordLocationTest, IndexKeyMatchingPreservesTailAndCollisionSemantics) {

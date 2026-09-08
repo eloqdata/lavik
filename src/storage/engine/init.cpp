@@ -907,6 +907,9 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       for (RecordIndex& index : partition_store.indexes_) {
         index.SetEntryArena(store.record_index_entry_arena_);
       }
+      for (GroupedObjectIndex& index : partition_store.grouped_objects_) {
+        index = GroupedObjectIndex(store.record_index_entry_arena_);
+      }
       partition_store.replication_epoch_ =
           epoch_values_[kLogicalDatabaseCount + partition];
       partition_store.replica_candidate_epoch_ =
@@ -1350,6 +1353,15 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       }
     }
   }
+  // Roots are selected by the ordinary key/epoch/sequence merge; only now
+  // can their auxiliary graphs be adjudicated against every durable commit.
+  // Do this before expiration or orphan reclamation can retire any graph.
+  status = co_await RecoverGroupedObjects(store);
+  if (status.ok()) status = co_await ValidateRecoveredGroups(store);
+  if (!status.ok()) {
+    Fail(status);
+    co_return status;
+  }
 
   // Winner selection must see expired values so a newer expired version
   // still suppresses every older version. Keep every expired winner charged
@@ -1364,22 +1376,21 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   };
   std::vector<RecoveryExpiredTombstone> expired_tombstones;
   std::uint64_t recovery_now_ms = UnixTimeMillis();
-#ifndef NDEBUG
-  // Deterministically emulate a wall-clock rollback in recovery tests. This
-  // must not be used as a correctness mechanism: runtime expiration first
-  // publishes a durable tombstone and only then retires a collection graph,
-  // so an older root can never become the winning recoverable version merely
-  // because this clock moved backwards.
-  if (const char* configured = std::getenv("KEYLANE_RECOVERY_NOW_MS");
-      configured != nullptr) {
-    const char* end = configured + std::strlen(configured);
-    std::uint64_t overridden = 0;
-    const auto parsed = std::from_chars(configured, end, overridden);
-    if (parsed.ec == std::errc{} && parsed.ptr == end) {
-      recovery_now_ms = overridden;
-    }
-  }
-#endif
+  KEYLANE_FAULT_INJECT(
+      // Deterministically emulate a wall-clock rollback in recovery tests. This
+      // must not be used as a correctness mechanism: runtime expiration first
+      // publishes a durable tombstone and only then retires a collection graph,
+      // so an older root can never become the winning recoverable version
+      // merely because this clock moved backwards.
+      if (const char* configured = std::getenv("KEYLANE_RECOVERY_NOW_MS");
+          configured != nullptr) {
+        const char* end = configured + std::strlen(configured);
+        std::uint64_t overridden = 0;
+        const auto parsed = std::from_chars(configured, end, overridden);
+        if (parsed.ec == std::errc{} && parsed.ptr == end) {
+          recovery_now_ms = overridden;
+        }
+      });
   for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
       // Recovery rebuilds this count alongside every winning index entry.
@@ -1580,6 +1591,71 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       }
     }
   }
+  // Auxiliary records and their extents are independent physical owners.
+  // Only complete graph reconstruction marks a candidate reachable; neither
+  // an uncommitted prepare nor a superseded incarnation contributes bytes.
+  // Flush per extent as well as per group, keeping a single oversized Hash
+  // from defeating the worker's bounded recovery-batch memory target.
+  for (const RecoveryRecord& recovered : store.recovery_hash_groups_) {
+    if (!recovered.grouped_reachable_) continue;
+    const RecordLocation& location = recovered.location_;
+    if (location.block_owner() >= worker_count_) {
+      status =
+          absl::DataLossError("recovered Hash group has no physical owner");
+      Fail(status);
+      co_return status;
+    }
+    live_by_owner[location.block_owner()].push_back(RecoveryLiveReference{
+        .block_id_ = location.block_id(),
+        .allocation_epoch_ = location.allocation_epoch(),
+        .txid_ = recovered.txid_,
+        .bytes_ = location.total_disk_bytes(),
+        .expected_owner_ = location.block_owner(),
+    });
+    buffered_bytes += sizeof(RecoveryLiveReference);
+    if (recovered.extents_ != nullptr) {
+      for (std::size_t index = 0; index < recovered.extents_->size(); ++index) {
+        const ExtentRef& extent = recovered.extents_->at(index);
+        const std::uint16_t owner = BlockOwner(extent.block_id_);
+        if (owner >= worker_count_) {
+          status = absl::DataLossError("Hash group has an unscanned extent");
+          Fail(status);
+          co_return status;
+        }
+        live_by_owner[owner].push_back(RecoveryLiveReference{
+            .block_id_ = extent.block_id_,
+            .allocation_epoch_ = extent.allocation_epoch_,
+            .bytes_ = extent.payload_bytes_,
+            .expected_owner_ = owner,
+            .extent_ = true,
+            .extent_payload_bytes_ = extent.payload_bytes_,
+            .extent_index_ = static_cast<std::uint32_t>(index),
+            .extent_payload_checksum_ = extent.payload_checksum_,
+        });
+        buffered_bytes += sizeof(RecoveryLiveReference);
+        if (buffered_bytes >= batch_target_bytes) {
+          status =
+              co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
+          if (!status.ok()) {
+            Fail(status);
+            co_return status;
+          }
+          buffered_bytes = 0;
+        }
+      }
+    }
+    if (buffered_bytes >= batch_target_bytes) {
+      status =
+          co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
+      if (!status.ok()) {
+        Fail(status);
+        co_return status;
+      }
+      buffered_bytes = 0;
+    }
+  }
+  store.recovery_hash_groups_.clear();
+  store.recovery_hash_groups_.shrink_to_fit();
   status = co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
   if (!status.ok()) {
     Fail(status);

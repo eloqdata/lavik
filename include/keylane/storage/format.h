@@ -187,6 +187,10 @@ void RestoreDigestSeed(const DigestSeed& seed) noexcept;
 // persisted only together with that seed; ordinary records remain independent
 // of runtime hashing and cold recovery can therefore choose a fresh seed.
 Digest ComputeDigest(std::string_view key) noexcept;
+// Explicit-seed SipHash-1-2 for durable routing. The caller persists the seed
+// and routing algorithm version with the owning object; this overload never
+// reads or changes the process-wide lookup seed.
+Digest ComputeDigest(std::string_view key, const DigestSeed& seed) noexcept;
 std::uint16_t RedisSlot(std::string_view key) noexcept;
 std::uint32_t StorageShardForKey(std::string_view key) noexcept;
 
@@ -324,6 +328,26 @@ struct RecordHeader {
   ValueType value_type_ = ValueType::kNone;
   bool external_ = false;
   bool key_external_ = false;
+  // A root and its independently indexed groups preserve the parent Redis
+  // collection type, but are not interchangeable compact values. Group
+  // identity lives outside the payload so recovery and GC can identify an
+  // extent-backed group without reading its potentially very large value.
+  // Hash/Set use a high-bit hash prefix; List/Sorted Set use a nonzero stable
+  // page id in group_prefix_ with zero prefix bits. The hash_group_ flag names
+  // the shared auxiliary-record wire bit, not a restriction to Redis Hash.
+  bool grouped_ = false;
+  bool hash_group_ = false;
+  // Routing retirement is authoritative header metadata. Recovery must not
+  // read an obsolete group's already-reclaimed value extents merely to learn
+  // whether this identity still owns a range. Only auxiliary records use it.
+  bool group_retired_ = false;
+  std::uint64_t group_incarnation_ = 0;
+  std::uint64_t group_prefix_ = 0;
+  std::uint8_t group_prefix_bits_ = 0;
+  // An auxiliary command nested inside EXEC/Lua needs both its enclosing
+  // transaction and its own batch decision. Zero denotes a single-decision
+  // group or a GC-promoted unconditional record.
+  std::uint64_t group_batch_txid_ = 0;
   std::uint32_t key_bytes_ = 0;
   // Redis-visible bytes/cardinality.
   std::uint32_t logical_size_ = 0;
@@ -408,23 +432,29 @@ constexpr std::size_t AlignRecord(std::size_t size) noexcept {
 // The durable record prefix stores fields at explicit offsets rather than
 // copying RecordHeader's C++ object representation. txid and expiration are
 // sparse extensions, so the overwhelmingly common standalone non-expiring
-// record pays only for the 72-byte base. Every extension is one aligned word.
+// record pays only for the 72-byte base. A Hash group adds its incarnation
+// and routing identity; these bytes are covered by the header checksum.
 inline constexpr std::size_t kRecordHeaderBaseBytes = 72;
 inline constexpr std::size_t kRecordHeaderOptionalBytes = 8;
+inline constexpr std::size_t kRecordHashGroupIdentityBytes = 32;
 inline constexpr std::size_t kMaxRecordFixedHeaderBytes =
     kRecordHeaderBaseBytes + 2 * kRecordHeaderOptionalBytes;
+inline constexpr std::size_t kMaxHashGroupFixedHeaderBytes =
+    kMaxRecordFixedHeaderBytes + kRecordHashGroupIdentityBytes;
 
-constexpr std::size_t RecordFixedHeaderBytes(bool has_txid,
-                                             bool has_expiry) noexcept {
+constexpr std::size_t RecordFixedHeaderBytes(bool has_txid, bool has_expiry,
+                                             bool hash_group = false) noexcept {
   return kRecordHeaderBaseBytes + (has_txid ? kRecordHeaderOptionalBytes : 0) +
-         (has_expiry ? kRecordHeaderOptionalBytes : 0);
+         (has_expiry ? kRecordHeaderOptionalBytes : 0) +
+         (hash_group ? kRecordHashGroupIdentityBytes : 0);
 }
 
 constexpr std::size_t RecordHeaderBytes(std::size_t key_bytes,
                                         bool key_external = false,
                                         bool has_txid = false,
-                                        bool has_expiry = false) noexcept {
-  return AlignRecord(RecordFixedHeaderBytes(has_txid, has_expiry) +
+                                        bool has_expiry = false,
+                                        bool hash_group = false) noexcept {
+  return AlignRecord(RecordFixedHeaderBytes(has_txid, has_expiry, hash_group) +
                      (key_external ? 0 : key_bytes));
 }
 

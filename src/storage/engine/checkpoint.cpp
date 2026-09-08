@@ -923,6 +923,15 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
             });
         if (entry == nullptr) continue;
         const RecordLocation location = MaterializeIndexLocation(*entry);
+        // This accelerator snapshots only top-level indexes, not auxiliary
+        // collection graphs. Declining publication leaves the already-flushed
+        // records authoritative and the next boot performs graph-aware cold
+        // recovery. Never publish a root-only snapshot that would let startup
+        // skip the ordinary blocks containing its live groups.
+        if (location.grouped()) {
+          co_return absl::FailedPreconditionError(
+              "shutdown checkpoint does not encode grouped collections");
+        }
         if (location.tx_tagged()) {
           co_return absl::FailedPreconditionError(
               "shutdown transaction cleanup left a transaction-tagged index "

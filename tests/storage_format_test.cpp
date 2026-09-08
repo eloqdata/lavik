@@ -41,6 +41,293 @@ TEST(StorageFormatTest, ComputesStableProcessLocalDigests) {
   EXPECT_EQ(DigestHash{}(first), first.value_);
 }
 
+namespace {
+
+keylane::storage::RecordHeader GroupRecordHeader(std::string_view key,
+                                                 bool external = false,
+                                                 bool transaction = false,
+                                                 bool external_key = false) {
+  using namespace keylane::storage;
+  const auto header_bytes =
+      RecordHeaderBytes(key.size(), external_key, transaction, false, true);
+  const std::uint32_t payload_bytes = external ? 64 : 80;
+  return RecordHeader{
+      .header_bytes_ = static_cast<std::uint16_t>(header_bytes),
+      .kind_ = RecordKind::kValue,
+      .db_id_ = 3,
+      .value_type_ = ValueType::kHash,
+      .external_ = external,
+      .key_external_ = external_key,
+      .hash_group_ = true,
+      .group_incarnation_ = 17,
+      .group_prefix_ = std::uint64_t{1} << 63,
+      .group_prefix_bits_ = 1,
+      .key_bytes_ = static_cast<std::uint32_t>(key.size()),
+      .logical_size_ = 1,
+      .payload_bytes_ = payload_bytes,
+      .total_disk_bytes_ =
+          static_cast<std::uint32_t>(AlignRecord(header_bytes + payload_bytes)),
+      .txid_ = transaction ? 19U : 0U,
+      .mutation_sequence_ = 21,
+      .lsn_ = 23,
+      .allocation_epoch_ = 25,
+  };
+}
+
+}  // namespace
+
+TEST(StorageFormatTest, GroupIdentitySurvivesInlineAndExtentHeaderRoundTrips) {
+  using namespace keylane::storage;
+  constexpr std::string_view key = "hash-key";
+  for (const bool external : {false, true}) {
+    for (const bool transaction : {false, true}) {
+      for (const bool external_key : {false, true}) {
+        const auto header =
+            GroupRecordHeader(key, external, transaction, external_key);
+        std::vector<std::byte> bytes(header.header_bytes_);
+        ASSERT_TRUE(EncodeRecordHeader(header, key, bytes));
+        RecordHeader decoded;
+        std::string_view decoded_key;
+        ASSERT_TRUE(DecodeRecordHeader(bytes, &decoded, &decoded_key));
+        EXPECT_TRUE(decoded.hash_group_);
+        EXPECT_FALSE(decoded.grouped_);
+        EXPECT_EQ(decoded.external_, external);
+        EXPECT_EQ(decoded.key_external_, external_key);
+        EXPECT_EQ(decoded.group_incarnation_, 17);
+        EXPECT_EQ(decoded.group_prefix_, std::uint64_t{1} << 63);
+        EXPECT_EQ(decoded.group_prefix_bits_, 1);
+        EXPECT_EQ(decoded.txid_, header.txid_);
+        EXPECT_EQ(decoded_key, external_key ? std::string_view{} : key);
+        // Every byte of the sparse identity, including its reserved padding,
+        // belongs to the checked header, not to unchecked recovery metadata.
+        const auto identity = RecordFixedHeaderBytes(transaction, false);
+        for (std::size_t i = 0; i < kRecordHashGroupIdentityBytes; ++i) {
+          bytes[identity + i] ^= std::byte{1};
+          EXPECT_FALSE(DecodeRecordHeader(bytes, &decoded, &decoded_key));
+          bytes[identity + i] ^= std::byte{1};
+        }
+        for (std::size_t length = 0; length < bytes.size(); ++length) {
+          EXPECT_FALSE(DecodeRecordHeader(
+              std::span<const std::byte>(bytes).first(length), &decoded,
+              &decoded_key));
+        }
+      }
+    }
+  }
+}
+
+TEST(StorageFormatTest, GroupHeaderRejectsAmbiguousOrInvalidIdentity) {
+  using namespace keylane::storage;
+  constexpr std::string_view key = "hash-key";
+  const auto original = GroupRecordHeader(key);
+  auto rejected = [&](RecordHeader header) {
+    std::vector<std::byte> bytes(header.header_bytes_);
+    EXPECT_FALSE(EncodeRecordHeader(header, key, bytes));
+  };
+  auto changed = original;
+  changed.grouped_ = true;
+  rejected(changed);
+  changed = original;
+  changed.group_incarnation_ = 0;
+  rejected(changed);
+  changed = original;
+  changed.group_prefix_bits_ = 65;
+  rejected(changed);
+  changed = original;
+  changed.group_prefix_ |= 1;
+  rejected(changed);
+  changed = original;
+  changed.group_prefix_bits_ = 0;
+  rejected(changed);
+  changed = original;
+  changed.value_type_ = ValueType::kString;
+  rejected(changed);
+  changed = original;
+  changed.mutation_sequence_ = 0;
+  rejected(changed);
+  changed = original;
+  changed.expire_at_ms_ = 123;
+  rejected(changed);
+  changed = original;
+  changed.hash_group_ = false;
+  rejected(changed);
+  for (const unsigned bits : {0U, 64U}) {
+    changed = original;
+    changed.group_prefix_bits_ = bits;
+    changed.group_prefix_ = bits == 0 ? 0 : 123;
+    std::vector<std::byte> bytes(changed.header_bytes_);
+    EXPECT_TRUE(EncodeRecordHeader(changed, key, bytes));
+  }
+}
+
+TEST(StorageFormatTest, GroupRetirementIsCheckedHeaderMetadata) {
+  using namespace keylane::storage;
+  constexpr std::string_view key = "retired-group";
+  for (const bool external : {false, true}) {
+    auto header = GroupRecordHeader(key, external, true, external);
+    header.group_retired_ = true;
+    header.logical_size_ = 0;
+    std::vector<std::byte> bytes(header.header_bytes_);
+    ASSERT_TRUE(EncodeRecordHeader(header, key, bytes));
+    RecordHeader decoded;
+    std::string_view decoded_key;
+    ASSERT_TRUE(DecodeRecordHeader(bytes, &decoded, &decoded_key));
+    EXPECT_TRUE(decoded.group_retired_);
+    EXPECT_EQ(decoded.group_prefix_bits_, header.group_prefix_bits_);
+    EXPECT_EQ(decoded.logical_size_, 0);
+    EXPECT_EQ(decoded.header_bytes_, header.header_bytes_);
+    header.logical_size_ = 1;
+    EXPECT_FALSE(EncodeRecordHeader(header, key, bytes));
+    header.logical_size_ = 0;
+    header.hash_group_ = false;
+    header.group_incarnation_ = 0;
+    header.group_prefix_ = 0;
+    header.group_prefix_bits_ = 0;
+    header.header_bytes_ = RecordHeaderBytes(key.size(), external, true, false);
+    header.total_disk_bytes_ =
+        AlignRecord(header.header_bytes_ + header.payload_bytes_);
+    EXPECT_FALSE(EncodeRecordHeader(header, key, bytes));
+  }
+}
+
+TEST(StorageFormatTest, GroupBatchDecisionRequiresAnEnclosingTransaction) {
+  using namespace keylane::storage;
+  constexpr std::string_view key = "nested-group";
+  auto header = GroupRecordHeader(key, false, true);
+  header.group_batch_txid_ = 37;
+  std::vector<std::byte> bytes(header.header_bytes_);
+  ASSERT_TRUE(EncodeRecordHeader(header, key, bytes));
+  RecordHeader decoded;
+  std::string_view decoded_key;
+  ASSERT_TRUE(DecodeRecordHeader(bytes, &decoded, &decoded_key));
+  EXPECT_EQ(decoded.txid_, header.txid_);
+  EXPECT_EQ(decoded.group_batch_txid_, 37);
+  header.txid_ = 0;
+  header.header_bytes_ =
+      RecordHeaderBytes(key.size(), false, false, false, true);
+  header.total_disk_bytes_ =
+      AlignRecord(header.header_bytes_ + header.payload_bytes_);
+  EXPECT_FALSE(EncodeRecordHeader(header, key, bytes));
+}
+
+TEST(StorageFormatTest, GroupedRootMarkerDoesNotCarryAGroupIdentity) {
+  using namespace keylane::storage;
+  constexpr std::string_view key = "hash-key";
+  RecordHeader root{
+      .header_bytes_ =
+          static_cast<std::uint16_t>(RecordHeaderBytes(key.size())),
+      .kind_ = RecordKind::kValue,
+      .value_type_ = ValueType::kHash,
+      .grouped_ = true,
+      .key_bytes_ = key.size(),
+      .logical_size_ = 99,
+      .payload_bytes_ = 56,
+      .total_disk_bytes_ = static_cast<std::uint32_t>(
+          AlignRecord(RecordHeaderBytes(key.size()) + 56)),
+      .mutation_sequence_ = 21,
+  };
+  std::vector<std::byte> bytes(root.header_bytes_);
+  ASSERT_TRUE(EncodeRecordHeader(root, key, bytes));
+  RecordHeader decoded;
+  std::string_view decoded_key;
+  ASSERT_TRUE(DecodeRecordHeader(bytes, &decoded, &decoded_key));
+  EXPECT_TRUE(decoded.grouped_);
+  EXPECT_FALSE(decoded.hash_group_);
+  EXPECT_EQ(decoded.group_incarnation_, 0);
+  root.group_incarnation_ = 17;
+  EXPECT_FALSE(EncodeRecordHeader(root, key, bytes));
+  root.group_incarnation_ = 0;
+  root.external_ = true;
+  EXPECT_FALSE(EncodeRecordHeader(root, key, bytes));
+  root.external_ = false;
+  root.logical_size_ = 0;
+  EXPECT_FALSE(EncodeRecordHeader(root, key, bytes));
+}
+
+TEST(StorageFormatTest, CollectionGroupHeadersKeepTypeAndRoutingSemantics) {
+  using namespace keylane::storage;
+  constexpr std::string_view key = "collection-key";
+  for (const auto type : {ValueType::kHash, ValueType::kSet, ValueType::kList,
+                          ValueType::kSortedSet}) {
+    const bool ordered =
+        type == ValueType::kList || type == ValueType::kSortedSet;
+    for (const bool external : {false, true}) {
+      for (const bool transaction : {false, true}) {
+        for (const bool external_key : {false, true}) {
+          auto header =
+              GroupRecordHeader(key, external, transaction, external_key);
+          header.value_type_ = type;
+          header.group_prefix_ = ordered ? 123 : std::uint64_t{1} << 63;
+          header.group_prefix_bits_ = ordered ? 0 : 1;
+          std::vector<std::byte> bytes(header.header_bytes_);
+          ASSERT_TRUE(EncodeRecordHeader(header, key, bytes));
+          RecordHeader decoded;
+          std::string_view decoded_key;
+          ASSERT_TRUE(DecodeRecordHeader(bytes, &decoded, &decoded_key));
+          EXPECT_EQ(decoded.value_type_, type);
+          EXPECT_EQ(decoded.group_prefix_, header.group_prefix_);
+          EXPECT_EQ(decoded.group_prefix_bits_, header.group_prefix_bits_);
+          if (ordered) {
+            header.group_prefix_ = 0;
+            EXPECT_FALSE(EncodeRecordHeader(header, key, bytes));
+            header.group_prefix_ = std::uint64_t{1} << 63;
+            header.group_prefix_bits_ = 1;
+            EXPECT_FALSE(EncodeRecordHeader(header, key, bytes));
+          } else {
+            header.group_prefix_ = 123;
+            header.group_prefix_bits_ = 0;
+            EXPECT_FALSE(EncodeRecordHeader(header, key, bytes));
+            header.group_prefix_ = 0;
+            EXPECT_TRUE(EncodeRecordHeader(header, key, bytes));
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(StorageFormatTest,
+     GroupedRootsAllowCollectionsButRejectStringsAndStreams) {
+  using namespace keylane::storage;
+  constexpr std::string_view key = "collection-key";
+  RecordHeader root{
+      .header_bytes_ =
+          static_cast<std::uint16_t>(RecordHeaderBytes(key.size())),
+      .kind_ = RecordKind::kValue,
+      .grouped_ = true,
+      .key_bytes_ = key.size(),
+      .logical_size_ = 99,
+      .payload_bytes_ = 64,
+      .total_disk_bytes_ = static_cast<std::uint32_t>(
+          AlignRecord(RecordHeaderBytes(key.size()) + 64)),
+      .mutation_sequence_ = 21,
+  };
+  std::vector<std::byte> bytes(root.header_bytes_);
+  for (const auto type : {ValueType::kHash, ValueType::kSet, ValueType::kList,
+                          ValueType::kSortedSet, ValueType::kNone,
+                          ValueType::kString, ValueType::kStream}) {
+    root.value_type_ = type;
+    const bool collection =
+        type == ValueType::kHash || type == ValueType::kSet ||
+        type == ValueType::kList || type == ValueType::kSortedSet;
+    EXPECT_EQ(EncodeRecordHeader(root, key, bytes), collection);
+    if (collection) {
+      RecordHeader decoded;
+      std::string_view decoded_key;
+      ASSERT_TRUE(DecodeRecordHeader(bytes, &decoded, &decoded_key));
+      EXPECT_TRUE(decoded.grouped_);
+      EXPECT_EQ(decoded.value_type_, type);
+    }
+  }
+  for (const auto type :
+       {ValueType::kNone, ValueType::kString, ValueType::kStream}) {
+    auto auxiliary = GroupRecordHeader(key);
+    auxiliary.value_type_ = type;
+    std::vector<std::byte> aux_bytes(auxiliary.header_bytes_);
+    EXPECT_FALSE(EncodeRecordHeader(auxiliary, key, aux_bytes));
+  }
+}
+
 TEST(StorageFormatTest, RestoresCheckpointDigestSeedBeforeHashing) {
   using namespace keylane::storage;
   const DigestSeed original = CurrentDigestSeed();
@@ -329,10 +616,10 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   ASSERT_TRUE(EncodeRecordHeader(
       record, key,
       std::span<std::byte>(record_page.data(), record_header_bytes)));
-  EXPECT_TRUE(
-      std::all_of(record_page.begin() + sizeof(RecordHeader) + key.size(),
-                  record_page.begin() + record_header_bytes,
-                  [](std::byte byte) { return byte == std::byte{0}; }));
+  EXPECT_TRUE(std::all_of(
+      record_page.begin() + RecordFixedHeaderBytes(true, true) + key.size(),
+      record_page.begin() + record_header_bytes,
+      [](std::byte byte) { return byte == std::byte{0}; }));
   RecordHeader decoded_record{};
   std::string_view decoded_key;
   ASSERT_TRUE(DecodeRecordHeader(

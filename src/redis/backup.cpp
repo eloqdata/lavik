@@ -1,13 +1,16 @@
 #include "backup.h"
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <utility>
@@ -19,8 +22,10 @@
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/sync.h"
 #include "celer/runtime/worker.h"
+#include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/rdb.h"
+#include "keylane/rdb_collection.h"
 #include "keylane/resp.h"
 #include "lua_eval.h"
 #include "spdlog/spdlog.h"
@@ -49,10 +54,26 @@ class RdbOutputQueue {
     return failed_.load(std::memory_order_acquire);
   }
 
-  bool TryPush(std::string* fragment) {
+  bool TryBeginEntry(unsigned owner) {
+    std::lock_guard lock(mutex_);
+    if (finishing_ || failed_.load(std::memory_order_relaxed) ||
+        entry_owner_ != UINT_MAX)
+      return false;
+    entry_owner_ = owner;
+    return true;
+  }
+
+  void EndEntry(unsigned owner) {
+    std::lock_guard lock(mutex_);
+    assert(entry_owner_ == owner);
+    entry_owner_ = UINT_MAX;
+  }
+
+  bool TryPush(std::string* fragment, unsigned owner = UINT_MAX) {
     if (fragment == nullptr) return false;
     std::lock_guard lock(mutex_);
     if (finishing_ || failed_.load(std::memory_order_relaxed)) return false;
+    if (entry_owner_ != owner) return false;
     // A single Redis value may exceed the queue budget. Admit it only into an
     // empty queue, preserving a bounded one-value overshoot.
     if (!queue_.empty() &&
@@ -141,6 +162,10 @@ class RdbOutputQueue {
   std::condition_variable condition_;
   std::deque<std::string> queue_;
   std::size_t queued_bytes_ = 0;
+  // A lease covers one complete RDB key, not one queue fragment. Other
+  // producers cannot occupy the bounded queue while the lease owner loads
+  // its next page, so backpressure cannot strand a partially emitted key.
+  unsigned entry_owner_ = UINT_MAX;
   bool finishing_ = false;
   std::mutex status_mutex_;
   absl::Status status_;
@@ -324,53 +349,119 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
         RunOwnedWorker(shared_from_this(), worker_id));
   }
 
+  Task<absl::Status> PushEntrySpan(unsigned worker_id, std::string_view bytes) {
+    constexpr std::size_t fragment_bytes = 1024 * 1024;
+    while (!bytes.empty()) {
+      const auto piece = bytes.substr(0, fragment_bytes);
+      std::string fragment(piece);
+      while (!output_.TryPush(&fragment, worker_id)) {
+        if (output_.failed())
+          co_return absl::InternalError("RDB output writer failed");
+        auto status = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                               std::chrono::milliseconds(1));
+        if (!status.ok()) co_return status;
+      }
+      bytes.remove_prefix(piece.size());
+    }
+    co_return absl::OkStatus();
+  }
+
+  Task<absl::Status> WriteCollection(unsigned worker_id,
+                                     const storage::RdbSnapshotValue& value) {
+    auto encoder = rdb::CollectionFileEncoder::Create(
+        value.db_id_, value.key_, value.value_.value_type_,
+        value.value_.logical_size_, value.value_.expire_at_ms_);
+    if (!encoder.ok()) co_return encoder.status();
+    auto drain = [&]() -> Task<absl::Status> {
+      while (auto span = encoder->Next()) {
+        auto status = co_await PushEntrySpan(worker_id, *span);
+        if (!status.ok()) co_return status;
+      }
+      co_return absl::OkStatus();
+    };
+    auto status = co_await drain();
+    if (!status.ok()) co_return status;
+    std::uint64_t cursor = 0;
+    for (;;) {
+      auto page = co_await storage_->ReadRdbCollectionPage(
+          session_id_, value.collection_token_, cursor);
+      if (!page.ok()) co_return page.status();
+      status = encoder->StartPage(*page);
+      if (!status.ok()) co_return status;
+      status = co_await drain();
+      if (!status.ok()) co_return status;
+      cursor = page->next_cursor_;
+      if (page->done_) break;
+      // Keep at most one decoded page while disk/output waits. The encoder
+      // has drained its borrowed spans before this page goes out of scope.
+    }
+    status = encoder->Finish();
+    if (!status.ok()) co_return status;
+    co_return co_await storage_->FinishRdbCollection(session_id_,
+                                                     value.collection_token_);
+  }
+
   Task<absl::Status> ScanWorker(unsigned worker_id) {
-    (void)worker_id;
     absl::Status status = absl::OkStatus();
     storage::RdbSnapshotCursor cursor;
     unsigned reads_since_yield = 0;
-    while (status.ok()) {
-      // Never retain a batch of unencoded old values. Materialize exactly one,
-      // turn it into an RDB fragment, and release it immediately; only encoded
-      // fragments are allowed to accumulate in the bounded output queue.
-      auto batch = co_await storage_->ReadRdbSnapshotBatch(
-          session_id_, cursor, 1, 8ULL * 1024 * 1024);
-      if (!batch.ok()) {
-        status = batch.status();
-        break;
-      }
-      cursor = batch->cursor_;
-      for (storage::RdbSnapshotValue& value : batch->values_) {
-        auto fragment =
-            rdb::EncodeFileEntry(value.db_id_, value.key_, value.value_);
-        // Dirty tracking holds only pinned physical locations. Drop this
-        // transient materialization as soon as its RDB bytes exist, before a
-        // full output queue can suspend this worker.
-        std::string().swap(value.value_.encoded_);
-        std::string().swap(value.key_);
-        if (!fragment.ok()) {
-          status = fragment.status();
+    try {
+      while (status.ok()) {
+        // Grouped keys carry only a retained-view token; pages are loaded after
+        // this producer acquires exclusive ownership of the file-entry stream.
+        auto batch = co_await storage_->ReadRdbSnapshotBatch(
+            session_id_, cursor, 1, 8ULL * 1024 * 1024);
+        if (!batch.ok()) {
+          status = batch.status();
           break;
         }
-        while (!output_.TryPush(&*fragment)) {
-          if (output_.failed()) {
-            status = absl::InternalError("RDB output writer failed");
+        cursor = batch->cursor_;
+        for (storage::RdbSnapshotValue& value : batch->values_) {
+          while (!output_.TryBeginEntry(worker_id)) {
+            if (output_.failed()) {
+              status = absl::InternalError("RDB output writer failed");
+              break;
+            }
+            status = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                              std::chrono::milliseconds(1));
+            if (!status.ok()) break;
+          }
+          if (!status.ok()) break;
+          struct EntryLease {
+            RdbOutputQueue* queue;
+            unsigned owner;
+            ~EntryLease() { queue->EndEntry(owner); }
+          } lease{&output_, worker_id};
+          if (value.collection_token_ != 0) {
+            status = co_await WriteCollection(worker_id, value);
+            if (!status.ok()) break;
+            continue;
+          }
+          auto fragment =
+              rdb::EncodeFileEntry(value.db_id_, value.key_, value.value_);
+          // Dirty tracking holds only pinned physical locations. Drop this
+          // transient materialization as soon as its RDB bytes exist, before a
+          // full output queue can suspend this worker.
+          std::string().swap(value.value_.encoded_);
+          std::string().swap(value.key_);
+          if (!fragment.ok()) {
+            status = fragment.status();
             break;
           }
-          absl::Status yielded = co_await celer::SleepFor(
-              *celer::ThisWorker().self_, std::chrono::milliseconds(1));
-          if (!yielded.ok()) {
-            status = yielded;
-            break;
-          }
+          status = co_await PushEntrySpan(worker_id, *fragment);
+          if (!status.ok()) break;
         }
-        if (!status.ok()) break;
+        if (!status.ok() || batch->done_) break;
+        if (++reads_since_yield == 64) {
+          reads_since_yield = 0;
+          co_await celer::Yield(*celer::ThisWorker().self_);
+        }
       }
-      if (!status.ok() || batch->done_) break;
-      if (++reads_since_yield == 64) {
-        reads_since_yield = 0;
-        co_await celer::Yield(*celer::ThisWorker().self_);
-      }
+    } catch (const std::bad_alloc&) {
+      // Cancellation still closes the token and releases physical pins. The
+      // incomplete temporary output must not replace the previous dump.
+      RecordMemoryRejection();
+      status = absl::ResourceExhaustedError("OOM RDB backup producer");
     }
     absl::Status ended = co_await storage_->EndRdbSnapshot(session_id_);
     if (status.ok()) status = std::move(ended);

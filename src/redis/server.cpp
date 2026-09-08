@@ -958,9 +958,11 @@ Task<absl::Status> RedisService::ImportRdb() {
   std::uint64_t skipped_count = 0;
   std::vector<std::string> function_libraries;
   while (true) {
-    auto entry = reader->Next();
+    auto entry = reader->NextStreaming();
     if (!entry.ok()) co_return entry.status();
     if (!entry->has_value()) break;
+    auto drained = reader->DrainCollection();
+    if (!drained.ok()) co_return drained;
     if ((**entry).kind_ == rdb::FileEntryKind::kValue) {
       ++entry_count;
     } else if ((**entry).kind_ == rdb::FileEntryKind::kFunctionLibrary) {
@@ -977,7 +979,7 @@ Task<absl::Status> RedisService::ImportRdb() {
   std::uint64_t imported = 0;
   std::uint64_t expired = 0;
   while (true) {
-    auto next = reader->Next();
+    auto next = reader->NextStreaming();
     if (!next.ok()) co_return next.status();
     if (!next->has_value()) break;
     rdb::FileEntry entry = std::move(**next);
@@ -996,18 +998,7 @@ Task<absl::Status> RedisService::ImportRdb() {
       }
       continue;
     }
-    const unsigned owner = storage_->OwnerForKey(entry.key_);
-    auto apply = [this, entry = std::move(entry)]() mutable
-        -> Task<absl::StatusOr<storage::RestoreRawResult>> {
-      co_return co_await storage_->RestoreRawValue(
-          entry.db_id_, entry.key_, entry.value_, /*replace=*/false, nullptr);
-    };
-    absl::StatusOr<storage::RestoreRawResult> result;
-    if (owner == ThisWorker().id_) {
-      result = co_await apply();
-    } else {
-      result = co_await SubmitTaskTo(owner, std::move(apply));
-    }
+    auto result = co_await rdb::RestoreFileEntry(storage_, &*reader, entry);
     if (!result.ok() || result->busy_) {
       absl::Status failure =
           result.ok() ? absl::AlreadyExistsError("duplicate key in RDB file")
@@ -2176,13 +2167,19 @@ int RunServer(ServerOptions options) {
     std::uint64_t entries = 0;
     std::uint64_t skipped = 0;
     while (true) {
-      auto entry = reader->Next();
+      auto entry = reader->NextStreaming();
       if (!entry.ok()) {
         spdlog::error("RDB replacement preflight failed: {}",
                       entry.status().message());
         return 1;
       }
       if (!entry->has_value()) break;
+      auto drained = reader->DrainCollection();
+      if (!drained.ok()) {
+        spdlog::error("RDB replacement preflight failed: {}",
+                      drained.message());
+        return 1;
+      }
       if ((**entry).kind_ == rdb::FileEntryKind::kValue) {
         ++entries;
       } else {

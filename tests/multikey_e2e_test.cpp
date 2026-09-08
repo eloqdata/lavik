@@ -1026,7 +1026,7 @@ int main(int argc, char** argv) {
            ":0", "FLUSHDB values after transaction generation retirement");
     generation_recovery_server.Stop();
 
-#ifndef NDEBUG
+#if KEYLANE_TEST_FAULTS_AVAILABLE
     // A failed transaction keeps its generation lease through rollback. Once
     // UNDO has restored every old value, dependency pins drop and the same
     // cleaner can retire the aborted tagged records safely.
@@ -1073,7 +1073,7 @@ int main(int argc, char** argv) {
         ":0", "UNDO TTL survives recovery");
     rollback_recovered_server.Stop();
 
-#ifndef NDEBUG
+#if KEYLANE_TEST_FAULTS_AVAILABLE
     // The first transaction holds the generation's allocation gate while the
     // test hook suspends physical allocation. A same-worker peer in that
     // generation must remain queued: completing early would mean rollover
@@ -1485,7 +1485,7 @@ int main(int argc, char** argv) {
       Expect(source_client.Command({"SET", "wide-multikey:after", "ok"}), "+OK",
              "source write after the wide multi-key burst");
 
-#ifndef NDEBUG
+#if KEYLANE_TEST_FAULTS_AVAILABLE
       // Once a Function child has durably installed a catalog, losing any
       // participant's transaction marker makes the source history unsafe.
       // Inject that exact failure and require a top-level fail-closed EXEC;
@@ -1518,7 +1518,7 @@ int main(int argc, char** argv) {
 #endif
     }
 
-#ifndef NDEBUG
+#if KEYLANE_TEST_FAULTS_AVAILABLE
     // Replication transaction order gate admission regression: with an ONLINE
     // replica, a cross-shard MSET acquires the global order gate while the
     // test-only KEYLANE_REPLICATION_ORDER_HOLD_MS hook holds it for 10 s. A

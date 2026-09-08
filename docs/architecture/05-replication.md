@@ -49,8 +49,11 @@ implemented. A node detached during an incomplete full sync may report
 `role:master`, but its durable LOADING fence also prevents it from exporting
 the invalidated or partial population.
 
-`REPLICAOF host port` first changes the role epoch so the old upstream cannot
-reconnect, cancels it while database admission is still open, and waits for
+`REPLICAOF host port` first joins any automatic session teardown, closes the
+reconfiguration gate, and changes the role epoch. The gate prevents a new
+coordinator attempt throughout cancellation and promotion; the epoch rejects
+continuations from the old attempt. It cancels the old upstream while database
+admission is still open, and waits for
 any apply that already crossed the replica FIFO boundary. When leaving the
 master role, it also retires source sessions before trying to close command
 database gates: an in-progress full sync may itself hold those gates while it
@@ -370,13 +373,32 @@ Each `(partition, database)` moves through `unstarted`, `scanning`, and
 
 Baseline values are captured under the key-ordering boundary. Large external
 values pin immutable extents and stream bounded value chunks between `begin`
-and `commit` frames. The target reserves key plus encoded-value staging
-capacity from its worker-local memory share before accepting a large value.
-Failure aborts the LOADING rebuild rather than exposing a partial record.
+and `commit` frames. Grouped sources pin an immutable root and its complete
+group graph, measure the compact wire length page by page, and traverse the
+same graph again to emit chunks. Source state retains one admitted decoded
+page; completion and cancellation release the graph only after active reads
+have finished. These source-local handles do not change the wire format.
+Non-collection targets reserve key plus encoded-value
+staging capacity from their worker-local memory share. Hash, Set, List and
+Sorted Set targets instead decode the same compact wire image incrementally,
+admitting one page at a time and writing complete grouped snapshots under one
+outer transaction. The key-ordering guard spans the entire framed value;
+partial page roots remain hidden behind LOADING and cannot become a promotable
+population. The final frame validates exact bytes and cardinality before the
+transaction's durability boundary. Malformed input, cancellation or OOM
+rolls back uncommitted pages and invalidates the rebuild. Cleanup errors after
+durable commit never roll back that committed decision.
 Ordinary values are materialized into bounded record batches. Transactions
 committed during the LOADING rebuild publish their participant after-images
 only after the commit decision. `FLUSHDB` or `FLUSHALL` invalidates an active
 capture attempt so the next attempt starts from the new database epochs.
+
+Grouped target views use partition/database-local population generations.
+Reset batches invalidate only the indexes they detach; promotion changes
+visibility without changing the candidate's index identity. The worker-wide
+generation used by ordinary suspended IO remains separate. See
+[Grouped collections](09-grouped-collections.md) for graph ownership,
+incremental mutation and snapshot limits.
 
 Before a source session becomes visible, each worker reserves coverage-map
 headroom for its largest `(partition, database)` scan, because only one such
@@ -390,12 +412,14 @@ durable foreground mutations remain valid but the lower-priority full-sync
 attempt is invalidated and retried.
 
 Native replication frame receive/send buffers, fragmented-command assembly,
-decoded record key/value strings, record vectors, and RDB strings are bounded
+decoded record key/value strings and record vectors are bounded
 temporary materializations. They rely on protocol size limits and checked
 allocation rather than max-memory reservations. State that can accumulate or
 survive an individual frame is still admitted against retained memory: this
 includes journal/backlog ownership, full-sync coverage and subscriber queues,
-and the replica's multi-frame large-value staging buffer.
+and the replica's multi-frame large-value staging buffer. Collection RDB
+decoders reserve memory before allocating a plain page or packed node; the
+page carries that charge through storage ingestion or output backpressure.
 
 Runtime-only commands published while the key snapshot is in progress enter
 the same bounded full-sync command FIFOs without creating snapshot state.
@@ -588,8 +612,13 @@ A Redis follower authenticates, sends PING, advertises its listening port and
 PSYNC2 capability, and requests either its process-local replid/offset or a
 fresh full synchronization. FULLRESYNC receives a length-delimited RDB into a
 temporary file. Import is serialized, closes and drains command database
-gates, resets the source-owned slots, validates ownership, and restores raw
-Redis values. Unsupported self-describing Module values and Module auxiliary
+gates, resets the source-owned slots, validates ownership, and restores values.
+Collection input is prevalidated and then consumed as admitted pages on the
+key owner, with one atomic ingest decision per complete key rather than a
+whole-object compact buffer. Packed collections and quicklist nodes are
+measured before decoding; Hash/Set/ZSet duplicate identities are checked
+across page boundaries, and ZSet input need not arrive in score order.
+Unsupported self-describing Module values and Module auxiliary
 records are skipped with warnings. Redis 7 `FUNCTION2` entries are instead
 collected as one catalog, validated before key application begins, and
 installed through the durable catalog replacement only after the RDB keys
@@ -623,6 +652,12 @@ time. The exporter closes command gates, starts one RDB snapshot per worker,
 fences every replication log, reopens writes, and streams a bounded-queue RDB
 followed by online backlog events. It snapshots the Function catalog inside
 the same cut and emits Redis 7 `FUNCTION2` entries before the key records.
+Grouped keys retain their exact snapshot graph and stream admitted pages
+through the incremental collection encoder. A whole-key lease serializes one
+queue producer token across workers: producer-local FIFO alone would not
+prevent different keys' fragments from interleaving at the consumer. Output
+fragments are at most 1 MiB; page memory and graph pins remain owned across
+network backpressure and are released on completion or cancellation.
 
 The backlog merger reads one head event per worker. Ready cross-worker
 transactions and control barriers take priority over unrelated mutations; a

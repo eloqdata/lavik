@@ -26,9 +26,10 @@ constexpr std::size_t ToIndex(CommandKind kind) noexcept {
   return static_cast<std::size_t>(kind);
 }
 
-// Written only by the owning worker. Alignment and the size assertion keep
-// adjacent workers from sharing a cache line.
-struct alignas(64) WorkerMetricsShard {
+// Transport copies use ordinary alignment: this data can live in a SubmitTo
+// result or a coroutine frame, whose allocator guarantees only max_align_t.
+// Cache-line isolation belongs to the live shard wrapper, not its snapshots.
+struct WorkerMetricsData {
   std::array<CommandMetricTotals, kCommandKindCount> commands_{};
   // Command latencies are strongly clustered under steady load. This is a
   // routing hint only; every miss still performs the exact lower_bound, so
@@ -47,8 +48,19 @@ struct alignas(64) WorkerMetricsShard {
   std::uint64_t dataset_changes_saved_ = 0;
 };
 
+// Written only by the owning worker. Keep neighboring live shards on separate
+// cache lines without imposing that alignment on cross-worker return values.
+struct alignas(64) WorkerMetricsShard : WorkerMetricsData {};
+
+using WorkerMetricsTransfer = std::pair<WorkerMetricsData, std::uint64_t>;
+
 static_assert(alignof(WorkerMetricsShard) == 64);
 static_assert(sizeof(WorkerMetricsShard) % 64 == 0);
+static_assert(alignof(WorkerMetricsData) <= alignof(std::max_align_t));
+static_assert(alignof(WorkerMetricsTransfer) <= alignof(std::max_align_t));
+static_assert(alignof(WorkerMetricsSnapshot) <= alignof(std::max_align_t));
+static_assert(alignof(celer::Worker::StorageIoStats) <=
+              alignof(std::max_align_t));
 
 std::unique_ptr<WorkerMetricsShard[]> g_worker_metrics;
 unsigned g_worker_metrics_count = 0;
@@ -195,10 +207,13 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
   result.counter_frequency_ = g_counter_frequency;
   for (unsigned worker = 0; worker < g_worker_metrics_count; ++worker) {
     // Copy on the owner rather than reading its live cache lines remotely.
+    // Explicitly slice off the live shard's alignment before returning: pair
+    // deduction from WorkerMetricsShard would over-align the coroutine frame.
     const auto [shard, connections] =
-        co_await celer::SubmitTo(worker, [worker] {
-          return std::pair{g_worker_metrics[worker],
-                           celer::ThisWorker().self_->ActiveConnectionCount()};
+        co_await celer::SubmitTo(worker, [worker]() -> WorkerMetricsTransfer {
+          return {
+              static_cast<const WorkerMetricsData&>(g_worker_metrics[worker]),
+              celer::ThisWorker().self_->ActiveConnectionCount()};
         });
     const celer::Worker::StorageIoStats storage_io = co_await celer::SubmitTo(
         worker, [] { return celer::ThisWorker().self_->storage_io_stats(); });

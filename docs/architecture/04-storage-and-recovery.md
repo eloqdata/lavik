@@ -20,9 +20,17 @@ durable records and epochs those modules act on.
 The top-level key indexes are runtime authority. An optional clean-shutdown
 checkpoint serializes them as a one-shot recovery accelerator, but committed
 records remain the durable source of truth and recovery falls back to scanning
-them whenever a checkpoint is absent or invalid. Collection values
-may contain storage-managed tree or compact encodings, but their current root
-is still selected through the same top-level record index.
+them whenever a checkpoint is absent or invalid. Collections have compact
+complete-value encodings. Hash, Set, List and Sorted Set also have independently
+addressable complete group snapshots, selected through a sparse object side index when the
+top-level index marks a grouped representation. Their serving, transaction,
+recovery and graph-lifecycle boundaries are described in
+[Grouped collections](09-grouped-collections.md). Collection writes promote
+automatically at the compact-size threshold, while streaming imports construct
+grouped graphs directly. Hash/Set use prefix routing; List/Sorted Set use
+ordered page directories. Explicit full-image callbacks retain aggregate
+materialization limits; grouped key transfers and collection snapshot streams
+instead consume admitted pages.
 
 ## Ownership and runtime state
 
@@ -157,9 +165,20 @@ restart would reject.
 
 The version-1 record wire layout has a 72-byte base header at explicit byte
 offsets. A nonzero transaction ID and expiration timestamp each add one aligned
-8-byte extension, so fixed metadata is 72, 80, or 88 bytes. The base packs
+8-byte extension, so ordinary fixed metadata is 72, 80, or 88 bytes. The base packs
 record kind, database, value type, external-payload state, external-key state,
-and extension presence into one 16-bit word. Header length is derived from
+grouped-root and auxiliary-group markers, and extension presence into one
+16-bit word. An auxiliary group carries an additional 32-byte checked
+identity containing its object incarnation, routing identity, retirement bit
+and optional nested-command transaction decision.
+Its identity is available without reading an external value; group payloads
+retain complete snapshots, not read-time mutation logs. The group payload
+envelope leaves framing space within the 1 GiB record-payload limit while
+preserving the independent 512 MiB limit for each field and value. Hash and Set
+use persisted-seed hash prefixes; List and Sorted Set use stable ordered page
+identities. Roots preserve an independent group revision, distinct from the
+source command sequence shared by mutations in a replay envelope.
+Header length is derived from
 those flags and key length; total record length is derived from header and
 payload length. Neither derived length is stored. The decoded `RecordHeader`
 is a runtime view rather than a persisted C++ object representation.
@@ -336,6 +355,20 @@ appended to the current worker's ordinary or transaction-generation staging
 block. The in-memory index is updated immediately and may point at staged bytes
 that have not crossed a crash-durability boundary. Staged reads use that buffer
 directly.
+
+Opted-in single-key writes to existing small inline Hash, Set, List and Sorted
+Set records retain exclusive key intent but release worker store state while
+reading and preparing the replacement. Publication reacquires store state and
+validates the source's logical version and population; same-version GC relocation
+is allowed, and append resolves the current physical predecessor for retirement.
+The command's database admission remains held through publication. This applies to HSET/HMSET,
+SADD/SREM, ordinary single-key List writes, and ZADD/ZINCRBY/ZREM. Successful
+no-ops and transitions to empty or grouped values also validate before returning
+or publishing. Creation, multi-key operations, transactions, Stream writes,
+native candidate/loading paths, grouped records and external keys/values retain
+their separate locking contracts. Ordinary online replay can use the same
+guarded single-key paths. Ordinary String GET does not acquire the store-state
+mutex; String SET still acquires it for append-state mutation.
 
 Runtime indexes retain key identity, logical version, record coordinates, and
 the state needed to serve the current value. The physical block's owner and
@@ -674,10 +707,14 @@ through the cold-free lifecycle only when it is sealed and durable and has no
 active transaction leases, live tagged bytes, or dependency pins. When a
 transaction block is durably retired, its deferred external-key extent debt is
 released through the same asynchronous reclaim path as an ordinary record
-block. When a shutdown checkpoint is enabled, worker 0 ignores the online
-cooldown and runs
-this lifecycle to a fixed point after commit and flush drain; failure skips the
-checkpoint rather than weakening cold recovery.
+block. Standalone grouped writes can coordinate this lifecycle under foreground
+space pressure before acquiring a new generation lease; borrowed transaction
+writers never wait for their own generation to retire. Online cleaning yields
+to shutdown at block boundaries after already-published relocations become
+durable, retaining the incomplete generation's decisions and source allocations.
+When a shutdown checkpoint is enabled, worker 0 ignores the online cooldown
+and completes this lifecycle to a fixed point after commit and flush drain;
+failure skips the checkpoint rather than weakening cold recovery.
 
 ## Crash-consistency invariants and failure behavior
 
@@ -741,6 +778,10 @@ Current test evidence includes:
 | `tests/atomicity_stress_e2e_test.cpp` | Overlapping multi-key serializability and recovery after a graceful durability drain |
 | `tests/list_e2e_test.cpp` | Function-catalog body/root/runtime crash windows, multi-device torn-root fallback, and shielded expired-winner behavior under an injected recovery clock rollback |
 | `tests/buffer_pool_test.cpp` | Reuse of a waiting storage write-buffer acquisition |
+| `tests/grouped_hash_test.cpp` | Group codecs, incremental routing, mutation planning and transaction-adjudicated recovery-model validation |
+| `tests/grouped_object_index_test.cpp` | Side-index identity, copy-on-write updates, retirement markers, pre-admitted publication and retained-memory rollback |
+| `tests/grouped_recovery_e2e_test.cpp` | Real grouped disk images, child/outer decisions, physical corruption, worker reassignment, GC crash windows, snapshots and graph detachment |
+| `LargeHashDurabilityE2eTest` in `tests/list_e2e_test.cpp` | Large Hash extent-write and GC crash recovery, bounded-device reclamation, and RESP OOM atomicity; dedicated grouped suites also cover graph publication and relocation boundaries |
 | `tests/device_affinity_test.cpp` | SPDK controller quota and qpair-owner planning across balanced, weighted, and controller-heavy layouts |
 
 ## Known gaps and documentation limits
@@ -797,6 +838,8 @@ current source code are authoritative for present storage behavior.
 | Public lifecycle, routing, typed operations, locked transaction contract, snapshots, epochs, maintenance, and durability interfaces | `include/keylane/storage/engine.h` |
 | Worker, partition, block, append-stream, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h` |
 | Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/keylane/storage/scan_hash_map.h`, `include/keylane/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
+| Compact and grouped Hash/Set serving, group identity and object side index | `src/storage/engine/hash_tree.cpp`, `src/storage/engine/hash_codec.cpp`, `src/storage/engine/grouped_hash.cpp`, `src/storage/engine/grouped_object_index.cpp`, [Grouped collections](09-grouped-collections.md) |
+| Compact physical index representation shared by user-key and group-location indexes | `include/keylane/storage/detail/record_index.h` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/keylane/storage/format.h`, `src/storage/format.cpp` |
 | Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |
 | System-state manifest, catalog COW extents, full-sync fence, population token, and promotion base | `src/storage/engine/system_state.cpp`, `include/keylane/storage/engine.h` |

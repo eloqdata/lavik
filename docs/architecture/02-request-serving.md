@@ -218,6 +218,11 @@ closed population.
   socket write. Direct disk replies keep their read lease; unbounded replies
   use a chunk source. A 30-second no-progress watchdog closes a connection that
   stalls while a streamed reply holds a database gate.
+  Negative-count random replies retain a charged, immutable command-time
+  snapshot (including inside `EXEC`), without retaining DB/key locks during
+  socket backpressure. Their encoder limits each output chunk to 1 MiB and
+  preserves a bulk-string cursor across chunks; disconnecting destroys the
+  snapshot and its retained charges.
 
 ## Lua scripts and Functions
 
@@ -372,5 +377,5 @@ real server executable.
 | Durable process-global Function catalog lifecycle | `src/redis/function_catalog.h`, `src/redis/function_catalog.cpp`, `src/storage/engine/system_state.cpp` |
 | Pub/Sub session queues, worker-local registries, fan-out, and subscribed connection serving | `include/keylane/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | SLOWLOG shards, command-stat reset, and client/Sentinel administration | `include/keylane/slowlog.h`, `src/redis/slowlog.cpp`, `include/keylane/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
-| Redis RDB import/export and backup commands | `include/keylane/rdb.h`, `src/redis/rdb.cpp`, `src/redis/backup.h`, `src/redis/backup.cpp` |
+| Redis RDB import/export and backup commands | `include/keylane/rdb.h`, `src/redis/rdb.cpp`, `include/keylane/rdb_collection.h`, `src/redis/rdb_collection.cpp`, `src/redis/backup.h`, `src/redis/backup.cpp` |
 | Parser, metadata, configuration, max-client admission, and end-to-end command coverage | `tests/resp_test.cpp`, `tests/command_table_test.cpp`, `tests/config_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/metrics_e2e_test.cpp`, `tests/sentinel_e2e_test.cpp`, `tests/list_e2e_test.cpp` |

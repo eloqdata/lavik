@@ -381,6 +381,121 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   auto& partition = PartitionForKey(key_store, key);
   auto& index = partition.indexes_[record.db_id_];
   const Digest digest = ComputeDigest(key);
+  if (record.hash_group_) {
+    const HashGroupId id{.prefix_ = record.group_prefix_,
+                         .bits_ = record.group_prefix_bits_};
+    auto lookup_object =
+        [&]() -> Task<absl::StatusOr<GroupedHashObject::Handle>> {
+      if (EffectiveRecordDbEpoch(partition, record.db_id_) !=
+              record.db_epoch_ ||
+          partition.replication_epoch_ != record.replication_epoch_) {
+        co_return GroupedHashObject::Handle{};
+      }
+      auto* root = index.Find(digest, key);
+      if (root != nullptr && !root->key_complete()) {
+        auto verified =
+            co_await FindVerifiedEntry(key_store, index, digest, key);
+        if (!verified.ok()) co_return verified.status();
+        root = *verified;
+      }
+      if (root == nullptr || !root->value_.grouped()) {
+        co_return GroupedHashObject::Handle{};
+      }
+      auto found = partition.grouped_objects_[record.db_id_].Lookup(
+          key, GroupedObjectVersion{
+                   .root_ = MaterializeIndexLocation(*root),
+                   .db_epoch_ = record.db_epoch_,
+                   .replication_epoch_ = partition.replication_epoch_,
+                   .index_generation_ =
+                       partition.grouped_generations_[record.db_id_],
+               });
+      if (!found.ok()) co_return found.status();
+      if ((*found)->incarnation() != record.group_incarnation_) {
+        co_return GroupedHashObject::Handle{};
+      }
+      co_return *found;
+    };
+    auto object = co_await lookup_object();
+    if (!object.ok()) co_return object.status();
+    if (*object == nullptr) {
+      co_return std::optional<RelocationDurabilityFence>{};
+    }
+    const RecordIndex::Entry* group = (*object)->FindRecord(id);
+    if (group == nullptr ||
+        !MaterializeIndexLocation(*group).SamePhysicalRecord(source_location)) {
+      co_return std::optional<RelocationDurabilityFence>{};
+    }
+    const ExtentManifest extents = (*object)->ExtentsFor(id);
+    const RelocationSource source{
+        .db_epoch_ = record.db_epoch_,
+        .replication_epoch_ = partition.replication_epoch_,
+        .index_generation_ = key_store.index_generations_[record.db_id_],
+        .block_id_ = source_location.block_id(),
+        .allocation_epoch_ = source_location.allocation_epoch(),
+        .record_offset_ = source_location.record_offset(),
+    };
+    const GroupRecordWrite descriptor{
+        .auxiliary_ = true,
+        .incarnation_ = record.group_incarnation_,
+        .id_ = id,
+        .retired_ = record.group_retired_,
+        .batch_txid_ = clear_txid ? 0 : record.group_batch_txid_,
+        .prepare_root_ = {},
+        .changed_groups_ = {},
+    };
+    RecordLocation relocated;
+    absl::Status written = co_await WriteRecordLocked(
+        key_store, record.db_id_, key, value, record.kind_, record.value_type_,
+        0, digest, clear_txid ? 0 : record.txid_, record.mutation_sequence_,
+        true, true, record.external_, record.key_external_,
+        record.logical_size_, extents, &relocated, &source, nullptr, nullptr,
+        nullptr, nullptr, nullptr, &partition, &descriptor);
+    if (!written.ok()) co_return written;
+    // Physical allocation can suspend owner serialization. Re-resolve the
+    // incarnation and exact group address afterward; a client update, another
+    // relocation or FLUSHDB must not be overwritten by this staged copy.
+    object = co_await lookup_object();
+    if (!object.ok() || *object == nullptr ||
+        (group = (*object)->FindRecord(id)) == nullptr ||
+        !MaterializeIndexLocation(*group).SamePhysicalRecord(source_location)) {
+      absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(relocated));
+      if (!dead.ok()) co_return dead;
+      if (!object.ok()) co_return object.status();
+      co_return std::optional<RelocationDurabilityFence>{};
+    }
+    auto replacement = GroupedHashObject::RelocateGroup(
+        *object, id, source_location, relocated, extents);
+    if (!replacement.ok()) {
+      // A failed metadata admission owns only the new physical record, not
+      // another reference to the shared value extents. Leave the old graph
+      // current and release that unreachable record without reclaiming data.
+      absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(relocated));
+      if (!dead.ok()) co_return dead;
+      co_return replacement.status();
+    }
+    absl::Status published = partition.grouped_objects_[record.db_id_].Publish(
+        key, *object, std::move(*replacement));
+    if (!published.ok()) {
+      absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(relocated));
+      if (!dead.ok()) co_return dead;
+      co_return published;
+    }
+    KEYLANE_MAYBE_CRASH_AT("hash-group-defrag-copy-staged");
+    // The salvage caller retains the source block and owes this destination
+    // fence before clearing its bitmap bit, just as for a top-level record.
+    // Unchanged extent ownership transfers to the new group record.
+    absl::Status dead =
+        co_await MarkRecordDead(RetiredRecordOf(source_location));
+    if (!dead.ok()) co_return dead;
+    co_return std::optional<RelocationDurabilityFence>(
+        RelocationDurabilityFence{
+            .block_id_ = relocated.block_id(),
+            .allocation_epoch_ = relocated.allocation_epoch(),
+            .block_owner_ = relocated.block_owner(),
+            .committed_bytes_ = static_cast<std::uint32_t>(
+                relocated.record_offset() + relocated.total_disk_bytes()),
+        });
+  }
   RecordIndex::Entry* current = nullptr;
   for (RecordIndex::Entry* candidate : index.FindCandidates(digest, key)) {
     if (MaterializeIndexLocation(*candidate)
@@ -396,7 +511,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   // published the new epoch and this worker's detach just has not run yet.
   // There is no value in copying it; relocation would retain the source epoch
   // for crash safety and detached-index reclaim will settle its accounting.
-  if (DbEpoch(record.db_id_) != record.db_epoch_) {
+  if (EffectiveRecordDbEpoch(partition, record.db_id_) != record.db_epoch_) {
     co_return std::optional<RelocationDurabilityFence>{};
   }
   const RelocationSource source{
@@ -407,13 +522,38 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       .allocation_epoch_ = source_location.allocation_epoch(),
       .record_offset_ = source_location.record_offset(),
   };
+  GroupedHashObject::PreparedHandle grouped_builder;
+  std::optional<GroupedObjectIndex::Publication> grouped_publication;
+  GroupRecordWrite grouped_descriptor;
+  if (record.grouped_) {
+    auto object = partition.grouped_objects_[record.db_id_].Lookup(
+        key,
+        GroupedObjectVersion{
+            .root_ = MaterializeIndexLocation(*current),
+            .db_epoch_ = record.db_epoch_,
+            .replication_epoch_ = partition.replication_epoch_,
+            .index_generation_ = partition.grouped_generations_[record.db_id_],
+        });
+    if (!object.ok()) co_return object.status();
+    auto prepared = GroupedHashObject::PrepareRootRelocation(*object);
+    if (!prepared.ok()) co_return prepared.status();
+    grouped_builder = std::move(*prepared);
+    auto publication =
+        partition.grouped_objects_[record.db_id_].PreparePublish(key, *object);
+    if (!publication.ok()) co_return publication.status();
+    grouped_publication.emplace(std::move(*publication));
+    grouped_descriptor.prepared_root_ = &grouped_builder;
+    grouped_descriptor.publication_ = &*grouped_publication;
+  }
   RecordLocation relocated;
   absl::Status written = co_await WriteRecordLocked(
       key_store, record.db_id_, key, value, record.kind_, record.value_type_,
       record.expire_at_ms_, digest, clear_txid ? 0 : record.txid_,
       record.mutation_sequence_, true, true, record.external_,
       record.key_external_, record.logical_size_,
-      ExtentsFor(key_store, current), &relocated, &source);
+      ExtentsFor(key_store, current), &relocated, &source, nullptr, nullptr,
+      nullptr, nullptr, nullptr, &partition,
+      record.grouped_ ? &grouped_descriptor : nullptr);
   if (written.code() == absl::StatusCode::kAborted) {
     // A client write replaced this key, or FLUSHDB/replica reset replaced the
     // index, while relocation waited for a block. Nothing was written; the
@@ -422,6 +562,14 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   }
   if (!written.ok()) {
     co_return written;
+  }
+  // The index now names the copied record, but its relocation fence has
+  // not been awaited. A crash here must still find a complete durable source.
+  if (record.grouped_) {
+    KEYLANE_MAYBE_CRASH_AT("grouped-root-defrag-copy-staged");
+  }
+  if (record.value_type_ == ValueType::kHash) {
+    KEYLANE_MAYBE_CRASH_AT("hash-defrag-copy-staged");
   }
   co_return std::optional<RelocationDurabilityFence>(RelocationDurabilityFence{
       .block_id_ = relocated.block_id(),
@@ -687,7 +835,10 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     // A record from a flushed database epoch is unreachable. Its header is
     // sufficient to advance safely; do not checksum a large payload or read
     // a shared extent chain that can no longer affect recovery.
-    if (record.kind_ != RecordKind::kTxCommit &&
+    // Native replica candidates use per-partition mapped epochs, so their
+    // eligibility is checked on the key owner after resolving the parent key.
+    if (!replica_loading_.load(std::memory_order_acquire) &&
+        record.kind_ != RecordKind::kTxCommit &&
         DbEpoch(record.db_id_) != record.db_epoch_) {
       record_offset += record.total_disk_bytes_;
       absl::Status paced = co_await DefragRecordCheckpoint(store);
@@ -757,7 +908,8 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
             record_offset, record.total_disk_bytes_, store.worker_->id(), false,
             record.external_, record.key_external_, false, false,
             record.txid_ != 0 && record.kind_ != RecordKind::kTxCommit,
-            record.kind_, record.value_type_));
+            record.kind_, record.value_type_, record.expire_at_ms_ != 0,
+            record.grouped_));
     if (record.external_) {
       const std::uint64_t extent_bytes =
           record.logical_size_ + (record.key_external_ ? record.key_bytes_ : 0);
@@ -772,10 +924,12 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     }
 
     if (committed_txids != nullptr &&
-        !committed_txids->contains(record.txid_)) {
-      // No durable decision: never turn this record into an unconditional
-      // txid-zero recovery winner. Rollback/accounting will make it dead; if
-      // it is still charged, the generation remains unreclaimable.
+        (!committed_txids->contains(record.txid_) ||
+         (record.group_batch_txid_ != 0 &&
+          !committed_txids->contains(record.group_batch_txid_)))) {
+      // No complete durable decision: never turn this record into an
+      // unconditional txid-zero recovery winner. Rollback/accounting will make
+      // it dead; if it is still charged, the generation remains unreclaimable.
       record_offset += record.total_disk_bytes_;
       continue;
     }

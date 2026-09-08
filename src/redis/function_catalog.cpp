@@ -1,7 +1,5 @@
 #include "function_catalog.h"
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -12,6 +10,7 @@
 #include "absl/strings/str_cat.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
+#include "keylane/fault_injection.h"
 #include "keylane/rdb.h"
 #include "keylane/replication_command.h"
 
@@ -20,15 +19,6 @@ namespace {
 
 std::unique_ptr<FunctionCatalog> g_function_catalog;
 std::atomic_flag g_function_catalog_operation = ATOMIC_FLAG_INIT;
-
-void MaybeCrashFunctionCatalogAt(const char* point) noexcept {
-#ifndef NDEBUG
-  const char* armed = std::getenv("KEYLANE_CRASH_POINT");
-  if (armed != nullptr && std::string_view(armed) == point) _exit(86);
-#else
-  (void)point;
-#endif
-}
 
 }  // namespace
 
@@ -180,7 +170,7 @@ celer::Task<absl::Status> FunctionCatalog::CommitStagedCatalog(
         "Function catalog commit has no durable staging token");
   }
   if (enable_crash_points) {
-    MaybeCrashFunctionCatalogAt("function-catalog-before-runtime-swap");
+    KEYLANE_MAYBE_CRASH_AT("function-catalog-before-runtime-swap");
   }
   for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
     auto commit = [] {
@@ -196,7 +186,7 @@ celer::Task<absl::Status> FunctionCatalog::CommitStagedCatalog(
   ReplaceStoredLuaFunctionCatalog(std::move(staged.libraries_));
   durability_token_ = token;
   if (enable_crash_points) {
-    MaybeCrashFunctionCatalogAt("function-catalog-after-runtime-swap");
+    KEYLANE_MAYBE_CRASH_AT("function-catalog-after-runtime-swap");
   }
   co_return absl::OkStatus();
 }

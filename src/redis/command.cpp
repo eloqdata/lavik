@@ -46,6 +46,7 @@
 #include "keylane/command_table.h"
 #include "keylane/config.h"
 #include "keylane/expiration.h"
+#include "keylane/fault_injection.h"
 #include "keylane/glob.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
@@ -117,8 +118,6 @@ struct ClientConnectionRecord {
 // request processing needs neither a lock nor an atomic lookup.
 std::array<std::vector<ClientConnectionRecord>, storage::kLogicalStorageShards>
     g_worker_clients;
-
-constexpr std::size_t kEstimatedIndexBytesPerKey = 512;
 
 bool CmpCaseInsensitive(std::string_view a, std::string_view b);
 std::string_view AppendStorageError(ReplyBuilder& reply_builder,
@@ -2198,9 +2197,10 @@ bool TryBeginDbOperation(std::uint8_t db_id) noexcept {
   return false;
 }
 
-// InitStorage resolves this before worker threads start. Every ordinary write
-// then does only the unarmed pointer check, without libc getenv or a
-// function-local static guard.
+#if KEYLANE_FAULTS_ENABLED
+// InitStorage resolves this before worker threads start. Fault-enabled writes
+// use the cached pointer instead of getenv or a function-local static guard;
+// ordinary Release builds omit both the hook and its coroutine call sites.
 const char* g_command_pause_before_db_admission = nullptr;
 
 // Deterministic E2E hook for widening the role-change window after write
@@ -2223,6 +2223,7 @@ Task<absl::Status> MaybePauseBeforeCommandDbAdmission() {
   co_return co_await celer::SleepFor(*ThisWorker().self_,
                                      std::chrono::milliseconds(milliseconds));
 }
+#endif
 
 void EndDbOperation(std::uint8_t db_id) noexcept {
   LocalDbGate(db_id).fetch_sub(1, std::memory_order_acq_rel);
@@ -2625,35 +2626,35 @@ Task<absl::Status> BeginReplicationTransactionOrder(
     ReplicationTransactionOrderGuard* guard) {
   co_await g_replication_transaction_order.Acquire(*ThisWorker().self_);
   guard->Activate();
-#ifndef NDEBUG
-  // Test-only hold for the order-gate e2e: once per process, keep the freshly
-  // acquired gate for the configured span and log a marker the fixture polls,
-  // so the test observes gate admission behaviour instead of guessing with
-  // sleeps. The gate's real hold window (until participant markers are
-  // queued) is otherwise too short to observe deterministically.
-  static std::atomic<bool> order_hold_claimed = false;
-  const char* order_hold_text =
-      std::getenv("KEYLANE_REPLICATION_ORDER_HOLD_MS");
-  bool expected_order_hold = false;
-  if (order_hold_text != nullptr &&
-      order_hold_claimed.compare_exchange_strong(expected_order_hold, true,
-                                                 std::memory_order_acq_rel)) {
-    char* end = nullptr;
-    const unsigned long hold_ms = std::strtoul(order_hold_text, &end, 10);
-    if (end != order_hold_text && *end == '\0' && hold_ms != 0) {
-      spdlog::warn(
-          "KEYLANE_REPLICATION_ORDER_HOLD_MS holding the replication order "
-          "gate for {} ms",
-          hold_ms);
-      absl::Status held = co_await celer::SleepFor(
-          *ThisWorker().self_, std::chrono::milliseconds(hold_ms));
-      if (!held.ok()) {
-        guard->Release();
-        co_return held;
-      }
-    }
-  }
-#endif
+  KEYLANE_FAULT_INJECT(
+      // Test-only hold for the order-gate e2e: once per process, keep the
+      // freshly acquired gate for the configured span and log a marker the
+      // fixture polls, so the test observes gate admission behaviour instead of
+      // guessing with sleeps. The gate's real hold window (until participant
+      // markers are queued) is otherwise too short to observe
+      // deterministically.
+      static std::atomic<bool> order_hold_claimed = false;
+      const char* order_hold_text =
+          std::getenv("KEYLANE_REPLICATION_ORDER_HOLD_MS");
+      bool expected_order_hold = false;
+      if (order_hold_text != nullptr &&
+          order_hold_claimed.compare_exchange_strong(
+              expected_order_hold, true, std::memory_order_acq_rel)) {
+        char* end = nullptr;
+        const unsigned long hold_ms = std::strtoul(order_hold_text, &end, 10);
+        if (end != order_hold_text && *end == '\0' && hold_ms != 0) {
+          spdlog::warn(
+              "KEYLANE_REPLICATION_ORDER_HOLD_MS holding the replication order "
+              "gate for {} ms",
+              hold_ms);
+          absl::Status held = co_await celer::SleepFor(
+              *ThisWorker().self_, std::chrono::milliseconds(hold_ms));
+          if (!held.ok()) {
+            guard->Release();
+            co_return held;
+          }
+        }
+      });
   co_return absl::OkStatus();
 }
 
@@ -3170,13 +3171,13 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
         "ERR wrong number of arguments for 'keys' command"));
   }
   // The shared fault-injection pause makes the admission-to-exclusive-gate
-  // generation race deterministic in integration coverage. It is inert
-  // unless the test-only environment setting is present.
-  absl::Status paused = co_await MaybePauseBeforeCommandDbAdmission();
-  if (!paused.ok()) {
-    co_return BuiltReply(reply_builder.AppendError(
-        absl::StrCat("ERR database admission failed: ", paused.message())));
-  }
+  // generation race deterministic in fault-enabled integration coverage.
+  KEYLANE_FAULT_INJECT(
+      absl::Status paused = co_await MaybePauseBeforeCommandDbAdmission();
+      if (!paused.ok()) {
+        co_return BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR database admission failed: ", paused.message())));
+      });
   const std::uint8_t db = request.db_id_;
   if (!CloseDbGate(db)) {
     co_return BuiltReply(reply_builder.AppendError(
@@ -3319,71 +3320,199 @@ std::optional<NegativeRandomStreamOptions> ParseNegativeRandomStream(
   return options;
 }
 
-// Keep one immutable command-time view and generate the with-replacement
-// result in bounded batches. This preserves the command's atomic read view
-// without retaining a DB gate or key lock across socket backpressure.
-struct NegativeRandomStreamState {
+// The snapshot and its accounting move together across workers. A cursor
+// retains the selected tuple until all of its RESP fragments have been sent:
+// choosing again at a chunk boundary would change the announced bulk value.
+struct RandomStreamPayloadState {
+  static constexpr std::size_t kChunkBytes = 1024 * 1024;
+  RetainedMemoryCharge state_charge_;
+  RetainedMemoryCharge chunk_charge_;
+  RetainedMemoryCharge supplemental_snapshot_charge_;
+  storage::HashResult snapshot_;
+  NegativeRandomStreamOptions options_;
+  std::uint64_t remaining_ = 0;
+  std::uint64_t population_ = 0;
+  enum class Part { kSelect, kHeader, kValue, kTerminator };
+  Part part_ = Part::kSelect;
+  std::size_t selected_ = 0;
+  std::size_t tuple_field_ = 0;
+  std::size_t part_offset_ = 0;
+  std::array<char, 32> header_{};
+  std::size_t header_bytes_ = 0;
+};
+
+absl::Status AdoptRandomStreamSnapshot(RandomStreamPayloadState& state,
+                                       storage::HashResult snapshot) {
+  const std::size_t width = state.options_.with_values_ ? 2 : 1;
+  if (snapshot.length_ > std::numeric_limits<std::size_t>::max() / width ||
+      snapshot.values_.size() != snapshot.length_ * width)
+    return absl::InternalError(
+        "random snapshot disagrees with collection length");
+  std::size_t retained = sizeof(snapshot) + snapshot.values_.capacity() *
+                                                sizeof(snapshot.values_[0]);
+  for (const auto& value : snapshot.values_) {
+    if (!value)
+      return absl::InternalError("random snapshot contains a missing value");
+    if (value->capacity() + 1 >
+        std::numeric_limits<std::size_t>::max() - retained)
+      return absl::ResourceExhaustedError("OOM random snapshot is too large");
+    retained += value->capacity() + 1;
+  }
+  // Modern producers transfer their output charge. The fallback also covers
+  // older compact producers, without charging the same buffers twice.
+  if (retained > snapshot.retained_charge_.bytes()) {
+    const auto additional = retained - snapshot.retained_charge_.bytes();
+    auto admission = TryReserveMemory(additional);
+    if (!admission) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError("OOM random snapshot retention");
+    }
+    state.supplemental_snapshot_charge_.Adopt(&*admission, additional);
+  }
+  // Account before constructing payloads. Allow an old returned chunk and
+  // its successor to overlap while the socket writer advances its coroutine.
+  constexpr auto bytes = 2 * (RandomStreamPayloadState::kChunkBytes + 1);
+  auto admission = TryReserveMemory(bytes);
+  if (!admission) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM random stream chunk retention");
+  }
+  state.chunk_charge_.Adopt(&*admission, bytes);
+  state.population_ = snapshot.length_;
+  state.snapshot_ = std::move(snapshot);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> EncodeRandomStreamChunk(
+    RandomStreamPayloadState& state) {
+  if (state.remaining_ == 0) return std::string();
+  try {
+    std::string payload;
+    payload.reserve(RandomStreamPayloadState::kChunkBytes);
+    const std::size_t width = state.options_.with_values_ ? 2 : 1;
+    auto begin_bulk = [&] {
+      state.header_[0] = '$';
+      const auto size =
+          state.snapshot_.values_[state.selected_ + state.tuple_field_]->size();
+      auto encoded = std::to_chars(state.header_.data() + 1,
+                                   state.header_.data() + 29, size);
+      assert(encoded.ec == std::errc{});
+      *encoded.ptr++ = '\r';
+      *encoded.ptr++ = '\n';
+      state.header_bytes_ = encoded.ptr - state.header_.data();
+      state.part_ = RandomStreamPayloadState::Part::kHeader;
+    };
+    while (state.remaining_ != 0 &&
+           payload.size() < RandomStreamPayloadState::kChunkBytes) {
+      if (state.part_ == RandomStreamPayloadState::Part::kSelect) {
+        state.selected_ = static_cast<std::size_t>(RandomRank(
+                              state.population_, RandomSampleGenerator())) *
+                          width;
+        state.tuple_field_ = 0;
+        begin_bulk();
+      }
+      std::string_view piece;
+      switch (state.part_) {
+        case RandomStreamPayloadState::Part::kHeader:
+          piece = {state.header_.data(), state.header_bytes_};
+          break;
+        case RandomStreamPayloadState::Part::kValue:
+          piece =
+              *state.snapshot_.values_[state.selected_ + state.tuple_field_];
+          break;
+        case RandomStreamPayloadState::Part::kTerminator:
+          piece = "\r\n";
+          break;
+        case RandomStreamPayloadState::Part::kSelect:
+          std::terminate();  // begin_bulk always advances this state.
+      }
+      const auto copied =
+          std::min(piece.size() - state.part_offset_,
+                   RandomStreamPayloadState::kChunkBytes - payload.size());
+      payload.append(piece.substr(state.part_offset_, copied));
+      state.part_offset_ += copied;
+      if (state.part_offset_ != piece.size()) continue;
+      state.part_offset_ = 0;
+      switch (state.part_) {
+        case RandomStreamPayloadState::Part::kHeader:
+          state.part_ = RandomStreamPayloadState::Part::kValue;
+          break;
+        case RandomStreamPayloadState::Part::kValue:
+          state.part_ = RandomStreamPayloadState::Part::kTerminator;
+          break;
+        case RandomStreamPayloadState::Part::kTerminator:
+          if (++state.tuple_field_ == width) {
+            --state.remaining_;
+            state.part_ = RandomStreamPayloadState::Part::kSelect;
+          } else {
+            begin_bulk();
+          }
+          break;
+        case RandomStreamPayloadState::Part::kSelect:
+          std::terminate();
+      }
+    }
+    return payload;
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM random stream chunk");
+  }
+}
+
+// Keep one immutable command-time view without retaining a DB gate or key
+// lock across socket backpressure. Destroying the chunk source on cancellation
+// also destroys the snapshot, its charges and any partially emitted tuple.
+struct NegativeRandomStreamState : RandomStreamPayloadState {
   NegativeRandomStreamState(std::uint8_t db_id,
                             NegativeRandomStreamOptions stream_options,
                             std::string key, unsigned owner)
       : db_(db_id),
-        options_(stream_options),
-        remaining_(stream_options.count_),
         key_(std::move(key)),
         owner_(owner),
-        digest_(storage::ComputeDigest(key_)) {}
+        digest_(storage::ComputeDigest(key_)) {
+    options_ = stream_options;
+    remaining_ = stream_options.count_;
+  }
 
   std::uint8_t db_ = 0;
-  NegativeRandomStreamOptions options_;
-  std::uint64_t remaining_ = 0;
   std::string key_;
   unsigned owner_ = 0;
   storage::Digest digest_{};
   std::uint64_t now_ms_ = 0;
-  std::uint64_t population_ = 0;
-  std::vector<std::string> values_;
 };
 
-Task<absl::StatusOr<storage::HashResult>> BeginNegativeRandomStream(
+Task<absl::StatusOr<std::uint64_t>> BeginNegativeRandomStream(
     const std::shared_ptr<NegativeRandomStreamState>& state) {
-  auto begin = [state]() -> Task<absl::StatusOr<storage::HashResult>> {
-    tx::TxShard::Guard guard = co_await tx::CurrentTxShard().AcquireKey(
-        state->db_, tx::FingerprintOf(state->digest_), tx::LockMode::kShared);
-    storage::HashOperation operation;
-    operation.kind_ = state->options_.hash_ && state->options_.with_values_
-                          ? storage::HashOperationKind::kGetAll
-                          : storage::HashOperationKind::kKeys;
-    operation.now_ms_ = state->now_ms_;
-    absl::StatusOr<storage::HashResult> snapshot;
-    if (state->options_.zset_) {
-      snapshot = co_await ZSetRandomSnapshotLocked(
-          state->db_, state->key_, state->digest_, state->options_.with_values_,
-          nullptr, state->now_ms_);
-    } else if (state->options_.hash_) {
-      snapshot = co_await g_storage->ExecuteHashLocked(
-          state->db_, state->key_, state->digest_, operation, nullptr);
-    } else {
-      snapshot = co_await g_storage->ExecuteSetLocked(
-          state->db_, state->key_, state->digest_, operation, nullptr);
+  auto begin = [state]() -> Task<absl::StatusOr<std::uint64_t>> {
+    try {
+      tx::TxShard::Guard guard = co_await tx::CurrentTxShard().AcquireKey(
+          state->db_, tx::FingerprintOf(state->digest_), tx::LockMode::kShared);
+      storage::HashOperation operation;
+      operation.kind_ = state->options_.hash_ && state->options_.with_values_
+                            ? storage::HashOperationKind::kGetAll
+                            : storage::HashOperationKind::kKeys;
+      operation.now_ms_ = state->now_ms_;
+      absl::StatusOr<storage::HashResult> snapshot;
+      if (state->options_.zset_) {
+        snapshot = co_await ZSetRandomSnapshotLocked(
+            state->db_, state->key_, state->digest_,
+            state->options_.with_values_, nullptr, state->now_ms_);
+      } else if (state->options_.hash_) {
+        snapshot = co_await g_storage->ExecuteHashLocked(
+            state->db_, state->key_, state->digest_, operation, nullptr);
+      } else {
+        snapshot = co_await g_storage->ExecuteSetLocked(
+            state->db_, state->key_, state->digest_, operation, nullptr);
+      }
+      if (!snapshot.ok()) co_return snapshot.status();
+      if (snapshot->length_ == 0) co_return std::uint64_t{0};
+      auto adopted = AdoptRandomStreamSnapshot(*state, std::move(*snapshot));
+      if (!adopted.ok()) co_return adopted;
+      co_return state->population_;
+    } catch (const std::bad_alloc&) {
+      RecordMemoryRejection();
+      co_return absl::ResourceExhaustedError("OOM random stream snapshot");
     }
-    if (!snapshot.ok() || snapshot->length_ == 0) co_return snapshot;
-
-    const std::size_t tuple_width = state->options_.with_values_ ? 2 : 1;
-    if (snapshot->length_ >
-            std::numeric_limits<std::size_t>::max() / tuple_width ||
-        snapshot->values_.size() != snapshot->length_ * tuple_width) {
-      co_return absl::InternalError(
-          "random snapshot disagrees with collection length");
-    }
-    state->population_ = snapshot->length_;
-    state->values_.reserve(snapshot->values_.size());
-    for (auto& value : snapshot->values_) {
-      if (!value.has_value())
-        co_return absl::InternalError(
-            "random snapshot contains a missing value");
-      state->values_.push_back(std::move(*value));
-    }
-    co_return snapshot;
   };
   if (state->owner_ != ThisWorker().id_) {
     co_return co_await celer::SubmitTaskTo(state->owner_, std::move(begin));
@@ -3393,60 +3522,72 @@ Task<absl::StatusOr<storage::HashResult>> BeginNegativeRandomStream(
 
 Task<absl::StatusOr<std::string>> NextNegativeRandomChunk(
     std::shared_ptr<NegativeRandomStreamState> state) {
-  if (state->remaining_ == 0) co_return std::string();
-  const std::uint64_t count =
-      std::min(state->remaining_, kRandomSampleBatchLimit);
-  const std::size_t tuple_width = state->options_.with_values_ ? 2 : 1;
-  std::string payload;
-  for (std::uint64_t i = 0; i < count; ++i) {
-    const std::uint64_t rank =
-        RandomRank(state->population_, RandomSampleGenerator());
-    const std::size_t offset = static_cast<std::size_t>(rank) * tuple_width;
-    for (std::size_t field = 0; field < tuple_width; ++field) {
-      payload += EncodeBulkString(state->values_[offset + field]);
-    }
-  }
-  state->remaining_ -= count;
-  co_return payload;
+  co_return EncodeRandomStreamChunk(*state);
 }
+
+#if KEYLANE_FAULTS_ENABLED
+void MaybeFailRandomStreamBuild(const CommandRequest& request,
+                                std::string_view stage) {
+  if (KEYLANE_FAULT_MATCHES("KEYLANE_FAIL_RANDOM_STREAM_STAGE", stage))
+    KEYLANE_FAULT_BAD_ALLOC("KEYLANE_FAIL_RANDOM_STREAM_KEY", request.args_[1]);
+}
+#endif
 
 Task<CommandReply> ExecuteNegativeRandomStream(
     const CommandRequest& request, NegativeRandomStreamOptions options,
     ReplyBuilder& reply_builder) {
-  const std::uint8_t db = request.db_id_;
-  const unsigned owner = ShardForKey(request.args_[1]);
-  auto state = std::make_shared<NegativeRandomStreamState>(
-      db, std::move(options), request.args_[1], owner);
-  if (!TryBeginDbOperation(db)) {
-    co_return BuiltReply(
-        AppendTryAgainError(reply_builder, "database flush is in progress"));
-  }
-  DbOperationGuard initial_db_guard(db);
-  if (const char* error = CommandServingGenerationError(request);
-      error != nullptr) [[unlikely]] {
-    co_return BuiltReply(reply_builder.AppendError(error));
-  }
-  state->now_ms_ = RedisUnixTimeMillis();
-  absl::StatusOr<storage::HashResult> length =
-      co_await BeginNegativeRandomStream(state);
-  if (!length.ok()) {
-    co_return BuiltReply(AppendStorageError(reply_builder, length.status()));
-  }
-  if (length->length_ == 0) {
-    co_return BuiltReply(reply_builder.AppendArrayHeader(0));
-  }
-  // The initial lookup is complete. Socket backpressure may retain the reply
-  // for an arbitrary duration, so retain neither the DB gate nor the key lock.
-  // Later batches sample only the immutable in-memory view.
-  initial_db_guard.Release();
+  try {
+    const std::uint8_t db = request.db_id_;
+    const unsigned owner = ShardForKey(request.args_[1]);
+    const auto state_bytes =
+        sizeof(NegativeRandomStreamState) + 64 + request.args_[1].size() + 1;
+    auto admission = TryReserveMemory(state_bytes);
+    if (!admission) {
+      RecordMemoryRejection();
+      co_return BuiltReply(AppendOomError(reply_builder));
+    }
+    auto state = std::make_shared<NegativeRandomStreamState>(
+        db, std::move(options), request.args_[1], owner);
+    state->state_charge_.Adopt(&*admission, state_bytes);
+    if (!TryBeginDbOperation(db)) {
+      co_return BuiltReply(
+          AppendTryAgainError(reply_builder, "database flush is in progress"));
+    }
+    DbOperationGuard initial_db_guard(db);
+    if (const char* error = CommandServingGenerationError(request);
+        error != nullptr) [[unlikely]] {
+      co_return BuiltReply(reply_builder.AppendError(error));
+    }
+    state->now_ms_ = RedisUnixTimeMillis();
+    auto length = co_await BeginNegativeRandomStream(state);
+    if (!length.ok()) {
+      co_return BuiltReply(AppendStorageError(reply_builder, length.status()));
+    }
+    if (*length == 0) {
+      co_return BuiltReply(reply_builder.AppendArrayHeader(0));
+    }
+    // The initial lookup is complete. Socket backpressure may retain the reply
+    // for an arbitrary duration, so retain neither the DB gate nor the key
+    // lock. Later batches sample only the immutable in-memory view.
+    initial_db_guard.Release();
 
-  std::uint64_t reply_elements = state->remaining_;
-  if (state->options_.with_values_) reply_elements *= 2;
-  CommandReply reply =
-      BuiltReply(reply_builder.AppendArrayHeader(reply_elements));
-  reply.chunks_ = std::make_unique<ReplyChunkSource>(
-      [state]() { return NextNegativeRandomChunk(state); });
-  co_return reply;
+    std::uint64_t reply_elements = state->remaining_;
+    if (state->options_.with_values_) reply_elements *= 2;
+    KEYLANE_FAULT_INJECT(MaybeFailRandomStreamBuild(request, "before-source"););
+    auto chunks = std::make_unique<ReplyChunkSource>(
+        [state]() { return NextNegativeRandomChunk(state); });
+    CommandReply reply =
+        BuiltReply(reply_builder.AppendArrayHeader(reply_elements));
+    KEYLANE_FAULT_INJECT(MaybeFailRandomStreamBuild(request, "after-header"););
+    reply.chunks_ = std::move(chunks);
+    co_return reply;
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    // This builder belongs to this request; no reply bytes have left this
+    // function yet. Discard a partially built array before returning one error.
+    reply_builder.Reset();
+    co_return BuiltReply(AppendOomError(reply_builder));
+  }
 }
 
 // EXEC must preserve the view observed at the command's position in the
@@ -3454,12 +3595,7 @@ Task<CommandReply> ExecuteNegativeRandomStream(
 // is controlled by the client. Capture the compact collection once while the
 // transaction owns its locks, then sample that immutable view in bounded
 // chunks after EXEC has released every DB/key guard.
-struct TransactionalRandomStreamState {
-  NegativeRandomStreamOptions options_;
-  std::uint64_t remaining_ = 0;
-  std::uint64_t population_ = 0;
-  std::vector<std::string> values_;
-};
+struct TransactionalRandomStreamState : RandomStreamPayloadState {};
 
 struct OwnedStreamReply {
   std::string encoded_;
@@ -3468,75 +3604,63 @@ struct OwnedStreamReply {
 
 Task<absl::StatusOr<std::string>> NextTransactionalRandomChunk(
     std::shared_ptr<TransactionalRandomStreamState> state) {
-  if (state->remaining_ == 0) co_return std::string();
-  const std::uint64_t count =
-      std::min(state->remaining_, kRandomSampleBatchLimit);
-  const std::size_t tuple_width = state->options_.with_values_ ? 2 : 1;
-  std::string payload;
-  for (std::uint64_t i = 0; i < count; ++i) {
-    const std::uint64_t rank =
-        RandomRank(state->population_, RandomSampleGenerator());
-    const std::size_t offset = static_cast<std::size_t>(rank) * tuple_width;
-    for (std::size_t field = 0; field < tuple_width; ++field) {
-      payload += EncodeBulkString(state->values_[offset + field]);
-    }
-  }
-  state->remaining_ -= count;
-  co_return payload;
+  co_return EncodeRandomStreamChunk(*state);
 }
 
 Task<absl::StatusOr<OwnedStreamReply>>
 PrepareTransactionalNegativeRandomStreamLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx, NegativeRandomStreamOptions options) {
-  storage::HashOperation operation;
-  operation.kind_ = options.hash_ && options.with_values_
-                        ? storage::HashOperationKind::kGetAll
-                        : storage::HashOperationKind::kKeys;
-  operation.now_ms_ = RedisUnixTimeMillis();
+  try {
+    storage::HashOperation operation;
+    operation.kind_ = options.hash_ && options.with_values_
+                          ? storage::HashOperationKind::kGetAll
+                          : storage::HashOperationKind::kKeys;
+    operation.now_ms_ = RedisUnixTimeMillis();
 
-  absl::StatusOr<storage::HashResult> snapshot;
-  if (options.zset_) {
-    snapshot = co_await ZSetRandomSnapshotLocked(
-        request.db_id_, request.args_[1], digest, options.with_values_, tx,
-        operation.now_ms_);
-  } else if (options.hash_) {
-    snapshot = co_await g_storage->ExecuteHashLocked(
-        request.db_id_, request.args_[1], digest, operation, tx);
-  } else {
-    snapshot = co_await g_storage->ExecuteSetLocked(
-        request.db_id_, request.args_[1], digest, operation, tx);
-  }
-  if (!snapshot.ok()) co_return snapshot.status();
-  if (snapshot->length_ == 0) {
-    co_return OwnedStreamReply{.encoded_ = "*0\r\n", .chunks_ = {}};
-  }
-
-  const std::size_t tuple_width = options.with_values_ ? 2 : 1;
-  if (snapshot->length_ >
-          std::numeric_limits<std::size_t>::max() / tuple_width ||
-      snapshot->values_.size() != snapshot->length_ * tuple_width) {
-    co_return absl::InternalError(
-        "random snapshot disagrees with collection length");
-  }
-  auto state = std::make_shared<TransactionalRandomStreamState>();
-  state->options_ = options;
-  state->remaining_ = options.count_;
-  state->population_ = snapshot->length_;
-  state->values_.reserve(snapshot->values_.size());
-  for (auto& value : snapshot->values_) {
-    if (!value.has_value()) {
-      co_return absl::InternalError("random snapshot contains a missing value");
+    absl::StatusOr<storage::HashResult> snapshot;
+    if (options.zset_) {
+      snapshot = co_await ZSetRandomSnapshotLocked(
+          request.db_id_, request.args_[1], digest, options.with_values_, tx,
+          operation.now_ms_);
+    } else if (options.hash_) {
+      snapshot = co_await g_storage->ExecuteHashLocked(
+          request.db_id_, request.args_[1], digest, operation, tx);
+    } else {
+      snapshot = co_await g_storage->ExecuteSetLocked(
+          request.db_id_, request.args_[1], digest, operation, tx);
     }
-    state->values_.push_back(std::move(*value));
-  }
+    if (!snapshot.ok()) co_return snapshot.status();
+    if (snapshot->length_ == 0) {
+      co_return OwnedStreamReply{.encoded_ = "*0\r\n", .chunks_ = {}};
+    }
 
-  const std::uint64_t elements =
-      options.with_values_ ? options.count_ * 2 : options.count_;
-  OwnedStreamReply reply;
-  reply.encoded_ = "*" + std::to_string(elements) + "\r\n";
-  reply.chunks_ = [state]() { return NextTransactionalRandomChunk(state); };
-  co_return reply;
+    constexpr auto state_bytes = sizeof(TransactionalRandomStreamState) + 64;
+    auto admission = TryReserveMemory(state_bytes);
+    if (!admission) {
+      RecordMemoryRejection();
+      co_return absl::ResourceExhaustedError("OOM transactional random stream");
+    }
+    auto state = std::make_shared<TransactionalRandomStreamState>();
+    state->state_charge_.Adopt(&*admission, state_bytes);
+    state->options_ = options;
+    state->remaining_ = options.count_;
+    auto adopted = AdoptRandomStreamSnapshot(*state, std::move(*snapshot));
+    if (!adopted.ok()) co_return adopted;
+
+    const std::uint64_t elements =
+        options.with_values_ ? options.count_ * 2 : options.count_;
+    OwnedStreamReply reply;
+    KEYLANE_FAULT_INJECT(MaybeFailRandomStreamBuild(request, "before-source"););
+    reply.chunks_ = [state]() { return NextTransactionalRandomChunk(state); };
+    reply.encoded_ = "*" + std::to_string(elements) + "\r\n";
+    KEYLANE_FAULT_INJECT(MaybeFailRandomStreamBuild(request, "after-header"););
+    co_return reply;
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    // The owned reply is discarded, so no partial array reaches EXEC's builder.
+    co_return absl::ResourceExhaustedError("OOM transactional random stream");
+  }
 }
 
 std::string EncodeStorageError(const absl::Status& status) {
@@ -3731,10 +3855,72 @@ absl::Status ParseRestoreTtl(std::string_view text, RestoreOptions* options) {
 }
 
 std::string RestoreDecodeError(const absl::Status& status) {
+  if (absl::IsResourceExhausted(status))
+    return absl::StrCat("OOM ", status.message());
   if (status.message() == "DUMP payload version or checksum are wrong") {
     return absl::StrCat("ERR ", status.message());
   }
   return "ERR Bad data format";
+}
+
+struct PreparedRestoreValue {
+  storage::RawValue raw_;
+  std::optional<rdb::DumpReader> collection_;
+  storage::ValueType value_type_ = storage::ValueType::kNone;
+  std::uint64_t expire_at_ms_ = 0;
+};
+
+absl::StatusOr<PreparedRestoreValue> PrepareRestoreValue(
+    std::string_view payload) {
+  auto reader = rdb::DumpReader::Open(payload);
+  if (!reader.ok()) return reader.status();
+  PreparedRestoreValue value;
+  if (!reader->collection()) {
+    auto raw = reader->ReadRawValue();
+    if (!raw.ok()) return raw.status();
+    value.value_type_ = raw->value_type_;
+    value.raw_ = std::move(*raw);
+  } else {
+    value.value_type_ = reader->value_type();
+    // Validate every field/member, including duplicates across pages, before
+    // replacing a live key. The second pass feeds the atomic ingest directly.
+    for (;;) {
+      auto page = reader->ReadCollectionPage();
+      if (!page.ok()) return page.status();
+      if (page->done_) break;
+    }
+    auto rewound = reader->Rewind();
+    if (!rewound.ok()) return rewound;
+    value.collection_.emplace(std::move(*reader));
+  }
+  return value;
+}
+
+Task<absl::StatusOr<storage::RestoreRawResult>> ApplyPreparedRestore(
+    PreparedRestoreValue& value, std::uint8_t db, std::string_view key,
+    bool replace, const storage::Digest* digest = nullptr,
+    storage::TxShardWrites* tx = nullptr,
+    storage::ReplicationCommandAppend* replication = nullptr) {
+  if (!value.collection_) {
+    value.raw_.expire_at_ms_ = value.expire_at_ms_;
+    co_return digest != nullptr
+        ? co_await g_storage->RestoreRawValueLocked(
+              db, key, *digest, value.raw_, replace, tx, replication)
+        : co_await g_storage->RestoreRawValue(db, key, value.raw_, replace,
+                                              replication);
+  }
+  storage::CollectionPageReader next =
+      [&value]() -> Task<absl::StatusOr<storage::CollectionPage>> {
+    co_return value.collection_->ReadCollectionPage();
+  };
+  co_return digest != nullptr
+      ? co_await g_storage->RestoreCollectionValueLocked(
+            db, key, *digest, value.value_type_, value.expire_at_ms_, replace,
+            value.collection_->expected_items(), std::move(next), tx,
+            replication)
+      : co_await g_storage->RestoreCollectionValue(
+            db, key, value.value_type_, value.expire_at_ms_, replace,
+            value.collection_->expected_items(), std::move(next), replication);
 }
 
 std::vector<std::string> CanonicalRestoreCommand(std::string_view key,
@@ -3814,8 +4000,13 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
     }
 
     case CommandKind::kType: {
-      const storage::ExpirationInfo info =
-          co_await g_storage->GetExpiration(request.db_id_, args[1]);
+      auto metadata =
+          co_await g_storage->ReadKeyMetadata(request.db_id_, args[1]);
+      if (!metadata.ok()) {
+        reply.encoded_ = AppendStorageError(reply_builder, metadata.status());
+        co_return reply;
+      }
+      const auto& info = *metadata;
       reply.encoded_ = reply_builder.AppendSimpleString(
           info.exists_ ? ValueTypeName(info.value_type_) : "none");
       co_return reply;
@@ -3862,7 +4053,7 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
             absl::StrCat("ERR ", ttl_status.message()));
         co_return reply;
       }
-      auto value = rdb::DecodeDump(args[3]);
+      auto value = PrepareRestoreValue(args[3]);
       if (!value.ok()) {
         reply.encoded_ =
             reply_builder.AppendError(RestoreDecodeError(value.status()));
@@ -3872,8 +4063,8 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       auto replication = PrepareReplicationCommand(
           request,
           CanonicalRestoreCommand(args[1], args[3], options->expire_at_ms_));
-      auto restored = co_await g_storage->RestoreRawValue(
-          request.db_id_, args[1], *value, options->replace_,
+      auto restored = co_await ApplyPreparedRestore(
+          *value, request.db_id_, args[1], options->replace_, nullptr, nullptr,
           replication ? &*replication : nullptr);
       if (!restored.ok()) {
         reply.encoded_ = AppendStorageError(reply_builder, restored.status());
@@ -4101,8 +4292,13 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
             std::string(request.spec_->name_) + "' command");
         co_return reply;
       }
-      const storage::ExpirationInfo info =
-          co_await g_storage->GetExpiration(request.db_id_, args[1]);
+      auto metadata =
+          co_await g_storage->ReadKeyMetadata(request.db_id_, args[1]);
+      if (!metadata.ok()) {
+        reply.encoded_ = AppendStorageError(reply_builder, metadata.status());
+        co_return reply;
+      }
+      const auto& info = *metadata;
       if (!info.exists_) {
         reply.encoded_ = reply_builder.AppendInteger(-2);
       } else if (info.expire_at_ms_ == 0) {
@@ -4641,8 +4837,10 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
     }
 
     case CommandKind::kType: {
-      const storage::ExpirationInfo info =
-          co_await g_storage->GetExpirationLocked(db_id, args[1], digest);
+      auto metadata =
+          co_await g_storage->ReadKeyMetadataLocked(db_id, args[1], digest);
+      if (!metadata.ok()) co_return EncodeStorageError(metadata.status());
+      const auto& info = *metadata;
       co_return EncodeSimpleString(
           info.exists_ ? ValueTypeName(info.value_type_) : "none");
     }
@@ -4680,13 +4878,13 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
       if (!ttl_status.ok()) {
         co_return EncodeError(absl::StrCat("ERR ", ttl_status.message()));
       }
-      auto value = rdb::DecodeDump(args[3]);
+      auto value = PrepareRestoreValue(args[3]);
       if (!value.ok()) {
         co_return EncodeError(RestoreDecodeError(value.status()));
       }
       value->expire_at_ms_ = options->expire_at_ms_;
-      auto restored = co_await g_storage->RestoreRawValueLocked(
-          db_id, args[1], digest, *value, options->replace_, tx);
+      auto restored = co_await ApplyPreparedRestore(
+          *value, db_id, args[1], options->replace_, &digest, tx);
       if (!restored.ok()) co_return EncodeStorageError(restored.status());
       if (restored->busy_) {
         co_return EncodeError("BUSYKEY Target key name already exists.");
@@ -4903,8 +5101,10 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
                                 request.kind_ == CommandKind::kPExpireTime;
       const bool absolute = request.kind_ == CommandKind::kExpireTime ||
                             request.kind_ == CommandKind::kPExpireTime;
-      const storage::ExpirationInfo info =
-          co_await g_storage->GetExpirationLocked(db_id, args[1], digest);
+      auto metadata =
+          co_await g_storage->ReadKeyMetadataLocked(db_id, args[1], digest);
+      if (!metadata.ok()) co_return EncodeStorageError(metadata.status());
+      const auto& info = *metadata;
       if (!info.exists_) {
         co_return EncodeInteger(-2);
       }
@@ -5069,7 +5269,7 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
 
 struct RenameContext {
   const CommandRequest* request_ = nullptr;
-  storage::RawValue source_;
+  storage::TransferValue source_;
   bool destination_exists_ = false;
   bool rollback_ = false;
   std::vector<storage::TxShardWrites> writes_;
@@ -5081,7 +5281,7 @@ Task<absl::Status> RenameReadCallback(void* opaque,
   for (const tx::TxKey& key : slice.keys_) {
     const std::string& name = context->request_->args_[key.arg_index_];
     if (key.arg_index_ == 1) {
-      auto source = co_await g_storage->ReadRawValueLocked(
+      auto source = co_await g_storage->ReadValueForTransferLocked(
           context->request_->db_id_, name, key.digest_);
       if (!source.ok()) co_return source.status();
       context->source_ = std::move(*source);
@@ -5105,7 +5305,7 @@ Task<absl::Status> RenameWriteCallback(void* opaque,
       if (!deleted.ok()) co_return deleted.status();
       if (!*deleted) co_return absl::NotFoundError("no such key");
     } else if (key.arg_index_ == 2) {
-      absl::Status written = co_await g_storage->WriteRawValueLocked(
+      absl::Status written = co_await g_storage->WriteValueForTransferLocked(
           context->request_->db_id_, name, key.digest_, context->source_,
           writes);
       if (!written.ok()) co_return written;
@@ -5127,7 +5327,7 @@ Task<absl::Status> RenameSingleShardCallback(void* opaque,
     co_return absl::InternalError("RENAME key routing is incomplete");
   }
   const auto& args = context->request_->args_;
-  auto source = co_await g_storage->ReadRawValueLocked(
+  auto source = co_await g_storage->ReadValueForTransferLocked(
       context->request_->db_id_, args[1], source_key->digest_);
   if (!source.ok()) co_return source.status();
   context->source_ = std::move(*source);
@@ -5139,7 +5339,7 @@ Task<absl::Status> RenameSingleShardCallback(void* opaque,
   }
 
   storage::TxShardWrites& writes = context->writes_[celer::ThisWorker().id_];
-  absl::Status written = co_await g_storage->WriteRawValueLocked(
+  absl::Status written = co_await g_storage->WriteValueForTransferLocked(
       context->request_->db_id_, args[2], destination_key->digest_,
       context->source_, &writes);
   if (written.ok()) {
@@ -5200,10 +5400,14 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
   const bool nx = request.kind_ == CommandKind::kRenameNx;
   if (args[1] == args[2]) {
     const unsigned owner = ShardForKey(args[1]);
-    const storage::ExpirationInfo info = co_await SubmitTaskTo(
+    auto metadata = co_await SubmitTaskTo(
         owner, [db = request.db_id_, key = std::string(args[1])]() {
-          return g_storage->GetExpiration(db, key);
+          return g_storage->ReadKeyMetadata(db, key);
         });
+    if (!metadata.ok())
+      co_return BuiltReply(
+          AppendStorageError(reply_builder, metadata.status()));
+    const auto& info = *metadata;
     if (!info.exists_) {
       co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
     }
@@ -5255,7 +5459,7 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
                                   std::move(context.writes_))) {
     co_await g_storage->WaitForTxCommitCapacity();
   }
-  NotifyRenamedValue(request, args[2], context.source_.value_type_);
+  NotifyRenamedValue(request, args[2], context.source_.metadata_.value_type_);
   co_return BuiltReply(nx ? reply_builder.AppendInteger(1)
                           : reply_builder.AppendSimpleString("OK"));
 }
@@ -5304,7 +5508,7 @@ absl::StatusOr<CopyOptions> ParseCopyOptions(const CommandRequest& request) {
 struct CopyContext {
   const CommandRequest* request_ = nullptr;
   CopyOptions options_;
-  std::optional<storage::RawValue> source_;
+  std::optional<storage::TransferValue> source_;
   bool destination_exists_ = false;
   bool copied_ = false;
   bool rollback_ = false;
@@ -5316,8 +5520,8 @@ Task<absl::Status> CopyReadCallback(void* opaque, const tx::ShardSlice& slice) {
   for (const tx::TxKey& key : slice.keys_) {
     const std::string& name = context->request_->args_[key.arg_index_];
     if (key.arg_index_ == 1) {
-      auto source =
-          co_await g_storage->ReadRawValueLocked(key.db_, name, key.digest_);
+      auto source = co_await g_storage->ReadValueForTransferLocked(
+          key.db_, name, key.digest_);
       if (source.ok()) {
         context->source_.emplace(std::move(*source));
       } else if (source.status().code() != absl::StatusCode::kNotFound) {
@@ -5337,7 +5541,7 @@ Task<absl::Status> CopyWriteCallback(void* opaque,
   for (const tx::TxKey& key : slice.keys_) {
     if (key.arg_index_ != 2) continue;
     storage::TxShardWrites* writes = &context->writes_[celer::ThisWorker().id_];
-    absl::Status status = co_await g_storage->WriteRawValueLocked(
+    absl::Status status = co_await g_storage->WriteValueForTransferLocked(
         key.db_, context->request_->args_[2], key.digest_, *context->source_,
         writes);
     if (!status.ok()) co_return status;
@@ -5437,7 +5641,7 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
     co_await g_storage->WaitForTxCommitCapacity();
   }
   NotifyRenamedValue(request, options->destination_db_, args[2],
-                     context.source_->value_type_);
+                     context.source_->metadata_.value_type_);
   co_return BuiltReply(reply_builder.AppendInteger(1));
 }
 
@@ -5622,8 +5826,10 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
       case CommandKind::kExists:
       case CommandKind::kTouch:
       default: {
-        if (co_await g_storage->ExistsLocked(ctx->request_->db_id_, name,
-                                             key.digest_)) {
+        auto metadata = co_await g_storage->ReadKeyMetadataLocked(
+            ctx->request_->db_id_, name, key.digest_);
+        if (!metadata.ok()) co_return metadata.status();
+        if (metadata->exists_) {
           ctx->hits_.fetch_add(1, std::memory_order_relaxed);
         }
         break;
@@ -5848,8 +6054,11 @@ bool IsExecSequentialCopy(CommandKind kind) {
 }
 
 bool IsExecSequentialStringMulti(CommandKind kind) {
-  return kind == CommandKind::kMSetNx || kind == CommandKind::kLcs ||
-         kind == CommandKind::kBitOp;
+  // MSET must settle its command-local undo across all owners before EXEC
+  // or a script can continue. A squashed run cannot roll back one command's
+  // partial writes after a later command has already consumed them.
+  return kind == CommandKind::kMSet || kind == CommandKind::kMSetNx ||
+         kind == CommandKind::kLcs || kind == CommandKind::kBitOp;
 }
 
 std::optional<std::uint16_t> GeoStoreDestinationArg(
@@ -6058,11 +6267,13 @@ Task<std::string> ExecuteExecSequentialRename(
   const ExecKey* destination = find_key(2);
   if (source == nullptr) co_return EncodeError("ERR no such key");
   if (args[1] == args[2]) {
-    auto info = co_await SubmitTaskTo(
+    auto metadata = co_await SubmitTaskTo(
         source->owner_, [db = command.db_id_, key = std::string(args[1]),
                          digest = source->digest_]() {
-          return g_storage->GetExpirationLocked(db, key, digest);
+          return g_storage->ReadKeyMetadataLocked(db, key, digest);
         });
+    if (!metadata.ok()) co_return EncodeStorageError(metadata.status());
+    const auto& info = *metadata;
     if (!info.exists_) co_return EncodeError("ERR no such key");
     co_return nx ? EncodeInteger(0) : EncodeSimpleString("OK");
   }
@@ -6073,7 +6284,7 @@ Task<std::string> ExecuteExecSequentialRename(
   auto raw = co_await SubmitTaskTo(
       source->owner_, [db = command.db_id_, key = std::string(args[1]),
                        digest = source->digest_]() {
-        return g_storage->ReadRawValueLocked(db, key, digest);
+        return g_storage->ReadValueForTransferLocked(db, key, digest);
       });
   if (!raw.ok()) {
     if (raw.status().code() == absl::StatusCode::kNotFound)
@@ -6100,7 +6311,8 @@ Task<std::string> ExecuteExecSequentialRename(
       destination->owner_, [db = command.db_id_, key = std::string(args[2]),
                             digest = destination->digest_, value = &*raw,
                             writes = &tx_writes[destination->owner_]] {
-        return g_storage->WriteRawValueLocked(db, key, digest, *value, writes);
+        return g_storage->WriteValueForTransferLocked(db, key, digest, *value,
+                                                      writes);
       });
   if (!written.ok()) {
     absl::Status rolled_back =
@@ -6123,7 +6335,7 @@ Task<std::string> ExecuteExecSequentialRename(
   absl::Status completed =
       co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
   if (!completed.ok()) co_return EncodeStorageError(completed);
-  NotifyRenamedValue(command, args[2], raw->value_type_);
+  NotifyRenamedValue(command, args[2], raw->metadata_.value_type_);
   if (nx) {
     CaptureReplicationCommand(command, {"RENAME", args[1], args[2]});
   }
@@ -6157,7 +6369,7 @@ Task<std::string> ExecuteExecSequentialCopy(
   auto raw = co_await SubmitTaskTo(
       source->owner_, [db = source->db_, key = std::string(args[1]),
                        digest = source->digest_]() {
-        return g_storage->ReadRawValueLocked(db, key, digest);
+        return g_storage->ReadValueForTransferLocked(db, key, digest);
       });
   if (!raw.ok()) {
     if (raw.status().code() == absl::StatusCode::kNotFound) {
@@ -6184,7 +6396,8 @@ Task<std::string> ExecuteExecSequentialCopy(
       destination->owner_, [db = destination->db_, key = std::string(args[2]),
                             digest = destination->digest_, value = &*raw,
                             writes = &tx_writes[destination->owner_]] {
-        return g_storage->WriteRawValueLocked(db, key, digest, *value, writes);
+        return g_storage->WriteValueForTransferLocked(db, key, digest, *value,
+                                                      writes);
       });
   if (!written.ok()) {
     absl::Status rolled_back =
@@ -6194,7 +6407,8 @@ Task<std::string> ExecuteExecSequentialCopy(
   absl::Status completed =
       co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
   if (!completed.ok()) co_return EncodeStorageError(completed);
-  NotifyRenamedValue(command, destination->db_, args[2], raw->value_type_);
+  NotifyRenamedValue(command, destination->db_, args[2],
+                     raw->metadata_.value_type_);
   std::vector<std::string> canonical = args;
   if (!options->replace_) canonical.emplace_back("REPLACE");
   CaptureReplicationCommand(command, std::move(canonical));
@@ -6220,23 +6434,26 @@ Task<std::string> ExecuteExecSequentialStringMulti(
 
   MarkReplicationCommandHandled(command);
   const auto& args = command.args_;
+  const bool nx = command.kind_ == CommandKind::kMSetNx;
   auto find_key = [&](std::size_t argument) -> const ExecKey* {
     for (const ExecKey& key : keys) {
       if (key.arg_ == argument) return &key;
     }
     return nullptr;
   };
-  for (std::size_t argument = 1; argument < args.size(); argument += 2) {
-    const ExecKey* key = find_key(argument);
-    if (key == nullptr) co_return EncodeError("ERR MSETNX key is missing");
-    auto exists = [db = command.db_id_, name = std::string(args[argument]),
-                   digest = key->digest_]() {
-      return g_storage->ExistsLocked(db, name, digest);
-    };
-    const bool present = key->owner_ == ThisWorker().id_
-                             ? co_await exists()
-                             : co_await SubmitTaskTo(key->owner_, exists);
-    if (present) co_return EncodeInteger(0);
+  if (nx) {
+    for (std::size_t argument = 1; argument < args.size(); argument += 2) {
+      const ExecKey* key = find_key(argument);
+      if (key == nullptr) co_return EncodeError("ERR MSETNX key is missing");
+      auto exists = [db = command.db_id_, name = std::string(args[argument]),
+                     digest = key->digest_]() {
+        return g_storage->ExistsLocked(db, name, digest);
+      };
+      const bool present = key->owner_ == ThisWorker().id_
+                               ? co_await exists()
+                               : co_await SubmitTaskTo(key->owner_, exists);
+      if (present) co_return EncodeInteger(0);
+    }
   }
 
   std::vector<unsigned> owners;
@@ -6254,7 +6471,7 @@ Task<std::string> ExecuteExecSequentialStringMulti(
     if (key == nullptr) {
       absl::Status rolled_back =
           co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
-      co_return rolled_back.ok() ? EncodeError("ERR MSETNX key is missing")
+      co_return rolled_back.ok() ? EncodeError("ERR MSET key is missing")
                                  : EncodeStorageError(rolled_back);
     }
     auto write = [db = command.db_id_, name = std::string(args[argument]),
@@ -6278,244 +6495,369 @@ Task<std::string> ExecuteExecSequentialStringMulti(
   std::vector<std::string> canonical = args;
   canonical[0] = "MSET";
   CaptureReplicationCommand(command, std::move(canonical));
-  co_return EncodeInteger(1);
+  co_return nx ? EncodeInteger(1) : EncodeSimpleString("OK");
 }
 
 Task<std::string> ExecuteExecSequentialSetMulti(
     const CommandRequest& command, const std::vector<ExecKey>& keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
-  const auto& args = command.args_;
-  auto find_key = [&](std::size_t argument) -> const ExecKey* {
-    for (const ExecKey& key : keys) {
-      if (key.arg_ == argument) return &key;
-    }
-    return nullptr;
+  std::vector<ExecWriteCheckpoint> checkpoints;
+  bool undo_active = false;
+  const auto oom = [] {
+    return absl::ResourceExhaustedError(
+        "OOM Set multi-key working set exceeds maxmemory");
   };
-  auto run_set = [&](const ExecKey& key, storage::HashOperation operation,
-                     bool write) -> Task<absl::StatusOr<storage::HashResult>> {
-    auto execute = [&]() {
-      return g_storage->ExecuteSetLocked(
-          command.db_id_, args[key.arg_], key.digest_, operation,
-          write ? &tx_writes[key.owner_] : nullptr);
+  const auto add_bytes = [](std::size_t* bytes, std::size_t count,
+                            std::size_t width = 1) {
+    if (count > (std::numeric_limits<std::size_t>::max() - *bytes) / width)
+      return false;
+    *bytes += count * width;
+    return true;
+  };
+  const auto prepare_capture = [&](const std::vector<std::string>& first,
+                                   const std::vector<std::string>& second,
+                                   bool include_second) -> absl::Status {
+    if (command.replication_capture_ == nullptr) return absl::OkStatus();
+    std::size_t bytes = 0;
+    for (const auto* effect : {&first, include_second ? &second : &first}) {
+      if (!add_bytes(&bytes, effect->capacity(), sizeof(std::string)))
+        return oom();
+      for (const auto& argument : *effect) {
+        if (!add_bytes(&bytes, argument.capacity() + 1)) return oom();
+      }
+      if (!include_second) break;
+    }
+    return command.replication_capture_->ReserveAdditionalCommands(
+        include_second ? 2 : 1, bytes);
+  };
+  try {
+    // These outlive the materialized input/output strings, including owner
+    // hops. A failed command releases its scratch before attempting
+    // command-local undo.
+    std::vector<RetainedMemoryCharge> input_charges(command.args_.size());
+    std::vector<RetainedMemoryCharge> vector_charges(command.args_.size());
+    RetainedMemoryCharge aggregate_charge;
+    RetainedMemoryCharge effect_charge;
+    const auto& args = command.args_;
+    auto find_key = [&](std::size_t argument) -> const ExecKey* {
+      for (const ExecKey& key : keys) {
+        if (key.arg_ == argument) return &key;
+      }
+      return nullptr;
     };
-    if (key.owner_ == ThisWorker().id_) {
-      co_return co_await execute();
-    }
-    co_return co_await SubmitTaskTo(key.owner_, execute);
-  };
-  auto read_members = [&](std::size_t argument)
-      -> Task<absl::StatusOr<std::vector<std::string>>> {
-    const ExecKey* key = find_key(argument);
-    if (key == nullptr) co_return absl::InternalError("Set key is missing");
-    storage::HashOperation operation;
-    operation.kind_ = storage::HashOperationKind::kKeys;
-    auto result = co_await run_set(*key, std::move(operation), false);
-    if (!result.ok()) co_return result.status();
-    std::vector<std::string> members;
-    members.reserve(result->values_.size());
-    for (auto& member : result->values_) {
-      members.push_back(std::move(*member));
-    }
-    co_return members;
-  };
-
-  if (command.kind_ == CommandKind::kSMove) {
-    MarkReplicationCommandHandled(command);
-    const ExecKey* source_key = find_key(1);
-    if (source_key == nullptr) {
-      co_return EncodeError("ERR Set source key is missing");
-    }
-    storage::HashOperation contains;
-    contains.kind_ = storage::HashOperationKind::kGet;
-    contains.fields_.push_back(args[3]);
-    auto source = co_await run_set(*source_key, std::move(contains), false);
-    if (!source.ok()) co_return EncodeStorageError(source.status());
-    if (!source->key_exists_) co_return EncodeInteger(0);
-    const bool source_contains =
-        !source->values_.empty() && source->values_.front().has_value();
-    if (args[1] == args[2]) co_return EncodeInteger(source_contains ? 1 : 0);
-    const ExecKey* destination = find_key(2);
-    if (destination == nullptr) {
-      co_return EncodeError("ERR Set destination key is missing");
-    }
-    storage::HashOperation validate;
-    validate.kind_ = storage::HashOperationKind::kLength;
-    auto checked = co_await run_set(*destination, std::move(validate), false);
-    if (!checked.ok()) co_return EncodeStorageError(checked.status());
-    if (!source_contains) co_return EncodeInteger(0);
-    const std::vector<unsigned> owners =
-        UniqueOwners({source_key->owner_, destination->owner_});
-    std::vector<ExecWriteCheckpoint> checkpoints;
-    absl::Status undo =
-        co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
-    if (!undo.ok()) co_return EncodeStorageError(undo);
-    storage::HashOperation remove;
-    remove.kind_ = storage::HashOperationKind::kDelete;
-    remove.fields_.push_back(args[3]);
-    auto removed = co_await run_set(*source_key, std::move(remove), true);
-    if (!removed.ok()) {
-      absl::Status rolled_back =
-          co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
-      co_return EncodeStorageError(rolled_back.ok() ? removed.status()
-                                                    : rolled_back);
-    }
-    storage::HashOperation add;
-    add.kind_ = storage::HashOperationKind::kSet;
-    add.fields_.push_back(args[3]);
-    add.values_.push_back({});
-    auto added = co_await run_set(*destination, std::move(add), true);
-    if (!added.ok()) {
-      absl::Status rolled_back =
-          co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
-      co_return EncodeStorageError(rolled_back.ok() ? added.status()
-                                                    : rolled_back);
-    }
-    absl::Status completed =
-        co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
-    if (!completed.ok()) co_return EncodeStorageError(completed);
-    CaptureReplicationCommand(command, {"SREM", args[1], args[3]});
-    CaptureReplicationCommand(command, {"SADD", args[2], args[3]});
-    co_return EncodeInteger(1);
-  }
-
-  const bool store = command.kind_ == CommandKind::kSDiffStore ||
-                     command.kind_ == CommandKind::kSInterStore ||
-                     command.kind_ == CommandKind::kSUnionStore;
-  const bool intersection = command.kind_ == CommandKind::kSInter ||
-                            command.kind_ == CommandKind::kSInterCard ||
-                            command.kind_ == CommandKind::kSInterStore;
-  const bool difference = command.kind_ == CommandKind::kSDiff ||
-                          command.kind_ == CommandKind::kSDiffStore;
-  const std::size_t first_source =
-      command.kind_ == CommandKind::kSInterCard ? 2 : (store ? 2 : 1);
-  const std::size_t last_source = keys.back().arg_;
-  std::uint64_t cardinality_limit = 0;
-  if (command.kind_ == CommandKind::kSInterCard) {
-    for (std::size_t option = last_source + 1; option < args.size();
-         option += 2) {
-      if (option + 1 >= args.size() ||
-          !CmpCaseInsensitive(args[option], "limit")) {
-        co_return EncodeError("ERR syntax error");
-      }
-      std::int64_t parsed_limit = 0;
-      const std::string_view text = args[option + 1];
-      const auto parsed =
-          std::from_chars(text.data(), text.data() + text.size(), parsed_limit);
-      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
-          parsed_limit < 0) {
-        co_return EncodeError("ERR LIMIT can't be negative");
-      }
-      cardinality_limit = static_cast<std::uint64_t>(parsed_limit);
-    }
-  }
-  std::vector<std::vector<std::string>> sources;
-  sources.reserve(last_source - first_source + 1);
-  for (std::size_t argument = first_source; argument <= last_source;
-       ++argument) {
-    auto members = co_await read_members(argument);
-    if (!members.ok()) co_return EncodeStorageError(members.status());
-    sources.push_back(std::move(*members));
-  }
-  absl::flat_hash_set<std::string> output;
-  for (const std::string& member : sources.front()) output.insert(member);
-  if (intersection) {
-    for (std::size_t i = 1; i < sources.size(); ++i) {
-      absl::flat_hash_set<std::string_view> current;
-      current.reserve(sources[i].size());
-      for (const std::string& member : sources[i]) current.insert(member);
-      for (auto it = output.begin(); it != output.end();) {
-        if (!current.contains(*it)) {
-          auto remove = it++;
-          output.erase(remove);
-        } else {
-          ++it;
+    auto run_set =
+        [&](const ExecKey& key, storage::HashOperation operation,
+            bool write) -> Task<absl::StatusOr<storage::HashResult>> {
+      auto execute = [&]() -> Task<absl::StatusOr<storage::HashResult>> {
+        auto result = co_await g_storage->ExecuteSetLocked(
+            command.db_id_, args[key.arg_], key.digest_, operation,
+            write ? &tx_writes[key.owner_] : nullptr);
+        if (!result.ok()) co_return result.status();
+        // Full kKeys can still use an uncharged legacy result. Establish the
+        // retained owner before transferring its strings to the coordinator.
+        if (operation.kind_ == storage::HashOperationKind::kKeys &&
+            result->retained_charge_.bytes() == 0) {
+          std::size_t bytes = 0;
+          if (!add_bytes(&bytes, result->values_.capacity(),
+                         sizeof(std::optional<std::string>)))
+            co_return oom();
+          for (const auto& member : result->values_) {
+            if (member && !add_bytes(&bytes, member->capacity() + 1))
+              co_return oom();
+          }
+          auto admitted = TryReserveMemory(bytes);
+          if (!admitted) co_return oom();
+          result->retained_charge_.Adopt(&*admitted, bytes);
         }
+        co_return result;
+      };
+      if (key.owner_ == ThisWorker().id_) {
+        co_return co_await execute();
       }
-    }
-  } else if (difference) {
-    for (std::size_t i = 1; i < sources.size(); ++i) {
-      for (const std::string& member : sources[i]) output.erase(member);
-    }
-  } else {
-    for (std::size_t i = 1; i < sources.size(); ++i) {
-      for (const std::string& member : sources[i]) output.insert(member);
-    }
-  }
-
-  if (command.kind_ == CommandKind::kSInterCard) {
-    const std::uint64_t cardinality = output.size();
-    co_return EncodeInteger(static_cast<long long>(
-        cardinality_limit == 0 ? cardinality
-                               : std::min(cardinality, cardinality_limit)));
-  }
-
-  if (store) {
-    MarkReplicationCommandHandled(command);
-    const ExecKey* destination = find_key(1);
-    if (destination == nullptr) {
-      co_return EncodeError("ERR Set destination key is missing");
-    }
-    const std::vector<unsigned> owners = UniqueOwners({destination->owner_});
-    std::vector<ExecWriteCheckpoint> checkpoints;
-    absl::Status undo =
-        co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
-    if (!undo.ok()) co_return EncodeStorageError(undo);
-    auto remove_destination = [&]() {
-      return g_storage->DeleteLocked(command.db_id_, args[1],
-                                     destination->digest_,
-                                     &tx_writes[destination->owner_]);
+      co_return co_await SubmitTaskTo(key.owner_, execute);
     };
-    absl::StatusOr<bool> deleted;
-    if (destination->owner_ == ThisWorker().id_) {
-      deleted = co_await remove_destination();
-    } else {
-      deleted = co_await SubmitTaskTo(destination->owner_, remove_destination);
-    }
-    if (!deleted.ok()) {
-      absl::Status rolled_back =
-          co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
-      co_return EncodeStorageError(rolled_back.ok() ? deleted.status()
-                                                    : rolled_back);
-    }
-    if (!output.empty()) {
+    auto read_members = [&](std::size_t argument)
+        -> Task<absl::StatusOr<std::vector<std::string>>> {
+      const ExecKey* key = find_key(argument);
+      if (key == nullptr) co_return absl::InternalError("Set key is missing");
+      storage::HashOperation operation;
+      operation.kind_ = storage::HashOperationKind::kKeys;
+      auto result = co_await run_set(*key, std::move(operation), false);
+      if (!result.ok()) co_return result.status();
+      std::size_t bytes = 0;
+      if (!add_bytes(&bytes, result->values_.size(), sizeof(std::string)))
+        co_return oom();
+      auto admitted = TryReserveMemory(bytes);
+      if (!admitted) co_return oom();
+      input_charges[argument] = std::move(result->retained_charge_);
+      vector_charges[argument].Adopt(&*admitted, bytes);
+      std::vector<std::string> members;
+      members.reserve(result->values_.size());
+      for (auto& member : result->values_) {
+        members.push_back(std::move(*member));
+      }
+      co_return members;
+    };
+
+    if (command.kind_ == CommandKind::kSMove) {
+      MarkReplicationCommandHandled(command);
+      const ExecKey* source_key = find_key(1);
+      if (source_key == nullptr) {
+        co_return EncodeError("ERR Set source key is missing");
+      }
+      storage::HashOperation contains;
+      contains.kind_ = storage::HashOperationKind::kGet;
+      contains.fields_.push_back(args[3]);
+      auto source = co_await run_set(*source_key, std::move(contains), false);
+      if (!source.ok()) co_return EncodeStorageError(source.status());
+      if (!source->key_exists_) co_return EncodeInteger(0);
+      const bool source_contains =
+          !source->values_.empty() && source->values_.front().has_value();
+      if (args[1] == args[2]) co_return EncodeInteger(source_contains ? 1 : 0);
+      const ExecKey* destination = find_key(2);
+      if (destination == nullptr) {
+        co_return EncodeError("ERR Set destination key is missing");
+      }
+      storage::HashOperation validate;
+      validate.kind_ = storage::HashOperationKind::kLength;
+      auto checked = co_await run_set(*destination, std::move(validate), false);
+      if (!checked.ok()) co_return EncodeStorageError(checked.status());
+      if (!source_contains) co_return EncodeInteger(0);
+      const std::vector<unsigned> owners =
+          UniqueOwners({source_key->owner_, destination->owner_});
+      storage::HashOperation remove;
+      remove.kind_ = storage::HashOperationKind::kDelete;
+      remove.fields_.push_back(args[3]);
       storage::HashOperation add;
       add.kind_ = storage::HashOperationKind::kSet;
-      add.fields_.reserve(output.size());
-      add.values_.reserve(output.size());
-      for (const std::string& member : output) {
-        add.fields_.push_back(member);
-        add.values_.push_back({});
+      add.fields_.push_back(args[3]);
+      add.values_.push_back({});
+      std::size_t effect_bytes = 4096;
+      for (const auto& argument : args) {
+        if (!add_bytes(&effect_bytes, argument.size() + 1, 4))
+          co_return EncodeStorageError(oom());
+      }
+      auto effect_admission = TryReserveMemory(effect_bytes);
+      if (!effect_admission) co_return EncodeStorageError(oom());
+      effect_charge.Adopt(&*effect_admission, effect_bytes);
+      std::vector<std::string> remove_effect{"SREM", args[1], args[3]};
+      std::vector<std::string> add_effect{"SADD", args[2], args[3]};
+      auto capture_ready = prepare_capture(remove_effect, add_effect, true);
+      if (!capture_ready.ok()) co_return EncodeStorageError(capture_ready);
+      absl::Status undo =
+          co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
+      if (!undo.ok()) co_return EncodeStorageError(undo);
+      undo_active = true;
+      auto removed = co_await run_set(*source_key, std::move(remove), true);
+      if (!removed.ok()) {
+        absl::Status rolled_back =
+            co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+        undo_active = false;
+        co_return EncodeStorageError(rolled_back.ok() ? removed.status()
+                                                      : rolled_back);
       }
       auto added = co_await run_set(*destination, std::move(add), true);
       if (!added.ok()) {
         absl::Status rolled_back =
             co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+        undo_active = false;
         co_return EncodeStorageError(rolled_back.ok() ? added.status()
                                                       : rolled_back);
       }
+      absl::Status completed =
+          co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
+      undo_active = false;
+      if (!completed.ok()) co_return EncodeStorageError(completed);
+      CaptureReplicationCommand(command, std::move(remove_effect));
+      CaptureReplicationCommand(command, std::move(add_effect));
+      co_return EncodeInteger(1);
     }
-    absl::Status completed =
-        co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
-    if (!completed.ok()) co_return EncodeStorageError(completed);
-    CaptureReplicationCommand(command, {"DEL", args[1]});
-    if (!output.empty()) {
-      std::vector<std::string> canonical{"SADD", args[1]};
-      std::vector<std::string> ordered(output.begin(), output.end());
-      std::sort(ordered.begin(), ordered.end());
-      canonical.insert(canonical.end(),
-                       std::make_move_iterator(ordered.begin()),
-                       std::make_move_iterator(ordered.end()));
-      CaptureReplicationCommand(command, std::move(canonical));
-    }
-    co_return EncodeInteger(static_cast<long long>(output.size()));
-  }
 
-  std::vector<std::string> ordered(output.begin(), output.end());
-  std::sort(ordered.begin(), ordered.end());
-  ReplyBuilder builder(command.resp_version_);
-  builder.AppendSetHeader(ordered.size());
-  for (const std::string& member : ordered) builder.AppendBulkString(member);
-  co_return std::string(builder.View());
+    const bool store = command.kind_ == CommandKind::kSDiffStore ||
+                       command.kind_ == CommandKind::kSInterStore ||
+                       command.kind_ == CommandKind::kSUnionStore;
+    const bool intersection = command.kind_ == CommandKind::kSInter ||
+                              command.kind_ == CommandKind::kSInterCard ||
+                              command.kind_ == CommandKind::kSInterStore;
+    const bool difference = command.kind_ == CommandKind::kSDiff ||
+                            command.kind_ == CommandKind::kSDiffStore;
+    const std::size_t first_source =
+        command.kind_ == CommandKind::kSInterCard ? 2 : (store ? 2 : 1);
+    const std::size_t last_source = keys.back().arg_;
+    std::uint64_t cardinality_limit = 0;
+    if (command.kind_ == CommandKind::kSInterCard) {
+      for (std::size_t option = last_source + 1; option < args.size();
+           option += 2) {
+        if (option + 1 >= args.size() ||
+            !CmpCaseInsensitive(args[option], "limit")) {
+          co_return EncodeError("ERR syntax error");
+        }
+        std::int64_t parsed_limit = 0;
+        const std::string_view text = args[option + 1];
+        const auto parsed = std::from_chars(
+            text.data(), text.data() + text.size(), parsed_limit);
+        if (parsed.ec != std::errc{} ||
+            parsed.ptr != text.data() + text.size() || parsed_limit < 0) {
+          co_return EncodeError("ERR LIMIT can't be negative");
+        }
+        cardinality_limit = static_cast<std::uint64_t>(parsed_limit);
+      }
+    }
+    std::vector<std::vector<std::string>> sources;
+    sources.reserve(last_source - first_source + 1);
+    for (std::size_t argument = first_source; argument <= last_source;
+         ++argument) {
+      auto members = co_await read_members(argument);
+      if (!members.ok()) co_return EncodeStorageError(members.status());
+      sources.push_back(std::move(*members));
+    }
+    std::size_t aggregate_bytes = 4096;
+    for (const auto& source : sources) {
+      if (!add_bytes(&aggregate_bytes, source.size(), 256))
+        co_return EncodeStorageError(oom());
+      for (const auto& member : source) {
+        // The encoded EXEC/Lua reply is an owning string, so it can overlap the
+        // hash table, ordered output and ReplyBuilder wire buffer.
+        if (!add_bytes(&aggregate_bytes, member.capacity() + 1, 4))
+          co_return EncodeStorageError(oom());
+      }
+    }
+    auto aggregate_admission = TryReserveMemory(aggregate_bytes);
+    if (!aggregate_admission) co_return EncodeStorageError(oom());
+    aggregate_charge.Adopt(&*aggregate_admission, aggregate_bytes);
+    absl::flat_hash_set<std::string> output;
+    for (const std::string& member : sources.front()) output.insert(member);
+    if (intersection) {
+      for (std::size_t i = 1; i < sources.size(); ++i) {
+        absl::flat_hash_set<std::string_view> current;
+        current.reserve(sources[i].size());
+        for (const std::string& member : sources[i]) current.insert(member);
+        for (auto it = output.begin(); it != output.end();) {
+          if (!current.contains(*it)) {
+            auto remove = it++;
+            output.erase(remove);
+          } else {
+            ++it;
+          }
+        }
+      }
+    } else if (difference) {
+      for (std::size_t i = 1; i < sources.size(); ++i) {
+        for (const std::string& member : sources[i]) output.erase(member);
+      }
+    } else {
+      for (std::size_t i = 1; i < sources.size(); ++i) {
+        for (const std::string& member : sources[i]) output.insert(member);
+      }
+    }
+
+    if (command.kind_ == CommandKind::kSInterCard) {
+      const std::uint64_t cardinality = output.size();
+      co_return EncodeInteger(static_cast<long long>(
+          cardinality_limit == 0 ? cardinality
+                                 : std::min(cardinality, cardinality_limit)));
+    }
+
+    if (store) {
+      MarkReplicationCommandHandled(command);
+      const ExecKey* destination = find_key(1);
+      if (destination == nullptr) {
+        co_return EncodeError("ERR Set destination key is missing");
+      }
+      const std::vector<unsigned> owners = UniqueOwners({destination->owner_});
+      // All STORE vectors and canonical copies are prepared while the original
+      // destination is intact, not after DEL has entered the undo journal.
+      storage::HashOperation add;
+      add.kind_ = storage::HashOperationKind::kSet;
+      add.fields_.reserve(output.size());
+      add.values_.resize(output.size());
+      for (const std::string& member : output) add.fields_.push_back(member);
+      std::size_t effect_bytes = 4096;
+      for (const auto& argument : args) {
+        if (!add_bytes(&effect_bytes, argument.size() + 1, 4))
+          co_return EncodeStorageError(oom());
+      }
+      for (const auto& member : output) {
+        if (!add_bytes(&effect_bytes, member.size() + 1, 3) ||
+            !add_bytes(&effect_bytes, 1, 128))
+          co_return EncodeStorageError(oom());
+      }
+      auto effect_admission = TryReserveMemory(effect_bytes);
+      if (!effect_admission) co_return EncodeStorageError(oom());
+      effect_charge.Adopt(&*effect_admission, effect_bytes);
+      std::vector<std::string> remove_effect{"DEL", args[1]};
+      std::vector<std::string> canonical{"SADD", args[1]};
+      if (!output.empty()) {
+        std::vector<std::string> ordered(output.begin(), output.end());
+        std::sort(ordered.begin(), ordered.end());
+        canonical.insert(canonical.end(),
+                         std::make_move_iterator(ordered.begin()),
+                         std::make_move_iterator(ordered.end()));
+      }
+      auto capture_ready =
+          prepare_capture(remove_effect, canonical, !output.empty());
+      if (!capture_ready.ok()) co_return EncodeStorageError(capture_ready);
+      absl::Status undo =
+          co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
+      if (!undo.ok()) co_return EncodeStorageError(undo);
+      undo_active = true;
+      auto remove_destination = [&]() {
+        return g_storage->DeleteLocked(command.db_id_, args[1],
+                                       destination->digest_,
+                                       &tx_writes[destination->owner_]);
+      };
+      absl::StatusOr<bool> deleted;
+      if (destination->owner_ == ThisWorker().id_) {
+        deleted = co_await remove_destination();
+      } else {
+        deleted =
+            co_await SubmitTaskTo(destination->owner_, remove_destination);
+      }
+      if (!deleted.ok()) {
+        absl::Status rolled_back =
+            co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+        undo_active = false;
+        co_return EncodeStorageError(rolled_back.ok() ? deleted.status()
+                                                      : rolled_back);
+      }
+      if (!output.empty()) {
+        auto added = co_await run_set(*destination, std::move(add), true);
+        if (!added.ok()) {
+          absl::Status rolled_back =
+              co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+          undo_active = false;
+          co_return EncodeStorageError(rolled_back.ok() ? added.status()
+                                                        : rolled_back);
+        }
+      }
+      absl::Status completed =
+          co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
+      undo_active = false;
+      if (!completed.ok()) co_return EncodeStorageError(completed);
+      CaptureReplicationCommand(command, std::move(remove_effect));
+      if (!output.empty()) {
+        CaptureReplicationCommand(command, std::move(canonical));
+      }
+      co_return EncodeInteger(static_cast<long long>(output.size()));
+    }
+
+    std::vector<std::string> ordered(output.begin(), output.end());
+    std::sort(ordered.begin(), ordered.end());
+    ReplyBuilder builder(command.resp_version_);
+    builder.AppendSetHeader(ordered.size());
+    for (const std::string& member : ordered) builder.AppendBulkString(member);
+    co_return std::string(builder.View());
+  } catch (const std::bad_alloc&) {
+    // Coroutine handlers cannot await; unwind owned scratch, then use the
+    // same command-local compensation path as an ordinary storage OOM below.
+  } catch (const std::length_error&) {
+  }
+  if (undo_active) {
+    const auto restored =
+        co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+    if (!restored.ok()) co_return EncodeStorageError(restored);
+  }
+  co_return EncodeStorageError(oom());
 }
 
 Task<std::string> ExecuteExecSequentialListPop(
@@ -6750,6 +7092,15 @@ Task<std::string> ExecuteExecSequentialCommand(
     const std::vector<ExecKey>& keys,
     std::vector<storage::TxShardWrites>& tx_writes,
     bool script_context = false) {
+  struct PreparedCaptureCleanup {
+    ReplicationCommandCapture* capture;
+    ~PreparedCaptureCleanup() {
+      if (capture != nullptr) capture->ReleaseUnusedPreparation();
+    }
+  } capture_cleanup{family == ExecSequentialFamily::kSetMulti ||
+                            family == ExecSequentialFamily::kZSetMulti
+                        ? command.replication_capture_.get()
+                        : nullptr};
   switch (family) {
     case ExecSequentialFamily::kListPop:
       co_return co_await ExecuteExecSequentialListPop(command, keys, tx_writes);
@@ -7171,9 +7522,10 @@ Task<std::string> ExecuteLuaRedisCall(
         }
         if (command.kind_ == CommandKind::kExists ||
             command.kind_ == CommandKind::kTouch) {
-          const bool exists = co_await g_storage->ExistsLocked(
+          auto metadata = co_await g_storage->ReadKeyMetadataLocked(
               command.db_id_, command.args_[key_index], digest);
-          reply = EncodeInteger(exists ? 1 : 0);
+          reply = metadata.ok() ? EncodeInteger(metadata->exists_ ? 1 : 0)
+                                : EncodeStorageError(metadata.status());
           co_return absl::OkStatus();
         }
         reply = co_await RunSingleKeyLocked(command.db_id_, command, digest,
@@ -7576,6 +7928,14 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
       // The script's mutations are complete once it returns; the publish and
       // release hops settle them and must not be fenced off retroactively.
       transaction->SetShardValidator(nullptr, nullptr);
+      // redis.pcall can catch a command error, but cannot make a known failed
+      // physical grouped transaction commit-safe. Reject before publishing
+      // successful-looking effects or handing its receipt to the async queue.
+      const auto valid = storage::StorageEngine::ValidateTxCommit(tx_writes);
+      if (!valid.ok()) {
+        (void)co_await transaction->Release();
+        co_return BuiltReply(AppendStorageError(reply_builder, valid));
+      }
       absl::Status published = co_await transaction->Execute(
           &PublishFullSyncEffectsCallback, &tx_writes, /*release=*/false);
       if (!published.ok()) {
@@ -8210,8 +8570,12 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
         }
         case CommandKind::kExists:
         case CommandKind::kTouch: {
-          if (co_await g_storage->ExistsLocked(cmd.db_id_, args[key.arg_],
-                                               key.digest_)) {
+          auto metadata = co_await g_storage->ReadKeyMetadataLocked(
+              cmd.db_id_, args[key.arg_], key.digest_);
+          if (!metadata.ok()) {
+            record_error(metadata.status());
+            command_failed = true;
+          } else if (metadata->exists_) {
             ctx->counters_[local].fetch_add(1, std::memory_order_relaxed);
           }
           break;
@@ -8282,11 +8646,12 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
   // cross-worker registration and liveness read: a replacement that starts
   // later must dirty the completed registrations, while a replacement that
   // won first is detected before this request installs any new ones.
-  absl::Status paused = co_await MaybePauseBeforeCommandDbAdmission();
-  if (!paused.ok()) {
-    co_return BuiltReply(reply_builder.AppendError(
-        absl::StrCat("ERR database admission failed: ", paused.message())));
-  }
+  KEYLANE_FAULT_INJECT(
+      absl::Status paused = co_await MaybePauseBeforeCommandDbAdmission();
+      if (!paused.ok()) {
+        co_return BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR database admission failed: ", paused.message())));
+      });
   while (!TryBeginDbOperation(request.db_id_)) {
     absl::Status waited = co_await celer::SleepFor(
         *ThisWorker().self_, std::chrono::milliseconds(1));
@@ -9141,26 +9506,25 @@ Task<CommandReply> ExecuteExecBody(
         co_return absl::FailedPreconditionError(
             "catalog transaction publisher admission was already released");
       }
-#ifndef NDEBUG
-      if (const char* configured = std::getenv(
-              "KEYLANE_EXEC_PAUSE_BEFORE_CATALOG_REPLICATION_FENCE_MS");
-          configured != nullptr) {
-        std::uint64_t pause_ms = 0;
-        const std::size_t length = std::strlen(configured);
-        const auto parsed =
-            std::from_chars(configured, configured + length, pause_ms);
-        static std::atomic<bool> pause_used = false;
-        if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
-            pause_ms != 0 && pause_ms <= 60000 &&
-            !pause_used.exchange(true, std::memory_order_acq_rel)) {
-          spdlog::info(
-              "catalog EXEC committed; pausing before replication fence");
-          absl::Status paused = co_await celer::SleepFor(
-              *ThisWorker().self_, std::chrono::milliseconds(pause_ms));
-          if (!paused.ok()) co_return paused;
-        }
-      }
-#endif
+      KEYLANE_FAULT_INJECT(
+          if (const char* configured = std::getenv(
+                  "KEYLANE_EXEC_PAUSE_BEFORE_CATALOG_REPLICATION_FENCE_MS");
+              configured != nullptr) {
+            std::uint64_t pause_ms = 0;
+            const std::size_t length = std::strlen(configured);
+            const auto parsed =
+                std::from_chars(configured, configured + length, pause_ms);
+            static std::atomic<bool> pause_used = false;
+            if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
+                pause_ms != 0 && pause_ms <= 60000 &&
+                !pause_used.exchange(true, std::memory_order_acq_rel)) {
+              spdlog::info(
+                  "catalog EXEC committed; pausing before replication fence");
+              absl::Status paused = co_await celer::SleepFor(
+                  *ThisWorker().self_, std::chrono::milliseconds(pause_ms));
+              if (!paused.ok()) co_return paused;
+            }
+          });
       // Every after-image and participant marker is now enqueued. Release the
       // outer EXEC admission before waiting for the log fence: the fence must
       // cross the same admitted-bytes waterline, so retaining it here would
@@ -9272,6 +9636,9 @@ Task<CommandReply> ExecuteExecBody(
               AssembleRunReplies(run);
               i = end;
             }
+            const auto valid =
+                storage::StorageEngine::ValidateTxCommit(tx_writes);
+            if (!valid.ok()) co_return valid;
             g_storage->PublishCommittedFullSyncEffects(
                 &tx_writes[celer::ThisWorker().id_]);
             co_return absl::OkStatus();
@@ -9471,6 +9838,13 @@ Task<CommandReply> ExecuteExecBody(
       // Every queued command ran; the publish/release hops settle their
       // effects and must not be fenced off retroactively.
       txn.SetShardValidator(nullptr, nullptr);
+      const auto valid = storage::StorageEngine::ValidateTxCommit(tx_writes);
+      if (!valid.ok()) {
+        (void)co_await txn.Release();
+        co_await DropWatches(ctx);
+        co_return finalize_exec_reply(
+            BuiltReply(AppendStorageError(reply_builder, valid)));
+      }
       absl::Status published =
           co_await txn.Execute(&PublishFullSyncEffectsCallback, &tx_writes,
                                /*release=*/false);
@@ -9896,11 +10270,9 @@ bool RequestSpansMultipleShards(const CommandRequest& request) {
 
 void InitStorage(storage::StorageEngine* engine,
                  ReplicationManager* replication) {
-  // Test processes set their environment before constructing the server.
-  // Capture it while startup is still single-threaded; the command hot path
-  // treats the pointer as immutable after workers launch.
-  g_command_pause_before_db_admission =
-      std::getenv("KEYLANE_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS");
+  // Fault-enabled test processes set the immutable hook before workers launch.
+  KEYLANE_FAULT_INJECT(g_command_pause_before_db_admission = std::getenv(
+                           "KEYLANE_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS"););
   g_storage = engine;
   InitFunctionCatalog(engine);
   InitBlockingWaitStorage(engine);
@@ -9917,6 +10289,61 @@ void InitStorage(storage::StorageEngine* engine,
 
 void InitClientLimit(ClientLimit* limit) noexcept { g_client_limit = limit; }
 
+absl::Status ReplicationCommandCapture::ReserveAdditionalCommands(
+    std::size_t count, std::size_t payload_bytes) {
+  std::lock_guard lock(mutex_);
+  constexpr auto limit = std::numeric_limits<std::size_t>::max();
+  constexpr auto overhead = sizeof(RetainedMemoryCharge) + 128;
+  const auto owner = CurrentMemoryAccountingShard();
+  if (prepared_charge_ && preparation_owner_ != owner)
+    return absl::FailedPreconditionError(
+        "replication capture preparation changed coordinator");
+  const auto existing = prepared_charge_ ? prepared_charge_->bytes() : 0;
+  if (count > commands_.max_size() - commands_.size() ||
+      payload_bytes > limit - overhead ||
+      count > (limit - overhead - payload_bytes) /
+                  sizeof(CapturedReplicationCommand))
+    return absl::ResourceExhaustedError(
+        "OOM replication capture size overflow");
+  const auto bytes =
+      overhead + payload_bytes + count * sizeof(CapturedReplicationCommand);
+  if (bytes > limit - existing)
+    return absl::ResourceExhaustedError(
+        "OOM replication capture size overflow");
+  auto admission = TryReserveMemory(bytes);
+  if (!admission) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM preparing replication capture");
+  }
+  try {
+    auto charge = prepared_charge_ ? prepared_charge_
+                                   : std::make_shared<RetainedMemoryCharge>();
+    commands_.reserve(commands_.size() + count);
+    if (prepared_charge_) {
+      charge->Resize(existing + bytes);
+      admission->Release();
+    } else {
+      charge->Adopt(&*admission, bytes);
+    }
+    preparation_owner_ = owner;
+    prepared_charge_ = std::move(charge);
+    return absl::OkStatus();
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM preparing replication capture");
+  }
+}
+
+void ReplicationCommandCapture::ReleaseUnusedPreparation() {
+  std::lock_guard lock(mutex_);
+  if (!commands_.empty() || !prepared_charge_) return;
+  // The queued request can outlive this failed command for the rest of EXEC.
+  // Drop allocated capacity before the charge; preserve handled_ so an empty
+  // canonical result cannot fall back to replaying the original command.
+  std::vector<CapturedReplicationCommand>().swap(commands_);
+  prepared_charge_.reset();
+}
+
 void ReplicationCommandCapture::MarkHandled() {
   std::lock_guard lock(mutex_);
   handled_ = true;
@@ -9927,7 +10354,9 @@ void ReplicationCommandCapture::Record(std::uint8_t db_id,
   if (args.empty()) return;
   std::lock_guard lock(mutex_);
   handled_ = true;
-  commands_.push_back(CapturedReplicationCommand{db_id, std::move(args)});
+  CapturedReplicationCommand command{db_id, std::move(args)};
+  command.retained_charge_ = prepared_charge_;
+  commands_.push_back(std::move(command));
 }
 
 CapturedReplicationEffects ReplicationCommandCapture::Take() {
@@ -10166,6 +10595,13 @@ absl::Status ReplicationTransactionGuard::TrySetCommandArgs(
   } catch (const std::length_error&) {
     return absl::ResourceExhaustedError(
         "replication transaction payload is too large");
+  } catch (const std::bad_alloc&) {
+    // Pre-mutation callers must be able to abort without changing the shared
+    // payload. In particular, a STORE's prepared effects cannot terminate the
+    // process just because this noexcept boundary owns the final vector.
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "OOM preparing replication transaction payload");
   }
 }
 
@@ -10208,6 +10644,11 @@ void ReplicationTransactionGuard::SetFinalExpirations(
     }
     SetCommandArgs(std::move(command_args));
   } catch (const std::length_error&) {
+    InvalidatePayload();
+  } catch (const std::bad_alloc&) {
+    // Expiry settlement happens after mutations. An incomplete replication
+    // body must invalidate its envelope instead of publishing partial effects.
+    RecordMemoryRejection();
     InvalidatePayload();
   }
 }
@@ -11277,14 +11718,15 @@ Task<CommandReply> ExecuteCommandBody(
                                    request.kind_ == CommandKind::kCopy;
   std::optional<DbOperationGuard> db_guard;
   if (uses_db && !manages_own_db_gate) {
-    if (!replication_origin &&
-        (cmd_flags & (kCmdWrite | kCmdDynamicWrite)) != 0) {
-      absl::Status paused = co_await MaybePauseBeforeCommandDbAdmission();
-      if (!paused.ok()) {
-        co_return BuiltReply(reply_builder.AppendError(
-            absl::StrCat("ERR database admission failed: ", paused.message())));
-      }
-    }
+    KEYLANE_FAULT_INJECT(
+        if (!replication_origin &&
+            (cmd_flags & (kCmdWrite | kCmdDynamicWrite)) != 0) {
+          absl::Status paused = co_await MaybePauseBeforeCommandDbAdmission();
+          if (!paused.ok()) {
+            co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+                "ERR database admission failed: ", paused.message())));
+          }
+        });
     while (!TryBeginDbOperation(request.db_id_)) {
       absl::Status waited = co_await celer::SleepFor(
           *ThisWorker().self_, std::chrono::milliseconds(1));

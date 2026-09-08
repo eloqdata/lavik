@@ -863,6 +863,9 @@ TEST(ListE2eTest, FreshMinimumStorageUsesImplicitEmptyCatalog) {
 }
 
 TEST(ListE2eTest, FunctionCatalogCrashRecoverySelectsCommittedRoot) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   constexpr std::string_view old_library =
       "#!lua name=crash_catalog\n"
@@ -942,6 +945,9 @@ TEST(ListE2eTest, FunctionCatalogCrashRecoverySelectsCommittedRoot) {
 }
 
 TEST(ListE2eTest, AmbiguousCatalogRootCommitFencesAllClientsUntilRestart) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   constexpr std::string_view old_library =
       "#!lua name=ambiguous_catalog\n"
@@ -3311,6 +3317,9 @@ TEST(ListE2eTest, WaitsForNativeReplicaAcknowledgementsAcrossFlows) {
 }
 
 TEST(ListE2eTest, ControlDisconnectBeforeFirstFlowCannotResumeEmptyDataset) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
       "/tmp/keylane-control-drop-fullsync-e2e-" + std::to_string(::getpid());
@@ -3931,6 +3940,9 @@ TEST(ListE2eTest, MaxClientsRejectsBeforeTlsAndUpdatesAtRuntime) {
 }
 
 TEST(ListE2eTest, FlushDbDuringFullSyncCancelsAndRestartsWithoutOldKeys) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix = "/tmp/keylane-replication-flush-fullsync-e2e-" +
                              std::to_string(::getpid());
@@ -4012,6 +4024,9 @@ TEST(ListE2eTest, FlushDbDuringFullSyncCancelsAndRestartsWithoutOldKeys) {
 }
 
 TEST(ListE2eTest, FullSyncInstallsOnlyTheFinalFunctionCatalog) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
       "/tmp/keylane-function-fullsync-cut-e2e-" + std::to_string(::getpid());
@@ -4127,6 +4142,9 @@ TEST(ListE2eTest, FullSyncInstallsOnlyTheFinalFunctionCatalog) {
 }
 
 TEST(ListE2eTest, FlushAllDuringFullSyncRestartsEveryDatabaseEpoch) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix = "/tmp/keylane-replication-flushall-fullsync-e2e-" +
                              std::to_string(::getpid());
@@ -4192,6 +4210,9 @@ TEST(ListE2eTest, FlushAllDuringFullSyncRestartsEveryDatabaseEpoch) {
 }
 
 TEST(ListE2eTest, FullSyncHandoffProjectsNonIdempotentTailExactlyOnce) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
       "/tmp/keylane-replication-handoff-tail-e2e-" + std::to_string(::getpid());
@@ -4319,6 +4340,9 @@ TEST(ListE2eTest, FullSyncHandoffProjectsNonIdempotentTailExactlyOnce) {
 }
 
 TEST(ListE2eTest, PromotionDrainsAdmittedReplicaApplyBeforeClosingDbGate) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
       "/tmp/keylane-promotion-apply-drain-e2e-" + std::to_string(::getpid());
@@ -4397,6 +4421,9 @@ TEST(ListE2eTest, PromotionDrainsAdmittedReplicaApplyBeforeClosingDbGate) {
 }
 
 TEST(ListE2eTest, PromotionDrainsCompleteReplicaTransaction) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix = "/tmp/keylane-promotion-transaction-drain-e2e-" +
                              std::to_string(::getpid());
@@ -4471,6 +4498,9 @@ TEST(ListE2eTest, PromotionDrainsCompleteReplicaTransaction) {
 }
 
 TEST(ListE2eTest, PromotionDrainsCompleteReplicaControlBarrier) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
       "/tmp/keylane-promotion-control-drain-e2e-" + std::to_string(::getpid());
@@ -4628,7 +4658,7 @@ TEST(ListE2eTest, RedisPsyncFullSyncActivatesBeforeOnlineWrites) {
   replica.Stop();
 }
 
-#ifndef NDEBUG
+#if !defined(NDEBUG) || KEYLANE_TEST_FAULTS_AVAILABLE
 TEST(ListE2eTest, DemotionCancelsRedisExportWaitingForDatabaseGates) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
@@ -4834,6 +4864,9 @@ TEST(ListE2eTest, DemotionDrainsCatalogExecBeforeDisablingSourceHistory) {
 #endif
 
 TEST(ListE2eTest, WriteDelayedAcrossRoleEpochIsRejected) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
       "/tmp/keylane-role-write-admission-e2e-" + std::to_string(::getpid());
@@ -4876,6 +4909,9 @@ TEST(ListE2eTest, WriteDelayedAcrossRoleEpochIsRejected) {
 }
 
 TEST(ListE2eTest, SwitchingUpstreamLoadsDestructivelyAndNoOneRemainsFenced) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
       "/tmp/keylane-replication-root-switch-e2e-" + std::to_string(::getpid());
@@ -5486,6 +5522,9 @@ TEST(ListE2eTest, AttachingAReplicaAddsNoCrossCoreHopsToSingleKeyWrites) {
 // Covers asymmetric source/replica worker counts, dynamic replica admission,
 // a one-shot flow disconnect, backlog continuation, and FLUSHDB propagation.
 TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug or fault-instrumented server";
+#endif
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
       "/tmp/keylane-multi-replica-e2e-" + std::to_string(::getpid());
@@ -5893,6 +5932,335 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   second.Stop();
   source.Stop();
 }
+// Real storage/process coverage of large Hash extents and crash recovery.
+// Group promotion is automatic; the dedicated grouped suites additionally
+// exercise split/merge, root-decision and group-relocation fault boundaries.
+class LargeHashDurabilityE2eTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    ASSERT_FALSE(g_keylane_binary.empty());
+    const std::string prefix =
+        "/tmp/keylane-large-hash-durability-" + std::to_string(::getpid()) +
+        "-" + ::testing::UnitTest::GetInstance()->current_test_info()->name();
+    data_path_ = prefix + ".data";
+    log_path_ = prefix + ".log";
+    const int fd =
+        ::open(data_path_.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    data_cleanup_.emplace(data_path_);
+    const int allocated = ::posix_fallocate(fd, 0, 128ULL * 1024 * 1024);
+    ASSERT_EQ(::close(fd), 0);
+    ASSERT_EQ(allocated, 0);
+    const int log_fd = ::open(log_path_.c_str(),
+                              O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(log_fd, 0);
+    log_cleanup_.emplace(log_path_);
+    ASSERT_EQ(::close(log_fd), 0);
+    port_ = FindFreePort();
+    for (unsigned i = 0; i < 9; ++i)
+      fields_.push_back("field-" + std::to_string(i));
+  }
+
+  void TearDown() override {
+    if (HasFailure()) {
+      std::ifstream log(log_path_);
+      const std::string bytes((std::istreambuf_iterator<char>(log)), {});
+      ADD_FAILURE() << "Server log tail:\n"
+                    << bytes.substr(bytes.size() > 12000 ? bytes.size() - 12000
+                                                         : 0);
+    }
+  }
+
+  std::vector<std::string_view> WriteCommand(std::string_view value) const {
+    std::vector<std::string_view> command{"HSET", kKey};
+    for (const auto& field : fields_) {
+      command.push_back(field);
+      command.push_back(value);
+    }
+    command.push_back("version");
+    command.push_back(value.substr(0, 1));
+    return command;
+  }
+
+  void Verify(RespClient& client, std::string_view value) const {
+    ASSERT_EQ(client.Command({"HLEN", kKey}),
+              ":" + std::to_string(fields_.size() + 1));
+    EXPECT_EQ(client.Command({"HGET", kKey, "version"}),
+              Bulk(value.substr(0, 1)));
+    for (const auto& field : fields_) {
+      // Check every byte and field, not only HLEN or an aggregate checksum.
+      EXPECT_EQ(client.Command({"HGET", kKey, field}), Bulk(value)) << field;
+    }
+  }
+
+  static constexpr std::string_view kKey = "{large-hash-gc}:hash";
+  void CheckGcCrash(std::string_view point);
+  void CheckOom(bool injected_storage_failure);
+  std::string data_path_;
+  std::string log_path_;
+  std::optional<FileCleanup> data_cleanup_;
+  std::optional<FileCleanup> log_cleanup_;
+  std::uint16_t port_ = 0;
+  std::vector<std::string> fields_;
+};
+
+TEST_F(LargeHashDurabilityE2eTest, CrashDuringExtentWriteKeepsOldHashAndTtl) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires Debug or the explicitly test-instrumented module";
+#else
+  // One field must itself exceed an inline group. Nine medium fields now
+  // split into independent pages and no longer exercise extent writes.
+  fields_.resize(1);
+  const std::string old_value(9 * 1024 * 1024, 'a');
+  const std::string new_value(9 * 1024 * 1024, 'z');
+  {
+    ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 2);
+    RespClient client(port_);
+    ASSERT_EQ(client.Command(WriteCommand(old_value)), ":2");
+    ASSERT_EQ(client.Command({"PEXPIRE", kKey, "3600000"}), ":1");
+    ASSERT_TRUE(WaitForDurability(client));
+    server.Kill();
+  }
+  for (const std::string_view point :
+       {"extent-first-part-durable", "group-extents-durable-before-record"}) {
+    SCOPED_TRACE(point);
+    {
+      ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 2,
+                           point);
+      RespClient ready(port_);
+      auto command = WriteCommand(new_value);
+      command.insert(command.end(), {"new-field", "must-not-appear"});
+      const int fd = ConnectSocket(port_);
+      ASSERT_GE(fd, 0);
+      SendAll(fd, EncodeCommand(command));
+      server.WaitForCrash();  // Must exit at the injection point with code 86.
+      ASSERT_EQ(::close(fd), 0);
+    }
+    {
+      // Change worker topology too; no runtime directory can survive exec.
+      ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 3);
+      RespClient client(port_);
+      Verify(client, old_value);
+      EXPECT_EQ(client.Command({"HEXISTS", kKey, "new-field"}), ":0");
+      const auto ttl = client.Command({"PTTL", kKey});
+      ASSERT_TRUE(ttl.starts_with(':'));
+      EXPECT_GT(std::stoll(ttl.substr(1)), 0);
+      ASSERT_TRUE(WaitForDurability(client));
+      server.Kill();
+    }
+  }
+  // The interrupted allocations must not accumulate into permanent disk
+  // exhaustion. A new complete replacement still fits this bounded device.
+  ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 2);
+  RespClient client(port_);
+  ASSERT_EQ(client.Command(WriteCommand(new_value)), ":0");
+  ASSERT_TRUE(WaitForDurability(client));
+  Verify(client, new_value);
+  server.Stop();
+#endif
+}
+
+TEST_F(LargeHashDurabilityE2eTest,
+       RepeatedExtentReplacementReclaimsBoundedStorage) {
+  std::string value(1024 * 1024, 'a');
+  {
+    ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 2);
+    RespClient client(port_);
+    // 20 complete 9 MiB rewrites exceed this 128 MiB device. Succeeding
+    // requires retirement/reuse, not just retaining every old extent.
+    for (unsigned round = 0; round < 20; ++round) {
+      SCOPED_TRACE(round);
+      value.assign(value.size(), 'a' + round);
+      ASSERT_EQ(client.Command(WriteCommand(value)), round == 0 ? ":10" : ":0");
+      ASSERT_TRUE(WaitForDurability(client));
+      EXPECT_EQ(client.Command({"HGET", kKey, "version"}),
+                Bulk(value.substr(0, 1)));
+    }
+    Verify(client, value);
+    ASSERT_EQ(client.Command({"DEL", kKey}), ":1");
+    ASSERT_TRUE(WaitForDurability(client));
+    ASSERT_EQ(client.Command({"HSET", kKey, "only-new-incarnation", "fresh"}),
+              ":1");
+    ASSERT_TRUE(WaitForDurability(client));
+    server.Kill();
+  }
+  ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 3);
+  RespClient client(port_);
+  EXPECT_EQ(client.Command({"HLEN", kKey}), ":1");
+  EXPECT_EQ(client.Command({"HGET", kKey, "only-new-incarnation"}),
+            Bulk("fresh"));
+  EXPECT_EQ(client.Command({"HEXISTS", kKey, "field-0"}), ":0");
+  server.Stop();
+}
+
+void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires Debug or the explicitly test-instrumented module";
+#else
+  const std::string value(1024 * 1024, 'g');
+  std::vector<std::string> fillers;
+  for (unsigned i = 0; i < 5; ++i)
+    fillers.push_back("{large-hash-gc}:filler-" + std::to_string(i));
+  {
+    ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 2);
+    RespClient client(port_);
+    ASSERT_EQ(client.Command(WriteCommand(value)), ":10");
+    // Same hash slot puts the root beside filler payloads. Group children
+    // belong to transaction generations and are relocated by the tx cleaner.
+    for (const auto& key : fillers)
+      ASSERT_EQ(client.Command({"SET", key, value}), "+OK");
+    ASSERT_TRUE(WaitForDurability(client));
+    server.Kill();
+  }
+  {
+    ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 2,
+                         point);
+    RespClient ready(port_);
+    if (point == "hash-group-defrag-copy-staged") {
+      // This case explicitly tests GC, not default pressure scheduling. Arm a
+      // short cleaner cadence so an auxiliary page is actually relocated.
+      ASSERT_EQ(
+          ready.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+          "+OK");
+    }
+    std::vector<std::string_view> command{"DEL"};
+    for (const auto& key : fillers) command.push_back(key);
+    const int fd = ConnectSocket(port_);
+    ASSERT_GE(fd, 0);
+    SendAll(fd, EncodeCommand(command));
+    server.WaitForCrash();
+    ASSERT_EQ(::close(fd), 0);
+  }
+  ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 3);
+  RespClient client(port_);
+  Verify(client, value);
+  server.Stop();
+#endif
+}
+
+TEST_F(LargeHashDurabilityE2eTest, GcSourceRetirementCrashPreservesExtentHash) {
+  CheckGcCrash("defrag-source-retired");
+}
+
+TEST_F(LargeHashDurabilityE2eTest,
+       GcStagedHashCopyCrashKeepsSourceRecoverable) {
+  CheckGcCrash("hash-group-defrag-copy-staged");
+}
+
+void LargeHashDurabilityE2eTest::CheckOom(bool injected_storage_failure) {
+#if defined(NDEBUG) && !KEYLANE_TEST_FAULTS_AVAILABLE
+  if (injected_storage_failure)
+    GTEST_SKIP() << "storage admission injection requires test faults";
+#endif
+  const std::string value(1024 * 1024, 'o');
+  {
+    ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 2);
+    RespClient client(port_);
+    ASSERT_EQ(client.Command(WriteCommand(value)), ":10");
+    ASSERT_TRUE(WaitForDurability(client));
+    server.Kill();
+  }
+  {
+    const std::vector<std::string> arguments =
+        injected_storage_failure
+            ? std::vector<std::string>{}
+            : std::vector<std::string>{"--max-memory", "96M",
+                                       "--maxmemory-clients", "64M"};
+    const std::vector<std::pair<std::string, std::string>> environment =
+        injected_storage_failure
+            ? std::vector<std::pair<
+                  std::string, std::string>>{{"KEYLANE_FAIL_HASH_ADMISSION_KEY",
+                                              std::string(kKey)}}
+            : std::vector<std::pair<std::string, std::string>>{};
+    ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 2, {},
+                         arguments, environment);
+    RespClient client(port_);
+    // Startup needs enough memory to reconstruct the durable side index.
+    // In the real-limit variant a 12 MiB request fits the separate 32 MiB
+    // per-worker client budget, but its group-write scratch cannot fit the
+    // 16 MiB per-worker storage budget. The injected variant stays small.
+    const std::string replacement =
+        injected_storage_failure ? "wrong" : std::string(12 * 1024 * 1024, 'w');
+    EXPECT_TRUE(
+        client.Command({"HSET", kKey, "version", "wrong", "new", replacement})
+            .starts_with("-OOM "));
+    EXPECT_TRUE(client.Command({"HMSET", kKey, "version", replacement})
+                    .starts_with("-OOM "));
+    EXPECT_TRUE(client.Command({"HSETNX", kKey, "new", replacement})
+                    .starts_with("-OOM "));
+    if (injected_storage_failure) {
+      ASSERT_EQ(client.Command({"MULTI"}), "+OK");
+      ASSERT_EQ(client.Command({"HSET", kKey, "version", "wrong"}), "+QUEUED");
+      ASSERT_EQ(client.Command({"HGET", kKey, "version"}), "+QUEUED");
+      const auto result = client.Command({"EXEC"});
+      EXPECT_TRUE(result.starts_with("*2\r\n-OOM ")) << result;
+      EXPECT_TRUE(result.ends_with(Bulk("o"))) << result;
+    }
+    EXPECT_EQ(client.Command({"HLEN", kKey}), ":10");
+    if (injected_storage_failure) {
+      EXPECT_EQ(client.Command({"HGET", kKey, "version"}), Bulk("o"));
+      EXPECT_EQ(client.Command({"HEXISTS", kKey, "new"}), ":0");
+    }
+    EXPECT_EQ(client.Command({"PING"}), "+PONG");
+    server.Kill();
+  }
+  ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 3);
+  RespClient client(port_);
+  Verify(client, value);
+  EXPECT_EQ(client.Command({"HEXISTS", kKey, "new"}), ":0");
+  server.Stop();
+}
+
+TEST_F(LargeHashDurabilityE2eTest,
+       RedisOomReplyDoesNotPartiallyUpdateLargeHash) {
+  CheckOom(false);
+}
+
+TEST_F(LargeHashDurabilityE2eTest, StorageOomKeepsRedisErrorClassAndOldValue) {
+  CheckOom(true);
+}
+
+TEST_F(LargeHashDurabilityE2eTest,
+       SingleOversizedFieldSurvivesNeighborUpdatesAndRecovery) {
+  // Unlike nine medium fields exceeding one block together, this entry alone
+  // cannot be made inline by splitting along field-hash boundaries.
+  const std::string huge(9 * 1024 * 1024, 'v');
+  {
+    ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 2);
+    RespClient client(port_);
+    ASSERT_EQ(client.Command({"HSET", kKey, "huge", huge, "small", "before"}),
+              ":2");
+    ASSERT_TRUE(WaitForDurability(client));
+    ASSERT_EQ(client.Command({"HSET", kKey, "small", "after"}), ":0");
+    ASSERT_TRUE(WaitForDurability(client));
+    ASSERT_EQ(client.Command({"HINCRBY", kKey, "counter", "5"}), ":5");
+    ASSERT_TRUE(WaitForDurability(client));
+    ASSERT_EQ(client.Command({"HSETNX", kKey, "huge", "wrong"}), ":0");
+    ASSERT_EQ(client.Command({"HLEN", kKey}), ":3");
+    server.Kill();
+  }
+  {
+    ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 3);
+    RespClient client(port_);
+    ASSERT_EQ(client.Command({"HGET", kKey, "huge"}), Bulk(huge));
+    ASSERT_EQ(client.Command({"HGET", kKey, "small"}), Bulk("after"));
+    ASSERT_EQ(client.Command({"HGET", kKey, "counter"}), Bulk("5"));
+    ASSERT_EQ(client.Command({"HDEL", kKey, "huge"}), ":1");
+    ASSERT_TRUE(WaitForDurability(client));
+    ASSERT_EQ(client.Command({"HLEN", kKey}), ":2");
+    ASSERT_EQ(client.Command({"HGET", kKey, "small"}), Bulk("after"));
+    server.Kill();
+  }
+  {
+    ServerProcess server(g_keylane_binary, port_, data_path_, log_path_, 2);
+    RespClient client(port_);
+    ASSERT_EQ(client.Command({"HLEN", kKey}), ":2");
+    ASSERT_EQ(client.Command({"HGET", kKey, "huge"}), "$-1");
+    ASSERT_EQ(client.Command({"HGET", kKey, "counter"}), Bulk("5"));
+    server.Stop();
+  }
+}
+
 TEST(HashE2eTest, UpdatesTransactionsAndRecoversMonolithicValues) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
@@ -5950,9 +6318,24 @@ TEST(HashE2eTest, UpdatesTransactionsAndRecoversMonolithicValues) {
     EXPECT_EQ(client.Command(
                   {"HINCRBYFLOAT", "numeric-hash", "plus-counter", "+0.5"}),
               Bulk("2"));
-    const std::string scan =
-        client.Command({"HSCAN", "large-hash", "0", "COUNT", "1000"});
-    EXPECT_TRUE(scan.starts_with("*2\r\n$1\r\n0\r\n*360\r\n"));
+    // COUNT is a hint: grouped storage can return one routing page per call.
+    std::string hash_cursor = "0";
+    std::unordered_set<std::string> scanned_fields;
+    unsigned hash_scan_calls = 0;
+    do {
+      auto [next, entries] = ParseScanReply(client.Command(
+          {"HSCAN", "large-hash", hash_cursor, "COUNT", "1000"}));
+      ASSERT_EQ(entries.size() % 2, 0u);
+      for (std::size_t i = 0; i < entries.size(); i += 2) {
+        const auto found = std::find(fields.begin(), fields.end(), entries[i]);
+        ASSERT_NE(found, fields.end());
+        EXPECT_EQ(entries[i + 1], values[found - fields.begin()]);
+        scanned_fields.insert(entries[i]);
+      }
+      hash_cursor = std::move(next);
+      ASSERT_LT(++hash_scan_calls, 2000u);
+    } while (hash_cursor != "0");
+    EXPECT_EQ(scanned_fields.size(), fields.size());
     const std::string random =
         client.Command({"HRANDFIELD", "large-hash", "10", "WITHVALUES"});
     EXPECT_TRUE(random.starts_with("*20\r\n"));
@@ -6195,13 +6578,19 @@ TEST(SetE2eTest, Redis72CommandsTransactionsAndRecovery) {
     EXPECT_EQ(client.Command({"SCARD", "large-set"}), ":180");
     EXPECT_EQ(client.Command({"SISMEMBER", "large-set", members[0]}), ":1");
     EXPECT_EQ(client.Command({"SISMEMBER", "large-set", members[179]}), ":1");
-    const std::string scan =
-        client.Command({"SSCAN", "large-set", "0", "mAtCh", "member-[0-2]-*",
-                        "cOuNt", "1000"});
-    EXPECT_TRUE(scan.starts_with("*2\r\n$1\r\n0\r\n*3\r\n"));
-    EXPECT_TRUE(scan.find(members[0]) != std::string::npos);
-    EXPECT_TRUE(scan.find(members[1]) != std::string::npos);
-    EXPECT_TRUE(scan.find(members[2]) != std::string::npos);
+    std::string set_cursor = "0";
+    std::unordered_set<std::string> scanned_members;
+    unsigned set_scan_calls = 0;
+    do {
+      auto [next, entries] = ParseScanReply(
+          client.Command({"SSCAN", "large-set", set_cursor, "mAtCh",
+                          "member-[0-2]-*", "cOuNt", "1000"}));
+      scanned_members.insert(entries.begin(), entries.end());
+      set_cursor = std::move(next);
+      ASSERT_LT(++set_scan_calls, 2000u);
+    } while (set_cursor != "0");
+    EXPECT_EQ(scanned_members, (std::unordered_set<std::string>{
+                                   members[0], members[1], members[2]}));
     EXPECT_TRUE(client.Command({"SRANDMEMBER", "large-set", "10"})
                     .starts_with("*10\r\n"));
 

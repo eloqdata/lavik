@@ -135,6 +135,21 @@ and EXEC paths settle their undo state, then transfer their `TxShardWrites`
 receipts to the current worker's commit queue. At most one drain coroutine runs
 per worker, replacing a detached coroutine per accepted transaction.
 
+Multi-step commands inside EXEC or Lua have a command-local undo boundary
+within the outer storage transaction. MSET and MSETNX complete their write
+and settlement phases across every affected owner before a later command
+can run; they are not part of a squashed keyed-command run. A failed command
+appends compensation records under the same outer txid, so catching its error
+and committing later commands cannot make its partial writes reappear during
+recovery. Rewinding only the runtime index would not satisfy this boundary.
+
+Set and Sorted Set multi-step writers prepare their outcome-dependent
+replication arguments and capture slots before the first mutation. Capture
+admission follows the recorded commands through EXEC/Lua's intermediate effect
+vectors until encoding hands ownership to the replication envelope. Allocation
+failure during this preparation leaves earlier effects intact; settlement
+cannot publish an incomplete replacement or expiry payload.
+
 The drain coroutine removes at most 256 receipts per batch. When it finds a
 backlog, it merges durability fences that name the same block owner, block ID,
 and allocation epoch, retaining the largest required committed boundary. It

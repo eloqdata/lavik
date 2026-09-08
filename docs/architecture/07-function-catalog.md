@@ -123,8 +123,9 @@ creates a new history and uses full sync.
 
 ## Failure evidence and observability
 
-Named debug crash points cover durable catalog body, per-device system root,
-root completion, and runtime-swap boundaries. `INFO replication` exposes the
+Named crash points in Debug and fault-server builds cover the durable catalog
+body, per-device system root, root completion, and runtime-swap boundaries.
+`INFO replication` exposes the
 local catalog generation and CRC64 alongside group, boot, incarnation, and
 history identities. End-to-end Function coverage exercises ordinary mutation,
 RDB/native transfer, and startup recovery; storage format tests cover the v1

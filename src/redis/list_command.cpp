@@ -423,6 +423,10 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
           reply_builder.AppendError("ERR unsupported List command path"));
   }
 
+  // This handler accepts only single-key commands. LMPOP/BLPOP and LMOVE use
+  // separate paths, some without durable receipts, so tx == nullptr alone
+  // cannot authorize releasing store state while they prepare a mutation.
+  op.prepare_unlocked_ = true;
   absl::StatusOr<storage::ListResult> result;
   auto replication =
       tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;

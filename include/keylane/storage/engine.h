@@ -20,7 +20,9 @@
 #include "keylane/read_trace.h"
 #include "keylane/set_trace.h"
 #include "keylane/storage/buffer_pool.h"
+#include "keylane/storage/collection_page.h"
 #include "keylane/storage/format.h"
+#include "keylane/storage/sorted_set.h"
 
 namespace celer {
 class Worker;
@@ -312,8 +314,10 @@ struct SnapshotRecord {
   std::uint64_t logical_size_ = 0;
   std::uint32_t chunk_index_ = 0;
   std::uint32_t chunk_count_ = 0;
-  // Source-only handle for an immutable external value pinned during full
-  // sync. It is never serialized; the sender reads it in transfer chunks.
+  // Source-only handle for pinned external bytes or an immutable grouped
+  // collection graph. The latter streams its compatible compact wire image
+  // one admitted page at a time; no aggregate value buffer is retained.
+  // This handle is never serialized; the sender reads sequential chunks.
   std::uint64_t source_id_ = 0;
   std::uint64_t source_value_bytes_ = 0;
   // Source-local snapshot metadata. This is deliberately not encoded on the
@@ -664,9 +668,17 @@ struct ListOperation {
   std::uint64_t max_length_ = 0;
   bool count_provided_ = false;
   bool max_length_provided_ = false;
+  // Only a single-key command retaining its key intent and database admission
+  // may opt into preparing an existing small inline value outside store state.
+  // Multi-key callers leave this false even when they have no durable tx;
+  // storage independently excludes transactions and native candidate/loading.
+  bool prepare_unlocked_ = false;
 };
 
 struct ListResult {
+  // Grouped results can outlive their source worker's scratch reservation.
+  // Destroy reply buffers before returning their retained allowance.
+  RetainedMemoryCharge retained_charge_;
   bool key_exists_ = false;
   bool changed_ = false;
   std::uint64_t length_ = 0;
@@ -713,6 +725,9 @@ struct HashOperation {
 };
 
 struct HashResult {
+  // Page replies can cross worker/coroutine ownership boundaries. Keep this
+  // first so the output buffers die before their retained allowance returns.
+  RetainedMemoryCharge retained_charge_;
   bool key_exists_ = false;
   bool changed_ = false;
   std::uint64_t length_ = 0;
@@ -774,14 +789,14 @@ struct RawValue {
   ValueType value_type_ = ValueType::kNone;
 };
 
-// One Redis-visible value materialized from an online point-in-time snapshot.
-// Batches are deliberately value-oriented so the RDB encoder can run outside
-// the storage worker and no physical block remains pinned while filesystem IO
-// is pending.
+// One Redis-visible value from an online point-in-time snapshot. Compact
+// values are materialized; grouped collections supply metadata and an opaque
+// worker/session-scoped token instead of copying their complete contents.
 struct RdbSnapshotValue {
   std::uint8_t db_id_ = 0;
   std::string key_;
   RawValue value_;
+  std::uint64_t collection_token_ = 0;
 };
 
 struct RdbSnapshotCursor {
@@ -804,9 +819,25 @@ struct RestoreRawResult {
   bool deleted_ = false;
 };
 
+// Pulls one admitted, move-only logical page at a time. done_ marks complete
+// EOF (including an empty final page); the callback and its captured input
+// must remain alive until the awaited restore returns.
+using CollectionPageReader =
+    std::function<celer::Task<absl::StatusOr<CollectionPage>>()>;
+
+// A transfer borrows no mutable index state. A nonempty reader owns a pinned,
+// single-pass grouped source; metadata_ then carries only type/count/TTL.
+// Otherwise metadata_.encoded_ is the complete ordinary compact value.
+struct TransferValue {
+  RawValue metadata_;
+  CollectionPageReader reader_;
+};
+
 // Per-owning-shard accumulator for one multi-key atomic write. The
 // coordinator owns one per shard; each shard writes only its own entry, so
 // no synchronization is needed.
+struct GroupedCommitDecision;
+
 struct TxShardWrites {
   std::uint64_t txid_ = 0;  // input: stamped into every record written
   // All shards of one transaction share the same generation and lease. The
@@ -844,11 +875,18 @@ struct TxShardWrites {
     std::uint32_t record_offset_ = 0;
     bool tx_tagged_ = false;
     bool dependency_pinned_ = false;
+    // A failed child batch can leave new auxiliaries with no published root.
+    // They are discarded on outer abort as well as on outer commit; unlike
+    // superseded predecessors, they must never be restored by undo.
+    bool aborted_auxiliary_ = false;
     std::shared_ptr<const std::vector<ExtentRef>> dependent_extents_;
     // Value-only extents can be reclaimed as soon as the transaction commit
     // is durable. External-key extents stay dependent on the stale records
     // block because recovery may still need them to identify that record.
     std::shared_ptr<const std::vector<ExtentRef>> immediate_extents_;
+    // Keeps admitted grouped-retirement metadata charged until the final
+    // commit-fence copy is released; ordinary retirements leave this empty.
+    std::shared_ptr<const void> retained_owner_ = nullptr;
   };
   std::vector<Fence> fences_;
   std::vector<Retired> retirements_;
@@ -867,6 +905,14 @@ struct TxShardWrites {
   // never roll back (Redis semantics), while recovery still treats the
   // whole EXEC atomically through the commit record.
   bool collect_undo_ = false;
+  // Lazily allocated only when this participant publishes grouped values.
+  // Retained views can await the durable decision after command locks are
+  // released; ordinary String transactions allocate no dependency object.
+  std::shared_ptr<GroupedCommitDecision> grouped_decision_;
+  // A pull-based collection restore shares one uncommitted command decision
+  // across all its page writes. Only its owner may commit this borrowed batch
+  // at complete EOF; ordinary grouped commands leave the pointer null.
+  TxShardWrites* grouped_ingest_batch_ = nullptr;
 };
 
 class StorageEngine {
@@ -961,6 +1007,17 @@ class StorageEngine {
   celer::Task<absl::StatusOr<RdbSnapshotBatch>> ReadRdbSnapshotBatch(
       std::uint64_t session_id, RdbSnapshotCursor cursor, std::size_t count,
       std::size_t max_bytes);
+  // Run on the snapshot's owning worker. Only one collection stream may be
+  // outstanding per worker; finish it before requesting another batch. Cursor
+  // starts at zero and must equal the preceding page's next_cursor_. A page
+  // can be empty, but always advances. Graph pins retain the exact old view
+  // through EOF until Finish, including while output backpressure suspends.
+  celer::Task<absl::StatusOr<CollectionPage>> ReadRdbCollectionPage(
+      std::uint64_t session_id, std::uint64_t token, std::uint64_t cursor);
+  celer::Task<absl::Status> FinishRdbCollection(std::uint64_t session_id,
+                                                std::uint64_t token);
+  // Cancels any unfinished stream, waits for admitted page reads, then
+  // releases their physical pins. Repeated cancellation is harmless.
   celer::Task<absl::Status> EndRdbSnapshot(std::uint64_t session_id);
   // Runs on one worker and returns a random live key owned by that worker.
   // Nullopt means this worker currently has no live key in the database.
@@ -1211,6 +1268,14 @@ class StorageEngine {
   celer::Task<absl::StatusOr<ListResult>> ExecuteList(
       std::uint8_t db_id, std::string_view key, const ListOperation& operation,
       ReplicationCommandAppend* replication = nullptr);
+  celer::Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSet(
+      std::uint8_t db_id, std::string_view key,
+      const SortedSetOperation& operation,
+      ReplicationCommandAppend* replication = nullptr);
+  celer::Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSetLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<HashResult>> ExecuteHash(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
       ReplicationCommandAppend* replication = nullptr);
@@ -1285,13 +1350,45 @@ class StorageEngine {
   celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest);
+  // Checked metadata for externally observable TYPE/TTL/EXISTS replies.
+  // Missing/expired is an OK exists_=false result; an indeterminate grouped
+  // transaction is an error, never an invented absence or partial metadata.
+  // The locked form requires the caller's shared/exclusive key intent.
+  celer::Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadata(
+      std::uint8_t db_id, std::string_view key);
+  celer::Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadataLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest);
   celer::Task<absl::StatusOr<RawValue>> ReadRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
   celer::Task<absl::StatusOr<RawValue>> ReadRawValue(std::uint8_t db_id,
                                                      std::string_view key);
+  celer::Task<absl::StatusOr<TransferValue>> ReadValueForTransferLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest);
+  celer::Task<absl::Status> WriteValueForTransferLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const TransferValue& value, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<RestoreRawResult>> RestoreRawValue(
       std::uint8_t db_id, std::string_view key, const RawValue& value,
       bool replace, ReplicationCommandAppend* replication = nullptr);
+  // Atomically replaces a collection from bounded pages, accepting arbitrary
+  // Sorted Set input order while rejecting duplicate fields/members. No
+  // aggregate compact value is built. A busy result does not consume reader.
+  // Failure aborts the uncommitted graph; successful EOF/count validation is
+  // required before any enclosing transaction can commit its auxiliaries.
+  celer::Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValue(
+      std::uint8_t db_id, std::string_view key, ValueType type,
+      std::uint64_t expire_at_ms, bool replace,
+      std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
+      ReplicationCommandAppend* replication = nullptr);
+  // Borrows the caller's exclusive key lock and optional outer transaction.
+  // Its independent command decision is committed only at complete EOF.
+  celer::Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValueLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      ValueType type, std::uint64_t expire_at_ms, bool replace,
+      std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
+      TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<RestoreRawResult>> RestoreRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const RawValue& value, bool replace, TxShardWrites* tx = nullptr,
@@ -1314,10 +1411,16 @@ class StorageEngine {
 
   // Appends the commit record for a transaction whose shard writes all
   // succeeded. Runs on any worker; fences and retirements come from the
-  // per-shard TxShardWrites. Safe to run in the background — the client
-  // reply never waits for durability.
+  // per-shard TxShardWrites. May run in the background for asynchronous client
+  // acknowledgement. A grouped decision that another mutation inherits is
+  // not inheritable until its own durability fence completes.
   celer::Task<absl::Status> CommitTxWrites(std::uint64_t txid,
                                            std::vector<TxShardWrites*> shards);
+  // Rejects an already-known failed grouped transaction before its coordinator
+  // publishes effects, queues a commit, or acknowledges success. All command
+  // callbacks must have settled before this check. This does not wait for IO
+  // and does not promise that an otherwise valid transaction is durable.
+  static absl::Status ValidateTxCommit(std::span<const TxShardWrites> writes);
   // Transfers one successful transaction's receipts to the current worker's
   // commit coordinator. At most one coordinator coroutine runs per worker;
   // it merges durability fences and appends commit decisions in batches.

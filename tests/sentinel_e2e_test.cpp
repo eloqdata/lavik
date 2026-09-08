@@ -98,7 +98,11 @@ int main(int argc, char** argv) {
     ChildProcess preferred(
         KeylaneArgs(argv[1], preferred_config, preferred_data),
         root.path() / "preferred.log",
-        {{"KEYLANE_REPLICATION_PAUSE_FULLSYNC_AFTER_RESET_MS", "1000"}});
+        {
+#if KEYLANE_TEST_FAULTS_AVAILABLE
+            {"KEYLANE_REPLICATION_PAUSE_FULLSYNC_AFTER_RESET_MS", "1000"}
+#endif
+        });
     (void)other_reservation.ReleaseForSpawn();
     ChildProcess other(KeylaneArgs(argv[1], other_config, other_data),
                        root.path() / "other.log");
@@ -195,10 +199,11 @@ int main(int argc, char** argv) {
       return client.Command({"ROLE"}).starts_with("*3\r\n$6\r\nmaster");
     });
     WaitUntil("remaining replica follows promoted master", 60s, [&] {
-      // Keep a runtime-only event queued while the promoted source is paused
-      // after its first 64-partition reset batch. This channel hashes to slot
-      // 7127, so accepting it proves PUBLISH does not incorrectly depend on
-      // that slot's not-yet-installed target epoch.
+      // Keep PUBLISH active while the remaining replica reconnects. A
+      // Debug/fault server additionally pauses after its first 64-partition
+      // reset batch: this channel's slot 7127 then exercises an epoch that is
+      // not installed yet. Ordinary Release still runs the full quorum,
+      // promotion and replication checks, without claiming that pause window.
       RespClient promoted = Connect(preferred_port);
       if (!promoted.Command({"PUBLISH", "fullsync-epoch-race", "probe"})
                .starts_with(':')) {
@@ -236,6 +241,10 @@ int main(int argc, char** argv) {
         std::string::npos) {
       Fail("PUBLISH raced ahead of its full-sync partition reset");
     }
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+    std::cout << "sentinel reset-pause injection not exercised: requires a "
+                 "Debug/fault server; quorum and replication checks passed\n";
+#endif
     std::cout << "sentinel e2e passed\n";
     return 0;
   } catch (const std::exception& error) {
