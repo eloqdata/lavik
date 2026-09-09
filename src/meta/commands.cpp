@@ -1285,6 +1285,11 @@ absl::Status WriteCommandBody(MetaWriter& w, const BindMetaMember& cmd) {
     return MetaDomainRejectError(
         "data_control_endpoint is empty or exceeds its cap");
   }
+  if (cmd.ctl_endpoint_.has_value() &&
+      (cmd.ctl_endpoint_->empty() ||
+       cmd.ctl_endpoint_->size() > kMaxMetaEndpointBytes)) {
+    return MetaDomainRejectError("ctl_endpoint is empty or exceeds its cap");
+  }
   if (auto st = WriteCommandHeader(w, MetaCommandTag::kBindMetaMember,
                                    cmd.request_id_, cmd.actor_);
       !st.ok()) {
@@ -1293,6 +1298,8 @@ absl::Status WriteCommandBody(MetaWriter& w, const BindMetaMember& cmd) {
   w.WriteU32(cmd.server_id_);
   w.WriteString(cmd.principal_);
   w.WriteString(cmd.data_control_endpoint_);
+  w.WriteBool(cmd.ctl_endpoint_.has_value());
+  if (cmd.ctl_endpoint_.has_value()) w.WriteString(*cmd.ctl_endpoint_);
   return absl::OkStatus();
 }
 
@@ -1305,12 +1312,21 @@ absl::StatusOr<BindMetaMember> ReadBindMetaMemberBody(MetaReader& r) {
   if (!principal.ok()) return principal.status();
   auto data_control_endpoint = ReadBoundedString(r, kMaxMetaEndpointBytes);
   if (!data_control_endpoint.ok()) return data_control_endpoint.status();
+  auto has_ctl_endpoint = r.ReadBool("invalid ctl endpoint presence tag");
+  if (!has_ctl_endpoint.ok()) return has_ctl_endpoint.status();
+  std::optional<std::string> ctl_endpoint;
+  if (*has_ctl_endpoint) {
+    auto decoded = ReadBoundedString(r, kMaxMetaEndpointBytes);
+    if (!decoded.ok()) return decoded.status();
+    ctl_endpoint = std::move(*decoded);
+  }
   BindMetaMember cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.server_id_ = *server_id;
   cmd.principal_ = std::move(*principal);
   cmd.data_control_endpoint_ = std::move(*data_control_endpoint);
+  cmd.ctl_endpoint_ = std::move(ctl_endpoint);
   return cmd;
 }
 

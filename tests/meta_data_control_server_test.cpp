@@ -11,6 +11,7 @@
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/control_projector.h"
 #include "keylane/meta/data_control_server.h"
+#include "keylane/meta/data_control_runtime_status.h"
 #include "keylane/meta/observation_store.h"
 
 namespace keylane::meta {
@@ -48,6 +49,7 @@ using keylane::meta::MetaCommittedView;
 using keylane::meta::MetaDataControlServer;
 using keylane::meta::MetaDataControlServerOptions;
 using keylane::meta::MetaDataControlServerTestPeer;
+using keylane::meta::MetaDataControlRuntimeStatus;
 using keylane::meta::MetaDirectiveDelivery;
 using keylane::meta::MetaDirectiveReceiptTracker;
 using keylane::meta::MetaLeaseEvaluation;
@@ -76,6 +78,81 @@ std::array<std::uint8_t, N> Bytes(std::uint8_t value) {
 }
 
 std::string Identity(char value) { return std::string(40, value); }
+
+TEST(MetaDataControlRuntimeStatusTest,
+     PublishesOnlyCurrentSessionAndAckedHeartbeatFacts) {
+  MetaDataControlRuntimeStatus status;
+  status.BeginLeadership(/*leadership_generation=*/11);
+  status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true);
+  control::FullDesiredState projection;
+  projection.source_meta_applied_index = 7;
+  projection.topology_epoch = 3;
+  projection.projection_hash = Bytes<32>(0x31);
+  projection.groups.push_back({
+      .group_id = "group-a",
+      .members = {{.node_id = Identity('1'),
+                   .assignment_id = Bytes<16>(0x11)},
+                  {.node_id = Identity('3'),
+                   .assignment_id = Bytes<16>(0x12)}},
+      .owner_node_id = Identity('1'),
+      .owner_assignment_id = Bytes<16>(0x11),
+      .group_term = 4,
+      .authority_version = 5,
+      .grant_revision = 6,
+      .manifest_revision = 8,
+      .manifest_digest = Bytes<32>(0x32),
+      .partition_replication_epoch = 9,
+  });
+  const auto session = Bytes<16>(0x41);
+  status.PublishCurrent(Identity('1'), Identity('2'), session,
+                        /*session_generation=*/10,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
+  auto snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  EXPECT_FALSE(snapshot.nodes_[0].health_.has_value());
+  EXPECT_EQ(snapshot.nodes_[0].groups_.size(), 1u);
+
+  control::LeaseDenied denied;
+  denied.reason = control::LeaseDenialReason::kNodeNotReady;
+  status.RecordHealth(
+      Identity('1'), session,
+      {.storage_ready = true, .population_ready = false, .draining = false},
+      /*received_unix_ms=*/100);
+  status.RecordLeaseDecisionWritten(Identity('1'), session,
+                                    control::LeaseDecision(denied),
+                                    /*written_unix_ms=*/101);
+  snapshot = status.Snapshot();
+  ASSERT_TRUE(snapshot.nodes_[0].health_.has_value());
+  EXPECT_TRUE(snapshot.nodes_[0].last_lease_decision_.has_value());
+  EXPECT_EQ(snapshot.nodes_[0].lease_decision_written_unix_ms_, 101);
+
+  const auto stale_session = Bytes<16>(0x42);
+  status.Remove(Identity('1'), &stale_session);
+  EXPECT_EQ(status.Snapshot().nodes_.size(), 1u);
+  status.Remove(Identity('1'), &session);
+  EXPECT_TRUE(status.Snapshot().nodes_.empty());
+
+  status.PublishCurrent(Identity('3'), Identity('4'), session,
+                        /*session_generation=*/12,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
+  snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  ASSERT_EQ(snapshot.nodes_[0].groups_.size(), 1u);
+  EXPECT_EQ(snapshot.nodes_[0].groups_[0].assignment_id_, Bytes<16>(0x12));
+
+  status.EndLeadership(/*leadership_generation=*/11);
+  snapshot = status.Snapshot();
+  EXPECT_EQ(snapshot.leadership_generation_, 0u);
+  EXPECT_FALSE(snapshot.leader_authority_eligible_);
+  EXPECT_TRUE(snapshot.nodes_.empty());
+  status.PublishCurrent(Identity('1'), Identity('2'), session,
+                        /*session_generation=*/13,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
+  EXPECT_TRUE(status.Snapshot().nodes_.empty());
+}
 
 TEST(MetaCommittedViewCacheTest, CopiesOncePerNewAppliedHighWater) {
   std::uint64_t next_index = 3;
@@ -468,10 +545,11 @@ TEST(MetaDataControlDirectoryTest,
 TEST(MetaDataControlDirectoryTest,
      FreshLocalBootstrapIsRepairableButConflictsFailClosed) {
   const std::string endpoint = "127.0.0.1:7100";
+  const std::string ctl_endpoint = "127.0.0.1:7200";
   MetaStores empty;
   auto action = EvaluateLocalMetaMemberBinding(
       MetaCommittedView(empty, /*applied_index=*/0), 1, "keylane://meta/1",
-      endpoint);
+      endpoint, ctl_endpoint);
   ASSERT_TRUE(action.ok()) << action.status();
   EXPECT_EQ(*action, MetaLocalMemberBindingDisposition::kNeedsBind);
 
@@ -482,13 +560,21 @@ TEST(MetaDataControlDirectoryTest,
   ASSERT_TRUE(empty.identity_.Apply(bind).ok());
   action = EvaluateLocalMetaMemberBinding(
       MetaCommittedView(empty, /*applied_index=*/1), 1, "keylane://meta/1",
-      endpoint);
+      endpoint, ctl_endpoint);
+  ASSERT_TRUE(action.ok()) << action.status();
+  EXPECT_EQ(*action, MetaLocalMemberBindingDisposition::kNeedsBind);
+
+  bind.ctl_endpoint_ = ctl_endpoint;
+  ASSERT_TRUE(empty.identity_.Apply(bind).ok());
+  action = EvaluateLocalMetaMemberBinding(
+      MetaCommittedView(empty, /*applied_index=*/2), 1, "keylane://meta/1",
+      endpoint, ctl_endpoint);
   ASSERT_TRUE(action.ok()) << action.status();
   EXPECT_EQ(*action, MetaLocalMemberBindingDisposition::kAlreadyBound);
 
   EXPECT_EQ(EvaluateLocalMetaMemberBinding(
-                MetaCommittedView(std::move(empty), /*applied_index=*/1), 1,
-                "keylane://meta/1", "127.0.0.1:7200")
+                MetaCommittedView(std::move(empty), /*applied_index=*/2), 1,
+                "keylane://meta/1", "127.0.0.1:7200", ctl_endpoint)
                 .status()
                 .code(),
             absl::StatusCode::kFailedPrecondition);
@@ -512,7 +598,7 @@ TEST(MetaDataControlDirectoryTest,
 
   const auto binding = EvaluateLocalMetaMemberBinding(
       MetaCommittedView(stores, /*applied_index=*/1), 2, "keylane://meta/2",
-      "[::1]:7302");
+      "[::1]:7302", "");
   ASSERT_TRUE(binding.ok()) << binding.status();
   EXPECT_EQ(*binding, MetaLocalMemberBindingDisposition::kAlreadyBound);
 

@@ -19,9 +19,12 @@ plane](08-meta-control-plane.md). It owns committed cluster metadata,
 leader-local observations, authenticated administration, and coordination
 plus process-lifetime Data-control sessions. It links the pinned NuRaft
 submodule, whose native Asio service owns Raft peer communication; Celer owns
-the separate administrative and Data-node sessions. NuRaft is linked
-only into `keylane-meta`: the data-plane executable, library, and tests never
-see consensus code, and the build enforces that boundary at configure time.
+the separate administrative and Data-node sessions. The Raft-free
+`keylane-cluster` operator client discovers the current Meta leader and reads
+one stable cluster-readiness cut through that administrative surface. NuRaft
+is linked only into `keylane-meta`: the data-plane executable, operator
+clients, libraries, and their focused tests never see consensus code, and the
+build enforces that boundary at configure time.
 
 ```text
 Redis/Valkey clients, Sentinels, and replicas
@@ -45,6 +48,9 @@ snapshots.
 keylane-meta Raft leader <-- framed control session --> Data NodeControl
        committed view       full state / lease /        topology, authority,
                             directive / observation      replication actions
+
+operator --> keylane-cluster --> Meta Admin seed --> current Meta leader
+                                      clusterhead       clusterstatus
 ```
 
 ## Component responsibilities
@@ -59,7 +65,7 @@ keylane-meta Raft leader <-- framed control session --> Data NodeControl
 | Function catalog | Stage one complete process-global Function definition set on every worker, commit its existing `FUNCTION DUMP` encoding, swap runtimes, and recover it before service readiness | `FunctionCatalog` |
 | Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
 | Cluster data plane | Admit, redirect, or refuse requests by slot ownership and finite authority; install static or Meta control; serve Redis Cluster discovery | `cluster::AuthorityGuard::CaptureAndAdmit` / `RegisterAndRecheck`, `cluster::TopologyCache`, `cluster::NodeControlInstaller`, `cluster::MetaControlClientService` |
-| Meta control plane | Replicate metadata commands, project node-specific desired state, publish leader-scoped Data sessions, admit fresh observations, and expose authenticated administration | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer` |
+| Meta control plane | Replicate metadata commands, project node-specific desired state, publish leader-scoped Data sessions, admit fresh observations, and expose authenticated administration plus stable cluster readiness | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer`, `meta::ClusterOperator` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
 ## Process lifecycle

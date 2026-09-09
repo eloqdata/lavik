@@ -1025,7 +1025,8 @@ absl::StatusOr<MetaLocalMemberBindingDisposition>
 EvaluateLocalMetaMemberBinding(const MetaCommittedView& view,
                                std::uint32_t server_id,
                                std::string_view principal,
-                               std::string_view data_control_endpoint) {
+                               std::string_view data_control_endpoint,
+                               std::string_view ctl_endpoint) {
   const auto existing = view.identity().FindMetaMember(server_id);
   if (!existing.has_value()) {
     return MetaLocalMemberBindingDisposition::kNeedsBind;
@@ -1039,7 +1040,18 @@ EvaluateLocalMetaMemberBinding(const MetaCommittedView& view,
     return absl::FailedPreconditionError(
         "local Meta-member binding conflicts with process identity");
   }
-  return MetaLocalMemberBindingDisposition::kAlreadyBound;
+  const std::optional<std::string> configured_ctl =
+      ctl_endpoint.empty()
+          ? std::nullopt
+          : std::optional<std::string>(std::string(ctl_endpoint));
+  if (existing->ctl_endpoint_ == configured_ctl) {
+    return MetaLocalMemberBindingDisposition::kAlreadyBound;
+  }
+  if (!existing->ctl_endpoint_.has_value() && configured_ctl.has_value()) {
+    return MetaLocalMemberBindingDisposition::kNeedsBind;
+  }
+  return absl::FailedPreconditionError(
+      "local Meta-member ctl endpoint conflicts with process identity");
 }
 
 control::LeaseDecision EvaluateLeaseChallenge(
@@ -1296,6 +1308,8 @@ MetaDataControlServer::LifecycleHarnessForTest(
     celer::ForeignExecutor foreign_executor, bool shutdown_complete) {
   auto core = std::make_shared<Core>();
   core->foreign_executor_ = foreign_executor;
+  core->options_.runtime_status_ =
+      std::make_shared<MetaDataControlRuntimeStatus>();
   core->shutdown_complete_.store(shutdown_complete, std::memory_order_release);
   return std::shared_ptr<MetaDataControlServer>(
       new MetaDataControlServer(std::move(core)));
@@ -1316,6 +1330,7 @@ struct LiveSessionState {
   std::string node_id_;
   std::string boot_id_;
   control::WireId128 session_id_{};
+  std::uint64_t session_generation_ = 0;
   std::uint64_t leadership_generation_ = 0;
 
   std::shared_ptr<const NodeControlBatch> installed_;
@@ -1432,7 +1447,8 @@ void FinishLeaderTask(MetaDataControlServer::Core& core,
 
 void RemoveSession(MetaDataControlServer::Core& core,
                    celer::Connection* connection,
-                   std::string_view node_id = {}) {
+                   std::string_view node_id = {},
+                   const control::WireId128* session_id = nullptr) {
   const auto session =
       std::find(core.sessions_.begin(), core.sessions_.end(), connection);
   if (session != core.sessions_.end()) {
@@ -1455,6 +1471,10 @@ void RemoveSession(MetaDataControlServer::Core& core,
   }
   if (!node_id.empty()) {
     core.bound_node_sessions_.Release(node_id, connection);
+    // An old session can finish after its per-node binding has already moved
+    // to a replacement. Remove only the incarnation owned by this coroutine;
+    // otherwise late teardown could erase the replacement's current status.
+    core.options_.runtime_status_->Remove(node_id, session_id);
   }
   NotifyShutdownDrained(core);
 }
@@ -1474,6 +1494,8 @@ void CloseConnectionNow(celer::Worker& worker, celer::Connection* connection,
 bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
                               std::uint64_t generation) {
   if (!StillLeader(core, generation) || !core.server_->is_leader_alive()) {
+    core.options_.runtime_status_->SetLeaderAuthorityEligible(generation,
+                                                               false);
     return false;
   }
   const MetaLeaderRuntimeDisposition runtime =
@@ -1504,7 +1526,10 @@ bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
       }
     }
   }
-  return runtime == MetaLeaderRuntimeDisposition::kEligible;
+  const bool eligible = runtime == MetaLeaderRuntimeDisposition::kEligible;
+  core.options_.runtime_status_->SetLeaderAuthorityEligible(generation,
+                                                             eligible);
+  return eligible;
 }
 
 struct BudgetedNodeControlBatch final : NodeControlBatch {
@@ -1601,7 +1626,7 @@ absl::StatusOr<MetaMemberIdentity> LocalConfiguredIdentity(
 absl::Status ValidateCommittedConfigBindings(
     const nuraft::ptr<nuraft::cluster_config>& config,
     const MetaCommittedView& view, std::uint32_t local_server_id,
-    std::string_view local_endpoint) {
+    std::string_view local_endpoint, std::string_view local_ctl_endpoint) {
   if (config == nullptr) {
     return absl::FailedPreconditionError(
         "NuRaft has no committed membership configuration");
@@ -1627,6 +1652,21 @@ absl::Status ValidateCommittedConfigBindings(
         committed->data_control_endpoint_ != local_endpoint) {
       return absl::FailedPreconditionError(
           "local committed data-control endpoint differs from process config");
+    }
+    if (config->get_servers().size() > 1 &&
+        !committed->ctl_endpoint_.has_value()) {
+      return absl::FailedPreconditionError(
+          "multi-voter Meta member lacks a committed ctl endpoint");
+    }
+    if (static_cast<std::uint32_t>(member->get_id()) == local_server_id) {
+      const std::optional<std::string> configured_ctl =
+          local_ctl_endpoint.empty()
+              ? std::nullopt
+              : std::optional<std::string>(std::string(local_ctl_endpoint));
+      if (committed->ctl_endpoint_ != configured_ctl) {
+        return absl::FailedPreconditionError(
+            "local committed ctl endpoint differs from process config");
+      }
     }
     // Remote legacy members cannot be repaired from this process because
     // their data-control endpoint is not present in NuRaft's peer descriptor.
@@ -1659,12 +1699,19 @@ celer::Task<absl::Status> ReconcileLocalMetaMember(
       MetaCommittedView view = context.CommittedView();
       auto binding = EvaluateLocalMetaMemberBinding(
           view, core->options_.server_id_, local_identity->principal_,
-          local_endpoint);
+          local_endpoint, core->options_.local_ctl_endpoint_);
       status = binding.status();
       if (binding.ok() &&
           *binding == MetaLocalMemberBindingDisposition::kNeedsBind) {
-        auto request_id = control::GenerateId128();
-        if (!request_id.ok()) {
+        const bool completing_existing =
+            view.identity().FindMetaMember(core->options_.server_id_)
+                .has_value();
+        if (completing_existing &&
+            (config == nullptr || config->get_servers().size() != 1)) {
+          status = absl::FailedPreconditionError(
+              "ctl endpoint completion is restricted to a sole voter");
+        } else if (auto request_id = control::GenerateId128();
+                   !request_id.ok()) {
           status = request_id.status();
         } else {
           BindMetaMember bind{
@@ -1673,6 +1720,10 @@ celer::Task<absl::Status> ReconcileLocalMetaMember(
               .server_id_ = core->options_.server_id_,
               .principal_ = local_identity->principal_,
               .data_control_endpoint_ = local_endpoint,
+              .ctl_endpoint_ = core->options_.local_ctl_endpoint_.empty()
+                                   ? std::nullopt
+                                   : std::optional<std::string>(
+                                         core->options_.local_ctl_endpoint_),
           };
           auto proposed =
               co_await context.Propose(MetaCommand(std::move(bind)));
@@ -1696,12 +1747,14 @@ celer::Task<absl::Status> ReconcileLocalMetaMember(
         // configuration that lacks those records remains unavailable.
         status = ValidateCommittedConfigBindings(
             core->server_->get_config(), context.CommittedView(),
-            core->options_.server_id_, local_endpoint);
+            core->options_.server_id_, local_endpoint,
+            core->options_.local_ctl_endpoint_);
       }
     }
 
     if (status.ok()) {
-      if (StillLeader(*core, generation)) {
+      if (StillLeader(*core, generation) &&
+          AuthoritySessionsAllowed(*core, generation)) {
         core->leader_ready_for_data_ = true;
       }
       co_return absl::OkStatus();
@@ -2291,6 +2344,9 @@ celer::Task<absl::Status> SessionPublisherBody(
       // suffix retained by receipt_tracker_.
       state->validated_committed_high_water_ = std::max(
           state->validated_committed_high_water_, view.applied_index());
+      state->core_->options_.runtime_status_->MarkValidated(
+          state->node_id_, state->session_id_,
+          state->validated_committed_high_water_);
       state->projection_superseded_ = false;
       StartDirectiveSender(state);
       continue;
@@ -2313,6 +2369,8 @@ celer::Task<absl::Status> SessionPublisherBody(
       continue;
     }
 
+    state->core_->options_.runtime_status_->Remove(state->node_id_,
+                                                   &state->session_id_);
     if (absl::Status sent =
             co_await SendReplacementFullStateLive(state, *installed, *latest);
         !sent.ok()) {
@@ -2352,6 +2410,10 @@ celer::Task<absl::Status> SessionPublisherBody(
       co_return rebuilt;
     }
     state->projection_superseded_ = false;
+    state->core_->options_.runtime_status_->PublishCurrent(
+        state->node_id_, state->boot_id_, state->session_id_,
+        state->session_generation_, state->leadership_generation_,
+        state->validated_committed_high_water_, state->installed_->full_state);
     StartDirectiveSender(state);
   }
   co_return absl::CancelledError(
@@ -2640,10 +2702,14 @@ celer::Task<absl::Status> RunEstablishedSession(
       if (!cached_view.ok()) co_return cached_view.status();
       const MetaCommittedView& latest_view = **cached_view;
       MetaStoresFacts facts(latest_view.stores());
+      const std::int64_t heartbeat_received_unix_ms = NowUnixMillis();
       MetaHeartbeatObservationResult observation = IngestHeartbeatObservations(
           *state->core_->observations_, facts, state->node_id_, boot_id,
           replication_history_id, session_generation, heartbeat->health,
-          heartbeat->role_information, NowUnixMillis());
+          heartbeat->role_information, heartbeat_received_unix_ms);
+      state->core_->options_.runtime_status_->RecordHealth(
+          state->node_id_, state->session_id_, heartbeat->health,
+          heartbeat_received_unix_ms);
       if (observation.status == control::ObservationStatus::kAccepted) {
         state->core_->observations_accepted_.fetch_add(
             1, std::memory_order_relaxed);
@@ -2705,6 +2771,9 @@ celer::Task<absl::Status> RunEstablishedSession(
           !sent.ok()) {
         co_return sent;
       }
+      state->core_->options_.runtime_status_->RecordLeaseDecisionWritten(
+          state->node_id_, state->session_id_, cached_ack->lease_decision,
+          NowUnixMillis());
       continue;
     }
 
@@ -2887,6 +2956,19 @@ absl::Status MetaDataControlServer::ValidateOptions(
     return absl::InvalidArgumentError(
         "data-control bind host must be a numeric IP address");
   }
+  if (!options.local_ctl_endpoint_.empty()) {
+    auto ctl = keylane::ParseNumericEndpoint(options.local_ctl_endpoint_);
+    in_addr ctl_address4{};
+    in6_addr ctl_address6{};
+    if (!ctl.has_value() ||
+        (::inet_pton(AF_INET, ctl->host_.c_str(), &ctl_address4) == 1 &&
+         ctl_address4.s_addr == htonl(INADDR_ANY)) ||
+        (::inet_pton(AF_INET6, ctl->host_.c_str(), &ctl_address6) == 1 &&
+         IN6_IS_ADDR_UNSPECIFIED(&ctl_address6))) {
+      return absl::InvalidArgumentError(
+          "local ctl endpoint must be a concrete numeric IP:port");
+    }
+  }
   const unsigned tls_fields = !options.tls_ca_cert_file_.empty() +
                               !options.tls_cert_file_.empty() +
                               !options.tls_key_file_.empty();
@@ -2935,6 +3017,10 @@ MetaDataControlServer::Create(
           [&coordinator] { return coordinator.CommittedView(); });
   core->observations_ = std::move(observations);
   core->options_ = std::move(options);
+  if (core->options_.runtime_status_ == nullptr) {
+    core->options_.runtime_status_ =
+        std::make_shared<MetaDataControlRuntimeStatus>();
+  }
   core->lease_handoff_guard_ = std::make_unique<MetaLeaseHandoffGuard>(
       core->options_.leadership_validity_ms_,
       core->options_.lease_handoff_safety_margin_ms_);
@@ -2999,6 +3085,8 @@ void MetaDataControlServer::Shutdown() {
           core->leader_context_ = nullptr;
           core->leader_commit_subscription_.reset();
           core->leader_commit_signal_.reset();
+          core->options_.runtime_status_->EndLeadership(
+              core->leadership_generation_);
           if (core->accept_loop_running_) {
             // TcpListener::Close does not currently cancel an armed accept.
             // A local connection gives that sole waiter a normal completion;
@@ -3123,6 +3211,8 @@ void MetaDataControlServer::StartOnExecutor(MetaLeaderContext* context) {
         core->leader_commit_signal_ = std::move(commit_signal);
         ++core->leadership_generation_;
         if (core->leadership_generation_ == 0) ++core->leadership_generation_;
+        core->options_.runtime_status_->BeginLeadership(
+            core->leadership_generation_);
         core->lease_handoff_guard_->Reset();
         core->leader_runtime_guard_->Reset(cluster::LeaseClockMillis(),
                                            ActiveClockMillis());
@@ -3155,6 +3245,7 @@ void MetaDataControlServer::CancelAndWait() {
         core->leader_context_ = nullptr;
         core->leader_commit_subscription_.reset();
         core->leader_commit_signal_.reset();
+        core->options_.runtime_status_->EndLeadership(cancelled_generation);
         core->generation_drain_waiters_[cancelled_generation].push_back(
             complete);
         if (core->worker_ != nullptr) {
@@ -3234,6 +3325,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     detail::PendingHandshakeLimiter::Permit handshake_permit) {
   std::string node_id;
   std::optional<MetaObservationIdentity> observation_identity;
+  std::optional<control::WireId128> status_session_id;
   bool accepted_session = false;
   bool redirected_session = false;
   // Declared before every session-local transport/subscription object so its
@@ -3245,6 +3337,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     celer::Connection* connection_;
     std::string* node_id_;
     std::optional<MetaObservationIdentity>* observation_identity_;
+    std::optional<control::WireId128>* status_session_id_;
     bool* accepted_;
     detail::PendingHandshakeLimiter::Permit* handshake_permit_;
     ~SessionCompletionGuard() {
@@ -3258,10 +3351,13 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
         core_->observations_->InvalidateCandidateOnDisconnect(
             **observation_identity_, NowUnixMillis());
       }
-      RemoveSession(*core_, connection_, *node_id_);
+      RemoveSession(*core_, connection_, *node_id_,
+                    status_session_id_->has_value()
+                        ? &status_session_id_->value()
+                        : nullptr);
     }
   } completion{core, connection, &node_id, &observation_identity,
-               &accepted_session, &handshake_permit};
+               &status_session_id, &accepted_session, &handshake_permit};
   SessionIo io(
       *core->worker_, connection, stream, core->options_.max_write_queue_bytes_,
       std::chrono::milliseconds(core->options_.session_progress_timeout_ms_));
@@ -3419,6 +3515,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   view.reset();
   auto session_id = control::GenerateId128();
   if (!session_id.ok()) co_return finish(session_id.status());
+  status_session_id = *session_id;
   std::uint64_t& next_generation = core->next_session_generation_[node_id];
   if (next_generation == std::numeric_limits<std::uint64_t>::max()) {
     co_return finish(absl::ResourceExhaustedError(
@@ -3470,6 +3567,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   live->node_id_ = node_id;
   live->boot_id_ = hello->boot_id;
   live->session_id_ = *session_id;
+  live->session_generation_ = session_generation;
   live->leadership_generation_ = leadership_generation;
   // Transfer the sole retained-projection owner into live session state. The
   // SessionLoop coroutine frame outlives the publisher, so copying here would
@@ -3516,6 +3614,10 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
       !rebuilt.ok()) {
     co_return finish(rebuilt, true);
   }
+  core->options_.runtime_status_->PublishCurrent(
+      node_id, hello->boot_id, *session_id, session_generation,
+      leadership_generation, live->validated_committed_high_water_,
+      live->installed_->full_state);
   core->accepted_sessions_.fetch_add(1, std::memory_order_relaxed);
   core->active_sessions_.fetch_add(1, std::memory_order_relaxed);
   accepted_session = true;

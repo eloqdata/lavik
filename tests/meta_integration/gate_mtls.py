@@ -162,7 +162,7 @@ def expect_isolated(leader, joiner, history, seq_start, label,
                     for pattern in evidence_patterns)
     invite = leader.ctl(
         f"addsrv {joiner.id} {joiner.endpoint} "
-        f"{joiner.data_control_endpoint}")
+        f"{joiner.data_control_endpoint} {joiner.ctl_endpoint}")
     H.log(f"{label}: addsrv node {joiner.id} -> {invite}")
     if invite != "OK":
         raise H.Failure(f"{label}: addsrv: {invite}")

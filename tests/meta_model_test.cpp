@@ -803,6 +803,8 @@ TEST(MetaModelCommands, DirectiveResultReceiptCommandsRoundTrip) {
 }
 
 TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
+  EXPECT_EQ(keylane::meta::kMetaFormatVersion, 3);
+
   keylane::meta::PruneAudit audit;
   audit.through_log_index_ = 42;
   ExpectRoundTrip(audit);
@@ -815,6 +817,7 @@ TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
   bind.server_id_ = 7;
   bind.principal_ = "keylane://meta/7";
   bind.data_control_endpoint_ = "10.0.0.7:7100";
+  bind.ctl_endpoint_ = "10.0.0.7:7200";
   ExpectRoundTrip(bind);
 
   keylane::meta::RetireMetaMember retire;
@@ -1204,6 +1207,16 @@ TEST(MetaStateApply, MetaStoresDeserializeRejectsCorruption) {
   ASSERT_FALSE(trailing.ok());
   EXPECT_EQ(keylane::meta::MetaFailureClassOf(trailing.status()),
             keylane::meta::MetaFailureClass::kFailStop);
+
+  std::string legacy_v2 = bytes;
+  legacy_v2[0] = '\x02';
+  legacy_v2[1] = '\0';
+  const auto unsupported = MetaStores::Deserialize(legacy_v2);
+  ASSERT_FALSE(unsupported.ok());
+  EXPECT_EQ(keylane::meta::MetaFailureClassOf(unsupported.status()),
+            keylane::meta::MetaFailureClass::kFailStop);
+  EXPECT_NE(unsupported.status().message().find("version"),
+            std::string_view::npos);
 }
 
 TEST(MetaStateApply, LogIndexZeroRejectedWithoutDispatchOrAudit) {

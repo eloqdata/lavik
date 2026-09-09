@@ -122,6 +122,7 @@ TEST(MetaIdentitySecurity, TcpAdminSupportsPlaintextOrCompleteMtls) {
       keylane::meta::MetaCtlServerOptions::Transport::kTcpPlaintext;
   options.bind_host_ = "127.0.0.1";
   options.port_ = 9000;
+  options.local_ctl_endpoint_ = "127.0.0.1:9000";
   EXPECT_TRUE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
 
   options.tls_ca_cert_file_ = "ca.pem";
@@ -132,6 +133,13 @@ TEST(MetaIdentitySecurity, TcpAdminSupportsPlaintextOrCompleteMtls) {
 
   options.transport_ = keylane::meta::MetaCtlServerOptions::Transport::kTcpMtls;
   EXPECT_TRUE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
+  options.bind_host_ = "0.0.0.0";
+  EXPECT_FALSE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
+  options.bind_host_ = "::";
+  EXPECT_FALSE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
+  options.bind_host_ = "127.0.0.1";
+  options.local_ctl_endpoint_ = "127.0.0.1:9001";
+  EXPECT_FALSE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
 }
 
 TEST(MetaIdentitySecurity, UnixAdminRequiresPathAndExplicitUid) {
@@ -140,6 +148,64 @@ TEST(MetaIdentitySecurity, UnixAdminRequiresPathAndExplicitUid) {
   EXPECT_FALSE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
   options.allowed_uids_.push_back(1000);
   EXPECT_TRUE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
+}
+
+TEST(MetaClusterStatusServiceTest, EnforcesSingleFlightAndRetainedBudget) {
+  keylane::meta::MetaClusterStatusService service;
+  EXPECT_TRUE(service.TryBeginCapture());
+  EXPECT_FALSE(service.TryBeginCapture());
+  service.EndCapture();
+  EXPECT_TRUE(service.TryBeginCapture());
+  service.EndCapture();
+
+  constexpr std::size_t kTwoHundredMiB = 200u << 20;
+  constexpr std::size_t kOneHundredMiB = 100u << 20;
+  EXPECT_TRUE(service.TryRetain(kTwoHundredMiB));
+  EXPECT_FALSE(service.TryBeginCapture());
+  EXPECT_FALSE(service.TryRetain(kOneHundredMiB));
+  service.Release(kTwoHundredMiB);
+  EXPECT_TRUE(service.TryRetain(kOneHundredMiB));
+  service.Release(kOneHundredMiB);
+}
+
+TEST(MetaClusterStatusBracketTest, RejectsEveryMixedAuthorityCut) {
+  using keylane::meta::detail::IsStableClusterStatusBracket;
+  using keylane::meta::detail::MetaClusterStatusBracket;
+  MetaClusterStatusBracket before{
+      .is_leader_ = true,
+      .leader_alive_ = true,
+      .term_ = 7,
+      .config_index_ = 11,
+      .config_server_ids_ = {1, 2, 3},
+      .active_meta_members_ = {
+          {.server_id_ = 1,
+           .principal_ = "keylane://meta/1",
+           .data_control_endpoint_ = "127.0.0.1:7001",
+           .ctl_endpoint_ = "127.0.0.1:7101"},
+      },
+      .leadership_ = {.leadership_generation_ = 5,
+                      .leader_authority_eligible_ = true},
+  };
+  EXPECT_TRUE(IsStableClusterStatusBracket(before, before));
+
+  auto expect_changed = [&](auto mutate) {
+    MetaClusterStatusBracket after = before;
+    mutate(after);
+    EXPECT_FALSE(IsStableClusterStatusBracket(before, after));
+  };
+  expect_changed([](auto& value) { value.is_leader_ = false; });
+  expect_changed([](auto& value) { value.leader_alive_ = false; });
+  expect_changed([](auto& value) { ++value.term_; });
+  expect_changed([](auto& value) { ++value.config_index_; });
+  expect_changed([](auto& value) { value.config_server_ids_.pop_back(); });
+  expect_changed([](auto& value) {
+    value.active_meta_members_.front().ctl_endpoint_ = "127.0.0.1:7199";
+  });
+  expect_changed(
+      [](auto& value) { ++value.leadership_.leadership_generation_; });
+  expect_changed([](auto& value) {
+    value.leadership_.leader_authority_eligible_ = false;
+  });
 }
 
 TEST(MetaIdentitySecurity, RegistrationRejectsPrincipalForAnotherNode) {
@@ -159,12 +225,15 @@ TEST(MetaIdentitySecurity,
   bind.server_id_ = 7;
   bind.principal_ = "keylane://meta/7";
   bind.data_control_endpoint_ = "10.0.0.7:7100";
+  bind.ctl_endpoint_ = "10.0.0.7:7200";
   ASSERT_TRUE(store.Apply(bind).ok());
 
   auto member = store.FindMetaMember(7);
   ASSERT_TRUE(member.has_value());
   EXPECT_EQ(member->principal_, "keylane://meta/7");
   EXPECT_EQ(member->data_control_endpoint_, "10.0.0.7:7100");
+  EXPECT_EQ(member->ctl_endpoint_,
+            std::optional<std::string>("10.0.0.7:7200"));
   EXPECT_FALSE(member->retired_);
   EXPECT_TRUE(store.Apply(bind).ok());
 
@@ -188,12 +257,32 @@ TEST(MetaIdentitySecurity, MetaMemberBindingSurvivesSnapshotRoundTrip) {
   bind.server_id_ = 3;
   bind.principal_ = "keylane://meta/3";
   bind.data_control_endpoint_ = "10.0.0.3:7100";
+  bind.ctl_endpoint_ = "10.0.0.3:7200";
   ASSERT_TRUE(store.Apply(bind).ok());
 
   auto restored =
       keylane::meta::MetaIdentityStore::Deserialize(store.Serialize());
   ASSERT_TRUE(restored.ok()) << restored.status();
   EXPECT_EQ(restored->FindMetaMember(3), store.FindMetaMember(3));
+}
+
+TEST(MetaIdentitySecurity, SoleMemberCtlEndpointCanOnlyBeCompletedOnce) {
+  keylane::meta::MetaIdentityStore store;
+  keylane::meta::BindMetaMember bind;
+  bind.server_id_ = 1;
+  bind.principal_ = "keylane://meta/1";
+  bind.data_control_endpoint_ = "10.0.0.1:7100";
+  ASSERT_TRUE(store.Apply(bind).ok());
+
+  bind.ctl_endpoint_ = "10.0.0.1:7200";
+  ASSERT_TRUE(store.Apply(bind).ok());
+  ASSERT_TRUE(store.FindMetaMember(1).has_value());
+  EXPECT_EQ(store.FindMetaMember(1)->ctl_endpoint_, bind.ctl_endpoint_);
+
+  bind.ctl_endpoint_ = "10.0.0.1:7300";
+  EXPECT_FALSE(store.Apply(bind).ok());
+  EXPECT_EQ(store.FindMetaMember(1)->ctl_endpoint_,
+            std::optional<std::string>("10.0.0.1:7200"));
 }
 
 }  // namespace

@@ -17,7 +17,7 @@
 //     return to Celer through the Runtime's foreign executor mailbox.
 //
 // Teardown order (main thread, on SIGTERM/SIGINT):
-//   Data control Shutdown() -> ctl Shutdown() -> coordinator demotion ->
+//   ctl Shutdown() -> Data control Shutdown() -> coordinator demotion ->
 //   proposal executor drain -> raft_launcher::shutdown() ->
 //   MetaStateMachine::WaitForSnapshotWriterIdle() -> release Raft ref -> Celer
 //   Runtime stop + join -> coordinator release.
@@ -73,6 +73,7 @@
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/ctl_server.h"
 #include "keylane/meta/data_control_server.h"
+#include "keylane/meta/data_control_runtime_status.h"
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/nuraft_asio_transport.h"
 #include "keylane/meta/nuraft_log_store.h"
@@ -144,7 +145,7 @@ void PrintUsage(const char* program) {
       stderr,
       "usage: %s --id N --addr ip:port --data-control-addr ip:port "
       "--data-dir PATH "
-      "[--ctl-socket PATH | --ctl-addr ip:port] "
+      "[--ctl-socket PATH] [--ctl-addr ip:port] "
       "[--bootstrap]\n"
       "          [--tls-ca F --tls-cert F --tls-key F]\n"
       "          [--ctl-allow-uid N] [--ctl-tls-ca F --ctl-tls-cert F "
@@ -329,10 +330,6 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "--data-dir is required");
   }
-  if (!options.ctl_addr_.empty() && !options.ctl_socket_.empty()) {
-    return absl::InvalidArgumentError(
-        "--ctl-addr and --ctl-socket are mutually exclusive");
-  }
   if (options.ctl_addr_.empty() && options.ctl_socket_.empty()) {
     options.ctl_socket_ = options.data_dir_ + "/meta-admin.sock";
   }
@@ -362,9 +359,9 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
         "--ctl-tls-ca, --ctl-tls-cert and --ctl-tls-key must be given "
         "together");
   }
-  if (!options.ctl_socket_.empty() && ctl_tls_any) {
+  if (options.ctl_addr_.empty() && ctl_tls_any) {
     return absl::InvalidArgumentError(
-        "ctl TLS options apply only to --ctl-addr");
+        "ctl TLS options require --ctl-addr");
   }
   if (options.election_ms_low_ >= options.election_ms_high_) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
@@ -571,6 +568,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::optional<EndpointParts> ctl_endpoint;
+  std::string ctl_endpoint_text;
   if (!options.ctl_addr_.empty()) {
     auto parsed_ctl = ParseEndpointArg(options.ctl_addr_);
     if (!parsed_ctl.ok()) {
@@ -578,7 +576,18 @@ int main(int argc, char** argv) {
                    std::string(parsed_ctl.status().message()).c_str());
       return 1;
     }
+    if (parsed_ctl->host_ == "0.0.0.0" || parsed_ctl->host_ == "::") {
+      std::fprintf(stderr,
+                   "keylane-meta: --ctl-addr must be a concrete routable "
+                   "numeric address\n");
+      return 1;
+    }
     ctl_endpoint = std::move(*parsed_ctl);
+    ctl_endpoint_text = ctl_endpoint->host_.find(':') == std::string::npos
+                            ? ctl_endpoint->host_ + ":" +
+                                  std::to_string(ctl_endpoint->port_)
+                            : "[" + ctl_endpoint->host_ + "]:" +
+                                  std::to_string(ctl_endpoint->port_);
   }
 
   // One process-wide logger to stderr; the pattern carries the node id so
@@ -738,7 +747,7 @@ int main(int argc, char** argv) {
   }
 
   int exit_code = 0;
-  std::shared_ptr<MetaCtlServer> ctl;
+  std::vector<std::shared_ptr<MetaCtlServer>> ctl_servers;
   std::shared_ptr<MetaDataControlServer> data_control;
   const std::uint32_t observation_ttl_ms = static_cast<std::uint32_t>(
       std::max(options.election_ms_high_, options.heartbeat_ms_ * 3));
@@ -748,6 +757,10 @@ int main(int argc, char** argv) {
       std::make_shared<keylane::meta::MetaObservationStore>(observation_limits);
   auto proposal_executor = std::make_unique<MetaProposalExecutor>();
   auto membership_gate = std::make_shared<MetaMembershipGate>();
+  auto cluster_status_service =
+      std::make_shared<keylane::meta::MetaClusterStatusService>();
+  auto data_control_runtime_status =
+      std::make_shared<keylane::meta::MetaDataControlRuntimeStatus>();
   nuraft::ptr<nuraft::log_store> raft_log_store = state_mgr->load_log_store();
   auto* wal = static_cast<keylane::meta::NuraftLogStore*>(raft_log_store.get());
   MetaCoordinatorOptions coordinator_options;
@@ -766,6 +779,8 @@ int main(int argc, char** argv) {
     control_options.tls_ca_cert_file_ = options.tls_ca_;
     control_options.tls_cert_file_ = options.tls_cert_;
     control_options.tls_key_file_ = options.tls_key_;
+    control_options.local_ctl_endpoint_ = ctl_endpoint_text;
+    control_options.runtime_status_ = data_control_runtime_status;
     // Couple transport cadence and authority lifetime to the configured Raft
     // liveness bounds instead of introducing unrelated control-plane knobs.
     control_options.heartbeat_interval_ms_ =
@@ -787,22 +802,30 @@ int main(int argc, char** argv) {
       exit_code = 1;
     } else {
       data_control = *control_or;
-      coordinator->RunAsLeader(data_control);
-      data_control->StartListener();
-      const absl::Status control_bound =
-          WaitForBound([&data_control] { return data_control->status(); });
-      if (!control_bound.ok()) {
-        spdlog::critical("data-control listener bind failed: {}",
-                         control_bound.message());
-        exit_code = 1;
-      }
     }
   }
 
   if (exit_code == 0) {
-    MetaCtlServerOptions ctl_options;
-    ctl_options.local_data_control_endpoint_ = options.data_control_addr_;
+    std::vector<MetaCtlServerOptions> ctl_option_set;
+    if (!options.ctl_socket_.empty()) {
+      MetaCtlServerOptions ctl_options;
+      ctl_options.local_data_control_endpoint_ = options.data_control_addr_;
+      ctl_options.local_ctl_endpoint_ = ctl_endpoint_text;
+      ctl_options.cluster_status_service_ = cluster_status_service;
+      ctl_options.data_control_runtime_status_ = data_control_runtime_status;
+      ctl_options.observation_ttl_ms_ = observation_ttl_ms;
+      ctl_options.transport_ = MetaCtlServerOptions::Transport::kUnix;
+      ctl_options.unix_socket_path_ = options.ctl_socket_;
+      ctl_options.allowed_uids_ = options.ctl_allowed_uids_;
+      ctl_option_set.push_back(std::move(ctl_options));
+    }
     if (ctl_endpoint.has_value()) {
+      MetaCtlServerOptions ctl_options;
+      ctl_options.local_data_control_endpoint_ = options.data_control_addr_;
+      ctl_options.local_ctl_endpoint_ = ctl_endpoint_text;
+      ctl_options.cluster_status_service_ = cluster_status_service;
+      ctl_options.data_control_runtime_status_ = data_control_runtime_status;
+      ctl_options.observation_ttl_ms_ = observation_ttl_ms;
       ctl_options.transport_ =
           options.ctl_tls_ca_.empty()
               ? MetaCtlServerOptions::Transport::kTcpPlaintext
@@ -812,33 +835,73 @@ int main(int argc, char** argv) {
       ctl_options.tls_ca_cert_file_ = options.ctl_tls_ca_;
       ctl_options.tls_cert_file_ = options.ctl_tls_cert_;
       ctl_options.tls_key_file_ = options.ctl_tls_key_;
-    } else {
-      ctl_options.transport_ = MetaCtlServerOptions::Transport::kUnix;
-      ctl_options.unix_socket_path_ = options.ctl_socket_;
-      ctl_options.allowed_uids_ = options.ctl_allowed_uids_;
+      ctl_option_set.push_back(std::move(ctl_options));
     }
-    auto ctl_or = MetaCtlServer::Create(
-        foreign_executor, server, state_machine, coordinator, obs_store,
-        *proposal_executor, membership_gate, std::move(ctl_options));
-    if (!ctl_or.ok()) {
-      spdlog::critical("ctl server create failed: {}",
-                       ctl_or.status().message());
-      exit_code = 1;
-    } else {
-      ctl = *ctl_or;
-      ctl->Start();
-      const absl::Status ctl_bound =
-          WaitForBound([&ctl] { return ctl->status(); });
-      if (!ctl_bound.ok()) {
-        spdlog::critical("ctl listener bind failed: {}", ctl_bound.message());
+    for (auto& ctl_options : ctl_option_set) {
+      auto ctl_or = MetaCtlServer::Create(
+          foreign_executor, server, state_machine, coordinator, obs_store,
+          *proposal_executor, membership_gate, std::move(ctl_options));
+      if (!ctl_or.ok()) {
+        spdlog::critical("ctl server create failed: {}",
+                         ctl_or.status().message());
         exit_code = 1;
+        break;
+      }
+      ctl_servers.push_back(*ctl_or);
+    }
+    if (exit_code == 0) {
+      for (const auto& ctl : ctl_servers) {
+        ctl->Start();
+      }
+      for (const auto& ctl : ctl_servers) {
+        const absl::Status ctl_bound =
+            WaitForBound([&ctl] { return ctl->status(); });
+        if (!ctl_bound.ok()) {
+          spdlog::critical("ctl listener bind failed: {}",
+                           ctl_bound.message());
+          exit_code = 1;
+          break;
+        }
+      }
+    }
+    if (exit_code != 0) {
+      for (const auto& ctl : ctl_servers) {
+        ctl->Shutdown();
       }
     }
   }
 
   if (exit_code == 0) {
-    const std::string ctl_display =
-        !options.ctl_socket_.empty() ? options.ctl_socket_ : options.ctl_addr_;
+    // Bind Admin first. If either Admin transport fails, Data-control has
+    // never accepted a connection and rollback cannot transiently expose a
+    // control endpoint for a process that will not become operational.
+    data_control->StartListener();
+    const absl::Status control_bound =
+        WaitForBound([&data_control] { return data_control->status(); });
+    if (!control_bound.ok()) {
+      spdlog::critical("data-control listener bind failed: {}",
+                       control_bound.message());
+      exit_code = 1;
+      for (const auto& ctl : ctl_servers) {
+        ctl->Shutdown();
+      }
+    }
+  }
+
+  if (exit_code == 0) {
+    // Register leader-scoped Data publication only after every configured
+    // listener has bound. In particular, the bootstrap reconciliation must
+    // not commit --ctl-addr before a failing Admin bind has rolled startup
+    // back.
+    coordinator->RunAsLeader(data_control);
+  }
+
+  if (exit_code == 0) {
+    std::string ctl_display = options.ctl_socket_;
+    if (!options.ctl_addr_.empty()) {
+      if (!ctl_display.empty()) ctl_display += ",";
+      ctl_display += options.ctl_addr_;
+    }
     spdlog::info(
         "node {} up: raft={} data-control={} ctl={} data-dir={} bootstrap={} "
         "tls={}",
@@ -855,11 +918,12 @@ int main(int argc, char** argv) {
   // Stop both ingress surfaces first, then synchronously revoke the
   // leader-scoped publisher before quiescing NuRaft/Asio while the Celer
   // worker mailbox and snapshot writer remain alive.
+  // Admin goes first so no new capture can race Data-control teardown.
+  for (const auto& ctl : ctl_servers) {
+    ctl->Shutdown();
+  }
   if (data_control != nullptr) {
     data_control->Shutdown();
-  }
-  if (ctl != nullptr) {
-    ctl->Shutdown();
   }
   // Detach first so callbacks racing shutdown cannot enqueue a later Leader
   // edge behind this final demotion. Coordinator teardown independently

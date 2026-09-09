@@ -194,6 +194,52 @@ MetaStores MetaStateMachine::StoresSnapshot() const {
   return stores_;
 }
 
+MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  MetaCommittedStatusView view;
+  view.applied_index_ = last_committed_idx_.load(std::memory_order_relaxed);
+  view.topology_epoch_ = stores_.topology_.TopologyEpoch();
+  view.meta_members_ = stores_.identity_.MetaMembers();
+  view.data_nodes_ = stores_.identity_.Nodes();
+  for (MetaTopologyGroupView topology : stores_.topology_.Groups()) {
+    auto grant = stores_.grant_.GroupState(topology.group_id_);
+    // Cross-store validation guarantees the grant half exists for every
+    // topology group; retain a defensive fenced value if corrupted in memory
+    // so status reports NOT READY instead of inventing authority.
+    MetaCommittedStatusGroup group;
+    group.topology_ = std::move(topology);
+    if (grant.has_value()) group.grant_ = std::move(*grant);
+    const auto& record = group.topology_.record_;
+    group.manifest_present_ =
+        record.population_manifest_revision_ != 0 &&
+        stores_.population_manifest_.Contains(
+            record.population_manifest_digest_);
+    if (group.grant_.grant_.has_value()) {
+      const MetaGrantSpec& spec = group.grant_.grant_->spec_;
+      group.policy_active_ =
+          stores_.policy_.IsVersionActive(spec.policy_id_,
+                                          spec.policy_version_);
+    }
+    view.groups_.push_back(std::move(group));
+  }
+  for (std::uint32_t slot = 0; slot < kMetaSlotCount;) {
+    auto owner = stores_.topology_.SlotOwner(slot);
+    if (!owner.has_value()) {
+      ++slot;
+      continue;
+    }
+    std::uint32_t last = slot;
+    while (last + 1 < kMetaSlotCount &&
+           stores_.topology_.SlotOwner(last + 1) == owner) {
+      ++last;
+    }
+    view.slot_ranges_.push_back(
+        {.first_ = slot, .last_ = last, .group_id_ = std::move(*owner)});
+    slot = last + 1;
+  }
+  return view;
+}
+
 void MetaStateMachine::SetCommitEventSink(MetaCommitEventSink sink) {
   std::lock_guard<std::mutex> lock(sink_mutex_);
   commit_event_sink_ = std::move(sink);

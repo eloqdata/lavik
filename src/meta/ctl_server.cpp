@@ -1,6 +1,9 @@
 #include "keylane/meta/ctl_server.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -8,8 +11,10 @@
 #include <coroutine>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <exception>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -37,13 +42,17 @@
 #pragma GCC diagnostic pop
 
 #include "keylane/cluster/control_protocol.h"
+#include "keylane/cluster/control_transport.h"
 #include "keylane/meta/commands.h"
+#include "keylane/meta/cluster_status.h"
 #include "keylane/meta/coordinator.h"
+#include "keylane/meta/data_control_runtime_status.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/observation_store.h"
 #include "keylane/meta/proposal_executor.h"
 #include "keylane/meta/state_machine.h"
+#include "keylane/numeric_endpoint.h"
 
 namespace keylane::meta {
 
@@ -72,14 +81,551 @@ struct MetaCtlServer::Core {
   celer::Worker* worker_ = nullptr;
   celer::TcpListener listener_;
   bool listening_ = false;
+  bool shutdown_ = false;
+  bool accept_loop_running_ = false;
+  int shutdown_accept_wake_fd_ = -1;
   std::vector<celer::Connection*> sessions_;
+  std::vector<std::shared_ptr<std::promise<void>>> shutdown_drain_waiters_;
+  std::atomic<bool> shutdown_complete_{false};
 };
+
+bool detail::IsStableClusterStatusBracket(
+    const MetaClusterStatusBracket& before,
+    const MetaClusterStatusBracket& after) {
+  return before.is_leader_ && before.leader_alive_ &&
+         before.leadership_.leader_authority_eligible_ && after.is_leader_ &&
+         after.leader_alive_ &&
+         after.leadership_.leader_authority_eligible_ &&
+         after.term_ == before.term_ &&
+         after.config_index_ == before.config_index_ &&
+         after.config_server_ids_ == before.config_server_ids_ &&
+         after.active_meta_members_ == before.active_meta_members_ &&
+         after.leadership_.leadership_generation_ ==
+             before.leadership_.leadership_generation_;
+}
 
 namespace {
 
 // One oversized partial line already proves a broken or hostile peer; the
 // Control-plane payloads are bounded, so cap the assembly buffer hard.
 constexpr std::size_t kMaxLineBytes = 64 * 1024;
+constexpr auto kClusterStatusSendDeadline = std::chrono::seconds(5);
+
+void NotifyCtlShutdownDrained(auto& core) {
+  if (!core.shutdown_ || core.accept_loop_running_ || !core.sessions_.empty()) {
+    return;
+  }
+  // Session coroutines retain their own dependencies while parked on a
+  // proposal. Releasing the Core copies only after the accept/session drain
+  // makes Admin shutdown a real lifecycle barrier before Data-control stops.
+  core.server_.reset();
+  core.state_machine_.reset();
+  core.coordinator_.reset();
+  core.obs_store_.reset();
+  core.tls_context_.reset();
+  for (const auto& waiter : core.shutdown_drain_waiters_) waiter->set_value();
+  core.shutdown_drain_waiters_.clear();
+}
+
+absl::StatusOr<int> OpenCtlShutdownAcceptWakeSocket(
+    const MetaCtlServerOptions& options) {
+  sockaddr_storage destination{};
+  socklen_t destination_size = 0;
+  int family = AF_UNSPEC;
+  int protocol = 0;
+
+  if (options.transport_ == MetaCtlServerOptions::Transport::kUnix) {
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    if (options.unix_socket_path_.size() >= sizeof(address.sun_path)) {
+      return absl::InvalidArgumentError("ctl shutdown wake path is too long");
+    }
+    std::memcpy(address.sun_path, options.unix_socket_path_.c_str(),
+                options.unix_socket_path_.size() + 1);
+    family = AF_UNIX;
+    destination_size = sizeof(address);
+    std::memcpy(&destination, &address, sizeof(address));
+  } else {
+    sockaddr_in address4{};
+    address4.sin_family = AF_INET;
+    address4.sin_port = htons(options.port_);
+    if (::inet_pton(AF_INET, options.bind_host_.c_str(), &address4.sin_addr) ==
+        1) {
+      family = AF_INET;
+      protocol = IPPROTO_TCP;
+      destination_size = sizeof(address4);
+      std::memcpy(&destination, &address4, sizeof(address4));
+    } else {
+      sockaddr_in6 address6{};
+      address6.sin6_family = AF_INET6;
+      address6.sin6_port = htons(options.port_);
+      if (::inet_pton(AF_INET6, options.bind_host_.c_str(),
+                      &address6.sin6_addr) != 1) {
+        return absl::InvalidArgumentError(
+            "ctl shutdown wake host is not numeric");
+      }
+      family = AF_INET6;
+      protocol = IPPROTO_TCP;
+      destination_size = sizeof(address6);
+      std::memcpy(&destination, &address6, sizeof(address6));
+    }
+  }
+
+  const int fd =
+      ::socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol);
+  if (fd < 0) {
+    return absl::ErrnoToStatus(errno, "create ctl shutdown wake socket");
+  }
+  if (::connect(fd, reinterpret_cast<const sockaddr*>(&destination),
+                destination_size) != 0 &&
+      errno != EINPROGRESS && errno != EALREADY && errno != EISCONN) {
+    const absl::Status status =
+        absl::ErrnoToStatus(errno, "connect ctl shutdown wake socket");
+    (void)::close(fd);
+    return status;
+  }
+  return fd;
+}
+
+std::vector<std::uint32_t> ConfigServerIds(
+    const nuraft::ptr<nuraft::cluster_config>& config) {
+  std::vector<std::uint32_t> ids;
+  if (config == nullptr) return ids;
+  for (const nuraft::ptr<nuraft::srv_config>& member : config->get_servers()) {
+    if (member != nullptr && member->get_id() > 0) {
+      ids.push_back(static_cast<std::uint32_t>(member->get_id()));
+    }
+  }
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
+std::vector<MetaMemberRecord> ActiveMetaMembers(
+    const MetaCommittedStatusView& view) {
+  std::vector<MetaMemberRecord> members;
+  for (const MetaMemberRecord& member : view.meta_members_) {
+    if (!member.retired_) members.push_back(member);
+  }
+  std::sort(members.begin(), members.end(), [](const auto& left,
+                                                const auto& right) {
+    return left.server_id_ < right.server_id_;
+  });
+  return members;
+}
+
+std::vector<ClusterMetaMemberWireV1> StatusMembers(
+    const std::vector<MetaMemberRecord>& members, std::int32_t leader_id) {
+  std::vector<ClusterMetaMemberWireV1> wire;
+  wire.reserve(members.size());
+  for (const auto& member : members) {
+    wire.push_back({.server_id_ = member.server_id_,
+                    .ctl_endpoint_ = member.ctl_endpoint_,
+                    .is_leader_ = leader_id > 0 &&
+                                  member.server_id_ ==
+                                      static_cast<std::uint32_t>(leader_id)});
+  }
+  return wire;
+}
+
+std::string BuildClusterHeadReply(
+    const nuraft::ptr<nuraft::raft_server>& server,
+    const nuraft::ptr<MetaStateMachine>& state_machine) {
+  const MetaCommittedStatusView view = state_machine->StatusSnapshot();
+  const auto members = ActiveMetaMembers(view);
+  const nuraft::ptr<nuraft::cluster_config> config = server->get_config();
+  if (config == nullptr || members.empty()) return "ERR leader_not_caught_up";
+  // Use one role observation for both fields. A promotion can otherwise land
+  // between two is_leader() reads and create a structurally corrupt head that
+  // the client must treat as fatal instead of retrying ordinary term churn.
+  const bool responder_is_leader = server->is_leader();
+  const std::int32_t leader_id =
+      responder_is_leader ? server->get_id() : server->get_leader();
+  if (leader_id <= 0) return "ERR leader_unknown";
+  if ((leader_id == server->get_id()) != responder_is_leader) {
+    return "ERR cut_changed";
+  }
+  const auto responder = std::find_if(
+      members.begin(), members.end(), [&](const MetaMemberRecord& member) {
+        return member.server_id_ == static_cast<std::uint32_t>(server->get_id());
+      });
+  const auto leader = std::find_if(
+      members.begin(), members.end(), [&](const MetaMemberRecord& member) {
+        return member.server_id_ == static_cast<std::uint32_t>(leader_id);
+      });
+  if (responder == members.end() || leader == members.end()) {
+    return "ERR leader_not_caught_up";
+  }
+  ClusterHeadWireV1 head;
+  head.responder_id_ = static_cast<std::uint32_t>(server->get_id());
+  head.role_ = responder_is_leader ? ClusterMetaRole::kLeader
+                                   : ClusterMetaRole::kFollower;
+  head.term_ = server->get_term();
+  if (leader_id > 0) head.leader_id_ = static_cast<std::uint32_t>(leader_id);
+  head.config_index_ = config->get_log_idx();
+  head.meta_members_ = StatusMembers(members, leader_id);
+  auto encoded = EncodeClusterHeadReply(head);
+  return encoded.ok() ? std::move(*encoded) : "ERR state_corrupt";
+}
+
+std::string BuildClusterStatusReply(
+    const nuraft::ptr<nuraft::raft_server>& server,
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
+    std::uint32_t observation_ttl_ms) {
+  const bool before_is_leader = server->is_leader();
+  const bool before_leader_alive = server->is_leader_alive();
+  if (!before_is_leader) return "ERR not_leader";
+  if (!before_leader_alive) return "ERR leader_not_caught_up";
+
+  const std::uint64_t before_term = server->get_term();
+  const nuraft::ptr<nuraft::cluster_config> before_config =
+      server->get_config();
+  if (before_config == nullptr) return "ERR leader_not_caught_up";
+  const std::uint64_t before_config_index = before_config->get_log_idx();
+  const std::vector<std::uint32_t> before_config_ids =
+      ConfigServerIds(before_config);
+
+  // Capture volatile session facts first, then take one atomic compact
+  // committed view. Compatibility checks below admit only runtime facts whose
+  // FDS and authority anchors still describe that committed cut.
+  const MetaDataControlRuntimeSnapshot runtime = runtime_status->Snapshot();
+  if (!runtime.leader_authority_eligible_ ||
+      runtime.leadership_generation_ == 0) {
+    return "ERR leader_not_caught_up";
+  }
+  const MetaCommittedStatusView view = state_machine->StatusSnapshot();
+  if (view.applied_index_ < server->get_committed_log_idx()) {
+    return "ERR leader_not_caught_up";
+  }
+  const auto active_meta_members = ActiveMetaMembers(view);
+  if (std::none_of(active_meta_members.begin(), active_meta_members.end(),
+                   [&](const MetaMemberRecord& member) {
+                     return member.server_id_ ==
+                            static_cast<std::uint32_t>(server->get_id());
+                   })) {
+    return "ERR leader_not_caught_up";
+  }
+  const detail::MetaClusterStatusBracket before_bracket{
+      .is_leader_ = before_is_leader,
+      .leader_alive_ = before_leader_alive,
+      .term_ = before_term,
+      .config_index_ = before_config_index,
+      .config_server_ids_ = before_config_ids,
+      .active_meta_members_ = active_meta_members,
+      .leadership_ = {.leadership_generation_ =
+                          runtime.leadership_generation_,
+                      .leader_authority_eligible_ =
+                          runtime.leader_authority_eligible_},
+  };
+
+  ClusterStatusWireV1 status;
+  status.capture_ = {
+      .responder_id_ = static_cast<std::uint32_t>(server->get_id()),
+      .term_ = before_term,
+      .config_index_ = before_config_index,
+      .committed_index_ = view.applied_index_,
+      .topology_epoch_ = view.topology_epoch_,
+  };
+  status.meta_available_ = true;
+  status.meta_members_ =
+      StatusMembers(active_meta_members, server->get_id());
+
+  std::vector<std::uint32_t> committed_ids;
+  std::vector<std::string> ctl_endpoints;
+  bool complete_ctl_directory = active_meta_members.size() <= 1;
+  for (const auto& member : active_meta_members) {
+    committed_ids.push_back(member.server_id_);
+    if (member.ctl_endpoint_.has_value()) {
+      ctl_endpoints.push_back(*member.ctl_endpoint_);
+    } else if (active_meta_members.size() > 1) {
+      complete_ctl_directory = false;
+    }
+  }
+  std::sort(committed_ids.begin(), committed_ids.end());
+  std::sort(ctl_endpoints.begin(), ctl_endpoints.end());
+  const bool unique_ctl_endpoints =
+      std::adjacent_find(ctl_endpoints.begin(), ctl_endpoints.end()) ==
+      ctl_endpoints.end();
+  if (active_meta_members.size() > 1 &&
+      ctl_endpoints.size() == active_meta_members.size()) {
+    complete_ctl_directory = true;
+  }
+  status.meta_membership_stable_ =
+      committed_ids == before_config_ids && complete_ctl_directory &&
+      unique_ctl_endpoints;
+  if (!status.meta_membership_stable_) {
+    status.blockers_.push_back(
+        {.code_ = "meta_membership_unstable",
+         .scope_ = "meta",
+         .detail_ = "committed_identity_or_ctl_directory_mismatch"});
+  }
+
+  for (const MetaNodeRecord& record : view.data_nodes_) {
+    ClusterDataNodeWireV1 node;
+    node.node_id_ = record.node_id_;
+    node.role_ = record.role_ == MetaNodeRole::kPrimary
+                     ? ClusterDataNodeRole::kPrimary
+                     : ClusterDataNodeRole::kReplica;
+    node.retired_ = record.retired_;
+    const auto runtime_node = std::find_if(
+        runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& item) {
+          return item.node_id_ == record.node_id_;
+        });
+    node.current_session_ =
+        !record.retired_ && runtime_node != runtime.nodes_.end();
+    for (const auto& group : view.groups_) {
+      const auto membership = std::find_if(
+          group.topology_.members_.begin(), group.topology_.members_.end(),
+          [&](const MetaGroupMember& item) {
+            return item.node_id_ == record.node_id_;
+          });
+      if (membership != group.topology_.members_.end()) {
+        node.group_id_ = group.topology_.group_id_;
+        break;
+      }
+    }
+    if (runtime_node != runtime.nodes_.end()) {
+      node.projection_current_ =
+          runtime_node->validated_committed_high_water_ >= view.applied_index_ &&
+          runtime_node->topology_epoch_ == view.topology_epoch_;
+      if (node.group_id_.has_value()) {
+        const auto committed_group = std::find_if(
+            view.groups_.begin(), view.groups_.end(), [&](const auto& group) {
+              return group.topology_.group_id_ == *node.group_id_;
+            });
+        const auto projected_group = std::find_if(
+            runtime_node->groups_.begin(), runtime_node->groups_.end(),
+            [&](const auto& group) {
+              return group.group_id_ == *node.group_id_;
+            });
+        const auto committed_member =
+            committed_group == view.groups_.end()
+                ? std::vector<MetaGroupMember>::const_iterator{}
+                : std::find_if(
+                      committed_group->topology_.members_.begin(),
+                      committed_group->topology_.members_.end(),
+                      [&](const MetaGroupMember& member) {
+                        return member.node_id_ == record.node_id_;
+                      });
+        const bool anchors_match =
+            committed_group != view.groups_.end() &&
+            projected_group != runtime_node->groups_.end() &&
+            committed_member != committed_group->topology_.members_.end() &&
+            projected_group->assignment_id_ ==
+                committed_member->assignment_id_ &&
+            projected_group->group_term_ == committed_group->grant_.group_term_ &&
+            projected_group->authority_version_ ==
+                committed_group->topology_.record_.authority_version_ &&
+            projected_group->manifest_revision_ ==
+                committed_group->topology_.record_.population_manifest_revision_ &&
+            projected_group->manifest_digest_ ==
+                committed_group->topology_.record_.population_manifest_digest_ &&
+            projected_group->partition_replication_epoch_ ==
+                committed_group->topology_.record_.partition_replication_epoch_;
+        node.projection_current_ = node.projection_current_ && anchors_match;
+      }
+      const std::int64_t now_unix_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count();
+      node.health_fresh_ =
+          runtime_node->health_.has_value() &&
+          runtime_node->health_received_unix_ms_ <= now_unix_ms &&
+          now_unix_ms - runtime_node->health_received_unix_ms_ <=
+              observation_ttl_ms &&
+          runtime_node->health_->storage_ready &&
+          !runtime_node->health_->draining;
+      node.population_current_ =
+          node.projection_current_ && node.health_fresh_ &&
+          runtime_node->health_->population_ready;
+      if (runtime_node->last_lease_decision_.has_value()) {
+        if (const auto* granted =
+                std::get_if<cluster::control::LeaseGranted>(
+                &*runtime_node->last_lease_decision_)) {
+          const auto committed_group = std::find_if(
+              view.groups_.begin(), view.groups_.end(), [&](const auto& group) {
+                return group.topology_.group_id_ == granted->group_id;
+              });
+          const std::uint64_t freshness_ms =
+              std::min<std::uint64_t>(granted->granted_duration_ms,
+                                      observation_ttl_ms);
+          const bool recent =
+              runtime_node->lease_decision_written_unix_ms_ <= now_unix_ms &&
+              static_cast<std::uint64_t>(
+                  now_unix_ms - runtime_node->lease_decision_written_unix_ms_) <=
+                  freshness_ms;
+          bool current_assignment = false;
+          if (committed_group != view.groups_.end() &&
+              committed_group->grant_.grant_.has_value() &&
+              committed_group->grant_.grant_->owner_ == record.node_id_) {
+            const auto owner_member = std::find_if(
+                committed_group->topology_.members_.begin(),
+                committed_group->topology_.members_.end(),
+                [&](const MetaGroupMember& member) {
+                  return member.node_id_ == record.node_id_;
+                });
+            current_assignment =
+                owner_member != committed_group->topology_.members_.end() &&
+                owner_member->assignment_id_ == granted->assignment_id;
+          }
+          const bool current_grant =
+              committed_group != view.groups_.end() &&
+              committed_group->grant_.grant_.has_value() &&
+              current_assignment &&
+              granted->leader_id == status.capture_.responder_id_ &&
+              granted->raft_term == before_term &&
+              granted->leadership_generation ==
+                  runtime_node->leadership_generation_ &&
+              granted->data_boot_id == runtime_node->boot_id_ &&
+              granted->projection_hash == runtime_node->projection_hash_ &&
+              granted->group_term == committed_group->grant_.group_term_ &&
+              granted->authority_version ==
+                  committed_group->topology_.record_.authority_version_ &&
+              granted->grant_revision ==
+                  committed_group->grant_.grant_->grant_revision_;
+          node.lease_status_ = recent && current_grant &&
+                                       node.projection_current_
+                                   ? ClusterLeaseStatus::kRecentlyGranted
+                                   : ClusterLeaseStatus::kUnknown;
+        } else if (!std::holds_alternative<cluster::control::NoChallenge>(
+                       *runtime_node->last_lease_decision_)) {
+          const bool recent =
+              runtime_node->lease_decision_written_unix_ms_ <= now_unix_ms &&
+              now_unix_ms - runtime_node->lease_decision_written_unix_ms_ <=
+                  observation_ttl_ms;
+          node.lease_status_ = recent ? ClusterLeaseStatus::kDenied
+                                      : ClusterLeaseStatus::kUnknown;
+        }
+      }
+    }
+    status.data_nodes_.push_back(std::move(node));
+  }
+
+  status.topology_converged_ = true;
+  for (const MetaCommittedStatusGroup& source : view.groups_) {
+    ClusterGroupWireV1 group;
+    group.group_id_ = source.topology_.group_id_;
+    group.term_ = source.grant_.group_term_;
+    if (!source.topology_.record_.owner_.empty()) {
+      group.owner_node_id_ = source.topology_.record_.owner_;
+    }
+    group.config_epoch_ = source.topology_.config_epoch_;
+    if (source.grant_.grant_.has_value()) {
+      group.grant_revision_ = source.grant_.grant_->grant_revision_;
+    }
+    group.topology_converged_ = true;
+    for (const MetaGroupMember& member : source.topology_.members_) {
+      const auto identity = std::find_if(
+          view.data_nodes_.begin(), view.data_nodes_.end(),
+          [&](const MetaNodeRecord& node) {
+            return node.node_id_ == member.node_id_;
+          });
+      // Retired identities remain visible for diagnosis but no longer
+      // participate in convergence of the active committed topology.
+      if (identity != view.data_nodes_.end() && identity->retired_) continue;
+      const auto runtime = std::find_if(
+          status.data_nodes_.begin(), status.data_nodes_.end(),
+          [&](const ClusterDataNodeWireV1& node) {
+            return node.node_id_ == member.node_id_;
+          });
+      if (runtime == status.data_nodes_.end() || !runtime->current_session_ ||
+          !runtime->projection_current_ || !runtime->health_fresh_ ||
+          !runtime->population_current_) {
+        group.topology_converged_ = false;
+      }
+    }
+    group.serving_ready_ =
+        source.grant_.grant_.has_value() && source.manifest_present_ &&
+        source.policy_active_ && group.owner_node_id_.has_value() &&
+        std::any_of(status.data_nodes_.begin(), status.data_nodes_.end(),
+                    [&](const ClusterDataNodeWireV1& node) {
+          return node.node_id_ == *group.owner_node_id_ &&
+                 node.current_session_ && node.projection_current_ &&
+                 node.health_fresh_ && node.population_current_ &&
+                 node.lease_status_ == ClusterLeaseStatus::kRecentlyGranted;
+        });
+    if (!group.topology_converged_) {
+      status.topology_converged_ = false;
+      status.blockers_.push_back(
+          {.code_ = "group_runtime_not_converged",
+           .scope_ = "group:" + group.group_id_,
+           .detail_ = "current_projection_health_or_population_missing"});
+    }
+    const bool owns_slots = std::any_of(
+        view.slot_ranges_.begin(), view.slot_ranges_.end(),
+        [&](const MetaCommittedStatusSlotRange& range) {
+          return range.group_id_ == group.group_id_;
+        });
+    if (owns_slots && !group.serving_ready_) {
+      status.blockers_.push_back(
+          {.code_ = "group_not_serving",
+           .scope_ = "group:" + group.group_id_,
+           .detail_ = "authority_or_recent_lease_missing"});
+    }
+    status.groups_.push_back(std::move(group));
+  }
+
+  bool full_slot_coverage = !view.slot_ranges_.empty();
+  std::uint32_t expected_first = 0;
+  for (const MetaCommittedStatusSlotRange& source : view.slot_ranges_) {
+    status.slot_ranges_.push_back({.first_ = source.first_,
+                                   .last_ = source.last_,
+                                   .group_id_ = source.group_id_});
+    if (source.first_ != expected_first) full_slot_coverage = false;
+    expected_first = source.last_ + 1;
+  }
+  full_slot_coverage = full_slot_coverage && expected_first == kMetaSlotCount;
+  status.serving_ready_ =
+      full_slot_coverage && !status.groups_.empty() &&
+      std::all_of(status.slot_ranges_.begin(), status.slot_ranges_.end(),
+                  [&](const ClusterSlotRangeWireV1& range) {
+                    const auto group = std::find_if(
+                        status.groups_.begin(), status.groups_.end(),
+                        [&](const ClusterGroupWireV1& item) {
+                          return item.group_id_ == range.group_id_;
+                        });
+                    return group != status.groups_.end() &&
+                           group->serving_ready_;
+                  });
+  if (!full_slot_coverage) {
+    status.blockers_.push_back({.code_ = "slots_unassigned",
+                                .scope_ = "cluster",
+                                .detail_ = "coverage_is_not_0_through_16383"});
+  }
+  status.cluster_ready_ =
+      status.meta_available_ && status.meta_membership_stable_ &&
+      status.serving_ready_ && status.topology_converged_;
+
+  auto encoded = EncodeClusterStatusReply(status);
+  if (!encoded.ok()) return "ERR state_corrupt";
+
+  // Leadership/config/directory bracket: ordinary topology commits after the
+  // compact snapshot do not invalidate that snapshot, but a leadership or
+  // routing-identity change would make the response a mixed authority cut.
+  const nuraft::ptr<nuraft::cluster_config> after_config = server->get_config();
+  const MetaCommittedStatusView after_view = state_machine->StatusSnapshot();
+  const MetaDataControlLeadershipState after_leadership =
+      runtime_status->LeadershipState();
+  detail::MetaClusterStatusBracket after_bracket{
+      .is_leader_ = server->is_leader(),
+      .leader_alive_ = server->is_leader_alive(),
+      .term_ = server->get_term(),
+      .config_index_ = 0,
+      .config_server_ids_ = {},
+      .active_meta_members_ = {},
+      .leadership_ = after_leadership,
+  };
+  if (after_config != nullptr) {
+    after_bracket.config_index_ = after_config->get_log_idx();
+    after_bracket.config_server_ids_ = ConfigServerIds(after_config);
+  }
+  after_bracket.active_meta_members_ = ActiveMetaMembers(after_view);
+  if (after_config == nullptr ||
+      !detail::IsStableClusterStatusBracket(before_bracket, after_bracket)) {
+    return "ERR cut_changed";
+  }
+  return *encoded;
+}
 
 // Reply tokens for the NuRaft result codes the gate can plausibly hit;
 // kept whitespace-free so a reply line always parses as "ERR <token>".
@@ -130,17 +676,28 @@ const char* AuditPolicyName(MetaAuditPolicy policy) {
 // add_srv, remove_srv). NuRaft may complete inline before await_suspend(), so
 // ready_ and waiter_ form a small handshake independent of mailbox timing.
 struct AsyncReply {
+  ~AsyncReply() {
+    if (retained_status_service_ != nullptr && retained_status_bytes_ != 0) {
+      retained_status_service_->Release(retained_status_bytes_);
+    }
+  }
+
   std::mutex mutex_;
   std::coroutine_handle<> waiter_{};
   std::string reply_;
+  std::shared_ptr<MetaClusterStatusService> retained_status_service_;
+  std::size_t retained_status_bytes_ = 0;
   bool ready_ = false;
   bool detached_ = false;
 };
 
 class AsyncReplyAwaiter {
  public:
-  explicit AsyncReplyAwaiter(std::shared_ptr<AsyncReply> state) noexcept
-      : state_(std::move(state)) {}
+  explicit AsyncReplyAwaiter(
+      std::shared_ptr<AsyncReply> state,
+      std::size_t* retained_status_bytes = nullptr) noexcept
+      : state_(std::move(state)),
+        retained_status_bytes_(retained_status_bytes) {}
 
   ~AsyncReplyAwaiter() {
     std::lock_guard<std::mutex> lock(state_->mutex_);
@@ -162,22 +719,36 @@ class AsyncReplyAwaiter {
   }
   std::string await_resume() noexcept {
     std::lock_guard<std::mutex> lock(state_->mutex_);
+    if (retained_status_bytes_ != nullptr) {
+      *retained_status_bytes_ = state_->retained_status_bytes_;
+      state_->retained_status_bytes_ = 0;
+      state_->retained_status_service_.reset();
+    }
     return std::move(state_->reply_);
   }
 
  private:
   std::shared_ptr<AsyncReply> state_;
+  std::size_t* retained_status_bytes_;
 };
 
 void CompleteAsyncReply(celer::ForeignExecutor foreign_executor,
-                        std::shared_ptr<AsyncReply> state, std::string reply) {
+                        std::shared_ptr<AsyncReply> state, std::string reply,
+                        std::shared_ptr<MetaClusterStatusService>
+                            retained_status_service = nullptr,
+                        std::size_t retained_status_bytes = 0) {
   std::coroutine_handle<> waiter;
   {
     std::lock_guard<std::mutex> lock(state->mutex_);
     if (state->detached_ || state->ready_) {
+      if (retained_status_service != nullptr && retained_status_bytes != 0) {
+        retained_status_service->Release(retained_status_bytes);
+      }
       return;
     }
     state->reply_ = std::move(reply);
+    state->retained_status_service_ = std::move(retained_status_service);
+    state->retained_status_bytes_ = retained_status_bytes;
     state->ready_ = true;
     waiter = state->waiter_;
   }
@@ -989,7 +1560,9 @@ celer::Task<std::string> HandleConfigChange(
     const std::shared_ptr<MetaMembershipGate>& membership_gate, bool add,
     int server_id, const std::string& endpoint,
     const std::string& data_control_endpoint,
+    const std::string& ctl_endpoint,
     std::string_view local_data_control_endpoint,
+    std::string_view local_ctl_endpoint,
     const std::string& member_principal) {
   std::unique_ptr<MetaMembershipGate::Lease> config_lease =
       membership_gate->TryAcquire();
@@ -1013,7 +1586,12 @@ celer::Task<std::string> HandleConfigChange(
     const auto existing =
         state_machine->StoresSnapshot().identity_.FindMetaMember(
             static_cast<std::uint32_t>(member->get_id()));
-    if (existing.has_value() && !existing->retired_) continue;
+    if (existing.has_value() && !existing->retired_) {
+      if (add && !existing->ctl_endpoint_.has_value()) {
+        co_return "ERR missing-ctl-endpoint";
+      }
+      continue;
+    }
     if (existing.has_value() && existing->retired_) {
       // NuRaft may briefly expose the just-removed member while its leave
       // bookkeeping drains. Do not try to reactivate the terminal binding;
@@ -1025,13 +1603,14 @@ celer::Task<std::string> HandleConfigChange(
     bind.server_id_ = static_cast<std::uint32_t>(descriptor->server_id_);
     bind.principal_ = descriptor->principal_;
     if (member->get_id() != server->get_id() ||
-        local_data_control_endpoint.empty()) {
+        local_data_control_endpoint.empty() || local_ctl_endpoint.empty()) {
       // Members added through `addsrv` already have a durable record.
       // The only record that may be absent is the bootstrap member, whose
       // advertised endpoint comes from this process's mandatory option.
       co_return "ERR missing-data-control-endpoint";
     }
     bind.data_control_endpoint_ = std::string(local_data_control_endpoint);
+    bind.ctl_endpoint_ = std::string(local_ctl_endpoint);
     std::string bound = co_await ProposeCommand(coordinator, principal, bind);
     if (bound.rfind("OK ", 0) != 0) co_return bound;
   }
@@ -1047,6 +1626,7 @@ celer::Task<std::string> HandleConfigChange(
     bind.server_id_ = static_cast<std::uint32_t>(server_id);
     bind.principal_ = member_principal;
     bind.data_control_endpoint_ = data_control_endpoint;
+    bind.ctl_endpoint_ = ctl_endpoint;
     std::string bound = co_await ProposeCommand(coordinator, principal, bind);
     if (bound.rfind("OK ", 0) != 0) co_return bound;
     add_config = nuraft::cs_new<nuraft::srv_config>(
@@ -1390,7 +1970,13 @@ celer::Task<std::string> DispatchCommand(
     MetaProposalExecutor& proposal_executor,
     std::shared_ptr<MetaMembershipGate> membership_gate,
     const MetaPrincipalIdentity& identity, AuthenticatedPrincipal principal,
-    std::string_view local_data_control_endpoint, std::string_view line) {
+    std::string_view local_data_control_endpoint,
+    std::string_view local_ctl_endpoint,
+    std::shared_ptr<MetaClusterStatusService> cluster_status_service,
+    std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status,
+    std::uint32_t observation_ttl_ms,
+    std::size_t* retained_status_bytes,
+    std::string_view line) {
   const std::vector<std::string> tokens = SplitTokens(line);
   if (tokens.empty()) {
     co_return "ERR bad-request";
@@ -1400,6 +1986,12 @@ celer::Task<std::string> DispatchCommand(
   std::string_view target_node_id;
   if (command == "status") {
     access = MetaAccess::kStatus;
+  } else if (command == "clusterhead" || command == "clusterstatus") {
+    // Cluster-wide topology and readiness are operator-only even though the
+    // legacy local status verb is also visible to a Data-node identity.
+    if (identity.role_ != MetaPrincipalRole::kOperator) {
+      co_return "ERR forbidden";
+    }
   } else if (command == "adoptsession" && tokens.size() >= 2) {
     access = MetaAccess::kObservationWrite;
     target_node_id = tokens[1];
@@ -1409,6 +2001,53 @@ celer::Task<std::string> DispatchCommand(
   }
   if (!AuthorizeMetaAccess(identity, access, target_node_id).ok()) {
     co_return "ERR forbidden";
+  }
+  if (command == "clusterhead") {
+    if (tokens.size() != 2 || tokens[1] != "1") {
+      co_return "ERR bad-request";
+    }
+    co_return BuildClusterHeadReply(server, state_machine);
+  }
+  if (command == "clusterstatus") {
+    if (tokens.size() != 2 || tokens[1] != "1") {
+      co_return "ERR bad-request";
+    }
+    if (!cluster_status_service->TryBeginCapture()) co_return "ERR busy";
+    auto reply = std::make_shared<AsyncReply>();
+    const absl::Status submitted = proposal_executor.Submit(
+        [server, state_machine, data_control_runtime_status,
+         observation_ttl_ms, cluster_status_service, foreign_executor,
+         reply]() mutable {
+          std::string result;
+          try {
+            result = BuildClusterStatusReply(
+                server, state_machine, data_control_runtime_status,
+                observation_ttl_ms);
+          } catch (...) {
+            result = "ERR state_corrupt";
+          }
+          std::size_t retained_bytes = 0;
+          if (result.starts_with("OK clusterstatus 1 ")) {
+            retained_bytes = result.size() + 1;
+            if (!cluster_status_service->TryRetain(retained_bytes)) {
+              retained_bytes = 0;
+              result = "ERR busy";
+            }
+          }
+          // The immutable, bracketed response no longer owns capture
+          // admission. Sending is independently bounded by the retained-byte
+          // budget and deadline on the Celer worker.
+          cluster_status_service->EndCapture();
+          CompleteAsyncReply(foreign_executor, std::move(reply),
+                             std::move(result), cluster_status_service,
+                             retained_bytes);
+        });
+    if (!submitted.ok()) {
+      cluster_status_service->EndCapture();
+      co_return "ERR busy";
+    }
+    co_return co_await AsyncReplyAwaiter(std::move(reply),
+                                         retained_status_bytes);
   }
   if (command == "submitop" || command == "completeop" ||
       command == "abortop" || command == "archiveoperations" ||
@@ -1555,7 +2194,7 @@ celer::Task<std::string> DispatchCommand(
   if (command == "addsrv" || command == "removesrv") {
     const bool add = command == "addsrv";
     if ((!add && tokens.size() != 2u) ||
-        (add && tokens.size() != 4u && tokens.size() != 5u)) {
+        (add && tokens.size() != 5u && tokens.size() != 6u)) {
       co_return "ERR bad-request";
     }
     int server_id = 0;
@@ -1564,15 +2203,16 @@ celer::Task<std::string> DispatchCommand(
     }
     std::string member_principal =
         "keylane://meta/" + std::to_string(server_id);
-    if (add && tokens.size() == 5u) {
-      member_principal = tokens[4];
+    if (add && tokens.size() == 6u) {
+      member_principal = tokens[5];
     }
     co_return co_await HandleConfigChange(
         std::move(server), std::move(state_machine), coordinator,
         std::move(principal), foreign_executor, proposal_executor,
         membership_gate, add, server_id, add ? tokens[2] : std::string(),
         add ? tokens[3] : std::string(local_data_control_endpoint),
-        local_data_control_endpoint, member_principal);
+        add ? tokens[4] : std::string(),
+        local_data_control_endpoint, local_ctl_endpoint, member_principal);
   }
   if (command == "snapshot") {
     // A manual snapshot must serialize against the commit
@@ -1630,6 +2270,24 @@ absl::Status MetaCtlServer::ValidateOptions(
 
   if (options.port_ == 0) {
     return absl::InvalidArgumentError("TCP ctl port must be non-zero");
+  }
+  in_addr address4{};
+  in6_addr address6{};
+  const bool numeric =
+      ::inet_pton(AF_INET, options.bind_host_.c_str(), &address4) == 1 ||
+      ::inet_pton(AF_INET6, options.bind_host_.c_str(), &address6) == 1;
+  if (!numeric || options.bind_host_ == "0.0.0.0" ||
+      options.bind_host_ == "::") {
+    return absl::InvalidArgumentError(
+        "TCP ctl host must be a concrete numeric address");
+  }
+  const auto committed_endpoint =
+      keylane::ParseNumericEndpoint(options.local_ctl_endpoint_);
+  if (!committed_endpoint.has_value() ||
+      committed_endpoint->host_ != options.bind_host_ ||
+      committed_endpoint->port_ != options.port_) {
+    return absl::InvalidArgumentError(
+        "TCP ctl bind must equal its committed local ctl endpoint");
   }
   if (options.transport_ != MetaCtlServerOptions::Transport::kTcpPlaintext &&
       options.transport_ != MetaCtlServerOptions::Transport::kTcpMtls) {
@@ -1699,6 +2357,14 @@ absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
   core->proposal_executor_ = &proposal_executor;
   core->membership_gate_ = std::move(membership_gate);
   core->options_ = std::move(options);
+  if (core->options_.cluster_status_service_ == nullptr) {
+    core->options_.cluster_status_service_ =
+        std::make_shared<MetaClusterStatusService>();
+  }
+  if (core->options_.data_control_runtime_status_ == nullptr) {
+    core->options_.data_control_runtime_status_ =
+        std::make_shared<MetaDataControlRuntimeStatus>();
+  }
   if (core->options_.transport_ == MetaCtlServerOptions::Transport::kTcpMtls) {
     celer::TlsServerOptions tls;
     tls.cert_file_ = core->options_.tls_cert_file_;
@@ -1712,13 +2378,13 @@ absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
   return std::shared_ptr<MetaCtlServer>(new MetaCtlServer(std::move(core)));
 }
 
-MetaCtlServer::~MetaCtlServer() { PostShutdown(); }
+MetaCtlServer::~MetaCtlServer() { Shutdown(); }
 
 void MetaCtlServer::Start() {
   CorePtr core = core_;
   const bool accepted = core->foreign_executor_.Notify([core]() noexcept {
     celer::Worker& worker = *celer::ThisWorker().self_;
-    if (core->listening_) {
+    if (core->listening_ || core->shutdown_) {
       return;
     }
     core->worker_ = &worker;
@@ -1740,6 +2406,7 @@ void MetaCtlServer::Start() {
       return;
     }
     core->listening_ = true;
+    core->accept_loop_running_ = true;
     worker.Spawn(AcceptLoop(core));
   });
   if (!accepted) {
@@ -1748,36 +2415,60 @@ void MetaCtlServer::Start() {
   }
 }
 
-void MetaCtlServer::Shutdown() { PostShutdown(); }
+void MetaCtlServer::Shutdown() {
+  CorePtr core = core_;
+  if (core->shutdown_complete_.load(std::memory_order_acquire)) return;
+  auto complete = std::make_shared<std::promise<void>>();
+  std::future<void> done = complete->get_future();
+  if (!core->foreign_executor_.Notify([core, complete]() noexcept {
+        core->shutdown_drain_waiters_.push_back(complete);
+        if (!core->shutdown_) {
+          core->shutdown_ = true;
+          core->listening_ = false;
+          if (core->accept_loop_running_) {
+            absl::Status wake_status =
+                absl::UnavailableError("ctl shutdown wake was not attempted");
+            for (int attempt = 0; attempt != 3; ++attempt) {
+              auto wake = OpenCtlShutdownAcceptWakeSocket(core->options_);
+              if (wake.ok()) {
+                core->shutdown_accept_wake_fd_ = *wake;
+                wake_status = absl::OkStatus();
+                break;
+              }
+              wake_status = wake.status();
+            }
+            if (!wake_status.ok()) {
+              spdlog::critical("cannot wake ctl accept loop for shutdown: {}",
+                               wake_status.message());
+              std::terminate();
+            }
+          } else {
+            (void)core->listener_.Close();
+          }
+          if (core->worker_ != nullptr) {
+            const std::vector<celer::Connection*> sessions = core->sessions_;
+            for (celer::Connection* connection : sessions) {
+              if (connection != nullptr && connection->file_.fd_ >= 0) {
+                (void)::shutdown(connection->file_.fd_, SHUT_RDWR);
+              }
+              core->worker_->BeginClose(
+                  connection, absl::CancelledError("ctl server shutdown"),
+                  celer::CloseMode::kLocalClose);
+            }
+          }
+        }
+        NotifyCtlShutdownDrained(*core);
+      })) {
+    if (core->shutdown_complete_.load(std::memory_order_acquire)) return;
+    std::terminate();
+  }
+  done.wait();
+  core->shutdown_complete_.store(true, std::memory_order_release);
+}
 
 absl::Status MetaCtlServer::status() const {
   std::lock_guard<std::mutex> lock(core_->status_mu_);
   return core_->status_;
-}
-
-void MetaCtlServer::PostShutdown() {
-  CorePtr core = core_;
-  (void)core->foreign_executor_.Notify([core]() noexcept {
-    celer::Worker& worker = *celer::ThisWorker().self_;
-    core->listening_ = false;
-    (void)core->listener_.Close();
-    // Fail the pending session reads; each session coroutine removes itself
-    // from sessions_ as it exits.
-    for (celer::Connection* connection : core->sessions_) {
-      worker.BeginClose(
-          connection,
-          absl::Status(absl::StatusCode::kCancelled, "ctl server shutdown"),
-          celer::CloseMode::kLocalClose);
-    }
-    // Drop the shared references on the worker; a parked propose/addsrv holds
-    // its own copy until its reply lands. meta_main also keeps the observation
-    // store alive through worker shutdown.
-    core->server_.reset();
-    core->state_machine_.reset();
-    core->coordinator_.reset();
-    core->obs_store_.reset();
-    core->tls_context_.reset();
-  });
 }
 
 celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
@@ -1799,9 +2490,32 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
       continue;
     }
     celer::Connection* connection = *accepted;
+    if (!core->listening_) {
+      if (connection != nullptr && connection->file_.fd_ >= 0) {
+        (void)::shutdown(connection->file_.fd_, SHUT_RDWR);
+      }
+      worker.BeginClose(connection,
+                        absl::CancelledError("ctl listener is shutting down"),
+                        celer::CloseMode::kLocalClose);
+      if (core->shutdown_accept_wake_fd_ >= 0) {
+        (void)::shutdown(core->shutdown_accept_wake_fd_, SHUT_RDWR);
+        (void)::close(core->shutdown_accept_wake_fd_);
+        core->shutdown_accept_wake_fd_ = -1;
+      }
+      (void)core->listener_.Close();
+      break;
+    }
     core->sessions_.push_back(connection);
     worker.Spawn(SessionLoop(core, celer::TcpStream(connection), connection));
   }
+  if (core->shutdown_accept_wake_fd_ >= 0) {
+    (void)::shutdown(core->shutdown_accept_wake_fd_, SHUT_RDWR);
+    (void)::close(core->shutdown_accept_wake_fd_);
+    core->shutdown_accept_wake_fd_ = -1;
+  }
+  (void)core->listener_.Close();
+  core->accept_loop_running_ = false;
+  NotifyCtlShutdownDrained(*core);
   co_return absl::OkStatus();
 }
 
@@ -1813,6 +2527,7 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
       if (*it == connection) {
         *it = sessions.back();
         sessions.pop_back();
+        NotifyCtlShutdownDrained(*core);
         return;
       }
     }
@@ -1891,15 +2606,48 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
       pending.erase(0, newline + 1);
       // One in-flight command per connection: replies stay FIFO and the
       // gate driver is synchronous per connection anyway.
+      std::size_t retained_status_bytes = 0;
       std::string reply = co_await DispatchCommand(
           core->server_, core->state_machine_, core->coordinator_,
           core->obs_store_, core->foreign_executor_, *core->proposal_executor_,
           core->membership_gate_, *identity, authenticated,
-          core->options_.local_data_control_endpoint_, line);
+          core->options_.local_data_control_endpoint_,
+          core->options_.local_ctl_endpoint_,
+          core->options_.cluster_status_service_,
+          core->options_.data_control_runtime_status_,
+          core->options_.observation_ttl_ms_, &retained_status_bytes, line);
       reply.push_back('\n');
+      std::unique_ptr<cluster::control::ControlDeadlineWatchdog>
+          status_write_deadline;
+      if (retained_status_bytes != 0) {
+        status_write_deadline =
+            std::make_unique<cluster::control::ControlDeadlineWatchdog>(
+                *core->worker_, [connection] {
+                  // Closing the native transport wakes either a plaintext or
+                  // TLS WriteAll without coupling Admin backpressure to Data
+                  // heartbeat progress on this shared worker.
+                  if (connection != nullptr && connection->file_.fd_ >= 0) {
+                    (void)::shutdown(connection->file_.fd_, SHUT_RDWR);
+                  }
+                });
+        if (absl::Status armed =
+                status_write_deadline->Arm(kClusterStatusSendDeadline);
+            !armed.ok()) {
+          core->options_.cluster_status_service_->Release(
+              retained_status_bytes);
+          drop = true;
+          break;
+        }
+      }
       const absl::Status written =
           co_await stream.WriteAll(std::span<const std::byte>(
               reinterpret_cast<const std::byte*>(reply.data()), reply.size()));
+      if (status_write_deadline != nullptr) {
+        (void)status_write_deadline->Disarm();
+      }
+      if (retained_status_bytes != 0) {
+        core->options_.cluster_status_service_->Release(retained_status_bytes);
+      }
       if (!written.ok()) {
         drop = true;
         break;

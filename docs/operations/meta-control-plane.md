@@ -5,7 +5,7 @@
 Build the separate Meta executable and its operator client with:
 
 ```sh
-cmake --build <build-dir> --target keylane-meta keylane-meta-ctl
+cmake --build <build-dir> --target keylane-meta keylane-meta-ctl keylane-cluster
 ```
 
 A cluster normally has three `keylane-meta` processes. Every process needs:
@@ -16,10 +16,15 @@ A cluster normally has three `keylane-meta` processes. Every process needs:
 - A distinct numeric `--data-control-addr` for the process-lifetime listener
   used by Data nodes. This endpoint is committed with membership and returned
   by every Meta seed; it must remain stable across restart.
+- A concrete numeric `--ctl-addr` for remote Admin access and leader discovery
+  before the cluster grows beyond one voter. It is both the actual bind and
+  committed address; wildcard hosts and port zero are rejected. Changing it
+  requires removing/retiring the member and joining a fresh server id.
 - A private `--data-dir`. Never share a directory between members or reuse it
   with another id.
-- A local administrative Unix socket, defaulting to
-  `<data-dir>/meta-admin.sock`.
+- At least one Admin listener. Omit both Admin options to use the local Unix
+  socket at `<data-dir>/meta-admin.sock`; use only `--ctl-addr` for a TCP-only
+  member, or specify both options to expose both transports.
 
 Create the data directory as the service account with mode 0700. The control
 socket itself is mode 0600 and authenticates the caller with Linux
@@ -30,6 +35,10 @@ is a separate option: `--ctl-addr` uses plaintext TCP unless all three
 `--ctl-tls-*` arguments are supplied. Partial TLS configuration fails startup
 instead of silently downgrading. A plaintext listener grants operator access to
 any reachable peer, so expose it only on loopback or a trusted private network.
+When both `--ctl-socket` and `--ctl-addr` are explicitly provided, both
+listeners start and share command dispatch, authorization, status capture, and
+limits; failure of either listener rolls back the process startup. Naming only
+one enables only that transport. Omitting both enables the default Unix socket.
 
 Only the first process of a new cluster is started with `--bootstrap`. A fresh
 process without `--bootstrap` opens its listener and waits to be invited; merely
@@ -53,6 +62,28 @@ is five seconds and `--timeout-ms` changes the whole connect/send/receive
 deadline. Query every live member when locating the leader; the leader's reply
 contains `leader=1`, while mutation requests sent to a follower return
 `ERR not-leader`.
+
+For cluster-wide readiness, use `keylane-cluster status`. It queries the seed
+for the current leader and requests one leader-bracketed status cut; it does
+not probe followers or claim their reachability or replication progress:
+
+```sh
+keylane-cluster status \
+  --socket /var/lib/keylane/meta-1/meta-admin.sock
+
+keylane-cluster status --addr 10.0.0.11:7200 \
+  --allow-plaintext-admin --json
+```
+
+The first human-readable line is `READY`, `NOT READY`, or `RETRYABLE`.
+Corresponding exits are 0, 2, and 3; invalid options, unsafe transport choices,
+TLS/identity failures, incompatible wire data, and corrupt status exit 1 with
+empty stdout. TCP without TLS always requires `--allow-plaintext-admin`.
+Supplying `--tls-ca`, `--tls-cert`, and `--tls-key` together enables mTLS for
+the seed and every learned address, with the address verified against the
+server certificate's IP SAN. There is no plaintext/TLS fallback. One absolute
+deadline, five seconds by default, covers discovery, redirects, capture, and
+response I/O.
 
 For plaintext remote administration, configure a listener and connect without
 TLS arguments:
@@ -87,16 +118,22 @@ install -d -m 0700 "$META_ROOT" \
 
 "$META_BIN" --id 1 --addr 127.0.0.1:7101 \
   --data-control-addr 127.0.0.1:7301 \
+  --ctl-addr 127.0.0.1:7201 \
+  --ctl-socket "$META_ROOT/node1/meta-admin.sock" \
   --data-dir "$META_ROOT/node1" --bootstrap \
   >"$META_ROOT/node1.log" 2>&1 &
 
 "$META_BIN" --id 2 --addr 127.0.0.1:7102 \
   --data-control-addr 127.0.0.1:7302 \
+  --ctl-addr 127.0.0.1:7202 \
+  --ctl-socket "$META_ROOT/node2/meta-admin.sock" \
   --data-dir "$META_ROOT/node2" \
   >"$META_ROOT/node2.log" 2>&1 &
 
 "$META_BIN" --id 3 --addr 127.0.0.1:7103 \
   --data-control-addr 127.0.0.1:7303 \
+  --ctl-addr 127.0.0.1:7203 \
+  --ctl-socket "$META_ROOT/node3/meta-admin.sock" \
   --data-dir "$META_ROOT/node3" \
   >"$META_ROOT/node3.log" 2>&1 &
 ```
@@ -106,12 +143,12 @@ Wait until node 1 reports `leader=1`, then add one waiting member at a time:
 ```sh
 keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" status
 keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
-  addsrv 2 127.0.0.1:7102 127.0.0.1:7302
+  addsrv 2 127.0.0.1:7102 127.0.0.1:7302 127.0.0.1:7202
 
 keylane-meta-ctl --socket "$META_ROOT/node2/meta-admin.sock" status
 
 keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
-  addsrv 3 127.0.0.1:7103 127.0.0.1:7303
+  addsrv 3 127.0.0.1:7103 127.0.0.1:7303 127.0.0.1:7203
 
 keylane-meta-ctl --socket "$META_ROOT/node3/meta-admin.sock" status
 ```
@@ -182,14 +219,19 @@ and the shared CA, for example member 1:
 keylane-meta \
   --id 1 --addr 10.0.0.11:7100 --data-dir /var/lib/keylane/meta-1 \
   --data-control-addr 10.0.0.11:7300 \
+  --ctl-addr 10.0.0.11:7200 \
   --bootstrap \
   --tls-ca /etc/keylane/meta/ca.crt \
   --tls-cert /etc/keylane/meta/meta-1.crt \
-  --tls-key /etc/keylane/meta/meta-1.key
+  --tls-key /etc/keylane/meta/meta-1.key \
+  --ctl-tls-ca /etc/keylane/meta/ca.crt \
+  --ctl-tls-cert /etc/keylane/meta/meta-1.crt \
+  --ctl-tls-key /etc/keylane/meta/meta-1.key
 ```
 
 Use the equivalent member-specific certificate and omit `--bootstrap` for
-members 2 and 3, then join them with both their Raft and Data-control endpoints.
+members 2 and 3, then join them with their Raft, Data-control, and Admin
+endpoints.
 The Data-control listener reuses the same CA, certificate, and key; there is no
 second Data-control TLS option set. `--tls-ca`, `--tls-cert`, and `--tls-key`
 are all-or-nothing; partial TLS configuration fails startup. Start the joiner
@@ -374,7 +416,16 @@ keylane-meta-ctl --addr 10.0.0.11:7200 \
   --tls-cert /etc/keylane/meta/operator-admin.crt \
   --tls-key /etc/keylane/meta/operator-admin.key \
   status
+
+keylane-cluster status --addr 10.0.0.11:7200 \
+  --tls-ca /etc/keylane/meta/ca.crt \
+  --tls-cert /etc/keylane/meta/operator-admin.crt \
+  --tls-key /etc/keylane/meta/operator-admin.key \
+  --json
 ```
+
+Unlike the low-level client, cluster discovery has no DNS server-name
+override: every committed Admin route is numeric and must appear as an IP SAN.
 
 ## Add and remove peers
 
@@ -382,12 +433,12 @@ Membership commands are accepted only by the current leader and only one
 change may be active at a time. To add a peer:
 
 1. Allocate a never-before-used positive id, private data directory, Raft
-   endpoint, and distinct Data-control endpoint. With mTLS, issue its matching
-   certificate first.
+   endpoint, distinct Data-control endpoint, and concrete Admin endpoint. With
+   mTLS, issue its matching certificate first.
 2. Start the new `keylane-meta` process without `--bootstrap`.
 3. On the current leader, run
-   `addsrv <id> <raft-endpoint> <data-control-endpoint>`. A fourth principal
-   argument is accepted but may only be the matching canonical
+   `addsrv <id> <raft-endpoint> <data-control-endpoint> <ctl-endpoint>`. A
+   fifth principal argument is accepted but may only be the matching canonical
    `keylane://meta/<id>`; omitting it selects that value automatically.
 4. Poll the joiner's `status` and verify replicated progress before adding
    another peer or relying on it for quorum.
@@ -396,7 +447,7 @@ For example:
 
 ```sh
 keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
-  addsrv 4 10.0.0.14:7100 10.0.0.14:7300
+  addsrv 4 10.0.0.14:7100 10.0.0.14:7300 10.0.0.14:7200
 ```
 
 The leader first commits and audits the member identity binding, then invokes
@@ -460,8 +511,9 @@ cluster; startup intentionally refuses to guess at a conversion.
 
 ## Binary replacement and format compatibility
 
-Meta has one exact durable format and does not support a mixed-version schema
-window or an in-band format switch. For a binary-only change that preserves the
+Meta durable schema v3 is exact and does not support a mixed-version window or
+an in-band format switch. A v2 data directory is rejected at startup and has no
+in-place migration. For a binary-only change that preserves the
 format, replace one follower at a time, wait for catch-up, and replace the
 leader last. Before any replacement, back up every member and record the
 membership, term, commit index, and snapshot index.

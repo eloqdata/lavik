@@ -84,6 +84,10 @@ struct MetaMemberRecord {
   std::uint32_t server_id_ = 0;
   std::string principal_;
   std::string data_control_endpoint_;
+  // Null only for a UDS-managed sole bootstrap voter. Once populated this is
+  // immutable; changing a remote administrative identity requires member
+  // replacement instead of an uncoordinated address rewrite.
+  std::optional<std::string> ctl_endpoint_;
   bool retired_ = false;
   bool operator==(const MetaMemberRecord&) const = default;
 };
@@ -117,7 +121,8 @@ class MetaIdentityStore {
 
   // Snapshot support: u16 schema_version envelope + Data-node count/records
   // + Meta-member count/records. A Meta-member record is
-  // (server_id, principal, Data-control endpoint, retired flag).
+  // (server_id, principal, Data-control endpoint, optional ctl endpoint,
+  // retired flag).
   // Serialize cannot fail: the state is bounded and codec-valid by
   // construction (field caps are enforced at apply time). Deserialize is
   // strict and every failure is the fail-stop class, including invariant

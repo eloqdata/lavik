@@ -51,6 +51,7 @@ class Failure(Exception):
 
 
 _TAG = "meta-integration"
+_ALLOCATED_PORTS = set()
 
 
 def set_tag(tag):
@@ -63,11 +64,18 @@ def log(msg):
 
 
 def free_port():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+    # The kernel may immediately return the same ephemeral port after the
+    # probe socket closes. Keep allocations unique within one gate process so
+    # the independently assigned Raft, Data-control, and Admin listeners do
+    # not collide before their nodes start.
+    while True:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        if port not in _ALLOCATED_PORTS:
+            _ALLOCATED_PORTS.add(port)
+            return port
 
 
 def wait_until(desc, timeout, fn):
@@ -103,6 +111,7 @@ class Node:
         self.log_path = os.path.join(workdir, f"node{node_id}.log")
         self.raft_port = free_port()
         self.data_control_port = free_port()
+        self.ctl_port = free_port()
         self.ctl_path = os.path.join(self.data_dir, "meta-admin.sock")
         self.args = list(args) if args is not None else raft_args()
         self.proc = None
@@ -120,6 +129,10 @@ class Node:
     @property
     def data_control_endpoint(self):
         return f"127.0.0.1:{self.data_control_port}"
+
+    @property
+    def ctl_endpoint(self):
+        return f"127.0.0.1:{self.ctl_port}"
 
     def start(self, bootstrap=False, raft_port=None, wait_ready=True):
         """(Re)starts the process; the data dir is always reused, so a
@@ -147,6 +160,7 @@ class Node:
                 "--data-control-addr", self.data_control_endpoint,
                 "--data-dir", self.data_dir,
                 "--ctl-socket", self.ctl_path,
+                "--ctl-addr", self.ctl_endpoint,
             ] + self.args
             if bootstrap:
                 args.append("--bootstrap")
@@ -156,7 +170,8 @@ class Node:
                 args, stdout=self.log_file, stderr=subprocess.STDOUT)
             self.paused = False
             log(f"node {self.id} started (pid {self.proc.pid}, "
-                f"raft {self.raft_port}, ctl {self.ctl_path}, "
+                f"raft {self.raft_port}, ctl {self.ctl_path},"
+                f"{self.ctl_endpoint}, "
                 f"bootstrap={bootstrap}, attempt {attempt + 1})")
             if not wait_ready:
                 return
@@ -888,7 +903,8 @@ def join_and_verify(leader, node, endpoint=None, timeout=30.0):
     invited = False
     while time.monotonic() < deadline:
         reply = leader.ctl(
-            f"addsrv {node.id} {target} {node.data_control_endpoint}")
+            f"addsrv {node.id} {target} {node.data_control_endpoint} "
+            f"{node.ctl_endpoint}")
         acceptable = ("OK", "ERR joining", "ERR config-changing",
                       "ERR already-exists")
         if reply not in acceptable:

@@ -79,7 +79,15 @@
 //                             before acknowledging its replacement FDS.
 //   status                 -> "OK leader=<0|1> id=<n> committed=<idx>
 //                             snapshot_idx=<idx> term=<n>".
-//   addsrv <id> <raft-ip:port> <data-control-ip:port>
+//   clusterhead 1          -> bounded versioned responder/role/term/leader/
+//                             committed-Meta-directory discovery response.
+//                             Any Meta member may answer this operator-only,
+//                             read-only verb.
+//   clusterstatus 1        -> bounded versioned full cluster-status cut from
+//                             the current caught-up Leader, or a typed
+//                             retryable error. Capture is single-flight and
+//                             never probes followers.
+//   addsrv <id> <raft-ip:port> <data-control-ip:port> <ctl-ip:port>
 //          [<keylane://meta/id>]
 //                          -> first commits the member identity, then returns
 //                             "OK" / "ERR <code>" from NuRaft add_srv. The
@@ -181,6 +189,8 @@
 
 #include <sys/types.h>
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -190,6 +200,8 @@
 #include "absl/status/statusor.h"
 #include "celer/runtime/foreign_executor.h"
 #include "celer/runtime/task.h"
+#include "keylane/meta/committed_status_view.h"
+#include "keylane/meta/data_control_runtime_status.h"
 // NuRaft's headers are not -Wpedantic-clean.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
@@ -215,6 +227,69 @@ class MetaProposalExecutor;
 class MetaObservationStore;
 class MetaCoordinator;
 class MetaStateMachine;
+namespace detail {
+
+// Pure representation of both sides of the server's clusterstatus bracket.
+// Keeping comparison free of NuRaft calls makes every invalidating transition
+// directly testable while the capture path remains the sole owner of reads.
+struct MetaClusterStatusBracket {
+  bool is_leader_ = false;
+  bool leader_alive_ = false;
+  std::uint64_t term_ = 0;
+  std::uint64_t config_index_ = 0;
+  std::vector<std::uint32_t> config_server_ids_;
+  std::vector<MetaMemberRecord> active_meta_members_;
+  MetaDataControlLeadershipState leadership_;
+};
+
+bool IsStableClusterStatusBracket(const MetaClusterStatusBracket& before,
+                                  const MetaClusterStatusBracket& after);
+
+}  // namespace detail
+
+// Shared by every configured Admin listener. Capture is single-flight across
+// UDS and TCP, so a second expensive status build fails retryably instead of
+// delaying Data-control heartbeat work on their shared worker.
+class MetaClusterStatusService {
+ public:
+  bool TryBeginCapture() noexcept {
+    if (capture_in_progress_.test_and_set(std::memory_order_acquire)) {
+      return false;
+    }
+    // A response can be almost the full process-wide retained budget. Keep
+    // capture admission closed while any prior reply is queued or sending so
+    // the next build cannot temporarily allocate a second 256 MiB payload.
+    if (retained_reply_bytes_.load(std::memory_order_acquire) != 0) {
+      capture_in_progress_.clear(std::memory_order_release);
+      return false;
+    }
+    return true;
+  }
+  void EndCapture() noexcept {
+    capture_in_progress_.clear(std::memory_order_release);
+  }
+  bool TryRetain(std::size_t bytes) noexcept {
+    std::size_t current = retained_reply_bytes_.load(std::memory_order_relaxed);
+    while (current <= kMaxRetainedReplyBytes -
+                          std::min(bytes, kMaxRetainedReplyBytes)) {
+      if (bytes > kMaxRetainedReplyBytes) return false;
+      if (retained_reply_bytes_.compare_exchange_weak(
+              current, current + bytes, std::memory_order_acquire,
+              std::memory_order_relaxed)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  void Release(std::size_t bytes) noexcept {
+    retained_reply_bytes_.fetch_sub(bytes, std::memory_order_release);
+  }
+
+ private:
+  static constexpr std::size_t kMaxRetainedReplyBytes = 256u << 20;
+  std::atomic_flag capture_in_progress_ = ATOMIC_FLAG_INIT;
+  std::atomic<std::size_t> retained_reply_bytes_{0};
+};
 
 struct MetaCtlServerOptions {
   enum class Transport : std::uint8_t { kUnix, kTcpPlaintext, kTcpMtls };
@@ -233,6 +308,12 @@ struct MetaCtlServerOptions {
   // used when the first membership change binds the bootstrap Raft member
   // into the committed Meta directory.
   std::string local_data_control_endpoint_;
+  // Concrete administrative TCP endpoint committed with the bootstrap
+  // member before the cluster grows beyond one voter.
+  std::string local_ctl_endpoint_;
+  std::shared_ptr<MetaClusterStatusService> cluster_status_service_;
+  std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status_;
+  std::uint32_t observation_ttl_ms_ = 30000;
 };
 
 class MetaCtlServer {
@@ -254,8 +335,8 @@ class MetaCtlServer {
       std::shared_ptr<MetaMembershipGate> membership_gate,
       MetaCtlServerOptions options);
 
-  // Posts shutdown() if it never happened, so sessions cannot outlive the
-  // handle while holding raft references.
+  // Shuts down if needed, so sessions cannot outlive the handle while holding
+  // Raft references. Process assembly destroys this while the worker is live.
   ~MetaCtlServer();
 
   MetaCtlServer(const MetaCtlServer&) = delete;
@@ -279,8 +360,6 @@ class MetaCtlServer {
   static celer::Task<absl::Status> SessionLoop(CorePtr core,
                                                celer::TcpStream stream,
                                                celer::Connection* connection);
-
-  void PostShutdown();
 
   CorePtr core_;
 };
