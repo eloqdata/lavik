@@ -14,6 +14,7 @@
 #include "celer/io/storage.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
+#include "cluster_gate.h"
 #include "keylane/resp.h"
 
 namespace keylane {
@@ -715,10 +716,13 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
                               const storage::CompactValueCallback& callback,
                               storage::ReplicationCommandAppend* replication) {
   const std::string_view key = request.args_[KeyIndex(request.kind_)];
-  if (!digest)
+  if (!digest) {
+    const storage::MutationPrecondition mutation_precondition =
+        ClusterMutationPrecondition(request);
     co_return co_await g_storage->ExecuteCompact(
         request.db_id_, key, storage::ValueType::kStream, read_only, callback,
-        0, replication);
+        0, replication, &mutation_precondition);
+  }
   co_return co_await g_storage->ExecuteCompactLocked(
       request.db_id_, key, *digest, storage::ValueType::kStream, read_only,
       callback, tx, 0, replication);
@@ -748,6 +752,11 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     const storage::Digest* locked_digest = nullptr,
     storage::TxShardWrites* tx = nullptr,
     const CommandRequest* request = nullptr) {
+  const storage::MutationPrecondition mutation_precondition =
+      request != nullptr ? ClusterMutationPrecondition(*request)
+                         : storage::MutationPrecondition{};
+  const storage::MutationPrecondition* mutation_precondition_ptr =
+      request != nullptr && tx == nullptr ? &mutation_precondition : nullptr;
   ReadOneResult result{.entries_ = {}, .cursor_ = cursor};
   const std::uint64_t now = NowMs();
   std::optional<storage::ReplicationCommandAppend> replication;
@@ -848,12 +857,12 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
   if (locked_digest == nullptr) {
     status = co_await g_storage->ExecuteCompact(
         db_id, key, storage::ValueType::kStream, !group_read, callback, 0,
-        replication ? &*replication : nullptr);
+        replication ? &*replication : nullptr, mutation_precondition_ptr);
   } else {
     status = co_await g_storage->ExecuteCompactLocked(
         db_id, key, *locked_digest, storage::ValueType::kStream, !group_read,
         callback, group_read ? tx : nullptr, 0,
-        replication ? &*replication : nullptr);
+        replication ? &*replication : nullptr, mutation_precondition_ptr);
   }
   if (!status.ok()) co_return status;
   if (request != nullptr && !captured_group_args.empty()) {
@@ -1015,6 +1024,21 @@ Task<CommandReply> ExecuteRead(
         error != nullptr) [[unlikely]] {
       co_return Built(builder.AppendError(error));
     }
+    // A top-level XREADGROUP can remain dormant indefinitely but mutates
+    // consumer/PENDING state on each concrete read attempt. Its assignment
+    // guard covers only those owner hops, not waiter registration or sleep
+    // below. EXEC/Lua locked execution already retains its enclosing
+    // transaction/script authority window and must not re-admit one child
+    // against a newer projection midway through that atomic operation.
+    cluster::AuthorityInFlightGuards attempt_authority;
+    if (group_read && owns_attempt_gate) {
+      if (std::optional<CommandReply> fenced =
+              RegisterClusterBlockingWriteAttempt(attempt_request, builder,
+                                                  &attempt_authority);
+          fenced.has_value()) {
+        co_return std::move(*fenced);
+      }
+    }
     std::vector<std::pair<std::string, std::vector<ReadOneResult::Item>>> found;
     for (std::size_t k = 0; k < key_count; ++k) {
       std::string key = a[first_key + k];
@@ -1056,7 +1080,7 @@ Task<CommandReply> ExecuteRead(
              initialize, group_read, group_name, consumer_name,
              is_new = new_messages[k], noack, count, locked_digest, local_tx,
              request_ptr = &attempt_request]() mutable
-                -> Task<absl::StatusOr<ReadOneResult>> {
+            -> Task<absl::StatusOr<ReadOneResult>> {
               co_return co_await ReadOneLocal(
                   db, std::move(key), cursor, initialize, group_read,
                   std::move(group_name), std::move(consumer_name), is_new,
@@ -1070,6 +1094,9 @@ Task<CommandReply> ExecuteRead(
         found.emplace_back(a[first_key + k], std::move(one->entries_));
       }
     }
+    // The awaited owner hops above contain every mutation from this attempt.
+    // Release before the code can register or enter a dormant wait.
+    attempt_authority.clear();
     initialized_dollars = true;
     if (!found.empty()) {
       if (builder.version() == RespVersion::k3)

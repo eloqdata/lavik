@@ -1,7 +1,7 @@
 #pragma once
 
 // MetaStateMachine is the metadata control plane's NuRaft `state_machine`.
-// It owns the committed aggregate `MetaStores` (six stores) and applies every
+// It owns the committed aggregate `MetaStores` (seven stores) and applies every
 // committed entry through
 // the deterministic pure function ApplyCommitted (see state_apply.h).
 //
@@ -44,9 +44,11 @@
 //   newer than the durable stores would silently drop acknowledged writes.
 //
 // Snapshot contract:
-//   - EXACT CUT POINT: create_snapshot() serializes MetaStores under the
-//     state mutex synchronously (KB-scale), so the captured bytes hold the
-//     state of exactly the snapshot's last_log_idx. Automatic snapshots run
+//   - EXACT CUT POINT: create_snapshot() serializes MetaStores under the state
+//     mutex synchronously, so the captured bytes hold the state of exactly the
+//     snapshot's last_log_idx. The aggregate is bounded by
+//     kMaxMetaSnapshotBytes but may be large, and this capture contributes
+//     directly to commit/proposal latency. Automatic snapshots run
 //     on the commit thread at a commit boundary (handle_commit.cxx:
 //     snapshot_and_compact right after sm_commit_index_ advances), and MANUAL
 //     snapshots must go through create_snapshot({serialize_commit_=true}) or
@@ -156,9 +158,10 @@ class MetaStateMachine : public nuraft::state_machine {
   static absl::StatusOr<nuraft::ptr<nuraft::buffer>> EncodeCommand(
       const MetaCommand& command);
 
-  // Atomic copy of the whole committed aggregate (the CommittedView
-  // building block; KB-scale). All six stores move together — readers never
-  // observe a cross-store tear.
+  // Atomic copy of the whole committed aggregate (the CommittedView building
+  // block). All seven stores move together, so readers never observe a
+  // cross-store tear. The copy is bounded by snapshot-format caps but can be
+  // large; hot callers must cache/reuse a view or use targeted queries.
   MetaStores StoresSnapshot() const;
 
   // Targeted read-only queries of the committed state, for the ctl surface
@@ -205,6 +208,12 @@ class MetaStateMachine : public nuraft::state_machine {
                      nuraft::ptr<nuraft::cluster_config>& new_conf) override;
   nuraft::ptr<nuraft::snapshot> last_snapshot() override;
   nuraft::ulong last_commit_index() override;
+  // Highest log index that replaced or applied MetaStores. Raft membership
+  // configuration entries advance last_commit_index() but not this cursor,
+  // because they cannot change a Data node projection.
+  nuraft::ulong state_change_index() const noexcept {
+    return last_state_change_idx_.load(std::memory_order_acquire);
+  }
   void create_snapshot(
       nuraft::snapshot& s,
       nuraft::async_result<bool>::handler_type& when_done) override;
@@ -279,6 +288,7 @@ class MetaStateMachine : public nuraft::state_machine {
   uint64_t receiving_next_obj_ = 0;
 
   std::atomic<uint64_t> last_committed_idx_{0};
+  std::atomic<uint64_t> last_state_change_idx_{0};
   std::atomic<uint64_t> consecutive_snapshot_failures_{0};
 
   // Serializes snapshot file IO between the writer thread and the

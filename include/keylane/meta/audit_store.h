@@ -16,8 +16,9 @@
 // Pruning a prefix does not break verification of what remains: the store
 // keeps the hash of the last pruned record as the new anchor, and exported
 // bytes carry the anchor they chain from, so an external archive can verify
-// continuity across exports. External archives deduplicate by
-// (cluster_id, raft_log_index, record_hash).
+// continuity across exports. Keylane deliberately has no persisted cluster
+// identity; an external archive supplies its own deployment namespace and
+// deduplicates records within it by (raft_log_index, record_hash).
 //
 // Replay idempotency: appending an index already in the window with identical
 // content is a no-op. Append of an existing index with DIFFERENT content, an
@@ -61,8 +62,9 @@
 
 namespace keylane::meta {
 
-// Per-record field caps (v1 policy values; the encoded schema does not depend
-// on them). The principal cap is the identity layer's kMaxMetaPrincipalBytes.
+// Per-record field caps (deployment-policy values; the encoded schema does
+// not depend on them). The principal cap is the identity layer's
+// kMaxMetaPrincipalBytes.
 inline constexpr std::uint32_t kMaxMetaAuditSummaryBytes = 2048;
 inline constexpr std::uint32_t kMaxMetaAuditDetailBytes = 2048;
 inline constexpr std::uint32_t kMaxMetaAuditReadableTimeBytes = 128;
@@ -115,7 +117,8 @@ class MetaAuditStore {
   std::uint32_t capacity() const { return window_capacity_; }
 
   // Full-window state gated by the coordinator's Propose layer: privileged
-  // proposals return RESOURCE_EXHAUSTED until the operator exports records.
+  // proposals return RESOURCE_EXHAUSTED until the operator exports and prunes
+  // records.
   bool NeedsExport() const {
     return policy_ == MetaAuditPolicy::kStrictExport &&
            window_.size() >= window_capacity_;
@@ -137,8 +140,8 @@ class MetaAuditStore {
   // floor fail stop (see Append).
   std::uint64_t pruned_floor() const { return pruned_floor_; }
 
-  // Versioned byte drain of every window record with log_index <= through,
-  // for ctl-side external archival. A pure read; the
+  // Read-only versioned encoding of every window record with
+  // log_index <= through for ctl-side external archival. The
   // blob carries the anchor it chains from plus per-record chain hashes.
   absl::StatusOr<std::string> ExportThrough(std::uint64_t through) const;
 

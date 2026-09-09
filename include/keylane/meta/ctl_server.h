@@ -16,7 +16,7 @@
 // reply line per command, processed strictly in order per connection.
 // Committed writes use the metadata command schema
 // (commands.h); generic KV verbs are not part of this surface:
-//   submitop <id32hex> <kind> <payload>
+//   submitop <id32hex> <kind> <payload> [<history40hex>]
 //                          -> propose SubmitOperation (intent = payload,
 //                             intent_hash = SHA-256(payload)): "OK <log_idx>"
 //                             once committed AND the effect verified in the
@@ -25,7 +25,7 @@
 //                             command; "ERR not-leader" on a follower;
 //                             otherwise "ERR <code>" (replication timeout is
 //                             NuRaft's client_req_timeout_).
-//   completeop <id32hex> <result>
+//   completeop <id32hex> [<result>]
 //                          -> propose CompleteOperation with the record's
 //                             current committed revision as the CAS token;
 //                             same reply shape as submitop. "ERR not-found"
@@ -34,6 +34,12 @@
 //                             proposing. Submitting and immediately
 //                             completing keeps the non-terminal operation set
 //                             tiny and below max_active_operations.
+//   abortop <id32hex> [<reason>]
+//                          -> propose AbortOperation with the same committed
+//                             revision/CAS and effect-verification rules.
+//                             Empty result/reason forms are the zero-growth
+//                             terminalization step admitted by the durability
+//                             fail-safe before archival.
 //   getop <id32hex>        -> "OK submitted" / "OK running" /
 //                             "OK completed <result>" / "OK aborted <reason>"
 //                             / "ERR not-found". Reads the state machine's
@@ -42,15 +48,39 @@
 //                             leader lease check), so a stale follower
 //                             may answer from an older commit index.
 //   registernode <node_id40hex> <principal> <primary|replica>
-//                          -> propose RegisterNode (empty endpoints, zero
-//                             capability mask); reply shape of submitop.
-//                             Backs the identity gate and model coverage.
+//                <data-endpoint> [<data-endpoint>]
+//                          -> propose RegisterNode with zero capability mask;
+//                             reply shape of submitop. Data endpoints are
+//                             numeric host:port values optionally tagged with
+//                             tcp:// or tls://; an active node needs one or
+//                             two before its desired state can be projected.
 //   getnode <node_id>      -> "OK principal=<p> role=<primary|replica>
 //                             revision=<n> retired=<0|1>" / "ERR not-found";
 //                             same non-linearizable read semantics as getop.
+//   putpolicy <policy_id> <version> <content>
+//                          -> commit one immutable policy version; content is
+//                             a whitespace-free token and its SHA-256 is
+//                             computed by this trusted proposer.
+//   setslotmap <first> <last> <group_id> <config_epoch>
+//                          -> replace the absolute slot map with one inclusive
+//                             range and set that group's absolute config
+//                             epoch. This deliberately narrow bootstrap form
+//                             does not imply incremental slot mutation.
+//   activateauthority <group_id> <expected_term> <owner_node_id>
+//                     <lease_ms> <policy_id> <policy_version>
+//                     <new_authority_version> <new_config_epoch>
+//                          -> atomically activate the committed owner/grant;
+//                             the topology epoch is derived from the local
+//                             committed snapshot and every other CAS/absolute
+//                             value remains explicit operator input.
+//   fencegroup <group_id> <expected_term>
+//                          -> commit FenceGroup under the current term. Data
+//                             sessions fence and drain the superseded anchor
+//                             before acknowledging its replacement FDS.
 //   status                 -> "OK leader=<0|1> id=<n> committed=<idx>
 //                             snapshot_idx=<idx> term=<n>".
-//   addsrv <id> <ip:port> [<keylane://meta/id>]
+//   addsrv <id> <raft-ip:port> <data-control-ip:port>
+//          [<keylane://meta/id>]
 //                          -> first commits the member identity, then returns
 //                             "OK" / "ERR <code>" from NuRaft add_srv. The
 //                             optional principal defaults to the canonical
@@ -62,6 +92,8 @@
 //   pruneaudit <through>   -> replicated prefix prune; callers must durably
 //                             store the matching export first.
 //   exportoperations      -> "OK <hex>" versioned archived-operation export.
+//   archiveoperations <seq>... -> move the named terminal live records into
+//                                  bounded archive summaries.
 //   pruneoperations <seq>... -> replicated tombstone prune; callers must
 //                                durably store the export first.
 //   snapshot               -> "OK <idx>" / "ERR snapshot-failed"; wraps
@@ -76,37 +108,38 @@
 //                             a later asynchronous write failure only skips
 //                             this compaction round.
 //
-// Observation surface: MetaObservationStore is volatile and
-// leader-local, so this whole verb family manipulates process-local state —
-// nothing here is replicated:
-//   creategroup <group_id> / begingroupterm <group_id> <expected> <new> /
-//   transitionop <id32hex> <phase> <history>
-//                          -> committed-state drivers so the gates can build
-//                             the term/manifest/history anchors observation
-//                             freshness checks match against; same propose +
-//                             effect-verification reply shape as submitop.
-//                             transitionop appends an evidence summary whose
-//                             replication_history_id is what later anchors
-//                             `obs evidence` (HistoryBoundToOperation).
-//   adoptsession <node_id> <boot_hex32> <gen>
+// creategroup, assignnode, begingroupterm, and transitionop are also typed,
+// committed-state drivers used by operators and gates to build the anchors
+// against which observation freshness is checked. transitionop appends an
+// evidence summary whose replication_history_id is what later anchors
+// `obs evidence` (HistoryBoundToOperation).
+//
+// Observation surface: MetaObservationStore is volatile and leader-local, so
+// this whole verb family manipulates process-local state — nothing here is
+// replicated:
+//   adoptsession <node_id> <boot_hex40> <gen>
 //                          -> MetaObservationStore::AdoptSession with the
 //                             transport-authorized session identity; "OK" /
 //                             "ERR <detail>".
-//   obs boot <node_id> <boot_hex32> <gen>
-//   obs health <node_id> <boot_hex32> <gen> <health>
-//   obs candidate <node_id> <boot_hex32> <gen> <group> <term> <manifest>
-//                 <history> <flow> <backlog> <readiness>
-//   obs evidence <node_id> <boot_hex32> <gen> <op32hex> <phase> <evidence>
-//                <group> <term> <manifest> <history>
+//   obs boot <node_id> <boot_hex40> <gen>
+//   obs health <node_id> <boot_hex40> <gen> <health>
+//   obs candidate <node_id> <boot_hex40> <gen> <group> <term> <manifest>
+//                 <partition_epoch> <history40hex> <flow> <backlog> <readiness>
+//   obs evidence <node_id> <boot_hex40> <gen> <op32hex> <phase> <evidence>
+//                <group> <term> <manifest> <partition_epoch> <history40hex>
 //                          -> one Ingest each (fields map 1:1 onto the
 //                             envelope payloads of observation_store.h;
+//                             candidate reporter/assignment identity is
+//                             derived from the trusted session identity and
+//                             the same committed snapshot used for admission;
 //                             evidence_hash is computed as SHA-256(evidence)
 //                             by the ctl, not taken from the wire). "OK" on
 //                             admission, "ERR <detail>" on rejection — every
 //                             rejection also lands in the audit ring.
 //   observations           -> "OK total=<n>"; observations <group_id> ->
 //                             "OK candidates=<n>" plus one
-//                             term=<t>,manifest=<m>,history=<h>,readiness=<r>
+//                             node=<n>,assignment=<a>,term=<t>,manifest=<m>,
+//                             partition_epoch=<p>,history=<h>,readiness=<r>
 //                             token per fresh candidate (read paths re-filter
 //                             against the current committed snapshot).
 //   obsaudit               -> "OK events=<n>" plus one
@@ -195,6 +228,11 @@ struct MetaCtlServerOptions {
   std::string tls_ca_cert_file_;
   std::string tls_cert_file_;
   std::string tls_key_file_;
+
+  // Advertised endpoint of this process's Data Node control listener. It is
+  // used when the first membership change binds the bootstrap Raft member
+  // into the committed Meta directory.
+  std::string local_data_control_endpoint_;
 };
 
 class MetaCtlServer {

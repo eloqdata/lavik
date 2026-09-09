@@ -8,8 +8,8 @@
 // the fenced flag. INVARIANT: fenced_ == (no grant). A group is created
 // fenced and grantless; BeginGroupTerm(T) is the only term-advancing command
 // and re-enters the fenced/grantless state; ActivateAuthority installs a grant
-// under the CURRENT term (it deliberately carries no new term) and unfences;
-// RevokeGrant/FenceGroup drop the grant and fence.
+// under the CURRENT nonzero term (it deliberately carries no new term) and
+// unfences; RevokeGrant/FenceGroup drop the grant and fence.
 //
 // authority_version strictly increases per group across activations and
 // survives revocation (last_authority_version_ is kept when the grant is
@@ -18,10 +18,13 @@
 // Command semantics (all absolute values, with CAS via expected_* fields):
 //   - BeginGroupTerm(expected=T-1, new=T): T must be exactly expected+1 and
 //     expected must equal the current term; promotes and fences.
-//   - GrantAuthority: same-owner lease renewal. CAS on term and
-//     authority_version; owner and term never change. The policy reference's
-//     existence in the policy store is a cross-store fact the apply dispatcher
-//     checks (this store records the reference and answers PolicyInUse).
+//   - GrantAuthority: same-owner committed grant-spec update (distinct from
+//     the heartbeat path's memory-only lease renewal). CAS on term and
+//     authority_version; owner and term never change. A changed spec records
+//     its committed log index as grant_revision; an exact replay preserves the
+//     prior value. The policy reference's existence in the policy store is a
+//     cross-store fact the apply dispatcher checks (this store records the
+//     reference and answers PolicyInUse).
 //   - ActivateAuthority: the failover/migration atomic commit point. Split
 //     into ValidateActivate (pure, all rejections) and ApplyGrantPart (the
 //     install) so the apply dispatcher can atomically write the topology-store
@@ -35,8 +38,10 @@
 // must reproduce the same verdict and state. Each command first checks
 // whether its post-effect is already present with identical content and then
 // accepts as a no-op; only genuinely conflicting content is rejected (a
-// kDomainReject absl::Status). GrantAuthority/RevokeGrant/FenceGroup are
-// naturally idempotent (their CAS tokens do not move on apply);
+// kDomainReject absl::Status). A semantic no-op never moves a CAS token.
+// GrantAuthority records the current committed log index as grant_revision
+// when its spec changes; an exact renewal replay preserves the first index.
+// RevokeGrant/FenceGroup do not advance term or authority-version tokens;
 // BeginGroupTerm and ActivateAuthority carry explicit already-applied checks.
 //
 // Cross-store invariants (grant vs topology owner/epochs, policy reference
@@ -67,6 +72,9 @@ struct MetaGroupGrant {
   std::string owner_;  // node_id
   std::uint64_t term_ = 0;
   std::uint64_t authority_version_ = 0;
+  // Raft apply index of the activation or last committed spec change.
+  // Heartbeat lease renewal is ephemeral and never changes this value.
+  std::uint64_t grant_revision_ = 0;
   MetaGrantSpec spec_;  // lease parameters + committed policy reference
   bool operator==(const MetaGroupGrant&) const = default;
 };
@@ -76,6 +84,9 @@ struct MetaGroupGrantState {
   std::uint64_t group_term_ = 0;
   // Survives revocation; strictly increases on each ActivateAuthority.
   std::uint64_t last_authority_version_ = 0;
+  // Retained while fenced so any later activation must advance beyond the
+  // rejected authority anchor.
+  std::uint64_t last_grant_revision_ = 0;
   std::optional<MetaGroupGrant> grant_;  // absent == fenced (invariant)
   bool fenced_ = true;
   bool operator==(const MetaGroupGrantState&) const = default;
@@ -94,13 +105,19 @@ class MetaGrantStore {
   absl::Status RemoveGroup(std::string_view group_id);
 
   absl::Status BeginGroupTerm(const BeginGroupTerm& command);
-  absl::Status GrantAuthority(const GrantAuthority& command);
+  // A changed grant spec records committed_index as grant_revision; an exact
+  // replay is a no-op and preserves the original revision.
+  absl::Status GrantAuthority(const GrantAuthority& command,
+                              std::uint64_t committed_index);
   // Pure validation of ActivateAuthority; every rejection lives here.
-  absl::Status ValidateActivate(const ActivateAuthority& command) const;
-  // Installs the grant part of ActivateAuthority. Caller must have run
-  // ValidateActivate successfully for the same command against the current
-  // state; a term mismatch here is an apply-layer bug and fails stop.
-  absl::Status ApplyGrantPart(const ActivateAuthority& command);
+  absl::Status ValidateActivate(const ActivateAuthority& command,
+                                std::uint64_t committed_index) const;
+  // Installs the grant part of ActivateAuthority, using committed_index as
+  // the new grant_revision. Caller must have run ValidateActivate successfully
+  // for the same command and index against the current state; a term mismatch
+  // here is an apply-layer bug and fails stop.
+  absl::Status ApplyGrantPart(const ActivateAuthority& command,
+                              std::uint64_t committed_index);
   absl::Status RevokeGrant(const RevokeGrant& command);
   absl::Status FenceGroup(const FenceGroup& command);
 
@@ -122,14 +139,15 @@ class MetaGrantStore {
   struct Entry {
     std::uint64_t group_term_ = 0;
     std::uint64_t last_authority_version_ = 0;
+    std::uint64_t last_grant_revision_ = 0;
     std::optional<MetaGroupGrant> grant_;
     bool fenced_ = true;
   };
 
   // The already-applied check of ActivateAuthority: the installed grant is
   // exactly what the command asks for.
-  static bool GrantMatches(const Entry& entry,
-                           const ActivateAuthority& command);
+  static bool GrantMatches(const Entry& entry, const ActivateAuthority& command,
+                           std::uint64_t committed_index);
 
   std::uint32_t max_groups_;
   std::map<std::string, Entry> groups_;

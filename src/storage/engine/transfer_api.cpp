@@ -271,14 +271,16 @@ StorageEngine::Impl::ReadValueForTransferLocked(std::uint8_t db_id,
 Task<absl::Status> StorageEngine::Impl::WriteValueForTransferLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const TransferValue& value, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   if (!value.reader_)
     co_return co_await WriteRawValueLocked(db_id, key, digest, value.metadata_,
-                                           tx, replication);
+                                           tx, replication,
+                                           mutation_precondition);
   auto restored = co_await RestoreCollectionValueLocked(
       db_id, key, digest, value.metadata_.value_type_,
       value.metadata_.expire_at_ms_, true, value.metadata_.logical_size_,
-      value.reader_, tx, replication);
+      value.reader_, tx, replication, mutation_precondition);
   co_return restored.ok() ? absl::OkStatus() : restored.status();
 }
 
@@ -290,9 +292,11 @@ Task<absl::StatusOr<TransferValue>> StorageEngine::ReadValueForTransferLocked(
 Task<absl::Status> StorageEngine::WriteValueForTransferLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const TransferValue& value, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   return impl_->WriteValueForTransferLocked(db_id, key, digest, value, tx,
-                                            replication);
+                                            replication,
+                                            mutation_precondition);
 }
 
 }  // namespace keylane::storage

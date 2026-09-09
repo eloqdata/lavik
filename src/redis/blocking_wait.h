@@ -14,6 +14,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "celer/runtime/task.h"
+#include "keylane/cluster/authority.h"
 #include "keylane/command.h"
 
 namespace keylane {
@@ -60,6 +61,14 @@ using BlockingAttempt =
 using BlockingReplyFactory = std::function<CommandReply()>;
 using BlockingStatusReplyFactory =
     std::function<CommandReply(const absl::Status&)>;
+
+// Re-admits one concrete blocking-write attempt and atomically registers its
+// assignment in-flight guards. A successful caller retains `guards` only
+// while touching storage; dormant waiter registration and sleep must happen
+// after clearing or destroying them so a control-plane fence can drain.
+std::optional<CommandReply> RegisterClusterBlockingWriteAttempt(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    cluster::AuthorityInFlightGuards* guards);
 
 absl::StatusOr<std::optional<std::chrono::steady_clock::time_point>>
 BlockingDeadlineFromSeconds(double timeout_seconds);

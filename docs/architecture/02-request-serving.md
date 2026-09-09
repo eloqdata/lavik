@@ -124,9 +124,14 @@ racing closure is either rejected or remains visible to the drain.
    manages database and replication gates, then calls the relevant local,
    storage, transaction, blocking, RDB, or administrative handler. In cluster
    mode, admitted writes re-check their authority against the current
-   `ServingState` after these suspending admissions and before the handler
-   runs; transactional writes re-check per shard through a validator hook on
-   `tx::Transaction` instead.
+   `ServingState` after these outer admissions and before the handler runs;
+   transactional writes also re-check per shard through a validator hook on
+   `tx::Transaction`. Because a handler can still suspend on key/store locks,
+   reads, or block allocation, every logical keyspace write carries a
+   storage-neutral `MutationPrecondition`. `StorageEngine` evaluates it after
+   that preparation and immediately before invalidating WATCH or changing the
+   staging buffer/index; rollback, background maintenance, and replica replay
+   do not depend on client authority.
 7. The service writes a normal encoded reply, a direct storage-backed value, or
    bounded chunks. Small pipeline replies are coalesced up to 64 KiB.
 
@@ -174,10 +179,16 @@ releases all leases before relocation retries or the next wave, while external,
 in-memory, remote-owner, or stale-location cases use the complete single-key
 fallback path.
 
-Blocking List, Sorted Set, and Stream commands release database admission while
-waiting and reacquire it for each concrete attempt. Their waiter registry and
-readiness events are implemented in the Redis subsystem, while storage remains
-the source of truth checked after wakeup.
+Top-level blocking List and Sorted Set writes and `XREADGROUP` release database
+admission while waiting and reacquire it for each concrete attempt. In cluster
+mode they also re-admit and register a fresh authority in-flight guard for that
+attempt, then release the guard before waiter registration or sleep. Immediate
+EXEC and Lua forms do not wait and stay within their enclosing authority
+window. Read-only `XREAD` and keyless `WAIT` register no mutation guard. The
+waiter registry and readiness events are implemented in the Redis subsystem,
+while storage remains the source of truth checked after wakeup. This
+attempt-scoped ownership lets fencing drain promptly even when a client waits
+without a timeout.
 
 External data commands capture the replication manager's packed
 serving-generation/open token at dispatch and revalidate it after obtaining
@@ -285,8 +296,13 @@ preventing scripts from probing disabled libraries. Ordinary commands do not
 take this worker-local Lua gate. Once an invocation exceeds
 `lua-time-limit`, however, a process-wide busy flag makes ordinary non-replay
 commands return `BUSY`; the matching `SCRIPT KILL` or `FUNCTION KILL` and
-`FUNCTION STATS` remain available. An invocation that has written or came from
-replication cannot be killed in a way that would expose partial effects.
+`FUNCTION STATS` bypass the ordinary execution gates and remain admissible.
+Lua 5.1 cannot yield across a protected-call C boundary, however, so a script
+that repeatedly catches its instruction-hook error can monopolize its worker.
+A kill connection accepted by that same worker cannot be read until the
+invocation yields; callers must retry through another connection while this
+worker-affinity limitation remains. An invocation that has written or came
+from replication cannot be killed in a way that would expose partial effects.
 
 ## Pub/Sub mode
 
@@ -381,6 +397,7 @@ real server executable.
 | Static command classification and key extraction | `include/keylane/command_table.h`, `src/redis/command_table.cpp` |
 | Admission, role checks, database/replication gates, transaction integration, routing, and replay | `src/redis/command.cpp` |
 | Cluster admission gate, CLUSTER subcommands, and discovery replies | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_command.cpp` |
+| Final logical-mutation precondition and WATCH/publication seam | `include/keylane/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp` |
 | Type-family command handlers | `src/redis/string_command.cpp`, `src/redis/list_command.cpp`, `src/redis/hash_command.cpp`, `src/redis/set_command.cpp`, `src/redis/zset_command.cpp`, `src/redis/stream_command.cpp`, `src/redis/sort_command.cpp` |
 | Blocking waiter ownership and wakeups | `src/redis/blocking_wait.h`, `src/redis/blocking_wait.cpp` |
 | Worker-local Lua VM, script cache, Function runtime staging, invocation state, and command re-entry | `src/redis/lua_eval.h`, `src/redis/lua_eval.cpp`, `src/redis/command.cpp` |

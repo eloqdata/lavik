@@ -12,9 +12,9 @@ captures committed logical effects; and the storage engine owns the source
 backlog, full-sync capture state, target rebuild state, and durable state.
 In cluster mode that deep group also owns one boot-scoped population identity
 and readiness proof. Its callable cluster adapter binds the proof to the native
-reset, transfer, cut, promotion, and abort path.
-The process does not receive Meta directives over a control-plane transport;
-external control integration calls the adapter rather than bypassing it.
+reset, transfer, cut, promotion, and abort path. The Data-side node controller
+is the only caller for Meta-delivered rebuild, source-authorization, and
+revocation directives; transport code cannot bypass the replication adapter.
 
 Replication moves deterministic logical commands, snapshot records, and the
 process-global Redis Function catalog, not physical block addresses or record
@@ -104,26 +104,61 @@ reported as `slave_priority`; Sentinel treats zero as ineligible and otherwise
 prefers the lower value. Sentinel-specific transaction handling and config
 persistence are described under [Redis interoperability](#sentinel-managed-failover).
 
-### Cluster-managed startup mode
+Process shutdown has a stronger one-way barrier. Before draining accepted
+client writes, a thread-safe request bit prevents reconnect and closes outbound
+target plus inbound native/Redis source sockets. Closing source flows releases
+retained backlog cursors, so a slow downstream cannot leave an admitted
+publisher waiting on its ACK while shutdown waits on that publisher. Worker
+zero then joins native and Redis target apply, aborts incomplete replacement
+roots, joins source exports and control handshakes, and disables source
+history. Storage may start its final freeze/checkpoint only after that barrier
+returns successfully.
 
-`cluster-enabled yes` (or `--cluster-enabled`) selects a separate,
-fail-closed startup mode for a process that may own at most one replication
-group. The manager starts in `connecting`, ordinary reads and writes return
-LOADING, and storage starts without expiration authority. Startup rejects
-`replicaof`, `redis-replicaof`, and `load-rdb`; runtime `REPLICAOF`/`SLAVEOF`
-(including `NO ONE`) and `ADDREPLICAOF` are also rejected. These restrictions
-prevent standalone role control or imported data from being mistaken for an
-authorized cluster population.
+### Meta-managed cluster startup mode
 
-The process has no built-in Meta transport or directive receiver. Instead,
-`ReplicationManager` exposes a callable boundary for the external control
-integration: `cluster_population_status()` reports the local node/boot and the
+`cluster-enabled yes` (or `--cluster-enabled`) together with configured Meta
+seeds selects the fail-closed population mode for a process that may own at
+most one replication group. The manager starts in `connecting`, ordinary reads
+and writes return LOADING, and storage starts without expiration authority.
+All cluster modes reject startup `replicaof`, `redis-replicaof`, and `load-rdb`;
+runtime `REPLICAOF`/`SLAVEOF` (including `NO ONE`) and `ADDREPLICAOF` are also
+rejected, as are unauthenticated native and Redis replication exports. These
+restrictions prevent standalone role control or imported data from being
+mistaken for an authorized cluster population.
+
+The static `nodes.conf` adapter is not Meta-managed population mode. Its file
+is permanent local grant authority and its readiness follows storage recovery.
+After a complete promotion, a static process may therefore expose the durable
+population on restart. An incomplete destructive full sync remains fenced
+because that replacement-in-progress marker is itself durable.
+
+In Meta-managed mode the configured stable data-node identity is also the
+ReplicationManager's local node identity. Status, the boot-scoped
+`ReplicationGroup`, and every native handshake therefore name the same node;
+boot and history identities remain freshly generated process incarnations.
+Standalone and static-file modes generate the local replication node identity
+at process start instead.
+
+`ReplicationManager` exposes a callable boundary to the Data-side node
+controller: `cluster_population_status()` reports the local node/boot and the
 boot-scoped state or ready/failure evidence,
-`ApplyClusterRebuildDirective()` starts one authorized rebuild, and
+`StartClusterRebuildDirective()` admits one authorized rebuild and returns its
+exact completion handle. NodeControl observes that handle later to distinguish
+wire admission from `ReadyToken`, cancellation, or failure; exact replay shares
+the same attempt.
+FDS reconciliation retains an in-progress attempt only while a current rebuild
+directive still names the same local assignment, term, manifest, and partition
+replication epoch. Removing
+that directive or changing the population identity closes serving, joins the
+native session, aborts partial storage, and retires the proof before
+`FullStateApplied`. Control-session loss performs the same barrier for an
+in-progress attempt but retains an already completed matching `ReadyToken`, so
+a transient reconnect does not itself force a full rebuild.
 `AuthorizeClusterRebuildSource()` plus its revocation method control exact
-downstream export capabilities. Meta transport and message adaptation are
-outside this process boundary. Until an external caller supplies a valid
-directive, a cluster-enabled process remains LOADING after recovery. `PING` and
+downstream export capabilities. `MetaControlClientService` receives and
+normalizes the wire directive, but only `NodeControlInstaller` may call this
+boundary after matching it to the installed projection and authority. Until a
+valid directive completes, a Meta-managed process remains LOADING. `PING` and
 the management/diagnostic surfaces needed to observe the process remain
 available, but recovered keyspace is not made readable or writable merely
 because storage initialization succeeded.
@@ -133,13 +168,20 @@ because storage initialization succeeded.
 A cluster data node has one physical dataset and accepts at most one
 replication-group assignment during a process boot. `PopulationManifest`
 content-addresses the desired `(partition, logical epoch)` set; it may be
-empty, sparse, or complete. Its logical epochs belong to the control-plane
-population identity and are distinct from storage's target-local replication
-epochs.
+empty, sparse, or complete. Meta and Data derive that identity from the same
+domain-separated, versioned, big-endian canonical encoding; a manifest
+accepted into committed Meta state therefore has exactly the digest Data
+recomputes while installing the projected full state. The committed group
+also carries a partition
+replication epoch that can advance without changing the manifest. Both values
+belong to the control-plane population identity and are distinct from the
+target-local replication epochs persisted by storage.
 
-One rebuild identity binds the group and assignment, authority term, directive
-revision and authority identity, source node/boot/history, target node/boot,
-operation and attempt, and manifest identity. `BeginRebuild` accepts only the
+One rebuild identity binds the group, distinct target and source membership
+assignments, authority term, directive revision and authority identity, source
+node/boot/history, target node/boot,
+operation, durable directive, execution attempt, manifest revision and digest,
+and partition replication epoch. `BeginRebuild` accepts only the
 local target boot and a matching manifest, rejects assignment to another
 group, and requires the directive's safe-source assertion before returning a
 destructive-reset authorization. Safe source is therefore bound to the
@@ -155,6 +197,16 @@ the replacement capability is installed. Every later proof operation must
 revalidate the complete identity, so an authorization from an older attempt
 cannot complete a replacement attempt.
 
+NodeControl publishes the local population as not ready before entering any
+destructive rebuild admission. Admission and terminal observation are
+separate: the short serialized admission lane may start a newer rebuild while
+the prior attempt's completion observer is pending, allowing
+ReplicationManager to run the supersession barrier above. Source authorization
+and revocation remain serialized against target admission. Completion
+observers are projection- and session-scoped; cancelling an observer never
+fabricates a terminal result or cancels the underlying attempt, which is
+retired only by the explicit ReplicationManager barriers.
+
 The transfer set and physical reset domain are deliberately different. A
 destructive rebuild must reset all 16,384 physical partitions, including
 partitions absent from a sparse desired manifest, so no record outside the
@@ -169,7 +221,7 @@ immutable stable cut for every declared source flow, and storage finalization
 before publishing a boot-scoped ready token. A sparse manifest never permits a
 sparse physical reset.
 
-`ApplyClusterRebuildDirective()` consumes this contract in production. It
+`StartClusterRebuildDirective()` consumes this contract in production. It
 calls `BeginRebuild`, retains the resulting destructive-reset capability, and
 revalidates that capability immediately before each storage reset batch. The
 native flows feed reset epochs and manifest handoffs into the same
@@ -187,20 +239,30 @@ attempt until restart.
 
 A source-side cluster export is separately fail-closed. The control adapter
 may authorize a downstream identity only while the local population has a
-valid ready token for the same group, assignment, and manifest, the native
-dataset is valid, the local role is primary with no upstream, and the directive
-names the current source node, boot, history, and flow layout. Authorization is
-exact to the complete rebuild identity and can be revoked by cancelling and
-joining the affected source sessions. One revision may authorize multiple
-targets only when their group, assignment, authority,
-source incarnation/history, manifest, and flow layout agree. A newer revision
+valid ready token for the same group, manifest, and partition replication
+epoch, the native dataset is valid,
+the local role is primary with no upstream, and the directive names the current
+source node, membership assignment, boot, history, and flow layout. The common
+directive assignment remains target-scoped; a separate source assignment must
+exactly match both the installed FDS member and the source's ready token.
+`NodeControlInstaller` proves both memberships current before crossing this
+boundary. Authorization is exact to the complete rebuild identity and can
+be revoked by cancelling and joining the affected source sessions. One
+revision may authorize multiple targets only when their common group term,
+source membership/boot/history, manifest, partition replication epoch, and flow
+layout agree; each target
+keeps its own assignment and authority identity. A newer revision
 first revokes and joins every older export. Revocation clears active grants but
-retains the accepted directive as a term/revision watermark, removes its
-sessions from the registry, and discards their reconnect leases. The revoked
-revision and any older directive therefore cannot resurrect authority; a
-revocation before any directive was accepted is an idempotent no-op.
-Authorization and revocation share the source-session registry lock, and grants
-stay closed while revoked flows are joined. The
+removes its sessions from the registry, and discards their reconnect leases. A
+committed revoke also retains the accepted term/revision as a rejection floor,
+so that revision and every older directive cannot resurrect authority; a
+revoke before any directive was accepted is an idempotent no-op. Replacing an
+authenticated Meta session uses a distinct cleanup path: it joins the
+predecessor's process-local exports without advancing that floor, and only
+after old-session dispatch is stopped may the replacement session reinstall
+the exact live directives from its authenticated full state. Authorization
+and both cleanup modes share the source-session registry lock, and grants stay
+closed while old flows are joined. The
 safe-source assertion alone does not promote an `Online` follower or permit
 unsupported native cascading. Cluster-primary activation and upstream
 detachment are outside this adapter; without that role transition, source
@@ -218,18 +280,26 @@ no compatibility layout from an earlier deployment. The control hello carries
 the group,
 replica incarnation, replica boot, requested history context, and complete
 Applied vector; the response supplies the source group, boot, history, session,
-and flow count. `Applied[flow]` is the next incomplete logical event and starts
-at one. A flow socket only binds its flow and repeats that component. Mode
+flow count, and a fresh 160-bit flow capability generated from the OS CSPRNG.
+Every `KLFLOW` presents that bearer capability when claiming its flow id; the
+source compares it in constant time before binding the socket. A guessed
+session number therefore cannot steal a flow from the corresponding control
+session. `Applied[flow]` is the next incomplete logical event and starts at
+one. A flow socket binds its flow and repeats that component. Mode
 selection waits for every flow: identical group/history context, the exact
 control-vector component, and complete retained event coverage on every flow
 selects `CONTINUE`; any restart, mismatch, gap, or missing event selects full
 sync for the whole group. Mixed continue/full sessions are not allowed.
 Every native data frame carries a payload CRC32C that the receiver verifies
 before parsing, applying, or acknowledging it. A cluster rebuild additionally
-carries the complete `POPULATION` identity in `KLPSYNC`; the source returns its
-current boot identity and accepts the session only when that identity exactly
-matches an installed source authorization and the connecting target node. A
-cluster-enabled source rejects an anonymous or standalone native export.
+carries the complete `POPULATION` identity, including both target and source
+assignment ids and the partition replication epoch, in `KLPSYNC`; the source
+returns its current boot identity and
+accepts the session only when that identity exactly matches its current ready
+population, an installed source authorization, and the connecting target node.
+A Meta-managed source rejects an anonymous or standalone native export and
+accepts only an exactly authorized `POPULATION` handshake. Static cluster mode
+has no replication lifecycle and rejects every native export.
 
 The steady-state source path is:
 
@@ -646,9 +716,11 @@ and return the node to loading.
 
 ### Exporting to Redis
 
-Redis export is available only while Keylane is a master, requires the replica
-to advertise diskless EOF support, and permits one export connection at a
-time. The exporter closes command gates, starts one RDB snapshot per worker,
+Redis export is available only in standalone mode while Keylane is a master,
+requires the replica to advertise diskless EOF support, and permits one export
+connection at a time. Every cluster mode rejects it because Redis PSYNC cannot
+carry the exact population authorization required by the cluster data plane.
+The exporter closes command gates, starts one RDB snapshot per worker,
 fences every replication log, reopens writes, and streams a bounded-queue RDB
 followed by online backlog events. It snapshots the Function catalog inside
 the same cut and emits Redis 7 `FUNCTION2` entries before the key records.
@@ -705,7 +777,7 @@ reattachment.
 | Setting or command | Current scope and behavior |
 |---|---|
 | `cluster-enabled` / `--cluster-enabled` | One-node-one-group, fail-closed startup; incompatible with startup `replicaof`, `redis-replicaof`, and `load-rdb`; the public manager also ignores a standalone initial upstream supplied by a direct embedder |
-| Cluster control adapter | Callable `ApplyClusterRebuildDirective`, population status, and source authorize/revoke APIs; not a Redis command or an in-process Meta transport |
+| Cluster control adapter | Node-controller-only `StartClusterRebuildDirective` admission/completion handle, population status, and source authorize/revoke APIs; Meta transport remains outside `ReplicationManager` |
 | `replicaof host port` / `REPLICAOF` | Standalone Redis-style config or runtime role change with native-first discovery; rejected in cluster-managed mode |
 | `redis-replicaof host port` / `--redis-replicaof` | Explicit standalone startup Redis PSYNC source; rejected in cluster-managed mode |
 | `ADDREPLICAOF host port` | Standalone runtime addition of a disjoint master from the active Redis Cluster; rejected in cluster-managed mode |
@@ -733,8 +805,9 @@ connection metrics.
 
 ## Invariants, failures, and current limitations
 
-- Role epoch, history ID, session ID, flow LSN, partition mutation sequence,
-  database epoch, and target replication epoch are separate identity domains.
+- Role epoch, history ID, session ID, flow LSN, manifest logical epoch,
+  committed partition replication epoch, database epoch, and target-local
+  replication epoch are separate identity domains.
   None can substitute for another.
 - A cluster-managed process accepts at most one replication-group assignment
   during one boot. Safe-source authority and readiness evidence are bound to
@@ -784,12 +857,16 @@ connection metrics.
   deadlock-free.
 - Redis PSYNC cursors and native continuation cursors do not survive restart.
   Durable target data does not imply crash-resumable replication history.
-- A `ReplicationGroup`, its reset capability, and its ready token are
-  current-boot state. Every cluster restart constructs a new `NOT_READY`
+- A Meta-managed `ReplicationGroup`, its reset capability, and its ready token
+  are current-boot state. Every such restart constructs a new `NOT_READY`
   group and remains LOADING even when storage recovered records written by a
-  prior boot; old directives and proof tokens cannot reactivate them.
-- The callable cluster adapter does not receive, authenticate, or persist Meta
-  messages and does not itself publish candidate state to a quorum.
+  prior boot; old directives and proof tokens cannot reactivate them. The
+  static-file adapter instead trusts its permanent local grant after storage
+  recovery and may reuse a fully promoted population, never an incomplete one.
+- The callable `ReplicationManager` adapter does not receive or authenticate
+  Meta messages and does not itself publish candidate state to a quorum.
+  `MetaControlClientService` owns the authenticated session, while
+  `NodeControlInstaller` is the sole topology/replication mutation seam.
 
 ## Verification and known gaps
 

@@ -27,6 +27,10 @@ namespace keylane {
 
 class BlockingWakeCascade;
 
+namespace cluster {
+class AuthorityAdmission;
+}
+
 namespace tx {
 class Transaction;
 }
@@ -408,12 +412,13 @@ struct alignas(std::max_align_t) CommandRequest {
   std::span<const std::uint16_t> ClusterSlots() const noexcept {
     return {cluster_slot_samples_.data(), cluster_slot_sample_count_};
   }
-  // Mutable: the owner-side re-check re-arms this snapshot after a benign
-  // republish (same serving verdict, refreshed token) so the transaction
-  // hook compares against the fresher state. This is a cache-consistency
-  // update, not a mutation of the request's logical contents, and
-  // ExecuteCommandBody takes the request as const.
-  mutable std::shared_ptr<const cluster::ServingState> cluster_admitted_state_;
+  // Mutable: an owner-side re-check may re-arm a request after an unrelated
+  // control-plane change. The admission is deliberately opaque here: only
+  // AuthorityGuard may interpret its topology, session, lease deadline, and
+  // generation proof. ExecuteCommandBody takes the request as const, while
+  // refreshing this proof does not change the request's logical contents.
+  mutable std::shared_ptr<const cluster::AuthorityAdmission>
+      cluster_authority_admission_;
   std::vector<std::string> args_;
   std::shared_ptr<ReplicationCommandCapture> replication_capture_;
   std::shared_ptr<BlockingNotificationCapture> blocking_notification_capture_;

@@ -152,15 +152,20 @@ def expect_isolated(leader, joiner, history, seq_start, label,
                     evidence_patterns):
     """Invite `joiner`, then prove for ISOLATION_WINDOW_S that the quorum
     keeps committing while the joiner makes zero raft progress."""
-    invite = leader.ctl(f"addsrv {joiner.id} {joiner.endpoint}")
-    H.log(f"{label}: addsrv node {joiner.id} -> {invite}")
-    if invite != "OK":
-        raise H.Failure(f"{label}: addsrv: {invite}")
     if isinstance(evidence_patterns, str):
         evidence_patterns = (evidence_patterns,)
     evidence_label = "|".join(evidence_patterns)
+    # Snapshot the evidence before inviting the peer. The first TLS failure
+    # can be logged before the successful addsrv reply reaches this process;
+    # sampling afterward would misclassify that real failure as old evidence.
     evidence0 = sum(leader.count_log_lines(pattern)
                     for pattern in evidence_patterns)
+    invite = leader.ctl(
+        f"addsrv {joiner.id} {joiner.endpoint} "
+        f"{joiner.data_control_endpoint}")
+    H.log(f"{label}: addsrv node {joiner.id} -> {invite}")
+    if invite != "OK":
+        raise H.Failure(f"{label}: addsrv: {invite}")
     committed0 = leader.committed()
 
     seq = seq_start
@@ -191,8 +196,16 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     if committed1 <= committed0:
         raise H.Failure(f"{label}: quorum committed stalled "
                         f"({committed0} -> {committed1})")
+    # addsrv acknowledges asynchronous join admission, not completion of its
+    # first socket attempt, so wait for bounded, new evidence rather than
+    # racing the log writer at the end of the isolation window.
+    evidence_deadline = time.monotonic() + 5.0
     evidence1 = sum(leader.count_log_lines(pattern)
                     for pattern in evidence_patterns)
+    while evidence1 <= evidence0 and time.monotonic() < evidence_deadline:
+        time.sleep(0.05)
+        evidence1 = sum(leader.count_log_lines(pattern)
+                        for pattern in evidence_patterns)
     if evidence1 <= evidence0:
         raise H.Failure(f"{label}: no '{evidence_label}' evidence in "
                         f"leader log")

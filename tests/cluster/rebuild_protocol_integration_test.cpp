@@ -264,7 +264,7 @@ TEST(RebuildProtocolIntegrationTest,
 }
 
 TEST(RebuildProtocolIntegrationTest,
-     TargetCrashDiscardsPartialAndBootScopedReadinessProof) {
+     TargetCrashDiscardsPartialAndStaticRecoveryUsesPromotedPopulation) {
 #if !KEYLANE_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires a Debug/fault server for the partial handoff pause";
 #endif
@@ -353,16 +353,21 @@ TEST(RebuildProtocolIntegrationTest,
     EXPECT_EQ(target_client.Command({"GET", key}), "$17\r\nsource-population");
   }
 
-  // Even a fully promoted SSD image cannot recreate the current-boot cluster
-  // readiness capability after process loss.
+  // The static adapter's nodes.conf is a permanent local authority, so after
+  // a complete promotion it may expose that durable population again once
+  // storage recovery finishes. This differs from Meta-managed mode, whose
+  // lease and population proof are boot-scoped. The incomplete replacement
+  // above remained fenced because that fence itself is durable.
   target.Stop(SIGKILL);
   target = ChildProcess(cluster_arguments, target_log);
   WaitForStartup(target_port, "promoted cluster target recovery");
   {
     RespClient target_client = Connect(target_port);
-    EXPECT_TRUE(target_client.Command({"GET", key}).starts_with("-LOADING"));
-    EXPECT_TRUE(target_client.Command({"SET", key, "forbidden"})
-                    .starts_with("-LOADING"));
+    WaitUntil("promoted static population ready", 20s, [&] {
+      return target_client.Command({"GET", key}) == "$17\r\nsource-population";
+    });
+    EXPECT_EQ(target_client.Command({"SET", key, "static-authority"}), "+OK");
+    EXPECT_EQ(target_client.Command({"GET", key}), "$16\r\nstatic-authority");
   }
 
   target.Stop(SIGINT);

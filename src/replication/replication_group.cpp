@@ -10,7 +10,6 @@
 #include <optional>
 #include <set>
 #include <string>
-#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -18,45 +17,12 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "keylane/memory.h"
+#include "keylane/population_manifest_format.h"
 
 namespace keylane {
 namespace {
 
-constexpr std::string_view kManifestDomain = "KEYLANE_POPULATION_V1";
-constexpr std::uint16_t kManifestSchemaVersion = 1;
-
 using DigestContext = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
-
-std::array<unsigned char, 2> BigEndianU16(std::uint16_t value) {
-  return {static_cast<unsigned char>(value >> 8),
-          static_cast<unsigned char>(value)};
-}
-
-std::array<unsigned char, 4> BigEndianU32(std::uint32_t value) {
-  return {static_cast<unsigned char>(value >> 24),
-          static_cast<unsigned char>(value >> 16),
-          static_cast<unsigned char>(value >> 8),
-          static_cast<unsigned char>(value)};
-}
-
-std::array<unsigned char, 8> BigEndianU64(std::uint64_t value) {
-  return {static_cast<unsigned char>(value >> 56),
-          static_cast<unsigned char>(value >> 48),
-          static_cast<unsigned char>(value >> 40),
-          static_cast<unsigned char>(value >> 32),
-          static_cast<unsigned char>(value >> 24),
-          static_cast<unsigned char>(value >> 16),
-          static_cast<unsigned char>(value >> 8),
-          static_cast<unsigned char>(value)};
-}
-
-absl::Status UpdateDigest(EVP_MD_CTX* context, const void* data,
-                          std::size_t size) {
-  if (EVP_DigestUpdate(context, data, size) != 1) {
-    return absl::InternalError("failed to hash population manifest");
-  }
-  return absl::OkStatus();
-}
 
 absl::StatusOr<PopulationManifestId> HashManifest(
     std::span<const PopulationManifestEntry> entries) {
@@ -65,23 +31,16 @@ absl::StatusOr<PopulationManifestId> HashManifest(
       EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
     return absl::InternalError("failed to initialize population manifest hash");
   }
-  absl::Status status = UpdateDigest(context.get(), kManifestDomain.data(),
-                                     kManifestDomain.size());
-  if (!status.ok()) return status;
-  const auto schema = BigEndianU16(kManifestSchemaVersion);
-  status = UpdateDigest(context.get(), schema.data(), schema.size());
-  if (!status.ok()) return status;
-  const auto count = BigEndianU32(static_cast<std::uint32_t>(entries.size()));
-  status = UpdateDigest(context.get(), count.data(), count.size());
-  if (!status.ok()) return status;
+  std::vector<PopulationManifestDigestEntry> digest_entries;
+  digest_entries.reserve(entries.size());
   for (const PopulationManifestEntry& entry : entries) {
-    const auto partition =
-        BigEndianU16(static_cast<std::uint16_t>(entry.partition_id_));
-    const auto epoch = BigEndianU64(entry.logical_epoch_);
-    status = UpdateDigest(context.get(), partition.data(), partition.size());
-    if (!status.ok()) return status;
-    status = UpdateDigest(context.get(), epoch.data(), epoch.size());
-    if (!status.ok()) return status;
+    digest_entries.push_back({entry.partition_id_, entry.logical_epoch_});
+  }
+  const std::string digest_input =
+      EncodePopulationManifestDigestInput(digest_entries);
+  if (EVP_DigestUpdate(context.get(), digest_input.data(),
+                       digest_input.size()) != 1) {
+    return absl::InternalError("failed to hash population manifest");
   }
 
   PopulationManifestId id;
@@ -101,9 +60,11 @@ bool IsEmpty(const PopulationManifestId& id) {
 absl::Status ValidateIdentity(const RebuildIdentity& identity) {
   if (identity.group_id_.empty() || identity.assignment_id_.empty() ||
       identity.authority_id_.empty() || identity.source_node_id_.empty() ||
+      identity.source_assignment_id_.empty() ||
       identity.source_boot_id_.empty() || identity.source_history_id_.empty() ||
       identity.target_node_id_.empty() || identity.target_boot_id_.empty() ||
-      identity.operation_id_.empty() || identity.attempt_id_.empty()) {
+      identity.operation_id_.empty() || identity.directive_id_.empty() ||
+      identity.attempt_id_.empty()) {
     return absl::InvalidArgumentError(
         "rebuild identity fields must all be nonempty");
   }
@@ -113,6 +74,10 @@ absl::Status ValidateIdentity(const RebuildIdentity& identity) {
   if (identity.directive_revision_ == 0) {
     return absl::InvalidArgumentError(
         "rebuild directive revision must be nonzero");
+  }
+  if (identity.manifest_revision_ == 0) {
+    return absl::InvalidArgumentError(
+        "population manifest revision must be nonzero");
   }
   if (IsEmpty(identity.manifest_id_)) {
     return absl::InvalidArgumentError("population manifest ID must be nonzero");
@@ -128,12 +93,17 @@ bool SameDirectiveRevisionScope(const RebuildIdentity& left,
          left.directive_revision_ == right.directive_revision_ &&
          left.authority_id_ == right.authority_id_ &&
          left.source_node_id_ == right.source_node_id_ &&
+         left.source_assignment_id_ == right.source_assignment_id_ &&
          left.source_boot_id_ == right.source_boot_id_ &&
          left.source_history_id_ == right.source_history_id_ &&
          left.target_node_id_ == right.target_node_id_ &&
          left.target_boot_id_ == right.target_boot_id_ &&
          left.operation_id_ == right.operation_id_ &&
-         left.manifest_id_ == right.manifest_id_;
+         left.directive_id_ == right.directive_id_ &&
+         left.manifest_revision_ == right.manifest_revision_ &&
+         left.manifest_id_ == right.manifest_id_ &&
+         left.partition_replication_epoch_ ==
+             right.partition_replication_epoch_;
 }
 
 bool IsNewerDirectiveVersion(const RebuildIdentity& candidate,

@@ -426,7 +426,8 @@ Task<absl::StatusOr<SortedSetResult>>
 StorageEngine::Impl::ExecuteSortedSetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const SortedSetOperation& operation, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   const auto valid = Validate(operation);
   if (!valid.ok()) co_return valid;
   auto& store = CurrentStore();
@@ -472,7 +473,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
         (*view) ? std::optional((*view)->version()) : std::nullopt;
     auto read = co_await ExecuteGroupedSortedSetLocked(
         store, partition, db_id, key, digest, operation, std::move(*view), tx,
-        replication);
+        replication, mutation_precondition);
     if (!read.ok() && ReadOnly(operation) && version &&
         (EffectiveRecordDbEpoch(partition, db_id) != version->db_epoch_ ||
          partition.replication_epoch_ != version->replication_epoch_ ||
@@ -627,7 +628,8 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
          operation.kind_ == SortedSetOperationKind::kRemove);
     const auto status = co_await ExecuteCompactLocked(
         db_id, key, digest, ValueType::kSortedSet, ReadOnly(operation),
-        callback, tx, now, replication, prepare_unlocked);
+        callback, tx, now, replication, prepare_unlocked,
+        mutation_precondition);
     if (!status.ok()) co_return status;
     co_return result;
   } catch (const std::bad_alloc&) {
@@ -641,7 +643,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const SortedSetOperation& operation, GroupedHashObject::Handle object,
-    TxShardWrites* tx, ReplicationCommandAppend* replication) {
+    TxShardWrites* tx, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   if (!object || !object->is_ordered() ||
       object->ordered_directory().root().kind_ !=
           OrderedCollectionKind::kSortedSet)
@@ -785,7 +788,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           store, partition, db_id, key, digest,
           SortedSetOperation{.kind_ = SortedSetOperationKind::kRemove,
                              .members_ = removed},
-          object, tx, replication);
+          object, tx, replication, mutation_precondition);
       if (!deleted.ok()) co_return deleted.status();
       result.changed_ = deleted->changed_;
       result.length_ = deleted->length_;
@@ -962,7 +965,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       plan.delete_key_ = true;
       auto written = co_await CommitGroupedOrderedMutationLocked(
           store, partition, db_id, key, digest, object, std::move(plan),
-          object->version().root_.expire_at_ms_, tx, replication);
+          object->version().root_.expire_at_ms_, tx, replication,
+          mutation_precondition);
       if (!written.ok()) co_return written;
       co_return result;
     }
@@ -1101,7 +1105,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     plan.root_.next_group_id_ = next_id;
     auto written = co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(plan),
-        object->version().root_.expire_at_ms_, tx, replication);
+        object->version().root_.expire_at_ms_, tx, replication,
+        mutation_precondition);
     if (!written.ok()) co_return written;
     co_return result;
   } catch (const std::bad_alloc&) {

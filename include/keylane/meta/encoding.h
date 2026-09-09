@@ -48,7 +48,7 @@ namespace keylane::meta {
 
 // ---------------------------------------------------------------------------
 // Hard caps keep all state bounded. Exceeding a cap fails safely and never
-// silently truncates. Values are v1 policy choices; the
+// silently truncates. Values are deployment-policy choices; the
 // encoded schema does not depend on them.
 // ---------------------------------------------------------------------------
 
@@ -57,22 +57,25 @@ inline constexpr std::uint32_t kMaxMetaCommandBytes = 1u << 20;  // 1 MiB
 // One bounded payload blob: policy content, intent, kind_phase_blob, terminal
 // result.
 inline constexpr std::uint32_t kMaxMetaPayloadBytes = 256u * 1024u;  // 256 KiB
-// Registered data nodes.
+// Registered Data nodes or Meta members, per identity registry. The two
+// registries have independent capacity while sharing principal uniqueness.
 inline constexpr std::uint32_t kMaxMetaNodes = 4096;
 // Shard groups.
 inline constexpr std::uint32_t kMaxMetaGroups = 512;
 // Non-terminal operations.
 inline constexpr std::uint32_t kMaxMetaActiveOperations = 4096;
 // Terminal-operation archive summaries kept as the tombstone index; at the
-// cap ArchiveOperations is rejected until the operator exports.
+// cap ArchiveOperations is rejected until the operator exports and prunes
+// retained summaries.
 inline constexpr std::uint32_t kMaxMetaArchivedOperationSummaries = 65536;
 // Retained versions per policy_id.
 inline constexpr std::uint32_t kMaxMetaPolicyVersionsPerPolicy = 32;
 // Total policy content bytes across all policies.
 inline constexpr std::uint32_t kMaxMetaPolicyTotalBytes = 16u << 20;  // 16 MiB
-// Audit window records; when full, privileged Propose fails with
-// RESOURCE_EXHAUSTED until the operator exports; records are never silently
-// dropped.
+// Records retained in the replicated audit window. At capacity, bounded-rotate
+// evicts the oldest record and advances durable loss watermarks, while
+// strict-export gates privileged proposals until the operator exports and
+// prunes; disabled mode suppresses ordinary records.
 inline constexpr std::uint32_t kMaxMetaAuditWindowRecords = 65536;
 // Total snapshot bytes; create_snapshot fails and alerts beyond this.
 inline constexpr std::uint64_t kMaxMetaSnapshotBytes = 512ull << 20;  // 512 MiB
@@ -87,7 +90,10 @@ inline constexpr std::uint64_t kMaxMetaUncompactedWalBytes = 1ull
 // pre-release data directories must be recreated instead of migrated.
 // ---------------------------------------------------------------------------
 
-inline constexpr std::uint16_t kMetaFormatVersion = 1;
+// v2 adds membership incarnation identities, content-addressed population
+// manifests, grant revisions, and complete operation intent/directive state.
+// There is intentionally no v1 migration path for pre-release data dirs.
+inline constexpr std::uint16_t kMetaFormatVersion = 2;
 
 // ---------------------------------------------------------------------------
 // Failure classification. See the file header for the two classes.

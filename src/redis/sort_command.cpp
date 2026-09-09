@@ -427,10 +427,9 @@ Task<absl::StatusOr<bool>> ReplaceDestinationLocked(
     const CommandRequest& request, const LockedKey& destination,
     std::span<const std::string> values, storage::TxShardWrites* writes) {
   auto replace = [&]() -> Task<absl::StatusOr<bool>> {
-    // Choke point 2 for SORT STORE: re-check the captured cluster
-    // admission on the destination owner, immediately before mutating — the
-    // hop itself is the airtight point. Nothing has run yet when it fires, so
-    // the caller can safely answer with a fresh redirect.
+    // Reject obviously stale work before decoding/rebuilding the destination.
+    // The storage precondition inherited through `writes` performs the
+    // authoritative final check after every possible suspension.
     const absl::Status authority = RecheckClusterRequestAuthority(request);
     if (!authority.ok()) co_return authority;
     auto deleted = co_await g_storage->DeleteLocked(
@@ -562,14 +561,15 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
       co_return Built(reply_builder.View());
     }
 
-    // SORT STORE's mutation runs inside ReplaceDestinationLocked's owner hop;
-    // the cluster authority re-check lives there, right before the first
-    // write — the airtight point.
+    // SORT STORE's mutation runs inside ReplaceDestinationLocked's owner hop.
+    // The early authority check avoids wasted work; each storage publication
+    // performs the final check carried by the transaction writes below.
     const std::string& destination_name = request.args_[*options->store_arg_];
     const LockedKey* destination = FindLockedKey(keys, destination_name);
     const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
     std::vector<storage::TxShardWrites> writes(g_storage->worker_count());
-    g_storage->InitializeTxWrites(txid, writes);
+    g_storage->InitializeTxWrites(txid, writes,
+                                  ClusterMutationPrecondition(request));
     writes[destination->owner_].collect_undo_ = true;
     auto replaced = co_await ReplaceDestinationLocked(
         request, *destination, product->stored_values_,
@@ -580,7 +580,9 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
       });
       (void)co_await ReleaseSortTransaction(&transaction);
       if (IsClusterAuthorityChanged(replaced.status())) {
-        // The re-check fired before any write of the destination.
+        // Rollback removed any staged destination record. The outer reply
+        // finalizer still closes conservatively if an earlier publication
+        // passed its final check before a later one rejected the request.
         co_return ClusterAuthorityChangedReply(
             request.ClusterSlots(), request.connection_tls_, reply_builder);
       }
@@ -682,22 +684,28 @@ Task<std::string> ExecuteSortCommandLocked(
       request, *destination, product->stored_values_,
       &tx_writes[destination->owner_]);
   if (!replaced.ok()) {
+    // Command-local compensation must restore the value even when the
+    // admission that rejected the second half of SORT STORE is now stale.
+    const storage::MutationPrecondition bypass_mutation_precondition;
     absl::Status restored;
     if (prior_missing) {
       auto deleted = co_await SubmitTaskTo(
           destination->owner_, [db = request.db_id_, name = destination->name_,
                                 digest = destination->digest_,
-                                writes = &tx_writes[destination->owner_]] {
-            return g_storage->DeleteLocked(db, name, digest, writes);
+                                writes = &tx_writes[destination->owner_],
+                                bypass = &bypass_mutation_precondition] {
+            return g_storage->DeleteLocked(db, name, digest, writes, nullptr,
+                                           bypass);
           });
       restored = deleted.ok() ? absl::OkStatus() : deleted.status();
     } else {
       restored = co_await SubmitTaskTo(
           destination->owner_, [db = request.db_id_, name = destination->name_,
                                 digest = destination->digest_, value = &*prior,
-                                writes = &tx_writes[destination->owner_]] {
+                                writes = &tx_writes[destination->owner_],
+                                bypass = &bypass_mutation_precondition] {
             return g_storage->WriteRawValueLocked(db, name, digest, *value,
-                                                  writes);
+                                                  writes, nullptr, bypass);
           });
     }
     co_return EncodeSortError(restored.ok() ? replaced.status() : restored);

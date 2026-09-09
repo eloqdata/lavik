@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -68,7 +69,87 @@ std::array<std::uint64_t, kCommandLatencyBucketUpperUs.size()>
     g_latency_bucket_upper_ticks{};
 double g_counter_frequency = 1.0;
 
+struct ClusterControlMetrics {
+  std::atomic<std::uint64_t> connected_{0};
+  std::atomic<std::uint64_t> reconnects_{0};
+  std::atomic<std::uint64_t> protocol_errors_{0};
+  std::atomic<std::uint64_t> full_states_applied_{0};
+  std::atomic<std::uint64_t> lease_grants_{0};
+  std::atomic<std::uint64_t> lease_denials_{0};
+  std::atomic<std::uint64_t> lease_expirations_{0};
+  std::atomic<std::uint64_t> directive_successes_{0};
+  std::atomic<std::uint64_t> directive_failures_{0};
+};
+
+ClusterControlMetrics g_cluster_control_metrics;
+
 }  // namespace
+
+void SetClusterControlConnected(bool connected) noexcept {
+  g_cluster_control_metrics.connected_.store(connected ? 1 : 0,
+                                             std::memory_order_relaxed);
+}
+
+void RecordClusterControlReconnect() noexcept {
+  g_cluster_control_metrics.reconnects_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordClusterControlProtocolError() noexcept {
+  g_cluster_control_metrics.protocol_errors_.fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+void RecordClusterControlFullStateApplied() noexcept {
+  g_cluster_control_metrics.full_states_applied_.fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+void RecordClusterControlLeaseGrant() noexcept {
+  g_cluster_control_metrics.lease_grants_.fetch_add(1,
+                                                    std::memory_order_relaxed);
+}
+
+void RecordClusterControlLeaseDenial() noexcept {
+  g_cluster_control_metrics.lease_denials_.fetch_add(1,
+                                                     std::memory_order_relaxed);
+}
+
+void RecordClusterControlLeaseExpiration() noexcept {
+  g_cluster_control_metrics.lease_expirations_.fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+void RecordClusterControlDirectiveResult(bool succeeded) noexcept {
+  std::atomic<std::uint64_t>& counter =
+      succeeded ? g_cluster_control_metrics.directive_successes_
+                : g_cluster_control_metrics.directive_failures_;
+  counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+ClusterControlMetricsSnapshot GetClusterControlMetrics() noexcept {
+  return ClusterControlMetricsSnapshot{
+      .connected_ =
+          g_cluster_control_metrics.connected_.load(std::memory_order_relaxed),
+      .reconnects_ =
+          g_cluster_control_metrics.reconnects_.load(std::memory_order_relaxed),
+      .protocol_errors_ = g_cluster_control_metrics.protocol_errors_.load(
+          std::memory_order_relaxed),
+      .full_states_applied_ =
+          g_cluster_control_metrics.full_states_applied_.load(
+              std::memory_order_relaxed),
+      .lease_grants_ = g_cluster_control_metrics.lease_grants_.load(
+          std::memory_order_relaxed),
+      .lease_denials_ = g_cluster_control_metrics.lease_denials_.load(
+          std::memory_order_relaxed),
+      .lease_expirations_ = g_cluster_control_metrics.lease_expirations_.load(
+          std::memory_order_relaxed),
+      .directive_successes_ =
+          g_cluster_control_metrics.directive_successes_.load(
+              std::memory_order_relaxed),
+      .directive_failures_ = g_cluster_control_metrics.directive_failures_.load(
+          std::memory_order_relaxed),
+  };
+}
 
 std::uint64_t WorkerMetricsSnapshot::TotalCalls() const noexcept {
   std::uint64_t total = 0;
@@ -319,6 +400,8 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
 
   RefreshMemoryDiagnostics();
   const WorkerMetricsSnapshot worker_metrics = co_await CollectWorkerMetrics();
+  const ClusterControlMetricsSnapshot control_metrics =
+      GetClusterControlMetrics();
   const storage::StorageMetricsSnapshot storage_metrics =
       co_await storage.CollectMetrics();
   const storage::DefragTotals defrag = storage.DefragStats();
@@ -423,6 +506,45 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE keylane_replication_flow_connections gauge\n"
       "keylane_replication_flow_connections ",
       worker_metrics.replication_flow_connections_, "\n",
+      "# HELP keylane_cluster_control_connected Whether worker 0 currently "
+      "holds an accepted Meta control session.\n"
+      "# TYPE keylane_cluster_control_connected gauge\n"
+      "keylane_cluster_control_connected ",
+      control_metrics.connected_, "\n",
+      "# HELP keylane_cluster_control_reconnects_total Meta control reconnect "
+      "rounds after the initial attempt.\n"
+      "# TYPE keylane_cluster_control_reconnects_total counter\n"
+      "keylane_cluster_control_reconnects_total ",
+      control_metrics.reconnects_, "\n",
+      "# HELP keylane_cluster_control_protocol_errors_total Control sessions "
+      "closed for invalid framing or protocol state.\n"
+      "# TYPE keylane_cluster_control_protocol_errors_total counter\n"
+      "keylane_cluster_control_protocol_errors_total ",
+      control_metrics.protocol_errors_, "\n",
+      "# HELP keylane_cluster_control_full_states_applied_total Complete Meta "
+      "projections installed by the data node.\n"
+      "# TYPE keylane_cluster_control_full_states_applied_total counter\n"
+      "keylane_cluster_control_full_states_applied_total ",
+      control_metrics.full_states_applied_, "\n",
+      "# HELP keylane_cluster_control_lease_decisions_total Lease decisions "
+      "received from Meta.\n"
+      "# TYPE keylane_cluster_control_lease_decisions_total counter\n"
+      "keylane_cluster_control_lease_decisions_total{decision=\"granted\"} ",
+      control_metrics.lease_grants_, "\n",
+      "keylane_cluster_control_lease_decisions_total{decision=\"denied\"} ",
+      control_metrics.lease_denials_, "\n",
+      "# HELP keylane_cluster_control_lease_expirations_total Locally detected "
+      "control lease expirations.\n"
+      "# TYPE keylane_cluster_control_lease_expirations_total counter\n"
+      "keylane_cluster_control_lease_expirations_total ",
+      control_metrics.lease_expirations_, "\n",
+      "# HELP keylane_cluster_control_directive_results_total Data-side "
+      "directive execution results.\n"
+      "# TYPE keylane_cluster_control_directive_results_total counter\n"
+      "keylane_cluster_control_directive_results_total{result=\"success\"} ",
+      control_metrics.directive_successes_, "\n",
+      "keylane_cluster_control_directive_results_total{result=\"failure\"} ",
+      control_metrics.directive_failures_, "\n",
       "# HELP keylane_storage_defrag_runs_total Completed defrag attempts.\n"
       "# TYPE keylane_storage_defrag_runs_total counter\n"
       "keylane_storage_defrag_runs_total{result=\"success\"} ",

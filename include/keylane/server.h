@@ -81,8 +81,15 @@ struct ServerOptions {
   std::optional<ReplicaOfConfig> replicaof_;
   // Redis Cluster data plane. All startup-only.
   bool cluster_enabled_ = false;
-  // nodes.conf-format static topology shared by every node in the cluster.
+  // Exactly one control source is selected in cluster mode. A static file is
+  // the operator-managed adapter; one or more Meta seeds select the outbound
+  // control-session adapter. The directory learned from Meta is deliberately
+  // process-local and is never persisted by the data node.
   std::string cluster_static_nodes_file_;
+  std::vector<std::string> cluster_meta_seeds_;
+  // Stable 160-bit data-node identity. Required only by the Meta adapter;
+  // boot/session incarnations remain volatile and are generated separately.
+  std::string cluster_node_id_;
   // Advertised client endpoints. 0 port = follow port_ / tls_port_; an empty
   // announce ip keeps the wildcard-bind startup-node convention for self.
   std::string cluster_announce_ip_;

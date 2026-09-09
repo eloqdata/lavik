@@ -69,15 +69,17 @@ bool NeedsGroupedHash(const HashValue& value) {
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const HashOperation& operation, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   return ExecuteHashLikeLocked(db_id, key, digest, operation, ValueType::kHash,
-                               tx, replication);
+                               tx, replication, mutation_precondition);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const HashOperation& operation, ValueType value_type, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const bool replace = operation.kind_ == HashOperationKind::kReplaceOnly;
   if (replace && (value_type != ValueType::kHash || operation.fields_.empty() ||
@@ -233,7 +235,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
        operation.kind_ == HashOperationKind::kPopRandom)) {
     co_return co_await ExecuteGroupedHashRandomLocked(
         store, partition, db_id, key, digest, operation, std::move(grouped),
-        value_type, tx, replication);
+        value_type, tx, replication, mutation_precondition);
   }
   if (grouped != nullptr && operation.kind_ == HashOperationKind::kScan) {
     // Cursors are field digests under the persisted routing seed, not ranks.
@@ -794,6 +796,14 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (value_type == ValueType::kHash &&
         operation.kind_ == HashOperationKind::kSet &&
         !operation.fields_.empty()) {
+      const MutationPrecondition* effective_precondition =
+          mutation_precondition != nullptr
+              ? mutation_precondition
+              : (tx != nullptr ? &tx->mutation_precondition_ : nullptr);
+      if (effective_precondition != nullptr) {
+        absl::Status valid = effective_precondition->Validate();
+        if (!valid.ok()) co_return valid;
+      }
       tx::CurrentTxShard().MarkWatched(db_id, tx::FingerprintOf(digest));
     }
     co_return result;
@@ -824,7 +834,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     absl::Status written = co_await CommitGroupedHashMutationLocked(
         store, partition, db_id, key, digest, grouped, std::move(compact),
         std::vector<HashGroupId>(changed_groups.begin(), changed_groups.end()),
-        result.length_, value_type, expire_at_ms, tx, replication);
+        result.length_, value_type, expire_at_ms, tx, replication,
+        mutation_precondition);
     if (!written.ok()) co_return written;
     co_return result;
   }
@@ -845,7 +856,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       store, partition, db_id, key, digest, payload, kind, published_type,
       kind == RecordKind::kValue ? expire_at_ms : 0, tx,
       kind == RecordKind::kValue ? compact.entries_.size() : 0, nullptr,
-      nullptr, replication);
+      nullptr, replication, nullptr, true, nullptr, mutation_precondition);
   if (!written.ok()) co_return written;
   co_return result;
 }

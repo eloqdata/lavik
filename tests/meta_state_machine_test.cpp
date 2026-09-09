@@ -265,6 +265,21 @@ TEST_F(MetaStateMachineTest, CommitAppliesRealCommands) {
   EXPECT_EQ(machine->last_commit_index(), 2u);
 }
 
+TEST_F(MetaStateMachineTest, LateConfigurationCallbackCannotRegressCursor) {
+  auto opened = Open();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
+
+  Commit(*machine, 2, MakeRegister(0x11));
+  nuraft::ptr<nuraft::cluster_config> config =
+      nuraft::cs_new<nuraft::cluster_config>();
+  machine->commit_config(/*log_idx=*/1, config);
+  EXPECT_EQ(machine->last_commit_index(), 2u);
+
+  machine->commit_config(/*log_idx=*/3, config);
+  EXPECT_EQ(machine->last_commit_index(), 3u);
+}
+
 TEST_F(MetaStateMachineTest, DomainRejectConsumesIndexWithoutStateChange) {
   auto opened = Open();
   ASSERT_TRUE(opened.ok()) << opened.status();

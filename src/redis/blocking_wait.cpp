@@ -512,71 +512,80 @@ unsigned ShardForKey(std::string_view key) {
   return g_storage->OwnerForKey(key);
 }
 
-// Re-admission for blocking commands. A blocking command was
-// admitted at dispatch time, but a topology reload may have fenced its slot
-// while it waited; every attempt re-runs the admission gate against the
-// current ServingState before touching storage. Every user of
-// ExecuteBlockingWaitLoop is a write (blocking pops and moves), so the view
-// is evaluated as a write. Returns the standard wire error to terminate the
-// wait with, or std::nullopt when the attempt may proceed.
-std::optional<CommandReply> ClusterBlockingAdmissionError(
-    std::span<const std::uint16_t> slots) {
-  if (slots.empty()) return std::nullopt;
+// Re-admission for blocking writes. Capture alone is not sufficient: a fence
+// can publish between that decision and the storage attempt. Registration on
+// the admitted snapshot closes that race and gives NodeControl a drain token
+// only for the concrete attempt, never for the following dormant wait.
+std::optional<CommandReply> RegisterClusterBlockingWriteAttemptImpl(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    cluster::AuthorityInFlightGuards* guards) {
+  assert(guards != nullptr);
+  guards->clear();
+  const std::span<const std::uint16_t> slots = request.ClusterSlots();
+  if (!cluster::ClusterEnabled() || request.replication_origin_ ||
+      slots.empty()) {
+    return std::nullopt;
+  }
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
-  // A slightly stale cached snapshot is fine: an attempt admitted under it is
-  // re-gated on the next wakeup, and the final mutation still passes the
-  // owner-side re-check before executing.
-  std::uint64_t unused_version = 0;
-  const std::shared_ptr<const cluster::ServingState>& state =
-      cluster::CurrentCachedWithVersion(runtime->topology_cache_,
-                                        &unused_version);
   const cluster::RequestView view{
       .slots_ = slots,
       .is_write_ = true,
       .connection_readonly_ = false,
       .loading_allowed_ = false,
   };
-  const cluster::Decision decision = cluster::Admit(state.get(), view);
-  std::string message;
-  switch (decision.kind_) {
-    case cluster::Decision::Kind::kServe:
-    case cluster::Decision::Kind::kServeStaleRead:
-      return std::nullopt;
-    case cluster::Decision::Kind::kMoved:
-      // The wait loop has no access to the connection's TLS state; prefer the
-      // plain port, falling back to the TLS port when the target offers no
-      // plain endpoint.
-      message = ClusterMovedMessage(decision.moved_slot_, decision.moved_host_,
-                                    decision.moved_port_ != 0
-                                        ? decision.moved_port_
-                                        : decision.moved_tls_port_);
-      break;
-    case cluster::Decision::Kind::kCrossSlot:
-      message = std::string(kClusterCrossSlotMessage);
-      break;
-    case cluster::Decision::Kind::kClusterDownUnbound:
-      message = std::string(kClusterDownUnboundMessage);
-      break;
-    case cluster::Decision::Kind::kLoading:
-      message = "LOADING Redis is loading the dataset in memory";
-      break;
-    case cluster::Decision::Kind::kCloseConnection: {
-      CommandReply reply;
-      reply.close_connection_ = true;
-      return reply;
+  for (;;) {
+    auto admission = std::make_shared<const cluster::AuthorityAdmission>(
+        runtime->authority_guard_.CaptureAndAdmit(
+            view, cluster::LeaseClockNow()));
+    const cluster::Decision& decision = admission->decision();
+    if (decision.kind_ == cluster::Decision::Kind::kServe) {
+      if (runtime->authority_guard_.RegisterAndRecheck(
+              *admission, celer::ThisWorker().id_,
+              cluster::LeaseClockNow(),
+              guards) == cluster::RecheckResult::kOk) {
+        // Per-type mutation callbacks still perform their owner-side recheck;
+        // point them at the same fresh proof protected by `guards`.
+        request.cluster_authority_admission_ = std::move(admission);
+        return std::nullopt;
+      }
+      // A publication crossed registration before any side effect. Drop the
+      // guards and retry against one coherent current snapshot.
+      guards->clear();
+      continue;
     }
+
+    CommandReply reply;
+    switch (decision.kind_) {
+      case cluster::Decision::Kind::kMoved: {
+        const std::uint16_t port =
+            request.connection_tls_ && decision.moved_tls_port_ != 0
+                ? decision.moved_tls_port_
+                : decision.moved_port_;
+        reply.encoded_ = reply_builder.AppendError(ClusterMovedMessage(
+            decision.moved_slot_, decision.moved_host_, port));
+        break;
+      }
+      case cluster::Decision::Kind::kCrossSlot:
+        reply.encoded_ = reply_builder.AppendError(kClusterCrossSlotMessage);
+        break;
+      case cluster::Decision::Kind::kClusterDownUnbound:
+        reply.encoded_ = reply_builder.AppendError(kClusterDownUnboundMessage);
+        break;
+      case cluster::Decision::Kind::kLoading:
+        reply.encoded_ = reply_builder.AppendError(
+            "LOADING Redis is loading the dataset in memory");
+        break;
+      case cluster::Decision::Kind::kCloseConnection:
+      case cluster::Decision::Kind::kServeStaleRead:
+        // A write view cannot legitimately receive stale-read authority. Keep
+        // that impossible state fail-closed alongside an explicit close.
+        reply.close_connection_ = true;
+        break;
+      case cluster::Decision::Kind::kServe:
+        std::terminate();
+    }
+    return reply;
   }
-  // CommandReply borrows its encoding; park the bytes in a shared string kept
-  // alive by the immediately-draining chunk source so the reply stays valid
-  // until the connection's write loop has consumed it.
-  CommandReply reply;
-  auto encoded = std::make_shared<std::string>(EncodeError(message));
-  reply.encoded_ = *encoded;
-  reply.chunks_ = std::make_unique<ReplyChunkSource>(
-      [encoded]() -> Task<absl::StatusOr<std::string>> {
-        co_return std::string();
-      });
-  return reply;
 }
 
 struct WaiterCleanup {
@@ -678,6 +687,13 @@ void RunServingGenerationNotification(void*, std::uint64_t) noexcept {
 }
 
 }  // namespace
+
+std::optional<CommandReply> RegisterClusterBlockingWriteAttempt(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    cluster::AuthorityInFlightGuards* guards) {
+  return RegisterClusterBlockingWriteAttemptImpl(request, reply_builder,
+                                                 guards);
+}
 
 void NotifyServingGenerationChanged() noexcept {
   const celer::CurrentWorker& current = celer::ThisWorker();
@@ -858,18 +874,8 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
 
   std::unique_ptr<BlockingWaitHandle> waiter;
   // Blocking waits outlive the admission that accepted them. The
-  // slot set is a pure function of the wait keys, so it is computed once and
-  // re-admitted against the current ServingState on every attempt.
-  std::vector<std::uint16_t> cluster_slots;
-  if (cluster::ClusterEnabled()) {
-    for (const BlockingWaitSpec& spec : specs) {
-      const std::uint16_t slot = storage::RedisSlot(spec.key_);
-      if (std::find(cluster_slots.begin(), cluster_slots.end(), slot) ==
-          cluster_slots.end()) {
-        cluster_slots.push_back(slot);
-      }
-    }
-  }
+  // dispatch-time slot set is a pure function of these immutable wait keys;
+  // every concrete attempt re-admits that set against the current state.
   for (;;) {
     BlockingWakeCascade* attempt_cascade = nullptr;
     if (waiter) {
@@ -916,13 +922,21 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
       co_return reply;
     }
 
-    if (std::optional<CommandReply> fenced =
-            ClusterBlockingAdmissionError(cluster_slots);
-        fenced.has_value()) {
-      co_return std::move(*fenced);
+    BlockingAttemptResult result;
+    {
+      // This guard covers only the storage attempt. In particular it is gone
+      // before RegisterBlockingWait or WaitForBlockingReady can suspend for an
+      // unbounded client timeout, allowing a Meta fence/FDS transition to
+      // drain the retired assignment independently of dormant clients.
+      cluster::AuthorityInFlightGuards attempt_guards;
+      if (std::optional<CommandReply> fenced =
+              RegisterClusterBlockingWriteAttempt(
+                  request, reply_builder, &attempt_guards);
+          fenced.has_value()) {
+        co_return std::move(*fenced);
+      }
+      result = co_await attempt(attempt_cascade);
     }
-
-    BlockingAttemptResult result = co_await attempt(attempt_cascade);
     cascade_completion.Finish();
     if (result.state_ == BlockingAttemptState::kComplete) {
       co_return std::move(result.reply_);

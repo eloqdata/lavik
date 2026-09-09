@@ -147,7 +147,8 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaCollection(
   if (!state->skip_) {
     const auto txid = tx::TxRuntime::Get()->next_txid_.fetch_add(
         1, std::memory_order_relaxed);
-    InitializeTxWrites(txid, std::span(&state->writes_, 1));
+    InitializeTxWrites(txid, std::span(&state->writes_, 1),
+                       MutationPrecondition{});
     state->writes_.collect_undo_ = true;
   }
   stage.collection_ = std::move(state);

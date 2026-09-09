@@ -23,14 +23,16 @@ celer::Task<CommandReply> ExecuteStringCommand(const CommandRequest& request,
 
 celer::Task<CommandReply> ExecuteStringCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,
-    storage::TxShardWrites* tx, ReplyBuilder& reply_builder);
+    storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
+    const storage::MutationPrecondition* mutation_precondition = nullptr);
 
 celer::Task<CommandReply> ExecuteBitmapCommand(const CommandRequest& request,
                                                ReplyBuilder& reply_builder);
 
 celer::Task<CommandReply> ExecuteBitmapCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,
-    storage::TxShardWrites* tx, ReplyBuilder& reply_builder);
+    storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
+    const storage::MutationPrecondition* mutation_precondition = nullptr);
 
 celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
                                               ReplyBuilder& reply_builder);

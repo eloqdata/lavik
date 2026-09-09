@@ -170,9 +170,11 @@ Task<CommandReply> ExecuteSetCommandImpl(const CommandRequest& request,
   auto replication =
       tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
   if (digest == nullptr) {
-    result =
-        co_await g_storage->ExecuteSet(request.db_id_, args[1], operation,
-                                       replication ? &*replication : nullptr);
+    const storage::MutationPrecondition mutation_precondition =
+        ClusterMutationPrecondition(request);
+    result = co_await g_storage->ExecuteSet(
+        request.db_id_, args[1], operation,
+        replication ? &*replication : nullptr, &mutation_precondition);
   } else {
     result = co_await g_storage->ExecuteSetLocked(
         request.db_id_, args[1], *digest, operation, tx,
@@ -737,7 +739,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   if (write) {
     txid = storage::StorageEngine::AllocateWriteTxid();
     context.tx_writes_.resize(g_storage->worker_count());
-    g_storage->InitializeTxWrites(txid, context.tx_writes_);
+    g_storage->InitializeTxWrites(txid, context.tx_writes_,
+                                  ClusterMutationPrecondition(request));
     for (auto& shard : context.tx_writes_) {
       shard.collect_undo_ = true;
     }

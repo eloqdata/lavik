@@ -17,9 +17,9 @@ Celer owns the worker and socket lifecycle underneath those Keylane modules.
 A separate `keylane-meta` executable runs the [Raft-backed meta control
 plane](08-meta-control-plane.md). It owns committed cluster metadata,
 leader-local observations, authenticated administration, and coordination
-seams for future data-node control sessions. It links the pinned NuRaft
+plus process-lifetime Data-control sessions. It links the pinned NuRaft
 submodule, whose native Asio service owns Raft peer communication; Celer owns
-the separate administrative and future data-node sessions. NuRaft is linked
+the separate administrative and Data-node sessions. NuRaft is linked
 only into `keylane-meta`: the data-plane executable, library, and tests never
 see consensus code, and the build enforces that boundary at configure time.
 
@@ -41,6 +41,10 @@ Redis/Valkey clients, Sentinels, and replicas
 
 Prometheus scrapes a separate Celer HTTP service backed by worker and storage
 snapshots.
+
+keylane-meta Raft leader <-- framed control session --> Data NodeControl
+       committed view       full state / lease /        topology, authority,
+                            directive / observation      replication actions
 ```
 
 ## Component responsibilities
@@ -54,8 +58,8 @@ snapshots.
 | Storage and recovery | Own logical indexes and physical blocks, execute reads and appends, recover durable state, and reclaim obsolete data | `storage::StorageEngine` |
 | Function catalog | Stage one complete process-global Function definition set on every worker, commit its existing `FUNCTION DUMP` encoding, swap runtimes, and recover it before service readiness | `FunctionCatalog` |
 | Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
-| Cluster data plane | Admit, redirect, or refuse requests by slot ownership and authority, and serve Redis Cluster discovery | `cluster::Admit`, `cluster::TopologyCache`, `cluster::ClusterControlPort` |
-| Meta control plane | Replicate metadata commands, maintain the durable control-plane model, admit fresh leader-local observations, and expose authenticated proposal and subscription seams | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaObservationStore` |
+| Cluster data plane | Admit, redirect, or refuse requests by slot ownership and finite authority; install static or Meta control; serve Redis Cluster discovery | `cluster::AuthorityGuard::CaptureAndAdmit` / `RegisterAndRecheck`, `cluster::TopologyCache`, `cluster::NodeControlInstaller`, `cluster::MetaControlClientService` |
+| Meta control plane | Replicate metadata commands, project node-specific desired state, publish leader-scoped Data sessions, admit fresh observations, and expose authenticated administration | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
 ## Process lifecycle
@@ -63,8 +67,10 @@ snapshots.
 1. `main` loads an optional Redis-style config file, applies CLI overrides,
    validates the combined options, and initializes logging.
 2. `RunServer` initializes the memory budget, signal handling, storage engine,
-   replication manager, command/storage bindings, metrics shards, transaction
-   runtime, and Celer service graph.
+   replication manager, cluster topology/authority/node-controller runtime,
+   command/storage bindings, metrics shards, transaction runtime, and Celer
+   service graph. Meta mode starts the outbound control client fenced; static
+   mode synchronously installs its configured topology.
 3. On every worker, `RedisService::Run` binds the memory and transaction shards
    and awaits `StorageEngine::InitializeWorker`. Recovery barriers ensure all
    workers finish recovery and allocator cleanup before the process becomes
@@ -73,11 +79,12 @@ snapshots.
    worker, then performs an optional validated RDB import before the readiness
    flag is published. Replication is notified only after worker storage and
    catalog recovery are ready.
-5. On a shutdown signal, new requests and accepts are closed, active requests
-   and RDB backup work drain, and storage is durably flushed. When configured,
-   shutdown transaction cleaning first relocates committed tagged winners into
-   durable ordinary records; a shutdown checkpoint then serializes the frozen
-   key indexes and publishes them before worker teardown. Celer then stops
+5. On a shutdown signal, new requests and accepts are closed; Meta control,
+   active requests, replication target/source work, and RDB backup work drain
+   before storage is durably flushed. When configured, shutdown transaction
+   cleaning relocates committed tagged winners into durable ordinary records;
+   a second seal/drain then freezes the resulting indexes before a shutdown
+   checkpoint publishes them. Celer then stops
    each worker; after that worker's I/O and coroutine frames are gone but
    before its native thread exits and is joined,
    `RedisService::FinalizeWorker` calls `StorageEngine::FinalizeWorker` to
@@ -169,13 +176,20 @@ state explicitly.
   Function-catalog readiness. Neither a valid old catalog root nor an
   interrupted replacement is sufficient to reopen service.
 - Readiness follows recovery and optional import; shutdown drains admitted
-  requests before the final storage flush.
+  requests and every replication storage mutator before the final flush.
 - Replication and full-sync queues use admission/backpressure. They must not
   silently drop an already accepted logical write.
 - Meta decisions derive from one committed view plus observations accepted by
   the current leader session generation. Observations are never Raft state and
-  are purged on role changes or when their committed term, manifest, history,
-  operation, or node identity anchor becomes stale.
+  are purged on role changes or when their committed node, assignment, term,
+  manifest, or partition replication epoch anchor becomes stale. Operation
+  evidence additionally binds committed operation/history state; candidate
+  history is instead checked against the authenticated `ClientHello` session.
+- Data nodes restore no positive serving authority, desired-state checkpoint,
+  or directive outcome from their data files. Each restart begins fenced with
+  a new boot identity; only a current Meta session and unexpired in-memory
+  lease can authorize a local owner, and an authority transition drains the
+  request generation it replaces.
 - Metadata apply is deterministic and replay-safe by log index. A rejected
   domain command still consumes its index and creates an audit record;
   malformed durable bytes or inconsistent replay fail stop rather than
@@ -219,6 +233,7 @@ those deployment boundaries remain unknown here.
 | Transaction boundary | `include/keylane/tx/`, `src/tx/` |
 | Storage boundary and focused lifecycle units | `include/keylane/storage/engine.h`, `include/keylane/storage/format.h`, `src/storage/engine/`, `src/storage/format.cpp` |
 | Replication manager, protocol, Sentinel-visible role state, and log boundary | `include/keylane/replication.h`, `include/keylane/replication_command.h`, `src/replication/`, `src/storage/engine/replication_log.cpp`, `tests/sentinel_e2e_test.cpp` |
+| Cluster topology, authority, node control, and Meta/Data session | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_gate.h`, `src/redis/server.cpp` |
 | Memory accounting, slow log, command statistics, and Prometheus service | `include/keylane/memory.h`, `src/memory.cpp`, `include/keylane/metrics.h`, `src/metrics.cpp`, `include/keylane/slowlog.h`, `src/redis/slowlog.cpp` |
 | Build, release, and package commands | `scripts/build_debug.sh`, `scripts/build_release.sh`, `scripts/package_release.sh`, `docs/operations/building-and-packaging.md` |
 | Keylane process deployment unit or orchestration manifest | Unknown; `deploy/` contains the monitoring stack, not the Keylane process definition |

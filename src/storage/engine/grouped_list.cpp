@@ -60,7 +60,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const ListOperation& operation, GroupedHashObject::Handle object,
-    TxShardWrites* tx, ReplicationCommandAppend* replication) {
+    TxShardWrites* tx, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   try {
     if (object == nullptr || !object->is_ordered() ||
         object->ordered_directory().root().kind_ !=
@@ -427,7 +428,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     if (!result.changed_) co_return result;
     const auto status = co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(*plan),
-        object->version().root_.expire_at_ms_, tx, replication);
+        object->version().root_.expire_at_ms_, tx, replication,
+        mutation_precondition);
     if (!status.ok()) co_return status;
     co_return result;
   } catch (const std::bad_alloc&) {

@@ -78,6 +78,7 @@ using keylane::meta::MetaCoordinator;
 using keylane::meta::MetaCoordinatorOptions;
 using keylane::meta::MetaCoordinatorTestPeer;
 using keylane::meta::MetaLeaderContext;
+using keylane::meta::MetaLeadershipRelay;
 using keylane::meta::MetaObservationIdentity;
 using keylane::meta::MetaObservationStore;
 using keylane::meta::MetaOperationId;
@@ -261,6 +262,154 @@ class MetaCoordinatorComponentTest : public ::testing::Test {
   MetaObservationStore observations_;
   std::unique_ptr<MetaCoordinator> coordinator_;
 };
+
+// Deliberately stalls the coordinator's leadership worker at both lifecycle
+// calls. Production reconcilers return quickly from Start, but the barrier
+// makes a rapid Leader -> Follower -> Leader sequence deterministic: all
+// three callbacks arrive before the worker can infer a final role.
+class BlockingLeadershipReconciler final : public MetaReconciler {
+ public:
+  void Start(MetaLeaderContext&) override {
+    std::unique_lock<std::mutex> lock(mu_);
+    ++starts_;
+    events_.push_back("start-" + std::to_string(starts_));
+    cv_.notify_all();
+    if (starts_ == 1) {
+      first_start_entered_ = true;
+      cv_.notify_all();
+      cv_.wait(lock, [&] { return release_first_start_; });
+    }
+  }
+
+  void CancelAndWait() override {
+    std::unique_lock<std::mutex> lock(mu_);
+    ++cancels_;
+    events_.push_back("cancel-enter");
+    cancel_entered_ = true;
+    cv_.notify_all();
+    cv_.wait(lock, [&] { return release_cancel_; });
+    events_.push_back("cancel-exit");
+    cv_.notify_all();
+  }
+
+  bool WaitForFirstStart(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [&] { return first_start_entered_; });
+  }
+
+  bool WaitForCancel(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [&] { return cancel_entered_; });
+  }
+
+  bool WaitForSecondStart(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [&] { return starts_ >= 2; });
+  }
+
+  void ReleaseFirstStart() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      release_first_start_ = true;
+    }
+    cv_.notify_all();
+  }
+
+  void ReleaseCancel() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      release_cancel_ = true;
+    }
+    cv_.notify_all();
+  }
+
+  void ReleaseAll() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      release_first_start_ = true;
+      release_cancel_ = true;
+    }
+    cv_.notify_all();
+  }
+
+  int starts() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return starts_;
+  }
+
+  std::vector<std::string> events() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return events_;
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  int starts_ = 0;
+  int cancels_ = 0;
+  bool first_start_entered_ = false;
+  bool cancel_entered_ = false;
+  bool release_first_start_ = false;
+  bool release_cancel_ = false;
+  std::vector<std::string> events_;
+};
+
+TEST_F(MetaCoordinatorComponentTest,
+       RapidDemotionIsABarrierBeforeLeaderRestart) {
+  MakeCoordinator();
+  auto reconciler = std::make_shared<BlockingLeadershipReconciler>();
+  coordinator_->RunAsLeader(reconciler);
+
+  // Model a stopped Celer worker during assembly: all three callbacks reach
+  // the process bridge before it can attach to the coordinator. The relay and
+  // coordinator must retain the ordered edges, not merely the final role.
+  MetaLeadershipRelay relay;
+  relay.RecordLeaderEdge();
+  relay.RecordFollowerEdge();
+  relay.RecordLeaderEdge();
+  relay.Attach(*coordinator_);
+  const bool started = reconciler->WaitForFirstStart(std::chrono::seconds(2));
+  EXPECT_TRUE(started);
+  if (!started) {
+    reconciler->ReleaseAll();
+    return;
+  }
+
+  MetaObservationIdentity old_session;
+  old_session.node_id_ = MakeNodeId(0x7a);
+  old_session.boot_incarnation_.fill(0x7b);
+  old_session.session_generation_ = 41;
+  const absl::Status adopted = observations_.AdoptSession(old_session, 1000);
+  EXPECT_TRUE(adopted.ok()) << adopted;
+  if (!adopted.ok()) {
+    reconciler->ReleaseAll();
+    relay.DetachAndStop();
+    return;
+  }
+
+  // The later edges are already queued while the leadership worker is stalled
+  // in the first Start. A final-role bool would collapse them and leave old
+  // authority live.
+  reconciler->ReleaseFirstStart();
+
+  const bool cancel_started =
+      reconciler->WaitForCancel(std::chrono::milliseconds(500));
+  EXPECT_TRUE(cancel_started);
+  EXPECT_EQ(reconciler->starts(), 1)
+      << "the next leader start must wait for CancelAndWait";
+  reconciler->ReleaseCancel();
+
+  const bool restarted =
+      reconciler->WaitForSecondStart(std::chrono::seconds(2));
+  reconciler->ReleaseAll();
+  EXPECT_TRUE(restarted);
+  EXPECT_EQ(reconciler->events(),
+            (std::vector<std::string>{"start-1", "cancel-enter", "cancel-exit",
+                                      "start-2"}));
+  EXPECT_FALSE(
+      observations_.CurrentGeneration(old_session.node_id_).has_value());
+  relay.DetachAndStop();
+}
 
 TEST_F(MetaCoordinatorComponentTest, SubscriptionTripleIsAtomicAndOrdered) {
   MakeCoordinator();
@@ -450,15 +599,19 @@ TEST_F(MetaCoordinatorComponentTest, CommittedViewFactsAnswerFromStores) {
 
   // The adapter the obs store's freshness queries run against.
   const auto view = coordinator_->CommittedView();
+  EXPECT_EQ(view.applied_index(), 4u);
   MetaStoresFacts facts(view.stores());
   EXPECT_TRUE(facts.IsActiveNode(MakeNodeId(0x61)));
   EXPECT_FALSE(facts.IsActiveNode(MakeNodeId(0x62)));
   EXPECT_EQ(facts.CurrentGroupTerm("g1"), 1u);
   EXPECT_EQ(facts.CurrentGroupTerm("no-such-group"), 0u);
-  EXPECT_EQ(facts.CurrentPopulationManifestId("g1"), 0u);
+  EXPECT_EQ(facts.CurrentPopulationManifestRevision("g1"), 0u);
   EXPECT_TRUE(facts.OperationNonTerminal(MakeOperationId(0x64)));
   EXPECT_FALSE(facts.OperationNonTerminal(MakeOperationId(0x65)));
-  EXPECT_FALSE(facts.HistoryBoundToOperation(MakeOperationId(0x64), 1));
+  keylane::meta::MetaReplicationHistoryId unbound_history{};
+  unbound_history.back() = 1;
+  EXPECT_FALSE(
+      facts.HistoryBoundToOperation(MakeOperationId(0x64), unbound_history));
 }
 
 // ---------------------------------------------------------------------------
@@ -731,9 +884,25 @@ TEST_F(MetaCoordinatorServerTest, ProposeNotLeaderThenLeader) {
 
 TEST_F(MetaCoordinatorServerTest, FailSafeWalGate) {
   StartServer();
+  MakeCoordinator();
   WaitLeader();
+
+  keylane::meta::PutPopulationManifest put;
+  put.request_id_ = MakeRequestId(0x30);
+  put.entries_ = {{1, 1}};
+  put.manifest_digest_ =
+      keylane::meta::MetaPopulationManifestStore::CanonicalDigest(put.entries_);
+  ASSERT_TRUE(ProposeSync(put).ok());
+  const std::size_t audit_before_gate =
+      machine_->StoresSnapshot().audit_.size();
+
   // Constructor-injected threshold: zero tolerated uncompacted WAL bytes. The
   // boot config entry alone already exceeds that, so the gate must trip.
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
   MetaCoordinatorOptions options;
   options.max_uncompacted_wal_bytes_ = 0;
   MakeCoordinator(options);
@@ -743,15 +912,48 @@ TEST_F(MetaCoordinatorServerTest, FailSafeWalGate) {
   EXPECT_NE(gated.status().message().find("WAL"), std::string::npos)
       << gated.status();
   // Fail-safe means nothing was appended: no audit record, no state change.
-  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), 0u);
+  EXPECT_EQ(machine_->StoresSnapshot().audit_.size(), audit_before_gate);
+
+  // A prune-shaped no-op is rejected before append; fresh request ids cannot
+  // use idempotency to grow the WAL after the hard gate has fired.
+  const std::uint64_t before_no_op = machine_->last_commit_index();
+  keylane::meta::PrunePopulationManifest no_op;
+  no_op.request_id_ = MakeRequestId(0x32);
+  no_op.manifest_digest_.fill(0x44);
+  auto ineffective = ProposeSync(no_op);
+  ASSERT_FALSE(ineffective.ok());
+  EXPECT_EQ(ineffective.status().code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_no_op);
+
+  keylane::meta::PrunePopulationManifest prune;
+  prune.request_id_ = MakeRequestId(0x33);
+  prune.manifest_digest_ = put.manifest_digest_;
+  auto recovery = ProposeSync(prune);
+  ASSERT_TRUE(recovery.ok()) << recovery.status();
+  EXPECT_EQ(recovery->verdict_, MetaAuditVerdict::kAccepted);
+  EXPECT_FALSE(machine_->StoresSnapshot().population_manifest_.Contains(
+      put.manifest_digest_));
 }
 
 TEST_F(MetaCoordinatorServerTest, FailSafeSnapshotFailureGate) {
   StartServer();
+  MakeCoordinator();
   WaitLeader();
+  keylane::meta::PutPopulationManifest put;
+  put.request_id_ = MakeRequestId(0x31);
+  put.entries_ = {{2, 1}};
+  put.manifest_digest_ =
+      keylane::meta::MetaPopulationManifestStore::CanonicalDigest(put.entries_);
+  ASSERT_TRUE(ProposeSync(put).ok());
+
   // Zero tolerated consecutive snapshot failures: the gate trips at the
   // current (zero) count. This proves the wiring; reaching a real failure
   // count would require faulting the snapshot writer's file IO.
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
   MetaCoordinatorOptions options;
   options.max_consecutive_snapshot_failures_ = 0;
   MakeCoordinator(options);
@@ -760,6 +962,172 @@ TEST_F(MetaCoordinatorServerTest, FailSafeSnapshotFailureGate) {
   EXPECT_EQ(gated.status().code(), absl::StatusCode::kResourceExhausted);
   EXPECT_NE(gated.status().message().find("snapshot"), std::string::npos)
       << gated.status();
+
+  const std::uint64_t before_no_op = machine_->last_commit_index();
+  keylane::meta::PrunePopulationManifest no_op;
+  no_op.request_id_ = MakeRequestId(0x33);
+  no_op.manifest_digest_.fill(0x44);
+  auto ineffective = ProposeSync(no_op);
+  ASSERT_FALSE(ineffective.ok());
+  EXPECT_EQ(ineffective.status().code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_no_op);
+
+  keylane::meta::PrunePopulationManifest prune;
+  prune.request_id_ = MakeRequestId(0x34);
+  prune.manifest_digest_ = put.manifest_digest_;
+  auto recovery = ProposeSync(prune);
+  ASSERT_TRUE(recovery.ok()) << recovery.status();
+  EXPECT_EQ(recovery->verdict_, MetaAuditVerdict::kAccepted);
+}
+
+TEST_F(MetaCoordinatorServerTest,
+       FailSafeSnapshotGateAllowsTerminalizeArchivePruneRecovery) {
+  StartServer();
+  MakeCoordinator();
+  WaitLeader();
+
+  SubmitOperation complete_target;
+  complete_target.request_id_ = MakeRequestId(0x35);
+  complete_target.operation_id_ = MakeOperationId(0x35);
+  complete_target.kind_ = "migration";
+  complete_target.intent_ = "complete-then-archive";
+  complete_target.intent_hash_ =
+      keylane::meta::MetaSha256(complete_target.intent_);
+  auto submitted_complete = ProposeSync(complete_target);
+  ASSERT_TRUE(submitted_complete.ok()) << submitted_complete.status();
+
+  SubmitOperation abort_target = complete_target;
+  abort_target.request_id_ = MakeRequestId(0x36);
+  abort_target.operation_id_ = MakeOperationId(0x36);
+  abort_target.intent_ = "abort-then-archive";
+  abort_target.intent_hash_ = keylane::meta::MetaSha256(abort_target.intent_);
+  auto submitted_abort = ProposeSync(abort_target);
+  ASSERT_TRUE(submitted_abort.ok()) << submitted_abort.status();
+
+  // Recreate only the coordinator with an already-tripped fail-safe gate;
+  // the same live Raft server and state machine retain the terminal operation.
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
+  MetaCoordinatorOptions options;
+  options.max_consecutive_snapshot_failures_ = 0;
+  MakeCoordinator(options);
+
+  // Emergency terminalization may not introduce a new variable-length result
+  // while snapshot recovery is already gated.
+  keylane::meta::CompleteOperation growing_complete;
+  growing_complete.request_id_ = MakeRequestId(0x37);
+  growing_complete.operation_id_ = complete_target.operation_id_;
+  growing_complete.expected_revision_ = 0;
+  growing_complete.result_ = "not-admitted-during-fail-safe";
+  const std::uint64_t before_growing = machine_->last_commit_index();
+  auto growing = ProposeSync(growing_complete);
+  ASSERT_FALSE(growing.ok());
+  EXPECT_EQ(growing.status().code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_growing);
+
+  keylane::meta::CompleteOperation complete = growing_complete;
+  complete.request_id_ = MakeRequestId(0x38);
+  complete.result_.clear();
+  auto completed = ProposeSync(complete);
+  ASSERT_TRUE(completed.ok()) << completed.status();
+
+  keylane::meta::AbortOperation abort;
+  abort.request_id_ = MakeRequestId(0x39);
+  abort.operation_id_ = abort_target.operation_id_;
+  abort.expected_revision_ = 0;
+  auto aborted = ProposeSync(abort);
+  ASSERT_TRUE(aborted.ok()) << aborted.status();
+
+  keylane::meta::ArchiveOperations archive;
+  archive.request_id_ = MakeRequestId(0x3a);
+  archive.operation_seqs_ = {submitted_complete->log_index_,
+                             submitted_abort->log_index_};
+  auto recovery = ProposeSync(archive);
+  ASSERT_TRUE(recovery.ok()) << recovery.status();
+  EXPECT_EQ(recovery->verdict_, MetaAuditVerdict::kAccepted);
+  EXPECT_TRUE(coordinator_->CommittedView()
+                  .operation()
+                  .FindArchived(complete_target.operation_id_)
+                  .has_value());
+
+  keylane::meta::PruneOperationArchive prune;
+  prune.request_id_ = MakeRequestId(0x3b);
+  prune.operation_seqs_ = archive.operation_seqs_;
+  auto pruned = ProposeSync(prune);
+  ASSERT_TRUE(pruned.ok()) << pruned.status();
+  const auto view = coordinator_->CommittedView();
+  EXPECT_FALSE(view.operation().OperationKnown(complete_target.operation_id_));
+  EXPECT_FALSE(view.operation().OperationKnown(abort_target.operation_id_));
+
+  // The same variant with a fresh id is now a no-op and must not reach Raft.
+  prune.request_id_ = MakeRequestId(0x3c);
+  const std::uint64_t before_repeat = machine_->last_commit_index();
+  auto repeated = ProposeSync(prune);
+  ASSERT_FALSE(repeated.ok());
+  EXPECT_EQ(repeated.status().code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_repeat);
+}
+
+TEST_F(MetaCoordinatorServerTest,
+       FailSafeRecoveryReservationFollowsUncertainRaftOutcome) {
+  StartServer();
+  MakeCoordinator();
+  WaitLeader();
+
+  SubmitOperation submit;
+  submit.request_id_ = MakeRequestId(0x3d);
+  submit.operation_id_ = MakeOperationId(0x3d);
+  submit.kind_ = "migration";
+  submit.intent_ = "uncertain-archive";
+  submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
+  auto submitted = ProposeSync(submit);
+  ASSERT_TRUE(submitted.ok()) << submitted.status();
+  keylane::meta::AbortOperation abort;
+  abort.request_id_ = MakeRequestId(0x3e);
+  abort.operation_id_ = submit.operation_id_;
+  abort.expected_revision_ = 0;
+  ASSERT_TRUE(ProposeSync(abort).ok());
+
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
+  MetaCoordinatorOptions options;
+  options.max_consecutive_snapshot_failures_ = 0;
+  options.propose_timeout_ms_ = 250;
+  MakeCoordinator(options);
+
+  server_->pause_state_machine_execution(5000);
+  keylane::meta::ArchiveOperations archive;
+  archive.request_id_ = MakeRequestId(0x3f);
+  archive.operation_seqs_ = {submitted->log_index_};
+  auto uncertain = ProposeSync(archive);
+  ASSERT_FALSE(uncertain.ok());
+  EXPECT_EQ(uncertain.status().code(), absl::StatusCode::kDeadlineExceeded);
+
+  archive.request_id_ = MakeRequestId(0x40);
+  auto overlapping = ProposeSync(archive);
+  ASSERT_FALSE(overlapping.ok());
+  EXPECT_EQ(overlapping.status().code(), absl::StatusCode::kResourceExhausted);
+
+  server_->resume_state_machine_execution();
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        return machine_->StoresSnapshot()
+            .operation_.FindArchived(submit.operation_id_)
+            .has_value();
+      },
+      std::chrono::seconds(10)));
+
+  keylane::meta::PruneOperationArchive prune;
+  prune.request_id_ = MakeRequestId(0x41);
+  prune.operation_seqs_ = archive.operation_seqs_;
+  auto recovered = ProposeSync(prune);
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
 }
 
 TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {

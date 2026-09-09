@@ -15,6 +15,8 @@
 namespace {
 
 using keylane::cluster::Admit;
+using keylane::cluster::AuthorityGuard;
+using keylane::cluster::AuthorityInFlightGuards;
 using keylane::cluster::AuthorityUnchanged;
 using keylane::cluster::Decision;
 using keylane::cluster::GroupInFlight;
@@ -23,6 +25,7 @@ using keylane::cluster::InFlightGuard;
 using keylane::cluster::NodeDescriptor;
 using keylane::cluster::NodeId;
 using keylane::cluster::NodeIndex;
+using keylane::cluster::RecheckResult;
 using keylane::cluster::RequestView;
 using keylane::cluster::ServingState;
 using keylane::cluster::ServingStateBuilder;
@@ -438,6 +441,79 @@ TEST(GroupInFlightTest, MoveTransfersOwnership) {
     EXPECT_EQ(state->GroupInFlightCount(kGroupA), 0);
   }
   EXPECT_EQ(state->TotalInFlightCount(), 0);
+}
+
+TEST(AuthorityGuardTest, RegistrationHandshakeOwnsOneGuardPerGroup) {
+  keylane::cluster::TopologyCache cache;
+  cache.Publish(BuildState(kNodeA));
+  AuthorityGuard authority(cache, AuthorityGuard::LeaseMode::kPermanent);
+  const std::array<std::uint16_t, 2> duplicate_slots{kSlotInA, kSlotInA};
+  const auto admission =
+      authority.CaptureAndAdmit(MakeRequest(duplicate_slots, /*is_write=*/true),
+                                keylane::cluster::MonotonicTime{});
+
+  AuthorityInFlightGuards guards;
+  EXPECT_EQ(
+      authority.RegisterAndRecheck(admission, /*worker_stripe=*/2,
+                                   keylane::cluster::MonotonicTime{}, &guards),
+      RecheckResult::kOk);
+  EXPECT_EQ(guards.size(), 1U);
+  EXPECT_EQ(admission.state()->GroupInFlightCount(kGroupA), 1U);
+
+  guards.clear();
+  EXPECT_EQ(admission.state()->GroupInFlightCount(kGroupA), 0U);
+}
+
+TEST(AuthorityGuardTest, RejectedRegistrationReleasesItsGuard) {
+  keylane::cluster::TopologyCache cache;
+  cache.Publish(BuildState(kNodeA));
+  AuthorityGuard authority(cache, AuthorityGuard::LeaseMode::kPermanent);
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto admission = authority.CaptureAndAdmit(
+      MakeRequest(slots, /*is_write=*/true), keylane::cluster::MonotonicTime{});
+
+  GroupView fenced = GroupA();
+  fenced.granted_ = false;
+  cache.Publish(BuildState(kNodeA, std::move(fenced), GroupB()));
+  AuthorityInFlightGuards guards;
+  EXPECT_EQ(
+      authority.RegisterAndRecheck(admission, /*worker_stripe=*/0,
+                                   keylane::cluster::MonotonicTime{}, &guards),
+      RecheckResult::kReject);
+  EXPECT_TRUE(guards.empty());
+  EXPECT_EQ(admission.state()->GroupInFlightCount(kGroupA), 0U);
+}
+
+TEST(AuthorityGuardTest, FinalMutationRecheckTracksAggregateOutcome) {
+  keylane::cluster::TopologyCache cache;
+  cache.Publish(BuildState(kNodeA));
+  AuthorityGuard authority(cache, AuthorityGuard::LeaseMode::kPermanent);
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+  const auto started = authority.CaptureAndAdmit(
+      MakeRequest(slots, /*is_write=*/true), keylane::cluster::MonotonicTime{});
+  const auto rejected = authority.CaptureAndAdmit(
+      MakeRequest(slots, /*is_write=*/true), keylane::cluster::MonotonicTime{});
+
+  EXPECT_EQ(
+      authority.RecheckAtMutation(started, keylane::cluster::MonotonicTime{}),
+      RecheckResult::kOk);
+  EXPECT_TRUE(started.mutation_started());
+  EXPECT_FALSE(started.final_recheck_failed());
+
+  GroupView fenced = GroupA();
+  fenced.granted_ = false;
+  cache.Publish(BuildState(kNodeA, std::move(fenced), GroupB()));
+  EXPECT_EQ(
+      authority.RecheckAtMutation(started, keylane::cluster::MonotonicTime{}),
+      RecheckResult::kReject);
+  EXPECT_TRUE(started.mutation_started());
+  EXPECT_TRUE(started.final_recheck_failed());
+
+  EXPECT_EQ(
+      authority.RecheckAtMutation(rejected, keylane::cluster::MonotonicTime{}),
+      RecheckResult::kReject);
+  EXPECT_FALSE(rejected.mutation_started());
+  EXPECT_TRUE(rejected.final_recheck_failed());
 }
 
 TEST(GroupInFlightTest, ConcurrentEnterExit) {

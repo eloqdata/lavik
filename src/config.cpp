@@ -21,6 +21,7 @@
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "keylane/numeric_endpoint.h"
 
 namespace keylane {
 namespace {
@@ -114,6 +115,21 @@ std::string QuoteRedisConfigArgument(std::string_view value) {
   }
   quoted.push_back('"');
   return quoted;
+}
+
+bool IsLowerHexNodeId(std::string_view value) {
+  if (value.size() != 40) return false;
+  for (const char c : value) {
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+  }
+  return true;
+}
+
+// Control sessions authenticate the dialled numeric address against the
+// peer's IP SAN. Keeping seeds numeric makes that check deterministic and
+// avoids an implicit DNS trust source in the bootstrap path.
+bool IsNumericEndpoint(std::string_view endpoint) {
+  return ParseNumericEndpoint(endpoint).has_value();
 }
 
 absl::Status WriteAll(int fd, std::string_view contents,
@@ -427,12 +443,17 @@ absl::Status ApplyRedisConfigDirective(
     options->cluster_enabled_ = *enabled;
     return absl::OkStatus();
   }
-  if (name == "cluster-static-nodes-file" || name == "cluster-announce-ip") {
+  if (name == "cluster-static-nodes-file" || name == "cluster-announce-ip" ||
+      name == "cluster-node-id" || name == "cluster-meta-seed") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     if (name == "cluster-static-nodes-file") {
       options->cluster_static_nodes_file_ = directive[1];
-    } else {
+    } else if (name == "cluster-announce-ip") {
       options->cluster_announce_ip_ = directive[1];
+    } else if (name == "cluster-node-id") {
+      options->cluster_node_id_ = directive[1];
+    } else {
+      options->cluster_meta_seeds_.push_back(directive[1]);
     }
     return absl::OkStatus();
   }
@@ -618,9 +639,34 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
   // node's address by the cluster control port at startup; validation here
   // only requires it to be configured.
   if (options.cluster_enabled_) {
-    if (options.cluster_static_nodes_file_.empty()) {
+    const bool static_control = !options.cluster_static_nodes_file_.empty();
+    const bool meta_control = !options.cluster_meta_seeds_.empty();
+    if (static_control == meta_control) {
       return absl::InvalidArgumentError(
-          "cluster-enabled requires cluster-static-nodes-file");
+          "cluster-enabled requires exactly one of cluster-static-nodes-file "
+          "or cluster-meta-seed");
+    }
+    if (meta_control) {
+      if (!IsLowerHexNodeId(options.cluster_node_id_)) {
+        return absl::InvalidArgumentError(
+            "Meta-controlled cluster mode requires cluster-node-id as 40 "
+            "lowercase hex characters");
+      }
+      for (const std::string& seed : options.cluster_meta_seeds_) {
+        if (!IsNumericEndpoint(seed)) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "cluster-meta-seed must be a numeric IP endpoint: ", seed));
+        }
+      }
+      // The data-control connection reuses the replication TLS identity. An
+      // opted-in mTLS session cannot silently fall back to a CA-only client.
+      if (options.tls_replication_ &&
+          (options.tls_ca_cert_file_.empty() ||
+           options.tls_cert_file_.empty() || options.tls_key_file_.empty())) {
+        return absl::InvalidArgumentError(
+            "Meta data-control mTLS requires tls-ca-cert-file, "
+            "tls-cert-file, and tls-key-file");
+      }
     }
     if (options.replicaof_.has_value() ||
         options.redis_replicaof_.has_value()) {
@@ -771,7 +817,7 @@ absl::Status RewriteRedisConfigFile(const std::string& path,
   static std::mutex rewrite_mutex;
   const std::lock_guard lock(rewrite_mutex);
 
-  struct stat metadata{};
+  struct stat metadata {};
   if (::stat(path.c_str(), &metadata) != 0) {
     return absl::NotFoundError(absl::StrCat("cannot stat configuration file '",
                                             path, "': ", std::strerror(errno)));

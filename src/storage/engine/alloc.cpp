@@ -176,6 +176,7 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
       device_index, reactivated);
   if (!invalidated.ok()) {
     allocator.failed_ = invalidated;
+    LatchRuntimeFailure();
     co_return invalidated;
   }
 
@@ -195,6 +196,7 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
     // over this activation range or hand out later blocks until restart has
     // selected the newest valid A/B page.
     allocator.failed_ = persisted;
+    LatchRuntimeFailure();
     co_return persisted;
   }
   allocator.ready_blocks_.insert(allocator.ready_blocks_.end(),
@@ -322,6 +324,7 @@ Task<absl::Status> StorageEngine::Impl::ReturnColdBlocksLocal(
                                                        std::move(dirty_pages));
   if (!persisted.ok()) {
     allocator.failed_ = persisted;
+    LatchRuntimeFailure();
     co_return persisted;
   }
   allocator.cold_free_.insert(allocator.cold_free_.end(), block_ids.begin(),
@@ -429,6 +432,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
       MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
   if (!written.ok() || *written != kDirectIoAlignment) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
+    LatchRuntimeFailure();
     co_return written.ok()
         ? absl::Status(absl::StatusCode::kInternal,
                        "short write of device epoch metadata")
@@ -438,6 +442,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
       *store.worker_, store.files_[device.file_index_]);
   if (!synced.ok()) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
+    LatchRuntimeFailure();
     co_return synced;
   }
   allocator.epoch_pages_[page_index] = MetadataPageState{
@@ -528,6 +533,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
         MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
     if (!written.ok() || *written != kDirectIoAlignment) {
       epoch_metadata_failed_.store(true, std::memory_order_release);
+      LatchRuntimeFailure();
       co_return written.ok()
           ? absl::Status(absl::StatusCode::kInternal,
                          "short write of device epoch metadata batch")
@@ -543,6 +549,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
       *store.worker_, store.files_[device.file_index_]);
   if (!synced.ok()) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
+    LatchRuntimeFailure();
     co_return synced;
   }
   for (std::size_t page_index = 0; page_index < dirty_pages.size();
@@ -669,7 +676,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
         shutdown_flush_requested_.load(std::memory_order_acquire)) {
       co_return absl::UnavailableError("storage is shutting down");
     }
-    if (store.write_failed_ ||
+    if (store.write_failed_ || RuntimeFailureLatched() ||
         epoch_metadata_failed_.load(std::memory_order_acquire)) {
       co_return absl::FailedPreconditionError(
           "storage writer is stopped after an IO failure");

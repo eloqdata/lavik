@@ -596,7 +596,7 @@ Task<absl::Status> StorageEngine::Impl::CommitSystemState(
       system_state_failure_ =
           absl::UnknownError("system-state commit result is ambiguous: " +
                              std::string(committed.message()));
-      FenceRequestServingUntilRestart();
+      LatchRuntimeFailure();
       co_return *system_state_failure_;
     }
     KEYLANE_MAYBE_CRASH_AT("system-state-device-root-durable");
@@ -682,13 +682,18 @@ Task<absl::Status> StorageEngine::Impl::MakeDurable(
                                                   std::chrono::milliseconds(1));
     if (!slept.ok()) co_return slept;
   }
+  // Keep each suspension in its own statement. GCC 13 can reuse the wrong
+  // coroutine-frame slot when both arms of ?: contain co_await.
   for (unsigned worker = 0; worker < worker_count_; ++worker) {
     auto drain = [this, worker]() {
       return DrainReplicaRootWritesLocal(*stores_[worker]);
     };
-    absl::Status durable = worker == 0
-                               ? co_await drain()
-                               : co_await celer::SubmitTaskTo(worker, drain);
+    absl::Status durable;
+    if (worker == 0) {
+      durable = co_await drain();
+    } else {
+      durable = co_await celer::SubmitTaskTo(worker, drain);
+    }
     if (!durable.ok()) co_return durable;
   }
   co_return absl::OkStatus();

@@ -27,7 +27,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedHashObject::Handle previous, OrderedCollectionMutationPlan plan,
     std::uint64_t expire_at_ms, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   if (!plan.changed_) co_return absl::OkStatus();
   if (previous && (!previous->is_ordered() ||
                    plan.expected_sequence_ != previous->revision()))
@@ -38,7 +39,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     // and transaction/replication bookkeeping as the ordinary delete path.
     co_return co_await AppendLocked(store, partition, db_id, key, digest, {},
                                     RecordKind::kTombstone, ValueType::kNone, 0,
-                                    tx, 0, nullptr, nullptr, replication);
+                                    tx, 0, nullptr, nullptr, replication,
+                                    nullptr, true, nullptr,
+                                    mutation_precondition);
   }
   const auto field_count = plan.root_.item_count_;
   const auto value_type = plan.root_.kind_ == OrderedCollectionKind::kList
@@ -91,7 +94,10 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     if (!space.ok()) co_return space;
     InitializeTxWrites(tx::TxRuntime::Get()->next_txid_.fetch_add(
                            1, std::memory_order_relaxed),
-                       std::span(&standalone, 1));
+                       std::span(&standalone, 1),
+                       mutation_precondition != nullptr
+                           ? *mutation_precondition
+                           : MutationPrecondition{});
     tx = &standalone;
   }
   const auto dependency =
@@ -368,7 +374,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   const auto appended = co_await AppendLocked(
       store, partition, db_id, key, digest, *root_payload, RecordKind::kValue,
       value_type, expire_at_ms, tx, field_count, nullptr, nullptr, replication,
-      nullptr, true, nullptr, &mutation);
+      nullptr, true, nullptr, mutation_precondition, &mutation);
   if (!appended.ok()) {
     if (store.write_failed_) {
       // A root may already be staged/published on a fail-stopped path. Its

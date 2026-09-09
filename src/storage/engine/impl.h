@@ -1140,7 +1140,7 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
                            .controller_id_ = device->controller_id_,
                            .io_queue_count_ = device->io_queue_count_};
   }
-  struct stat file_info{};
+  struct stat file_info {};
   if (::stat(path.c_str(), &file_info) != 0) {
     return absl::Status(
         absl::StatusCode::kInternal,
@@ -1808,7 +1808,8 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<SetResult>> Set(
       std::uint8_t db_id, std::string_view key, std::string_view value,
       SetOptions options, ReplicationCommandAppend* replication,
-      SetLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id);
+      SetLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id,
+      const MutationPrecondition* mutation_precondition);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<SetResult>> SetLocked(
@@ -1816,71 +1817,84 @@ class StorageEngine::Impl {
       std::string_view value, SetOptions options, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       SetLatencyTrace* trace = nullptr,
-      std::optional<std::uint16_t> routed_partition_id = std::nullopt);
+      std::optional<std::uint16_t> routed_partition_id = std::nullopt,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
       std::span<const std::string_view> values,
-      ReplicationCommandAppend* replication);
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::span<const std::string_view> values, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   Task<absl::StatusOr<ListResult>> ExecuteList(
       std::uint8_t db_id, std::string_view key, const ListOperation& operation,
-      ReplicationCommandAppend* replication);
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
 
   Task<absl::StatusOr<ListResult>> ExecuteListLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const ListOperation& operation, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   Task<absl::StatusOr<HashResult>> ExecuteHash(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
-      ReplicationCommandAppend* replication);
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
   Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSet(
       std::uint8_t db_id, std::string_view key,
       const SortedSetOperation& operation,
-      ReplicationCommandAppend* replication);
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
   Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   Task<absl::StatusOr<HashResult>> ExecuteHashLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   Task<absl::StatusOr<HashResult>> ExecuteSet(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
-      ReplicationCommandAppend* replication);
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
 
   Task<absl::StatusOr<HashResult>> ExecuteSetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
-  Task<absl::Status> ExecuteCompact(std::uint8_t db_id, std::string_view key,
-                                    ValueType value_type, bool read_only,
-                                    const CompactValueCallback& callback,
-                                    std::uint64_t now_ms,
-                                    ReplicationCommandAppend* replication);
+  Task<absl::Status> ExecuteCompact(
+      std::uint8_t db_id, std::string_view key, ValueType value_type,
+      bool read_only, const CompactValueCallback& callback,
+      std::uint64_t now_ms, ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
   Task<absl::Status> ExecuteCompactLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ValueType value_type, bool read_only,
       const CompactValueCallback& callback, TxShardWrites* tx = nullptr,
       std::uint64_t now_ms = 0, ReplicationCommandAppend* replication = nullptr,
-      bool prepare_unlocked = false);
+      bool prepare_unlocked = false,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   Task<absl::StatusOr<HashResult>> ExecuteHashLikeLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, ValueType value_type,
       TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   // The caller retains the ordinary exclusive key hold and store lock. The
   // after-image contains only loaded groups for point operations, or every
@@ -1892,7 +1906,8 @@ class StorageEngine::Impl {
       GroupedHashObject::Handle previous, HashValue after_image,
       std::vector<HashGroupId> changed_groups, std::uint64_t field_count,
       ValueType value_type, std::uint64_t expire_at_ms, TxShardWrites* tx,
-      ReplicationCommandAppend* replication);
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   // The plan contains complete changed ordered pages, not an append-only
   // mutation log. Null previous promotes a compact collection; the adapter
@@ -1902,7 +1917,8 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedHashObject::Handle previous, OrderedCollectionMutationPlan plan,
       std::uint64_t expire_at_ms, TxShardWrites* tx,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   struct SortedSetMemberMutation {
     MemoryReservation scratch_;
     MemoryReservation leaves_;
@@ -1920,7 +1936,8 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedHashObject::Handle previous, std::uint64_t expire_at_ms,
-      TxShardWrites* tx, ReplicationCommandAppend* replication);
+      TxShardWrites* tx, ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition = nullptr);
   // Publishes a new root revision over an already retained predecessor graph;
   // the caller separately cancels retirements for reused physical groups.
   Task<absl::Status> RestoreGroupedViewLocked(
@@ -1932,12 +1949,14 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const ListOperation& operation, GroupedHashObject::Handle previous,
-      TxShardWrites* tx, ReplicationCommandAppend* replication);
+      TxShardWrites* tx, ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition = nullptr);
   Task<absl::StatusOr<SortedSetResult>> ExecuteGroupedSortedSetLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation, GroupedHashObject::Handle previous,
-      TxShardWrites* tx, ReplicationCommandAppend* replication);
+      TxShardWrites* tx, ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 
@@ -1951,7 +1970,8 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, GroupedHashObject::Handle object,
       ValueType value_type, TxShardWrites* tx,
-      ReplicationCommandAppend* replication);
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition = nullptr);
   Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                            std::string_view key,
                                            const Digest& digest);
@@ -1966,49 +1986,60 @@ class StorageEngine::Impl {
   Task<absl::Status> WriteValueForTransferLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const TransferValue& value, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
   Task<absl::StatusOr<RestoreRawResult>> RestoreRawValue(
       std::uint8_t db_id, std::string_view key, const RawValue& value,
-      bool replace, ReplicationCommandAppend* replication);
+      bool replace, ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
   Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValue(
       std::uint8_t db_id, std::string_view key, ValueType type,
       std::uint64_t expire_at_ms, bool replace,
       std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
-      ReplicationCommandAppend* replication);
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition = nullptr);
   Task<absl::StatusOr<RestoreRawResult>> RestoreCollectionValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ValueType type, std::uint64_t expire_at_ms, bool replace,
       std::optional<std::uint64_t> expected_items, CollectionPageReader reader,
-      TxShardWrites* tx, ReplicationCommandAppend* replication);
+      TxShardWrites* tx, ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
   Task<absl::StatusOr<RestoreRawResult>> RestoreRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const RawValue& value, bool replace, TxShardWrites* tx,
-      ReplicationCommandAppend* replication);
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   Task<absl::Status> WriteRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const RawValue& value, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   Task<absl::StatusOr<bool>> UpdateExpiration(
       std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
-      ExpirationCondition condition, ReplicationCommandAppend* replication);
+      ExpirationCondition condition, ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::uint64_t expire_at_ms, ExpirationCondition condition,
       TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
-  Task<absl::StatusOr<bool>> Delete(std::uint8_t db_id, std::string_view key,
-                                    ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<bool>> Delete(
+      std::uint8_t db_id, std::string_view key,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<bool>> DeleteLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   // Freezes the keyspace against expiration writes for stable-count scans
   // (KEYS): client writes are already excluded by the closed database gate;
@@ -2089,7 +2120,8 @@ class StorageEngine::Impl {
     return tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
   }
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
-  void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes);
+  void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes,
+                          MutationPrecondition mutation_precondition);
   void RegisterRecoveredTxGeneration(WorkerStore& store,
                                      std::uint64_t generation);
 
@@ -2515,7 +2547,22 @@ class StorageEngine::Impl {
                                                 std::memory_order_release);
     replica_recovery_fenced_.store(true, std::memory_order_release);
     replica_loading_.store(true, std::memory_order_release);
+    // Publish the monitor notification last. Its acquire load then proves the
+    // immediate request/replication fence was already visible before worker
+    // zero begins the asynchronous NodeControl barrier.
+    runtime_failure_latched_.store(true, std::memory_order_release);
   }
+  bool RuntimeFailureLatched() const noexcept {
+    return runtime_failure_latched_.load(std::memory_order_acquire);
+  }
+  // Worker-local write_failed_ preserves existing shutdown/drain diagnostics;
+  // the process-wide latch closes every request path and lets worker zero join
+  // NodeControl cleanup. Both are irreversible for this process.
+  void LatchRuntimeFailure(WorkerStore& store) noexcept {
+    store.write_failed_ = true;
+    LatchRuntimeFailure();
+  }
+  void LatchRuntimeFailure() noexcept { FenceRequestServingUntilRestart(); }
 
  private:
   struct DurableSystemState {
@@ -3111,6 +3158,7 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication = nullptr,
       SetLatencyTrace* trace = nullptr, bool capture_fullsync = true,
       TxUndoLog* replacement_undo = nullptr,
+      const MutationPrecondition* mutation_precondition = nullptr,
       GroupMutationWrite* grouped = nullptr);
 
   Task<absl::Status> CaptureRdbSnapshotBeforeWriteLocked(
@@ -3298,7 +3346,9 @@ class StorageEngine::Impl {
       const ExplicitWriteRoot* explicit_root = nullptr,
       TxUndoLog* replacement_undo = nullptr,
       WorkerStore::PartitionStore* known_partition = nullptr,
-      const GroupRecordWrite* group = nullptr);
+      const GroupRecordWrite* group = nullptr,
+      bool mark_watched = false,
+      const MutationPrecondition* mutation_precondition = nullptr);
 
   absl::StatusOr<RecordIndex::Entry*> ReplaceIndexLocation(
       WorkerStore& store, RecordIndex& index, RecordIndex::Entry* entry,
@@ -3550,6 +3600,7 @@ class StorageEngine::Impl {
   std::atomic<bool> shutdown_checkpoint_published_{false};
   std::atomic<bool> abandon_worker_state_on_finalize_{false};
   std::atomic<bool> epoch_metadata_failed_{false};
+  std::atomic<bool> runtime_failure_latched_{false};
   // Cold branch on every logical write. It is set only while this node is
   // destructively rebuilding its single data root; foreground commands are
   // rejected above the engine, while tail commands stamp the pending epochs.
@@ -3624,6 +3675,7 @@ class StorageEngine::Impl {
   std::unique_ptr<CoroutineBarrier> orphan_extent_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_tx_cleaned_barrier_;
+  std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_refrozen_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_built_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_published_barrier_;
   std::atomic<std::uint64_t> recovery_scanned_blocks_{0};

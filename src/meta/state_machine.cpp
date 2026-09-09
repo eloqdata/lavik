@@ -175,6 +175,7 @@ absl::StatusOr<std::unique_ptr<MetaStateMachine>> MetaStateMachine::Open(
     machine->last_snapshot_ = data.snapshot_;
     machine->snapshots_[latest_idx] = std::move(data);
     machine->last_committed_idx_ = latest_idx;
+    machine->last_state_change_idx_ = latest_idx;
   }
 
   try {
@@ -241,6 +242,7 @@ nuraft::ptr<nuraft::buffer> MetaStateMachine::commit(nuraft::ulong log_idx,
     // it names. Readers cannot copy stores_ until the cursor and sink event
     // for this commit are both visible.
     last_committed_idx_ = log_idx;
+    last_state_change_idx_ = log_idx;
     // Coordinator commit-event sink: still under the state mutex, so consumers
     // observe the event atomically with the apply. The sink contract
     // (state_machine.h) keeps this O(1) and non-blocking.
@@ -261,8 +263,14 @@ nuraft::ptr<nuraft::buffer> MetaStateMachine::commit(nuraft::ulong log_idx,
 void MetaStateMachine::commit_config(
     nuraft::ulong log_idx, nuraft::ptr<nuraft::cluster_config>& /*new_conf*/) {
   // Membership bindings use ordinary committed commands in a two-phase
-  // transition; the configuration entry itself touches no store.
-  last_committed_idx_ = log_idx;
+  // transition; the configuration entry itself touches no store. NuRaft may
+  // deliver a configuration callback after a newer ordinary commit has
+  // already advanced the visible cursor, so this hook must never regress it.
+  nuraft::ulong current = last_committed_idx_.load(std::memory_order_relaxed);
+  while (current < log_idx && !last_committed_idx_.compare_exchange_weak(
+                                  current, log_idx, std::memory_order_release,
+                                  std::memory_order_relaxed)) {
+  }
 }
 
 nuraft::ptr<nuraft::snapshot> MetaStateMachine::last_snapshot() {
@@ -505,6 +513,7 @@ bool MetaStateMachine::apply_snapshot(nuraft::snapshot& s) {
   snapshots_[idx] = std::move(data);
   PruneSnapshotsLocked(idx);
   if (last_committed_idx_ < idx) last_committed_idx_ = idx;
+  if (last_state_change_idx_ < idx) last_state_change_idx_ = idx;
   return true;
 }
 

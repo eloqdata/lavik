@@ -2,19 +2,35 @@
 
 // Process-wide cluster data-plane runtime. Installed once at
 // startup when `cluster-enabled yes`, before any client connection is
-// served; nullptr in standalone mode. Everything except the TopologyCache is
-// immutable after installation, so readers need no synchronization.
+// served; nullptr in standalone mode. The object graph and advertised
+// endpoints are immutable after installation; the cache, authority guard, and
+// node controller own their documented synchronized/worker-affine state.
 
 #include <cstdint>
 #include <memory>
 #include <string>
 
+#include "keylane/cluster/node_control.h"
 #include "keylane/cluster/topology.h"
 
 namespace keylane::cluster {
 
 struct ClusterRuntime {
+  // Static mode is the compatibility default. Meta-controlled startup passes
+  // kFinite and a process-lifetime ReplicationManager adapter.
+  explicit ClusterRuntime(
+      AuthorityGuard::LeaseMode lease_mode =
+          AuthorityGuard::LeaseMode::kPermanent,
+      std::unique_ptr<NodeControlActions> actions = nullptr);
+
   TopologyCache topology_cache_;
+  NullNodeControlActions null_control_actions_;
+  // Meta mode owns the ReplicationManager adapter for exactly as long as the
+  // installer can dispatch into it. Static mode leaves this null and uses the
+  // no-op adapter above.
+  std::unique_ptr<NodeControlActions> control_actions_;
+  AuthorityGuard authority_guard_;
+  NodeControlInstaller node_control_installer_;
   // Advertised address of this node for discovery self entries (the
   // cluster-announce-* values after defaults resolve). An empty host keeps
   // the existing wildcard-bind convention: clients dial the startup node's

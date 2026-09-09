@@ -5,22 +5,26 @@ namespace keylane::storage {
 Task<absl::StatusOr<SortedSetResult>> StorageEngine::ExecuteSortedSet(
     std::uint8_t db_id, std::string_view key,
     const SortedSetOperation& operation,
-    ReplicationCommandAppend* replication) {
-  return impl_->ExecuteSortedSet(db_id, key, operation, replication);
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
+  return impl_->ExecuteSortedSet(db_id, key, operation, replication,
+                                 mutation_precondition);
 }
 
 Task<absl::StatusOr<SortedSetResult>> StorageEngine::ExecuteSortedSetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const SortedSetOperation& operation, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   return impl_->ExecuteSortedSetLocked(db_id, key, digest, operation, tx,
-                                       replication);
+                                       replication, mutation_precondition);
 }
 
 Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
     std::uint8_t db_id, std::string_view key,
     const SortedSetOperation& operation,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   const bool read_only = operation.kind_ != SortedSetOperationKind::kAdd &&
@@ -30,7 +34,8 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
       db_id, tx::FingerprintOf(digest),
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
   co_return co_await ExecuteSortedSetLocked(db_id, key, digest, operation,
-                                            nullptr, replication);
+                                            nullptr, replication,
+                                            mutation_precondition);
 }
 
 }  // namespace keylane::storage

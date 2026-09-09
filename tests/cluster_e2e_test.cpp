@@ -593,7 +593,7 @@ TEST(ClusterE2eTest, RoutingAndClusterModePolicies) {
   EXPECT_EQ(ca.Command({"EXEC"}),
             "-CROSSSLOT Keys in request don't hash to the same slot");
 
-  // Cluster-mode policies, verbatim Redis texts.
+  // Cluster-mode policies and stable wire texts.
   EXPECT_EQ(ca.Command({"SELECT", "0"}), "+OK");
   EXPECT_EQ(ca.Command({"SELECT", "1"}),
             "-ERR SELECT is not allowed in cluster mode");
@@ -601,6 +601,42 @@ TEST(ClusterE2eTest, RoutingAndClusterModePolicies) {
             "-ERR Copying to another database is not allowed in cluster mode");
   EXPECT_EQ(ca.Command({"REPLICAOF", "127.0.0.1", "1"}),
             "-ERR REPLICAOF not allowed in cluster mode.");
+  // Static compatibility mode has permanent authority. Its sole local
+  // slot-owning primary retains the existing process-wide mutation surface;
+  // the replica case below remains fail-closed.
+  EXPECT_EQ(ca.Command({"FLUSHDB"}), "+OK");
+  EXPECT_EQ(ca.Command({"FLUSHALL"}), "+OK");
+  constexpr std::string_view static_library =
+      "#!lua name=static_cluster\n"
+      "redis.register_function('static_value', function(keys, args) "
+      "return 1 end)";
+  EXPECT_EQ(ca.Command({"FUNCTION", "LOAD", std::string(static_library)}),
+            "$14\r\nstatic_cluster");
+  EXPECT_NE(ca.Command({"FUNCTION", "LIST"}).find("static_cluster"),
+            std::string::npos);
+  EXPECT_EQ(ca.Command({"FUNCTION", "DELETE", "static_cluster"}), "+OK");
+  constexpr std::string_view static_exec_library =
+      "#!lua name=static_exec\n"
+      "redis.register_function('static_exec_value', function(keys, args) "
+      "return 1 end)";
+  EXPECT_EQ(ca.Command({"MULTI"}), "+OK");
+  EXPECT_EQ(
+      ca.Command({"FUNCTION", "LOAD", std::string(static_exec_library)}),
+      "+QUEUED");
+  EXPECT_EQ(ca.Command({"EXEC"}), "*1\r\n$11\r\nstatic_exec");
+  EXPECT_NE(ca.Command({"FUNCTION", "LIST"}).find("static_exec"),
+            std::string::npos);
+  EXPECT_EQ(ca.Command({"FUNCTION", "DELETE", "static_exec"}), "+OK");
+  EXPECT_TRUE(
+      ca.Command({"SCRIPT", "LOAD", "return 1"}).starts_with("$40\r\n"));
+  RespClient native_export(cluster.port_a);
+  EXPECT_EQ(
+      native_export.Command({"KLPSYNC", "1", "?", "?", "?", "?", "?", "?"}),
+      "-ERR native replication export is unavailable in static cluster mode");
+  RespClient redis_export(cluster.port_a);
+  EXPECT_EQ(redis_export.Command({"REPLCONF", "capa", "eof"}), "+OK");
+  EXPECT_EQ(redis_export.Command({"PSYNC", "?", "-1"}),
+            "-ERR Redis replication export is unavailable in cluster mode");
 
   // INFO advertises cluster mode in both sections.
   const std::string info_all = ca.Command({"INFO"});
@@ -616,6 +652,15 @@ TEST(ClusterE2eTest, ReplicaReadonlyAdmission) {
   cluster.Start();
 
   RespClient replica(cluster.port_r);
+  // Static topology has no replication lifecycle capable of transferring
+  // durable expiration authority. tomb_raider_enabled is fixed from that same
+  // startup authority bit, so this catches accidental coupling to Meta-only
+  // population management.
+  const std::string replica_stats = replica.Command({"INFO", "STATS"});
+  EXPECT_NE(replica_stats.find("tomb_raider_enabled:0"), std::string::npos)
+      << replica_stats;
+  EXPECT_EQ(replica.Command({"FLUSHDB"}),
+            "-ERR FLUSHDB is not allowed in cluster mode");
   const std::string key_a = KeyInSlotRange(kSlotsAFirst, kSlotsALast);
 
   // Without READONLY every keyed request redirects to the primary.
@@ -638,6 +683,63 @@ TEST(ClusterE2eTest, ReplicaReadonlyAdmission) {
       absl::StrCat("-MOVED ", SlotOf(key_a), " 127.0.0.1:", cluster.port_a));
 
   cluster.StopAll();
+}
+
+TEST(ClusterE2eTest, SlotlessStaticPrimaryRejectsGlobalMutationsAndExec) {
+  TempDir dir;
+  const std::uint16_t port = FindFreePort();
+  std::uint16_t remote_port = 0;
+  do {
+    remote_port = FindFreePort();
+  } while (remote_port == port);
+  const std::string nodes = dir.Path("nodes.conf");
+  const std::string data = dir.Path("data");
+  const std::string log = dir.Path("server.log");
+  WriteFile(nodes, absl::StrCat(
+                       kNodeD, " 127.0.0.1:", port,
+                       "@0 master - 0 0 1 connected\n", kNodeE,
+                       " 127.0.0.1:", remote_port,
+                       "@0 master - 0 0 1 connected 0-16383\n"
+                       "vars currentEpoch 1 lastVoteEpoch 0\n"));
+  CreateDataFile(data);
+  ServerProcess server(port, data, log, nodes);
+  RespClient client(port);
+
+  const auto ready_deadline = std::chrono::steady_clock::now() + 30s;
+  while (std::chrono::steady_clock::now() < ready_deadline &&
+         !client.Command({"DBSIZE"}).starts_with(":")) {
+    std::this_thread::sleep_for(20ms);
+  }
+  ASSERT_TRUE(client.Command({"DBSIZE"}).starts_with(":"));
+  EXPECT_EQ(client.Command({"FLUSHDB"}),
+            "-ERR FLUSHDB is not allowed in cluster mode");
+  EXPECT_EQ(client.Command({"FLUSHALL"}),
+            "-ERR FLUSHALL is not allowed in cluster mode");
+  constexpr std::string_view library =
+      "#!lua name=slotless_rejected\n"
+      "redis.register_function('slotless_value', function(keys, args) "
+      "return 1 end)";
+  EXPECT_EQ(client.Command({"FUNCTION", "LOAD", std::string(library)}),
+            "-ERR FUNCTION LOAD is not allowed in cluster mode");
+  EXPECT_EQ(client.Command({"FUNCTION", "DELETE", "slotless_rejected"}),
+            "-ERR FUNCTION DELETE is not allowed in cluster mode");
+  EXPECT_EQ(client.Command({"FUNCTION", "FLUSH"}),
+            "-ERR FUNCTION FLUSH is not allowed in cluster mode");
+  EXPECT_EQ(client.Command({"FUNCTION", "RESTORE", "payload"}),
+            "-ERR FUNCTION RESTORE is not allowed in cluster mode");
+  EXPECT_EQ(client.Command({"FUNCTION", "LIST"}), "*0");
+
+  // FUNCTION mutations are otherwise legal transaction children. Rejecting
+  // this one at queue time is important: a slotless EXEC has no union slot on
+  // which to perform its final authority recheck.
+  EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+  EXPECT_EQ(client.Command({"FUNCTION", "LOAD", std::string(library)}),
+            "-ERR FUNCTION LOAD is not allowed in cluster mode");
+  EXPECT_EQ(client.Command({"EXEC"}),
+            "-EXECABORT Transaction discarded because of previous errors.");
+  EXPECT_EQ(client.Command({"FUNCTION", "LIST"}), "*0");
+
+  server.Stop();
 }
 
 TEST(ClusterE2eTest, CoverageGapReportsClusterDown) {

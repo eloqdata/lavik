@@ -3,6 +3,7 @@
 #include <charconv>
 #include <limits>
 
+#include "cluster_gate.h"
 #include "keylane/resp.h"
 
 namespace keylane {
@@ -187,9 +188,11 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
   auto replication =
       tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
   if (digest == nullptr) {
-    result =
-        co_await g_storage->ExecuteHash(request.db_id_, args[1], operation,
-                                        replication ? &*replication : nullptr);
+    const storage::MutationPrecondition mutation_precondition =
+        ClusterMutationPrecondition(request);
+    result = co_await g_storage->ExecuteHash(
+        request.db_id_, args[1], operation,
+        replication ? &*replication : nullptr, &mutation_precondition);
   } else {
     result = co_await g_storage->ExecuteHashLocked(
         request.db_id_, args[1], *digest, operation, tx,

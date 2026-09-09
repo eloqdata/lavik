@@ -113,6 +113,10 @@ int main(int argc, char** argv) {
   app.add_option("--cluster-static-nodes-file",
                  options.cluster_static_nodes_file_,
                  "Shared nodes.conf-format static cluster topology file");
+  app.add_option("--cluster-meta-seed", options.cluster_meta_seeds_,
+                 "Numeric Meta data-control endpoint; repeat for bootstrap");
+  app.add_option("--cluster-node-id", options.cluster_node_id_,
+                 "40-character lowercase hex data-node identity");
   app.add_option("--cluster-announce-ip", options.cluster_announce_ip_,
                  "Client-facing address advertised by cluster discovery");
   app.add_option("--cluster-announce-port", options.cluster_announce_port_,

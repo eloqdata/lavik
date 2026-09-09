@@ -90,6 +90,30 @@ histogram_quantile(
 )
 ```
 
+## Cluster control metrics
+
+Meta-managed Data nodes export process-level control health without node,
+group, assignment, directive, or operation identifiers as labels:
+
+- `keylane_cluster_control_connected`: 1 while worker 0 owns an accepted Meta
+  session, otherwise 0.
+- `keylane_cluster_control_reconnects_total`: reconnect rounds after the first
+  attempt.
+- `keylane_cluster_control_protocol_errors_total`: sessions closed for invalid
+  framing or protocol state.
+- `keylane_cluster_control_full_states_applied_total`: complete desired-state
+  projections installed atomically.
+- `keylane_cluster_control_lease_decisions_total{decision="granted|denied"}`:
+  finite-authority outcomes returned by Meta.
+- `keylane_cluster_control_lease_expirations_total`: locally detected lease
+  expirations that fenced authority.
+- `keylane_cluster_control_directive_results_total{result="success|failure"}`:
+  terminal Data-side directive execution outcomes.
+
+Alert on a Meta-managed node remaining disconnected, repeated protocol errors,
+or lease expirations. A reconnect count alone is diagnostic: leader changes and
+process restarts legitimately increment it.
+
 ## Storage metrics
 
 The active defrag tuning values are exported alongside the work gauges so

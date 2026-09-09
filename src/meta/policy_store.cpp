@@ -124,6 +124,18 @@ std::optional<std::uint64_t> MetaPolicyStore::LatestVersion(
   return policy->second.rbegin()->first;
 }
 
+std::vector<MetaPolicyVersionView> MetaPolicyStore::Versions() const {
+  std::vector<MetaPolicyVersionView> result;
+  for (const auto& [policy_id, versions] : policies_) {
+    for (const auto& [version, state] : versions) {
+      result.push_back(MetaPolicyVersionView{policy_id, version, state.content_,
+                                             state.content_hash_,
+                                             state.retired_});
+    }
+  }
+  return result;
+}
+
 // Envelope: schema_version u16 | policy count u32 | per policy (sorted):
 // policy_id, version count u32, versions ascending (version u64, retired u8,
 // content, hash). See the header for the strictness contract.

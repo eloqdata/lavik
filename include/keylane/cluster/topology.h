@@ -28,6 +28,7 @@
 
 #include "absl/container/inlined_vector.h"
 #include "absl/status/statusor.h"
+#include "keylane/cluster/control_types.h"
 
 namespace keylane::cluster {
 
@@ -94,9 +95,11 @@ inline constexpr GroupIndex kNoGroupIndex =
     std::numeric_limits<GroupIndex>::max();
 static_assert(kSlotCount < kNoGroupIndex);
 
-// One cluster node as the data plane sees it. In v1 the static topology file
-// is the only source; `tls_port_` is the configured cluster-wide TLS port
-// (uniform-port assumption, see control_port.h).
+// One cluster node as the data plane sees it. Static mode builds this from its
+// topology file; Meta-managed mode builds it from an authenticated complete
+// desired state. Static mode applies the cluster-wide uniform TLS-port
+// assumption documented by control_port.h; Meta mode preserves each node's
+// committed endpoint independently.
 struct alignas(64) NodeDescriptor {
   NodeId node_id_;              // stable across restarts
   bool link_connected_ = true;  // parsed from the file; not consulted in v1
@@ -224,15 +227,24 @@ class [[nodiscard]] InFlightGuard {
 };
 
 // Authority and readiness for one shard group. `group_id_` is opaque to the
-// data plane; the static adapter uses the primary's node id (a future Meta
-// adapter will assign Meta-scoped ids over the same seam).
+// data plane; the static adapter uses the primary's node id while Meta control
+// supplies the committed Meta group id through the node controller.
 struct GroupView {
   std::string group_id_;
   NodeIndex primary_node_index_ = kNoNodeIndex;
+  // Meta creates a fresh assignment incarnation on remove/re-add. Monotonic
+  // authority counters are compared only while this identity is unchanged.
+  // Static topology leaves it empty and uses a permanent local lease.
+  AssignmentId assignment_id_;
+  // This is the committed desired grant, not a live lease. A Meta-managed
+  // primary serves only while AuthorityGuard also holds an unexpired lease.
   bool granted_ = true;  // false = fenced: this group must not serve
   bool population_ready_ = true;
   bool storage_ready_ = true;
   std::uint64_t group_term_ = 0;
+  std::uint64_t authority_version_ = 0;
+  std::uint64_t grant_revision_ = 0;
+  std::uint64_t manifest_revision_ = 0;
   std::uint64_t config_epoch_ = 0;
   std::vector<NodeIndex> replica_node_indices_;
   std::vector<SlotRange> slot_ranges_;  // owned slots, validated at Build
@@ -259,6 +271,9 @@ class ServingState {
   const GroupView* GroupForSlot(std::uint16_t slot) const;
   bool CoverageComplete() const { return covered_slots_ == kSlotCount; }
   std::uint32_t CoveredSlotCount() const { return covered_slots_; }
+  // Builder setting retained so installer-driven readiness/fence republishes
+  // preserve the request-worker stripe layout.
+  std::size_t InFlightStripeCount() const { return in_flight_stripe_count_; }
   // True when every group's storage and population are ready. Global/admin
   // commands without keys consult this aggregate.
   bool FullyReady() const;
@@ -296,6 +311,7 @@ class ServingState {
   // keeps the hot, fixed-size routing table at 32 KiB.
   std::array<GroupIndex, kSlotCount> slot_to_group_;
   std::uint32_t covered_slots_ = 0;
+  std::size_t in_flight_stripe_count_ = 1;
   // Precomputed per-group authority tokens, parallel to groups_. Computed
   // once at Build so the request path never hashes or scans for them.
   std::vector<std::uint64_t> group_tokens_;

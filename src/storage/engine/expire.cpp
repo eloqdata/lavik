@@ -200,7 +200,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
     if (!dead.ok()) break;
     dead = co_await MarkRecordDead(record);
   }
-  if (!dead.ok()) store.write_failed_ = true;
+  if (!dead.ok()) LatchRuntimeFailure(store);
   co_return dead;
 }
 
@@ -290,9 +290,19 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
         if (store->expiry_scan_cursor_ == 0) {
           AdvanceExpiryMap(*store);
         }
+        // A populated index can run callbacks and external-key reads. Keep the
+        // original per-map checkpoint for dense TTL workloads; only empty maps
+        // use the bounded batching fast path below.
+        co_await celer::Yield(*store->worker_);
       }
-      co_await celer::Yield(*store->worker_);
     }
+    // Empty maps are the common case across 16,384 partitions and 16 DBs.
+    // Yielding once per map makes a complete pass depend on hundreds of
+    // thousands of scheduler turns, so a key scanned just before its TTL can
+    // remain uncollected for longer than a full-device reclaim can tolerate.
+    // The fixed empty-map bound keeps this batch short while one yield
+    // preserves fairness before candidate deletion begins.
+    co_await celer::Yield(*store->worker_);
 
     std::size_t deleted = 0;
     bool warned_failure = false;

@@ -32,9 +32,25 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr std::uint64_t kMiB = 1024 * 1024;
+constexpr std::uint64_t kPartitionReplicationEpoch = 23;
 
 absl::Status TestFailure(std::string_view message) {
   return absl::FailedPreconditionError(std::string(message));
+}
+
+bool IsCanonicalReplicationId(std::string_view value) {
+  if (value.size() != 40) return false;
+  for (const unsigned char digit : value) {
+    if ((digit < '0' || digit > '9') && (digit < 'a' || digit > 'f')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string RespBulk(std::string_view value) {
+  return "$" + std::to_string(value.size()) + "\r\n" + std::string(value) +
+         "\r\n";
 }
 
 // A system-boundary peer that returns one well-formed KLFULLRESYNC carrying the
@@ -43,10 +59,17 @@ absl::Status TestFailure(std::string_view message) {
 // deterministic without exposing a test-only manager state mutation.
 class StallingNativeSource {
  public:
-  StallingNativeSource()
-      : first_response_("+KLFULLRESYNC 1 " + std::string(40, 'a') + " " +
+  StallingNativeSource(std::string expected_target_node_id,
+                       std::uint16_t target_port)
+      : expected_client_identity_(RespBulk("?" + expected_target_node_id + ":" +
+                                           std::to_string(target_port))),
+        expected_population_target_(RespBulk(expected_target_node_id)),
+        expected_population_epoch_(
+            RespBulk(std::to_string(kPartitionReplicationEpoch))),
+        first_response_("+KLFULLRESYNC 1 " + std::string(40, 'a') + " " +
                         std::string(40, 'e') + " " + std::string(40, 'b') +
-                        " " + std::string(40, 'c') + " 1\r\n") {
+                        " " + std::string(40, 'c') + " 1 " +
+                        std::string(40, 'f') + "\r\n") {
     listener_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listener_ < 0) {
       error_.store(errno == 0 ? EIO : errno, std::memory_order_release);
@@ -97,6 +120,18 @@ class StallingNativeSource {
     return closed_.load(std::memory_order_acquire);
   }
   int error() const noexcept { return error_.load(std::memory_order_acquire); }
+  bool saw_directive_identity() const noexcept {
+    return saw_directive_identity_.load(std::memory_order_acquire);
+  }
+  bool saw_configured_node_identity() const noexcept {
+    return saw_configured_node_identity_.load(std::memory_order_acquire);
+  }
+  bool saw_source_assignment() const noexcept {
+    return saw_source_assignment_.load(std::memory_order_acquire);
+  }
+  bool saw_population_epoch() const noexcept {
+    return saw_population_epoch_.load(std::memory_order_acquire);
+  }
 
  private:
   void AcceptConnections(std::stop_token stop) noexcept {
@@ -130,6 +165,56 @@ class StallingNativeSource {
       const unsigned accepted =
           accepted_.fetch_add(1, std::memory_order_acq_rel) + 1;
       if (accepted == 1) {
+        // Read the complete identity prefix before answering so this test also
+        // pins the pre-release POPULATION field order at the network boundary.
+        constexpr std::string_view kDirectiveIdentity =
+            "$11\r\noperation-a\r\n$11\r\ndirective-a\r\n"
+            "$9\r\nattempt-1\r\n$1\r\n1\r\n$64\r\n";
+        constexpr std::string_view kSourceAssignment =
+            "$19\r\nsource-assignment-a\r\n";
+        std::string request;
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (
+            (request.find(kDirectiveIdentity) == std::string::npos ||
+             request.find(kSourceAssignment) == std::string::npos ||
+             request.find(expected_client_identity_) == std::string::npos ||
+             request.find(expected_population_target_) == std::string::npos ||
+             request.find(expected_population_epoch_) == std::string::npos) &&
+            std::chrono::steady_clock::now() < deadline) {
+          pollfd peer{.fd = connection, .events = POLLIN, .revents = 0};
+          const int activity = ::poll(&peer, 1, 50);
+          if (activity < 0) {
+            if (errno == EINTR) continue;
+            break;
+          }
+          if (activity == 0 || (peer.revents & POLLIN) == 0) continue;
+          char buffer[4096];
+          const ssize_t received =
+              ::recv(connection, buffer, sizeof(buffer), 0);
+          if (received <= 0) break;
+          request.append(buffer, static_cast<std::size_t>(received));
+        }
+        if (request.find(kDirectiveIdentity) == std::string::npos) {
+          error_.store(EPROTO, std::memory_order_release);
+          (void)::close(connection);
+          return;
+        }
+        if (request.find(kSourceAssignment) == std::string::npos) {
+          error_.store(EPROTO, std::memory_order_release);
+          (void)::close(connection);
+          return;
+        }
+        if (request.find(expected_client_identity_) == std::string::npos ||
+            request.find(expected_population_target_) == std::string::npos ||
+            request.find(expected_population_epoch_) == std::string::npos) {
+          error_.store(EPROTO, std::memory_order_release);
+          (void)::close(connection);
+          return;
+        }
+        saw_directive_identity_.store(true, std::memory_order_release);
+        saw_source_assignment_.store(true, std::memory_order_release);
+        saw_population_epoch_.store(true, std::memory_order_release);
+        saw_configured_node_identity_.store(true, std::memory_order_release);
         const ssize_t sent = ::send(connection, first_response_.data(),
                                     first_response_.size(), MSG_NOSIGNAL);
         if (sent != static_cast<ssize_t>(first_response_.size())) {
@@ -176,12 +261,19 @@ class StallingNativeSource {
 
   int listener_ = -1;
   std::uint16_t port_ = 0;
+  const std::string expected_client_identity_;
+  const std::string expected_population_target_;
+  const std::string expected_population_epoch_;
   const std::string first_response_;
   std::jthread thread_;
   std::atomic<int> connection_{-1};
   std::atomic<unsigned> accepted_{0};
   std::atomic<unsigned> closed_{0};
   std::atomic<int> error_{0};
+  std::atomic<bool> saw_directive_identity_{false};
+  std::atomic<bool> saw_source_assignment_{false};
+  std::atomic<bool> saw_population_epoch_{false};
+  std::atomic<bool> saw_configured_node_identity_{false};
 };
 
 keylane::RebuildDirective TargetDirective(
@@ -196,13 +288,17 @@ keylane::RebuildDirective TargetDirective(
               .directive_revision_ = 1,
               .authority_id_ = "authority-a",
               .source_node_id_ = std::string(40, 'a'),
+              .source_assignment_id_ = "source-assignment-a",
               .source_boot_id_ = std::string(40, 'b'),
               .source_history_id_ = std::string(40, 'c'),
               .target_node_id_ = target.local_node_id_,
               .target_boot_id_ = target.local_boot_id_,
               .operation_id_ = "operation-a",
+              .directive_id_ = "directive-a",
               .attempt_id_ = "attempt-1",
+              .manifest_revision_ = 1,
               .manifest_id_ = manifest.id(),
+              .partition_replication_epoch_ = kPartitionReplicationEpoch,
           },
       .flow_count_ = 1,
       .safe_source_active_ = true,
@@ -231,8 +327,12 @@ class ReplicationManagerService final : public celer::Service {
  public:
   ReplicationManagerService(keylane::storage::StorageEngine* storage,
                             keylane::ReplicationManager* replication,
-                            StallingNativeSource* source)
-      : storage_(storage), replication_(replication), source_(source) {}
+                            StallingNativeSource* source,
+                            std::string expected_node_id)
+      : storage_(storage),
+        replication_(replication),
+        source_(source),
+        expected_node_id_(std::move(expected_node_id)) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) {
@@ -265,11 +365,12 @@ class ReplicationManagerService final : public celer::Service {
 
     const keylane::ClusterPopulationStatus initial =
         co_await replication_->cluster_population_status();
-    if (initial.local_node_id_.empty() || initial.local_boot_id_.empty() ||
+    if (initial.local_node_id_ != expected_node_id_ ||
+        !IsCanonicalReplicationId(initial.local_boot_id_) ||
         initial.state_ != keylane::ReplicationGroupState::kNotReady ||
         initial.ready_token_.has_value()) {
       co_return TestFailure(
-          "cluster population did not start with boot-scoped NOT_READY state");
+          "cluster population did not use the configured node identity");
     }
     absl::Status startup_wait = co_await celer::SleepFor(worker, 50ms);
     if (!startup_wait.ok()) co_return startup_wait;
@@ -315,6 +416,11 @@ class ReplicationManagerService final : public celer::Service {
 
     const keylane::ReplicationStatus replication_status =
         co_await replication_->Observe();
+    if (replication_status.local_node_id_ != expected_node_id_ ||
+        replication_status.boot_id_ != initial.local_boot_id_) {
+      co_return TestFailure(
+          "replication status did not preserve the configured node identity");
+    }
     keylane::RebuildDirective source_authorization = directive;
     source_authorization.identity_.source_node_id_ = initial.local_node_id_;
     source_authorization.identity_.source_boot_id_ = initial.local_boot_id_;
@@ -338,7 +444,11 @@ class ReplicationManagerService final : public celer::Service {
 
     applied = co_await replication_->ApplyClusterRebuildDirective(
         upstream, directive, *manifest);
-    if (!applied.ok()) co_return applied;
+    if (applied.code() != absl::StatusCode::kFailedPrecondition) {
+      co_return TestFailure(
+          "rebuild admission was reported as terminal success before the "
+          "source identity failure");
+    }
     absl::Status peer = co_await WaitForPeerCount(
         worker, *source_, false, 1,
         "native source did not receive the mismatched-group connection");
@@ -347,6 +457,23 @@ class ReplicationManagerService final : public celer::Service {
         worker, *source_, true, 1,
         "target did not reject the mismatched source group");
     if (!peer.ok()) co_return peer;
+    if (!source_->saw_directive_identity()) {
+      co_return TestFailure(
+          "native POPULATION handshake omitted the directive identity");
+    }
+    if (!source_->saw_source_assignment()) {
+      co_return TestFailure(
+          "native POPULATION handshake omitted the source assignment");
+    }
+    if (!source_->saw_population_epoch()) {
+      co_return TestFailure(
+          "native POPULATION handshake omitted the partition replication "
+          "epoch");
+    }
+    if (!source_->saw_configured_node_identity()) {
+      co_return TestFailure(
+          "native POPULATION handshake did not use the configured node id");
+    }
 
     keylane::ClusterPopulationStatus after_mismatch;
     const auto mismatch_deadline = std::chrono::steady_clock::now() + 5s;
@@ -365,9 +492,10 @@ class ReplicationManagerService final : public celer::Service {
 
     directive.identity_.directive_revision_ = 2;
     directive.identity_.attempt_id_ = "attempt-2";
-    applied = co_await replication_->ApplyClusterRebuildDirective(
+    auto started = co_await replication_->StartClusterRebuildDirective(
         upstream, directive, *manifest);
-    if (!applied.ok()) co_return applied;
+    if (!started.ok()) co_return started.status();
+    keylane::ClusterRebuildCompletion in_progress = std::move(*started);
     const keylane::ClusterPopulationStatus rebuilding =
         co_await replication_->cluster_population_status();
     if (rebuilding.state_ != keylane::ReplicationGroupState::kRebuilding ||
@@ -379,9 +507,9 @@ class ReplicationManagerService final : public celer::Service {
         "native source did not receive the replacement rebuild connection");
     if (!peer.ok()) co_return peer;
 
-    applied = co_await replication_->ApplyClusterRebuildDirective(
+    auto replay = co_await replication_->StartClusterRebuildDirective(
         upstream, directive, *manifest);
-    if (!applied.ok()) {
+    if (!replay.ok()) {
       co_return TestFailure(
           "exact in-progress directive replay was not idempotent");
     }
@@ -390,10 +518,10 @@ class ReplicationManagerService final : public celer::Service {
         source_->port() == std::numeric_limits<std::uint16_t>::max()
             ? static_cast<std::uint16_t>(source_->port() - 1)
             : static_cast<std::uint16_t>(source_->port() + 1);
-    applied = co_await replication_->ApplyClusterRebuildDirective(
+    auto conflicting = co_await replication_->StartClusterRebuildDirective(
         keylane::ReplicaOfConfig{"127.0.0.1", conflicting_port}, directive,
         *manifest);
-    if (applied.code() != absl::StatusCode::kFailedPrecondition) {
+    if (conflicting.status().code() != absl::StatusCode::kFailedPrecondition) {
       co_return TestFailure(
           "exact directive replay accepted a conflicting source endpoint");
     }
@@ -405,9 +533,15 @@ class ReplicationManagerService final : public celer::Service {
     keylane::RebuildDirective replacement = directive;
     replacement.identity_.directive_revision_ = 3;
     replacement.identity_.attempt_id_ = "attempt-3";
-    applied = co_await replication_->ApplyClusterRebuildDirective(
-        upstream, replacement, *manifest);
-    if (!applied.ok()) co_return applied;
+    auto replacement_started =
+        co_await replication_->StartClusterRebuildDirective(
+            upstream, replacement, *manifest);
+    if (!replacement_started.ok()) co_return replacement_started.status();
+    if ((co_await in_progress.Await()).code() != absl::StatusCode::kCancelled ||
+        (co_await replay->Await()).code() != absl::StatusCode::kCancelled) {
+      co_return TestFailure(
+          "superseded rebuild did not resolve every exact-attempt waiter");
+    }
 
     peer = co_await WaitForPeerCount(
         worker, *source_, true, 2,
@@ -429,11 +563,100 @@ class ReplicationManagerService final : public celer::Service {
           "replacement directive did not remain fail-closed while rebuilding");
     }
 
-    applied = co_await replication_->ApplyClusterRebuildDirective(
+    auto stale = co_await replication_->StartClusterRebuildDirective(
         upstream, directive, *manifest);
-    if (applied.code() != absl::StatusCode::kFailedPrecondition) {
+    if (stale.status().code() != absl::StatusCode::kFailedPrecondition) {
       co_return TestFailure("supersession did not reject the stale directive");
     }
+
+    keylane::DesiredClusterPopulation desired{
+        .group_id_ = replacement.identity_.group_id_,
+        .assignment_id_ = replacement.identity_.assignment_id_,
+        .term_ = replacement.identity_.term_,
+        .manifest_revision_ = replacement.identity_.manifest_revision_,
+        .manifest_id_ = replacement.identity_.manifest_id_,
+        .partition_replication_epoch_ =
+            replacement.identity_.partition_replication_epoch_,
+        .rebuild_expected_ = true,
+    };
+    absl::Status reconciled =
+        co_await replication_->ReconcileClusterPopulation(desired);
+    if (!reconciled.ok() || replacement_started->result().has_value()) {
+      co_return TestFailure(
+          "matching FDS reconciliation retired its live rebuild successor");
+    }
+
+    ++desired.partition_replication_epoch_;
+    reconciled = co_await replication_->ReconcileClusterPopulation(desired);
+    if (!reconciled.ok() || (co_await replacement_started->Await()).code() !=
+                                absl::StatusCode::kCancelled) {
+      co_return TestFailure(
+          "FDS population epoch change did not retire the stale rebuild");
+    }
+
+    keylane::RebuildDirective after_reconcile = replacement;
+    after_reconcile.identity_.directive_revision_ = 4;
+    after_reconcile.identity_.attempt_id_ = "attempt-4";
+    after_reconcile.identity_.partition_replication_epoch_ =
+        desired.partition_replication_epoch_;
+    auto restarted = co_await replication_->StartClusterRebuildDirective(
+        upstream, after_reconcile, *manifest);
+    if (!restarted.ok()) {
+      co_return TestFailure(
+          "FDS reconciliation permanently closed rebuild admission");
+    }
+
+    desired.rebuild_expected_ = false;
+    reconciled = co_await replication_->ReconcileClusterPopulation(desired);
+    if (!reconciled.ok() ||
+        (co_await restarted->Await()).code() != absl::StatusCode::kCancelled) {
+      co_return TestFailure(
+          "FDS directive removal did not retire the orphan rebuild");
+    }
+
+    keylane::RebuildDirective after_directive_removal = after_reconcile;
+    after_directive_removal.identity_.directive_revision_ = 5;
+    after_directive_removal.identity_.attempt_id_ = "attempt-5";
+    auto after_removal = co_await replication_->StartClusterRebuildDirective(
+        upstream, after_directive_removal, *manifest);
+    if (!after_removal.ok()) {
+      co_return TestFailure(
+          "directive removal reconciliation permanently closed admission");
+    }
+    absl::Status session_cancelled =
+        co_await replication_->CancelInProgressClusterPopulation();
+    if (!session_cancelled.ok() || (co_await after_removal->Await()).code() !=
+                                       absl::StatusCode::kCancelled) {
+      co_return TestFailure(
+          "control loss did not cancel and retire an in-progress rebuild");
+    }
+
+    keylane::RebuildDirective at_shutdown = after_directive_removal;
+    at_shutdown.identity_.directive_revision_ = 6;
+    at_shutdown.identity_.attempt_id_ = "attempt-6";
+    const unsigned accepted_before_shutdown = source_->accepted();
+    auto shutdown_attempt =
+        co_await replication_->StartClusterRebuildDirective(
+            upstream, at_shutdown, *manifest);
+    if (!shutdown_attempt.ok()) co_return shutdown_attempt.status();
+    peer = co_await WaitForPeerCount(
+        worker, *source_, false, accepted_before_shutdown + 1,
+        "shutdown test did not enter its outbound control handshake");
+    if (!peer.ok()) co_return peer;
+
+    replication_->RequestShutdown();
+    absl::Status cancelled =
+        co_await replication_->QuiesceForShutdown();
+    if (!cancelled.ok()) co_return cancelled;
+    if ((co_await shutdown_attempt->Await()).code() !=
+        absl::StatusCode::kCancelled) {
+      co_return TestFailure(
+          "process shutdown did not cancel the active rebuild completion");
+    }
+    peer = co_await WaitForPeerCount(
+        worker, *source_, true, accepted_before_shutdown + 1,
+        "process shutdown did not close the outbound control handshake");
+    if (!peer.ok()) co_return peer;
 
     co_return absl::OkStatus();
   }
@@ -441,24 +664,124 @@ class ReplicationManagerService final : public celer::Service {
   keylane::storage::StorageEngine* storage_ = nullptr;
   keylane::ReplicationManager* replication_ = nullptr;
   StallingNativeSource* source_ = nullptr;
+  std::string expected_node_id_;
   absl::Status result_ = absl::OkStatus();
 };
 
-class StandaloneRevokeService final : public celer::Service {
+class StandaloneIdentityService final : public celer::Service {
  public:
-  explicit StandaloneRevokeService(keylane::ReplicationManager* replication)
-      : replication_(replication) {}
+  StandaloneIdentityService(keylane::ReplicationManager* first,
+                            keylane::ReplicationManager* second,
+                            keylane::ReplicationManager* static_cluster)
+      : first_(first), second_(second), static_cluster_(static_cluster) {}
 
   void Prepare(unsigned) override {}
 
   celer::Task<absl::Status> Run(celer::Worker& worker,
                                 celer::ServiceContext) override {
-    result_ = co_await replication_->RevokeClusterRebuildSourceAuthorizations();
-    if (result_.code() == absl::StatusCode::kFailedPrecondition) {
-      result_ = absl::OkStatus();
-    } else {
+    const keylane::ReplicationStatus first_status = co_await first_->Observe();
+    const keylane::ReplicationStatus second_status =
+        co_await second_->Observe();
+    const keylane::ClusterPopulationStatus first_population =
+        co_await first_->cluster_population_status();
+    const keylane::ClusterPopulationStatus second_population =
+        co_await second_->cluster_population_status();
+    if (!IsCanonicalReplicationId(first_status.local_node_id_) ||
+        !IsCanonicalReplicationId(second_status.local_node_id_) ||
+        first_status.local_node_id_ == second_status.local_node_id_ ||
+        first_population.local_node_id_ != first_status.local_node_id_ ||
+        second_population.local_node_id_ != second_status.local_node_id_) {
+      result_ = TestFailure(
+          "default replication node identities were not unique canonical ids");
+      worker.RequestStop();
+      co_return result_;
+    }
+
+    const keylane::ReplicationStatus static_status =
+        co_await static_cluster_->Observe();
+    if (static_status.role_ != keylane::ReplicationRole::kMaster ||
+        static_status.upstream_.has_value() || static_cluster_->is_loading() ||
+        static_cluster_->reject_writes()) {
+      result_ = TestFailure(
+          "static cluster policy did not ignore a standalone initial "
+          "upstream while preserving storage-based readiness");
+      worker.RequestStop();
+      co_return result_;
+    }
+    keylane::ReplicationDirective set_upstream{
+        .kind_ = keylane::ReplicationDirective::Kind::kSetUpstream,
+        .upstream_ = keylane::ReplicaOfConfig{"127.0.0.1", 1},
+    };
+    result_ = co_await static_cluster_->ApplyDirective(set_upstream);
+    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
+      result_ = TestFailure(
+          "static cluster manager accepted a standalone upstream directive");
+      worker.RequestStop();
+      co_return result_;
+    }
+    set_upstream.kind_ = keylane::ReplicationDirective::Kind::kAddUpstream;
+    result_ = co_await static_cluster_->ApplyDirective(set_upstream);
+    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
+      result_ = TestFailure(
+          "static cluster manager accepted an added standalone upstream");
+      worker.RequestStop();
+      co_return result_;
+    }
+    auto manifest = keylane::PopulationManifest::Create({{0, 1}});
+    if (!manifest.ok()) {
+      result_ = manifest.status();
+      worker.RequestStop();
+      co_return result_;
+    }
+    const keylane::ClusterPopulationStatus static_population =
+        co_await static_cluster_->cluster_population_status();
+    auto rebuild = co_await static_cluster_->StartClusterRebuildDirective(
+        keylane::ReplicaOfConfig{"127.0.0.1", 1},
+        TargetDirective(static_population, *manifest), *manifest);
+    if (rebuild.status().code() != absl::StatusCode::kFailedPrecondition) {
+      result_ = TestFailure(
+          "static cluster manager accepted a Meta population rebuild");
+      worker.RequestStop();
+      co_return result_;
+    }
+    result_ =
+        co_await static_cluster_->ReconcileClusterPopulation(std::nullopt);
+    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
+      result_ =
+          TestFailure("static cluster manager accepted FDS reconciliation");
+      worker.RequestStop();
+      co_return result_;
+    }
+    result_ = co_await static_cluster_->CancelInProgressClusterPopulation();
+    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
+      result_ = TestFailure(
+          "static cluster manager accepted control-loss cancellation");
+      worker.RequestStop();
+      co_return result_;
+    }
+    result_ = co_await static_cluster_->CancelClusterRebuildForShutdown();
+    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
+      result_ = TestFailure(
+          "static cluster manager accepted Meta population shutdown");
+      worker.RequestStop();
+      co_return result_;
+    }
+
+    result_ =
+        co_await first_
+            ->ClearClusterRebuildSourceAuthorizationsForSessionReplacement();
+    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
+      result_ = TestFailure(
+          "standalone manager accepted cluster session authorization cleanup");
+      worker.RequestStop();
+      co_return result_;
+    }
+    result_ = co_await first_->RevokeClusterRebuildSourceAuthorizations();
+    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
       result_ =
           TestFailure("standalone manager accepted cluster source revocation");
+    } else {
+      result_ = absl::OkStatus();
     }
     worker.RequestStop();
     co_return result_;
@@ -469,17 +792,21 @@ class StandaloneRevokeService final : public celer::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
-  keylane::ReplicationManager* replication_ = nullptr;
+  keylane::ReplicationManager* first_ = nullptr;
+  keylane::ReplicationManager* second_ = nullptr;
+  keylane::ReplicationManager* static_cluster_ = nullptr;
   absl::Status result_ = absl::OkStatus();
 };
 
 TEST(ReplicationManagerIntegrationTest,
      ClusterControlApiStaysFailClosedAndSupersedesWholeSession) {
+  const std::string expected_node_id(40, '9');
+  constexpr std::uint16_t kReplicationPort = 6380;
   keylane::test::TempDirectory directory("cluster-manager-api");
   const std::filesystem::path data = directory.path() / "node.data";
   keylane::test::CreateDataFile(data, 128 * kMiB);
 
-  StallingNativeSource source;
+  StallingNativeSource source(expected_node_id, kReplicationPort);
   ASSERT_NE(source.port(), 0);
   ASSERT_EQ(source.error(), 0) << std::strerror(source.error());
 
@@ -495,14 +822,17 @@ TEST(ReplicationManagerIntegrationTest,
 
   keylane::ReplicationOptions replication_options;
   replication_options.cluster_enabled_ = true;
-  replication_options.listen_port_ = 6380;
+  replication_options.cluster_population_managed_ = true;
+  replication_options.node_id_override_ = expected_node_id;
+  replication_options.listen_port_ = kReplicationPort;
   keylane::ReplicationManager replication(
       &storage, std::move(replication_options),
       keylane::ReplicaOfConfig{"127.0.0.1", source.port()});
   keylane::InitStorage(&storage, &replication);
   keylane::tx::TxRuntime::Create(1);
 
-  ReplicationManagerService service(&storage, &replication, &source);
+  ReplicationManagerService service(&storage, &replication, &source,
+                                    expected_node_id);
   celer::Server server;
   server.AddService(&service);
   celer::ServerOptions runtime;
@@ -515,7 +845,7 @@ TEST(ReplicationManagerIntegrationTest,
 }
 
 TEST(ReplicationManagerIntegrationTest,
-     StandaloneManagerRejectsClusterSourceRevocation) {
+     StandaloneManagersGenerateDistinctCanonicalNodeIdentities) {
   keylane::test::TempDirectory directory("standalone-manager-revoke");
   const std::filesystem::path data = directory.path() / "node.data";
   keylane::test::CreateDataFile(data, 128 * kMiB);
@@ -525,9 +855,16 @@ TEST(ReplicationManagerIntegrationTest,
   keylane::storage::StorageEngine storage(std::move(storage_options));
   ASSERT_TRUE(storage.Prepare(1).ok());
 
-  keylane::ReplicationManager replication(
-      &storage, keylane::ReplicationOptions{}, std::nullopt);
-  StandaloneRevokeService service(&replication);
+  keylane::ReplicationManager first(&storage, keylane::ReplicationOptions{},
+                                    std::nullopt);
+  keylane::ReplicationManager second(&storage, keylane::ReplicationOptions{},
+                                     std::nullopt);
+  keylane::ReplicationOptions static_options;
+  static_options.cluster_enabled_ = true;
+  keylane::ReplicationManager static_cluster(
+      &storage, std::move(static_options),
+      keylane::ReplicaOfConfig{"127.0.0.1", 1});
+  StandaloneIdentityService service(&first, &second, &static_cluster);
   celer::Server server;
   server.AddService(&service);
   celer::ServerOptions runtime;

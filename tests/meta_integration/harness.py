@@ -102,6 +102,7 @@ class Node:
         self.data_dir = os.path.join(workdir, f"node{node_id}")
         self.log_path = os.path.join(workdir, f"node{node_id}.log")
         self.raft_port = free_port()
+        self.data_control_port = free_port()
         self.ctl_path = os.path.join(self.data_dir, "meta-admin.sock")
         self.args = list(args) if args is not None else raft_args()
         self.proc = None
@@ -115,6 +116,10 @@ class Node:
     @property
     def endpoint(self):
         return f"127.0.0.1:{self.raft_port}"
+
+    @property
+    def data_control_endpoint(self):
+        return f"127.0.0.1:{self.data_control_port}"
 
     def start(self, bootstrap=False, raft_port=None, wait_ready=True):
         """(Re)starts the process; the data dir is always reused, so a
@@ -139,6 +144,7 @@ class Node:
                 self.binary,
                 "--id", str(self.id),
                 "--addr", self.endpoint,
+                "--data-control-addr", self.data_control_endpoint,
                 "--data-dir", self.data_dir,
                 "--ctl-socket", self.ctl_path,
             ] + self.args
@@ -219,39 +225,90 @@ class Node:
         self._op_seq += 1
         return f"{self.id:08x}{self._op_seq:024x}"
 
+    @staticmethod
+    def _history_id(value):
+        """Canonical 160-bit replication-history id used by the ctl wire."""
+        if isinstance(value, str):
+            if len(value) != 40 or any(c not in "0123456789abcdef"
+                                       for c in value):
+                raise Failure(f"invalid replication history id: {value!r}")
+            return value
+        if not isinstance(value, int) or value < 0 or value >= (1 << 160):
+            raise Failure(f"invalid replication history id: {value!r}")
+        return f"{value:040x}"
+
     def submitop(self, op_id, kind, payload, timeout=5.0, history=0):
-        suffix = f" {history}" if history else ""
+        suffix = f" {self._history_id(history)}" if history else ""
         return self.ctl(f"submitop {op_id} {kind} {payload}{suffix}",
                         timeout=timeout)
 
-    def completeop(self, op_id, result, timeout=5.0):
-        return self.ctl(f"completeop {op_id} {result}", timeout=timeout)
+    def completeop(self, op_id, result="", timeout=5.0):
+        suffix = f" {result}" if result else ""
+        return self.ctl(f"completeop {op_id}{suffix}", timeout=timeout)
+
+    def abortop(self, op_id, reason="", timeout=5.0):
+        suffix = f" {reason}" if reason else ""
+        return self.ctl(f"abortop {op_id}{suffix}", timeout=timeout)
+
+    def archiveoperations(self, *seqs, timeout=5.0):
+        return self.ctl("archiveoperations " + " ".join(map(str, seqs)),
+                        timeout=timeout)
 
     def getop(self, op_id):
         return self.ctl(f"getop {op_id}")
 
-    def registernode(self, node_id, principal, role="primary", timeout=5.0):
-        return self.ctl(f"registernode {node_id} {principal} {role}",
-                        timeout=timeout)
+    def registernode(self, node_id, principal, role="primary", timeout=5.0,
+                     endpoints=()):
+        suffix = "" if not endpoints else " " + " ".join(endpoints)
+        return self.ctl(
+            f"registernode {node_id} {principal} {role}{suffix}",
+            timeout=timeout)
 
     def getnode(self, node_id):
         return self.ctl(f"getnode {node_id}")
 
     # -- observation-surface drivers ---------------------------------------
     # creategroup/begingroupterm/transitionop build the committed anchors
-    # (group term, manifest, operation history binding) that observation
-    # freshness is checked against; adoptsession/obs_*/observations/obsaudit
-    # drive the leader-local MetaObservationStore itself.
+    # (group term, manifest, partition epoch, and operation history binding)
+    # that observation freshness is checked against;
+    # adoptsession/obs_*/observations/obsaudit drive the leader-local
+    # MetaObservationStore itself.
 
     def creategroup(self, group_id, timeout=5.0):
         return self.ctl(f"creategroup {group_id}", timeout=timeout)
+
+    def assignnode(self, group_id, node_id, role="primary", timeout=5.0):
+        return self.ctl(f"assignnode {group_id} {node_id} {role}",
+                        timeout=timeout)
 
     def begingroupterm(self, group_id, expected, new, timeout=5.0):
         return self.ctl(f"begingroupterm {group_id} {expected} {new}",
                         timeout=timeout)
 
+    def putpolicy(self, policy_id, version, content, timeout=5.0):
+        return self.ctl(f"putpolicy {policy_id} {version} {content}",
+                        timeout=timeout)
+
+    def setslotmap(self, first, last, group_id, config_epoch, timeout=5.0):
+        return self.ctl(
+            f"setslotmap {first} {last} {group_id} {config_epoch}",
+            timeout=timeout)
+
+    def activateauthority(self, group_id, expected_term, owner_node_id,
+                          lease_ms, policy_id, policy_version,
+                          authority_version, config_epoch, timeout=5.0):
+        return self.ctl(
+            f"activateauthority {group_id} {expected_term} {owner_node_id} "
+            f"{lease_ms} {policy_id} {policy_version} "
+            f"{authority_version} {config_epoch}", timeout=timeout)
+
+    def fencegroup(self, group_id, expected_term, timeout=5.0):
+        return self.ctl(f"fencegroup {group_id} {expected_term}",
+                        timeout=timeout)
+
     def transitionop(self, op_id, phase, history, timeout=5.0):
-        return self.ctl(f"transitionop {op_id} {phase} {history}",
+        return self.ctl(
+            f"transitionop {op_id} {phase} {self._history_id(history)}",
                         timeout=timeout)
 
     def adoptsession(self, node_id, boot_hex, generation, timeout=5.0):
@@ -268,18 +325,21 @@ class Node:
                         f"{health}", timeout=timeout)
 
     def obs_candidate(self, node_id, boot_hex, generation, group, term,
-                      manifest, history, flow="-", backlog="-",
-                      readiness="ready", timeout=5.0):
+                      manifest, history, partition_epoch=0, flow="-",
+                      backlog="-", readiness="ready", timeout=5.0):
         return self.ctl(
             f"obs candidate {node_id} {boot_hex} {generation} {group} "
-            f"{term} {manifest} {history} {flow} {backlog} {readiness}",
+            f"{term} {manifest} {partition_epoch} {self._history_id(history)} "
+            f"{flow} {backlog} {readiness}",
             timeout=timeout)
 
     def obs_evidence(self, node_id, boot_hex, generation, op_id, phase,
-                     evidence, group, term, manifest, history, timeout=5.0):
+                     evidence, group, term, manifest, history,
+                     partition_epoch=0, timeout=5.0):
         return self.ctl(
             f"obs evidence {node_id} {boot_hex} {generation} {op_id} "
-            f"{phase} {evidence} {group} {term} {manifest} {history}",
+            f"{phase} {evidence} {group} {term} {manifest} {partition_epoch} "
+            f"{self._history_id(history)}",
             timeout=timeout)
 
     def observations(self, group=None, timeout=5.0):
@@ -827,7 +887,8 @@ def join_and_verify(leader, node, endpoint=None, timeout=30.0):
     deadline = time.monotonic() + timeout
     invited = False
     while time.monotonic() < deadline:
-        reply = leader.ctl(f"addsrv {node.id} {target}")
+        reply = leader.ctl(
+            f"addsrv {node.id} {target} {node.data_control_endpoint}")
         acceptable = ("OK", "ERR joining", "ERR config-changing",
                       "ERR already-exists")
         if reply not in acceptable:

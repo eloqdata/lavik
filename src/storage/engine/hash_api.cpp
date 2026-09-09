@@ -18,7 +18,8 @@ bool IsHashLikeWrite(const HashOperation& operation) {
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHash(
     std::uint8_t db_id, std::string_view key, const HashOperation& operation,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
@@ -26,12 +27,13 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHash(
       IsHashLikeWrite(operation) ? tx::LockMode::kExclusive
                                  : tx::LockMode::kShared);
   co_return co_await ExecuteHashLocked(db_id, key, digest, operation, nullptr,
-                                       replication);
+                                       replication, mutation_precondition);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteSet(
     std::uint8_t db_id, std::string_view key, const HashOperation& operation,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
@@ -39,15 +41,16 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteSet(
       IsHashLikeWrite(operation) ? tx::LockMode::kExclusive
                                  : tx::LockMode::kShared);
   co_return co_await ExecuteSetLocked(db_id, key, digest, operation, nullptr,
-                                      replication);
+                                      replication, mutation_precondition);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteSetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const HashOperation& operation, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   return ExecuteHashLikeLocked(db_id, key, digest, operation, ValueType::kSet,
-                               tx, replication);
+                               tx, replication, mutation_precondition);
 }
 
 }  // namespace keylane::storage

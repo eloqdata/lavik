@@ -1,11 +1,13 @@
 #include "keylane/meta/coordinator.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <ctime>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -32,11 +34,12 @@ namespace keylane::meta {
 // Shared because a Raft completion may arrive after the proposing coroutine
 // timed out or was dropped. Reservations therefore never call back through a
 // potentially destroyed coordinator.
-class MetaAuditProposalGate {
+class MetaProposalGate {
  public:
   std::mutex mu_;
   std::uint64_t regular_reservations_ = 0;
   bool prune_reserved_ = false;
+  bool fail_safe_recovery_reserved_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -47,7 +50,7 @@ namespace {
 
 class AuditReservation {
  public:
-  AuditReservation(std::shared_ptr<MetaAuditProposalGate> gate, bool prune)
+  AuditReservation(std::shared_ptr<MetaProposalGate> gate, bool prune)
       : gate_(std::move(gate)), prune_(prune) {}
   ~AuditReservation() {
     if (gate_ == nullptr) return;
@@ -60,8 +63,25 @@ class AuditReservation {
   }
 
  private:
-  std::shared_ptr<MetaAuditProposalGate> gate_;
+  std::shared_ptr<MetaProposalGate> gate_;
   bool prune_;
+};
+
+// Exactly one durability-recovery proposal may be unresolved at a time. The
+// lease follows NuRaft's completion rather than the caller coroutine, so a
+// timeout cannot admit a duplicate against the same committed view.
+class FailSafeRecoveryReservation {
+ public:
+  explicit FailSafeRecoveryReservation(std::shared_ptr<MetaProposalGate> gate)
+      : gate_(std::move(gate)) {}
+  ~FailSafeRecoveryReservation() {
+    if (gate_ == nullptr) return;
+    std::lock_guard<std::mutex> lock(gate_->mu_);
+    gate_->fail_safe_recovery_reserved_ = false;
+  }
+
+ private:
+  std::shared_ptr<MetaProposalGate> gate_;
 };
 
 struct Subscriber {
@@ -140,10 +160,28 @@ uint64_t MetaStoresFacts::CurrentGroupTerm(std::string_view group_id) const {
   return stores_.grant_.CurrentGroupTerm(group_id).value_or(0);
 }
 
-uint64_t MetaStoresFacts::CurrentPopulationManifestId(
+uint64_t MetaStoresFacts::CurrentPopulationManifestRevision(
     std::string_view group_id) const {
   const auto group = stores_.topology_.FindGroup(std::string(group_id));
-  return group.has_value() ? group->record_.population_manifest_id_ : 0;
+  return group.has_value() ? group->record_.population_manifest_revision_ : 0;
+}
+
+uint64_t MetaStoresFacts::CurrentPartitionReplicationEpoch(
+    std::string_view group_id) const {
+  const auto group = stores_.topology_.FindGroup(std::string(group_id));
+  return group.has_value() ? group->record_.partition_replication_epoch_ : 0;
+}
+
+bool MetaStoresFacts::AssignmentMatches(
+    std::string_view group_id, std::string_view node_id,
+    const MetaAssignmentId& assignment_id) const {
+  const auto group = stores_.topology_.FindGroup(std::string(group_id));
+  return group.has_value() &&
+         std::any_of(group->members_.begin(), group->members_.end(),
+                     [&](const MetaGroupMember& member) {
+                       return member.node_id_ == node_id &&
+                              member.assignment_id_ == assignment_id;
+                     });
 }
 
 bool MetaStoresFacts::OperationNonTerminal(const MetaOperationId& id) const {
@@ -155,10 +193,14 @@ bool MetaStoresFacts::OperationNonTerminal(const MetaOperationId& id) const {
          record->lifecycle_ == MetaOperationLifecycle::kRunning;
 }
 
-bool MetaStoresFacts::HistoryBoundToOperation(const MetaOperationId& id,
-                                              uint64_t history_id) const {
+bool MetaStoresFacts::HistoryBoundToOperation(
+    const MetaOperationId& id,
+    const MetaReplicationHistoryId& history_id) const {
   const auto record = stores_.operation_.FindOperation(id);
-  return record.has_value() && record->replication_history_id_ != 0 &&
+  return record.has_value() &&
+         std::any_of(record->replication_history_id_.begin(),
+                     record->replication_history_id_.end(),
+                     [](std::uint8_t byte) { return byte != 0; }) &&
          record->replication_history_id_ == history_id;
 }
 
@@ -191,6 +233,10 @@ struct ProposeWaiter {
   // local deadline wins. That distinction closes the uncertain-tail audit
   // overflow race.
   std::unique_ptr<AuditReservation> audit_reservation_;
+  // Same ownership rule for durability-gate recovery. Serializing effective
+  // recovery proposals prevents two callers from appending the same logical
+  // shrink after both inspected one stale committed view.
+  std::unique_ptr<FailSafeRecoveryReservation> recovery_reservation_;
 };
 
 // Awaiter for the NuRaft round trip. The destructor runs on every exit from
@@ -251,6 +297,7 @@ void CompletePropose(const std::shared_ptr<ProposeWaiter>& waiter,
     // coroutine lifetime, owns that headroom.
     if (waiter->ready_) {
       waiter->audit_reservation_.reset();
+      waiter->recovery_reservation_.reset();
       return;
     }
     waiter->code_ = result.get_result_code();
@@ -274,6 +321,7 @@ void CompletePropose(const std::shared_ptr<ProposeWaiter>& waiter,
       to_resume = waiter->awaiting_;
     }
     waiter->audit_reservation_.reset();
+    waiter->recovery_reservation_.reset();
   }
   ScheduleProposeResume(*waiter, to_resume);
 }
@@ -284,6 +332,7 @@ void FailProposeDispatch(const std::shared_ptr<ProposeWaiter>& waiter) {
     std::lock_guard<std::mutex> lock(waiter->mu_);
     if (waiter->ready_) {
       waiter->audit_reservation_.reset();
+      waiter->recovery_reservation_.reset();
       return;
     }
     waiter->code_ = nuraft::cmd_result_code::FAILED;
@@ -292,20 +341,21 @@ void FailProposeDispatch(const std::shared_ptr<ProposeWaiter>& waiter) {
       to_resume = waiter->awaiting_;
     }
     waiter->audit_reservation_.reset();
+    waiter->recovery_reservation_.reset();
   }
   ScheduleProposeResume(*waiter, to_resume);
 }
 
 MetaCommandTag CommandTagOf(const MetaCommand& command) {
   // The MetaCommand variant is declared in tag order (commands.h:
-  // kRegisterNode=1 .. kSetAuditPolicy=25); pin both ends and the
-  // size so a
+  // kRegisterNode=1 .. kPruneTerminalReceipts=29); pin both ends and the size
+  // so a
   // future reorder breaks the build here instead of mislabeling results.
-  static_assert(std::variant_size_v<MetaCommand> == 25);
+  static_assert(std::variant_size_v<MetaCommand> == 29);
   static_assert(
       std::is_same_v<std::variant_alternative_t<0, MetaCommand>, RegisterNode>);
-  static_assert(std::is_same_v<std::variant_alternative_t<24, MetaCommand>,
-                               SetAuditPolicy>);
+  static_assert(std::is_same_v<std::variant_alternative_t<28, MetaCommand>,
+                               PruneTerminalReceipts>);
   return static_cast<MetaCommandTag>(command.index() + 1);
 }
 
@@ -327,6 +377,153 @@ std::string FormatReadableTime() {
                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
                 tm.tm_min, tm.tm_sec, static_cast<int>(millis % 1000));
   return buf;
+}
+
+absl::Status IneffectiveFailSafeRecovery(std::string_view detail) {
+  return absl::ResourceExhaustedError(
+      "meta: durability fail-safe admits only one effective recovery "
+      "mutation at a time: " +
+      std::string(detail));
+}
+
+bool IsNonTerminal(MetaOperationLifecycle lifecycle) {
+  return lifecycle == MetaOperationLifecycle::kSubmitted ||
+         lifecycle == MetaOperationLifecycle::kRunning;
+}
+
+// The WAL/snapshot fail-safe cannot use a variant-name whitelist: most prune
+// commands are intentionally replay-idempotent, so an absent target would let
+// fresh request ids append no-op records forever. Evaluate the command against
+// the exact committed view and require a one-way, bounded recovery effect.
+// Terminalization is the sole non-shrinking prerequisite and permits no new
+// variable-length payload while the guard is active; it can happen once per
+// live operation and unlocks archive -> prune.
+absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
+                                      const MetaCommittedView& view,
+                                      std::uint64_t applied_index,
+                                      std::string_view actor_principal,
+                                      std::string_view readable_time) {
+  const MetaStores& stores = view.stores();
+  if (const auto* complete = std::get_if<CompleteOperation>(&command)) {
+    if (!complete->result_.empty()) {
+      return IneffectiveFailSafeRecovery(
+          "CompleteOperation must use an empty result while recovery is "
+          "gated");
+    }
+    const auto before =
+        stores.operation_.FindOperation(complete->operation_id_);
+    MetaOperationStore candidate = stores.operation_;
+    const absl::Status applied = candidate.CompleteOperation(*complete);
+    const auto after = candidate.FindOperation(complete->operation_id_);
+    if (!applied.ok() || !before.has_value() || !after.has_value() ||
+        !IsNonTerminal(before->lifecycle_) ||
+        after->lifecycle_ != MetaOperationLifecycle::kCompleted ||
+        after->revision_ != before->revision_ + 1) {
+      return IneffectiveFailSafeRecovery(
+          "CompleteOperation does not terminalize the current live revision");
+    }
+    return absl::OkStatus();
+  }
+  if (const auto* abort = std::get_if<AbortOperation>(&command)) {
+    if (!abort->reason_.empty()) {
+      return IneffectiveFailSafeRecovery(
+          "AbortOperation must use an empty reason while recovery is gated");
+    }
+    const auto before = stores.operation_.FindOperation(abort->operation_id_);
+    MetaOperationStore candidate = stores.operation_;
+    const absl::Status applied = candidate.AbortOperation(*abort);
+    const auto after = candidate.FindOperation(abort->operation_id_);
+    if (!applied.ok() || !before.has_value() || !after.has_value() ||
+        !IsNonTerminal(before->lifecycle_) ||
+        after->lifecycle_ != MetaOperationLifecycle::kAborted ||
+        after->revision_ != before->revision_ + 1) {
+      return IneffectiveFailSafeRecovery(
+          "AbortOperation does not terminalize the current live revision");
+    }
+    return absl::OkStatus();
+  }
+  if (const auto* archive = std::get_if<ArchiveOperations>(&command)) {
+    MetaOperationStore candidate = stores.operation_;
+    const std::size_t live_before = candidate.LiveCount();
+    const std::size_t archived_before = candidate.ArchivedCount();
+    const absl::Status applied = candidate.ArchiveOperations(*archive);
+    if (!applied.ok() || candidate.LiveCount() >= live_before ||
+        candidate.ArchivedCount() <= archived_before) {
+      return IneffectiveFailSafeRecovery(
+          "ArchiveOperations moves no terminal live operation");
+    }
+    return absl::OkStatus();
+  }
+  if (const auto* prune = std::get_if<PruneOperationArchive>(&command)) {
+    MetaOperationStore candidate = stores.operation_;
+    const std::size_t before = candidate.ArchivedCount();
+    const absl::Status applied = candidate.PruneArchive(*prune);
+    if (!applied.ok() || candidate.ArchivedCount() >= before) {
+      return IneffectiveFailSafeRecovery(
+          "PruneOperationArchive removes no retained summary");
+    }
+    return absl::OkStatus();
+  }
+  if (const auto* prune = std::get_if<PruneTerminalReceipts>(&command)) {
+    std::size_t before = 0;
+    for (const MetaTerminalReceiptKey& key : prune->receipts_) {
+      before += stores.operation_.FindTerminalReceipt(key).has_value() ? 1 : 0;
+    }
+    MetaOperationStore candidate = stores.operation_;
+    const absl::Status applied = candidate.PruneTerminalReceipts(*prune);
+    std::size_t after = 0;
+    for (const MetaTerminalReceiptKey& key : prune->receipts_) {
+      after += candidate.FindTerminalReceipt(key).has_value() ? 1 : 0;
+    }
+    if (!applied.ok() || after >= before) {
+      return IneffectiveFailSafeRecovery(
+          "PruneTerminalReceipts removes no retained receipt");
+    }
+    return absl::OkStatus();
+  }
+  if (const auto* prune = std::get_if<PrunePopulationManifest>(&command)) {
+    if (!stores.population_manifest_.Contains(prune->manifest_digest_) ||
+        stores.topology_.PopulationManifestInUse(prune->manifest_digest_) ||
+        stores.operation_.PopulationManifestInUse(prune->manifest_digest_)) {
+      return IneffectiveFailSafeRecovery(
+          "PrunePopulationManifest removes no unreferenced document");
+    }
+    MetaPopulationManifestStore candidate = stores.population_manifest_;
+    const std::size_t before = candidate.Size();
+    const absl::Status applied = candidate.Prune(*prune);
+    if (!applied.ok() || candidate.Size() >= before) {
+      return IneffectiveFailSafeRecovery(
+          "PrunePopulationManifest removes no unreferenced document");
+    }
+    return absl::OkStatus();
+  }
+  if (std::holds_alternative<PruneAudit>(command)) {
+    if (applied_index == std::numeric_limits<std::uint64_t>::max()) {
+      return IneffectiveFailSafeRecovery("the applied index is exhausted");
+    }
+    const auto before = stores.audit_.Serialize();
+    if (!before.ok()) {
+      return absl::InternalError(
+          "meta: cannot evaluate fail-safe audit recovery state");
+    }
+    // Apply against a minimal aggregate carrying the exact audit store. This
+    // reuses the real prune + mandatory audit-append semantics without copying
+    // unrelated potentially-large snapshot stores onto the ingress thread.
+    MetaStores candidate;
+    candidate.audit_ = stores.audit_;
+    const MetaApplyResult applied = ApplyCommitted(
+        candidate, applied_index + 1, command, actor_principal, readable_time);
+    const auto after = candidate.audit_.Serialize();
+    if (applied.verdict_ != MetaAuditVerdict::kAccepted || !after.ok() ||
+        after->size() >= before->size()) {
+      return IneffectiveFailSafeRecovery(
+          "PruneAudit does not reduce the serialized audit window after its "
+          "own audit record");
+    }
+    return absl::OkStatus();
+  }
+  return IneffectiveFailSafeRecovery(
+      "the command is not part of terminalize, archive, or prune recovery");
 }
 
 std::int64_t NowUnixMs() {
@@ -465,7 +662,7 @@ MetaCoordinator::MetaCoordinator(nuraft::ptr<nuraft::raft_server> server,
       proposal_executor_(options_.proposal_executor_ != nullptr
                              ? options_.proposal_executor_
                              : owned_proposal_executor_.get()),
-      audit_gate_(std::make_shared<MetaAuditProposalGate>()),
+      proposal_gate_(std::make_shared<MetaProposalGate>()),
       propose_timer_(std::make_unique<MetaProposeTimer>()),
       sub_core_(std::make_shared<MetaSubscriptionCore>()),
       leader_context_(*this,
@@ -543,10 +740,6 @@ MetaCoordinator::~MetaCoordinator() {
 
   // Cancel and join reconcilers on the leadership thread (it owns every
   // Start/CancelAndWait call).
-  {
-    std::lock_guard<std::mutex> lock(leadership_mu_);
-    desired_leader_ = false;
-  }
   leadership_cv_.notify_all();
   if (leadership_thread_.joinable()) leadership_thread_.join();
 
@@ -642,8 +835,12 @@ MetaStores MetaCoordinator::AtomicStoresSnapshot(std::uint64_t& applied_index,
 MetaCommittedView MetaCoordinator::CommittedView() {
   std::uint64_t applied_index = 0;
   std::uint64_t high_water = 0;
-  return MetaCommittedView(AtomicStoresSnapshot(applied_index, high_water),
-                           applied_index);
+  MetaStores stores = AtomicStoresSnapshot(applied_index, high_water);
+  return MetaCommittedView(std::move(stores), applied_index);
+}
+
+std::uint64_t MetaCoordinator::CommittedHighWater() const {
+  return state_machine_.state_change_index();
 }
 
 MetaSubscriptionStart MetaCoordinator::SubscribeCommitted(
@@ -740,62 +937,71 @@ void MetaCoordinator::RunAsLeader(std::shared_ptr<MetaReconciler> reconciler) {
   {
     std::lock_guard<std::mutex> lock(leadership_mu_);
     if (stopping_.load(std::memory_order_acquire)) return;
-    reconcilers_.push_back(ReconcilerEntry{std::move(reconciler), false});
+    leadership_events_.push_back(
+        LeadershipEvent{LeadershipEventKind::kRegister, std::move(reconciler)});
   }
-  leadership_cv_.notify_all();
+  leadership_cv_.notify_one();
 }
 
 void MetaCoordinator::BecomeLeader() {
   {
     std::lock_guard<std::mutex> lock(leadership_mu_);
     if (stopping_.load(std::memory_order_acquire)) return;
-    desired_leader_ = true;
+    leadership_events_.push_back(
+        LeadershipEvent{LeadershipEventKind::kBecomeLeader, nullptr});
   }
-  leadership_cv_.notify_all();
+  leadership_cv_.notify_one();
 }
 
 void MetaCoordinator::BecomeFollower() {
   {
     std::lock_guard<std::mutex> lock(leadership_mu_);
     if (stopping_.load(std::memory_order_acquire)) return;
-    desired_leader_ = false;
+    leadership_events_.push_back(
+        LeadershipEvent{LeadershipEventKind::kBecomeFollower, nullptr});
   }
-  leadership_cv_.notify_all();
+  leadership_cv_.notify_one();
 }
 
 void MetaCoordinator::LeadershipMain() {
   std::unique_lock<std::mutex> lock(leadership_mu_);
-  const auto has_unstarted = [&] {
-    if (!applied_leader_) return false;
-    for (const ReconcilerEntry& entry : reconcilers_) {
-      if (!entry.started_) return true;
-    }
-    return false;
-  };
-  while (!stopping_.load(std::memory_order_acquire)) {
+  for (;;) {
     leadership_cv_.wait(lock, [&] {
       return stopping_.load(std::memory_order_acquire) ||
-             desired_leader_ != applied_leader_ || has_unstarted();
+             !leadership_events_.empty();
     });
     if (stopping_.load(std::memory_order_acquire)) break;
-    if (desired_leader_ == applied_leader_ && !has_unstarted()) continue;
+    LeadershipEvent event = std::move(leadership_events_.front());
+    leadership_events_.pop_front();
+    // External lifecycle calls can wait for their own workers. Leave the
+    // queue mutex free so Raft callbacks keep recording later edges while the
+    // current edge is still serving as their ordering barrier.
+    lock.unlock();
 
-    if (desired_leader_) {
-      applied_leader_ = true;
-      // Soft evidence is scoped to one leadership epoch. Reset before any
-      // reconciler starts so it can only act on freshly authenticated reports.
-      observations_.ResetForLeadershipChange();
-      for (ReconcilerEntry& entry : reconcilers_) {
-        if (!entry.started_) {
-          entry.started_ = true;
-          // Reconciler calls run under leadership_mu_ on purpose: the
-          // reconciler contract never calls back into leadership, and this
-          // serialization is what makes the Start/CancelAndWait pairing
-          // strict per reconciler.
-          entry.reconciler_->Start(leader_context_);
+    if (event.kind_ == LeadershipEventKind::kRegister) {
+      reconcilers_.push_back(
+          ReconcilerEntry{std::move(event.reconciler_), false});
+      ReconcilerEntry& entry = reconcilers_.back();
+      if (applied_leader_) {
+        entry.started_ = true;
+        entry.reconciler_->Start(leader_context_);
+      }
+    } else if (event.kind_ == LeadershipEventKind::kBecomeLeader) {
+      if (!applied_leader_) {
+        // Soft evidence is scoped to one leadership epoch. Reset before any
+        // reconciler starts so it can act only on freshly authenticated data.
+        observations_.ResetForLeadershipChange();
+        applied_leader_ = true;
+        for (ReconcilerEntry& entry : reconcilers_) {
+          if (!entry.started_) {
+            entry.started_ = true;
+            entry.reconciler_->Start(leader_context_);
+          }
         }
       }
     } else {
+      // Every observed follower edge is processed, including a redundant one:
+      // it is the invalidation barrier for all leader-local authority.
       applied_leader_ = false;
       // Cancel in reverse registration order (stack discipline for
       // reconcilers that depend on earlier ones).
@@ -807,7 +1013,9 @@ void MetaCoordinator::LeadershipMain() {
       }
       observations_.ResetForLeadershipChange();
     }
+    lock.lock();
   }
+  lock.unlock();
   // Teardown: cancel and join whatever is still running.
   for (auto it = reconcilers_.rbegin(); it != reconcilers_.rend(); ++it) {
     if (it->started_) {
@@ -816,6 +1024,82 @@ void MetaCoordinator::LeadershipMain() {
     }
   }
   applied_leader_ = false;
+}
+
+void MetaLeadershipRelay::RecordLeaderEdge() noexcept { Record(Role::kLeader); }
+
+void MetaLeadershipRelay::RecordFollowerEdge() noexcept {
+  Record(Role::kFollower);
+}
+
+void MetaLeadershipRelay::Record(Role role) noexcept {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (stopped_) return;
+  // Allocation failure is fail-stop: dropping a role edge could preserve an
+  // obsolete authority session, which is less safe than terminating.
+  pending_.push_back(role);
+}
+
+void MetaLeadershipRelay::Drain() noexcept {
+  std::deque<Role> batch;
+  MetaCoordinator* target = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (stopped_ || target_ == nullptr || draining_) return;
+    draining_ = true;
+    target = target_;
+    batch.swap(pending_);
+  }
+
+  for (;;) {
+    for (Role role : batch) Forward(*target, role);
+    batch.clear();
+
+    std::lock_guard<std::mutex> lock(mu_);
+    if (stopped_ || pending_.empty()) {
+      draining_ = false;
+      cv_.notify_all();
+      return;
+    }
+    // Record() only appends and this is the sole drainer, so swapping the next
+    // prefix outside the lock preserves the global callback order.
+    batch.swap(pending_);
+  }
+}
+
+void MetaLeadershipRelay::Attach(MetaCoordinator& coordinator) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (attached_once_ || stopped_) {
+      throw std::logic_error(
+          "MetaLeadershipRelay may be attached exactly once");
+    }
+    attached_once_ = true;
+    target_ = &coordinator;
+  }
+  Drain();
+  // If the Celer worker won the single-drainer race, wait for it to finish the
+  // retained pre-attach prefix before process assembly proceeds.
+  std::unique_lock<std::mutex> lock(mu_);
+  cv_.wait(lock, [&] { return !draining_; });
+}
+
+void MetaLeadershipRelay::DetachAndStop() noexcept {
+  std::unique_lock<std::mutex> lock(mu_);
+  stopped_ = true;
+  pending_.clear();
+  // Drain forwards outside mu_; wait out its captured target before releasing
+  // the caller's lifetime ownership of the coordinator.
+  cv_.wait(lock, [&] { return !draining_; });
+  target_ = nullptr;
+}
+
+void MetaLeadershipRelay::Forward(MetaCoordinator& coordinator, Role role) {
+  if (role == Role::kLeader) {
+    coordinator.BecomeLeader();
+  } else {
+    coordinator.BecomeFollower();
+  }
 }
 
 celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
@@ -838,12 +1122,16 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   InFlightGuard in_flight(*this);
 
   // One atomic committed view serves the fail-safe gates AND the validate
-  // hooks (KB-scale copy at control-plane proposal rates; cheaper than
-  // letting each hook snapshot independently, and consistent across them).
+  // hooks. This bounded aggregate copy may be large and contributes to
+  // proposal latency, but copying once is cheaper than letting each hook
+  // snapshot independently and keeps every validation on one exact cut.
   std::uint64_t applied_index = 0;
   std::uint64_t high_water = 0;
   MetaCommittedView view(AtomicStoresSnapshot(applied_index, high_water),
                          applied_index);
+  // Reuse one stamp for emergency candidate evaluation and the real command;
+  // audit-size admission must model exactly the record that would be appended.
+  const std::string readable_time = FormatReadableTime();
 
   // Strict-export reserves audit headroom before validation/encoding. The
   // default bounded-rotate policy needs no reservation because deterministic
@@ -852,16 +1140,16 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   // uncertain client timeout cannot free space while its append is unresolved.
   std::unique_ptr<AuditReservation> audit_reservation;
   if (view.stores().audit_.policy() == MetaAuditPolicy::kStrictExport) {
-    std::lock_guard<std::mutex> lock(audit_gate_->mu_);
+    std::lock_guard<std::mutex> lock(proposal_gate_->mu_);
     const MetaAuditStore& audit = view.stores().audit_;
     const auto* prune = std::get_if<PruneAudit>(&command);
     const bool valid_prune =
         prune != nullptr && audit.Find(prune->through_log_index_).has_value();
-    const bool prune_busy =
-        audit_gate_->prune_reserved_ || audit_gate_->regular_reservations_ != 0;
+    const bool prune_busy = proposal_gate_->prune_reserved_ ||
+                            proposal_gate_->regular_reservations_ != 0;
     const bool regular_overflow =
-        audit_gate_->prune_reserved_ || audit.NeedsExport() ||
-        audit.size() + audit_gate_->regular_reservations_ + 1 >
+        proposal_gate_->prune_reserved_ || audit.NeedsExport() ||
+        audit.size() + proposal_gate_->regular_reservations_ + 1 >
             audit.capacity();
     const bool prune_overflow =
         !valid_prune &&
@@ -874,37 +1162,54 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
           "export and prune the full window (fail-safe)");
     }
     if (prune != nullptr) {
-      audit_gate_->prune_reserved_ = true;
+      proposal_gate_->prune_reserved_ = true;
       audit_reservation =
-          std::make_unique<AuditReservation>(audit_gate_, /*prune=*/true);
+          std::make_unique<AuditReservation>(proposal_gate_, /*prune=*/true);
     } else {
-      ++audit_gate_->regular_reservations_;
+      ++proposal_gate_->regular_reservations_;
       audit_reservation =
-          std::make_unique<AuditReservation>(audit_gate_, /*prune=*/false);
+          std::make_unique<AuditReservation>(proposal_gate_, /*prune=*/false);
     }
   }
 
-  // Remaining fail-safe gates do not need audit-gate serialization.
-  {
-    const std::uint64_t uncompacted = log_store_.UncompactedBytes();
-    if (uncompacted > options_.max_uncompacted_wal_bytes_) {
-      co_return absl::Status(
-          absl::StatusCode::kResourceExhausted,
-          "meta: uncompacted WAL bytes " + std::to_string(uncompacted) +
-              " exceed limit " +
-              std::to_string(options_.max_uncompacted_wal_bytes_) +
-              "; snapshot/compaction outstanding (fail-safe)");
+  const std::uint64_t uncompacted = log_store_.UncompactedBytes();
+  const std::uint64_t snapshot_failures =
+      state_machine_.consecutive_snapshot_failures();
+  const bool wal_fail_safe = uncompacted > options_.max_uncompacted_wal_bytes_;
+  const bool snapshot_fail_safe =
+      snapshot_failures >= options_.max_consecutive_snapshot_failures_;
+  std::unique_ptr<FailSafeRecoveryReservation> recovery_reservation;
+  if (wal_fail_safe || snapshot_fail_safe) {
+    // Serialize recovery through the actual Raft outcome. A type whitelist is
+    // insufficient because idempotent prune commands can legally be no-ops;
+    // repeated fresh request ids would then grow the WAL without bound.
+    std::lock_guard<std::mutex> lock(proposal_gate_->mu_);
+    if (proposal_gate_->fail_safe_recovery_reserved_) {
+      co_return IneffectiveFailSafeRecovery(
+          "another recovery proposal still has an uncertain Raft outcome");
     }
-    const std::uint64_t snapshot_failures =
-        state_machine_.consecutive_snapshot_failures();
-    if (snapshot_failures >= options_.max_consecutive_snapshot_failures_) {
-      co_return absl::Status(
-          absl::StatusCode::kResourceExhausted,
-          "meta: " + std::to_string(snapshot_failures) +
-              " consecutive snapshot failures reached the limit " +
-              std::to_string(options_.max_consecutive_snapshot_failures_) +
-              " (fail-safe)");
+    if (absl::Status recovery = ValidateFailSafeRecovery(
+            command, view, applied_index, principal.principal(), readable_time);
+        !recovery.ok()) {
+      std::string trigger;
+      if (wal_fail_safe) {
+        trigger = "uncompacted WAL bytes " + std::to_string(uncompacted) +
+                  " exceed limit " +
+                  std::to_string(options_.max_uncompacted_wal_bytes_);
+      }
+      if (snapshot_fail_safe) {
+        if (!trigger.empty()) trigger += "; ";
+        trigger += std::to_string(snapshot_failures) +
+                   " consecutive snapshot failures reached the limit " +
+                   std::to_string(options_.max_consecutive_snapshot_failures_);
+      }
+      co_return absl::Status(absl::StatusCode::kResourceExhausted,
+                             "meta: " + trigger + " (fail-safe); " +
+                                 std::string(recovery.message()));
     }
+    proposal_gate_->fail_safe_recovery_reserved_ = true;
+    recovery_reservation =
+        std::make_unique<FailSafeRecoveryReservation>(proposal_gate_);
   }
 
   // ValidateProposal plugins run leader-locally. The first rejection aborts
@@ -917,7 +1222,6 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   // Actor injection: the trusted entry's principal plus a
   // propose-time readable timestamp. The clock read is legal HERE — the
   // proposal entry point; apply only copies the text into the audit record.
-  const std::string readable_time = FormatReadableTime();
   std::visit(
       [&](auto& cmd) {
         cmd.actor_.principal_ = principal.principal();
@@ -932,6 +1236,7 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   waiter->foreign_executor_ = options_.foreign_executor_;
   waiter->inline_resume_ = options_.inline_resume_for_testing_;
   waiter->audit_reservation_ = std::move(audit_reservation);
+  waiter->recovery_reservation_ = std::move(recovery_reservation);
   std::vector<nuraft::ptr<nuraft::buffer>> logs;
   logs.push_back(*encoded);
   const absl::Status submitted = proposal_executor_->Submit(

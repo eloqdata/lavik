@@ -356,6 +356,38 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
+bool WaitForLogMarker(const std::string& path, std::string_view marker,
+                      std::chrono::seconds timeout = 20s) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (ReadFile(path).find(marker) != std::string::npos) return true;
+    std::this_thread::sleep_for(10ms);
+  }
+  return false;
+}
+
+std::size_t CountOccurrences(std::string_view haystack,
+                             std::string_view needle) {
+  std::size_t count = 0;
+  for (std::size_t offset = 0;
+       (offset = haystack.find(needle, offset)) != std::string_view::npos;
+       offset += needle.size()) {
+    ++count;
+  }
+  return count;
+}
+
+bool WaitForLogMarkerCount(const std::string& path, std::string_view marker,
+                           std::size_t expected,
+                           std::chrono::seconds timeout = 20s) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (CountOccurrences(ReadFile(path), marker) >= expected) return true;
+    std::this_thread::sleep_for(10ms);
+  }
+  return false;
+}
+
 std::uint64_t InfoUnsigned(RespClient& client, std::string_view section,
                            std::string_view marker) {
   const std::string info = client.Command({"INFO", section});
@@ -928,6 +960,18 @@ int main(int argc, char** argv) {
                            "{disk-batch}d", "batch-d"}),
            "+OK", "same-shard disk batch seed");
 
+    // Leave one committed tagged generation for the shutdown-only cleaner.
+    // Its promoted ordinary records are appended after the first storage
+    // freeze, so loading them from the checkpoint after restart specifically
+    // exercises the required second seal-and-drain round.
+    Expect(client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
+           "+OK", "defer transaction cleaning until shutdown");
+    // These keys are also used by the order-gate coverage below because they
+    // deterministically span workers when the server runs with four workers.
+    Expect(client.Command(
+               {"MSET", "order-a", "shutdown-a", "order-b", "shutdown-b"}),
+           "+OK", "shutdown-only cleaner seed");
+
     // Enabling immediately before the drain must be enough to publish a
     // checkpoint even though the process started with the default disabled.
     Expect(client.Command({"CONFIG", "SET", "shutdown-checkpoint", "yes"}),
@@ -937,13 +981,23 @@ int main(int argc, char** argv) {
         std::string::npos) {
       Fail("runtime-enabled shutdown did not publish a checkpoint");
     }
+    constexpr std::string_view kWorkerReadyMarker =
+        "direct-IO storage initialized";
+    const std::size_t ready_workers_before_restart =
+        CountOccurrences(ReadFile(log_path), kWorkerReadyMarker);
     ServerProcess recovered_server(argv[1], port, data_path, log_path, {}, {},
                                    false, 4, {}, {}, {}, true);
-    RespClient recovered = Connect(port);
-    if (ReadFile(log_path).find("loaded shutdown checkpoint generation=") ==
-        std::string::npos) {
+    // Opening the listener precedes recovery. Wait for the recovery decision
+    // and every worker's ready boundary rather than treating a successful TCP
+    // connect as storage readiness.
+    if (!WaitForLogMarker(log_path, "loaded shutdown checkpoint generation=")) {
       Fail("startup-enabled recovery did not load the runtime checkpoint");
     }
+    if (!WaitForLogMarkerCount(log_path, kWorkerReadyMarker,
+                               ready_workers_before_restart + 4)) {
+      Fail("startup-enabled checkpoint recovery did not become ready");
+    }
+    RespClient recovered = Connect(port);
     Expect(recovered.Command({"CONFIG", "GET", "shutdown-checkpoint"}),
            "*2\r\n" + Bulk("shutdown-checkpoint") + "\r\n" + Bulk("yes"),
            "startup checkpoint setting initializes runtime state");
@@ -959,6 +1013,9 @@ int main(int argc, char** argv) {
            "*4\r\n" + Bulk("batch-d") + "\r\n" + Bulk("batch-b") + "\r\n" +
                Bulk("batch-a") + "\r\n" + Bulk("batch-c"),
            "same-shard batched disk MGET after restart");
+    Expect(recovered.Command({"MGET", "order-a", "order-b"}),
+           "*2\r\n" + Bulk("shutdown-a") + "\r\n" + Bulk("shutdown-b"),
+           "shutdown-cleaner values loaded from checkpoint");
     // Recovered values exercise disk-backed replies. Encoded replies preceding
     // them must flush first, and an empty batch must not suppress a disk reply.
     for (int repeat = 0; repeat < 3; ++repeat) {

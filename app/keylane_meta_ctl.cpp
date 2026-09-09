@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "keylane/numeric_endpoint.h"
 #include "keylane/version.h"
 
 namespace {
@@ -148,6 +149,8 @@ void PrintUsage(const char* program) {
       "     [--tls-server-name NAME] [--timeout-ms N] COMMAND [ARG...]\n"
       "\n"
       "The command is sent as one LF-terminated Meta control-protocol line.\n"
+      "Durability recovery uses: abortop ID, archiveoperations SEQ..., then\n"
+      "exportoperations and pruneoperations SEQ....\n"
       "Exit status is 0 for an OK reply, 2 for an ERR reply, and 1 for a\n"
       "local, connection, TLS, or malformed-protocol failure.\n",
       program, program);
@@ -249,41 +252,32 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
 }
 
 Endpoint ParseEndpoint(std::string_view text) {
-  const std::size_t colon = text.rfind(':');
-  if (colon == std::string_view::npos || colon == 0 ||
-      colon + 1 == text.size()) {
-    Fail("--addr must be a numeric IPv4/IPv6 address followed by :port");
-  }
-  std::string host(text.substr(0, colon));
-  if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
-    host = host.substr(1, host.size() - 2);
-  }
-  int port = 0;
-  if (!ParseInt(text.substr(colon + 1), 1, 65535, &port)) {
-    Fail("--addr has an invalid port");
+  auto parsed = keylane::ParseNumericEndpoint(text);
+  if (!parsed.has_value()) {
+    Fail("--addr must be numeric IPv4:port or [IPv6]:port");
   }
 
   Endpoint endpoint;
-  endpoint.host_ = host;
+  endpoint.host_ = std::move(parsed->host_);
   sockaddr_in ipv4{};
-  if (::inet_pton(AF_INET, host.c_str(), &ipv4.sin_addr) == 1) {
+  if (::inet_pton(AF_INET, endpoint.host_.c_str(), &ipv4.sin_addr) == 1) {
     ipv4.sin_family = AF_INET;
-    ipv4.sin_port = htons(static_cast<std::uint16_t>(port));
+    ipv4.sin_port = htons(parsed->port_);
     std::memcpy(&endpoint.address_, &ipv4, sizeof(ipv4));
     endpoint.length_ = sizeof(ipv4);
     endpoint.family_ = AF_INET;
     return endpoint;
   }
   sockaddr_in6 ipv6{};
-  if (::inet_pton(AF_INET6, host.c_str(), &ipv6.sin6_addr) == 1) {
+  if (::inet_pton(AF_INET6, endpoint.host_.c_str(), &ipv6.sin6_addr) == 1) {
     ipv6.sin6_family = AF_INET6;
-    ipv6.sin6_port = htons(static_cast<std::uint16_t>(port));
+    ipv6.sin6_port = htons(parsed->port_);
     std::memcpy(&endpoint.address_, &ipv6, sizeof(ipv6));
     endpoint.length_ = sizeof(ipv6);
     endpoint.family_ = AF_INET6;
     return endpoint;
   }
-  Fail("--addr host must be a numeric IPv4/IPv6 address");
+  Fail("--addr host normalization produced an unsupported address family");
 }
 
 int RemainingMillis(Deadline deadline) {

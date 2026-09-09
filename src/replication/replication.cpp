@@ -4,8 +4,11 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <openssl/crypto.h>
 
 #include <algorithm>
 #include <array>
@@ -23,7 +26,6 @@
 #include <mutex>
 #include <new>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -43,6 +45,7 @@
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/sync.h"
 #include "celer/runtime/worker.h"
+#include "keylane/cluster/control_protocol.h"
 #include "keylane/command.h"
 #include "keylane/command_table.h"
 #include "keylane/fault_injection.h"
@@ -58,6 +61,51 @@
 #include "spdlog/spdlog.h"
 
 namespace keylane {
+
+namespace detail {
+
+// The attempt context and every replay handle share one result. A mutex keeps
+// the non-trivial Status payload coherent across flow workers; Await() polls on
+// its own worker so queued coroutine handles never outlive a cancelled caller.
+class ClusterRebuildCompletionState {
+ public:
+  void Resolve(absl::Status result) {
+    std::lock_guard lock(mutex_);
+    if (!result_.has_value()) result_ = std::move(result);
+  }
+
+  std::optional<absl::Status> result() const {
+    std::lock_guard lock(mutex_);
+    return result_;
+  }
+
+  celer::Task<absl::Status> Await() const {
+    celer::Worker* worker = celer::ThisWorker().self_;
+    if (worker == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "cluster rebuild completion requires a Celer worker");
+    }
+    for (;;) {
+      if (std::optional<absl::Status> terminal = result();
+          terminal.has_value()) {
+        co_return *terminal;
+      }
+      // Rebuilds can legitimately run for hours. This low-frequency poll is
+      // cancellation-safe (no borrowed coroutine handle remains registered)
+      // and there is at most one active target population per process.
+      absl::Status waited =
+          co_await celer::SleepFor(*worker, std::chrono::milliseconds(10));
+      if (!waited.ok()) co_return waited;
+    }
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::optional<absl::Status> result_;
+};
+
+}  // namespace detail
+
 namespace {
 
 using celer::Connection;
@@ -387,6 +435,15 @@ Task<absl::Status> WriteText(TcpStream& stream, std::string_view text) {
   return stream.WriteAll(std::span<const std::byte>(
       reinterpret_cast<const std::byte*>(text.data()), text.size()));
 }
+
+Task<absl::Status> WriteText(TcpStream& stream, const char* text) {
+  return WriteText(stream, std::string_view(text));
+}
+
+// A Task starts after the call expression has finished. Force temporary
+// command/reply buffers into a caller-owned local instead of allowing a
+// string_view to outlive them.
+Task<absl::Status> WriteText(TcpStream&, std::string&&) = delete;
 
 std::uint32_t DataFrameCrc32c(std::string_view first,
                               std::string_view second = {}) noexcept {
@@ -1741,7 +1798,8 @@ Task<absl::Status> AuthenticateUpstream(TcpStream& stream,
   std::vector<std::string> args{"AUTH"};
   if (username != "default") args.emplace_back(username);
   args.emplace_back(password);
-  absl::Status sent = co_await WriteText(stream, EncodeRespCommand(args));
+  const std::string encoded = EncodeRespCommand(args);
+  absl::Status sent = co_await WriteText(stream, encoded);
   if (!sent.ok()) co_return sent;
   auto response = co_await ReadLine(stream);
   if (!response.ok()) co_return response.status();
@@ -1772,6 +1830,58 @@ Task<absl::Status> WaitForClose(TcpStream& stream) {
   co_return absl::OkStatus();
 }
 
+class SocketSet {
+ public:
+  bool Add(int fd) {
+    std::lock_guard lock(mutex_);
+    if (cancelled_) {
+      ::shutdown(fd, SHUT_RDWR);
+      return false;
+    }
+    fds_.push_back(fd);
+    return true;
+  }
+
+  void Remove(int fd) {
+    std::lock_guard lock(mutex_);
+    const auto found = std::find(fds_.begin(), fds_.end(), fd);
+    if (found != fds_.end()) fds_.erase(found);
+  }
+
+  void Cancel() {
+    std::lock_guard lock(mutex_);
+    if (cancelled_) return;
+    cancelled_ = true;
+    for (int fd : fds_) ::shutdown(fd, SHUT_RDWR);
+  }
+
+  bool cancelled() const {
+    std::lock_guard lock(mutex_);
+    return cancelled_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<int> fds_;
+  bool cancelled_ = false;
+};
+
+class ScopedSocketSetMembership {
+ public:
+  ScopedSocketSetMembership(SocketSet* sockets, int fd)
+      : sockets_(sockets), fd_(fd) {}
+  ScopedSocketSetMembership(const ScopedSocketSetMembership&) = delete;
+  ScopedSocketSetMembership& operator=(const ScopedSocketSetMembership&) =
+      delete;
+  ~ScopedSocketSetMembership() {
+    if (sockets_ != nullptr) sockets_->Remove(fd_);
+  }
+
+ private:
+  SocketSet* sockets_;
+  int fd_;
+};
+
 absl::Status ConfigureConnectedFd(int fd) {
   int one = 1;
   if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) {
@@ -1786,7 +1896,8 @@ absl::Status ConfigureConnectedFd(int fd) {
 
 Task<absl::StatusOr<TcpStream>> ConnectTcp(
     std::string_view host, std::uint16_t port,
-    const std::shared_ptr<celer::TlsContext>& tls_context) {
+    const std::shared_ptr<celer::TlsContext>& tls_context,
+    SocketSet* sockets) {
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -1807,22 +1918,68 @@ Task<absl::StatusOr<TcpStream>> ConnectTcp(
         ::socket(address->ai_family, address->ai_socktype | SOCK_CLOEXEC,
                  address->ai_protocol);
     if (fd < 0) continue;
-    // Cold-path connect. Once registered, all reads and writes use io_uring.
-    if (::connect(fd, address->ai_addr, address->ai_addrlen) == 0) {
+    absl::Status configured = ConfigureConnectedFd(fd);
+    if (!configured.ok()) {
+      ::close(fd);
+      continue;
+    }
+    if (sockets != nullptr && !sockets->Add(fd)) {
+      ::close(fd);
+      ::freeaddrinfo(addresses);
+      co_return absl::CancelledError(
+          "replication connection was cancelled before connect");
+    }
+
+    int connect_result =
+        ::connect(fd, address->ai_addr, address->ai_addrlen);
+    if (connect_result != 0 && errno == EINPROGRESS) {
+      // The old blocking connect could pin worker zero through process
+      // shutdown. Poll in short slices so a thread-safe SocketSet cancellation
+      // can terminate even a black-holed connect before the coroutine runtime
+      // has adopted the descriptor.
+      for (;;) {
+        if (sockets != nullptr && sockets->cancelled()) {
+          connect_result = -1;
+          errno = ECANCELED;
+          break;
+        }
+        pollfd pending{.fd = fd, .events = POLLOUT, .revents = 0};
+        const int polled = ::poll(&pending, 1, 100);
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled == 0) continue;
+        if (polled < 0) {
+          connect_result = -1;
+          break;
+        }
+        int socket_error = 0;
+        socklen_t error_size = sizeof(socket_error);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                         &error_size) != 0) {
+          connect_result = -1;
+          break;
+        }
+        if (socket_error == 0) {
+          connect_result = 0;
+        } else {
+          connect_result = -1;
+          errno = socket_error;
+        }
+        break;
+      }
+    }
+    if (connect_result == 0) {
       connected_fd = fd;
       break;
     }
+    if (sockets != nullptr) sockets->Remove(fd);
     ::close(fd);
   }
   ::freeaddrinfo(addresses);
   if (connected_fd < 0) {
+    if (sockets != nullptr && sockets->cancelled()) {
+      co_return absl::CancelledError("replication connect was cancelled");
+    }
     co_return absl::UnavailableError("replication connect failed");
-  }
-
-  absl::Status configured = ConfigureConnectedFd(connected_fd);
-  if (!configured.ok()) {
-    ::close(connected_fd);
-    co_return configured;
   }
   Connection connection;
   connection.worker_ = celer::ThisWorker().self_;
@@ -1831,6 +1988,7 @@ Task<absl::StatusOr<TcpStream>> ConnectTcp(
   Connection* registered =
       celer::ThisWorker().self_->AddConnection(std::move(connection));
   if (registered == nullptr) {
+    if (sockets != nullptr) sockets->Remove(connected_fd);
     ::close(connected_fd);
     co_return absl::InternalError("failed to register replication connection");
   }
@@ -1838,6 +1996,7 @@ Task<absl::StatusOr<TcpStream>> ConnectTcp(
   if (tls_context != nullptr) {
     absl::Status started = co_await stream.StartTls(tls_context, false, host);
     if (!started.ok()) {
+      if (sockets != nullptr) sockets->Remove(connected_fd);
       stream.Close().IgnoreError();
       co_return started;
     }
@@ -1846,13 +2005,16 @@ Task<absl::StatusOr<TcpStream>> ConnectTcp(
 }
 
 std::string NewReplicationId() {
-  std::random_device random;
-  std::mt19937_64 generator((static_cast<std::uint64_t>(random()) << 32) ^
-                            random() ^ static_cast<std::uint64_t>(::getpid()));
-  constexpr char digits[] = "0123456789abcdef";
-  std::string result(40, '0');
-  for (char& value : result) value = digits[generator() & 0xfU];
-  return result;
+  auto generated = cluster::control::GenerateIdentity160();
+  if (!generated.ok()) {
+    // These values distinguish process/storage incarnations. Falling back to
+    // a predictable or repeated id could make an old replication session look
+    // current, so the legacy infallible constructor contract fails closed.
+    spdlog::critical("cannot generate replication identity: {}",
+                     generated.status().ToString());
+    std::abort();
+  }
+  return std::move(*generated);
 }
 
 bool IsReplicationId(std::string_view value) {
@@ -1900,42 +2062,6 @@ std::string PeerHost(int fd) {
   }
   return host;
 }
-
-class SocketSet {
- public:
-  bool Add(int fd) {
-    std::lock_guard lock(mutex_);
-    if (cancelled_) {
-      ::shutdown(fd, SHUT_RDWR);
-      return false;
-    }
-    fds_.push_back(fd);
-    return true;
-  }
-
-  void Remove(int fd) {
-    std::lock_guard lock(mutex_);
-    const auto found = std::find(fds_.begin(), fds_.end(), fd);
-    if (found != fds_.end()) fds_.erase(found);
-  }
-
-  void Cancel() {
-    std::lock_guard lock(mutex_);
-    if (cancelled_) return;
-    cancelled_ = true;
-    for (int fd : fds_) ::shutdown(fd, SHUT_RDWR);
-  }
-
-  bool cancelled() const {
-    std::lock_guard lock(mutex_);
-    return cancelled_;
-  }
-
- private:
-  mutable std::mutex mutex_;
-  std::vector<int> fds_;
-  bool cancelled_ = false;
-};
 
 struct ReplicaCursorState {
   explicit ReplicaCursorState(unsigned count) : cursors_(count) {
@@ -2195,13 +2321,16 @@ struct ClusterRebuildContext {
                         DestructiveResetAuthorization authorization)
       : directive_(std::move(directive)),
         manifest_(std::move(manifest)),
-        authorization_(std::move(authorization)) {}
+        authorization_(std::move(authorization)),
+        completion_(std::make_shared<detail::ClusterRebuildCompletionState>()) {
+  }
 
   const RebuildDirective directive_;
   const PopulationManifest manifest_;
   const DestructiveResetAuthorization authorization_;
   std::atomic<ReplicationGroupState> state_{ReplicationGroupState::kRebuilding};
   std::optional<ReadyToken> ready_token_;
+  const std::shared_ptr<detail::ClusterRebuildCompletionState> completion_;
 };
 
 struct ReplicaSession {
@@ -2215,6 +2344,9 @@ struct ReplicaSession {
   };
 
   std::uint64_t session_id_ = 0;
+  // Unpredictable bearer capability returned only on the control channel.
+  // Data flows present it before they may claim a flow id or read bytes.
+  std::string flow_capability_;
   unsigned source_worker_count_ = 0;
   std::shared_ptr<ClusterRebuildContext> cluster_rebuild_;
   std::shared_ptr<ReplicaCursorState> cursors_;
@@ -2577,6 +2709,7 @@ struct MasterSession {
                 std::vector<std::uint64_t> applied,
                 std::shared_ptr<const ClusterRebuildContext> population_export)
       : id_(id),
+        flow_capability_(NewReplicationId()),
         node_id_(std::move(node_id)),
         host_(std::move(host)),
         port_(port),
@@ -2601,9 +2734,13 @@ struct MasterSession {
     return true;
   }
 
-  bool SetFlow(unsigned flow_id, int fd) {
+  bool SetFlow(unsigned flow_id, std::string_view capability, int fd) {
     std::lock_guard lock(mutex_);
-    if (cancelled_.load(std::memory_order_acquire) ||
+    const bool capability_matches =
+        capability.size() == flow_capability_.size() &&
+        CRYPTO_memcmp(capability.data(), flow_capability_.data(),
+                      flow_capability_.size()) == 0;
+    if (!capability_matches || cancelled_.load(std::memory_order_acquire) ||
         flow_id >= flow_fds_.size() || flow_fds_[flow_id] >= 0) {
       return false;
     }
@@ -2859,6 +2996,7 @@ struct MasterSession {
   bool cancelled() const { return cancelled_.load(std::memory_order_acquire); }
 
   std::uint64_t id_ = 0;
+  const std::string flow_capability_;
   const std::string node_id_;
   const std::string host_;
   const std::uint16_t port_ = 0;
@@ -2932,13 +3070,17 @@ class ReplicationManager::ReplicationGroup {
                    std::atomic<std::uint64_t>* serving_generation)
       : storage_(storage),
         serving_generation_(serving_generation),
-        cluster_enabled_(options.cluster_enabled_),
+        cluster_enabled_(options.cluster_enabled_ ||
+                         options.cluster_population_managed_),
+        cluster_population_managed_(options.cluster_population_managed_),
         upstream_(cluster_enabled_ ? std::nullopt
                                    : std::move(initial_upstream)),
         cursor_state_(
             std::make_shared<ReplicaCursorState>(storage->worker_count())),
         replica_priority_(options.replica_priority_),
-        node_id_(NewReplicationId()),
+        node_id_(options.node_id_override_.has_value()
+                     ? *options.node_id_override_
+                     : NewReplicationId()),
         group_id_(NewReplicationId()),
         boot_id_(NewReplicationId()),
         replica_incarnation_(NewReplicationId()),
@@ -2949,7 +3091,7 @@ class ReplicationManager::ReplicationGroup {
         masterauth_(options.masterauth_),
         redis_psync_(cluster_enabled_ ? false : options.redis_psync_),
         redis_export_backpressure_(options.redis_export_backpressure_) {
-    if (cluster_enabled_) {
+    if (cluster_population_managed_) {
       cluster_group_ =
           std::make_unique<keylane::ReplicationGroup>(node_id_, boot_id_);
     }
@@ -2960,9 +3102,8 @@ class ReplicationManager::ReplicationGroup {
     if (cluster_enabled_ && initial_upstream.has_value()) {
       // Server config rejects this combination, but ReplicationManager is also
       // a public embedding seam. Ignore the standalone source here so a direct
-      // caller cannot bypass boot-scoped cluster population authorization.
-      spdlog::warn(
-          "ignoring standalone initial upstream in cluster-managed mode");
+      // caller cannot bypass cluster replication policy.
+      spdlog::warn("ignoring standalone initial upstream in cluster mode");
     }
     const std::size_t minimum_blocks = storage_->worker_count();
     const std::size_t configured_blocks =
@@ -2990,7 +3131,7 @@ class ReplicationManager::ReplicationGroup {
         group_id_ = (**recovered_base).group_id_;
       }
     }
-    if (upstream_.has_value() || cluster_enabled_) {
+    if (upstream_.has_value() || cluster_population_managed_) {
       StoreRole(ReplicationRole::kConnecting, std::memory_order_relaxed);
       role_epoch_.store(1, std::memory_order_relaxed);
     }
@@ -3014,21 +3155,22 @@ class ReplicationManager::ReplicationGroup {
     }
   }
 
-  Task<absl::Status> ApplyClusterRebuildDirective(ReplicaOfConfig upstream,
-                                                  RebuildDirective directive,
-                                                  PopulationManifest manifest) {
+  Task<absl::StatusOr<std::shared_ptr<detail::ClusterRebuildCompletionState>>>
+  StartClusterRebuildDirective(ReplicaOfConfig upstream,
+                               RebuildDirective directive,
+                               PopulationManifest manifest) {
     if (celer::ThisWorker().id_ != 0) {
       co_return co_await celer::SubmitTaskTo(
           0, [this, upstream = std::move(upstream),
               directive = std::move(directive),
               manifest = std::move(manifest)]() mutable {
-            return ApplyClusterRebuildDirective(
+            return StartClusterRebuildDirective(
                 std::move(upstream), std::move(directive), std::move(manifest));
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!cluster_population_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
-          "cluster rebuild directives require cluster-enabled mode");
+          "cluster rebuild directives require Meta-managed population mode");
     }
     if (upstream.host_.empty() || upstream.port_ == 0) {
       co_return absl::InvalidArgumentError(
@@ -3037,6 +3179,10 @@ class ReplicationManager::ReplicationGroup {
     if (directive.identity_.manifest_id_ != manifest.id()) {
       co_return absl::FailedPreconditionError(
           "rebuild directive does not match the supplied manifest");
+    }
+    if (cluster_control_stopping_) {
+      co_return absl::CancelledError(
+          "cluster rebuild admission stopped for process shutdown");
     }
     // An automatic session teardown already owns cancellation, proof
     // invalidation, and candidate abort. Let it finish before evaluating a
@@ -3051,6 +3197,10 @@ class ReplicationManager::ReplicationGroup {
       absl::Status waited = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
+    }
+    if (cluster_control_stopping_) {
+      co_return absl::CancelledError(
+          "cluster rebuild admission stopped during prior teardown");
     }
 
     absl::Status validated =
@@ -3091,7 +3241,7 @@ class ReplicationManager::ReplicationGroup {
               "cluster rebuild retry conflicts with its accepted source "
               "endpoint");
         }
-        co_return absl::OkStatus();
+        co_return cluster_rebuild_->completion_;
       }
       if (!validated.ok()) co_return validated;
       if (replica_reconfiguration_running_) {
@@ -3213,6 +3363,20 @@ class ReplicationManager::ReplicationGroup {
           co_return waited;
         }
       }
+      previous_context->completion_->Resolve(absl::CancelledError(
+          "cluster rebuild attempt was superseded after cleanup"));
+      if (cluster_control_stopping_) {
+        std::lock_guard lock(state_mutex_);
+        replica_reconfiguration_running_ = false;
+        if (cluster_rebuild_ == previous_context) {
+          cluster_rebuild_.reset();
+          upstream_.reset();
+          upstream_node_id_.reset();
+          upstream_history_id_.reset();
+        }
+        co_return absl::CancelledError(
+            "cluster rebuild supersession stopped for process shutdown");
+      }
     }
 
     auto authorization = cluster_group_->BeginRebuild(directive, manifest);
@@ -3253,7 +3417,302 @@ class ReplicationManager::ReplicationGroup {
     }
 
     StartCoordinator();
+    co_return context->completion_;
+  }
+
+  Task<absl::Status> ApplyClusterRebuildDirective(ReplicaOfConfig upstream,
+                                                  RebuildDirective directive,
+                                                  PopulationManifest manifest) {
+    auto started = co_await StartClusterRebuildDirective(
+        std::move(upstream), std::move(directive), std::move(manifest));
+    if (!started.ok()) co_return started.status();
+    co_return co_await (*started)->Await();
+  }
+
+  Task<absl::Status> RetireClusterPopulation(
+      std::optional<DesiredClusterPopulation> desired, bool preserve_any_ready,
+      std::string_view reason) {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, desired = std::move(desired), preserve_any_ready,
+              reason = std::string(reason)]() mutable {
+            return RetireClusterPopulation(std::move(desired),
+                                           preserve_any_ready, reason);
+          });
+    }
+    if (!cluster_population_managed_ || cluster_group_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "population reconciliation requires Meta-managed population mode");
+    }
+
+    // Automatic teardown owns the same session/root cleanup. Joining it first
+    // prevents two coroutines from aborting one in-place candidate.
+    for (;;) {
+      bool teardown_running = false;
+      {
+        std::lock_guard lock(state_mutex_);
+        teardown_running = replica_session_teardown_running_;
+      }
+      if (!teardown_running) break;
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+
+    std::shared_ptr<ClusterRebuildContext> context;
+    std::shared_ptr<ReplicaSession> session;
+    {
+      std::lock_guard lock(state_mutex_);
+      if (failed_stopped_.load(std::memory_order_relaxed)) {
+        co_return absl::FailedPreconditionError(absl::StrCat(
+            "replication is failed-stopped until restart: ", failure_reason_));
+      }
+      context = cluster_rebuild_;
+      if (context == nullptr) co_return absl::OkStatus();
+
+      const RebuildIdentity& identity = context->directive_.identity_;
+      const ReplicationGroupState state =
+          context->state_.load(std::memory_order_acquire);
+      const bool matches_population =
+          desired.has_value() && identity.group_id_ == desired->group_id_ &&
+          identity.assignment_id_ == desired->assignment_id_ &&
+          identity.manifest_revision_ == desired->manifest_revision_ &&
+          identity.manifest_id_ == desired->manifest_id_ &&
+          identity.partition_replication_epoch_ ==
+              desired->partition_replication_epoch_;
+      const bool matches_attempt =
+          matches_population && identity.term_ == desired->term_;
+      const bool completed_ready = state == ReplicationGroupState::kReady &&
+                                   context->ready_token_.has_value();
+      const bool desired_attempt_still_live =
+          matches_attempt && desired->rebuild_expected_ &&
+          state == ReplicationGroupState::kRebuilding;
+      // A term transition fences authority but does not change the physical
+      // population. Preserve a completed proof across that transition when
+      // membership incarnation and immutable manifest remain exact; the Data
+      // controller re-anchors its heartbeat proof to the newer FDS term.
+      const bool desired_ready_population =
+          matches_population && completed_ready;
+      if (desired_attempt_still_live || desired_ready_population ||
+          (preserve_any_ready && completed_ready)) {
+        co_return absl::OkStatus();
+      }
+      if (replica_reconfiguration_running_) {
+        co_return absl::AbortedError(
+            "cluster population changed during FDS reconciliation");
+      }
+
+      // Close every externally observable proof before the first suspension.
+      // The moved session gives this transition exclusive ownership of flow
+      // join and root abort; Coordinator observes the move and exits.
+      context->state_.store(ReplicationGroupState::kNotReady,
+                            std::memory_order_release);
+      context->ready_token_.reset();
+      source_authorizations_.RevokeAll();
+      replica_reconfiguration_running_ = true;
+      session = std::move(active_replica_session_);
+      upstream_.reset();
+      cursor_state_.reset();
+      upstream_node_id_.reset();
+      upstream_history_id_.reset();
+      replica_session_id_ = 0;
+      source_worker_count_ = 0;
+      role_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    native_dataset_valid_.store(false, std::memory_order_release);
+    storage_->SetReplicaLoading(true);
+    storage_->SetExpirationAuthority(false);
+    StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
+    if (session != nullptr) session->Cancel();
+
+    absl::Status revoked = co_await RevokeClusterRebuildSourceAuthorizations();
+    if (!revoked.ok()) {
+      const std::string failure =
+          absl::StrCat("cluster population source revocation is uncertain: ",
+                       revoked.message());
+      (void)cluster_group_->FailStop(context->directive_.identity_);
+      LatchReplicationFailure(failure);
+      co_return revoked;
+    }
+
+    if (session != nullptr) {
+      absl::Status stopped = co_await CancelAndWaitForReplicaFlows(session);
+      std::optional<std::string> failure = session->FailStopReason();
+      if (!stopped.ok() && !failure.has_value()) {
+        failure = absl::StrCat("replica cancellation/join is uncertain: ",
+                               stopped.message());
+      }
+      if (stopped.ok() && !failure.has_value() && session->session_id_ != 0) {
+        absl::Status discarded =
+            co_await storage_->AbortReplicaRoot(session->session_id_);
+        if (!discarded.ok()) {
+          failure = absl::StrCat("replica root abort is uncertain: ",
+                                 discarded.message());
+        }
+      }
+      if (failure.has_value()) {
+        (void)cluster_group_->FailStop(context->directive_.identity_);
+        LatchReplicationFailure(*failure);
+        co_return absl::FailedPreconditionError(absl::StrCat(
+            "replication is failed-stopped until restart: ", *failure));
+      }
+    }
+
+    absl::Status retired =
+        cluster_group_->InvalidateProof(context->directive_.identity_);
+    if (!retired.ok()) {
+      const std::string failure = absl::StrCat(
+          "cluster population proof could not be retired: ", retired.message());
+      (void)cluster_group_->FailStop(context->directive_.identity_);
+      LatchReplicationFailure(failure);
+      co_return absl::FailedPreconditionError(failure);
+    }
+
+    while (coordinator_started_) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) {
+        const std::string failure =
+            absl::StrCat("cluster population coordinator could not be joined: ",
+                         waited.message());
+        LatchReplicationFailure(failure);
+        co_return waited;
+      }
+    }
+    {
+      std::lock_guard lock(state_mutex_);
+      if (cluster_rebuild_ == context) cluster_rebuild_.reset();
+      replica_reconfiguration_running_ = false;
+    }
+    context->completion_->Resolve(absl::CancelledError(std::string(reason)));
     co_return absl::OkStatus();
+  }
+
+  Task<absl::Status> ReconcileClusterPopulation(
+      std::optional<DesiredClusterPopulation> desired) {
+    return RetireClusterPopulation(std::move(desired),
+                                   /*preserve_any_ready=*/false,
+                                   "cluster population was retired by FDS");
+  }
+
+  Task<absl::Status> CancelInProgressClusterPopulation() {
+    return RetireClusterPopulation(
+        std::nullopt, /*preserve_any_ready=*/true,
+        "in-progress cluster rebuild was cancelled after control loss");
+  }
+
+  Task<absl::Status> CancelClusterRebuildForShutdown() {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this]() { return CancelClusterRebuildForShutdown(); });
+    }
+    if (!cluster_population_managed_ || cluster_group_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "population shutdown requires Meta-managed population mode");
+    }
+    cluster_control_stopping_ = true;
+    co_return co_await RetireClusterPopulation(
+        std::nullopt, /*preserve_any_ready=*/false,
+        "cluster population was retired for process shutdown");
+  }
+
+  void RequestShutdown() noexcept {
+    replication_shutdown_requested_.store(true, std::memory_order_release);
+    discovery_sockets_.Cancel();
+    source_sockets_.Cancel();
+
+    // Target session socket sets are independently thread-safe. Snapshot their
+    // shared owners under the state mutex, then cancel without holding it.
+    // Native/Redis source sockets use source_sockets_ because their registry
+    // is guarded by a worker-affine mutex that the process main thread cannot
+    // acquire. Closing both directions wakes transport awaits and lets source
+    // flow teardown release any backlog retention blocking an admitted write.
+    std::vector<std::shared_ptr<ReplicaSession>> sessions;
+    {
+      std::lock_guard lock(state_mutex_);
+      if (active_replica_session_ != nullptr) {
+        sessions.push_back(active_replica_session_);
+      }
+      for (const auto& source : redis_sources_) {
+        if (source->session_ != nullptr) sessions.push_back(source->session_);
+      }
+    }
+    for (const auto& session : sessions) session->Cancel();
+  }
+
+  Task<absl::Status> QuiesceForShutdown() {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this]() { return QuiesceForShutdown(); });
+    }
+    RequestShutdown();
+    absl::Status result = absl::OkStatus();
+    if (cluster_population_managed_) {
+      // The Meta transition additionally retires its Ready proof. It is
+      // idempotent when the control client already completed the same barrier.
+      result = co_await CancelClusterRebuildForShutdown();
+    } else {
+      std::vector<std::shared_ptr<ReplicaSession>> sessions;
+      std::uint64_t redis_full_sync_session = 0;
+      {
+        std::lock_guard lock(state_mutex_);
+        role_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        initial_protocol_probe_pending_ = false;
+        replica_reconfiguration_running_ = true;
+        if (active_replica_session_ != nullptr) {
+          sessions.push_back(std::move(active_replica_session_));
+        }
+        for (const auto& source : redis_sources_) {
+          StoreRedisLink(source, false);
+          source->syncing_ = false;
+          if (source->session_ != nullptr) {
+            sessions.push_back(std::move(source->session_));
+          }
+        }
+        redis_full_sync_session = redis_full_sync_session_id_;
+        redis_full_sync_session_id_ = 0;
+        replica_session_id_ = 0;
+        source_worker_count_ = 0;
+      }
+      for (const auto& session : sessions) session->Cancel();
+
+      for (const auto& session : sessions) {
+        absl::Status stopped = co_await CancelAndWaitForReplicaFlows(session);
+        if (result.ok() && !stopped.ok()) result = stopped;
+        if (!stopped.ok() || session->session_id_ == 0) continue;
+        absl::Status aborted =
+            co_await storage_->AbortReplicaRoot(session->session_id_);
+        if (result.ok() && !aborted.ok()) result = aborted;
+      }
+      if (redis_full_sync_session != 0) {
+        absl::Status aborted =
+            co_await storage_->AbortReplicaRoot(redis_full_sync_session);
+        if (result.ok() && !aborted.ok()) result = aborted;
+      }
+    }
+
+    // A protocol probe owns a connection before it creates ReplicaSession.
+    // The stop bit makes each completion path abstain from retrying or
+    // publishing a source; join those coordinator roots too.
+    for (;;) {
+      bool running = coordinator_started_ || redis_topology_monitor_started_;
+      for (const auto& source : redis_sources_) {
+        running = running || source->coordinator_started_;
+      }
+      if (!running) break;
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) {
+        if (result.ok()) result = waited;
+        break;
+      }
+    }
+    // Source handshakes can enable replication logs and source flows hold
+    // snapshot/log retention. Join them and disable history before the storage
+    // shutdown path performs its final freeze.
+    absl::Status source_retired = co_await RetireSourceHistory();
+    if (result.ok() && !source_retired.ok()) result = source_retired;
+    co_return result;
   }
 
   Task<ClusterPopulationStatus> cluster_population_status() const {
@@ -3283,9 +3742,10 @@ class ReplicationManager::ReplicationGroup {
             return AuthorizeClusterRebuildSource(std::move(directive));
           });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!cluster_population_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
-          "cluster source authorization requires cluster-enabled mode");
+          "cluster source authorization requires Meta-managed population "
+          "mode");
     }
     const RebuildIdentity& identity = directive.identity_;
     if (!directive.safe_source_active_ ||
@@ -3293,8 +3753,10 @@ class ReplicationManager::ReplicationGroup {
         identity.term_ == 0 || identity.directive_revision_ == 0 ||
         identity.group_id_.empty() || identity.assignment_id_.empty() ||
         identity.authority_id_.empty() || identity.operation_id_.empty() ||
-        identity.attempt_id_.empty() || identity.target_node_id_.empty() ||
+        identity.directive_id_.empty() || identity.attempt_id_.empty() ||
+        identity.manifest_revision_ == 0 || identity.target_node_id_.empty() ||
         identity.target_boot_id_.empty() ||
+        identity.source_assignment_id_.empty() ||
         identity.source_node_id_ != node_id_ ||
         identity.source_boot_id_ != boot_id_) {
       co_return absl::InvalidArgumentError(
@@ -3328,13 +3790,21 @@ class ReplicationManager::ReplicationGroup {
             cluster_rebuild_->ready_token_->identity().group_id_ !=
                 identity.group_id_ ||
             cluster_rebuild_->ready_token_->identity().assignment_id_ !=
-                identity.assignment_id_ ||
+                identity.source_assignment_id_ ||
+            cluster_rebuild_->ready_token_->identity().manifest_revision_ !=
+                identity.manifest_revision_ ||
             cluster_rebuild_->ready_token_->identity().manifest_id_ !=
-                identity.manifest_id_) {
+                identity.manifest_id_ ||
+            cluster_rebuild_->ready_token_->identity()
+                    .partition_replication_epoch_ !=
+                identity.partition_replication_epoch_) {
           co_return absl::FailedPreconditionError(
               "cluster source population is not ready for this "
               "group/manifest");
         }
+        // assignment_id_ names the rebuild target. source_assignment_id_
+        // separately binds the local ReadyToken, so remove/re-add of the same
+        // stable source node cannot revive an old export authorization.
         auto authorized = source_authorizations_.Authorize(directive);
         if (!authorized.ok()) co_return authorized.status();
         action = *authorized;
@@ -3354,13 +3824,28 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> RevokeClusterRebuildSourceAuthorizations() {
+    return RetireClusterRebuildSourceAuthorizations(
+        /*allow_same_revision_replay=*/false);
+  }
+
+  Task<absl::Status>
+  ClearClusterRebuildSourceAuthorizationsForSessionReplacement() {
+    return RetireClusterRebuildSourceAuthorizations(
+        /*allow_same_revision_replay=*/true);
+  }
+
+  Task<absl::Status> RetireClusterRebuildSourceAuthorizations(
+      bool allow_same_revision_replay) {
     if (celer::ThisWorker().id_ != 0) {
       co_return co_await celer::SubmitTaskTo(
-          0, [this] { return RevokeClusterRebuildSourceAuthorizations(); });
+          0, [this, allow_same_revision_replay] {
+            return RetireClusterRebuildSourceAuthorizations(
+                allow_same_revision_replay);
+          });
     }
-    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+    if (!cluster_population_managed_ || cluster_group_ == nullptr) {
       co_return absl::FailedPreconditionError(
-          "cluster source revocation requires cluster-enabled mode");
+          "cluster source revocation requires Meta-managed population mode");
     }
     struct RevocationGuard {
       std::mutex* state_mutex_ = nullptr;
@@ -3381,7 +3866,11 @@ class ReplicationManager::ReplicationGroup {
         std::lock_guard state_lock(state_mutex_);
         ++cluster_source_revocations_in_flight_;
         revocation_guard.active_ = true;
-        source_authorizations_.RevokeAll();
+        if (allow_same_revision_replay) {
+          source_authorizations_.ClearActiveForSessionReplacement();
+        } else {
+          source_authorizations_.RevokeAll();
+        }
       }
       sessions.reserve(master_sessions_.size() +
                        retired_master_sessions_.size());
@@ -3401,16 +3890,18 @@ class ReplicationManager::ReplicationGroup {
     for (const auto& session : sessions) session->Cancel();
     auto next_warning =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (std::any_of(
-        sessions.begin(), sessions.end(),
-        [](const auto& session) { return session->connected_flows() != 0; })) {
+    while (active_master_controls_.load(std::memory_order_acquire) != 0 ||
+           std::any_of(sessions.begin(), sessions.end(),
+                       [](const auto& session) {
+                         return session->connected_flows() != 0;
+                       })) {
       absl::Status waited = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
       if (std::chrono::steady_clock::now() >= next_warning) {
         spdlog::warn(
-            "waiting for revoked cluster source flows to release their "
-            "population snapshots");
+            "waiting for revoked cluster source handshakes/flows to release "
+            "their population snapshots");
         next_warning =
             std::chrono::steady_clock::now() + std::chrono::seconds(5);
       }
@@ -3436,7 +3927,11 @@ class ReplicationManager::ReplicationGroup {
     }
     if (cluster_enabled_) {
       co_return absl::FailedPreconditionError(
-          "REPLICAOF is unavailable in cluster-managed mode");
+          "REPLICAOF is unavailable in cluster mode");
+    }
+    if (replication_shutdown_requested_) {
+      co_return absl::CancelledError(
+          "replication reconfiguration stopped for process shutdown");
     }
     if (failed_stopped_.load(std::memory_order_acquire)) {
       std::lock_guard lock(state_mutex_);
@@ -3847,7 +4342,7 @@ class ReplicationManager::ReplicationGroup {
     }
     if (cluster_enabled_) {
       co_return absl::FailedPreconditionError(
-          "ADDREPLICAOF is unavailable in cluster-managed mode");
+          "ADDREPLICAOF is unavailable in cluster mode");
     }
     if (failed_stopped_.load(std::memory_order_acquire)) {
       std::lock_guard lock(state_mutex_);
@@ -3928,12 +4423,17 @@ class ReplicationManager::ReplicationGroup {
       history_id = history_id_;
     }
     std::vector<std::uint64_t> next_lsns(storage_->worker_count());
+    // Keep the suspension paths in separate statements. GCC 13 can reuse the
+    // wrong coroutine-frame slot when both arms of ?: contain co_await.
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       auto fence = [this]() { return storage_->FenceReplicationLog(); };
-      absl::StatusOr<std::uint64_t> next =
-          worker == celer::ThisWorker().id_
-              ? co_await fence()
-              : co_await celer::SubmitTaskTo(worker, fence);
+      absl::StatusOr<std::uint64_t> next{
+          absl::UnknownError("replication-log fence was not dispatched")};
+      if (worker == celer::ThisWorker().id_) {
+        next = co_await fence();
+      } else {
+        next = co_await celer::SubmitTaskTo(worker, fence);
+      }
       if (!next.ok()) {
         // With no native consumer the runtime backlog is intentionally
         // disabled. WAIT keeps the connection dirty and retries if a replica
@@ -4311,6 +4811,16 @@ class ReplicationManager::ReplicationGroup {
                                            std::uint64_t client_id,
                                            std::string client_address,
                                            bool tls) {
+    if (cluster_enabled_ && !cluster_population_managed_) {
+      absl::Status sent = co_await WriteText(
+          stream,
+          "-ERR native replication export is unavailable in static cluster "
+          "mode\r\n");
+      co_return sent.ok() ? absl::FailedPreconditionError(
+                                "static cluster mode has no authorized native "
+                                "replication export")
+                          : sent;
+    }
     if (is_loading()) {
       absl::Status sent = co_await WriteText(
           stream,
@@ -4338,7 +4848,7 @@ class ReplicationManager::ReplicationGroup {
     std::uint64_t replication_session_id = 0;
     if (EqualCaseInsensitive(args.front(), "KLFLOW")) {
       unsigned flow_id = 0;
-      if (args.size() != 6 ||
+      if (args.size() != 7 ||
           !ParseUnsigned(args[2], &replication_session_id) ||
           replication_session_id == 0 || !ParseUnsigned(args[3], &flow_id)) {
         co_return absl::InvalidArgumentError("invalid KLFLOW handshake");
@@ -4407,6 +4917,12 @@ class ReplicationManager::ReplicationGroup {
                                                 std::uint64_t client_id,
                                                 std::string client_address,
                                                 bool tls, bool eof_capable) {
+    if (!source_sockets_.Add(stream.NativeFd())) {
+      co_return absl::CancelledError(
+          "Redis replication export stopped for process shutdown");
+    }
+    ScopedSocketSetMembership source_socket(&source_sockets_,
+                                             stream.NativeFd());
     if (args.size() != 3 || !EqualCaseInsensitive(args[0], "PSYNC")) {
       co_return absl::InvalidArgumentError("invalid Redis PSYNC handshake");
     }
@@ -4425,6 +4941,16 @@ class ReplicationManager::ReplicationGroup {
       co_return sent.ok() ? absl::FailedPreconditionError(
                                 "a fenced node cannot export Redis PSYNC")
                           : sent;
+    }
+    if (cluster_enabled_) {
+      absl::Status sent = co_await WriteText(
+          stream,
+          "-ERR Redis replication export is unavailable in cluster mode\r\n");
+      co_return sent.ok()
+          ? absl::FailedPreconditionError(
+                "cluster mode has no authorized Redis replication "
+                "export")
+          : sent;
     }
     if (is_replica()) {
       absl::Status sent = co_await WriteText(
@@ -4454,6 +4980,13 @@ class ReplicationManager::ReplicationGroup {
         active_->store(false, std::memory_order_release);
       }
     } active_guard{&redis_export_active_, &redis_export_fd_};
+    // CAS-before-check pairs with DrainSourceEgress's active observation. If
+    // shutdown won first, this handler exits before any await/history setup;
+    // otherwise the barrier sees active=true and joins the whole export.
+    if (replication_shutdown_requested_.load(std::memory_order_acquire)) {
+      co_return absl::CancelledError(
+          "Redis replication export stopped for process shutdown");
+    }
     if (is_replica() || is_loading()) {
       absl::Status sent = co_await WriteText(
           stream,
@@ -4587,9 +5120,10 @@ class ReplicationManager::ReplicationGroup {
     // Start all storage workers even if the socket fails immediately: every
     // producer owns the matching EndRdbSnapshot cleanup.
     rdb_queue->Start();
-    status = co_await WriteText(
-        stream, absl::StrCat("+FULLRESYNC ", node_id_, " 0\r\n$EOF:", eof_token,
-                             "\r\n"));
+    const std::string full_resync_header =
+        absl::StrCat("+FULLRESYNC ", node_id_, " 0\r\n$EOF:", eof_token,
+                     "\r\n");
+    status = co_await WriteText(stream, full_resync_header);
     if (status.ok()) {
       // RDB v10 is accepted by Redis 7.0 and later. Keylane's value opcodes
       // do not require the v11 metadata additions used by backup files.
@@ -4691,10 +5225,12 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::StatusOr<std::optional<RedisClusterTopology>>>
   QueryRedisClusterTopology(const ReplicaOfConfig& upstream) {
-    auto connected =
-        co_await ConnectTcp(upstream.host_, upstream.port_, tls_context_);
+    auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
+                                         tls_context_, &discovery_sockets_);
     if (!connected.ok()) co_return connected.status();
     TcpStream stream = std::move(*connected);
+    ScopedSocketSetMembership membership(&discovery_sockets_,
+                                         stream.NativeFd());
     absl::Status status =
         co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
     if (!status.ok()) {
@@ -4702,7 +5238,8 @@ class ReplicationManager::ReplicationGroup {
       co_return status;
     }
     const std::vector<std::string> command{"CLUSTER", "NODES"};
-    status = co_await WriteText(stream, EncodeRespCommand(command));
+    const std::string encoded_command = EncodeRespCommand(command);
+    status = co_await WriteText(stream, encoded_command);
     if (!status.ok()) {
       stream.Close().IgnoreError();
       co_return status;
@@ -4746,10 +5283,12 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::StatusOr<UpstreamDiscovery>> ProbeUpstream(
       const ReplicaOfConfig& upstream) {
-    auto connected =
-        co_await ConnectTcp(upstream.host_, upstream.port_, tls_context_);
+    auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
+                                         tls_context_, &discovery_sockets_);
     if (!connected.ok()) co_return connected.status();
     TcpStream stream = std::move(*connected);
+    ScopedSocketSetMembership membership(&discovery_sockets_,
+                                         stream.NativeFd());
     absl::Status status =
         co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
     if (!status.ok()) {
@@ -4758,7 +5297,8 @@ class ReplicationManager::ReplicationGroup {
     }
     const std::vector<std::string> sync_args{
         "KLPSYNC", std::string(kProtocolVersion), "?", "?", "?", "?", "?", "?"};
-    status = co_await WriteText(stream, EncodeRespCommand(sync_args));
+    const std::string encoded_sync = EncodeRespCommand(sync_args);
+    status = co_await WriteText(stream, encoded_sync);
     if (!status.ok()) {
       stream.Close().IgnoreError();
       co_return status;
@@ -4783,16 +5323,23 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> WaitUntilStorageReady() {
     while (!StorageIsReady()) {
+      if (replication_shutdown_requested_) {
+        co_return absl::CancelledError(
+            "replication startup stopped for process shutdown");
+      }
       absl::Status slept = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!slept.ok()) co_return slept;
     }
-    StartCoordinator();
+    if (!replication_shutdown_requested_) StartCoordinator();
     co_return absl::OkStatus();
   }
 
   void StartCoordinator() {
-    if (celer::ThisWorker().id_ != 0 || !StorageIsReady()) return;
+    if (celer::ThisWorker().id_ != 0 || !StorageIsReady() ||
+        replication_shutdown_requested_) {
+      return;
+    }
     if (failed_stopped_.load(std::memory_order_acquire)) return;
     {
       std::lock_guard lock(state_mutex_);
@@ -4837,7 +5384,8 @@ class ReplicationManager::ReplicationGroup {
       std::uint64_t role_epoch = 0;
       {
         std::lock_guard lock(state_mutex_);
-        if (!upstream_.has_value() || !initial_protocol_probe_pending_) {
+        if (replication_shutdown_requested_ || !upstream_.has_value() ||
+            !initial_protocol_probe_pending_) {
           coordinator_started_ = false;
           co_return absl::OkStatus();
         }
@@ -4859,7 +5407,8 @@ class ReplicationManager::ReplicationGroup {
       }
       {
         std::lock_guard lock(state_mutex_);
-        if (!upstream_.has_value() || *upstream_ != upstream ||
+        if (replication_shutdown_requested_ || !upstream_.has_value() ||
+            *upstream_ != upstream ||
             role_epoch_.load(std::memory_order_relaxed) != role_epoch ||
             !initial_protocol_probe_pending_) {
           coordinator_started_ = false;
@@ -4918,7 +5467,8 @@ class ReplicationManager::ReplicationGroup {
                                          celer::ThisWorker().self_);
       {
         std::lock_guard lock(state_mutex_);
-        if (!redis_psync_.load(std::memory_order_relaxed) ||
+        if (replication_shutdown_requested_ ||
+            !redis_psync_.load(std::memory_order_relaxed) ||
             !RedisSourceRegistered(source) || redis_topology_fault_ ||
             source->role_epoch_ !=
                 role_epoch_.load(std::memory_order_relaxed)) {
@@ -4958,7 +5508,8 @@ class ReplicationManager::ReplicationGroup {
     while (storage_->ReplicaRecoveryFenced()) {
       {
         std::lock_guard lock(state_mutex_);
-        if (!RedisSourceRegistered(source) || redis_topology_fault_ ||
+        if (replication_shutdown_requested_ ||
+            !RedisSourceRegistered(source) || redis_topology_fault_ ||
             source->role_epoch_ !=
                 role_epoch_.load(std::memory_order_relaxed)) {
           co_return absl::CancelledError(
@@ -4999,7 +5550,10 @@ class ReplicationManager::ReplicationGroup {
   }
 
   void StartRedisTopologyMonitor() {
-    if (redis_topology_monitor_started_ || !redis_cluster_) return;
+    if (replication_shutdown_requested_ || redis_topology_monitor_started_ ||
+        !redis_cluster_) {
+      return;
+    }
     redis_topology_monitor_started_ = true;
     const std::uint64_t epoch = role_epoch_.load(std::memory_order_acquire);
     celer::ThisWorker().self_->SpawnRoot(RedisTopologyMonitor(epoch));
@@ -5067,7 +5621,8 @@ class ReplicationManager::ReplicationGroup {
       std::vector<ReplicaOfConfig> endpoints;
       {
         std::lock_guard lock(state_mutex_);
-        if (!redis_psync_.load(std::memory_order_relaxed) || !redis_cluster_ ||
+        if (replication_shutdown_requested_ ||
+            !redis_psync_.load(std::memory_order_relaxed) || !redis_cluster_ ||
             redis_topology_fault_ ||
             role_epoch_.load(std::memory_order_relaxed) != role_epoch) {
           if (role_epoch_.load(std::memory_order_relaxed) == role_epoch) {
@@ -5126,7 +5681,7 @@ class ReplicationManager::ReplicationGroup {
   }
 
   void StartRedisCoordinator(const std::shared_ptr<RedisSource>& source) {
-    if (source->coordinator_started_) return;
+    if (replication_shutdown_requested_ || source->coordinator_started_) return;
     source->coordinator_started_ = true;
     spdlog::info("starting Redis replication coordinator for {}:{}",
                  source->upstream_.host_, source->upstream_.port_);
@@ -5134,6 +5689,11 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> RedisCoordinator(std::shared_ptr<RedisSource> source) {
+    if (replication_shutdown_requested_) {
+      source->coordinator_started_ = false;
+      co_return absl::CancelledError(
+          "Redis replication stopped for process shutdown");
+    }
     if (source->node_id_.empty()) {
       auto discovery = co_await DiscoverRedis(source->upstream_);
       if (!discovery.ok()) {
@@ -5146,7 +5706,8 @@ class ReplicationManager::ReplicationGroup {
       }
       {
         std::lock_guard lock(state_mutex_);
-        if (!RedisSourceRegistered(source) ||
+        if (replication_shutdown_requested_ ||
+            !RedisSourceRegistered(source) ||
             source->role_epoch_ !=
                 role_epoch_.load(std::memory_order_relaxed)) {
           source->coordinator_started_ = false;
@@ -5170,7 +5731,8 @@ class ReplicationManager::ReplicationGroup {
       auto session = std::make_shared<ReplicaSession>();
       {
         std::lock_guard lock(state_mutex_);
-        if (!redis_psync_.load(std::memory_order_relaxed) ||
+        if (replication_shutdown_requested_ ||
+            !redis_psync_.load(std::memory_order_relaxed) ||
             !RedisSourceRegistered(source) || redis_topology_fault_ ||
             source->role_epoch_ !=
                 role_epoch_.load(std::memory_order_relaxed)) {
@@ -5192,6 +5754,7 @@ class ReplicationManager::ReplicationGroup {
       {
         std::lock_guard lock(state_mutex_);
         retry =
+            !replication_shutdown_requested_ &&
             redis_psync_.load(std::memory_order_relaxed) &&
             RedisSourceRegistered(source) && !redis_topology_fault_ &&
             source->role_epoch_ == role_epoch_.load(std::memory_order_relaxed);
@@ -5213,6 +5776,7 @@ class ReplicationManager::ReplicationGroup {
 
   void LatchReplicationFailure(std::string reason) {
     std::string latched_reason;
+    std::shared_ptr<detail::ClusterRebuildCompletionState> completion;
     {
       std::lock_guard lock(state_mutex_);
       if (!failed_stopped_.load(std::memory_order_relaxed)) {
@@ -5225,8 +5789,13 @@ class ReplicationManager::ReplicationGroup {
         cluster_rebuild_->ready_token_.reset();
         cluster_rebuild_->state_.store(ReplicationGroupState::kFailedStopped,
                                        std::memory_order_release);
+        completion = cluster_rebuild_->completion_;
       }
       latched_reason = failure_reason_;
+    }
+    if (completion != nullptr) {
+      completion->Resolve(absl::InternalError(
+          absl::StrCat("replication failed-stopped: ", latched_reason)));
     }
     // The role/generation close and storage write guard are independent
     // defenses: neither client dispatch nor a stale internal continuation may
@@ -5235,7 +5804,7 @@ class ReplicationManager::ReplicationGroup {
     storage_->SetReplicaLoading(true);
     storage_->SetExpirationAuthority(false);
     StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
-    if (cluster_enabled_) {
+    if (cluster_population_managed_) {
       celer::ThisWorker().self_->Spawn(
           RevokeClusterRebuildSourceAuthorizations());
     }
@@ -5250,7 +5819,8 @@ class ReplicationManager::ReplicationGroup {
       std::shared_ptr<ReplicaSession> session;
       {
         std::lock_guard lock(state_mutex_);
-        if (!upstream_.has_value() || replica_reconfiguration_running_ ||
+        if (replication_shutdown_requested_ || !upstream_.has_value() ||
+            replica_reconfiguration_running_ ||
             failed_stopped_.load(std::memory_order_relaxed)) {
           break;
         }
@@ -5347,11 +5917,25 @@ class ReplicationManager::ReplicationGroup {
           upstream_history_id_.reset();
         }
         replica_session_teardown_running_ = false;
-        retry = upstream_.has_value() &&
+        retry = !replication_shutdown_requested_ && upstream_.has_value() &&
                 role_epoch_.load(std::memory_order_relaxed) == role_epoch &&
                 !fail_stop.has_value() &&
                 (cluster_context == nullptr ||
                  (cluster_ready && !cluster_proof_invalidated));
+      }
+      if (cluster_attempt_must_retire) {
+        absl::Status terminal = connected;
+        if (fail_stop.has_value()) {
+          terminal = absl::InternalError(
+              absl::StrCat("replication failed-stopped: ", *fail_stop));
+        } else if (cluster_control_stopping_) {
+          terminal = absl::CancelledError(
+              "cluster rebuild cancelled and retired for process shutdown");
+        } else if (connected.ok()) {
+          terminal = absl::AbortedError(
+              "replication session ended before rebuild readiness");
+        }
+        cluster_context->completion_->Resolve(std::move(terminal));
       }
       if (fail_stop.has_value()) {
         LatchReplicationFailure(*fail_stop);
@@ -5861,15 +6445,12 @@ class ReplicationManager::ReplicationGroup {
       const std::shared_ptr<ReplicaSession>& session) {
     session->active_flows_.fetch_add(1, std::memory_order_acq_rel);
     ReplicaFlowActivityGuard activity(&session->active_flows_);
-    auto connected = co_await ConnectTcp(source->upstream_.host_,
-                                         source->upstream_.port_, tls_context_);
+    auto connected = co_await ConnectTcp(
+        source->upstream_.host_, source->upstream_.port_, tls_context_,
+        &session->sockets_);
     if (!connected.ok()) co_return connected.status();
     TcpStream stream = std::move(*connected);
     const int fd = stream.NativeFd();
-    if (!session->sockets_.Add(fd)) {
-      stream.Close().IgnoreError();
-      co_return absl::CancelledError("replication session was cancelled");
-    }
     session->connected_flows_.store(1, std::memory_order_release);
     ReplicationConnectionMetricGuard connection_metric(
         ReplicationConnectionKind::kControl);
@@ -5911,15 +6492,11 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> RunReplicaSession(
       const ReplicaOfConfig& upstream, std::uint64_t role_epoch,
       const std::shared_ptr<ReplicaSession>& session) {
-    auto connected =
-        co_await ConnectTcp(upstream.host_, upstream.port_, tls_context_);
+    auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
+                                         tls_context_, &session->sockets_);
     if (!connected.ok()) co_return connected.status();
     TcpStream control = std::move(*connected);
     const int control_fd = control.NativeFd();
-    if (!session->sockets_.Add(control_fd)) {
-      control.Close().IgnoreError();
-      co_return absl::CancelledError("replication role epoch was replaced");
-    }
     ReplicationConnectionMetricGuard connection_metric(
         ReplicationConnectionKind::kControl);
 
@@ -5974,15 +6551,18 @@ class ReplicationManager::ReplicationGroup {
       sync_args.insert(
           sync_args.end(),
           {"POPULATION", identity.group_id_, identity.assignment_id_,
-           absl::StrCat(identity.term_),
+           identity.source_assignment_id_, absl::StrCat(identity.term_),
            absl::StrCat(identity.directive_revision_), identity.authority_id_,
            identity.source_node_id_, identity.source_boot_id_,
            identity.source_history_id_, identity.target_node_id_,
            identity.target_boot_id_, identity.operation_id_,
-           identity.attempt_id_, identity.manifest_id_.Hex()});
+           identity.directive_id_, identity.attempt_id_,
+           absl::StrCat(identity.manifest_revision_),
+           identity.manifest_id_.Hex(),
+           absl::StrCat(identity.partition_replication_epoch_)});
     }
-    absl::Status sent =
-        co_await WriteText(control, EncodeRespCommand(sync_args));
+    const std::string encoded_sync = EncodeRespCommand(sync_args);
+    absl::Status sent = co_await WriteText(control, encoded_sync);
     if (!sent.ok()) {
       session->sockets_.Remove(control_fd);
       control.Close().IgnoreError();
@@ -5997,11 +6577,12 @@ class ReplicationManager::ReplicationGroup {
     const std::vector<std::string_view> words = SplitWords(*response);
     std::uint64_t session_id = 0;
     unsigned source_workers = 0;
-    if (words.size() != 7 || words[0] != "+KLFULLRESYNC" ||
+    if (words.size() != 8 || words[0] != "+KLFULLRESYNC" ||
         !ParseUnsigned(words[1], &session_id) || session_id == 0 ||
         !IsReplicationId(words[2]) || !IsReplicationId(words[3]) ||
         !IsReplicationId(words[4]) || !IsReplicationId(words[5]) ||
-        !ParseUnsigned(words[6], &source_workers) || source_workers == 0) {
+        !ParseUnsigned(words[6], &source_workers) || source_workers == 0 ||
+        !IsReplicationId(words[7])) {
       if (session->cluster_rebuild_ != nullptr) {
         InvalidateReplicaContinuation(session, false);
       }
@@ -6054,6 +6635,7 @@ class ReplicationManager::ReplicationGroup {
       }
     }
     session->session_id_ = session_id;
+    session->flow_capability_ = std::string(words[7]);
     session->source_worker_count_ = source_workers;
     session->transaction_owners_.reserve(storage_->worker_count());
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
@@ -6360,8 +6942,8 @@ class ReplicationManager::ReplicationGroup {
                                     std::shared_ptr<ReplicaSession> session,
                                     unsigned flow_id) {
     ReplicaFlowActivityGuard activity(&session->active_flows_);
-    auto connected =
-        co_await ConnectTcp(upstream.host_, upstream.port_, tls_context_);
+    auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
+                                         tls_context_, &session->sockets_);
     if (!connected.ok()) {
       session->Cancel();
       co_return connected.status();
@@ -6374,10 +6956,6 @@ class ReplicationManager::ReplicationGroup {
       co_return bounded_recv;
     }
     const int fd = stream.NativeFd();
-    if (!session->sockets_.Add(fd)) {
-      stream.Close().IgnoreError();
-      co_return absl::CancelledError("replication session was cancelled");
-    }
     ReplicationConnectionMetricGuard connection_metric(
         ReplicationConnectionKind::kFlow);
     absl::Status authenticated =
@@ -6398,9 +6976,10 @@ class ReplicationManager::ReplicationGroup {
         std::to_string(session->session_id_),
         std::to_string(flow_id),
         std::to_string(cursor.lsn_),
-        std::to_string(cursor.fragment_index_)};
-    absl::Status sent =
-        co_await WriteText(stream, EncodeRespCommand(flow_args));
+        std::to_string(cursor.fragment_index_),
+        session->flow_capability_};
+    const std::string encoded_flow = EncodeRespCommand(flow_args);
+    absl::Status sent = co_await WriteText(stream, encoded_flow);
     if (!sent.ok()) {
       session->sockets_.Remove(fd);
       stream.Close().IgnoreError();
@@ -7572,6 +8151,7 @@ class ReplicationManager::ReplicationGroup {
                 co_return replaced;
               }
             }
+            session->cluster_rebuild_->completion_->Resolve(absl::OkStatus());
           } else {
             native_dataset_valid_.store(true, std::memory_order_release);
           }
@@ -9240,6 +9820,12 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> ServeOwnedNativeConnection(TcpStream& stream,
                                                 std::vector<std::string> args,
                                                 std::uint64_t client_id) {
+    if (!source_sockets_.Add(stream.NativeFd())) {
+      co_return absl::CancelledError(
+          "native replication source stopped for process shutdown");
+    }
+    ScopedSocketSetMembership source_socket(&source_sockets_,
+                                             stream.NativeFd());
     ReplicationConnectionMetricGuard connection_metric(
         EqualCaseInsensitive(args.front(), "KLPSYNC")
             ? ReplicationConnectionKind::kControl
@@ -9254,9 +9840,9 @@ class ReplicationManager::ReplicationGroup {
                                         std::vector<std::string> args,
                                         std::uint64_t client_id) {
     const bool population_handshake =
-        args.size() == 22 && args[8] == "POPULATION";
-    if ((!cluster_enabled_ && args.size() != 8) ||
-        (cluster_enabled_ && !population_handshake) ||
+        args.size() == 26 && args[8] == "POPULATION";
+    if ((!cluster_population_managed_ && args.size() != 8) ||
+        (cluster_population_managed_ && !population_handshake) ||
         args[1] != kProtocolVersion ||
         (args[3] != "?" && !IsReplicationId(args[3])) ||
         (args[4] != "?" && !IsReplicationId(args[4])) ||
@@ -9264,34 +9850,59 @@ class ReplicationManager::ReplicationGroup {
         (args[6] != "?" && !IsReplicationId(args[6]))) {
       co_return absl::InvalidArgumentError("invalid KLPSYNC handshake");
     }
+    active_master_controls_.fetch_add(1, std::memory_order_acq_rel);
+    struct ControlGuard {
+      std::atomic<unsigned>* active_;
+      ~ControlGuard() { active_->fetch_sub(1, std::memory_order_acq_rel); }
+    } control_guard{&active_master_controls_};
+    // Increment-before-check closes admission against DrainSourceEgress: the
+    // barrier either observes this handler or this handler observes shutdown
+    // before its first await or storage mutation.
+    if (replication_shutdown_requested_.load(std::memory_order_acquire)) {
+      co_return absl::CancelledError(
+          "replication source stopped for process shutdown");
+    }
     std::optional<RebuildIdentity> requested_population;
     if (population_handshake) {
       RebuildIdentity identity;
       identity.group_id_ = args[9];
       identity.assignment_id_ = args[10];
-      identity.authority_id_ = args[13];
-      identity.source_node_id_ = args[14];
-      identity.source_boot_id_ = args[15];
-      identity.source_history_id_ = args[16];
-      identity.target_node_id_ = args[17];
-      identity.target_boot_id_ = args[18];
-      identity.operation_id_ = args[19];
-      identity.attempt_id_ = args[20];
-      auto manifest = ParsePopulationManifestId(args[21]);
-      if (!ParseUnsigned(args[11], &identity.term_) || identity.term_ == 0 ||
-          !ParseUnsigned(args[12], &identity.directive_revision_) ||
-          identity.directive_revision_ == 0 || !manifest.ok()) {
+      identity.source_assignment_id_ = args[11];
+      identity.authority_id_ = args[14];
+      identity.source_node_id_ = args[15];
+      identity.source_boot_id_ = args[16];
+      identity.source_history_id_ = args[17];
+      identity.target_node_id_ = args[18];
+      identity.target_boot_id_ = args[19];
+      identity.operation_id_ = args[20];
+      identity.directive_id_ = args[21];
+      identity.attempt_id_ = args[22];
+      auto manifest = ParsePopulationManifestId(args[24]);
+      if (!ParseUnsigned(args[12], &identity.term_) || identity.term_ == 0 ||
+          !ParseUnsigned(args[13], &identity.directive_revision_) ||
+          identity.directive_revision_ == 0 ||
+          !ParseUnsigned(args[23], &identity.manifest_revision_) ||
+          identity.manifest_revision_ == 0 || !manifest.ok() ||
+          !ParseUnsigned(args[25], &identity.partition_replication_epoch_)) {
         co_return absl::InvalidArgumentError(
             "invalid population identity in KLPSYNC handshake");
       }
       identity.manifest_id_ = *manifest;
       requested_population = std::move(identity);
     }
-    active_master_controls_.fetch_add(1, std::memory_order_acq_rel);
-    struct ControlGuard {
-      std::atomic<unsigned>* active_;
-      ~ControlGuard() { active_->fetch_sub(1, std::memory_order_acq_rel); }
-    } control_guard{&active_master_controls_};
+    if (population_handshake) {
+      std::lock_guard lock(state_mutex_);
+      // This is the admission side of the revoke barrier. If this handler
+      // observes an open gate, a later revoker sees active_master_controls_
+      // and joins it; if the revoker closed the gate first, reject before
+      // starting the history monitor or awaiting storage setup. Keeping the
+      // gate closed for the whole revoke join prevents connection churn from
+      // starving FenceAck/FDS publication.
+      if (cluster_source_revocations_in_flight_ != 0) {
+        co_return absl::FailedPreconditionError(
+            "cluster source authorization is being revoked");
+      }
+    }
     if (is_replica() || is_loading()) {
       co_return absl::FailedPreconditionError(
           "node lost valid source state during the native handshake");
@@ -9337,7 +9948,8 @@ class ReplicationManager::ReplicationGroup {
         std::lock_guard lock(state_mutex_);
         source_group_id = group_id_;
       }
-      if (is_replica() || is_loading()) {
+      if (replication_shutdown_requested_.load(std::memory_order_acquire) ||
+          is_replica() || is_loading()) {
         co_return absl::FailedPreconditionError(
             "node lost valid source state during the native handshake");
       }
@@ -9350,11 +9962,24 @@ class ReplicationManager::ReplicationGroup {
             cluster_rebuild_ != nullptr &&
             cluster_rebuild_->state_.load(std::memory_order_relaxed) ==
                 ReplicationGroupState::kReady &&
+            cluster_rebuild_->ready_token_.has_value() &&
+            cluster_rebuild_->ready_token_->identity().group_id_ ==
+                requested.group_id_ &&
+            cluster_rebuild_->ready_token_->identity().assignment_id_ ==
+                requested.source_assignment_id_ &&
+            cluster_rebuild_->ready_token_->identity().manifest_revision_ ==
+                requested.manifest_revision_ &&
+            cluster_rebuild_->ready_token_->identity().manifest_id_ ==
+                requested.manifest_id_ &&
+            cluster_rebuild_->ready_token_->identity()
+                    .partition_replication_epoch_ ==
+                requested.partition_replication_epoch_ &&
             requested.source_node_id_ == node_id_ &&
             requested.source_boot_id_ == boot_id_ &&
             requested.source_history_id_ == source_history_id &&
             requested.target_node_id_ == replica_node_id &&
-            source_authorizations_.IsAuthorized(requested);
+            source_authorizations_.MatchesAuthorizedRebuild(
+                requested, storage_->worker_count(), true);
         if (!authorized) {
           co_return absl::PermissionDeniedError(
               "cluster population export is not authorized for this exact "
@@ -9402,11 +10027,12 @@ class ReplicationManager::ReplicationGroup {
             "cluster population export authorization was revoked");
       }
     }
-    absl::Status sent = co_await WriteText(
-        stream,
+    const std::string resync_reply =
         absl::StrCat("+KLFULLRESYNC ", session_id, " ", node_id_, " ",
                      source_group_id, " ", boot_id_, " ", source_history_id,
-                     " ", storage_->worker_count(), "\r\n"));
+                     " ", storage_->worker_count(), " ",
+                     session->flow_capability_, "\r\n");
+    absl::Status sent = co_await WriteText(stream, resync_reply);
     if (!sent.ok()) {
       (void)co_await RemoveMasterSession(session);
       co_return sent;
@@ -9509,12 +10135,13 @@ class ReplicationManager::ReplicationGroup {
     unsigned flow_id = 0;
     std::uint64_t next_lsn = 0;
     std::uint32_t fragment_index = 0;
-    if (args.size() != 6 || args[1] != kProtocolVersion ||
+    if (args.size() != 7 || args[1] != kProtocolVersion ||
         !ParseUnsigned(args[2], &session_id) || session_id == 0 ||
         !ParseUnsigned(args[3], &flow_id) ||
         flow_id != celer::ThisWorker().id_ ||
         !ParseUnsigned(args[4], &next_lsn) || next_lsn == 0 ||
-        !ParseUnsigned(args[5], &fragment_index)) {
+        !ParseUnsigned(args[5], &fragment_index) ||
+        !IsReplicationId(args[6])) {
       co_return absl::InvalidArgumentError("invalid KLFLOW handshake");
     }
     std::shared_ptr<MasterSession> session;
@@ -9524,7 +10151,8 @@ class ReplicationManager::ReplicationGroup {
       const auto found = master_sessions_.find(session_id);
       if (found != master_sessions_.end()) session = found->second;
     }
-    if (session == nullptr || !session->SetFlow(flow_id, stream.NativeFd())) {
+    if (session == nullptr ||
+        !session->SetFlow(flow_id, args[6], stream.NativeFd())) {
       co_return absl::FailedPreconditionError(
           "KLFLOW references an unavailable session");
     }
@@ -9563,20 +10191,26 @@ class ReplicationManager::ReplicationGroup {
           "replication session ended before flow mode selection");
     }
     const bool selected_continue_mode = *session_continue_mode;
-    absl::Status sent = co_await WriteText(
-        stream,
+    const std::string flow_reply =
         absl::StrCat("+KLFLOW ", session_id, " ", flow_id, " ",
-                     selected_continue_mode ? "CONTINUE" : "FULL", "\r\n"));
+                     selected_continue_mode ? "CONTINUE" : "FULL", "\r\n");
+    absl::Status sent = co_await WriteText(stream, flow_reply);
     if (!sent.ok()) {
       session->ClearFlow(flow_id, stream.NativeFd());
       session->Cancel();
       co_return sent;
     }
-    absl::Status waited =
-        selected_continue_mode
-            ? co_await EnterMasterFlowBacklog(stream, session, flow_id,
-                                              next_lsn, fragment_index)
-            : co_await RunMasterFlowData(stream, session, flow_id);
+    // Keep the protocol branch outside a conditional expression containing
+    // two co_await operands. GCC 13 can mis-lower that expression in this
+    // large coroutine and resume the backlog awaiter for a selected FULL flow,
+    // which sends its ONLINE cursor before the required full-sync cut.
+    absl::Status waited;
+    if (selected_continue_mode) {
+      waited = co_await EnterMasterFlowBacklog(stream, session, flow_id,
+                                               next_lsn, fragment_index);
+    } else {
+      waited = co_await RunMasterFlowData(stream, session, flow_id);
+    }
     if (!waited.ok()) {
       spdlog::warn("replication source flow {} ended: {}", flow_id,
                    waited.message());
@@ -9620,9 +10254,10 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> DrainSourceEgress() {
     assert(celer::ThisWorker().id_ == 0);
-    // The role is already non-master. Cancel registered downstreams and wait
-    // for handshake/export guards without touching publisher reservations:
-    // commands admitted under the old role still have to drain and publish.
+    // Demotion has already made the role non-master. Process shutdown closes
+    // every registered source socket before request drain so retained history
+    // cannot deadlock an admitted publisher; this coroutine performs the
+    // worker-affine registry join before source history is disabled.
     std::vector<std::shared_ptr<MasterSession>> sessions;
     {
       co_await master_mutex_.Lock(*celer::ThisWorker().self_);
@@ -9914,6 +10549,7 @@ class ReplicationManager::ReplicationGroup {
   // remaining bits are a monotonic dataset generation.
   std::atomic<std::uint64_t>* const serving_generation_;
   const bool cluster_enabled_;
+  const bool cluster_population_managed_;
   mutable std::mutex state_mutex_;
   std::optional<ReplicaOfConfig> upstream_;
   // Guarded by state_mutex_. A failed promotion remains fenced, but REPLICAOF
@@ -9948,7 +10584,13 @@ class ReplicationManager::ReplicationGroup {
   // an ordinary disconnected session. A control-plane supersession waits for
   // this owner to finish instead of racing a second abort of the same root.
   bool replica_session_teardown_running_ = false;  // guarded by state_mutex_
-  bool initial_protocol_probe_pending_ = false;    // worker 0 only
+  // Worker-zero lifecycle bit. Shutdown sets it before cancelling the native
+  // target session so no directive can recreate work behind the drain barrier.
+  bool cluster_control_stopping_ = false;
+  // Process main may set this before worker zero joins native/Redis target
+  // roots. Every coordinator treats it as terminal for this process boot.
+  std::atomic<bool> replication_shutdown_requested_{false};
+  bool initial_protocol_probe_pending_ = false;  // worker 0 only
   std::shared_ptr<ReplicaCursorState> cursor_state_;
   std::optional<std::string> upstream_node_id_;
   std::optional<std::string> upstream_history_id_;
@@ -10005,9 +10647,9 @@ class ReplicationManager::ReplicationGroup {
   std::string group_id_;  // guarded by state_mutex_
   const std::string boot_id_;
   const std::string replica_incarnation_;
-  // Cluster control transport lands in #20. Owning the single boot-scoped
-  // group here fixes the one-process/one-dataset seam without allowing a
-  // second local group or making recovered bytes implicitly ready.
+  // Owning the single boot-scoped group here fixes the
+  // one-process/one-dataset seam without allowing the control client to create
+  // a second local group or making recovered bytes implicitly ready.
   std::unique_ptr<keylane::ReplicationGroup> cluster_group_;
   std::string history_id_;  // guarded by master_mutex_
   const std::uint16_t listen_port_;
@@ -10028,6 +10670,14 @@ class ReplicationManager::ReplicationGroup {
   bool redis_cluster_ = false;
   bool redis_topology_fault_ = false;
   bool redis_topology_monitor_started_ = false;  // worker 0 only
+  // Covers outbound sockets before a target session exists. RequestShutdown
+  // may cancel it from the process main thread while worker zero is inside a
+  // TLS or discovery exchange.
+  SocketSet discovery_sockets_;
+  // Covers native control/flow and Redis PSYNC export sockets independently
+  // of the worker-affine source session registry. Process shutdown cancels it
+  // before request drain so transport teardown releases backlog retention.
+  SocketSet source_sockets_;
   celer::AsyncMutex redis_fullsync_mutex_;       // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};
   std::atomic<unsigned> active_master_controls_{0};
@@ -10087,11 +10737,42 @@ Task<ReplicationStatus> ReplicationManager::Observe() const {
   return group_->status();
 }
 
+Task<absl::StatusOr<ClusterRebuildCompletion>>
+ReplicationManager::StartClusterRebuildDirective(ReplicaOfConfig upstream,
+                                                 RebuildDirective directive,
+                                                 PopulationManifest manifest) {
+  auto started = co_await group_->StartClusterRebuildDirective(
+      std::move(upstream), std::move(directive), std::move(manifest));
+  if (!started.ok()) co_return started.status();
+  co_return ClusterRebuildCompletion(std::move(*started));
+}
+
 Task<absl::Status> ReplicationManager::ApplyClusterRebuildDirective(
     ReplicaOfConfig upstream, RebuildDirective directive,
     PopulationManifest manifest) {
   return group_->ApplyClusterRebuildDirective(
       std::move(upstream), std::move(directive), std::move(manifest));
+}
+
+Task<absl::Status> ReplicationManager::CancelClusterRebuildForShutdown() {
+  return group_->CancelClusterRebuildForShutdown();
+}
+
+void ReplicationManager::RequestShutdown() noexcept {
+  group_->RequestShutdown();
+}
+
+Task<absl::Status> ReplicationManager::QuiesceForShutdown() {
+  return group_->QuiesceForShutdown();
+}
+
+Task<absl::Status> ReplicationManager::ReconcileClusterPopulation(
+    std::optional<DesiredClusterPopulation> desired) {
+  return group_->ReconcileClusterPopulation(std::move(desired));
+}
+
+Task<absl::Status> ReplicationManager::CancelInProgressClusterPopulation() {
+  return group_->CancelInProgressClusterPopulation();
 }
 
 Task<ClusterPopulationStatus> ReplicationManager::cluster_population_status()
@@ -10107,6 +10788,27 @@ Task<absl::Status> ReplicationManager::AuthorizeClusterRebuildSource(
 Task<absl::Status>
 ReplicationManager::RevokeClusterRebuildSourceAuthorizations() {
   return group_->RevokeClusterRebuildSourceAuthorizations();
+}
+
+Task<absl::Status> ClusterRebuildCompletion::Await() const {
+  if (state_ == nullptr) {
+    co_return absl::FailedPreconditionError(
+        "cluster rebuild completion handle is empty");
+  }
+  co_return co_await state_->Await();
+}
+
+std::optional<absl::Status> ClusterRebuildCompletion::result() const {
+  if (state_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "cluster rebuild completion handle is empty");
+  }
+  return state_->result();
+}
+
+Task<absl::Status> ReplicationManager::
+    ClearClusterRebuildSourceAuthorizationsForSessionReplacement() {
+  return group_->ClearClusterRebuildSourceAuthorizationsForSessionReplacement();
 }
 
 unsigned ReplicationManager::snapshot_read_concurrency() const noexcept {

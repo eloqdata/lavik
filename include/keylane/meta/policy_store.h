@@ -91,6 +91,7 @@ class MetaPolicyStore {
   // Highest version of the policy, any status; nullopt when unknown.
   std::optional<std::uint64_t> LatestVersion(
       const std::string& policy_id) const;
+  std::vector<MetaPolicyVersionView> Versions() const;
   // Content bytes across all versions of all policies, including retired
   // tombstones (they occupy state until the state itself is compacted).
   std::uint64_t TotalContentBytes() const { return total_content_bytes_; }

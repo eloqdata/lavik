@@ -774,6 +774,7 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointRootOnDeviceLocal(
       MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
   if (!written.ok() || *written != kDirectIoAlignment) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
+    LatchRuntimeFailure();
     co_return written.ok()
         ? absl::InternalError("short checkpoint-root metadata write")
         : written.status();
@@ -782,6 +783,7 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointRootOnDeviceLocal(
       *store.worker_, store.files_[device.file_index_]);
   if (!synced.ok()) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
+    LatchRuntimeFailure();
     co_return synced;
   }
   allocator.epoch_pages_[page_index] = {.generation_ = next_page_generation,

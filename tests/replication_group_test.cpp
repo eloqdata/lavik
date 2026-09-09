@@ -46,13 +46,17 @@ keylane::RebuildDirective DirectiveForManifest(
               .directive_revision_ = 1,
               .authority_id_ = "authority-1",
               .source_node_id_ = "source-1",
+              .source_assignment_id_ = "source-assignment-1",
               .source_boot_id_ = "source-boot-1",
               .source_history_id_ = "history-1",
               .target_node_id_ = "target-1",
               .target_boot_id_ = "target-boot-1",
               .operation_id_ = "operation-1",
+              .directive_id_ = "directive-1",
               .attempt_id_ = std::move(attempt_id),
+              .manifest_revision_ = 1,
               .manifest_id_ = manifest.id(),
+              .partition_replication_epoch_ = 23,
           },
       .flow_count_ = flow_count,
       .safe_source_active_ = safe_source_active,
@@ -151,6 +155,24 @@ TEST(PopulationManifestTest, RejectsDuplicateAndInvalidEntries) {
 TEST(ReplicationGroupTest, RequiresBootScopedSafeSourceAuthorization) {
   keylane::ReplicationGroup group("target-1", "target-boot-1");
 
+  auto missing_directive_id = Directive();
+  missing_directive_id.identity_.directive_id_.clear();
+  EXPECT_EQ(
+      group.BeginRebuild(missing_directive_id, Manifest()).status().code(),
+      absl::StatusCode::kInvalidArgument);
+
+  auto missing_source_assignment = Directive();
+  missing_source_assignment.identity_.source_assignment_id_.clear();
+  EXPECT_EQ(
+      group.BeginRebuild(missing_source_assignment, Manifest()).status().code(),
+      absl::StatusCode::kInvalidArgument);
+
+  auto missing_manifest_revision = Directive();
+  missing_manifest_revision.identity_.manifest_revision_ = 0;
+  EXPECT_EQ(
+      group.BeginRebuild(missing_manifest_revision, Manifest()).status().code(),
+      absl::StatusCode::kInvalidArgument);
+
   auto unsafe = Directive("group-a", 7, "attempt-1", false);
   EXPECT_EQ(group.BeginRebuild(unsafe, Manifest()).status().code(),
             absl::StatusCode::kFailedPrecondition);
@@ -244,9 +266,16 @@ TEST(ReplicationGroupTest, PublishesReadinessOnlyFromCompleteCurrentAttempt) {
   ASSERT_TRUE(ready.ok()) << ready.status();
   EXPECT_EQ(ready->identity(), directive.identity_);
   EXPECT_EQ(ready->identity().target_boot_id_, "target-boot-1");
+  EXPECT_EQ(ready->identity().partition_replication_epoch_, 23U);
   EXPECT_EQ(std::vector<std::uint64_t>(ready->cut_vector().begin(),
                                        ready->cut_vector().end()),
             (std::vector<std::uint64_t>{101, 202}));
+  EXPECT_EQ(group.state(), keylane::ReplicationGroupState::kReady);
+
+  auto wrong_population_epoch = directive.identity_;
+  ++wrong_population_epoch.partition_replication_epoch_;
+  EXPECT_EQ(group.PublishReady(wrong_population_epoch).status().code(),
+            absl::StatusCode::kFailedPrecondition);
   EXPECT_EQ(group.state(), keylane::ReplicationGroupState::kReady);
 
   auto repeated = group.PublishReady(directive.identity_);
@@ -392,6 +421,7 @@ TEST(ReplicationGroupTest,
   auto newer = DirectiveForManifest(sparse, "group-a", 7, "attempt-2");
   newer.identity_.directive_revision_ = 2;
   newer.identity_.source_node_id_ = "source-2";
+  newer.identity_.source_assignment_id_ = "source-assignment-2";
   newer.identity_.source_boot_id_ = "source-boot-2";
   newer.identity_.source_history_id_ = "history-2";
   newer.identity_.operation_id_ = "operation-2";
@@ -408,8 +438,31 @@ TEST(ReplicationGroupTest,
   EXPECT_EQ(group.BeginRebuild(equal_but_conflicting, sparse).status().code(),
             absl::StatusCode::kFailedPrecondition);
 
+  auto equal_but_different_directive = newer;
+  equal_but_different_directive.identity_.directive_id_ = "directive-2";
+  equal_but_different_directive.identity_.attempt_id_ = "attempt-5";
+  EXPECT_EQ(
+      group.BeginRebuild(equal_but_different_directive, sparse).status().code(),
+      absl::StatusCode::kFailedPrecondition);
+
+  auto equal_but_different_manifest_revision = newer;
+  equal_but_different_manifest_revision.identity_.attempt_id_ = "attempt-6";
+  ++equal_but_different_manifest_revision.identity_.manifest_revision_;
+  EXPECT_EQ(group.BeginRebuild(equal_but_different_manifest_revision, sparse)
+                .status()
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  auto equal_but_different_population_epoch = newer;
+  equal_but_different_population_epoch.identity_.attempt_id_ = "attempt-7";
+  ++equal_but_different_population_epoch.identity_.partition_replication_epoch_;
+  EXPECT_EQ(group.BeginRebuild(equal_but_different_population_epoch, sparse)
+                .status()
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+
   auto equal_with_changed_flow_layout = newer;
-  equal_with_changed_flow_layout.identity_.attempt_id_ = "attempt-5";
+  equal_with_changed_flow_layout.identity_.attempt_id_ = "attempt-8";
   equal_with_changed_flow_layout.flow_count_ = 3;
   EXPECT_EQ(group.BeginRebuild(equal_with_changed_flow_layout, sparse)
                 .status()
@@ -431,6 +484,7 @@ TEST(ReplicationGroupTest,
   auto newer = DirectiveForManifest(sparse, "group-a", 7, "attempt-2");
   newer.identity_.directive_revision_ = 2;
   newer.identity_.source_node_id_ = "source-2";
+  newer.identity_.source_assignment_id_ = "source-assignment-2";
   newer.identity_.source_boot_id_ = "source-boot-2";
   newer.identity_.source_history_id_ = "history-2";
   newer.identity_.operation_id_ = "operation-2";

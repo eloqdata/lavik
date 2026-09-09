@@ -3,13 +3,12 @@
 // Cluster owner-side authority re-check plumbing shared by command.cpp and the
 // per-type multi-key executors (invariant 1 choke point 2).
 //
-// The dispatch gate captures the ServingState a request was admitted against
-// on CommandRequest (cluster_admitted_state_ / ClusterSlots()). A topology
-// reload (SIGHUP) can fence that admission while a command suspends on
-// scheduling or I/O, so every mutation path re-checks the captured per-group
-// authority tokens against the current cache right before writing. The
-// tx::Transaction hook covers shard-callback executors; executors whose
-// mutation runs in a bare SubmitTaskTo hop use the one-shot re-check.
+// The dispatch gate captures AuthorityGuard's complete admission proof on
+// CommandRequest (cluster_authority_admission_ / ClusterSlots()). A topology,
+// session, lease, or fence change can invalidate that proof while a command
+// suspends. Early one-shot and tx::Transaction checks reject stale work before
+// expensive handlers run; a storage-neutral MutationPrecondition carries the
+// same proof across later suspensions and checks again at logical publication.
 //
 // Every entry point is a no-op in standalone mode, for replication replay, and
 // for requests without a captured admission, so non-cluster behavior is
@@ -28,20 +27,23 @@
 
 namespace keylane {
 
+namespace storage {
+class MutationPrecondition;
+}  // namespace storage
+
 // Context carried by a transaction's shard validator. It lives on the
 // coordinator coroutine frame that owns the transaction (the barrier rule
 // guarantees the frame outlives every hop); tripped_ is written from shard
 // threads and lets the command layer tell a fence abort apart from an
 // ordinary storage failure.
 struct ClusterShardValidatorContext {
-  std::shared_ptr<const cluster::ServingState> admitted_;
-  std::span<const std::uint16_t> slots_;
+  std::shared_ptr<const cluster::AuthorityAdmission> admission_;
   std::atomic<bool> tripped_{false};
 };
 
-// tx::ShardValidator implementation: compares the captured per-group authority
-// tokens against the current cache. Runs on the owner shard before the shard
-// callback; must not suspend.
+// tx::ShardValidator implementation: re-checks the captured topology and
+// finite-lease proof. Runs on the owner shard before the shard callback; must
+// not suspend.
 absl::Status ValidateClusterShardAuthority(void* ctx, unsigned shard);
 
 // Installs the per-shard re-check on a write transaction when the request was
@@ -66,6 +68,19 @@ CommandReply ClusterValidatorFailureReply(
 // fast path or SORT STORE's destination replace). Returns OkStatus when the
 // captured admission still holds.
 absl::Status RecheckClusterRequestAuthority(const CommandRequest& request);
+
+// Builds the storage-neutral final check carried to the keyspace publication
+// seam. The returned object owns the admission proof across suspension and is
+// empty for standalone, read, and replication-replay work.
+storage::MutationPrecondition ClusterMutationPrecondition(
+    const CommandRequest& request);
+
+// Replaces an inner handler's reply after a final storage re-check failed.
+// No prior mutation gets a fresh redirect; any prior mutation makes the
+// aggregate outcome indeterminate and closes the connection.
+CommandReply FinalizeClusterMutationReply(const CommandRequest& request,
+                                          ReplyBuilder& reply_builder,
+                                          CommandReply reply);
 
 // Re-admits `slots` against the current cache and produces the standard wire
 // answer for a write that provably never executed. A serve decision here

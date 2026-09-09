@@ -188,7 +188,8 @@ bool NeedsGroupedList(std::span<const std::string> elements) {
 Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const ListOperation& operation, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -245,7 +246,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     if (operation.kind_ == ListOperationKind::kLength) co_return result;
     co_return co_await ExecuteGroupedListLocked(
         store, partition, db_id, key, digest, operation, std::move(*object), tx,
-        replication);
+        replication, mutation_precondition);
   }
 
   if (operation.kind_ == ListOperationKind::kLength) co_return result;
@@ -507,7 +508,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
         .writes_ = std::move(split->groups_)};
     auto written = co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, nullptr, std::move(plan),
-        expire_at_ms, tx, replication);
+        expire_at_ms, tx, replication, mutation_precondition);
     if (!written.ok()) co_return written;
     co_return result;
   }
@@ -529,7 +530,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       store, partition, db_id, key, digest, payload, kind, type,
       kind == RecordKind::kValue ? expire_at_ms : 0, tx,
       kind == RecordKind::kValue ? elements.size() : 0, nullptr, nullptr,
-      replication);
+      replication, nullptr, true, nullptr, mutation_precondition);
   if (!written.ok()) co_return written;
   co_return result;
 }

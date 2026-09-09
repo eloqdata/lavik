@@ -17,14 +17,29 @@
 
 namespace {
 
+using keylane::cluster::AuthorityGuard;
 using keylane::cluster::GroupView;
 using keylane::cluster::InMemoryClusterControl;
 using keylane::cluster::kSlotCount;
+using keylane::cluster::NodeControlInstaller;
 using keylane::cluster::NodeDescriptor;
 using keylane::cluster::NodeId;
+using keylane::cluster::NullNodeControlActions;
 using keylane::cluster::ServingState;
 using keylane::cluster::StaticClusterControl;
 using keylane::cluster::TopologyCache;
+
+absl::Status Refresh(keylane::cluster::ClusterControlPort& control,
+                     TopologyCache& cache) {
+  NullNodeControlActions actions;
+  AuthorityGuard guard(cache, AuthorityGuard::LeaseMode::kPermanent);
+  NodeControlInstaller installer(cache, guard, actions);
+  // Legacy control-port tests construct fully recovered in-memory targets;
+  // StaticClusterControl overrides this with its own readiness before install.
+  const absl::Status ready = installer.SetStorageReady(true);
+  if (!ready.ok()) return ready;
+  return control.RefreshTarget(installer);
+}
 
 constexpr std::string_view kIdA =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";  // 40 hex chars
@@ -390,14 +405,14 @@ TEST(ClusterControlPortTest, RefreshPublishesFileContent) {
                                /*cluster_tls_port=*/17011);
   control.SetStorageReady(true);
   TopologyCache cache;
-  ASSERT_TRUE(control.RefreshTarget(cache).ok());
+  ASSERT_TRUE(Refresh(control, cache).ok());
   ASSERT_NE(cache.Current(), nullptr);
   EXPECT_TRUE(cache.Current()->CoverageComplete());
   EXPECT_TRUE(cache.Current()->FullyReady());
   const std::uint64_t version = cache.version();
   EXPECT_GT(version, 0U);
   // Re-reading identical content does not republish.
-  ASSERT_TRUE(control.RefreshTarget(cache).ok());
+  ASSERT_TRUE(Refresh(control, cache).ok());
   EXPECT_EQ(cache.version(), version);
 }
 
@@ -409,7 +424,7 @@ TEST(ClusterControlPortTest, RefreshWithMissingFilePublishesNothing) {
                    ".conf");
   StaticClusterControl control(missing.string(), {"127.0.0.1", 7001}, 0);
   TopologyCache cache;
-  EXPECT_FALSE(control.RefreshTarget(cache).ok());
+  EXPECT_FALSE(Refresh(control, cache).ok());
   EXPECT_EQ(cache.Current(), nullptr);
   EXPECT_EQ(cache.version(), 0U);
 }
@@ -419,20 +434,20 @@ TEST(ClusterControlPortTest, RefreshFailureKeepsPublishedState) {
   StaticClusterControl control(file.path().string(), {"127.0.0.1", 7001}, 0);
   control.SetStorageReady(true);
   TopologyCache cache;
-  ASSERT_TRUE(control.RefreshTarget(cache).ok());
+  ASSERT_TRUE(Refresh(control, cache).ok());
   const std::shared_ptr<const ServingState> published = cache.Current();
   ASSERT_NE(published, nullptr);
   const std::uint64_t version = cache.version();
 
   // Unparsable content: the previous state stays in effect.
   file.Write("this is not a nodes.conf line\n");
-  EXPECT_FALSE(control.RefreshTarget(cache).ok());
+  EXPECT_FALSE(Refresh(control, cache).ok());
   EXPECT_EQ(cache.version(), version);
   EXPECT_EQ(cache.Current().get(), published.get());
 
   // A vanished file likewise keeps the old state.
   file.Remove();
-  EXPECT_FALSE(control.RefreshTarget(cache).ok());
+  EXPECT_FALSE(Refresh(control, cache).ok());
   EXPECT_EQ(cache.version(), version);
   EXPECT_EQ(cache.Current().get(), published.get());
 }
@@ -441,13 +456,13 @@ TEST(ClusterControlPortTest, StorageReadyTakesEffectOnNextRefresh) {
   TempNodesFile file(ValidTopology());
   StaticClusterControl control(file.path().string(), {"127.0.0.1", 7001}, 0);
   TopologyCache cache;
-  ASSERT_TRUE(control.RefreshTarget(cache).ok());
+  ASSERT_TRUE(Refresh(control, cache).ok());
   ASSERT_NE(cache.Current(), nullptr);
   EXPECT_FALSE(cache.Current()->FullyReady());
   const std::uint64_t not_ready_version = cache.version();
 
   control.SetStorageReady(true);
-  ASSERT_TRUE(control.RefreshTarget(cache).ok());
+  ASSERT_TRUE(Refresh(control, cache).ok());
   ASSERT_NE(cache.Current(), nullptr);
   EXPECT_TRUE(cache.Current()->FullyReady());
   // Readiness is part of the published content, so the flip republishes.
@@ -461,28 +476,28 @@ TEST(ClusterControlPortTest, InMemoryPublishesOnlyPendingTargets) {
 
   TopologyCache cache;
   InMemoryClusterControl control;
-  EXPECT_TRUE(control.RefreshTarget(cache).ok());  // nothing pending
+  EXPECT_TRUE(Refresh(control, cache).ok());  // nothing pending
   EXPECT_EQ(cache.Current(), nullptr);
   EXPECT_EQ(cache.version(), 0U);
 
   control.SetTarget(*state);
-  ASSERT_TRUE(control.RefreshTarget(cache).ok());
+  ASSERT_TRUE(Refresh(control, cache).ok());
   EXPECT_EQ(cache.Current().get(), state->get());
   const std::uint64_t version = cache.version();
   EXPECT_GT(version, 0U);
 
   // The pending target is consumed by the refresh.
-  EXPECT_TRUE(control.RefreshTarget(cache).ok());
+  EXPECT_TRUE(Refresh(control, cache).ok());
   EXPECT_EQ(cache.version(), version);
 
   // Re-setting identical content republishes nothing.
   control.SetTarget(*state);
-  EXPECT_TRUE(control.RefreshTarget(cache).ok());
+  EXPECT_TRUE(Refresh(control, cache).ok());
   EXPECT_EQ(cache.version(), version);
 
   // A null target publishes nothing.
   control.SetTarget(nullptr);
-  EXPECT_TRUE(control.RefreshTarget(cache).ok());
+  EXPECT_TRUE(Refresh(control, cache).ok());
   EXPECT_EQ(cache.version(), version);
   EXPECT_EQ(cache.Current().get(), state->get());
 }

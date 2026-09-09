@@ -3,16 +3,16 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <cstdio>
 #include <ctime>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -36,6 +36,7 @@
 #include "libnuraft/srv_config.hxx"
 #pragma GCC diagnostic pop
 
+#include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/hash.h"
@@ -190,25 +191,29 @@ void CompleteAsyncReply(celer::ForeignExecutor foreign_executor,
   }
 }
 
-// Opaque request_id for audit correlation: 8B LE per-process counter ||
-// 8B random boot salt. Its representation carries no ordering contract.
+// Opaque request_id for audit correlation. It is generated before proposal;
+// apply never manufactures randomness, preserving deterministic replay. A
+// failure of the OS CSPRNG is a process-safety failure: continuing with a
+// guessed or reused id would break the idempotency boundary.
 MetaRequestId MakeRequestId() {
-  static const std::uint64_t boot_salt = [] {
-    std::random_device rd;
-    std::uint64_t salt = 0;
-    for (int ii = 0; ii < 8; ++ii) {
-      salt = (salt << 8) | (rd() & 0xffu);
-    }
-    return salt;
-  }();
-  static std::atomic<std::uint64_t> counter{0};
-  const std::uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
-  MetaRequestId id{};
-  for (int ii = 0; ii < 8; ++ii) {
-    id[ii] = static_cast<std::uint8_t>(seq >> (8 * ii));
-    id[8 + ii] = static_cast<std::uint8_t>(boot_salt >> (8 * ii));
+  auto id = cluster::control::GenerateId128();
+  if (!id.ok()) {
+    spdlog::critical("OS CSPRNG failed while generating Meta request id: {}",
+                     id.status().message());
+    std::terminate();
   }
-  return id;
+  return *id;
+}
+
+MetaAssignmentId MakeAssignmentId() {
+  auto id = cluster::control::GenerateId128();
+  if (!id.ok()) {
+    spdlog::critical(
+        "OS CSPRNG failed while generating membership assignment id: {}",
+        id.status().message());
+    std::terminate();
+  }
+  return *id;
 }
 
 int HexNybble(char c) {
@@ -235,8 +240,33 @@ bool ParseHexBytes(const std::string& text, std::size_t hex_chars,
   return true;
 }
 
+std::string HexEncode(std::string_view bytes);
+
 bool ParseOperationId(const std::string& text, MetaOperationId& out) {
   return ParseHexBytes(text, 32, out.data());
+}
+
+bool ParseReplicationHistoryId(const std::string& text,
+                               MetaReplicationHistoryId& out) {
+  if (text.size() != 2 * out.size() ||
+      std::any_of(text.begin(), text.end(), [](char c) {
+        return !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+      })) {
+    return false;
+  }
+  return ParseHexBytes(text, text.size(), out.data());
+}
+
+std::string ReplicationHistoryIdText(
+    const MetaReplicationHistoryId& history_id) {
+  return HexEncode(std::string_view(
+      reinterpret_cast<const char*>(history_id.data()), history_id.size()));
+}
+
+std::string AssignmentIdText(const MetaAssignmentId& assignment_id) {
+  return HexEncode(
+      std::string_view(reinterpret_cast<const char*>(assignment_id.data()),
+                       assignment_id.size()));
 }
 
 std::string HexEncode(std::string_view bytes) {
@@ -300,11 +330,12 @@ std::int64_t NowUnixMs() {
       .count();
 }
 
-// MetaCommittedFacts over ONE committed MetaStores snapshot, so all five
-// freshness checks of a single obs command see one consistent cut instead of
-// tearing across per-call reads. StoresSnapshot() deep-copies the aggregate —
-// KB-scale and fine at ctl command frequency; high-frequency coordinator
-// callers must build their facts from a CommittedView instead.
+// MetaCommittedFacts over ONE committed MetaStores snapshot, so every
+// freshness check of a single obs command sees one consistent cut instead of
+// tearing across per-call reads. StoresSnapshot() deep-copies the bounded but
+// potentially large aggregate; this low-frequency administrative path accepts
+// that latency, while high-frequency coordinator callers reuse a
+// CommittedView instead.
 class SnapshotCommittedFacts : public MetaCommittedFacts {
  public:
   explicit SnapshotCommittedFacts(MetaStores stores)
@@ -317,25 +348,45 @@ class SnapshotCommittedFacts : public MetaCommittedFacts {
     // 0 when the group does not exist: unknown committed state rejects.
     return stores_.grant_.CurrentGroupTerm(std::string(group_id)).value_or(0);
   }
-  std::uint64_t CurrentPopulationManifestId(
+  std::uint64_t CurrentPopulationManifestRevision(
       std::string_view group_id) const override {
     const std::optional<MetaTopologyGroupView> group =
         stores_.topology_.FindGroup(std::string(group_id));
-    return group.has_value() ? group->record_.population_manifest_id_ : 0;
+    return group.has_value() ? group->record_.population_manifest_revision_ : 0;
+  }
+  std::uint64_t CurrentPartitionReplicationEpoch(
+      std::string_view group_id) const override {
+    const std::optional<MetaTopologyGroupView> group =
+        stores_.topology_.FindGroup(std::string(group_id));
+    return group.has_value() ? group->record_.partition_replication_epoch_ : 0;
+  }
+  bool AssignmentMatches(std::string_view group_id, std::string_view node_id,
+                         const MetaAssignmentId& assignment_id) const override {
+    const std::optional<MetaTopologyGroupView> group =
+        stores_.topology_.FindGroup(std::string(group_id));
+    return group.has_value() &&
+           std::any_of(group->members_.begin(), group->members_.end(),
+                       [&](const MetaGroupMember& member) {
+                         return member.node_id_ == node_id &&
+                                member.assignment_id_ == assignment_id;
+                       });
   }
   bool OperationNonTerminal(const MetaOperationId& id) const override {
     const std::optional<MetaOperationRecord> record =
         stores_.operation_.FindOperation(id);
     return record.has_value() && !IsTerminal(record->lifecycle_);
   }
-  bool HistoryBoundToOperation(const MetaOperationId& id,
-                               std::uint64_t history_id) const override {
+  bool HistoryBoundToOperation(
+      const MetaOperationId& id,
+      const MetaReplicationHistoryId& history_id) const override {
     const std::optional<MetaOperationRecord> record =
         stores_.operation_.FindOperation(id);
     if (!record.has_value()) {
       return false;
     }
-    return record->replication_history_id_ != 0 &&
+    return std::any_of(record->replication_history_id_.begin(),
+                       record->replication_history_id_.end(),
+                       [](std::uint8_t byte) { return byte != 0; }) &&
            record->replication_history_id_ == history_id;
   }
 
@@ -364,7 +415,7 @@ bool ParseU64(const std::string& text, std::uint64_t& out) {
 }
 
 // The trusted {node_id, boot_incarnation, session_generation} triple of the
-// obs verbs: node id as 40 hex chars, boot as 32 hex chars (16B), generation
+// obs verbs: node id and boot incarnation as 40 hex chars (20B), generation
 // as decimal u64.
 bool ParseObsIdentity(const std::vector<std::string>& tokens, std::size_t base,
                       MetaObservationIdentity& out) {
@@ -430,7 +481,7 @@ celer::Task<std::string> HandleSubmitOp(
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& kind, const std::string& payload,
-    std::uint64_t replication_history_id) {
+    const MetaReplicationHistoryId& replication_history_id) {
   SubmitOperation command;
   command.request_id_ = MakeRequestId();
   command.operation_id_ = id;
@@ -492,6 +543,39 @@ celer::Task<std::string> HandleCompleteOp(
   co_return reply;
 }
 
+celer::Task<std::string> HandleAbortOp(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, const MetaOperationId& id,
+    const std::string& reason) {
+  const std::optional<MetaOperationRecord> record =
+      state_machine->FindOperation(id);
+  if (!record.has_value()) {
+    co_return "ERR not-found";
+  }
+  if (IsTerminal(record->lifecycle_)) {
+    co_return "ERR terminal";
+  }
+  AbortOperation command;
+  command.request_id_ = MakeRequestId();
+  command.operation_id_ = id;
+  command.expected_revision_ = record->revision_;
+  command.reason_ = reason;
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) {
+    co_return reply;
+  }
+  const std::optional<MetaOperationRecord> after =
+      state_machine->FindOperation(id);
+  if (!after.has_value() ||
+      after->lifecycle_ != MetaOperationLifecycle::kAborted ||
+      after->terminal_result_ != reason) {
+    co_return "ERR rejected";
+  }
+  co_return reply;
+}
+
 // Non-linearizable read of the committed journal (see the header).
 std::string HandleGetOp(nuraft::ptr<MetaStateMachine> state_machine,
                         const MetaOperationId& id) {
@@ -511,12 +595,15 @@ celer::Task<std::string> HandleRegisterNode(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal authenticated, const std::string& node_id,
-    const std::string& principal, MetaNodeRole role) {
+    const std::string& principal, MetaNodeRole role,
+    std::vector<std::string> endpoints) {
   RegisterNode command;
   command.request_id_ = MakeRequestId();
   command.node_id_ = node_id;
   command.principal_ = principal;
-  command.role_ = role;  // endpoints empty, capability mask 0
+  command.endpoints_ = std::move(endpoints);
+  command.role_ = role;  // capability mask 0
+  const std::vector<std::string> expected_endpoints = command.endpoints_;
   std::string reply =
       co_await ProposeCommand(coordinator, std::move(authenticated), command);
   if (reply.rfind("OK ", 0) != 0) {
@@ -526,7 +613,8 @@ celer::Task<std::string> HandleRegisterNode(
   // identical content verifies; a principal conflict does not.
   const std::optional<MetaNodeRecord> record = state_machine->FindNode(node_id);
   if (!record.has_value() || record->principal_ != principal ||
-      record->role_ != role || record->retired_) {
+      record->endpoints_ != expected_endpoints || record->role_ != role ||
+      record->capability_mask_ != 0 || record->retired_) {
     co_return "ERR rejected";
   }
   co_return reply;
@@ -566,6 +654,52 @@ celer::Task<std::string> HandleCreateGroup(
   co_return reply;
 }
 
+// assignnode <group_id> <node_id> <primary|replica>. The operator names the
+// desired membership, but never its incarnation: the trusted proposer creates
+// a fresh nonzero 128-bit CSPRNG identity immediately before submission.
+celer::Task<std::string> HandleAssignNode(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, const std::string& group_id,
+    const std::string& node_id, MetaNodeRole role) {
+  const MetaStores before = state_machine->StoresSnapshot();
+  const auto group = before.topology_.FindGroup(group_id);
+  if (!group.has_value()) co_return "ERR not-found";
+  const auto existing =
+      std::find_if(group->members_.begin(), group->members_.end(),
+                   [&](const MetaGroupMember& member) {
+                     return member.node_id_ == node_id;
+                   });
+  if (existing != group->members_.end()) {
+    co_return existing->role_ == role ? "OK already-assigned" : "ERR rejected";
+  }
+
+  AssignNodeToGroup command;
+  command.request_id_ = MakeRequestId();
+  command.group_id_ = group_id;
+  command.node_id_ = node_id;
+  command.assignment_id_ = MakeAssignmentId();
+  command.role_ = role;
+  command.expected_revision_ = group->revision_;
+  command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
+  const MetaAssignmentId expected_assignment = command.assignment_id_;
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) co_return reply;
+
+  const auto after =
+      state_machine->StoresSnapshot().topology_.FindGroup(group_id);
+  if (!after.has_value()) co_return "ERR rejected";
+  const auto installed =
+      std::find_if(after->members_.begin(), after->members_.end(),
+                   [&](const MetaGroupMember& member) {
+                     return member.node_id_ == node_id &&
+                            member.assignment_id_ == expected_assignment &&
+                            member.role_ == role;
+                   });
+  co_return installed == after->members_.end() ? "ERR rejected" : reply;
+}
+
 // begingroupterm <group_id> <expected> <new>: promotes the committed
 // group_term (and fences the group), which is what term-bound observations
 // anchor to.
@@ -592,6 +726,134 @@ celer::Task<std::string> HandleBeginGroupTerm(
   co_return reply;
 }
 
+// These topology/authority verbs intentionally expose the typed domain
+// operations instead of a generic command-encoding escape hatch. Absolute
+// CAS values remain operator input; only the cluster-wide topology epoch is
+// derived from one committed snapshot because no external caller can safely
+// guess commits in unrelated groups.
+celer::Task<std::string> HandlePutPolicy(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, const std::string& policy_id,
+    std::uint64_t version, const std::string& content) {
+  PutPolicy command;
+  command.request_id_ = MakeRequestId();
+  command.policy_id_ = policy_id;
+  command.version_ = version;
+  command.content_ = content;
+  command.content_hash_ = MetaPolicyStore::ContentHash(content);
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) co_return reply;
+
+  const auto installed =
+      state_machine->StoresSnapshot().policy_.FindVersion(policy_id, version);
+  if (!installed.has_value() || installed->retired_ ||
+      installed->content_ != content ||
+      installed->content_hash_ != command.content_hash_) {
+    co_return "ERR rejected";
+  }
+  co_return reply;
+}
+
+celer::Task<std::string> HandleSetSlotMap(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, std::uint16_t first_slot,
+    std::uint16_t last_slot, const std::string& group_id,
+    std::uint64_t config_epoch) {
+  const MetaStores before = state_machine->StoresSnapshot();
+  SetSlotMap command;
+  command.request_id_ = MakeRequestId();
+  command.ranges_.push_back({first_slot, last_slot, group_id});
+  command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
+  command.config_epochs_.push_back({group_id, config_epoch});
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) co_return reply;
+
+  const MetaStores after = state_machine->StoresSnapshot();
+  const auto group = after.topology_.FindGroup(group_id);
+  if (!group.has_value() || group->config_epoch_ != config_epoch ||
+      after.topology_.TopologyEpoch() != command.new_topology_epoch_) {
+    co_return "ERR rejected";
+  }
+  for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
+    const std::optional<std::string> owner = after.topology_.SlotOwner(slot);
+    const bool assigned = slot >= first_slot && slot <= last_slot;
+    if ((assigned && owner != std::optional<std::string>(group_id)) ||
+        (!assigned && owner.has_value())) {
+      co_return "ERR rejected";
+    }
+  }
+  co_return reply;
+}
+
+celer::Task<std::string> HandleActivateAuthority(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, const std::string& group_id,
+    std::uint64_t expected_term, const std::string& owner_node_id,
+    std::uint64_t lease_duration_ms, const std::string& policy_id,
+    std::uint64_t policy_version, std::uint64_t authority_version,
+    std::uint64_t config_epoch) {
+  const MetaStores before = state_machine->StoresSnapshot();
+  ActivateAuthority command;
+  command.request_id_ = MakeRequestId();
+  command.group_id_ = group_id;
+  command.expected_term_ = expected_term;
+  command.new_owner_ = owner_node_id;
+  command.grant_.lease_duration_ms_ = lease_duration_ms;
+  command.grant_.policy_id_ = policy_id;
+  command.grant_.policy_version_ = policy_version;
+  command.new_authority_version_ = authority_version;
+  command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
+  command.new_config_epoch_ = config_epoch;
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) co_return reply;
+
+  const MetaStores after = state_machine->StoresSnapshot();
+  const auto topology = after.topology_.FindGroup(group_id);
+  const auto grant = after.grant_.GroupState(group_id);
+  if (!topology.has_value() || !grant.has_value() || grant->fenced_ ||
+      !grant->grant_.has_value() ||
+      grant->grant_->owner_ != owner_node_id ||
+      grant->grant_->term_ != expected_term ||
+      grant->grant_->authority_version_ != authority_version ||
+      grant->grant_->spec_ != command.grant_ ||
+      topology->record_.owner_ != owner_node_id ||
+      topology->record_.group_term_ != expected_term ||
+      topology->record_.authority_version_ != authority_version ||
+      topology->config_epoch_ != config_epoch ||
+      after.topology_.TopologyEpoch() != command.new_topology_epoch_) {
+    co_return "ERR rejected";
+  }
+  co_return reply;
+}
+
+celer::Task<std::string> HandleFenceGroup(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, const std::string& group_id,
+    std::uint64_t expected_term) {
+  FenceGroup command;
+  command.request_id_ = MakeRequestId();
+  command.group_id_ = group_id;
+  command.expected_term_ = expected_term;
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) co_return reply;
+
+  const auto state =
+      state_machine->StoresSnapshot().grant_.GroupState(group_id);
+  if (!state.has_value() || state->group_term_ != expected_term ||
+      !state->fenced_ || state->grant_.has_value()) {
+    co_return "ERR rejected";
+  }
+  co_return reply;
+}
+
 // transitionop <id32hex> <phase> <history>: moves the operation to Running.
 // The history argument must match the anchor committed by submitop; it is a
 // ctl-side consistency check and is not fabricated into evidence.
@@ -599,7 +861,7 @@ celer::Task<std::string> HandleTransitionOp(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
-    const std::string& phase, std::uint64_t history) {
+    const std::string& phase, const MetaReplicationHistoryId& history) {
   const std::optional<MetaOperationRecord> record =
       state_machine->FindOperation(id);
   if (!record.has_value()) {
@@ -660,6 +922,26 @@ celer::Task<std::string> HandlePruneOperationArchive(
   co_return co_await ProposeCommand(coordinator, std::move(principal), command);
 }
 
+celer::Task<std::string> HandleArchiveOperations(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, std::vector<std::uint64_t> seqs) {
+  ArchiveOperations command;
+  command.request_id_ = MakeRequestId();
+  command.operation_seqs_ = std::move(seqs);
+  std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (reply.rfind("OK ", 0) != 0) co_return reply;
+
+  const MetaStores after = state_machine->StoresSnapshot();
+  for (const std::uint64_t seq : command.operation_seqs_) {
+    if (!after.operation_.FindArchivedBySeq(seq).has_value()) {
+      co_return "ERR rejected";
+    }
+  }
+  co_return reply;
+}
+
 // adoptsession injects a session identity supplied by the authorized transport
 // adapter. No facts are needed here: adopting a session for an unregistered
 // node is harmless because Ingest re-checks registration on every observation.
@@ -681,7 +963,38 @@ std::string HandleObsIngest(
     nuraft::ptr<MetaStateMachine> state_machine, MetaObservation observation) {
   const std::int64_t now = NowUnixMs();
   obs_store->SweepExpired(now);
-  const SnapshotCommittedFacts facts(state_machine->StoresSnapshot());
+  MetaStores stores = state_machine->StoresSnapshot();
+  const auto bind_reporter_assignment = [&](std::string_view group_id,
+                                            std::string* node_id,
+                                            MetaAssignmentId* assignment_id) {
+    *node_id = observation.identity_.node_id_;
+    const auto group = stores.topology_.FindGroup(std::string(group_id));
+    if (!group.has_value()) return;
+    const auto member = std::find_if(
+        group->members_.begin(), group->members_.end(),
+        [&](const MetaGroupMember& candidate_member) {
+          return candidate_member.node_id_ == observation.identity_.node_id_;
+        });
+    if (member != group->members_.end()) {
+      *assignment_id = member->assignment_id_;
+    }
+  };
+  if (auto* candidate =
+          std::get_if<MetaCandidateProgressObs>(&observation.payload_)) {
+    // The ctl surface stands in for an authenticated Data session in the
+    // observation integration gate. Derive identity fields that production
+    // receives from the session and heartbeat instead of asking an operator
+    // to discover the CSPRNG-generated assignment id.
+    bind_reporter_assignment(candidate->group_id_, &candidate->node_id_,
+                             &candidate->assignment_id_);
+    candidate->boot_incarnation_ = observation.identity_.boot_incarnation_;
+  } else if (auto* evidence =
+                 std::get_if<MetaOperationEvidenceObs>(&observation.payload_)) {
+    bind_reporter_assignment(evidence->group_id_, &evidence->node_id_,
+                             &evidence->assignment_id_);
+    evidence->boot_incarnation_ = observation.identity_.boot_incarnation_;
+  }
+  const SnapshotCommittedFacts facts(std::move(stores));
   const absl::Status status =
       obs_store->Ingest(std::move(observation), facts, now);
   if (!status.ok()) {
@@ -703,10 +1016,15 @@ std::string HandleObservations(
       obs_store->CandidateProgressFor(*group_id, facts);
   std::string reply = "OK candidates=" + std::to_string(candidates.size());
   for (const MetaCandidateProgressObs& candidate : candidates) {
-    reply += " term=" + std::to_string(candidate.group_term_) +
-             ",manifest=" + std::to_string(candidate.population_manifest_id_) +
-             ",history=" + std::to_string(candidate.replication_history_id_) +
-             ",readiness=" + candidate.readiness_;
+    reply +=
+        " node=" + candidate.node_id_ +
+        ",assignment=" + AssignmentIdText(candidate.assignment_id_) +
+        ",term=" + std::to_string(candidate.group_term_) +
+        ",manifest=" + std::to_string(candidate.population_manifest_revision_) +
+        ",partition_epoch=" +
+        std::to_string(candidate.partition_replication_epoch_) + ",history=" +
+        ReplicationHistoryIdText(candidate.replication_history_id_) +
+        ",readiness=" + candidate.readiness_;
   }
   return reply;
 }
@@ -733,6 +1051,8 @@ celer::Task<std::string> HandleConfigChange(
     MetaProposalExecutor& proposal_executor,
     const std::shared_ptr<MetaMembershipGate>& membership_gate, bool add,
     int server_id, const std::string& endpoint,
+    const std::string& data_control_endpoint,
+    std::string_view local_data_control_endpoint,
     const std::string& member_principal) {
   std::unique_ptr<MetaMembershipGate::Lease> config_lease =
       membership_gate->TryAcquire();
@@ -767,6 +1087,14 @@ celer::Task<std::string> HandleConfigChange(
     bind.request_id_ = MakeRequestId();
     bind.server_id_ = static_cast<std::uint32_t>(descriptor->server_id_);
     bind.principal_ = descriptor->principal_;
+    if (member->get_id() != server->get_id() ||
+        local_data_control_endpoint.empty()) {
+      // Members added through `addsrv` already have a durable record.
+      // The only record that may be absent is the bootstrap member, whose
+      // advertised endpoint comes from this process's mandatory option.
+      co_return "ERR missing-data-control-endpoint";
+    }
+    bind.data_control_endpoint_ = std::string(local_data_control_endpoint);
     std::string bound = co_await ProposeCommand(coordinator, principal, bind);
     if (bound.rfind("OK ", 0) != 0) co_return bound;
   }
@@ -781,6 +1109,7 @@ celer::Task<std::string> HandleConfigChange(
     bind.request_id_ = MakeRequestId();
     bind.server_id_ = static_cast<std::uint32_t>(server_id);
     bind.principal_ = member_principal;
+    bind.data_control_endpoint_ = data_control_endpoint;
     std::string bound = co_await ProposeCommand(coordinator, principal, bind);
     if (bound.rfind("OK ", 0) != 0) co_return bound;
     add_config = nuraft::cs_new<nuraft::srv_config>(
@@ -879,32 +1208,44 @@ celer::Task<std::string> DispatchMutationVerb(
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& command,
     const std::vector<std::string>& tokens) {
-  if (command == "submitop" || command == "completeop") {
-    const bool submit = command == "submitop";
+  if (command == "submitop") {
     // submitop <id> <kind> <payload> [replication_history_id];
-    // completeop <id> <result>.
-    if ((!submit && tokens.size() != 3u) ||
-        (submit && tokens.size() != 4u && tokens.size() != 5u)) {
+    if (tokens.size() != 4u && tokens.size() != 5u) {
       co_return "ERR bad-request";
     }
     MetaOperationId id{};
     if (!ParseOperationId(tokens[1], id)) {
       co_return "ERR bad-request";
     }
-    if (submit) {
-      std::uint64_t history = 0;
-      if (tokens.size() == 5u && !ParseU64(tokens[4], history)) {
-        co_return "ERR bad-request";
-      }
-      co_return co_await HandleSubmitOp(coordinator, std::move(state_machine),
-                                        std::move(principal), id, tokens[2],
-                                        tokens[3], history);
+    MetaReplicationHistoryId history{};
+    if (tokens.size() == 5u && !ParseReplicationHistoryId(tokens[4], history)) {
+      co_return "ERR bad-request";
     }
-    co_return co_await HandleCompleteOp(coordinator, std::move(state_machine),
-                                        std::move(principal), id, tokens[2]);
+    co_return co_await HandleSubmitOp(coordinator, std::move(state_machine),
+                                      std::move(principal), id, tokens[2],
+                                      tokens[3], history);
+  }
+  if (command == "completeop" || command == "abortop") {
+    // The final token is optional so a durability-gated operator can express
+    // zero-growth terminalization before archive/prune recovery.
+    if (tokens.size() != 2u && tokens.size() != 3u) {
+      co_return "ERR bad-request";
+    }
+    MetaOperationId id{};
+    if (!ParseOperationId(tokens[1], id)) {
+      co_return "ERR bad-request";
+    }
+    const std::string payload = tokens.size() == 3u ? tokens[2] : "";
+    if (command == "completeop") {
+      co_return co_await HandleCompleteOp(coordinator, std::move(state_machine),
+                                          std::move(principal), id, payload);
+    }
+    co_return co_await HandleAbortOp(coordinator, std::move(state_machine),
+                                     std::move(principal), id, payload);
   }
   if (command == "registernode") {
-    if (tokens.size() != 4 || !IsNodeId(tokens[1])) {
+    if (tokens.size() < 5 || tokens.size() > 4 + kMaxMetaEndpointsPerNode ||
+        !IsNodeId(tokens[1])) {
       co_return "ERR bad-request";
     }
     MetaNodeRole role;
@@ -915,9 +1256,10 @@ celer::Task<std::string> DispatchMutationVerb(
     } else {
       co_return "ERR bad-request";
     }
-    co_return co_await HandleRegisterNode(coordinator, std::move(state_machine),
-                                          std::move(principal), tokens[1],
-                                          tokens[2], role);
+    std::vector<std::string> endpoints(tokens.begin() + 4, tokens.end());
+    co_return co_await HandleRegisterNode(
+        coordinator, std::move(state_machine), std::move(principal), tokens[1],
+        tokens[2], role, std::move(endpoints));
   }
   if (command == "creategroup") {
     if (tokens.size() != 2 || tokens[1].empty() ||
@@ -926,6 +1268,23 @@ celer::Task<std::string> DispatchMutationVerb(
     }
     co_return co_await HandleCreateGroup(coordinator, std::move(state_machine),
                                          std::move(principal), tokens[1]);
+  }
+  if (command == "assignnode") {
+    if (tokens.size() != 4 || tokens[1].empty() ||
+        tokens[1].size() > kMaxMetaGroupIdBytes || !IsNodeId(tokens[2])) {
+      co_return "ERR bad-request";
+    }
+    MetaNodeRole role;
+    if (tokens[3] == "primary") {
+      role = MetaNodeRole::kPrimary;
+    } else if (tokens[3] == "replica") {
+      role = MetaNodeRole::kReplica;
+    } else {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandleAssignNode(coordinator, std::move(state_machine),
+                                        std::move(principal), tokens[1],
+                                        tokens[2], role);
   }
   if (command == "begingroupterm") {
     if (tokens.size() != 4 || tokens[1].empty() ||
@@ -941,13 +1300,75 @@ celer::Task<std::string> DispatchMutationVerb(
         coordinator, std::move(state_machine), std::move(principal), tokens[1],
         expected, next);
   }
+  if (command == "putpolicy") {
+    std::uint64_t version = 0;
+    if (tokens.size() != 4 || tokens[1].empty() ||
+        tokens[1].size() > kMaxMetaPolicyIdBytes ||
+        !ParseU64(tokens[2], version) || version == 0 || tokens[3].empty() ||
+        tokens[3].size() > kMaxMetaPayloadBytes) {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandlePutPolicy(
+        coordinator, std::move(state_machine), std::move(principal), tokens[1],
+        version, tokens[3]);
+  }
+  if (command == "setslotmap") {
+    std::uint64_t first = 0;
+    std::uint64_t last = 0;
+    std::uint64_t config_epoch = 0;
+    if (tokens.size() != 5 || !ParseU64(tokens[1], first) ||
+        !ParseU64(tokens[2], last) || first > last ||
+        last >= kMetaSlotCount || tokens[3].empty() ||
+        tokens[3].size() > kMaxMetaGroupIdBytes ||
+        !ParseU64(tokens[4], config_epoch)) {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandleSetSlotMap(
+        coordinator, std::move(state_machine), std::move(principal),
+        static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last),
+        tokens[3], config_epoch);
+  }
+  if (command == "activateauthority") {
+    std::uint64_t expected_term = 0;
+    std::uint64_t lease_duration_ms = 0;
+    std::uint64_t policy_version = 0;
+    std::uint64_t authority_version = 0;
+    std::uint64_t config_epoch = 0;
+    if (tokens.size() != 9 || tokens[1].empty() ||
+        tokens[1].size() > kMaxMetaGroupIdBytes ||
+        !ParseU64(tokens[2], expected_term) || !IsNodeId(tokens[3]) ||
+        !ParseU64(tokens[4], lease_duration_ms) || lease_duration_ms == 0 ||
+        lease_duration_ms > std::numeric_limits<std::uint32_t>::max() ||
+        tokens[5].empty() || tokens[5].size() > kMaxMetaPolicyIdBytes ||
+        !ParseU64(tokens[6], policy_version) || policy_version == 0 ||
+        !ParseU64(tokens[7], authority_version) || authority_version == 0 ||
+        !ParseU64(tokens[8], config_epoch) || config_epoch == 0) {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandleActivateAuthority(
+        coordinator, std::move(state_machine), std::move(principal), tokens[1],
+        expected_term, tokens[3], lease_duration_ms, tokens[5], policy_version,
+        authority_version, config_epoch);
+  }
+  if (command == "fencegroup") {
+    std::uint64_t expected_term = 0;
+    if (tokens.size() != 3 || tokens[1].empty() ||
+        tokens[1].size() > kMaxMetaGroupIdBytes ||
+        !ParseU64(tokens[2], expected_term)) {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandleFenceGroup(
+        coordinator, std::move(state_machine), std::move(principal), tokens[1],
+        expected_term);
+  }
   if (command == "transitionop") {
     if (tokens.size() != 4) {
       co_return "ERR bad-request";
     }
     MetaOperationId id{};
-    std::uint64_t history = 0;
-    if (!ParseOperationId(tokens[1], id) || !ParseU64(tokens[3], history)) {
+    MetaReplicationHistoryId history{};
+    if (!ParseOperationId(tokens[1], id) ||
+        !ParseReplicationHistoryId(tokens[3], history)) {
       co_return "ERR bad-request";
     }
     co_return co_await HandleTransitionOp(coordinator, std::move(state_machine),
@@ -994,6 +1415,24 @@ celer::Task<std::string> DispatchMutationVerb(
     co_return co_await HandlePruneOperationArchive(
         coordinator, std::move(principal), std::move(seqs));
   }
+  if (command == "archiveoperations") {
+    if (tokens.size() < 2 ||
+        tokens.size() - 1 > kMaxMetaArchivedOperationSummaries) {
+      co_return "ERR bad-request";
+    }
+    std::vector<std::uint64_t> seqs;
+    seqs.reserve(tokens.size() - 1);
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      std::uint64_t seq = 0;
+      if (!ParseU64(tokens[i], seq) || seq == 0) {
+        co_return "ERR bad-request";
+      }
+      seqs.push_back(seq);
+    }
+    co_return co_await HandleArchiveOperations(
+        coordinator, std::move(state_machine), std::move(principal),
+        std::move(seqs));
+  }
   co_return "ERR unknown-command";
 }
 
@@ -1014,7 +1453,7 @@ celer::Task<std::string> DispatchCommand(
     MetaProposalExecutor& proposal_executor,
     std::shared_ptr<MetaMembershipGate> membership_gate,
     const MetaPrincipalIdentity& identity, AuthenticatedPrincipal principal,
-    std::string_view line) {
+    std::string_view local_data_control_endpoint, std::string_view line) {
   const std::vector<std::string> tokens = SplitTokens(line);
   if (tokens.empty()) {
     co_return "ERR bad-request";
@@ -1035,10 +1474,13 @@ celer::Task<std::string> DispatchCommand(
     co_return "ERR forbidden";
   }
   if (command == "submitop" || command == "completeop" ||
+      command == "abortop" || command == "archiveoperations" ||
       command == "registernode" || command == "creategroup" ||
-      command == "begingroupterm" || command == "transitionop" ||
-      command == "pruneaudit" || command == "setauditpolicy" ||
-      command == "pruneoperations") {
+      command == "assignnode" || command == "begingroupterm" ||
+      command == "putpolicy" || command == "setslotmap" ||
+      command == "activateauthority" || command == "fencegroup" ||
+      command == "transitionop" || command == "pruneaudit" ||
+      command == "setauditpolicy" || command == "pruneoperations") {
     std::string reply = co_await DispatchMutationVerb(
         coordinator, state_machine, std::move(principal), command, tokens);
     co_return reply;
@@ -1087,19 +1529,21 @@ celer::Task<std::string> DispatchCommand(
       MetaNodeHealthObs payload;
       payload.health_ = tokens[5];
       observation.payload_ = std::move(payload);
-    } else if (kind == "candidate" && tokens.size() == 12) {
+    } else if (kind == "candidate" && tokens.size() == 13) {
       MetaCandidateProgressObs payload;
       payload.group_id_ = tokens[5];
       if (!ParseU64(tokens[6], payload.group_term_) ||
-          !ParseU64(tokens[7], payload.population_manifest_id_) ||
-          !ParseU64(tokens[8], payload.replication_history_id_)) {
+          !ParseU64(tokens[7], payload.population_manifest_revision_) ||
+          !ParseU64(tokens[8], payload.partition_replication_epoch_) ||
+          !ParseReplicationHistoryId(tokens[9],
+                                     payload.replication_history_id_)) {
         co_return "ERR bad-request";
       }
-      payload.applied_flow_vector_ = tokens[9];
-      payload.backlog_coverage_ = tokens[10];
-      payload.readiness_ = tokens[11];
+      payload.applied_flow_vector_ = tokens[10];
+      payload.backlog_coverage_ = tokens[11];
+      payload.readiness_ = tokens[12];
       observation.payload_ = std::move(payload);
-    } else if (kind == "evidence" && tokens.size() == 12) {
+    } else if (kind == "evidence" && tokens.size() == 13) {
       MetaOperationEvidenceObs payload;
       if (!ParseOperationId(tokens[5], payload.operation_id_)) {
         co_return "ERR bad-request";
@@ -1111,8 +1555,10 @@ celer::Task<std::string> DispatchCommand(
       payload.evidence_hash_ = MetaSha256(payload.evidence_);
       payload.group_id_ = tokens[8];
       if (!ParseU64(tokens[9], payload.group_term_) ||
-          !ParseU64(tokens[10], payload.population_manifest_id_) ||
-          !ParseU64(tokens[11], payload.replication_history_id_)) {
+          !ParseU64(tokens[10], payload.population_manifest_revision_) ||
+          !ParseU64(tokens[11], payload.partition_replication_epoch_) ||
+          !ParseReplicationHistoryId(tokens[12],
+                                     payload.replication_history_id_)) {
         co_return "ERR bad-request";
       }
       observation.payload_ = std::move(payload);
@@ -1172,7 +1618,7 @@ celer::Task<std::string> DispatchCommand(
   if (command == "addsrv" || command == "removesrv") {
     const bool add = command == "addsrv";
     if ((!add && tokens.size() != 2u) ||
-        (add && tokens.size() != 3u && tokens.size() != 4u)) {
+        (add && tokens.size() != 4u && tokens.size() != 5u)) {
       co_return "ERR bad-request";
     }
     int server_id = 0;
@@ -1181,24 +1627,26 @@ celer::Task<std::string> DispatchCommand(
     }
     std::string member_principal =
         "keylane://meta/" + std::to_string(server_id);
-    if (add && tokens.size() == 4u) {
-      member_principal = tokens[3];
+    if (add && tokens.size() == 5u) {
+      member_principal = tokens[4];
     }
     co_return co_await HandleConfigChange(
         std::move(server), std::move(state_machine), coordinator,
         std::move(principal), foreign_executor, proposal_executor,
         membership_gate, add, server_id, add ? tokens[2] : std::string(),
-        member_principal);
+        add ? tokens[3] : std::string(local_data_control_endpoint),
+        local_data_control_endpoint, member_principal);
   }
   if (command == "snapshot") {
     // A manual snapshot must serialize against the commit
     // thread — serialize_commit_ blocks the background commit until the
     // state machine's exact-cut capture returns (NuRaft semantics per
-    // raft_server.hxx create_snapshot_options). The capture is synchronous
-    // and KB-scale on the proposal executor; the durability write is handed
-    // to the state machine's writer thread, so the reply only guarantees the
-    // cut point, and compaction completes asynchronously. A round already
-    // in flight fails fast (returns 0).
+    // raft_server.hxx create_snapshot_options). The capture is synchronous on
+    // the proposal executor, bounded by kMaxMetaSnapshotBytes, and can add
+    // substantial proposal latency near that cap. The durability write is
+    // handed to the state machine's writer thread, so the reply only
+    // guarantees the cut point, and compaction completes asynchronously. A
+    // round already in flight fails fast (returns 0).
     std::shared_ptr<AsyncReply> state = std::make_shared<AsyncReply>();
     const absl::Status submitted =
         proposal_executor.Submit([server, foreign_executor, state]() mutable {
@@ -1509,7 +1957,8 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
       std::string reply = co_await DispatchCommand(
           core->server_, core->state_machine_, core->coordinator_,
           core->obs_store_, core->foreign_executor_, *core->proposal_executor_,
-          core->membership_gate_, *identity, authenticated, line);
+          core->membership_gate_, *identity, authenticated,
+          core->options_.local_data_control_endpoint_, line);
       reply.push_back('\n');
       const absl::Status written =
           co_await stream.WriteAll(std::span<const std::byte>(
