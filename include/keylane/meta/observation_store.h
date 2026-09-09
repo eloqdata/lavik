@@ -18,16 +18,17 @@
 //   - AdoptSession() establishes the current generation for a node and
 //     atomically purges every older observation of that node. Only the
 //     current generation may ingest.
-//   - Invalidation is threefold: checked at ingest against MetaCommittedFacts,
-//     actively purged when committed state changes (RevalidateAll), and
-//     re-filtered at every read (Latest*/List* take facts and filter again),
-//     so a commit landing between ingest and query cannot leak stale data.
+//   - Candidate disconnect is withdrawn by the session layer. Other
+//     invalidation is checked at ingest against MetaCommittedFacts, actively
+//     purged when committed state changes (RevalidateAll), and re-filtered at
+//     every read (Latest*/List* take facts and filter again), so a commit
+//     landing between ingest and query cannot leak stale data.
 //   - Group-bound observations require the authenticated node's exact current
 //     membership assignment and group_term == committed current term (older is
 //     stale, newer is forged: both rejected). Manifest ids and operation
 //     evidence histories must match committed values/bindings. Candidate
-//     history is opaque here; the authenticated Data-session adapter binds it
-//     to the history declared by that session's ClientHello before ingest.
+//     reporter history comes from ClientHello, while its independent source
+//     history is a compatibility-domain anchor for the internal selector.
 //
 // Rejections and evictions are appended to a bounded audit ring buffer for
 // operators (MetaObsAuditEvent); this ring is debugging surface, not the
@@ -37,8 +38,9 @@
 // container overhead, candidate/evidence domain caps stop one group,
 // operation, or reporter from monopolizing keys, and exact charged-byte
 // budgets cover every large payload and its primary index copies. Capacity
-// rejection preserves the previous latest-wins value; observations are soft
-// state, so exhaustion can delay reconciliation but cannot create authority.
+// rejection preserves the previous latest-wins value for diagnostic ingest;
+// heartbeat replace-or-clear still removes stale role evidence. Observations
+// are soft state, so exhaustion cannot create authority.
 //
 // Threading: public operations are internally serialized. This is required
 // because authenticated sessions ingest on control-channel workers while the
@@ -76,7 +78,11 @@ struct MetaNodeBootObs {
 };
 
 struct MetaNodeHealthObs {
-  std::string health_;  // bounded free-form status (e.g. "ok", degraded flags)
+  bool storage_ready_ = false;
+  bool population_ready_ = false;
+  bool draining_ = false;
+  std::uint32_t active_groups_ = 0;
+  std::string health_;  // bounded free-form diagnostic summary
   bool operator==(const MetaNodeHealthObs&) const = default;
 };
 
@@ -86,15 +92,29 @@ struct MetaCandidateProgressObs {
   // proof that a reconciler would have to join against another query.
   std::string node_id_;
   MetaBootIncarnation boot_incarnation_{};
+  std::uint64_t session_generation_ = 0;
   std::string group_id_;
   MetaAssignmentId assignment_id_{};
   uint64_t group_term_ = 0;
   uint64_t population_manifest_revision_ = 0;
+  MetaHash256 population_manifest_digest_{};
   uint64_t partition_replication_epoch_ = 0;
+  // Reporter-local history remains the compatibility/diagnostic `history`
+  // field. Candidate comparison uses the independent rebuild source lineage.
   MetaReplicationHistoryId replication_history_id_{};
-  std::string applied_flow_vector_;  // opaque and bounded
+  std::string source_node_id_;
+  MetaAssignmentId source_assignment_id_{};
+  MetaBootIncarnation source_boot_incarnation_{};
+  MetaReplicationHistoryId source_replication_history_id_{};
+  std::vector<std::uint64_t> applied_next_lsns_;
+  std::string applied_flow_vector_;  // compatibility diagnostic rendering
   std::string backlog_coverage_;     // opaque, bounded
   std::string readiness_;            // opaque, bounded
+  bool storage_ready_ = false;
+  bool population_ready_ = false;
+  bool draining_ = false;
+  std::int64_t received_unix_ms_ = 0;
+  std::int64_t expires_unix_ms_ = 0;
   bool operator==(const MetaCandidateProgressObs&) const = default;
 };
 
@@ -139,8 +159,9 @@ struct MetaObservation {
 
 // Read-only projection of committed MetaStores used for freshness checks.
 // Implemented by the state-machine/coordinator wiring and by test fakes.
-// All "unknown" answers must be conservative (0/false) so that unknown
-// committed state rejects rather than admits.
+// All "unknown" answers must be conservative (0/false/zero hash) so that
+// unknown committed state rejects rather than admits. A zero manifest digest
+// is therefore a sentinel, never an admissible committed manifest anchor.
 class MetaCommittedFacts {
  public:
   virtual ~MetaCommittedFacts() = default;
@@ -151,6 +172,9 @@ class MetaCommittedFacts {
   // 0 when the group does not exist.
   virtual uint64_t CurrentPopulationManifestRevision(
       std::string_view group_id) const = 0;
+  // Zero hash when the group or manifest does not exist.
+  virtual MetaHash256 CurrentPopulationManifestDigest(
+      std::string_view group_id) const = 0;
   // 0 when the group does not exist. Zero may also be the initial committed
   // epoch; term matching distinguishes a real group from unknown state.
   virtual uint64_t CurrentPartitionReplicationEpoch(
@@ -159,6 +183,10 @@ class MetaCommittedFacts {
   // outside the group, or a removed-and-readded node using an old assignment,
   // must not contribute candidate or operation evidence.
   virtual bool AssignmentMatches(
+      std::string_view group_id, std::string_view node_id,
+      const MetaAssignmentId& assignment_id) const = 0;
+  // True only when this exact member assignment is the committed owner.
+  virtual bool IsOwnerAssignment(
       std::string_view group_id, std::string_view node_id,
       const MetaAssignmentId& assignment_id) const = 0;
   // True when the operation exists (including archived summaries) and is not
@@ -190,6 +218,12 @@ struct MetaObsAuditEvent {
 
 class MetaObservationStore {
  public:
+  struct HeartbeatReplaceResult {
+    absl::Status boot_status_;
+    absl::Status health_status_;
+    absl::Status candidate_status_;
+  };
+
   struct Limits {
     // Session keys have fixed-size authenticated node ids in production. The
     // explicit count cap also protects test/administrative adapters before an
@@ -248,17 +282,35 @@ class MetaObservationStore {
   absl::Status AdoptSession(const MetaObservationIdentity& identity,
                             int64_t now_unix_ms);
 
+  // Immediately withdraws candidate evidence when the exact authenticated
+  // session disconnects. A stale completion from an older generation cannot
+  // clear a replacement session's candidate; health and diagnostic evidence
+  // retain their ordinary TTL semantics.
+  void InvalidateCandidateOnDisconnect(
+      const MetaObservationIdentity& identity, int64_t now_unix_ms);
+
   // Ingest one observation. Validates identity (registered active node,
   // current generation) and freshness (facts) before storing; rejection is
   // recorded in the audit ring and returned as a domain error.
   absl::Status Ingest(MetaObservation observation,
                       const MetaCommittedFacts& facts, int64_t now_unix_ms);
 
+  // Replaces common liveness/health and the role-derived candidate state under
+  // one lock. Absence or rejection of candidate evidence clears every older
+  // candidate for this node, so a promotion heartbeat cannot preserve the
+  // node's previous replica role.
+  HeartbeatReplaceResult ReplaceHeartbeat(
+      const MetaObservationIdentity& identity, MetaNodeHealthObs health,
+      std::optional<MetaCandidateProgressObs> candidate,
+      const MetaCommittedFacts& facts, int64_t now_unix_ms);
+
   // Commit-driven invalidation: drop observations whose node, assignment,
   // term, manifest, or partition-epoch bindings no longer match committed
   // state; operation evidence additionally checks its committed history and
-  // operation anchors. Candidate history is session-bound instead. Events are
-  // audited, and callers run this after each committed batch.
+  // operation anchors. Candidate reporter-local history is session-bound;
+  // its independent source history is a compatibility-domain anchor rather
+  // than a committed Meta fact. Events are audited, and callers run this
+  // after each committed batch.
   void RevalidateAll(const MetaCommittedFacts& facts, int64_t now_unix_ms);
 
   // TTL sweep (events audited).
@@ -273,6 +325,12 @@ class MetaObservationStore {
       std::string_view group_id, const MetaCommittedFacts& facts) const;
   std::vector<MetaCandidateProgressObs> CandidateProgressFor(
       std::string_view group_id, const MetaCommittedFacts& facts) const;
+  // Selector-only view. Unlike the compatibility diagnostics above, this
+  // applies TTL at the caller's fixed planning instant without mutating the
+  // deadline or depending on a global observation revision.
+  std::vector<MetaCandidateProgressObs> LiveCandidateProgressFor(
+      std::string_view group_id, const MetaCommittedFacts& facts,
+      int64_t now_unix_ms) const;
   std::optional<MetaObservation> LatestForNode(
       std::string_view node_id, const MetaCommittedFacts& facts) const;
   std::vector<MetaOperationEvidenceObs> EvidenceForOperation(
@@ -290,6 +348,12 @@ class MetaObservationStore {
   std::uint64_t retained_bytes_for_node(std::string_view node_id) const;
 
  private:
+  absl::Status IngestLocked(MetaObservation observation,
+                            const MetaCommittedFacts& facts,
+                            int64_t now_unix_ms);
+  void ClearCandidatesForNodeLocked(std::string_view node_id,
+                                    int64_t now_unix_ms,
+                                    std::string_view detail);
   void SweepExpiredLocked(int64_t now_unix_ms);
 
   Limits limits_;

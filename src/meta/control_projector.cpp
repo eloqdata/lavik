@@ -313,9 +313,32 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
         return Inconsistent(absl::StrCat("group ", source.group_id_,
                                          " names an inactive member"));
       }
-      // Meta may retain role intent for later workflows, but protocol v1
-      // derives the Data serving role solely from the committed grant owner.
+      // Membership has no redundant role byte. Protocol v2 projects owner
+      // intent separately below and grant_active independently authorizes
+      // serving.
       projected.members.push_back({member.node_id_, member.assignment_id_});
+    }
+
+    // Project durable owner intent even while fenced. Data needs this fact to
+    // choose the owner/no-role branch instead of misreporting a Ready former
+    // authority as a replica candidate. grant_active remains the independent
+    // serving-authority bit.
+    auto owner = source.members_.end();
+    if (!source.record_.owner_.empty()) {
+      owner = std::find_if(source.members_.begin(), source.members_.end(),
+                           [&source](const MetaGroupMember& member) {
+                             return member.node_id_ == source.record_.owner_;
+                           });
+      // Removing a fenced owner may leave its id as durable history. It no
+      // longer classifies any live member and is intentionally omitted.
+      if (owner != source.members_.end() && IsZero(owner->assignment_id_)) {
+        return Inconsistent(absl::StrCat("group ", source.group_id_,
+                                         " owner has no live assignment"));
+      }
+      if (owner != source.members_.end()) {
+        projected.owner_node_id = source.record_.owner_;
+        projected.owner_assignment_id = owner->assignment_id_;
+      }
     }
 
     if (grant->grant_.has_value()) {
@@ -335,18 +358,9 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
             absl::StrCat("group ", source.group_id_,
                          " active grant has incomplete serving authority"));
       }
-      if (!active_nodes.contains(source.record_.owner_)) {
+      if (owner == source.members_.end()) {
         return Inconsistent(absl::StrCat("group ", source.group_id_,
-                                         " names an inactive owner"));
-      }
-      const auto owner =
-          std::find_if(source.members_.begin(), source.members_.end(),
-                       [&source](const MetaGroupMember& member) {
-                         return member.node_id_ == source.record_.owner_;
-                       });
-      if (owner == source.members_.end() || IsZero(owner->assignment_id_)) {
-        return Inconsistent(absl::StrCat("group ", source.group_id_,
-                                         " owner has no live assignment"));
+                                         " active grant has no owner"));
       }
       if (active.spec_.lease_duration_ms_ == 0 ||
           active.spec_.lease_duration_ms_ >
@@ -361,11 +375,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
           static_cast<std::uint32_t>(active.spec_.lease_duration_ms_);
       projected.grant_policy_id = active.spec_.policy_id_;
       projected.grant_policy_version = active.spec_.policy_version_;
-      // Topology retains the last owner as durable history after fencing.
-      // Only an active grant turns that fact into a serving owner/assignment
-      // on the Data-control wire.
-      projected.owner_node_id = source.record_.owner_;
-      projected.owner_assignment_id = owner->assignment_id_;
       policy_references.emplace(active.spec_.policy_id_,
                                 active.spec_.policy_version_);
     } else if (!grant->fenced_) {

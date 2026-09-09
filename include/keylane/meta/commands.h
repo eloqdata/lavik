@@ -110,7 +110,7 @@ inline constexpr std::uint32_t kMaxMetaEvidenceSummariesPerCommand = 64;
 inline constexpr std::uint32_t kMaxMetaDirectivesPerOperation = 64;
 inline constexpr std::uint32_t kMaxMetaDirectiveKindBytes = 64;
 // Payload and preconditions retain separate bounded schema slots for a future
-// operation-kind interpreter. Control protocol v1 rejects non-empty values
+// operation-kind interpreter. Control protocol v2 rejects non-empty values
 // (and force=true) at Meta transition apply and again at Data admission rather
 // than silently treating an unknown execution contract as satisfied.
 inline constexpr std::uint32_t kMaxMetaDirectivePreconditionsBytes =

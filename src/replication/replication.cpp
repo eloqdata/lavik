@@ -57,6 +57,7 @@
 #include "keylane/replication_group.h"
 #include "keylane/resp.h"
 #include "keylane/storage/engine.h"
+#include "replica_applied_frontier.h"
 #include "source_authorization.h"
 #include "spdlog/spdlog.h"
 
@@ -2063,45 +2064,11 @@ std::string PeerHost(int fd) {
   return host;
 }
 
-struct ReplicaCursorState {
-  explicit ReplicaCursorState(unsigned count) : cursors_(count) {
-    for (auto& cursor : cursors_) {
-      cursor = {.lsn_ = 1, .fragment_index_ = 0};
-    }
-    total_lsn_.store(count, std::memory_order_relaxed);
-  }
-
-  storage::ReplicationLogCursor Load(unsigned flow_id) const noexcept {
-    if (flow_id >= cursors_.size()) return {};
-    return cursors_[flow_id];
-  }
-
-  void Store(unsigned flow_id, std::uint64_t lsn,
-             std::uint32_t fragment) noexcept {
-    if (flow_id >= cursors_.size()) return;
-    const std::uint64_t previous = cursors_[flow_id].lsn_;
-    cursors_[flow_id] = {.lsn_ = lsn, .fragment_index_ = fragment};
-    if (lsn >= previous) {
-      total_lsn_.fetch_add(lsn - previous, std::memory_order_relaxed);
-    } else {
-      total_lsn_.fetch_sub(previous - lsn, std::memory_order_relaxed);
-    }
-  }
-
-  std::size_t size() const noexcept { return cursors_.size(); }
-  std::uint64_t total_lsn() const noexcept {
-    return total_lsn_.load(std::memory_order_relaxed);
-  }
-
-  std::vector<storage::ReplicationLogCursor> cursors_;
-  std::atomic<std::uint64_t> total_lsn_{0};
-};
-
-std::string EncodeAppliedVector(const ReplicaCursorState& state) {
+std::string EncodeAppliedVector(std::span<const std::uint64_t> next_lsns) {
   std::string result;
-  for (unsigned flow = 0; flow < state.size(); ++flow) {
+  for (std::uint64_t next_lsn : next_lsns) {
     if (!result.empty()) result.push_back(',');
-    absl::StrAppend(&result, state.Load(flow).lsn_);
+    absl::StrAppend(&result, next_lsn);
   }
   return result.empty() ? "?" : result;
 }
@@ -2349,7 +2316,7 @@ struct ReplicaSession {
   std::string flow_capability_;
   unsigned source_worker_count_ = 0;
   std::shared_ptr<ClusterRebuildContext> cluster_rebuild_;
-  std::shared_ptr<ReplicaCursorState> cursors_;
+  std::shared_ptr<detail::ReplicaAppliedFrontier> applied_frontier_;
   // No flow may consume data until every KLFLOW response selected the same
   // session mode. FULL then has a second barrier: flow zero drains old client
   // work and maintenance before any flow can issue a destructive reset.
@@ -2380,14 +2347,22 @@ struct ReplicaSession {
   mutable std::mutex failure_mutex_;
   std::string fail_stop_reason_;
 
-  void InitializeFullSyncState(unsigned flow_count) {
+  void InitializeFullSyncState(std::span<const std::uint64_t> requested) {
     std::lock_guard lock(fullsync_mutex_);
+    const unsigned flow_count = static_cast<unsigned>(requested.size());
     flow_phases_.assign(flow_count, FlowProtocolPhase::kAwaitMode);
     requested_cursors_.resize(flow_count);
     for (unsigned flow = 0; flow < flow_count; ++flow) {
-      requested_cursors_[flow] = cursors_->Load(flow);
+      requested_cursors_[flow] = {
+          .lsn_ = requested[flow], .fragment_index_ = 0};
     }
     fullsync_cuts_.assign(flow_count, std::nullopt);
+  }
+
+  storage::ReplicationLogCursor RequestedCursor(unsigned flow) const {
+    std::lock_guard lock(fullsync_mutex_);
+    if (flow >= requested_cursors_.size()) return {};
+    return requested_cursors_[flow];
   }
 
   absl::Status SelectFlowMode(unsigned flow_id, bool fullsync) {
@@ -2426,9 +2401,9 @@ struct ReplicaSession {
     // No shared cursor changes until every flow has selected FULL. A failure
     // after this point must never retry with a mixture of old-history and
     // replacement-population cursors.
-    for (unsigned flow = 0; flow < cursors_->size(); ++flow) {
-      cursors_->Store(flow, 1, 0);
-    }
+    std::vector<std::uint64_t> reset(applied_frontier_->size(), 1);
+    absl::Status installed = applied_frontier_->InstallNextLsns(reset);
+    if (!installed.ok()) return installed;
     fullsync_cursors_reset_ = true;
     return absl::OkStatus();
   }
@@ -2463,8 +2438,14 @@ struct ReplicaSession {
     std::lock_guard lock(fullsync_mutex_);
     absl::Status complete = ValidateFullSyncCutVectorLocked();
     if (!complete.ok()) return complete;
+    std::vector<std::uint64_t> cut;
+    cut.reserve(fullsync_cuts_.size());
+    for (const std::optional<std::uint64_t>& next_lsn : fullsync_cuts_) {
+      cut.push_back(*next_lsn);
+    }
+    absl::Status installed = applied_frontier_->InstallNextLsns(cut);
+    if (!installed.ok()) return installed;
     for (unsigned flow = 0; flow < fullsync_cuts_.size(); ++flow) {
-      cursors_->Store(flow, *fullsync_cuts_[flow], 0);
       flow_phases_[flow] = FlowProtocolPhase::kFullCutAwaitCursor;
     }
     fullsync_cursors_installed_ = true;
@@ -3075,8 +3056,8 @@ class ReplicationManager::ReplicationGroup {
         cluster_population_managed_(options.cluster_population_managed_),
         upstream_(cluster_enabled_ ? std::nullopt
                                    : std::move(initial_upstream)),
-        cursor_state_(
-            std::make_shared<ReplicaCursorState>(storage->worker_count())),
+        applied_frontier_(std::make_shared<detail::ReplicaAppliedFrontier>(
+            storage->worker_count(), storage->worker_count())),
         replica_priority_(options.replica_priority_),
         node_id_(options.node_id_override_.has_value()
                      ? *options.node_id_override_
@@ -3283,7 +3264,7 @@ class ReplicationManager::ReplicationGroup {
         source_authorizations_.RevokeAll();
         previous_session = std::move(active_replica_session_);
         upstream_.reset();
-        cursor_state_.reset();
+        applied_frontier_.reset();
         upstream_node_id_.reset();
         upstream_history_id_.reset();
         replica_session_id_ = 0;
@@ -3400,7 +3381,7 @@ class ReplicationManager::ReplicationGroup {
       if (installed) {
         cluster_rebuild_ = context;
         upstream_ = std::move(upstream);
-        cursor_state_.reset();
+        applied_frontier_.reset();
         upstream_node_id_.reset();
         upstream_history_id_.reset();
         native_dataset_valid_.store(false, std::memory_order_release);
@@ -3512,7 +3493,7 @@ class ReplicationManager::ReplicationGroup {
       replica_reconfiguration_running_ = true;
       session = std::move(active_replica_session_);
       upstream_.reset();
-      cursor_state_.reset();
+      applied_frontier_.reset();
       upstream_node_id_.reset();
       upstream_history_id_.reset();
       replica_session_id_ = 0;
@@ -3719,19 +3700,65 @@ class ReplicationManager::ReplicationGroup {
     ClusterPopulationStatus result;
     result.local_node_id_ = node_id_;
     result.local_boot_id_ = boot_id_;
-    std::lock_guard lock(state_mutex_);
-    result.state_ =
-        failed_stopped_.load(std::memory_order_relaxed)
-            ? ReplicationGroupState::kFailedStopped
-        : cluster_rebuild_ == nullptr
-            ? ReplicationGroupState::kNotReady
-            : cluster_rebuild_->state_.load(std::memory_order_relaxed);
-    if (result.state_ == ReplicationGroupState::kReady &&
-        cluster_rebuild_ != nullptr &&
-        cluster_rebuild_->ready_token_.has_value()) {
-      result.ready_token_ = cluster_rebuild_->ready_token_;
+    std::shared_ptr<ClusterRebuildContext> context;
+    std::shared_ptr<detail::ReplicaAppliedFrontier> frontier;
+    {
+      std::lock_guard lock(state_mutex_);
+      result.state_ =
+          failed_stopped_.load(std::memory_order_relaxed)
+              ? ReplicationGroupState::kFailedStopped
+          : cluster_rebuild_ == nullptr
+              ? ReplicationGroupState::kNotReady
+              : cluster_rebuild_->state_.load(std::memory_order_relaxed);
+      if (result.state_ == ReplicationGroupState::kReady &&
+          cluster_rebuild_ != nullptr &&
+          cluster_rebuild_->ready_token_.has_value()) {
+        context = cluster_rebuild_;
+        result.ready_token_ = cluster_rebuild_->ready_token_;
+        frontier = applied_frontier_;
+      }
+      result.failure_reason_ = failure_reason_;
     }
-    result.failure_reason_ = failure_reason_;
+    // Frontier lifetime is shared with in-flight apply work. Sampling outside
+    // state_mutex_ keeps heartbeat observation off the replication hot path.
+    std::optional<std::vector<std::uint64_t>> live_snapshot;
+    if (frontier != nullptr && result.ready_token_.has_value()) {
+      auto snapshot = frontier->TrySnapshot();
+      if (snapshot.ok() &&
+          snapshot->size() == result.ready_token_->cut_vector().size() &&
+          std::equal(snapshot->begin(), snapshot->end(),
+                     result.ready_token_->cut_vector().begin(),
+                     [](std::uint64_t live, std::uint64_t cut) {
+                       return live >= cut;
+                     })) {
+        live_snapshot = std::move(*snapshot);
+      }
+    }
+    {
+      std::lock_guard lock(state_mutex_);
+      const bool still_current =
+          context != nullptr && cluster_rebuild_ == context &&
+          applied_frontier_ == frontier &&
+          context->state_.load(std::memory_order_relaxed) ==
+              ReplicationGroupState::kReady &&
+          context->ready_token_.has_value();
+      if (still_current) {
+        result.applied_next_lsns_ = std::move(live_snapshot);
+      } else if (context != nullptr) {
+        // The snapshot raced proof withdrawal or replacement. Return no
+        // Ready token/vector from the obsolete context; the next heartbeat
+        // will sample the replacement after its own readiness transition.
+        result.state_ =
+            failed_stopped_.load(std::memory_order_relaxed)
+                ? ReplicationGroupState::kFailedStopped
+            : cluster_rebuild_ == nullptr
+                ? ReplicationGroupState::kNotReady
+                : cluster_rebuild_->state_.load(std::memory_order_relaxed);
+        result.ready_token_.reset();
+        result.applied_next_lsns_.reset();
+        result.failure_reason_ = failure_reason_;
+      }
+    }
     co_return result;
   }
 
@@ -4148,13 +4175,11 @@ class ReplicationManager::ReplicationGroup {
             promotion_base.parent_frontier_.flow_cursors_.push_back(
                 source->offset_.load(std::memory_order_acquire) + 1);
           }
-        } else if (cursor_state_ != nullptr) {
-          promotion_base.parent_frontier_.flow_cursors_.reserve(
-              cursor_state_->size());
-          for (unsigned flow = 0; flow < cursor_state_->size(); ++flow) {
-            promotion_base.parent_frontier_.flow_cursors_.push_back(
-                cursor_state_->Load(flow).lsn_);
-          }
+        } else if (applied_frontier_ != nullptr) {
+          auto snapshot = applied_frontier_->TrySnapshot();
+          if (!snapshot.ok()) co_return snapshot.status();
+          promotion_base.parent_frontier_.flow_cursors_ =
+              std::move(*snapshot);
         }
         promotion_base.storage_accumulator_ = absl::StrCat(
             "role-epoch:", role_epoch_.load(std::memory_order_relaxed));
@@ -4189,7 +4214,7 @@ class ReplicationManager::ReplicationGroup {
       // An explicit topology change is not an automatic reconnect. Local
       // writes may have occurred while promoted or while following another
       // source, so none of the old per-flow cursors are safe for CONTINUE.
-      cursor_state_.reset();
+      applied_frontier_.reset();
       std::uint64_t next_epoch = 0;
       if (detached_role_epoch.has_value()) {
         next_epoch = *detached_role_epoch;
@@ -4529,8 +4554,19 @@ class ReplicationManager::ReplicationGroup {
         result.replica_repl_offset_ +=
             source->offset_.load(std::memory_order_acquire);
       }
-      if (result.redis_sources_.empty() && cursor_state_ != nullptr) {
-        result.replica_repl_offset_ = cursor_state_->total_lsn();
+      if (result.redis_sources_.empty() && applied_frontier_ != nullptr) {
+        auto snapshot = applied_frontier_->TrySnapshot();
+        if (snapshot.ok()) {
+          for (std::uint64_t next_lsn : *snapshot) {
+            if (next_lsn > std::numeric_limits<std::uint64_t>::max() -
+                               result.replica_repl_offset_) {
+              result.replica_repl_offset_ =
+                  std::numeric_limits<std::uint64_t>::max();
+              break;
+            }
+            result.replica_repl_offset_ += next_lsn;
+          }
+        }
       }
       result.replica_priority_ =
           replica_priority_.load(std::memory_order_acquire);
@@ -6514,6 +6550,7 @@ class ReplicationManager::ReplicationGroup {
     std::string requested_group;
     std::string requested_history;
     std::string applied_vector;
+    std::vector<std::uint64_t> requested_next_lsns;
     unsigned requested_flow_count = 0;
     bool resume_proof_advertised = false;
     {
@@ -6528,12 +6565,19 @@ class ReplicationManager::ReplicationGroup {
           !native_dataset_valid_.load(std::memory_order_acquire);
       requested_history =
           replacement_required ? "?" : upstream_history_id_.value_or("?");
-      applied_vector = replacement_required || cursor_state_ == nullptr
-                           ? "?"
-                           : EncodeAppliedVector(*cursor_state_);
-      if (applied_vector != "?") {
-        requested_flow_count = cursor_state_->size();
-        resume_proof_advertised = true;
+      if (!replacement_required && applied_frontier_ != nullptr) {
+        auto snapshot = applied_frontier_->TrySnapshot();
+        if (snapshot.ok()) {
+          requested_next_lsns = std::move(*snapshot);
+          applied_vector = EncodeAppliedVector(requested_next_lsns);
+          requested_flow_count =
+              static_cast<unsigned>(requested_next_lsns.size());
+          resume_proof_advertised = true;
+        } else {
+          applied_vector = "?";
+        }
+      } else {
+        applied_vector = "?";
       }
     }
     std::vector<std::string> sync_args{
@@ -6650,23 +6694,30 @@ class ReplicationManager::ReplicationGroup {
         std::make_unique<celer::CoroutineBarrier>(source_workers);
     session->fullsync_begin_complete_ =
         std::make_unique<celer::CoroutineBarrier>(source_workers);
-    // Flow count is defined by the upstream, not by this node's worker count.
-    // Build the cursor state before spawning any flow so every flow_id has a
-    // valid (lsn, fragment) pair, including when worker counts differ.
-    auto next_cursors = std::make_shared<ReplicaCursorState>(source_workers);
+    // Flow requests use one immutable control-handshake snapshot. A changed
+    // layout never inherits an old prefix; it starts at the initial cursor and
+    // the source selects FULL collectively.
+    auto initial_next_lsns = detail::InitialAppliedNextLsnsForReconnect(
+        source_workers, requested_next_lsns, local_population_matches_response);
+    if (!initial_next_lsns.ok()) {
+      session->sockets_.Remove(control_fd);
+      control.Close().IgnoreError();
+      co_return initial_next_lsns.status();
+    }
+    auto next_frontier = std::make_shared<detail::ReplicaAppliedFrontier>(
+        source_workers, storage_->worker_count());
+    absl::Status installed =
+        next_frontier->InstallNextLsns(*initial_next_lsns);
+    if (!installed.ok()) {
+      session->sockets_.Remove(control_fd);
+      control.Close().IgnoreError();
+      co_return installed;
+    }
     {
       std::lock_guard lock(state_mutex_);
-      if (cursor_state_ != nullptr) {
-        const unsigned copied = static_cast<unsigned>(
-            std::min(cursor_state_->size(), next_cursors->size()));
-        for (unsigned i = 0; i < copied; ++i) {
-          const auto cursor = cursor_state_->Load(i);
-          next_cursors->Store(i, cursor.lsn_, cursor.fragment_index_);
-        }
-      }
-      cursor_state_ = next_cursors;
-      session->cursors_ = std::move(next_cursors);
-      session->InitializeFullSyncState(source_workers);
+      applied_frontier_ = next_frontier;
+      session->applied_frontier_ = std::move(next_frontier);
+      session->InitializeFullSyncState(*initial_next_lsns);
       if (active_replica_session_ == session) {
         upstream_node_id_ = std::string(words[2]);
         group_id_ = std::string(words[3]);
@@ -6966,7 +7017,7 @@ class ReplicationManager::ReplicationGroup {
       session->Cancel();
       co_return authenticated;
     }
-    const auto cursor = session->cursors_->Load(flow_id);
+    const auto cursor = session->RequestedCursor(flow_id);
     spdlog::info(
         "replication target session {} flow {} requesting cursor={}:{}",
         session->session_id_, flow_id, cursor.lsn_, cursor.fragment_index_);
@@ -7079,11 +7130,25 @@ class ReplicationManager::ReplicationGroup {
         .db_id_ = arrival->db_id_,
         .args_ = std::move(arrival->command_args_),
     };
-
+    std::vector<detail::ReplicaAppliedFrontier::FlowApplied> frontier_updates;
+    frontier_updates.reserve(arrival->participants_.size());
     absl::Status status = absl::OkStatus();
-    for (const auto& predecessor : predecessors) {
-      status = co_await WaitForReplicaTransaction(predecessor);
-      if (!status.ok()) break;
+    for (unsigned participant : arrival->participants_) {
+      const std::uint64_t lsn = arrival->lsns_[participant];
+      if (lsn == std::numeric_limits<std::uint64_t>::max()) {
+        status = absl::OutOfRangeError(
+            "replicated transaction LSN cannot advance past UINT64_MAX");
+        break;
+      }
+      frontier_updates.push_back(
+          {.flow_id_ = participant, .applied_lsn_ = lsn});
+    }
+
+    if (status.ok()) {
+      for (const auto& predecessor : predecessors) {
+        status = co_await WaitForReplicaTransaction(predecessor);
+        if (!status.ok()) break;
+      }
     }
     // Once every participant is registered, promotion owns this apply through
     // active_transaction_applies_. Transport cancellation discards only
@@ -7094,16 +7159,14 @@ class ReplicationManager::ReplicationGroup {
             co_await MaybePauseBeforeReplicaTransactionApply(););
     if (status.ok()) status = co_await ApplyReplicatedCommand(command);
 
-    arrival->status_ = std::move(status);
-    if (arrival->status_.ok()) {
+    if (status.ok()) {
       // Cursor publication is part of the apply completion, not network ACK.
       // A role change may close the socket while this transaction is inside
       // storage; a successful commit must still enter the frozen frontier.
-      for (unsigned participant : arrival->participants_) {
-        session->cursors_->Store(participant, arrival->lsns_[participant] + 1,
-                                 0);
-      }
+      status = session->applied_frontier_->AdvanceBatchAfterApply(
+          owner, frontier_updates);
     }
+    arrival->status_ = std::move(status);
     auto& transactions = session->transaction_owners_[owner]->transactions_;
     auto found = transactions.find(arrival->id_);
     if (found != transactions.end() && found->second == arrival) {
@@ -7289,6 +7352,7 @@ class ReplicationManager::ReplicationGroup {
     std::shared_ptr<ReplicaControlArrival> arrival;
     bool apply_here = false;
     ReplicatedCommand apply_command;
+    std::vector<detail::ReplicaAppliedFrontier::FlowApplied> frontier_updates;
     {
       std::lock_guard lock(session->control_mutex_);
       if (session->cancelled()) {
@@ -7318,6 +7382,13 @@ class ReplicationManager::ReplicationGroup {
         arrival->applying_ = true;
         apply_here = true;
         apply_command = std::move(arrival->command_);
+        frontier_updates.reserve(session->source_worker_count_);
+        for (unsigned participant = 0;
+             participant < session->source_worker_count_; ++participant) {
+          frontier_updates.push_back(
+              {.flow_id_ = participant,
+               .applied_lsn_ = arrival->lsns_[participant]});
+        }
       }
     }
 
@@ -7326,19 +7397,23 @@ class ReplicationManager::ReplicationGroup {
       KEYLANE_FAULT_INJECT(status =
                                co_await MaybePauseBeforeReplicaControlApply(););
       if (status.ok()) {
+        if (std::ranges::any_of(frontier_updates, [](const auto& update) {
+              return update.applied_lsn_ ==
+                     std::numeric_limits<std::uint64_t>::max();
+            })) {
+          status = absl::OutOfRangeError(
+              "replicated control LSN cannot advance past UINT64_MAX");
+        }
+      }
+      if (status.ok()) {
         status = co_await ApplyReplicatedCommand(apply_command);
+      }
+      if (status.ok()) {
+        status = session->applied_frontier_->AdvanceBatchAfterApply(
+            celer::ThisWorker().id_, frontier_updates);
       }
       std::lock_guard lock(session->control_mutex_);
       arrival->status_ = std::move(status);
-      if (arrival->status_.ok()) {
-        // Every source flow stops at this barrier. Publish their cursors as
-        // one vector only after the DB epoch change is fully installed.
-        for (unsigned participant = 0;
-             participant < session->source_worker_count_; ++participant) {
-          session->cursors_->Store(participant, arrival->lsns_[participant] + 1,
-                                   0);
-        }
-      }
     }
 
     absl::Status completed =
@@ -7468,8 +7543,13 @@ class ReplicationManager::ReplicationGroup {
           applied = co_await ApplyReplicaControl(session, flow_id, pending.lsn_,
                                                  std::move(pending.command_));
         } else if (applied.ok()) {
-          KEYLANE_FAULT_INJECT(
-              applied = co_await MaybePauseBeforeReplicaCommandApply(););
+          if (pending.lsn_ == std::numeric_limits<std::uint64_t>::max()) {
+            applied = absl::OutOfRangeError(
+                "replicated command LSN cannot advance past UINT64_MAX");
+          }
+          KEYLANE_FAULT_INJECT(if (applied.ok()) {
+            applied = co_await MaybePauseBeforeReplicaCommandApply();
+          });
           if (applied.ok()) {
             applied = co_await ApplyReplicatedCommand(pending.command_);
           }
@@ -7487,7 +7567,12 @@ class ReplicationManager::ReplicationGroup {
         // Applied is a storage boundary. Publish the cursor here so promotion
         // can close the transport and still capture every command whose local
         // mutation completed; ACK delivery is not part of that proof.
-        session->cursors_->Store(flow_id, pending.lsn_ + 1, 0);
+        applied = session->applied_frontier_->AdvanceAfterApply(flow_id,
+                                                                pending.lsn_);
+        if (!applied.ok()) {
+          InvalidateReplicaContinuation(session);
+          co_return applied;
+        }
       }
       while (state->completions_.size() >= kOnlineCompletionCommands &&
              !state->ack_done_) {
@@ -8344,10 +8429,11 @@ class ReplicationManager::ReplicationGroup {
     {
       std::lock_guard lock(state_mutex_);
       if (active_replica_session_ != session ||
-          (require_installed_cursor && cursor_state_ != session->cursors_)) {
+          (require_installed_cursor &&
+           applied_frontier_ != session->applied_frontier_)) {
         return;
       }
-      cursor_state_.reset();
+      applied_frontier_.reset();
       upstream_history_id_.reset();
       continuation_invalidated = true;
       if (session->cluster_rebuild_ != nullptr) {
@@ -10591,7 +10677,7 @@ class ReplicationManager::ReplicationGroup {
   // roots. Every coordinator treats it as terminal for this process boot.
   std::atomic<bool> replication_shutdown_requested_{false};
   bool initial_protocol_probe_pending_ = false;  // worker 0 only
-  std::shared_ptr<ReplicaCursorState> cursor_state_;
+  std::shared_ptr<detail::ReplicaAppliedFrontier> applied_frontier_;
   std::optional<std::string> upstream_node_id_;
   std::optional<std::string> upstream_history_id_;
   std::string failure_reason_;  // guarded by state_mutex_

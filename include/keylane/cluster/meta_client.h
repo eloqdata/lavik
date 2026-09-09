@@ -83,15 +83,9 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
 control::DirectiveResultStatus ClassifyDirectiveResultStatus(
     const absl::Status& status, bool started) noexcept;
 
-// Canonical decimal encoding: `<count>:<lsn0>,...`. The count makes empty and
-// truncated vectors unambiguous; oversized observations are rejected before
-// entering a heartbeat frame.
-absl::StatusOr<std::string> EncodeCandidateFlowVector(
-    std::span<const std::uint64_t> cut_vector);
-
-// Fits the soft health/candidate observation into the protocol's mandatory
-// single-frame heartbeat. Human-readable summary text is shortened first; an
-// indivisible candidate proof is omitted rather than truncated or falsified.
+// Fits the soft health and single role payload into the mandatory one-frame
+// heartbeat. Human-readable summary text is the only truncatable field; an
+// indivisible candidate is omitted only as a defensive last resort.
 absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat);
 
 // Versioned, delimiter-safe identity used by the native rebuild adapter for
@@ -148,6 +142,13 @@ class MetaEndpointDirectory {
 // renewals to the first group.
 class MetaLeaseChallengeRotation {
  public:
+  // Owner role is independent of whether its current grant is renewable. A
+  // projected owner with an inactive grant must send no role payload instead
+  // of falling through to replica candidate reporting.
+  static bool IsCommittedOwner(
+      std::span<const control::WireDesiredGroup> groups,
+      std::string_view local_node_id) noexcept;
+
   std::optional<std::size_t> Next(
       std::span<const control::WireDesiredGroup> groups,
       std::string_view local_node_id) noexcept;

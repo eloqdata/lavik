@@ -169,9 +169,9 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
       return Invalid(absl::StrCat("group ", group.group_id,
                                   " has a partial owner identity"));
     }
-    if (group.grant_active != group.owner_node_id.has_value()) {
+    if (group.grant_active && !group.owner_node_id.has_value()) {
       return Invalid(absl::StrCat("group ", group.group_id,
-                                  " grant and serving owner disagree"));
+                                  " active grant has no serving owner"));
     }
     std::optional<NodeIndex> owner_index;
     if (group.owner_node_id.has_value()) {
@@ -216,7 +216,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
           return Invalid(absl::StrCat("group ", group.group_id,
                                       " owner assignment does not match"));
         }
-      } else if (owner_index.has_value()) {
+      } else if (group.grant_active && owner_index.has_value()) {
         nodes[node->second].primary_node_index_ = *owner_index;
       }
       nodes[node->second].config_epoch_ = group.config_epoch;
@@ -255,9 +255,10 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     }
     control_groups.push_back(std::move(control_group));
 
-    // A committed grantless/fenced group intentionally has no serving owner.
-    // Its slots remain unbound until Meta commits a fresh activation.
-    if (!source.owner_node_id.has_value()) continue;
+    // Durable owner intent remains available for heartbeat role
+    // classification while fenced. Its slots remain unbound until Meta
+    // commits a fresh activation.
+    if (!source.grant_active) continue;
     const NodeIndex primary = node_indices.at(*source.owner_node_id);
     GroupView group;
     group.group_id_ = source.group_id;

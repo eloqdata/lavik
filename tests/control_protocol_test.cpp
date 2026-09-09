@@ -153,10 +153,10 @@ TEST(ControlProtocolFrameTest, EncodesNetworkOrderAndChecksCrcAndSequence) {
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   ASSERT_EQ(encoded->size(), control::kFrameHeaderBytes + 3U);
 
-  // Header literals independently pin the v1 network-byte-order layout.
+  // Header literals independently pin the v2 network-byte-order layout.
   const std::array<unsigned char, 24> expected_prefix = {
       0x4b, 0x4c, 0x43, 0x50,                           // KLCP
-      0x00, 0x01,                                       // protocol version
+      0x00, 0x02,                                       // protocol version
       0x00, 0x01,                                       // ClientHello
       0x00, 0x00,                                       // flags
       0x00, 0x00,                                       // reserved
@@ -207,18 +207,7 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
   heartbeat.health.population_ready = true;
   heartbeat.health.draining = false;
   heartbeat.health.active_groups = 3;
-  heartbeat.candidate = control::CandidateProgress{
-      .group_id = "group-a",
-      .assignment_id = Id(4),
-      .group_term = 7,
-      .manifest_revision = 12,
-      .partition_replication_epoch = 13,
-      .replication_history_id = std::string(40, 'b'),
-      .applied_flow_vector = "3:10,20,30",
-      .backlog_coverage = "complete",
-      .readiness = "ready",
-  };
-  heartbeat.challenge = control::LeaseChallenge{
+  const control::LeaseChallenge challenge{
       .nonce = Id(2),
       .projection_hash = Sha256("projection"),
       .group_id = "group-a",
@@ -227,6 +216,8 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
       .authority_version = 8,
       .grant_revision = 11,
   };
+  heartbeat.role_information =
+      control::AuthorityLeaseRequest{.challenge = challenge};
 
   control::WireMessage message = heartbeat;
   auto encoded = control::EncodeMessage(message);
@@ -241,17 +232,17 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
   ack.heartbeat_sequence = heartbeat.heartbeat_sequence;
   ack.observation_status = control::ObservationStatus::kAccepted;
   ack.lease_decision = control::LeaseGranted{
-      .nonce = heartbeat.challenge->nonce,
+      .nonce = challenge.nonce,
       .leader_id = 4,
       .raft_term = 22,
       .leadership_generation = 5,
       .data_boot_id = std::string(40, 'a'),
-      .projection_hash = heartbeat.challenge->projection_hash,
-      .group_id = heartbeat.challenge->group_id,
-      .assignment_id = heartbeat.challenge->assignment_id,
-      .group_term = heartbeat.challenge->group_term,
-      .authority_version = heartbeat.challenge->authority_version,
-      .grant_revision = heartbeat.challenge->grant_revision,
+      .projection_hash = challenge.projection_hash,
+      .group_id = challenge.group_id,
+      .assignment_id = challenge.assignment_id,
+      .group_term = challenge.group_term,
+      .authority_version = challenge.authority_version,
+      .grant_revision = challenge.grant_revision,
       .granted_duration_ms = 3'000,
   };
   encoded = control::EncodeMessage(control::WireMessage{ack});
@@ -261,15 +252,108 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
   EXPECT_EQ(std::get<control::HeartbeatAck>(*decoded), ack);
 
   ack.lease_decision = control::LeaseDenied{
-      .nonce = heartbeat.challenge->nonce,
+      .nonce = challenge.nonce,
       .reason = control::LeaseDenialReason::kAuthorityHandoffPending,
-      .current_projection_hash = heartbeat.challenge->projection_hash,
+      .current_projection_hash = challenge.projection_hash,
   };
   encoded = control::EncodeMessage(control::WireMessage{ack});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   decoded = control::DecodeMessage(MessageType::kHeartbeatAck, *encoded);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::HeartbeatAck>(*decoded), ack);
+}
+
+TEST(ControlProtocolCodecTest, RoundTripsTypedReplicaCandidate) {
+  control::Heartbeat heartbeat;
+  heartbeat.session_id = Id(1);
+  heartbeat.heartbeat_sequence = 10;
+  heartbeat.health.storage_ready = true;
+  heartbeat.health.population_ready = true;
+  heartbeat.role_information = control::ReplicaCandidate{
+      .progress =
+          {
+              .group_id = "group-a",
+              .assignment_id = Id(4),
+              .group_term = 7,
+              .manifest_revision = 12,
+              .manifest_digest = Sha256("manifest"),
+              .partition_replication_epoch = 13,
+              .source_node_id = std::string(40, 'a'),
+              .source_assignment_id = Id(5),
+              .source_boot_id = std::string(40, 'b'),
+              .source_history_id = std::string(40, 'c'),
+              .applied_next_lsns = {10, 20, 30},
+          },
+  };
+
+  auto encoded =
+      control::EncodeMessage(control::WireMessage{heartbeat});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded = control::DecodeMessage(MessageType::kHeartbeat, *encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(std::get<control::Heartbeat>(*decoded), heartbeat);
+}
+
+TEST(ControlProtocolCodecTest, RejectsMalformedTypedCandidateAndRoleTag) {
+  control::Heartbeat heartbeat;
+  heartbeat.heartbeat_sequence = 1;
+  heartbeat.role_information = control::ReplicaCandidate{
+      .progress =
+          {
+              .group_id = "group-a",
+              .assignment_id = Id(4),
+              .group_term = 7,
+              .manifest_revision = 12,
+              .manifest_digest = Sha256("manifest"),
+              .partition_replication_epoch = 13,
+              .source_node_id = std::string(40, 'a'),
+              .source_assignment_id = Id(5),
+              .source_boot_id = std::string(40, 'b'),
+              .source_history_id = std::string(40, 'c'),
+              .applied_next_lsns = {10},
+          },
+  };
+  auto encoded = control::EncodeMessage(control::WireMessage{heartbeat});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+
+  std::string zero_cursor = *encoded;
+  std::fill(zero_cursor.end() - 8, zero_cursor.end(), '\0');
+  EXPECT_EQ(control::DecodeMessage(MessageType::kHeartbeat, zero_cursor)
+                .status()
+                .code(),
+            absl::StatusCode::kInvalidArgument);
+
+  std::string trailing = *encoded;
+  trailing.push_back('\0');
+  EXPECT_EQ(control::DecodeMessage(MessageType::kHeartbeat, trailing)
+                .status()
+                .code(),
+            absl::StatusCode::kInvalidArgument);
+
+  control::Heartbeat no_role;
+  no_role.heartbeat_sequence = 2;
+  encoded = control::EncodeMessage(control::WireMessage{no_role});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  encoded->back() = static_cast<char>(99);
+  EXPECT_EQ(control::DecodeMessage(MessageType::kHeartbeat, *encoded)
+                .status()
+                .code(),
+            absl::StatusCode::kInvalidArgument);
+
+  auto* candidate =
+      std::get_if<control::ReplicaCandidate>(&heartbeat.role_information);
+  ASSERT_NE(candidate, nullptr);
+  candidate->progress.applied_next_lsns.clear();
+  EXPECT_EQ(control::EncodeMessage(control::WireMessage{heartbeat})
+                .status()
+                .code(),
+            absl::StatusCode::kResourceExhausted);
+  candidate->progress.applied_next_lsns.assign(
+      control::kMaxCandidateFlows + 1, 1);
+  EXPECT_EQ(control::EncodeMessage(control::WireMessage{heartbeat})
+                .status()
+                .code(),
+            absl::StatusCode::kResourceExhausted);
 }
 
 TEST(ControlProtocolCodecTest, HeartbeatReplayIsExactAndGapFree) {

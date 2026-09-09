@@ -24,7 +24,7 @@
 namespace keylane::cluster::control {
 
 inline constexpr std::uint32_t kFrameMagic = 0x4b4c4350;  // "KLCP"
-inline constexpr std::uint16_t kProtocolVersion = 1;
+inline constexpr std::uint16_t kProtocolVersion = 2;
 inline constexpr std::size_t kFrameHeaderBytes = 28;
 inline constexpr std::size_t kMaxFrameBytes = 16u * 1024u;
 inline constexpr std::size_t kMaxFramePayloadBytes =
@@ -54,6 +54,7 @@ inline constexpr std::size_t kMaxProjectedGroups = 512;
 inline constexpr std::size_t kMaxManifestEntries = 16384;
 inline constexpr std::size_t kMaxProjectedPolicies = 4096;
 inline constexpr std::size_t kMaxProjectedDirectives = 4096;
+inline constexpr std::size_t kMaxCandidateFlows = 1024;
 
 using WireId128 = std::array<std::uint8_t, 16>;
 using WireHash256 = std::array<std::uint8_t, 32>;
@@ -65,7 +66,7 @@ absl::StatusOr<std::string> GenerateIdentity160();
 absl::StatusOr<WireId128> GenerateId128();
 bool IsCanonicalIdentity160(std::string_view identity) noexcept;
 
-// SHA-256 is the object-integrity algorithm fixed by protocol v1.
+// SHA-256 is the object-integrity algorithm fixed by this protocol family.
 WireHash256 ComputeSha256(std::string_view bytes) noexcept;
 
 enum class MessageType : std::uint16_t {
@@ -293,21 +294,22 @@ struct HeartbeatHealth {
                          const HeartbeatHealth&) = default;
 };
 
-// Latest boot-scoped candidate proof piggybacked on the heartbeat. These
-// fields remain volatile observations on Meta: the member assignment, term,
-// manifest revision, and partition replication epoch anchor freshness, while
-// the history and progress strings describe only the currently connected
-// data-node incarnation.
+// Latest boot-scoped candidate proof piggybacked on a replica heartbeat. Meta
+// derives the reporter boot and local history from the authenticated session;
+// source_* names the completed rebuild lineage and must not be conflated with
+// that reporter-local history.
 struct CandidateProgress {
   std::string group_id;
   WireId128 assignment_id{};
   std::uint64_t group_term = 0;
   std::uint64_t manifest_revision = 0;
+  WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
-  std::string replication_history_id;
-  std::string applied_flow_vector;
-  std::string backlog_coverage;
-  std::string readiness;
+  std::string source_node_id;
+  WireId128 source_assignment_id{};
+  std::string source_boot_id;
+  std::string source_history_id;
+  std::vector<std::uint64_t> applied_next_lsns;
 
   friend bool operator==(const CandidateProgress&,
                          const CandidateProgress&) = default;
@@ -326,12 +328,36 @@ struct LeaseChallenge {
                          const LeaseChallenge&) = default;
 };
 
+struct NoRoleInformation {
+  friend bool operator==(const NoRoleInformation&,
+                         const NoRoleInformation&) = default;
+};
+
+struct AuthorityLeaseRequest {
+  LeaseChallenge challenge;
+
+  friend bool operator==(const AuthorityLeaseRequest&,
+                         const AuthorityLeaseRequest&) = default;
+};
+
+struct ReplicaCandidate {
+  CandidateProgress progress;
+
+  friend bool operator==(const ReplicaCandidate&,
+                         const ReplicaCandidate&) = default;
+};
+
+// Exactly one role-specific payload follows common heartbeat health. The
+// installed FDS remains authoritative: Meta validates this tag against the
+// committed owner/member assignment before using either payload.
+using HeartbeatRoleInformation =
+    std::variant<NoRoleInformation, AuthorityLeaseRequest, ReplicaCandidate>;
+
 struct Heartbeat {
   WireId128 session_id{};
   std::uint64_t heartbeat_sequence = 0;
   HeartbeatHealth health;
-  std::optional<CandidateProgress> candidate;
-  std::optional<LeaseChallenge> challenge;
+  HeartbeatRoleInformation role_information = NoRoleInformation{};
 
   friend bool operator==(const Heartbeat&, const Heartbeat&) = default;
 };
@@ -602,7 +628,8 @@ struct WireDataEndpoint {
 
 struct WireDesiredMember {
   // Membership incarnation only. WireDesiredGroup's committed owner identity
-  // is the sole serving-role truth; a redundant role byte could contradict it.
+  // classifies heartbeat role; serving additionally requires grant_active. A
+  // redundant member-role byte could contradict those facts.
   std::string node_id;
   WireId128 assignment_id{};
 
@@ -620,8 +647,9 @@ struct WireSlotRange {
 struct WireDesiredGroup {
   std::string group_id;
   std::vector<WireDesiredMember> members;
-  // Grantless/fenced groups have neither owner field. Presence must match;
-  // there is no all-zero identity sentinel in the 128-bit id space.
+  // A fenced group may retain both owner fields for role classification even
+  // though grant_active is false. Presence must match; there is no all-zero
+  // identity sentinel in the 128-bit id space.
   std::optional<std::string> owner_node_id;
   std::optional<WireId128> owner_assignment_id;
   std::uint64_t group_term = 0;

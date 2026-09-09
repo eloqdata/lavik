@@ -495,6 +495,25 @@ TEST(MetaControlProjector,
 }
 
 TEST(MetaControlProjector,
+     FencedGroupProjectsCommittedOwnerRoleWithoutAnActiveGrant) {
+  Fixture fixture = CompleteFixture();
+
+  keylane::meta::RevokeGrant revoke;
+  revoke.request_id_ = Bytes<16>(0x78);
+  revoke.group_id_ = "group-a";
+  revoke.expected_term_ = 1;
+  Commit(fixture.stores, 21, revoke);
+
+  const auto projected = MetaControlProjector::ProjectNode(
+      MetaCommittedView(std::move(fixture.stores), 21), fixture.source);
+  ASSERT_TRUE(projected.ok()) << projected.status();
+  const control::WireDesiredGroup& group = projected->full_state.groups[0];
+  EXPECT_FALSE(group.grant_active);
+  EXPECT_EQ(group.owner_node_id, fixture.target);
+  EXPECT_EQ(group.owner_assignment_id, fixture.target_assignment);
+}
+
+TEST(MetaControlProjector,
      RoutesSourceActionsToSourceWithoutRebindingTheRebuildTarget) {
   Fixture fixture = CompleteFixture();
   const auto operation =

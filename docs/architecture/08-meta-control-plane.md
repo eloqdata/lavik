@@ -143,7 +143,7 @@ and live directives whose explicit
 recipient is that node. The source applied index is an ordering/diagnostic
 watermark; SHA-256 of the canonical semantic projection is the dependency used
 by leases and directives. The publisher sends a full projection on session
-acceptance and whenever that hash changes. Protocol v1 has no delta format, so
+acceptance and whenever that hash changes. Control protocol v2 has no delta format, so
 an index advance with identical content does not create network churn and a
 reconnect never depends on retained incremental history.
 
@@ -194,21 +194,29 @@ permit follows shared ownership through transfer and live installation, so
 4096 small sessions remain possible while a few abuse-sized projections cannot
 multiply common topology and manifest data into a TiB-scale allocation.
 
-Heartbeat is the periodic Data-to-Meta observation message. It contains
-health, optional boot-scoped candidate progress, and at most one lease
-challenge. A session accepts only the next business sequence or an exact replay
+Heartbeat is the periodic Data-to-Meta observation message. Protocol v2 carries
+common health followed by exactly one tagged role payload: no role information,
+an authority lease request, or replica candidate progress. A session accepts
+only the next business sequence or an exact replay
 of the previous heartbeat; an exact replay gets the cached exact ack. Data
 quiesces heartbeat projection reads during an FDS replacement. Any outstanding
 ack for the old object is consumed without applying its lease decision, and
 production resumes only after the new object is acknowledged.
 Candidate progress names the authenticated reporter's exact committed member
-assignment, term, manifest, partition replication epoch, and boot history.
+assignment, term, manifest revision and digest, partition replication epoch,
+completed rebuild source lineage, and typed next-LSN vector.
 Meta rejects reports from active nodes that are not members of the named group
 and old assignment proofs after remove/re-add; group queries retain the
-reporter identity with each proof. Health/candidate ingestion is independent
-of challenge validation, so a bad
-renewal request cannot hide useful liveness evidence. Candidate history is
-bound to the history announced in `ClientHello` for that boot session.
+reporter identity with each proof. Reporter-local history is bound to the
+history announced in `ClientHello`; source history in candidate progress is an
+independent lineage anchor. Health ingestion is independent of challenge
+validation, so a bad renewal request cannot hide useful liveness evidence.
+Meta derives role from committed FDS facts rather than trusting the tag, and
+replaces common health plus candidate state under one observation-store lock.
+An authority/no-role heartbeat, or rejected candidate, clears any older
+candidate for that node. Session teardown also withdraws the exact
+generation's candidate immediately; a stale teardown cannot clear evidence
+from a replacement generation.
 Challenges name the exact projection and complete group authority anchor.
 Meta grants only while it remains the caught-up leader, and caps duration at
 both committed policy and the configured leadership-validity bound. An
@@ -284,8 +292,10 @@ committed subscription. Admission authenticates the tuple `(node identity,
 boot incarnation, controller-local session generation)` and accepts only the
 current generation. A new generation atomically removes the node's older
 observations. Candidate progress must match committed node/group/assignment,
-term, manifest, and partition replication epoch state, while its history is
-bound to the authenticated session's `ClientHello`. Operation evidence also
+term, manifest revision and digest, and partition replication epoch state.
+The compatibility `history` field remains reporter-local; the internal
+selector uses the separately stored source assignment, boot, and history.
+Operation evidence also
 matches the committed operation and its replication-history binding. The
 typed candidate/evidence query results include the authenticated reporter boot
 alongside node and assignment, so a reconciler never joins a payload to a
@@ -311,9 +321,26 @@ retained variable fields and their lookup-key copies: the global 68 MiB budget
 is one direct frame plus identifier allowance per maximum node, while a node's
 289 KiB share holds one maximum streamed evidence object, one heartbeat frame,
 and its index allowance. Replacement, generation purge, revalidation, TTL
-expiry, and leader reset update the same counters. A capacity rejection keeps
-the previous latest-wins value and can delay reconciliation, but soft state
-cannot grant or restore authority.
+expiry, and leader reset update the same counters. Ordinary diagnostic
+ingestion keeps its previous latest-wins value on capacity rejection.
+Heartbeat candidate replacement is stricter: it clears old role evidence
+before admitting the replacement. Soft state cannot grant or restore
+authority.
+
+`CandidatePlanFor` is an internal, read-only function seam rather than an
+administrative command or RPC. At one fixed receive-time cut it selects only
+current-session, current-boot, Ready, healthy, non-draining replicas whose
+assignment and population anchors still match committed facts. Each report has
+a non-extendable TTL deadline; planning does not depend on a global observation
+revision, so unrelated heartbeats cannot restart the calculation. Exact
+manifest/source lineage and flow dimension define a compatibility domain;
+multiple domains stop the plan. Within one domain the selector removes vectors
+strictly dominated component-by-component. A unique greatest vector wins,
+equal greatest vectors choose the lowest node id, and incomparable maxima choose
+the lowest envelope-deficit tuple `(sum as uint128, max, node id)`. The latter
+is an explicit best-effort data-loss policy, not a claim of a lossless latest
+node. The self-contained result is returned immediately; this layer adds no
+yield/resume revalidation lifecycle.
 
 ## Durability and recovery
 
@@ -437,6 +464,7 @@ transition into or out of disabled mode.
 |---|---|
 | Public Meta boundaries, commands, store composition, and correctness contracts | `include/keylane/meta/` |
 | Deterministic apply, stores, coordinator, observations, and administrative protocol implementations | `src/meta/` |
+| Volatile candidate replacement and internal deterministic plan selection | `include/keylane/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/keylane/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | Pure per-node projection and leader-scoped Data-session publisher | `include/keylane/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/keylane/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
 | Shared Meta/Data frame, object-transfer, and message formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |

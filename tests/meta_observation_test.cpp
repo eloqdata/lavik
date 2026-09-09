@@ -6,7 +6,7 @@
 // nodes, stale/future session generations, boot mismatch, old/future/exact
 // group terms, manifest or partition-replication-epoch mismatch, unbound
 // history, unknown/terminal
-// operations, generation-adoption purge, commit-driven revalidation with
+// operations, disconnect/generation-adoption purge, commit-driven revalidation with
 // read-path re-filtering, TTL expiry, entry/domain/byte capacity bounds, exact
 // resource accounting across every removal path, and the audit ring.
 
@@ -61,6 +61,13 @@ class FakeCommittedFacts : public MetaCommittedFacts {
     const auto it = group_manifests_.find(std::string(group_id));
     return it != group_manifests_.end() ? it->second : 0;
   }
+  keylane::meta::MetaHash256 CurrentPopulationManifestDigest(
+      std::string_view group_id) const override {
+    const auto it = group_manifest_digests_.find(std::string(group_id));
+    return it != group_manifest_digests_.end()
+               ? it->second
+               : keylane::meta::MetaHash256{};
+  }
   std::uint64_t CurrentPartitionReplicationEpoch(
       std::string_view group_id) const override {
     const auto it = group_partition_epochs_.find(std::string(group_id));
@@ -71,6 +78,13 @@ class FakeCommittedFacts : public MetaCommittedFacts {
     const auto it =
         assignments_.find({std::string(group_id), std::string(node_id)});
     return it != assignments_.end() && it->second == assignment_id;
+  }
+  bool IsOwnerAssignment(
+      std::string_view group_id, std::string_view node_id,
+      const MetaAssignmentId& assignment_id) const override {
+    const auto it = owners_.find(std::string(group_id));
+    return it != owners_.end() && it->second == node_id &&
+           AssignmentMatches(group_id, node_id, assignment_id);
   }
   bool OperationNonTerminal(const MetaOperationId& id) const override {
     return nonterminal_ops_.contains(id);
@@ -83,6 +97,9 @@ class FakeCommittedFacts : public MetaCommittedFacts {
   }
 
   std::set<std::string> active_nodes_;
+  std::map<std::string, keylane::meta::MetaHash256>
+      group_manifest_digests_;
+  std::map<std::string, std::string> owners_;
   std::map<std::string, std::uint64_t> group_terms_;
   std::map<std::string, std::uint64_t> group_manifests_;
   std::map<std::string, std::uint64_t> group_partition_epochs_;
@@ -361,6 +378,28 @@ TEST(MetaObservationStore, NewGenerationAtomicallyPurgesOldObservations) {
   EXPECT_EQ(store.size(), 3);
 }
 
+TEST(MetaObservationStore,
+     ExactSessionDisconnectImmediatelyWithdrawsOnlyItsCandidate) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  const MetaObservationIdentity current = Ident("n1", 0x0a, 2);
+  ASSERT_TRUE(store.AdoptSession(current, 1000).ok());
+  ASSERT_TRUE(store.Ingest(BootObs(current), facts, 1000).ok());
+  ASSERT_TRUE(store.Ingest(HealthObs(current), facts, 1001).ok());
+  ASSERT_TRUE(store
+                  .Ingest(CandidateObs(current, "g1", 3, 7, 42), facts, 1002)
+                  .ok());
+
+  store.InvalidateCandidateOnDisconnect(Ident("n1", 0x0a, 1), 1003);
+  ASSERT_EQ(store.CandidateProgressFor("g1", facts).size(), 1u);
+
+  store.InvalidateCandidateOnDisconnect(current, 1004);
+  EXPECT_TRUE(store.CandidateProgressFor("g1", facts).empty());
+  EXPECT_EQ(store.size(), 2u);
+  EXPECT_TRUE(
+      RingHas(store, MetaObsAuditKind::kStalePurged, "session-disconnected"));
+}
+
 TEST(MetaObservationStore, LeadershipChangeDropsSessionsAndAllSoftState) {
   MetaObservationStore store;
   FakeCommittedFacts facts = MakeFreshFacts();
@@ -480,6 +519,27 @@ TEST(MetaObservationStore,
   EXPECT_EQ(candidates.front().assignment_id_, Assignment(0x31));
   EXPECT_TRUE(
       RingHas(store, MetaObsAuditKind::kRejected, "assignment-mismatch"));
+}
+
+TEST(MetaObservationStore, CommittedOwnerCannotRemainACandidate) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  facts.owners_["g1"] = "n1";
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+
+  MetaObservation candidate =
+      CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42);
+  auto& payload = std::get<MetaCandidateProgressObs>(candidate.payload_);
+  payload.source_node_id_ = std::string(40, 'f');
+  payload.source_assignment_id_ = Assignment(0xf1);
+  payload.source_boot_incarnation_ = Boot(0xf2);
+  payload.source_replication_history_id_ = History(0xf3);
+  payload.applied_next_lsns_ = {10};
+  payload.storage_ready_ = true;
+  payload.population_ready_ = true;
+  ExpectDomainReject(store.Ingest(std::move(candidate), facts, 1001));
+  EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kRejected,
+                      "candidate-is-committed-owner"));
 }
 
 TEST(MetaObservationStore,

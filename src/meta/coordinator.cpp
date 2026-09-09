@@ -166,6 +166,13 @@ uint64_t MetaStoresFacts::CurrentPopulationManifestRevision(
   return group.has_value() ? group->record_.population_manifest_revision_ : 0;
 }
 
+MetaHash256 MetaStoresFacts::CurrentPopulationManifestDigest(
+    std::string_view group_id) const {
+  const auto group = stores_.topology_.FindGroup(std::string(group_id));
+  return group.has_value() ? group->record_.population_manifest_digest_
+                           : MetaHash256{};
+}
+
 uint64_t MetaStoresFacts::CurrentPartitionReplicationEpoch(
     std::string_view group_id) const {
   const auto group = stores_.topology_.FindGroup(std::string(group_id));
@@ -177,6 +184,18 @@ bool MetaStoresFacts::AssignmentMatches(
     const MetaAssignmentId& assignment_id) const {
   const auto group = stores_.topology_.FindGroup(std::string(group_id));
   return group.has_value() &&
+         std::any_of(group->members_.begin(), group->members_.end(),
+                     [&](const MetaGroupMember& member) {
+                       return member.node_id_ == node_id &&
+                              member.assignment_id_ == assignment_id;
+                     });
+}
+
+bool MetaStoresFacts::IsOwnerAssignment(
+    std::string_view group_id, std::string_view node_id,
+    const MetaAssignmentId& assignment_id) const {
+  const auto group = stores_.topology_.FindGroup(std::string(group_id));
+  return group.has_value() && group->record_.owner_ == node_id &&
          std::any_of(group->members_.begin(), group->members_.end(),
                      [&](const MetaGroupMember& member) {
                        return member.node_id_ == node_id &&

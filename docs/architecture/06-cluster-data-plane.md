@@ -274,7 +274,7 @@ structural object can therefore be rejected below its wire cap, and aggregate
 normal projections cannot multiply the global topology into TiB-scale output
 ownership.
 
-Protocol v1 has no delta format. Initial connection, reconnection, and every
+Control protocol v2 has no delta format. Initial connection, reconnection, and every
 semantic projection change transfer a complete `FullDesiredState`. The object
 contains global topology plus each group's partition replication epoch and the
 receiving node's policies, immutable population manifests, and current
@@ -288,21 +288,34 @@ state before one publication; partial transfer never changes serving state. A
 group's partition replication epoch cannot regress even when the global
 topology epoch advances.
 Membership entries carry node and assignment identities only. The committed
-group owner and matching owner assignment are the sole serving-role truth;
-protocol v1 has no redundant member-role field that could disagree with them.
+group owner and matching owner assignment are projected independently from
+the active-grant bit: they classify the heartbeat role while `grant_active`
+alone authorizes serving. Protocol v2 has no redundant member-role field that
+could disagree with them.
 
-Heartbeat carries health, the latest boot-scoped candidate progress when a
-ready population exists, and at most one lease challenge. Candidate progress
-includes the exact local membership assignment, manifest, and partition
-replication epoch under which the population became ready. Candidate and health
-are volatile Meta observations, not Raft commands. The challenge names the
+Heartbeat carries common health followed by exactly one tagged role payload:
+no role information, an authority lease request, or replica candidate
+progress. A committed owner with an active renewable grant sends only the
+lease request; without one it sends no role information and never falls
+through to candidate reporting. A non-owner member with a coherent live Ready
+frontier sends only candidate progress. Candidate
+progress includes the exact local membership assignment, manifest revision and
+digest, partition replication epoch, completed rebuild source lineage, and a
+typed bounded next-LSN vector sampled after successful apply. Candidate and
+health are volatile Meta observations, not Raft commands. The challenge names the
 exact projection and complete group authority anchor. `sent_at` is captured
 immediately before the first socket write, and the granted duration is applied
 to that monotonic timestamp, so a delayed response cannot extend authority.
 Business heartbeat sequences accept only the next message or an exact replay
 of the preceding message; the latter receives the cached exact ack. Invalid
-challenge content changes only the lease decision and cannot suppress the
-independent health/progress observation.
+challenge content changes only the lease decision and cannot suppress common
+health observation. Meta derives role from the installed committed projection,
+not from the payload tag; an authority/no-role heartbeat atomically clears any
+candidate left from the same node's prior replica role. The authenticated
+session completion path immediately withdraws the exact generation's
+candidate. Generation replacement, boot replacement, committed freshness
+changes, and Meta leadership changes independently invalidate it, so the
+selector never waits for TTL after a known disconnect or role change.
 
 An FDS replacement quiesces the heartbeat producer before publishing the new
 controller projection. A heartbeat already written under the old projection
@@ -325,6 +338,10 @@ fails the session.
 Meta's typed candidate/evidence query results retain that authenticated boot
 beside the reporter and assignment, so later directive/evidence construction
 never has to race a second session lookup.
+Reporter-local history remains the compatibility diagnostic `history` value.
+The candidate's source boot, assignment, and history are independent fields;
+only equal source lineages and equal population anchors/flow dimensions form a
+comparison domain.
 
 A committed slot-map cut cannot reuse an existing grant. Meta rejects a slot
 ownership or config-epoch change while any affected source or destination

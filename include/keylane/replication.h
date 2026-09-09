@@ -157,6 +157,10 @@ struct ClusterPopulationStatus {
   std::string local_boot_id_;
   ReplicationGroupState state_ = ReplicationGroupState::kNotReady;
   std::optional<ReadyToken> ready_token_;
+  // A best-effort coherent snapshot of the live next-unapplied LSN frontier.
+  // It is present only when the Ready population and frontier still agree;
+  // heartbeat construction omits candidate evidence when sampling is busy.
+  std::optional<std::vector<std::uint64_t>> applied_next_lsns_;
   // Nonempty exactly while state_ is kFailedStopped.
   std::string failure_reason_;
 };

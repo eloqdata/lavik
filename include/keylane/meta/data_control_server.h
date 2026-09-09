@@ -176,17 +176,16 @@ struct MetaHeartbeatObservationResult {
   std::string detail;
 };
 
-// Ingests the independently useful boot, health, and optional candidate
-// reports carried by one authenticated heartbeat at one receive timestamp.
-// Candidate history is bound to the history declared by ClientHello for this
-// session. A rejected candidate never rolls back the boot or health reports;
-// status and detail aggregate all rejected components for the wire Ack.
+// Atomically replaces boot, health, and role-derived candidate state from one
+// authenticated heartbeat. The reporter history comes from ClientHello; the
+// candidate payload carries an independent rebuild-source lineage. Authority
+// and no-role payloads clear any prior candidate for the node.
 MetaHeartbeatObservationResult IngestHeartbeatObservations(
     MetaObservationStore& observations, const MetaCommittedFacts& facts,
     std::string_view node_id, const MetaBootIncarnation& boot,
     const MetaReplicationHistoryId& session_history, std::uint64_t generation,
     const cluster::control::HeartbeatHealth& health,
-    const std::optional<cluster::control::CandidateProgress>& candidate,
+    const cluster::control::HeartbeatRoleInformation& role_information,
     std::int64_t now_unix_ms);
 
 // Validates a typed operation-evidence envelope against the authenticated
