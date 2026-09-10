@@ -1507,8 +1507,14 @@ struct MetaControlClientService::Impl {
       bool started) {
     const absl::Status status = applied.ok() ? absl::OkStatus()
                                              : applied.status();
-    const std::string result = applied.ok() ? *applied
-                                            : std::string(status.message());
+    const bool promotion =
+        directive.kind == control::WireDirectiveKind::kPromotionPrepare;
+    // Status-only directives retain their v1 terminal bytes. Only promotion
+    // owns an opaque typed success result, so extending the completion seam
+    // must not change rebuild/source receipt hashes during a rolling upgrade.
+    const std::string result = applied.ok()
+                                   ? (promotion ? *applied : std::string("ok"))
+                                   : std::string(status.message());
     control::DirectiveResult response{
         .session_id = directive.session_id,
         .recipient_boot_id = directive.recipient_boot_id,
@@ -1560,14 +1566,14 @@ struct MetaControlClientService::Impl {
         }
         result = co_await SendDirectiveCompleted(*state->writer_, directive);
         if (result.ok() && completion.started()) {
-          std::string terminal_evidence = terminal->ok()
-                                              ? **terminal
-                                              : std::string(
-                                                    terminal->status().message());
+          const bool promotion =
+              directive.kind == control::WireDirectiveKind::kPromotionPrepare;
+          std::string terminal_evidence =
+              terminal->ok()
+                  ? (promotion ? **terminal : std::string("succeeded"))
+                  : std::string(terminal->status().message());
           const std::string_view terminal_phase =
-              directive.kind == control::WireDirectiveKind::kPromotionPrepare
-                  ? "prepared"
-                  : "completed";
+              promotion ? "prepared" : "completed";
           result = co_await SendOperationEvidence(
               *state->writer_,
               EvidenceForDirective(directive, terminal_phase,

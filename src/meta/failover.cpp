@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -409,8 +410,28 @@ absl::Status ValidateFailoverProposal(
   if (transition == nullptr) return absl::OkStatus();
   const auto operation =
       view.operation().FindOperation(transition->operation_id_);
-  if (!operation.has_value() || operation->kind_ != kFailoverOperationKind) {
+  if (!operation.has_value()) {
     return absl::OkStatus();
+  }
+  const auto is_promotion_prepare = [](const auto& directive) {
+    if constexpr (std::is_same_v<std::decay_t<decltype(directive)>,
+                                 MetaCurrentDirective>) {
+      return directive.spec_.kind_ == "promotion-prepare";
+    } else {
+      return directive.kind_ == "promotion-prepare";
+    }
+  };
+  const bool owns_promotion_prepare =
+      std::any_of(transition->current_directives_.begin(),
+                  transition->current_directives_.end(),
+                  is_promotion_prepare) ||
+      std::any_of(operation->current_directives_.begin(),
+                  operation->current_directives_.end(), is_promotion_prepare);
+  if (operation->kind_ != kFailoverOperationKind) {
+    return owns_promotion_prepare
+               ? Invalid(
+                     "promotion-prepare belongs only to a failover operation")
+               : absl::OkStatus();
   }
   if (view.operation().TransitionAlreadyApplied(*transition)) {
     return absl::OkStatus();

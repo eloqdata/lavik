@@ -137,6 +137,29 @@ TEST(MetaFailoverValidationTest,
 }
 
 TEST(MetaFailoverValidationTest,
+     RejectsPromotionPrepareOwnedByAnotherOperationKind) {
+  MetaObservationStore observations;
+  MetaStores stores;
+  SubmitOperation submit;
+  submit.operation_id_ = Bytes<16>(9);
+  submit.kind_ = "maintenance";
+  submit.intent_ = "opaque";
+  submit.intent_hash_ = MetaSha256(submit.intent_);
+  submit.replication_history_id_ = Bytes<20>(7);
+  ASSERT_TRUE(stores.operation_.SubmitOperation(submit, 1).ok());
+
+  TransitionOperationPhase transition;
+  transition.operation_id_ = submit.operation_id_;
+  transition.current_directives_.push_back(
+      MetaDirectiveSpec{.kind_ = "promotion-prepare"});
+  EXPECT_EQ(MetaFailureClassOf(
+                ValidateFailoverProposal(MetaCommand(transition),
+                                         MetaCommittedView(stores, 1),
+                                         observations)),
+            MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
      AcceptsOrderedPrepareAndExactPreparedReceiptEvidence) {
   const FailoverIntent failover = Intent();
   MetaObservationStore observations;
