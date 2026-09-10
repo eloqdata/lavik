@@ -89,8 +89,9 @@ and impossible apply ordering fail stop. Replaying the same entry at the same
 index is idempotent and produces the same verdict and audit record;
 correctness does not depend on apply running only once.
 
-Failover uses one top-level durable operation whose intent and phase blobs have
-strict versioned codecs. The #40 graph ends at `promotion-prepared`:
+Failover preparation uses one top-level durable operation whose intent and
+phase blobs have strict versioned codecs. The implemented graph ends at
+`promotion-prepared`:
 old authority excluded, candidate caught up, promotion preparing, then
 promotion prepared. A registered proposal-validation hook forbids skipped or
 repeated phases, changes to earlier exclusion/frontier proofs, and any prepare
@@ -98,7 +99,7 @@ before the committed group is fenced and grantless. The preparing phase owns
 one current `promotion-prepare` directive; the prepared phase clears it only
 after the exact successful terminal receipt and matching evidence summary are
 committed under the same operation id. Authority activation and serving phases
-are reserved for the later failover reconciler and are rejected by this graph.
+are outside the preparation graph and are rejected by its validator.
 
 All model collections, command fields, snapshots, active operations, archived
 summaries, policy bytes, and the audit window have explicit bounds. An
@@ -318,11 +319,14 @@ content-hash data closes it.
 For promotion prepare, terminal success is opaque only to the generic journal:
 the Failover validator decodes `PromotionPreparedEvidence`, requires its parent
 history and frozen frontier to satisfy the current phase, and requires the
-same hash in the evidence summary and successful terminal receipt. This is the
-Raft boundary between Data-local prepare and later authority activation. A
-control stream may remain connected across it, but Data must receive later
-committed FDS/lease authority before local activation; no single RPC may cross
-the commit point on Meta's behalf.
+same bytes and hash in a successful terminal receipt and a TTL-fresh operation
+observation from the candidate's current boot/session before constructing the
+durable evidence summary. The evidence query applies the TTL boundary itself;
+it does not rely on a periodic cleanup sweep. This is the Raft boundary between
+Data-local prepare and later authority activation. A control stream may remain
+connected across it, but Data must receive later committed FDS/lease authority
+before local activation; no single RPC may cross the commit point on Meta's
+behalf.
 
 `MetaObservationStore` is deliberately outside `MetaStores`: it is volatile,
 leader-local evidence and is never encoded into a command, WAL, snapshot, or

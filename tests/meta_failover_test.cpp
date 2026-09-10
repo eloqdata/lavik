@@ -1,6 +1,7 @@
 #include "keylane/meta/failover.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -30,6 +31,12 @@ std::string Hex(const std::array<std::uint8_t, N>& bytes) {
     result[index * 2 + 1] = kDigits[bytes[index] & 0x0f];
   }
   return result;
+}
+
+int64_t UnixMillisNow() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
 }
 
 FailoverIntent Intent() {
@@ -164,6 +171,14 @@ TEST(MetaFailoverValidationTest,
   const FailoverIntent failover = Intent();
   MetaObservationStore observations;
   MetaStores stores;
+
+  RegisterNode register_candidate;
+  register_candidate.node_id_ = failover.candidate_node_id_;
+  register_candidate.principal_ =
+      "keylane://node/" + failover.candidate_node_id_;
+  register_candidate.endpoints_ = {"127.0.0.1:6379"};
+  register_candidate.role_ = MetaNodeRole::kReplica;
+  ASSERT_TRUE(stores.identity_.Apply(register_candidate).ok());
 
   CreateGroup create;
   create.group_id_ = failover.group_id_;
@@ -321,6 +336,42 @@ TEST(MetaFailoverValidationTest,
                     .old_authority_exclusion_hash_ = exclusion_hash,
                     .required_applied_next_lsns_ = required},
       2, {directive});
+
+  const auto expect_directive_rejected = [&](MetaDirectiveSpec changed) {
+    TransitionOperationPhase stale = phase3;
+    stale.current_directives_ = {std::move(changed)};
+    EXPECT_EQ(MetaFailureClassOf(
+                  ValidateFailoverProposal(MetaCommand(stale),
+                                           MetaCommittedView(stores, 3),
+                                           observations)),
+              MetaFailureClass::kDomainReject);
+  };
+  MetaDirectiveSpec changed = directive;
+  changed.assignment_id_ = Bytes<16>(0x31);
+  expect_directive_rejected(std::move(changed));
+  changed = directive;
+  changed.target_boot_id_ = Bytes<20>(0x41);
+  expect_directive_rejected(std::move(changed));
+  changed = directive;
+  ++changed.group_term_;
+  expect_directive_rejected(std::move(changed));
+  changed = directive;
+  ++changed.population_manifest_revision_;
+  expect_directive_rejected(std::move(changed));
+  changed = directive;
+  ++changed.partition_replication_epoch_;
+  expect_directive_rejected(std::move(changed));
+  changed = directive;
+  changed.source_replication_history_id_ = Bytes<20>(0x71);
+  expect_directive_rejected(std::move(changed));
+  changed = directive;
+  auto changed_frontier = cluster::control::EncodePromotionPrepareRequest(
+      {.parent_history_id = Hex(failover.parent_history_id_),
+       .required_applied_next_lsns = {19, 24}});
+  ASSERT_TRUE(changed_frontier.ok()) << changed_frontier.status();
+  changed.payload_ = *changed_frontier;
+  expect_directive_rejected(std::move(changed));
+
   ASSERT_TRUE(ValidateFailoverProposal(MetaCommand(phase3),
                                        MetaCommittedView(stores, 3),
                                        observations)
@@ -348,32 +399,98 @@ TEST(MetaFailoverValidationTest,
   receipt.result_ = *result;
   ASSERT_TRUE(stores.operation_.CommitDirectiveResult(receipt, 5).ok());
 
-  MetaEvidenceSummary evidence{
+  MetaOperationEvidenceObs observed_evidence{
       .node_id_ = failover.candidate_node_id_,
-      .group_id_ = failover.group_id_,
-      .assignment_id_ = failover.candidate_assignment_id_,
       .boot_incarnation_ = failover.candidate_boot_id_,
+      .assignment_id_ = failover.candidate_assignment_id_,
+      .operation_id_ = submit.operation_id_,
+      .kind_phase_ = "promotion-prepare:prepared",
+      .evidence_hash_ = receipt.result_hash_,
+      .evidence_ = *result,
+      .group_id_ = failover.group_id_,
       .group_term_ = failover.group_term_,
       .population_manifest_revision_ =
           failover.population_manifest_revision_,
-      .population_manifest_digest_ =
-          failover.population_manifest_digest_,
       .partition_replication_epoch_ =
           failover.partition_replication_epoch_,
       .replication_history_id_ = failover.parent_history_id_,
-      .operation_id_ = submit.operation_id_,
-      .kind_hash_ = receipt.result_hash_,
   };
+  const MetaEvidenceSummary evidence = SummarizeOperationEvidence(
+      observed_evidence, failover.population_manifest_digest_);
   TransitionOperationPhase phase4 = transition_phase(
       FailoverPhase{.stage_ = FailoverPhaseStage::kPromotionPrepared,
                     .old_authority_exclusion_hash_ = exclusion_hash,
                     .required_applied_next_lsns_ = required,
                     .prepared_result_hash_ = receipt.result_hash_},
       4, {}, {evidence});
+
+  EXPECT_EQ(MetaFailureClassOf(
+                ValidateFailoverProposal(MetaCommand(phase4),
+                                         MetaCommittedView(stores, 5),
+                                         observations)),
+            MetaFailureClass::kDomainReject);
+
+  const int64_t now_unix_ms = UnixMillisNow();
+  ASSERT_TRUE(observations
+                  .AdoptSession({failover.candidate_node_id_,
+                                 failover.candidate_boot_id_, 1},
+                                now_unix_ms)
+                  .ok());
+  MetaObservation observation{
+      .identity_ = {failover.candidate_node_id_, failover.candidate_boot_id_,
+                    1},
+      .payload_ = observed_evidence,
+      .received_unix_ms_ = 1000,
+  };
+  ASSERT_TRUE(observations
+                  .Ingest(std::move(observation), MetaStoresFacts(stores),
+                          now_unix_ms)
+                  .ok());
   EXPECT_TRUE(ValidateFailoverProposal(MetaCommand(phase4),
                                        MetaCommittedView(stores, 5),
                                        observations)
                   .ok());
+
+  MetaObservationStore::Limits stale_limits;
+  stale_limits.ttl_ms_ = 1;
+  MetaObservationStore stale_observations(stale_limits);
+  ASSERT_TRUE(stale_observations
+                  .AdoptSession({failover.candidate_node_id_,
+                                 failover.candidate_boot_id_, 1},
+                                now_unix_ms - 1000)
+                  .ok());
+  MetaObservation stale_observation{
+      .identity_ = {failover.candidate_node_id_, failover.candidate_boot_id_,
+                    1},
+      .payload_ = observed_evidence,
+  };
+  ASSERT_TRUE(stale_observations
+                  .Ingest(std::move(stale_observation),
+                          MetaStoresFacts(stores), now_unix_ms - 1000)
+                  .ok());
+  EXPECT_EQ(MetaFailureClassOf(
+                ValidateFailoverProposal(MetaCommand(phase4),
+                                         MetaCommittedView(stores, 5),
+                                         stale_observations)),
+            MetaFailureClass::kDomainReject);
+
+  ASSERT_TRUE(stores.operation_.TransitionOperationPhase(phase4, 6).ok());
+  const auto committed = stores.operation_.FindOperation(submit.operation_id_);
+  ASSERT_TRUE(committed.has_value());
+  observations.ResetForLeadershipChange();
+  EXPECT_TRUE(ValidateFailoverProposal(MetaCommand(phase4),
+                                       MetaCommittedView(stores, 6),
+                                       observations)
+                  .ok())
+      << "an already committed phase replay needs no former leader evidence";
+  ASSERT_TRUE(stores.operation_.TransitionOperationPhase(phase4, 6).ok());
+  const auto replayed = stores.operation_.FindOperation(submit.operation_id_);
+  ASSERT_TRUE(replayed.has_value());
+  EXPECT_EQ(replayed->operation_id_, committed->operation_id_);
+  EXPECT_EQ(replayed->revision_, committed->revision_);
+  EXPECT_EQ(replayed->kind_phase_blob_, committed->kind_phase_blob_);
+  EXPECT_EQ(replayed->evidence_, committed->evidence_);
+  EXPECT_EQ(replayed->terminal_receipts_, committed->terminal_receipts_);
 }
 
 }  // namespace

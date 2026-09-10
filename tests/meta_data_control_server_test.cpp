@@ -1132,7 +1132,7 @@ TEST(MetaOperationEvidenceTest,
                   evidence, /*now_unix_ms=*/1001)
                   .ok());
   const auto accepted =
-      observations.EvidenceForOperation(Bytes<16>(0x33), facts);
+      observations.EvidenceForOperation(Bytes<16>(0x33), facts, 1001);
   ASSERT_EQ(accepted.size(), 1u);
   EXPECT_EQ(accepted.front().node_id_, Identity('1'));
   EXPECT_EQ(accepted.front().boot_incarnation_, boot);

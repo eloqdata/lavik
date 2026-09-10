@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -23,6 +24,29 @@ constexpr std::string_view kIntentMagic = "KLFI";
 constexpr std::string_view kPhaseMagic = "KLFP";
 constexpr std::uint16_t kFailoverSchemaVersion = 1;
 constexpr std::uint32_t kMaxFailoverFlowCount = 1024;
+
+int64_t UnixMillisNow() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+std::optional<FailoverPhaseStage> NextPreparationStage(
+    FailoverPhaseStage stage) {
+  switch (stage) {
+    case FailoverPhaseStage::kOldAuthorityExcluded:
+      return FailoverPhaseStage::kCandidateCaughtUp;
+    case FailoverPhaseStage::kCandidateCaughtUp:
+      return FailoverPhaseStage::kPromotionPreparing;
+    case FailoverPhaseStage::kPromotionPreparing:
+      return FailoverPhaseStage::kPromotionPrepared;
+    case FailoverPhaseStage::kPromotionPrepared:
+    case FailoverPhaseStage::kAuthorityActivated:
+    case FailoverPhaseStage::kServing:
+      return std::nullopt;
+  }
+  return std::nullopt;
+}
 
 template <std::size_t N>
 bool IsZero(const std::array<std::uint8_t, N>& value) {
@@ -217,7 +241,8 @@ const MetaTerminalReceipt* FindSuccessfulReceipt(
 absl::Status ValidatePreparedTransition(
     const TransitionOperationPhase& transition,
     const MetaOperationRecord& operation, const FailoverIntent& intent,
-    const FailoverPhase& phase) {
+    const FailoverPhase& phase, const MetaCommittedView& view,
+    const MetaObservationStore& observations) {
   if (!transition.current_directives_.empty() ||
       transition.evidence_.size() != 1 ||
       operation.current_directives_.size() != 1) {
@@ -250,21 +275,39 @@ absl::Status ValidatePreparedTransition(
       return Invalid("promotion prepared frontier is behind its requirement");
     }
   }
-  const MetaEvidenceSummary& evidence = transition.evidence_.front();
-  if (evidence.node_id_ != intent.candidate_node_id_ ||
-      evidence.boot_incarnation_ != intent.candidate_boot_id_ ||
-      evidence.assignment_id_ != intent.candidate_assignment_id_ ||
-      evidence.operation_id_ != operation.operation_id_ ||
-      evidence.group_id_ != intent.group_id_ ||
-      evidence.group_term_ != intent.group_term_ ||
-      evidence.population_manifest_revision_ !=
-          intent.population_manifest_revision_ ||
-      evidence.population_manifest_digest_ !=
-          intent.population_manifest_digest_ ||
-      evidence.partition_replication_epoch_ !=
-          intent.partition_replication_epoch_ ||
-      evidence.replication_history_id_ != intent.parent_history_id_ ||
-      evidence.kind_hash_ != receipt->result_hash_) {
+  // A terminal receipt proves what was committed to the operation journal;
+  // the current-session observation proves those bytes were actually reported
+  // by this exact candidate boot. Requiring both prevents a proposer from
+  // fabricating a matching summary from committed fields alone.
+  const MetaStoresFacts facts(view.stores());
+  const std::vector<MetaOperationEvidenceObs> observed =
+      observations.EvidenceForOperation(operation.operation_id_, facts,
+                                        UnixMillisNow());
+  const auto exact = std::find_if(
+      observed.begin(), observed.end(),
+      [&](const MetaOperationEvidenceObs& evidence) {
+        return evidence.kind_phase_ == "promotion-prepare:prepared" &&
+               evidence.node_id_ == intent.candidate_node_id_ &&
+               evidence.boot_incarnation_ == intent.candidate_boot_id_ &&
+               evidence.assignment_id_ == intent.candidate_assignment_id_ &&
+               evidence.operation_id_ == operation.operation_id_ &&
+               evidence.evidence_hash_ == receipt->result_hash_ &&
+               evidence.evidence_ == receipt->result_ &&
+               evidence.group_id_ == intent.group_id_ &&
+               evidence.group_term_ == intent.group_term_ &&
+               evidence.population_manifest_revision_ ==
+                   intent.population_manifest_revision_ &&
+               evidence.partition_replication_epoch_ ==
+                   intent.partition_replication_epoch_ &&
+               evidence.replication_history_id_ == intent.parent_history_id_;
+      });
+  if (exact == observed.end()) {
+    return Invalid(
+        "promotion-prepared is missing fresh exact candidate evidence");
+  }
+  if (transition.evidence_.front() != SummarizeOperationEvidence(
+                                          *exact,
+                                          intent.population_manifest_digest_)) {
     return Invalid("promotion-prepared evidence summary changed its anchors");
   }
   return absl::OkStatus();
@@ -394,7 +437,6 @@ absl::StatusOr<FailoverPhase> DecodeFailoverPhase(std::string_view encoded) {
 absl::Status ValidateFailoverProposal(
     const MetaCommand& command, const MetaCommittedView& view,
     const MetaObservationStore& observations) {
-  (void)observations;
   if (const auto* submit = std::get_if<SubmitOperation>(&command)) {
     if (submit->kind_ != kFailoverOperationKind) return absl::OkStatus();
     auto intent = DecodeFailoverIntent(submit->intent_);
@@ -448,7 +490,7 @@ absl::Status ValidateFailoverProposal(
   }
   if (static_cast<std::uint8_t>(next->stage_) >
       static_cast<std::uint8_t>(FailoverPhaseStage::kPromotionPrepared)) {
-    return Invalid("failover phase is reserved for issue 41");
+    return Invalid("failover phase is outside the preparation workflow");
   }
 
   std::optional<FailoverPhase> previous;
@@ -459,12 +501,11 @@ absl::Status ValidateFailoverProposal(
     }
     previous = std::move(*decoded);
   }
-  const auto next_stage = static_cast<std::uint8_t>(next->stage_);
-  const auto expected_stage = previous.has_value()
-                                  ? static_cast<std::uint8_t>(previous->stage_) + 1
-                                  : static_cast<std::uint8_t>(
-                                        FailoverPhaseStage::kOldAuthorityExcluded);
-  if (next_stage != expected_stage) {
+  const std::optional<FailoverPhaseStage> expected_stage =
+      previous.has_value()
+          ? NextPreparationStage(previous->stage_)
+          : std::optional(FailoverPhaseStage::kOldAuthorityExcluded);
+  if (!expected_stage.has_value() || next->stage_ != *expected_stage) {
     return Invalid("failover transition skipped or repeated a phase");
   }
   if (previous.has_value() &&
@@ -499,10 +540,10 @@ absl::Status ValidateFailoverProposal(
           transition->current_directives_.front(), *intent, *next);
     case FailoverPhaseStage::kPromotionPrepared:
       return ValidatePreparedTransition(*transition, *operation, *intent,
-                                        *next);
+                                        *next, view, observations);
     case FailoverPhaseStage::kAuthorityActivated:
     case FailoverPhaseStage::kServing:
-      return Invalid("failover phase is reserved for issue 41");
+      return Invalid("failover phase is outside the preparation workflow");
   }
   return Invalid("unknown failover phase");
 }

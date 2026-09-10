@@ -365,9 +365,10 @@ class ReplicationManager {
       const RebuildDirective& directive) const;
 
   // Starts the prepare half of a Meta-authorized promotion. Success preserves
-  // LOADING, write fencing, and disabled expiration authority; #41 activates
-  // only after a later FDS plus current-session lease. Exact replay returns
-  // the original completion and evidence without repeating local side effects.
+  // LOADING, write fencing, and disabled expiration authority. A separate
+  // authority workflow may activate only after a later FDS plus current-session
+  // lease. Exact replay returns the original completion and evidence without
+  // repeating local side effects.
   celer::Task<absl::StatusOr<ClusterPromotionPrepareCompletion>>
   StartClusterPromotionPrepareDirective(
       ClusterPromotionPrepareDirective directive);

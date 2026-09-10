@@ -1343,6 +1343,297 @@ TEST(ReplicationManagerIntegrationTest,
   EXPECT_TRUE(service.result().ok()) << service.result();
 }
 
+class PromotionPrepareService final : public celer::Service {
+ public:
+  PromotionPrepareService(keylane::storage::StorageEngine* storage,
+                          keylane::ReplicationManager* replication,
+                          std::string fault_stage)
+      : storage_(storage),
+        replication_(replication),
+        fault_stage_(std::move(fault_stage)) {}
+
+  void Prepare(unsigned thread_count) override {
+    if (thread_count != 1) {
+      result_ = TestFailure("promotion prepare test requires one worker");
+    }
+  }
+
+  celer::Task<absl::Status> Run(celer::Worker& worker,
+                                celer::ServiceContext) override {
+    keylane::BindMemoryAccountingShard(worker.id());
+    keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
+    if (result_.ok()) result_ = co_await storage_->InitializeWorker(worker);
+    if (result_.ok()) {
+      replication_->StorageReady(worker);
+      result_ = co_await Exercise();
+    }
+    replication_->RequestShutdown();
+    (void)co_await replication_->QuiesceForShutdown();
+    worker.RequestStop();
+    co_return result_;
+  }
+
+  void Stop() noexcept override {}
+
+  const absl::Status& result() const noexcept { return result_; }
+
+ private:
+  celer::Task<absl::Status> Exercise() {
+    auto manifest = keylane::PopulationManifest::Create({});
+    if (!manifest.ok()) co_return manifest.status();
+    const keylane::ClusterPopulationStatus initial =
+        co_await replication_->cluster_population_status();
+    keylane::RebuildIdentity identity{
+        .group_id_ = std::string(40, 'd'),
+        .assignment_id_ = "candidate-assignment",
+        .term_ = 7,
+        .directive_revision_ = 1,
+        .authority_id_ = "excluded-authority",
+        .source_node_id_ = std::string(40, 'a'),
+        .source_assignment_id_ = "source-assignment",
+        .source_boot_id_ = std::string(40, 'b'),
+        .source_history_id_ = std::string(40, 'c'),
+        .target_node_id_ = initial.local_node_id_,
+        .target_boot_id_ = initial.local_boot_id_,
+        .operation_id_ = "failover-operation",
+        .directive_id_ = "promotion-prepare",
+        .attempt_id_ = "promotion-attempt",
+        .manifest_revision_ = 1,
+        .manifest_id_ = manifest->id(),
+        .partition_replication_epoch_ = kPartitionReplicationEpoch,
+    };
+    keylane::ClusterPromotionPrepareDirective directive{
+        .identity_ = identity,
+        .parent_history_id_ = identity.source_history_id_,
+        .required_applied_next_lsns_ = {1},
+        .excluded_group_term_ = identity.term_,
+    };
+    directive.old_authority_exclusion_hash_.fill(1);
+
+    auto started =
+        co_await replication_->StartClusterPromotionPrepareDirective(directive);
+    if (!started.ok()) co_return started.status();
+    auto prepared = co_await started->Await();
+    if (!fault_stage_.empty()) {
+      if (prepared.ok()) {
+        co_return TestFailure("injected promotion prepare unexpectedly passed");
+      }
+      const keylane::ReplicationStatus status = co_await replication_->Observe();
+      if (!status.failed_stopped_ || !replication_->is_loading() ||
+          !replication_->reject_writes()) {
+        co_return TestFailure(
+            "uncertain promotion prepare did not fail-stop the node");
+      }
+      auto replay = co_await replication_->StartClusterPromotionPrepareDirective(
+          directive);
+      if (!replay.ok() || (co_await replay->Await()).ok()) {
+        co_return TestFailure(
+            "failed promotion prepare replay changed its terminal result");
+      }
+      auto base = storage_->RecoverPromotionBase();
+      if (!base.ok()) co_return base.status();
+      const bool base_expected = fault_stage_ == "child-history" ||
+                                 fault_stage_ == "evidence-publication";
+      if (base->has_value() != base_expected) {
+        co_return TestFailure(
+            "promotion fault crossed an unexpected durability boundary");
+      }
+      co_return absl::OkStatus();
+    }
+
+    if (!prepared.ok()) co_return prepared.status();
+    if (prepared->parent_history_id_ != directive.parent_history_id_ ||
+        prepared->frozen_applied_next_lsns_ !=
+            directive.required_applied_next_lsns_ ||
+        prepared->population_generation_ == 0 ||
+        prepared->catalog_generation_ == 0 ||
+        !IsCanonicalReplicationId(prepared->child_history_id_) ||
+        prepared->child_history_id_ == prepared->parent_history_id_) {
+      co_return TestFailure("promotion prepare returned incomplete evidence");
+    }
+    auto base = storage_->RecoverPromotionBase();
+    if (!base.ok() || !base->has_value() ||
+        (**base).group_id_ != identity.group_id_ ||
+        (**base).parent_history_id_ != directive.parent_history_id_ ||
+        (**base).parent_frontier_.flow_cursors_ !=
+            directive.required_applied_next_lsns_) {
+      co_return TestFailure("promotion prepare did not persist its base");
+    }
+    const keylane::ReplicationStatus status = co_await replication_->Observe();
+    const keylane::ClusterPopulationStatus population =
+        co_await replication_->cluster_population_status();
+    if (status.role_ != keylane::ReplicationRole::kSyncing ||
+        status.failed_stopped_ || !replication_->is_loading() ||
+        !replication_->reject_writes() ||
+        population.state_ != keylane::ReplicationGroupState::kReady ||
+        !population.ready_token_.has_value() ||
+        population.parent_history_id_.has_value() ||
+        !population.applied_next_lsns_.empty()) {
+      co_return TestFailure(
+          "prepared cluster promotion exposed serving or candidate authority");
+    }
+    auto watermark = co_await replication_->CaptureNativeReplicationWatermark();
+    if (!watermark.ok() || !watermark->has_value()) {
+      co_return TestFailure("prepared promotion did not create a child history");
+    }
+
+    auto replay =
+        co_await replication_->StartClusterPromotionPrepareDirective(directive);
+    if (!replay.ok()) co_return replay.status();
+    auto replayed = co_await replay->Await();
+    if (!replayed.ok() || *replayed != *prepared) {
+      co_return TestFailure("exact promotion prepare replay changed evidence");
+    }
+    keylane::ClusterPromotionPrepareDirective conflict = directive;
+    conflict.identity_.attempt_id_ = "conflicting-attempt";
+    auto conflicting =
+        co_await replication_->StartClusterPromotionPrepareDirective(conflict);
+    if (conflicting.status().code() !=
+        absl::StatusCode::kFailedPrecondition) {
+      co_return TestFailure("promotion prepare accepted conflicting anchors");
+    }
+
+    std::vector<keylane::ClusterPromotionPrepareDirective> stale_directives;
+    conflict = directive;
+    conflict.identity_.assignment_id_ = "stale-assignment";
+    stale_directives.push_back(conflict);
+    conflict = directive;
+    conflict.identity_.target_boot_id_ = std::string(40, '8');
+    stale_directives.push_back(conflict);
+    conflict = directive;
+    ++conflict.identity_.term_;
+    ++conflict.excluded_group_term_;
+    stale_directives.push_back(conflict);
+    conflict = directive;
+    ++conflict.identity_.manifest_revision_;
+    stale_directives.push_back(conflict);
+    conflict = directive;
+    ++conflict.identity_.partition_replication_epoch_;
+    stale_directives.push_back(conflict);
+    conflict = directive;
+    conflict.identity_.source_history_id_ = std::string(40, '7');
+    conflict.parent_history_id_ = conflict.identity_.source_history_id_;
+    stale_directives.push_back(conflict);
+    conflict = directive;
+    ++conflict.required_applied_next_lsns_.front();
+    stale_directives.push_back(conflict);
+    for (auto& stale : stale_directives) {
+      auto rejected =
+          co_await replication_->StartClusterPromotionPrepareDirective(stale);
+      if (rejected.ok()) {
+        co_return TestFailure(
+            "promotion prepare accepted a changed identity anchor");
+      }
+    }
+
+    keylane::RebuildDirective unauthorized_export{
+        .identity_ =
+            {
+                .group_id_ = identity.group_id_,
+                .assignment_id_ = "downstream-assignment",
+                .term_ = identity.term_,
+                .directive_revision_ = 2,
+                .authority_id_ = "future-authority",
+                .source_node_id_ = initial.local_node_id_,
+                .source_assignment_id_ = identity.assignment_id_,
+                .source_boot_id_ = initial.local_boot_id_,
+                .source_history_id_ = prepared->child_history_id_,
+                .target_node_id_ = std::string(40, 'e'),
+                .target_boot_id_ = std::string(40, 'f'),
+                .operation_id_ = "downstream-operation",
+                .directive_id_ = "downstream-rebuild",
+                .attempt_id_ = "downstream-attempt",
+                .manifest_revision_ = identity.manifest_revision_,
+                .manifest_id_ = identity.manifest_id_,
+                .partition_replication_epoch_ =
+                    identity.partition_replication_epoch_,
+            },
+        .flow_count_ = 1,
+        .safe_source_active_ = true,
+    };
+    const absl::Status authorized =
+        co_await replication_->AuthorizeClusterRebuildSource(
+            std::move(unauthorized_export));
+    if (authorized.code() != absl::StatusCode::kFailedPrecondition) {
+      co_return TestFailure(
+          "prepared cluster promotion authorized downstream export");
+    }
+    co_return absl::OkStatus();
+  }
+
+  keylane::storage::StorageEngine* storage_ = nullptr;
+  keylane::ReplicationManager* replication_ = nullptr;
+  std::string fault_stage_;
+  absl::Status result_ = absl::OkStatus();
+};
+
+class ScopedPromotionFaults {
+ public:
+  explicit ScopedPromotionFaults(std::string_view stage) {
+    EXPECT_EQ(::setenv("KEYLANE_REPLICATION_SEED_READY_PROMOTION_CANDIDATE",
+                      "promotion-attempt", 1),
+              0);
+    if (!stage.empty()) {
+      EXPECT_EQ(::setenv("KEYLANE_REPLICATION_FAIL_PROMOTION_PREPARE_AT",
+                        std::string(stage).c_str(), 1),
+                0);
+    }
+  }
+  ~ScopedPromotionFaults() {
+    (void)::unsetenv("KEYLANE_REPLICATION_SEED_READY_PROMOTION_CANDIDATE");
+    (void)::unsetenv("KEYLANE_REPLICATION_FAIL_PROMOTION_PREPARE_AT");
+  }
+};
+
+void RunPromotionPrepareCase(std::string_view fault_stage) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug/fault build for candidate seeding";
+#endif
+  ScopedPromotionFaults faults(fault_stage);
+  keylane::test::TempDirectory directory(
+      fault_stage.empty() ? "cluster-promotion-prepare"
+                          : "cluster-promotion-" + std::string(fault_stage));
+  const std::filesystem::path data = directory.path() / "node.data";
+  keylane::test::CreateDataFile(data, 128 * kMiB);
+
+  keylane::storage::StorageEngineOptions storage_options;
+  storage_options.data_files_ = {data.string()};
+  storage_options.expiration_authority_ = false;
+  storage_options.buffers_.registered_bytes_ = 64 * kMiB;
+  storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
+  keylane::storage::StorageEngine storage(std::move(storage_options));
+  keylane::InitWorkerMetrics(1);
+  ASSERT_TRUE(keylane::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(storage.Prepare(1).ok());
+
+  keylane::ReplicationOptions replication_options;
+  replication_options.cluster_enabled_ = true;
+  replication_options.cluster_population_managed_ = true;
+  replication_options.node_id_override_ = std::string(40, '9');
+  keylane::ReplicationManager replication(&storage,
+                                          std::move(replication_options),
+                                          std::nullopt);
+  keylane::InitStorage(&storage, &replication);
+  if (keylane::tx::TxRuntime::Get() == nullptr) {
+    keylane::tx::TxRuntime::Create(1);
+  }
+
+  PromotionPrepareService service(&storage, &replication,
+                                  std::string(fault_stage));
+  celer::Server server;
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+class PromotionPrepareFailureIntegrationTest
+    : public testing::TestWithParam<const char*> {};
+
 TEST(ReplicationManagerIntegrationTest,
      ClusterControlApiStaysFailClosedAndSupersedesWholeSession) {
   const std::string expected_node_id(40, '9');
@@ -1565,5 +1856,20 @@ TEST(ReplicationManagerIntegrationTest,
   server.WaitUntilStopped();
   EXPECT_TRUE(service.result().ok()) << service.result();
 }
+
+TEST(ReplicationManagerIntegrationTest,
+     MetaManagedPromotionPreparePersistsEvidenceAndStaysFenced) {
+  RunPromotionPrepareCase({});
+}
+
+TEST_P(PromotionPrepareFailureIntegrationTest,
+       UncertainStageFailStopsWithoutPublishingAuthority) {
+  RunPromotionPrepareCase(GetParam());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    PromotionPrepareBoundaries, PromotionPrepareFailureIntegrationTest,
+    testing::Values("storage-barrier", "promotion-base", "child-history",
+                    "evidence-publication"));
 
 }  // namespace

@@ -3621,6 +3621,96 @@ class ReplicationManager::ReplicationGroup {
     co_return context->completion_;
   }
 
+#if KEYLANE_FAULTS_ENABLED
+  // Fault builds can synthesize the already-proven candidate boundary so the
+  // promotion kernel can be exercised without a second process implementing
+  // the full destructive-rebuild protocol. The selector is attempt-scoped,
+  // and this entire path is erased from ordinary release binaries.
+  Task<absl::Status> SeedReadyPromotionCandidateForFaultTest(
+      const ClusterPromotionPrepareDirective& directive) {
+    {
+      AssertStateOwner();
+      if (cluster_rebuild_ != nullptr) co_return absl::OkStatus();
+    }
+    auto manifest = PopulationManifest::Create({});
+    if (!manifest.ok()) co_return manifest.status();
+    if (manifest->id() != directive.identity_.manifest_id_) {
+      co_return absl::InvalidArgumentError(
+          "fault-seeded promotion requires the empty population manifest");
+    }
+
+    constexpr std::uint64_t kFaultFullSyncSession = 0x50524f4d4f5445ULL;
+    absl::Status storage_ready =
+        co_await storage_->BeginReplicaFullSync(kFaultFullSyncSession);
+    if (!storage_ready.ok()) co_return storage_ready;
+    storage_ready = co_await GlobalFunctionCatalog().ReplaceFromLibraryCodes({});
+    if (!storage_ready.ok()) co_return storage_ready;
+    storage_ready = co_await storage_->CompleteReplicaFullSync(
+        kFaultFullSyncSession,
+        storage::PopulationToken{.generation_ = kFaultFullSyncSession,
+                                 .digest_ = 1});
+    if (!storage_ready.ok()) co_return storage_ready;
+
+    RebuildDirective rebuild{
+        .identity_ = directive.identity_,
+        .flow_count_ = static_cast<std::uint32_t>(
+            directive.required_applied_next_lsns_.size()),
+        .safe_source_active_ = true,
+    };
+    auto authorization = cluster_group_->BeginRebuild(rebuild, *manifest);
+    if (!authorization.ok()) co_return authorization.status();
+    auto population = std::make_shared<ClusterRebuildContext>(
+        rebuild, *manifest, std::move(*authorization));
+    for (std::uint32_t partition = 0;
+         partition < kReplicationPartitionCount; ++partition) {
+      const std::uint64_t target_epoch = partition + 1;
+      absl::Status recorded = cluster_group_->RecordPartitionReset(
+          rebuild.identity_, partition, target_epoch);
+      if (recorded.ok()) {
+        recorded = cluster_group_->RecordPartitionHandoff(
+            rebuild.identity_, partition, 0, target_epoch);
+      }
+      if (!recorded.ok()) co_return recorded;
+    }
+    absl::Status proof =
+        cluster_group_->MarkFunctionCatalogComplete(rebuild.identity_);
+    if (proof.ok()) {
+      proof = cluster_group_->RecordFlowCutVector(
+          rebuild.identity_, directive.required_applied_next_lsns_);
+    }
+    if (proof.ok()) {
+      proof = cluster_group_->MarkStoragePromoted(rebuild.identity_);
+    }
+    if (!proof.ok()) co_return proof;
+    auto ready = cluster_group_->PublishReady(rebuild.identity_);
+    if (!ready.ok()) co_return ready.status();
+
+    auto frontier = std::make_shared<detail::ReplicaAppliedFrontier>(
+        directive.required_applied_next_lsns_.size(), storage_->worker_count());
+    absl::Status frontier_installed = frontier->InstallNextLsns(
+        directive.required_applied_next_lsns_);
+    if (!frontier_installed.ok()) co_return frontier_installed;
+    population->ready_token_ = *ready;
+    population->state_.store(ReplicationGroupState::kReady,
+                             std::memory_order_release);
+    population->completion_->Resolve(absl::OkStatus());
+    {
+      AssertStateOwner();
+      if (cluster_rebuild_ != nullptr) {
+        co_return absl::AbortedError(
+            "cluster candidate changed during fault seeding");
+      }
+      cluster_rebuild_ = std::move(population);
+      applied_frontier_ = std::move(frontier);
+      upstream_node_id_ = directive.identity_.source_node_id_;
+      upstream_history_id_ = directive.parent_history_id_;
+      source_worker_count_ = directive.required_applied_next_lsns_.size();
+      native_dataset_valid_.store(true, std::memory_order_release);
+    }
+    co_return absl::OkStatus();
+  }
+#endif
+
   Task<absl::Status> RunClusterPromotionPrepare(
       std::shared_ptr<ClusterPromotionPrepareContext> context,
       std::shared_ptr<ClusterRebuildContext> population,
@@ -3732,6 +3822,12 @@ class ReplicationManager::ReplicationGroup {
               "promotion context changed before evidence publication"),
           "evidence publication");
     }
+    if (ShouldInjectPromotionPrepareFailure("evidence-publication")) {
+      co_return fail_stop(
+          absl::InternalError(
+              "injected promotion-prepare evidence publication failure"),
+          "evidence publication");
+    }
     context->completion_->Resolve(*prepared);
     co_return absl::OkStatus();
   }
@@ -3779,6 +3875,15 @@ class ReplicationManager::ReplicationGroup {
       co_return absl::CancelledError(
           "promotion-prepare admission stopped for process shutdown");
     }
+#if KEYLANE_FAULTS_ENABLED
+    if (KEYLANE_FAULT_MATCHES(
+            "KEYLANE_REPLICATION_SEED_READY_PROMOTION_CANDIDATE",
+            identity.attempt_id_)) {
+      absl::Status seeded =
+          co_await SeedReadyPromotionCandidateForFaultTest(directive);
+      if (!seeded.ok()) co_return seeded;
+    }
+#endif
 
     std::shared_ptr<ClusterRebuildContext> population;
     std::shared_ptr<detail::ReplicaAppliedFrontier> frontier;
@@ -3812,6 +3917,7 @@ class ReplicationManager::ReplicationGroup {
       const RebuildIdentity& ready = population->ready_token_->identity();
       if (ready.group_id_ != identity.group_id_ ||
           ready.assignment_id_ != identity.assignment_id_ ||
+          ready.term_ != identity.term_ ||
           ready.source_node_id_ != identity.source_node_id_ ||
           ready.source_assignment_id_ != identity.source_assignment_id_ ||
           ready.source_boot_id_ != identity.source_boot_id_ ||
@@ -4425,6 +4531,10 @@ class ReplicationManager::ReplicationGroup {
     promotion_base.population_token_ = *population;
     promotion_base.catalog_token_ = GlobalFunctionCatalog().durability_token();
 
+    if (ShouldInjectPromotionPrepareFailure("storage-barrier")) {
+      co_return absl::InternalError(
+          "injected promotion-prepare storage barrier failure");
+    }
     absl::Status durable = co_await storage_->MakeDurable(
         promotion_base.parent_frontier_, promotion_base.storage_accumulator_);
     if (!durable.ok()) co_return durable;
@@ -4433,12 +4543,20 @@ class ReplicationManager::ReplicationGroup {
       co_return absl::AbortedError(
           "Function catalog changed while preparing promotion");
     }
+    if (ShouldInjectPromotionPrepareFailure("promotion-base")) {
+      co_return absl::InternalError(
+          "injected promotion-prepare base commit failure");
+    }
     absl::Status committed =
         co_await storage_->CommitPromotionBase(promotion_base);
     if (!committed.ok()) co_return committed;
 
     absl::Status retired = co_await RetireSourceHistory();
     if (!retired.ok()) co_return retired;
+    if (ShouldInjectPromotionPrepareFailure("child-history")) {
+      co_return absl::InternalError(
+          "injected promotion-prepare child history failure");
+    }
     const std::uint64_t child_log_epoch =
         role_epoch_.load(std::memory_order_acquire);
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
@@ -4473,8 +4591,9 @@ class ReplicationManager::ReplicationGroup {
   }
 
   // Standalone/Sentinel has no external authority commit between prepare and
-  // activation, so its synchronous command invokes this immediately. Cluster
-  // intentionally has no public activation entry point in #40.
+  // activation, so its synchronous command invokes this immediately. The
+  // Cluster preparation contract intentionally has no public activation entry
+  // point.
   void ActivatePreparedPromotion() {
     {
       AssertStateOwner();
@@ -9250,6 +9369,19 @@ class ReplicationManager::ReplicationGroup {
     return false;
   }
 
+  bool ShouldInjectPromotionPrepareFailure(std::string_view stage) {
+    KEYLANE_FAULT_INJECT({
+      if (!KEYLANE_FAULT_MATCHES(
+              "KEYLANE_REPLICATION_FAIL_PROMOTION_PREPARE_AT", stage)) {
+        return false;
+      }
+      return !promotion_prepare_fault_used_.exchange(
+          true, std::memory_order_acq_rel);
+    });
+    (void)stage;
+    return false;
+  }
+
   bool ShouldInjectEarlyOnline() const {
     return KEYLANE_FAULT_MATCHES("KEYLANE_REPLICATION_EARLY_ONLINE", "1");
   }
@@ -11611,6 +11743,7 @@ class ReplicationManager::ReplicationGroup {
   std::atomic<bool> replication_promotion_fault_used_{false};
   std::atomic<bool> empty_population_reset_fault_used_{false};
   std::atomic<bool> empty_population_catalog_fault_used_{false};
+  std::atomic<bool> promotion_prepare_fault_used_{false};
   std::atomic<bool> replication_post_cut_reset_fault_used_{false};
   std::atomic<bool> replication_divergent_tail_fault_used_{false};
   std::atomic<bool> replication_fullsync_pause_used_{false};

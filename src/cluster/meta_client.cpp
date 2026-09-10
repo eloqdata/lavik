@@ -927,7 +927,7 @@ struct MetaControlClientService::Impl {
     celer::AsyncNotification tasks_changed_;
     std::size_t active_tasks_ = 0;
     std::size_t directive_completion_tasks_ = 0;
-    std::size_t population_completion_tasks_ = 0;
+    std::size_t target_population_completion_tasks_ = 0;
     std::size_t promotion_prepare_tasks_ = 0;
     std::size_t source_completion_tasks_ = 0;
     std::uint64_t directive_generation_ = 1;
@@ -1539,7 +1539,7 @@ struct MetaControlClientService::Impl {
   celer::Task<absl::Status> ObserveDirectiveCompletion(
       std::shared_ptr<SessionState> state, control::Directive directive,
       NodeDirectiveCompletion completion, std::uint64_t generation,
-      bool population_mutation) {
+      bool target_population_work) {
     absl::Status result = absl::OkStatus();
     if (completion.started()) {
       result = co_await SendOperationEvidence(
@@ -1590,8 +1590,8 @@ struct MetaControlClientService::Impl {
       if (!result.ok()) break;
     }
     --state->directive_completion_tasks_;
-    if (population_mutation) {
-      --state->population_completion_tasks_;
+    if (target_population_work) {
+      --state->target_population_completion_tasks_;
       if (directive.kind == control::WireDirectiveKind::kPromotionPrepare) {
         --state->promotion_prepare_tasks_;
       }
@@ -1611,21 +1611,21 @@ struct MetaControlClientService::Impl {
            !state->directive_queue_.empty()) {
       DirectiveWork work = std::move(state->directive_queue_.front());
       state->directive_queue_.pop_front();
-      const bool population_mutation =
+      const bool target_population_work =
           work.normalized_.kind_ == NodeDirective::Kind::kReplication ||
           work.normalized_.kind_ ==
               NodeDirective::Kind::kInitializeEmptyPopulation ||
           work.normalized_.kind_ == NodeDirective::Kind::kPromotionPrepare;
       const bool promotion =
           work.normalized_.kind_ == NodeDirective::Kind::kPromotionPrepare;
-      // Population completions may overlap only other population admissions,
-      // which is the path ReplicationManager uses for exact replay or
-      // supersession.
-      // Source authorization/revocation remains a serialized barrier and can
-      // neither overtake nor be overtaken by target population work.
+      // Target-population completions may overlap only other target admissions,
+      // which is the path ReplicationManager uses for exact replay and rebuild
+      // supersession. Source authorization/revocation remains a serialized
+      // barrier and can neither overtake nor be overtaken by that work.
       while (!state->closing_ && state->directive_dispatch_enabled_ &&
-             (population_mutation ? state->source_completion_tasks_ != 0
-                                  : state->directive_completion_tasks_ != 0)) {
+             (target_population_work
+                  ? state->source_completion_tasks_ != 0
+                  : state->directive_completion_tasks_ != 0)) {
         co_await state->tasks_changed_.Wait();
       }
       if (state->closing_ || !state->directive_dispatch_enabled_) break;
@@ -1638,15 +1638,15 @@ struct MetaControlClientService::Impl {
         break;
       }
       ++state->directive_completion_tasks_;
-      if (population_mutation) {
-        ++state->population_completion_tasks_;
+      if (target_population_work) {
+        ++state->target_population_completion_tasks_;
       } else {
         ++state->source_completion_tasks_;
       }
       ++state->active_tasks_;
       state->worker_->Spawn(ObserveDirectiveCompletion(
           state, std::move(work.wire_), std::move(*started),
-          state->directive_generation_, population_mutation));
+          state->directive_generation_, target_population_work));
     }
     if (state->closing_ || !state->directive_dispatch_enabled_) {
       state->directive_queue_.clear();
