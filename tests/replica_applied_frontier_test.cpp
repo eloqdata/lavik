@@ -127,6 +127,53 @@ TEST(ReplicaAppliedFrontierTest, LifecycleInstallPublishesOneVector) {
   EXPECT_EQ(frontier.TrySnapshot().value(), installed);
 }
 
+TEST(ReplicaAppliedFrontierTest, DiagnosticOffsetRemainsAvailableDuringBatch) {
+  ReplicaAppliedFrontier frontier(/*flow_count=*/2, /*publisher_count=*/1);
+  ASSERT_TRUE(
+      frontier.InstallNextLsns(std::vector<std::uint64_t>{100, 200}).ok());
+  EXPECT_EQ(frontier.ApproximateTotalNextLsn(), 300U);
+
+  // Model a publisher preempted halfway through publishing a completed
+  // transaction. A proof must fail closed, but diagnostics still have progress.
+  ASSERT_TRUE(
+      ReplicaAppliedFrontierTestPeer::BeginPublication(frontier, 0).ok());
+  ReplicaAppliedFrontierTestPeer::StoreNextLsn(frontier, 0, 101);
+  EXPECT_EQ(frontier.TrySnapshot().status().code(),
+            absl::StatusCode::kUnavailable);
+  EXPECT_EQ(frontier.ApproximateTotalNextLsn(), 301U);
+
+  ReplicaAppliedFrontierTestPeer::StoreNextLsn(frontier, 1, 201);
+  ReplicaAppliedFrontierTestPeer::EndPublication(frontier, 0);
+  EXPECT_EQ(frontier.TrySnapshot().value(),
+            (std::vector<std::uint64_t>{101, 201}));
+  EXPECT_EQ(frontier.ApproximateTotalNextLsn(), 302U);
+}
+
+TEST(ReplicaAppliedFrontierTest, DiagnosticOffsetSaturatesWithoutWrapping) {
+  ReplicaAppliedFrontier frontier(/*flow_count=*/2, /*publisher_count=*/1);
+  constexpr std::uint64_t maximum = std::numeric_limits<std::uint64_t>::max();
+  ASSERT_TRUE(
+      frontier.InstallNextLsns(std::vector<std::uint64_t>{maximum - 1, 1})
+          .ok());
+  EXPECT_EQ(frontier.ApproximateTotalNextLsn(), maximum);
+
+  ASSERT_TRUE(frontier.AdvanceAfterApply(/*flow=*/1, /*applied_lsn=*/1).ok());
+  EXPECT_EQ(frontier.ApproximateTotalNextLsn(), maximum);
+}
+
+TEST(ReplicaAppliedFrontierTest, DiagnosticOffsetReflectsResetAndReplacement) {
+  ReplicaAppliedFrontier frontier(/*flow_count=*/2, /*publisher_count=*/1);
+  ASSERT_TRUE(
+      frontier.InstallNextLsns(std::vector<std::uint64_t>{100, 200}).ok());
+  EXPECT_EQ(frontier.ApproximateTotalNextLsn(), 300U);
+
+  ASSERT_TRUE(frontier.InstallNextLsns(std::vector<std::uint64_t>{1, 1}).ok());
+  EXPECT_EQ(frontier.ApproximateTotalNextLsn(), 2U);
+
+  ReplicaAppliedFrontier replacement(/*flow_count=*/3, /*publisher_count=*/1);
+  EXPECT_EQ(replacement.ApproximateTotalNextLsn(), 3U);
+}
+
 TEST(ReplicaAppliedFrontierTest, PublicationSequenceNeverWraps) {
   ReplicaAppliedFrontier frontier(/*flow_count=*/2, /*publisher_count=*/1);
   ReplicaAppliedFrontierTestPeer::SetPublisherSequence(

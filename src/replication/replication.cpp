@@ -4555,18 +4555,11 @@ class ReplicationManager::ReplicationGroup {
             source->offset_.load(std::memory_order_acquire);
       }
       if (result.redis_sources_.empty() && applied_frontier_ != nullptr) {
-        auto snapshot = applied_frontier_->TrySnapshot();
-        if (snapshot.ok()) {
-          for (std::uint64_t next_lsn : *snapshot) {
-            if (next_lsn > std::numeric_limits<std::uint64_t>::max() -
-                               result.replica_repl_offset_) {
-              result.replica_repl_offset_ =
-                  std::numeric_limits<std::uint64_t>::max();
-              break;
-            }
-            result.replica_repl_offset_ += next_lsn;
-          }
-        }
+        // INFO/ROLE expose a compatibility scalar. Sampling current cells
+        // keeps a busy coherent snapshot from becoming a false zero offset,
+        // without retaining an old history's total across a frontier reset.
+        result.replica_repl_offset_ =
+            applied_frontier_->ApproximateTotalNextLsn();
       }
       result.replica_priority_ =
           replica_priority_.load(std::memory_order_acquire);

@@ -27,9 +27,9 @@ absl::StatusOr<std::vector<std::uint64_t>> InitialAppliedNextLsnsForReconnect(
 //
 // A transport fragment is not an applied unit: callers advance a flow only
 // after its complete logical event has been decoded and committed. Independent
-// flow publications may be sampled at adjacent instants, but one batch is
-// never exposed partially. Each publisher id is single-writer, and callers
-// must not overlap ordinary and batch publication for the same flow.
+// flow publications may be sampled at adjacent instants, but TrySnapshot()
+// never exposes one batch partially. Each publisher id is single-writer, and
+// callers must not overlap ordinary and batch publication for the same flow.
 class ReplicaAppliedFrontier {
  public:
   struct FlowApplied {
@@ -65,6 +65,11 @@ class ReplicaAppliedFrontier {
   // Returns a coherent vector or Unavailable after a bounded number of
   // concurrent-batch observations. A poisoned frontier fails closed.
   absl::StatusOr<std::vector<std::uint64_t>> TrySnapshot() const;
+
+  // Samples a UINT64_MAX-saturating total for INFO/ROLE diagnostics without
+  // allocations or retries. The total may straddle batch publication or a
+  // lifecycle reset; it is never a candidate, resume, or promotion proof.
+  std::uint64_t ApproximateTotalNextLsn() const noexcept;
 
   bool poisoned() const noexcept {
     return poisoned_.load(std::memory_order_acquire);

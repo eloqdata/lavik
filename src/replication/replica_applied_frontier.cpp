@@ -167,6 +167,21 @@ ReplicaAppliedFrontier::TrySnapshot() const {
       "replica Applied frontier remained busy during snapshot");
 }
 
+std::uint64_t ReplicaAppliedFrontier::ApproximateTotalNextLsn() const noexcept {
+  std::uint64_t total = 0;
+  for (unsigned flow = 0; flow < flow_count_; ++flow) {
+    // This scalar publishes no storage visibility or cross-flow proof, so
+    // per-cell atomicity is sufficient even while a batch sequence is odd.
+    const std::uint64_t next_lsn =
+        flows_[flow].next_lsn_.load(std::memory_order_relaxed);
+    if (next_lsn > std::numeric_limits<std::uint64_t>::max() - total) {
+      return std::numeric_limits<std::uint64_t>::max();
+    }
+    total += next_lsn;
+  }
+  return total;
+}
+
 absl::Status ReplicaAppliedFrontier::BeginPublication(
     unsigned publisher_id) noexcept {
   if (publisher_id >= publisher_count_) {
