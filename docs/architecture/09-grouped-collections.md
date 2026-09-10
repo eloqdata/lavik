@@ -35,17 +35,20 @@ Ordered roots identify a doubly linked page chain, aggregate item count and
 the next unused page identifier. Page identifiers are not reused inside an
 incarnation. Rank metadata locates a page without keeping item values resident.
 Splits and removals publish changed neighbour links and retained retirement
-records together. Recovery checks the complete chain, rank totals and every
-live extent checksum while retaining only routing envelopes. Full-page
-decoding validates local item ordering; Sorted Set materialization also checks
+records together. Sorted Set directories also retain per-page minimum and
+maximum scores, but no member boundaries. Recovery checks the complete chain,
+rank totals, numeric score boundaries and every live extent checksum while
+retaining only routing metadata. Full-page decoding validates local item
+ordering; Sorted Set materialization also checks
 score/binary-member ordering across adjacent pages.
 
 Indexed Sorted Sets persist each member twice: once in an ordered page and
 once as a Hash field whose value is an eight-byte little-endian IEEE-754
 score. The member index records scores, not ordered page identifiers, so
 ordered splits do not invalidate member routing. Neither directory retains
-members or scores in memory. Both graphs have the same incarnation and
-cardinality. Their revisions need not match: an ordered-only topology change
+per-member data in memory; the ordered directory's score bounds scale with
+pages, not members. Both graphs have the same incarnation and cardinality.
+Their revisions need not match: an ordered-only topology change
 or compensating root may retain an older, unchanged member graph.
 
 The outer root record retains source command order; its payload separately
@@ -108,6 +111,13 @@ member path. New keys, compact promotions and streaming imports build
 version-2 roots; startup does not rewrite legacy objects. Older binaries
 cannot read the new dual-index format; logical export/import is required to
 move such data back to an older format.
+
+Page score bounds are derived runtime metadata, not new durable fields. Writes
+derive them from complete replacement pages and publish them with the same
+immutable directory/root view. Recovery derives them from the existing entry
+headers during the selected pages' checksum pass, skipping member payloads in
+bounded space. Physical relocation does not change logical bounds, and old
+read/snapshot views retain their own bounds.
 
 Each group contains a complete snapshot, not a mutation log requiring read-time
 replay or compaction. An indivisible large field, list item or sorted-set
@@ -204,9 +214,10 @@ the writer, and admitted reply buffers retain their charge across owner hops.
 
 Sorted Set operations use a typed storage interface. Cardinality reads root
 metadata. Indexed score lookups read only the selected member-prefix pages;
-legacy score lookups, member ranks and range counts scan admitted ordered
-pages. Rank ranges start at the directory's selected pages; score ranges
-follow physical order. Range replies retain only admitted output members.
+legacy score lookups and member ranks scan admitted ordered pages. Rank ranges
+start at the directory's selected pages; score ranges and score counts first
+seek their candidate interval using resident score bounds, then read matching
+pages in physical order. Range replies retain only admitted output members.
 Mixed-score BYLEX preserves global member ordering without a resident member
 index by repeatedly selecting
 the next member: its work can scale with the collection size times the offset
@@ -214,12 +225,15 @@ and result count. Read-only scans retain shared key intent, yield between pages
 and revalidate their population without retaining the store mutex. Add, increment,
 remove and GEOADD use the member index, when present, to resolve old scores
 before locating ordered source pages and routing final scores against old page
-boundaries. Those ordered-page searches remain sequential. Only changed pages
-and structural link neighbours remain decoded during publication; a score
+boundaries. Resident score bounds skip unrelated pages; equal-score runs still
+require pagewise exact member comparisons. Batched requests coalesce source
+intervals and share destination boundary reads against the old logical view.
+Only changed pages and structural link neighbours remain decoded during
+publication; a score
 moving across the set does not retain or rewrite its intervening values.
-There is no resident per-member
-index: ordered lookup CPU and I/O can still scale with the collection, while
-scratch scales with requested members, selected pages and routing metadata.
+There is no resident per-member index: equal-score or legacy member searches
+can still scale with the collection, while scratch scales with requested
+members, selected pages and routing metadata.
 Repeated input members and conditional updates are evaluated in request order
 before any physical write. Endpoint pops share the typed sparse mutation path across
 single-key, multi-key and blocking commands. ZSCAN uses two pagewise passes and

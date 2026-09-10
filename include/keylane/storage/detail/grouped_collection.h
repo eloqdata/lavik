@@ -73,13 +73,42 @@ struct OrderedGroupMetadata {
   std::uint64_t next_ = 0;
   std::uint32_t item_count_ = 0;
   bool retired_ = false;
+  // Derived from entry headers, not additional durable fields. List and
+  // retired pages use zero; live Sorted Set pages retain exact score bounds.
+  double min_score_ = 0;
+  double max_score_ = 0;
 };
 
 // Recovery reads this checked envelope only after the outer-header winner and
 // every extent checksum are known. Entry payload syntax/order is validated by
 // DecodeOrderedGroup when loaded; this parser never claims to inspect values.
+// Score bounds remain zero here; the streaming decoder below derives them.
 absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
     std::string_view prefix, std::size_t encoded_bytes);
+
+// Reconstructs routing metadata from the existing page encoding in bounded
+// space. Feed the complete payload in order, after verifying each fragment's
+// physical checksum. Member bytes are skipped, never retained. This validates
+// framing and numeric score order, not member uniqueness or equal-score member
+// ordering; full page decoding remains responsible for those checks.
+class OrderedGroupMetadataDecoder {
+ public:
+  explicit OrderedGroupMetadataDecoder(std::size_t encoded_bytes) noexcept
+      : encoded_bytes_(encoded_bytes) {}
+  absl::Status Read(std::string_view bytes);
+  absl::StatusOr<OrderedGroupMetadata> Finish() const;
+
+ private:
+  std::size_t encoded_bytes_;
+  std::size_t consumed_ = 0;
+  std::size_t header_used_ = 0;
+  std::size_t member_remaining_ = 0;
+  std::uint32_t entries_ = 0;
+  bool envelope_ready_ = false;
+  bool failed_ = false;
+  std::array<char, kOrderedGroupHeaderBytes> header_{};
+  OrderedGroupMetadata metadata_;
+};
 
 // The cursor validates before emitting any data and borrows immutable entry
 // strings. An extent writer can consume it without a second full-value copy.
@@ -137,6 +166,12 @@ struct RecoveredOrderedGroup {
   std::uint64_t item_count_ = 0;
   std::uint64_t record_token_ = 0;
   bool retired_ = false;
+  // These two doubles are the resident score routing index. They are rebuilt
+  // from checked pages during recovery and published with every new directory
+  // view; physical relocation shares them unchanged. No member strings are
+  // retained, so equal-score runs still require pagewise member comparisons.
+  double min_score_ = 0;
+  double max_score_ = 0;
 };
 
 class OrderedGroupDirectory {
@@ -172,6 +207,15 @@ class OrderedGroupDirectory {
     std::uint64_t offset_;
   };
   std::optional<Position> FindRank(std::uint64_t rank) const noexcept;
+  // Sorted Set only; score must not be NaN. Return the first page whose maximum
+  // is >= score (or > score when exclusive), and the first page whose minimum
+  // is > score (or >= score when exclusive), respectively. groups().size()
+  // denotes past-the-end. Together these bound every possible matching page,
+  // including arbitrarily long equal-score runs without resident member keys.
+  std::size_t LowerBoundScore(double score,
+                              bool exclusive = false) const noexcept;
+  std::size_t UpperBoundScore(double score,
+                              bool exclusive = false) const noexcept;
   const OrderedCollectionRoot& root() const noexcept { return root_; }
   std::uint64_t sequence() const noexcept { return sequence_; }
   std::uint64_t command_sequence() const noexcept { return command_sequence_; }

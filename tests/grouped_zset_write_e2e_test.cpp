@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 
 #include "grouped_write_e2e_support.h"
@@ -91,6 +93,197 @@ TEST(GroupedSortedSetWriteE2e, MemberScoresUsePrefixPagesWithoutOrderedReads) {
   EXPECT_NE(range.text_.find("injected ordered-page"), std::string::npos);
   EXPECT_EQ(client.Command({"ZCARD", "indexed"}).text_, "256");
   EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e, ScoreBoundsSkipUnrelatedPagesAfterRecovery) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires selected ordered-page failure injection";
+#endif
+  PrivateDisk disk;
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed("routed")).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  struct Fault {
+    std::optional<std::string> key_, page_;
+    Fault() {
+      if (const char* value = std::getenv("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY"))
+        key_ = value;
+      if (const char* value =
+              std::getenv("KEYLANE_FAIL_ZSET_ORDERED_READ_PAGE"))
+        page_ = value;
+      ::setenv("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY", "routed", 1);
+      ::setenv("KEYLANE_FAIL_ZSET_ORDERED_READ_PAGE", "1", 1);
+    }
+    ~Fault() {
+      if (key_)
+        ::setenv("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY", key_->c_str(), 1);
+      else
+        ::unsetenv("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY");
+      if (page_)
+        ::setenv("KEYLANE_FAIL_ZSET_ORDERED_READ_PAGE", page_->c_str(), 1);
+      else
+        ::unsetenv("KEYLANE_FAIL_ZSET_ORDERED_READ_PAGE");
+    }
+  } fault;
+  // Changing worker count forces recovery/physical owner reassignment too.
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  const auto member = "220" + std::string(128, 'm');
+  EXPECT_EQ(client.Command({"ZINCRBY", "routed", "0.25", member}).text_,
+            "220.25");
+  auto range = client.Command({"ZRANGEBYSCORE", "routed", "220", "221"});
+  ASSERT_EQ(range.items_.size(), 2) << range.text_;
+  EXPECT_EQ(range.items_[0].text_, member);
+  EXPECT_EQ(client.Command({"ZCOUNT", "routed", "200", "230"}).text_, "31");
+  EXPECT_EQ(
+      client.Command({"ZREM", "routed", "240" + std::string(128, 'm')}).text_,
+      "1");
+  // Negative control: the fault must be armed, not merely skipped by Release.
+  const auto first = client.Command({"ZRANGE", "routed", "0", "0"});
+  EXPECT_EQ(first.kind_, '-');
+  EXPECT_NE(first.text_.find("injected ordered-page"), std::string::npos);
+  client.Durable();
+  EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e, ScoreBoundsHandleLongTieRunsAndMixedBatchMoves) {
+  PrivateDisk disk;
+  std::vector<std::string> members;
+  std::map<std::string, double> expected;
+  std::vector<std::string> seed{"ZADD", "ties"};
+  for (unsigned i = 0; i < 64; ++i) {
+    // Every member exceeds the page target: the equal-score run necessarily
+    // spans many pages, rather than only exercising a page-local tie search.
+    members.push_back(std::to_string(1000 + i) + std::string(20 * 1024, 'x'));
+    const double score = i < 8 ? -1 : i < 56 ? 7 : 20;
+    expected[members.back()] = score;
+    seed.push_back(std::to_string(score));
+    seed.push_back(members.back());
+  }
+  auto check = [&](Client& client) {
+    std::vector<std::pair<double, std::string>> sorted;
+    for (const auto& [member, score] : expected)
+      sorted.emplace_back(score, member);
+    std::sort(sorted.begin(), sorted.end());
+    const auto all =
+        client.Command({"ZRANGE", "ties", "0", "-1", "WITHSCORES"});
+    ASSERT_EQ(all.kind_, '*') << all.text_;
+    ASSERT_EQ(all.items_.size(), 2 * sorted.size());
+    for (std::size_t i = 0; i < sorted.size(); ++i) {
+      EXPECT_EQ(all.items_[2 * i].text_, sorted[i].second) << "rank " << i;
+      EXPECT_EQ(std::stod(all.items_[2 * i + 1].text_), sorted[i].first);
+    }
+    const auto tied = client.Command({"ZRANGEBYSCORE", "ties", "7", "7"});
+    std::vector<std::string> at_seven;
+    std::size_t above_seven = 0;
+    for (const auto& [score, member] : sorted) {
+      if (score == 7) at_seven.push_back(member);
+      if (score > 7 && score <= 20) ++above_seven;
+    }
+    ASSERT_EQ(tied.items_.size(), at_seven.size()) << tied.text_;
+    for (std::size_t i = 0; i < at_seven.size(); ++i)
+      EXPECT_EQ(tied.items_[i].text_, at_seven[i]);
+    EXPECT_EQ(client.Command({"ZCOUNT", "ties", "(7", "20"}).text_,
+              std::to_string(above_seven));
+    EXPECT_EQ(client.Command({"ZCOUNT", "ties", "7", "(7"}).text_, "0");
+    EXPECT_EQ(client.Command({"ZCARD", "ties"}).text_,
+              std::to_string(expected.size()));
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(seed).text_, "64");
+    check(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    Server server(disk, 3);
+    Client client(server.port());
+    check(client);
+    // Preserve binary member ordering when inserting into an existing tie run.
+    const auto fresh = members[30] + std::string(1, '\0');
+    ASSERT_EQ(client
+                  .Command({"ZADD", "ties", "CH", "-inf", members[63], "7",
+                            members[0], "20", members[10], "7", fresh})
+                  .text_,
+              "4");
+    expected[members[63]] = -std::numeric_limits<double>::infinity();
+    expected[members[0]] = 7;
+    expected[members[10]] = 20;
+    expected[fresh] = 7;
+    check(client);
+    ASSERT_EQ(client
+                  .Command({"ZADD", "ties", "CH", "7", members[10], "20",
+                            members[10], "7", members[10]})
+                  .text_,
+              "3");
+    expected[members[10]] = 7;
+    ASSERT_EQ(client
+                  .Command({"ZREM", "ties", members[24], members[31],
+                            members[24], "missing"})
+                  .text_,
+              "2");
+    expected.erase(members[24]);
+    expected.erase(members[31]);
+    ASSERT_EQ(client
+                  .Command({"ZADD", "ties", "CH", "+inf", members[62], "-0",
+                            members[3], "+0", members[4]})
+                  .text_,
+              "3");
+    expected[members[62]] = std::numeric_limits<double>::infinity();
+    expected[members[3]] = expected[members[4]] = 0;
+    ASSERT_EQ(client.Command({"ZINCRBY", "ties", "1", members[20]}).text_, "8");
+    expected[members[20]] = 8;
+    check(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  check(client);
+  ASSERT_EQ(client.Command({"ZADD", "ties", "CH", "6.5", members[48]}).text_,
+            "1");
+  expected[members[48]] = 6.5;
+  check(client);
+}
+
+TEST(GroupedSortedSetWriteE2e, ScoreBoundsRecoverAfterMultiExtentParentKey) {
+  PrivateDisk disk;
+  // The parent key consumes an entire extent before the ordered encoding
+  // begins. Recovery must checksum but not feed those key bytes to the score
+  // decoder, including when the runtime assigns new physical owners.
+  const std::string key(9 * 1024 * 1024, 'K');
+  const std::string first(9000, 'a'), middle(9000, 'b'), last(9000, 'c');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(
+        client.Command({"ZADD", key, "10", first, "20", middle, "30", last})
+            .text_,
+        "3");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    Server recovered(disk, 3);
+    Client client(recovered.port());
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "1", last}).text_, "31");
+    const auto range = client.Command({"ZRANGEBYSCORE", key, "30", "32"});
+    ASSERT_EQ(range.items_.size(), 1) << range.text_;
+    EXPECT_EQ(range.items_[0].text_, last);
+    EXPECT_EQ(client.Command({"ZCOUNT", key, "(10", "31"}).text_, "2");
+    client.Durable();
+    ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZINCRBY", key, "-1", last}).text_, "30");
+  EXPECT_EQ(client.Command({"ZCARD", key}).text_, "3");
 }
 
 TEST(GroupedSortedSetWriteE2e, FailedMemberWriteCannotCommitOrderedHalf) {

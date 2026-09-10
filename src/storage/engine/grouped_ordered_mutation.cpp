@@ -299,17 +299,21 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       continue;
     }
     const auto& page = plan.writes_[i];
-    candidates.push_back({.incarnation_ = plan.root_.incarnation_,
-                          .id_ = page.id_,
-                          .previous_ = page.previous_,
-                          .next_ = page.next_,
-                          .sequence_ = revision,
-                          .lsn_ = revision,
-                          .txid_ = tx->txid_,
-                          .batch_txid_ = command_batch,
-                          .item_count_ = group.location_.logical_size_,
-                          .record_token_ = page.id_,
-                          .retired_ = group.retired_});
+    candidates.push_back(
+        {.incarnation_ = plan.root_.incarnation_,
+         .id_ = page.id_,
+         .previous_ = page.previous_,
+         .next_ = page.next_,
+         .sequence_ = revision,
+         .lsn_ = revision,
+         .txid_ = tx->txid_,
+         .batch_txid_ = command_batch,
+         .item_count_ = group.location_.logical_size_,
+         .record_token_ = page.id_,
+         .retired_ = group.retired_,
+         .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
+         .max_score_ =
+             page.entries_.empty() ? 0 : page.entries_.back().score_});
   }
   GroupedHashObject::PreparedHandle builder;
   GroupRecordWrite root_write{

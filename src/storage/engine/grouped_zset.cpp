@@ -705,8 +705,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     };
     auto read_page = [&](std::size_t i) -> Task<absl::StatusOr<ScanPage>> {
       KEYLANE_FAULT_INJECT(
+          // An optional one-based directory page isolates routing tests from
+          // the existing fail-all-ordered-reads member-index test.
           if (KEYLANE_FAULT_MATCHES("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY",
-                                    key)) co_return absl::
+                                    key) &&
+              (std::getenv("KEYLANE_FAIL_ZSET_ORDERED_READ_PAGE") == nullptr ||
+               KEYLANE_FAULT_MATCHES_NTH("KEYLANE_FAIL_ZSET_ORDERED_READ_KEY",
+                                         key,
+                                         "KEYLANE_FAIL_ZSET_ORDERED_READ_PAGE",
+                                         i + 1))) co_return absl::
               UnavailableError("injected ordered-page read failure"););
       if (ReadOnly(operation)) {
         co_await celer::Yield(*store.worker_);
@@ -851,6 +858,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
             operation.reverse_ ? result.length_ - cursor.first_ : cursor.end_;
         first_page = directory.FindRank(begin_rank)->group_index_;
         end_page = directory.FindRank(end_rank - 1)->group_index_ + 1;
+      } else if (operation.kind_ != SortedSetOperationKind::kRank &&
+                 operation.range_mode_ == SortedSetRangeMode::kScore) {
+        first_page =
+            directory.LowerBoundScore(operation.minimum_score_.value_,
+                                      operation.minimum_score_.exclusive_);
+        end_page =
+            directory.UpperBoundScore(operation.maximum_score_.value_,
+                                      operation.maximum_score_.exclusive_);
+        if (first_page >= end_page) co_return result;
       }
       std::uint64_t rank = 0;
       const bool reverse = operation.reverse_;
@@ -927,26 +943,49 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         co_return result;
       }
     }
-    // Legacy roots still discover membership pagewise. Indexed mutations
-    // already know old scores, but retain the existing ordered-page locator;
-    // adding a score-boundary seek index is an independent optimization.
-    for (std::size_t i = 0;
-         i < metadata.size() && (!indexed || remaining_sources != 0); ++i) {
-      auto page = co_await read_page(i);
-      if (!page.ok()) co_return page.status();
-      for (const auto& entry : page->page_.snapshot_.entries_) {
-        auto member = members.find(entry.value_);
-        if (member == members.end()) continue;
-        auto& state = member->second;
-        if ((!indexed && state.before_) || state.source_ != kNoPage)
+    // The two resident doubles bound old-score candidates without reading
+    // unrelated pages. Equal-score runs still scan for exact members. Sort
+    // and merge requested intervals so a batch reads an overlapping page only
+    // once; interval storage is covered by the per-input reservation. Legacy
+    // roots have no old-score lookup and keep the full membership scan.
+    std::vector<std::pair<std::size_t, std::size_t>> source_ranges;
+    if (indexed) {
+      source_ranges.reserve(members.size());
+      for (const auto& [member, state] : members) {
+        if (!state.before_) continue;
+        const auto first = directory.LowerBoundScore(*state.before_);
+        const auto end = directory.UpperBoundScore(*state.before_);
+        if (first >= end)
           co_return absl::DataLossError(
-              "duplicate persisted Sorted Set member");
-        if (indexed && (!state.before_ || *state.before_ != entry.score_))
-          co_return absl::DataLossError("member-index/ordered score mismatch");
-        state.before_ = state.after_ = entry.score_;
-        state.source_ = i;
-        if (indexed) --remaining_sources;
+              "member score lies outside ordered pages");
+        source_ranges.emplace_back(first, end);
       }
+      std::sort(source_ranges.begin(), source_ranges.end());
+    } else {
+      source_ranges.emplace_back(0, metadata.size());
+    }
+    std::size_t scanned_end = 0;
+    for (const auto& [first, end] : source_ranges) {
+      for (std::size_t i = std::max(first, scanned_end);
+           i < end && (!indexed || remaining_sources != 0); ++i) {
+        auto page = co_await read_page(i);
+        if (!page.ok()) co_return page.status();
+        for (const auto& entry : page->page_.snapshot_.entries_) {
+          auto member = members.find(entry.value_);
+          if (member == members.end()) continue;
+          auto& state = member->second;
+          if ((!indexed && state.before_) || state.source_ != kNoPage)
+            co_return absl::DataLossError(
+                "duplicate persisted Sorted Set member");
+          if (indexed && (!state.before_ || *state.before_ != entry.score_))
+            co_return absl::DataLossError(
+                "member-index/ordered score mismatch");
+          state.before_ = state.after_ = entry.score_;
+          state.source_ = i;
+          if (indexed) --remaining_sources;
+        }
+      }
+      scanned_end = std::max(scanned_end, end);
     }
     if (indexed && remaining_sources != 0)
       co_return absl::DataLossError(
@@ -982,24 +1021,32 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       return *a.second->after_ < *b.second->after_ ||
              (*a.second->after_ == *b.second->after_ && a.first < b.first);
     });
-    // Original last (score,member) bounds are stable fences for this mutation,
-    // even when that last member moves away. A cross-set score move therefore
-    // changes only its two endpoint pages, not all intervening values.
+    // Original page bounds remain stable fences for the entire batch, even
+    // when boundary members move. Scores alone route strict inequalities;
+    // only a tie with a page's maximum needs its last member decoded. Skip
+    // gaps in the request with an in-memory seek, preserving sequential reads
+    // for equal-score runs and reusing each boundary page within the batch.
     std::size_t next = 0;
     for (std::size_t i = 0; next != pending.size() && i < metadata.size();
          ++i) {
-      auto page = co_await read_page(i);
-      if (!page.ok()) co_return page.status();
-      const auto& entries = page->page_.snapshot_.entries_;
-      if (entries.empty())
-        co_return absl::DataLossError("empty active Sorted Set page");
-      const auto& last = entries.back();
+      i = std::max(
+          i, std::min(directory.LowerBoundScore(*pending[next].second->after_),
+                      metadata.size() - 1));
+      std::optional<ScanPage> boundary;
       while (next != pending.size()) {
         const auto& [member, state] = pending[next];
-        if (i + 1 != metadata.size() &&
-            (*state->after_ > last.score_ ||
-             (*state->after_ == last.score_ && member > last.value_)))
-          break;
+        if (i + 1 != metadata.size()) {
+          if (*state->after_ > metadata[i].max_score_) break;
+          if (*state->after_ == metadata[i].max_score_) {
+            if (!boundary) {
+              auto page = co_await read_page(i);
+              if (!page.ok()) co_return page.status();
+              boundary.emplace(std::move(*page));
+            }
+            if (member > boundary->page_.snapshot_.entries_.back().value_)
+              break;
+          }
+        }
         state->destination_ = i;
         modified.insert(i);
         ++next;

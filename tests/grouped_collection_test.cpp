@@ -43,16 +43,20 @@ std::vector<RecoveredOrderedGroup> Candidates(
     std::uint64_t txid = 0) {
   std::vector<RecoveredOrderedGroup> result;
   for (const auto& page : pages) {
-    result.push_back({.incarnation_ = page.incarnation_,
-                      .id_ = page.id_,
-                      .previous_ = page.previous_,
-                      .next_ = page.next_,
-                      .sequence_ = seq,
-                      .lsn_ = seq,
-                      .txid_ = txid,
-                      .item_count_ = page.entries_.size(),
-                      .record_token_ = page.id_,
-                      .retired_ = page.retired_});
+    result.push_back(
+        {.incarnation_ = page.incarnation_,
+         .id_ = page.id_,
+         .previous_ = page.previous_,
+         .next_ = page.next_,
+         .sequence_ = seq,
+         .lsn_ = seq,
+         .txid_ = txid,
+         .item_count_ = page.entries_.size(),
+         .record_token_ = page.id_,
+         .retired_ = page.retired_,
+         .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
+         .max_score_ =
+             page.entries_.empty() ? 0 : page.entries_.back().score_});
   }
   return result;
 }
@@ -580,6 +584,154 @@ TEST(GroupedCollectionTest, EnvelopeOnlyDecodeAndDualDecisionRetirement) {
   revived.retired_ = false;
   revived.item_count_ = 1;
   EXPECT_FALSE(directory->Apply(root, 11, std::span(&revived, 1), 7).ok());
+}
+
+TEST(GroupedCollectionTest, StreamingMetadataRebuildsBoundsAcrossAnyFraming) {
+  const auto infinity = std::numeric_limits<double>::infinity();
+  auto page = Page(1, 0, OrderedCollectionKind::kSortedSet);
+  page.entries_ = {{"", -infinity},
+                   {"a" + std::string(65537, 'x'), -0.0},
+                   {"b", 0.0},
+                   {"c", 1.5},
+                   {"d", infinity}};
+  for (auto kind :
+       {OrderedCollectionKind::kSortedSet, OrderedCollectionKind::kList}) {
+    page.kind_ = kind;
+    if (kind == OrderedCollectionKind::kList)
+      for (auto& entry : page.entries_) entry.score_ = 0;
+    const auto encoded = EncodeOrderedGroup(page);
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    for (const std::size_t chunk : {1, 7, 12, 63, 64, 65, 4096, 65536}) {
+      OrderedGroupMetadataDecoder decoder(encoded->size());
+      EXPECT_TRUE(decoder.Read({}).ok());
+      for (std::size_t offset = 0; offset < encoded->size(); offset += chunk)
+        ASSERT_TRUE(
+            decoder.Read(std::string_view(*encoded).substr(offset, chunk)).ok())
+            << "chunk=" << chunk << " offset=" << offset;
+      const auto metadata = decoder.Finish();
+      ASSERT_TRUE(metadata.ok()) << metadata.status();
+      EXPECT_EQ(metadata->id_, page.id_);
+      EXPECT_EQ(metadata->item_count_, page.entries_.size());
+      EXPECT_EQ(metadata->min_score_, page.entries_.front().score_);
+      EXPECT_EQ(metadata->max_score_, page.entries_.back().score_);
+    }
+  }
+  page.retired_ = true;
+  page.entries_.clear();
+  const auto encoded = EncodeOrderedGroup(page);
+  ASSERT_TRUE(encoded.ok());
+  OrderedGroupMetadataDecoder decoder(encoded->size());
+  ASSERT_TRUE(decoder.Read(*encoded).ok());
+  const auto retired = decoder.Finish();
+  ASSERT_TRUE(retired.ok());
+  EXPECT_TRUE(retired->retired_);
+  EXPECT_EQ(retired->min_score_, 0);
+  EXPECT_EQ(retired->max_score_, 0);
+}
+
+TEST(GroupedCollectionTest,
+     StreamingMetadataRejectsTruncationAndInvalidScores) {
+  auto page = Page(1, 2, OrderedCollectionKind::kSortedSet);
+  const auto encoded = EncodeOrderedGroup(page);
+  ASSERT_TRUE(encoded.ok());
+  for (std::size_t size = 0; size < encoded->size(); ++size) {
+    OrderedGroupMetadataDecoder decoder(encoded->size());
+    ASSERT_TRUE(decoder.Read(std::string_view(*encoded).substr(0, size)).ok());
+    EXPECT_FALSE(decoder.Finish().ok()) << "truncated size=" << size;
+  }
+  OrderedGroupMetadataDecoder extra(encoded->size());
+  ASSERT_TRUE(extra.Read(*encoded).ok());
+  EXPECT_FALSE(extra.Read("x").ok());
+  EXPECT_FALSE(extra.Finish().ok());
+  for (const double score : {-1.0, std::numeric_limits<double>::quiet_NaN()}) {
+    auto corrupt = *encoded;
+    const auto second_score =
+        kOrderedGroupHeaderBytes + 12 + page.entries_[0].value_.size() + 4;
+    const auto bits = std::bit_cast<std::uint64_t>(score);
+    for (unsigned byte = 0; byte < 8; ++byte)
+      corrupt[second_score + byte] = static_cast<char>(bits >> (8 * byte));
+    OrderedGroupMetadataDecoder decoder(corrupt.size());
+    EXPECT_FALSE(decoder.Read(corrupt).ok());
+    EXPECT_FALSE(decoder.Finish().ok());
+  }
+}
+
+TEST(GroupedCollectionTest, ScoreBoundsSeekGapsTiesInfinitiesAndExclusiveEnds) {
+  const auto infinity = std::numeric_limits<double>::infinity();
+  const std::vector<std::pair<double, double>> bounds = {
+      {-infinity, -1}, {-0.0, 0.0}, {0, 0}, {0, 10}, {30, infinity}};
+  std::vector<OrderedGroupSnapshot> pages;
+  for (std::size_t i = 0; i < bounds.size(); ++i) {
+    pages.push_back(
+        {.kind_ = OrderedCollectionKind::kSortedSet,
+         .incarnation_ = 17,
+         .id_ = i + 1,
+         .previous_ = i,
+         .next_ = i + 1 == bounds.size() ? 0 : i + 2,
+         .entries_ = {{std::to_string(i) + "a", bounds[i].first},
+                      {std::to_string(i) + "b", bounds[i].second}}});
+  }
+  auto root = Root(pages, pages.size() + 1);
+  const auto records = Candidates(pages);
+  auto directory = OrderedGroupDirectory::Recover(root, 1, records, {});
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  for (double score :
+       {-infinity, -2.0, -1.0, -0.0, 0.0, 1.0, 10.0, 11.0, 30.0, infinity}) {
+    for (bool exclusive : {false, true}) {
+      std::size_t lower = 0, upper = 0;
+      while (lower < bounds.size() &&
+             (exclusive ? bounds[lower].second <= score
+                        : bounds[lower].second < score))
+        ++lower;
+      while (upper < bounds.size() &&
+             (exclusive ? bounds[upper].first < score
+                        : bounds[upper].first <= score))
+        ++upper;
+      EXPECT_EQ(directory->LowerBoundScore(score, exclusive), lower) << score;
+      EXPECT_EQ(directory->UpperBoundScore(score, exclusive), upper) << score;
+    }
+  }
+  EXPECT_EQ(directory->LowerBoundScore(0), 1);
+  EXPECT_EQ(directory->UpperBoundScore(0), 4);
+  EXPECT_EQ(directory->LowerBoundScore(11), directory->UpperBoundScore(11));
+
+  // A new logical view replaces the changed fence, while suspended readers
+  // retain the previous directory's score range and rank counts.
+  root.revision_ = 2;
+  auto changed = records[3];
+  changed.sequence_ = changed.lsn_ = 2;
+  changed.max_score_ = 20;
+  auto updated = directory->Apply(root, 2, std::span(&changed, 1), 2);
+  ASSERT_TRUE(updated.ok()) << updated.status();
+  EXPECT_EQ(directory->LowerBoundScore(15), 4);
+  EXPECT_EQ(updated->LowerBoundScore(15), 3);
+  EXPECT_EQ(updated->FindRank(6)->group_index_, 3);
+}
+
+TEST(GroupedCollectionTest, RecoveryRejectsInvalidAndNonMonotoneScoreBounds) {
+  auto page = Page(1, 2, OrderedCollectionKind::kSortedSet);
+  page.next_ = 2;
+  auto next = Page(2, 2, OrderedCollectionKind::kSortedSet);
+  next.previous_ = 1;
+  for (auto& entry : next.entries_) entry.score_ += 2;
+  const auto root = Root({page, next}, 3);
+  auto records = Candidates({page, next});
+  const auto good = records;
+  ASSERT_TRUE(OrderedGroupDirectory::Recover(root, 1, records, {}).ok());
+  records[1].min_score_ = 0;
+  EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 1, records, {}).ok());
+  records = good;
+  records[1].min_score_ = 4;
+  EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 1, records, {}).ok());
+  records = good;
+  records[1].max_score_ = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 1, records, {}).ok());
+  records = good;
+  auto conflicting = records[1];
+  conflicting.lsn_ = 2;
+  conflicting.max_score_ = 4;
+  records.push_back(conflicting);
+  EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 1, records, {}).ok());
 }
 
 }  // namespace

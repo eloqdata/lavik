@@ -37,7 +37,9 @@ SortedFixture Fixture() {
                           .sequence_ = 1,
                           .lsn_ = 1,
                           .item_count_ = 4,
-                          .record_token_ = id});
+                          .record_token_ = id,
+                          .min_score_ = page.entries_.front().score_,
+                          .max_score_ = page.entries_.back().score_});
     fixture.pages_.push_back(std::move(page));
   }
   OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kSortedSet,
@@ -64,15 +66,19 @@ void CheckApplied(const SortedFixture& fixture,
   std::vector<RecoveredOrderedGroup> changed;
   for (const auto& page : plan.writes_) {
     pages[page.id_] = page;
-    changed.push_back({.incarnation_ = page.incarnation_,
-                       .id_ = page.id_,
-                       .previous_ = page.previous_,
-                       .next_ = page.next_,
-                       .sequence_ = 2,
-                       .lsn_ = 2,
-                       .item_count_ = page.entries_.size(),
-                       .record_token_ = page.id_,
-                       .retired_ = page.retired_});
+    changed.push_back(
+        {.incarnation_ = page.incarnation_,
+         .id_ = page.id_,
+         .previous_ = page.previous_,
+         .next_ = page.next_,
+         .sequence_ = 2,
+         .lsn_ = 2,
+         .item_count_ = page.entries_.size(),
+         .record_token_ = page.id_,
+         .retired_ = page.retired_,
+         .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
+         .max_score_ =
+             page.entries_.empty() ? 0 : page.entries_.back().score_});
   }
   plan.root_.revision_ = 2;
   auto directory = fixture.directory_.Apply(plan.root_, 2, changed, 2);

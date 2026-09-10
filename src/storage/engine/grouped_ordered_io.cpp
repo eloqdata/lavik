@@ -171,6 +171,10 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
       }
       auto decoded = DecodeOrderedGroup(payload);
       if (!decoded.ok()) co_return decoded.status();
+      if (root.kind_ == OrderedCollectionKind::kSortedSet &&
+          (decoded->entries_.front().score_ != route->min_score_ ||
+           decoded->entries_.back().score_ != route->max_score_))
+        co_return absl::DataLossError("ordered page score bounds mismatch");
       co_return LoadedOrderedGroup{.sequence_ = location.mutation_sequence_,
                                    .snapshot_ = std::move(*decoded)};
     }

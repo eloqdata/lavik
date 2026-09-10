@@ -104,7 +104,11 @@ bool SameMetadata(const RecoveredOrderedGroup& left,
                   const RecoveredOrderedGroup& right) {
   return left.previous_ == right.previous_ && left.next_ == right.next_ &&
          left.item_count_ == right.item_count_ &&
-         left.retired_ == right.retired_;
+         left.retired_ == right.retired_ &&
+         std::bit_cast<std::uint64_t>(left.min_score_) ==
+             std::bit_cast<std::uint64_t>(right.min_score_) &&
+         std::bit_cast<std::uint64_t>(left.max_score_) ==
+             std::bit_cast<std::uint64_t>(right.max_score_);
 }
 
 OrderedGroupSnapshot Retired(const OrderedCollectionRoot& root,
@@ -312,6 +316,67 @@ absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
   return result;
 }
 
+absl::Status OrderedGroupMetadataDecoder::Read(std::string_view bytes) {
+  auto fail = [&](std::string_view message) {
+    failed_ = true;
+    return absl::DataLossError(message);
+  };
+  if (failed_ || consumed_ > encoded_bytes_ ||
+      bytes.size() > encoded_bytes_ - consumed_)
+    return fail("ordered metadata stream length mismatch");
+  consumed_ += bytes.size();
+  while (!bytes.empty()) {
+    if (member_remaining_ != 0) {
+      const auto skipped = std::min(member_remaining_, bytes.size());
+      member_remaining_ -= skipped;
+      bytes.remove_prefix(skipped);
+      continue;
+    }
+    if (envelope_ready_ && entries_ == metadata_.item_count_)
+      return fail("ordered metadata stream has trailing bytes");
+    const auto header_bytes =
+        envelope_ready_ ? kEntryHeaderBytes : kOrderedGroupHeaderBytes;
+    const auto copied = std::min(header_bytes - header_used_, bytes.size());
+    std::copy_n(bytes.data(), copied, header_.data() + header_used_);
+    header_used_ += copied;
+    bytes.remove_prefix(copied);
+    if (header_used_ != header_bytes) continue;
+    header_used_ = 0;
+    const std::string_view header(header_.data(), header_bytes);
+    if (!envelope_ready_) {
+      auto metadata = DecodeOrderedGroupMetadata(header, encoded_bytes_);
+      if (!metadata.ok()) {
+        failed_ = true;
+        return metadata.status();
+      }
+      metadata_ = *metadata;
+      envelope_ready_ = true;
+      continue;
+    }
+    const auto length = Load(header, 0, 4);
+    const auto score_bits = Load(header, 4, 8);
+    const auto score = std::bit_cast<double>(score_bits);
+    if (length > kMaxStringBytes || std::isnan(score) ||
+        (metadata_.kind_ == OrderedCollectionKind::kList && score_bits != 0) ||
+        (entries_ != 0 && score < metadata_.max_score_))
+      return fail("invalid ordered metadata entry length/score");
+    if (entries_ == 0) metadata_.min_score_ = score;
+    metadata_.max_score_ = score;
+    ++entries_;
+    member_remaining_ = length;
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<OrderedGroupMetadata> OrderedGroupMetadataDecoder::Finish()
+    const {
+  if (failed_ || !envelope_ready_ || consumed_ != encoded_bytes_ ||
+      header_used_ != 0 || member_remaining_ != 0 ||
+      entries_ != metadata_.item_count_)
+    return absl::DataLossError("unfinished ordered metadata stream");
+  return metadata_;
+}
+
 absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
                                           const OrderedGroupSnapshot& right) {
   if (left.kind_ != right.kind_ || left.incarnation_ != right.incarnation_ ||
@@ -351,7 +416,9 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
         candidate.record_token_ == 0 ||
         (candidate.retired_ ? (candidate.item_count_ != 0 ||
                                candidate.previous_ != 0 || candidate.next_ != 0)
-                            : candidate.item_count_ == 0)) {
+                            : candidate.item_count_ == 0) ||
+        std::isnan(candidate.min_score_) || std::isnan(candidate.max_score_) ||
+        candidate.min_score_ > candidate.max_score_) {
       return absl::DataLossError("invalid recovered ordered page");
     }
     auto [it, inserted] = winners.emplace(candidate.id_, candidate);
@@ -395,6 +462,10 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
       return absl::DataLossError("broken ordered page chain or count");
     }
     const auto& group = found->second;
+    if (root.kind_ == OrderedCollectionKind::kSortedSet &&
+        !result.groups_.empty() &&
+        result.groups_.back().max_score_ > group.min_score_)
+      return absl::DataLossError("unordered recovered Sorted Set score bounds");
     result.ids_.emplace_back(group.id_, result.groups_.size());
     result.groups_.push_back(group);
     count += group.item_count_;
@@ -480,6 +551,26 @@ std::optional<OrderedGroupDirectory::Position> OrderedGroupDirectory::FindRank(
   const auto found = std::upper_bound(ends_.begin(), ends_.end(), rank);
   const std::size_t index = found - ends_.begin();
   return Position{index, rank - (index == 0 ? 0 : ends_[index - 1])};
+}
+
+std::size_t OrderedGroupDirectory::LowerBoundScore(
+    double score, bool exclusive) const noexcept {
+  const auto found = std::lower_bound(groups_.begin(), groups_.end(), score,
+                                      [exclusive](const auto& page, double at) {
+                                        return exclusive ? page.max_score_ <= at
+                                                         : page.max_score_ < at;
+                                      });
+  return found - groups_.begin();
+}
+
+std::size_t OrderedGroupDirectory::UpperBoundScore(
+    double score, bool exclusive) const noexcept {
+  const auto found = std::lower_bound(
+      groups_.begin(), groups_.end(), score,
+      [exclusive](const auto& page, double at) {
+        return exclusive ? page.min_score_ < at : page.min_score_ <= at;
+      });
+  return found - groups_.begin();
 }
 
 absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(OrderedGroupSnapshot group,

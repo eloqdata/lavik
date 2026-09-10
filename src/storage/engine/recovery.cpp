@@ -52,7 +52,8 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
 
 Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
     WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-    std::span<std::byte> destination, std::size_t payload_offset) {
+    std::span<std::byte> destination, std::size_t payload_offset,
+    OrderedGroupMetadataDecoder* ordered) {
   if (payload_offset > ref.payload_bytes_) {
     co_return absl::DataLossError("recovered extent slice is out of bounds");
   }
@@ -88,6 +89,15 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
   if (Crc32c(payload) != ref.payload_checksum_) {
     co_return absl::InternalError("recovered key extent checksum mismatch");
   }
+  if (ordered != nullptr) {
+    // The caller awaits each extent before proceeding. Even an SPDK owner hop
+    // has exclusive access to this bounded, non-affine decoder until return;
+    // no borrowed I/O span or worker-owned metadata survives this call.
+    auto status = ordered->Read(std::string_view(
+        reinterpret_cast<const char*>(payload.data() + payload_offset),
+        payload.size() - payload_offset));
+    if (!status.ok()) co_return status;
+  }
   if (!destination.empty()) {
     std::memcpy(destination.data(), payload.data() + payload_offset,
                 std::min(payload.size() - payload_offset, destination.size()));
@@ -97,7 +107,7 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
 
 Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadRecoveryPayloadSlice(
     WorkerStore& store, ExtentManifest extents, std::size_t offset,
-    std::size_t bytes) {
+    std::size_t bytes, OrderedGroupMetadataDecoder* ordered) {
   if (extents == nullptr || bytes > kMaxRecordPayloadBytes) {
     co_return absl::DataLossError("recovered payload slice has no manifest");
   }
@@ -109,7 +119,7 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadRecoveryPayloadSlice(
     std::size_t count = 0;
     if (offset >= ref.payload_bytes_) {
       offset -= ref.payload_bytes_;
-      slice_offset = 0;
+      slice_offset = ref.payload_bytes_;
     } else {
       count =
           std::min<std::size_t>(bytes - copied, ref.payload_bytes_ - offset);
@@ -118,6 +128,8 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadRecoveryPayloadSlice(
     // The envelope is small, but every extent still crosses checksum and
     // identity validation before this graph can become recovery authority.
     // Empty destinations validate the remaining payload without retaining it.
+    // Ordered recovery also observes its entry headers in this same pass to
+    // derive score bounds without a format change or value-sized allocation.
     const auto destination = std::span<std::byte>(
         reinterpret_cast<std::byte*>(result.data() + copied), count);
     absl::Status read;
@@ -129,21 +141,21 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadRecoveryPayloadSlice(
     if (owner != store.worker_->id()) {
       read = co_await celer::SubmitTaskTo(
           owner,
-          [this, owner, ref, index, destination,
-           slice_offset]() -> Task<absl::Status> {
+          [this, owner, ref, index, destination, slice_offset,
+           ordered]() -> Task<absl::Status> {
             co_return co_await ReadRecoveryExtentInto(
                 *stores_[owner], ref, static_cast<std::uint32_t>(index),
-                destination, slice_offset);
+                destination, slice_offset, ordered);
           });
     } else {
-      read = co_await ReadRecoveryExtentInto(store, ref,
-                                             static_cast<std::uint32_t>(index),
-                                             destination, slice_offset);
+      read = co_await ReadRecoveryExtentInto(
+          store, ref, static_cast<std::uint32_t>(index), destination,
+          slice_offset, ordered);
     }
 #else
     read = co_await ReadRecoveryExtentInto(store, ref,
                                            static_cast<std::uint32_t>(index),
-                                           destination, slice_offset);
+                                           destination, slice_offset, ordered);
 #endif
     if (!read.ok()) co_return read;
     copied += count;
@@ -668,6 +680,12 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                   .batch_txid_ = record.group_batch_txid_,
                   .item_count_ = record.logical_size_,
                   .retired_ = record.group_retired_,
+                  .min_score_ = decoded->entries_.empty()
+                                    ? 0
+                                    : decoded->entries_.front().score_,
+                  .max_score_ = decoded->entries_.empty()
+                                    ? 0
+                                    : decoded->entries_.back().score_,
               };
             } else {
               auto decoded = DecodeHashGroup(encoded);
@@ -1260,12 +1278,15 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
         co_return absl::DataLossError("ordered page parent key is truncated");
       // Only the highest committed revision of each stable id reaches IO.
       // Superseded value-only extents may already be recycled. The selected
-      // page is checked completely, but only its 64-byte routing envelope is
-      // retained, even when one indivisible item spans many extents.
-      auto prefix = co_await LoadRecoveryPayloadSlice(
-          store, physical.extents_, key_bytes, kOrderedGroupHeaderBytes);
+      // page is checked completely. Stream framing and scores into bounded
+      // state while the same checksum pass skips member payloads; only the
+      // routing envelope and two score bounds survive, even for huge members.
+      OrderedGroupMetadataDecoder decoder(bytes - key_bytes);
+      auto prefix =
+          co_await LoadRecoveryPayloadSlice(store, physical.extents_, key_bytes,
+                                            kOrderedGroupHeaderBytes, &decoder);
       if (!prefix.ok()) co_return prefix.status();
-      auto metadata = DecodeOrderedGroupMetadata(*prefix, bytes - key_bytes);
+      auto metadata = decoder.Finish();
       if (!metadata.ok()) co_return metadata.status();
       if (metadata->kind_ != root.kind_ ||
           metadata->incarnation_ != candidate.incarnation_ ||
@@ -1277,11 +1298,15 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
       }
       candidate.previous_ = metadata->previous_;
       candidate.next_ = metadata->next_;
+      candidate.min_score_ = metadata->min_score_;
+      candidate.max_score_ = metadata->max_score_;
     } else {
       if (!physical.ordered_group_.has_value())
         co_return absl::DataLossError("ordered inline page has no metadata");
       candidate.previous_ = physical.ordered_group_->previous_;
       candidate.next_ = physical.ordered_group_->next_;
+      candidate.min_score_ = physical.ordered_group_->min_score_;
+      candidate.max_score_ = physical.ordered_group_->max_score_;
     }
     candidates.push_back(candidate);
   }

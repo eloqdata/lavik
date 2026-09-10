@@ -2966,16 +2966,19 @@ class StorageEngine::Impl {
       std::size_t key_bytes);
   Task<absl::StatusOr<std::string>> LoadExternalKeyForRecovery(
       WorkerStore& store, ExtentManifest extents, std::size_t key_bytes);
-  Task<absl::Status> ReadRecoveryExtentInto(WorkerStore& store, ExtentRef ref,
-                                            std::uint32_t extent_index,
-                                            std::span<std::byte> destination,
-                                            std::size_t payload_offset = 0);
+  Task<absl::Status> ReadRecoveryExtentInto(
+      WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
+      std::span<std::byte> destination, std::size_t payload_offset = 0,
+      OrderedGroupMetadataDecoder* ordered = nullptr);
   // Read a bounded slice while validating every extent in the manifest. Used
   // for group envelopes so an indivisible large field does not become a large
   // recovery allocation merely to reconstruct resident routing metadata.
+  // Optional ordered decoding observes all bytes after offset during that same
+  // pass, not just the returned slice. Its caller-owned state outlives the
+  // task.
   Task<absl::StatusOr<std::string>> LoadRecoveryPayloadSlice(
       WorkerStore& store, ExtentManifest extents, std::size_t offset,
-      std::size_t bytes);
+      std::size_t bytes, OrderedGroupMetadataDecoder* ordered = nullptr);
 
   Task<absl::StatusOr<bool>> VerifyExternalKey(WorkerStore& store,
                                                const RecordIndex::Entry& entry,
