@@ -1405,7 +1405,10 @@ class PromotionPrepareService final : public celer::Service {
     keylane::ClusterPromotionPrepareDirective directive{
         .identity_ = identity,
         .parent_history_id_ = identity.source_history_id_,
-        .required_applied_next_lsns_ = {1},
+        // Exercise a two-flow source on this one-worker target. Promotion
+        // freezes the source-flow domain published by ReplicaAppliedFrontier,
+        // not the target worker layout.
+        .required_applied_next_lsns_ = {1, 3},
         .excluded_group_term_ = identity.term_,
     };
     directive.old_authority_exclusion_hash_.fill(1);
@@ -1467,8 +1470,7 @@ class PromotionPrepareService final : public celer::Service {
         !replication_->reject_writes() ||
         population.state_ != keylane::ReplicationGroupState::kReady ||
         !population.ready_token_.has_value() ||
-        population.parent_history_id_.has_value() ||
-        !population.applied_next_lsns_.empty()) {
+        population.applied_next_lsns_.has_value()) {
       co_return TestFailure(
           "prepared cluster promotion exposed serving or candidate authority");
     }
