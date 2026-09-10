@@ -10,6 +10,7 @@
 #include "gtest/gtest.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/control_projector.h"
+#include "keylane/meta/data_control_runtime_status.h"
 #include "keylane/meta/data_control_server.h"
 #include "keylane/meta/observation_store.h"
 
@@ -45,15 +46,16 @@ using keylane::meta::IngestHeartbeatObservations;
 using keylane::meta::IngestOperationEvidenceObservation;
 using keylane::meta::MetaCommittedFacts;
 using keylane::meta::MetaCommittedView;
+using keylane::meta::MetaDataControlRuntimeStatus;
 using keylane::meta::MetaDataControlServer;
 using keylane::meta::MetaDataControlServerOptions;
 using keylane::meta::MetaDataControlServerTestPeer;
 using keylane::meta::MetaDirectiveDelivery;
 using keylane::meta::MetaDirectiveReceiptTracker;
-using keylane::meta::MetaLeaseEvaluation;
-using keylane::meta::MetaLeaseHandoffGuard;
 using keylane::meta::MetaLeaderRuntimeDisposition;
 using keylane::meta::MetaLeaderRuntimeGuard;
+using keylane::meta::MetaLeaseEvaluation;
+using keylane::meta::MetaLeaseHandoffGuard;
 using keylane::meta::MetaLocalMemberBindingDisposition;
 using keylane::meta::MetaNodeHealthObs;
 using keylane::meta::MetaObservationStore;
@@ -64,8 +66,8 @@ using keylane::meta::UnfencedSupersededAuthorities;
 using keylane::meta::detail::BoundNodeSessionRegistry;
 using keylane::meta::detail::MetaCommittedViewCache;
 using keylane::meta::detail::PendingHandshakeLimiter;
-using keylane::meta::detail::RetainedProjectionLimiter;
 using keylane::meta::detail::RecordEquivalentTransferBoundary;
+using keylane::meta::detail::RetainedProjectionLimiter;
 using keylane::meta::detail::TransferBoundaryNeedsProjectionValidation;
 
 template <std::size_t N>
@@ -76,6 +78,129 @@ std::array<std::uint8_t, N> Bytes(std::uint8_t value) {
 }
 
 std::string Identity(char value) { return std::string(40, value); }
+
+TEST(MetaDataControlRuntimeStatusTest,
+     PublishesOnlyCurrentSessionAndAckedHeartbeatFacts) {
+  MetaDataControlRuntimeStatus status;
+  status.BeginLeadership(/*leadership_generation=*/11);
+  status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true);
+  control::FullDesiredState projection;
+  projection.source_meta_applied_index = 7;
+  projection.topology_epoch = 3;
+  projection.projection_hash = Bytes<32>(0x31);
+  projection.groups.push_back({
+      .group_id = "group-a",
+      .members = {{.node_id = Identity('1'), .assignment_id = Bytes<16>(0x11)},
+                  {.node_id = Identity('3'), .assignment_id = Bytes<16>(0x12)}},
+      .owner_node_id = Identity('1'),
+      .owner_assignment_id = Bytes<16>(0x11),
+      .group_term = 4,
+      .authority_version = 5,
+      .grant_revision = 6,
+      .manifest_revision = 8,
+      .manifest_digest = Bytes<32>(0x32),
+      .partition_replication_epoch = 9,
+  });
+  const auto session = Bytes<16>(0x41);
+  status.PublishCurrent(Identity('1'), Identity('2'), session,
+                        /*session_generation=*/10,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
+  auto snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  EXPECT_FALSE(snapshot.nodes_[0].health_.has_value());
+  EXPECT_EQ(snapshot.nodes_[0].groups_.size(), 1u);
+
+  control::LeaseDenied denied;
+  denied.reason = control::LeaseDenialReason::kNodeNotReady;
+  status.RecordHealth(
+      Identity('1'), session,
+      {.storage_ready = true, .population_ready = false, .draining = false},
+      /*received_unix_ms=*/100);
+  status.RecordLeaseDecisionWritten(Identity('1'), session,
+                                    control::LeaseDecision(denied),
+                                    /*written_unix_ms=*/101);
+  snapshot = status.Snapshot();
+  ASSERT_TRUE(snapshot.nodes_[0].health_.has_value());
+  EXPECT_TRUE(snapshot.nodes_[0].last_lease_decision_.has_value());
+  EXPECT_EQ(snapshot.nodes_[0].lease_decision_written_unix_ms_, 101);
+
+  const auto stale_session = Bytes<16>(0x42);
+  status.Remove(Identity('1'), &stale_session);
+  EXPECT_EQ(status.Snapshot().nodes_.size(), 1u);
+  status.Remove(Identity('1'), &session);
+  EXPECT_TRUE(status.Snapshot().nodes_.empty());
+
+  status.PublishCurrent(Identity('3'), Identity('4'), session,
+                        /*session_generation=*/12,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
+  snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  ASSERT_EQ(snapshot.nodes_[0].groups_.size(), 1u);
+  EXPECT_EQ(snapshot.nodes_[0].groups_[0].assignment_id_, Bytes<16>(0x12));
+
+  status.EndLeadership(/*leadership_generation=*/11);
+  snapshot = status.Snapshot();
+  EXPECT_EQ(snapshot.leadership_generation_, 0u);
+  EXPECT_FALSE(snapshot.leader_authority_eligible_);
+  EXPECT_TRUE(snapshot.nodes_.empty());
+  status.PublishCurrent(Identity('1'), Identity('2'), session,
+                        /*session_generation=*/13,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
+  EXPECT_TRUE(status.Snapshot().nodes_.empty());
+}
+
+TEST(MetaDataControlRuntimeStatusTest,
+     EligibilityRecoversWithinTheSameLeadershipGeneration) {
+  MetaDataControlRuntimeStatus status;
+  MetaLeaderRuntimeGuard guard(/*leadership_validity_ms=*/250);
+  status.BeginLeadership(/*leadership_generation=*/11);
+  guard.Reset(/*now_suspend_clock_ms=*/1'000,
+              /*now_active_clock_ms=*/2'000);
+  const auto session = Bytes<16>(0x41);
+  control::FullDesiredState projection;
+  const auto publish = [&] {
+    status.PublishCurrent(Identity('1'), Identity('2'), session,
+                          /*session_generation=*/10,
+                          /*leadership_generation=*/11,
+                          /*validated_committed_high_water=*/7, projection);
+  };
+
+  // A suspend gap during initial membership reconciliation can leave the
+  // first authority check temporarily ineligible within a valid leader epoch.
+  const auto initial = guard.Observe(/*now_suspend_clock_ms=*/1'250,
+                                     /*now_active_clock_ms=*/2'000);
+  ASSERT_EQ(initial, MetaLeaderRuntimeDisposition::kQuarantineStarted);
+  status.SetLeaderAuthorityEligible(11, false);
+  publish();
+  EXPECT_FALSE(status.LeadershipState().leader_authority_eligible_);
+  EXPECT_TRUE(status.Snapshot().nodes_.empty());
+
+  const auto recovered = guard.Observe(/*now_suspend_clock_ms=*/1'500,
+                                       /*now_active_clock_ms=*/2'250);
+  ASSERT_EQ(recovered, MetaLeaderRuntimeDisposition::kEligible);
+  status.SetLeaderAuthorityEligible(11, true);
+  publish();
+  EXPECT_TRUE(status.LeadershipState().leader_authority_eligible_);
+  ASSERT_EQ(status.Snapshot().nodes_.size(), 1u);
+
+  // A later transient authority loss changes the status bracket, without
+  // destroying the established session or requiring a new leader generation.
+  status.SetLeaderAuthorityEligible(11, false);
+  EXPECT_FALSE(status.LeadershipState().leader_authority_eligible_);
+  EXPECT_EQ(status.Snapshot().nodes_.size(), 1u);
+  status.SetLeaderAuthorityEligible(11, true);
+  status.RecordHealth(Identity('1'), session,
+                      {.storage_ready = true, .population_ready = true},
+                      /*received_unix_ms=*/100);
+  const auto snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  EXPECT_EQ(snapshot.leadership_generation_, 11u);
+  EXPECT_TRUE(snapshot.leader_authority_eligible_);
+  EXPECT_EQ(snapshot.nodes_[0].health_received_unix_ms_, 100);
+}
 
 TEST(MetaCommittedViewCacheTest, CopiesOncePerNewAppliedHighWater) {
   std::uint64_t next_index = 3;
@@ -298,19 +423,41 @@ TEST(MetaDataControlHandshakeLimitTest,
   ASSERT_TRUE(handshake.has_value());
   celer::Connection first;
   celer::Connection duplicate;
+  MetaDataControlRuntimeStatus status;
+  status.BeginLeadership(/*leadership_generation=*/11);
+  status.SetLeaderAuthorityEligible(11, true);
+  const auto session = Bytes<16>(0x41);
+  control::FullDesiredState projection;
 
   ASSERT_TRUE(slots.TryClaim("node-a", &first));
+  status.PublishCurrent("node-a", Identity('2'), session,
+                        /*session_generation=*/10,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
   handshake->Release();
   auto next_handshake = limiter.TryAcquire();
   ASSERT_TRUE(next_handshake.has_value());
   EXPECT_FALSE(slots.TryClaim("node-a", &duplicate));
   EXPECT_EQ(slots.size(), 1u);
 
-  // Cleanup by a rejected duplicate must not release the incumbent's slot.
+  // A rejected duplicate never receives a session ID. Its cleanup must keep
+  // both the incumbent's admission slot and its live runtime observations.
   slots.Release("node-a", &duplicate);
+  status.Remove("node-a", nullptr);
   EXPECT_EQ(slots.size(), 1u);
+  ASSERT_EQ(status.Snapshot().nodes_.size(), 1u);
+  status.MarkValidated("node-a", session, 8);
+  status.RecordHealth("node-a", session,
+                      {.storage_ready = true, .population_ready = true},
+                      /*received_unix_ms=*/100);
+  const auto snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  EXPECT_EQ(snapshot.nodes_[0].validated_committed_high_water_, 8u);
+  EXPECT_EQ(snapshot.nodes_[0].health_received_unix_ms_, 100);
   slots.Release("node-a", &first);
+  status.Remove("node-a", &session);
   EXPECT_EQ(slots.size(), 0u);
+  EXPECT_TRUE(status.Snapshot().nodes_.empty());
   EXPECT_TRUE(slots.TryClaim("node-a", &duplicate));
 }
 
@@ -468,10 +615,11 @@ TEST(MetaDataControlDirectoryTest,
 TEST(MetaDataControlDirectoryTest,
      FreshLocalBootstrapIsRepairableButConflictsFailClosed) {
   const std::string endpoint = "127.0.0.1:7100";
+  const std::string ctl_endpoint = "127.0.0.1:7200";
   MetaStores empty;
   auto action = EvaluateLocalMetaMemberBinding(
       MetaCommittedView(empty, /*applied_index=*/0), 1, "keylane://meta/1",
-      endpoint);
+      endpoint, ctl_endpoint);
   ASSERT_TRUE(action.ok()) << action.status();
   EXPECT_EQ(*action, MetaLocalMemberBindingDisposition::kNeedsBind);
 
@@ -482,13 +630,21 @@ TEST(MetaDataControlDirectoryTest,
   ASSERT_TRUE(empty.identity_.Apply(bind).ok());
   action = EvaluateLocalMetaMemberBinding(
       MetaCommittedView(empty, /*applied_index=*/1), 1, "keylane://meta/1",
-      endpoint);
+      endpoint, ctl_endpoint);
+  ASSERT_TRUE(action.ok()) << action.status();
+  EXPECT_EQ(*action, MetaLocalMemberBindingDisposition::kNeedsBind);
+
+  bind.ctl_endpoint_ = ctl_endpoint;
+  ASSERT_TRUE(empty.identity_.Apply(bind).ok());
+  action = EvaluateLocalMetaMemberBinding(
+      MetaCommittedView(empty, /*applied_index=*/2), 1, "keylane://meta/1",
+      endpoint, ctl_endpoint);
   ASSERT_TRUE(action.ok()) << action.status();
   EXPECT_EQ(*action, MetaLocalMemberBindingDisposition::kAlreadyBound);
 
   EXPECT_EQ(EvaluateLocalMetaMemberBinding(
-                MetaCommittedView(std::move(empty), /*applied_index=*/1), 1,
-                "keylane://meta/1", "127.0.0.1:7200")
+                MetaCommittedView(std::move(empty), /*applied_index=*/2), 1,
+                "keylane://meta/1", "127.0.0.1:7200", ctl_endpoint)
                 .status()
                 .code(),
             absl::StatusCode::kFailedPrecondition);
@@ -512,7 +668,7 @@ TEST(MetaDataControlDirectoryTest,
 
   const auto binding = EvaluateLocalMetaMemberBinding(
       MetaCommittedView(stores, /*applied_index=*/1), 2, "keylane://meta/2",
-      "[::1]:7302");
+      "[::1]:7302", "");
   ASSERT_TRUE(binding.ok()) << binding.status();
   EXPECT_EQ(*binding, MetaLocalMemberBindingDisposition::kAlreadyBound);
 

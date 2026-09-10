@@ -99,12 +99,31 @@ absl::Status ValidateDataEndpoints(
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::string> CanonicalMetaControlEndpoint(
+absl::StatusOr<std::string> CanonicalMetaDataControlEndpoint(
     std::string_view encoded) {
   auto endpoint = keylane::ParseNumericEndpoint(encoded);
   if (!endpoint.has_value()) {
     return absl::InvalidArgumentError(
         "Meta data-control endpoint must be numeric IPv4:port or [IPv6]:port");
+  }
+  return keylane::FormatNumericEndpoint(*endpoint);
+}
+
+absl::StatusOr<std::string> CanonicalMetaAdminEndpoint(
+    std::string_view encoded) {
+  auto endpoint = keylane::ParseNumericEndpoint(encoded);
+  if (!endpoint.has_value()) {
+    return absl::InvalidArgumentError(
+        "Meta ctl endpoint must be numeric IPv4:port or [IPv6]:port");
+  }
+  in_addr address4{};
+  in6_addr address6{};
+  if ((::inet_pton(AF_INET, endpoint->host_.c_str(), &address4) == 1 &&
+       address4.s_addr == htonl(INADDR_ANY)) ||
+      (::inet_pton(AF_INET6, endpoint->host_.c_str(), &address6) == 1 &&
+       IN6_IS_ADDR_UNSPECIFIED(&address6))) {
+    return absl::InvalidArgumentError(
+        "Meta ctl endpoint must be a concrete routable address");
   }
   return keylane::FormatNumericEndpoint(*endpoint);
 }
@@ -132,6 +151,7 @@ absl::Status ValidateActiveMetaDirectory(
   std::vector<control::WireMetaEndpoint> directory;
   directory.reserve(members.size());
   std::set<std::pair<std::string, std::uint16_t>> endpoints;
+  std::set<std::string> ctl_endpoints;
   for (const MetaMemberRecord& member : members) {
     if (member.retired_) continue;
     auto endpoint = ParseMetaControlEndpoint(member);
@@ -141,6 +161,11 @@ absl::Status ValidateActiveMetaDirectory(
           "active Meta data-control endpoints must be unique");
     }
     directory.push_back(std::move(*endpoint));
+    if (member.ctl_endpoint_.has_value() &&
+        !ctl_endpoints.insert(*member.ctl_endpoint_).second) {
+      return absl::InvalidArgumentError(
+          "active Meta ctl endpoints must be unique");
+    }
   }
   control::ServerHello probe{
       .disposition = control::ServerHelloDisposition::kAccepted,
@@ -295,16 +320,42 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
     return MetaDomainRejectError(checked.status().message());
   }
   auto canonical_endpoint =
-      CanonicalMetaControlEndpoint(cmd.data_control_endpoint_);
+      CanonicalMetaDataControlEndpoint(cmd.data_control_endpoint_);
   if (!canonical_endpoint.ok()) {
     return MetaDomainRejectError(canonical_endpoint.status().message());
   }
+  std::optional<std::string> canonical_ctl_endpoint;
+  if (cmd.ctl_endpoint_.has_value()) {
+    auto parsed = CanonicalMetaAdminEndpoint(*cmd.ctl_endpoint_);
+    if (!parsed.ok()) {
+      return MetaDomainRejectError(parsed.status().message());
+    }
+    canonical_ctl_endpoint = std::move(*parsed);
+  }
   if (const auto existing = meta_members_.find(cmd.server_id_);
       existing != meta_members_.end()) {
-    const MetaMemberRecord& record = existing->second;
+    MetaMemberRecord& record = existing->second;
     if (!record.retired_ && record.principal_ == cmd.principal_ &&
         record.data_control_endpoint_ == *canonical_endpoint) {
-      return absl::OkStatus();
+      if (record.ctl_endpoint_ == canonical_ctl_endpoint) {
+        return absl::OkStatus();
+      }
+      if (!record.ctl_endpoint_.has_value() &&
+          canonical_ctl_endpoint.has_value()) {
+        std::vector<MetaMemberRecord> candidate = MetaMembers();
+        for (MetaMemberRecord& member : candidate) {
+          if (member.server_id_ == record.server_id_) {
+            member.ctl_endpoint_ = canonical_ctl_endpoint;
+          }
+        }
+        if (auto status = ValidateActiveMetaDirectory(candidate);
+            !status.ok()) {
+          return MetaDomainRejectError(status.message());
+        }
+        record.ctl_endpoint_ = std::move(canonical_ctl_endpoint);
+        return absl::OkStatus();
+      }
+      return MetaDomainRejectError("meta ctl endpoint is immutable");
     }
     return MetaDomainRejectError("meta server_id already bound");
   }
@@ -315,8 +366,12 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
   if (meta_members_.size() >= kMaxMetaNodes) {
     return MetaDomainRejectError("meta member cap reached");
   }
-  MetaMemberRecord record{cmd.server_id_, cmd.principal_,
-                          std::move(*canonical_endpoint), false};
+  MetaMemberRecord record{
+      .server_id_ = cmd.server_id_,
+      .principal_ = cmd.principal_,
+      .data_control_endpoint_ = std::move(*canonical_endpoint),
+      .ctl_endpoint_ = std::move(canonical_ctl_endpoint),
+      .retired_ = false};
   std::vector<MetaMemberRecord> candidate = MetaMembers();
   candidate.push_back(record);
   if (auto status = ValidateActiveMetaDirectory(candidate); !status.ok()) {
@@ -392,7 +447,8 @@ std::vector<MetaMemberRecord> MetaIdentityStore::MetaMembers() const {
 
 // Envelope: schema_version u16 | Data-node count u32 | sorted Data-node
 // records | Meta-member count u32 | sorted (server_id, principal,
-// data_control_endpoint, retired) records. See the header for strictness.
+// data_control_endpoint, optional ctl_endpoint, retired) records. See the
+// header for strictness.
 std::string MetaIdentityStore::Serialize() const {
   MetaWriter w;
   w.WriteU16(kMetaFormatVersion);
@@ -413,6 +469,8 @@ std::string MetaIdentityStore::Serialize() const {
     w.WriteU32(server_id);
     w.WriteString(record.principal_);
     w.WriteString(record.data_control_endpoint_);
+    w.WriteBool(record.ctl_endpoint_.has_value());
+    if (record.ctl_endpoint_.has_value()) w.WriteString(*record.ctl_endpoint_);
     w.WriteBool(record.retired_);
   }
   return w.TakeBuffer();
@@ -502,6 +560,19 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     if (!principal.ok()) return principal.status();
     auto data_control_endpoint = r.ReadString(kMaxMetaEndpointBytes);
     if (!data_control_endpoint.ok()) return data_control_endpoint.status();
+    auto has_ctl_endpoint =
+        r.ReadBool("invalid meta ctl endpoint presence tag");
+    if (!has_ctl_endpoint.ok()) return has_ctl_endpoint.status();
+    std::optional<std::string> ctl_endpoint;
+    if (*has_ctl_endpoint) {
+      auto decoded = r.ReadString(kMaxMetaEndpointBytes);
+      if (!decoded.ok()) return decoded.status();
+      auto canonical_ctl = CanonicalMetaAdminEndpoint(*decoded);
+      if (!canonical_ctl.ok() || *canonical_ctl != *decoded) {
+        return MetaFailStopError("non-canonical Meta ctl endpoint in snapshot");
+      }
+      ctl_endpoint = std::move(*canonical_ctl);
+    }
     auto retired = r.ReadBool("invalid meta member in snapshot");
     if (!retired.ok()) return retired.status();
     if (*server_id == 0 ||
@@ -516,7 +587,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
       return MetaFailStopError("invalid meta member descriptor in snapshot");
     }
     auto canonical_endpoint =
-        CanonicalMetaControlEndpoint(*data_control_endpoint);
+        CanonicalMetaDataControlEndpoint(*data_control_endpoint);
     if (!canonical_endpoint.ok() ||
         *canonical_endpoint != *data_control_endpoint) {
       return MetaFailStopError(
@@ -527,8 +598,12 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
         store.meta_server_id_by_principal_.contains(std::string(*principal))) {
       return MetaFailStopError("duplicate meta member binding in snapshot");
     }
-    MetaMemberRecord record{*server_id, std::string(*principal),
-                            std::move(*canonical_endpoint), *retired};
+    MetaMemberRecord record{
+        .server_id_ = *server_id,
+        .principal_ = std::string(*principal),
+        .data_control_endpoint_ = std::move(*canonical_endpoint),
+        .ctl_endpoint_ = std::move(ctl_endpoint),
+        .retired_ = *retired};
     store.meta_server_id_by_principal_.emplace(record.principal_,
                                                record.server_id_);
     store.meta_members_.emplace(record.server_id_, std::move(record));

@@ -317,6 +317,14 @@ candidate. Generation replacement, boot replacement, committed freshness
 changes, and Meta leadership changes independently invalidate it, so the
 selector never waits for TTL after a known disconnect or role change.
 
+After the initial projection is applied and validated, Meta also publishes a
+compact leader-local runtime record for cluster status. The record follows the
+current session and FDS incarnation, timestamps health at receive, and records
+a lease decision only after the corresponding Ack write succeeds. Cached Ack
+replay does not renew that timestamp. Replacement, session close, leadership
+loss, and shutdown remove the record. This is a one-way observational feed:
+Data authority and lease evaluation never read status state back.
+
 An FDS replacement quiesces the heartbeat producer before publishing the new
 controller projection. A heartbeat already written under the old projection
 is detached from lease authority; its exact ack may still be consumed for wire

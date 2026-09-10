@@ -4,8 +4,9 @@
 
 `keylane-meta` is a separate C++ process for durable cluster metadata. It
 embeds NuRaft and uses its native Asio service for Raft peer sockets, timers,
-and TLS. One Celer worker owns the administrative listener and the
-process-lifetime Data-control listener; a bounded proposal executor keeps
+and TLS. One Celer worker owns the configured Unix and/or TCP administrative
+listeners and the process-lifetime Data-control listener; a bounded proposal
+executor keeps
 synchronous NuRaft API entry and WAL I/O off that worker. NuRaft and
 proposal-executor threads return typed notifications or coroutine handles
 through Celer's foreign MPSC mailbox, which reuses the worker's normal wake
@@ -16,7 +17,8 @@ the publisher that may create sessions, project desired state, evaluate lease
 challenges, or accept results. Demotion cancels that publisher and begins
 closing, then joins, all sessions and leader-scoped tasks from its leadership
 generation before the coordinator reports the transition complete. Shutdown
-first quiesces those sessions and
+first stops and drains every administrative listener, then quiesces Data
+sessions and
 all NuRaft/proposal-executor producers, waits for the foreign executor's
 accepted prefix to reach the Meta worker, and only then stops the generic Celer
 runtime. An active demotion or first shutdown drain is fail-stop if the worker
@@ -24,6 +26,16 @@ mailbox cannot accept its notification: reporting success would permit a later
 leader epoch to reuse authority that was never revoked. Once shutdown has
 synchronously drained the worker, later reconciler cancellation and object
 destruction are no-ops and do not depend on a still-running executor.
+
+The process exposes three independent network responsibilities. `--addr` is
+the Raft peer endpoint, `--data-control-addr` accepts Data-node control
+sessions, and the optional concrete `--ctl-addr` is the remote operator/Admin
+endpoint. Admin defaults to the mode-0600 Unix socket when neither Admin option
+is specified; explicitly naming both Unix and TCP starts both over one
+dispatcher, authentication policy, capture limiter, and retained-reply budget.
+There is no separate bind/advertise Admin identity: `--ctl-addr` is both the
+actual bind and the committed route, so wildcard addresses and port zero are
+invalid.
 
 The state machine owns one `MetaStores` value containing seven committed
 stores:
@@ -351,7 +363,7 @@ after capture. A snapshot becomes eligible for log compaction only after its
 atomic durable publication succeeds. Incoming snapshots are size-bounded,
 decoded completely, and installed synchronously as one replacement state.
 
-WAL v2 uses checksum-protected `log-<first-index>.seg` files. Segments roll at
+WAL v1 uses checksum-protected `log-<first-index>.seg` files. Segments roll at
 a size trigger. Compaction writes the complete surviving suffix to a synced
 `compact-<first-index>.ready` intent before replacing the old segment set;
 startup finishes such an intent after a crash. A reported pre-publication
@@ -359,8 +371,10 @@ failure leaves both the live index and old segments authoritative. Append
 batches become durable at NuRaft's flush hooks;
 membership state and vote state use atomic rename plus file and directory
 sync. Recovery retains the intact contiguous prefix and truncates a torn tail.
+A checksum-valid segment or compact-intent header with an unsupported format
+version is rejected before recovery modifies any files.
 The older prototype's `raft_log.dat` and `LSN1` snapshots are intentionally
-incompatible and cause startup to fail with an explicit migration error.
+incompatible and cause startup to fail with an explicit format error.
 
 The persisted state-machine watermark is the snapshot index, not every applied
 WAL index. After restart, a post-snapshot tail remains invisible until Raft
@@ -377,20 +391,25 @@ peers must use the same layout; earlier pre-release layouts have no
 compatibility or negotiation path. This wire version is independent of the
 durable schemas below.
 
-Commands, records, exports, and snapshots carry exact schema version 2. Its
-pre-release layout includes distinct target and source assignment anchors and
-the partition replication epoch in durable directives. Durable operation
-evidence includes its exact group id, reporter assignment and boot, population
-identity, history, operation id, and evidence hash. Snapshot decoding rejects
+Commands, records, exports, snapshots, and WAL replay carry exact schema
+version 1. Each active Meta-member identity may carry one canonical, concrete
+numeric Admin endpoint. The endpoint is committed with membership rather than
+revised by a separate routing command. A sole UDS-managed member with no
+endpoint may complete that field once from its configured `--ctl-addr`; a
+nonempty endpoint is immutable, and changing it requires retirement followed
+by a fresh server id. Before a configuration can contain multiple voters,
+every current and new member must have a unique Admin endpoint. Durable
+operation evidence includes its exact group id, reporter assignment and boot,
+population identity, history, operation id, and evidence hash. Snapshot decoding rejects
 malformed identity anchors and evidence that names a missing group or an
 impossible future group/population epoch; older committed evidence remains
 valid history after a group legitimately advances or the reporter moves.
-Version 1 lacks the Data-control fields and seventh store
-and is rejected rather than partially decoded or upgraded in place.
-Keylane Meta does not negotiate durable formats between mixed binary versions
-and has no in-band schema-switch command. A release that changes an
-incompatible format requires coordinated replacement of the Meta cluster;
-pre-release data from the superseded format is recreated rather than migrated.
+The unreleased schema and segmented WAL evolve in place as v1. This label
+does not guarantee compatibility with earlier development layouts: their
+data directories are recreated rather than migrated. Keylane Meta does not
+negotiate durable formats between mixed binary versions and has no in-band
+schema-switch command. Incompatible changes require coordinated replacement
+of the Meta cluster.
 Readers reject unknown markers and trailing bytes so incompatible state fails
 at startup or replay instead of being interpreted approximately. The
 independent segmented-WAL marker follows the same fail-loudly rule.
@@ -415,14 +434,16 @@ first state-machine entry or snapshot. Plaintext deployments instead rely on
 network isolation during that bootstrap interval.
 
 Dynamic membership preserves the applicable configuration and identity-store
-bindings. Add commits the member binding before `add_srv`; removal commits
-`remove_srv` before retiring the binding.
+bindings. Add commits the member's principal plus Data-control and Admin
+endpoints before `add_srv`; the Raft endpoint is carried by the NuRaft
+configuration change itself. Removal commits `remove_srv` before retiring the
+identity-store binding.
 The retired binding also disambiguates the short interval after removal commits
 but before NuRaft publishes its new in-memory configuration. Reactivation of
-retired principals is rejected. Every member also commits its numeric
-Data-control endpoint in the canonical `IPv4:port` or `[IPv6]:port` spelling,
-allowing any seed to return the same directory and making the local leader's
-listener identity compare equal to its committed binding.
+retired principals is rejected. Every member commits numeric Data-control and
+Admin endpoints in canonical `IPv4:port` or `[IPv6]:port` spelling. Data seeds
+use the former directory; operator discovery uses the latter. Neither
+directory implies that every follower is currently reachable.
 Data-node identities use canonical `keylane://node/<node-id>` principals with
 global one-to-one binding.
 
@@ -448,10 +469,53 @@ separates operators, Meta members, and data-node self-reporting; actor fields on
 the wire are never trusted.
 Certificate validity is enforced by TLS, but online issuance, rotation, CRL,
 and OCSP integration are outside this module.
-The one-shot `keylane-meta-ctl` operator client speaks the same ordered line
-protocol over Unix, plaintext TCP, or mTLS TCP; in mTLS mode it verifies the
-remote server certificate. It keeps RESP and NuRaft dependencies out of the
-client.
+The `keylane-ctl` operator client uses one Raft-free Admin transport for
+Unix, plaintext TCP, and mTLS TCP. Direct commands address the selected member;
+`status` reports its local state. The `cluster-status` command discovers the
+leader and evaluates cluster readiness. The transport handles partial I/O
+under one absolute deadline. Direct commands support a TLS server-name
+override; cluster discovery verifies each numeric Admin IP against the
+certificate IP SAN and never falls back between TLS and plaintext. A Unix
+seed can use configured TLS credentials for subsequent remote leader access.
+
+`keylane-ctl cluster-status` normally performs exactly two reads:
+`clusterhead 1` against the supplied seed to learn the current committed Admin
+directory, then `clusterstatus 1` against the indicated leader. Redirect,
+leader-change, busy, and incomplete-catch-up results retry discovery only
+within the original deadline. Leader routing stays internal to the operator
+API. The client reads this leader-observed cut without probing followers or
+reporting their replication progress. A stable
+result therefore states only leader-observed Meta availability and committed
+membership consistency; a quorum-serving leader can report the cluster ready
+while one follower is unreachable.
+
+The leader builds `clusterstatus` from a compact state-machine view captured
+under the same mutex as committed apply plus a Data-control runtime snapshot
+captured first. Evaluation and encoding run on the bounded proposal executor,
+not the Celer worker that drives Data heartbeats. Runtime entries exist only
+after Hello, FDS application, and a current-view validation; replacement,
+disconnect, demotion, and shutdown remove them. Health is timestamped on
+receipt, while a lease decision becomes observable only after its Ack is
+written, and replaying a cached Ack does not refresh it. Merging requires the
+session, projection, assignment, group term, authority, grant, manifest, and
+population anchors to match the committed cut. The result then passes a second
+leader-alive, term, leadership-generation/eligibility, Raft-config, and
+committed Meta-directory check; a changed bracket returns `cut_changed`
+instead of mixed state. Captures are single-flight across both Admin listeners.
+Completed replies release the capture permit before sending, share a 256 MiB
+retained-reply budget, and a slow receiver loses the connection after five
+seconds rather than delaying Data heartbeats.
+
+Readiness uses this leader-observed cut. Meta availability requires a live,
+caught-up leader with quorum; membership stability compares its Raft config
+with committed Meta identities and the complete unique Admin directory.
+Topology convergence requires current projection plus fresh storage and
+population facts for each active node referenced by committed groups. Serving
+readiness requires complete slot coverage and, for every slot-owning group, a
+committed owner/grant, present manifest, active policy, and a recent
+successfully written lease grant matching the current session and authority.
+Unassigned nodes remain diagnostic only. Empty and partially configured
+clusters are stable `NOT READY` results.
 
 Every privileged committed command creates a deterministic audit record keyed
 by Raft log index. Records include the injected actor, proposal time, command
@@ -474,5 +538,5 @@ transition into or out of disabled mode.
 | Shared Meta/Data frame, object-transfer, and message formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
 | Foreign-thread typed completion ingress and worker wakeup | `celer/include/celer/runtime/foreign_executor.h`, `celer/src/runtime/foreign_executor.cpp`, `celer/include/celer/runtime/cross_core.h`, `celer/src/runtime/worker.cpp` |
-| TLS identity, RBAC, Unix peer credentials, and administrative clients | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp`, `celer/src/net/` |
+| TLS identity, RBAC, Unix peer credentials, Admin transport, and cluster status | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `celer/src/net/` |
 | Recovery, partition, membership, and security gates | `tests/meta_*`, `tests/meta_integration/` |

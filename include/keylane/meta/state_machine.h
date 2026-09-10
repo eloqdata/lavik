@@ -122,6 +122,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "keylane/meta/committed_status_view.h"
 #include "keylane/meta/state_apply.h"
 #include "libnuraft/state_machine.hxx"
 
@@ -163,6 +164,11 @@ class MetaStateMachine : public nuraft::state_machine {
   // cross-store tear. The copy is bounded by snapshot-format caps but can be
   // large; hot callers must cache/reuse a view or use targeted queries.
   MetaStores StoresSnapshot() const;
+
+  // Copies only status-relevant committed facts under the same mutex used by
+  // ApplyCommitted. Retained audit/operation/policy payloads never enter this
+  // read path.
+  MetaCommittedStatusView StatusSnapshot() const;
 
   // Targeted read-only queries of the committed state, for the ctl surface
   // (ctl_server.h getop/getnode/completeop). A full StoresSnapshot()

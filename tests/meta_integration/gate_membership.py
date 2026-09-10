@@ -105,7 +105,8 @@ def main():
                      lambda: node5.alive() and node5.status())
         leader = H.find_leader(members)
         reply = leader.ctl(
-            f"addsrv 5 {node5.endpoint} {node5.data_control_endpoint}")
+            f"addsrv 5 {node5.endpoint} {node5.data_control_endpoint} "
+            f"{node5.ctl_endpoint}")
         if reply != "OK":
             raise H.Failure(f"addsrv node 5: {reply}")
         node5.kill9()
@@ -115,7 +116,8 @@ def main():
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
             reply = leader.ctl(
-                f"addsrv 5 {node5.endpoint} {node5.data_control_endpoint}")
+                f"addsrv 5 {node5.endpoint} {node5.data_control_endpoint} "
+                f"{node5.ctl_endpoint}")
             if not observed or observed[-1] != reply:
                 observed.append(reply)
             # Once a retry gets OK again the leader reset the dead join;
@@ -136,7 +138,7 @@ def main():
         existing = members[0] if members[0].id != leader.id else members[1]
         reply = leader.ctl(
             f"addsrv {existing.id} {existing.endpoint} "
-            f"{existing.data_control_endpoint}")
+            f"{existing.data_control_endpoint} {existing.ctl_endpoint}")
         H.log(f"phase 4: addsrv existing member {existing.id} -> {reply}")
         if reply != "ERR already-exists":
             raise H.Failure(

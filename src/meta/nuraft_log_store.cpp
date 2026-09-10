@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -21,7 +22,7 @@ namespace keylane::meta {
 namespace {
 
 constexpr uint32_t kSegmentMagic = 0x4C534547;  // "LSEG"
-constexpr uint32_t kSegmentFormatVersion = 2;
+constexpr uint32_t kSegmentFormatVersion = 1;
 constexpr size_t kSegmentHeaderSize =
     20;  // magic | version | first_index | crc
 constexpr uint32_t kRecordMagic = 0x4C524131;  // "LRA1"
@@ -102,6 +103,25 @@ absl::StatusOr<size_t> PreadUpTo(int fd, uint8_t* data, size_t len,
     done += static_cast<size_t>(got);
   }
   return done;
+}
+
+// Check every durable container before recovery can truncate a tail or finish
+// a compact intent. A valid header from another format is not a torn write;
+// interpreting it as one could erase acknowledged data on binary replacement.
+absl::Status CheckSegmentFormat(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return ErrnoStatus("open(segment format)", path);
+  uint8_t header[kSegmentHeaderSize];
+  auto read = PreadUpTo(fd, header, sizeof(header), 0);
+  ::close(fd);
+  if (!read.ok()) return read.status();
+  if (*read == sizeof(header) && LoadLe32(header) == kSegmentMagic &&
+      LoadLe32(header + 16) == Fnv1a32(header, 16) &&
+      LoadLe32(header + 4) != kSegmentFormatVersion) {
+    return absl::FailedPreconditionError(
+        "unsupported WAL segment format version in " + path);
+  }
+  return absl::OkStatus();
 }
 
 absl::Status FsyncDirectory(const std::string& dir) {
@@ -201,16 +221,35 @@ absl::StatusOr<std::unique_ptr<NuraftLogStore>> NuraftLogStore::Open(
     return ErrnoStatus("mkdir", data_dir);
   }
 
-  // v2 is deliberately incompatible with the legacy single-file layout (see
-  // the class header): refuse to open a directory that still holds a v1 log.
-  const std::string v1_path = data_dir + "/raft_log.dat";
+  // The current segmented layout is incompatible with the prototype
+  // single-file log, even though the unreleased format number remains v1.
+  const std::string legacy_path = data_dir + "/raft_log.dat";
   std::error_code ec;
-  if (std::filesystem::exists(v1_path, ec)) {
+  if (std::filesystem::exists(legacy_path, ec)) {
     return absl::Status(
         absl::StatusCode::kFailedPrecondition,
-        "WAL v2 refuses the legacy single-file layout: " + v1_path +
+        "WAL v1 refuses the legacy single-file layout: " + legacy_path +
             " exists; wipe the legacy data directory (it holds no production "
             "data) instead of migrating it");
+  }
+
+  for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
+    const std::string name = entry.path().filename().string();
+    std::string_view digits;
+    if (name.starts_with("log-") && name.ends_with(".seg") && name.size() > 8) {
+      digits = std::string_view(name).substr(4, name.size() - 8);
+    } else if (name.starts_with("compact-") && name.ends_with(".ready") &&
+               name.size() > 14) {
+      digits = std::string_view(name).substr(8, name.size() - 14);
+    } else {
+      continue;
+    }
+    if (digits.find_first_not_of("0123456789") != std::string_view::npos) {
+      continue;
+    }
+    if (auto status = CheckSegmentFormat(entry.path().string()); !status.ok()) {
+      return status;
+    }
   }
 
   // A compact replacement is published under a non-WAL name before any old

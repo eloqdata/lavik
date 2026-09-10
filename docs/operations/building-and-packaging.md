@@ -28,6 +28,17 @@ cases can trigger GCC compiler failures; they still link against the optimized
 production libraries. Debug builds also omit IPO to keep iteration time
 predictable. LTO is not required for functional correctness.
 
+When `KEYLANE_BUILD_META=ON`, the source build also provides `keylane-meta`
+and the Raft-free `keylane-ctl` operator target for direct administration
+and cluster readiness:
+
+```bash
+cmake --build <build-dir> --target keylane-meta keylane-ctl
+```
+
+The downloadable release archive below continues to contain only `keylane`;
+build the Meta and operator binaries from source for this release.
+
 AddressSanitizer builds use Clang so coroutine symmetric transfers remain tail
 calls under sanitizer instrumentation:
 

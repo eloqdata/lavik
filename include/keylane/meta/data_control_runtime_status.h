@@ -1,0 +1,113 @@
+#pragma once
+
+// Compact volatile status registry published by the Data-control worker.
+// This is observational only: lease authorization never reads it back.
+
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "keylane/cluster/control_protocol.h"
+
+namespace keylane::meta {
+
+struct MetaDataControlRuntimeGroup {
+  std::string group_id_;
+  cluster::control::WireId128 assignment_id_{};
+  std::uint64_t group_term_ = 0;
+  std::uint64_t authority_version_ = 0;
+  std::uint64_t grant_revision_ = 0;
+  std::uint64_t manifest_revision_ = 0;
+  cluster::control::WireHash256 manifest_digest_{};
+  std::uint64_t partition_replication_epoch_ = 0;
+};
+
+struct MetaDataControlRuntimeNode {
+  std::string node_id_;
+  std::string boot_id_;
+  cluster::control::WireId128 session_id_{};
+  std::uint64_t session_generation_ = 0;
+  std::uint64_t leadership_generation_ = 0;
+  std::uint64_t source_meta_applied_index_ = 0;
+  std::uint64_t validated_committed_high_water_ = 0;
+  std::uint64_t topology_epoch_ = 0;
+  cluster::control::WireHash256 projection_hash_{};
+  std::vector<MetaDataControlRuntimeGroup> groups_;
+  std::optional<cluster::control::HeartbeatHealth> health_;
+  std::int64_t health_received_unix_ms_ = 0;
+  std::optional<cluster::control::LeaseDecision> last_lease_decision_;
+  std::int64_t lease_decision_written_unix_ms_ = 0;
+};
+
+struct MetaDataControlRuntimeSnapshot {
+  std::uint64_t leadership_generation_ = 0;
+  bool leader_authority_eligible_ = false;
+  std::vector<MetaDataControlRuntimeNode> nodes_;
+};
+
+struct MetaDataControlLeadershipState {
+  std::uint64_t leadership_generation_ = 0;
+  bool leader_authority_eligible_ = false;
+};
+
+class MetaDataControlRuntimeStatus {
+ public:
+  // Starts a new leader-owned observation epoch. Status capture uses this
+  // generation to reject a response assembled across a leadership change.
+  void BeginLeadership(std::uint64_t leadership_generation);
+  // Changes eligibility only for the current generation. Stale worker
+  // notifications are ignored; becoming ineligible preserves observations so
+  // recovery within the same generation can reuse still-current sessions.
+  void SetLeaderAuthorityEligible(std::uint64_t leadership_generation,
+                                  bool eligible);
+  // Clears observations only when ending the current generation. A delayed
+  // demotion for an older generation cannot erase a newer leader's state.
+  void EndLeadership(std::uint64_t leadership_generation);
+  // Publishes a fully validated Hello/FDS session for the current eligible
+  // leader generation. Replacing a node session atomically discards all
+  // heartbeat and lease observations belonging to its predecessor.
+  void PublishCurrent(std::string node_id, std::string boot_id,
+                      const cluster::control::WireId128& session_id,
+                      std::uint64_t session_generation,
+                      std::uint64_t leadership_generation,
+                      std::uint64_t validated_committed_high_water,
+                      const cluster::control::FullDesiredState& projection);
+  // Advances only the named current session's validated committed high-water;
+  // stale sessions are ignored and the value never moves backwards.
+  void MarkValidated(std::string_view node_id,
+                     const cluster::control::WireId128& session_id,
+                     std::uint64_t validated_committed_high_water);
+  // Replaces health and its Meta receive time only for the named current
+  // session; status freshness is evaluated later from this receive time.
+  void RecordHealth(std::string_view node_id,
+                    const cluster::control::WireId128& session_id,
+                    const cluster::control::HeartbeatHealth& health,
+                    std::int64_t received_unix_ms);
+  // Records a lease decision only after its Ack was written successfully.
+  // Cached Ack replay deliberately does not call this method or refresh time.
+  void RecordLeaseDecisionWritten(
+      std::string_view node_id, const cluster::control::WireId128& session_id,
+      const cluster::control::LeaseDecision& written_decision,
+      std::int64_t written_unix_ms);
+  // Removes only the matching session. A null session_id is a no-op: a
+  // rejected handshake never owned a runtime incarnation and must not erase
+  // an incumbent. Leadership teardown clears all nodes through EndLeadership.
+  void Remove(std::string_view node_id,
+              const cluster::control::WireId128* session_id);
+  // Copies one mutex-consistent observational snapshot.
+  MetaDataControlRuntimeSnapshot Snapshot() const;
+  // Copies only the leadership bracket used after off-worker status encoding.
+  MetaDataControlLeadershipState LeadershipState() const;
+
+ private:
+  mutable std::mutex mutex_;
+  std::uint64_t leadership_generation_ = 0;
+  bool leader_authority_eligible_ = false;
+  std::map<std::string, MetaDataControlRuntimeNode> nodes_;
+};
+
+}  // namespace keylane::meta

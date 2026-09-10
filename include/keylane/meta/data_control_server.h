@@ -21,6 +21,7 @@
 #include "celer/runtime/foreign_executor.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/coordinator.h"
+#include "keylane/meta/data_control_runtime_status.h"
 
 namespace nuraft {
 class raft_server;
@@ -203,6 +204,11 @@ struct MetaDataControlServerOptions {
   std::uint32_t server_id_ = 0;
   std::string bind_host_;
   std::uint16_t port_ = 0;
+  // The local administrative TCP endpoint is committed with the member
+  // definition so operator clients can follow a follower seed to the leader.
+  // Empty is permitted only while this process is a UDS-managed sole voter.
+  std::string local_ctl_endpoint_;
+  std::shared_ptr<MetaDataControlRuntimeStatus> runtime_status_;
 
   // Data control deliberately reuses the Meta Raft identity. An empty triple
   // selects explicitly trusted plaintext; a partial triple is invalid.
@@ -382,7 +388,8 @@ absl::StatusOr<MetaLocalMemberBindingDisposition>
 EvaluateLocalMetaMemberBinding(const MetaCommittedView& view,
                                std::uint32_t server_id,
                                std::string_view principal,
-                               std::string_view data_control_endpoint);
+                               std::string_view data_control_endpoint,
+                               std::string_view ctl_endpoint);
 
 enum class MetaDirectiveDelivery : std::uint8_t {
   kFrame,

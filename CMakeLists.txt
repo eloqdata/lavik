@@ -179,6 +179,25 @@ option(KEYLANE_BUILD_META
   "Build the keylane-meta Raft control plane (requires the recursive nuraft submodule)"
   ON)
 if (KEYLANE_BUILD_META)
+  # Shared operator transport stays below keylane_meta_core so the CLI and
+  # operator library have no NuRaft dependency.
+  add_library(keylane_meta_admin STATIC
+    src/meta/admin_client.cpp
+    src/meta/cluster_status.cpp
+  )
+  target_include_directories(keylane_meta_admin PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(keylane_meta_admin PUBLIC
+    absl::status
+    absl::statusor
+    OpenSSL::SSL
+    OpenSSL::Crypto
+  )
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(keylane_meta_admin PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+
   if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/CMakeLists.txt)
     message(FATAL_ERROR
       "nuraft submodule not found; run git submodule update --init --recursive")
@@ -578,6 +597,7 @@ if (KEYLANE_BUILD_META)
     src/meta/coordinator.cpp
     src/meta/ctl_server.cpp
     src/meta/data_control_server.cpp
+    src/meta/data_control_runtime_status.cpp
     src/meta/encoding.cpp
     src/meta/grant_store.cpp
     src/meta/identity_verifier.cpp
@@ -600,6 +620,7 @@ if (KEYLANE_BUILD_META)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(keylane_meta_core PUBLIC
+    keylane_meta_admin
     keylane::lease_clock
     keylane::control_transport
     keylane::control_protocol
@@ -626,22 +647,20 @@ if (KEYLANE_BUILD_META)
     target_compile_options(keylane-meta PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 
-  # The operator client intentionally does not link keylane_meta_core (and
-  # therefore NuRaft). It only needs OpenSSL for the optional remote mTLS
-  # transport; local administration uses a Unix domain socket.
-  add_executable(keylane-meta-ctl
-    app/keylane_meta_ctl.cpp
+  # Direct administration and cluster readiness share one Raft-free CLI over
+  # the Admin transport/operator library, without linking keylane_meta_core.
+  add_executable(keylane-ctl
+    app/keylane_ctl.cpp
   )
-  target_include_directories(keylane-meta-ctl PRIVATE
+  target_include_directories(keylane-ctl PRIVATE
     ${KEYLANE_GENERATED_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  target_link_libraries(keylane-meta-ctl PRIVATE
-    OpenSSL::SSL
-    OpenSSL::Crypto
+  target_link_libraries(keylane-ctl PRIVATE
+    keylane_meta_admin
   )
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(keylane-meta-ctl PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(keylane-ctl PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 
   # Negative guard for the layering rule above: fail at configure time if
@@ -761,6 +780,19 @@ if (BUILD_TESTING)
   )
 
   if (KEYLANE_BUILD_META)
+    # The public operator model is tested without keylane_meta_core so this
+    # target also guards the promised Raft-free client boundary.
+    add_executable(keylane_cluster_status_tests
+      tests/meta_cluster_status_test.cpp
+    )
+    target_link_libraries(keylane_cluster_status_tests PRIVATE
+      keylane_meta_admin
+      GTest::gtest_main
+    )
+    gtest_discover_tests(keylane_cluster_status_tests
+      TEST_PREFIX cluster_status.
+      PROPERTIES LABELS "meta;operator" TIMEOUT 30)
+
     # Meta-plane tests. Links keylane_meta_core (NuRaft); the data-plane unit
     # test binary stays Raft-free, while this binary also links the data module
     # for explicit Meta-projection-to-Data-validation contract tests.
@@ -801,6 +833,7 @@ if (BUILD_TESTING)
         COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/smoke_3node.py
                 $<TARGET_FILE:keylane-meta>
+                $<TARGET_FILE:keylane-ctl>
       )
       set_tests_properties(meta_integration.smoke_3node PROPERTIES
         LABELS meta-integration
@@ -813,7 +846,7 @@ if (BUILD_TESTING)
         COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/ctl_client.py
                 $<TARGET_FILE:keylane-meta>
-                $<TARGET_FILE:keylane-meta-ctl>
+                $<TARGET_FILE:keylane-ctl>
       )
       set_tests_properties(meta_integration.ctl_client PROPERTIES
         LABELS meta-integration

@@ -40,6 +40,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -638,6 +639,10 @@ struct BindMetaMember {
   // Numeric-IP endpoint advertised by this Meta member's data-control
   // listener. Committing it keeps redirects identical across the Raft group.
   std::string data_control_endpoint_;
+  // Numeric-IP endpoint of this member's administrative listener. A sole
+  // bootstrap member may omit it while it is managed only through UDS; the
+  // endpoint is otherwise part of the immutable member definition.
+  std::optional<std::string> ctl_endpoint_;
   bool operator==(const BindMetaMember&) const = default;
 };
 

@@ -11,7 +11,7 @@
 // The coordinator is assembled at process wiring time from pieces the caller
 // owns: it holds a refcounted nuraft::ptr on the raft_server (an in-flight
 // Propose must never see a destroyed core) and plain references to the
-// MetaStateMachine, the WAL v2 NuraftLogStore (fail-safe gate only), and the
+// MetaStateMachine, the WAL v1 NuraftLogStore (fail-safe gate only), and the
 // leader-local MetaObservationStore. Those three references MUST outlive the
 // coordinator. Destruction contract (mirrors the state machine's shutdown
 // contract in state_machine.h):

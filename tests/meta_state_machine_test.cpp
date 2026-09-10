@@ -1,4 +1,4 @@
-// Tests for MetaStateMachine and its integration with the WAL v2
+// Tests for MetaStateMachine and its integration with the WAL v1
 // NuraftLogStore through a real raft_server.
 //
 // Vertical slices:
@@ -9,7 +9,7 @@
 //      snapshot transmission; audit uniqueness under
 //      replay; domain-reject vs fail-stop classification (death test).
 //   2. Core-driven integration: a single-node raft_server running on the
-//      real adapters (NuraftStateMgr + WAL v2 NuraftLogStore +
+//      real adapters (NuraftStateMgr + WAL v1 NuraftLogStore +
 //      MetaStateMachine) proves the persistence ordering the Raft core
 //      relies on and replay-based recovery after restart. These two tests
 //      use the production state machine with real commands.

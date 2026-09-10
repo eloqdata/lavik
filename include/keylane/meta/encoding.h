@@ -90,10 +90,10 @@ inline constexpr std::uint64_t kMaxMetaUncompactedWalBytes = 1ull
 // pre-release data directories must be recreated instead of migrated.
 // ---------------------------------------------------------------------------
 
-// v2 adds membership incarnation identities, content-addressed population
-// manifests, grant revisions, and complete operation intent/directive state.
-// There is intentionally no v1 migration path for pre-release data dirs.
-inline constexpr std::uint16_t kMetaFormatVersion = 2;
+// The unreleased schema evolves in place as v1, including optional Meta
+// Admin endpoints. This number does not promise compatibility with earlier
+// development layouts; those data directories must be recreated.
+inline constexpr std::uint16_t kMetaFormatVersion = 1;
 
 // ---------------------------------------------------------------------------
 // Failure classification. See the file header for the two classes.

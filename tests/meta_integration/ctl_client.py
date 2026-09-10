@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""End-to-end gate for keylane-meta-ctl over Unix and TCP transports.
+"""End-to-end gate for keylane-ctl over Unix and TCP transports.
 
-Usage: ctl_client.py /path/to/keylane-meta /path/to/keylane-meta-ctl [workdir]
+Usage: ctl_client.py /path/to/keylane-meta /path/to/keylane-ctl [workdir]
 """
 
 import os
+import socket
+import struct
 import subprocess
 import sys
+import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness as H  # noqa: E402
@@ -20,6 +24,16 @@ def run(args, expected=0, timeout=10):
             f"ctl exit {proc.returncode}, want {expected}: "
             f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
     return proc.stdout.strip()
+
+
+def run_cluster(args, expected, timeout=10):
+    proc = subprocess.run([CTL] + args, capture_output=True, text=True,
+                          timeout=timeout)
+    if proc.returncode != expected:
+        raise H.Failure(
+            f"cluster exit {proc.returncode}, want {expected}: "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    return proc
 
 
 def make_leaf(directory, ca_crt, ca_key, name, san):
@@ -43,16 +57,368 @@ def make_leaf(directory, ca_crt, ca_key, name, san):
     return cert, key
 
 
+def ctl_characterization_gate(workdir):
+    help_result = subprocess.run(
+        [CTL, "--help"], capture_output=True, text=True, timeout=3)
+    if (help_result.returncode != 0 or help_result.stdout or
+            "Exit status is 0 for an OK reply, 2 for an ERR reply" not in
+            help_result.stderr):
+        raise H.Failure(
+            "keylane-ctl help contract changed: "
+            f"exit={help_result.returncode} stdout={help_result.stdout!r} "
+            f"stderr={help_result.stderr!r}")
+    bad_args = subprocess.run(
+        [CTL, "--addr", "127.0.0.1:1"], capture_output=True, text=True,
+        timeout=3)
+    if (bad_args.returncode != 1 or bad_args.stdout or
+            "a Meta command is required" not in bad_args.stderr):
+        raise H.Failure(
+            "keylane-ctl argument contract changed: "
+            f"exit={bad_args.returncode} stdout={bad_args.stdout!r} "
+            f"stderr={bad_args.stderr!r}")
+
+    path = os.path.join(workdir, "ctl-deadline.sock")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(path)
+    listener.listen(1)
+    release = threading.Event()
+    errors = []
+
+    def stall():
+        try:
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(4096)
+                release.wait(timeout=2)
+        except OSError as error:
+            if not release.is_set():
+                errors.append(error)
+
+    thread = threading.Thread(target=stall, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        deadline = subprocess.run(
+            [CTL, "--socket", path, "--timeout-ms", "20", "status"],
+            capture_output=True, text=True, timeout=3)
+    finally:
+        release.set()
+        listener.close()
+        thread.join(timeout=2)
+    elapsed = time.monotonic() - started
+    if (deadline.returncode != 1 or deadline.stdout or
+            "timed out" not in deadline.stderr or elapsed > 1.0 or
+            thread.is_alive() or errors):
+        raise H.Failure(
+            "keylane-ctl absolute deadline contract changed: "
+            f"elapsed={elapsed:.3f}s exit={deadline.returncode} "
+            f"stdout={deadline.stdout!r} stderr={deadline.stderr!r} "
+            f"server_errors={errors}")
+    H.log("keylane-ctl help, arguments, deadline, and exit contract — OK")
+
+
+def raw_argument_gate(workdir):
+    """Client-only options must not consume raw command operands."""
+    path = os.path.join(workdir, "raw-arguments.sock")
+    cases = [
+        ["submitop", "id", "kind", "--json"],
+        ["submitop", "id", "kind", "--allow-plaintext-admin"],
+        ["submitop", "id", "kind", "cluster-status"],
+        ["status", "--timeout-ms", "1"],
+        ["--", "--help", "--json"],
+        ["--", "cluster-status", "--json"],
+    ]
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(path)
+    listener.listen(len(cases))
+    listener.settimeout(3)
+    requests = []
+    errors = []
+
+    def serve():
+        try:
+            for _ in cases:
+                connection, _ = listener.accept()
+                with connection:
+                    reader = connection.makefile("rb")
+                    requests.append(reader.readline().decode().rstrip("\n"))
+                    connection.sendall(b"OK raw-arguments\n")
+        except OSError as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        for arguments in cases:
+            reply = run(["--socket", path] + arguments)
+            if reply != "OK raw-arguments":
+                raise H.Failure(f"raw argument reply: {reply!r}")
+    finally:
+        listener.close()
+        thread.join(timeout=4)
+    expected = [" ".join(args[1:] if args[0] == "--" else args)
+                for args in cases]
+    if thread.is_alive() or errors or requests != expected:
+        raise H.Failure(
+            f"raw argument boundary changed: requests={requests!r} "
+            f"expected={expected!r} errors={errors}")
+    H.log("raw command arguments and option terminator — OK")
+
+
+def scripted_cluster_gate(workdir):
+    """Drive the real CLI through its public transport with scripted wire.
+
+    Production cannot mint the first ReadyToken yet, so a minimal valid
+    operator peer is the only way to exercise external READY/0 without adding
+    a production bypass.
+    """
+    directory = os.path.join(workdir, "scripted")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+
+    def wire_string(value):
+        encoded = value.encode()
+        return struct.pack(">I", len(encoded)) + encoded
+
+    member = struct.pack(">IBB", 1, 0, 1)
+    head_payload = (
+        struct.pack(">HIBQBIQI", 1, 1, 1, 1, 1, 1, 1, 1) + member)
+    data_node = (
+        wire_string("data-1") + bytes([0, 0, 1]) +
+        wire_string("group-1") + bytes([1, 1, 1, 1, 0]))
+    group = (
+        wire_string("group-1") + struct.pack(">Q", 4) + bytes([1]) +
+        wire_string("data-1") + struct.pack(">QBQBB", 8, 1, 12, 1, 1))
+    slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
+    status_payload = (
+        struct.pack(">HIQQQQ", 1, 1, 1, 1, 1, 1) +
+        bytes([1, 1, 1, 1, 1]) + struct.pack(">I", 1) + member +
+        struct.pack(">I", 1) + data_node +
+        struct.pack(">I", 1) + group +
+        struct.pack(">I", 1) + slot_range + struct.pack(">I", 0))
+    ready_replies = {
+        "clusterhead 1": "OK clusterhead 1 " + head_payload.hex(),
+        "clusterstatus 1": "OK clusterstatus 1 " + status_payload.hex(),
+    }
+
+    def run_server(name, responder, cli_args, expected, terminate_reply=True,
+                   options_first=False):
+        path = os.path.join(directory, name + ".sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(8)
+        listener.settimeout(0.1)
+        stopped = threading.Event()
+        errors = []
+
+        def serve():
+            while not stopped.is_set():
+                try:
+                    connection, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError as error:
+                    if not stopped.is_set():
+                        errors.append(error)
+                    return
+                with connection:
+                    request = b""
+                    while not request.endswith(b"\n"):
+                        chunk = connection.recv(4096)
+                        if not chunk:
+                            break
+                        request += chunk
+                    reply = responder(request.decode().strip())
+                    terminator = b"\n" if terminate_reply else b""
+                    connection.sendall(reply.encode() + terminator)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            arguments = (["--socket", path] + cli_args + ["cluster-status"]
+                         if options_first else
+                         ["cluster-status", "--socket", path] + cli_args)
+            result = run_cluster(arguments, expected=expected)
+        finally:
+            stopped.set()
+            listener.close()
+            thread.join(timeout=2)
+        if thread.is_alive() or errors:
+            raise H.Failure(f"scripted cluster server failed: {errors}")
+        return result
+
+    ready = run_server(
+        "ready", lambda command: ready_replies.get(command, "ERR bad-request"),
+        ["--json"], expected=0)
+    if '"result":"ready"' not in ready.stdout:
+        raise H.Failure(f"scripted READY output missing: {ready.stdout!r}")
+
+    # Both command-first and traditional global-options-first invocations
+    # reach the client command, without changing raw `status` semantics.
+    options_first = run_server(
+        "options-first", lambda command: ready_replies.get(command, "ERR bad-request"),
+        ["--json"], expected=0, options_first=True)
+    if '"result":"ready"' not in options_first.stdout:
+        raise H.Failure(f"options-first READY output missing: {options_first.stdout!r}")
+
+    for arguments, error in [
+            (["cluster-status", "--socket", "/unused", "unexpected"],
+             "does not take positional arguments"),
+            (["--socket", "/unused", "cluster-status", "unexpected"],
+             "does not take positional arguments"),
+            (["cluster-status", "--socket", "/unused", "--tls-ca", "ca.pem"],
+             "must be given together"),
+            (["cluster-status", "--addr", "127.0.0.1:1", "--tls-ca", "ca.pem",
+              "--tls-cert", "cert.pem", "--tls-key", "key.pem",
+              "--tls-server-name", "meta.example"],
+             "does not accept --tls-server-name"),
+    ]:
+        rejected = run_cluster(arguments, expected=1)
+        if rejected.stdout or error not in rejected.stderr:
+            raise H.Failure(
+                f"invalid cluster arguments were not stdout-clean: {arguments!r} "
+                f"stdout={rejected.stdout!r} stderr={rejected.stderr!r}")
+
+    retry = run_server(
+        "retry", lambda _: "ERR busy",
+        ["--timeout-ms", "20", "--json"], expected=3)
+    if '"result":"retryable"' not in retry.stdout:
+        raise H.Failure(f"scripted RETRYABLE output missing: {retry.stdout!r}")
+    truncated = run_server(
+        "truncated", lambda _: "OK clusterhead 1 ",
+        ["--timeout-ms", "20", "--json"], expected=1,
+        terminate_reply=False)
+    if truncated.stdout or "terminating its reply" not in truncated.stderr:
+        raise H.Failure(
+            "truncated cluster reply was not fatal and stdout-clean: "
+            f"stdout={truncated.stdout!r} stderr={truncated.stderr!r}")
+    empty_close = run_server(
+        "empty-close", lambda _: "", ["--timeout-ms", "20", "--json"],
+        expected=3, terminate_reply=False)
+    if '"result":"retryable"' not in empty_close.stdout:
+        raise H.Failure(
+            "empty connection close was not retryable: "
+            f"stdout={empty_close.stdout!r} stderr={empty_close.stderr!r}")
+    H.log("keylane-ctl cluster-status scripted READY/0 and RETRYABLE/3 — OK")
+
+
+def dual_listener_rollback_gate(workdir):
+    directory = os.path.join(workdir, "rollback")
+    data_dir = os.path.join(directory, "node1")
+    os.makedirs(data_dir, mode=0o700, exist_ok=True)
+    ctl_path = os.path.join(data_dir, "meta-admin.sock")
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    ctl_port = blocker.getsockname()[1]
+    raft_port = H.free_port()
+    data_control_port = H.free_port()
+    try:
+        proc = subprocess.run(
+            [META, "--id", "1", "--addr", f"127.0.0.1:{raft_port}",
+             "--data-control-addr", f"127.0.0.1:{data_control_port}",
+             "--data-dir", data_dir, "--bootstrap",
+             "--ctl-socket", ctl_path,
+             "--ctl-addr", f"127.0.0.1:{ctl_port}"] + H.raft_args(),
+            capture_output=True, text=True, timeout=15)
+        if proc.returncode != 1:
+            raise H.Failure(
+                "dual-listener bind failure did not roll startup back: "
+                f"exit={proc.returncode} stdout={proc.stdout!r} "
+                f"stderr={proc.stderr!r}")
+        if os.path.exists(ctl_path):
+            raise H.Failure("failed dual-listener startup left its UDS behind")
+        try:
+            leaked = socket.create_connection(
+                ("127.0.0.1", data_control_port), timeout=0.2)
+        except OSError:
+            leaked = None
+        if leaked is not None:
+            leaked.close()
+            raise H.Failure(
+                "failed dual-listener startup left Data control accepting")
+        H.log("dual Admin listener startup rollback — OK")
+    finally:
+        blocker.close()
+
+
+def admin_slow_reader_gate(node):
+    # Keep the fixture compact in code but large enough to exceed a Unix
+    # socket's send buffer after the binary status is hex-wrapped.
+    node_count = 2_500
+    commands = [
+        "registernode " + f"{index:040x}" + " keylane://node/" +
+        f"{index:040x}" + " primary 127.0.0.1:9000\n"
+        for index in range(node_count)]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as populate:
+        populate.settimeout(30)
+        populate.connect(node.ctl_path)
+        reader = populate.makefile("rb")
+        # Bound both directions during setup: sending every command before
+        # reading replies can fill both Unix socket buffers and deadlock.
+        batch_size = 128
+        for first in range(0, node_count, batch_size):
+            batch = commands[first:first + batch_size]
+            populate.sendall("".join(batch).encode())
+            for index in range(first, first + len(batch)):
+                reply = reader.readline()
+                if not reply.startswith(b"OK "):
+                    raise H.Failure(
+                        f"slow-reader fixture node {index}: {reply!r}")
+
+    slow = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1_024)
+    slow.settimeout(2)
+    slow.connect(node.ctl_path)
+    started = time.monotonic()
+    slow.sendall(b"clusterstatus 1\n")
+    try:
+        # A parked large status write must not pin the Celer worker: unrelated
+        # Admin traffic still completes while the 5-second send watchdog owns
+        # the slow connection.
+        time.sleep(0.25)
+        probe_started = time.monotonic()
+        status = run(["--socket", node.ctl_path, "status"], timeout=3)
+        if not status.startswith("OK leader=1 "):
+            raise H.Failure(f"status behind slow reader: {status}")
+        if time.monotonic() - probe_started > 1.0:
+            raise H.Failure("slow Admin reader blocked unrelated ctl traffic")
+
+        time.sleep(max(0.0, 5.75 - (time.monotonic() - started)))
+        saw_eof = False
+        while True:
+            chunk = slow.recv(65_536)
+            if not chunk:
+                saw_eof = True
+                break
+        if not saw_eof or time.monotonic() - started > 8.0:
+            raise H.Failure("slow status reader was not closed by send deadline")
+    finally:
+        slow.close()
+
+    cluster = run_cluster(
+        ["cluster-status", "--socket", node.ctl_path, "--json"], expected=2,
+        timeout=10)
+    if '"result":"not_ready"' not in cluster.stdout:
+        raise H.Failure("status capture did not recover after slow reader")
+    H.log("slow Admin status reader deadline and worker isolation — OK")
+
+
 def unix_gate(workdir):
     directory = os.path.join(workdir, "unix")
     os.makedirs(directory, exist_ok=True)
-    node = H.Node(META, directory, 1)
+    node = H.Node(
+        META, directory, 1, args=H.raft_args(snapshot_distance=100_000))
     try:
         node.start(bootstrap=True)
         H.wait_until("Unix ctl leader", 10, node.is_leader)
         status = run(["--socket", node.ctl_path, "status"])
         if not status.startswith("OK leader=1 "):
             raise H.Failure(f"unexpected Unix status: {status}")
+        cluster = run_cluster(
+            ["cluster-status", "--socket", node.ctl_path, "--json"], expected=2)
+        if '"result":"not_ready"' not in cluster.stdout:
+            raise H.Failure(f"unexpected Unix cluster status: {cluster.stdout}")
 
         op_id = "00000001000000000000000000000001"
         reply = run(["--socket", node.ctl_path, "submitop", op_id,
@@ -80,7 +446,8 @@ def unix_gate(workdir):
         if run(["--socket", node.ctl_path, "unknown"], expected=2) != \
                 "ERR unknown-command":
             raise H.Failure("ERR reply did not produce exit status 2")
-        H.log("keylane-meta-ctl Unix transport and exit statuses — OK")
+        admin_slow_reader_gate(node)
+        H.log("keylane-ctl Unix transport and exit statuses — OK")
     finally:
         node.terminate()
 
@@ -116,6 +483,15 @@ def plaintext_gate(workdir):
         status = run(client_args + ["status"])
         if not status.startswith("OK leader="):
             raise H.Failure(f"unexpected plaintext status: {status}")
+        denied = run_cluster(
+            ["cluster-status", "--addr", f"127.0.0.1:{ctl_port}"], expected=1)
+        if denied.stdout:
+            raise H.Failure("fatal plaintext policy failure wrote stdout")
+        cluster = run_cluster(
+            ["cluster-status", "--addr", f"127.0.0.1:{ctl_port}",
+             "--allow-plaintext-admin"], expected=2)
+        if not cluster.stdout.startswith("NOT READY\n"):
+            raise H.Failure(f"unexpected plaintext cluster status: {cluster.stdout}")
 
         op_id = "00000002000000000000000000000001"
         reply = run(client_args + ["submitop", op_id, "ctl-gate", "plain"])
@@ -126,7 +502,7 @@ def plaintext_gate(workdir):
             raise H.Failure(f"plaintext exportaudit: {export}")
         if b"keylane://operator/plaintext" not in bytes.fromhex(export[3:]):
             raise H.Failure("plaintext audit actor was not persisted")
-        H.log("keylane-meta-ctl remote plaintext transport — OK")
+        H.log("keylane-ctl remote plaintext transport — OK")
     finally:
         if server.poll() is None:
             server.terminate()
@@ -191,6 +567,62 @@ def mtls_gate(workdir):
         status = run(client_args + ["status"])
         if not status.startswith("OK leader="):
             raise H.Failure(f"unexpected mTLS status: {status}")
+        cluster = run_cluster(["cluster-status"] + client_args, expected=2)
+        if not cluster.stdout.startswith("NOT READY\n"):
+            raise H.Failure(f"unexpected mTLS cluster status: {cluster.stdout}")
+
+        # The UDS seed supplies the remote leader address; its TLS options
+        # must survive parsing and protect the learned TCP connection.
+        seed_path = os.path.join(directory, "discovery.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(seed_path)
+        listener.listen(1)
+        listener.settimeout(3)
+        endpoint = f"127.0.0.1:{ctl_port}".encode()
+        leader_member = (struct.pack(">IBI", 1, 1, len(endpoint)) + endpoint +
+                         bytes([1]))
+        seed_member = struct.pack(">IBB", 2, 0, 0)
+        head = (struct.pack(">HIBQBIQI", 1, 2, 0, 1, 1, 1, 1, 2) +
+                leader_member + seed_member)
+        seed_errors = []
+
+        def serve_seed():
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    reader = connection.makefile("rb")
+                    request = reader.readline()
+                    if request != b"clusterhead 1\n":
+                        raise H.Failure(f"unexpected discovery command: {request!r}")
+                    connection.sendall(
+                        b"OK clusterhead 1 " + head.hex().encode() + b"\n")
+            except (OSError, H.Failure) as error:
+                seed_errors.append(error)
+
+        seed_thread = threading.Thread(target=serve_seed, daemon=True)
+        seed_thread.start()
+        try:
+            redirected = run_cluster(
+                ["cluster-status", "--socket", seed_path,
+                 "--tls-ca", ca_crt, "--tls-cert", client_cert,
+                 "--tls-key", client_key], expected=2)
+            if not redirected.stdout.startswith("NOT READY\n"):
+                raise H.Failure(f"unexpected UDS-to-mTLS result: {redirected.stdout}")
+        finally:
+            listener.close()
+            seed_thread.join(timeout=4)
+        if seed_thread.is_alive() or seed_errors:
+            raise H.Failure(f"UDS-to-mTLS discovery failed: {seed_errors}")
+
+        bad_certificate = run_cluster(
+            ["cluster-status", "--addr", f"127.0.0.1:{ctl_port}",
+             "--tls-ca", client_cert, "--tls-cert", client_cert,
+             "--tls-key", client_key], expected=1)
+        if bad_certificate.stdout or not bad_certificate.stderr:
+            raise H.Failure(
+                "keylane-ctl cluster-status certificate failure did not stay fatal and "
+                f"stdout-clean: stdout={bad_certificate.stdout!r} "
+                f"stderr={bad_certificate.stderr!r}")
         wrong_name = subprocess.run(
             [CTL] + client_args + ["--tls-server-name", "wrong.invalid",
                                    "status"],
@@ -200,7 +632,7 @@ def mtls_gate(workdir):
                 "mTLS server-name mismatch was not rejected: "
                 f"exit={wrong_name.returncode} stdout={wrong_name.stdout!r} "
                 f"stderr={wrong_name.stderr!r}")
-        H.log("keylane-meta-ctl remote mTLS transport — OK")
+        H.log("keylane-ctl remote mTLS transport — OK")
     finally:
         if server.poll() is None:
             server.terminate()
@@ -219,6 +651,10 @@ def main():
     harness_argv = [sys.argv[0], META] + sys.argv[3:]
     workdir, keep = H.make_workdir(harness_argv, "meta_ctl_client_")
     try:
+        ctl_characterization_gate(workdir)
+        raw_argument_gate(workdir)
+        scripted_cluster_gate(workdir)
+        dual_listener_rollback_gate(workdir)
         unix_gate(workdir)
         plaintext_gate(workdir)
         mtls_gate(workdir)

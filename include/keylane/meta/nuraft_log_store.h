@@ -1,9 +1,9 @@
 #pragma once
 
-// NuraftLogStore is a NuRaft `log_store` backed by one WAL v2 segmented log
+// NuraftLogStore is a NuRaft `log_store` backed by one WAL v1 segmented log
 // per server.
 //
-// WAL v2 layout (`data_dir`):
+// WAL v1 layout (`data_dir`):
 //   log-<first_idx>.seg   one segment per index range; <first_idx> is the
 //                         first log index the segment can hold, pinned again
 //                         in the segment header
@@ -27,8 +27,7 @@
 // data; the remedy is to wipe the directory, not to migrate.
 //
 // Durability contract with the Raft core (verified against the pinned NuRaft
-// source, third_party/nuraft @ 0b01b18) — unchanged from v1, extended to
-// segment-file metadata:
+// source, third_party/nuraft @ 0b01b18), including segment-file metadata:
 //   - append()/write_at() pwrite records but never fsync. NuRaft always
 //     follows a batch of writes with exactly one sync point before the
 //     append result becomes visible: end_of_append_batch() after every
@@ -56,10 +55,9 @@
 //     (on_snapshot_completed runs after create_snapshot's callback), so a
 //     crash cannot leave compacted logs without a durable snapshot.
 //
-// On-disk format (all integers little-endian); the record format is
-// byte-identical to v1, the segment header adds the format version:
+// On-disk format (all integers little-endian):
 //   segment  := segment_header record*
-//   segment_header := magic u32 ("LSEG") | format_version u32 (=2) |
+//   segment_header := magic u32 ("LSEG") | format_version u32 (=1) |
 //                     first_index u64 | checksum u32
 //   record   := magic u32 ("LRA1") | index u64 | term u64 | type u8 |
 //               has_crc32 u8 | crc32 u32 | timestamp_us u64 |
@@ -80,7 +78,8 @@
 // form: the anomaly is either a crash mid-pwrite or the remnant of an
 // interrupted write_at/apply_pack truncation, both of which cut at or above
 // the uncommitted tail (committed prefixes are never overwritten in Raft).
-// This is v1's torn-tail rule lifted to a segment list.
+// A checksum-valid header with an unsupported version is incompatible data,
+// not a torn tail: Open rejects it before mutating any recovery files.
 //
 // Threading and IO model: every method takes the internal mutex and performs
 // synchronous pwrite/fdatasync on the calling NuRaft thread. NuRaft drives
@@ -134,9 +133,10 @@ class NuraftLogStore : public nuraft::log_store {
   // Default roll trigger for the active segment.
   static constexpr uint64_t kDefaultMaxSegmentBytes = 64ull << 20;  // 64 MiB
 
-  // Opens (creating if absent) the v2 segment set inside `data_dir`; the
+  // Opens (creating if absent) the v1 segment set inside `data_dir`; the
   // directory itself is created when missing. Fails when the directory holds
-  // a legacy single-file log (`raft_log.dat`) — the layouts are incompatible.
+  // a legacy single-file log (`raft_log.dat`) or a checksum-valid unsupported
+  // segment version, without changing existing files.
   // `max_segment_bytes` is the segment roll trigger; tests pass a tiny value
   // to exercise rolling.
   static absl::StatusOr<std::unique_ptr<NuraftLogStore>> Open(
