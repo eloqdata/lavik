@@ -167,9 +167,9 @@ RespClient Connect(std::uint16_t port) {
         RespClient client(fd);
         if (client.Command({"PING"}) == "+PONG") return client;
       } catch (const std::exception&) {
-        // The listener is created before storage recovery finishes. A TCP
-        // handshake alone is not readiness: initialization may reset that
-        // connection, so reconnect until the command path answers too.
+        // Rapid same-port restarts can complete a loopback handshake against
+        // the previous process generation. Reconnect until the command path
+        // proves this socket belongs to the ready server.
       }
     } else {
       ::close(fd);

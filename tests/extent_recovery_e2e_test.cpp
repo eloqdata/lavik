@@ -206,6 +206,22 @@ RespClient Connect(std::uint16_t port) {
   Fail("timed out connecting to Keylane");
 }
 
+RespClient ConnectReady(std::uint16_t port) {
+  const auto deadline = std::chrono::steady_clock::now() + 30s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      RespClient client = Connect(port);
+      if (client.Command({"PING"}) == "+PONG") return client;
+    } catch (const std::exception&) {
+      // Rapid same-port restarts can complete a loopback handshake against
+      // the previous process generation. Reconnect until the command path
+      // proves this socket belongs to the ready server.
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  Fail("timed out waiting for Keylane readiness");
+}
+
 class ServerProcess {
  public:
   ServerProcess(std::string binary, std::uint16_t port,
@@ -370,7 +386,7 @@ int main(int argc, char** argv) {
     // own block id, so its owner no longer follows the manifest's owner.
     {
       ServerProcess server(argv[1], port, data_path, log_path, 2);
-      RespClient client = Connect(port);
+      RespClient client = ConnectReady(port);
       for (int i = 0; i < kExternalKeys; ++i) {
         Expect(client.Command({"STRLEN", ExternalKey(i)}),
                ":" + std::to_string(kExternalBytes),
@@ -409,7 +425,7 @@ int main(int argc, char** argv) {
     // must survive until the root block is durably retired.
     {
       ServerProcess server(argv[1], port, data_path, log_path, 3);
-      RespClient client = Connect(port);
+      RespClient client = ConnectReady(port);
       for (int i = 0; i < kExternalKeys; ++i) {
         const std::string key = ExternalKey(i);
         ExpectEventually(client, {"STRLEN", key}, ":5", "post-reclaim STRLEN");

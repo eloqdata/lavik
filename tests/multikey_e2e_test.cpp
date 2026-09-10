@@ -233,6 +233,22 @@ RespClient Connect(std::uint16_t port) {
   Fail("timed out connecting to Keylane");
 }
 
+RespClient ConnectReady(std::uint16_t port) {
+  const auto deadline = std::chrono::steady_clock::now() + 20s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      RespClient client = Connect(port);
+      if (client.Command({"PING"}) == "+PONG") return client;
+    } catch (const std::exception&) {
+      // Rapid same-port restarts can complete a loopback handshake against
+      // the previous process generation. Reconnect until the command path
+      // proves this socket belongs to the ready server.
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  Fail("timed out waiting for Keylane readiness");
+}
+
 class ServerProcess {
  public:
   ServerProcess(const std::string& binary, std::uint16_t port,
@@ -1042,7 +1058,7 @@ int main(int argc, char** argv) {
 
     ServerProcess generation_recovery_server(argv[1], port, data_path,
                                              log_path);
-    RespClient generation_recovery = Connect(port);
+    RespClient generation_recovery = ConnectReady(port);
     const std::uint64_t recovered_cleaner_baseline =
         TxCleanerRetiredGenerations(generation_recovery);
     Expect(generation_recovery.Command(
@@ -1089,7 +1105,7 @@ int main(int argc, char** argv) {
     // cleaner can retire the aborted tagged records safely.
     ServerProcess rollback_server(argv[1], port, data_path, log_path,
                                   "cleaner-undo-d");
-    RespClient rollback = Connect(port);
+    RespClient rollback = ConnectReady(port);
     Expect(rollback.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable tx cleaner during rollback");
     for (std::string_view key : {"cleaner-undo-a", "cleaner-undo-b",
@@ -1118,7 +1134,7 @@ int main(int argc, char** argv) {
     rollback_server.Stop();
 
     ServerProcess rollback_recovered_server(argv[1], port, data_path, log_path);
-    RespClient rollback_recovered = Connect(port);
+    RespClient rollback_recovered = ConnectReady(port);
     Expect(
         rollback_recovered.Command({"MGET", "cleaner-undo-a", "cleaner-undo-b",
                                     "cleaner-undo-c", "cleaner-undo-d"}),
@@ -1138,7 +1154,7 @@ int main(int argc, char** argv) {
     // elected allocator publishes the shared stream.
     ServerProcess allocation_server(argv[1], port, data_path, log_path, {},
                                     "1000");
-    RespClient allocation_control = Connect(port);
+    RespClient allocation_control = ConnectReady(port);
     auto elected_write = std::async(std::launch::async, [port] {
       RespClient client = Connect(port);
       return client.Command({"MSET", "allocation-leader-a{tx-stream}",
@@ -1193,7 +1209,7 @@ int main(int argc, char** argv) {
     CreateDataFile(standby_data, 128ULL * 1024 * 1024);
     ServerProcess standby_server(argv[1], port, standby_data, log_path, {}, {},
                                  false, 4, {}, "1000");
-    RespClient standby_control = Connect(port);
+    RespClient standby_control = ConnectReady(port);
     const std::string standby_payload(7 * 1024 * 1024, 's');
     Expect(standby_control.Command(
                {"SET", "standby-leader{standby}", standby_payload}),
@@ -1233,7 +1249,7 @@ int main(int argc, char** argv) {
     // same process must run a later round and retire the generation.
     ServerProcess retry_server(argv[1], port, data_path, log_path, {}, {},
                                true);
-    RespClient retry = Connect(port);
+    RespClient retry = ConnectReady(port);
     const std::uint64_t failure_baseline =
         InfoStat(retry, "tx_cleaner_failures:");
     const std::uint64_t retry_retired_baseline =
@@ -1257,7 +1273,7 @@ int main(int argc, char** argv) {
     retry_server.Stop();
 
     ServerProcess retry_recovered_server(argv[1], port, data_path, log_path);
-    RespClient retry_recovered = Connect(port);
+    RespClient retry_recovered = ConnectReady(port);
     Expect(retry_recovered.Command(
                {"MGET", "cleaner-retry-a{tx}", "cleaner-retry-b{tx}"}),
            "*2\r\n" + Bulk("durable-a") + "\r\n" + Bulk("durable-b"),

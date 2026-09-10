@@ -222,6 +222,22 @@ RespClient Connect(std::uint16_t port) {
   Fail("timed out connecting to Keylane");
 }
 
+RespClient ConnectReady(std::uint16_t port) {
+  const auto deadline = std::chrono::steady_clock::now() + 20s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      RespClient client = Connect(port);
+      if (client.Command({"PING"}) == "+PONG") return client;
+    } catch (const std::exception&) {
+      // Rapid same-port restarts can complete a loopback handshake against
+      // the previous process generation. Reconnect until the command path
+      // proves this socket belongs to the ready server.
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  Fail("timed out waiting for Keylane readiness");
+}
+
 class ServerProcess {
  public:
   ServerProcess(const std::string& binary, std::uint16_t port,
@@ -481,7 +497,7 @@ int main(int argc, char** argv) {
 
     {
       ServerProcess server(argv[1], port, data_path, log_path);
-      RespClient recovered = Connect(port);
+      RespClient recovered = ConnectReady(port);
       const auto recovered_values = RespClient::ParseFlatArray(
           recovered.Command({"MGET", "sa", "sb", "sc", "ha", "hb"}));
       if (recovered_values != final_values) {

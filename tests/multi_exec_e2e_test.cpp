@@ -246,6 +246,22 @@ RespClient Connect(std::uint16_t port) {
   Fail("timed out connecting to Keylane");
 }
 
+RespClient ConnectReady(std::uint16_t port) {
+  const auto deadline = std::chrono::steady_clock::now() + 20s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    try {
+      RespClient client = Connect(port);
+      if (client.Command({"PING"}) == "+PONG") return client;
+    } catch (const std::exception&) {
+      // Rapid same-port restarts can complete a loopback handshake against
+      // the previous process generation. Reconnect until the command path
+      // proves this socket belongs to the ready server.
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  Fail("timed out waiting for Keylane readiness");
+}
+
 class ServerProcess {
  public:
   ServerProcess(const std::string& binary, std::uint16_t port,
@@ -1593,7 +1609,7 @@ int main(int argc, char** argv) {
     // runtime reclamation, never the durability boundary).
     {
       ServerProcess restarted(argv[1], port, data_path, log_path);
-      RespClient recovered = Connect(port);
+      RespClient recovered = ConnectReady(port);
       ExpectContains(
           recovered.Command({"FCALL_RO", "keylane_globals", "0"}),
           "Script attempted to access nonexistent global variable 'KEYS'",
@@ -1607,7 +1623,7 @@ int main(int argc, char** argv) {
     }
     {
       ServerProcess restarted(argv[1], port, data_path, log_path);
-      RespClient recovered = Connect(port);
+      RespClient recovered = ConnectReady(port);
       ExpectContains(
           recovered.Command({"FCALL", "keylane_get", "1", "function:key"}),
           "Function not found", "FUNCTION DELETE survives restart");
@@ -1619,7 +1635,7 @@ int main(int argc, char** argv) {
     }
     {
       ServerProcess restarted(argv[1], port, data_path, log_path);
-      RespClient recovered = Connect(port);
+      RespClient recovered = ConnectReady(port);
       ExpectContains(recovered.Command({"FCALL", "transaction_set", "1",
                                         "function:restart", "x"}),
                      "Function not found", "FUNCTION FLUSH survives restart");
