@@ -255,9 +255,15 @@ Task<absl::Status> StorageEngine::Impl::PrepinGroupedRetirementsLocked(
     // Reacquire the caller's mutex on every outcome, then its append loop must
     // resolve the key/view and capacity again before root construction.
     store.store_state_mutex_.Unlock(*store.worker_);
-    auto status = owner == store.worker_->id()
-                      ? co_await pin()
-                      : co_await celer::SubmitTaskTo(owner, pin);
+    // if/else, not ?:, to keep the two co_awaits in separate full
+    // expressions. GCC 13 can reuse the wrong coroutine-frame slot when both
+    // arms of ?: contain co_await, which can run the pin on the wrong worker.
+    absl::Status status;
+    if (owner == store.worker_->id()) {
+      status = co_await pin();
+    } else {
+      status = co_await celer::SubmitTaskTo(owner, pin);
+    }
     co_await store.store_state_mutex_.Lock();
     if (!status.ok()) {
       guard.Sort();

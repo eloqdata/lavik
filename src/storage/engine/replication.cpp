@@ -2256,8 +2256,13 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
       }
       co_return absl::OkStatus();
     };
-    auto cancelled = target == 0 ? co_await cancel()
-                                 : co_await celer::SubmitTaskTo(target, cancel);
+    // Same GCC 13 double-co_await workaround as PromoteReplicaRoot above.
+    absl::Status cancelled;
+    if (target == 0) {
+      cancelled = co_await cancel();
+    } else {
+      cancelled = co_await celer::SubmitTaskTo(target, cancel);
+    }
     if (!cancelled.ok()) co_return cancelled;
   }
   for (unsigned target = 0; target < worker_count_; ++target) {

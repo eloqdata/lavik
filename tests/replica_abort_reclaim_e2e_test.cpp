@@ -107,6 +107,14 @@ class ReplicaAbortReclaimService final : public celer::Service {
 
   void Stop() noexcept override {}
 
+  // Mirror the production RedisService lifecycle: release each WorkerStore on
+  // its owning worker. Without this, final cleanup destroys owner-thread
+  // state (e.g. LocalSharedPtr<GroupIndexNode>) on the main thread and trips
+  // the owner-thread assertion.
+  void FinalizeWorker(celer::Worker& worker) noexcept override {
+    storage_->FinalizeWorker(worker);
+  }
+
   const absl::Status& result() const noexcept { return result_; }
 
  private:

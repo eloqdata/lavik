@@ -3996,27 +3996,34 @@ Task<absl::StatusOr<storage::RestoreRawResult>> ApplyPreparedRestore(
     const storage::MutationPrecondition* mutation_precondition = nullptr) {
   if (!value.collection_) {
     value.raw_.expire_at_ms_ = value.expire_at_ms_;
-    co_return digest != nullptr
-        ? co_await g_storage->RestoreRawValueLocked(
-              db, key, *digest, value.raw_, replace, tx, replication,
-              mutation_precondition)
-        : co_await g_storage->RestoreRawValue(db, key, value.raw_, replace,
-                                              replication,
-                                              mutation_precondition);
+    // if/else, not ?:, to keep the two co_awaits in separate full
+    // expressions. GCC 13 can reuse the wrong coroutine-frame slot when both
+    // arms of ?: contain co_await.
+    if (digest != nullptr) {
+      co_return co_await g_storage->RestoreRawValueLocked(
+          db, key, *digest, value.raw_, replace, tx, replication,
+          mutation_precondition);
+    }
+    co_return co_await g_storage->RestoreRawValue(db, key, value.raw_, replace,
+                                                  replication,
+                                                  mutation_precondition);
   }
   storage::CollectionPageReader next =
       [&value]() -> Task<absl::StatusOr<storage::CollectionPage>> {
     co_return value.collection_->ReadCollectionPage();
   };
-  co_return digest != nullptr
-      ? co_await g_storage->RestoreCollectionValueLocked(
-            db, key, *digest, value.value_type_, value.expire_at_ms_, replace,
-            value.collection_->expected_items(), std::move(next), tx,
-            replication, mutation_precondition)
-      : co_await g_storage->RestoreCollectionValue(
-            db, key, value.value_type_, value.expire_at_ms_, replace,
-            value.collection_->expected_items(), std::move(next), replication,
-            mutation_precondition);
+  // Same GCC 13 double-co_await hazard as the raw branch above: keep the
+  // suspensions in separate statements.
+  if (digest != nullptr) {
+    co_return co_await g_storage->RestoreCollectionValueLocked(
+        db, key, *digest, value.value_type_, value.expire_at_ms_, replace,
+        value.collection_->expected_items(), std::move(next), tx, replication,
+        mutation_precondition);
+  }
+  co_return co_await g_storage->RestoreCollectionValue(
+      db, key, value.value_type_, value.expire_at_ms_, replace,
+      value.collection_->expected_items(), std::move(next), replication,
+      mutation_precondition);
 }
 
 std::vector<std::string> CanonicalRestoreCommand(std::string_view key,

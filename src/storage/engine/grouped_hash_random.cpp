@@ -199,18 +199,24 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
       for (const auto& member : result.values_)
         replication->args_.push_back(*member);
     }
-    const auto status =
-        result.key_exists_
-            ? co_await CommitGroupedHashMutationLocked(
-                  store, partition, db_id, key, digest, object,
-                  std::move(remaining), std::move(changed), result.length_,
-                  value_type, object->version().root_.expire_at_ms_, tx,
-                  replication, mutation_precondition)
-            : co_await AppendLocked(store, partition, db_id, key, digest, {},
-                                    RecordKind::kTombstone, ValueType::kNone, 0,
-                                    tx, 0, nullptr, nullptr, replication,
-                                    nullptr, true, nullptr,
-                                    mutation_precondition);
+    // if/else, not ?:, to keep the two co_awaits in separate full
+    // expressions. GCC 13 can reuse the wrong coroutine-frame slot when both
+    // arms of ?: contain co_await, which can publish the tombstone path for a
+    // non-empty result.
+    absl::Status status;
+    if (result.key_exists_) {
+      status = co_await CommitGroupedHashMutationLocked(
+          store, partition, db_id, key, digest, object, std::move(remaining),
+          std::move(changed), result.length_, value_type,
+          object->version().root_.expire_at_ms_, tx, replication,
+          mutation_precondition);
+    } else {
+      status = co_await AppendLocked(store, partition, db_id, key, digest, {},
+                                     RecordKind::kTombstone, ValueType::kNone,
+                                     0, tx, 0, nullptr, nullptr, replication,
+                                     nullptr, true, nullptr,
+                                     mutation_precondition);
+    }
     if (!status.ok()) co_return status;
     co_return result;
   } catch (const std::bad_alloc&) {

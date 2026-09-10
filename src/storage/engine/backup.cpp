@@ -1164,10 +1164,14 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
                   ? block->pins_
                   : 0;
             };
-            remaining +=
-                physical_owner == owner->worker_->id()
-                    ? co_await count()
-                    : co_await celer::SubmitTaskTo(physical_owner, count);
+            // if/else, not ?:, to keep the two co_awaits in separate full
+            // expressions. GCC 13 can reuse the wrong coroutine-frame slot
+            // when both arms of ?: contain co_await.
+            if (physical_owner == owner->worker_->id()) {
+              remaining += co_await count();
+            } else {
+              remaining += co_await celer::SubmitTaskTo(physical_owner, count);
+            }
           }
           const auto after =
               GetWorkerMemoryStats(owner->worker_->id()).retained_bytes_;

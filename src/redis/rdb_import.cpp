@@ -29,9 +29,11 @@ celer::Task<absl::StatusOr<storage::RestoreRawResult>> RestoreFileEntry(
     }
     co_return result;
   };
-  co_return owner == celer::ThisWorker().id_
-      ? co_await apply()
-      : co_await celer::SubmitTaskTo(owner, apply);
+  // if/else, not ?:, to keep the two co_awaits in separate full expressions.
+  // GCC 13 can reuse the wrong coroutine-frame slot when both arms of ?:
+  // contain co_await, which can run the restore on the wrong worker.
+  if (owner == celer::ThisWorker().id_) co_return co_await apply();
+  co_return co_await celer::SubmitTaskTo(owner, apply);
 }
 
 }  // namespace keylane::rdb
