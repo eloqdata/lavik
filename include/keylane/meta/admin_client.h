@@ -19,7 +19,7 @@ struct MetaAdminTlsOptions {
   std::string certificate_file_;
   std::string private_key_file_;
   // Empty verifies the numeric endpoint's IP SAN. This override exists only
-  // for direct keylane-meta-ctl commands; cluster discovery deliberately
+  // for direct keylane-ctl commands; cluster discovery deliberately
   // leaves it empty so learned addresses cannot change certificate identity.
   std::string server_name_;
 };

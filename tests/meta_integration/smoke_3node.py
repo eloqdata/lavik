@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """3-node smoke test for the keylane-meta Raft driver.
 
-Usage: smoke_3node.py /path/to/keylane-meta /path/to/keylane-meta-ctl [workdir]
+Usage: smoke_3node.py /path/to/keylane-meta /path/to/keylane-ctl [workdir]
 
 Scenario: bootstrap node1, add node2/node3 through the ctl surface,
 replicate committed writes (real SubmitOperation/CompleteOperation

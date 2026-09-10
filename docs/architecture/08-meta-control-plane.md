@@ -469,7 +469,7 @@ separates operators, Meta members, and data-node self-reporting; actor fields on
 the wire are never trusted.
 Certificate validity is enforced by TLS, but online issuance, rotation, CRL,
 and OCSP integration are outside this module.
-The `keylane-meta-ctl` operator client uses one Raft-free Admin transport for
+The `keylane-ctl` operator client uses one Raft-free Admin transport for
 Unix, plaintext TCP, and mTLS TCP. Direct commands address the selected member;
 `status` reports its local state. The `cluster-status` command discovers the
 leader and evaluates cluster readiness. The transport handles partial I/O
@@ -478,7 +478,7 @@ override; cluster discovery verifies each numeric Admin IP against the
 certificate IP SAN and never falls back between TLS and plaintext. A Unix
 seed can use configured TLS credentials for subsequent remote leader access.
 
-`keylane-meta-ctl cluster-status` normally performs exactly two reads:
+`keylane-ctl cluster-status` normally performs exactly two reads:
 `clusterhead 1` against the supplied seed to learn the current committed Admin
 directory, then `clusterstatus 1` against the indicated leader. Redirect,
 leader-change, busy, and incomplete-catch-up results retry discovery only
@@ -538,5 +538,5 @@ transition into or out of disabled mode.
 | Shared Meta/Data frame, object-transfer, and message formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
 | Foreign-thread typed completion ingress and worker wakeup | `celer/include/celer/runtime/foreign_executor.h`, `celer/src/runtime/foreign_executor.cpp`, `celer/include/celer/runtime/cross_core.h`, `celer/src/runtime/worker.cpp` |
-| TLS identity, RBAC, Unix peer credentials, Admin transport, and cluster status | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp`, `celer/src/net/` |
+| TLS identity, RBAC, Unix peer credentials, Admin transport, and cluster status | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `celer/src/net/` |
 | Recovery, partition, membership, and security gates | `tests/meta_*`, `tests/meta_integration/` |

@@ -20,7 +20,7 @@ leader-local observations, authenticated administration, and coordination
 plus process-lifetime Data-control sessions. It links the pinned NuRaft
 submodule, whose native Asio service owns Raft peer communication; Celer owns
 the separate administrative and Data-node sessions. The Raft-free
-`keylane-meta-ctl` operator client sends direct administrative commands; its
+`keylane-ctl` operator client sends direct administrative commands; its
 `cluster-status` command discovers the current Meta leader and reads one stable
 cluster-readiness cut through that surface. NuRaft is linked only into
 `keylane-meta`: the data-plane executable, operator client, their supporting
@@ -50,7 +50,7 @@ keylane-meta Raft leader <-- framed control session --> Data NodeControl
        committed view       full state / lease /        topology, authority,
                             directive / observation      replication actions
 
-operator --> keylane-meta-ctl cluster-status
+operator --> keylane-ctl cluster-status
                          |
                     Meta Admin seed --> current Meta leader
                       clusterhead           clusterstatus

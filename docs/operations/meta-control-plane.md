@@ -5,7 +5,7 @@
 Build the separate Meta executable and its operator client with:
 
 ```sh
-cmake --build <build-dir> --target keylane-meta keylane-meta-ctl
+cmake --build <build-dir> --target keylane-meta keylane-ctl
 ```
 
 A cluster normally has three `keylane-meta` processes. Every process needs:
@@ -48,12 +48,12 @@ member.
 
 ## Send administrative commands
 
-Direct `keylane-meta-ctl` commands send one LF-terminated request to the
+Direct `keylane-ctl` commands send one LF-terminated request to the
 selected member and print its one-line reply. `status` reports that member's
 local state. Run the client as an allowed uid when using the local Unix socket:
 
 ```sh
-keylane-meta-ctl \
+keylane-ctl \
   --socket /var/lib/keylane/meta-1/meta-admin.sock status
 ```
 
@@ -64,20 +64,20 @@ deadline. Query every live member when locating the leader; the leader's reply
 contains `leader=1`, while mutation requests sent to a follower return
 `ERR not-leader`.
 
-For cluster-wide readiness, use `keylane-meta-ctl cluster-status`. It queries
+For cluster-wide readiness, use `keylane-ctl cluster-status`. It queries
 the seed for the current leader and requests one leader-bracketed status cut;
 it does not probe followers or claim their reachability or replication progress:
 
 ```sh
-keylane-meta-ctl cluster-status \
+keylane-ctl cluster-status \
   --socket /var/lib/keylane/meta-1/meta-admin.sock
 
-keylane-meta-ctl cluster-status --addr 10.0.0.11:7200 \
+keylane-ctl cluster-status --addr 10.0.0.11:7200 \
   --allow-plaintext-admin --json
 ```
 
 Connection options may also precede `cluster-status`, for example
-`keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock cluster-status`.
+`keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock cluster-status`.
 The first human-readable line is `READY`, `NOT READY`, or `RETRYABLE`.
 Corresponding exits are 0, 2, and 3; invalid options, unsafe transport choices,
 TLS/identity failures, incompatible wire data, and corrupt status exit 1 with
@@ -99,7 +99,7 @@ keylane-meta --id 1 --addr 10.0.0.11:7100 \
   --data-dir /var/lib/keylane/meta-1 --bootstrap \
   --ctl-addr 10.0.0.11:7200
 
-keylane-meta-ctl --addr 10.0.0.11:7200 status
+keylane-ctl --addr 10.0.0.11:7200 status
 ```
 
 All plaintext peers share the audit actor
@@ -146,16 +146,16 @@ install -d -m 0700 "$META_ROOT" \
 Wait until node 1 reports `leader=1`, then add one waiting member at a time:
 
 ```sh
-keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" status
-keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
+keylane-ctl --socket "$META_ROOT/node1/meta-admin.sock" status
+keylane-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
   addsrv 2 127.0.0.1:7102 127.0.0.1:7302 127.0.0.1:7202
 
-keylane-meta-ctl --socket "$META_ROOT/node2/meta-admin.sock" status
+keylane-ctl --socket "$META_ROOT/node2/meta-admin.sock" status
 
-keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
+keylane-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
   addsrv 3 127.0.0.1:7103 127.0.0.1:7303 127.0.0.1:7203
 
-keylane-meta-ctl --socket "$META_ROOT/node3/meta-admin.sock" status
+keylane-ctl --socket "$META_ROOT/node3/meta-admin.sock" status
 ```
 
 Do not treat `addsrv` returning `OK` as proof that catch-up finished: NuRaft
@@ -259,7 +259,7 @@ tagged `tcp://` or `tls://`; a dual-listener node may supply one of each, using
 the same numeric host:
 
 ```sh
-keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
   registernode 0123456789abcdef0123456789abcdef01234567 \
   keylane://node/0123456789abcdef0123456789abcdef01234567 \
   primary tcp://10.0.1.11:6379
@@ -417,13 +417,13 @@ openssl x509 -req -sha256 -days 30 \
 Use that operator identity with the control client:
 
 ```sh
-keylane-meta-ctl --addr 10.0.0.11:7200 \
+keylane-ctl --addr 10.0.0.11:7200 \
   --tls-ca /etc/keylane/meta/ca.crt \
   --tls-cert /etc/keylane/meta/operator-admin.crt \
   --tls-key /etc/keylane/meta/operator-admin.key \
   status
 
-keylane-meta-ctl cluster-status --addr 10.0.0.11:7200 \
+keylane-ctl cluster-status --addr 10.0.0.11:7200 \
   --tls-ca /etc/keylane/meta/ca.crt \
   --tls-cert /etc/keylane/meta/operator-admin.crt \
   --tls-key /etc/keylane/meta/operator-admin.key \
@@ -452,7 +452,7 @@ change may be active at a time. To add a peer:
 For example:
 
 ```sh
-keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
   addsrv 4 10.0.0.14:7100 10.0.0.14:7300 10.0.0.14:7200
 ```
 
@@ -465,7 +465,7 @@ rather than creating a different identity.
 To remove a peer, select a follower and run this on the leader:
 
 ```sh
-keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock removesrv 4
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock removesrv 4
 ```
 
 On success, Keylane first completes NuRaft `remove_srv`, then commits and
@@ -589,14 +589,14 @@ operation id and sequence returned by `submitop`; `getop` does not return the
 sequence and is not a linearizable read on a follower.
 
 ```sh
-keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
   abortop 00000001000000000000000000000001
-keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
   archiveoperations 12345
-keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
   exportoperations
 # Verify and durably store the exported blob before removing its retry tombstone.
-keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
   pruneoperations 12345
 ```
 

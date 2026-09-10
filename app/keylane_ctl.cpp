@@ -117,7 +117,7 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
       return options;
     }
     if (argument == "--version") {
-      std::cout << "keylane-meta-ctl " << keylane::kVersion << '\n';
+      std::cout << "keylane-ctl " << keylane::kVersion << '\n';
       *early_exit = true;
       return options;
     }
@@ -308,7 +308,7 @@ int main(int argc, char** argv) {
     if (early_exit) return 0;
     return Run(options);
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "keylane-meta-ctl: %s\n", error.what());
+    std::fprintf(stderr, "keylane-ctl: %s\n", error.what());
     return 1;
   }
 }

@@ -649,18 +649,18 @@ if (KEYLANE_BUILD_META)
 
   # Direct administration and cluster readiness share one Raft-free CLI over
   # the Admin transport/operator library, without linking keylane_meta_core.
-  add_executable(keylane-meta-ctl
-    app/keylane_meta_ctl.cpp
+  add_executable(keylane-ctl
+    app/keylane_ctl.cpp
   )
-  target_include_directories(keylane-meta-ctl PRIVATE
+  target_include_directories(keylane-ctl PRIVATE
     ${KEYLANE_GENERATED_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  target_link_libraries(keylane-meta-ctl PRIVATE
+  target_link_libraries(keylane-ctl PRIVATE
     keylane_meta_admin
   )
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(keylane-meta-ctl PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(keylane-ctl PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 
   # Negative guard for the layering rule above: fail at configure time if
@@ -833,7 +833,7 @@ if (BUILD_TESTING)
         COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/smoke_3node.py
                 $<TARGET_FILE:keylane-meta>
-                $<TARGET_FILE:keylane-meta-ctl>
+                $<TARGET_FILE:keylane-ctl>
       )
       set_tests_properties(meta_integration.smoke_3node PROPERTIES
         LABELS meta-integration
@@ -846,7 +846,7 @@ if (BUILD_TESTING)
         COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/ctl_client.py
                 $<TARGET_FILE:keylane-meta>
-                $<TARGET_FILE:keylane-meta-ctl>
+                $<TARGET_FILE:keylane-ctl>
       )
       set_tests_properties(meta_integration.ctl_client PROPERTIES
         LABELS meta-integration
