@@ -1,8 +1,7 @@
-#include "keylane/meta/candidate_plan.h"
-
 #include <array>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -10,6 +9,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "keylane/meta/candidate_plan.h"
 
 namespace {
 
@@ -21,6 +21,7 @@ using keylane::meta::MetaBootIncarnation;
 using keylane::meta::MetaCandidateProgressObs;
 using keylane::meta::MetaCommittedFacts;
 using keylane::meta::MetaHash256;
+using keylane::meta::MetaNodeHealthObs;
 using keylane::meta::MetaObservation;
 using keylane::meta::MetaObservationIdentity;
 using keylane::meta::MetaObservationStore;
@@ -183,6 +184,66 @@ TEST(MetaCandidatePlanTest, TtlIsAppliedAtTheFixedPlanningInstant) {
             CandidatePlanDisposition::kSelected);
   EXPECT_EQ(CandidatePlanFor("g", facts, store, 1031).disposition_,
             CandidatePlanDisposition::kNoEligibleCandidates);
+}
+
+TEST(MetaCandidatePlanTest, MissingHeartbeatCandidateWithdrawsBeforeTtl) {
+  MetaObservationStore::Limits limits;
+  limits.ttl_ms_ = 30;
+  MetaObservationStore store(limits);
+  PlanFacts facts;
+  const auto slower = Candidate(Node('a'), 1, {10, 10});
+  const auto greatest = Candidate(Node('b'), 2, {11, 10});
+  const MetaNodeHealthObs healthy{
+      .storage_ready_ = true, .population_ready_ = true, .active_groups_ = 1};
+
+  for (const auto& candidate : {slower, greatest}) {
+    const MetaObservationIdentity identity{candidate.node_id_,
+                                           candidate.boot_incarnation_,
+                                           candidate.session_generation_};
+    facts.active_.insert(candidate.node_id_);
+    facts.assignments_[candidate.node_id_] = candidate.assignment_id_;
+    ASSERT_TRUE(store.AdoptSession(identity, 999).ok());
+    const auto accepted =
+        store.ReplaceHeartbeat(identity, healthy, candidate, facts, 1000);
+    ASSERT_TRUE(accepted.boot_status_.ok());
+    ASSERT_TRUE(accepted.health_status_.ok());
+    ASSERT_TRUE(accepted.candidate_status_.ok());
+  }
+
+  const auto initial = CandidatePlanFor("g", facts, store, 1001);
+  ASSERT_EQ(initial.disposition_, CandidatePlanDisposition::kSelected);
+  ASSERT_TRUE(initial.selected_.has_value());
+  ASSERT_EQ(initial.selected_->node_id_, greatest.node_id_);
+  ASSERT_GT(initial.selected_->expires_unix_ms_, 1002);
+
+  const MetaObservationIdentity identity{greatest.node_id_,
+                                         greatest.boot_incarnation_,
+                                         greatest.session_generation_};
+  // A healthy heartbeat that lacks a coherent frontier withdraws role
+  // evidence immediately; the previous report's TTL cannot bridge a busy read.
+  const auto omitted =
+      store.ReplaceHeartbeat(identity, healthy, std::nullopt, facts, 1002);
+  ASSERT_TRUE(omitted.boot_status_.ok());
+  ASSERT_TRUE(omitted.health_status_.ok());
+  ASSERT_TRUE(omitted.candidate_status_.ok());
+  const auto fallback = CandidatePlanFor("g", facts, store, 1002);
+  ASSERT_EQ(fallback.disposition_, CandidatePlanDisposition::kSelected);
+  ASSERT_TRUE(fallback.selected_.has_value());
+  EXPECT_EQ(fallback.selected_->node_id_, slower.node_id_);
+  EXPECT_EQ(fallback.maximal_node_ids_,
+            (std::vector<std::string>{slower.node_id_}));
+
+  const auto resumed =
+      store.ReplaceHeartbeat(identity, healthy, greatest, facts, 1003);
+  ASSERT_TRUE(resumed.boot_status_.ok());
+  ASSERT_TRUE(resumed.health_status_.ok());
+  ASSERT_TRUE(resumed.candidate_status_.ok());
+  const auto restored = CandidatePlanFor("g", facts, store, 1003);
+  ASSERT_EQ(restored.disposition_, CandidatePlanDisposition::kSelected);
+  ASSERT_TRUE(restored.selected_.has_value());
+  EXPECT_EQ(restored.selected_->node_id_, greatest.node_id_);
+  EXPECT_EQ(restored.selection_basis_,
+            CandidateSelectionBasis::kUniqueGreatest);
 }
 
 }  // namespace

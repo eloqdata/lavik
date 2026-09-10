@@ -3723,9 +3723,9 @@ class ReplicationManager::ReplicationGroup {
     // state_mutex_ keeps heartbeat observation off the replication hot path.
     std::optional<std::vector<std::uint64_t>> live_snapshot;
     if (frontier != nullptr && result.ready_token_.has_value()) {
-      // A later heartbeat can retry; do not spin through a concurrent batch
-      // on the control worker merely to produce optional candidate evidence.
-      auto snapshot = frontier->TrySnapshotOnce();
+      // A missing vector withdraws the node's previous Meta candidate, so
+      // preserve bounded retries for short publication races.
+      auto snapshot = frontier->TrySnapshot();
       if (snapshot.ok() &&
           snapshot->size() == result.ready_token_->cut_vector().size() &&
           std::equal(snapshot->begin(), snapshot->end(),

@@ -136,16 +136,6 @@ absl::Status ReplicaAppliedFrontier::InstallNextLsns(
 
 absl::StatusOr<std::vector<std::uint64_t>>
 ReplicaAppliedFrontier::TrySnapshot() const {
-  return TrySnapshot(kSnapshotAttempts);
-}
-
-absl::StatusOr<std::vector<std::uint64_t>>
-ReplicaAppliedFrontier::TrySnapshotOnce() const {
-  return TrySnapshot(1);
-}
-
-absl::StatusOr<std::vector<std::uint64_t>> ReplicaAppliedFrontier::TrySnapshot(
-    unsigned attempts) const {
   if (poisoned()) {
     return absl::FailedPreconditionError("replica Applied frontier is poisoned");
   }
@@ -155,7 +145,7 @@ absl::StatusOr<std::vector<std::uint64_t>> ReplicaAppliedFrontier::TrySnapshot(
   thread_local std::vector<std::uint64_t> before;
   before.resize(publisher_count_);
   std::vector<std::uint64_t> result;
-  for (unsigned attempt = 0; attempt < attempts; ++attempt) {
+  for (unsigned attempt = 0; attempt < kSnapshotAttempts; ++attempt) {
     bool stable = true;
     for (unsigned publisher = 0; publisher < publisher_count_; ++publisher) {
       before[publisher] = publishers_[publisher].published_.load(
