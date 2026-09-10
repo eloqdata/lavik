@@ -107,6 +107,7 @@ struct NodeDirective {
     kReplication,
     kAuthorizeSource,
     kRevokeSources,
+    kInitializeEmptyPopulation,
   };
 
   ProjectionBasis projection_;
@@ -129,12 +130,11 @@ struct NodeDirective {
   Sha256Digest manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
   std::vector<NodeManifestEntry> manifest_entries_;
-  // Reserved wire-schema fields. V1 rejects non-empty values before entering
-  // NodeControlActions because the native replication adapter has no
-  // operation-kind interpreter for them.
+  // V1 uses payload only to bind empty-population initialization to the
+  // authenticated target history id; preconditions remain reserved.
   std::string payload_;
   std::string preconditions_;
-  // Active V1 classification: only rebuild directives may set this. It drives
+  // Active V1 classification: population directives set this. It drives
   // non-serving-target admission and cross-operation mutation exclusion.
   bool storage_mutating_ = false;
   // Reserved in V1 and rejected when true before entering NodeControlActions.
@@ -145,8 +145,8 @@ struct NodeDirective {
 
 // Pollable terminal outcome for one exact directive attempt. Starting and
 // observing are deliberately separate: a later FDS directive must be able to
-// enter ReplicationManager and supersede an in-progress rebuild, while the
-// original wire identity continues to own its eventual terminal result.
+// enter ReplicationManager and supersede an in-progress population mutation,
+// while the original wire identity continues to own its terminal result.
 class NodeDirectiveCompletion {
  public:
   using Poll = std::function<std::optional<absl::Status>()>;
@@ -210,7 +210,8 @@ class NodeControlActions {
   // native-flow join and partial-root abort, making FullStateApplied a real
   // population invalidation barrier.
   virtual celer::Task<absl::Status> ReconcilePopulation(
-      std::optional<PopulationReadiness> desired, bool rebuild_expected);
+      std::optional<PopulationReadiness> desired,
+      bool population_transition_expected);
   // Session loss cancels a destructive attempt whose terminal result is no
   // longer observable on that wire, but preserves an already Ready population
   // for an equal FDS on reconnect.
@@ -221,8 +222,9 @@ class NodeControlActions {
   // in-progress cancellation.
   virtual celer::Task<absl::Status> CancelPopulationForShutdown();
   // The default adapts actions whose admission and completion are one short
-  // operation. ReplicationManager overrides this for rebuilds so admission
-  // returns a pollable exact-attempt completion without awaiting readiness.
+  // operation. ReplicationManager overrides this for population mutations so
+  // admission returns a pollable exact-attempt completion without awaiting
+  // readiness.
   virtual celer::Task<NodeDirectiveCompletion> StartDirective(
       NodeDirective directive);
   virtual celer::Task<absl::Status> ApplyDirective(NodeDirective directive) = 0;
@@ -291,7 +293,7 @@ class NodeControlInstaller {
   // ServingState before returning to the wire client.
   celer::Task<absl::Status> InstallFullStateTransition(
       PreparedFullState prepared_state, ProjectionBasis projection_basis,
-      bool local_rebuild_expected = false);
+      bool local_population_transition_expected = false);
 
   // Meta-only fence barrier. New authority and directive admission are blocked
   // synchronously; success is returned only after earlier action registration,

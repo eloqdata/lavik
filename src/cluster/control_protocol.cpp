@@ -1815,7 +1815,7 @@ absl::StatusOr<std::string> Encode(const Directive& directive) {
   writer.Fixed(directive.manifest_digest);
   writer.U64(directive.partition_replication_epoch);
   const auto kind = static_cast<std::uint8_t>(directive.kind);
-  if (kind < 1 || kind > 3) return ProtocolError("unknown directive kind");
+  if (kind < 1 || kind > 4) return ProtocolError("unknown directive kind");
   writer.U8(kind);
   if (absl::Status status = writer.String(
           directive.payload, kMaxOpaqueFieldBytes, "directive payload");
@@ -1886,7 +1886,7 @@ absl::StatusOr<WireMessage> DecodeDirective(std::string_view bytes) {
   directive.partition_replication_epoch = *partition_replication_epoch;
   auto kind = reader.U8();
   if (!kind.ok()) return kind.status();
-  if (*kind < 1 || *kind > 3) return ProtocolError("unknown directive kind");
+  if (*kind < 1 || *kind > 4) return ProtocolError("unknown directive kind");
   directive.kind = static_cast<WireDirectiveKind>(*kind);
   auto payload = reader.String(kMaxOpaqueFieldBytes);
   if (!payload.ok()) return payload.status();
@@ -2554,7 +2554,7 @@ absl::Status WriteProjectedDirective(Writer& writer,
   writer.Fixed(directive.manifest_digest);
   writer.U64(directive.partition_replication_epoch);
   const auto kind = static_cast<std::uint8_t>(directive.kind);
-  if (kind < 1 || kind > 3) return ProtocolError("unknown directive kind");
+  if (kind < 1 || kind > 4) return ProtocolError("unknown directive kind");
   writer.U8(kind);
   if (absl::Status status = writer.String(
           directive.payload, kMaxOpaqueFieldBytes, "directive payload");
@@ -2620,7 +2620,7 @@ absl::StatusOr<WireProjectedDirective> ReadProjectedDirective(Reader& reader) {
   directive.partition_replication_epoch = *partition_replication_epoch;
   auto kind = reader.U8();
   if (!kind.ok()) return kind.status();
-  if (*kind < 1 || *kind > 3) return ProtocolError("unknown directive kind");
+  if (*kind < 1 || *kind > 4) return ProtocolError("unknown directive kind");
   directive.kind = static_cast<WireDirectiveKind>(*kind);
   auto payload = reader.String(kMaxOpaqueFieldBytes);
   if (!payload.ok()) return payload.status();

@@ -465,6 +465,45 @@ TEST(ControlProtocolCodecTest,
   EXPECT_EQ(std::get<control::ResultNoLongerTracked>(*decoded), forgotten);
 }
 
+TEST(ControlProtocolCodecTest, RoundTripsSourceLessPopulationInitialization) {
+  control::Directive directive{
+      .session_id = Id(1),
+      .basis = {.source_meta_applied_index = 19,
+                .projection_hash = Sha256("projection")},
+      .authority = {.group_id = "group-a",
+                    .assignment_id = Id(2),
+                    .group_term = 3,
+                    .authority_version = 4,
+                    .grant_revision = 5},
+      .identity = {.operation_id = Id(6),
+                   .directive_id = Id(7),
+                   .attempt_id = Id(8),
+                   .directive_revision = 20},
+      .recipient_node_id = std::string(40, 'a'),
+      .recipient_boot_id = std::string(40, 'b'),
+      .target_node_id = std::string(40, 'a'),
+      .target_boot_id = std::string(40, 'b'),
+      .source_node_id = std::string(40, '0'),
+      .source_boot_id = std::string(40, '0'),
+      .source_replication_history_id = std::string(40, '0'),
+      .manifest_revision = 1,
+      .manifest_digest = Sha256("manifest"),
+      .partition_replication_epoch = 1,
+      .kind = control::WireDirectiveKind::kInitializeEmptyPopulation,
+      // The existing payload binds the history advertised by the target's
+      // current Hello. Zero wire identities denote the absent source and can
+      // never authorize a replication connection.
+      .payload = std::string(40, 'c'),
+      .storage_mutating = true,
+  };
+
+  auto encoded = control::EncodeMessage(control::WireMessage{directive});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded = control::DecodeMessage(MessageType::kDirective, *encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(std::get<control::Directive>(*decoded), directive);
+}
+
 TEST(ControlProtocolCodecTest,
      OperationEvidenceCarriesSessionBootAssignmentAndFreshnessAnchors) {
   const std::string evidence_body = "flow-0=41,flow-1=52";

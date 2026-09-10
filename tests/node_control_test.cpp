@@ -317,10 +317,10 @@ class RecordingActions final : public NodeControlActions {
 
   celer::Task<absl::Status> ReconcilePopulation(
       std::optional<PopulationReadiness> desired,
-      bool rebuild_expected) override {
+      bool population_transition_expected) override {
     ++population_reconciliations_;
     desired_population_ = std::move(desired);
-    rebuild_expected_ = rebuild_expected;
+    population_transition_expected_ = population_transition_expected;
     co_return population_reconcile_status_;
   }
 
@@ -388,7 +388,7 @@ class RecordingActions final : public NodeControlActions {
   std::vector<std::string> population_events_;
   std::optional<PopulationReadiness> desired_population_;
   std::optional<absl::Status> deferred_directive_result_;
-  bool rebuild_expected_ = false;
+  bool population_transition_expected_ = false;
   bool receives_directives_ = false;
   std::function<void()> on_async_revocation_;
   std::function<void()> on_apply_directive_;
@@ -1534,7 +1534,7 @@ TEST(NodeControlInstallerTest,
   EXPECT_TRUE(service.storage_loss_waited_for_prior_transition_);
   EXPECT_TRUE(service.control_.actions.session_clear_exited_);
   EXPECT_FALSE(service.control_.actions.desired_population_.has_value());
-  EXPECT_FALSE(service.control_.actions.rebuild_expected_);
+  EXPECT_FALSE(service.control_.actions.population_transition_expected_);
   EXPECT_EQ(service.control_.actions.async_revocations_, 1);
   EXPECT_EQ(service.control_.actions.population_shutdown_cancellations_, 1);
 }
@@ -1847,16 +1847,16 @@ TEST(NodeControlInstallerTest,
   EXPECT_EQ(control.actions.desired_population_->assignment_id_, Assignment(1));
   EXPECT_EQ(control.actions.desired_population_->partition_replication_epoch_,
             kPartitionReplicationEpoch);
-  EXPECT_FALSE(control.actions.rebuild_expected_);
+  EXPECT_FALSE(control.actions.population_transition_expected_);
 
   // An exact FDS replay on a reconnected session still joins any source
   // exports left by the previous session before it can be acknowledged.
   ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
                               FullState(MakeState(), 3), Basis(10, 2),
-                              /*local_rebuild_expected=*/true))
+                              /*local_population_transition_expected=*/true))
                   .ok());
   EXPECT_EQ(control.actions.session_clears_, 2);
-  EXPECT_TRUE(control.actions.rebuild_expected_);
+  EXPECT_TRUE(control.actions.population_transition_expected_);
 
   const std::shared_ptr<const ServingState> old = control.cache.Current();
   ASSERT_NE(old, nullptr);
@@ -2134,6 +2134,74 @@ TEST(NodeControlInstallerTest, DirectiveRequiresCurrentProjectionAndAuthority) {
   directive.anchor_ = Anchor(*control.cache.Current());
   EXPECT_TRUE(RunTaskSync(control.installer.ApplyDirective(directive)).ok());
   EXPECT_EQ(control.actions.directives_.size(), 2U);
+}
+
+TEST(NodeControlInstallerTest,
+     EmptyPopulationUsesTheExistingPopulationAdmissionWithoutASource) {
+  DynamicControl control;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(
+      control.installer
+          .InstallFullState(FullState(MakeState(Assignment(1), 1, 1, 1, 1, 1, 1,
+                                                /*granted=*/true,
+                                                /*population_ready=*/false),
+                                      3),
+                            Basis(10, 2))
+          .ok());
+  NodeDirective directive{
+      .projection_ = Basis(10, 2),
+      .anchor_ = Anchor(*control.cache.Current()),
+      .operation_id_ = ShortId<OperationId>(1),
+      .directive_id_ = ShortId<DirectiveId>(2),
+      .attempt_id_ = ShortId<AttemptId>(3),
+      .directive_revision_ = 8,
+      .kind_ = NodeDirective::Kind::kInitializeEmptyPopulation,
+      .target_node_id_ = *NodeId::Parse(kNodeA),
+      .target_boot_id_ = *NodeId::Parse(kBoot),
+      .flow_count_ = 0,
+      .manifest_revision_ = 1,
+      .manifest_digest_ = Digest(4),
+      .partition_replication_epoch_ = kPartitionReplicationEpoch,
+      .payload_ = std::string(kNodeB),
+      .storage_mutating_ = true,
+  };
+
+  NodeDirective stale_assignment = directive;
+  stale_assignment.anchor_.assignment_id_ = Assignment(2);
+  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(stale_assignment))
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  NodeDirective stale_authority = directive;
+  ++stale_authority.anchor_.authority_version_;
+  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(stale_authority))
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  NodeDirective stale_population = directive;
+  ++stale_population.partition_replication_epoch_;
+  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(stale_population))
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  EXPECT_TRUE(RunTaskSync(control.installer.ApplyDirective(directive)).ok());
+  ASSERT_EQ(control.actions.directives_.size(), 1U);
+  EXPECT_EQ(control.actions.directives_.front().kind_,
+            NodeDirective::Kind::kInitializeEmptyPopulation);
+  EXPECT_TRUE(control.actions.directives_.front().source_node_id_.empty());
+
+  NodeDirective sourced = directive;
+  sourced.directive_id_ = ShortId<DirectiveId>(4);
+  sourced.source_node_id_ = *NodeId::Parse(kNodeB);
+  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(sourced)).code(),
+            absl::StatusCode::kInvalidArgument);
+
+  NodeDirective malformed_history = directive;
+  malformed_history.directive_id_ = ShortId<DirectiveId>(5);
+  malformed_history.payload_ = std::string(40, 'G');
+  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(malformed_history))
+                .code(),
+            absl::StatusCode::kInvalidArgument);
 }
 
 TEST(NodeControlInstallerTest,

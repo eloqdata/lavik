@@ -955,6 +955,12 @@ ClusterOperator::ClusterOperator(MetaAdminRoundTrip round_trip)
 
 absl::StatusOr<ClusterStatusOutcome> ClusterOperator::Status(
     const MetaAdminTarget& seed, const ClusterStatusOptions& options) const {
+  return CaptureStatus(seed, options, nullptr);
+}
+
+absl::StatusOr<ClusterStatusOutcome> ClusterOperator::CaptureStatus(
+    const MetaAdminTarget& seed, const ClusterStatusOptions& options,
+    MetaAdminTarget* resolved_leader) const {
   if (!round_trip_) return absl::FailedPreconditionError("missing transport");
   if (TlsAny(options.tls_) &&
       (!TlsComplete(options.tls_) || !options.tls_.server_name_.empty())) {
@@ -1070,6 +1076,9 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::Status(
       outcome.result_ = status->cluster_ready_ ? ClusterStatusResult::kReady
                                                : ClusterStatusResult::kNotReady;
       outcome.status_ = std::move(*status);
+      if (resolved_leader != nullptr) {
+        *resolved_leader = std::move(leader_target);
+      }
       return outcome;
     }
     known_targets.clear();

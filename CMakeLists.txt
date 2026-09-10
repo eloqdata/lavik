@@ -183,6 +183,7 @@ if (KEYLANE_BUILD_META)
   # operator library have no NuRaft dependency.
   add_library(keylane_meta_admin STATIC
     src/meta/admin_client.cpp
+    src/meta/cluster_create.cpp
     src/meta/cluster_status.cpp
   )
   target_include_directories(keylane_meta_admin PUBLIC
@@ -783,6 +784,7 @@ if (BUILD_TESTING)
     # The public operator model is tested without keylane_meta_core so this
     # target also guards the promised Raft-free client boundary.
     add_executable(keylane_cluster_status_tests
+      tests/meta_cluster_create_test.cpp
       tests/meta_cluster_status_test.cpp
     )
     target_link_libraries(keylane_cluster_status_tests PRIVATE
@@ -900,6 +902,26 @@ if (BUILD_TESTING)
         TIMEOUT 180
         RUN_SERIAL TRUE
       )
+
+      # The tracer-bullet creator verifies the public Redis surface with the
+      # same redis-cli dependency required by the production command.
+      find_program(KEYLANE_CLUSTER_CREATE_REDIS_CLI NAMES redis-cli)
+      if (KEYLANE_CLUSTER_CREATE_REDIS_CLI)
+        add_test(
+          NAME meta_integration.gate_cluster_create
+          COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_cluster_create.py
+                  $<TARGET_FILE:keylane-meta>
+                  $<TARGET_FILE:keylane>
+                  $<TARGET_FILE:keylane-ctl>
+                  ${KEYLANE_CLUSTER_CREATE_REDIS_CLI}
+        )
+        set_tests_properties(meta_integration.gate_cluster_create PROPERTIES
+          LABELS meta-integration
+          TIMEOUT 180
+          RUN_SERIAL TRUE
+        )
+      endif()
     else()
       message(STATUS "python3 not found; meta integration tests are disabled")
     endif()

@@ -93,9 +93,12 @@ bool HasAssignment(const MetaTopologyGroupView& view,
 
 absl::Status ValidateCommittedDirectiveAnchorImpl(
     const MetaStores& stores, const MetaDirectiveSpec& directive) {
+  const bool initializes_empty =
+      directive.kind_ == kMetaDirectiveInitializeEmptyPopulation;
   if (!stores.identity_.IsActiveNode(directive.recipient_node_id_) ||
       !stores.identity_.IsActiveNode(directive.target_node_id_) ||
-      !stores.identity_.IsActiveNode(directive.source_node_id_)) {
+      (!initializes_empty &&
+       !stores.identity_.IsActiveNode(directive.source_node_id_))) {
     return MetaDomainRejectError(
         "directive recipient, source, or target is not active");
   }
@@ -107,8 +110,9 @@ absl::Status ValidateCommittedDirectiveAnchorImpl(
   }
   if (!HasAssignment(*group, directive.target_node_id_,
                      directive.assignment_id_) ||
-      !HasAssignment(*group, directive.source_node_id_,
-                     directive.source_assignment_id_)) {
+      (!initializes_empty &&
+       !HasAssignment(*group, directive.source_node_id_,
+                      directive.source_assignment_id_))) {
     return MetaDomainRejectError("directive membership or assignment is stale");
   }
   if (group->record_.group_term_ != directive.group_term_ ||
@@ -871,6 +875,13 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   const auto operation = stores.operation_.FindOperation(cmd.operation_id_);
   if (operation.has_value()) {
     for (const MetaDirectiveSpec& directive : cmd.current_directives_) {
+      if (directive.kind_ == kMetaDirectiveInitializeEmptyPopulation &&
+          directive.payload_ !=
+              HexBytes(operation->replication_history_id_)) {
+        return Rejected(
+            "empty-population target history is not operation-bound",
+            std::move(summary));
+      }
       if (const absl::Status anchor =
               ValidateCommittedDirectiveAnchorImpl(stores, directive);
           !anchor.ok()) {

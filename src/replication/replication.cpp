@@ -3410,6 +3410,121 @@ class ReplicationManager::ReplicationGroup {
     co_return co_await (*started)->Await();
   }
 
+  Task<absl::StatusOr<std::shared_ptr<detail::ClusterRebuildCompletionState>>>
+  StartEmptyPopulationInitialization(RebuildIdentity identity,
+                                     PopulationManifest manifest) {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, identity = std::move(identity),
+              manifest = std::move(manifest)]() mutable {
+            return StartEmptyPopulationInitialization(std::move(identity),
+                                                      std::move(manifest));
+          });
+    }
+    if (!cluster_population_managed_ || cluster_group_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "empty population initialization requires Meta-managed mode");
+    }
+    if (!StorageIsReady()) {
+      co_return absl::UnavailableError(
+          "storage is not ready for population initialization");
+    }
+    if (cluster_control_stopping_) {
+      co_return absl::CancelledError(
+          "population initialization stopped for process shutdown");
+    }
+    if (identity.manifest_id_ != manifest.id()) {
+      co_return absl::FailedPreconditionError(
+          "empty population directive does not match its manifest");
+    }
+    {
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      if (identity.target_history_id_ != history_id_) {
+        co_return absl::FailedPreconditionError(
+            "empty population directive uses stale target history");
+      }
+    }
+    absl::Status validated =
+        cluster_group_->ValidateEmptyPopulation(identity, manifest);
+    if (!validated.ok()) co_return validated;
+
+    RebuildDirective directive{.identity_ = std::move(identity)};
+    {
+      std::lock_guard lock(state_mutex_);
+      if (failed_stopped_.load(std::memory_order_relaxed)) {
+        co_return absl::FailedPreconditionError(absl::StrCat(
+            "replication is failed-stopped until restart: ", failure_reason_));
+      }
+      if (cluster_rebuild_ != nullptr &&
+          cluster_rebuild_->directive_ == directive) {
+        const ReplicationGroupState state =
+            cluster_rebuild_->state_.load(std::memory_order_relaxed);
+        if (state == ReplicationGroupState::kRebuilding ||
+            (state == ReplicationGroupState::kReady &&
+             cluster_rebuild_->ready_token_.has_value())) {
+          co_return cluster_rebuild_->completion_;
+        }
+        co_return absl::FailedPreconditionError(
+            "empty population proof was invalidated; a fresh attempt is "
+            "required");
+      }
+      if (replica_reconfiguration_running_ || cluster_rebuild_ != nullptr ||
+          active_replica_session_ != nullptr || upstream_.has_value() ||
+          coordinator_started_) {
+        co_return absl::FailedPreconditionError(
+            "another cluster population transition is active");
+      }
+      replica_reconfiguration_running_ = true;
+    }
+
+    StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
+    storage_->SetReplicaLoading(true);
+    storage_->SetExpirationAuthority(false);
+    native_dataset_valid_.store(false, std::memory_order_release);
+
+    auto authorization =
+        cluster_group_->BeginEmptyPopulation(directive.identity_, manifest);
+    if (!authorization.ok()) {
+      std::lock_guard lock(state_mutex_);
+      replica_reconfiguration_running_ = false;
+      co_return authorization.status();
+    }
+    auto context = std::make_shared<ClusterRebuildContext>(
+        std::move(directive), std::move(manifest),
+        std::move(*authorization));
+    bool install_failed = false;
+    {
+      std::lock_guard lock(state_mutex_);
+      if (!replica_reconfiguration_running_ || cluster_rebuild_ != nullptr ||
+          failed_stopped_.load(std::memory_order_relaxed) ||
+          cluster_control_stopping_) {
+        replica_reconfiguration_running_ = false;
+        install_failed = true;
+      } else {
+        cluster_rebuild_ = context;
+        applied_frontier_.reset();
+        upstream_node_id_.reset();
+        upstream_history_id_.reset();
+        replica_session_id_ = 0;
+        source_worker_count_ = 0;
+        role_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        replica_reconfiguration_running_ = false;
+        coordinator_started_ = true;
+      }
+    }
+    if (install_failed) {
+      const std::string reason =
+          "population state changed while installing empty initialization";
+      (void)cluster_group_->FailStop(context->directive_.identity_);
+      LatchReplicationFailure(reason);
+      co_return absl::AbortedError(reason);
+    }
+    celer::ThisWorker().self_->Spawn(
+        RunEmptyPopulationInitialization(context));
+    co_return context->completion_;
+  }
+
   Task<absl::Status> RetireClusterPopulation(
       std::optional<DesiredClusterPopulation> desired, bool preserve_any_ready,
       std::string_view reason) {
@@ -3466,7 +3581,7 @@ class ReplicationManager::ReplicationGroup {
       const bool completed_ready = state == ReplicationGroupState::kReady &&
                                    context->ready_token_.has_value();
       const bool desired_attempt_still_live =
-          matches_attempt && desired->rebuild_expected_ &&
+          matches_attempt && desired->population_transition_expected_ &&
           state == ReplicationGroupState::kRebuilding;
       // A term transition fences authority but does not change the physical
       // population. Preserve a completed proof across that transition when
@@ -3536,6 +3651,17 @@ class ReplicationManager::ReplicationGroup {
         LatchReplicationFailure(*failure);
         co_return absl::FailedPreconditionError(absl::StrCat(
             "replication is failed-stopped until restart: ", *failure));
+      }
+    }
+
+    if (context->directive_.flow_count_ == 0) {
+      // Source-less initialization owns no ReplicaSession to cancel. Its
+      // coordinator observes the reconfiguration bit, aborts any known
+      // candidate root, and exits before this owner retires the proof.
+      while (coordinator_started_) {
+        absl::Status waited = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!waited.ok()) co_return waited;
       }
     }
 
@@ -5255,6 +5381,280 @@ class ReplicationManager::ReplicationGroup {
   }
 
  private:
+  bool EmptyPopulationCurrent(
+      const std::shared_ptr<ClusterRebuildContext>& context) {
+    std::lock_guard lock(state_mutex_);
+    return cluster_rebuild_ == context && !replica_reconfiguration_running_ &&
+           !cluster_control_stopping_ &&
+           !failed_stopped_.load(std::memory_order_relaxed) &&
+           context->state_.load(std::memory_order_relaxed) ==
+               ReplicationGroupState::kRebuilding;
+  }
+
+  Task<absl::Status> FinishEmptyPopulationFailure(
+      const std::shared_ptr<ClusterRebuildContext>& context,
+      std::uint64_t session_id, bool root_started, bool promoted,
+      absl::Status failure) {
+    if (promoted) {
+      const std::string reason = absl::StrCat(
+          "empty population failed after promotion: ", failure.message());
+      (void)cluster_group_->FailStop(context->directive_.identity_);
+      storage_->FenceRequestServingUntilRestart();
+      LatchReplicationFailure(reason);
+      absl::Status terminal = absl::InternalError(reason);
+      context->completion_->Resolve(terminal);
+      co_return terminal;
+    }
+    if (root_started) {
+      absl::Status aborted = co_await storage_->AbortReplicaRoot(session_id);
+      if (!aborted.ok()) {
+        const std::string reason = absl::StrCat(
+            "empty population abort outcome is uncertain: ",
+            aborted.message());
+        (void)cluster_group_->FailStop(context->directive_.identity_);
+        storage_->FenceRequestServingUntilRestart();
+        LatchReplicationFailure(reason);
+        absl::Status terminal = absl::InternalError(reason);
+        context->completion_->Resolve(terminal);
+        co_return terminal;
+      }
+    }
+    {
+      std::lock_guard lock(state_mutex_);
+      if (cluster_rebuild_ == context &&
+          !failed_stopped_.load(std::memory_order_relaxed)) {
+        context->state_.store(ReplicationGroupState::kNotReady,
+                              std::memory_order_release);
+      }
+    }
+    context->completion_->Resolve(failure);
+    co_return failure;
+  }
+
+  Task<absl::Status> RunEmptyPopulationInitialization(
+      std::shared_ptr<ClusterRebuildContext> context) {
+    struct CoordinatorGuard {
+      bool* running_;
+      ~CoordinatorGuard() { *running_ = false; }
+    } coordinator_guard{&coordinator_started_};
+
+    std::uint64_t session_id = NextRedisFullSyncSessionId();
+    bool root_started = false;
+    bool promoted = false;
+    const auto cancelled = [] {
+      return absl::CancelledError(
+          "empty population initialization was superseded");
+    };
+    auto current_or_cancelled = [&]() -> absl::Status {
+      return EmptyPopulationCurrent(context) ? absl::OkStatus() : cancelled();
+    };
+
+    absl::Status prepared = current_or_cancelled();
+    while (prepared.ok() && !CloseAllCommandDbGates()) {
+      prepared = current_or_cancelled();
+      if (!prepared.ok()) break;
+      prepared = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                          std::chrono::milliseconds(1));
+    }
+    const bool gates_closed = prepared.ok();
+    if (gates_closed) {
+      while (CommandDbOperationsActive()) {
+        prepared = current_or_cancelled();
+        if (!prepared.ok()) break;
+        prepared = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                            std::chrono::milliseconds(1));
+        if (!prepared.ok()) break;
+      }
+    }
+    if (prepared.ok()) {
+      prepared = co_await storage_->QuiesceTombRaiderForReplica();
+    }
+    if (prepared.ok()) {
+      prepared = co_await storage_->QuiesceExpiration();
+      if (prepared.ok()) storage_->ResumeExpiration();
+    }
+    if (gates_closed) OpenAllCommandDbGates();
+    if (!prepared.ok()) {
+      co_return co_await FinishEmptyPopulationFailure(
+          context, session_id, root_started, promoted, prepared);
+    }
+
+    absl::Status invalidated = co_await storage_->BeginReplicaFullSync(session_id);
+    if (!invalidated.ok()) {
+      co_return co_await FinishEmptyPopulationFailure(
+          context, session_id, root_started, promoted, invalidated);
+    }
+    root_started = true;
+
+    const unsigned worker_count = storage_->worker_count();
+    for (unsigned owner = 0; owner < worker_count; ++owner) {
+      if (absl::Status current = current_or_cancelled(); !current.ok()) {
+        co_return co_await FinishEmptyPopulationFailure(
+            context, session_id, root_started, promoted, current);
+      }
+      if (absl::Status authorized = cluster_group_->ValidateResetAuthorization(
+              context->authorization_);
+          !authorized.ok()) {
+        co_return co_await FinishEmptyPopulationFailure(
+            context, session_id, root_started, promoted, authorized);
+      }
+      std::vector<storage::ReplicaPartitionReset> resets;
+      resets.reserve((storage::kLogicalStorageShards + worker_count - 1) /
+                     worker_count);
+      for (std::uint32_t partition = owner;
+           partition < storage::kLogicalStorageShards;
+           partition += worker_count) {
+        storage::ReplicaPartitionReset reset;
+        reset.partition_id_ = static_cast<std::uint16_t>(partition);
+        reset.db_epochs_.fill(1);
+        resets.push_back(reset);
+      }
+      absl::StatusOr<std::vector<storage::ReplicaPartitionEpoch>> reset;
+      if (owner == 0) {
+        reset = co_await storage_->ResetReplicaPartitions(session_id, resets);
+      } else {
+        reset = co_await celer::SubmitTaskTo(
+            owner, [this, session_id, resets = std::move(resets)]() mutable {
+              return storage_->ResetReplicaPartitions(session_id, resets);
+            });
+      }
+      if (!reset.ok()) {
+        co_return co_await FinishEmptyPopulationFailure(
+            context, session_id, root_started, promoted, reset.status());
+      }
+      if (ShouldInjectEmptyPopulationResetFailure(owner)) {
+        co_return co_await FinishEmptyPopulationFailure(
+            context, session_id, root_started, promoted,
+            absl::InternalError(
+                "injected empty-population reset result failure"));
+      }
+      for (const storage::ReplicaPartitionEpoch& partition : *reset) {
+        absl::Status recorded = cluster_group_->RecordPartitionReset(
+            context->directive_.identity_, partition.partition_id_,
+            partition.replication_epoch_);
+        if (!recorded.ok()) {
+          co_return co_await FinishEmptyPopulationFailure(
+              context, session_id, root_started, promoted, recorded);
+        }
+        absl::Status handed_off;
+        if (owner == 0) {
+          handed_off = co_await storage_->HandoffReplicaPartition(
+              session_id, partition.partition_id_,
+              partition.replication_epoch_);
+        } else {
+          handed_off = co_await celer::SubmitTaskTo(
+              owner, [this, session_id, partition]() {
+                return storage_->HandoffReplicaPartition(
+                    session_id, partition.partition_id_,
+                    partition.replication_epoch_);
+              });
+        }
+        if (!handed_off.ok()) {
+          co_return co_await FinishEmptyPopulationFailure(
+              context, session_id, root_started, promoted, handed_off);
+        }
+        absl::Status recorded_handoff =
+            cluster_group_->RecordPartitionHandoff(
+                context->directive_.identity_, partition.partition_id_,
+                context->manifest_.logical_epochs()[partition.partition_id_],
+                partition.replication_epoch_);
+        if (!recorded_handoff.ok()) {
+          co_return co_await FinishEmptyPopulationFailure(
+              context, session_id, root_started, promoted, recorded_handoff);
+        }
+      }
+    }
+
+    if (absl::Status current = current_or_cancelled(); !current.ok()) {
+      co_return co_await FinishEmptyPopulationFailure(
+          context, session_id, root_started, promoted, current);
+    }
+    const std::vector<std::string> empty_catalog;
+    absl::Status catalog = co_await ReplaceLuaFunctionCatalog(empty_catalog);
+    if (catalog.ok() && ShouldInjectEmptyPopulationCatalogFailure()) {
+      catalog = absl::InternalError(
+          "injected empty-population catalog result failure");
+    }
+    if (catalog.ok()) {
+      catalog = cluster_group_->MarkFunctionCatalogComplete(
+          context->directive_.identity_);
+    }
+    if (!catalog.ok()) {
+      co_return co_await FinishEmptyPopulationFailure(
+          context, session_id, root_started, promoted, catalog);
+    }
+
+    absl::Status promotion;
+    if (ShouldInjectReplicaPromotionFailure()) {
+      promotion =
+          absl::InternalError("injected replica promotion failure");
+    } else {
+      // Keep co_await out of a conditional expression. GCC has historically
+      // mis-lowered that shape in this coroutine-heavy translation unit.
+      promotion = co_await storage_->PromoteReplicaRoot(session_id);
+    }
+    if (!promotion.ok()) {
+      // PromoteReplicaRoot persists and publishes in several ordered steps;
+      // any error is treated as unknowable, matching replicated full sync.
+      promoted = true;
+      co_return co_await FinishEmptyPopulationFailure(
+          context, session_id, root_started, promoted, promotion);
+    }
+    promoted = true;
+
+    const std::uint64_t child_log_epoch =
+        role_epoch_.load(std::memory_order_acquire);
+    for (unsigned worker = 0; worker < worker_count; ++worker) {
+      const std::size_t flow_capacity = BacklogCapacityForFlow(
+          worker, backlog_size_bytes_.load(std::memory_order_acquire));
+      absl::Status enabled = co_await celer::SubmitTaskTo(
+          worker,
+          [this, child_log_epoch, flow_capacity]() -> Task<absl::Status> {
+            co_return co_await storage_->EnableReplicationLog(child_log_epoch,
+                                                              flow_capacity);
+          });
+      if (!enabled.ok()) {
+        co_return co_await FinishEmptyPopulationFailure(
+            context, session_id, root_started, promoted, enabled);
+      }
+    }
+    absl::Status group_ready = cluster_group_->MarkStoragePromoted(
+        context->directive_.identity_);
+    auto ready = group_ready.ok()
+                     ? cluster_group_->PublishReady(
+                           context->directive_.identity_)
+                     : absl::StatusOr<ReadyToken>(group_ready);
+    if (!ready.ok()) {
+      co_return co_await FinishEmptyPopulationFailure(
+          context, session_id, root_started, promoted, ready.status());
+    }
+
+    bool installed = false;
+    {
+      std::lock_guard lock(state_mutex_);
+      installed = cluster_rebuild_ == context &&
+                  !replica_reconfiguration_running_ &&
+                  !failed_stopped_.load(std::memory_order_relaxed);
+      if (installed) {
+        context->ready_token_ = *ready;
+        context->state_.store(ReplicationGroupState::kReady,
+                              std::memory_order_release);
+        native_dataset_valid_.store(true, std::memory_order_release);
+      }
+    }
+    if (!installed) {
+      co_return co_await FinishEmptyPopulationFailure(
+          context, session_id, root_started, promoted,
+          absl::CancelledError(
+              "empty population completed after supersession"));
+    }
+    StoreRole(ReplicationRole::kMaster, std::memory_order_release);
+    storage_->SetReplicaLoading(false);
+    storage_->SetExpirationAuthority(true);
+    context->completion_->Resolve(absl::OkStatus());
+    co_return absl::OkStatus();
+  }
+
   Task<absl::Status> RunRedisExportBacklog(TcpStream& stream,
                                            std::uint64_t session_id,
                                            RedisExportBacklogState* state) {
@@ -8397,6 +8797,34 @@ class ReplicationManager::ReplicationGroup {
     return false;
   }
 
+  bool ShouldInjectEmptyPopulationResetFailure(unsigned owner) {
+    KEYLANE_FAULT_INJECT({
+      if (owner != 0) return false;
+      const char* configured =
+          std::getenv("KEYLANE_REPLICATION_FAIL_EMPTY_RESET_ONCE");
+      if (configured == nullptr || std::string_view(configured) != "1") {
+        return false;
+      }
+      return !empty_population_reset_fault_used_.exchange(
+          true, std::memory_order_acq_rel);
+    });
+    (void)owner;
+    return false;
+  }
+
+  bool ShouldInjectEmptyPopulationCatalogFailure() {
+    KEYLANE_FAULT_INJECT({
+      const char* configured =
+          std::getenv("KEYLANE_REPLICATION_FAIL_EMPTY_CATALOG_ONCE");
+      if (configured == nullptr || std::string_view(configured) != "1") {
+        return false;
+      }
+      return !empty_population_catalog_fault_used_.exchange(
+          true, std::memory_order_acq_rel);
+    });
+    return false;
+  }
+
   bool ShouldInjectEarlyOnline() const {
     return KEYLANE_FAULT_MATCHES("KEYLANE_REPLICATION_EARLY_ONLINE", "1");
   }
@@ -10722,6 +11150,8 @@ class ReplicationManager::ReplicationGroup {
   std::atomic<bool> replication_peer_flow_cancel_fault_used_{false};
   std::atomic<unsigned> replication_fullsync_cut_ack_count_{0};
   std::atomic<bool> replication_promotion_fault_used_{false};
+  std::atomic<bool> empty_population_reset_fault_used_{false};
+  std::atomic<bool> empty_population_catalog_fault_used_{false};
   std::atomic<bool> replication_post_cut_reset_fault_used_{false};
   std::atomic<bool> replication_divergent_tail_fault_used_{false};
   std::atomic<bool> replication_fullsync_pause_used_{false};
@@ -10847,6 +11277,15 @@ ReplicationManager::StartClusterRebuildDirective(ReplicaOfConfig upstream,
                                                  PopulationManifest manifest) {
   auto started = co_await group_->StartClusterRebuildDirective(
       std::move(upstream), std::move(directive), std::move(manifest));
+  if (!started.ok()) co_return started.status();
+  co_return ClusterRebuildCompletion(std::move(*started));
+}
+
+Task<absl::StatusOr<ClusterRebuildCompletion>>
+ReplicationManager::StartEmptyPopulationInitialization(
+    RebuildIdentity identity, PopulationManifest manifest) {
+  auto started = co_await group_->StartEmptyPopulationInitialization(
+      std::move(identity), std::move(manifest));
   if (!started.ok()) co_return started.status();
   co_return ClusterRebuildCompletion(std::move(*started));
 }

@@ -79,6 +79,7 @@ void MetaDataControlRuntimeStatus::EndLeadership(
 void MetaDataControlRuntimeStatus::PublishCurrent(
     std::string node_id, std::string boot_id,
     const cluster::control::WireId128& session_id,
+    const MetaReplicationHistoryId& replication_history_id,
     std::uint64_t session_generation, std::uint64_t leadership_generation,
     std::uint64_t validated_committed_high_water,
     const cluster::control::FullDesiredState& projection) {
@@ -91,6 +92,7 @@ void MetaDataControlRuntimeStatus::PublishCurrent(
   node.node_id_ = std::move(node_id);
   node.boot_id_ = std::move(boot_id);
   node.session_id_ = session_id;
+  node.replication_history_id_ = replication_history_id;
   node.session_generation_ = session_generation;
   node.leadership_generation_ = leadership_generation;
   ApplyProjection(node, validated_committed_high_water, projection);

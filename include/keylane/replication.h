@@ -186,9 +186,11 @@ struct DesiredClusterPopulation {
   std::uint64_t manifest_revision_ = 0;
   PopulationManifestId manifest_id_;
   std::uint64_t partition_replication_epoch_ = 0;
-  // False means the FDS removed the live rebuild directive: an in-progress
-  // attempt must retire even when its population identity still matches.
-  bool rebuild_expected_ = false;
+  // False means the FDS removed the live population-transition directive: an
+  // in-progress attempt must retire even when its population identity still
+  // matches. Both replication rebuild and source-less initialization use this
+  // lifecycle bit.
+  bool population_transition_expected_ = false;
 
   friend bool operator==(const DesiredClusterPopulation&,
                          const DesiredClusterPopulation&) = default;
@@ -285,6 +287,15 @@ class ReplicationManager {
   StartClusterRebuildDirective(ReplicaOfConfig upstream,
                                RebuildDirective directive,
                                PopulationManifest manifest);
+
+  // Starts source-less initialization of the first Meta-owned population.
+  // The target history carried by identity is checked against this process
+  // before any reset; the returned handle reuses the existing population
+  // completion and resolves only after durable root promotion and ReadyToken
+  // publication.
+  celer::Task<absl::StatusOr<ClusterRebuildCompletion>>
+  StartEmptyPopulationInitialization(RebuildIdentity identity,
+                                     PopulationManifest manifest);
 
   // Convenience wrapper that starts and awaits one full rebuild. Production
   // NodeControl uses StartClusterRebuildDirective so wire admission and later

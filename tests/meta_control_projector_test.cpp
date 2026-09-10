@@ -41,6 +41,17 @@ std::array<std::uint8_t, N> Bytes(std::uint8_t seed) {
   return result;
 }
 
+template <std::size_t N>
+std::string Hex(const std::array<std::uint8_t, N>& bytes) {
+  constexpr std::string_view kHex = "0123456789abcdef";
+  std::string result(bytes.size() * 2, '0');
+  for (std::size_t i = 0; i < bytes.size(); ++i) {
+    result[i * 2] = kHex[bytes[i] >> 4];
+    result[i * 2 + 1] = kHex[bytes[i] & 0x0f];
+  }
+  return result;
+}
+
 std::string NodeId(std::uint8_t value) {
   constexpr std::string_view kHex = "0123456789abcdef";
   std::string id(40, '0');
@@ -226,6 +237,7 @@ Fixture CompleteFixture() {
   submit.kind_ = "population-rebuild";
   submit.intent_ = "rebuild group-a";
   submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
+  submit.replication_history_id_ = Bytes<20>(0x33);
   submit.policy_references_ = {{"operation-policy", 2}};
   Commit(fixture.stores, index++, submit);
 
@@ -617,10 +629,13 @@ TEST(MetaControlProjector,
   };
   const std::vector<DirectiveCase> cases = {
       {"rebuild", true, control::WireDirectiveKind::kRebuild},
+      {"initialize-empty-population", true,
+       control::WireDirectiveKind::kInitializeEmptyPopulation},
       {"authorize-source", false, control::WireDirectiveKind::kAuthorizeSource},
       {"revoke-sources", false, control::WireDirectiveKind::kRevokeSources},
       {"unknown", false, std::nullopt},
       {"rebuild", false, std::nullopt},
+      {"initialize-empty-population", false, std::nullopt},
       {"authorize-source", true, std::nullopt},
       {"revoke-sources", true, std::nullopt},
   };
@@ -636,7 +651,14 @@ TEST(MetaControlProjector,
         operation->current_directives_[0].spec_;
     directive.kind_ = test.kind;
     directive.storage_mutating_ = test.storage_mutating;
-    if (test.kind == "authorize-source" || test.kind == "revoke-sources") {
+    if (test.kind == "initialize-empty-population") {
+      directive.source_node_id_ = std::string(40, '0');
+      directive.source_assignment_id_ = {};
+      directive.source_boot_id_ = {};
+      directive.source_replication_history_id_ = {};
+      directive.payload_ = Hex(operation->replication_history_id_);
+    } else if (test.kind == "authorize-source" ||
+               test.kind == "revoke-sources") {
       directive.recipient_node_id_ = fixture.source;
     }
     keylane::meta::TransitionOperationPhase transition;

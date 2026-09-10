@@ -807,6 +807,9 @@ TEST(MetaOperationStore, SubmitCreatesSubmittedRecordKeyedByClientId) {
   ASSERT_TRUE(store.FindOperationBySeq(100).has_value());
   EXPECT_EQ(store.FindOperationBySeq(100)->operation_id_, id);
   EXPECT_EQ(store.ActiveCount(), 1);
+  EXPECT_TRUE(store.HasActiveKind("failover"));
+  EXPECT_FALSE(store.HasActiveKind(
+      keylane::meta::kMetaClusterCreateOperationKind));
   EXPECT_TRUE(store.OperationKnown(id));
   EXPECT_FALSE(store.OperationKnown(MakeOperationId(9)));
 }
@@ -1223,6 +1226,7 @@ TEST(MetaOperationStore, CompleteIsTerminalAndReplayIdempotent) {
   EXPECT_EQ(record->terminal_result_, "done");
   EXPECT_TRUE(record->data_loss_possible_);
   EXPECT_EQ(store.ActiveCount(), 0);  // terminal ops are not active
+  EXPECT_FALSE(store.HasActiveKind("failover"));
   // Replay: identical content already installed — no-op accept.
   ASSERT_TRUE(store.CompleteOperation(complete).ok());
   // Same revision, different content: conflict reject.

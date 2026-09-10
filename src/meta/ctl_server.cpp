@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/strings/str_cat.h"
 #include "celer/io/storage.h"
 #include "celer/net/connection.h"
 #include "celer/net/tcp_listener.h"
@@ -43,6 +44,7 @@
 
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/cluster/control_transport.h"
+#include "keylane/meta/cluster_create.h"
 #include "keylane/meta/cluster_status.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/coordinator.h"
@@ -50,6 +52,7 @@
 #include "keylane/meta/hash.h"
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/observation_store.h"
+#include "keylane/meta/population_manifest_store.h"
 #include "keylane/meta/proposal_executor.h"
 #include "keylane/meta/state_machine.h"
 #include "keylane/numeric_endpoint.h"
@@ -402,6 +405,12 @@ std::string BuildClusterStatusReply(
   };
   status.meta_available_ = true;
   status.meta_members_ = StatusMembers(active_meta_members, server->get_id());
+  if (view.active_cluster_create_operation_) {
+    status.blockers_.push_back(
+        {.code_ = std::string(kClusterCreateActiveBlockerCode),
+         .scope_ = "cluster",
+         .detail_ = "non_terminal_cluster_create_operation_exists"});
+  }
 
   std::vector<std::uint32_t> committed_ids;
   std::vector<std::string> ctl_endpoints;
@@ -771,29 +780,38 @@ void CompleteAsyncReply(
   }
 }
 
-// Opaque request_id for audit correlation. It is generated before proposal;
-// apply never manufactures randomness, preserving deterministic replay. A
-// failure of the OS CSPRNG is a process-safety failure: continuing with a
-// guessed or reused id would break the idempotency boundary.
-MetaRequestId MakeRequestId() {
+// Ids are generated before proposal; apply never manufactures randomness,
+// preserving deterministic replay. A CSPRNG failure is a process-safety
+// failure because continuing with a guessed or reused id would break the
+// idempotency boundary.
+cluster::control::WireId128 MakeRequiredId(std::string_view purpose) {
   auto id = cluster::control::GenerateId128();
   if (!id.ok()) {
-    spdlog::critical("OS CSPRNG failed while generating Meta request id: {}",
+    spdlog::critical("OS CSPRNG failed while generating {}: {}", purpose,
                      id.status().message());
     std::terminate();
   }
   return *id;
 }
 
+MetaRequestId MakeRequestId() {
+  return MakeRequiredId("Meta request id");
+}
+
 MetaAssignmentId MakeAssignmentId() {
-  auto id = cluster::control::GenerateId128();
-  if (!id.ok()) {
-    spdlog::critical(
-        "OS CSPRNG failed while generating membership assignment id: {}",
-        id.status().message());
-    std::terminate();
-  }
-  return *id;
+  return MakeRequiredId("membership assignment id");
+}
+
+MetaOperationId MakeOperationId() {
+  return MakeRequiredId("operation id");
+}
+
+MetaDirectiveId MakeDirectiveId() {
+  return MakeRequiredId("directive id");
+}
+
+MetaAttemptId MakeAttemptId() {
+  return MakeRequiredId("directive attempt id");
 }
 
 int HexNybble(char c) {
@@ -1409,6 +1427,452 @@ celer::Task<std::string> HandleTransitionOp(
   co_return reply;
 }
 
+std::string ClusterCreateError(std::string_view stage, std::string_view code,
+                               std::string detail) {
+  std::replace(detail.begin(), detail.end(), '\n', ' ');
+  std::replace(detail.begin(), detail.end(), '\r', ' ');
+  return absl::StrCat("ERR clustercreate 1 ", stage, " ", code, " ",
+                      detail);
+}
+
+std::string ClusterCreateMutationError(
+    std::string_view stage, std::string_view reply) {
+  const bool definite_rejection =
+      reply == "ERR rejected" || reply == "ERR not-found" ||
+      reply == "ERR terminal" || reply == "ERR history-mismatch";
+  return ClusterCreateError(
+      stage, definite_rejection ? "domain-rejected" : "uncertain-outcome",
+      std::string(reply));
+}
+
+bool ClusterCreateProjectionMatches(
+    const MetaDataControlRuntimeNode& runtime,
+    const MetaTopologyGroupView& group, const MetaGroupGrantState& grant,
+    std::uint64_t required_applied_index) {
+  if (runtime.source_meta_applied_index_ < required_applied_index ||
+      runtime.validated_committed_high_water_ < required_applied_index ||
+      runtime.groups_.size() != 1 || !grant.grant_.has_value()) {
+    return false;
+  }
+  const auto member = std::find_if(
+      group.members_.begin(), group.members_.end(), [&](const auto& candidate) {
+        return candidate.node_id_ == runtime.node_id_;
+      });
+  if (member == group.members_.end()) return false;
+  const MetaDataControlRuntimeGroup& projected = runtime.groups_.front();
+  return projected.group_id_ == group.group_id_ &&
+         projected.assignment_id_ == member->assignment_id_ &&
+         projected.group_term_ == group.record_.group_term_ &&
+         projected.authority_version_ == group.record_.authority_version_ &&
+         projected.grant_revision_ == grant.grant_->grant_revision_ &&
+         projected.manifest_revision_ ==
+             group.record_.population_manifest_revision_ &&
+         projected.manifest_digest_ ==
+             group.record_.population_manifest_digest_ &&
+         projected.partition_replication_epoch_ ==
+             group.record_.partition_replication_epoch_;
+}
+
+constexpr std::string_view kClusterCreatePolicyId =
+    "keylane.cluster-create-v1";
+
+celer::Task<std::string> CommitClusterCreateIdentityAndTopology(
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest) {
+  std::vector<std::string> endpoints{manifest.client_endpoint_};
+  std::string reply = co_await HandleRegisterNode(
+      coordinator, state_machine, principal, manifest.data_node_id_,
+      absl::StrCat("keylane://node/", manifest.data_node_id_),
+      MetaNodeRole::kPrimary, std::move(endpoints));
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("register-data", reply);
+  reply = co_await HandleCreateGroup(coordinator, state_machine, principal,
+                                     manifest.group_id_);
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("create-group", reply);
+  reply = co_await HandleAssignNode(
+      coordinator, state_machine, principal, manifest.group_id_,
+      manifest.data_node_id_, MetaNodeRole::kPrimary);
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("assign-primary", reply);
+  reply = co_await HandleBeginGroupTerm(coordinator, state_machine, principal,
+                                        manifest.group_id_, 0, 1);
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("begin-term", reply);
+  reply = co_await HandleSetSlotMap(
+      coordinator, state_machine, principal, manifest.first_slot_,
+      manifest.last_slot_, manifest.group_id_, 1);
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("slot-map", reply);
+  co_return "OK";
+}
+
+celer::Task<std::string> CommitClusterCreatePopulationAndAuthority(
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest,
+    MetaHash256* manifest_digest) {
+  PutPopulationManifest put_manifest;
+  put_manifest.request_id_ = MakeRequestId();
+  put_manifest.entries_.reserve(kMetaSlotCount);
+  for (std::uint32_t partition = 0; partition < kMetaSlotCount; ++partition) {
+    put_manifest.entries_.push_back({partition, 1});
+  }
+  put_manifest.manifest_digest_ =
+      MetaPopulationManifestStore::CanonicalDigest(put_manifest.entries_);
+  *manifest_digest = put_manifest.manifest_digest_;
+  std::string reply =
+      co_await ProposeCommand(coordinator, principal, put_manifest);
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("population-manifest", reply);
+  if (!state_machine->StoresSnapshot().population_manifest_.Contains(
+          *manifest_digest)) {
+    co_return ClusterCreateError("population-manifest", "domain-rejected",
+                                 "committed effect is absent");
+  }
+
+  SetGroupReplicationState set_population;
+  set_population.request_id_ = MakeRequestId();
+  set_population.group_id_ = manifest.group_id_;
+  set_population.new_population_manifest_revision_ = 1;
+  set_population.new_population_manifest_digest_ = *manifest_digest;
+  set_population.new_partition_replication_epoch_ = 1;
+  set_population.new_topology_epoch_ =
+      state_machine->StoresSnapshot().topology_.TopologyEpoch() + 1;
+  reply = co_await ProposeCommand(coordinator, principal, set_population);
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("population-anchor", reply);
+  const auto population_group =
+      state_machine->StoresSnapshot().topology_.FindGroup(manifest.group_id_);
+  if (!population_group.has_value() ||
+      population_group->record_.population_manifest_revision_ != 1 ||
+      population_group->record_.population_manifest_digest_ !=
+          *manifest_digest ||
+      population_group->record_.partition_replication_epoch_ != 1) {
+    co_return ClusterCreateError("population-anchor", "domain-rejected",
+                                 "committed effect is absent");
+  }
+
+  reply = co_await HandlePutPolicy(coordinator, state_machine, principal,
+                                   std::string(kClusterCreatePolicyId), 1,
+                                   "first-empty-population");
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("policy", reply);
+  reply = co_await HandleActivateAuthority(
+      coordinator, state_machine, principal, manifest.group_id_, 1,
+      manifest.data_node_id_, 5'000,
+      std::string(kClusterCreatePolicyId), 1, 1, 1);
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("activate-authority", reply);
+  co_return "OK";
+}
+
+celer::Task<std::string> WaitForClusterCreateProjection(
+    const nuraft::ptr<nuraft::raft_server>& server,
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
+    const ClusterCreateManifestV1& manifest,
+    std::chrono::steady_clock::time_point deadline,
+    MetaDataControlRuntimeNode* target_runtime,
+    MetaTopologyGroupView* target_group, MetaGroupGrantState* target_grant) {
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!server->is_leader() || !server->is_leader_alive()) {
+      co_return ClusterCreateError("wait-data-projection", "uncertain-outcome",
+                                   "leadership was lost after commits");
+    }
+    const MetaCommittedStatusView current_status =
+        state_machine->StatusSnapshot();
+    const MetaStores current = state_machine->StoresSnapshot();
+    const auto group = current.topology_.FindGroup(manifest.group_id_);
+    const auto grant = current.grant_.GroupState(manifest.group_id_);
+    const MetaDataControlRuntimeSnapshot runtime = runtime_status->Snapshot();
+    const auto node = std::find_if(
+        runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& item) {
+          return item.node_id_ == manifest.data_node_id_;
+        });
+    if (runtime.leader_authority_eligible_ && group.has_value() &&
+        grant.has_value() && node != runtime.nodes_.end() &&
+        ClusterCreateProjectionMatches(*node, *group, *grant,
+                                       current_status.applied_index_)) {
+      *target_runtime = *node;
+      *target_group = *group;
+      *target_grant = *grant;
+      co_return "OK";
+    }
+    absl::Status slept = co_await celer::SleepFor(
+        *celer::ThisWorker().self_, std::chrono::milliseconds(10));
+    if (!slept.ok()) {
+      co_return ClusterCreateError("wait-data-projection", "uncertain-outcome",
+                                   std::string(slept.message()));
+    }
+  }
+  co_return ClusterCreateError("wait-data-projection", "uncertain-outcome",
+                               "deadline expired after topology commits");
+}
+
+celer::Task<std::string> StartClusterCreateOperation(
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest,
+    const MetaHash256& manifest_digest,
+    const MetaDataControlRuntimeNode& target_runtime,
+    const MetaTopologyGroupView& target_group,
+    const MetaGroupGrantState& target_grant, MetaOperationId* operation_id) {
+  MetaBootIncarnation target_boot{};
+  if (!ParseHexBytes(target_runtime.boot_id_, target_runtime.boot_id_.size(),
+                     target_boot.data()) ||
+      !target_grant.grant_.has_value()) {
+    co_return ClusterCreateError("wait-data-projection", "runtime-invalid",
+                                 "Data runtime identity is malformed");
+  }
+  const auto member = std::find_if(
+      target_group.members_.begin(), target_group.members_.end(),
+      [&](const auto& item) { return item.node_id_ == manifest.data_node_id_; });
+  if (member == target_group.members_.end()) {
+    co_return ClusterCreateError("wait-data-projection", "runtime-invalid",
+                                 "Data assignment disappeared");
+  }
+
+  *operation_id = MakeOperationId();
+  SubmitOperation submit;
+  submit.request_id_ = MakeRequestId();
+  submit.operation_id_ = *operation_id;
+  submit.kind_ = kMetaClusterCreateOperationKind;
+  submit.intent_ = absl::StrCat(manifest.data_node_id_, " ", manifest.group_id_,
+                                " ", manifest.client_endpoint_);
+  submit.intent_hash_ = MetaSha256(submit.intent_);
+  submit.replication_history_id_ = target_runtime.replication_history_id_;
+  submit.policy_references_.push_back(
+      {std::string(kClusterCreatePolicyId), 1});
+  std::string reply = co_await ProposeCommand(coordinator, principal, submit);
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("submit-operation", reply);
+  auto operation = state_machine->FindOperation(*operation_id);
+  if (!operation.has_value() || operation->intent_hash_ != submit.intent_hash_) {
+    co_return ClusterCreateError("submit-operation", "domain-rejected",
+                                 "committed effect is absent");
+  }
+
+  MetaDirectiveSpec initialize;
+  initialize.directive_id_ = MakeDirectiveId();
+  initialize.attempt_id_ = MakeAttemptId();
+  initialize.recipient_node_id_ = manifest.data_node_id_;
+  initialize.target_node_id_ = manifest.data_node_id_;
+  initialize.target_boot_id_ = target_boot;
+  initialize.assignment_id_ = member->assignment_id_;
+  initialize.source_node_id_ = std::string(kMetaNodeIdBytes, '0');
+  initialize.group_id_ = manifest.group_id_;
+  initialize.group_term_ = 1;
+  initialize.authority_version_ = 1;
+  initialize.grant_revision_ = target_grant.grant_->grant_revision_;
+  initialize.population_manifest_revision_ = 1;
+  initialize.population_manifest_digest_ = manifest_digest;
+  initialize.partition_replication_epoch_ = 1;
+  initialize.kind_ = kMetaDirectiveInitializeEmptyPopulation;
+  initialize.payload_ =
+      ReplicationHistoryIdText(target_runtime.replication_history_id_);
+  initialize.storage_mutating_ = true;
+
+  TransitionOperationPhase start;
+  start.request_id_ = MakeRequestId();
+  start.operation_id_ = *operation_id;
+  start.expected_revision_ = operation->revision_;
+  start.kind_phase_blob_ = "initializing-empty-population";
+  start.current_directives_.push_back(initialize);
+  reply = co_await ProposeCommand(coordinator, principal, start);
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("start-initialization", reply);
+  operation = state_machine->FindOperation(*operation_id);
+  if (!operation.has_value() || operation->current_directives_.size() != 1) {
+    co_return ClusterCreateError("start-initialization", "domain-rejected",
+                                 "committed directive is absent");
+  }
+  co_return "OK";
+}
+
+bool IsDefiniteClusterCreateStartFailure(std::string_view reply) {
+  return reply.starts_with("ERR clustercreate 1 ") &&
+         (reply.find(" domain-rejected ") != std::string_view::npos ||
+          reply.find(" runtime-invalid ") != std::string_view::npos);
+}
+
+// Authority is activated before Data can receive its first-population
+// directive. If admission is definitely rejected, close that authority and
+// terminate any operation that was definitely submitted. Uncertain proposal
+// outcomes are deliberately left untouched for #36 recovery rather than
+// risking a contradictory cleanup commit.
+celer::Task<std::string> RefenceDefiniteClusterCreateStartFailure(
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest,
+    const MetaOperationId& operation_id, std::string original_error) {
+  std::string fenced = co_await HandleFenceGroup(
+      coordinator, state_machine, principal, manifest.group_id_, 1);
+  if (!fenced.starts_with("OK ")) {
+    co_return ClusterCreateMutationError("refence-after-start-failure",
+                                         fenced);
+  }
+  const std::optional<MetaOperationRecord> operation =
+      state_machine->FindOperation(operation_id);
+  if (operation.has_value() && !IsTerminal(operation->lifecycle_)) {
+    std::string aborted = co_await HandleAbortOp(
+        coordinator, state_machine, std::move(principal), operation_id,
+        "cluster-create directive admission was rejected");
+    if (!aborted.starts_with("OK ")) {
+      co_return ClusterCreateMutationError("abort-after-start-failure",
+                                           aborted);
+    }
+  }
+  co_return original_error;
+}
+
+celer::Task<std::string> FinishClusterCreateOperation(
+    const nuraft::ptr<nuraft::raft_server>& server,
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest,
+    const MetaOperationId& operation_id,
+    std::chrono::steady_clock::time_point deadline) {
+  std::optional<MetaOperationRecord> operation;
+  std::optional<MetaTerminalReceipt> terminal_receipt;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!server->is_leader() || !server->is_leader_alive()) {
+      co_return ClusterCreateError("initialize-data", "uncertain-outcome",
+                                   "leadership was lost after directive commit");
+    }
+    operation = state_machine->FindOperation(operation_id);
+    if (!operation.has_value()) {
+      co_return ClusterCreateError("initialize-data", "uncertain-outcome",
+                                   "operation disappeared");
+    }
+    if (!operation->terminal_receipts_.empty()) {
+      terminal_receipt = operation->terminal_receipts_.back();
+      break;
+    }
+    absl::Status slept = co_await celer::SleepFor(
+        *celer::ThisWorker().self_, std::chrono::milliseconds(10));
+    if (!slept.ok()) {
+      co_return ClusterCreateError("initialize-data", "uncertain-outcome",
+                                   std::string(slept.message()));
+    }
+  }
+  if (!terminal_receipt.has_value()) {
+    co_return ClusterCreateError("initialize-data", "uncertain-outcome",
+                                 "deadline expired after directive commit");
+  }
+  if (terminal_receipt->status_ != MetaDirectiveResultStatus::kSucceeded) {
+    const std::string fenced = co_await HandleFenceGroup(
+        coordinator, state_machine, principal, manifest.group_id_, 1);
+    if (!fenced.starts_with("OK "))
+      co_return ClusterCreateMutationError("refence-after-failure", fenced);
+    const std::string aborted = co_await HandleAbortOp(
+        coordinator, state_machine, principal, operation_id,
+        absl::StrCat("empty population initialization: ",
+                     terminal_receipt->result_));
+    if (!aborted.starts_with("OK "))
+      co_return ClusterCreateMutationError("abort-operation", aborted);
+    co_return ClusterCreateError("initialize-data", "data-rejected",
+                                 terminal_receipt->result_);
+  }
+
+  operation = state_machine->FindOperation(operation_id);
+  if (!operation.has_value()) {
+    co_return ClusterCreateError("finish-operation", "uncertain-outcome",
+                                 "operation disappeared");
+  }
+  TransitionOperationPhase remove;
+  remove.request_id_ = MakeRequestId();
+  remove.operation_id_ = operation_id;
+  remove.expected_revision_ = operation->revision_;
+  remove.kind_phase_blob_ = "population-ready";
+  std::string reply = co_await ProposeCommand(coordinator, principal, remove);
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("remove-directive", reply);
+  reply = co_await HandleCompleteOp(coordinator, state_machine, principal,
+                                    operation_id, "cluster-created");
+  if (!reply.starts_with("OK "))
+    co_return ClusterCreateMutationError("complete-operation", reply);
+  const std::string_view committed_index =
+      std::string_view(reply).substr(std::string_view("OK ").size());
+  co_return absl::StrCat(
+      "OK clustercreate 1 ", committed_index, " ",
+      HexEncode(std::string_view(
+          reinterpret_cast<const char*>(operation_id.data()),
+          operation_id.size())));
+}
+
+// The tracer-bullet workflow deliberately composes the existing committed
+// commands and operation journal. This is an entry-layer convenience, not a
+// second durable state machine: every stage is effect-verified through the
+// same handlers and stores used by the ordinary ctl verbs.
+celer::Task<std::string> HandleClusterCreate(
+    const nuraft::ptr<nuraft::raft_server>& server,
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
+    AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest,
+    std::uint32_t wait_timeout_ms) {
+  // The timeout carried by the one high-level request covers the entire
+  // server workflow, including the metadata prefix. Starting it after those
+  // commits would let abandoned work outlive the client's absolute deadline.
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(wait_timeout_ms);
+  if (!server->is_leader() || !server->is_leader_alive() ||
+      !server->is_leader_sm_fully_caught_up()) {
+    co_return ClusterCreateError("preflight", "not-leader",
+                                 "responder is not an eligible leader");
+  }
+  const MetaCommittedStatusView status = state_machine->StatusSnapshot();
+  const auto active_members = ActiveMetaMembers(status);
+  const auto config_ids = ConfigServerIds(server->get_config());
+  const MetaStores before = state_machine->StoresSnapshot();
+  if (active_members.size() != 1 || config_ids.size() != 1 ||
+      active_members.front().server_id_ != manifest.meta_member_id_ ||
+      config_ids.front() != manifest.meta_member_id_ ||
+      before.identity_.NodeCount() != 0 ||
+      before.topology_.GroupCount() != 0 || !status.slot_ranges_.empty() ||
+      status.active_cluster_create_operation_ ||
+      before.population_manifest_.Size() != 0) {
+    co_return ClusterCreateError(
+        "preflight", "non-empty-cluster",
+        "requires one matching Meta member and empty Data, Group, slot, "
+        "population, and active-operation state");
+  }
+
+  MetaHash256 manifest_digest{};
+  std::string reply = co_await CommitClusterCreateIdentityAndTopology(
+      state_machine, coordinator, principal, manifest);
+  if (reply != "OK") co_return reply;
+  reply = co_await CommitClusterCreatePopulationAndAuthority(
+      state_machine, coordinator, principal, manifest, &manifest_digest);
+  if (reply != "OK") co_return reply;
+
+  MetaDataControlRuntimeNode target_runtime;
+  MetaTopologyGroupView target_group;
+  MetaGroupGrantState target_grant;
+  reply = co_await WaitForClusterCreateProjection(
+      server, state_machine, runtime_status, manifest, deadline,
+      &target_runtime, &target_group, &target_grant);
+  if (reply != "OK") co_return reply;
+
+  MetaOperationId operation_id{};
+  reply = co_await StartClusterCreateOperation(
+      state_machine, coordinator, principal, manifest, manifest_digest,
+      target_runtime, target_group, target_grant, &operation_id);
+  if (reply != "OK") {
+    if (IsDefiniteClusterCreateStartFailure(reply)) {
+      co_return co_await RefenceDefiniteClusterCreateStartFailure(
+          state_machine, coordinator, std::move(principal), manifest,
+          operation_id, std::move(reply));
+    }
+    co_return reply;
+  }
+  co_return co_await FinishClusterCreateOperation(
+      server, state_machine, coordinator, std::move(principal), manifest,
+      operation_id, deadline);
+}
+
 celer::Task<std::string> HandlePruneAudit(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, std::uint64_t through) {
@@ -1992,7 +2456,8 @@ celer::Task<std::string> DispatchCommand(
   std::string_view target_node_id;
   if (command == "status") {
     access = MetaAccess::kStatus;
-  } else if (command == "clusterhead" || command == "clusterstatus") {
+  } else if (command == "clusterhead" || command == "clusterstatus" ||
+             command == "clustercreate") {
     // Cluster-wide topology and readiness are operator-only even though the
     // legacy local status verb is also visible to a Data-node identity.
     if (identity.role_ != MetaPrincipalRole::kOperator) {
@@ -2053,6 +2518,26 @@ celer::Task<std::string> DispatchCommand(
     }
     co_return co_await AsyncReplyAwaiter(std::move(reply),
                                          retained_status_bytes);
+  }
+  if (command == "clustercreate") {
+    if (tokens.size() != 3) {
+      co_return ClusterCreateError(
+          "decode", "bad-request",
+          "expected clustercreate 1 <hex-payload>");
+    }
+    if (tokens[1] != "1") {
+      co_return ClusterCreateError("decode", "bad-request",
+                                   "unsupported protocol version");
+    }
+    std::uint32_t wait_timeout_ms = 0;
+    auto manifest = DecodeClusterCreateRequest(line, &wait_timeout_ms);
+    if (!manifest.ok()) {
+      co_return ClusterCreateError("decode", "bad-request",
+                                   std::string(manifest.status().message()));
+    }
+    co_return co_await HandleClusterCreate(
+        server, state_machine, coordinator, data_control_runtime_status,
+        std::move(principal), *manifest, wait_timeout_ms);
   }
   if (command == "submitop" || command == "completeop" ||
       command == "abortop" || command == "archiveoperations" ||

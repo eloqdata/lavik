@@ -30,6 +30,7 @@ struct MetaCommittedStatusSlotRange {
 struct MetaCommittedStatusView {
   std::uint64_t applied_index_ = 0;
   std::uint64_t topology_epoch_ = 0;
+  bool active_cluster_create_operation_ = false;
   std::vector<MetaMemberRecord> meta_members_;
   std::vector<MetaNodeRecord> data_nodes_;
   std::vector<MetaCommittedStatusGroup> groups_;

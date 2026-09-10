@@ -90,6 +90,91 @@ the connection to a discovered remote leader. There is no plaintext/TLS
 fallback. One absolute deadline, five seconds by default, covers discovery,
 redirects, capture, and response I/O.
 
+## Create the first single-Data cluster
+
+`keylane-ctl cluster-create` is the supported v1 bootstrap path for a fresh
+single-member Meta cluster and one preconfigured Data process. It is not an
+import or expansion command: Meta must contain no Data identity, group, slot
+map, population manifest, or active cluster-create operation. The Data process
+may have records in its configured storage; successful initialization
+deliberately erases all 16,384 physical partitions before serving.
+
+Install `redis-cli` on the operator host and make it available on `PATH`. The
+command uses the real cluster-mode client after metadata creation to verify
+`CLUSTER INFO`, `CLUSTER SLOTS`, `CLUSTER KEYSLOT`, and a temporary
+`SET`/`GET`/`DEL` round trip. Start the bootstrap Meta first, then start Data
+in fail-closed Meta-managed mode using the final node id and Meta Data-control
+endpoint. The advertised plaintext port must match the manifest endpoint:
+
+```sh
+keylane-meta --id 1 --addr 127.0.0.1:7101 \
+  --data-control-addr 127.0.0.1:7301 \
+  --data-dir /var/lib/keylane/meta-1 --bootstrap \
+  --ctl-socket /var/lib/keylane/meta-1/meta-admin.sock
+
+keylane --cluster-enabled \
+  --cluster-node-id 0123456789abcdef0123456789abcdef01234567 \
+  --cluster-meta-seed 127.0.0.1:7301 \
+  --cluster-announce-ip 127.0.0.1 --port 6379 \
+  --data-file /var/lib/keylane/data-1/keylane.data
+```
+
+Data initially reports LOADING while its unregistered control connection
+retries. Meta and Data must run the same version because v1 appends a new
+control directive kind. Do not put listener addresses, storage paths, TLS
+files, or other deployment configuration in the creation manifest. Its exact
+schema is:
+
+```toml
+schema_version = 1
+
+[[meta_members]]
+id = 1
+
+[[data_nodes]]
+id = "0123456789abcdef0123456789abcdef01234567"
+client_endpoint = "tcp://127.0.0.1:6379"
+
+[[groups]]
+id = "group-1"
+primary = "0123456789abcdef0123456789abcdef01234567"
+
+[[slot_ranges]]
+first = 0
+last = 16383
+group = "group-1"
+```
+
+The parser rejects files over 64 KiB, unknown or duplicate fields/sections,
+noncanonical ids or numeric endpoints, broken references, and any topology
+other than one Meta, one Data, one group, and one full slot range. Run:
+
+```sh
+keylane-ctl cluster-create --manifest cluster.toml \
+  --socket /var/lib/keylane/meta-1/meta-admin.sock
+```
+
+Review the normalized plan and data-erasure warning, then enter exactly
+lowercase `yes`. EOF, any other input, or a failed parse exits before any Meta
+request. Automation may pass `--yes`. `--timeout-ms` is one absolute deadline
+for leader discovery, all server-side commits and Data initialization, READY
+polling, and Redis verification; its default is 120 seconds. Remote TCP uses
+the same mTLS or explicit `--allow-plaintext-admin` policy as
+`cluster-status`; `--json` does not apply.
+
+Exit 0 means the exact topology reached READY and the Redis probes passed.
+Exit 1 is a local manifest, confirmation, dependency, or protocol/verification
+failure. Exit 2 is an explicit Meta precondition or domain rejection. Exit 3
+means a timeout, lost leader, or connection failure occurred after creation
+may have begun. Never automatically replay an exit-3 creation. Run
+`cluster-status`, preserve the Meta and Data logs/directories, and determine
+whether the topology and population reached READY. V1 has no partial-workflow
+resume or conflict-safe retry; if it is not READY, keep the fenced cluster out
+of service and investigate the reported `clustercreate` stage/code before any
+manual recovery. An exit-1 Redis verification failure can occur after Meta
+creation completed, so use the same status and Redis commands after correcting
+the local dependency rather than rerunning creation.
+
 For plaintext remote administration, configure a listener and connect without
 TLS arguments:
 

@@ -152,19 +152,26 @@ std::string Hex(const std::array<std::uint8_t, N>& bytes) {
 
 absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
     const MetaDirectiveSpec& directive) {
-  if (directive.kind_ == "rebuild") {
+  if (directive.kind_ == kMetaDirectiveRebuild) {
     if (!directive.storage_mutating_) {
       return Invalid("rebuild directive must be storage-mutating");
     }
     return control::WireDirectiveKind::kRebuild;
   }
-  if (directive.kind_ == "authorize-source") {
+  if (directive.kind_ == kMetaDirectiveInitializeEmptyPopulation) {
+    if (!directive.storage_mutating_) {
+      return Invalid(
+          "initialize-empty-population directive must be storage-mutating");
+    }
+    return control::WireDirectiveKind::kInitializeEmptyPopulation;
+  }
+  if (directive.kind_ == kMetaDirectiveAuthorizeSource) {
     if (directive.storage_mutating_) {
       return Invalid("authorize-source directive must not be storage-mutating");
     }
     return control::WireDirectiveKind::kAuthorizeSource;
   }
-  if (directive.kind_ == "revoke-sources") {
+  if (directive.kind_ == kMetaDirectiveRevokeSources) {
     if (directive.storage_mutating_) {
       return Invalid("revoke-sources directive must not be storage-mutating");
     }
@@ -189,11 +196,15 @@ absl::Status AddManifestReference(std::uint64_t revision,
 absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
     const MetaOperationRecord& operation, const MetaCurrentDirective& current) {
   const MetaDirectiveSpec& source = current.spec_;
+  const bool initializes_empty =
+      source.kind_ == kMetaDirectiveInitializeEmptyPopulation;
   if (IsZero(operation.operation_id_) || IsZero(source.directive_id_) ||
       IsZero(source.attempt_id_) || IsZero(source.assignment_id_) ||
-      IsZero(source.source_assignment_id_) || IsZero(source.target_boot_id_) ||
-      IsZero(source.source_boot_id_) ||
-      IsZero(source.source_replication_history_id_) ||
+      IsZero(source.target_boot_id_) ||
+      (!initializes_empty &&
+       (IsZero(source.source_assignment_id_) ||
+        IsZero(source.source_boot_id_) ||
+        IsZero(source.source_replication_history_id_))) ||
       current.directive_revision_ == 0) {
     return Inconsistent("current directive contains an empty identity");
   }
@@ -204,7 +215,9 @@ absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
   }
   auto kind = ProjectDirectiveKind(source);
   if (!kind.ok()) return kind.status();
-  const bool executes_on_target = *kind == control::WireDirectiveKind::kRebuild;
+  const bool executes_on_target =
+      *kind == control::WireDirectiveKind::kRebuild ||
+      *kind == control::WireDirectiveKind::kInitializeEmptyPopulation;
   const std::string& expected_recipient =
       executes_on_target ? source.target_node_id_ : source.source_node_id_;
   if (source.recipient_node_id_ != expected_recipient) {

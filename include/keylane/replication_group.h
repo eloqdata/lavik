@@ -90,6 +90,10 @@ struct RebuildIdentity {
   std::string source_history_id_;
   std::string target_node_id_;
   std::string target_boot_id_;
+  // The target's local replication-history incarnation. It is present only
+  // for source-less empty initialization, whose destructive reset must remain
+  // bound to the exact history advertised by the current control session.
+  std::string target_history_id_;
   std::string operation_id_;
   // Stable Meta-owned identity of the directive. Retries may use a fresh
   // attempt ID, but they must not silently rebind work to another directive.
@@ -185,6 +189,20 @@ class ReplicationGroup {
   absl::StatusOr<DestructiveResetAuthorization> BeginRebuild(
       const RebuildDirective& directive, const PopulationManifest& manifest);
 
+  // Checks a source-less first-population directive without consuming its
+  // attempt. Source identity fields must be empty and target_history_id_ must
+  // bind the current control session. The resulting storage proof reuses the
+  // rebuild lifecycle but deliberately has no replication-flow cut.
+  absl::Status ValidateEmptyPopulation(
+      const RebuildIdentity& identity,
+      const PopulationManifest& manifest) const;
+
+  // Enters REBUILDING for a validated source-less first population. This is
+  // the destructive capability seam used by ReplicationManager after it has
+  // independently matched session, assignment, history, and authority.
+  absl::StatusOr<DestructiveResetAuthorization> BeginEmptyPopulation(
+      const RebuildIdentity& identity, const PopulationManifest& manifest);
+
   // Revalidates a reset capability against the currently active attempt. This
   // must be checked at the destructive storage boundary so an authorization
   // retained from an aborted or superseded attempt cannot be replayed.
@@ -219,7 +237,8 @@ class ReplicationGroup {
   absl::Status MarkFunctionCatalogComplete(const RebuildIdentity& identity);
 
   // Records successful storage drain and PromoteReplicaRoot. This is rejected
-  // until the manifest, Function catalog, and every flow cut are complete.
+  // until the manifest and Function catalog are complete, plus every source
+  // flow cut for a replicated rebuild.
   absl::Status MarkStoragePromoted(const RebuildIdentity& identity);
 
   // Atomically publishes current-boot readiness after every proof is complete.

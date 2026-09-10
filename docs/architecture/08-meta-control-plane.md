@@ -260,11 +260,14 @@ The common assignment field always names the target membership incarnation;
 the durable directive carries a separate source assignment and the committed
 partition replication epoch. Both must exactly match committed topology and
 the installed group view.
-The durable and wire codecs reserve bounded `payload`, `preconditions`, and
-`force` fields for future operation-kind semantics. V1 executable directives
-require the strings to be empty and `force=false`; Meta transition apply and
-Data admission both reject any other value, so the replication adapter cannot
-silently ignore a requested predicate or override.
+The durable and wire codecs keep bounded `payload`, `preconditions`, and
+`force` fields. V1 uses `payload` only for
+`initialize-empty-population`, where it carries the target Data session's
+authenticated replication-history id; all other executable directives require
+an empty payload. `preconditions` stays empty and `force=false` for every v1
+kind. Meta transition apply and Data admission both enforce this per-kind
+contract, so the replication adapter cannot silently ignore a predicate or
+override.
 Operation, durable directive, execution attempt, and assignment-incarnation
 identities remain distinct. Assignment ids are proposer-generated
 128-bit values that are never reused across incarnations; the topology store
@@ -504,7 +507,13 @@ committed Meta-directory check; a changed bracket returns `cut_changed`
 instead of mixed state. Captures are single-flight across both Admin listeners.
 Completed replies release the capture permit before sending, share a 256 MiB
 retained-reply budget, and a slow receiver loses the connection after five
-seconds rather than delaying Data heartbeats.
+seconds rather than delaying Data heartbeats. The compact committed cut also
+carries whether a non-terminal `cluster-create-v1` operation exists. The
+server exposes that fact through the existing `cluster_create_active` blocker,
+preserving the `cluster-status` v1 wire layout, and the operator uses it for its
+read-only creation preflight without copying the journal. The leader repeats
+the check immediately before its first proposal. Unrelated operation kinds do
+not make a clean topology appear occupied.
 
 Readiness uses this leader-observed cut. Meta availability requires a live,
 caught-up leader with quorum; membership stability compares its Raft config
@@ -516,6 +525,37 @@ committed owner/grant, present manifest, active policy, and a recent
 successfully written lease grant matching the current session and authority.
 Unassigned nodes remain diagnostic only. Empty and partially configured
 clusters are stable `NOT READY` results.
+
+`keylane-ctl cluster-create` reuses the same private leader discovery and
+status-capture seam. Its v1 manifest is a topology document, not a deployment
+document: it names exactly one existing Meta id, one canonical Data id and
+numeric plaintext client endpoint, one group/primary, and one full
+`0..16383` range. The CLI rejects unknown or duplicate TOML structure and
+files over 64 KiB, renders the normalized plan and destructive Data warning,
+and requires exact lowercase `yes` before opening an Admin connection unless
+`--yes` is present.
+
+After an empty-topology and no-active-create client check, the CLI sends one
+versioned `clustercreate` request to the discovered leader. `MetaCtlServer`
+owns the
+workflow inside the existing Admin module: it repeats the single-voter/empty
+precondition, preserves the authenticated operator in every proposal, then
+commits Data identity, group assignment and fenced term, full slot map, the
+server-generated 16,384-entry population manifest, partition epoch, built-in
+policy, and finite authority in dependency order. It waits for the exact live
+Data session and projected FDS before submitting one persistent operation with
+an `initialize-empty-population` directive bound to that session's boot,
+assignment, replication history, term, authority, grant, manifest, and
+partition epoch. Success commits the terminal result, removes the directive,
+and retains the operation evidence. An explicit Data failure fences the group;
+an uncertain proposal or connection outcome is never replayed by v1.
+
+The client then polls the ordinary status path until the exact topology,
+population proof, and recent lease are READY, and invokes `redis-cli -c` to
+verify the public `CLUSTER INFO`, `SLOTS`, and `KEYSLOT` contracts plus an exact
+`SET`/`GET`/`DEL` round trip. This keeps internal Raft revisions and generated
+identities off the public CLI while making success mean the client-facing data
+plane is usable, not merely that a metadata prefix committed.
 
 Every privileged committed command creates a deterministic audit record keyed
 by Raft log index. Records include the injected actor, proposal time, command
@@ -538,5 +578,5 @@ transition into or out of disabled mode.
 | Shared Meta/Data frame, object-transfer, and message formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
 | Foreign-thread typed completion ingress and worker wakeup | `celer/include/celer/runtime/foreign_executor.h`, `celer/src/runtime/foreign_executor.cpp`, `celer/include/celer/runtime/cross_core.h`, `celer/src/runtime/worker.cpp` |
-| TLS identity, RBAC, Unix peer credentials, Admin transport, and cluster status | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `celer/src/net/` |
+| TLS identity, RBAC, Unix peer credentials, Admin transport, cluster status, and initial cluster creation | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `include/keylane/meta/cluster_create.h`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `celer/src/net/` |
 | Recovery, partition, membership, and security gates | `tests/meta_*`, `tests/meta_integration/` |

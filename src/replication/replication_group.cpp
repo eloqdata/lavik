@@ -57,16 +57,32 @@ bool IsEmpty(const PopulationManifestId& id) {
                      [](std::uint8_t value) { return value == 0; });
 }
 
-absl::Status ValidateIdentity(const RebuildIdentity& identity) {
+absl::Status ValidateIdentity(const RebuildIdentity& identity,
+                              bool source_less) {
   if (identity.group_id_.empty() || identity.assignment_id_.empty() ||
-      identity.authority_id_.empty() || identity.source_node_id_.empty() ||
-      identity.source_assignment_id_.empty() ||
-      identity.source_boot_id_.empty() || identity.source_history_id_.empty() ||
-      identity.target_node_id_.empty() || identity.target_boot_id_.empty() ||
-      identity.operation_id_.empty() || identity.directive_id_.empty() ||
-      identity.attempt_id_.empty()) {
+      identity.authority_id_.empty() || identity.target_node_id_.empty() ||
+      identity.target_boot_id_.empty() || identity.operation_id_.empty() ||
+      identity.directive_id_.empty() || identity.attempt_id_.empty()) {
     return absl::InvalidArgumentError(
-        "rebuild identity fields must all be nonempty");
+        "population identity fields must all be nonempty");
+  }
+  const bool source_fields_empty =
+      identity.source_node_id_.empty() &&
+      identity.source_assignment_id_.empty() &&
+      identity.source_boot_id_.empty() &&
+      identity.source_history_id_.empty();
+  if (source_less) {
+    if (!source_fields_empty || identity.target_history_id_.empty()) {
+      return absl::InvalidArgumentError(
+          "empty population must bind target history and have no source");
+    }
+  } else if (identity.source_node_id_.empty() ||
+             identity.source_assignment_id_.empty() ||
+             identity.source_boot_id_.empty() ||
+             identity.source_history_id_.empty() ||
+             !identity.target_history_id_.empty()) {
+    return absl::InvalidArgumentError(
+        "rebuild must bind every source field and no target history");
   }
   if (identity.term_ == 0) {
     return absl::InvalidArgumentError("rebuild term must be nonzero");
@@ -98,6 +114,7 @@ bool SameDirectiveRevisionScope(const RebuildIdentity& left,
          left.source_history_id_ == right.source_history_id_ &&
          left.target_node_id_ == right.target_node_id_ &&
          left.target_boot_id_ == right.target_boot_id_ &&
+         left.target_history_id_ == right.target_history_id_ &&
          left.operation_id_ == right.operation_id_ &&
          left.directive_id_ == right.directive_id_ &&
          left.manifest_revision_ == right.manifest_revision_ &&
@@ -170,11 +187,25 @@ class ReplicationGroup::Impl {
 
   absl::Status ValidateRebuild(const RebuildDirective& directive,
                                const PopulationManifest& manifest) const {
+    return ValidatePopulation(directive, manifest, false);
+  }
+
+  absl::Status ValidateEmptyPopulation(
+      const RebuildIdentity& identity,
+      const PopulationManifest& manifest) const {
+    return ValidatePopulation(RebuildDirective{.identity_ = identity}, manifest,
+                              true);
+  }
+
+  absl::Status ValidatePopulation(const RebuildDirective& directive,
+                                  const PopulationManifest& manifest,
+                                  bool source_less) const {
     if (state_ == ReplicationGroupState::kFailedStopped) {
       return absl::FailedPreconditionError(
           "replication group is failure-latched for this boot");
     }
-    absl::Status identity_status = ValidateIdentity(directive.identity_);
+    absl::Status identity_status =
+        ValidateIdentity(directive.identity_, source_less);
     if (!identity_status.ok()) return identity_status;
     if (local_node_id_.empty() || local_boot_id_.empty()) {
       return absl::FailedPreconditionError(
@@ -189,14 +220,21 @@ class ReplicationGroup::Impl {
       return absl::FailedPreconditionError(
           "rebuild directive does not match the supplied manifest");
     }
-    if (directive.flow_count_ == 0 ||
-        directive.flow_count_ > kMaxMemoryWorkers) {
-      return absl::InvalidArgumentError(
-          "rebuild flow count must be within the supported worker domain");
-    }
-    if (!directive.safe_source_active_) {
-      return absl::FailedPreconditionError(
-          "destructive reset requires a safely active source");
+    if (source_less) {
+      if (directive.flow_count_ != 0 || directive.safe_source_active_) {
+        return absl::InvalidArgumentError(
+            "empty population cannot carry source-flow authorization");
+      }
+    } else {
+      if (directive.flow_count_ == 0 ||
+          directive.flow_count_ > kMaxMemoryWorkers) {
+        return absl::InvalidArgumentError(
+            "rebuild flow count must be within the supported worker domain");
+      }
+      if (!directive.safe_source_active_) {
+        return absl::FailedPreconditionError(
+            "destructive reset requires a safely active source");
+      }
     }
     if (last_directive_.has_value() &&
         last_directive_->identity_.group_id_ != directive.identity_.group_id_) {
@@ -258,7 +296,20 @@ class ReplicationGroup::Impl {
 
   absl::StatusOr<DestructiveResetAuthorization> BeginRebuild(
       const RebuildDirective& directive, const PopulationManifest& manifest) {
-    absl::Status validated = ValidateRebuild(directive, manifest);
+    return BeginPopulation(directive, manifest, false);
+  }
+
+  absl::StatusOr<DestructiveResetAuthorization> BeginEmptyPopulation(
+      const RebuildIdentity& identity, const PopulationManifest& manifest) {
+    return BeginPopulation(RebuildDirective{.identity_ = identity}, manifest,
+                           true);
+  }
+
+  absl::StatusOr<DestructiveResetAuthorization> BeginPopulation(
+      const RebuildDirective& directive, const PopulationManifest& manifest,
+      bool source_less) {
+    absl::Status validated =
+        ValidatePopulation(directive, manifest, source_less);
     if (!validated.ok()) return validated;
     if (state_ == ReplicationGroupState::kRebuilding) {
       if (current_directive_.has_value() && *current_directive_ == directive) {
@@ -360,6 +411,10 @@ class ReplicationGroup::Impl {
       std::span<const std::uint64_t> stable_next_lsns) {
     absl::Status current = ValidateCurrent(identity);
     if (!current.ok()) return current;
+    if (current_directive_->flow_count_ == 0) {
+      return absl::FailedPreconditionError(
+          "empty population has no source flow cut");
+    }
     if (stable_next_lsns.size() != current_directive_->flow_count_) {
       return absl::InvalidArgumentError(
           "full-sync cut vector does not match the rebuild flow count");
@@ -412,7 +467,8 @@ class ReplicationGroup::Impl {
       return absl::FailedPreconditionError(
           "rebuild proof is incomplete and cannot publish readiness");
     }
-    ready_token_ = ReadyToken(identity, *flow_cut_vector_);
+    ready_token_ = ReadyToken(
+        identity, flow_cut_vector_.value_or(std::vector<std::uint64_t>{}));
     state_ = ReplicationGroupState::kReady;
     return *ready_token_;
   }
@@ -500,7 +556,9 @@ class ReplicationGroup::Impl {
   bool CutProofComplete() const {
     return partition_reset_count_ == kReplicationPartitionCount &&
            partition_handoff_count_ == kReplicationPartitionCount &&
-           function_catalog_complete_ && flow_cut_vector_.has_value();
+           function_catalog_complete_ &&
+           (current_directive_->flow_count_ == 0 ||
+            flow_cut_vector_.has_value());
   }
 
   const std::string local_node_id_;
@@ -539,6 +597,18 @@ absl::Status ReplicationGroup::ValidateRebuild(
 absl::StatusOr<DestructiveResetAuthorization> ReplicationGroup::BeginRebuild(
     const RebuildDirective& directive, const PopulationManifest& manifest) {
   return impl_->BeginRebuild(directive, manifest);
+}
+
+absl::Status ReplicationGroup::ValidateEmptyPopulation(
+    const RebuildIdentity& identity,
+    const PopulationManifest& manifest) const {
+  return impl_->ValidateEmptyPopulation(identity, manifest);
+}
+
+absl::StatusOr<DestructiveResetAuthorization>
+ReplicationGroup::BeginEmptyPopulation(
+    const RebuildIdentity& identity, const PopulationManifest& manifest) {
+  return impl_->BeginEmptyPopulation(identity, manifest);
 }
 
 absl::Status ReplicationGroup::ValidateResetAuthorization(
