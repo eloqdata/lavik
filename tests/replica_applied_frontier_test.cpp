@@ -127,6 +127,47 @@ TEST(ReplicaAppliedFrontierTest, LifecycleInstallPublishesOneVector) {
   EXPECT_EQ(frontier.TrySnapshot().value(), installed);
 }
 
+TEST(ReplicaAppliedFrontierTest, SingleAttemptOmitsBusyBatch) {
+  ReplicaAppliedFrontier frontier(/*flow_count=*/2, /*publisher_count=*/2);
+  ASSERT_TRUE(
+      ReplicaAppliedFrontierTestPeer::BeginPublication(frontier, 1).ok());
+  ReplicaAppliedFrontierTestPeer::StoreNextLsn(frontier, 0, 2);
+  EXPECT_EQ(frontier.TrySnapshotOnce().status().code(),
+            absl::StatusCode::kUnavailable);
+
+  ReplicaAppliedFrontierTestPeer::StoreNextLsn(frontier, 1, 2);
+  ReplicaAppliedFrontierTestPeer::EndPublication(frontier, 1);
+  EXPECT_EQ(frontier.TrySnapshotOnce().value(),
+            (std::vector<std::uint64_t>{2, 2}));
+}
+
+TEST(ReplicaAppliedFrontierTest,
+     ScratchReuseKeepsLayoutsAndResultsIndependent) {
+  ReplicaAppliedFrontier small(/*flow_count=*/2, /*publisher_count=*/1);
+  ASSERT_TRUE(small.InstallNextLsns(std::vector<std::uint64_t>{100, 200}).ok());
+  const auto retained = small.TrySnapshotOnce();
+  ASSERT_TRUE(retained.ok()) << retained.status();
+
+  ReplicaAppliedFrontier large(/*flow_count=*/3, /*publisher_count=*/4);
+  EXPECT_EQ(large.TrySnapshotOnce().value(),
+            (std::vector<std::uint64_t>{1, 1, 1}));
+  ASSERT_TRUE(ReplicaAppliedFrontierTestPeer::BeginPublication(large, 3).ok());
+  ReplicaAppliedFrontierTestPeer::StoreNextLsn(large, 2, 2);
+  EXPECT_EQ(large.TrySnapshotOnce().status().code(),
+            absl::StatusCode::kUnavailable);
+
+  // A busy publisher from another layout must not contaminate the next
+  // sample, or overwrite an earlier vector still owned by a queued message.
+  ASSERT_TRUE(small.AdvanceAfterApply(/*flow=*/0, /*applied_lsn=*/100).ok());
+  EXPECT_EQ(small.TrySnapshotOnce().value(),
+            (std::vector<std::uint64_t>{101, 200}));
+  EXPECT_EQ(*retained, (std::vector<std::uint64_t>{100, 200}));
+
+  ReplicaAppliedFrontierTestPeer::EndPublication(large, 3);
+  EXPECT_EQ(large.TrySnapshotOnce().value(),
+            (std::vector<std::uint64_t>{1, 1, 2}));
+}
+
 TEST(ReplicaAppliedFrontierTest, DiagnosticOffsetRemainsAvailableDuringBatch) {
   ReplicaAppliedFrontier frontier(/*flow_count=*/2, /*publisher_count=*/1);
   ASSERT_TRUE(
@@ -186,6 +227,8 @@ TEST(ReplicaAppliedFrontierTest, PublicationSequenceNeverWraps) {
             absl::StatusCode::kResourceExhausted);
   EXPECT_TRUE(frontier.poisoned());
   EXPECT_EQ(frontier.TrySnapshot().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(frontier.TrySnapshotOnce().status().code(),
             absl::StatusCode::kFailedPrecondition);
 }
 

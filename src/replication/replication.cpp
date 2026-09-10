@@ -3723,7 +3723,9 @@ class ReplicationManager::ReplicationGroup {
     // state_mutex_ keeps heartbeat observation off the replication hot path.
     std::optional<std::vector<std::uint64_t>> live_snapshot;
     if (frontier != nullptr && result.ready_token_.has_value()) {
-      auto snapshot = frontier->TrySnapshot();
+      // A later heartbeat can retry; do not spin through a concurrent batch
+      // on the control worker merely to produce optional candidate evidence.
+      auto snapshot = frontier->TrySnapshotOnce();
       if (snapshot.ok() &&
           snapshot->size() == result.ready_token_->cut_vector().size() &&
           std::equal(snapshot->begin(), snapshot->end(),
@@ -4502,6 +4504,21 @@ class ReplicationManager::ReplicationGroup {
     co_return static_cast<std::uint64_t>(std::count_if(
         master_sessions_.begin(), master_sessions_.end(),
         [](const auto& entry) { return entry.second->online(); }));
+  }
+
+  Task<ReplicationIdentity> identity() const {
+    co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+    celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+    co_return ReplicationIdentity{
+        .local_node_id_ = node_id_,
+        .boot_id_ = boot_id_,
+        .local_history_id_ = history_id_,
+    };
+  }
+
+  std::optional<ReplicaOfConfig> upstream() const {
+    std::lock_guard lock(state_mutex_);
+    return upstream_;
   }
 
   Task<ReplicationStatus> status() const {
@@ -10814,6 +10831,14 @@ Task<absl::Status> ReplicationManager::ApplyDirective(
 
 Task<ReplicationStatus> ReplicationManager::Observe() const {
   return group_->status();
+}
+
+Task<ReplicationIdentity> ReplicationManager::ObserveIdentity() const {
+  return group_->identity();
+}
+
+std::optional<ReplicaOfConfig> ReplicationManager::upstream() const {
+  return group_->upstream();
 }
 
 Task<absl::StatusOr<ClusterRebuildCompletion>>

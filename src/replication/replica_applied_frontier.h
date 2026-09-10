@@ -27,8 +27,8 @@ absl::StatusOr<std::vector<std::uint64_t>> InitialAppliedNextLsnsForReconnect(
 //
 // A transport fragment is not an applied unit: callers advance a flow only
 // after its complete logical event has been decoded and committed. Independent
-// flow publications may be sampled at adjacent instants, but TrySnapshot()
-// never exposes one batch partially. Each publisher id is single-writer, and
+// flow publications may be sampled at adjacent instants, but vector snapshots
+// never expose one batch partially. Each publisher id is single-writer, and
 // callers must not overlap ordinary and batch publication for the same flow.
 class ReplicaAppliedFrontier {
  public:
@@ -66,6 +66,11 @@ class ReplicaAppliedFrontier {
   // concurrent-batch observations. A poisoned frontier fails closed.
   absl::StatusOr<std::vector<std::uint64_t>> TrySnapshot() const;
 
+  // Uses the same coherent-vector checks once, omitting a busy observation
+  // instead of retrying on the heartbeat worker. The returned vector owns its
+  // storage independently from scratch reused by later calls on that thread.
+  absl::StatusOr<std::vector<std::uint64_t>> TrySnapshotOnce() const;
+
   // Samples a UINT64_MAX-saturating total for INFO/ROLE diagnostics without
   // allocations or retries. The total may straddle batch publication or a
   // lifecycle reset; it is never a candidate, resume, or promotion proof.
@@ -91,6 +96,8 @@ class ReplicaAppliedFrontier {
                 "replica Applied publication requires lock-free uint64 atomics");
   static constexpr unsigned kSnapshotAttempts = 64;
 
+  absl::StatusOr<std::vector<std::uint64_t>> TrySnapshot(
+      unsigned attempts) const;
   absl::Status ValidateAdvance(unsigned flow_id,
                                std::uint64_t applied_lsn) const noexcept;
   absl::Status BeginPublication(unsigned publisher_id) noexcept;

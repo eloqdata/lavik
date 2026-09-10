@@ -136,19 +136,38 @@ absl::Status ReplicaAppliedFrontier::InstallNextLsns(
 
 absl::StatusOr<std::vector<std::uint64_t>>
 ReplicaAppliedFrontier::TrySnapshot() const {
+  return TrySnapshot(kSnapshotAttempts);
+}
+
+absl::StatusOr<std::vector<std::uint64_t>>
+ReplicaAppliedFrontier::TrySnapshotOnce() const {
+  return TrySnapshot(1);
+}
+
+absl::StatusOr<std::vector<std::uint64_t>> ReplicaAppliedFrontier::TrySnapshot(
+    unsigned attempts) const {
   if (poisoned()) {
     return absl::FailedPreconditionError("replica Applied frontier is poisoned");
   }
-  std::vector<std::uint64_t> before(publisher_count_);
-  std::vector<std::uint64_t> result(flow_count_);
-  for (unsigned attempt = 0; attempt < kSnapshotAttempts; ++attempt) {
+  // Sampling never suspends or invokes callbacks. Each caller thread can
+  // reuse sequence scratch across frontiers without sharing mutable state
+  // with another worker. Output remains independently owned for async sends.
+  thread_local std::vector<std::uint64_t> before;
+  before.resize(publisher_count_);
+  std::vector<std::uint64_t> result;
+  for (unsigned attempt = 0; attempt < attempts; ++attempt) {
     bool stable = true;
     for (unsigned publisher = 0; publisher < publisher_count_; ++publisher) {
       before[publisher] = publishers_[publisher].published_.load(
           std::memory_order_acquire);
-      stable = stable && (before[publisher] & 1u) == 0;
+      if ((before[publisher] & 1u) != 0) {
+        stable = false;
+        break;
+      }
     }
     if (!stable) continue;
+    // An already-busy publisher needs no output allocation or flow scan.
+    result.resize(flow_count_);
     for (unsigned flow = 0; flow < flow_count_; ++flow) {
       result[flow] =
           flows_[flow].next_lsn_.load(std::memory_order_acquire);

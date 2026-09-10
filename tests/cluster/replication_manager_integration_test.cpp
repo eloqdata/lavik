@@ -48,6 +48,30 @@ bool IsCanonicalReplicationId(std::string_view value) {
   return true;
 }
 
+celer::Task<absl::Status> CheckLightweightQueries(
+    const keylane::ReplicationManager& replication,
+    const std::optional<keylane::ReplicaOfConfig>& expected_upstream,
+    std::string_view phase) {
+  const keylane::ReplicationIdentity identity =
+      co_await replication.ObserveIdentity();
+  const auto upstream = replication.upstream();
+  const keylane::ReplicationStatus status = co_await replication.Observe();
+  if (!IsCanonicalReplicationId(identity.local_node_id_) ||
+      !IsCanonicalReplicationId(identity.boot_id_) ||
+      !IsCanonicalReplicationId(identity.local_history_id_) ||
+      identity.local_node_id_ != status.local_node_id_ ||
+      identity.boot_id_ != status.boot_id_ ||
+      identity.local_history_id_ != status.local_history_id_) {
+    co_return TestFailure(std::string(phase) +
+                          ": lightweight identity disagrees with Observe");
+  }
+  if (upstream != expected_upstream || upstream != status.upstream_) {
+    co_return TestFailure(std::string(phase) +
+                          ": lightweight upstream did not track configuration");
+  }
+  co_return absl::OkStatus();
+}
+
 std::string RespBulk(std::string_view value) {
   return "$" + std::to_string(value.size()) + "\r\n" + std::string(value) +
          "\r\n";
@@ -372,6 +396,11 @@ class ReplicationManagerService final : public celer::Service {
       co_return TestFailure(
           "cluster population did not use the configured node identity");
     }
+    if (const absl::Status query = co_await CheckLightweightQueries(
+            *replication_, std::nullopt, "cluster startup");
+        !query.ok()) {
+      co_return query;
+    }
     absl::Status startup_wait = co_await celer::SleepFor(worker, 50ms);
     if (!startup_wait.ok()) co_return startup_wait;
     if (source_->accepted() != 0) {
@@ -507,6 +536,11 @@ class ReplicationManagerService final : public celer::Service {
         "native source did not receive the replacement rebuild connection");
     if (!peer.ok()) co_return peer;
 
+    if (const absl::Status query = co_await CheckLightweightQueries(
+            *replication_, upstream, "native rebuild connected");
+        !query.ok()) {
+      co_return query;
+    }
     auto replay = co_await replication_->StartClusterRebuildDirective(
         upstream, directive, *manifest);
     if (!replay.ok()) {
@@ -593,6 +627,11 @@ class ReplicationManagerService final : public celer::Service {
       co_return TestFailure(
           "FDS population epoch change did not retire the stale rebuild");
     }
+    if (const absl::Status query = co_await CheckLightweightQueries(
+            *replication_, std::nullopt, "population epoch reset");
+        !query.ok()) {
+      co_return query;
+    }
 
     keylane::RebuildDirective after_reconcile = replacement;
     after_reconcile.identity_.directive_revision_ = 4;
@@ -604,6 +643,11 @@ class ReplicationManagerService final : public celer::Service {
     if (!restarted.ok()) {
       co_return TestFailure(
           "FDS reconciliation permanently closed rebuild admission");
+    }
+    if (const absl::Status query = co_await CheckLightweightQueries(
+            *replication_, upstream, "rebuild after reset");
+        !query.ok()) {
+      co_return query;
     }
 
     desired.rebuild_expected_ = false;
@@ -629,6 +673,11 @@ class ReplicationManagerService final : public celer::Service {
                                        absl::StatusCode::kCancelled) {
       co_return TestFailure(
           "control loss did not cancel and retire an in-progress rebuild");
+    }
+    if (const absl::Status query = co_await CheckLightweightQueries(
+            *replication_, std::nullopt, "control session cancellation");
+        !query.ok()) {
+      co_return query;
     }
 
     keylane::RebuildDirective at_shutdown = after_directive_removal;
@@ -679,6 +728,21 @@ class StandaloneIdentityService final : public celer::Service {
 
   celer::Task<absl::Status> Run(celer::Worker& worker,
                                 celer::ServiceContext) override {
+    result_ = co_await CheckLightweightQueries(*first_, std::nullopt,
+                                               "standalone primary");
+    if (result_.ok()) {
+      result_ = co_await CheckLightweightQueries(
+          *second_, keylane::ReplicaOfConfig{"127.0.0.1", 1},
+          "configured standalone replica");
+    }
+    if (result_.ok()) {
+      result_ = co_await CheckLightweightQueries(*static_cluster_, std::nullopt,
+                                                 "static cluster primary");
+    }
+    if (!result_.ok()) {
+      worker.RequestStop();
+      co_return result_;
+    }
     const keylane::ReplicationStatus first_status = co_await first_->Observe();
     const keylane::ReplicationStatus second_status =
         co_await second_->Observe();
@@ -858,7 +922,7 @@ TEST(ReplicationManagerIntegrationTest,
   keylane::ReplicationManager first(&storage, keylane::ReplicationOptions{},
                                     std::nullopt);
   keylane::ReplicationManager second(&storage, keylane::ReplicationOptions{},
-                                     std::nullopt);
+                                     keylane::ReplicaOfConfig{"127.0.0.1", 1});
   keylane::ReplicationOptions static_options;
   static_options.cluster_enabled_ = true;
   keylane::ReplicationManager static_cluster(

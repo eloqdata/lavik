@@ -799,7 +799,7 @@ struct MetaControlClientService::Impl {
     control::ControlSessionWriter* writer_ = nullptr;
     SessionIdentity session_;
     std::string boot_id_;
-    ReplicationStatus replication_status_;
+    ReplicationIdentity replication_identity_;
     std::shared_ptr<const control::FullDesiredState> desired_;
     std::chrono::milliseconds heartbeat_interval_{};
     std::chrono::milliseconds progress_timeout_{};
@@ -1693,16 +1693,17 @@ struct MetaControlClientService::Impl {
     std::uint64_t heartbeat_sequence = 1;
     while (!state->closing_) {
       if (co_await QuiesceHeartbeatIfRequested(state)) continue;
-      const ReplicationStatus latest = co_await replication_.Observe();
+      const ReplicationIdentity latest =
+          co_await replication_.ObserveIdentity();
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       if (latest.boot_id_ != state->boot_id_ ||
           latest.local_history_id_ !=
-              state->replication_status_.local_history_id_) {
+              state->replication_identity_.local_history_id_) {
         result = absl::FailedPreconditionError(
             "replication boot or history changed during the Meta session");
         break;
       }
-      const ClusterPopulationStatus population =
+      ClusterPopulationStatus population =
           co_await replication_.cluster_population_status();
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       auto readiness = PopulationProof(population, *state->desired_);
@@ -1802,7 +1803,8 @@ struct MetaControlClientService::Impl {
                     .source_assignment_id = source_assignment->bytes(),
                     .source_boot_id = identity.source_boot_id_,
                     .source_history_id = identity.source_history_id_,
-                    .applied_next_lsns = *population.applied_next_lsns_,
+                    .applied_next_lsns =
+                        std::move(*population.applied_next_lsns_),
                 },
         };
       }
@@ -1823,7 +1825,8 @@ struct MetaControlClientService::Impl {
               ? std::optional<control::WireId128>(heartbeat_challenge->nonce)
               : std::nullopt;
       result = co_await state->writer_->Write(
-          control::MessagePriority::kAuthority, control::WireMessage(heartbeat),
+          control::MessagePriority::kAuthority,
+          control::WireMessage(std::move(heartbeat)),
           [state, sent_at_ms, challenge_nonce] {
             if (!challenge_nonce.has_value()) return;
             *sent_at_ms = LeaseClockMillis();
@@ -2035,11 +2038,11 @@ struct MetaControlClientService::Impl {
       if (!tls.ok()) co_return tls;
     }
 
-    const ReplicationStatus replication_status =
-        co_await replication_.Observe();
-    if (!control::IsCanonicalIdentity160(replication_status.boot_id_) ||
+    const ReplicationIdentity replication_identity =
+        co_await replication_.ObserveIdentity();
+    if (!control::IsCanonicalIdentity160(replication_identity.boot_id_) ||
         !control::IsCanonicalIdentity160(
-            replication_status.local_history_id_)) {
+            replication_identity.local_history_id_)) {
       co_return absl::FailedPreconditionError(
           "replication boot/history identity is not ready");
     }
@@ -2051,8 +2054,8 @@ struct MetaControlClientService::Impl {
         control::MessagePriority::kReliable,
         control::WireMessage(control::ClientHello{
             .node_id = options_.node_id_,
-            .boot_id = replication_status.boot_id_,
-            .replication_history_id = replication_status.local_history_id_,
+            .boot_id = replication_identity.boot_id_,
+            .replication_history_id = replication_identity.local_history_id_,
         }));
     if (!hello_sent.ok()) {
       const bool expired = socket_deadline.Disarm();
@@ -2137,7 +2140,7 @@ struct MetaControlClientService::Impl {
         std::min(std::chrono::milliseconds(hello->session_progress_timeout_ms),
                  std::chrono::duration_cast<std::chrono::milliseconds>(
                      kMaximumSessionProgressTimeout));
-    const auto boot = NodeId::Parse(replication_status.boot_id_);
+    const auto boot = NodeId::Parse(replication_identity.boot_id_);
     if (!boot.has_value()) {
       co_return absl::FailedPreconditionError("invalid local boot identity");
     }
@@ -2157,7 +2160,7 @@ struct MetaControlClientService::Impl {
         co_return absl::CancelledError("Meta control client stopped");
       }
       if (absl::Status installed =
-              co_await Install(*initial, replication_status.boot_id_);
+              co_await Install(*initial, replication_identity.boot_id_);
           !installed.ok()) {
         co_return installed;
       }
@@ -2170,8 +2173,8 @@ struct MetaControlClientService::Impl {
       state->stream_ = &stream;
       state->writer_ = &writer;
       state->session_ = session;
-      state->boot_id_ = replication_status.boot_id_;
-      state->replication_status_ = replication_status;
+      state->boot_id_ = replication_identity.boot_id_;
+      state->replication_identity_ = replication_identity;
       state->desired_ =
           std::make_shared<control::FullDesiredState>(std::move(*initial));
       state->heartbeat_interval_ =
@@ -2340,7 +2343,7 @@ struct MetaControlClientService::Impl {
         if (const auto* fence = std::get_if<control::Fence>(&*incoming)) {
           DisableDirectiveDispatch(state);
           if (absl::Status fenced = co_await HandleFence(
-                  *fence, session, replication_status.boot_id_);
+                  *fence, session, replication_identity.boot_id_);
               !fenced.ok()) {
             co_return fenced;
           }
