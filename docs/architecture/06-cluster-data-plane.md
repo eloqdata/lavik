@@ -241,8 +241,8 @@ from the authenticated Hello. The hint and directory are intentionally not persi
 Hello, read progress, and write progress each have a ten-second bound; backoff
 resets only after an accepted session has produced a valid `HeartbeatAck`.
 
-The session protocol is versioned and framed independently of TCP packets. A
-fixed header carries type, length, per-direction sequence, and CRC32C. Frames
+The session uses control protocol v1 with framing independent of TCP packets.
+A fixed header carries type, length, per-direction sequence, and CRC32C. Frames
 are at most 16 KiB. A frame-sized `FullDesiredState` is sent directly as one
 typed frame. Complete objects that exceed one frame use Start/Chunk/End plus
 total length and SHA-256; chunks stream without per-frame application
@@ -274,10 +274,10 @@ structural object can therefore be rejected below its wire cap, and aggregate
 normal projections cannot multiply the global topology into TiB-scale output
 ownership.
 
-Control protocol v2 has no delta format. Initial connection, reconnection, and every
-semantic projection change transfer a complete `FullDesiredState`. The object
-contains global topology plus each group's partition replication epoch and the
-receiving node's policies, immutable population manifests, and current
+Control protocol v1 has no delta format. Initial connection, reconnection, and
+every semantic projection change transfer a complete `FullDesiredState`. The
+object contains global topology plus each group's partition replication epoch
+and the receiving node's policies, immutable population manifests, and current
 directives. The source applied index is a
 diagnostic/order watermark; the projection SHA-256 is the semantic dependency
 for leases and directives. A higher index with identical semantic content is
@@ -290,7 +290,7 @@ topology epoch advances.
 Membership entries carry node and assignment identities only. The committed
 group owner and matching owner assignment are projected independently from
 the active-grant bit: they classify the heartbeat role while `grant_active`
-alone authorizes serving. Protocol v2 has no redundant member-role field that
+alone authorizes serving. Protocol v1 has no redundant member-role field that
 could disagree with them.
 
 Heartbeat carries common health followed by exactly one tagged role payload:

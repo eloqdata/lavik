@@ -24,7 +24,8 @@
 namespace keylane::cluster::control {
 
 inline constexpr std::uint32_t kFrameMagic = 0x4b4c4350;  // "KLCP"
-inline constexpr std::uint16_t kProtocolVersion = 2;
+// Control v1 is unreleased; schema changes replace its layout in place.
+inline constexpr std::uint16_t kProtocolVersion = 1;
 inline constexpr std::size_t kFrameHeaderBytes = 28;
 inline constexpr std::size_t kMaxFrameBytes = 16u * 1024u;
 inline constexpr std::size_t kMaxFramePayloadBytes =

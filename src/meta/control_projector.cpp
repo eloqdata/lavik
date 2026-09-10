@@ -313,7 +313,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
         return Inconsistent(absl::StrCat("group ", source.group_id_,
                                          " names an inactive member"));
       }
-      // Membership has no redundant role byte. Protocol v2 projects owner
+      // Membership has no redundant role byte. Protocol v1 projects owner
       // intent separately below and grant_active independently authorizes
       // serving.
       projected.members.push_back({member.node_id_, member.assignment_id_});

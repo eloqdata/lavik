@@ -143,9 +143,9 @@ and live directives whose explicit
 recipient is that node. The source applied index is an ordering/diagnostic
 watermark; SHA-256 of the canonical semantic projection is the dependency used
 by leases and directives. The publisher sends a full projection on session
-acceptance and whenever that hash changes. Control protocol v2 has no delta format, so
-an index advance with identical content does not create network churn and a
-reconnect never depends on retained incremental history.
+acceptance and whenever that hash changes. Control protocol v1 has no delta
+format, so an index advance with identical content does not create network
+churn and a reconnect never depends on retained incremental history.
 
 The Data-control wire protocol has a fixed versioned header, per-direction
 sequence, payload length, and CRC32C. Frames are bounded to 16 KiB. Larger
@@ -194,7 +194,7 @@ permit follows shared ownership through transfer and live installation, so
 4096 small sessions remain possible while a few abuse-sized projections cannot
 multiply common topology and manifest data into a TiB-scale allocation.
 
-Heartbeat is the periodic Data-to-Meta observation message. Protocol v2 carries
+Heartbeat is the periodic Data-to-Meta observation message. Protocol v1 carries
 common health followed by exactly one tagged role payload: no role information,
 an authority lease request, or replica candidate progress. A session accepts
 only the next business sequence or an exact replay
@@ -371,6 +371,11 @@ Client timeouts therefore mean an uncertain outcome and must be resolved by
 the operation's stable idempotency key.
 
 ## Format compatibility
+
+The Meta/Data control wire uses protocol v1 with a pre-release layout. Both
+peers must use the same layout; earlier pre-release layouts have no
+compatibility or negotiation path. This wire version is independent of the
+durable schemas below.
 
 Commands, records, exports, and snapshots carry exact schema version 2. Its
 pre-release layout includes distinct target and source assignment anchors and

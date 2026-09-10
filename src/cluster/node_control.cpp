@@ -351,7 +351,7 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
       directive.force_) {
     return absl::InvalidArgumentError(
         "directive payload, preconditions, and force are reserved in "
-        "control protocol v2");
+        "control protocol v1");
   }
   if (const absl::Status projection = ValidateProjection(directive.projection_);
       !projection.ok()) {

@@ -153,10 +153,10 @@ TEST(ControlProtocolFrameTest, EncodesNetworkOrderAndChecksCrcAndSequence) {
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   ASSERT_EQ(encoded->size(), control::kFrameHeaderBytes + 3U);
 
-  // Header literals independently pin the v2 network-byte-order layout.
+  // Header literals independently pin the v1 network-byte-order layout.
   const std::array<unsigned char, 24> expected_prefix = {
       0x4b, 0x4c, 0x43, 0x50,                           // KLCP
-      0x00, 0x02,                                       // protocol version
+      0x00, 0x01,                                       // protocol version
       0x00, 0x01,                                       // ClientHello
       0x00, 0x00,                                       // flags
       0x00, 0x00,                                       // reserved

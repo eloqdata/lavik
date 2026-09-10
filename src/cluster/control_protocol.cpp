@@ -27,8 +27,8 @@ constexpr std::size_t kTransferChunkEnvelopeBytes = 16 + 8 + 4;
 constexpr std::size_t kMaxTransferChunkBytes =
     kMaxFramePayloadBytes - kTransferChunkEnvelopeBytes;
 
-// Protocol-v2 heartbeat role tags are exhaustive. Unknown tags fail closed so
-// adding a role requires an explicit versioned codec change on both peers.
+// Protocol-v1 heartbeat role tags are exhaustive. Unknown tags fail closed so
+// adding a role requires an explicit codec update on both peers.
 enum class HeartbeatRoleKind : std::uint8_t {
   kNone = 0,
   kAuthorityLeaseRequest = 1,
