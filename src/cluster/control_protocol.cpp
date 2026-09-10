@@ -27,6 +27,14 @@ constexpr std::size_t kTransferChunkEnvelopeBytes = 16 + 8 + 4;
 constexpr std::size_t kMaxTransferChunkBytes =
     kMaxFramePayloadBytes - kTransferChunkEnvelopeBytes;
 
+// Protocol-v1 heartbeat role tags are exhaustive. Unknown tags fail closed so
+// adding a role requires an explicit codec update on both peers.
+enum class HeartbeatRoleKind : std::uint8_t {
+  kNone = 0,
+  kAuthorityLeaseRequest = 1,
+  kReplicaCandidate = 2,
+};
+
 absl::StatusOr<std::uint64_t> TransferCap(TransferKind kind) {
   switch (kind) {
     case TransferKind::kFullDesiredState:
@@ -590,7 +598,7 @@ absl::StatusOr<FrameHeader> ParseFrameHeader(std::string_view encoded_header) {
     return ProtocolError("unknown frame message type");
   }
   const std::uint16_t flags = ReadBe16(encoded_header, 8);
-  if (flags != 0) return ProtocolError("protocol v1 has no frame flags");
+  if (flags != 0) return ProtocolError("frame flags are reserved");
   if (ReadBe16(encoded_header, 10) != 0) {
     return ProtocolError("non-zero reserved frame bits");
   }
@@ -613,7 +621,7 @@ absl::StatusOr<std::string> FrameEncoder::Encode(MessageType type,
   if (!IsKnownMessageType(static_cast<std::uint16_t>(type))) {
     return ProtocolError("unknown frame message type");
   }
-  if (flags != 0) return ProtocolError("protocol v1 has no frame flags");
+  if (flags != 0) return ProtocolError("frame flags are reserved");
   if (payload.size() > kMaxFramePayloadBytes) {
     return ResourceLimit("encoded frame exceeds 16 KiB");
   }
@@ -654,7 +662,7 @@ absl::StatusOr<Frame> FrameDecoder::Decode(std::string_view encoded) {
     return ProtocolError("unknown frame message type");
   }
   const std::uint16_t flags = ReadBe16(encoded, 8);
-  if (flags != 0) return ProtocolError("protocol v1 has no frame flags");
+  if (flags != 0) return ProtocolError("frame flags are reserved");
   if (ReadBe16(encoded, 10) != 0) {
     return ProtocolError("non-zero reserved frame bits");
   }
@@ -1338,9 +1346,24 @@ absl::StatusOr<std::string> Encode(const Heartbeat& heartbeat) {
       !status.ok()) {
     return status;
   }
-  writer.Bool(heartbeat.candidate.has_value());
-  if (heartbeat.candidate.has_value()) {
-    const CandidateProgress& candidate = *heartbeat.candidate;
+  if (std::holds_alternative<NoRoleInformation>(
+          heartbeat.role_information)) {
+    writer.U8(static_cast<std::uint8_t>(HeartbeatRoleKind::kNone));
+  } else if (const auto* authority =
+                 std::get_if<AuthorityLeaseRequest>(
+                     &heartbeat.role_information)) {
+    writer.U8(static_cast<std::uint8_t>(
+        HeartbeatRoleKind::kAuthorityLeaseRequest));
+    if (absl::Status status =
+            WriteLeaseChallenge(writer, authority->challenge);
+        !status.ok()) {
+      return status;
+    }
+  } else {
+    writer.U8(
+        static_cast<std::uint8_t>(HeartbeatRoleKind::kReplicaCandidate));
+    const CandidateProgress& candidate =
+        std::get<ReplicaCandidate>(heartbeat.role_information).progress;
     if (absl::Status status = writer.String(
             candidate.group_id, kMaxIdentifierBytes, "candidate group id");
         !status.ok()) {
@@ -1349,34 +1372,44 @@ absl::StatusOr<std::string> Encode(const Heartbeat& heartbeat) {
     writer.Fixed(candidate.assignment_id);
     writer.U64(candidate.group_term);
     writer.U64(candidate.manifest_revision);
+    writer.Fixed(candidate.manifest_digest);
     writer.U64(candidate.partition_replication_epoch);
-    if (!IsCanonicalIdentity160(candidate.replication_history_id)) {
-      return ProtocolError("candidate replication history id is not canonical");
+    if (!IsCanonicalIdentity160(candidate.source_node_id) ||
+        !IsCanonicalIdentity160(candidate.source_boot_id) ||
+        !IsCanonicalIdentity160(candidate.source_history_id)) {
+      return ProtocolError("candidate source lineage is not canonical");
     }
-    if (absl::Status status =
-            writer.String(candidate.replication_history_id, kMaxIdentifierBytes,
-                          "candidate replication history id");
+    if (absl::Status status = writer.String(
+            candidate.source_node_id, kMaxIdentifierBytes,
+            "candidate source node id");
         !status.ok()) {
       return status;
     }
-    for (const auto& [value, field] :
-         std::array<std::pair<std::string_view, std::string_view>, 3>{
-             std::pair<std::string_view, std::string_view>{
-                 candidate.applied_flow_vector, "candidate flow vector"},
-             {candidate.backlog_coverage, "candidate backlog coverage"},
-             {candidate.readiness, "candidate readiness"}}) {
-      if (absl::Status status =
-              writer.String(value, kMaxOpaqueFieldBytes, field);
-          !status.ok()) {
-        return status;
+    writer.Fixed(candidate.source_assignment_id);
+    if (absl::Status status = writer.String(
+            candidate.source_boot_id, kMaxIdentifierBytes,
+            "candidate source boot id");
+        !status.ok()) {
+      return status;
+    }
+    if (absl::Status status = writer.String(
+            candidate.source_history_id, kMaxIdentifierBytes,
+            "candidate source history id");
+        !status.ok()) {
+      return status;
+    }
+    if (candidate.applied_next_lsns.empty() ||
+        candidate.applied_next_lsns.size() > kMaxCandidateFlows) {
+      return ResourceLimit(
+          "candidate flow vector count is outside its protocol cap");
+    }
+    writer.U16(
+        static_cast<std::uint16_t>(candidate.applied_next_lsns.size()));
+    for (std::uint64_t next_lsn : candidate.applied_next_lsns) {
+      if (next_lsn == 0) {
+        return ProtocolError("candidate next LSN must be nonzero");
       }
-    }
-  }
-  writer.Bool(heartbeat.challenge.has_value());
-  if (heartbeat.challenge.has_value()) {
-    if (absl::Status status = WriteLeaseChallenge(writer, *heartbeat.challenge);
-        !status.ok()) {
-      return status;
+      writer.U64(next_lsn);
     }
   }
   return std::move(writer).Take();
@@ -1406,9 +1439,16 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
   auto summary = reader.String(kMaxOpaqueFieldBytes);
   if (!summary.ok()) return summary.status();
   heartbeat.health.summary = std::move(*summary);
-  auto has_candidate = reader.Bool();
-  if (!has_candidate.ok()) return has_candidate.status();
-  if (*has_candidate) {
+  auto role_kind = reader.U8();
+  if (!role_kind.ok()) return role_kind.status();
+  if (*role_kind == static_cast<std::uint8_t>(
+                        HeartbeatRoleKind::kAuthorityLeaseRequest)) {
+    auto challenge = ReadLeaseChallenge(reader);
+    if (!challenge.ok()) return challenge.status();
+    heartbeat.role_information =
+        AuthorityLeaseRequest{.challenge = std::move(*challenge)};
+  } else if (*role_kind == static_cast<std::uint8_t>(
+                               HeartbeatRoleKind::kReplicaCandidate)) {
     CandidateProgress candidate;
     auto group_id = reader.String(kMaxIdentifierBytes);
     if (!group_id.ok()) return group_id.status();
@@ -1422,34 +1462,51 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
     auto manifest_revision = reader.U64();
     if (!manifest_revision.ok()) return manifest_revision.status();
     candidate.manifest_revision = *manifest_revision;
+    auto manifest_digest = reader.Fixed<32>();
+    if (!manifest_digest.ok()) return manifest_digest.status();
+    candidate.manifest_digest = *manifest_digest;
     auto partition_replication_epoch = reader.U64();
     if (!partition_replication_epoch.ok()) {
       return partition_replication_epoch.status();
     }
     candidate.partition_replication_epoch = *partition_replication_epoch;
-    auto history_id = reader.String(kMaxIdentifierBytes);
-    if (!history_id.ok()) return history_id.status();
-    if (!IsCanonicalIdentity160(*history_id)) {
-      return ProtocolError("candidate replication history id is not canonical");
+    auto source_node_id = reader.String(kMaxIdentifierBytes);
+    if (!source_node_id.ok()) return source_node_id.status();
+    auto source_assignment_id = reader.Fixed<16>();
+    if (!source_assignment_id.ok()) return source_assignment_id.status();
+    candidate.source_assignment_id = *source_assignment_id;
+    auto source_boot_id = reader.String(kMaxIdentifierBytes);
+    if (!source_boot_id.ok()) return source_boot_id.status();
+    auto source_history_id = reader.String(kMaxIdentifierBytes);
+    if (!source_history_id.ok()) return source_history_id.status();
+    if (!IsCanonicalIdentity160(*source_node_id) ||
+        !IsCanonicalIdentity160(*source_boot_id) ||
+        !IsCanonicalIdentity160(*source_history_id)) {
+      return ProtocolError("candidate source lineage is not canonical");
     }
-    candidate.replication_history_id = std::move(*history_id);
-    auto flow_vector = reader.String(kMaxOpaqueFieldBytes);
-    if (!flow_vector.ok()) return flow_vector.status();
-    candidate.applied_flow_vector = std::move(*flow_vector);
-    auto backlog = reader.String(kMaxOpaqueFieldBytes);
-    if (!backlog.ok()) return backlog.status();
-    candidate.backlog_coverage = std::move(*backlog);
-    auto readiness = reader.String(kMaxOpaqueFieldBytes);
-    if (!readiness.ok()) return readiness.status();
-    candidate.readiness = std::move(*readiness);
-    heartbeat.candidate = std::move(candidate);
-  }
-  auto has_challenge = reader.Bool();
-  if (!has_challenge.ok()) return has_challenge.status();
-  if (*has_challenge) {
-    auto challenge = ReadLeaseChallenge(reader);
-    if (!challenge.ok()) return challenge.status();
-    heartbeat.challenge = std::move(*challenge);
+    candidate.source_node_id = std::move(*source_node_id);
+    candidate.source_boot_id = std::move(*source_boot_id);
+    candidate.source_history_id = std::move(*source_history_id);
+    auto flow_count = reader.U16();
+    if (!flow_count.ok()) return flow_count.status();
+    if (*flow_count == 0 || *flow_count > kMaxCandidateFlows) {
+      return ResourceLimit(
+          "candidate flow vector count is outside its protocol cap");
+    }
+    candidate.applied_next_lsns.reserve(*flow_count);
+    for (std::uint16_t flow = 0; flow < *flow_count; ++flow) {
+      auto next_lsn = reader.U64();
+      if (!next_lsn.ok()) return next_lsn.status();
+      if (*next_lsn == 0) {
+        return ProtocolError("candidate next LSN must be nonzero");
+      }
+      candidate.applied_next_lsns.push_back(*next_lsn);
+    }
+    heartbeat.role_information =
+        ReplicaCandidate{.progress = std::move(candidate)};
+  } else if (*role_kind !=
+             static_cast<std::uint8_t>(HeartbeatRoleKind::kNone)) {
+    return ProtocolError("unknown heartbeat role-information kind");
   }
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return WireMessage{std::move(heartbeat)};

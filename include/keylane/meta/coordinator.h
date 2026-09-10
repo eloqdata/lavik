@@ -205,9 +205,13 @@ class MetaStoresFacts : public MetaCommittedFacts {
   uint64_t CurrentGroupTerm(std::string_view group_id) const override;
   uint64_t CurrentPopulationManifestRevision(
       std::string_view group_id) const override;
+  MetaHash256 CurrentPopulationManifestDigest(
+      std::string_view group_id) const override;
   uint64_t CurrentPartitionReplicationEpoch(
       std::string_view group_id) const override;
   bool AssignmentMatches(std::string_view group_id, std::string_view node_id,
+                         const MetaAssignmentId& assignment_id) const override;
+  bool IsOwnerAssignment(std::string_view group_id, std::string_view node_id,
                          const MetaAssignmentId& assignment_id) const override;
   bool OperationNonTerminal(const MetaOperationId& id) const override;
   bool HistoryBoundToOperation(

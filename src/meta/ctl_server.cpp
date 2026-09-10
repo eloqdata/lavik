@@ -330,70 +330,6 @@ std::int64_t NowUnixMs() {
       .count();
 }
 
-// MetaCommittedFacts over ONE committed MetaStores snapshot, so every
-// freshness check of a single obs command sees one consistent cut instead of
-// tearing across per-call reads. StoresSnapshot() deep-copies the bounded but
-// potentially large aggregate; this low-frequency administrative path accepts
-// that latency, while high-frequency coordinator callers reuse a
-// CommittedView instead.
-class SnapshotCommittedFacts : public MetaCommittedFacts {
- public:
-  explicit SnapshotCommittedFacts(MetaStores stores)
-      : stores_(std::move(stores)) {}
-
-  bool IsActiveNode(std::string_view node_id) const override {
-    return stores_.identity_.IsActiveNode(std::string(node_id));
-  }
-  std::uint64_t CurrentGroupTerm(std::string_view group_id) const override {
-    // 0 when the group does not exist: unknown committed state rejects.
-    return stores_.grant_.CurrentGroupTerm(std::string(group_id)).value_or(0);
-  }
-  std::uint64_t CurrentPopulationManifestRevision(
-      std::string_view group_id) const override {
-    const std::optional<MetaTopologyGroupView> group =
-        stores_.topology_.FindGroup(std::string(group_id));
-    return group.has_value() ? group->record_.population_manifest_revision_ : 0;
-  }
-  std::uint64_t CurrentPartitionReplicationEpoch(
-      std::string_view group_id) const override {
-    const std::optional<MetaTopologyGroupView> group =
-        stores_.topology_.FindGroup(std::string(group_id));
-    return group.has_value() ? group->record_.partition_replication_epoch_ : 0;
-  }
-  bool AssignmentMatches(std::string_view group_id, std::string_view node_id,
-                         const MetaAssignmentId& assignment_id) const override {
-    const std::optional<MetaTopologyGroupView> group =
-        stores_.topology_.FindGroup(std::string(group_id));
-    return group.has_value() &&
-           std::any_of(group->members_.begin(), group->members_.end(),
-                       [&](const MetaGroupMember& member) {
-                         return member.node_id_ == node_id &&
-                                member.assignment_id_ == assignment_id;
-                       });
-  }
-  bool OperationNonTerminal(const MetaOperationId& id) const override {
-    const std::optional<MetaOperationRecord> record =
-        stores_.operation_.FindOperation(id);
-    return record.has_value() && !IsTerminal(record->lifecycle_);
-  }
-  bool HistoryBoundToOperation(
-      const MetaOperationId& id,
-      const MetaReplicationHistoryId& history_id) const override {
-    const std::optional<MetaOperationRecord> record =
-        stores_.operation_.FindOperation(id);
-    if (!record.has_value()) {
-      return false;
-    }
-    return std::any_of(record->replication_history_id_.begin(),
-                       record->replication_history_id_.end(),
-                       [](std::uint8_t byte) { return byte != 0; }) &&
-           record->replication_history_id_ == history_id;
-  }
-
- private:
-  MetaStores stores_;
-};
-
 // Strict decimal u64 ("0" allowed, no signs/padding games, overflow rejects).
 bool ParseU64(const std::string& text, std::uint64_t& out) {
   if (text.empty()) {
@@ -994,7 +930,7 @@ std::string HandleObsIngest(
                              &evidence->assignment_id_);
     evidence->boot_incarnation_ = observation.identity_.boot_incarnation_;
   }
-  const SnapshotCommittedFacts facts(std::move(stores));
+  const MetaStoresFacts facts(stores);
   const absl::Status status =
       obs_store->Ingest(std::move(observation), facts, now);
   if (!status.ok()) {
@@ -1011,7 +947,8 @@ std::string HandleObservations(
   if (!group_id.has_value()) {
     return "OK total=" + std::to_string(obs_store->size());
   }
-  const SnapshotCommittedFacts facts(state_machine->StoresSnapshot());
+  const MetaStores stores = state_machine->StoresSnapshot();
+  const MetaStoresFacts facts(stores);
   const std::vector<MetaCandidateProgressObs> candidates =
       obs_store->CandidateProgressFor(*group_id, facts);
   std::string reply = "OK candidates=" + std::to_string(candidates.size());

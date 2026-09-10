@@ -281,6 +281,12 @@ the group,
 replica incarnation, replica boot, requested history context, and complete
 Applied vector; the response supplies the source group, boot, history, session,
 flow count, and a fresh 160-bit flow capability generated from the OS CSPRNG.
+The target captures that vector once for the control handshake and every
+`KLFLOW` request in the session. It reuses the vector only when source
+group/history and flow layout all match; a missing proof or changed layout
+starts every flow at one, never by copying a matching prefix from an older
+layout. If retained coverage later forces collective FULL, the target installs
+the all-ones vector before destructive reset.
 Every `KLFLOW` presents that bearer capability when claiming its flow id; the
 source compares it in constant time before binding the socket. A guessed
 session number therefore cannot steal a flow from the corresponding control
@@ -324,7 +330,9 @@ the backlog without another complete flattened allocation. The native v1
 transport wraps each fragment in a versioned little-endian header containing
 magic, header and payload lengths, kind, and payload CRC32C. One logical event
 has one flow-local LSN and may span transport fragments and 8 MiB memory blocks,
-but Applied advances and ACKs only after the complete event succeeds. Mutation,
+but target continuation state contains only next-LSNs: fragment position is
+source/backlog/wire state and is never published as applied progress. Applied
+advances and ACKs only after the complete event succeeds. Mutation,
 catalog-mutation, transaction, database-control, and ephemeral events are
 distinct kinds. `kEphemeral` is reserved for runtime-only effects such as
 standalone `PUBLISH`; Function mutations carry the original Redis command in
@@ -576,7 +584,8 @@ notification: the target opens its serving generation only after every flow
 has completed its cursor handoff, the FULL cut vector is installed (or the
 CONTINUE population was already valid), every flow remains connected, and the
 session is not cancelled. For a cluster rebuild, the same cut proof marks the
-Function catalog complete, records every immutable flow cursor, records
+Function catalog complete, records the stable cut, initializes the live Applied
+frontier, records
 successful storage promotion, and publishes the boot-scoped `ReadyToken`.
 Storage promotion first drains each worker's existing detached-index queue, so
 successive successful destructive rebuilds cannot accumulate old index arenas
@@ -631,9 +640,11 @@ participant sets have no dependency and may apply concurrently across owners;
 transactions sharing any flow retain source order even when their IDs select
 different owners.
 
-A separate ACK coroutine drains the completion FIFO in receive order. Only
-successful application publishes the next in-memory resume cursor and permits
-its ACK. If an ACK detects a disconnect, reconnect does not repeat an already
+A separate ACK coroutine drains the completion FIFO in receive order. A
+successful storage apply publishes its next-LSN to a cache-line-isolated,
+lock-free atomic slot before it becomes ACK-eligible. The ordinary per-flow hot
+path performs one release store and no cross-core mutex or atomic RMW. If an
+ACK detects a disconnect, reconnect does not repeat an already
 applied `APPEND`, `INCR`, or similar effect. An ingress, staging, ACK,
 rendezvous, or apply failure cancels the whole session. Cancellation visits
 each rendezvous table on its owner worker, resolves incomplete arrivals, and
@@ -649,8 +660,13 @@ canonical command as the remaining KRC1 arguments while the other flows carry
 only the metadata argument. Payload-flow selection rotates across the
 participants so one bounded backlog does not become a hotspot. The target
 verifies and groups these markers by transaction ID, applies the command once,
-and advances all participant cursors before any flow ACKs. This representation
-is shared by every cross-flow command and does not encode a Redis command kind.
+and publishes all participant cursors inside one publisher sequence before any
+flow ACKs. Snapshots accept a vector only when every publisher sequence is
+unchanged and even, so promotion, reconnect, and heartbeat observation cannot
+see half of a transaction or control barrier. Publisher sequences are
+single-writer release stores rather than lock-prefixed increments; sequence or
+LSN exhaustion poisons the frontier and fails closed. This representation is
+shared by every cross-flow command and does not encode a Redis command kind.
 
 Source-side cross-flow transaction and control publication uses one
 process-global ordering slot so independent worker FIFOs agree on rendezvous
@@ -815,6 +831,12 @@ connection metrics.
   only an exact authorized population handshake from its named target.
 - All native flows continue together or full-sync together. A target publishes
   online only after all partitions and the all-flow cut validate.
+- Applied progress is next-unapplied LSN per logical source flow. Ordinary
+  event publication is lock-free and per-flow; cross-flow logical effects use
+  bounded sequence validation so readers either obtain the whole vector or no
+  snapshot. Heartbeat sampling revalidates the Ready context, token, and
+  frontier identity after that lock-free read; a concurrent withdrawal omits
+  the candidate. Transport fragments never enter candidate progress.
 - A native full sync destructively resets every physical partition in place;
   it has neither a retained old active root nor a separate staging root. The
   target installs the complete all-flow cut vector before acknowledging any
@@ -915,6 +937,7 @@ FLUSH/full-sync interleavings. Two legacy replication tests in
 | Public roles, options, status, and manager boundary | `include/keylane/replication.h` |
 | Single-group rebuild identity, safe-source authorization, logical/local epoch mapping, manifest/reset proof, readiness, restart invalidation, and fail-stop contract | `include/keylane/replication_group.h`, `src/replication/replication_group.cpp` |
 | Callable cluster directive/status/source-authorization adapter, native control/data protocol, duplex online flow, role lifecycle, Redis follower/export, topology, Function full sync, and reconnect behavior | `include/keylane/replication.h`, `src/replication/replication.cpp` |
+| Lock-free live target Applied frontier and coherent cross-flow snapshots | `src/replication/replica_applied_frontier.h`, `src/replication/replica_applied_frontier.cpp` |
 | Canonical command format and deterministic expiration effects | `include/keylane/replication_command.h`, `src/replication/command.cpp` |
 | REPLICAOF/Sentinel commands, serving-generation fencing, blocking-wait invalidation, MSET publication admission/order, Function and PUBLISH capture, transaction/control capture, and trusted replay | `include/keylane/command.h`, `src/redis/command.cpp`, `src/redis/blocking_wait.cpp`, `src/redis/command_table.cpp` |
 | Authenticated listener handoff and module construction | `src/redis/server.cpp` |

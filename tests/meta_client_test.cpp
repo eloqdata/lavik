@@ -292,6 +292,10 @@ TEST(MetaLeaseChallengeRotationTest, HandlesProjectionReplacementAndNoOwner) {
   EXPECT_EQ(rotation.Next(replacement, kLocal), 0u);
   replacement[0].grant_active = false;
   EXPECT_EQ(rotation.Next(replacement, kLocal), std::nullopt);
+  EXPECT_TRUE(
+      MetaLeaseChallengeRotation::IsCommittedOwner(replacement, kLocal));
+  EXPECT_FALSE(MetaLeaseChallengeRotation::IsCommittedOwner(
+      replacement, "2222222222222222222222222222222222222222"));
 }
 
 TEST(MetaHeartbeatProjectionGateTest,
@@ -504,21 +508,8 @@ TEST(MetaDirectiveResultTest, SeparatesRejectionsFromExecutionFailures) {
             control::DirectiveResultStatus::kFailed);
 }
 
-TEST(MetaCandidateProgressTest, FlowVectorEncodingIsCanonicalAndBounded) {
-  constexpr std::array<std::uint64_t, 3> cut{
-      0, 17, std::numeric_limits<std::uint64_t>::max()};
-  auto encoded = EncodeCandidateFlowVector(cut);
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  EXPECT_EQ(*encoded, "3:0,17,18446744073709551615");
-
-  const std::vector<std::uint64_t> oversized(20000,
-                                             std::uint64_t{999999999999999});
-  EXPECT_EQ(EncodeCandidateFlowVector(oversized).status().code(),
-            absl::StatusCode::kResourceExhausted);
-}
-
 TEST(MetaCandidateProgressTest,
-     HeartbeatPreservesWholeCandidateOrOmitsItToFitOneFrame) {
+     HeartbeatPreservesWholeTypedCandidateWhileShorteningSummary) {
   control::WireId128 assignment{};
   assignment.fill(0x31);
   control::Heartbeat heartbeat{
@@ -529,38 +520,39 @@ TEST(MetaCandidateProgressTest,
                  .draining = false,
                  .active_groups = 1,
                  .summary = std::string(control::kMaxFramePayloadBytes, 's')},
-      .candidate =
-          control::CandidateProgress{
-              .group_id = "group-a",
-              .assignment_id = assignment,
-              .group_term = 1,
-              .manifest_revision = 1,
-              .partition_replication_epoch = 2,
-              .replication_history_id =
-                  "1111111111111111111111111111111111111111",
-              .applied_flow_vector = "2:10,20",
-              .backlog_coverage = "complete",
-              .readiness = "ready",
+      .role_information =
+          control::ReplicaCandidate{
+              .progress =
+                  {
+                      .group_id = "group-a",
+                      .assignment_id = assignment,
+                      .group_term = 1,
+                      .manifest_revision = 1,
+                      .manifest_digest = {},
+                      .partition_replication_epoch = 2,
+                      .source_node_id =
+                          "1111111111111111111111111111111111111111",
+                      .source_assignment_id = assignment,
+                      .source_boot_id =
+                          "2222222222222222222222222222222222222222",
+                      .source_history_id =
+                          "3333333333333333333333333333333333333333",
+                      .applied_next_lsns = {10, 20},
+                  },
           },
-      .challenge = std::nullopt,
   };
   ASSERT_TRUE(FitHeartbeatToSingleFrame(heartbeat).ok());
-  ASSERT_TRUE(heartbeat.candidate.has_value());
-  EXPECT_EQ(heartbeat.candidate->assignment_id.front(), 0x31);
-  EXPECT_EQ(heartbeat.candidate->applied_flow_vector, "2:10,20");
+  const auto* candidate =
+      std::get_if<control::ReplicaCandidate>(&heartbeat.role_information);
+  ASSERT_NE(candidate, nullptr);
+  EXPECT_EQ(candidate->progress.assignment_id.front(), 0x31);
+  EXPECT_EQ(candidate->progress.applied_next_lsns,
+            (std::vector<std::uint64_t>{10, 20}));
   auto encoded = control::EncodeMessage(control::WireMessage(heartbeat));
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   EXPECT_LE(encoded->size(), control::kMaxFramePayloadBytes);
   EXPECT_LT(heartbeat.health.summary.size(), control::kMaxFramePayloadBytes);
 
-  heartbeat.health.summary = "healthy";
-  heartbeat.candidate->applied_flow_vector =
-      std::string(control::kMaxFramePayloadBytes, '9');
-  ASSERT_TRUE(FitHeartbeatToSingleFrame(heartbeat).ok());
-  EXPECT_FALSE(heartbeat.candidate.has_value());
-  encoded = control::EncodeMessage(control::WireMessage(heartbeat));
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  EXPECT_LE(encoded->size(), control::kMaxFramePayloadBytes);
 }
 
 TEST(MetaAuthorityIdentityTest, UsesVersionedUnambiguousEncoding) {

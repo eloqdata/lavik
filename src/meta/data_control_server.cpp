@@ -139,53 +139,6 @@ bool IsTerminal(MetaOperationLifecycle lifecycle) {
          lifecycle == MetaOperationLifecycle::kAborted;
 }
 
-class ViewFacts final : public MetaCommittedFacts {
- public:
-  explicit ViewFacts(const MetaCommittedView& view) : view_(view) {}
-
-  bool IsActiveNode(std::string_view node_id) const override {
-    return view_.identity().IsActiveNode(std::string(node_id));
-  }
-  std::uint64_t CurrentGroupTerm(std::string_view group_id) const override {
-    return view_.grant().CurrentGroupTerm(group_id).value_or(0);
-  }
-  std::uint64_t CurrentPopulationManifestRevision(
-      std::string_view group_id) const override {
-    const auto group = view_.topology().FindGroup(std::string(group_id));
-    return group.has_value() ? group->record_.population_manifest_revision_ : 0;
-  }
-  std::uint64_t CurrentPartitionReplicationEpoch(
-      std::string_view group_id) const override {
-    const auto group = view_.topology().FindGroup(std::string(group_id));
-    return group.has_value() ? group->record_.partition_replication_epoch_ : 0;
-  }
-  bool AssignmentMatches(std::string_view group_id, std::string_view node_id,
-                         const MetaAssignmentId& assignment_id) const override {
-    const auto group = view_.topology().FindGroup(std::string(group_id));
-    return group.has_value() &&
-           std::any_of(group->members_.begin(), group->members_.end(),
-                       [&](const MetaGroupMember& member) {
-                         return member.node_id_ == node_id &&
-                                member.assignment_id_ == assignment_id;
-                       });
-  }
-  bool OperationNonTerminal(const MetaOperationId& id) const override {
-    const auto operation = view_.operation().FindOperation(id);
-    return operation.has_value() && !IsTerminal(operation->lifecycle_);
-  }
-  bool HistoryBoundToOperation(
-      const MetaOperationId& id,
-      const MetaReplicationHistoryId& history_id) const override {
-    const auto operation = view_.operation().FindOperation(id);
-    return operation.has_value() &&
-           !IsZero(operation->replication_history_id_) &&
-           operation->replication_history_id_ == history_id;
-  }
-
- private:
-  const MetaCommittedView& view_;
-};
-
 std::int64_t NowUnixMillis() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::system_clock::now().time_since_epoch())
@@ -719,7 +672,7 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
     std::string_view node_id, const MetaBootIncarnation& boot,
     const MetaReplicationHistoryId& session_history, std::uint64_t generation,
     const control::HeartbeatHealth& health,
-    const std::optional<control::CandidateProgress>& candidate,
+    const control::HeartbeatRoleInformation& role_information,
     std::int64_t now_unix_ms) {
   (void)observations.MaybeSweepExpired(now_unix_ms);
   const MetaObservationIdentity identity{std::string(node_id), boot,
@@ -735,58 +688,82 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
     result.detail.append(status.message());
   };
 
-  const absl::Status boot_status =
-      observations.Ingest(MetaObservation{.identity_ = identity,
-                                          .payload_ = MetaNodeBootObs{},
-                                          .received_unix_ms_ = now_unix_ms},
-                          facts, now_unix_ms);
-  if (!boot_status.ok()) record_rejection("boot", boot_status);
-
   std::string health_text = absl::StrCat(
       "storage_ready=", health.storage_ready ? 1 : 0,
       ",population_ready=", health.population_ready ? 1 : 0,
       ",draining=", health.draining ? 1 : 0,
       ",active_groups=", health.active_groups, ",summary=", health.summary);
-  const absl::Status health_status = observations.Ingest(
-      MetaObservation{.identity_ = identity,
-                      .payload_ = MetaNodeHealthObs{std::move(health_text)},
-                      .received_unix_ms_ = now_unix_ms},
-      facts, now_unix_ms);
-  if (!health_status.ok()) record_rejection("health", health_status);
+  MetaNodeHealthObs health_observation{
+      .storage_ready_ = health.storage_ready,
+      .population_ready_ = health.population_ready,
+      .draining_ = health.draining,
+      .active_groups_ = health.active_groups,
+      .health_ = std::move(health_text),
+  };
 
-  if (candidate.has_value()) {
-    auto history = ParseIdentity<20>(candidate->replication_history_id,
-                                     "candidate replication history id");
-    if (!history.ok()) {
-      record_rejection("candidate", history.status());
-    } else if (*history != session_history) {
-      record_rejection("candidate",
-                       absl::FailedPreconditionError(
-                           "replication history does not match ClientHello"));
+  std::optional<MetaCandidateProgressObs> candidate_observation;
+  if (const auto* replica =
+          std::get_if<control::ReplicaCandidate>(&role_information)) {
+    const control::CandidateProgress& candidate = replica->progress;
+    auto source_boot =
+        ParseIdentity<20>(candidate.source_boot_id, "candidate source boot id");
+    auto source_history = ParseIdentity<20>(
+        candidate.source_history_id, "candidate source history id");
+    if (!health.storage_ready || !health.population_ready || health.draining) {
+      record_rejection(
+          "candidate",
+          absl::FailedPreconditionError(
+              "candidate heartbeat is not ready and healthy"));
+    } else if (!source_boot.ok()) {
+      record_rejection("candidate", source_boot.status());
+    } else if (!source_history.ok()) {
+      record_rejection("candidate", source_history.status());
     } else {
+      std::string vector_text = absl::StrCat(candidate.applied_next_lsns.size(),
+                                             ":");
+      for (std::size_t i = 0; i < candidate.applied_next_lsns.size(); ++i) {
+        absl::StrAppend(&vector_text, i == 0 ? "" : ",",
+                        candidate.applied_next_lsns[i]);
+      }
       MetaCandidateProgressObs progress{
           .node_id_ = std::string(node_id),
           .boot_incarnation_ = boot,
-          .group_id_ = candidate->group_id,
-          .assignment_id_ = candidate->assignment_id,
-          .group_term_ = candidate->group_term,
-          .population_manifest_revision_ = candidate->manifest_revision,
+          .session_generation_ = generation,
+          .group_id_ = candidate.group_id,
+          .assignment_id_ = candidate.assignment_id,
+          .group_term_ = candidate.group_term,
+          .population_manifest_revision_ = candidate.manifest_revision,
+          .population_manifest_digest_ = candidate.manifest_digest,
           .partition_replication_epoch_ =
-              candidate->partition_replication_epoch,
-          .replication_history_id_ = *history,
-          .applied_flow_vector_ = candidate->applied_flow_vector,
-          .backlog_coverage_ = candidate->backlog_coverage,
-          .readiness_ = candidate->readiness,
+              candidate.partition_replication_epoch,
+          .replication_history_id_ = session_history,
+          .source_node_id_ = candidate.source_node_id,
+          .source_assignment_id_ = candidate.source_assignment_id,
+          .source_boot_incarnation_ = *source_boot,
+          .source_replication_history_id_ = *source_history,
+          .applied_next_lsns_ = candidate.applied_next_lsns,
+          .applied_flow_vector_ = std::move(vector_text),
+          .backlog_coverage_ = "complete",
+          .readiness_ = "ready",
+          .storage_ready_ = health.storage_ready,
+          .population_ready_ = health.population_ready,
+          .draining_ = health.draining,
       };
-      const absl::Status candidate_status =
-          observations.Ingest(MetaObservation{.identity_ = identity,
-                                              .payload_ = std::move(progress),
-                                              .received_unix_ms_ = now_unix_ms},
-                              facts, now_unix_ms);
-      if (!candidate_status.ok()) {
-        record_rejection("candidate", candidate_status);
-      }
+      candidate_observation = std::move(progress);
     }
+  }
+  MetaObservationStore::HeartbeatReplaceResult replaced =
+      observations.ReplaceHeartbeat(identity, std::move(health_observation),
+                                    std::move(candidate_observation), facts,
+                                    now_unix_ms);
+  if (!replaced.boot_status_.ok()) {
+    record_rejection("boot", replaced.boot_status_);
+  }
+  if (!replaced.health_status_.ok()) {
+    record_rejection("health", replaced.health_status_);
+  }
+  if (!replaced.candidate_status_.ok()) {
+    record_rejection("candidate", replaced.candidate_status_);
   }
   return result;
 }
@@ -2662,11 +2639,11 @@ celer::Task<absl::Status> RunEstablishedSession(
           CommittedViewAtLeast(*state->core_, committed_high_water);
       if (!cached_view.ok()) co_return cached_view.status();
       const MetaCommittedView& latest_view = **cached_view;
-      ViewFacts facts(latest_view);
+      MetaStoresFacts facts(latest_view.stores());
       MetaHeartbeatObservationResult observation = IngestHeartbeatObservations(
           *state->core_->observations_, facts, state->node_id_, boot_id,
           replication_history_id, session_generation, heartbeat->health,
-          heartbeat->candidate, NowUnixMillis());
+          heartbeat->role_information, NowUnixMillis());
       if (observation.status == control::ObservationStatus::kAccepted) {
         state->core_->observations_accepted_.fetch_add(
             1, std::memory_order_relaxed);
@@ -2687,7 +2664,15 @@ celer::Task<absl::Status> RunEstablishedSession(
       control::LeaseDecision lease =
           state->core_->lease_handoff_guard_->Enforce(
               EvaluateLeaseChallenge(
-                  heartbeat->challenge, heartbeat->health,
+                  [&]() -> std::optional<control::LeaseChallenge> {
+                    if (const auto* authority =
+                            std::get_if<control::AuthorityLeaseRequest>(
+                                &heartbeat->role_information)) {
+                      return authority->challenge;
+                    }
+                    return std::nullopt;
+                  }(),
+                  heartbeat->health,
                   MetaLeaseEvaluation{
                       .leader_valid_ = leader_valid,
                       .server_id_ = state->core_->options_.server_id_,
@@ -2731,7 +2716,7 @@ celer::Task<absl::Status> RunEstablishedSession(
           CommittedViewAtLeast(*state->core_, committed_high_water);
       if (!cached_view.ok()) co_return cached_view.status();
       const MetaCommittedView& latest_view = **cached_view;
-      const ViewFacts facts(latest_view);
+      const MetaStoresFacts facts(latest_view.stores());
       const absl::Status ingested = IngestOperationEvidenceObservation(
           *state->core_->observations_, facts, state->node_id_, boot_id,
           session_generation, state->session_id_, *evidence, NowUnixMillis());
@@ -3248,6 +3233,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     CorePtr core, celer::TcpStream stream, celer::Connection* connection,
     detail::PendingHandshakeLimiter::Permit handshake_permit) {
   std::string node_id;
+  std::optional<MetaObservationIdentity> observation_identity;
   bool accepted_session = false;
   bool redirected_session = false;
   // Declared before every session-local transport/subscription object so its
@@ -3258,6 +3244,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     CorePtr core_;
     celer::Connection* connection_;
     std::string* node_id_;
+    std::optional<MetaObservationIdentity>* observation_identity_;
     bool* accepted_;
     detail::PendingHandshakeLimiter::Permit* handshake_permit_;
     ~SessionCompletionGuard() {
@@ -3267,10 +3254,14 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
       if (*accepted_) {
         core_->active_sessions_.fetch_sub(1, std::memory_order_relaxed);
       }
+      if (observation_identity_->has_value()) {
+        core_->observations_->InvalidateCandidateOnDisconnect(
+            **observation_identity_, NowUnixMillis());
+      }
       RemoveSession(*core_, connection_, *node_id_);
     }
-  } completion{core, connection, &node_id, &accepted_session,
-               &handshake_permit};
+  } completion{core, connection, &node_id, &observation_identity,
+               &accepted_session, &handshake_permit};
   SessionIo io(
       *core->worker_, connection, stream, core->options_.max_write_queue_bytes_,
       std::chrono::milliseconds(core->options_.session_progress_timeout_ms_));
@@ -3434,9 +3425,10 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
         "data-node session generation is exhausted"));
   }
   const std::uint64_t session_generation = ++next_generation;
+  observation_identity =
+      MetaObservationIdentity{node_id, *boot_id, session_generation};
   const absl::Status adopted = core->observations_->AdoptSession(
-      MetaObservationIdentity{node_id, *boot_id, session_generation},
-      NowUnixMillis());
+      *observation_identity, NowUnixMillis());
   if (!adopted.ok()) co_return finish(adopted);
 
   std::deque<control::WireMessage> deferred;

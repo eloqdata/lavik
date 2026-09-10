@@ -674,13 +674,13 @@ Task<std::optional<std::string>> ReplicaMovedError(
   if (!keys.ok() || keys->empty()) {
     co_return std::nullopt;
   }
-  const ReplicationStatus replication = co_await g_replication->Observe();
-  if (!replication.upstream_.has_value()) {
+  const std::optional<ReplicaOfConfig> upstream = g_replication->upstream();
+  if (!upstream.has_value()) {
     co_return std::nullopt;
   }
   const std::uint16_t slot = storage::RedisSlot(request.args_[keys->first_]);
-  co_return absl::StrCat("MOVED ", slot, " ", replication.upstream_->host_, ":",
-                         replication.upstream_->port_);
+  co_return absl::StrCat("MOVED ", slot, " ", upstream->host_, ":",
+                         upstream->port_);
 }
 
 // ---- Redis Cluster data-plane gate ----

@@ -536,21 +536,6 @@ control::DirectiveResultStatus ClassifyDirectiveResultStatus(
                  : control::DirectiveResultStatus::kRejected;
 }
 
-absl::StatusOr<std::string> EncodeCandidateFlowVector(
-    std::span<const std::uint64_t> cut_vector) {
-  std::string encoded = absl::StrCat(cut_vector.size(), ":");
-  for (std::size_t i = 0; i < cut_vector.size(); ++i) {
-    const std::string item = absl::StrCat(i == 0 ? "" : ",", cut_vector[i]);
-    if (encoded.size() > control::kMaxOpaqueFieldBytes ||
-        item.size() > control::kMaxOpaqueFieldBytes - encoded.size()) {
-      return absl::ResourceExhaustedError(
-          "candidate flow vector exceeds the protocol field cap");
-    }
-    encoded.append(item);
-  }
-  return encoded;
-}
-
 absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat) {
   const auto fits = [&]() -> absl::StatusOr<bool> {
     auto encoded = control::EncodeMessage(control::WireMessage(heartbeat));
@@ -602,7 +587,12 @@ absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat) {
   if (!summary_fit.ok()) return summary_fit.status();
   if (*summary_fit) return absl::OkStatus();
 
-  heartbeat.candidate.reset();
+  if (!std::holds_alternative<control::ReplicaCandidate>(
+          heartbeat.role_information)) {
+    return absl::ResourceExhaustedError(
+        "heartbeat authority fields exceed the single-frame protocol limit");
+  }
+  heartbeat.role_information = control::NoRoleInformation{};
   heartbeat.health.summary = absl::StrCat(
       "candidate progress omitted: single-frame limit",
       heartbeat.health.summary.empty() ? "" : "; ", heartbeat.health.summary);
@@ -711,6 +701,15 @@ std::vector<MetaControlEndpoint> MetaEndpointDirectory::Candidates() const {
   return result;
 }
 
+bool MetaLeaseChallengeRotation::IsCommittedOwner(
+    std::span<const control::WireDesiredGroup> groups,
+    std::string_view local_node_id) noexcept {
+  return std::ranges::any_of(groups, [&](const auto& group) {
+    return group.owner_node_id.has_value() &&
+           *group.owner_node_id == local_node_id;
+  });
+}
+
 std::optional<std::size_t> MetaLeaseChallengeRotation::Next(
     std::span<const control::WireDesiredGroup> groups,
     std::string_view local_node_id) noexcept {
@@ -800,7 +799,7 @@ struct MetaControlClientService::Impl {
     control::ControlSessionWriter* writer_ = nullptr;
     SessionIdentity session_;
     std::string boot_id_;
-    ReplicationStatus replication_status_;
+    ReplicationIdentity replication_identity_;
     std::shared_ptr<const control::FullDesiredState> desired_;
     std::chrono::milliseconds heartbeat_interval_{};
     std::chrono::milliseconds progress_timeout_{};
@@ -1694,16 +1693,17 @@ struct MetaControlClientService::Impl {
     std::uint64_t heartbeat_sequence = 1;
     while (!state->closing_) {
       if (co_await QuiesceHeartbeatIfRequested(state)) continue;
-      const ReplicationStatus latest = co_await replication_.Observe();
+      const ReplicationIdentity latest =
+          co_await replication_.ObserveIdentity();
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       if (latest.boot_id_ != state->boot_id_ ||
           latest.local_history_id_ !=
-              state->replication_status_.local_history_id_) {
+              state->replication_identity_.local_history_id_) {
         result = absl::FailedPreconditionError(
             "replication boot or history changed during the Meta session");
         break;
       }
-      const ClusterPopulationStatus population =
+      ClusterPopulationStatus population =
           co_await replication_.cluster_population_status();
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       auto readiness = PopulationProof(population, *state->desired_);
@@ -1738,8 +1738,7 @@ struct MetaControlClientService::Impl {
           .session_id = state->session_.session_id_.bytes(),
           .heartbeat_sequence = heartbeat_sequence,
           .health = {},
-          .candidate = std::nullopt,
-          .challenge = std::nullopt,
+          .role_information = control::NoRoleInformation{},
       };
       heartbeat.health.active_groups = static_cast<std::uint32_t>(std::count_if(
           state->desired_->groups.begin(), state->desired_->groups.end(),
@@ -1752,31 +1751,14 @@ struct MetaControlClientService::Impl {
       heartbeat.health.storage_ready = installer_.storage_ready();
       heartbeat.health.population_ready = readiness->has_value();
       heartbeat.health.summary = population.failure_reason_;
-      if (readiness->has_value() && population.ready_token_.has_value()) {
-        const ReadyToken& ready = *population.ready_token_;
-        auto flow_vector = EncodeCandidateFlowVector(ready.cut_vector());
-        if (!flow_vector.ok()) {
-          result = flow_vector.status();
-          break;
-        }
-        heartbeat.candidate = control::CandidateProgress{
-            .group_id = ready.identity().group_id_,
-            .assignment_id = (*readiness)->assignment_id_.bytes(),
-            .group_term = (*readiness)->group_term_,
-            .manifest_revision = (*readiness)->manifest_revision_,
-            .partition_replication_epoch =
-                (*readiness)->partition_replication_epoch_,
-            .replication_history_id = latest.local_history_id_,
-            .applied_flow_vector = std::move(*flow_vector),
-            .backlog_coverage = "complete",
-            .readiness = "ready",
-        };
-      }
-
+      const bool local_is_committed_owner =
+          MetaLeaseChallengeRotation::IsCommittedOwner(
+              state->desired_->groups, options_.node_id_);
       const std::optional<std::size_t> local_group_index =
           state->challenge_rotation_.Next(state->desired_->groups,
                                           options_.node_id_);
       std::uint32_t challenged_grant_duration_ms = 0;
+      std::optional<control::LeaseChallenge> heartbeat_challenge;
       if (local_group_index.has_value()) {
         const control::WireDesiredGroup& local_group =
             state->desired_->groups[*local_group_index];
@@ -1785,13 +1767,46 @@ struct MetaControlClientService::Impl {
           result = nonce.status();
           break;
         }
-        heartbeat.challenge =
+        heartbeat_challenge =
             ChallengeFor(local_group, state->desired_->projection_hash, *nonce);
+        heartbeat.role_information = control::AuthorityLeaseRequest{
+            .challenge = *heartbeat_challenge,
+        };
         challenged_grant_duration_ms = local_group.grant_duration_ms;
         result = state->challenge_tracker_.Begin(
             state->session_.session_id_.bytes(), state->boot_id_,
-            *heartbeat.challenge);
+            *heartbeat_challenge);
         if (!result.ok()) break;
+      } else if (!local_is_committed_owner && readiness->has_value() &&
+                 population.ready_token_.has_value() &&
+                 population.applied_next_lsns_.has_value()) {
+        const ReadyToken& ready = *population.ready_token_;
+        const RebuildIdentity& identity = ready.identity();
+        const auto source_assignment =
+            AssignmentId::Parse(identity.source_assignment_id_);
+        if (!source_assignment.has_value()) {
+          result = absl::FailedPreconditionError(
+              "Ready population source assignment is not canonical");
+          break;
+        }
+        heartbeat.role_information = control::ReplicaCandidate{
+            .progress =
+                {
+                    .group_id = identity.group_id_,
+                    .assignment_id = (*readiness)->assignment_id_.bytes(),
+                    .group_term = (*readiness)->group_term_,
+                    .manifest_revision = (*readiness)->manifest_revision_,
+                    .manifest_digest = (*readiness)->manifest_digest_,
+                    .partition_replication_epoch =
+                        (*readiness)->partition_replication_epoch_,
+                    .source_node_id = identity.source_node_id_,
+                    .source_assignment_id = source_assignment->bytes(),
+                    .source_boot_id = identity.source_boot_id_,
+                    .source_history_id = identity.source_history_id_,
+                    .applied_next_lsns =
+                        std::move(*population.applied_next_lsns_),
+                },
+        };
       }
       result = FitHeartbeatToSingleFrame(heartbeat);
       if (!result.ok()) {
@@ -1800,17 +1815,18 @@ struct MetaControlClientService::Impl {
       }
       state->pending_heartbeat_ = PendingHeartbeat{
           .sequence_ = heartbeat_sequence,
-          .challenge_ = heartbeat.challenge,
+          .challenge_ = heartbeat_challenge,
           .challenged_grant_duration_ms_ = challenged_grant_duration_ms,
       };
       state->heartbeat_ack_observed_ = false;
       auto sent_at_ms = std::make_shared<std::optional<std::int64_t>>();
       const std::optional<control::WireId128> challenge_nonce =
-          heartbeat.challenge.has_value()
-              ? std::optional<control::WireId128>(heartbeat.challenge->nonce)
+          heartbeat_challenge.has_value()
+              ? std::optional<control::WireId128>(heartbeat_challenge->nonce)
               : std::nullopt;
       result = co_await state->writer_->Write(
-          control::MessagePriority::kAuthority, control::WireMessage(heartbeat),
+          control::MessagePriority::kAuthority,
+          control::WireMessage(std::move(heartbeat)),
           [state, sent_at_ms, challenge_nonce] {
             if (!challenge_nonce.has_value()) return;
             *sent_at_ms = LeaseClockMillis();
@@ -2022,11 +2038,11 @@ struct MetaControlClientService::Impl {
       if (!tls.ok()) co_return tls;
     }
 
-    const ReplicationStatus replication_status =
-        co_await replication_.Observe();
-    if (!control::IsCanonicalIdentity160(replication_status.boot_id_) ||
+    const ReplicationIdentity replication_identity =
+        co_await replication_.ObserveIdentity();
+    if (!control::IsCanonicalIdentity160(replication_identity.boot_id_) ||
         !control::IsCanonicalIdentity160(
-            replication_status.local_history_id_)) {
+            replication_identity.local_history_id_)) {
       co_return absl::FailedPreconditionError(
           "replication boot/history identity is not ready");
     }
@@ -2038,8 +2054,8 @@ struct MetaControlClientService::Impl {
         control::MessagePriority::kReliable,
         control::WireMessage(control::ClientHello{
             .node_id = options_.node_id_,
-            .boot_id = replication_status.boot_id_,
-            .replication_history_id = replication_status.local_history_id_,
+            .boot_id = replication_identity.boot_id_,
+            .replication_history_id = replication_identity.local_history_id_,
         }));
     if (!hello_sent.ok()) {
       const bool expired = socket_deadline.Disarm();
@@ -2124,7 +2140,7 @@ struct MetaControlClientService::Impl {
         std::min(std::chrono::milliseconds(hello->session_progress_timeout_ms),
                  std::chrono::duration_cast<std::chrono::milliseconds>(
                      kMaximumSessionProgressTimeout));
-    const auto boot = NodeId::Parse(replication_status.boot_id_);
+    const auto boot = NodeId::Parse(replication_identity.boot_id_);
     if (!boot.has_value()) {
       co_return absl::FailedPreconditionError("invalid local boot identity");
     }
@@ -2144,7 +2160,7 @@ struct MetaControlClientService::Impl {
         co_return absl::CancelledError("Meta control client stopped");
       }
       if (absl::Status installed =
-              co_await Install(*initial, replication_status.boot_id_);
+              co_await Install(*initial, replication_identity.boot_id_);
           !installed.ok()) {
         co_return installed;
       }
@@ -2157,8 +2173,8 @@ struct MetaControlClientService::Impl {
       state->stream_ = &stream;
       state->writer_ = &writer;
       state->session_ = session;
-      state->boot_id_ = replication_status.boot_id_;
-      state->replication_status_ = replication_status;
+      state->boot_id_ = replication_identity.boot_id_;
+      state->replication_identity_ = replication_identity;
       state->desired_ =
           std::make_shared<control::FullDesiredState>(std::move(*initial));
       state->heartbeat_interval_ =
@@ -2327,7 +2343,7 @@ struct MetaControlClientService::Impl {
         if (const auto* fence = std::get_if<control::Fence>(&*incoming)) {
           DisableDirectiveDispatch(state);
           if (absl::Status fenced = co_await HandleFence(
-                  *fence, session, replication_status.boot_id_);
+                  *fence, session, replication_identity.boot_id_);
               !fenced.ok()) {
             co_return fenced;
           }

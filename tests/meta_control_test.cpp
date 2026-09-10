@@ -174,11 +174,10 @@ TEST(MetaControlMapperTest, AcceptsCommittedOwnerlessGroupBeforeActivation) {
   EXPECT_EQ(prepared->control_groups_.front().grant_revision_, 0U);
 }
 
-TEST(MetaControlMapperTest, AcceptsFencedGroupWithHistoricalAuthorityCounters) {
+TEST(MetaControlMapperTest,
+     AcceptsFencedGroupWithOwnerIntentAndHistoricalAuthorityCounters) {
   auto desired = DesiredState();
   auto& group = desired.groups.front();
-  group.owner_node_id.reset();
-  group.owner_assignment_id.reset();
   group.grant_active = false;
   group.grant_duration_ms = 0;
   group.grant_policy_id.clear();

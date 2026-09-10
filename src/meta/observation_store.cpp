@@ -1,7 +1,9 @@
 #include "keylane/meta/observation_store.h"
 
+#include <algorithm>
 #include <cassert>
 #include <deque>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -115,6 +117,9 @@ std::uint64_t ChargedBytes(const MetaObservation& observation) {
           std::get_if<MetaCandidateProgressObs>(&observation.payload_)) {
     return identity_node + bytes(candidate->node_id_) +
            2 * bytes(candidate->group_id_) +
+           bytes(candidate->source_node_id_) +
+           static_cast<std::uint64_t>(candidate->applied_next_lsns_.size()) *
+               sizeof(std::uint64_t) +
            bytes(candidate->applied_flow_vector_) +
            bytes(candidate->backlog_coverage_) +
            bytes(candidate->readiness_) + identity_node;
@@ -284,6 +289,10 @@ struct MetaObservationStore::Impl {
           observation.identity_.boot_incarnation_) {
         return MetaDomainRejectError("candidate-boot-mismatch");
       }
+      if (candidate->session_generation_ !=
+          observation.identity_.session_generation_) {
+        return MetaDomainRejectError("candidate-session-mismatch");
+      }
       const absl::Status anchor =
           CheckPopulationAnchor(candidate->group_id_, candidate->group_term_,
                                 candidate->population_manifest_revision_,
@@ -295,10 +304,48 @@ struct MetaObservationStore::Impl {
                                    candidate->assignment_id_)) {
         return MetaDomainRejectError("assignment-mismatch");
       }
+      // The legacy ctl observation surface may retain an opaque vector for
+      // diagnostics. Only typed heartbeat candidates populate this vector and
+      // source lineage, and only those enter LiveCandidateProgressFor.
+      if (!candidate->applied_next_lsns_.empty()) {
+        if (!candidate->storage_ready_ || !candidate->population_ready_ ||
+            candidate->draining_) {
+          return MetaDomainRejectError("candidate-not-ready");
+        }
+        if (candidate->population_manifest_digest_ !=
+            facts.CurrentPopulationManifestDigest(candidate->group_id_)) {
+          return MetaDomainRejectError("manifest-digest-mismatch");
+        }
+        if (facts.IsOwnerAssignment(candidate->group_id_, candidate->node_id_,
+                                    candidate->assignment_id_)) {
+          return MetaDomainRejectError("candidate-is-committed-owner");
+        }
+        if (!cluster::control::IsCanonicalIdentity160(
+                candidate->source_node_id_)) {
+          return MetaDomainRejectError("bad-candidate-source-node");
+        }
+        const auto is_zero = [](const auto& value) {
+          return std::ranges::all_of(value,
+                                     [](std::uint8_t byte) { return byte == 0; });
+        };
+        if (is_zero(candidate->source_assignment_id_) ||
+            is_zero(candidate->source_boot_incarnation_) ||
+            is_zero(candidate->source_replication_history_id_)) {
+          return MetaDomainRejectError("empty-candidate-source-lineage");
+        }
+        if (candidate->applied_next_lsns_.size() >
+            cluster::control::kMaxCandidateFlows) {
+          return MetaDomainRejectError("bad-candidate-flow-count");
+        }
+        if (std::ranges::any_of(candidate->applied_next_lsns_,
+                                [](std::uint64_t lsn) { return lsn == 0; })) {
+          return MetaDomainRejectError("zero-candidate-next-lsn");
+        }
+      }
       // GroupRecord deliberately carries no history id because replication
-      // history is scoped to a data-plane boot. A bare candidate therefore
-      // has no committed history anchor; operation-specific comparison rules
-      // consume the value as opaque payload.
+      // history is scoped to a data-plane boot. Typed heartbeat candidates
+      // carry an independent source history anchor used by CandidatePlanFor;
+      // these legacy opaque fields remain diagnostic-only for ctl clients.
       if (const absl::Status size =
               CheckFieldSize(candidate->applied_flow_vector_,
                              kMaxObsFieldBytes, "flow");
@@ -496,11 +543,37 @@ absl::Status MetaObservationStore::AdoptSession(
   return absl::OkStatus();
 }
 
+void MetaObservationStore::InvalidateCandidateOnDisconnect(
+    const MetaObservationIdentity& identity, int64_t now_unix_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto session = impl_->sessions_.find(identity.node_id_);
+  if (session == impl_->sessions_.end() ||
+      session->second.generation_ != identity.session_generation_ ||
+      session->second.boot_incarnation_ != identity.boot_incarnation_) {
+    return;
+  }
+  ClearCandidatesForNodeLocked(identity.node_id_, now_unix_ms,
+                               "session-disconnected");
+}
+
 absl::Status MetaObservationStore::Ingest(MetaObservation observation,
                                           const MetaCommittedFacts& facts,
                                           int64_t now_unix_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return IngestLocked(std::move(observation), facts, now_unix_ms);
+}
+
+absl::Status MetaObservationStore::IngestLocked(
+    MetaObservation observation, const MetaCommittedFacts& facts,
+    int64_t now_unix_ms) {
   Impl& impl = *impl_;
+  if (auto* candidate =
+          std::get_if<MetaCandidateProgressObs>(&observation.payload_);
+      candidate != nullptr && candidate->session_generation_ == 0) {
+    // Preserve the administrative/test observation adapter: it predates the
+    // explicit payload copy but still arrives through a trusted identity.
+    candidate->session_generation_ = observation.identity_.session_generation_;
+  }
   const absl::Status valid = impl.Validate(observation, facts);
   if (!valid.ok()) {
     const std::string detail(valid.message());
@@ -652,6 +725,77 @@ absl::Status MetaObservationStore::Ingest(MetaObservation observation,
     impl.AccountReplace(existing->first.node_id_, old_bytes, new_bytes);
   }
   return absl::OkStatus();
+}
+
+void MetaObservationStore::ClearCandidatesForNodeLocked(
+    std::string_view node_id, int64_t now_unix_ms, std::string_view detail) {
+  Impl& impl = *impl_;
+  for (auto group_it = impl.candidates_by_group_.begin();
+       group_it != impl.candidates_by_group_.end();) {
+    auto node_it = group_it->second.find(std::string(node_id));
+    if (node_it != group_it->second.end()) {
+      impl.AccountErase(node_it->second, false);
+      group_it->second.erase(node_it);
+      if (!detail.empty()) {
+        impl.Audit(MetaObsAuditKind::kStalePurged, std::string(node_id),
+                   std::string(detail), now_unix_ms,
+                   limits_.audit_ring_capacity_);
+      }
+    }
+    if (group_it->second.empty()) {
+      group_it = impl.candidates_by_group_.erase(group_it);
+    } else {
+      ++group_it;
+    }
+  }
+}
+
+MetaObservationStore::HeartbeatReplaceResult
+MetaObservationStore::ReplaceHeartbeat(
+    const MetaObservationIdentity& identity, MetaNodeHealthObs health,
+    std::optional<MetaCandidateProgressObs> candidate,
+    const MetaCommittedFacts& facts, int64_t now_unix_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const absl::Status identity_status = impl_->CheckIdentity(identity, facts);
+  if (!identity_status.ok()) {
+    const absl::Status rejected =
+        MetaDomainRejectError(std::string(identity_status.message()));
+    impl_->Audit(MetaObsAuditKind::kRejected, identity.node_id_,
+                 std::string(identity_status.message()), now_unix_ms,
+                 limits_.audit_ring_capacity_);
+    return {.boot_status_ = rejected,
+            .health_status_ = rejected,
+            .candidate_status_ = rejected};
+  }
+
+  HeartbeatReplaceResult result;
+  result.boot_status_ = IngestLocked(
+      MetaObservation{.identity_ = identity, .payload_ = MetaNodeBootObs{}},
+      facts, now_unix_ms);
+  result.health_status_ = IngestLocked(
+      MetaObservation{.identity_ = identity, .payload_ = std::move(health)},
+      facts, now_unix_ms);
+
+  // Candidate is replace-or-clear, never patch-in-place. This also removes a
+  // candidate for another group left behind by an FDS role or membership
+  // transition before attempting to admit the new report.
+  ClearCandidatesForNodeLocked(identity.node_id_, now_unix_ms,
+                               candidate.has_value()
+                                   ? std::string_view{}
+                                   : "heartbeat-role-has-no-candidate");
+  if (candidate.has_value() && result.boot_status_.ok() &&
+      result.health_status_.ok()) {
+    result.candidate_status_ = IngestLocked(
+        MetaObservation{.identity_ = identity,
+                        .payload_ = std::move(*candidate)},
+        facts, now_unix_ms);
+  } else if (candidate.has_value()) {
+    result.candidate_status_ = absl::FailedPreconditionError(
+        "candidate requires accepted heartbeat boot and health");
+  } else {
+    result.candidate_status_ = absl::OkStatus();
+  }
+  return result;
 }
 
 void MetaObservationStore::RevalidateAll(const MetaCommittedFacts& facts,
@@ -846,6 +990,37 @@ MetaObservationStore::CandidateProgressFor(
     if (impl.Validate(observation, facts).ok()) {
       out.push_back(std::get<MetaCandidateProgressObs>(observation.payload_));
     }
+  }
+  return out;
+}
+
+std::vector<MetaCandidateProgressObs>
+MetaObservationStore::LiveCandidateProgressFor(
+    std::string_view group_id, const MetaCommittedFacts& facts,
+    int64_t now_unix_ms) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const Impl& impl = *impl_;
+  std::vector<MetaCandidateProgressObs> out;
+  const auto group_it = impl.candidates_by_group_.find(std::string(group_id));
+  if (group_it == impl.candidates_by_group_.end()) return out;
+  for (const auto& [node_id, observation] : group_it->second) {
+    const std::int64_t age = now_unix_ms - observation.received_unix_ms_;
+    const auto& stored =
+        std::get<MetaCandidateProgressObs>(observation.payload_);
+    if (age > limits_.ttl_ms_ || stored.applied_next_lsns_.empty() ||
+        !stored.storage_ready_ || !stored.population_ready_ ||
+        stored.draining_ || !impl.Validate(observation, facts).ok()) {
+      continue;
+    }
+    MetaCandidateProgressObs candidate =
+        std::get<MetaCandidateProgressObs>(observation.payload_);
+    candidate.received_unix_ms_ = observation.received_unix_ms_;
+    candidate.expires_unix_ms_ =
+        observation.received_unix_ms_ >
+                std::numeric_limits<std::int64_t>::max() - limits_.ttl_ms_
+            ? std::numeric_limits<std::int64_t>::max()
+            : observation.received_unix_ms_ + limits_.ttl_ms_;
+    out.push_back(std::move(candidate));
   }
   return out;
 }

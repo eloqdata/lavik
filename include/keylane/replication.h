@@ -114,6 +114,14 @@ struct RedisSourceStatus {
   bool dataset_valid_ = false;
 };
 
+// Identity used to bind control sessions. The local source history may change
+// within one process boot, so an established session must revalidate it.
+struct ReplicationIdentity {
+  std::string local_node_id_;
+  std::string boot_id_;
+  std::string local_history_id_;
+};
+
 struct ReplicationStatus {
   ReplicationRole role_ = ReplicationRole::kMaster;
   std::optional<ReplicaOfConfig> upstream_;
@@ -157,6 +165,10 @@ struct ClusterPopulationStatus {
   std::string local_boot_id_;
   ReplicationGroupState state_ = ReplicationGroupState::kNotReady;
   std::optional<ReadyToken> ready_token_;
+  // A best-effort coherent snapshot of the live next-unapplied LSN frontier.
+  // It is present only when the Ready population and frontier still agree;
+  // heartbeat construction omits candidate evidence when sampling is busy.
+  std::optional<std::vector<std::uint64_t>> applied_next_lsns_;
   // Nonempty exactly while state_ is kFailedStopped.
   std::string failure_reason_;
 };
@@ -255,6 +267,14 @@ class ReplicationManager {
   // worker while another worker updates the native session registry.
   celer::Task<absl::Status> ApplyDirective(ReplicationDirective directive);
   celer::Task<ReplicationStatus> Observe() const;
+
+  // Copies the current node, boot, and local history identities without
+  // collecting replication progress or downstream session status.
+  celer::Task<ReplicationIdentity> ObserveIdentity() const;
+
+  // Copies the desired upstream under the role-state lock. This endpoint is
+  // not an admission proof; callers must retain their role and mode checks.
+  std::optional<ReplicaOfConfig> upstream() const;
 
   // Starts one already-validated Meta full-rebuild directive and returns the
   // exact attempt's boot-local completion. Admission is not a terminal result:
