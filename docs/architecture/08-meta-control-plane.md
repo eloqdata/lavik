@@ -469,21 +469,25 @@ separates operators, Meta members, and data-node self-reporting; actor fields on
 the wire are never trusted.
 Certificate validity is enforced by TLS, but online issuance, rotation, CRL,
 and OCSP integration are outside this module.
-The one-shot `keylane-meta-ctl` operator client and the higher-level
-`keylane-cluster` client share one Raft-free Admin transport for Unix,
-plaintext TCP, and mTLS TCP. The transport handles partial I/O under one
-absolute deadline; cluster discovery always verifies the numeric Admin IP
-against the certificate IP SAN and never falls back between TLS and plaintext.
+The `keylane-meta-ctl` operator client uses one Raft-free Admin transport for
+Unix, plaintext TCP, and mTLS TCP. Direct commands address the selected member;
+`status` reports its local state. The `cluster-status` command discovers the
+leader and evaluates cluster readiness. The transport handles partial I/O
+under one absolute deadline. Direct commands support a TLS server-name
+override; cluster discovery verifies each numeric Admin IP against the
+certificate IP SAN and never falls back between TLS and plaintext. A Unix
+seed can use configured TLS credentials for subsequent remote leader access.
 
-`keylane-cluster status` normally performs exactly two reads:
+`keylane-meta-ctl cluster-status` normally performs exactly two reads:
 `clusterhead 1` against the supplied seed to learn the current committed Admin
 directory, then `clusterstatus 1` against the indicated leader. Redirect,
 leader-change, busy, and incomplete-catch-up results retry discovery only
-within the original deadline. It never launches `keylane-meta-ctl`, publishes
-a reusable leader-route API, probes followers, or reports their replication
-progress. A stable result therefore states only leader-observed Meta
-availability and committed membership consistency; a quorum-serving leader
-can report the cluster ready while one follower is unreachable.
+within the original deadline. Leader routing stays internal to the operator
+API. The client reads this leader-observed cut without probing followers or
+reporting their replication progress. A stable
+result therefore states only leader-observed Meta availability and committed
+membership consistency; a quorum-serving leader can report the cluster ready
+while one follower is unreachable.
 
 The leader builds `clusterstatus` from a compact state-machine view captured
 under the same mutex as committed apply plus a Data-control runtime snapshot
@@ -534,5 +538,5 @@ transition into or out of disabled mode.
 | Shared Meta/Data frame, object-transfer, and message formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
 | Foreign-thread typed completion ingress and worker wakeup | `celer/include/celer/runtime/foreign_executor.h`, `celer/src/runtime/foreign_executor.cpp`, `celer/include/celer/runtime/cross_core.h`, `celer/src/runtime/worker.cpp` |
-| TLS identity, RBAC, Unix peer credentials, Admin transport, and cluster status | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp`, `app/keylane_cluster.cpp`, `celer/src/net/` |
+| TLS identity, RBAC, Unix peer credentials, Admin transport, and cluster status | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp`, `celer/src/net/` |
 | Recovery, partition, membership, and security gates | `tests/meta_*`, `tests/meta_integration/` |

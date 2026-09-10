@@ -70,7 +70,7 @@ architecture update.
 
 | Claim | Repository source |
 |---|---|
-| The process composes the `keylane` data-plane executable and one main Keylane library around Celer, plus the separate `keylane-meta` service and Raft-free Meta operator clients | `CMakeLists.txt`, `app/keylane.cpp`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp`, `app/keylane_cluster.cpp`, `src/redis/server.cpp`, `include/keylane/meta/`, `src/meta/` |
+| The process composes the `keylane` data-plane executable and one main Keylane library around Celer, plus the separate `keylane-meta` service and Raft-free `keylane-meta-ctl` operator client | `CMakeLists.txt`, `app/keylane.cpp`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp`, `src/redis/server.cpp`, `include/keylane/meta/`, `src/meta/` |
 | Request serving has distinct RESP-version, session, command, scripting, Function-catalog, Pub/Sub, and observability boundaries | `include/keylane/resp.h`, `include/keylane/resp_version.h`, `include/keylane/session.h`, `include/keylane/command.h`, `include/keylane/pubsub.h`, `include/keylane/slowlog.h`, `src/redis/` |
 | The Function catalog is a durable module with one complete-catalog commit boundary | `src/redis/function_catalog.h`, `src/redis/function_catalog.cpp`, `src/storage/engine/system_state.cpp` |
 | Transaction coordination has its own interfaces and implementation lifecycle | `include/keylane/tx/`, `src/tx/` |
@@ -78,5 +78,5 @@ architecture update.
 | Shutdown checkpoints are optional one-shot recovery accelerators published through fixed metadata | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/recovery.cpp` |
 | Replication has manager, boot-scoped single-group coordination, a callable cluster-rebuild adapter behind fail-closed admission, Sentinel-compatible configuration, and storage-log integration boundaries | `include/keylane/replication.h`, `include/keylane/replication_group.h`, `src/config.cpp`, `src/replication/`, `src/storage/engine/replication_log.cpp`, `tests/replication_group_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/rebuild_protocol_integration_test.cpp` |
 | Cluster data plane has topology, authority, node-controller, static-control, Meta-client/session, and Redis gate boundaries | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_command.cpp`, `src/redis/command.cpp`, `src/redis/server.cpp` |
-| Meta control plane separates deterministic committed state, pure node projection, volatile observations, leader-scoped Data publishing, authenticated administration and stable cluster status, and NuRaft integration | `include/keylane/meta/`, `src/meta/`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp`, `app/keylane_cluster.cpp` |
+| Meta control plane separates deterministic committed state, pure node projection, volatile observations, leader-scoped Data publishing, authenticated administration and stable cluster status, and NuRaft integration | `include/keylane/meta/`, `src/meta/`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp` |
 | Celer is a pinned runtime submodule | `.gitmodules`, `CMakeLists.txt`, `celer/include/celer/`, `celer/src/` |

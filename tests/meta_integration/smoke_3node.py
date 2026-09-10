@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """3-node smoke test for the keylane-meta Raft driver.
 
-Usage: smoke_3node.py /path/to/keylane-meta /path/to/keylane-cluster [workdir]
+Usage: smoke_3node.py /path/to/keylane-meta /path/to/keylane-meta-ctl [workdir]
 
 Scenario: bootstrap node1, add node2/node3 through the ctl surface,
 replicate committed writes (real SubmitOperation/CompleteOperation
@@ -66,7 +66,7 @@ def main():
         # producer, so a stable result is exit 2 rather than exit 0.
         follower = next(node for node in nodes if node.id != leader.id)
         cluster_status = subprocess.run(
-            [CLUSTER, "status", "--addr", follower.ctl_endpoint,
+            [CTL, "cluster-status", "--addr", follower.ctl_endpoint,
              "--allow-plaintext-admin", "--json"],
             capture_output=True, text=True, timeout=10)
         if (cluster_status.returncode != 2 or
@@ -94,7 +94,7 @@ def main():
         transition_seed = survivors[0]
         transition_probes = [
             subprocess.Popen(
-                [CLUSTER, "status", "--addr", transition_seed.ctl_endpoint,
+                [CTL, "cluster-status", "--addr", transition_seed.ctl_endpoint,
                  "--allow-plaintext-admin", "--timeout-ms", "1000", "--json"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             for _ in range(8)
@@ -118,7 +118,7 @@ def main():
         # further Meta command is issued before this status read. Reconciliation
         # must follow NuRaft's leader-alive transition on its own after election.
         cluster_status = subprocess.run(
-            [CLUSTER, "status", "--addr", leader.ctl_endpoint,
+            [CTL, "cluster-status", "--addr", leader.ctl_endpoint,
              "--allow-plaintext-admin", "--json"],
             capture_output=True, text=True, timeout=10)
         if (cluster_status.returncode != 2 or
@@ -178,7 +178,7 @@ def main():
                 node.kill9()
         time.sleep(0.8)
         no_quorum = subprocess.run(
-            [CLUSTER, "status", "--addr", leader.ctl_endpoint,
+            [CTL, "cluster-status", "--addr", leader.ctl_endpoint,
              "--allow-plaintext-admin", "--timeout-ms", "1000", "--json"],
             capture_output=True, text=True, timeout=5)
         if (no_quorum.returncode != 3 or
@@ -210,6 +210,6 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(2)
     BINARY = sys.argv[1]
-    CLUSTER = sys.argv[2]
+    CTL = sys.argv[2]
     H.set_tag("smoke")
     sys.exit(main())

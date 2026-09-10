@@ -5,7 +5,7 @@
 Build the separate Meta executable and its operator client with:
 
 ```sh
-cmake --build <build-dir> --target keylane-meta keylane-meta-ctl keylane-cluster
+cmake --build <build-dir> --target keylane-meta keylane-meta-ctl
 ```
 
 A cluster normally has three `keylane-meta` processes. Every process needs:
@@ -48,42 +48,47 @@ member.
 
 ## Send administrative commands
 
-`keylane-meta-ctl` sends one LF-terminated command and prints the one-line
-reply. Run it as an allowed uid when using the local Unix socket:
+Direct `keylane-meta-ctl` commands send one LF-terminated request to the
+selected member and print its one-line reply. `status` reports that member's
+local state. Run the client as an allowed uid when using the local Unix socket:
 
 ```sh
 keylane-meta-ctl \
   --socket /var/lib/keylane/meta-1/meta-admin.sock status
 ```
 
-The client exits 0 for an `OK` reply, 2 for an `ERR` reply, and 1 for local,
-connection, TLS, timeout, or malformed-protocol failures. Its default timeout
+Direct commands exit 0 for an `OK` reply, 2 for an `ERR` reply, and 1 for local,
+connection, TLS, timeout, or malformed-protocol failures. The default timeout
 is five seconds and `--timeout-ms` changes the whole connect/send/receive
 deadline. Query every live member when locating the leader; the leader's reply
 contains `leader=1`, while mutation requests sent to a follower return
 `ERR not-leader`.
 
-For cluster-wide readiness, use `keylane-cluster status`. It queries the seed
-for the current leader and requests one leader-bracketed status cut; it does
-not probe followers or claim their reachability or replication progress:
+For cluster-wide readiness, use `keylane-meta-ctl cluster-status`. It queries
+the seed for the current leader and requests one leader-bracketed status cut;
+it does not probe followers or claim their reachability or replication progress:
 
 ```sh
-keylane-cluster status \
+keylane-meta-ctl cluster-status \
   --socket /var/lib/keylane/meta-1/meta-admin.sock
 
-keylane-cluster status --addr 10.0.0.11:7200 \
+keylane-meta-ctl cluster-status --addr 10.0.0.11:7200 \
   --allow-plaintext-admin --json
 ```
 
+Connection options may also precede `cluster-status`, for example
+`keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock cluster-status`.
 The first human-readable line is `READY`, `NOT READY`, or `RETRYABLE`.
 Corresponding exits are 0, 2, and 3; invalid options, unsafe transport choices,
 TLS/identity failures, incompatible wire data, and corrupt status exit 1 with
-empty stdout. TCP without TLS always requires `--allow-plaintext-admin`.
+empty stdout. `cluster-status` requires `--allow-plaintext-admin` for TCP
+without TLS.
 Supplying `--tls-ca`, `--tls-cert`, and `--tls-key` together enables mTLS for
-the seed and every learned address, with the address verified against the
-server certificate's IP SAN. There is no plaintext/TLS fallback. One absolute
-deadline, five seconds by default, covers discovery, redirects, capture, and
-response I/O.
+every TCP connection, with the address verified against the server
+certificate's IP SAN. These credentials can accompany a Unix seed and secure
+the connection to a discovered remote leader. There is no plaintext/TLS
+fallback. One absolute deadline, five seconds by default, covers discovery,
+redirects, capture, and response I/O.
 
 For plaintext remote administration, configure a listener and connect without
 TLS arguments:
@@ -383,7 +388,8 @@ Remote administration configures its server certificate independently with
 member's Raft certificate when the control listener uses an IP or DNS already
 covered by the certificate and the leaf permits `serverAuth`; otherwise issue
 a dedicated server leaf with a SAN covering `--ctl-addr`. The client can select
-a DNS SAN instead of the numeric control address with `--tls-server-name`.
+a DNS SAN instead of the numeric control address with `--tls-server-name` for
+direct commands.
 
 Every client certificate must carry exactly one canonical operator URI SAN.
 The following development example uses the CA created above to issue
@@ -417,15 +423,15 @@ keylane-meta-ctl --addr 10.0.0.11:7200 \
   --tls-key /etc/keylane/meta/operator-admin.key \
   status
 
-keylane-cluster status --addr 10.0.0.11:7200 \
+keylane-meta-ctl cluster-status --addr 10.0.0.11:7200 \
   --tls-ca /etc/keylane/meta/ca.crt \
   --tls-cert /etc/keylane/meta/operator-admin.crt \
   --tls-key /etc/keylane/meta/operator-admin.key \
   --json
 ```
 
-Unlike the low-level client, cluster discovery has no DNS server-name
-override: every committed Admin route is numeric and must appear as an IP SAN.
+`cluster-status` has no DNS server-name override: every committed Admin route
+is numeric and must appear as an IP SAN.
 
 ## Add and remove peers
 

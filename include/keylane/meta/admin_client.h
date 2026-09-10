@@ -1,9 +1,8 @@
 #pragma once
 
 // Raft-free synchronous transport for Meta's one-line administrative
-// protocol. Operator tools share this boundary so endpoint validation,
-// partial I/O, TLS identity checks, response limits, and absolute deadlines
-// cannot drift between CLIs.
+// protocol. Direct administration and cluster discovery share endpoint
+// validation, partial I/O, TLS identity checks, response limits, and deadlines.
 
 #include <chrono>
 #include <string>
@@ -20,7 +19,7 @@ struct MetaAdminTlsOptions {
   std::string certificate_file_;
   std::string private_key_file_;
   // Empty verifies the numeric endpoint's IP SAN. This override exists only
-  // for the legacy keylane-meta-ctl interface; cluster discovery deliberately
+  // for direct keylane-meta-ctl commands; cluster discovery deliberately
   // leaves it empty so learned addresses cannot change certificate identity.
   std::string server_name_;
 };

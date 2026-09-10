@@ -1,6 +1,6 @@
 #pragma once
 
-// Raft-free wire and operator model for `keylane-cluster status`. The server
+// Raft-free model for `keylane-meta-ctl cluster-status`. The server
 // translates its committed/runtime state into these bounded values; clients
 // strictly decode them and never need NuRaft types or a public leader-route
 // cache.

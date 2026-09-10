@@ -1,4 +1,4 @@
-// One-shot adapter over the shared, Raft-free Meta administrative client.
+// Raft-free Meta CLI for direct administrative commands and cluster readiness.
 
 #include <signal.h>
 
@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "keylane/meta/admin_client.h"
+#include "keylane/meta/cluster_status.h"
+#include "keylane/numeric_endpoint.h"
 #include "keylane/version.h"
 
 namespace {
@@ -29,6 +31,9 @@ struct Options {
   std::string tls_key_;
   std::string tls_server_name_;
   int timeout_ms_ = 5000;
+  bool cluster_status_ = false;
+  bool json_ = false;
+  bool allow_plaintext_admin_ = false;
   std::vector<std::string> command_;
 };
 
@@ -43,13 +48,21 @@ void PrintUsage(const char* program) {
       "  %s --socket PATH [--timeout-ms N] COMMAND [ARG...]\n"
       "  %s --addr IP:PORT [--tls-ca FILE --tls-cert FILE --tls-key FILE]\n"
       "     [--tls-server-name NAME] [--timeout-ms N] COMMAND [ARG...]\n"
+      "  %s cluster-status (--socket PATH | --addr IP:PORT)\n"
+      "     [--tls-ca FILE --tls-cert FILE --tls-key FILE]\n"
+      "     [--allow-plaintext-admin] [--timeout-ms N] [--json]\n"
       "\n"
-      "The command is sent as one LF-terminated Meta control-protocol line.\n"
+      "Direct commands are sent to the specified Meta node as one line.\n"
+      "status reports that node's state; cluster-status discovers the leader\n"
+      "and reports cluster readiness. Options may precede cluster-status.\n"
       "Durability recovery uses: abortop ID, archiveoperations SEQ..., then\n"
       "exportoperations and pruneoperations SEQ....\n"
       "Exit status is 0 for an OK reply, 2 for an ERR reply, and 1 for a\n"
-      "local, connection, TLS, or malformed-protocol failure.\n",
-      program, program);
+      "local, connection, TLS, or malformed-protocol failure.\n"
+      "cluster-status exits 0 for READY, 2 for NOT READY, 3 for RETRYABLE,\n"
+      "and 1 for fatal errors. TCP discovery requires mTLS or explicit\n"
+      "--allow-plaintext-admin; --json applies only to cluster-status.\n",
+      program, program, program);
 }
 
 bool ParseInt(std::string_view text, int min, int max, int* result) {
@@ -85,7 +98,19 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
       ++index;
       break;
     }
-    if (!argument.starts_with("--")) break;
+    if (!argument.starts_with("--")) {
+      if (!options.cluster_status_ && argument == "cluster-status") {
+        options.cluster_status_ = true;
+        continue;
+      }
+      if (options.cluster_status_) {
+        Fail("cluster-status does not take positional arguments");
+      }
+      // Direct command operands belong to the server, even when they look
+      // like CLI options. Only the reserved cluster-status command continues
+      // local option parsing; -- can force a verbatim direct command.
+      break;
+    }
     if (argument == "--help") {
       PrintUsage(argv[0]);
       *early_exit = true;
@@ -95,6 +120,14 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
       std::cout << "keylane-meta-ctl " << keylane::kVersion << '\n';
       *early_exit = true;
       return options;
+    }
+    if (argument == "--json") {
+      options.json_ = true;
+      continue;
+    }
+    if (argument == "--allow-plaintext-admin") {
+      options.allow_plaintext_admin_ = true;
+      continue;
     }
     auto assign = [&](std::string_view name, std::string* output) {
       const std::string prefix = std::string(name) + "=";
@@ -125,7 +158,16 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
   }
 
   for (; index < argc; ++index) options.command_.emplace_back(argv[index]);
-  if (options.command_.empty()) Fail("a Meta command is required");
+  if (options.cluster_status_) {
+    if (!options.command_.empty()) {
+      Fail("cluster-status does not take positional arguments");
+    }
+  } else {
+    if (options.command_.empty()) Fail("a Meta command is required");
+    if (options.json_ || options.allow_plaintext_admin_) {
+      Fail("--json and --allow-plaintext-admin apply only to cluster-status");
+    }
+  }
   if (options.socket_path_.empty() == options.address_.empty()) {
     Fail("exactly one of --socket and --addr is required");
   }
@@ -133,8 +175,29 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
                        !options.tls_key_.empty();
   const bool tls_all = !options.tls_ca_.empty() && !options.tls_cert_.empty() &&
                        !options.tls_key_.empty();
-  if (!options.address_.empty() && tls_any != tls_all) {
+  if ((options.cluster_status_ || !options.address_.empty()) &&
+      tls_any != tls_all) {
     Fail("--tls-ca, --tls-cert, and --tls-key must be given together");
+  }
+  if (options.cluster_status_) {
+    if (!options.tls_server_name_.empty()) {
+      Fail(
+          "cluster-status verifies IP SANs and does not accept "
+          "--tls-server-name");
+    }
+    // With a Unix seed, TLS credentials authorize any discovered remote
+    // leader. Direct Unix commands have no redirect and reject TLS options.
+    if (!options.address_.empty()) {
+      auto endpoint = keylane::ParseNumericEndpoint(options.address_);
+      if (!endpoint.has_value()) {
+        Fail("--addr must be numeric IPv4:port or [IPv6]:port");
+      }
+      options.address_ = keylane::FormatNumericEndpoint(*endpoint);
+      if (!tls_all && !options.allow_plaintext_admin_) {
+        Fail("plaintext TCP admin requires --allow-plaintext-admin");
+      }
+    }
+    return options;
   }
   if (!options.tls_server_name_.empty() && !tls_all) {
     Fail("--tls-server-name requires TLS options");
@@ -169,7 +232,7 @@ bool IsReply(std::string_view reply, std::string_view prefix) {
           reply[prefix.size()] == ' ');
 }
 
-int Run(const Options& options) {
+keylane::meta::MetaAdminTarget AdminTarget(const Options& options) {
   keylane::meta::MetaAdminTarget target;
   if (!options.socket_path_.empty()) {
     target.transport_ = keylane::meta::MetaAdminTarget::Transport::kUnix;
@@ -185,6 +248,44 @@ int Run(const Options& options) {
     target.tls_.private_key_file_ = options.tls_key_;
     target.tls_.server_name_ = options.tls_server_name_;
   }
+  return target;
+}
+
+int RunClusterStatus(const Options& options) {
+  keylane::meta::ClusterStatusOptions status_options;
+  status_options.tls_.ca_file_ = options.tls_ca_;
+  status_options.tls_.certificate_file_ = options.tls_cert_;
+  status_options.tls_.private_key_file_ = options.tls_key_;
+  status_options.allow_plaintext_admin_ = options.allow_plaintext_admin_;
+  status_options.deadline_ = std::chrono::steady_clock::now() +
+                             std::chrono::milliseconds(options.timeout_ms_);
+  keylane::meta::ClusterOperator cluster;
+  auto outcome = cluster.Status(AdminTarget(options), status_options);
+  if (!outcome.ok()) Fail(std::string(outcome.status().message()));
+  auto rendered = options.json_
+                      ? keylane::meta::RenderClusterStatusJson(*outcome)
+                      : keylane::meta::RenderClusterStatusText(*outcome);
+  if (!rendered.ok()) Fail(std::string(rendered.status().message()));
+  // Render completely before writing so fatal paths leave stdout empty.
+  std::string output = std::move(*rendered);
+  if (output.empty() || output.back() != '\n') output.push_back('\n');
+  if (std::fwrite(output.data(), output.size(), 1, stdout) != 1) {
+    Fail("failed to write stdout");
+  }
+  switch (outcome->result_) {
+    case keylane::meta::ClusterStatusResult::kReady:
+      return 0;
+    case keylane::meta::ClusterStatusResult::kNotReady:
+      return 2;
+    case keylane::meta::ClusterStatusResult::kRetryable:
+      return 3;
+  }
+  return 1;
+}
+
+int Run(const Options& options) {
+  if (options.cluster_status_) return RunClusterStatus(options);
+  const auto target = AdminTarget(options);
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(options.timeout_ms_);
   keylane::meta::MetaAdminClient client;

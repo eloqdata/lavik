@@ -28,11 +28,12 @@ cases can trigger GCC compiler failures; they still link against the optimized
 production libraries. Debug builds also omit IPO to keep iteration time
 predictable. LTO is not required for functional correctness.
 
-When `KEYLANE_BUILD_META=ON`, the source build also provides `keylane-meta`,
-`keylane-meta-ctl`, and the Raft-free `keylane-cluster` operator target:
+When `KEYLANE_BUILD_META=ON`, the source build also provides `keylane-meta`
+and the Raft-free `keylane-meta-ctl` operator target for direct administration
+and cluster readiness:
 
 ```bash
-cmake --build <build-dir> --target keylane-meta keylane-meta-ctl keylane-cluster
+cmake --build <build-dir> --target keylane-meta keylane-meta-ctl
 ```
 
 The downloadable release archive below continues to contain only `keylane`;

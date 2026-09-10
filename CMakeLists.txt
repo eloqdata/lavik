@@ -179,8 +179,8 @@ option(KEYLANE_BUILD_META
   "Build the keylane-meta Raft control plane (requires the recursive nuraft submodule)"
   ON)
 if (KEYLANE_BUILD_META)
-  # Shared operator transport deliberately stays below keylane_meta_core so
-  # neither operator binary gains a NuRaft dependency.
+  # Shared operator transport stays below keylane_meta_core so the CLI and
+  # operator library have no NuRaft dependency.
   add_library(keylane_meta_admin STATIC
     src/meta/admin_client.cpp
     src/meta/cluster_status.cpp
@@ -647,8 +647,8 @@ if (KEYLANE_BUILD_META)
     target_compile_options(keylane-meta PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 
-  # The legacy operator client remains a thin argument/output adapter over
-  # the shared transport and therefore does not link keylane_meta_core.
+  # Direct administration and cluster readiness share one Raft-free CLI over
+  # the Admin transport/operator library, without linking keylane_meta_core.
   add_executable(keylane-meta-ctl
     app/keylane_meta_ctl.cpp
   )
@@ -661,19 +661,6 @@ if (KEYLANE_BUILD_META)
   )
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(keylane-meta-ctl PRIVATE -Wall -Wextra -Wpedantic)
-  endif()
-
-  add_executable(keylane-cluster
-    app/keylane_cluster.cpp
-  )
-  target_include_directories(keylane-cluster PRIVATE
-    ${KEYLANE_GENERATED_INCLUDE_DIR}
-  )
-  target_link_libraries(keylane-cluster PRIVATE
-    keylane_meta_admin
-  )
-  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(keylane-cluster PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 
   # Negative guard for the layering rule above: fail at configure time if
@@ -846,7 +833,7 @@ if (BUILD_TESTING)
         COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/smoke_3node.py
                 $<TARGET_FILE:keylane-meta>
-                $<TARGET_FILE:keylane-cluster>
+                $<TARGET_FILE:keylane-meta-ctl>
       )
       set_tests_properties(meta_integration.smoke_3node PROPERTIES
         LABELS meta-integration
@@ -860,7 +847,6 @@ if (BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/ctl_client.py
                 $<TARGET_FILE:keylane-meta>
                 $<TARGET_FILE:keylane-meta-ctl>
-                $<TARGET_FILE:keylane-cluster>
       )
       set_tests_properties(meta_integration.ctl_client PROPERTIES
         LABELS meta-integration
