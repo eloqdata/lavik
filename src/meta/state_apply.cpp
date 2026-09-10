@@ -104,9 +104,16 @@ absl::Status ValidateCommittedDirectiveAnchorImpl(
   }
   const auto group = stores.topology_.FindGroup(directive.group_id_);
   const auto grant = stores.grant_.GroupState(directive.group_id_);
-  if (!group.has_value() || !grant.has_value() || grant->fenced_ ||
-      !grant->grant_.has_value()) {
-    return MetaDomainRejectError("directive group has no active authority");
+  if (!group.has_value() || !grant.has_value()) {
+    return MetaDomainRejectError("directive group does not exist");
+  }
+  const bool promotion_prepare = directive.kind_ == "promotion-prepare";
+  if (promotion_prepare ? (!grant->fenced_ || grant->grant_.has_value())
+                        : (grant->fenced_ || !grant->grant_.has_value())) {
+    return MetaDomainRejectError(
+        promotion_prepare
+            ? "promotion-prepare requires committed authority exclusion"
+            : "directive group has no active authority");
   }
   if (!HasAssignment(*group, directive.target_node_id_,
                      directive.assignment_id_) ||
@@ -115,11 +122,19 @@ absl::Status ValidateCommittedDirectiveAnchorImpl(
                       directive.source_assignment_id_))) {
     return MetaDomainRejectError("directive membership or assignment is stale");
   }
-  if (group->record_.group_term_ != directive.group_term_ ||
-      group->record_.authority_version_ != directive.authority_version_ ||
-      grant->grant_->term_ != directive.group_term_ ||
-      grant->grant_->authority_version_ != directive.authority_version_ ||
-      grant->grant_->grant_revision_ != directive.grant_revision_) {
+  const bool authority_matches =
+      group->record_.group_term_ == directive.group_term_ &&
+      group->record_.authority_version_ == directive.authority_version_ &&
+      (promotion_prepare
+           ? grant->group_term_ == directive.group_term_ &&
+                 grant->last_authority_version_ ==
+                     directive.authority_version_ &&
+                 grant->last_grant_revision_ == directive.grant_revision_
+           : grant->grant_->term_ == directive.group_term_ &&
+                 grant->grant_->authority_version_ ==
+                     directive.authority_version_ &&
+                 grant->grant_->grant_revision_ == directive.grant_revision_);
+  if (!authority_matches) {
     return MetaDomainRejectError("directive authority anchor is stale");
   }
   if (group->record_.population_manifest_revision_ !=

@@ -76,6 +76,7 @@
 #include "keylane/meta/ctl_server.h"
 #include "keylane/meta/data_control_runtime_status.h"
 #include "keylane/meta/data_control_server.h"
+#include "keylane/meta/failover.h"
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/membership_reconciler.h"
 #include "keylane/meta/nuraft_asio_transport.h"
@@ -771,6 +772,7 @@ int main(int argc, char** argv) {
   std::shared_ptr<MetaCoordinator> coordinator =
       std::make_shared<MetaCoordinator>(server, *state_machine, *wal,
                                         *obs_store, coordinator_options);
+  coordinator->AddValidateHook(keylane::meta::ValidateFailoverProposal);
   leadership_relay->Attach(*coordinator);
   auto cluster_create_reconciler =
       std::make_shared<keylane::meta::MetaClusterCreateReconciler>(

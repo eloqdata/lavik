@@ -98,6 +98,20 @@ struct PopulationReadiness {
                          const PopulationReadiness&) = default;
 };
 
+// Wire-independent promotion input admitted only after the enclosing current
+// directive has matched the installed FDS exactly. Keeping the decoded value
+// here lets NodeControl and ReplicationManager share one domain seam without
+// teaching either layer about control-protocol envelopes.
+struct PromotionPrepareInput {
+  std::string parent_history_id_;
+  std::vector<std::uint64_t> required_applied_next_lsns_;
+  std::uint64_t excluded_group_term_ = 0;
+  Sha256Digest old_authority_exclusion_hash_{};
+
+  friend bool operator==(const PromotionPrepareInput&,
+                         const PromotionPrepareInput&) = default;
+};
+
 // Fully normalized execution request. Transport clients resolve the source
 // endpoint and referenced manifest from the same FullDesiredState that
 // supplied `projection_`; the action adapter therefore never looks through a
@@ -108,6 +122,7 @@ struct NodeDirective {
     kAuthorizeSource,
     kRevokeSources,
     kInitializeEmptyPopulation,
+    kPromotionPrepare,
   };
 
   ProjectionBasis projection_;
@@ -130,12 +145,14 @@ struct NodeDirective {
   Sha256Digest manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
   std::vector<NodeManifestEntry> manifest_entries_;
-  // V1 uses payload only to bind empty-population initialization to the
-  // authenticated target history id; preconditions remain reserved.
+  std::optional<PromotionPrepareInput> promotion_prepare_;
+  // Empty-population initialization retains its authenticated target history
+  // in payload_. Promotion-prepare is decoded into promotion_prepare_ and its
+  // raw opaque fields are cleared; other V1 kinds require both strings empty.
   std::string payload_;
   std::string preconditions_;
-  // Active V1 classification: population directives set this. It drives
-  // non-serving-target admission and cross-operation mutation exclusion.
+  // Population directives set this to drive non-serving-target admission and
+  // cross-operation mutation exclusion.
   bool storage_mutating_ = false;
   // Reserved in V1 and rejected when true before entering NodeControlActions.
   bool force_ = false;
@@ -150,13 +167,22 @@ struct NodeDirective {
 class NodeDirectiveCompletion {
  public:
   using Poll = std::function<std::optional<absl::Status>()>;
+  using TerminalResult = absl::StatusOr<std::string>;
+  using ResultPoll = std::function<std::optional<TerminalResult>()>;
 
   NodeDirectiveCompletion() = default;
   // A directly constructed completion represents work that crossed the
   // NodeControl admission boundary. Tests and native adapters use this form
   // for deferred execution; validation failures must use Rejected().
   explicit NodeDirectiveCompletion(Poll poll)
-      : poll_(std::move(poll)), started_(true) {}
+      : result_poll_([poll = std::move(poll)]() mutable
+                         -> std::optional<TerminalResult> {
+          std::optional<absl::Status> status = poll();
+          if (!status.has_value()) return std::nullopt;
+          if (!status->ok()) return TerminalResult(*status);
+          return TerminalResult(std::string{});
+        }),
+        started_(true) {}
 
   // Constructs a terminal controller/admission rejection. `result` must be a
   // failure; an accidental success is converted to an internal error.
@@ -164,17 +190,24 @@ class NodeDirectiveCompletion {
   // Constructs work that started and reached a terminal result before its
   // completion handle was returned.
   static NodeDirectiveCompletion StartedTerminal(absl::Status result);
+  // Constructs a started terminal result while preserving opaque canonical
+  // success bytes for DirectiveResult and OperationEvidence publication.
+  static NodeDirectiveCompletion StartedTerminalResult(TerminalResult result);
+  // Adapts a native asynchronous action that publishes typed success bytes.
+  static NodeDirectiveCompletion FromResultPoll(ResultPoll poll);
 
-  bool valid() const noexcept { return static_cast<bool>(poll_); }
+  bool valid() const noexcept { return static_cast<bool>(result_poll_); }
   bool started() const noexcept { return started_; }
   std::optional<absl::Status> result() const;
+  std::optional<TerminalResult> terminal_result() const;
   celer::Task<absl::Status> Await() const;
 
  private:
-  NodeDirectiveCompletion(Poll poll, bool started)
-      : poll_(std::move(poll)), started_(started) {}
+  struct ResultPollTag {};
+  NodeDirectiveCompletion(ResultPoll poll, bool started, ResultPollTag)
+      : result_poll_(std::move(poll)), started_(started) {}
 
-  Poll poll_;
+  ResultPoll result_poll_;
   bool started_ = false;
 };
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -28,6 +29,7 @@ namespace keylane {
 
 namespace detail {
 class ClusterRebuildCompletionState;
+class ClusterPromotionPrepareCompletionState;
 }  // namespace detail
 
 struct ReplicaOfConfig {
@@ -173,6 +175,36 @@ struct ClusterPopulationStatus {
   std::string failure_reason_;
 };
 
+// One exact Meta promotion-prepare request after the control envelope and its
+// versioned opaque fields have been validated. RebuildIdentity is reused for
+// the candidate, source, manifest, operation, directive, and attempt anchors;
+// the additional fields bind the committed authority-exclusion proof and the
+// live parent frontier that prepare must freeze.
+struct ClusterPromotionPrepareDirective {
+  RebuildIdentity identity_;
+  std::string parent_history_id_;
+  std::vector<std::uint64_t> required_applied_next_lsns_;
+  std::uint64_t excluded_group_term_ = 0;
+  std::array<std::uint8_t, 32> old_authority_exclusion_hash_{};
+
+  bool operator==(const ClusterPromotionPrepareDirective&) const = default;
+};
+
+// Boot-local proof returned after the shared promotion kernel has made the
+// parent frontier durable, committed PromotionBase, retired the parent
+// history, and created the child publisher. It grants no serving authority.
+struct ClusterPromotionPrepared {
+  std::string parent_history_id_;
+  std::vector<std::uint64_t> frozen_applied_next_lsns_;
+  std::uint64_t population_generation_ = 0;
+  std::uint64_t population_digest_ = 0;
+  std::uint64_t catalog_generation_ = 0;
+  std::uint64_t catalog_dump_crc64_ = 0;
+  std::string child_history_id_;
+
+  bool operator==(const ClusterPromotionPrepared&) const = default;
+};
+
 // FDS-owned subset of population identity. Assignment and immutable manifest
 // plus the Meta partition-replication epoch decide whether a completed local
 // population still belongs to the group; a term additionally scopes an
@@ -218,6 +250,28 @@ class ClusterRebuildCompletion {
 
   friend class ReplicationManager;
   std::shared_ptr<detail::ClusterRebuildCompletionState> state_;
+};
+
+// Pollable completion for one exact promotion-prepare attempt. Exact replay
+// shares this state, so a lost DirectiveResult cannot repeat durability or
+// history-creation side effects.
+class ClusterPromotionPrepareCompletion {
+ public:
+  using Result = absl::StatusOr<ClusterPromotionPrepared>;
+
+  ClusterPromotionPrepareCompletion() = default;
+
+  celer::Task<Result> Await() const;
+  std::optional<Result> result() const;
+  bool valid() const noexcept { return state_ != nullptr; }
+
+ private:
+  explicit ClusterPromotionPrepareCompletion(
+      std::shared_ptr<detail::ClusterPromotionPrepareCompletionState> state)
+      : state_(std::move(state)) {}
+
+  friend class ReplicationManager;
+  std::shared_ptr<detail::ClusterPromotionPrepareCompletionState> state_;
 };
 
 // A source-history-local cut across Keylane's worker replication logs. Native
@@ -309,6 +363,14 @@ class ReplicationManager {
   // uninterrupted decision; cross-worker callers must explicitly submit it.
   std::optional<ClusterRebuildCompletion> FindCompletedClusterPopulation(
       const RebuildDirective& directive) const;
+
+  // Starts the prepare half of a Meta-authorized promotion. Success preserves
+  // LOADING, write fencing, and disabled expiration authority; #41 activates
+  // only after a later FDS plus current-session lease. Exact replay returns
+  // the original completion and evidence without repeating local side effects.
+  celer::Task<absl::StatusOr<ClusterPromotionPrepareCompletion>>
+  StartClusterPromotionPrepareDirective(
+      ClusterPromotionPrepareDirective directive);
 
   // Convenience wrapper that starts and awaits one full rebuild. Production
   // NodeControl uses StartClusterRebuildDirective so wire admission and later

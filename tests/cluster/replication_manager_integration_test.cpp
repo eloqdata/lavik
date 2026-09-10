@@ -1123,6 +1123,23 @@ class StandaloneIdentityService final : public celer::Service {
       worker.RequestStop();
       co_return result_;
     }
+    keylane::ClusterPromotionPrepareDirective promotion{
+        .identity_ = TargetDirective(static_population, *manifest).identity_,
+        .parent_history_id_ = std::string(40, 'a'),
+        .required_applied_next_lsns_ = {1},
+        .excluded_group_term_ = 1,
+    };
+    promotion.old_authority_exclusion_hash_.fill(1);
+    auto promotion_started =
+        co_await static_cluster_->StartClusterPromotionPrepareDirective(
+            std::move(promotion));
+    if (promotion_started.status().code() !=
+        absl::StatusCode::kFailedPrecondition) {
+      result_ = TestFailure(
+          "static cluster manager accepted a Meta promotion prepare");
+      worker.RequestStop();
+      co_return result_;
+    }
     result_ =
         co_await static_cluster_->ReconcileClusterPopulation(std::nullopt);
     if (result_.code() != absl::StatusCode::kFailedPrecondition) {

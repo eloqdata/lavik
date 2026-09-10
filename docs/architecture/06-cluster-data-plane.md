@@ -463,13 +463,17 @@ grant. A same-anchor heartbeat can extend only a lease that never expired, so
 pre-expiry admissions cannot be revived by a delayed timer.
 
 The encoded directive schema retains bounded `payload`, `preconditions`, and
-`force` fields. V1 appends `initialize-empty-population` after the existing
-directive numbers and uses its payload for exactly one canonical target
-replication-history id. That kind has no source node, source authorization, or
-replication connection; the zero-valued wire source fields are sentinels that
-normalize to an empty domain source. Other v1 kinds still require an empty
-payload, and all kinds require empty preconditions and `force=false`.
-Meta and NodeControl repeat the kind-specific checks before the action seam.
+`force` fields. V1 appends `initialize-empty-population` as directive value 4
+and `promotion-prepare` as value 5, preserving the earlier wire values.
+Initialization uses its payload for exactly one canonical target
+replication-history id and has no source node, source authorization, or
+replication connection; zero-valued wire source fields normalize to an empty
+domain source. Promotion prepare instead owns versioned typed payload and
+precondition codecs that bind parent history, required per-flow frontier,
+excluded group term, and old-authority-exclusion hash. Other v1 kinds require
+both strings empty, and every kind requires `force=false`. Meta and NodeControl
+repeat these checks before the action seam, so the native adapter never treats
+an unknown predicate or forced operation as satisfied.
 
 Initialization reuses the ordinary directive, FDS, operation receipt, and
 population-proof lifecycles. NodeControl first closes readiness and serving,
@@ -514,6 +518,17 @@ zero: validation and exact-result lookup do not suspend or acquire a global
 state mutex. Other workers request population observations through the
 replication owner's asynchronous API, while data-flow progress remains
 worker-local and independently sampled.
+
+`promotion-prepare` is target-executed and storage-mutating like rebuild, but
+is admitted only from an ownerless, grantless FDS whose candidate population
+is already Ready. Its terminal success bytes are a versioned
+`PromotionPreparedEvidence` containing the frozen parent frontier,
+population/catalog durability tokens, and child history. The same bytes are
+sent in completed operation evidence and the terminal result; Meta commits the
+result receipt before the Failover operation can enter `promotion-prepared`.
+The boot-local completion prevents result replay from repeating durability or
+history creation. Prepare never opens writes, expiration, or source export,
+and protocol v1 has no `activate-promotion` directive.
 
 A completed population is content-scoped by group, membership assignment,
 immutable manifest, and partition replication epoch. `BeginGroupTerm` fences

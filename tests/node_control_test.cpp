@@ -416,6 +416,82 @@ struct DynamicControl {
   NodeControlInstaller installer;
 };
 
+TEST(NodeDirectiveCompletionTest, PreservesOpaqueSuccessfulResultBytes) {
+  NodeDirectiveCompletion completion =
+      NodeDirectiveCompletion::StartedTerminalResult(std::string("prepared"));
+  ASSERT_TRUE(completion.started());
+  auto terminal = completion.terminal_result();
+  ASSERT_TRUE(terminal.has_value());
+  ASSERT_TRUE(terminal->ok()) << terminal->status();
+  EXPECT_EQ(**terminal, "prepared");
+  ASSERT_TRUE(completion.result().has_value());
+  EXPECT_TRUE(completion.result()->ok());
+}
+
+TEST(NodeControlDirectiveTest,
+     PromotionPrepareRunsOnReadyCandidateWhileOwnerlessAndStaysFenced) {
+  DynamicControl control;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+
+  PreparedFullState prepared{
+      .serving_state_ = MakeOwnerlessState(),
+      .object_hash_ = Digest(3),
+      .control_groups_ =
+          {{.group_id_ = "group-a",
+            .group_term_ = 2,
+            .authority_version_ = 1,
+            .grant_revision_ = 10,
+            .config_epoch_ = 2,
+            .manifest_revision_ = 1,
+            .manifest_digest_ = Digest(4),
+            .partition_replication_epoch_ = kPartitionReplicationEpoch,
+            .members_ = {{.node_id_ = *NodeId::Parse(kNodeA),
+                          .assignment_id_ = Assignment(1)},
+                         {.node_id_ = *NodeId::Parse(kNodeB),
+                          .assignment_id_ = Assignment(2)}}}},
+  };
+  ASSERT_TRUE(
+      control.installer.InstallFullState(std::move(prepared), Basis(10, 2)).ok());
+
+  NodeDirective directive{
+      .projection_ = Basis(10, 2),
+      .anchor_ = {.group_id_ = "group-a",
+                  .assignment_id_ = Assignment(2),
+                  .group_term_ = 2,
+                  .authority_version_ = 1,
+                  .grant_revision_ = 10},
+      .operation_id_ = ShortId<OperationId>(1),
+      .directive_id_ = ShortId<DirectiveId>(2),
+      .attempt_id_ = ShortId<AttemptId>(3),
+      .directive_revision_ = 11,
+      .kind_ = NodeDirective::Kind::kPromotionPrepare,
+      .target_node_id_ = *NodeId::Parse(kNodeB),
+      .target_boot_id_ = *NodeId::Parse(kBoot),
+      .source_node_id_ = *NodeId::Parse(kNodeA),
+      .source_assignment_id_ = Assignment(1),
+      .source_boot_id_ = *NodeId::Parse(std::string(40, 'd')),
+      .source_replication_history_id_ =
+          *NodeId::Parse(std::string(40, 'e')),
+      .flow_count_ = 1,
+      .manifest_revision_ = 1,
+      .manifest_digest_ = Digest(4),
+      .partition_replication_epoch_ = kPartitionReplicationEpoch,
+      .promotion_prepare_ =
+          PromotionPrepareInput{
+              .parent_history_id_ = std::string(40, 'e'),
+              .required_applied_next_lsns_ = {17},
+              .excluded_group_term_ = 2,
+              .old_authority_exclusion_hash_ = Digest(9),
+          },
+      .storage_mutating_ = true,
+  };
+  NodeDirectiveCompletion completion =
+      RunTaskSync(control.installer.StartDirective(directive));
+  ASSERT_TRUE(completion.started());
+  EXPECT_EQ(control.actions.directives_, std::vector{directive});
+  EXPECT_EQ(control.cache.Current()->FindGroup("group-a"), nullptr);
+}
+
 class FenceDrainService final : public celer::Service {
  public:
   explicit FenceDrainService(celer::Server* server) : server_(server) {}

@@ -601,6 +601,7 @@ if (KEYLANE_BUILD_META)
     src/meta/data_control_server.cpp
     src/meta/data_control_runtime_status.cpp
     src/meta/encoding.cpp
+    src/meta/failover.cpp
     src/meta/grant_store.cpp
     src/meta/identity_verifier.cpp
     src/meta/identity_store.cpp
@@ -807,6 +808,7 @@ if (BUILD_TESTING)
       tests/meta_candidate_plan_test.cpp
       tests/meta_control_projector_test.cpp
       tests/meta_data_control_server_test.cpp
+      tests/meta_failover_test.cpp
       tests/meta_journal_test.cpp
       tests/meta_model_test.cpp
       tests/meta_observation_test.cpp
