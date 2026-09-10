@@ -163,9 +163,17 @@ RespClient Connect(std::uint16_t port) {
     address.sin_port = htons(port);
     if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
                   sizeof(address)) == 0) {
-      return RespClient(fd);
+      try {
+        RespClient client(fd);
+        if (client.Command({"PING"}) == "+PONG") return client;
+      } catch (const std::exception&) {
+        // The listener is created before storage recovery finishes. A TCP
+        // handshake alone is not readiness: initialization may reset that
+        // connection, so reconnect until the command path answers too.
+      }
+    } else {
+      ::close(fd);
     }
-    ::close(fd);
     std::this_thread::sleep_for(10ms);
   }
   Fail("timed out connecting to Keylane");
