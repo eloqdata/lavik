@@ -210,15 +210,13 @@ MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {
     group.topology_ = std::move(topology);
     if (grant.has_value()) group.grant_ = std::move(*grant);
     const auto& record = group.topology_.record_;
-    group.manifest_present_ =
-        record.population_manifest_revision_ != 0 &&
-        stores_.population_manifest_.Contains(
-            record.population_manifest_digest_);
+    group.manifest_present_ = record.population_manifest_revision_ != 0 &&
+                              stores_.population_manifest_.Contains(
+                                  record.population_manifest_digest_);
     if (group.grant_.grant_.has_value()) {
       const MetaGrantSpec& spec = group.grant_.grant_->spec_;
-      group.policy_active_ =
-          stores_.policy_.IsVersionActive(spec.policy_id_,
-                                          spec.policy_version_);
+      group.policy_active_ = stores_.policy_.IsVersionActive(
+          spec.policy_id_, spec.policy_version_);
     }
     view.groups_.push_back(std::move(group));
   }

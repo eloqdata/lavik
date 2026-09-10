@@ -175,9 +175,10 @@ int Run(const Options& options) {
     target.transport_ = keylane::meta::MetaAdminTarget::Transport::kUnix;
     target.endpoint_ = options.socket_path_;
   } else {
-    target.transport_ = options.tls_ca_.empty()
-                            ? keylane::meta::MetaAdminTarget::Transport::kTcpPlaintext
-                            : keylane::meta::MetaAdminTarget::Transport::kTcpMtls;
+    target.transport_ =
+        options.tls_ca_.empty()
+            ? keylane::meta::MetaAdminTarget::Transport::kTcpPlaintext
+            : keylane::meta::MetaAdminTarget::Transport::kTcpMtls;
     target.endpoint_ = options.address_;
     target.tls_.ca_file_ = options.tls_ca_;
     target.tls_.certificate_file_ = options.tls_cert_;
@@ -187,7 +188,8 @@ int Run(const Options& options) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(options.timeout_ms_);
   keylane::meta::MetaAdminClient client;
-  auto reply = client.RoundTrip(target, BuildCommand(options.command_), deadline);
+  auto reply =
+      client.RoundTrip(target, BuildCommand(options.command_), deadline);
   if (!reply.ok()) Fail(std::string(reply.status().message()));
   std::cout << *reply << '\n';
   if (IsReply(*reply, "OK")) return 0;

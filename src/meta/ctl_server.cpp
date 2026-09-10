@@ -43,8 +43,8 @@
 
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/cluster/control_transport.h"
-#include "keylane/meta/commands.h"
 #include "keylane/meta/cluster_status.h"
+#include "keylane/meta/commands.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/data_control_runtime_status.h"
 #include "keylane/meta/hash.h"
@@ -94,14 +94,88 @@ bool detail::IsStableClusterStatusBracket(
     const MetaClusterStatusBracket& after) {
   return before.is_leader_ && before.leader_alive_ &&
          before.leadership_.leader_authority_eligible_ && after.is_leader_ &&
-         after.leader_alive_ &&
-         after.leadership_.leader_authority_eligible_ &&
+         after.leader_alive_ && after.leadership_.leader_authority_eligible_ &&
          after.term_ == before.term_ &&
          after.config_index_ == before.config_index_ &&
          after.config_server_ids_ == before.config_server_ids_ &&
          after.active_meta_members_ == before.active_meta_members_ &&
          after.leadership_.leadership_generation_ ==
              before.leadership_.leadership_generation_;
+}
+
+void detail::ApplyClusterRuntimeObservation(
+    ClusterDataNodeWireV1& node, const MetaDataControlRuntimeNode& runtime_node,
+    const MetaCommittedStatusView& view, const ClusterCaptureWireV1& capture,
+    std::int64_t now_unix_ms, std::uint32_t observation_ttl_ms) {
+  node.lease_status_ = ClusterLeaseStatus::kUnknown;
+  node.health_fresh_ = runtime_node.health_.has_value() &&
+                       runtime_node.health_received_unix_ms_ <= now_unix_ms &&
+                       now_unix_ms - runtime_node.health_received_unix_ms_ <=
+                           observation_ttl_ms &&
+                       runtime_node.health_->storage_ready &&
+                       !runtime_node.health_->draining;
+  node.population_current_ = node.projection_current_ && node.health_fresh_ &&
+                             runtime_node.health_->population_ready;
+  if (runtime_node.last_lease_decision_.has_value()) {
+    if (const auto* granted = std::get_if<cluster::control::LeaseGranted>(
+            &*runtime_node.last_lease_decision_)) {
+      const auto committed_group = std::find_if(
+          view.groups_.begin(), view.groups_.end(), [&](const auto& group) {
+            return group.topology_.group_id_ == granted->group_id;
+          });
+      const std::uint64_t freshness_ms = std::min<std::uint64_t>(
+          granted->granted_duration_ms, observation_ttl_ms);
+      const bool recent =
+          runtime_node.lease_decision_written_unix_ms_ <= now_unix_ms &&
+          static_cast<std::uint64_t>(
+              now_unix_ms - runtime_node.lease_decision_written_unix_ms_) <=
+              freshness_ms;
+      bool current_assignment = false;
+      if (committed_group != view.groups_.end() &&
+          committed_group->grant_.grant_.has_value() &&
+          committed_group->grant_.grant_->owner_ == node.node_id_) {
+        const auto owner_member =
+            std::find_if(committed_group->topology_.members_.begin(),
+                         committed_group->topology_.members_.end(),
+                         [&](const MetaGroupMember& member) {
+                           return member.node_id_ == node.node_id_;
+                         });
+        current_assignment =
+            owner_member != committed_group->topology_.members_.end() &&
+            owner_member->assignment_id_ == granted->assignment_id;
+      }
+      const bool current_grant =
+          committed_group != view.groups_.end() &&
+          committed_group->grant_.grant_.has_value() && current_assignment &&
+          granted->leader_id == capture.responder_id_ &&
+          granted->raft_term == capture.term_ &&
+          granted->leadership_generation ==
+              runtime_node.leadership_generation_ &&
+          granted->data_boot_id == runtime_node.boot_id_ &&
+          granted->projection_hash == runtime_node.projection_hash_ &&
+          granted->group_term == committed_group->grant_.group_term_ &&
+          granted->authority_version ==
+              committed_group->topology_.record_.authority_version_ &&
+          granted->grant_revision ==
+              committed_group->grant_.grant_->grant_revision_;
+      // Health arrives before the corresponding Ack finishes writing. An old
+      // successful grant is not current readiness evidence after health drops,
+      // even while that Ack is queued or when heartbeat freshness expires.
+      node.lease_status_ =
+          recent && current_grant && node.projection_current_ &&
+                  node.health_fresh_ && node.population_current_
+              ? ClusterLeaseStatus::kRecentlyGranted
+              : ClusterLeaseStatus::kUnknown;
+    } else if (!std::holds_alternative<cluster::control::NoChallenge>(
+                   *runtime_node.last_lease_decision_)) {
+      const bool recent =
+          runtime_node.lease_decision_written_unix_ms_ <= now_unix_ms &&
+          now_unix_ms - runtime_node.lease_decision_written_unix_ms_ <=
+              observation_ttl_ms;
+      node.lease_status_ =
+          recent ? ClusterLeaseStatus::kDenied : ClusterLeaseStatus::kUnknown;
+    }
+  }
 }
 
 namespace {
@@ -206,10 +280,10 @@ std::vector<MetaMemberRecord> ActiveMetaMembers(
   for (const MetaMemberRecord& member : view.meta_members_) {
     if (!member.retired_) members.push_back(member);
   }
-  std::sort(members.begin(), members.end(), [](const auto& left,
-                                                const auto& right) {
-    return left.server_id_ < right.server_id_;
-  });
+  std::sort(members.begin(), members.end(),
+            [](const auto& left, const auto& right) {
+              return left.server_id_ < right.server_id_;
+            });
   return members;
 }
 
@@ -246,7 +320,8 @@ std::string BuildClusterHeadReply(
   }
   const auto responder = std::find_if(
       members.begin(), members.end(), [&](const MetaMemberRecord& member) {
-        return member.server_id_ == static_cast<std::uint32_t>(server->get_id());
+        return member.server_id_ ==
+               static_cast<std::uint32_t>(server->get_id());
       });
   const auto leader = std::find_if(
       members.begin(), members.end(), [&](const MetaMemberRecord& member) {
@@ -312,8 +387,7 @@ std::string BuildClusterStatusReply(
       .config_index_ = before_config_index,
       .config_server_ids_ = before_config_ids,
       .active_meta_members_ = active_meta_members,
-      .leadership_ = {.leadership_generation_ =
-                          runtime.leadership_generation_,
+      .leadership_ = {.leadership_generation_ = runtime.leadership_generation_,
                       .leader_authority_eligible_ =
                           runtime.leader_authority_eligible_},
   };
@@ -327,8 +401,7 @@ std::string BuildClusterStatusReply(
       .topology_epoch_ = view.topology_epoch_,
   };
   status.meta_available_ = true;
-  status.meta_members_ =
-      StatusMembers(active_meta_members, server->get_id());
+  status.meta_members_ = StatusMembers(active_meta_members, server->get_id());
 
   std::vector<std::uint32_t> committed_ids;
   std::vector<std::string> ctl_endpoints;
@@ -350,9 +423,9 @@ std::string BuildClusterStatusReply(
       ctl_endpoints.size() == active_meta_members.size()) {
     complete_ctl_directory = true;
   }
-  status.meta_membership_stable_ =
-      committed_ids == before_config_ids && complete_ctl_directory &&
-      unique_ctl_endpoints;
+  status.meta_membership_stable_ = committed_ids == before_config_ids &&
+                                   complete_ctl_directory &&
+                                   unique_ctl_endpoints;
   if (!status.meta_membership_stable_) {
     status.blockers_.push_back(
         {.code_ = "meta_membership_unstable",
@@ -368,9 +441,8 @@ std::string BuildClusterStatusReply(
                      : ClusterDataNodeRole::kReplica;
     node.retired_ = record.retired_;
     const auto runtime_node = std::find_if(
-        runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& item) {
-          return item.node_id_ == record.node_id_;
-        });
+        runtime.nodes_.begin(), runtime.nodes_.end(),
+        [&](const auto& item) { return item.node_id_ == record.node_id_; });
     node.current_session_ =
         !record.retired_ && runtime_node != runtime.nodes_.end();
     for (const auto& group : view.groups_) {
@@ -386,117 +458,53 @@ std::string BuildClusterStatusReply(
     }
     if (runtime_node != runtime.nodes_.end()) {
       node.projection_current_ =
-          runtime_node->validated_committed_high_water_ >= view.applied_index_ &&
+          runtime_node->validated_committed_high_water_ >=
+              view.applied_index_ &&
           runtime_node->topology_epoch_ == view.topology_epoch_;
       if (node.group_id_.has_value()) {
         const auto committed_group = std::find_if(
             view.groups_.begin(), view.groups_.end(), [&](const auto& group) {
               return group.topology_.group_id_ == *node.group_id_;
             });
-        const auto projected_group = std::find_if(
-            runtime_node->groups_.begin(), runtime_node->groups_.end(),
-            [&](const auto& group) {
-              return group.group_id_ == *node.group_id_;
-            });
+        const auto projected_group =
+            std::find_if(runtime_node->groups_.begin(),
+                         runtime_node->groups_.end(), [&](const auto& group) {
+                           return group.group_id_ == *node.group_id_;
+                         });
         const auto committed_member =
             committed_group == view.groups_.end()
                 ? std::vector<MetaGroupMember>::const_iterator{}
-                : std::find_if(
-                      committed_group->topology_.members_.begin(),
-                      committed_group->topology_.members_.end(),
-                      [&](const MetaGroupMember& member) {
-                        return member.node_id_ == record.node_id_;
-                      });
+                : std::find_if(committed_group->topology_.members_.begin(),
+                               committed_group->topology_.members_.end(),
+                               [&](const MetaGroupMember& member) {
+                                 return member.node_id_ == record.node_id_;
+                               });
         const bool anchors_match =
             committed_group != view.groups_.end() &&
             projected_group != runtime_node->groups_.end() &&
             committed_member != committed_group->topology_.members_.end() &&
             projected_group->assignment_id_ ==
                 committed_member->assignment_id_ &&
-            projected_group->group_term_ == committed_group->grant_.group_term_ &&
+            projected_group->group_term_ ==
+                committed_group->grant_.group_term_ &&
             projected_group->authority_version_ ==
                 committed_group->topology_.record_.authority_version_ &&
             projected_group->manifest_revision_ ==
-                committed_group->topology_.record_.population_manifest_revision_ &&
+                committed_group->topology_.record_
+                    .population_manifest_revision_ &&
             projected_group->manifest_digest_ ==
-                committed_group->topology_.record_.population_manifest_digest_ &&
+                committed_group->topology_.record_
+                    .population_manifest_digest_ &&
             projected_group->partition_replication_epoch_ ==
                 committed_group->topology_.record_.partition_replication_epoch_;
         node.projection_current_ = node.projection_current_ && anchors_match;
       }
-      const std::int64_t now_unix_ms =
+      detail::ApplyClusterRuntimeObservation(
+          node, *runtime_node, view, status.capture_,
           std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::system_clock::now().time_since_epoch())
-              .count();
-      node.health_fresh_ =
-          runtime_node->health_.has_value() &&
-          runtime_node->health_received_unix_ms_ <= now_unix_ms &&
-          now_unix_ms - runtime_node->health_received_unix_ms_ <=
-              observation_ttl_ms &&
-          runtime_node->health_->storage_ready &&
-          !runtime_node->health_->draining;
-      node.population_current_ =
-          node.projection_current_ && node.health_fresh_ &&
-          runtime_node->health_->population_ready;
-      if (runtime_node->last_lease_decision_.has_value()) {
-        if (const auto* granted =
-                std::get_if<cluster::control::LeaseGranted>(
-                &*runtime_node->last_lease_decision_)) {
-          const auto committed_group = std::find_if(
-              view.groups_.begin(), view.groups_.end(), [&](const auto& group) {
-                return group.topology_.group_id_ == granted->group_id;
-              });
-          const std::uint64_t freshness_ms =
-              std::min<std::uint64_t>(granted->granted_duration_ms,
-                                      observation_ttl_ms);
-          const bool recent =
-              runtime_node->lease_decision_written_unix_ms_ <= now_unix_ms &&
-              static_cast<std::uint64_t>(
-                  now_unix_ms - runtime_node->lease_decision_written_unix_ms_) <=
-                  freshness_ms;
-          bool current_assignment = false;
-          if (committed_group != view.groups_.end() &&
-              committed_group->grant_.grant_.has_value() &&
-              committed_group->grant_.grant_->owner_ == record.node_id_) {
-            const auto owner_member = std::find_if(
-                committed_group->topology_.members_.begin(),
-                committed_group->topology_.members_.end(),
-                [&](const MetaGroupMember& member) {
-                  return member.node_id_ == record.node_id_;
-                });
-            current_assignment =
-                owner_member != committed_group->topology_.members_.end() &&
-                owner_member->assignment_id_ == granted->assignment_id;
-          }
-          const bool current_grant =
-              committed_group != view.groups_.end() &&
-              committed_group->grant_.grant_.has_value() &&
-              current_assignment &&
-              granted->leader_id == status.capture_.responder_id_ &&
-              granted->raft_term == before_term &&
-              granted->leadership_generation ==
-                  runtime_node->leadership_generation_ &&
-              granted->data_boot_id == runtime_node->boot_id_ &&
-              granted->projection_hash == runtime_node->projection_hash_ &&
-              granted->group_term == committed_group->grant_.group_term_ &&
-              granted->authority_version ==
-                  committed_group->topology_.record_.authority_version_ &&
-              granted->grant_revision ==
-                  committed_group->grant_.grant_->grant_revision_;
-          node.lease_status_ = recent && current_grant &&
-                                       node.projection_current_
-                                   ? ClusterLeaseStatus::kRecentlyGranted
-                                   : ClusterLeaseStatus::kUnknown;
-        } else if (!std::holds_alternative<cluster::control::NoChallenge>(
-                       *runtime_node->last_lease_decision_)) {
-          const bool recent =
-              runtime_node->lease_decision_written_unix_ms_ <= now_unix_ms &&
-              now_unix_ms - runtime_node->lease_decision_written_unix_ms_ <=
-                  observation_ttl_ms;
-          node.lease_status_ = recent ? ClusterLeaseStatus::kDenied
-                                      : ClusterLeaseStatus::kUnknown;
-        }
-      }
+              .count(),
+          observation_ttl_ms);
     }
     status.data_nodes_.push_back(std::move(node));
   }
@@ -515,19 +523,19 @@ std::string BuildClusterStatusReply(
     }
     group.topology_converged_ = true;
     for (const MetaGroupMember& member : source.topology_.members_) {
-      const auto identity = std::find_if(
-          view.data_nodes_.begin(), view.data_nodes_.end(),
-          [&](const MetaNodeRecord& node) {
-            return node.node_id_ == member.node_id_;
-          });
+      const auto identity =
+          std::find_if(view.data_nodes_.begin(), view.data_nodes_.end(),
+                       [&](const MetaNodeRecord& node) {
+                         return node.node_id_ == member.node_id_;
+                       });
       // Retired identities remain visible for diagnosis but no longer
       // participate in convergence of the active committed topology.
       if (identity != view.data_nodes_.end() && identity->retired_) continue;
-      const auto runtime = std::find_if(
-          status.data_nodes_.begin(), status.data_nodes_.end(),
-          [&](const ClusterDataNodeWireV1& node) {
-            return node.node_id_ == member.node_id_;
-          });
+      const auto runtime =
+          std::find_if(status.data_nodes_.begin(), status.data_nodes_.end(),
+                       [&](const ClusterDataNodeWireV1& node) {
+                         return node.node_id_ == member.node_id_;
+                       });
       if (runtime == status.data_nodes_.end() || !runtime->current_session_ ||
           !runtime->projection_current_ || !runtime->health_fresh_ ||
           !runtime->population_current_) {
@@ -537,13 +545,14 @@ std::string BuildClusterStatusReply(
     group.serving_ready_ =
         source.grant_.grant_.has_value() && source.manifest_present_ &&
         source.policy_active_ && group.owner_node_id_.has_value() &&
-        std::any_of(status.data_nodes_.begin(), status.data_nodes_.end(),
-                    [&](const ClusterDataNodeWireV1& node) {
-          return node.node_id_ == *group.owner_node_id_ &&
-                 node.current_session_ && node.projection_current_ &&
-                 node.health_fresh_ && node.population_current_ &&
-                 node.lease_status_ == ClusterLeaseStatus::kRecentlyGranted;
-        });
+        std::any_of(
+            status.data_nodes_.begin(), status.data_nodes_.end(),
+            [&](const ClusterDataNodeWireV1& node) {
+              return node.node_id_ == *group.owner_node_id_ &&
+                     node.current_session_ && node.projection_current_ &&
+                     node.health_fresh_ && node.population_current_ &&
+                     node.lease_status_ == ClusterLeaseStatus::kRecentlyGranted;
+            });
     if (!group.topology_converged_) {
       status.topology_converged_ = false;
       status.blockers_.push_back(
@@ -551,11 +560,11 @@ std::string BuildClusterStatusReply(
            .scope_ = "group:" + group.group_id_,
            .detail_ = "current_projection_health_or_population_missing"});
     }
-    const bool owns_slots = std::any_of(
-        view.slot_ranges_.begin(), view.slot_ranges_.end(),
-        [&](const MetaCommittedStatusSlotRange& range) {
-          return range.group_id_ == group.group_id_;
-        });
+    const bool owns_slots =
+        std::any_of(view.slot_ranges_.begin(), view.slot_ranges_.end(),
+                    [&](const MetaCommittedStatusSlotRange& range) {
+                      return range.group_id_ == group.group_id_;
+                    });
     if (owns_slots && !group.serving_ready_) {
       status.blockers_.push_back(
           {.code_ = "group_not_serving",
@@ -577,24 +586,24 @@ std::string BuildClusterStatusReply(
   full_slot_coverage = full_slot_coverage && expected_first == kMetaSlotCount;
   status.serving_ready_ =
       full_slot_coverage && !status.groups_.empty() &&
-      std::all_of(status.slot_ranges_.begin(), status.slot_ranges_.end(),
-                  [&](const ClusterSlotRangeWireV1& range) {
-                    const auto group = std::find_if(
-                        status.groups_.begin(), status.groups_.end(),
-                        [&](const ClusterGroupWireV1& item) {
-                          return item.group_id_ == range.group_id_;
-                        });
-                    return group != status.groups_.end() &&
-                           group->serving_ready_;
-                  });
+      std::all_of(
+          status.slot_ranges_.begin(), status.slot_ranges_.end(),
+          [&](const ClusterSlotRangeWireV1& range) {
+            const auto group =
+                std::find_if(status.groups_.begin(), status.groups_.end(),
+                             [&](const ClusterGroupWireV1& item) {
+                               return item.group_id_ == range.group_id_;
+                             });
+            return group != status.groups_.end() && group->serving_ready_;
+          });
   if (!full_slot_coverage) {
     status.blockers_.push_back({.code_ = "slots_unassigned",
                                 .scope_ = "cluster",
                                 .detail_ = "coverage_is_not_0_through_16383"});
   }
-  status.cluster_ready_ =
-      status.meta_available_ && status.meta_membership_stable_ &&
-      status.serving_ready_ && status.topology_converged_;
+  status.cluster_ready_ = status.meta_available_ &&
+                          status.meta_membership_stable_ &&
+                          status.serving_ready_ && status.topology_converged_;
 
   auto encoded = EncodeClusterStatusReply(status);
   if (!encoded.ok()) return "ERR state_corrupt";
@@ -732,11 +741,11 @@ class AsyncReplyAwaiter {
   std::size_t* retained_status_bytes_;
 };
 
-void CompleteAsyncReply(celer::ForeignExecutor foreign_executor,
-                        std::shared_ptr<AsyncReply> state, std::string reply,
-                        std::shared_ptr<MetaClusterStatusService>
-                            retained_status_service = nullptr,
-                        std::size_t retained_status_bytes = 0) {
+void CompleteAsyncReply(
+    celer::ForeignExecutor foreign_executor, std::shared_ptr<AsyncReply> state,
+    std::string reply,
+    std::shared_ptr<MetaClusterStatusService> retained_status_service = nullptr,
+    std::size_t retained_status_bytes = 0) {
   std::coroutine_handle<> waiter;
   {
     std::lock_guard<std::mutex> lock(state->mutex_);
@@ -1559,11 +1568,9 @@ celer::Task<std::string> HandleConfigChange(
     MetaProposalExecutor& proposal_executor,
     const std::shared_ptr<MetaMembershipGate>& membership_gate, bool add,
     int server_id, const std::string& endpoint,
-    const std::string& data_control_endpoint,
-    const std::string& ctl_endpoint,
+    const std::string& data_control_endpoint, const std::string& ctl_endpoint,
     std::string_view local_data_control_endpoint,
-    std::string_view local_ctl_endpoint,
-    const std::string& member_principal) {
+    std::string_view local_ctl_endpoint, const std::string& member_principal) {
   std::unique_ptr<MetaMembershipGate::Lease> config_lease =
       membership_gate->TryAcquire();
   if (config_lease == nullptr) co_return "ERR config-changing";
@@ -1974,8 +1981,7 @@ celer::Task<std::string> DispatchCommand(
     std::string_view local_ctl_endpoint,
     std::shared_ptr<MetaClusterStatusService> cluster_status_service,
     std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status,
-    std::uint32_t observation_ttl_ms,
-    std::size_t* retained_status_bytes,
+    std::uint32_t observation_ttl_ms, std::size_t* retained_status_bytes,
     std::string_view line) {
   const std::vector<std::string> tokens = SplitTokens(line);
   if (tokens.empty()) {
@@ -2015,14 +2021,13 @@ celer::Task<std::string> DispatchCommand(
     if (!cluster_status_service->TryBeginCapture()) co_return "ERR busy";
     auto reply = std::make_shared<AsyncReply>();
     const absl::Status submitted = proposal_executor.Submit(
-        [server, state_machine, data_control_runtime_status,
-         observation_ttl_ms, cluster_status_service, foreign_executor,
-         reply]() mutable {
+        [server, state_machine, data_control_runtime_status, observation_ttl_ms,
+         cluster_status_service, foreign_executor, reply]() mutable {
           std::string result;
           try {
-            result = BuildClusterStatusReply(
-                server, state_machine, data_control_runtime_status,
-                observation_ttl_ms);
+            result = BuildClusterStatusReply(server, state_machine,
+                                             data_control_runtime_status,
+                                             observation_ttl_ms);
           } catch (...) {
             result = "ERR state_corrupt";
           }
@@ -2211,8 +2216,8 @@ celer::Task<std::string> DispatchCommand(
         std::move(principal), foreign_executor, proposal_executor,
         membership_gate, add, server_id, add ? tokens[2] : std::string(),
         add ? tokens[3] : std::string(local_data_control_endpoint),
-        add ? tokens[4] : std::string(),
-        local_data_control_endpoint, local_ctl_endpoint, member_principal);
+        add ? tokens[4] : std::string(), local_data_control_endpoint,
+        local_ctl_endpoint, member_principal);
   }
   if (command == "snapshot") {
     // A manual snapshot must serialize against the commit

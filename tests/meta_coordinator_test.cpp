@@ -3,14 +3,14 @@
 //
 // Two slices:
 //   1. Component tests (MetaCoordinatorComponentTest): a MetaCoordinator over a
-//      bare MetaStateMachine + WAL v2 NuraftLogStore with NO raft_server,
+//      bare MetaStateMachine + WAL v1 NuraftLogStore with NO raft_server,
 //      driven by direct SM commit() calls. Covers the subscription contract
 //      (atomic {view, cursor, subscription} triple, strict commit order, the
 //      documented replay duplicate-index/dedup rule, bounded-queue backpressure
 //      cancel, handle-destruction unsubscribe), the view-backed
 //      MetaCommittedFacts adapter, and the no-server fast-fail of Propose.
 //   2. Single-node raft_server integration (MetaCoordinatorServerTest): real
-//      elections and commits over the real adapters (NuraftStateMgr + WAL v2 +
+//      elections and commits over the real adapters (NuraftStateMgr + WAL v1 +
 //      MetaStateMachine), mirroring meta_state_machine_test.cpp's
 //      ThreadScheduler/NullRpcClientFactory harness. Covers Propose (actor
 //      injection, verdict from the audit store), NOT_LEADER, the three

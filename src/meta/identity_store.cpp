@@ -348,7 +348,8 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
             member.ctl_endpoint_ = canonical_ctl_endpoint;
           }
         }
-        if (auto status = ValidateActiveMetaDirectory(candidate); !status.ok()) {
+        if (auto status = ValidateActiveMetaDirectory(candidate);
+            !status.ok()) {
           return MetaDomainRejectError(status.message());
         }
         record.ctl_endpoint_ = std::move(canonical_ctl_endpoint);
@@ -365,12 +366,12 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
   if (meta_members_.size() >= kMaxMetaNodes) {
     return MetaDomainRejectError("meta member cap reached");
   }
-  MetaMemberRecord record{.server_id_ = cmd.server_id_,
-                          .principal_ = cmd.principal_,
-                          .data_control_endpoint_ =
-                              std::move(*canonical_endpoint),
-                          .ctl_endpoint_ = std::move(canonical_ctl_endpoint),
-                          .retired_ = false};
+  MetaMemberRecord record{
+      .server_id_ = cmd.server_id_,
+      .principal_ = cmd.principal_,
+      .data_control_endpoint_ = std::move(*canonical_endpoint),
+      .ctl_endpoint_ = std::move(canonical_ctl_endpoint),
+      .retired_ = false};
   std::vector<MetaMemberRecord> candidate = MetaMembers();
   candidate.push_back(record);
   if (auto status = ValidateActiveMetaDirectory(candidate); !status.ok()) {
@@ -568,8 +569,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
       if (!decoded.ok()) return decoded.status();
       auto canonical_ctl = CanonicalMetaAdminEndpoint(*decoded);
       if (!canonical_ctl.ok() || *canonical_ctl != *decoded) {
-        return MetaFailStopError(
-            "non-canonical Meta ctl endpoint in snapshot");
+        return MetaFailStopError("non-canonical Meta ctl endpoint in snapshot");
       }
       ctl_endpoint = std::move(*canonical_ctl);
     }

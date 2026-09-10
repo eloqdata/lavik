@@ -1,6 +1,8 @@
 #include <sys/types.h>
 
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -168,6 +170,102 @@ TEST(MetaClusterStatusServiceTest, EnforcesSingleFlightAndRetainedBudget) {
   service.Release(kOneHundredMiB);
 }
 
+TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
+  namespace control = keylane::cluster::control;
+  using namespace keylane::meta;
+  const std::string node_id(kNodeId);
+  control::WireId128 assignment{};
+  assignment[0] = 1;
+  MetaCommittedStatusView view;
+  MetaCommittedStatusGroup group;
+  group.topology_.group_id_ = "group-a";
+  group.topology_.record_.authority_version_ = 5;
+  group.topology_.members_.push_back(
+      {.node_id_ = node_id, .assignment_id_ = assignment});
+  group.grant_.group_term_ = 4;
+  group.grant_.grant_ = MetaGroupGrant{.owner_ = node_id,
+                                       .term_ = 4,
+                                       .authority_version_ = 5,
+                                       .grant_revision_ = 6};
+  view.groups_.push_back(std::move(group));
+  const ClusterCaptureWireV1 capture{.responder_id_ = 1,
+                                     .term_ = 7,
+                                     .config_index_ = 8,
+                                     .committed_index_ = 9,
+                                     .topology_epoch_ = 3};
+  MetaDataControlRuntimeNode runtime;
+  runtime.node_id_ = node_id;
+  runtime.boot_id_ = std::string(40, '2');
+  runtime.leadership_generation_ = 11;
+  runtime.health_ =
+      control::HeartbeatHealth{.storage_ready = true, .population_ready = true};
+  runtime.health_received_unix_ms_ = 1000;
+  runtime.last_lease_decision_ =
+      control::LeaseGranted{.leader_id = 1,
+                            .raft_term = 7,
+                            .leadership_generation = 11,
+                            .data_boot_id = runtime.boot_id_,
+                            .projection_hash = runtime.projection_hash_,
+                            .group_id = "group-a",
+                            .assignment_id = assignment,
+                            .group_term = 4,
+                            .authority_version = 5,
+                            .grant_revision = 6,
+                            .granted_duration_ms = 500};
+  runtime.lease_decision_written_unix_ms_ = 1001;
+  auto observe = [&](std::int64_t now_unix_ms) {
+    ClusterDataNodeWireV1 node{.node_id_ = node_id,
+                               .role_ = ClusterDataNodeRole::kPrimary,
+                               .group_id_ = "group-a",
+                               .current_session_ = true,
+                               .projection_current_ = true};
+    detail::ApplyClusterRuntimeObservation(node, runtime, view, capture,
+                                           now_unix_ms, /*ttl_ms=*/500);
+    return node;
+  };
+  EXPECT_EQ(observe(1001).lease_status_, ClusterLeaseStatus::kRecentlyGranted);
+  auto expect_not_ready = [&](const ClusterDataNodeWireV1& node) {
+    EXPECT_EQ(node.lease_status_, ClusterLeaseStatus::kUnknown);
+    EXPECT_FALSE(node.population_current_);
+    ClusterStatusWireV1 status;
+    status.capture_ = capture;
+    status.meta_available_ = true;
+    status.meta_membership_stable_ = true;
+    status.meta_members_.push_back({.server_id_ = 1, .is_leader_ = true});
+    status.data_nodes_.push_back(node);
+    status.groups_.push_back({.group_id_ = "group-a",
+                              .term_ = 4,
+                              .owner_node_id_ = node_id,
+                              .config_epoch_ = 8,
+                              .grant_revision_ = 6});
+    const auto encoded = EncodeClusterStatusReply(status);
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    const auto decoded = DecodeClusterStatusReply(*encoded);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    EXPECT_FALSE(decoded->cluster_ready_);
+  };
+
+  // These snapshots fall between receiving new health and finishing its Ack.
+  // The previous granted decision is still present in each captured runtime.
+  for (const auto health : {control::HeartbeatHealth{.storage_ready = false,
+                                                     .population_ready = true},
+                            control::HeartbeatHealth{.storage_ready = true,
+                                                     .population_ready = false},
+                            control::HeartbeatHealth{.storage_ready = true,
+                                                     .population_ready = true,
+                                                     .draining = true}}) {
+    runtime.health_ = health;
+    runtime.health_received_unix_ms_ = 1002;
+    expect_not_ready(observe(1002));
+  }
+  // Ack completion can be newer than the health receipt. Health expiration
+  // must also suppress the grant while its own freshness window still holds.
+  runtime.health_ =
+      control::HeartbeatHealth{.storage_ready = true, .population_ready = true};
+  runtime.health_received_unix_ms_ = 1000;
+  expect_not_ready(observe(1501));
+}
+
 TEST(MetaClusterStatusBracketTest, RejectsEveryMixedAuthorityCut) {
   using keylane::meta::detail::IsStableClusterStatusBracket;
   using keylane::meta::detail::MetaClusterStatusBracket;
@@ -177,12 +275,13 @@ TEST(MetaClusterStatusBracketTest, RejectsEveryMixedAuthorityCut) {
       .term_ = 7,
       .config_index_ = 11,
       .config_server_ids_ = {1, 2, 3},
-      .active_meta_members_ = {
-          {.server_id_ = 1,
-           .principal_ = "keylane://meta/1",
-           .data_control_endpoint_ = "127.0.0.1:7001",
-           .ctl_endpoint_ = "127.0.0.1:7101"},
-      },
+      .active_meta_members_ =
+          {
+              {.server_id_ = 1,
+               .principal_ = "keylane://meta/1",
+               .data_control_endpoint_ = "127.0.0.1:7001",
+               .ctl_endpoint_ = "127.0.0.1:7101"},
+          },
       .leadership_ = {.leadership_generation_ = 5,
                       .leader_authority_eligible_ = true},
   };
@@ -232,8 +331,7 @@ TEST(MetaIdentitySecurity,
   ASSERT_TRUE(member.has_value());
   EXPECT_EQ(member->principal_, "keylane://meta/7");
   EXPECT_EQ(member->data_control_endpoint_, "10.0.0.7:7100");
-  EXPECT_EQ(member->ctl_endpoint_,
-            std::optional<std::string>("10.0.0.7:7200"));
+  EXPECT_EQ(member->ctl_endpoint_, std::optional<std::string>("10.0.0.7:7200"));
   EXPECT_FALSE(member->retired_);
   EXPECT_TRUE(store.Apply(bind).ok());
 

@@ -358,6 +358,7 @@ TEST(MetaModelCommands, EnvelopeStartsWithFormatVersionThenTag) {
   const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
   const std::uint16_t version = static_cast<std::uint16_t>(p[0] | (p[1] << 8));
   const std::uint16_t tag = static_cast<std::uint16_t>(p[2] | (p[3] << 8));
+  EXPECT_EQ(version, 1);
   EXPECT_EQ(version, keylane::meta::kMetaFormatVersion);
   EXPECT_EQ(tag, static_cast<std::uint16_t>(
                      keylane::meta::MetaCommandTag::kRegisterNode));
@@ -365,7 +366,7 @@ TEST(MetaModelCommands, EnvelopeStartsWithFormatVersionThenTag) {
 
 TEST(MetaModelCommands, UnknownFormatVersionFails) {
   const std::string bytes = MustEncode(MakeRegisterNode());
-  for (const std::uint16_t bad_version : {0, 0x7FFF, 0xFFFF}) {
+  for (const std::uint16_t bad_version : {0, 2, 3, 0x7FFF, 0xFFFF}) {
     std::string corrupt = bytes;
     corrupt[0] = static_cast<char>(bad_version & 0xFF);
     corrupt[1] = static_cast<char>((bad_version >> 8) & 0xFF);
@@ -803,7 +804,7 @@ TEST(MetaModelCommands, DirectiveResultReceiptCommandsRoundTrip) {
 }
 
 TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
-  EXPECT_EQ(keylane::meta::kMetaFormatVersion, 3);
+  EXPECT_EQ(keylane::meta::kMetaFormatVersion, 1);
 
   keylane::meta::PruneAudit audit;
   audit.through_log_index_ = 42;
@@ -1187,6 +1188,7 @@ TEST(MetaStateApply, MetaStoresSnapshotRoundTrip) {
   EXPECT_EQ(restored->audit_.size(), 2u);
   EXPECT_TRUE(restored->audit_.VerifyChain());
   const auto* envelope = reinterpret_cast<const unsigned char*>(bytes.data());
+  EXPECT_EQ(static_cast<std::uint16_t>(envelope[0] | (envelope[1] << 8)), 1);
   EXPECT_EQ(static_cast<std::uint16_t>(envelope[0] | (envelope[1] << 8)),
             keylane::meta::kMetaFormatVersion);
 }
@@ -1208,15 +1210,17 @@ TEST(MetaStateApply, MetaStoresDeserializeRejectsCorruption) {
   EXPECT_EQ(keylane::meta::MetaFailureClassOf(trailing.status()),
             keylane::meta::MetaFailureClass::kFailStop);
 
-  std::string legacy_v2 = bytes;
-  legacy_v2[0] = '\x02';
-  legacy_v2[1] = '\0';
-  const auto unsupported = MetaStores::Deserialize(legacy_v2);
-  ASSERT_FALSE(unsupported.ok());
-  EXPECT_EQ(keylane::meta::MetaFailureClassOf(unsupported.status()),
-            keylane::meta::MetaFailureClass::kFailStop);
-  EXPECT_NE(unsupported.status().message().find("version"),
-            std::string_view::npos);
+  for (const char version : {'\x02', '\x03'}) {
+    std::string future = bytes;
+    future[0] = version;
+    future[1] = '\0';
+    const auto unsupported = MetaStores::Deserialize(future);
+    ASSERT_FALSE(unsupported.ok());
+    EXPECT_EQ(keylane::meta::MetaFailureClassOf(unsupported.status()),
+              keylane::meta::MetaFailureClass::kFailStop);
+    EXPECT_NE(unsupported.status().message().find("version"),
+              std::string_view::npos);
+  }
 }
 
 TEST(MetaStateApply, LogIndexZeroRejectedWithoutDispatchOrAudit) {

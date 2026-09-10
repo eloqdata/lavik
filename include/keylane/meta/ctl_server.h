@@ -200,6 +200,7 @@
 #include "absl/status/statusor.h"
 #include "celer/runtime/foreign_executor.h"
 #include "celer/runtime/task.h"
+#include "keylane/meta/cluster_status.h"
 #include "keylane/meta/committed_status_view.h"
 #include "keylane/meta/data_control_runtime_status.h"
 // NuRaft's headers are not -Wpedantic-clean.
@@ -245,6 +246,15 @@ struct MetaClusterStatusBracket {
 bool IsStableClusterStatusBracket(const MetaClusterStatusBracket& before,
                                   const MetaClusterStatusBracket& after);
 
+// Projects the captured heartbeat and last written lease onto a node whose
+// session/projection fields already describe this committed cut. Health can
+// arrive before its Ack is written; only a healthy, current population may
+// expose a recent grant. All freshness checks use the supplied capture time.
+void ApplyClusterRuntimeObservation(
+    ClusterDataNodeWireV1& node, const MetaDataControlRuntimeNode& runtime_node,
+    const MetaCommittedStatusView& view, const ClusterCaptureWireV1& capture,
+    std::int64_t now_unix_ms, std::uint32_t observation_ttl_ms);
+
 }  // namespace detail
 
 // Shared by every configured Admin listener. Capture is single-flight across
@@ -270,8 +280,8 @@ class MetaClusterStatusService {
   }
   bool TryRetain(std::size_t bytes) noexcept {
     std::size_t current = retained_reply_bytes_.load(std::memory_order_relaxed);
-    while (current <= kMaxRetainedReplyBytes -
-                          std::min(bytes, kMaxRetainedReplyBytes)) {
+    while (current <=
+           kMaxRetainedReplyBytes - std::min(bytes, kMaxRetainedReplyBytes)) {
       if (bytes > kMaxRetainedReplyBytes) return false;
       if (retained_reply_bytes_.compare_exchange_weak(
               current, current + bytes, std::memory_order_acquire,

@@ -12,10 +12,9 @@ std::vector<MetaDataControlRuntimeGroup> ProjectedGroups(
   std::vector<MetaDataControlRuntimeGroup> groups;
   groups.reserve(projection.groups.size());
   for (const auto& group : projection.groups) {
-    auto member = std::find_if(
-        group.members.begin(), group.members.end(), [&](const auto& item) {
-          return item.node_id == node_id;
-        });
+    auto member =
+        std::find_if(group.members.begin(), group.members.end(),
+                     [&](const auto& item) { return item.node_id == node_id; });
     if (member == group.members.end()) continue;
     groups.push_back({
         .group_id_ = group.group_id,
@@ -28,10 +27,10 @@ std::vector<MetaDataControlRuntimeGroup> ProjectedGroups(
         .partition_replication_epoch_ = group.partition_replication_epoch,
     });
   }
-  std::sort(groups.begin(), groups.end(), [](const auto& left,
-                                             const auto& right) {
-    return left.group_id_ < right.group_id_;
-  });
+  std::sort(groups.begin(), groups.end(),
+            [](const auto& left, const auto& right) {
+              return left.group_id_ < right.group_id_;
+            });
   return groups;
 }
 
@@ -99,8 +98,7 @@ void MetaDataControlRuntimeStatus::PublishCurrent(
 }
 
 void MetaDataControlRuntimeStatus::MarkValidated(
-    std::string_view node_id,
-    const cluster::control::WireId128& session_id,
+    std::string_view node_id, const cluster::control::WireId128& session_id,
     std::uint64_t validated_committed_high_water) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto found = nodes_.find(std::string(node_id));
@@ -111,8 +109,7 @@ void MetaDataControlRuntimeStatus::MarkValidated(
 }
 
 void MetaDataControlRuntimeStatus::RecordHealth(
-    std::string_view node_id,
-    const cluster::control::WireId128& session_id,
+    std::string_view node_id, const cluster::control::WireId128& session_id,
     const cluster::control::HeartbeatHealth& health,
     std::int64_t received_unix_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -123,8 +120,7 @@ void MetaDataControlRuntimeStatus::RecordHealth(
 }
 
 void MetaDataControlRuntimeStatus::RecordLeaseDecisionWritten(
-    std::string_view node_id,
-    const cluster::control::WireId128& session_id,
+    std::string_view node_id, const cluster::control::WireId128& session_id,
     const cluster::control::LeaseDecision& written_decision,
     std::int64_t written_unix_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -135,12 +131,11 @@ void MetaDataControlRuntimeStatus::RecordLeaseDecisionWritten(
 }
 
 void MetaDataControlRuntimeStatus::Remove(
-    std::string_view node_id,
-    const cluster::control::WireId128* session_id) {
+    std::string_view node_id, const cluster::control::WireId128* session_id) {
+  if (session_id == nullptr) return;
   std::lock_guard<std::mutex> lock(mutex_);
   auto found = nodes_.find(std::string(node_id));
-  if (found == nodes_.end() ||
-      (session_id != nullptr && found->second.session_id_ != *session_id)) {
+  if (found == nodes_.end() || found->second.session_id_ != *session_id) {
     return;
   }
   nodes_.erase(found);
@@ -156,8 +151,8 @@ MetaDataControlRuntimeSnapshot MetaDataControlRuntimeStatus::Snapshot() const {
   return snapshot;
 }
 
-MetaDataControlLeadershipState
-MetaDataControlRuntimeStatus::LeadershipState() const {
+MetaDataControlLeadershipState MetaDataControlRuntimeStatus::LeadershipState()
+    const {
   std::lock_guard<std::mutex> lock(mutex_);
   return {.leadership_generation_ = leadership_generation_,
           .leader_authority_eligible_ = leader_authority_eligible_};

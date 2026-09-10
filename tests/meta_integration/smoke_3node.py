@@ -13,7 +13,7 @@ all nodes. Stdlib only; the whole run is budgeted well under 60 seconds.
 All process/ctl plumbing (Node, wait_until, find_leader, join_and_verify,
 propose_ops, workdir handling) lives in harness.py; this file is only the
 smoke scenario's own orchestration plus its smoke-specific checks (the
-full committed-history sweep and the WAL v2 segment compaction check).
+full committed-history sweep and the WAL v1 segment compaction check).
 """
 
 import os
@@ -114,6 +114,9 @@ def main():
                     "leader-change status result disagreed with exit code: "
                     f"exit={probe.returncode} stdout={stdout!r}")
         leader = H.find_leader(survivors)
+        # There are no Data sessions to refresh runtime eligibility, and no
+        # further Meta command is issued before this status read. Reconciliation
+        # must follow NuRaft's leader-alive transition on its own after election.
         cluster_status = subprocess.run(
             [CLUSTER, "status", "--addr", leader.ctl_endpoint,
              "--allow-plaintext-admin", "--json"],
@@ -151,7 +154,7 @@ def main():
         # 7. Manual snapshot on the current leader: the ctl drives
         #    create_snapshot with serialize_commit (exact cut point), the
         #    durable write + log compaction then complete asynchronously —
-        #    poll for both the snapshot index and the WAL v2 segment
+        #    poll for both the snapshot index and the WAL v1 segment
         #    compaction (min log-*.seg first index advances past 1).
         leader = H.find_leader(nodes)
         snap_idx = H.manual_snapshot(leader)

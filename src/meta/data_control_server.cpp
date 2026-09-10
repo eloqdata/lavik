@@ -1446,8 +1446,7 @@ void FinishLeaderTask(MetaDataControlServer::Core& core,
 }
 
 void RemoveSession(MetaDataControlServer::Core& core,
-                   celer::Connection* connection,
-                   std::string_view node_id = {},
+                   celer::Connection* connection, std::string_view node_id = {},
                    const control::WireId128* session_id = nullptr) {
   const auto session =
       std::find(core.sessions_.begin(), core.sessions_.end(), connection);
@@ -1495,7 +1494,7 @@ bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
                               std::uint64_t generation) {
   if (!StillLeader(core, generation) || !core.server_->is_leader_alive()) {
     core.options_.runtime_status_->SetLeaderAuthorityEligible(generation,
-                                                               false);
+                                                              false);
     return false;
   }
   const MetaLeaderRuntimeDisposition runtime =
@@ -1528,7 +1527,7 @@ bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
   }
   const bool eligible = runtime == MetaLeaderRuntimeDisposition::kEligible;
   core.options_.runtime_status_->SetLeaderAuthorityEligible(generation,
-                                                             eligible);
+                                                            eligible);
   return eligible;
 }
 
@@ -1704,7 +1703,8 @@ celer::Task<absl::Status> ReconcileLocalMetaMember(
       if (binding.ok() &&
           *binding == MetaLocalMemberBindingDisposition::kNeedsBind) {
         const bool completing_existing =
-            view.identity().FindMetaMember(core->options_.server_id_)
+            view.identity()
+                .FindMetaMember(core->options_.server_id_)
                 .has_value();
         if (completing_existing &&
             (config == nullptr || config->get_servers().size() != 1)) {
@@ -1753,14 +1753,23 @@ celer::Task<absl::Status> ReconcileLocalMetaMember(
     }
 
     if (status.ok()) {
-      if (StillLeader(*core, generation) &&
-          AuthoritySessionsAllowed(*core, generation)) {
+      if (StillLeader(*core, generation)) {
+        // Membership reconciliation completes once per leader generation.
+        // A temporary quorum loss or suspend quarantine must not prevent this
+        // latch from opening: each Hello still rechecks live authority, which
+        // can recover without another membership reconciliation task.
         core->leader_ready_for_data_ = true;
+        // NuRaft can announce leadership before its live-leader flag becomes
+        // true. Keep retrying until the observational bracket is initialized;
+        // a cluster with no Data sessions has no Hello/heartbeat to refresh it.
+        if (AuthoritySessionsAllowed(*core, generation)) {
+          co_return absl::OkStatus();
+        }
       }
-      co_return absl::OkStatus();
+    } else {
+      spdlog::warn("data-control leader membership reconciliation: {}",
+                   status.message());
     }
-    spdlog::warn("data-control leader membership reconciliation: {}",
-                 status.message());
     const absl::Status waited = co_await celer::SleepFor(*core->worker_, 100ms);
     if (!waited.ok()) co_return waited;
   }
@@ -3356,8 +3365,13 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
                         ? &status_session_id_->value()
                         : nullptr);
     }
-  } completion{core, connection, &node_id, &observation_identity,
-               &status_session_id, &accepted_session, &handshake_permit};
+  } completion{core,
+               connection,
+               &node_id,
+               &observation_identity,
+               &status_session_id,
+               &accepted_session,
+               &handshake_permit};
   SessionIo io(
       *core->worker_, connection, stream, core->options_.max_write_queue_bytes_,
       std::chrono::milliseconds(core->options_.session_progress_timeout_ms_));

@@ -123,8 +123,7 @@ absl::Status WaitFor(int fd, short events, MetaAdminDeadline deadline,
     pollfd descriptor{.fd = fd, .events = events, .revents = 0};
     const int timeout = RemainingMillis(deadline);
     if (timeout == 0) {
-      return absl::DeadlineExceededError(std::string(operation) +
-                                         " timed out");
+      return absl::DeadlineExceededError(std::string(operation) + " timed out");
     }
     const int result = ::poll(&descriptor, 1, timeout);
     if (result > 0) {
@@ -135,8 +134,7 @@ absl::Status WaitFor(int fd, short events, MetaAdminDeadline deadline,
       continue;
     }
     if (result == 0) {
-      return absl::DeadlineExceededError(std::string(operation) +
-                                         " timed out");
+      return absl::DeadlineExceededError(std::string(operation) + " timed out");
     }
     if (errno != EINTR) return ErrnoStatus(operation);
   }
@@ -227,8 +225,7 @@ absl::Status PlainWriteAll(int fd, std::string_view bytes,
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::string> PlainReadLine(int fd,
-                                          MetaAdminDeadline deadline) {
+absl::StatusOr<std::string> PlainReadLine(int fd, MetaAdminDeadline deadline) {
   std::string reply;
   char buffer[4096];
   while (true) {
@@ -247,11 +244,10 @@ absl::StatusOr<std::string> PlainReadLine(int fd,
       // An empty close is ordinary connection churn and discovery may retry
       // it. Once any wire bytes arrive, EOF proves a truncated reply and must
       // remain fatal instead of being hidden by another discovery attempt.
-      return reply.empty()
-                 ? absl::UnavailableError(
-                       "server closed before terminating its reply")
-                 : absl::DataLossError(
-                       "server closed before terminating its reply");
+      return reply.empty() ? absl::UnavailableError(
+                                 "server closed before terminating its reply")
+                           : absl::DataLossError(
+                                 "server closed before terminating its reply");
     }
     if (errno == EINTR) continue;
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -267,8 +263,7 @@ absl::StatusOr<std::string> PlainReadLine(int fd,
   return reply;
 }
 
-absl::StatusOr<SslContext> MakeTlsContext(
-    const MetaAdminTlsOptions& options) {
+absl::StatusOr<SslContext> MakeTlsContext(const MetaAdminTlsOptions& options) {
   if (options.ca_file_.empty() || options.certificate_file_.empty() ||
       options.private_key_file_.empty()) {
     return absl::InvalidArgumentError(
@@ -284,9 +279,8 @@ absl::StatusOr<SslContext> MakeTlsContext(
       1) {
     return OpenSslStatus("load TLS CA");
   }
-  if (SSL_CTX_use_certificate_chain_file(raw,
-                                         options.certificate_file_.c_str()) !=
-      1) {
+  if (SSL_CTX_use_certificate_chain_file(
+          raw, options.certificate_file_.c_str()) != 1) {
     return OpenSslStatus("load TLS certificate chain");
   }
   if (SSL_CTX_use_PrivateKey_file(raw, options.private_key_file_.c_str(),
@@ -301,8 +295,7 @@ absl::StatusOr<SslContext> MakeTlsContext(
 }
 
 absl::Status WaitForSsl(SSL* ssl, int result, MetaAdminDeadline deadline,
-                        std::string_view operation,
-                        bool authentication_phase,
+                        std::string_view operation, bool authentication_phase,
                         bool partial_reply = false) {
   const int error = SSL_get_error(ssl, result);
   if (error == SSL_ERROR_WANT_READ) {
@@ -312,8 +305,7 @@ absl::Status WaitForSsl(SSL* ssl, int result, MetaAdminDeadline deadline,
     return WaitFor(SSL_get_fd(ssl), POLLOUT, deadline, operation);
   }
   if (partial_reply) {
-    return absl::DataLossError(
-        "server closed before terminating its reply");
+    return absl::DataLossError("server closed before terminating its reply");
   }
   if (error == SSL_ERROR_SYSCALL && errno != 0) {
     return ErrnoStatus(operation);
@@ -379,8 +371,7 @@ absl::Status TlsWriteAll(SSL* ssl, std::string_view bytes,
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::string> TlsReadLine(SSL* ssl,
-                                        MetaAdminDeadline deadline) {
+absl::StatusOr<std::string> TlsReadLine(SSL* ssl, MetaAdminDeadline deadline) {
   std::string reply;
   char buffer[4096];
   while (true) {
@@ -397,15 +388,13 @@ absl::StatusOr<std::string> TlsReadLine(SSL* ssl,
       continue;
     }
     if (SSL_get_error(ssl, received) == SSL_ERROR_ZERO_RETURN) {
-      return reply.empty()
-                 ? absl::UnavailableError(
-                       "server closed before terminating its reply")
-                 : absl::DataLossError(
-                       "server closed before terminating its reply");
+      return reply.empty() ? absl::UnavailableError(
+                                 "server closed before terminating its reply")
+                           : absl::DataLossError(
+                                 "server closed before terminating its reply");
     }
-    if (absl::Status ready =
-            WaitForSsl(ssl, received, deadline, "TLS read", false,
-                       !reply.empty());
+    if (absl::Status ready = WaitForSsl(ssl, received, deadline, "TLS read",
+                                        false, !reply.empty());
         !ready.ok()) {
       return ready;
     }
@@ -457,7 +446,8 @@ absl::StatusOr<std::string> MetaAdminClient::RoundTrip(
   }
   auto context = MakeTlsContext(target.tls_);
   if (!context.ok()) return context.status();
-  auto ssl = StartTls(context->get(), fd->get(), *endpoint, target.tls_, deadline);
+  auto ssl =
+      StartTls(context->get(), fd->get(), *endpoint, target.tls_, deadline);
   if (!ssl.ok()) return ssl.status();
   if (absl::Status sent = TlsWriteAll(ssl->get(), wire, deadline); !sent.ok()) {
     return sent;

@@ -511,12 +511,13 @@ cluster; startup intentionally refuses to guess at a conversion.
 
 ## Binary replacement and format compatibility
 
-Meta durable schema v3 is exact and does not support a mixed-version window or
-an in-band format switch. A v2 data directory is rejected at startup and has no
-in-place migration. For a binary-only change that preserves the
-format, replace one follower at a time, wait for catch-up, and replace the
-leader last. Before any replacement, back up every member and record the
-membership, term, commit index, and snapshot index.
+Meta durable schema and segmented WAL remain v1 while the first release is
+unpublished. The current layout replaces earlier development layouts in
+place; equal version numbers do not make incompatible builds safe to mix.
+There is no mixed-format window or in-band format switch. For a binary-only
+change that preserves the format, replace one follower at a time, wait for
+catch-up, and replace the leader last. Before any replacement, back up every
+member and record the membership, term, commit index, and snapshot index.
 
 For an incompatible pre-release format change, stop the old cluster and create
 fresh data directories with the new binary. Do not add a new-format process to

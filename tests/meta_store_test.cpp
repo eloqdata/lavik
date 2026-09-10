@@ -1,4 +1,4 @@
-// Tests for the persistence glue under src/meta/: the WAL v2
+// Tests for the persistence glue under src/meta/: the WAL v1
 // segmented NuraftLogStore and NuraftStateMgr.
 //
 // Component contracts are exercised by closing and reopening the same data
@@ -16,6 +16,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -81,6 +83,35 @@ std::string EntryPayload(const nuraft::ptr<nuraft::log_entry>& entry) {
                      buf.size());
 }
 
+std::string ReadFileBytes(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+void WriteFileBytes(const std::filesystem::path& path,
+                    const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(bytes.data(), bytes.size());
+  ASSERT_TRUE(out.good());
+}
+
+// Keep the header checksum valid so recovery must distinguish an unsupported
+// format from an interrupted header write.
+void SetSegmentVersion(std::string& bytes, uint32_t version) {
+  ASSERT_GE(bytes.size(), 20u);
+  for (unsigned ii = 0; ii < 4; ++ii) {
+    bytes[4 + ii] = static_cast<char>(version >> (8 * ii));
+  }
+  uint32_t checksum = 2166136261u;
+  for (unsigned ii = 0; ii < 16; ++ii) {
+    checksum ^= static_cast<unsigned char>(bytes[ii]);
+    checksum *= 16777619u;
+  }
+  for (unsigned ii = 0; ii < 4; ++ii) {
+    bytes[16 + ii] = static_cast<char>(checksum >> (8 * ii));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // NuraftLogStore
 // ---------------------------------------------------------------------------
@@ -94,7 +125,7 @@ class LogStoreTest : public ::testing::Test {
     return NuraftLogStore::Open(dir_);
   }
 
-  // WAL v2: tiny segment cap forces rolling so tests exercise multi-segment
+  // WAL v1: tiny segment cap forces rolling so tests exercise multi-segment
   // behavior without writing megabytes.
   absl::StatusOr<std::unique_ptr<NuraftLogStore>> OpenWithCap(
       uint64_t max_segment_bytes) {
@@ -123,6 +154,15 @@ class LogStoreTest : public ::testing::Test {
     return total;
   }
 
+  std::map<std::string, std::string> DirectoryBytes() {
+    std::map<std::string, std::string> result;
+    for (const auto& entry : std::filesystem::directory_iterator(dir_)) {
+      result.emplace(entry.path().filename().string(),
+                     ReadFileBytes(entry.path()));
+    }
+    return result;
+  }
+
   std::filesystem::path dir_;
 };
 
@@ -136,6 +176,79 @@ TEST_F(LogStoreTest, FreshStoreIsEmpty) {
   EXPECT_EQ(store->last_entry()->get_term(), 0u);
   EXPECT_EQ(store->term_at(1), 0u);
   EXPECT_EQ(store->entry_at(1), nullptr);
+}
+
+TEST_F(LogStoreTest, SegmentHeaderUsesFormatV1) {
+  {
+    auto opened = Open();
+    ASSERT_TRUE(opened.ok()) << opened.status();
+    auto entry = MakeEntry(1, "payload");
+    (*opened)->append(entry);
+    ASSERT_TRUE((*opened)->flush());
+  }
+  const std::string bytes = ReadFileBytes(dir_ / "log-1.seg");
+  ASSERT_GE(bytes.size(), 20u);
+  EXPECT_EQ(bytes.substr(4, 4), std::string("\x01\x00\x00\x00", 4));
+}
+
+TEST_F(LogStoreTest, UnsupportedSegmentVersionLeavesAllFilesUntouched) {
+  for (const uint32_t version : {2u, 3u}) {
+    for (const bool incompatible_first : {true, false}) {
+      SCOPED_TRACE(version);
+      SCOPED_TRACE(incompatible_first);
+      RemoveTestDir(dir_);
+      {
+        auto opened = OpenWithCap(64);
+        ASSERT_TRUE(opened.ok()) << opened.status();
+        for (unsigned ii = 0; ii < 5; ++ii) {
+          auto entry = MakeEntry(1, "x");
+          (*opened)->append(entry);
+        }
+        ASSERT_TRUE((*opened)->flush());
+      }
+      const auto segments = SegmentFiles();
+      ASSERT_GT(segments.size(), 1u);
+      const auto incompatible =
+          dir_ / (incompatible_first ? segments.front() : segments.back());
+      std::string bytes = ReadFileBytes(incompatible);
+      SetSegmentVersion(bytes, version);
+      WriteFileBytes(incompatible, bytes);
+      if (!incompatible_first) {
+        // A later incompatible header must be found before an earlier torn
+        // record could trigger destructive prefix recovery.
+        const auto first = dir_ / segments.front();
+        WriteFileBytes(first, ReadFileBytes(first) + "torn");
+      }
+      const auto before = DirectoryBytes();
+      auto opened = Open();
+      ASSERT_FALSE(opened.ok());
+      EXPECT_EQ(opened.status().code(), absl::StatusCode::kFailedPrecondition);
+      EXPECT_NE(opened.status().message().find("format version"),
+                std::string_view::npos);
+      EXPECT_EQ(DirectoryBytes(), before);
+    }
+  }
+}
+
+TEST_F(LogStoreTest, UnsupportedCompactIntentLeavesAllFilesUntouched) {
+  {
+    auto opened = Open();
+    ASSERT_TRUE(opened.ok()) << opened.status();
+    auto entry = MakeEntry(1, "payload");
+    (*opened)->append(entry);
+    ASSERT_TRUE((*opened)->flush());
+  }
+  for (const uint32_t version : {2u, 3u}) {
+    SCOPED_TRACE(version);
+    std::string intent = ReadFileBytes(dir_ / "log-1.seg");
+    SetSegmentVersion(intent, version);
+    WriteFileBytes(dir_ / "compact-1.ready", intent);
+    const auto before = DirectoryBytes();
+    auto opened = Open();
+    ASSERT_FALSE(opened.ok());
+    EXPECT_EQ(opened.status().code(), absl::StatusCode::kFailedPrecondition);
+    EXPECT_EQ(DirectoryBytes(), before);
+  }
 }
 
 TEST_F(LogStoreTest, AppendSurvivesReopen) {
@@ -375,10 +488,9 @@ TEST_F(LogStoreTest, TornTailIsTruncatedOnOpen) {
   EXPECT_EQ(store->append(entry), 4u);
 }
 
-TEST_F(LogStoreTest, RejectsV1LayoutDirectory) {
-  // WAL v2 is incompatible with the legacy single-file layout: a directory
-  // holding the v1 log must fail loudly instead of silently starting a fresh
-  // v2 log next to it.
+TEST_F(LogStoreTest, RejectsPrototypeSingleFileLayoutDirectory) {
+  // The segmented WAL is incompatible with the prototype single-file layout:
+  // refuse that directory instead of silently starting an empty segment set.
   std::filesystem::create_directories(dir_);
   {
     std::ofstream out(dir_ / "raft_log.dat", std::ios::binary);

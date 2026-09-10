@@ -363,7 +363,7 @@ after capture. A snapshot becomes eligible for log compaction only after its
 atomic durable publication succeeds. Incoming snapshots are size-bounded,
 decoded completely, and installed synchronously as one replacement state.
 
-WAL v2 uses checksum-protected `log-<first-index>.seg` files. Segments roll at
+WAL v1 uses checksum-protected `log-<first-index>.seg` files. Segments roll at
 a size trigger. Compaction writes the complete surviving suffix to a synced
 `compact-<first-index>.ready` intent before replacing the old segment set;
 startup finishes such an intent after a crash. A reported pre-publication
@@ -371,8 +371,10 @@ failure leaves both the live index and old segments authoritative. Append
 batches become durable at NuRaft's flush hooks;
 membership state and vote state use atomic rename plus file and directory
 sync. Recovery retains the intact contiguous prefix and truncates a torn tail.
+A checksum-valid segment or compact-intent header with an unsupported format
+version is rejected before recovery modifies any files.
 The older prototype's `raft_log.dat` and `LSN1` snapshots are intentionally
-incompatible and cause startup to fail with an explicit migration error.
+incompatible and cause startup to fail with an explicit format error.
 
 The persisted state-machine watermark is the snapshot index, not every applied
 WAL index. After restart, a post-snapshot tail remains invisible until Raft
@@ -390,25 +392,24 @@ compatibility or negotiation path. This wire version is independent of the
 durable schemas below.
 
 Commands, records, exports, snapshots, and WAL replay carry exact schema
-version 3. In addition to the established directive and evidence anchors, each
-active Meta-member identity may carry one canonical, concrete numeric Admin
-endpoint. The endpoint is committed with membership rather than revised by a
-separate routing command. A sole legacy-style member with no endpoint may
-complete that field once from its configured `--ctl-addr`; a nonempty endpoint
-is immutable, and changing it requires retirement followed by a fresh server
-id. Before a configuration can contain multiple voters, every current and new
-member must have a unique Admin endpoint. Durable operation
-evidence includes its exact group id, reporter assignment and boot, population
-identity, history, operation id, and evidence hash. Snapshot decoding rejects
+version 1. Each active Meta-member identity may carry one canonical, concrete
+numeric Admin endpoint. The endpoint is committed with membership rather than
+revised by a separate routing command. A sole UDS-managed member with no
+endpoint may complete that field once from its configured `--ctl-addr`; a
+nonempty endpoint is immutable, and changing it requires retirement followed
+by a fresh server id. Before a configuration can contain multiple voters,
+every current and new member must have a unique Admin endpoint. Durable
+operation evidence includes its exact group id, reporter assignment and boot,
+population identity, history, operation id, and evidence hash. Snapshot decoding rejects
 malformed identity anchors and evidence that names a missing group or an
 impossible future group/population epoch; older committed evidence remains
 valid history after a group legitimately advances or the reporter moves.
-Versions 1 and 2 are rejected rather than partially decoded or upgraded in
-place.
-Keylane Meta does not negotiate durable formats between mixed binary versions
-and has no in-band schema-switch command. A release that changes an
-incompatible format requires coordinated replacement of the Meta cluster;
-pre-release data from the superseded format is recreated rather than migrated.
+The unreleased schema and segmented WAL evolve in place as v1. This label
+does not guarantee compatibility with earlier development layouts: their
+data directories are recreated rather than migrated. Keylane Meta does not
+negotiate durable formats between mixed binary versions and has no in-band
+schema-switch command. Incompatible changes require coordinated replacement
+of the Meta cluster.
 Readers reject unknown markers and trailing bytes so incompatible state fails
 at startup or replay instead of being interpreted approximately. The
 independent segmented-WAL marker follows the same fail-loudly rule.

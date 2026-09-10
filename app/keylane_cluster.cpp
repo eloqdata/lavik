@@ -32,13 +32,12 @@ struct Options {
 }
 
 void PrintUsage(const char* program) {
-  std::fprintf(
-      stderr,
-      "Usage:\n"
-      "  %s status (--socket PATH | --addr IP:PORT)\n"
-      "     [--tls-ca FILE --tls-cert FILE --tls-key FILE]\n"
-      "     [--allow-plaintext-admin] [--timeout-ms N] [--json]\n",
-      program);
+  std::fprintf(stderr,
+               "Usage:\n"
+               "  %s status (--socket PATH | --addr IP:PORT)\n"
+               "     [--tls-ca FILE --tls-cert FILE --tls-key FILE]\n"
+               "     [--allow-plaintext-admin] [--timeout-ms N] [--json]\n",
+               program);
 }
 
 std::string_view Value(int argc, char** argv, int* index,
@@ -140,9 +139,10 @@ int Run(const Options& options) {
     seed.transport_ = keylane::meta::MetaAdminTarget::Transport::kUnix;
     seed.endpoint_ = options.socket_;
   } else {
-    seed.transport_ = options.tls_.ca_file_.empty()
-                          ? keylane::meta::MetaAdminTarget::Transport::kTcpPlaintext
-                          : keylane::meta::MetaAdminTarget::Transport::kTcpMtls;
+    seed.transport_ =
+        options.tls_.ca_file_.empty()
+            ? keylane::meta::MetaAdminTarget::Transport::kTcpPlaintext
+            : keylane::meta::MetaAdminTarget::Transport::kTcpMtls;
     seed.endpoint_ = options.address_;
     seed.tls_ = options.tls_;
   }
@@ -166,9 +166,12 @@ int Run(const Options& options) {
     Fail("failed to write stdout");
   }
   switch (outcome->result_) {
-    case keylane::meta::ClusterStatusResult::kReady: return 0;
-    case keylane::meta::ClusterStatusResult::kNotReady: return 2;
-    case keylane::meta::ClusterStatusResult::kRetryable: return 3;
+    case keylane::meta::ClusterStatusResult::kReady:
+      return 0;
+    case keylane::meta::ClusterStatusResult::kNotReady:
+      return 2;
+    case keylane::meta::ClusterStatusResult::kRetryable:
+      return 3;
   }
   return 1;
 }

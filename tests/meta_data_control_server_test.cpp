@@ -10,8 +10,8 @@
 #include "gtest/gtest.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/control_projector.h"
-#include "keylane/meta/data_control_server.h"
 #include "keylane/meta/data_control_runtime_status.h"
+#include "keylane/meta/data_control_server.h"
 #include "keylane/meta/observation_store.h"
 
 namespace keylane::meta {
@@ -46,16 +46,16 @@ using keylane::meta::IngestHeartbeatObservations;
 using keylane::meta::IngestOperationEvidenceObservation;
 using keylane::meta::MetaCommittedFacts;
 using keylane::meta::MetaCommittedView;
+using keylane::meta::MetaDataControlRuntimeStatus;
 using keylane::meta::MetaDataControlServer;
 using keylane::meta::MetaDataControlServerOptions;
 using keylane::meta::MetaDataControlServerTestPeer;
-using keylane::meta::MetaDataControlRuntimeStatus;
 using keylane::meta::MetaDirectiveDelivery;
 using keylane::meta::MetaDirectiveReceiptTracker;
-using keylane::meta::MetaLeaseEvaluation;
-using keylane::meta::MetaLeaseHandoffGuard;
 using keylane::meta::MetaLeaderRuntimeDisposition;
 using keylane::meta::MetaLeaderRuntimeGuard;
+using keylane::meta::MetaLeaseEvaluation;
+using keylane::meta::MetaLeaseHandoffGuard;
 using keylane::meta::MetaLocalMemberBindingDisposition;
 using keylane::meta::MetaNodeHealthObs;
 using keylane::meta::MetaObservationStore;
@@ -66,8 +66,8 @@ using keylane::meta::UnfencedSupersededAuthorities;
 using keylane::meta::detail::BoundNodeSessionRegistry;
 using keylane::meta::detail::MetaCommittedViewCache;
 using keylane::meta::detail::PendingHandshakeLimiter;
-using keylane::meta::detail::RetainedProjectionLimiter;
 using keylane::meta::detail::RecordEquivalentTransferBoundary;
+using keylane::meta::detail::RetainedProjectionLimiter;
 using keylane::meta::detail::TransferBoundaryNeedsProjectionValidation;
 
 template <std::size_t N>
@@ -90,10 +90,8 @@ TEST(MetaDataControlRuntimeStatusTest,
   projection.projection_hash = Bytes<32>(0x31);
   projection.groups.push_back({
       .group_id = "group-a",
-      .members = {{.node_id = Identity('1'),
-                   .assignment_id = Bytes<16>(0x11)},
-                  {.node_id = Identity('3'),
-                   .assignment_id = Bytes<16>(0x12)}},
+      .members = {{.node_id = Identity('1'), .assignment_id = Bytes<16>(0x11)},
+                  {.node_id = Identity('3'), .assignment_id = Bytes<16>(0x12)}},
       .owner_node_id = Identity('1'),
       .owner_assignment_id = Bytes<16>(0x11),
       .group_term = 4,
@@ -152,6 +150,56 @@ TEST(MetaDataControlRuntimeStatusTest,
                         /*leadership_generation=*/11,
                         /*validated_committed_high_water=*/7, projection);
   EXPECT_TRUE(status.Snapshot().nodes_.empty());
+}
+
+TEST(MetaDataControlRuntimeStatusTest,
+     EligibilityRecoversWithinTheSameLeadershipGeneration) {
+  MetaDataControlRuntimeStatus status;
+  MetaLeaderRuntimeGuard guard(/*leadership_validity_ms=*/250);
+  status.BeginLeadership(/*leadership_generation=*/11);
+  guard.Reset(/*now_suspend_clock_ms=*/1'000,
+              /*now_active_clock_ms=*/2'000);
+  const auto session = Bytes<16>(0x41);
+  control::FullDesiredState projection;
+  const auto publish = [&] {
+    status.PublishCurrent(Identity('1'), Identity('2'), session,
+                          /*session_generation=*/10,
+                          /*leadership_generation=*/11,
+                          /*validated_committed_high_water=*/7, projection);
+  };
+
+  // A suspend gap during initial membership reconciliation can leave the
+  // first authority check temporarily ineligible within a valid leader epoch.
+  const auto initial = guard.Observe(/*now_suspend_clock_ms=*/1'250,
+                                     /*now_active_clock_ms=*/2'000);
+  ASSERT_EQ(initial, MetaLeaderRuntimeDisposition::kQuarantineStarted);
+  status.SetLeaderAuthorityEligible(11, false);
+  publish();
+  EXPECT_FALSE(status.LeadershipState().leader_authority_eligible_);
+  EXPECT_TRUE(status.Snapshot().nodes_.empty());
+
+  const auto recovered = guard.Observe(/*now_suspend_clock_ms=*/1'500,
+                                       /*now_active_clock_ms=*/2'250);
+  ASSERT_EQ(recovered, MetaLeaderRuntimeDisposition::kEligible);
+  status.SetLeaderAuthorityEligible(11, true);
+  publish();
+  EXPECT_TRUE(status.LeadershipState().leader_authority_eligible_);
+  ASSERT_EQ(status.Snapshot().nodes_.size(), 1u);
+
+  // A later transient authority loss changes the status bracket, without
+  // destroying the established session or requiring a new leader generation.
+  status.SetLeaderAuthorityEligible(11, false);
+  EXPECT_FALSE(status.LeadershipState().leader_authority_eligible_);
+  EXPECT_EQ(status.Snapshot().nodes_.size(), 1u);
+  status.SetLeaderAuthorityEligible(11, true);
+  status.RecordHealth(Identity('1'), session,
+                      {.storage_ready = true, .population_ready = true},
+                      /*received_unix_ms=*/100);
+  const auto snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  EXPECT_EQ(snapshot.leadership_generation_, 11u);
+  EXPECT_TRUE(snapshot.leader_authority_eligible_);
+  EXPECT_EQ(snapshot.nodes_[0].health_received_unix_ms_, 100);
 }
 
 TEST(MetaCommittedViewCacheTest, CopiesOncePerNewAppliedHighWater) {
@@ -375,19 +423,41 @@ TEST(MetaDataControlHandshakeLimitTest,
   ASSERT_TRUE(handshake.has_value());
   celer::Connection first;
   celer::Connection duplicate;
+  MetaDataControlRuntimeStatus status;
+  status.BeginLeadership(/*leadership_generation=*/11);
+  status.SetLeaderAuthorityEligible(11, true);
+  const auto session = Bytes<16>(0x41);
+  control::FullDesiredState projection;
 
   ASSERT_TRUE(slots.TryClaim("node-a", &first));
+  status.PublishCurrent("node-a", Identity('2'), session,
+                        /*session_generation=*/10,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
   handshake->Release();
   auto next_handshake = limiter.TryAcquire();
   ASSERT_TRUE(next_handshake.has_value());
   EXPECT_FALSE(slots.TryClaim("node-a", &duplicate));
   EXPECT_EQ(slots.size(), 1u);
 
-  // Cleanup by a rejected duplicate must not release the incumbent's slot.
+  // A rejected duplicate never receives a session ID. Its cleanup must keep
+  // both the incumbent's admission slot and its live runtime observations.
   slots.Release("node-a", &duplicate);
+  status.Remove("node-a", nullptr);
   EXPECT_EQ(slots.size(), 1u);
+  ASSERT_EQ(status.Snapshot().nodes_.size(), 1u);
+  status.MarkValidated("node-a", session, 8);
+  status.RecordHealth("node-a", session,
+                      {.storage_ready = true, .population_ready = true},
+                      /*received_unix_ms=*/100);
+  const auto snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  EXPECT_EQ(snapshot.nodes_[0].validated_committed_high_water_, 8u);
+  EXPECT_EQ(snapshot.nodes_[0].health_received_unix_ms_, 100);
   slots.Release("node-a", &first);
+  status.Remove("node-a", &session);
   EXPECT_EQ(slots.size(), 0u);
+  EXPECT_TRUE(status.Snapshot().nodes_.empty());
   EXPECT_TRUE(slots.TryClaim("node-a", &duplicate));
 }
 

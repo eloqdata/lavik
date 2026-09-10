@@ -54,8 +54,7 @@ class Writer {
     }
     if (bytes_.size() > kMaxPayload - 4 ||
         value.size() > kMaxPayload - 4 - bytes_.size()) {
-      return absl::ResourceExhaustedError(
-          "cluster status payload exceeds cap");
+      return absl::ResourceExhaustedError("cluster status payload exceeds cap");
     }
     U32(static_cast<std::uint32_t>(value.size()));
     bytes_.append(value);
@@ -130,7 +129,8 @@ class Reader {
 
 absl::Status Count(Writer& writer, std::size_t count) {
   if (count > kMaxItems) {
-    return absl::ResourceExhaustedError("cluster status item count exceeds cap");
+    return absl::ResourceExhaustedError(
+        "cluster status item count exceeds cap");
   }
   writer.U32(static_cast<std::uint32_t>(count));
   return absl::OkStatus();
@@ -280,11 +280,11 @@ absl::Status ValidateDirectory(
 
 absl::Status ValidateHeadTarget(const ClusterHeadWireV1& head,
                                 const MetaAdminTarget& target) {
-  const auto responder = std::find_if(
-      head.meta_members_.begin(), head.meta_members_.end(),
-      [&](const ClusterMetaMemberWireV1& member) {
-        return member.server_id_ == head.responder_id_;
-      });
+  const auto responder =
+      std::find_if(head.meta_members_.begin(), head.meta_members_.end(),
+                   [&](const ClusterMetaMemberWireV1& member) {
+                     return member.server_id_ == head.responder_id_;
+                   });
   if (responder == head.meta_members_.end()) {
     return absl::DataLossError("responder id is absent from Meta directory");
   }
@@ -297,11 +297,11 @@ absl::Status ValidateHeadTarget(const ClusterHeadWireV1& head,
 }
 
 absl::Status ValidateStatusIdentity(const ClusterStatusWireV1& status) {
-  const auto responder = std::find_if(
-      status.meta_members_.begin(), status.meta_members_.end(),
-      [&](const ClusterMetaMemberWireV1& member) {
-        return member.server_id_ == status.capture_.responder_id_;
-      });
+  const auto responder =
+      std::find_if(status.meta_members_.begin(), status.meta_members_.end(),
+                   [&](const ClusterMetaMemberWireV1& member) {
+                     return member.server_id_ == status.capture_.responder_id_;
+                   });
   if (responder == status.meta_members_.end() || !responder->is_leader_) {
     return absl::InvalidArgumentError(
         "clusterstatus responder is not the directory leader");
@@ -353,13 +353,12 @@ absl::Status ValidateStatusIdentity(const ClusterStatusWireV1& status) {
         return absl::InvalidArgumentError(
             "clusterstatus serving group lacks an owner grant");
       }
-      const auto owner = std::find_if(
-          status.data_nodes_.begin(), status.data_nodes_.end(),
-          [&](const ClusterDataNodeWireV1& node) {
-            return node.node_id_ == *group.owner_node_id_;
-          });
-      if (owner == status.data_nodes_.end() ||
-          !owner->group_id_.has_value() ||
+      const auto owner =
+          std::find_if(status.data_nodes_.begin(), status.data_nodes_.end(),
+                       [&](const ClusterDataNodeWireV1& node) {
+                         return node.node_id_ == *group.owner_node_id_;
+                       });
+      if (owner == status.data_nodes_.end() || !owner->group_id_.has_value() ||
           *owner->group_id_ != group.group_id_ ||
           owner->lease_status_ != ClusterLeaseStatus::kRecentlyGranted) {
         return absl::InvalidArgumentError(
@@ -382,11 +381,11 @@ absl::Status ValidateStatusIdentity(const ClusterStatusWireV1& status) {
         "clusterstatus data node references an unknown group");
   }
   auto ranges = status.slot_ranges_;
-  std::sort(ranges.begin(), ranges.end(), [](const auto& left,
-                                             const auto& right) {
-    return std::tie(left.first_, left.last_, left.group_id_) <
-           std::tie(right.first_, right.last_, right.group_id_);
-  });
+  std::sort(ranges.begin(), ranges.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.first_, left.last_, left.group_id_) <
+                     std::tie(right.first_, right.last_, right.group_id_);
+            });
   std::uint32_t previous_last = 0;
   std::uint32_t expected_first = 0;
   bool first_range = true;
@@ -426,11 +425,11 @@ absl::Status ValidateStatusIdentity(const ClusterStatusWireV1& status) {
   if (status.serving_ready_) {
     const bool every_slot_group_ready =
         std::all_of(ranges.begin(), ranges.end(), [&](const auto& range) {
-          const auto group = std::find_if(
-              status.groups_.begin(), status.groups_.end(),
-              [&](const ClusterGroupWireV1& item) {
-                return item.group_id_ == range.group_id_;
-              });
+          const auto group =
+              std::find_if(status.groups_.begin(), status.groups_.end(),
+                           [&](const ClusterGroupWireV1& item) {
+                             return item.group_id_ == range.group_id_;
+                           });
           return group != status.groups_.end() && group->serving_ready_;
         });
     if (!full_slot_coverage || status.groups_.empty() ||
@@ -508,13 +507,27 @@ std::string EscapeJson(std::string_view value) {
   std::string output;
   for (unsigned char ch : value) {
     switch (ch) {
-      case '"': output += "\\\""; break;
-      case '\\': output += "\\\\"; break;
-      case '\b': output += "\\b"; break;
-      case '\f': output += "\\f"; break;
-      case '\n': output += "\\n"; break;
-      case '\r': output += "\\r"; break;
-      case '\t': output += "\\t"; break;
+      case '"':
+        output += "\\\"";
+        break;
+      case '\\':
+        output += "\\\\";
+        break;
+      case '\b':
+        output += "\\b";
+        break;
+      case '\f':
+        output += "\\f";
+        break;
+      case '\n':
+        output += "\\n";
+        break;
+      case '\r':
+        output += "\\r";
+        break;
+      case '\t':
+        output += "\\t";
+        break;
       default:
         if (ch < 0x20) {
           static constexpr char kDigits[] = "0123456789abcdef";
@@ -549,26 +562,34 @@ std::string OptionalStringJson(const std::optional<std::string>& value) {
 
 std::string ResultName(ClusterStatusResult result) {
   switch (result) {
-    case ClusterStatusResult::kReady: return "ready";
-    case ClusterStatusResult::kNotReady: return "not_ready";
-    case ClusterStatusResult::kRetryable: return "retryable";
+    case ClusterStatusResult::kReady:
+      return "ready";
+    case ClusterStatusResult::kNotReady:
+      return "not_ready";
+    case ClusterStatusResult::kRetryable:
+      return "retryable";
   }
   return "retryable";
 }
 
 std::string LeaseName(ClusterLeaseStatus status) {
   switch (status) {
-    case ClusterLeaseStatus::kRecentlyGranted: return "recently_granted";
-    case ClusterLeaseStatus::kDenied: return "denied";
-    case ClusterLeaseStatus::kUnknown: return "unknown";
+    case ClusterLeaseStatus::kRecentlyGranted:
+      return "recently_granted";
+    case ClusterLeaseStatus::kDenied:
+      return "denied";
+    case ClusterLeaseStatus::kUnknown:
+      return "unknown";
   }
   return "unknown";
 }
 
 std::string_view DataNodeRoleName(ClusterDataNodeRole role) {
   switch (role) {
-    case ClusterDataNodeRole::kPrimary: return "primary";
-    case ClusterDataNodeRole::kReplica: return "replica";
+    case ClusterDataNodeRole::kPrimary:
+      return "primary";
+    case ClusterDataNodeRole::kReplica:
+      return "replica";
   }
   return "unknown";
 }
@@ -580,7 +601,8 @@ absl::StatusOr<std::string> EncodeClusterHeadReply(
   if (head.responder_id_ == 0) {
     return absl::InvalidArgumentError("responder id must be nonzero");
   }
-  if (absl::Status status = ValidateDirectory(head.meta_members_); !status.ok()) {
+  if (absl::Status status = ValidateDirectory(head.meta_members_);
+      !status.ok()) {
     return status;
   }
   Writer writer;
@@ -649,14 +671,15 @@ absl::StatusOr<ClusterHeadWireV1> DecodeClusterHeadReply(
   if (head.responder_id_ == 0) {
     return absl::DataLossError("responder id is zero");
   }
-  if (absl::Status status = ValidateDirectory(head.meta_members_); !status.ok()) {
+  if (absl::Status status = ValidateDirectory(head.meta_members_);
+      !status.ok()) {
     return status;
   }
-  const auto responder_member = std::find_if(
-      head.meta_members_.begin(), head.meta_members_.end(),
-      [&](const ClusterMetaMemberWireV1& member) {
-        return member.server_id_ == head.responder_id_;
-      });
+  const auto responder_member =
+      std::find_if(head.meta_members_.begin(), head.meta_members_.end(),
+                   [&](const ClusterMetaMemberWireV1& member) {
+                     return member.server_id_ == head.responder_id_;
+                   });
   const auto marked_leader = std::find_if(
       head.meta_members_.begin(), head.meta_members_.end(),
       [](const ClusterMetaMemberWireV1& member) { return member.is_leader_; });
@@ -684,7 +707,8 @@ absl::StatusOr<std::string> EncodeClusterStatusReply(
        status.topology_converged_ && status.serving_ready_)) {
     return absl::InvalidArgumentError("inconsistent cluster readiness");
   }
-  if (absl::Status valid = ValidateDirectory(status.meta_members_); !valid.ok()) {
+  if (absl::Status valid = ValidateDirectory(status.meta_members_);
+      !valid.ok()) {
     return valid;
   }
   if (absl::Status valid = ValidateStatusIdentity(status); !valid.ok()) {
@@ -703,17 +727,22 @@ absl::StatusOr<std::string> EncodeClusterStatusReply(
   writer.Bool(status.serving_ready_);
   writer.Bool(status.cluster_ready_);
   if (absl::Status counted = Count(writer, status.meta_members_.size());
-      !counted.ok()) return counted;
+      !counted.ok())
+    return counted;
   for (const auto& member : status.meta_members_) {
-    if (absl::Status wrote = WriteMember(writer, member); !wrote.ok()) return wrote;
+    if (absl::Status wrote = WriteMember(writer, member); !wrote.ok())
+      return wrote;
   }
   if (absl::Status counted = Count(writer, status.data_nodes_.size());
-      !counted.ok()) return counted;
+      !counted.ok())
+    return counted;
   for (const auto& node : status.data_nodes_) {
-    if (absl::Status wrote = writer.String(node.node_id_); !wrote.ok()) return wrote;
+    if (absl::Status wrote = writer.String(node.node_id_); !wrote.ok())
+      return wrote;
     writer.U8(static_cast<std::uint8_t>(node.role_));
     writer.Bool(node.retired_);
-    if (absl::Status wrote = OptionalString(writer, node.group_id_); !wrote.ok())
+    if (absl::Status wrote = OptionalString(writer, node.group_id_);
+        !wrote.ok())
       return wrote;
     writer.Bool(node.current_session_);
     writer.Bool(node.projection_current_);
@@ -721,31 +750,40 @@ absl::StatusOr<std::string> EncodeClusterStatusReply(
     writer.Bool(node.population_current_);
     writer.U8(static_cast<std::uint8_t>(node.lease_status_));
   }
-  if (absl::Status counted = Count(writer, status.groups_.size()); !counted.ok())
+  if (absl::Status counted = Count(writer, status.groups_.size());
+      !counted.ok())
     return counted;
   for (const auto& group : status.groups_) {
-    if (absl::Status wrote = writer.String(group.group_id_); !wrote.ok()) return wrote;
+    if (absl::Status wrote = writer.String(group.group_id_); !wrote.ok())
+      return wrote;
     writer.U64(group.term_);
     if (absl::Status wrote = OptionalString(writer, group.owner_node_id_);
-        !wrote.ok()) return wrote;
+        !wrote.ok())
+      return wrote;
     writer.U64(group.config_epoch_);
     OptionalU64(writer, group.grant_revision_);
     writer.Bool(group.serving_ready_);
     writer.Bool(group.topology_converged_);
   }
   if (absl::Status counted = Count(writer, status.slot_ranges_.size());
-      !counted.ok()) return counted;
+      !counted.ok())
+    return counted;
   for (const auto& range : status.slot_ranges_) {
     writer.U32(range.first_);
     writer.U32(range.last_);
-    if (absl::Status wrote = writer.String(range.group_id_); !wrote.ok()) return wrote;
+    if (absl::Status wrote = writer.String(range.group_id_); !wrote.ok())
+      return wrote;
   }
-  if (absl::Status counted = Count(writer, status.blockers_.size()); !counted.ok())
+  if (absl::Status counted = Count(writer, status.blockers_.size());
+      !counted.ok())
     return counted;
   for (const auto& blocker : status.blockers_) {
-    if (absl::Status wrote = writer.String(blocker.code_); !wrote.ok()) return wrote;
-    if (absl::Status wrote = writer.String(blocker.scope_); !wrote.ok()) return wrote;
-    if (absl::Status wrote = writer.String(blocker.detail_); !wrote.ok()) return wrote;
+    if (absl::Status wrote = writer.String(blocker.code_); !wrote.ok())
+      return wrote;
+    if (absl::Status wrote = writer.String(blocker.scope_); !wrote.ok())
+      return wrote;
+    if (absl::Status wrote = writer.String(blocker.detail_); !wrote.ok())
+      return wrote;
   }
   if (writer.bytes().size() > kMaxPayload) {
     return absl::ResourceExhaustedError("cluster status payload exceeds cap");
@@ -785,8 +823,7 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
     *output = *value;
     return absl::OkStatus();
   };
-  for (bool* value : {&status.meta_available_,
-                      &status.meta_membership_stable_,
+  for (bool* value : {&status.meta_available_, &status.meta_membership_stable_,
                       &status.topology_converged_, &status.serving_ready_,
                       &status.cluster_ready_}) {
     if (absl::Status read = read_bool(value); !read.ok()) return read;
@@ -947,9 +984,10 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::Status(
   MetaAdminTarget discovery = seed;
   std::vector<MetaAdminTarget> known_targets;
   std::string last_retry = "leader unavailable";
-  for (std::size_t attempt = 0; std::chrono::steady_clock::now() < options.deadline_;
-       ++attempt) {
-    auto head_reply = round_trip_(discovery, "clusterhead 1", options.deadline_);
+  for (std::size_t attempt = 0;
+       std::chrono::steady_clock::now() < options.deadline_; ++attempt) {
+    auto head_reply =
+        round_trip_(discovery, "clusterhead 1", options.deadline_);
     if (!head_reply.ok()) {
       if (IsFatalRoundTripStatus(head_reply.status())) {
         return head_reply.status();
@@ -980,11 +1018,11 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::Status(
       RetryBackoff(options.deadline_);
       continue;
     }
-    const auto member = std::find_if(
-        head->meta_members_.begin(), head->meta_members_.end(),
-        [&](const ClusterMetaMemberWireV1& item) {
-          return item.server_id_ == *head->leader_id_;
-        });
+    const auto member =
+        std::find_if(head->meta_members_.begin(), head->meta_members_.end(),
+                     [&](const ClusterMetaMemberWireV1& item) {
+                       return item.server_id_ == *head->leader_id_;
+                     });
     if (member == head->meta_members_.end()) {
       return absl::DataLossError("leader id is absent from Meta directory");
     }
@@ -1035,11 +1073,16 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::Status(
       return outcome;
     }
     known_targets.clear();
-    for (const auto& known_member : head->meta_members_) {
-      if (!known_member.ctl_endpoint_.has_value()) continue;
-      auto target = LearnedTarget(*known_member.ctl_endpoint_, options);
-      if (!target.ok()) return target.status();
-      known_targets.push_back(std::move(*target));
+    // A published TCP directory does not require a local UDS query to use it.
+    // Retry the existing UDS route without remote credentials; rediscovery
+    // still enforces TCP authorization above if the leader actually moves.
+    if (TlsComplete(options.tls_) || options.allow_plaintext_admin_) {
+      for (const auto& known_member : head->meta_members_) {
+        if (!known_member.ctl_endpoint_.has_value()) continue;
+        auto target = LearnedTarget(*known_member.ctl_endpoint_, options);
+        if (!target.ok()) return target.status();
+        known_targets.push_back(std::move(*target));
+      }
     }
     if (!known_targets.empty()) {
       discovery = known_targets[attempt % known_targets.size()];
@@ -1051,9 +1094,9 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::Status(
 
 absl::StatusOr<std::string> RenderClusterStatusJson(
     const ClusterStatusOutcome& outcome) {
-  std::string json = "{\"schema_version\":1,\"result\":" +
-                     Quote(ResultName(outcome.result_)) +
-                     ",\"readiness_basis\":\"meta_observed_v1\"";
+  std::string json =
+      "{\"schema_version\":1,\"result\":" + Quote(ResultName(outcome.result_)) +
+      ",\"readiness_basis\":\"meta_observed_v1\"";
   if (!outcome.status_.has_value()) {
     json += ",\"meta_available\":false,\"meta_membership_stable\":false";
     json += ",\"topology_converged\":false,\"serving_ready\":false";
@@ -1065,8 +1108,8 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
   }
   const auto& status = *outcome.status_;
   json += ",\"meta_available\":" + BoolJson(status.meta_available_);
-  json += ",\"meta_membership_stable\":" +
-          BoolJson(status.meta_membership_stable_);
+  json +=
+      ",\"meta_membership_stable\":" + BoolJson(status.meta_membership_stable_);
   json += ",\"topology_converged\":" + BoolJson(status.topology_converged_);
   json += ",\"serving_ready\":" + BoolJson(status.serving_ready_);
   json += ",\"cluster_ready\":" + BoolJson(status.cluster_ready_);
@@ -1075,24 +1118,30 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
   json += ",\"term\":" + U64Json(status.capture_.term_);
   json += ",\"config_index\":" + U64Json(status.capture_.config_index_);
   json += ",\"committed_index\":" + U64Json(status.capture_.committed_index_);
-  json += ",\"topology_epoch\":" + U64Json(status.capture_.topology_epoch_) + "}";
+  json +=
+      ",\"topology_epoch\":" + U64Json(status.capture_.topology_epoch_) + "}";
 
   auto members = status.meta_members_;
-  std::sort(members.begin(), members.end(), [](const auto& left, const auto& right) {
-    return left.server_id_ < right.server_id_;
-  });
+  std::sort(members.begin(), members.end(),
+            [](const auto& left, const auto& right) {
+              return left.server_id_ < right.server_id_;
+            });
   json += ",\"meta_members\":[";
   for (std::size_t ii = 0; ii < members.size(); ++ii) {
     if (ii != 0) json += ',';
     json += "{\"server_id\":" + Quote(std::to_string(members[ii].server_id_));
     json += ",\"leader\":" + BoolJson(members[ii].is_leader_);
-    json += ",\"ctl_endpoint\":" + OptionalStringJson(members[ii].ctl_endpoint_) + "}";
+    json +=
+        ",\"ctl_endpoint\":" + OptionalStringJson(members[ii].ctl_endpoint_) +
+        "}";
   }
   json += ']';
 
   auto nodes = status.data_nodes_;
   std::sort(nodes.begin(), nodes.end(),
-            [](const auto& left, const auto& right) { return left.node_id_ < right.node_id_; });
+            [](const auto& left, const auto& right) {
+              return left.node_id_ < right.node_id_;
+            });
   json += ",\"data_nodes\":[";
   for (std::size_t ii = 0; ii < nodes.size(); ++ii) {
     if (ii != 0) json += ',';
@@ -1110,9 +1159,10 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
   json += ']';
 
   auto groups = status.groups_;
-  std::sort(groups.begin(), groups.end(), [](const auto& left, const auto& right) {
-    return left.group_id_ < right.group_id_;
-  });
+  std::sort(groups.begin(), groups.end(),
+            [](const auto& left, const auto& right) {
+              return left.group_id_ < right.group_id_;
+            });
   json += ",\"groups\":[";
   for (std::size_t ii = 0; ii < groups.size(); ++ii) {
     if (ii != 0) json += ',';
@@ -1123,15 +1173,17 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
     json += ",\"config_epoch\":" + U64Json(group.config_epoch_);
     json += ",\"grant_revision\":" + OptionalU64Json(group.grant_revision_);
     json += ",\"serving_ready\":" + BoolJson(group.serving_ready_);
-    json += ",\"topology_converged\":" + BoolJson(group.topology_converged_) + "}";
+    json +=
+        ",\"topology_converged\":" + BoolJson(group.topology_converged_) + "}";
   }
   json += ']';
 
   auto ranges = status.slot_ranges_;
-  std::sort(ranges.begin(), ranges.end(), [](const auto& left, const auto& right) {
-    return std::tie(left.first_, left.last_, left.group_id_) <
-           std::tie(right.first_, right.last_, right.group_id_);
-  });
+  std::sort(ranges.begin(), ranges.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.first_, left.last_, left.group_id_) <
+                     std::tie(right.first_, right.last_, right.group_id_);
+            });
   json += ",\"slot_ranges\":[";
   for (std::size_t ii = 0; ii < ranges.size(); ++ii) {
     if (ii != 0) json += ',';
@@ -1142,10 +1194,11 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
   json += ']';
 
   auto blockers = status.blockers_;
-  std::sort(blockers.begin(), blockers.end(), [](const auto& left, const auto& right) {
-    return std::tie(left.code_, left.scope_, left.detail_) <
-           std::tie(right.code_, right.scope_, right.detail_);
-  });
+  std::sort(blockers.begin(), blockers.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.code_, left.scope_, left.detail_) <
+                     std::tie(right.code_, right.scope_, right.detail_);
+            });
   json += ",\"blockers\":[";
   for (std::size_t ii = 0; ii < blockers.size(); ++ii) {
     if (ii != 0) json += ',';
@@ -1162,8 +1215,12 @@ absl::StatusOr<std::string> RenderClusterStatusText(
     const ClusterStatusOutcome& outcome) {
   std::string text;
   switch (outcome.result_) {
-    case ClusterStatusResult::kReady: text = "READY\n"; break;
-    case ClusterStatusResult::kNotReady: text = "NOT READY\n"; break;
+    case ClusterStatusResult::kReady:
+      text = "READY\n";
+      break;
+    case ClusterStatusResult::kNotReady:
+      text = "NOT READY\n";
+      break;
     case ClusterStatusResult::kRetryable:
       text = "RETRYABLE\nreason=" + outcome.retry_reason_ + "\n";
       return text;
@@ -1172,18 +1229,20 @@ absl::StatusOr<std::string> RenderClusterStatusText(
     return absl::DataLossError("stable status outcome has no snapshot");
   }
   const auto& status = *outcome.status_;
-  text += "meta_available=" + std::string(status.meta_available_ ? "yes" : "no") +
-          " membership_stable=" +
-          std::string(status.meta_membership_stable_ ? "yes" : "no") +
-          " topology_converged=" +
-          std::string(status.topology_converged_ ? "yes" : "no") +
-          " serving_ready=" +
-          std::string(status.serving_ready_ ? "yes" : "no") + "\n";
+  text +=
+      "meta_available=" + std::string(status.meta_available_ ? "yes" : "no") +
+      " membership_stable=" +
+      std::string(status.meta_membership_stable_ ? "yes" : "no") +
+      " topology_converged=" +
+      std::string(status.topology_converged_ ? "yes" : "no") +
+      " serving_ready=" + std::string(status.serving_ready_ ? "yes" : "no") +
+      "\n";
   auto blockers = status.blockers_;
-  std::sort(blockers.begin(), blockers.end(), [](const auto& left, const auto& right) {
-    return std::tie(left.code_, left.scope_, left.detail_) <
-           std::tie(right.code_, right.scope_, right.detail_);
-  });
+  std::sort(blockers.begin(), blockers.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.code_, left.scope_, left.detail_) <
+                     std::tie(right.code_, right.scope_, right.detail_);
+            });
   for (const auto& blocker : blockers) {
     text += "blocker " + blocker.code_ + " " + blocker.scope_ + " " +
             blocker.detail_ + "\n";

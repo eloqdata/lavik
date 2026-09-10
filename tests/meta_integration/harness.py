@@ -1006,7 +1006,7 @@ def manual_snapshot(node, timeout=15.0):
 
 
 def wal_segment_first_indexes(node):
-    """Sorted first indexes of the node's WAL v2 segments
+    """Sorted first indexes of the node's WAL v1 segments
     (log-<first_idx>.seg; nuraft_log_store.h). Compaction unlinks covered
     segments and rewrites the boundary one, so once the log prefix is
     compacted the minimum first index advances past 1."""

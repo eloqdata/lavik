@@ -72,8 +72,8 @@
 
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/ctl_server.h"
-#include "keylane/meta/data_control_server.h"
 #include "keylane/meta/data_control_runtime_status.h"
+#include "keylane/meta/data_control_server.h"
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/nuraft_asio_transport.h"
 #include "keylane/meta/nuraft_log_store.h"
@@ -360,8 +360,7 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
         "together");
   }
   if (options.ctl_addr_.empty() && ctl_tls_any) {
-    return absl::InvalidArgumentError(
-        "ctl TLS options require --ctl-addr");
+    return absl::InvalidArgumentError("ctl TLS options require --ctl-addr");
   }
   if (options.election_ms_low_ >= options.election_ms_high_) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
@@ -583,11 +582,11 @@ int main(int argc, char** argv) {
       return 1;
     }
     ctl_endpoint = std::move(*parsed_ctl);
-    ctl_endpoint_text = ctl_endpoint->host_.find(':') == std::string::npos
-                            ? ctl_endpoint->host_ + ":" +
-                                  std::to_string(ctl_endpoint->port_)
-                            : "[" + ctl_endpoint->host_ + "]:" +
-                                  std::to_string(ctl_endpoint->port_);
+    ctl_endpoint_text =
+        ctl_endpoint->host_.find(':') == std::string::npos
+            ? ctl_endpoint->host_ + ":" + std::to_string(ctl_endpoint->port_)
+            : "[" + ctl_endpoint->host_ +
+                  "]:" + std::to_string(ctl_endpoint->port_);
   }
 
   // One process-wide logger to stderr; the pattern carries the node id so
@@ -857,8 +856,7 @@ int main(int argc, char** argv) {
         const absl::Status ctl_bound =
             WaitForBound([&ctl] { return ctl->status(); });
         if (!ctl_bound.ok()) {
-          spdlog::critical("ctl listener bind failed: {}",
-                           ctl_bound.message());
+          spdlog::critical("ctl listener bind failed: {}", ctl_bound.message());
           exit_code = 1;
           break;
         }

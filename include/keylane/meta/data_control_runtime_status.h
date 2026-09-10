@@ -90,14 +90,14 @@ class MetaDataControlRuntimeStatus {
   // Records a lease decision only after its Ack was written successfully.
   // Cached Ack replay deliberately does not call this method or refresh time.
   void RecordLeaseDecisionWritten(
-      std::string_view node_id,
-      const cluster::control::WireId128& session_id,
+      std::string_view node_id, const cluster::control::WireId128& session_id,
       const cluster::control::LeaseDecision& written_decision,
       std::int64_t written_unix_ms);
-  // Removes a node unconditionally when session_id is null; otherwise removes
-  // only the matching session so late cleanup cannot erase a replacement.
+  // Removes only the matching session. A null session_id is a no-op: a
+  // rejected handshake never owned a runtime incarnation and must not erase
+  // an incumbent. Leadership teardown clears all nodes through EndLeadership.
   void Remove(std::string_view node_id,
-              const cluster::control::WireId128* session_id = nullptr);
+              const cluster::control::WireId128* session_id);
   // Copies one mutex-consistent observational snapshot.
   MetaDataControlRuntimeSnapshot Snapshot() const;
   // Copies only the leadership bracket used after off-worker status encoding.

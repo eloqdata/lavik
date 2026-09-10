@@ -270,20 +270,25 @@ def admin_slow_reader_gate(node):
     # Keep the fixture compact in code but large enough to exceed a Unix
     # socket's send buffer after the binary status is hex-wrapped.
     node_count = 2_500
-    commands = "".join(
+    commands = [
         "registernode " + f"{index:040x}" + " keylane://node/" +
         f"{index:040x}" + " primary 127.0.0.1:9000\n"
-        for index in range(node_count)).encode()
+        for index in range(node_count)]
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as populate:
         populate.settimeout(30)
         populate.connect(node.ctl_path)
-        populate.sendall(commands)
         reader = populate.makefile("rb")
-        for index in range(node_count):
-            reply = reader.readline()
-            if not reply.startswith(b"OK "):
-                raise H.Failure(
-                    f"slow-reader fixture node {index}: {reply!r}")
+        # Bound both directions during setup: sending every command before
+        # reading replies can fill both Unix socket buffers and deadlock.
+        batch_size = 128
+        for first in range(0, node_count, batch_size):
+            batch = commands[first:first + batch_size]
+            populate.sendall("".join(batch).encode())
+            for index in range(first, first + len(batch)):
+                reply = reader.readline()
+                if not reply.startswith(b"OK "):
+                    raise H.Failure(
+                        f"slow-reader fixture node {index}: {reply!r}")
 
     slow = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1_024)
