@@ -256,6 +256,61 @@ absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
   return result;
 }
 
+bool SameClusterCreateRebuildScope(const MetaDirectiveSpec& authorize,
+                                   const MetaDirectiveSpec& rebuild) {
+  return authorize.target_node_id_ == rebuild.target_node_id_ &&
+         authorize.target_boot_id_ == rebuild.target_boot_id_ &&
+         authorize.assignment_id_ == rebuild.assignment_id_ &&
+         authorize.source_node_id_ == rebuild.source_node_id_ &&
+         authorize.source_assignment_id_ == rebuild.source_assignment_id_ &&
+         authorize.source_boot_id_ == rebuild.source_boot_id_ &&
+         authorize.source_replication_history_id_ ==
+             rebuild.source_replication_history_id_ &&
+         authorize.group_id_ == rebuild.group_id_ &&
+         authorize.group_term_ == rebuild.group_term_ &&
+         authorize.authority_version_ == rebuild.authority_version_ &&
+         authorize.grant_revision_ == rebuild.grant_revision_ &&
+         authorize.population_manifest_revision_ ==
+             rebuild.population_manifest_revision_ &&
+         authorize.population_manifest_digest_ ==
+             rebuild.population_manifest_digest_ &&
+         authorize.partition_replication_epoch_ ==
+             rebuild.partition_replication_epoch_;
+}
+
+// Cluster creation commits source authorization and target rebuild together
+// so both carry the revision checked by the source handshake. Delivery is
+// nevertheless ordered: the target cannot dial until Meta has durably
+// observed that the source installed the matching authorization.
+bool ClusterCreateDirectiveReady(const MetaOperationRecord& operation,
+                                 const MetaCurrentDirective& current) {
+  if (operation.kind_ != kMetaClusterCreateV1GroupOperationKind ||
+      current.spec_.kind_ != kMetaDirectiveRebuild) {
+    return true;
+  }
+  const auto authorize = std::find_if(
+      operation.current_directives_.begin(),
+      operation.current_directives_.end(),
+      [&](const MetaCurrentDirective& candidate) {
+        return candidate.spec_.kind_ == kMetaDirectiveAuthorizeSource &&
+               candidate.directive_revision_ == current.directive_revision_ &&
+               SameClusterCreateRebuildScope(candidate.spec_, current.spec_);
+      });
+  if (authorize == operation.current_directives_.end()) return false;
+  return std::any_of(
+      operation.terminal_receipts_.begin(),
+      operation.terminal_receipts_.end(),
+      [&](const MetaTerminalReceipt& receipt) {
+        return receipt.key_.operation_id_ == operation.operation_id_ &&
+               receipt.key_.directive_id_ ==
+                   authorize->spec_.directive_id_ &&
+               receipt.key_.attempt_id_ == authorize->spec_.attempt_id_ &&
+               receipt.key_.directive_revision_ ==
+                   authorize->directive_revision_ &&
+               receipt.status_ == MetaDirectiveResultStatus::kSucceeded;
+      });
+}
+
 }  // namespace
 
 absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
@@ -439,6 +494,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     bool has_directive_for_requested_node = false;
     for (const MetaCurrentDirective& current : operation.current_directives_) {
       if (current.spec_.recipient_node_id_ != node_id) continue;
+      if (!ClusterCreateDirectiveReady(operation, current)) continue;
       has_directive_for_requested_node = true;
       if (const absl::Status anchor =
               ValidateCommittedDirectiveAnchor(view.stores(), current.spec_);

@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <optional>
+#include <string_view>
 
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/data_control_runtime_status.h"
@@ -9,6 +10,12 @@
 namespace keylane::meta {
 
 namespace detail {
+// Stable child identity used by recovery and the Admin outcome. It is derived
+// from the durable root operation and normalized Group id, so leadership
+// changes never mint a competing population operation.
+MetaOperationId ClusterCreateV1GroupOperationId(
+    const MetaOperationId& root, std::string_view group_id);
+
 // Plans at most one committed effect from an atomic recovered view. A missing
 // command means wait for Data; incompatible state requires operator recovery,
 // never another destructive initialization. No I/O or in-memory phase cursor.

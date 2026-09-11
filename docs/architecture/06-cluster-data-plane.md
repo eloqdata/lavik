@@ -695,9 +695,12 @@ A real-process plaintext Data-control gate starts three Meta members and a Data
 node, exercising follower-seed redirect, full-state install, heartbeat
 observation, leader failure and reconnect, stale-member restart, and graceful
 shutdown. Separate single-Meta gates cover mTLS identity and TLS/plaintext mode
-selection. The cluster-create process gate starts an unregistered, fenced Data
-node and a bootstrap Meta, then exercises both interactive and `--yes` creation
-through real population initialization and Redis Cluster commands.
+selection. The cluster-create process gate starts one bootstrap Meta and two
+Groups of initially unregistered, fenced primary/replica Data nodes. It covers
+automatic and explicit slot layouts, interactive and `--yes` confirmation,
+real sparse-population initialization, native full rebuild and continued
+replication, Redis routing/redirect/cross-slot behavior, and exact node-level
+diagnostics when one replica is stopped.
 
 ## Source map
 

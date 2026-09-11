@@ -554,67 +554,87 @@ Unassigned nodes remain diagnostic only. Empty and partially configured
 clusters are stable `NOT READY` results.
 
 `keylane-ctl cluster-create` reuses the same private leader discovery and
-status-capture seam. Its v1 manifest is a topology document, not a deployment
-document: it names exactly one existing Meta id, one canonical Data id and
-numeric plaintext client endpoint, one group/primary, and one full
-`0..16383` range. The CLI rejects unknown or duplicate TOML structure and
-files over 64 KiB, renders the normalized plan and destructive Data warning,
-and requires exact lowercase `yes` before opening an Admin connection unless
-`--yes` is present.
+status-capture seam and accepts only manifest schema v1. A manifest names one
+existing Meta member, one or more canonical Data identities and numeric client
+endpoints, and one or more Groups with exactly one primary and optional
+replicas. Slots are either generated with `contiguous-even` after sorting Group
+ids or supplied as a complete, non-overlapping `0..16383` range table. All
+declared Data belongs to exactly one Group and every Group owns at least one
+slot. The parser rejects unknown TOML structure and files over 64 KiB, then
+sorts nodes, Groups, replicas and ranges and merges adjacent ranges belonging
+to the same Group. The CLI renders that canonical plan and requires exact
+lowercase `yes` unless `--yes` is present. Only this normalized multi-Group
+shape is accepted under version 1; scalar payloads have no compatibility
+decoder.
 
 After an empty-topology and no-active-create client check, the CLI sends one
-versioned `clustercreate` request to the discovered leader. `MetaCtlServer`
-submits the complete normalized plan as a `cluster-create-workflow-v1`
-operation before modifying topology, retaining the authenticated submitter.
-Apply reserves pristine state for that operation; a different creation id is
-rejected, while exact-id replay remains valid after topology changes.
-Admin only waits for the durable result. A timeout or shutdown cancels the
-wait, not the operation, and a repeated CLI invocation does not create a
-replacement for unfinished work.
+`clustercreate 1` request to the discovered leader. `MetaCtlServer` commits
+the entire normalized request as the intent of the existing
+`cluster-create-workflow-v1` root operation before changing topology. Apply
+reserves pristine state for that operation; a different creation id is
+rejected, while exact-id replay remains legal. Admin only waits for the
+durable result. A timeout or shutdown cancels the wait, not the operation, and
+a repeated CLI invocation does not create a replacement for unfinished work.
 
 `MetaClusterCreateReconciler` runs on the Meta worker after each caught-up
 leader transition. Its atomic committed subscription includes the recovered
-snapshot/WAL prefix; it scans non-terminal creation operations and plans one
-effect at a time from their retained intent, phase and actual committed state.
-Every effect is checked before a phase checkpoint advances, including recovery
-between those two commits. Subscription overflow reacquires the complete view.
-The reconciler uses the trusted coordinator actor for follow-up proposals;
-the original operator remains recorded on the root operation. Creation and
-Meta membership changes share an asynchronous admission lease, with the
-durable active-operation check covering handoff, timeout and restart.
+snapshot/WAL prefix; it scans the one non-terminal creation root and plans one
+existing Meta command at a time from retained intent, phase, and actual
+committed state. Every effect is checked before its phase checkpoint advances,
+including recovery between those commits. Subscription overflow reacquires the
+complete view. The reconciler uses the trusted coordinator actor for follow-up
+proposals; the original operator remains recorded on the root operation.
+Creation and Meta membership changes share admission, with the durable active
+operation check covering handoff, timeout, and restart.
 
-The workflow commits Data identity, assignment and fenced term, the full slot
-map, 16,384-entry population manifest, partition epoch, policy and finite
-authority in dependency order. Only an acknowledged, current Data projection
-permits submitting the history-bound population child operation. A stable,
-domain-separated child id ties it to the creation intent; its immutable
-boot/history binding is not guessed at initial submission or changed on retry.
-The child retains the original `cluster-create-v1` population kind and carries
-the `initialize-empty-population` directive with exact assignment, term,
-authority, grant, manifest and partition-epoch anchors. The existing publisher
-replays that same directive after reconnect; it does not mint a new attempt
-because a result is missing. Success durably records the receipt, removes the
-directive, completes the child, then completes the root. Each boundary resumes
-independently without the original Admin connection. A committed failure
-fences before terminalization. Changed topology, lost attempt authorization or
-a changed Data incarnation is not permission to reset again: incompatible
-recovery stops at an inspectable `recovery-required` phase. Legacy population
-operations without a full root intent are not adopted as new creations.
+The reconciler registers Data in node-id order, creates Groups in Group-id
+order, assigns primary before sorted replicas, begins term 1, and replaces the
+whole Slot map with one `SetSlotMap` carrying every canonical range and each
+Group's config epoch. It installs one shared `keylane.cluster-create-v1`
+policy, then uses the existing population store, replication-state command,
+and finite authority command to anchor a sparse manifest containing only each
+Group's slots and grant that Group to its declared primary. No separate
+persistent topology or creation-state model exists.
+
+Only current, boot-bound Data sessions that acknowledge the complete
+projection permit population initialization. Each Group receives one stable,
+domain-separated `cluster-create-v1` child operation. Its primary first gets
+the existing source-less empty-population directive. After that exact success
+receipt commits, the child installs one existing `authorize-source` and one
+`rebuild` directive per replica in a single revision. The projector sends
+the authorization immediately but withholds each rebuild until its matching
+authorization success is durable. The rebuild completion means the existing
+replication manager has activated the population and established its native
+replication session; subsequent heartbeats supply the population-current READY
+evidence.
+
+Group children execute in canonical Group order. Exact directive identities,
+attempts, boots, histories, assignments, terms, grants, manifests, and
+partition epochs make reconnect replay safe without minting another attempt.
+A deterministic failure fences only that Group before aborting its child and
+then the root; already completed Groups are not rolled back. Incompatible
+topology or incarnation changes stop at an inspectable `recovery-required`
+phase rather than authorizing another destructive initialization. After every
+child completes, the root completes and Admin returns the stable Group ids,
+child operation ids, and their committed population proof indices.
 
 Demotion and shutdown cancel the owner and join its local proposal work while
-the worker/executor remain live. Already accepted proposals may commit;
-cancellation never synthesizes a Data result, rolls back committed topology or
-adds a compensating fence. The next leader re-reads the authoritative effects.
+the worker and executor remain live. Already accepted proposals may commit;
+cancellation never synthesizes a Data result, rolls back committed topology,
+or adds a compensating fence. The next leader re-reads authoritative effects.
 Creation and Meta membership have dedicated background drivers. Arbitrary
 operation kinds, including full Data migration/failover orchestration, still
 require their own recovery policy; journal persistence alone supplies none.
 
-The client then polls the ordinary status path until the exact topology,
-population proof, and recent lease are READY, and invokes `redis-cli -c` to
-verify the public `CLUSTER INFO`, `SLOTS`, and `KEYSLOT` contracts plus an exact
-`SET`/`GET`/`DEL` round trip. This keeps internal Raft revisions and generated
-identities off the public CLI while making success mean the client-facing data
-plane is usable, not merely that a metadata prefix committed.
+The client then polls the ordinary cluster-status v1 wire until roles,
+membership, topology, sparse population state, and recent authority evidence
+match the complete manifest. Node failures use existing blockers with
+`node:<id>` scope and identify the Group plus missing session, projection,
+health, or population conditions. Finally the CLI invokes `redis-cli` to
+exercise every Group's primary and verify `MOVED`, `CROSSSLOT`,
+`CLUSTER INFO`, `CLUSTER SLOTS`, and normal key operations. This makes
+success mean the declared multi-Group data plane is usable, not merely that a
+metadata prefix committed.
 
 Every privileged committed command creates a deterministic audit record keyed
 by Raft log index. Records include the injected actor, proposal time, command

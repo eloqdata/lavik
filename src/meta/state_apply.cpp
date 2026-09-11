@@ -844,15 +844,18 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   // reservation survives a lost proposer/leader. The entry-layer gate is
   // only fast rejection; two different creation ids must not both commit.
   // Existing-id replay above remains legal after topology has been built.
-  if ((cmd.kind_ == kMetaClusterCreateOperationKind ||
+  const bool creation = cmd.kind_ == kMetaClusterCreateOperationKind;
+  const bool creation_active =
+      stores.operation_.HasActiveKind(kMetaClusterCreateOperationKind);
+  if ((creation ||
        cmd.kind_ == kMetaMembershipOperationKind) &&
-      (stores.operation_.HasActiveKind(kMetaClusterCreateOperationKind) ||
+      (creation_active ||
        stores.operation_.HasActiveKind(kMetaMembershipOperationKind))) {
     return Rejected(
         "another durable Meta membership/creation workflow is active",
         std::move(summary));
   }
-  if (cmd.kind_ == kMetaClusterCreateOperationKind &&
+  if (creation &&
       (stores.identity_.NodeCount() != 0 ||
        stores.topology_.GroupCount() != 0 ||
        stores.population_manifest_.Size() != 0)) {

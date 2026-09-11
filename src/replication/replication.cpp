@@ -2051,6 +2051,25 @@ bool IsReplicationId(std::string_view value) {
          });
 }
 
+std::string PopulationGroupToken(std::string_view group_id) {
+  constexpr char kHex[] = "0123456789abcdef";
+  std::string token;
+  token.reserve(group_id.size() * 2);
+  for (unsigned char byte : group_id) {
+    token.push_back(kHex[byte >> 4]);
+    token.push_back(kHex[byte & 0x0f]);
+  }
+  return token;
+}
+
+bool IsPopulationGroupToken(std::string_view value) {
+  return !value.empty() && value.size() <= 128 && value.size() % 2 == 0 &&
+         std::all_of(value.begin(), value.end(), [](unsigned char digit) {
+           return (digit >= '0' && digit <= '9') ||
+                  (digit >= 'a' && digit <= 'f');
+         });
+}
+
 absl::StatusOr<PopulationManifestId> ParsePopulationManifestId(
     std::string_view value) {
   if (value.size() != 64) {
@@ -4001,18 +4020,20 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status>
-  ClearClusterRebuildSourceAuthorizationsForSessionReplacement() {
+  ClearClusterRebuildSourceAuthorizationsForSessionReplacement(
+      bool preserve_established_exports) {
     return RetireClusterRebuildSourceAuthorizations(
-        /*allow_same_revision_replay=*/true);
+        /*allow_same_revision_replay=*/true, preserve_established_exports);
   }
 
   Task<absl::Status> RetireClusterRebuildSourceAuthorizations(
-      bool allow_same_revision_replay) {
+      bool allow_same_revision_replay,
+      bool preserve_established_exports = false) {
     if (celer::ThisWorker().id_ != 0) {
       co_return co_await celer::SubmitTaskTo(
-          0, [this, allow_same_revision_replay] {
+          0, [this, allow_same_revision_replay, preserve_established_exports] {
             return RetireClusterRebuildSourceAuthorizations(
-                allow_same_revision_replay);
+                allow_same_revision_replay, preserve_established_exports);
           });
     }
     if (!cluster_population_managed_ || cluster_group_ == nullptr) {
@@ -4030,6 +4051,7 @@ class ReplicationManager::ReplicationGroup {
       }
     } revocation_guard{&cluster_source_revocations_in_flight_};
     std::vector<std::shared_ptr<MasterSession>> sessions;
+    std::size_t preserved_control_count = 0;
     {
       co_await master_mutex_.Lock(*celer::ThisWorker().self_);
       celer::CrossWorkerMutex::Guard lock(&master_mutex_);
@@ -4047,21 +4069,30 @@ class ReplicationManager::ReplicationGroup {
                        retired_master_sessions_.size());
       sessions.insert(sessions.end(), retired_master_sessions_.begin(),
                       retired_master_sessions_.end());
-      for (const auto& [id, session] : master_sessions_) {
-        (void)id;
-        sessions.push_back(session);
-        retired_master_sessions_.push_back(session);
+      for (auto session = master_sessions_.begin();
+           session != master_sessions_.end();) {
+        if (preserve_established_exports && session->second->online() &&
+            session->second->population_export_ != nullptr) {
+          ++preserved_control_count;
+          ++session;
+          continue;
+        }
+        const std::shared_ptr<MasterSession> retiring = session->second;
+        const auto erase = session++;
+        master_sessions_.erase(erase);
+        sessions.push_back(retiring);
+        retired_master_sessions_.push_back(std::move(retiring));
       }
       // Removing the registry entries under the same mutex as KLPSYNC
       // publication prevents a revoked control session from accepting a late
       // KLFLOW while cancellation is propagating.
-      master_sessions_.clear();
       disconnected_replica_leases_.clear();
     }
     for (const auto& session : sessions) session->Cancel();
     auto next_warning =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (active_master_controls_.load(std::memory_order_acquire) != 0 ||
+    while (active_master_controls_.load(std::memory_order_acquire) >
+               preserved_control_count ||
            std::any_of(sessions.begin(), sessions.end(),
                        [](const auto& session) {
                          return session->connected_flows() != 0;
@@ -7082,9 +7113,13 @@ class ReplicationManager::ReplicationGroup {
     const std::vector<std::string_view> words = SplitWords(*response);
     std::uint64_t session_id = 0;
     unsigned source_workers = 0;
+    const bool source_group_valid =
+        session->cluster_rebuild_ == nullptr
+            ? words.size() == 8 && IsReplicationId(words[3])
+            : words.size() == 8 && IsPopulationGroupToken(words[3]);
     if (words.size() != 8 || words[0] != "+KLFULLRESYNC" ||
         !ParseUnsigned(words[1], &session_id) || session_id == 0 ||
-        !IsReplicationId(words[2]) || !IsReplicationId(words[3]) ||
+        !IsReplicationId(words[2]) || !source_group_valid ||
         !IsReplicationId(words[4]) || !IsReplicationId(words[5]) ||
         !ParseUnsigned(words[6], &source_workers) || source_workers == 0 ||
         !IsReplicationId(words[7])) {
@@ -7104,7 +7139,7 @@ class ReplicationManager::ReplicationGroup {
     if (session->cluster_rebuild_ != nullptr) {
       const RebuildDirective& directive = session->cluster_rebuild_->directive_;
       if (words[2] != directive.identity_.source_node_id_ ||
-          words[3] != directive.identity_.group_id_ ||
+          words[3] != PopulationGroupToken(directive.identity_.group_id_) ||
           words[4] != directive.identity_.source_boot_id_ ||
           words[5] != directive.identity_.source_history_id_ ||
           source_workers != directive.flow_count_) {
@@ -10577,6 +10612,10 @@ class ReplicationManager::ReplicationGroup {
               "rebuild identity");
         }
         authorized_population = cluster_rebuild_;
+        // Meta-managed population identity supersedes the legacy process-local
+        // replication Group id. The target compares this response with the
+        // same authorized directive before accepting any source bytes.
+        source_group_id = PopulationGroupToken(requested.group_id_);
       }
 
       const bool allow_continue =
@@ -11436,8 +11475,10 @@ std::optional<absl::Status> ClusterRebuildCompletion::result() const {
 }
 
 Task<absl::Status> ReplicationManager::
-    ClearClusterRebuildSourceAuthorizationsForSessionReplacement() {
-  return group_->ClearClusterRebuildSourceAuthorizationsForSessionReplacement();
+    ClearClusterRebuildSourceAuthorizationsForSessionReplacement(
+        bool preserve_established_exports) {
+  return group_->ClearClusterRebuildSourceAuthorizationsForSessionReplacement(
+      preserve_established_exports);
 }
 
 unsigned ReplicationManager::snapshot_read_concurrency() const noexcept {

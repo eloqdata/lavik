@@ -299,8 +299,10 @@ class RecordingActions final : public NodeControlActions {
   }
 
   celer::Task<absl::Status>
-  ClearSourceAuthorizationsForSessionReplacementAndWait() override {
+  ClearSourceAuthorizationsForSessionReplacementAndWait(
+      bool preserve_established_exports) override {
     ++session_clears_;
+    preserve_established_exports_.push_back(preserve_established_exports);
     session_clear_entered_ = true;
     if (on_async_revocation_) on_async_revocation_();
     while (block_session_clear_) {
@@ -377,6 +379,7 @@ class RecordingActions final : public NodeControlActions {
   int revocations_ = 0;
   int async_revocations_ = 0;
   int session_clears_ = 0;
+  std::vector<bool> preserve_established_exports_;
   int population_reconciliations_ = 0;
   int population_cancellations_ = 0;
   int population_shutdown_cancellations_ = 0;
@@ -542,7 +545,7 @@ class LeaseExpiryService final : public celer::Service {
       server_->RequestStop();
       co_return result_;
     }
-    control_.actions.block_revocation_ = true;
+    control_.actions.block_session_clear_ = true;
 
     absl::Status slept = co_await celer::SleepFor(worker, 10ms);
     if (!slept.ok()) {
@@ -572,7 +575,7 @@ class LeaseExpiryService final : public celer::Service {
                 .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
                 .decision()
                 .kind_ == Decision::Kind::kServe &&
-        control_.actions.async_revocations_ == 0;
+        control_.actions.session_clears_ == 0;
 
     slept = co_await celer::SleepFor(worker, 70ms);
     if (!slept.ok()) {
@@ -592,14 +595,17 @@ class LeaseExpiryService final : public celer::Service {
     directive_blocked_during_expiry_ =
         (co_await control_.installer.ApplyDirective(NodeDirective{})).code() ==
         absl::StatusCode::kUnavailable;
-    control_.actions.block_revocation_ = false;
-    while (!control_.actions.revocation_exited_) {
+    control_.actions.block_session_clear_ = false;
+    while (!control_.actions.session_clear_exited_) {
       co_await celer::Yield(worker);
     }
     grant.sent_at_ = LeaseClockNow();
     renewal_succeeded_after_expiry_ =
         (co_await control_.installer.ApplyLeaseGrantTransition(grant)).ok();
-    revocations_ = control_.actions.async_revocations_;
+    revocations_ = control_.actions.session_clears_;
+    preserved_established_export_ =
+        control_.actions.preserve_established_exports_.size() == 1 &&
+        control_.actions.preserve_established_exports_.front();
     expirations_after_ = GetClusterControlMetrics().lease_expirations_;
     result_ = absl::OkStatus();
     server_->RequestStop();
@@ -617,6 +623,7 @@ class LeaseExpiryService final : public celer::Service {
   bool directive_blocked_during_expiry_ = false;
   bool renewal_succeeded_after_expiry_ = false;
   int revocations_ = 0;
+  bool preserved_established_export_ = false;
   std::uint64_t expirations_before_ = 0;
   std::uint64_t expirations_after_ = 0;
   absl::Status result_ = absl::UnknownError("lease expiry service did not run");
@@ -1586,6 +1593,7 @@ TEST(NodeControlInstallerTest,
   EXPECT_TRUE(service.directive_blocked_during_expiry_);
   EXPECT_TRUE(service.renewal_succeeded_after_expiry_);
   EXPECT_EQ(service.revocations_, 1);
+  EXPECT_TRUE(service.preserved_established_export_);
   EXPECT_EQ(service.expirations_after_, service.expirations_before_ + 1);
 }
 
@@ -1605,7 +1613,9 @@ TEST(NodeControlInstallerTest,
   EXPECT_TRUE(service.old_admitted_);
   EXPECT_TRUE(service.old_rejected_after_renewal_);
   EXPECT_TRUE(service.new_admission_serves_);
-  EXPECT_EQ(service.control_.actions.async_revocations_, 1);
+  EXPECT_EQ(service.control_.actions.session_clears_, 1);
+  ASSERT_EQ(service.control_.actions.preserve_established_exports_.size(), 1U);
+  EXPECT_TRUE(service.control_.actions.preserve_established_exports_.front());
   EXPECT_EQ(service.control_.actions.drained_.size(), 1u);
   EXPECT_EQ(service.expirations_after_, service.expirations_before_ + 1);
 }
@@ -1848,6 +1858,8 @@ TEST(NodeControlInstallerTest,
                               FullState(MakeState(), 3), Basis(10, 2)))
                   .ok());
   EXPECT_EQ(control.actions.session_clears_, 1);
+  ASSERT_EQ(control.actions.preserve_established_exports_.size(), 1U);
+  EXPECT_FALSE(control.actions.preserve_established_exports_.back());
   EXPECT_EQ(control.actions.population_reconciliations_, 1);
   ASSERT_TRUE(control.actions.desired_population_.has_value());
   EXPECT_EQ(control.actions.desired_population_->group_id_, "group-a");
@@ -1863,7 +1875,25 @@ TEST(NodeControlInstallerTest,
                               /*local_population_transition_expected=*/true))
                   .ok());
   EXPECT_EQ(control.actions.session_clears_, 2);
+  ASSERT_EQ(control.actions.preserve_established_exports_.size(), 2U);
+  EXPECT_TRUE(control.actions.preserve_established_exports_.back());
   EXPECT_TRUE(control.actions.population_transition_expected_);
+
+  // A replacement FDS carries committed desired state, not the boot-local
+  // ReadyToken that the heartbeat reapplies afterwards. That normalization
+  // must not tear down an already-online export when every durable population
+  // and authority anchor remains exact.
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              FullState(MakeState(
+                                            Assignment(1), 1, 1, 1, 1, 1, 1,
+                                            /*granted=*/true,
+                                            /*population_ready=*/false),
+                                        4),
+                              Basis(11, 3)))
+                  .ok());
+  EXPECT_EQ(control.actions.session_clears_, 3);
+  ASSERT_EQ(control.actions.preserve_established_exports_.size(), 3U);
+  EXPECT_TRUE(control.actions.preserve_established_exports_.back());
 
   const std::shared_ptr<const ServingState> old = control.cache.Current();
   ASSERT_NE(old, nullptr);
@@ -1875,9 +1905,11 @@ TEST(NodeControlInstallerTest,
   EXPECT_TRUE(
       RunTaskSync(
           control.installer.InstallFullStateTransition(
-              FullState(MakeState(Assignment(1), 2, 1, 1, 2), 4), Basis(11, 3)))
+              FullState(MakeState(Assignment(1), 2, 1, 1, 2), 5), Basis(12, 4)))
           .ok());
-  EXPECT_EQ(control.actions.session_clears_, 3);
+  EXPECT_EQ(control.actions.session_clears_, 4);
+  ASSERT_EQ(control.actions.preserve_established_exports_.size(), 4U);
+  EXPECT_FALSE(control.actions.preserve_established_exports_.back());
   EXPECT_EQ(old->GroupInFlightCount("group-a"), 0U);
 }
 
@@ -1977,6 +2009,8 @@ TEST(NodeControlInstallerTest,
   EXPECT_TRUE(RunTaskSync(control.installer.ApplyDirective(authorize)).ok());
   ASSERT_EQ(control.actions.directives_.size(), 1U);
   EXPECT_EQ(control.actions.session_clears_, 2);
+  ASSERT_EQ(control.actions.preserve_established_exports_.size(), 2U);
+  EXPECT_TRUE(control.actions.preserve_established_exports_.back());
 }
 
 TEST(NodeControlInstallerTest,

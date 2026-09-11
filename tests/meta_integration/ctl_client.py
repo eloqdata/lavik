@@ -475,9 +475,12 @@ else:
         return result, requests
 
     created, requests = run_create_server(
-        "success", "OK clustercreate 1 22 00112233445566778899aabbccddeeff",
+        "success", "OK clustercreate 1 22 1 67726f75702d31 22 "
+        "00112233445566778899aabbccddeeff",
         expected=0)
     if ("Cluster READY: committed=22" not in created.stdout or
+            "group=group-1 operation=00112233445566778899aabbccddeeff" not in
+            created.stdout or
             not any(request.startswith("clustercreate 1 ")
                     for request in requests)):
         raise H.Failure(
@@ -509,7 +512,8 @@ else:
     stalled_environment["KEYLANE_TEST_REDIS_STALL"] = "1"
     timed_out, _ = run_create_server(
         "redis-timeout",
-        "OK clustercreate 1 22 00112233445566778899aabbccddeeff",
+        "OK clustercreate 1 22 1 67726f75702d31 22 "
+        "00112233445566778899aabbccddeeff",
         expected=3, timeout_ms="100", process_environment=stalled_environment)
     if ("verification timed out" not in timed_out.stderr or
             "cluster-status" not in timed_out.stderr):
@@ -518,7 +522,8 @@ else:
     leaked_pipe_environment["KEYLANE_TEST_REDIS_LEAK_PIPE"] = "1"
     leaked_pipe, _ = run_create_server(
         "redis-leaked-pipe",
-        "OK clustercreate 1 22 00112233445566778899aabbccddeeff",
+        "OK clustercreate 1 22 1 67726f75702d31 22 "
+        "00112233445566778899aabbccddeeff",
         expected=3, timeout_ms="100",
         process_environment=leaked_pipe_environment)
     if "verification timed out" not in leaked_pipe.stderr:

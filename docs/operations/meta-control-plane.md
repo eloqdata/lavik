@@ -90,64 +90,104 @@ the connection to a discovered remote leader. There is no plaintext/TLS
 fallback. One absolute deadline, five seconds by default, covers discovery,
 redirects, capture, and response I/O.
 
-## Create the first single-Data cluster
+## Create the first multi-Group cluster
 
-`keylane-ctl cluster-create` is the supported v1 bootstrap path for a fresh
-single-member Meta cluster and one preconfigured Data process. It is not an
-import or expansion command: Meta must contain no Data identity, group, slot
-map, population manifest, or active cluster-create operation. The Data process
-may have records in its configured storage; successful initialization
-deliberately erases all 16,384 physical partitions before serving.
+`keylane-ctl cluster-create` is the v1 bootstrap path for a fresh
+single-member Meta cluster and one or more preconfigured Data processes. It is
+not an import or expansion command: Meta must contain no Data identity, Group,
+Slot map, population manifest, or active cluster-create operation. Creation is
+destructive for every declared Data process.
 
-Install `redis-cli` on the operator host and make it available on `PATH`. The
-command uses the real cluster-mode client after metadata creation to verify
-`CLUSTER INFO`, `CLUSTER SLOTS`, `CLUSTER KEYSLOT`, and a temporary
-`SET`/`GET`/`DEL` round trip. Start the bootstrap Meta first, then start Data
-in fail-closed Meta-managed mode using the final node id and Meta Data-control
-endpoint. The advertised plaintext port must match the manifest endpoint:
+Install `redis-cli` on the operator host and make it available on `PATH`.
+The command checks every primary with `CLUSTER INFO`, `CLUSTER SLOTS`,
+`CLUSTER KEYSLOT`, and a temporary `SET`/`GET`/`DEL` round trip.
+For multiple Groups it also checks the expected `MOVED` target and a
+`CROSSSLOT` multi-key rejection. Start the bootstrap Meta first:
 
 ```sh
 keylane-meta --id 1 --addr 127.0.0.1:7101 \
   --data-control-addr 127.0.0.1:7301 \
   --data-dir /var/lib/keylane/meta-1 --bootstrap \
   --ctl-socket /var/lib/keylane/meta-1/meta-admin.sock
-
-keylane --cluster-enabled \
-  --cluster-node-id 0123456789abcdef0123456789abcdef01234567 \
-  --cluster-meta-seed 127.0.0.1:7301 \
-  --cluster-announce-ip 127.0.0.1 --port 6379 \
-  --data-file /var/lib/keylane/data-1/keylane.data
 ```
 
-Data initially reports LOADING while its unregistered control connection
-retries. Meta and Data must run the same version because v1 appends a new
-control directive kind. Do not put listener addresses, storage paths, TLS
-files, or other deployment configuration in the creation manifest. Its exact
-schema is:
+Start every Data process in fail-closed Meta-managed mode with its final node
+id, unique client port and storage path. For example, repeat this pattern for
+the ids and ports named by the manifest:
+
+```sh
+keylane --cluster-enabled \
+  --cluster-node-id 1111111111111111111111111111111111111111 \
+  --cluster-meta-seed 127.0.0.1:7301 \
+  --cluster-announce-ip 127.0.0.1 --port 6371 \
+  --data-file /var/lib/keylane/data-primary-1/keylane.data
+```
+
+Data reports LOADING while its unregistered control connection retries. Run
+the same release on Meta, Data and the CLI. Version 1 names the current
+multi-Group manifest and Admin layout; it does not provide compatibility with
+the earlier scalar development layout. Do not put listener bind addresses,
+storage paths, TLS files, or other deployment configuration in the manifest.
+An automatically allocated two-Group topology is:
 
 ```toml
 schema_version = 1
+slot_strategy = "contiguous-even"
 
 [[meta_members]]
 id = 1
 
 [[data_nodes]]
-id = "0123456789abcdef0123456789abcdef01234567"
-client_endpoint = "tcp://127.0.0.1:6379"
+id = "1111111111111111111111111111111111111111"
+client_endpoint = "tcp://127.0.0.1:6371"
+
+[[data_nodes]]
+id = "2222222222222222222222222222222222222222"
+client_endpoint = "tcp://127.0.0.1:6372"
+
+[[data_nodes]]
+id = "3333333333333333333333333333333333333333"
+client_endpoint = "tcp://127.0.0.1:6373"
+
+[[data_nodes]]
+id = "4444444444444444444444444444444444444444"
+client_endpoint = "tcp://127.0.0.1:6374"
 
 [[groups]]
 id = "group-1"
-primary = "0123456789abcdef0123456789abcdef01234567"
+primary = "1111111111111111111111111111111111111111"
+replicas = ["2222222222222222222222222222222222222222"]
 
-[[slot_ranges]]
-first = 0
-last = 16383
-group = "group-1"
+[[groups]]
+id = "group-2"
+primary = "3333333333333333333333333333333333333333"
+replicas = ["4444444444444444444444444444444444444444"]
 ```
 
-The parser rejects files over 64 KiB, unknown or duplicate fields/sections,
-noncanonical ids or numeric endpoints, broken references, and any topology
-other than one Meta, one Data, one group, and one full slot range. Run:
+To choose Slots explicitly, omit `slot_strategy` and add a complete table:
+
+```toml
+[[slot_ranges]]
+first = 0
+last = 8191
+group = "group-1"
+
+[[slot_ranges]]
+first = 8192
+last = 16383
+group = "group-2"
+```
+
+The parser rejects files over 64 KiB, unknown or duplicate structure,
+noncanonical ids or numeric endpoints, duplicate or cross-Group membership,
+Groups without a valid primary, and Slot tables with gaps, overlaps, unknown
+Groups, or incomplete coverage. Every declared Data must belong to exactly one
+Group and every Group must own at least one Slot. `contiguous-even` sorts
+Group ids and assigns boundaries with
+`floor(i*16384/N)..floor((i+1)*16384/N)-1`. The CLI displays the fully
+normalized order and range table before any mutation.
+
+Run:
 
 ```sh
 keylane-ctl cluster-create --manifest cluster.toml \
@@ -156,40 +196,42 @@ keylane-ctl cluster-create --manifest cluster.toml \
 
 Review the normalized plan and data-erasure warning, then enter exactly
 lowercase `yes`. EOF, any other input, or a failed parse exits before any Meta
-request. Automation may pass `--yes`. `--timeout-ms` is one absolute deadline
-for leader discovery, all server-side commits and Data initialization, READY
-polling, and Redis verification; its default is 120 seconds. Remote TCP uses
-the same mTLS or explicit `--allow-plaintext-admin` policy as
-`cluster-status`; `--json` does not apply. This deadline bounds the client's
-wait, not the lifetime of an accepted durable creation task.
+request. Automation may pass `--yes`. `--timeout-ms` is one absolute
+deadline for leader discovery, server-side reconciliation, Data
+initialization, READY polling, and Redis verification; its default is 120
+seconds. Remote TCP uses the same mTLS or explicit
+`--allow-plaintext-admin` policy as `cluster-status`; `--json` does
+not apply. The deadline bounds the client's wait, not the lifetime of an
+accepted durable creation task.
 
 Exit 0 means the exact topology reached READY and the Redis probes passed.
 Exit 1 is a local manifest, confirmation, dependency, or protocol/verification
 failure. Exit 2 is an explicit Meta precondition or domain rejection. Exit 3
 means a timeout, lost leader, or connection failure occurred after creation
 may have begun. Do not submit a replacement creation after exit 3. The leader
-continues the accepted task in the background; after Meta restart or leader
-change it finds unfinished creation operations in the restored journal and
-resumes their committed phase, without another `cluster-create` request.
-Run `cluster-status` and `getop <operation-id>` using the original id from the
-reply or `cluster-create <id> phase=...` Meta log. A non-terminal creation
-record includes its current phase; `recovery-required` means the retained
-intent no longer matches safe execution conditions. Preserve the Meta/Data
-logs and directories and investigate rather than reinitialize. In particular,
-a changed Data boot/history, invalidated attempt, or changed topology does not
-authorize another destructive reset. Existing partial population operations
-from binaries without a durable creation root are not automatically adopted.
+continues the accepted root operation in the background; after Meta restart or
+leader change the reconciler resumes from restored snapshot/WAL state without
+another request.
 
-Graceful Meta stop cancels result waits and leaves accepted task state intact;
-it does not wait for an offline Data node to return. A Data-reported failure
-fences the group before aborting the operation. Meta recovery preserves a
-successful population and finishes its bookkeeping without initializing again.
-An exit-1 Redis verification failure can occur after Meta
-creation completed, so use the same status and Redis commands after correcting
-the local dependency rather than rerunning creation. Other multi-step cluster
-changes need their own recovery driver. Meta-member addition/removal also has
-one; Data migration/failover orchestration is not automatically recovered just
-because an operation journal exists.
+Run `cluster-status` and `getop <operation-id>` using the per-Group ids
+printed after success, or the root id from the
+`cluster-create <id> phase=...` Meta log. A non-terminal record includes its
+phase; `recovery-required` means the retained v1 intent no longer matches
+safe execution conditions. Preserve Meta/Data logs and directories and
+investigate rather than reinitialize. A changed Data boot/history,
+invalidated attempt, or changed topology does not authorize another
+destructive reset.
+
+Graceful Meta stop cancels result waits and leaves accepted work intact; it
+does not wait for an offline Data node. A deterministic Data failure fences
+only that Group before aborting its child and the overall creation. Already
+completed Groups are not rolled back. Meta recovery preserves successful
+population work and finishes bookkeeping without initializing it again. An
+exit-1 Redis verification failure can occur after Meta creation completed, so
+correct the local dependency and inspect status rather than rerunning
+creation. Meta-member addition/removal has a separate recovery driver; Data
+migration and failover orchestration do not become recoverable merely because
+the operation journal exists.
 
 For plaintext remote administration, configure a listener and connect without
 TLS arguments:

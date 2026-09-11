@@ -4,8 +4,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
@@ -20,31 +23,25 @@
 
 namespace keylane::meta {
 namespace {
-constexpr std::string_view kPopulationKind =
-    kMetaClusterCreatePopulationOperationKind;
-constexpr std::string_view kPolicy = "keylane.cluster-create-v1";
-constexpr std::array<std::string_view, 11> kPhases = {
-    "register-data",        "create-group",   "assign-primary",
-    "begin-term",           "slot-map",       "population-manifest",
-    "population-anchor",    "policy",         "activate-authority",
-    "wait-data-projection", "initialize-data"};
+constexpr std::string_view kV1Policy = "keylane.cluster-create-v1";
+constexpr std::string_view kRootPhaseRegisterData = "register-data";
+constexpr std::string_view kRootPhaseCreateGroups = "create-groups";
+constexpr std::string_view kRootPhaseSlotMap = "slot-map";
+constexpr std::string_view kRootPhasePolicy = "policy";
+constexpr std::string_view kRootPhasePopulation = "population";
+constexpr std::string_view kRootPhaseWaitDataProjection =
+    "wait-data-projection";
+constexpr std::string_view kRootPhaseInitializeGroups = "initialize-groups";
+constexpr std::string_view kGroupPhaseInitialize =
+    "initializing-empty-population";
+constexpr std::string_view kGroupPhaseReplicate =
+    "replicating-empty-population";
+constexpr std::string_view kGroupPhaseReady = "population-ready";
+constexpr std::string_view kGroupFailurePrefix = "deterministic-failure:";
 
 bool IsTerminal(MetaOperationLifecycle state) {
   return state == MetaOperationLifecycle::kCompleted ||
          state == MetaOperationLifecycle::kAborted;
-}
-
-const PutPopulationManifest& EmptyPopulationManifest() {
-  static const PutPopulationManifest manifest = [] {
-    PutPopulationManifest value;
-    value.entries_.reserve(kMetaSlotCount);
-    for (std::uint32_t partition = 0; partition < kMetaSlotCount; ++partition)
-      value.entries_.push_back({partition, 1});
-    value.manifest_digest_ =
-        MetaPopulationManifestStore::CanonicalDigest(value.entries_);
-    return value;
-  }();
-  return manifest;
 }
 
 template <std::size_t N>
@@ -56,8 +53,8 @@ std::string Hex(const std::array<std::uint8_t, N>& value) {
 // The randomly generated root id supplies the entropy. Domain separation
 // gives recovery the SAME child, assignment and directive identities without
 // another durable format or a random in-memory value lost between commits.
-MetaOperationId DerivedId(const MetaOperationId& root,
-                          std::string_view purpose) {
+MetaOperationId DerivedV1Id(const MetaOperationId& root,
+                            std::string_view purpose) {
   const auto hash =
       MetaSha256(absl::StrCat("cluster-create-v1/", Hex(root), "/", purpose));
   MetaOperationId id;
@@ -123,301 +120,793 @@ bool ProjectionMatches(const MetaDataControlRuntimeNode& runtime,
          projected.partition_replication_epoch_ ==
              group.record_.partition_replication_epoch_;
 }
-}  // namespace
 
-Plan detail::PlanClusterCreateStep(
+const ClusterCreateManifestV1::DataNode* FindData(
+    const ClusterCreateManifestV1& manifest, std::string_view node_id) {
+  const auto found = std::find_if(
+      manifest.data_nodes_.begin(), manifest.data_nodes_.end(),
+      [&](const auto& node) { return node.node_id_ == node_id; });
+  return found == manifest.data_nodes_.end() ? nullptr : &*found;
+}
+
+const ClusterCreateManifestV1::Group* FindDeclaration(
+    const ClusterCreateManifestV1& manifest, std::string_view group_id) {
+  const auto found = std::find_if(
+      manifest.groups_.begin(), manifest.groups_.end(),
+      [&](const auto& group) { return group.group_id_ == group_id; });
+  return found == manifest.groups_.end() ? nullptr : &*found;
+}
+
+MetaNodeRole DeclaredRole(const ClusterCreateManifestV1& manifest,
+                          std::string_view node_id) {
+  for (const auto& group : manifest.groups_) {
+    if (group.primary_node_id_ == node_id) return MetaNodeRole::kPrimary;
+  }
+  return MetaNodeRole::kReplica;
+}
+
+MetaAssignmentId V1AssignmentId(const MetaOperationId& root,
+                                std::string_view group_id,
+                                std::string_view node_id) {
+  return DerivedV1Id(
+      root, absl::StrCat("assignment/", absl::BytesToHexString(group_id), "/",
+                        node_id));
+}
+
+std::vector<std::pair<std::string, MetaNodeRole>> DeclaredMembers(
+    const ClusterCreateManifestV1::Group& group) {
+  std::vector<std::pair<std::string, MetaNodeRole>> members;
+  members.reserve(group.replica_node_ids_.size() + 1);
+  members.emplace_back(group.primary_node_id_, MetaNodeRole::kPrimary);
+  for (const std::string& replica : group.replica_node_ids_)
+    members.emplace_back(replica, MetaNodeRole::kReplica);
+  return members;
+}
+
+PutPopulationManifest V1PopulationManifest(
+    const ClusterCreateManifestV1& manifest, std::string_view group_id) {
+  PutPopulationManifest population;
+  for (const auto& range : manifest.slot_ranges_) {
+    if (range.group_id_ != group_id) continue;
+    for (std::uint32_t slot = range.first_; slot <= range.last_; ++slot)
+      population.entries_.push_back({slot, 1});
+  }
+  population.manifest_digest_ =
+      MetaPopulationManifestStore::CanonicalDigest(population.entries_);
+  return population;
+}
+
+bool V1SlotMapMatches(const MetaStores& stores,
+                      const ClusterCreateManifestV1& manifest,
+                      bool* empty) {
+  *empty = true;
+  bool matches = true;
+  std::size_t range_index = 0;
+  for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
+    while (range_index + 1 < manifest.slot_ranges_.size() &&
+           slot > manifest.slot_ranges_[range_index].last_)
+      ++range_index;
+    const auto owner = stores.topology_.SlotOwner(slot);
+    *empty &= !owner.has_value();
+    matches &= owner == std::optional<std::string>(
+                            manifest.slot_ranges_[range_index].group_id_);
+  }
+  return matches;
+}
+
+absl::Status ValidateV1Nodes(const MetaStores& stores,
+                             const ClusterCreateManifestV1& manifest,
+                             bool require_all) {
+  for (const MetaNodeRecord& node : stores.identity_.Nodes()) {
+    const auto* declaration = FindData(manifest, node.node_id_);
+    if (declaration == nullptr || node.retired_ ||
+        node.principal_ != absl::StrCat("keylane://node/", node.node_id_) ||
+        node.role_ != DeclaredRole(manifest, node.node_id_) ||
+        node.endpoints_ !=
+            std::vector<std::string>{declaration->client_endpoint_}) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("creation node differs from intent: node=",
+                       node.node_id_));
+    }
+  }
+  if (stores.identity_.NodeCount() > manifest.data_nodes_.size() ||
+      (require_all &&
+       stores.identity_.NodeCount() != manifest.data_nodes_.size())) {
+    return absl::FailedPreconditionError(
+        "creation Data membership differs from intent");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateV1GroupMembers(
+    const MetaTopologyGroupView& group,
+    const ClusterCreateManifestV1::Group& declaration,
+    const MetaOperationId& root, bool require_all) {
+  const auto expected = DeclaredMembers(declaration);
+  for (const MetaGroupMember& member : group.members_) {
+    const auto found = std::find_if(
+        expected.begin(), expected.end(),
+        [&](const auto& item) { return item.first == member.node_id_; });
+    if (found == expected.end() || member.role_ != found->second ||
+        member.assignment_id_ !=
+            V1AssignmentId(root, declaration.group_id_, member.node_id_)) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("creation assignment differs from intent: group=",
+                       declaration.group_id_, " node=", member.node_id_));
+    }
+  }
+  if (group.members_.size() > expected.size() ||
+      (require_all && group.members_.size() != expected.size())) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("creation Group membership is incomplete: group=",
+                     declaration.group_id_));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateV1GroupsKnown(
+    const MetaStores& stores, const ClusterCreateManifestV1& manifest,
+    const MetaOperationId& root, bool require_all_members) {
+  for (const MetaTopologyGroupView& group : stores.topology_.Groups()) {
+    const auto* declaration = FindDeclaration(manifest, group.group_id_);
+    if (declaration == nullptr)
+      return absl::FailedPreconditionError(
+          absl::StrCat("creation has an unknown Group: group=",
+                       group.group_id_));
+    if (auto status = ValidateV1GroupMembers(group, *declaration, root,
+                                             require_all_members);
+        !status.ok())
+      return status;
+  }
+  if (stores.topology_.GroupCount() > manifest.groups_.size() ||
+      (require_all_members &&
+       stores.topology_.GroupCount() != manifest.groups_.size())) {
+    return absl::FailedPreconditionError(
+        "creation Group set differs from intent");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateV1FinalTopology(
+    const MetaStores& stores, const ClusterCreateManifestV1& manifest,
+    const MetaOperationId& root, bool allow_failed_group) {
+  if (auto status = ValidateV1Nodes(stores, manifest, true); !status.ok())
+    return status;
+  if (auto status = ValidateV1GroupsKnown(stores, manifest, root, true);
+      !status.ok())
+    return status;
+  bool slots_empty = false;
+  if (!V1SlotMapMatches(stores, manifest, &slots_empty) || slots_empty)
+    return absl::FailedPreconditionError(
+        "creation Slot map differs from intent");
+  const auto policy = stores.policy_.FindVersion(std::string(kV1Policy), 1);
+  if (!policy.has_value() || policy->retired_ ||
+      policy->content_ != "declarative-empty-population" ||
+      policy->content_hash_ != MetaSha256(policy->content_))
+    return absl::FailedPreconditionError(
+        "creation policy differs from intent");
+  const MetaGrantSpec expected_grant{5'000, std::string(kV1Policy), 1};
+  for (const auto& declaration : manifest.groups_) {
+    const auto group = stores.topology_.FindGroup(declaration.group_id_);
+    const auto grant = stores.grant_.GroupState(declaration.group_id_);
+    const auto population =
+        V1PopulationManifest(manifest, declaration.group_id_);
+    if (!group.has_value() || group->record_.group_term_ != 1 ||
+        group->config_epoch_ != 1 ||
+        group->record_.population_manifest_revision_ != 1 ||
+        group->record_.population_manifest_digest_ !=
+            population.manifest_digest_ ||
+        group->record_.partition_replication_epoch_ != 1 ||
+        !stores.population_manifest_.Contains(population.manifest_digest_) ||
+        !grant.has_value()) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("creation Group anchors differ from intent: group=",
+                       declaration.group_id_));
+    }
+    const bool active =
+        grant->grant_.has_value() && !grant->fenced_ &&
+        grant->grant_->owner_ == declaration.primary_node_id_ &&
+        grant->grant_->term_ == 1 &&
+        grant->grant_->authority_version_ == 1 &&
+        grant->grant_->spec_ == expected_grant;
+    const bool failed = allow_failed_group && grant->fenced_ &&
+                        group->record_.authority_version_ == 1;
+    if (!active && !failed)
+      return absl::FailedPreconditionError(
+          absl::StrCat("creation authority differs from intent: group=",
+                       declaration.group_id_));
+  }
+  return absl::OkStatus();
+}
+
+std::optional<MetaTerminalReceipt> ReceiptFor(
+    const MetaOperationRecord& operation, const MetaOperationId& directive_id,
+    const MetaOperationId& attempt_id) {
+  const auto found = std::find_if(
+      operation.terminal_receipts_.begin(),
+      operation.terminal_receipts_.end(), [&](const auto& receipt) {
+        return receipt.key_.directive_id_ == directive_id &&
+               receipt.key_.attempt_id_ == attempt_id;
+      });
+  return found == operation.terminal_receipts_.end()
+             ? std::nullopt
+             : std::optional<MetaTerminalReceipt>(*found);
+}
+
+absl::StatusOr<MetaBootIncarnation> ParseBoot(std::string_view value) {
+  MetaBootIncarnation result{};
+  std::string bytes;
+  if (!cluster::control::IsCanonicalIdentity160(value) ||
+      !absl::HexStringToBytes(value, &bytes) || bytes.size() != result.size())
+    return absl::InvalidArgumentError("Data boot identity is malformed");
+  std::copy(bytes.begin(), bytes.end(), result.begin());
+  return result;
+}
+
+Plan PlanV1GroupStep(
+    const MetaCommittedView& view, const MetaOperationRecord& root,
+    const MetaOperationRecord& operation,
+    const ClusterCreateManifestV1& manifest,
+    const ClusterCreateManifestV1::Group& declaration,
+    const MetaDataControlRuntimeSnapshot& runtime) {
+  const auto& stores = view.stores();
+  const auto group = stores.topology_.FindGroup(declaration.group_id_);
+  const auto grant = stores.grant_.GroupState(declaration.group_id_);
+  const auto population =
+      V1PopulationManifest(manifest, declaration.group_id_);
+  if (!group.has_value() || !grant.has_value())
+    return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                 " committed anchors disappeared"));
+  const auto primary_member = std::find_if(
+      group->members_.begin(), group->members_.end(), [&](const auto& member) {
+        return member.node_id_ == declaration.primary_node_id_;
+      });
+  if (primary_member == group->members_.end())
+    return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                 " primary assignment disappeared"));
+  const std::string intent_prefix = absl::StrCat(
+      "cluster-create-v1-group ", Hex(root.operation_id_), " ",
+      absl::BytesToHexString(declaration.group_id_), " ");
+  if (operation.kind_ != kMetaClusterCreateV1GroupOperationKind ||
+      !operation.intent_.starts_with(intent_prefix))
+    return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                 " operation is not owned by creation"));
+  const std::string_view source_boot_text =
+      std::string_view(operation.intent_).substr(intent_prefix.size());
+  auto source_boot = ParseBoot(source_boot_text);
+  if (!source_boot.ok()) return Conflict(source_boot.status().message());
+
+  const auto primary_directive =
+      DerivedV1Id(operation.operation_id_, "primary/directive");
+  const auto primary_attempt =
+      DerivedV1Id(operation.operation_id_, "primary/attempt");
+  const auto primary_receipt =
+      ReceiptFor(operation, primary_directive, primary_attempt);
+  auto fence_or_abort = [&](std::string reason) -> Plan {
+    if (grant->grant_.has_value() && !grant->fenced_) {
+      FenceGroup fence;
+      fence.group_id_ = declaration.group_id_;
+      fence.expected_term_ = 1;
+      return Emit(std::move(fence));
+    }
+    return Abort(operation, std::move(reason));
+  };
+  if (operation.kind_phase_blob_.starts_with(kGroupFailurePrefix)) {
+    return fence_or_abort(operation.kind_phase_blob_.substr(
+        kGroupFailurePrefix.size()));
+  }
+
+  if (operation.lifecycle_ == MetaOperationLifecycle::kSubmitted) {
+    if (!operation.current_directives_.empty() || primary_receipt.has_value())
+      return Conflict("submitted Group operation contains progress");
+    if (!grant->grant_.has_value() || grant->fenced_)
+      return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                   " authority is unavailable"));
+    MetaDirectiveSpec initialize;
+    initialize.directive_id_ = primary_directive;
+    initialize.attempt_id_ = primary_attempt;
+    initialize.recipient_node_id_ = declaration.primary_node_id_;
+    initialize.target_node_id_ = declaration.primary_node_id_;
+    initialize.target_boot_id_ = *source_boot;
+    initialize.assignment_id_ = primary_member->assignment_id_;
+    initialize.source_node_id_ = std::string(kMetaNodeIdBytes, '0');
+    initialize.group_id_ = declaration.group_id_;
+    initialize.group_term_ = 1;
+    initialize.authority_version_ = 1;
+    initialize.grant_revision_ = grant->grant_->grant_revision_;
+    initialize.population_manifest_revision_ = 1;
+    initialize.population_manifest_digest_ = population.manifest_digest_;
+    initialize.partition_replication_epoch_ = 1;
+    initialize.kind_ = kMetaDirectiveInitializeEmptyPopulation;
+    initialize.payload_ = Hex(operation.replication_history_id_);
+    initialize.storage_mutating_ = true;
+    TransitionOperationPhase transition;
+    transition.operation_id_ = operation.operation_id_;
+    transition.expected_revision_ = operation.revision_;
+    transition.kind_phase_blob_ = kGroupPhaseInitialize;
+    transition.current_directives_.push_back(std::move(initialize));
+    return Emit(std::move(transition));
+  }
+
+  if (operation.kind_phase_blob_ == kGroupPhaseInitialize) {
+    if (!primary_receipt.has_value()) {
+      if (!grant->grant_.has_value() || grant->fenced_)
+        return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                     " authority changed during initialization"));
+      if (operation.current_directives_.size() != 1 ||
+          operation.current_directives_.front().spec_.directive_id_ !=
+              primary_directive ||
+          operation.current_directives_.front().spec_.attempt_id_ !=
+              primary_attempt)
+        return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                     " primary directive was invalidated"));
+      const auto current = std::find_if(
+          runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& node) {
+            return node.node_id_ == declaration.primary_node_id_;
+          });
+      if (current != runtime.nodes_.end() &&
+          (current->boot_id_ != source_boot_text ||
+           current->replication_history_id_ !=
+               operation.replication_history_id_))
+        return Advance(
+            operation,
+            absl::StrCat(kGroupFailurePrefix, "group=", declaration.group_id_,
+                         " node=", declaration.primary_node_id_,
+                         " restarted during empty-population initialization"));
+      return std::nullopt;
+    }
+    if (primary_receipt->status_ != MetaDirectiveResultStatus::kSucceeded)
+      return fence_or_abort(absl::StrCat(
+          "group=", declaration.group_id_, " node=",
+          primary_receipt->recipient_node_id_, " primary initialization: ",
+          primary_receipt->result_));
+    if (declaration.replica_node_ids_.empty())
+      return Advance(operation, kGroupPhaseReady);
+    if (!grant->grant_.has_value() || grant->fenced_)
+      return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                   " authority changed before replication"));
+
+    TransitionOperationPhase transition;
+    transition.operation_id_ = operation.operation_id_;
+    transition.expected_revision_ = operation.revision_;
+    transition.kind_phase_blob_ = kGroupPhaseReplicate;
+    transition.current_directives_.reserve(
+        declaration.replica_node_ids_.size() * 2);
+    for (const std::string& replica : declaration.replica_node_ids_) {
+      const auto target = std::find_if(
+          runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& node) {
+            return node.node_id_ == replica;
+          });
+      const auto target_member = std::find_if(
+          group->members_.begin(), group->members_.end(),
+          [&](const auto& member) { return member.node_id_ == replica; });
+      if (target == runtime.nodes_.end() || target_member == group->members_.end() ||
+          !ProjectionMatches(*target, *group, *grant, view.applied_index()))
+        return std::nullopt;
+      auto target_boot = ParseBoot(target->boot_id_);
+      if (!target_boot.ok())
+        return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                     " node=", replica, " ",
+                                     target_boot.status().message()));
+      const std::string purpose =
+          absl::StrCat("replica/", replica, "/");
+      MetaDirectiveSpec authorize;
+      authorize.directive_id_ =
+          DerivedV1Id(operation.operation_id_, purpose + "authorize");
+      authorize.attempt_id_ =
+          DerivedV1Id(operation.operation_id_, purpose + "authorize-attempt");
+      authorize.recipient_node_id_ = declaration.primary_node_id_;
+      authorize.target_node_id_ = replica;
+      authorize.target_boot_id_ = *target_boot;
+      authorize.assignment_id_ = target_member->assignment_id_;
+      authorize.source_node_id_ = declaration.primary_node_id_;
+      authorize.source_assignment_id_ = primary_member->assignment_id_;
+      authorize.source_boot_id_ = *source_boot;
+      authorize.source_replication_history_id_ =
+          operation.replication_history_id_;
+      authorize.group_id_ = declaration.group_id_;
+      authorize.group_term_ = 1;
+      authorize.authority_version_ = 1;
+      authorize.grant_revision_ = grant->grant_->grant_revision_;
+      authorize.population_manifest_revision_ = 1;
+      authorize.population_manifest_digest_ = population.manifest_digest_;
+      authorize.partition_replication_epoch_ = 1;
+      authorize.kind_ = kMetaDirectiveAuthorizeSource;
+      MetaDirectiveSpec rebuild = authorize;
+      rebuild.directive_id_ =
+          DerivedV1Id(operation.operation_id_, purpose + "rebuild");
+      rebuild.attempt_id_ =
+          DerivedV1Id(operation.operation_id_, purpose + "rebuild-attempt");
+      rebuild.recipient_node_id_ = replica;
+      rebuild.kind_ = kMetaDirectiveRebuild;
+      rebuild.storage_mutating_ = true;
+      transition.current_directives_.push_back(std::move(authorize));
+      transition.current_directives_.push_back(std::move(rebuild));
+    }
+    return Emit(std::move(transition));
+  }
+
+  if (operation.kind_phase_blob_ == kGroupPhaseReplicate) {
+    const std::size_t expected_directives =
+        declaration.replica_node_ids_.size() * 2;
+    if (!grant->fenced_) {
+      if (!grant->grant_.has_value() ||
+          operation.current_directives_.size() != expected_directives ||
+          operation.current_directives_.empty())
+        return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                     " replica directives were invalidated"));
+      const std::uint64_t revision =
+          operation.current_directives_.front().directive_revision_;
+      for (std::size_t index = 0;
+           index < declaration.replica_node_ids_.size(); ++index) {
+        const std::string& replica = declaration.replica_node_ids_[index];
+        const std::string purpose =
+            absl::StrCat("replica/", replica, "/");
+        const auto& authorize = operation.current_directives_[index * 2];
+        const auto& rebuild = operation.current_directives_[index * 2 + 1];
+        if (revision == 0 ||
+            authorize.directive_revision_ != revision ||
+            rebuild.directive_revision_ != revision ||
+            authorize.spec_.directive_id_ !=
+                DerivedV1Id(operation.operation_id_, purpose + "authorize") ||
+            authorize.spec_.attempt_id_ != DerivedV1Id(
+                operation.operation_id_, purpose + "authorize-attempt") ||
+            authorize.spec_.kind_ != kMetaDirectiveAuthorizeSource ||
+            authorize.spec_.recipient_node_id_ !=
+                declaration.primary_node_id_ ||
+            rebuild.spec_.directive_id_ !=
+                DerivedV1Id(operation.operation_id_, purpose + "rebuild") ||
+            rebuild.spec_.attempt_id_ != DerivedV1Id(
+                operation.operation_id_, purpose + "rebuild-attempt") ||
+            rebuild.spec_.kind_ != kMetaDirectiveRebuild ||
+            rebuild.spec_.recipient_node_id_ != replica)
+          return Conflict(absl::StrCat(
+              "group=", declaration.group_id_, " node=", replica,
+              " replica directive batch differs from intent"));
+      }
+    }
+    std::optional<MetaTerminalReceipt> failed;
+    bool all_succeeded = true;
+    for (const std::string& replica : declaration.replica_node_ids_) {
+      const std::string purpose =
+          absl::StrCat("replica/", replica, "/");
+      for (const std::string_view kind : {"authorize", "rebuild"}) {
+        const auto directive =
+            DerivedV1Id(operation.operation_id_, purpose + std::string(kind));
+        const auto attempt = DerivedV1Id(
+            operation.operation_id_,
+            purpose + std::string(kind) + "-attempt");
+        const auto receipt = ReceiptFor(operation, directive, attempt);
+        if (!receipt.has_value()) {
+          all_succeeded = false;
+          continue;
+        }
+        if (receipt->status_ != MetaDirectiveResultStatus::kSucceeded) {
+          failed = receipt;
+          break;
+        }
+      }
+      if (failed.has_value()) break;
+    }
+    if (failed.has_value())
+      return fence_or_abort(absl::StrCat(
+          "group=", declaration.group_id_, " node=",
+          failed->recipient_node_id_, " replica initialization: ",
+          failed->result_));
+    if (grant->fenced_)
+      return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                   " authority changed during replication"));
+    if (!all_succeeded) return std::nullopt;
+    return Advance(operation, kGroupPhaseReady);
+  }
+
+  if (operation.kind_phase_blob_ == kGroupPhaseReady) {
+    if (!operation.current_directives_.empty())
+      return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                   " ready operation retains directives"));
+    return Complete(operation);
+  }
+  return Conflict(absl::StrCat("group=", declaration.group_id_,
+                               " has an unknown creation phase"));
+}
+
+Plan PlanV1ClusterCreateStep(
     const MetaCommittedView& view, const MetaOperationRecord& operation,
     const MetaDataControlRuntimeSnapshot& runtime) {
   if (operation.kind_ != kMetaClusterCreateOperationKind ||
       IsTerminal(operation.lifecycle_))
     return std::nullopt;
   std::uint32_t unused_timeout = 0;
-  const auto manifest =
-      DecodeClusterCreateRequest(operation.intent_, &unused_timeout);
+  auto manifest = DecodeClusterCreateRequest(operation.intent_, &unused_timeout);
   if (!manifest.ok())
     return Conflict("creation intent is not a recoverable v1 plan");
-  const auto phase = operation.kind_phase_blob_.empty()
-                         ? kPhases.begin()
-                         : std::find(kPhases.begin(), kPhases.end(),
-                                     operation.kind_phase_blob_);
-  if (phase == kPhases.end()) return Conflict("unknown creation phase");
-  const std::size_t step = phase - kPhases.begin();
   const auto& stores = view.stores();
-  const auto& m = *manifest;
-  const auto assignment = DerivedId(operation.operation_id_, "assignment");
-  const auto child_id = DerivedId(operation.operation_id_, "population");
-  const auto node = stores.identity_.FindNode(m.data_node_id_);
-  const auto group = stores.topology_.FindGroup(m.group_id_);
-  const auto grant = stores.grant_.GroupState(m.group_id_);
-  const MetaGrantSpec expected_grant{5'000, std::string(kPolicy), 1};
-  const auto policy = stores.policy_.FindVersion(std::string(kPolicy), 1);
-  const auto& population = EmptyPopulationManifest();
-
-  // Check the already-committed prefix before filling a missing next effect.
-  // Recovery must never undo an operator's later membership, epoch, owner or
-  // endpoint change merely because the old creation intent still exists.
   const auto meta_members = stores.identity_.MetaMembers();
   if (std::count_if(meta_members.begin(), meta_members.end(),
                     [](const auto& member) { return !member.retired_; }) != 1 ||
       std::none_of(meta_members.begin(), meta_members.end(),
                    [&](const auto& member) {
                      return !member.retired_ &&
-                            member.server_id_ == m.meta_member_id_;
-                   }) ||
-      stores.identity_.NodeCount() > 1 || stores.topology_.GroupCount() > 1)
-    return Conflict("creation membership no longer matches its intent");
-  const bool node_matches =
-      node.has_value() && !node->retired_ &&
-      node->principal_ == absl::StrCat("keylane://node/", m.data_node_id_) &&
-      node->role_ == MetaNodeRole::kPrimary &&
-      node->endpoints_ == std::vector<std::string>{m.client_endpoint_};
-  if ((node.has_value() && !node_matches) || (step > 0 && !node_matches) ||
-      (stores.identity_.NodeCount() != 0 && !node.has_value()) ||
-      (step > 1 && !group.has_value()) ||
-      (stores.topology_.GroupCount() != 0 && !group.has_value()))
-    return Conflict("creation identity or group was replaced");
-  const bool assigned =
-      group.has_value() && group->members_.size() == 1 &&
-      group->members_.front() ==
-          MetaGroupMember{m.data_node_id_, assignment, MetaNodeRole::kPrimary};
-  if (group.has_value() &&
-      ((!group->members_.empty() && !assigned) || (step > 2 && !assigned) ||
-       group->record_.group_term_ > 1 ||
-       (step > 3 && group->record_.group_term_ != 1) ||
-       group->record_.authority_version_ > 1 || group->config_epoch_ > 1 ||
-       (!group->record_.owner_.empty() &&
-        group->record_.owner_ != m.data_node_id_)))
-    return Conflict("creation group incarnation or authority changed");
-  bool slots_complete = true;
-  bool slots_empty = true;
-  for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
-    const auto owner = stores.topology_.SlotOwner(slot);
-    slots_complete &= owner == std::optional<std::string>(m.group_id_);
-    slots_empty &= !owner.has_value();
-  }
-  if ((!slots_empty && !slots_complete) || (step > 4 && !slots_complete))
-    return Conflict("creation slot map changed");
-  const bool population_matches =
-      group.has_value() && group->record_.population_manifest_revision_ == 1 &&
-      group->record_.population_manifest_digest_ ==
-          population.manifest_digest_ &&
-      group->record_.partition_replication_epoch_ == 1;
-  if (group.has_value() &&
-      ((group->record_.population_manifest_revision_ != 0 &&
-        !population_matches) ||
-       (step > 6 && !population_matches)))
-    return Conflict("creation population epoch changed");
-  const bool policy_matches =
-      policy.has_value() && !policy->retired_ &&
-      policy->content_ == "first-empty-population" &&
-      policy->content_hash_ == MetaSha256("first-empty-population");
-  if ((policy.has_value() && !policy_matches) || (step > 7 && !policy_matches))
-    return Conflict("creation policy changed");
-  const bool authority_matches =
-      grant.has_value() && grant->grant_.has_value() && !grant->fenced_ &&
-      grant->grant_->owner_ == m.data_node_id_ && grant->grant_->term_ == 1 &&
-      grant->grant_->authority_version_ == 1 &&
-      grant->grant_->spec_ == expected_grant && group->config_epoch_ == 1;
-  if ((grant.has_value() && grant->grant_.has_value() && !authority_matches) ||
-      (step == 9 && !authority_matches))
-    return Conflict("creation authority changed");
+                            member.server_id_ == manifest->meta_member_id_;
+                   }))
+    return Conflict("creation Meta membership differs from intent");
+  if (auto status = ValidateV1Nodes(stores, *manifest, false); !status.ok())
+    return Conflict(status.message());
+  if (auto status =
+          ValidateV1GroupsKnown(stores, *manifest, operation.operation_id_,
+                                false);
+      !status.ok())
+    return Conflict(status.message());
 
-  switch (step) {
-    case 0:
-      if (!node_matches) {
-        RegisterNode c;
-        c.node_id_ = m.data_node_id_;
-        c.principal_ = absl::StrCat("keylane://node/", m.data_node_id_);
-        c.role_ = MetaNodeRole::kPrimary;
-        c.endpoints_ = {m.client_endpoint_};
-        return Emit(std::move(c));
+  const std::string phase = operation.kind_phase_blob_.empty()
+                                ? std::string(kRootPhaseRegisterData)
+                                : operation.kind_phase_blob_;
+  if (phase == kRootPhaseRegisterData) {
+    if (stores.topology_.GroupCount() != 0)
+      return Conflict("creation Group appeared before registration completed");
+    for (const auto& node : manifest->data_nodes_) {
+      if (!stores.identity_.FindNode(node.node_id_).has_value()) {
+        RegisterNode command;
+        command.node_id_ = node.node_id_;
+        command.principal_ = absl::StrCat("keylane://node/", node.node_id_);
+        command.role_ = DeclaredRole(*manifest, node.node_id_);
+        command.endpoints_ = {node.client_endpoint_};
+        return Emit(std::move(command));
       }
-      break;
-    case 1:
+    }
+    return Advance(operation, kRootPhaseCreateGroups);
+  }
+
+  if (auto status = ValidateV1Nodes(stores, *manifest, true); !status.ok())
+    return Conflict(status.message());
+  if (phase == kRootPhaseCreateGroups) {
+    for (const auto& declaration : manifest->groups_) {
+      auto group = stores.topology_.FindGroup(declaration.group_id_);
       if (!group.has_value()) {
-        CreateGroup c;
-        c.group_id_ = m.group_id_;
-        c.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
-        return Emit(std::move(c));
+        CreateGroup command;
+        command.group_id_ = declaration.group_id_;
+        command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
+        return Emit(std::move(command));
       }
-      break;
-    case 2:
-      if (!assigned) {
-        AssignNodeToGroup c;
-        c.group_id_ = m.group_id_;
-        c.node_id_ = m.data_node_id_;
-        c.assignment_id_ = assignment;
-        c.role_ = MetaNodeRole::kPrimary;
-        c.expected_revision_ = group->revision_;
-        c.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
-        return Emit(std::move(c));
+      if (group->record_.group_term_ > 1 ||
+          group->record_.authority_version_ != 0 || group->config_epoch_ != 0 ||
+          group->record_.population_manifest_revision_ != 0 ||
+          group->record_.partition_replication_epoch_ != 0 ||
+          !group->record_.owner_.empty())
+        return Conflict(absl::StrCat(
+            "creation Group advanced unexpectedly: group=",
+            declaration.group_id_));
+      if (auto status = ValidateV1GroupMembers(
+              *group, declaration, operation.operation_id_, false);
+          !status.ok())
+        return Conflict(status.message());
+      for (const auto& [node_id, role] : DeclaredMembers(declaration)) {
+        const auto member = std::find_if(
+            group->members_.begin(), group->members_.end(),
+            [&](const auto& item) { return item.node_id_ == node_id; });
+        if (member == group->members_.end()) {
+          AssignNodeToGroup command;
+          command.group_id_ = declaration.group_id_;
+          command.node_id_ = node_id;
+          command.assignment_id_ = V1AssignmentId(
+              operation.operation_id_, declaration.group_id_, node_id);
+          command.role_ = role;
+          command.expected_revision_ = group->revision_;
+          command.new_topology_epoch_ =
+              stores.topology_.TopologyEpoch() + 1;
+          return Emit(std::move(command));
+        }
       }
-      break;
-    case 3:
       if (group->record_.group_term_ == 0) {
-        BeginGroupTerm c;
-        c.group_id_ = m.group_id_;
-        c.new_term_ = 1;
-        return Emit(std::move(c));
+        BeginGroupTerm command;
+        command.group_id_ = declaration.group_id_;
+        command.new_term_ = 1;
+        return Emit(std::move(command));
       }
-      break;
-    case 4:
-      if (!slots_complete || group->config_epoch_ != 1) {
-        SetSlotMap c;
-        c.ranges_ = {{m.first_slot_, m.last_slot_, m.group_id_}};
-        c.config_epochs_ = {{m.group_id_, 1}};
-        c.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
-        return Emit(std::move(c));
-      }
-      break;
-    case 5:
+    }
+    return Advance(operation, kRootPhaseSlotMap);
+  }
+
+  if (auto status = ValidateV1GroupsKnown(
+          stores, *manifest, operation.operation_id_, true);
+      !status.ok())
+    return Conflict(status.message());
+  if (phase == kRootPhaseSlotMap) {
+    bool slots_empty = false;
+    const bool slots_match = V1SlotMapMatches(stores, *manifest, &slots_empty);
+    bool epochs_zero = true;
+    bool epochs_one = true;
+    for (const auto& declaration : manifest->groups_) {
+      const auto group = stores.topology_.FindGroup(declaration.group_id_);
+      if (!group.has_value() || group->record_.group_term_ != 1 ||
+          group->record_.authority_version_ != 0)
+        return Conflict(absl::StrCat("creation Group is not ready for Slots: ",
+                                     declaration.group_id_));
+      epochs_zero &= group->config_epoch_ == 0;
+      epochs_one &= group->config_epoch_ == 1;
+    }
+    if (slots_empty && epochs_zero) {
+      SetSlotMap command;
+      for (const auto& range : manifest->slot_ranges_)
+        command.ranges_.push_back(
+            {range.first_, range.last_, range.group_id_});
+      for (const auto& declaration : manifest->groups_)
+        command.config_epochs_.push_back({declaration.group_id_, 1});
+      command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
+      return Emit(std::move(command));
+    }
+    if (!slots_match || !epochs_one)
+      return Conflict("creation Slot map or config epoch differs from intent");
+    return Advance(operation, kRootPhasePolicy);
+  }
+
+  bool slots_empty = false;
+  if (!V1SlotMapMatches(stores, *manifest, &slots_empty) || slots_empty)
+    return Conflict("creation Slot map differs from intent");
+  if (phase == kRootPhasePolicy) {
+    const auto policy =
+        stores.policy_.FindVersion(std::string(kV1Policy), 1);
+    if (!policy.has_value()) {
+      PutPolicy command;
+      command.policy_id_ = kV1Policy;
+      command.version_ = 1;
+      command.content_ = "declarative-empty-population";
+      command.content_hash_ = MetaSha256(command.content_);
+      return Emit(std::move(command));
+    }
+    if (policy->retired_ ||
+        policy->content_ != "declarative-empty-population" ||
+        policy->content_hash_ != MetaSha256(policy->content_))
+      return Conflict("creation policy differs from intent");
+    return Advance(operation, kRootPhasePopulation);
+  }
+
+  if (phase == kRootPhasePopulation) {
+    const MetaGrantSpec expected_grant{5'000, std::string(kV1Policy), 1};
+    for (const auto& declaration : manifest->groups_) {
+      const auto population =
+          V1PopulationManifest(*manifest, declaration.group_id_);
       if (!stores.population_manifest_.Contains(population.manifest_digest_))
         return Emit(population);
-      break;
-    case 6:
-      if (!population_matches) {
-        SetGroupReplicationState c;
-        c.group_id_ = m.group_id_;
-        c.new_population_manifest_revision_ = 1;
-        c.new_population_manifest_digest_ = population.manifest_digest_;
-        c.new_partition_replication_epoch_ = 1;
-        c.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
-        return Emit(std::move(c));
+      const auto group = stores.topology_.FindGroup(declaration.group_id_);
+      const auto grant = stores.grant_.GroupState(declaration.group_id_);
+      if (!group.has_value() || !grant.has_value())
+        return Conflict(absl::StrCat("creation Group disappeared: group=",
+                                     declaration.group_id_));
+      const bool population_empty =
+          group->record_.population_manifest_revision_ == 0 &&
+          group->record_.partition_replication_epoch_ == 0;
+      const bool population_matches =
+          group->record_.population_manifest_revision_ == 1 &&
+          group->record_.population_manifest_digest_ ==
+              population.manifest_digest_ &&
+          group->record_.partition_replication_epoch_ == 1;
+      if (population_empty) {
+        SetGroupReplicationState command;
+        command.group_id_ = declaration.group_id_;
+        command.new_population_manifest_revision_ = 1;
+        command.new_population_manifest_digest_ = population.manifest_digest_;
+        command.new_partition_replication_epoch_ = 1;
+        command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
+        return Emit(std::move(command));
       }
-      break;
-    case 7:
-      if (!policy_matches) {
-        PutPolicy c;
-        c.policy_id_ = kPolicy;
-        c.version_ = 1;
-        c.content_ = "first-empty-population";
-        c.content_hash_ = MetaSha256(c.content_);
-        return Emit(std::move(c));
-      }
-      break;
-    case 8:
+      if (!population_matches)
+        return Conflict(absl::StrCat(
+            "creation population differs from intent: group=",
+            declaration.group_id_));
+      const bool authority_matches =
+          grant->grant_.has_value() && !grant->fenced_ &&
+          grant->grant_->owner_ == declaration.primary_node_id_ &&
+          grant->grant_->term_ == 1 &&
+          grant->grant_->authority_version_ == 1 &&
+          grant->grant_->spec_ == expected_grant;
       if (!authority_matches) {
-        // A fenced authority version 1 is a later revocation, not the
-        // never-activated version 0. Do not undo it during recovery.
-        if (group->record_.authority_version_ != 0)
-          return Conflict("creation authority was revoked");
-        ActivateAuthority c;
-        c.group_id_ = m.group_id_;
-        c.expected_term_ = 1;
-        c.new_owner_ = m.data_node_id_;
-        c.grant_ = expected_grant;
-        c.new_authority_version_ = 1;
-        c.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
-        c.new_config_epoch_ = 1;
-        return Emit(std::move(c));
+        if (group->record_.authority_version_ != 0 ||
+            grant->grant_.has_value())
+          return Conflict(absl::StrCat(
+              "creation authority changed: group=", declaration.group_id_));
+        ActivateAuthority command;
+        command.group_id_ = declaration.group_id_;
+        command.expected_term_ = 1;
+        command.new_owner_ = declaration.primary_node_id_;
+        command.grant_ = expected_grant;
+        command.new_authority_version_ = 1;
+        command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
+        command.new_config_epoch_ = 1;
+        return Emit(std::move(command));
       }
-      break;
-    default: {
-      const auto child = stores.operation_.FindOperation(child_id);
-      if (!child.has_value()) {
-        if (step != 9 || stores.operation_.OperationKnown(child_id))
-          return Conflict(
-              "initialization operation disappeared or was archived");
-        const auto target = std::find_if(
-            runtime.nodes_.begin(), runtime.nodes_.end(),
-            [&](const auto& item) { return item.node_id_ == m.data_node_id_; });
-        if (!runtime.leader_authority_eligible_ ||
-            target == runtime.nodes_.end() ||
-            !ProjectionMatches(*target, *group, *grant, view.applied_index()))
-          return std::nullopt;
-        if (!cluster::control::IsCanonicalIdentity160(target->boot_id_))
-          return Conflict("Data boot identity is malformed");
-        SubmitOperation c;
-        c.operation_id_ = child_id;
-        c.kind_ = kPopulationKind;
-        c.intent_ =
-            absl::StrCat("empty-population-v1 ", Hex(operation.operation_id_),
-                         " ", target->boot_id_);
-        c.intent_hash_ = MetaSha256(c.intent_);
-        c.replication_history_id_ = target->replication_history_id_;
-        c.policy_references_ = {{std::string(kPolicy), 1}};
-        return Emit(std::move(c));
-      }
-      const std::string prefix = absl::StrCat(
-          "empty-population-v1 ", Hex(operation.operation_id_), " ");
-      if (child->kind_ != kPopulationKind ||
-          !child->intent_.starts_with(prefix) ||
-          !cluster::control::IsCanonicalIdentity160(
-              child->intent_.substr(prefix.size())))
-        return Conflict(
-            "initialization operation is not owned by this creation");
-      if (step == 9) break;
-      if (child->lifecycle_ == MetaOperationLifecycle::kCompleted)
-        return Complete(operation);
-      if (child->lifecycle_ == MetaOperationLifecycle::kAborted)
-        return Abort(operation, child->terminal_result_);
-      if (!child->terminal_receipts_.empty()) {
-        const auto& receipt = child->terminal_receipts_.back();
-        if (receipt.key_.directive_id_ != DerivedId(child_id, "directive") ||
-            receipt.key_.attempt_id_ != DerivedId(child_id, "attempt"))
-          return Conflict("initialization receipt belongs to another attempt");
-        if (receipt.status_ != MetaDirectiveResultStatus::kSucceeded) {
-          if (authority_matches) {
-            FenceGroup c;
-            c.group_id_ = m.group_id_;
-            c.expected_term_ = 1;
-            return Emit(std::move(c));
-          }
-          return Abort(*child, absl::StrCat("empty population initialization: ",
-                                            receipt.result_));
-        }
-        if (!child->current_directives_.empty())
-          return Advance(*child, "population-ready");
-        return Complete(*child);
-      }
-      if (!authority_matches)
-        return Conflict("initialization authority was revoked");
-      if (!child->current_directives_.empty()) {
-        const auto target = std::find_if(
-            runtime.nodes_.begin(), runtime.nodes_.end(),
-            [&](const auto& item) { return item.node_id_ == m.data_node_id_; });
-        if (target != runtime.nodes_.end() &&
-            (target->boot_id_ != child->intent_.substr(prefix.size()) ||
-             target->replication_history_id_ != child->replication_history_id_))
-          return Conflict(
-              "Data restarted during initialization; recovery requires a new "
-              "authorized attempt");
-        // The publisher owns resend/receipt tracking. A missing receipt is
-        // NOT permission to mint another destructive directive identity.
-        return std::nullopt;
-      }
-      if (child->lifecycle_ != MetaOperationLifecycle::kSubmitted)
-        return Conflict("initialization directive was invalidated");
-      MetaDirectiveSpec initialize;
-      initialize.directive_id_ = DerivedId(child_id, "directive");
-      initialize.attempt_id_ = DerivedId(child_id, "attempt");
-      initialize.recipient_node_id_ = m.data_node_id_;
-      initialize.target_node_id_ = m.data_node_id_;
-      std::string boot;
-      if (!absl::HexStringToBytes(child->intent_.substr(prefix.size()), &boot))
-        return Conflict("invalid initialization boot identity");
-      std::copy(boot.begin(), boot.end(), initialize.target_boot_id_.begin());
-      initialize.assignment_id_ = assignment;
-      initialize.source_node_id_ = std::string(kMetaNodeIdBytes, '0');
-      initialize.group_id_ = m.group_id_;
-      initialize.group_term_ = 1;
-      initialize.authority_version_ = 1;
-      initialize.grant_revision_ = grant->grant_->grant_revision_;
-      initialize.population_manifest_revision_ = 1;
-      initialize.population_manifest_digest_ = population.manifest_digest_;
-      initialize.partition_replication_epoch_ = 1;
-      initialize.kind_ = kMetaDirectiveInitializeEmptyPopulation;
-      initialize.payload_ = Hex(child->replication_history_id_);
-      initialize.storage_mutating_ = true;
-      TransitionOperationPhase c;
-      c.operation_id_ = child_id;
-      c.expected_revision_ = child->revision_;
-      c.kind_phase_blob_ = "initializing-empty-population";
-      c.current_directives_.push_back(std::move(initialize));
-      return Emit(std::move(c));
     }
+    return Advance(operation, kRootPhaseWaitDataProjection);
   }
-  return Advance(operation, kPhases[step + 1]);
+
+  if (phase != kRootPhaseWaitDataProjection &&
+      phase != kRootPhaseInitializeGroups)
+    return Conflict("unknown v1 creation phase");
+  if (auto status = ValidateV1FinalTopology(
+          stores, *manifest, operation.operation_id_,
+          phase == kRootPhaseInitializeGroups);
+      !status.ok())
+    return Conflict(status.message());
+  if (phase == kRootPhaseWaitDataProjection) {
+    if (!runtime.leader_authority_eligible_) return std::nullopt;
+    for (const auto& declaration : manifest->groups_) {
+      const auto group = stores.topology_.FindGroup(declaration.group_id_);
+      const auto grant = stores.grant_.GroupState(declaration.group_id_);
+      for (const auto& [node_id, role] : DeclaredMembers(declaration)) {
+        (void)role;
+        const auto node = std::find_if(
+            runtime.nodes_.begin(), runtime.nodes_.end(),
+            [&](const auto& item) { return item.node_id_ == node_id; });
+        if (node == runtime.nodes_.end() ||
+            !ProjectionMatches(*node, *group, *grant, view.applied_index()))
+          return std::nullopt;
+      }
+    }
+    return Advance(operation, kRootPhaseInitializeGroups);
+  }
+
+  for (const auto& declaration : manifest->groups_) {
+    const MetaOperationId child_id = detail::ClusterCreateV1GroupOperationId(
+        operation.operation_id_, declaration.group_id_);
+    const auto child = stores.operation_.FindOperation(child_id);
+    if (!child.has_value()) {
+      if (stores.operation_.OperationKnown(child_id))
+        return Conflict(absl::StrCat(
+            "creation Group operation was archived: group=",
+            declaration.group_id_));
+      const auto group = stores.topology_.FindGroup(declaration.group_id_);
+      const auto grant = stores.grant_.GroupState(declaration.group_id_);
+      const auto primary = std::find_if(
+          runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& node) {
+            return node.node_id_ == declaration.primary_node_id_;
+          });
+      if (!runtime.leader_authority_eligible_ ||
+          primary == runtime.nodes_.end() ||
+          !ProjectionMatches(*primary, *group, *grant, view.applied_index()))
+        return std::nullopt;
+      if (!cluster::control::IsCanonicalIdentity160(primary->boot_id_))
+        return Conflict(absl::StrCat("group=", declaration.group_id_,
+                                     " node=", declaration.primary_node_id_,
+                                     " boot identity is malformed"));
+      SubmitOperation submit;
+      submit.operation_id_ = child_id;
+      submit.kind_ = kMetaClusterCreateV1GroupOperationKind;
+      submit.intent_ = absl::StrCat(
+          "cluster-create-v1-group ", Hex(operation.operation_id_), " ",
+          absl::BytesToHexString(declaration.group_id_), " ",
+          primary->boot_id_);
+      submit.intent_hash_ = MetaSha256(submit.intent_);
+      submit.replication_history_id_ = primary->replication_history_id_;
+      submit.policy_references_ = {{std::string(kV1Policy), 1}};
+      return Emit(std::move(submit));
+    }
+    if (child->lifecycle_ == MetaOperationLifecycle::kCompleted) continue;
+    if (child->lifecycle_ == MetaOperationLifecycle::kAborted)
+      return Abort(operation,
+                   absl::StrCat("group=", declaration.group_id_, " ",
+                                child->terminal_result_));
+    auto next = PlanV1GroupStep(view, operation, *child, *manifest,
+                                declaration, runtime);
+    if (!next.ok() || next->has_value()) return next;
+    return std::nullopt;
+  }
+  return Complete(operation);
+}
+
+}  // namespace
+
+MetaOperationId detail::ClusterCreateV1GroupOperationId(
+    const MetaOperationId& root, std::string_view group_id) {
+  return DerivedV1Id(
+      root, absl::StrCat("group/", absl::BytesToHexString(group_id)));
+}
+
+Plan detail::PlanClusterCreateStep(
+    const MetaCommittedView& view, const MetaOperationRecord& operation,
+    const MetaDataControlRuntimeSnapshot& runtime) {
+  if (operation.kind_ == kMetaClusterCreateOperationKind)
+    return PlanV1ClusterCreateStep(view, operation, runtime);
+  return std::nullopt;
 }
 
 struct MetaClusterCreateReconciler::Core {
@@ -503,10 +992,11 @@ celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
     if (changed->exchange(false, std::memory_order_acq_rel))
       subscribed.view_ = context->CommittedView();
     const auto& view = subscribed.view_;
-    const auto operations =
-        view.operation().HasActiveKind(kMetaClusterCreateOperationKind)
-            ? view.operation().LiveOperations()
-            : std::vector<MetaOperationRecord>{};
+    const bool has_creation =
+        view.operation().HasActiveKind(kMetaClusterCreateOperationKind);
+    const auto operations = has_creation
+                                ? view.operation().LiveOperations()
+                                : std::vector<MetaOperationRecord>{};
     const auto operation = std::find_if(
         operations.begin(), operations.end(), [](const auto& item) {
           return item.kind_ == kMetaClusterCreateOperationKind &&
@@ -521,18 +1011,28 @@ celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
         std::string cut = operation->kind_phase_blob_.empty()
                               ? "submitted"
                               : operation->kind_phase_blob_;
-        if (cut == "initialize-data") {
-          const auto child = view.operation().FindOperation(
-              DerivedId(operation->operation_id_, "population"));
-          if (child.has_value()) {
-            if (child->lifecycle_ == MetaOperationLifecycle::kCompleted)
-              cut = "child-completed";
-            else if (child->kind_phase_blob_ == "population-ready")
-              cut = "directive-removed";
-            else if (!child->terminal_receipts_.empty())
-              cut = "result-committed";
-            else if (!child->current_directives_.empty())
-              cut = "initialization-issued";
+        if (cut == kRootPhaseInitializeGroups) {
+          std::uint32_t timeout = 0;
+          const auto manifest =
+              DecodeClusterCreateRequest(operation->intent_, &timeout);
+          if (manifest.ok()) {
+            for (const auto& declaration : manifest->groups_) {
+              const auto child = view.operation().FindOperation(
+                  detail::ClusterCreateV1GroupOperationId(
+                      operation->operation_id_, declaration.group_id_));
+              if (!child.has_value()) break;
+              if (child->lifecycle_ == MetaOperationLifecycle::kCompleted) {
+                cut = "child-completed";
+                continue;
+              }
+              if (child->kind_phase_blob_ == kGroupPhaseReady)
+                cut = "directive-removed";
+              else if (!child->terminal_receipts_.empty())
+                cut = "result-committed";
+              else if (!child->current_directives_.empty())
+                cut = "initialization-issued";
+              break;
+            }
           }
         }
         if (cut != last_cut) {

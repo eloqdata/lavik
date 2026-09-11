@@ -16,7 +16,9 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -162,6 +164,19 @@ RedisCliResult RunRedisCli(
   return RunProcess(std::move(arguments), deadline);
 }
 
+RedisCliResult RunRedisCliWithoutRedirects(
+    const keylane::NumericEndpoint& endpoint,
+    std::vector<std::string> command,
+    std::chrono::steady_clock::time_point deadline) {
+  std::vector<std::string> arguments{
+      "redis-cli", "--raw", "-h", endpoint.host_,
+      "-p", std::to_string(endpoint.port_)};
+  arguments.insert(arguments.end(),
+                   std::make_move_iterator(command.begin()),
+                   std::make_move_iterator(command.end()));
+  return RunProcess(std::move(arguments), deadline);
+}
+
 std::uint16_t RedisKeySlot(std::string_view key) {
   const std::size_t open = key.find('{');
   if (open != std::string_view::npos) {
@@ -233,8 +248,8 @@ void PrintUsage(const char* program) {
       "\n"
       "Direct commands are sent to the specified Meta node as one line.\n"
       "status reports that node's state; cluster-status discovers the leader\n"
-      "and reports cluster readiness. cluster-create creates the v1 single-\n"
-      "Data topology and verifies it with redis-cli. Options may precede\n"
+      "and reports cluster readiness. cluster-create creates the v1 multi-\n"
+      "Data, multi-Group topology and verifies it with redis-cli. Options may precede\n"
       "either local cluster command.\n"
       "Durability recovery uses: abortop ID, archiveoperations SEQ..., then\n"
       "exportoperations and pruneoperations SEQ....\n"
@@ -529,18 +544,75 @@ void VerifyClusterWithRedisCli(
   }
 
   constexpr std::string_view kTcpPrefix = "tcp://";
-  auto endpoint = keylane::ParseNumericEndpoint(
-      std::string_view(manifest.client_endpoint_).substr(kTcpPrefix.size()));
-  if (!endpoint.has_value()) Fail("manifest Data endpoint became invalid");
+  std::map<std::string, keylane::NumericEndpoint> endpoints;
+  for (const auto& node : manifest.data_nodes_) {
+    auto endpoint = keylane::ParseNumericEndpoint(
+        std::string_view(node.client_endpoint_).substr(kTcpPrefix.size()));
+    if (!endpoint.has_value()) Fail("manifest Data endpoint became invalid");
+    endpoints.emplace(node.node_id_, std::move(*endpoint));
+  }
+  const auto group_by_id = [&](std::string_view group_id) {
+    return std::find_if(manifest.groups_.begin(), manifest.groups_.end(),
+                        [&](const auto& group) {
+                          return group.group_id_ == group_id;
+                        });
+  };
+  const auto key_in_range = [](std::uint16_t first, std::uint16_t last,
+                               std::string_view label) {
+    for (std::uint32_t ordinal = 0;; ++ordinal) {
+      std::string key = "{keylane-create-" + std::string(label) + "-" +
+                        std::to_string(ordinal) + "}";
+      const std::uint16_t slot = RedisKeySlot(key);
+      if (slot >= first && slot <= last) return key;
+    }
+  };
 
-  const std::string info = RequireRedisCli(
-      *endpoint, {"CLUSTER", "INFO"}, deadline, "CLUSTER INFO");
-  if (info.find("cluster_state:ok") == std::string::npos) {
-    Fail("CLUSTER INFO did not report cluster_state:ok");
+  std::vector<std::string> group_probe_keys;
+  group_probe_keys.reserve(manifest.groups_.size());
+  for (const auto& group : manifest.groups_) {
+    const auto endpoint = endpoints.find(group.primary_node_id_);
+    if (endpoint == endpoints.end()) Fail("manifest primary endpoint is absent");
+    const std::string info = RequireRedisCli(
+        endpoint->second, {"CLUSTER", "INFO"}, deadline, "CLUSTER INFO");
+    if (info.find("cluster_state:ok") == std::string::npos) {
+      Fail("CLUSTER INFO did not report cluster_state:ok for " +
+           group.group_id_);
+    }
+    const auto range = std::find_if(
+        manifest.slot_ranges_.begin(), manifest.slot_ranges_.end(),
+        [&](const auto& candidate) {
+          return candidate.group_id_ == group.group_id_;
+        });
+    if (range == manifest.slot_ranges_.end())
+      Fail("manifest Group has no normalized Slot range");
+    const std::string probe_key =
+        key_in_range(range->first_, range->last_, group.group_id_);
+    group_probe_keys.push_back(probe_key);
+    const std::string observed_slot = RequireRedisCli(
+        endpoint->second, {"CLUSTER", "KEYSLOT", probe_key}, deadline,
+        "CLUSTER KEYSLOT");
+    if (observed_slot != std::to_string(RedisKeySlot(probe_key))) {
+      Fail("CLUSTER KEYSLOT disagreed with the Keylane CRC16 calculation");
+    }
+    const std::string probe_value = "keylane-cluster-create-ok";
+    const std::string set = RequireRedisCli(
+        endpoint->second, {"SET", probe_key, probe_value}, deadline,
+        "SET probe");
+    if (set != "OK") Fail("SET probe returned an unexpected reply");
+    const std::string get = RequireRedisCli(
+        endpoint->second, {"GET", probe_key}, deadline, "GET probe");
+    const std::string deleted = RequireRedisCli(
+        endpoint->second, {"DEL", probe_key}, deadline, "DEL probe cleanup");
+    if (get != probe_value || deleted != "1") {
+      Fail("redis-cli write/read/cleanup probe did not round-trip exactly");
+    }
   }
 
+  const auto first_primary = endpoints.find(manifest.groups_.front().primary_node_id_);
+  if (first_primary == endpoints.end()) Fail("manifest primary endpoint is absent");
   const std::string slots = RequireRedisCli(
-      *endpoint, {"CLUSTER", "SLOTS"}, deadline, "CLUSTER SLOTS");
+      first_primary->second, {"CLUSTER", "SLOTS"}, deadline,
+      "CLUSTER SLOTS");
   std::vector<std::string_view> slot_lines;
   std::string_view remaining = slots;
   while (!remaining.empty()) {
@@ -551,46 +623,54 @@ void VerifyClusterWithRedisCli(
     if (newline == std::string_view::npos) break;
     remaining.remove_prefix(newline + 1);
   }
-  if (slot_lines.size() != 5 || slot_lines[0] != "0" ||
-      slot_lines[1] != "16383" || slot_lines[2] != endpoint->host_ ||
-      slot_lines[3] != std::to_string(endpoint->port_) ||
-      slot_lines[4] != manifest.data_node_id_) {
-    Fail("CLUSTER SLOTS did not return the requested full range and endpoint");
+  std::size_t line = 0;
+  for (const auto& range : manifest.slot_ranges_) {
+    const auto group = group_by_id(range.group_id_);
+    if (group == manifest.groups_.end()) Fail("normalized Slot Group is absent");
+    const auto primary = endpoints.find(group->primary_node_id_);
+    if (primary == endpoints.end() || line + 5 > slot_lines.size() ||
+        slot_lines[line++] != std::to_string(range.first_) ||
+        slot_lines[line++] != std::to_string(range.last_) ||
+        slot_lines[line++] != primary->second.host_ ||
+        slot_lines[line++] != std::to_string(primary->second.port_) ||
+        slot_lines[line++] != group->primary_node_id_) {
+      Fail("CLUSTER SLOTS primary range differs from the manifest");
+    }
+    for (const std::string& replica_id : group->replica_node_ids_) {
+      const auto replica = endpoints.find(replica_id);
+      if (replica == endpoints.end() || line + 3 > slot_lines.size() ||
+          slot_lines[line++] != replica->second.host_ ||
+          slot_lines[line++] != std::to_string(replica->second.port_) ||
+          slot_lines[line++] != replica_id) {
+        Fail("CLUSTER SLOTS replica membership differs from the manifest");
+      }
+    }
+  }
+  if (line != slot_lines.size()) {
+    Fail("CLUSTER SLOTS returned unexpected trailing topology data");
   }
 
-  const std::string probe_key =
-      "keylane:cluster-create:" + std::to_string(::getpid()) + ":" +
-      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-  const std::string expected_slot = std::to_string(RedisKeySlot(probe_key));
-  const std::string observed_slot = RequireRedisCli(
-      *endpoint, {"CLUSTER", "KEYSLOT", probe_key}, deadline,
-      "CLUSTER KEYSLOT");
-  if (observed_slot != expected_slot) {
-    Fail("CLUSTER KEYSLOT disagreed with the Keylane CRC16 calculation");
-  }
-
-  const std::string probe_value = "keylane-cluster-create-ok";
-  const std::string set = RequireRedisCli(
-      *endpoint, {"SET", probe_key, probe_value}, deadline, "SET probe");
-  if (set != "OK") {
-    (void)RunRedisCli(*endpoint, {"DEL", probe_key}, deadline);
-    Fail("SET probe returned an unexpected reply");
-  }
-  std::string get;
-  try {
-    get = RequireRedisCli(*endpoint, {"GET", probe_key}, deadline,
-                          "GET probe");
-  } catch (...) {
-    // SET may have committed even when a later verification command fails.
-    // Cleanup is best-effort here so the original diagnostic and exit
-    // classification remain intact.
-    (void)RunRedisCli(*endpoint, {"DEL", probe_key}, deadline);
-    throw;
-  }
-  const std::string deleted = RequireRedisCli(
-      *endpoint, {"DEL", probe_key}, deadline, "DEL probe cleanup");
-  if (get != probe_value || deleted != "1") {
-    Fail("redis-cli write/read/cleanup probe did not round-trip exactly");
+  if (manifest.groups_.size() > 1) {
+    const auto second_primary =
+        endpoints.find(manifest.groups_[1].primary_node_id_);
+    if (second_primary == endpoints.end())
+      Fail("second manifest primary endpoint is absent");
+    RedisCliResult moved = RunRedisCliWithoutRedirects(
+        first_primary->second, {"GET", group_probe_keys[1]}, deadline);
+    const std::string expected_moved =
+        "MOVED " + std::to_string(RedisKeySlot(group_probe_keys[1])) + " " +
+        keylane::FormatNumericEndpoint(second_primary->second);
+    if (moved.timed_out_ || moved.output_.find(expected_moved) ==
+                                std::string::npos) {
+      Fail("wrong-Group request did not return the expected MOVED target");
+    }
+    RedisCliResult cross_slot = RunRedisCliWithoutRedirects(
+        first_primary->second,
+        {"MGET", group_probe_keys[0], group_probe_keys[1]}, deadline);
+    if (cross_slot.timed_out_ ||
+        cross_slot.output_.find("CROSSSLOT") == std::string::npos) {
+      Fail("cross-Group multi-key request did not return CROSSSLOT");
+    }
   }
 }
 
@@ -598,16 +678,40 @@ int RunClusterCreate(const Options& options) {
   auto manifest = keylane::meta::ParseClusterCreateManifest(
       ReadManifest(options.manifest_path_));
   if (!manifest.ok()) Fail(std::string(manifest.status().message()));
+  // Encoding is part of local admission so an oversized normalized topology
+  // is rejected before the destructive confirmation prompt.
+  auto encoded = keylane::meta::EncodeClusterCreateRequest(
+      *manifest, static_cast<std::uint32_t>(options.timeout_ms_));
+  if (!encoded.ok()) Fail(std::string(encoded.status().message()));
 
   std::cout << "Cluster create plan (schema v1)\n"
             << "  Meta member: " << manifest->meta_member_id_ << '\n'
-            << "  Data node: " << manifest->data_node_id_ << '\n'
-            << "  Client endpoint: " << manifest->client_endpoint_ << '\n'
-            << "  Group/primary: " << manifest->group_id_ << " / "
-            << manifest->primary_node_id_ << '\n'
-            << "  Slots: " << manifest->first_slot_ << '-'
-            << manifest->last_slot_
-            << "\nWARNING: existing data on the Data node will be erased.\n";
+            << "  Slot layout: "
+            << (manifest->slots_generated_ ? "contiguous-even" : "explicit")
+            << '\n';
+  for (const auto& node : manifest->data_nodes_) {
+    std::cout << "  Data node: " << node.node_id_ << " @ "
+              << node.client_endpoint_ << '\n';
+  }
+  for (const auto& group : manifest->groups_) {
+    std::cout << "  Group: " << group.group_id_ << " primary="
+              << group.primary_node_id_ << " replicas=";
+    if (group.replica_node_ids_.empty()) {
+      std::cout << "none";
+    } else {
+      for (std::size_t index = 0; index < group.replica_node_ids_.size();
+           ++index) {
+        if (index != 0) std::cout << ',';
+        std::cout << group.replica_node_ids_[index];
+      }
+    }
+    std::cout << '\n';
+  }
+  for (const auto& range : manifest->slot_ranges_) {
+    std::cout << "  Slots: " << range.first_ << '-' << range.last_ << " -> "
+              << range.group_id_ << '\n';
+  }
+  std::cout << "WARNING: existing data on all Data nodes will be erased.\n";
   if (!options.yes_) {
     std::cout << "Type yes to continue: " << std::flush;
     std::string confirmation;
@@ -648,8 +752,12 @@ int RunClusterCreate(const Options& options) {
                  "run cluster-status before taking further action\n";
     return 3;
   }
-  std::cout << "Cluster READY: committed=" << outcome->committed_index_
-            << " operation=" << outcome->operation_id_ << '\n';
+  std::cout << "Cluster READY: committed=" << outcome->committed_index_;
+  for (const auto& group : outcome->groups_) {
+    std::cout << " group=" << group.group_id_
+              << " operation=" << group.operation_id_;
+  }
+  std::cout << '\n';
   return 0;
 }
 
