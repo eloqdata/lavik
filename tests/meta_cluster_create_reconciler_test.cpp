@@ -135,9 +135,9 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
     Apply(std::move(**next));
   }
 
-  void CommitResult(const MetaOperationRecord& operation,
-                    const MetaCurrentDirective& directive,
-                    MetaDirectiveResultStatus status) {
+  CommitDirectiveResult ResultFor(const MetaOperationRecord& operation,
+                                  const MetaCurrentDirective& directive,
+                                  MetaDirectiveResultStatus status) {
     CommitDirectiveResult result;
     result.operation_id_ = operation.operation_id_;
     result.directive_id_ = directive.spec_.directive_id_;
@@ -154,7 +154,13 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
                          ? "ready"
                          : "failed";
     result.result_hash_ = MetaSha256(result.result_);
-    Apply(result);
+    return result;
+  }
+
+  void CommitResult(const MetaOperationRecord& operation,
+                    const MetaCurrentDirective& directive,
+                    MetaDirectiveResultStatus status) {
+    Apply(ResultFor(operation, directive, status));
   }
 
   void StartFirstReplicaBatch() {
@@ -168,6 +174,32 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
     CommitResult(child, child.current_directives_.front(),
                  MetaDirectiveResultStatus::kSucceeded);
     ApplyPlanned();  // group-a: authorize and rebuild replica
+  }
+
+  void ExpectIncarnationFailure(std::string_view node_id) {
+    const auto receipts = GroupOperation("group-a").terminal_receipts_;
+    ApplyPlanned();  // retain failure and remove old directives
+    auto child = GroupOperation("group-a");
+    EXPECT_TRUE(child.kind_phase_blob_.starts_with("deterministic-failure:"));
+    EXPECT_NE(child.kind_phase_blob_.find("node=" + std::string(node_id)),
+              std::string::npos);
+    EXPECT_TRUE(child.current_directives_.empty());
+    EXPECT_EQ(child.terminal_receipts_, receipts);
+
+    // Every Apply serializes/restores the stores. Dropping runtime as well
+    // models a Meta restart after detection but before fencing the Group.
+    runtime_ = {};
+    ApplyPlanned();  // fence group-a
+    EXPECT_TRUE(stores_.grant_.GroupState("group-a")->fenced_);
+    EXPECT_FALSE(stores_.grant_.GroupState("group-b")->fenced_);
+    ApplyPlanned();  // abort group-a
+    ApplyPlanned();  // abort root
+    EXPECT_EQ(GroupOperation("group-a").lifecycle_,
+              MetaOperationLifecycle::kAborted);
+    EXPECT_EQ(stores_.operation_.FindOperation(root_)->lifecycle_,
+              MetaOperationLifecycle::kAborted);
+    EXPECT_FALSE(stores_.operation_.FindOperation(
+        detail::ClusterCreateV1GroupOperationId(root_, "group-b")));
   }
 
   MetaStores stores_;
@@ -299,6 +331,117 @@ TEST_F(ClusterCreateV1RecoveryTest,
   EXPECT_FALSE(next.ok());
   EXPECT_NE(next.status().message().find("authority changed"),
             std::string_view::npos);
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       ReplicaRestartBeforeResultFencesItsGroupAndAbortsRoot) {
+  StartFirstReplicaBatch();
+  const auto child = GroupOperation("group-a");
+  CommitResult(child, child.current_directives_[0],
+               MetaDirectiveResultStatus::kSucceeded);
+  runtime_.nodes_[1].boot_id_ = std::string(40, 'f');
+  ExpectIncarnationFailure(std::string(40, '2'));
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       SourceRestartBeforeAuthorizationFencesItsGroupAndAbortsRoot) {
+  StartFirstReplicaBatch();
+  runtime_.nodes_[0].boot_id_ = std::string(40, 'f');
+  ExpectIncarnationFailure(std::string(40, '1'));
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       SourceHistoryChangeWhileRebuildingFencesItsGroupAndAbortsRoot) {
+  StartFirstReplicaBatch();
+  const auto child = GroupOperation("group-a");
+  CommitResult(child, child.current_directives_[0],
+               MetaDirectiveResultStatus::kSucceeded);
+  runtime_.nodes_[0].replication_history_id_.fill(99);
+  ExpectIncarnationFailure(std::string(40, '1'));
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       PrimaryRestartBeforeDirectiveDispatchDoesNotIssueStaleInitialization) {
+  AdvanceToProjectionWait();
+  PublishRuntime();
+  ApplyPlanned();  // root: initialize-groups
+  ApplyPlanned();  // group-a: submit with the original primary boot
+  runtime_.nodes_[0].boot_id_ = std::string(40, 'f');
+  ExpectIncarnationFailure(std::string(40, '1'));
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       PrimaryRestartAfterInitializationDoesNotIssueStaleSourceAuthorization) {
+  AdvanceToProjectionWait();
+  PublishRuntime();
+  ApplyPlanned();  // root: initialize-groups
+  ApplyPlanned();  // group-a: submit
+  ApplyPlanned();  // group-a: initialize primary
+  const auto child = GroupOperation("group-a");
+  CommitResult(child, child.current_directives_.front(),
+               MetaDirectiveResultStatus::kSucceeded);
+  runtime_.nodes_[0].boot_id_ = std::string(40, 'f');
+  ExpectIncarnationFailure(std::string(40, '1'));
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       MissingRuntimeAndSameBootReconnectDoNotImplyRestart) {
+  StartFirstReplicaBatch();
+  auto reconnected = runtime_;
+  runtime_ = {};
+  auto next = Plan();
+  ASSERT_TRUE(next.ok()) << next.status();
+  EXPECT_FALSE(next->has_value());
+  runtime_ = std::move(reconnected);
+  for (auto& node : runtime_.nodes_) {
+    node.session_id_.fill(99);
+    ++node.session_generation_;
+  }
+  next = Plan();
+  ASSERT_TRUE(next.ok()) << next.status();
+  EXPECT_FALSE(next->has_value());
+
+  runtime_.leader_authority_eligible_ = false;
+  runtime_.nodes_[1].boot_id_ = std::string(40, 'f');
+  next = Plan();
+  ASSERT_TRUE(next.ok()) << next.status();
+  EXPECT_FALSE(next->has_value());
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       CommittedReplicaSuccessRemainsHistoryAfterBootChanges) {
+  StartFirstReplicaBatch();
+  const auto child = GroupOperation("group-a");
+  for (const auto& directive : child.current_directives_)
+    CommitResult(child, directive, MetaDirectiveResultStatus::kSucceeded);
+  const auto receipts = GroupOperation("group-a").terminal_receipts_;
+  runtime_.nodes_[0].boot_id_ = std::string(40, 'e');
+  runtime_.nodes_[1].boot_id_ = std::string(40, 'f');
+  ApplyPlanned();  // retire completed directives
+  ApplyPlanned();  // complete the child without rewriting its results
+  EXPECT_EQ(GroupOperation("group-a").lifecycle_,
+            MetaOperationLifecycle::kCompleted);
+  EXPECT_EQ(GroupOperation("group-a").terminal_receipts_, receipts);
+  EXPECT_FALSE(stores_.grant_.GroupState("group-a")->fenced_);
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       LateOldBootResultCannotCompleteAnInvalidatedAttempt) {
+  StartFirstReplicaBatch();
+  const auto child = GroupOperation("group-a");
+  auto late = ResultFor(child, child.current_directives_[1],
+                        MetaDirectiveResultStatus::kSucceeded);
+  runtime_.nodes_[1].boot_id_ = std::string(40, 'f');
+  ApplyPlanned();  // durably invalidate the attempt before its result arrives
+  const auto failed = GroupOperation("group-a");
+  late.request_id_.fill(2);
+  const auto result =
+      ApplyCommitted(stores_, ++index_, late, "keylane://operator/test", "now");
+  EXPECT_EQ(result.verdict_, MetaAuditVerdict::kRejected) << result.detail_;
+  EXPECT_EQ(GroupOperation("group-a").kind_phase_blob_,
+            failed.kind_phase_blob_);
+  EXPECT_EQ(GroupOperation("group-a").terminal_receipts_,
+            failed.terminal_receipts_);
 }
 
 TEST_F(ClusterCreateV1RecoveryTest,

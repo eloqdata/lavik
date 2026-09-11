@@ -557,11 +557,21 @@ void VerifyClusterWithRedisCli(
                           return group.group_id_ == group_id;
                         });
   };
-  const auto key_in_range = [](std::uint16_t first, std::uint16_t last,
-                               std::string_view label) {
+  const auto key_in_range = [deadline](std::uint16_t first, std::uint16_t last,
+                                       std::string_view label) {
+    // Group ids are arbitrary bytes. Encoding keeps a literal '}' in an id
+    // from ending the Redis hash tag before the varying search ordinal.
+    constexpr std::string_view hex = "0123456789abcdef";
+    std::string prefix = "{keylane-create-";
+    for (const unsigned char byte : label) {
+      prefix.push_back(hex[byte >> 4]);
+      prefix.push_back(hex[byte & 15]);
+    }
+    prefix.push_back('-');
     for (std::uint32_t ordinal = 0;; ++ordinal) {
-      std::string key = "{keylane-create-" + std::string(label) + "-" +
-                        std::to_string(ordinal) + "}";
+      if (std::chrono::steady_clock::now() >= deadline)
+        throw ClusterCreateTimeout("probe key search timed out");
+      std::string key = prefix + std::to_string(ordinal) + "}";
       const std::uint16_t slot = RedisKeySlot(key);
       if (slot >= first && slot <= last) return key;
     }

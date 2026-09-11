@@ -612,11 +612,17 @@ Group children execute in canonical Group order. Exact directive identities,
 attempts, boots, histories, assignments, terms, grants, manifests, and
 partition epochs make reconnect replay safe without minting another attempt.
 A deterministic failure fences only that Group before aborting its child and
-then the root; already completed Groups are not rolled back. Incompatible
-topology or incarnation changes stop at an inspectable `recovery-required`
-phase rather than authorizing another destructive initialization. After every
-child completes, the root completes and Admin returns the stable Group ids,
-child operation ids, and their committed population proof indices.
+then the root; already completed Groups are not rolled back. While population
+work is unfinished, a current Data session with a different target boot or
+source boot/history invalidates the attempt. The reconciler durably removes
+its directives and records the reason before fencing and aborting, so Meta
+recovery does not depend on retaining the detecting session. Committed success
+receipts remain immutable history; they do not establish readiness for a new
+boot. Other incompatible topology changes stop at an inspectable
+`recovery-required` phase. Neither path authorizes another destructive
+initialization. After every child completes, the root completes and Admin
+returns the stable Group ids, child operation ids, and their committed
+population proof indices.
 
 Demotion and shutdown cancel the owner and join its local proposal work while
 the worker and executor remain live. Already accepted proposals may commit;

@@ -225,7 +225,11 @@ destructive reset.
 Graceful Meta stop cancels result waits and leaves accepted work intact; it
 does not wait for an offline Data node. A deterministic Data failure fences
 only that Group before aborting its child and the overall creation. Already
-completed Groups are not rolled back. Meta recovery preserves successful
+completed Groups are not rolled back. While replica initialization is pending,
+a changed source boot/history or a new boot on a replica still awaiting its
+result follows this failure path and reports the affected Group and node.
+The failure is retained across Meta restart; it does not automatically start
+a new destructive attempt. Meta recovery preserves successful
 population work and finishes bookkeeping without initializing it again. An
 exit-1 Redis verification failure can occur after Meta creation completed, so
 correct the local dependency and inspect status rather than rerunning

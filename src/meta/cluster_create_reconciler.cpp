@@ -382,6 +382,25 @@ Plan PlanV1GroupStep(
       DerivedV1Id(operation.operation_id_, "primary/attempt");
   const auto primary_receipt =
       ReceiptFor(operation, primary_directive, primary_attempt);
+  const auto primary_runtime = std::find_if(
+      runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& node) {
+        return node.node_id_ == declaration.primary_node_id_;
+      });
+  const bool source_incarnation_changed =
+      runtime.leader_authority_eligible_ &&
+      primary_runtime != runtime.nodes_.end() &&
+      (primary_runtime->boot_id_ != source_boot_text ||
+       primary_runtime->replication_history_id_ !=
+           operation.replication_history_id_);
+  auto retain_incarnation_failure = [&](std::string_view node_id,
+                                        std::string_view reason) -> Plan {
+    // Removing the old directives and retaining the reason is one committed
+    // transition. A late result cannot complete that attempt afterwards, and
+    // a new Meta leader can still fence/abort after runtime evidence is lost.
+    return Advance(operation, absl::StrCat(kGroupFailurePrefix,
+                                           "group=", declaration.group_id_,
+                                           " node=", node_id, " ", reason));
+  };
   auto fence_or_abort = [&](std::string reason) -> Plan {
     if (grant->grant_.has_value() && !grant->fenced_) {
       FenceGroup fence;
@@ -402,6 +421,10 @@ Plan PlanV1GroupStep(
     if (!grant->grant_.has_value() || grant->fenced_)
       return Conflict(absl::StrCat("group=", declaration.group_id_,
                                    " authority is unavailable"));
+    if (source_incarnation_changed)
+      return retain_incarnation_failure(declaration.primary_node_id_,
+                                        "primary boot/history changed before "
+                                        "empty-population initialization");
     MetaDirectiveSpec initialize;
     initialize.directive_id_ = primary_directive;
     initialize.attempt_id_ = primary_attempt;
@@ -440,19 +463,10 @@ Plan PlanV1GroupStep(
               primary_attempt)
         return Conflict(absl::StrCat("group=", declaration.group_id_,
                                      " primary directive was invalidated"));
-      const auto current = std::find_if(
-          runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& node) {
-            return node.node_id_ == declaration.primary_node_id_;
-          });
-      if (current != runtime.nodes_.end() &&
-          (current->boot_id_ != source_boot_text ||
-           current->replication_history_id_ !=
-               operation.replication_history_id_))
-        return Advance(
-            operation,
-            absl::StrCat(kGroupFailurePrefix, "group=", declaration.group_id_,
-                         " node=", declaration.primary_node_id_,
-                         " restarted during empty-population initialization"));
+      if (source_incarnation_changed)
+        return retain_incarnation_failure(declaration.primary_node_id_,
+                                          "primary boot/history changed during "
+                                          "empty-population initialization");
       return std::nullopt;
     }
     if (primary_receipt->status_ != MetaDirectiveResultStatus::kSucceeded)
@@ -465,6 +479,10 @@ Plan PlanV1GroupStep(
     if (!grant->grant_.has_value() || grant->fenced_)
       return Conflict(absl::StrCat("group=", declaration.group_id_,
                                    " authority changed before replication"));
+    if (source_incarnation_changed)
+      return retain_incarnation_failure(
+          declaration.primary_node_id_,
+          "source boot/history changed before replica initialization");
 
     TransitionOperationPhase transition;
     transition.operation_id_ = operation.operation_id_;
@@ -596,8 +614,35 @@ Plan PlanV1GroupStep(
     if (grant->fenced_)
       return Conflict(absl::StrCat("group=", declaration.group_id_,
                                    " authority changed during replication"));
-    if (!all_succeeded) return std::nullopt;
-    return Advance(operation, kGroupPhaseReady);
+    // Durable success remains historical fact after a restart. For unfinished
+    // work, however, neither source capability nor target execution may cross
+    // a boot boundary. SendDirectives deliberately skips an old recipient
+    // boot, so waiting for its missing receipt could otherwise last forever.
+    if (all_succeeded) return Advance(operation, kGroupPhaseReady);
+    if (source_incarnation_changed)
+      return retain_incarnation_failure(
+          declaration.primary_node_id_,
+          "source boot/history changed during replica initialization");
+    if (runtime.leader_authority_eligible_) {
+      for (const auto& current : operation.current_directives_) {
+        const auto& spec = current.spec_;
+        if (spec.kind_ != kMetaDirectiveRebuild ||
+            ReceiptFor(operation, spec.directive_id_, spec.attempt_id_)
+                .has_value())
+          continue;
+        const auto target =
+            std::find_if(runtime.nodes_.begin(), runtime.nodes_.end(),
+                         [&](const auto& node) {
+                           return node.node_id_ == spec.target_node_id_;
+                         });
+        if (target != runtime.nodes_.end() &&
+            target->boot_id_ != Hex(spec.target_boot_id_))
+          return retain_incarnation_failure(
+              spec.target_node_id_,
+              "target boot changed during replica initialization");
+      }
+    }
+    return std::nullopt;
   }
 
   if (operation.kind_phase_blob_ == kGroupPhaseReady) {

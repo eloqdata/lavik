@@ -678,11 +678,13 @@ def stopped_replica_blocker(environment, meta, replica):
 
 
 def run_multi_group_case(workdir, automatic, interactive,
-                         block_replica_during_create=False):
+                         block_replica_during_create=False,
+                         restart_replica_during_create=False):
     layout = "automatic" if automatic else "explicit"
     mode = "interactive" if interactive else "yes"
     blocked = "-blocked" if block_replica_during_create else ""
-    name = f"multi-{layout}-{mode}{blocked}"
+    restarted = "-restart" if restart_replica_during_create else ""
+    name = f"multi-{layout}-{mode}{blocked}{restarted}"
     scenario = os.path.join(workdir, name)
     os.makedirs(scenario, mode=0o700)
     meta_workdir = os.path.join(scenario, "meta")
@@ -709,7 +711,17 @@ def run_multi_group_case(workdir, automatic, interactive,
         meta.wait_leader()
         started_nodes = nodes[:-1] if block_replica_during_create else nodes
         for node in started_nodes:
-            node.start()
+            variable = "KEYLANE_REPLICATION_PAUSE_FULLSYNC_BEFORE_CATALOG_ACK_MS"
+            old = os.environ.get(variable)
+            try:
+                if restart_replica_during_create and node is nodes[0]:
+                    os.environ[variable] = "30000"
+                node.start()
+            finally:
+                if old is None:
+                    os.environ.pop(variable, None)
+                else:
+                    os.environ[variable] = old
         arguments = [
             CTL, "cluster-create", "--manifest", manifest,
             "--socket", meta.ctl_path, "--timeout-ms",
@@ -718,6 +730,46 @@ def run_multi_group_case(workdir, automatic, interactive,
         input_text = "yes\n" if interactive else None
         if not interactive:
             arguments.append("--yes")
+        if restart_replica_during_create:
+            creator = subprocess.Popen(
+                arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=environment)
+            try:
+                if input_text is not None:
+                    creator.stdin.write(input_text)
+                    creator.stdin.flush()
+                H.wait_until(
+                    "primary pauses while replica full sync is in progress", 20,
+                    lambda: "native full sync holds command gates before catalog "
+                            "acknowledgement" in nodes[0].log_tail())
+                operation_id = root_operation(meta)
+                if operation_id is None:
+                    raise H.Failure("rebuilding replica has no root operation")
+                nodes[1].force_kill()
+                nodes[1].start()
+                stdout, stderr = creator.communicate(timeout=20)
+                if (creator.returncode != 2 or "Cluster READY:" in stdout or
+                        "target boot changed during replica initialization" not in stderr or
+                        REPLICA_1 not in stderr):
+                    raise H.Failure(
+                        f"replica restart did not end creation: "
+                        f"exit={creator.returncode} stdout={stdout!r} stderr={stderr!r}")
+                if not meta.getop(operation_id).startswith("OK aborted "):
+                    raise H.Failure("replica restart left the root active")
+                groups = {group["group_id"]: group
+                          for group in cluster_status(meta)["groups"]}
+                if groups["group-1"]["serving_ready"]:
+                    raise H.Failure("failed Group retained serving authority")
+                H.log(f"{name}: full-sync target restart fenced its Group "
+                      "and aborted creation")
+            finally:
+                if creator.poll() is None:
+                    creator.kill()
+                    creator.communicate(timeout=5)
+            for node in nodes:
+                node.terminate()
+            meta.terminate()
+            return
         if block_replica_during_create:
             result = subprocess.run(
                 arguments, input=input_text, capture_output=True, text=True,
@@ -774,6 +826,50 @@ def run_multi_group_case(workdir, automatic, interactive,
             print(f"--- Data log tail ({node.log_path}) ---", file=sys.stderr)
             print(node.log_tail(lines=250), file=sys.stderr)
         raise
+    finally:
+        for node in nodes:
+            node.force_kill()
+        meta.force_kill()
+
+
+def run_group_id_probe_case(workdir):
+    """A Group id must not terminate the CLI's Redis probe hash tag."""
+    scenario = os.path.join(workdir, "group-id-probe")
+    os.makedirs(scenario, mode=0o700)
+    meta = H.Node(META, scenario, 1,
+                  args=H.raft_args(snapshot_distance=100_000))
+    nodes = [DataProcess(DATA, os.path.join(scenario, str(index)), node_id,
+                         meta.data_control_endpoint)
+             for index, node_id in enumerate((PRIMARY_1, PRIMARY_2))]
+    manifest = os.path.join(scenario, "cluster.toml")
+    # Without escaping, every {keylane-create-group-2}-N} hashes to 9188,
+    # outside this Group's generated range 0..8191, regardless of N.
+    lines = ['schema_version = 1', 'slot_strategy = "contiguous-even"',
+             '[[meta_members]]', 'id = 1']
+    for node, group_id in zip(nodes, ("group-2}", "z")):
+        lines.extend(['[[data_nodes]]', f'id = "{node.node_id}"',
+                      f'client_endpoint = "{node.advertised_endpoint}"',
+                      '[[groups]]', f'id = "{group_id}"',
+                      f'primary = "{node.node_id}"'])
+    with open(manifest, "w", encoding="utf-8") as output:
+        output.write("\n".join(lines) + "\n")
+    environment = os.environ.copy()
+    environment["PATH"] = (os.path.dirname(REDIS_CLI) + os.pathsep +
+                           environment.get("PATH", ""))
+    try:
+        meta.start(bootstrap=True)
+        meta.wait_leader()
+        for node in nodes:
+            node.start()
+        result = command(environment, [
+            CTL, "cluster-create", "--manifest", manifest, "--socket",
+            meta.ctl_path, "--yes", "--timeout-ms", "20000"], timeout=25)
+        if "Cluster READY:" not in result or "group=group-2}" not in result:
+            raise H.Failure(f"escaped Group id did not finish verification: {result}")
+        H.log("Group id containing '}' completes CLI routing verification")
+        for node in nodes:
+            node.terminate()
+        meta.terminate()
     finally:
         for node in nodes:
             node.force_kill()
@@ -950,13 +1046,12 @@ def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False):
         meta.force_kill()
 
 
-def has_phase_faults():
+def has_fault(binary, needle):
     # Release builds erase the hook and its arguments. Scan in bounded chunks
     # so these optional deterministic cuts also work with stripped binaries.
-    needle = b"KEYLANE_TEST_PAUSE_CLUSTER_CREATE_PHASE"
     tail = b""
-    with open(META, "rb") as binary:
-        while chunk := binary.read(1 << 20):
+    with open(binary, "rb") as source:
+        while chunk := source.read(1 << 20):
             joined = tail + chunk
             if needle in joined:
                 return True
@@ -975,8 +1070,14 @@ def main():
         run_multi_group_case(workdir, automatic=False, interactive=False)
         run_multi_group_case(workdir, automatic=False, interactive=False,
                              block_replica_during_create=True)
+        run_group_id_probe_case(workdir)
+        if has_fault(DATA, b"KEYLANE_REPLICATION_PAUSE_FULLSYNC_BEFORE_CATALOG_ACK_MS"):
+            run_multi_group_case(workdir, automatic=True, interactive=False,
+                                 restart_replica_during_create=True)
+        else:
+            H.log("SKIP replica restart cut: Data binary has no full-sync pause hook")
         run_case(workdir, interactive=False)
-        if has_phase_faults():
+        if has_fault(META, b"KEYLANE_TEST_PAUSE_CLUSTER_CREATE_PHASE"):
             for phase, snapshot in (("submitted", False), ("create-groups", True),
                                     ("wait-data-projection", False),
                                     ("result-committed", True),
