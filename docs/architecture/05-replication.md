@@ -33,6 +33,26 @@ promotion base are durable, but native flow cursors and Redis replid/offset
 state are process-local. Every process boot creates a new boot ID, history ID,
 and replica incarnation; a restart therefore requires whole-group full sync.
 
+## Runtime ownership
+
+Worker zero owns mutable role, upstream configuration, target sessions,
+population proofs, source authorizations, and failure state. Control commands
+and observations from other workers enter through Celer submissions and resume
+on their caller's worker. No process-thread mutex serializes this state.
+The node controller shares that owner, so validation and non-suspending exact
+completion lookup form one uninterrupted decision. Per-worker immutable
+upstream caches serve legacy MOVED replies without an owner hop; role and
+serving-generation admission remain atomic and independent of that cache.
+
+Data flows remain on their assigned workers and publish progress through their
+existing session/frontier boundaries. A malformed or failed flow awaits
+owner-side exact-session invalidation before completing teardown; a retired
+flow cannot invalidate its replacement. Population heartbeat sampling runs on
+the owner without suspending while it captures the proof, and validates the
+concurrently published frontier independently. The downstream registry retains
+its coroutine-aware cross-worker gate because source flow workers also access
+it; it does not block an operating-system worker thread.
+
 ## Roles and lifecycle
 
 ### Standalone and Sentinel-managed mode
@@ -109,10 +129,17 @@ client writes, a thread-safe request bit prevents reconnect and closes outbound
 target plus inbound native/Redis source sockets. Closing source flows releases
 retained backlog cursors, so a slow downstream cannot leave an admitted
 publisher waiting on its ACK while shutdown waits on that publisher. Worker
-zero then joins native and Redis target apply, aborts incomplete replacement
-roots, joins source exports and control handshakes, and disables source
-history. Storage may start its final freeze/checkpoint only after that barrier
-returns successfully.
+zero owns session cancellation and then joins native and Redis target apply,
+aborts incomplete replacement roots, joins source exports and control
+handshakes, and disables source history. Storage may start its final
+freeze/checkpoint only after that barrier
+returns successfully. Main accesses only transport cancellation sets, never
+the worker-owned session registry or partially initialized session proofs.
+Target sockets join both their session set and the process shutdown set before
+connect/TLS; late registration after shutdown is rejected. Transport sets retain
+descriptor-lifetime mutexes for concurrent registration, close, and shutdown;
+normal command admission, progress publication, and heartbeat queries do not
+acquire them.
 
 ### Meta-managed cluster startup mode
 

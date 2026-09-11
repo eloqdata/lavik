@@ -1,3 +1,6 @@
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -154,8 +157,7 @@ TEST(RebuildProtocolIntegrationTest,
   source.Stop(SIGINT);
 }
 
-TEST(RebuildProtocolIntegrationTest,
-     DivergentOnlineTailInvalidatesEveryContinuationCursor) {
+void CheckDivergentOnlineTail(unsigned workers, unsigned failing_flow) {
 #if !KEYLANE_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires a Debug/fault server for divergent tail injection";
 #endif
@@ -165,16 +167,20 @@ TEST(RebuildProtocolIntegrationTest,
   const std::filesystem::path target_data = directory.path() / "target.data";
   const std::filesystem::path source_log = directory.path() / "source.log";
   const std::filesystem::path target_log = directory.path() / "target.log";
-  CreateDataFile(source_data, 128ULL * 1024 * 1024);
-  CreateDataFile(target_data, 128ULL * 1024 * 1024);
+  CreateDataFile(source_data, workers * 128ULL * 1024 * 1024);
+  CreateDataFile(target_data, workers * 128ULL * 1024 * 1024);
 
   PortReservation source_reservation;
   PortReservation target_reservation;
   const std::uint16_t source_port = source_reservation.ReleaseForSpawn();
   const std::uint16_t target_port = target_reservation.ReleaseForSpawn();
-  ChildProcess source(ServerArguments(source_port, source_data), source_log,
-                      {{"KEYLANE_REPLICATION_DIVERGENT_TAIL_ONCE", "1"}});
-  ChildProcess target(ServerArguments(target_port, target_data), target_log);
+  ChildProcess source(ServerArguments(source_port, source_data, workers),
+                      source_log,
+                      {{"KEYLANE_REPLICATION_DIVERGENT_TAIL_ONCE", "1"},
+                       {"KEYLANE_REPLICATION_DIVERGENT_TAIL_FLOW",
+                        std::to_string(failing_flow)}});
+  ChildProcess target(ServerArguments(target_port, target_data, workers),
+                      target_log);
   WaitForStartup(source_port, "divergent-tail source startup");
   WaitForStartup(target_port, "divergent-tail target startup");
 
@@ -190,24 +196,87 @@ TEST(RebuildProtocolIntegrationTest,
     return info.find("keylane_replication_state:online") != std::string::npos;
   });
 
-  ASSERT_EQ(source_client.Command({"SET", "population-after-gap", "replayed"}),
-            "+OK");
+  std::string after_gap = "population-after-gap";
+  for (;;) {
+    const auto slot = source_client.Command({"CLUSTER", "KEYSLOT", after_gap});
+    ASSERT_FALSE(slot.empty());
+    ASSERT_EQ(slot.front(), ':');
+    if (std::stoul(slot.substr(1)) % workers == failing_flow) break;
+    after_gap.push_back('x');
+    ASSERT_LT(after_gap.size(), 128u);
+  }
+  ASSERT_EQ(source_client.Command({"SET", after_gap, "replayed"}), "+OK");
   WaitUntil("divergent tail injection", 30s, [&] {
     return ReadFile(source_log).find("injected divergent replication tail") !=
            std::string::npos;
   });
   WaitUntil("whole-population retry", 45s, [&] {
-    return CountOccurrences(ReadFile(source_log), "selected=FULL") >= 2;
+    return CountOccurrences(ReadFile(source_log), "selected=FULL") >=
+           2 * workers;
   });
   WaitUntil("replacement population online", 30s, [&] {
     const std::string info = target_client.Command({"INFO", "replication"});
     return info.find("keylane_replication_state:online") != std::string::npos;
   });
   ASSERT_EQ(target_client.Command({"READONLY"}), "+OK");
-  EXPECT_EQ(target_client.Command({"GET", "population-after-gap"}),
-            "$8\r\nreplayed");
+  EXPECT_NE(
+      ReadFile(target_log).find("invalidated native replication continuation"),
+      std::string::npos);
+  EXPECT_EQ(target_client.Command({"GET", after_gap}), "$8\r\nreplayed");
 
   target.Stop(SIGINT);
+  source.Stop(SIGINT);
+}
+
+TEST(RebuildProtocolIntegrationTest,
+     DivergentOnlineTailInvalidatesEveryContinuationCursor) {
+  CheckDivergentOnlineTail(1, 0);
+}
+
+TEST(RebuildProtocolIntegrationTest,
+     NonzeroWorkerInvalidatesContinuationThroughControlOwner) {
+  // The corrupt frame is consumed on target worker 1, while all manager
+  // state belongs to worker 0. Recovery must wait for the owner invalidation
+  // and rebuild both flows, not continue from either old cursor.
+  CheckDivergentOnlineTail(2, 1);
+}
+
+TEST(RebuildProtocolIntegrationTest,
+     ShutdownClosesTargetSocketsWithoutReadingOwnerSessionState) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  TempDirectory directory("replication-target-shutdown");
+  const auto source_data = directory.path() / "source.data";
+  const auto target_data = directory.path() / "target.data";
+  CreateDataFile(source_data, 256ULL * 1024 * 1024);
+  CreateDataFile(target_data, 256ULL * 1024 * 1024);
+  PortReservation source_reservation;
+  PortReservation target_reservation;
+  const auto source_port = source_reservation.ReleaseForSpawn();
+  const auto target_port = target_reservation.ReleaseForSpawn();
+  ChildProcess source(ServerArguments(source_port, source_data, 2),
+                      directory.path() / "source.log");
+  ChildProcess target(ServerArguments(target_port, target_data, 2),
+                      directory.path() / "target.log");
+  WaitForStartup(source_port, "shutdown source startup");
+  WaitForStartup(target_port, "shutdown target startup");
+  RespClient client = Connect(target_port);
+  ASSERT_EQ(
+      client.Command({"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+      "+OK");
+  WaitUntil("target online before shutdown", 30s, [&] {
+    return client.Command({"INFO", "replication"})
+               .find("keylane_replication_state:online") != std::string::npos;
+  });
+
+  // No peer can acknowledge or close these connections. Main's transport
+  // cancellation must wake worker zero and both flow owners, then let the
+  // normal owner-side join finish before storage shutdown.
+  source.Pause();
+  ASSERT_EQ(::kill(target.pid(), SIGTERM), 0);
+  const int status = target.Wait(5s);
+  source.Resume();
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
   source.Stop(SIGINT);
 }
 

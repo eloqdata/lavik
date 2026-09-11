@@ -20,6 +20,7 @@
 
 #include "absl/status/status.h"
 #include "celer/net/server.h"
+#include "celer/runtime/cross_core.h"
 #include "gtest/gtest.h"
 #include "keylane/command.h"
 #include "keylane/fault_injection.h"
@@ -1175,6 +1176,155 @@ class StandaloneIdentityService final : public celer::Service {
   keylane::ReplicationManager* static_cluster_ = nullptr;
   absl::Status result_ = absl::OkStatus();
 };
+
+// No storage recovery is started: accepted rebuilds retain their control
+// state without dialing a source or mutating a device. This isolates owner
+// routing and snapshot publication from transfer timing and TxRuntime's
+// process-global one-worker fixture used by the storage tests above.
+class CrossWorkerControlService final : public celer::Service {
+ public:
+  explicit CrossWorkerControlService(keylane::ReplicationManager& replication)
+      : replication_(replication) {}
+
+  void Prepare(unsigned) override {}
+  void Stop() noexcept override {}
+
+  celer::Task<absl::Status> Run(celer::Worker& worker,
+                                celer::ServiceContext) override {
+    if (worker.id() == 1) {
+      result_ = co_await Exercise();
+      finished_.store(true, std::memory_order_release);
+    } else {
+      while (!finished_.load(std::memory_order_acquire)) {
+        auto waited = co_await celer::SleepFor(worker, 1ms);
+        if (!waited.ok()) co_return waited;
+      }
+    }
+    worker.RequestStop();
+    co_return absl::OkStatus();
+  }
+
+  bool ready_for_shutdown() const { return ready_for_shutdown_.load(); }
+  bool finished() const { return finished_.load(); }
+  void ShutdownRequested() { shutdown_requested_.store(true); }
+  const absl::Status& result() const { return result_; }
+
+ private:
+  celer::Task<absl::Status> CheckEveryWorker(
+      std::optional<keylane::ReplicaOfConfig> expected) {
+    for (unsigned owner = 0; owner < 2; ++owner) {
+      auto checked = co_await celer::SubmitTaskTo(owner, [this, expected] {
+        return CheckLightweightQueries(replication_, expected,
+                                       "cross-worker control");
+      });
+      if (!checked.ok()) co_return checked;
+    }
+    // A remote observation must return to its originating worker; both this
+    // loop and subsequent directive admission intentionally run off-owner.
+    if (celer::ThisWorker().id_ != 1)
+      co_return TestFailure("control query migrated its caller");
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> Exercise() {
+    auto checked = co_await CheckEveryWorker(std::nullopt);
+    if (!checked.ok()) co_return checked;
+    const auto initial = co_await replication_.cluster_population_status();
+    auto manifest = keylane::PopulationManifest::Create({{42, 9}});
+    if (!manifest.ok()) co_return manifest.status();
+    auto directive = TargetDirective(initial, *manifest);
+    std::optional<keylane::ClusterRebuildCompletion> previous;
+    for (unsigned revision = 1; revision <= 8; ++revision) {
+      directive.identity_.directive_revision_ = revision;
+      directive.identity_.attempt_id_ = "attempt-" + std::to_string(revision);
+      directive.identity_.directive_id_ =
+          "directive-" + std::to_string(revision);
+      keylane::ReplicaOfConfig upstream{
+          "127.0.0.1", static_cast<std::uint16_t>(6400 + revision)};
+      auto started = co_await replication_.StartClusterRebuildDirective(
+          upstream, directive, *manifest);
+      if (!started.ok()) co_return started.status();
+      if (previous.has_value() && (!previous->result().has_value() ||
+                                   !absl::IsCancelled(*previous->result()))) {
+        co_return TestFailure("supersession did not retire the old attempt");
+      }
+      previous = std::move(*started);
+      checked = co_await CheckEveryWorker(upstream);
+      if (!checked.ok()) co_return checked;
+      const auto population = co_await replication_.cluster_population_status();
+      if (population.state_ != keylane::ReplicationGroupState::kRebuilding ||
+          population.ready_token_.has_value()) {
+        co_return TestFailure("remote heartbeat observed an incoherent proof");
+      }
+      const bool completed = co_await celer::SubmitTo(0, [this, directive] {
+        return replication_.FindCompletedClusterPopulation(directive)
+            .has_value();
+      });
+      if (completed)
+        co_return TestFailure("unfinished rebuild replayed as ready");
+    }
+
+    ready_for_shutdown_.store(true, std::memory_order_release);
+    while (!shutdown_requested_.load(std::memory_order_acquire)) {
+      (void)co_await replication_.Observe();
+      auto waited = co_await celer::SleepFor(*celer::ThisWorker().self_, 1ms);
+      if (!waited.ok()) co_return waited;
+    }
+    auto cancelled = co_await replication_.CancelClusterRebuildForShutdown();
+    if (!cancelled.ok()) co_return cancelled;
+    if (!previous->result().has_value() ||
+        !absl::IsCancelled(*previous->result())) {
+      co_return TestFailure("shutdown did not retire the accepted attempt");
+    }
+    const auto population = co_await replication_.cluster_population_status();
+    if (population.state_ != keylane::ReplicationGroupState::kNotReady ||
+        population.ready_token_.has_value()) {
+      co_return TestFailure("shutdown retained population readiness");
+    }
+    co_return co_await CheckEveryWorker(std::nullopt);
+  }
+
+  keylane::ReplicationManager& replication_;
+  std::atomic<bool> ready_for_shutdown_{false};
+  std::atomic<bool> shutdown_requested_{false};
+  std::atomic<bool> finished_{false};
+  absl::Status result_ =
+      absl::UnknownError("cross-worker exercise did not run");
+};
+
+TEST(ReplicationManagerIntegrationTest,
+     CrossWorkerControlQueriesSupersessionAndMainThreadShutdown) {
+  keylane::test::TempDirectory directory("owner-local-replication");
+  const auto data = directory.path() / "node.data";
+  keylane::test::CreateDataFile(data, 256 * kMiB);
+  keylane::storage::StorageEngineOptions storage_options;
+  storage_options.data_files_ = {data.string()};
+  storage_options.expiration_authority_ = false;
+  keylane::storage::StorageEngine storage(std::move(storage_options));
+  ASSERT_TRUE(storage.Prepare(2).ok());
+  keylane::ReplicationOptions options;
+  options.cluster_population_managed_ = true;
+  keylane::ReplicationManager replication(&storage, options, std::nullopt);
+  CrossWorkerControlService service(replication);
+  celer::Server server;
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 2;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  const auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (!service.ready_for_shutdown() && !service.finished() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  const bool ready = service.ready_for_shutdown();
+  replication.RequestShutdown();
+  service.ShutdownRequested();
+  server.WaitUntilStopped();
+  EXPECT_TRUE(ready) << service.result();
+  EXPECT_TRUE(service.result().ok()) << service.result();
+}
 
 TEST(ReplicationManagerIntegrationTest,
      ClusterControlApiStaysFailClosedAndSupersedesWholeSession) {

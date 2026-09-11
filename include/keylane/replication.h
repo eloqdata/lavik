@@ -252,6 +252,8 @@ struct ReplicationDirective {
 // Owns exactly one replication group. Replica connections are initiated on
 // worker 0 for control and on one target worker per source flow. Source-side
 // accepted flow sockets are adopted by the matching source worker.
+// Mutable control state belongs to worker 0. Asynchronous APIs may be called
+// on any runtime worker and preserve caller affinity across the owner hop.
 class ReplicationManager {
  public:
   ReplicationManager(storage::StorageEngine* storage,
@@ -274,8 +276,9 @@ class ReplicationManager {
   // collecting replication progress or downstream session status.
   celer::Task<ReplicationIdentity> ObserveIdentity() const;
 
-  // Copies the desired upstream under the role-state lock. This endpoint is
-  // not an admission proof; callers must retain their role and mode checks.
+  // Copies the immutable desired-upstream snapshot. Runtime workers cache it
+  // locally; unchanged reads require no cross-worker hop or shared refcount
+  // update. This is not an admission proof: retain role and mode checks.
   std::optional<ReplicaOfConfig> upstream() const;
 
   // Starts one already-validated Meta full-rebuild directive and returns the
@@ -298,10 +301,12 @@ class ReplicationManager {
   StartEmptyPopulationInitialization(RebuildIdentity identity,
                                      PopulationManifest manifest);
 
-  // Non-mutating, lock-safe exact replay lookup. Returns only a still-valid
+  // Worker-zero-only, non-suspending exact replay lookup. Returns a still-valid
   // Ready attempt's original completion, never starts/restarts work or clears
   // readiness. NodeControl uses this before new-mutation admission so a lost
   // result can be replayed while the completed population is already serving.
+  // NodeControl runs on that same owner, making its validation and lookup one
+  // uninterrupted decision; cross-worker callers must explicitly submit it.
   std::optional<ClusterRebuildCompletion> FindCompletedClusterPopulation(
       const RebuildDirective& directive) const;
 

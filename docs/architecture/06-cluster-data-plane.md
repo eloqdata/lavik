@@ -509,6 +509,11 @@ exact still-valid population completion through a non-mutating lookup even
 while that population is serving. This path neither clears readiness nor
 starts work; no match retains all ordinary destructive-admission and drain
 checks. No local result record can reopen authority after restart.
+The production node controller and replication control state share worker
+zero: validation and exact-result lookup do not suspend or acquire a global
+state mutex. Other workers request population observations through the
+replication owner's asynchronous API, while data-flow progress remains
+worker-local and independently sampled.
 
 A completed population is content-scoped by group, membership assignment,
 immutable manifest, and partition replication epoch. `BeginGroupTerm` fences
