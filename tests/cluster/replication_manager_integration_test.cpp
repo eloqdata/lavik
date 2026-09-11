@@ -1860,7 +1860,7 @@ TEST(ReplicationManagerIntegrationTest,
 }
 
 TEST(ReplicationManagerIntegrationTest,
-     MetaManagedPromotionPreparePersistsEvidenceAndStaysFenced) {
+     MetaManagedPromotionAcceptsPriorTermReadyPopulationAndStaysFenced) {
   RunPromotionPrepareCase({});
 }
 

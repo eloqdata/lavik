@@ -1837,7 +1837,8 @@ struct MetaControlClientService::Impl {
         desired.groups.begin(), desired.groups.end(),
         [&](const control::WireDesiredGroup& candidate) {
           return candidate.group_id == ready.group_id_ &&
-                 candidate.group_term >= ready.term_ &&
+                 population.ready_token_->CanCarryForwardToTerm(
+                     candidate.group_term) &&
                  candidate.manifest_revision == ready.manifest_revision_ &&
                  candidate.manifest_digest == ready.manifest_id_.bytes_ &&
                  candidate.partition_replication_epoch ==

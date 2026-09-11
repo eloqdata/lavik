@@ -154,6 +154,13 @@ class ReadyToken {
     return cut_vector_;
   }
 
+  // Returns whether the term component permits this completed population to
+  // be retained under a committed group term. Callers must still match every
+  // content and membership anchor before carrying the proof forward.
+  bool CanCarryForwardToTerm(std::uint64_t group_term) const noexcept {
+    return group_term >= identity_.term_;
+  }
+
  private:
   friend class ReplicationGroup;
   ReadyToken(RebuildIdentity identity, std::vector<std::uint64_t> cut_vector)

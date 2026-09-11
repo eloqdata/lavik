@@ -3651,8 +3651,17 @@ class ReplicationManager::ReplicationGroup {
                                  .digest_ = 1});
     if (!storage_ready.ok()) co_return storage_ready;
 
+    if (directive.identity_.term_ <= 1) {
+      co_return absl::InvalidArgumentError(
+          "fault-seeded promotion requires a prior group term");
+    }
+    RebuildIdentity ready_identity = directive.identity_;
+    // A normal failover begins a new fenced authority term without rebuilding
+    // unchanged population content. Seed the proof under the preceding term so
+    // this fixture exercises that production reconciliation boundary.
+    --ready_identity.term_;
     RebuildDirective rebuild{
-        .identity_ = directive.identity_,
+        .identity_ = std::move(ready_identity),
         .flow_count_ = static_cast<std::uint32_t>(
             directive.required_applied_next_lsns_.size()),
         .safe_source_active_ = true,
@@ -3917,7 +3926,7 @@ class ReplicationManager::ReplicationGroup {
       const RebuildIdentity& ready = population->ready_token_->identity();
       if (ready.group_id_ != identity.group_id_ ||
           ready.assignment_id_ != identity.assignment_id_ ||
-          ready.term_ != identity.term_ ||
+          !population->ready_token_->CanCarryForwardToTerm(identity.term_) ||
           ready.source_node_id_ != identity.source_node_id_ ||
           ready.source_assignment_id_ != identity.source_assignment_id_ ||
           ready.source_boot_id_ != identity.source_boot_id_ ||
