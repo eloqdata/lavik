@@ -482,8 +482,7 @@ class LeaseChallengeTracker {
  public:
   absl::Status Begin(WireId128 session_id, std::string data_boot_id,
                      LeaseChallenge challenge);
-  absl::Status MarkWritten(const WireId128& nonce,
-                           std::int64_t lease_now_ms);
+  absl::Status MarkWritten(const WireId128& nonce, std::int64_t lease_now_ms);
   absl::StatusOr<std::int64_t> AcceptGrant(const WireId128& session_id,
                                            const LeaseGranted& grant,
                                            std::int64_t lease_now_ms);
@@ -586,6 +585,45 @@ struct PromotionPreparedEvidence {
                          const PromotionPreparedEvidence&) = default;
 };
 
+// Typed authorize-source payload used only after Meta has excluded the old
+// finite authority. It reuses kAuthorizeSource so source execution retains the
+// existing serialization and capability lifecycle; the generation binds the
+// terminal proof to one durable failover recovery record.
+struct FrozenSourceRequest {
+  std::uint64_t recovery_generation = 0;
+  // Exact native source layout for the held boot/history. The receiving
+  // target's local worker count is unrelated to this export identity.
+  std::uint32_t source_flow_count = 0;
+
+  friend bool operator==(const FrozenSourceRequest&,
+                         const FrozenSourceRequest&) = default;
+};
+
+// Old authority tuple which the receiving Data boot must have rejected before
+// it may freeze and report the former source's final replication frontier.
+struct FrozenSourcePreconditions {
+  std::uint64_t excluded_group_term = 0;
+  std::uint64_t excluded_authority_version = 0;
+  std::uint64_t excluded_grant_revision = 0;
+
+  friend bool operator==(const FrozenSourcePreconditions&,
+                         const FrozenSourcePreconditions&) = default;
+};
+
+// Exact terminal proof returned by a frozen authorize-source execution. Every
+// flow cursor is a next-LSN (never an applied LSN), and proof_hash
+// authenticates the canonical, versioned fields preceding it rather than an ABI
+// layout.
+struct FrozenSourceEvidence {
+  std::uint64_t recovery_generation = 0;
+  std::string source_history_id;
+  std::vector<std::uint64_t> final_next_lsns;
+  WireHash256 proof_hash{};
+
+  friend bool operator==(const FrozenSourceEvidence&,
+                         const FrozenSourceEvidence&) = default;
+};
+
 absl::StatusOr<std::string> EncodePromotionPrepareRequest(
     const PromotionPrepareRequest& request);
 absl::StatusOr<PromotionPrepareRequest> DecodePromotionPrepareRequest(
@@ -597,6 +635,23 @@ DecodePromotionPreparePreconditions(std::string_view encoded);
 absl::StatusOr<std::string> EncodePromotionPreparedEvidence(
     const PromotionPreparedEvidence& evidence);
 absl::StatusOr<PromotionPreparedEvidence> DecodePromotionPreparedEvidence(
+    std::string_view encoded);
+absl::StatusOr<std::string> EncodeFrozenSourceRequest(
+    const FrozenSourceRequest& request);
+absl::StatusOr<FrozenSourceRequest> DecodeFrozenSourceRequest(
+    std::string_view encoded);
+absl::StatusOr<std::string> EncodeFrozenSourcePreconditions(
+    const FrozenSourcePreconditions& preconditions);
+absl::StatusOr<FrozenSourcePreconditions> DecodeFrozenSourcePreconditions(
+    std::string_view encoded);
+// Computes the domain-separated proof over generation, source history, and
+// exact per-flow final next-LSNs. The proof_hash member is intentionally
+// ignored, allowing callers to populate it before encoding the evidence.
+absl::StatusOr<WireHash256> ComputeFrozenSourceProofHash(
+    const FrozenSourceEvidence& evidence);
+absl::StatusOr<std::string> EncodeFrozenSourceEvidence(
+    const FrozenSourceEvidence& evidence);
+absl::StatusOr<FrozenSourceEvidence> DecodeFrozenSourceEvidence(
     std::string_view encoded);
 
 struct Directive {
@@ -617,9 +672,9 @@ struct Directive {
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
-  // V1 uses typed payloads for rebuild/authorize-source source layouts and
-  // promotion-prepare, and a target history id for initialize-empty-population.
-  // Only promotion-prepare carries preconditions.
+  // V1 uses typed payloads for rebuild/ordinary source authorization,
+  // promotion-prepare, and frozen-source authorization. The latter two also
+  // carry typed preconditions; initialize-empty retains a target history id.
   std::string payload;
   std::string preconditions;
   // Active V1 classification: population mutations set it; source
@@ -714,6 +769,23 @@ struct WireSlotRange {
   friend bool operator==(const WireSlotRange&, const WireSlotRange&) = default;
 };
 
+// A boot-local request to retain one source replication history. The
+// population anchors prevent a delayed projection from pinning history for a
+// different incarnation of the same group; generation gives Data a monotonic
+// replacement key without granting or restoring source authority.
+struct WireSourceHistoryHold {
+  std::uint64_t generation = 0;
+  WireId128 source_assignment_id{};
+  std::string source_boot_id;
+  std::string source_replication_history_id;
+  std::uint64_t manifest_revision = 0;
+  WireHash256 manifest_digest{};
+  std::uint64_t partition_replication_epoch = 0;
+
+  friend bool operator==(const WireSourceHistoryHold&,
+                         const WireSourceHistoryHold&) = default;
+};
+
 struct WireDesiredGroup {
   std::string group_id;
   std::vector<WireDesiredMember> members;
@@ -735,6 +807,7 @@ struct WireDesiredGroup {
   // part of population identity even when immutable manifest content stays
   // unchanged.
   std::uint64_t partition_replication_epoch = 0;
+  std::optional<WireSourceHistoryHold> source_history_hold;
   std::string grant_policy_id;
   std::uint64_t grant_policy_version = 0;
 
@@ -789,9 +862,9 @@ struct WireProjectedDirective {
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
-  // V1 uses typed payloads for rebuild/authorize-source source layouts and
-  // promotion-prepare, and a target history id for initialize-empty-population.
-  // Only promotion-prepare carries preconditions.
+  // V1 uses typed payloads for rebuild/ordinary source authorization,
+  // promotion-prepare, and frozen-source authorization. The latter two also
+  // carry typed preconditions; initialize-empty retains a target history id.
   std::string payload;
   std::string preconditions;
   // Active V1 classification: population mutations set it; source

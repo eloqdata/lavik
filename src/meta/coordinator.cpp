@@ -16,6 +16,7 @@
 #include <utility>
 #include <variant>
 
+#include "keylane/meta/failover.h"
 #include "keylane/meta/nuraft_log_store.h"
 #include "keylane/meta/state_machine.h"
 #include "spdlog/spdlog.h"
@@ -367,14 +368,16 @@ void FailProposeDispatch(const std::shared_ptr<ProposeWaiter>& waiter) {
 
 MetaCommandTag CommandTagOf(const MetaCommand& command) {
   // The MetaCommand variant is declared in tag order (commands.h:
-  // kRegisterNode=1 .. kPruneTerminalReceipts=29); pin both ends and the size
+  // kRegisterNode=1 .. kClearFailoverRecovery=31); pin both ends and the size
   // so a
   // future reorder breaks the build here instead of mislabeling results.
-  static_assert(std::variant_size_v<MetaCommand> == 29);
+  static_assert(std::variant_size_v<MetaCommand> == 31);
   static_assert(
       std::is_same_v<std::variant_alternative_t<0, MetaCommand>, RegisterNode>);
   static_assert(std::is_same_v<std::variant_alternative_t<28, MetaCommand>,
                                PruneTerminalReceipts>);
+  static_assert(std::is_same_v<std::variant_alternative_t<30, MetaCommand>,
+                               ClearFailoverRecovery>);
   return static_cast<MetaCommandTag>(command.index() + 1);
 }
 
@@ -414,23 +417,35 @@ bool IsNonTerminal(MetaOperationLifecycle lifecycle) {
 // commands are intentionally replay-idempotent, so an absent target would let
 // fresh request ids append no-op records forever. Evaluate the command against
 // the exact committed view and require a one-way, bounded recovery effect.
-// Terminalization is the sole non-shrinking prerequisite and permits no new
-// variable-length payload while the guard is active; it can happen once per
-// live operation and unlocks archive -> prune.
+// Terminalization is the sole generally available non-shrinking prerequisite
+// and normally permits no new variable-length payload while the guard is
+// active. A validated failover may persist its bounded typed outcome and the
+// exact bootstrap/checkpoints and same-generation cleanup/handoff transitions
+// needed to reach and unlock a terminal state; directives and authority
+// progression remain closed.
 absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
                                       const MetaCommittedView& view,
+                                      const MetaObservationStore& observations,
                                       std::uint64_t applied_index,
                                       std::string_view actor_principal,
                                       std::string_view readable_time) {
   const MetaStores& stores = view.stores();
   if (const auto* complete = std::get_if<CompleteOperation>(&command)) {
-    if (!complete->result_.empty()) {
+    const auto before =
+        stores.operation_.FindOperation(complete->operation_id_);
+    const bool failover =
+        before.has_value() && before->kind_ == kFailoverOperationKind;
+    if (failover) {
+      if (const absl::Status status =
+              ValidateFailoverTerminalCommand(*complete, stores);
+          !status.ok()) {
+        return IneffectiveFailSafeRecovery(status.message());
+      }
+    } else if (!complete->result_.empty()) {
       return IneffectiveFailSafeRecovery(
           "CompleteOperation must use an empty result while recovery is "
           "gated");
     }
-    const auto before =
-        stores.operation_.FindOperation(complete->operation_id_);
     MetaOperationStore candidate = stores.operation_;
     const absl::Status applied = candidate.CompleteOperation(*complete);
     const auto after = candidate.FindOperation(complete->operation_id_);
@@ -444,11 +459,19 @@ absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
     return absl::OkStatus();
   }
   if (const auto* abort = std::get_if<AbortOperation>(&command)) {
-    if (!abort->reason_.empty()) {
+    const auto before = stores.operation_.FindOperation(abort->operation_id_);
+    const bool failover =
+        before.has_value() && before->kind_ == kFailoverOperationKind;
+    if (failover) {
+      if (const absl::Status status =
+              ValidateFailoverTerminalCommand(*abort, stores);
+          !status.ok()) {
+        return IneffectiveFailSafeRecovery(status.message());
+      }
+    } else if (!abort->reason_.empty()) {
       return IneffectiveFailSafeRecovery(
           "AbortOperation must use an empty reason while recovery is gated");
     }
-    const auto before = stores.operation_.FindOperation(abort->operation_id_);
     MetaOperationStore candidate = stores.operation_;
     const absl::Status applied = candidate.AbortOperation(*abort);
     const auto after = candidate.FindOperation(abort->operation_id_);
@@ -461,7 +484,93 @@ absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
     }
     return absl::OkStatus();
   }
+  if (const auto* set = std::get_if<SetFailoverRecovery>(&command)) {
+    if (applied_index == std::numeric_limits<std::uint64_t>::max()) {
+      return IneffectiveFailSafeRecovery("the applied index is exhausted");
+    }
+    const absl::Status cleanup =
+        ValidateFailoverTerminalCleanupCommand(*set, stores);
+    if (!cleanup.ok()) {
+      const absl::Status checkpoint =
+          ValidateFailoverFailSafeCheckpoint(*set, stores);
+      if (!checkpoint.ok()) {
+        if (const absl::Status availability =
+                ValidateFailoverRecoveryAvailabilityCommand(*set, stores);
+            !availability.ok()) {
+          return IneffectiveFailSafeRecovery(checkpoint.message());
+        }
+      }
+    }
+    MetaStores candidate = stores;
+    const MetaApplyResult applied = ApplyCommitted(
+        candidate, applied_index + 1, command, actor_principal, readable_time);
+    const auto after = candidate.failover_recovery_.Find(set->group_id_);
+    if (applied.verdict_ != MetaAuditVerdict::kAccepted || !after.has_value() ||
+        after->revision_ != applied_index + 1 ||
+        after->recovery_generation_ != set->recovery_generation_ ||
+        after->hold_required_ != set->hold_required_ ||
+        after->recovery_required_ != set->recovery_required_) {
+      return IneffectiveFailSafeRecovery(
+          "SetFailoverRecovery does not advance bounded failover recovery");
+    }
+    return absl::OkStatus();
+  }
+  if (const auto* clear = std::get_if<ClearFailoverRecovery>(&command)) {
+    if (applied_index == std::numeric_limits<std::uint64_t>::max()) {
+      return IneffectiveFailSafeRecovery("the applied index is exhausted");
+    }
+    if (const absl::Status cleanup =
+            ValidateFailoverTerminalCleanupCommand(*clear, stores);
+        !cleanup.ok()) {
+      return IneffectiveFailSafeRecovery(cleanup.message());
+    }
+    MetaStores candidate = stores;
+    const MetaApplyResult applied = ApplyCommitted(
+        candidate, applied_index + 1, command, actor_principal, readable_time);
+    if (applied.verdict_ != MetaAuditVerdict::kAccepted ||
+        candidate.failover_recovery_.Find(clear->group_id_).has_value() ||
+        candidate.failover_recovery_.LastGeneration(clear->group_id_) !=
+            clear->recovery_generation_ ||
+        candidate.failover_recovery_.LastRevision(clear->group_id_) !=
+            applied_index + 1) {
+      return IneffectiveFailSafeRecovery(
+          "ClearFailoverRecovery does not remove the released tombstone");
+    }
+    return absl::OkStatus();
+  }
+  if (const auto* transition =
+          std::get_if<TransitionOperationPhase>(&command)) {
+    if (applied_index == std::numeric_limits<std::uint64_t>::max()) {
+      return IneffectiveFailSafeRecovery("the applied index is exhausted");
+    }
+    if (const absl::Status checkpoint =
+            ValidateFailoverFailSafeCheckpoint(*transition, view, observations);
+        !checkpoint.ok()) {
+      return IneffectiveFailSafeRecovery(checkpoint.message());
+    }
+    const auto before =
+        stores.operation_.FindOperation(transition->operation_id_);
+    MetaStores candidate = stores;
+    const MetaApplyResult applied = ApplyCommitted(
+        candidate, applied_index + 1, command, actor_principal, readable_time);
+    const auto after =
+        candidate.operation_.FindOperation(transition->operation_id_);
+    if (applied.verdict_ != MetaAuditVerdict::kAccepted ||
+        !before.has_value() || !after.has_value() ||
+        after->revision_ != before->revision_ + 1 ||
+        after->kind_phase_blob_ != transition->kind_phase_blob_) {
+      return IneffectiveFailSafeRecovery(
+          "TransitionOperationPhase does not advance an exact failover "
+          "checkpoint");
+    }
+    return absl::OkStatus();
+  }
   if (const auto* archive = std::get_if<ArchiveOperations>(&command)) {
+    if (const absl::Status workflow =
+            ValidateFailoverArchiveCommand(*archive, stores);
+        !workflow.ok()) {
+      return IneffectiveFailSafeRecovery(workflow.message());
+    }
     MetaOperationStore candidate = stores.operation_;
     const std::size_t live_before = candidate.LiveCount();
     const std::size_t archived_before = candidate.ArchivedCount();
@@ -503,7 +612,9 @@ absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
   if (const auto* prune = std::get_if<PrunePopulationManifest>(&command)) {
     if (!stores.population_manifest_.Contains(prune->manifest_digest_) ||
         stores.topology_.PopulationManifestInUse(prune->manifest_digest_) ||
-        stores.operation_.PopulationManifestInUse(prune->manifest_digest_)) {
+        stores.operation_.PopulationManifestInUse(prune->manifest_digest_) ||
+        stores.failover_recovery_.PopulationManifestInUse(
+            prune->manifest_digest_)) {
       return IneffectiveFailSafeRecovery(
           "PrunePopulationManifest removes no unreferenced document");
     }
@@ -542,7 +653,8 @@ absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
     return absl::OkStatus();
   }
   return IneffectiveFailSafeRecovery(
-      "the command is not part of terminalize, archive, or prune recovery");
+      "the command is not part of terminalize, failover cleanup, archive, or "
+      "prune recovery");
 }
 
 std::int64_t NowUnixMs() {
@@ -1208,7 +1320,8 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
           "another recovery proposal still has an uncertain Raft outcome");
     }
     if (absl::Status recovery = ValidateFailSafeRecovery(
-            command, view, applied_index, principal.principal(), readable_time);
+            command, view, observations_, applied_index, principal.principal(),
+            readable_time);
         !recovery.ok()) {
       std::string trigger;
       if (wal_fail_safe) {

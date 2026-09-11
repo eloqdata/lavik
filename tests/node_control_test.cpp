@@ -193,6 +193,17 @@ std::shared_ptr<const ServingState> MakeOwnerlessState() {
   return state.ok() ? *state : nullptr;
 }
 
+std::shared_ptr<const ServingState> MakeLocalSourceOwnerlessState() {
+  ServingStateBuilder builder;
+  builder.SetTopologyEpoch(2)
+      .SetSelfNodeIndex(0)
+      .AddNode(MakeNode(kNodeA, 7000))
+      .AddNode(MakeNode(kNodeB, 7001));
+  auto state = builder.Build();
+  EXPECT_TRUE(state.ok()) << state.status();
+  return state.ok() ? *state : nullptr;
+}
+
 ProjectionBasis Basis(std::uint64_t index, std::uint8_t hash) {
   return ProjectionBasis{.source_meta_applied_index_ = index,
                          .projection_hash_ = Digest(hash)};
@@ -223,6 +234,29 @@ PreparedFullState FullState(
                       .assignment_id_ =
                           node_b_assignment.value_or(group->assignment_id_)}},
     });
+  }
+  return prepared;
+}
+
+SourceHistoryHoldDesired SourceHistoryHold(std::uint64_t generation = 7) {
+  return SourceHistoryHoldDesired{
+      .group_id_ = "group-a",
+      .recovery_generation_ = generation,
+      .source_assignment_id_ = Assignment(1),
+      .source_boot_id_ = *NodeId::Parse(kBoot),
+      .source_replication_history_id_ = *NodeId::Parse(kNodeA),
+      .manifest_revision_ = 1,
+      .manifest_digest_ = Digest(4),
+      .partition_replication_epoch_ = kPartitionReplicationEpoch,
+  };
+}
+
+PreparedFullState WithSourceHistoryHold(PreparedFullState prepared,
+                                        std::uint64_t generation = 7) {
+  EXPECT_EQ(prepared.control_groups_.size(), 1U);
+  if (!prepared.control_groups_.empty()) {
+    prepared.control_groups_.front().source_history_hold_ =
+        SourceHistoryHold(generation);
   }
   return prepared;
 }
@@ -317,6 +351,33 @@ class RecordingActions final : public NodeControlActions {
     co_return revoke_status_;
   }
 
+  celer::Task<absl::Status> ReconcileSourceHistoryHold(
+      std::optional<SourceHistoryHoldDesired> desired) override {
+    source_history_hold_reconciled_after_session_clear_ = session_clear_exited_;
+    source_history_hold_reconciliations_.push_back(std::move(desired));
+    co_return source_history_hold_reconcile_status_;
+  }
+
+  celer::Task<absl::Status> ActivatePreparedPromotion(
+      PromotionActivationInput activation) override {
+    promotion_activations_.push_back(std::move(activation));
+    promotion_activation_entered_ = true;
+    while (block_promotion_activation_) {
+      celer::Worker* worker = celer::ThisWorker().self_;
+      if (worker == nullptr) {
+        co_return absl::FailedPreconditionError(
+            "blocked promotion activation requires a Celer worker");
+      }
+      co_await celer::Yield(*worker);
+    }
+    co_return promotion_activation_status_;
+  }
+
+  absl::Status EnableExpirationAuthorityUntil(MonotonicTime deadline) override {
+    expiration_authority_deadlines_.push_back(deadline);
+    return expiration_authority_status_;
+  }
+
   celer::Task<absl::Status> ReconcilePopulation(
       std::optional<PopulationReadiness> desired,
       bool population_transition_expected) override {
@@ -389,12 +450,19 @@ class RecordingActions final : public NodeControlActions {
   bool block_session_clear_ = false;
   bool session_clear_entered_ = false;
   bool session_clear_exited_ = false;
+  bool source_history_hold_reconciled_after_session_clear_ = false;
   bool block_directive_action_ = false;
   bool directive_action_entered_ = false;
+  bool block_promotion_activation_ = false;
+  bool promotion_activation_entered_ = false;
   bool defer_directive_completion_ = false;
   std::vector<NodeDirective> directives_;
   std::vector<AuthorityAnchor> drained_;
   std::vector<std::string> population_events_;
+  std::vector<std::optional<SourceHistoryHoldDesired>>
+      source_history_hold_reconciliations_;
+  std::vector<PromotionActivationInput> promotion_activations_;
+  std::vector<MonotonicTime> expiration_authority_deadlines_;
   std::optional<PopulationReadiness> desired_population_;
   std::optional<absl::Status> deferred_directive_result_;
   std::optional<NodeDirective> completed_population_;
@@ -405,6 +473,9 @@ class RecordingActions final : public NodeControlActions {
   absl::Status revoke_status_ = absl::OkStatus();
   absl::Status directive_status_ = absl::OkStatus();
   absl::Status population_reconcile_status_ = absl::OkStatus();
+  absl::Status source_history_hold_reconcile_status_ = absl::OkStatus();
+  absl::Status promotion_activation_status_ = absl::OkStatus();
+  absl::Status expiration_authority_status_ = absl::OkStatus();
   absl::Status drain_status_ = absl::OkStatus();
 };
 
@@ -439,22 +510,23 @@ TEST(NodeControlDirectiveTest,
   PreparedFullState prepared{
       .serving_state_ = MakeOwnerlessState(),
       .object_hash_ = Digest(3),
-      .control_groups_ =
-          {{.group_id_ = "group-a",
-            .group_term_ = 2,
-            .authority_version_ = 1,
-            .grant_revision_ = 10,
-            .config_epoch_ = 2,
-            .manifest_revision_ = 1,
-            .manifest_digest_ = Digest(4),
-            .partition_replication_epoch_ = kPartitionReplicationEpoch,
-            .members_ = {{.node_id_ = *NodeId::Parse(kNodeA),
-                          .assignment_id_ = Assignment(1)},
-                         {.node_id_ = *NodeId::Parse(kNodeB),
-                          .assignment_id_ = Assignment(2)}}}},
+      .control_groups_ = {{.group_id_ = "group-a",
+                           .group_term_ = 2,
+                           .authority_version_ = 1,
+                           .grant_revision_ = 10,
+                           .config_epoch_ = 2,
+                           .manifest_revision_ = 1,
+                           .manifest_digest_ = Digest(4),
+                           .partition_replication_epoch_ =
+                               kPartitionReplicationEpoch,
+                           .members_ = {{.node_id_ = *NodeId::Parse(kNodeA),
+                                         .assignment_id_ = Assignment(1)},
+                                        {.node_id_ = *NodeId::Parse(kNodeB),
+                                         .assignment_id_ = Assignment(2)}}}},
   };
   ASSERT_TRUE(
-      control.installer.InstallFullState(std::move(prepared), Basis(10, 2)).ok());
+      control.installer.InstallFullState(std::move(prepared), Basis(10, 2))
+          .ok());
 
   NodeDirective directive{
       .projection_ = Basis(10, 2),
@@ -473,8 +545,7 @@ TEST(NodeControlDirectiveTest,
       .source_node_id_ = *NodeId::Parse(kNodeA),
       .source_assignment_id_ = Assignment(1),
       .source_boot_id_ = *NodeId::Parse(std::string(40, 'd')),
-      .source_replication_history_id_ =
-          *NodeId::Parse(std::string(40, 'e')),
+      .source_replication_history_id_ = *NodeId::Parse(std::string(40, 'e')),
       .flow_count_ = 1,
       .manifest_revision_ = 1,
       .manifest_digest_ = Digest(4),
@@ -647,8 +718,7 @@ class LeaseExpiryService final : public celer::Service {
     }
     constexpr std::array<std::uint16_t, 1> slots{12};
     old_timer_preserved_lease_ =
-        control_.guard
-                .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
+        control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
                 .decision()
                 .kind_ == Decision::Kind::kServe &&
         control_.actions.session_clears_ == 0;
@@ -659,10 +729,10 @@ class LeaseExpiryService final : public celer::Service {
       server_->RequestStop();
       co_return result_;
     }
-    expired_ = control_.guard
-                   .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
-                   .decision()
-                   .kind_ == Decision::Kind::kClusterDownUnbound;
+    expired_ =
+        control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
+            .decision()
+            .kind_ == Decision::Kind::kClusterDownUnbound;
     grant.sent_at_ = LeaseClockNow();
     grant.granted_duration_ = 100ms;
     renewal_blocked_during_expiry_ =
@@ -703,6 +773,177 @@ class LeaseExpiryService final : public celer::Service {
   std::uint64_t expirations_before_ = 0;
   std::uint64_t expirations_after_ = 0;
   absl::Status result_ = absl::UnknownError("lease expiry service did not run");
+};
+
+class PromotionLeaseActivationService final : public celer::Service {
+ public:
+  explicit PromotionLeaseActivationService(celer::Server* server)
+      : server_(server) {}
+
+  void Prepare(unsigned thread_count) override {
+    prepared_ = thread_count == 1;
+  }
+
+  celer::Task<absl::Status> Run(celer::Worker&,
+                                celer::ServiceContext) override {
+    if (!prepared_) {
+      result_ = absl::FailedPreconditionError(
+          "promotion lease test requires one worker");
+      server_->RequestStop();
+      co_return result_;
+    }
+    if (absl::Status ready = control_.installer.SetStorageReady(true);
+        !ready.ok()) {
+      result_ = ready;
+      server_->RequestStop();
+      co_return result_;
+    }
+    if (absl::Status installed = control_.installer.InstallFullState(
+            FullState(MakeState(), 3), Basis(10, 2));
+        !installed.ok()) {
+      result_ = installed;
+      server_->RequestStop();
+      co_return result_;
+    }
+    const auto state = control_.cache.Current();
+    AuthorityMessage grant{
+        .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+        .session_ = Session(1),
+        .projection_ = Basis(10, 2),
+        .anchor_ = Anchor(*state),
+        .sent_at_ = LeaseClockNow(),
+        .granted_duration_ = 5s,
+    };
+
+    AuthorityMessage stale = grant;
+    stale.projection_ = Basis(10, 9);
+    validation_failure_ =
+        co_await control_.installer.ApplyLeaseGrantTransition(stale);
+    validation_failure_skipped_activation_ =
+        control_.actions.promotion_activations_.empty();
+
+    control_.actions.promotion_activation_status_ =
+        absl::FailedPreconditionError("injected activation rejection");
+    grant.sent_at_ = LeaseClockNow();
+    activation_failure_ =
+        co_await control_.installer.ApplyLeaseGrantTransition(grant);
+    constexpr std::array<std::uint16_t, 1> slots{12};
+    activation_failure_revoked_lease_ =
+        control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
+            .decision()
+            .kind_ == Decision::Kind::kClusterDownUnbound;
+
+    control_.actions.promotion_activation_status_ = absl::OkStatus();
+    grant.sent_at_ = LeaseClockNow();
+    result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
+    success_installed_lease_ =
+        control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
+            .decision()
+            .kind_ == Decision::Kind::kServe;
+    expected_ = PromotionActivationInput{
+        .group_id_ = "group-a",
+        .assignment_id_ = Assignment(1),
+        .group_term_ = 1,
+        .authority_version_ = 1,
+        .grant_revision_ = 1,
+        .target_node_id_ = *NodeId::Parse(kNodeA),
+        .target_boot_id_ = *NodeId::Parse(kBoot),
+        .manifest_revision_ = 1,
+        .manifest_digest_ = Digest(4),
+        .partition_replication_epoch_ = kPartitionReplicationEpoch,
+    };
+    server_->RequestStop();
+    co_return result_;
+  }
+
+  void Stop() noexcept override {}
+
+  celer::Server* server_ = nullptr;
+  DynamicControl control_;
+  bool prepared_ = false;
+  bool validation_failure_skipped_activation_ = false;
+  bool activation_failure_revoked_lease_ = false;
+  bool success_installed_lease_ = false;
+  PromotionActivationInput expected_;
+  absl::Status validation_failure_ =
+      absl::UnknownError("stale lease validation did not run");
+  absl::Status activation_failure_ =
+      absl::UnknownError("promotion activation failure did not run");
+  absl::Status result_ =
+      absl::UnknownError("promotion lease activation service did not run");
+};
+
+class PromotionLeaseExpiresDuringActivationService final
+    : public celer::Service {
+ public:
+  explicit PromotionLeaseExpiresDuringActivationService(celer::Server* server)
+      : server_(server) {}
+
+  void Prepare(unsigned thread_count) override {
+    prepared_ = thread_count == 1;
+  }
+
+  celer::Task<absl::Status> Run(celer::Worker& worker,
+                                celer::ServiceContext) override {
+    if (!prepared_) {
+      result_ = absl::FailedPreconditionError(
+          "promotion lease expiry test requires one worker");
+      server_->RequestStop();
+      co_return result_;
+    }
+    if (absl::Status ready = control_.installer.SetStorageReady(true);
+        !ready.ok()) {
+      result_ = ready;
+      server_->RequestStop();
+      co_return result_;
+    }
+    if (absl::Status installed = control_.installer.InstallFullState(
+            FullState(MakeState(), 3), Basis(10, 2));
+        !installed.ok()) {
+      result_ = installed;
+      server_->RequestStop();
+      co_return result_;
+    }
+
+    control_.actions.block_promotion_activation_ = true;
+    worker.Spawn(ReleaseActivationAfterDeadline(worker));
+    const auto state = control_.cache.Current();
+    AuthorityMessage grant{
+        .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+        .session_ = Session(1),
+        .projection_ = Basis(10, 2),
+        .anchor_ = Anchor(*state),
+        .sent_at_ = LeaseClockNow(),
+        .granted_duration_ = 10ms,
+    };
+    result_ = co_await control_.installer.ApplyLeaseGrantTransition(grant);
+    constexpr std::array<std::uint16_t, 1> slots{12};
+    lease_remained_fenced_ =
+        control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
+            .decision()
+            .kind_ == Decision::Kind::kClusterDownUnbound;
+    server_->RequestStop();
+    co_return absl::OkStatus();
+  }
+
+  void Stop() noexcept override {}
+
+  celer::Task<absl::Status> ReleaseActivationAfterDeadline(
+      celer::Worker& worker) {
+    while (!control_.actions.promotion_activation_entered_) {
+      co_await celer::Yield(worker);
+    }
+    absl::Status slept = co_await celer::SleepFor(worker, 30ms);
+    control_.actions.block_promotion_activation_ = false;
+    co_return slept;
+  }
+
+  celer::Server* server_ = nullptr;
+  DynamicControl control_;
+  bool prepared_ = false;
+  bool lease_remained_fenced_ = false;
+  absl::Status result_ =
+      absl::UnknownError("promotion lease expiry service did not run");
 };
 
 // Blocks the sole worker across the first deadline so the ordinary timer
@@ -757,8 +998,7 @@ class DelayedLeaseExpiryRenewalService final : public celer::Service {
     constexpr std::array<std::uint16_t, 1> slots{12};
     old_admission_ =
         control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow());
-    old_admitted_ =
-        old_admission_->decision().kind_ == Decision::Kind::kServe;
+    old_admitted_ = old_admission_->decision().kind_ == Decision::Kind::kServe;
     expirations_before_ = GetClusterControlMetrics().lease_expirations_;
 
     // Do not yield: the deadline passes while the timer remains queued.
@@ -771,10 +1011,9 @@ class DelayedLeaseExpiryRenewalService final : public celer::Service {
           control_.guard.Recheck(*old_admission_, LeaseClockNow()) ==
           RecheckResult::kReject;
       new_admission_serves_ =
-          control_.guard
-                  .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
-                  .decision()
-                  .kind_ == Decision::Kind::kServe;
+          control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
+              .decision()
+              .kind_ == Decision::Kind::kServe;
     }
     expirations_after_ = GetClusterControlMetrics().lease_expirations_;
     server_->RequestStop();
@@ -1267,30 +1506,32 @@ TEST(NodeControlInstallerTest,
   const MonotonicTime before_suspend{};
   const auto state = control.cache.Current();
   ASSERT_TRUE(control.installer
-                  .ApplyAuthority(AuthorityMessage{
-                      .kind_ = AuthorityMessage::Kind::kLeaseGrant,
-                      .session_ = Session(1),
-                      .projection_ = Basis(10, 2),
-                      .anchor_ = Anchor(*state),
-                      .sent_at_ = before_suspend,
-                      .granted_duration_ = 5s,
-                  }, before_suspend)
+                  .ApplyAuthority(
+                      AuthorityMessage{
+                          .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+                          .session_ = Session(1),
+                          .projection_ = Basis(10, 2),
+                          .anchor_ = Anchor(*state),
+                          .sent_at_ = before_suspend,
+                          .granted_duration_ = 5s,
+                      },
+                      before_suspend)
                   .ok());
 
   constexpr std::array<std::uint16_t, 1> slots{12};
-  EXPECT_EQ(control.guard
-                .CaptureAndAdmit(WriteRequest(slots), before_suspend + 1s)
-                .decision()
-                .kind_,
-            Decision::Kind::kServe);
+  EXPECT_EQ(
+      control.guard.CaptureAndAdmit(WriteRequest(slots), before_suspend + 1s)
+          .decision()
+          .kind_,
+      Decision::Kind::kServe);
   // Production supplies this value from CLOCK_BOOTTIME. A host suspend can
   // jump it past the deadline even when Celer's CLOCK_MONOTONIC timer has not
   // resumed yet, so the request path itself must fail closed.
-  EXPECT_EQ(control.guard
-                .CaptureAndAdmit(WriteRequest(slots), before_suspend + 20s)
-                .decision()
-                .kind_,
-            Decision::Kind::kClusterDownUnbound);
+  EXPECT_EQ(
+      control.guard.CaptureAndAdmit(WriteRequest(slots), before_suspend + 20s)
+          .decision()
+          .kind_,
+      Decision::Kind::kClusterDownUnbound);
 }
 
 TEST(NodeControlInstallerTest,
@@ -1309,17 +1550,15 @@ TEST(NodeControlInstallerTest,
       .sent_at_ = MonotonicTime{},
       .granted_duration_ = 5s,
   };
-  ASSERT_TRUE(
-      control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
+  ASSERT_TRUE(control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
 
   constexpr std::array<std::uint16_t, 1> slots{12};
   const AuthorityAdmission before =
       control.guard.CaptureAndAdmit(WriteRequest(slots), MonotonicTime{} + 1s);
   grant.sent_at_ = MonotonicTime{} + 4s;
   grant.granted_duration_ = 10s;
-  ASSERT_TRUE(control.installer
-                  .ApplyAuthority(grant, MonotonicTime{} + 4s)
-                  .ok());
+  ASSERT_TRUE(
+      control.installer.ApplyAuthority(grant, MonotonicTime{} + 4s).ok());
 
   EXPECT_EQ(control.guard.Recheck(before, MonotonicTime{} + 8s),
             RecheckResult::kOk);
@@ -1337,14 +1576,16 @@ TEST(NodeControlInstallerTest,
   const std::shared_ptr<const ServingState> state = control.cache.Current();
   const AuthorityAnchor anchor = Anchor(*state);
   ASSERT_TRUE(control.installer
-                  .ApplyAuthority({
-                      .kind_ = AuthorityMessage::Kind::kLeaseGrant,
-                      .session_ = Session(1),
-                      .projection_ = Basis(10, 2),
-                      .anchor_ = anchor,
-                      .sent_at_ = MonotonicTime{},
-                      .granted_duration_ = 5s,
-                  }, MonotonicTime{})
+                  .ApplyAuthority(
+                      {
+                          .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+                          .session_ = Session(1),
+                          .projection_ = Basis(10, 2),
+                          .anchor_ = anchor,
+                          .sent_at_ = MonotonicTime{},
+                          .granted_duration_ = 5s,
+                      },
+                      MonotonicTime{})
                   .ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
   EXPECT_EQ(
@@ -1393,14 +1634,16 @@ TEST(NodeControlInstallerTest, CountsOneLocalExpirationPerExpiredLease) {
                   .ok());
   const auto state = control.cache.Current();
   ASSERT_TRUE(control.installer
-                  .ApplyAuthority({
-                      .kind_ = AuthorityMessage::Kind::kLeaseGrant,
-                      .session_ = Session(1),
-                      .projection_ = Basis(10, 2),
-                      .anchor_ = Anchor(*state),
-                      .sent_at_ = MonotonicTime{},
-                      .granted_duration_ = 1s,
-                  }, MonotonicTime{})
+                  .ApplyAuthority(
+                      {
+                          .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+                          .session_ = Session(1),
+                          .projection_ = Basis(10, 2),
+                          .anchor_ = Anchor(*state),
+                          .sent_at_ = MonotonicTime{},
+                          .granted_duration_ = 1s,
+                      },
+                      MonotonicTime{})
                   .ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
   const std::uint64_t before = GetClusterControlMetrics().lease_expirations_;
@@ -1460,16 +1703,14 @@ TEST(NodeControlInstallerTest,
       .sent_at_ = MonotonicTime{},
       .granted_duration_ = 10s,
   };
-  ASSERT_TRUE(
-      control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
+  ASSERT_TRUE(control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
   const AuthorityAdmission admission =
       control.guard.CaptureAndAdmit(WriteRequest(slots), MonotonicTime{} + 1s);
 
   AuthorityMessage fence = grant;
   fence.kind_ = AuthorityMessage::Kind::kFence;
-  ASSERT_TRUE(
-      control.installer.ApplyAuthority(fence, MonotonicTime{}).ok());
+  ASSERT_TRUE(control.installer.ApplyAuthority(fence, MonotonicTime{}).ok());
 
   EXPECT_EQ(control.guard.Recheck(admission, MonotonicTime{} + 2s),
             RecheckResult::kReject);
@@ -1533,6 +1774,54 @@ TEST(NodeControlInstallerTest,
   EXPECT_TRUE(service.result().ok()) << service.result();
   EXPECT_TRUE(service.release_ran_while_waiting());
   EXPECT_TRUE(service.saw_fenced_state());
+}
+
+TEST(NodeControlInstallerTest,
+     LeaseValidatesThenActivatesAndRollsBackOnActionFailure) {
+  celer::Server server;
+  PromotionLeaseActivationService service(&server);
+  server.AddService(&service);
+  celer::ServerOptions options;
+  options.thread_count_ = 1;
+  options.pin_workers_ = false;
+  options.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(options).ok());
+  server.WaitUntilStopped();
+
+  EXPECT_TRUE(service.result_.ok()) << service.result_;
+  EXPECT_EQ(service.validation_failure_.code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_TRUE(service.validation_failure_skipped_activation_);
+  EXPECT_EQ(service.activation_failure_.code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_TRUE(service.activation_failure_revoked_lease_);
+  EXPECT_TRUE(service.success_installed_lease_);
+  ASSERT_EQ(service.control_.actions.promotion_activations_.size(), 2U);
+  EXPECT_EQ(service.control_.actions.promotion_activations_.back(),
+            service.expected_);
+  EXPECT_EQ(service.control_.actions.expiration_authority_deadlines_.size(),
+            1U);
+}
+
+TEST(NodeControlInstallerTest,
+     LeaseExpiringDuringPromotionActivationCannotOpenAuthority) {
+  celer::Server server;
+  PromotionLeaseExpiresDuringActivationService service(&server);
+  server.AddService(&service);
+  celer::ServerOptions options;
+  options.thread_count_ = 1;
+  options.pin_workers_ = false;
+  options.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(options).ok());
+  server.WaitUntilStopped();
+
+  EXPECT_EQ(service.result_.code(), absl::StatusCode::kDeadlineExceeded)
+      << service.result_;
+  EXPECT_TRUE(service.lease_remained_fenced_);
+  EXPECT_EQ(service.control_.actions.promotion_activations_.size(), 1U);
+  EXPECT_TRUE(service.control_.actions.expiration_authority_deadlines_.empty());
+  EXPECT_EQ(service.control_.actions.async_revocations_, 1);
+  EXPECT_EQ(service.control_.actions.drained_.size(), 1U);
 }
 
 TEST(NodeControlInstallerTest,
@@ -1751,8 +2040,7 @@ TEST(NodeControlInstallerTest,
       .sent_at_ = MonotonicTime{},
       .granted_duration_ = 10s,
   };
-  ASSERT_TRUE(
-      control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
+  ASSERT_TRUE(control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
   control.actions.receives_directives_ = true;
 
   AuthorityMessage fence = grant;
@@ -1827,9 +2115,7 @@ TEST(NodeControlInstallerTest,
                                         {.node_id_ = *NodeId::Parse(kNodeB),
                                          .assignment_id_ = Assignment(2)}}}},
   };
-  ASSERT_TRUE(control.installer
-                  .InstallFullState(ownerless, Basis(10, 2))
-                  .ok());
+  ASSERT_TRUE(control.installer.InstallFullState(ownerless, Basis(10, 2)).ok());
 
   const auto expect_rejected = [&](PreparedFullState candidate,
                                    std::uint8_t hash) {
@@ -1861,10 +2147,10 @@ TEST(NodeControlInstallerTest,
   candidate = ownerless;
   candidate.object_hash_ = Digest(9);
   candidate.control_groups_[0].manifest_digest_ = Digest(9);
-  EXPECT_EQ(control.installer
-                .InstallFullState(std::move(candidate), Basis(11, 9))
-                .code(),
-            absl::StatusCode::kDataLoss);
+  EXPECT_EQ(
+      control.installer.InstallFullState(std::move(candidate), Basis(11, 9))
+          .code(),
+      absl::StatusCode::kDataLoss);
 }
 
 TEST(NodeControlInstallerTest,
@@ -1922,8 +2208,7 @@ TEST(NodeControlInstallerTest,
             absl::StatusCode::kUnavailable);
 
   in_flight.reset();
-  EXPECT_TRUE(
-      control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
+  EXPECT_TRUE(control.installer.ApplyAuthority(grant, MonotonicTime{}).ok());
 }
 
 TEST(NodeControlInstallerTest,
@@ -1959,14 +2244,14 @@ TEST(NodeControlInstallerTest,
   // ReadyToken that the heartbeat reapplies afterwards. That normalization
   // must not tear down an already-online export when every durable population
   // and authority anchor remains exact.
-  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
-                              FullState(MakeState(
-                                            Assignment(1), 1, 1, 1, 1, 1, 1,
-                                            /*granted=*/true,
-                                            /*population_ready=*/false),
-                                        4),
-                              Basis(11, 3)))
-                  .ok());
+  ASSERT_TRUE(
+      RunTaskSync(control.installer.InstallFullStateTransition(
+                      FullState(MakeState(Assignment(1), 1, 1, 1, 1, 1, 1,
+                                          /*granted=*/true,
+                                          /*population_ready=*/false),
+                                4),
+                      Basis(11, 3)))
+          .ok());
   EXPECT_EQ(control.actions.session_clears_, 3);
   ASSERT_EQ(control.actions.preserve_established_exports_.size(), 3U);
   EXPECT_TRUE(control.actions.preserve_established_exports_.back());
@@ -1987,6 +2272,130 @@ TEST(NodeControlInstallerTest,
   ASSERT_EQ(control.actions.preserve_established_exports_.size(), 4U);
   EXPECT_FALSE(control.actions.preserve_established_exports_.back());
   EXPECT_EQ(old->GroupInFlightCount("group-a"), 0U);
+}
+
+TEST(NodeControlInstallerTest,
+     FullStateReconcilesExactSourceHistoryHoldReplayAndRemoval) {
+  DynamicControl control;
+  control.actions.receives_directives_ = true;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              WithSourceHistoryHold(FullState(MakeState(), 3)),
+                              Basis(10, 2)))
+                  .ok());
+  ASSERT_EQ(control.actions.source_history_hold_reconciliations_.size(), 1U);
+  EXPECT_EQ(control.actions.source_history_hold_reconciliations_.back(),
+            SourceHistoryHold());
+
+  // Session replacement still awaits idempotent native reconciliation for an
+  // exact FDS replay; the new session must not assume the boot-local hold.
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              WithSourceHistoryHold(FullState(MakeState(), 3)),
+                              Basis(10, 2)))
+                  .ok());
+  ASSERT_EQ(control.actions.source_history_hold_reconciliations_.size(), 2U);
+  EXPECT_EQ(control.actions.source_history_hold_reconciliations_.back(),
+            SourceHistoryHold());
+
+  ASSERT_TRUE(
+      RunTaskSync(control.installer.InstallFullStateTransition(
+                      WithSourceHistoryHold(FullState(MakeState(), 4), 8),
+                      Basis(11, 3)))
+          .ok());
+  ASSERT_EQ(control.actions.source_history_hold_reconciliations_.size(), 3U);
+  EXPECT_EQ(control.actions.source_history_hold_reconciliations_.back(),
+            SourceHistoryHold(8));
+
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              FullState(MakeState(), 5), Basis(12, 4)))
+                  .ok());
+  ASSERT_EQ(control.actions.source_history_hold_reconciliations_.size(), 4U);
+  EXPECT_FALSE(
+      control.actions.source_history_hold_reconciliations_.back().has_value());
+}
+
+TEST(NodeControlInstallerTest,
+     FullStateWaitsForSourceHistoryHoldAndPropagatesFailure) {
+  DynamicControl control;
+  control.actions.receives_directives_ = true;
+  control.actions.source_history_hold_reconcile_status_ =
+      absl::InternalError("injected history hold failure");
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+
+  const absl::Status status =
+      RunTaskSync(control.installer.InstallFullStateTransition(
+          WithSourceHistoryHold(FullState(MakeState(), 3)), Basis(10, 2)));
+
+  EXPECT_EQ(status.code(), absl::StatusCode::kInternal);
+  ASSERT_EQ(control.actions.source_history_hold_reconciliations_.size(), 1U);
+  EXPECT_EQ(control.actions.source_history_hold_reconciliations_.front(),
+            SourceHistoryHold());
+  EXPECT_TRUE(
+      control.actions.source_history_hold_reconciled_after_session_clear_);
+}
+
+TEST(NodeControlInstallerTest,
+     FenceAndSessionLossRetainInstalledSourceHistoryHold) {
+  DynamicControl control;
+  control.actions.receives_directives_ = true;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              WithSourceHistoryHold(FullState(MakeState(), 3)),
+                              Basis(10, 2)))
+                  .ok());
+  const std::shared_ptr<const ServingState> installed = control.cache.Current();
+  ASSERT_NE(installed, nullptr);
+
+  ASSERT_TRUE(
+      RunTaskSync(control.installer.ApplyFenceTransition(AuthorityMessage{
+                      .kind_ = AuthorityMessage::Kind::kFence,
+                      .session_ = Session(1),
+                      .projection_ = Basis(10, 2),
+                      .anchor_ = Anchor(*installed),
+                  }))
+          .ok());
+  EXPECT_EQ(control.actions.source_history_hold_reconciliations_.size(), 1U);
+
+  ASSERT_TRUE(RunTaskSync(control.installer.LoseSessionTransition(
+                              Session(1), "transport closed"))
+                  .ok());
+  ASSERT_EQ(control.actions.source_history_hold_reconciliations_.size(), 1U);
+  EXPECT_EQ(control.actions.source_history_hold_reconciliations_.front(),
+            SourceHistoryHold());
+}
+
+TEST(NodeControlInstallerTest, StorageLossReleasesInstalledSourceHistoryHold) {
+  DynamicControl control;
+  control.actions.receives_directives_ = true;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              WithSourceHistoryHold(FullState(MakeState(), 3)),
+                              Basis(10, 2)))
+                  .ok());
+
+  ASSERT_TRUE(
+      RunTaskSync(control.installer.LoseStorageReadinessTransition()).ok());
+  ASSERT_EQ(control.actions.source_history_hold_reconciliations_.size(), 2U);
+  EXPECT_FALSE(
+      control.actions.source_history_hold_reconciliations_.back().has_value());
+}
+
+TEST(NodeControlInstallerTest, ShutdownReleasesInstalledSourceHistoryHold) {
+  DynamicControl control;
+  control.actions.receives_directives_ = true;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              WithSourceHistoryHold(FullState(MakeState(), 3)),
+                              Basis(10, 2)))
+                  .ok());
+
+  ASSERT_TRUE(
+      RunTaskSync(control.installer.CancelPopulationForShutdownTransition())
+          .ok());
+  ASSERT_EQ(control.actions.source_history_hold_reconciliations_.size(), 2U);
+  EXPECT_FALSE(
+      control.actions.source_history_hold_reconciliations_.back().has_value());
 }
 
 TEST(NodeControlInstallerTest,
@@ -2100,25 +2509,25 @@ TEST(NodeControlInstallerTest,
   const std::shared_ptr<const ServingState> current = control.cache.Current();
   ASSERT_NE(current, nullptr);
   ASSERT_TRUE(control.installer
-                  .ApplyAuthority(AuthorityMessage{
-                      .kind_ = AuthorityMessage::Kind::kLeaseGrant,
-                      .session_ = session,
-                      .projection_ = Basis(10, 2),
-                      .anchor_ = Anchor(*current),
-                      .sent_at_ = LeaseClockNow(),
-                      .granted_duration_ = 1h,
-                  }, LeaseClockNow())
+                  .ApplyAuthority(
+                      AuthorityMessage{
+                          .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+                          .session_ = session,
+                          .projection_ = Basis(10, 2),
+                          .anchor_ = Anchor(*current),
+                          .sent_at_ = LeaseClockNow(),
+                          .granted_duration_ = 1h,
+                      },
+                      LeaseClockNow())
                   .ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
-  EXPECT_EQ(control.guard
-                .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
+  EXPECT_EQ(control.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
                 .decision()
                 .kind_,
             Decision::Kind::kServe);
 
   ASSERT_TRUE(control.installer.InvalidateSessionNow(session).ok());
-  EXPECT_NE(control.guard
-                .CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
+  EXPECT_NE(control.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
                 .decision()
                 .kind_,
             Decision::Kind::kServe);
@@ -2137,14 +2546,16 @@ TEST(NodeControlInstallerTest,
   const std::shared_ptr<const ServingState> state = control.cache.Current();
   ASSERT_NE(state, nullptr);
   ASSERT_TRUE(control.installer
-                  .ApplyAuthority({
-                      .kind_ = AuthorityMessage::Kind::kLeaseGrant,
-                      .session_ = Session(1),
-                      .projection_ = Basis(10, 2),
-                      .anchor_ = Anchor(*state),
-                      .sent_at_ = MonotonicTime{},
-                      .granted_duration_ = 5s,
-                  }, MonotonicTime{})
+                  .ApplyAuthority(
+                      {
+                          .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+                          .session_ = Session(1),
+                          .projection_ = Basis(10, 2),
+                          .anchor_ = Anchor(*state),
+                          .sent_at_ = MonotonicTime{},
+                          .granted_duration_ = 5s,
+                      },
+                      MonotonicTime{})
                   .ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
   const AuthorityAdmission admitted =
@@ -2152,8 +2563,7 @@ TEST(NodeControlInstallerTest,
   ASSERT_EQ(admitted.decision().kind_, Decision::Kind::kServe);
 
   EXPECT_TRUE(
-      RunTaskSync(
-          control.installer.CancelPopulationForShutdownTransition())
+      RunTaskSync(control.installer.CancelPopulationForShutdownTransition())
           .ok());
   EXPECT_EQ(control.actions.population_shutdown_cancellations_, 1);
   EXPECT_EQ(control.actions.population_cancellations_, 0);
@@ -2285,21 +2695,21 @@ TEST(NodeControlInstallerTest,
 
   NodeDirective stale_assignment = directive;
   stale_assignment.anchor_.assignment_id_ = Assignment(2);
-  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(stale_assignment))
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(
+      RunTaskSync(control.installer.ApplyDirective(stale_assignment)).code(),
+      absl::StatusCode::kFailedPrecondition);
 
   NodeDirective stale_authority = directive;
   ++stale_authority.anchor_.authority_version_;
-  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(stale_authority))
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(
+      RunTaskSync(control.installer.ApplyDirective(stale_authority)).code(),
+      absl::StatusCode::kFailedPrecondition);
 
   NodeDirective stale_population = directive;
   ++stale_population.partition_replication_epoch_;
-  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(stale_population))
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(
+      RunTaskSync(control.installer.ApplyDirective(stale_population)).code(),
+      absl::StatusCode::kFailedPrecondition);
 
   EXPECT_TRUE(RunTaskSync(control.installer.ApplyDirective(directive)).ok());
   ASSERT_EQ(control.actions.directives_.size(), 1U);
@@ -2343,9 +2753,9 @@ TEST(NodeControlInstallerTest,
   NodeDirective malformed_history = directive;
   malformed_history.directive_id_ = ShortId<DirectiveId>(5);
   malformed_history.payload_ = std::string(40, 'G');
-  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(malformed_history))
-                .code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(
+      RunTaskSync(control.installer.ApplyDirective(malformed_history)).code(),
+      absl::StatusCode::kInvalidArgument);
 }
 
 TEST(NodeControlInstallerTest,
@@ -2416,6 +2826,228 @@ TEST(NodeControlInstallerTest,
   authorize.source_assignment_id_ = fresh_source;
   EXPECT_TRUE(RunTaskSync(control.installer.ApplyDirective(authorize)).ok());
   ASSERT_EQ(control.actions.directives_.size(), 1U);
+}
+
+TEST(NodeControlInstallerTest,
+     FrozenSourceRequiresExactHeldFormerAuthorityAndBootLocalExclusion) {
+  DynamicControl control;
+  control.actions.receives_directives_ = true;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              WithSourceHistoryHold(FullState(MakeState(), 3)),
+                              Basis(10, 2)))
+                  .ok());
+  const AuthorityAnchor old_authority = Anchor(*control.cache.Current());
+
+  NodeDirective frozen{
+      .projection_ = Basis(11, 3),
+      .anchor_ = {.group_id_ = "group-a",
+                  .assignment_id_ = Assignment(2),
+                  .group_term_ = 2,
+                  .authority_version_ = 1,
+                  .grant_revision_ = 1},
+      .operation_id_ = ShortId<OperationId>(1),
+      .directive_id_ = ShortId<DirectiveId>(2),
+      .attempt_id_ = ShortId<AttemptId>(3),
+      .directive_revision_ = 8,
+      .kind_ = NodeDirective::Kind::kAuthorizeSource,
+      .target_node_id_ = *NodeId::Parse(kNodeB),
+      .target_boot_id_ = *NodeId::Parse(std::string(40, 'd')),
+      .source_node_id_ = *NodeId::Parse(kNodeA),
+      .source_assignment_id_ = Assignment(1),
+      .source_boot_id_ = *NodeId::Parse(kBoot),
+      .source_replication_history_id_ = *NodeId::Parse(kNodeA),
+      .flow_count_ = 1,
+      .manifest_revision_ = 1,
+      .manifest_digest_ = Digest(4),
+      .partition_replication_epoch_ = kPartitionReplicationEpoch,
+      .frozen_source_ =
+          FrozenSourceInput{
+              .recovery_generation_ = 7,
+              .excluded_group_term_ = 1,
+              .excluded_authority_version_ = 1,
+              .excluded_grant_revision_ = 1,
+          },
+  };
+
+  PreparedFullState ownerless{
+      .serving_state_ = MakeLocalSourceOwnerlessState(),
+      .object_hash_ = Digest(4),
+      .control_groups_ = {{
+          .group_id_ = "group-a",
+          .group_term_ = 2,
+          .authority_version_ = 1,
+          .grant_revision_ = 1,
+          .config_epoch_ = 2,
+          .manifest_revision_ = 1,
+          .manifest_digest_ = Digest(4),
+          .partition_replication_epoch_ = kPartitionReplicationEpoch,
+          .members_ = {{.node_id_ = *NodeId::Parse(kNodeA),
+                        .assignment_id_ = Assignment(1)},
+                       {.node_id_ = *NodeId::Parse(kNodeB),
+                        .assignment_id_ = Assignment(2)}},
+          .source_history_hold_ = SourceHistoryHold(),
+      }}};
+
+  // BeginGroupTerm committed after this old control session disconnected, so
+  // its explicit Fence could not arrive. The replacement session's committed
+  // ownerless FDS must recover that exact exclusion within the same boot.
+  ASSERT_TRUE(RunTaskSync(control.installer.LoseSessionTransition(
+                              Session(1), "transport closed before Fence"))
+                  .ok());
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              ownerless, frozen.projection_))
+                  .ok());
+  EXPECT_TRUE(RunTaskSync(control.installer.ApplyDirective(frozen)).ok());
+  ASSERT_EQ(control.actions.directives_.size(), 1U);
+  EXPECT_EQ(control.actions.directives_.front(), frozen);
+
+  // The recovered floor belongs to the exact retired source assignment. A
+  // later membership incarnation with an otherwise matching hold cannot
+  // borrow that boot-local exclusion proof.
+  PreparedFullState reassigned = ownerless;
+  reassigned.object_hash_ = Digest(5);
+  reassigned.control_groups_.front().members_.front().assignment_id_ =
+      Assignment(3);
+  reassigned.control_groups_.front()
+      .source_history_hold_->source_assignment_id_ = Assignment(3);
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              std::move(reassigned), Basis(12, 4)))
+                  .ok());
+  NodeDirective reassigned_frozen = frozen;
+  reassigned_frozen.projection_ = Basis(12, 4);
+  reassigned_frozen.directive_id_ = ShortId<DirectiveId>(4);
+  reassigned_frozen.source_assignment_id_ = Assignment(3);
+  const absl::Status reassigned_replay =
+      RunTaskSync(control.installer.ApplyDirective(reassigned_frozen));
+  EXPECT_EQ(reassigned_replay.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(reassigned_replay.message(),
+            "frozen source old authority has not been fenced through its "
+            "exact anchor");
+  EXPECT_EQ(control.actions.directives_.size(), 1U);
+
+  // An installer that never observed the active local grant has no boot-local
+  // exclusion evidence. The same ownerless FDS cannot synthesize it.
+  DynamicControl fresh_control;
+  fresh_control.actions.receives_directives_ = true;
+  ASSERT_TRUE(fresh_control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(RunTaskSync(fresh_control.installer.InstallFullStateTransition(
+                              ownerless, frozen.projection_))
+                  .ok());
+  EXPECT_EQ(RunTaskSync(fresh_control.installer.ApplyDirective(frozen)).code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_TRUE(fresh_control.actions.directives_.empty());
+
+  // The ordinary explicit-Fence path remains equivalent.
+  DynamicControl fenced_control;
+  fenced_control.actions.receives_directives_ = true;
+  ASSERT_TRUE(fenced_control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(RunTaskSync(fenced_control.installer.InstallFullStateTransition(
+                              WithSourceHistoryHold(FullState(MakeState(), 3)),
+                              Basis(10, 2)))
+                  .ok());
+  ASSERT_TRUE(RunTaskSync(fenced_control.installer.ApplyFenceTransition(
+                              AuthorityMessage{
+                                  .kind_ = AuthorityMessage::Kind::kFence,
+                                  .session_ = Session(1),
+                                  .projection_ = Basis(10, 2),
+                                  .anchor_ = old_authority,
+                              }))
+                  .ok());
+  ASSERT_TRUE(RunTaskSync(fenced_control.installer.InstallFullStateTransition(
+                              std::move(ownerless), frozen.projection_))
+                  .ok());
+  ASSERT_EQ(fenced_control.cache.Current()->FindGroup("group-a"), nullptr);
+
+  EXPECT_TRUE(
+      RunTaskSync(fenced_control.installer.ApplyDirective(frozen)).ok());
+  ASSERT_EQ(fenced_control.actions.directives_.size(), 1U);
+  EXPECT_EQ(fenced_control.actions.directives_.front(), frozen);
+
+  NodeDirective incomplete = frozen;
+  incomplete.directive_id_ = ShortId<DirectiveId>(8);
+  incomplete.frozen_source_->recovery_generation_ = 0;
+  EXPECT_EQ(
+      RunTaskSync(fenced_control.installer.ApplyDirective(incomplete)).code(),
+      absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(fenced_control.actions.directives_.size(), 1U);
+
+  const auto expect_rejected = [&](NodeDirective changed) {
+    changed.directive_id_ = ShortId<DirectiveId>(9);
+    EXPECT_EQ(
+        RunTaskSync(fenced_control.installer.ApplyDirective(std::move(changed)))
+            .code(),
+        absl::StatusCode::kFailedPrecondition);
+    EXPECT_EQ(fenced_control.actions.directives_.size(), 1U);
+  };
+  NodeDirective changed = frozen;
+  ++changed.frozen_source_->recovery_generation_;
+  expect_rejected(std::move(changed));
+  changed = frozen;
+  ++changed.frozen_source_->excluded_authority_version_;
+  expect_rejected(std::move(changed));
+  changed = frozen;
+  ++changed.frozen_source_->excluded_group_term_;
+  expect_rejected(std::move(changed));
+  changed = frozen;
+  changed.source_assignment_id_ = Assignment(3);
+  expect_rejected(std::move(changed));
+  changed = frozen;
+  changed.source_boot_id_ = *NodeId::Parse(std::string(40, 'e'));
+  expect_rejected(std::move(changed));
+  changed = frozen;
+  changed.source_replication_history_id_ = *NodeId::Parse(std::string(40, 'e'));
+  expect_rejected(std::move(changed));
+  changed = frozen;
+  ++changed.manifest_revision_;
+  expect_rejected(std::move(changed));
+  changed = frozen;
+  changed.manifest_digest_ = Digest(5);
+  expect_rejected(std::move(changed));
+  changed = frozen;
+  ++changed.partition_replication_epoch_;
+  expect_rejected(std::move(changed));
+}
+
+TEST(NodeControlInstallerTest,
+     FrozenSourceSchemaCannotAttachToAnotherDirectiveKind) {
+  DynamicControl control;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(control.installer
+                  .InstallFullState(FullState(MakeState(), 3), Basis(10, 2))
+                  .ok());
+  NodeDirective rebuild{
+      .projection_ = Basis(10, 2),
+      .anchor_ = Anchor(*control.cache.Current()),
+      .operation_id_ = ShortId<OperationId>(1),
+      .directive_id_ = ShortId<DirectiveId>(2),
+      .attempt_id_ = ShortId<AttemptId>(3),
+      .directive_revision_ = 8,
+      .kind_ = NodeDirective::Kind::kReplication,
+      .target_node_id_ = *NodeId::Parse(kNodeA),
+      .target_boot_id_ = *NodeId::Parse(kBoot),
+      .source_node_id_ = *NodeId::Parse(kNodeB),
+      .source_assignment_id_ = Assignment(1),
+      .source_boot_id_ = *NodeId::Parse(kBoot),
+      .source_replication_history_id_ = *NodeId::Parse(kNodeB),
+      .source_host_ = "127.0.0.1",
+      .source_port_ = 7001,
+      .flow_count_ = 1,
+      .manifest_revision_ = 1,
+      .manifest_digest_ = Digest(4),
+      .partition_replication_epoch_ = kPartitionReplicationEpoch,
+      .frozen_source_ =
+          FrozenSourceInput{
+              .recovery_generation_ = 7,
+              .excluded_group_term_ = 1,
+              .excluded_authority_version_ = 1,
+              .excluded_grant_revision_ = 1,
+          },
+      .storage_mutating_ = true,
+  };
+  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(rebuild)).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(control.actions.directives_.empty());
 }
 
 TEST(NodeControlInstallerTest,

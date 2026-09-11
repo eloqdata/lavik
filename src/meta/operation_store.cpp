@@ -106,8 +106,9 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
       directive.kind_ == kMetaDirectiveInitializeEmptyPopulation;
   const bool promotion_prepare =
       directive.kind_ == kMetaDirectivePromotionPrepare;
-  const bool rebuild = directive.kind_ == kMetaDirectiveRebuild ||
-                       directive.kind_ == kMetaDirectiveAuthorizeSource;
+  const bool rebuild = directive.kind_ == kMetaDirectiveRebuild;
+  const bool authorize_source =
+      directive.kind_ == kMetaDirectiveAuthorizeSource;
   const bool absent_source =
       directive.source_node_id_ == std::string(kMetaNodeIdBytes, '0') &&
       IsZero(directive.source_assignment_id_) &&
@@ -120,6 +121,23 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
                 !IsZero(directive.source_assignment_id_) &&
                 !IsZero(directive.source_boot_id_) &&
                 !IsZero(directive.source_replication_history_id_);
+  // authorize-source has exactly two durable shapes. Ordinary authorization
+  // binds the source layout in a rebuild request; post-fence authorization
+  // binds the recovery generation and the same layout in a frozen-source
+  // request plus exact authority preconditions.
+  const bool ordinary_source_body =
+      authorize_source && directive.preconditions_.empty() &&
+      cluster::control::DecodeRebuildRequest(directive.payload_).ok();
+  const bool frozen_source_body =
+      authorize_source && !directive.payload_.empty() &&
+      !directive.preconditions_.empty() &&
+      cluster::control::DecodeFrozenSourceRequest(directive.payload_).ok() &&
+      cluster::control::DecodeFrozenSourcePreconditions(
+          directive.preconditions_)
+          .ok();
+  const bool authorize_source_payload_valid =
+      authorize_source && (ordinary_source_body || frozen_source_body) &&
+      !directive.storage_mutating_;
   const bool payload_valid =
       initializes_empty
           ? directive.payload_.size() == 2 * kMetaReplicationHistoryIdBytes &&
@@ -136,13 +154,14 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
       : promotion_prepare
           ? !directive.payload_.empty() && !directive.preconditions_.empty() &&
                 directive.storage_mutating_
+      : authorize_source
+          ? authorize_source_payload_valid
           : directive.payload_.empty() && directive.preconditions_.empty();
   return !IsZero(directive.directive_id_) && !IsZero(directive.attempt_id_) &&
          directive.recipient_node_id_.size() == kMetaNodeIdBytes &&
          directive.target_node_id_.size() == kMetaNodeIdBytes &&
          !IsZero(directive.target_boot_id_) &&
-         !IsZero(directive.assignment_id_) &&
-         source_valid &&
+         !IsZero(directive.assignment_id_) && source_valid &&
          !directive.group_id_.empty() &&
          directive.group_id_.size() <= kMaxMetaGroupIdBytes &&
          directive.group_term_ != 0 && directive.authority_version_ != 0 &&
@@ -153,9 +172,7 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
          directive.payload_.size() <= kMaxMetaPayloadBytes &&
          directive.preconditions_.size() <=
              kMaxMetaDirectivePreconditionsBytes &&
-         payload_valid &&
-         !directive.force_ &&
-         RecipientMatchesKind(directive);
+         payload_valid && !directive.force_ && RecipientMatchesKind(directive);
 }
 
 bool EvidenceSummaryWellFormed(const MetaEvidenceSummary& evidence) {
@@ -328,8 +345,7 @@ std::vector<MetaOperationRecord> MetaOperationStore::LiveOperations() const {
 
 bool MetaOperationStore::HasActiveKind(std::string_view kind) const {
   return std::any_of(live_.begin(), live_.end(), [&](const auto& entry) {
-    return entry.second.kind_ == kind &&
-           !IsTerminal(entry.second.lifecycle_);
+    return entry.second.kind_ == kind && !IsTerminal(entry.second.lifecycle_);
   });
 }
 
@@ -567,7 +583,8 @@ absl::Status MetaOperationStore::AbortOperation(
   }
   if (record.lifecycle_ == MetaOperationLifecycle::kAborted &&
       record.revision_ == command.expected_revision_ + 1 &&
-      record.terminal_result_ == command.reason_) {
+      record.terminal_result_ == command.reason_ &&
+      record.data_loss_possible_ == command.data_loss_possible_) {
     return absl::OkStatus();  // replay no-op
   }
   if (IsTerminal(record.lifecycle_)) {
@@ -576,13 +593,13 @@ absl::Status MetaOperationStore::AbortOperation(
   if (record.revision_ != command.expected_revision_) {
     return MetaDomainRejectError("expected_revision mismatch");
   }
-  if (command.reason_.size() > kMaxMetaAbortReasonBytes) {
+  if (command.reason_.size() > kMaxMetaAbortPayloadBytes) {
     return MetaDomainRejectError("abort reason exceeds its cap");
   }
   record.lifecycle_ = MetaOperationLifecycle::kAborted;
   record.current_directives_.clear();
   record.terminal_result_ = command.reason_;
-  record.data_loss_possible_ = false;
+  record.data_loss_possible_ = command.data_loss_possible_;
   record.revision_ = command.expected_revision_ + 1;
   --active_count_;
   return absl::OkStatus();

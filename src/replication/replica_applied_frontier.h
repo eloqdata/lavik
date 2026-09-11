@@ -5,10 +5,12 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "keylane/replication_group.h"
 
 namespace keylane::detail {
 
@@ -22,6 +24,23 @@ absl::StatusOr<std::vector<std::uint64_t>> InitialAppliedNextLsnsForReconnect(
     unsigned source_flow_count,
     std::span<const std::uint64_t> requested_next_lsns,
     bool exact_resume_context_matches);
+
+// Checks the target-local, boot-scoped population proof that permits a native
+// cluster reconnect to reuse its Applied vector. Delivery identities excluded
+// from RebuildExportScope do not invalidate already continuous data, but every
+// population anchor and the complete flow layout remain exact.
+bool ClusterPopulationResumeProofMatches(
+    const RebuildDirective& directive, ReplicationGroupState state,
+    const RebuildIdentity* ready_identity,
+    std::span<const std::uint64_t> ready_cut_vector,
+    std::string_view local_node_id, std::string_view local_boot_id);
+
+// Validates the cursor at the target's KLFLOW mode transition. A logical
+// Applied frontier starts at one, so CONTINUE at one is valid after the control
+// handshake has proved the population; transport fragments are never reusable
+// Applied evidence.
+absl::Status ValidateNativeFlowModeCursor(bool fullsync, std::uint64_t next_lsn,
+                                          std::uint32_t fragment_index);
 
 // Publishes the next unapplied LSN of every native source flow.
 //
@@ -89,8 +108,9 @@ class ReplicaAppliedFrontier {
     std::uint64_t next_sequence_ = 0;
   };
 
-  static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
-                "replica Applied publication requires lock-free uint64 atomics");
+  static_assert(
+      std::atomic<std::uint64_t>::is_always_lock_free,
+      "replica Applied publication requires lock-free uint64 atomics");
   static constexpr unsigned kSnapshotAttempts = 64;
 
   absl::Status ValidateAdvance(unsigned flow_id,

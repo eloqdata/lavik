@@ -251,6 +251,13 @@ class AuthorityGuard {
   absl::Status RenewLease(const SessionIdentity& session,
                           const AuthorityAnchor& anchor, MonotonicTime deadline,
                           MonotonicTime now);
+  // Captures the guard generation only while the exact lease is still current
+  // and unexpired. NodeControl brackets a suspending local activation with this
+  // proof so a fence, session loss, or replacement grant cannot be mistaken for
+  // the lease that authorized the activation.
+  std::optional<std::uint64_t> ExactLeaseGeneration(
+      const SessionIdentity& session, const AuthorityAnchor& anchor,
+      MonotonicTime deadline, MonotonicTime now) const;
   // Removes only the exact lease instance named by its original deadline.
   // A renewal changes that deadline, so a stale timer cannot revoke the
   // replacement lease. Returns true exactly once for a due lease.

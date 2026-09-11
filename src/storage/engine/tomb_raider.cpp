@@ -115,8 +115,7 @@ absl::Status StorageEngine::Impl::ApplyTombRaiderConfig(
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "tomb raider is quiescing for replica reset");
   }
-  if (needs_authority &&
-      !expiration_authority_.load(std::memory_order_acquire)) {
+  if (needs_authority && CurrentExpirationAuthority() == nullptr) {
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "tomb raider is unavailable on this server");
   }
@@ -270,7 +269,7 @@ Task<absl::Status> StorageEngine::Impl::TombRaiderLoop(
         tomb_raider_config_.generation_.load(std::memory_order_acquire)) {
       break;
     }
-    absl::Status round = co_await RunTombRaider();
+    absl::Status round = co_await RunTombRaider(CurrentExpirationAuthority());
     if (!round.ok()) {
       spdlog::error("tomb raider round failed: {}", round.message());
       co_return round;
@@ -279,8 +278,9 @@ Task<absl::Status> StorageEngine::Impl::TombRaiderLoop(
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
-  if (TombRaiderShouldForfeit()) {
+Task<absl::Status> StorageEngine::Impl::RunTombRaider(
+    std::shared_ptr<ExpirationAuthorityGrant> authority) {
+  if (TombRaiderShouldForfeit(authority)) {
     co_return absl::OkStatus();
   }
   bool expected = false;
@@ -307,7 +307,7 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
   } round_guard{&tomb_raider_running_, &active_settlements_,
                 &tomb_raider_round_finished_, celer::ThisWorker().self_};
 
-  if (TombRaiderShouldForfeit()) {
+  if (TombRaiderShouldForfeit(authority)) {
     co_return absl::OkStatus();
   }
 
@@ -315,37 +315,37 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
   // record that still needs a candidate may sit in the last unswept block.
   for (unsigned target = 0; target < worker_count_; ++target) {
     absl::Status marked = co_await celer::SubmitTaskTo(
-        target, [this, target]() -> Task<absl::Status> {
-          co_return co_await TombMarkLocal(*stores_[target]);
+        target, [this, target, authority]() -> Task<absl::Status> {
+          co_return co_await TombMarkLocal(*stores_[target], authority);
         });
     if (!marked.ok()) {
       co_return marked;
     }
-    if (TombRaiderShouldForfeit()) {
+    if (TombRaiderShouldForfeit(authority)) {
       co_return absl::OkStatus();
     }
   }
   for (unsigned target = 0; target < worker_count_; ++target) {
     absl::Status swept = co_await celer::SubmitTaskTo(
-        target, [this, target]() -> Task<absl::Status> {
-          co_return co_await TombSweepLocal(*stores_[target]);
+        target, [this, target, authority]() -> Task<absl::Status> {
+          co_return co_await TombSweepLocal(*stores_[target], authority);
         });
     if (!swept.ok()) {
       co_return swept;
     }
-    if (TombRaiderShouldForfeit()) {
+    if (TombRaiderShouldForfeit(authority)) {
       co_return absl::OkStatus();
     }
   }
   for (unsigned target = 0; target < worker_count_; ++target) {
     absl::Status reaped = co_await celer::SubmitTaskTo(
-        target, [this, target]() -> Task<absl::Status> {
-          co_return co_await TombReapLocal(*stores_[target]);
+        target, [this, target, authority]() -> Task<absl::Status> {
+          co_return co_await TombReapLocal(*stores_[target], authority);
         });
     if (!reaped.ok()) {
       co_return reaped;
     }
-    if (TombRaiderShouldForfeit()) {
+    if (TombRaiderShouldForfeit(authority)) {
       co_return absl::OkStatus();
     }
   }
@@ -353,7 +353,8 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store) {
+Task<absl::Status> StorageEngine::Impl::TombMarkLocal(
+    WorkerStore& store, std::shared_ptr<ExpirationAuthorityGrant> authority) {
   std::size_t steps = 0;
   for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
@@ -363,7 +364,7 @@ Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store) {
       }
       std::uint64_t cursor = 0;
       do {
-        if (TombRaiderShouldForfeit()) {
+        if (TombRaiderShouldForfeit(authority)) {
           co_return absl::OkStatus();  // forfeit the round
         }
         cursor = index.Scan(cursor, [](RecordIndex::Entry& entry) {
@@ -383,10 +384,11 @@ Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store) {
 }
 
 Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
-    WorkerStore& store, std::vector<TombClaim> claims) {
+    WorkerStore& store, std::vector<TombClaim> claims,
+    std::shared_ptr<ExpirationAuthorityGrant> authority) {
   std::size_t handled = 0;
   for (const TombClaim& claim : claims) {
-    if (TombRaiderShouldForfeit()) {
+    if (TombRaiderShouldForfeit(authority)) {
       co_return absl::OkStatus();
     }
     auto& partition = PartitionForKey(store, claim.key_);
@@ -397,6 +399,9 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
         co_return resolved.status();
       }
       auto* entry = *resolved;
+      if (TombRaiderShouldForfeit(authority)) {
+        co_return absl::OkStatus();
+      }
       if (entry != nullptr && entry->value_.unclaimed() &&
           claim.mutation_sequence_ < entry->value_.mutation_sequence_) {
         entry->value_.set_unclaimed(false);
@@ -409,7 +414,8 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
+Task<absl::Status> StorageEngine::Impl::TombSweepLocal(
+    WorkerStore& store, std::shared_ptr<ExpirationAuthorityGrant> authority) {
   struct SweepBuffer {
     RegisteredBufferPool* pool_ = nullptr;
     std::uint16_t buffer_id_ = 0;
@@ -467,7 +473,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
 
   std::vector<std::vector<TombClaim>> pending(worker_count_);
   auto flush_claims = [&](unsigned owner) -> Task<absl::Status> {
-    if (TombRaiderShouldForfeit()) {
+    if (TombRaiderShouldForfeit(authority)) {
       pending[owner].clear();
       co_return absl::OkStatus();
     }
@@ -477,18 +483,19 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
       co_return absl::OkStatus();
     }
     if (owner == store.worker_->id()) {
-      co_return co_await TombClaimLocal(store, std::move(batch));
+      co_return co_await TombClaimLocal(store, std::move(batch), authority);
     }
     co_return co_await celer::SubmitTaskTo(
         owner,
-        [this, owner,
+        [this, owner, authority,
          batch = std::move(batch)]() mutable -> Task<absl::Status> {
-          co_return co_await TombClaimLocal(*stores_[owner], std::move(batch));
+          co_return co_await TombClaimLocal(*stores_[owner], std::move(batch),
+                                            authority);
         });
   };
 
   for (const BlockSnapshot& snapshot : blocks) {
-    if (TombRaiderShouldForfeit()) {
+    if (TombRaiderShouldForfeit(authority)) {
       co_return absl::OkStatus();  // forfeit the round
     }
     BlockState* state = FindBlockState(store, snapshot.block_id_);
@@ -617,7 +624,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
         }
       }
       if (++decoded % 256 == 0) {
-        if (TombRaiderShouldForfeit()) {
+        if (TombRaiderShouldForfeit(authority)) {
           co_return absl::OkStatus();
         }
         co_await celer::Yield(*store.worker_);
@@ -629,7 +636,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
         tomb_raider_config_.block_sleep_ms_.load(std::memory_order_relaxed);
     auto sleep_remaining = std::chrono::milliseconds(block_sleep_ms);
     while (sleep_remaining > std::chrono::milliseconds::zero()) {
-      if (TombRaiderShouldForfeit()) {
+      if (TombRaiderShouldForfeit(authority)) {
         co_return absl::OkStatus();
       }
       const auto sleep_chunk =
@@ -643,7 +650,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
     }
   }
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
-    if (TombRaiderShouldForfeit()) {
+    if (TombRaiderShouldForfeit(authority)) {
       co_return absl::OkStatus();
     }
     absl::Status flushed = co_await flush_claims(owner);
@@ -654,7 +661,8 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
+Task<absl::Status> StorageEngine::Impl::TombReapLocal(
+    WorkerStore& store, std::shared_ptr<ExpirationAuthorityGrant> authority) {
   struct Candidate {
     Digest digest_{};
     std::string key_;
@@ -674,7 +682,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
       }
       std::uint64_t cursor = 0;
       do {
-        if (TombRaiderShouldForfeit()) {
+        if (TombRaiderShouldForfeit(authority)) {
           co_return absl::OkStatus();
         }
         cursor = index.Scan(cursor, [&](RecordIndex::Entry& entry) {
@@ -712,7 +720,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
 
   std::uint64_t reaped = 0;
   for (Candidate& candidate : tombs) {
-    if (TombRaiderShouldForfeit()) {
+    if (TombRaiderShouldForfeit(authority)) {
       break;  // forfeit the rest; totals below still publish
     }
     if (candidate.key_.empty() && candidate.key_bytes_ != 0) [[unlikely]] {
@@ -739,6 +747,12 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
     if (entry == nullptr || entry->value_.kind() != RecordKind::kTombstone ||
         !entry->value_.unclaimed()) {
       continue;  // rewritten or claimed since collection
+    }
+    // AcquireKey, the store lock, and external-key verification may all
+    // suspend. Recheck the exact round token at the no-await erase cut so a
+    // late NodeControl timer cannot extend maintenance authority.
+    if (TombRaiderShouldForfeit(authority)) {
+      co_return absl::OkStatus();
     }
     const RecordLocation dropped = MaterializeIndexLocation(*entry);
     const ExtentManifest dropped_dependent_extents =

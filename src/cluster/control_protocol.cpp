@@ -27,12 +27,15 @@ constexpr std::size_t kFrameCrcOffset = 24;
 constexpr std::size_t kTransferChunkEnvelopeBytes = 16 + 8 + 4;
 constexpr std::size_t kMaxTransferChunkBytes =
     kMaxFramePayloadBytes - kTransferChunkEnvelopeBytes;
-constexpr std::size_t kMaxPromotionFlowCount = 1024;
-constexpr std::uint16_t kDirectiveBodySchemaVersion = 1;
+constexpr std::size_t kMaxTypedFlowCount = kMaxCandidateFlows;
+constexpr std::uint16_t kTypedDirectiveSchemaVersion = 1;
 constexpr std::string_view kRebuildRequestMagic = "KLRR";
 constexpr std::string_view kPromotionRequestMagic = "KLPR";
 constexpr std::string_view kPromotionPreconditionsMagic = "KLPC";
 constexpr std::string_view kPromotionEvidenceMagic = "KLPE";
+constexpr std::string_view kFrozenSourceRequestMagic = "KLFR";
+constexpr std::string_view kFrozenSourcePreconditionsMagic = "KLFC";
+constexpr std::string_view kFrozenSourceEvidenceMagic = "KLFE";
 
 // Protocol-v1 heartbeat role tags are exhaustive. Unknown tags fail closed so
 // adding a role requires an explicit codec update on both peers.
@@ -284,34 +287,42 @@ bool IsZeroHash(const WireHash256& hash) noexcept {
                      [](std::uint8_t byte) { return byte == 0; });
 }
 
+bool IsZeroId(const WireId128& id) noexcept {
+  return std::all_of(id.begin(), id.end(),
+                     [](std::uint8_t byte) { return byte == 0; });
+}
+
 absl::Status WriteSchemaHeader(Writer& writer, std::string_view magic) {
   if (magic.size() != 4) return ProtocolError("invalid schema magic");
   writer.Raw(magic);
-  writer.U16(kDirectiveBodySchemaVersion);
+  writer.U16(kTypedDirectiveSchemaVersion);
   return absl::OkStatus();
 }
 
 absl::Status ReadSchemaHeader(Reader& reader, std::string_view magic) {
   auto encoded_magic = reader.Raw(4);
   if (!encoded_magic.ok()) return encoded_magic.status();
-  if (*encoded_magic != magic)
-    return ProtocolError("unknown directive body schema");
+  if (*encoded_magic != magic) {
+    return ProtocolError("unknown typed directive schema");
+  }
   auto version = reader.U16();
   if (!version.ok()) return version.status();
-  if (*version != kDirectiveBodySchemaVersion) {
-    return ProtocolError("unknown directive body schema version");
+  if (*version != kTypedDirectiveSchemaVersion) {
+    return ProtocolError("unknown typed directive schema version");
   }
   return absl::OkStatus();
 }
 
 absl::Status WriteFlowVector(Writer& writer,
                              std::span<const std::uint64_t> cursors) {
-  if (cursors.empty() || cursors.size() > kMaxPromotionFlowCount) {
-    return ProtocolError("promotion flow vector has invalid cardinality");
+  if (cursors.empty() || cursors.size() > kMaxTypedFlowCount) {
+    return ProtocolError("typed flow vector has invalid cardinality");
   }
   writer.U32(static_cast<std::uint32_t>(cursors.size()));
   for (const std::uint64_t cursor : cursors) {
-    if (cursor == 0) return ProtocolError("promotion flow cursor must be nonzero");
+    if (cursor == 0) {
+      return ProtocolError("typed flow cursor must be nonzero");
+    }
     writer.U64(cursor);
   }
   return absl::OkStatus();
@@ -320,15 +331,17 @@ absl::Status WriteFlowVector(Writer& writer,
 absl::StatusOr<std::vector<std::uint64_t>> ReadFlowVector(Reader& reader) {
   auto count = reader.U32();
   if (!count.ok()) return count.status();
-  if (*count == 0 || *count > kMaxPromotionFlowCount) {
-    return ProtocolError("promotion flow vector has invalid cardinality");
+  if (*count == 0 || *count > kMaxTypedFlowCount) {
+    return ProtocolError("typed flow vector has invalid cardinality");
   }
   std::vector<std::uint64_t> cursors;
   cursors.reserve(*count);
   for (std::uint32_t i = 0; i < *count; ++i) {
     auto cursor = reader.U64();
     if (!cursor.ok()) return cursor.status();
-    if (*cursor == 0) return ProtocolError("promotion flow cursor must be nonzero");
+    if (*cursor == 0) {
+      return ProtocolError("typed flow cursor must be nonzero");
+    }
     cursors.push_back(*cursor);
   }
   return cursors;
@@ -522,6 +535,25 @@ absl::StatusOr<std::string> ReadIdentity(Reader& reader,
   return std::string(*raw);
 }
 
+absl::Status WriteFrozenSourceProofFields(
+    Writer& writer, const FrozenSourceEvidence& evidence) {
+  if (evidence.recovery_generation == 0) {
+    return ProtocolError("frozen source recovery generation must be nonzero");
+  }
+  if (absl::Status status =
+          WriteSchemaHeader(writer, kFrozenSourceEvidenceMagic);
+      !status.ok()) {
+    return status;
+  }
+  writer.U64(evidence.recovery_generation);
+  if (absl::Status status = WriteIdentity(writer, evidence.source_history_id,
+                                          "frozen source history id");
+      !status.ok()) {
+    return status;
+  }
+  return WriteFlowVector(writer, evidence.final_next_lsns);
+}
+
 void WriteProjectionBasis(Writer& writer, const WireProjectionBasis& basis) {
   writer.U64(basis.source_meta_applied_index);
   writer.Fixed(basis.projection_hash);
@@ -677,8 +709,8 @@ absl::StatusOr<std::string> EncodePromotionPrepareRequest(
       !status.ok()) {
     return status;
   }
-  if (absl::Status status = WriteIdentity(
-          writer, request.parent_history_id, "promotion parent history id");
+  if (absl::Status status = WriteIdentity(writer, request.parent_history_id,
+                                          "promotion parent history id");
       !status.ok()) {
     return status;
   }
@@ -752,8 +784,7 @@ DecodePromotionPreparePreconditions(std::string_view encoded) {
 
 absl::StatusOr<std::string> EncodePromotionPreparedEvidence(
     const PromotionPreparedEvidence& evidence) {
-  if (evidence.population_generation == 0 ||
-      evidence.catalog_generation == 0) {
+  if (evidence.population_generation == 0 || evidence.catalog_generation == 0) {
     return ProtocolError(
         "promotion population and catalog generations must be nonzero");
   }
@@ -766,8 +797,8 @@ absl::StatusOr<std::string> EncodePromotionPreparedEvidence(
       !status.ok()) {
     return status;
   }
-  if (absl::Status status = WriteIdentity(
-          writer, evidence.parent_history_id, "promotion parent history id");
+  if (absl::Status status = WriteIdentity(writer, evidence.parent_history_id,
+                                          "promotion parent history id");
       !status.ok()) {
     return status;
   }
@@ -780,8 +811,8 @@ absl::StatusOr<std::string> EncodePromotionPreparedEvidence(
   writer.U64(evidence.population_digest);
   writer.U64(evidence.catalog_generation);
   writer.U64(evidence.catalog_dump_crc64);
-  if (absl::Status status = WriteIdentity(
-          writer, evidence.child_history_id, "promotion child history id");
+  if (absl::Status status = WriteIdentity(writer, evidence.child_history_id,
+                                          "promotion child history id");
       !status.ok()) {
     return status;
   }
@@ -818,14 +849,156 @@ absl::StatusOr<PromotionPreparedEvidence> DecodePromotionPreparedEvidence(
   if (!child.ok()) return child.status();
   evidence.child_history_id = std::move(*child);
   if (absl::Status status = Finish(reader); !status.ok()) return status;
-  if (evidence.population_generation == 0 ||
-      evidence.catalog_generation == 0) {
+  if (evidence.population_generation == 0 || evidence.catalog_generation == 0) {
     return ProtocolError(
         "promotion population and catalog generations must be nonzero");
   }
   if (evidence.parent_history_id == evidence.child_history_id) {
     return ProtocolError(
         "promotion child history must differ from its parent history");
+  }
+  return evidence;
+}
+
+absl::StatusOr<std::string> EncodeFrozenSourceRequest(
+    const FrozenSourceRequest& request) {
+  if (request.recovery_generation == 0 || request.source_flow_count == 0 ||
+      request.source_flow_count > kMaxTypedFlowCount) {
+    return ProtocolError(
+        "frozen source generation and flow count must be valid");
+  }
+  Writer writer;
+  if (absl::Status status =
+          WriteSchemaHeader(writer, kFrozenSourceRequestMagic);
+      !status.ok()) {
+    return status;
+  }
+  writer.U64(request.recovery_generation);
+  writer.U32(request.source_flow_count);
+  return std::move(writer).Take();
+}
+
+absl::StatusOr<FrozenSourceRequest> DecodeFrozenSourceRequest(
+    std::string_view encoded) {
+  Reader reader(encoded);
+  if (absl::Status status = ReadSchemaHeader(reader, kFrozenSourceRequestMagic);
+      !status.ok()) {
+    return status;
+  }
+  auto generation = reader.U64();
+  if (!generation.ok()) return generation.status();
+  auto flow_count = reader.U32();
+  if (!flow_count.ok()) return flow_count.status();
+  if (absl::Status status = Finish(reader); !status.ok()) return status;
+  if (*generation == 0 || *flow_count == 0 ||
+      *flow_count > kMaxTypedFlowCount) {
+    return ProtocolError(
+        "frozen source generation and flow count must be valid");
+  }
+  return FrozenSourceRequest{.recovery_generation = *generation,
+                             .source_flow_count = *flow_count};
+}
+
+absl::StatusOr<std::string> EncodeFrozenSourcePreconditions(
+    const FrozenSourcePreconditions& preconditions) {
+  if (preconditions.excluded_group_term == 0 ||
+      preconditions.excluded_authority_version == 0 ||
+      preconditions.excluded_grant_revision == 0) {
+    return ProtocolError("frozen source authority preconditions are partial");
+  }
+  Writer writer;
+  if (absl::Status status =
+          WriteSchemaHeader(writer, kFrozenSourcePreconditionsMagic);
+      !status.ok()) {
+    return status;
+  }
+  writer.U64(preconditions.excluded_group_term);
+  writer.U64(preconditions.excluded_authority_version);
+  writer.U64(preconditions.excluded_grant_revision);
+  return std::move(writer).Take();
+}
+
+absl::StatusOr<FrozenSourcePreconditions> DecodeFrozenSourcePreconditions(
+    std::string_view encoded) {
+  Reader reader(encoded);
+  if (absl::Status status =
+          ReadSchemaHeader(reader, kFrozenSourcePreconditionsMagic);
+      !status.ok()) {
+    return status;
+  }
+  FrozenSourcePreconditions preconditions;
+  auto term = reader.U64();
+  if (!term.ok()) return term.status();
+  preconditions.excluded_group_term = *term;
+  auto version = reader.U64();
+  if (!version.ok()) return version.status();
+  preconditions.excluded_authority_version = *version;
+  auto revision = reader.U64();
+  if (!revision.ok()) return revision.status();
+  preconditions.excluded_grant_revision = *revision;
+  if (absl::Status status = Finish(reader); !status.ok()) return status;
+  if (preconditions.excluded_group_term == 0 ||
+      preconditions.excluded_authority_version == 0 ||
+      preconditions.excluded_grant_revision == 0) {
+    return ProtocolError("frozen source authority preconditions are partial");
+  }
+  return preconditions;
+}
+
+absl::StatusOr<WireHash256> ComputeFrozenSourceProofHash(
+    const FrozenSourceEvidence& evidence) {
+  Sha256WriterSink sink;
+  Writer writer(sink);
+  if (absl::Status status = WriteFrozenSourceProofFields(writer, evidence);
+      !status.ok()) {
+    return status;
+  }
+  return sink.Final();
+}
+
+absl::StatusOr<std::string> EncodeFrozenSourceEvidence(
+    const FrozenSourceEvidence& evidence) {
+  auto expected_proof = ComputeFrozenSourceProofHash(evidence);
+  if (!expected_proof.ok()) return expected_proof.status();
+  if (*expected_proof != evidence.proof_hash) {
+    return ProtocolError("frozen source proof hash does not match its fields");
+  }
+  Writer writer;
+  if (absl::Status status = WriteFrozenSourceProofFields(writer, evidence);
+      !status.ok()) {
+    return status;
+  }
+  writer.Fixed(evidence.proof_hash);
+  return std::move(writer).Take();
+}
+
+absl::StatusOr<FrozenSourceEvidence> DecodeFrozenSourceEvidence(
+    std::string_view encoded) {
+  Reader reader(encoded);
+  if (absl::Status status =
+          ReadSchemaHeader(reader, kFrozenSourceEvidenceMagic);
+      !status.ok()) {
+    return status;
+  }
+  FrozenSourceEvidence evidence;
+  auto generation = reader.U64();
+  if (!generation.ok()) return generation.status();
+  evidence.recovery_generation = *generation;
+  auto history = ReadIdentity(reader, "frozen source history id");
+  if (!history.ok()) return history.status();
+  evidence.source_history_id = std::move(*history);
+  auto cursors = ReadFlowVector(reader);
+  if (!cursors.ok()) return cursors.status();
+  evidence.final_next_lsns = std::move(*cursors);
+  auto proof = reader.Fixed<32>();
+  if (!proof.ok()) return proof.status();
+  evidence.proof_hash = *proof;
+  if (absl::Status status = Finish(reader); !status.ok()) return status;
+
+  auto expected_proof = ComputeFrozenSourceProofHash(evidence);
+  if (!expected_proof.ok()) return expected_proof.status();
+  if (*expected_proof != evidence.proof_hash) {
+    return ProtocolError("frozen source proof hash does not match its fields");
   }
   return evidence;
 }
@@ -1604,22 +1777,18 @@ absl::StatusOr<std::string> Encode(const Heartbeat& heartbeat) {
       !status.ok()) {
     return status;
   }
-  if (std::holds_alternative<NoRoleInformation>(
-          heartbeat.role_information)) {
+  if (std::holds_alternative<NoRoleInformation>(heartbeat.role_information)) {
     writer.U8(static_cast<std::uint8_t>(HeartbeatRoleKind::kNone));
-  } else if (const auto* authority =
-                 std::get_if<AuthorityLeaseRequest>(
-                     &heartbeat.role_information)) {
-    writer.U8(static_cast<std::uint8_t>(
-        HeartbeatRoleKind::kAuthorityLeaseRequest));
-    if (absl::Status status =
-            WriteLeaseChallenge(writer, authority->challenge);
+  } else if (const auto* authority = std::get_if<AuthorityLeaseRequest>(
+                 &heartbeat.role_information)) {
+    writer.U8(
+        static_cast<std::uint8_t>(HeartbeatRoleKind::kAuthorityLeaseRequest));
+    if (absl::Status status = WriteLeaseChallenge(writer, authority->challenge);
         !status.ok()) {
       return status;
     }
   } else {
-    writer.U8(
-        static_cast<std::uint8_t>(HeartbeatRoleKind::kReplicaCandidate));
+    writer.U8(static_cast<std::uint8_t>(HeartbeatRoleKind::kReplicaCandidate));
     const CandidateProgress& candidate =
         std::get<ReplicaCandidate>(heartbeat.role_information).progress;
     if (absl::Status status = writer.String(
@@ -1637,22 +1806,22 @@ absl::StatusOr<std::string> Encode(const Heartbeat& heartbeat) {
         !IsCanonicalIdentity160(candidate.source_history_id)) {
       return ProtocolError("candidate source lineage is not canonical");
     }
-    if (absl::Status status = writer.String(
-            candidate.source_node_id, kMaxIdentifierBytes,
-            "candidate source node id");
+    if (absl::Status status =
+            writer.String(candidate.source_node_id, kMaxIdentifierBytes,
+                          "candidate source node id");
         !status.ok()) {
       return status;
     }
     writer.Fixed(candidate.source_assignment_id);
-    if (absl::Status status = writer.String(
-            candidate.source_boot_id, kMaxIdentifierBytes,
-            "candidate source boot id");
+    if (absl::Status status =
+            writer.String(candidate.source_boot_id, kMaxIdentifierBytes,
+                          "candidate source boot id");
         !status.ok()) {
       return status;
     }
-    if (absl::Status status = writer.String(
-            candidate.source_history_id, kMaxIdentifierBytes,
-            "candidate source history id");
+    if (absl::Status status =
+            writer.String(candidate.source_history_id, kMaxIdentifierBytes,
+                          "candidate source history id");
         !status.ok()) {
       return status;
     }
@@ -1661,8 +1830,7 @@ absl::StatusOr<std::string> Encode(const Heartbeat& heartbeat) {
       return ResourceLimit(
           "candidate flow vector count is outside its protocol cap");
     }
-    writer.U16(
-        static_cast<std::uint16_t>(candidate.applied_next_lsns.size()));
+    writer.U16(static_cast<std::uint16_t>(candidate.applied_next_lsns.size()));
     for (std::uint64_t next_lsn : candidate.applied_next_lsns) {
       if (next_lsn == 0) {
         return ProtocolError("candidate next LSN must be nonzero");
@@ -1699,14 +1867,14 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
   heartbeat.health.summary = std::move(*summary);
   auto role_kind = reader.U8();
   if (!role_kind.ok()) return role_kind.status();
-  if (*role_kind == static_cast<std::uint8_t>(
-                        HeartbeatRoleKind::kAuthorityLeaseRequest)) {
+  if (*role_kind ==
+      static_cast<std::uint8_t>(HeartbeatRoleKind::kAuthorityLeaseRequest)) {
     auto challenge = ReadLeaseChallenge(reader);
     if (!challenge.ok()) return challenge.status();
     heartbeat.role_information =
         AuthorityLeaseRequest{.challenge = std::move(*challenge)};
-  } else if (*role_kind == static_cast<std::uint8_t>(
-                               HeartbeatRoleKind::kReplicaCandidate)) {
+  } else if (*role_kind ==
+             static_cast<std::uint8_t>(HeartbeatRoleKind::kReplicaCandidate)) {
     CandidateProgress candidate;
     auto group_id = reader.String(kMaxIdentifierBytes);
     if (!group_id.ok()) return group_id.status();
@@ -2148,8 +2316,7 @@ absl::StatusOr<WireMessage> DecodeDirective(std::string_view bytes) {
   auto kind = reader.U8();
   if (!kind.ok()) return kind.status();
   if (*kind < 1 ||
-      *kind >
-          static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
+      *kind > static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
     return ProtocolError("unknown directive kind");
   }
   directive.kind = static_cast<WireDirectiveKind>(*kind);
@@ -2534,6 +2701,83 @@ absl::StatusOr<WireDesiredMember> ReadDesiredMember(Reader& reader) {
   return member;
 }
 
+absl::Status ValidateSourceHistoryHold(const WireSourceHistoryHold& hold) {
+  if (hold.generation == 0) {
+    return ProtocolError("source history hold generation must be nonzero");
+  }
+  if (IsZeroId(hold.source_assignment_id)) {
+    return ProtocolError("source history hold assignment id must be nonzero");
+  }
+  if (absl::Status status =
+          ValidateIdentity(hold.source_boot_id, "source history hold boot id");
+      !status.ok()) {
+    return status;
+  }
+  if (absl::Status status =
+          ValidateIdentity(hold.source_replication_history_id,
+                           "source history hold replication history id");
+      !status.ok()) {
+    return status;
+  }
+  if (hold.manifest_revision == 0 || IsZeroHash(hold.manifest_digest)) {
+    return ProtocolError("source history hold manifest anchor must be nonzero");
+  }
+  if (hold.partition_replication_epoch == 0) {
+    return ProtocolError(
+        "source history hold partition replication epoch must be nonzero");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status WriteSourceHistoryHold(Writer& writer,
+                                    const WireSourceHistoryHold& hold) {
+  if (absl::Status status = ValidateSourceHistoryHold(hold); !status.ok()) {
+    return status;
+  }
+  writer.U64(hold.generation);
+  writer.Fixed(hold.source_assignment_id);
+  // Validation above lets these fixed-width identities be emitted without
+  // adding redundant length prefixes to the v1 group layout.
+  writer.Raw(hold.source_boot_id);
+  writer.Raw(hold.source_replication_history_id);
+  writer.U64(hold.manifest_revision);
+  writer.Fixed(hold.manifest_digest);
+  writer.U64(hold.partition_replication_epoch);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<WireSourceHistoryHold> ReadSourceHistoryHold(Reader& reader) {
+  WireSourceHistoryHold hold;
+  auto generation = reader.U64();
+  if (!generation.ok()) return generation.status();
+  hold.generation = *generation;
+  auto source_assignment_id = reader.Fixed<16>();
+  if (!source_assignment_id.ok()) return source_assignment_id.status();
+  hold.source_assignment_id = *source_assignment_id;
+  auto source_boot_id = ReadIdentity(reader, "source history hold boot id");
+  if (!source_boot_id.ok()) return source_boot_id.status();
+  hold.source_boot_id = std::move(*source_boot_id);
+  auto source_history_id =
+      ReadIdentity(reader, "source history hold replication history id");
+  if (!source_history_id.ok()) return source_history_id.status();
+  hold.source_replication_history_id = std::move(*source_history_id);
+  auto manifest_revision = reader.U64();
+  if (!manifest_revision.ok()) return manifest_revision.status();
+  hold.manifest_revision = *manifest_revision;
+  auto manifest_digest = reader.Fixed<32>();
+  if (!manifest_digest.ok()) return manifest_digest.status();
+  hold.manifest_digest = *manifest_digest;
+  auto partition_replication_epoch = reader.U64();
+  if (!partition_replication_epoch.ok()) {
+    return partition_replication_epoch.status();
+  }
+  hold.partition_replication_epoch = *partition_replication_epoch;
+  if (absl::Status status = ValidateSourceHistoryHold(hold); !status.ok()) {
+    return status;
+  }
+  return hold;
+}
+
 absl::Status WriteDesiredGroup(Writer& writer, const WireDesiredGroup& group) {
   if (absl::Status status =
           writer.String(group.group_id, kMaxIdentifierBytes, "group id");
@@ -2589,6 +2833,14 @@ absl::Status WriteDesiredGroup(Writer& writer, const WireDesiredGroup& group) {
   writer.U64(group.manifest_revision);
   writer.Fixed(group.manifest_digest);
   writer.U64(group.partition_replication_epoch);
+  writer.Bool(group.source_history_hold.has_value());
+  if (group.source_history_hold.has_value()) {
+    if (absl::Status status =
+            WriteSourceHistoryHold(writer, *group.source_history_hold);
+        !status.ok()) {
+      return status;
+    }
+  }
   if (absl::Status status = writer.String(
           group.grant_policy_id, kMaxIdentifierBytes, "grant policy id");
       !status.ok()) {
@@ -2667,6 +2919,13 @@ absl::StatusOr<WireDesiredGroup> ReadDesiredGroup(Reader& reader) {
     return partition_replication_epoch.status();
   }
   group.partition_replication_epoch = *partition_replication_epoch;
+  auto has_source_history_hold = reader.Bool();
+  if (!has_source_history_hold.ok()) return has_source_history_hold.status();
+  if (*has_source_history_hold) {
+    auto source_history_hold = ReadSourceHistoryHold(reader);
+    if (!source_history_hold.ok()) return source_history_hold.status();
+    group.source_history_hold = std::move(*source_history_hold);
+  }
   auto policy_id = reader.String(kMaxIdentifierBytes);
   if (!policy_id.ok()) return policy_id.status();
   group.grant_policy_id = std::move(*policy_id);
@@ -2889,8 +3148,7 @@ absl::StatusOr<WireProjectedDirective> ReadProjectedDirective(Reader& reader) {
   auto kind = reader.U8();
   if (!kind.ok()) return kind.status();
   if (*kind < 1 ||
-      *kind >
-          static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
+      *kind > static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
     return ProtocolError("unknown directive kind");
   }
   directive.kind = static_cast<WireDirectiveKind>(*kind);
@@ -2953,12 +3211,12 @@ bool CanonicalProjectedDirectiveLess(
     const WireProjectedDirective& right) noexcept {
 #define KEYLANE_COMPARE_DIRECTIVE(call) \
   if (const int order = (call); order != 0) return order < 0
-  KEYLANE_COMPARE_DIRECTIVE(CompareEncodedString(left.authority.group_id,
-                                                 right.authority.group_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareEncodedString(left.authority.group_id, right.authority.group_id));
   KEYLANE_COMPARE_DIRECTIVE(CompareFixed(left.authority.assignment_id,
                                          right.authority.assignment_id));
-  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.group_term,
-                                          right.authority.group_term));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareScalar(left.authority.group_term, right.authority.group_term));
   KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.authority_version,
                                           right.authority.authority_version));
   KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.grant_revision,
@@ -2981,23 +3239,22 @@ bool CanonicalProjectedDirectiveLess(
       CompareRawBytes(left.target_boot_id, right.target_boot_id));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareRawBytes(left.source_node_id, right.source_node_id));
-  KEYLANE_COMPARE_DIRECTIVE(CompareFixed(left.source_assignment_id,
-                                         right.source_assignment_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareFixed(left.source_assignment_id, right.source_assignment_id));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareRawBytes(left.source_boot_id, right.source_boot_id));
   KEYLANE_COMPARE_DIRECTIVE(CompareRawBytes(
-      left.source_replication_history_id,
-      right.source_replication_history_id));
+      left.source_replication_history_id, right.source_replication_history_id));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareScalar(left.manifest_revision, right.manifest_revision));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareFixed(left.manifest_digest, right.manifest_digest));
   KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.partition_replication_epoch,
                                           right.partition_replication_epoch));
-  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(static_cast<std::uint8_t>(left.kind),
-                                          static_cast<std::uint8_t>(right.kind)));
   KEYLANE_COMPARE_DIRECTIVE(
-      CompareEncodedString(left.payload, right.payload));
+      CompareScalar(static_cast<std::uint8_t>(left.kind),
+                    static_cast<std::uint8_t>(right.kind)));
+  KEYLANE_COMPARE_DIRECTIVE(CompareEncodedString(left.payload, right.payload));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareEncodedString(left.preconditions, right.preconditions));
   KEYLANE_COMPARE_DIRECTIVE(
@@ -3069,12 +3326,12 @@ absl::StatusOr<WireHash256> ComputeDirectiveSetDigest(
 
 namespace {
 
-absl::Status WriteFullDesiredStateBody(
-    Writer& writer, const FullDesiredState& state,
-    std::uint64_t source_meta_applied_index,
-    const WireHash256& projection_hash,
-    const WireHash256& directive_set_digest,
-    bool normalize_directive_basis) {
+absl::Status WriteFullDesiredStateBody(Writer& writer,
+                                       const FullDesiredState& state,
+                                       std::uint64_t source_meta_applied_index,
+                                       const WireHash256& projection_hash,
+                                       const WireHash256& directive_set_digest,
+                                       bool normalize_directive_basis) {
   writer.U16(kProtocolVersion);
   writer.U64(source_meta_applied_index);
   writer.U64(state.topology_epoch);
@@ -3215,8 +3472,8 @@ absl::StatusOr<std::string> EncodeFullDesiredState(
 
   Writer writer;
   if (absl::Status status = WriteFullDesiredStateBody(
-          writer, state, state.source_meta_applied_index,
-          state.projection_hash, state.directive_set_digest, false);
+          writer, state, state.source_meta_applied_index, state.projection_hash,
+          state.directive_set_digest, false);
       !status.ok()) {
     return status;
   }
@@ -3332,8 +3589,7 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
   return state;
 }
 
-absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
-    std::string&& encoded) {
+absl::StatusOr<FullDesiredState> DecodeFullDesiredState(std::string&& encoded) {
   auto decoded = DecodeFullDesiredState(std::string_view(encoded));
   // A transferred FDS is already duplicated by its decoded owning strings.
   // Release the contiguous wire allocation before returning it to callers so
@@ -3345,8 +3601,7 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
 
 absl::StatusOr<WireHash256> ComputeProjectionHash(
     const FullDesiredState& state) {
-  auto directive_digest =
-      ComputeDirectiveSetDigest(state.current_directives);
+  auto directive_digest = ComputeDirectiveSetDigest(state.current_directives);
   if (!directive_digest.ok()) return directive_digest.status();
   return ComputeProjectionHashImpl(state, *directive_digest);
 }

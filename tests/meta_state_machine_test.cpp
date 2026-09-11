@@ -38,8 +38,12 @@
 #include "gtest/gtest.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/encoding.h"
+#include "keylane/meta/failover.h"
+#include "keylane/meta/hash.h"
 #include "keylane/meta/nuraft_log_store.h"
 #include "keylane/meta/nuraft_state_mgr.h"
+#include "keylane/meta/policy_store.h"
+#include "keylane/meta/population_manifest_store.h"
 #include "keylane/meta/state_apply.h"
 #include "keylane/meta/state_machine.h"
 #include "libnuraft/nuraft.hxx"
@@ -381,6 +385,212 @@ TEST_F(MetaStateMachineTest, SnapshotIsDurableAcrossRestart) {
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 1u);
   EXPECT_EQ(stores.audit_.size(), 3u);
   EXPECT_TRUE(stores.audit_.VerifyChain());
+}
+
+TEST_F(MetaStateMachineTest,
+       FailoverRecoveryRecordAndClearTombstoneSurviveSnapshots) {
+  const std::string source = MakeNodeId(0x31);
+  const std::string candidate = MakeNodeId(0x42);
+  keylane::meta::MetaAssignmentId source_assignment{};
+  source_assignment.fill(0x51);
+  keylane::meta::MetaAssignmentId candidate_assignment{};
+  candidate_assignment.fill(0x52);
+  keylane::meta::MetaHash256 manifest_digest{};
+
+  {
+    auto opened = Open();
+    ASSERT_TRUE(opened.ok()) << opened.status();
+    std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
+    Commit(*machine, 1, MakeRegister(0x31));
+    Commit(*machine, 2, MakeRegister(0x42));
+    Commit(*machine, 3, MakeCreateGroup("g-recovery", 1));
+
+    keylane::meta::AssignNodeToGroup assign_source;
+    assign_source.group_id_ = "g-recovery";
+    assign_source.node_id_ = source;
+    assign_source.assignment_id_ = source_assignment;
+    assign_source.role_ = keylane::meta::MetaNodeRole::kPrimary;
+    assign_source.expected_revision_ = 1;
+    assign_source.new_topology_epoch_ = 2;
+    Commit(*machine, 4, assign_source);
+    keylane::meta::AssignNodeToGroup assign_candidate;
+    assign_candidate.group_id_ = "g-recovery";
+    assign_candidate.node_id_ = candidate;
+    assign_candidate.assignment_id_ = candidate_assignment;
+    assign_candidate.role_ = keylane::meta::MetaNodeRole::kReplica;
+    assign_candidate.expected_revision_ = 2;
+    assign_candidate.new_topology_epoch_ = 3;
+    Commit(*machine, 5, assign_candidate);
+
+    keylane::meta::PutPolicy policy;
+    policy.policy_id_ = "lease";
+    policy.version_ = 1;
+    policy.content_ = "lease-v1";
+    policy.content_hash_ =
+        keylane::meta::MetaPolicyStore::ContentHash(policy.content_);
+    Commit(*machine, 6, policy);
+    keylane::meta::BeginGroupTerm begin;
+    begin.group_id_ = "g-recovery";
+    begin.expected_term_ = 0;
+    begin.new_term_ = 1;
+    Commit(*machine, 7, begin);
+    keylane::meta::ActivateAuthority activate;
+    activate.group_id_ = "g-recovery";
+    activate.expected_term_ = 1;
+    activate.new_owner_ = source;
+    activate.grant_.lease_duration_ms_ = 5000;
+    activate.grant_.policy_id_ = "lease";
+    activate.grant_.policy_version_ = 1;
+    activate.new_authority_version_ = 1;
+    activate.new_topology_epoch_ = 4;
+    activate.new_config_epoch_ = 1;
+    Commit(*machine, 8, activate);
+
+    keylane::meta::PutPopulationManifest manifest;
+    manifest.entries_ = {{1, 10}, {2, 20}};
+    manifest.manifest_digest_ =
+        keylane::meta::MetaPopulationManifestStore::CanonicalDigest(
+            manifest.entries_);
+    manifest_digest = manifest.manifest_digest_;
+    Commit(*machine, 9, manifest);
+    keylane::meta::SetGroupReplicationState population;
+    population.group_id_ = "g-recovery";
+    population.new_population_manifest_revision_ = 1;
+    population.new_population_manifest_digest_ = manifest_digest;
+    population.new_partition_replication_epoch_ = 1;
+    population.new_topology_epoch_ = 5;
+    Commit(*machine, 10, population);
+
+    keylane::meta::MetaBootIncarnation source_boot{};
+    source_boot.fill(0x61);
+    keylane::meta::MetaBootIncarnation candidate_boot{};
+    candidate_boot.fill(0x63);
+    keylane::meta::MetaReplicationHistoryId source_history{};
+    source_history.fill(0x62);
+    keylane::meta::FailoverIntent intent{
+        .group_id_ = "g-recovery",
+        .recovery_generation_ = 1,
+        .attempt_timeout_ms_ = 120'000,
+        .former_owner_node_id_ = source,
+        .former_owner_assignment_id_ = source_assignment,
+        .former_owner_boot_id_ = source_boot,
+        .candidate_node_id_ = candidate,
+        .candidate_assignment_id_ = candidate_assignment,
+        .candidate_boot_id_ = candidate_boot,
+        .group_term_ = 2,
+        .authority_version_ = 1,
+        .grant_revision_ = 8,
+        .old_grant_ = activate.grant_,
+        .population_manifest_revision_ = 1,
+        .population_manifest_digest_ = manifest_digest,
+        .partition_replication_epoch_ = 1,
+        .parent_history_id_ = source_history,
+        .flow_count_ = 2,
+    };
+    auto encoded_intent = keylane::meta::EncodeFailoverIntent(intent);
+    ASSERT_TRUE(encoded_intent.ok()) << encoded_intent.status();
+    keylane::meta::SubmitOperation submit;
+    submit.operation_id_.fill(0x64);
+    submit.kind_ = std::string(keylane::meta::kFailoverOperationKind);
+    submit.intent_ = *encoded_intent;
+    submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
+    submit.replication_history_id_ = source_history;
+    submit.policy_references_ = {{"lease", 1}};
+    Commit(*machine, 11, submit);
+
+    keylane::meta::SetFailoverRecovery recovery;
+    recovery.group_id_ = "g-recovery";
+    recovery.recovery_generation_ = 1;
+    recovery.old_source_node_id_ = source;
+    recovery.old_source_assignment_id_ = source_assignment;
+    recovery.old_source_boot_incarnation_ = source_boot;
+    recovery.old_source_history_id_ = source_history;
+    recovery.excluded_authority_term_ = 1;
+    recovery.excluded_authority_version_ = 1;
+    recovery.excluded_grant_revision_ = 8;
+    recovery.population_manifest_revision_ = 1;
+    recovery.population_manifest_digest_ = manifest_digest;
+    recovery.partition_replication_epoch_ = 1;
+    recovery.hold_required_ = true;
+    Commit(*machine, 12, recovery);
+
+    keylane::meta::FailoverPhase phase{
+        .stage_ = keylane::meta::FailoverPhaseStage::kSourceHolding};
+    auto encoded_phase = keylane::meta::EncodeFailoverPhase(phase);
+    ASSERT_TRUE(encoded_phase.ok()) << encoded_phase.status();
+    keylane::meta::TransitionOperationPhase transition;
+    transition.operation_id_ = submit.operation_id_;
+    transition.kind_phase_blob_ = *encoded_phase;
+    Commit(*machine, 13, transition);
+
+    keylane::meta::ControlledFailoverOutcome outcome{
+        .succeeded_ = false,
+        .terminal_stage_ = keylane::meta::FailoverPhaseStage::kSourceHolding,
+        .loss_ = keylane::meta::FailoverLossClassification::kExact,
+        .recovery_required_ = false,
+        .reason_ = "candidate failed before the authority cut",
+    };
+    auto encoded_outcome =
+        keylane::meta::EncodeControlledFailoverOutcome(outcome);
+    ASSERT_TRUE(encoded_outcome.ok()) << encoded_outcome.status();
+    keylane::meta::AbortOperation abort;
+    abort.operation_id_ = submit.operation_id_;
+    abort.expected_revision_ = 1;
+    abort.reason_ = *encoded_outcome;
+    Commit(*machine, 14, abort);
+    ASSERT_TRUE(machine->StoresSnapshot()
+                    .failover_recovery_.Find("g-recovery")
+                    .has_value());
+    CreateSnapshot(*machine, /*log_idx=*/14, /*log_term=*/2);
+  }
+
+  {
+    auto reopened = Open();
+    ASSERT_TRUE(reopened.ok()) << reopened.status();
+    std::unique_ptr<MetaStateMachine> machine = std::move(*reopened);
+    const auto recovered =
+        machine->StoresSnapshot().failover_recovery_.Find("g-recovery");
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ(recovered->revision_, 12U);
+    EXPECT_EQ(recovered->population_manifest_digest_, manifest_digest);
+
+    keylane::meta::SetFailoverRecovery release;
+    release.group_id_ = recovered->group_id_;
+    release.expected_revision_ = recovered->revision_;
+    release.recovery_generation_ = recovered->recovery_generation_;
+    release.old_source_node_id_ = recovered->old_source_node_id_;
+    release.old_source_assignment_id_ = recovered->old_source_assignment_id_;
+    release.old_source_boot_incarnation_ =
+        recovered->old_source_boot_incarnation_;
+    release.old_source_history_id_ = recovered->old_source_history_id_;
+    release.excluded_authority_term_ = recovered->excluded_authority_term_;
+    release.excluded_authority_version_ =
+        recovered->excluded_authority_version_;
+    release.excluded_grant_revision_ = recovered->excluded_grant_revision_;
+    release.population_manifest_revision_ =
+        recovered->population_manifest_revision_;
+    release.population_manifest_digest_ =
+        recovered->population_manifest_digest_;
+    release.partition_replication_epoch_ =
+        recovered->partition_replication_epoch_;
+    release.proof_state_ = recovered->proof_state_;
+    release.frozen_proof_ = recovered->frozen_proof_;
+    Commit(*machine, 15, release);
+
+    keylane::meta::ClearFailoverRecovery clear;
+    clear.group_id_ = "g-recovery";
+    clear.expected_revision_ = 15;
+    clear.recovery_generation_ = 1;
+    Commit(*machine, 16, clear);
+    CreateSnapshot(*machine, /*log_idx=*/16, /*log_term=*/3);
+  }
+
+  auto reopened = Open();
+  ASSERT_TRUE(reopened.ok()) << reopened.status();
+  const MetaStores restored = (*reopened)->StoresSnapshot();
+  EXPECT_FALSE(restored.failover_recovery_.Find("g-recovery").has_value());
+  EXPECT_EQ(restored.failover_recovery_.LastGeneration("g-recovery"), 1U);
+  EXPECT_EQ(restored.failover_recovery_.LastRevision("g-recovery"), 16U);
 }
 
 TEST_F(MetaStateMachineTest, SnapshotExactCutPoint) {

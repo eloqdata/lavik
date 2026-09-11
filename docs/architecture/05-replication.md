@@ -13,9 +13,9 @@ backlog, full-sync capture state, target rebuild state, and durable state.
 In cluster mode that deep group also owns one boot-scoped population identity
 and readiness proof. Its callable cluster adapter binds the proof to the native
 reset, transfer, cut, promotion, and abort path. The Data-side node controller
-is the only caller for Meta-delivered rebuild, promotion-prepare,
-source-authorization, and revocation directives; transport code cannot bypass
-the replication adapter.
+is the only caller for Meta-delivered rebuild, source-history hold,
+promotion-prepare/activation, frozen or ordinary source authorization, and
+revocation; transport code cannot bypass the replication adapter.
 
 Replication moves deterministic logical commands, snapshot records, and the
 process-global Redis Function catalog, not physical block addresses or record
@@ -28,11 +28,15 @@ commands re-enter those paths with client role checks bypassed and publication
 disabled.
 
 The source backlog is deliberately not durable. It is process-local memory
-used for connected downstreams and bounded reconnects. Target records,
-Function catalog, full-sync invalidation, population eligibility, and
-promotion base are durable, but native flow cursors and Redis replid/offset
-state are process-local. Every process boot creates a new boot ID, history ID,
-and replica incarnation; a restart therefore requires whole-group full sync.
+used for connected downstreams, bounded reconnects, and a Meta-projected
+source-history hold during failover. The hold only suppresses idle history
+rotation and disable; it neither authorizes export nor restores serving
+authority. Target records, Function catalog, full-sync invalidation,
+population eligibility, and promotion base are durable, but the backlog,
+native flow cursors, held frontier, and Redis replid/offset state are
+process-local. Every process boot creates a new boot ID, history ID, and
+replica incarnation; a restart therefore invalidates the hold and requires
+whole-group full sync or a conservative Meta recovery decision.
 
 ## Runtime ownership
 
@@ -187,6 +191,14 @@ It joins upstream apply, freezes the current frontier, runs the shared durable
 prepare kernel, and returns population/catalog tokens plus the child history.
 Exact replay shares the original completion and evidence; a different
 directive/attempt cannot reuse its boot-local context.
+`ActivateClusterPreparedPromotion()` is the narrow second half. It receives
+the current FDS and finite-lease identity from `NodeControlInstaller`, requires
+the immediate successor authority and the exact retained prepare context,
+revalidates the Ready population, durability tokens, and child history, and
+then calls the same private activation kernel used by `REPLICAOF NO ONE`.
+There is no activation wire directive: a lease for an already-ready ordinary
+primary is an idempotent no-op, while any mismatch leaves a prepared replica
+LOADING and fenced.
 FDS reconciliation retains an in-progress attempt only while a current rebuild
 directive still names the same local assignment, term, manifest, and partition
 replication epoch. Removing
@@ -212,13 +224,44 @@ surfaces needed to observe the process remain available, but recovered keyspace
 is not made readable or writable merely because storage initialization
 succeeded.
 
+Source history retention uses a separate FDS-owned desired value bound to the
+exact group, source assignment/boot/history, manifest, partition epoch, and
+monotonic recovery generation. FDS may retain or release an armed hold but
+cannot arm one; only a matching successful ordinary source authorization may
+do that. Revoking source authorizations, fencing, lease expiry, or replacing a
+control session still closes and joins export capabilities, while the armed
+hold continues to keep the shared history available for another authorized
+candidate. Removing the desired hold, losing the population, shutdown, or a
+process restart releases it.
+
+After the old authority is fenced, a typed frozen-source mode reuses the
+ordinary authorize-source directive, receipt, evidence, ledger, and native
+export path. `FreezeAndAuthorizeClusterRebuildSource()` requires the exact
+armed hold, captures one immutable `NativeReplicationWatermark` across every
+worker log, and caches that frontier for exact replay in the recovery
+generation. Candidate identity is deliberately outside that cached cut, so a
+later independently authorized candidate can reuse the source-wide history.
+For the active controlled attempt, Meta keeps the exact frozen-source
+directive projected until the selected candidate has durably reported every
+flow at the frozen frontier. A full-state replacement may revoke and join the
+live export, but replay of that same directive revision reauthorizes the stable
+export scope; the hold by itself never grants reads.
+The retained bytes are still boot-local: Meta marks an unreachable or
+restarted old source unavailable instead of assuming that history remains
+readable. The already captured frontier and proof remain immutable historical
+evidence; a candidate that reached that frontier can still prove an exact
+outcome, while a lagging candidate requires an explicit lower recovery basis.
+
 Promotion prepare is intentionally not Cluster activation. After successful
 prepare the role remains `syncing`, storage remains LOADING, expiration
 authority remains disabled, and native/Redis source export remains closed.
-There is no Cluster activation method or activation wire directive in this
-version. The later authority workflow must first commit `ActivateAuthority`,
-install its new FDS, and obtain a current-session lease before it can connect
-that committed authority to the private local activation half.
+Only a later committed `ActivateAuthority`, its installed FDS, and a
+current-session finite lease can consume the retained context and open the
+write gate. The lease transition is provisional until local activation
+succeeds; after that suspending step, NodeControl revalidates the exact lease
+and only then installs a separate expiration token carrying the same absolute
+`CLOCK_BOOTTIME` deadline. Rejection or proof loss removes the provisional
+lease without ever opening expiration.
 
 ## Single-group population coordination contract
 
@@ -336,6 +379,22 @@ safe-source assertion alone does not promote an `Online` follower or permit
 unsupported native cascading. Cluster-primary activation and upstream
 detachment are outside this adapter; without that role transition, source
 authorization remains fail-closed.
+
+The native data-session continuity check is deliberately narrower than this
+complete control authorization. `RebuildIdentity::ExportScope()` contains the
+group; source and target node, assignment, and boot; source history; manifest;
+partition epoch; and flow count. It omits term, authority, operation,
+directive, attempt, and revision identities. Every new control authorization
+still validates and versions the full identity, but an already continuous
+source-to-target stream need not be torn down merely because Meta moved that
+unchanged data relationship into a successor authority or recovery attempt.
+The source uses this stable export scope, rather than the complete directive
+identity, to decide whether a reconnect may select `CONTINUE`; the complete
+identity remains mandatory for opening or replacing the export capability.
+When a full-state replacement retires the local source owner, NodeControl also
+advances the source directive rejection floor from that retired control
+identity before reconnect dispatch resumes. An old same-boot session therefore
+cannot reconstruct an export after its FDS owner disappeared.
 
 ## Native control and data flow
 
@@ -613,6 +672,16 @@ publish the old logical population. Physical maintenance such as defrag and
 transaction cleanup may continue; epoch, index-generation, and record-location
 revalidation prevents that stale work from publishing into the replacement.
 
+Meta-managed expiration has an additional exact-time boundary independent of
+that drain. Each finite lease installs a fresh revocable storage token with its
+absolute `CLOCK_BOOTTIME` deadline. Active expiration captures the exact token
+when it queues a candidate and validates it both at the durable append
+linearization cut and at the disk-full in-memory delete cut. Tomb Raider keeps
+the exact round token and checks it before each index-mutation batch and again
+after suspending lookup work at the final erase cut. Renewing or revoking a
+lease invalidates the old token, so a late worker timer or a quick regrant
+cannot let queued maintenance from the prior authority mutate the population.
+
 After that boundary, the native flows collectively call
 `ResetReplicaPartitions` for all 16,384 physical partitions, including empty
 ones. Each bounded reset batch persists new candidate replication epochs and
@@ -862,7 +931,7 @@ reattachment.
 | Setting or command | Current scope and behavior |
 |---|---|
 | `cluster-enabled` / `--cluster-enabled` | One-node-one-group, fail-closed startup; incompatible with startup `replicaof`, `redis-replicaof`, and `load-rdb`; the public manager also ignores a standalone initial upstream supplied by a direct embedder |
-| Cluster control adapter | Node-controller-only source rebuild and source-less first-population admission/completion handles, population status, and source authorize/revoke APIs; Meta transport remains outside `ReplicationManager` |
+| Cluster control adapter | Node-controller-only source rebuild and source-less first-population admission/completion handles, population status, source hold/frozen-source/authorize/revoke APIs, and prepared-promotion activation; Meta transport remains outside `ReplicationManager` |
 | `replicaof host port` / `REPLICAOF` | Standalone Redis-style config or runtime role change with native-first discovery; rejected in cluster-managed mode |
 | `redis-replicaof host port` / `--redis-replicaof` | Explicit standalone startup Redis PSYNC source; rejected in cluster-managed mode |
 | `ADDREPLICAOF host port` | Standalone runtime addition of a disjoint master from the active Redis Cluster; rejected in cluster-managed mode |
@@ -898,6 +967,14 @@ connection metrics.
   during one boot. Safe-source authority and readiness evidence are bound to
   the complete rebuild directive and target boot. A cluster source accepts
   only an exact authorized population handshake from its named target.
+- A failover source hold retains one shared, boot-local history rather than a
+  candidate-specific backlog. It can be armed only by exact source
+  authorization, does not survive restart, and never substitutes for a source
+  capability or finite serving lease. Frozen evidence is an all-flow vector;
+  a scalar offset or liveness signal cannot prove the same cut.
+- Prepared Cluster activation is not a second promotion implementation. It
+  consumes the exact retained prepare context only after successor FDS and
+  finite-lease validation; failure leaves the candidate fenced and LOADING.
 - All native flows continue together or full-sync together. A target publishes
   online only after all partitions and the all-flow cut validate.
 - Applied progress is next-unapplied LSN per logical source flow. Ordinary
@@ -973,8 +1050,9 @@ Function-catalog full sync and incremental mutation, config rewrite, and
 transaction/control fault injection and destructive replacement of the
 previous population. Cluster model and integration coverage checks boot-scoped
 identity, safe-source reset authorization, all-partition reset and handoff,
-all-flow cut publication, fail-closed admission and failure, serving fences,
-and reclaim accounting. `tests/cluster/README.md` is the cluster test inventory.
+all-flow cut publication, fail-closed admission and failure, source-history
+hold and frozen-frontier replay, prepared activation, serving fences, and
+reclaim accounting. `tests/cluster/README.md` is the cluster test inventory.
 
 `tests/multikey_e2e_test.cpp` covers concurrent wide replicated `MSET`, changing
 participant sets, duplex source sending, and cross-flow rendezvous progress.
@@ -1003,9 +1081,9 @@ FLUSH/full-sync interleavings. Two legacy replication tests in
 
 | Claim | Repository source |
 |---|---|
-| Public roles, options, status, and manager boundary | `include/keylane/replication.h` |
-| Single-group rebuild identity, safe-source authorization, logical/local epoch mapping, manifest/reset proof, readiness, restart invalidation, and fail-stop contract | `include/keylane/replication_group.h`, `src/replication/replication_group.cpp` |
-| Callable cluster directive/status/source-authorization adapter, native control/data protocol, duplex online flow, role lifecycle, Redis follower/export, topology, Function full sync, and reconnect behavior | `include/keylane/replication.h`, `src/replication/replication.cpp` |
+| Public roles, options, status, source hold/frozen proof, prepared activation, and manager boundary | `include/keylane/replication.h` |
+| Single-group rebuild and stable export identities, safe-source authorization, logical/local epoch mapping, manifest/reset proof, readiness, restart invalidation, and fail-stop contract | `include/keylane/replication_group.h`, `src/replication/replication_group.cpp` |
+| Callable cluster directive/status/source-authorization/hold/activation adapters, native control/data protocol, duplex online flow, role lifecycle, Redis follower/export, topology, Function full sync, and reconnect behavior | `include/keylane/replication.h`, `src/replication/replication.cpp`, `src/replication/source_authorization.h` |
 | Lock-free live target Applied frontier and coherent cross-flow snapshots | `src/replication/replica_applied_frontier.h`, `src/replication/replica_applied_frontier.cpp` |
 | Canonical command format and deterministic expiration effects | `include/keylane/replication_command.h`, `src/replication/command.cpp` |
 | REPLICAOF/Sentinel commands, serving-generation fencing, blocking-wait invalidation, MSET publication admission/order, Function and PUBLISH capture, transaction/control capture, and trusted replay | `include/keylane/command.h`, `src/redis/command.cpp`, `src/redis/blocking_wait.cpp`, `src/redis/command_table.cpp` |
@@ -1019,4 +1097,4 @@ FLUSH/full-sync interleavings. Two legacy replication tests in
 | Manifest-filtered full-sync scanning, replacements, handoff, target reset/apply/promotion/abort, detached-index reclaim, cascade and DB-gate limitations | `src/storage/engine/replication.cpp`, `src/storage/engine/write.cpp` |
 | Frame layout, event kinds, fragmentation, and checksums | `include/keylane/storage/format.h`, `src/storage/format.cpp` |
 | Startup/runtime replication configuration, cluster fail-closed admission, and atomic CONFIG REWRITE | `app/keylane.cpp`, `include/keylane/server.h`, `src/config.cpp`, `src/redis/command.cpp`, `src/redis/server.cpp` |
-| Native, group-model, cluster-startup/manager/generation/failure/protocol-guard, log, MSET, Pub/Sub, Sentinel, Redis PSYNC/export, RDB, format, and configuration verification | `tests/replication_group_test.cpp`, `tests/cluster/cluster_invariants.cpp`, `tests/cluster/fault_harness_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/cluster/serving_generation_integration_test.cpp`, `tests/cluster/rebuild_failure_integration_test.cpp`, `tests/cluster/rebuild_protocol_integration_test.cpp`, `tests/replication_log_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/sentinel_e2e_test.cpp`, `tests/redis_cluster_psync_e2e.sh`, `tests/redis_export_e2e.sh`, `tests/multi_exec_e2e_test.cpp`, `tests/rdb_test.cpp`, `tests/replication_command_test.cpp`, `tests/storage_format_test.cpp`, `tests/config_test.cpp` |
+| Native, group-model, cluster-startup/manager/generation/failure/protocol-guard, source-hold/frozen-source/prepared-activation, log, MSET, Pub/Sub, Sentinel, Redis PSYNC/export, RDB, format, and configuration verification | `tests/replication_group_test.cpp`, `tests/cluster/cluster_invariants.cpp`, `tests/cluster/fault_harness_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/cluster/source_history_hold_integration_test.cpp`, `tests/cluster/serving_generation_integration_test.cpp`, `tests/cluster/rebuild_failure_integration_test.cpp`, `tests/cluster/rebuild_protocol_integration_test.cpp`, `tests/replication_log_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/sentinel_e2e_test.cpp`, `tests/redis_cluster_psync_e2e.sh`, `tests/redis_export_e2e.sh`, `tests/multi_exec_e2e_test.cpp`, `tests/rdb_test.cpp`, `tests/replication_command_test.cpp`, `tests/storage_format_test.cpp`, `tests/config_test.cpp` |

@@ -22,6 +22,7 @@
 #include "celer/net/server.h"
 #include "celer/runtime/cross_core.h"
 #include "gtest/gtest.h"
+#include "keylane/cluster/lease_clock.h"
 #include "keylane/command.h"
 #include "keylane/fault_injection.h"
 #include "keylane/memory.h"
@@ -102,10 +103,12 @@ class StallingNativeSource {
         expected_population_target_(RespBulk(expected_target_node_id)),
         expected_population_epoch_(
             RespBulk(std::to_string(kPartitionReplicationEpoch))),
+        // Hex("wrong") is a syntactically valid short population token. The
+        // target must reject it for identity mismatch, not wire shape.
         first_response_("+KLFULLRESYNC 1 " + std::string(40, 'a') + " " +
-                        std::string(40, 'e') + " " + std::string(40, 'b') +
-                        " " + std::string(40, 'c') + " 1 " +
-                        std::string(40, 'f') + "\r\n") {
+                        "77726f6e67 " + std::string(40, 'b') + " " +
+                        std::string(40, 'c') + " 1 " + std::string(40, 'f') +
+                        "\r\n") {
     listener_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listener_ < 0) {
       error_.store(errno == 0 ? EIO : errno, std::memory_order_release);
@@ -318,7 +321,7 @@ keylane::RebuildDirective TargetDirective(
   return keylane::RebuildDirective{
       .identity_ =
           {
-              .group_id_ = std::string(40, 'd'),
+              .group_id_ = "group-1",
               .assignment_id_ = "assignment-a",
               .term_ = 7,
               .directive_revision_ = 1,
@@ -696,9 +699,8 @@ class ReplicationManagerService final : public celer::Service {
     at_shutdown.identity_.directive_revision_ = 6;
     at_shutdown.identity_.attempt_id_ = "attempt-6";
     const unsigned accepted_before_shutdown = source_->accepted();
-    auto shutdown_attempt =
-        co_await replication_->StartClusterRebuildDirective(
-            upstream, at_shutdown, *manifest);
+    auto shutdown_attempt = co_await replication_->StartClusterRebuildDirective(
+        upstream, at_shutdown, *manifest);
     if (!shutdown_attempt.ok()) co_return shutdown_attempt.status();
     peer = co_await WaitForPeerCount(
         worker, *source_, false, accepted_before_shutdown + 1,
@@ -706,8 +708,7 @@ class ReplicationManagerService final : public celer::Service {
     if (!peer.ok()) co_return peer;
 
     replication_->RequestShutdown();
-    absl::Status cancelled =
-        co_await replication_->QuiesceForShutdown();
+    absl::Status cancelled = co_await replication_->QuiesceForShutdown();
     if (!cancelled.ok()) co_return cancelled;
     if ((co_await shutdown_attempt->Await()).code() !=
         absl::StatusCode::kCancelled) {
@@ -787,8 +788,7 @@ class EmptyPopulationService final : public celer::Service {
          partition < keylane::kReplicationPartitionCount; ++partition) {
       entries.push_back({partition, 1});
     }
-    auto manifest =
-        keylane::PopulationManifest::Create(std::move(entries));
+    auto manifest = keylane::PopulationManifest::Create(std::move(entries));
     if (!manifest.ok()) co_return manifest.status();
 
     keylane::RebuildIdentity identity{
@@ -819,12 +819,10 @@ class EmptyPopulationService final : public celer::Service {
                return value;
              }(),
          }) {
-      auto rejected =
-          co_await replication_->StartEmptyPopulationInitialization(stale,
-                                                                    *manifest);
+      auto rejected = co_await replication_->StartEmptyPopulationInitialization(
+          stale, *manifest);
       if (rejected.ok() ||
-          rejected.status().code() !=
-              absl::StatusCode::kFailedPrecondition) {
+          rejected.status().code() != absl::StatusCode::kFailedPrecondition) {
         co_return TestFailure(
             "empty population accepted stale boot or history identity");
       }
@@ -854,8 +852,7 @@ class EmptyPopulationService final : public celer::Service {
       const keylane::ReplicationGroupState expected_state =
           expect_fail_stop ? keylane::ReplicationGroupState::kFailedStopped
                            : keylane::ReplicationGroupState::kNotReady;
-      if (failed.state_ != expected_state ||
-          failed.ready_token_.has_value() ||
+      if (failed.state_ != expected_state || failed.ready_token_.has_value() ||
           observed.failed_stopped_ != expect_fail_stop ||
           (expect_fail_stop && (failed.failure_reason_.empty() ||
                                 observed.failure_reason_.empty() ||
@@ -896,6 +893,35 @@ class EmptyPopulationService final : public celer::Service {
         replication_->is_loading() || replication_->reject_writes()) {
       co_return TestFailure(
           "empty population did not publish the source-less ReadyToken");
+    }
+
+    // Finite leases all traverse the same activation seam. A population that
+    // was initialized directly as a primary has no prepare context to consume,
+    // so exact anchors must be an idempotent no-op.
+    const keylane::ReplicationStatus before_primary_lease =
+        co_await replication_->Observe();
+    const absl::Status primary_lease =
+        co_await replication_->ActivateClusterPreparedPromotion(
+            keylane::ClusterPromotionActivation{
+                .group_id_ = identity.group_id_,
+                .assignment_id_ = identity.assignment_id_,
+                .group_term_ = identity.term_,
+                .authority_version_ = 1,
+                .grant_revision_ = 1,
+                .target_node_id_ = identity.target_node_id_,
+                .target_boot_id_ = identity.target_boot_id_,
+                .manifest_revision_ = identity.manifest_revision_,
+                .manifest_id_ = identity.manifest_id_,
+                .partition_replication_epoch_ =
+                    identity.partition_replication_epoch_,
+            });
+    const keylane::ReplicationStatus after_primary_lease =
+        co_await replication_->Observe();
+    if (!primary_lease.ok() ||
+        before_primary_lease.role_epoch_ != after_primary_lease.role_epoch_ ||
+        replication_->is_loading() || replication_->reject_writes()) {
+      co_return TestFailure(
+          "ordinary primary lease disturbed an already-active population");
     }
 
     // A completed replay must reuse the original result, not start another
@@ -963,8 +989,7 @@ class EmptyPopulationService final : public celer::Service {
         .term_ = identity.term_,
         .manifest_revision_ = identity.manifest_revision_,
         .manifest_id_ = identity.manifest_id_,
-        .partition_replication_epoch_ =
-            identity.partition_replication_epoch_,
+        .partition_replication_epoch_ = identity.partition_replication_epoch_,
         .population_transition_expected_ = false,
     };
     if (absl::Status reconciled =
@@ -1034,8 +1059,7 @@ class EmptyPopulationService final : public celer::Service {
 
   keylane::storage::StorageEngine* storage_ = nullptr;
   keylane::ReplicationManager* replication_ = nullptr;
-  EmptyPopulationExpectation expectation_ =
-      EmptyPopulationExpectation::kReady;
+  EmptyPopulationExpectation expectation_ = EmptyPopulationExpectation::kReady;
   absl::Status result_ = absl::OkStatus();
 };
 
@@ -1417,6 +1441,8 @@ class PromotionPrepareService final : public celer::Service {
         // not the target worker layout.
         .required_applied_next_lsns_ = {1, 3},
         .excluded_group_term_ = identity.term_,
+        .excluded_authority_version_ = 4,
+        .excluded_grant_revision_ = 10,
     };
     directive.old_authority_exclusion_hash_.fill(1);
 
@@ -1428,14 +1454,16 @@ class PromotionPrepareService final : public celer::Service {
       if (prepared.ok()) {
         co_return TestFailure("injected promotion prepare unexpectedly passed");
       }
-      const keylane::ReplicationStatus status = co_await replication_->Observe();
+      const keylane::ReplicationStatus status =
+          co_await replication_->Observe();
       if (!status.failed_stopped_ || !replication_->is_loading() ||
           !replication_->reject_writes()) {
         co_return TestFailure(
             "uncertain promotion prepare did not fail-stop the node");
       }
-      auto replay = co_await replication_->StartClusterPromotionPrepareDirective(
-          directive);
+      auto replay =
+          co_await replication_->StartClusterPromotionPrepareDirective(
+              directive);
       if (!replay.ok() || (co_await replay->Await()).ok()) {
         co_return TestFailure(
             "failed promotion prepare replay changed its terminal result");
@@ -1483,7 +1511,8 @@ class PromotionPrepareService final : public celer::Service {
     }
     auto watermark = co_await replication_->CaptureNativeReplicationWatermark();
     if (!watermark.ok() || !watermark->has_value()) {
-      co_return TestFailure("prepared promotion did not create a child history");
+      co_return TestFailure(
+          "prepared promotion did not create a child history");
     }
 
     auto replay =
@@ -1493,12 +1522,12 @@ class PromotionPrepareService final : public celer::Service {
     if (!replayed.ok() || *replayed != *prepared) {
       co_return TestFailure("exact promotion prepare replay changed evidence");
     }
+
     keylane::ClusterPromotionPrepareDirective conflict = directive;
     conflict.identity_.attempt_id_ = "conflicting-attempt";
     auto conflicting =
         co_await replication_->StartClusterPromotionPrepareDirective(conflict);
-    if (conflicting.status().code() !=
-        absl::StatusCode::kFailedPrecondition) {
+    if (conflicting.status().code() != absl::StatusCode::kFailedPrecondition) {
       co_return TestFailure("promotion prepare accepted conflicting anchors");
     }
 
@@ -1567,6 +1596,271 @@ class PromotionPrepareService final : public celer::Service {
       co_return TestFailure(
           "prepared cluster promotion authorized downstream export");
     }
+
+    keylane::ClusterPromotionActivation activation{
+        .group_id_ = identity.group_id_,
+        .assignment_id_ = identity.assignment_id_,
+        .group_term_ = identity.term_,
+        .authority_version_ = 5,
+        .grant_revision_ = 11,
+        .target_node_id_ = identity.target_node_id_,
+        .target_boot_id_ = identity.target_boot_id_,
+        .manifest_revision_ = identity.manifest_revision_,
+        .manifest_id_ = identity.manifest_id_,
+        .partition_replication_epoch_ = identity.partition_replication_epoch_,
+    };
+    std::vector<keylane::ClusterPromotionActivation> stale_activations;
+    auto stale_activation = activation;
+    stale_activation.assignment_id_ = "stale-assignment";
+    stale_activations.push_back(stale_activation);
+    stale_activation = activation;
+    ++stale_activation.group_term_;
+    stale_activations.push_back(stale_activation);
+    stale_activation = activation;
+    stale_activation.target_boot_id_ = std::string(40, '8');
+    stale_activations.push_back(stale_activation);
+    stale_activation = activation;
+    ++stale_activation.manifest_revision_;
+    stale_activations.push_back(stale_activation);
+    stale_activation = activation;
+    stale_activation.manifest_id_.bytes_.front() ^= 0xff;
+    stale_activations.push_back(stale_activation);
+    stale_activation = activation;
+    ++stale_activation.partition_replication_epoch_;
+    stale_activations.push_back(stale_activation);
+    stale_activation = activation;
+    ++stale_activation.authority_version_;
+    stale_activations.push_back(stale_activation);
+    for (const auto& stale : stale_activations) {
+      const absl::Status rejected =
+          co_await replication_->ActivateClusterPreparedPromotion(stale);
+      const keylane::ReplicationStatus still_prepared =
+          co_await replication_->Observe();
+      if (rejected.code() != absl::StatusCode::kFailedPrecondition ||
+          still_prepared.role_ != keylane::ReplicationRole::kSyncing ||
+          !replication_->is_loading() || !replication_->reject_writes()) {
+        co_return TestFailure(
+            "stale promotion activation changed the fenced candidate");
+      }
+    }
+
+    const keylane::ReplicationStatus before_activation =
+        co_await replication_->Observe();
+    const absl::Status activated =
+        co_await replication_->ActivateClusterPreparedPromotion(activation);
+    if (!activated.ok()) co_return activated;
+    const keylane::ReplicationStatus after_activation =
+        co_await replication_->Observe();
+    auto activated_watermark =
+        co_await replication_->CaptureNativeReplicationWatermark();
+    if (after_activation.role_ != keylane::ReplicationRole::kMaster ||
+        replication_->is_loading() || replication_->reject_writes() ||
+        !activated_watermark.ok() || !activated_watermark->has_value() ||
+        (*activated_watermark)->history_id_ != prepared->child_history_id_) {
+      co_return TestFailure(
+          "exact successor authority did not activate the prepared child");
+    }
+    const absl::Status activation_replay =
+        co_await replication_->ActivateClusterPreparedPromotion(activation);
+    const keylane::ReplicationStatus after_replay =
+        co_await replication_->Observe();
+    auto replay_watermark =
+        co_await replication_->CaptureNativeReplicationWatermark();
+    if (!activation_replay.ok() ||
+        before_activation.role_epoch_ != after_activation.role_epoch_ ||
+        after_activation.role_epoch_ != after_replay.role_epoch_ ||
+        !replay_watermark.ok() || !replay_watermark->has_value() ||
+        (*replay_watermark)->history_id_ != prepared->child_history_id_) {
+      co_return TestFailure(
+          "promotion activation replay repeated or changed local effects");
+    }
+    keylane::ClusterPromotionActivation renewed_activation = activation;
+    ++renewed_activation.grant_revision_;
+    if (absl::Status renewed =
+            co_await replication_->ActivateClusterPreparedPromotion(
+                renewed_activation);
+        !renewed.ok()) {
+      co_return TestFailure(
+          "monotonic promotion activation lease renewal was rejected");
+    }
+    if ((co_await replication_->ActivateClusterPreparedPromotion(activation))
+                .code() != absl::StatusCode::kFailedPrecondition ||
+        replication_->is_loading() || replication_->reject_writes()) {
+      co_return TestFailure(
+          "promotion activation accepted a regressed grant revision");
+    }
+
+    const auto unix_time_millis = [] {
+      return static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count());
+    };
+    const auto wait_for_local_size =
+        [this](std::size_t expected) -> celer::Task<absl::Status> {
+      for (unsigned attempt = 0; attempt < 5'000; ++attempt) {
+        if (storage_->LocalSize(0) == expected) co_return absl::OkStatus();
+        absl::Status slept = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!slept.ok()) co_return slept;
+      }
+      co_return absl::DeadlineExceededError(
+          "expiration did not reach the expected local key count");
+    };
+    const auto queue_expired =
+        [this](std::string_view key) -> celer::Task<absl::Status> {
+      auto read = co_await storage_->Get(0, key);
+      if (read.ok() || !absl::IsNotFound(read.status())) {
+        co_return TestFailure(
+            "expired test key did not produce a not-found read");
+      }
+      co_return absl::OkStatus();
+    };
+    const auto grant_expiration_until =
+        [this](keylane::cluster::LeaseTime deadline) {
+          return replication_->EnableClusterExpirationAuthorityUntil(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  deadline.time_since_epoch()));
+        };
+
+    const std::size_t baseline_size = storage_->LocalSize(0);
+    auto activation_did_not_grant = co_await storage_->Set(
+        0, "activation-only-expiration", "value",
+        keylane::storage::SetOptions{.expire_at_ms_ = unix_time_millis() + 30});
+    if (!activation_did_not_grant.ok()) {
+      co_return activation_did_not_grant.status();
+    }
+    absl::Status slept = co_await celer::SleepFor(
+        *celer::ThisWorker().self_, std::chrono::milliseconds(50));
+    if (!slept.ok()) co_return slept;
+    if (absl::Status queued =
+            co_await queue_expired("activation-only-expiration");
+        !queued.ok()) {
+      co_return queued;
+    }
+    slept = co_await celer::SleepFor(*celer::ThisWorker().self_, 100ms);
+    if (!slept.ok()) co_return slept;
+    if (storage_->LocalSize(0) != baseline_size + 1) {
+      co_return TestFailure(
+          "cluster activation opened expiration before lease post-check");
+    }
+
+    if (absl::Status granted = grant_expiration_until(
+            keylane::cluster::LeaseClockNow() + std::chrono::seconds(30));
+        !granted.ok()) {
+      co_return granted;
+    }
+    if (absl::Status queued =
+            co_await queue_expired("activation-only-expiration");
+        !queued.ok()) {
+      co_return queued;
+    }
+    if (absl::Status expired = co_await wait_for_local_size(baseline_size);
+        !expired.ok()) {
+      co_return TestFailure(
+          "post-check lease grant did not enable expiration authority");
+    }
+
+    if (absl::Status paused = co_await storage_->QuiesceExpiration();
+        !paused.ok()) {
+      co_return paused;
+    }
+    const auto expiration_deadline =
+        keylane::cluster::LeaseClockNow() + std::chrono::milliseconds(500);
+    if (absl::Status granted = grant_expiration_until(expiration_deadline);
+        !granted.ok()) {
+      storage_->ResumeExpiration();
+      co_return granted;
+    }
+    auto queued_before_deadline = co_await storage_->Set(
+        0, "deadline-expiration", "value",
+        keylane::storage::SetOptions{.expire_at_ms_ = unix_time_millis() + 10});
+    if (!queued_before_deadline.ok()) {
+      storage_->ResumeExpiration();
+      co_return queued_before_deadline.status();
+    }
+    slept = co_await celer::SleepFor(*celer::ThisWorker().self_, 30ms);
+    if (!slept.ok()) {
+      storage_->ResumeExpiration();
+      co_return slept;
+    }
+    if (keylane::cluster::LeaseClockNow() >= expiration_deadline) {
+      storage_->ResumeExpiration();
+      co_return TestFailure(
+          "expiration deadline elapsed before the candidate was queued");
+    }
+    if (absl::Status queued = co_await queue_expired("deadline-expiration");
+        !queued.ok()) {
+      storage_->ResumeExpiration();
+      co_return queued;
+    }
+    const auto remaining =
+        expiration_deadline - keylane::cluster::LeaseClockNow();
+    if (remaining > keylane::cluster::LeaseDuration::zero()) {
+      slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                       remaining + 30ms);
+      if (!slept.ok()) {
+        storage_->ResumeExpiration();
+        co_return slept;
+      }
+    }
+    storage_->ResumeExpiration();
+    slept = co_await celer::SleepFor(*celer::ThisWorker().self_, 100ms);
+    if (!slept.ok()) co_return slept;
+    if (storage_->LocalSize(0) != baseline_size + 1) {
+      co_return TestFailure(
+          "queued expiration crossed its finite authority deadline");
+    }
+
+    if (absl::Status revoked =
+            co_await replication_->RevokeClusterExpirationAuthority();
+        !revoked.ok()) {
+      co_return revoked;
+    }
+    auto retained_without_authority = co_await storage_->Set(
+        0, "fenced-expiration", "value",
+        keylane::storage::SetOptions{.expire_at_ms_ = unix_time_millis() + 30});
+    if (!retained_without_authority.ok()) {
+      co_return retained_without_authority.status();
+    }
+    slept = co_await celer::SleepFor(*celer::ThisWorker().self_, 50ms);
+    if (!slept.ok()) co_return slept;
+    if (absl::Status queued = co_await queue_expired("fenced-expiration");
+        !queued.ok()) {
+      co_return queued;
+    }
+    slept = co_await celer::SleepFor(*celer::ThisWorker().self_, 100ms);
+    if (!slept.ok()) co_return slept;
+    if (storage_->LocalSize(0) != baseline_size + 2) {
+      co_return TestFailure(
+          "fenced primary performed authoritative expiration");
+    }
+
+    ++renewed_activation.grant_revision_;
+    if (absl::Status reactivated =
+            co_await replication_->ActivateClusterPreparedPromotion(
+                renewed_activation);
+        !reactivated.ok()) {
+      co_return reactivated;
+    }
+    if (absl::Status granted = grant_expiration_until(
+            keylane::cluster::LeaseClockNow() + std::chrono::seconds(30));
+        !granted.ok()) {
+      co_return granted;
+    }
+    if (absl::Status queued = co_await queue_expired("deadline-expiration");
+        !queued.ok()) {
+      co_return queued;
+    }
+    if (absl::Status queued = co_await queue_expired("fenced-expiration");
+        !queued.ok()) {
+      co_return queued;
+    }
+    if (absl::Status expired = co_await wait_for_local_size(baseline_size);
+        !expired.ok()) {
+      co_return TestFailure(
+          "exact lease reactivation did not restore expiration authority");
+    }
     co_return absl::OkStatus();
   }
 
@@ -1580,11 +1874,11 @@ class ScopedPromotionFaults {
  public:
   explicit ScopedPromotionFaults(std::string_view stage) {
     EXPECT_EQ(::setenv("KEYLANE_REPLICATION_SEED_READY_PROMOTION_CANDIDATE",
-                      "promotion-attempt", 1),
+                       "promotion-attempt", 1),
               0);
     if (!stage.empty()) {
       EXPECT_EQ(::setenv("KEYLANE_REPLICATION_FAIL_PROMOTION_PREPARE_AT",
-                        std::string(stage).c_str(), 1),
+                         std::string(stage).c_str(), 1),
                 0);
     }
   }
@@ -1619,9 +1913,8 @@ void RunPromotionPrepareCase(std::string_view fault_stage) {
   replication_options.cluster_enabled_ = true;
   replication_options.cluster_population_managed_ = true;
   replication_options.node_id_override_ = std::string(40, '9');
-  keylane::ReplicationManager replication(&storage,
-                                          std::move(replication_options),
-                                          std::nullopt);
+  keylane::ReplicationManager replication(
+      &storage, std::move(replication_options), std::nullopt);
   keylane::InitStorage(&storage, &replication);
   if (keylane::tx::TxRuntime::Get() == nullptr) {
     keylane::tx::TxRuntime::Create(1);
@@ -1759,8 +2052,8 @@ TEST(ReplicationManagerIntegrationTest,
   keylane::InitStorage(&storage, &replication);
   EnsureTxRuntime();
 
-  EmptyPopulationService service(
-      &storage, &replication, EmptyPopulationExpectation::kFailedStopped);
+  EmptyPopulationService service(&storage, &replication,
+                                 EmptyPopulationExpectation::kFailedStopped);
   celer::Server server;
   server.AddService(&service);
   celer::ServerOptions runtime;
@@ -1806,8 +2099,7 @@ void RunRecoverableEmptyPopulationFault(const char* environment_name,
   EnsureTxRuntime();
 
   EmptyPopulationService service(
-      &storage, &replication,
-      EmptyPopulationExpectation::kRecoverableFailure);
+      &storage, &replication, EmptyPopulationExpectation::kRecoverableFailure);
   celer::Server server;
   server.AddService(&service);
   celer::ServerOptions runtime;
@@ -1867,7 +2159,7 @@ TEST(ReplicationManagerIntegrationTest,
 }
 
 TEST(ReplicationManagerIntegrationTest,
-     MetaManagedPromotionAcceptsPriorTermReadyPopulationAndStaysFenced) {
+     MetaManagedPromotionExpirationFollowsExactLeaseAuthority) {
   RunPromotionPrepareCase({});
 }
 
@@ -1876,9 +2168,10 @@ TEST_P(PromotionPrepareFailureIntegrationTest,
   RunPromotionPrepareCase(GetParam());
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    PromotionPrepareBoundaries, PromotionPrepareFailureIntegrationTest,
-    testing::Values("storage-barrier", "promotion-base", "child-history",
-                    "evidence-publication"));
+INSTANTIATE_TEST_SUITE_P(PromotionPrepareBoundaries,
+                         PromotionPrepareFailureIntegrationTest,
+                         testing::Values("storage-barrier", "promotion-base",
+                                         "child-history",
+                                         "evidence-publication"));
 
 }  // namespace

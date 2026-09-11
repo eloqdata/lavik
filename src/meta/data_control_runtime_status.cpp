@@ -25,6 +25,7 @@ std::vector<MetaDataControlRuntimeGroup> ProjectedGroups(
         .manifest_revision_ = group.manifest_revision,
         .manifest_digest_ = group.manifest_digest,
         .partition_replication_epoch_ = group.partition_replication_epoch,
+        .source_history_hold_ = group.source_history_hold,
     });
   }
   std::sort(groups.begin(), groups.end(),
@@ -46,8 +47,42 @@ void ApplyProjection(MetaDataControlRuntimeNode& node,
   // heartbeat under the new projection is successfully acknowledged.
   node.health_.reset();
   node.last_lease_decision_.reset();
+  node.confirmed_serving_lease_.reset();
   node.health_received_unix_ms_ = 0;
   node.lease_decision_written_unix_ms_ = 0;
+  node.serving_confirmed_unix_ms_ = 0;
+}
+
+bool MatchesCurrentProjection(const MetaDataControlRuntimeNode& node,
+                              const cluster::control::LeaseGranted& grant) {
+  if (grant.data_boot_id != node.boot_id_ ||
+      grant.leadership_generation != node.leadership_generation_ ||
+      grant.projection_hash != node.projection_hash_) {
+    return false;
+  }
+  const auto group = std::find_if(
+      node.groups_.begin(), node.groups_.end(), [&](const auto& candidate) {
+        return candidate.group_id_ == grant.group_id;
+      });
+  return group != node.groups_.end() &&
+         group->assignment_id_ == grant.assignment_id &&
+         group->group_term_ == grant.group_term &&
+         group->authority_version_ == grant.authority_version &&
+         group->grant_revision_ == grant.grant_revision;
+}
+
+bool LeaseWasLiveAtHeartbeat(const MetaDataControlRuntimeNode& node,
+                             const cluster::control::LeaseGranted& grant,
+                             std::int64_t received_unix_ms) {
+  if (node.lease_decision_written_unix_ms_ <= 0 || received_unix_ms < 0 ||
+      received_unix_ms < node.lease_decision_written_unix_ms_) {
+    return false;
+  }
+  const std::uint64_t elapsed_ms =
+      static_cast<std::uint64_t>(received_unix_ms) -
+      static_cast<std::uint64_t>(node.lease_decision_written_unix_ms_);
+  return grant.granted_duration_ms != 0 &&
+         elapsed_ms < grant.granted_duration_ms;
 }
 
 }  // namespace
@@ -143,8 +178,24 @@ void MetaDataControlRuntimeStatus::RecordHealth(
   std::lock_guard<std::mutex> lock(mutex_);
   auto found = nodes_.find(std::string(node_id));
   if (found == nodes_.end() || found->second.session_id_ != session_id) return;
-  found->second.health_ = health;
-  found->second.health_received_unix_ms_ = received_unix_ms;
+  MetaDataControlRuntimeNode& node = found->second;
+  // RecordHealth precedes RecordLeaseDecisionWritten in the heartbeat path.
+  // Consequently only a later ready heartbeat can turn the prior successful
+  // Ack write into serving evidence. Keep the exact grant so a reconciler can
+  // compare every authority and projection anchor rather than trusting a
+  // lossy boolean.
+  if (health.storage_ready && health.population_ready && !health.draining &&
+      node.last_lease_decision_.has_value()) {
+    if (const auto* grant = std::get_if<cluster::control::LeaseGranted>(
+            &*node.last_lease_decision_);
+        grant != nullptr && MatchesCurrentProjection(node, *grant) &&
+        LeaseWasLiveAtHeartbeat(node, *grant, received_unix_ms)) {
+      node.confirmed_serving_lease_ = *grant;
+      node.serving_confirmed_unix_ms_ = received_unix_ms;
+    }
+  }
+  node.health_ = health;
+  node.health_received_unix_ms_ = received_unix_ms;
 }
 
 void MetaDataControlRuntimeStatus::RecordLeaseDecisionWritten(

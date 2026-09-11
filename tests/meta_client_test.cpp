@@ -449,6 +449,8 @@ TEST(MetaDirectiveValidationTest,
   authorize.target_node_id = kRemote;
   authorize.target_boot_id = kRemoteBoot;
   authorize.authority.assignment_id = remote_assignment;
+  authorize.payload.clear();
+  authorize.preconditions.clear();
   desired.current_directives.front().source_node_id = authorize.source_node_id;
   desired.current_directives.front().source_assignment_id =
       authorize.source_assignment_id;
@@ -456,8 +458,41 @@ TEST(MetaDirectiveValidationTest,
   desired.current_directives.front().target_node_id = authorize.target_node_id;
   desired.current_directives.front().target_boot_id = authorize.target_boot_id;
   desired.current_directives.front().authority = authorize.authority;
+  desired.current_directives.front().payload.clear();
+  desired.current_directives.front().preconditions.clear();
   EXPECT_TRUE(
       ValidateLiveDirective(authorize, desired, kLocal, kLocalBoot).ok());
+
+  control::Directive malformed_frozen = authorize;
+  malformed_frozen.payload = "opaque";
+  desired.current_directives.front().payload = malformed_frozen.payload;
+  EXPECT_EQ(ValidateLiveDirective(malformed_frozen, desired, kLocal, kLocalBoot)
+                .code(),
+            absl::StatusCode::kInvalidArgument);
+  auto frozen_request = control::EncodeFrozenSourceRequest(
+      control::FrozenSourceRequest{.recovery_generation = 17});
+  auto frozen_preconditions = control::EncodeFrozenSourcePreconditions(
+      control::FrozenSourcePreconditions{
+          .excluded_group_term = 2,
+          .excluded_authority_version = 4,
+          .excluded_grant_revision = 5,
+      });
+  ASSERT_TRUE(frozen_request.ok()) << frozen_request.status();
+  ASSERT_TRUE(frozen_preconditions.ok()) << frozen_preconditions.status();
+  control::Directive typed_frozen = authorize;
+  typed_frozen.payload = *frozen_request;
+  typed_frozen.preconditions = *frozen_preconditions;
+  desired.current_directives.front().payload = typed_frozen.payload;
+  desired.current_directives.front().preconditions = typed_frozen.preconditions;
+  EXPECT_TRUE(
+      ValidateLiveDirective(typed_frozen, desired, kLocal, kLocalBoot).ok());
+  typed_frozen.payload[0] ^= 0x01;
+  desired.current_directives.front().payload = typed_frozen.payload;
+  EXPECT_EQ(
+      ValidateLiveDirective(typed_frozen, desired, kLocal, kLocalBoot).code(),
+      absl::StatusCode::kInvalidArgument);
+  desired.current_directives.front().payload.clear();
+  desired.current_directives.front().preconditions.clear();
 
   control::Directive stale_source = authorize;
   stale_source.source_assignment_id = remote_assignment;
@@ -483,8 +518,7 @@ TEST(MetaDirectiveValidationTest,
   EXPECT_TRUE(ValidateLiveDirective(revoke, desired, kLocal, kLocalBoot).ok());
 
   control::Directive initialize = live;
-  initialize.kind =
-      control::WireDirectiveKind::kInitializeEmptyPopulation;
+  initialize.kind = control::WireDirectiveKind::kInitializeEmptyPopulation;
   initialize.source_node_id = std::string(40, '0');
   initialize.source_assignment_id = {};
   initialize.source_boot_id = std::string(40, '0');
@@ -494,11 +528,9 @@ TEST(MetaDirectiveValidationTest,
   initialize.authority.assignment_id = projected.authority.assignment_id;
   desired.current_directives.front() = projected;
   desired.current_directives.front().kind = initialize.kind;
-  desired.current_directives.front().source_node_id =
-      initialize.source_node_id;
+  desired.current_directives.front().source_node_id = initialize.source_node_id;
   desired.current_directives.front().source_assignment_id = {};
-  desired.current_directives.front().source_boot_id =
-      initialize.source_boot_id;
+  desired.current_directives.front().source_boot_id = initialize.source_boot_id;
   desired.current_directives.front().source_replication_history_id =
       initialize.source_replication_history_id;
   desired.current_directives.front().payload = initialize.payload;
@@ -512,10 +544,10 @@ TEST(MetaDirectiveValidationTest,
   stale_initialize_boot.target_boot_id = kRemoteBoot;
   desired.current_directives.front().recipient_boot_id = kRemoteBoot;
   desired.current_directives.front().target_boot_id = kRemoteBoot;
-  EXPECT_EQ(ValidateLiveDirective(stale_initialize_boot, desired, kLocal,
-                                  kLocalBoot)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(
+      ValidateLiveDirective(stale_initialize_boot, desired, kLocal, kLocalBoot)
+          .code(),
+      absl::StatusCode::kFailedPrecondition);
   desired.current_directives.front().recipient_boot_id = kLocalBoot;
   desired.current_directives.front().target_boot_id = kLocalBoot;
 
@@ -604,7 +636,6 @@ TEST(MetaCandidateProgressTest,
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   EXPECT_LE(encoded->size(), control::kMaxFramePayloadBytes);
   EXPECT_LT(heartbeat.health.summary.size(), control::kMaxFramePayloadBytes);
-
 }
 
 TEST(MetaAuthorityIdentityTest, UsesVersionedUnambiguousEncoding) {

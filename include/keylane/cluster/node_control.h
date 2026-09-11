@@ -33,6 +33,23 @@ struct PreparedMemberAssignment {
                          const PreparedMemberAssignment&) = default;
 };
 
+// Boot-local request to retain one local source history while Meta coordinates
+// failover. It is control identity only: retaining backlog neither restores
+// source authorization nor makes the fenced group eligible to serve.
+struct SourceHistoryHoldDesired {
+  std::string group_id_;
+  std::uint64_t recovery_generation_ = 0;
+  AssignmentId source_assignment_id_;
+  NodeId source_boot_id_;
+  NodeId source_replication_history_id_;
+  std::uint64_t manifest_revision_ = 0;
+  Sha256Digest manifest_digest_{};
+  std::uint64_t partition_replication_epoch_ = 0;
+
+  friend bool operator==(const SourceHistoryHoldDesired&,
+                         const SourceHistoryHoldDesired&) = default;
+};
+
 // Member-specific identities retained beside the routing-optimized
 // ServingState. GroupView carries the current serving owner's assignment;
 // rebuild and readiness proofs instead name the target member's assignment.
@@ -46,6 +63,7 @@ struct PreparedGroupControlIdentity {
   Sha256Digest manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
   std::vector<PreparedMemberAssignment> members_;
+  std::optional<SourceHistoryHoldDesired> source_history_hold_;
 
   friend bool operator==(const PreparedGroupControlIdentity&,
                          const PreparedGroupControlIdentity&) = default;
@@ -57,9 +75,9 @@ struct PreparedFullState {
   // index. This detects same-index equivocation independently of the semantic
   // projection hash.
   Sha256Digest object_hash_{};
-  // Exact member incarnations and manifest binding from the same decoded FDS.
-  // Static topology leaves this empty because it has no Meta directives or
-  // boot-local population proof to validate.
+  // Exact member incarnations, manifest binding, and optional boot-local
+  // source-history hold from the same decoded FDS. Static topology leaves this
+  // empty because it has no Meta directives or boot-local proof to validate.
   std::vector<PreparedGroupControlIdentity> control_groups_;
 };
 
@@ -112,6 +130,41 @@ struct PromotionPrepareInput {
                          const PromotionPrepareInput&) = default;
 };
 
+// Exact current-FDS identity presented to the local promotion activation
+// seam only after NodeControl has validated and provisionally installed the
+// corresponding finite lease. The retained prepare context supplies the
+// operation/directive/attempt identity; this value proves that Meta committed
+// its immediate successor authority for the same local population.
+struct PromotionActivationInput {
+  std::string group_id_;
+  AssignmentId assignment_id_;
+  std::uint64_t group_term_ = 0;
+  std::uint64_t authority_version_ = 0;
+  std::uint64_t grant_revision_ = 0;
+  NodeId target_node_id_;
+  NodeId target_boot_id_;
+  std::uint64_t manifest_revision_ = 0;
+  Sha256Digest manifest_digest_{};
+  std::uint64_t partition_replication_epoch_ = 0;
+
+  friend bool operator==(const PromotionActivationInput&,
+                         const PromotionActivationInput&) = default;
+};
+
+// Wire-independent marker for the authorize-source variant that freezes a
+// former primary after its exact finite authority has been fenced. All source,
+// history, manifest, and population identities remain on NodeDirective so the
+// existing authorization seam has one canonical copy of those anchors.
+struct FrozenSourceInput {
+  std::uint64_t recovery_generation_ = 0;
+  std::uint64_t excluded_group_term_ = 0;
+  std::uint64_t excluded_authority_version_ = 0;
+  std::uint64_t excluded_grant_revision_ = 0;
+
+  friend bool operator==(const FrozenSourceInput&,
+                         const FrozenSourceInput&) = default;
+};
+
 // Fully normalized execution request. Transport clients resolve the source
 // endpoint and referenced manifest from the same FullDesiredState that
 // supplied `projection_`; the action adapter therefore never looks through a
@@ -148,10 +201,11 @@ struct NodeDirective {
   std::uint64_t partition_replication_epoch_ = 0;
   std::vector<NodeManifestEntry> manifest_entries_;
   std::optional<PromotionPrepareInput> promotion_prepare_;
-  // Rebuild/authorize-source payloads are decoded into flow_count_ above.
+  std::optional<FrozenSourceInput> frozen_source_;
+  // Rebuild/source-authorization layouts are decoded into flow_count_ above.
   // Empty-population initialization retains its authenticated target history
-  // in payload_. Promotion-prepare is decoded into promotion_prepare_ and its
-  // raw opaque fields are cleared; other V1 kinds require both strings empty.
+  // in payload_; typed promotion and frozen-source fields are decoded above.
+  // All other typed bodies are cleared during normalization.
   std::string payload_;
   std::string preconditions_;
   // Population directives set this to drive non-serving-target admission and
@@ -178,8 +232,8 @@ class NodeDirectiveCompletion {
   // NodeControl admission boundary. Tests and native adapters use this form
   // for deferred execution; validation failures must use Rejected().
   explicit NodeDirectiveCompletion(Poll poll)
-      : result_poll_([poll = std::move(poll)]() mutable
-                         -> std::optional<TerminalResult> {
+      : result_poll_([poll = std::move(
+                          poll)]() mutable -> std::optional<TerminalResult> {
           std::optional<absl::Status> status = poll();
           if (!status.has_value()) return std::nullopt;
           if (!status->ok()) return TerminalResult(*status);
@@ -243,6 +297,23 @@ class NodeControlActions {
   virtual celer::Task<absl::Status>
   ClearSourceAuthorizationsForSessionReplacementAndWait(
       bool preserve_established_exports = false);
+  // Installs or releases the source-wide, boot-local history hold from the
+  // latest FDS. Completion is an acknowledgement barrier: callers must not
+  // report FullStateApplied until the native replication state agrees.
+  virtual celer::Task<absl::Status> ReconcileSourceHistoryHold(
+      std::optional<SourceHistoryHoldDesired> desired) = 0;
+  // Consumes a successfully prepared local promotion, or confirms that an
+  // ordinary ready primary already needs no activation. NodeControl removes
+  // the provisionally installed lease if this action rejects.
+  virtual celer::Task<absl::Status> ActivatePreparedPromotion(
+      PromotionActivationInput activation) = 0;
+  // Opens only background expiration authority after NodeControl has
+  // revalidated the exact lease following promotion activation. The deadline
+  // is an absolute CLOCK_BOOTTIME timestamp; implementations must enforce it
+  // at the storage mutation cut rather than relying on the lease timer to run
+  // promptly.
+  virtual absl::Status EnableExpirationAuthorityUntil(
+      MonotonicTime deadline) = 0;
   // Retires an in-progress or ready target population unless it still names
   // the desired local assignment, term, manifest, and partition replication
   // epoch. Completion includes
@@ -274,17 +345,27 @@ class NodeControlActions {
     return std::nullopt;
   }
   virtual celer::Task<absl::Status> ApplyDirective(NodeDirective directive) = 0;
-  // Optional post-counter hook for adapters that retain assignment-scoped
-  // state outside ServingState. ReplicationManager currently needs no extra
-  // work here because its source sessions were joined by async revocation and
-  // NodeControlInstaller owns the replaced snapshot's request counters.
+  // Optional non-suspending post-counter hook for static adapters. Dynamic
+  // adapters use the awaited form below when they retain background authority
+  // outside ServingState.
   virtual absl::Status DrainAssignment(const AuthorityAnchor& anchor) = 0;
+  // Dynamic adapters may also own background mutation authority that needs a
+  // suspending drain. Meta transitions await this stronger boundary before
+  // acknowledging a fence, lease expiry, session loss, or retired FDS owner;
+  // the default preserves the synchronous static/test adapter contract.
+  virtual celer::Task<absl::Status> DrainAssignmentAndWait(
+      const AuthorityAnchor& anchor);
 };
 
 class NullNodeControlActions final : public NodeControlActions {
  public:
   bool ReceivesDirectives() const noexcept override { return false; }
   absl::Status RevokeSourceAuthorizations() override;
+  celer::Task<absl::Status> ReconcileSourceHistoryHold(
+      std::optional<SourceHistoryHoldDesired> desired) override;
+  celer::Task<absl::Status> ActivatePreparedPromotion(
+      PromotionActivationInput activation) override;
+  absl::Status EnableExpirationAuthorityUntil(MonotonicTime deadline) override;
   celer::Task<absl::Status> ApplyDirective(NodeDirective directive) override;
   absl::Status DrainAssignment(const AuthorityAnchor& anchor) override;
 };
@@ -474,11 +555,14 @@ class NodeControlInstaller {
                                          bool replay_lookup = false);
   absl::StatusOr<std::optional<PopulationReadiness>> DesiredLocalPopulation()
       const;
+  std::optional<SourceHistoryHoldDesired> DesiredLocalSourceHistoryHold() const;
   const PreparedGroupControlIdentity* FindControlGroup(
       std::string_view group_id) const;
   const PreparedMemberAssignment* FindMemberAssignment(
       const PreparedGroupControlIdentity& group, const NodeId& node_id) const;
   bool RejectedByFence(const AuthorityAnchor& anchor) const;
+  bool FencedThrough(const AuthorityAnchor& anchor) const;
+  void RecordFencedThrough(const AuthorityAnchor& anchor);
   bool DrainPending(std::string_view group_id);
   // Invalidating transitions advance the generation before publishing their
   // new boundary, then wait for every earlier admission to either reject on
@@ -505,6 +589,14 @@ class NodeControlInstaller {
   // and joins source/directive cleanup; callers remain fail-closed on failure.
   celer::Task<absl::Status> FinishExpiredLeaseTransition(
       std::shared_ptr<LeaseExpirySchedule> schedule, MonotonicTime now);
+  // Joins every background mutation capability after authority has already
+  // been removed. Lease-only expiry may preserve an established data export,
+  // but still closes new source admission and drains expiration authority. A
+  // stronger fence instead revokes and joins every source export. The caller
+  // owns a ControlTransitionGuard so no replacement lease or directive can
+  // overtake this cleanup.
+  celer::Task<absl::Status> DrainRevokedAuthority(
+      const AuthorityAnchor& anchor, bool preserve_established_exports);
   void RememberDrain(std::shared_ptr<const ServingState> state,
                      const AuthorityAnchor& anchor);
   std::vector<AuthorityAnchor> RememberCurrentLocalDrains();

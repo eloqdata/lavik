@@ -313,6 +313,50 @@ class ReplicationNodeControlActions final : public NodeControlActions {
             preserve_established_exports);
   }
 
+  celer::Task<absl::Status> ReconcileSourceHistoryHold(
+      std::optional<cluster::SourceHistoryHoldDesired> desired) override {
+    std::optional<::keylane::SourceHistoryHoldDesired> translated;
+    if (desired.has_value()) {
+      translated = ::keylane::SourceHistoryHoldDesired{
+          .group_id_ = std::move(desired->group_id_),
+          .recovery_generation_ = desired->recovery_generation_,
+          .source_assignment_id_ = desired->source_assignment_id_.ToHexString(),
+          .source_boot_id_ = desired->source_boot_id_.ToHexString(),
+          .source_history_id_ =
+              desired->source_replication_history_id_.ToHexString(),
+          .manifest_revision_ = desired->manifest_revision_,
+          .manifest_id_ = PopulationManifestId{desired->manifest_digest_},
+          .partition_replication_epoch_ = desired->partition_replication_epoch_,
+      };
+    }
+    co_return co_await replication_.ReconcileClusterSourceHistoryHold(
+        std::move(translated));
+  }
+
+  celer::Task<absl::Status> ActivatePreparedPromotion(
+      PromotionActivationInput activation) override {
+    co_return co_await replication_.ActivateClusterPreparedPromotion(
+        ClusterPromotionActivation{
+            .group_id_ = std::move(activation.group_id_),
+            .assignment_id_ = activation.assignment_id_.ToHexString(),
+            .group_term_ = activation.group_term_,
+            .authority_version_ = activation.authority_version_,
+            .grant_revision_ = activation.grant_revision_,
+            .target_node_id_ = activation.target_node_id_.ToHexString(),
+            .target_boot_id_ = activation.target_boot_id_.ToHexString(),
+            .manifest_revision_ = activation.manifest_revision_,
+            .manifest_id_ = PopulationManifestId{activation.manifest_digest_},
+            .partition_replication_epoch_ =
+                activation.partition_replication_epoch_,
+        });
+  }
+
+  absl::Status EnableExpirationAuthorityUntil(MonotonicTime deadline) override {
+    return replication_.EnableClusterExpirationAuthorityUntil(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline.time_since_epoch()));
+  }
+
   celer::Task<absl::Status> ReconcilePopulation(
       std::optional<PopulationReadiness> desired,
       bool population_transition_expected) override {
@@ -325,8 +369,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
           .manifest_revision_ = desired->manifest_revision_,
           .manifest_id_ = PopulationManifestId{desired->manifest_digest_},
           .partition_replication_epoch_ = desired->partition_replication_epoch_,
-          .population_transition_expected_ =
-              population_transition_expected,
+          .population_transition_expected_ = population_transition_expected,
       };
     }
     co_return co_await replication_.ReconcileClusterPopulation(
@@ -385,6 +428,32 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation;
     RebuildDirective rebuild = NativePopulationDirective(directive, *manifest);
     if (directive.kind_ == NodeDirective::Kind::kAuthorizeSource) {
+      if (directive.frozen_source_.has_value()) {
+        const std::uint64_t recovery_generation =
+            directive.frozen_source_->recovery_generation_;
+        auto captured =
+            co_await replication_.FreezeAndAuthorizeClusterRebuildSource(
+                recovery_generation, std::move(rebuild));
+        if (!captured.ok()) {
+          co_return NodeDirectiveCompletion::StartedTerminal(captured.status());
+        }
+        control::FrozenSourceEvidence evidence{
+            .recovery_generation = captured->recovery_generation_,
+            .source_history_id = captured->watermark_.history_id_,
+            .final_next_lsns = std::move(captured->watermark_.next_lsns_),
+        };
+        auto proof = control::ComputeFrozenSourceProofHash(evidence);
+        if (!proof.ok()) {
+          co_return NodeDirectiveCompletion::StartedTerminal(proof.status());
+        }
+        evidence.proof_hash = *proof;
+        auto encoded = control::EncodeFrozenSourceEvidence(evidence);
+        if (!encoded.ok()) {
+          co_return NodeDirectiveCompletion::StartedTerminal(encoded.status());
+        }
+        co_return NodeDirectiveCompletion::StartedTerminalResult(
+            NodeDirectiveCompletion::TerminalResult(std::move(*encoded)));
+      }
       co_return NodeDirectiveCompletion::StartedTerminal(
           co_await replication_.AuthorizeClusterRebuildSource(
               std::move(rebuild)));
@@ -408,6 +477,9 @@ class ReplicationNodeControlActions final : public NodeControlActions {
                   .required_applied_next_lsns_ =
                       prepare.required_applied_next_lsns_,
                   .excluded_group_term_ = prepare.excluded_group_term_,
+                  .excluded_authority_version_ =
+                      directive.anchor_.authority_version_,
+                  .excluded_grant_revision_ = directive.anchor_.grant_revision_,
                   .old_authority_exclusion_hash_ =
                       prepare.old_authority_exclusion_hash_,
               });
@@ -438,8 +510,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
             if (!encoded.ok()) {
               return NodeDirectiveCompletion::TerminalResult(encoded.status());
             }
-            return NodeDirectiveCompletion::TerminalResult(
-                std::move(*encoded));
+            return NodeDirectiveCompletion::TerminalResult(std::move(*encoded));
           });
     }
     auto started = co_await replication_.StartClusterRebuildDirective(
@@ -464,9 +535,15 @@ class ReplicationNodeControlActions final : public NodeControlActions {
   }
 
   absl::Status DrainAssignment(const AuthorityAnchor&) override {
-    // NodeControlInstaller owns the replaced ServingState counters. Source
-    // sessions were already joined by RevokeSourceAuthorizationsAndWait().
+    // Static callers never use this dynamic adapter. Meta transitions use the
+    // awaited form below so background storage mutation authority is part of
+    // the same acknowledgement boundary as the ServingState counters.
     return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> DrainAssignmentAndWait(
+      const AuthorityAnchor&) override {
+    co_return co_await replication_.RevokeClusterExpirationAuthority();
   }
 
  private:
@@ -561,6 +638,24 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
        directive.source_replication_history_id != std::string(40, '0'))) {
     return absl::InvalidArgumentError(
         "empty population directive must not name a source");
+  }
+  if (directive.kind == control::WireDirectiveKind::kAuthorizeSource) {
+    if (directive.preconditions.empty()) {
+      if (auto request = control::DecodeRebuildRequest(directive.payload);
+          !request.ok()) {
+        return request.status();
+      }
+    } else {
+      if (auto request = control::DecodeFrozenSourceRequest(directive.payload);
+          !request.ok()) {
+        return request.status();
+      }
+      if (auto preconditions =
+              control::DecodeFrozenSourcePreconditions(directive.preconditions);
+          !preconditions.ok()) {
+        return preconditions.status();
+      }
+    }
   }
 
   const auto group =
@@ -917,8 +1012,7 @@ struct MetaControlClientService::Impl {
     // watchdog once receipt is known, but still waits for pending_heartbeat_
     // to clear after the transition finishes.
     bool heartbeat_ack_observed_ = false;
-    std::unique_ptr<control::ControlDeadlineWatchdog>
-        heartbeat_ack_deadline_;
+    std::unique_ptr<control::ControlDeadlineWatchdog> heartbeat_ack_deadline_;
     std::unique_ptr<control::ControlDeadlineWatchdog>
         inbound_transfer_deadline_;
     std::deque<DirectiveWork> directive_queue_;
@@ -1138,8 +1232,8 @@ struct MetaControlClientService::Impl {
       std::chrono::milliseconds progress_timeout,
       std::optional<control::WireMessage> first = std::nullopt) {
     if (!first.has_value()) {
-      auto read = co_await ReadWithDeadline(
-          frames, deadline, progress_timeout, "initial FullDesiredState");
+      auto read = co_await ReadWithDeadline(frames, deadline, progress_timeout,
+                                            "initial FullDesiredState");
       if (!read.ok()) co_return read.status();
       first = std::move(*read);
     }
@@ -1184,8 +1278,7 @@ struct MetaControlClientService::Impl {
                  directive.recipient_boot_id == local_boot_id;
         });
     absl::Status installed = co_await installer_.InstallFullStateTransition(
-        std::move(*prepared), basis,
-        local_population_transition_expected);
+        std::move(*prepared), basis, local_population_transition_expected);
     if (!installed.ok()) co_return installed;
     directory_ = std::move(refreshed_directory);
     RecordClusterControlFullStateApplied();
@@ -1262,6 +1355,12 @@ struct MetaControlClientService::Impl {
         return "promotion-prepare";
     }
     return "unknown";
+  }
+
+  static bool IsFrozenSourceDirective(
+      const control::Directive& directive) noexcept {
+    return directive.kind == control::WireDirectiveKind::kAuthorizeSource &&
+           !directive.payload.empty() && !directive.preconditions.empty();
   }
 
   control::OperationEvidence EvidenceForDirective(
@@ -1348,18 +1447,21 @@ struct MetaControlClientService::Impl {
         return absl::InvalidArgumentError("unknown directive kind");
     }
 
-    const bool rebuild = kind == NodeDirective::Kind::kReplication ||
-                         kind == NodeDirective::Kind::kAuthorizeSource;
+    const bool source_directive =
+        kind == NodeDirective::Kind::kReplication ||
+        kind == NodeDirective::Kind::kAuthorizeSource;
     std::uint32_t flow_count = 0;
-    if (rebuild) {
+    if (kind == NodeDirective::Kind::kReplication ||
+        (kind == NodeDirective::Kind::kAuthorizeSource &&
+         directive.preconditions.empty())) {
       auto request = control::DecodeRebuildRequest(directive.payload);
       if (!request.ok()) return request.status();
       flow_count = request->source_flow_count;
     }
     std::optional<PromotionPrepareInput> promotion_prepare;
+    std::optional<FrozenSourceInput> frozen_source;
     if (kind == NodeDirective::Kind::kPromotionPrepare) {
-      auto request =
-          control::DecodePromotionPrepareRequest(directive.payload);
+      auto request = control::DecodePromotionPrepareRequest(directive.payload);
       if (!request.ok()) return request.status();
       flow_count = static_cast<std::uint32_t>(
           request->required_applied_next_lsns.size());
@@ -1373,6 +1475,21 @@ struct MetaControlClientService::Impl {
           .excluded_group_term_ = preconditions->excluded_group_term,
           .old_authority_exclusion_hash_ =
               preconditions->old_authority_exclusion_hash,
+      };
+    } else if (kind == NodeDirective::Kind::kAuthorizeSource &&
+               !directive.preconditions.empty()) {
+      auto request = control::DecodeFrozenSourceRequest(directive.payload);
+      if (!request.ok()) return request.status();
+      auto preconditions =
+          control::DecodeFrozenSourcePreconditions(directive.preconditions);
+      if (!preconditions.ok()) return preconditions.status();
+      flow_count = request->source_flow_count;
+      frozen_source = FrozenSourceInput{
+          .recovery_generation_ = request->recovery_generation,
+          .excluded_group_term_ = preconditions->excluded_group_term,
+          .excluded_authority_version_ =
+              preconditions->excluded_authority_version,
+          .excluded_grant_revision_ = preconditions->excluded_grant_revision,
       };
     }
 
@@ -1465,12 +1582,17 @@ struct MetaControlClientService::Impl {
         .partition_replication_epoch_ = directive.partition_replication_epoch,
         .manifest_entries_ = std::move(manifest_entries),
         .promotion_prepare_ = std::move(promotion_prepare),
-        .payload_ = rebuild || kind == NodeDirective::Kind::kPromotionPrepare
+        .frozen_source_ = std::move(frozen_source),
+        .payload_ = source_directive ||
+                            kind == NodeDirective::Kind::kPromotionPrepare
                         ? std::string{}
                         : directive.payload,
-        .preconditions_ = kind == NodeDirective::Kind::kPromotionPrepare
-                              ? std::string{}
-                              : directive.preconditions,
+        .preconditions_ =
+            kind == NodeDirective::Kind::kPromotionPrepare ||
+                    (kind == NodeDirective::Kind::kAuthorizeSource &&
+                     !directive.preconditions.empty())
+                ? std::string{}
+                : directive.preconditions,
         .storage_mutating_ = directive.storage_mutating,
         .force_ = directive.force,
     };
@@ -1512,18 +1634,19 @@ struct MetaControlClientService::Impl {
       control::ControlSessionWriter& writer,
       const std::shared_ptr<SessionState>& state,
       const control::Directive& directive,
-      const NodeDirectiveCompletion::TerminalResult& applied,
-      bool started) {
-    const absl::Status status = applied.ok() ? absl::OkStatus()
-                                             : applied.status();
+      const NodeDirectiveCompletion::TerminalResult& applied, bool started) {
+    const absl::Status status =
+        applied.ok() ? absl::OkStatus() : applied.status();
     const bool promotion =
         directive.kind == control::WireDirectiveKind::kPromotionPrepare;
-    // Status-only directives retain their v1 terminal bytes. Only promotion
-    // owns an opaque typed success result, so extending the completion seam
-    // must not change rebuild/source receipt hashes during a rolling upgrade.
-    const std::string result = applied.ok()
-                                   ? (promotion ? *applied : std::string("ok"))
-                                   : std::string(status.message());
+    const bool frozen_source = IsFrozenSourceDirective(directive);
+    // Status-only directives retain their v1 terminal bytes. Promotion and
+    // frozen-source own opaque typed success results; ordinary source
+    // authorization must therefore continue to hash and return exactly "ok".
+    const std::string result =
+        applied.ok()
+            ? (promotion || frozen_source ? *applied : std::string("ok"))
+            : std::string(status.message());
     control::DirectiveResult response{
         .session_id = directive.session_id,
         .recipient_boot_id = directive.recipient_boot_id,
@@ -1560,6 +1683,7 @@ struct MetaControlClientService::Impl {
       std::optional<NodeDirectiveCompletion::TerminalResult> terminal =
           completion.terminal_result();
       if (terminal.has_value()) {
+        const bool frozen_source = IsFrozenSourceDirective(directive);
         if (directive.kind == control::WireDirectiveKind::kPromotionPrepare &&
             terminal->ok()) {
           auto prepared = control::DecodePromotionPreparedEvidence(**terminal);
@@ -1572,6 +1696,27 @@ struct MetaControlClientService::Impl {
           // history-stability check.
           state->replication_identity_.local_history_id_ =
               prepared->child_history_id;
+        } else if (frozen_source && terminal->ok()) {
+          auto request = control::DecodeFrozenSourceRequest(directive.payload);
+          auto frozen = control::DecodeFrozenSourceEvidence(**terminal);
+          if (!request.ok()) {
+            result = request.status();
+            break;
+          }
+          if (!frozen.ok()) {
+            result = frozen.status();
+            break;
+          }
+          if (frozen->recovery_generation != request->recovery_generation ||
+              frozen->source_history_id !=
+                  directive.source_replication_history_id ||
+              frozen->final_next_lsns.size() !=
+                  request->source_flow_count) {
+            result = absl::FailedPreconditionError(
+                "frozen source result does not match its request, history, or "
+                "flow count");
+            break;
+          }
         }
         result = co_await SendDirectiveCompleted(*state->writer_, directive);
         if (result.ok() && completion.started()) {
@@ -1579,10 +1724,11 @@ struct MetaControlClientService::Impl {
               directive.kind == control::WireDirectiveKind::kPromotionPrepare;
           std::string terminal_evidence =
               terminal->ok()
-                  ? (promotion ? **terminal : std::string("succeeded"))
+                  ? (promotion || frozen_source ? **terminal
+                                                : std::string("succeeded"))
                   : std::string(terminal->status().message());
           const std::string_view terminal_phase =
-              promotion ? "prepared" : "completed";
+              promotion ? "prepared" : (frozen_source ? "frozen" : "completed");
           result = co_await SendOperationEvidence(
               *state->writer_,
               EvidenceForDirective(directive, terminal_phase,
@@ -1760,8 +1906,8 @@ struct MetaControlClientService::Impl {
         !installed.ok()) {
       co_return installed;
     }
-    state->desired_ = std::make_shared<control::FullDesiredState>(
-        std::move(replacement));
+    state->desired_ =
+        std::make_shared<control::FullDesiredState>(std::move(replacement));
     state->accepted_directives_.clear();
     state->challenge_rotation_.Reset();
     if (absl::Status applied = co_await SendApplied(writer, *state->desired_);
@@ -1969,8 +2115,8 @@ struct MetaControlClientService::Impl {
       heartbeat.health.population_ready = readiness->has_value();
       heartbeat.health.summary = population.failure_reason_;
       const bool local_is_committed_owner =
-          MetaLeaseChallengeRotation::IsCommittedOwner(
-              state->desired_->groups, options_.node_id_);
+          MetaLeaseChallengeRotation::IsCommittedOwner(state->desired_->groups,
+                                                       options_.node_id_);
       const std::optional<std::size_t> local_group_index =
           state->challenge_rotation_.Next(state->desired_->groups,
                                           options_.node_id_);
@@ -2075,8 +2221,7 @@ struct MetaControlClientService::Impl {
           state->pending_heartbeat_.has_value() &&
           state->pending_heartbeat_->sequence_ == heartbeat_sequence;
       if (ack_still_pending && !state->heartbeat_ack_observed_) {
-        result =
-            state->heartbeat_ack_deadline_->Arm(state->progress_timeout_);
+        result = state->heartbeat_ack_deadline_->Arm(state->progress_timeout_);
         if (!result.ok()) break;
       }
       while (!state->closing_ && state->pending_heartbeat_.has_value() &&
@@ -2332,9 +2477,9 @@ struct MetaControlClientService::Impl {
     if (options_.tls_context_ != nullptr) {
       auto sans = stream.PeerCertificateUriSans();
       if (!sans.ok()) co_return sans.status();
-      const std::string& expected_principal =
-          endpoint.principal_.has_value() ? *endpoint.principal_
-                                          : *hello_member->principal;
+      const std::string& expected_principal = endpoint.principal_.has_value()
+                                                  ? *endpoint.principal_
+                                                  : *hello_member->principal;
       if (absl::Status identity =
               ValidateUniqueControlPrincipal(*sans, expected_principal);
           !identity.ok()) {
@@ -2633,8 +2778,7 @@ struct MetaControlClientService::Impl {
       // is independent of this control socket. NodeControl first closes and
       // drains action admission, then resolves that exact attempt before this
       // client joins the executor.
-      shutdown_cancel =
-          co_await CancelPopulationForShutdown();
+      shutdown_cancel = co_await CancelPopulationForShutdown();
     } else {
       immediate_invalidation = installer_.InvalidateSessionNow(session);
     }
@@ -2655,7 +2799,7 @@ struct MetaControlClientService::Impl {
       cleanup_status = std::move(cleanup);
     }
     co_return detail::MetaSessionRunResult(std::move(session_status),
-                                          std::move(cleanup_status));
+                                           std::move(cleanup_status));
   }
 
   MetaControlClientOptions options_;
@@ -2746,8 +2890,7 @@ celer::Task<absl::Status> MetaControlClientService::Run(celer::Worker& worker,
       const detail::MetaSessionRunResult session =
           co_await impl_->RunSession(worker, endpoint, &valid_ack);
       const absl::Status& reported = session.report_status();
-      if (!reported.ok() &&
-          reported.code() != absl::StatusCode::kCancelled) {
+      if (!reported.ok() && reported.code() != absl::StatusCode::kCancelled) {
         spdlog::warn("Meta control session to {} ended: {}",
                      EndpointText(endpoint.host_, endpoint.port_),
                      reported.message());

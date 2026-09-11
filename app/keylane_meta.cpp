@@ -75,6 +75,7 @@
 
 #include "keylane/meta/cluster_create.h"
 #include "keylane/meta/cluster_create_reconciler.h"
+#include "keylane/meta/controlled_failover_reconciler.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/ctl_server.h"
 #include "keylane/meta/data_control_runtime_status.h"
@@ -520,7 +521,7 @@ void ShutdownSignalHandler(int signal) {
 }
 
 absl::Status InstallShutdownSignalHandlers() {
-  struct sigaction action {};
+  struct sigaction action{};
   sigemptyset(&action.sa_mask);
   action.sa_handler = ShutdownSignalHandler;
   if (::sigaction(SIGINT, &action, nullptr) != 0 ||
@@ -868,6 +869,10 @@ int main(int argc, char** argv) {
       std::make_shared<keylane::meta::MetaClusterCreateReconciler>(
           foreign_executor, membership_gate, data_control_runtime_status,
           server, static_cast<std::uint64_t>(observation_ttl_ms) * 1000);
+  auto controlled_failover_reconciler =
+      std::make_shared<keylane::meta::MetaControlledFailoverReconciler>(
+          foreign_executor, membership_gate, obs_store,
+          data_control_runtime_status);
   auto membership_reconciler =
       std::make_shared<keylane::meta::MetaMembershipReconciler>(
           foreign_executor, *proposal_executor, server, state_machine,
@@ -916,6 +921,8 @@ int main(int argc, char** argv) {
       ctl_options.cluster_status_service_ = cluster_status_service;
       ctl_options.data_control_runtime_status_ = data_control_runtime_status;
       ctl_options.cluster_create_reconciler_ = cluster_create_reconciler;
+      ctl_options.controlled_failover_reconciler_ =
+          controlled_failover_reconciler;
       ctl_options.membership_reconciler_ = membership_reconciler;
       ctl_options.observation_ttl_ms_ = observation_ttl_ms;
       ctl_options.transport_ = MetaCtlServerOptions::Transport::kUnix;
@@ -930,6 +937,8 @@ int main(int argc, char** argv) {
       ctl_options.cluster_status_service_ = cluster_status_service;
       ctl_options.data_control_runtime_status_ = data_control_runtime_status;
       ctl_options.cluster_create_reconciler_ = cluster_create_reconciler;
+      ctl_options.controlled_failover_reconciler_ =
+          controlled_failover_reconciler;
       ctl_options.membership_reconciler_ = membership_reconciler;
       ctl_options.observation_ttl_ms_ = observation_ttl_ms;
       ctl_options.transport_ =
@@ -1000,6 +1009,7 @@ int main(int argc, char** argv) {
     // bind has rolled startup back.
     coordinator->RunAsLeader(membership_reconciler);
     coordinator->RunAsLeader(cluster_create_reconciler);
+    coordinator->RunAsLeader(controlled_failover_reconciler);
     coordinator->RunAsLeader(data_control);
   }
 
@@ -1027,6 +1037,7 @@ int main(int argc, char** argv) {
   // proposals/API entries may finish, but no remote Data or membership result
   // is needed to join; the next leader reconstructs work from the journal.
   cluster_create_reconciler->Shutdown();
+  controlled_failover_reconciler->Shutdown();
   membership_reconciler->Shutdown();
   // Stop both ingress surfaces first, then synchronously revoke the
   // leader-scoped publisher before quiescing NuRaft/Asio while the Celer

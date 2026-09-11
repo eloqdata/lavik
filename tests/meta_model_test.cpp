@@ -583,6 +583,8 @@ TEST(MetaModelCommands, BeginGroupTermRoundTrip) {
   cmd.group_id_ = "0123456789abcdef0123456789abcdef01234567";
   cmd.expected_term_ = 41;  // T-1
   cmd.new_term_ = 42;       // T
+  cmd.workflow_operation_id_ = MakeRequestId(0x71);
+  cmd.expected_operation_revision_ = 17;
   ExpectRoundTrip(cmd);
 }
 
@@ -611,6 +613,8 @@ TEST(MetaModelCommands, ActivateAuthorityRoundTrip) {
   cmd.new_authority_version_ = 5;
   cmd.new_topology_epoch_ = 102;
   cmd.new_config_epoch_ = 12;
+  cmd.workflow_operation_id_ = MakeRequestId(0x72);
+  cmd.expected_operation_revision_ = 23;
   ExpectRoundTrip(cmd);
 }
 
@@ -769,7 +773,15 @@ TEST(MetaModelCommands, AbortOperationRoundTrip) {
   cmd.operation_id_ = MakeOperationId(0x04);
   cmd.expected_revision_ = 2;
   cmd.reason_ = "target group fenced";
+  cmd.data_loss_possible_ = true;
   ExpectRoundTrip(cmd);
+
+  // The unreleased command schema evolves in-place as v1. An older encoded
+  // AbortOperation that ends before the required loss bit must fail-stop; it
+  // must not be accepted with a synthesized lossless default.
+  std::string legacy_layout = MustEncode(cmd);
+  legacy_layout.pop_back();
+  ExpectDecodeFailStop(legacy_layout);
 }
 
 TEST(MetaModelCommands, ArchiveOperationsRoundTrip) {
@@ -801,6 +813,82 @@ TEST(MetaModelCommands, DirectiveResultReceiptCommandsRoundTrip) {
   prune.receipts_ = {{commit.operation_id_, commit.directive_id_,
                       commit.attempt_id_, commit.directive_revision_}};
   ExpectRoundTrip(prune);
+}
+
+TEST(MetaOperationStore,
+     AuthorizeSourceAcceptsOnlyOrdinaryOrCanonicalFrozenBody) {
+  namespace control = keylane::cluster::control;
+  using keylane::meta::MetaDirectiveSpec;
+  using keylane::meta::MetaOperationStore;
+  using keylane::meta::SubmitOperation;
+  using keylane::meta::TransitionOperationPhase;
+
+  const auto request = control::EncodeFrozenSourceRequest(
+      control::FrozenSourceRequest{.recovery_generation = 7});
+  const auto preconditions = control::EncodeFrozenSourcePreconditions(
+      control::FrozenSourcePreconditions{.excluded_group_term = 4,
+                                         .excluded_authority_version = 9,
+                                         .excluded_grant_revision = 11});
+  ASSERT_TRUE(request.ok()) << request.status();
+  ASSERT_TRUE(preconditions.ok()) << preconditions.status();
+
+  MetaDirectiveSpec base;
+  base.directive_id_.fill(1);
+  base.attempt_id_.fill(2);
+  base.recipient_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  base.target_node_id_ = "89abcdef0123456789abcdef0123456789abcdef";
+  base.target_boot_id_.fill(3);
+  base.assignment_id_.fill(4);
+  base.source_node_id_ = base.recipient_node_id_;
+  base.source_assignment_id_.fill(5);
+  base.source_boot_id_.fill(6);
+  base.source_replication_history_id_.fill(7);
+  base.group_id_ = "group-a";
+  base.group_term_ = 5;
+  base.authority_version_ = 9;
+  base.grant_revision_ = 11;
+  base.kind_ = std::string(keylane::meta::kMetaDirectiveAuthorizeSource);
+
+  const auto accepted = [&](MetaDirectiveSpec directive) {
+    MetaOperationStore store;
+    SubmitOperation submit;
+    submit.operation_id_.fill(8);
+    submit.kind_ = "test";
+    submit.intent_ = "intent";
+    submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
+    EXPECT_TRUE(store.SubmitOperation(submit, 1).ok());
+    TransitionOperationPhase transition;
+    transition.operation_id_ = submit.operation_id_;
+    transition.current_directives_ = {std::move(directive)};
+    return store.TransitionOperationPhase(transition, 2).ok();
+  };
+
+  EXPECT_TRUE(accepted(base));  // existing active-authority form
+  MetaDirectiveSpec frozen = base;
+  frozen.payload_ = *request;
+  frozen.preconditions_ = *preconditions;
+  EXPECT_TRUE(accepted(frozen));
+
+  MetaDirectiveSpec partial = frozen;
+  partial.preconditions_.clear();
+  EXPECT_FALSE(accepted(partial));
+  partial = frozen;
+  partial.payload_.clear();
+  EXPECT_FALSE(accepted(partial));
+
+  MetaDirectiveSpec malformed = frozen;
+  malformed.payload_.append("trailing");
+  EXPECT_FALSE(accepted(malformed));
+  malformed = frozen;
+  malformed.preconditions_[0] ^= 0x7f;
+  EXPECT_FALSE(accepted(malformed));
+
+  MetaDirectiveSpec mutating = frozen;
+  mutating.storage_mutating_ = true;
+  EXPECT_FALSE(accepted(mutating));
+  MetaDirectiveSpec forced = frozen;
+  forced.force_ = true;
+  EXPECT_FALSE(accepted(forced));
 }
 
 TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
@@ -846,6 +934,38 @@ TEST(MetaModelCommands, SetGroupReplicationStateRoundTrip) {
   command.new_partition_replication_epoch_ = 11;
   command.new_topology_epoch_ = 12;
   ExpectRoundTrip(command);
+}
+
+TEST(MetaModelCommands, FailoverRecoveryCommandsRoundTrip) {
+  keylane::meta::SetFailoverRecovery set;
+  set.request_id_ = MakeRequestId(0x76);
+  set.group_id_ = "g-recovery";
+  set.expected_revision_ = 31;
+  set.recovery_generation_ = 7;
+  set.old_source_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  set.old_source_assignment_id_.fill(0x11);
+  set.old_source_boot_incarnation_.fill(0x12);
+  set.old_source_history_id_.fill(0x13);
+  set.excluded_authority_term_ = 17;
+  set.excluded_authority_version_ = 19;
+  set.excluded_grant_revision_ = 23;
+  set.population_manifest_revision_ = 29;
+  set.population_manifest_digest_.fill(0x14);
+  set.partition_replication_epoch_ = 31;
+  set.hold_required_ = true;
+  set.recovery_required_ = true;
+  set.proof_state_ = keylane::meta::MetaFailoverProofState::kExact;
+  set.frozen_proof_ = keylane::meta::MetaFailoverFrozenProof{
+      .final_next_lsns_ = {101, 202}, .proof_hash_ = {}};
+  set.frozen_proof_->proof_hash_.fill(0x15);
+  ExpectRoundTrip(set);
+
+  keylane::meta::ClearFailoverRecovery clear;
+  clear.request_id_ = MakeRequestId(0x77);
+  clear.group_id_ = set.group_id_;
+  clear.expected_revision_ = 37;
+  clear.recovery_generation_ = set.recovery_generation_;
+  ExpectRoundTrip(clear);
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1148,7 @@ std::string DomainStateBytes(const MetaStores& stores) {
   out += stores.grant_.Serialize().value_or("!");
   out += stores.operation_.Serialize().value_or("!");
   out += stores.population_manifest_.Serialize();
+  out += stores.failover_recovery_.Serialize();
   return out;
 }
 
@@ -1178,6 +1299,28 @@ TEST(MetaStateApply, MetaStoresSnapshotRoundTrip) {
   ApplyOk(stores, 2, group);
 
   const std::string bytes = MustSerialize(stores);
+
+  // Pin the current aggregate layout independently of its decoder. The
+  // eighth blob is an empty failover-recovery store for this fixture, between
+  // population manifests and audit; omitting it is not another valid v1.
+  MetaWriter expected;
+  expected.WriteU16(keylane::meta::kMetaFormatVersion);
+  expected.WriteString(stores.identity_.Serialize());
+  expected.WriteString(stores.topology_.Serialize());
+  expected.WriteString(stores.policy_.Serialize());
+  const auto grant = stores.grant_.Serialize();
+  ASSERT_TRUE(grant.ok()) << grant.status();
+  expected.WriteString(*grant);
+  const auto operation = stores.operation_.Serialize();
+  ASSERT_TRUE(operation.ok()) << operation.status();
+  expected.WriteString(*operation);
+  expected.WriteString(stores.population_manifest_.Serialize());
+  expected.WriteString(stores.failover_recovery_.Serialize());
+  const auto audit = stores.audit_.Serialize();
+  ASSERT_TRUE(audit.ok()) << audit.status();
+  expected.WriteString(*audit);
+  EXPECT_EQ(bytes, expected.buffer());
+
   const auto restored = MetaStores::Deserialize(bytes);
   ASSERT_TRUE(restored.ok()) << restored.status();
   // Equal states serialize to equal bytes.
@@ -1191,6 +1334,112 @@ TEST(MetaStateApply, MetaStoresSnapshotRoundTrip) {
   EXPECT_EQ(static_cast<std::uint16_t>(envelope[0] | (envelope[1] << 8)), 1);
   EXPECT_EQ(static_cast<std::uint16_t>(envelope[0] | (envelope[1] << 8)),
             keylane::meta::kMetaFormatVersion);
+}
+
+TEST(MetaStateApply, MetaStoresRejectsLegacySevenStoreLayout) {
+  MetaStores stores;
+  ApplyOk(stores, 1, MakeRegisterFor(1));
+  keylane::meta::CreateGroup group;
+  group.request_id_ = MakeRequestId(0x33);
+  group.group_id_ = "g1";
+  group.new_topology_epoch_ = 1;
+  ApplyOk(stores, 2, group);
+
+  // Before failover recovery became the eighth committed store, development
+  // snapshots placed audit immediately after population manifests. The Meta
+  // format policy explicitly does not promise compatibility for those
+  // unreleased layouts, so accepting this as a partially empty current state
+  // would be unsafe. It must fail deterministically instead.
+  MetaWriter legacy;
+  legacy.WriteU16(keylane::meta::kMetaFormatVersion);
+  legacy.WriteString(stores.identity_.Serialize());
+  legacy.WriteString(stores.topology_.Serialize());
+  legacy.WriteString(stores.policy_.Serialize());
+  const auto grant = stores.grant_.Serialize();
+  ASSERT_TRUE(grant.ok()) << grant.status();
+  legacy.WriteString(*grant);
+  const auto operation = stores.operation_.Serialize();
+  ASSERT_TRUE(operation.ok()) << operation.status();
+  legacy.WriteString(*operation);
+  legacy.WriteString(stores.population_manifest_.Serialize());
+  const auto audit = stores.audit_.Serialize();
+  ASSERT_TRUE(audit.ok()) << audit.status();
+  legacy.WriteString(*audit);
+
+  const auto restored = MetaStores::Deserialize(legacy.buffer());
+  ASSERT_FALSE(restored.ok());
+  EXPECT_EQ(keylane::meta::MetaFailureClassOf(restored.status()),
+            keylane::meta::MetaFailureClass::kFailStop);
+}
+
+keylane::meta::ActivateAuthority MakeActivate(
+    const std::string& group_id, std::uint64_t expected_term,
+    std::uint32_t owner_node, std::uint64_t authority_version,
+    std::uint64_t topology_epoch, std::uint64_t config_epoch,
+    const std::string& policy_id, std::uint64_t policy_version);
+void SetupActivatedGroupPrerequisites(MetaStores& stores, std::uint32_t node,
+                                      const std::string& group_id);
+
+TEST(MetaStateApply, FailoverRecoveryAppliesAgainstExactCommittedAnchors) {
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 7, "p", 1)});
+
+  keylane::meta::PutPopulationManifest put;
+  put.entries_ = {{1, 11}, {7, 17}};
+  put.manifest_digest_ =
+      keylane::meta::MetaPopulationManifestStore::CanonicalDigest(put.entries_);
+  ApplyOk(stores, 7, MetaCommand{put});
+  keylane::meta::SetGroupReplicationState population;
+  population.group_id_ = "g1";
+  population.new_population_manifest_revision_ = 1;
+  population.new_population_manifest_digest_ = put.manifest_digest_;
+  population.new_partition_replication_epoch_ = 1;
+  population.new_topology_epoch_ = 4;
+  ApplyOk(stores, 8, MetaCommand{population});
+
+  keylane::meta::SetFailoverRecovery recovery;
+  recovery.group_id_ = "g1";
+  recovery.recovery_generation_ = 1;
+  recovery.old_source_node_id_ = MakeNodeId(1);
+  recovery.old_source_assignment_id_.fill(1);
+  recovery.old_source_boot_incarnation_.fill(0x21);
+  recovery.old_source_history_id_.fill(0x22);
+  recovery.excluded_authority_term_ = 1;
+  recovery.excluded_authority_version_ = 1;
+  recovery.excluded_grant_revision_ = 6;
+  recovery.population_manifest_revision_ = 1;
+  recovery.population_manifest_digest_ = put.manifest_digest_;
+  recovery.partition_replication_epoch_ = 1;
+  recovery.hold_required_ = true;
+  const MetaApplyResult applied = ApplyOk(stores, 9, MetaCommand{recovery});
+  EXPECT_EQ(applied.command_tag_,
+            keylane::meta::MetaCommandTag::kSetFailoverRecovery);
+  ASSERT_TRUE(stores.failover_recovery_.Find("g1").has_value());
+  EXPECT_EQ(stores.failover_recovery_.Find("g1")->revision_, 9u);
+
+  const auto restored = MetaStores::Deserialize(MustSerialize(stores));
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->failover_recovery_.Find("g1"),
+            stores.failover_recovery_.Find("g1"));
+
+  auto premature_successor = recovery;
+  premature_successor.expected_revision_ = 9;
+  premature_successor.recovery_generation_ = 2;
+  const std::string before_successor = DomainStateBytes(stores);
+  ApplyRejected(stores, 10, MetaCommand{premature_successor});
+  EXPECT_EQ(DomainStateBytes(stores), before_successor);
+
+  auto stale = recovery;
+  stale.expected_revision_ = 9;
+  stale.old_source_assignment_id_.fill(0x7f);
+  const std::string before = DomainStateBytes(stores);
+  ApplyRejected(stores, 11, MetaCommand{stale});
+  EXPECT_EQ(DomainStateBytes(stores), before);
+
+  // Release and clear are intentionally exercised by the typed terminal-owner
+  // lifecycle tests. This anchor-only fixture has no operation owner and must
+  // not manufacture one merely to bypass the production mutation gate.
 }
 
 TEST(MetaStateApply, MetaStoresDeserializeRejectsCorruption) {
@@ -1876,8 +2125,7 @@ TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
   moved.new_topology_epoch_ = 8;
   moved.config_epochs_ = {{"g1", 2}, {"g2", 2}};
   const std::string before = DomainStateBytes(stores);
-  MetaApplyResult source_live =
-      ApplyRejected(stores, 13, MetaCommand{moved});
+  MetaApplyResult source_live = ApplyRejected(stores, 13, MetaCommand{moved});
   EXPECT_NE(source_live.detail_.find("fenced"), std::string::npos);
   EXPECT_EQ(DomainStateBytes(stores), before);
 
@@ -1892,8 +2140,7 @@ TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
   MetaApplyResult destination_live =
       ApplyRejected(stores, 15, MetaCommand{moved});
   EXPECT_NE(destination_live.detail_.find("g2"), std::string::npos);
-  EXPECT_EQ(stores.topology_.SlotOwner(5000),
-            std::optional<std::string>("g1"));
+  EXPECT_EQ(stores.topology_.SlotOwner(5000), std::optional<std::string>("g1"));
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 7u);
 
   keylane::meta::FenceGroup fence_g2;
@@ -1902,8 +2149,7 @@ TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
   fence_g2.expected_term_ = 1;
   ApplyOk(stores, 16, MetaCommand{fence_g2});
   ApplyOk(stores, 17, MetaCommand{moved});
-  EXPECT_EQ(stores.topology_.SlotOwner(5000),
-            std::optional<std::string>("g2"));
+  EXPECT_EQ(stores.topology_.SlotOwner(5000), std::optional<std::string>("g2"));
   EXPECT_EQ(stores.topology_.FindGroup("g1")->config_epoch_, 2u);
   EXPECT_EQ(stores.topology_.FindGroup("g2")->config_epoch_, 2u);
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 8u);
@@ -1919,8 +2165,7 @@ TEST(MetaStateApply, SetSlotMapCannotChangeActiveGrantConfigEpoch) {
   change_config.new_topology_epoch_ = 4;
   change_config.config_epochs_ = {{"g1", 8}};
   const std::string before = DomainStateBytes(stores);
-  MetaApplyResult active =
-      ApplyRejected(stores, 7, MetaCommand{change_config});
+  MetaApplyResult active = ApplyRejected(stores, 7, MetaCommand{change_config});
   EXPECT_NE(active.detail_.find("fenced"), std::string::npos);
   EXPECT_EQ(DomainStateBytes(stores), before);
 
@@ -2236,6 +2481,34 @@ TEST(MetaStateApply, OperationLifecycleAndArchiveThroughDispatcher) {
   EXPECT_EQ(stores.operation_.ArchivedCount(), 1u);
 }
 
+TEST(MetaStateApply, AbortedOperationRetainsConservativeDataLossResult) {
+  MetaStores stores;
+  const keylane::meta::SubmitOperation submit = MakeSubmit(0x62, 0x22);
+  ApplyOk(stores, 1, MetaCommand{submit});
+
+  keylane::meta::AbortOperation abort;
+  abort.request_id_ = MakeRequestId(0x63);
+  abort.operation_id_ = submit.operation_id_;
+  abort.expected_revision_ = 0;
+  abort.reason_ = "failover-v1 stage=candidate-caught-up loss=unknown";
+  abort.data_loss_possible_ = true;
+  ApplyOk(stores, 2, MetaCommand{abort});
+
+  const auto failed = stores.operation_.FindOperation(submit.operation_id_);
+  ASSERT_TRUE(failed.has_value());
+  EXPECT_EQ(failed->lifecycle_,
+            keylane::meta::MetaOperationLifecycle::kAborted);
+  EXPECT_TRUE(failed->data_loss_possible_);
+
+  keylane::meta::ArchiveOperations archive;
+  archive.request_id_ = MakeRequestId(0x64);
+  archive.operation_seqs_ = {1};
+  ApplyOk(stores, 3, MetaCommand{archive});
+  const auto tombstone = stores.operation_.FindArchived(submit.operation_id_);
+  ASSERT_TRUE(tombstone.has_value());
+  EXPECT_TRUE(tombstone->data_loss_possible_);
+}
+
 TEST(MetaStateApply, DirectiveResultCommitUsesFirstRaftIndexOnReplay) {
   MetaStores stores;
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
@@ -2347,6 +2620,83 @@ TEST(MetaStateApply, DirectiveIntentMustMatchCommittedAuthorityAndAssignment) {
   ASSERT_EQ(installed.size(), 1u);
   EXPECT_EQ(installed[0].spec_, directive);
   EXPECT_EQ(installed[0].directive_revision_, 12u);
+}
+
+TEST(MetaStateApply,
+     FrozenAuthorizeSourceRequiresExactGrantlessSuccessorAnchor) {
+  namespace control = keylane::cluster::control;
+  MetaStores stores;
+  SetupActivatedGroupPrerequisites(stores, 1, "g1");
+  ApplyOk(stores, 6, MakeRegisterFor(2));
+  ApplyOk(stores, 7, MakeAssign("g1", 2, 2, 3));
+  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 1, 4, 1)});
+
+  keylane::meta::MetaDirectiveSpec directive;
+  directive.directive_id_.fill(1);
+  directive.attempt_id_.fill(2);
+  directive.recipient_node_id_ = MakeNodeId(1);
+  directive.target_node_id_ = MakeNodeId(2);
+  directive.target_boot_id_.fill(3);
+  directive.assignment_id_.fill(2);
+  directive.source_node_id_ = MakeNodeId(1);
+  directive.source_assignment_id_.fill(1);
+  directive.source_boot_id_.fill(4);
+  directive.source_replication_history_id_.fill(5);
+  directive.group_id_ = "g1";
+  directive.group_term_ = 1;
+  directive.authority_version_ = 1;
+  directive.grant_revision_ = 8;
+  directive.kind_ = std::string(keylane::meta::kMetaDirectiveAuthorizeSource);
+
+  // The ordinary empty authorize-source remains tied to the active finite
+  // grant. A typed frozen request may never run before BeginGroupTerm fences
+  // that authority.
+  EXPECT_TRUE(
+      keylane::meta::ValidateCommittedDirectiveAnchor(stores, directive).ok());
+  const auto payload = control::EncodeFrozenSourceRequest(
+      control::FrozenSourceRequest{.recovery_generation = 3});
+  const auto preconditions = control::EncodeFrozenSourcePreconditions(
+      control::FrozenSourcePreconditions{.excluded_group_term = 1,
+                                         .excluded_authority_version = 1,
+                                         .excluded_grant_revision = 8});
+  ASSERT_TRUE(payload.ok()) << payload.status();
+  ASSERT_TRUE(preconditions.ok()) << preconditions.status();
+  keylane::meta::MetaDirectiveSpec frozen = directive;
+  frozen.group_term_ = 2;
+  frozen.payload_ = *payload;
+  frozen.preconditions_ = *preconditions;
+  EXPECT_FALSE(
+      keylane::meta::ValidateCommittedDirectiveAnchor(stores, frozen).ok());
+
+  keylane::meta::BeginGroupTerm begin;
+  begin.group_id_ = "g1";
+  begin.expected_term_ = 1;
+  begin.new_term_ = 2;
+  ApplyOk(stores, 9, MetaCommand{begin});
+
+  EXPECT_TRUE(
+      keylane::meta::ValidateCommittedDirectiveAnchor(stores, frozen).ok());
+  directive.group_term_ = 2;
+  EXPECT_FALSE(
+      keylane::meta::ValidateCommittedDirectiveAnchor(stores, directive).ok());
+
+  auto stale = frozen;
+  auto stale_preconditions = control::EncodeFrozenSourcePreconditions(
+      control::FrozenSourcePreconditions{.excluded_group_term = 1,
+                                         .excluded_authority_version = 2,
+                                         .excluded_grant_revision = 8});
+  ASSERT_TRUE(stale_preconditions.ok()) << stale_preconditions.status();
+  stale.preconditions_ = *stale_preconditions;
+  EXPECT_FALSE(
+      keylane::meta::ValidateCommittedDirectiveAnchor(stores, stale).ok());
+  stale = frozen;
+  ++stale.grant_revision_;
+  EXPECT_FALSE(
+      keylane::meta::ValidateCommittedDirectiveAnchor(stores, stale).ok());
+  stale = frozen;
+  ++stale.authority_version_;
+  EXPECT_FALSE(
+      keylane::meta::ValidateCommittedDirectiveAnchor(stores, stale).ok());
 }
 
 struct InstalledDirectiveFixture {

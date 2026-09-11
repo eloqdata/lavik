@@ -32,7 +32,7 @@
 //     the command cannot move, or are skipped once the effect is in place).
 //
 // Cross-store invariants enforced HERE (the stores expose fact queries; this
-// layer is the only place that sees all seven stores):
+// layer is the only place that sees all eight stores):
 //   1. principal vs grant: the target node of AssignNodeToGroup,
 //      GrantAuthority, and ActivateAuthority must be a registered, non-retired
 //      node (identity store).
@@ -82,6 +82,11 @@
 //      before its first mutation and excludes another active creation id.
 //      Exact-id replay resolves before this guard, even after topology is
 //      populated.
+//  11. A live controlled failover owns its group's recovery and authority
+//      mutations. Apply revalidates the typed operation/recovery relation on
+//      every replica; in particular, an operation receipt and the independently
+//      versioned recovery record cannot race to discard a committed exact
+//      frozen-source result.
 //
 // MetaStores is the committed aggregate that snapshots serialize as one
 // versioned envelope: per-store length-prefixed versioned blobs in a fixed
@@ -98,6 +103,7 @@
 #include "absl/status/statusor.h"
 #include "keylane/meta/audit_store.h"
 #include "keylane/meta/commands.h"
+#include "keylane/meta/failover_recovery_store.h"
 #include "keylane/meta/grant_store.h"
 #include "keylane/meta/identity_store.h"
 #include "keylane/meta/operation_store.h"
@@ -107,7 +113,7 @@
 
 namespace keylane::meta {
 
-// The seven committed stores. Store constructor knobs (audit window capacity,
+// The eight committed stores. Store constructor knobs (audit window capacity,
 // group/operation caps) are deployment constants: snapshots do not carry
 // them and Deserialize restores defaults.
 struct MetaStores {
@@ -117,6 +123,7 @@ struct MetaStores {
   MetaGrantStore grant_;
   MetaOperationStore operation_;
   MetaPopulationManifestStore population_manifest_;
+  MetaFailoverRecoveryStore failover_recovery_;
   MetaAuditStore audit_;
 
   // One versioned envelope for snapshots: u16 schema_version, then a u32

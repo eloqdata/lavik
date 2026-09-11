@@ -187,6 +187,9 @@ class MetaCommittedView {
   const MetaPopulationManifestStore& population_manifest() const {
     return stores_.population_manifest_;
   }
+  const MetaFailoverRecoveryStore& failover_recovery() const {
+    return stores_.failover_recovery_;
+  }
   const MetaAuditStore& audit() const { return stores_.audit_; }
 
  private:

@@ -49,8 +49,10 @@
 #include "keylane/meta/cluster_create_reconciler.h"
 #include "keylane/meta/cluster_status.h"
 #include "keylane/meta/commands.h"
+#include "keylane/meta/controlled_failover_reconciler.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/data_control_runtime_status.h"
+#include "keylane/meta/failover.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/membership_reconciler.h"
@@ -980,6 +982,31 @@ std::int64_t NowUnixMs() {
       .count();
 }
 
+std::string FailoverFrontierText(const std::vector<std::uint64_t>& frontier) {
+  if (frontier.empty()) return "none";
+  std::string result;
+  for (const std::uint64_t cursor : frontier) {
+    if (!result.empty()) result.push_back(',');
+    absl::StrAppend(&result, cursor);
+  }
+  return result;
+}
+
+std::string SingleLine(std::string text) {
+  std::replace(text.begin(), text.end(), '\n', ' ');
+  std::replace(text.begin(), text.end(), '\r', ' ');
+  return text;
+}
+
+std::string FailoverOutcomeFields(const ControlledFailoverOutcome& outcome) {
+  return absl::StrCat(
+      "phase=", FailoverPhaseStageName(outcome.terminal_stage_),
+      " loss=", FailoverLossClassificationName(outcome.loss_),
+      " recovery_required=", outcome.recovery_required_ ? 1 : 0,
+      " frontier=", FailoverFrontierText(outcome.proven_next_lsns_),
+      " reason=", SingleLine(outcome.reason_));
+}
+
 // Strict decimal u64 ("0" allowed, no signs/padding games, overflow rejects).
 bool ParseU64(const std::string& text, std::uint64_t& out) {
   if (text.empty()) {
@@ -1068,7 +1095,9 @@ celer::Task<std::string> HandleSubmitOp(
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& kind, const std::string& payload,
     const MetaReplicationHistoryId& replication_history_id) {
-  if (kind == kMetaMembershipOperationKind) co_return "ERR workflow-owned";
+  if (kind == kMetaMembershipOperationKind || kind == kFailoverOperationKind) {
+    co_return "ERR workflow-owned";
+  }
   SubmitOperation command;
   command.request_id_ = MakeRequestId();
   command.operation_id_ = id;
@@ -1114,7 +1143,8 @@ celer::Task<std::string> HandleCompleteOp(
   // leave would allow a second workflow to overtake its uncertain outcome.
   if (record->kind_ == kMetaMembershipOperationKind ||
       record->kind_ == kMetaClusterCreateOperationKind ||
-      record->kind_ == kMetaClusterCreateV1GroupOperationKind)
+      record->kind_ == kMetaClusterCreateV1GroupOperationKind ||
+      record->kind_ == kFailoverOperationKind)
     co_return "ERR workflow-owned";
   CompleteOperation command;
   command.request_id_ = MakeRequestId();
@@ -1151,7 +1181,8 @@ celer::Task<std::string> HandleAbortOp(
   }
   if (record->kind_ == kMetaMembershipOperationKind ||
       record->kind_ == kMetaClusterCreateOperationKind ||
-      record->kind_ == kMetaClusterCreateV1GroupOperationKind)
+      record->kind_ == kMetaClusterCreateV1GroupOperationKind ||
+      record->kind_ == kFailoverOperationKind)
     co_return "ERR workflow-owned";
   AbortOperation command;
   command.request_id_ = MakeRequestId();
@@ -1180,6 +1211,31 @@ std::string HandleGetOp(nuraft::ptr<MetaStateMachine> state_machine,
       state_machine->FindOperation(id);
   if (!record.has_value()) {
     return "ERR not-found";
+  }
+  if (record->kind_ == kFailoverOperationKind) {
+    const auto intent = DecodeFailoverIntent(record->intent_);
+    if (!intent.ok()) return "ERR state-corrupt";
+    if (IsTerminal(record->lifecycle_)) {
+      const auto outcome =
+          DecodeControlledFailoverOutcome(record->terminal_result_);
+      if (!outcome.ok()) return "ERR state-corrupt";
+      return absl::StrCat("OK ", LifecycleName(record->lifecycle_),
+                          " kind=failover group=", intent->group_id_,
+                          " candidate=", intent->candidate_node_id_,
+                          " attempt_timeout_ms=", intent->attempt_timeout_ms_,
+                          " ", FailoverOutcomeFields(*outcome));
+    }
+    std::string_view phase = "planning";
+    if (!record->kind_phase_blob_.empty()) {
+      const auto decoded = DecodeFailoverPhase(record->kind_phase_blob_);
+      if (!decoded.ok()) return "ERR state-corrupt";
+      phase = FailoverPhaseStageName(decoded->stage_);
+    }
+    return absl::StrCat("OK ", LifecycleName(record->lifecycle_),
+                        " kind=failover group=", intent->group_id_,
+                        " candidate=", intent->candidate_node_id_,
+                        " phase=", phase,
+                        " attempt_timeout_ms=", intent->attempt_timeout_ms_);
   }
   if (IsTerminal(record->lifecycle_)) {
     return std::string("OK ") + LifecycleName(record->lifecycle_) + " " +
@@ -1474,6 +1530,10 @@ celer::Task<std::string> HandleTransitionOp(
   if (IsTerminal(record->lifecycle_)) {
     co_return "ERR terminal";
   }
+  if (record->kind_ == kMetaMembershipOperationKind ||
+      record->kind_ == kFailoverOperationKind) {
+    co_return "ERR workflow-owned";
+  }
   TransitionOperationPhase command;
   command.request_id_ = MakeRequestId();
   command.operation_id_ = id;
@@ -1666,6 +1726,137 @@ celer::Task<std::string> HandleClusterCreate(
           id,
           ClusterCreateLastBlocker(server, state_machine, runtime_status,
                                    observation_ttl_ms, manifest)));
+}
+
+std::string ControlledFailoverError(std::string_view phase,
+                                    std::string_view code, std::string detail) {
+  return absl::StrCat("ERR failover 1 ", phase, " ", code, " ",
+                      SingleLine(std::move(detail)));
+}
+
+// Admission selects exactly once from the #39 candidate plan and persists
+// that immutable incarnation before releasing the global topology-workflow
+// gate. The connection is only a bounded waiter; all subsequent progress and
+// cleanup remain owned by the leader-scoped reconciler.
+celer::Task<std::string> HandleControlledFailover(
+    const nuraft::ptr<nuraft::raft_server>& server,
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    const std::shared_ptr<MetaObservationStore>& observations,
+    const std::shared_ptr<MetaMembershipGate>& membership_gate,
+    AuthenticatedPrincipal principal, std::string group_id,
+    std::uint32_t wait_timeout_ms, std::uint32_t attempt_timeout_ms,
+    const bool* shutdown) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(wait_timeout_ms);
+  if (*shutdown) {
+    co_return ControlledFailoverError("preflight", "uncertain-outcome",
+                                      "Meta is shutting down");
+  }
+  auto workflow_lease = membership_gate->TryAcquire();
+  if (workflow_lease == nullptr) {
+    co_return ControlledFailoverError(
+        "preflight", "domain-rejected",
+        "another topology or authority workflow is in progress");
+  }
+  if (!server->is_leader() || !server->is_leader_alive() ||
+      !server->is_leader_sm_fully_caught_up()) {
+    co_return ControlledFailoverError(
+        "preflight", "not-leader",
+        "responder is not an eligible caught-up leader");
+  }
+
+  const MetaOperationId operation_id = MakeOperationId();
+  const MetaRequestId request_id = MakeRequestId();
+  const std::string id = HexEncode(std::string_view(
+      reinterpret_cast<const char*>(operation_id.data()), operation_id.size()));
+  const MetaCommittedView view = coordinator->CommittedView();
+  auto submission = BuildControlledFailoverSubmission(
+      group_id, operation_id, request_id, view, *observations, NowUnixMs(),
+      attempt_timeout_ms);
+  if (!submission.ok()) {
+    co_return ControlledFailoverError(
+        "preflight", "domain-rejected",
+        std::string(submission.status().message()));
+  }
+  const auto intent = DecodeFailoverIntent(submission->intent_);
+  if (!intent.ok()) {
+    co_return ControlledFailoverError("preflight", "state-corrupt",
+                                      "generated failover intent is invalid");
+  }
+  const std::string candidate = intent->candidate_node_id_;
+  const MetaHash256 intent_hash = submission->intent_hash_;
+  const std::string reply = co_await ProposeCommand(
+      coordinator, std::move(principal), std::move(*submission));
+  if (!reply.starts_with("OK ")) {
+    const bool definitive =
+        reply == "ERR rejected" || reply == "ERR resource-exhausted";
+    co_return ControlledFailoverError(
+        "submit-operation",
+        definitive ? "domain-rejected" : "uncertain-outcome",
+        absl::StrCat(reply, " operation=", id, " candidate=", candidate));
+  }
+  const auto committed = state_machine->FindOperation(operation_id);
+  if (!committed.has_value() || committed->kind_ != kFailoverOperationKind ||
+      committed->intent_hash_ != intent_hash) {
+    co_return ControlledFailoverError(
+        "submit-operation", "domain-rejected",
+        absl::StrCat("committed intent is absent operation=", id));
+  }
+  workflow_lease.reset();
+
+  std::string phase = "planning";
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (*shutdown || !server->is_leader() || !server->is_leader_alive()) {
+      co_return ControlledFailoverError(
+          phase, "uncertain-outcome",
+          absl::StrCat("wait cancelled; durable operation=", id,
+                       " candidate=", candidate));
+    }
+    const auto operation = state_machine->FindOperation(operation_id);
+    if (!operation.has_value()) {
+      co_return ControlledFailoverError(
+          phase, "uncertain-outcome",
+          absl::StrCat("operation disappeared operation=", id));
+    }
+    if (!operation->kind_phase_blob_.empty()) {
+      const auto decoded = DecodeFailoverPhase(operation->kind_phase_blob_);
+      if (!decoded.ok()) {
+        co_return ControlledFailoverError(
+            phase, "state-corrupt",
+            absl::StrCat("durable phase is invalid operation=", id));
+      }
+      phase = std::string(FailoverPhaseStageName(decoded->stage_));
+    }
+    if (IsTerminal(operation->lifecycle_)) {
+      const auto outcome =
+          DecodeControlledFailoverOutcome(operation->terminal_result_);
+      if (!outcome.ok()) {
+        co_return ControlledFailoverError(
+            phase, "state-corrupt",
+            absl::StrCat("terminal result is invalid operation=", id));
+      }
+      const std::string fields = FailoverOutcomeFields(*outcome);
+      if (operation->lifecycle_ == MetaOperationLifecycle::kCompleted &&
+          outcome->succeeded_) {
+        co_return absl::StrCat(
+            "OK failover 1 ", state_machine->StatusSnapshot().applied_index_,
+            " operation=", id, " candidate=", candidate, " ", fields);
+      }
+      co_return ControlledFailoverError(
+          FailoverPhaseStageName(outcome->terminal_stage_), "controlled-failed",
+          absl::StrCat("operation=", id, " candidate=", candidate, " ",
+                       fields));
+    }
+    const auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                                std::chrono::milliseconds(10));
+    if (!slept.ok()) break;
+  }
+  co_return ControlledFailoverError(
+      phase, "uncertain-outcome",
+      absl::StrCat("wait deadline expired; background failover continues; "
+                   "operation=",
+                   id, " candidate=", candidate));
 }
 
 celer::Task<std::string> HandlePruneAudit(
@@ -2256,7 +2447,7 @@ celer::Task<std::string> DispatchCommand(
     std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status,
     std::uint32_t observation_ttl_ms, std::size_t* retained_status_bytes,
     std::string_view line, const bool* shutdown, bool creation_enabled,
-    bool membership_enabled) {
+    bool failover_enabled, bool membership_enabled) {
   const std::vector<std::string> tokens = SplitTokens(line);
   if (tokens.empty()) {
     co_return "ERR bad-request";
@@ -2267,7 +2458,7 @@ celer::Task<std::string> DispatchCommand(
   if (command == "status") {
     access = MetaAccess::kStatus;
   } else if (command == "clusterhead" || command == "clusterstatus" ||
-             command == "clustercreate") {
+             command == "clustercreate" || command == "failover") {
     // Cluster-wide topology and readiness are operator-only even though the
     // legacy local status verb is also visible to a Data-node identity.
     if (identity.role_ != MetaPrincipalRole::kOperator) {
@@ -2351,6 +2542,31 @@ celer::Task<std::string> DispatchCommand(
         server, state_machine, coordinator, membership_gate,
         data_control_runtime_status, observation_ttl_ms, std::move(principal),
         *manifest, wait_timeout_ms, shutdown);
+  }
+  if (command == "failover") {
+    if (!failover_enabled) {
+      co_return ControlledFailoverError(
+          "preflight", "runtime-unavailable",
+          "controlled failover reconciler is unavailable");
+    }
+    std::uint64_t wait_timeout_ms = 0;
+    std::uint64_t attempt_timeout_ms = 0;
+    if (tokens.size() != 5 || tokens[1] != "1" || tokens[2].empty() ||
+        tokens[2].size() > kMaxMetaGroupIdBytes ||
+        !ParseU64(tokens[3], wait_timeout_ms) || wait_timeout_ms == 0 ||
+        wait_timeout_ms > 3'600'000 ||
+        !ParseU64(tokens[4], attempt_timeout_ms) || attempt_timeout_ms == 0 ||
+        attempt_timeout_ms > kMaxControlledFailoverAttemptTimeoutMs) {
+      co_return ControlledFailoverError(
+          "decode", "bad-request",
+          "expected failover 1 <group_id> <wait_ms:1..3600000> "
+          "<attempt_ms:1..3600000>");
+    }
+    co_return co_await HandleControlledFailover(
+        server, state_machine, coordinator, obs_store, membership_gate,
+        std::move(principal), tokens[2],
+        static_cast<std::uint32_t>(wait_timeout_ms),
+        static_cast<std::uint32_t>(attempt_timeout_ms), shutdown);
   }
   if (command == "submitop" || command == "completeop" ||
       command == "abortop" || command == "archiveoperations" ||
@@ -2921,6 +3137,8 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
           &core->shutdown_,
           core->options_.cluster_create_reconciler_ != nullptr &&
               core->options_.cluster_create_reconciler_->accepting(),
+          core->options_.controlled_failover_reconciler_ != nullptr &&
+              core->options_.controlled_failover_reconciler_->accepting(),
           core->options_.membership_reconciler_ != nullptr &&
               core->options_.membership_reconciler_->accepting());
       reply.push_back('\n');

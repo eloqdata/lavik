@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -185,9 +186,33 @@ struct ClusterPromotionPrepareDirective {
   std::string parent_history_id_;
   std::vector<std::uint64_t> required_applied_next_lsns_;
   std::uint64_t excluded_group_term_ = 0;
+  // Retained beside the operation/directive/attempt identity so a later
+  // generic lease can activate only the immediate successor of the authority
+  // whose exclusion proof authorized this prepare.
+  std::uint64_t excluded_authority_version_ = 0;
+  std::uint64_t excluded_grant_revision_ = 0;
   std::array<std::uint8_t, 32> old_authority_exclusion_hash_{};
 
   bool operator==(const ClusterPromotionPrepareDirective&) const = default;
+};
+
+// Current-FDS identity supplied at the finite-lease boundary. This is an
+// in-process domain value, not another control directive: the retained
+// promotion-prepare context already owns the exact operation, directive,
+// attempt, and prepared evidence that may be activated.
+struct ClusterPromotionActivation {
+  std::string group_id_;
+  std::string assignment_id_;
+  std::uint64_t group_term_ = 0;
+  std::uint64_t authority_version_ = 0;
+  std::uint64_t grant_revision_ = 0;
+  std::string target_node_id_;
+  std::string target_boot_id_;
+  std::uint64_t manifest_revision_ = 0;
+  PopulationManifestId manifest_id_;
+  std::uint64_t partition_replication_epoch_ = 0;
+
+  bool operator==(const ClusterPromotionActivation&) const = default;
 };
 
 // Boot-local proof returned after the shared promotion kernel has made the
@@ -282,6 +307,15 @@ struct NativeReplicationWatermark {
   std::vector<std::uint64_t> next_lsns_;
 };
 
+// Boot-local terminal result of freezing one source history for failover.
+// The recovery generation binds the all-flow frontier to Meta's durable
+// recovery record; transport encoding and authority-exclusion proofs remain
+// owned by the control plane.
+struct FrozenSourceCapture {
+  std::uint64_t recovery_generation_ = 0;
+  NativeReplicationWatermark watermark_;
+};
+
 struct ReplicationDirective {
   // kSetUpstream consumes upstream_; an empty endpoint requests promotion.
   // kAddUpstream requires upstream_ and adds another Redis Cluster source to
@@ -373,6 +407,27 @@ class ReplicationManager {
   StartClusterPromotionPrepareDirective(
       ClusterPromotionPrepareDirective directive);
 
+  // Activates the sole successfully prepared Cluster promotion when a later
+  // exact FDS and finite lease name its immediate successor authority. An
+  // ordinary already-master population is an idempotent no-op after the same
+  // population anchors are checked. A prepared replica remains LOADING on
+  // every rejection.
+  celer::Task<absl::Status> ActivateClusterPreparedPromotion(
+      ClusterPromotionActivation activation);
+
+  // Enables Meta-managed expiration only after NodeControl has revalidated
+  // the exact lease following activation. The absolute CLOCK_BOOTTIME
+  // deadline is enforced by StorageEngine at the final mutation cut.
+  absl::Status EnableClusterExpirationAuthorityUntil(
+      std::chrono::nanoseconds deadline_since_boot) noexcept;
+
+  // Revokes this process's boot-local background expiration authority and
+  // waits for already-running expiration and Tomb Raider work to leave their
+  // mutation boundaries. Meta's assignment drain invokes this after closing
+  // request authority; a later exact FDS plus finite lease activation may
+  // enable expiration again without rebuilding the retained population.
+  celer::Task<absl::Status> RevokeClusterExpirationAuthority();
+
   // Convenience wrapper that starts and awaits one full rebuild. Production
   // NodeControl uses StartClusterRebuildDirective so wire admission and later
   // terminal observation remain distinct; this wrapper returns success only
@@ -408,6 +463,13 @@ class ReplicationManager {
   celer::Task<absl::Status> ReconcileClusterPopulation(
       std::optional<DesiredClusterPopulation> desired);
 
+  // Reconciles the boot-local request to retain this node's current source
+  // history. FDS may retain or release an already armed hold but cannot arm
+  // one; the first arm requires a later matching successful source
+  // authorization. An absent desired value releases the hold idempotently.
+  celer::Task<absl::Status> ReconcileClusterSourceHistoryHold(
+      std::optional<SourceHistoryHoldDesired> desired);
+
   // Transport loss cannot leave an unobserved destructive attempt running.
   // A completed Ready population is retained so reconnecting with the same
   // FDS does not force another full rebuild.
@@ -427,6 +489,15 @@ class ReplicationManager {
   // fail-closed.
   celer::Task<absl::Status> AuthorizeClusterRebuildSource(
       RebuildDirective directive);
+
+  // Authorizes one candidate through the ordinary source ledger, then returns
+  // the final source-wide frontier retained by an already armed exact history
+  // hold. FDS reconciliation cannot arm this operation. Exact replays for the
+  // same held recovery generation reuse the first captured frontier, including
+  // when a replacement candidate has a different target-side export scope.
+  celer::Task<absl::StatusOr<FrozenSourceCapture>>
+  FreezeAndAuthorizeClusterRebuildSource(std::uint64_t recovery_generation,
+                                         RebuildDirective directive);
 
   // Revokes every downstream destructive-reset capability and reconnect lease
   // (for example, when this node loses primary authority). An accepted

@@ -152,11 +152,10 @@ std::string Hex(const std::array<std::uint8_t, N>& bytes) {
 
 absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
     const MetaDirectiveSpec& directive) {
-  if ((directive.kind_ == kMetaDirectiveRebuild ||
-       directive.kind_ == kMetaDirectiveAuthorizeSource) &&
+  if (directive.kind_ == kMetaDirectiveRebuild &&
       (!control::DecodeRebuildRequest(directive.payload_).ok() ||
        !directive.preconditions_.empty())) {
-    return Invalid("rebuild/source authorization has an invalid typed body");
+    return Invalid("rebuild directive has an invalid typed body");
   }
   if (directive.kind_ == kMetaDirectiveRebuild) {
     if (!directive.storage_mutating_) {
@@ -176,8 +175,7 @@ absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
       return Invalid("promotion-prepare directive must be storage-mutating");
     }
     if (!control::DecodePromotionPrepareRequest(directive.payload_).ok() ||
-        !control::DecodePromotionPreparePreconditions(
-             directive.preconditions_)
+        !control::DecodePromotionPreparePreconditions(directive.preconditions_)
              .ok()) {
       return Invalid("promotion-prepare directive has an invalid typed body");
     }
@@ -186,6 +184,19 @@ absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
   if (directive.kind_ == kMetaDirectiveAuthorizeSource) {
     if (directive.storage_mutating_) {
       return Invalid("authorize-source directive must not be storage-mutating");
+    }
+    const bool valid = directive.preconditions_.empty()
+                           ? control::DecodeRebuildRequest(directive.payload_)
+                                 .ok()
+                           : control::DecodeFrozenSourceRequest(
+                                 directive.payload_)
+                                     .ok() &&
+                                 control::DecodeFrozenSourcePreconditions(
+                                     directive.preconditions_)
+                                     .ok();
+    if (!valid) {
+      return Invalid(
+          "authorize-source directive has an invalid typed body");
     }
     return control::WireDirectiveKind::kAuthorizeSource;
   }
@@ -219,10 +230,9 @@ absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
   if (IsZero(operation.operation_id_) || IsZero(source.directive_id_) ||
       IsZero(source.attempt_id_) || IsZero(source.assignment_id_) ||
       IsZero(source.target_boot_id_) ||
-      (!initializes_empty &&
-       (IsZero(source.source_assignment_id_) ||
-        IsZero(source.source_boot_id_) ||
-        IsZero(source.source_replication_history_id_))) ||
+      (!initializes_empty && (IsZero(source.source_assignment_id_) ||
+                              IsZero(source.source_boot_id_) ||
+                              IsZero(source.source_replication_history_id_))) ||
       current.directive_revision_ == 0) {
     return Inconsistent("current directive contains an empty identity");
   }
@@ -318,12 +328,10 @@ bool ClusterCreateDirectiveReady(const MetaOperationRecord& operation,
       });
   if (authorize == operation.current_directives_.end()) return false;
   return std::any_of(
-      operation.terminal_receipts_.begin(),
-      operation.terminal_receipts_.end(),
+      operation.terminal_receipts_.begin(), operation.terminal_receipts_.end(),
       [&](const MetaTerminalReceipt& receipt) {
         return receipt.key_.operation_id_ == operation.operation_id_ &&
-               receipt.key_.directive_id_ ==
-                   authorize->spec_.directive_id_ &&
+               receipt.key_.directive_id_ == authorize->spec_.directive_id_ &&
                receipt.key_.attempt_id_ == authorize->spec_.attempt_id_ &&
                receipt.key_.directive_revision_ ==
                    authorize->directive_revision_ &&
@@ -395,6 +403,24 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     projected.manifest_digest = source.record_.population_manifest_digest_;
     projected.partition_replication_epoch =
         source.record_.partition_replication_epoch_;
+
+    // A source history hold is addressed to one exact old-primary
+    // incarnation. Other members still receive the group topology, but must
+    // not retain this source's history merely because they share the group.
+    const auto recovery = view.failover_recovery().Find(source.group_id_);
+    if (recovery.has_value() && recovery->hold_required_ &&
+        recovery->old_source_node_id_ == node_id) {
+      projected.source_history_hold = control::WireSourceHistoryHold{
+          .generation = recovery->recovery_generation_,
+          .source_assignment_id = recovery->old_source_assignment_id_,
+          .source_boot_id = Hex(recovery->old_source_boot_incarnation_),
+          .source_replication_history_id =
+              Hex(recovery->old_source_history_id_),
+          .manifest_revision = recovery->population_manifest_revision_,
+          .manifest_digest = recovery->population_manifest_digest_,
+          .partition_replication_epoch = recovery->partition_replication_epoch_,
+      };
+    }
 
     for (const MetaGroupMember& member : source.members_) {
       if (!active_nodes.contains(member.node_id_)) {
@@ -657,6 +683,10 @@ std::size_t NodeControlBatchRetainedBytes(
     }
     if (group.owner_node_id.has_value()) add_string(*group.owner_node_id);
     add_array(group.slot_ranges.capacity(), sizeof(control::WireSlotRange));
+    if (group.source_history_hold.has_value()) {
+      add_string(group.source_history_hold->source_boot_id);
+      add_string(group.source_history_hold->source_replication_history_id);
+    }
     add_string(group.grant_policy_id);
   }
 

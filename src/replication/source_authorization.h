@@ -101,31 +101,16 @@ class SourceAuthorizationLedger {
   bool MatchesAuthorizedRebuild(const RebuildIdentity& requested,
                                 std::uint32_t flow_count,
                                 bool safe_source_active) const {
+    const RebuildExportScope requested_scope =
+        RebuildDirective{.identity_ = requested, .flow_count_ = flow_count}
+            .ExportScope();
     return std::any_of(
         active_.begin(), active_.end(), [&](const RebuildDirective& installed) {
-          const RebuildIdentity& authorized = installed.identity_;
-          return installed.flow_count_ == flow_count &&
-                 installed.safe_source_active_ == safe_source_active &&
-                 authorized.group_id_ == requested.group_id_ &&
-                 authorized.assignment_id_ == requested.assignment_id_ &&
-                 authorized.term_ == requested.term_ &&
-                 authorized.directive_revision_ ==
-                     requested.directive_revision_ &&
-                 authorized.authority_id_ == requested.authority_id_ &&
-                 authorized.source_node_id_ == requested.source_node_id_ &&
-                 authorized.source_assignment_id_ ==
-                     requested.source_assignment_id_ &&
-                 authorized.source_boot_id_ == requested.source_boot_id_ &&
-                 authorized.source_history_id_ ==
-                     requested.source_history_id_ &&
-                 authorized.target_node_id_ == requested.target_node_id_ &&
-                 authorized.target_boot_id_ == requested.target_boot_id_ &&
-                 authorized.operation_id_ == requested.operation_id_ &&
-                 authorized.manifest_revision_ ==
-                     requested.manifest_revision_ &&
-                 authorized.manifest_id_ == requested.manifest_id_ &&
-                 authorized.partition_replication_epoch_ ==
-                     requested.partition_replication_epoch_;
+          // Authorize() still admits and versions the complete directive. This
+          // narrower equality is only the continuity check for an already
+          // authorized native export session.
+          return installed.safe_source_active_ == safe_source_active &&
+                 installed.ExportScope() == requested_scope;
         });
   }
 

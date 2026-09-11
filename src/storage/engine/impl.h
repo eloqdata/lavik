@@ -1140,7 +1140,7 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
                            .controller_id_ = device->controller_id_,
                            .io_queue_count_ = device->io_queue_count_};
   }
-  struct stat file_info {};
+  struct stat file_info{};
   if (::stat(path.c_str(), &file_info) != 0) {
     return absl::Status(
         absl::StatusCode::kInternal,
@@ -1252,6 +1252,15 @@ inline Task<absl::Status> PauseGroupedWriteForTest(Worker& worker,
 
 class StorageEngine::Impl {
  public:
+  struct ExpirationAuthorityGrant {
+    explicit ExpirationAuthorityGrant(
+        std::chrono::nanoseconds deadline_since_boot)
+        : deadline_since_boot_(deadline_since_boot) {}
+
+    std::atomic<bool> active_{true};
+    const std::chrono::nanoseconds deadline_since_boot_;
+  };
+
   explicit Impl(StorageEngineOptions options) : options_(std::move(options)) {
     shutdown_checkpoint_enabled_.store(options_.shutdown_checkpoint_,
                                        std::memory_order_relaxed);
@@ -1259,7 +1268,14 @@ class StorageEngine::Impl {
         options_.replication_publish_queue_bytes_, std::memory_order_relaxed);
     replication_backlog_backpressure_.store(
         options_.replication_backlog_backpressure_, std::memory_order_relaxed);
-    expiration_authority_.store(options_.expiration_authority_,
+    permanent_expiration_authority_ =
+        std::make_shared<ExpirationAuthorityGrant>(
+            std::chrono::nanoseconds::max());
+    permanent_expiration_authority_->active_.store(
+        options_.expiration_authority_, std::memory_order_relaxed);
+    expiration_authority_.store(options_.expiration_authority_
+                                    ? permanent_expiration_authority_
+                                    : nullptr,
                                 std::memory_order_relaxed);
     const TombRaiderMode mode =
         options_.expiration_authority_ && options_.tomb_raider_interval_ms_ != 0
@@ -1588,6 +1604,10 @@ class StorageEngine::Impl {
       std::uint64_t mutation_sequence_ = 0;
       std::uint64_t expire_at_ms_ = 0;
       std::string key_;
+      // A queued candidate retains the exact grant that admitted it. Revoking
+      // or replacing that grant makes the final storage precondition fail,
+      // even if a newer lease is enabled before this candidate runs.
+      std::shared_ptr<ExpirationAuthorityGrant> expiration_authority_;
     };
 
     Worker* worker_ = nullptr;
@@ -2171,9 +2191,18 @@ class StorageEngine::Impl {
     expiration_pause_count_.fetch_sub(1, std::memory_order_acq_rel);
   }
 
-  void SetExpirationAuthority(bool authority) noexcept {
-    expiration_authority_.store(authority, std::memory_order_release);
-  }
+  void SetExpirationAuthority(bool authority) noexcept;
+
+  absl::Status SetExpirationAuthorityUntil(
+      std::chrono::nanoseconds deadline_since_boot) noexcept;
+
+  std::shared_ptr<ExpirationAuthorityGrant> CurrentExpirationAuthority()
+      const noexcept;
+
+  static bool ExpirationAuthorityIsValid(
+      const ExpirationAuthorityGrant* authority) noexcept;
+
+  static absl::Status ValidateExpirationAuthority(const void* context);
 
   std::uint32_t ExpirationPauseCount() const noexcept {
     return expiration_pause_count_.load(std::memory_order_acquire);
@@ -3476,8 +3505,7 @@ class StorageEngine::Impl {
       const ExplicitWriteRoot* explicit_root = nullptr,
       TxUndoLog* replacement_undo = nullptr,
       WorkerStore::PartitionStore* known_partition = nullptr,
-      const GroupRecordWrite* group = nullptr,
-      bool mark_watched = false,
+      const GroupRecordWrite* group = nullptr, bool mark_watched = false,
       const MutationPrecondition* mutation_precondition = nullptr);
 
   absl::StatusOr<RecordIndex::Entry*> ReplaceIndexLocation(
@@ -3546,21 +3574,28 @@ class StorageEngine::Impl {
   absl::Status ApplyTombRaiderConfig(WorkerStore& coordinator,
                                      TombRaiderConfigUpdate update);
 
-  Task<absl::Status> RunTombRaider();
+  Task<absl::Status> RunTombRaider(
+      std::shared_ptr<ExpirationAuthorityGrant> authority);
 
-  bool TombRaiderShouldForfeit() const noexcept {
+  bool TombRaiderShouldForfeit(const std::shared_ptr<ExpirationAuthorityGrant>&
+                                   authority) const noexcept {
     return shutdown_flush_requested_.load(std::memory_order_acquire) ||
-           tomb_raider_forfeit_requested_.load(std::memory_order_acquire);
+           tomb_raider_forfeit_requested_.load(std::memory_order_acquire) ||
+           !ExpirationAuthorityIsValid(authority.get());
   }
 
-  Task<absl::Status> TombMarkLocal(WorkerStore& store);
+  Task<absl::Status> TombMarkLocal(
+      WorkerStore& store, std::shared_ptr<ExpirationAuthorityGrant> authority);
 
-  Task<absl::Status> TombSweepLocal(WorkerStore& store);
+  Task<absl::Status> TombSweepLocal(
+      WorkerStore& store, std::shared_ptr<ExpirationAuthorityGrant> authority);
 
-  Task<absl::Status> TombClaimLocal(WorkerStore& store,
-                                    std::vector<TombClaim> claims);
+  Task<absl::Status> TombClaimLocal(
+      WorkerStore& store, std::vector<TombClaim> claims,
+      std::shared_ptr<ExpirationAuthorityGrant> authority);
 
-  Task<absl::Status> TombReapLocal(WorkerStore& store);
+  Task<absl::Status> TombReapLocal(
+      WorkerStore& store, std::shared_ptr<ExpirationAuthorityGrant> authority);
 
   Task<absl::Status> PeriodicFlush(WorkerStore* store);
 
@@ -3748,7 +3783,11 @@ class StorageEngine::Impl {
   std::optional<std::string> recovered_catalog_dump_;
   std::optional<absl::Status> system_state_failure_;
   std::atomic<bool> system_state_root_failure_injected_{false};
-  std::atomic<bool> expiration_authority_{true};
+  // The permanent capability preserves standalone behavior; Meta-managed
+  // grants always allocate a distinct token so revoke/regrant cannot validate
+  // a candidate queued under an older lease generation.
+  std::shared_ptr<ExpirationAuthorityGrant> permanent_expiration_authority_;
+  std::atomic<std::shared_ptr<ExpirationAuthorityGrant>> expiration_authority_;
   std::atomic<std::uint32_t> expiration_pause_count_{0};
   // Background tasks that settle accounting through cross-worker hops
   // (retired-record settlement, detached-index reclaim, a tomb raider

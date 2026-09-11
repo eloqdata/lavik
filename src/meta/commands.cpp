@@ -568,6 +568,8 @@ absl::Status WriteCommandBody(MetaWriter& w, const BeginGroupTerm& cmd) {
   if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
   w.WriteU64(cmd.expected_term_);
   w.WriteU64(cmd.new_term_);
+  WriteFixedArray(w, cmd.workflow_operation_id_);
+  w.WriteU64(cmd.expected_operation_revision_);
   return absl::OkStatus();
 }
 
@@ -577,6 +579,12 @@ absl::StatusOr<BeginGroupTerm> ReadBeginGroupTermBody(MetaReader& r) {
   auto new_term = r.ReadU64();
   if (!new_term.ok()) return new_term.status();
   cmd->new_term_ = *new_term;
+  auto operation_id = ReadFixedArray<16>(r);
+  if (!operation_id.ok()) return operation_id.status();
+  cmd->workflow_operation_id_ = *operation_id;
+  auto operation_revision = r.ReadU64();
+  if (!operation_revision.ok()) return operation_revision.status();
+  cmd->expected_operation_revision_ = *operation_revision;
   return cmd;
 }
 
@@ -630,6 +638,8 @@ absl::Status WriteCommandBody(MetaWriter& w, const ActivateAuthority& cmd) {
   w.WriteU64(cmd.new_authority_version_);
   w.WriteU64(cmd.new_topology_epoch_);
   w.WriteU64(cmd.new_config_epoch_);
+  WriteFixedArray(w, cmd.workflow_operation_id_);
+  w.WriteU64(cmd.expected_operation_revision_);
   return absl::OkStatus();
 }
 
@@ -650,6 +660,10 @@ absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
   if (!topology_epoch.ok()) return topology_epoch.status();
   auto config_epoch = r.ReadU64();
   if (!config_epoch.ok()) return config_epoch.status();
+  auto operation_id = ReadFixedArray<16>(r);
+  if (!operation_id.ok()) return operation_id.status();
+  auto operation_revision = r.ReadU64();
+  if (!operation_revision.ok()) return operation_revision.status();
   ActivateAuthority cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -660,6 +674,8 @@ absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
   cmd.new_authority_version_ = *authority_version;
   cmd.new_topology_epoch_ = *topology_epoch;
   cmd.new_config_epoch_ = *config_epoch;
+  cmd.workflow_operation_id_ = *operation_id;
+  cmd.expected_operation_revision_ = *operation_revision;
   return cmd;
 }
 
@@ -1090,7 +1106,7 @@ absl::StatusOr<CompleteOperation> ReadCompleteOperationBody(MetaReader& r) {
 
 absl::Status WriteCommandBody(MetaWriter& w, const AbortOperation& cmd) {
   if (auto st =
-          CheckCap("reason", cmd.reason_.size(), kMaxMetaAbortReasonBytes);
+          CheckCap("reason", cmd.reason_.size(), kMaxMetaAbortPayloadBytes);
       !st.ok()) {
     return st;
   }
@@ -1102,6 +1118,7 @@ absl::Status WriteCommandBody(MetaWriter& w, const AbortOperation& cmd) {
   WriteFixedArray(w, cmd.operation_id_);
   w.WriteU64(cmd.expected_revision_);
   w.WriteString(cmd.reason_);
+  w.WriteBool(cmd.data_loss_possible_);
   return absl::OkStatus();
 }
 
@@ -1112,14 +1129,17 @@ absl::StatusOr<AbortOperation> ReadAbortOperationBody(MetaReader& r) {
   if (!operation_id.ok()) return operation_id.status();
   auto expected_revision = r.ReadU64();
   if (!expected_revision.ok()) return expected_revision.status();
-  auto reason = ReadBoundedString(r, kMaxMetaAbortReasonBytes);
+  auto reason = ReadBoundedString(r, kMaxMetaAbortPayloadBytes);
   if (!reason.ok()) return reason.status();
+  auto data_loss = r.ReadBool("data_loss_possible must be 0 or 1");
+  if (!data_loss.ok()) return data_loss.status();
   AbortOperation cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.operation_id_ = *operation_id;
   cmd.expected_revision_ = *expected_revision;
   cmd.reason_ = std::move(*reason);
+  cmd.data_loss_possible_ = *data_loss;
   return cmd;
 }
 
@@ -1418,6 +1438,157 @@ absl::StatusOr<PrunePopulationManifest> ReadPrunePopulationManifestBody(
   return cmd;
 }
 
+absl::Status WriteCommandBody(MetaWriter& w, const SetFailoverRecovery& cmd) {
+  if (cmd.frozen_proof_.has_value() &&
+      cmd.frozen_proof_->final_next_lsns_.size() >
+          kMaxMetaFailoverRecoveryFlows) {
+    return MetaDomainRejectError("failover recovery flow cap exceeded");
+  }
+  if (cmd.proof_state_ < MetaFailoverProofState::kPending ||
+      cmd.proof_state_ > MetaFailoverProofState::kUnavailable) {
+    return MetaDomainRejectError("invalid failover recovery proof state");
+  }
+  if (auto st = WriteCommandHeader(w, MetaCommandTag::kSetFailoverRecovery,
+                                   cmd.request_id_, cmd.actor_);
+      !st.ok()) {
+    return st;
+  }
+  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
+  w.WriteU64(cmd.expected_revision_);
+  w.WriteU64(cmd.recovery_generation_);
+  if (auto st = WriteNodeId(w, cmd.old_source_node_id_); !st.ok()) return st;
+  WriteFixedArray(w, cmd.old_source_assignment_id_);
+  WriteFixedArray(w, cmd.old_source_boot_incarnation_);
+  WriteFixedArray(w, cmd.old_source_history_id_);
+  w.WriteU64(cmd.excluded_authority_term_);
+  w.WriteU64(cmd.excluded_authority_version_);
+  w.WriteU64(cmd.excluded_grant_revision_);
+  w.WriteU64(cmd.population_manifest_revision_);
+  WriteFixedArray(w, cmd.population_manifest_digest_);
+  w.WriteU64(cmd.partition_replication_epoch_);
+  w.WriteBool(cmd.hold_required_);
+  w.WriteBool(cmd.recovery_required_);
+  w.WriteU8(static_cast<std::uint8_t>(cmd.proof_state_));
+  w.WriteOptional(cmd.frozen_proof_, [](MetaWriter& proof_writer,
+                                        const MetaFailoverFrozenProof& proof) {
+    proof_writer.WriteList(proof.final_next_lsns_,
+                           [](MetaWriter& flow_writer, std::uint64_t next_lsn) {
+                             flow_writer.WriteU64(next_lsn);
+                           });
+    WriteFixedArray(proof_writer, proof.proof_hash_);
+  });
+  return absl::OkStatus();
+}
+
+absl::StatusOr<SetFailoverRecovery> ReadSetFailoverRecoveryBody(MetaReader& r) {
+  auto header = ReadCommandHeader(r);
+  if (!header.ok()) return header.status();
+  auto group_id = ReadGroupId(r);
+  if (!group_id.ok()) return group_id.status();
+  auto expected_revision = r.ReadU64();
+  if (!expected_revision.ok()) return expected_revision.status();
+  auto generation = r.ReadU64();
+  if (!generation.ok()) return generation.status();
+  auto source_node = ReadNodeId(r);
+  if (!source_node.ok()) return source_node.status();
+  auto source_assignment = ReadFixedArray<16>(r);
+  if (!source_assignment.ok()) return source_assignment.status();
+  auto source_boot = ReadFixedArray<kMetaBootIncarnationBytes>(r);
+  if (!source_boot.ok()) return source_boot.status();
+  auto source_history = ReadFixedArray<kMetaReplicationHistoryIdBytes>(r);
+  if (!source_history.ok()) return source_history.status();
+  auto excluded_term = r.ReadU64();
+  if (!excluded_term.ok()) return excluded_term.status();
+  auto excluded_authority = r.ReadU64();
+  if (!excluded_authority.ok()) return excluded_authority.status();
+  auto excluded_grant = r.ReadU64();
+  if (!excluded_grant.ok()) return excluded_grant.status();
+  auto manifest_revision = r.ReadU64();
+  if (!manifest_revision.ok()) return manifest_revision.status();
+  auto manifest_digest = ReadFixedArray<32>(r);
+  if (!manifest_digest.ok()) return manifest_digest.status();
+  auto partition_epoch = r.ReadU64();
+  if (!partition_epoch.ok()) return partition_epoch.status();
+  auto hold_required = r.ReadBool("failover recovery hold flag must be 0 or 1");
+  if (!hold_required.ok()) return hold_required.status();
+  auto recovery_required =
+      r.ReadBool("failover recovery-required flag must be 0 or 1");
+  if (!recovery_required.ok()) return recovery_required.status();
+  auto proof_state = r.ReadU8();
+  if (!proof_state.ok()) return proof_state.status();
+  if (*proof_state <
+          static_cast<std::uint8_t>(MetaFailoverProofState::kPending) ||
+      *proof_state >
+          static_cast<std::uint8_t>(MetaFailoverProofState::kUnavailable)) {
+    return MetaFailStopError("invalid failover recovery proof state");
+  }
+  auto frozen_proof = r.ReadOptional<MetaFailoverFrozenProof>(
+      [](MetaReader& proof_reader) -> absl::StatusOr<MetaFailoverFrozenProof> {
+        auto frontier = proof_reader.ReadList<std::uint64_t>(
+            kMaxMetaFailoverRecoveryFlows,
+            [](MetaReader& flow_reader) { return flow_reader.ReadU64(); });
+        if (!frontier.ok()) return frontier.status();
+        auto proof_hash = ReadFixedArray<32>(proof_reader);
+        if (!proof_hash.ok()) return proof_hash.status();
+        return MetaFailoverFrozenProof{.final_next_lsns_ = std::move(*frontier),
+                                       .proof_hash_ = *proof_hash};
+      });
+  if (!frozen_proof.ok()) return frozen_proof.status();
+
+  SetFailoverRecovery cmd;
+  cmd.request_id_ = header->request_id_;
+  cmd.actor_ = std::move(header->actor_);
+  cmd.group_id_ = std::move(*group_id);
+  cmd.expected_revision_ = *expected_revision;
+  cmd.recovery_generation_ = *generation;
+  cmd.old_source_node_id_ = std::move(*source_node);
+  cmd.old_source_assignment_id_ = *source_assignment;
+  cmd.old_source_boot_incarnation_ = *source_boot;
+  cmd.old_source_history_id_ = *source_history;
+  cmd.excluded_authority_term_ = *excluded_term;
+  cmd.excluded_authority_version_ = *excluded_authority;
+  cmd.excluded_grant_revision_ = *excluded_grant;
+  cmd.population_manifest_revision_ = *manifest_revision;
+  cmd.population_manifest_digest_ = *manifest_digest;
+  cmd.partition_replication_epoch_ = *partition_epoch;
+  cmd.hold_required_ = *hold_required;
+  cmd.recovery_required_ = *recovery_required;
+  cmd.proof_state_ = static_cast<MetaFailoverProofState>(*proof_state);
+  cmd.frozen_proof_ = std::move(*frozen_proof);
+  return cmd;
+}
+
+absl::Status WriteCommandBody(MetaWriter& w, const ClearFailoverRecovery& cmd) {
+  if (auto st = WriteCommandHeader(w, MetaCommandTag::kClearFailoverRecovery,
+                                   cmd.request_id_, cmd.actor_);
+      !st.ok()) {
+    return st;
+  }
+  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
+  w.WriteU64(cmd.expected_revision_);
+  w.WriteU64(cmd.recovery_generation_);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<ClearFailoverRecovery> ReadClearFailoverRecoveryBody(
+    MetaReader& r) {
+  auto header = ReadCommandHeader(r);
+  if (!header.ok()) return header.status();
+  auto group_id = ReadGroupId(r);
+  if (!group_id.ok()) return group_id.status();
+  auto expected_revision = r.ReadU64();
+  if (!expected_revision.ok()) return expected_revision.status();
+  auto generation = r.ReadU64();
+  if (!generation.ok()) return generation.status();
+  ClearFailoverRecovery cmd;
+  cmd.request_id_ = header->request_id_;
+  cmd.actor_ = std::move(header->actor_);
+  cmd.group_id_ = std::move(*group_id);
+  cmd.expected_revision_ = *expected_revision;
+  cmd.recovery_generation_ = *generation;
+  return cmd;
+}
+
 }  // namespace
 
 absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command) {
@@ -1620,6 +1791,18 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
     }
     case MetaCommandTag::kPruneTerminalReceipts: {
       auto body = ReadPruneTerminalReceiptsBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kSetFailoverRecovery: {
+      auto body = ReadSetFailoverRecoveryBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kClearFailoverRecovery: {
+      auto body = ReadClearFailoverRecoveryBody(r);
       if (!body.ok()) return body.status();
       command = std::move(*body);
       break;

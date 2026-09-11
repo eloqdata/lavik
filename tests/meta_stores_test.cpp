@@ -20,6 +20,7 @@
 #include "absl/status/status.h"
 #include "gtest/gtest.h"
 #include "keylane/meta/encoding.h"
+#include "keylane/meta/failover_recovery_store.h"
 #include "keylane/meta/identity_store.h"
 #include "keylane/meta/policy_store.h"
 #include "keylane/meta/population_manifest_store.h"
@@ -1755,6 +1756,341 @@ TEST(MetaPopulationManifestStore, RejectsNonCanonicalOrMismatchedContent) {
   zero_epoch.manifest_digest_ =
       MetaPopulationManifestStore::CanonicalDigest(zero_epoch.entries_);
   ExpectDomainReject(store.Put(zero_epoch));
+}
+
+keylane::meta::SetFailoverRecovery MakeFailoverRecovery(
+    std::uint64_t expected_revision = 0,
+    std::uint64_t recovery_generation = 7) {
+  keylane::meta::SetFailoverRecovery command;
+  command.request_id_ = MakeRequestId(0xa0);
+  command.group_id_ = "group-recovery";
+  command.expected_revision_ = expected_revision;
+  command.recovery_generation_ = recovery_generation;
+  command.old_source_node_id_ = MakeNodeId(0xa1);
+  command.old_source_assignment_id_.fill(0xa2);
+  command.old_source_boot_incarnation_.fill(0xa3);
+  command.old_source_history_id_.fill(0xa4);
+  command.excluded_authority_term_ = 11;
+  command.excluded_authority_version_ = 13;
+  command.excluded_grant_revision_ = 17;
+  command.population_manifest_revision_ = 19;
+  command.population_manifest_digest_.fill(0xa5);
+  command.partition_replication_epoch_ = 23;
+  command.hold_required_ = true;
+  command.recovery_required_ = false;
+  return command;
+}
+
+TEST(MetaFailoverRecoveryStore,
+     PersistsExactRecoveryAndRetainsGenerationAfterClear) {
+  using keylane::meta::ClearFailoverRecovery;
+  using keylane::meta::MetaFailoverFrozenProof;
+  using keylane::meta::MetaFailoverRecoveryStore;
+
+  MetaFailoverRecoveryStore store;
+  auto create = MakeFailoverRecovery();
+  ASSERT_TRUE(store.Set(create, /*committed_index=*/41).ok());
+  ASSERT_TRUE(store.Set(create, /*committed_index=*/41).ok());
+
+  auto record = store.Find(create.group_id_);
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(record->revision_, 41u);
+  EXPECT_EQ(record->recovery_generation_, create.recovery_generation_);
+  EXPECT_EQ(record->old_source_node_id_, create.old_source_node_id_);
+  EXPECT_TRUE(record->hold_required_);
+  EXPECT_FALSE(record->frozen_proof_.has_value());
+
+  auto freeze = create;
+  freeze.expected_revision_ = 41;
+  freeze.proof_state_ = keylane::meta::MetaFailoverProofState::kExact;
+  freeze.frozen_proof_ = MetaFailoverFrozenProof{.final_next_lsns_ = {101, 203},
+                                                 .proof_hash_ = {}};
+  freeze.frozen_proof_->proof_hash_.fill(0xa6);
+  ASSERT_TRUE(store.Set(freeze, /*committed_index=*/43).ok());
+
+  auto restored = MetaFailoverRecoveryStore::Deserialize(store.Serialize());
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  record = restored->Find(create.group_id_);
+  ASSERT_TRUE(record.has_value());
+  ASSERT_TRUE(record->frozen_proof_.has_value());
+  EXPECT_EQ(record->frozen_proof_->final_next_lsns_,
+            freeze.frozen_proof_->final_next_lsns_);
+
+  auto release = freeze;
+  release.expected_revision_ = 43;
+  release.hold_required_ = false;
+  ASSERT_TRUE(restored->Set(release, /*committed_index=*/44).ok());
+
+  ClearFailoverRecovery clear;
+  clear.group_id_ = create.group_id_;
+  clear.expected_revision_ = 44;
+  clear.recovery_generation_ = create.recovery_generation_;
+  ASSERT_TRUE(restored->Clear(clear, /*committed_index=*/45).ok());
+  ASSERT_TRUE(restored->Clear(clear, /*committed_index=*/45).ok());
+  EXPECT_FALSE(restored->Find(create.group_id_).has_value());
+  EXPECT_EQ(restored->LastGeneration(create.group_id_),
+            create.recovery_generation_);
+  EXPECT_EQ(restored->LastRevision(create.group_id_), 45u);
+
+  auto conflicting_clear = clear;
+  conflicting_clear.expected_revision_ = 43;
+  ExpectDomainReject(
+      restored->Clear(conflicting_clear, /*committed_index=*/45));
+
+  ExpectDomainReject(restored->Set(create, /*committed_index=*/45));
+  auto next = MakeFailoverRecovery(/*expected_revision=*/45,
+                                   /*recovery_generation=*/8);
+  ASSERT_TRUE(restored->Set(next, /*committed_index=*/46).ok());
+}
+
+TEST(MetaFailoverRecoveryStore,
+     EnforcesMonotonicLossFlagsAndAtomicallyAdvancesGeneration) {
+  using keylane::meta::MetaFailoverProofState;
+  using keylane::meta::MetaFailoverRecoveryStore;
+
+  MetaFailoverRecoveryStore store;
+  auto create = MakeFailoverRecovery(/*expected_revision=*/0,
+                                     /*recovery_generation=*/1);
+  ASSERT_TRUE(store.Set(create, /*committed_index=*/10).ok());
+
+  auto unavailable = create;
+  unavailable.expected_revision_ = 10;
+  unavailable.recovery_required_ = true;
+  unavailable.proof_state_ = MetaFailoverProofState::kUnavailable;
+  ASSERT_TRUE(store.Set(unavailable, /*committed_index=*/11).ok());
+
+  auto delayed_exact = unavailable;
+  delayed_exact.expected_revision_ = 11;
+  delayed_exact.proof_state_ = MetaFailoverProofState::kExact;
+  delayed_exact.frozen_proof_ = keylane::meta::MetaFailoverFrozenProof{
+      .final_next_lsns_ = {100}, .proof_hash_ = {}};
+  delayed_exact.frozen_proof_->proof_hash_.fill(0xc1);
+  ExpectDomainReject(store.Set(delayed_exact, /*committed_index=*/12));
+
+  auto drop_recovery_hold = unavailable;
+  drop_recovery_hold.expected_revision_ = 11;
+  drop_recovery_hold.hold_required_ = false;
+  ExpectDomainReject(store.Set(drop_recovery_hold, /*committed_index=*/12));
+
+  auto clear_recovery = unavailable;
+  clear_recovery.expected_revision_ = 11;
+  clear_recovery.recovery_required_ = false;
+  ExpectDomainReject(store.Set(clear_recovery, /*committed_index=*/12));
+
+  // A new term/recovery generation replaces the old handoff in one committed
+  // mutation, so leader loss cannot expose an empty generation in between.
+  auto next = MakeFailoverRecovery(/*expected_revision=*/11,
+                                   /*recovery_generation=*/2);
+  next.old_source_node_id_ = MakeNodeId(0xb1);
+  next.old_source_assignment_id_.fill(0xb2);
+  next.old_source_boot_incarnation_.fill(0xb3);
+  next.old_source_history_id_.fill(0xb4);
+  next.excluded_authority_term_ = 12;
+  next.excluded_authority_version_ = 14;
+  next.excluded_grant_revision_ = 18;
+  ASSERT_TRUE(store.Set(next, /*committed_index=*/13).ok());
+  ASSERT_TRUE(store.Find(next.group_id_).has_value());
+  EXPECT_EQ(store.Find(next.group_id_)->recovery_generation_, 2u);
+  EXPECT_EQ(store.Find(next.group_id_)->old_source_node_id_,
+            next.old_source_node_id_);
+}
+
+TEST(MetaFailoverRecoveryStore,
+     RejectsSuccessorGenerationBeforeExplicitRecoveryHandoff) {
+  using keylane::meta::MetaFailoverRecoveryStore;
+
+  MetaFailoverRecoveryStore store;
+  auto controlled = MakeFailoverRecovery(/*expected_revision=*/0,
+                                         /*recovery_generation=*/1);
+  ASSERT_TRUE(store.Set(controlled, /*committed_index=*/20).ok());
+
+  auto successor = MakeFailoverRecovery(/*expected_revision=*/20,
+                                        /*recovery_generation=*/2);
+  successor.old_source_node_id_ = MakeNodeId(0xb1);
+  successor.old_source_assignment_id_.fill(0xb2);
+  successor.old_source_boot_incarnation_.fill(0xb3);
+  successor.old_source_history_id_.fill(0xb4);
+  successor.excluded_authority_term_ = 12;
+  successor.excluded_authority_version_ = 14;
+  successor.excluded_grant_revision_ = 18;
+  ExpectDomainReject(store.Set(successor, /*committed_index=*/21));
+  ASSERT_EQ(store.Find(controlled.group_id_)->recovery_generation_, 1u);
+
+  auto handoff = controlled;
+  handoff.expected_revision_ = 20;
+  handoff.recovery_required_ = true;
+  ASSERT_TRUE(store.Set(handoff, /*committed_index=*/21).ok());
+
+  successor.expected_revision_ = 21;
+  ASSERT_TRUE(store.Set(successor, /*committed_index=*/22).ok());
+  ASSERT_EQ(store.Find(controlled.group_id_)->recovery_generation_, 2u);
+}
+
+TEST(MetaFailoverRecoveryStore,
+     RetainsReleasedHoldTombstoneUntilAcknowledgedClear) {
+  using keylane::meta::ClearFailoverRecovery;
+  using keylane::meta::MetaFailoverRecoveryStore;
+
+  MetaFailoverRecoveryStore store;
+  auto create = MakeFailoverRecovery(/*expected_revision=*/0,
+                                     /*recovery_generation=*/3);
+  ASSERT_TRUE(store.Set(create, /*committed_index=*/20).ok());
+
+  // Clear is only physical tombstone collection. It must not be able to
+  // bypass the durable desired-state release that FDS still needs to project.
+  ClearFailoverRecovery active_clear;
+  active_clear.group_id_ = create.group_id_;
+  active_clear.expected_revision_ = 20;
+  active_clear.recovery_generation_ = create.recovery_generation_;
+  ExpectDomainReject(store.Clear(active_clear, /*committed_index=*/21));
+
+  auto release = create;
+  release.expected_revision_ = 20;
+  release.hold_required_ = false;
+  ASSERT_TRUE(store.Set(release, /*committed_index=*/21).ok());
+  const auto tombstone = store.Find(create.group_id_);
+  ASSERT_TRUE(tombstone.has_value());
+  EXPECT_FALSE(tombstone->hold_required_);
+  EXPECT_FALSE(tombstone->recovery_required_);
+
+  auto resurrect = release;
+  resurrect.expected_revision_ = 21;
+  resurrect.hold_required_ = true;
+  ExpectDomainReject(store.Set(resurrect, /*committed_index=*/22));
+
+  auto bypass_release_ack = release;
+  bypass_release_ack.expected_revision_ = 21;
+  bypass_release_ack.recovery_required_ = true;
+  ExpectDomainReject(store.Set(bypass_release_ack, /*committed_index=*/22));
+
+  ClearFailoverRecovery clear;
+  clear.group_id_ = create.group_id_;
+  clear.expected_revision_ = 21;
+  clear.recovery_generation_ = create.recovery_generation_;
+  ASSERT_TRUE(store.Clear(clear, /*committed_index=*/22).ok());
+  EXPECT_FALSE(store.Find(create.group_id_).has_value());
+}
+
+TEST(MetaFailoverRecoveryStore,
+     RetainsHistoricalProofAcrossAvailabilityDowngrade) {
+  using keylane::meta::MetaFailoverFrozenProof;
+  using keylane::meta::MetaFailoverProofState;
+  using keylane::meta::MetaFailoverRecoveryStore;
+
+  MetaFailoverRecoveryStore store;
+  auto create = MakeFailoverRecovery(/*expected_revision=*/0,
+                                     /*recovery_generation=*/5);
+  ASSERT_TRUE(store.Set(create, /*committed_index=*/30).ok());
+
+  auto exact = create;
+  exact.expected_revision_ = 30;
+  exact.proof_state_ = MetaFailoverProofState::kExact;
+  exact.frozen_proof_ = MetaFailoverFrozenProof{.final_next_lsns_ = {101, 203},
+                                                .proof_hash_ = {}};
+  exact.frozen_proof_->proof_hash_.fill(0xd1);
+  ASSERT_TRUE(store.Set(exact, /*committed_index=*/31).ok());
+
+  auto unavailable = exact;
+  unavailable.expected_revision_ = 31;
+  unavailable.proof_state_ = MetaFailoverProofState::kUnavailable;
+  ASSERT_TRUE(store.Set(unavailable, /*committed_index=*/32).ok());
+  const auto record = store.Find(create.group_id_);
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(record->proof_state_, MetaFailoverProofState::kUnavailable);
+  EXPECT_EQ(record->frozen_proof_, exact.frozen_proof_);
+
+  auto delayed_exact = unavailable;
+  delayed_exact.expected_revision_ = 32;
+  delayed_exact.proof_state_ = MetaFailoverProofState::kExact;
+  ExpectDomainReject(store.Set(delayed_exact, /*committed_index=*/33));
+
+  auto drops_history = unavailable;
+  drops_history.expected_revision_ = 32;
+  drops_history.frozen_proof_.reset();
+  ExpectDomainReject(store.Set(drops_history, /*committed_index=*/33));
+
+  auto restored = MetaFailoverRecoveryStore::Deserialize(store.Serialize());
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->Find(create.group_id_), record);
+}
+
+TEST(MetaFailoverRecoveryStore, RejectsInvalidIdentityProofAndCapacity) {
+  using keylane::meta::MetaFailoverProofState;
+  using keylane::meta::MetaFailoverRecoveryStore;
+
+  MetaFailoverRecoveryStore store(/*max_groups=*/1);
+  auto invalid = MakeFailoverRecovery();
+  invalid.old_source_node_id_ = std::string(40, 'A');
+  ExpectDomainReject(store.Set(invalid, /*committed_index=*/1));
+
+  invalid = MakeFailoverRecovery();
+  invalid.proof_state_ = MetaFailoverProofState::kExact;
+  ExpectDomainReject(store.Set(invalid, /*committed_index=*/1));
+
+  invalid = MakeFailoverRecovery();
+  invalid.frozen_proof_ = keylane::meta::MetaFailoverFrozenProof{
+      .final_next_lsns_ = {1}, .proof_hash_ = {}};
+  invalid.frozen_proof_->proof_hash_.fill(1);
+  ExpectDomainReject(store.Set(invalid, /*committed_index=*/1));
+
+  invalid = MakeFailoverRecovery();
+  invalid.hold_required_ = false;
+  invalid.recovery_required_ = true;
+  ExpectDomainReject(store.Set(invalid, /*committed_index=*/1));
+
+  const auto valid = MakeFailoverRecovery();
+  ASSERT_TRUE(store.Set(valid, /*committed_index=*/1).ok());
+  auto second = valid;
+  second.group_id_ = "another-group";
+  second.old_source_node_id_ = MakeNodeId(0xb1);
+  ExpectDomainReject(store.Set(second, /*committed_index=*/2));
+}
+
+TEST(MetaFailoverRecoveryStore, SnapshotRoundTripIsStrictAndDeterministic) {
+  using keylane::meta::ClearFailoverRecovery;
+  using keylane::meta::MetaFailoverRecoveryStore;
+
+  MetaFailoverRecoveryStore store;
+  auto first = MakeFailoverRecovery(/*expected_revision=*/0,
+                                    /*recovery_generation=*/2);
+  first.group_id_ = "a";
+  auto second = MakeFailoverRecovery(/*expected_revision=*/0,
+                                     /*recovery_generation=*/4);
+  second.group_id_ = "b";
+  second.old_source_node_id_ = MakeNodeId(0xb2);
+  ASSERT_TRUE(store.Set(second, /*committed_index=*/7).ok());
+  ASSERT_TRUE(store.Set(first, /*committed_index=*/8).ok());
+  auto release_second = second;
+  release_second.expected_revision_ = 7;
+  release_second.hold_required_ = false;
+  ASSERT_TRUE(store.Set(release_second, /*committed_index=*/9).ok());
+  ClearFailoverRecovery clear;
+  clear.group_id_ = second.group_id_;
+  clear.expected_revision_ = 9;
+  clear.recovery_generation_ = 4;
+  ASSERT_TRUE(store.Clear(clear, /*committed_index=*/10).ok());
+
+  const std::string bytes = store.Serialize();
+  auto restored = MetaFailoverRecoveryStore::Deserialize(bytes);
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->Serialize(), bytes);
+  EXPECT_EQ(restored->Find(first.group_id_), store.Find(first.group_id_));
+  EXPECT_FALSE(restored->Find(second.group_id_).has_value());
+  EXPECT_EQ(restored->LastGeneration(second.group_id_), 4u);
+  EXPECT_EQ(restored->LastRevision(second.group_id_), 10u);
+
+  for (std::size_t len = 0; len < bytes.size(); ++len) {
+    SCOPED_TRACE("len=" + std::to_string(len));
+    ExpectStoreFailStop(MetaFailoverRecoveryStore::Deserialize(
+                            std::string_view(bytes).substr(0, len))
+                            .status());
+  }
+  ExpectStoreFailStop(
+      MetaFailoverRecoveryStore::Deserialize(bytes + '\0').status());
+  std::string bad_version = bytes;
+  bad_version[0] = '\x7f';
+  ExpectStoreFailStop(
+      MetaFailoverRecoveryStore::Deserialize(bad_version).status());
 }
 
 }  // namespace

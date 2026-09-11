@@ -146,6 +146,11 @@ void StorageEngine::SetExpirationAuthority(bool authority) noexcept {
   impl_->SetExpirationAuthority(authority);
 }
 
+absl::Status StorageEngine::SetExpirationAuthorityUntil(
+    std::chrono::nanoseconds deadline_since_boot) noexcept {
+  return impl_->SetExpirationAuthorityUntil(deadline_since_boot);
+}
+
 std::uint32_t StorageEngine::ExpirationPauseCount() const noexcept {
   return impl_->ExpirationPauseCount();
 }

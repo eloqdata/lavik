@@ -119,8 +119,7 @@ struct Fixture {
   std::uint64_t directive_revision = 0;
 };
 
-Fixture CompleteFixture(
-    std::string operation_kind = "population-rebuild") {
+Fixture CompleteFixture(std::string operation_kind = "population-rebuild") {
   Fixture fixture;
   std::uint64_t index = 1;
 
@@ -525,6 +524,73 @@ TEST(MetaControlProjector,
   EXPECT_FALSE(group.grant_active);
   EXPECT_EQ(group.owner_node_id, fixture.target);
   EXPECT_EQ(group.owner_assignment_id, fixture.target_assignment);
+}
+
+TEST(MetaControlProjector,
+     ProjectsRecoveryHistoryHoldOnlyToTheExactOldSourceGroup) {
+  Fixture fixture = CompleteFixture();
+
+  keylane::meta::SetFailoverRecovery recovery;
+  recovery.request_id_ = Bytes<16>(0x7a);
+  recovery.group_id_ = "group-a";
+  recovery.recovery_generation_ = 7;
+  recovery.old_source_node_id_ = fixture.target;
+  recovery.old_source_assignment_id_ = fixture.target_assignment;
+  recovery.old_source_boot_incarnation_ = fixture.target_boot;
+  recovery.old_source_history_id_ = fixture.source_history;
+  recovery.excluded_authority_term_ = 1;
+  recovery.excluded_authority_version_ = 1;
+  recovery.excluded_grant_revision_ = fixture.grant_revision;
+  recovery.population_manifest_revision_ = 1;
+  recovery.population_manifest_digest_ = fixture.manifest_digest;
+  recovery.partition_replication_epoch_ = 1;
+  recovery.hold_required_ = true;
+  Commit(fixture.stores, 21, recovery);
+
+  const MetaCommittedView view(fixture.stores, 21);
+  ASSERT_TRUE(view.failover_recovery().Find("group-a").has_value());
+
+  auto old_source = MetaControlProjector::ProjectNode(view, fixture.target);
+  ASSERT_TRUE(old_source.ok()) << old_source.status();
+  ASSERT_EQ(old_source->full_state.groups.size(), 2u);
+  const auto& projected_hold =
+      old_source->full_state.groups[0].source_history_hold;
+  ASSERT_TRUE(projected_hold.has_value());
+  EXPECT_EQ(projected_hold->generation, 7u);
+  EXPECT_EQ(projected_hold->source_assignment_id, fixture.target_assignment);
+  EXPECT_EQ(projected_hold->source_boot_id, Hex(fixture.target_boot));
+  EXPECT_EQ(projected_hold->source_replication_history_id,
+            Hex(fixture.source_history));
+  EXPECT_EQ(projected_hold->manifest_revision, 1u);
+  EXPECT_EQ(projected_hold->manifest_digest, fixture.manifest_digest);
+  EXPECT_EQ(projected_hold->partition_replication_epoch, 1u);
+  EXPECT_FALSE(
+      old_source->full_state.groups[1].source_history_hold.has_value());
+
+  const auto other_member =
+      MetaControlProjector::ProjectNode(view, fixture.source);
+  ASSERT_TRUE(other_member.ok()) << other_member.status();
+  for (const control::WireDesiredGroup& group :
+       other_member->full_state.groups) {
+    EXPECT_FALSE(group.source_history_hold.has_value());
+  }
+
+  const std::size_t retained_before =
+      keylane::meta::NodeControlBatchRetainedBytes(*old_source);
+  auto& mutable_hold = *old_source->full_state.groups[0].source_history_hold;
+  const std::size_t boot_capacity_before =
+      mutable_hold.source_boot_id.capacity();
+  const std::size_t history_capacity_before =
+      mutable_hold.source_replication_history_id.capacity();
+  mutable_hold.source_boot_id.reserve(boot_capacity_before + 257);
+  mutable_hold.source_replication_history_id.reserve(history_capacity_before +
+                                                     313);
+  const std::size_t retained_after =
+      keylane::meta::NodeControlBatchRetainedBytes(*old_source);
+  EXPECT_EQ(retained_after - retained_before,
+            mutable_hold.source_boot_id.capacity() - boot_capacity_before +
+                mutable_hold.source_replication_history_id.capacity() -
+                history_capacity_before);
 }
 
 TEST(MetaControlProjector,

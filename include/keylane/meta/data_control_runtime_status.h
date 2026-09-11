@@ -26,6 +26,10 @@ struct MetaDataControlRuntimeGroup {
   std::uint64_t manifest_revision_ = 0;
   cluster::control::WireHash256 manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
+  // Exact hold contained in the FDS this session acknowledged. The failover
+  // reconciler uses this as the Data-side barrier before fencing the old
+  // authority; the durable recovery store alone proves only desired intent.
+  std::optional<cluster::control::WireSourceHistoryHold> source_history_hold_;
 };
 
 struct MetaDataControlRuntimeNode {
@@ -49,6 +53,12 @@ struct MetaDataControlRuntimeNode {
   std::int64_t health_received_unix_ms_ = 0;
   std::optional<cluster::control::LeaseDecision> last_lease_decision_;
   std::int64_t lease_decision_written_unix_ms_ = 0;
+  // Exact grant whose successful write was followed by a ready heartbeat on
+  // this same current session. This is an observed serving barrier, not lease
+  // authority: FDS/session/leadership replacement discards it, and lease
+  // issuance never reads it back.
+  std::optional<cluster::control::LeaseGranted> confirmed_serving_lease_;
+  std::int64_t serving_confirmed_unix_ms_ = 0;
 };
 
 struct MetaDataControlRuntimeSnapshot {
@@ -107,7 +117,10 @@ class MetaDataControlRuntimeStatus {
                      const cluster::control::WireId128& session_id,
                      std::uint64_t validated_committed_high_water);
   // Replaces health and its Meta receive time only for the named current
-  // session; status freshness is evaluated later from this receive time.
+  // session; status freshness is evaluated later from this receive time. A
+  // ready heartbeat also confirms a previously written exact LeaseGranted.
+  // Because the server records health before writing the same heartbeat's
+  // decision, the first heartbeat that obtains a grant cannot self-confirm.
   void RecordHealth(std::string_view node_id,
                     const cluster::control::WireId128& session_id,
                     const cluster::control::HeartbeatHealth& health,

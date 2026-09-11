@@ -45,7 +45,9 @@
 
 #include "gtest/gtest.h"
 #include "keylane/meta/commands.h"
+#include "keylane/meta/controlled_failover_reconciler.h"
 #include "keylane/meta/coordinator.h"
+#include "keylane/meta/failover.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/nuraft_log_store.h"
 #include "keylane/meta/nuraft_state_mgr.h"
@@ -1078,6 +1080,298 @@ TEST_F(MetaCoordinatorServerTest,
   ASSERT_FALSE(repeated.ok());
   EXPECT_EQ(repeated.status().code(), absl::StatusCode::kResourceExhausted);
   EXPECT_EQ(machine_->last_commit_index(), before_repeat);
+}
+
+TEST_F(MetaCoordinatorServerTest,
+       FailSafeAllowsFailoverCleanupArchiveAndOrphanAvailabilityDowngrade) {
+  StartServer();
+  MakeCoordinator();
+  WaitLeader();
+
+  RegisterNode source = MakeRegister(0x51);
+  source.endpoints_ = {"10.0.0.1:7051"};
+  source.role_ = keylane::meta::MetaNodeRole::kPrimary;
+  ASSERT_TRUE(ProposeSync(source).ok());
+  RegisterNode candidate = MakeRegister(0x62);
+  candidate.endpoints_ = {"10.0.0.1:7062"};
+  ASSERT_TRUE(ProposeSync(candidate).ok());
+
+  const std::string group_id = "fail-safe-controlled";
+  CreateGroup create;
+  create.request_id_ = MakeRequestId(0x52);
+  create.group_id_ = group_id;
+  create.new_topology_epoch_ = 1;
+  ASSERT_TRUE(ProposeSync(create).ok());
+
+  keylane::meta::MetaAssignmentId source_assignment{};
+  source_assignment.fill(0x53);
+  keylane::meta::AssignNodeToGroup assign_source;
+  assign_source.request_id_ = MakeRequestId(0x53);
+  assign_source.group_id_ = group_id;
+  assign_source.node_id_ = source.node_id_;
+  assign_source.assignment_id_ = source_assignment;
+  assign_source.role_ = keylane::meta::MetaNodeRole::kPrimary;
+  assign_source.expected_revision_ = 1;
+  assign_source.new_topology_epoch_ = 2;
+  ASSERT_TRUE(ProposeSync(assign_source).ok());
+
+  keylane::meta::MetaAssignmentId candidate_assignment{};
+  candidate_assignment.fill(0x54);
+  keylane::meta::AssignNodeToGroup assign_candidate;
+  assign_candidate.request_id_ = MakeRequestId(0x54);
+  assign_candidate.group_id_ = group_id;
+  assign_candidate.node_id_ = candidate.node_id_;
+  assign_candidate.assignment_id_ = candidate_assignment;
+  assign_candidate.role_ = keylane::meta::MetaNodeRole::kReplica;
+  assign_candidate.expected_revision_ = 2;
+  assign_candidate.new_topology_epoch_ = 3;
+  ASSERT_TRUE(ProposeSync(assign_candidate).ok());
+
+  keylane::meta::PutPopulationManifest manifest;
+  manifest.request_id_ = MakeRequestId(0x55);
+  manifest.entries_ = {{1, 1}, {2, 1}};
+  manifest.manifest_digest_ =
+      keylane::meta::MetaPopulationManifestStore::CanonicalDigest(
+          manifest.entries_);
+  ASSERT_TRUE(ProposeSync(manifest).ok());
+
+  keylane::meta::SetGroupReplicationState population;
+  population.request_id_ = MakeRequestId(0x56);
+  population.group_id_ = group_id;
+  population.new_population_manifest_revision_ = 1;
+  population.new_population_manifest_digest_ = manifest.manifest_digest_;
+  population.new_partition_replication_epoch_ = 1;
+  population.new_topology_epoch_ = 4;
+  ASSERT_TRUE(ProposeSync(population).ok());
+
+  keylane::meta::PutPolicy policy;
+  policy.request_id_ = MakeRequestId(0x57);
+  policy.policy_id_ = "fail-safe-lease";
+  policy.version_ = 1;
+  policy.content_ = "finite";
+  policy.content_hash_ = keylane::meta::MetaSha256(policy.content_);
+  ASSERT_TRUE(ProposeSync(policy).ok());
+
+  BeginGroupTerm first_term;
+  first_term.request_id_ = MakeRequestId(0x58);
+  first_term.group_id_ = group_id;
+  first_term.expected_term_ = 0;
+  first_term.new_term_ = 1;
+  ASSERT_TRUE(ProposeSync(first_term).ok());
+
+  const keylane::meta::MetaGrantSpec old_grant{
+      .lease_duration_ms_ = 5000,
+      .policy_id_ = policy.policy_id_,
+      .policy_version_ = policy.version_,
+  };
+  keylane::meta::ActivateAuthority activate;
+  activate.request_id_ = MakeRequestId(0x59);
+  activate.group_id_ = group_id;
+  activate.expected_term_ = 1;
+  activate.new_owner_ = source.node_id_;
+  activate.grant_ = old_grant;
+  activate.new_authority_version_ = 1;
+  activate.new_topology_epoch_ = 5;
+  activate.new_config_epoch_ = 1;
+  auto activated = ProposeSync(activate);
+  ASSERT_TRUE(activated.ok()) << activated.status();
+  ASSERT_EQ(activated->verdict_, MetaAuditVerdict::kAccepted)
+      << activated->detail_;
+
+  keylane::meta::MetaBootIncarnation source_boot{};
+  source_boot.fill(0x5a);
+  keylane::meta::MetaBootIncarnation candidate_boot{};
+  candidate_boot.fill(0x5b);
+  keylane::meta::MetaReplicationHistoryId source_history{};
+  source_history.fill(0x5c);
+  keylane::meta::FailoverIntent intent{
+      .group_id_ = group_id,
+      .recovery_generation_ = 1,
+      .attempt_timeout_ms_ = 120'000,
+      .former_owner_node_id_ = source.node_id_,
+      .former_owner_assignment_id_ = source_assignment,
+      .former_owner_boot_id_ = source_boot,
+      .candidate_node_id_ = candidate.node_id_,
+      .candidate_assignment_id_ = candidate_assignment,
+      .candidate_boot_id_ = candidate_boot,
+      .group_term_ = 2,
+      .authority_version_ = 1,
+      .grant_revision_ = activated->log_index_,
+      .old_grant_ = old_grant,
+      .population_manifest_revision_ = 1,
+      .population_manifest_digest_ = manifest.manifest_digest_,
+      .partition_replication_epoch_ = 1,
+      .parent_history_id_ = source_history,
+      .flow_count_ = 2,
+  };
+  auto encoded_intent = keylane::meta::EncodeFailoverIntent(intent);
+  ASSERT_TRUE(encoded_intent.ok()) << encoded_intent.status();
+  SubmitOperation submit;
+  submit.request_id_ = MakeRequestId(0x5d);
+  submit.operation_id_ = MakeOperationId(0x5d);
+  submit.kind_ = std::string(keylane::meta::kFailoverOperationKind);
+  submit.intent_ = *encoded_intent;
+  submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
+  submit.replication_history_id_ = source_history;
+  submit.policy_references_ = {{policy.policy_id_, policy.version_}};
+  auto submitted = ProposeSync(submit);
+  ASSERT_TRUE(submitted.ok()) << submitted.status();
+  ASSERT_EQ(submitted->verdict_, MetaAuditVerdict::kAccepted);
+
+  // Trip the snapshot fail-safe immediately after submit. The workflow must
+  // still be able to install its bounded recovery owner and initial no-work
+  // phase; otherwise it can never reach a state that the terminal-only gate
+  // is able to abort and archive.
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
+  MetaCoordinatorOptions options;
+  options.max_consecutive_snapshot_failures_ = 0;
+  MakeCoordinator(options);
+
+  keylane::meta::SetFailoverRecovery recovery;
+  recovery.request_id_ = MakeRequestId(0x5e);
+  recovery.group_id_ = group_id;
+  recovery.recovery_generation_ = 1;
+  recovery.old_source_node_id_ = source.node_id_;
+  recovery.old_source_assignment_id_ = source_assignment;
+  recovery.old_source_boot_incarnation_ = source_boot;
+  recovery.old_source_history_id_ = source_history;
+  recovery.excluded_authority_term_ = 1;
+  recovery.excluded_authority_version_ = 1;
+  recovery.excluded_grant_revision_ = activated->log_index_;
+  recovery.population_manifest_revision_ = 1;
+  recovery.population_manifest_digest_ = manifest.manifest_digest_;
+  recovery.partition_replication_epoch_ = 1;
+  recovery.hold_required_ = true;
+  auto recovered = ProposeSync(recovery);
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  ASSERT_EQ(recovered->verdict_, MetaAuditVerdict::kAccepted);
+
+  keylane::meta::FailoverPhase phase{
+      .stage_ = keylane::meta::FailoverPhaseStage::kSourceHolding};
+  auto encoded_phase = keylane::meta::EncodeFailoverPhase(phase);
+  ASSERT_TRUE(encoded_phase.ok()) << encoded_phase.status();
+  TransitionOperationPhase transition;
+  transition.request_id_ = MakeRequestId(0x5f);
+  transition.operation_id_ = submit.operation_id_;
+  transition.kind_phase_blob_ = *encoded_phase;
+  auto transitioned = ProposeSync(transition);
+  ASSERT_TRUE(transitioned.ok()) << transitioned.status();
+  ASSERT_EQ(transitioned->verdict_, MetaAuditVerdict::kAccepted);
+
+  keylane::meta::ControlledFailoverOutcome outcome{
+      .succeeded_ = false,
+      .terminal_stage_ = keylane::meta::FailoverPhaseStage::kSourceHolding,
+      .loss_ = keylane::meta::FailoverLossClassification::kExact,
+      .recovery_required_ = false,
+      .reason_ = "candidate failed before the authority cut",
+  };
+  auto encoded_outcome =
+      keylane::meta::EncodeControlledFailoverOutcome(outcome);
+  ASSERT_TRUE(encoded_outcome.ok()) << encoded_outcome.status();
+  keylane::meta::AbortOperation abort;
+  abort.request_id_ = MakeRequestId(0x60);
+  abort.operation_id_ = submit.operation_id_;
+  abort.expected_revision_ = 1;
+  abort.reason_ = *encoded_outcome;
+  auto aborted = ProposeSync(abort);
+  ASSERT_TRUE(aborted.ok()) << aborted.status();
+  ASSERT_EQ(aborted->verdict_, MetaAuditVerdict::kAccepted);
+
+  recovery.request_id_ = MakeRequestId(0x62);
+  recovery.expected_revision_ = recovered->log_index_;
+  recovery.hold_required_ = false;
+  auto released = ProposeSync(recovery);
+  ASSERT_TRUE(released.ok()) << released.status();
+  ASSERT_EQ(released->verdict_, MetaAuditVerdict::kAccepted);
+
+  recovery.request_id_ = MakeRequestId(0x65);
+  const std::uint64_t before_release_replay = machine_->last_commit_index();
+  auto repeated_release = ProposeSync(recovery);
+  ASSERT_FALSE(repeated_release.ok());
+  EXPECT_EQ(repeated_release.status().code(),
+            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_release_replay);
+
+  keylane::meta::ClearFailoverRecovery clear;
+  clear.request_id_ = MakeRequestId(0x63);
+  clear.group_id_ = group_id;
+  clear.expected_revision_ = released->log_index_;
+  clear.recovery_generation_ = 1;
+  auto cleared = ProposeSync(clear);
+  ASSERT_TRUE(cleared.ok()) << cleared.status();
+  ASSERT_EQ(cleared->verdict_, MetaAuditVerdict::kAccepted);
+
+  clear.request_id_ = MakeRequestId(0x66);
+  const std::uint64_t before_clear_replay = machine_->last_commit_index();
+  auto repeated_clear = ProposeSync(clear);
+  ASSERT_FALSE(repeated_clear.ok());
+  EXPECT_EQ(repeated_clear.status().code(),
+            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_clear_replay);
+
+  keylane::meta::ArchiveOperations archive;
+  archive.request_id_ = MakeRequestId(0x64);
+  archive.operation_seqs_ = {submitted->log_index_};
+  auto archived = ProposeSync(archive);
+  ASSERT_TRUE(archived.ok()) << archived.status();
+  EXPECT_EQ(archived->verdict_, MetaAuditVerdict::kAccepted);
+  EXPECT_TRUE(machine_->StoresSnapshot()
+                  .operation_.FindArchived(submit.operation_id_)
+                  .has_value());
+
+  // Seed the next explicit recovery handoff with the normal gate. It has no
+  // live operation owner, matching the state left after an uncontrolled
+  // workflow takes over or a terminal owner is archived.
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
+  MakeCoordinator();
+  recovery.request_id_ = MakeRequestId(0x67);
+  recovery.expected_revision_ = cleared->log_index_;
+  recovery.recovery_generation_ = 2;
+  recovery.hold_required_ = true;
+  recovery.recovery_required_ = true;
+  recovery.proof_state_ = keylane::meta::MetaFailoverProofState::kPending;
+  recovery.frozen_proof_.reset();
+  auto orphan_handoff = ProposeSync(recovery);
+  ASSERT_TRUE(orphan_handoff.ok()) << orphan_handoff.status();
+  ASSERT_EQ(orphan_handoff->verdict_, MetaAuditVerdict::kAccepted);
+
+  // The fail-safe must still admit the record-owned conservative downgrade;
+  // requiring a live terminal operation here would strand a stale exact or
+  // pending availability claim after archival.
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
+  MakeCoordinator(options);
+  recovery.request_id_ = MakeRequestId(0x68);
+  recovery.expected_revision_ = orphan_handoff->log_index_;
+  recovery.proof_state_ = keylane::meta::MetaFailoverProofState::kUnavailable;
+  auto unavailable = ProposeSync(recovery);
+  ASSERT_TRUE(unavailable.ok()) << unavailable.status();
+  ASSERT_EQ(unavailable->verdict_, MetaAuditVerdict::kAccepted);
+  const auto unavailable_record =
+      machine_->StoresSnapshot().failover_recovery_.Find(group_id);
+  ASSERT_TRUE(unavailable_record.has_value());
+  EXPECT_EQ(unavailable_record->proof_state_,
+            keylane::meta::MetaFailoverProofState::kUnavailable);
+  EXPECT_EQ(unavailable_record->revision_, unavailable->log_index_);
+
+  recovery.request_id_ = MakeRequestId(0x69);
+  const std::uint64_t before_unavailable_replay = machine_->last_commit_index();
+  auto repeated_unavailable = ProposeSync(recovery);
+  ASSERT_FALSE(repeated_unavailable.ok());
+  EXPECT_EQ(repeated_unavailable.status().code(),
+            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_unavailable_replay);
 }
 
 TEST_F(MetaCoordinatorServerTest,

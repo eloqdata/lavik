@@ -45,7 +45,9 @@
 //                             / "ERR not-found".
 //                             Non-terminal creation/membership workflows
 //                             additionally include phase=<durable
-//                             phase/recovery reason>. Reads the committed
+//                             phase/recovery reason>. Failover reads include
+//                             group, candidate, phase/outcome, and the
+//                             persisted attempt_timeout_ms. Reads the committed
 //                             operation journal directly; this is NOT a
 //                             linearizable read (no read-index round or leader
 //                             lease check), so a stale follower may answer from
@@ -101,6 +103,20 @@
 //                             changes share admission across all Admin
 //                             listeners; a competing creator gets
 //                             preflight/domain-rejected without proposing.
+//   failover 1 <group_id> <wait_ms> <attempt_timeout_ms>
+//                          -> starts one operator-triggered controlled
+//                             failover using the current #39 candidate plan.
+//                             wait_ms bounds only this connection; the
+//                             separately persisted attempt timeout bounds each
+//                             Meta leader tenure's workflow execution.
+//                             Post-proposal replies include an operation
+//                             correlation id. It is durable after a confirmed
+//                             commit; an uncertain reply requires getop
+//                             reconciliation, while a definitive rejection may
+//                             leave no record. Terminal success/failure
+//                             includes phase, loss classification, proven
+//                             frontier, and reason. A timeout or leader change
+//                             does not cancel the background workflow.
 //   addsrv <id> <raft-ip:port> <data-control-ip:port> <ctl-ip:port>
 //          [<keylane://meta/id>]
 //                          -> persists a membership workflow before binding
@@ -327,6 +343,7 @@ class MetaClusterStatusService {
 };
 
 class MetaClusterCreateReconciler;
+class MetaControlledFailoverReconciler;
 
 struct MetaCtlServerOptions {
   enum class Transport : std::uint8_t { kUnix, kTcpPlaintext, kTcpMtls };
@@ -352,6 +369,8 @@ struct MetaCtlServerOptions {
   std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status_;
   // Shared background owner; listeners submit durable intent and only wait.
   std::shared_ptr<MetaClusterCreateReconciler> cluster_create_reconciler_;
+  std::shared_ptr<MetaControlledFailoverReconciler>
+      controlled_failover_reconciler_;
   std::shared_ptr<class MetaMembershipReconciler> membership_reconciler_;
   std::uint32_t observation_ttl_ms_ = 30000;
 };

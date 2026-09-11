@@ -161,7 +161,8 @@ keylane --cluster-enabled \
 ```
 
 Data reports LOADING while its unregistered control connection retries. Run
-the same release on Meta, Data and the CLI. Version 1 names the current
+the same release on Meta, Data and the CLI because control protocol v1 is a
+homogeneous pre-release layout with no capability negotiation. Version 1 names the current
 multi-Group topology and full initial Meta directory; it does not provide
 compatibility with the earlier scalar Meta development layout. Raft,
 Data-control, and Admin advertised addresses belong to each Meta descriptor.
@@ -289,9 +290,10 @@ a new destructive attempt. Meta recovery preserves successful
 population work and finishes bookkeeping without initializing it again. An
 exit-1 Redis verification failure can occur after Meta creation completed, so
 correct the local dependency and inspect status rather than rerunning
-creation. Meta-member addition/removal has a separate recovery driver; Data
-migration and failover orchestration do not become recoverable merely because
-the operation journal exists.
+creation. Meta-member addition/removal and operator-triggered controlled
+failover each have a separate recovery driver. Detector-triggered uncontrolled
+failover and Data migration do not become recoverable merely because the
+operation journal exists.
 
 During creation, `cluster-status` distinguishes `meta_catching_up`, a declared
 but not yet committed `data_unregistered`, an unregistered Data process whose
@@ -695,6 +697,174 @@ keylane-ctl cluster-status --addr 10.0.0.11:7200 \
 `cluster-status` has no DNS server-name override: every committed Admin route
 is numeric and must appear as an IP SAN.
 
+## Run an operator-triggered controlled failover
+
+`failover` is the supported planned-maintenance path for moving one group's
+authority while its current primary and at least one replica are expected to
+cooperate. It is not a failure detector and does not start automatically. The
+server chooses one candidate from the current healthy Ready replicas using the
+Meta compatibility-domain and deterministic per-flow election policy; the
+operator does not name or replace the candidate inside this operation.
+
+Before starting:
+
+1. Run `cluster-status` and confirm the group is serving from one consistent
+   active grant. Find the current caught-up Meta leader with `status`; the
+   direct `failover` command does not discover or redirect to the leader.
+2. Keep the old primary and all candidate Data processes running. The old
+   primary continues serving until Meta commits `BeginGroupTerm`; shutting it
+   down early converts a planned operation into a recovery handoff.
+3. Deploy the same Meta and Data binary version everywhere. The FDS hold,
+   frozen-source payloads, and activation behavior have no mixed-version
+   negotiation.
+4. Ensure no cluster creation, membership change, same-group failover, or
+   retained recovery handoff is active. These workflows share topology-change
+   admission, and Meta rejects overlap rather than interleaving authority
+   effects.
+
+Run the direct Admin command on the leader:
+
+```text
+failover 1 <group_id> <wait_ms> <attempt_timeout_ms>
+```
+
+The fourth token bounds only how long the server keeps this CLI request waiting.
+The fifth token is the controlled attempt's duration, persisted in its immutable
+intent. Both are from 1 through 3,600,000 milliseconds. They are independent:
+set the client's `--timeout-ms` slightly longer than `wait_ms`; it need not span
+the attempt duration.
+
+```sh
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  --timeout-ms 130000 failover 1 group-1 120000 600000
+```
+
+A successful line has this shape:
+
+```text
+OK failover 1 <applied-index> operation=<hex-id> candidate=<node-id> phase=serving loss=<exact|bounded|unknown> recovery_required=0 frontier=<comma-separated-next-lsns|none> reason=<text>
+```
+
+Success means the chosen candidate received the committed successor FDS,
+installed a current-session finite lease, activated its retained prepared
+promotion, and then sent a later ready heartbeat confirming that lease. The
+old source-history hold and its Meta recovery record are removed
+asynchronously after this user-visible boundary. A new request during that
+short cleanup window may be rejected because the recovery handoff still
+exists; wait for cleanup instead of forcing journal state.
+
+Treat the `loss` field as part of success, not as optional diagnostics. An
+`OK` with `loss=unknown` means serving was restored from the best available
+replica frontier but the operation cannot prove that all source-acknowledged
+data survived.
+
+There are three separate timers. `--timeout-ms` bounds the client's complete
+connect/send/receive exchange. `wait_ms` bounds the server-side synchronous
+wait and is not a workflow deadline. `attempt_timeout_ms` is the durable
+workflow policy: the reconciler starts one steady-clock deadline when each Meta
+leader tenure first observes the committed operation. Phase changes, receipt
+commits, Data reconnects, and committed-view resynchronization do not refresh
+that deadline. A Meta leader or process change discards the local clock value
+and gives the recovered operation one full new attempt duration; this avoids
+depending on a cross-host wall clock, so the duration is not a strict
+cluster-wide elapsed-time bound.
+
+Per-flow catch-up, durable promotion prepare, FDS delivery, the full finite-
+lease handoff quarantine, and the confirming heartbeat may therefore outlive
+`wait_ms`. At attempt expiry the reconciler starts no new catch-up, promotion,
+or authority effect, but first reconciles already committed proof, authority,
+and serving facts before terminalizing the attempt. A frozen proof does not
+shorten the quarantine in this version. A CLI wait expiry or leader change
+returns an `uncertain-outcome` line containing the durable operation id and
+candidate while the reconciler continues. Attempt expiry is otherwise a
+definitive `controlled-failed` terminal result; if the CLI wait has already
+ended, retrieve it with `getop`. Direct commands return exit 2 for every `ERR`,
+so automation must inspect the stable error code rather than treating every
+exit 2 as a definitive failure.
+
+Use the original id to inspect progress on the current leader:
+
+```sh
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  getop <hex-id>
+```
+
+A running record reports `kind=failover`, group, selected candidate, and one
+of `planning`, `source-holding`, `source-held`, `old-authority-excluding`,
+`old-authority-excluded`, `candidate-caught-up`, `promotion-preparing`,
+`promotion-prepared`, `authority-activated`, or `serving`. A terminal record
+also reports `phase`, `loss`, `recovery_required`, `frontier`, and `reason`.
+`getop` is not linearizable on a follower. Do not use generic `completeop` or
+`abortop` on a failover; both reject workflow-owned operations, and bypassing
+its cleanup would be unsafe.
+
+Interpret terminal failures by where authority was cut:
+
+| Failure | Durable result and operator action |
+|---|---|
+| Candidate is lost before `BeginGroupTerm` | Controlled failover aborts, reports why, and releases its pre-cutover hold; the old primary remains authoritative. After cleanup and after fixing replica health, a new controlled request is safe. |
+| Old primary is lost before `BeginGroupTerm` | Meta first persists `proof_state=unavailable` as a durable degrade latch, then aborts controlled failover with `recovery_required=1`. A reconnect or leader change cannot resume that controlled attempt; preserve Meta and Data directories and logs. This version does not automatically start uncontrolled recovery. |
+| Candidate is lost after `BeginGroupTerm` | The operation terminalizes promptly instead of waiting for that boot to return. `recovery_required=1` hands the group to a separate uncontrolled workflow; this version does not contain that driver. |
+| Old primary is lost after `BeginGroupTerm` | Recovery does not wait for it. Meta marks the old source unavailable but retains any historical frozen proof. A candidate already at or beyond that frontier can still complete exact; otherwise Meta rebases once to its current per-flow vector and reports unknown loss. |
+| Candidate is lost after `ActivateAuthority` but before confirmed serving | Never substitute another node in the same authority term. Recovery must advance a new term and generation through an independent workflow. |
+| Attempt deadline expires before `BeginGroupTerm` | If the old primary is currently confirmed, the operation aborts with exact loss and releases the pre-cutover hold. If it is unconfirmed, Meta reports unknown loss and retains `recovery_required=1` rather than assuming that authority is safely recoverable. |
+| Attempt deadline expires after `BeginGroupTerm` | The controlled operation aborts with `recovery_required=1`. Before activation the group remains fenced; after a committed activation but before serving, independent recovery must advance a new term. A committed frozen proof is retained before terminalization. |
+| Meta leader or Data control session changes without a Data boot change | A bounded revalidation grace permits exact reconnect/replay. Follow the original operation; do not submit a replacement because the initiating connection ended. |
+
+For a pre-cutover failure, `loss=exact` means authority never moved and the
+attempt introduced no data loss. On a post-cutover failure, `loss=exact` means
+the recovery handoff still has an available trusted frozen all-flow frontier;
+it does not claim that a candidate served it. On successful completion, exact
+means the candidate reached and served that historical frontier. Replacement
+of the old boot, assignment, or replication history after capture does not
+invalidate the historical proof, but it does make the source unavailable. If
+the selected candidate is behind, the
+`old-authority-excluded` phase alone may replace its required vector with that
+candidate's exact current per-flow progress. The operation then continues
+without the old boot and reports `loss=unknown`, because the lower frontier
+does not prove that all source-acknowledged data survived. `bounded` is part of
+the durable result schema for a recovery workflow that can prove a non-exact
+bound; the current single-attempt controlled driver emits exact or unknown.
+The same loss possibility is retained in operation archive metadata.
+
+A recovery handoff is not another operation link. It is a group record in the
+eighth Meta durable store, replicated through the Raft WAL and state-machine
+snapshot. It retains the old source incarnation, excluded-authority and
+population anchors, recovery generation, hold/recovery flags, and any frozen
+proof. After a recovery-required handoff is durable, a group-record watcher
+continues even if the originating operation is archived. A missing matching
+source gets the bounded leader-tenure reconnect grace; a replacement boot,
+assignment, or replication history is definitive immediately. The watcher
+CAS-downgrades `proof_state` to unavailable while retaining the historical
+frontier and proof for audit; those bytes are no longer evidence that the held
+backlog still exists. The terminal outcome remains the historical result at
+terminalization, while the newer recovery-record revision describes the later
+availability loss. The record contains no candidate history. A terminal result
+with `recovery_required=1` intentionally retains the record and source hold;
+do not delete Meta state or restart the old source merely to clear it. The
+independent uncontrolled driver that consumes this handoff is outside the
+current release. A future successor generation may claim this record only
+after both the hold and recovery-required flags are durable; it cannot replace
+an active controlled hold or a false/false release tombstone.
+
+For success and safe pre-cutover failure, cleanup first persists the same
+generation as a false/false release tombstone. This removes the hold from the
+projected FDS but keeps the recovery anchors until the connected old boot
+acknowledges that projection. If that exact boot is absent, cleanup need not
+wait for an acknowledgement. Meta then clears the record while retaining its
+generation/revision floor against stale replay.
+
+Search Meta logs by the operation id. Phase records use stable key/value fields
+`operation`, `group`, `phase`, `candidate`, and `old_source`; the terminal
+record uses `operation`, `group`, `terminal`, `phase`, `loss`,
+`recovery_required`, `frontier`, and `reason`. A later handoff downgrade logs
+`group`, `generation`, `old_source`, `proof_state=unavailable`, and whether a
+historical frontier was retained. Preserve these records for a
+recovery-required incident. Planner conflicts and deferred Raft proposals are
+logged separately. Failover identities are deliberately not Prometheus labels,
+so use the logs and `getop` rather than expecting a per-node or per-operation
+metric series.
+
 ## Add and remove peers
 
 Membership commands are accepted only by the current leader and only one
@@ -782,13 +952,23 @@ cluster; startup intentionally refuses to guess at a conversion.
 
 ## Binary replacement and format compatibility
 
-Meta durable schema and segmented WAL remain v1 while the first release is
-unpublished. The current layout replaces earlier development layouts in
-place; equal version numbers do not make incompatible builds safe to mix.
+The outer Meta durable schema and segmented WAL remain v1 while the first
+release is unpublished. Embedded controlled-failover intent and phase blobs
+carry their own strict `KLFI`/`KLFP` v2 marker; failover terminal outcome,
+unavailable proof, and recovery-store envelopes currently use their own v1
+markers. The current layout replaces earlier development layouts in place;
+equal outer version numbers do not make incompatible builds safe to mix.
 There is no mixed-format window or in-band format switch. For a binary-only
 change that preserves the format, replace one follower at a time, wait for
 catch-up, and replace the leader last. Before any replacement, back up every
 member and record the membership, term, commit index, and snapshot index.
+
+The controlled-failover release adds the eighth durable store plus FDS and
+directive fields. Roll it out homogeneously across Meta and Data, and do not
+start a failover while versions are mixed. Finish any safe pre-cutover
+operation first; if `recovery_required=1`, preserve the existing binaries and
+state until the matching recovery tooling is available rather than upgrading
+away the only observable handoff.
 
 For an incompatible pre-release format change, stop the old cluster and create
 fresh data directories with the new binary. Do not add a new-format process to
@@ -825,6 +1005,16 @@ as a versioned hex blob. After durable external storage, `pruneoperations
 Pruning a summary ends the local late-retry tombstone window for that operation
 id, so retention must cover the clients' documented retry horizon.
 
+Failover terminal records have an additional archive prerequisite. Successful
+and safely cancelled operations remain live until their recovery release
+tombstone has been acknowledged and cleared. A failure with
+`recovery_required=1` remains live until the matching generation records the
+durable hold/recovery handoff. An earlier `archiveoperations` request is
+rejected consistently before append and at deterministic apply; retry after
+the reconciler finishes the corresponding step. After archival, the group
+recovery record—not the archived operation summary—owns source-availability
+tracking and may still move monotonically to unavailable.
+
 The current line protocol returns export bytes as hexadecimal on one line.
 Protect these responses as audit data and avoid terminal logging that could
 copy principals or operation results into an ungoverned sink.
@@ -844,14 +1034,34 @@ next recovery proposal remains rejected until NuRaft resolves the first one's
 actual outcome. Reconcile that outcome from the leader's committed view before
 moving to the next step.
 
+An accepted controlled failover remains able to create its canonical recovery
+owner, enter its initial source-holding phase, persist monotonic proof
+availability, and attribute authority activation or serving that already
+happened. It can then persist its bounded terminal result and the exact matching
+recovery handoff or release/clear steps. These are typed, reconciler-owned
+exceptions to the usual empty terminal payload rule; they cannot dispatch a
+Data directive, commit a new authority mutation, or perform ordinary catch-up
+phase progression. The workflow may therefore stop at a safe boundary while
+the guard is active, but it does not become permanently unowned if the guard
+fires immediately after submission or concurrently with an already-committed
+cutover fact.
+
+An orphaned recovery-required handoff has one additional fail-safe exception:
+the exact same generation may move only from pending or exact to unavailable.
+The mutation must preserve its hold/recovery flags, source and population
+anchors, and any frozen proof. It cannot release, clear, rebind, or upgrade the
+record without a typed successor workflow owner.
+
 If strict-export audit retention is also full, export and durably acknowledge a
 large enough prefix first, then run `pruneaudit <through-index>`. The proposed
 prune must make the serialized audit window smaller after accounting for the
 prune command's own audit record.
 
-For retained live operations, use this bounded sequence. Keep the original
-operation id and sequence returned by `submitop`; `getop` does not return the
-sequence and is not a linearizable read on a follower.
+For retained generic live operations, use this bounded sequence. It does not
+apply to controlled failover or membership operations: their `abortop` and
+`completeop` paths are workflow-owned and reject manual terminalization. Keep
+the original operation id and sequence returned by `submitop`; `getop` does
+not return the sequence and is not a linearizable read on a follower.
 
 ```sh
 keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \

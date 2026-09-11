@@ -2,7 +2,7 @@
 
 // Compact atomic projection used only by cluster status. It deliberately
 // excludes audit records, policy bodies, operation payload/evidence, and the
-// complete seven-store aggregate so an operator read has bounded cost tied to
+// complete eight-store aggregate so an operator read has bounded cost tied to
 // current identity/topology rather than retained history.
 
 #include <cstdint>

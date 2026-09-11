@@ -79,6 +79,20 @@ control::FullDesiredState DesiredState() {
   return desired;
 }
 
+void AddValidSourceHistoryHold(control::FullDesiredState* desired) {
+  const control::WireDesiredGroup& group = desired->groups.front();
+  desired->groups.front().source_history_hold = control::WireSourceHistoryHold{
+      .generation = 23,
+      .source_assignment_id = group.members.front().assignment_id,
+      .source_boot_id = std::string(40, 'b'),
+      .source_replication_history_id = std::string(40, 'c'),
+      .manifest_revision = group.manifest_revision,
+      .manifest_digest = group.manifest_digest,
+      .partition_replication_epoch = group.partition_replication_epoch,
+  };
+  Rehash(desired);
+}
+
 TEST(MetaControlMapperTest, BuildsCompleteImmutableServingState) {
   auto prepared = cluster::PrepareMetaFullState(DesiredState(), kNode1, 4);
   ASSERT_TRUE(prepared.ok()) << prepared.status();
@@ -109,6 +123,109 @@ TEST(MetaControlMapperTest, BuildsCompleteImmutableServingState) {
             DesiredState().groups[0].manifest_digest);
   EXPECT_EQ(prepared->control_groups_[0].partition_replication_epoch_,
             DesiredState().groups[0].partition_replication_epoch);
+}
+
+TEST(MetaControlMapperTest,
+     MapsSourceHistoryHoldToControlIdentityWithoutRestoringServing) {
+  auto desired = DesiredState();
+  auto& group = desired.groups.front();
+  group.grant_active = false;
+  group.grant_duration_ms = 0;
+  group.grant_policy_id.clear();
+  group.grant_policy_version = 0;
+  AddValidSourceHistoryHold(&desired);
+
+  auto prepared = cluster::PrepareMetaFullState(desired, kNode1, 4);
+  ASSERT_TRUE(prepared.ok()) << prepared.status();
+  ASSERT_EQ(prepared->control_groups_.size(), 1U);
+  ASSERT_TRUE(
+      prepared->control_groups_.front().source_history_hold_.has_value());
+  const cluster::SourceHistoryHoldDesired& hold =
+      *prepared->control_groups_.front().source_history_hold_;
+  EXPECT_EQ(hold.group_id_, "group-a");
+  EXPECT_EQ(hold.recovery_generation_, 23U);
+  EXPECT_EQ(hold.source_assignment_id_,
+            cluster::AssignmentId::FromBytes(
+                desired.groups.front().members.front().assignment_id));
+  EXPECT_EQ(hold.source_boot_id_.ToHexString(), std::string(40, 'b'));
+  EXPECT_EQ(hold.source_replication_history_id_.ToHexString(),
+            std::string(40, 'c'));
+  EXPECT_EQ(hold.manifest_revision_, 5U);
+  EXPECT_EQ(hold.manifest_digest_, desired.groups.front().manifest_digest);
+  EXPECT_EQ(hold.partition_replication_epoch_, 13U);
+  // A history hold retains replication data; it never restores the fenced
+  // source as a serving group.
+  EXPECT_TRUE(prepared->serving_state_->Groups().empty());
+}
+
+TEST(MetaControlMapperTest, RejectsSourceHistoryHoldForAnotherAssignment) {
+  auto desired = DesiredState();
+  AddValidSourceHistoryHold(&desired);
+  desired.groups.front().source_history_hold->source_assignment_id =
+      desired.groups.front().members.back().assignment_id;
+  Rehash(&desired);
+
+  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
+TEST(MetaControlMapperTest, RejectsSourceHistoryHoldProjectedToNonlocalGroup) {
+  auto desired = DesiredState();
+  auto& group = desired.groups.front();
+  group.members.erase(group.members.begin());
+  group.owner_node_id = kNode2;
+  group.owner_assignment_id = group.members.front().assignment_id;
+  AddValidSourceHistoryHold(&desired);
+
+  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
+TEST(MetaControlMapperTest,
+     RejectsSourceHistoryHoldWithZeroGenerationOrStalePopulation) {
+  auto expect_rejected = [](control::FullDesiredState desired) {
+    Rehash(&desired);
+    EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
+              absl::StatusCode::kInvalidArgument);
+  };
+
+  auto desired = DesiredState();
+  AddValidSourceHistoryHold(&desired);
+  desired.groups.front().source_history_hold->generation = 0;
+  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  desired = DesiredState();
+  AddValidSourceHistoryHold(&desired);
+  ++desired.groups.front().source_history_hold->manifest_revision;
+  expect_rejected(std::move(desired));
+
+  desired = DesiredState();
+  AddValidSourceHistoryHold(&desired);
+  desired.groups.front().source_history_hold->manifest_digest[0] ^= 0xff;
+  expect_rejected(std::move(desired));
+
+  desired = DesiredState();
+  AddValidSourceHistoryHold(&desired);
+  ++desired.groups.front().source_history_hold->partition_replication_epoch;
+  expect_rejected(std::move(desired));
+}
+
+TEST(MetaControlMapperTest,
+     RejectsSourceHistoryHoldWithNoncanonicalBootOrHistory) {
+  auto desired = DesiredState();
+  AddValidSourceHistoryHold(&desired);
+  desired.groups.front().source_history_hold->source_boot_id =
+      std::string(40, 'B');
+  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  desired = DesiredState();
+  AddValidSourceHistoryHold(&desired);
+  desired.groups.front().source_history_hold->source_replication_history_id =
+      "short";
+  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
+            absl::StatusCode::kInvalidArgument);
 }
 
 TEST(MetaControlMapperTest, SourceIndexDoesNotBecomeTopologyEpoch) {

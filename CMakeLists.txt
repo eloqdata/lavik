@@ -594,6 +594,7 @@ if (KEYLANE_BUILD_META)
     src/meta/audit_store.cpp
     src/meta/candidate_plan.cpp
     src/meta/cluster_create_reconciler.cpp
+    src/meta/controlled_failover_reconciler.cpp
     src/meta/commands.cpp
     src/meta/control_projector.cpp
     src/meta/coordinator.cpp
@@ -602,6 +603,7 @@ if (KEYLANE_BUILD_META)
     src/meta/data_control_runtime_status.cpp
     src/meta/encoding.cpp
     src/meta/failover.cpp
+    src/meta/failover_recovery_store.cpp
     src/meta/grant_store.cpp
     src/meta/identity_verifier.cpp
     src/meta/identity_store.cpp
@@ -807,6 +809,8 @@ if (BUILD_TESTING)
       tests/meta_coordinator_test.cpp
       tests/meta_candidate_plan_test.cpp
       tests/meta_control_projector_test.cpp
+      tests/meta_controlled_failover_reconciler_test.cpp
+      tests/meta_controlled_failover_lifecycle_test.cpp
       tests/meta_data_control_server_test.cpp
       tests/meta_failover_test.cpp
       tests/meta_journal_test.cpp
@@ -1016,6 +1020,7 @@ if (BUILD_TESTING)
 
     add_executable(keylane_cluster_replication_manager_integration_test
       tests/cluster/replication_manager_integration_test.cpp
+      tests/cluster/source_history_hold_integration_test.cpp
     )
     target_link_libraries(keylane_cluster_replication_manager_integration_test PRIVATE
       keylane::module

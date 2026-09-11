@@ -386,6 +386,21 @@ absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
   return absl::OkStatus();
 }
 
+std::optional<std::uint64_t> AuthorityGuard::ExactLeaseGeneration(
+    const SessionIdentity& session, const AuthorityAnchor& anchor,
+    MonotonicTime deadline, MonotonicTime now) const {
+  if (lease_mode_ != LeaseMode::kFinite) return std::nullopt;
+  const std::lock_guard lock(mutex_);
+  if (!session_.has_value() || *session_ != session) return std::nullopt;
+  const auto lease = leases_.find(anchor.group_id_);
+  if (lease == leases_.end() || lease->second.session_ != session ||
+      lease->second.anchor_ != anchor || lease->second.deadline_ != deadline ||
+      deadline <= now) {
+    return std::nullopt;
+  }
+  return generation_;
+}
+
 bool AuthorityGuard::ExpireLease(const SessionIdentity& session,
                                  const AuthorityAnchor& anchor,
                                  MonotonicTime deadline, MonotonicTime now) {

@@ -1395,7 +1395,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           recovery_now_ms = overridden;
         }
       });
-  if (expiration_authority_.load(std::memory_order_acquire)) {
+  if (CurrentExpirationAuthority() != nullptr) {
     for (auto& partition : store.partitions_) {
       for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
         // Recovery rebuilds this count alongside every winning index entry.

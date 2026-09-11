@@ -143,7 +143,7 @@ class RetainedProjectionLimiter {
 };
 
 // Worker-local immutable view cache shared by all Data sessions. A Meta
-// commit may wake thousands of sessions, but the seven committed stores are
+// commit may wake thousands of sessions, but the eight committed stores are
 // copied only once for each new applied high-water. Not thread-safe: the
 // data-control server owns and accesses it exclusively on its Celer worker.
 class MetaCommittedViewCache {

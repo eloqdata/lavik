@@ -77,6 +77,51 @@ std::array<std::uint8_t, N> Bytes(std::uint8_t value) {
 
 std::string Identity(char value) { return std::string(40, value); }
 
+control::FullDesiredState RuntimeServingProjection(
+    std::string_view node_id, std::uint8_t hash_byte = 0x31,
+    std::uint64_t grant_revision = 6) {
+  control::FullDesiredState projection;
+  projection.source_meta_applied_index = 7;
+  projection.topology_epoch = 3;
+  projection.projection_hash = Bytes<32>(hash_byte);
+  projection.groups.push_back({
+      .group_id = "group-a",
+      .members = {{.node_id = std::string(node_id),
+                   .assignment_id = Bytes<16>(0x11)}},
+      .owner_node_id = std::string(node_id),
+      .owner_assignment_id = Bytes<16>(0x11),
+      .group_term = 4,
+      .authority_version = 5,
+      .grant_revision = grant_revision,
+      .grant_duration_ms = 250,
+      .grant_active = true,
+      .manifest_revision = 8,
+      .manifest_digest = Bytes<32>(0x32),
+      .partition_replication_epoch = 9,
+  });
+  return projection;
+}
+
+control::LeaseGranted RuntimeServingGrant(
+    const control::FullDesiredState& projection, std::string boot_id,
+    std::uint64_t leadership_generation) {
+  const auto& group = projection.groups.front();
+  return {
+      .nonce = Bytes<16>(0x21),
+      .leader_id = 3,
+      .raft_term = 17,
+      .leadership_generation = leadership_generation,
+      .data_boot_id = std::move(boot_id),
+      .projection_hash = projection.projection_hash,
+      .group_id = group.group_id,
+      .assignment_id = *group.owner_assignment_id,
+      .group_term = group.group_term,
+      .authority_version = group.authority_version,
+      .grant_revision = group.grant_revision,
+      .granted_duration_ms = 200,
+  };
+}
+
 TEST(MetaDataControlRuntimeStatusTest,
      PublishesOnlyCurrentSessionAndAckedHeartbeatFacts) {
   MetaDataControlRuntimeStatus status;
@@ -98,6 +143,16 @@ TEST(MetaDataControlRuntimeStatusTest,
       .manifest_revision = 8,
       .manifest_digest = Bytes<32>(0x32),
       .partition_replication_epoch = 9,
+      .source_history_hold =
+          control::WireSourceHistoryHold{
+              .generation = 3,
+              .source_assignment_id = Bytes<16>(0x11),
+              .source_boot_id = Identity('2'),
+              .source_replication_history_id = Identity('5'),
+              .manifest_revision = 8,
+              .manifest_digest = Bytes<32>(0x32),
+              .partition_replication_epoch = 9,
+          },
   });
   const auto session = Bytes<16>(0x41);
   status.PublishCurrent(Identity('1'), Identity('2'), session, Bytes<20>(0x51),
@@ -113,6 +168,8 @@ TEST(MetaDataControlRuntimeStatusTest,
   EXPECT_EQ(snapshot.nodes_[0].replication_flow_count_, 3);
   EXPECT_FALSE(snapshot.nodes_[0].health_.has_value());
   EXPECT_EQ(snapshot.nodes_[0].groups_.size(), 1u);
+  ASSERT_TRUE(snapshot.nodes_[0].groups_[0].source_history_hold_.has_value());
+  EXPECT_EQ(snapshot.nodes_[0].groups_[0].source_history_hold_->generation, 3u);
 
   // Validating an unchanged FDS advances freshness, not the origin of the
   // object Data acknowledged. Old sessions cannot advance that proof.
@@ -138,6 +195,7 @@ TEST(MetaDataControlRuntimeStatusTest,
   ASSERT_TRUE(snapshot.nodes_[0].health_.has_value());
   EXPECT_TRUE(snapshot.nodes_[0].last_lease_decision_.has_value());
   EXPECT_EQ(snapshot.nodes_[0].lease_decision_written_unix_ms_, 101);
+  EXPECT_FALSE(snapshot.nodes_[0].confirmed_serving_lease_.has_value());
 
   const auto stale_session = Bytes<16>(0x42);
   status.Remove(Identity('1'), &stale_session);
@@ -158,6 +216,7 @@ TEST(MetaDataControlRuntimeStatusTest,
             std::vector<std::string>({Identity('1'), Identity('3')}));
   ASSERT_EQ(snapshot.nodes_[0].groups_.size(), 1u);
   EXPECT_EQ(snapshot.nodes_[0].groups_[0].assignment_id_, Bytes<16>(0x12));
+  ASSERT_TRUE(snapshot.nodes_[0].groups_[0].source_history_hold_.has_value());
 
   status.EndLeadership(/*leadership_generation=*/11);
   snapshot = status.Snapshot();
@@ -171,6 +230,169 @@ TEST(MetaDataControlRuntimeStatusTest,
                         /*leadership_generation=*/11,
                         /*validated_committed_high_water=*/7, projection);
   EXPECT_TRUE(status.Snapshot().nodes_.empty());
+}
+
+TEST(MetaDataControlRuntimeStatusTest,
+     ConfirmsExactGrantOnlyOnLaterReadyHeartbeat) {
+  MetaDataControlRuntimeStatus status;
+  status.BeginLeadership(/*leadership_generation=*/11);
+  status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true);
+  const std::string node_id = Identity('1');
+  const std::string boot_id = Identity('2');
+  const auto session = Bytes<16>(0x41);
+  const auto projection = RuntimeServingProjection(node_id);
+  status.PublishCurrent(node_id, boot_id, session, Bytes<20>(0x51),
+                        /*session_generation=*/10,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
+  const auto grant = RuntimeServingGrant(projection, boot_id, 11);
+
+  // Health is recorded before the decision is written in the heartbeat path,
+  // so the grant-producing heartbeat cannot prove it is already serving.
+  status.RecordHealth(
+      node_id, session,
+      {.storage_ready = true, .population_ready = true, .draining = false},
+      /*received_unix_ms=*/100);
+  status.RecordLeaseDecisionWritten(node_id, session,
+                                    control::LeaseDecision(grant),
+                                    /*written_unix_ms=*/101);
+  auto snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  EXPECT_FALSE(snapshot.nodes_[0].confirmed_serving_lease_.has_value());
+
+  // A later heartbeat must itself be ready. An unready round does not turn a
+  // successfully written grant into serving evidence.
+  const std::array unready_health = {
+      control::HeartbeatHealth{
+          .storage_ready = false, .population_ready = true, .draining = false},
+      control::HeartbeatHealth{
+          .storage_ready = true, .population_ready = false, .draining = false},
+      control::HeartbeatHealth{
+          .storage_ready = true, .population_ready = true, .draining = true},
+  };
+  for (std::size_t index = 0; index < unready_health.size(); ++index) {
+    status.RecordHealth(node_id, session, unready_health[index],
+                        /*received_unix_ms=*/102 + index);
+    EXPECT_FALSE(
+        status.Snapshot().nodes_[0].confirmed_serving_lease_.has_value());
+  }
+  status.RecordHealth(
+      node_id, session,
+      {.storage_ready = true, .population_ready = true, .draining = false},
+      /*received_unix_ms=*/105);
+  snapshot = status.Snapshot();
+  ASSERT_TRUE(snapshot.nodes_[0].confirmed_serving_lease_.has_value());
+  EXPECT_EQ(*snapshot.nodes_[0].confirmed_serving_lease_, grant);
+  EXPECT_EQ(snapshot.nodes_[0].serving_confirmed_unix_ms_, 105);
+}
+
+TEST(MetaDataControlRuntimeStatusTest, DoesNotConfirmAnExpiredGrantAsServing) {
+  MetaDataControlRuntimeStatus status;
+  status.BeginLeadership(/*leadership_generation=*/11);
+  status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true);
+  const std::string node_id = Identity('1');
+  const std::string boot_id = Identity('2');
+  const auto session = Bytes<16>(0x41);
+  const auto projection = RuntimeServingProjection(node_id);
+  status.PublishCurrent(node_id, boot_id, session, Bytes<20>(0x51),
+                        /*session_generation=*/10,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
+  const auto grant = RuntimeServingGrant(projection, boot_id, 11);
+  status.RecordLeaseDecisionWritten(node_id, session,
+                                    control::LeaseDecision(grant),
+                                    /*written_unix_ms=*/100);
+
+  // A delayed heartbeat can still belong to the same authenticated session,
+  // but it cannot prove that Data is serving under a lease which has already
+  // reached its finite duration.
+  status.RecordHealth(
+      node_id, session,
+      {.storage_ready = true, .population_ready = true, .draining = false},
+      /*received_unix_ms=*/300);
+
+  const auto snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  EXPECT_FALSE(snapshot.nodes_[0].confirmed_serving_lease_.has_value());
+}
+
+TEST(MetaDataControlRuntimeStatusTest,
+     ServingConfirmationIsScopedToProjectionSessionAndLeadership) {
+  MetaDataControlRuntimeStatus status;
+  status.BeginLeadership(/*leadership_generation=*/11);
+  status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true);
+  const std::string node_id = Identity('1');
+  const std::string boot_id = Identity('2');
+  const auto session = Bytes<16>(0x41);
+  auto projection = RuntimeServingProjection(node_id);
+  status.PublishCurrent(node_id, boot_id, session, Bytes<20>(0x51),
+                        /*session_generation=*/10,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/7, projection);
+  auto grant = RuntimeServingGrant(projection, boot_id, 11);
+  status.RecordLeaseDecisionWritten(node_id, session,
+                                    control::LeaseDecision(grant), 100);
+  status.RecordHealth(
+      node_id, session,
+      {.storage_ready = true, .population_ready = true, .draining = false},
+      101);
+  ASSERT_TRUE(status.Snapshot().nodes_[0].confirmed_serving_lease_.has_value());
+
+  // Replacing FDS invalidates both the proof and its pending grant. Even a
+  // stale copy of the old grant cannot match the replacement projection.
+  projection = RuntimeServingProjection(node_id, /*hash_byte=*/0x42,
+                                        /*grant_revision=*/7);
+  status.PublishCurrent(node_id, boot_id, session, Bytes<20>(0x51),
+                        /*session_generation=*/10,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/8, projection);
+  EXPECT_FALSE(
+      status.Snapshot().nodes_[0].confirmed_serving_lease_.has_value());
+  status.RecordLeaseDecisionWritten(node_id, session,
+                                    control::LeaseDecision(grant), 102);
+  status.RecordHealth(
+      node_id, session,
+      {.storage_ready = true, .population_ready = true, .draining = false},
+      103);
+  EXPECT_FALSE(
+      status.Snapshot().nodes_[0].confirmed_serving_lease_.has_value());
+
+  grant = RuntimeServingGrant(projection, boot_id, 11);
+  status.RecordLeaseDecisionWritten(node_id, session,
+                                    control::LeaseDecision(grant), 104);
+  status.RecordHealth(
+      node_id, session,
+      {.storage_ready = true, .population_ready = true, .draining = false},
+      105);
+  ASSERT_TRUE(status.Snapshot().nodes_[0].confirmed_serving_lease_.has_value());
+
+  const auto replacement_session = Bytes<16>(0x52);
+  status.PublishCurrent(node_id, boot_id, replacement_session, Bytes<20>(0x51),
+                        /*session_generation=*/11,
+                        /*leadership_generation=*/11,
+                        /*validated_committed_high_water=*/8, projection);
+  EXPECT_FALSE(
+      status.Snapshot().nodes_[0].confirmed_serving_lease_.has_value());
+
+  // Delayed calls from the displaced session cannot populate or otherwise
+  // mutate the replacement's proof.
+  status.RecordLeaseDecisionWritten(node_id, session,
+                                    control::LeaseDecision(grant), 106);
+  status.RecordHealth(
+      node_id, session,
+      {.storage_ready = true, .population_ready = true, .draining = false},
+      107);
+  auto snapshot = status.Snapshot();
+  ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  EXPECT_EQ(snapshot.nodes_[0].session_id_, replacement_session);
+  EXPECT_FALSE(snapshot.nodes_[0].last_lease_decision_.has_value());
+  EXPECT_FALSE(snapshot.nodes_[0].confirmed_serving_lease_.has_value());
+  EXPECT_EQ(snapshot.nodes_[0].health_received_unix_ms_, 0);
+
+  status.BeginLeadership(/*leadership_generation=*/12);
+  snapshot = status.Snapshot();
+  EXPECT_EQ(snapshot.leadership_generation_, 12u);
+  EXPECT_TRUE(snapshot.nodes_.empty());
 }
 
 TEST(MetaDataControlRuntimeStatusTest,

@@ -17,12 +17,12 @@ the publisher that may create sessions, project desired state, evaluate lease
 challenges, or accept results. Demotion cancels that publisher and begins
 closing, then joins, all sessions and leader-scoped tasks from its leadership
 generation before the coordinator reports the transition complete. Shutdown
-first stops the creation and membership reconcilers without waiting for remote results, then
-cancels administrative result waits and drains every listener, then quiesces Data
-sessions and
-all NuRaft/proposal-executor producers, waits for the foreign executor's
-accepted prefix to reach the Meta worker, and only then stops the generic Celer
-runtime. An active demotion or first shutdown drain is fail-stop if the worker
+first stops the creation, membership, and controlled-failover reconcilers
+without waiting for remote results, then cancels administrative result waits
+and drains every listener, then quiesces Data sessions and all
+NuRaft/proposal-executor producers, waits for the foreign executor's accepted
+prefix to reach the Meta worker, and only then stops the generic Celer runtime.
+An active demotion or first shutdown drain is fail-stop if the worker
 mailbox cannot accept its notification: reporting success would permit a later
 leader epoch to reuse authority that was never revoked. Once shutdown has
 synchronously drained the worker, later reconciler cancellation and object
@@ -38,7 +38,7 @@ membership descriptor own the advertised routes, which may name explicit
 proxies rather than these local binds. Wildcard Admin binds and port zero are
 invalid.
 
-The state machine owns one `MetaStores` value containing seven committed
+The state machine owns one `MetaStores` value containing eight committed
 stores:
 
 | Store | Durable responsibility |
@@ -49,6 +49,7 @@ stores:
 | Grant | Group terms and authority grants, including fencing and lease parameters |
 | Operation | Idempotent operation lifecycle, current directives, durable terminal receipts, and exported/prunable terminal summaries |
 | Population manifest | Immutable, content-addressed partition/epoch documents and explicit pruning |
+| Failover recovery | Group-scoped recovery generations, old-source and excluded-authority anchors, source-hold intent, recovery requirement, and optional frozen frontier proof |
 | Audit | Log-index-ordered command verdicts in a bounded hash chain |
 
 `ApplyCommitted` is the only mutation path. It dispatches absolute-value and
@@ -89,17 +90,59 @@ and impossible apply ordering fail stop. Replaying the same entry at the same
 index is idempotent and produces the same verdict and audit record;
 correctness does not depend on apply running only once.
 
-Failover preparation uses one top-level durable operation whose intent and
-phase blobs have strict versioned codecs. The implemented graph ends at
-`promotion-prepared`:
-old authority excluded, candidate caught up, promotion preparing, then
-promotion prepared. A registered proposal-validation hook forbids skipped or
-repeated phases, changes to earlier exclusion/frontier proofs, and any prepare
-before the committed group is fenced and grantless. The preparing phase owns
-one current `promotion-prepare` directive; the prepared phase clears it only
-after the exact successful terminal receipt and matching evidence summary are
-committed under the same operation id. Authority activation and serving phases
-are outside the preparation graph and are rejected by its validator.
+Controlled failover uses one top-level durable operation whose immutable
+single-attempt intent and phase blobs have strict versioned codecs. Candidate
+selection occurs once from the current compatible Candidate Plan; the recovery
+store deliberately contains no candidate or attempt history. The submitted
+no-phase state is rendered as `planning`; its ordered phase graph is
+`source-holding`, `source-held`, `old-authority-excluding`,
+`old-authority-excluded`, `candidate-caught-up`, `promotion-preparing`,
+`promotion-prepared`, `authority-activated`, then `serving`. A registered
+proposal-validation hook forbids skipped phases, more than one live failover
+for a group, arbitrary changes to exclusion/frontier/prepared proofs, and a
+term, prepare, or activation that does not match the exact committed authority
+and population anchors. Its sole same-stage frontier change is the validated
+candidate-backed downgrade at `old-authority-excluded` after source
+availability is lost.
+
+The recovery record is created before the first phase and is independently
+snapshotted. It binds one monotonic group generation to the old source
+assignment/boot/history, excluded term/authority/grant, manifest and partition
+epoch, hold/recovery flags, and an optional all-flow frozen proof. Within a
+generation, immutable anchors and frozen proof bytes cannot change. Proof
+state moves only conservatively: `pending` resolves to `exact` or
+`unavailable`; replacement of the exact old boot, assignment, or replication
+history changes `exact` to `unavailable` while retaining its historical frozen
+proof; and `unavailable` cannot upgrade or rewrite that proof. Operation
+receipts and recovery records have independent
+CAS revisions, so every replica repeats a typed apply-time validation: a queued
+proof-loss command is rejected if a successful exact frozen-source receipt was
+ordered ahead of it in Raft. Final clear retains a generation/revision
+tombstone so delayed replay cannot recreate an old hold.
+Before the authority cut, definitive old-source loss first checkpoints
+`pending -> unavailable`; that state is a durable degrade latch, so reconnect,
+leader replacement, or a queued `BeginGroupTerm` cannot resume controlled
+cutover. Only after that checkpoint may the operation publish its unknown-loss
+terminal result and recovery handoff.
+Safe terminal cleanup first converts the existing generation to a durable
+false/false release tombstone, keeps that record until the old source
+acknowledges an FDS without the hold, and only then clears it. A new or
+successor-generation record cannot start in this released state. A successor
+may atomically replace an active generation only after that generation has
+durably entered recovery-required handoff, so an independent recovery driver
+cannot steal a hold still owned by controlled cleanup. The record
+pins its source assignment and population manifest until final clear. An
+independent uncontrolled operation can later read a recovery-required handoff
+without a parent/child operation relationship.
+Once the handoff flags are durable, source availability belongs to the group
+record rather than to the terminal operation. The reconciler scans these
+records independently, including after operation archival, applies the same
+leader-tenure reconnect grace, and CAS-downgrades `pending` or `exact` to
+`unavailable` if the pinned boot/assignment/history/hold is lost. An exact
+frontier is retained as immutable historical evidence. The already-published
+terminal outcome remains an audit statement about the attempt at
+terminalization; later source loss is represented by the newer recovery-record
+revision.
 
 All model collections, command fields, snapshots, active operations, archived
 summaries, policy bytes, and the audit window have explicit bounds. An
@@ -111,11 +154,23 @@ round. Once uncompacted WAL or consecutive snapshot-failure guards fire, the
 coordinator rejects ordinary proposals with `RESOURCE_EXHAUSTED`. It simulates
 an explicit recovery command against one committed view and admits exactly one
 whose effect advances the bounded recovery chain: empty-result terminalization
-of a live operation, movement of terminal records into the archive, removal of
-existing archived summaries or terminal receipts, removal of an existing
-unreferenced manifest, or an audit prune whose serialized window is smaller
-even after its own audit record. A no-op prune, stale revision, nonempty result,
+of a generic live operation; canonical bounded failover bootstrap,
+proof-availability checkpoints, and attribution of an already-committed
+authority or observed serving fact; failover terminalization and its exact
+same-generation handoff/release/clear; movement of terminal records into the
+archive; removal of existing archived summaries or terminal receipts; removal
+of an existing unreferenced manifest; or an audit prune whose serialized
+window is smaller even after its own audit record. Failover exceptions are a
+typed allowlist: they cannot dispatch a Data directive or commit a new
+authority mutation. A no-op prune, stale revision, arbitrary nonempty result,
 or other nominally whitelisted command is rejected before Raft append.
+Failover archive admission additionally requires the same cross-store gate as
+normal proposal and apply: safe outcomes must have fully cleared their
+recovery record, while recovery-required outcomes must first persist the exact
+hold/recovery handoff. Archival therefore transfers availability ownership to
+the group record instead of leaving cleanup dependent on archived operation
+intent. Its narrow same-generation availability downgrade remains admissible
+under WAL or snapshot pressure.
 The recovery reservation follows the actual NuRaft proposal until it resolves,
 even if its caller times out, so another recovery step cannot overtake an
 uncertain outcome. After enough state is removed, a successful snapshot clears
@@ -164,8 +219,9 @@ the state machine up.
 produces a canonical node-specific `FullDesiredState`: the global Meta/Data
 directories and topology, each group's partition replication epoch, that
 node's group/authority policy, referenced population manifests and policies,
-and live directives whose explicit
-recipient is that node. The source applied index is an ordering/diagnostic
+live directives whose explicit recipient is that node, and an active recovery
+record's source-history hold only for its exact old-source node incarnation.
+The source applied index is an ordering/diagnostic
 watermark; SHA-256 of the canonical semantic projection is the dependency used
 by leases and directives. The publisher sends a full projection on session
 acceptance and whenever that hash changes. Control protocol v1 has no delta
@@ -394,6 +450,129 @@ is an explicit best-effort data-loss policy, not a claim of a lossless latest
 node. The self-contained result is returned immediately; this layer adds no
 yield/resume revalidation lifecycle.
 
+## Controlled failover workflow
+
+The authenticated Admin `failover` verb starts only an operator-triggered
+controlled failover. Admission requires a consistent active owner and finite
+grant, no active recovery handoff or same-group failover, and one eligible
+candidate from `CandidatePlanFor`. It persists that exact candidate
+assignment/boot, its source lineage, and the operator-supplied bounded
+`attempt_timeout_ms` duration in the immutable operation intent; the workflow
+never silently switches candidates. The Admin connection has a separate
+caller-supplied wait duration. Expiry of that wait, disconnect, or leader
+change does not cancel an accepted operation.
+
+`MetaControlledFailoverReconciler` owns the operation on each caught-up leader.
+Its pure planner derives at most one next command from the committed operation,
+recovery store, current observations, and Data runtime snapshot. When a leader
+tenure first observes a committed operation, it turns the persisted duration
+into one `steady_clock` deadline. Phase changes, receipt commits, control
+reconnects, and subscription resynchronization within that tenure do not
+refresh it. Demotion joins the old owner and discards the local clock value; a
+new leader or restarted process resumes from snapshot/WAL state and exact
+directive receipts, then grants the recovered operation one full new duration
+instead of comparing an untrustworthy cross-host wall-clock timestamp. A short
+absence of the same Data incarnation receives a bounded revalidation grace
+because leader change clears volatile sessions; a replaced boot, exact terminal
+failure, grace expiry, or attempt-deadline expiry is definitive for that
+attempt.
+
+Before cutting service, the reconciler creates the recovery record, projects a
+source-wide history hold to the exact old-primary incarnation, dispatches an
+ordinary source authorization, and waits for both its successful terminal
+receipt and the acknowledged FDS hold. Only then does `BeginGroupTerm` remove
+the old grant. In the fenced successor term, frozen-source mode reuses the
+authorize-source result/evidence path to capture an exact all-flow frontier and
+proof hash while retaining export to the selected candidate. If the old source
+is unreachable after the cut, the record moves monotonically to unavailable
+without discarding a previously captured historical frontier or proof. A
+selected candidate already at or beyond that frontier can still complete
+exactly. If it is behind, the only permitted recovery-basis rewrite is a
+same-stage `old-authority-excluded` transition that lowers the required
+per-flow vector to that candidate's current exact progress and replaces the
+exclusion hash with the candidate-backed unavailable proof. Recovery then
+continues with unknown loss instead of waiting for the old boot.
+
+The candidate must report every applied flow at or beyond the chosen frontier.
+Until it does, the exact frozen-source authorization remains the operation's
+current directive and therefore remains projected through FDS replacement or
+session reconnect with its original directive revision. The
+`candidate-caught-up` transition retains it once more; entering
+`promotion-preparing` replaces it with the one exact promotion-prepare
+directive. The reconciler commits that directive's matching terminal receipt
+and evidence before atomically assigning the successor with
+`ActivateAuthority`. The new FDS and current-session finite lease make Data
+consume the retained prepared context through its ordinary local promotion
+activation. A later ready heartbeat that matches that exact lease proves
+serving; only then does the operation complete.
+
+Failure handling follows the authority cut. Candidate loss before
+`BeginGroupTerm` aborts controlled failover and releases the hold while the old
+primary remains authoritative. Old-primary loss before the cut aborts the
+controlled attempt, but first latches the source proof as unavailable and then
+retains a `recovery_required` handoff for a separate uncontrolled operation.
+Candidate loss after the cut also terminalizes this
+attempt with recovery required instead of waiting for that candidate to
+restart; after authority activation, a replacement additionally requires a
+new term. Old-primary loss after the cut never blocks a surviving candidate:
+Meta retains any historical frozen proof for audit, marks the source
+unavailable, and either preserves an exact outcome when the candidate reached
+that frontier or rebases once to the candidate's lower per-flow cut with
+unknown loss. This version contains no detector, automatic uncontrolled
+driver, or multi-candidate retry loop.
+
+Attempt-deadline handling follows the same authority cut. Before
+`BeginGroupTerm`, expiry aborts and releases the hold only when the old primary
+is currently confirmed; an unconfirmed old primary instead produces unknown
+loss and retains a recovery-required handoff. After `BeginGroupTerm`, expiry
+terminalizes the controlled operation with recovery required and leaves the
+group fenced. If authority activation already committed, that durable fact wins
+the race with expiry and the recovery handoff requires a new term. Likewise, a
+current-session serving proof wins an expiry race and completes the already
+serving operation. Committed frozen proof and monotonic proof-availability
+downgrades are persisted before an expiry result so an independent recovery
+workflow receives the strongest safe handoff.
+
+Terminal results encode the failure stage, reason, recovery-required flag,
+proven per-flow frontier, and an `exact`, `bounded`, or `unknown` loss class. A
+safe pre-cutover abort is exact because authority never moved. After the cut,
+a failed attempt reports exact only while the recovery record still has an
+available exact source proof; this describes a proven recovery frontier, not a
+serving candidate. A successful completion reports exact when its phase still
+uses the historical frozen frontier and the candidate reached it, even if the
+source later became unavailable. Rebasing to the selected candidate's lower
+frontier reports `unknown`; the `bounded` value is available to a recovery
+driver that can prove a non-exact bound. `data_loss_possible` is retained in
+the generic operation archive. After a successful serving proof or a safe
+pre-cutover abort, cleanup persists the false/false release tombstone, waits
+for the exact old FDS acknowledgement when that boot is present, then clears
+the recovery record. A terminal operation that requires recovery keeps both
+record and hold intent. A failover operation cannot move into the generic
+archive until the release is fully cleared or the matching recovery-required
+handoff is durable. Generic `completeop` and `abortop` cannot bypass this
+lifecycle.
+
+The workflow has one hard attempt deadline during each continuous Meta leader
+tenure. It is distinct from the Admin wait: per-flow catch-up, prepare
+durability, FDS delivery, the full existing finite-lease handoff quarantine,
+and the confirming heartbeat may outlive the initiating request. At expiry the
+reconciler starts no new catch-up, promotion, or authority effect, but first
+attributes already committed proof, authority, and serving facts before
+terminalizing the attempt. A frozen proof does not shorten the quarantine.
+Because leadership or process replacement deliberately reconstructs a full
+monotonic budget, the persisted duration is not a cluster-wide absolute
+wall-clock completion bound. A post-cutover expiry leaves the group unavailable
+until an independent recovery workflow advances it.
+
+The reconciler emits one structured log when the visible phase changes, with
+`operation`, `group`, `phase`, `candidate`, and `old_source`. Its one terminal
+log uses `operation`, `group`, `terminal`, `phase`, `loss`,
+`recovery_required`, `frontier`, and `reason`. Planner conflicts and deferred
+proposals are distinct records. The same-stage frontier rebase is reflected in
+the terminal loss/frontier fields. These identities stay in logs and operation
+results rather than Prometheus labels, avoiding a per-operation or per-node
+metric cardinality domain.
+
 ## Durability and recovery
 
 The durable source of truth is the newest completed state-machine snapshot plus
@@ -484,10 +663,18 @@ the operation's stable idempotency key.
 The Meta/Data control wire uses protocol v1 with a pre-release layout. Both
 peers must use the same layout; earlier pre-release layouts have no
 compatibility or negotiation path. This wire version is independent of the
-durable schemas below.
+durable schemas below. Source-history hold projection, frozen-source typed
+bodies, and prepared activation are a homogeneous/coordinated rollout; mixed
+binaries do not negotiate these capabilities.
 
-Commands, records, exports, snapshots, and WAL replay carry exact schema
-version 1. Every configured Meta identity has one canonical concrete numeric
+The outer command, store, export, snapshot, and WAL envelopes use exact Meta
+schema version 1. Embedded controlled-failover intent and phase blobs use their
+own `KLFI`/`KLFP` version 2; terminal outcome (`KLFO`), unavailable proof
+(`KLFU`), and failover-recovery store records remain at their own version 1.
+These nested versions are strict format markers, not a mixed-version
+negotiation mechanism.
+
+Every configured Meta identity has one canonical concrete numeric
 Data-control endpoint and one canonical concrete numeric Admin endpoint. The
 NuRaft `srv_config::aux` `KMI2` descriptor carries the server id, derived
 principal, and both endpoints; Raft keeps its endpoint in the native field.
@@ -771,9 +958,10 @@ Demotion and shutdown cancel the owner and join its local proposal work while
 the worker and executor remain live. Already accepted proposals may commit;
 cancellation never synthesizes a Data result, rolls back committed topology,
 or adds a compensating fence. The next leader re-reads authoritative effects.
-Creation and Meta membership have dedicated background drivers. Arbitrary
-operation kinds, including full Data migration/failover orchestration, still
-require their own recovery policy; journal persistence alone supplies none.
+Creation, Meta membership, and operator-triggered controlled failover have
+dedicated background drivers. Data migration, detector-triggered uncontrolled
+failover, and arbitrary operation kinds still require their own recovery
+policy; journal persistence alone supplies none.
 
 The client then polls the ordinary cluster-status v1 wire until roles,
 membership, topology, sparse population state, and recent authority evidence
@@ -799,15 +987,16 @@ transition into or out of disabled mode.
 
 | Claim | Repository source |
 |---|---|
-| Public Meta boundaries, commands, store composition, and correctness contracts | `include/keylane/meta/` |
-| Deterministic apply, stores, coordinator, observations, and administrative protocol implementations | `src/meta/` |
+| Public Meta boundaries, commands, eight-store composition, controlled failover, and correctness contracts | `include/keylane/meta/` |
+| Deterministic apply, stores, coordinator, observations, failover recovery/reconciliation, and administrative protocol implementations | `src/meta/` |
 | Volatile candidate replacement and internal deterministic plan selection | `include/keylane/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/keylane/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | Pure per-node projection and leader-scoped Data-session publisher | `include/keylane/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/keylane/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
 | Static initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `include/keylane/meta/nuraft_state_mgr.h`, `src/meta/nuraft_state_mgr.cpp`, `app/keylane_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
 | Durable creation admission, Meta catch-up barrier, leader-owned recovery, and shutdown cancellation | `src/meta/ctl_server.cpp`, `include/keylane/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `src/meta/operation_store.cpp`, `app/keylane_meta.cpp` |
+| Single-attempt controlled failover, durable group recovery handoff, source-hold projection, activation/serving proof, and failure/loss outcomes | `include/keylane/meta/failover.h`, `src/meta/failover.cpp`, `include/keylane/meta/failover_recovery_store.h`, `src/meta/failover_recovery_store.cpp`, `include/keylane/meta/controlled_failover_reconciler.h`, `src/meta/controlled_failover_reconciler.cpp`, `src/meta/control_projector.cpp`, `src/meta/data_control_runtime_status.cpp`, `src/meta/ctl_server.cpp` |
 | Durable post-genesis Meta membership intent, exact-config recovery, leadership handoff, and identity retirement | `include/keylane/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |
 | Shared Meta/Data frame, object-transfer, and message formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
 | Foreign-thread typed completion ingress and worker wakeup | `celer/include/celer/runtime/foreign_executor.h`, `celer/src/runtime/foreign_executor.cpp`, `celer/include/celer/runtime/cross_core.h`, `celer/src/runtime/worker.cpp` |
 | TLS identity, RBAC, Unix peer credentials, Admin transport, cluster status, and initial cluster creation | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `include/keylane/meta/cluster_create.h`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `celer/src/net/` |
-| Recovery, partition, membership, and security gates | `tests/meta_*`, `tests/meta_integration/` |
+| Recovery, controlled-failover, partition, membership, and security gates | `tests/meta_*`, `tests/meta_controlled_failover_reconciler_test.cpp`, `tests/meta_integration/` |

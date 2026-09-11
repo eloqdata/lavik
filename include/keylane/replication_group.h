@@ -111,12 +111,71 @@ struct RebuildIdentity {
   bool operator==(const RebuildIdentity&) const = default;
 };
 
+// Stable identity of the native source-to-target data session. Control-plane
+// authority and delivery identities are intentionally absent: a new term,
+// authority, operation, directive, attempt, or directive revision may reuse an
+// already continuous export only when every data and population anchor below
+// is unchanged.
+struct RebuildExportScope {
+  std::string group_id_;
+  std::string source_node_id_;
+  std::string source_assignment_id_;
+  std::string source_boot_id_;
+  std::string source_history_id_;
+  std::string target_node_id_;
+  std::string target_assignment_id_;
+  std::string target_boot_id_;
+  std::uint64_t manifest_revision_ = 0;
+  PopulationManifestId manifest_id_;
+  std::uint64_t partition_replication_epoch_ = 0;
+  std::uint32_t flow_count_ = 0;
+
+  bool operator==(const RebuildExportScope&) const = default;
+};
+
+// Node-local projection of Meta's request to preserve one source population
+// history during failover. It is neither an export authorization nor serving
+// authority: ReplicationManager may arm it only after a matching authorized
+// source directive succeeds during this process boot.
+struct SourceHistoryHoldDesired {
+  std::string group_id_;
+  std::uint64_t recovery_generation_ = 0;
+  std::string source_assignment_id_;
+  std::string source_boot_id_;
+  std::string source_history_id_;
+  std::uint64_t manifest_revision_ = 0;
+  PopulationManifestId manifest_id_;
+  std::uint64_t partition_replication_epoch_ = 0;
+
+  bool operator==(const SourceHistoryHoldDesired&) const = default;
+};
+
 // A Meta directive that binds safe-source authorization and flow layout to a
 // complete rebuild identity.
 struct RebuildDirective {
   RebuildIdentity identity_;
   std::uint32_t flow_count_ = 0;
   bool safe_source_active_ = false;
+
+  // Returns the stable native data-session scope. This is narrower than the
+  // complete directive identity used for ledger authorization and does not
+  // include safe_source_active_, which callers must validate independently.
+  RebuildExportScope ExportScope() const {
+    return {
+        .group_id_ = identity_.group_id_,
+        .source_node_id_ = identity_.source_node_id_,
+        .source_assignment_id_ = identity_.source_assignment_id_,
+        .source_boot_id_ = identity_.source_boot_id_,
+        .source_history_id_ = identity_.source_history_id_,
+        .target_node_id_ = identity_.target_node_id_,
+        .target_assignment_id_ = identity_.assignment_id_,
+        .target_boot_id_ = identity_.target_boot_id_,
+        .manifest_revision_ = identity_.manifest_revision_,
+        .manifest_id_ = identity_.manifest_id_,
+        .partition_replication_epoch_ = identity_.partition_replication_epoch_,
+        .flow_count_ = flow_count_,
+    };
+  }
 
   bool operator==(const RebuildDirective&) const = default;
 };

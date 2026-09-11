@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <string>
+#include <string_view>
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
@@ -33,6 +34,41 @@ absl::StatusOr<std::vector<std::uint64_t>> InitialAppliedNextLsnsForReconnect(
                                     requested_next_lsns.end());
 }
 
+bool ClusterPopulationResumeProofMatches(
+    const RebuildDirective& directive, ReplicationGroupState state,
+    const RebuildIdentity* ready_identity,
+    std::span<const std::uint64_t> ready_cut_vector,
+    std::string_view local_node_id, std::string_view local_boot_id) {
+  if (state != ReplicationGroupState::kReady || ready_identity == nullptr ||
+      !directive.safe_source_active_ || directive.flow_count_ == 0 ||
+      directive.identity_.target_node_id_ != local_node_id ||
+      directive.identity_.target_boot_id_ != local_boot_id ||
+      ready_cut_vector.size() != directive.flow_count_ ||
+      std::ranges::any_of(ready_cut_vector,
+                          [](std::uint64_t lsn) { return lsn == 0; })) {
+    return false;
+  }
+  const RebuildDirective ready{
+      .identity_ = *ready_identity,
+      .flow_count_ = directive.flow_count_,
+      .safe_source_active_ = true,
+  };
+  return ready.ExportScope() == directive.ExportScope();
+}
+
+absl::Status ValidateNativeFlowModeCursor(bool fullsync, std::uint64_t next_lsn,
+                                          std::uint32_t fragment_index) {
+  if (next_lsn == 0) {
+    return absl::InvalidArgumentError(
+        "native replication flow cursor must be nonzero");
+  }
+  if (!fullsync && fragment_index != 0) {
+    return absl::InvalidArgumentError(
+        "CONTINUE cannot reuse a transport fragment cursor");
+  }
+  return absl::OkStatus();
+}
+
 ReplicaAppliedFrontier::ReplicaAppliedFrontier(unsigned flow_count,
                                                unsigned publisher_count)
     : flow_count_(flow_count),
@@ -53,16 +89,17 @@ absl::Status ReplicaAppliedFrontier::ValidateAdvance(
         "replica Applied LSN cannot advance past UINT64_MAX");
   }
   if (poisoned()) {
-    return absl::FailedPreconditionError("replica Applied frontier is poisoned");
+    return absl::FailedPreconditionError(
+        "replica Applied frontier is poisoned");
   }
   const std::uint64_t current =
       flows_[flow_id].next_lsn_.load(std::memory_order_acquire);
   if (current == applied_lsn || current == applied_lsn + 1) {
     return absl::OkStatus();
   }
-  return absl::FailedPreconditionError(absl::StrCat(
-      "replica Applied LSN is gapped or stale: expected ", current, ", got ",
-      applied_lsn));
+  return absl::FailedPreconditionError(
+      absl::StrCat("replica Applied LSN is gapped or stale: expected ", current,
+                   ", got ", applied_lsn));
 }
 
 absl::Status ReplicaAppliedFrontier::AdvanceAfterApply(
@@ -123,7 +160,8 @@ absl::Status ReplicaAppliedFrontier::InstallNextLsns(
         "replica Applied install vector contains zero");
   }
   if (poisoned()) {
-    return absl::FailedPreconditionError("replica Applied frontier is poisoned");
+    return absl::FailedPreconditionError(
+        "replica Applied frontier is poisoned");
   }
   absl::Status begun = BeginPublication(0);
   if (!begun.ok()) return begun;
@@ -134,10 +172,11 @@ absl::Status ReplicaAppliedFrontier::InstallNextLsns(
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::vector<std::uint64_t>>
-ReplicaAppliedFrontier::TrySnapshot() const {
+absl::StatusOr<std::vector<std::uint64_t>> ReplicaAppliedFrontier::TrySnapshot()
+    const {
   if (poisoned()) {
-    return absl::FailedPreconditionError("replica Applied frontier is poisoned");
+    return absl::FailedPreconditionError(
+        "replica Applied frontier is poisoned");
   }
   // Sampling never suspends or invokes callbacks. Each caller thread can
   // reuse sequence scratch across frontiers without sharing mutable state
@@ -148,8 +187,8 @@ ReplicaAppliedFrontier::TrySnapshot() const {
   for (unsigned attempt = 0; attempt < kSnapshotAttempts; ++attempt) {
     bool stable = true;
     for (unsigned publisher = 0; publisher < publisher_count_; ++publisher) {
-      before[publisher] = publishers_[publisher].published_.load(
-          std::memory_order_acquire);
+      before[publisher] =
+          publishers_[publisher].published_.load(std::memory_order_acquire);
       if ((before[publisher] & 1u) != 0) {
         stable = false;
         break;
@@ -159,12 +198,11 @@ ReplicaAppliedFrontier::TrySnapshot() const {
     // An already-busy publisher needs no output allocation or flow scan.
     result.resize(flow_count_);
     for (unsigned flow = 0; flow < flow_count_; ++flow) {
-      result[flow] =
-          flows_[flow].next_lsn_.load(std::memory_order_acquire);
+      result[flow] = flows_[flow].next_lsn_.load(std::memory_order_acquire);
     }
     for (unsigned publisher = 0; publisher < publisher_count_; ++publisher) {
-      const std::uint64_t after = publishers_[publisher].published_.load(
-          std::memory_order_acquire);
+      const std::uint64_t after =
+          publishers_[publisher].published_.load(std::memory_order_acquire);
       if (after != before[publisher] || (after & 1u) != 0) {
         stable = false;
         break;

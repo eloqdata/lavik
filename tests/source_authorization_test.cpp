@@ -222,8 +222,8 @@ TEST(SourceAuthorizationLedgerTest,
                                                authorize.flow_count_, true));
   auto wrong_operation = rebuild;
   wrong_operation.operation_id_ = "operation-b";
-  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(wrong_operation,
-                                               authorize.flow_count_, true));
+  EXPECT_TRUE(ledger.MatchesAuthorizedRebuild(wrong_operation,
+                                              authorize.flow_count_, true));
   auto stale_source_incarnation = rebuild;
   stale_source_incarnation.source_assignment_id_ = "source-assignment-b";
   EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(stale_source_incarnation,
@@ -232,6 +232,71 @@ TEST(SourceAuthorizationLedgerTest,
       rebuild, authorize.flow_count_ + 1, true));
   EXPECT_FALSE(
       ledger.MatchesAuthorizedRebuild(rebuild, authorize.flow_count_, false));
+}
+
+TEST(SourceAuthorizationLedgerTest,
+     NativeHandshakeExportScopeExcludesControlDeliveryIdentity) {
+  keylane::detail::SourceAuthorizationLedger ledger;
+  const keylane::RebuildDirective authorize =
+      Directive(7, 11, "target-a", "operation-a", "authorize-attempt");
+  ASSERT_TRUE(ledger.Authorize(authorize).ok());
+
+  const auto expect_match = [&](auto mutate) {
+    keylane::RebuildIdentity requested = authorize.identity_;
+    mutate(requested);
+    EXPECT_TRUE(ledger.MatchesAuthorizedRebuild(
+        requested, authorize.flow_count_, authorize.safe_source_active_));
+  };
+
+  expect_match([](auto& identity) { ++identity.term_; });
+  expect_match([](auto& identity) { ++identity.directive_revision_; });
+  expect_match([](auto& identity) { identity.authority_id_ = "authority-b"; });
+  expect_match([](auto& identity) { identity.operation_id_ = "operation-b"; });
+  expect_match([](auto& identity) { identity.directive_id_ = "directive-b"; });
+  expect_match([](auto& identity) { identity.attempt_id_ = "attempt-b"; });
+}
+
+TEST(SourceAuthorizationLedgerTest,
+     NativeHandshakeExportScopeIncludesDataSessionIdentity) {
+  keylane::detail::SourceAuthorizationLedger ledger;
+  const keylane::RebuildDirective authorize =
+      Directive(7, 11, "target-a", "operation-a", "authorize-attempt");
+  ASSERT_TRUE(ledger.Authorize(authorize).ok());
+
+  const auto expect_mismatch = [&](auto mutate) {
+    keylane::RebuildIdentity requested = authorize.identity_;
+    mutate(requested);
+    EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(
+        requested, authorize.flow_count_, authorize.safe_source_active_));
+  };
+
+  expect_mismatch([](auto& identity) { identity.group_id_ = "group-b"; });
+  expect_mismatch(
+      [](auto& identity) { identity.source_node_id_ = "source-b"; });
+  expect_mismatch([](auto& identity) {
+    identity.source_assignment_id_ = "source-assignment-b";
+  });
+  expect_mismatch(
+      [](auto& identity) { identity.source_boot_id_ = "source-boot-b"; });
+  expect_mismatch(
+      [](auto& identity) { identity.source_history_id_ = "source-history-b"; });
+  expect_mismatch(
+      [](auto& identity) { identity.target_node_id_ = "target-b"; });
+  expect_mismatch(
+      [](auto& identity) { identity.assignment_id_ = "assignment-b"; });
+  expect_mismatch(
+      [](auto& identity) { identity.target_boot_id_ = "target-boot-b"; });
+  expect_mismatch([](auto& identity) { ++identity.manifest_revision_; });
+  expect_mismatch([](auto& identity) { ++identity.manifest_id_.bytes_[0]; });
+  expect_mismatch(
+      [](auto& identity) { ++identity.partition_replication_epoch_; });
+
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(authorize.identity_,
+                                               authorize.flow_count_ + 1,
+                                               authorize.safe_source_active_));
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(authorize.identity_,
+                                               authorize.flow_count_,
+                                               !authorize.safe_source_active_));
 }
 
 TEST(SourceAuthorizationLedgerTest, EmptyRevocationIsAnIdempotentNoOp) {

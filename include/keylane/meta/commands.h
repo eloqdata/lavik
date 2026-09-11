@@ -124,6 +124,7 @@ inline constexpr std::uint32_t kMaxMetaEvidenceSummariesPerCommand = 64;
 // tighter admission bound for cluster-create.
 inline constexpr std::uint32_t kMaxMetaDirectivesPerOperation = 1024;
 inline constexpr std::uint32_t kMaxMetaDirectiveKindBytes = 64;
+inline constexpr std::uint32_t kMaxMetaFailoverRecoveryFlows = 1024;
 // Durable directive names and their execution-side classification live with
 // the command schema. Keeping these predicates here prevents stores,
 // projectors, and control-session handlers from independently reconstructing
@@ -168,7 +169,12 @@ inline constexpr std::uint32_t kMaxMetaTerminalReceiptPrunesPerCommand = 1024;
 inline constexpr std::uint32_t kMaxMetaSlotRangeCount = 16384;
 // Valid slot ids are [0, kMetaSlotCount).
 inline constexpr std::uint32_t kMetaSlotCount = 16384;
+// AbortOperation carries a versioned workflow outcome, not necessarily only
+// human prose. Keep the prose component small, while allowing the same
+// bounded terminal payload envelope as CompleteOperation so a legal
+// per-partition failure proof always fits atomically.
 inline constexpr std::uint32_t kMaxMetaAbortReasonBytes = 1024;
+inline constexpr std::uint32_t kMaxMetaAbortPayloadBytes = kMaxMetaPayloadBytes;
 inline constexpr std::uint32_t kMaxMetaAttestationBytes = 4096;
 
 // Mirrors the data-plane primary/replica distinction (topology.h
@@ -215,6 +221,8 @@ enum class MetaCommandTag : std::uint16_t {
   kPrunePopulationManifest = 27,
   kCommitDirectiveResult = 28,
   kPruneTerminalReceipts = 29,
+  kSetFailoverRecovery = 30,
+  kClearFailoverRecovery = 31,
 };
 
 // ---------------------------------------------------------------------------
@@ -392,6 +400,11 @@ struct BeginGroupTerm {
   std::string group_id_;
   std::uint64_t expected_term_ = 0;  // T-1
   std::uint64_t new_term_ = 0;       // T
+  // Optional owner fence for a multi-command workflow. A zero id/revision is
+  // the legacy standalone form; controlled failover binds both so an abort
+  // committed first makes a delayed authority cut fail closed at apply.
+  MetaOperationId workflow_operation_id_{};
+  std::uint64_t expected_operation_revision_ = 0;
   bool operator==(const BeginGroupTerm&) const = default;
 };
 
@@ -416,6 +429,10 @@ struct ActivateAuthority {
   std::uint64_t new_authority_version_ = 0;
   std::uint64_t new_topology_epoch_ = 0;
   std::uint64_t new_config_epoch_ = 0;
+  // See BeginGroupTerm::workflow_operation_id_. This fence is optional for
+  // ordinary activation but mandatory when controlled failover constructs it.
+  MetaOperationId workflow_operation_id_{};
+  std::uint64_t expected_operation_revision_ = 0;
   bool operator==(const ActivateAuthority&) const = default;
 };
 
@@ -624,12 +641,17 @@ struct AbortOperation {
   MetaOperationId operation_id_{};
   std::uint64_t expected_revision_ = 0;
   std::string reason_;
+  // Failure is not evidence of losslessness. Failover reconcilers set this
+  // whenever the exact old-primary frontier was not both proven and carried
+  // through preparation; the bit survives archival beside the failure.
+  bool data_loss_possible_ = false;
   bool operator==(const AbortOperation&) const = default;
 };
 
-// Non-contiguous archival of terminal operations.
-// operation_seq values are raft log indexes of the corresponding
-// SubmitOperation commands, used here purely as references.
+// Non-contiguous archival of terminal operations. Cross-store workflows may
+// impose an additional deterministic cleanup/handoff gate before their live
+// owner can be removed. operation_seq values are raft log indexes of the
+// corresponding SubmitOperation commands, used here purely as references.
 struct ArchiveOperations {
   MetaRequestId request_id_{};
   ActorContext actor_;
@@ -723,16 +745,75 @@ struct PrunePopulationManifest {
   bool operator==(const PrunePopulationManifest&) const = default;
 };
 
-using MetaCommand =
-    std::variant<RegisterNode, UpdateNode, RetireNode, CreateGroup,
-                 AssignNodeToGroup, RemoveNodeFromGroup, SetSlotMap,
-                 BeginGroupTerm, GrantAuthority, ActivateAuthority, RevokeGrant,
-                 FenceGroup, PutPolicy, RetirePolicy, SubmitOperation,
-                 TransitionOperationPhase, CompleteOperation, AbortOperation,
-                 ArchiveOperations, PruneAudit, PruneOperationArchive,
-                 BindMetaMember, RetireMetaMember, SetGroupReplicationState,
-                 SetAuditPolicy, PutPopulationManifest, PrunePopulationManifest,
-                 CommitDirectiveResult, PruneTerminalReceipts>;
+// Exact final source frontier captured after the former owner has stopped
+// authoritative mutation. The history identity lives on the enclosing
+// recovery command so the proof cannot be detached from its source lineage.
+struct MetaFailoverFrozenProof {
+  std::vector<std::uint64_t> final_next_lsns_;
+  MetaHash256 proof_hash_{};
+  bool operator==(const MetaFailoverFrozenProof&) const = default;
+};
+
+// Pending may still become exact after the old source responds. Unavailable is
+// a durable recovery-availability downgrade and must never be upgraded by a
+// delayed response; it may retain the formerly trusted frozen proof solely as
+// an auditable final-source upper bound after the held source incarnation is
+// lost.
+enum class MetaFailoverProofState : std::uint8_t {
+  kPending = 1,
+  kExact = 2,
+  kUnavailable = 3,
+};
+
+// Absolute replacement of one active group recovery record. The durable
+// record revision is the committed log index. expected_revision=0 creates the
+// first record; later updates and successor generations CAS the durable
+// Set/Clear revision. Candidate and attempt identity deliberately do not live
+// here: this is the narrow handoff between independent operations.
+struct SetFailoverRecovery {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  std::string group_id_;
+  std::uint64_t expected_revision_ = 0;
+  std::uint64_t recovery_generation_ = 0;
+  std::string old_source_node_id_;
+  MetaAssignmentId old_source_assignment_id_{};
+  MetaBootIncarnation old_source_boot_incarnation_{};
+  MetaReplicationHistoryId old_source_history_id_{};
+  std::uint64_t excluded_authority_term_ = 0;
+  std::uint64_t excluded_authority_version_ = 0;
+  std::uint64_t excluded_grant_revision_ = 0;
+  std::uint64_t population_manifest_revision_ = 0;
+  MetaHash256 population_manifest_digest_{};
+  std::uint64_t partition_replication_epoch_ = 0;
+  bool hold_required_ = false;
+  bool recovery_required_ = false;
+  MetaFailoverProofState proof_state_ = MetaFailoverProofState::kPending;
+  std::optional<MetaFailoverFrozenProof> frozen_proof_;
+  bool operator==(const SetFailoverRecovery&) const = default;
+};
+
+// Removes an active projection while retaining the generation tombstone. A
+// later recovery must use a strictly newer generation, preventing a delayed
+// command or FDS replay from resurrecting a released source hold.
+struct ClearFailoverRecovery {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  std::string group_id_;
+  std::uint64_t expected_revision_ = 0;
+  std::uint64_t recovery_generation_ = 0;
+  bool operator==(const ClearFailoverRecovery&) const = default;
+};
+
+using MetaCommand = std::variant<
+    RegisterNode, UpdateNode, RetireNode, CreateGroup, AssignNodeToGroup,
+    RemoveNodeFromGroup, SetSlotMap, BeginGroupTerm, GrantAuthority,
+    ActivateAuthority, RevokeGrant, FenceGroup, PutPolicy, RetirePolicy,
+    SubmitOperation, TransitionOperationPhase, CompleteOperation,
+    AbortOperation, ArchiveOperations, PruneAudit, PruneOperationArchive,
+    BindMetaMember, RetireMetaMember, SetGroupReplicationState, SetAuditPolicy,
+    PutPopulationManifest, PrunePopulationManifest, CommitDirectiveResult,
+    PruneTerminalReceipts, SetFailoverRecovery, ClearFailoverRecovery>;
 
 // Encode produces the full envelope. Fails (kDomainReject class) when a field
 // exceeds its cap or the total exceeds kMaxMetaCommandBytes; the encoding is

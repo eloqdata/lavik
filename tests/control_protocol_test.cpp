@@ -51,6 +51,12 @@ void AppendBe32(std::string* bytes, std::uint32_t value) {
   }
 }
 
+void AppendBe64(std::string* bytes, std::uint64_t value) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    bytes->push_back(static_cast<char>(value >> shift));
+  }
+}
+
 absl::StatusOr<WireHash256> LegacyDirectiveSetDigest(
     const std::vector<control::WireProjectedDirective>& directives) {
   std::vector<std::string> entries;
@@ -67,8 +73,7 @@ absl::StatusOr<WireHash256> LegacyDirectiveSetDigest(
         .source_node_id = source.source_node_id,
         .source_assignment_id = source.source_assignment_id,
         .source_boot_id = source.source_boot_id,
-        .source_replication_history_id =
-            source.source_replication_history_id,
+        .source_replication_history_id = source.source_replication_history_id,
         .manifest_revision = source.manifest_revision,
         .manifest_digest = source.manifest_digest,
         .partition_replication_epoch = source.partition_replication_epoch,
@@ -144,6 +149,30 @@ class RecordingSink final : public LargeObjectSink {
   TransferStart start_;
   std::string bytes_;
 };
+
+control::FullDesiredState SourceHistoryHoldState() {
+  control::FullDesiredState state;
+  state.source_meta_applied_index = 1;
+  state.topology_epoch = 1;
+  control::WireDesiredGroup group;
+  group.group_id = "group-a";
+  group.members.push_back(
+      {.node_id = std::string(40, 'a'), .assignment_id = Id(1)});
+  group.manifest_revision = 2;
+  group.manifest_digest = Sha256("manifest");
+  group.partition_replication_epoch = 3;
+  group.source_history_hold = control::WireSourceHistoryHold{
+      .generation = 4,
+      .source_assignment_id = Id(1),
+      .source_boot_id = std::string(40, 'b'),
+      .source_replication_history_id = std::string(40, 'c'),
+      .manifest_revision = 2,
+      .manifest_digest = Sha256("manifest"),
+      .partition_replication_epoch = 3,
+  };
+  state.groups.push_back(std::move(group));
+  return state;
+}
 
 TEST(ControlProtocolFrameTest, EncodesNetworkOrderAndChecksCrcAndSequence) {
   FrameEncoder encoder;
@@ -286,8 +315,7 @@ TEST(ControlProtocolCodecTest, RoundTripsTypedReplicaCandidate) {
           },
   };
 
-  auto encoded =
-      control::EncodeMessage(control::WireMessage{heartbeat});
+  auto encoded = control::EncodeMessage(control::WireMessage{heartbeat});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   auto decoded = control::DecodeMessage(MessageType::kHeartbeat, *encoded);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
@@ -325,35 +353,31 @@ TEST(ControlProtocolCodecTest, RejectsMalformedTypedCandidateAndRoleTag) {
 
   std::string trailing = *encoded;
   trailing.push_back('\0');
-  EXPECT_EQ(control::DecodeMessage(MessageType::kHeartbeat, trailing)
-                .status()
-                .code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(
+      control::DecodeMessage(MessageType::kHeartbeat, trailing).status().code(),
+      absl::StatusCode::kInvalidArgument);
 
   control::Heartbeat no_role;
   no_role.heartbeat_sequence = 2;
   encoded = control::EncodeMessage(control::WireMessage{no_role});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   encoded->back() = static_cast<char>(99);
-  EXPECT_EQ(control::DecodeMessage(MessageType::kHeartbeat, *encoded)
-                .status()
-                .code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(
+      control::DecodeMessage(MessageType::kHeartbeat, *encoded).status().code(),
+      absl::StatusCode::kInvalidArgument);
 
   auto* candidate =
       std::get_if<control::ReplicaCandidate>(&heartbeat.role_information);
   ASSERT_NE(candidate, nullptr);
   candidate->progress.applied_next_lsns.clear();
-  EXPECT_EQ(control::EncodeMessage(control::WireMessage{heartbeat})
-                .status()
-                .code(),
-            absl::StatusCode::kResourceExhausted);
-  candidate->progress.applied_next_lsns.assign(
-      control::kMaxCandidateFlows + 1, 1);
-  EXPECT_EQ(control::EncodeMessage(control::WireMessage{heartbeat})
-                .status()
-                .code(),
-            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{heartbeat}).status().code(),
+      absl::StatusCode::kResourceExhausted);
+  candidate->progress.applied_next_lsns.assign(control::kMaxCandidateFlows + 1,
+                                               1);
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{heartbeat}).status().code(),
+      absl::StatusCode::kResourceExhausted);
 }
 
 TEST(ControlProtocolCodecTest, HeartbeatReplayIsExactAndGapFree) {
@@ -699,6 +723,15 @@ TEST(ControlProtocolFullStateTest,
   group.manifest_revision = 15;
   group.manifest_digest = Sha256("manifest");
   group.partition_replication_epoch = 19;
+  group.source_history_hold = control::WireSourceHistoryHold{
+      .generation = 23,
+      .source_assignment_id = Id(5),
+      .source_boot_id = std::string(40, 'b'),
+      .source_replication_history_id = std::string(40, 'c'),
+      .manifest_revision = 15,
+      .manifest_digest = Sha256("manifest"),
+      .partition_replication_epoch = 19,
+  };
   group.grant_policy_id = "default-grant";
   group.grant_policy_version = 2;
   state.groups.push_back(std::move(group));
@@ -846,11 +879,10 @@ TEST(ControlProtocolFullStateTest,
   ASSERT_TRUE(frame.ok()) << frame.status();
   EXPECT_EQ(frame->type, control::MessageType::kFullDesiredState);
 
-  auto decoded = control::DecodeMessage(
-      control::MessageType::kFullDesiredState, frame->payload);
+  auto decoded = control::DecodeMessage(control::MessageType::kFullDesiredState,
+                                        frame->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
-  const auto* full_state =
-      std::get_if<control::FullDesiredState>(&*decoded);
+  const auto* full_state = std::get_if<control::FullDesiredState>(&*decoded);
   ASSERT_NE(full_state, nullptr);
   state.object_hash = Sha256(*encoded);
   EXPECT_EQ(*full_state, state);
@@ -889,6 +921,69 @@ TEST(ControlProtocolFullStateTest,
   auto topology_change = control::ComputeProjectionHash(state);
   ASSERT_TRUE(topology_change.ok());
   EXPECT_NE(*topology_change, *original);
+}
+
+TEST(ControlProtocolFullStateTest, ProjectionHashCoversSourceHistoryHold) {
+  control::FullDesiredState state = SourceHistoryHoldState();
+  auto original = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(original.ok()) << original.status();
+
+  ++state.groups[0].source_history_hold->generation;
+  auto generation_change = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(generation_change.ok()) << generation_change.status();
+  EXPECT_NE(*generation_change, *original);
+
+  --state.groups[0].source_history_hold->generation;
+  state.groups[0].source_history_hold->source_boot_id = std::string(40, 'd');
+  auto source_incarnation_change = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(source_incarnation_change.ok())
+      << source_incarnation_change.status();
+  EXPECT_NE(*source_incarnation_change, *original);
+
+  state.groups[0].source_history_hold.reset();
+  auto removal = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(removal.ok()) << removal.status();
+  EXPECT_NE(*removal, *original);
+}
+
+TEST(ControlProtocolFullStateTest, RejectsInvalidSourceHistoryHoldIdentity) {
+  const auto expect_invalid = [](auto mutate) {
+    control::FullDesiredState state = SourceHistoryHoldState();
+    mutate(*state.groups[0].source_history_hold);
+    EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+              absl::StatusCode::kInvalidArgument);
+  };
+
+  expect_invalid([](auto& hold) { hold.generation = 0; });
+  expect_invalid([](auto& hold) { hold.source_assignment_id = {}; });
+  expect_invalid(
+      [](auto& hold) { hold.source_boot_id = std::string(40, 'A'); });
+  expect_invalid([](auto& hold) {
+    hold.source_replication_history_id = std::string(39, 'c');
+  });
+  expect_invalid([](auto& hold) { hold.manifest_revision = 0; });
+  expect_invalid([](auto& hold) { hold.manifest_digest = {}; });
+  expect_invalid([](auto& hold) { hold.partition_replication_epoch = 0; });
+}
+
+TEST(ControlProtocolFullStateTest,
+     DecodeRejectsNonCanonicalSourceHistoryHoldIdentity) {
+  control::FullDesiredState state = SourceHistoryHoldState();
+  auto directive_digest =
+      control::ComputeDirectiveSetDigest(state.current_directives);
+  ASSERT_TRUE(directive_digest.ok()) << directive_digest.status();
+  state.directive_set_digest = *directive_digest;
+  auto projection_hash = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(projection_hash.ok()) << projection_hash.status();
+  state.projection_hash = *projection_hash;
+  auto encoded = control::EncodeFullDesiredState(state);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+
+  const std::size_t boot_id = encoded->find(std::string(40, 'b'));
+  ASSERT_NE(boot_id, std::string::npos);
+  (*encoded)[boot_id] = 'B';
+  EXPECT_EQ(control::DecodeFullDesiredState(*encoded).status().code(),
+            absl::StatusCode::kInvalidArgument);
 }
 
 TEST(ControlProtocolFullStateTest,
@@ -1044,6 +1139,127 @@ TEST(ControlProtocolPromotionPrepareTest,
   evidence.child_history_id = evidence.parent_history_id;
   EXPECT_EQ(control::EncodePromotionPreparedEvidence(evidence).status().code(),
             absl::StatusCode::kInvalidArgument);
+}
+
+TEST(ControlProtocolFrozenSourceTest,
+     RoundTripsVersionedRequestPreconditionsAndHashedEvidence) {
+  const control::FrozenSourceRequest request{.recovery_generation = 23};
+  auto encoded_request = control::EncodeFrozenSourceRequest(request);
+  ASSERT_TRUE(encoded_request.ok()) << encoded_request.status();
+  auto decoded_request = control::DecodeFrozenSourceRequest(*encoded_request);
+  ASSERT_TRUE(decoded_request.ok()) << decoded_request.status();
+  EXPECT_EQ(*decoded_request, request);
+
+  const control::FrozenSourcePreconditions preconditions{
+      .excluded_group_term = 7,
+      .excluded_authority_version = 11,
+      .excluded_grant_revision = 13,
+  };
+  auto encoded_preconditions =
+      control::EncodeFrozenSourcePreconditions(preconditions);
+  ASSERT_TRUE(encoded_preconditions.ok()) << encoded_preconditions.status();
+  auto decoded_preconditions =
+      control::DecodeFrozenSourcePreconditions(*encoded_preconditions);
+  ASSERT_TRUE(decoded_preconditions.ok()) << decoded_preconditions.status();
+  EXPECT_EQ(*decoded_preconditions, preconditions);
+
+  control::FrozenSourceEvidence evidence{
+      .recovery_generation = request.recovery_generation,
+      .source_history_id = std::string(40, 'a'),
+      .final_next_lsns = {17, 29, 41},
+  };
+  auto proof = control::ComputeFrozenSourceProofHash(evidence);
+  ASSERT_TRUE(proof.ok()) << proof.status();
+  evidence.proof_hash = *proof;
+
+  // The proof hash owns a canonical domain-separated byte definition rather
+  // than depending on a compiler layout or the surrounding result envelope.
+  std::string canonical = "KLFE";
+  AppendBe16(&canonical, 1);
+  AppendBe64(&canonical, evidence.recovery_generation);
+  canonical.append(evidence.source_history_id);
+  AppendBe32(&canonical,
+             static_cast<std::uint32_t>(evidence.final_next_lsns.size()));
+  for (std::uint64_t cursor : evidence.final_next_lsns) {
+    AppendBe64(&canonical, cursor);
+  }
+  EXPECT_EQ(evidence.proof_hash, Sha256(canonical));
+
+  auto encoded_evidence = control::EncodeFrozenSourceEvidence(evidence);
+  ASSERT_TRUE(encoded_evidence.ok()) << encoded_evidence.status();
+  auto decoded_evidence =
+      control::DecodeFrozenSourceEvidence(*encoded_evidence);
+  ASSERT_TRUE(decoded_evidence.ok()) << decoded_evidence.status();
+  EXPECT_EQ(*decoded_evidence, evidence);
+}
+
+TEST(ControlProtocolFrozenSourceTest,
+     RejectsIncompleteNonCanonicalOrMismatchedProofs) {
+  control::FrozenSourceRequest request{.recovery_generation = 0};
+  EXPECT_EQ(control::EncodeFrozenSourceRequest(request).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  request.recovery_generation = 1;
+  auto encoded_request = control::EncodeFrozenSourceRequest(request);
+  ASSERT_TRUE(encoded_request.ok()) << encoded_request.status();
+  (*encoded_request)[5] = 2;
+  EXPECT_EQ(
+      control::DecodeFrozenSourceRequest(*encoded_request).status().code(),
+      absl::StatusCode::kInvalidArgument);
+
+  control::FrozenSourcePreconditions preconditions{
+      .excluded_group_term = 1,
+      .excluded_authority_version = 2,
+      .excluded_grant_revision = 3,
+  };
+  for (int missing = 0; missing != 3; ++missing) {
+    control::FrozenSourcePreconditions invalid = preconditions;
+    if (missing == 0) invalid.excluded_group_term = 0;
+    if (missing == 1) invalid.excluded_authority_version = 0;
+    if (missing == 2) invalid.excluded_grant_revision = 0;
+    EXPECT_EQ(control::EncodeFrozenSourcePreconditions(invalid).status().code(),
+              absl::StatusCode::kInvalidArgument);
+  }
+
+  control::FrozenSourceEvidence evidence{
+      .recovery_generation = 1,
+      .source_history_id = std::string(40, 'a'),
+      .final_next_lsns = {17, 29},
+  };
+  auto proof = control::ComputeFrozenSourceProofHash(evidence);
+  ASSERT_TRUE(proof.ok()) << proof.status();
+  evidence.proof_hash = *proof;
+
+  control::FrozenSourceEvidence invalid = evidence;
+  invalid.recovery_generation = 0;
+  EXPECT_EQ(control::ComputeFrozenSourceProofHash(invalid).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  invalid = evidence;
+  invalid.source_history_id = std::string(40, 'A');
+  EXPECT_EQ(control::ComputeFrozenSourceProofHash(invalid).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  invalid = evidence;
+  invalid.final_next_lsns.clear();
+  EXPECT_EQ(control::EncodeFrozenSourceEvidence(invalid).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  invalid = evidence;
+  invalid.final_next_lsns.front() = 0;
+  EXPECT_EQ(control::EncodeFrozenSourceEvidence(invalid).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  invalid = evidence;
+  invalid.final_next_lsns.assign(control::kMaxCandidateFlows + 1, 1);
+  EXPECT_EQ(control::EncodeFrozenSourceEvidence(invalid).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  invalid = evidence;
+  invalid.proof_hash[0] ^= 0xff;
+  EXPECT_EQ(control::EncodeFrozenSourceEvidence(invalid).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  auto encoded_evidence = control::EncodeFrozenSourceEvidence(evidence);
+  ASSERT_TRUE(encoded_evidence.ok()) << encoded_evidence.status();
+  (*encoded_evidence)[encoded_evidence->size() - 1] ^= 0xff;
+  EXPECT_EQ(
+      control::DecodeFrozenSourceEvidence(*encoded_evidence).status().code(),
+      absl::StatusCode::kInvalidArgument);
 }
 
 TEST(ControlProtocolFullStateTest,

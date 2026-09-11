@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
@@ -841,7 +842,8 @@ struct TransferValue {
 // linearization seam after all potentially suspending lock, allocation, and
 // read work. The owning command supplies an immutable shared context so the
 // check remains valid across worker hops and coroutine suspension. Background
-// maintenance and replica replay leave it empty. A pointer passed to any
+// expiration maintenance uses it for its own finite authority token; replica
+// replay and other maintenance leave it empty. A pointer passed to any
 // Task-returning StorageEngine API must remain alive until that Task completes;
 // transaction initialization instead copies the value into each shard receipt.
 // Validators run synchronously while the owning shard holds its key and store
@@ -1551,6 +1553,14 @@ class StorageEngine {
   // the stable local population is authoritative and its recovery fence is
   // clear; this call never grants client mutation authority by itself.
   void SetExpirationAuthority(bool authority) noexcept;
+  // Installs a fresh, revocable expiration capability whose absolute deadline
+  // is measured from Linux CLOCK_BOOTTIME. Active expiration carries this
+  // exact capability to both its durable and disk-full in-memory mutation
+  // cuts, so a late control-plane timer cannot extend finite cluster
+  // authority. Each call creates a new generation; work queued under an older
+  // grant remains rejected after renewal.
+  absl::Status SetExpirationAuthorityUntil(
+      std::chrono::nanoseconds deadline_since_boot) noexcept;
   std::uint32_t ExpirationPauseCount() const noexcept;
 
   // Lifetime totals of the tomb raider (rounds run, tombstone entries

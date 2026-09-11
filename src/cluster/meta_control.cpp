@@ -44,10 +44,9 @@ absl::Status Invalid(std::string message) {
 }
 
 bool IsCanonicalNumericHost(std::string_view host) {
-  const std::string encoded =
-      host.find(':') == std::string_view::npos
-          ? absl::StrCat(host, ":1")
-          : absl::StrCat("[", host, "]:1");
+  const std::string encoded = host.find(':') == std::string_view::npos
+                                  ? absl::StrCat(host, ":1")
+                                  : absl::StrCat("[", host, "]:1");
   const auto parsed = keylane::ParseNumericEndpoint(encoded);
   return parsed.has_value() && parsed->host_ == host;
 }
@@ -245,6 +244,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
         .manifest_digest_ = source.manifest_digest,
         .partition_replication_epoch_ = source.partition_replication_epoch,
         .members_ = {},
+        .source_history_hold_ = {},
     };
     control_group.members_.reserve(source.members.size());
     for (const control::WireDesiredMember& member : source.members) {
@@ -252,6 +252,50 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
           .node_id_ = *NodeId::Parse(member.node_id),
           .assignment_id_ = AssignmentId::FromBytes(member.assignment_id),
       });
+    }
+    if (source.source_history_hold.has_value()) {
+      const control::WireSourceHistoryHold& wire_hold =
+          *source.source_history_hold;
+      if (wire_hold.generation == 0 ||
+          wire_hold.manifest_revision != source.manifest_revision ||
+          wire_hold.manifest_digest != source.manifest_digest ||
+          wire_hold.partition_replication_epoch !=
+              source.partition_replication_epoch) {
+        return Invalid(absl::StrCat(
+            "group ", source.group_id,
+            " source history hold has stale recovery or population anchors"));
+      }
+      const auto local_member = std::find_if(
+          source.members.begin(), source.members.end(),
+          [local_node_id](const control::WireDesiredMember& member) {
+            return member.node_id == local_node_id;
+          });
+      if (local_member == source.members.end() ||
+          wire_hold.source_assignment_id != local_member->assignment_id) {
+        return Invalid(absl::StrCat(
+            "group ", source.group_id,
+            " source history hold does not bind the local assignment"));
+      }
+      const std::optional<NodeId> source_boot =
+          NodeId::Parse(wire_hold.source_boot_id);
+      const std::optional<NodeId> source_history =
+          NodeId::Parse(wire_hold.source_replication_history_id);
+      if (!source_boot.has_value() || !source_history.has_value()) {
+        return Invalid(absl::StrCat("group ", source.group_id,
+                                    " has a non-canonical source history "
+                                    "hold identity"));
+      }
+      control_group.source_history_hold_ = SourceHistoryHoldDesired{
+          .group_id_ = source.group_id,
+          .recovery_generation_ = wire_hold.generation,
+          .source_assignment_id_ =
+              AssignmentId::FromBytes(wire_hold.source_assignment_id),
+          .source_boot_id_ = *source_boot,
+          .source_replication_history_id_ = *source_history,
+          .manifest_revision_ = wire_hold.manifest_revision,
+          .manifest_digest_ = wire_hold.manifest_digest,
+          .partition_replication_epoch_ = wire_hold.partition_replication_epoch,
+      };
     }
     control_groups.push_back(std::move(control_group));
 

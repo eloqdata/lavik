@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -28,15 +29,100 @@ class ReplicaAppliedFrontierTestPeer {
   }
 
   static void SetPublisherSequence(ReplicaAppliedFrontier& frontier,
-                                   unsigned publisher,
-                                   std::uint64_t sequence) {
+                                   unsigned publisher, std::uint64_t sequence) {
     frontier.publishers_[publisher].next_sequence_ = sequence;
-    frontier.publishers_[publisher].published_.store(
-        sequence, std::memory_order_relaxed);
+    frontier.publishers_[publisher].published_.store(sequence,
+                                                     std::memory_order_relaxed);
   }
 };
 
 namespace {
+
+RebuildDirective ContinuationDirective() {
+  RebuildDirective result{
+      .identity_ =
+          {
+              .group_id_ = std::string(40, 'a'),
+              .assignment_id_ = "target-assignment",
+              .term_ = 9,
+              .directive_revision_ = 17,
+              .authority_id_ = "authority-new",
+              .source_node_id_ = std::string(40, 'b'),
+              .source_assignment_id_ = "source-assignment",
+              .source_boot_id_ = std::string(40, 'c'),
+              .source_history_id_ = std::string(40, 'd'),
+              .target_node_id_ = std::string(40, 'e'),
+              .target_boot_id_ = std::string(40, 'f'),
+              .operation_id_ = "operation-new",
+              .directive_id_ = "directive-new",
+              .attempt_id_ = "attempt-new",
+              .manifest_revision_ = 3,
+              .partition_replication_epoch_ = 7,
+          },
+      .flow_count_ = 2,
+      .safe_source_active_ = true,
+  };
+  result.identity_.manifest_id_.bytes_.front() = 1;
+  return result;
+}
+
+TEST(ReplicaAppliedFrontierTest,
+     ClusterResumeProofUsesExportScopeButRequiresReadyPopulation) {
+  RebuildDirective current = ContinuationDirective();
+  RebuildIdentity ready = current.identity_;
+  ready.term_ = 8;
+  ready.directive_revision_ = 11;
+  ready.authority_id_ = "authority-old";
+  ready.operation_id_ = "operation-old";
+  ready.directive_id_ = "directive-old";
+  ready.attempt_id_ = "attempt-old";
+  const std::vector<std::uint64_t> cut{2, 5};
+
+  EXPECT_TRUE(ClusterPopulationResumeProofMatches(
+      current, ReplicationGroupState::kReady, &ready, cut,
+      current.identity_.target_node_id_, current.identity_.target_boot_id_));
+  EXPECT_FALSE(ClusterPopulationResumeProofMatches(
+      current, ReplicationGroupState::kRebuilding, &ready, cut,
+      current.identity_.target_node_id_, current.identity_.target_boot_id_));
+  EXPECT_FALSE(ClusterPopulationResumeProofMatches(
+      current, ReplicationGroupState::kReady, nullptr, {},
+      current.identity_.target_node_id_, current.identity_.target_boot_id_));
+
+  const auto expect_scope_mismatch = [&](auto mutate) {
+    RebuildDirective changed = current;
+    mutate(changed);
+    EXPECT_FALSE(ClusterPopulationResumeProofMatches(
+        changed, ReplicationGroupState::kReady, &ready, cut,
+        current.identity_.target_node_id_, current.identity_.target_boot_id_));
+  };
+  expect_scope_mismatch([](auto& value) {
+    value.identity_.source_history_id_ = std::string(40, '1');
+  });
+  expect_scope_mismatch(
+      [](auto& value) { ++value.identity_.manifest_revision_; });
+  expect_scope_mismatch(
+      [](auto& value) { value.identity_.manifest_id_.bytes_.front() ^= 0xff; });
+  expect_scope_mismatch(
+      [](auto& value) { ++value.identity_.partition_replication_epoch_; });
+  expect_scope_mismatch([](auto& value) {
+    value.identity_.target_boot_id_ = std::string(40, '0');
+  });
+  EXPECT_FALSE(ClusterPopulationResumeProofMatches(
+      current, ReplicationGroupState::kReady, &ready,
+      std::vector<std::uint64_t>{2}, current.identity_.target_node_id_,
+      current.identity_.target_boot_id_));
+}
+
+TEST(ReplicaAppliedFrontierTest,
+     ContinueAcceptsInitialLogicalCursorButNeverTransportFragments) {
+  EXPECT_TRUE(ValidateNativeFlowModeCursor(/*fullsync=*/false, 1, 0).ok());
+  EXPECT_TRUE(ValidateNativeFlowModeCursor(/*fullsync=*/false, 9, 0).ok());
+  EXPECT_EQ(ValidateNativeFlowModeCursor(/*fullsync=*/false, 0, 0).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(ValidateNativeFlowModeCursor(/*fullsync=*/false, 9, 1).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(ValidateNativeFlowModeCursor(/*fullsync=*/true, 9, 1).ok());
+}
 
 TEST(ReplicaAppliedFrontierTest, ReconnectLayoutMismatchResetsEveryFlow) {
   const std::vector<std::uint64_t> old_layout{11, 22};
@@ -67,10 +153,10 @@ TEST(ReplicaAppliedFrontierTest, AdvancesOnlyTheCompletedEvent) {
             absl::StatusCode::kFailedPrecondition);
   EXPECT_EQ(frontier.AdvanceAfterApply(1, 0).code(),
             absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(frontier.AdvanceAfterApply(
-                1, std::numeric_limits<std::uint64_t>::max())
-                .code(),
-            absl::StatusCode::kOutOfRange);
+  EXPECT_EQ(
+      frontier.AdvanceAfterApply(1, std::numeric_limits<std::uint64_t>::max())
+          .code(),
+      absl::StatusCode::kOutOfRange);
   EXPECT_EQ(frontier.AdvanceAfterApply(3, 1).code(),
             absl::StatusCode::kInvalidArgument);
 }
@@ -106,8 +192,7 @@ TEST(ReplicaAppliedFrontierTest, SnapshotNeverAcceptsHalfPublishedBatch) {
 
   ReplicaAppliedFrontierTestPeer::StoreNextLsn(frontier, 1, 2);
   ReplicaAppliedFrontierTestPeer::EndPublication(frontier, 0);
-  EXPECT_EQ(frontier.TrySnapshot().value(),
-            (std::vector<std::uint64_t>{2, 2}));
+  EXPECT_EQ(frontier.TrySnapshot().value(), (std::vector<std::uint64_t>{2, 2}));
 }
 
 TEST(ReplicaAppliedFrontierTest, LifecycleInstallPublishesOneVector) {
@@ -121,9 +206,9 @@ TEST(ReplicaAppliedFrontierTest, LifecycleInstallPublishesOneVector) {
 
   EXPECT_EQ(frontier.InstallNextLsns(std::vector<std::uint64_t>{1, 2}).code(),
             absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(frontier.InstallNextLsns(std::vector<std::uint64_t>{1, 0, 2})
-                .code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(
+      frontier.InstallNextLsns(std::vector<std::uint64_t>{1, 0, 2}).code(),
+      absl::StatusCode::kInvalidArgument);
   EXPECT_EQ(frontier.TrySnapshot().value(), installed);
 }
 

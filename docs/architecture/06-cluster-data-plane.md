@@ -22,8 +22,9 @@ seams:
   owning node, MOVED target, and client-facing endpoint selection.
 - `NodeControlInstaller` is the only state-changing seam. It validates and
   atomically publishes full state, installs finite leases and fences, drains
-  retired request generations, revokes source capabilities, and dispatches
-  typed replication directives.
+  retired request generations, reconciles source-history holds, revokes source
+  capabilities, dispatches typed replication directives, and consumes a
+  prepared promotion only at the finite-lease boundary.
 - `ClusterControlPort` supplies complete target state for the static-file
   adapter and in-memory tests.
 - `MetaControlClientService` owns leader discovery and the one outbound
@@ -148,8 +149,10 @@ nonblocking callback on the owning shard after all potentially suspending
 preparation and immediately before WATCH invalidation and staging/index
 publication. The hash no-op path performs the same check before its observable
 WATCH invalidation. Internal rollback explicitly bypasses the inherited check
-so it can restore an already-started transaction; background expiration,
-maintenance, and replica replay carry no client precondition.
+so it can restore an already-started transaction. Replica replay carries no
+client precondition. Background expiration and Tomb Raider instead carry the
+exact revocable expiration token granted after lease activation; they enforce
+its `CLOCK_BOOTTIME` deadline at their own final mutation cuts.
 
 The shared admission records whether any storage publication began and whether
 a later final check failed. If the first attempted mutation is rejected, the
@@ -277,8 +280,10 @@ ownership.
 Control protocol v1 has no delta format. Initial connection, reconnection, and
 every semantic projection change transfer a complete `FullDesiredState`. The
 object contains global topology plus each group's partition replication epoch
-and the receiving node's policies, immutable population manifests, and current
-directives. The source applied index is a
+and the receiving node's policies, immutable population manifests, current
+directives, and at most one exact source-history hold addressed to that node.
+The hold carries its recovery generation and source/population incarnation but
+no serving or export authority. The source applied index is a
 diagnostic/order watermark; the projection SHA-256 is the semantic dependency
 for leases and directives. A higher index with identical semantic content is
 therefore harmless. Lower indexes reject, exact index/object replays are
@@ -322,10 +327,12 @@ compact leader-local runtime record for cluster status and leader-owned
 workflows. The record follows the current session and FDS incarnation, retains
 the replication-history id authenticated by `ClientHello`, timestamps health
 at receive, and records a lease decision only after the corresponding Ack
-write succeeds. Cached Ack replay does not renew that timestamp. Replacement,
-session close, leadership loss, and shutdown remove the record. This is a
-one-way observational feed: Data authority and lease evaluation never read
-status state back.
+write succeeds. A successful grant becomes serving evidence only when a later
+ready heartbeat from the same session and projection confirms it; the
+heartbeat that first obtains the grant cannot confirm itself. Cached Ack replay
+does not renew either timestamp. Replacement, session close, leadership loss,
+and shutdown remove the record. This is a one-way observational feed: Data
+authority and lease evaluation never read status state back.
 
 An FDS replacement quiesces the heartbeat producer before publishing the new
 controller projection. A heartbeat already written under the old projection
@@ -454,6 +461,11 @@ fence floor also rejects directives through the fenced counter tuple: rebuilds
 compare the local target assignment, while source authorize/revoke compares the
 local source assignment. A fresh assignment or a strictly newer committed
 counter tuple is therefore distinguishable from replay of fenced authority.
+Retiring an active local source owner in a full-state replacement advances that
+same source rejection floor for the exact retired assignment before reconnect
+dispatch resumes. This recovers the exclusion boundary when the old control
+session missed its explicit fence, while a fresh boot or a later assignment
+cannot synthesize or inherit that proof from an ownerless FDS.
 The bounded worker timer may still be queued briefly after a host resume, so a
 renewal also compares the old deadline with `CLOCK_BOOTTIME` synchronously. If
 the old lease is already due, the renewal path runs that exact expiration
@@ -461,6 +473,23 @@ transition first: it advances the authority generation, retires the stale
 timer, and joins source/directive cleanup before considering the replacement
 grant. A same-anchor heartbeat can extend only a lease that never expired, so
 pre-expiry admissions cannot be revived by a delayed timer.
+
+A projected source-history hold is reconciled under the same FDS barrier but
+remains separate from authority. It is accepted only for the local exact
+member/boot/history/population incarnation and one monotonic recovery
+generation. FDS alone cannot arm retention: the matching ordinary
+authorize-source directive must first pass the full control and source-ledger
+checks. Fence, lease expiry, and session replacement still revoke and join
+source capabilities without deleting the armed hold, allowing a later
+authorized candidate to reuse the shared backlog. Removing the hold from FDS,
+population loss, storage failure, shutdown, or restart releases it.
+
+A frozen-source authorization remains a current Meta directive while its
+selected candidate catches up. Full-state installation still clears the prior
+session's live export first, then exact replay of the retained directive and
+its stable export scope reauthorizes access to the held shared history. The
+directive is replaced only after the candidate reports every flow at the
+required frontier; the projected hold never substitutes for this capability.
 
 The encoded directive schema retains bounded `payload`, `preconditions`, and
 `force` fields. V1 appends `initialize-empty-population` as directive value 4
@@ -471,9 +500,13 @@ replication connection; zero-valued wire source fields normalize to an empty
 domain source. Promotion prepare instead owns versioned typed payload and
 precondition codecs that bind parent history, required per-flow frontier,
 excluded group term, and old-authority-exclusion hash. Other v1 kinds require
-both strings empty, and every kind requires `force=false`. Meta and NodeControl
-repeat these checks before the action seam, so the native adapter never treats
-an unknown predicate or forced operation as satisfied.
+both strings empty except `authorize-source` in its typed frozen-source mode.
+That mode binds the recovery generation to the exact excluded term, authority
+version, and grant revision and returns a versioned source history/all-flow
+frontier/proof hash through the existing terminal result and evidence path.
+Every kind requires `force=false`. Meta and NodeControl repeat these checks
+before the action seam, so the native adapter never treats an unknown
+predicate or forced operation as satisfied.
 
 Initialization reuses the ordinary directive, FDS, operation receipt, and
 population-proof lifecycles. NodeControl first closes readiness and serving,
@@ -529,6 +562,30 @@ result receipt before the Failover operation can enter `promotion-prepared`.
 The boot-local completion prevents result replay from repeating durability or
 history creation. Prepare never opens writes, expiration, or source export,
 and protocol v1 has no `activate-promotion` directive.
+
+Activation instead reuses the ordinary lease transition after
+`ActivateAuthority` is committed and the successor FDS is installed. The
+controller first installs the finite lease provisionally, translates the exact
+current FDS identity into an in-process activation input, and asks
+`ReplicationManager` to consume the retained prepare context. The group,
+candidate assignment/boot, immediate successor term and authority version,
+monotonic grant revision, manifest, partition epoch, Ready population,
+durability tokens, and child history must all still match. Success calls the
+same private role/population activation half as standalone promotion, but does
+not itself open expiration. After the suspending activation returns,
+NodeControl revalidates the exact lease generation and deadline, then
+synchronously installs a fresh storage expiration token carrying that absolute
+deadline. The token is checked again at active-expiration durable append and
+disk-full in-memory delete cuts and at Tomb Raider mutation cuts, so delayed
+activation or a late lease timer cannot extend authority. Rejection removes
+the provisional lease and leaves the candidate LOADING. Exact lease replay is
+idempotent after activation.
+
+Meta treats serving as a later observation boundary. The heartbeat that
+requests the first successful lease is recorded before its Ack is written, so
+it cannot prove that Data applied the lease and activation. Only a subsequent
+ready heartbeat from the same session, boot, projection, assignment, term,
+authority, and grant confirms serving for workflow completion.
 
 A completed population is content-scoped by group, membership assignment,
 immutable manifest, and partition replication epoch. `BeginGroupTerm` fences
@@ -700,10 +757,12 @@ no-key mutations, and the remaining `CLUSTER` management subcommands
 
 The admission decision matrix, builder and parser validation, content-hash
 publication semantics, finite lease lifecycle, frame and complete-object
-codecs, projection validation, drain behavior, TLS-aware endpoint selection,
-in-flight counter concurrency and cell sharing, and the CLUSTER wire texts and
-reply shapes are unit-tested through pure seams and the in-memory adapter. The
-three-node static-cluster end-to-end suite verifies routing, redirects,
+codecs, projection and source-hold validation, frozen-source admission,
+prepared activation, serving confirmation, drain behavior, TLS-aware endpoint
+selection, in-flight counter concurrency and cell sharing, and the CLUSTER
+wire texts and reply shapes are unit-tested through pure seams and the
+in-memory adapter. The three-node static-cluster end-to-end suite verifies
+routing, redirects,
 read-only replica admission, cluster-mode command restrictions, static export
 denial, expiration-authority state, INFO/CLUSTER replies, and topology reload.
 A real-process plaintext Data-control gate starts three Meta members and a Data
@@ -724,8 +783,8 @@ diagnostics when one replica is stopped.
 | ServingState model, builder validation, topology cache, content hash, striped in-flight cells, and routing functions | `include/keylane/cluster/topology.h`, `src/cluster/topology.cpp` |
 | Admission decision and owner-side authority re-check | `include/keylane/cluster/authority.h`, `src/cluster/authority.cpp` |
 | Final logical-mutation precondition and WATCH/publication seam | `include/keylane/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp` |
-| Meta/Data protocol framing, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
-| Node controller, full-state validation, finite authority, drain, and typed replication adaptation | `include/keylane/cluster/node_control.h`, `include/keylane/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp` |
+| Meta/Data protocol framing, source-hold and frozen-source codecs, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
+| Node controller, full-state/source-hold validation, finite authority, prepared activation, drain, and typed replication adaptation | `include/keylane/cluster/node_control.h`, `include/keylane/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp` |
 | Meta discovery and outbound Data control session | `include/keylane/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
 | Control-port seam, nodes.conf adapter, and in-memory adapter | `include/keylane/cluster/control_port.h`, `src/cluster/control_port.cpp` |
 | Process-wide runtime installation | `include/keylane/cluster/runtime.h`, `src/cluster/runtime.cpp` |
@@ -735,6 +794,6 @@ diagnostics when one replica is stopped.
 | Per-shard transaction validator hook | `include/keylane/tx/transaction.h`, `src/tx/transaction.cpp` |
 | Startup wiring, storage-ready publication, and SIGHUP reload | `src/redis/server.cpp` |
 | Cluster configuration directives and validation | `include/keylane/server.h`, `src/config.cpp`, `app/keylane.cpp` |
-| Decision matrix, parser, publication, and concurrency unit tests | `tests/cluster_authority_test.cpp`, `tests/cluster_control_port_test.cpp`, `tests/cluster_topology_test.cpp`, `tests/cluster_command_test.cpp` |
+| Decision matrix, parser, publication, source-hold/frozen-source/activation, and concurrency unit tests | `tests/cluster_authority_test.cpp`, `tests/cluster_control_port_test.cpp`, `tests/cluster_topology_test.cpp`, `tests/cluster_command_test.cpp`, `tests/control_protocol_test.cpp`, `tests/meta_control_test.cpp`, `tests/node_control_test.cpp` |
 | Real-process Meta/Data discovery, failover, mTLS, initial creation, and shutdown gates | `tests/meta_integration/gate_data_control.py`, `tests/meta_integration/gate_cluster_create.py` |
 | Static-cluster routing, admission, policy, and reload end-to-end suite | `tests/cluster_e2e_test.cpp` |
