@@ -28,8 +28,9 @@ struct ClusterCreateManifestV1 {
   bool operator==(const ClusterCreateManifestV1&) const = default;
 };
 
-// Terminal Meta result. committed_index_ identifies the operation-completion
-// commit and operation_id_ names the retained audit/evidence record.
+// Terminal Meta result. committed_index_ identifies a committed cut observing
+// completion (possibly newer than its commit); operation_id_ names the
+// retained creation intent and progress record.
 struct ClusterCreateOutcome {
   std::uint64_t committed_index_ = 0;
   std::string operation_id_;

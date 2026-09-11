@@ -3447,7 +3447,6 @@ class ReplicationManager::ReplicationGroup {
     }
     absl::Status validated =
         cluster_group_->ValidateEmptyPopulation(identity, manifest);
-    if (!validated.ok()) co_return validated;
 
     RebuildDirective directive{.identity_ = std::move(identity)};
     {
@@ -3458,8 +3457,17 @@ class ReplicationManager::ReplicationGroup {
       }
       if (cluster_rebuild_ != nullptr &&
           cluster_rebuild_->directive_ == directive) {
+        if (replica_reconfiguration_running_) {
+          co_return absl::FailedPreconditionError(
+              "another cluster population transition is active");
+        }
         const ReplicationGroupState state =
             cluster_rebuild_->state_.load(std::memory_order_relaxed);
+        // ReplicationGroup rejects starting an already-READY directive again.
+        // Exact replay instead shares the accepted attempt's completion, so
+        // handle it before returning the new-initialization validation error.
+        // Full identity/manifest equality and a still-valid proof are required;
+        // replay must never perform another destructive reset.
         if (state == ReplicationGroupState::kRebuilding ||
             (state == ReplicationGroupState::kReady &&
              cluster_rebuild_->ready_token_.has_value())) {
@@ -3469,6 +3477,7 @@ class ReplicationManager::ReplicationGroup {
             "empty population proof was invalidated; a fresh attempt is "
             "required");
       }
+      if (!validated.ok()) co_return validated;
       if (replica_reconfiguration_running_ || cluster_rebuild_ != nullptr ||
           active_replica_session_ != nullptr || upstream_.has_value() ||
           coordinator_started_) {
@@ -3820,6 +3829,19 @@ class ReplicationManager::ReplicationGroup {
     absl::Status source_retired = co_await RetireSourceHistory();
     if (result.ok() && !source_retired.ok()) result = source_retired;
     co_return result;
+  }
+
+  std::shared_ptr<detail::ClusterRebuildCompletionState>
+  FindCompletedClusterPopulation(const RebuildDirective& directive) const {
+    std::lock_guard lock(state_mutex_);
+    if (failed_stopped_.load(std::memory_order_relaxed) ||
+        replica_reconfiguration_running_ || cluster_rebuild_ == nullptr ||
+        cluster_rebuild_->directive_ != directive ||
+        cluster_rebuild_->state_.load(std::memory_order_relaxed) !=
+            ReplicationGroupState::kReady ||
+        !cluster_rebuild_->ready_token_.has_value())
+      return nullptr;
+    return cluster_rebuild_->completion_;
   }
 
   Task<ClusterPopulationStatus> cluster_population_status() const {
@@ -11316,6 +11338,14 @@ Task<absl::Status> ReplicationManager::ReconcileClusterPopulation(
 
 Task<absl::Status> ReplicationManager::CancelInProgressClusterPopulation() {
   return group_->CancelInProgressClusterPopulation();
+}
+
+std::optional<ClusterRebuildCompletion>
+ReplicationManager::FindCompletedClusterPopulation(
+    const RebuildDirective& directive) const {
+  auto completion = group_->FindCompletedClusterPopulation(directive);
+  if (completion == nullptr) return std::nullopt;
+  return ClusterRebuildCompletion(std::move(completion));
 }
 
 Task<ClusterPopulationStatus> ReplicationManager::cluster_population_status()

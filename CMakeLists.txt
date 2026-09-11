@@ -593,6 +593,7 @@ if (KEYLANE_BUILD_META)
   set(KEYLANE_META_CORE_SOURCES
     src/meta/audit_store.cpp
     src/meta/candidate_plan.cpp
+    src/meta/cluster_create_reconciler.cpp
     src/meta/commands.cpp
     src/meta/control_projector.cpp
     src/meta/coordinator.cpp
@@ -603,6 +604,7 @@ if (KEYLANE_BUILD_META)
     src/meta/grant_store.cpp
     src/meta/identity_verifier.cpp
     src/meta/identity_store.cpp
+    src/meta/membership_reconciler.cpp
     src/meta/observation_store.cpp
     src/meta/operation_store.cpp
     src/meta/policy_store.cpp
@@ -799,6 +801,8 @@ if (BUILD_TESTING)
     # test binary stays Raft-free, while this binary also links the data module
     # for explicit Meta-projection-to-Data-validation contract tests.
     add_executable(keylane_meta_tests
+      tests/meta_cluster_create_reconciler_test.cpp
+      tests/meta_membership_reconciler_test.cpp
       tests/meta_coordinator_test.cpp
       tests/meta_candidate_plan_test.cpp
       tests/meta_control_projector_test.cpp
@@ -864,7 +868,7 @@ if (BUILD_TESTING)
       # allocator quarantine would turn it into a measurement of ASan retention
       # instead of the bounded live Raft queues it is intended to cover.
       set(KEYLANE_META_INTEGRATION_GATES
-        leader_change recovery membership transport mtls stale_evidence
+        leader_change recovery membership membership_recovery transport mtls stale_evidence
         partition
       )
       if (NOT KEYLANE_ASAN_BUILD)

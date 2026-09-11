@@ -241,6 +241,55 @@ struct ReceivedTransfer {
   std::string bytes_;
 };
 
+RebuildDirective NativePopulationDirective(const NodeDirective& directive,
+                                           const PopulationManifest& manifest) {
+  // Replication's native population handshake predates the structured Meta
+  // anchor. Give both source and target the same canonical string identity
+  // over every committed authority field so neither side can accidentally
+  // collapse two assignments or grant revisions into one authorization.
+  const std::string authority_id =
+      EncodeRebuildAuthorityIdentity(directive.anchor_);
+  const bool initializes_empty =
+      directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation;
+  return RebuildDirective{
+      .identity_ =
+          {
+              .group_id_ = directive.anchor_.group_id_,
+              .assignment_id_ = directive.anchor_.assignment_id_.ToHexString(),
+              .term_ = directive.anchor_.group_term_,
+              .directive_revision_ = directive.directive_revision_,
+              .authority_id_ = authority_id,
+              .source_node_id_ = initializes_empty
+                                     ? std::string{}
+                                     : directive.source_node_id_.ToHexString(),
+              .source_assignment_id_ =
+                  initializes_empty
+                      ? std::string{}
+                      : directive.source_assignment_id_.ToHexString(),
+              .source_boot_id_ = initializes_empty
+                                     ? std::string{}
+                                     : directive.source_boot_id_.ToHexString(),
+              .source_history_id_ =
+                  initializes_empty
+                      ? std::string{}
+                      : directive.source_replication_history_id_.ToHexString(),
+              .target_node_id_ = directive.target_node_id_.ToHexString(),
+              .target_boot_id_ = directive.target_boot_id_.ToHexString(),
+              .target_history_id_ =
+                  initializes_empty ? directive.payload_ : std::string{},
+              .operation_id_ = directive.operation_id_.ToHexString(),
+              .directive_id_ = directive.directive_id_.ToHexString(),
+              .attempt_id_ = directive.attempt_id_.ToHexString(),
+              .manifest_revision_ = directive.manifest_revision_,
+              .manifest_id_ = manifest.id(),
+              .partition_replication_epoch_ =
+                  directive.partition_replication_epoch_,
+          },
+      .flow_count_ = directive.flow_count_,
+      .safe_source_active_ = !initializes_empty,
+  };
+}
+
 class ReplicationNodeControlActions final : public NodeControlActions {
  public:
   explicit ReplicationNodeControlActions(ReplicationManager& replication)
@@ -290,6 +339,22 @@ class ReplicationNodeControlActions final : public NodeControlActions {
     co_return co_await replication_.CancelClusterRebuildForShutdown();
   }
 
+  std::optional<NodeDirectiveCompletion> FindCompletedPopulation(
+      const NodeDirective& directive) const override {
+    std::vector<PopulationManifestEntry> entries;
+    entries.reserve(directive.manifest_entries_.size());
+    for (const auto& entry : directive.manifest_entries_)
+      entries.push_back({entry.partition_id_, entry.logical_epoch_});
+    auto manifest = PopulationManifest::Create(std::move(entries));
+    if (!manifest.ok() || manifest->id().bytes_ != directive.manifest_digest_)
+      return std::nullopt;
+    auto completed = replication_.FindCompletedClusterPopulation(
+        NativePopulationDirective(directive, *manifest));
+    if (!completed.has_value()) return std::nullopt;
+    return NodeDirectiveCompletion(
+        [completion = std::move(*completed)] { return completion.result(); });
+  }
+
   celer::Task<NodeDirectiveCompletion> StartDirective(
       NodeDirective directive) override {
     if (directive.kind_ == NodeDirective::Kind::kRevokeSources) {
@@ -314,54 +379,9 @@ class ReplicationNodeControlActions final : public NodeControlActions {
           "normalized directive manifest digest does not match its "
           "entries"));
     }
-
-    // Replication's native population handshake predates the structured Meta
-    // anchor. Give both source and target the same canonical string identity
-    // over every committed authority field so neither side can accidentally
-    // collapse two assignments or grant revisions into one authorization.
-    const std::string authority_id =
-        EncodeRebuildAuthorityIdentity(directive.anchor_);
     const bool initializes_empty =
         directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation;
-    RebuildDirective rebuild{
-        .identity_ =
-            {
-                .group_id_ = directive.anchor_.group_id_,
-                .assignment_id_ =
-                    directive.anchor_.assignment_id_.ToHexString(),
-                .term_ = directive.anchor_.group_term_,
-                .directive_revision_ = directive.directive_revision_,
-                .authority_id_ = authority_id,
-                .source_node_id_ = initializes_empty
-                                       ? std::string{}
-                                       : directive.source_node_id_.ToHexString(),
-                .source_assignment_id_ =
-                    initializes_empty
-                        ? std::string{}
-                        : directive.source_assignment_id_.ToHexString(),
-                .source_boot_id_ =
-                    initializes_empty
-                        ? std::string{}
-                        : directive.source_boot_id_.ToHexString(),
-                .source_history_id_ =
-                    initializes_empty
-                        ? std::string{}
-                        : directive.source_replication_history_id_.ToHexString(),
-                .target_node_id_ = directive.target_node_id_.ToHexString(),
-                .target_boot_id_ = directive.target_boot_id_.ToHexString(),
-                .target_history_id_ =
-                    initializes_empty ? directive.payload_ : std::string{},
-                .operation_id_ = directive.operation_id_.ToHexString(),
-                .directive_id_ = directive.directive_id_.ToHexString(),
-                .attempt_id_ = directive.attempt_id_.ToHexString(),
-                .manifest_revision_ = directive.manifest_revision_,
-                .manifest_id_ = manifest->id(),
-                .partition_replication_epoch_ =
-                    directive.partition_replication_epoch_,
-            },
-        .flow_count_ = directive.flow_count_,
-        .safe_source_active_ = !initializes_empty,
-    };
+    RebuildDirective rebuild = NativePopulationDirective(directive, *manifest);
     if (directive.kind_ == NodeDirective::Kind::kAuthorizeSource) {
       co_return NodeDirectiveCompletion::StartedTerminal(
           co_await replication_.AuthorizeClusterRebuildSource(

@@ -109,6 +109,13 @@ inline constexpr std::uint32_t kMaxMetaPolicyIdBytes = 128;
 inline constexpr std::uint32_t kMaxMetaPolicyReferencesPerOperation = 16;
 inline constexpr std::uint32_t kMaxMetaOperationKindBytes = 64;
 inline constexpr std::string_view kMetaClusterCreateOperationKind =
+    "cluster-create-workflow-v1";
+inline constexpr std::string_view kMetaMembershipOperationKind =
+    "meta-membership-workflow-v1";
+// Keep the original boot/history-bound population kind distinct from the
+// new pre-topology workflow. Old WAL entries retain their apply semantics;
+// recovery never guesses a full creation intent from a legacy partial task.
+inline constexpr std::string_view kMetaClusterCreatePopulationOperationKind =
     "cluster-create-v1";
 inline constexpr std::uint32_t kMaxMetaEvidenceSummariesPerCommand = 64;
 inline constexpr std::uint32_t kMaxMetaDirectivesPerOperation = 64;

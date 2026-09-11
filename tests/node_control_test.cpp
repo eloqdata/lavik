@@ -363,6 +363,12 @@ class RecordingActions final : public NodeControlActions {
         [this] { return deferred_directive_result_; });
   }
 
+  std::optional<NodeDirectiveCompletion> FindCompletedPopulation(
+      const NodeDirective& directive) const override {
+    if (completed_population_ != directive) return std::nullopt;
+    return NodeDirectiveCompletion::StartedTerminal(absl::OkStatus());
+  }
+
   absl::Status DrainAssignment(const AuthorityAnchor& anchor) override {
     drained_.push_back(anchor);
     return drain_status_;
@@ -388,6 +394,7 @@ class RecordingActions final : public NodeControlActions {
   std::vector<std::string> population_events_;
   std::optional<PopulationReadiness> desired_population_;
   std::optional<absl::Status> deferred_directive_result_;
+  std::optional<NodeDirective> completed_population_;
   bool population_transition_expected_ = false;
   bool receives_directives_ = false;
   std::function<void()> on_async_revocation_;
@@ -2189,6 +2196,33 @@ TEST(NodeControlInstallerTest,
   EXPECT_EQ(control.actions.directives_.front().kind_,
             NodeDirective::Kind::kInitializeEmptyPopulation);
   EXPECT_TRUE(control.actions.directives_.front().source_node_id_.empty());
+
+  // Lost-result replay while the target is already serving is a read of the
+  // original completion, not another population mutation. Unknown attempts
+  // still cannot enter the action adapter or take this Ready owner offline.
+  ASSERT_TRUE(RunTaskSync(control.installer.SetPopulationReadinessTransition(
+                              PopulationReadiness{"group-a", Assignment(1), 1,
+                                                  1, Digest(4),
+                                                  kPartitionReplicationEpoch}))
+                  .ok());
+  control.actions.completed_population_ = directive;
+  ASSERT_TRUE(control.cache.Current()->FindGroup("group-a")->population_ready_);
+  const auto before_replay = control.cache.Current();
+  EXPECT_TRUE(RunTaskSync(control.installer.ApplyDirective(directive)).ok());
+  EXPECT_EQ(control.cache.Current(), before_replay);
+  EXPECT_EQ(control.actions.directives_.size(), 1U);
+  NodeDirective different_attempt = directive;
+  different_attempt.attempt_id_ = ShortId<AttemptId>(9);
+  EXPECT_EQ(
+      RunTaskSync(control.installer.ApplyDirective(different_attempt)).code(),
+      absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(control.cache.Current(), before_replay);
+  EXPECT_EQ(control.actions.directives_.size(), 1U);
+  NodeDirective stale_replay = directive;
+  ++stale_replay.anchor_.authority_version_;
+  control.actions.completed_population_ = stale_replay;
+  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(stale_replay)).code(),
+            absl::StatusCode::kFailedPrecondition);
 
   NodeDirective sourced = directive;
   sourced.directive_id_ = ShortId<DirectiveId>(4);

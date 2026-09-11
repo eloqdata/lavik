@@ -831,6 +831,13 @@ class EmptyPopulationService final : public celer::Service {
     auto started = co_await replication_->StartEmptyPopulationInitialization(
         identity, *manifest);
     if (!started.ok()) co_return started.status();
+    std::optional<keylane::ClusterRebuildCompletion> in_progress_replay;
+    if (expectation_ == EmptyPopulationExpectation::kReady) {
+      auto replay = co_await replication_->StartEmptyPopulationInitialization(
+          identity, *manifest);
+      if (!replay.ok()) co_return replay.status();
+      in_progress_replay = std::move(*replay);
+    }
     const absl::Status completed = co_await started->Await();
     if (expectation_ != EmptyPopulationExpectation::kReady) {
       if (completed.ok()) {
@@ -868,6 +875,10 @@ class EmptyPopulationService final : public celer::Service {
     if (!completed.ok()) {
       co_return completed;
     }
+    if (!in_progress_replay.has_value() ||
+        (co_await in_progress_replay->Await()) != completed) {
+      co_return TestFailure("empty population replay lost the original result");
+    }
 
     const keylane::ClusterPopulationStatus ready =
         co_await replication_->cluster_population_status();
@@ -878,6 +889,64 @@ class EmptyPopulationService final : public celer::Service {
         replication_->is_loading() || replication_->reject_writes()) {
       co_return TestFailure(
           "empty population did not publish the source-less ReadyToken");
+    }
+
+    // A completed replay must reuse the original result, not start another
+    // destructive reset. Keep post-initialization data and its DB epoch as
+    // observable evidence that neither replay nor a rejected mismatch resets.
+    constexpr std::string_view kReplayKey = "after-empty-initialization";
+    constexpr std::string_view kReplayValue = "must-survive-replay";
+    auto written = co_await storage_->Set(0, kReplayKey, kReplayValue);
+    if (!written.ok()) co_return written.status();
+    const std::uint64_t db_epoch = storage_->DbEpoch(0);
+    auto lookup = replication_->FindCompletedClusterPopulation(
+        keylane::RebuildDirective{.identity_ = identity});
+    if (!lookup.has_value() ||
+        lookup->result() != std::optional<absl::Status>(completed)) {
+      co_return TestFailure("non-mutating replay lookup lost completed result");
+    }
+    auto replay = co_await replication_->StartEmptyPopulationInitialization(
+        identity, *manifest);
+    if (!replay.ok()) co_return replay.status();
+    if (replay->result() != std::optional<absl::Status>(completed) ||
+        (co_await replay->Await()) != completed) {
+      co_return TestFailure(
+          "completed empty population did not replay its result");
+    }
+
+    for (auto field : {&keylane::RebuildIdentity::group_id_,
+                       &keylane::RebuildIdentity::assignment_id_,
+                       &keylane::RebuildIdentity::target_node_id_,
+                       &keylane::RebuildIdentity::target_boot_id_,
+                       &keylane::RebuildIdentity::target_history_id_,
+                       &keylane::RebuildIdentity::operation_id_,
+                       &keylane::RebuildIdentity::directive_id_,
+                       &keylane::RebuildIdentity::attempt_id_}) {
+      auto mismatched = identity;
+      mismatched.*field += "-other";
+      if (replication_
+              ->FindCompletedClusterPopulation(
+                  keylane::RebuildDirective{.identity_ = mismatched})
+              .has_value()) {
+        co_return TestFailure("completed lookup accepted mismatched identity");
+      }
+      auto rejected = co_await replication_->StartEmptyPopulationInitialization(
+          mismatched, *manifest);
+      if (rejected.ok() ||
+          rejected.status().code() != absl::StatusCode::kFailedPrecondition) {
+        co_return TestFailure(
+            "empty population replay accepted another identity");
+      }
+    }
+    auto different_manifest = keylane::PopulationManifest::Create({{0, 2}});
+    if (!different_manifest.ok()) co_return different_manifest.status();
+    auto wrong_manifest =
+        co_await replication_->StartEmptyPopulationInitialization(
+            identity, *different_manifest);
+    if (wrong_manifest.ok() || wrong_manifest.status().code() !=
+                                   absl::StatusCode::kFailedPrecondition) {
+      co_return TestFailure(
+          "empty population replay accepted another manifest");
     }
 
     keylane::DesiredClusterPopulation desired{
@@ -902,6 +971,55 @@ class EmptyPopulationService final : public celer::Service {
         after_removal.ready_token_->identity() != identity) {
       co_return TestFailure(
           "matching FDS without the directive retired the ReadyToken");
+    }
+    auto retained_replay =
+        co_await replication_->StartEmptyPopulationInitialization(identity,
+                                                                  *manifest);
+    if (!retained_replay.ok()) co_return retained_replay.status();
+    if (retained_replay->result() != std::optional<absl::Status>(completed) ||
+        storage_->DbEpoch(0) != db_epoch || replication_->is_loading() ||
+        replication_->reject_writes()) {
+      co_return TestFailure(
+          "empty population replay disturbed the ready dataset");
+    }
+    {
+      auto preserved = co_await storage_->Get(0, kReplayKey);
+      if (!preserved.ok()) co_return preserved.status();
+      const auto bytes = preserved->value_bytes();
+      if (std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                           bytes.size()) != kReplayValue) {
+        co_return TestFailure("empty population replay erased subsequent data");
+      }
+    }
+
+    // An old completion handle remains historical evidence, not permission to
+    // reuse a READY proof after the desired population has changed.
+    ++desired.partition_replication_epoch_;
+    if (absl::Status reconciled =
+            co_await replication_->ReconcileClusterPopulation(desired);
+        !reconciled.ok()) {
+      co_return reconciled;
+    }
+    auto invalidated_replay =
+        co_await replication_->StartEmptyPopulationInitialization(identity,
+                                                                  *manifest);
+    if (replication_
+            ->FindCompletedClusterPopulation(
+                keylane::RebuildDirective{.identity_ = identity})
+            .has_value()) {
+      co_return TestFailure("completed lookup revived an invalidated proof");
+    }
+    if (invalidated_replay.ok() || invalidated_replay.status().code() !=
+                                       absl::StatusCode::kFailedPrecondition) {
+      co_return TestFailure(
+          "empty population replay revived an invalidated proof");
+    }
+    const auto invalidated = co_await replication_->cluster_population_status();
+    if (invalidated.state_ != keylane::ReplicationGroupState::kNotReady ||
+        invalidated.ready_token_.has_value() || !replication_->is_loading() ||
+        !replication_->reject_writes()) {
+      co_return TestFailure(
+          "invalidated empty population lost its serving fence");
     }
     co_return absl::OkStatus();
   }

@@ -77,6 +77,11 @@
 //      any slot-ownership or config-epoch change that affects a group with an
 //      active grant. Source and destination groups must be fenced before the
 //      cut, so no lease issued for the old projection can span a slot move.
+//  10. Creation and Meta-membership workflows have one shared durable
+//      reservation. A new cluster-create workflow reserves pristine topology
+//      before its first mutation and excludes another active creation id.
+//      Exact-id replay resolves before this guard, even after topology is
+//      populated.
 //
 // MetaStores is the committed aggregate that snapshots serialize as one
 // versioned envelope: per-store length-prefixed versioned blobs in a fixed

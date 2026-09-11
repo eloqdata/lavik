@@ -46,9 +46,12 @@ class MetaProposalExecutor {
   std::thread thread_;
 };
 
-// NuRaft accepts only one membership change at a time. Holding this
-// process-local lease across the complete asynchronous workflow rejects a
-// second ctl request without blocking Celer's sole worker.
+// NuRaft accepts only one membership change at a time. Initial cluster creation
+// shares this gate to reserve the pristine topology and keep its single-Meta
+// precondition stable. Every Admin listener and both workflow reconcilers share
+// one gate. After intent submission the background owner holds the lease;
+// the durable active-kind check bridges handoff and restart. No mutex is held
+// across suspension, and an Admin timeout does not abandon the reservation.
 class MetaMembershipGate
     : public std::enable_shared_from_this<MetaMembershipGate> {
  public:
@@ -65,8 +68,8 @@ class MetaMembershipGate
     std::shared_ptr<MetaMembershipGate> gate_;
   };
 
-  // Never waits: callers return a retryable config-changing response when a
-  // mutually exclusive operation is already in flight.
+  // Does not wait for the active workflow: a null lease means the caller must
+  // reject the request before making any committed mutation.
   std::unique_ptr<Lease> TryAcquire();
 
  private:

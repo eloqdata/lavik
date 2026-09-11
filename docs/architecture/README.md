@@ -17,7 +17,7 @@ references rather than current architecture.
 | Storage and recovery | Logical indexes, append/read paths, durable format, devices, recovery, shutdown checkpoints, flushing, expiry, and reclamation | [Storage and recovery](04-storage-and-recovery.md), [Grouped collections](09-grouped-collections.md), [Shutdown index checkpoints](06-shutdown-index-checkpoints.md) |
 | Replication | Native Keylane replication, Redis PSYNC interoperability, destructive full sync, online logs, Sentinel role changes, replay, and the fail-closed single-group cluster boundary | [Replication](05-replication.md) |
 | Cluster data plane | Slot routing, finite authority admission, node-local control installation, Meta discovery/session handling, and Redis Cluster compatibility | [Cluster data plane](06-cluster-data-plane.md) |
-| Meta control plane | NuRaft-backed committed metadata, projection and Data-session publishing, leader-local observations, authenticated administration, cluster status and initial creation, membership identity, and WAL/snapshot recovery | [Meta control plane](08-meta-control-plane.md) |
+| Meta control plane | NuRaft-backed metadata, Data-session publishing, leader-local observations, administration, cluster status, leader-owned recovery of creation and membership workflows, membership identity, and WAL/snapshots | [Meta control plane](08-meta-control-plane.md) |
 
 Metrics, memory accounting, logging, configuration, and the Celer runtime cross
 several subsystems and are summarized in the system overview rather than

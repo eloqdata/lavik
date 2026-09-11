@@ -342,7 +342,7 @@ absl::Status NodeControlInstaller::ValidateDirectiveAnchor(
 }
 
 absl::Status NodeControlInstaller::ValidateDirectiveForStart(
-    const NodeDirective& directive) {
+    const NodeDirective& directive, bool replay_lookup) {
   if (storage_failed_) {
     return absl::FailedPreconditionError(
         "storage failed during this boot; directive execution requires "
@@ -419,12 +419,14 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
         group != nullptr &&
         group->primary_node_index_ == current->SelfNodeIndex() &&
         group->granted_ && group->population_ready_ && group->storage_ready_;
-    if (!directive.storage_mutating_ || local_serving_owner) {
+    if (!directive.storage_mutating_ ||
+        (!replay_lookup && local_serving_owner)) {
       return absl::FailedPreconditionError(
           "population mutation requires a non-serving local target assignment");
     }
-    if (DrainPending(directive.anchor_.group_id_) ||
-        current->GroupInFlightCount(directive.anchor_.group_id_) != 0) {
+    if (!replay_lookup &&
+        (DrainPending(directive.anchor_.group_id_) ||
+         current->GroupInFlightCount(directive.anchor_.group_id_) != 0)) {
       return absl::UnavailableError(
           "population target still has in-flight requests");
     }
@@ -1206,6 +1208,19 @@ celer::Task<NodeDirectiveCompletion> NodeControlInstaller::StartDirective(
   const auto terminal = [](absl::Status status) {
     return NodeDirectiveCompletion::Rejected(std::move(status));
   };
+  // Re-reporting an exact completed result is not a storage mutation. Keep
+  // all session/FDS/fence/identity checks, but do not require an already-Ready
+  // owner to stop serving or drain client writes merely to repeat its result.
+  // The adapter's lookup cannot start work; no match uses every normal guard.
+  if (directive.kind_ == NodeDirective::Kind::kReplication ||
+      directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation) {
+    if (auto valid =
+            ValidateDirectiveForStart(directive, /*replay_lookup=*/true);
+        !valid.ok())
+      co_return terminal(std::move(valid));
+    if (auto completed = actions_.FindCompletedPopulation(directive))
+      co_return std::move(*completed);
+  }
   if (absl::Status valid = ValidateDirectiveForStart(directive); !valid.ok()) {
     co_return terminal(std::move(valid));
   }

@@ -160,20 +160,36 @@ request. Automation may pass `--yes`. `--timeout-ms` is one absolute deadline
 for leader discovery, all server-side commits and Data initialization, READY
 polling, and Redis verification; its default is 120 seconds. Remote TCP uses
 the same mTLS or explicit `--allow-plaintext-admin` policy as
-`cluster-status`; `--json` does not apply.
+`cluster-status`; `--json` does not apply. This deadline bounds the client's
+wait, not the lifetime of an accepted durable creation task.
 
 Exit 0 means the exact topology reached READY and the Redis probes passed.
 Exit 1 is a local manifest, confirmation, dependency, or protocol/verification
 failure. Exit 2 is an explicit Meta precondition or domain rejection. Exit 3
 means a timeout, lost leader, or connection failure occurred after creation
-may have begun. Never automatically replay an exit-3 creation. Run
-`cluster-status`, preserve the Meta and Data logs/directories, and determine
-whether the topology and population reached READY. V1 has no partial-workflow
-resume or conflict-safe retry; if it is not READY, keep the fenced cluster out
-of service and investigate the reported `clustercreate` stage/code before any
-manual recovery. An exit-1 Redis verification failure can occur after Meta
+may have begun. Do not submit a replacement creation after exit 3. The leader
+continues the accepted task in the background; after Meta restart or leader
+change it finds unfinished creation operations in the restored journal and
+resumes their committed phase, without another `cluster-create` request.
+Run `cluster-status` and `getop <operation-id>` using the original id from the
+reply or `cluster-create <id> phase=...` Meta log. A non-terminal creation
+record includes its current phase; `recovery-required` means the retained
+intent no longer matches safe execution conditions. Preserve the Meta/Data
+logs and directories and investigate rather than reinitialize. In particular,
+a changed Data boot/history, invalidated attempt, or changed topology does not
+authorize another destructive reset. Existing partial population operations
+from binaries without a durable creation root are not automatically adopted.
+
+Graceful Meta stop cancels result waits and leaves accepted task state intact;
+it does not wait for an offline Data node to return. A Data-reported failure
+fences the group before aborting the operation. Meta recovery preserves a
+successful population and finishes its bookkeeping without initializing again.
+An exit-1 Redis verification failure can occur after Meta
 creation completed, so use the same status and Redis commands after correcting
-the local dependency rather than rerunning creation.
+the local dependency rather than rerunning creation. Other multi-step cluster
+changes need their own recovery driver. Meta-member addition/removal also has
+one; Data migration/failover orchestration is not automatically recovered just
+because an operation journal exists.
 
 For plaintext remote administration, configure a listener and connect without
 TLS arguments:
@@ -243,12 +259,28 @@ keylane-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
 keylane-ctl --socket "$META_ROOT/node3/meta-admin.sock" status
 ```
 
-Do not treat `addsrv` returning `OK` as proof that catch-up finished: NuRaft
-returns it when the invite is accepted. Before adding the next member, poll the
+`addsrv` and `removesrv` persist a workflow before changing identity or Raft
+membership. `OK` means the requested configuration and identity changes have
+committed, not just that NuRaft accepted an invite. Before adding the next member, poll the
 new member's `status` until it remains alive and its `committed` index reaches
 the leader value observed after the add. The current `status` command does not
 list the membership set; a replicated write observed on the joiner is the
 stronger end-to-end check when an automation needs proof of convergence.
+
+The server bounds the Admin wait using `--client-req-timeout-ms`. An
+`ERR uncertain-outcome operation=<id>` reply or disconnected client does not
+cancel the accepted task. The current leader retries in the background; after
+restart or leader change it finds the task in the recovered journal and
+continues without another command. An identical in-flight `addsrv/removesrv`
+request waits on that same task, while a conflicting request returns
+`ERR config-changing`. Query `getop <id>` for the durable phase/result; Meta
+also logs `membership <id> phase=...`. Generic `abortop/completeop` cannot
+release a membership reservation while an accepted Raft change may still
+commit. A `recovery-required` phase requires investigation of the retained
+intent and actual configuration, not a replacement change or automatic
+identity reactivation. A direct request to remove the current leader remains
+rejected; if a previously authorized removal target later becomes leader,
+recovery performs a leadership handoff before continuing its removal.
 
 Plaintext peers still check the claimed Raft source and destination ids against
 the configuration and committed identity bindings, but those ids are not
@@ -541,9 +573,11 @@ keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
   addsrv 4 10.0.0.14:7100 10.0.0.14:7300 10.0.0.14:7200
 ```
 
-The leader first commits and audits the member identity binding, then invokes
-NuRaft `add_srv`. `ERR joining` and `ERR config-changing` mean the caller should
-wait, re-check the leader and both members, and retry the same operation.
+The leader first commits and audits the complete membership intent, then its
+background owner binds identity and invokes NuRaft `add_srv`. A successful
+invite alone does not complete the task. `ERR config-changing` indicates a
+different active workflow; an uncertain-outcome reply retains the original
+operation id and the leader continues retrying independently of the client.
 `ERR already-exists` may mean an earlier invite committed; verify the joiner
 rather than creating a different identity.
 
@@ -553,16 +587,15 @@ To remove a peer, select a follower and run this on the leader:
 keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock removesrv 4
 ```
 
-On success, Keylane first completes NuRaft `remove_srv`, then commits and
+On success, Keylane first observes the committed configuration without the peer, then commits and
 audits retirement of that member's identity before replying `OK`. Stop the
 removed process after the command succeeds. The retired id and principal are
 terminal and cannot be reactivated; replacing that machine requires a new id,
 fresh data directory, and, with mTLS, a new certificate.
 
 Remove one member at a time and preserve a quorum throughout. Prefer removing
-a follower; removing the current leader may return `ERR cannot-remove-leader`
-or trigger a step-down depending on NuRaft state. `ERR leaving` and
-`ERR config-changing` indicate another membership change is still active.
+a follower; directly removing the current leader returns `ERR cannot-remove-leader`.
+`ERR config-changing` indicates another durable membership/creation task is active.
 Never wipe or repurpose a member's data directory before its removal has
 committed and the remaining cluster has elected a healthy leader.
 

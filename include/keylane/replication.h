@@ -290,12 +290,20 @@ class ReplicationManager {
 
   // Starts source-less initialization of the first Meta-owned population.
   // The target history carried by identity is checked against this process
-  // before any reset; the returned handle reuses the existing population
-  // completion and resolves only after durable root promotion and ReadyToken
-  // publication.
+  // before any reset. Exact replay of an active or still-valid completed
+  // attempt shares its original completion without resetting storage again;
+  // an invalidated proof requires a fresh attempt identity. Success resolves
+  // only after durable root promotion and ReadyToken publication.
   celer::Task<absl::StatusOr<ClusterRebuildCompletion>>
   StartEmptyPopulationInitialization(RebuildIdentity identity,
                                      PopulationManifest manifest);
+
+  // Non-mutating, lock-safe exact replay lookup. Returns only a still-valid
+  // Ready attempt's original completion, never starts/restarts work or clears
+  // readiness. NodeControl uses this before new-mutation admission so a lost
+  // result can be replayed while the completed population is already serving.
+  std::optional<ClusterRebuildCompletion> FindCompletedClusterPopulation(
+      const RebuildDirective& directive) const;
 
   // Convenience wrapper that starts and awaits one full rebuild. Production
   // NodeControl uses StartClusterRebuildDirective so wire admission and later

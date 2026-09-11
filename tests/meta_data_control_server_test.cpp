@@ -112,6 +112,17 @@ TEST(MetaDataControlRuntimeStatusTest,
   EXPECT_FALSE(snapshot.nodes_[0].health_.has_value());
   EXPECT_EQ(snapshot.nodes_[0].groups_.size(), 1u);
 
+  // Validating an unchanged FDS advances freshness, not the origin of the
+  // object Data acknowledged. Old sessions cannot advance that proof.
+  status.MarkValidated(Identity('1'), Bytes<16>(0x42), 99);
+  EXPECT_EQ(status.Snapshot().nodes_[0].validated_committed_high_water_, 7u);
+  status.MarkValidated(Identity('1'), session, 9);
+  status.MarkValidated(Identity('1'), session, 8);
+  snapshot = status.Snapshot();
+  EXPECT_EQ(snapshot.nodes_[0].validated_committed_high_water_, 9u);
+  EXPECT_EQ(snapshot.nodes_[0].source_meta_applied_index_, 7u);
+  EXPECT_EQ(snapshot.nodes_[0].projection_hash_, projection.projection_hash);
+
   control::LeaseDenied denied;
   denied.reason = control::LeaseDenialReason::kNodeNotReady;
   status.RecordHealth(

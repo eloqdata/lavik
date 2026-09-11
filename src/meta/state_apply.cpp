@@ -840,6 +840,25 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     if (!result.ok()) return Rejected(result.status(), std::move(summary));
     return Accepted(std::move(summary));
   }
+  // Creation intent is the first committed mutation and its durable
+  // reservation survives a lost proposer/leader. The entry-layer gate is
+  // only fast rejection; two different creation ids must not both commit.
+  // Existing-id replay above remains legal after topology has been built.
+  if ((cmd.kind_ == kMetaClusterCreateOperationKind ||
+       cmd.kind_ == kMetaMembershipOperationKind) &&
+      (stores.operation_.HasActiveKind(kMetaClusterCreateOperationKind) ||
+       stores.operation_.HasActiveKind(kMetaMembershipOperationKind))) {
+    return Rejected(
+        "another durable Meta membership/creation workflow is active",
+        std::move(summary));
+  }
+  if (cmd.kind_ == kMetaClusterCreateOperationKind &&
+      (stores.identity_.NodeCount() != 0 ||
+       stores.topology_.GroupCount() != 0 ||
+       stores.population_manifest_.Size() != 0)) {
+    return Rejected("cluster creation requires pristine unreserved state",
+                    std::move(summary));
+  }
   for (const MetaPolicyReference& reference : cmd.policy_references_) {
     if (!stores.policy_.IsVersionActive(reference.policy_id_,
                                         reference.version_)) {

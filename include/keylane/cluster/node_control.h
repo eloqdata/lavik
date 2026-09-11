@@ -227,6 +227,13 @@ class NodeControlActions {
   // readiness.
   virtual celer::Task<NodeDirectiveCompletion> StartDirective(
       NodeDirective directive);
+  // Non-suspending, non-mutating lookup: only an exact, still-valid completed
+  // population may return its original completion. A miss falls through to
+  // normal mutation admission; implementations must never initiate a reset.
+  virtual std::optional<NodeDirectiveCompletion> FindCompletedPopulation(
+      const NodeDirective& /*directive*/) const {
+    return std::nullopt;
+  }
   virtual celer::Task<absl::Status> ApplyDirective(NodeDirective directive) = 0;
   // Optional post-counter hook for adapters that retain assignment-scoped
   // state outside ServingState. ReplicationManager currently needs no extra
@@ -421,7 +428,8 @@ class NodeControlInstaller {
   absl::Status ValidateAnchor(const AuthorityAnchor& anchor,
                               bool require_local_owner) const;
   absl::Status ValidateDirectiveAnchor(const NodeDirective& directive) const;
-  absl::Status ValidateDirectiveForStart(const NodeDirective& directive);
+  absl::Status ValidateDirectiveForStart(const NodeDirective& directive,
+                                         bool replay_lookup = false);
   absl::StatusOr<std::optional<PopulationReadiness>> DesiredLocalPopulation()
       const;
   const PreparedGroupControlIdentity* FindControlGroup(

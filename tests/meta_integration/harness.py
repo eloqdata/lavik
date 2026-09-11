@@ -886,12 +886,11 @@ def find_leader(nodes, timeout=15.0, exclude=()):
 def join_and_verify(leader, node, endpoint=None, timeout=30.0):
     """Drive addsrv until `node` verifiably replicates a probe operation.
 
-    NuRaft's add_srv completes its cmd_result as soon as the join invite is
-    accepted by the leader, NOT when the new config commits, and a failed
-    invite (e.g. the joiner was still binding its listener) is only retried
-    when add_srv is called again after the activity timeout. So "OK" alone
-    proves nothing: keep re-issuing addsrv and probing until the joiner's
-    state machine serves the probe operation. "ERR already-exists" is
+    The durable workflow retries invites independently of this connection.
+    OK means configuration and identity completion on the leader, while a
+    probe additionally verifies the joiner's state-machine catch-up. Identical
+    retries attach to the retained task after an uncertain wait outcome.
+    "ERR already-exists" is
     accepted: it means the node's config entry committed earlier (e.g. it
     finished joining just before a mid-invite crash), which the probe then
     confirms.
@@ -907,7 +906,7 @@ def join_and_verify(leader, node, endpoint=None, timeout=30.0):
             f"{node.ctl_endpoint}")
         acceptable = ("OK", "ERR joining", "ERR config-changing",
                       "ERR already-exists")
-        if reply not in acceptable:
+        if reply not in acceptable and not reply.startswith("ERR uncertain-outcome operation="):
             raise Failure(f"addsrv {node.id}: {reply}")
         invited = invited or reply in ("OK", "ERR already-exists")
         if invited:

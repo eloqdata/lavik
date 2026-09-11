@@ -503,8 +503,12 @@ success, precondition rejection, or runtime failure. Meta durably commits the
 exact
 terminal receipt before returning `ResultCommitted`. With no Data-side journal,
 a lost acknowledgement causes the committed directive to be replayed and its
-idempotent replication identity to resolve the work again; no local record can
-reopen authority after restart.
+idempotent replication identity to resolve the work again. After current
+session, projection, identity and fence checks, NodeControl may return an
+exact still-valid population completion through a non-mutating lookup even
+while that population is serving. This path neither clears readiness nor
+starts work; no match retains all ordinary destructive-admission and drain
+checks. No local result record can reopen authority after restart.
 
 A completed population is content-scoped by group, membership assignment,
 immutable manifest, and partition replication epoch. `BeginGroupTerm` fences
