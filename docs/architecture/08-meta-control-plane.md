@@ -17,7 +17,8 @@ the publisher that may create sessions, project desired state, evaluate lease
 challenges, or accept results. Demotion cancels that publisher and begins
 closing, then joins, all sessions and leader-scoped tasks from its leadership
 generation before the coordinator reports the transition complete. Shutdown
-first stops and drains every administrative listener, then quiesces Data
+first stops the creation and membership reconcilers without waiting for remote results, then
+cancels administrative result waits and drains every listener, then quiesces Data
 sessions and
 all NuRaft/proposal-executor producers, waits for the foreign executor's
 accepted prefix to reach the Meta worker, and only then stops the generic Celer
@@ -260,11 +261,14 @@ The common assignment field always names the target membership incarnation;
 the durable directive carries a separate source assignment and the committed
 partition replication epoch. Both must exactly match committed topology and
 the installed group view.
-The durable and wire codecs reserve bounded `payload`, `preconditions`, and
-`force` fields for future operation-kind semantics. V1 executable directives
-require the strings to be empty and `force=false`; Meta transition apply and
-Data admission both reject any other value, so the replication adapter cannot
-silently ignore a requested predicate or override.
+The durable and wire codecs keep bounded `payload`, `preconditions`, and
+`force` fields. V1 uses `payload` only for
+`initialize-empty-population`, where it carries the target Data session's
+authenticated replication-history id; all other executable directives require
+an empty payload. `preconditions` stays empty and `force=false` for every v1
+kind. Meta transition apply and Data admission both enforce this per-kind
+contract, so the replication adapter cannot silently ignore a predicate or
+override.
 Operation, durable directive, execution attempt, and assignment-incarnation
 identities remain distinct. Assignment ids are proposer-generated
 128-bit values that are never reused across incarnations; the topology store
@@ -433,11 +437,36 @@ invited configuration until it installs the leader's configuration and its
 first state-machine entry or snapshot. Plaintext deployments instead rely on
 network isolation during that bootstrap interval.
 
-Dynamic membership preserves the applicable configuration and identity-store
-bindings. Add commits the member's principal plus Data-control and Admin
-endpoints before `add_srv`; the Raft endpoint is carried by the NuRaft
-configuration change itself. Removal commits `remove_srv` before retiring the
-identity-store binding.
+Dynamic membership is a leader-owned `meta-membership-workflow-v1` operation.
+Before either identity or NuRaft mutation, Admin commits a bounded versioned
+intent containing the requested target, all three endpoints, principal, and
+the baseline peer descriptors and identity bindings. Peer descriptors retain
+voter/joiner flags, priority and data-center attributes; election-only config
+log indices are not semantic membership changes. A recovered owner accepts
+only that exact baseline or requested post-state, never overwrites a changed
+peer set or reactivates a retired identity. Legacy partial changes without an
+intent are not inferred as authorized workflows.
+
+`MetaMembershipReconciler` scans the recovered non-terminal journal on each
+leader transition. Add binds identity before invoking `add_srv`; remove
+observes the committed configuration without the member before retiring its
+identity. NuRaft's accepted invite/leave result is not a commit certificate.
+The owner checks the actual committed configuration, checkpoints each phase,
+and completes the operation only after all effects are present. Recovery also
+handles a crash between an effect and its phase checkpoint. If the removal
+target becomes leader during recovery, it yields leadership before another
+leader continues the same removal.
+
+Creation and membership operations share durable admission as well as one
+leader-local lease. Identical in-flight membership requests attach to the
+existing task; conflicting requests cannot bypass it after timeout or restart.
+Generic Admin submit/complete/abort commands cannot create or abandon a
+membership workflow. A timed-out invite can still commit, so cancelling its
+wait does not release this reservation. Demotion joins only queued/local
+NuRaft API entry and local proposals; remote-result callbacks own inert result
+storage, not a reconciler or leader context. The next owner retries from the
+committed state. Incompatible recovery retains an inspectable
+`recovery-required` phase instead of guessing a rollback.
 The retired binding also disambiguates the short interval after removal commits
 but before NuRaft publishes its new in-memory configuration. Reactivation of
 retired principals is rejected. Every member commits numeric Data-control and
@@ -504,7 +533,14 @@ committed Meta-directory check; a changed bracket returns `cut_changed`
 instead of mixed state. Captures are single-flight across both Admin listeners.
 Completed replies release the capture permit before sending, share a 256 MiB
 retained-reply budget, and a slow receiver loses the connection after five
-seconds rather than delaying Data heartbeats.
+seconds rather than delaying Data heartbeats. The compact committed cut also
+carries whether a non-terminal `cluster-create-workflow-v1` root exists. The
+server exposes that fact through the existing `cluster_create_active` blocker,
+preserving the `cluster-status` v1 wire layout, and the operator uses it for its
+read-only creation preflight without copying the journal. The leader repeats
+the check under exclusive creation/membership admission before its first
+proposal. Unrelated operation kinds do not make a clean topology appear
+occupied.
 
 Readiness uses this leader-observed cut. Meta availability requires a live,
 caught-up leader with quorum; membership stability compares its Raft config
@@ -516,6 +552,69 @@ committed owner/grant, present manifest, active policy, and a recent
 successfully written lease grant matching the current session and authority.
 Unassigned nodes remain diagnostic only. Empty and partially configured
 clusters are stable `NOT READY` results.
+
+`keylane-ctl cluster-create` reuses the same private leader discovery and
+status-capture seam. Its v1 manifest is a topology document, not a deployment
+document: it names exactly one existing Meta id, one canonical Data id and
+numeric plaintext client endpoint, one group/primary, and one full
+`0..16383` range. The CLI rejects unknown or duplicate TOML structure and
+files over 64 KiB, renders the normalized plan and destructive Data warning,
+and requires exact lowercase `yes` before opening an Admin connection unless
+`--yes` is present.
+
+After an empty-topology and no-active-create client check, the CLI sends one
+versioned `clustercreate` request to the discovered leader. `MetaCtlServer`
+submits the complete normalized plan as a `cluster-create-workflow-v1`
+operation before modifying topology, retaining the authenticated submitter.
+Apply reserves pristine state for that operation; a different creation id is
+rejected, while exact-id replay remains valid after topology changes.
+Admin only waits for the durable result. A timeout or shutdown cancels the
+wait, not the operation, and a repeated CLI invocation does not create a
+replacement for unfinished work.
+
+`MetaClusterCreateReconciler` runs on the Meta worker after each caught-up
+leader transition. Its atomic committed subscription includes the recovered
+snapshot/WAL prefix; it scans non-terminal creation operations and plans one
+effect at a time from their retained intent, phase and actual committed state.
+Every effect is checked before a phase checkpoint advances, including recovery
+between those two commits. Subscription overflow reacquires the complete view.
+The reconciler uses the trusted coordinator actor for follow-up proposals;
+the original operator remains recorded on the root operation. Creation and
+Meta membership changes share an asynchronous admission lease, with the
+durable active-operation check covering handoff, timeout and restart.
+
+The workflow commits Data identity, assignment and fenced term, the full slot
+map, 16,384-entry population manifest, partition epoch, policy and finite
+authority in dependency order. Only an acknowledged, current Data projection
+permits submitting the history-bound population child operation. A stable,
+domain-separated child id ties it to the creation intent; its immutable
+boot/history binding is not guessed at initial submission or changed on retry.
+The child retains the original `cluster-create-v1` population kind and carries
+the `initialize-empty-population` directive with exact assignment, term,
+authority, grant, manifest and partition-epoch anchors. The existing publisher
+replays that same directive after reconnect; it does not mint a new attempt
+because a result is missing. Success durably records the receipt, removes the
+directive, completes the child, then completes the root. Each boundary resumes
+independently without the original Admin connection. A committed failure
+fences before terminalization. Changed topology, lost attempt authorization or
+a changed Data incarnation is not permission to reset again: incompatible
+recovery stops at an inspectable `recovery-required` phase. Legacy population
+operations without a full root intent are not adopted as new creations.
+
+Demotion and shutdown cancel the owner and join its local proposal work while
+the worker/executor remain live. Already accepted proposals may commit;
+cancellation never synthesizes a Data result, rolls back committed topology or
+adds a compensating fence. The next leader re-reads the authoritative effects.
+Creation and Meta membership have dedicated background drivers. Arbitrary
+operation kinds, including full Data migration/failover orchestration, still
+require their own recovery policy; journal persistence alone supplies none.
+
+The client then polls the ordinary status path until the exact topology,
+population proof, and recent lease are READY, and invokes `redis-cli -c` to
+verify the public `CLUSTER INFO`, `SLOTS`, and `KEYSLOT` contracts plus an exact
+`SET`/`GET`/`DEL` round trip. This keeps internal Raft revisions and generated
+identities off the public CLI while making success mean the client-facing data
+plane is usable, not merely that a metadata prefix committed.
 
 Every privileged committed command creates a deterministic audit record keyed
 by Raft log index. Records include the injected actor, proposal time, command
@@ -535,8 +634,10 @@ transition into or out of disabled mode.
 | Deterministic apply, stores, coordinator, observations, and administrative protocol implementations | `src/meta/` |
 | Volatile candidate replacement and internal deterministic plan selection | `include/keylane/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/keylane/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | Pure per-node projection and leader-scoped Data-session publisher | `include/keylane/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/keylane/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
+| Durable creation admission, leader-owned recovery and shutdown cancellation | `src/meta/ctl_server.cpp`, `include/keylane/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `src/meta/operation_store.cpp`, `app/keylane_meta.cpp` |
+| Durable Meta membership intent, exact-config recovery, leadership handoff and identity retirement | `include/keylane/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |
 | Shared Meta/Data frame, object-transfer, and message formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
 | Foreign-thread typed completion ingress and worker wakeup | `celer/include/celer/runtime/foreign_executor.h`, `celer/src/runtime/foreign_executor.cpp`, `celer/include/celer/runtime/cross_core.h`, `celer/src/runtime/worker.cpp` |
-| TLS identity, RBAC, Unix peer credentials, Admin transport, and cluster status | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `celer/src/net/` |
+| TLS identity, RBAC, Unix peer credentials, Admin transport, cluster status, and initial cluster creation | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `include/keylane/meta/cluster_create.h`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `celer/src/net/` |
 | Recovery, partition, membership, and security gates | `tests/meta_*`, `tests/meta_integration/` |

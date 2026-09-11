@@ -142,10 +142,12 @@ at process start instead.
 `ReplicationManager` exposes a callable boundary to the Data-side node
 controller: `cluster_population_status()` reports the local node/boot and the
 boot-scoped state or ready/failure evidence,
-`StartClusterRebuildDirective()` admits one authorized rebuild and returns its
-exact completion handle. NodeControl observes that handle later to distinguish
-wire admission from `ReadyToken`, cancellation, or failure; exact replay shares
-the same attempt.
+`StartClusterRebuildDirective()` admits one authorized source rebuild and
+returns its exact completion handle. `StartEmptyPopulationInitialization()` is
+the source-less first-population variant and reuses the same completion and
+proof ownership instead of exposing a second runtime. NodeControl observes the
+handle later to distinguish wire admission from `ReadyToken`, cancellation, or
+failure; exact replay shares the same attempt.
 FDS reconciliation retains an in-progress attempt only while a current rebuild
 directive still names the same local assignment, term, manifest, and partition
 replication epoch. Removing
@@ -236,6 +238,18 @@ installation,
 cancellation/join, proof invalidation, or abort enters a group-identity-bound
 current-boot failure latch: the process remains LOADING and accepts no later
 attempt until restart.
+
+First population follows the same destructive boundary without inventing a
+source. The accepted identity binds the current target replication history and
+requires zero flows and no safe-source assertion. The manager durably
+invalidates serving, resets and hands off all 16,384 physical partitions using
+logical epoch 1 from the complete manifest, commits an empty Function catalog,
+and promotes through the normal root path. Only the complete reset, catalog,
+handoff, promotion, and proof sequence can publish the boot-scoped ReadyToken;
+its cut vector is empty. A matching desired population retains that token after
+the initialization directive is removed. Definite failures before promotion
+remain fenced, while any uncertain reset/abort/promotion or post-promotion
+failure uses the existing fail-stop/restart barrier.
 
 A source-side cluster export is separately fail-closed. The control adapter
 may authorize a downstream identity only while the local population has a
@@ -793,7 +807,7 @@ reattachment.
 | Setting or command | Current scope and behavior |
 |---|---|
 | `cluster-enabled` / `--cluster-enabled` | One-node-one-group, fail-closed startup; incompatible with startup `replicaof`, `redis-replicaof`, and `load-rdb`; the public manager also ignores a standalone initial upstream supplied by a direct embedder |
-| Cluster control adapter | Node-controller-only `StartClusterRebuildDirective` admission/completion handle, population status, and source authorize/revoke APIs; Meta transport remains outside `ReplicationManager` |
+| Cluster control adapter | Node-controller-only source rebuild and source-less first-population admission/completion handles, population status, and source authorize/revoke APIs; Meta transport remains outside `ReplicationManager` |
 | `replicaof host port` / `REPLICAOF` | Standalone Redis-style config or runtime role change with native-first discovery; rejected in cluster-managed mode |
 | `redis-replicaof host port` / `--redis-replicaof` | Explicit standalone startup Redis PSYNC source; rejected in cluster-managed mode |
 | `ADDREPLICAOF host port` | Standalone runtime addition of a disjoint master from the active Redis Cluster; rejected in cluster-managed mode |

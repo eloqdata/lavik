@@ -241,6 +241,55 @@ struct ReceivedTransfer {
   std::string bytes_;
 };
 
+RebuildDirective NativePopulationDirective(const NodeDirective& directive,
+                                           const PopulationManifest& manifest) {
+  // Replication's native population handshake predates the structured Meta
+  // anchor. Give both source and target the same canonical string identity
+  // over every committed authority field so neither side can accidentally
+  // collapse two assignments or grant revisions into one authorization.
+  const std::string authority_id =
+      EncodeRebuildAuthorityIdentity(directive.anchor_);
+  const bool initializes_empty =
+      directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation;
+  return RebuildDirective{
+      .identity_ =
+          {
+              .group_id_ = directive.anchor_.group_id_,
+              .assignment_id_ = directive.anchor_.assignment_id_.ToHexString(),
+              .term_ = directive.anchor_.group_term_,
+              .directive_revision_ = directive.directive_revision_,
+              .authority_id_ = authority_id,
+              .source_node_id_ = initializes_empty
+                                     ? std::string{}
+                                     : directive.source_node_id_.ToHexString(),
+              .source_assignment_id_ =
+                  initializes_empty
+                      ? std::string{}
+                      : directive.source_assignment_id_.ToHexString(),
+              .source_boot_id_ = initializes_empty
+                                     ? std::string{}
+                                     : directive.source_boot_id_.ToHexString(),
+              .source_history_id_ =
+                  initializes_empty
+                      ? std::string{}
+                      : directive.source_replication_history_id_.ToHexString(),
+              .target_node_id_ = directive.target_node_id_.ToHexString(),
+              .target_boot_id_ = directive.target_boot_id_.ToHexString(),
+              .target_history_id_ =
+                  initializes_empty ? directive.payload_ : std::string{},
+              .operation_id_ = directive.operation_id_.ToHexString(),
+              .directive_id_ = directive.directive_id_.ToHexString(),
+              .attempt_id_ = directive.attempt_id_.ToHexString(),
+              .manifest_revision_ = directive.manifest_revision_,
+              .manifest_id_ = manifest.id(),
+              .partition_replication_epoch_ =
+                  directive.partition_replication_epoch_,
+          },
+      .flow_count_ = directive.flow_count_,
+      .safe_source_active_ = !initializes_empty,
+  };
+}
+
 class ReplicationNodeControlActions final : public NodeControlActions {
  public:
   explicit ReplicationNodeControlActions(ReplicationManager& replication)
@@ -264,7 +313,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
 
   celer::Task<absl::Status> ReconcilePopulation(
       std::optional<PopulationReadiness> desired,
-      bool rebuild_expected) override {
+      bool population_transition_expected) override {
     std::optional<DesiredClusterPopulation> translated;
     if (desired.has_value()) {
       translated = DesiredClusterPopulation{
@@ -274,7 +323,8 @@ class ReplicationNodeControlActions final : public NodeControlActions {
           .manifest_revision_ = desired->manifest_revision_,
           .manifest_id_ = PopulationManifestId{desired->manifest_digest_},
           .partition_replication_epoch_ = desired->partition_replication_epoch_,
-          .rebuild_expected_ = rebuild_expected,
+          .population_transition_expected_ =
+              population_transition_expected,
       };
     }
     co_return co_await replication_.ReconcileClusterPopulation(
@@ -287,6 +337,22 @@ class ReplicationNodeControlActions final : public NodeControlActions {
 
   celer::Task<absl::Status> CancelPopulationForShutdown() override {
     co_return co_await replication_.CancelClusterRebuildForShutdown();
+  }
+
+  std::optional<NodeDirectiveCompletion> FindCompletedPopulation(
+      const NodeDirective& directive) const override {
+    std::vector<PopulationManifestEntry> entries;
+    entries.reserve(directive.manifest_entries_.size());
+    for (const auto& entry : directive.manifest_entries_)
+      entries.push_back({entry.partition_id_, entry.logical_epoch_});
+    auto manifest = PopulationManifest::Create(std::move(entries));
+    if (!manifest.ok() || manifest->id().bytes_ != directive.manifest_digest_)
+      return std::nullopt;
+    auto completed = replication_.FindCompletedClusterPopulation(
+        NativePopulationDirective(directive, *manifest));
+    if (!completed.has_value()) return std::nullopt;
+    return NodeDirectiveCompletion(
+        [completion = std::move(*completed)] { return completion.result(); });
   }
 
   celer::Task<NodeDirectiveCompletion> StartDirective(
@@ -313,45 +379,22 @@ class ReplicationNodeControlActions final : public NodeControlActions {
           "normalized directive manifest digest does not match its "
           "entries"));
     }
-
-    // Replication's native population handshake predates the structured Meta
-    // anchor. Give both source and target the same canonical string identity
-    // over every committed authority field so neither side can accidentally
-    // collapse two assignments or grant revisions into one authorization.
-    const std::string authority_id =
-        EncodeRebuildAuthorityIdentity(directive.anchor_);
-    RebuildDirective rebuild{
-        .identity_ =
-            {
-                .group_id_ = directive.anchor_.group_id_,
-                .assignment_id_ =
-                    directive.anchor_.assignment_id_.ToHexString(),
-                .term_ = directive.anchor_.group_term_,
-                .directive_revision_ = directive.directive_revision_,
-                .authority_id_ = authority_id,
-                .source_node_id_ = directive.source_node_id_.ToHexString(),
-                .source_assignment_id_ =
-                    directive.source_assignment_id_.ToHexString(),
-                .source_boot_id_ = directive.source_boot_id_.ToHexString(),
-                .source_history_id_ =
-                    directive.source_replication_history_id_.ToHexString(),
-                .target_node_id_ = directive.target_node_id_.ToHexString(),
-                .target_boot_id_ = directive.target_boot_id_.ToHexString(),
-                .operation_id_ = directive.operation_id_.ToHexString(),
-                .directive_id_ = directive.directive_id_.ToHexString(),
-                .attempt_id_ = directive.attempt_id_.ToHexString(),
-                .manifest_revision_ = directive.manifest_revision_,
-                .manifest_id_ = manifest->id(),
-                .partition_replication_epoch_ =
-                    directive.partition_replication_epoch_,
-            },
-        .flow_count_ = directive.flow_count_,
-        .safe_source_active_ = true,
-    };
+    const bool initializes_empty =
+        directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation;
+    RebuildDirective rebuild = NativePopulationDirective(directive, *manifest);
     if (directive.kind_ == NodeDirective::Kind::kAuthorizeSource) {
       co_return NodeDirectiveCompletion::StartedTerminal(
           co_await replication_.AuthorizeClusterRebuildSource(
               std::move(rebuild)));
+    }
+    if (initializes_empty) {
+      auto started = co_await replication_.StartEmptyPopulationInitialization(
+          std::move(rebuild.identity_), std::move(*manifest));
+      if (!started.ok()) {
+        co_return NodeDirectiveCompletion::StartedTerminal(started.status());
+      }
+      co_return NodeDirectiveCompletion(
+          [completion = std::move(*started)]() { return completion.result(); });
     }
     auto started = co_await replication_.StartClusterRebuildDirective(
         ReplicaOfConfig{.host_ = std::move(directive.source_host_),
@@ -447,10 +490,11 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
   }
   switch (directive.kind) {
     case control::WireDirectiveKind::kRebuild:
+    case control::WireDirectiveKind::kInitializeEmptyPopulation:
       if (directive.recipient_node_id != directive.target_node_id ||
           directive.recipient_boot_id != directive.target_boot_id) {
         return absl::FailedPreconditionError(
-            "rebuild directive recipient is not its target incarnation");
+          "population directive recipient is not its target incarnation");
       }
       break;
     case control::WireDirectiveKind::kAuthorizeSource:
@@ -461,6 +505,15 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
             "source directive recipient is not its source incarnation");
       }
       break;
+  }
+  if (directive.kind ==
+          control::WireDirectiveKind::kInitializeEmptyPopulation &&
+      (directive.source_node_id != std::string(40, '0') ||
+       !IsZero(directive.source_assignment_id) ||
+       directive.source_boot_id != std::string(40, '0') ||
+       directive.source_replication_history_id != std::string(40, '0'))) {
+    return absl::InvalidArgumentError(
+        "empty population directive must not name a source");
   }
 
   const auto group =
@@ -487,7 +540,9 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
     return absl::FailedPreconditionError(
         "directive target assignment is not current in the installed FDS");
   }
-  if (std::none_of(group->members.begin(), group->members.end(),
+  if (directive.kind !=
+          control::WireDirectiveKind::kInitializeEmptyPopulation &&
+      std::none_of(group->members.begin(), group->members.end(),
                    [&](const control::WireDesiredMember& member) {
                      return member.node_id == directive.source_node_id &&
                             member.assignment_id ==
@@ -827,7 +882,7 @@ struct MetaControlClientService::Impl {
     celer::AsyncNotification tasks_changed_;
     std::size_t active_tasks_ = 0;
     std::size_t directive_completion_tasks_ = 0;
-    std::size_t rebuild_completion_tasks_ = 0;
+    std::size_t population_completion_tasks_ = 0;
     std::size_t source_completion_tasks_ = 0;
     std::uint64_t directive_generation_ = 1;
     detail::MetaHeartbeatProjectionGate heartbeat_projection_gate_;
@@ -1071,15 +1126,18 @@ struct MetaControlClientService::Impl {
         .source_meta_applied_index_ = desired.source_meta_applied_index,
         .projection_hash_ = desired.projection_hash,
     };
-    const bool local_rebuild_expected = std::any_of(
+    const bool local_population_transition_expected = std::any_of(
         desired.current_directives.begin(), desired.current_directives.end(),
         [&](const control::WireProjectedDirective& directive) {
-          return directive.kind == control::WireDirectiveKind::kRebuild &&
+          return (directive.kind == control::WireDirectiveKind::kRebuild ||
+                  directive.kind ==
+                      control::WireDirectiveKind::kInitializeEmptyPopulation) &&
                  directive.recipient_node_id == options_.node_id_ &&
                  directive.recipient_boot_id == local_boot_id;
         });
     absl::Status installed = co_await installer_.InstallFullStateTransition(
-        std::move(*prepared), basis, local_rebuild_expected);
+        std::move(*prepared), basis,
+        local_population_transition_expected);
     if (!installed.ok()) co_return installed;
     directory_ = std::move(refreshed_directory);
     RecordClusterControlFullStateApplied();
@@ -1150,6 +1208,8 @@ struct MetaControlClientService::Impl {
         return "authorize-source";
       case control::WireDirectiveKind::kRevokeSources:
         return "revoke-sources";
+      case control::WireDirectiveKind::kInitializeEmptyPopulation:
+        return "initialize-empty-population";
     }
     return "unknown";
   }
@@ -1158,7 +1218,9 @@ struct MetaControlClientService::Impl {
       const control::Directive& directive, std::string_view phase,
       std::string evidence) const {
     const bool executes_on_target =
-        directive.kind == control::WireDirectiveKind::kRebuild;
+        directive.kind == control::WireDirectiveKind::kRebuild ||
+        directive.kind ==
+            control::WireDirectiveKind::kInitializeEmptyPopulation;
     const std::string kind_phase =
         absl::StrCat(DirectiveKindName(directive.kind), ":", phase);
     control::OperationEvidence report{
@@ -1174,7 +1236,11 @@ struct MetaControlClientService::Impl {
         .group_term = directive.authority.group_term,
         .manifest_revision = directive.manifest_revision,
         .partition_replication_epoch = directive.partition_replication_epoch,
-        .replication_history_id = directive.source_replication_history_id,
+        .replication_history_id =
+            directive.kind ==
+                    control::WireDirectiveKind::kInitializeEmptyPopulation
+                ? directive.payload
+                : directive.source_replication_history_id,
     };
     return report;
   }
@@ -1199,7 +1265,7 @@ struct MetaControlClientService::Impl {
 
   absl::StatusOr<NodeDirective> NormalizeDirective(
       const control::Directive& directive, const SessionIdentity& session,
-      std::string_view boot_id,
+      std::string_view boot_id, std::string_view local_history_id,
       const control::FullDesiredState& desired) const {
     if (directive.session_id != session.session_id_.bytes()) {
       return absl::FailedPreconditionError(
@@ -1210,7 +1276,7 @@ struct MetaControlClientService::Impl {
         !live.ok()) {
       return live;
     }
-    NodeDirective::Kind kind;
+    NodeDirective::Kind kind = NodeDirective::Kind::kReplication;
     switch (directive.kind) {
       case control::WireDirectiveKind::kRebuild:
         kind = NodeDirective::Kind::kReplication;
@@ -1221,6 +1287,11 @@ struct MetaControlClientService::Impl {
       case control::WireDirectiveKind::kRevokeSources:
         kind = NodeDirective::Kind::kRevokeSources;
         break;
+      case control::WireDirectiveKind::kInitializeEmptyPopulation:
+        kind = NodeDirective::Kind::kInitializeEmptyPopulation;
+        break;
+      default:
+        return absl::InvalidArgumentError("unknown directive kind");
     }
 
     const auto target_node = NodeId::Parse(directive.target_node_id);
@@ -1234,6 +1305,11 @@ struct MetaControlClientService::Impl {
         !source_history.has_value()) {
       return absl::InvalidArgumentError(
           "directive contains a non-canonical 160-bit identity");
+    }
+    if (kind == NodeDirective::Kind::kInitializeEmptyPopulation &&
+        directive.payload != local_history_id) {
+      return absl::FailedPreconditionError(
+          "empty population directive uses stale target history");
     }
 
     std::string source_host;
@@ -1283,14 +1359,28 @@ struct MetaControlClientService::Impl {
         .kind_ = kind,
         .target_node_id_ = *target_node,
         .target_boot_id_ = *target_boot,
-        .source_node_id_ = *source_node,
+        .source_node_id_ =
+            kind == NodeDirective::Kind::kInitializeEmptyPopulation
+                ? NodeId{}
+                : *source_node,
         .source_assignment_id_ =
-            AssignmentId::FromBytes(directive.source_assignment_id),
-        .source_boot_id_ = *source_boot,
-        .source_replication_history_id_ = *source_history,
+            kind == NodeDirective::Kind::kInitializeEmptyPopulation
+                ? AssignmentId{}
+                : AssignmentId::FromBytes(directive.source_assignment_id),
+        .source_boot_id_ =
+            kind == NodeDirective::Kind::kInitializeEmptyPopulation
+                ? NodeId{}
+                : *source_boot,
+        .source_replication_history_id_ =
+            kind == NodeDirective::Kind::kInitializeEmptyPopulation
+                ? NodeId{}
+                : *source_history,
         .source_host_ = std::move(source_host),
         .source_port_ = source_port,
-        .flow_count_ = options_.request_worker_count_,
+        .flow_count_ =
+            kind == NodeDirective::Kind::kInitializeEmptyPopulation
+                ? 0
+                : options_.request_worker_count_,
         .manifest_revision_ = directive.manifest_revision,
         .manifest_digest_ = directive.manifest_digest,
         .partition_replication_epoch_ = directive.partition_replication_epoch,
@@ -1365,7 +1455,7 @@ struct MetaControlClientService::Impl {
   celer::Task<absl::Status> ObserveDirectiveCompletion(
       std::shared_ptr<SessionState> state, control::Directive directive,
       NodeDirectiveCompletion completion, std::uint64_t generation,
-      bool rebuild) {
+      bool population_mutation) {
     absl::Status result = absl::OkStatus();
     if (completion.started()) {
       result = co_await SendOperationEvidence(
@@ -1396,8 +1486,8 @@ struct MetaControlClientService::Impl {
       if (!result.ok()) break;
     }
     --state->directive_completion_tasks_;
-    if (rebuild) {
-      --state->rebuild_completion_tasks_;
+    if (population_mutation) {
+      --state->population_completion_tasks_;
     } else {
       --state->source_completion_tasks_;
     }
@@ -1414,15 +1504,18 @@ struct MetaControlClientService::Impl {
            !state->directive_queue_.empty()) {
       DirectiveWork work = std::move(state->directive_queue_.front());
       state->directive_queue_.pop_front();
-      const bool rebuild =
-          work.normalized_.kind_ == NodeDirective::Kind::kReplication;
-      // Rebuild completions may overlap only other rebuild admissions, which
-      // is the path ReplicationManager uses for exact replay/supersession.
+      const bool population_mutation =
+          work.normalized_.kind_ == NodeDirective::Kind::kReplication ||
+          work.normalized_.kind_ ==
+              NodeDirective::Kind::kInitializeEmptyPopulation;
+      // Population completions may overlap only other population admissions,
+      // which is the path ReplicationManager uses for exact replay or
+      // supersession.
       // Source authorization/revocation remains a serialized barrier and can
       // neither overtake nor be overtaken by target population work.
       while (!state->closing_ && state->directive_dispatch_enabled_ &&
-             (rebuild ? state->source_completion_tasks_ != 0
-                      : state->directive_completion_tasks_ != 0)) {
+             (population_mutation ? state->source_completion_tasks_ != 0
+                                  : state->directive_completion_tasks_ != 0)) {
         co_await state->tasks_changed_.Wait();
       }
       if (state->closing_ || !state->directive_dispatch_enabled_) break;
@@ -1433,15 +1526,15 @@ struct MetaControlClientService::Impl {
         break;
       }
       ++state->directive_completion_tasks_;
-      if (rebuild) {
-        ++state->rebuild_completion_tasks_;
+      if (population_mutation) {
+        ++state->population_completion_tasks_;
       } else {
         ++state->source_completion_tasks_;
       }
       ++state->active_tasks_;
       state->worker_->Spawn(ObserveDirectiveCompletion(
           state, std::move(work.wire_), std::move(*started),
-          state->directive_generation_, rebuild));
+          state->directive_generation_, population_mutation));
     }
     if (state->closing_ || !state->directive_dispatch_enabled_) {
       state->directive_queue_.clear();
@@ -1471,8 +1564,9 @@ struct MetaControlClientService::Impl {
       co_return absl::AlreadyExistsError(
           "directive identity was delivered twice in one projection");
     }
-    auto normalized = NormalizeDirective(directive, state->session_,
-                                         state->boot_id_, *state->desired_);
+    auto normalized = NormalizeDirective(
+        directive, state->session_, state->boot_id_,
+        state->replication_identity_.local_history_id_, *state->desired_);
     if (!normalized.ok()) co_return normalized.status();
     absl::Status accepted = co_await state->writer_->Write(
         control::MessagePriority::kReliable,

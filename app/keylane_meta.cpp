@@ -17,7 +17,8 @@
 //     return to Celer through the Runtime's foreign executor mailbox.
 //
 // Teardown order (main thread, on SIGTERM/SIGINT):
-//   ctl Shutdown() -> Data control Shutdown() -> coordinator demotion ->
+//   workflow reconcilers Shutdown() -> ctl Shutdown() ->
+//   Data control Shutdown() -> coordinator demotion ->
 //   proposal executor drain -> raft_launcher::shutdown() ->
 //   MetaStateMachine::WaitForSnapshotWriterIdle() -> release Raft ref -> Celer
 //   Runtime stop + join -> coordinator release.
@@ -70,11 +71,13 @@
 #include "libnuraft/srv_config.hxx"
 #pragma GCC diagnostic pop
 
+#include "keylane/meta/cluster_create_reconciler.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/ctl_server.h"
 #include "keylane/meta/data_control_runtime_status.h"
 #include "keylane/meta/data_control_server.h"
 #include "keylane/meta/identity_verifier.h"
+#include "keylane/meta/membership_reconciler.h"
 #include "keylane/meta/nuraft_asio_transport.h"
 #include "keylane/meta/nuraft_log_store.h"
 #include "keylane/meta/nuraft_state_mgr.h"
@@ -769,6 +772,13 @@ int main(int argc, char** argv) {
       std::make_shared<MetaCoordinator>(server, *state_machine, *wal,
                                         *obs_store, coordinator_options);
   leadership_relay->Attach(*coordinator);
+  auto cluster_create_reconciler =
+      std::make_shared<keylane::meta::MetaClusterCreateReconciler>(
+          foreign_executor, membership_gate, data_control_runtime_status);
+  auto membership_reconciler =
+      std::make_shared<keylane::meta::MetaMembershipReconciler>(
+          foreign_executor, *proposal_executor, server, state_machine,
+          membership_gate);
 
   if (exit_code == 0) {
     MetaDataControlServerOptions control_options;
@@ -812,6 +822,8 @@ int main(int argc, char** argv) {
       ctl_options.local_ctl_endpoint_ = ctl_endpoint_text;
       ctl_options.cluster_status_service_ = cluster_status_service;
       ctl_options.data_control_runtime_status_ = data_control_runtime_status;
+      ctl_options.cluster_create_reconciler_ = cluster_create_reconciler;
+      ctl_options.membership_reconciler_ = membership_reconciler;
       ctl_options.observation_ttl_ms_ = observation_ttl_ms;
       ctl_options.transport_ = MetaCtlServerOptions::Transport::kUnix;
       ctl_options.unix_socket_path_ = options.ctl_socket_;
@@ -824,6 +836,8 @@ int main(int argc, char** argv) {
       ctl_options.local_ctl_endpoint_ = ctl_endpoint_text;
       ctl_options.cluster_status_service_ = cluster_status_service;
       ctl_options.data_control_runtime_status_ = data_control_runtime_status;
+      ctl_options.cluster_create_reconciler_ = cluster_create_reconciler;
+      ctl_options.membership_reconciler_ = membership_reconciler;
       ctl_options.observation_ttl_ms_ = observation_ttl_ms;
       ctl_options.transport_ =
           options.ctl_tls_ca_.empty()
@@ -892,6 +906,8 @@ int main(int argc, char** argv) {
     // not commit --ctl-addr before a failing Admin bind has rolled startup
     // back.
     coordinator->RunAsLeader(data_control);
+    coordinator->RunAsLeader(cluster_create_reconciler);
+    coordinator->RunAsLeader(membership_reconciler);
   }
 
   if (exit_code == 0) {
@@ -913,6 +929,11 @@ int main(int argc, char** argv) {
                  static_cast<int>(g_last_shutdown_signal));
   }
 
+  // Stop durable workflows before draining Admin waiters. Local accepted
+  // proposals/API entries may finish, but no remote Data or membership result
+  // is needed to join; the next leader reconstructs work from the journal.
+  cluster_create_reconciler->Shutdown();
+  membership_reconciler->Shutdown();
   // Stop both ingress surfaces first, then synchronously revoke the
   // leader-scoped publisher before quiescing NuRaft/Asio while the Celer
   // worker mailbox and snapshot writer remain alive.

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "keylane/cluster/control_protocol.h"
+#include "keylane/meta/commands.h"
 
 namespace keylane::meta {
 
@@ -30,6 +31,10 @@ struct MetaDataControlRuntimeNode {
   std::string node_id_;
   std::string boot_id_;
   cluster::control::WireId128 session_id_{};
+  // Authenticated by the Hello handshake and scoped to this exact live
+  // session. Source-less population initialization binds its durable intent
+  // to this value before any destructive reset is projected to Data.
+  MetaReplicationHistoryId replication_history_id_{};
   std::uint64_t session_generation_ = 0;
   std::uint64_t leadership_generation_ = 0;
   std::uint64_t source_meta_applied_index_ = 0;
@@ -72,6 +77,7 @@ class MetaDataControlRuntimeStatus {
   // heartbeat and lease observations belonging to its predecessor.
   void PublishCurrent(std::string node_id, std::string boot_id,
                       const cluster::control::WireId128& session_id,
+                      const MetaReplicationHistoryId& replication_history_id,
                       std::uint64_t session_generation,
                       std::uint64_t leadership_generation,
                       std::uint64_t validated_committed_high_water,

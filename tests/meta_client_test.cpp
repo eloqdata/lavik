@@ -481,6 +481,58 @@ TEST(MetaDirectiveValidationTest,
   revoke.kind = control::WireDirectiveKind::kRevokeSources;
   desired.current_directives.front().kind = revoke.kind;
   EXPECT_TRUE(ValidateLiveDirective(revoke, desired, kLocal, kLocalBoot).ok());
+
+  control::Directive initialize = live;
+  initialize.kind =
+      control::WireDirectiveKind::kInitializeEmptyPopulation;
+  initialize.source_node_id = std::string(40, '0');
+  initialize.source_assignment_id = {};
+  initialize.source_boot_id = std::string(40, '0');
+  initialize.source_replication_history_id = std::string(40, '0');
+  initialize.payload = kRemote;
+  initialize.preconditions.clear();
+  initialize.authority.assignment_id = projected.authority.assignment_id;
+  desired.current_directives.front() = projected;
+  desired.current_directives.front().kind = initialize.kind;
+  desired.current_directives.front().source_node_id =
+      initialize.source_node_id;
+  desired.current_directives.front().source_assignment_id = {};
+  desired.current_directives.front().source_boot_id =
+      initialize.source_boot_id;
+  desired.current_directives.front().source_replication_history_id =
+      initialize.source_replication_history_id;
+  desired.current_directives.front().payload = initialize.payload;
+  desired.current_directives.front().preconditions.clear();
+  desired.current_directives.front().authority = initialize.authority;
+  EXPECT_TRUE(
+      ValidateLiveDirective(initialize, desired, kLocal, kLocalBoot).ok());
+
+  control::Directive stale_initialize_boot = initialize;
+  stale_initialize_boot.recipient_boot_id = kRemoteBoot;
+  stale_initialize_boot.target_boot_id = kRemoteBoot;
+  desired.current_directives.front().recipient_boot_id = kRemoteBoot;
+  desired.current_directives.front().target_boot_id = kRemoteBoot;
+  EXPECT_EQ(ValidateLiveDirective(stale_initialize_boot, desired, kLocal,
+                                  kLocalBoot)
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+  desired.current_directives.front().recipient_boot_id = kLocalBoot;
+  desired.current_directives.front().target_boot_id = kLocalBoot;
+
+  control::Directive stale_initialize_authority = initialize;
+  --stale_initialize_authority.authority.authority_version;
+  desired.current_directives.front().authority =
+      stale_initialize_authority.authority;
+  EXPECT_EQ(ValidateLiveDirective(stale_initialize_authority, desired, kLocal,
+                                  kLocalBoot)
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+  desired.current_directives.front().authority = initialize.authority;
+
+  initialize.source_node_id = kRemote;
+  EXPECT_EQ(
+      ValidateLiveDirective(initialize, desired, kLocal, kLocalBoot).code(),
+      absl::StatusCode::kInvalidArgument);
 }
 
 TEST(MetaDirectiveResultTest, SeparatesRejectionsFromExecutionFailures) {

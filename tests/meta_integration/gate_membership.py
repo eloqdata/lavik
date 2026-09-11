@@ -3,26 +3,20 @@
 
 One cluster under a continuous propose load; serial phases:
 
-1. 3 -> 4 nodes: addsrv node4, proven by a real replicated probe operation
-   (addsrv's OK only means the invite was accepted, never that the config
-   committed — the probe is the proof).
+1. 3 -> 4 nodes: addsrv node4 commits configuration/identity; a replicated
+   probe additionally proves the joiner's state-machine catch-up.
 2. removesrv a follower under load: the cluster must keep committing and
    the removed node's committed index must freeze.
-3. Invite-crash retry: addsrv node5, kill -9 it mid-invite, then poll
-   addsrv with the joiner down and record NuRaft's actual replies (join
-   serialization and/or activity-timeout reset). Restart node5 and drive
-   addsrv until the probe proves it joined. The contract being gated is
-   "single config change at a time, retryable" — the exact reply sequence
-   is observed and logged.
-4. Conflicting ops: addsrv for an existing member (NuRaft
-   SERVER_ALREADY_EXISTS -> "ERR already-exists") and a second removesrv
-   while one is in flight (SERVER_IS_LEAVING -> "ERR leaving"). The first
+3. Post-join crash: addsrv node5, kill -9 after completion, then repeat
+   addsrv while it is down. Restart it and prove catch-up without replacing
+   its membership. Interrupted invites are covered by gate_membership_recovery.
+4. Conflicting ops: addsrv for an existing member returns "ERR already-exists";
+   a different removesrv while one is in flight returns "ERR config-changing". The first
    target is paused and the commands use separate ctl sessions so the overlap
    is deterministic.
-5. removesrv the leader itself: record NuRaft's actual behavior. In this
-   build (third_party/nuraft @ 0b01b18) handle_rm_srv_req refuses it with
-   CANNOT_REMOVE_LEADER; if that ever changes to an accepted step-down,
-   the gate follows the new behavior and still requires no data loss.
+5. A new request to remove the current leader is rejected before submission.
+   A previously admitted removal target elected during recovery is a distinct
+   case handled by the background driver's leadership handoff.
 6. Full committed-history check on the surviving members, clean teardown.
 
 Usage: gate_membership.py /path/to/keylane-meta [workdir]
@@ -97,7 +91,7 @@ def main():
         H.log(f"phase 2: node {victim.id} removed under load, "
               f"cluster kept committing")
 
-        # --- phase 3: invite-crash retry ---------------------------------
+        # --- phase 3: post-join crash and repeated request ----------------
         node5 = H.Node(BINARY, workdir, 5, args=args)
         extras.append(node5)
         node5.start(bootstrap=False)
@@ -110,7 +104,7 @@ def main():
         if reply != "OK":
             raise H.Failure(f"addsrv node 5: {reply}")
         node5.kill9()
-        H.log("phase 3: node 5 killed mid-invite")
+        H.log("phase 3: node 5 killed after committed join")
 
         observed = []
         deadline = time.monotonic() + 8
@@ -120,8 +114,10 @@ def main():
                 f"{node5.ctl_endpoint}")
             if not observed or observed[-1] != reply:
                 observed.append(reply)
-            # Once a retry gets OK again the leader reset the dead join;
-            # anything further would just pile on more invites.
+            # Already-exists confirms an accepted task was not replaced just
+            # because its target subsequently went offline.
+            if reply == "ERR already-exists":
+                break
             if len(observed) >= 2 and observed[-1] == "OK":
                 break
             time.sleep(0.5)
@@ -131,7 +127,7 @@ def main():
         H.join_and_verify(leader, node5, timeout=40)
         history.check([node5], timeout=30, desc="node5 post-crash join")
         members.append(node5)
-        H.log("phase 3: node 5 rejoined after invite-crash")
+        H.log("phase 3: node 5 caught up after post-join crash")
 
         # --- phase 4: conflicting membership ops -------------------------
         leader = H.find_leader(members)
@@ -144,7 +140,7 @@ def main():
             raise H.Failure(
                 f"addsrv existing member: {reply}, want ERR already-exists")
 
-        # A ctl reply follows both the NuRaft result and the committed identity
+        # A ctl reply follows both the committed config and committed identity
         # retirement, so two calls made serially are not concurrent. Pause
         # node5 and issue the first removal on another ctl session; NuRaft
         # retains its single-change gate while awaiting the leave response.
@@ -171,9 +167,9 @@ def main():
               f"overlapping removesrv {nodes[2].id} -> {second}")
         if first != "OK":
             raise H.Failure(f"removesrv node {node5.id}: {first}")
-        if second not in ("ERR leaving", "ERR config-changing"):
+        if second != "ERR config-changing":
             raise H.Failure(
-                f"concurrent removesrv: {second}, want ERR leaving")
+                f"concurrent removesrv: {second}, want ERR config-changing")
         ok_before = load.ok_count
         H.wait_until("cluster keeps committing after phase-4 removesrv",
                      15, lambda: load.ok_count > ok_before + 5)

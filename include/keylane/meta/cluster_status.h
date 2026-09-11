@@ -15,6 +15,7 @@
 
 #include "absl/status/statusor.h"
 #include "keylane/meta/admin_client.h"
+#include "keylane/meta/cluster_create.h"
 
 namespace keylane::meta {
 
@@ -89,6 +90,11 @@ struct ClusterBlockerWireV1 {
   bool operator==(const ClusterBlockerWireV1&) const = default;
 };
 
+// Reuses the extensible v1 blocker list for the cluster-create preflight;
+// adding a fixed field would silently change the established v1 wire layout.
+inline constexpr std::string_view kClusterCreateActiveBlockerCode =
+    "cluster_create_active";
+
 struct ClusterCaptureWireV1 {
   std::uint32_t responder_id_ = 0;
   std::uint64_t term_ = 0;
@@ -158,7 +164,22 @@ class ClusterOperator {
   absl::StatusOr<ClusterStatusOutcome> Status(
       const MetaAdminTarget& seed, const ClusterStatusOptions& options) const;
 
+  // Creates the v1 single-Data topology from an empty single-Meta cluster and
+  // returns only after cluster-status observes the exact manifest as READY.
+  // A transport failure after the mutation request starts is intentionally
+  // not retried because v1 does not resume partially committed creation.
+  absl::StatusOr<ClusterCreateOutcome> Create(
+      const MetaAdminTarget& seed, const ClusterCreateManifestV1& manifest,
+      const ClusterStatusOptions& options) const;
+
  private:
+  // Shared leader-resolution/status capture seam. Mutation workflows receive
+  // the exact endpoint whose head/status identity checks succeeded instead of
+  // rediscovering or accidentally sending a write back to the seed.
+  absl::StatusOr<ClusterStatusOutcome> CaptureStatus(
+      const MetaAdminTarget& seed, const ClusterStatusOptions& options,
+      MetaAdminTarget* leader_target) const;
+
   MetaAdminRoundTrip round_trip_;
 };
 

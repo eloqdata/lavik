@@ -318,12 +318,14 @@ changes, and Meta leadership changes independently invalidate it, so the
 selector never waits for TTL after a known disconnect or role change.
 
 After the initial projection is applied and validated, Meta also publishes a
-compact leader-local runtime record for cluster status. The record follows the
-current session and FDS incarnation, timestamps health at receive, and records
-a lease decision only after the corresponding Ack write succeeds. Cached Ack
-replay does not renew that timestamp. Replacement, session close, leadership
-loss, and shutdown remove the record. This is a one-way observational feed:
-Data authority and lease evaluation never read status state back.
+compact leader-local runtime record for cluster status and leader-owned
+workflows. The record follows the current session and FDS incarnation, retains
+the replication-history id authenticated by `ClientHello`, timestamps health
+at receive, and records a lease decision only after the corresponding Ack
+write succeeds. Cached Ack replay does not renew that timestamp. Replacement,
+session close, leadership loss, and shutdown remove the record. This is a
+one-way observational feed: Data authority and lease evaluation never read
+status state back.
 
 An FDS replacement quiesces the heartbeat producer before publishing the new
 controller projection. A heartbeat already written under the old projection
@@ -461,11 +463,26 @@ grant. A same-anchor heartbeat can extend only a lease that never expired, so
 pre-expiry admissions cannot be revived by a delayed timer.
 
 The encoded directive schema retains bounded `payload`, `preconditions`, and
-`force` fields for a future operation-kind interpreter. V1 defines no such
-semantics: Meta rejects a phase transition carrying non-empty strings or
-`force=true`, and NodeControl repeats that check before the action seam. The
-native adapter therefore never silently treats an unknown predicate or forced
-operation as satisfied.
+`force` fields. V1 appends `initialize-empty-population` after the existing
+directive numbers and uses its payload for exactly one canonical target
+replication-history id. That kind has no source node, source authorization, or
+replication connection; the zero-valued wire source fields are sentinels that
+normalize to an empty domain source. Other v1 kinds still require an empty
+payload, and all kinds require empty preconditions and `force=false`.
+Meta and NodeControl repeat the kind-specific checks before the action seam.
+
+Initialization reuses the ordinary directive, FDS, operation receipt, and
+population-proof lifecycles. NodeControl first closes readiness and serving,
+then passes a source-less `RebuildIdentity` to `ReplicationManager` only after
+the current session, boot, target assignment/history, authority, grant,
+manifest, and partition epoch all match. The manager reuses the durable
+full-sync fence, resets and hands off every physical partition, installs an
+empty Function catalog, promotes the candidate root, and publishes a
+ReadyToken with an empty flow cut. The token remains valid when the completed
+directive disappears from otherwise matching FDS. A definite pre-promotion
+failure stays LOADING and lets Meta abort/fence the operation; an uncertain
+reset, abort, or promotion latches fail-stop until restart and never enables
+lease admission.
 
 Receipt stages distinguish acceptance, execution start, and completion. A
 controller rejection moves directly from
@@ -486,8 +503,12 @@ success, precondition rejection, or runtime failure. Meta durably commits the
 exact
 terminal receipt before returning `ResultCommitted`. With no Data-side journal,
 a lost acknowledgement causes the committed directive to be replayed and its
-idempotent replication identity to resolve the work again; no local record can
-reopen authority after restart.
+idempotent replication identity to resolve the work again. After current
+session, projection, identity and fence checks, NodeControl may return an
+exact still-valid population completion through a non-mutating lookup even
+while that population is serving. This path neither clears readiness nor
+starts work; no match retains all ordinary destructive-admission and drain
+checks. No local result record can reopen authority after restart.
 
 A completed population is content-scoped by group, membership assignment,
 immutable manifest, and partition replication epoch. `BeginGroupTerm` fences
@@ -669,7 +690,9 @@ A real-process plaintext Data-control gate starts three Meta members and a Data
 node, exercising follower-seed redirect, full-state install, heartbeat
 observation, leader failure and reconnect, stale-member restart, and graceful
 shutdown. Separate single-Meta gates cover mTLS identity and TLS/plaintext mode
-selection.
+selection. The cluster-create process gate starts an unregistered, fenced Data
+node and a bootstrap Meta, then exercises both interactive and `--yes` creation
+through real population initialization and Redis Cluster commands.
 
 ## Source map
 
@@ -690,5 +713,5 @@ selection.
 | Startup wiring, storage-ready publication, and SIGHUP reload | `src/redis/server.cpp` |
 | Cluster configuration directives and validation | `include/keylane/server.h`, `src/config.cpp`, `app/keylane.cpp` |
 | Decision matrix, parser, publication, and concurrency unit tests | `tests/cluster_authority_test.cpp`, `tests/cluster_control_port_test.cpp`, `tests/cluster_topology_test.cpp`, `tests/cluster_command_test.cpp` |
-| Real-process Meta/Data discovery, failover, mTLS, and shutdown gate | `tests/meta_integration/gate_data_control.py` |
+| Real-process Meta/Data discovery, failover, mTLS, initial creation, and shutdown gates | `tests/meta_integration/gate_data_control.py`, `tests/meta_integration/gate_cluster_create.py` |
 | Static-cluster routing, admission, policy, and reload end-to-end suite | `tests/cluster_e2e_test.cpp` |

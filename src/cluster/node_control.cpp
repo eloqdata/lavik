@@ -157,7 +157,8 @@ NodeControlActions::ClearSourceAuthorizationsForSessionReplacementAndWait() {
 }
 
 celer::Task<absl::Status> NodeControlActions::ReconcilePopulation(
-    std::optional<PopulationReadiness> /*desired*/, bool /*rebuild_expected*/) {
+    std::optional<PopulationReadiness> /*desired*/,
+    bool /*population_transition_expected*/) {
   co_return absl::OkStatus();
 }
 
@@ -317,17 +318,21 @@ absl::Status NodeControlInstaller::ValidateDirectiveAnchor(
   }
   const PreparedMemberAssignment* source =
       FindMemberAssignment(*control_group, directive.source_node_id_);
-  if (source == nullptr ||
-      source->assignment_id_ != directive.source_assignment_id_) {
+  const bool initializes_empty =
+      directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation;
+  if (!initializes_empty &&
+      (source == nullptr ||
+       source->assignment_id_ != directive.source_assignment_id_)) {
     return absl::FailedPreconditionError(
         "directive source assignment is not current");
   }
 
   const NodeId& local_node_id = current->Self()->node_id_;
-  if (directive.kind_ == NodeDirective::Kind::kReplication) {
+  if (directive.kind_ == NodeDirective::Kind::kReplication ||
+      initializes_empty) {
     if (directive.target_node_id_ != local_node_id) {
       return absl::FailedPreconditionError(
-          "rebuild directive does not execute on its target");
+          "population directive does not execute on its target");
     }
   } else if (directive.source_node_id_ != local_node_id) {
     return absl::FailedPreconditionError(
@@ -337,7 +342,7 @@ absl::Status NodeControlInstaller::ValidateDirectiveAnchor(
 }
 
 absl::Status NodeControlInstaller::ValidateDirectiveForStart(
-    const NodeDirective& directive) {
+    const NodeDirective& directive, bool replay_lookup) {
   if (storage_failed_) {
     return absl::FailedPreconditionError(
         "storage failed during this boot; directive execution requires "
@@ -347,11 +352,22 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
     return absl::UnavailableError(
         "source authority cleanup is still in progress");
   }
-  if (!directive.payload_.empty() || !directive.preconditions_.empty() ||
+  const bool initializes_empty =
+      directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation;
+  const bool payload_valid =
+      initializes_empty
+          ? directive.payload_.size() == 40 &&
+                std::all_of(directive.payload_.begin(),
+                            directive.payload_.end(), [](unsigned char value) {
+                              return (value >= '0' && value <= '9') ||
+                                     (value >= 'a' && value <= 'f');
+                            })
+          : directive.payload_.empty();
+  if (!payload_valid || !directive.preconditions_.empty() ||
       directive.force_) {
     return absl::InvalidArgumentError(
-        "directive payload, preconditions, and force are reserved in "
-        "control protocol v1");
+        "control protocol v1 permits only the initialization history payload; "
+        "preconditions and force remain reserved");
   }
   if (const absl::Status projection = ValidateProjection(directive.projection_);
       !projection.ok()) {
@@ -360,12 +376,22 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
   if (directive.operation_id_.empty() || directive.directive_id_.empty() ||
       directive.attempt_id_.empty() || directive.directive_revision_ == 0 ||
       directive.target_node_id_.empty() || directive.target_boot_id_.empty() ||
-      directive.source_node_id_.empty() ||
-      directive.source_assignment_id_.empty() ||
-      directive.source_boot_id_.empty() ||
-      directive.source_replication_history_id_.empty()) {
+      (!initializes_empty &&
+       (directive.source_node_id_.empty() ||
+        directive.source_assignment_id_.empty() ||
+        directive.source_boot_id_.empty() ||
+        directive.source_replication_history_id_.empty()))) {
     return absl::InvalidArgumentError(
         "directive execution identity is incomplete");
+  }
+  if (initializes_empty &&
+      (!directive.source_node_id_.empty() ||
+       !directive.source_assignment_id_.empty() ||
+       !directive.source_boot_id_.empty() ||
+       !directive.source_replication_history_id_.empty() ||
+       !directive.source_host_.empty() || directive.source_port_ != 0)) {
+    return absl::InvalidArgumentError(
+        "empty population directive must not carry a source identity");
   }
   if (const absl::Status anchor = ValidateDirectiveAnchor(directive);
       !anchor.ok()) {
@@ -377,7 +403,8 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
   // group counter floor. Otherwise a former owner could reopen an export
   // capability merely because a later directive names a different target.
   AuthorityAnchor local_anchor = directive.anchor_;
-  if (directive.kind_ != NodeDirective::Kind::kReplication) {
+  if (directive.kind_ != NodeDirective::Kind::kReplication &&
+      !initializes_empty) {
     local_anchor.assignment_id_ = directive.source_assignment_id_;
   }
   if (RejectedByFence(local_anchor)) {
@@ -386,19 +413,22 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
   }
   const std::shared_ptr<const ServingState> current = topology_.Current();
   const GroupView* group = current->FindGroup(directive.anchor_.group_id_);
-  if (directive.kind_ == NodeDirective::Kind::kReplication) {
+  if (directive.kind_ == NodeDirective::Kind::kReplication ||
+      initializes_empty) {
     const bool local_serving_owner =
         group != nullptr &&
         group->primary_node_index_ == current->SelfNodeIndex() &&
         group->granted_ && group->population_ready_ && group->storage_ready_;
-    if (!directive.storage_mutating_ || local_serving_owner) {
+    if (!directive.storage_mutating_ ||
+        (!replay_lookup && local_serving_owner)) {
       return absl::FailedPreconditionError(
-          "rebuild requires a non-serving local target assignment");
+          "population mutation requires a non-serving local target assignment");
     }
-    if (DrainPending(directive.anchor_.group_id_) ||
-        current->GroupInFlightCount(directive.anchor_.group_id_) != 0) {
+    if (!replay_lookup &&
+        (DrainPending(directive.anchor_.group_id_) ||
+         current->GroupInFlightCount(directive.anchor_.group_id_) != 0)) {
       return absl::UnavailableError(
-          "rebuild target still has in-flight requests");
+          "population target still has in-flight requests");
     }
   } else if (directive.kind_ == NodeDirective::Kind::kAuthorizeSource &&
              DrainPending(directive.anchor_.group_id_)) {
@@ -406,15 +436,17 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
         "source authorization waits for the retired assignment to drain");
   } else if (directive.storage_mutating_) {
     return absl::InvalidArgumentError(
-        "only rebuild directives may mutate storage");
+        "only population directives may mutate storage");
   }
   if (directive.kind_ != NodeDirective::Kind::kRevokeSources &&
-      (directive.flow_count_ == 0 || directive.manifest_revision_ == 0 ||
+      ((initializes_empty ? directive.flow_count_ != 0
+                          : directive.flow_count_ == 0) ||
+       directive.manifest_revision_ == 0 ||
        std::all_of(directive.manifest_digest_.begin(),
                    directive.manifest_digest_.end(),
                    [](std::uint8_t byte) { return byte == 0; }))) {
     return absl::InvalidArgumentError(
-        "rebuild directive is missing flow or manifest identity");
+        "population directive is missing its flow or manifest identity");
   }
   if (directive.kind_ == NodeDirective::Kind::kReplication &&
       (directive.source_host_.empty() || directive.source_port_ == 0)) {
@@ -827,7 +859,7 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
 
 celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
     PreparedFullState prepared_state, ProjectionBasis projection_basis,
-    bool local_rebuild_expected) {
+    bool local_population_transition_expected) {
   ControlTransitionGuard transition_guard(*this);
   InvalidateDirectiveAdmissions();
 
@@ -867,7 +899,8 @@ celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
   actions = FirstFailure(
       std::move(actions),
       co_await actions_.ReconcilePopulation(
-          reconciled_population, !storage_failed_ && local_rebuild_expected));
+          reconciled_population,
+          !storage_failed_ && local_population_transition_expected));
   for (const AuthorityAnchor& anchor : effects.retired_) {
     actions =
         FirstFailure(std::move(actions), actions_.DrainAssignment(anchor));
@@ -1175,6 +1208,19 @@ celer::Task<NodeDirectiveCompletion> NodeControlInstaller::StartDirective(
   const auto terminal = [](absl::Status status) {
     return NodeDirectiveCompletion::Rejected(std::move(status));
   };
+  // Re-reporting an exact completed result is not a storage mutation. Keep
+  // all session/FDS/fence/identity checks, but do not require an already-Ready
+  // owner to stop serving or drain client writes merely to repeat its result.
+  // The adapter's lookup cannot start work; no match uses every normal guard.
+  if (directive.kind_ == NodeDirective::Kind::kReplication ||
+      directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation) {
+    if (auto valid =
+            ValidateDirectiveForStart(directive, /*replay_lookup=*/true);
+        !valid.ok())
+      co_return terminal(std::move(valid));
+    if (auto completed = actions_.FindCompletedPopulation(directive))
+      co_return std::move(*completed);
+  }
   if (absl::Status valid = ValidateDirectiveForStart(directive); !valid.ok()) {
     co_return terminal(std::move(valid));
   }
@@ -1191,7 +1237,8 @@ celer::Task<NodeDirectiveCompletion> NodeControlInstaller::StartDirective(
       --*count_;
     }
   } admission_guard{&directive_admissions_in_flight_};
-  if (directive.kind_ == NodeDirective::Kind::kReplication) {
+  if (directive.kind_ == NodeDirective::Kind::kReplication ||
+      directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation) {
     // Publish fail-closed state before ReplicationManager reaches any
     // destructive reset. A rejected or failed admission deliberately leaves
     // the target unready; only a matching ReadyToken may reopen it.

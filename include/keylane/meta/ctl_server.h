@@ -42,11 +42,14 @@
 //                             fail-safe before archival.
 //   getop <id32hex>        -> "OK submitted" / "OK running" /
 //                             "OK completed <result>" / "OK aborted <reason>"
-//                             / "ERR not-found". Reads the state machine's
-//                             committed operation journal directly; this is
-//                             NOT a linearizable read (no read-index round or
-//                             leader lease check), so a stale follower
-//                             may answer from an older commit index.
+//                             / "ERR not-found".
+//                             Non-terminal creation/membership workflows
+//                             additionally include phase=<durable
+//                             phase/recovery reason>. Reads the committed
+//                             operation journal directly; this is NOT a
+//                             linearizable read (no read-index round or leader
+//                             lease check), so a stale follower may answer from
+//                             an older commit index.
 //   registernode <node_id40hex> <principal> <primary|replica>
 //                <data-endpoint> [<data-endpoint>]
 //                          -> propose RegisterNode with zero capability mask;
@@ -87,14 +90,29 @@
 //                             the current caught-up Leader, or a typed
 //                             retryable error. Capture is single-flight and
 //                             never probes followers.
+//   clustercreate 1 <hex>  -> leader-owned v1 single-Meta/single-Data
+//                             creation workflow. The bounded payload contains
+//                             only normalized topology and a wait budget;
+//                             generated revisions, assignment, operation, and
+//                             epoch identities remain server-owned. Success
+//                             returns a committed index observing completion
+//                             and operation id; failures name a stage and
+//                             stable code. Creation and membership changes
+//                             share admission across all Admin listeners; a
+//                             competing creator gets preflight/domain-rejected
+//                             without proposing.
 //   addsrv <id> <raft-ip:port> <data-control-ip:port> <ctl-ip:port>
 //          [<keylane://meta/id>]
-//                          -> first commits the member identity, then returns
-//                             "OK" / "ERR <code>" from NuRaft add_srv. The
+//                          -> persists a membership workflow before binding
+//                             identity or invoking NuRaft. "OK" means the
+//                             exact configuration and identity are committed.
+//                             A wait timeout returns uncertain-outcome with
+//                             an operation id; the leader keeps retrying.
+//                             Identical retries attach to the same task. The
 //                             optional principal defaults to the canonical
 //                             identity for that member id.
-//   removesrv <id>         -> "OK" / "ERR <code>" from NuRaft remove_srv.
-//                             A successful removal then retires the committed
+//   removesrv <id>         -> the same durable workflow/wait contract. Only a
+//                             committed removal retires the committed
 //                             member identity.
 //   exportaudit <through>  -> "OK <hex>" versioned, hash-chained export.
 //   pruneaudit <through>   -> replicated prefix prune; callers must durably
@@ -301,6 +319,8 @@ class MetaClusterStatusService {
   std::atomic<std::size_t> retained_reply_bytes_{0};
 };
 
+class MetaClusterCreateReconciler;
+
 struct MetaCtlServerOptions {
   enum class Transport : std::uint8_t { kUnix, kTcpPlaintext, kTcpMtls };
   Transport transport_ = Transport::kUnix;
@@ -323,6 +343,9 @@ struct MetaCtlServerOptions {
   std::string local_ctl_endpoint_;
   std::shared_ptr<MetaClusterStatusService> cluster_status_service_;
   std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status_;
+  // Shared background owner; listeners submit durable intent and only wait.
+  std::shared_ptr<MetaClusterCreateReconciler> cluster_create_reconciler_;
+  std::shared_ptr<class MetaMembershipReconciler> membership_reconciler_;
   std::uint32_t observation_ttl_ms_ = 30000;
 };
 
@@ -342,6 +365,8 @@ class MetaCtlServer {
       // Non-owning: process assembly must keep the executor alive until the
       // Celer worker and all ctl session coroutines have stopped.
       MetaProposalExecutor& proposal_executor,
+      // All listeners for this Meta process must share the same gate, covering
+      // both membership changes and the complete cluster-create workflow.
       std::shared_ptr<MetaMembershipGate> membership_gate,
       MetaCtlServerOptions options);
 
@@ -355,6 +380,8 @@ class MetaCtlServer {
   // Connections are accepted only after Start(). The bind itself runs on the
   // worker asynchronously; check status() afterwards.
   void Start();
+  // Cancels result waits and drains local sessions; committed background
+  // creation is not aborted or rolled back when an Admin waiter goes away.
   void Shutdown();
 
   // Result of the asynchronous bind: kUnavailable until the worker reports.

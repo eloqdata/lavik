@@ -199,6 +199,8 @@ MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {
   MetaCommittedStatusView view;
   view.applied_index_ = last_committed_idx_.load(std::memory_order_relaxed);
   view.topology_epoch_ = stores_.topology_.TopologyEpoch();
+  view.active_cluster_create_operation_ = stores_.operation_.HasActiveKind(
+      kMetaClusterCreateOperationKind);
   view.meta_members_ = stores_.identity_.MetaMembers();
   view.data_nodes_ = stores_.identity_.Nodes();
   for (MetaTopologyGroupView topology : stores_.topology_.Groups()) {

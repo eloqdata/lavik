@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -107,13 +108,48 @@ inline constexpr std::uint32_t kMaxMetaEndpointBytes = 256;
 inline constexpr std::uint32_t kMaxMetaPolicyIdBytes = 128;
 inline constexpr std::uint32_t kMaxMetaPolicyReferencesPerOperation = 16;
 inline constexpr std::uint32_t kMaxMetaOperationKindBytes = 64;
+inline constexpr std::string_view kMetaClusterCreateOperationKind =
+    "cluster-create-workflow-v1";
+inline constexpr std::string_view kMetaMembershipOperationKind =
+    "meta-membership-workflow-v1";
+// Keep the original boot/history-bound population kind distinct from the
+// new pre-topology workflow. Old WAL entries retain their apply semantics;
+// recovery never guesses a full creation intent from a legacy partial task.
+inline constexpr std::string_view kMetaClusterCreatePopulationOperationKind =
+    "cluster-create-v1";
 inline constexpr std::uint32_t kMaxMetaEvidenceSummariesPerCommand = 64;
 inline constexpr std::uint32_t kMaxMetaDirectivesPerOperation = 64;
 inline constexpr std::uint32_t kMaxMetaDirectiveKindBytes = 64;
-// Payload and preconditions retain separate bounded schema slots for a future
-// operation-kind interpreter. Control protocol v1 rejects non-empty values
-// (and force=true) at Meta transition apply and again at Data admission rather
-// than silently treating an unknown execution contract as satisfied.
+// Durable directive names and their execution-side classification live with
+// the command schema. Keeping these predicates here prevents stores,
+// projectors, and control-session handlers from independently reconstructing
+// recipient and mutation semantics when a new kind is appended.
+inline constexpr std::string_view kMetaDirectiveRebuild = "rebuild";
+inline constexpr std::string_view kMetaDirectiveAuthorizeSource =
+    "authorize-source";
+inline constexpr std::string_view kMetaDirectiveRevokeSources =
+    "revoke-sources";
+inline constexpr std::string_view kMetaDirectiveInitializeEmptyPopulation =
+    "initialize-empty-population";
+
+inline constexpr bool IsMetaPopulationDirective(std::string_view kind) {
+  return kind == kMetaDirectiveRebuild ||
+         kind == kMetaDirectiveInitializeEmptyPopulation;
+}
+
+inline constexpr bool IsMetaSourceDirective(std::string_view kind) {
+  return kind == kMetaDirectiveAuthorizeSource ||
+         kind == kMetaDirectiveRevokeSources;
+}
+
+inline constexpr bool IsKnownMetaDirective(std::string_view kind) {
+  return IsMetaPopulationDirective(kind) || IsMetaSourceDirective(kind);
+}
+
+// Directive kinds define their own bounded payload contracts;
+// initialize-empty-population carries the authenticated target history ID.
+// Preconditions remain reserved and force=true is rejected at Meta transition
+// apply and again at Data admission rather than silently weakening execution.
 inline constexpr std::uint32_t kMaxMetaDirectivePreconditionsBytes =
     kMaxMetaPayloadBytes;
 // Receipt retention shares the operation evidence horizon: both are
@@ -475,9 +511,10 @@ struct SubmitOperation {
 struct MetaDirectiveSpec {
   MetaDirectiveId directive_id_{};
   MetaAttemptId attempt_id_{};
-  // Node that executes this directive. Rebuild runs on target_node_id_, while
-  // source authorization and revocation run on source_node_id_. Keeping this
-  // explicit prevents delivery routing from rewriting the rebuild identity.
+  // Node that executes this directive. Population mutations run on
+  // target_node_id_, while source authorization and revocation run on
+  // source_node_id_. Keeping this explicit prevents delivery routing from
+  // rewriting the durable population identity.
   std::string recipient_node_id_;
   std::string target_node_id_;
   // Incarnation and authority anchors are part of the durable intent. A
@@ -502,13 +539,13 @@ struct MetaDirectiveSpec {
   MetaHash256 population_manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
   std::string kind_;
-  // Reserved v1 schema strings. Codecs preserve them for fail-loud future
-  // format evolution, but executable v1 directives require both empty.
+  // V1 uses payload only for initialize-empty-population's authenticated
+  // target history id. Preconditions remain reserved for future evolution.
   std::string payload_;
   std::string preconditions_;
   // Active classification used to exclude concurrent mutations of the same
-  // target assignment. The executable V1 projector requires it for rebuild
-  // and forbids it for source authorization or revocation.
+  // target assignment. The executable V1 projector requires it for population
+  // directives and forbids it for source authorization or revocation.
   bool storage_mutating_ = false;
   // Reserved execution override; executable V1 directives require false.
   bool force_ = false;

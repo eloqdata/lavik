@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/strings/str_cat.h"
 #include "celer/io/storage.h"
 #include "celer/net/connection.h"
 #include "celer/net/tcp_listener.h"
@@ -37,19 +38,24 @@
 #include "libnuraft/async.hxx"
 #include "libnuraft/buffer.hxx"
 #include "libnuraft/cluster_config.hxx"
+#include "libnuraft/raft_params.hxx"
 #include "libnuraft/raft_server.hxx"
 #include "libnuraft/srv_config.hxx"
 #pragma GCC diagnostic pop
 
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/cluster/control_transport.h"
+#include "keylane/meta/cluster_create.h"
+#include "keylane/meta/cluster_create_reconciler.h"
 #include "keylane/meta/cluster_status.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/data_control_runtime_status.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/identity_verifier.h"
+#include "keylane/meta/membership_reconciler.h"
 #include "keylane/meta/observation_store.h"
+#include "keylane/meta/population_manifest_store.h"
 #include "keylane/meta/proposal_executor.h"
 #include "keylane/meta/state_machine.h"
 #include "keylane/numeric_endpoint.h"
@@ -402,6 +408,12 @@ std::string BuildClusterStatusReply(
   };
   status.meta_available_ = true;
   status.meta_members_ = StatusMembers(active_meta_members, server->get_id());
+  if (view.active_cluster_create_operation_) {
+    status.blockers_.push_back(
+        {.code_ = std::string(kClusterCreateActiveBlockerCode),
+         .scope_ = "cluster",
+         .detail_ = "non_terminal_cluster_create_operation_exists"});
+  }
 
   std::vector<std::uint32_t> committed_ids;
   std::vector<std::string> ctl_endpoints;
@@ -636,38 +648,6 @@ std::string BuildClusterStatusReply(
   return *encoded;
 }
 
-// Reply tokens for the NuRaft result codes the gate can plausibly hit;
-// kept whitespace-free so a reply line always parses as "ERR <token>".
-std::string CmdResultToken(nuraft::cmd_result_code code) {
-  switch (code) {
-    case nuraft::cmd_result_code::OK:
-      return "ok";
-    case nuraft::cmd_result_code::CANCELLED:
-      return "cancelled";
-    case nuraft::cmd_result_code::TIMEOUT:
-      return "timeout";
-    case nuraft::cmd_result_code::NOT_LEADER:
-      return "not-leader";
-    case nuraft::cmd_result_code::BAD_REQUEST:
-      return "bad-request";
-    case nuraft::cmd_result_code::SERVER_ALREADY_EXISTS:
-      return "already-exists";
-    case nuraft::cmd_result_code::CONFIG_CHANGING:
-      return "config-changing";
-    case nuraft::cmd_result_code::SERVER_IS_JOINING:
-      return "joining";
-    case nuraft::cmd_result_code::SERVER_NOT_FOUND:
-      return "not-found";
-    case nuraft::cmd_result_code::CANNOT_REMOVE_LEADER:
-      return "cannot-remove-leader";
-    case nuraft::cmd_result_code::SERVER_IS_LEAVING:
-      return "leaving";
-    case nuraft::cmd_result_code::TERM_MISMATCH:
-      return "term-mismatch";
-    default:
-      return "code-" + std::to_string(static_cast<int>(code));
-  }
-}
 
 const char* AuditPolicyName(MetaAuditPolicy policy) {
   switch (policy) {
@@ -771,29 +751,30 @@ void CompleteAsyncReply(
   }
 }
 
-// Opaque request_id for audit correlation. It is generated before proposal;
-// apply never manufactures randomness, preserving deterministic replay. A
-// failure of the OS CSPRNG is a process-safety failure: continuing with a
-// guessed or reused id would break the idempotency boundary.
-MetaRequestId MakeRequestId() {
+// Ids are generated before proposal; apply never manufactures randomness,
+// preserving deterministic replay. A CSPRNG failure is a process-safety
+// failure because continuing with a guessed or reused id would break the
+// idempotency boundary.
+cluster::control::WireId128 MakeRequiredId(std::string_view purpose) {
   auto id = cluster::control::GenerateId128();
   if (!id.ok()) {
-    spdlog::critical("OS CSPRNG failed while generating Meta request id: {}",
+    spdlog::critical("OS CSPRNG failed while generating {}: {}", purpose,
                      id.status().message());
     std::terminate();
   }
   return *id;
 }
 
+MetaRequestId MakeRequestId() {
+  return MakeRequiredId("Meta request id");
+}
+
 MetaAssignmentId MakeAssignmentId() {
-  auto id = cluster::control::GenerateId128();
-  if (!id.ok()) {
-    spdlog::critical(
-        "OS CSPRNG failed while generating membership assignment id: {}",
-        id.status().message());
-    std::terminate();
-  }
-  return *id;
+  return MakeRequiredId("membership assignment id");
+}
+
+MetaOperationId MakeOperationId() {
+  return MakeRequiredId("operation id");
 }
 
 int HexNybble(char c) {
@@ -998,6 +979,7 @@ celer::Task<std::string> HandleSubmitOp(
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& kind, const std::string& payload,
     const MetaReplicationHistoryId& replication_history_id) {
+  if (kind == kMetaMembershipOperationKind) co_return "ERR workflow-owned";
   SubmitOperation command;
   command.request_id_ = MakeRequestId();
   command.operation_id_ = id;
@@ -1039,6 +1021,10 @@ celer::Task<std::string> HandleCompleteOp(
   if (IsTerminal(record->lifecycle_)) {
     co_return "ERR terminal";
   }
+  // Releasing this reservation while NuRaft still owns an accepted invite or
+  // leave would allow a second workflow to overtake its uncertain outcome.
+  if (record->kind_ == kMetaMembershipOperationKind)
+    co_return "ERR workflow-owned";
   CompleteOperation command;
   command.request_id_ = MakeRequestId();
   command.operation_id_ = id;
@@ -1072,6 +1058,8 @@ celer::Task<std::string> HandleAbortOp(
   if (IsTerminal(record->lifecycle_)) {
     co_return "ERR terminal";
   }
+  if (record->kind_ == kMetaMembershipOperationKind)
+    co_return "ERR workflow-owned";
   AbortOperation command;
   command.request_id_ = MakeRequestId();
   command.operation_id_ = id;
@@ -1103,6 +1091,13 @@ std::string HandleGetOp(nuraft::ptr<MetaStateMachine> state_machine,
   if (IsTerminal(record->lifecycle_)) {
     return std::string("OK ") + LifecycleName(record->lifecycle_) + " " +
            record->terminal_result_;
+  }
+  if (record->kind_ == kMetaClusterCreateOperationKind ||
+      record->kind_ == kMetaMembershipOperationKind) {
+    return absl::StrCat("OK ", LifecycleName(record->lifecycle_), " phase=",
+                        record->kind_phase_blob_.empty()
+                            ? "submitted"
+                            : record->kind_phase_blob_);
   }
   return std::string("OK ") + LifecycleName(record->lifecycle_);
 }
@@ -1409,6 +1404,124 @@ celer::Task<std::string> HandleTransitionOp(
   co_return reply;
 }
 
+std::string ClusterCreateError(std::string_view stage, std::string_view code,
+                               std::string detail) {
+  std::replace(detail.begin(), detail.end(), '\n', ' ');
+  std::replace(detail.begin(), detail.end(), '\r', ' ');
+  return absl::StrCat("ERR clustercreate 1 ", stage, " ", code, " ",
+                      detail);
+}
+
+// Admission persists the whole plan BEFORE topology mutation. The leader
+// reconciler, not this connection or its timeout, owns all subsequent work.
+celer::Task<std::string> HandleClusterCreate(
+    const nuraft::ptr<nuraft::raft_server>& server,
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    const std::shared_ptr<MetaMembershipGate>& membership_gate,
+    AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest,
+    std::uint32_t wait_timeout_ms, const bool* shutdown) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(wait_timeout_ms);
+  if (*shutdown)
+    co_return ClusterCreateError("preflight", "uncertain-outcome",
+                                 "Meta is shutting down");
+  auto create_lease = membership_gate->TryAcquire();
+  if (create_lease == nullptr) {
+    co_return ClusterCreateError(
+        "preflight", "domain-rejected",
+        "another cluster creation or Meta membership change is in progress");
+  }
+  if (!server->is_leader() || !server->is_leader_alive() ||
+      !server->is_leader_sm_fully_caught_up()) {
+    co_return ClusterCreateError("preflight", "not-leader",
+                                 "responder is not an eligible leader");
+  }
+  const auto status = state_machine->StatusSnapshot();
+  const auto active_members = ActiveMetaMembers(status);
+  const auto config_ids = ConfigServerIds(server->get_config());
+  const auto before = state_machine->StoresSnapshot();
+  if (status.active_cluster_create_operation_ ||
+      before.operation_.HasActiveKind(kMetaMembershipOperationKind)) {
+    co_return ClusterCreateError("preflight", "domain-rejected",
+                                 "another cluster creation is in progress");
+  }
+  if (active_members.size() != 1 || config_ids.size() != 1 ||
+      active_members.front().server_id_ != manifest.meta_member_id_ ||
+      config_ids.front() != manifest.meta_member_id_ ||
+      before.identity_.NodeCount() != 0 || before.topology_.GroupCount() != 0 ||
+      !status.slot_ranges_.empty() || before.population_manifest_.Size() != 0) {
+    co_return ClusterCreateError("preflight", "non-empty-cluster",
+                                 "requires one matching Meta member and empty "
+                                 "Data, Group, slot, population state");
+  }
+  // A fixed wait budget makes intent independent of a particular Admin
+  // connection. The existing versioned codec retains every normalized field.
+  auto intent = EncodeClusterCreateRequest(manifest, 1);
+  if (!intent.ok())
+    co_return ClusterCreateError("preflight", "bad-request",
+                                 std::string(intent.status().message()));
+  SubmitOperation submit;
+  submit.request_id_ = MakeRequestId();
+  submit.operation_id_ = MakeOperationId();
+  submit.kind_ = kMetaClusterCreateOperationKind;
+  submit.intent_ = *intent;
+  submit.intent_hash_ = MetaSha256(submit.intent_);
+  const auto operation_id = submit.operation_id_;
+  const std::string id = HexEncode(std::string_view(
+      reinterpret_cast<const char*>(operation_id.data()), operation_id.size()));
+  const auto reply =
+      co_await ProposeCommand(coordinator, std::move(principal), submit);
+  if (!reply.starts_with("OK ")) {
+    co_return ClusterCreateError("submit-operation", "uncertain-outcome",
+                                 absl::StrCat(reply, " operation=", id));
+  }
+  if (!state_machine->FindOperation(operation_id).has_value())
+    co_return ClusterCreateError("submit-operation", "domain-rejected",
+                                 "committed intent is absent");
+  // Durable admission bridges the handoff to the background lease. Membership
+  // handlers also check HasActiveKind, including after process restart.
+  create_lease.reset();
+  std::string phase = "register-data";
+  while (std::chrono::steady_clock::now() < deadline) {
+    // Closing the Admin socket does not cancel a suspended coroutine. This
+    // worker-owned flag must be checked even while Raft still reports leader:
+    // process teardown drains Admin BEFORE stopping Raft.
+    if (*shutdown || !server->is_leader() || !server->is_leader_alive()) {
+      co_return ClusterCreateError(
+          phase, "uncertain-outcome",
+          absl::StrCat("wait cancelled; durable operation=", id));
+    }
+    const auto operation = state_machine->FindOperation(operation_id);
+    if (!operation.has_value())
+      co_return ClusterCreateError(phase, "uncertain-outcome",
+                                   "operation disappeared");
+    if (operation->lifecycle_ == MetaOperationLifecycle::kCompleted) {
+      co_return absl::StrCat("OK clustercreate 1 ",
+                             state_machine->StatusSnapshot().applied_index_,
+                             " ", id);
+    }
+    if (operation->lifecycle_ == MetaOperationLifecycle::kAborted) {
+      co_return ClusterCreateError(phase, "data-rejected",
+                                   operation->terminal_result_);
+    }
+    if (!operation->kind_phase_blob_.empty())
+      phase = operation->kind_phase_blob_;
+    if (phase.starts_with("recovery-required:")) {
+      co_return ClusterCreateError("recovery", "domain-rejected",
+                                   absl::StrCat(phase, " operation=", id));
+    }
+    const auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                                std::chrono::milliseconds(10));
+    if (!slept.ok()) break;
+  }
+  co_return ClusterCreateError(
+      phase, "uncertain-outcome",
+      absl::StrCat(
+          "wait deadline expired; background creation continues; operation=",
+          id));
+}
+
 celer::Task<std::string> HandlePruneAudit(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, std::uint64_t through) {
@@ -1564,132 +1677,141 @@ celer::Task<std::string> HandleConfigChange(
     nuraft::ptr<nuraft::raft_server> server,
     nuraft::ptr<MetaStateMachine> state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    AuthenticatedPrincipal principal, celer::ForeignExecutor foreign_executor,
-    MetaProposalExecutor& proposal_executor,
+    AuthenticatedPrincipal principal,
     const std::shared_ptr<MetaMembershipGate>& membership_gate, bool add,
-    int server_id, const std::string& endpoint,
-    const std::string& data_control_endpoint, const std::string& ctl_endpoint,
-    std::string_view local_data_control_endpoint,
-    std::string_view local_ctl_endpoint, const std::string& member_principal) {
-  std::unique_ptr<MetaMembershipGate::Lease> config_lease =
-      membership_gate->TryAcquire();
-  if (config_lease == nullptr) co_return "ERR config-changing";
-  if (!server->is_leader()) {
+    int server_id, std::string endpoint, std::string data_control_endpoint,
+    std::string ctl_endpoint, const std::string& member_principal,
+    const bool* shutdown) {
+  if (*shutdown) co_return "ERR shutting-down";
+  if (!server->is_leader() || !server->is_leader_alive() ||
+      !server->is_leader_sm_fully_caught_up())
     co_return "ERR not-leader";
-  }
-  // Bind the bootstrap member (and any legacy configuration) into the
-  // committed identity store before the next membership mutation. Permission
-  // always requires BOTH this binding and NuRaft's committed config aux.
-  const nuraft::ptr<nuraft::cluster_config> current_config =
-      server->get_config();
-  if (current_config == nullptr) {
-    co_return "ERR no-config";
-  }
-  for (const nuraft::ptr<nuraft::srv_config>& member :
-       current_config->get_servers()) {
-    if (member == nullptr) continue;
-    auto descriptor = MetaMemberIdentity::DecodeAux(member->get_aux());
-    if (!descriptor.ok()) co_return "ERR bad-member-identity";
-    const auto existing =
-        state_machine->StoresSnapshot().identity_.FindMetaMember(
-            static_cast<std::uint32_t>(member->get_id()));
-    if (existing.has_value() && !existing->retired_) {
-      if (add && !existing->ctl_endpoint_.has_value()) {
-        co_return "ERR missing-ctl-endpoint";
-      }
-      continue;
-    }
-    if (existing.has_value() && existing->retired_) {
-      // NuRaft may briefly expose the just-removed member while its leave
-      // bookkeeping drains. Do not try to reactivate the terminal binding;
-      // report the same retryable state as a concurrent config mutation.
-      co_return "ERR config-changing";
-    }
-    BindMetaMember bind;
-    bind.request_id_ = MakeRequestId();
-    bind.server_id_ = static_cast<std::uint32_t>(descriptor->server_id_);
-    bind.principal_ = descriptor->principal_;
-    if (member->get_id() != server->get_id() ||
-        local_data_control_endpoint.empty() || local_ctl_endpoint.empty()) {
-      // Members added through `addsrv` already have a durable record.
-      // The only record that may be absent is the bootstrap member, whose
-      // advertised endpoint comes from this process's mandatory option.
-      co_return "ERR missing-data-control-endpoint";
-    }
-    bind.data_control_endpoint_ = std::string(local_data_control_endpoint);
-    bind.ctl_endpoint_ = std::string(local_ctl_endpoint);
-    std::string bound = co_await ProposeCommand(coordinator, principal, bind);
-    if (bound.rfind("OK ", 0) != 0) co_return bound;
-  }
-  nuraft::ptr<nuraft::srv_config> add_config;
   if (add) {
-    const MetaMemberIdentity identity{server_id, member_principal};
-    auto canonical = MetaMemberIdentity::DecodeAux(identity.EncodeAux());
-    if (!canonical.ok()) {
-      co_return "ERR bad-member-identity";
+    // Persist the same canonical addresses as the identity store. Otherwise
+    // an equivalent IPv6/port spelling would appear to diverge after bind,
+    // or a retry could fail to recognize its original operation.
+    auto raft = keylane::ParseNumericEndpoint(endpoint);
+    auto data = keylane::ParseNumericEndpoint(data_control_endpoint);
+    auto ctl = keylane::ParseNumericEndpoint(ctl_endpoint);
+    if (!raft) co_return "ERR bad-request";
+    if (!data || !ctl) co_return "ERR rejected";
+    endpoint = keylane::FormatNumericEndpoint(*raft);
+    data_control_endpoint = keylane::FormatNumericEndpoint(*data);
+    ctl_endpoint = keylane::FormatNumericEndpoint(*ctl);
+  }
+  const auto before = state_machine->StoresSnapshot();
+  if (before.operation_.HasActiveKind(kMetaClusterCreateOperationKind))
+    co_return "ERR config-changing";
+  std::optional<MetaOperationId> operation_id;
+  // Retrying an identical in-flight request attaches to its original task.
+  // Different requests must not overtake an uncertain membership outcome.
+  for (const auto& op : before.operation_.LiveOperations()) {
+    if (op.kind_ != kMetaMembershipOperationKind || IsTerminal(op.lifecycle_))
+      continue;
+    auto intent = DecodeMembershipIntent(op.intent_);
+    if (!intent.ok() || intent->add_ != add ||
+        intent->target_.id_ != static_cast<std::uint32_t>(server_id) ||
+        (add &&
+         (intent->target_.endpoint_ != endpoint ||
+          intent->target_.principal_ != member_principal ||
+          intent->binding_.data_control_endpoint_ != data_control_endpoint ||
+          intent->binding_.ctl_endpoint_ != std::optional(ctl_endpoint))))
+      co_return "ERR config-changing";
+    operation_id = op.operation_id_;
+    break;
+  }
+  if (!operation_id) {
+    auto lease = membership_gate->TryAcquire();
+    if (!lease) co_return "ERR config-changing";
+    auto config = CaptureMembershipConfig(server->get_config());
+    if (!config.ok()) co_return "ERR bad-member-identity";
+    auto peer =
+        std::find_if(config->begin(), config->end(), [&](const auto& p) {
+          return p.id_ == static_cast<std::uint32_t>(server_id);
+        });
+    if (add && peer != config->end()) co_return "ERR already-exists";
+    if (!add && server_id == server->get_id())
+      co_return "ERR cannot-remove-leader";
+    if (!add && peer == config->end()) {
+      auto binding = before.identity_.FindMetaMember(server_id);
+      co_return binding && binding->retired_ ? "OK" : "ERR not-found";
     }
-    BindMetaMember bind;
-    bind.request_id_ = MakeRequestId();
-    bind.server_id_ = static_cast<std::uint32_t>(server_id);
-    bind.principal_ = member_principal;
-    bind.data_control_endpoint_ = data_control_endpoint;
-    bind.ctl_endpoint_ = ctl_endpoint;
-    std::string bound = co_await ProposeCommand(coordinator, principal, bind);
-    if (bound.rfind("OK ", 0) != 0) co_return bound;
-    add_config = nuraft::cs_new<nuraft::srv_config>(
-        server_id, /*dc_id=*/0, endpoint, identity.EncodeAux(),
-        /*learner=*/false);
+    MetaMembershipIntent intent;
+    intent.add_ = add;
+    intent.before_ = *config;
+    for (const auto& p : *config) {
+      auto binding = before.identity_.FindMetaMember(p.id_);
+      // The Data publisher owns bootstrap binding; never persist an intent
+      // reconstructed from this process's guesses about remote endpoints.
+      if (!binding || binding->retired_ || binding->principal_ != p.principal_)
+        co_return "ERR config-changing";
+      if (add && !binding->ctl_endpoint_) co_return "ERR missing-ctl-endpoint";
+      intent.bindings_.push_back(*binding);
+    }
+    if (add) {
+      if (!keylane::ParseNumericEndpoint(endpoint).has_value())
+        co_return "ERR bad-request";
+      intent.target_ = {static_cast<std::uint32_t>(server_id), endpoint,
+                        member_principal};
+      intent.binding_ = {static_cast<std::uint32_t>(server_id),
+                         member_principal, data_control_endpoint, ctl_endpoint,
+                         false};
+      BindMetaMember bind;
+      bind.server_id_ = server_id;
+      bind.principal_ = member_principal;
+      bind.data_control_endpoint_ = data_control_endpoint;
+      bind.ctl_endpoint_ = ctl_endpoint;
+      auto identity = before.identity_;
+      if (!identity.Apply(bind).ok()) co_return "ERR rejected";
+    } else {
+      intent.target_ = *peer;
+      intent.binding_ = *before.identity_.FindMetaMember(server_id);
+    }
+    auto encoded = EncodeMembershipIntent(intent);
+    if (!encoded.ok()) co_return "ERR rejected";
+    SubmitOperation submit;
+    submit.request_id_ = MakeRequestId();
+    submit.operation_id_ = MakeOperationId();
+    submit.kind_ = kMetaMembershipOperationKind;
+    submit.intent_ = *encoded;
+    submit.intent_hash_ = MetaSha256(*encoded);
+    operation_id = submit.operation_id_;
+    const auto reply =
+        co_await ProposeCommand(coordinator, std::move(principal), submit);
+    if (!reply.starts_with("OK ")) {
+      if (reply == "ERR rejected") co_return reply;
+      // A timed-out submission can still commit after this coroutine leaves.
+      // Preserve its id even before it is visible in the local operation view.
+      co_return absl::StrCat(
+          "ERR uncertain-outcome operation=",
+          HexEncode(std::string_view(
+              reinterpret_cast<const char*>(operation_id->data()),
+              operation_id->size())));
+    }
+    if (!state_machine->FindOperation(*operation_id)) co_return "ERR rejected";
+    // The committed active-kind reservation bridges release to the reconciler.
   }
-  std::shared_ptr<AsyncReply> state = std::make_shared<AsyncReply>();
-  const absl::Status submitted =
-      proposal_executor.Submit([server, foreign_executor, state, add, server_id,
-                                add_config = std::move(add_config)]() mutable {
-        try {
-          nuraft::ptr<CmdResult> result = add ? server->add_srv(*add_config)
-                                              : server->remove_srv(server_id);
-          if (result == nullptr) {
-            CompleteAsyncReply(foreign_executor, std::move(state),
-                               "ERR no-result");
-            return;
-          }
-          CmdResult::handler_type2 handler =
-              [foreign_executor, state](
-                  CmdResult& completed,
-                  nuraft::ptr<std::exception>& err) mutable {
-                std::string reply;
-                if (err != nullptr) {
-                  reply = "ERR exception";
-                } else if (completed.get_result_code() ==
-                               nuraft::cmd_result_code::OK &&
-                           completed.get_accepted()) {
-                  reply = "OK";
-                } else {
-                  reply = "ERR " + CmdResultToken(completed.get_result_code());
-                }
-                CompleteAsyncReply(foreign_executor, std::move(state),
-                                   std::move(reply));
-              };
-          // when_ready may invoke inline or register for a later NuRaft
-          // callback. Either path must be established before this work item
-          // is allowed to finish successfully.
-          result->when_ready(handler);
-        } catch (...) {
-          CompleteAsyncReply(foreign_executor, std::move(state),
-                             "ERR exception");
-        }
-      });
-  if (!submitted.ok()) co_return "ERR executor-unavailable";
-  std::string reply = co_await AsyncReplyAwaiter(std::move(state));
-  if (add || (reply != "OK" && reply != "ERR not-found")) {
-    co_return reply;
+  const auto id = HexEncode(
+      std::string_view(reinterpret_cast<const char*>(operation_id->data()),
+                       operation_id->size()));
+  // A bounded wait is not cancellation of the accepted durable workflow.
+  // Both the id in timeout replies and an identical request can locate it.
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(
+                            server->get_current_params().client_req_timeout_);
+  while (!*shutdown && server->is_leader() &&
+         std::chrono::steady_clock::now() < deadline) {
+    auto op = state_machine->FindOperation(*operation_id);
+    if (!op) co_return absl::StrCat("ERR uncertain-outcome operation=", id);
+    if (op->lifecycle_ == MetaOperationLifecycle::kCompleted) co_return "OK";
+    if (op->lifecycle_ == MetaOperationLifecycle::kAborted ||
+        op->kind_phase_blob_.starts_with("recovery-required:"))
+      co_return absl::StrCat("ERR recovery-required operation=", id);
+    auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                          std::chrono::milliseconds(10));
+    if (!slept.ok()) break;
   }
-  RetireMetaMember retire;
-  retire.request_id_ = MakeRequestId();
-  retire.server_id_ = static_cast<std::uint32_t>(server_id);
-  std::string retired =
-      co_await ProposeCommand(coordinator, std::move(principal), retire);
-  if (retired.rfind("OK ", 0) != 0) co_return retired;
-  co_return "OK";
+  co_return absl::StrCat("ERR uncertain-outcome operation=", id);
 }
 
 std::vector<std::string> SplitTokens(std::string_view line) {
@@ -1982,7 +2104,8 @@ celer::Task<std::string> DispatchCommand(
     std::shared_ptr<MetaClusterStatusService> cluster_status_service,
     std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status,
     std::uint32_t observation_ttl_ms, std::size_t* retained_status_bytes,
-    std::string_view line) {
+    std::string_view line, const bool* shutdown, bool creation_enabled,
+    bool membership_enabled) {
   const std::vector<std::string> tokens = SplitTokens(line);
   if (tokens.empty()) {
     co_return "ERR bad-request";
@@ -1992,7 +2115,8 @@ celer::Task<std::string> DispatchCommand(
   std::string_view target_node_id;
   if (command == "status") {
     access = MetaAccess::kStatus;
-  } else if (command == "clusterhead" || command == "clusterstatus") {
+  } else if (command == "clusterhead" || command == "clusterstatus" ||
+             command == "clustercreate") {
     // Cluster-wide topology and readiness are operator-only even though the
     // legacy local status verb is also visible to a Data-node identity.
     if (identity.role_ != MetaPrincipalRole::kOperator) {
@@ -2053,6 +2177,29 @@ celer::Task<std::string> DispatchCommand(
     }
     co_return co_await AsyncReplyAwaiter(std::move(reply),
                                          retained_status_bytes);
+  }
+  if (command == "clustercreate") {
+    if (!creation_enabled)
+      co_return ClusterCreateError("preflight", "runtime-unavailable",
+                                   "cluster-create reconciler is unavailable");
+    if (tokens.size() != 3) {
+      co_return ClusterCreateError(
+          "decode", "bad-request",
+          "expected clustercreate 1 <hex-payload>");
+    }
+    if (tokens[1] != "1") {
+      co_return ClusterCreateError("decode", "bad-request",
+                                   "unsupported protocol version");
+    }
+    std::uint32_t wait_timeout_ms = 0;
+    auto manifest = DecodeClusterCreateRequest(line, &wait_timeout_ms);
+    if (!manifest.ok()) {
+      co_return ClusterCreateError("decode", "bad-request",
+                                   std::string(manifest.status().message()));
+    }
+    co_return co_await HandleClusterCreate(
+        server, state_machine, coordinator, membership_gate,
+        std::move(principal), *manifest, wait_timeout_ms, shutdown);
   }
   if (command == "submitop" || command == "completeop" ||
       command == "abortop" || command == "archiveoperations" ||
@@ -2197,6 +2344,7 @@ celer::Task<std::string> DispatchCommand(
         " audit_dropped_through=" + std::to_string(audit.dropped_through());
   }
   if (command == "addsrv" || command == "removesrv") {
+    if (!membership_enabled) co_return "ERR membership-unavailable";
     const bool add = command == "addsrv";
     if ((!add && tokens.size() != 2u) ||
         (add && tokens.size() != 5u && tokens.size() != 6u)) {
@@ -2213,11 +2361,10 @@ celer::Task<std::string> DispatchCommand(
     }
     co_return co_await HandleConfigChange(
         std::move(server), std::move(state_machine), coordinator,
-        std::move(principal), foreign_executor, proposal_executor,
-        membership_gate, add, server_id, add ? tokens[2] : std::string(),
+        std::move(principal), membership_gate, add, server_id,
+        add ? tokens[2] : std::string(),
         add ? tokens[3] : std::string(local_data_control_endpoint),
-        add ? tokens[4] : std::string(), local_data_control_endpoint,
-        local_ctl_endpoint, member_principal);
+        add ? tokens[4] : std::string(), member_principal, shutdown);
   }
   if (command == "snapshot") {
     // A manual snapshot must serialize against the commit
@@ -2620,7 +2767,12 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
           core->options_.local_ctl_endpoint_,
           core->options_.cluster_status_service_,
           core->options_.data_control_runtime_status_,
-          core->options_.observation_ttl_ms_, &retained_status_bytes, line);
+          core->options_.observation_ttl_ms_, &retained_status_bytes, line,
+          &core->shutdown_,
+          core->options_.cluster_create_reconciler_ != nullptr &&
+              core->options_.cluster_create_reconciler_->accepting(),
+          core->options_.membership_reconciler_ != nullptr &&
+              core->options_.membership_reconciler_->accepting());
       reply.push_back('\n');
       std::unique_ptr<cluster::control::ControlDeadlineWatchdog>
           status_write_deadline;

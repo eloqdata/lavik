@@ -102,14 +102,26 @@ TEST(MetaDataControlRuntimeStatusTest,
       .partition_replication_epoch = 9,
   });
   const auto session = Bytes<16>(0x41);
-  status.PublishCurrent(Identity('1'), Identity('2'), session,
+  status.PublishCurrent(Identity('1'), Identity('2'), session, Bytes<20>(0x51),
                         /*session_generation=*/10,
                         /*leadership_generation=*/11,
                         /*validated_committed_high_water=*/7, projection);
   auto snapshot = status.Snapshot();
   ASSERT_EQ(snapshot.nodes_.size(), 1u);
+  EXPECT_EQ(snapshot.nodes_[0].replication_history_id_, Bytes<20>(0x51));
   EXPECT_FALSE(snapshot.nodes_[0].health_.has_value());
   EXPECT_EQ(snapshot.nodes_[0].groups_.size(), 1u);
+
+  // Validating an unchanged FDS advances freshness, not the origin of the
+  // object Data acknowledged. Old sessions cannot advance that proof.
+  status.MarkValidated(Identity('1'), Bytes<16>(0x42), 99);
+  EXPECT_EQ(status.Snapshot().nodes_[0].validated_committed_high_water_, 7u);
+  status.MarkValidated(Identity('1'), session, 9);
+  status.MarkValidated(Identity('1'), session, 8);
+  snapshot = status.Snapshot();
+  EXPECT_EQ(snapshot.nodes_[0].validated_committed_high_water_, 9u);
+  EXPECT_EQ(snapshot.nodes_[0].source_meta_applied_index_, 7u);
+  EXPECT_EQ(snapshot.nodes_[0].projection_hash_, projection.projection_hash);
 
   control::LeaseDenied denied;
   denied.reason = control::LeaseDenialReason::kNodeNotReady;
@@ -131,7 +143,7 @@ TEST(MetaDataControlRuntimeStatusTest,
   status.Remove(Identity('1'), &session);
   EXPECT_TRUE(status.Snapshot().nodes_.empty());
 
-  status.PublishCurrent(Identity('3'), Identity('4'), session,
+  status.PublishCurrent(Identity('3'), Identity('4'), session, Bytes<20>(0x52),
                         /*session_generation=*/12,
                         /*leadership_generation=*/11,
                         /*validated_committed_high_water=*/7, projection);
@@ -145,7 +157,7 @@ TEST(MetaDataControlRuntimeStatusTest,
   EXPECT_EQ(snapshot.leadership_generation_, 0u);
   EXPECT_FALSE(snapshot.leader_authority_eligible_);
   EXPECT_TRUE(snapshot.nodes_.empty());
-  status.PublishCurrent(Identity('1'), Identity('2'), session,
+  status.PublishCurrent(Identity('1'), Identity('2'), session, Bytes<20>(0x53),
                         /*session_generation=*/13,
                         /*leadership_generation=*/11,
                         /*validated_committed_high_water=*/7, projection);
@@ -163,6 +175,7 @@ TEST(MetaDataControlRuntimeStatusTest,
   control::FullDesiredState projection;
   const auto publish = [&] {
     status.PublishCurrent(Identity('1'), Identity('2'), session,
+                          Bytes<20>(0x54),
                           /*session_generation=*/10,
                           /*leadership_generation=*/11,
                           /*validated_committed_high_water=*/7, projection);
@@ -430,7 +443,7 @@ TEST(MetaDataControlHandshakeLimitTest,
   control::FullDesiredState projection;
 
   ASSERT_TRUE(slots.TryClaim("node-a", &first));
-  status.PublishCurrent("node-a", Identity('2'), session,
+  status.PublishCurrent("node-a", Identity('2'), session, Bytes<20>(0x55),
                         /*session_generation=*/10,
                         /*leadership_generation=*/11,
                         /*validated_committed_high_water=*/7, projection);

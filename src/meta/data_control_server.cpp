@@ -1330,6 +1330,7 @@ struct LiveSessionState {
   std::string node_id_;
   std::string boot_id_;
   control::WireId128 session_id_{};
+  MetaReplicationHistoryId replication_history_id_{};
   std::uint64_t session_generation_ = 0;
   std::uint64_t leadership_generation_ = 0;
 
@@ -2421,6 +2422,7 @@ celer::Task<absl::Status> SessionPublisherBody(
     state->projection_superseded_ = false;
     state->core_->options_.runtime_status_->PublishCurrent(
         state->node_id_, state->boot_id_, state->session_id_,
+        state->replication_history_id_,
         state->session_generation_, state->leadership_generation_,
         state->validated_committed_high_water_, state->installed_->full_state);
     StartDirectiveSender(state);
@@ -2500,12 +2502,11 @@ celer::Task<absl::Status> HandleDirectiveResult(
     co_return receipt_path;
   }
   const MetaDirectiveSpec& spec = tracked->spec_;
-  if (spec.kind_ != "rebuild" && spec.kind_ != "authorize-source" &&
-      spec.kind_ != "revoke-sources") {
+  if (!IsKnownMetaDirective(spec.kind_)) {
     co_return absl::FailedPreconditionError(
         "tracked directive kind is not executable by data control");
   }
-  const bool executes_on_target = spec.kind_ == "rebuild";
+  const bool executes_on_target = IsMetaPopulationDirective(spec.kind_);
   const std::string& expected_node =
       executes_on_target ? spec.target_node_id_ : spec.source_node_id_;
   const MetaBootIncarnation& expected_boot =
@@ -3581,6 +3582,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   live->node_id_ = node_id;
   live->boot_id_ = hello->boot_id;
   live->session_id_ = *session_id;
+  live->replication_history_id_ = *replication_history_id;
   live->session_generation_ = session_generation;
   live->leadership_generation_ = leadership_generation;
   // Transfer the sole retained-projection owner into live session state. The
@@ -3629,7 +3631,8 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     co_return finish(rebuilt, true);
   }
   core->options_.runtime_status_->PublishCurrent(
-      node_id, hello->boot_id, *session_id, session_generation,
+      node_id, hello->boot_id, *session_id, *replication_history_id,
+      session_generation,
       leadership_generation, live->validated_committed_high_water_,
       live->installed_->full_state);
   core->accepted_sessions_.fetch_add(1, std::memory_order_relaxed);

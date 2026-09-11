@@ -12,7 +12,7 @@ P.  positive: a 3-node all-TLS cluster runs the full flow — probe-verified
     joins, 30 replicated keys, automatic snapshots (distance 30), kill -9
     and restart of a follower with catch-up, clean SIGTERM of all nodes.
 N1. plaintext joiner vs TLS cluster: a node started WITHOUT the TLS flags
-    is invited (addsrv OK = invite accepted), but every handshake dies,
+    has a retained pending invite, but every handshake dies,
     so it never makes raft progress (committed stays 0, reads miss) while
     the quorum keeps writing. And the mirror: a TLS joiner against a
     plaintext cluster.
@@ -40,6 +40,7 @@ Usage: gate_mtls.py /path/to/keylane-meta [workdir]
 """
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -149,7 +150,7 @@ commonName = supplied
 
 
 def expect_isolated(leader, joiner, history, seq_start, label,
-                    evidence_patterns):
+                    evidence_patterns, recovery_args):
     """Invite `joiner`, then prove for ISOLATION_WINDOW_S that the quorum
     keeps committing while the joiner makes zero raft progress."""
     if isinstance(evidence_patterns, str):
@@ -164,8 +165,10 @@ def expect_isolated(leader, joiner, history, seq_start, label,
         f"addsrv {joiner.id} {joiner.endpoint} "
         f"{joiner.data_control_endpoint} {joiner.ctl_endpoint}")
     H.log(f"{label}: addsrv node {joiner.id} -> {invite}")
-    if invite != "OK":
+    pending = re.fullmatch(r"ERR uncertain-outcome operation=([0-9a-f]{32})", invite)
+    if pending is None:
         raise H.Failure(f"{label}: addsrv: {invite}")
+    operation_id = pending.group(1)
     committed0 = leader.committed()
 
     seq = seq_start
@@ -196,8 +199,7 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     if committed1 <= committed0:
         raise H.Failure(f"{label}: quorum committed stalled "
                         f"({committed0} -> {committed1})")
-    # addsrv acknowledges asynchronous join admission, not completion of its
-    # first socket attempt, so wait for bounded, new evidence rather than
+    # The retained operation retries asynchronously, so wait for bounded new evidence rather than
     # racing the log writer at the end of the isolation window.
     evidence_deadline = time.monotonic() + 5.0
     evidence1 = sum(leader.count_log_lines(pattern)
@@ -212,6 +214,18 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     H.log(f"{label}: node {joiner.id} isolated (alive, committed=0), "
           f"quorum committed {committed0} -> {committed1}, leader log "
           f"'{evidence_label}' lines {evidence0} -> {evidence1}")
+    # Fix only the joiner's transport credentials. No replacement addsrv:
+    # the original durable task must resume after authentication succeeds.
+    joiner.terminate()
+    joiner.args = recovery_args
+    joiner.start(bootstrap=False)
+    H.wait_until(f"{label}: original invite completes after credential repair", 30,
+                 lambda: leader.getop(operation_id) == "OK completed member-added")
+    history.check([joiner], timeout=20, desc=f"{label}: repaired joiner")
+    if leader.ctl(f"removesrv {joiner.id}") != "OK":
+        raise H.Failure(f"{label}: repaired member did not retire")
+    joiner.terminate()
+    H.log(f"{label}: same operation recovered after credential repair and member retired")
     return seq
 
 
@@ -256,7 +270,8 @@ def main():
         joiners.append(plain_joiner)
         plain_joiner.start(bootstrap=False)
         expect_isolated(leader, plain_joiner, hist_a, 0, "N1a-plaintext",
-                        "SSL handshake")
+                        "SSL handshake", member_tls_args(
+                            os.path.join(workdir, "repaired_plain"), main_ca, main_ca_key, 4))
 
         # ---- scenario N2: wrong-CA joiner vs TLS cluster ----------------
         wrong_dir = os.path.join(workdir, "wrong_ca")
@@ -270,7 +285,8 @@ def main():
         joiners.append(wrong_joiner)
         wrong_joiner.start(bootstrap=False)
         expect_isolated(leader, wrong_joiner, hist_a, 100,
-                        "N2-wrong-ca", "SSL handshake")
+                        "N2-wrong-ca", "SSL handshake", member_tls_args(
+                            os.path.join(workdir, "repaired_ca"), main_ca, main_ca_key, 5))
 
         # ---- scenario N1b: TLS joiner vs plaintext cluster --------------
         dir_b = os.path.join(workdir, "plain_cluster")
@@ -291,7 +307,7 @@ def main():
         # native Asio service surfaces it through NuRaft's join-path error log
         # ("rpc error response ... closed: peer EOF").
         expect_isolated(plain_leader, tls_joiner, hist_b, 200,
-                        "N1b-tls-joiner", "rpc error response")
+                        "N1b-tls-joiner", "rpc error response", H.raft_args())
 
         # ---- cluster C: nodes hold SAN=127.0.0.1 leaves from ca2 --------
         # N3 and N4 share this cluster: both need a CA the cluster trusts
@@ -309,15 +325,17 @@ def main():
         try:
             expired_crt, expired_key = make_expired_leaf(
                 workdir, ca2_dir, ca2_crt, ca2_key, "expired", 4)
+        except H.Failure as exc:
+            H.log(f"N3-expired: SKIP ({exc})")
+        else:
             expired_args = H.raft_args() + H.tls_args(ca2_crt, expired_crt,
                                                       expired_key)
             expired_joiner = H.Node(BINARY, dir_c, 4, args=expired_args)
             joiners.append(expired_joiner)
             expired_joiner.start(bootstrap=False)
             expect_isolated(leader_c, expired_joiner, hist_c, 300,
-                            "N3-expired", "SSL handshake")
-        except H.Failure as exc:
-            H.log(f"N3-expired: SKIP ({exc})")
+                            "N3-expired", "SSL handshake", member_tls_args(
+                                os.path.join(workdir, "repaired_expired"), ca2_crt, ca2_key, 4))
 
         # ---- scenario N4: trusted CA, wrong SAN --------------------------
         # The joiner's leaf IS signed by the CA the cluster trusts, so the
@@ -334,7 +352,8 @@ def main():
         joiners.append(badsan_joiner)
         badsan_joiner.start(bootstrap=False)
         expect_isolated(leader_c, badsan_joiner, hist_c, 400,
-                        "N4-wrong-san", "SSL handshake")
+                        "N4-wrong-san", "SSL handshake", member_tls_args(
+                            os.path.join(workdir, "repaired_san"), ca2_crt, ca2_key, 5))
 
         # ---- scenario N5: valid endpoint, wrong member URI binding ------
         wrongid_args = member_tls_args(
@@ -346,7 +365,8 @@ def main():
         expect_isolated(leader_c, wrongid_joiner, hist_c, 500,
                         "N5-wrong-member-id",
                         ("rejected Raft peer",
-                         "RPC peer verification failed"))
+                         "RPC peer verification failed"), member_tls_args(
+                             os.path.join(workdir, "repaired_id"), ca2_crt, ca2_key, 6))
 
         # ---- teardown: members must SIGTERM cleanly; the isolated joiners
         # never joined, so shutting them down cleanly is asserted too.

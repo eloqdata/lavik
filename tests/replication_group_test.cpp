@@ -290,6 +290,54 @@ TEST(ReplicationGroupTest, PublishesReadinessOnlyFromCompleteCurrentAttempt) {
   EXPECT_EQ(group.state(), keylane::ReplicationGroupState::kReady);
 }
 
+TEST(ReplicationGroupTest,
+     EmptyPopulationPublishesReadinessWithoutASourceFlowCut) {
+  keylane::ReplicationGroup group("target-1", "target-boot-1");
+  auto identity = Directive().identity_;
+  identity.source_node_id_.clear();
+  identity.source_assignment_id_.clear();
+  identity.source_boot_id_.clear();
+  identity.source_history_id_.clear();
+  identity.target_history_id_ = "target-history-1";
+
+  auto authorization = group.BeginEmptyPopulation(identity, Manifest());
+  ASSERT_TRUE(authorization.ok()) << authorization.status();
+  RecordCompleteManifestProof(group, identity, Manifest());
+  ASSERT_TRUE(group.MarkFunctionCatalogComplete(identity).ok());
+  ASSERT_TRUE(group.MarkStoragePromoted(identity).ok());
+
+  auto ready = group.PublishReady(identity);
+  ASSERT_TRUE(ready.ok()) << ready.status();
+  EXPECT_TRUE(ready->cut_vector().empty());
+  EXPECT_EQ(group.state(), keylane::ReplicationGroupState::kReady);
+}
+
+TEST(ReplicationGroupTest,
+     RestartDropsEmptyPopulationProofAndRejectsThePriorBootDirective) {
+  auto identity = Directive().identity_;
+  identity.source_node_id_.clear();
+  identity.source_assignment_id_.clear();
+  identity.source_boot_id_.clear();
+  identity.source_history_id_.clear();
+  identity.target_history_id_ = "target-history-1";
+
+  keylane::ReplicationGroup before_restart("target-1", "target-boot-1");
+  ASSERT_TRUE(before_restart.BeginEmptyPopulation(identity, Manifest()).ok());
+  RecordCompleteManifestProof(before_restart, identity, Manifest());
+  ASSERT_TRUE(before_restart.MarkFunctionCatalogComplete(identity).ok());
+  ASSERT_TRUE(before_restart.MarkStoragePromoted(identity).ok());
+  ASSERT_TRUE(before_restart.PublishReady(identity).ok());
+
+  keylane::ReplicationGroup restarted("target-1", "target-boot-2");
+  EXPECT_EQ(restarted.state(), keylane::ReplicationGroupState::kNotReady);
+  EXPECT_EQ(restarted.BeginEmptyPopulation(identity, Manifest()).status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  identity.target_boot_id_ = "target-boot-2";
+  EXPECT_TRUE(restarted.BeginEmptyPopulation(identity, Manifest()).ok());
+  EXPECT_EQ(restarted.state(), keylane::ReplicationGroupState::kRebuilding);
+}
+
 TEST(ReplicationGroupTest, RejectsStaleIdentityAndAttemptReuse) {
   keylane::ReplicationGroup group("target-1", "target-boot-1");
   auto first = Directive();

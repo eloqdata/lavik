@@ -220,6 +220,10 @@ class MetaOperationStore {
   std::optional<MetaTerminalReceipt> FindTerminalReceipt(
       const MetaTerminalReceiptKey& key) const;
   std::vector<MetaOperationRecord> LiveOperations() const;
+  // True only for a non-terminal live record of the requested durable kind.
+  // Status callers use this bounded fact instead of copying the operation
+  // journal and its evidence payloads.
+  bool HasActiveKind(std::string_view kind) const;
   bool OperationKnown(const MetaOperationId& id) const {
     return live_.contains(id) || archived_.contains(id);
   }

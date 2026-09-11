@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -21,6 +22,7 @@
 #include "celer/net/server.h"
 #include "gtest/gtest.h"
 #include "keylane/command.h"
+#include "keylane/fault_injection.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/replication.h"
@@ -46,6 +48,15 @@ bool IsCanonicalReplicationId(std::string_view value) {
     }
   }
   return true;
+}
+
+void EnsureTxRuntime() {
+  // TxRuntime is process-global and intentionally has no teardown API. This
+  // integration binary starts several one-worker servers sequentially, so
+  // later cases reuse and rebind the same idle shard.
+  if (keylane::tx::TxRuntime::Get() == nullptr) {
+    keylane::tx::TxRuntime::Create(1);
+  }
 }
 
 celer::Task<absl::Status> CheckLightweightQueries(
@@ -611,7 +622,7 @@ class ReplicationManagerService final : public celer::Service {
         .manifest_id_ = replacement.identity_.manifest_id_,
         .partition_replication_epoch_ =
             replacement.identity_.partition_replication_epoch_,
-        .rebuild_expected_ = true,
+        .population_transition_expected_ = true,
     };
     absl::Status reconciled =
         co_await replication_->ReconcileClusterPopulation(desired);
@@ -650,7 +661,7 @@ class ReplicationManagerService final : public celer::Service {
       co_return query;
     }
 
-    desired.rebuild_expected_ = false;
+    desired.population_transition_expected_ = false;
     reconciled = co_await replication_->ReconcileClusterPopulation(desired);
     if (!reconciled.ok() ||
         (co_await restarted->Await()).code() != absl::StatusCode::kCancelled) {
@@ -714,6 +725,309 @@ class ReplicationManagerService final : public celer::Service {
   keylane::ReplicationManager* replication_ = nullptr;
   StallingNativeSource* source_ = nullptr;
   std::string expected_node_id_;
+  absl::Status result_ = absl::OkStatus();
+};
+
+enum class EmptyPopulationExpectation {
+  kReady,
+  kRecoverableFailure,
+  kFailedStopped,
+};
+
+class EmptyPopulationService final : public celer::Service {
+ public:
+  EmptyPopulationService(keylane::storage::StorageEngine* storage,
+                         keylane::ReplicationManager* replication,
+                         EmptyPopulationExpectation expectation =
+                             EmptyPopulationExpectation::kReady)
+      : storage_(storage),
+        replication_(replication),
+        expectation_(expectation) {}
+
+  void Prepare(unsigned thread_count) override {
+    if (thread_count != 1) {
+      result_ = TestFailure("empty population test requires one worker");
+    }
+  }
+
+  celer::Task<absl::Status> Run(celer::Worker& worker,
+                                celer::ServiceContext) override {
+    keylane::BindMemoryAccountingShard(worker.id());
+    keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
+    if (result_.ok()) result_ = co_await storage_->InitializeWorker(worker);
+    if (result_.ok()) {
+      replication_->StorageReady(worker);
+      result_ = co_await Exercise();
+    }
+    worker.RequestStop();
+    co_return result_;
+  }
+
+  void Stop() noexcept override {}
+
+  const absl::Status& result() const noexcept { return result_; }
+
+ private:
+  celer::Task<absl::Status> Exercise() {
+    const keylane::ReplicationIdentity local =
+        co_await replication_->ObserveIdentity();
+    const keylane::ClusterPopulationStatus cold =
+        co_await replication_->cluster_population_status();
+    if (cold.state_ != keylane::ReplicationGroupState::kNotReady ||
+        cold.ready_token_.has_value() || !replication_->is_loading() ||
+        !replication_->reject_writes()) {
+      co_return TestFailure(
+          "Meta-managed Data did not start fenced before initialization");
+    }
+
+    std::vector<keylane::PopulationManifestEntry> entries;
+    entries.reserve(keylane::kReplicationPartitionCount);
+    for (std::uint32_t partition = 0;
+         partition < keylane::kReplicationPartitionCount; ++partition) {
+      entries.push_back({partition, 1});
+    }
+    auto manifest =
+        keylane::PopulationManifest::Create(std::move(entries));
+    if (!manifest.ok()) co_return manifest.status();
+
+    keylane::RebuildIdentity identity{
+        .group_id_ = "group-1",
+        .assignment_id_ = "assignment-a",
+        .term_ = 1,
+        .directive_revision_ = 1,
+        .authority_id_ = "authority-1",
+        .target_node_id_ = local.local_node_id_,
+        .target_boot_id_ = local.boot_id_,
+        .target_history_id_ = local.local_history_id_,
+        .operation_id_ = "operation-a",
+        .directive_id_ = "directive-a",
+        .attempt_id_ = "attempt-a",
+        .manifest_revision_ = 1,
+        .manifest_id_ = manifest->id(),
+        .partition_replication_epoch_ = 1,
+    };
+    for (const keylane::RebuildIdentity& stale : {
+             [&] {
+               auto value = identity;
+               value.target_boot_id_ = std::string(40, 'f');
+               return value;
+             }(),
+             [&] {
+               auto value = identity;
+               value.target_history_id_ = std::string(40, 'e');
+               return value;
+             }(),
+         }) {
+      auto rejected =
+          co_await replication_->StartEmptyPopulationInitialization(stale,
+                                                                    *manifest);
+      if (rejected.ok() ||
+          rejected.status().code() !=
+              absl::StatusCode::kFailedPrecondition) {
+        co_return TestFailure(
+            "empty population accepted stale boot or history identity");
+      }
+    }
+    auto started = co_await replication_->StartEmptyPopulationInitialization(
+        identity, *manifest);
+    if (!started.ok()) co_return started.status();
+    std::optional<keylane::ClusterRebuildCompletion> in_progress_replay;
+    if (expectation_ == EmptyPopulationExpectation::kReady) {
+      auto replay = co_await replication_->StartEmptyPopulationInitialization(
+          identity, *manifest);
+      if (!replay.ok()) co_return replay.status();
+      in_progress_replay = std::move(*replay);
+    }
+    const absl::Status completed = co_await started->Await();
+    if (expectation_ != EmptyPopulationExpectation::kReady) {
+      if (completed.ok()) {
+        co_return TestFailure(
+            "injected empty-population failure unexpectedly completed");
+      }
+      const keylane::ClusterPopulationStatus failed =
+          co_await replication_->cluster_population_status();
+      const keylane::ReplicationStatus observed =
+          co_await replication_->Observe();
+      const bool expect_fail_stop =
+          expectation_ == EmptyPopulationExpectation::kFailedStopped;
+      const keylane::ReplicationGroupState expected_state =
+          expect_fail_stop ? keylane::ReplicationGroupState::kFailedStopped
+                           : keylane::ReplicationGroupState::kNotReady;
+      if (failed.state_ != expected_state ||
+          failed.ready_token_.has_value() ||
+          observed.failed_stopped_ != expect_fail_stop ||
+          (expect_fail_stop && (failed.failure_reason_.empty() ||
+                                observed.failure_reason_.empty() ||
+                                !storage_->ReplicaRecoveryFenced())) ||
+          !replication_->is_loading() || !replication_->reject_writes()) {
+        co_return TestFailure(
+            "failed empty population did not retain its serving fence");
+      }
+      auto retry = co_await replication_->StartEmptyPopulationInitialization(
+          identity, *manifest);
+      if (retry.ok() ||
+          retry.status().code() != absl::StatusCode::kFailedPrecondition) {
+        co_return TestFailure(
+            "failed-stopped empty population accepted an exact retry");
+      }
+      co_return absl::OkStatus();
+    }
+    if (!completed.ok()) {
+      co_return completed;
+    }
+    if (!in_progress_replay.has_value() ||
+        (co_await in_progress_replay->Await()) != completed) {
+      co_return TestFailure("empty population replay lost the original result");
+    }
+
+    const keylane::ClusterPopulationStatus ready =
+        co_await replication_->cluster_population_status();
+    if (ready.state_ != keylane::ReplicationGroupState::kReady ||
+        !ready.ready_token_.has_value() ||
+        ready.ready_token_->identity() != identity ||
+        !ready.ready_token_->cut_vector().empty() ||
+        replication_->is_loading() || replication_->reject_writes()) {
+      co_return TestFailure(
+          "empty population did not publish the source-less ReadyToken");
+    }
+
+    // A completed replay must reuse the original result, not start another
+    // destructive reset. Keep post-initialization data and its DB epoch as
+    // observable evidence that neither replay nor a rejected mismatch resets.
+    constexpr std::string_view kReplayKey = "after-empty-initialization";
+    constexpr std::string_view kReplayValue = "must-survive-replay";
+    auto written = co_await storage_->Set(0, kReplayKey, kReplayValue);
+    if (!written.ok()) co_return written.status();
+    const std::uint64_t db_epoch = storage_->DbEpoch(0);
+    auto lookup = replication_->FindCompletedClusterPopulation(
+        keylane::RebuildDirective{.identity_ = identity});
+    if (!lookup.has_value() ||
+        lookup->result() != std::optional<absl::Status>(completed)) {
+      co_return TestFailure("non-mutating replay lookup lost completed result");
+    }
+    auto replay = co_await replication_->StartEmptyPopulationInitialization(
+        identity, *manifest);
+    if (!replay.ok()) co_return replay.status();
+    if (replay->result() != std::optional<absl::Status>(completed) ||
+        (co_await replay->Await()) != completed) {
+      co_return TestFailure(
+          "completed empty population did not replay its result");
+    }
+
+    for (auto field : {&keylane::RebuildIdentity::group_id_,
+                       &keylane::RebuildIdentity::assignment_id_,
+                       &keylane::RebuildIdentity::target_node_id_,
+                       &keylane::RebuildIdentity::target_boot_id_,
+                       &keylane::RebuildIdentity::target_history_id_,
+                       &keylane::RebuildIdentity::operation_id_,
+                       &keylane::RebuildIdentity::directive_id_,
+                       &keylane::RebuildIdentity::attempt_id_}) {
+      auto mismatched = identity;
+      mismatched.*field += "-other";
+      if (replication_
+              ->FindCompletedClusterPopulation(
+                  keylane::RebuildDirective{.identity_ = mismatched})
+              .has_value()) {
+        co_return TestFailure("completed lookup accepted mismatched identity");
+      }
+      auto rejected = co_await replication_->StartEmptyPopulationInitialization(
+          mismatched, *manifest);
+      if (rejected.ok() ||
+          rejected.status().code() != absl::StatusCode::kFailedPrecondition) {
+        co_return TestFailure(
+            "empty population replay accepted another identity");
+      }
+    }
+    auto different_manifest = keylane::PopulationManifest::Create({{0, 2}});
+    if (!different_manifest.ok()) co_return different_manifest.status();
+    auto wrong_manifest =
+        co_await replication_->StartEmptyPopulationInitialization(
+            identity, *different_manifest);
+    if (wrong_manifest.ok() || wrong_manifest.status().code() !=
+                                   absl::StatusCode::kFailedPrecondition) {
+      co_return TestFailure(
+          "empty population replay accepted another manifest");
+    }
+
+    keylane::DesiredClusterPopulation desired{
+        .group_id_ = identity.group_id_,
+        .assignment_id_ = identity.assignment_id_,
+        .term_ = identity.term_,
+        .manifest_revision_ = identity.manifest_revision_,
+        .manifest_id_ = identity.manifest_id_,
+        .partition_replication_epoch_ =
+            identity.partition_replication_epoch_,
+        .population_transition_expected_ = false,
+    };
+    if (absl::Status reconciled =
+            co_await replication_->ReconcileClusterPopulation(desired);
+        !reconciled.ok()) {
+      co_return reconciled;
+    }
+    const keylane::ClusterPopulationStatus after_removal =
+        co_await replication_->cluster_population_status();
+    if (after_removal.state_ != keylane::ReplicationGroupState::kReady ||
+        !after_removal.ready_token_.has_value() ||
+        after_removal.ready_token_->identity() != identity) {
+      co_return TestFailure(
+          "matching FDS without the directive retired the ReadyToken");
+    }
+    auto retained_replay =
+        co_await replication_->StartEmptyPopulationInitialization(identity,
+                                                                  *manifest);
+    if (!retained_replay.ok()) co_return retained_replay.status();
+    if (retained_replay->result() != std::optional<absl::Status>(completed) ||
+        storage_->DbEpoch(0) != db_epoch || replication_->is_loading() ||
+        replication_->reject_writes()) {
+      co_return TestFailure(
+          "empty population replay disturbed the ready dataset");
+    }
+    {
+      auto preserved = co_await storage_->Get(0, kReplayKey);
+      if (!preserved.ok()) co_return preserved.status();
+      const auto bytes = preserved->value_bytes();
+      if (std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                           bytes.size()) != kReplayValue) {
+        co_return TestFailure("empty population replay erased subsequent data");
+      }
+    }
+
+    // An old completion handle remains historical evidence, not permission to
+    // reuse a READY proof after the desired population has changed.
+    ++desired.partition_replication_epoch_;
+    if (absl::Status reconciled =
+            co_await replication_->ReconcileClusterPopulation(desired);
+        !reconciled.ok()) {
+      co_return reconciled;
+    }
+    auto invalidated_replay =
+        co_await replication_->StartEmptyPopulationInitialization(identity,
+                                                                  *manifest);
+    if (replication_
+            ->FindCompletedClusterPopulation(
+                keylane::RebuildDirective{.identity_ = identity})
+            .has_value()) {
+      co_return TestFailure("completed lookup revived an invalidated proof");
+    }
+    if (invalidated_replay.ok() || invalidated_replay.status().code() !=
+                                       absl::StatusCode::kFailedPrecondition) {
+      co_return TestFailure(
+          "empty population replay revived an invalidated proof");
+    }
+    const auto invalidated = co_await replication_->cluster_population_status();
+    if (invalidated.state_ != keylane::ReplicationGroupState::kNotReady ||
+        invalidated.ready_token_.has_value() || !replication_->is_loading() ||
+        !replication_->reject_writes()) {
+      co_return TestFailure(
+          "invalidated empty population lost its serving fence");
+    }
+    co_return absl::OkStatus();
+  }
+
+  keylane::storage::StorageEngine* storage_ = nullptr;
+  keylane::ReplicationManager* replication_ = nullptr;
+  EmptyPopulationExpectation expectation_ =
+      EmptyPopulationExpectation::kReady;
   absl::Status result_ = absl::OkStatus();
 };
 
@@ -893,7 +1207,7 @@ TEST(ReplicationManagerIntegrationTest,
       &storage, std::move(replication_options),
       keylane::ReplicaOfConfig{"127.0.0.1", source.port()});
   keylane::InitStorage(&storage, &replication);
-  keylane::tx::TxRuntime::Create(1);
+  EnsureTxRuntime();
 
   ReplicationManagerService service(&storage, &replication, &source,
                                     expected_node_id);
@@ -907,6 +1221,151 @@ TEST(ReplicationManagerIntegrationTest,
   server.WaitUntilStopped();
   EXPECT_TRUE(service.result().ok()) << service.result();
 }
+
+TEST(ReplicationManagerIntegrationTest,
+     InitializesAndRetainsSourceLessEmptyPopulation) {
+  const std::string expected_node_id(40, '8');
+  keylane::test::TempDirectory directory("empty-population");
+  const std::filesystem::path data = directory.path() / "node.data";
+  keylane::test::CreateDataFile(data, 128 * kMiB);
+
+  keylane::storage::StorageEngineOptions storage_options;
+  storage_options.data_files_ = {data.string()};
+  storage_options.expiration_authority_ = false;
+  storage_options.buffers_.registered_bytes_ = 64 * kMiB;
+  storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
+  keylane::storage::StorageEngine storage(std::move(storage_options));
+  keylane::InitWorkerMetrics(1);
+  ASSERT_TRUE(keylane::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(storage.Prepare(1).ok());
+
+  keylane::ReplicationOptions replication_options;
+  replication_options.cluster_enabled_ = true;
+  replication_options.cluster_population_managed_ = true;
+  replication_options.node_id_override_ = expected_node_id;
+  keylane::ReplicationManager replication(
+      &storage, std::move(replication_options), std::nullopt);
+  keylane::InitStorage(&storage, &replication);
+  EnsureTxRuntime();
+
+  EmptyPopulationService service(&storage, &replication);
+  celer::Server server;
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+#if KEYLANE_FAULTS_ENABLED
+TEST(ReplicationManagerIntegrationTest,
+     EmptyPopulationPromotionFailureRemainsFailedStopped) {
+  ASSERT_EQ(::setenv("KEYLANE_REPLICATION_FAIL_PROMOTE_ONCE", "1", 1), 0);
+  struct FaultReset {
+    ~FaultReset() { (void)::unsetenv("KEYLANE_REPLICATION_FAIL_PROMOTE_ONCE"); }
+  } fault_reset;
+
+  const std::string expected_node_id(40, '9');
+  keylane::test::TempDirectory directory("empty-population-promote-failure");
+  const std::filesystem::path data = directory.path() / "node.data";
+  keylane::test::CreateDataFile(data, 128 * kMiB);
+
+  keylane::storage::StorageEngineOptions storage_options;
+  storage_options.data_files_ = {data.string()};
+  storage_options.expiration_authority_ = false;
+  storage_options.buffers_.registered_bytes_ = 64 * kMiB;
+  storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
+  keylane::storage::StorageEngine storage(std::move(storage_options));
+  keylane::InitWorkerMetrics(1);
+  ASSERT_TRUE(keylane::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(storage.Prepare(1).ok());
+
+  keylane::ReplicationOptions replication_options;
+  replication_options.cluster_enabled_ = true;
+  replication_options.cluster_population_managed_ = true;
+  replication_options.node_id_override_ = expected_node_id;
+  keylane::ReplicationManager replication(
+      &storage, std::move(replication_options), std::nullopt);
+  keylane::InitStorage(&storage, &replication);
+  EnsureTxRuntime();
+
+  EmptyPopulationService service(
+      &storage, &replication, EmptyPopulationExpectation::kFailedStopped);
+  celer::Server server;
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+void RunRecoverableEmptyPopulationFault(const char* environment_name,
+                                        char node_id_digit,
+                                        std::string_view directory_name) {
+  ASSERT_EQ(::setenv(environment_name, "1", 1), 0);
+  struct FaultReset {
+    const char* name_;
+    ~FaultReset() { (void)::unsetenv(name_); }
+  } fault_reset{environment_name};
+
+  const std::string expected_node_id(40, node_id_digit);
+  keylane::test::TempDirectory directory(directory_name);
+  const std::filesystem::path data = directory.path() / "node.data";
+  keylane::test::CreateDataFile(data, 128 * kMiB);
+
+  keylane::storage::StorageEngineOptions storage_options;
+  storage_options.data_files_ = {data.string()};
+  storage_options.expiration_authority_ = false;
+  storage_options.buffers_.registered_bytes_ = 64 * kMiB;
+  storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
+  keylane::storage::StorageEngine storage(std::move(storage_options));
+  keylane::InitWorkerMetrics(1);
+  ASSERT_TRUE(keylane::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(storage.Prepare(1).ok());
+
+  keylane::ReplicationOptions replication_options;
+  replication_options.cluster_enabled_ = true;
+  replication_options.cluster_population_managed_ = true;
+  replication_options.node_id_override_ = expected_node_id;
+  keylane::ReplicationManager replication(
+      &storage, std::move(replication_options), std::nullopt);
+  keylane::InitStorage(&storage, &replication);
+  EnsureTxRuntime();
+
+  EmptyPopulationService service(
+      &storage, &replication,
+      EmptyPopulationExpectation::kRecoverableFailure);
+  celer::Server server;
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     EmptyPopulationResetFailureRemainsLoading) {
+  RunRecoverableEmptyPopulationFault(
+      "KEYLANE_REPLICATION_FAIL_EMPTY_RESET_ONCE", 'a',
+      "empty-population-reset-failure");
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     EmptyPopulationCatalogFailureRemainsLoading) {
+  RunRecoverableEmptyPopulationFault(
+      "KEYLANE_REPLICATION_FAIL_EMPTY_CATALOG_ONCE", 'b',
+      "empty-population-catalog-failure");
+}
+#endif
 
 TEST(ReplicationManagerIntegrationTest,
      StandaloneManagersGenerateDistinctCanonicalNodeIdentities) {

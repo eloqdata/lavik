@@ -56,11 +56,10 @@ bool DirectiveSpecsMatch(const std::vector<MetaCurrentDirective>& installed,
 }
 
 bool RecipientMatchesKind(const MetaDirectiveSpec& directive) {
-  if (directive.kind_ == "rebuild") {
+  if (IsMetaPopulationDirective(directive.kind_)) {
     return directive.recipient_node_id_ == directive.target_node_id_;
   }
-  if (directive.kind_ == "authorize-source" ||
-      directive.kind_ == "revoke-sources") {
+  if (IsMetaSourceDirective(directive.kind_)) {
     return directive.recipient_node_id_ == directive.source_node_id_;
   }
   // Operation kinds are extensible at the durable layer. Unknown kinds still
@@ -71,17 +70,15 @@ bool RecipientMatchesKind(const MetaDirectiveSpec& directive) {
 }
 
 const MetaBootIncarnation* RecipientBoot(const MetaDirectiveSpec& directive) {
-  if (directive.kind_ == "rebuild" &&
+  if (IsMetaPopulationDirective(directive.kind_) &&
       directive.recipient_node_id_ == directive.target_node_id_) {
     return &directive.target_boot_id_;
   }
-  if ((directive.kind_ == "authorize-source" ||
-       directive.kind_ == "revoke-sources") &&
+  if (IsMetaSourceDirective(directive.kind_) &&
       directive.recipient_node_id_ == directive.source_node_id_) {
     return &directive.source_boot_id_;
   }
-  if (directive.kind_ == "rebuild" || directive.kind_ == "authorize-source" ||
-      directive.kind_ == "revoke-sources") {
+  if (IsKnownMetaDirective(directive.kind_)) {
     return nullptr;
   }
   if (directive.recipient_node_id_ == directive.target_node_id_ &&
@@ -104,15 +101,35 @@ const MetaBootIncarnation* RecipientBoot(const MetaDirectiveSpec& directive) {
 
 bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
   const bool zero_manifest = IsZero(directive.population_manifest_digest_);
+  const bool initializes_empty =
+      directive.kind_ == kMetaDirectiveInitializeEmptyPopulation;
+  const bool absent_source =
+      directive.source_node_id_ == std::string(kMetaNodeIdBytes, '0') &&
+      IsZero(directive.source_assignment_id_) &&
+      IsZero(directive.source_boot_id_) &&
+      IsZero(directive.source_replication_history_id_);
+  const bool source_valid =
+      initializes_empty
+          ? absent_source
+          : directive.source_node_id_.size() == kMetaNodeIdBytes &&
+                !IsZero(directive.source_assignment_id_) &&
+                !IsZero(directive.source_boot_id_) &&
+                !IsZero(directive.source_replication_history_id_);
+  const bool payload_valid =
+      initializes_empty
+          ? directive.payload_.size() == 2 * kMetaReplicationHistoryIdBytes &&
+                std::all_of(directive.payload_.begin(),
+                            directive.payload_.end(), [](unsigned char value) {
+                              return (value >= '0' && value <= '9') ||
+                                     (value >= 'a' && value <= 'f');
+                            })
+          : directive.payload_.empty();
   return !IsZero(directive.directive_id_) && !IsZero(directive.attempt_id_) &&
          directive.recipient_node_id_.size() == kMetaNodeIdBytes &&
          directive.target_node_id_.size() == kMetaNodeIdBytes &&
          !IsZero(directive.target_boot_id_) &&
          !IsZero(directive.assignment_id_) &&
-         directive.source_node_id_.size() == kMetaNodeIdBytes &&
-         !IsZero(directive.source_assignment_id_) &&
-         !IsZero(directive.source_boot_id_) &&
-         !IsZero(directive.source_replication_history_id_) &&
+         source_valid &&
          !directive.group_id_.empty() &&
          directive.group_id_.size() <= kMaxMetaGroupIdBytes &&
          directive.group_term_ != 0 && directive.authority_version_ != 0 &&
@@ -123,11 +140,10 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
          directive.payload_.size() <= kMaxMetaPayloadBytes &&
          directive.preconditions_.size() <=
              kMaxMetaDirectivePreconditionsBytes &&
-         // The fields remain in the durable/wire schema for a future
-         // operation-kind interpreter. V1 has no semantics for them, so
-         // admitting a non-default value would let the production action
+         // Payload has kind-specific semantics above. Preconditions and force
+         // remain reserved; accepting either would let the production action
          // adapter silently weaken requested execution behavior.
-         directive.payload_.empty() && directive.preconditions_.empty() &&
+         payload_valid && directive.preconditions_.empty() &&
          !directive.force_ &&
          RecipientMatchesKind(directive);
 }
@@ -298,6 +314,13 @@ std::vector<MetaOperationRecord> MetaOperationStore::LiveOperations() const {
     result.push_back(record);
   }
   return result;
+}
+
+bool MetaOperationStore::HasActiveKind(std::string_view kind) const {
+  return std::any_of(live_.begin(), live_.end(), [&](const auto& entry) {
+    return entry.second.kind_ == kind &&
+           !IsTerminal(entry.second.lifecycle_);
+  });
 }
 
 std::optional<MetaTerminalReceipt> MetaOperationStore::FindTerminalReceipt(

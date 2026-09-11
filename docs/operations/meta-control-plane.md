@@ -90,6 +90,107 @@ the connection to a discovered remote leader. There is no plaintext/TLS
 fallback. One absolute deadline, five seconds by default, covers discovery,
 redirects, capture, and response I/O.
 
+## Create the first single-Data cluster
+
+`keylane-ctl cluster-create` is the supported v1 bootstrap path for a fresh
+single-member Meta cluster and one preconfigured Data process. It is not an
+import or expansion command: Meta must contain no Data identity, group, slot
+map, population manifest, or active cluster-create operation. The Data process
+may have records in its configured storage; successful initialization
+deliberately erases all 16,384 physical partitions before serving.
+
+Install `redis-cli` on the operator host and make it available on `PATH`. The
+command uses the real cluster-mode client after metadata creation to verify
+`CLUSTER INFO`, `CLUSTER SLOTS`, `CLUSTER KEYSLOT`, and a temporary
+`SET`/`GET`/`DEL` round trip. Start the bootstrap Meta first, then start Data
+in fail-closed Meta-managed mode using the final node id and Meta Data-control
+endpoint. The advertised plaintext port must match the manifest endpoint:
+
+```sh
+keylane-meta --id 1 --addr 127.0.0.1:7101 \
+  --data-control-addr 127.0.0.1:7301 \
+  --data-dir /var/lib/keylane/meta-1 --bootstrap \
+  --ctl-socket /var/lib/keylane/meta-1/meta-admin.sock
+
+keylane --cluster-enabled \
+  --cluster-node-id 0123456789abcdef0123456789abcdef01234567 \
+  --cluster-meta-seed 127.0.0.1:7301 \
+  --cluster-announce-ip 127.0.0.1 --port 6379 \
+  --data-file /var/lib/keylane/data-1/keylane.data
+```
+
+Data initially reports LOADING while its unregistered control connection
+retries. Meta and Data must run the same version because v1 appends a new
+control directive kind. Do not put listener addresses, storage paths, TLS
+files, or other deployment configuration in the creation manifest. Its exact
+schema is:
+
+```toml
+schema_version = 1
+
+[[meta_members]]
+id = 1
+
+[[data_nodes]]
+id = "0123456789abcdef0123456789abcdef01234567"
+client_endpoint = "tcp://127.0.0.1:6379"
+
+[[groups]]
+id = "group-1"
+primary = "0123456789abcdef0123456789abcdef01234567"
+
+[[slot_ranges]]
+first = 0
+last = 16383
+group = "group-1"
+```
+
+The parser rejects files over 64 KiB, unknown or duplicate fields/sections,
+noncanonical ids or numeric endpoints, broken references, and any topology
+other than one Meta, one Data, one group, and one full slot range. Run:
+
+```sh
+keylane-ctl cluster-create --manifest cluster.toml \
+  --socket /var/lib/keylane/meta-1/meta-admin.sock
+```
+
+Review the normalized plan and data-erasure warning, then enter exactly
+lowercase `yes`. EOF, any other input, or a failed parse exits before any Meta
+request. Automation may pass `--yes`. `--timeout-ms` is one absolute deadline
+for leader discovery, all server-side commits and Data initialization, READY
+polling, and Redis verification; its default is 120 seconds. Remote TCP uses
+the same mTLS or explicit `--allow-plaintext-admin` policy as
+`cluster-status`; `--json` does not apply. This deadline bounds the client's
+wait, not the lifetime of an accepted durable creation task.
+
+Exit 0 means the exact topology reached READY and the Redis probes passed.
+Exit 1 is a local manifest, confirmation, dependency, or protocol/verification
+failure. Exit 2 is an explicit Meta precondition or domain rejection. Exit 3
+means a timeout, lost leader, or connection failure occurred after creation
+may have begun. Do not submit a replacement creation after exit 3. The leader
+continues the accepted task in the background; after Meta restart or leader
+change it finds unfinished creation operations in the restored journal and
+resumes their committed phase, without another `cluster-create` request.
+Run `cluster-status` and `getop <operation-id>` using the original id from the
+reply or `cluster-create <id> phase=...` Meta log. A non-terminal creation
+record includes its current phase; `recovery-required` means the retained
+intent no longer matches safe execution conditions. Preserve the Meta/Data
+logs and directories and investigate rather than reinitialize. In particular,
+a changed Data boot/history, invalidated attempt, or changed topology does not
+authorize another destructive reset. Existing partial population operations
+from binaries without a durable creation root are not automatically adopted.
+
+Graceful Meta stop cancels result waits and leaves accepted task state intact;
+it does not wait for an offline Data node to return. A Data-reported failure
+fences the group before aborting the operation. Meta recovery preserves a
+successful population and finishes its bookkeeping without initializing again.
+An exit-1 Redis verification failure can occur after Meta
+creation completed, so use the same status and Redis commands after correcting
+the local dependency rather than rerunning creation. Other multi-step cluster
+changes need their own recovery driver. Meta-member addition/removal also has
+one; Data migration/failover orchestration is not automatically recovered just
+because an operation journal exists.
+
 For plaintext remote administration, configure a listener and connect without
 TLS arguments:
 
@@ -158,12 +259,28 @@ keylane-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
 keylane-ctl --socket "$META_ROOT/node3/meta-admin.sock" status
 ```
 
-Do not treat `addsrv` returning `OK` as proof that catch-up finished: NuRaft
-returns it when the invite is accepted. Before adding the next member, poll the
+`addsrv` and `removesrv` persist a workflow before changing identity or Raft
+membership. `OK` means the requested configuration and identity changes have
+committed, not just that NuRaft accepted an invite. Before adding the next member, poll the
 new member's `status` until it remains alive and its `committed` index reaches
 the leader value observed after the add. The current `status` command does not
 list the membership set; a replicated write observed on the joiner is the
 stronger end-to-end check when an automation needs proof of convergence.
+
+The server bounds the Admin wait using `--client-req-timeout-ms`. An
+`ERR uncertain-outcome operation=<id>` reply or disconnected client does not
+cancel the accepted task. The current leader retries in the background; after
+restart or leader change it finds the task in the recovered journal and
+continues without another command. An identical in-flight `addsrv/removesrv`
+request waits on that same task, while a conflicting request returns
+`ERR config-changing`. Query `getop <id>` for the durable phase/result; Meta
+also logs `membership <id> phase=...`. Generic `abortop/completeop` cannot
+release a membership reservation while an accepted Raft change may still
+commit. A `recovery-required` phase requires investigation of the retained
+intent and actual configuration, not a replacement change or automatic
+identity reactivation. A direct request to remove the current leader remains
+rejected; if a previously authorized removal target later becomes leader,
+recovery performs a leadership handoff before continuing its removal.
 
 Plaintext peers still check the claimed Raft source and destination ids against
 the configuration and committed identity bindings, but those ids are not
@@ -456,9 +573,11 @@ keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
   addsrv 4 10.0.0.14:7100 10.0.0.14:7300 10.0.0.14:7200
 ```
 
-The leader first commits and audits the member identity binding, then invokes
-NuRaft `add_srv`. `ERR joining` and `ERR config-changing` mean the caller should
-wait, re-check the leader and both members, and retry the same operation.
+The leader first commits and audits the complete membership intent, then its
+background owner binds identity and invokes NuRaft `add_srv`. A successful
+invite alone does not complete the task. `ERR config-changing` indicates a
+different active workflow; an uncertain-outcome reply retains the original
+operation id and the leader continues retrying independently of the client.
 `ERR already-exists` may mean an earlier invite committed; verify the joiner
 rather than creating a different identity.
 
@@ -468,16 +587,15 @@ To remove a peer, select a follower and run this on the leader:
 keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock removesrv 4
 ```
 
-On success, Keylane first completes NuRaft `remove_srv`, then commits and
+On success, Keylane first observes the committed configuration without the peer, then commits and
 audits retirement of that member's identity before replying `OK`. Stop the
 removed process after the command succeeds. The retired id and principal are
 terminal and cannot be reactivated; replacing that machine requires a new id,
 fresh data directory, and, with mTLS, a new certificate.
 
 Remove one member at a time and preserve a quorum throughout. Prefer removing
-a follower; removing the current leader may return `ERR cannot-remove-leader`
-or trigger a step-down depending on NuRaft state. `ERR leaving` and
-`ERR config-changing` indicate another membership change is still active.
+a follower; directly removing the current leader returns `ERR cannot-remove-leader`.
+`ERR config-changing` indicates another durable membership/creation task is active.
 Never wipe or repurpose a member's data directory before its removal has
 committed and the remaining cluster has elected a healthy leader.
 

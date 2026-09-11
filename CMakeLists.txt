@@ -183,6 +183,7 @@ if (KEYLANE_BUILD_META)
   # operator library have no NuRaft dependency.
   add_library(keylane_meta_admin STATIC
     src/meta/admin_client.cpp
+    src/meta/cluster_create.cpp
     src/meta/cluster_status.cpp
   )
   target_include_directories(keylane_meta_admin PUBLIC
@@ -592,6 +593,7 @@ if (KEYLANE_BUILD_META)
   set(KEYLANE_META_CORE_SOURCES
     src/meta/audit_store.cpp
     src/meta/candidate_plan.cpp
+    src/meta/cluster_create_reconciler.cpp
     src/meta/commands.cpp
     src/meta/control_projector.cpp
     src/meta/coordinator.cpp
@@ -602,6 +604,7 @@ if (KEYLANE_BUILD_META)
     src/meta/grant_store.cpp
     src/meta/identity_verifier.cpp
     src/meta/identity_store.cpp
+    src/meta/membership_reconciler.cpp
     src/meta/observation_store.cpp
     src/meta/operation_store.cpp
     src/meta/policy_store.cpp
@@ -783,6 +786,7 @@ if (BUILD_TESTING)
     # The public operator model is tested without keylane_meta_core so this
     # target also guards the promised Raft-free client boundary.
     add_executable(keylane_cluster_status_tests
+      tests/meta_cluster_create_test.cpp
       tests/meta_cluster_status_test.cpp
     )
     target_link_libraries(keylane_cluster_status_tests PRIVATE
@@ -797,6 +801,8 @@ if (BUILD_TESTING)
     # test binary stays Raft-free, while this binary also links the data module
     # for explicit Meta-projection-to-Data-validation contract tests.
     add_executable(keylane_meta_tests
+      tests/meta_cluster_create_reconciler_test.cpp
+      tests/meta_membership_reconciler_test.cpp
       tests/meta_coordinator_test.cpp
       tests/meta_candidate_plan_test.cpp
       tests/meta_control_projector_test.cpp
@@ -862,7 +868,7 @@ if (BUILD_TESTING)
       # allocator quarantine would turn it into a measurement of ASan retention
       # instead of the bounded live Raft queues it is intended to cover.
       set(KEYLANE_META_INTEGRATION_GATES
-        leader_change recovery membership transport mtls stale_evidence
+        leader_change recovery membership membership_recovery transport mtls stale_evidence
         partition
       )
       if (NOT KEYLANE_ASAN_BUILD)
@@ -900,6 +906,26 @@ if (BUILD_TESTING)
         TIMEOUT 180
         RUN_SERIAL TRUE
       )
+
+      # The tracer-bullet creator verifies the public Redis surface with the
+      # same redis-cli dependency required by the production command.
+      find_program(KEYLANE_CLUSTER_CREATE_REDIS_CLI NAMES redis-cli)
+      if (KEYLANE_CLUSTER_CREATE_REDIS_CLI)
+        add_test(
+          NAME meta_integration.gate_cluster_create
+          COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_cluster_create.py
+                  $<TARGET_FILE:keylane-meta>
+                  $<TARGET_FILE:keylane>
+                  $<TARGET_FILE:keylane-ctl>
+                  ${KEYLANE_CLUSTER_CREATE_REDIS_CLI}
+        )
+        set_tests_properties(meta_integration.gate_cluster_create PROPERTIES
+          LABELS meta-integration
+          TIMEOUT 180
+          RUN_SERIAL TRUE
+        )
+      endif()
     else()
       message(STATUS "python3 not found; meta integration tests are disabled")
     endif()

@@ -17,7 +17,9 @@ Celer owns the worker and socket lifecycle underneath those Keylane modules.
 A separate `keylane-meta` executable runs the [Raft-backed meta control
 plane](08-meta-control-plane.md). It owns committed cluster metadata,
 leader-local observations, authenticated administration, and coordination
-plus process-lifetime Data-control sessions. It links the pinned NuRaft
+plus process-lifetime Data-control sessions. Initial creation and Meta-member
+addition/removal are durable operations recovered by the current leader, independent of an Admin client's
+connection or wait deadline. It links the pinned NuRaft
 submodule, whose native Asio service owns Raft peer communication; Celer owns
 the separate administrative and Data-node sessions. The Raft-free
 `keylane-ctl` operator client sends direct administrative commands; its
