@@ -204,9 +204,9 @@ struct MetaDataControlServerOptions {
   std::uint32_t server_id_ = 0;
   std::string bind_host_;
   std::uint16_t port_ = 0;
-  // The local administrative TCP endpoint is committed with the member
-  // definition so operator clients can follow a follower seed to the leader.
-  // Empty is permitted only while this process is a UDS-managed sole voter.
+  // Process-local administrative TCP listener. Every process supplies one
+  // even when it also exposes UDS; the durable advertised route may name a
+  // proxy instead.
   std::string local_ctl_endpoint_;
   std::shared_ptr<MetaDataControlRuntimeStatus> runtime_status_;
 
@@ -235,8 +235,7 @@ struct MetaDataControlServerOptions {
   // follower finishes its redirect), there is no durable owner with which to
   // deduplicate a socket. The default equals the maximum projected Data-node
   // population, and validation forbids raising it beyond that domain cap.
-  std::size_t max_pending_handshakes_ =
-      cluster::control::kMaxProjectedNodes;
+  std::size_t max_pending_handshakes_ = cluster::control::kMaxProjectedNodes;
   // Four frame-sized lanes: authority, reliable, bulk, and soft. Large
   // objects stream one frame at a time and do not consume an object-sized
   // allocation here.
@@ -247,8 +246,7 @@ struct MetaDataControlServerOptions {
   // pathologically structural object may still be rejected below its wire
   // cap instead of escaping this process-wide bound.
   std::size_t max_retained_projection_bytes_ =
-      4 * static_cast<std::size_t>(
-              cluster::control::kMaxFullDesiredStateBytes);
+      4 * static_cast<std::size_t>(cluster::control::kMaxFullDesiredStateBytes);
 };
 
 struct MetaDataControlMetricsSnapshot {
@@ -375,21 +373,6 @@ class MetaLeaderRuntimeGuard {
 // member records. Malformed committed endpoints fail closed.
 absl::StatusOr<std::vector<cluster::control::WireMetaEndpoint>>
 BuildCommittedMetaDirectory(const MetaCommittedView& view);
-
-enum class MetaLocalMemberBindingDisposition : std::uint8_t {
-  kAlreadyBound,
-  kNeedsBind,
-};
-
-// Pure leader-start decision for the local bootstrap member. Missing state is
-// repairable by one idempotent BindMetaMember proposal; retirement or a
-// principal/endpoint conflict is terminal and remains fail-closed.
-absl::StatusOr<MetaLocalMemberBindingDisposition>
-EvaluateLocalMetaMemberBinding(const MetaCommittedView& view,
-                               std::uint32_t server_id,
-                               std::string_view principal,
-                               std::string_view data_control_endpoint,
-                               std::string_view ctl_endpoint);
 
 enum class MetaDirectiveDelivery : std::uint8_t {
   kFrame,
@@ -530,11 +513,9 @@ class MetaDataControlServer final : public MetaReconciler {
   void StartOnExecutor(MetaLeaderContext* context);
 
   static celer::Task<absl::Status> AcceptLoop(CorePtr core);
-  static celer::Task<absl::Status> SessionLoop(CorePtr core,
-                                               celer::TcpStream stream,
-                                               celer::Connection* connection,
-                                               detail::PendingHandshakeLimiter::Permit
-                                                   handshake_permit);
+  static celer::Task<absl::Status> SessionLoop(
+      CorePtr core, celer::TcpStream stream, celer::Connection* connection,
+      detail::PendingHandshakeLimiter::Permit handshake_permit);
 
   CorePtr core_;
 };

@@ -19,11 +19,14 @@
 #include "keylane/meta/cluster_create.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/population_manifest_store.h"
+#include "libnuraft/raft_params.hxx"
+#include "libnuraft/raft_server.hxx"
 #include "spdlog/spdlog.h"
 
 namespace keylane::meta {
 namespace {
 constexpr std::string_view kV1Policy = "keylane.cluster-create-v1";
+constexpr std::string_view kRootPhaseWaitMetaBarrier = "wait-meta-barrier";
 constexpr std::string_view kRootPhaseRegisterData = "register-data";
 constexpr std::string_view kRootPhaseCreateGroups = "create-groups";
 constexpr std::string_view kRootPhaseSlotMap = "slot-map";
@@ -92,6 +95,81 @@ Plan Abort(const MetaOperationRecord& operation, std::string reason) {
   return Emit(std::move(command));
 }
 
+// ClusterCreateManifestV1 is normalized before persistence; comparisons below
+// adapt its validated tcp:// endpoints to the scheme-free runtime models.
+std::string StripValidatedTcpEndpointScheme(std::string_view endpoint) {
+  constexpr std::string_view kTcpPrefix = "tcp://";
+  return std::string(endpoint.substr(kTcpPrefix.size()));
+}
+
+absl::Status ValidateMetaSet(const MetaCommittedView& view,
+                             const ClusterCreateManifestV1& manifest,
+                             const MetaClusterCreateRaftView& raft) {
+  if (raft.local_server_id_ == 0 ||
+      raft.members_.size() != manifest.meta_members_.size()) {
+    return absl::FailedPreconditionError(
+        "creation Meta config differs from intent");
+  }
+  const auto bindings = view.identity().MetaMembers();
+  if (bindings.size() != manifest.meta_members_.size()) {
+    return absl::FailedPreconditionError(
+        "creation Meta identity directory differs from intent");
+  }
+  bool local_found = false;
+  for (std::size_t index = 0; index < manifest.meta_members_.size(); ++index) {
+    const auto& expected = manifest.meta_members_[index];
+    const auto& peer = raft.members_[index];
+    if (peer.id_ != expected.server_id_ ||
+        peer.endpoint_ !=
+            StripValidatedTcpEndpointScheme(expected.raft_endpoint_) ||
+        peer.principal_ !=
+            absl::StrCat("keylane://meta/", expected.server_id_) ||
+        peer.data_control_endpoint_ !=
+            StripValidatedTcpEndpointScheme(
+                expected.data_control_endpoint_) ||
+        peer.ctl_endpoint_ !=
+            StripValidatedTcpEndpointScheme(expected.ctl_endpoint_) ||
+        peer.dc_id_ != 0 || peer.priority_ != 1 || peer.learner_ ||
+        peer.new_joiner_) {
+      return absl::FailedPreconditionError(
+          "creation Meta config descriptor differs from intent");
+    }
+    const auto binding = view.identity().FindMetaMember(expected.server_id_);
+    if (!binding.has_value() || binding->retired_ ||
+        binding->principal_ != peer.principal_ ||
+        binding->data_control_endpoint_ != peer.data_control_endpoint_ ||
+        binding->ctl_endpoint_ != std::optional(peer.ctl_endpoint_)) {
+      return absl::FailedPreconditionError(
+          "creation Meta identity binding differs from config descriptor");
+    }
+    local_found |= expected.server_id_ == raft.local_server_id_;
+  }
+  if (!local_found) {
+    return absl::FailedPreconditionError(
+        "local Meta member is absent from creation intent");
+  }
+  return absl::OkStatus();
+}
+
+bool MetaBarrierSatisfied(const MetaOperationRecord& operation,
+                          const MetaClusterCreateRaftView& raft) {
+  if (operation.operation_seq_ == 0 || raft.max_response_age_us_ == 0) {
+    return false;
+  }
+  for (const auto& member : raft.members_) {
+    if (member.id_ == raft.local_server_id_) continue;
+    const auto progress = std::find_if(
+        raft.peer_progress_.begin(), raft.peer_progress_.end(),
+        [&](const auto& item) { return item.server_id_ == member.id_; });
+    if (progress == raft.peer_progress_.end() ||
+        progress->last_response_age_us_ > raft.max_response_age_us_ ||
+        progress->last_sm_committed_index_ < operation.operation_seq_) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool ProjectionMatches(const MetaDataControlRuntimeNode& runtime,
                        const MetaTopologyGroupView& group,
                        const MetaGroupGrantState& grant,
@@ -123,9 +201,9 @@ bool ProjectionMatches(const MetaDataControlRuntimeNode& runtime,
 
 const ClusterCreateManifestV1::DataNode* FindData(
     const ClusterCreateManifestV1& manifest, std::string_view node_id) {
-  const auto found = std::find_if(
-      manifest.data_nodes_.begin(), manifest.data_nodes_.end(),
-      [&](const auto& node) { return node.node_id_ == node_id; });
+  const auto found =
+      std::find_if(manifest.data_nodes_.begin(), manifest.data_nodes_.end(),
+                   [&](const auto& node) { return node.node_id_ == node_id; });
   return found == manifest.data_nodes_.end() ? nullptr : &*found;
 }
 
@@ -150,7 +228,7 @@ MetaAssignmentId V1AssignmentId(const MetaOperationId& root,
                                 std::string_view node_id) {
   return DerivedV1Id(
       root, absl::StrCat("assignment/", absl::BytesToHexString(group_id), "/",
-                        node_id));
+                         node_id));
 }
 
 std::vector<std::pair<std::string, MetaNodeRole>> DeclaredMembers(
@@ -177,8 +255,7 @@ PutPopulationManifest V1PopulationManifest(
 }
 
 bool V1SlotMapMatches(const MetaStores& stores,
-                      const ClusterCreateManifestV1& manifest,
-                      bool* empty) {
+                      const ClusterCreateManifestV1& manifest, bool* empty) {
   *empty = true;
   bool matches = true;
   std::size_t range_index = 0;
@@ -204,9 +281,8 @@ absl::Status ValidateV1Nodes(const MetaStores& stores,
         node.role_ != DeclaredRole(manifest, node.node_id_) ||
         node.endpoints_ !=
             std::vector<std::string>{declaration->client_endpoint_}) {
-      return absl::FailedPreconditionError(
-          absl::StrCat("creation node differs from intent: node=",
-                       node.node_id_));
+      return absl::FailedPreconditionError(absl::StrCat(
+          "creation node differs from intent: node=", node.node_id_));
     }
   }
   if (stores.identity_.NodeCount() > manifest.data_nodes_.size() ||
@@ -244,15 +320,15 @@ absl::Status ValidateV1GroupMembers(
   return absl::OkStatus();
 }
 
-absl::Status ValidateV1GroupsKnown(
-    const MetaStores& stores, const ClusterCreateManifestV1& manifest,
-    const MetaOperationId& root, bool require_all_members) {
+absl::Status ValidateV1GroupsKnown(const MetaStores& stores,
+                                   const ClusterCreateManifestV1& manifest,
+                                   const MetaOperationId& root,
+                                   bool require_all_members) {
   for (const MetaTopologyGroupView& group : stores.topology_.Groups()) {
     const auto* declaration = FindDeclaration(manifest, group.group_id_);
     if (declaration == nullptr)
-      return absl::FailedPreconditionError(
-          absl::StrCat("creation has an unknown Group: group=",
-                       group.group_id_));
+      return absl::FailedPreconditionError(absl::StrCat(
+          "creation has an unknown Group: group=", group.group_id_));
     if (auto status = ValidateV1GroupMembers(group, *declaration, root,
                                              require_all_members);
         !status.ok())
@@ -267,9 +343,10 @@ absl::Status ValidateV1GroupsKnown(
   return absl::OkStatus();
 }
 
-absl::Status ValidateV1FinalTopology(
-    const MetaStores& stores, const ClusterCreateManifestV1& manifest,
-    const MetaOperationId& root, bool allow_failed_group) {
+absl::Status ValidateV1FinalTopology(const MetaStores& stores,
+                                     const ClusterCreateManifestV1& manifest,
+                                     const MetaOperationId& root,
+                                     bool allow_failed_group) {
   if (auto status = ValidateV1Nodes(stores, manifest, true); !status.ok())
     return status;
   if (auto status = ValidateV1GroupsKnown(stores, manifest, root, true);
@@ -283,8 +360,7 @@ absl::Status ValidateV1FinalTopology(
   if (!policy.has_value() || policy->retired_ ||
       policy->content_ != "declarative-empty-population" ||
       policy->content_hash_ != MetaSha256(policy->content_))
-    return absl::FailedPreconditionError(
-        "creation policy differs from intent");
+    return absl::FailedPreconditionError("creation policy differs from intent");
   const MetaGrantSpec expected_grant{5'000, std::string(kV1Policy), 1};
   for (const auto& declaration : manifest.groups_) {
     const auto group = stores.topology_.FindGroup(declaration.group_id_);
@@ -303,12 +379,11 @@ absl::Status ValidateV1FinalTopology(
           absl::StrCat("creation Group anchors differ from intent: group=",
                        declaration.group_id_));
     }
-    const bool active =
-        grant->grant_.has_value() && !grant->fenced_ &&
-        grant->grant_->owner_ == declaration.primary_node_id_ &&
-        grant->grant_->term_ == 1 &&
-        grant->grant_->authority_version_ == 1 &&
-        grant->grant_->spec_ == expected_grant;
+    const bool active = grant->grant_.has_value() && !grant->fenced_ &&
+                        grant->grant_->owner_ == declaration.primary_node_id_ &&
+                        grant->grant_->term_ == 1 &&
+                        grant->grant_->authority_version_ == 1 &&
+                        grant->grant_->spec_ == expected_grant;
     const bool failed = allow_failed_group && grant->fenced_ &&
                         group->record_.authority_version_ == 1;
     if (!active && !failed)
@@ -323,8 +398,8 @@ std::optional<MetaTerminalReceipt> ReceiptFor(
     const MetaOperationRecord& operation, const MetaOperationId& directive_id,
     const MetaOperationId& attempt_id) {
   const auto found = std::find_if(
-      operation.terminal_receipts_.begin(),
-      operation.terminal_receipts_.end(), [&](const auto& receipt) {
+      operation.terminal_receipts_.begin(), operation.terminal_receipts_.end(),
+      [&](const auto& receipt) {
         return receipt.key_.directive_id_ == directive_id &&
                receipt.key_.attempt_id_ == attempt_id;
       });
@@ -343,17 +418,16 @@ absl::StatusOr<MetaBootIncarnation> ParseBoot(std::string_view value) {
   return result;
 }
 
-Plan PlanV1GroupStep(
-    const MetaCommittedView& view, const MetaOperationRecord& root,
-    const MetaOperationRecord& operation,
-    const ClusterCreateManifestV1& manifest,
-    const ClusterCreateManifestV1::Group& declaration,
-    const MetaDataControlRuntimeSnapshot& runtime) {
+Plan PlanV1GroupStep(const MetaCommittedView& view,
+                     const MetaOperationRecord& root,
+                     const MetaOperationRecord& operation,
+                     const ClusterCreateManifestV1& manifest,
+                     const ClusterCreateManifestV1::Group& declaration,
+                     const MetaDataControlRuntimeSnapshot& runtime) {
   const auto& stores = view.stores();
   const auto group = stores.topology_.FindGroup(declaration.group_id_);
   const auto grant = stores.grant_.GroupState(declaration.group_id_);
-  const auto population =
-      V1PopulationManifest(manifest, declaration.group_id_);
+  const auto population = V1PopulationManifest(manifest, declaration.group_id_);
   if (!group.has_value() || !grant.has_value())
     return Conflict(absl::StrCat("group=", declaration.group_id_,
                                  " committed anchors disappeared"));
@@ -364,9 +438,9 @@ Plan PlanV1GroupStep(
   if (primary_member == group->members_.end())
     return Conflict(absl::StrCat("group=", declaration.group_id_,
                                  " primary assignment disappeared"));
-  const std::string intent_prefix = absl::StrCat(
-      "cluster-create-v1-group ", Hex(root.operation_id_), " ",
-      absl::BytesToHexString(declaration.group_id_), " ");
+  const std::string intent_prefix =
+      absl::StrCat("cluster-create-v1-group ", Hex(root.operation_id_), " ",
+                   absl::BytesToHexString(declaration.group_id_), " ");
   if (operation.kind_ != kMetaClusterCreateV1GroupOperationKind ||
       !operation.intent_.starts_with(intent_prefix))
     return Conflict(absl::StrCat("group=", declaration.group_id_,
@@ -411,8 +485,8 @@ Plan PlanV1GroupStep(
     return Abort(operation, std::move(reason));
   };
   if (operation.kind_phase_blob_.starts_with(kGroupFailurePrefix)) {
-    return fence_or_abort(operation.kind_phase_blob_.substr(
-        kGroupFailurePrefix.size()));
+    return fence_or_abort(
+        operation.kind_phase_blob_.substr(kGroupFailurePrefix.size()));
   }
 
   if (operation.lifecycle_ == MetaOperationLifecycle::kSubmitted) {
@@ -454,8 +528,9 @@ Plan PlanV1GroupStep(
   if (operation.kind_phase_blob_ == kGroupPhaseInitialize) {
     if (!primary_receipt.has_value()) {
       if (!grant->grant_.has_value() || grant->fenced_)
-        return Conflict(absl::StrCat("group=", declaration.group_id_,
-                                     " authority changed during initialization"));
+        return Conflict(
+            absl::StrCat("group=", declaration.group_id_,
+                         " authority changed during initialization"));
       if (operation.current_directives_.size() != 1 ||
           operation.current_directives_.front().spec_.directive_id_ !=
               primary_directive ||
@@ -470,10 +545,10 @@ Plan PlanV1GroupStep(
       return std::nullopt;
     }
     if (primary_receipt->status_ != MetaDirectiveResultStatus::kSucceeded)
-      return fence_or_abort(absl::StrCat(
-          "group=", declaration.group_id_, " node=",
-          primary_receipt->recipient_node_id_, " primary initialization: ",
-          primary_receipt->result_));
+      return fence_or_abort(
+          absl::StrCat("group=", declaration.group_id_,
+                       " node=", primary_receipt->recipient_node_id_,
+                       " primary initialization: ", primary_receipt->result_));
     if (declaration.replica_node_ids_.empty())
       return Advance(operation, kGroupPhaseReady);
     if (!grant->grant_.has_value() || grant->fenced_)
@@ -492,13 +567,13 @@ Plan PlanV1GroupStep(
         declaration.replica_node_ids_.size() * 2);
     for (const std::string& replica : declaration.replica_node_ids_) {
       const auto target = std::find_if(
-          runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& node) {
-            return node.node_id_ == replica;
-          });
+          runtime.nodes_.begin(), runtime.nodes_.end(),
+          [&](const auto& node) { return node.node_id_ == replica; });
       const auto target_member = std::find_if(
           group->members_.begin(), group->members_.end(),
           [&](const auto& member) { return member.node_id_ == replica; });
-      if (target == runtime.nodes_.end() || target_member == group->members_.end() ||
+      if (target == runtime.nodes_.end() ||
+          target_member == group->members_.end() ||
           !ProjectionMatches(*target, *group, *grant, view.applied_index()))
         return std::nullopt;
       auto target_boot = ParseBoot(target->boot_id_);
@@ -506,8 +581,7 @@ Plan PlanV1GroupStep(
         return Conflict(absl::StrCat("group=", declaration.group_id_,
                                      " node=", replica, " ",
                                      target_boot.status().message()));
-      const std::string purpose =
-          absl::StrCat("replica/", replica, "/");
+      const std::string purpose = absl::StrCat("replica/", replica, "/");
       MetaDirectiveSpec authorize;
       authorize.directive_id_ =
           DerivedV1Id(operation.operation_id_, purpose + "authorize");
@@ -555,45 +629,43 @@ Plan PlanV1GroupStep(
                                      " replica directives were invalidated"));
       const std::uint64_t revision =
           operation.current_directives_.front().directive_revision_;
-      for (std::size_t index = 0;
-           index < declaration.replica_node_ids_.size(); ++index) {
+      for (std::size_t index = 0; index < declaration.replica_node_ids_.size();
+           ++index) {
         const std::string& replica = declaration.replica_node_ids_[index];
-        const std::string purpose =
-            absl::StrCat("replica/", replica, "/");
+        const std::string purpose = absl::StrCat("replica/", replica, "/");
         const auto& authorize = operation.current_directives_[index * 2];
         const auto& rebuild = operation.current_directives_[index * 2 + 1];
-        if (revision == 0 ||
-            authorize.directive_revision_ != revision ||
+        if (revision == 0 || authorize.directive_revision_ != revision ||
             rebuild.directive_revision_ != revision ||
             authorize.spec_.directive_id_ !=
                 DerivedV1Id(operation.operation_id_, purpose + "authorize") ||
-            authorize.spec_.attempt_id_ != DerivedV1Id(
-                operation.operation_id_, purpose + "authorize-attempt") ||
+            authorize.spec_.attempt_id_ !=
+                DerivedV1Id(operation.operation_id_,
+                            purpose + "authorize-attempt") ||
             authorize.spec_.kind_ != kMetaDirectiveAuthorizeSource ||
             authorize.spec_.recipient_node_id_ !=
                 declaration.primary_node_id_ ||
             rebuild.spec_.directive_id_ !=
                 DerivedV1Id(operation.operation_id_, purpose + "rebuild") ||
-            rebuild.spec_.attempt_id_ != DerivedV1Id(
-                operation.operation_id_, purpose + "rebuild-attempt") ||
+            rebuild.spec_.attempt_id_ !=
+                DerivedV1Id(operation.operation_id_,
+                            purpose + "rebuild-attempt") ||
             rebuild.spec_.kind_ != kMetaDirectiveRebuild ||
             rebuild.spec_.recipient_node_id_ != replica)
-          return Conflict(absl::StrCat(
-              "group=", declaration.group_id_, " node=", replica,
-              " replica directive batch differs from intent"));
+          return Conflict(
+              absl::StrCat("group=", declaration.group_id_, " node=", replica,
+                           " replica directive batch differs from intent"));
       }
     }
     std::optional<MetaTerminalReceipt> failed;
     bool all_succeeded = true;
     for (const std::string& replica : declaration.replica_node_ids_) {
-      const std::string purpose =
-          absl::StrCat("replica/", replica, "/");
+      const std::string purpose = absl::StrCat("replica/", replica, "/");
       for (const std::string_view kind : {"authorize", "rebuild"}) {
         const auto directive =
             DerivedV1Id(operation.operation_id_, purpose + std::string(kind));
         const auto attempt = DerivedV1Id(
-            operation.operation_id_,
-            purpose + std::string(kind) + "-attempt");
+            operation.operation_id_, purpose + std::string(kind) + "-attempt");
         const auto receipt = ReceiptFor(operation, directive, attempt);
         if (!receipt.has_value()) {
           all_succeeded = false;
@@ -608,9 +680,8 @@ Plan PlanV1GroupStep(
     }
     if (failed.has_value())
       return fence_or_abort(absl::StrCat(
-          "group=", declaration.group_id_, " node=",
-          failed->recipient_node_id_, " replica initialization: ",
-          failed->result_));
+          "group=", declaration.group_id_, " node=", failed->recipient_node_id_,
+          " replica initialization: ", failed->result_));
     if (grant->fenced_)
       return Conflict(absl::StrCat("group=", declaration.group_id_,
                                    " authority changed during replication"));
@@ -655,37 +726,37 @@ Plan PlanV1GroupStep(
                                " has an unknown creation phase"));
 }
 
-Plan PlanV1ClusterCreateStep(
-    const MetaCommittedView& view, const MetaOperationRecord& operation,
-    const MetaDataControlRuntimeSnapshot& runtime) {
+Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
+                             const MetaOperationRecord& operation,
+                             const MetaDataControlRuntimeSnapshot& runtime,
+                             const MetaClusterCreateRaftView& raft) {
   if (operation.kind_ != kMetaClusterCreateOperationKind ||
       IsTerminal(operation.lifecycle_))
     return std::nullopt;
   std::uint32_t unused_timeout = 0;
-  auto manifest = DecodeClusterCreateRequest(operation.intent_, &unused_timeout);
+  auto manifest =
+      DecodeClusterCreateRequest(operation.intent_, &unused_timeout);
   if (!manifest.ok())
     return Conflict("creation intent is not a recoverable v1 plan");
   const auto& stores = view.stores();
-  const auto meta_members = stores.identity_.MetaMembers();
-  if (std::count_if(meta_members.begin(), meta_members.end(),
-                    [](const auto& member) { return !member.retired_; }) != 1 ||
-      std::none_of(meta_members.begin(), meta_members.end(),
-                   [&](const auto& member) {
-                     return !member.retired_ &&
-                            member.server_id_ == manifest->meta_member_id_;
-                   }))
-    return Conflict("creation Meta membership differs from intent");
+  if (auto status = detail::ValidateClusterCreateMetaSet(view, *manifest, raft);
+      !status.ok()) {
+    return Conflict(status.message());
+  }
   if (auto status = ValidateV1Nodes(stores, *manifest, false); !status.ok())
     return Conflict(status.message());
-  if (auto status =
-          ValidateV1GroupsKnown(stores, *manifest, operation.operation_id_,
-                                false);
+  if (auto status = ValidateV1GroupsKnown(stores, *manifest,
+                                          operation.operation_id_, false);
       !status.ok())
     return Conflict(status.message());
 
   const std::string phase = operation.kind_phase_blob_.empty()
-                                ? std::string(kRootPhaseRegisterData)
+                                ? std::string(kRootPhaseWaitMetaBarrier)
                                 : operation.kind_phase_blob_;
+  if (phase == kRootPhaseWaitMetaBarrier) {
+    if (!MetaBarrierSatisfied(operation, raft)) return std::nullopt;
+    return Advance(operation, kRootPhaseRegisterData);
+  }
   if (phase == kRootPhaseRegisterData) {
     if (stores.topology_.GroupCount() != 0)
       return Conflict("creation Group appeared before registration completed");
@@ -718,11 +789,11 @@ Plan PlanV1ClusterCreateStep(
           group->record_.population_manifest_revision_ != 0 ||
           group->record_.partition_replication_epoch_ != 0 ||
           !group->record_.owner_.empty())
-        return Conflict(absl::StrCat(
-            "creation Group advanced unexpectedly: group=",
-            declaration.group_id_));
-      if (auto status = ValidateV1GroupMembers(
-              *group, declaration, operation.operation_id_, false);
+        return Conflict(
+            absl::StrCat("creation Group advanced unexpectedly: group=",
+                         declaration.group_id_));
+      if (auto status = ValidateV1GroupMembers(*group, declaration,
+                                               operation.operation_id_, false);
           !status.ok())
         return Conflict(status.message());
       for (const auto& [node_id, role] : DeclaredMembers(declaration)) {
@@ -737,8 +808,7 @@ Plan PlanV1ClusterCreateStep(
               operation.operation_id_, declaration.group_id_, node_id);
           command.role_ = role;
           command.expected_revision_ = group->revision_;
-          command.new_topology_epoch_ =
-              stores.topology_.TopologyEpoch() + 1;
+          command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
           return Emit(std::move(command));
         }
       }
@@ -752,8 +822,8 @@ Plan PlanV1ClusterCreateStep(
     return Advance(operation, kRootPhaseSlotMap);
   }
 
-  if (auto status = ValidateV1GroupsKnown(
-          stores, *manifest, operation.operation_id_, true);
+  if (auto status = ValidateV1GroupsKnown(stores, *manifest,
+                                          operation.operation_id_, true);
       !status.ok())
     return Conflict(status.message());
   if (phase == kRootPhaseSlotMap) {
@@ -773,8 +843,7 @@ Plan PlanV1ClusterCreateStep(
     if (slots_empty && epochs_zero) {
       SetSlotMap command;
       for (const auto& range : manifest->slot_ranges_)
-        command.ranges_.push_back(
-            {range.first_, range.last_, range.group_id_});
+        command.ranges_.push_back({range.first_, range.last_, range.group_id_});
       for (const auto& declaration : manifest->groups_)
         command.config_epochs_.push_back({declaration.group_id_, 1});
       command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
@@ -789,8 +858,7 @@ Plan PlanV1ClusterCreateStep(
   if (!V1SlotMapMatches(stores, *manifest, &slots_empty) || slots_empty)
     return Conflict("creation Slot map differs from intent");
   if (phase == kRootPhasePolicy) {
-    const auto policy =
-        stores.policy_.FindVersion(std::string(kV1Policy), 1);
+    const auto policy = stores.policy_.FindVersion(std::string(kV1Policy), 1);
     if (!policy.has_value()) {
       PutPolicy command;
       command.policy_id_ = kV1Policy;
@@ -836,20 +904,18 @@ Plan PlanV1ClusterCreateStep(
         return Emit(std::move(command));
       }
       if (!population_matches)
-        return Conflict(absl::StrCat(
-            "creation population differs from intent: group=",
-            declaration.group_id_));
+        return Conflict(
+            absl::StrCat("creation population differs from intent: group=",
+                         declaration.group_id_));
       const bool authority_matches =
           grant->grant_.has_value() && !grant->fenced_ &&
           grant->grant_->owner_ == declaration.primary_node_id_ &&
-          grant->grant_->term_ == 1 &&
-          grant->grant_->authority_version_ == 1 &&
+          grant->grant_->term_ == 1 && grant->grant_->authority_version_ == 1 &&
           grant->grant_->spec_ == expected_grant;
       if (!authority_matches) {
-        if (group->record_.authority_version_ != 0 ||
-            grant->grant_.has_value())
-          return Conflict(absl::StrCat(
-              "creation authority changed: group=", declaration.group_id_));
+        if (group->record_.authority_version_ != 0 || grant->grant_.has_value())
+          return Conflict(absl::StrCat("creation authority changed: group=",
+                                       declaration.group_id_));
         ActivateAuthority command;
         command.group_id_ = declaration.group_id_;
         command.expected_term_ = 1;
@@ -867,9 +933,9 @@ Plan PlanV1ClusterCreateStep(
   if (phase != kRootPhaseWaitDataProjection &&
       phase != kRootPhaseInitializeGroups)
     return Conflict("unknown v1 creation phase");
-  if (auto status = ValidateV1FinalTopology(
-          stores, *manifest, operation.operation_id_,
-          phase == kRootPhaseInitializeGroups);
+  if (auto status =
+          ValidateV1FinalTopology(stores, *manifest, operation.operation_id_,
+                                  phase == kRootPhaseInitializeGroups);
       !status.ok())
     return Conflict(status.message());
   if (phase == kRootPhaseWaitDataProjection) {
@@ -896,9 +962,9 @@ Plan PlanV1ClusterCreateStep(
     const auto child = stores.operation_.FindOperation(child_id);
     if (!child.has_value()) {
       if (stores.operation_.OperationKnown(child_id))
-        return Conflict(absl::StrCat(
-            "creation Group operation was archived: group=",
-            declaration.group_id_));
+        return Conflict(
+            absl::StrCat("creation Group operation was archived: group=",
+                         declaration.group_id_));
       const auto group = stores.topology_.FindGroup(declaration.group_id_);
       const auto grant = stores.grant_.GroupState(declaration.group_id_);
       const auto primary = std::find_if(
@@ -916,10 +982,10 @@ Plan PlanV1ClusterCreateStep(
       SubmitOperation submit;
       submit.operation_id_ = child_id;
       submit.kind_ = kMetaClusterCreateV1GroupOperationKind;
-      submit.intent_ = absl::StrCat(
-          "cluster-create-v1-group ", Hex(operation.operation_id_), " ",
-          absl::BytesToHexString(declaration.group_id_), " ",
-          primary->boot_id_);
+      submit.intent_ =
+          absl::StrCat("cluster-create-v1-group ", Hex(operation.operation_id_),
+                       " ", absl::BytesToHexString(declaration.group_id_), " ",
+                       primary->boot_id_);
       submit.intent_hash_ = MetaSha256(submit.intent_);
       submit.replication_history_id_ = primary->replication_history_id_;
       submit.policy_references_ = {{std::string(kV1Policy), 1}};
@@ -927,11 +993,10 @@ Plan PlanV1ClusterCreateStep(
     }
     if (child->lifecycle_ == MetaOperationLifecycle::kCompleted) continue;
     if (child->lifecycle_ == MetaOperationLifecycle::kAborted)
-      return Abort(operation,
-                   absl::StrCat("group=", declaration.group_id_, " ",
-                                child->terminal_result_));
-    auto next = PlanV1GroupStep(view, operation, *child, *manifest,
-                                declaration, runtime);
+      return Abort(operation, absl::StrCat("group=", declaration.group_id_, " ",
+                                           child->terminal_result_));
+    auto next = PlanV1GroupStep(view, operation, *child, *manifest, declaration,
+                                runtime);
     if (!next.ok() || next->has_value()) return next;
     return std::nullopt;
   }
@@ -942,15 +1007,22 @@ Plan PlanV1ClusterCreateStep(
 
 MetaOperationId detail::ClusterCreateV1GroupOperationId(
     const MetaOperationId& root, std::string_view group_id) {
-  return DerivedV1Id(
-      root, absl::StrCat("group/", absl::BytesToHexString(group_id)));
+  return DerivedV1Id(root,
+                     absl::StrCat("group/", absl::BytesToHexString(group_id)));
+}
+
+absl::Status detail::ValidateClusterCreateMetaSet(
+    const MetaCommittedView& view, const ClusterCreateManifestV1& manifest,
+    const MetaClusterCreateRaftView& raft) {
+  return ValidateMetaSet(view, manifest, raft);
 }
 
 Plan detail::PlanClusterCreateStep(
     const MetaCommittedView& view, const MetaOperationRecord& operation,
-    const MetaDataControlRuntimeSnapshot& runtime) {
+    const MetaDataControlRuntimeSnapshot& runtime,
+    const MetaClusterCreateRaftView& raft) {
   if (operation.kind_ == kMetaClusterCreateOperationKind)
-    return PlanV1ClusterCreateStep(view, operation, runtime);
+    return PlanV1ClusterCreateStep(view, operation, runtime, raft);
   return std::nullopt;
 }
 
@@ -958,6 +1030,8 @@ struct MetaClusterCreateReconciler::Core {
   celer::ForeignExecutor executor_;
   std::shared_ptr<MetaMembershipGate> membership_gate_;
   std::shared_ptr<MetaDataControlRuntimeStatus> runtime_status_;
+  nuraft::ptr<nuraft::raft_server> server_;
+  std::uint64_t max_peer_response_age_us_ = 0;
   // Worker-owned except the atomic ingress/stop-completion flags below.
   bool running_ = false;
   bool cancelled_ = true;
@@ -967,18 +1041,47 @@ struct MetaClusterCreateReconciler::Core {
   std::atomic<bool> stopping_{false};
 };
 
+template <typename CoreT>
+void SetPeerSmCommitTracking(const std::shared_ptr<CoreT>& core, bool enabled) {
+  auto params = core->server_->get_current_params();
+  if (params.track_peers_sm_commit_idx_ == enabled) return;
+  params.track_peers_sm_commit_idx_ = enabled;
+  core->server_->update_params(params);
+  spdlog::info("cluster-create peer SM commit tracking {}",
+               enabled ? "enabled" : "disabled");
+}
+
+bool IsWaitingAtMetaBarrier(const MetaOperationRecord& operation) {
+  return operation.kind_ == kMetaClusterCreateOperationKind &&
+         !IsTerminal(operation.lifecycle_) &&
+         (operation.kind_phase_blob_.empty() ||
+          operation.kind_phase_blob_ == kRootPhaseWaitMetaBarrier);
+}
+
 MetaClusterCreateReconciler::MetaClusterCreateReconciler(
     celer::ForeignExecutor executor, std::shared_ptr<MetaMembershipGate> gate,
-    std::shared_ptr<MetaDataControlRuntimeStatus> runtime)
+    std::shared_ptr<MetaDataControlRuntimeStatus> runtime,
+    nuraft::ptr<nuraft::raft_server> server,
+    std::uint64_t max_peer_response_age_us)
     : core_(std::make_shared<Core>()) {
   core_->executor_ = std::move(executor);
   core_->membership_gate_ = std::move(gate);
   core_->runtime_status_ = std::move(runtime);
+  core_->server_ = std::move(server);
+  core_->max_peer_response_age_us_ = max_peer_response_age_us;
 }
 MetaClusterCreateReconciler::~MetaClusterCreateReconciler() { Shutdown(); }
 
 void MetaClusterCreateReconciler::Start(MetaLeaderContext& context) {
   const auto core = core_;
+  // Start is serialized on the coordinator's leadership thread. Establish
+  // leader completion semantics here, before an earlier-registered reconciler
+  // can run a genesis binding proposal on the worker executor.
+  const auto view = context.CommittedView();
+  const auto live_operations = view.operation().LiveOperations();
+  SetPeerSmCommitTracking(
+      core, std::any_of(live_operations.begin(), live_operations.end(),
+                        IsWaitingAtMetaBarrier));
   if (!core->executor_.Notify([core, context = &context]() noexcept {
         if (core->shutdown_) return;
         if (core->running_) std::terminate();
@@ -1039,14 +1142,22 @@ celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
     const auto& view = subscribed.view_;
     const bool has_creation =
         view.operation().HasActiveKind(kMetaClusterCreateOperationKind);
-    const auto operations = has_creation
-                                ? view.operation().LiveOperations()
-                                : std::vector<MetaOperationRecord>{};
+    const auto operations = has_creation ? view.operation().LiveOperations()
+                                         : std::vector<MetaOperationRecord>{};
     const auto operation = std::find_if(
         operations.begin(), operations.end(), [](const auto& item) {
           return item.kind_ == kMetaClusterCreateOperationKind &&
                  !IsTerminal(item.lifecycle_);
         });
+    // NuRaft's tracking switch has two inseparable effects: followers report
+    // their SM commit index, while a leader delays every client completion
+    // until all peers have applied it. Followers therefore keep the switch on,
+    // but a leader enables it only while proving the creation barrier. The root
+    // SubmitOperation committed before this point under normal majority
+    // semantics; fresh heartbeats repopulate peer progress after enabling.
+    const bool waiting_at_meta_barrier =
+        operation != operations.end() && IsWaitingAtMetaBarrier(*operation);
+    SetPeerSmCommitTracking(core, waiting_at_meta_barrier);
     if (operation == operations.end())
       lease.reset();
     else {
@@ -1092,8 +1203,19 @@ celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
             paused = KEYLANE_FAULT_MATCHES(
                 "KEYLANE_TEST_PAUSE_CLUSTER_CREATE_PHASE", cut););
         if (!paused) {
+          MetaClusterCreateRaftView raft_view;
+          raft_view.local_server_id_ = core->server_->get_id();
+          raft_view.max_response_age_us_ = core->max_peer_response_age_us_;
+          auto membership =
+              CaptureMembershipConfig(core->server_->get_config());
+          if (membership.ok()) raft_view.members_ = std::move(*membership);
+          for (const auto& peer : core->server_->get_peer_info_all()) {
+            raft_view.peer_progress_.push_back(
+                {static_cast<std::uint32_t>(peer.id_),
+                 peer.last_sm_committed_idx_, peer.last_succ_resp_us_});
+          }
           auto planned = detail::PlanClusterCreateStep(
-              view, *operation, core->runtime_status_->Snapshot());
+              view, *operation, core->runtime_status_->Snapshot(), raft_view);
           if (!planned.ok()) {
             spdlog::warn("cluster-create {} requires recovery: {}",
                          Hex(operation->operation_id_),
@@ -1107,6 +1229,18 @@ celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
             auto request = cluster::control::GenerateId128();
             if (!request.ok()) std::terminate();
             std::visit([&](auto& c) { c.request_id_ = *request; }, command);
+            if (waiting_at_meta_barrier) {
+              const auto* transition =
+                  std::get_if<TransitionOperationPhase>(&command);
+              if (transition != nullptr &&
+                  transition->kind_phase_blob_ != kRootPhaseWaitMetaBarrier) {
+                // The already-observed peer indexes prove B. Publish the
+                // durable exit (including recovery-required) with ordinary
+                // majority completion; if it does not commit, the next loop
+                // re-enables tracking from the retained barrier phase.
+                SetPeerSmCommitTracking(core, false);
+              }
+            }
             // Cancellation never rolls back or submits a compensating fence.
             // An accepted proposal may still commit; the next owner re-reads
             // its effect before deciding whether anything remains to do.
@@ -1132,6 +1266,12 @@ celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
     if (!slept.ok()) break;
   }
   lease.reset();
+  if (!core->shutdown_) {
+    // A demoted node is a follower again and must be ready to report progress
+    // to whichever peer owns a recovered creation barrier next. Permanent
+    // shutdown does not reopen all-peer completion while ingress is draining.
+    SetPeerSmCommitTracking(core, true);
+  }
   core->running_ = false;
   for (const auto& waiter : core->waiters_) waiter->set_value();
   core->waiters_.clear();

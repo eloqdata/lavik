@@ -1,5 +1,3 @@
-#include "keylane/meta/cluster_create.h"
-
 #include <chrono>
 #include <string>
 #include <string_view>
@@ -8,25 +6,25 @@
 
 #include "absl/status/status.h"
 #include "gtest/gtest.h"
+#include "keylane/meta/cluster_create.h"
 #include "keylane/meta/cluster_status.h"
 
 namespace keylane::meta {
 namespace {
 
-constexpr std::string_view kNodeA =
-    "0123456789abcdef0123456789abcdef01234567";
-constexpr std::string_view kNodeB =
-    "1123456789abcdef0123456789abcdef01234567";
-constexpr std::string_view kNodeC =
-    "2123456789abcdef0123456789abcdef01234567";
-constexpr std::string_view kNodeD =
-    "3123456789abcdef0123456789abcdef01234567";
+constexpr std::string_view kNodeA = "0123456789abcdef0123456789abcdef01234567";
+constexpr std::string_view kNodeB = "1123456789abcdef0123456789abcdef01234567";
+constexpr std::string_view kNodeC = "2123456789abcdef0123456789abcdef01234567";
+constexpr std::string_view kNodeD = "3123456789abcdef0123456789abcdef01234567";
 constexpr std::string_view kValidManifest = R"toml(
 schema_version = 1
 slot_strategy = "contiguous-even"
 
 [[meta_members]]
 id = 1
+raft_endpoint = "tcp://127.0.0.1:7101"
+data_control_endpoint = "tcp://127.0.0.1:7301"
+ctl_endpoint = "tcp://127.0.0.1:7201"
 
 [[data_nodes]]
 id = "0123456789abcdef0123456789abcdef01234567"
@@ -58,7 +56,10 @@ std::string ReplaceOnce(std::string input, std::string_view from,
 std::string AutoManifest(std::size_t count) {
   std::string result =
       "schema_version = 1\nslot_strategy = \"contiguous-even\"\n"
-      "[[meta_members]]\nid = 1\n";
+      "[[meta_members]]\nid = 1\n"
+      "raft_endpoint = \"tcp://127.0.0.1:7101\"\n"
+      "data_control_endpoint = \"tcp://127.0.0.1:7301\"\n"
+      "ctl_endpoint = \"tcp://127.0.0.1:7201\"\n";
   for (std::size_t index = 0; index < count; ++index) {
     const char digit = "0123456789abcdef"[index];
     result += "[[data_nodes]]\nid = \"" + std::string(40, digit) +
@@ -78,7 +79,11 @@ TEST(ClusterCreateManifestTest, NormalizesMultipleGroupsAndAllocatesSlots) {
 
   ASSERT_TRUE(manifest.ok()) << manifest.status();
   EXPECT_EQ(manifest->schema_version_, 1);
-  EXPECT_EQ(manifest->meta_member_id_, 1);
+  ASSERT_EQ(manifest->meta_members_.size(), 1U);
+  EXPECT_EQ(manifest->meta_members_.front(),
+            (ClusterCreateManifestV1::MetaMember{1, "tcp://127.0.0.1:7101",
+                                                 "tcp://127.0.0.1:7301",
+                                                 "tcp://127.0.0.1:7201"}));
   ASSERT_EQ(manifest->data_nodes_.size(), 2U);
   EXPECT_EQ(manifest->data_nodes_[0].node_id_, kNodeA);
   ASSERT_EQ(manifest->groups_.size(), 2U);
@@ -105,7 +110,8 @@ TEST(ClusterCreateManifestTest, AllocatesNonDivisorGroupCountsExactly) {
       };
   const std::vector<std::size_t> counts = {1, 2, 3, 5};
   for (std::size_t case_index = 0; case_index < counts.size(); ++case_index) {
-    auto manifest = ParseClusterCreateManifest(AutoManifest(counts[case_index]));
+    auto manifest =
+        ParseClusterCreateManifest(AutoManifest(counts[case_index]));
     ASSERT_TRUE(manifest.ok()) << manifest.status();
     ASSERT_EQ(manifest->slot_ranges_.size(), expected[case_index].size());
     for (std::size_t index = 0; index < expected[case_index].size(); ++index) {
@@ -122,6 +128,9 @@ TEST(ClusterCreateManifestTest, ExplicitRangesAreCanonicalAndFullyCovered) {
 schema_version = 1
 [[meta_members]]
 id = 1
+raft_endpoint = "tcp://127.0.0.1:7101"
+data_control_endpoint = "tcp://127.0.0.1:7301"
+ctl_endpoint = "tcp://127.0.0.1:7201"
 [[data_nodes]]
 id = "1123456789abcdef0123456789abcdef01234567"
 client_endpoint = "tcp://127.0.0.1:6380"
@@ -162,34 +171,44 @@ TEST(ClusterCreateManifestTest, InputOrderCannotChangeNormalizedWire) {
   const auto manifest = [](bool shuffled) {
     std::string text =
         "schema_version = 1\nslot_strategy = \"contiguous-even\"\n"
-        "[[meta_members]]\nid = 1\n";
+        "[[meta_members]]\nid = 1\n"
+        "raft_endpoint = \"tcp://127.0.0.1:7101\"\n"
+        "data_control_endpoint = \"tcp://127.0.0.1:7301\"\n"
+        "ctl_endpoint = \"tcp://127.0.0.1:7201\"\n";
     const std::vector<std::pair<std::string_view, std::uint16_t>> nodes =
         shuffled
-            ? std::vector<std::pair<std::string_view, std::uint16_t>>{
-                  {kNodeD, 6382}, {kNodeC, 6381}, {kNodeB, 6380},
-                  {kNodeA, 6379}}
+            ? std::vector<std::pair<std::string_view, std::uint16_t>>{{kNodeD,
+                                                                       6382},
+                                                                      {kNodeC,
+                                                                       6381},
+                                                                      {kNodeB,
+                                                                       6380},
+                                                                      {kNodeA,
+                                                                       6379}}
             : std::vector<std::pair<std::string_view, std::uint16_t>>{
-                  {kNodeA, 6379}, {kNodeB, 6380}, {kNodeC, 6381},
+                  {kNodeA, 6379},
+                  {kNodeB, 6380},
+                  {kNodeC, 6381},
                   {kNodeD, 6382}};
     for (const auto& [node_id, port] : nodes) {
-      text += "[[data_nodes]]\nid = \"" + std::string(node_id) +
-              "\"\nclient_endpoint = \"tcp://127.0.0.1:" +
-              std::to_string(port) + "\"\n";
+      text +=
+          "[[data_nodes]]\nid = \"" + std::string(node_id) +
+          "\"\nclient_endpoint = \"tcp://127.0.0.1:" + std::to_string(port) +
+          "\"\n";
     }
-    const std::string group_1 =
-        "[[groups]]\nid = \"group-1\"\nprimary = \"" +
-        std::string(kNodeA) + "\"\nreplicas = [\"" + std::string(kNodeB) +
-        "\", \"" + std::string(kNodeC) + "\"]\n";
-    const std::string group_2 =
-        "[[groups]]\nid = \"group-2\"\nprimary = \"" +
-        std::string(kNodeD) + "\"\nreplicas = []\n";
-    text += shuffled ? group_2 + ReplaceOnce(
-                                   group_1,
-                                   std::string(kNodeB) + "\", \"" +
-                                       std::string(kNodeC),
-                                   std::string(kNodeC) + "\", \"" +
-                                       std::string(kNodeB))
-                     : group_1 + group_2;
+    const std::string group_1 = "[[groups]]\nid = \"group-1\"\nprimary = \"" +
+                                std::string(kNodeA) + "\"\nreplicas = [\"" +
+                                std::string(kNodeB) + "\", \"" +
+                                std::string(kNodeC) + "\"]\n";
+    const std::string group_2 = "[[groups]]\nid = \"group-2\"\nprimary = \"" +
+                                std::string(kNodeD) + "\"\nreplicas = []\n";
+    text += shuffled
+                ? group_2 +
+                      ReplaceOnce(
+                          group_1,
+                          std::string(kNodeB) + "\", \"" + std::string(kNodeC),
+                          std::string(kNodeC) + "\", \"" + std::string(kNodeB))
+                : group_1 + group_2;
     return ParseClusterCreateManifest(text);
   };
 
@@ -204,6 +223,65 @@ TEST(ClusterCreateManifestTest, InputOrderCannotChangeNormalizedWire) {
   EXPECT_EQ(shuffled->groups_.front().replica_node_ids_[1], kNodeC);
   EXPECT_EQ(EncodeClusterCreateRequest(*shuffled, 10'000),
             EncodeClusterCreateRequest(*canonical, 10'000));
+}
+
+TEST(ClusterCreateManifestTest, NormalizesOneThreeAndFiveInitialMetaMembers) {
+  for (const std::size_t count : {1U, 3U, 5U}) {
+    std::string text = AutoManifest(1);
+    text = ReplaceOnce(std::move(text),
+                       "[[meta_members]]\nid = 1\n"
+                       "raft_endpoint = \"tcp://127.0.0.1:7101\"\n"
+                       "data_control_endpoint = \"tcp://127.0.0.1:7301\"\n"
+                       "ctl_endpoint = \"tcp://127.0.0.1:7201\"\n",
+                       "");
+    for (std::size_t offset = 0; offset < count; ++offset) {
+      const std::size_t id = count - offset;
+      text +=
+          "[[meta_members]]\nid = " + std::to_string(id) +
+          "\nraft_endpoint = \"tcp://127.0.0.1:" + std::to_string(7100 + id) +
+          "\"\ndata_control_endpoint = \"tcp://127.0.0.1:" +
+          std::to_string(7300 + id) +
+          "\"\nctl_endpoint = \"tcp://127.0.0.1:" + std::to_string(7200 + id) +
+          "\"\n";
+    }
+
+    auto manifest = ParseClusterCreateManifest(text);
+
+    ASSERT_TRUE(manifest.ok()) << manifest.status();
+    ASSERT_EQ(manifest->meta_members_.size(), count);
+    for (std::size_t index = 0; index < count; ++index) {
+      EXPECT_EQ(manifest->meta_members_[index].server_id_, index + 1);
+    }
+  }
+}
+
+TEST(ClusterCreateManifestTest, RejectsDuplicateMetaIdentityAndEndpoints) {
+  const std::string base = AutoManifest(1);
+  const std::string second =
+      "[[meta_members]]\nid = 2\n"
+      "raft_endpoint = \"tcp://127.0.0.1:7102\"\n"
+      "data_control_endpoint = \"tcp://127.0.0.1:7302\"\n"
+      "ctl_endpoint = \"tcp://127.0.0.1:7202\"\n";
+  ASSERT_TRUE(ParseClusterCreateManifest(base + second).ok());
+  for (const auto& duplicate : {
+           ReplaceOnce(second, "id = 2", "id = 1"),
+           ReplaceOnce(second, "tcp://127.0.0.1:7102", "tcp://127.0.0.1:7101"),
+           ReplaceOnce(second, "tcp://127.0.0.1:7302", "tcp://127.0.0.1:7301"),
+           ReplaceOnce(second, "tcp://127.0.0.1:7202", "tcp://127.0.0.1:7201"),
+       }) {
+    EXPECT_FALSE(ParseClusterCreateManifest(base + duplicate).ok());
+  }
+}
+
+TEST(ClusterCreateManifestTest, RejectsLegacyScalarMetaMemberShape) {
+  const std::string legacy =
+      ReplaceOnce(AutoManifest(1),
+                  "raft_endpoint = \"tcp://127.0.0.1:7101\"\n"
+                  "data_control_endpoint = \"tcp://127.0.0.1:7301\"\n"
+                  "ctl_endpoint = \"tcp://127.0.0.1:7201\"\n",
+                  "");
+
+  EXPECT_FALSE(ParseClusterCreateManifest(legacy).ok());
 }
 
 TEST(ClusterCreateManifestTest,
@@ -246,9 +324,14 @@ TEST(ClusterCreateManifestTest, RejectsInvalidReplicaMembership) {
   const std::string base =
       "schema_version = 1\nslot_strategy = \"contiguous-even\"\n"
       "[[meta_members]]\nid = 1\n"
-      "[[data_nodes]]\nid = \"" + std::string(kNodeA) +
+      "raft_endpoint = \"tcp://127.0.0.1:7101\"\n"
+      "data_control_endpoint = \"tcp://127.0.0.1:7301\"\n"
+      "ctl_endpoint = \"tcp://127.0.0.1:7201\"\n"
+      "[[data_nodes]]\nid = \"" +
+      std::string(kNodeA) +
       "\"\nclient_endpoint = \"tcp://127.0.0.1:6379\"\n"
-      "[[data_nodes]]\nid = \"" + std::string(kNodeB) +
+      "[[data_nodes]]\nid = \"" +
+      std::string(kNodeB) +
       "\"\nclient_endpoint = \"tcp://127.0.0.1:6380\"\n"
       "[[groups]]\nid = \"group-1\"\nprimary = \"" +
       std::string(kNodeA) + "\"\nreplicas = [\"" + std::string(kNodeB) +
@@ -270,43 +353,48 @@ TEST(ClusterCreateManifestTest, RejectsInvalidReplicaMembership) {
 }
 
 TEST(ClusterCreateManifestTest, RejectsGapsOverlapsAndGroupsWithoutSlots) {
-  std::string explicit_manifest =
-      ReplaceOnce(std::string(kValidManifest),
-                  "slot_strategy = \"contiguous-even\"\n", "");
+  std::string explicit_manifest = ReplaceOnce(
+      std::string(kValidManifest), "slot_strategy = \"contiguous-even\"\n", "");
   explicit_manifest +=
       "[[slot_ranges]]\nfirst = 0\nlast = 8191\ngroup = \"group-1\"\n"
       "[[slot_ranges]]\nfirst = 8192\nlast = 16383\ngroup = \"group-2\"\n";
   EXPECT_TRUE(ParseClusterCreateManifest(explicit_manifest).ok());
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-                   explicit_manifest, "first = 8192", "first = 8193"))
+  EXPECT_FALSE(
+      ParseClusterCreateManifest(
+          ReplaceOnce(explicit_manifest, "first = 8192", "first = 8193"))
+          .ok());
+  EXPECT_FALSE(
+      ParseClusterCreateManifest(
+          ReplaceOnce(explicit_manifest, "first = 8192", "first = 8191"))
+          .ok());
+  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(explicit_manifest,
+                                                      "group = \"group-2\"",
+                                                      "group = \"group-1\""))
                    .ok());
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-                   explicit_manifest, "first = 8192", "first = 8191"))
+  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(explicit_manifest,
+                                                      "group = \"group-2\"",
+                                                      "group = \"unknown\""))
                    .ok());
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-                   explicit_manifest, "group = \"group-2\"",
-                   "group = \"group-1\""))
+  EXPECT_FALSE(
+      ParseClusterCreateManifest(
+          ReplaceOnce(explicit_manifest, "last = 16383", "last = 16384"))
+          .ok());
+  EXPECT_FALSE(ParseClusterCreateManifest(
+                   ReplaceOnce(explicit_manifest, "last = 8191", "last = 8190"))
                    .ok());
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-                   explicit_manifest, "group = \"group-2\"",
-                   "group = \"unknown\""))
-                   .ok());
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-                   explicit_manifest, "last = 16383", "last = 16384"))
-                   .ok());
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-                   explicit_manifest, "last = 8191", "last = 8190"))
-                   .ok());
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-                   explicit_manifest, "first = 8192", "first = 16383"))
-                   .ok());
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-                   explicit_manifest, "schema_version = 1",
-                   "schema_version = 1\nslot_strategy = \"contiguous-even\""))
-                   .ok());
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-                   std::string(kValidManifest),
-                   "slot_strategy = \"contiguous-even\"\n", ""))
+  EXPECT_FALSE(
+      ParseClusterCreateManifest(
+          ReplaceOnce(explicit_manifest, "first = 8192", "first = 16383"))
+          .ok());
+  EXPECT_FALSE(
+      ParseClusterCreateManifest(
+          ReplaceOnce(
+              explicit_manifest, "schema_version = 1",
+              "schema_version = 1\nslot_strategy = \"contiguous-even\""))
+          .ok());
+  EXPECT_FALSE(ParseClusterCreateManifest(
+                   ReplaceOnce(std::string(kValidManifest),
+                               "slot_strategy = \"contiguous-even\"\n", ""))
                    .ok());
 }
 
@@ -392,8 +480,7 @@ ClusterStatusWireV1 ReadyStatus(const ClusterCreateManifestV1& manifest,
                               .topology_converged_ = true});
   }
   for (const auto& range : manifest.slot_ranges_) {
-    status.slot_ranges_.push_back(
-        {range.first_, range.last_, range.group_id_});
+    status.slot_ranges_.push_back({range.first_, range.last_, range.group_id_});
   }
   return status;
 }
@@ -432,10 +519,9 @@ TEST(ClusterCreateOperatorTest, WaitsForTheExactMultiGroupTopology) {
   options.deadline_ =
       std::chrono::steady_clock::now() + std::chrono::seconds(1);
 
-  auto outcome = op.Create(
-      {.transport_ = MetaAdminTarget::Transport::kUnix,
-       .endpoint_ = "/tmp/meta.sock"},
-      manifest, options);
+  auto outcome = op.Create({.transport_ = MetaAdminTarget::Transport::kUnix,
+                            .endpoint_ = "/tmp/meta.sock"},
+                           manifest, options);
 
   ASSERT_TRUE(outcome.ok()) << outcome.status();
   EXPECT_EQ(outcome->committed_index_, 24U);
@@ -459,18 +545,16 @@ TEST(ClusterCreateOperatorTest, PreservesUncertainServerFailures) {
   ClusterOperator op([&](const MetaAdminTarget&, std::string_view command,
                          auto) -> absl::StatusOr<std::string> {
     if (command == "clusterhead 1") return *EncodeClusterHeadReply(head);
-    if (command == "clusterstatus 1")
-      return *EncodeClusterStatusReply(empty);
+    if (command == "clusterstatus 1") return *EncodeClusterStatusReply(empty);
     return "ERR clustercreate 1 initialize-data uncertain-outcome timed out";
   });
   ClusterStatusOptions options;
   options.deadline_ =
       std::chrono::steady_clock::now() + std::chrono::seconds(1);
 
-  auto outcome = op.Create(
-      {.transport_ = MetaAdminTarget::Transport::kUnix,
-       .endpoint_ = "/tmp/meta.sock"},
-      manifest, options);
+  auto outcome = op.Create({.transport_ = MetaAdminTarget::Transport::kUnix,
+                            .endpoint_ = "/tmp/meta.sock"},
+                           manifest, options);
 
   EXPECT_EQ(outcome.status().code(), absl::StatusCode::kAborted);
 }
@@ -495,8 +579,7 @@ TEST(ClusterCreateOperatorTest, RejectsActiveCreateBeforeMutation) {
   ClusterOperator op([&](const MetaAdminTarget&, std::string_view command,
                          auto) -> absl::StatusOr<std::string> {
     if (command == "clusterhead 1") return *EncodeClusterHeadReply(head);
-    if (command == "clusterstatus 1")
-      return *EncodeClusterStatusReply(empty);
+    if (command == "clusterstatus 1") return *EncodeClusterStatusReply(empty);
     mutation_sent = true;
     return absl::InternalError("unexpected mutation");
   });
@@ -504,10 +587,9 @@ TEST(ClusterCreateOperatorTest, RejectsActiveCreateBeforeMutation) {
   options.deadline_ =
       std::chrono::steady_clock::now() + std::chrono::seconds(1);
 
-  auto outcome = op.Create(
-      {.transport_ = MetaAdminTarget::Transport::kUnix,
-       .endpoint_ = "/tmp/meta.sock"},
-      manifest, options);
+  auto outcome = op.Create({.transport_ = MetaAdminTarget::Transport::kUnix,
+                            .endpoint_ = "/tmp/meta.sock"},
+                           manifest, options);
 
   EXPECT_EQ(outcome.status().code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_FALSE(mutation_sent);
@@ -543,7 +625,7 @@ TEST(ClusterCreateOperatorTest, NamesTheNodeThatPreventsExactReadiness) {
     if (command == "clusterhead 1") return *EncodeClusterHeadReply(head);
     if (command == "clusterstatus 1") {
       return *EncodeClusterStatusReply(status_calls++ == 0 ? empty
-                                                            : incomplete);
+                                                           : incomplete);
     }
     return "OK clustercreate 1 24 2 "
            "67726f75702d31 23 00112233445566778899aabbccddeeff "
@@ -553,10 +635,9 @@ TEST(ClusterCreateOperatorTest, NamesTheNodeThatPreventsExactReadiness) {
   options.deadline_ =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(75);
 
-  auto outcome = op.Create(
-      {.transport_ = MetaAdminTarget::Transport::kUnix,
-       .endpoint_ = "/tmp/meta.sock"},
-      manifest, options);
+  auto outcome = op.Create({.transport_ = MetaAdminTarget::Transport::kUnix,
+                            .endpoint_ = "/tmp/meta.sock"},
+                           manifest, options);
 
   EXPECT_EQ(outcome.status().code(), absl::StatusCode::kDeadlineExceeded);
   EXPECT_NE(outcome.status().message().find("node:" + std::string(kNodeB)),
@@ -576,10 +657,9 @@ TEST(ClusterCreateOperatorTest, DistinguishesFailureBeforeMutation) {
   options.deadline_ =
       std::chrono::steady_clock::now() + std::chrono::seconds(1);
 
-  auto outcome = op.Create(
-      {.transport_ = MetaAdminTarget::Transport::kUnix,
-       .endpoint_ = "/tmp/meta.sock"},
-      manifest, options);
+  auto outcome = op.Create({.transport_ = MetaAdminTarget::Transport::kUnix,
+                            .endpoint_ = "/tmp/meta.sock"},
+                           manifest, options);
 
   EXPECT_EQ(outcome.status().code(), absl::StatusCode::kCancelled);
   EXPECT_NE(outcome.status().message().find("before sending a mutation"),

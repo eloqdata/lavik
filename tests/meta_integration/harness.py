@@ -103,10 +103,60 @@ def raft_args(snapshot_distance=30, heartbeat_ms=100, election_ms_low=300,
     ]
 
 
+def write_initial_meta_manifest(path, members):
+    """Write a complete initial-cluster manifest from Meta endpoint tuples.
+
+    The Data/group section is deliberately inert. The production manifest is
+    also the desired cluster-create topology, but most Meta process gates only
+    exercise Raft and membership. Nothing persists the Data portion until an
+    operator submits `cluster-create`.
+    """
+    lines = ["schema_version = 1", ""]
+    for node_id, raft, data_control, ctl in sorted(members):
+        lines.extend([
+            "[[meta_members]]",
+            f"id = {node_id}",
+            f'raft_endpoint = "tcp://{raft}"',
+            f'data_control_endpoint = "tcp://{data_control}"',
+            f'ctl_endpoint = "tcp://{ctl}"',
+            "",
+        ])
+    lines.extend([
+        "[[data_nodes]]",
+        'id = "ffffffffffffffffffffffffffffffffffffffff"',
+        'client_endpoint = "tcp://127.0.0.1:1"',
+        "",
+        "[[groups]]",
+        'id = "initial-meta-placeholder"',
+        'primary = "ffffffffffffffffffffffffffffffffffffffff"',
+        "",
+        "[[slot_ranges]]",
+        "first = 0",
+        "last = 16383",
+        'group = "initial-meta-placeholder"',
+        "",
+    ])
+    with open(path, "w", encoding="utf-8") as output:
+        output.write("\n".join(lines))
+
+
+def write_initial_cluster_manifest(path, nodes, raft_endpoints=None):
+    """Write one canonical genesis input shared by every initial Meta node."""
+    endpoints = raft_endpoints or {node.id: node.endpoint for node in nodes}
+    write_initial_meta_manifest(path, [
+        (node.id, endpoints[node.id],
+         getattr(node, "advertised_data_control_endpoint",
+                 node.data_control_endpoint),
+         getattr(node, "advertised_ctl_endpoint", node.ctl_endpoint))
+        for node in nodes
+    ])
+
+
 class Node:
     def __init__(self, binary, workdir, node_id, args=None):
         self.binary = binary
         self.id = node_id
+        self.workdir = workdir
         self.data_dir = os.path.join(workdir, f"node{node_id}")
         self.log_path = os.path.join(workdir, f"node{node_id}.log")
         self.raft_port = free_port()
@@ -134,12 +184,20 @@ class Node:
     def ctl_endpoint(self):
         return f"127.0.0.1:{self.ctl_port}"
 
-    def start(self, bootstrap=False, raft_port=None, wait_ready=True):
+    def start(self, bootstrap=False, raft_port=None, wait_ready=True,
+              initial_cluster_manifest=None, explicit_ctl_socket=True):
         """(Re)starts the process; the data dir is always reused, so a
         restart after kill9()/terminate() exercises WAL/snapshot replay.
         `raft_port` rebinds the raft listener (used by the mesh bootstrap;
         the advertised cluster endpoint lives in the durable config and is
         unaffected by rebinding).
+
+        `bootstrap=True` is retained as a concise test-harness operation: on a
+        pristine directory it writes a one-member initial manifest next to
+        the node directory. It never replays that manifest on restart.
+
+        `explicit_ctl_socket=False` omits the flag while retaining `ctl_path`
+        as the expected default under the data directory.
 
         With wait_ready, start blocks until the ctl surface answers (or the
         process dies) and retries a few times: after a SIGKILL the kernel
@@ -159,11 +217,20 @@ class Node:
                 "--addr", self.endpoint,
                 "--data-control-addr", self.data_control_endpoint,
                 "--data-dir", self.data_dir,
-                "--ctl-socket", self.ctl_path,
                 "--ctl-addr", self.ctl_endpoint,
             ] + self.args
-            if bootstrap:
-                args.append("--bootstrap")
+            if explicit_ctl_socket:
+                args.extend(["--ctl-socket", self.ctl_path])
+            manifest = initial_cluster_manifest
+            if bootstrap and manifest is not None:
+                raise Failure("bootstrap and initial_cluster_manifest conflict")
+            if bootstrap and not os.path.exists(
+                    os.path.join(self.data_dir, "cluster_config.dat")):
+                manifest = os.path.join(
+                    self.workdir, f"initial-meta-{self.id}.toml")
+                write_initial_cluster_manifest(manifest, [self])
+            if manifest is not None:
+                args.extend(["--initial-cluster-manifest", manifest])
             # Append across restarts: one file holds the node's history.
             self.log_file = open(self.log_path, "ab")
             self.proc = subprocess.Popen(
@@ -172,7 +239,8 @@ class Node:
             log(f"node {self.id} started (pid {self.proc.pid}, "
                 f"raft {self.raft_port}, ctl {self.ctl_path},"
                 f"{self.ctl_endpoint}, "
-                f"bootstrap={bootstrap}, attempt {attempt + 1})")
+                f"initial_manifest={manifest is not None}, "
+                f"attempt {attempt + 1})")
             if not wait_ready:
                 return
             deadline = time.monotonic() + 5.0
@@ -941,6 +1009,19 @@ def bootstrap_cluster(nodes, mesh=None):
         node.start(bootstrap=False)
         join_and_verify(leader, node, endpoint=endpoint)
     log(f"{len(nodes)}-node cluster converged")
+    return leader
+
+
+def bootstrap_static_cluster(nodes, raft_endpoints=None):
+    """Start all first-wave voters from one identical full Raft config."""
+    if not nodes:
+        raise Failure("static initial Meta cluster cannot be empty")
+    manifest = os.path.join(nodes[0].workdir, "initial-cluster.toml")
+    write_initial_cluster_manifest(manifest, nodes, raft_endpoints)
+    for node in nodes:
+        node.start(initial_cluster_manifest=manifest)
+    leader = find_leader(nodes, timeout=20)
+    log(f"{len(nodes)}-node static initial cluster converged")
     return leader
 
 

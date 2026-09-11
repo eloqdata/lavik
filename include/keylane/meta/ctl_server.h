@@ -212,6 +212,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -263,6 +264,12 @@ struct MetaClusterStatusBracket {
 
 bool IsStableClusterStatusBracket(const MetaClusterStatusBracket& before,
                                   const MetaClusterStatusBracket& after);
+
+// Classifies a registered node with no current session. Prior parsed Hello or
+// accepted-session evidence distinguishes a missing session from a process
+// this leadership generation has never observed.
+std::string_view ClusterCreateMissingSessionBlocker(bool retry_observed,
+                                                    bool session_observed);
 
 // Projects the captured heartbeat and last written lease onto a node whose
 // session/projection fields already describe this committed cut. Health can
@@ -334,12 +341,12 @@ struct MetaCtlServerOptions {
   std::string tls_cert_file_;
   std::string tls_key_file_;
 
-  // Advertised endpoint of this process's Data Node control listener. It is
-  // used when the first membership change binds the bootstrap Raft member
-  // into the committed Meta directory.
+  // Process-local Data Node control listener. Dynamic remove parsing retains
+  // this value only as a syntactic placeholder; durable advertised routes
+  // come from the committed member descriptor.
   std::string local_data_control_endpoint_;
-  // Concrete administrative TCP endpoint committed with the bootstrap
-  // member before the cluster grows beyond one voter.
+  // Process-local administrative TCP listener, which may sit behind the
+  // durable advertised ctl route.
   std::string local_ctl_endpoint_;
   std::shared_ptr<MetaClusterStatusService> cluster_status_service_;
   std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status_;

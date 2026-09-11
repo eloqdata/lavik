@@ -57,14 +57,19 @@ absl::StatusOr<MetaPrincipalIdentity> AuthenticateLocalOperator(
 absl::Status ValidateDataNodePrincipal(std::string_view node_id,
                                        std::string_view principal);
 
-// NuRaft persists this descriptor in srv_config::aux so an authenticated
-// certificate can be bound to the Raft source id before message processing.
+// NuRaft persists this descriptor in srv_config::aux. It is the complete
+// advertised identity needed to authenticate transport and reconstruct the
+// committed Meta directory; the Raft endpoint remains in srv_config's native
+// endpoint field.
 struct MetaMemberIdentity {
   std::int32_t server_id_ = 0;
   std::string principal_;
+  std::string data_control_endpoint_;
+  std::string ctl_endpoint_;
 
   std::string EncodeAux() const;
   static absl::StatusOr<MetaMemberIdentity> DecodeAux(std::string_view aux);
+  bool operator==(const MetaMemberIdentity&) const = default;
 };
 
 // Validates the authenticated certificate identity against the source id and

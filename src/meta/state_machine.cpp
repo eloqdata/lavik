@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "absl/status/status.h"
+#include "keylane/meta/cluster_create.h"
 #include "keylane/meta/commands.h"
 #include "libnuraft/buffer.hxx"
 #include "libnuraft/cluster_config.hxx"
@@ -199,8 +200,29 @@ MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {
   MetaCommittedStatusView view;
   view.applied_index_ = last_committed_idx_.load(std::memory_order_relaxed);
   view.topology_epoch_ = stores_.topology_.TopologyEpoch();
-  view.active_cluster_create_operation_ = stores_.operation_.HasActiveKind(
-      kMetaClusterCreateOperationKind);
+  view.active_cluster_create_operation_ =
+      stores_.operation_.HasActiveKind(kMetaClusterCreateOperationKind);
+  if (view.active_cluster_create_operation_) {
+    for (const MetaOperationRecord& operation :
+         stores_.operation_.LiveOperations()) {
+      if (operation.kind_ != kMetaClusterCreateOperationKind ||
+          operation.lifecycle_ == MetaOperationLifecycle::kCompleted ||
+          operation.lifecycle_ == MetaOperationLifecycle::kAborted) {
+        continue;
+      }
+      view.active_cluster_create_phase_ = operation.kind_phase_blob_;
+      std::uint32_t timeout = 0;
+      auto manifest = DecodeClusterCreateRequest(operation.intent_, &timeout);
+      if (manifest.ok()) {
+        view.active_cluster_create_data_nodes_.reserve(
+            manifest->data_nodes_.size());
+        for (const auto& node : manifest->data_nodes_) {
+          view.active_cluster_create_data_nodes_.push_back(node.node_id_);
+        }
+      }
+      break;
+    }
+  }
   view.meta_members_ = stores_.identity_.MetaMembers();
   view.data_nodes_ = stores_.identity_.Nodes();
   for (MetaTopologyGroupView topology : stores_.topology_.Groups()) {

@@ -222,8 +222,21 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     H.wait_until(f"{label}: original invite completes after credential repair", 30,
                  lambda: leader.getop(operation_id) == "OK completed member-added")
     history.check([joiner], timeout=20, desc=f"{label}: repaired joiner")
-    if leader.ctl(f"removesrv {joiner.id}") != "OK":
-        raise H.Failure(f"{label}: repaired member did not retire")
+    retire_replies = []
+
+    def terminally_retired():
+        retire_replies[:] = [leader.ctl(f"removesrv {joiner.id}")]
+        return retire_replies == ["OK"]
+
+    # A leader can append NuRaft's same-membership config copy immediately
+    # after the recovered add completes.  That internal round briefly returns
+    # `config-changing`; wait for the stable, idempotent retirement result.
+    try:
+        H.wait_until(f"{label}: repaired member retires", 5,
+                     terminally_retired)
+    except H.Failure as error:
+        raise H.Failure(
+            f"{label}: repaired member did not retire: {retire_replies}") from error
     joiner.terminate()
     H.log(f"{label}: same operation recovered after credential repair and member retired")
     return seq

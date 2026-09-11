@@ -29,13 +29,13 @@ synchronously drained the worker, later reconciler cancellation and object
 destruction are no-ops and do not depend on a still-running executor.
 
 The process exposes three independent network responsibilities. `--addr` is
-the Raft peer endpoint, `--data-control-addr` accepts Data-node control
-sessions, and the optional concrete `--ctl-addr` is the remote operator/Admin
-endpoint. Admin defaults to the mode-0600 Unix socket when neither Admin option
-is specified; explicitly naming both Unix and TCP starts both over one
-dispatcher, authentication policy, capture limiter, and retained-reply budget.
-There is no separate bind/advertise Admin identity: `--ctl-addr` is both the
-actual bind and the committed route, so wildcard addresses and port zero are
+the local Raft listener, `--data-control-addr` accepts Data-node control
+sessions, and the required concrete `--ctl-addr` is the remote operator/Admin
+listener. Admin also defaults to a mode-0600 Unix socket unless an explicit
+socket choice is supplied; Unix and TCP share one dispatcher, authentication
+policy, capture limiter, and retained-reply budget. The manifest and durable
+membership descriptor own the advertised routes, which may name explicit
+proxies rather than these local binds. Wildcard Admin binds and port zero are
 invalid.
 
 The state machine owns one `MetaStores` value containing seven committed
@@ -406,6 +406,44 @@ version is rejected before recovery modifies any files.
 The older prototype's `raft_log.dat` and `LSN1` snapshots are intentionally
 incompatible and cause startup to fail with an explicit format error.
 
+Before NuRaft opens its network or election timer, a pristine initial member
+loads the canonical full Meta vector from `--initial-cluster-manifest` and
+atomically publishes it as `cluster_config.dat`. A one-, three-, or five-voter
+genesis differs only in vector length. Every member starts the same ordinary
+randomized election; there is no distinguished bootstrap candidate. The
+manifest is rejected once any durable config exists and is never read on
+restart. `initial_bindings.dat` retains that exact genesis descriptor set
+until the membership reconciler has committed every identity binding. It
+survives election-time config copies and restarts, then is atomically removed
+after `initial_bindings_complete.dat` is published as a permanent tombstone;
+the tombstone prevents a completed zero-index genesis from being mistaken for
+the config-first publication crash prefix. A pristine process with no manifest
+instead persists
+`waiting_joiner.dat` before its singleton placeholder config and disables its
+initial election. That marker makes restart and partial dynamic-join catch-up
+remain election-disabled, and is durably removed only after the joiner applies
+the identity bindings through its committed config entry. An invite may
+publish that config before the joiner receives a WAL segment; the marker keeps
+that recoverable prefix distinct from an incomplete ordinary member.
+The first persisted NuRaft vote also publishes `raft_started.dat` before the
+vote itself. For genesis and ordinary members this irreversible boundary makes
+loss of both the vote and WAL distinguishable from a process that never opened
+Raft; waiting joiners retain their explicitly narrower pre-WAL recovery rule.
+
+After either lifecycle converges, `transport_bindings.dat` records the exact
+full descriptor set and the state-machine watermark that proved or followed
+its identity bindings. An ordinary restart may use those descriptors only
+while replay remains below that watermark. Committed dynamic membership
+changes reuse the same baseline: `save_config()` publishes a bounded
+`transport_bindings.next`, replaces `cluster_config.dat`, and durably promotes
+the candidate. Recovery either discards a candidate paired with the old config
+or completes a candidate paired with the new config; any other pairing fails
+closed. This is Raft transport recovery state, not a Cluster Create operation
+or membership workflow record. Config indices, a genesis completion tombstone,
+the Raft-started marker, or a transport baseline require the matching server
+state and segmented WAL to exist. Missing, oversized, truncated, or
+contradictory state fails closed rather than replaying genesis.
+
 The persisted state-machine watermark is the snapshot index, not every applied
 WAL index. After restart, a post-snapshot tail remains invisible until Raft
 legally reconfirms it with a current-term quorum; depending on the elected
@@ -422,13 +460,18 @@ compatibility or negotiation path. This wire version is independent of the
 durable schemas below.
 
 Commands, records, exports, snapshots, and WAL replay carry exact schema
-version 1. Each active Meta-member identity may carry one canonical, concrete
-numeric Admin endpoint. The endpoint is committed with membership rather than
-revised by a separate routing command. A sole UDS-managed member with no
-endpoint may complete that field once from its configured `--ctl-addr`; a
-nonempty endpoint is immutable, and changing it requires retirement followed
-by a fresh server id. Before a configuration can contain multiple voters,
-every current and new member must have a unique Admin endpoint. Durable
+version 1. Every configured Meta identity has one canonical concrete numeric
+Data-control endpoint and one canonical concrete numeric Admin endpoint. The
+NuRaft `srv_config::aux` `KMI2` descriptor carries the server id, derived
+principal, and both endpoints; Raft keeps its endpoint in the native field.
+The descriptor and committed identity binding must agree exactly. Advertised
+Data-control and Admin addresses may route through an explicit proxy instead
+of equaling their local process binds; restart can likewise rebind a Raft
+listener behind a transport proxy without changing its durable advertised
+endpoint. Endpoints are immutable, unique within their
+respective directories, and change only through retirement and replacement
+with a fresh server id. The previous partial `KMI1` development descriptor is
+rejected and is not migrated. Durable
 operation evidence includes its exact group id, reporter assignment and boot,
 population identity, history, operation id, and evidence hash. Snapshot decoding rejects
 malformed identity anchors and evidence that names a missing group or an
@@ -457,11 +500,29 @@ the stricter total-URI rule below. An IP or DNS SAN covers the advertised Raft
 endpoint. The NuRaft configuration
 identity descriptor, the CA-authenticated certificate, and the committed
 identity-store binding must all match the claimed source id; neither the
-configuration nor the store binding grants membership alone. With mTLS, a
-pristine joiner temporarily relies on the authenticated certificate and
-invited configuration until it installs the leader's configuration and its
-first state-machine entry or snapshot. Plaintext deployments instead rely on
-network isolation during that bootstrap interval.
+configuration nor the store binding grants membership alone. During static
+genesis, the complete config descriptor may temporarily stand in for a
+not-yet-applied binding only while the durable initial-binding marker names
+that unchanged descriptor set. The membership reconciler commits missing
+bindings in server-id order; followers close the same local marker when their
+transport observes exact config/binding convergence. A dynamic waiting joiner
+has a second narrow catch-up window only while its durable waiting marker is
+present. Replaying a pre-add config cannot close that window: the marker is
+removed only after the installed config includes the local id, every descriptor
+binding is visible, and the state machine has applied through that config
+index. The config can arrive before the earlier binding command. With
+mTLS these windows also require the exact certificate identity; plaintext
+deployments rely on network isolation. Ordinary replay uses only the exact
+descriptor set in `transport_bindings.dat`, only below its recorded watermark;
+at or above that cut a config descriptor never substitutes for a missing or
+conflicting binding.
+
+Initial identity recovery is not a Cluster Create child operation. The
+existing `MetaMembershipReconciler` holds the shared membership gate, compares
+the loaded genesis descriptors with the identity store, and proposes one
+idempotent `BindMetaMember` at a time. Matching crash prefixes resume; any
+descriptor conflict fails closed. Once this convergence is complete, the
+same reconciler handles only ordinary reusable membership workflows.
 
 Dynamic membership is a leader-owned `meta-membership-workflow-v1` operation.
 Before either identity or NuRaft mutation, Admin commits a bounded versioned
@@ -560,13 +621,19 @@ instead of mixed state. Captures are single-flight across both Admin listeners.
 Completed replies release the capture permit before sending, share a 256 MiB
 retained-reply budget, and a slow receiver loses the connection after five
 seconds rather than delaying Data heartbeats. The compact committed cut also
-carries whether a non-terminal `cluster-create-workflow-v1` root exists. The
-server exposes that fact through the existing `cluster_create_active` blocker,
-preserving the `cluster-status` v1 wire layout, and the operator uses it for its
-read-only creation preflight without copying the journal. The leader repeats
-the check under exclusive creation/membership admission before its first
-proposal. Unrelated operation kinds do not make a clean topology appear
-occupied.
+carries whether a non-terminal `cluster-create-workflow-v1` root exists, its
+phase, and only the declared Data ids needed for diagnostics. The server
+exposes `cluster_create_active` plus specific `meta_catching_up`,
+`data_unregistered`, `data_unregistered_retrying`, `data_unobserved`, and
+`data_session_missing` blockers while preserving the `cluster-status` v1 wire
+layout. `data_unobserved` means the current leader has no handshake evidence;
+`data_session_missing` means a previously accepted or actively retrying node
+has no current accepted session. A rejected,
+parsed Data Hello is leader-generation-scoped observational evidence only; it
+never authorizes a node. The operator uses the compact cut for its read-only
+creation preflight without copying the journal. The leader repeats the check
+under exclusive creation/membership admission before its first proposal.
+Unrelated operation kinds do not make a clean topology appear occupied.
 
 Readiness uses this leader-observed cut. Meta availability requires a live,
 caught-up leader with quorum; membership stability compares its Raft config
@@ -580,18 +647,21 @@ Unassigned nodes remain diagnostic only. Empty and partially configured
 clusters are stable `NOT READY` results.
 
 `keylane-ctl cluster-create` reuses the same private leader discovery and
-status-capture seam and accepts only manifest schema v1. A manifest names one
-existing Meta member, one or more canonical Data identities and numeric client
+status-capture seam and accepts only manifest schema v1. A manifest names the
+complete initial Meta vector—id plus canonical numeric Raft, Data-control, and
+Admin endpoints—one or more canonical Data identities and numeric client
 endpoints, and one or more Groups with exactly one primary and optional
-replicas. Slots are either generated with `contiguous-even` after sorting Group
-ids or supplied as a complete, non-overlapping `0..16383` range table. All
+replicas. Meta entries are sorted by id, all are voters, each endpoint class is
+unique, and the principal derives as `keylane://meta/<id>`. Slots are either
+generated with `contiguous-even` after sorting Group ids or supplied as a
+complete, non-overlapping `0..16383` range table. All
 declared Data belongs to exactly one Group and every Group owns at least one
 slot. The parser rejects unknown TOML structure and files over 64 KiB, then
 sorts nodes, Groups, replicas and ranges and merges adjacent ranges belonging
 to the same Group. The CLI renders that canonical plan and requires exact
 lowercase `yes` unless `--yes` is present. Only this normalized multi-Group
-shape is accepted under version 1; scalar payloads have no compatibility
-decoder.
+and multi-Meta shape is accepted under version 1; the earlier scalar-Meta
+payload has no compatibility decoder.
 
 After an empty-topology and no-active-create client check, the CLI sends one
 `clustercreate 1` request to the discovered leader. `MetaCtlServer` commits
@@ -612,6 +682,22 @@ complete view. The reconciler uses the trusted coordinator actor for follow-up
 proposals; the original operator remains recorded on the root operation.
 Creation and Meta membership changes share admission, with the durable active
 operation check covering handoff, timeout, and restart.
+
+Before changing Data topology, the root remains in `wait-meta-barrier`. Its
+submit log index is the fixed barrier `B`: every remote member in the genesis
+configuration must have a recent transport-verified response and report a
+state-machine commit index at least `B`. NuRaft peer-SM tracking remains
+enabled on followers so their responses carry that index. A leader enables it
+only while this phase is active, because the same NuRaft switch also delays
+ordinary client completion until every peer applies the write; outside the
+genesis barrier, leader proposals retain normal majority availability. The
+reconciler also requires exact agreement among the manifest Meta vector,
+NuRaft descriptors, committed
+identity bindings, and both advertised Meta directories. It never calls
+`add_srv`; initial membership already exists as the full genesis
+configuration. Cluster Create retains the shared membership admission gate
+through completion, so ordinary membership changes cannot invalidate this
+barrier or the retained creation intent.
 
 The reconciler registers Data in node-id order, creates Groups in Group-id
 order, assigns primary before sorted replicas, begins term 1, and replaces the
@@ -686,8 +772,9 @@ transition into or out of disabled mode.
 | Deterministic apply, stores, coordinator, observations, and administrative protocol implementations | `src/meta/` |
 | Volatile candidate replacement and internal deterministic plan selection | `include/keylane/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/keylane/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | Pure per-node projection and leader-scoped Data-session publisher | `include/keylane/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/keylane/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
-| Durable creation admission, leader-owned recovery and shutdown cancellation | `src/meta/ctl_server.cpp`, `include/keylane/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `src/meta/operation_store.cpp`, `app/keylane_meta.cpp` |
-| Durable Meta membership intent, exact-config recovery, leadership handoff and identity retirement | `include/keylane/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |
+| Static initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `include/keylane/meta/nuraft_state_mgr.h`, `src/meta/nuraft_state_mgr.cpp`, `app/keylane_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
+| Durable creation admission, Meta catch-up barrier, leader-owned recovery, and shutdown cancellation | `src/meta/ctl_server.cpp`, `include/keylane/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `src/meta/operation_store.cpp`, `app/keylane_meta.cpp` |
+| Durable post-genesis Meta membership intent, exact-config recovery, leadership handoff, and identity retirement | `include/keylane/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |
 | Shared Meta/Data frame, object-transfer, and message formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
 | Foreign-thread typed completion ingress and worker wakeup | `celer/include/celer/runtime/foreign_executor.h`, `celer/src/runtime/foreign_executor.cpp`, `celer/include/celer/runtime/cross_core.h`, `celer/src/runtime/worker.cpp` |

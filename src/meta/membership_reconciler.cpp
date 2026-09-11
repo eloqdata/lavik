@@ -13,6 +13,7 @@
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/fault_injection.h"
 #include "keylane/meta/identity_verifier.h"
+#include "keylane/meta/nuraft_state_mgr.h"
 #include "keylane/meta/proposal_executor.h"
 #include "keylane/meta/state_machine.h"
 #include "keylane/numeric_endpoint.h"
@@ -48,6 +49,8 @@ void WritePeer(MetaWriter& w, const MetaMembershipPeer& p) {
   w.WriteU32(p.id_);
   w.WriteString(p.endpoint_);
   w.WriteString(p.principal_);
+  w.WriteString(p.data_control_endpoint_);
+  w.WriteString(p.ctl_endpoint_);
   w.WriteU32(std::bit_cast<std::uint32_t>(p.dc_id_));
   w.WriteU32(std::bit_cast<std::uint32_t>(p.priority_));
   w.WriteBool(p.learner_);
@@ -57,20 +60,26 @@ absl::StatusOr<MetaMembershipPeer> ReadPeer(MetaReader& r) {
   auto id = r.ReadU32();
   auto endpoint = r.ReadString(kMaxMetaEndpointBytes);
   auto principal = r.ReadString(kMaxMetaPrincipalBytes);
+  auto data_control = r.ReadString(kMaxMetaEndpointBytes);
+  auto ctl = r.ReadString(kMaxMetaEndpointBytes);
   auto dc = r.ReadU32();
   auto priority = r.ReadU32();
   auto learner = r.ReadBool("invalid learner");
   auto joining = r.ReadBool("invalid new-joiner");
-  if (!id.ok() || !endpoint.ok() || !principal.ok() || !dc.ok() ||
-      !priority.ok() || !learner.ok() || !joining.ok())
+  if (!id.ok() || !endpoint.ok() || !principal.ok() || !data_control.ok() ||
+      !ctl.ok() || !dc.ok() || !priority.ok() || !learner.ok() || !joining.ok())
     return Conflict("invalid membership peer encoding");
   if (*id == 0 || *id > INT32_MAX ||
       *principal != absl::StrCat("keylane://meta/", *id) ||
-      !keylane::ParseNumericEndpoint(*endpoint))
+      !keylane::ParseNumericEndpoint(*endpoint) ||
+      !keylane::ParseNumericEndpoint(*data_control) ||
+      !keylane::ParseNumericEndpoint(*ctl))
     return Conflict("invalid membership peer identity");
   return MetaMembershipPeer{*id,
                             std::string(*endpoint),
                             std::string(*principal),
+                            std::string(*data_control),
+                            std::string(*ctl),
                             std::bit_cast<std::int32_t>(*dc),
                             std::bit_cast<std::int32_t>(*priority),
                             *learner,
@@ -112,7 +121,8 @@ absl::StatusOr<std::vector<MetaMembershipPeer>> CaptureMembershipConfig(
     if (!identity.ok() || identity->server_id_ != p->get_id())
       return Conflict("invalid membership aux identity");
     peers.push_back({static_cast<std::uint32_t>(p->get_id()), p->get_endpoint(),
-                     identity->principal_, p->get_dc_id(), p->get_priority(),
+                     identity->principal_, identity->data_control_endpoint_,
+                     identity->ctl_endpoint_, p->get_dc_id(), p->get_priority(),
                      p->is_learner(), p->is_new_joiner()});
   }
   std::sort(peers.begin(), peers.end(),
@@ -126,13 +136,56 @@ absl::StatusOr<std::vector<MetaMembershipPeer>> CaptureMembershipConfig(
   return peers;
 }
 
+absl::StatusOr<std::optional<BindMetaMember>> PlanInitialMetaBindings(
+    const MetaCommittedView& view,
+    const std::vector<MetaMembershipPeer>& config, bool initial_config) {
+  for (const auto& peer : config) {
+    if (initial_config && (peer.dc_id_ != 0 || peer.priority_ != 1 ||
+                           peer.learner_ || peer.new_joiner_)) {
+      return Conflict("initial Meta config contains a non-voter descriptor");
+    }
+    const MetaMemberRecord expected{peer.id_, peer.principal_,
+                                    peer.data_control_endpoint_,
+                                    peer.ctl_endpoint_, false};
+    const auto actual = view.identity().FindMetaMember(peer.id_);
+    if (actual.has_value()) {
+      if (*actual != expected) {
+        return Conflict(
+            "Meta config descriptor conflicts with identity binding");
+      }
+      continue;
+    }
+    if (!initial_config) {
+      return Conflict("post-genesis Meta config has no identity binding");
+    }
+    BindMetaMember bind;
+    bind.server_id_ = peer.id_;
+    bind.principal_ = peer.principal_;
+    bind.data_control_endpoint_ = peer.data_control_endpoint_;
+    bind.ctl_endpoint_ = peer.ctl_endpoint_;
+    return std::optional(std::move(bind));
+  }
+  if (initial_config) {
+    for (const auto& binding : view.identity().MetaMembers()) {
+      const auto peer = std::find_if(
+          config.begin(), config.end(), [&](const auto& candidate) {
+            return candidate.id_ == binding.server_id_;
+          });
+      if (peer == config.end()) {
+        return Conflict("initial identity binding is absent from Meta config");
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 absl::StatusOr<std::string> EncodeMembershipIntent(
     const MetaMembershipIntent& plan) {
   if (plan.before_.size() > kMaxMetaNodes ||
       plan.bindings_.size() > kMaxMetaNodes)
     return Conflict("membership intent exceeds member bound");
   MetaWriter w;
-  w.WriteU16(1);
+  w.WriteU16(2);
   w.WriteBool(plan.add_);
   WritePeer(w, plan.target_);
   WriteBinding(w, plan.binding_);
@@ -157,11 +210,13 @@ absl::StatusOr<MetaMembershipIntent> DecodeMembershipIntent(
   auto binding = ReadBinding(r);
   auto before = r.ReadList<MetaMembershipPeer>(kMaxMetaNodes, ReadPeer);
   auto bindings = r.ReadList<MetaMemberRecord>(kMaxMetaNodes, ReadBinding);
-  if (!version.ok() || *version != 1 || !add.ok() || !target.ok() ||
+  if (!version.ok() || *version != 2 || !add.ok() || !target.ok() ||
       !binding.ok() || !before.ok() || !bindings.ok() || !r.Finish().ok())
     return Conflict("invalid membership intent encoding");
   if (before->empty() || binding->server_id_ != target->id_ ||
       binding->principal_ != target->principal_ ||
+      binding->data_control_endpoint_ != target->data_control_endpoint_ ||
+      binding->ctl_endpoint_ != std::optional(target->ctl_endpoint_) ||
       bindings->size() != before->size())
     return Conflict("inconsistent membership intent");
   MetaIdentityStore identities;
@@ -171,6 +226,10 @@ absl::StatusOr<MetaMembershipIntent> DecodeMembershipIntent(
     if ((i && (*before)[i - 1].id_ >= peer.id_) ||
         record.server_id_ != peer.id_ || record.principal_ != peer.principal_)
       return Conflict("membership baseline is not canonical");
+    if (record.data_control_endpoint_ != peer.data_control_endpoint_ ||
+        record.ctl_endpoint_ != std::optional(peer.ctl_endpoint_)) {
+      return Conflict("membership baseline descriptor differs from binding");
+    }
     BindMetaMember c;
     c.server_id_ = record.server_id_;
     c.principal_ = record.principal_;
@@ -281,6 +340,7 @@ struct MetaMembershipReconciler::Core {
   MetaProposalExecutor* proposals_;
   nuraft::ptr<nuraft::raft_server> server_;
   nuraft::ptr<MetaStateMachine> state_machine_;
+  nuraft::ptr<NuraftStateMgr> state_mgr_;
   std::shared_ptr<MetaMembershipGate> gate_;
   bool running_ = false, cancelled_ = true, shutdown_ = false;
   std::atomic<bool> stopping_{false}, stopped_{false};
@@ -295,12 +355,14 @@ MetaMembershipReconciler::MetaMembershipReconciler(
     celer::ForeignExecutor executor, MetaProposalExecutor& proposals,
     nuraft::ptr<nuraft::raft_server> server,
     nuraft::ptr<MetaStateMachine> machine,
+    nuraft::ptr<NuraftStateMgr> state_mgr,
     std::shared_ptr<MetaMembershipGate> gate)
     : core_(std::make_shared<Core>()) {
   core_->executor_ = std::move(executor);
   core_->proposals_ = &proposals;
   core_->server_ = std::move(server);
   core_->state_machine_ = std::move(machine);
+  core_->state_mgr_ = std::move(state_mgr);
   core_->gate_ = std::move(gate);
 }
 MetaMembershipReconciler::~MetaMembershipReconciler() { Shutdown(); }
@@ -376,6 +438,85 @@ celer::Task<absl::Status> MetaMembershipReconciler::Run(
         operations.begin(), operations.end(), [](const auto& item) {
           return item.kind_ == kMetaMembershipOperationKind && !Terminal(item);
         });
+    const auto loaded_config = core->server_->get_config();
+    auto configured = CaptureMembershipConfig(loaded_config);
+    if (op == operations.end()) {
+      auto initial_binding =
+          configured.ok() ? PlanInitialMetaBindings(
+                                view, *configured,
+                                core->state_mgr_->initial_bindings_pending())
+                          : absl::StatusOr<std::optional<BindMetaMember>>(
+                                configured.status());
+      if (!initial_binding.ok() || initial_binding->has_value()) {
+        if (!lease) lease = core->gate_->TryAcquire();
+        if (!initial_binding.ok()) {
+          if (last_cut != initial_binding.status().message()) {
+            spdlog::critical("initial Meta identity reconciliation blocked: {}",
+                             initial_binding.status().message());
+            last_cut = std::string(initial_binding.status().message());
+          }
+        } else {
+          bool paused = false;
+          std::size_t active_binding_count = 0;
+          KEYLANE_FAULT_INJECT(
+              const auto bindings = view.identity().MetaMembers();
+              active_binding_count = static_cast<std::size_t>(std::count_if(
+                  bindings.begin(), bindings.end(),
+                  [](const auto& binding) { return !binding.retired_; }));
+              paused = KEYLANE_FAULT_MATCHES(
+                  "KEYLANE_TEST_PAUSE_INITIAL_BINDINGS_AFTER",
+                  std::to_string(active_binding_count)););
+          if (paused) {
+            const std::string cut = absl::StrCat(
+                "initial-bindings-paused-after-", active_binding_count);
+            if (last_cut != cut) {
+              spdlog::info(
+                  "initial Meta identity reconciliation paused after {} "
+                  "bindings",
+                  active_binding_count);
+              last_cut = cut;
+            }
+          } else if (lease && core->server_->is_leader() &&
+                     core->server_->is_leader_alive() &&
+                     core->server_->is_leader_sm_fully_caught_up()) {
+            MetaCommand command(std::move(**initial_binding));
+            auto request = cluster::control::GenerateId128();
+            if (!request.ok()) std::terminate();
+            std::visit([&](auto& value) { value.request_id_ = *request; },
+                       command);
+            auto result = co_await context->Propose(std::move(command));
+            changed->store(true, std::memory_order_release);
+            if (result.ok() &&
+                result->verdict_ == MetaAuditVerdict::kAccepted) {
+              continue;
+            }
+          }
+        }
+        auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                              std::chrono::milliseconds(25));
+        if (!slept.ok()) break;
+        continue;
+      }
+      if (core->state_mgr_->initial_bindings_pending()) {
+        // Clear transport grace only after the complete identity projection
+        // is authoritative. The marker is durable so a crash or another
+        // election-time config copy cannot strand an unfinished genesis.
+        if (absl::Status status = core->state_mgr_->CompleteInitialBindings(
+                view.applied_index());
+            !status.ok()) {
+          if (last_cut != status.message()) {
+            spdlog::critical(
+                "initial Meta identity completion could not be persisted: {}",
+                status.message());
+            last_cut = std::string(status.message());
+          }
+          auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                                std::chrono::milliseconds(25));
+          if (!slept.ok()) break;
+          continue;
+        }
+      }
+    }
     if (op == operations.end()) {
       lease.reset();
       attempt.reset();
@@ -475,8 +616,9 @@ celer::Task<absl::Status> MetaMembershipReconciler::Run(
                       const auto& t = intent.target_;
                       nuraft::srv_config peer(
                           t.id_, t.dc_id_, t.endpoint_,
-                          MetaMemberIdentity{static_cast<int>(t.id_),
-                                             t.principal_}
+                          MetaMemberIdentity{
+                              static_cast<int>(t.id_), t.principal_,
+                              t.data_control_endpoint_, t.ctl_endpoint_}
                               .EncodeAux(),
                           t.learner_, t.priority_);
                       result = server->add_srv(peer);

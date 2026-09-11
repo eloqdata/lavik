@@ -1,5 +1,6 @@
 #include "keylane/meta/identity_verifier.h"
 
+#include <array>
 #include <charconv>
 #include <limits>
 #include <vector>
@@ -7,6 +8,7 @@
 #include "absl/strings/str_cat.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/encoding.h"
+#include "keylane/numeric_endpoint.h"
 
 namespace keylane::meta {
 namespace {
@@ -14,7 +16,7 @@ namespace {
 constexpr std::string_view kNodePrefix = "keylane://node/";
 constexpr std::string_view kMetaPrefix = "keylane://meta/";
 constexpr std::string_view kOperatorPrefix = "keylane://operator/";
-constexpr std::string_view kAuxPrefix = "KMI1|";
+constexpr std::string_view kAuxPrefix = "KMI2|";
 
 bool IsLowerHex(std::string_view text) {
   for (const char c : text) {
@@ -133,21 +135,28 @@ absl::Status ValidateDataNodePrincipal(std::string_view node_id,
 }
 
 std::string MetaMemberIdentity::EncodeAux() const {
-  return absl::StrCat(kAuxPrefix, server_id_, "|", principal_);
+  return absl::StrCat(kAuxPrefix, server_id_, "|", principal_, "|",
+                      data_control_endpoint_, "|", ctl_endpoint_);
 }
 
 absl::StatusOr<MetaMemberIdentity> MetaMemberIdentity::DecodeAux(
     std::string_view aux) {
   if (!aux.starts_with(kAuxPrefix)) {
-    return absl::InvalidArgumentError("missing KMI1 member identity prefix");
+    return absl::InvalidArgumentError("missing KMI2 member identity prefix");
   }
   aux.remove_prefix(kAuxPrefix.size());
-  const std::size_t separator = aux.find('|');
-  if (separator == std::string_view::npos) {
-    return absl::InvalidArgumentError("truncated KMI1 member identity");
+  std::array<std::string_view, 4> fields;
+  for (std::size_t index = 0; index < fields.size() - 1; ++index) {
+    const std::size_t separator = aux.find('|');
+    if (separator == std::string_view::npos) {
+      return absl::InvalidArgumentError("truncated KMI2 member identity");
+    }
+    fields[index] = aux.substr(0, separator);
+    aux.remove_prefix(separator + 1);
   }
-  const std::string_view server_id_text = aux.substr(0, separator);
-  const std::string_view principal_text = aux.substr(separator + 1);
+  fields.back() = aux;
+  const std::string_view server_id_text = fields[0];
+  const std::string_view principal_text = fields[1];
 
   auto server_id = ParseCanonicalDecimal(server_id_text);
   if (!server_id.ok()) return server_id.status();
@@ -158,8 +167,17 @@ absl::StatusOr<MetaMemberIdentity> MetaMemberIdentity::DecodeAux(
     return absl::InvalidArgumentError(
         "member principal does not match its server id");
   }
+  const auto data_control = keylane::ParseNumericEndpoint(fields[2]);
+  const auto ctl = keylane::ParseNumericEndpoint(fields[3]);
+  if (!data_control.has_value() || !ctl.has_value() ||
+      keylane::FormatNumericEndpoint(*data_control) != fields[2] ||
+      keylane::FormatNumericEndpoint(*ctl) != fields[3]) {
+    return absl::InvalidArgumentError(
+        "member endpoints are not canonical numeric endpoints");
+  }
   return MetaMemberIdentity{static_cast<std::int32_t>(*server_id),
-                            std::string(principal_text)};
+                            std::string(principal_text), std::string(fields[2]),
+                            std::string(fields[3])};
 }
 
 absl::Status VerifyRaftPeerIdentity(std::int32_t claimed_server_id,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-process single-Meta cluster-create and recovery gate.
+"""Real-process static-Meta cluster-create and recovery gate.
 
 Usage: gate_cluster_create.py META DATA CTL REDIS_CLI [workdir]
 """
@@ -31,11 +31,27 @@ GROUPS = {
 }
 
 
-def write_manifest(path, endpoint):
+def meta_manifest_lines(*metas):
+    lines = []
+    for meta in sorted(metas, key=lambda node: node.id):
+        lines.extend([
+            "[[meta_members]]",
+            f"id = {meta.id}",
+            f'raft_endpoint = "tcp://{meta.endpoint}"',
+            f'data_control_endpoint = "tcp://{meta.data_control_endpoint}"',
+            f'ctl_endpoint = "tcp://{meta.ctl_endpoint}"',
+            "",
+        ])
+    return lines
+
+
+def write_manifest(path, endpoint, metas):
+    if not isinstance(metas, (list, tuple)):
+        metas = [metas]
     with open(path, "w", encoding="utf-8") as output:
         output.write(
-            "schema_version = 1\n\n"
-            "[[meta_members]]\nid = 1\n\n"
+            "schema_version = 1\n\n" +
+            "\n".join(meta_manifest_lines(*metas)) +
             "[[data_nodes]]\n"
             f'id = "{DATA_NODE}"\n'
             f'client_endpoint = "{endpoint}"\n\n'
@@ -66,9 +82,24 @@ def cluster_status(meta):
     return json.loads(result.stdout)
 
 
-def create_request(node_id, endpoint, group_id, meta_id=1, timeout_ms=3000):
+def create_request(meta, node_id, endpoint, group_id, meta_id=None,
+                   timeout_ms=3000):
     """Send a normalized public v1 envelope so CLI cannot hide races."""
-    payload = struct.pack(">HIHI", 1, meta_id, 0, 1)
+    metas = meta if isinstance(meta, (list, tuple)) else [meta]
+    payload = struct.pack(">HI", 2, len(metas))
+    for member in sorted(metas, key=lambda item: item.id):
+        member_id = member.id if meta_id is None else meta_id
+        payload += struct.pack(">I", member_id)
+        for value in (f"tcp://{member.endpoint}",
+                      "tcp://" + getattr(
+                          member, "advertised_data_control_endpoint",
+                          member.data_control_endpoint),
+                      "tcp://" + getattr(
+                          member, "advertised_ctl_endpoint",
+                          member.ctl_endpoint)):
+            encoded = value.encode()
+            payload += struct.pack(">I", len(encoded)) + encoded
+    payload += struct.pack(">HI", 0, 1)
     for value in (node_id, endpoint):
         encoded = value.encode()
         payload += struct.pack(">I", len(encoded)) + encoded
@@ -151,7 +182,7 @@ def run_unrelated_commit_case(workdir):
         H.wait_until("bootstrap Meta identity committed", 5,
                      lambda: cluster_status(meta)["meta_membership_stable"])
         connection.connect(meta.ctl_path)
-        request = create_request(DATA_NODE, data.advertised_endpoint,
+        request = create_request(meta, DATA_NODE, data.advertised_endpoint,
                                  "group-1", timeout_ms=10000)
         connection.sendall(request.encode() + b"\n")
         # Complete all topology/authority commits before starting Data, so
@@ -226,7 +257,7 @@ def run_concurrent_case(workdir, transports):
         # A rejected preflight must release admission before any proposal.
         before = meta.committed()
         rejected = meta.ctl(create_request(
-            node_ids[0], endpoints[0], groups[0], meta_id=2))
+            meta, node_ids[0], endpoints[0], groups[0], meta_id=2))
         if (not rejected.startswith(
                 "ERR clustercreate 1 preflight non-empty-cluster ") or
                 meta.committed() != before):
@@ -250,7 +281,7 @@ def run_concurrent_case(workdir, transports):
 
         meta.pause()
         for index, connection in enumerate(connections):
-            request = create_request(node_ids[index], endpoints[index],
+            request = create_request(meta, node_ids[index], endpoints[index],
                                      groups[index])
             connection.sendall(request.encode() + b"\n")
         meta.resume()
@@ -283,7 +314,7 @@ def run_concurrent_case(workdir, transports):
         # retains the single-Meta premise until completion or explicit abort.
         if meta.ctl("removesrv 1") != "ERR config-changing":
             raise H.Failure(f"{name}: timeout abandoned durable admission")
-        retry = meta.ctl(create_request(node_ids[winner], endpoints[winner],
+        retry = meta.ctl(create_request(meta, node_ids[winner], endpoints[winner],
                                        groups[winner]))
         if not retry.startswith(
                 "ERR clustercreate 1 preflight domain-rejected "):
@@ -333,7 +364,7 @@ def run_case(workdir, interactive):
     environment["PATH"] = (os.path.dirname(REDIS_CLI) + os.pathsep +
                            environment.get("PATH", ""))
     manifest = os.path.join(scenario, "cluster.toml")
-    write_manifest(manifest, data.advertised_endpoint)
+    write_manifest(manifest, data.advertised_endpoint, meta)
     try:
         meta.start(bootstrap=True)
         meta.wait_leader()
@@ -440,12 +471,145 @@ def run_case(workdir, interactive):
         meta.force_kill()
 
 
-def write_multi_manifest(path, nodes, automatic):
+def run_static_multi_meta_create_case(workdir, count, late_voter):
+    """Every static vector creates through the same fixed Meta barrier."""
+    scenario = os.path.join(workdir, f"static-{count}-meta-create")
+    meta_workdir = os.path.join(scenario, "meta")
+    os.makedirs(meta_workdir, mode=0o700)
+    metas = H.make_nodes(
+        META, meta_workdir, count,
+        args=H.raft_args(snapshot_distance=100_000))
+    data = DataProcess(DATA, os.path.join(scenario, "data"), DATA_NODE,
+                       metas[0].data_control_endpoint)
+    manifest = os.path.join(scenario, "cluster.toml")
+    write_manifest(manifest, data.advertised_endpoint, metas)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(120)
+    post_create_joiner = None
+    try:
+        # Data may start before any Meta process and remains fail closed while
+        # its unregistered session retries the static seed.
+        data.start()
+        running = metas[:-1] if late_voter else metas
+        for meta in running:
+            meta.start(initial_cluster_manifest=manifest)
+        leader = H.find_leader(running, timeout=20)
+        H.wait_until(
+            "initial Meta identities converge before Cluster Create", 10,
+            lambda: cluster_status(leader)["meta_membership_stable"])
+
+        connection.connect(leader.ctl_path)
+        connection.sendall(
+            (create_request(metas, DATA_NODE, data.advertised_endpoint,
+                            "group-1", timeout_ms=120000) + "\n").encode())
+
+        def waiting_at_barrier():
+            status = cluster_status(leader)
+            codes = {blocker["code"] for blocker in status["blockers"]}
+            return ("meta_catching_up" in codes and
+                    ("data_unregistered_retrying" in codes or
+                     "data_unregistered" in codes))
+
+        if late_voter:
+            H.wait_until(
+                "late Meta and pre-registration Data blockers", 15,
+                waiting_at_barrier)
+            if leader.ctl(f"removesrv {count}") != "ERR config-changing":
+                raise H.Failure(
+                    "Cluster Create did not retain membership admission")
+            old_leader = leader
+            old_leader.terminate()
+            try:
+                H.find_leader(
+                    [meta for meta in metas[:-1] if meta is not old_leader],
+                    timeout=2)
+                raise H.Failure(
+                    "submitted Cluster Create elected without a majority")
+            except H.Failure as error:
+                if "timeout" not in str(error):
+                    raise
+            metas[-1].start(initial_cluster_manifest=manifest)
+            leader = H.find_leader(
+                [meta for meta in metas if meta is not old_leader],
+                timeout=20)
+            # The original Admin waiter is gone with its leader. Restart that
+            # member without the genesis manifest and let the new leader
+            # resume the one durable root without another create request.
+            connection.close()
+            connection = None
+            old_leader.start()
+        else:
+            reply = read_reply(connection)
+            if not reply.startswith("OK clustercreate 1 "):
+                raise H.Failure(
+                    "initial Meta barrier did not release Cluster Create: "
+                    f"{reply}")
+        H.wait_until(
+            f"{count}-Meta cluster reaches serving readiness", 20,
+            lambda: cluster_status(leader)["result"] == "ready")
+        status = cluster_status(leader)
+        if (status["result"] != "ready" or
+                not status["meta_membership_stable"] or
+                len(status["meta_members"]) != count):
+            raise H.Failure(
+                f"{count}-Meta Cluster Create is not READY: {status}")
+        if count == 3:
+            post_create_joiner = H.Node(
+                META, meta_workdir, count + 1,
+                args=H.raft_args(snapshot_distance=100_000))
+            post_create_joiner.start()
+            leader = H.find_leader(metas)
+            H.join_and_verify(leader, post_create_joiner, timeout=30)
+            retire_replies = []
+
+            def post_create_member_retires():
+                retire_replies[:] = [
+                    leader.ctl(f"removesrv {post_create_joiner.id}")]
+                return retire_replies == ["OK"]
+
+            try:
+                H.wait_until("post-create membership remains reusable", 10,
+                             post_create_member_retires)
+            except H.Failure as error:
+                raise H.Failure(
+                    "post-create membership workflow did not retire member: "
+                    f"{retire_replies}") from error
+            post_create_joiner.terminate()
+            minority = next(meta for meta in metas if meta is not leader)
+            minority.terminate()
+            before = leader.committed()
+            reply = leader.putpolicy("post-create-majority", 1,
+                                     "barrier-released")
+            match = re.fullmatch(r"OK (\d+)", reply)
+            if match is None or int(match.group(1)) <= before:
+                raise H.Failure(
+                    "post-create writes retained all-peer completion: "
+                    f"{reply}")
+        H.log(f"static {count}-Meta barrier and Data-first create — OK")
+        data.terminate()
+        for meta in metas:
+            meta.terminate()
+    except Exception:
+        H.dump_node_logs(metas)
+        print(f"--- Data log tail ({data.log_path}) ---", file=sys.stderr)
+        print(data.log_tail(lines=250), file=sys.stderr)
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+        data.force_kill()
+        if post_create_joiner is not None:
+            post_create_joiner.force_kill()
+        for meta in metas:
+            meta.force_kill()
+
+
+def write_multi_manifest(path, nodes, automatic, meta):
     by_id = {node.node_id: node for node in nodes}
     lines = ["schema_version = 1"]
     if automatic:
         lines.append('slot_strategy = "contiguous-even"')
-    lines.extend(["", "[[meta_members]]", "id = 1", ""])
+    lines.extend([""] + meta_manifest_lines(meta))
     # Reverse every input collection to prove normalization drives preview,
     # wire encoding, and the committed command sequence.
     for node_id in reversed(sorted(by_id)):
@@ -679,7 +843,8 @@ def stopped_replica_blocker(environment, meta, replica):
 
 def run_multi_group_case(workdir, automatic, interactive,
                          block_replica_during_create=False,
-                         restart_replica_during_create=False):
+                         restart_replica_during_create=False,
+                         data_first=False):
     layout = "automatic" if automatic else "explicit"
     mode = "interactive" if interactive else "yes"
     blocked = "-blocked" if block_replica_during_create else ""
@@ -705,11 +870,10 @@ def run_multi_group_case(workdir, automatic, interactive,
     environment["PATH"] = (os.path.dirname(REDIS_CLI) + os.pathsep +
                            environment.get("PATH", ""))
     manifest = os.path.join(scenario, "cluster.toml")
-    write_multi_manifest(manifest, nodes, automatic)
-    try:
-        meta.start(bootstrap=True)
-        meta.wait_leader()
-        started_nodes = nodes[:-1] if block_replica_during_create else nodes
+    write_multi_manifest(manifest, nodes, automatic, meta)
+    started_nodes = nodes[:-1] if block_replica_during_create else nodes
+
+    def start_data_nodes():
         for node in started_nodes:
             variable = "KEYLANE_REPLICATION_PAUSE_FULLSYNC_BEFORE_CATALOG_ACK_MS"
             old = os.environ.get(variable)
@@ -722,6 +886,17 @@ def run_multi_group_case(workdir, automatic, interactive,
                     os.environ.pop(variable, None)
                 else:
                     os.environ[variable] = old
+
+    try:
+        # The normal acceptance path starts the complete multi-Data,
+        # multi-Group cohort before Meta. Other fault cases retain their
+        # targeted ordering but still use the same complete genesis manifest.
+        if data_first:
+            start_data_nodes()
+        meta.start(initial_cluster_manifest=manifest)
+        meta.wait_leader()
+        if not data_first:
+            start_data_nodes()
         arguments = [
             CTL, "cluster-create", "--manifest", manifest,
             "--socket", meta.ctl_path, "--timeout-ms",
@@ -844,8 +1019,8 @@ def run_group_id_probe_case(workdir):
     manifest = os.path.join(scenario, "cluster.toml")
     # Without escaping, every {keylane-create-group-2}-N} hashes to 9188,
     # outside this Group's generated range 0..8191, regardless of N.
-    lines = ['schema_version = 1', 'slot_strategy = "contiguous-even"',
-             '[[meta_members]]', 'id = 1']
+    lines = (['schema_version = 1', 'slot_strategy = "contiguous-even"'] +
+             meta_manifest_lines(meta))
     for node, group_id in zip(nodes, ("group-2}", "z")):
         lines.extend(['[[data_nodes]]', f'id = "{node.node_id}"',
                       f'client_endpoint = "{node.advertised_endpoint}"',
@@ -937,6 +1112,11 @@ def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False):
                   args=H.raft_args(snapshot_distance=100_000))
     proxy = (DirectiveBarrier(meta.data_control_port, result=wire == "result")
              if wire else None)
+    if proxy:
+        # The manifest owns the advertised endpoint while the process flag
+        # owns the local bind. Advertising the proxy keeps reconnects on the
+        # same observable path instead of racing the first session's FDS.
+        meta.advertised_data_control_endpoint = proxy.endpoint
     data = DataProcess(DATA, os.path.join(scenario, "data"), DATA_NODE,
                        proxy.endpoint if proxy else meta.data_control_endpoint)
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -966,7 +1146,7 @@ def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False):
         connection.connect(meta.ctl_path)
         # The maximum accepted wait must not become the process stop budget.
         connection.sendall((create_request(
-            DATA_NODE, data.advertised_endpoint, "group-1",
+            meta, DATA_NODE, data.advertised_endpoint, "group-1",
             timeout_ms=3600000) + "\n").encode())
         if proxy:
             # Install the topology before connecting through the barrier. A
@@ -1066,7 +1246,10 @@ def main():
         run_unrelated_commit_case(workdir)
         for transports in (("unix", "unix"), ("tcp", "tcp"), ("unix", "tcp")):
             run_concurrent_case(workdir, transports)
-        run_multi_group_case(workdir, automatic=True, interactive=True)
+        run_static_multi_meta_create_case(workdir, 3, late_voter=True)
+        run_static_multi_meta_create_case(workdir, 5, late_voter=False)
+        run_multi_group_case(workdir, automatic=True, interactive=True,
+                             data_first=True)
         run_multi_group_case(workdir, automatic=False, interactive=False)
         run_multi_group_case(workdir, automatic=False, interactive=False,
                              block_replica_during_create=True)

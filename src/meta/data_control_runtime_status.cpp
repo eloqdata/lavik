@@ -56,6 +56,8 @@ void MetaDataControlRuntimeStatus::BeginLeadership(
     std::uint64_t leadership_generation) {
   std::lock_guard<std::mutex> lock(mutex_);
   nodes_.clear();
+  unregistered_retries_.clear();
+  observed_nodes_.clear();
   leadership_generation_ = leadership_generation;
   leader_authority_eligible_ = false;
 }
@@ -72,8 +74,25 @@ void MetaDataControlRuntimeStatus::EndLeadership(
   std::lock_guard<std::mutex> lock(mutex_);
   if (leadership_generation_ != leadership_generation) return;
   nodes_.clear();
+  unregistered_retries_.clear();
+  observed_nodes_.clear();
   leadership_generation_ = 0;
   leader_authority_eligible_ = false;
+}
+
+void MetaDataControlRuntimeStatus::NoteUnregisteredRetry(
+    std::string node_id, std::uint64_t leadership_generation) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (leadership_generation_ != leadership_generation ||
+      leadership_generation == 0) {
+    return;
+  }
+  if (!unregistered_retries_.contains(node_id) &&
+      unregistered_retries_.size() >=
+          cluster::control::kMaxProjectedNodes) {
+    return;
+  }
+  unregistered_retries_[std::move(node_id)] = leadership_generation;
 }
 
 void MetaDataControlRuntimeStatus::PublishCurrent(
@@ -96,6 +115,11 @@ void MetaDataControlRuntimeStatus::PublishCurrent(
   node.session_generation_ = session_generation;
   node.leadership_generation_ = leadership_generation;
   ApplyProjection(node, validated_committed_high_water, projection);
+  unregistered_retries_.erase(node.node_id_);
+  if (observed_nodes_.contains(node.node_id_) ||
+      observed_nodes_.size() < cluster::control::kMaxProjectedNodes) {
+    observed_nodes_.insert(node.node_id_);
+  }
   nodes_[node.node_id_] = std::move(node);
 }
 
@@ -150,6 +174,12 @@ MetaDataControlRuntimeSnapshot MetaDataControlRuntimeStatus::Snapshot() const {
   snapshot.leader_authority_eligible_ = leader_authority_eligible_;
   snapshot.nodes_.reserve(nodes_.size());
   for (const auto& [id, node] : nodes_) snapshot.nodes_.push_back(node);
+  snapshot.unregistered_retries_.reserve(unregistered_retries_.size());
+  for (const auto& retry : unregistered_retries_) {
+    snapshot.unregistered_retries_.push_back(retry.first);
+  }
+  snapshot.observed_nodes_.assign(observed_nodes_.begin(),
+                                  observed_nodes_.end());
   return snapshot;
 }
 

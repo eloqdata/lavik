@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -52,6 +53,15 @@ struct MetaDataControlRuntimeSnapshot {
   std::uint64_t leadership_generation_ = 0;
   bool leader_authority_eligible_ = false;
   std::vector<MetaDataControlRuntimeNode> nodes_;
+  // Authenticated/parsed Hellos rejected because cluster-create has not yet
+  // committed the corresponding identity. This distinguishes a reconnecting
+  // Data process from a declared node that has never contacted this leader.
+  std::vector<std::string> unregistered_retries_;
+  // Nodes that established an accepted session in this leadership generation.
+  // Entries outlive session removal so diagnostics can distinguish a missing
+  // session from a node this leader has never observed. The registry is
+  // bounded by the protocol's maximum projected node count.
+  std::vector<std::string> observed_nodes_;
 };
 
 struct MetaDataControlLeadershipState {
@@ -72,6 +82,12 @@ class MetaDataControlRuntimeStatus {
   // Clears observations only when ending the current generation. A delayed
   // demotion for an older generation cannot erase a newer leader's state.
   void EndLeadership(std::uint64_t leadership_generation);
+  // Records an authenticated, active-create-declared node id only in the
+  // current leadership generation. The caller enforces those predicates and
+  // this store independently caps retained evidence; diagnostics never
+  // participate in authorization.
+  void NoteUnregisteredRetry(std::string node_id,
+                             std::uint64_t leadership_generation);
   // Publishes a fully validated Hello/FDS session for the current eligible
   // leader generation. Replacing a node session atomically discards all
   // heartbeat and lease observations belonging to its predecessor.
@@ -114,6 +130,8 @@ class MetaDataControlRuntimeStatus {
   std::uint64_t leadership_generation_ = 0;
   bool leader_authority_eligible_ = false;
   std::map<std::string, MetaDataControlRuntimeNode> nodes_;
+  std::map<std::string, std::uint64_t> unregistered_retries_;
+  std::set<std::string> observed_nodes_;
 };
 
 }  // namespace keylane::meta
