@@ -131,10 +131,13 @@ inline constexpr std::string_view kMetaDirectiveRevokeSources =
     "revoke-sources";
 inline constexpr std::string_view kMetaDirectiveInitializeEmptyPopulation =
     "initialize-empty-population";
+inline constexpr std::string_view kMetaDirectivePromotionPrepare =
+    "promotion-prepare";
 
 inline constexpr bool IsMetaPopulationDirective(std::string_view kind) {
   return kind == kMetaDirectiveRebuild ||
-         kind == kMetaDirectiveInitializeEmptyPopulation;
+         kind == kMetaDirectiveInitializeEmptyPopulation ||
+         kind == kMetaDirectivePromotionPrepare;
 }
 
 inline constexpr bool IsMetaSourceDirective(std::string_view kind) {
@@ -146,10 +149,10 @@ inline constexpr bool IsKnownMetaDirective(std::string_view kind) {
   return IsMetaPopulationDirective(kind) || IsMetaSourceDirective(kind);
 }
 
-// Directive kinds define their own bounded payload contracts;
-// initialize-empty-population carries the authenticated target history ID.
-// Preconditions remain reserved and force=true is rejected at Meta transition
-// apply and again at Data admission rather than silently weakening execution.
+// Directive kinds define their own bounded payload contracts.
+// initialize-empty-population carries the authenticated target history ID;
+// promotion-prepare owns versioned payload and precondition bodies. Every kind
+// rejects force=true at Meta transition apply and again at Data admission.
 inline constexpr std::uint32_t kMaxMetaDirectivePreconditionsBytes =
     kMaxMetaPayloadBytes;
 // Receipt retention shares the operation evidence horizon: both are
@@ -539,8 +542,9 @@ struct MetaDirectiveSpec {
   MetaHash256 population_manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
   std::string kind_;
-  // V1 uses payload only for initialize-empty-population's authenticated
-  // target history id. Preconditions remain reserved for future evolution.
+  // V1 uses payload for initialize-empty-population's authenticated target
+  // history and versioned bodies for promotion-prepare. Other executable kinds
+  // require both fields empty.
   std::string payload_;
   std::string preconditions_;
   // Active classification used to exclude concurrent mutations of the same

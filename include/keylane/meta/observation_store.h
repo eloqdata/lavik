@@ -138,9 +138,9 @@ struct MetaOperationEvidenceObs {
 };
 
 // Canonical conversion used after EvidenceForOperation returns a validated,
-// self-contained observation. The manifest digest comes from the same
-// committed view used for that query; every observation/session anchor is
-// copied without a second lookup that could race session supersession.
+// TTL-fresh, self-contained observation. The manifest digest comes from the
+// same committed view used for that query; every observation/session anchor
+// is copied without a second lookup that could race session supersession.
 MetaEvidenceSummary SummarizeOperationEvidence(
     const MetaOperationEvidenceObs& evidence,
     const MetaHash256& population_manifest_digest);
@@ -320,7 +320,9 @@ class MetaObservationStore {
   // explicit query paths retain SweepExpired's exact boundary semantics.
   bool MaybeSweepExpired(int64_t now_unix_ms);
 
-  // Read paths re-filter against current facts and never return stale data.
+  // Read paths re-filter against current committed facts. Operation evidence
+  // additionally takes the caller's current wall time so an authority
+  // decision cannot depend on a delayed periodic TTL sweep.
   std::optional<MetaCandidateProgressObs> LatestCandidateProgress(
       std::string_view group_id, const MetaCommittedFacts& facts) const;
   std::vector<MetaCandidateProgressObs> CandidateProgressFor(
@@ -334,7 +336,8 @@ class MetaObservationStore {
   std::optional<MetaObservation> LatestForNode(
       std::string_view node_id, const MetaCommittedFacts& facts) const;
   std::vector<MetaOperationEvidenceObs> EvidenceForOperation(
-      const MetaOperationId& id, const MetaCommittedFacts& facts) const;
+      const MetaOperationId& id, const MetaCommittedFacts& facts,
+      int64_t now_unix_ms) const;
 
   std::optional<uint64_t> CurrentGeneration(std::string_view node_id) const;
 

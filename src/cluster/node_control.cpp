@@ -106,24 +106,48 @@ NodeDirectiveCompletion NodeDirectiveCompletion::Rejected(absl::Status result) {
     result = absl::InternalError(
         "a rejected directive completion cannot contain success");
   }
-  auto terminal = std::make_shared<const absl::Status>(std::move(result));
+  auto terminal =
+      std::make_shared<const TerminalResult>(std::move(result));
   return NodeDirectiveCompletion(
-      [terminal = std::move(terminal)]() { return *terminal; }, false);
+      [terminal = std::move(terminal)]() { return *terminal; }, false,
+      ResultPollTag{});
 }
 
 NodeDirectiveCompletion NodeDirectiveCompletion::StartedTerminal(
     absl::Status result) {
-  auto terminal = std::make_shared<const absl::Status>(std::move(result));
+  TerminalResult terminal_result = result.ok()
+                                       ? TerminalResult(std::string{})
+                                       : TerminalResult(std::move(result));
+  return StartedTerminalResult(std::move(terminal_result));
+}
+
+NodeDirectiveCompletion NodeDirectiveCompletion::StartedTerminalResult(
+    TerminalResult result) {
+  auto terminal =
+      std::make_shared<const TerminalResult>(std::move(result));
   return NodeDirectiveCompletion(
-      [terminal = std::move(terminal)]() { return *terminal; }, true);
+      [terminal = std::move(terminal)]() { return *terminal; }, true,
+      ResultPollTag{});
+}
+
+NodeDirectiveCompletion NodeDirectiveCompletion::FromResultPoll(
+    ResultPoll poll) {
+  return NodeDirectiveCompletion(std::move(poll), true, ResultPollTag{});
+}
+
+std::optional<NodeDirectiveCompletion::TerminalResult>
+NodeDirectiveCompletion::terminal_result() const {
+  if (!result_poll_) {
+    return TerminalResult(absl::FailedPreconditionError(
+        "directive completion handle is empty"));
+  }
+  return result_poll_();
 }
 
 std::optional<absl::Status> NodeDirectiveCompletion::result() const {
-  if (!poll_) {
-    return absl::FailedPreconditionError(
-        "directive completion handle is empty");
-  }
-  return poll_();
+  std::optional<TerminalResult> terminal = terminal_result();
+  if (!terminal.has_value()) return std::nullopt;
+  return terminal->ok() ? absl::OkStatus() : terminal->status();
 }
 
 celer::Task<absl::Status> NodeDirectiveCompletion::Await() const {
@@ -329,7 +353,8 @@ absl::Status NodeControlInstaller::ValidateDirectiveAnchor(
 
   const NodeId& local_node_id = current->Self()->node_id_;
   if (directive.kind_ == NodeDirective::Kind::kReplication ||
-      initializes_empty) {
+      initializes_empty ||
+      directive.kind_ == NodeDirective::Kind::kPromotionPrepare) {
     if (directive.target_node_id_ != local_node_id) {
       return absl::FailedPreconditionError(
           "population directive does not execute on its target");
@@ -354,20 +379,49 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
   }
   const bool initializes_empty =
       directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation;
-  const bool payload_valid =
-      initializes_empty
-          ? directive.payload_.size() == 40 &&
-                std::all_of(directive.payload_.begin(),
-                            directive.payload_.end(), [](unsigned char value) {
-                              return (value >= '0' && value <= '9') ||
-                                     (value >= 'a' && value <= 'f');
-                            })
-          : directive.payload_.empty();
-  if (!payload_valid || !directive.preconditions_.empty() ||
-      directive.force_) {
+  const bool promotion =
+      directive.kind_ == NodeDirective::Kind::kPromotionPrepare;
+  if (directive.force_) {
     return absl::InvalidArgumentError(
-        "control protocol v1 permits only the initialization history payload; "
-        "preconditions and force remain reserved");
+        "directive force is reserved in control protocol v1");
+  }
+  if (promotion != directive.promotion_prepare_.has_value()) {
+    return absl::InvalidArgumentError(
+        "directive kind does not match its decoded payload schema");
+  }
+  const bool initialization_payload_valid =
+      directive.payload_.size() == 40 &&
+      std::all_of(directive.payload_.begin(), directive.payload_.end(),
+                  [](unsigned char value) {
+                    return (value >= '0' && value <= '9') ||
+                           (value >= 'a' && value <= 'f');
+                  });
+  if (initializes_empty
+          ? (!initialization_payload_valid ||
+             !directive.preconditions_.empty())
+          : (!directive.payload_.empty() ||
+             !directive.preconditions_.empty())) {
+    return absl::InvalidArgumentError(
+        "directive kind does not match its opaque field schema");
+  }
+  if (promotion) {
+    const PromotionPrepareInput& input = *directive.promotion_prepare_;
+    const bool zero_exclusion =
+        std::all_of(input.old_authority_exclusion_hash_.begin(),
+                    input.old_authority_exclusion_hash_.end(),
+                    [](std::uint8_t byte) { return byte == 0; });
+    if (input.parent_history_id_.empty() ||
+        input.parent_history_id_ !=
+            directive.source_replication_history_id_.ToHexString() ||
+        input.required_applied_next_lsns_.empty() ||
+        std::any_of(input.required_applied_next_lsns_.begin(),
+                    input.required_applied_next_lsns_.end(),
+                    [](std::uint64_t cursor) { return cursor == 0; }) ||
+        input.excluded_group_term_ != directive.anchor_.group_term_ ||
+        zero_exclusion) {
+      return absl::InvalidArgumentError(
+          "promotion prepare payload or preconditions are incomplete");
+    }
   }
   if (const absl::Status projection = ValidateProjection(directive.projection_);
       !projection.ok()) {
@@ -404,7 +458,8 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
   // capability merely because a later directive names a different target.
   AuthorityAnchor local_anchor = directive.anchor_;
   if (directive.kind_ != NodeDirective::Kind::kReplication &&
-      !initializes_empty) {
+      !initializes_empty &&
+      directive.kind_ != NodeDirective::Kind::kPromotionPrepare) {
     local_anchor.assignment_id_ = directive.source_assignment_id_;
   }
   if (RejectedByFence(local_anchor)) {
@@ -429,6 +484,20 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
          current->GroupInFlightCount(directive.anchor_.group_id_) != 0)) {
       return absl::UnavailableError(
           "population target still has in-flight requests");
+    }
+  } else if (directive.kind_ == NodeDirective::Kind::kPromotionPrepare) {
+    // Grantless FDS deliberately omits the group from ServingState. The
+    // control identity checked above still binds candidate, term, manifest,
+    // and population epoch; ReplicationManager owns the boot-local ReadyToken
+    // check before durability work begins.
+    if (!directive.storage_mutating_ || group != nullptr) {
+      return absl::FailedPreconditionError(
+          "promotion prepare requires a fenced ownerless group");
+    }
+    if (DrainPending(directive.anchor_.group_id_) ||
+        current->GroupInFlightCount(directive.anchor_.group_id_) != 0) {
+      return absl::UnavailableError(
+          "promotion candidate still has in-flight requests");
     }
   } else if (directive.kind_ == NodeDirective::Kind::kAuthorizeSource &&
              DrainPending(directive.anchor_.group_id_)) {

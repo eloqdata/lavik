@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -26,6 +27,11 @@ constexpr std::size_t kFrameCrcOffset = 24;
 constexpr std::size_t kTransferChunkEnvelopeBytes = 16 + 8 + 4;
 constexpr std::size_t kMaxTransferChunkBytes =
     kMaxFramePayloadBytes - kTransferChunkEnvelopeBytes;
+constexpr std::size_t kMaxPromotionFlowCount = 1024;
+constexpr std::uint16_t kPromotionPrepareSchemaVersion = 1;
+constexpr std::string_view kPromotionRequestMagic = "KLPR";
+constexpr std::string_view kPromotionPreconditionsMagic = "KLPC";
+constexpr std::string_view kPromotionEvidenceMagic = "KLPE";
 
 // Protocol-v1 heartbeat role tags are exhaustive. Unknown tags fail closed so
 // adding a role requires an explicit codec update on both peers.
@@ -275,6 +281,55 @@ bool IsKnownMessageType(std::uint16_t raw) noexcept {
 bool IsZeroHash(const WireHash256& hash) noexcept {
   return std::all_of(hash.begin(), hash.end(),
                      [](std::uint8_t byte) { return byte == 0; });
+}
+
+absl::Status WriteSchemaHeader(Writer& writer, std::string_view magic) {
+  if (magic.size() != 4) return ProtocolError("invalid schema magic");
+  writer.Raw(magic);
+  writer.U16(kPromotionPrepareSchemaVersion);
+  return absl::OkStatus();
+}
+
+absl::Status ReadSchemaHeader(Reader& reader, std::string_view magic) {
+  auto encoded_magic = reader.Raw(4);
+  if (!encoded_magic.ok()) return encoded_magic.status();
+  if (*encoded_magic != magic) return ProtocolError("unknown promotion schema");
+  auto version = reader.U16();
+  if (!version.ok()) return version.status();
+  if (*version != kPromotionPrepareSchemaVersion) {
+    return ProtocolError("unknown promotion schema version");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status WriteFlowVector(Writer& writer,
+                             std::span<const std::uint64_t> cursors) {
+  if (cursors.empty() || cursors.size() > kMaxPromotionFlowCount) {
+    return ProtocolError("promotion flow vector has invalid cardinality");
+  }
+  writer.U32(static_cast<std::uint32_t>(cursors.size()));
+  for (const std::uint64_t cursor : cursors) {
+    if (cursor == 0) return ProtocolError("promotion flow cursor must be nonzero");
+    writer.U64(cursor);
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<std::uint64_t>> ReadFlowVector(Reader& reader) {
+  auto count = reader.U32();
+  if (!count.ok()) return count.status();
+  if (*count == 0 || *count > kMaxPromotionFlowCount) {
+    return ProtocolError("promotion flow vector has invalid cardinality");
+  }
+  std::vector<std::uint64_t> cursors;
+  cursors.reserve(*count);
+  for (std::uint32_t i = 0; i < *count; ++i) {
+    auto cursor = reader.U64();
+    if (!cursor.ok()) return cursor.status();
+    if (*cursor == 0) return ProtocolError("promotion flow cursor must be nonzero");
+    cursors.push_back(*cursor);
+  }
+  return cursors;
 }
 
 absl::Status FillRandom(void* output, std::size_t bytes) {
@@ -581,6 +636,166 @@ WireHash256 ComputeSha256(std::string_view bytes) noexcept {
   Sha256 sha;
   sha.Update(bytes);
   return sha.Final();
+}
+
+absl::StatusOr<std::string> EncodePromotionPrepareRequest(
+    const PromotionPrepareRequest& request) {
+  Writer writer;
+  if (absl::Status status = WriteSchemaHeader(writer, kPromotionRequestMagic);
+      !status.ok()) {
+    return status;
+  }
+  if (absl::Status status = WriteIdentity(
+          writer, request.parent_history_id, "promotion parent history id");
+      !status.ok()) {
+    return status;
+  }
+  if (absl::Status status =
+          WriteFlowVector(writer, request.required_applied_next_lsns);
+      !status.ok()) {
+    return status;
+  }
+  return std::move(writer).Take();
+}
+
+absl::StatusOr<PromotionPrepareRequest> DecodePromotionPrepareRequest(
+    std::string_view encoded) {
+  Reader reader(encoded);
+  if (absl::Status status = ReadSchemaHeader(reader, kPromotionRequestMagic);
+      !status.ok()) {
+    return status;
+  }
+  PromotionPrepareRequest request;
+  auto parent = ReadIdentity(reader, "promotion parent history id");
+  if (!parent.ok()) return parent.status();
+  request.parent_history_id = std::move(*parent);
+  auto cursors = ReadFlowVector(reader);
+  if (!cursors.ok()) return cursors.status();
+  request.required_applied_next_lsns = std::move(*cursors);
+  if (absl::Status status = Finish(reader); !status.ok()) return status;
+  return request;
+}
+
+absl::StatusOr<std::string> EncodePromotionPreparePreconditions(
+    const PromotionPreparePreconditions& preconditions) {
+  if (preconditions.excluded_group_term == 0) {
+    return ProtocolError("excluded group term must be nonzero");
+  }
+  if (IsZeroHash(preconditions.old_authority_exclusion_hash)) {
+    return ProtocolError("old authority exclusion hash must be nonzero");
+  }
+  Writer writer;
+  if (absl::Status status =
+          WriteSchemaHeader(writer, kPromotionPreconditionsMagic);
+      !status.ok()) {
+    return status;
+  }
+  writer.U64(preconditions.excluded_group_term);
+  writer.Fixed(preconditions.old_authority_exclusion_hash);
+  return std::move(writer).Take();
+}
+
+absl::StatusOr<PromotionPreparePreconditions>
+DecodePromotionPreparePreconditions(std::string_view encoded) {
+  Reader reader(encoded);
+  if (absl::Status status =
+          ReadSchemaHeader(reader, kPromotionPreconditionsMagic);
+      !status.ok()) {
+    return status;
+  }
+  PromotionPreparePreconditions preconditions;
+  auto term = reader.U64();
+  if (!term.ok()) return term.status();
+  preconditions.excluded_group_term = *term;
+  auto exclusion_hash = reader.Fixed<32>();
+  if (!exclusion_hash.ok()) return exclusion_hash.status();
+  preconditions.old_authority_exclusion_hash = *exclusion_hash;
+  if (absl::Status status = Finish(reader); !status.ok()) return status;
+  if (preconditions.excluded_group_term == 0 ||
+      IsZeroHash(preconditions.old_authority_exclusion_hash)) {
+    return ProtocolError("incomplete promotion preconditions");
+  }
+  return preconditions;
+}
+
+absl::StatusOr<std::string> EncodePromotionPreparedEvidence(
+    const PromotionPreparedEvidence& evidence) {
+  if (evidence.population_generation == 0 ||
+      evidence.catalog_generation == 0) {
+    return ProtocolError(
+        "promotion population and catalog generations must be nonzero");
+  }
+  if (evidence.parent_history_id == evidence.child_history_id) {
+    return ProtocolError(
+        "promotion child history must differ from its parent history");
+  }
+  Writer writer;
+  if (absl::Status status = WriteSchemaHeader(writer, kPromotionEvidenceMagic);
+      !status.ok()) {
+    return status;
+  }
+  if (absl::Status status = WriteIdentity(
+          writer, evidence.parent_history_id, "promotion parent history id");
+      !status.ok()) {
+    return status;
+  }
+  if (absl::Status status =
+          WriteFlowVector(writer, evidence.frozen_applied_next_lsns);
+      !status.ok()) {
+    return status;
+  }
+  writer.U64(evidence.population_generation);
+  writer.U64(evidence.population_digest);
+  writer.U64(evidence.catalog_generation);
+  writer.U64(evidence.catalog_dump_crc64);
+  if (absl::Status status = WriteIdentity(
+          writer, evidence.child_history_id, "promotion child history id");
+      !status.ok()) {
+    return status;
+  }
+  return std::move(writer).Take();
+}
+
+absl::StatusOr<PromotionPreparedEvidence> DecodePromotionPreparedEvidence(
+    std::string_view encoded) {
+  Reader reader(encoded);
+  if (absl::Status status = ReadSchemaHeader(reader, kPromotionEvidenceMagic);
+      !status.ok()) {
+    return status;
+  }
+  PromotionPreparedEvidence evidence;
+  auto parent = ReadIdentity(reader, "promotion parent history id");
+  if (!parent.ok()) return parent.status();
+  evidence.parent_history_id = std::move(*parent);
+  auto cursors = ReadFlowVector(reader);
+  if (!cursors.ok()) return cursors.status();
+  evidence.frozen_applied_next_lsns = std::move(*cursors);
+  auto population_generation = reader.U64();
+  if (!population_generation.ok()) return population_generation.status();
+  evidence.population_generation = *population_generation;
+  auto population_digest = reader.U64();
+  if (!population_digest.ok()) return population_digest.status();
+  evidence.population_digest = *population_digest;
+  auto catalog_generation = reader.U64();
+  if (!catalog_generation.ok()) return catalog_generation.status();
+  evidence.catalog_generation = *catalog_generation;
+  auto catalog_dump_crc64 = reader.U64();
+  if (!catalog_dump_crc64.ok()) return catalog_dump_crc64.status();
+  evidence.catalog_dump_crc64 = *catalog_dump_crc64;
+  auto child = ReadIdentity(reader, "promotion child history id");
+  if (!child.ok()) return child.status();
+  evidence.child_history_id = std::move(*child);
+  if (absl::Status status = Finish(reader); !status.ok()) return status;
+  if (evidence.population_generation == 0 ||
+      evidence.catalog_generation == 0) {
+    return ProtocolError(
+        "promotion population and catalog generations must be nonzero");
+  }
+  if (evidence.parent_history_id == evidence.child_history_id) {
+    return ProtocolError(
+        "promotion child history must differ from its parent history");
+  }
+  return evidence;
 }
 
 absl::StatusOr<FrameHeader> ParseFrameHeader(std::string_view encoded_header) {
@@ -1815,7 +2030,10 @@ absl::StatusOr<std::string> Encode(const Directive& directive) {
   writer.Fixed(directive.manifest_digest);
   writer.U64(directive.partition_replication_epoch);
   const auto kind = static_cast<std::uint8_t>(directive.kind);
-  if (kind < 1 || kind > 4) return ProtocolError("unknown directive kind");
+  if (kind < 1 ||
+      kind > static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
+    return ProtocolError("unknown directive kind");
+  }
   writer.U8(kind);
   if (absl::Status status = writer.String(
           directive.payload, kMaxOpaqueFieldBytes, "directive payload");
@@ -1886,7 +2104,11 @@ absl::StatusOr<WireMessage> DecodeDirective(std::string_view bytes) {
   directive.partition_replication_epoch = *partition_replication_epoch;
   auto kind = reader.U8();
   if (!kind.ok()) return kind.status();
-  if (*kind < 1 || *kind > 4) return ProtocolError("unknown directive kind");
+  if (*kind < 1 ||
+      *kind >
+          static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
+    return ProtocolError("unknown directive kind");
+  }
   directive.kind = static_cast<WireDirectiveKind>(*kind);
   auto payload = reader.String(kMaxOpaqueFieldBytes);
   if (!payload.ok()) return payload.status();
@@ -2554,7 +2776,10 @@ absl::Status WriteProjectedDirective(Writer& writer,
   writer.Fixed(directive.manifest_digest);
   writer.U64(directive.partition_replication_epoch);
   const auto kind = static_cast<std::uint8_t>(directive.kind);
-  if (kind < 1 || kind > 4) return ProtocolError("unknown directive kind");
+  if (kind < 1 ||
+      kind > static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
+    return ProtocolError("unknown directive kind");
+  }
   writer.U8(kind);
   if (absl::Status status = writer.String(
           directive.payload, kMaxOpaqueFieldBytes, "directive payload");
@@ -2620,7 +2845,11 @@ absl::StatusOr<WireProjectedDirective> ReadProjectedDirective(Reader& reader) {
   directive.partition_replication_epoch = *partition_replication_epoch;
   auto kind = reader.U8();
   if (!kind.ok()) return kind.status();
-  if (*kind < 1 || *kind > 4) return ProtocolError("unknown directive kind");
+  if (*kind < 1 ||
+      *kind >
+          static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
+    return ProtocolError("unknown directive kind");
+  }
   directive.kind = static_cast<WireDirectiveKind>(*kind);
   auto payload = reader.String(kMaxOpaqueFieldBytes);
   if (!payload.ok()) return payload.status();

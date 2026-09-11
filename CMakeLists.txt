@@ -601,6 +601,7 @@ if (KEYLANE_BUILD_META)
     src/meta/data_control_server.cpp
     src/meta/data_control_runtime_status.cpp
     src/meta/encoding.cpp
+    src/meta/failover.cpp
     src/meta/grant_store.cpp
     src/meta/identity_verifier.cpp
     src/meta/identity_store.cpp
@@ -807,6 +808,7 @@ if (BUILD_TESTING)
       tests/meta_candidate_plan_test.cpp
       tests/meta_control_projector_test.cpp
       tests/meta_data_control_server_test.cpp
+      tests/meta_failover_test.cpp
       tests/meta_journal_test.cpp
       tests/meta_model_test.cpp
       tests/meta_observation_test.cpp
@@ -1018,6 +1020,10 @@ if (BUILD_TESTING)
       keylane_test_support
       GTest::gtest_main
     )
+    target_compile_definitions(
+      keylane_cluster_replication_manager_integration_test PRIVATE
+      KEYLANE_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>>
+    )
     add_test(
       NAME cluster_integration.replication_manager_control_api
       COMMAND keylane_cluster_replication_manager_integration_test
@@ -1025,7 +1031,7 @@ if (BUILD_TESTING)
     set_tests_properties(
       cluster_integration.replication_manager_control_api PROPERTIES
       LABELS cluster-integration
-      TIMEOUT 30
+      TIMEOUT 90
       RUN_SERIAL TRUE
     )
 

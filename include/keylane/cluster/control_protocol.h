@@ -532,7 +532,54 @@ enum class WireDirectiveKind : std::uint8_t {
   // Source-less destructive initialization of the target's first committed
   // population. Existing values are wire-stable; new kinds append only.
   kInitializeEmptyPopulation = 4,
+  kPromotionPrepare = 5,
 };
+
+// Versioned opaque bodies carried by a promotion-prepare directive and its
+// successful terminal result. They intentionally exclude envelope identity:
+// the enclosing Directive/DirectiveResult remains the single source of truth
+// for operation, attempt, recipient, assignment, and authority anchors.
+struct PromotionPrepareRequest {
+  std::string parent_history_id;
+  std::vector<std::uint64_t> required_applied_next_lsns;
+
+  friend bool operator==(const PromotionPrepareRequest&,
+                         const PromotionPrepareRequest&) = default;
+};
+
+struct PromotionPreparePreconditions {
+  std::uint64_t excluded_group_term = 0;
+  WireHash256 old_authority_exclusion_hash{};
+
+  friend bool operator==(const PromotionPreparePreconditions&,
+                         const PromotionPreparePreconditions&) = default;
+};
+
+struct PromotionPreparedEvidence {
+  std::string parent_history_id;
+  std::vector<std::uint64_t> frozen_applied_next_lsns;
+  std::uint64_t population_generation = 0;
+  std::uint64_t population_digest = 0;
+  std::uint64_t catalog_generation = 0;
+  std::uint64_t catalog_dump_crc64 = 0;
+  std::string child_history_id;
+
+  friend bool operator==(const PromotionPreparedEvidence&,
+                         const PromotionPreparedEvidence&) = default;
+};
+
+absl::StatusOr<std::string> EncodePromotionPrepareRequest(
+    const PromotionPrepareRequest& request);
+absl::StatusOr<PromotionPrepareRequest> DecodePromotionPrepareRequest(
+    std::string_view encoded);
+absl::StatusOr<std::string> EncodePromotionPreparePreconditions(
+    const PromotionPreparePreconditions& preconditions);
+absl::StatusOr<PromotionPreparePreconditions>
+DecodePromotionPreparePreconditions(std::string_view encoded);
+absl::StatusOr<std::string> EncodePromotionPreparedEvidence(
+    const PromotionPreparedEvidence& evidence);
+absl::StatusOr<PromotionPreparedEvidence> DecodePromotionPreparedEvidence(
+    std::string_view encoded);
 
 struct Directive {
   WireId128 session_id{};
@@ -552,8 +599,9 @@ struct Directive {
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
-  // V1 uses payload only for initialize-empty-population's target history id;
-  // every other kind requires it empty. Preconditions remain reserved.
+  // V1 uses payload for initialize-empty-population's target history id and
+  // versioned payload/preconditions for promotion-prepare. Other kinds require
+  // both fields empty at admission.
   std::string payload;
   std::string preconditions;
   // Active V1 classification: population mutations set it; source
@@ -723,8 +771,9 @@ struct WireProjectedDirective {
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
-  // V1 uses payload only for initialize-empty-population's target history id;
-  // every other kind requires it empty. Preconditions remain reserved.
+  // V1 uses payload for initialize-empty-population's target history id and
+  // versioned payload/preconditions for promotion-prepare. Other kinds require
+  // both fields empty at admission.
   std::string payload;
   std::string preconditions;
   // Active V1 classification: population mutations set it; source

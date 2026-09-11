@@ -915,6 +915,86 @@ TEST(ControlProtocolFullStateTest,
   EXPECT_NE(*semantic_change, *original);
 }
 
+TEST(ControlProtocolPromotionPrepareTest,
+     RoundTripsVersionedRequestPreconditionsAndPreparedEvidence) {
+  const control::PromotionPrepareRequest request{
+      .parent_history_id = std::string(40, 'a'),
+      .required_applied_next_lsns = {17, 29, 41},
+  };
+  auto encoded_request = control::EncodePromotionPrepareRequest(request);
+  ASSERT_TRUE(encoded_request.ok()) << encoded_request.status();
+  auto decoded_request =
+      control::DecodePromotionPrepareRequest(*encoded_request);
+  ASSERT_TRUE(decoded_request.ok()) << decoded_request.status();
+  EXPECT_EQ(*decoded_request, request);
+
+  const control::PromotionPreparePreconditions preconditions{
+      .excluded_group_term = 7,
+      .old_authority_exclusion_hash = Sha256("old-authority-excluded"),
+  };
+  auto encoded_preconditions =
+      control::EncodePromotionPreparePreconditions(preconditions);
+  ASSERT_TRUE(encoded_preconditions.ok()) << encoded_preconditions.status();
+  auto decoded_preconditions =
+      control::DecodePromotionPreparePreconditions(*encoded_preconditions);
+  ASSERT_TRUE(decoded_preconditions.ok()) << decoded_preconditions.status();
+  EXPECT_EQ(*decoded_preconditions, preconditions);
+
+  const control::PromotionPreparedEvidence evidence{
+      .parent_history_id = request.parent_history_id,
+      .frozen_applied_next_lsns = request.required_applied_next_lsns,
+      .population_generation = 3,
+      .population_digest = 5,
+      .catalog_generation = 11,
+      .catalog_dump_crc64 = 13,
+      .child_history_id = std::string(40, 'b'),
+  };
+  auto encoded_evidence = control::EncodePromotionPreparedEvidence(evidence);
+  ASSERT_TRUE(encoded_evidence.ok()) << encoded_evidence.status();
+  auto decoded_evidence =
+      control::DecodePromotionPreparedEvidence(*encoded_evidence);
+  ASSERT_TRUE(decoded_evidence.ok()) << decoded_evidence.status();
+  EXPECT_EQ(*decoded_evidence, evidence);
+}
+
+TEST(ControlProtocolPromotionPrepareTest,
+     RejectsIncompleteOrNonCanonicalPromotionProofs) {
+  control::PromotionPrepareRequest request{
+      .parent_history_id = std::string(40, 'a'),
+      .required_applied_next_lsns = {17, 29},
+  };
+  request.required_applied_next_lsns[1] = 0;
+  EXPECT_EQ(control::EncodePromotionPrepareRequest(request).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  request.required_applied_next_lsns[1] = 29;
+  auto encoded = control::EncodePromotionPrepareRequest(request);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  encoded->push_back('\0');
+  EXPECT_EQ(control::DecodePromotionPrepareRequest(*encoded).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  control::PromotionPreparedEvidence evidence{
+      .parent_history_id = std::string(40, 'a'),
+      .frozen_applied_next_lsns = {17, 29},
+      .population_generation = 0,
+      .catalog_generation = 1,
+      .child_history_id = std::string(40, 'b'),
+  };
+  EXPECT_EQ(control::EncodePromotionPreparedEvidence(evidence).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  evidence.population_generation = 1;
+  evidence.catalog_generation = 0;
+  EXPECT_EQ(control::EncodePromotionPreparedEvidence(evidence).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  evidence.catalog_generation = 1;
+  evidence.child_history_id = evidence.parent_history_id;
+  EXPECT_EQ(control::EncodePromotionPreparedEvidence(evidence).status().code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
 TEST(ControlProtocolFullStateTest,
      StreamingDirectiveDigestMatchesV1ByteSortAcrossFieldsAndPermutations) {
   const control::WireProjectedDirective base{

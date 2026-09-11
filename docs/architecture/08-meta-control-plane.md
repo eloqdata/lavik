@@ -89,6 +89,18 @@ and impossible apply ordering fail stop. Replaying the same entry at the same
 index is idempotent and produces the same verdict and audit record;
 correctness does not depend on apply running only once.
 
+Failover preparation uses one top-level durable operation whose intent and
+phase blobs have strict versioned codecs. The implemented graph ends at
+`promotion-prepared`:
+old authority excluded, candidate caught up, promotion preparing, then
+promotion prepared. A registered proposal-validation hook forbids skipped or
+repeated phases, changes to earlier exclusion/frontier proofs, and any prepare
+before the committed group is fenced and grantless. The preparing phase owns
+one current `promotion-prepare` directive; the prepared phase clears it only
+after the exact successful terminal receipt and matching evidence summary are
+committed under the same operation id. Authority activation and serving phases
+are outside the preparation graph and are rejected by its validator.
+
 All model collections, command fields, snapshots, active operations, archived
 summaries, policy bytes, and the audit window have explicit bounds. An
 unreferenced population-manifest insertion is charged against the exact bytes
@@ -255,20 +267,22 @@ time; a further suspend restarts the wait. Live FDS boundaries, directives,
 result proposals, and grants all pass this barrier. It covers the same-identity
 case whose ordinary `2D` handoff entry matured before suspension.
 
-Directives separate the wire recipient from the rebuild target: rebuild is
-delivered to the target, while authorize/revoke is delivered to the source.
+Directives separate the wire recipient from the rebuild target: rebuild and
+promotion-prepare are delivered to the target, while authorize/revoke is
+delivered to the source.
 The common assignment field always names the target membership incarnation;
 the durable directive carries a separate source assignment and the committed
 partition replication epoch. Both must exactly match committed topology and
 the installed group view.
 The durable and wire codecs keep bounded `payload`, `preconditions`, and
-`force` fields. V1 uses `payload` only for
-`initialize-empty-population`, where it carries the target Data session's
-authenticated replication-history id; all other executable directives require
-an empty payload. `preconditions` stays empty and `force=false` for every v1
-kind. Meta transition apply and Data admission both enforce this per-kind
-contract, so the replication adapter cannot silently ignore a predicate or
-override.
+`force` fields. V1 uses `payload` for `initialize-empty-population`, where it
+carries the target Data session's authenticated replication-history id, and
+defines versioned payload/precondition bodies for `promotion-prepare`. Other
+executable directives require both fields empty, and all kinds require
+`force=false`. The prepare bodies bind parent history and
+required flow frontier to the committed old-authority exclusion term and hash.
+Meta transition apply and Data admission reject malformed or misplaced bodies,
+so the replication adapter cannot silently ignore a predicate or override.
 Operation, durable directive, execution attempt, and assignment-incarnation
 identities remain distinct. Assignment ids are proposer-generated
 128-bit values that are never reused across incarnations; the topology store
@@ -301,6 +315,18 @@ before admission. A report that is structurally valid but stale against the
 latest committed view is audited and discarded without disrupting an
 otherwise current authority session; malformed session, boot, framing, or
 content-hash data closes it.
+
+For promotion prepare, terminal success is opaque only to the generic journal:
+the Failover validator decodes `PromotionPreparedEvidence`, requires its parent
+history and frozen frontier to satisfy the current phase, and requires the
+same bytes and hash in a successful terminal receipt and a TTL-fresh operation
+observation from the candidate's current boot/session before constructing the
+durable evidence summary. The evidence query applies the TTL boundary itself;
+it does not rely on a periodic cleanup sweep. This is the Raft boundary between
+Data-local prepare and later authority activation. A control stream may remain
+connected across it, but Data must receive later committed FDS/lease authority
+before local activation; no single RPC may cross the commit point on Meta's
+behalf.
 
 `MetaObservationStore` is deliberately outside `MetaStores`: it is volatile,
 leader-local evidence and is never encoded into a command, WAL, snapshot, or

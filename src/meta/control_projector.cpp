@@ -165,6 +165,18 @@ absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
     }
     return control::WireDirectiveKind::kInitializeEmptyPopulation;
   }
+  if (directive.kind_ == kMetaDirectivePromotionPrepare) {
+    if (!directive.storage_mutating_) {
+      return Invalid("promotion-prepare directive must be storage-mutating");
+    }
+    if (!control::DecodePromotionPrepareRequest(directive.payload_).ok() ||
+        !control::DecodePromotionPreparePreconditions(
+             directive.preconditions_)
+             .ok()) {
+      return Invalid("promotion-prepare directive has an invalid typed body");
+    }
+    return control::WireDirectiveKind::kPromotionPrepare;
+  }
   if (directive.kind_ == kMetaDirectiveAuthorizeSource) {
     if (directive.storage_mutating_) {
       return Invalid("authorize-source directive must not be storage-mutating");
@@ -217,7 +229,8 @@ absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
   if (!kind.ok()) return kind.status();
   const bool executes_on_target =
       *kind == control::WireDirectiveKind::kRebuild ||
-      *kind == control::WireDirectiveKind::kInitializeEmptyPopulation;
+      *kind == control::WireDirectiveKind::kInitializeEmptyPopulation ||
+      *kind == control::WireDirectiveKind::kPromotionPrepare;
   const std::string& expected_recipient =
       executes_on_target ? source.target_node_id_ : source.source_node_id_;
   if (source.recipient_node_id_ != expected_recipient) {

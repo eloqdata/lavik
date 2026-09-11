@@ -457,6 +457,27 @@ TEST(ReplicationGroupTest,
 }
 
 TEST(ReplicationGroupTest,
+     ReadyPopulationCarriesForwardAcrossAuthorityTermAdvance) {
+  keylane::ReplicationGroup group("target-1", "target-boot-1");
+  auto rebuild = Directive("group-a", 6);
+  ASSERT_TRUE(group.BeginRebuild(rebuild, Manifest()).ok());
+  RecordCompleteManifestProof(group, rebuild.identity_, Manifest());
+  ASSERT_TRUE(group.MarkFunctionCatalogComplete(rebuild.identity_).ok());
+  ASSERT_TRUE(group
+                  .RecordFlowCutVector(rebuild.identity_,
+                                       std::vector<std::uint64_t>{10, 11})
+                  .ok());
+  ASSERT_TRUE(group.MarkStoragePromoted(rebuild.identity_).ok());
+  auto ready = group.PublishReady(rebuild.identity_);
+  ASSERT_TRUE(ready.ok()) << ready.status();
+
+  EXPECT_FALSE(ready->CanCarryForwardToTerm(5));
+  EXPECT_TRUE(ready->CanCarryForwardToTerm(6));
+  EXPECT_TRUE(ready->CanCarryForwardToTerm(7));
+  EXPECT_EQ(ready->identity().term_, 6U);
+}
+
+TEST(ReplicationGroupTest,
      AcceptsOnlyMonotonicDirectiveRevisionsWithinAnAuthorityTerm) {
   keylane::ReplicationGroup group("target-1", "target-boot-1");
   auto first = Directive();

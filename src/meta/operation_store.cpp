@@ -103,6 +103,8 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
   const bool zero_manifest = IsZero(directive.population_manifest_digest_);
   const bool initializes_empty =
       directive.kind_ == kMetaDirectiveInitializeEmptyPopulation;
+  const bool promotion_prepare =
+      directive.kind_ == kMetaDirectivePromotionPrepare;
   const bool absent_source =
       directive.source_node_id_ == std::string(kMetaNodeIdBytes, '0') &&
       IsZero(directive.source_assignment_id_) &&
@@ -122,8 +124,14 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
                             directive.payload_.end(), [](unsigned char value) {
                               return (value >= '0' && value <= '9') ||
                                      (value >= 'a' && value <= 'f');
-                            })
-          : directive.payload_.empty();
+                            }) &&
+                directive.preconditions_.empty()
+          : promotion_prepare
+                ? !directive.payload_.empty() &&
+                      !directive.preconditions_.empty() &&
+                      directive.storage_mutating_
+                : directive.payload_.empty() &&
+                      directive.preconditions_.empty();
   return !IsZero(directive.directive_id_) && !IsZero(directive.attempt_id_) &&
          directive.recipient_node_id_.size() == kMetaNodeIdBytes &&
          directive.target_node_id_.size() == kMetaNodeIdBytes &&
@@ -140,10 +148,7 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
          directive.payload_.size() <= kMaxMetaPayloadBytes &&
          directive.preconditions_.size() <=
              kMaxMetaDirectivePreconditionsBytes &&
-         // Payload has kind-specific semantics above. Preconditions and force
-         // remain reserved; accepting either would let the production action
-         // adapter silently weaken requested execution behavior.
-         payload_valid && directive.preconditions_.empty() &&
+         payload_valid &&
          !directive.force_ &&
          RecipientMatchesKind(directive);
 }

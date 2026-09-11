@@ -352,7 +352,7 @@ TEST(MetaObservationStore, NewGenerationAtomicallyPurgesOldObservations) {
   EXPECT_EQ(store.retained_bytes_for_node("n1"), 0u);
   EXPECT_FALSE(store.LatestForNode("n1", facts).has_value());
   EXPECT_TRUE(store.CandidateProgressFor("g1", facts).empty());
-  EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts).empty());
+  EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts, 2000).empty());
   // Every purged entry is audited.
   EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kStalePurged,
                       "superseded-by-generation"));
@@ -372,7 +372,8 @@ TEST(MetaObservationStore, NewGenerationAtomicallyPurgesOldObservations) {
   const auto candidates = store.CandidateProgressFor("g1", facts);
   ASSERT_EQ(candidates.size(), 1u);
   EXPECT_EQ(candidates.front().boot_incarnation_, Boot(0x0b));
-  const auto evidence = store.EvidenceForOperation(OpId(0x51), facts);
+  const auto evidence =
+      store.EvidenceForOperation(OpId(0x51), facts, 2003);
   ASSERT_EQ(evidence.size(), 1u);
   EXPECT_EQ(evidence.front().boot_incarnation_, Boot(0x0b));
   EXPECT_EQ(store.size(), 3);
@@ -795,7 +796,8 @@ TEST(MetaObservationStore, EvidenceLatestWinsPerNodeAndPhase) {
                   .ok());
 
   // (n1,p1) was replaced, (n1,p2) and (n2,p1) coexist: 3 entries.
-  const auto evidence = store.EvidenceForOperation(OpId(0x51), facts);
+  const auto evidence =
+      store.EvidenceForOperation(OpId(0x51), facts, 1003);
   ASSERT_EQ(evidence.size(), 3);
   // (node, phase)-sorted: (n1,p1) first, carrying the replacement payload.
   EXPECT_EQ(evidence[0].kind_phase_, "p1");
@@ -811,7 +813,7 @@ TEST(MetaObservationStore, EvidenceLatestWinsPerNodeAndPhase) {
   EXPECT_EQ(summary.assignment_id_, evidence[0].assignment_id_);
   EXPECT_EQ(summary.population_manifest_digest_, manifest_digest);
   EXPECT_EQ(summary.kind_hash_, evidence[0].evidence_hash_);
-  EXPECT_EQ(store.EvidenceForOperation(OpId(0x77), facts).size(), 0);
+  EXPECT_EQ(store.EvidenceForOperation(OpId(0x77), facts, 1003).size(), 0);
   EXPECT_EQ(store.size(), 3);
 }
 
@@ -994,7 +996,7 @@ TEST(MetaObservationStore, RevalidateAllPurgesCommitStaleObservations) {
   EXPECT_TRUE(std::holds_alternative<MetaNodeBootObs>(latest->payload_));
   EXPECT_FALSE(store.LatestForNode("n2", facts).has_value());
   EXPECT_TRUE(store.CandidateProgressFor("g1", facts).empty());
-  EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts).empty());
+  EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts, 2000).empty());
   // Every drop is audited with the failed rule in the detail.
   EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kStalePurged,
                       "commit-stale:term-mismatch"));
@@ -1027,7 +1029,7 @@ TEST(MetaObservationStore, ReadPathsRefilterEvenWithoutRevalidate) {
   EXPECT_TRUE(store.CandidateProgressFor("g1", facts).empty());
   EXPECT_FALSE(store.LatestCandidateProgress("g1", facts).has_value());
   EXPECT_FALSE(store.LatestForNode("n1", facts).has_value());
-  EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts).empty());
+  EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts, 2000).empty());
 
   // The subsequent commit-driven purge reclaims them and audits the drops.
   store.RevalidateAll(facts, 2000);
@@ -1055,7 +1057,7 @@ TEST(MetaObservationStore,
   EXPECT_EQ(store.size(), 2);
   EXPECT_TRUE(store.CandidateProgressFor("g1", facts).empty());
   EXPECT_FALSE(store.LatestCandidateProgress("g1", facts).has_value());
-  EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts).empty());
+  EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts, 2000).empty());
 
   store.RevalidateAll(facts, 2000);
   EXPECT_EQ(store.size(), 0);
@@ -1082,6 +1084,26 @@ TEST(MetaObservationStore, SweepExpiredDropsEntriesOlderThanTtl) {
   const auto latest = store.LatestForNode("n1", facts);
   ASSERT_TRUE(latest.has_value());
   EXPECT_TRUE(std::holds_alternative<MetaNodeHealthObs>(latest->payload_));
+}
+
+TEST(MetaObservationStore,
+     EvidenceQueryEnforcesTtlWithoutWaitingForPeriodicSweep) {
+  MetaObservationStore::Limits limits;
+  limits.ttl_ms_ = 1000;
+  MetaObservationStore store(limits);
+  FakeCommittedFacts facts = MakeFreshFacts();
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 0).ok());
+  ASSERT_TRUE(store
+                  .Ingest(EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1",
+                                      "g1", 3, 7, 42),
+                          facts, 1000)
+                  .ok());
+
+  EXPECT_EQ(store.EvidenceForOperation(OpId(0x51), facts, 2000).size(), 1u);
+  EXPECT_TRUE(
+      store.EvidenceForOperation(OpId(0x51), facts, 2001).empty());
+  EXPECT_EQ(store.size(), 1u)
+      << "freshness filtering must not depend on destructive cleanup";
 }
 
 TEST(MetaObservationStore, PeriodicSweepAmortizesHeartbeatScans) {

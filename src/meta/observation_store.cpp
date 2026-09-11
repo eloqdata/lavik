@@ -46,6 +46,14 @@ constexpr std::uint32_t kMaxObsFieldBytes = kMaxMetaPayloadBytes;
 // byte-bounded.
 constexpr std::size_t kMaxAuditDetailBytes = 256;
 
+bool ObservationExpired(const MetaObservation& observation,
+                        int64_t now_unix_ms, int64_t ttl_ms) {
+  // Backwards wall-clock movement is conservative: it cannot expire evidence.
+  // Avoid subtracting until the ordering check has ruled out underflow.
+  return now_unix_ms > observation.received_unix_ms_ &&
+         now_unix_ms - observation.received_unix_ms_ > ttl_ms;
+}
+
 std::string BoundedDetail(std::string detail) {
   if (detail.size() > kMaxAuditDetailBytes) {
     detail.resize(kMaxAuditDetailBytes);
@@ -892,7 +900,7 @@ void MetaObservationStore::SweepExpiredLocked(int64_t now_unix_ms) {
   // An entry exactly ttl_ms_ old still survives: expiry is strictly older
   // than the TTL so a sweep tick at the boundary never races a report.
   auto expired = [&](const MetaObservation& observation) {
-    return now_unix_ms - observation.received_unix_ms_ > limits_.ttl_ms_;
+    return ObservationExpired(observation, now_unix_ms, limits_.ttl_ms_);
   };
   auto sweep_map = [&](std::map<std::string, MetaObservation>& by_node) {
     for (auto it = by_node.begin(); it != by_node.end();) {
@@ -1068,7 +1076,8 @@ std::optional<MetaObservation> MetaObservationStore::LatestForNode(
 
 std::vector<MetaOperationEvidenceObs>
 MetaObservationStore::EvidenceForOperation(
-    const MetaOperationId& id, const MetaCommittedFacts& facts) const {
+    const MetaOperationId& id, const MetaCommittedFacts& facts,
+    int64_t now_unix_ms) const {
   std::lock_guard<std::mutex> lock(mutex_);
   const Impl& impl = *impl_;
   std::vector<MetaOperationEvidenceObs> out;
@@ -1078,7 +1087,8 @@ MetaObservationStore::EvidenceForOperation(
   }
   // (node, phase)-sorted (map order): deterministic evidence sets.
   for (const auto& [key, observation] : op_it->second) {
-    if (impl.Validate(observation, facts).ok()) {
+    if (impl.Validate(observation, facts).ok() &&
+        !ObservationExpired(observation, now_unix_ms, limits_.ttl_ms_)) {
       out.push_back(std::get<MetaOperationEvidenceObs>(observation.payload_));
     }
   }

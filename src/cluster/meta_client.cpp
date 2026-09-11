@@ -396,6 +396,50 @@ class ReplicationNodeControlActions final : public NodeControlActions {
       co_return NodeDirectiveCompletion(
           [completion = std::move(*started)]() { return completion.result(); });
     }
+    if (directive.kind_ == NodeDirective::Kind::kPromotionPrepare) {
+      const PromotionPrepareInput& prepare = *directive.promotion_prepare_;
+      auto started =
+          co_await replication_.StartClusterPromotionPrepareDirective(
+              ClusterPromotionPrepareDirective{
+                  .identity_ = std::move(rebuild.identity_),
+                  .parent_history_id_ = prepare.parent_history_id_,
+                  .required_applied_next_lsns_ =
+                      prepare.required_applied_next_lsns_,
+                  .excluded_group_term_ = prepare.excluded_group_term_,
+                  .old_authority_exclusion_hash_ =
+                      prepare.old_authority_exclusion_hash_,
+              });
+      if (!started.ok()) {
+        co_return NodeDirectiveCompletion::StartedTerminal(started.status());
+      }
+      co_return NodeDirectiveCompletion::FromResultPoll(
+          [completion = std::move(*started)]() mutable
+              -> std::optional<NodeDirectiveCompletion::TerminalResult> {
+            std::optional<ClusterPromotionPrepareCompletion::Result> result =
+                completion.result();
+            if (!result.has_value()) return std::nullopt;
+            if (!result->ok()) {
+              return NodeDirectiveCompletion::TerminalResult(result->status());
+            }
+            const ClusterPromotionPrepared& prepared = **result;
+            auto encoded = control::EncodePromotionPreparedEvidence(
+                control::PromotionPreparedEvidence{
+                    .parent_history_id = prepared.parent_history_id_,
+                    .frozen_applied_next_lsns =
+                        prepared.frozen_applied_next_lsns_,
+                    .population_generation = prepared.population_generation_,
+                    .population_digest = prepared.population_digest_,
+                    .catalog_generation = prepared.catalog_generation_,
+                    .catalog_dump_crc64 = prepared.catalog_dump_crc64_,
+                    .child_history_id = prepared.child_history_id_,
+                });
+            if (!encoded.ok()) {
+              return NodeDirectiveCompletion::TerminalResult(encoded.status());
+            }
+            return NodeDirectiveCompletion::TerminalResult(
+                std::move(*encoded));
+          });
+    }
     auto started = co_await replication_.StartClusterRebuildDirective(
         ReplicaOfConfig{.host_ = std::move(directive.source_host_),
                         .port_ = directive.source_port_},
@@ -491,10 +535,11 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
   switch (directive.kind) {
     case control::WireDirectiveKind::kRebuild:
     case control::WireDirectiveKind::kInitializeEmptyPopulation:
+    case control::WireDirectiveKind::kPromotionPrepare:
       if (directive.recipient_node_id != directive.target_node_id ||
           directive.recipient_boot_id != directive.target_boot_id) {
         return absl::FailedPreconditionError(
-          "population directive recipient is not its target incarnation");
+            "population directive recipient is not its target incarnation");
       }
       break;
     case control::WireDirectiveKind::kAuthorizeSource:
@@ -882,7 +927,8 @@ struct MetaControlClientService::Impl {
     celer::AsyncNotification tasks_changed_;
     std::size_t active_tasks_ = 0;
     std::size_t directive_completion_tasks_ = 0;
-    std::size_t population_completion_tasks_ = 0;
+    std::size_t target_population_completion_tasks_ = 0;
+    std::size_t promotion_prepare_tasks_ = 0;
     std::size_t source_completion_tasks_ = 0;
     std::uint64_t directive_generation_ = 1;
     detail::MetaHeartbeatProjectionGate heartbeat_projection_gate_;
@@ -1210,6 +1256,8 @@ struct MetaControlClientService::Impl {
         return "revoke-sources";
       case control::WireDirectiveKind::kInitializeEmptyPopulation:
         return "initialize-empty-population";
+      case control::WireDirectiveKind::kPromotionPrepare:
+        return "promotion-prepare";
     }
     return "unknown";
   }
@@ -1220,7 +1268,8 @@ struct MetaControlClientService::Impl {
     const bool executes_on_target =
         directive.kind == control::WireDirectiveKind::kRebuild ||
         directive.kind ==
-            control::WireDirectiveKind::kInitializeEmptyPopulation;
+            control::WireDirectiveKind::kInitializeEmptyPopulation ||
+        directive.kind == control::WireDirectiveKind::kPromotionPrepare;
     const std::string kind_phase =
         absl::StrCat(DirectiveKindName(directive.kind), ":", phase);
     control::OperationEvidence report{
@@ -1290,8 +1339,29 @@ struct MetaControlClientService::Impl {
       case control::WireDirectiveKind::kInitializeEmptyPopulation:
         kind = NodeDirective::Kind::kInitializeEmptyPopulation;
         break;
+      case control::WireDirectiveKind::kPromotionPrepare:
+        kind = NodeDirective::Kind::kPromotionPrepare;
+        break;
       default:
         return absl::InvalidArgumentError("unknown directive kind");
+    }
+
+    std::optional<PromotionPrepareInput> promotion_prepare;
+    if (kind == NodeDirective::Kind::kPromotionPrepare) {
+      auto request =
+          control::DecodePromotionPrepareRequest(directive.payload);
+      if (!request.ok()) return request.status();
+      auto preconditions = control::DecodePromotionPreparePreconditions(
+          directive.preconditions);
+      if (!preconditions.ok()) return preconditions.status();
+      promotion_prepare = PromotionPrepareInput{
+          .parent_history_id_ = std::move(request->parent_history_id),
+          .required_applied_next_lsns_ =
+              std::move(request->required_applied_next_lsns),
+          .excluded_group_term_ = preconditions->excluded_group_term,
+          .old_authority_exclusion_hash_ =
+              preconditions->old_authority_exclusion_hash,
+      };
     }
 
     const auto target_node = NodeId::Parse(directive.target_node_id);
@@ -1385,8 +1455,13 @@ struct MetaControlClientService::Impl {
         .manifest_digest_ = directive.manifest_digest,
         .partition_replication_epoch_ = directive.partition_replication_epoch,
         .manifest_entries_ = std::move(manifest_entries),
-        .payload_ = directive.payload,
-        .preconditions_ = directive.preconditions,
+        .promotion_prepare_ = std::move(promotion_prepare),
+        .payload_ = kind == NodeDirective::Kind::kPromotionPrepare
+                        ? std::string{}
+                        : directive.payload,
+        .preconditions_ = kind == NodeDirective::Kind::kPromotionPrepare
+                              ? std::string{}
+                              : directive.preconditions,
         .storage_mutating_ = directive.storage_mutating,
         .force_ = directive.force,
     };
@@ -1427,16 +1502,25 @@ struct MetaControlClientService::Impl {
   celer::Task<absl::Status> SendTerminalDirectiveResult(
       control::ControlSessionWriter& writer,
       const std::shared_ptr<SessionState>& state,
-      const control::Directive& directive, const absl::Status& applied,
+      const control::Directive& directive,
+      const NodeDirectiveCompletion::TerminalResult& applied,
       bool started) {
-    const std::string result =
-        applied.ok() ? "ok" : std::string(applied.message());
+    const absl::Status status = applied.ok() ? absl::OkStatus()
+                                             : applied.status();
+    const bool promotion =
+        directive.kind == control::WireDirectiveKind::kPromotionPrepare;
+    // Status-only directives retain their v1 terminal bytes. Only promotion
+    // owns an opaque typed success result, so extending the completion seam
+    // must not change rebuild/source receipt hashes during a rolling upgrade.
+    const std::string result = applied.ok()
+                                   ? (promotion ? *applied : std::string("ok"))
+                                   : std::string(status.message());
     control::DirectiveResult response{
         .session_id = directive.session_id,
         .recipient_boot_id = directive.recipient_boot_id,
         .assignment_id = directive.authority.assignment_id,
         .identity = directive.identity,
-        .status = ClassifyDirectiveResultStatus(applied, started),
+        .status = ClassifyDirectiveResultStatus(status, started),
         .result_hash = control::ComputeSha256(result),
         .result = result,
     };
@@ -1448,14 +1532,14 @@ struct MetaControlClientService::Impl {
         .identity_ = response.identity,
         .result_hash_ = response.result_hash,
     });
-    RecordClusterControlDirectiveResult(applied.ok());
+    RecordClusterControlDirectiveResult(status.ok());
     co_return co_await SendDirectiveResult(writer, response);
   }
 
   celer::Task<absl::Status> ObserveDirectiveCompletion(
       std::shared_ptr<SessionState> state, control::Directive directive,
       NodeDirectiveCompletion completion, std::uint64_t generation,
-      bool population_mutation) {
+      bool target_population_work) {
     absl::Status result = absl::OkStatus();
     if (completion.started()) {
       result = co_await SendOperationEvidence(
@@ -1464,15 +1548,35 @@ struct MetaControlClientService::Impl {
     }
     while (result.ok() && !state->closing_ &&
            generation == state->directive_generation_) {
-      std::optional<absl::Status> terminal = completion.result();
+      std::optional<NodeDirectiveCompletion::TerminalResult> terminal =
+          completion.terminal_result();
       if (terminal.has_value()) {
+        if (directive.kind == control::WireDirectiveKind::kPromotionPrepare &&
+            terminal->ok()) {
+          auto prepared = control::DecodePromotionPreparedEvidence(**terminal);
+          if (!prepared.ok()) {
+            result = prepared.status();
+            break;
+          }
+          // Promotion creates a new child history during the same control
+          // session. Adopt it before the heartbeat task resumes its ordinary
+          // history-stability check.
+          state->replication_identity_.local_history_id_ =
+              prepared->child_history_id;
+        }
         result = co_await SendDirectiveCompleted(*state->writer_, directive);
         if (result.ok() && completion.started()) {
+          const bool promotion =
+              directive.kind == control::WireDirectiveKind::kPromotionPrepare;
           std::string terminal_evidence =
-              terminal->ok() ? "succeeded" : std::string(terminal->message());
+              terminal->ok()
+                  ? (promotion ? **terminal : std::string("succeeded"))
+                  : std::string(terminal->status().message());
+          const std::string_view terminal_phase =
+              promotion ? "prepared" : "completed";
           result = co_await SendOperationEvidence(
               *state->writer_,
-              EvidenceForDirective(directive, "completed",
+              EvidenceForDirective(directive, terminal_phase,
                                    std::move(terminal_evidence)));
         }
         if (result.ok()) {
@@ -1486,8 +1590,11 @@ struct MetaControlClientService::Impl {
       if (!result.ok()) break;
     }
     --state->directive_completion_tasks_;
-    if (population_mutation) {
-      --state->population_completion_tasks_;
+    if (target_population_work) {
+      --state->target_population_completion_tasks_;
+      if (directive.kind == control::WireDirectiveKind::kPromotionPrepare) {
+        --state->promotion_prepare_tasks_;
+      }
     } else {
       --state->source_completion_tasks_;
     }
@@ -1504,37 +1611,42 @@ struct MetaControlClientService::Impl {
            !state->directive_queue_.empty()) {
       DirectiveWork work = std::move(state->directive_queue_.front());
       state->directive_queue_.pop_front();
-      const bool population_mutation =
+      const bool target_population_work =
           work.normalized_.kind_ == NodeDirective::Kind::kReplication ||
           work.normalized_.kind_ ==
-              NodeDirective::Kind::kInitializeEmptyPopulation;
-      // Population completions may overlap only other population admissions,
-      // which is the path ReplicationManager uses for exact replay or
-      // supersession.
-      // Source authorization/revocation remains a serialized barrier and can
-      // neither overtake nor be overtaken by target population work.
+              NodeDirective::Kind::kInitializeEmptyPopulation ||
+          work.normalized_.kind_ == NodeDirective::Kind::kPromotionPrepare;
+      const bool promotion =
+          work.normalized_.kind_ == NodeDirective::Kind::kPromotionPrepare;
+      // Target-population completions may overlap only other target admissions,
+      // which is the path ReplicationManager uses for exact replay and rebuild
+      // supersession. Source authorization/revocation remains a serialized
+      // barrier and can neither overtake nor be overtaken by that work.
       while (!state->closing_ && state->directive_dispatch_enabled_ &&
-             (population_mutation ? state->source_completion_tasks_ != 0
-                                  : state->directive_completion_tasks_ != 0)) {
+             (target_population_work
+                  ? state->source_completion_tasks_ != 0
+                  : state->directive_completion_tasks_ != 0)) {
         co_await state->tasks_changed_.Wait();
       }
       if (state->closing_ || !state->directive_dispatch_enabled_) break;
+      if (promotion) ++state->promotion_prepare_tasks_;
       auto started = co_await StartDirective(*state->writer_, work.wire_,
                                              std::move(work.normalized_));
       if (!started.ok()) {
+        if (promotion) --state->promotion_prepare_tasks_;
         result = started.status();
         break;
       }
       ++state->directive_completion_tasks_;
-      if (population_mutation) {
-        ++state->population_completion_tasks_;
+      if (target_population_work) {
+        ++state->target_population_completion_tasks_;
       } else {
         ++state->source_completion_tasks_;
       }
       ++state->active_tasks_;
       state->worker_->Spawn(ObserveDirectiveCompletion(
           state, std::move(work.wire_), std::move(*started),
-          state->directive_generation_, population_mutation));
+          state->directive_generation_, target_population_work));
     }
     if (state->closing_ || !state->directive_dispatch_enabled_) {
       state->directive_queue_.clear();
@@ -1725,7 +1837,8 @@ struct MetaControlClientService::Impl {
         desired.groups.begin(), desired.groups.end(),
         [&](const control::WireDesiredGroup& candidate) {
           return candidate.group_id == ready.group_id_ &&
-                 candidate.group_term >= ready.term_ &&
+                 population.ready_token_->CanCarryForwardToTerm(
+                     candidate.group_term) &&
                  candidate.manifest_revision == ready.manifest_revision_ &&
                  candidate.manifest_digest == ready.manifest_id_.bytes_ &&
                  candidate.partition_replication_epoch ==
@@ -1791,8 +1904,9 @@ struct MetaControlClientService::Impl {
           co_await replication_.ObserveIdentity();
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
       if (latest.boot_id_ != state->boot_id_ ||
-          latest.local_history_id_ !=
-              state->replication_identity_.local_history_id_) {
+          (latest.local_history_id_ !=
+               state->replication_identity_.local_history_id_ &&
+           state->promotion_prepare_tasks_ == 0)) {
         result = absl::FailedPreconditionError(
             "replication boot or history changed during the Meta session");
         break;

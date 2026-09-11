@@ -13,8 +13,9 @@ backlog, full-sync capture state, target rebuild state, and durable state.
 In cluster mode that deep group also owns one boot-scoped population identity
 and readiness proof. Its callable cluster adapter binds the proof to the native
 reset, transfer, cut, promotion, and abort path. The Data-side node controller
-is the only caller for Meta-delivered rebuild, source-authorization, and
-revocation directives; transport code cannot bypass the replication adapter.
+is the only caller for Meta-delivered rebuild, promotion-prepare,
+source-authorization, and revocation directives; transport code cannot bypass
+the replication adapter.
 
 Replication moves deterministic logical commands, snapshot records, and the
 process-global Redis Function catalog, not physical block addresses or record
@@ -85,7 +86,8 @@ Ordinary `REPLICAOF` probes the native protocol first and falls back to Redis
 discovery when the peer does not support it. Explicit `redis-replicaof`
 configuration skips that probe.
 
-`REPLICAOF NO ONE` and Sentinel promotion use the same role-transition path.
+`REPLICAOF NO ONE` and Sentinel promotion use the same role-transition path
+and the same private prepare/activate kernel used by Meta-managed promotion.
 The group first enters `syncing`, prevents upstream reconnect, and cancels the
 transport while database admission remains open. Native commands already
 popped for apply, complete registered transactions that entered apply, and a
@@ -98,7 +100,10 @@ validates the durable population, captures the parent history and next-event
 vector, crosses the storage durability barrier, and commits a `PromotionBase`
 containing the population and catalog tokens. This gate-before-Function-guard
 order matches FUNCTION/FCALL locking. Only then does it create a child history,
-prepare a fresh source backlog, restore expiration authority, and open writes.
+prepare a fresh source backlog, then immediately activate: restore expiration
+authority and open writes. The two internal steps are consecutive inside the
+one synchronous Redis command because Sentinel is itself the authority
+coordinator; no Meta commit point separates them.
 Source retirement first joins old downstream flow teardown/history resets and
 the idle-history monitor through their final log-disable steps, so that teardown
 cannot disable newly enabled child logs. A
@@ -168,13 +173,20 @@ at process start instead.
 
 `ReplicationManager` exposes a callable boundary to the Data-side node
 controller: `cluster_population_status()` reports the local node/boot and the
-boot-scoped state or ready/failure evidence,
+boot-scoped state or ready/failure evidence plus the currently applied
+parent-flow frontier,
 `StartClusterRebuildDirective()` admits one authorized source rebuild and
 returns its exact completion handle. `StartEmptyPopulationInitialization()` is
 the source-less first-population variant and reuses the same completion and
 proof ownership instead of exposing a second runtime. NodeControl observes the
 handle later to distinguish wire admission from `ReadyToken`, cancellation, or
 failure; exact replay shares the same attempt.
+`StartClusterPromotionPrepareDirective()` similarly admits
+one exact, ownerless `promotion-prepare` attempt after the candidate is Ready.
+It joins upstream apply, freezes the current frontier, runs the shared durable
+prepare kernel, and returns population/catalog tokens plus the child history.
+Exact replay shares the original completion and evidence; a different
+directive/attempt cannot reuse its boot-local context.
 FDS reconciliation retains an in-progress attempt only while a current rebuild
 directive still names the same local assignment, term, manifest, and partition
 replication epoch. Removing
@@ -191,6 +203,14 @@ valid directive completes, a Meta-managed process remains LOADING. `PING` and
 the management/diagnostic surfaces needed to observe the process remain
 available, but recovered keyspace is not made readable or writable merely
 because storage initialization succeeded.
+
+Promotion prepare is intentionally not Cluster activation. After successful
+prepare the role remains `syncing`, storage remains LOADING, expiration
+authority remains disabled, and native/Redis source export remains closed.
+There is no Cluster activation method or activation wire directive in this
+version. The later authority workflow must first commit `ActivateAuthority`,
+install its new FDS, and obtain a current-session lease before it can connect
+that committed authority to the private local activation half.
 
 ## Single-group population coordination contract
 
