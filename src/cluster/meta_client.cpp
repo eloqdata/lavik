@@ -306,9 +306,11 @@ class ReplicationNodeControlActions final : public NodeControlActions {
   }
 
   celer::Task<absl::Status>
-  ClearSourceAuthorizationsForSessionReplacementAndWait() override {
+  ClearSourceAuthorizationsForSessionReplacementAndWait(
+      bool preserve_established_exports) override {
     co_return co_await replication_
-        .ClearClusterRebuildSourceAuthorizationsForSessionReplacement();
+        .ClearClusterRebuildSourceAuthorizationsForSessionReplacement(
+            preserve_established_exports);
   }
 
   celer::Task<absl::Status> ReconcilePopulation(

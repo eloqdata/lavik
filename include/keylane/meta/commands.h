@@ -108,17 +108,21 @@ inline constexpr std::uint32_t kMaxMetaEndpointBytes = 256;
 inline constexpr std::uint32_t kMaxMetaPolicyIdBytes = 128;
 inline constexpr std::uint32_t kMaxMetaPolicyReferencesPerOperation = 16;
 inline constexpr std::uint32_t kMaxMetaOperationKindBytes = 64;
+// Cluster creation is a v1-only protocol. This existing workflow kind remains
+// the single durable root type rather than introducing a parallel topology
+// model; its opaque intent is the normalized v1 request.
 inline constexpr std::string_view kMetaClusterCreateOperationKind =
     "cluster-create-workflow-v1";
+inline constexpr std::string_view kMetaClusterCreateV1GroupOperationKind =
+    "cluster-create-v1";
 inline constexpr std::string_view kMetaMembershipOperationKind =
     "meta-membership-workflow-v1";
-// Keep the original boot/history-bound population kind distinct from the
-// new pre-topology workflow. Old WAL entries retain their apply semantics;
-// recovery never guesses a full creation intent from a legacy partial task.
-inline constexpr std::string_view kMetaClusterCreatePopulationOperationKind =
-    "cluster-create-v1";
 inline constexpr std::uint32_t kMaxMetaEvidenceSummariesPerCommand = 64;
-inline constexpr std::uint32_t kMaxMetaDirectivesPerOperation = 64;
+// A declarative create installs one source authorization and one rebuild per
+// replica in a single revision. This remains below both the terminal-receipt
+// cap and projected-directive cap, while the 64 KiB Admin request is the
+// tighter admission bound for cluster-create.
+inline constexpr std::uint32_t kMaxMetaDirectivesPerOperation = 1024;
 inline constexpr std::uint32_t kMaxMetaDirectiveKindBytes = 64;
 // Durable directive names and their execution-side classification live with
 // the command schema. Keeping these predicates here prevents stores,

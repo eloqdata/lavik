@@ -176,7 +176,8 @@ NodeControlActions::RevokeSourceAuthorizationsAndWait() {
 }
 
 celer::Task<absl::Status>
-NodeControlActions::ClearSourceAuthorizationsForSessionReplacementAndWait() {
+NodeControlActions::ClearSourceAuthorizationsForSessionReplacementAndWait(
+    bool /*preserve_established_exports*/) {
   co_return RevokeSourceAuthorizations();
 }
 
@@ -791,6 +792,11 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
         projection_basis_->source_meta_applied_index_) {
       if (projection_basis == *projection_basis_ && object_hash_.has_value() &&
           prepared_state.object_hash_ == *object_hash_) {
+        // Exact replay can follow a control-session refresh. Source admission
+        // was cleared at disconnect, but a population export that was already
+        // ONLINE remains safe while the old lease is invalid and this byte-
+        // exact desired state is being re-established.
+        effects->preserve_established_exports_ = true;
         return absl::OkStatus();
       }
       // One applied index cannot name two objects. Drop all memory authority;
@@ -884,10 +890,33 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
 
   std::vector<AuthorityAnchor> retired;
   bool revoke_sources = false;
+  bool preserve_established_exports = false;
   if (before != nullptr) {
     for (const GroupView& old_group : before->Groups()) {
       if (!SameLocalAssignment(*before, old_group)) continue;
       const GroupView* new_group = next->FindGroup(old_group.group_id_);
+      const PreparedGroupControlIdentity* old_control =
+          FindControlGroup(old_group.group_id_);
+      const auto new_control = std::find_if(
+          prepared_state.control_groups_.begin(),
+          prepared_state.control_groups_.end(),
+          [&](const PreparedGroupControlIdentity& candidate) {
+            return candidate.group_id_ == old_group.group_id_;
+          });
+      // Desired-state projection intentionally excludes the boot-local
+      // ReadyToken. A live replacement therefore normalizes population_ready
+      // to false until the heartbeat reapplies the proof. An already-online
+      // native export may span only that normalization, and only when the
+      // complete durable group/member/population identity remains byte-exact.
+      preserve_established_exports =
+          old_group.primary_node_index_ == before->SelfNodeIndex() &&
+          new_group != nullptr &&
+          new_group->primary_node_index_ == next->SelfNodeIndex() &&
+          new_group->granted_ == old_group.granted_ &&
+          new_group->storage_ready_ == old_group.storage_ready_ &&
+          old_control != nullptr &&
+          new_control != prepared_state.control_groups_.end() &&
+          *old_control == *new_control;
       const bool authority_changed =
           new_group == nullptr ||
           new_group->primary_node_index_ != next->SelfNodeIndex() ||
@@ -922,6 +951,7 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
     RememberDrain(before, anchor);
   }
   effects->revoke_sources_ = revoke_sources;
+  effects->preserve_established_exports_ = preserve_established_exports;
   effects->retired_ = std::move(retired);
   return absl::OkStatus();
 }
@@ -944,17 +974,20 @@ celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
       std::optional<PopulationReadiness>{});
   if (local.ok()) desired_population = DesiredLocalPopulation();
 
-  // A newly authenticated session must not inherit an export capability from
-  // its predecessor, even when it replays the exact same FDS. The async seam
-  // makes FullStateApplied a real join boundary instead of an enqueue receipt.
-  // Target population reconciliation runs under the same exclusion counter:
-  // no directive may start after the FDS publication but before an invalidated
-  // native session and its partial storage root have been joined.
+  // Every replacement clears new export admission. An exact live FDS may keep
+  // an established ONLINE export quarantined until this replacement validates
+  // the same Group and population; any stronger transition joins and revokes
+  // the old session. The async seam makes FullStateApplied a real join boundary
+  // instead of an enqueue receipt. Target population reconciliation runs under
+  // the same exclusion counter: no directive may start after FDS publication
+  // but before an invalidated native session and partial storage root are
+  // joined.
   absl::Status actions = co_await WaitForDirectiveAdmissions();
   actions = FirstFailure(
       std::move(actions),
       co_await actions_
-          .ClearSourceAuthorizationsForSessionReplacementAndWait());
+          .ClearSourceAuthorizationsForSessionReplacementAndWait(
+              local.ok() && effects.preserve_established_exports_));
   // Even an internally inconsistent FDS must leave the local population
   // fail-closed and join the old session's work before the failed transfer
   // tears down its socket.
@@ -1193,8 +1226,14 @@ NodeControlInstaller::FinishExpiredLeaseTransition(
   ControlTransitionGuard transition_guard(*this);
   InvalidateDirectiveAdmissions();
   absl::Status result = co_await WaitForDirectiveAdmissions();
-  result = FirstFailure(std::move(result),
-                        co_await actions_.RevokeSourceAuthorizationsAndWait());
+  // Lease expiry removes mutation authority and prevents every new source
+  // handshake, but an exact population export that is already ONLINE may stay
+  // quarantined until renewal. A committed fence or population-identity change
+  // uses the stronger revocation path and joins it.
+  result = FirstFailure(
+      std::move(result),
+      co_await actions_.ClearSourceAuthorizationsForSessionReplacementAndWait(
+          /*preserve_established_exports=*/true));
   result = FirstFailure(std::move(result), actions_.DrainAssignment(anchor));
   co_return result;
 }
@@ -1392,7 +1431,8 @@ celer::Task<absl::Status> NodeControlInstaller::LoseSessionTransition(
   result = FirstFailure(
       std::move(result),
       co_await actions_
-          .ClearSourceAuthorizationsForSessionReplacementAndWait());
+          .ClearSourceAuthorizationsForSessionReplacementAndWait(
+              /*preserve_established_exports=*/true));
   result = FirstFailure(std::move(result),
                         co_await actions_.CancelInProgressPopulation());
   for (const AuthorityAnchor& anchor : anchors) {

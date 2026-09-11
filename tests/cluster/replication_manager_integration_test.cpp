@@ -873,13 +873,19 @@ class EmptyPopulationService final : public celer::Service {
       }
       co_return absl::OkStatus();
     }
+
     if (!completed.ok()) {
       co_return completed;
     }
-    if (!in_progress_replay.has_value() ||
-        (co_await in_progress_replay->Await()) != completed) {
+    if (!in_progress_replay.has_value()) {
       co_return TestFailure("empty population replay lost the original result");
     }
+    // GCC 13 ICEs if these suspension results remain inside the surrounding
+    // compound conditions after the worker-owner regression enlarged this TU.
+    const absl::Status in_progress_result =
+        co_await in_progress_replay->Await();
+    if (in_progress_result != completed)
+      co_return TestFailure("empty population replay lost the original result");
 
     const keylane::ClusterPopulationStatus ready =
         co_await replication_->cluster_population_status();
@@ -909,8 +915,9 @@ class EmptyPopulationService final : public celer::Service {
     auto replay = co_await replication_->StartEmptyPopulationInitialization(
         identity, *manifest);
     if (!replay.ok()) co_return replay.status();
+    const absl::Status replay_result = co_await replay->Await();
     if (replay->result() != std::optional<absl::Status>(completed) ||
-        (co_await replay->Await()) != completed) {
+        replay_result != completed) {
       co_return TestFailure(
           "completed empty population did not replay its result");
     }

@@ -119,7 +119,8 @@ struct Fixture {
   std::uint64_t directive_revision = 0;
 };
 
-Fixture CompleteFixture() {
+Fixture CompleteFixture(
+    std::string operation_kind = "population-rebuild") {
   Fixture fixture;
   std::uint64_t index = 1;
 
@@ -234,7 +235,7 @@ Fixture CompleteFixture() {
   keylane::meta::SubmitOperation submit;
   submit.request_id_ = Bytes<16>(0x1c);
   submit.operation_id_ = fixture.operation_id;
-  submit.kind_ = "population-rebuild";
+  submit.kind_ = std::move(operation_kind);
   submit.intent_ = "rebuild group-a";
   submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
   submit.replication_history_id_ = Bytes<20>(0x33);
@@ -593,6 +594,84 @@ TEST(MetaControlProjector,
     EXPECT_EQ(directive.source_boot_id,
               "8182838485868788898a8b8c8d8e8f9091929394");
   }
+}
+
+TEST(MetaControlProjector,
+     ClusterCreateRebuildWaitsForCommittedSourceAuthorization) {
+  Fixture fixture =
+      CompleteFixture(
+          std::string(keylane::meta::kMetaClusterCreateV1GroupOperationKind));
+  const auto operation =
+      fixture.stores.operation_.FindOperation(fixture.operation_id);
+  ASSERT_TRUE(operation.has_value());
+  ASSERT_EQ(operation->current_directives_.size(), 1u);
+
+  keylane::meta::MetaDirectiveSpec rebuild =
+      operation->current_directives_[0].spec_;
+  rebuild.directive_id_ = Bytes<16>(0x54);
+  rebuild.attempt_id_ = Bytes<16>(0x64);
+  keylane::meta::MetaDirectiveSpec authorize = rebuild;
+  authorize.directive_id_ = Bytes<16>(0x52);
+  authorize.attempt_id_ = Bytes<16>(0x62);
+  authorize.recipient_node_id_ = fixture.source;
+  authorize.kind_ = keylane::meta::kMetaDirectiveAuthorizeSource;
+  authorize.storage_mutating_ = false;
+
+  keylane::meta::TransitionOperationPhase transition;
+  transition.request_id_ = Bytes<16>(0x77);
+  transition.operation_id_ = fixture.operation_id;
+  transition.expected_revision_ = 1;
+  transition.kind_phase_blob_ = "replicating-empty-population";
+  transition.current_directives_ = {authorize, rebuild};
+  Commit(fixture.stores, 21, transition);
+
+  auto target = MetaControlProjector::ProjectNode(
+      MetaCommittedView(fixture.stores, 104), fixture.target);
+  ASSERT_TRUE(target.ok()) << target.status();
+  EXPECT_TRUE(target->full_state.current_directives.empty());
+
+  auto source = MetaControlProjector::ProjectNode(
+      MetaCommittedView(fixture.stores, 104), fixture.source);
+  ASSERT_TRUE(source.ok()) << source.status();
+  ASSERT_EQ(source->full_state.current_directives.size(), 1u);
+  EXPECT_EQ(source->full_state.current_directives.front().kind,
+            control::WireDirectiveKind::kAuthorizeSource);
+
+  keylane::meta::CommitDirectiveResult result;
+  result.request_id_ = Bytes<16>(0x78);
+  result.operation_id_ = fixture.operation_id;
+  result.directive_id_ = authorize.directive_id_;
+  result.attempt_id_ = authorize.attempt_id_;
+  result.directive_revision_ = 21;
+  result.recipient_node_id_ = fixture.source;
+  result.recipient_boot_id_ = fixture.source_boot;
+  result.assignment_id_ = fixture.target_assignment;
+  result.status_ = keylane::meta::MetaDirectiveResultStatus::kSucceeded;
+  result.result_ = "source-authorized";
+  result.result_hash_ = keylane::meta::MetaSha256(result.result_);
+
+  keylane::meta::MetaStores failed_stores = fixture.stores;
+  keylane::meta::CommitDirectiveResult failed = result;
+  failed.status_ = keylane::meta::MetaDirectiveResultStatus::kFailed;
+  failed.result_ = "source-rejected";
+  failed.result_hash_ = keylane::meta::MetaSha256(failed.result_);
+  Commit(failed_stores, 22, failed);
+  const auto target_after_failure = MetaControlProjector::ProjectNode(
+      MetaCommittedView(std::move(failed_stores), 105), fixture.target);
+  ASSERT_TRUE(target_after_failure.ok()) << target_after_failure.status();
+  EXPECT_TRUE(target_after_failure->full_state.current_directives.empty());
+
+  Commit(fixture.stores, 22, result);
+
+  target = MetaControlProjector::ProjectNode(
+      MetaCommittedView(std::move(fixture.stores), 105), fixture.target);
+  ASSERT_TRUE(target.ok()) << target.status();
+  ASSERT_EQ(target->full_state.current_directives.size(), 1u);
+  EXPECT_EQ(target->full_state.current_directives.front().kind,
+            control::WireDirectiveKind::kRebuild);
+  EXPECT_EQ(target->full_state.current_directives.front()
+                .identity.directive_revision,
+            21u);
 }
 
 TEST(MetaControlProjector,

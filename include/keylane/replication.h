@@ -436,12 +436,15 @@ class ReplicationManager {
   // downstream replication sessions.
   celer::Task<absl::Status> RevokeClusterRebuildSourceAuthorizations();
 
-  // Joins capabilities inherited from a disconnected Meta control session
-  // without advancing the committed revoke floor. The replacement session
-  // may replay the exact current FDS only after the caller has prevented every
-  // continuation from the old session from dispatching more directives.
+  // Clears capabilities inherited from an older desired-state projection
+  // without advancing the committed revoke floor. A live FDS replacement may
+  // preserve already-online population exports when its topology and authority
+  // are unchanged. A disconnected control session may also preserve only those
+  // established exports: source admission is still cleared, and NodeControl
+  // invalidates the write lease until a replacement FDS validates their group.
   celer::Task<absl::Status>
-  ClearClusterRebuildSourceAuthorizationsForSessionReplacement();
+  ClearClusterRebuildSourceAuthorizationsForSessionReplacement(
+      bool preserve_established_exports = false);
 
   // Current runtime settings; all mutations enter through ApplyDirective.
   unsigned snapshot_read_concurrency() const noexcept;

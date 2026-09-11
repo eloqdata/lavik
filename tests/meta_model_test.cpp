@@ -2668,8 +2668,16 @@ TEST(MetaStateApply,
 
   const auto make_directive = [](std::size_t ordinal) {
     keylane::meta::MetaDirectiveSpec directive;
-    directive.directive_id_.fill(static_cast<std::uint8_t>(ordinal + 1));
-    directive.attempt_id_.fill(static_cast<std::uint8_t>(ordinal + 65));
+    directive.directive_id_.fill(0);
+    directive.directive_id_[0] = 1;
+    directive.directive_id_[14] =
+        static_cast<std::uint8_t>((ordinal >> 8) & 0xff);
+    directive.directive_id_[15] = static_cast<std::uint8_t>(ordinal & 0xff);
+    directive.attempt_id_.fill(0);
+    directive.attempt_id_[0] = 2;
+    directive.attempt_id_[14] =
+        static_cast<std::uint8_t>((ordinal >> 8) & 0xff);
+    directive.attempt_id_[15] = static_cast<std::uint8_t>(ordinal & 0xff);
     directive.recipient_node_id_ = MakeNodeId(1);
     directive.target_node_id_ = MakeNodeId(1);
     directive.target_boot_id_.fill(1);

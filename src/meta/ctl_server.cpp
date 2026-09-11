@@ -548,10 +548,26 @@ std::string BuildClusterStatusReply(
                        [&](const ClusterDataNodeWireV1& node) {
                          return node.node_id_ == member.node_id_;
                        });
-      if (runtime == status.data_nodes_.end() || !runtime->current_session_ ||
-          !runtime->projection_current_ || !runtime->health_fresh_ ||
-          !runtime->population_current_) {
+      std::vector<std::string_view> missing;
+      if (runtime == status.data_nodes_.end() || !runtime->current_session_)
+        missing.push_back("session");
+      if (runtime == status.data_nodes_.end() || !runtime->projection_current_)
+        missing.push_back("projection");
+      if (runtime == status.data_nodes_.end() || !runtime->health_fresh_)
+        missing.push_back("health");
+      if (runtime == status.data_nodes_.end() || !runtime->population_current_)
+        missing.push_back("population");
+      if (!missing.empty()) {
         group.topology_converged_ = false;
+        std::string detail = "group=" + group.group_id_ + ";missing=";
+        for (std::size_t index = 0; index < missing.size(); ++index) {
+          if (index != 0) detail.push_back(',');
+          detail.append(missing[index]);
+        }
+        status.blockers_.push_back(
+            {.code_ = "node_runtime_not_ready",
+             .scope_ = "node:" + member.node_id_,
+             .detail_ = std::move(detail)});
       }
     }
     group.serving_ready_ =
@@ -646,6 +662,34 @@ std::string BuildClusterStatusReply(
     return "ERR cut_changed";
   }
   return *encoded;
+}
+
+std::string ClusterCreateLastBlocker(
+    const nuraft::ptr<nuraft::raft_server>& server,
+    const nuraft::ptr<MetaStateMachine>& state_machine,
+    const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
+    std::uint32_t observation_ttl_ms,
+    const ClusterCreateManifestV1& manifest) {
+  auto status = DecodeClusterStatusReply(BuildClusterStatusReply(
+      server, state_machine, runtime_status, observation_ttl_ms));
+  if (!status.ok()) return {};
+
+  const ClusterBlockerWireV1* selected = nullptr;
+  for (const ClusterBlockerWireV1& blocker : status->blockers_) {
+    if (!blocker.scope_.starts_with("node:")) continue;
+    const std::string_view node_id =
+        std::string_view(blocker.scope_).substr(std::string_view("node:").size());
+    if (std::any_of(manifest.data_nodes_.begin(), manifest.data_nodes_.end(),
+                    [&](const auto& node) { return node.node_id_ == node_id; })) {
+      selected = &blocker;
+    }
+  }
+  if (selected == nullptr && !status->blockers_.empty())
+    selected = &status->blockers_.back();
+  if (selected == nullptr) return {};
+  return absl::StrCat(" last_blocker=", selected->code_,
+                      " scope=", selected->scope_,
+                      " detail=", selected->detail_);
 }
 
 
@@ -1023,7 +1067,9 @@ celer::Task<std::string> HandleCompleteOp(
   }
   // Releasing this reservation while NuRaft still owns an accepted invite or
   // leave would allow a second workflow to overtake its uncertain outcome.
-  if (record->kind_ == kMetaMembershipOperationKind)
+  if (record->kind_ == kMetaMembershipOperationKind ||
+      record->kind_ == kMetaClusterCreateOperationKind ||
+      record->kind_ == kMetaClusterCreateV1GroupOperationKind)
     co_return "ERR workflow-owned";
   CompleteOperation command;
   command.request_id_ = MakeRequestId();
@@ -1058,7 +1104,9 @@ celer::Task<std::string> HandleAbortOp(
   if (IsTerminal(record->lifecycle_)) {
     co_return "ERR terminal";
   }
-  if (record->kind_ == kMetaMembershipOperationKind)
+  if (record->kind_ == kMetaMembershipOperationKind ||
+      record->kind_ == kMetaClusterCreateOperationKind ||
+      record->kind_ == kMetaClusterCreateV1GroupOperationKind)
     co_return "ERR workflow-owned";
   AbortOperation command;
   command.request_id_ = MakeRequestId();
@@ -1093,6 +1141,7 @@ std::string HandleGetOp(nuraft::ptr<MetaStateMachine> state_machine,
            record->terminal_result_;
   }
   if (record->kind_ == kMetaClusterCreateOperationKind ||
+      record->kind_ == kMetaClusterCreateV1GroupOperationKind ||
       record->kind_ == kMetaMembershipOperationKind) {
     return absl::StrCat("OK ", LifecycleName(record->lifecycle_), " phase=",
                         record->kind_phase_blob_.empty()
@@ -1419,6 +1468,8 @@ celer::Task<std::string> HandleClusterCreate(
     const nuraft::ptr<MetaStateMachine>& state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
     const std::shared_ptr<MetaMembershipGate>& membership_gate,
+    const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
+    std::uint32_t observation_ttl_ms,
     AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest,
     std::uint32_t wait_timeout_ms, const bool* shutdown) {
   const auto deadline = std::chrono::steady_clock::now() +
@@ -1497,19 +1548,63 @@ celer::Task<std::string> HandleClusterCreate(
       co_return ClusterCreateError(phase, "uncertain-outcome",
                                    "operation disappeared");
     if (operation->lifecycle_ == MetaOperationLifecycle::kCompleted) {
-      co_return absl::StrCat("OK clustercreate 1 ",
-                             state_machine->StatusSnapshot().applied_index_,
-                             " ", id);
+      ClusterCreateOutcome outcome;
+      outcome.committed_index_ =
+          state_machine->StatusSnapshot().applied_index_;
+      outcome.groups_.reserve(manifest.groups_.size());
+      for (const auto& declaration : manifest.groups_) {
+        const MetaOperationId group_id =
+            detail::ClusterCreateV1GroupOperationId(
+                operation_id, declaration.group_id_);
+        const auto group_operation =
+            state_machine->FindOperation(group_id);
+        if (!group_operation.has_value() ||
+            group_operation->lifecycle_ !=
+                MetaOperationLifecycle::kCompleted ||
+            group_operation->terminal_receipts_.empty()) {
+          co_return ClusterCreateError(
+              "finish-operation", "uncertain-outcome",
+              absl::StrCat("group=", declaration.group_id_,
+                           " completed proof is absent; operation=", id));
+        }
+        std::uint64_t committed_index = 0;
+        for (const MetaTerminalReceipt& receipt :
+             group_operation->terminal_receipts_) {
+          committed_index =
+              std::max(committed_index, receipt.committed_index_);
+        }
+        outcome.groups_.push_back(
+            {.group_id_ = declaration.group_id_,
+             .committed_index_ = committed_index,
+             .operation_id_ = HexEncode(std::string_view(
+                 reinterpret_cast<const char*>(group_id.data()),
+                 group_id.size()))});
+      }
+      std::string response =
+          absl::StrCat("OK clustercreate 1 ", outcome.committed_index_, " ",
+                       outcome.groups_.size());
+      for (const auto& group : outcome.groups_) {
+        absl::StrAppend(&response, " ", HexEncode(group.group_id_), " ",
+                        group.committed_index_, " ", group.operation_id_);
+      }
+      co_return response;
     }
     if (operation->lifecycle_ == MetaOperationLifecycle::kAborted) {
-      co_return ClusterCreateError(phase, "data-rejected",
-                                   operation->terminal_result_);
+      co_return ClusterCreateError(
+          phase, "data-rejected",
+          operation->terminal_result_ +
+              ClusterCreateLastBlocker(server, state_machine, runtime_status,
+                                       observation_ttl_ms, manifest));
     }
     if (!operation->kind_phase_blob_.empty())
       phase = operation->kind_phase_blob_;
     if (phase.starts_with("recovery-required:")) {
-      co_return ClusterCreateError("recovery", "domain-rejected",
-                                   absl::StrCat(phase, " operation=", id));
+      co_return ClusterCreateError(
+          "recovery", "domain-rejected",
+          absl::StrCat(phase, " operation=", id,
+                       ClusterCreateLastBlocker(
+                           server, state_machine, runtime_status,
+                           observation_ttl_ms, manifest)));
     }
     const auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
                                                 std::chrono::milliseconds(10));
@@ -1519,7 +1614,9 @@ celer::Task<std::string> HandleClusterCreate(
       phase, "uncertain-outcome",
       absl::StrCat(
           "wait deadline expired; background creation continues; operation=",
-          id));
+          id,
+          ClusterCreateLastBlocker(server, state_machine, runtime_status,
+                                   observation_ttl_ms, manifest)));
 }
 
 celer::Task<std::string> HandlePruneAudit(
@@ -2100,7 +2197,6 @@ celer::Task<std::string> DispatchCommand(
     std::shared_ptr<MetaMembershipGate> membership_gate,
     const MetaPrincipalIdentity& identity, AuthenticatedPrincipal principal,
     std::string_view local_data_control_endpoint,
-    std::string_view local_ctl_endpoint,
     std::shared_ptr<MetaClusterStatusService> cluster_status_service,
     std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status,
     std::uint32_t observation_ttl_ms, std::size_t* retained_status_bytes,
@@ -2199,6 +2295,7 @@ celer::Task<std::string> DispatchCommand(
     }
     co_return co_await HandleClusterCreate(
         server, state_machine, coordinator, membership_gate,
+        data_control_runtime_status, observation_ttl_ms,
         std::move(principal), *manifest, wait_timeout_ms, shutdown);
   }
   if (command == "submitop" || command == "completeop" ||
@@ -2764,7 +2861,6 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
           core->obs_store_, core->foreign_executor_, *core->proposal_executor_,
           core->membership_gate_, *identity, authenticated,
           core->options_.local_data_control_endpoint_,
-          core->options_.local_ctl_endpoint_,
           core->options_.cluster_status_service_,
           core->options_.data_control_runtime_status_,
           core->options_.observation_ttl_ms_, &retained_status_bytes, line,

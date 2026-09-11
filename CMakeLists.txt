@@ -924,7 +924,7 @@ if (BUILD_TESTING)
         )
         set_tests_properties(meta_integration.gate_cluster_create PROPERTIES
           LABELS meta-integration
-          TIMEOUT 180
+          TIMEOUT 300
           RUN_SERIAL TRUE
         )
       endif()

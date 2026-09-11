@@ -232,11 +232,14 @@ class NodeControlActions {
   // adapters backed by asynchronous subsystems must override it rather than
   // detach work and report completion early.
   virtual celer::Task<absl::Status> RevokeSourceAuthorizationsAndWait();
-  // Session replacement closes live source exports without advancing the
-  // committed directive/fence floor, allowing the new authenticated session
-  // to replay the exact current authorize directive from its FDS.
+  // Clears source admission without advancing the committed directive/fence
+  // floor. A live FDS replacement may preserve already-online population
+  // exports while write authority is invalid and the installed topology and
+  // authority are unchanged. New handshakes remain closed until an
+  // authenticated replacement projection replays their admission.
   virtual celer::Task<absl::Status>
-  ClearSourceAuthorizationsForSessionReplacementAndWait();
+  ClearSourceAuthorizationsForSessionReplacementAndWait(
+      bool preserve_established_exports = false);
   // Retires an in-progress or ready target population unless it still names
   // the desired local assignment, term, manifest, and partition replication
   // epoch. Completion includes
@@ -321,8 +324,8 @@ class NodeControlInstaller {
   // bounded relative waits that repeatedly check its suspend-aware deadline.
   // Admission and renewal also compare that clock at their own cut, so a
   // delayed worker timer cannot revive an expired lease. Expiry invalidates
-  // only that lease instance and joins source-authorization revocation before
-  // completing.
+  // only that lease instance, closes new source admission, and quarantines any
+  // already-online population export until renewal or a stronger fence.
   celer::Task<absl::Status> ApplyLeaseGrantTransition(
       const AuthorityMessage& authority_message);
 
@@ -369,9 +372,11 @@ class NodeControlInstaller {
   absl::Status LoseSession(const SessionIdentity& session_identity,
                            std::string_view reason);
 
-  // Records every current local assignment as draining before awaiting
-  // source-capability cleanup. A replacement session can install an FDS, but
-  // lease, rebuild, and source authorization remain blocked by those drains.
+  // Records every current local assignment as draining before awaiting source
+  // admission cleanup. Already-online population exports are quarantined while
+  // the write lease is invalid and may survive only if the replacement FDS
+  // proves the durable group identity unchanged; lease, rebuild, and new source
+  // authorization remain blocked by the drains.
   celer::Task<absl::Status> LoseSessionTransition(
       const SessionIdentity& session_identity, std::string_view reason);
 
@@ -440,6 +445,7 @@ class NodeControlInstaller {
 
   struct FullStateEffects {
     bool revoke_sources_ = false;
+    bool preserve_established_exports_ = false;
     std::vector<AuthorityAnchor> retired_;
   };
 

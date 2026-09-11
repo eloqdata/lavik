@@ -164,10 +164,10 @@ class ClusterOperator {
   absl::StatusOr<ClusterStatusOutcome> Status(
       const MetaAdminTarget& seed, const ClusterStatusOptions& options) const;
 
-  // Creates the v1 single-Data topology from an empty single-Meta cluster and
+  // Creates a v1 multi-Group topology from an empty single-Meta cluster and
   // returns only after cluster-status observes the exact manifest as READY.
   // A transport failure after the mutation request starts is intentionally
-  // not retried because v1 does not resume partially committed creation.
+  // not retried; interruption recovery belongs to the resume workflow.
   absl::StatusOr<ClusterCreateOutcome> Create(
       const MetaAdminTarget& seed, const ClusterCreateManifestV1& manifest,
       const ClusterStatusOptions& options) const;

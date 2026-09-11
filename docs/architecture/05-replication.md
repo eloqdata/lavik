@@ -198,11 +198,19 @@ a transient reconnect does not itself force a full rebuild.
 `AuthorizeClusterRebuildSource()` plus its revocation method control exact
 downstream export capabilities. `MetaControlClientService` receives and
 normalizes the wire directive, but only `NodeControlInstaller` may call this
-boundary after matching it to the installed projection and authority. Until a
-valid directive completes, a Meta-managed process remains LOADING. `PING` and
-the management/diagnostic surfaces needed to observe the process remain
-available, but recovered keyspace is not made readable or writable merely
-because storage initialization succeeded.
+boundary after matching it to the installed projection and authority. A live
+FDS replacement, transient control-session refresh, or finite-lease expiry
+clears new export admission but may quarantine an already-ONLINE population
+session while write authority is closed. That session survives only while the
+replacement FDS proves the complete committed Group/member/population identity
+unchanged; fence, membership/population change, readiness loss, or storage loss
+uses the stronger join-and-revoke barrier. This lets a completed initialization
+operation retire its one-shot directives without interrupting the continuous
+replication session it established. Until a valid directive completes, a
+Meta-managed process remains LOADING. `PING` and the management/diagnostic
+surfaces needed to observe the process remain available, but recovered keyspace
+is not made readable or writable merely because storage initialization
+succeeded.
 
 Promotion prepare is intentionally not Cluster activation. After successful
 prepare the role remains `syncing`, storage remains LOADING, expiration
