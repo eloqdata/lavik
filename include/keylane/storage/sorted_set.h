@@ -81,7 +81,8 @@ struct SortedSetOperation {
   std::uint64_t scan_count_ = 10;
   std::string_view scan_pattern_ = "*";
   // Explicit permission from a single-key ZADD/ZREM/ZINCRBY caller to prepare
-  // a small compact update without the store-state mutex. The exclusive key
+  // a new collection or small compact update without the store-state mutex.
+  // New grouped values include preparation of both indexes. The exclusive key
   // hold and database admission remain owned by the caller through publication;
   // storage independently checks physical eligibility and revalidates before
   // publishing or returning a no-op.

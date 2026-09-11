@@ -61,7 +61,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const ListOperation& operation, GroupedHashObject::Handle object,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    PreparedOrderedMutation* prepared) {
   try {
     if (object == nullptr || !object->is_ordered() ||
         object->ordered_directory().root().kind_ !=
@@ -289,6 +290,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     std::vector<LoadedOrderedGroup> loaded;
     loaded.reserve(end_page - begin_page);
     for (std::size_t i = begin_page; i < end_page; ++i) {
+      if (prepared != nullptr) co_await celer::Yield(*store.worker_);
       auto page = co_await LoadOrderedGroupSnapshot(store, partition, db_id,
                                                     key, digest, object,
                                                     directory.groups()[i].id_);
@@ -426,6 +428,12 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     result.changed_ = plan->changed_;
     result.length_ = plan->root_.item_count_;
     if (!result.changed_) co_return result;
+    if (prepared != nullptr) {
+      prepared->pages_ = std::move(*page_scratch);
+      prepared->inputs_ = std::move(*incoming_scratch);
+      prepared->plan_ = std::move(*plan);
+      co_return result;
+    }
     const auto status = co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(*plan),
         object->version().root_.expire_at_ms_, tx, replication,

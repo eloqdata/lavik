@@ -1231,6 +1231,23 @@ inline Task<absl::Status> PauseCompactWriteForTest(Worker& worker,
   spdlog::info("compact collection write pause complete key={}", key);
   co_return absl::OkStatus();
 }
+
+// Select a preparation/extent boundary without delaying unrelated writes.
+// Markers let concurrency tests observe the unlocked interval
+// deterministically.
+inline Task<absl::Status> PauseGroupedWriteForTest(Worker& worker,
+                                                   std::string_view key,
+                                                   std::string_view phase) {
+  if (!KEYLANE_FAULT_MATCHES("KEYLANE_GROUPED_WRITE_PAUSE_KEY", key))
+    co_return absl::OkStatus();
+  const char* selected = std::getenv("KEYLANE_GROUPED_WRITE_PAUSE_PHASE");
+  if (selected == nullptr || phase != selected) co_return absl::OkStatus();
+  spdlog::info("grouped write pause armed key={} phase={}", key, phase);
+  const auto status = co_await celer::SleepFor(worker, std::chrono::seconds(3));
+  if (!status.ok()) co_return status;
+  spdlog::info("grouped write pause complete key={} phase={}", key, phase);
+  co_return absl::OkStatus();
+}
 #endif
 
 class StorageEngine::Impl {
@@ -1896,10 +1913,16 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
 
-  // The caller retains the ordinary exclusive key hold and store lock. The
-  // after-image contains only loaded groups for point operations, or every
-  // group for full-collection operations. Only changed_groups are rewritten.
-  // A null previous view promotes an ordinary compact Hash/Set.
+  // Pure private-page planning; no store lock is needed. The after-image owns
+  // selected groups for point operations or all groups for full-image callers.
+  // Only changed_groups are rewritten. Null previous builds a fresh graph.
+  absl::StatusOr<HashGroupMutationPlan> PrepareGroupedHashMutation(
+      const GroupedHashObject::Handle& previous, HashValue after_image,
+      std::span<const HashGroupId> changed_groups, std::uint64_t field_count,
+      std::uint64_t revision);
+  // Caller retains exclusive key intent and store state. A prepared plan must
+  // name the validated predecessor or a validated creation; commit assigns
+  // its durable revision and stamps every page of a fresh incarnation.
   Task<absl::Status> CommitGroupedHashMutationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -1907,18 +1930,21 @@ class StorageEngine::Impl {
       std::vector<HashGroupId> changed_groups, std::uint64_t field_count,
       ValueType value_type, std::uint64_t expire_at_ms, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      HashGroupMutationPlan* prepared = nullptr);
 
   // The plan contains complete changed ordered pages, not an append-only
-  // mutation log. Null previous promotes a compact collection; the adapter
+  // mutation log. Null previous creates/promotes a collection; the adapter
   // assigns its fresh incarnation/revision before staging any auxiliary.
+  struct SortedSetMemberMutation;
   Task<absl::Status> CommitGroupedOrderedMutationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedHashObject::Handle previous, OrderedCollectionMutationPlan plan,
       std::uint64_t expire_at_ms, TxShardWrites* tx,
       ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      SortedSetMemberMutation* prepared_members = nullptr);
   struct SortedSetMemberMutation {
     MemoryReservation scratch_;
     MemoryReservation leaves_;
@@ -1927,11 +1953,12 @@ class StorageEngine::Impl {
   // Derives member-index changes from complete ordered before/after pages so
   // every typed, callback and ingest writer shares the same atomic boundary.
   // Only touched prefix leaves are decoded; all retained scratch is admitted.
+  // Unlocked callers yield between pages, keeping hot-buffer scans cooperative.
   Task<absl::StatusOr<SortedSetMemberMutation>> PrepareSortedSetMembers(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedHashObject::Handle previous,
-      const OrderedCollectionMutationPlan& ordered);
+      const OrderedCollectionMutationPlan& ordered, bool unlocked = false);
   Task<absl::Status> UpdateGroupedExpirationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -1945,18 +1972,29 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedHashObject::Handle previous, TxShardWrites* compensation,
       TxUndoLog* replacement_undo);
+  // Page ownership and admission travel together from preparation through
+  // publication. Declare charges first so pages die before credit is returned.
+  struct PreparedOrderedMutation {
+    MemoryReservation pages_;
+    MemoryReservation inputs_;
+    OrderedCollectionMutationPlan plan_;
+  };
+  // With an output, only prepare private pages; the caller owns store-lock
+  // release/reacquisition, validation and commit (including successful no-ops).
   Task<absl::StatusOr<ListResult>> ExecuteGroupedListLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const ListOperation& operation, GroupedHashObject::Handle previous,
       TxShardWrites* tx, ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      PreparedOrderedMutation* prepared = nullptr);
   Task<absl::StatusOr<SortedSetResult>> ExecuteGroupedSortedSetLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation, GroupedHashObject::Handle previous,
       TxShardWrites* tx, ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      PreparedOrderedMutation* prepared = nullptr);
 
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 
@@ -2221,12 +2259,100 @@ class StorageEngine::Impl {
            !replica_loading_.load(std::memory_order_acquire);
   }
 
+  // The command adapter must retain exclusive key intent and database
+  // admission even when no live record exists. Multi-key/transaction and
+  // candidate writers keep their separate lifetime contracts.
+  bool CanPrepareCollectionCreateUnlocked(
+      const WorkerStore::PartitionStore& partition,
+      const TxShardWrites* tx) const noexcept {
+    return tx == nullptr && !partition.replica_sync_ &&
+           !replica_loading_.load(std::memory_order_acquire);
+  }
+
+  // Validate logical absence at the original command time, not the current
+  // clock. An expired value or tombstone may be relocated/removed by GC, so
+  // physical absence is not the invariant. The caller re-resolves the key
+  // under store state, including full-key verification for external keys,
+  // and passes only that freshly verified entry (or nullptr).
+  absl::Status ValidateCollectionCreateSnapshot(
+      const WorkerStore& store, const WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, const RecordIndex::Entry* current,
+      std::uint64_t now_ms, const CompactWriteSnapshot& snapshot,
+      const MutationPrecondition* precondition) const {
+    if (!CanPrepareCollectionCreateUnlocked(partition, nullptr) ||
+        store.index_generations_[db_id] != snapshot.index_generation_ ||
+        EffectiveRecordDbEpoch(partition, db_id) != snapshot.db_epoch_ ||
+        partition.replication_epoch_ != snapshot.replication_epoch_)
+      return absl::AbortedError(
+          "collection population changed during creation");
+    if (store.write_failed_ ||
+        epoch_metadata_failed_.load(std::memory_order_acquire))
+      return absl::FailedPreconditionError(
+          "storage writer stopped during creation");
+    if (current != nullptr && current->value_.kind() == RecordKind::kValue &&
+        !IsExpired(*current, now_ms))
+      return absl::AbortedError("collection key appeared during creation");
+    return precondition != nullptr ? precondition->Validate()
+                                   : absl::OkStatus();
+  }
+
   CompactWriteSnapshot CaptureCompactWriteSnapshot(
       const WorkerStore& store, const WorkerStore::PartitionStore& partition,
       std::uint8_t db_id) const noexcept {
     return {.index_generation_ = store.index_generations_[db_id],
             .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
             .replication_epoch_ = partition.replication_epoch_};
+  }
+
+  // The caller retains key intent and database admission. Candidate ingestion
+  // has its own population lifetime and stays on its existing writer path.
+  bool CanPrepareGroupedWriteUnlocked(
+      const WorkerStore::PartitionStore& partition) const noexcept {
+    return !partition.replica_sync_ &&
+           !replica_loading_.load(std::memory_order_acquire);
+  }
+
+  // Call after reacquiring store state, including for no-ops and last-element
+  // deletion. Retained directories own metadata, not physical allocations:
+  // permit GC relocation but never publish a plan into another logical view.
+  absl::Status ValidateGroupedWriteSnapshot(
+      const WorkerStore& store, const WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key,
+      const GroupedHashObject::Handle& previous,
+      const CompactWriteSnapshot& snapshot,
+      const MutationPrecondition* precondition) const {
+    if (!CanPrepareGroupedWriteUnlocked(partition) ||
+        store.index_generations_[db_id] != snapshot.index_generation_ ||
+        EffectiveRecordDbEpoch(partition, db_id) != snapshot.db_epoch_ ||
+        partition.replication_epoch_ != snapshot.replication_epoch_)
+      return absl::AbortedError(
+          "grouped population changed during preparation");
+    if (store.write_failed_ ||
+        epoch_metadata_failed_.load(std::memory_order_acquire))
+      return absl::FailedPreconditionError(
+          "storage writer stopped during preparation");
+    const auto current =
+        partition.grouped_objects_[db_id].CurrentForMutation(key);
+    if (!previous || !current)
+      return absl::AbortedError(
+          "grouped source disappeared during preparation");
+    const auto& a = previous->version();
+    const auto& b = current->version();
+    if (a.db_epoch_ != b.db_epoch_ ||
+        a.replication_epoch_ != b.replication_epoch_ ||
+        a.index_generation_ != b.index_generation_ ||
+        partition.grouped_generations_[db_id] != a.index_generation_ ||
+        a.root_.mutation_sequence_ != b.root_.mutation_sequence_ ||
+        a.root_.logical_size_ != b.root_.logical_size_ ||
+        a.root_.expire_at_ms_ != b.root_.expire_at_ms_ ||
+        a.root_.value_type() != b.root_.value_type() ||
+        !previous->SameLogicalRoot(*current))
+      return absl::AbortedError(
+          "grouped logical version changed during preparation");
+    auto status = current->ReadStatus();
+    if (status.ok() && precondition != nullptr)
+      status = precondition->Validate();
+    return status;
   }
 
   // Reacquire store state before validating, even for successful no-ops. This
@@ -3147,7 +3273,8 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
   WriteExtentValueLocked(WorkerStore& store, std::string_view first,
                          std::string_view second = {},
-                         RecordPayloadCursor* cursor = nullptr);
+                         RecordPayloadCursor* cursor = nullptr,
+                         std::string_view fault_key = {});
 
   struct GroupMutationWrite;
   Task<absl::Status> AppendLocked(

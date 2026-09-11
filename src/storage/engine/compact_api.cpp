@@ -4,6 +4,33 @@
 #include "keylane/storage/detail/ordered_compact_codec.h"
 
 namespace keylane::storage {
+namespace {
+
+absl::StatusOr<OrderedCollectionMutationPlan> PrepareSortedSetGroups(
+    std::string_view encoded, std::uint64_t count) {
+  auto entries = DecodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
+                                           encoded, count);
+  if (!entries.ok()) return entries.status();
+  OrderedGroupSnapshot initial{.kind_ = OrderedCollectionKind::kSortedSet,
+                               .incarnation_ = 1,
+                               .id_ = 1,
+                               .entries_ = std::move(*entries)};
+  auto split = SplitOrderedGroup(std::move(initial), 2);
+  if (!split.ok()) return split.status();
+  return OrderedCollectionMutationPlan{
+      .root_ = {.kind_ = OrderedCollectionKind::kSortedSet,
+                .incarnation_ = 1,
+                .item_count_ = count,
+                .first_group_ = split->groups_.front().id_,
+                .last_group_ = split->groups_.back().id_,
+                .next_group_id_ = split->next_group_id_,
+                .group_count_ =
+                    static_cast<std::uint32_t>(split->groups_.size())},
+      .changed_ = true,
+      .writes_ = std::move(split->groups_)};
+}
+
+}  // namespace
 
 Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
     std::uint8_t db_id, std::string_view key, ValueType value_type,
@@ -85,8 +112,11 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         value_type == ValueType::kSortedSet && prepare_unlocked && !read_only &&
         exists &&
         CanPrepareCompactWriteUnlocked(store, partition, found, location, tx);
+    const bool unlocked_create =
+        value_type == ValueType::kSortedSet && prepare_unlocked && !read_only &&
+        !exists && CanPrepareCollectionCreateUnlocked(partition, tx);
     std::optional<CompactWriteSnapshot> write_snapshot;
-    if (unlocked_compact_write)
+    if (unlocked_compact_write || unlocked_create)
       write_snapshot = CaptureCompactWriteSnapshot(store, partition, db_id);
     GroupedHashObject::Handle grouped;
     if (exists && location.grouped()) {
@@ -143,12 +173,16 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     }
     std::optional<LoadedValue> loaded;
     std::optional<CompactValueView> view;
-    if (read_only || unlocked_compact_write) {
+    if (read_only || unlocked_compact_write || unlocked_create) {
       // Keep only copied physical identity and owned read buffers across IO.
       // The caller's key hold excludes logical writes, but not GC relocation.
       found = nullptr;
       unlock.Unlock();
     }
+    KEYLANE_FAULT_INJECT(if (unlocked_create) {
+      KEYLANE_FAULT_BAD_ALLOC("KEYLANE_FAIL_COLLECTION_CREATE_PREPARE_KEY",
+                              key);
+    });
     KEYLANE_FAULT_INJECT(if (unlocked_compact_write) {
       auto paused = co_await PauseCompactWriteForTest(*store.worker_, key);
       if (!paused.ok()) co_return paused;
@@ -172,11 +206,62 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
 
     auto update = callback(view);
     if (!update.ok()) co_return update.status();
-    if (unlocked_compact_write) {
+    // A missing key may be created directly as a large graph. Keep both
+    // indexes private/admitted until absence and population are revalidated;
+    // the commit adapter stamps their placeholder incarnations together.
+    std::optional<MemoryReservation> create_admission;
+    std::optional<OrderedCollectionMutationPlan> created_groups;
+    SortedSetMemberMutation created_members;
+    if (unlocked_create && update->changed_ && !update->erase_ &&
+        update->encoded_.size() >= kGroupedHashPromotionBytes) {
+      GroupedScratchBudget budget;
+      auto added = budget.AddBytes(update->encoded_.size());
+      if (!added.ok()) co_return added;
+      if (update->logical_size_ > std::numeric_limits<std::size_t>::max() / 256)
+        co_return absl::ResourceExhaustedError(
+            "Sorted Set creation count overflow");
+      added = budget.AddBytes(update->logical_size_ * 256);
+      if (!added.ok()) co_return added;
+      auto admitted = budget.Reserve(1);
+      if (!admitted.ok()) co_return admitted.status();
+      create_admission.emplace(std::move(*admitted));
+      auto plan =
+          PrepareSortedSetGroups(update->encoded_, update->logical_size_);
+      if (!plan.ok()) co_return plan.status();
+      created_groups.emplace(std::move(*plan));
+      KEYLANE_FAULT_INJECT({
+        const auto paused = co_await PauseGroupedWriteForTest(
+            *store.worker_, key, "create-members");
+        if (!paused.ok()) co_return paused;
+      });
+      auto members = co_await PrepareSortedSetMembers(
+          store, partition, db_id, key, digest, nullptr, *created_groups, true);
+      if (!members.ok()) co_return members.status();
+      created_members = std::move(*members);
+    }
+    if (unlocked_compact_write || unlocked_create) {
+      KEYLANE_FAULT_INJECT(if (unlocked_create) {
+        const auto paused =
+            co_await PauseGroupedWriteForTest(*store.worker_, key, "create");
+        if (!paused.ok()) co_return paused;
+      });
       co_await store.store_state_mutex_.Lock();
       unlock.Adopt();
-      const auto valid = ValidateCompactWriteSnapshot(
-          store, partition, db_id, key, digest, location, *write_snapshot);
+      absl::Status valid;
+      if (unlocked_create) {
+        auto* current = index.Find(digest, key);
+        if (current != nullptr && !current->key_complete()) {
+          auto verified = co_await FindVerifiedEntry(store, index, digest, key);
+          if (!verified.ok()) co_return verified.status();
+          current = *verified;
+        }
+        valid = ValidateCollectionCreateSnapshot(
+            store, partition, db_id, current, now_ms, *write_snapshot,
+            mutation_precondition);
+      } else {
+        valid = ValidateCompactWriteSnapshot(store, partition, db_id, key,
+                                             digest, location, *write_snapshot);
+      }
       if (!valid.ok()) co_return valid;
       // Validate even a no-op before returning success. Never retry this
       // callback: it already populated the typed command's private result.
@@ -217,28 +302,20 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     const bool promote_ordered = encoded.size() >= kGroupedHashPromotionBytes;
     if (!update->erase_ && value_type == ValueType::kSortedSet &&
         (grouped != nullptr || promote_ordered)) {
-      auto after = DecodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
-                                             encoded, logical_size);
-      if (!after.ok()) co_return after.status();
+      if (created_groups)
+        co_return co_await CommitGroupedOrderedMutationLocked(
+            store, partition, db_id, key, digest, nullptr,
+            std::move(*created_groups), expire_at_ms, tx, replication,
+            mutation_precondition, &created_members);
       OrderedCollectionMutationPlan plan;
       if (grouped == nullptr) {
-        OrderedGroupSnapshot initial{.kind_ = OrderedCollectionKind::kSortedSet,
-                                     .incarnation_ = 1,
-                                     .id_ = 1,
-                                     .entries_ = std::move(*after)};
-        auto split = SplitOrderedGroup(std::move(initial), 2);
-        if (!split.ok()) co_return split.status();
-        plan.root_ = {
-            .kind_ = OrderedCollectionKind::kSortedSet,
-            .incarnation_ = 1,
-            .item_count_ = logical_size,
-            .first_group_ = split->groups_.front().id_,
-            .last_group_ = split->groups_.back().id_,
-            .next_group_id_ = split->next_group_id_,
-            .group_count_ = static_cast<std::uint32_t>(split->groups_.size())};
-        plan.changed_ = true;
-        plan.writes_ = std::move(split->groups_);
+        auto created = PrepareSortedSetGroups(encoded, logical_size);
+        if (!created.ok()) co_return created.status();
+        plan = std::move(*created);
       } else {
+        auto after = DecodeOrderedCompactValue(
+            OrderedCollectionKind::kSortedSet, encoded, logical_size);
+        if (!after.ok()) co_return after.status();
         if (!grouped->is_ordered() ||
             grouped->ordered_directory().root().kind_ !=
                 OrderedCollectionKind::kSortedSet ||

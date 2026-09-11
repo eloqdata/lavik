@@ -20,7 +20,10 @@ bool SameLogicalView(const GroupedHashObject::Handle& before,
          before->SameLogicalRoot(*current);
 }
 
-absl::StatusOr<HashGroupMutationPlan> BuildMutation(
+}  // namespace
+
+absl::StatusOr<HashGroupMutationPlan>
+StorageEngine::Impl::PrepareGroupedHashMutation(
     const GroupedHashObject::Handle& previous, HashValue after_image,
     std::span<const HashGroupId> changed_groups, std::uint64_t field_count,
     std::uint64_t sequence) {
@@ -100,8 +103,6 @@ absl::StatusOr<HashGroupMutationPlan> BuildMutation(
   return plan;
 }
 
-}  // namespace
-
 Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -109,7 +110,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     std::vector<HashGroupId> changed_groups, std::uint64_t field_count,
     ValueType value_type, std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    HashGroupMutationPlan* prepared) {
   if (field_count == 0 ||
       field_count > std::numeric_limits<std::uint32_t>::max() ||
       (value_type != ValueType::kHash && value_type != ValueType::kSet)) {
@@ -137,6 +139,11 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     std::uint64_t append_bytes = kBlockHeaderSlotBytes;
     for (const auto& entry : after_image.entries_)
       append_bytes += entry.field_.size() + entry.value_.size() + 64;
+    if (prepared != nullptr) {
+      for (const auto& page : prepared->writes_)
+        for (const auto& entry : page.value_.entries_)
+          append_bytes += entry.field_.size() + entry.value_.size() + 64;
+    }
     // No generation lease may be held while asking the cleaner to make room.
     // The population checks below also cover GC during this unlocked wait.
     store.store_state_mutex_.Unlock(*store.worker_);
@@ -214,9 +221,27 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     co_return absl::OutOfRangeError(
         "group revision allocation did not advance");
   }
-  auto plan = BuildMutation(previous, std::move(after_image), changed_groups,
-                            field_count, revision);
+  auto plan =
+      prepared != nullptr
+          ? absl::StatusOr<HashGroupMutationPlan>(std::move(*prepared))
+          : PrepareGroupedHashMutation(previous, std::move(after_image),
+                                       changed_groups, field_count, revision);
   if (!plan.ok()) co_return plan.status();
+  if (prepared != nullptr) {
+    if (plan->root_.field_count_ != field_count ||
+        (previous
+             ? (plan->expected_sequence_ != previous->directory().sequence() ||
+                plan->root_.incarnation_ != previous->incarnation())
+             : plan->expected_sequence_ != 0))
+      co_return absl::AbortedError("prepared Hash mutation is stale");
+    if (!previous) {
+      // Creation plans have only private placeholder identities until this
+      // batch is admitted. Every page must share the newly allocated root C.
+      plan->root_.incarnation_ = revision;
+      for (auto& page : plan->writes_) page.incarnation_ = revision;
+    }
+  }
+  plan->root_.revision_ = revision;
   auto root_payload = EncodeGroupedHashRoot(plan->root_);
   if (!root_payload.ok()) co_return root_payload.status();
   // Validate every indivisible field/envelope before the first disk write.

@@ -1,3 +1,4 @@
+#include <exception>
 #include <new>
 
 #include "absl/strings/str_cat.h"
@@ -1419,10 +1420,9 @@ Task<absl::Status> StorageEngine::Impl::PrefetchStandbyBlock(
 }
 
 Task<absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
-StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
-                                            std::string_view first,
-                                            std::string_view second,
-                                            RecordPayloadCursor* cursor) {
+StorageEngine::Impl::WriteExtentValueLocked(
+    WorkerStore& store, std::string_view first, std::string_view second,
+    RecordPayloadCursor* cursor, [[maybe_unused]] std::string_view fault_key) {
   if (cursor != nullptr && (!first.empty() || !second.empty())) {
     co_return absl::InvalidArgumentError(
         "extent writer requires either spans or a payload cursor");
@@ -1503,123 +1503,159 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
       co_return absl::Status(absl::StatusCode::kInternal,
                              "extent staging buffer is smaller than a block");
     }
-    std::fill_n(staging.data_, kStorageBlockBytes, std::byte{0});
-    std::size_t copied = 0;
-    if (cursor != nullptr) {
-      auto copied_status = cursor->Read(std::span<std::byte>(
-          staging.data_ + kBlockHeaderBytes, payload_bytes));
-      if (!copied_status.ok()) {
-        release_buffer();
-        reclaim_allocated();
-        co_return copied_status;
-      }
-      copied = payload_bytes;
-    }
-    while (copied < payload_bytes) {
-      const std::uint64_t logical_offset = payload_offset + copied;
-      const std::string_view source =
-          logical_offset < first.size() ? first : second;
-      const std::size_t source_offset =
-          logical_offset < first.size()
-              ? static_cast<std::size_t>(logical_offset)
-              : static_cast<std::size_t>(logical_offset - first.size());
-      const std::size_t chunk =
-          std::min(payload_bytes - copied, source.size() - source_offset);
-      std::memcpy(staging.data_ + kBlockHeaderBytes + copied,
-                  source.data() + source_offset, chunk);
-      copied += chunk;
-    }
-    const auto payload = std::span<const std::byte>(
-        staging.data_ + kBlockHeaderBytes, payload_bytes);
-    const std::uint32_t payload_checksum = Crc32c(payload);
-    refs->back() = ExtentRef{
-        .block_id_ = reserved->block_id_,
-        .allocation_epoch_ = reserved->allocation_epoch_,
-        .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
-        .payload_checksum_ = payload_checksum,
-    };
     auto allocated_lsn = AllocateLsn(store);
     if (!allocated_lsn.ok()) {
       release_buffer();
       reclaim_allocated();
       co_return allocated_lsn.status();
     }
-    BlockHeader header{
-        .magic_ = kBlockMagic,
-        .block_id_ = reserved->block_id_,
-        .version_ = kStorageFormatVersion,
-        .header_bytes_ = kBlockHeaderBytes,
-        .block_bytes_ = kStorageBlockBytes,
-        .writer_id_ = store.worker_->id(),
-        .allocation_epoch_ = reserved->allocation_epoch_,
-        .committed_bytes_ =
-            static_cast<std::uint32_t>(kBlockHeaderBytes + payload_bytes),
-        .record_count_ = 0,
-        .max_lsn_ = *allocated_lsn,
-        .header_sequence_ = 1,
-        .checksum_ = 0,
-        .layout_worker_count_ = worker_count_,
-        .kind_ = BlockKind::kPayloadExtent,
-        .reserved_ = {},
-        .extent_index_ = extent_index,
-        .extent_payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
-        .extent_payload_checksum_ = payload_checksum,
+    // This extent is not reachable from any root yet. Its live-byte charge
+    // and explicit pin keep allocation identity stable while this coroutine
+    // exclusively owns the buffer/cursor. Only private bytes and device IO
+    // are touched outside store state; body-before-header durability is intact.
+    ++state.pins_;
+    auto write_extent = [&]() -> Task<absl::Status> {
+      KEYLANE_FAULT_INJECT(if (extent_index == 0) {
+        const auto paused = co_await PauseGroupedWriteForTest(
+            *store.worker_, fault_key, "extent");
+        if (!paused.ok()) co_return paused;
+      });
+      std::fill_n(staging.data_, kStorageBlockBytes, std::byte{0});
+      std::size_t copied = 0;
+      if (cursor != nullptr) {
+        auto copied_status = cursor->Read(std::span<std::byte>(
+            staging.data_ + kBlockHeaderBytes, payload_bytes));
+        if (!copied_status.ok()) {
+          co_return copied_status;
+        }
+        copied = payload_bytes;
+      }
+      while (copied < payload_bytes) {
+        const std::uint64_t logical_offset = payload_offset + copied;
+        const std::string_view source =
+            logical_offset < first.size() ? first : second;
+        const std::size_t source_offset =
+            logical_offset < first.size()
+                ? static_cast<std::size_t>(logical_offset)
+                : static_cast<std::size_t>(logical_offset - first.size());
+        const std::size_t chunk =
+            std::min(payload_bytes - copied, source.size() - source_offset);
+        std::memcpy(staging.data_ + kBlockHeaderBytes + copied,
+                    source.data() + source_offset, chunk);
+        copied += chunk;
+      }
+      const auto payload = std::span<const std::byte>(
+          staging.data_ + kBlockHeaderBytes, payload_bytes);
+      const std::uint32_t payload_checksum = Crc32c(payload);
+      refs->back() = ExtentRef{
+          .block_id_ = reserved->block_id_,
+          .allocation_epoch_ = reserved->allocation_epoch_,
+          .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
+          .payload_checksum_ = payload_checksum,
+      };
+      BlockHeader header{
+          .magic_ = kBlockMagic,
+          .block_id_ = reserved->block_id_,
+          .version_ = kStorageFormatVersion,
+          .header_bytes_ = kBlockHeaderBytes,
+          .block_bytes_ = kStorageBlockBytes,
+          .writer_id_ = store.worker_->id(),
+          .allocation_epoch_ = reserved->allocation_epoch_,
+          .committed_bytes_ =
+              static_cast<std::uint32_t>(kBlockHeaderBytes + payload_bytes),
+          .record_count_ = 0,
+          .max_lsn_ = *allocated_lsn,
+          .header_sequence_ = 1,
+          .checksum_ = 0,
+          .layout_worker_count_ = worker_count_,
+          .kind_ = BlockKind::kPayloadExtent,
+          .reserved_ = {},
+          .extent_index_ = extent_index,
+          .extent_payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
+          .extent_payload_checksum_ = payload_checksum,
+      };
+      EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
+                                    staging.data_, kBlockHeaderSlotBytes));
+      std::memset(staging.data_ + kBlockHeaderSlotBytes, 0,
+                  kBlockHeaderBytes - kBlockHeaderSlotBytes);
+      const auto [file_id, block_offset] = FileOffset(reserved->block_id_);
+      // Start at the second header slot, which staging left zero. An extent
+      // block only ever writes slot 0, so this durably clears whatever header
+      // the block carried in a previous life before the new one commits.
+      const std::size_t write_begin = kBlockHeaderSlotBytes;
+      const std::size_t write_bytes =
+          kBlockHeaderBytes + AlignDirect(payload_bytes);
+      bool write_ok = true;
+      absl::Status write_status = absl::OkStatus();
+      for (std::size_t offset = write_begin; offset < write_bytes;) {
+        const std::size_t chunk =
+            std::min(options_.flush_size_bytes_, write_bytes - offset);
+        auto written = co_await WriteStorageBuffer(
+            *store.worker_, store.files_[file_id],
+            std::span<const std::byte>(staging.data_ + offset, chunk),
+            write_buffer_id != 0 && store.buffers_.buffers_registered(),
+            staging, block_offset + offset);
+        if (!written.ok() || *written != chunk) {
+          write_ok = false;
+          write_status = written.ok()
+                             ? absl::Status(absl::StatusCode::kInternal,
+                                            "short extent block write")
+                             : written.status();
+          break;
+        }
+        offset += chunk;
+      }
+      if (write_ok) {
+        write_status =
+            co_await celer::Fdatasync(*store.worker_, store.files_[file_id]);
+      }
+      if (write_status.ok()) {
+        auto written = co_await WriteStorageBuffer(
+            *store.worker_, store.files_[file_id],
+            std::span<const std::byte>(staging.data_, kBlockHeaderSlotBytes),
+            write_buffer_id != 0 && store.buffers_.buffers_registered(),
+            staging, block_offset);
+        if (!written.ok() || *written != kBlockHeaderSlotBytes) {
+          write_status = written.ok()
+                             ? absl::Status(absl::StatusCode::kInternal,
+                                            "short extent header write")
+                             : written.status();
+        }
+      }
+      if (write_status.ok()) {
+        write_status =
+            co_await celer::Fdatasync(*store.worker_, store.files_[file_id]);
+      }
+      co_return write_status;
     };
-    EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
-                                  staging.data_, kBlockHeaderSlotBytes));
-    std::memset(staging.data_ + kBlockHeaderSlotBytes, 0,
-                kBlockHeaderBytes - kBlockHeaderSlotBytes);
-    const auto [file_id, block_offset] = FileOffset(reserved->block_id_);
-    // Start at the second header slot, which staging left zero. An extent
-    // block only ever writes slot 0, so this durably clears whatever header
-    // the block carried in a previous life before the new one commits.
-    const std::size_t write_begin = kBlockHeaderSlotBytes;
-    const std::size_t write_bytes =
-        kBlockHeaderBytes + AlignDirect(payload_bytes);
-    bool write_ok = true;
-    absl::Status write_status = absl::OkStatus();
-    for (std::size_t offset = write_begin; offset < write_bytes;) {
-      const std::size_t chunk =
-          std::min(options_.flush_size_bytes_, write_bytes - offset);
-      auto written = co_await WriteStorageBuffer(
-          *store.worker_, store.files_[file_id],
-          std::span<const std::byte>(staging.data_ + offset, chunk),
-          write_buffer_id != 0 && store.buffers_.buffers_registered(), staging,
-          block_offset + offset);
-      if (!written.ok() || *written != chunk) {
-        write_ok = false;
-        write_status = written.ok() ? absl::Status(absl::StatusCode::kInternal,
-                                                   "short extent block write")
-                                    : written.status();
-        break;
-      }
-      offset += chunk;
+    store.store_state_mutex_.Unlock(*store.worker_);
+    absl::Status extent_status;
+    std::exception_ptr exception;
+    try {
+      extent_status = co_await write_extent();
+    } catch (...) {
+      exception = std::current_exception();
     }
-    if (write_ok) {
-      write_status =
-          co_await celer::Fdatasync(*store.worker_, store.files_[file_id]);
-    }
-    if (write_status.ok()) {
-      auto written = co_await WriteStorageBuffer(
-          *store.worker_, store.files_[file_id],
-          std::span<const std::byte>(staging.data_, kBlockHeaderSlotBytes),
-          write_buffer_id != 0 && store.buffers_.buffers_registered(), staging,
-          block_offset);
-      if (!written.ok() || *written != kBlockHeaderSlotBytes) {
-        write_status = written.ok() ? absl::Status(absl::StatusCode::kInternal,
-                                                   "short extent header write")
-                                    : written.status();
-      }
-    }
-    if (write_status.ok()) {
-      write_status =
-          co_await celer::Fdatasync(*store.worker_, store.files_[file_id]);
-    }
+    // Restore the caller's lock invariant on every exit, including failure to
+    // allocate the IO coroutine frame. No destructor attempts an async lock.
+    co_await store.store_state_mutex_.Lock();
+    assert(state.allocation_epoch_ == reserved->allocation_epoch_ &&
+           state.pins_ != 0);
+    --state.pins_;
     release_buffer();
-    if (!write_status.ok()) {
+    if (exception) {
+      reclaim_allocated();
+      std::rethrow_exception(exception);
+    }
+    if (!extent_status.ok()) {
       LatchRuntimeFailure(store);
       reclaim_allocated();
-      co_return write_status;
+      co_return extent_status;
+    }
+    if (store.write_failed_) {
+      reclaim_allocated();
+      co_return absl::FailedPreconditionError(
+          "storage writer stopped during extent IO");
     }
     // The first extent has a durable header and allocation bit, but the
     // remaining payload and keyed manifest have not been published. Recovery

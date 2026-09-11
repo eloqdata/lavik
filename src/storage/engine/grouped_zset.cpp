@@ -466,6 +466,59 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
                  .index_generation_ = partition.grouped_generations_[db_id]});
     if (!view.ok()) co_return view.status();
     if (operation.kind_ == SortedSetOperationKind::kLength) co_return result;
+    if (!ReadOnly(operation) && CanPrepareGroupedWriteUnlocked(partition)) {
+      try {
+        const auto snapshot =
+            CaptureCompactWriteSnapshot(store, partition, db_id);
+        PreparedOrderedMutation mutation;
+        auto& plan = mutation.plan_;
+        SortedSetMemberMutation members;
+        found = nullptr;
+        unlock.Unlock();
+        KEYLANE_FAULT_INJECT({
+          const auto paused =
+              co_await PauseGroupedWriteForTest(*store.worker_, key, "prepare");
+          if (!paused.ok()) co_return paused;
+        });
+        auto prepared = co_await ExecuteGroupedSortedSetLocked(
+            store, partition, db_id, key, digest, operation, *view, tx,
+            replication, mutation_precondition, &mutation);
+        if (!prepared.ok()) co_return prepared.status();
+        if (plan.changed_ && !plan.delete_key_) {
+          // The member-index builder also reads old ordered/prefix pages. Keep
+          // it in the unlocked phase; both plans still publish through one
+          // root.
+          KEYLANE_FAULT_INJECT({
+            const auto paused = co_await PauseGroupedWriteForTest(
+                *store.worker_, key, "members");
+            if (!paused.ok()) co_return paused;
+          });
+          auto member_plan = co_await PrepareSortedSetMembers(
+              store, partition, db_id, key, digest, *view, plan, true);
+          if (!member_plan.ok()) co_return member_plan.status();
+          members = std::move(*member_plan);
+        }
+        co_await store.store_state_mutex_.Lock();
+        unlock.Adopt();
+        const auto valid = ValidateGroupedWriteSnapshot(
+            store, partition, db_id, key, *view, snapshot,
+            mutation_precondition != nullptr
+                ? mutation_precondition
+                : (tx != nullptr ? &tx->mutation_precondition_ : nullptr));
+        if (!valid.ok()) co_return valid;
+        if (plan.changed_) {
+          const auto committed = co_await CommitGroupedOrderedMutationLocked(
+              store, partition, db_id, key, digest, *view, std::move(plan),
+              (*view)->version().root_.expire_at_ms_, tx, replication,
+              mutation_precondition, &members);
+          if (!committed.ok()) co_return committed;
+        }
+        co_return prepared;
+      } catch (const std::bad_alloc&) {
+        co_return absl::ResourceExhaustedError(
+            "OOM grouped Sorted Set operation allocation");
+      }
+    }
     // As with Hash reads, retain the shared key intent but release the store
     // mutex before a potentially long scan. Page readers revalidate this view.
     if (ReadOnly(operation)) unlock.Unlock();
@@ -644,7 +697,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const SortedSetOperation& operation, GroupedHashObject::Handle object,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    PreparedOrderedMutation* prepared) {
   if (!object || !object->is_ordered() ||
       object->ordered_directory().root().kind_ !=
           OrderedCollectionKind::kSortedSet)
@@ -715,7 +769,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
                                          "KEYLANE_FAIL_ZSET_ORDERED_READ_PAGE",
                                          i + 1))) co_return absl::
               UnavailableError("injected ordered-page read failure"););
-      if (ReadOnly(operation)) {
+      if (ReadOnly(operation) || prepared != nullptr) {
         co_await celer::Yield(*store.worker_);
         if (shutdown_flush_requested_)
           co_return absl::CancelledError(
@@ -795,7 +849,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           store, partition, db_id, key, digest,
           SortedSetOperation{.kind_ = SortedSetOperationKind::kRemove,
                              .members_ = removed},
-          object, tx, replication, mutation_precondition);
+          object, tx, replication, mutation_precondition, prepared);
       if (!deleted.ok()) co_return deleted.status();
       result.changed_ = deleted->changed_;
       result.length_ = deleted->length_;
@@ -902,7 +956,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         selected.insert(route->id_);
       }
       for (const auto id : selected) {
-        if (ReadOnly(operation)) {
+        if (ReadOnly(operation) || prepared != nullptr) {
           co_await celer::Yield(*store.worker_);
           if (shutdown_flush_requested_)
             co_return absl::CancelledError("member read cancelled by shutdown");
@@ -1002,6 +1056,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     plan.root_.item_count_ = result.length_;
     if (result.length_ == 0) {
       plan.delete_key_ = true;
+      if (prepared != nullptr) {
+        prepared->plan_ = std::move(plan);
+        co_return result;
+      }
       auto written = co_await CommitGroupedOrderedMutationLocked(
           store, partition, db_id, key, digest, object, std::move(plan),
           object->version().root_.expire_at_ms_, tx, replication,
@@ -1150,6 +1208,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     plan.root_.last_group_ = route.back().id_;
     plan.root_.group_count_ = route.size();
     plan.root_.next_group_id_ = next_id;
+    if (prepared != nullptr) {
+      prepared->pages_ = std::move(*working_admission);
+      prepared->plan_ = std::move(plan);
+      co_return result;
+    }
     auto written = co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(plan),
         object->version().root_.expire_at_ms_, tx, replication,

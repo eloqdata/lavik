@@ -669,7 +669,8 @@ struct ListOperation {
   bool count_provided_ = false;
   bool max_length_provided_ = false;
   // Only a single-key command retaining its key intent and database admission
-  // may opt into preparing an existing small inline value outside store state.
+  // may opt into preparing a new value or an existing small inline value
+  // outside store state. New values may be prepared directly as grouped pages.
   // Multi-key callers leave this false even when they have no durable tx;
   // storage independently excludes transactions and native candidate/loading.
   bool prepare_unlocked_ = false;

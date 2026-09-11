@@ -92,9 +92,14 @@ cmake --build bld-clang18-debug --target keylane keylane_grouped_hash_write_e2e_
 ctest --test-dir bld-clang18-debug -R '^keylane_grouped_(hash|ordered)_write_e2e$' --output-on-failure
 ```
 
-The compact collection write suite uses cold records and deterministic Debug
-pauses to verify that unrelated keys progress while the same key stays locked.
-It also checks command semantics, TTL, WATCH, cold recovery and grouped promotion:
+The collection write-concurrency suite uses cold compact and grouped records
+and deterministic Debug pauses to verify that unrelated keys progress while
+the same key stays locked. Grouped cases cover page preparation, Sorted Set
+member-index preparation, oversized extent IO and shutdown during that IO.
+It also checks command semantics, TTL, WATCH, EXEC/Lua, cold recovery and grouped
+promotion. Creation cases cover missing keys, compact and directly grouped
+values, both Sorted Set indexes, oversized extents, expired/deleted predecessors
+and allocation failure before publication:
 
 ```bash
 cmake --build bld-clang18-debug --target keylane keylane_compact_collection_write_e2e_test -j 8

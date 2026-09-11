@@ -1384,7 +1384,7 @@ if (BUILD_TESTING)
       COMMAND keylane_compact_collection_write_e2e_test $<TARGET_FILE:keylane>
     )
     set_tests_properties(keylane_compact_collection_write_e2e PROPERTIES
-      TIMEOUT 240 RUN_SERIAL TRUE
+      TIMEOUT 600 RUN_SERIAL TRUE
     )
 
     add_executable(keylane_grouped_ordered_write_e2e_test

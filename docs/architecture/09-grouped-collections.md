@@ -132,6 +132,26 @@ metadata before staging root bytes. Root index replacement and side-view
 publication then occur without suspension. Physical auxiliary writes alone
 make no user-visible mutation.
 
+Existing Hash/Set point writers and typed List/Sorted Set writers retain key
+intent and database admission while releasing worker store state for page reads
+and private mutation planning. This includes both Sorted Set graphs and retained
+EXEC/Lua key holds, but not native candidate ingestion. Plans retain their page
+admission through commit. Reacquisition checks population and logical root
+identity even for no-ops and last-element deletion; physical relocation alone
+is allowed. The writer refreshes GC coordinates and assigns durable revisions
+under store state. Full-image, promotion and random Set-pop adapters retain
+their separate preparation paths and share the same publication boundary.
+
+Ordinary single-key creation prepares initial pages without worker store state,
+including the Sorted Set member graph. Private plans own their scratch admission
+and contain placeholder incarnations, never published identities. The command
+keeps missing-key intent and database admission; before commit it validates
+population and command-time logical absence, allowing expired/tombstone
+predecessors to be reclaimed. Durable batch admission assigns one fresh
+incarnation to the root and every initial page in both graphs. Transactional
+creation and promotion of an existing compact value retain their separate
+preparation contracts.
+
 Sorted Set mutation planning derives member-index changes from complete
 ordered before/after pages, including full-image callback and import paths.
 Changed ordered pages, prefix snapshots and split retirements share the same

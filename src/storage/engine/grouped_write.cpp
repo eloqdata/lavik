@@ -83,7 +83,7 @@ StorageEngine::Impl::WriteHashGroupRecordLocked(
   if (external) {
     RecordPayloadCursor cursor(*encoder,
                                key_external ? key : std::string_view{});
-    auto written = co_await WriteExtentValueLocked(store, {}, {}, &cursor);
+    auto written = co_await WriteExtentValueLocked(store, {}, {}, &cursor, key);
     if (!written.ok()) co_return written.status();
     extents = std::move(*written);
     payload = EncodeManifest(*extents);

@@ -374,11 +374,34 @@ is allowed, and append resolves the current physical predecessor for retirement.
 The command's database admission remains held through publication. This applies to HSET/HMSET,
 SADD/SREM, ordinary single-key List writes, and ZADD/ZINCRBY/ZREM. Successful
 no-ops and transitions to empty or grouped values also validate before returning
-or publishing. Creation, multi-key operations, transactions, Stream writes,
-native candidate/loading paths, grouped records and external keys/values retain
+or publishing. Multi-key operations, transactions, Stream writes,
+native candidate/loading paths and compact external keys/values retain
 their separate locking contracts. Ordinary online replay can use the same
 guarded single-key paths. Ordinary String GET does not acquire the store-state
 mutex; String SET still acquires it for append-state mutation.
+
+Ordinary single-key Hash/Set insertion, List push and opted-in Sorted Set
+add/increment also prepare new collections outside worker store state. The
+command retains exclusive key intent even for an absent key, together with
+database admission. Preparation owns admitted private data, including initial
+group pages and both Sorted Set indexes when the new value is large. Publication
+revalidates population, writer/authority state and logical absence at the
+original command time; expired or tombstone predecessors may have moved or
+been reclaimed. Fresh graph incarnations are assigned together under store
+state only after durable batch admission. Preparation allocation failure
+publishes no key.
+Creation within transactions, multi-key and native candidate/loading adapters
+retains their separate preparation contracts.
+
+Existing grouped Hash/Set point writes and typed List/Sorted Set writes also
+prepare private pages without worker store state, including under retained
+EXEC/Lua key intents. They carry immutable predecessor metadata and admitted
+page ownership through preparation, then reacquire state and validate population
+and logical identity before any publication or successful no-op. Sorted Set
+preparation covers both the ordered and member graphs. GC-only physical moves
+are refreshed, not treated as conflicting logical writes. Random Set pops,
+full-image callbacks, promotion and candidate ingestion retain their separate
+preparation contracts; all paths share the same atomic grouped writer.
 
 Runtime indexes retain key identity, logical version, record coordinates, and
 the state needed to serve the current value. The physical block's owner and
@@ -460,6 +483,14 @@ commit slot is written and synchronized. Only after all children are durable
 can the root manifest record be appended. Failed construction queues already
 created extents for reclamation and fail-stops the writer on storage I/O
 failure.
+
+Extent allocation and buffer ownership are registered under worker store state.
+The foreground coroutine retains a pin on its unpublished extent and exclusive
+ownership of its bounded buffer while encoding and waiting for device writes
+and synchronization without that mutex. Completion reacquires store state before
+releasing the pin/buffer, observing writer failure or reclaiming an orphan.
+The manifest remains unpublished until all child extents are durable; shutdown
+drains the owning operation before destroying its storage state.
 
 Standalone replacements do not immediately retire the old durable record.
 The old version remains live in physical accounting until the replacement's

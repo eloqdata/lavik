@@ -28,7 +28,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     GroupedHashObject::Handle previous, OrderedCollectionMutationPlan plan,
     std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    SortedSetMemberMutation* prepared_members) {
   if (!plan.changed_) co_return absl::OkStatus();
   if (previous && (!previous->is_ordered() ||
                    plan.expected_sequence_ != previous->revision()))
@@ -164,13 +165,33 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   }
   // Derive both graphs before staging either one. This shared writer also
   // covers full-image callbacks and import, not only ZADD's typed fast path.
-  auto member_mutation = co_await PrepareSortedSetMembers(
-      store, partition, db_id, key, digest, previous, plan);
+  absl::StatusOr<SortedSetMemberMutation> member_mutation;
+  // Keep suspension out of ?: (GCC coroutine conditional lowering).
+  if (prepared_members != nullptr)
+    member_mutation = std::move(*prepared_members);
+  else
+    member_mutation = co_await PrepareSortedSetMembers(
+        store, partition, db_id, key, digest, previous, plan);
   if (!member_mutation.ok()) co_return member_mutation.status();
   auto& member_plan = member_mutation->plan_;
   if (value_type == ValueType::kSortedSet &&
-      (!previous || previous->has_member_index()))
+      (!previous || previous->has_member_index())) {
+    if (!previous && prepared_members != nullptr) {
+      if (member_plan.expected_sequence_ != 0)
+        co_return absl::AbortedError("prepared member creation is stale");
+      member_plan.root_.incarnation_ = revision;
+      for (auto& page : member_plan.writes_) page.incarnation_ = revision;
+    }
+    // Prepared pages keep the predecessor incarnation; the durable revision
+    // is assigned only after reacquiring store state and admitting this batch.
+    if (member_plan.root_.incarnation_ != plan.root_.incarnation_ ||
+        member_plan.root_.field_count_ != plan.root_.item_count_)
+      co_return absl::AbortedError("prepared member index is stale");
+    // An ordered-only topology rewrite may leave the member graph untouched;
+    // keep its existing root/revision instead of manufacturing a new version.
+    if (member_plan.changed_) member_plan.root_.revision_ = revision;
     plan.root_.member_index_ = member_plan.root_;
+  }
   auto root_payload = EncodeOrderedCollectionRoot(plan.root_);
   if (!root_payload.ok()) co_return root_payload.status();
   // Validate every indivisible field/envelope before the first disk write.
