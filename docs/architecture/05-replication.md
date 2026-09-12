@@ -232,7 +232,10 @@ do that. Revoking source authorizations, fencing, lease expiry, or replacing a
 control session still closes and joins export capabilities, while the armed
 hold continues to keep the shared history available for another authorized
 candidate. Removing the desired hold, losing the population, shutdown, or a
-process restart releases it.
+process restart releases it. Adding or removing the hold does not itself
+change the established export-preservation identity: an already-ONLINE
+replica stream can span the FDS-to-authorization interval without exposing an
+idle-history rotation gap.
 
 After the old authority is fenced, a typed frozen-source mode reuses the
 ordinary authorize-source directive, receipt, evidence, ledger, and native

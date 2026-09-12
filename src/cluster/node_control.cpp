@@ -64,6 +64,26 @@ bool LocalMember(const ServingState& state, const GroupView& group) {
                    state.SelfNodeIndex()) != group.replica_node_indices_.end();
 }
 
+bool SameEstablishedExportPreservationIdentity(
+    const PreparedGroupControlIdentity& left,
+    const PreparedGroupControlIdentity& right) {
+  // A source-history hold changes backlog retention, not the native
+  // source-to-target data relationship. Excluding it here closes the gap in
+  // which installing the hold would first tear down the ONLINE export and
+  // permit idle history rotation before the later authorization can arm it.
+  // Authority and topology counters remain part of this stronger FDS
+  // preservation gate even though ExportScope itself is deliberately stable
+  // across controlled-failover terms.
+  return std::tie(left.group_id_, left.group_term_, left.authority_version_,
+                  left.grant_revision_, left.config_epoch_,
+                  left.manifest_revision_, left.manifest_digest_,
+                  left.partition_replication_epoch_, left.members_) ==
+         std::tie(right.group_id_, right.group_term_, right.authority_version_,
+                  right.grant_revision_, right.config_epoch_,
+                  right.manifest_revision_, right.manifest_digest_,
+                  right.partition_replication_epoch_, right.members_);
+}
+
 // Rebuilds an immutable state while preserving every semantic field and the
 // worker stripe layout. Mutators are used only for local readiness and a
 // committed fence, keeping those transitions atomic at TopologyCache.
@@ -1033,7 +1053,7 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
           new_group->storage_ready_ == old_group.storage_ready_ &&
           old_control != nullptr &&
           new_control != prepared_state.control_groups_.end() &&
-          *old_control == *new_control;
+          SameEstablishedExportPreservationIdentity(*old_control, *new_control);
       const bool active_authority_retired =
           old_group.granted_ &&
           (new_group == nullptr ||

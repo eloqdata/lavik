@@ -1301,8 +1301,9 @@ TEST(MetaStateApply, MetaStoresSnapshotRoundTrip) {
   const std::string bytes = MustSerialize(stores);
 
   // Pin the current aggregate layout independently of its decoder. The
-  // eighth blob is an empty failover-recovery store for this fixture, between
-  // population manifests and audit; omitting it is not another valid v1.
+  // seventh blob is the newly added empty failover-recovery store for this
+  // fixture, between population manifests and the eighth (audit) blob;
+  // omitting it is not another valid v1.
   MetaWriter expected;
   expected.WriteU16(keylane::meta::kMetaFormatVersion);
   expected.WriteString(stores.identity_.Serialize());
@@ -1418,6 +1419,12 @@ TEST(MetaStateApply, FailoverRecoveryAppliesAgainstExactCommittedAnchors) {
   ASSERT_TRUE(stores.failover_recovery_.Find("g1").has_value());
   EXPECT_EQ(stores.failover_recovery_.Find("g1")->revision_, 9u);
 
+  const std::string state_after_first = MustSerialize(stores);
+  const MetaApplyResult replay = ApplyOk(stores, 9, MetaCommand{recovery});
+  EXPECT_EQ(replay, applied);
+  EXPECT_EQ(MustSerialize(stores), state_after_first);
+  EXPECT_EQ(stores.audit_.size(), 9u);
+
   const auto restored = MetaStores::Deserialize(MustSerialize(stores));
   ASSERT_TRUE(restored.ok()) << restored.status();
   EXPECT_EQ(restored->failover_recovery_.Find("g1"),
@@ -1440,6 +1447,24 @@ TEST(MetaStateApply, FailoverRecoveryAppliesAgainstExactCommittedAnchors) {
   // Release and clear are intentionally exercised by the typed terminal-owner
   // lifecycle tests. This anchor-only fixture has no operation owner and must
   // not manufacture one merely to bypass the production mutation gate.
+}
+
+TEST(MetaStateApply,
+     ExactFailoverRecoveryReplayUsesNoAdditionalSnapshotBudget) {
+  constexpr std::uint64_t kTestSnapshotLimit = 4096;
+
+  // A first apply still needs room for the audit append that follows dispatch.
+  EXPECT_FALSE(keylane::meta::detail::FailoverRecoveryFitsSnapshotBudget(
+      kTestSnapshotLimit - 1, /*exact_same_index_effect=*/false,
+      kTestSnapshotLimit));
+  // At the same serialized size, an exact replay adds neither recovery state
+  // nor another audit record and must remain accepted at the budget boundary.
+  EXPECT_TRUE(keylane::meta::detail::FailoverRecoveryFitsSnapshotBudget(
+      kTestSnapshotLimit - 1, /*exact_same_index_effect=*/true,
+      kTestSnapshotLimit));
+  EXPECT_FALSE(keylane::meta::detail::FailoverRecoveryFitsSnapshotBudget(
+      kTestSnapshotLimit + 1, /*exact_same_index_effect=*/true,
+      kTestSnapshotLimit));
 }
 
 TEST(MetaStateApply, MetaStoresDeserializeRejectsCorruption) {

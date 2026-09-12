@@ -2269,6 +2269,10 @@ absl::StatusOr<SubmitOperation> BuildControlledFailoverSubmission(
     return Invalid("controlled failover candidate plan is incomplete");
   }
   const MetaCandidateProgressObs& candidate = *plan.selected_;
+  // Member roles are placement metadata and do not rotate when authority
+  // moves. Bind both participants to the dynamic owner and their exact current
+  // assignments; requiring static primary/replica roles would reject a later
+  // failover back to the original owner.
   const auto former_member = std::find_if(
       group->members_.begin(), group->members_.end(), [&](const auto& member) {
         return member.node_id_ == group->record_.owner_ &&
@@ -2282,9 +2286,7 @@ absl::StatusOr<SubmitOperation> BuildControlledFailoverSubmission(
   if (candidate.node_id_ == group->record_.owner_ ||
       candidate.source_node_id_ != group->record_.owner_ ||
       former_member == group->members_.end() ||
-      former_member->role_ != MetaNodeRole::kPrimary ||
       candidate_member == group->members_.end() ||
-      candidate_member->role_ != MetaNodeRole::kReplica ||
       candidate.group_term_ != grant->group_term_ ||
       candidate.population_manifest_revision_ !=
           group->record_.population_manifest_revision_ ||

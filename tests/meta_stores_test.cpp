@@ -1828,6 +1828,7 @@ TEST(MetaFailoverRecoveryStore,
   ASSERT_TRUE(restored->Clear(clear, /*committed_index=*/45).ok());
   ASSERT_TRUE(restored->Clear(clear, /*committed_index=*/45).ok());
   EXPECT_FALSE(restored->Find(create.group_id_).has_value());
+  EXPECT_EQ(restored->Size(), 1u);
   EXPECT_EQ(restored->LastGeneration(create.group_id_),
             create.recovery_generation_);
   EXPECT_EQ(restored->LastRevision(create.group_id_), 45u);

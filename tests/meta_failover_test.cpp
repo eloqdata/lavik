@@ -1354,6 +1354,74 @@ TEST_F(ControlledFailoverSubmissionTest,
 }
 
 TEST_F(ControlledFailoverSubmissionTest,
+       AcceptsFormerStaticPrimaryAfterAuthorityMovesToStaticReplica) {
+  constexpr std::uint64_t kMovedTerm = kCurrentTerm + 1;
+  constexpr std::uint64_t kMovedAuthorityVersion = kAuthorityVersion + 1;
+  constexpr std::uint64_t kMovedGrantRevision = kGrantRevision + 1;
+  const MetaReplicationHistoryId moved_source_history = Bytes<20>(0x42);
+
+  BeginGroupTerm next_term;
+  next_term.group_id_ = group_id_;
+  next_term.expected_term_ = kCurrentTerm;
+  next_term.new_term_ = kMovedTerm;
+  ASSERT_TRUE(stores_.grant_.BeginGroupTerm(next_term).ok());
+
+  ActivateAuthority activate;
+  activate.group_id_ = group_id_;
+  activate.expected_term_ = kMovedTerm;
+  activate.new_owner_ = Node('b');
+  activate.grant_ = old_grant_;
+  activate.new_authority_version_ = kMovedAuthorityVersion;
+  ASSERT_TRUE(
+      stores_.grant_.ValidateActivate(activate, kMovedGrantRevision).ok());
+  ASSERT_TRUE(
+      stores_.grant_.ApplyGrantPart(activate, kMovedGrantRevision).ok());
+  ASSERT_TRUE(stores_.topology_.SetOwner(group_id_, Node('b')).ok());
+  ASSERT_TRUE(stores_.topology_.SetGroupTerm(group_id_, kMovedTerm).ok());
+  ASSERT_TRUE(
+      stores_.topology_.SetAuthorityVersion(group_id_, kMovedAuthorityVersion)
+          .ok());
+
+  const auto moved_group = stores_.topology_.FindGroup(group_id_);
+  ASSERT_TRUE(moved_group.has_value());
+  ASSERT_EQ(moved_group->record_.owner_, Node('b'));
+  const auto static_owner = std::find_if(
+      moved_group->members_.begin(), moved_group->members_.end(),
+      [&](const auto& member) { return member.node_id_ == Node('b'); });
+  const auto static_candidate = std::find_if(
+      moved_group->members_.begin(), moved_group->members_.end(),
+      [&](const auto& member) { return member.node_id_ == Node('a'); });
+  ASSERT_NE(static_owner, moved_group->members_.end());
+  ASSERT_NE(static_candidate, moved_group->members_.end());
+  EXPECT_EQ(static_owner->role_, MetaNodeRole::kReplica);
+  EXPECT_EQ(static_candidate->role_, MetaNodeRole::kPrimary);
+
+  MetaCandidateProgressObs candidate =
+      Candidate('a', former_assignment_, former_boot_, {31, 37});
+  candidate.group_term_ = kMovedTerm;
+  candidate.source_node_id_ = Node('b');
+  candidate.source_assignment_id_ = candidate_b_assignment_;
+  candidate.source_boot_incarnation_ = candidate_b_boot_;
+  candidate.source_replication_history_id_ = moved_source_history;
+  Admit(std::move(candidate));
+
+  auto submission = Build();
+  ASSERT_TRUE(submission.ok()) << submission.status();
+  auto intent = DecodeFailoverIntent(submission->intent_);
+  ASSERT_TRUE(intent.ok()) << intent.status();
+  EXPECT_EQ(intent->former_owner_node_id_, Node('b'));
+  EXPECT_EQ(intent->former_owner_assignment_id_, candidate_b_assignment_);
+  EXPECT_EQ(intent->former_owner_boot_id_, candidate_b_boot_);
+  EXPECT_EQ(intent->candidate_node_id_, Node('a'));
+  EXPECT_EQ(intent->candidate_assignment_id_, former_assignment_);
+  EXPECT_EQ(intent->candidate_boot_id_, former_boot_);
+  EXPECT_EQ(intent->group_term_, kMovedTerm + 1);
+  EXPECT_EQ(intent->authority_version_, kMovedAuthorityVersion);
+  EXPECT_EQ(intent->grant_revision_, kMovedGrantRevision);
+  EXPECT_EQ(intent->parent_history_id_, moved_source_history);
+}
+
+TEST_F(ControlledFailoverSubmissionTest,
        ProposalRejectsAWellFormedButNonSelectedCandidate) {
   Admit(Candidate('b', candidate_b_assignment_, candidate_b_boot_, {41, 43}));
   Admit(Candidate('c', candidate_c_assignment_, candidate_c_boot_, {31, 37}));

@@ -915,8 +915,8 @@ if (BUILD_TESTING)
         RUN_SERIAL TRUE
       )
 
-      # The tracer-bullet creator verifies the public Redis surface with the
-      # same redis-cli dependency required by the production command.
+      # Creation and controlled-failover acceptance both enter through the
+      # production creator, including its public redis-cli verification.
       find_program(KEYLANE_CLUSTER_CREATE_REDIS_CLI NAMES redis-cli)
       if (KEYLANE_CLUSTER_CREATE_REDIS_CLI)
         add_test(
@@ -929,6 +929,21 @@ if (BUILD_TESTING)
                   ${KEYLANE_CLUSTER_CREATE_REDIS_CLI}
         )
         set_tests_properties(meta_integration.gate_cluster_create PROPERTIES
+          LABELS meta-integration
+          TIMEOUT 300
+          RUN_SERIAL TRUE
+        )
+
+        add_test(
+          NAME meta_integration.gate_controlled_failover
+          COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_controlled_failover.py
+                  $<TARGET_FILE:keylane-meta>
+                  $<TARGET_FILE:keylane>
+                  $<TARGET_FILE:keylane-ctl>
+                  ${KEYLANE_CLUSTER_CREATE_REDIS_CLI}
+        )
+        set_tests_properties(meta_integration.gate_controlled_failover PROPERTIES
           LABELS meta-integration
           TIMEOUT 300
           RUN_SERIAL TRUE

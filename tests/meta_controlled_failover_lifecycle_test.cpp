@@ -1,13 +1,11 @@
 // Component-integration gate for the real controlled-failover owner loop.
 //
-// The public process harness cannot yet create a second Ready population:
-// cluster-create v1 is intentionally single-Data, assigning a replica does not
-// populate it, and the legacy Admin candidate observation is diagnostic-only.
-// This gate therefore keeps the production surface closed and drives the same
-// FDS acknowledgement, directive receipt, observation, and finite-lease seams
-// that authenticated Data sessions publish. Meta itself is real: a single-node
-// NuRaft server, MetaCoordinator, state machine, WAL, and
-// MetaControlledFailoverReconciler::Run execute the complete workflow.
+// This component gate drives FDS acknowledgements, directive receipts,
+// observations, and finite-lease seams directly so every workflow cut can be
+// made deterministic. The separate real-process controlled-failover gate
+// covers production Meta/Data transport and Redis routing. Meta itself remains
+// real here: a single-node NuRaft server, MetaCoordinator, state machine, WAL,
+// and MetaControlledFailoverReconciler::Run execute the complete workflow.
 
 #include <unistd.h>
 

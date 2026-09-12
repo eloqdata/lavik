@@ -2316,6 +2316,42 @@ TEST(NodeControlInstallerTest,
 }
 
 TEST(NodeControlInstallerTest,
+     SourceHistoryHoldChangesPreserveAnOtherwiseExactOnlineExport) {
+  DynamicControl control;
+  control.actions.receives_directives_ = true;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              FullState(MakeState(), 3), Basis(10, 2)))
+                  .ok());
+  ASSERT_EQ(control.actions.preserve_established_exports_.size(), 1U);
+  EXPECT_FALSE(control.actions.preserve_established_exports_.back());
+
+  // The hold is retention policy, not native export-session identity. Adding
+  // it must leave an already-ONLINE replica stream continuous until the
+  // matching authorization arms the hold; otherwise idle history cleanup can
+  // rotate the backlog in the gap between FDS and directive delivery.
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              WithSourceHistoryHold(FullState(MakeState(), 4)),
+                              Basis(11, 3)))
+                  .ok());
+  ASSERT_EQ(control.actions.preserve_established_exports_.size(), 2U);
+  EXPECT_TRUE(control.actions.preserve_established_exports_.back());
+  ASSERT_EQ(control.actions.source_history_hold_reconciliations_.size(), 2U);
+  EXPECT_EQ(control.actions.source_history_hold_reconciliations_.back(),
+            SourceHistoryHold());
+
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              FullState(MakeState(), 5), Basis(12, 4)))
+                  .ok());
+  ASSERT_EQ(control.actions.preserve_established_exports_.size(), 3U);
+  EXPECT_TRUE(control.actions.preserve_established_exports_.back());
+  ASSERT_EQ(control.actions.source_history_hold_reconciliations_.size(), 3U);
+  EXPECT_FALSE(
+      control.actions.source_history_hold_reconciliations_.back().has_value());
+}
+
+TEST(NodeControlInstallerTest,
      FullStateWaitsForSourceHistoryHoldAndPropagatesFailure) {
   DynamicControl control;
   control.actions.receives_directives_ = true;

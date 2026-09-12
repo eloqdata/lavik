@@ -159,6 +159,18 @@ struct MetaApplyResult {
   bool operator==(const MetaApplyResult&) const = default;
 };
 
+namespace detail {
+
+// Pure budget seam used by SetFailoverRecovery apply and its boundary tests.
+// `serialized_size` already includes the candidate recovery effect. An exact
+// same-index effect also proves that the corresponding audit record is part
+// of the current aggregate, so replay has no additional snapshot growth.
+bool FailoverRecoveryFitsSnapshotBudget(std::uint64_t serialized_size,
+                                        bool exact_same_index_effect,
+                                        std::uint64_t snapshot_byte_limit);
+
+}  // namespace detail
+
 // Process-local NuRaft completion payload. It is not part of the durable WAL
 // or snapshot format; carrying the apply verdict in cmd_result avoids racing
 // a later audit rotation/prune when the proposer resumes.

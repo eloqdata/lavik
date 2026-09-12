@@ -805,10 +805,15 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
+  // Set accepts a same-index no-op only when the entire command effect is
+  // already present. A different command colliding at this index rejected
+  // above, before it can receive replay budget treatment.
+  const bool exact_same_index_effect =
+      current.has_value() && current->revision_ == log_index;
   const auto encoded = candidate.Serialize();
   if (!encoded.ok()) return Rejected(encoded.status(), std::move(summary));
-  if (encoded->size() > kMaxMetaSnapshotBytes ||
-      kMaximumAuditSnapshotGrowth > kMaxMetaSnapshotBytes - encoded->size()) {
+  if (!detail::FailoverRecoveryFitsSnapshotBudget(
+          encoded->size(), exact_same_index_effect, kMaxMetaSnapshotBytes)) {
     return Rejected(
         "failover recovery exceeds the remaining snapshot byte budget",
         std::move(summary));
@@ -1377,6 +1382,18 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 }  // namespace
+
+bool detail::FailoverRecoveryFitsSnapshotBudget(
+    std::uint64_t serialized_size, bool exact_same_index_effect,
+    std::uint64_t snapshot_byte_limit) {
+  if (serialized_size > snapshot_byte_limit) return false;
+  // The candidate encoding already includes the recovery effect. An exact
+  // same-index replay also includes that index's existing audit record, so
+  // neither half can grow. Every first apply or later revision still reserves
+  // the maximum audit append before publishing the candidate recovery store.
+  return exact_same_index_effect ||
+         kMaximumAuditSnapshotGrowth <= snapshot_byte_limit - serialized_size;
+}
 
 absl::Status ValidateCommittedDirectiveAnchor(
     const MetaStores& stores, const MetaDirectiveSpec& directive) {

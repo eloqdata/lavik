@@ -470,11 +470,7 @@ bool MetaFailoverRecoveryStore::SourceAssignmentInUse(
       });
 }
 
-std::size_t MetaFailoverRecoveryStore::Size() const {
-  return static_cast<std::size_t>(std::count_if(
-      entries_.begin(), entries_.end(),
-      [](const auto& item) { return item.second.record_.has_value(); }));
-}
+std::size_t MetaFailoverRecoveryStore::Size() const { return entries_.size(); }
 
 std::string MetaFailoverRecoveryStore::Serialize() const {
   MetaWriter writer;

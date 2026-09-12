@@ -482,14 +482,20 @@ authorize-source directive must first pass the full control and source-ledger
 checks. Fence, lease expiry, and session replacement still revoke and join
 source capabilities without deleting the armed hold, allowing a later
 authorized candidate to reuse the shared backlog. Removing the hold from FDS,
-population loss, storage failure, shutdown, or restart releases it.
+population loss, storage failure, shutdown, or restart releases it. The hold
+is excluded from the established export-preservation identity, so adding or
+removing it alone cannot tear down an otherwise unchanged ONLINE stream and
+open an idle-history rotation gap.
 
 A frozen-source authorization remains a current Meta directive while its
-selected candidate catches up. Full-state installation still clears the prior
-session's live export first, then exact replay of the retained directive and
-its stable export scope reauthorizes access to the held shared history. The
-directive is replaced only after the candidate reports every flow at the
-required frontier; the projected hold never substitutes for this capability.
+selected candidate catches up. Full-state installation always clears the
+prior control session's admission; when its complete data and authority
+identity remains unchanged, the already-ONLINE export may stay quarantined
+while exact replay of the retained directive reauthorizes its stable export
+scope. Stronger authority or population changes still cancel and join the
+stream. The directive is replaced only after the candidate reports every flow
+at the required frontier; the projected hold never substitutes for this
+capability.
 
 The encoded directive schema retains bounded `payload`, `preconditions`, and
 `force` fields. V1 appends `initialize-empty-population` as directive value 4
@@ -774,7 +780,10 @@ Groups of initially unregistered, fenced primary/replica Data nodes. It covers
 automatic and explicit slot layouts, interactive and `--yes` confirmation,
 real sparse-population initialization, native full rebuild and continued
 replication, Redis routing/redirect/cross-slot behavior, and exact node-level
-diagnostics when one replica is stopped.
+diagnostics when one replica is stopped. The controlled-failover process gate
+then carries one replicated write through the production operator command,
+requires the promoted owner to serve it under term 2, and proves that repeated
+writes to the former owner return only `MOVED` after cutover.
 
 ## Source map
 
@@ -795,5 +804,5 @@ diagnostics when one replica is stopped.
 | Startup wiring, storage-ready publication, and SIGHUP reload | `src/redis/server.cpp` |
 | Cluster configuration directives and validation | `include/keylane/server.h`, `src/config.cpp`, `app/keylane.cpp` |
 | Decision matrix, parser, publication, source-hold/frozen-source/activation, and concurrency unit tests | `tests/cluster_authority_test.cpp`, `tests/cluster_control_port_test.cpp`, `tests/cluster_topology_test.cpp`, `tests/cluster_command_test.cpp`, `tests/control_protocol_test.cpp`, `tests/meta_control_test.cpp`, `tests/node_control_test.cpp` |
-| Real-process Meta/Data discovery, failover, mTLS, initial creation, and shutdown gates | `tests/meta_integration/gate_data_control.py`, `tests/meta_integration/gate_cluster_create.py` |
+| Real-process Meta/Data discovery, controlled failover, mTLS, initial creation, and shutdown gates | `tests/meta_integration/gate_data_control.py`, `tests/meta_integration/gate_cluster_create.py`, `tests/meta_integration/gate_controlled_failover.py` |
 | Static-cluster routing, admission, policy, and reload end-to-end suite | `tests/cluster_e2e_test.cpp` |
