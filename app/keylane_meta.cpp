@@ -708,6 +708,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   nuraft::ptr<MetaStateMachine> state_machine(std::move(*machine_or));
+  state_machine->AttachStateMgr(state_mgr);
 
   MetaAsioTransportConfig transport_config;
   transport_config.bind_address_ = raft_endpoint->host_;

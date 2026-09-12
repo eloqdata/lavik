@@ -11,8 +11,10 @@
 #include <utility>
 
 #include "absl/status/status.h"
+#include "keylane/fault_injection.h"
 #include "keylane/meta/cluster_create.h"
 #include "keylane/meta/commands.h"
+#include "keylane/meta/nuraft_state_mgr.h"
 #include "libnuraft/buffer.hxx"
 #include "libnuraft/cluster_config.hxx"
 #include "libnuraft/snapshot.hxx"
@@ -139,11 +141,26 @@ absl::StatusOr<std::unique_ptr<MetaStateMachine>> MetaStateMachine::Open(
     return ErrnoStatus("mkdir", data_dir);
   }
 
+  std::unique_ptr<MetaStateMachine> machine(new MetaStateMachine(data_dir));
+  if (auto status = machine->LoadLatestSnapshot(); !status.ok()) return status;
+
+  try {
+    machine->writer_thread_ =
+        std::thread(&MetaStateMachine::WriterMain, machine.get());
+  } catch (const std::system_error& e) {
+    return absl::Status(
+        absl::StatusCode::kInternal,
+        std::string("snapshot writer thread start failed: ") + e.what());
+  }
+  return machine;
+}
+
+absl::Status MetaStateMachine::LoadLatestSnapshot() {
   // Find the newest intact snapshot file; only the latest (plus in-flight
   // pins) is ever retained, so at most one candidate is expected.
   uint64_t latest_idx = 0;
   bool found = false;
-  for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
+  for (const auto& entry : std::filesystem::directory_iterator(data_dir_)) {
     const std::string name = entry.path().filename().string();
     if (name.rfind("snapshot_", 0) != 0) continue;
     if (name.size() < 5 || name.compare(name.size() - 4, 4, ".dat") != 0) {
@@ -162,32 +179,41 @@ absl::StatusOr<std::unique_ptr<MetaStateMachine>> MetaStateMachine::Open(
     }
   }
 
-  std::unique_ptr<MetaStateMachine> machine(new MetaStateMachine(data_dir));
   if (found) {
     SnapshotData data;
-    absl::Status status = machine->ReadSnapshotFileLocked(latest_idx, data);
+    absl::Status status = ReadSnapshotFileLocked(latest_idx, data);
     if (!status.ok()) return status;
     // A snapshot whose envelope does not decode is fail-stop-class corruption
     // (MetaStores::Deserialize is strict; the same bytes fail identically on
     // every node) — boot refuses the directory loudly.
     absl::StatusOr<MetaStores> stores = MetaStores::Deserialize(data.envelope_);
     if (!stores.ok()) return stores.status();
-    machine->stores_ = std::move(*stores);
-    machine->last_snapshot_ = data.snapshot_;
-    machine->snapshots_[latest_idx] = std::move(data);
-    machine->last_committed_idx_ = latest_idx;
-    machine->last_state_change_idx_ = latest_idx;
+    stores_ = std::move(*stores);
+    last_snapshot_ = data.snapshot_;
+    snapshots_[latest_idx] = std::move(data);
+    last_committed_idx_ = latest_idx;
+    last_state_change_idx_ = latest_idx;
   }
 
-  try {
-    machine->writer_thread_ =
-        std::thread(&MetaStateMachine::WriterMain, machine.get());
-  } catch (const std::system_error& e) {
-    return absl::Status(
-        absl::StatusCode::kInternal,
-        std::string("snapshot writer thread start failed: ") + e.what());
-  }
-  return machine;
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::optional<MetaSnapshotMembership>>
+MetaStateMachine::ReadSnapshotMembership(const std::string& data_dir) {
+  // The startup-only second read avoids accepting config evidence from a
+  // corrupt payload, without starting background work or retaining two stores.
+  auto reader =
+      std::unique_ptr<MetaStateMachine>(new MetaStateMachine(data_dir));
+  if (auto status = reader->LoadLatestSnapshot(); !status.ok()) return status;
+  if (reader->last_snapshot_ == nullptr) return std::nullopt;
+  return MetaSnapshotMembership{reader->last_snapshot_->get_last_log_idx(),
+                                reader->last_snapshot_->get_last_config(),
+                                reader->stores_.identity_.MetaMembers()};
+}
+
+void MetaStateMachine::AttachStateMgr(std::weak_ptr<NuraftStateMgr> state_mgr) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  state_mgr_ = std::move(state_mgr);
 }
 
 MetaStores MetaStateMachine::StoresSnapshot() const {
@@ -311,6 +337,15 @@ nuraft::ptr<nuraft::buffer> MetaStateMachine::commit(nuraft::ulong log_idx,
     // for this commit are both visible.
     last_committed_idx_ = log_idx;
     last_state_change_idx_ = log_idx;
+    if (const auto manager = state_mgr_.lock()) {
+      if (auto status =
+              manager->ReconcileCommittedBindings(stores_.identity_, log_idx);
+          !status.ok()) {
+        spdlog::critical("committed Meta binding reconciliation failed: {}",
+                         status.message());
+        std::abort();
+      }
+    }
     // Coordinator commit-event sink: still under the state mutex, so consumers
     // observe the event atomically with the apply. The sink contract
     // (state_machine.h) keeps this O(1) and non-blocking.
@@ -334,10 +369,20 @@ void MetaStateMachine::commit_config(
   // transition; the configuration entry itself touches no store. NuRaft may
   // deliver a configuration callback after a newer ordinary commit has
   // already advanced the visible cursor, so this hook must never regress it.
+  std::lock_guard<std::mutex> lock(mutex_);
   nuraft::ulong current = last_committed_idx_.load(std::memory_order_relaxed);
   while (current < log_idx && !last_committed_idx_.compare_exchange_weak(
                                   current, log_idx, std::memory_order_release,
                                   std::memory_order_relaxed)) {
+  }
+  if (const auto manager = state_mgr_.lock()) {
+    if (auto status = manager->ReconcileCommittedBindings(
+            stores_.identity_, last_committed_idx_.load());
+        !status.ok()) {
+      spdlog::critical("committed config binding reconciliation failed: {}",
+                       status.message());
+      std::abort();
+    }
   }
 }
 
@@ -575,6 +620,20 @@ bool MetaStateMachine::apply_snapshot(nuraft::snapshot& s) {
     spdlog::error("meta state machine: snapshot {} decode failed: {}", idx,
                   stores.status().message());
     return false;
+  }
+  // The received snapshot file is already durable, so it is also the redo
+  // authority if a crash interrupts config/baseline/marker publication here.
+  KEYLANE_MAYBE_CRASH_AT("meta-snapshot-before-membership");
+  if (const auto manager = state_mgr_.lock()) {
+    const MetaSnapshotMembership membership{idx,
+                                            data.snapshot_->get_last_config(),
+                                            stores->identity_.MetaMembers()};
+    if (auto status = manager->InstallSnapshotMembership(membership);
+        !status.ok()) {
+      spdlog::error("snapshot membership installation failed: {}",
+                    status.message());
+      return false;
+    }
   }
   stores_ = std::move(*stores);
   last_snapshot_ = data.snapshot_;

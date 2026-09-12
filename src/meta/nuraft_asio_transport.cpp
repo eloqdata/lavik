@@ -97,40 +97,6 @@ std::optional<MetaMemberIdentity> FindConfiguredMember(
   return std::nullopt;
 }
 
-absl::StatusOr<bool> ConfigBindingsConverged(
-    const nuraft::ptr<nuraft::cluster_config>& config,
-    const MetaStores& stores) {
-  if (config == nullptr) return false;
-  const auto members = stores.identity_.MetaMembers();
-  const std::size_t active_bindings = std::count_if(
-      members.begin(), members.end(),
-      [](const auto& member) { return !member.retired_; });
-  if (active_bindings != config->get_servers().size()) {
-    return false;
-  }
-  for (const auto& member : config->get_servers()) {
-    if (member == nullptr) {
-      return absl::DataLossError("null member in durable Raft config");
-    }
-    auto descriptor = MetaMemberIdentity::DecodeAux(member->get_aux());
-    if (!descriptor.ok() || descriptor->server_id_ != member->get_id()) {
-      return absl::DataLossError("invalid descriptor in durable Raft config");
-    }
-    const auto binding = stores.identity_.FindMetaMember(
-        static_cast<std::uint32_t>(member->get_id()));
-    if (!binding.has_value()) return false;
-    if (binding->retired_ || binding->principal_ != descriptor->principal_ ||
-        binding->data_control_endpoint_ !=
-            descriptor->data_control_endpoint_ ||
-        binding->ctl_endpoint_ !=
-            std::optional<std::string>(descriptor->ctl_endpoint_)) {
-      return absl::PermissionDeniedError(
-          "Raft config descriptor conflicts with identity binding");
-    }
-  }
-  return true;
-}
-
 absl::Status VerifyPeer(const nuraft::asio_service::meta_cb_params& params,
                         std::span<const std::string> uri_sans,
                         const nuraft::ptr<NuraftStateMgr>& state_mgr,
@@ -185,32 +151,6 @@ absl::Status VerifyPeer(const nuraft::asio_service::meta_cb_params& params,
     if (!certificate.ok()) return certificate;
   }
   const MetaStores stores = state_machine->StoresSnapshot();
-  if (state_mgr->initial_bindings_pending() ||
-      state_mgr->waiting_joiner_catchup_pending()) {
-    const auto durable_config = state_mgr->load_config();
-    auto converged = ConfigBindingsConverged(durable_config, stores);
-    if (!converged.ok()) return converged.status();
-    if (*converged) {
-      if (state_mgr->initial_bindings_pending()) {
-        if (absl::Status status = state_mgr->CompleteInitialBindings(
-                state_machine->last_commit_index());
-            !status.ok()) {
-          return status;
-        }
-      }
-      if (state_mgr->waiting_joiner_catchup_pending() &&
-          durable_config != nullptr &&
-          durable_config->get_server(state_mgr->server_id()) != nullptr &&
-          state_machine->last_commit_index() >=
-              durable_config->get_log_idx()) {
-        if (absl::Status status = state_mgr->CompleteWaitingJoinerCatchup(
-                state_machine->last_commit_index());
-            !status.ok()) {
-          return status;
-        }
-      }
-    }
-  }
   const auto committed = stores.identity_.FindMetaMember(
       static_cast<std::uint32_t>(params.src_id_));
   if (!committed.has_value()) {

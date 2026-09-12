@@ -58,13 +58,13 @@
 //     than the snapshot index (safe via replay idempotency, but not exact).
 //   - ASYNC WRITE: the framed image is handed to the dedicated snapshot
 //     writer thread, which performs the file IO (tmp + fdatasync + rename +
-//     directory fsync) and only then invokes when_done — the commit thread
-//     never blocks on durability IO. The core compacts the log only after
-//     when_done(true) (on_snapshot_completed), so a durable snapshot always
-//     precedes log truncation. A write failure rejects the snapshot via
-//     when_done(false), which only skips this compaction round; consecutive
-//     failures are counted by consecutive_snapshot_failures() for replay
-//     observability and alerting.
+//     directory fsync) and only then invokes when_done — snapshot publication
+//     does not block the commit thread on durability IO. The core compacts the
+//     log only after when_done(true) (on_snapshot_completed), so a durable
+//     snapshot always precedes log truncation. A write failure rejects the
+//     snapshot via when_done(false), which only skips this compaction round;
+//     consecutive failures are counted by consecutive_snapshot_failures() for
+//     replay observability and alerting.
 //   - SIZE FAIL-SAFE: MetaStores::Serialize fails beyond
 //     kMaxMetaSnapshotBytes; create_snapshot rejects the round and
 //     alerts instead of silently truncating.
@@ -78,6 +78,11 @@
 //     the snapshot file before apply_snapshot() loads it — a received
 //     snapshot is durable before it is applied; apply_snapshot() returning
 //     false is the core's designed path into state_mgr::system_exit.
+//     Apply synchronously reconciles membership through the attached state
+//     manager before publishing the replacement stores; startup redoes that
+//     reconciliation from the durable snapshot if any intermediate write was
+//     interrupted. Ordinary committed apply also closes local binding lifecycle
+//     markers synchronously, independently of transport callbacks.
 //     Assembly is POSITIONALLY EXACTLY-ONCE: NuRaft has no in-flight guard on
 //     install_snapshot requests (the leader resends the current sync-ctx
 //     offset on every append tick until a response advances it, client
@@ -141,6 +146,16 @@ namespace keylane::meta {
 using MetaCommitEventSink =
     std::function<void(std::uint64_t log_index, const MetaApplyResult&)>;
 
+class NuraftStateMgr;
+
+// Membership evidence extracted only after the complete snapshot frame and
+// MetaStores payload have passed their normal recovery validation.
+struct MetaSnapshotMembership {
+  std::uint64_t applied_index_ = 0;
+  nuraft::ptr<nuraft::cluster_config> config_;
+  std::vector<MetaMemberRecord> bindings_;
+};
+
 class MetaStateMachine : public nuraft::state_machine {
  public:
   // Byte granularity of the bounded logical snapshot objects streamed to
@@ -151,6 +166,19 @@ class MetaStateMachine : public nuraft::state_machine {
   // if any. Without a snapshot the machine starts empty at commit index 0.
   static absl::StatusOr<std::unique_ptr<MetaStateMachine>> Open(
       const std::string& data_dir);
+
+  // Reads the same validated snapshot as Open(), without starting a writer.
+  // State-manager startup uses its embedded config before opening transport;
+  // a snapshot-covered membership change must never be lost to an older
+  // cluster_config.dat. No snapshot returns nullopt.
+  static absl::StatusOr<std::optional<MetaSnapshotMembership>>
+  ReadSnapshotMembership(const std::string& data_dir);
+
+  // Attach before starting NuRaft. Committed apply synchronously reconciles
+  // local membership durability, including on followers and snapshot install.
+  // The weak reference avoids ownership cycles. Lock order is SM -> state
+  // manager; the state manager never calls a live state machine while locked.
+  void AttachStateMgr(std::weak_ptr<NuraftStateMgr> state_mgr);
 
   ~MetaStateMachine() override;
 
@@ -234,6 +262,8 @@ class MetaStateMachine : public nuraft::state_machine {
   bool apply_snapshot(nuraft::snapshot& s) override;
 
  private:
+  absl::Status LoadLatestSnapshot();
+
   struct SnapshotData {
     nuraft::ptr<nuraft::snapshot> snapshot_;
     std::string envelope_;  // serialized MetaStores (the streamed payload)
@@ -286,6 +316,7 @@ class MetaStateMachine : public nuraft::state_machine {
   // header's transmission contract).
   std::map<uint64_t, uint32_t> pinned_snapshots_;
   nuraft::ptr<nuraft::snapshot> last_snapshot_;
+  std::weak_ptr<NuraftStateMgr> state_mgr_;
   // Receive-side accumulation for an in-flight install_snapshot.
   std::string receiving_bytes_;
   uint64_t receiving_idx_ = 0;

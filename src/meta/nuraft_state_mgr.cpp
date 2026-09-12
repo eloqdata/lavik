@@ -14,9 +14,11 @@
 #include <utility>
 
 #include "absl/status/status.h"
+#include "keylane/fault_injection.h"
 #include "keylane/meta/encoding.h"
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/nuraft_log_store.h"
+#include "keylane/meta/state_machine.h"
 #include "keylane/numeric_endpoint.h"
 #include "libnuraft/buffer.hxx"
 #include "libnuraft/cluster_config.hxx"
@@ -447,6 +449,163 @@ bool SameConfigVersion(const nuraft::ptr<nuraft::cluster_config>& left,
          left->get_prev_log_idx() == right->get_prev_log_idx();
 }
 
+// Extra bindings are legitimate during two-phase membership changes. Genesis
+// completion also accepts retired tombstones: they prove the original binding
+// committed, without granting that member permission to rejoin.
+absl::StatusOr<bool> BindingsCoverConfig(
+    const nuraft::ptr<nuraft::cluster_config>& config,
+    const std::vector<MetaMemberRecord>& bindings, bool allow_retired) {
+  bool complete = true;
+  for (const auto& server : config->get_servers()) {
+    auto descriptor = MetaMemberIdentity::DecodeAux(server->get_aux());
+    if (!descriptor.ok()) return descriptor.status();
+    const auto binding =
+        std::find_if(bindings.begin(), bindings.end(), [&](const auto& record) {
+          return record.server_id_ ==
+                 static_cast<std::uint32_t>(server->get_id());
+        });
+    if (binding == bindings.end()) {
+      complete = false;
+      continue;
+    }
+    if ((!allow_retired && binding->retired_) ||
+        binding->principal_ != descriptor->principal_ ||
+        binding->data_control_endpoint_ != descriptor->data_control_endpoint_ ||
+        binding->ctl_endpoint_ != descriptor->ctl_endpoint_) {
+      return absl::DataLossError(
+          "committed binding conflicts with Meta config");
+    }
+  }
+  return complete;
+}
+
+struct SnapshotMembershipPlan {
+  bool install_ = false;
+  bool publish_baseline_ = false;
+  bool complete_initial_ = false;
+  bool complete_waiting_ = false;
+  std::uint64_t watermark_ = 0;
+};
+
+absl::StatusOr<SnapshotMembershipPlan> PlanSnapshotMembership(
+    const MetaSnapshotMembership& snapshot,
+    const nuraft::ptr<nuraft::cluster_config>& current,
+    const nuraft::ptr<nuraft::cluster_config>& initial, bool waiting,
+    std::int32_t local_id, std::uint64_t baseline_index) {
+  NuraftMemberConfig local;
+  local.server_id_ = local_id;
+  local.principal_ = "keylane://meta/" + std::to_string(local_id);
+  if (auto status = ValidateLoadedConfig(snapshot.config_, local,
+                                         /*require_local=*/false);
+      !status.ok())
+    return status;
+  const auto snapshot_config_index = snapshot.config_->get_log_idx();
+  if (snapshot.applied_index_ == 0 ||
+      snapshot_config_index > snapshot.applied_index_) {
+    return absl::DataLossError("snapshot does not cover its Meta config");
+  }
+  // Compare configuration-entry indices, not the snapshot's applied index.
+  // A later disk config can belong to the durable, un-replayed WAL suffix;
+  // startup separately verifies that exact entry before enabling elections.
+  if (current->get_log_idx() > snapshot_config_index) {
+    if (current->get_log_idx() <= snapshot.applied_index_) {
+      return absl::DataLossError(
+          "snapshot contradicts covered durable Meta config");
+    }
+    return SnapshotMembershipPlan{};
+  }
+  // The waiting joiner's zero-index singleton is a placeholder, not a config
+  // from the existing cluster's history.
+  const bool placeholder = waiting && current->get_log_idx() == 0 &&
+                           current->get_servers().size() == 1 &&
+                           current->get_server(local_id);
+  if (current->get_log_idx() == snapshot_config_index && !placeholder &&
+      !SameConfigVersion(current, snapshot.config_)) {
+    return absl::DataLossError("same-index Meta configurations conflict");
+  }
+
+  SnapshotMembershipPlan plan;
+  plan.install_ = true;
+  if (initial != nullptr) {
+    auto covered = BindingsCoverConfig(initial, snapshot.bindings_,
+                                       /*allow_retired=*/true);
+    if (!covered.ok()) return covered.status();
+    plan.complete_initial_ = *covered;
+    if (!*covered && !SameMemberDescriptors(initial, snapshot.config_)) {
+      return absl::DataLossError(
+          "snapshot changes membership without genesis bindings");
+    }
+  }
+  auto covered = BindingsCoverConfig(snapshot.config_, snapshot.bindings_,
+                                     /*allow_retired=*/false);
+  if (!covered.ok()) return covered.status();
+  // A local snapshot can precede the final binding commands while the disk
+  // baseline already records their completion. Preserve that later watermark
+  // so ordinary WAL replay remains possible; a partial snapshot cannot lower
+  // it.
+  const bool replay_baseline = SameConfigVersion(current, snapshot.config_) &&
+                               snapshot.applied_index_ < baseline_index;
+  if (!*covered && !replay_baseline &&
+      (initial == nullptr || plan.complete_initial_)) {
+    return absl::DataLossError("snapshot is missing configured Meta bindings");
+  }
+  plan.publish_baseline_ = *covered || replay_baseline;
+  plan.complete_waiting_ =
+      waiting && *covered && snapshot.config_->get_server(local_id) != nullptr;
+  plan.watermark_ = snapshot.applied_index_;
+  if (SameConfigVersion(current, snapshot.config_)) {
+    plan.watermark_ = std::max(plan.watermark_, baseline_index);
+  }
+  return plan;
+}
+
+// The validated snapshot is durable before any of these writes. Every crash
+// prefix can therefore redo this same transaction before transport starts.
+absl::Status PersistSnapshotMembership(const std::string& data_dir,
+                                       const MetaSnapshotMembership& snapshot,
+                                       const SnapshotMembershipPlan& plan) {
+  if (!plan.install_) return absl::OkStatus();
+  if (plan.publish_baseline_) {
+    const auto baseline =
+        EncodeTransportBindingBaseline(*snapshot.config_, plan.watermark_);
+    if (auto status = WriteFileAtomicallyAt(data_dir, "transport_bindings.next",
+                                            *baseline);
+        !status.ok())
+      return status;
+    KEYLANE_MAYBE_CRASH_AT("meta-snapshot-after-candidate");
+  }
+  const auto config = snapshot.config_->serialize();
+  if (auto status =
+          WriteFileAtomicallyAt(data_dir, "cluster_config.dat", *config);
+      !status.ok())
+    return status;
+  KEYLANE_MAYBE_CRASH_AT("meta-snapshot-after-config");
+  if (plan.publish_baseline_) {
+    if (auto status = RenameFileDurably(data_dir, "transport_bindings.next",
+                                        "transport_bindings.dat");
+        !status.ok())
+      return status;
+    KEYLANE_MAYBE_CRASH_AT("meta-snapshot-after-baseline");
+  }
+  if (plan.complete_initial_) {
+    const auto marker = BufferFrom(kInitialBindingsCompleteMarker);
+    if (auto status = WriteFileAtomicallyAt(
+            data_dir, "initial_bindings_complete.dat", *marker);
+        !status.ok())
+      return status;
+    KEYLANE_MAYBE_CRASH_AT("meta-snapshot-after-completion");
+    if (auto status = RemoveFileDurably(data_dir, "initial_bindings.dat");
+        !status.ok())
+      return status;
+  }
+  if (plan.complete_waiting_) {
+    if (auto status = RemoveFileDurably(data_dir, "waiting_joiner.dat");
+        !status.ok())
+      return status;
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<bool> HasWalSegment(const std::string& data_dir) {
   std::error_code error;
   for (std::filesystem::directory_iterator it(data_dir, error), end;
@@ -510,8 +669,8 @@ absl::StatusOr<std::unique_ptr<NuraftStateMgr>> NuraftStateMgr::Open(
   if (!transport_bindings_next_blob.ok()) {
     return transport_bindings_next_blob.status();
   }
-  const bool waiting_marker = *waiting_blob != nullptr;
-  const bool initial_complete = *initial_complete_blob != nullptr;
+  bool waiting_marker = *waiting_blob != nullptr;
+  bool initial_complete = *initial_complete_blob != nullptr;
   const bool raft_started_marker = *raft_started_blob != nullptr;
   std::optional<TransportBindingBaseline> transport_baseline;
   std::optional<TransportBindingBaseline> transport_next;
@@ -545,6 +704,8 @@ absl::StatusOr<std::unique_ptr<NuraftStateMgr>> NuraftStateMgr::Open(
   nuraft::ptr<nuraft::cluster_config> config;
   nuraft::ptr<nuraft::cluster_config> initial_binding_config;
   NuraftStartupMode startup_mode = NuraftStartupMode::kRestart;
+  auto snapshot = MetaStateMachine::ReadSnapshotMembership(options.data_dir_);
+  if (!snapshot.ok()) return snapshot.status();
   if (*config_blob) {
     if (options.initial_cluster_.has_value()) {
       return absl::FailedPreconditionError(
@@ -577,17 +738,56 @@ absl::StatusOr<std::unique_ptr<NuraftStateMgr>> NuraftStateMgr::Open(
             std::string("invalid initial-binding descriptor set: ") +
             std::string(status.message()));
       }
-      if (initial_complete) {
-        // CompleteInitialBindings publishes the tombstone before removing the
-        // active marker. Finish that crash prefix without reopening grace.
-        if (absl::Status status =
-                RemoveFileDurably(options.data_dir_, "initial_bindings.dat");
-            !status.ok()) {
-          return status;
+      initial_binding_config = std::move(*decoded);
+    }
+    for (const auto* candidate : {&transport_baseline, &transport_next}) {
+      if (!candidate->has_value()) continue;
+      if (auto status =
+              ValidateLoadedConfig((*candidate)->config_, options.local_member_,
+                                   /*require_local=*/false);
+          !status.ok()) {
+        return status;
+      }
+    }
+    if (snapshot->has_value()) {
+      std::uint64_t baseline_index = 0;
+      for (const auto* candidate : {&transport_baseline, &transport_next}) {
+        if (candidate->has_value() &&
+            SameConfigVersion((*candidate)->config_, config)) {
+          baseline_index =
+              std::max(baseline_index, (*candidate)->applied_index_);
         }
-      } else if (SameMemberDescriptors(*decoded, config)) {
-        initial_binding_config = std::move(*decoded);
-      } else {
+      }
+      auto plan = PlanSnapshotMembership(
+          **snapshot, config, initial_binding_config, waiting_marker,
+          options.local_member_.server_id_, baseline_index);
+      if (!plan.ok()) return plan.status();
+      if (auto status =
+              PersistSnapshotMembership(options.data_dir_, **snapshot, *plan);
+          !status.ok()) {
+        return status;
+      }
+      if (plan->install_) {
+        config = (**snapshot).config_;
+        if (plan->publish_baseline_) {
+          transport_baseline =
+              TransportBindingBaseline{config, plan->watermark_};
+          transport_next.reset();
+        }
+        if (plan->complete_initial_) initial_complete = true;
+        if (plan->complete_waiting_) waiting_marker = false;
+      }
+    }
+    if (initial_binding_config != nullptr) {
+      if (initial_complete) {
+        // Completion is published before marker removal. Finish that prefix
+        // without reopening genesis grace, including snapshot recovery.
+        if (auto status =
+                RemoveFileDurably(options.data_dir_, "initial_bindings.dat");
+            !status.ok())
+          return status;
+        initial_binding_config.reset();
+      } else if (!SameMemberDescriptors(initial_binding_config, config)) {
         return absl::DataLossError(
             "durable config changed before genesis bindings completed");
       }
@@ -788,6 +988,26 @@ absl::StatusOr<std::unique_ptr<NuraftStateMgr>> NuraftStateMgr::Open(
   absl::StatusOr<std::unique_ptr<NuraftLogStore>> log_store =
       NuraftLogStore::Open(options.data_dir_);
   if (!log_store.ok()) return log_store.status();
+  if (snapshot->has_value() && !waiting_marker &&
+      config->get_log_idx() > (**snapshot).config_->get_log_idx()) {
+    // The snapshot cannot justify a later config, and an index alone is not
+    // evidence. Require the exact configuration in the surviving durable WAL.
+    const auto entry = (*log_store)->entry_at(config->get_log_idx());
+    if (!entry || entry->get_val_type() != nuraft::log_val_type::conf) {
+      return absl::DataLossError(
+          "post-snapshot Meta config is missing its WAL entry");
+    }
+    try {
+      auto bytes = nuraft::buffer::clone(entry->get_buf());
+      auto logged = nuraft::cluster_config::deserialize(*bytes);
+      if (!SameConfigVersion(logged, config)) {
+        return absl::DataLossError(
+            "post-snapshot Meta config conflicts with WAL");
+      }
+    } catch (...) {
+      return absl::DataLossError("invalid post-snapshot Meta config WAL entry");
+    }
+  }
 
   return std::unique_ptr<NuraftStateMgr>(new NuraftStateMgr(
       std::move(options.data_dir_), options.local_member_.server_id_,
@@ -841,7 +1061,7 @@ void NuraftStateMgr::save_config(const nuraft::cluster_config& config) {
   }
   if (waiting_joiner_marker_.load(std::memory_order_relaxed)) {
     // A new joiner cannot assert convergence merely because NuRaft installed
-    // its config. Transport clears this lifecycle only after the identity
+    // its config. Committed apply clears this lifecycle only after the identity
     // projection catches up through the config entry.
     WriteFileAtomically("cluster_config.dat", *blob, "save_config");
     config_ = std::move(next_config);
@@ -865,6 +1085,11 @@ void NuraftStateMgr::save_config(const nuraft::cluster_config& config) {
 absl::Status NuraftStateMgr::CompleteInitialBindings(
     std::uint64_t applied_index) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return CompleteInitialBindingsLocked(applied_index);
+}
+
+absl::Status NuraftStateMgr::CompleteInitialBindingsLocked(
+    std::uint64_t applied_index) {
   if (!initial_bindings_pending_.load(std::memory_order_relaxed)) {
     return absl::OkStatus();
   }
@@ -897,6 +1122,11 @@ absl::Status NuraftStateMgr::CompleteInitialBindings(
 absl::Status NuraftStateMgr::CompleteWaitingJoinerCatchup(
     std::uint64_t applied_index) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return CompleteWaitingJoinerCatchupLocked(applied_index);
+}
+
+absl::Status NuraftStateMgr::CompleteWaitingJoinerCatchupLocked(
+    std::uint64_t applied_index) {
   if (!waiting_joiner_marker_.load(std::memory_order_relaxed)) {
     return absl::OkStatus();
   }
@@ -923,6 +1153,61 @@ absl::Status NuraftStateMgr::CompleteWaitingJoinerCatchup(
     return status;
   }
   waiting_joiner_marker_.store(false, std::memory_order_release);
+  return absl::OkStatus();
+}
+
+absl::Status NuraftStateMgr::ReconcileCommittedBindings(
+    const MetaIdentityStore& identity, std::uint64_t applied_index) {
+  if (!initial_bindings_pending() && !waiting_joiner_catchup_pending()) {
+    return absl::OkStatus();
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto bindings = identity.MetaMembers();
+  if (initial_binding_config_ != nullptr) {
+    auto covered = BindingsCoverConfig(initial_binding_config_, bindings,
+                                       /*allow_retired=*/true);
+    if (!covered.ok()) return covered.status();
+    if (*covered) return CompleteInitialBindingsLocked(applied_index);
+  }
+  if (waiting_joiner_marker_.load(std::memory_order_relaxed) &&
+      config_->get_server(server_id_) != nullptr &&
+      applied_index >= config_->get_log_idx()) {
+    auto covered =
+        BindingsCoverConfig(config_, bindings, /*allow_retired=*/false);
+    if (!covered.ok()) return covered.status();
+    if (*covered) return CompleteWaitingJoinerCatchupLocked(applied_index);
+  }
+  return absl::OkStatus();
+}
+
+absl::Status NuraftStateMgr::InstallSnapshotMembership(
+    const MetaSnapshotMembership& snapshot) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto plan = PlanSnapshotMembership(
+      snapshot, config_, initial_binding_config_,
+      waiting_joiner_marker_.load(std::memory_order_relaxed), server_id_,
+      transport_binding_index_);
+  if (!plan.ok()) return plan.status();
+  // NuRaft also retains a newer installed config when applying an older
+  // snapshot. Its post-snapshot WAL must still be replayed before catch-up
+  // completes; in particular a waiting joiner keeps its election-disabled
+  // marker.
+  if (!plan->install_) return absl::OkStatus();
+  if (auto status = PersistSnapshotMembership(data_dir_, snapshot, *plan);
+      !status.ok())
+    return status;
+  config_ = snapshot.config_;
+  if (plan->publish_baseline_) {
+    transport_binding_config_ = config_;
+    transport_binding_index_ = plan->watermark_;
+  }
+  if (plan->complete_initial_) {
+    initial_binding_config_.reset();
+    initial_bindings_pending_.store(false, std::memory_order_release);
+  }
+  if (plan->complete_waiting_) {
+    waiting_joiner_marker_.store(false, std::memory_order_release);
+  }
   return absl::OkStatus();
 }
 

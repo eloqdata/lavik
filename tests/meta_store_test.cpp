@@ -26,6 +26,7 @@
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/nuraft_log_store.h"
 #include "keylane/meta/nuraft_state_mgr.h"
+#include "keylane/meta/state_machine.h"
 #include "libnuraft/nuraft.hxx"
 
 namespace {
@@ -757,8 +758,205 @@ class StateMgrTest : public ::testing::Test {
     ASSERT_TRUE(log->flush());
   }
 
+  static keylane::meta::BindMetaMember Binding(std::uint32_t id) {
+    const auto member = Member(id);
+    keylane::meta::BindMetaMember binding;
+    binding.request_id_[0] = static_cast<std::uint8_t>(id);
+    binding.server_id_ = id;
+    binding.principal_ = member.principal_;
+    binding.data_control_endpoint_ = member.data_control_endpoint_;
+    binding.ctl_endpoint_ = member.ctl_endpoint_;
+    return binding;
+  }
+
+  static nuraft::ptr<nuraft::cluster_config> Config(
+      std::uint64_t index, std::initializer_list<std::uint32_t> ids) {
+    auto config = nuraft::cs_new<nuraft::cluster_config>(index, 0);
+    for (const auto id : ids) {
+      const auto member = Member(id);
+      const MetaMemberIdentity identity{member.server_id_, member.principal_,
+                                        member.data_control_endpoint_,
+                                        member.ctl_endpoint_};
+      config->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(
+          member.server_id_, 0, member.raft_endpoint_, identity.EncodeAux(),
+          false, 1));
+    }
+    return config;
+  }
+
+  // A sender's real state-machine snapshot is published in the receiver's
+  // directory, stopping at the receive-durable / config-not-yet-installed cut.
+  void PublishSnapshot(nuraft::ptr<nuraft::cluster_config> config,
+                       std::uint64_t index,
+                       std::initializer_list<std::uint32_t> bindings,
+                       std::optional<std::uint32_t> retired = std::nullopt) {
+    auto opened = keylane::meta::MetaStateMachine::Open(dir_.string());
+    ASSERT_TRUE(opened.ok()) << opened.status();
+    auto& machine = **opened;
+    std::uint64_t applied = 0;
+    for (const auto id : bindings) {
+      auto command =
+          keylane::meta::MetaStateMachine::EncodeCommand(Binding(id));
+      ASSERT_TRUE(command.ok()) << command.status();
+      machine.commit(++applied, **command);
+    }
+    if (retired) {
+      keylane::meta::RetireMetaMember retirement;
+      retirement.request_id_[0] = 99;
+      retirement.server_id_ = *retired;
+      auto command = keylane::meta::MetaStateMachine::EncodeCommand(retirement);
+      ASSERT_TRUE(command.ok()) << command.status();
+      machine.commit(++applied, **command);
+    }
+    ASSERT_LE(applied, index);
+    machine.commit_config(index, config);
+    bool completed = false;
+    nuraft::async_result<bool>::handler_type handler =
+        [&](bool& ok, nuraft::ptr<std::exception>& error) {
+          EXPECT_EQ(error, nullptr);
+          completed = ok;
+        };
+    nuraft::snapshot snapshot(index, 1, config);
+    machine.create_snapshot(snapshot, handler);
+    machine.WaitForSnapshotWriterIdle();
+    ASSERT_TRUE(completed);
+  }
+
   std::filesystem::path dir_;
 };
+
+TEST_F(StateMgrTest, CommittedApplyClosesGenesisWithoutTransportCallbacks) {
+  auto opened = OpenInitial({Member(7), Member(8), Member(9)});
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  nuraft::ptr<NuraftStateMgr> manager(std::move(*opened));
+  auto machine = keylane::meta::MetaStateMachine::Open(dir_.string());
+  ASSERT_TRUE(machine.ok()) << machine.status();
+  (*machine)->AttachStateMgr(manager);
+  for (const auto id : {7U, 8U, 9U}) {
+    auto command = keylane::meta::MetaStateMachine::EncodeCommand(Binding(id));
+    ASSERT_TRUE(command.ok()) << command.status();
+    (*machine)->commit(id - 6, **command);
+    EXPECT_EQ(manager->initial_bindings_pending(), id != 9);
+  }
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "initial_bindings_complete.dat"));
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
+}
+
+TEST_F(StateMgrTest, SnapshotRepairsLateGenesisAndRetainsRetiredEvidence) {
+  auto opened = OpenInitial({Member(7), Member(8), Member(9)});
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  PublishSnapshot(Config(10, {7, 8, 10}), 20, {7, 8, 9, 10}, 9);
+  opened->reset();
+
+  for (int restart = 0; restart < 2; ++restart) {
+    auto recovered = OpenRestart();
+    ASSERT_TRUE(recovered.ok()) << recovered.status();
+    EXPECT_FALSE((*recovered)->initial_bindings_pending());
+    EXPECT_EQ((*recovered)->load_config()->get_log_idx(), 10U);
+    EXPECT_NE((*recovered)->load_config()->get_server(10), nullptr);
+    EXPECT_EQ((*recovered)->load_config()->get_server(9), nullptr);
+    EXPECT_TRUE((*recovered)->transport_binding_replay_pending(19));
+    EXPECT_FALSE((*recovered)->transport_binding_replay_pending(20));
+  }
+}
+
+TEST_F(StateMgrTest,
+       SnapshotMissingGenesisEvidenceFailsBeforeConfigReplacement) {
+  auto opened = OpenInitial({Member(7), Member(8), Member(9)});
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  PublishSnapshot(Config(10, {7, 8, 10}), 20, {7, 8, 10});
+  opened->reset();
+  EXPECT_FALSE(OpenRestart().ok());
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "initial_bindings_complete.dat"));
+}
+
+TEST_F(StateMgrTest, PartialGenesisSnapshotKeepsCatchupGrace) {
+  auto opened = OpenInitial({Member(7), Member(8), Member(9)});
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  PublishSnapshot(Config(0, {7, 8, 9}), 2, {7});
+  opened->reset();
+  auto recovered = OpenRestart();
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_TRUE((*recovered)->initial_bindings_pending());
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "transport_bindings.dat"));
+}
+
+TEST_F(StateMgrTest, SameIndexSnapshotConfigConflictFailsClosed) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  PublishSnapshot(Config(0, {7, 8}), 3, {7, 8});
+  opened->reset();
+  EXPECT_FALSE(OpenRestart().ok());
+}
+
+TEST_F(StateMgrTest, PartialSnapshotPreservesLaterCompletedBindingWatermark) {
+  auto opened = OpenInitial({Member(7), Member(8), Member(9)});
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  ASSERT_TRUE((*opened)->CompleteInitialBindings(5).ok());
+  PublishSnapshot(Config(0, {7, 8, 9}), 2, {7});
+  opened->reset();
+  auto recovered = OpenRestart();
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_FALSE((*recovered)->initial_bindings_pending());
+  EXPECT_TRUE((*recovered)->transport_binding_replay_pending(2));
+  EXPECT_TRUE((*recovered)->transport_binding_replay_pending(4));
+  EXPECT_FALSE((*recovered)->transport_binding_replay_pending(5));
+}
+
+TEST_F(StateMgrTest, SnapshotCannotHideCoveredConfigurationConflict) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  ASSERT_TRUE((*opened)->CompleteInitialBindings(1).ok());
+  (*opened)->save_config(*Config(5, {7, 8}));
+  // Config 5 is covered by index 10, but the snapshot says the latest config
+  // is still 0. Taking the larger applied index would silently lose a voter.
+  PublishSnapshot(Config(0, {7}), 10, {7});
+  opened->reset();
+  EXPECT_FALSE(OpenRestart().ok());
+}
+
+TEST_F(StateMgrTest, NewerDiskConfigRequiresExactPostSnapshotWalEntry) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  ASSERT_TRUE((*opened)->CompleteInitialBindings(1).ok());
+  const auto config = Config(5, {7, 8});
+  (*opened)->save_config(*config);
+  PublishSnapshot(Config(0, {7}), 3, {7});
+  auto log = (*opened)->load_log_store();
+  for (int index = 2; index <= 4; ++index) {
+    auto entry = MakeEntry(1, "tail");
+    ASSERT_EQ(log->append(entry), index);
+  }
+  auto entry = nuraft::cs_new<nuraft::log_entry>(1, config->serialize(),
+                                                 nuraft::log_val_type::conf);
+  ASSERT_EQ(log->append(entry), 5U);
+  ASSERT_TRUE(log->flush());
+  log.reset();
+  opened->reset();
+  auto recovered = OpenRestart();
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_EQ((*recovered)->load_config()->get_log_idx(), 5U);
+  EXPECT_NE((*recovered)->load_config()->get_server(8), nullptr);
+}
+
+TEST_F(StateMgrTest, MissingPostSnapshotConfigWalEntryFailsClosed) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  ASSERT_TRUE((*opened)->CompleteInitialBindings(1).ok());
+  (*opened)->save_config(*Config(5, {7, 8}));
+  PublishSnapshot(Config(0, {7}), 3, {7});
+  opened->reset();
+  EXPECT_FALSE(OpenRestart().ok());
+}
 
 TEST_F(StateMgrTest, FreshDirYieldsInitialConfigAndNoState) {
   auto opened = OpenInitial();

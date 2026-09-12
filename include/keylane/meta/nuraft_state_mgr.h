@@ -29,6 +29,11 @@
 //   - save_config() uses the same atomic-rename discipline: the core saves
 //     the config when a conf log commits, and load_config() must never
 //     resurrect a configuration older than the last committed one.
+//   - Open() validates the latest state-machine snapshot before exposing a
+//     config. Its embedded membership repairs interrupted snapshot
+//     installation; a newer disk config must be backed by the exact
+//     post-snapshot WAL entry (waiting joiners retain their election-disabled
+//     invite-before-WAL grace).
 //   - Recovery order is fixed by raft_server's constructor:
 //     load_log_store() -> load_config() -> read_state() ->
 //     state_machine::last_commit_index() -> last_snapshot(). This class
@@ -65,12 +70,14 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "keylane/meta/identity_store.h"
 #include "libnuraft/buffer.hxx"
 #include "libnuraft/state_mgr.hxx"
 
 namespace keylane::meta {
 
 class NuraftLogStore;
+struct MetaSnapshotMembership;
 
 // Complete durable descriptor for one Raft member. The Raft endpoint lives in
 // NuRaft's native srv_config field; the remaining fields are encoded in aux.
@@ -115,9 +122,9 @@ class NuraftStateMgr : public nuraft::state_mgr {
   // marker changes restart behavior but does not mutate the current mode.
   NuraftStartupMode startup_mode() const { return startup_mode_; }
   // Remains true across election-time config copies and process restarts until
-  // the membership reconciler confirms every genesis identity binding. A real
-  // membership change also clears it before its descriptor can authorize
-  // transport.
+  // committed apply confirms every genesis identity binding. Snapshot recovery
+  // can close it using the retained original bindings even after later member
+  // additions or removals.
   bool initial_bindings_pending() const {
     return initial_bindings_pending_.load(std::memory_order_acquire);
   }
@@ -144,6 +151,18 @@ class NuraftStateMgr : public nuraft::state_mgr {
   // A config descriptor change invalidates the old baseline transactionally.
   bool transport_binding_replay_pending(std::uint64_t applied_index) const;
 
+  // Called from committed apply, never from untrusted transport observations.
+  // Missing genesis bindings mean wait; retained retired bindings still prove
+  // that genesis completed before a later membership change.
+  absl::Status ReconcileCommittedBindings(const MetaIdentityStore& identity,
+                                          std::uint64_t applied_index);
+
+  // Installs the config/lifecycle part of a validated durable snapshot before
+  // the state machine exposes its new state. Startup repeats this operation
+  // idempotently if the process stops between its individual durable writes.
+  absl::Status InstallSnapshotMembership(
+      const MetaSnapshotMembership& snapshot);
+
   nuraft::ptr<nuraft::cluster_config> load_config() override;
   void save_config(const nuraft::cluster_config& config) override;
   void save_state(const nuraft::srv_state& state) override;
@@ -166,6 +185,8 @@ class NuraftStateMgr : public nuraft::state_mgr {
   absl::Status PublishTransportBindingBaselineLocked(
       const nuraft::cluster_config& config, std::uint64_t applied_index,
       bool transactional_with_config);
+  absl::Status CompleteInitialBindingsLocked(std::uint64_t applied_index);
+  absl::Status CompleteWaitingJoinerCatchupLocked(std::uint64_t applied_index);
 
   // Serializes `blob` to `name` inside the data directory with
   // tmp-write/fdatasync/rename/dir-fsync; aborts the process on IO errors.

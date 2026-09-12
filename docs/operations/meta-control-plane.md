@@ -66,7 +66,14 @@ genesis directory look unused. Once either path converges,
 `transport_bindings.dat` holds the exact last-converged descriptors and their
 state-machine replay watermark; future `addsrv` and `removesrv` changes update
 that same reusable baseline transactionally with `cluster_config.dat`. A
-transient `transport_bindings.next` is resolved during crash recovery. Do not
+transient `transport_bindings.next` is resolved during crash recovery. A late
+initial member may catch up through either WAL or a snapshot after membership
+has changed. Before opening Raft transport or elections, restart validates the
+snapshot and reconciles its embedded membership with the durable config. It
+automatically completes interrupted config/baseline/lifecycle writes when that
+snapshot supplies the evidence; a later config needs its matching WAL entry
+(except an election-disabled joiner's pending invite). Conflicting configurations
+or missing recovery evidence prevent startup. Do not
 edit or delete these files or other Raft state to turn an old member into a new
 one; missing, mismatched, or malformed lifecycle state intentionally prevents
 startup.

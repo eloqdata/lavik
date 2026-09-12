@@ -413,7 +413,7 @@ genesis differs only in vector length. Every member starts the same ordinary
 randomized election; there is no distinguished bootstrap candidate. The
 manifest is rejected once any durable config exists and is never read on
 restart. `initial_bindings.dat` retains that exact genesis descriptor set
-until the membership reconciler has committed every identity binding. It
+until local committed apply has observed every identity binding. It
 survives election-time config copies and restarts, then is atomically removed
 after `initial_bindings_complete.dat` is published as a permanent tombstone;
 the tombstone prevents a completed zero-index genesis from being mistaken for
@@ -438,7 +438,24 @@ changes reuse the same baseline: `save_config()` publishes a bounded
 `transport_bindings.next`, replaces `cluster_config.dat`, and durably promotes
 the candidate. Recovery either discards a candidate paired with the old config
 or completes a candidate paired with the new config; any other pairing fails
-closed. This is Raft transport recovery state, not a Cluster Create operation
+closed. Snapshot installation uses the validated snapshot's embedded NuRaft
+configuration and identity projection to update this same config/baseline pair
+and finish local genesis or join catch-up. Retired genesis bindings still prove
+that initialization completed; they grant no active membership. Extra bindings
+may belong to the normal two-phase membership workflow.
+
+The durable snapshot also supplies redo evidence for an interrupted installation.
+Before transport or elections start, recovery validates the complete snapshot
+and compares configuration-entry indices. A newer snapshot configuration replaces
+an older disk configuration; equal-index configurations must agree. A later disk
+configuration must lie beyond the snapshot's applied index and match its exact
+surviving WAL entry. Election-disabled waiting joiners retain their narrower
+invite-before-WAL exception. A snapshot that precedes binding completion preserves
+the matching baseline's later replay watermark. Conflicting or insufficient
+evidence fails startup; a covered membership entry can never disappear merely
+because compaction removed it from the WAL.
+
+This is Raft transport recovery state, not a Cluster Create operation
 or membership workflow record. Config indices, a genesis completion tombstone,
 the Raft-started marker, or a transport baseline require the matching server
 state and segmented WAL to exist. Missing, oversized, truncated, or
@@ -504,8 +521,9 @@ configuration nor the store binding grants membership alone. During static
 genesis, the complete config descriptor may temporarily stand in for a
 not-yet-applied binding only while the durable initial-binding marker names
 that unchanged descriptor set. The membership reconciler commits missing
-bindings in server-id order; followers close the same local marker when their
-transport observes exact config/binding convergence. A dynamic waiting joiner
+bindings in server-id order; every member closes its local marker synchronously
+when committed log or snapshot apply proves convergence. Transport checks identity
+and reads recovery state without advancing that lifecycle. A dynamic waiting joiner
 has a second narrow catch-up window only while its durable waiting marker is
 present. Replaying a pre-add config cannot close that window: the marker is
 removed only after the installed config includes the local id, every descriptor
