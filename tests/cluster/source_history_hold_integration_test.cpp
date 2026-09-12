@@ -46,22 +46,79 @@ struct NativeStreamPair {
   celer::TcpStream peer_;
 };
 
+struct NativeReplicaPeers {
+  NativeReplicaPeers(celer::TcpStream control, celer::TcpStream flow)
+      : control_(std::move(control)), flow_(std::move(flow)) {}
+  NativeReplicaPeers(NativeReplicaPeers&& other) noexcept
+      : control_(std::move(other.control_)), flow_(std::move(other.flow_)) {
+    other.Reset();
+  }
+  NativeReplicaPeers& operator=(NativeReplicaPeers&& other) noexcept {
+    if (this == &other) return *this;
+    Close();
+    control_ = std::move(other.control_);
+    flow_ = std::move(other.flow_);
+    other.Reset();
+    return *this;
+  }
+  NativeReplicaPeers(const NativeReplicaPeers&) = delete;
+  NativeReplicaPeers& operator=(const NativeReplicaPeers&) = delete;
+  ~NativeReplicaPeers() { Close(); }
+
+  void Close() {
+    flow_.Close().IgnoreError();
+    control_.Close().IgnoreError();
+    Reset();
+  }
+
+  void Reset() {
+    control_ = celer::TcpStream();
+    flow_ = celer::TcpStream();
+  }
+
+  celer::TcpStream control_;
+  celer::TcpStream flow_;
+};
+
+struct NativeUpstreamStub {
+  ~NativeUpstreamStub() {
+    if (peer_.has_value()) peer_->Close().IgnoreError();
+    listener_.Close().IgnoreError();
+  }
+
+  celer::TcpListener listener_;
+  std::optional<celer::TcpStream> peer_;
+};
+
+enum class RebuildRetirementScenario : std::uint8_t {
+  kNone,
+  kActiveBacklog,
+  kInvalidResetRace,
+};
+
+absl::StatusOr<std::uint16_t> BoundTcpPort(celer::TcpListener& listener) {
+  sockaddr_in address{};
+  socklen_t size = sizeof(address);
+  if (::getsockname(listener.NativeFd(), reinterpret_cast<sockaddr*>(&address),
+                    &size) != 0) {
+    return absl::UnknownError(std::string("getsockname failed: ") +
+                              std::strerror(errno));
+  }
+  return ntohs(address.sin_port);
+}
+
 celer::Task<absl::StatusOr<NativeStreamPair>> OpenNativeStreamPair(
     celer::Worker& worker) {
   celer::TcpListener listener;
   absl::Status bound = listener.Bind(&worker, "127.0.0.1", 0);
   if (!bound.ok()) co_return bound;
-  sockaddr_in address{};
-  socklen_t size = sizeof(address);
-  if (::getsockname(listener.NativeFd(), reinterpret_cast<sockaddr*>(&address),
-                    &size) != 0) {
-    const int error = errno;
+  auto port = BoundTcpPort(listener);
+  if (!port.ok()) {
     listener.Close().IgnoreError();
-    co_return absl::UnknownError(std::string("getsockname failed: ") +
-                                 std::strerror(error));
+    co_return port.status();
   }
-  auto peer = co_await celer::ConnectTcp(
-      worker, "127.0.0.1", ntohs(address.sin_port), std::chrono::seconds(5));
+  auto peer = co_await celer::ConnectTcp(worker, "127.0.0.1", *port,
+                                         std::chrono::seconds(5));
   if (!peer.ok()) {
     listener.Close().IgnoreError();
     co_return peer.status();
@@ -173,8 +230,12 @@ void EnsureTxRuntime() {
 class SourceHistoryHoldService final : public celer::Service {
  public:
   SourceHistoryHoldService(keylane::storage::StorageEngine* storage,
-                           keylane::ReplicationManager* replication)
-      : storage_(storage), replication_(replication) {}
+                           keylane::ReplicationManager* replication,
+                           RebuildRetirementScenario rebuild_scenario =
+                               RebuildRetirementScenario::kNone)
+      : storage_(storage),
+        replication_(replication),
+        rebuild_scenario_(rebuild_scenario) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) {
@@ -203,7 +264,7 @@ class SourceHistoryHoldService final : public celer::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
-  celer::Task<absl::Status> VerifyPopulationFlowMode(
+  celer::Task<absl::StatusOr<NativeReplicaPeers>> OpenPopulationFlow(
       const keylane::RebuildIdentity& requested, std::uint64_t applied_lsn,
       std::uint64_t requested_flow_lsn, std::string_view expected_mode,
       std::optional<std::string> transport_group_token = std::nullopt) {
@@ -251,16 +312,61 @@ class SourceHistoryHoldService final : public celer::Service {
     worker.Spawn(ServeNativeAndClose(replication_, std::move(flow->source_),
                                      std::move(flow_args), 902));
     auto flow_line = co_await ReadNativeLine(flow_peer);
-    flow_peer.Close().IgnoreError();
-    control_peer.Close().IgnoreError();
-    if (!flow_line.ok()) co_return flow_line.status();
+    if (!flow_line.ok()) {
+      flow_peer.Close().IgnoreError();
+      control_peer.Close().IgnoreError();
+      co_return flow_line.status();
+    }
     const std::vector<std::string_view> flow_words =
         SplitNativeLine(*flow_line);
     if (flow_words.size() != 4 || flow_words[0] != "+KLFLOW" ||
         flow_words[1] != session_id || flow_words[2] != "0" ||
         flow_words[3] != expected_mode) {
+      flow_peer.Close().IgnoreError();
+      control_peer.Close().IgnoreError();
       co_return TestFailure("population KLFLOW selected the wrong mode");
     }
+    if (expected_mode == "CONTINUE") {
+      const auto deadline = std::chrono::steady_clock::now() + 3s;
+      bool cursor_installed = false;
+      do {
+        const keylane::ReplicationStatus status =
+            co_await replication_->Observe();
+        for (const auto& replica : status.downstream_replicas_) {
+          if (replica.node_id_ == requested.target_node_id_ &&
+              replica.min_lsn_ == requested_flow_lsn) {
+            cursor_installed = true;
+            break;
+          }
+        }
+        if (cursor_installed) break;
+        absl::Status waited =
+            co_await celer::SleepFor(worker, std::chrono::milliseconds(1));
+        if (!waited.ok()) {
+          flow_peer.Close().IgnoreError();
+          control_peer.Close().IgnoreError();
+          co_return waited;
+        }
+      } while (std::chrono::steady_clock::now() < deadline);
+      if (!cursor_installed) {
+        flow_peer.Close().IgnoreError();
+        control_peer.Close().IgnoreError();
+        co_return TestFailure(
+            "population source flow did not install its backlog cursor");
+      }
+    }
+    co_return NativeReplicaPeers(std::move(control_peer), std::move(flow_peer));
+  }
+
+  celer::Task<absl::Status> VerifyPopulationFlowMode(
+      const keylane::RebuildIdentity& requested, std::uint64_t applied_lsn,
+      std::uint64_t requested_flow_lsn, std::string_view expected_mode,
+      std::optional<std::string> transport_group_token = std::nullopt) {
+    auto peers = co_await OpenPopulationFlow(requested, applied_lsn,
+                                             requested_flow_lsn, expected_mode,
+                                             std::move(transport_group_token));
+    if (!peers.ok()) co_return peers.status();
+    peers->Close();
     co_return co_await replication_
         ->ClearClusterRebuildSourceAuthorizationsForSessionReplacement();
   }
@@ -317,6 +423,189 @@ class SourceHistoryHoldService final : public celer::Service {
     absl::Status completed = co_await started->Await();
     if (!completed.ok()) co_return completed;
     co_return identity;
+  }
+
+  celer::Task<absl::Status> ExerciseRebuildRetirement(
+      const keylane::RebuildIdentity& population,
+      const keylane::ReplicationIdentity& local,
+      const keylane::SourceHistoryHoldDesired& desired,
+      const keylane::RebuildDirective& authorization,
+      bool exercise_invalid_reset_race) {
+    auto fenced = co_await storage_->FenceReplicationLog();
+    if (!fenced.ok()) co_return fenced.status();
+    auto manifest = keylane::PopulationManifest::Create({});
+    if (!manifest.ok()) co_return manifest.status();
+    keylane::RebuildDirective rebuild{
+        .identity_ =
+            {
+                .group_id_ = population.group_id_,
+                .assignment_id_ = population.assignment_id_,
+                .term_ = population.term_ + 1,
+                .directive_revision_ = 2,
+                .authority_id_ = "replacement-authority",
+                .source_node_id_ = std::string(40, 'a'),
+                .source_assignment_id_ = "00000000000000000000000000000002",
+                .source_boot_id_ = std::string(40, 'b'),
+                .source_history_id_ = std::string(40, 'c'),
+                .target_node_id_ = local.local_node_id_,
+                .target_boot_id_ = local.boot_id_,
+                .operation_id_ = "replacement-operation",
+                .directive_id_ = "replacement-rebuild",
+                .attempt_id_ = "replacement-attempt",
+                .manifest_revision_ = population.manifest_revision_,
+                .manifest_id_ = population.manifest_id_,
+                .partition_replication_epoch_ =
+                    population.partition_replication_epoch_ + 1,
+            },
+        .flow_count_ = 1,
+        .safe_source_active_ = true,
+    };
+    const keylane::storage::ReplicationLogInfo retained =
+        storage_->LocalReplicationLogInfo();
+    if (retained.state_ != keylane::storage::ReplicationLogState::kActive ||
+        retained.tail_lsn_ == 0 || retained.capacity_bytes_ == 0) {
+      co_return TestFailure(
+          "source fixture did not retain a non-empty old-primary backlog: " +
+          std::to_string(static_cast<unsigned>(retained.state_)) + "/" +
+          std::to_string(retained.log_epoch_) + "/" +
+          std::to_string(retained.tail_lsn_) + "/" +
+          std::to_string(retained.capacity_bytes_));
+    }
+
+    auto stale = rebuild;
+    stale.identity_.target_boot_id_ = std::string(40, 'd');
+    auto rejected = co_await replication_->StartClusterRebuildDirective(
+        {"127.0.0.1", 1}, stale, *manifest);
+    if (rejected.status().code() != absl::StatusCode::kFailedPrecondition ||
+        storage_->LocalReplicationLogInfo().state_ !=
+            keylane::storage::ReplicationLogState::kActive) {
+      co_return TestFailure("invalid rebuild changed retained source history");
+    }
+
+    rejected = co_await replication_->StartClusterRebuildDirective(
+        {"127.0.0.1", 1}, rebuild, *manifest);
+    if (rejected.status().code() != absl::StatusCode::kFailedPrecondition ||
+        storage_->LocalReplicationLogInfo().state_ !=
+            keylane::storage::ReplicationLogState::kActive) {
+      co_return TestFailure(
+          "target rebuild bypassed the FDS source-history hold");
+    }
+    auto still_frozen =
+        co_await replication_->CaptureNativeReplicationWatermark();
+    if (!still_frozen.ok() || !still_frozen->has_value() ||
+        (**still_frozen).history_id_ != desired.source_history_id_) {
+      co_return TestFailure(
+          "rejected target rebuild released the held source history");
+    }
+
+    std::optional<NativeReplicaPeers> source_peers;
+    if (exercise_invalid_reset_race) {
+      // Keep a source flow suspended before its cursor ACK, then model a
+      // mutation whose late replication representation cannot be formed.
+      // Rebuild revocation must join that flow's normal invalid-history reset
+      // without letting the reset rotate the boot-local identity bound to the
+      // Meta session.
+      const std::uint64_t next_lsn = retained.tail_lsn_ + 1;
+      auto opened = co_await OpenPopulationFlow(authorization.identity_,
+                                                next_lsn, next_lsn, "CONTINUE");
+      if (!opened.ok()) co_return opened.status();
+      source_peers.emplace(std::move(*opened));
+    }
+    absl::Status released =
+        co_await replication_->ReconcileClusterSourceHistoryHold(std::nullopt);
+    if (!released.ok()) co_return released;
+
+    if (exercise_invalid_reset_race) {
+      auto admission =
+          co_await storage_->AcquireReplicationPublisherAdmission(1);
+      if (!admission.ok()) co_return admission.status();
+      const absl::Status invalidated =
+          storage_->PublishLateAdmittedReplicationCommand(
+              *admission, keylane::storage::ReplicationEventKind::kEphemeral, 0,
+              std::vector<std::string>{});
+      storage_->ReleaseReplicationPublisherAdmission(*admission, 1);
+      if (invalidated.code() != absl::StatusCode::kFailedPrecondition ||
+          storage_->LocalReplicationLogInfo().state_ !=
+              keylane::storage::ReplicationLogState::kInvalid) {
+        co_return TestFailure(
+            "source fixture did not enter invalid-history reset path");
+      }
+    } else if (storage_->LocalReplicationLogInfo().state_ !=
+               keylane::storage::ReplicationLogState::kActive) {
+      co_return TestFailure(
+          "source backlog was not active when fresh rebuild cleanup began");
+    }
+
+    NativeUpstreamStub upstream;
+    celer::Worker& worker = *celer::ThisWorker().self_;
+    absl::Status bound = upstream.listener_.Bind(&worker, "127.0.0.1", 0);
+    if (!bound.ok()) co_return bound;
+    auto upstream_port = BoundTcpPort(upstream.listener_);
+    if (!upstream_port.ok()) co_return upstream_port.status();
+
+    auto started = co_await replication_->StartClusterRebuildDirective(
+        {"127.0.0.1", *upstream_port}, rebuild, *manifest);
+    if (source_peers.has_value()) source_peers->Close();
+    if (!started.ok()) co_return started.status();
+    auto accepted = co_await upstream.listener_.Accept();
+    upstream.listener_.Close().IgnoreError();
+    if (!accepted.ok()) co_return accepted.status();
+    upstream.peer_.emplace(std::move(*accepted));
+
+    const keylane::storage::ReplicationLogInfo disabled =
+        storage_->LocalReplicationLogInfo();
+    const keylane::ReplicationIdentity after =
+        co_await replication_->ObserveIdentity();
+    const keylane::ReplicationStatus status = co_await replication_->Observe();
+    const keylane::ReplicaOfConfig expected_upstream{"127.0.0.1",
+                                                     *upstream_port};
+    if (disabled.state_ != keylane::storage::ReplicationLogState::kDisabled ||
+        disabled.log_epoch_ != 0 || disabled.tail_lsn_ != 0 ||
+        disabled.block_count_ != 0 || disabled.capacity_bytes_ != 0 ||
+        after.local_history_id_ != local.local_history_id_ ||
+        (status.role_ != keylane::ReplicationRole::kConnecting &&
+         status.role_ != keylane::ReplicationRole::kSyncing) ||
+        status.upstream_ !=
+            std::optional<keylane::ReplicaOfConfig>(expected_upstream) ||
+        !replication_->is_loading()) {
+      co_return TestFailure(
+          "fresh target rebuild did not retire only the physical backlog: " +
+          std::to_string(static_cast<unsigned>(disabled.state_)) + "/" +
+          std::to_string(disabled.log_epoch_) + "/" +
+          std::to_string(disabled.tail_lsn_) + "/" +
+          std::to_string(disabled.block_count_) + "/" +
+          std::to_string(disabled.capacity_bytes_) + "/history=" +
+          std::to_string(after.local_history_id_ == local.local_history_id_) +
+          "/role=" + std::to_string(static_cast<unsigned>(status.role_)) +
+          "/upstream=" + std::to_string(status.upstream_ == expected_upstream) +
+          "/loading=" + std::to_string(replication_->is_loading()));
+    }
+
+    const std::uint64_t accepted_role_epoch = status.role_epoch_;
+    auto replay = co_await replication_->StartClusterRebuildDirective(
+        {"127.0.0.1", *upstream_port}, rebuild, *manifest);
+    if (!replay.ok()) co_return replay.status();
+    const keylane::ReplicationIdentity after_replay =
+        co_await replication_->ObserveIdentity();
+    const keylane::ReplicationStatus replay_status =
+        co_await replication_->Observe();
+    if (after_replay.local_history_id_ != local.local_history_id_ ||
+        replay_status.role_epoch_ != accepted_role_epoch ||
+        storage_->LocalReplicationLogInfo().state_ !=
+            keylane::storage::ReplicationLogState::kDisabled) {
+      co_return TestFailure(
+          "exact rebuild replay repeated source-history retirement");
+    }
+
+    absl::Status cancelled =
+        co_await replication_->CancelInProgressClusterPopulation();
+    if (!cancelled.ok()) co_return cancelled;
+    if ((co_await started->Await()).code() != absl::StatusCode::kCancelled ||
+        (co_await replay->Await()).code() != absl::StatusCode::kCancelled) {
+      co_return TestFailure(
+          "target rebuild cleanup did not preserve exact completion replay");
+    }
+    co_return absl::OkStatus();
   }
 
   celer::Task<absl::Status> Exercise() {
@@ -405,6 +694,11 @@ class SourceHistoryHoldService final : public celer::Service {
         co_await storage_->PublishEphemeralReplicationCommand(
             0, {"PING", "after-freeze"});
     if (!published.ok()) co_return published;
+    if (rebuild_scenario_ != RebuildRetirementScenario::kNone) {
+      co_return co_await ExerciseRebuildRetirement(
+          *population, local, desired, authorization,
+          rebuild_scenario_ == RebuildRetirementScenario::kInvalidResetRace);
+    }
     auto replay_authorization = authorization;
     replay_authorization.identity_.operation_id_ = "replayed-operation";
     replay_authorization.identity_.directive_id_ = "replayed-directive";
@@ -726,12 +1020,15 @@ class SourceHistoryHoldService final : public celer::Service {
 
   keylane::storage::StorageEngine* storage_ = nullptr;
   keylane::ReplicationManager* replication_ = nullptr;
+  RebuildRetirementScenario rebuild_scenario_ =
+      RebuildRetirementScenario::kNone;
   absl::Status result_ = absl::OkStatus();
 };
 
-TEST(SourceHistoryHoldIntegrationTest,
-     ReconcilesBootLocalAuthorizationAndReleaseLifecycle) {
-  keylane::test::TempDirectory directory("source-history-hold");
+void RunSourceHistoryHoldScenario(std::string_view directory_name, char node_id,
+                                  RebuildRetirementScenario rebuild_scenario =
+                                      RebuildRetirementScenario::kNone) {
+  keylane::test::TempDirectory directory{std::string(directory_name)};
   const std::filesystem::path data = directory.path() / "node.data";
   keylane::test::CreateDataFile(data, 128 * kMiB);
 
@@ -748,13 +1045,13 @@ TEST(SourceHistoryHoldIntegrationTest,
   keylane::ReplicationOptions replication_options;
   replication_options.cluster_enabled_ = true;
   replication_options.cluster_population_managed_ = true;
-  replication_options.node_id_override_ = std::string(40, '7');
+  replication_options.node_id_override_ = std::string(40, node_id);
   keylane::ReplicationManager replication(
       &storage, std::move(replication_options), std::nullopt);
   keylane::InitStorage(&storage, &replication);
   EnsureTxRuntime();
 
-  SourceHistoryHoldService service(&storage, &replication);
+  SourceHistoryHoldService service(&storage, &replication, rebuild_scenario);
   celer::Server server;
   server.AddService(&service);
   celer::ServerOptions runtime;
@@ -764,6 +1061,23 @@ TEST(SourceHistoryHoldIntegrationTest,
   ASSERT_TRUE(server.Start(runtime).ok());
   server.WaitUntilStopped();
   EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+TEST(SourceHistoryHoldIntegrationTest,
+     ReconcilesBootLocalAuthorizationAndReleaseLifecycle) {
+  RunSourceHistoryHoldScenario("source-history-hold", '7');
+}
+
+TEST(SourceHistoryHoldIntegrationTest,
+     FreshTargetRebuildRetiresReleasedOldPrimaryBacklog) {
+  RunSourceHistoryHoldScenario("source-history-active-rebuild-retirement", '6',
+                               RebuildRetirementScenario::kActiveBacklog);
+}
+
+TEST(SourceHistoryHoldIntegrationTest,
+     FreshTargetRebuildJoinsConcurrentInvalidHistoryReset) {
+  RunSourceHistoryHoldScenario("source-history-invalid-rebuild-retirement", '5',
+                               RebuildRetirementScenario::kInvalidResetRace);
 }
 
 }  // namespace

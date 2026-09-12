@@ -493,6 +493,15 @@ class ReplicationManagerService final : public celer::Service {
           "rebuild admission was reported as terminal success before the "
           "source identity failure");
     }
+    const keylane::ReplicationIdentity after_cold_rebuild =
+        co_await replication_->ObserveIdentity();
+    if (after_cold_rebuild.local_history_id_ !=
+            replication_status.local_history_id_ ||
+        storage_->LocalReplicationLogInfo().state_ !=
+            keylane::storage::ReplicationLogState::kDisabled) {
+      co_return TestFailure(
+          "cold rebuild cleanup changed the Meta session history identity");
+    }
     absl::Status peer = co_await WaitForPeerCount(
         worker, *source_, false, 1,
         "native source did not receive the mismatched-group connection");

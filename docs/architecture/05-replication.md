@@ -237,6 +237,17 @@ change the established export-preservation identity: an already-ONLINE
 replica stream can span the FDS-to-authorization interval without exposing an
 idle-history rotation gap.
 
+A fresh target rebuild is rejected while that FDS-owned hold remains desired.
+After the hold is withdrawn, accepting the rebuild drains source egress and
+disables any residual old-primary backlog before the new target attempt starts;
+this cleanup is Data-local and requires no Meta cleanup directive. It preserves
+the local history ID because that identity is fixed for the current Meta
+session. The node is already Connecting and cannot export under the disabled
+history, and a later promotion performs the normal rotating retirement before
+enabling its child source history. Source retirement is serialized with
+shutdown and role transitions so a second drain cannot mistake a session moved
+into another coroutine's ownership for a completed flow join.
+
 After the old authority is fenced, a typed frozen-source mode reuses the
 ordinary authorize-source directive, receipt, evidence, ledger, and native
 export path. `FreezeAndAuthorizeClusterRebuildSource()` requires the exact

@@ -3141,6 +3141,11 @@ struct RedisSource {
 
 enum class UpstreamProtocol : std::uint8_t { kNative, kRedis };
 
+enum class SourceHistoryIdentityPolicy : std::uint8_t {
+  kRotate,
+  kPreserve,
+};
+
 struct UpstreamDiscovery {
   UpstreamProtocol protocol_ = UpstreamProtocol::kNative;
   bool redis_cluster_ = false;
@@ -3271,7 +3276,8 @@ class ReplicationManager::ReplicationGroup {
       co_return absl::FailedPreconditionError(
           "rebuild directive does not match the supplied manifest");
     }
-    if (cluster_control_stopping_) {
+    if (cluster_control_stopping_ ||
+        replication_shutdown_requested_.load(std::memory_order_acquire)) {
       co_return absl::CancelledError(
           "cluster rebuild admission stopped for process shutdown");
     }
@@ -3289,7 +3295,8 @@ class ReplicationManager::ReplicationGroup {
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
-    if (cluster_control_stopping_) {
+    if (cluster_control_stopping_ ||
+        replication_shutdown_requested_.load(std::memory_order_acquire)) {
       co_return absl::CancelledError(
           "cluster rebuild admission stopped during prior teardown");
     }
@@ -3300,6 +3307,8 @@ class ReplicationManager::ReplicationGroup {
     std::shared_ptr<ClusterRebuildContext> previous_context;
     bool superseding = false;
     {
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
       AssertStateOwner();
       if (cluster_promotion_prepare_ != nullptr) {
         co_return absl::FailedPreconditionError(
@@ -3339,6 +3348,13 @@ class ReplicationManager::ReplicationGroup {
         co_return cluster_rebuild_->completion_;
       }
       if (!validated.ok()) co_return validated;
+      // The FDS hold is Meta's promise that this exact source history remains
+      // available to another candidate. A target rebuild may retire only the
+      // physical residue left after that logical promise has been withdrawn.
+      if (desired_source_history_hold_.has_value()) {
+        co_return absl::FailedPreconditionError(
+            "cluster rebuild waits for source history hold release");
+      }
       if (replica_reconfiguration_running_) {
         co_return absl::FailedPreconditionError(
             "another cluster population transition is active");
@@ -3354,11 +3370,22 @@ class ReplicationManager::ReplicationGroup {
 
     // The candidate is already fully validated, so closing admission cannot
     // turn a malformed or stale directive into a denial of service against a
-    // healthy population. From here on, any uncertain teardown is fail-stop.
+    // healthy population. Session/proof teardown is fail-stop if uncertain;
+    // the idempotent physical backlog disable below remains retryable.
     StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
     storage_->SetReplicaLoading(true);
     storage_->SetExpirationAuthority(false);
 
+    struct TargetRebuildSourceIdentityGuard {
+      bool* preserve_ = nullptr;
+      ~TargetRebuildSourceIdentityGuard() { Release(); }
+      void Release() {
+        if (preserve_ == nullptr) return;
+        AssertStateOwner();
+        *preserve_ = false;
+        preserve_ = nullptr;
+      }
+    } source_identity_guard;
     std::shared_ptr<ReplicaSession> previous_session;
     {
       AssertStateOwner();
@@ -3369,6 +3396,14 @@ class ReplicationManager::ReplicationGroup {
             "cluster rebuild state changed before directive transition");
       }
       replica_reconfiguration_running_ = true;
+      // Flow teardown can discover an invalid source log and enter its normal
+      // reset path while revocation suspends below. Keep that reset from
+      // rotating the Meta-session identity during this target transition; it
+      // must still cancel sessions and disable the invalid physical history.
+      assert(!preserve_history_id_for_target_rebuild_);
+      preserve_history_id_for_target_rebuild_ = true;
+      source_identity_guard.preserve_ =
+          &preserve_history_id_for_target_rebuild_;
       if (superseding) {
         // Status, source authorization, and serving all become invalid in one
         // fail-closed transition before old flow work can be joined.
@@ -3433,17 +3468,6 @@ class ReplicationManager::ReplicationGroup {
         }
       }
 
-      absl::Status retired = cluster_group_->InvalidateProof(
-          previous_context->directive_.identity_);
-      if (!retired.ok()) {
-        const std::string reason =
-            absl::StrCat("superseded cluster proof could not be retired: ",
-                         retired.message());
-        (void)cluster_group_->FailStop(previous_context->directive_.identity_);
-        LatchReplicationFailure(reason);
-        co_return absl::FailedPreconditionError(reason);
-      }
-
       // The old coordinator owns the control connection rather than a
       // separately joinable task. Cancellation closes that socket; wait until
       // it observes the moved session and exits before starting its successor.
@@ -3458,9 +3482,55 @@ class ReplicationManager::ReplicationGroup {
           co_return waited;
         }
       }
+    }
+
+    // A fresh target transition owns cleanup of any old-primary backlog that
+    // survived logical failover cleanup. Preserve the boot-local history ID:
+    // Meta binds it to this control session, and a future promotion performs
+    // the normal rotating retirement before enabling a child source history.
+    absl::Status source_retired =
+        co_await RetireSourceHistory(SourceHistoryIdentityPolicy::kPreserve);
+    if (!source_retired.ok()) {
+      AssertStateOwner();
+      replica_reconfiguration_running_ = false;
+      if (previous_context != nullptr) {
+        previous_context->completion_->Resolve(absl::CancelledError(
+            "cluster rebuild supersession stopped during source history "
+            "cleanup"));
+      }
+      co_return source_retired;
+    }
+    source_identity_guard.Release();
+
+    // A fresh attempt has no installed context for shutdown reconciliation to
+    // retire while the cleanup above is suspended. Recheck the one-way stop
+    // fence before creating that context; there is no further await between
+    // this check and installation.
+    if (!superseding &&
+        (cluster_control_stopping_ ||
+         replication_shutdown_requested_.load(std::memory_order_acquire))) {
+      AssertStateOwner();
+      replica_reconfiguration_running_ = false;
+      co_return absl::CancelledError(
+          "cluster rebuild stopped after source history cleanup");
+    }
+
+    if (superseding) {
+      absl::Status retired = cluster_group_->InvalidateProof(
+          previous_context->directive_.identity_);
+      if (!retired.ok()) {
+        const std::string reason =
+            absl::StrCat("superseded cluster proof could not be retired: ",
+                         retired.message());
+        (void)cluster_group_->FailStop(previous_context->directive_.identity_);
+        LatchReplicationFailure(reason);
+        co_return absl::FailedPreconditionError(reason);
+      }
+
       previous_context->completion_->Resolve(absl::CancelledError(
           "cluster rebuild attempt was superseded after cleanup"));
-      if (cluster_control_stopping_) {
+      if (cluster_control_stopping_ ||
+          replication_shutdown_requested_.load(std::memory_order_acquire)) {
         AssertStateOwner();
         replica_reconfiguration_running_ = false;
         if (cluster_rebuild_ == previous_context) {
@@ -11834,7 +11904,9 @@ class ReplicationManager::ReplicationGroup {
     co_return absl::OkStatus();
   }
 
-  Task<absl::Status> DrainSourceEgress() {
+  Task<absl::Status> DrainSourceEgressExclusive(
+      SourceHistoryIdentityPolicy identity_policy =
+          SourceHistoryIdentityPolicy::kRotate) {
     assert(celer::ThisWorker().id_ == 0);
     // Demotion has already made the role non-master. Process shutdown closes
     // every registered source socket before request drain so retained history
@@ -11859,7 +11931,9 @@ class ReplicationManager::ReplicationGroup {
       master_sessions_.clear();
       retired_master_sessions_.clear();
       disconnected_replica_leases_.clear();
-      history_id_ = NewReplicationId();
+      if (identity_policy == SourceHistoryIdentityPolicy::kRotate) {
+        history_id_ = NewReplicationId();
+      }
     }
     for (const auto& session : sessions) session->Cancel();
     auto source_flows_active = [&] {
@@ -11884,6 +11958,16 @@ class ReplicationManager::ReplicationGroup {
     co_return absl::OkStatus();
   }
 
+  Task<absl::Status> DrainSourceEgress(
+      SourceHistoryIdentityPolicy identity_policy =
+          SourceHistoryIdentityPolicy::kRotate) {
+    assert(celer::ThisWorker().id_ == 0);
+    co_await source_history_retirement_mutex_.Lock(*celer::ThisWorker().self_);
+    celer::CrossWorkerMutex::Guard retirement_lock(
+        &source_history_retirement_mutex_);
+    co_return co_await DrainSourceEgressExclusive(identity_policy);
+  }
+
   Task<absl::Status> DisableSourceHistory() {
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       absl::Status disabled = co_await celer::SubmitTaskTo(
@@ -11893,8 +11977,18 @@ class ReplicationManager::ReplicationGroup {
     co_return absl::OkStatus();
   }
 
-  Task<absl::Status> RetireSourceHistory() {
-    absl::Status drained = co_await DrainSourceEgress();
+  Task<absl::Status> RetireSourceHistory(
+      SourceHistoryIdentityPolicy identity_policy =
+          SourceHistoryIdentityPolicy::kRotate) {
+    assert(celer::ThisWorker().id_ == 0);
+    // Drain moves source sessions into coroutine-local ownership. Serialize
+    // the whole drain+disable boundary so a concurrent shutdown or role
+    // transition cannot observe an empty registry and finish before the first
+    // owner has joined those flows.
+    co_await source_history_retirement_mutex_.Lock(*celer::ThisWorker().self_);
+    celer::CrossWorkerMutex::Guard retirement_lock(
+        &source_history_retirement_mutex_);
+    absl::Status drained = co_await DrainSourceEgressExclusive(identity_policy);
     if (!drained.ok()) co_return drained;
     co_return co_await DisableSourceHistory();
   }
@@ -12185,7 +12279,9 @@ class ReplicationManager::ReplicationGroup {
       master_sessions_.clear();
       disconnected_replica_leases_.clear();
       ClearSourceHistoryHoldLocked();
-      history_id_ = NewReplicationId();
+      if (!preserve_history_id_for_target_rebuild_) {
+        history_id_ = NewReplicationId();
+      }
     }
     for (const auto& session : cancelled) session->Cancel();
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
@@ -12334,6 +12430,11 @@ class ReplicationManager::ReplicationGroup {
   std::atomic<std::size_t> publish_queue_bytes_per_worker_{0};
   std::atomic<unsigned> replica_priority_{100};
   bool history_reset_running_ = false;  // worker 0 only
+  // A fresh Meta target rebuild keeps the current control-session identity
+  // while draining old source flows. Invalid-history cleanup still disables
+  // their backlog, but its ordinary source-incarnation rotation is deferred
+  // to a later promotion.
+  bool preserve_history_id_for_target_rebuild_ = false;  // worker 0 only
 
   const std::string node_id_;
   std::string group_id_;  // worker 0 only
@@ -12369,6 +12470,10 @@ class ReplicationManager::ReplicationGroup {
   celer::AsyncMutex redis_fullsync_mutex_;  // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};
   std::atomic<unsigned> active_master_controls_{0};
+  // DrainSourceEgress moves session ownership out of master_sessions_. Keep
+  // every drain/disable owner ordered so another transition cannot mistake
+  // the temporarily empty registry for a completed source-flow join.
+  celer::CrossWorkerMutex source_history_retirement_mutex_;
   mutable celer::CrossWorkerMutex master_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<MasterSession>>
       master_sessions_;
