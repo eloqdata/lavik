@@ -183,6 +183,13 @@ enum class MetaAuditPolicy : std::uint8_t {
   kStrictExport = 2,
 };
 
+// Version of the Raft command/WAL envelope, independent from individual
+// store codecs. Version 2 makes the ClusterCreate lifecycle cut explicit:
+// an older WAL whose opaque root intent predates the caller-owned Genesis id
+// must fail stop at decode instead of partially rebuilding Uninitialized
+// state. This changes no command tag.
+inline constexpr std::uint16_t kMetaCommandFormatVersion = 2;
+
 // Wire tag per command. Tags are append-only and never reused.
 enum class MetaCommandTag : std::uint16_t {
   kRegisterNode = 1,

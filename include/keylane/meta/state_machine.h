@@ -210,6 +210,12 @@ class MetaStateMachine : public nuraft::state_machine {
     std::lock_guard<std::mutex> lock(mutex_);
     return stores_.operation_.FindOperation(id);
   }
+  // Copies the topology-owned singleton lifecycle without exposing mutable
+  // stores to Admin request handlers.
+  MetaClusterLifecycleState ClusterLifecycle() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return stores_.topology_.ClusterLifecycle();
+  }
   std::optional<MetaNodeRecord> FindNode(const std::string& node_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return stores_.identity_.FindNode(node_id);

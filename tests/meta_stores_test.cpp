@@ -501,7 +501,16 @@ TEST(MetaIdentityStore, DeserializeRejectsInvariantViolations) {
 // ===========================================================================
 
 using keylane::meta::CreateGroup;
+using keylane::meta::MetaClusterLifecycle;
+using keylane::meta::MetaClusterTerminalOutcome;
+using keylane::meta::MetaOperationId;
 using keylane::meta::MetaTopologyStore;
+
+MetaOperationId MakeOperationId(std::uint8_t seed) {
+  MetaOperationId id{};
+  id.fill(seed);
+  return id;
+}
 
 std::string MakeGroupId(std::uint8_t seed) {
   return "group-" + std::string(1, static_cast<char>('a' + (seed & 0xF))) +
@@ -515,6 +524,67 @@ CreateGroup MakeCreateGroup(const std::string& group_id,
   cmd.group_id_ = group_id;
   cmd.new_topology_epoch_ = new_topology_epoch;
   return cmd;
+}
+
+// ---------------------------------------------------------------------------
+// Cluster lifecycle: one durable creation binding independent of topology
+// epochs and the operation journal's retention policy.
+// ---------------------------------------------------------------------------
+
+TEST(MetaTopologyStore, ClusterLifecycleBeginsAndCompletesIndependently) {
+  MetaTopologyStore store;
+  const MetaOperationId root = MakeOperationId(0x91);
+
+  EXPECT_EQ(store.ClusterLifecycle().state_,
+            MetaClusterLifecycle::kUninitialized);
+  EXPECT_EQ(store.ClusterLifecycle().revision_, 0u);
+  EXPECT_EQ(store.TopologyEpoch(), 0u);
+
+  ASSERT_TRUE(store.BeginClusterCreate(root, 42).ok());
+  EXPECT_EQ(store.ClusterLifecycle().state_, MetaClusterLifecycle::kCreating);
+  EXPECT_EQ(store.ClusterLifecycle().revision_, 1u);
+  EXPECT_EQ(store.ClusterLifecycle().root_operation_id_, root);
+  EXPECT_EQ(store.ClusterLifecycle().genesis_commit_index_, 42u);
+  EXPECT_EQ(store.ClusterLifecycle().terminal_outcome_,
+            MetaClusterTerminalOutcome::kNone);
+  EXPECT_EQ(store.TopologyEpoch(), 0u);
+
+  ASSERT_TRUE(store.BeginClusterCreate(root, 42).ok());
+  EXPECT_EQ(store.ClusterLifecycle().revision_, 1u);
+  ExpectDomainReject(store.BeginClusterCreate(MakeOperationId(0x92), 43));
+
+  ASSERT_TRUE(store.CompleteClusterCreate(root).ok());
+  EXPECT_EQ(store.ClusterLifecycle().state_, MetaClusterLifecycle::kCreated);
+  EXPECT_EQ(store.ClusterLifecycle().revision_, 2u);
+  EXPECT_EQ(store.ClusterLifecycle().terminal_outcome_,
+            MetaClusterTerminalOutcome::kCreated);
+  EXPECT_TRUE(store.ClusterLifecycle().failure_summary_.empty());
+  EXPECT_EQ(store.TopologyEpoch(), 0u);
+
+  ASSERT_TRUE(store.CompleteClusterCreate(root).ok());
+  EXPECT_EQ(store.ClusterLifecycle().revision_, 2u);
+  ExpectDomainReject(store.FailClusterCreate(root, "too late"));
+}
+
+TEST(MetaTopologyStore, ClusterLifecycleFailureIsBoundedAndSerialized) {
+  MetaTopologyStore store;
+  const MetaOperationId root = MakeOperationId(0x93);
+  ASSERT_TRUE(store.BeginClusterCreate(root, 77).ok());
+  ASSERT_TRUE(store.FailClusterCreate(root, "initial population failed").ok());
+
+  const auto loaded = MetaTopologyStore::Deserialize(store.Serialize());
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  EXPECT_EQ(loaded->ClusterLifecycle(), store.ClusterLifecycle());
+  EXPECT_EQ(loaded->ClusterLifecycle().state_,
+            MetaClusterLifecycle::kProvisioningFailed);
+  EXPECT_EQ(loaded->ClusterLifecycle().failure_summary_,
+            "initial population failed");
+  ExpectDomainReject(store.FailClusterCreate(
+      root,
+      std::string(keylane::meta::kMaxMetaClusterFailureSummaryBytes + 1,
+                  'x')));
+  ExpectDomainReject(store.FailClusterCreate(root, ""));
+  ExpectDomainReject(store.FailClusterCreate(root, "unsafe\nsummary"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,6 +1143,7 @@ MetaTopologyStore MakePopulatedTopology() {
 
 void ExpectEqualTopology(const MetaTopologyStore& a,
                          const MetaTopologyStore& b) {
+  EXPECT_EQ(a.ClusterLifecycle(), b.ClusterLifecycle());
   EXPECT_EQ(a.TopologyEpoch(), b.TopologyEpoch());
   EXPECT_EQ(a.GroupCount(), b.GroupCount());
   EXPECT_EQ(a.FindGroup("group-a"), b.FindGroup("group-a"));
@@ -1092,7 +1163,7 @@ TEST(MetaTopologyStore, SerializationRoundTrip) {
   ASSERT_GE(bytes.size(), 2u);
   const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
   EXPECT_EQ(static_cast<std::uint16_t>(p[0] | (p[1] << 8)),
-            keylane::meta::kMetaFormatVersion);
+            keylane::meta::kMetaTopologyStoreFormatVersion);
 
   const auto loaded = MetaTopologyStore::Deserialize(bytes);
   ASSERT_TRUE(loaded.ok()) << loaded.status();
@@ -1143,6 +1214,10 @@ TEST(MetaTopologyStore, DeserializeRejectsCorruption) {
   std::string bad_version = bytes;
   bad_version[0] = '\x7F';
   ExpectStoreFailStop(MetaTopologyStore::Deserialize(bad_version).status());
+  std::string old_development_version = bytes;
+  old_development_version[0] = '\x01';
+  ExpectStoreFailStop(
+      MetaTopologyStore::Deserialize(old_development_version).status());
 }
 
 // Hand-builds a topology blob from parts, so in-byte invariant violations
@@ -1158,7 +1233,14 @@ std::string MakeTopologyBlob(
     std::uint64_t topology_epoch, const std::vector<TopologyBlobGroup>& groups,
     const std::vector<keylane::meta::MetaSlotAssignment>& runs) {
   keylane::meta::MetaWriter w;
-  w.WriteU16(keylane::meta::kMetaFormatVersion);
+  w.WriteU16(keylane::meta::kMetaTopologyStoreFormatVersion);
+  w.WriteU8(static_cast<std::uint8_t>(MetaClusterLifecycle::kUninitialized));
+  w.WriteU64(0);
+  keylane::meta::WriteFixedArray(w, MetaOperationId{});
+  w.WriteU64(0);
+  w.WriteU8(
+      static_cast<std::uint8_t>(MetaClusterTerminalOutcome::kNone));
+  w.WriteString("");
   w.WriteU64(topology_epoch);
   w.WriteCount(static_cast<std::uint32_t>(groups.size()));
   for (const TopologyBlobGroup& group : groups) {

@@ -197,6 +197,8 @@ namespace {
 constexpr std::size_t kMaxLineBytes = 64 * 1024;
 constexpr auto kClusterStatusSendDeadline = std::chrono::seconds(5);
 
+std::string HexEncode(std::string_view bytes);
+
 void NotifyCtlShutdownDrained(auto& core) {
   if (!core.shutdown_ || core.accept_loop_running_ || !core.sessions_.empty()) {
     return;
@@ -412,6 +414,43 @@ std::string BuildClusterStatusReply(
       .committed_index_ = view.applied_index_,
       .topology_epoch_ = view.topology_epoch_,
   };
+  status.lifecycle_revision_ = view.cluster_lifecycle_.revision_;
+  switch (view.cluster_lifecycle_.state_) {
+    case MetaClusterLifecycle::kUninitialized:
+      status.cluster_state_ =
+          view.cluster_non_pristine_ ? ClusterStateWireV1::kNonPristine
+                                     : ClusterStateWireV1::kUninitialized;
+      break;
+    case MetaClusterLifecycle::kCreating:
+      status.cluster_state_ = ClusterStateWireV1::kCreating;
+      break;
+    case MetaClusterLifecycle::kCreated:
+      status.cluster_state_ = ClusterStateWireV1::kCreated;
+      break;
+    case MetaClusterLifecycle::kProvisioningFailed:
+      status.cluster_state_ = ClusterStateWireV1::kProvisioningFailed;
+      break;
+  }
+  if (view.cluster_lifecycle_.state_ !=
+      MetaClusterLifecycle::kUninitialized) {
+    status.root_operation_id_ = HexEncode(std::string_view(
+        reinterpret_cast<const char*>(
+            view.cluster_lifecycle_.root_operation_id_.data()),
+        view.cluster_lifecycle_.root_operation_id_.size()));
+    status.genesis_commit_index_ =
+        view.cluster_lifecycle_.genesis_commit_index_;
+  }
+  if (view.cluster_lifecycle_.state_ == MetaClusterLifecycle::kCreating) {
+    status.cluster_create_phase_ =
+        view.active_cluster_create_phase_.empty()
+            ? std::string("submitted")
+            : view.active_cluster_create_phase_;
+  }
+  if (view.cluster_lifecycle_.state_ ==
+      MetaClusterLifecycle::kProvisioningFailed) {
+    status.provisioning_failure_summary_ =
+        view.cluster_lifecycle_.failure_summary_;
+  }
   status.meta_available_ = true;
   status.meta_members_ = StatusMembers(active_meta_members, server->get_id());
   if (view.active_cluster_create_operation_) {
@@ -713,35 +752,6 @@ std::string BuildClusterStatusReply(
   return *encoded;
 }
 
-std::string ClusterCreateLastBlocker(
-    const nuraft::ptr<nuraft::raft_server>& server,
-    const nuraft::ptr<MetaStateMachine>& state_machine,
-    const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
-    std::uint32_t observation_ttl_ms, const ClusterCreateManifestV1& manifest) {
-  auto status = DecodeClusterStatusReply(BuildClusterStatusReply(
-      server, state_machine, runtime_status, observation_ttl_ms));
-  if (!status.ok()) return {};
-
-  const ClusterBlockerWireV1* selected = nullptr;
-  for (const ClusterBlockerWireV1& blocker : status->blockers_) {
-    if (!blocker.scope_.starts_with("node:")) continue;
-    const std::string_view node_id =
-        std::string_view(blocker.scope_)
-            .substr(std::string_view("node:").size());
-    if (std::any_of(
-            manifest.data_nodes_.begin(), manifest.data_nodes_.end(),
-            [&](const auto& node) { return node.node_id_ == node_id; })) {
-      selected = &blocker;
-    }
-  }
-  if (selected == nullptr && !status->blockers_.empty())
-    selected = &status->blockers_.back();
-  if (selected == nullptr) return {};
-  return absl::StrCat(" last_blocker=", selected->code_,
-                      " scope=", selected->scope_,
-                      " detail=", selected->detail_);
-}
-
 const char* AuditPolicyName(MetaAuditPolicy policy) {
   switch (policy) {
     case MetaAuditPolicy::kDisabled:
@@ -889,8 +899,6 @@ bool ParseHexBytes(const std::string& text, std::size_t hex_chars,
   }
   return true;
 }
-
-std::string HexEncode(std::string_view bytes);
 
 bool ParseOperationId(const std::string& text, MetaOperationId& out) {
   return ParseHexBytes(text, 32, out.data());
@@ -1068,7 +1076,11 @@ celer::Task<std::string> HandleSubmitOp(
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& kind, const std::string& payload,
     const MetaReplicationHistoryId& replication_history_id) {
-  if (kind == kMetaMembershipOperationKind) co_return "ERR workflow-owned";
+  if (kind == kMetaMembershipOperationKind ||
+      kind == kMetaClusterCreateOperationKind ||
+      kind == kMetaClusterCreateV1GroupOperationKind) {
+    co_return "ERR workflow-owned";
+  }
   SubmitOperation command;
   command.request_id_ = MakeRequestId();
   command.operation_id_ = id;
@@ -1097,6 +1109,11 @@ celer::Task<std::string> HandleCompleteOp(
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& result) {
+  const auto lifecycle = state_machine->ClusterLifecycle();
+  if (lifecycle.state_ != MetaClusterLifecycle::kUninitialized &&
+      lifecycle.root_operation_id_ == id) {
+    co_return "ERR workflow-owned";
+  }
   // The CAS token comes from the local committed state: on the leader that
   // accepted the submit, the record is visible at its post-submit revision.
   // A freshly elected leader may legitimately lag behind the submit's OK —
@@ -1107,15 +1124,15 @@ celer::Task<std::string> HandleCompleteOp(
   if (!record.has_value()) {
     co_return "ERR not-found";
   }
-  if (IsTerminal(record->lifecycle_)) {
-    co_return "ERR terminal";
-  }
   // Releasing this reservation while NuRaft still owns an accepted invite or
   // leave would allow a second workflow to overtake its uncertain outcome.
   if (record->kind_ == kMetaMembershipOperationKind ||
       record->kind_ == kMetaClusterCreateOperationKind ||
       record->kind_ == kMetaClusterCreateV1GroupOperationKind)
     co_return "ERR workflow-owned";
+  if (IsTerminal(record->lifecycle_)) {
+    co_return "ERR terminal";
+  }
   CompleteOperation command;
   command.request_id_ = MakeRequestId();
   command.operation_id_ = id;
@@ -1141,18 +1158,23 @@ celer::Task<std::string> HandleAbortOp(
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& reason) {
+  const auto lifecycle = state_machine->ClusterLifecycle();
+  if (lifecycle.state_ != MetaClusterLifecycle::kUninitialized &&
+      lifecycle.root_operation_id_ == id) {
+    co_return "ERR workflow-owned";
+  }
   const std::optional<MetaOperationRecord> record =
       state_machine->FindOperation(id);
   if (!record.has_value()) {
     co_return "ERR not-found";
   }
-  if (IsTerminal(record->lifecycle_)) {
-    co_return "ERR terminal";
-  }
   if (record->kind_ == kMetaMembershipOperationKind ||
       record->kind_ == kMetaClusterCreateOperationKind ||
       record->kind_ == kMetaClusterCreateV1GroupOperationKind)
     co_return "ERR workflow-owned";
+  if (IsTerminal(record->lifecycle_)) {
+    co_return "ERR terminal";
+  }
   AbortOperation command;
   command.request_id_ = MakeRequestId();
   command.operation_id_ = id;
@@ -1504,6 +1526,18 @@ std::string ClusterCreateError(std::string_view stage, std::string_view code,
   return absl::StrCat("ERR clustercreate 1 ", stage, " ", code, " ", detail);
 }
 
+std::string ClusterAlreadyCreatedError(
+    std::string_view stage, const MetaClusterLifecycleState& lifecycle) {
+  return ClusterCreateError(
+      stage, "already-created",
+      absl::StrCat("Meta already owns a Data cluster; operation=",
+                   HexEncode(std::string_view(
+                       reinterpret_cast<const char*>(
+                           lifecycle.root_operation_id_.data()),
+                       lifecycle.root_operation_id_.size())),
+                   " genesis=", lifecycle.genesis_commit_index_));
+}
+
 // Admission persists the whole plan BEFORE topology mutation. The leader
 // reconciler, not this connection or its timeout, owns all subsequent work.
 celer::Task<std::string> HandleClusterCreate(
@@ -1511,38 +1545,47 @@ celer::Task<std::string> HandleClusterCreate(
     const nuraft::ptr<MetaStateMachine>& state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
     const std::shared_ptr<MetaMembershipGate>& membership_gate,
-    const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
-    std::uint32_t observation_ttl_ms, AuthenticatedPrincipal principal,
-    const ClusterCreateManifestV1& manifest, std::uint32_t wait_timeout_ms,
-    const bool* shutdown) {
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(wait_timeout_ms);
+    AuthenticatedPrincipal principal,
+    const ClusterCreateManifestV1& manifest,
+    const MetaOperationId& root_operation_id, const bool* shutdown) {
+  const std::string id = HexEncode(std::string_view(
+      reinterpret_cast<const char*>(root_operation_id.data()),
+      root_operation_id.size()));
   if (*shutdown)
-    co_return ClusterCreateError("preflight", "uncertain-outcome",
+    co_return ClusterCreateError("preflight", "pre-commit-failed",
                                  "Meta is shutting down");
+  const auto observed = state_machine->StoresSnapshot();
+  if (observed.topology_.ClusterLifecycle().state_ !=
+      MetaClusterLifecycle::kUninitialized) {
+    co_return ClusterAlreadyCreatedError(
+        "preflight", observed.topology_.ClusterLifecycle());
+  }
   auto create_lease = membership_gate->TryAcquire();
   if (create_lease == nullptr) {
     co_return ClusterCreateError(
-        "preflight", "domain-rejected",
+        "preflight", "pre-commit-failed",
         "another cluster creation or Meta membership change is in progress");
   }
   if (!server->is_leader() || !server->is_leader_alive() ||
       !server->is_leader_sm_fully_caught_up()) {
-    co_return ClusterCreateError("preflight", "not-leader",
+    co_return ClusterCreateError("preflight", "pre-commit-failed",
                                  "responder is not an eligible leader");
   }
-  const auto status = state_machine->StatusSnapshot();
   const auto before = state_machine->StoresSnapshot();
-  if (status.active_cluster_create_operation_ ||
-      before.operation_.HasActiveKind(kMetaMembershipOperationKind)) {
-    co_return ClusterCreateError("preflight", "domain-rejected",
-                                 "another cluster creation is in progress");
+  const auto& lifecycle = before.topology_.ClusterLifecycle();
+  if (lifecycle.state_ != MetaClusterLifecycle::kUninitialized) {
+    co_return ClusterAlreadyCreatedError("preflight", lifecycle);
+  }
+  if (before.operation_.HasActiveKind(kMetaMembershipOperationKind)) {
+    co_return ClusterCreateError(
+        "preflight", "pre-commit-failed",
+        "a Meta membership workflow is active");
   }
   MetaClusterCreateRaftView raft_view;
   raft_view.local_server_id_ = server->get_id();
   auto config = CaptureMembershipConfig(server->get_config());
   if (!config.ok()) {
-    co_return ClusterCreateError("preflight", "domain-rejected",
+    co_return ClusterCreateError("preflight", "pre-commit-failed",
                                  std::string(config.status().message()));
   }
   raft_view.members_ = std::move(*config);
@@ -1550,122 +1593,66 @@ celer::Task<std::string> HandleClusterCreate(
   if (auto meta =
           detail::ValidateClusterCreateMetaSet(committed, manifest, raft_view);
       !meta.ok()) {
-    co_return ClusterCreateError("preflight", "non-empty-cluster",
+    co_return ClusterCreateError("preflight", "bad-request",
                                  std::string(meta.message()));
   }
-  if (before.identity_.NodeCount() != 0 || before.topology_.GroupCount() != 0 ||
-      !status.slot_ranges_.empty() || before.population_manifest_.Size() != 0) {
-    co_return ClusterCreateError("preflight", "non-empty-cluster",
-                                 "requires the exact Meta set and empty "
-                                 "Data, Group, slot, population state");
+  if (HasDataClusterArtifacts(before)) {
+    co_return ClusterCreateError(
+        "preflight", "non-pristine",
+        "Uninitialized Meta contains Data-cluster artifacts");
   }
-  // A fixed wait budget makes intent independent of a particular Admin
-  // connection. The existing versioned codec retains every normalized field.
-  auto intent = EncodeClusterCreateRequest(manifest, 1);
+  auto intent = EncodeClusterCreateRequest(manifest, root_operation_id);
   if (!intent.ok())
     co_return ClusterCreateError("preflight", "bad-request",
                                  std::string(intent.status().message()));
   SubmitOperation submit;
   submit.request_id_ = MakeRequestId();
-  submit.operation_id_ = MakeOperationId();
+  submit.operation_id_ = root_operation_id;
   submit.kind_ = kMetaClusterCreateOperationKind;
   submit.intent_ = *intent;
   submit.intent_hash_ = MetaSha256(submit.intent_);
-  const auto operation_id = submit.operation_id_;
-  const std::string id = HexEncode(std::string_view(
-      reinterpret_cast<const char*>(operation_id.data()), operation_id.size()));
-  const auto reply =
-      co_await ProposeCommand(coordinator, std::move(principal), submit);
-  if (!reply.starts_with("OK ")) {
-    co_return ClusterCreateError("submit-operation", "uncertain-outcome",
-                                 absl::StrCat(reply, " operation=", id));
+  auto applied =
+      co_await coordinator->Propose(MetaCommand{submit}, std::move(principal));
+  if (!applied.ok()) {
+    const bool uncertain =
+        applied.status().code() == absl::StatusCode::kDeadlineExceeded ||
+        applied.status().code() == absl::StatusCode::kCancelled ||
+        applied.status().code() == absl::StatusCode::kInternal;
+    co_return ClusterCreateError(
+        "proposal", uncertain ? "uncertain-outcome" : "pre-commit-failed",
+        absl::StrCat(applied.status().message(), "; operation=", id));
   }
-  if (!state_machine->FindOperation(operation_id).has_value())
-    co_return ClusterCreateError("submit-operation", "domain-rejected",
-                                 "committed intent is absent");
-  // Durable admission bridges the handoff to the background lease. Membership
-  // handlers also check HasActiveKind, including after process restart.
+  if (applied->verdict_ != MetaAuditVerdict::kAccepted) {
+    const auto after = state_machine->StoresSnapshot();
+    if (after.topology_.ClusterLifecycle().state_ !=
+        MetaClusterLifecycle::kUninitialized) {
+      co_return ClusterAlreadyCreatedError(
+          "proposal", after.topology_.ClusterLifecycle());
+    }
+    if (HasDataClusterArtifacts(after)) {
+      co_return ClusterCreateError(
+          "proposal", "non-pristine",
+          "Uninitialized Meta acquired Data-cluster artifacts before commit");
+    }
+    co_return ClusterCreateError("proposal", "pre-commit-failed",
+                                 applied->detail_);
+  }
+  const auto committed_stores = state_machine->StoresSnapshot();
+  const auto& accepted = committed_stores.topology_.ClusterLifecycle();
+  // The background reconciler can terminalize a very small workflow before
+  // this read. Any non-Uninitialized state with the exact Genesis identity
+  // proves the atomic admission commit; readiness and terminal outcome are
+  // reported separately through cluster-status.
+  if (accepted.state_ == MetaClusterLifecycle::kUninitialized ||
+      accepted.root_operation_id_ != root_operation_id ||
+      accepted.genesis_commit_index_ != applied->log_index_) {
+    co_return ClusterCreateError(
+        "proposal", "uncertain-outcome",
+        absl::StrCat("committed aggregate could not be verified; operation=",
+                     id));
+  }
   create_lease.reset();
-  std::string phase = "wait-meta-barrier";
-  while (std::chrono::steady_clock::now() < deadline) {
-    // Closing the Admin socket does not cancel a suspended coroutine. This
-    // worker-owned flag must be checked even while Raft still reports leader:
-    // process teardown drains Admin BEFORE stopping Raft.
-    if (*shutdown || !server->is_leader() || !server->is_leader_alive()) {
-      co_return ClusterCreateError(
-          phase, "uncertain-outcome",
-          absl::StrCat("wait cancelled; durable operation=", id));
-    }
-    const auto operation = state_machine->FindOperation(operation_id);
-    if (!operation.has_value())
-      co_return ClusterCreateError(phase, "uncertain-outcome",
-                                   "operation disappeared");
-    if (operation->lifecycle_ == MetaOperationLifecycle::kCompleted) {
-      ClusterCreateOutcome outcome;
-      outcome.committed_index_ = state_machine->StatusSnapshot().applied_index_;
-      outcome.groups_.reserve(manifest.groups_.size());
-      for (const auto& declaration : manifest.groups_) {
-        const MetaOperationId group_id =
-            detail::ClusterCreateV1GroupOperationId(operation_id,
-                                                    declaration.group_id_);
-        const auto group_operation = state_machine->FindOperation(group_id);
-        if (!group_operation.has_value() ||
-            group_operation->lifecycle_ != MetaOperationLifecycle::kCompleted ||
-            group_operation->terminal_receipts_.empty()) {
-          co_return ClusterCreateError(
-              "finish-operation", "uncertain-outcome",
-              absl::StrCat("group=", declaration.group_id_,
-                           " completed proof is absent; operation=", id));
-        }
-        std::uint64_t committed_index = 0;
-        for (const MetaTerminalReceipt& receipt :
-             group_operation->terminal_receipts_) {
-          committed_index = std::max(committed_index, receipt.committed_index_);
-        }
-        outcome.groups_.push_back(
-            {.group_id_ = declaration.group_id_,
-             .committed_index_ = committed_index,
-             .operation_id_ = HexEncode(std::string_view(
-                 reinterpret_cast<const char*>(group_id.data()),
-                 group_id.size()))});
-      }
-      std::string response =
-          absl::StrCat("OK clustercreate 1 ", outcome.committed_index_, " ",
-                       outcome.groups_.size());
-      for (const auto& group : outcome.groups_) {
-        absl::StrAppend(&response, " ", HexEncode(group.group_id_), " ",
-                        group.committed_index_, " ", group.operation_id_);
-      }
-      co_return response;
-    }
-    if (operation->lifecycle_ == MetaOperationLifecycle::kAborted) {
-      co_return ClusterCreateError(
-          phase, "data-rejected",
-          operation->terminal_result_ +
-              ClusterCreateLastBlocker(server, state_machine, runtime_status,
-                                       observation_ttl_ms, manifest));
-    }
-    if (!operation->kind_phase_blob_.empty())
-      phase = operation->kind_phase_blob_;
-    if (phase.starts_with("recovery-required:")) {
-      co_return ClusterCreateError(
-          "recovery", "domain-rejected",
-          absl::StrCat(
-              phase, " operation=", id,
-              ClusterCreateLastBlocker(server, state_machine, runtime_status,
-                                       observation_ttl_ms, manifest)));
-    }
-    const auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                                std::chrono::milliseconds(10));
-    if (!slept.ok()) break;
-  }
-  co_return ClusterCreateError(
-      phase, "uncertain-outcome",
-      absl::StrCat(
-          "wait deadline expired; background creation continues; operation=",
-          id,
-          ClusterCreateLastBlocker(server, state_machine, runtime_status,
-                                   observation_ttl_ms, manifest)));
+  co_return absl::StrCat("OK clustercreate 1 ", applied->log_index_, " ", id);
 }
 
 celer::Task<std::string> HandlePruneAudit(
@@ -1846,7 +1833,8 @@ celer::Task<std::string> HandleConfigChange(
     ctl_endpoint = keylane::FormatNumericEndpoint(*ctl);
   }
   const auto before = state_machine->StoresSnapshot();
-  if (before.operation_.HasActiveKind(kMetaClusterCreateOperationKind))
+  if (before.topology_.ClusterLifecycle().state_ ==
+      MetaClusterLifecycle::kCreating)
     co_return "ERR config-changing";
   std::optional<MetaOperationId> operation_id;
   // Retrying an identical in-flight request attaches to its original task.
@@ -2331,7 +2319,7 @@ celer::Task<std::string> DispatchCommand(
   }
   if (command == "clustercreate") {
     if (!creation_enabled)
-      co_return ClusterCreateError("preflight", "runtime-unavailable",
+      co_return ClusterCreateError("preflight", "pre-commit-failed",
                                    "cluster-create reconciler is unavailable");
     if (tokens.size() != 3) {
       co_return ClusterCreateError("decode", "bad-request",
@@ -2341,16 +2329,15 @@ celer::Task<std::string> DispatchCommand(
       co_return ClusterCreateError("decode", "bad-request",
                                    "unsupported protocol version");
     }
-    std::uint32_t wait_timeout_ms = 0;
-    auto manifest = DecodeClusterCreateRequest(line, &wait_timeout_ms);
+    MetaOperationId root_operation_id{};
+    auto manifest = DecodeClusterCreateRequest(line, &root_operation_id);
     if (!manifest.ok()) {
       co_return ClusterCreateError("decode", "bad-request",
                                    std::string(manifest.status().message()));
     }
     co_return co_await HandleClusterCreate(
         server, state_machine, coordinator, membership_gate,
-        data_control_runtime_status, observation_ttl_ms, std::move(principal),
-        *manifest, wait_timeout_ms, shutdown);
+        std::move(principal), *manifest, root_operation_id, shutdown);
   }
   if (command == "submitop" || command == "completeop" ||
       command == "abortop" || command == "archiveoperations" ||

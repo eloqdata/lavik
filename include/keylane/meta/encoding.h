@@ -5,8 +5,10 @@
 //
 // Wire conventions:
 //   - Fixed-width integers (u8/u16/u32/u64) are little-endian.
-//   - Every committed blob (command or record) starts with a u16 format
-//     version; readers accept exactly kMetaFormatVersion.
+//   - Every committed envelope starts with a u16 format version; its owning
+//     module declares and validates the exact marker. Most v1 stores share
+//     kMetaFormatVersion, while independently evolved envelopes use a
+//     module-specific constant.
 //   - Variable-length byte strings carry a u32 length prefix; readers always
 //     enforce a caller-supplied cap, and the cap check precedes the bounds
 //     check so an over-cap prefix fails even on a truncated buffer.
@@ -86,12 +88,14 @@ inline constexpr std::uint64_t kMaxMetaUncompactedWalBytes = 1ull
 
 // ---------------------------------------------------------------------------
 // Durable format versioning. Keylane does not negotiate mixed Meta binary
-// schemas: a release reads and writes exactly this format. Incompatible
-// pre-release data directories must be recreated instead of migrated.
+// schemas. Each envelope reads and writes exactly its declared format, and
+// incompatible pre-release data directories are recreated instead of
+// migrated.
 // ---------------------------------------------------------------------------
 
-// The unreleased schema evolves in place as v1, including optional Meta
-// Admin endpoints. This number does not promise compatibility with earlier
+// Shared marker for the stores, records, exports, and aggregate envelopes that
+// remain at v1. Commands and independently evolved stores declare their own
+// constants. Equal markers do not promise compatibility with earlier
 // development layouts; those data directories must be recreated.
 inline constexpr std::uint16_t kMetaFormatVersion = 1;
 

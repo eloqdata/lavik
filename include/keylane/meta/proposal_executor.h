@@ -47,11 +47,10 @@ class MetaProposalExecutor {
 };
 
 // NuRaft accepts only one membership change at a time. Initial cluster creation
-// shares this gate to reserve the pristine topology and keep its single-Meta
-// precondition stable. Every Admin listener and both workflow reconcilers share
-// one gate. After intent submission the background owner holds the lease;
-// the durable active-kind check bridges handoff and restart. No mutex is held
-// across suspension, and an Admin timeout does not abandon the reservation.
+// shares this gate so membership cannot race its singleton lifecycle admission.
+// Every Admin listener and both workflow reconcilers share one gate. After
+// intent submission the background owner holds the lease; the durable Creating
+// lifecycle bridges handoff and restart. No mutex is held across suspension.
 class MetaMembershipGate
     : public std::enable_shared_from_this<MetaMembershipGate> {
  public:

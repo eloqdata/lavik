@@ -70,9 +70,9 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
         {0, 8191, "group-a"},
         {8192, 16'383, "group-b"},
     };
-    auto intent = EncodeClusterCreateRequest(manifest_, 1);
-    ASSERT_TRUE(intent.ok()) << intent.status();
     root_.fill(8);
+    auto intent = EncodeClusterCreateRequest(manifest_, root_);
+    ASSERT_TRUE(intent.ok()) << intent.status();
     SubmitOperation submit;
     submit.operation_id_ = root_;
     submit.kind_ = kMetaClusterCreateOperationKind;

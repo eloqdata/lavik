@@ -44,7 +44,7 @@ stores:
 | Store | Durable responsibility |
 |---|---|
 | Identity | Data-node certificate principal bindings and retired identities; Meta-member principal bindings |
-| Topology | Groups, membership, owners, epochs, manifest references, and slot ranges |
+| Topology | Single-Data-cluster lifecycle, Groups, membership, owners, epochs, manifest references, and slot ranges |
 | Policy | Versioned, content-addressed policy documents and retirement state |
 | Grant | Group terms and authority grants, including fencing and lease parameters |
 | Operation | Idempotent operation lifecycle, current directives, durable terminal receipts, and exported/prunable terminal summaries |
@@ -89,6 +89,27 @@ and impossible apply ordering fail stop. Replaying the same entry at the same
 index is idempotent and produces the same verdict and audit record;
 correctness does not depend on apply running only once.
 
+The topology store also owns an independently revisioned cluster lifecycle:
+`Uninitialized`, `Creating`, `Created`, or `ProvisioningFailed`. A Meta Raft
+cluster owns at most one logical Data cluster. The root Cluster Create
+`SubmitOperation` and `Uninitialized -> Creating` transition occur on
+candidate copies in one apply; root completion or abort similarly updates the
+operation and terminal lifecycle together. These transitions do not advance
+the topology epoch. The topology record permanently retains the root operation
+id, Genesis commit index, terminal outcome, and a bounded non-sensitive failure
+summary, while the manifest remains only in the root operation during
+creation. Operation archive or pruning therefore cannot reopen creation.
+Snapshot decode requires `Creating` to name exactly one matching non-terminal
+root whose operation sequence equals the Genesis index; a missing or mismatched
+half is fail-stop corruption. Terminal lifecycle permits that root to be live,
+archived, or pruned. An `Uninitialized` snapshot containing Data-cluster
+artifacts remains decodable and is reported as `non-pristine`. The lifecycle is
+part of the topology-store durable format. Keylane is pre-release, so this
+format change has no migration path; older development data directories must be
+rebuilt. The Raft command/WAL envelope version also advances without adding a
+command tag, so a WAL-only directory containing the older opaque creation
+intent fails stop at decode rather than replaying a partial lifecycle.
+
 Failover preparation uses one top-level durable operation whose intent and
 phase blobs have strict versioned codecs. The implemented graph ends at
 `promotion-prepared`:
@@ -110,12 +131,16 @@ an unrelated collection limit. An oversized snapshot fails that snapshot
 round. Once uncompacted WAL or consecutive snapshot-failure guards fire, the
 coordinator rejects ordinary proposals with `RESOURCE_EXHAUSTED`. It simulates
 an explicit recovery command against one committed view and admits exactly one
-whose effect advances the bounded recovery chain: empty-result terminalization
-of a live operation, movement of terminal records into the archive, removal of
+whose effect advances the bounded recovery chain: terminalization of a live
+operation, movement of terminal records into the archive, removal of
 existing archived summaries or terminal receipts, removal of an existing
 unreferenced manifest, or an audit prune whose serialized window is smaller
-even after its own audit record. A no-op prune, stale revision, nonempty result,
-or other nominally whitelisted command is rejected before Raft append.
+even after its own audit record. Generic terminalization still requires a
+bounded empty result. Cluster Create root terminalization is instead simulated
+against the complete stores and must atomically produce `Created` with
+`cluster-created`, or `ProvisioningFailed` with an abort; validating only the
+operation half is not safe recovery. A no-op prune, stale revision, or other
+nominally whitelisted command is rejected before Raft append.
 The recovery reservation follows the actual NuRaft proposal until it resolves,
 even if its caller times out, so another recovery step cannot overtake an
 uncertain outcome. After enough state is removed, a successful snapshot clears
@@ -486,8 +511,11 @@ peers must use the same layout; earlier pre-release layouts have no
 compatibility or negotiation path. This wire version is independent of the
 durable schemas below.
 
-Commands, records, exports, snapshots, and WAL replay carry exact schema
-version 1. Every configured Meta identity has one canonical concrete numeric
+Commands, stores, records, exports, snapshots, and the physical segmented WAL
+carry independent exact format markers. The command envelope and topology
+store are v2 for the cluster lifecycle cut; the aggregate snapshot envelope,
+other persisted stores, and segmented-WAL container retain their existing v1
+markers. Every configured Meta identity has one canonical concrete numeric
 Data-control endpoint and one canonical concrete numeric Admin endpoint. The
 NuRaft `srv_config::aux` `KMI2` descriptor carries the server id, derived
 principal, and both endpoints; Raft keeps its endpoint in the native field.
@@ -504,12 +532,12 @@ population identity, history, operation id, and evidence hash. Snapshot decoding
 malformed identity anchors and evidence that names a missing group or an
 impossible future group/population epoch; older committed evidence remains
 valid history after a group legitimately advances or the reporter moves.
-The unreleased schema and segmented WAL evolve in place as v1. This label
-does not guarantee compatibility with earlier development layouts: their
-data directories are recreated rather than migrated. Keylane Meta does not
-negotiate durable formats between mixed binary versions and has no in-band
-schema-switch command. Incompatible changes require coordinated replacement
-of the Meta cluster.
+These unreleased formats evolve independently in place. A shared version
+number in one layer does not guarantee compatibility with earlier development
+layouts: their data directories are recreated rather than migrated. Keylane
+Meta does not negotiate durable formats between mixed binary versions and has
+no in-band schema-switch command. Incompatible changes require coordinated
+replacement of the Meta cluster.
 Readers reject unknown markers and trailing bytes so incompatible state fails
 at startup or replay instead of being interpreted approximately. The
 independent segmented-WAL marker follows the same fail-loudly rule.
@@ -572,9 +600,9 @@ handles a crash between an effect and its phase checkpoint. If the removal
 target becomes leader during recovery, it yields leadership before another
 leader continues the same removal.
 
-Creation and membership operations share durable admission as well as one
-leader-local lease. Identical in-flight membership requests attach to the
-existing task; conflicting requests cannot bypass it after timeout or restart.
+Creating lifecycle and membership operations share durable admission as well
+as one leader-local lease. Identical in-flight membership requests attach to
+the existing task; conflicting requests cannot bypass it after timeout or restart.
 Generic Admin submit/complete/abort commands cannot create or abandon a
 membership workflow. A timed-out invite can still commit, so cancelling its
 wait does not release this reservation. Demotion joins only queued/local
@@ -648,20 +676,28 @@ committed Meta-directory check; a changed bracket returns `cut_changed`
 instead of mixed state. Captures are single-flight across both Admin listeners.
 Completed replies release the capture permit before sending, share a 256 MiB
 retained-reply budget, and a slow receiver loses the connection after five
-seconds rather than delaying Data heartbeats. The compact committed cut also
-carries whether a non-terminal `cluster-create-workflow-v1` root exists, its
-phase, and only the declared Data ids needed for diagnostics. The server
-exposes `cluster_create_active` plus specific `meta_catching_up`,
+seconds rather than delaying Data heartbeats. The compact committed cut carries
+the topology-owned cluster lifecycle, its revision, root operation id, Genesis
+commit index, and any creating phase or terminal failure summary. While
+`Creating`, the server locates that exact root id and retains only the declared
+Data ids needed for diagnostics; it does not scan operation kinds. The
+`cluster_create_active` blocker means that durable workflow remains
+non-terminal. The server also exposes specific `meta_catching_up`,
 `data_unregistered`, `data_unregistered_retrying`, `data_unobserved`, and
-`data_session_missing` blockers while preserving the `cluster-status` v1 wire
-layout. `data_unobserved` means the current leader has no handshake evidence;
+`data_session_missing` blockers. The public command remains `clusterstatus 1`;
+its strict inner payload version includes the lifecycle fields.
+`data_unobserved` means the current leader has no handshake evidence;
 `data_session_missing` means a previously accepted or actively retrying node
 has no current accepted session. A rejected,
 parsed Data Hello is leader-generation-scoped observational evidence only; it
 never authorizes a node. The operator uses the compact cut for its read-only
 creation preflight without copying the journal. The leader repeats the check
-under exclusive creation/membership admission before its first proposal.
-Unrelated operation kinds do not make a clean topology appear occupied.
+under exclusive creation/membership admission before its proposal; apply is
+the authoritative concurrency boundary. In `Uninitialized`, any Data identity
+including retired identities, Group or slot state, policy, grant, population
+manifest, or legacy creation operation derives `non-pristine` rather than
+snapshot corruption. Meta identity/configuration and audit state are not Data
+cluster artifacts.
 
 Readiness uses this leader-observed cut. Meta availability requires a live,
 caught-up leader with quorum; membership stability compares its Raft config
@@ -671,8 +707,11 @@ population facts for each active node referenced by committed groups. Serving
 readiness requires complete slot coverage and, for every slot-owning group, a
 committed owner/grant, present manifest, active policy, and a recent
 successfully written lease grant matching the current session and authority.
-Unassigned nodes remain diagnostic only. Empty and partially configured
-clusters are stable `NOT READY` results.
+Unassigned nodes remain diagnostic only. Lifecycle and runtime readiness are
+orthogonal: `Created` means the initial workflow completed, not that current
+Data sessions are READY. Empty and partially configured clusters are stable
+`NOT READY` results. Every rendered result, including retryable and fatal CLI
+errors, includes a status explanation and an operator next action.
 
 `keylane-ctl cluster-create` reuses the same private leader discovery and
 status-capture seam and accepts only manifest schema v1. A manifest names the
@@ -691,25 +730,35 @@ lowercase `yes` unless `--yes` is present. Only this normalized multi-Group
 and multi-Meta shape is accepted under version 1; the earlier scalar-Meta
 payload has no compatibility decoder.
 
-After an empty-topology and no-active-create client check, the CLI sends one
-`clustercreate 1` request to the discovered leader. `MetaCtlServer` commits
-the entire normalized request as the intent of the existing
-`cluster-create-workflow-v1` root operation before changing topology. Apply
-reserves pristine state for that operation; a different creation id is
-rejected, while exact-id replay remains legal. Admin only waits for the
-durable result. A timeout or shutdown cancels the wait, not the operation, and
-a repeated CLI invocation does not create a replacement for unfinished work.
+After an `Uninitialized` and pristine client check, the CLI generates a root
+operation id and sends one `clustercreate 1` request to the discovered leader.
+`MetaCtlServer` proposes the existing `SubmitOperation` command with the
+normalized manifest as a `cluster-create-workflow-v1` intent. At that Raft
+index, `ApplyCommitted` atomically inserts the root and enters `Creating`; this
+Genesis commit is the command's success point. The server replies
+`OK clustercreate 1 <genesis-index> <root-id>` immediately, without waiting for
+workflow phases, Data readiness, or Redis probes. `--timeout-ms` covers leader
+discovery and this proposal response only.
+
+Only `Uninitialized` accepts Genesis. `Creating`, `Created`, and
+`ProvisioningFailed` reject every later create as `already-created`, without
+manifest comparison, attach, or retry-existing behavior. A proposal rejected
+before commit leaves both operation and lifecycle unchanged. Once a mutation
+has been sent, a transport or proposal ambiguity is `uncertain-outcome` and
+retains the caller-generated root id so the operator can resolve it with
+`cluster-status`.
 
 `MetaClusterCreateReconciler` runs on the Meta worker after each caught-up
-leader transition. Its atomic committed subscription includes the recovered
-snapshot/WAL prefix; it scans the one non-terminal creation root and plans one
-existing Meta command at a time from retained intent, phase, and actual
+leader transition, but only while lifecycle is `Creating`. Its atomic
+committed subscription includes the recovered snapshot/WAL prefix; it loads the
+exact root id stored by topology and plans one existing Meta command at a time
+from retained intent, phase, and actual
 committed state. Every effect is checked before its phase checkpoint advances,
 including recovery between those commits. Subscription overflow reacquires the
 complete view. The reconciler uses the trusted coordinator actor for follow-up
 proposals; the original operator remains recorded on the root operation.
-Creation and Meta membership changes share admission, with the durable active
-operation check covering handoff, timeout, and restart.
+Creation and Meta membership changes share admission, with the durable
+`Creating` lifecycle covering handoff, timeout, archive, and restart.
 
 Before changing Data topology, the root remains in `wait-meta-barrier`. Its
 submit log index is the fixed barrier `B`: every remote member in the genesis
@@ -733,8 +782,9 @@ whole Slot map with one `SetSlotMap` carrying every canonical range and each
 Group's config epoch. It installs one shared `keylane.cluster-create-v1`
 policy, then uses the existing population store, replication-state command,
 and finite authority command to anchor a sparse manifest containing only each
-Group's slots and grant that Group to its declared primary. No separate
-persistent topology or creation-state model exists.
+Group's slots and grant that Group to its declared primary. Creation state is
+the lifecycle embedded in `MetaTopologyStore`; there is no separate durable
+module, singleton Genesis record, or new Raft command.
 
 Only current, boot-bound Data sessions that acknowledge the complete
 projection permit population initialization. Each Group receives one stable,
@@ -763,9 +813,11 @@ recovery does not depend on retaining the detecting session. Committed success
 receipts remain immutable history; they do not establish readiness for a new
 boot. Other incompatible topology changes stop at an inspectable
 `recovery-required` phase. Neither path authorizes another destructive
-initialization. After every child completes, the root completes and Admin
-returns the stable Group ids, child operation ids, and their committed
-population proof indices.
+initialization. After every child completes, the reconciler submits the
+existing root `CompleteOperation` result `cluster-created`; apply atomically
+enters `Created`. A deterministic failure first completes fencing and then
+submits root `AbortOperation`, atomically entering `ProvisioningFailed` with a
+bounded sanitized summary. Recoverable or uncertain errors remain `Creating`.
 
 Demotion and shutdown cancel the owner and join its local proposal work while
 the worker and executor remain live. Already accepted proposals may commit;
@@ -775,15 +827,14 @@ Creation and Meta membership have dedicated background drivers. Arbitrary
 operation kinds, including full Data migration/failover orchestration, still
 require their own recovery policy; journal persistence alone supplies none.
 
-The client then polls the ordinary cluster-status v1 wire until roles,
-membership, topology, sparse population state, and recent authority evidence
-match the complete manifest. Node failures use existing blockers with
-`node:<id>` scope and identify the Group plus missing session, projection,
-health, or population conditions. Finally the CLI invokes `redis-cli` to
-exercise every Group's primary and verify `MOVED`, `CROSSSLOT`,
-`CLUSTER INFO`, `CLUSTER SLOTS`, and normal key operations. This makes
-success mean the declared multi-Group data plane is usable, not merely that a
-metadata prefix committed.
+Operators separately use `cluster-status` to follow lifecycle and runtime
+readiness. `creating` includes the root phase; `provisioning-failed` includes
+the durable safe summary; every non-uninitialized state includes the root id
+and Genesis index. Node failures use existing blockers with `node:<id>` scope
+and identify the Group plus missing session, projection, health, or population
+conditions. The CLI has no `redis-cli` dependency and its exit 0 confirms only
+the atomic Genesis commit; current Data-plane usability remains the READY
+status contract.
 
 Every privileged committed command creates a deterministic audit record keyed
 by Raft log index. Records include the injected actor, proposal time, command
@@ -804,7 +855,7 @@ transition into or out of disabled mode.
 | Volatile candidate replacement and internal deterministic plan selection | `include/keylane/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/keylane/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | Pure per-node projection and leader-scoped Data-session publisher | `include/keylane/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/keylane/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
 | Static initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `include/keylane/meta/nuraft_state_mgr.h`, `src/meta/nuraft_state_mgr.cpp`, `app/keylane_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
-| Durable creation admission, Meta catch-up barrier, leader-owned recovery, and shutdown cancellation | `src/meta/ctl_server.cpp`, `include/keylane/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `src/meta/operation_store.cpp`, `app/keylane_meta.cpp` |
+| Atomic Genesis lifecycle, durable creation admission, Meta catch-up barrier, and leader-owned recovery | `include/keylane/meta/topology_store.h`, `src/meta/topology_store.cpp`, `src/meta/state_apply.cpp`, `src/meta/ctl_server.cpp`, `include/keylane/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `app/keylane_meta.cpp` |
 | Durable post-genesis Meta membership intent, exact-config recovery, leadership handoff, and identity retirement | `include/keylane/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |
 | Shared Meta/Data frame, object-transfer, and message formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |

@@ -10,7 +10,9 @@
 #include <variant>
 
 #include "absl/strings/str_cat.h"
+#include "keylane/meta/cluster_create.h"
 #include "keylane/meta/control_projector.h"
+#include "keylane/meta/hash.h"
 
 namespace keylane::meta {
 namespace {
@@ -193,12 +195,133 @@ constexpr std::uint64_t kMaximumAuditSnapshotGrowth =
     (4u + kMaxMetaAuditDetailBytes) + (4u + kMaxMetaAuditReadableTimeBytes) +
     32u;
 
+bool IsTerminal(MetaOperationLifecycle lifecycle) {
+  return lifecycle == MetaOperationLifecycle::kCompleted ||
+         lifecycle == MetaOperationLifecycle::kAborted;
+}
+
+// A terminal command may be replayed only when the retained operation is the
+// same canonical Genesis root named by topology. Merely observing compatible
+// terminal states on both stores is insufficient: a wrong kind, submit index,
+// or embedded intent id would be an aggregate corruption that snapshot decode
+// must reject as well.
+bool LiveClusterCreateRootMatchesLifecycle(
+    const MetaOperationRecord& root,
+    const MetaClusterLifecycleState& lifecycle) {
+  if (root.operation_id_ != lifecycle.root_operation_id_ ||
+      root.kind_ != kMetaClusterCreateOperationKind ||
+      root.operation_seq_ != lifecycle.genesis_commit_index_ ||
+      root.intent_hash_ != MetaSha256(root.intent_)) {
+    return false;
+  }
+  MetaOperationId intent_root{};
+  const auto manifest = DecodeClusterCreateRequest(root.intent_, &intent_root);
+  return manifest.ok() && intent_root == lifecycle.root_operation_id_;
+}
+
+bool ExistingClusterCreateEffectMatches(const MetaStores& stores,
+                                        const MetaOperationId& operation_id,
+                                        std::uint64_t log_index) {
+  const auto& lifecycle = stores.topology_.ClusterLifecycle();
+  if (lifecycle.state_ == MetaClusterLifecycle::kUninitialized ||
+      lifecycle.root_operation_id_ != operation_id ||
+      lifecycle.genesis_commit_index_ != log_index) {
+    return false;
+  }
+  const auto live = stores.operation_.FindOperation(operation_id);
+  const auto archived = stores.operation_.FindArchived(operation_id);
+  switch (lifecycle.state_) {
+    case MetaClusterLifecycle::kUninitialized:
+      return false;
+    case MetaClusterLifecycle::kCreating:
+      return live.has_value() &&
+             LiveClusterCreateRootMatchesLifecycle(*live, lifecycle) &&
+             !IsTerminal(live->lifecycle_);
+    case MetaClusterLifecycle::kCreated:
+      return (live.has_value() &&
+              LiveClusterCreateRootMatchesLifecycle(*live, lifecycle) &&
+              live->lifecycle_ == MetaOperationLifecycle::kCompleted &&
+              live->terminal_result_ == "cluster-created") ||
+             (archived.has_value() &&
+              archived->operation_seq_ == log_index &&
+              archived->terminal_lifecycle_ ==
+                  MetaOperationLifecycle::kCompleted &&
+              archived->terminal_result_ == "cluster-created");
+    case MetaClusterLifecycle::kProvisioningFailed:
+      return (live.has_value() &&
+              LiveClusterCreateRootMatchesLifecycle(*live, lifecycle) &&
+              live->lifecycle_ == MetaOperationLifecycle::kAborted) ||
+             (archived.has_value() &&
+              archived->operation_seq_ == log_index &&
+              archived->terminal_lifecycle_ ==
+                  MetaOperationLifecycle::kAborted);
+  }
+  return false;
+}
+
 // Store decoders validate their own representation, but a snapshot is one
 // committed aggregate: references and lockstep facts that ApplyCommitted
 // protects must be re-established before recovery exposes any store.  Keep
 // historical topology owners legal while fenced; only an active grant gives
 // that field serving authority and therefore requires a live membership.
 absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
+  const MetaClusterLifecycleState& lifecycle =
+      stores.topology_.ClusterLifecycle();
+  const auto root =
+      stores.operation_.FindOperation(lifecycle.root_operation_id_);
+  const auto archived_root =
+      stores.operation_.FindArchived(lifecycle.root_operation_id_);
+  const auto live_operations = stores.operation_.LiveOperations();
+  if (lifecycle.state_ == MetaClusterLifecycle::kCreating) {
+    if (!root.has_value() ||
+        !LiveClusterCreateRootMatchesLifecycle(*root, lifecycle) ||
+        IsTerminal(root->lifecycle_)) {
+      return MetaFailStopError(
+          "creating cluster lifecycle lacks its exact live root operation");
+    }
+    if (std::count_if(live_operations.begin(), live_operations.end(),
+                      [](const auto& operation) {
+          return operation.kind_ == kMetaClusterCreateOperationKind;
+        }) != 1) {
+      return MetaFailStopError(
+          "creating cluster lifecycle does not have one unique live root");
+    }
+  } else if (lifecycle.state_ == MetaClusterLifecycle::kCreated ||
+             lifecycle.state_ ==
+                 MetaClusterLifecycle::kProvisioningFailed) {
+    const MetaOperationLifecycle expected =
+        lifecycle.state_ == MetaClusterLifecycle::kCreated
+            ? MetaOperationLifecycle::kCompleted
+            : MetaOperationLifecycle::kAborted;
+    if (root.has_value() &&
+        (!LiveClusterCreateRootMatchesLifecycle(*root, lifecycle) ||
+         root->lifecycle_ != expected ||
+         (expected == MetaOperationLifecycle::kCompleted &&
+          root->terminal_result_ != "cluster-created"))) {
+      return MetaFailStopError(
+          "terminal cluster lifecycle disagrees with its live root");
+    }
+    if (archived_root.has_value() &&
+        (archived_root->operation_seq_ != lifecycle.genesis_commit_index_ ||
+         archived_root->terminal_lifecycle_ != expected ||
+         (expected == MetaOperationLifecycle::kCompleted &&
+          archived_root->terminal_result_ != "cluster-created"))) {
+      return MetaFailStopError(
+          "terminal cluster lifecycle disagrees with its archived root");
+    }
+    if (std::any_of(live_operations.begin(), live_operations.end(),
+                    [&](const auto& operation) {
+                      return operation.kind_ ==
+                                 kMetaClusterCreateOperationKind &&
+                             (operation.operation_id_ !=
+                                  lifecycle.root_operation_id_ ||
+                              !IsTerminal(operation.lifecycle_));
+                    })) {
+      return MetaFailStopError(
+          "terminal cluster lifecycle has another or active creation root");
+    }
+  }
+
   if (stores.topology_.GroupCount() != stores.grant_.GroupCount()) {
     return MetaFailStopError(
         "topology and grant stores have different group sets");
@@ -350,6 +473,37 @@ bool GroupHasActiveGrant(const MetaStores& stores,
                          std::string_view group_id) {
   const auto state = stores.grant_.GroupState(group_id);
   return state.has_value() && !state->fenced_ && state->grant_.has_value();
+}
+
+// Genesis may be accepted only against an environment with no Data-cluster
+// ownership facts. Meta identity/configuration and audit history are
+// intentionally excluded: they are prerequisites and provenance, not Data
+// cluster artifacts. Existing development snapshots predate the lifecycle
+// field, so live legacy create operations are also treated as artifacts.
+bool HasDataClusterArtifactsImpl(const MetaStores& stores) {
+  if (stores.identity_.NodeCount() != 0 ||
+      stores.topology_.GroupCount() != 0 ||
+      stores.policy_.PolicyCount() != 0 || stores.grant_.GroupCount() != 0 ||
+      stores.population_manifest_.Size() != 0) {
+    return true;
+  }
+  const auto operations = stores.operation_.LiveOperations();
+  return std::any_of(operations.begin(), operations.end(),
+                     [](const auto& operation) {
+                       return operation.kind_ ==
+                                  kMetaClusterCreateOperationKind ||
+                              operation.kind_ ==
+                                  kMetaClusterCreateV1GroupOperationKind;
+                     });
+}
+
+std::string ClusterFailureSummary(const MetaOperationId& operation_id) {
+  // Abort reasons may contain downstream error text or credentials. The
+  // durable topology lifecycle therefore stores an allowlisted diagnostic;
+  // the operation journal and Meta logs retain detailed troubleshooting data
+  // only under their existing retention/access controls.
+  return absl::StrCat("cluster-create provisioning failed; root-operation=",
+                      HexBytes(operation_id));
 }
 
 // A live lease names the projection that granted it. Moving a slot into or
@@ -845,37 +999,85 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   std::string summary =
       absl::StrCat("SubmitOperation kind=", cmd.kind_,
                    " id=", HexBytes(cmd.operation_id_), " seq=", log_index);
-  // A permanent-id duplicate cannot mutate the existing record. Resolve it
-  // before checking current policy state so an old accepted submit remains an
-  // idempotent replay after the operation terminates and its policy retires.
+  const bool creation = cmd.kind_ == kMetaClusterCreateOperationKind;
+  const auto& lifecycle = stores.topology_.ClusterLifecycle();
+  const bool reuses_genesis_id =
+      lifecycle.state_ != MetaClusterLifecycle::kUninitialized &&
+      lifecycle.root_operation_id_ == cmd.operation_id_;
+  if (reuses_genesis_id && !creation) {
+    return Rejected("operation id is permanently reserved by ClusterCreate",
+                    std::move(summary));
+  }
+  if (creation) {
+    MetaOperationId intent_root{};
+    if (const auto manifest =
+            DecodeClusterCreateRequest(cmd.intent_, &intent_root);
+        !manifest.ok()) {
+      return Rejected(
+          absl::StrCat("invalid canonical cluster-create intent: ",
+                       manifest.status().message()),
+          std::move(summary));
+    }
+    if (intent_root != cmd.operation_id_) {
+      return Rejected("cluster-create intent root id mismatch",
+                      std::move(summary));
+    }
+    if (cmd.intent_hash_ != MetaSha256(cmd.intent_)) {
+      return Rejected("cluster-create intent hash mismatch",
+                      std::move(summary));
+    }
+  }
+
+  // A permanent-id duplicate cannot mutate the existing record. Creation
+  // replay is an aggregate check: both the journal record and the lifecycle
+  // binding must describe the Genesis entry. A one-sided match is rejected.
   if (stores.operation_.OperationKnown(cmd.operation_id_)) {
+    if (creation && !ExistingClusterCreateEffectMatches(
+                        stores, cmd.operation_id_, log_index)) {
+      return Rejected(
+          "cluster-create replay does not match the complete Genesis effect",
+          std::move(summary));
+    }
     SubmitOperation injected = cmd;
     injected.actor_ = actor;
-    const auto result = stores.operation_.SubmitOperation(injected, log_index);
+    MetaStores candidate = stores;
+    const auto result =
+        candidate.operation_.SubmitOperation(injected, log_index);
     if (!result.ok()) return Rejected(result.status(), std::move(summary));
+    if (creation) {
+      if (const absl::Status status = candidate.topology_.BeginClusterCreate(
+              cmd.operation_id_, log_index);
+          !status.ok()) {
+        return Rejected(status, std::move(summary));
+      }
+    }
+    stores.operation_ = std::move(candidate.operation_);
+    stores.topology_ = std::move(candidate.topology_);
     return Accepted(std::move(summary));
   }
   // Creation intent is the first committed mutation and its durable
   // reservation survives a lost proposer/leader. The entry-layer gate is
   // only fast rejection; two different creation ids must not both commit.
   // Existing-id replay above remains legal after topology has been built.
-  const bool creation = cmd.kind_ == kMetaClusterCreateOperationKind;
-  const bool creation_active =
-      stores.operation_.HasActiveKind(kMetaClusterCreateOperationKind);
-  if ((creation ||
-       cmd.kind_ == kMetaMembershipOperationKind) &&
+  const bool creation_active = stores.topology_.ClusterLifecycle().state_ ==
+                               MetaClusterLifecycle::kCreating;
+  if ((creation || cmd.kind_ == kMetaMembershipOperationKind) &&
       (creation_active ||
        stores.operation_.HasActiveKind(kMetaMembershipOperationKind))) {
     return Rejected(
         "another durable Meta membership/creation workflow is active",
         std::move(summary));
   }
-  if (creation &&
-      (stores.identity_.NodeCount() != 0 ||
-       stores.topology_.GroupCount() != 0 ||
-       stores.population_manifest_.Size() != 0)) {
-    return Rejected("cluster creation requires pristine unreserved state",
-                    std::move(summary));
+  if (creation) {
+    if (stores.topology_.ClusterLifecycle().state_ !=
+        MetaClusterLifecycle::kUninitialized) {
+      return Rejected("cluster has already accepted creation",
+                      std::move(summary));
+    }
+    if (HasDataClusterArtifactsImpl(stores)) {
+      return Rejected("cluster creation requires pristine unreserved state",
+                      std::move(summary));
+    }
   }
   for (const MetaPolicyReference& reference : cmd.policy_references_) {
     if (!stores.policy_.IsVersionActive(reference.policy_id_,
@@ -893,8 +1095,19 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   // parameter keeps the dispatch contract independent of the wire path.)
   SubmitOperation injected = cmd;
   injected.actor_ = actor;
-  const auto result = stores.operation_.SubmitOperation(injected, log_index);
+  MetaStores candidate = stores;
+  const auto result =
+      candidate.operation_.SubmitOperation(injected, log_index);
   if (!result.ok()) return Rejected(result.status(), std::move(summary));
+  if (creation) {
+    if (const absl::Status status = candidate.topology_.BeginClusterCreate(
+            cmd.operation_id_, log_index);
+        !status.ok()) {
+      return Rejected(status, std::move(summary));
+    }
+  }
+  stores.operation_ = std::move(candidate.operation_);
+  stores.topology_ = std::move(candidate.topology_);
   return Accepted(std::move(summary));
 }
 
@@ -995,20 +1208,115 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                       const CompleteOperation& cmd) {
   (void)log_index;
-  return FromStatus(
-      stores.operation_.CompleteOperation(cmd),
+  std::string summary =
       absl::StrCat("CompleteOperation id=", HexBytes(cmd.operation_id_),
                    " expected_revision=", cmd.expected_revision_,
-                   " data_loss_possible=", cmd.data_loss_possible_ ? 1 : 0));
+                   " data_loss_possible=", cmd.data_loss_possible_ ? 1 : 0);
+  const auto operation = stores.operation_.FindOperation(cmd.operation_id_);
+  const auto& lifecycle = stores.topology_.ClusterLifecycle();
+  const bool creation_root =
+      (operation.has_value() &&
+       operation->kind_ == kMetaClusterCreateOperationKind) ||
+      (lifecycle.state_ != MetaClusterLifecycle::kUninitialized &&
+       lifecycle.root_operation_id_ == cmd.operation_id_);
+  if (!creation_root) {
+    return FromStatus(stores.operation_.CompleteOperation(cmd),
+                      std::move(summary));
+  }
+  if (cmd.result_ != "cluster-created") {
+    return Rejected("cluster-create root requires result cluster-created",
+                    std::move(summary));
+  }
+  if (!operation.has_value() ||
+      !LiveClusterCreateRootMatchesLifecycle(*operation, lifecycle)) {
+    return Rejected("cluster-create completion root anchor mismatch",
+                    std::move(summary));
+  }
+  const bool operation_effect_applied =
+      operation->lifecycle_ == MetaOperationLifecycle::kCompleted &&
+      cmd.expected_revision_ != std::numeric_limits<std::uint64_t>::max() &&
+      operation->revision_ == cmd.expected_revision_ + 1 &&
+      operation->terminal_result_ == cmd.result_ &&
+      operation->data_loss_possible_ == cmd.data_loss_possible_;
+  const bool lifecycle_effect_applied =
+      lifecycle.state_ == MetaClusterLifecycle::kCreated &&
+      lifecycle.revision_ == 2 &&
+      lifecycle.root_operation_id_ == cmd.operation_id_ &&
+      lifecycle.terminal_outcome_ == MetaClusterTerminalOutcome::kCreated &&
+      lifecycle.failure_summary_.empty();
+  if (operation_effect_applied != lifecycle_effect_applied) {
+    return Rejected(
+        "cluster-create completion replay halves do not agree",
+        std::move(summary));
+  }
+  MetaStores candidate = stores;
+  if (const absl::Status status = candidate.operation_.CompleteOperation(cmd);
+      !status.ok()) {
+    return Rejected(status, std::move(summary));
+  }
+  if (const absl::Status status =
+          candidate.topology_.CompleteClusterCreate(cmd.operation_id_);
+      !status.ok()) {
+    return Rejected(status, std::move(summary));
+  }
+  stores.operation_ = std::move(candidate.operation_);
+  stores.topology_ = std::move(candidate.topology_);
+  return Accepted(std::move(summary));
 }
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                       const AbortOperation& cmd) {
   (void)log_index;
-  return FromStatus(
-      stores.operation_.AbortOperation(cmd),
+  std::string summary =
       absl::StrCat("AbortOperation id=", HexBytes(cmd.operation_id_),
-                   " expected_revision=", cmd.expected_revision_));
+                   " expected_revision=", cmd.expected_revision_);
+  const auto operation = stores.operation_.FindOperation(cmd.operation_id_);
+  const auto& lifecycle = stores.topology_.ClusterLifecycle();
+  const bool creation_root =
+      (operation.has_value() &&
+       operation->kind_ == kMetaClusterCreateOperationKind) ||
+      (lifecycle.state_ != MetaClusterLifecycle::kUninitialized &&
+       lifecycle.root_operation_id_ == cmd.operation_id_);
+  if (!creation_root) {
+    return FromStatus(stores.operation_.AbortOperation(cmd),
+                      std::move(summary));
+  }
+  if (!operation.has_value() ||
+      !LiveClusterCreateRootMatchesLifecycle(*operation, lifecycle)) {
+    return Rejected("cluster-create abort root anchor mismatch",
+                    std::move(summary));
+  }
+  const std::string failure_summary =
+      ClusterFailureSummary(cmd.operation_id_);
+  const bool operation_effect_applied =
+      operation->lifecycle_ == MetaOperationLifecycle::kAborted &&
+      cmd.expected_revision_ != std::numeric_limits<std::uint64_t>::max() &&
+      operation->revision_ == cmd.expected_revision_ + 1 &&
+      operation->terminal_result_ == cmd.reason_;
+  const bool lifecycle_effect_applied =
+      lifecycle.state_ == MetaClusterLifecycle::kProvisioningFailed &&
+      lifecycle.revision_ == 2 &&
+      lifecycle.root_operation_id_ == cmd.operation_id_ &&
+      lifecycle.terminal_outcome_ ==
+          MetaClusterTerminalOutcome::kProvisioningFailed &&
+      lifecycle.failure_summary_ == failure_summary;
+  if (operation_effect_applied != lifecycle_effect_applied) {
+    return Rejected("cluster-create abort replay halves do not agree",
+                    std::move(summary));
+  }
+  MetaStores candidate = stores;
+  if (const absl::Status status = candidate.operation_.AbortOperation(cmd);
+      !status.ok()) {
+    return Rejected(status, std::move(summary));
+  }
+  if (const absl::Status status = candidate.topology_.FailClusterCreate(
+          cmd.operation_id_, failure_summary);
+      !status.ok()) {
+    return Rejected(status, std::move(summary));
+  }
+  stores.operation_ = std::move(candidate.operation_);
+  stores.topology_ = std::move(candidate.topology_);
+  return Accepted(std::move(summary));
 }
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -1117,6 +1425,10 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 }  // namespace
+
+bool HasDataClusterArtifacts(const MetaStores& stores) {
+  return HasDataClusterArtifactsImpl(stores);
+}
 
 absl::Status ValidateCommittedDirectiveAnchor(
     const MetaStores& stores, const MetaDirectiveSpec& directive) {

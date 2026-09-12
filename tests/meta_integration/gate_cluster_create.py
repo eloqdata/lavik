@@ -7,7 +7,6 @@ Usage: gate_cluster_create.py META DATA CTL REDIS_CLI [workdir]
 import json
 import os
 import re
-import select
 import socket
 import struct
 import subprocess
@@ -84,11 +83,31 @@ def cluster_status(meta):
     return json.loads(result.stdout)
 
 
+def wait_cluster_ready(meta, description, timeout):
+    """Observe asynchronous readiness without saturating Meta with CLI forks."""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = cluster_status(meta)
+        if last.get("result") == "ready":
+            return
+        if last.get("cluster_state") == "provisioning-failed":
+            root = last.get("root_operation_id")
+            detail = meta.getop(root) if root else "root operation unavailable"
+            raise H.Failure(
+                f"{description} failed: "
+                f"{last.get('provisioning_failure_summary')}; {detail}")
+        time.sleep(0.25)
+    raise H.Failure(
+        f"timeout ({timeout}s) waiting for: {description}; status={last}")
+
+
 def create_request(meta, node_id, endpoint, group_id, meta_id=None,
-                   timeout_ms=3000):
+                   operation_id=None):
     """Send a normalized public v1 envelope so CLI cannot hide races."""
     metas = meta if isinstance(meta, (list, tuple)) else [meta]
-    payload = struct.pack(">HI", 2, len(metas))
+    operation_id = operation_id or os.urandom(16)
+    payload = struct.pack(">H", 3) + operation_id + struct.pack(">I", len(metas))
     for member in sorted(metas, key=lambda item: item.id):
         member_id = member.id if meta_id is None else meta_id
         payload += struct.pack(">I", member_id)
@@ -113,7 +132,6 @@ def create_request(meta, node_id, endpoint, group_id, meta_id=None,
     payload += struct.pack(">HH", 0, 16383)
     encoded_group = group_id.encode()
     payload += struct.pack(">I", len(encoded_group)) + encoded_group
-    payload += struct.pack(">I", timeout_ms)
     return "clustercreate 1 " + payload.hex()
 
 
@@ -185,8 +203,13 @@ def run_unrelated_commit_case(workdir):
                      lambda: cluster_status(meta)["meta_membership_stable"])
         connection.connect(meta.ctl_path)
         request = create_request(meta, DATA_NODE, data.advertised_endpoint,
-                                 "group-1", timeout_ms=10000)
+                                 "group-1")
         connection.sendall(request.encode() + b"\n")
+        accepted = read_reply(connection)
+        if not accepted.startswith("OK clustercreate 1 "):
+            raise H.Failure(
+                f"unrelated commit did not admit Genesis: {accepted}")
+        operation_id = accepted.split()[-1]
         # Complete all topology/authority commits before starting Data, so
         # the only later metadata change is the unreferenced policy below.
         H.wait_until("creation committed its authority", 5,
@@ -203,25 +226,18 @@ def run_unrelated_commit_case(workdir):
         if match is None or int(match.group(1)) <= before:
             raise H.Failure(f"unrelated policy did not advance Meta: {reply}")
         held = cluster_status(meta)
-        if (any(node["current_session"] or node["projection_current"]
-                for node in held["data_nodes"]) or
-                select.select([connection], [], [], 0)[0]):
+        if any(node["current_session"] or node["projection_current"]
+               for node in held["data_nodes"]):
             raise H.Failure("creation advanced before Data acknowledged FDS")
 
         # The initial object's source index predates this commit, but its
         # semantic content is still current. No further commits are needed to
         # unblock creation: the publisher must validate the installed object.
         proxy.release.set()
-        reply = read_reply(connection)
-        if not reply.startswith("OK clustercreate 1 "):
-            raise H.Failure(
-                f"unrelated commit stalled creation: {reply}; "
-                f"status={cluster_status(meta)}")
         if proxy.error is not None:
             raise H.Failure(f"initial FDS barrier failed: {proxy.error}")
         H.wait_until("creation with an unrelated commit reaches READY", 15,
                      lambda: cluster_status(meta)["result"] == "ready")
-        operation_id = reply.split()[-1]
         if meta.getop(operation_id) != "OK completed cluster-created":
             raise H.Failure("creation did not durably complete its operation")
         H.log("unrelated-commit: acknowledged older FDS reaches READY after "
@@ -261,7 +277,7 @@ def run_concurrent_case(workdir, transports):
         rejected = meta.ctl(create_request(
             meta, node_ids[0], endpoints[0], groups[0], meta_id=2))
         if (not rejected.startswith(
-                "ERR clustercreate 1 preflight non-empty-cluster ") or
+                "ERR clustercreate 1 preflight bad-request ") or
                 meta.committed() != before):
             raise H.Failure(f"{name}: invalid preflight mutated Meta: {rejected}")
 
@@ -288,18 +304,20 @@ def run_concurrent_case(workdir, transports):
             connection.sendall(request.encode() + b"\n")
         meta.resume()
 
-        # No Data process is running, so the admitted creator stays in its
-        # projection wait. The competing request must fail before committing
-        # its identity, not part-way through its topology workflow.
-        readable, _, _ = select.select(connections, [], [], 5)
-        if not readable:
-            raise H.Failure(f"{name}: competing create was not rejected")
-        loser = connections.index(readable[0])
-        winner = 1 - loser
-        reply = read_reply(connections[loser])
-        if not reply.startswith(
-                "ERR clustercreate 1 preflight domain-rejected "):
-            raise H.Failure(f"{name}: create escaped admission: {reply}")
+        # Genesis acceptance returns before Data readiness. Exactly one
+        # proposal owns the singleton lifecycle; the competing manifest is
+        # rejected without comparison or partial topology mutation.
+        replies = [read_reply(connection) for connection in connections]
+        winners = [index for index, reply in enumerate(replies)
+                   if reply.startswith("OK clustercreate 1 ")]
+        losers = [index for index, reply in enumerate(replies)
+                  if (" already-created " in reply or
+                      " pre-commit-failed " in reply)]
+        if len(winners) != 1 or len(losers) != 1:
+            raise H.Failure(
+                f"{name}: expected one accepted Genesis: {replies}")
+        winner = winners[0]
+        loser = losers[0]
         H.wait_until(f"{name}: admitted identity committed", 2,
                      lambda: meta.getnode(node_ids[winner]).startswith("OK "))
         if meta.getnode(node_ids[loser]) != "ERR not-found":
@@ -307,19 +325,14 @@ def run_concurrent_case(workdir, transports):
         if meta.ctl("removesrv 1") != "ERR config-changing":
             raise H.Failure(f"{name}: membership bypassed creation admission")
 
-        reply = read_reply(connections[winner])
-        if not reply.startswith(
-                "ERR clustercreate 1 wait-data-projection uncertain-outcome "):
-            raise H.Failure(
-                f"{name}: admitted create did not reach Data wait: {reply}")
-        # An Admin timeout cancels only the wait. The durable background task
-        # retains the single-Meta premise until completion or explicit abort.
+        # The durable background task retains singleton creation ownership
+        # after the accepted Admin request returns.
         if meta.ctl("removesrv 1") != "ERR config-changing":
-            raise H.Failure(f"{name}: timeout abandoned durable admission")
+            raise H.Failure(f"{name}: acceptance abandoned durable admission")
         retry = meta.ctl(create_request(meta, node_ids[winner], endpoints[winner],
                                        groups[winner]))
         if not retry.startswith(
-                "ERR clustercreate 1 preflight domain-rejected "):
+                "ERR clustercreate 1 preflight already-created "):
             raise H.Failure(f"{name}: partial create was admitted again: {retry}")
 
         meta.terminate()
@@ -349,6 +362,56 @@ def run_concurrent_case(workdir, transports):
     finally:
         for connection in connections:
             connection.close()
+        meta.force_kill()
+
+
+def run_single_meta_client_loss_case(workdir):
+    """A disconnected creator cannot roll back or duplicate one-node Genesis."""
+    scenario = os.path.join(workdir, "single-meta-client-loss")
+    os.makedirs(scenario, mode=0o700)
+    meta = H.Node(META, scenario, 1,
+                  args=H.raft_args(snapshot_distance=100_000))
+    operation_id = os.urandom(16)
+    node_id = "0123456789abcdef0123456789abcdef01234567"
+    try:
+        meta.start(bootstrap=True)
+        meta.wait_leader()
+        H.wait_until("single Meta identity committed", 5,
+                     lambda: cluster_status(meta)["meta_membership_stable"])
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(5)
+        connection.connect(meta.ctl_path)
+        request = create_request(
+            meta, node_id, f"tcp://127.0.0.1:{H.free_port()}", "group-1",
+            operation_id=operation_id)
+        connection.sendall(request.encode() + b"\n")
+        connection.close()  # Deliberately lose the proposal response.
+
+        expected_root = operation_id.hex()
+        H.wait_until(
+            "one-node Genesis survives client loss", 5,
+            lambda: cluster_status(meta).get("root_operation_id") ==
+            expected_root)
+        retry = meta.ctl(create_request(
+            meta, node_id, f"tcp://127.0.0.1:{H.free_port()}", "group-1"))
+        if " already-created " not in retry:
+            raise H.Failure(
+                f"single Meta admitted another create after client loss: {retry}")
+
+        meta.terminate()
+        meta.start(bootstrap=True)
+        meta.wait_leader()
+        restored = cluster_status(meta)
+        if (restored.get("cluster_state") != "creating" or
+                restored.get("root_operation_id") != expected_root):
+            raise H.Failure(
+                f"single Meta restart lost Genesis binding: {restored}")
+        H.log("single Meta client/response loss and restart — OK")
+        meta.terminate()
+    except Exception:
+        H.dump_node_logs([meta])
+        raise
+    finally:
         meta.force_kill()
 
 
@@ -391,7 +454,8 @@ def run_case(workdir, interactive):
             arguments.append("--yes")
         created = command(environment, arguments, input_text=input_text)
         if ("WARNING: existing data on all Data nodes will be erased" not in
-                created or "Cluster READY:" not in created):
+                created or "Cluster create accepted: genesis committed=" not in
+                created or "Run cluster-status" not in created):
             raise H.Failure(
                 f"{name} cluster-create omitted plan or success: {created!r}")
         operation_match = re.search(r"operation=([0-9a-f]{32})", created)
@@ -399,6 +463,7 @@ def run_case(workdir, interactive):
             raise H.Failure(
                 f"{name} cluster-create omitted its operation id: {created!r}")
 
+        wait_cluster_ready(meta, f"{name} cluster reaches READY", 20)
         status_text = command(
             environment,
             [CTL, "cluster-status", "--socket", meta.ctl_path, "--json"])
@@ -444,6 +509,29 @@ def run_case(workdir, interactive):
             raise H.Failure(
                 f"{name} durable identity/operation state is wrong: "
                 f"node={node_record!r} operation={operation!r}")
+        if (meta.completeop(operation_match.group(1), "cluster-created") !=
+                "ERR workflow-owned" or
+                meta.ctl(f"abortop {operation_match.group(1)} retry") !=
+                "ERR workflow-owned"):
+            raise H.Failure(
+                f"{name} generic Admin terminalization bypassed workflow ownership")
+        genesis_index = int(status["genesis_commit_index"])
+        if not meta.archiveoperations(genesis_index).startswith("OK "):
+            raise H.Failure(f"{name} could not archive the creation root")
+        if (meta.completeop(operation_match.group(1), "cluster-created") !=
+                "ERR workflow-owned" or
+                meta.ctl(f"abortop {operation_match.group(1)} retry") !=
+                "ERR workflow-owned"):
+            raise H.Failure(
+                f"{name} archived root lost workflow ownership")
+        if not meta.ctl(f"pruneoperations {genesis_index}").startswith("OK "):
+            raise H.Failure(f"{name} could not prune the creation root")
+        if (meta.completeop(operation_match.group(1), "cluster-created") !=
+                "ERR workflow-owned" or
+                meta.ctl(f"abortop {operation_match.group(1)} retry") !=
+                "ERR workflow-owned"):
+            raise H.Failure(
+                f"{name} pruned root lost permanent workflow ownership")
         if meta.ctl("removesrv 1") != "ERR cannot-remove-leader":
             raise H.Failure(f"{name}: successful create leaked admission")
 
@@ -503,7 +591,7 @@ def run_static_multi_meta_create_case(workdir, count, late_voter):
         connection.connect(leader.ctl_path)
         connection.sendall(
             (create_request(metas, DATA_NODE, data.advertised_endpoint,
-                            "group-1", timeout_ms=120000) + "\n").encode())
+                            "group-1") + "\n").encode())
 
         def waiting_at_barrier():
             status = cluster_status(leader)
@@ -534,9 +622,9 @@ def run_static_multi_meta_create_case(workdir, count, late_voter):
             leader = H.find_leader(
                 [meta for meta in metas if meta is not old_leader],
                 timeout=20)
-            # The original Admin waiter is gone with its leader. Restart that
+            # The accepted response may be lost with its leader. Restart that
             # member without the genesis manifest and let the new leader
-            # resume the one durable root without another create request.
+            # resume the durable root without another create request.
             connection.close()
             connection = None
             old_leader.start()
@@ -602,6 +690,59 @@ def run_static_multi_meta_create_case(workdir, count, late_voter):
         data.force_kill()
         if post_create_joiner is not None:
             post_create_joiner.force_kill()
+        for meta in metas:
+            meta.force_kill()
+
+
+def run_five_meta_response_loss_case(workdir):
+    """Five voters preserve Genesis across response loss and leader restart."""
+    scenario = os.path.join(workdir, "five-meta-response-loss")
+    meta_workdir = os.path.join(scenario, "meta")
+    os.makedirs(meta_workdir, mode=0o700)
+    metas = H.make_nodes(
+        META, meta_workdir, 5,
+        args=H.raft_args(snapshot_distance=100_000))
+    manifest = os.path.join(scenario, "cluster.toml")
+    write_manifest(
+        manifest, f"tcp://127.0.0.1:{H.free_port()}", metas)
+    operation_id = os.urandom(16)
+    try:
+        for meta in metas:
+            meta.start(initial_cluster_manifest=manifest)
+        leader = H.find_leader(metas, timeout=20)
+        H.wait_until("five Meta identities committed", 10,
+                     lambda: cluster_status(leader)["meta_membership_stable"])
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(5)
+        connection.connect(leader.ctl_path)
+        connection.sendall(
+            (create_request(
+                metas, DATA_NODE, f"tcp://127.0.0.1:{H.free_port()}",
+                "group-1", operation_id=operation_id) + "\n").encode())
+        connection.close()
+
+        expected_root = operation_id.hex()
+        H.wait_until(
+            "five-node Genesis survives response loss", 10,
+            lambda: cluster_status(leader).get("root_operation_id") ==
+            expected_root)
+        old_leader = leader
+        old_leader.terminate()
+        leader = H.find_leader(
+            [meta for meta in metas if meta is not old_leader], timeout=20)
+        old_leader.start()
+        restored = cluster_status(leader)
+        if (restored.get("cluster_state") != "creating" or
+                restored.get("root_operation_id") != expected_root):
+            raise H.Failure(
+                f"five Meta failover lost Genesis binding: {restored}")
+        H.log("five Meta response loss, re-election, and restart — OK")
+        for meta in metas:
+            meta.terminate()
+    except Exception:
+        H.dump_node_logs(metas)
+        raise
+    finally:
         for meta in metas:
             meta.force_kill()
 
@@ -924,41 +1065,35 @@ def run_multi_group_case(workdir, automatic, interactive,
         if not interactive:
             arguments.append("--yes")
         if restart_replica_during_create:
-            creator = subprocess.Popen(
-                arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=environment)
-            try:
-                if input_text is not None:
-                    creator.stdin.write(input_text)
-                    creator.stdin.flush()
-                H.wait_until(
-                    "primary pauses while replica full sync is in progress", 20,
-                    lambda: "native full sync holds command gates before catalog "
-                            "acknowledgement" in nodes[0].log_tail())
-                operation_id = root_operation(meta)
-                if operation_id is None:
-                    raise H.Failure("rebuilding replica has no root operation")
-                nodes[1].force_kill()
-                nodes[1].start()
-                stdout, stderr = creator.communicate(timeout=20)
-                if (creator.returncode != 2 or "Cluster READY:" in stdout or
-                        "target boot changed during replica initialization" not in stderr or
-                        REPLICA_1 not in stderr):
-                    raise H.Failure(
-                        f"replica restart did not end creation: "
-                        f"exit={creator.returncode} stdout={stdout!r} stderr={stderr!r}")
-                if not meta.getop(operation_id).startswith("OK aborted "):
-                    raise H.Failure("replica restart left the root active")
-                groups = {group["group_id"]: group
-                          for group in cluster_status(meta)["groups"]}
-                if groups["group-1"]["serving_ready"]:
-                    raise H.Failure("failed Group retained serving authority")
-                H.log(f"{name}: full-sync target restart fenced its Group "
-                      "and aborted creation")
-            finally:
-                if creator.poll() is None:
-                    creator.kill()
-                    creator.communicate(timeout=5)
+            created = command(
+                environment, arguments, input_text=input_text, timeout=20)
+            operation_match = re.search(
+                r"operation=([0-9a-f]{32})", created)
+            if operation_match is None:
+                raise H.Failure("accepted create omitted root operation")
+            operation_id = operation_match.group(1)
+            H.wait_until(
+                "primary pauses while replica full sync is in progress", 20,
+                lambda: "native full sync holds command gates before catalog "
+                        "acknowledgement" in nodes[0].log_tail())
+            nodes[1].force_kill()
+            nodes[1].start()
+
+            def provisioning_failed():
+                status = cluster_status(meta)
+                return (status.get("cluster_state") ==
+                        "provisioning-failed")
+
+            H.wait_until("replica restart fails provisioning", 20,
+                         provisioning_failed)
+            if not meta.getop(operation_id).startswith("OK aborted "):
+                raise H.Failure("replica restart left the root active")
+            groups = {group["group_id"]: group
+                      for group in cluster_status(meta)["groups"]}
+            if groups["group-1"]["serving_ready"]:
+                raise H.Failure("failed Group retained serving authority")
+            H.log(f"{name}: accepted Genesis later fenced its Group and "
+                  "reported provisioning-failed")
             for node in nodes:
                 node.terminate()
             meta.terminate()
@@ -967,20 +1102,24 @@ def run_multi_group_case(workdir, automatic, interactive,
             result = subprocess.run(
                 arguments, input=input_text, capture_output=True, text=True,
                 timeout=15, env=environment)
-            diagnostic = result.stdout + result.stderr
-            expected = (
-                "wait-data-projection",
-                "last_blocker=node_runtime_not_ready",
-                f"scope=node:{REPLICA_2}",
-                "group=group-2",
-            )
-            if (result.returncode == 0 or "Cluster READY:" in diagnostic or
-                    any(marker not in diagnostic for marker in expected)):
+            if (result.returncode != 0 or
+                    "Cluster create accepted:" not in result.stdout):
                 raise H.Failure(
-                    "stopped replica was not diagnosed during creation: "
-                    f"returncode={result.returncode} output={diagnostic!r}")
+                    "stopped replica prevented Genesis acceptance: "
+                    f"returncode={result.returncode} "
+                    f"stdout={result.stdout!r} stderr={result.stderr!r}")
             stopped_replica_blocker(environment, meta, nodes[-1])
-            H.log(f"{name}: create stayed incomplete and named Group/Node")
+            status_result = subprocess.run(
+                [CTL, "cluster-status", "--socket", meta.ctl_path, "--json"],
+                capture_output=True, text=True, timeout=5, env=environment)
+            status = json.loads(status_result.stdout)
+            if (status_result.returncode != 2 or
+                    status.get("cluster_state") != "creating" or
+                    not status.get("next_action")):
+                raise H.Failure(
+                    f"creating status omitted guidance: {status_result}")
+            H.log(f"{name}: accepted create stayed incomplete; status named "
+                  "the blocked Group/Node and next action")
             for node in started_nodes:
                 node.terminate()
             meta.terminate()
@@ -1027,11 +1166,11 @@ def run_multi_group_case(workdir, automatic, interactive,
         else:
             created = command(
                 environment, arguments, input_text=input_text, timeout=150)
-        operations = dict(re.findall(
-            r"group=(group-[12]) operation=([0-9a-f]{32})", created))
+        operation_match = re.search(r"operation=([0-9a-f]{32})", created)
         if ("WARNING: existing data on all Data nodes will be erased" not in
-                created or "Cluster READY:" not in created or
-                set(operations) != set(GROUPS)):
+                created or "Cluster create accepted:" not in created or
+                "Run cluster-status" not in created or
+                operation_match is None):
             raise H.Failure(
                 f"{name} omitted normalized preview or outcomes: {created!r}")
         markers = [
@@ -1044,10 +1183,12 @@ def run_multi_group_case(workdir, automatic, interactive,
         positions = [created.find(marker) for marker in markers]
         if -1 in positions or positions != sorted(positions):
             raise H.Failure(f"{name} preview was not normalized: {created!r}")
+        wait_cluster_ready(
+            meta, f"{name}: background create reaches READY", 90)
         assert_multi_status(environment, meta, nodes)
-        for group_id, operation_id in operations.items():
-            if meta.getop(operation_id) != "OK completed cluster-created":
-                raise H.Failure(f"{group_id} operation did not complete")
+        operation_id = operation_match.group(1)
+        if meta.getop(operation_id) != "OK completed cluster-created":
+            raise H.Failure("root ClusterCreate operation did not complete")
         assert_redis_topology_and_replication(nodes)
         if proxy:
             by_id = {node.node_id: node for node in nodes}
@@ -1087,7 +1228,7 @@ def run_multi_group_case(workdir, automatic, interactive,
 
 
 def run_group_id_probe_case(workdir):
-    """A Group id must not terminate the CLI's Redis probe hash tag."""
+    """An unusual Group id survives accepted Genesis and async creation."""
     scenario = os.path.join(workdir, "group-id-probe")
     os.makedirs(scenario, mode=0o700)
     meta = H.Node(META, scenario, 1,
@@ -1096,8 +1237,8 @@ def run_group_id_probe_case(workdir):
                          meta.data_control_endpoint)
              for index, node_id in enumerate((PRIMARY_1, PRIMARY_2))]
     manifest = os.path.join(scenario, "cluster.toml")
-    # Without escaping, every {keylane-create-group-2}-N} hashes to 9188,
-    # outside this Group's generated range 0..8191, regardless of N.
+    # Keep a delimiter-like character in the durable identifier so the
+    # lifecycle path proves it does not reinterpret Group ids as probe keys.
     lines = (['schema_version = 1', 'slot_strategy = "contiguous-even"'] +
              meta_manifest_lines(meta))
     for node, group_id in zip(nodes, ("group-2}", "z")):
@@ -1118,9 +1259,13 @@ def run_group_id_probe_case(workdir):
         result = command(environment, [
             CTL, "cluster-create", "--manifest", manifest, "--socket",
             meta.ctl_path, "--yes", "--timeout-ms", "20000"], timeout=25)
-        if "Cluster READY:" not in result or "group=group-2}" not in result:
-            raise H.Failure(f"escaped Group id did not finish verification: {result}")
-        H.log("Group id containing '}' completes CLI routing verification")
+        if "Cluster create accepted:" not in result:
+            raise H.Failure(f"unusual Group id was not accepted: {result}")
+        wait_cluster_ready(meta, "unusual Group id reaches READY", 20)
+        status = cluster_status(meta)
+        if "group-2}" not in {group["group_id"] for group in status["groups"]}:
+            raise H.Failure(f"unusual Group id was not preserved: {status}")
+        H.log("Group id containing '}' survives async creation")
         for node in nodes:
             node.terminate()
         meta.terminate()
@@ -1239,10 +1384,13 @@ def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False):
         if online and not proxy:
             data.start()
         connection.connect(meta.ctl_path)
-        # The maximum accepted wait must not become the process stop budget.
         connection.sendall((create_request(
-            meta, DATA_NODE, data.advertised_endpoint, "group-1",
-            timeout_ms=3600000) + "\n").encode())
+            meta, DATA_NODE, data.advertised_endpoint, "group-1") +
+            "\n").encode())
+        accepted = read_reply(connection)
+        if not accepted.startswith("OK clustercreate 1 "):
+            raise H.Failure(f"{name}: Genesis was not accepted: {accepted}")
+        operation_id = accepted.split()[-1]
         if proxy:
             # Install the topology before connecting through the barrier. A
             # superseded initial FDS can redirect a reconnect to Meta's real
@@ -1255,9 +1403,8 @@ def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False):
         else:
             H.wait_until(f"{name}: durable cut", 10,
                          lambda: root_operation(meta, phase))
-        operation_id = root_operation(meta)
-        if operation_id is None:
-            raise H.Failure(f"{name}: no durable operation identity")
+        if root_operation(meta) != operation_id:
+            raise H.Failure(f"{name}: durable operation identity changed")
         if phase == "submitted":
             status = cluster_status(meta)
             if status["data_nodes"] or status["groups"]:
@@ -1268,8 +1415,6 @@ def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False):
             sentinel = True
         if snapshot:
             H.manual_snapshot(meta)
-        if select.select([connection], [], [], 0)[0]:
-            raise H.Failure(f"{name}: Admin completed before the paused cut")
         started = time.monotonic()
         if crash:
             meta.kill9()
@@ -1368,6 +1513,11 @@ def main():
             H.log("SKIP phase-pause cuts: ordinary Release erases test hooks")
         run_recovery_case(workdir, "wire-directive", wire="directive")
         run_recovery_case(workdir, "wire-result", wire="result")
+        # Keep the new client-loss fault cuts after the existing Data/full-sync
+        # matrix so their process churn cannot perturb those timing-sensitive
+        # integration scenarios.
+        run_single_meta_client_loss_case(workdir)
+        run_five_meta_response_loss_case(workdir)
         H.log("PASS")
         return 0
     except Exception as error:  # noqa: BLE001 - logs are test evidence

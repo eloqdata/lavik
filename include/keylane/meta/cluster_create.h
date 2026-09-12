@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "keylane/meta/commands.h"
 
 namespace keylane::meta {
 
@@ -56,19 +57,11 @@ struct ClusterCreateManifestV1 {
   bool operator==(const ClusterCreateManifestV1&) const = default;
 };
 
-// Terminal Meta result. committed_index_ identifies a committed cut observing
-// completion; groups_ names every retained per-Group operation and the commit
-// that proved its population initialization complete.
+// Acceptance result for the atomic Genesis commit. The background workflow
+// may still be Creating after this result is returned.
 struct ClusterCreateOutcome {
-  struct Group {
-    std::string group_id_;
-    std::uint64_t committed_index_ = 0;
-    std::string operation_id_;
-    bool operator==(const Group&) const = default;
-  };
-
-  std::uint64_t committed_index_ = 0;
-  std::vector<Group> groups_;
+  std::uint64_t genesis_commit_index_ = 0;
+  std::string operation_id_;
   bool operator==(const ClusterCreateOutcome&) const = default;
 };
 
@@ -79,15 +72,16 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
     std::string_view toml);
 
 // Produces the bounded binary request accepted by the Meta Admin adapter.
-// Keeping opaque Raft revisions and generated identities out of this
-// interface lets the leader own the complete ordered mutation workflow.
+// The caller-generated root id gives a client that loses the proposal reply a
+// stable correlation key for cluster-status and logs.
 absl::StatusOr<std::string> EncodeClusterCreateRequest(
-    const ClusterCreateManifestV1& manifest, std::uint32_t wait_timeout_ms);
+    const ClusterCreateManifestV1& manifest,
+    const MetaOperationId& root_operation_id);
 
-// Strictly decodes the versioned binary request and returns the leader-side
-// projection-wait budget separately from the durable manifest.
+// Strictly decodes the versioned binary request and returns the root id
+// separately from the normalized durable manifest.
 absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
-    std::string_view request, std::uint32_t* wait_timeout_ms);
+    std::string_view request, MetaOperationId* root_operation_id);
 
 // Decodes the successful Admin response; structured ERR responses are mapped
 // by ClusterOperator because their status controls the CLI exit contract.

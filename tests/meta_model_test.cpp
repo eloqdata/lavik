@@ -13,9 +13,11 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "gtest/gtest.h"
 #include "keylane/cluster/control_protocol.h"
+#include "keylane/meta/cluster_create.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/control_projector.h"
 #include "keylane/meta/encoding.h"
@@ -358,15 +360,18 @@ TEST(MetaModelCommands, EnvelopeStartsWithFormatVersionThenTag) {
   const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
   const std::uint16_t version = static_cast<std::uint16_t>(p[0] | (p[1] << 8));
   const std::uint16_t tag = static_cast<std::uint16_t>(p[2] | (p[3] << 8));
-  EXPECT_EQ(version, 1);
-  EXPECT_EQ(version, keylane::meta::kMetaFormatVersion);
+  EXPECT_EQ(version, 2);
+  EXPECT_EQ(version, keylane::meta::kMetaCommandFormatVersion);
   EXPECT_EQ(tag, static_cast<std::uint16_t>(
                      keylane::meta::MetaCommandTag::kRegisterNode));
 }
 
 TEST(MetaModelCommands, UnknownFormatVersionFails) {
   const std::string bytes = MustEncode(MakeRegisterNode());
-  for (const std::uint16_t bad_version : {0, 2, 3, 0x7FFF, 0xFFFF}) {
+  // Version 1 is the previous development WAL envelope. Rejecting it at
+  // command decode prevents an old opaque ClusterCreate intent from replaying
+  // into only the operation half of the new lifecycle aggregate.
+  for (const std::uint16_t bad_version : {0, 1, 3, 0x7FFF, 0xFFFF}) {
     std::string corrupt = bytes;
     corrupt[0] = static_cast<char>(bad_version & 0xFF);
     corrupt[1] = static_cast<char>((bad_version >> 8) & 0xFF);
@@ -425,7 +430,7 @@ TEST(MetaModelCommands, ActorFieldCapsEnforced) {
   // Hand-built RegisterNode header: version | tag | request_id | actor...
   {
     keylane::meta::MetaWriter w;
-    w.WriteU16(keylane::meta::kMetaFormatVersion);
+    w.WriteU16(keylane::meta::kMetaCommandFormatVersion);
     w.WriteU16(static_cast<std::uint16_t>(
         keylane::meta::MetaCommandTag::kRegisterNode));
     w.WriteRaw(std::string(16, '\0'));                      // request_id
@@ -434,7 +439,7 @@ TEST(MetaModelCommands, ActorFieldCapsEnforced) {
   }
   {
     keylane::meta::MetaWriter w;
-    w.WriteU16(keylane::meta::kMetaFormatVersion);
+    w.WriteU16(keylane::meta::kMetaCommandFormatVersion);
     w.WriteU16(static_cast<std::uint16_t>(
         keylane::meta::MetaCommandTag::kRegisterNode));
     w.WriteRaw(std::string(16, '\0'));
@@ -452,7 +457,7 @@ TEST(MetaModelCommands, DecodeRejectsMissingActorFields) {
   // decode runs out of bytes. (Every proper prefix already fails via
   // TruncatedCommandFails; this names the actor-position case explicitly.)
   keylane::meta::MetaWriter w;
-  w.WriteU16(keylane::meta::kMetaFormatVersion);
+  w.WriteU16(keylane::meta::kMetaCommandFormatVersion);
   w.WriteU16(
       static_cast<std::uint16_t>(keylane::meta::MetaCommandTag::kRegisterNode));
   w.WriteRaw(std::string(16, '\0'));  // request_id
@@ -805,6 +810,7 @@ TEST(MetaModelCommands, DirectiveResultReceiptCommandsRoundTrip) {
 
 TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
   EXPECT_EQ(keylane::meta::kMetaFormatVersion, 1);
+  EXPECT_EQ(keylane::meta::kMetaCommandFormatVersion, 2);
 
   keylane::meta::PruneAudit audit;
   audit.through_log_index_ = 42;
@@ -906,7 +912,7 @@ TEST(MetaModelCommands, DecodeRejectsOverCapLengthPrefix) {
   // Hand-build a PutPolicy whose content length prefix exceeds the payload
   // cap; the reader must reject on the cap before even looking for the body.
   keylane::meta::MetaWriter w;
-  w.WriteU16(keylane::meta::kMetaFormatVersion);
+  w.WriteU16(keylane::meta::kMetaCommandFormatVersion);
   w.WriteU16(
       static_cast<std::uint16_t>(keylane::meta::MetaCommandTag::kPutPolicy));
   w.WriteRaw(std::string(16, '\0'));  // request_id
@@ -2085,6 +2091,123 @@ keylane::meta::SubmitOperation MakeSubmit(std::uint8_t seed,
   return cmd;
 }
 
+keylane::meta::SubmitOperation MakeClusterCreateSubmit(
+    std::uint8_t seed, std::string group_id = "group-a") {
+  keylane::meta::ClusterCreateManifestV1 manifest;
+  manifest.schema_version_ = 1;
+  manifest.meta_members_ = {
+      {1, "tcp://127.0.0.1:7101", "tcp://127.0.0.1:7301",
+       "tcp://127.0.0.1:7201"}};
+  manifest.data_nodes_ = {{std::string(40, '1'),
+                           "tcp://127.0.0.1:6379"}};
+  manifest.groups_ = {{group_id, std::string(40, '1'), {}}};
+  manifest.slot_ranges_ = {{0, 16383, group_id}};
+  const auto operation_id = MakeOperationId(seed);
+  const auto intent =
+      keylane::meta::EncodeClusterCreateRequest(manifest, operation_id);
+  EXPECT_TRUE(intent.ok()) << intent.status();
+
+  keylane::meta::SubmitOperation cmd;
+  cmd.request_id_ = MakeRequestId(seed);
+  cmd.operation_id_ = operation_id;
+  cmd.kind_ = keylane::meta::kMetaClusterCreateOperationKind;
+  cmd.intent_ = intent.value_or("");
+  cmd.intent_hash_ = keylane::meta::MetaSha256(cmd.intent_);
+  return cmd;
+}
+
+std::string ClusterCreateFailureSummaryForTest(
+    const keylane::meta::MetaOperationId& id) {
+  return absl::StrCat(
+      "cluster-create provisioning failed; root-operation=",
+      absl::BytesToHexString(std::string_view(
+          reinterpret_cast<const char*>(id.data()), id.size())));
+}
+
+TEST(MetaStateApply, ClusterCreateRootAtomicallyOwnsLifecycle) {
+  MetaStores stores;
+  const auto root = MakeClusterCreateSubmit(0x71);
+  ApplyOk(stores, 11, MetaCommand{root});
+
+  const auto& creating = stores.topology_.ClusterLifecycle();
+  EXPECT_EQ(creating.state_,
+            keylane::meta::MetaClusterLifecycle::kCreating);
+  EXPECT_EQ(creating.root_operation_id_, root.operation_id_);
+  EXPECT_EQ(creating.genesis_commit_index_, 11u);
+  EXPECT_EQ(creating.revision_, 1u);
+  EXPECT_EQ(stores.topology_.TopologyEpoch(), 0u);
+  ASSERT_TRUE(stores.operation_.FindOperation(root.operation_id_).has_value());
+
+  // A different request is rejected even when its manifest is identical.
+  const auto second = MakeClusterCreateSubmit(0x72);
+  ApplyRejected(stores, 12, MetaCommand{second});
+  EXPECT_FALSE(stores.operation_.FindOperation(second.operation_id_)
+                   .has_value());
+  EXPECT_EQ(stores.topology_.ClusterLifecycle().root_operation_id_,
+            root.operation_id_);
+
+  const auto different = MakeClusterCreateSubmit(0x73, "group-b");
+  ApplyRejected(stores, 13, MetaCommand{different});
+  EXPECT_FALSE(stores.operation_.FindOperation(different.operation_id_)
+                   .has_value());
+
+  keylane::meta::CompleteOperation complete;
+  complete.request_id_ = MakeRequestId(0x74);
+  complete.operation_id_ = root.operation_id_;
+  complete.expected_revision_ = 0;
+  complete.result_ = "cluster-created";
+  ApplyOk(stores, 14, MetaCommand{complete});
+  EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+            keylane::meta::MetaClusterLifecycle::kCreated);
+  EXPECT_EQ(stores.topology_.ClusterLifecycle().revision_, 2u);
+
+  // Exact Genesis replay validates both already-applied halves and remains a
+  // no-op after the root reaches its terminal state.
+  ApplyOk(stores, 11, MetaCommand{root});
+  EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+            keylane::meta::MetaClusterLifecycle::kCreated);
+
+  keylane::meta::ArchiveOperations archive;
+  archive.operation_seqs_ = {11};
+  ApplyOk(stores, 15, MetaCommand{archive});
+  keylane::meta::PruneOperationArchive prune;
+  prune.operation_seqs_ = {11};
+  ApplyOk(stores, 16, MetaCommand{prune});
+  EXPECT_FALSE(stores.operation_.OperationKnown(root.operation_id_));
+  EXPECT_EQ(stores.topology_.ClusterLifecycle().root_operation_id_,
+            root.operation_id_);
+  ApplyRejected(stores, 17, MetaCommand{second});
+
+  // Pruning operation history does not permit the permanently recorded root
+  // id to be recycled by an unrelated workflow.
+  auto recycled = MakeSubmit(0x75, 0x76);
+  recycled.operation_id_ = root.operation_id_;
+  ApplyRejected(stores, 18, MetaCommand{recycled});
+  EXPECT_FALSE(stores.operation_.OperationKnown(root.operation_id_));
+}
+
+TEST(MetaStateApply, ClusterCreateAbortAtomicallyRecordsSafeFailure) {
+  MetaStores stores;
+  const auto root = MakeClusterCreateSubmit(0x74);
+  ApplyOk(stores, 21, MetaCommand{root});
+
+  keylane::meta::AbortOperation abort;
+  abort.request_id_ = MakeRequestId(0x75);
+  abort.operation_id_ = root.operation_id_;
+  abort.expected_revision_ = 0;
+  abort.reason_ = "password=hunter2\nraw downstream failure";
+  ApplyOk(stores, 22, MetaCommand{abort});
+
+  const auto& failed = stores.topology_.ClusterLifecycle();
+  EXPECT_EQ(failed.state_,
+            keylane::meta::MetaClusterLifecycle::kProvisioningFailed);
+  EXPECT_EQ(failed.terminal_outcome_,
+            keylane::meta::MetaClusterTerminalOutcome::kProvisioningFailed);
+  EXPECT_EQ(failed.failure_summary_.find("hunter2"), std::string::npos);
+  EXPECT_NE(failed.failure_summary_.find("root-operation="),
+            std::string::npos);
+}
+
 TEST(MetaStateApply, MetaStoresDeserializeRejectsGroupStoreDrift) {
   {
     MetaStores stores;
@@ -2095,6 +2218,302 @@ TEST(MetaStateApply, MetaStoresDeserializeRejectsGroupStoreDrift) {
     MetaStores stores;
     ASSERT_TRUE(stores.grant_.AddGroup("g1").ok());
     ExpectAggregateSnapshotFailStop(stores);
+  }
+}
+
+TEST(MetaStateApply, SnapshotValidatesClusterLifecycleAggregate) {
+  {
+    MetaStores stores;
+    const auto root = MakeOperationId(0x76);
+    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root, 9).ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+  {
+    MetaStores stores;
+    auto root = MakeClusterCreateSubmit(0x7d);
+    const auto other = MakeClusterCreateSubmit(0x7e);
+    root.intent_ = other.intent_;
+    root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
+    ASSERT_TRUE(stores.operation_.SubmitOperation(root, 10).ok());
+    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 10)
+                    .ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+  {
+    // Uninitialized plus artifacts is reported as non-pristine by status; it
+    // is not structural snapshot corruption.
+    MetaStores stores;
+    ASSERT_TRUE(stores.policy_.Apply(MakePutPolicy("legacy", 1, "{}"))
+                    .ok());
+    const auto restored = MetaStores::Deserialize(MustSerialize(stores));
+    ASSERT_TRUE(restored.ok()) << restored.status();
+    EXPECT_EQ(restored->topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kUninitialized);
+  }
+  {
+    MetaStores stores;
+    const auto root = MakeClusterCreateSubmit(0x7b);
+    ApplyOk(stores, 43, MetaCommand{root});
+    const auto extra = MakeClusterCreateSubmit(0x7c);
+    ASSERT_TRUE(stores.operation_.SubmitOperation(extra, 44).ok());
+    keylane::meta::CompleteOperation complete;
+    complete.operation_id_ = extra.operation_id_;
+    complete.expected_revision_ = 0;
+    complete.result_ = "cluster-created";
+    ASSERT_TRUE(stores.operation_.CompleteOperation(complete).ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+  {
+    MetaStores stores;
+    const auto root = MakeClusterCreateSubmit(0x79);
+    ApplyOk(stores, 40, MetaCommand{root});
+    keylane::meta::CompleteOperation complete;
+    complete.operation_id_ = root.operation_id_;
+    complete.expected_revision_ = 0;
+    complete.result_ = "cluster-created";
+    ApplyOk(stores, 41, MetaCommand{complete});
+
+    const auto extra = MakeClusterCreateSubmit(0x7a);
+    ASSERT_TRUE(stores.operation_.SubmitOperation(extra, 42).ok());
+    ExpectAggregateSnapshotFailStop(stores);
+  }
+}
+
+TEST(MetaStateApply, ClusterRootTerminalizationRejectsASingleStoreEffect) {
+  MetaStores stores;
+  auto root = MakeClusterCreateSubmit(0x77);
+  ASSERT_TRUE(stores.operation_.SubmitOperation(root, 30).ok());
+
+  keylane::meta::CompleteOperation complete;
+  complete.request_id_ = MakeRequestId(0x78);
+  complete.operation_id_ = root.operation_id_;
+  complete.expected_revision_ = 0;
+  complete.result_ = "cluster-created";
+  ApplyRejected(stores, 31, MetaCommand{complete});
+
+  const auto operation = stores.operation_.FindOperation(root.operation_id_);
+  ASSERT_TRUE(operation.has_value());
+  EXPECT_EQ(operation->lifecycle_,
+            keylane::meta::MetaOperationLifecycle::kSubmitted);
+  EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+            keylane::meta::MetaClusterLifecycle::kUninitialized);
+}
+
+TEST(MetaStateApply, ClusterRootTerminalizationRequiresExactGenesisAnchor) {
+  {
+    MetaStores stores;
+    const auto root = MakeClusterCreateSubmit(0x75);
+    ASSERT_TRUE(stores.operation_.SubmitOperation(root, 28).ok());
+    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 29)
+                    .ok());
+    keylane::meta::CompleteOperation complete;
+    complete.operation_id_ = root.operation_id_;
+    complete.expected_revision_ = 0;
+    complete.result_ = "cluster-created";
+
+    ApplyRejected(stores, 30, MetaCommand{complete});
+    EXPECT_EQ(stores.operation_.FindOperation(root.operation_id_)->lifecycle_,
+              keylane::meta::MetaOperationLifecycle::kSubmitted);
+    EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kCreating);
+  }
+  {
+    MetaStores stores;
+    auto root = MakeClusterCreateSubmit(0x76);
+    root.kind_ = "migration";
+    ASSERT_TRUE(stores.operation_.SubmitOperation(root, 31).ok());
+    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 31)
+                    .ok());
+    keylane::meta::AbortOperation abort;
+    abort.operation_id_ = root.operation_id_;
+    abort.expected_revision_ = 0;
+    abort.reason_ = "provisioning failed";
+
+    ApplyRejected(stores, 32, MetaCommand{abort});
+    EXPECT_EQ(stores.operation_.FindOperation(root.operation_id_)->lifecycle_,
+              keylane::meta::MetaOperationLifecycle::kSubmitted);
+    EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kCreating);
+  }
+  {
+    MetaStores stores;
+    auto root = MakeClusterCreateSubmit(0x77);
+    const auto other = MakeClusterCreateSubmit(0x78);
+    root.intent_ = other.intent_;
+    root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
+    ASSERT_TRUE(stores.operation_.SubmitOperation(root, 33).ok());
+    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 33)
+                    .ok());
+    keylane::meta::CompleteOperation complete;
+    complete.operation_id_ = root.operation_id_;
+    complete.expected_revision_ = 0;
+    complete.result_ = "cluster-created";
+    ASSERT_TRUE(stores.operation_.CompleteOperation(complete).ok());
+
+    ApplyRejected(stores, 34, MetaCommand{complete});
+    EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kCreating);
+  }
+  {
+    MetaStores stores;
+    const auto root = MakeClusterCreateSubmit(0x79);
+    ASSERT_TRUE(stores.operation_.SubmitOperation(root, 35).ok());
+    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 36)
+                    .ok());
+    keylane::meta::AbortOperation abort;
+    abort.operation_id_ = root.operation_id_;
+    abort.expected_revision_ = 0;
+    abort.reason_ = "provisioning failed";
+    ASSERT_TRUE(stores.operation_.AbortOperation(abort).ok());
+
+    ApplyRejected(stores, 37, MetaCommand{abort});
+    EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kCreating);
+  }
+}
+
+TEST(MetaStateApply, ClusterRootTerminalReplayRejectsEitherMissingHalf) {
+  {
+    MetaStores stores;
+    const auto root = MakeClusterCreateSubmit(0x75);
+    ApplyOk(stores, 30, MetaCommand{root});
+    keylane::meta::CompleteOperation complete;
+    complete.operation_id_ = root.operation_id_;
+    complete.expected_revision_ = 0;
+    complete.result_ = "cluster-created";
+    ASSERT_TRUE(stores.operation_.CompleteOperation(complete).ok());
+
+    ApplyRejected(stores, 31, MetaCommand{complete});
+    EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kCreating);
+  }
+  {
+    MetaStores stores;
+    const auto root = MakeClusterCreateSubmit(0x76);
+    ApplyOk(stores, 32, MetaCommand{root});
+    ASSERT_TRUE(stores.topology_.CompleteClusterCreate(root.operation_id_)
+                    .ok());
+    keylane::meta::CompleteOperation complete;
+    complete.operation_id_ = root.operation_id_;
+    complete.expected_revision_ = 0;
+    complete.result_ = "cluster-created";
+
+    ApplyRejected(stores, 33, MetaCommand{complete});
+    EXPECT_EQ(stores.operation_.FindOperation(root.operation_id_)->lifecycle_,
+              keylane::meta::MetaOperationLifecycle::kSubmitted);
+  }
+  {
+    MetaStores stores;
+    const auto root = MakeClusterCreateSubmit(0x79);
+    ApplyOk(stores, 34, MetaCommand{root});
+    keylane::meta::AbortOperation abort;
+    abort.operation_id_ = root.operation_id_;
+    abort.expected_revision_ = 0;
+    abort.reason_ = "provisioning failed";
+    ASSERT_TRUE(stores.operation_.AbortOperation(abort).ok());
+
+    ApplyRejected(stores, 35, MetaCommand{abort});
+    EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kCreating);
+  }
+  {
+    MetaStores stores;
+    const auto root = MakeClusterCreateSubmit(0x7a);
+    ApplyOk(stores, 36, MetaCommand{root});
+    ASSERT_TRUE(stores.topology_
+                    .FailClusterCreate(root.operation_id_,
+                                       ClusterCreateFailureSummaryForTest(
+                                           root.operation_id_))
+                    .ok());
+    keylane::meta::AbortOperation abort;
+    abort.operation_id_ = root.operation_id_;
+    abort.expected_revision_ = 0;
+    abort.reason_ = "provisioning failed";
+
+    ApplyRejected(stores, 37, MetaCommand{abort});
+    EXPECT_EQ(stores.operation_.FindOperation(root.operation_id_)->lifecycle_,
+              keylane::meta::MetaOperationLifecycle::kSubmitted);
+  }
+}
+
+TEST(MetaStateApply, ClusterRootTerminalReplayRejectsInvalidGenesisAnchor) {
+  {
+    MetaStores stores;
+    auto root = MakeClusterCreateSubmit(0x7b);
+    root.kind_ = "migration";
+    ASSERT_TRUE(stores.operation_.SubmitOperation(root, 38).ok());
+    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 38)
+                    .ok());
+    keylane::meta::CompleteOperation complete;
+    complete.operation_id_ = root.operation_id_;
+    complete.expected_revision_ = 0;
+    complete.result_ = "cluster-created";
+    ASSERT_TRUE(stores.operation_.CompleteOperation(complete).ok());
+    ASSERT_TRUE(stores.topology_.CompleteClusterCreate(root.operation_id_)
+                    .ok());
+
+    ApplyRejected(stores, 39, MetaCommand{complete});
+  }
+  {
+    MetaStores stores;
+    auto root = MakeClusterCreateSubmit(0x7c);
+    const auto other = MakeClusterCreateSubmit(0x7d);
+    root.intent_ = other.intent_;
+    root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
+    ASSERT_TRUE(stores.operation_.SubmitOperation(root, 40).ok());
+    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 40)
+                    .ok());
+    keylane::meta::CompleteOperation complete;
+    complete.operation_id_ = root.operation_id_;
+    complete.expected_revision_ = 0;
+    complete.result_ = "cluster-created";
+    ASSERT_TRUE(stores.operation_.CompleteOperation(complete).ok());
+    ASSERT_TRUE(stores.topology_.CompleteClusterCreate(root.operation_id_)
+                    .ok());
+
+    ApplyRejected(stores, 41, MetaCommand{complete});
+  }
+  {
+    MetaStores stores;
+    const auto root = MakeClusterCreateSubmit(0x7e);
+    ASSERT_TRUE(stores.operation_.SubmitOperation(root, 42).ok());
+    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 43)
+                    .ok());
+    keylane::meta::AbortOperation abort;
+    abort.operation_id_ = root.operation_id_;
+    abort.expected_revision_ = 0;
+    abort.reason_ = "provisioning failed";
+    ASSERT_TRUE(stores.operation_.AbortOperation(abort).ok());
+    ASSERT_TRUE(stores.topology_
+                    .FailClusterCreate(
+                        root.operation_id_,
+                        ClusterCreateFailureSummaryForTest(root.operation_id_))
+                    .ok());
+
+    ApplyRejected(stores, 44, MetaCommand{abort});
+  }
+}
+
+TEST(MetaStateApply, ClusterRootSubmitReplayRejectsASingleStoreEffect) {
+  const auto root = MakeClusterCreateSubmit(0x78);
+  {
+    MetaStores stores;
+    ASSERT_TRUE(stores.operation_.SubmitOperation(root, 32).ok());
+
+    ApplyRejected(stores, 32, MetaCommand{root});
+
+    EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kUninitialized);
+  }
+  {
+    MetaStores stores;
+    ASSERT_TRUE(
+        stores.topology_.BeginClusterCreate(root.operation_id_, 32).ok());
+
+    ApplyRejected(stores, 32, MetaCommand{root});
+
+    EXPECT_FALSE(stores.operation_.FindOperation(root.operation_id_)
+                     .has_value());
   }
 }
 

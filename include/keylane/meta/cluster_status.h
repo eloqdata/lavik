@@ -90,8 +90,8 @@ struct ClusterBlockerWireV1 {
   bool operator==(const ClusterBlockerWireV1&) const = default;
 };
 
-// Reuses the extensible v1 blocker list for the cluster-create preflight;
-// adding a fixed field would silently change the established v1 wire layout.
+// Retained alongside the explicit lifecycle so existing blocker consumers can
+// diagnose the active creation workflow in the ordinary readiness list.
 inline constexpr std::string_view kClusterCreateActiveBlockerCode =
     "cluster_create_active";
 
@@ -104,8 +104,23 @@ struct ClusterCaptureWireV1 {
   bool operator==(const ClusterCaptureWireV1&) const = default;
 };
 
+enum class ClusterStateWireV1 : std::uint8_t {
+  kUninitialized = 0,
+  kCreating = 1,
+  kCreated = 2,
+  kProvisioningFailed = 3,
+  kNonPristine = 4,
+};
+
 struct ClusterStatusWireV1 {
   ClusterCaptureWireV1 capture_;
+  ClusterStateWireV1 cluster_state_ =
+      ClusterStateWireV1::kUninitialized;
+  std::uint64_t lifecycle_revision_ = 0;
+  std::optional<std::string> root_operation_id_;
+  std::optional<std::uint64_t> genesis_commit_index_;
+  std::optional<std::string> cluster_create_phase_;
+  std::optional<std::string> provisioning_failure_summary_;
   bool meta_available_ = false;
   bool meta_membership_stable_ = false;
   bool topology_converged_ = false;
@@ -164,10 +179,10 @@ class ClusterOperator {
   absl::StatusOr<ClusterStatusOutcome> Status(
       const MetaAdminTarget& seed, const ClusterStatusOptions& options) const;
 
-  // Creates a v1 multi-Group topology from an empty single-Meta cluster and
-  // returns only after cluster-status observes the exact manifest as READY.
-  // A transport failure after the mutation request starts is intentionally
-  // not retried; interruption recovery belongs to the resume workflow.
+  // Atomically commits the creation root and Creating lifecycle, then returns
+  // without waiting for topology provisioning or runtime readiness. A
+  // transport failure after the mutation request starts is not retried and
+  // carries the caller-generated root operation id for status correlation.
   absl::StatusOr<ClusterCreateOutcome> Create(
       const MetaAdminTarget& seed, const ClusterCreateManifestV1& manifest,
       const ClusterStatusOptions& options) const;

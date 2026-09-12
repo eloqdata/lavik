@@ -77,11 +77,12 @@
 //      any slot-ownership or config-epoch change that affects a group with an
 //      active grant. Source and destination groups must be fenced before the
 //      cut, so no lease issued for the old projection can span a slot move.
-//  10. Creation and Meta-membership workflows have one shared durable
-//      reservation. A new cluster-create workflow reserves pristine topology
-//      before its first mutation and excludes another active creation id.
-//      Exact-id replay resolves before this guard, even after topology is
-//      populated.
+//  10. A root ClusterCreate submission and the topology store's transition
+//      from Uninitialized to Creating are one aggregate apply. Root completion
+//      or abort atomically enters Created or ProvisioningFailed. Exact replay
+//      must observe both halves; lifecycle, rather than retained operation
+//      history or manifest equality, permanently rejects another Genesis.
+//      Creating also holds the existing Meta-membership workflow gate.
 //
 // MetaStores is the committed aggregate that snapshots serialize as one
 // versioned envelope: per-store length-prefixed versioned blobs in a fixed
@@ -128,6 +129,12 @@ struct MetaStores {
   // Strict decode of the Serialize envelope; every failure is fail-stop.
   static absl::StatusOr<MetaStores> Deserialize(std::string_view bytes);
 };
+
+// True when an Uninitialized Meta aggregate contains any Data-cluster-owned
+// fact. Meta membership/configuration and audit history are intentionally not
+// artifacts. Apply admission, status derivation, and Admin fast rejection use
+// this one predicate so their definition of pristine cannot drift.
+bool HasDataClusterArtifacts(const MetaStores& stores);
 
 // Validates one durable directive against the exact currently committed
 // source/target memberships, active authority, and population identity. Boot

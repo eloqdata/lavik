@@ -45,6 +45,22 @@ primary = "1123456789abcdef0123456789abcdef01234567"
 replicas = []
 )toml";
 
+MetaOperationId OperationId(std::uint8_t seed) {
+  MetaOperationId id{};
+  id.fill(seed);
+  return id;
+}
+
+std::string OperationIdHex(const MetaOperationId& id) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string result;
+  for (const std::uint8_t byte : id) {
+    result.push_back(kHex[byte >> 4]);
+    result.push_back(kHex[byte & 0x0f]);
+  }
+  return result;
+}
+
 std::string ReplaceOnce(std::string input, std::string_view from,
                         std::string_view to) {
   const std::size_t position = input.find(from);
@@ -221,8 +237,8 @@ TEST(ClusterCreateManifestTest, InputOrderCannotChangeNormalizedWire) {
   ASSERT_EQ(shuffled->groups_.front().replica_node_ids_.size(), 2U);
   EXPECT_EQ(shuffled->groups_.front().replica_node_ids_[0], kNodeB);
   EXPECT_EQ(shuffled->groups_.front().replica_node_ids_[1], kNodeC);
-  EXPECT_EQ(EncodeClusterCreateRequest(*shuffled, 10'000),
-            EncodeClusterCreateRequest(*canonical, 10'000));
+  EXPECT_EQ(EncodeClusterCreateRequest(*shuffled, OperationId(1)),
+            EncodeClusterCreateRequest(*canonical, OperationId(1)));
 }
 
 TEST(ClusterCreateManifestTest, NormalizesOneThreeAndFiveInitialMetaMembers) {
@@ -401,32 +417,31 @@ TEST(ClusterCreateManifestTest, RejectsGapsOverlapsAndGroupsWithoutSlots) {
 TEST(ClusterCreateProtocolTest, RoundTripsOnlyCanonicalV1Requests) {
   const ClusterCreateManifestV1 manifest =
       *ParseClusterCreateManifest(kValidManifest);
-  auto request = EncodeClusterCreateRequest(manifest, 120'000);
+  const MetaOperationId root = OperationId(7);
+  auto request = EncodeClusterCreateRequest(manifest, root);
   ASSERT_TRUE(request.ok()) << request.status();
   EXPECT_TRUE(request->starts_with("clustercreate 1 "));
-  std::uint32_t timeout = 0;
+  MetaOperationId decoded_root{};
 
-  auto decoded = DecodeClusterCreateRequest(*request, &timeout);
+  auto decoded = DecodeClusterCreateRequest(*request, &decoded_root);
 
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(*decoded, manifest);
-  EXPECT_EQ(timeout, 120'000U);
-  EXPECT_FALSE(DecodeClusterCreateRequest(*request + "00", &timeout).ok());
-  EXPECT_FALSE(DecodeClusterCreateRequest("clustercreate 2 00", &timeout).ok());
+  EXPECT_EQ(decoded_root, root);
+  EXPECT_FALSE(
+      DecodeClusterCreateRequest(*request + "00", &decoded_root).ok());
+  EXPECT_FALSE(
+      DecodeClusterCreateRequest("clustercreate 2 00", &decoded_root).ok());
 }
 
-TEST(ClusterCreateProtocolTest, DecodesPerGroupOutcome) {
+TEST(ClusterCreateProtocolTest, DecodesGenesisOutcome) {
   auto outcome = DecodeClusterCreateReply(
-      "OK clustercreate 1 25 2 "
-      "67726f75702d31 23 00112233445566778899aabbccddeeff "
-      "67726f75702d32 24 10112233445566778899aabbccddeeff");
+      "OK clustercreate 1 25 00112233445566778899aabbccddeeff");
 
   ASSERT_TRUE(outcome.ok()) << outcome.status();
-  EXPECT_EQ(outcome->committed_index_, 25U);
-  ASSERT_EQ(outcome->groups_.size(), 2U);
-  EXPECT_EQ(outcome->groups_[0].group_id_, "group-1");
-  EXPECT_EQ(outcome->groups_[1].operation_id_,
-            "10112233445566778899aabbccddeeff");
+  EXPECT_EQ(outcome->genesis_commit_index_, 25U);
+  EXPECT_EQ(outcome->operation_id_,
+            "00112233445566778899aabbccddeeff");
 }
 
 ClusterStatusWireV1 EmptyStatus(const ClusterHeadWireV1& head) {
@@ -485,7 +500,7 @@ ClusterStatusWireV1 ReadyStatus(const ClusterCreateManifestV1& manifest,
   return status;
 }
 
-TEST(ClusterCreateOperatorTest, WaitsForTheExactMultiGroupTopology) {
+TEST(ClusterCreateOperatorTest, ReturnsImmediatelyAfterGenesisCommit) {
   const ClusterCreateManifestV1 manifest =
       *ParseClusterCreateManifest(kValidManifest);
   const ClusterHeadWireV1 head{
@@ -498,20 +513,17 @@ TEST(ClusterCreateOperatorTest, WaitsForTheExactMultiGroupTopology) {
   };
   const std::string head_reply = *EncodeClusterHeadReply(head);
   const std::string empty_reply = *EncodeClusterStatusReply(EmptyStatus(head));
-  const std::string ready_reply =
-      *EncodeClusterStatusReply(ReadyStatus(manifest, head));
   std::vector<std::string> calls;
-  std::size_t status_calls = 0;
   ClusterOperator op([&](const MetaAdminTarget&, std::string_view command,
                          auto) -> absl::StatusOr<std::string> {
     calls.emplace_back(command);
     if (command == "clusterhead 1") return head_reply;
-    if (command == "clusterstatus 1")
-      return status_calls++ == 0 ? empty_reply : ready_reply;
+    if (command == "clusterstatus 1") return empty_reply;
     if (command.starts_with("clustercreate 1 ")) {
-      return "OK clustercreate 1 24 2 "
-             "67726f75702d31 23 00112233445566778899aabbccddeeff "
-             "67726f75702d32 24 10112233445566778899aabbccddeeff";
+      MetaOperationId root{};
+      auto decoded = DecodeClusterCreateRequest(command, &root);
+      if (!decoded.ok()) return decoded.status();
+      return "OK clustercreate 1 24 " + OperationIdHex(root);
     }
     return absl::InvalidArgumentError("unexpected command");
   });
@@ -524,9 +536,9 @@ TEST(ClusterCreateOperatorTest, WaitsForTheExactMultiGroupTopology) {
                            manifest, options);
 
   ASSERT_TRUE(outcome.ok()) << outcome.status();
-  EXPECT_EQ(outcome->committed_index_, 24U);
-  ASSERT_EQ(outcome->groups_.size(), 2U);
-  ASSERT_EQ(calls.size(), 5U);
+  EXPECT_EQ(outcome->genesis_commit_index_, 24U);
+  EXPECT_EQ(outcome->operation_id_.size(), 32U);
+  ASSERT_EQ(calls.size(), 3U);
   EXPECT_TRUE(calls[2].starts_with("clustercreate 1 "));
 }
 
@@ -557,6 +569,8 @@ TEST(ClusterCreateOperatorTest, PreservesUncertainServerFailures) {
                            manifest, options);
 
   EXPECT_EQ(outcome.status().code(), absl::StatusCode::kAborted);
+  EXPECT_NE(outcome.status().message().find("operation="),
+            std::string_view::npos);
 }
 
 TEST(ClusterCreateOperatorTest, RejectsActiveCreateBeforeMutation) {
@@ -571,6 +585,11 @@ TEST(ClusterCreateOperatorTest, RejectsActiveCreateBeforeMutation) {
       .meta_members_ = {{.server_id_ = 1, .is_leader_ = true}},
   };
   ClusterStatusWireV1 empty = EmptyStatus(head);
+  empty.cluster_state_ = ClusterStateWireV1::kCreating;
+  empty.lifecycle_revision_ = 1;
+  empty.root_operation_id_ = "00112233445566778899aabbccddeeff";
+  empty.genesis_commit_index_ = 8;
+  empty.cluster_create_phase_ = "register-data";
   empty.blockers_.push_back(
       {.code_ = std::string(kClusterCreateActiveBlockerCode),
        .scope_ = "cluster",
@@ -592,10 +611,12 @@ TEST(ClusterCreateOperatorTest, RejectsActiveCreateBeforeMutation) {
                            manifest, options);
 
   EXPECT_EQ(outcome.status().code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_NE(outcome.status().message().find("already-created"),
+            std::string_view::npos);
   EXPECT_FALSE(mutation_sent);
 }
 
-TEST(ClusterCreateOperatorTest, NamesTheNodeThatPreventsExactReadiness) {
+TEST(ClusterCreateOperatorTest, DoesNotWaitForRuntimeReadiness) {
   const ClusterCreateManifestV1 manifest =
       *ParseClusterCreateManifest(kValidManifest);
   const ClusterHeadWireV1 head{
@@ -607,29 +628,18 @@ TEST(ClusterCreateOperatorTest, NamesTheNodeThatPreventsExactReadiness) {
       .meta_members_ = {{.server_id_ = 1, .is_leader_ = true}},
   };
   const ClusterStatusWireV1 empty = EmptyStatus(head);
-  ClusterStatusWireV1 incomplete = ReadyStatus(manifest, head);
-  incomplete.data_nodes_[1].population_current_ = false;
-  incomplete.data_nodes_[1].lease_status_ = ClusterLeaseStatus::kUnknown;
-  incomplete.groups_[1].serving_ready_ = false;
-  incomplete.groups_[1].topology_converged_ = false;
-  incomplete.cluster_ready_ = false;
-  incomplete.serving_ready_ = false;
-  incomplete.topology_converged_ = false;
-  incomplete.blockers_.push_back(
-      {.code_ = "node_runtime_not_ready",
-       .scope_ = "node:" + std::string(kNodeB),
-       .detail_ = "group=group-2;missing=population"});
   std::size_t status_calls = 0;
   ClusterOperator op([&](const MetaAdminTarget&, std::string_view command,
                          auto) -> absl::StatusOr<std::string> {
     if (command == "clusterhead 1") return *EncodeClusterHeadReply(head);
     if (command == "clusterstatus 1") {
-      return *EncodeClusterStatusReply(status_calls++ == 0 ? empty
-                                                           : incomplete);
+      ++status_calls;
+      return *EncodeClusterStatusReply(empty);
     }
-    return "OK clustercreate 1 24 2 "
-           "67726f75702d31 23 00112233445566778899aabbccddeeff "
-           "67726f75702d32 24 10112233445566778899aabbccddeeff";
+    MetaOperationId root{};
+    auto decoded = DecodeClusterCreateRequest(command, &root);
+    if (!decoded.ok()) return decoded.status();
+    return "OK clustercreate 1 24 " + OperationIdHex(root);
   });
   ClusterStatusOptions options;
   options.deadline_ =
@@ -639,11 +649,9 @@ TEST(ClusterCreateOperatorTest, NamesTheNodeThatPreventsExactReadiness) {
                             .endpoint_ = "/tmp/meta.sock"},
                            manifest, options);
 
-  EXPECT_EQ(outcome.status().code(), absl::StatusCode::kDeadlineExceeded);
-  EXPECT_NE(outcome.status().message().find("node:" + std::string(kNodeB)),
-            std::string_view::npos);
-  EXPECT_NE(outcome.status().message().find("group=group-2"),
-            std::string_view::npos);
+  ASSERT_TRUE(outcome.ok()) << outcome.status();
+  EXPECT_EQ(outcome->genesis_commit_index_, 24U);
+  EXPECT_EQ(status_calls, 1U);
 }
 
 TEST(ClusterCreateOperatorTest, DistinguishesFailureBeforeMutation) {
@@ -652,6 +660,39 @@ TEST(ClusterCreateOperatorTest, DistinguishesFailureBeforeMutation) {
   ClusterOperator op([](const MetaAdminTarget&, std::string_view,
                         auto) -> absl::StatusOr<std::string> {
     return absl::UnavailableError("seed is offline");
+  });
+  ClusterStatusOptions options;
+  options.deadline_ =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+
+  auto outcome = op.Create({.transport_ = MetaAdminTarget::Transport::kUnix,
+                            .endpoint_ = "/tmp/meta.sock"},
+                           manifest, options);
+
+  EXPECT_EQ(outcome.status().code(), absl::StatusCode::kCancelled);
+  EXPECT_NE(outcome.status().message().find("before sending a mutation"),
+            std::string_view::npos);
+}
+
+TEST(ClusterCreateOperatorTest,
+     DistinguishesSecondConnectionFailureBeforeMutationWrite) {
+  const ClusterCreateManifestV1 manifest =
+      *ParseClusterCreateManifest(kValidManifest);
+  const ClusterHeadWireV1 head{
+      .responder_id_ = 1,
+      .role_ = ClusterMetaRole::kLeader,
+      .term_ = 1,
+      .leader_id_ = 1,
+      .config_index_ = 1,
+      .meta_members_ = {{.server_id_ = 1, .is_leader_ = true}},
+  };
+  const ClusterStatusWireV1 empty = EmptyStatus(head);
+  ClusterOperator op([&](const MetaAdminTarget&, std::string_view command,
+                         auto) -> absl::StatusOr<std::string> {
+    if (command == "clusterhead 1") return *EncodeClusterHeadReply(head);
+    if (command == "clusterstatus 1") return *EncodeClusterStatusReply(empty);
+    return MarkMetaAdminRequestNotSent(
+        absl::UnavailableError("leader connection refused"));
   });
   ClusterStatusOptions options;
   options.deadline_ =

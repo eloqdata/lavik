@@ -31,6 +31,10 @@ struct MetaCommittedStatusSlotRange {
 struct MetaCommittedStatusView {
   std::uint64_t applied_index_ = 0;
   std::uint64_t topology_epoch_ = 0;
+  MetaClusterLifecycleState cluster_lifecycle_;
+  // Only meaningful with an Uninitialized lifecycle. This is a reportable
+  // admission condition, not snapshot corruption.
+  bool cluster_non_pristine_ = false;
   bool active_cluster_create_operation_ = false;
   // The compact creation projection retains only diagnostic routing facts,
   // never the complete operation intent or destructive workflow evidence.

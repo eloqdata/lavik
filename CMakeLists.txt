@@ -911,8 +911,9 @@ if (BUILD_TESTING)
         RUN_SERIAL TRUE
       )
 
-      # The tracer-bullet creator verifies the public Redis surface with the
-      # same redis-cli dependency required by the production command.
+      # The tracer-bullet test independently verifies the eventual public
+      # Redis surface. Production cluster-create returns at Genesis commit and
+      # deliberately has no redis-cli dependency.
       find_program(KEYLANE_CLUSTER_CREATE_REDIS_CLI NAMES redis-cli)
       if (KEYLANE_CLUSTER_CREATE_REDIS_CLI)
         add_test(
