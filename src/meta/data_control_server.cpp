@@ -3264,6 +3264,12 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   SessionIo io(
       *core->worker_, connection, stream, core->options_.max_write_queue_bytes_,
       std::chrono::milliseconds(core->options_.session_progress_timeout_ms_));
+  // Set once established-session teardown hands the transport to the worker
+  // via CloseConnectionNow. The worker may reclaim the Connection storage
+  // while this coroutine is still suspended in the child-task join, so after
+  // the handoff finish must not close the stream through the stale borrowed
+  // pointer.
+  bool worker_owns_transport_close = false;
   const auto finish = [&](absl::Status status, bool protocol_error = false) {
     if (protocol_error) {
       core->protocol_errors_.fetch_add(1, std::memory_order_relaxed);
@@ -3271,7 +3277,9 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     if (!accepted_session && !redirected_session && !status.ok()) {
       core->rejected_sessions_.fetch_add(1, std::memory_order_relaxed);
     }
-    (void)stream.Close();
+    if (!worker_owns_transport_close) {
+      (void)stream.Close();
+    }
     return status;
   };
   if (absl::Status prepared = io.Prepare(); !prepared.ok()) {
@@ -3550,6 +3558,10 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   live->commit_signal_->changed_.NotifyAll(*live->worker_);
   live->response_changed_.NotifyAll(*live->worker_);
   CloseConnectionNow(*live->worker_, live->connection_, session_status);
+  // Transport retirement now belongs to the worker; keep the close before the
+  // join because shutdown(2)/BeginClose is what wakes in-flight publisher and
+  // directive-sender I/O so the join terminates.
+  worker_owns_transport_close = true;
   while (live->active_tasks_ != 0) {
     co_await live->tasks_changed_.Wait();
   }
