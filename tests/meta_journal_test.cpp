@@ -15,6 +15,7 @@
 
 #include "absl/status/status.h"
 #include "gtest/gtest.h"
+#include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/audit_store.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/encoding.h"
@@ -856,6 +857,7 @@ TEST(MetaOperationStore, DirectiveRevisionTracksOnlySemanticChanges) {
   directive.grant_revision_ = 9;
   directive.partition_replication_epoch_ = 10;
   directive.kind_ = "rebuild";
+  directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
   directive.storage_mutating_ = true;
 
   TransitionOperationPhase first;
@@ -929,6 +931,7 @@ TEST(MetaOperationStore,
   directive.grant_revision_ = 9;
   directive.partition_replication_epoch_ = 10;
   directive.kind_ = "authorize-source";
+  directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
   TransitionOperationPhase transition;
   transition.operation_id_ = id;
   transition.current_directives_ = {directive};
@@ -1015,6 +1018,7 @@ TEST(MetaOperationStore,
   directive.grant_revision_ = 9;
   directive.partition_replication_epoch_ = 10;
   directive.kind_ = "rebuild";
+  directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
   TransitionOperationPhase transition;
   transition.operation_id_ = id;
   transition.current_directives_ = {directive};
@@ -1093,6 +1097,7 @@ TEST(MetaOperationStore, TerminalReceiptRetentionIsBoundedPerOperation) {
   first.grant_revision_ = 9;
   first.partition_replication_epoch_ = 10;
   first.kind_ = "rebuild";
+  first.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
   keylane::meta::MetaDirectiveSpec second = first;
   second.directive_id_.fill(10);
   second.attempt_id_.fill(11);

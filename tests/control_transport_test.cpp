@@ -40,6 +40,7 @@ control::WireMessage Hello(char node_id_digit) {
       .node_id = std::string(40, node_id_digit),
       .boot_id = std::string(40, 'b'),
       .replication_history_id = std::string(40, 'c'),
+      .replication_flow_count = 3,
   };
 }
 
@@ -519,6 +520,7 @@ TEST(ControlWriteQueueTest, RejectsOverflowWithoutDiscardingQueuedMessage) {
                         .node_id = std::string(40, 'd'),
                         .boot_id = std::string(40, 'e'),
                         .replication_history_id = std::string(40, 'f'),
+                        .replication_flow_count = 3,
                     });
   EXPECT_EQ(rejected.code(), absl::StatusCode::kResourceExhausted);
   EXPECT_EQ(queue.queued_bytes(), before);

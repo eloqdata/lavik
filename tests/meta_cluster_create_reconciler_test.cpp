@@ -134,6 +134,7 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
       node.node_id_ = declaration.node_id_;
       node.boot_id_ = std::string(40, static_cast<char>('5' + index));
       node.replication_history_id_.fill(static_cast<std::uint8_t>(10 + index));
+      node.replication_flow_count_ = index == 0 ? 3 : 2;
       node.source_meta_applied_index_ = index_;
       node.validated_committed_high_water_ =
           std::numeric_limits<std::uint64_t>::max();
@@ -304,6 +305,35 @@ TEST_F(ClusterCreateV1RecoveryTest,
 }
 
 TEST_F(ClusterCreateV1RecoveryTest,
+       WaitsForLiveSourceLayoutBeforePlanningReplicaBatch) {
+  AdvanceToProjectionWait();
+  PublishRuntime();
+  ApplyPlanned();  // root: initialize-groups
+  ApplyPlanned();  // group-a: submit
+  ApplyPlanned();  // group-a: initialize primary
+  auto child = GroupOperation("group-a");
+  ASSERT_EQ(child.current_directives_.size(), 1);
+  CommitResult(child, child.current_directives_.front(),
+               MetaDirectiveResultStatus::kSucceeded);
+  const auto primary = runtime_.nodes_.front();
+  runtime_.nodes_.erase(runtime_.nodes_.begin());
+  auto waiting = Plan();
+  ASSERT_TRUE(waiting.ok()) << waiting.status();
+  EXPECT_FALSE(waiting->has_value());
+
+  runtime_.nodes_.insert(runtime_.nodes_.begin(), primary);
+  ApplyPlanned();
+  child = GroupOperation("group-a");
+  ASSERT_EQ(child.current_directives_.size(), 2);
+  for (const auto& directive : child.current_directives_) {
+    auto request =
+        cluster::control::DecodeRebuildRequest(directive.spec_.payload_);
+    ASSERT_TRUE(request.ok()) << request.status();
+    EXPECT_EQ(request->source_flow_count, primary.replication_flow_count_);
+  }
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
        InitializesGroupsInOrderWithOneReplicaRevision) {
   StartFirstReplicaBatch();
   auto first = GroupOperation("group-a");
@@ -313,6 +343,15 @@ TEST_F(ClusterCreateV1RecoveryTest,
   EXPECT_EQ(first.current_directives_[1].spec_.kind_, kMetaDirectiveRebuild);
   EXPECT_EQ(first.current_directives_[0].directive_revision_,
             first.current_directives_[1].directive_revision_);
+  // The fixture's primary has three source flows and its target two workers.
+  // Apply round-trips the stores, so this also checks that replay preserves
+  // the source layout in both halves of the authorization/rebuild pair.
+  for (const auto& directive : first.current_directives_) {
+    auto request =
+        cluster::control::DecodeRebuildRequest(directive.spec_.payload_);
+    ASSERT_TRUE(request.ok()) << request.status();
+    EXPECT_EQ(request->source_flow_count, 3);
+  }
   EXPECT_FALSE(stores_.operation_.FindOperation(
       detail::ClusterCreateV1GroupOperationId(root_, "group-b")));
 

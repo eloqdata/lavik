@@ -6,6 +6,7 @@
 #include <set>
 #include <tuple>
 
+#include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/value_codec.h"
 #include "spdlog/spdlog.h"
@@ -105,6 +106,8 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
       directive.kind_ == kMetaDirectiveInitializeEmptyPopulation;
   const bool promotion_prepare =
       directive.kind_ == kMetaDirectivePromotionPrepare;
+  const bool rebuild = directive.kind_ == kMetaDirectiveRebuild ||
+                       directive.kind_ == kMetaDirectiveAuthorizeSource;
   const bool absent_source =
       directive.source_node_id_ == std::string(kMetaNodeIdBytes, '0') &&
       IsZero(directive.source_assignment_id_) &&
@@ -121,17 +124,19 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
       initializes_empty
           ? directive.payload_.size() == 2 * kMetaReplicationHistoryIdBytes &&
                 std::all_of(directive.payload_.begin(),
-                            directive.payload_.end(), [](unsigned char value) {
+                            directive.payload_.end(),
+                            [](unsigned char value) {
                               return (value >= '0' && value <= '9') ||
                                      (value >= 'a' && value <= 'f');
                             }) &&
                 directive.preconditions_.empty()
-          : promotion_prepare
-                ? !directive.payload_.empty() &&
-                      !directive.preconditions_.empty() &&
-                      directive.storage_mutating_
-                : directive.payload_.empty() &&
-                      directive.preconditions_.empty();
+      : rebuild
+          ? cluster::control::DecodeRebuildRequest(directive.payload_).ok() &&
+                directive.preconditions_.empty()
+      : promotion_prepare
+          ? !directive.payload_.empty() && !directive.preconditions_.empty() &&
+                directive.storage_mutating_
+          : directive.payload_.empty() && directive.preconditions_.empty();
   return !IsZero(directive.directive_id_) && !IsZero(directive.attempt_id_) &&
          directive.recipient_node_id_.size() == kMetaNodeIdBytes &&
          directive.target_node_id_.size() == kMetaNodeIdBytes &&

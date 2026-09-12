@@ -152,6 +152,12 @@ std::string Hex(const std::array<std::uint8_t, N>& bytes) {
 
 absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
     const MetaDirectiveSpec& directive) {
+  if ((directive.kind_ == kMetaDirectiveRebuild ||
+       directive.kind_ == kMetaDirectiveAuthorizeSource) &&
+      (!control::DecodeRebuildRequest(directive.payload_).ok() ||
+       !directive.preconditions_.empty())) {
+    return Invalid("rebuild/source authorization has an invalid typed body");
+  }
   if (directive.kind_ == kMetaDirectiveRebuild) {
     if (!directive.storage_mutating_) {
       return Invalid("rebuild directive must be storage-mutating");
@@ -288,7 +294,8 @@ bool SameClusterCreateRebuildScope(const MetaDirectiveSpec& authorize,
          authorize.population_manifest_digest_ ==
              rebuild.population_manifest_digest_ &&
          authorize.partition_replication_epoch_ ==
-             rebuild.partition_replication_epoch_;
+             rebuild.partition_replication_epoch_ &&
+         authorize.payload_ == rebuild.payload_;
 }
 
 // Cluster creation commits source authorization and target rebuild together

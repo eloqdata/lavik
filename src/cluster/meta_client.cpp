@@ -1348,11 +1348,21 @@ struct MetaControlClientService::Impl {
         return absl::InvalidArgumentError("unknown directive kind");
     }
 
+    const bool rebuild = kind == NodeDirective::Kind::kReplication ||
+                         kind == NodeDirective::Kind::kAuthorizeSource;
+    std::uint32_t flow_count = 0;
+    if (rebuild) {
+      auto request = control::DecodeRebuildRequest(directive.payload);
+      if (!request.ok()) return request.status();
+      flow_count = request->source_flow_count;
+    }
     std::optional<PromotionPrepareInput> promotion_prepare;
     if (kind == NodeDirective::Kind::kPromotionPrepare) {
       auto request =
           control::DecodePromotionPrepareRequest(directive.payload);
       if (!request.ok()) return request.status();
+      flow_count = static_cast<std::uint32_t>(
+          request->required_applied_next_lsns.size());
       auto preconditions = control::DecodePromotionPreparePreconditions(
           directive.preconditions);
       if (!preconditions.ok()) return preconditions.status();
@@ -1449,16 +1459,13 @@ struct MetaControlClientService::Impl {
                 : *source_history,
         .source_host_ = std::move(source_host),
         .source_port_ = source_port,
-        .flow_count_ =
-            kind == NodeDirective::Kind::kInitializeEmptyPopulation
-                ? 0
-                : options_.request_worker_count_,
+        .flow_count_ = flow_count,
         .manifest_revision_ = directive.manifest_revision,
         .manifest_digest_ = directive.manifest_digest,
         .partition_replication_epoch_ = directive.partition_replication_epoch,
         .manifest_entries_ = std::move(manifest_entries),
         .promotion_prepare_ = std::move(promotion_prepare),
-        .payload_ = kind == NodeDirective::Kind::kPromotionPrepare
+        .payload_ = rebuild || kind == NodeDirective::Kind::kPromotionPrepare
                         ? std::string{}
                         : directive.payload,
         .preconditions_ = kind == NodeDirective::Kind::kPromotionPrepare
@@ -2266,6 +2273,7 @@ struct MetaControlClientService::Impl {
             .node_id = options_.node_id_,
             .boot_id = replication_identity.boot_id_,
             .replication_history_id = replication_identity.local_history_id_,
+            .replication_flow_count = options_.request_worker_count_,
         }));
     if (!hello_sent.ok()) {
       const bool expired = socket_deadline.Disarm();

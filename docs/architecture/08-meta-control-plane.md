@@ -172,6 +172,10 @@ acceptance and whenever that hash changes. Control protocol v1 has no delta
 format, so an index advance with identical content does not create network
 churn and a reconnect never depends on retained incremental history.
 
+Control v1 is unreleased and its schema is replaced in place. Data and Meta
+must use matching layouts; missing Hello flow counts and untyped rebuild
+payloads fail validation rather than defaulting to a local worker count.
+
 The Data-control wire protocol has a fixed versioned header, per-direction
 sequence, payload length, and CRC32C. Frames are bounded to 16 KiB. Larger
 objects use Start/Chunk/End with a declared total length and SHA-256; desired
@@ -277,10 +281,16 @@ the installed group view.
 The durable and wire codecs keep bounded `payload`, `preconditions`, and
 `force` fields. V1 uses `payload` for `initialize-empty-population`, where it
 carries the target Data session's authenticated replication-history id, and
-defines versioned payload/precondition bodies for `promotion-prepare`. Other
-executable directives require both fields empty, and all kinds require
-`force=false`. The prepare bodies bind parent history and
-required flow frontier to the committed old-authority exclusion term and hash.
+defines versioned payload/precondition bodies for `promotion-prepare`.
+`rebuild` and `authorize-source` share a versioned payload containing the source
+flow count advertised with its boot/history in `ClientHello`. Meta commits that
+layout in both directives; projection and replay never infer it from the
+recipient's workers or a newer source session. Source authorization and the
+native target handshake both check it against the actual source layout.
+Only `promotion-prepare` carries preconditions; `revoke-sources` requires both
+fields empty, and all kinds require `force=false`. The prepare bodies bind parent
+history and required flow frontier to the committed old-authority exclusion term
+and hash.
 Meta transition apply and Data admission reject malformed or misplaced bodies,
 so the replication adapter cannot silently ignore a predicate or override.
 Operation, durable directive, execution attempt, and assignment-incarnation
@@ -739,8 +749,11 @@ replication session; subsequent heartbeats supply the population-current READY
 evidence.
 
 Group children execute in canonical Group order. Exact directive identities,
-attempts, boots, histories, assignments, terms, grants, manifests, and
-partition epochs make reconnect replay safe without minting another attempt.
+attempts, boots, histories, assignments, terms, grants, manifests,
+partition epochs, and source flow layouts make reconnect replay safe without
+minting another attempt. Primary and replica worker counts may differ: flow
+identity follows the source and native replication maps those flows onto the
+target's workers.
 A deterministic failure fences only that Group before aborting its child and
 then the root; already completed Groups are not rolled back. While population
 work is unfinished, a current Data session with a different target boot or

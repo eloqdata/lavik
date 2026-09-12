@@ -28,7 +28,8 @@ constexpr std::size_t kTransferChunkEnvelopeBytes = 16 + 8 + 4;
 constexpr std::size_t kMaxTransferChunkBytes =
     kMaxFramePayloadBytes - kTransferChunkEnvelopeBytes;
 constexpr std::size_t kMaxPromotionFlowCount = 1024;
-constexpr std::uint16_t kPromotionPrepareSchemaVersion = 1;
+constexpr std::uint16_t kDirectiveBodySchemaVersion = 1;
+constexpr std::string_view kRebuildRequestMagic = "KLRR";
 constexpr std::string_view kPromotionRequestMagic = "KLPR";
 constexpr std::string_view kPromotionPreconditionsMagic = "KLPC";
 constexpr std::string_view kPromotionEvidenceMagic = "KLPE";
@@ -286,18 +287,19 @@ bool IsZeroHash(const WireHash256& hash) noexcept {
 absl::Status WriteSchemaHeader(Writer& writer, std::string_view magic) {
   if (magic.size() != 4) return ProtocolError("invalid schema magic");
   writer.Raw(magic);
-  writer.U16(kPromotionPrepareSchemaVersion);
+  writer.U16(kDirectiveBodySchemaVersion);
   return absl::OkStatus();
 }
 
 absl::Status ReadSchemaHeader(Reader& reader, std::string_view magic) {
   auto encoded_magic = reader.Raw(4);
   if (!encoded_magic.ok()) return encoded_magic.status();
-  if (*encoded_magic != magic) return ProtocolError("unknown promotion schema");
+  if (*encoded_magic != magic)
+    return ProtocolError("unknown directive body schema");
   auto version = reader.U16();
   if (!version.ok()) return version.status();
-  if (*version != kPromotionPrepareSchemaVersion) {
-    return ProtocolError("unknown promotion schema version");
+  if (*version != kDirectiveBodySchemaVersion) {
+    return ProtocolError("unknown directive body schema version");
   }
   return absl::OkStatus();
 }
@@ -636,6 +638,36 @@ WireHash256 ComputeSha256(std::string_view bytes) noexcept {
   Sha256 sha;
   sha.Update(bytes);
   return sha.Final();
+}
+
+absl::StatusOr<std::string> EncodeRebuildRequest(
+    const RebuildRequest& request) {
+  if (request.source_flow_count == 0 ||
+      request.source_flow_count > kMaxCandidateFlows) {
+    return ProtocolError("invalid rebuild source flow count");
+  }
+  Writer writer;
+  if (absl::Status status = WriteSchemaHeader(writer, kRebuildRequestMagic);
+      !status.ok()) {
+    return status;
+  }
+  writer.U32(request.source_flow_count);
+  return std::move(writer).Take();
+}
+
+absl::StatusOr<RebuildRequest> DecodeRebuildRequest(std::string_view encoded) {
+  Reader reader(encoded);
+  if (absl::Status status = ReadSchemaHeader(reader, kRebuildRequestMagic);
+      !status.ok()) {
+    return status;
+  }
+  auto count = reader.U32();
+  if (!count.ok()) return count.status();
+  if (*count == 0 || *count > kMaxCandidateFlows) {
+    return ProtocolError("invalid rebuild source flow count");
+  }
+  if (absl::Status status = Finish(reader); !status.ok()) return status;
+  return RebuildRequest{.source_flow_count = *count};
 }
 
 absl::StatusOr<std::string> EncodePromotionPrepareRequest(
@@ -1284,6 +1316,10 @@ absl::StatusOr<std::string> Encode(const ClientHello& hello) {
       hello.minimum_version > hello.maximum_version) {
     return ProtocolError("invalid ClientHello version range");
   }
+  if (hello.replication_flow_count == 0 ||
+      hello.replication_flow_count > kMaxCandidateFlows) {
+    return ProtocolError("invalid ClientHello replication flow count");
+  }
   Writer writer;
   writer.U16(hello.minimum_version);
   writer.U16(hello.maximum_version);
@@ -1300,6 +1336,7 @@ absl::StatusOr<std::string> Encode(const ClientHello& hello) {
       !status.ok()) {
     return status;
   }
+  writer.U32(hello.replication_flow_count);
   return std::move(writer).Take();
 }
 
@@ -1325,6 +1362,12 @@ absl::StatusOr<WireMessage> DecodeClientHello(std::string_view bytes) {
   auto history_id = ReadIdentity(reader, "replication history id");
   if (!history_id.ok()) return history_id.status();
   hello.replication_history_id = std::move(*history_id);
+  auto count = reader.U32();
+  if (!count.ok()) return count.status();
+  if (*count == 0 || *count > kMaxCandidateFlows) {
+    return ProtocolError("invalid ClientHello replication flow count");
+  }
+  hello.replication_flow_count = *count;
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return WireMessage{std::move(hello)};
 }

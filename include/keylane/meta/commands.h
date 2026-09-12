@@ -547,8 +547,8 @@ struct MetaDirectiveSpec {
   std::uint64_t partition_replication_epoch_ = 0;
   std::string kind_;
   // V1 uses payload for initialize-empty-population's authenticated target
-  // history and versioned bodies for promotion-prepare. Other executable kinds
-  // require both fields empty.
+  // history and versioned bodies for rebuild/authorize-source source layouts
+  // and promotion-prepare. Only promotion-prepare carries preconditions.
   std::string payload_;
   std::string preconditions_;
   // Active classification used to exclude concurrent mutations of the same

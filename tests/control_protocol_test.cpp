@@ -504,6 +504,57 @@ TEST(ControlProtocolCodecTest, RoundTripsSourceLessPopulationInitialization) {
   EXPECT_EQ(std::get<control::Directive>(*decoded), directive);
 }
 
+TEST(ControlProtocolCodecTest, HelloRequiresBoundedSourceFlowCount) {
+  control::ClientHello hello{
+      .node_id = std::string(40, 'a'),
+      .boot_id = std::string(40, 'b'),
+      .replication_history_id = std::string(40, 'c'),
+      .replication_flow_count = 3,
+  };
+  auto encoded = control::EncodeMessage(control::WireMessage{hello});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded = control::DecodeMessage(MessageType::kClientHello, *encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(std::get<control::ClientHello>(*decoded), hello);
+  for (std::uint32_t count : {0U, 1025U}) {
+    hello.replication_flow_count = count;
+    EXPECT_FALSE(control::EncodeMessage(control::WireMessage{hello}).ok());
+    std::string malformed = encoded->substr(0, encoded->size() - 4);
+    AppendBe32(&malformed, count);
+    EXPECT_FALSE(
+        control::DecodeMessage(MessageType::kClientHello, malformed).ok());
+  }
+  EXPECT_FALSE(control::DecodeMessage(MessageType::kClientHello,
+                                      encoded->substr(0, encoded->size() - 4))
+                   .ok());
+  EXPECT_FALSE(
+      control::DecodeMessage(MessageType::kClientHello, *encoded + "x").ok());
+}
+
+TEST(ControlProtocolCodecTest,
+     RebuildPayloadRequiresExactVersionedSourceLayout) {
+  auto encoded = control::EncodeRebuildRequest({3});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded = control::DecodeRebuildRequest(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->source_flow_count, 3);
+  EXPECT_EQ(*encoded, std::string("KLRR\0\1\0\0\0\3", 10));
+  for (std::uint32_t count : {0U, 1025U}) {
+    EXPECT_FALSE(control::EncodeRebuildRequest({count}).ok());
+    std::string malformed = encoded->substr(0, 6);
+    AppendBe32(&malformed, count);
+    EXPECT_FALSE(control::DecodeRebuildRequest(malformed).ok());
+  }
+  for (std::size_t size = 0; size < encoded->size(); ++size)
+    EXPECT_FALSE(control::DecodeRebuildRequest(encoded->substr(0, size)).ok());
+  EXPECT_FALSE(control::DecodeRebuildRequest(*encoded + "x").ok());
+  (*encoded)[5] = 2;
+  EXPECT_FALSE(control::DecodeRebuildRequest(*encoded).ok());
+  (*encoded)[5] = 1;
+  (*encoded)[0] = 'X';
+  EXPECT_FALSE(control::DecodeRebuildRequest(*encoded).ok());
+}
+
 TEST(ControlProtocolCodecTest,
      OperationEvidenceCarriesSessionBootAssignmentAndFreshnessAnchors) {
   const std::string evidence_body = "flow-0=41,flow-1=52";

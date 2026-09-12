@@ -36,6 +36,8 @@ struct MetaDataControlRuntimeNode {
   // session. Source-less population initialization binds its durable intent
   // to this value before any destructive reset is projected to Data.
   MetaReplicationHistoryId replication_history_id_{};
+  // Native source layout from the same authenticated Hello as boot/history.
+  std::uint32_t replication_flow_count_ = 0;
   std::uint64_t session_generation_ = 0;
   std::uint64_t leadership_generation_ = 0;
   std::uint64_t source_meta_applied_index_ = 0;
@@ -94,6 +96,7 @@ class MetaDataControlRuntimeStatus {
   void PublishCurrent(std::string node_id, std::string boot_id,
                       const cluster::control::WireId128& session_id,
                       const MetaReplicationHistoryId& replication_history_id,
+                      std::uint32_t replication_flow_count,
                       std::uint64_t session_generation,
                       std::uint64_t leadership_generation,
                       std::uint64_t validated_committed_high_water,

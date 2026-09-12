@@ -63,19 +63,19 @@ def expect_commit(reply, label):
     return int(match.group(1))
 
 
-def allocate_data_file(path):
+def allocate_data_file(path, size=DATA_FILE_BYTES):
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         if hasattr(os, "posix_fallocate"):
-            os.posix_fallocate(fd, 0, DATA_FILE_BYTES)
+            os.posix_fallocate(fd, 0, size)
         else:
-            os.ftruncate(fd, DATA_FILE_BYTES)
+            os.ftruncate(fd, size)
     finally:
         os.close(fd)
 
 
 class DataProcess:
-    def __init__(self, binary, workdir, node_id, seed, tls=None):
+    def __init__(self, binary, workdir, node_id, seed, tls=None, workers=1):
         self.binary = binary
         self.node_id = node_id
         self.workdir = workdir
@@ -85,6 +85,7 @@ class DataProcess:
             self.metrics_port = H.free_port()
         self.seed = seed
         self.tls = tls
+        self.workers = workers
         self.log_path = os.path.join(workdir, "keylane.log")
         self.data_path = os.path.join(workdir, "keylane.data")
         self.proc = None
@@ -96,16 +97,16 @@ class DataProcess:
 
     def start(self):
         os.makedirs(self.workdir, exist_ok=True)
-        allocate_data_file(self.data_path)
+        allocate_data_file(self.data_path, DATA_FILE_BYTES * self.workers)
         args = [
             self.binary,
             "--logtostderr",
             "--port", str(self.redis_port),
             "--metrics-port", str(self.metrics_port),
-            "--threads", "1",
+            "--threads", str(self.workers),
             "--recv-buffers-per-worker", "0",
             "--registered-buffer-mb-per-worker", "64",
-            "--repl-backlog-size", "8mb",
+            "--repl-backlog-size", f"{8 * self.workers}mb",
             "--max-memory", "1073741824",
             "--flush-max-ms", "20",
             "--data-file", self.data_path,

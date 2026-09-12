@@ -140,12 +140,15 @@ struct NodeDirective {
   NodeId source_replication_history_id_;
   std::string source_host_;
   std::uint16_t source_port_ = 0;
+  // Source boot/history layout decoded from committed rebuild intent. This
+  // is independent of the receiving node's local worker count.
   std::uint32_t flow_count_ = 0;
   std::uint64_t manifest_revision_ = 0;
   Sha256Digest manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
   std::vector<NodeManifestEntry> manifest_entries_;
   std::optional<PromotionPrepareInput> promotion_prepare_;
+  // Rebuild/authorize-source payloads are decoded into flow_count_ above.
   // Empty-population initialization retains its authenticated target history
   // in payload_. Promotion-prepare is decoded into promotion_prepare_ and its
   // raw opaque fields are cleared; other V1 kinds require both strings empty.

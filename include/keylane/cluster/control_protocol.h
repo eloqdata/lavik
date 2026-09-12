@@ -157,6 +157,9 @@ struct ClientHello {
   std::string node_id;
   std::string boot_id;
   std::string replication_history_id;
+  // Native source layout for this boot/history, independent of any upstream
+  // source layout when this node is a replica. Zero is not a valid layout.
+  std::uint32_t replication_flow_count = 0;
 
   friend bool operator==(const ClientHello&, const ClientHello&) = default;
 };
@@ -535,6 +538,21 @@ enum class WireDirectiveKind : std::uint8_t {
   kPromotionPrepare = 5,
 };
 
+// Versioned payload shared by rebuild and authorize-source. The envelope binds
+// this layout to its exact source assignment, boot, and history; the target's
+// local worker count never participates in that identity.
+struct RebuildRequest {
+  std::uint32_t source_flow_count = 0;
+
+  friend bool operator==(const RebuildRequest&,
+                         const RebuildRequest&) = default;
+};
+
+// Encodes/decodes a bounded, nonzero source layout. Unknown schemas, missing
+// counts, and trailing bytes are rejected rather than inferred locally.
+absl::StatusOr<std::string> EncodeRebuildRequest(const RebuildRequest& request);
+absl::StatusOr<RebuildRequest> DecodeRebuildRequest(std::string_view encoded);
+
 // Versioned opaque bodies carried by a promotion-prepare directive and its
 // successful terminal result. They intentionally exclude envelope identity:
 // the enclosing Directive/DirectiveResult remains the single source of truth
@@ -599,9 +617,9 @@ struct Directive {
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
-  // V1 uses payload for initialize-empty-population's target history id and
-  // versioned payload/preconditions for promotion-prepare. Other kinds require
-  // both fields empty at admission.
+  // V1 uses typed payloads for rebuild/authorize-source source layouts and
+  // promotion-prepare, and a target history id for initialize-empty-population.
+  // Only promotion-prepare carries preconditions.
   std::string payload;
   std::string preconditions;
   // Active V1 classification: population mutations set it; source
@@ -771,9 +789,9 @@ struct WireProjectedDirective {
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
-  // V1 uses payload for initialize-empty-population's target history id and
-  // versioned payload/preconditions for promotion-prepare. Other kinds require
-  // both fields empty at admission.
+  // V1 uses typed payloads for rebuild/authorize-source source layouts and
+  // promotion-prepare, and a target history id for initialize-empty-population.
+  // Only promotion-prepare carries preconditions.
   std::string payload;
   std::string preconditions;
   // Active V1 classification: population mutations set it; source

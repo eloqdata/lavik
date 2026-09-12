@@ -1287,6 +1287,7 @@ struct LiveSessionState {
   std::string boot_id_;
   control::WireId128 session_id_{};
   MetaReplicationHistoryId replication_history_id_{};
+  std::uint32_t replication_flow_count_ = 0;
   std::uint64_t session_generation_ = 0;
   std::uint64_t leadership_generation_ = 0;
 
@@ -2313,9 +2314,9 @@ celer::Task<absl::Status> SessionPublisherBody(
     state->projection_superseded_ = false;
     state->core_->options_.runtime_status_->PublishCurrent(
         state->node_id_, state->boot_id_, state->session_id_,
-        state->replication_history_id_, state->session_generation_,
-        state->leadership_generation_, state->validated_committed_high_water_,
-        state->installed_->full_state);
+        state->replication_history_id_, state->replication_flow_count_,
+        state->session_generation_, state->leadership_generation_,
+        state->validated_committed_high_water_, state->installed_->full_state);
     StartDirectiveSender(state);
   }
   co_return absl::CancelledError(
@@ -3477,6 +3478,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   live->boot_id_ = hello->boot_id;
   live->session_id_ = *session_id;
   live->replication_history_id_ = *replication_history_id;
+  live->replication_flow_count_ = hello->replication_flow_count;
   live->session_generation_ = session_generation;
   live->leadership_generation_ = leadership_generation;
   // Transfer the sole retained-projection owner into live session state. The
@@ -3524,7 +3526,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   }
   core->options_.runtime_status_->PublishCurrent(
       node_id, hello->boot_id, *session_id, *replication_history_id,
-      session_generation, leadership_generation,
+      hello->replication_flow_count, session_generation, leadership_generation,
       live->validated_committed_high_water_, live->installed_->full_state);
   core->accepted_sessions_.fetch_add(1, std::memory_order_relaxed);
   core->active_sessions_.fetch_add(1, std::memory_order_relaxed);

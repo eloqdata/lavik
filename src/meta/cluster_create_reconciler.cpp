@@ -559,6 +559,19 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
           declaration.primary_node_id_,
           "source boot/history changed before replica initialization");
 
+    // Bind the layout from this exact live source incarnation into durable
+    // intent. Reconnect/replay must not substitute the target's worker count
+    // or re-read a newer source layout while projecting the same directive.
+    if (!runtime.leader_authority_eligible_ ||
+        primary_runtime == runtime.nodes_.end() ||
+        !ProjectionMatches(*primary_runtime, *group, *grant,
+                           view.applied_index()))
+      return std::nullopt;
+    auto rebuild_request = cluster::control::EncodeRebuildRequest(
+        {.source_flow_count = primary_runtime->replication_flow_count_});
+    if (!rebuild_request.ok())
+      return Conflict(rebuild_request.status().message());
+
     TransitionOperationPhase transition;
     transition.operation_id_ = operation.operation_id_;
     transition.expected_revision_ = operation.revision_;
@@ -604,6 +617,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
       authorize.population_manifest_digest_ = population.manifest_digest_;
       authorize.partition_replication_epoch_ = 1;
       authorize.kind_ = kMetaDirectiveAuthorizeSource;
+      authorize.payload_ = *rebuild_request;
       MetaDirectiveSpec rebuild = authorize;
       rebuild.directive_id_ =
           DerivedV1Id(operation.operation_id_, purpose + "rebuild");

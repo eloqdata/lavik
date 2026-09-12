@@ -34,11 +34,13 @@ GROUPS = {
 def meta_manifest_lines(*metas):
     lines = []
     for meta in sorted(metas, key=lambda node: node.id):
+        data_endpoint = getattr(meta, "advertised_data_control_endpoint",
+                                meta.data_control_endpoint)
         lines.extend([
             "[[meta_members]]",
             f"id = {meta.id}",
             f'raft_endpoint = "tcp://{meta.endpoint}"',
-            f'data_control_endpoint = "tcp://{meta.data_control_endpoint}"',
+            f'data_control_endpoint = "tcp://{data_endpoint}"',
             f'ctl_endpoint = "tcp://{meta.ctl_endpoint}"',
             "",
         ])
@@ -844,18 +846,27 @@ def stopped_replica_blocker(environment, meta, replica):
 def run_multi_group_case(workdir, automatic, interactive,
                          block_replica_during_create=False,
                          restart_replica_during_create=False,
-                         data_first=False):
+                         data_first=False, worker_counts=None):
     layout = "automatic" if automatic else "explicit"
     mode = "interactive" if interactive else "yes"
     blocked = "-blocked" if block_replica_during_create else ""
     restarted = "-restart" if restart_replica_during_create else ""
     name = f"multi-{layout}-{mode}{blocked}{restarted}"
+    if worker_counts is not None:
+        name += "-workers-" + "-".join(map(str, worker_counts))
     scenario = os.path.join(workdir, name)
     os.makedirs(scenario, mode=0o700)
     meta_workdir = os.path.join(scenario, "meta")
     os.makedirs(meta_workdir, mode=0o700)
     meta = H.Node(META, meta_workdir, 1,
                   args=H.raft_args(snapshot_distance=100_000))
+    # Hold target rebuilds after source initialization so snapshots contain
+    # real data. The advertised proxy also captures reconnects and redirects.
+    proxy = (DirectiveBarrier(meta.data_control_port,
+                              recipients=(REPLICA_1, REPLICA_2))
+             if worker_counts is not None else None)
+    if proxy:
+        meta.advertised_data_control_endpoint = proxy.endpoint
     nodes = [
         DataProcess(DATA, os.path.join(scenario, "primary-1"), PRIMARY_1,
                     meta.data_control_endpoint),
@@ -866,6 +877,11 @@ def run_multi_group_case(workdir, automatic, interactive,
         DataProcess(DATA, os.path.join(scenario, "replica-2"), REPLICA_2,
                     meta.data_control_endpoint),
     ]
+    if proxy:
+        for node, workers in zip(nodes, worker_counts):
+            node.workers = workers
+            node.seed = proxy.endpoint
+    snapshot_values = {}
     environment = os.environ.copy()
     environment["PATH"] = (os.path.dirname(REDIS_CLI) + os.pathsep +
                            environment.get("PATH", ""))
@@ -888,6 +904,8 @@ def run_multi_group_case(workdir, automatic, interactive,
                     os.environ[variable] = old
 
     try:
+        if proxy:
+            proxy.start()
         # The normal acceptance path starts the complete multi-Data,
         # multi-Group cohort before Meta. Other fault cases retain their
         # targeted ordering but still use the same complete genesis manifest.
@@ -967,8 +985,48 @@ def run_multi_group_case(workdir, automatic, interactive,
                 node.terminate()
             meta.terminate()
             return
-        created = command(
-            environment, arguments, input_text=input_text, timeout=150)
+        if proxy:
+            creator = subprocess.Popen(
+                arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=environment)
+            try:
+                if input_text is not None:
+                    creator.stdin.write(input_text)
+                    creator.stdin.flush()
+                by_id = {node.node_id: node for node in nodes}
+                for group_id, (primary_id, replica_id, first, last) in GROUPS.items():
+                    held, release = proxy.recipients[replica_id]
+                    H.wait_until(f"{group_id} target rebuild held", 30, held.is_set)
+                    primary = by_id[primary_id]
+                    values = {key_in_range(f"{group_id}-snapshot-{i}", first, last):
+                              f"snapshot-{i}-" + "x" * 4096 for i in range(32)}
+                    key, value = next(iter(values.items()))
+
+                    def primary_writable():
+                        try:
+                            return redis_call(primary, ["SET", key, value]) == "OK"
+                        except H.Failure as error:
+                            if str(error).startswith(("CLUSTERDOWN", "TRYAGAIN")):
+                                return False
+                            raise
+
+                    H.wait_until(f"{group_id} initialized primary writable", 10,
+                                 primary_writable)
+                    for key, value in values.items():
+                        if redis_call(primary, ["SET", key, value]) != "OK":
+                            raise H.Failure("snapshot seed write failed")
+                    snapshot_values[replica_id] = values
+                    release.set()
+                created, stderr = creator.communicate(timeout=120)
+                if creator.returncode != 0:
+                    raise H.Failure(f"heterogeneous creation failed: {created!r} {stderr!r}")
+            finally:
+                if creator.poll() is None:
+                    creator.kill()
+                    creator.communicate(timeout=5)
+        else:
+            created = command(
+                environment, arguments, input_text=input_text, timeout=150)
         operations = dict(re.findall(
             r"group=(group-[12]) operation=([0-9a-f]{32})", created))
         if ("WARNING: existing data on all Data nodes will be erased" not in
@@ -991,6 +1049,25 @@ def run_multi_group_case(workdir, automatic, interactive,
             if meta.getop(operation_id) != "OK completed cluster-created":
                 raise H.Failure(f"{group_id} operation did not complete")
         assert_redis_topology_and_replication(nodes)
+        if proxy:
+            by_id = {node.node_id: node for node in nodes}
+            for primary_id, replica_id, _, _ in GROUPS.values():
+                primary, replica = by_id[primary_id], by_id[replica_id]
+                info = redis_call(replica, ["INFO", "replication"])
+                for field in ("keylane_source_workers", "keylane_connected_flows"):
+                    if f"{field}:{primary.workers}\r\n" not in info:
+                        raise H.Failure(f"source layout was not preserved: {info!r}")
+                values = snapshot_values[replica_id]
+                for key, value in values.items():
+                    if readonly_get(replica, key) != value:
+                        raise H.Failure(f"snapshot missing {key}")
+                    if redis_call(primary, ["SET", key, "delta-" + value]) != "OK":
+                        raise H.Failure(f"incremental write failed for {key}")
+                H.wait_until(
+                    f"{primary.workers}->{replica.workers} incremental replication", 20,
+                    lambda: all(readonly_get(replica, key) == "delta-" + value
+                                for key, value in values.items()))
+                H.log(f"{primary.workers}->{replica.workers}: snapshot and incremental writes verified")
         H.log(f"{name}: both Groups routed, replicated, and reached READY")
         for node in nodes:
             node.terminate()
@@ -1002,6 +1079,8 @@ def run_multi_group_case(workdir, automatic, interactive,
             print(node.log_tail(lines=250), file=sys.stderr)
         raise
     finally:
+        if proxy:
+            proxy.close()
         for node in nodes:
             node.force_kill()
         meta.force_kill()
@@ -1054,11 +1133,13 @@ def run_group_id_probe_case(workdir):
 class DirectiveBarrier(H.Proxy):
     """Hold one complete control frame without changing its bytes/identity."""
 
-    def __init__(self, target_port, result=False):
+    def __init__(self, target_port, result=False, recipients=()):
         super().__init__("result" if result else "directive", target_port)
         self.result = result
         self.blocked = threading.Event()
         self.release = threading.Event()
+        self.recipients = {node_id: (threading.Event(), threading.Event())
+                           for node_id in recipients}
 
     def _pump(self, src, dst, pair):
         selected = src is pair[0] if self.result else src is pair[1]
@@ -1083,8 +1164,20 @@ class DirectiveBarrier(H.Proxy):
                     raise H.Failure("unexpected control frame")
                 payload = exact(size)
                 if kind == (14 if self.result else 12):
-                    self.blocked.set()
-                    if not self.release.wait(20):
+                    blocked, release = self.blocked, self.release
+                    if self.recipients:
+                        # Directive's fixed session/basis precede the variable
+                        # Group id, then authority and directive identities.
+                        group_size = struct.unpack_from(">I", payload, 56)[0]
+                        recipient_offset = 156 + group_size
+                        recipient = payload[recipient_offset:recipient_offset + 40].decode()
+                        events = self.recipients.get(recipient)
+                        if events is None or events[0].is_set():
+                            dst.sendall(header + payload)
+                            continue
+                        blocked, release = events
+                    blocked.set()
+                    if not release.wait(20):
                         raise OSError("test barrier timed out")
                     dst.sendall(header + payload)
                     return super()._pump(src, dst, pair)
@@ -1094,6 +1187,8 @@ class DirectiveBarrier(H.Proxy):
 
     def close(self):
         self.release.set()
+        for _, release in self.recipients.values():
+            release.set()
         super().close()
 
 
@@ -1251,6 +1346,8 @@ def main():
         run_multi_group_case(workdir, automatic=True, interactive=True,
                              data_first=True)
         run_multi_group_case(workdir, automatic=False, interactive=False)
+        run_multi_group_case(workdir, automatic=True, interactive=False,
+                             worker_counts=(1, 2, 3, 2))
         run_multi_group_case(workdir, automatic=False, interactive=False,
                              block_replica_during_create=True)
         run_group_id_probe_case(workdir)
