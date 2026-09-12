@@ -3026,6 +3026,11 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
       break;
     }
     core->sessions_.push_back(connection);
+    // Same storage-borrow contract as the data-control server: shutdown may
+    // BeginClose this connection at any later suspension point, and the
+    // session coroutine must still find the storage allocated when it
+    // resumes. Released by SessionLoop's borrow guard.
+    celer::BorrowConnectionStorage(connection);
     worker.Spawn(SessionLoop(core, celer::TcpStream(connection), connection));
   }
   if (core->shutdown_accept_wake_fd_ >= 0) {
@@ -3041,6 +3046,13 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
 
 celer::Task<absl::Status> MetaCtlServer::SessionLoop(
     CorePtr core, celer::TcpStream stream, celer::Connection* connection) {
+  // Declared first so it destructs last: the AcceptLoop storage borrow is
+  // released only after every session-local object stopped dereferencing the
+  // connection, which an external shutdown close may have already retired.
+  struct BorrowGuard {
+    ~BorrowGuard() { celer::ReleaseConnectionStorage(connection_); }
+    celer::Connection* connection_;
+  } borrow_guard{connection};
   const auto remove_session = [&] {
     std::vector<celer::Connection*>& sessions = core->sessions_;
     for (auto it = sessions.begin(); it != sessions.end(); ++it) {

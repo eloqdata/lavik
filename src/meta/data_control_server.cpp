@@ -3204,6 +3204,12 @@ celer::Task<absl::Status> MetaDataControlServer::AcceptLoop(CorePtr core) {
     }
     core->sessions_.push_back(connection);
     core->live_session_tasks_.fetch_add(1, std::memory_order_relaxed);
+    // Pin the Connection storage before the session can outlive it: shutdown,
+    // demotion, or a watchdog may BeginClose the connection at any later
+    // suspension point, and ReclaimConnections must not free the storage while
+    // the spawned session (and its children/watchdogs) can still dereference
+    // it. The session's completion guard releases the borrow.
+    celer::BorrowConnectionStorage(connection);
     core->worker_->Spawn(SessionLoop(core, celer::TcpStream(connection),
                                      connection, std::move(*handshake_permit)));
   }
@@ -3253,6 +3259,10 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
                     status_session_id_->has_value()
                         ? &status_session_id_->value()
                         : nullptr);
+      // Release the AcceptLoop borrow only after the session left every core
+      // registry: external closers iterate those registries and dereference
+      // the connection, so the storage must stay pinned until deregistration.
+      celer::ReleaseConnectionStorage(connection_);
     }
   } completion{core,
                connection,
@@ -3265,10 +3275,10 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
       *core->worker_, connection, stream, core->options_.max_write_queue_bytes_,
       std::chrono::milliseconds(core->options_.session_progress_timeout_ms_));
   // Set once established-session teardown hands the transport to the worker
-  // via CloseConnectionNow. The worker may reclaim the Connection storage
-  // while this coroutine is still suspended in the child-task join, so after
-  // the handoff finish must not close the stream through the stale borrowed
-  // pointer.
+  // via CloseConnectionNow. The AcceptLoop borrow keeps the retired
+  // Connection storage alive until this coroutine exits, so the skip is about
+  // ownership, not liveness: after the handoff a second close is at best a
+  // no-op, and the flag records that the worker owns transport retirement.
   bool worker_owns_transport_close = false;
   const auto finish = [&](absl::Status status, bool protocol_error = false) {
     if (protocol_error) {
