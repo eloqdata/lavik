@@ -155,9 +155,24 @@ def recovery_cut(workdir, add, phase, snapshot=False, failover=False):
             H.wait_until("target catches up", 15,
                          lambda: target.getop(probe) == "OK completed after-membership-recovery")
         else:
-            if (restored.ctl("removesrv 4") != "OK" or
-                    restored.ctl(add_request(target)) != "ERR rejected"):
-                raise H.Failure("removed identity was not terminally retired")
+            replies = []
+
+            def terminally_retired():
+                replies[:] = [restored.ctl("removesrv 4"),
+                              restored.ctl(add_request(target))]
+                return replies == ["OK", "ERR rejected"]
+
+            # A newly elected leader appends NuRaft's same-membership config
+            # copy before accepting another config request. Operation
+            # completion and identity retirement are already committed, but
+            # that internal config round can transiently return
+            # `config-changing`; observe the stable admission result.
+            try:
+                H.wait_until("removed identity is terminally retired", 5,
+                             terminally_retired)
+            except H.Failure as error:
+                raise H.Failure(
+                    f"removed identity was not terminally retired: {replies}") from error
         H.log(f"{name}: original operation completes without resubmission ({'snapshot' if snapshot else 'WAL'})")
     except Exception:
         H.dump_node_logs(nodes + [target])

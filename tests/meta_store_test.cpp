@@ -23,16 +23,22 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/nuraft_log_store.h"
 #include "keylane/meta/nuraft_state_mgr.h"
+#include "keylane/meta/state_machine.h"
 #include "libnuraft/nuraft.hxx"
 
 namespace {
 
+using keylane::meta::MetaMemberIdentity;
 using keylane::meta::NuraftLogFaultInjector;
 using keylane::meta::NuraftLogFaultPoint;
 using keylane::meta::NuraftLogStore;
+using keylane::meta::NuraftMemberConfig;
+using keylane::meta::NuraftStartupMode;
 using keylane::meta::NuraftStateMgr;
+using keylane::meta::NuraftStateMgrOpenOptions;
 
 class OneShotLogFault final : public NuraftLogFaultInjector {
  public:
@@ -714,20 +720,255 @@ class StateMgrTest : public ::testing::Test {
   void SetUp() override { dir_ = MakeTestDir("store", "mgr"); }
   void TearDown() override { RemoveTestDir(dir_); }
 
+  static NuraftMemberConfig Member(std::uint32_t id) {
+    return NuraftMemberConfig{
+        .server_id_ = static_cast<std::int32_t>(id),
+        .raft_endpoint_ = "127.0.0.1:" + std::to_string(9700 + id),
+        .principal_ = "keylane://meta/" + std::to_string(id),
+        .data_control_endpoint_ = "127.0.0.1:" + std::to_string(9800 + id),
+        .ctl_endpoint_ = "127.0.0.1:" + std::to_string(9900 + id),
+    };
+  }
+
+  absl::StatusOr<std::unique_ptr<NuraftStateMgr>> OpenInitial(
+      std::vector<NuraftMemberConfig> members = {Member(7)}) {
+    return NuraftStateMgr::Open({.data_dir_ = dir_.string(),
+                                 .local_member_ = Member(7),
+                                 .initial_cluster_ = std::move(members)});
+  }
+
+  absl::StatusOr<std::unique_ptr<NuraftStateMgr>> OpenRestart() {
+    return NuraftStateMgr::Open(
+        {.data_dir_ = dir_.string(), .local_member_ = Member(7)});
+  }
+
   absl::StatusOr<std::unique_ptr<NuraftStateMgr>> Open() {
-    return NuraftStateMgr::Open(dir_, /*server_id=*/7, "127.0.0.1:9707");
+    return std::filesystem::exists(dir_ / "cluster_config.dat") ? OpenRestart()
+                                                                : OpenInitial();
+  }
+
+  static void PersistInitializedRaftEvidence(NuraftStateMgr& manager) {
+    nuraft::srv_state state;
+    state.set_term(1);
+    state.set_voted_for(manager.server_id());
+    manager.save_state(state);
+    auto log = manager.load_log_store();
+    nuraft::ptr<nuraft::log_entry> entry = MakeEntry(1, "initialized");
+    ASSERT_EQ(log->append(entry), 1U);
+    ASSERT_TRUE(log->flush());
+  }
+
+  static keylane::meta::BindMetaMember Binding(std::uint32_t id) {
+    const auto member = Member(id);
+    keylane::meta::BindMetaMember binding;
+    binding.request_id_[0] = static_cast<std::uint8_t>(id);
+    binding.server_id_ = id;
+    binding.principal_ = member.principal_;
+    binding.data_control_endpoint_ = member.data_control_endpoint_;
+    binding.ctl_endpoint_ = member.ctl_endpoint_;
+    return binding;
+  }
+
+  static nuraft::ptr<nuraft::cluster_config> Config(
+      std::uint64_t index, std::initializer_list<std::uint32_t> ids) {
+    auto config = nuraft::cs_new<nuraft::cluster_config>(index, 0);
+    for (const auto id : ids) {
+      const auto member = Member(id);
+      const MetaMemberIdentity identity{member.server_id_, member.principal_,
+                                        member.data_control_endpoint_,
+                                        member.ctl_endpoint_};
+      config->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(
+          member.server_id_, 0, member.raft_endpoint_, identity.EncodeAux(),
+          false, 1));
+    }
+    return config;
+  }
+
+  // A sender's real state-machine snapshot is published in the receiver's
+  // directory, stopping at the receive-durable / config-not-yet-installed cut.
+  void PublishSnapshot(nuraft::ptr<nuraft::cluster_config> config,
+                       std::uint64_t index,
+                       std::initializer_list<std::uint32_t> bindings,
+                       std::optional<std::uint32_t> retired = std::nullopt) {
+    auto opened = keylane::meta::MetaStateMachine::Open(dir_.string());
+    ASSERT_TRUE(opened.ok()) << opened.status();
+    auto& machine = **opened;
+    std::uint64_t applied = 0;
+    for (const auto id : bindings) {
+      auto command =
+          keylane::meta::MetaStateMachine::EncodeCommand(Binding(id));
+      ASSERT_TRUE(command.ok()) << command.status();
+      machine.commit(++applied, **command);
+    }
+    if (retired) {
+      keylane::meta::RetireMetaMember retirement;
+      retirement.request_id_[0] = 99;
+      retirement.server_id_ = *retired;
+      auto command = keylane::meta::MetaStateMachine::EncodeCommand(retirement);
+      ASSERT_TRUE(command.ok()) << command.status();
+      machine.commit(++applied, **command);
+    }
+    ASSERT_LE(applied, index);
+    machine.commit_config(index, config);
+    bool completed = false;
+    nuraft::async_result<bool>::handler_type handler =
+        [&](bool& ok, nuraft::ptr<std::exception>& error) {
+          EXPECT_EQ(error, nullptr);
+          completed = ok;
+        };
+    nuraft::snapshot snapshot(index, 1, config);
+    machine.create_snapshot(snapshot, handler);
+    machine.WaitForSnapshotWriterIdle();
+    ASSERT_TRUE(completed);
   }
 
   std::filesystem::path dir_;
 };
 
+TEST_F(StateMgrTest, CommittedApplyClosesGenesisWithoutTransportCallbacks) {
+  auto opened = OpenInitial({Member(7), Member(8), Member(9)});
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  nuraft::ptr<NuraftStateMgr> manager(std::move(*opened));
+  auto machine = keylane::meta::MetaStateMachine::Open(dir_.string());
+  ASSERT_TRUE(machine.ok()) << machine.status();
+  (*machine)->AttachStateMgr(manager);
+  for (const auto id : {7U, 8U, 9U}) {
+    auto command = keylane::meta::MetaStateMachine::EncodeCommand(Binding(id));
+    ASSERT_TRUE(command.ok()) << command.status();
+    (*machine)->commit(id - 6, **command);
+    EXPECT_EQ(manager->initial_bindings_pending(), id != 9);
+  }
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "initial_bindings_complete.dat"));
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
+}
+
+TEST_F(StateMgrTest, SnapshotRepairsLateGenesisAndRetainsRetiredEvidence) {
+  auto opened = OpenInitial({Member(7), Member(8), Member(9)});
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  PublishSnapshot(Config(10, {7, 8, 10}), 20, {7, 8, 9, 10}, 9);
+  opened->reset();
+
+  for (int restart = 0; restart < 2; ++restart) {
+    auto recovered = OpenRestart();
+    ASSERT_TRUE(recovered.ok()) << recovered.status();
+    EXPECT_FALSE((*recovered)->initial_bindings_pending());
+    EXPECT_EQ((*recovered)->load_config()->get_log_idx(), 10U);
+    EXPECT_NE((*recovered)->load_config()->get_server(10), nullptr);
+    EXPECT_EQ((*recovered)->load_config()->get_server(9), nullptr);
+    EXPECT_TRUE((*recovered)->transport_binding_replay_pending(19));
+    EXPECT_FALSE((*recovered)->transport_binding_replay_pending(20));
+  }
+}
+
+TEST_F(StateMgrTest,
+       SnapshotMissingGenesisEvidenceFailsBeforeConfigReplacement) {
+  auto opened = OpenInitial({Member(7), Member(8), Member(9)});
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  PublishSnapshot(Config(10, {7, 8, 10}), 20, {7, 8, 10});
+  opened->reset();
+  EXPECT_FALSE(OpenRestart().ok());
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "initial_bindings_complete.dat"));
+}
+
+TEST_F(StateMgrTest, PartialGenesisSnapshotKeepsCatchupGrace) {
+  auto opened = OpenInitial({Member(7), Member(8), Member(9)});
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  PublishSnapshot(Config(0, {7, 8, 9}), 2, {7});
+  opened->reset();
+  auto recovered = OpenRestart();
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_TRUE((*recovered)->initial_bindings_pending());
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "transport_bindings.dat"));
+}
+
+TEST_F(StateMgrTest, SameIndexSnapshotConfigConflictFailsClosed) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  PublishSnapshot(Config(0, {7, 8}), 3, {7, 8});
+  opened->reset();
+  EXPECT_FALSE(OpenRestart().ok());
+}
+
+TEST_F(StateMgrTest, PartialSnapshotPreservesLaterCompletedBindingWatermark) {
+  auto opened = OpenInitial({Member(7), Member(8), Member(9)});
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  ASSERT_TRUE((*opened)->CompleteInitialBindings(5).ok());
+  PublishSnapshot(Config(0, {7, 8, 9}), 2, {7});
+  opened->reset();
+  auto recovered = OpenRestart();
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_FALSE((*recovered)->initial_bindings_pending());
+  EXPECT_TRUE((*recovered)->transport_binding_replay_pending(2));
+  EXPECT_TRUE((*recovered)->transport_binding_replay_pending(4));
+  EXPECT_FALSE((*recovered)->transport_binding_replay_pending(5));
+}
+
+TEST_F(StateMgrTest, SnapshotCannotHideCoveredConfigurationConflict) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  ASSERT_TRUE((*opened)->CompleteInitialBindings(1).ok());
+  (*opened)->save_config(*Config(5, {7, 8}));
+  // Config 5 is covered by index 10, but the snapshot says the latest config
+  // is still 0. Taking the larger applied index would silently lose a voter.
+  PublishSnapshot(Config(0, {7}), 10, {7});
+  opened->reset();
+  EXPECT_FALSE(OpenRestart().ok());
+}
+
+TEST_F(StateMgrTest, NewerDiskConfigRequiresExactPostSnapshotWalEntry) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  ASSERT_TRUE((*opened)->CompleteInitialBindings(1).ok());
+  const auto config = Config(5, {7, 8});
+  (*opened)->save_config(*config);
+  PublishSnapshot(Config(0, {7}), 3, {7});
+  auto log = (*opened)->load_log_store();
+  for (int index = 2; index <= 4; ++index) {
+    auto entry = MakeEntry(1, "tail");
+    ASSERT_EQ(log->append(entry), index);
+  }
+  auto entry = nuraft::cs_new<nuraft::log_entry>(1, config->serialize(),
+                                                 nuraft::log_val_type::conf);
+  ASSERT_EQ(log->append(entry), 5U);
+  ASSERT_TRUE(log->flush());
+  log.reset();
+  opened->reset();
+  auto recovered = OpenRestart();
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_EQ((*recovered)->load_config()->get_log_idx(), 5U);
+  EXPECT_NE((*recovered)->load_config()->get_server(8), nullptr);
+}
+
+TEST_F(StateMgrTest, MissingPostSnapshotConfigWalEntryFailsClosed) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  ASSERT_TRUE((*opened)->CompleteInitialBindings(1).ok());
+  (*opened)->save_config(*Config(5, {7, 8}));
+  PublishSnapshot(Config(0, {7}), 3, {7});
+  opened->reset();
+  EXPECT_FALSE(OpenRestart().ok());
+}
+
 TEST_F(StateMgrTest, FreshDirYieldsInitialConfigAndNoState) {
-  auto opened = Open();
+  auto opened = OpenInitial();
   ASSERT_TRUE(opened.ok()) << opened.status();
   std::unique_ptr<NuraftStateMgr> mgr = std::move(*opened);
 
   EXPECT_EQ(mgr->server_id(), 7);
+  EXPECT_EQ(mgr->startup_mode(), NuraftStartupMode::kInitialCluster);
+  EXPECT_TRUE(mgr->initial_bindings_pending());
   EXPECT_EQ(mgr->read_state(), nullptr);
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "cluster_config.dat"));
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
 
   nuraft::ptr<nuraft::cluster_config> config = mgr->load_config();
   ASSERT_NE(config, nullptr);
@@ -735,6 +976,383 @@ TEST_F(StateMgrTest, FreshDirYieldsInitialConfigAndNoState) {
   const nuraft::ptr<nuraft::srv_config>& self = config->get_servers().front();
   EXPECT_EQ(self->get_id(), 7);
   EXPECT_EQ(self->get_endpoint(), "127.0.0.1:9707");
+}
+
+TEST_F(StateMgrTest, InitialAdvertisedControlRoutesMayDifferFromLocalBinds) {
+  NuraftMemberConfig local = Member(7);
+  NuraftMemberConfig advertised = local;
+  advertised.data_control_endpoint_ = "127.0.0.1:19707";
+  advertised.ctl_endpoint_ = "127.0.0.1:29707";
+
+  auto opened = NuraftStateMgr::Open({
+      .data_dir_ = dir_.string(),
+      .local_member_ = std::move(local),
+      .initial_cluster_ = std::vector<NuraftMemberConfig>{advertised},
+  });
+
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  const auto config = (*opened)->load_config();
+  ASSERT_NE(config, nullptr);
+  auto identity =
+      MetaMemberIdentity::DecodeAux(config->get_servers().front()->get_aux());
+  ASSERT_TRUE(identity.ok()) << identity.status();
+  EXPECT_EQ(identity->data_control_endpoint_, "127.0.0.1:19707");
+  EXPECT_EQ(identity->ctl_endpoint_, "127.0.0.1:29707");
+}
+
+TEST_F(StateMgrTest, InitialConfigTreatsOneThreeAndFiveMembersIdentically) {
+  for (const std::size_t count : {1U, 3U, 5U}) {
+    RemoveTestDir(dir_);
+    std::vector<NuraftMemberConfig> members;
+    for (std::size_t id = 1; id <= count; ++id) members.push_back(Member(id));
+    if (count == 1) members.front() = Member(7);
+    if (count > 1) members[0] = Member(7);
+
+    auto opened = OpenInitial(std::move(members));
+
+    ASSERT_TRUE(opened.ok()) << opened.status();
+    EXPECT_EQ((*opened)->startup_mode(), NuraftStartupMode::kInitialCluster);
+    EXPECT_EQ((*opened)->load_config()->get_servers().size(), count);
+    EXPECT_EQ((*opened)->load_config()->get_log_idx(), 0U);
+  }
+}
+
+TEST_F(StateMgrTest, PristineWithoutManifestIsDurableWaitingJoiner) {
+  auto opened = OpenRestart();
+
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  EXPECT_EQ((*opened)->startup_mode(), NuraftStartupMode::kWaitingJoiner);
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "cluster_config.dat"));
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "waiting_joiner.dat"));
+  opened->reset();
+
+  auto restarted = OpenRestart();
+  ASSERT_TRUE(restarted.ok()) << restarted.status();
+  EXPECT_EQ((*restarted)->startup_mode(), NuraftStartupMode::kWaitingJoiner);
+
+  restarted->reset();
+  std::filesystem::remove(dir_ / "cluster_config.dat");
+  auto recovered_prefix = OpenRestart();
+  ASSERT_TRUE(recovered_prefix.ok()) << recovered_prefix.status();
+  EXPECT_EQ((*recovered_prefix)->startup_mode(),
+            NuraftStartupMode::kWaitingJoiner);
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "cluster_config.dat"));
+}
+
+TEST_F(StateMgrTest, WaitingJoinerSurvivesConfigBeforeWalCatchup) {
+  auto opened = OpenRestart();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  auto config = nuraft::cs_new<nuraft::cluster_config>(/*log_idx=*/9,
+                                                       /*prev_log_idx=*/4);
+  for (const std::uint32_t id : {1U, 7U}) {
+    const NuraftMemberConfig member = Member(id);
+    config->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(
+        member.server_id_, /*dc_id=*/0, member.raft_endpoint_,
+        MetaMemberIdentity{
+            .server_id_ = member.server_id_,
+            .principal_ = member.principal_,
+            .data_control_endpoint_ = member.data_control_endpoint_,
+            .ctl_endpoint_ = member.ctl_endpoint_,
+        }
+            .EncodeAux(),
+        /*learner=*/false, /*priority=*/1));
+  }
+  (*opened)->save_config(*config);
+  opened->reset();
+
+  auto restarted = OpenRestart();
+  ASSERT_TRUE(restarted.ok()) << restarted.status();
+  EXPECT_EQ((*restarted)->startup_mode(), NuraftStartupMode::kWaitingJoiner);
+  EXPECT_TRUE((*restarted)->waiting_joiner_catchup_pending());
+  EXPECT_EQ((*restarted)->read_state(), nullptr);
+}
+
+TEST_F(StateMgrTest,
+       InitialBindingMarkerSurvivesConfigCopiesAndClearsAtExactBoundary) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+
+  auto election_copy = nuraft::cs_new<nuraft::cluster_config>(
+      /*log_idx=*/5, /*prev_log_idx=*/1);
+  const NuraftMemberConfig member = Member(7);
+  election_copy->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(
+      member.server_id_, /*dc_id=*/0, member.raft_endpoint_,
+      MetaMemberIdentity{
+          .server_id_ = member.server_id_,
+          .principal_ = member.principal_,
+          .data_control_endpoint_ = member.data_control_endpoint_,
+          .ctl_endpoint_ = member.ctl_endpoint_,
+      }
+          .EncodeAux(),
+      /*learner=*/false, /*priority=*/1));
+  (*opened)->save_config(*election_copy);
+  EXPECT_TRUE((*opened)->initial_bindings_pending());
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
+
+  ASSERT_TRUE((*opened)->CompleteInitialBindings(/*applied_index=*/1).ok());
+  EXPECT_FALSE((*opened)->initial_bindings_pending());
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
+  opened->reset();
+
+  NuraftMemberConfig rebound = Member(7);
+  rebound.raft_endpoint_ = "127.0.0.1:19707";
+  rebound.data_control_endpoint_ = "127.0.0.1:29707";
+  rebound.ctl_endpoint_ = "127.0.0.1:39707";
+  auto restarted = NuraftStateMgr::Open(
+      {.data_dir_ = dir_.string(), .local_member_ = std::move(rebound)});
+  ASSERT_TRUE(restarted.ok()) << restarted.status();
+  EXPECT_FALSE((*restarted)->initial_bindings_pending());
+  EXPECT_TRUE((*restarted)->transport_binding_replay_pending(
+      /*applied_index=*/0));
+  EXPECT_FALSE((*restarted)->transport_binding_replay_pending(
+      /*applied_index=*/1));
+}
+
+TEST_F(StateMgrTest, CompletedZeroIndexGenesisDoesNotResurrectGrace) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  ASSERT_TRUE((*opened)->CompleteInitialBindings(/*applied_index=*/1).ok());
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
+  EXPECT_TRUE(
+      std::filesystem::exists(dir_ / "initial_bindings_complete.dat"));
+  opened->reset();
+
+  auto restarted = OpenRestart();
+  ASSERT_TRUE(restarted.ok()) << restarted.status();
+  EXPECT_FALSE((*restarted)->initial_bindings_pending());
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
+}
+
+TEST_F(StateMgrTest,
+       InitialBindingMarkerRecoversPublicationPrefixBeforeMembershipChange) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  opened->reset();
+
+  // The config file is the first atomic publication. Reconstruct the marker
+  // if a process dies before the second publication reaches disk.
+  std::filesystem::remove(dir_ / "initial_bindings.dat");
+  auto recovered = OpenRestart();
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_TRUE((*recovered)->initial_bindings_pending());
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
+  PersistInitializedRaftEvidence(**recovered);
+  ASSERT_TRUE(
+      (*recovered)->CompleteInitialBindings(/*applied_index=*/1).ok());
+
+  auto changed = nuraft::cs_new<nuraft::cluster_config>(
+      /*log_idx=*/9, /*prev_log_idx=*/5);
+  for (const std::uint32_t id : {7U, 8U}) {
+    const NuraftMemberConfig member = Member(id);
+    changed->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(
+        member.server_id_, /*dc_id=*/0, member.raft_endpoint_,
+        MetaMemberIdentity{
+            .server_id_ = member.server_id_,
+            .principal_ = member.principal_,
+            .data_control_endpoint_ = member.data_control_endpoint_,
+            .ctl_endpoint_ = member.ctl_endpoint_,
+        }
+            .EncodeAux(),
+        /*learner=*/false, /*priority=*/1));
+  }
+  (*recovered)->save_config(*changed);
+  EXPECT_FALSE((*recovered)->initial_bindings_pending());
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "initial_bindings.dat"));
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "transport_bindings.dat"));
+}
+
+TEST_F(StateMgrTest, JoinedWaitingNodeRestartsAsOrdinaryMember) {
+  auto opened = OpenRestart();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+
+  auto config = nuraft::cs_new<nuraft::cluster_config>(/*log_idx=*/9,
+                                                       /*prev_log_idx=*/4);
+  for (const std::uint32_t id : {1U, 7U}) {
+    const NuraftMemberConfig member = Member(id);
+    config->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(
+        member.server_id_, /*dc_id=*/0, member.raft_endpoint_,
+        MetaMemberIdentity{
+            .server_id_ = member.server_id_,
+            .principal_ = member.principal_,
+            .data_control_endpoint_ = member.data_control_endpoint_,
+            .ctl_endpoint_ = member.ctl_endpoint_,
+        }
+            .EncodeAux(),
+        /*learner=*/false, /*priority=*/1));
+  }
+  (*opened)->save_config(*config);
+  EXPECT_TRUE((*opened)->waiting_joiner_catchup_pending());
+  EXPECT_TRUE(std::filesystem::exists(dir_ / "waiting_joiner.dat"));
+  ASSERT_TRUE(
+      (*opened)->CompleteWaitingJoinerCatchup(/*applied_index=*/9).ok());
+  EXPECT_FALSE((*opened)->waiting_joiner_catchup_pending());
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "waiting_joiner.dat"));
+  opened->reset();
+
+  auto restarted = OpenRestart();
+  ASSERT_TRUE(restarted.ok()) << restarted.status();
+  EXPECT_EQ((*restarted)->startup_mode(), NuraftStartupMode::kRestart);
+}
+
+TEST_F(StateMgrTest, WaitingJoinerDoesNotCompleteAgainstPreAddConfig) {
+  auto opened = OpenRestart();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+
+  auto pre_add = nuraft::cs_new<nuraft::cluster_config>(/*log_idx=*/9,
+                                                        /*prev_log_idx=*/4);
+  const NuraftMemberConfig inviter = Member(1);
+  pre_add->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(
+      inviter.server_id_, /*dc_id=*/0, inviter.raft_endpoint_,
+      MetaMemberIdentity{
+          .server_id_ = inviter.server_id_,
+          .principal_ = inviter.principal_,
+          .data_control_endpoint_ = inviter.data_control_endpoint_,
+          .ctl_endpoint_ = inviter.ctl_endpoint_,
+      }
+          .EncodeAux(),
+      /*learner=*/false, /*priority=*/1));
+  (*opened)->save_config(*pre_add);
+  EXPECT_EQ((*opened)->CompleteWaitingJoinerCatchup(/*applied_index=*/9).code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_TRUE((*opened)->waiting_joiner_catchup_pending());
+  opened->reset();
+
+  auto restarted = OpenRestart();
+  ASSERT_TRUE(restarted.ok()) << restarted.status();
+  EXPECT_EQ((*restarted)->startup_mode(), NuraftStartupMode::kWaitingJoiner);
+  EXPECT_EQ((*restarted)->load_config()->get_server(7), nullptr);
+  EXPECT_TRUE((*restarted)->waiting_joiner_catchup_pending());
+}
+
+TEST_F(StateMgrTest, RejectsManifestReplayAndPartialOrCorruptState) {
+  auto initialized = OpenInitial();
+  ASSERT_TRUE(initialized.ok());
+  initialized->reset();
+  EXPECT_EQ(OpenInitial().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  WriteFileBytes(dir_ / "initial_bindings.dat", "truncated");
+  EXPECT_EQ(OpenRestart().status().code(), absl::StatusCode::kDataLoss);
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  WriteFileBytes(dir_ / "srv_state.dat", "partial");
+  EXPECT_EQ(OpenRestart().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  WriteFileBytes(dir_ / "cluster_config.dat", "truncated");
+  EXPECT_FALSE(OpenRestart().ok());
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  WriteFileBytes(dir_ / "waiting_joiner.dat", "truncated");
+  EXPECT_FALSE(OpenRestart().ok());
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  initialized = OpenInitial();
+  ASSERT_TRUE(initialized.ok()) << initialized.status();
+  PersistInitializedRaftEvidence(**initialized);
+  initialized->reset();
+  std::filesystem::remove(dir_ / "initial_bindings.dat");
+  EXPECT_EQ(OpenRestart().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  initialized = OpenInitial();
+  ASSERT_TRUE(initialized.ok()) << initialized.status();
+  PersistInitializedRaftEvidence(**initialized);
+  initialized->reset();
+  std::filesystem::remove(dir_ / "raft_started.dat");
+  EXPECT_EQ(OpenRestart().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  initialized = OpenInitial();
+  ASSERT_TRUE(initialized.ok()) << initialized.status();
+  PersistInitializedRaftEvidence(**initialized);
+  ASSERT_TRUE(
+      (*initialized)->CompleteInitialBindings(/*applied_index=*/1).ok());
+  initialized->reset();
+  WriteFileBytes(dir_ / "transport_bindings.dat", "truncated");
+  EXPECT_EQ(OpenRestart().status().code(), absl::StatusCode::kDataLoss);
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  initialized = OpenInitial();
+  ASSERT_TRUE(initialized.ok()) << initialized.status();
+  PersistInitializedRaftEvidence(**initialized);
+  ASSERT_TRUE(
+      (*initialized)->CompleteInitialBindings(/*applied_index=*/1).ok());
+  initialized->reset();
+  std::filesystem::remove(dir_ / "transport_bindings.dat");
+  EXPECT_EQ(OpenRestart().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  initialized = OpenInitial();
+  ASSERT_TRUE(initialized.ok()) << initialized.status();
+  PersistInitializedRaftEvidence(**initialized);
+  ASSERT_TRUE(
+      (*initialized)->CompleteInitialBindings(/*applied_index=*/1).ok());
+  initialized->reset();
+  std::filesystem::remove(dir_ / "initial_bindings_complete.dat");
+  EXPECT_EQ(OpenRestart().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  initialized = OpenInitial();
+  ASSERT_TRUE(initialized.ok()) << initialized.status();
+  PersistInitializedRaftEvidence(**initialized);
+  initialized->reset();
+  std::filesystem::remove(dir_ / "srv_state.dat");
+  for (const auto& entry : std::filesystem::directory_iterator(dir_)) {
+    const std::string name = entry.path().filename().string();
+    if (name.starts_with("log-") && name.ends_with(".seg")) {
+      std::filesystem::remove(entry.path());
+    }
+  }
+  EXPECT_EQ(OpenRestart().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  initialized = OpenInitial();
+  ASSERT_TRUE(initialized.ok()) << initialized.status();
+  PersistInitializedRaftEvidence(**initialized);
+  ASSERT_TRUE(
+      (*initialized)->CompleteInitialBindings(/*applied_index=*/1).ok());
+  initialized->reset();
+  std::filesystem::remove(dir_ / "srv_state.dat");
+  EXPECT_EQ(OpenRestart().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  RemoveTestDir(dir_);
+  std::filesystem::create_directories(dir_);
+  initialized = OpenInitial();
+  ASSERT_TRUE(initialized.ok()) << initialized.status();
+  PersistInitializedRaftEvidence(**initialized);
+  ASSERT_TRUE(
+      (*initialized)->CompleteInitialBindings(/*applied_index=*/1).ok());
+  initialized->reset();
+  for (const auto& entry : std::filesystem::directory_iterator(dir_)) {
+    const std::string name = entry.path().filename().string();
+    if (name.starts_with("log-") && name.ends_with(".seg")) {
+      std::filesystem::remove(entry.path());
+    }
+  }
+  EXPECT_EQ(OpenRestart().status().code(),
+            absl::StatusCode::kFailedPrecondition);
 }
 
 TEST_F(StateMgrTest, SaveStateSurvivesReopen) {
@@ -747,6 +1365,10 @@ TEST_F(StateMgrTest, SaveStateSurvivesReopen) {
     state.set_term(41);
     state.set_voted_for(3);
     mgr->save_state(state);
+    auto log = mgr->load_log_store();
+    nuraft::ptr<nuraft::log_entry> entry = MakeEntry(41, "initialized");
+    ASSERT_EQ(log->append(entry), 1U);
+    ASSERT_TRUE(log->flush());
   }
 
   auto reopened = Open();
@@ -763,16 +1385,25 @@ TEST_F(StateMgrTest, SaveConfigSurvivesReopen) {
     auto opened = Open();
     ASSERT_TRUE(opened.ok()) << opened.status();
     std::unique_ptr<NuraftStateMgr> mgr = std::move(*opened);
+    PersistInitializedRaftEvidence(*mgr);
+    ASSERT_TRUE(mgr->CompleteInitialBindings(/*applied_index=*/1).ok());
 
     nuraft::ptr<nuraft::cluster_config> config =
         nuraft::cs_new<nuraft::cluster_config>(/*log_idx=*/9,
                                                /*prev_log_idx=*/4);
-    config->get_servers().push_back(
-        nuraft::cs_new<nuraft::srv_config>(1, "127.0.0.1:9701"));
-    config->get_servers().push_back(
-        nuraft::cs_new<nuraft::srv_config>(7, "127.0.0.1:9707"));
-    config->get_servers().push_back(
-        nuraft::cs_new<nuraft::srv_config>(9, "127.0.0.1:9709"));
+    for (const std::uint32_t id : {1U, 7U, 9U}) {
+      const NuraftMemberConfig member = Member(id);
+      config->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(
+          member.server_id_, /*dc_id=*/0, member.raft_endpoint_,
+          MetaMemberIdentity{
+              .server_id_ = member.server_id_,
+              .principal_ = member.principal_,
+              .data_control_endpoint_ = member.data_control_endpoint_,
+              .ctl_endpoint_ = member.ctl_endpoint_,
+          }
+              .EncodeAux(),
+          /*learner=*/false, /*priority=*/1));
+    }
     mgr->save_config(*config);
   }
 
@@ -786,6 +1417,58 @@ TEST_F(StateMgrTest, SaveConfigSurvivesReopen) {
   ASSERT_EQ(config->get_servers().size(), 3u);
   EXPECT_NE(config->get_server(9), nullptr);
   EXPECT_EQ(config->get_server(9)->get_endpoint(), "127.0.0.1:9709");
+}
+
+TEST_F(StateMgrTest, RecoversBothTransportBaselineTransactionPrefixes) {
+  auto opened = OpenInitial();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  PersistInitializedRaftEvidence(**opened);
+  ASSERT_TRUE(
+      (*opened)->CompleteInitialBindings(/*applied_index=*/1).ok());
+  const std::string old_config = ReadFileBytes(dir_ / "cluster_config.dat");
+  const std::string old_baseline =
+      ReadFileBytes(dir_ / "transport_bindings.dat");
+
+  auto changed = nuraft::cs_new<nuraft::cluster_config>(
+      /*log_idx=*/9, /*prev_log_idx=*/4);
+  for (const std::uint32_t id : {7U, 8U}) {
+    const NuraftMemberConfig member = Member(id);
+    changed->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(
+        member.server_id_, /*dc_id=*/0, member.raft_endpoint_,
+        MetaMemberIdentity{
+            .server_id_ = member.server_id_,
+            .principal_ = member.principal_,
+            .data_control_endpoint_ = member.data_control_endpoint_,
+            .ctl_endpoint_ = member.ctl_endpoint_,
+        }
+            .EncodeAux(),
+        /*learner=*/false, /*priority=*/1));
+  }
+  (*opened)->save_config(*changed);
+  const std::string new_config = ReadFileBytes(dir_ / "cluster_config.dat");
+  const std::string new_baseline =
+      ReadFileBytes(dir_ / "transport_bindings.dat");
+  opened->reset();
+
+  // Crash before publishing config: retain the old pair and discard next.
+  WriteFileBytes(dir_ / "cluster_config.dat", old_config);
+  WriteFileBytes(dir_ / "transport_bindings.dat", old_baseline);
+  WriteFileBytes(dir_ / "transport_bindings.next", new_baseline);
+  auto before_config = OpenRestart();
+  ASSERT_TRUE(before_config.ok()) << before_config.status();
+  EXPECT_EQ((*before_config)->load_config()->get_servers().size(), 1U);
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "transport_bindings.next"));
+  before_config->reset();
+
+  // Crash after config but before promotion: next completes the new pair.
+  WriteFileBytes(dir_ / "cluster_config.dat", new_config);
+  WriteFileBytes(dir_ / "transport_bindings.dat", old_baseline);
+  WriteFileBytes(dir_ / "transport_bindings.next", new_baseline);
+  auto after_config = OpenRestart();
+  ASSERT_TRUE(after_config.ok()) << after_config.status();
+  EXPECT_EQ((*after_config)->load_config()->get_servers().size(), 2U);
+  EXPECT_EQ(ReadFileBytes(dir_ / "transport_bindings.dat"), new_baseline);
+  EXPECT_FALSE(std::filesystem::exists(dir_ / "transport_bindings.next"));
 }
 
 TEST_F(StateMgrTest, LoadLogStoreReturnsUsableSharedStore) {

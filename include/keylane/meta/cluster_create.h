@@ -1,8 +1,9 @@
 #pragma once
 
-// Raft-free manifest model for the single-Meta declarative cluster creation
-// workflow. Deployment configuration deliberately stays outside this
-// interface: the manifest describes only durable cluster identity and shape.
+// Raft-free manifest model for declarative cluster creation and the immutable
+// genesis Meta cohort. Local bind/storage/TLS configuration deliberately
+// stays outside this interface: the manifest describes only durable cluster
+// identity and advertised topology.
 
 #include <cstdint>
 #include <string>
@@ -17,6 +18,14 @@ namespace keylane::meta {
 // vectors are in canonical order and slot_ranges_ is the complete derived
 // table even when the manifest requested automatic allocation.
 struct ClusterCreateManifestV1 {
+  struct MetaMember {
+    std::uint32_t server_id_ = 0;
+    std::string raft_endpoint_;
+    std::string data_control_endpoint_;
+    std::string ctl_endpoint_;
+    bool operator==(const MetaMember&) const = default;
+  };
+
   struct DataNode {
     std::string node_id_;
     std::string client_endpoint_;
@@ -38,7 +47,7 @@ struct ClusterCreateManifestV1 {
   };
 
   std::uint32_t schema_version_ = 0;
-  std::uint32_t meta_member_id_ = 0;
+  std::vector<MetaMember> meta_members_;
   bool slots_generated_ = false;
   std::vector<DataNode> data_nodes_;
   std::vector<Group> groups_;

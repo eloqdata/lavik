@@ -11,40 +11,72 @@ cmake --build <build-dir> --target keylane-meta keylane-ctl
 A cluster normally has three `keylane-meta` processes. Every process needs:
 
 - A positive, cluster-unique `--id` that never changes for that member.
-- A numeric IPv4 or IPv6 `--addr` used both as its Raft listener and advertised
-  endpoint. For IPv6, use the form accepted by `keylane-meta --help`.
+- A numeric IPv4 or IPv6 `--addr` for its local Raft listener. At genesis it
+  must equal the manifest's advertised Raft endpoint; a restart may bind
+  behind an explicit transport proxy without changing the durable endpoint.
+  For IPv6, use the form accepted by `keylane-meta --help`.
 - A distinct numeric `--data-control-addr` for the process-lifetime listener
-  used by Data nodes. This endpoint is committed with membership and returned
-  by every Meta seed; it must remain stable across restart.
+  used by Data nodes. The durable advertised route comes from membership and
+  may instead name a proxy; that route must remain stable across restart.
 - A concrete numeric `--ctl-addr` for remote Admin access and leader discovery
-  before the cluster grows beyond one voter. It is both the actual bind and
-  committed address; wildcard hosts and port zero are rejected. Changing it
-  requires removing/retiring the member and joining a fresh server id.
+  before the cluster grows beyond one voter. This flag is the local bind; the
+  durable advertised route may name a proxy. Wildcard hosts and port zero are
+  rejected. Changing an advertised route requires removing/retiring the
+  member and joining a fresh server id.
 - A private `--data-dir`. Never share a directory between members or reuse it
   with another id.
-- At least one Admin listener. Omit both Admin options to use the local Unix
-  socket at `<data-dir>/meta-admin.sock`; use only `--ctl-addr` for a TCP-only
-  member, or specify both options to expose both transports.
+- The required TCP Admin listener plus an optional Unix socket. With no
+  explicit `--ctl-socket`, `keylane-meta` also uses
+  `<data-dir>/meta-admin.sock`.
 
 Create the data directory as the service account with mode 0700. The control
 socket itself is mode 0600 and authenticates the caller with Linux
 `SO_PEERCRED`. By default only the process uid is allowed; repeat
 `--ctl-allow-uid N` to replace that default with an explicit uid allowlist.
-The socket parent must not be group- or world-writable. Remote administration
-is a separate option: `--ctl-addr` uses plaintext TCP unless all three
-`--ctl-tls-*` arguments are supplied. Partial TLS configuration fails startup
-instead of silently downgrading. A plaintext listener grants operator access to
-any reachable peer, so expose it only on loopback or a trusted private network.
-When both `--ctl-socket` and `--ctl-addr` are explicitly provided, both
-listeners start and share command dispatch, authorization, status capture, and
-limits; failure of either listener rolls back the process startup. Naming only
-one enables only that transport. Omitting both enables the default Unix socket.
+The socket parent must not be group- or world-writable. The required
+`--ctl-addr` listener uses plaintext TCP unless all three `--ctl-tls-*`
+arguments are supplied. Partial TLS configuration fails startup instead of
+silently downgrading. A plaintext listener grants operator access to any
+reachable peer, so expose it only on loopback or a trusted private network.
+The TCP listener and the explicit or default Unix socket share command
+dispatch, authorization, status capture, and limits; failure of either rolls
+back process startup.
 
-Only the first process of a new cluster is started with `--bootstrap`. A fresh
-process without `--bootstrap` opens its listener and waits to be invited; merely
-starting it does not make it a member. On restart, use the same id, address,
-data directory, TLS mode, and bootstrap setting originally used for that
-member.
+Before the first start, give every initial Meta process the same canonical
+cluster manifest through `--initial-cluster-manifest`. The manifest's complete
+`[[meta_members]]` set becomes one NuRaft genesis configuration; one, three,
+and five initial voters follow the same path and use ordinary randomized
+election. Each process's `--id` and initial Raft address must match its
+manifest descriptor. Data-control and Admin process addresses are local binds;
+their manifest values are the durable advertised routes.
+
+The manifest is a bootstrap-only input. After `cluster_config.dat` exists,
+restart with the same id, data directory, compatible listeners, and TLS mode
+but omit `--initial-cluster-manifest`; replaying it is rejected. A pristine
+process started without a manifest is instead an election-disabled waiting
+joiner for a future `addsrv`. Internally, `initial_bindings.dat` keeps initial
+transport recovery enabled only until every genesis identity binding commits;
+`initial_bindings_complete.dat` permanently disambiguates that completed state
+from the initial two-file publication prefix. A waiting process's
+`waiting_joiner.dat` survives pre-add config replay and is removed only after
+the installed config includes its local id and it applies all bindings through
+that committed membership config. `raft_started.dat` is published before the
+first durable vote so a later loss of both vote and WAL cannot make an active
+genesis directory look unused. Once either path converges,
+`transport_bindings.dat` holds the exact last-converged descriptors and their
+state-machine replay watermark; future `addsrv` and `removesrv` changes update
+that same reusable baseline transactionally with `cluster_config.dat`. A
+transient `transport_bindings.next` is resolved during crash recovery. A late
+initial member may catch up through either WAL or a snapshot after membership
+has changed. Before opening Raft transport or elections, restart validates the
+snapshot and reconciles its embedded membership with the durable config. It
+automatically completes interrupted config/baseline/lifecycle writes when that
+snapshot supplies the evidence; a later config needs its matching WAL entry
+(except an election-disabled joiner's pending invite). Conflicting configurations
+or missing recovery evidence prevent startup. Do not
+edit or delete these files or other Raft state to turn an old member into a new
+one; missing, mismatched, or malformed lifecycle state intentionally prevents
+startup.
 
 ## Send administrative commands
 
@@ -92,8 +124,9 @@ redirects, capture, and response I/O.
 
 ## Create the first multi-Group cluster
 
-`keylane-ctl cluster-create` is the v1 bootstrap path for a fresh
-single-member Meta cluster and one or more preconfigured Data processes. It is
+`keylane-ctl cluster-create` is the v1 topology-creation path for a fresh
+statically bootstrapped Meta cluster and one or more preconfigured Data
+processes. It is
 not an import or expansion command: Meta must contain no Data identity, Group,
 Slot map, population manifest, or active cluster-create operation. Creation is
 destructive for every declared Data process.
@@ -102,12 +135,16 @@ Install `redis-cli` on the operator host and make it available on `PATH`.
 The command checks every primary with `CLUSTER INFO`, `CLUSTER SLOTS`,
 `CLUSTER KEYSLOT`, and a temporary `SET`/`GET`/`DEL` round trip.
 For multiple Groups it also checks the expected `MOVED` target and a
-`CROSSSLOT` multi-key rejection. Start the bootstrap Meta first:
+`CROSSSLOT` multi-key rejection. Define the initial Meta set in the same
+manifest shown below, then start every Meta process from that file before
+starting Data:
 
 ```sh
 keylane-meta --id 1 --addr 127.0.0.1:7101 \
   --data-control-addr 127.0.0.1:7301 \
-  --data-dir /var/lib/keylane/meta-1 --bootstrap \
+  --ctl-addr 127.0.0.1:7201 \
+  --data-dir /var/lib/keylane/meta-1 \
+  --initial-cluster-manifest /etc/keylane/cluster.toml \
   --ctl-socket /var/lib/keylane/meta-1/meta-admin.sock
 ```
 
@@ -125,9 +162,13 @@ keylane --cluster-enabled \
 
 Data reports LOADING while its unregistered control connection retries. Run
 the same release on Meta, Data and the CLI. Version 1 names the current
-multi-Group manifest and Admin layout; it does not provide compatibility with
-the earlier scalar development layout. Do not put listener bind addresses,
-storage paths, TLS files, or other deployment configuration in the manifest.
+multi-Group topology and full initial Meta directory; it does not provide
+compatibility with the earlier scalar Meta development layout. Raft,
+Data-control, and Admin advertised addresses belong to each Meta descriptor.
+Local bind addresses, storage paths, Unix socket paths, TLS files, and runtime
+tuning remain per-process arguments and do not belong in the manifest. A bind
+may differ from its advertised route when an explicit proxy or load balancer
+owns that route.
 An automatically allocated two-Group topology is:
 
 ```toml
@@ -136,6 +177,9 @@ slot_strategy = "contiguous-even"
 
 [[meta_members]]
 id = 1
+raft_endpoint = "tcp://127.0.0.1:7101"
+data_control_endpoint = "tcp://127.0.0.1:7301"
+ctl_endpoint = "tcp://127.0.0.1:7201"
 
 [[data_nodes]]
 id = "1111111111111111111111111111111111111111"
@@ -187,6 +231,18 @@ Group ids and assigns boundaries with
 `floor(i*16384/N)..floor((i+1)*16384/N)-1`. The CLI displays the fully
 normalized order and range table before any mutation.
 
+Repeat `[[meta_members]]` for every first-wave voter. IDs and each endpoint
+class must be unique; entries are canonicalized by ID, all members are voters,
+and the principal is fixed as `keylane://meta/<id>`. At admission the manifest
+set must exactly equal NuRaft's committed descriptors, the identity store, and
+the Admin/Data-control directories. Cluster Create never calls `add_srv`.
+Its durable root first waits at a fixed Raft barrier until every remote Meta
+has recently replied and reports its state machine applied through the root's
+submit index; only then does Data registration begin. During that phase the
+leader deliberately waits for all Meta state machines. After the root advances,
+normal writes return to majority-based completion, so an unavailable minority
+does not stall unrelated control-plane mutations.
+
 Run:
 
 ```sh
@@ -237,13 +293,22 @@ creation. Meta-member addition/removal has a separate recovery driver; Data
 migration and failover orchestration do not become recoverable merely because
 the operation journal exists.
 
+During creation, `cluster-status` distinguishes `meta_catching_up`, a declared
+but not yet committed `data_unregistered`, an unregistered Data process whose
+Hello is actively retrying (`data_unregistered_retrying`), and a committed
+identity that has never contacted the current leader (`data_unobserved`). If a
+previously accepted or actively retrying node lacks a current accepted session,
+the blocker is `data_session_missing`. Later Group blockers continue to name
+missing projection, health, or population evidence.
+
 For plaintext remote administration, configure a listener and connect without
 TLS arguments:
 
 ```sh
 keylane-meta --id 1 --addr 10.0.0.11:7100 \
   --data-control-addr 10.0.0.11:7300 \
-  --data-dir /var/lib/keylane/meta-1 --bootstrap \
+  --data-dir /var/lib/keylane/meta-1 \
+  --initial-cluster-manifest /etc/keylane/cluster.toml \
   --ctl-addr 10.0.0.11:7200
 
 keylane-ctl --addr 10.0.0.11:7200 status
@@ -267,12 +332,42 @@ META_BIN=./build-clang/keylane-meta
 META_ROOT=/tmp/keylane-meta-demo
 install -d -m 0700 "$META_ROOT" \
   "$META_ROOT/node1" "$META_ROOT/node2" "$META_ROOT/node3"
+INITIAL_MANIFEST="$META_ROOT/cluster.toml"
+```
+
+Create `cluster.toml` with the intended Data/Group sections and these three
+Meta entries (the parser normalizes them by id):
+
+```toml
+[[meta_members]]
+id = 1
+raft_endpoint = "tcp://127.0.0.1:7101"
+data_control_endpoint = "tcp://127.0.0.1:7301"
+ctl_endpoint = "tcp://127.0.0.1:7201"
+
+[[meta_members]]
+id = 2
+raft_endpoint = "tcp://127.0.0.1:7102"
+data_control_endpoint = "tcp://127.0.0.1:7302"
+ctl_endpoint = "tcp://127.0.0.1:7202"
+
+[[meta_members]]
+id = 3
+raft_endpoint = "tcp://127.0.0.1:7103"
+data_control_endpoint = "tcp://127.0.0.1:7303"
+ctl_endpoint = "tcp://127.0.0.1:7203"
+```
+
+Start all three first-wave members with that same file:
+
+```sh
 
 "$META_BIN" --id 1 --addr 127.0.0.1:7101 \
   --data-control-addr 127.0.0.1:7301 \
   --ctl-addr 127.0.0.1:7201 \
   --ctl-socket "$META_ROOT/node1/meta-admin.sock" \
-  --data-dir "$META_ROOT/node1" --bootstrap \
+  --data-dir "$META_ROOT/node1" \
+  --initial-cluster-manifest "$INITIAL_MANIFEST" \
   >"$META_ROOT/node1.log" 2>&1 &
 
 "$META_BIN" --id 2 --addr 127.0.0.1:7102 \
@@ -280,6 +375,7 @@ install -d -m 0700 "$META_ROOT" \
   --ctl-addr 127.0.0.1:7202 \
   --ctl-socket "$META_ROOT/node2/meta-admin.sock" \
   --data-dir "$META_ROOT/node2" \
+  --initial-cluster-manifest "$INITIAL_MANIFEST" \
   >"$META_ROOT/node2.log" 2>&1 &
 
 "$META_BIN" --id 3 --addr 127.0.0.1:7103 \
@@ -287,24 +383,25 @@ install -d -m 0700 "$META_ROOT" \
   --ctl-addr 127.0.0.1:7203 \
   --ctl-socket "$META_ROOT/node3/meta-admin.sock" \
   --data-dir "$META_ROOT/node3" \
+  --initial-cluster-manifest "$INITIAL_MANIFEST" \
   >"$META_ROOT/node3.log" 2>&1 &
 ```
 
-Wait until node 1 reports `leader=1`, then add one waiting member at a time:
+Query the processes until exactly one reports `leader=1`. No `addsrv` command
+is part of this initial startup:
 
 ```sh
 keylane-ctl --socket "$META_ROOT/node1/meta-admin.sock" status
-keylane-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
-  addsrv 2 127.0.0.1:7102 127.0.0.1:7302 127.0.0.1:7202
-
 keylane-ctl --socket "$META_ROOT/node2/meta-admin.sock" status
-
-keylane-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
-  addsrv 3 127.0.0.1:7103 127.0.0.1:7303 127.0.0.1:7203
-
 keylane-ctl --socket "$META_ROOT/node3/meta-admin.sock" status
 ```
 
+On every later restart, use the same process arguments but remove
+`--initial-cluster-manifest`. The durable config, not this genesis file, is
+then authoritative.
+
+For later expansion, replacement, or contraction, start a pristine waiting
+joiner without a manifest and use the reusable membership workflow below.
 `addsrv` and `removesrv` persist a workflow before changing identity or Raft
 membership. `OK` means the requested configuration and identity changes have
 committed, not just that NuRaft accepted an invite. Before adding the next member, poll the
@@ -388,7 +485,7 @@ keylane-meta \
   --id 1 --addr 10.0.0.11:7100 --data-dir /var/lib/keylane/meta-1 \
   --data-control-addr 10.0.0.11:7300 \
   --ctl-addr 10.0.0.11:7200 \
-  --bootstrap \
+  --initial-cluster-manifest /etc/keylane/cluster.toml \
   --tls-ca /etc/keylane/meta/ca.crt \
   --tls-cert /etc/keylane/meta/meta-1.crt \
   --tls-key /etc/keylane/meta/meta-1.key \
@@ -397,9 +494,11 @@ keylane-meta \
   --ctl-tls-key /etc/keylane/meta/meta-1.key
 ```
 
-Use the equivalent member-specific certificate and omit `--bootstrap` for
-members 2 and 3, then join them with their Raft, Data-control, and Admin
-endpoints.
+Start every initial member with the equivalent member-specific certificate
+and the same manifest. The first election authenticates the complete static
+peer set; it does not join members sequentially. Omit the manifest from every
+later restart. A future dynamic joiner starts with mTLS but without a manifest,
+then enters through `addsrv` with all three endpoints.
 The Data-control listener reuses the same CA, certificate, and key; there is no
 second Data-control TLS option set. `--tls-ca`, `--tls-cert`, and `--tls-key`
 are all-or-nothing; partial TLS configuration fails startup. Start the joiner
@@ -604,7 +703,9 @@ change may be active at a time. To add a peer:
 1. Allocate a never-before-used positive id, private data directory, Raft
    endpoint, distinct Data-control endpoint, and concrete Admin endpoint. With
    mTLS, issue its matching certificate first.
-2. Start the new `keylane-meta` process without `--bootstrap`.
+2. Start the new `keylane-meta` process without
+   `--initial-cluster-manifest`; its pristine directory becomes a durable,
+   election-disabled waiting joiner.
 3. On the current leader, run
    `addsrv <id> <raft-endpoint> <data-control-endpoint> <ctl-endpoint>`. A
    fifth principal argument is accepted but may only be the matching canonical

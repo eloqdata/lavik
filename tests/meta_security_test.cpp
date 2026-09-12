@@ -15,6 +15,16 @@ namespace {
 
 constexpr std::string_view kNodeId = "0123456789abcdef0123456789abcdef01234567";
 
+TEST(MetaClusterCreateStatus, DistinguishesUnobservedFromMissingSession) {
+  using keylane::meta::detail::ClusterCreateMissingSessionBlocker;
+  EXPECT_EQ(ClusterCreateMissingSessionBlocker(false, false),
+            "data_unobserved");
+  EXPECT_EQ(ClusterCreateMissingSessionBlocker(true, false),
+            "data_session_missing");
+  EXPECT_EQ(ClusterCreateMissingSessionBlocker(false, true),
+            "data_session_missing");
+}
+
 TEST(MetaIdentitySecurity, ParsesCanonicalRoles) {
   auto node = keylane::meta::ParseMetaPrincipal(std::string("keylane://node/") +
                                                 std::string(kNodeId));
@@ -58,7 +68,8 @@ TEST(MetaIdentitySecurity, CertificateMustCarryExactlyOneKeylanePrincipal) {
 }
 
 TEST(MetaIdentitySecurity, RaftPeerClaimMatchesPersistedMemberBinding) {
-  const keylane::meta::MetaMemberIdentity member{2, "keylane://meta/2"};
+  const keylane::meta::MetaMemberIdentity member{
+      2, "keylane://meta/2", "10.0.0.2:7300", "10.0.0.2:7200"};
   const std::vector<std::string> sans{"keylane://meta/2"};
   EXPECT_TRUE(
       keylane::meta::VerifyRaftPeerIdentity(2, sans, member.EncodeAux()).ok());
@@ -73,12 +84,32 @@ TEST(MetaIdentitySecurity, RaftPeerClaimMatchesPersistedMemberBinding) {
 }
 
 TEST(MetaIdentitySecurity, MemberDescriptorRoundTrips) {
-  const keylane::meta::MetaMemberIdentity member{7, "keylane://meta/7"};
+  const keylane::meta::MetaMemberIdentity member{
+      7, "keylane://meta/7", "10.0.0.7:7300", "10.0.0.7:7200"};
   auto decoded =
       keylane::meta::MetaMemberIdentity::DecodeAux(member.EncodeAux());
   ASSERT_TRUE(decoded.ok()) << decoded.status();
-  EXPECT_EQ(decoded->server_id_, 7);
-  EXPECT_EQ(decoded->principal_, "keylane://meta/7");
+  EXPECT_EQ(*decoded, member);
+  EXPECT_TRUE(member.EncodeAux().starts_with("KMI2|"));
+  EXPECT_FALSE(
+      keylane::meta::MetaMemberIdentity::DecodeAux("KMI1|7|keylane://meta/7")
+          .ok());
+}
+
+TEST(MetaIdentitySecurity, MemberDescriptorRejectsMissingOrNoncanonicalFields) {
+  for (const keylane::meta::MetaMemberIdentity& invalid : {
+           keylane::meta::MetaMemberIdentity{7, "keylane://meta/8",
+                                             "10.0.0.7:7300", "10.0.0.7:7200"},
+           keylane::meta::MetaMemberIdentity{7, "keylane://meta/7", "",
+                                             "10.0.0.7:7200"},
+           keylane::meta::MetaMemberIdentity{7, "keylane://meta/7",
+                                             "localhost:7300", "10.0.0.7:7200"},
+           keylane::meta::MetaMemberIdentity{7, "keylane://meta/7",
+                                             "10.0.0.7:7300", ""},
+       }) {
+    EXPECT_FALSE(
+        keylane::meta::MetaMemberIdentity::DecodeAux(invalid.EncodeAux()).ok());
+  }
 }
 
 TEST(MetaIdentitySecurity, RbacKeepsDataNodeAtItsObservationBoundary) {

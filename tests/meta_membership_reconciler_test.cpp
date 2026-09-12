@@ -7,8 +7,13 @@ namespace {
 class MembershipRecoveryTest : public testing::Test {
  protected:
   MetaMembershipPeer Peer(unsigned id) {
-    return {id, "127.0.0.1:" + std::to_string(7100 + id),
-            "keylane://meta/" + std::to_string(id)};
+    return {
+        .id_ = id,
+        .endpoint_ = "127.0.0.1:" + std::to_string(7100 + id),
+        .principal_ = "keylane://meta/" + std::to_string(id),
+        .data_control_endpoint_ = "127.0.0.1:" + std::to_string(7300 + id),
+        .ctl_endpoint_ = "127.0.0.1:" + std::to_string(7200 + id),
+    };
   }
   MetaMemberRecord Binding(unsigned id) {
     return {id, Peer(id).principal_, "127.0.0.1:" + std::to_string(7300 + id),
@@ -91,6 +96,52 @@ class MembershipRecoveryTest : public testing::Test {
   MetaMembershipIntent intent_;
   std::vector<MetaMembershipPeer> config_;
 };
+
+TEST_F(MembershipRecoveryTest,
+       InitialConfigBindingsResumeInIdOrderWithoutMembershipOperation) {
+  config_ = {Peer(1), Peer(2), Peer(3)};
+  for (unsigned expected_id = 1; expected_id <= 3; ++expected_id) {
+    auto step =
+        PlanInitialMetaBindings(MetaCommittedView(stores_, index_), config_,
+                                /*initial_config=*/true);
+    ASSERT_TRUE(step.ok()) << step.status();
+    ASSERT_TRUE(step->has_value());
+    EXPECT_EQ((*step)->server_id_, expected_id);
+    Apply(MetaCommand(std::move(**step)));
+  }
+
+  auto complete =
+      PlanInitialMetaBindings(MetaCommittedView(stores_, index_), config_,
+                              /*initial_config=*/true);
+  ASSERT_TRUE(complete.ok()) << complete.status();
+  EXPECT_FALSE(complete->has_value());
+  EXPECT_TRUE(stores_.operation_.LiveOperations().empty());
+}
+
+TEST_F(MembershipRecoveryTest,
+       InitialConfigBindingConflictAndPostGenesisGapFailClosed) {
+  config_ = {Peer(1), Peer(2)};
+  Bind(1);
+  BindMetaMember conflicting;
+  conflicting.server_id_ = 2;
+  conflicting.principal_ = Peer(2).principal_;
+  conflicting.data_control_endpoint_ = "127.0.0.1:7999";
+  conflicting.ctl_endpoint_ = Peer(2).ctl_endpoint_;
+  Apply(MetaCommand(conflicting));
+
+  EXPECT_EQ(PlanInitialMetaBindings(MetaCommittedView(stores_, index_), config_,
+                                    /*initial_config=*/true)
+                .status()
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  MetaStores empty;
+  EXPECT_EQ(PlanInitialMetaBindings(MetaCommittedView(empty, 0), config_,
+                                    /*initial_config=*/false)
+                .status()
+                .code(),
+            absl::StatusCode::kFailedPrecondition);
+}
 
 TEST_F(MembershipRecoveryTest, AddRestoresEveryCommittedPrefix) {
   Start(true);

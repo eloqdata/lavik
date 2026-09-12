@@ -28,9 +28,34 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
     member.data_control_endpoint_ = "127.0.0.1:7301";
     member.ctl_endpoint_ = "127.0.0.1:7201";
     Apply(member);
+    for (const std::uint32_t id : {2U, 3U}) {
+      member.server_id_ = id;
+      member.principal_ = "keylane://meta/" + std::to_string(id);
+      member.data_control_endpoint_ = "127.0.0.1:" + std::to_string(7300 + id);
+      member.ctl_endpoint_ = "127.0.0.1:" + std::to_string(7200 + id);
+      Apply(member);
+    }
 
     manifest_.schema_version_ = 1;
-    manifest_.meta_member_id_ = 1;
+    for (const std::uint32_t id : {1U, 2U, 3U}) {
+      manifest_.meta_members_.push_back(
+          {id, "tcp://127.0.0.1:" + std::to_string(7100 + id),
+           "tcp://127.0.0.1:" + std::to_string(7300 + id),
+           "tcp://127.0.0.1:" + std::to_string(7200 + id)});
+      raft_.members_.push_back({
+          .id_ = id,
+          .endpoint_ = "127.0.0.1:" + std::to_string(7100 + id),
+          .principal_ = "keylane://meta/" + std::to_string(id),
+          .data_control_endpoint_ = "127.0.0.1:" + std::to_string(7300 + id),
+          .ctl_endpoint_ = "127.0.0.1:" + std::to_string(7200 + id),
+      });
+    }
+    raft_.local_server_id_ = 1;
+    raft_.max_response_age_us_ = 1'000'000;
+    raft_.peer_progress_ = {
+        {2, std::numeric_limits<std::uint64_t>::max(), 1},
+        {3, std::numeric_limits<std::uint64_t>::max(), 1},
+    };
     manifest_.data_nodes_ = {
         {std::string(40, '1'), "tcp://127.0.0.1:6371"},
         {std::string(40, '2'), "tcp://127.0.0.1:6372"},
@@ -59,7 +84,7 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
   auto Plan() {
     return detail::PlanClusterCreateStep(
         MetaCommittedView(stores_, index_),
-        *stores_.operation_.FindOperation(root_), runtime_);
+        *stores_.operation_.FindOperation(root_), runtime_, raft_);
   }
 
   void AdvanceToProjectionWait() {
@@ -99,10 +124,11 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
           stores_.grant_.GroupState(group_declaration->group_id_);
       ASSERT_TRUE(group.has_value());
       ASSERT_TRUE(grant.has_value() && grant->grant_.has_value());
-      const auto member = std::find_if(
-          group->members_.begin(), group->members_.end(), [&](const auto& item) {
-            return item.node_id_ == declaration.node_id_;
-          });
+      const auto member =
+          std::find_if(group->members_.begin(), group->members_.end(),
+                       [&](const auto& item) {
+                         return item.node_id_ == declaration.node_id_;
+                       });
       ASSERT_NE(member, group->members_.end());
       MetaDataControlRuntimeNode node;
       node.node_id_ = declaration.node_id_;
@@ -112,9 +138,8 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
       node.validated_committed_high_water_ =
           std::numeric_limits<std::uint64_t>::max();
       node.groups_.push_back(
-          {group->group_id_, member->assignment_id_,
-           group->record_.group_term_, group->record_.authority_version_,
-           grant->grant_->grant_revision_,
+          {group->group_id_, member->assignment_id_, group->record_.group_term_,
+           group->record_.authority_version_, grant->grant_->grant_revision_,
            group->record_.population_manifest_revision_,
            group->record_.population_manifest_digest_,
            group->record_.partition_replication_epoch_});
@@ -150,9 +175,8 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
             : directive.spec_.target_boot_id_;
     result.assignment_id_ = directive.spec_.assignment_id_;
     result.status_ = status;
-    result.result_ = status == MetaDirectiveResultStatus::kSucceeded
-                         ? "ready"
-                         : "failed";
+    result.result_ =
+        status == MetaDirectiveResultStatus::kSucceeded ? "ready" : "failed";
     result.result_hash_ = MetaSha256(result.result_);
     return result;
   }
@@ -207,7 +231,41 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
   MetaOperationId root_{};
   ClusterCreateManifestV1 manifest_;
   MetaDataControlRuntimeSnapshot runtime_;
+  MetaClusterCreateRaftView raft_;
 };
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       WaitsAtStableMetaBarrierUntilEveryRemoteIsRecentAndApplied) {
+  const std::uint64_t barrier =
+      stores_.operation_.FindOperation(root_)->operation_seq_;
+
+  raft_.peer_progress_.clear();
+  auto waiting = Plan();
+  ASSERT_TRUE(waiting.ok()) << waiting.status();
+  EXPECT_FALSE(waiting->has_value());
+
+  raft_.peer_progress_ = {
+      {2, barrier - 1, 1},
+      {3, barrier, 1},
+  };
+  waiting = Plan();
+  ASSERT_TRUE(waiting.ok()) << waiting.status();
+  EXPECT_FALSE(waiting->has_value());
+
+  raft_.peer_progress_[0].last_sm_committed_index_ = barrier;
+  raft_.peer_progress_[1].last_response_age_us_ =
+      raft_.max_response_age_us_ + 1;
+  waiting = Plan();
+  ASSERT_TRUE(waiting.ok()) << waiting.status();
+  EXPECT_FALSE(waiting->has_value());
+
+  raft_.peer_progress_[1].last_response_age_us_ = 1;
+  auto ready = Plan();
+  ASSERT_TRUE(ready.ok() && ready->has_value()) << ready.status();
+  const auto* phase = std::get_if<TransitionOperationPhase>(&**ready);
+  ASSERT_NE(phase, nullptr);
+  EXPECT_EQ(phase->kind_phase_blob_, "register-data");
+}
 
 TEST_F(ClusterCreateV1RecoveryTest,
        CommitsOneSlotMapAndSparsePopulationPerGroup) {
@@ -223,9 +281,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
       EXPECT_EQ(slot_map->ranges_,
                 (std::vector<MetaSlotAssignment>{{0, 8191, "group-a"},
                                                  {8192, 16'383, "group-b"}}));
-      EXPECT_EQ(slot_map->config_epochs_,
-                (std::vector<MetaGroupConfigEpoch>{{"group-a", 1},
-                                                    {"group-b", 1}}));
+      EXPECT_EQ(slot_map->config_epochs_, (std::vector<MetaGroupConfigEpoch>{
+                                              {"group-a", 1}, {"group-b", 1}}));
     }
     Apply(std::move(**next));
     ASSERT_FALSE(HasFatalFailure());

@@ -109,6 +109,12 @@ bool detail::IsStableClusterStatusBracket(
              before.leadership_.leadership_generation_;
 }
 
+std::string_view detail::ClusterCreateMissingSessionBlocker(
+    bool retry_observed, bool session_observed) {
+  return retry_observed || session_observed ? "data_session_missing"
+                                            : "data_unobserved";
+}
+
 void detail::ApplyClusterRuntimeObservation(
     ClusterDataNodeWireV1& node, const MetaDataControlRuntimeNode& runtime_node,
     const MetaCommittedStatusView& view, const ClusterCaptureWireV1& capture,
@@ -413,6 +419,50 @@ std::string BuildClusterStatusReply(
         {.code_ = std::string(kClusterCreateActiveBlockerCode),
          .scope_ = "cluster",
          .detail_ = "non_terminal_cluster_create_operation_exists"});
+    if (view.active_cluster_create_phase_.empty() ||
+        view.active_cluster_create_phase_ == "wait-meta-barrier") {
+      status.blockers_.push_back(
+          {.code_ = "meta_catching_up",
+           .scope_ = "meta",
+           .detail_ = "initial_meta_members_have_not_applied_create_barrier"});
+    }
+    for (const std::string& node_id : view.active_cluster_create_data_nodes_) {
+      const auto identity = std::find_if(
+          view.data_nodes_.begin(), view.data_nodes_.end(),
+          [&](const MetaNodeRecord& node) { return node.node_id_ == node_id; });
+      const bool retrying =
+          std::find(runtime.unregistered_retries_.begin(),
+                    runtime.unregistered_retries_.end(),
+                    node_id) != runtime.unregistered_retries_.end();
+      if (identity == view.data_nodes_.end()) {
+        status.blockers_.push_back(
+            {.code_ =
+                 retrying ? "data_unregistered_retrying" : "data_unregistered",
+             .scope_ = "node:" + node_id,
+             .detail_ = retrying ? "hello_rejected_until_identity_commits"
+                                 : "declared_identity_not_committed"});
+        continue;
+      }
+      const bool observed =
+          std::any_of(runtime.nodes_.begin(), runtime.nodes_.end(),
+                      [&](const MetaDataControlRuntimeNode& node) {
+                        return node.node_id_ == node_id;
+                      });
+      if (!observed) {
+        const bool session_observed =
+            std::binary_search(runtime.observed_nodes_.begin(),
+                               runtime.observed_nodes_.end(), node_id);
+        const std::string_view blocker =
+            detail::ClusterCreateMissingSessionBlocker(retrying,
+                                                       session_observed);
+        status.blockers_.push_back(
+            {.code_ = std::string(blocker),
+             .scope_ = "node:" + node_id,
+             .detail_ = blocker == "data_session_missing"
+                            ? "observed_node_has_no_current_session"
+                            : "registered_node_has_not_contacted_this_leader"});
+      }
+    }
   }
 
   std::vector<std::uint32_t> committed_ids;
@@ -564,10 +614,9 @@ std::string BuildClusterStatusReply(
           if (index != 0) detail.push_back(',');
           detail.append(missing[index]);
         }
-        status.blockers_.push_back(
-            {.code_ = "node_runtime_not_ready",
-             .scope_ = "node:" + member.node_id_,
-             .detail_ = std::move(detail)});
+        status.blockers_.push_back({.code_ = "node_runtime_not_ready",
+                                    .scope_ = "node:" + member.node_id_,
+                                    .detail_ = std::move(detail)});
       }
     }
     group.serving_ready_ =
@@ -668,8 +717,7 @@ std::string ClusterCreateLastBlocker(
     const nuraft::ptr<nuraft::raft_server>& server,
     const nuraft::ptr<MetaStateMachine>& state_machine,
     const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
-    std::uint32_t observation_ttl_ms,
-    const ClusterCreateManifestV1& manifest) {
+    std::uint32_t observation_ttl_ms, const ClusterCreateManifestV1& manifest) {
   auto status = DecodeClusterStatusReply(BuildClusterStatusReply(
       server, state_machine, runtime_status, observation_ttl_ms));
   if (!status.ok()) return {};
@@ -678,9 +726,11 @@ std::string ClusterCreateLastBlocker(
   for (const ClusterBlockerWireV1& blocker : status->blockers_) {
     if (!blocker.scope_.starts_with("node:")) continue;
     const std::string_view node_id =
-        std::string_view(blocker.scope_).substr(std::string_view("node:").size());
-    if (std::any_of(manifest.data_nodes_.begin(), manifest.data_nodes_.end(),
-                    [&](const auto& node) { return node.node_id_ == node_id; })) {
+        std::string_view(blocker.scope_)
+            .substr(std::string_view("node:").size());
+    if (std::any_of(
+            manifest.data_nodes_.begin(), manifest.data_nodes_.end(),
+            [&](const auto& node) { return node.node_id_ == node_id; })) {
       selected = &blocker;
     }
   }
@@ -691,7 +741,6 @@ std::string ClusterCreateLastBlocker(
                       " scope=", selected->scope_,
                       " detail=", selected->detail_);
 }
-
 
 const char* AuditPolicyName(MetaAuditPolicy policy) {
   switch (policy) {
@@ -809,17 +858,13 @@ cluster::control::WireId128 MakeRequiredId(std::string_view purpose) {
   return *id;
 }
 
-MetaRequestId MakeRequestId() {
-  return MakeRequiredId("Meta request id");
-}
+MetaRequestId MakeRequestId() { return MakeRequiredId("Meta request id"); }
 
 MetaAssignmentId MakeAssignmentId() {
   return MakeRequiredId("membership assignment id");
 }
 
-MetaOperationId MakeOperationId() {
-  return MakeRequiredId("operation id");
-}
+MetaOperationId MakeOperationId() { return MakeRequiredId("operation id"); }
 
 int HexNybble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -1377,8 +1422,7 @@ celer::Task<std::string> HandleActivateAuthority(
   const auto topology = after.topology_.FindGroup(group_id);
   const auto grant = after.grant_.GroupState(group_id);
   if (!topology.has_value() || !grant.has_value() || grant->fenced_ ||
-      !grant->grant_.has_value() ||
-      grant->grant_->owner_ != owner_node_id ||
+      !grant->grant_.has_value() || grant->grant_->owner_ != owner_node_id ||
       grant->grant_->term_ != expected_term ||
       grant->grant_->authority_version_ != authority_version ||
       grant->grant_->spec_ != command.grant_ ||
@@ -1457,8 +1501,7 @@ std::string ClusterCreateError(std::string_view stage, std::string_view code,
                                std::string detail) {
   std::replace(detail.begin(), detail.end(), '\n', ' ');
   std::replace(detail.begin(), detail.end(), '\r', ' ');
-  return absl::StrCat("ERR clustercreate 1 ", stage, " ", code, " ",
-                      detail);
+  return absl::StrCat("ERR clustercreate 1 ", stage, " ", code, " ", detail);
 }
 
 // Admission persists the whole plan BEFORE topology mutation. The leader
@@ -1469,9 +1512,9 @@ celer::Task<std::string> HandleClusterCreate(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     const std::shared_ptr<MetaMembershipGate>& membership_gate,
     const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
-    std::uint32_t observation_ttl_ms,
-    AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest,
-    std::uint32_t wait_timeout_ms, const bool* shutdown) {
+    std::uint32_t observation_ttl_ms, AuthenticatedPrincipal principal,
+    const ClusterCreateManifestV1& manifest, std::uint32_t wait_timeout_ms,
+    const bool* shutdown) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(wait_timeout_ms);
   if (*shutdown)
@@ -1489,21 +1532,31 @@ celer::Task<std::string> HandleClusterCreate(
                                  "responder is not an eligible leader");
   }
   const auto status = state_machine->StatusSnapshot();
-  const auto active_members = ActiveMetaMembers(status);
-  const auto config_ids = ConfigServerIds(server->get_config());
   const auto before = state_machine->StoresSnapshot();
   if (status.active_cluster_create_operation_ ||
       before.operation_.HasActiveKind(kMetaMembershipOperationKind)) {
     co_return ClusterCreateError("preflight", "domain-rejected",
                                  "another cluster creation is in progress");
   }
-  if (active_members.size() != 1 || config_ids.size() != 1 ||
-      active_members.front().server_id_ != manifest.meta_member_id_ ||
-      config_ids.front() != manifest.meta_member_id_ ||
-      before.identity_.NodeCount() != 0 || before.topology_.GroupCount() != 0 ||
+  MetaClusterCreateRaftView raft_view;
+  raft_view.local_server_id_ = server->get_id();
+  auto config = CaptureMembershipConfig(server->get_config());
+  if (!config.ok()) {
+    co_return ClusterCreateError("preflight", "domain-rejected",
+                                 std::string(config.status().message()));
+  }
+  raft_view.members_ = std::move(*config);
+  const MetaCommittedView committed(before, state_machine->last_commit_index());
+  if (auto meta =
+          detail::ValidateClusterCreateMetaSet(committed, manifest, raft_view);
+      !meta.ok()) {
+    co_return ClusterCreateError("preflight", "non-empty-cluster",
+                                 std::string(meta.message()));
+  }
+  if (before.identity_.NodeCount() != 0 || before.topology_.GroupCount() != 0 ||
       !status.slot_ranges_.empty() || before.population_manifest_.Size() != 0) {
     co_return ClusterCreateError("preflight", "non-empty-cluster",
-                                 "requires one matching Meta member and empty "
+                                 "requires the exact Meta set and empty "
                                  "Data, Group, slot, population state");
   }
   // A fixed wait budget makes intent independent of a particular Admin
@@ -1533,7 +1586,7 @@ celer::Task<std::string> HandleClusterCreate(
   // Durable admission bridges the handoff to the background lease. Membership
   // handlers also check HasActiveKind, including after process restart.
   create_lease.reset();
-  std::string phase = "register-data";
+  std::string phase = "wait-meta-barrier";
   while (std::chrono::steady_clock::now() < deadline) {
     // Closing the Admin socket does not cancel a suspended coroutine. This
     // worker-owned flag must be checked even while Raft still reports leader:
@@ -1549,18 +1602,15 @@ celer::Task<std::string> HandleClusterCreate(
                                    "operation disappeared");
     if (operation->lifecycle_ == MetaOperationLifecycle::kCompleted) {
       ClusterCreateOutcome outcome;
-      outcome.committed_index_ =
-          state_machine->StatusSnapshot().applied_index_;
+      outcome.committed_index_ = state_machine->StatusSnapshot().applied_index_;
       outcome.groups_.reserve(manifest.groups_.size());
       for (const auto& declaration : manifest.groups_) {
         const MetaOperationId group_id =
-            detail::ClusterCreateV1GroupOperationId(
-                operation_id, declaration.group_id_);
-        const auto group_operation =
-            state_machine->FindOperation(group_id);
+            detail::ClusterCreateV1GroupOperationId(operation_id,
+                                                    declaration.group_id_);
+        const auto group_operation = state_machine->FindOperation(group_id);
         if (!group_operation.has_value() ||
-            group_operation->lifecycle_ !=
-                MetaOperationLifecycle::kCompleted ||
+            group_operation->lifecycle_ != MetaOperationLifecycle::kCompleted ||
             group_operation->terminal_receipts_.empty()) {
           co_return ClusterCreateError(
               "finish-operation", "uncertain-outcome",
@@ -1570,8 +1620,7 @@ celer::Task<std::string> HandleClusterCreate(
         std::uint64_t committed_index = 0;
         for (const MetaTerminalReceipt& receipt :
              group_operation->terminal_receipts_) {
-          committed_index =
-              std::max(committed_index, receipt.committed_index_);
+          committed_index = std::max(committed_index, receipt.committed_index_);
         }
         outcome.groups_.push_back(
             {.group_id_ = declaration.group_id_,
@@ -1601,10 +1650,10 @@ celer::Task<std::string> HandleClusterCreate(
     if (phase.starts_with("recovery-required:")) {
       co_return ClusterCreateError(
           "recovery", "domain-rejected",
-          absl::StrCat(phase, " operation=", id,
-                       ClusterCreateLastBlocker(
-                           server, state_machine, runtime_status,
-                           observation_ttl_ms, manifest)));
+          absl::StrCat(
+              phase, " operation=", id,
+              ClusterCreateLastBlocker(server, state_machine, runtime_status,
+                                       observation_ttl_ms, manifest)));
     }
     const auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
                                                 std::chrono::milliseconds(10));
@@ -1811,6 +1860,8 @@ celer::Task<std::string> HandleConfigChange(
         (add &&
          (intent->target_.endpoint_ != endpoint ||
           intent->target_.principal_ != member_principal ||
+          intent->target_.data_control_endpoint_ != data_control_endpoint ||
+          intent->target_.ctl_endpoint_ != ctl_endpoint ||
           intent->binding_.data_control_endpoint_ != data_control_endpoint ||
           intent->binding_.ctl_endpoint_ != std::optional(ctl_endpoint))))
       co_return "ERR config-changing";
@@ -1838,8 +1889,8 @@ celer::Task<std::string> HandleConfigChange(
     intent.before_ = *config;
     for (const auto& p : *config) {
       auto binding = before.identity_.FindMetaMember(p.id_);
-      // The Data publisher owns bootstrap binding; never persist an intent
-      // reconstructed from this process's guesses about remote endpoints.
+      // The membership reconciler owns initial binding; never persist an
+      // intent reconstructed from this process's guesses about endpoints.
       if (!binding || binding->retired_ || binding->principal_ != p.principal_)
         co_return "ERR config-changing";
       if (add && !binding->ctl_endpoint_) co_return "ERR missing-ctl-endpoint";
@@ -1848,8 +1899,13 @@ celer::Task<std::string> HandleConfigChange(
     if (add) {
       if (!keylane::ParseNumericEndpoint(endpoint).has_value())
         co_return "ERR bad-request";
-      intent.target_ = {static_cast<std::uint32_t>(server_id), endpoint,
-                        member_principal};
+      intent.target_ = {
+          .id_ = static_cast<std::uint32_t>(server_id),
+          .endpoint_ = endpoint,
+          .principal_ = member_principal,
+          .data_control_endpoint_ = data_control_endpoint,
+          .ctl_endpoint_ = ctl_endpoint,
+      };
       intent.binding_ = {static_cast<std::uint32_t>(server_id),
                          member_principal, data_control_endpoint, ctl_endpoint,
                          false};
@@ -2051,18 +2107,17 @@ celer::Task<std::string> DispatchMutationVerb(
         tokens[3].size() > kMaxMetaPayloadBytes) {
       co_return "ERR bad-request";
     }
-    co_return co_await HandlePutPolicy(
-        coordinator, std::move(state_machine), std::move(principal), tokens[1],
-        version, tokens[3]);
+    co_return co_await HandlePutPolicy(coordinator, std::move(state_machine),
+                                       std::move(principal), tokens[1], version,
+                                       tokens[3]);
   }
   if (command == "setslotmap") {
     std::uint64_t first = 0;
     std::uint64_t last = 0;
     std::uint64_t config_epoch = 0;
     if (tokens.size() != 5 || !ParseU64(tokens[1], first) ||
-        !ParseU64(tokens[2], last) || first > last ||
-        last >= kMetaSlotCount || tokens[3].empty() ||
-        tokens[3].size() > kMaxMetaGroupIdBytes ||
+        !ParseU64(tokens[2], last) || first > last || last >= kMetaSlotCount ||
+        tokens[3].empty() || tokens[3].size() > kMaxMetaGroupIdBytes ||
         !ParseU64(tokens[4], config_epoch)) {
       co_return "ERR bad-request";
     }
@@ -2100,9 +2155,9 @@ celer::Task<std::string> DispatchMutationVerb(
         !ParseU64(tokens[2], expected_term)) {
       co_return "ERR bad-request";
     }
-    co_return co_await HandleFenceGroup(
-        coordinator, std::move(state_machine), std::move(principal), tokens[1],
-        expected_term);
+    co_return co_await HandleFenceGroup(coordinator, std::move(state_machine),
+                                        std::move(principal), tokens[1],
+                                        expected_term);
   }
   if (command == "transitionop") {
     if (tokens.size() != 4) {
@@ -2279,9 +2334,8 @@ celer::Task<std::string> DispatchCommand(
       co_return ClusterCreateError("preflight", "runtime-unavailable",
                                    "cluster-create reconciler is unavailable");
     if (tokens.size() != 3) {
-      co_return ClusterCreateError(
-          "decode", "bad-request",
-          "expected clustercreate 1 <hex-payload>");
+      co_return ClusterCreateError("decode", "bad-request",
+                                   "expected clustercreate 1 <hex-payload>");
     }
     if (tokens[1] != "1") {
       co_return ClusterCreateError("decode", "bad-request",
@@ -2295,8 +2349,8 @@ celer::Task<std::string> DispatchCommand(
     }
     co_return co_await HandleClusterCreate(
         server, state_machine, coordinator, membership_gate,
-        data_control_runtime_status, observation_ttl_ms,
-        std::move(principal), *manifest, wait_timeout_ms, shutdown);
+        data_control_runtime_status, observation_ttl_ms, std::move(principal),
+        *manifest, wait_timeout_ms, shutdown);
   }
   if (command == "submitop" || command == "completeop" ||
       command == "abortop" || command == "archiveoperations" ||
@@ -2530,13 +2584,13 @@ absl::Status MetaCtlServer::ValidateOptions(
     return absl::InvalidArgumentError(
         "TCP ctl host must be a concrete numeric address");
   }
-  const auto committed_endpoint =
+  const auto local_endpoint =
       keylane::ParseNumericEndpoint(options.local_ctl_endpoint_);
-  if (!committed_endpoint.has_value() ||
-      committed_endpoint->host_ != options.bind_host_ ||
-      committed_endpoint->port_ != options.port_) {
+  if (!local_endpoint.has_value() ||
+      local_endpoint->host_ != options.bind_host_ ||
+      local_endpoint->port_ != options.port_) {
     return absl::InvalidArgumentError(
-        "TCP ctl bind must equal its committed local ctl endpoint");
+        "TCP ctl bind must equal its process-local ctl endpoint");
   }
   if (options.transport_ != MetaCtlServerOptions::Transport::kTcpPlaintext &&
       options.transport_ != MetaCtlServerOptions::Transport::kTcpMtls) {

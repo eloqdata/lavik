@@ -3,6 +3,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <optional>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "keylane/meta/encoding.h"
 #include "keylane/meta/identity_verifier.h"
@@ -114,14 +116,21 @@ absl::Status VerifyPeer(const nuraft::asio_service::meta_cb_params& params,
         static_cast<std::uint32_t>(params.src_id_));
     if (pending.has_value() && !pending->retired_) {
       if (tls_enabled) {
-        const MetaMemberIdentity expected{params.src_id_, pending->principal_};
+        if (!pending->ctl_endpoint_.has_value()) {
+          return absl::PermissionDeniedError(
+              "joining Raft source has an incomplete identity binding");
+        }
+        const MetaMemberIdentity expected{params.src_id_, pending->principal_,
+                                          pending->data_control_endpoint_,
+                                          *pending->ctl_endpoint_};
         const absl::Status certificate = VerifyRaftPeerIdentity(
             params.src_id_, uri_sans, expected.EncodeAux());
         if (!certificate.ok()) return certificate;
       }
       return absl::OkStatus();
     }
-    if (state_machine->last_commit_index() != 0) {
+    if (!state_mgr->waiting_joiner_catchup_pending() ||
+        state_machine->last_commit_index() != 0) {
       return absl::PermissionDeniedError(
           "joining Raft source has no committed identity binding");
     }
@@ -145,13 +154,24 @@ absl::Status VerifyPeer(const nuraft::asio_service::meta_cb_params& params,
   const auto committed = stores.identity_.FindMetaMember(
       static_cast<std::uint32_t>(params.src_id_));
   if (!committed.has_value()) {
-    // After the join request installs configuration but before the first
-    // snapshot/entry, the durable config descriptor is the joiner's only
-    // available binding.
-    if (state_machine->last_commit_index() == 0) return absl::OkStatus();
+    // Lifecycle markers bridge first convergence. On ordinary restart, the
+    // reusable baseline authorizes only the exact descriptor set that had
+    // already converged, and only below its durable replay watermark.
+    const auto config = state_mgr->load_config();
+    if (config != nullptr &&
+        (state_mgr->initial_bindings_pending() ||
+         (state_mgr->waiting_joiner_catchup_pending() &&
+          state_machine->last_commit_index() < config->get_log_idx()) ||
+         state_mgr->transport_binding_replay_pending(
+             state_machine->last_commit_index()))) {
+      return absl::OkStatus();
+    }
     return absl::PermissionDeniedError("Raft member has no committed binding");
   }
-  if (committed->retired_ || committed->principal_ != configured->principal_) {
+  if (committed->retired_ || committed->principal_ != configured->principal_ ||
+      committed->data_control_endpoint_ != configured->data_control_endpoint_ ||
+      committed->ctl_endpoint_ !=
+          std::optional<std::string>(configured->ctl_endpoint_)) {
     return absl::PermissionDeniedError(
         "Raft member binding is retired or differs from configuration");
   }

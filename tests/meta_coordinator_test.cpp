@@ -683,7 +683,16 @@ class MetaCoordinatorServerTest : public ::testing::Test {
   }
 
   void OpenStorage() {
-    auto mgr = NuraftStateMgr::Open(dir_, /*server_id=*/1, "127.0.0.1:9601");
+    const keylane::meta::NuraftMemberConfig local{
+        1, "127.0.0.1:9601", "keylane://meta/1", "127.0.0.1:9701",
+        "127.0.0.1:9801"};
+    keylane::meta::NuraftStateMgrOpenOptions options{.data_dir_ = dir_,
+                                                     .local_member_ = local};
+    if (!std::filesystem::exists(std::filesystem::path(dir_) /
+                                 "cluster_config.dat")) {
+      options.initial_cluster_ = std::vector{local};
+    }
+    auto mgr = NuraftStateMgr::Open(std::move(options));
     ASSERT_TRUE(mgr.ok()) << mgr.status();
     mgr_ = nuraft::ptr<NuraftStateMgr>(std::move(*mgr));
     auto machine = MetaStateMachine::Open(dir_);

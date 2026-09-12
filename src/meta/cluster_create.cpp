@@ -1,8 +1,8 @@
 #include "keylane/meta/cluster_create.h"
 
 #include <algorithm>
-#include <charconv>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -28,7 +28,10 @@ namespace {
 constexpr std::size_t kMaxManifestBytes = 64 * 1024;
 constexpr std::size_t kMaxAdminCommandBytes = 64 * 1024;
 constexpr std::size_t kMaxWireString = 64 * 1024;
-constexpr std::uint16_t kWireVersion = 1;
+// Version 1 encoded one scalar Meta id. There is deliberately no migration:
+// genesis membership is safety-critical, so only a complete descriptor set is
+// accepted by the current development format.
+constexpr std::uint16_t kWireVersion = 2;
 constexpr std::uint32_t kMaxClusterCreateTimeoutMs = 3'600'000;
 constexpr std::uint32_t kMaxManifestItems = 16'384;
 
@@ -58,8 +61,7 @@ absl::StatusOr<T> ParseUnsigned(const CLI::ConfigItem& item) {
   const auto parsed =
       std::from_chars(input.data(), input.data() + input.size(), value);
   if (parsed.ec != std::errc{} || parsed.ptr != input.data() + input.size() ||
-      value > std::numeric_limits<T>::max() ||
-      input != std::to_string(value)) {
+      value > std::numeric_limits<T>::max() || input != std::to_string(value)) {
     return Invalid("manifest integer is out of range");
   }
   return static_cast<T>(value);
@@ -93,12 +95,48 @@ bool CanonicalEndpoint(std::string_view value) {
 
 absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
   if (manifest == nullptr || manifest->schema_version_ != 1 ||
-      manifest->meta_member_id_ == 0 || manifest->data_nodes_.empty() ||
+      manifest->meta_members_.empty() || manifest->data_nodes_.empty() ||
       manifest->groups_.empty() ||
+      manifest->meta_members_.size() > kMaxManifestItems ||
       manifest->data_nodes_.size() > kMaxManifestItems ||
       manifest->groups_.size() > kMaxManifestItems ||
       manifest->slot_ranges_.size() > kMaxManifestItems) {
     return Invalid("clustercreate manifest is not a supported v1 topology");
+  }
+
+  std::sort(manifest->meta_members_.begin(), manifest->meta_members_.end(),
+            [](const auto& left, const auto& right) {
+              return left.server_id_ < right.server_id_;
+            });
+  std::set<std::uint32_t> meta_ids;
+  std::set<std::string> raft_endpoints;
+  std::set<std::string> data_control_endpoints;
+  std::set<std::string> ctl_endpoints;
+  for (const auto& member : manifest->meta_members_) {
+    if (member.server_id_ == 0 ||
+        member.server_id_ > static_cast<std::uint32_t>(
+                                std::numeric_limits<std::int32_t>::max())) {
+      return Invalid(
+          "Meta member id must fit a positive signed 32-bit integer");
+    }
+    if (!CanonicalEndpoint(member.raft_endpoint_) ||
+        !CanonicalEndpoint(member.data_control_endpoint_) ||
+        !CanonicalEndpoint(member.ctl_endpoint_)) {
+      return Invalid(
+          "Meta endpoints must be canonical numeric tcp:// endpoints");
+    }
+    if (!meta_ids.insert(member.server_id_).second) {
+      return Invalid("duplicate Meta member id");
+    }
+    if (!raft_endpoints.insert(member.raft_endpoint_).second) {
+      return Invalid("duplicate Meta Raft endpoint");
+    }
+    if (!data_control_endpoints.insert(member.data_control_endpoint_).second) {
+      return Invalid("duplicate Meta Data-control endpoint");
+    }
+    if (!ctl_endpoints.insert(member.ctl_endpoint_).second) {
+      return Invalid("duplicate Meta ctl endpoint");
+    }
   }
 
   std::sort(manifest->data_nodes_.begin(), manifest->data_nodes_.end(),
@@ -142,8 +180,7 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
     if (!assigned_nodes.insert(group.primary_node_id_).second) {
       return Invalid("a Data node belongs to more than one Group");
     }
-    std::sort(group.replica_node_ids_.begin(),
-              group.replica_node_ids_.end());
+    std::sort(group.replica_node_ids_.begin(), group.replica_node_ids_.end());
     for (const std::string& replica : group.replica_node_ids_) {
       if (!node_ids.contains(replica)) {
         return Invalid("Group replica references an unknown Data node");
@@ -202,8 +239,7 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
     }
     groups_with_slots.insert(range.group_id_);
     expected_first = static_cast<std::uint32_t>(range.last_) + 1;
-    if (!canonical.empty() &&
-        canonical.back().group_id_ == range.group_id_ &&
+    if (!canonical.empty() && canonical.back().group_id_ == range.group_id_ &&
         static_cast<std::uint32_t>(canonical.back().last_) + 1 ==
             range.first_) {
       canonical.back().last_ = range.last_;
@@ -302,7 +338,8 @@ absl::StatusOr<std::string> Unhex(std::string_view input) {
   for (std::size_t index = 0; index < input.size(); index += 2) {
     const int high = nibble(input[index]);
     const int low = nibble(input[index + 1]);
-    if (high < 0 || low < 0) return Invalid("invalid clustercreate hex payload");
+    if (high < 0 || low < 0)
+      return Invalid("invalid clustercreate hex payload");
     result[index / 2] = static_cast<char>((high << 4) | low);
   }
   return result;
@@ -313,7 +350,8 @@ absl::StatusOr<std::uint64_t> ParseU64(std::string_view text) {
   const auto parsed =
       std::from_chars(text.data(), text.data() + text.size(), result);
   if (text.empty() || parsed.ec != std::errc{} ||
-      parsed.ptr != text.data() + text.size() || text != std::to_string(result)) {
+      parsed.ptr != text.data() + text.size() ||
+      text != std::to_string(result)) {
     return Invalid("invalid clustercreate reply integer");
   }
   return result;
@@ -321,12 +359,18 @@ absl::StatusOr<std::uint64_t> ParseU64(std::string_view text) {
 
 bool ReadyMatches(const ClusterStatusWireV1& status,
                   const ClusterCreateManifestV1& manifest) {
-  if (!status.cluster_ready_ || status.meta_members_.size() != 1 ||
-      status.meta_members_.front().server_id_ != manifest.meta_member_id_ ||
+  if (!status.cluster_ready_ ||
+      status.meta_members_.size() != manifest.meta_members_.size() ||
       status.data_nodes_.size() != manifest.data_nodes_.size() ||
       status.groups_.size() != manifest.groups_.size() ||
       status.slot_ranges_.size() != manifest.slot_ranges_.size()) {
     return false;
+  }
+  for (std::size_t index = 0; index < manifest.meta_members_.size(); ++index) {
+    if (status.meta_members_[index].server_id_ !=
+        manifest.meta_members_[index].server_id_) {
+      return false;
+    }
   }
 
   std::map<std::string, std::pair<std::string, ClusterDataNodeRole>> expected;
@@ -334,8 +378,8 @@ bool ReadyMatches(const ClusterStatusWireV1& status,
     expected.emplace(group.primary_node_id_,
                      std::pair(group.group_id_, ClusterDataNodeRole::kPrimary));
     for (const std::string& replica : group.replica_node_ids_) {
-      expected.emplace(replica,
-                       std::pair(group.group_id_, ClusterDataNodeRole::kReplica));
+      expected.emplace(
+          replica, std::pair(group.group_id_, ClusterDataNodeRole::kReplica));
     }
   }
   for (const auto& node : status.data_nodes_) {
@@ -434,33 +478,35 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
   Section section = Section::kNone;
   std::set<std::string> section_fields;
   std::set<std::string> top_fields;
-  std::vector<std::uint32_t> meta_members;
 
   const auto finish_section = [&]() -> absl::Status {
     switch (section) {
       case Section::kNone:
         return absl::OkStatus();
       case Section::kMeta:
-        if (section_fields != std::set<std::string>{"id"})
-          return Invalid("meta_members requires exactly id");
+        if (section_fields != std::set<std::string>{"ctl_endpoint",
+                                                    "data_control_endpoint",
+                                                    "id", "raft_endpoint"}) {
+          return Invalid(
+              "meta_members requires exactly id, raft_endpoint, "
+              "data_control_endpoint, and ctl_endpoint");
+        }
         break;
       case Section::kData:
-        if (section_fields !=
-            std::set<std::string>{"client_endpoint", "id"})
+        if (section_fields != std::set<std::string>{"client_endpoint", "id"})
           return Invalid("data_nodes requires exactly id and client_endpoint");
         break;
       case Section::kGroup:
         if (!section_fields.contains("id") ||
-            !section_fields.contains("primary") ||
-            section_fields.size() > 3 ||
+            !section_fields.contains("primary") || section_fields.size() > 3 ||
             (section_fields.size() == 3 &&
              !section_fields.contains("replicas"))) {
-          return Invalid("groups requires id and primary, with optional replicas");
+          return Invalid(
+              "groups requires id and primary, with optional replicas");
         }
         break;
       case Section::kSlot:
-        if (section_fields !=
-            std::set<std::string>{"first", "group", "last"})
+        if (section_fields != std::set<std::string>{"first", "group", "last"})
           return Invalid("slot_ranges requires exactly first, last, and group");
         break;
     }
@@ -476,7 +522,7 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
       const std::string& name = item.parents.front();
       if (name == "meta_members") {
         section = Section::kMeta;
-        meta_members.push_back(0);
+        result.meta_members_.emplace_back();
       } else if (name == "data_nodes") {
         section = Section::kData;
         result.data_nodes_.emplace_back();
@@ -525,10 +571,26 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
 
     switch (section) {
       case Section::kMeta: {
-        if (item.name != "id") return Invalid("unknown meta_members field");
-        auto value = ParseUnsigned<std::uint32_t>(item);
-        if (!value.ok()) return value.status();
-        meta_members.back() = *value;
+        if (item.name == "id") {
+          auto value = ParseUnsigned<std::uint32_t>(item);
+          if (!value.ok()) return value.status();
+          result.meta_members_.back().server_id_ = *value;
+        } else if (item.name == "raft_endpoint") {
+          auto value = ParseString(item);
+          if (!value.ok()) return value.status();
+          result.meta_members_.back().raft_endpoint_ = std::move(*value);
+        } else if (item.name == "data_control_endpoint") {
+          auto value = ParseString(item);
+          if (!value.ok()) return value.status();
+          result.meta_members_.back().data_control_endpoint_ =
+              std::move(*value);
+        } else if (item.name == "ctl_endpoint") {
+          auto value = ParseString(item);
+          if (!value.ok()) return value.status();
+          result.meta_members_.back().ctl_endpoint_ = std::move(*value);
+        } else {
+          return Invalid("unknown meta_members field");
+        }
         break;
       }
       case Section::kData:
@@ -585,14 +647,12 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
   if (section != Section::kNone) {
     if (absl::Status status = finish_section(); !status.ok()) return status;
   }
-  if (!top_fields.contains("schema_version") || meta_members.size() != 1 ||
-      meta_members.front() == 0) {
-    return Invalid("manifest requires schema_version and exactly one Meta member");
+  if (!top_fields.contains("schema_version") || result.meta_members_.empty()) {
+    return Invalid("manifest requires schema_version and Meta members");
   }
   if (result.slots_generated_ && !result.slot_ranges_.empty()) {
     return Invalid("slot_strategy and slot_ranges are mutually exclusive");
   }
-  result.meta_member_id_ = meta_members.front();
   if (absl::Status status = ValidateAndNormalize(&result); !status.ok()) {
     return status;
   }
@@ -614,20 +674,37 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
 
   Writer writer;
   writer.U16(kWireVersion);
-  writer.U32(manifest.meta_member_id_);
+  writer.U32(static_cast<std::uint32_t>(manifest.meta_members_.size()));
+  for (const auto& member : manifest.meta_members_) {
+    writer.U32(member.server_id_);
+    if (absl::Status status = writer.String(member.raft_endpoint_);
+        !status.ok()) {
+      return status;
+    }
+    if (absl::Status status = writer.String(member.data_control_endpoint_);
+        !status.ok()) {
+      return status;
+    }
+    if (absl::Status status = writer.String(member.ctl_endpoint_);
+        !status.ok()) {
+      return status;
+    }
+  }
   writer.U16(manifest.slots_generated_ ? 1 : 0);
   writer.U32(static_cast<std::uint32_t>(manifest.data_nodes_.size()));
   for (const auto& node : manifest.data_nodes_) {
     if (absl::Status status = writer.String(node.node_id_); !status.ok())
       return status;
-    if (absl::Status status = writer.String(node.client_endpoint_); !status.ok())
+    if (absl::Status status = writer.String(node.client_endpoint_);
+        !status.ok())
       return status;
   }
   writer.U32(static_cast<std::uint32_t>(manifest.groups_.size()));
   for (const auto& group : manifest.groups_) {
     if (absl::Status status = writer.String(group.group_id_); !status.ok())
       return status;
-    if (absl::Status status = writer.String(group.primary_node_id_); !status.ok())
+    if (absl::Status status = writer.String(group.primary_node_id_);
+        !status.ok())
       return status;
     writer.U32(static_cast<std::uint32_t>(group.replica_node_ids_.size()));
     for (const std::string& replica : group.replica_node_ids_) {
@@ -663,13 +740,31 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
   Reader reader(*bytes);
   auto version = reader.U16();
   if (!version.ok()) return version.status();
-  if (*version != kWireVersion) return Invalid("unsupported clustercreate version");
+  if (*version != kWireVersion)
+    return Invalid("unsupported clustercreate version");
 
   ClusterCreateManifestV1 manifest;
   manifest.schema_version_ = 1;
-  auto meta = reader.U32();
-  if (!meta.ok()) return meta.status();
-  manifest.meta_member_id_ = *meta;
+  auto meta_count = reader.U32();
+  if (!meta_count.ok() || *meta_count == 0 || *meta_count > kMaxManifestItems) {
+    return Invalid("invalid Meta member count");
+  }
+  manifest.meta_members_.reserve(*meta_count);
+  for (std::uint32_t index = 0; index < *meta_count; ++index) {
+    ClusterCreateManifestV1::MetaMember member;
+    auto id = reader.U32();
+    auto raft = reader.String();
+    auto data_control = reader.String();
+    auto ctl = reader.String();
+    if (!id.ok() || !raft.ok() || !data_control.ok() || !ctl.ok()) {
+      return Invalid("invalid Meta member descriptor");
+    }
+    member.server_id_ = *id;
+    member.raft_endpoint_ = std::move(*raft);
+    member.data_control_endpoint_ = std::move(*data_control);
+    member.ctl_endpoint_ = std::move(*ctl);
+    manifest.meta_members_.push_back(std::move(member));
+  }
   auto generated = reader.U16();
   if (!generated.ok() || *generated > 1) {
     return Invalid("invalid clustercreate Slot allocation mode");
@@ -739,7 +834,8 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
   ClusterCreateManifestV1 canonical = manifest;
   if (absl::Status status = ValidateAndNormalize(&canonical); !status.ok())
     return status;
-  if (canonical != manifest) return Invalid("clustercreate request is not canonical");
+  if (canonical != manifest)
+    return Invalid("clustercreate request is not canonical");
   if (*wait_timeout_ms == 0 || *wait_timeout_ms > kMaxClusterCreateTimeoutMs)
     return Invalid("clustercreate timeout is out of range");
   return manifest;
@@ -748,7 +844,8 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
 absl::StatusOr<ClusterCreateOutcome> DecodeClusterCreateReply(
     std::string_view reply) {
   constexpr std::string_view kPrefix = "OK clustercreate 1 ";
-  if (!reply.starts_with(kPrefix)) return Invalid("invalid clustercreate reply");
+  if (!reply.starts_with(kPrefix))
+    return Invalid("invalid clustercreate reply");
   reply.remove_prefix(kPrefix.size());
   std::istringstream input{std::string(reply)};
   std::string final_index_text;
@@ -757,8 +854,8 @@ absl::StatusOr<ClusterCreateOutcome> DecodeClusterCreateReply(
     return Invalid("invalid clustercreate reply");
   auto final_index = ParseU64(final_index_text);
   auto count = ParseU64(count_text);
-  if (!final_index.ok() || !count.ok() || *final_index == 0 ||
-      *count == 0 || *count > kMaxManifestItems) {
+  if (!final_index.ok() || !count.ok() || *final_index == 0 || *count == 0 ||
+      *count > kMaxManifestItems) {
     return Invalid("invalid clustercreate reply");
   }
   ClusterCreateOutcome outcome;
@@ -802,26 +899,33 @@ absl::StatusOr<ClusterCreateOutcome> ClusterOperator::Create(
   ClusterCreateManifestV1 canonical = manifest;
   if (absl::Status status = ValidateAndNormalize(&canonical); !status.ok())
     return status;
-  if (canonical != manifest) return Invalid("clustercreate manifest is not normalized");
+  if (canonical != manifest)
+    return Invalid("clustercreate manifest is not normalized");
 
   MetaAdminTarget leader;
   auto initial = CaptureStatus(seed, options, &leader);
   if (!initial.ok()) return BeforeMutationFailure(initial.status());
   if (!initial->status_.has_value()) {
-    return BeforeMutationFailure(absl::UnavailableError(initial->retry_reason_));
+    return BeforeMutationFailure(
+        absl::UnavailableError(initial->retry_reason_));
   }
   const ClusterStatusWireV1& status = *initial->status_;
-  const bool create_active = std::any_of(
-      status.blockers_.begin(), status.blockers_.end(),
-      [](const ClusterBlockerWireV1& blocker) {
-        return blocker.code_ == kClusterCreateActiveBlockerCode;
-      });
-  if (status.meta_members_.size() != 1 ||
-      status.meta_members_.front().server_id_ != manifest.meta_member_id_ ||
-      create_active || !status.data_nodes_.empty() || !status.groups_.empty() ||
-      !status.slot_ranges_.empty()) {
+  const bool create_active =
+      std::any_of(status.blockers_.begin(), status.blockers_.end(),
+                  [](const ClusterBlockerWireV1& blocker) {
+                    return blocker.code_ == kClusterCreateActiveBlockerCode;
+                  });
+  const bool meta_matches =
+      status.meta_members_.size() == manifest.meta_members_.size() &&
+      std::equal(status.meta_members_.begin(), status.meta_members_.end(),
+                 manifest.meta_members_.begin(),
+                 [](const auto& actual, const auto& expected) {
+                   return actual.server_id_ == expected.server_id_;
+                 });
+  if (!meta_matches || create_active || !status.data_nodes_.empty() ||
+      !status.groups_.empty() || !status.slot_ranges_.empty()) {
     return absl::FailedPreconditionError(
-        "cluster-create requires the named single Meta and an empty topology");
+        "cluster-create requires the declared Meta set and an empty topology");
   }
 
   const auto now = std::chrono::steady_clock::now();
@@ -834,9 +938,9 @@ absl::StatusOr<ClusterCreateOutcome> ClusterOperator::Create(
   // Leave the Admin transport enough of the caller's deadline to deliver the
   // server's structured timeout, including its last node-level blocker.
   constexpr std::int64_t kReplyReserveMs = 250;
-  const auto wait_ms = static_cast<std::uint32_t>(std::clamp<std::int64_t>(
-      remaining.count() - kReplyReserveMs, 1,
-      std::numeric_limits<std::uint32_t>::max()));
+  const auto wait_ms = static_cast<std::uint32_t>(
+      std::clamp<std::int64_t>(remaining.count() - kReplyReserveMs, 1,
+                               std::numeric_limits<std::uint32_t>::max()));
   auto request = EncodeClusterCreateRequest(manifest, wait_ms);
   if (!request.ok()) return request.status();
   auto reply = round_trip_(leader, *request, options.deadline_);
@@ -854,14 +958,16 @@ absl::StatusOr<ClusterCreateOutcome> ClusterOperator::Create(
       if (ReadyMatches(*observed->status_, manifest)) return *outcome;
       if (!observed->status_->blockers_.empty()) {
         const auto& blocker = observed->status_->blockers_.front();
-        last_blocker = " last_blocker=" + blocker.code_ + " scope=" +
-                       blocker.scope_ + " detail=" + blocker.detail_;
+        last_blocker = " last_blocker=" + blocker.code_ +
+                       " scope=" + blocker.scope_ +
+                       " detail=" + blocker.detail_;
       }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
   }
   return absl::DeadlineExceededError(
-      "cluster-create committed but the requested topology did not become READY;" +
+      "cluster-create committed but the requested topology did not become "
+      "READY;" +
       last_blocker);
 }
 

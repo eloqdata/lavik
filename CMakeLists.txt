@@ -870,7 +870,7 @@ if (BUILD_TESTING)
       # allocator quarantine would turn it into a measurement of ASan retention
       # instead of the bounded live Raft queues it is intended to cover.
       set(KEYLANE_META_INTEGRATION_GATES
-        leader_change recovery membership membership_recovery transport mtls stale_evidence
+        initial_meta initial_recovery leader_change recovery membership membership_recovery transport mtls stale_evidence
         partition
       )
       if (NOT KEYLANE_ASAN_BUILD)
@@ -893,6 +893,8 @@ if (BUILD_TESTING)
           RUN_SERIAL TRUE
         )
       endforeach()
+      set_tests_properties(meta_integration.gate_initial_recovery PROPERTIES
+        TIMEOUT 300)
 
       # Real-process Meta <-> Data control gate.  It needs both executables,
       # unlike the Meta-only fault gates above.

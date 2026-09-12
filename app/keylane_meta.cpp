@@ -41,8 +41,10 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <span>
 #include <string>
@@ -71,6 +73,7 @@
 #include "libnuraft/srv_config.hxx"
 #pragma GCC diagnostic pop
 
+#include "keylane/meta/cluster_create.h"
 #include "keylane/meta/cluster_create_reconciler.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/ctl_server.h"
@@ -101,7 +104,10 @@ using keylane::meta::MetaLeadershipRelay;
 using keylane::meta::MetaMembershipGate;
 using keylane::meta::MetaProposalExecutor;
 using keylane::meta::MetaStateMachine;
+using keylane::meta::NuraftMemberConfig;
+using keylane::meta::NuraftStartupMode;
 using keylane::meta::NuraftStateMgr;
+using keylane::meta::NuraftStateMgrOpenOptions;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -110,18 +116,20 @@ using keylane::meta::NuraftStateMgr;
 struct CliOptions {
   int id_ = 0;
   bool has_id_ = false;
-  std::string raft_addr_;  // "ip:port": raft bind AND advertised endpoint
+  // Process-local listeners. The initial manifest and then durable NuRaft
+  // config remain authoritative for advertised membership endpoints.
+  std::string raft_addr_;
   // Kept distinct from the NuRaft endpoint: data nodes neither speak nor
   // discover through the Raft transport.
   std::string data_control_addr_;
   std::string data_dir_;
-  std::string ctl_addr_;    // optional remote "ip:port" control surface
+  std::string ctl_addr_;    // required remote "ip:port" control surface
   std::string ctl_socket_;  // default: <data-dir>/meta-admin.sock
   std::vector<uid_t> ctl_allowed_uids_;
   std::string ctl_tls_ca_;
   std::string ctl_tls_cert_;
   std::string ctl_tls_key_;
-  bool bootstrap_ = false;
+  std::string initial_cluster_manifest_;
   std::string tls_ca_;
   std::string tls_cert_;
   std::string tls_key_;
@@ -149,8 +157,8 @@ void PrintUsage(const char* program) {
       stderr,
       "usage: %s --id N --addr ip:port --data-control-addr ip:port "
       "--data-dir PATH "
-      "[--ctl-socket PATH] [--ctl-addr ip:port] "
-      "[--bootstrap]\n"
+      "[--ctl-socket PATH] --ctl-addr ip:port "
+      "[--initial-cluster-manifest FILE]\n"
       "          [--tls-ca F --tls-cert F --tls-key F]\n"
       "          [--ctl-allow-uid N] [--ctl-tls-ca F --ctl-tls-cert F "
       "--ctl-tls-key F]\n"
@@ -220,11 +228,6 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
       *early_exit_code = 0;
       return options;
     }
-    if (name == "--bootstrap") {
-      options.bootstrap_ = true;
-      continue;
-    }
-
     std::string_view value = inline_value;
     if (eq == std::string_view::npos) {
       if (ii + 1 >= argc) {
@@ -250,6 +253,8 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
       options.ctl_addr_ = std::string(value);
     } else if (name == "--ctl-socket") {
       options.ctl_socket_ = std::string(value);
+    } else if (name == "--initial-cluster-manifest") {
+      options.initial_cluster_manifest_ = std::string(value);
     } else if (name == "--ctl-allow-uid") {
       int uid = 0;
       if (!ParseInt(value, 0, 0x7fffffff, &uid)) {
@@ -334,7 +339,7 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "--data-dir is required");
   }
-  if (options.ctl_addr_.empty() && options.ctl_socket_.empty()) {
+  if (options.ctl_socket_.empty()) {
     options.ctl_socket_ = options.data_dir_ + "/meta-admin.sock";
   }
   if (!options.ctl_socket_.empty() && options.ctl_allowed_uids_.empty()) {
@@ -542,6 +547,34 @@ absl::Status WaitForBound(
                       "listener bind did not complete in time");
 }
 
+absl::StatusOr<std::string> ReadInitialClusterManifest(
+    const std::string& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    return absl::NotFoundError("cannot open initial cluster manifest: " + path);
+  }
+  std::string contents(64 * 1024 + 1, '\0');
+  input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+  contents.resize(static_cast<std::size_t>(input.gcount()));
+  if (input.bad()) {
+    return absl::DataLossError("failed to read initial cluster manifest: " +
+                               path);
+  }
+  if (contents.size() > 64 * 1024) {
+    return absl::ResourceExhaustedError(
+        "initial cluster manifest exceeds 64 KiB");
+  }
+  return contents;
+}
+
+// ParseClusterCreateManifest has already established the canonical tcp://
+// scheme; this adapter supplies NuRaft's scheme-free endpoint representation.
+std::string StripValidatedTcpEndpointScheme(
+    std::string_view manifest_endpoint) {
+  constexpr std::string_view kTcpPrefix = "tcp://";
+  return std::string(manifest_endpoint.substr(kTcpPrefix.size()));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -592,6 +625,12 @@ int main(int argc, char** argv) {
             : "[" + ctl_endpoint->host_ +
                   "]:" + std::to_string(ctl_endpoint->port_);
   }
+  if (ctl_endpoint_text.empty()) {
+    std::fprintf(stderr,
+                 "keylane-meta: --ctl-addr is required for the durable Meta "
+                 "member descriptor\n");
+    return 1;
+  }
 
   // One process-wide logger to stderr; the pattern carries the node id so
   // interleaved multi-node smoke logs stay attributable.
@@ -607,8 +646,51 @@ int main(int argc, char** argv) {
   }
 
   // --- durable state (synchronous file IO, main thread) ---
-  auto mgr_or =
-      NuraftStateMgr::Open(options.data_dir_, options.id_, options.raft_addr_);
+  const NuraftMemberConfig local_member{
+      .server_id_ = options.id_,
+      .raft_endpoint_ = keylane::FormatNumericEndpoint(
+          {.host_ = raft_endpoint->host_, .port_ = raft_endpoint->port_}),
+      .principal_ = "keylane://meta/" + std::to_string(options.id_),
+      .data_control_endpoint_ = keylane::FormatNumericEndpoint(
+          {.host_ = data_control_endpoint->host_,
+           .port_ = data_control_endpoint->port_}),
+      .ctl_endpoint_ = ctl_endpoint_text,
+  };
+  NuraftStateMgrOpenOptions state_options{
+      .data_dir_ = options.data_dir_,
+      .local_member_ = local_member,
+      .initial_cluster_ = std::nullopt,
+  };
+  if (!options.initial_cluster_manifest_.empty()) {
+    auto bytes = ReadInitialClusterManifest(options.initial_cluster_manifest_);
+    if (!bytes.ok()) {
+      spdlog::critical("initial cluster manifest read failed: {}",
+                       bytes.status().message());
+      return 1;
+    }
+    auto manifest = keylane::meta::ParseClusterCreateManifest(*bytes);
+    if (!manifest.ok()) {
+      spdlog::critical("initial cluster manifest parse failed: {}",
+                       manifest.status().message());
+      return 1;
+    }
+    std::vector<NuraftMemberConfig> initial;
+    initial.reserve(manifest->meta_members_.size());
+    for (const auto& member : manifest->meta_members_) {
+      initial.push_back({
+          .server_id_ = static_cast<std::int32_t>(member.server_id_),
+          .raft_endpoint_ =
+              StripValidatedTcpEndpointScheme(member.raft_endpoint_),
+          .principal_ = "keylane://meta/" + std::to_string(member.server_id_),
+          .data_control_endpoint_ =
+              StripValidatedTcpEndpointScheme(member.data_control_endpoint_),
+          .ctl_endpoint_ =
+              StripValidatedTcpEndpointScheme(member.ctl_endpoint_),
+      });
+    }
+    state_options.initial_cluster_ = std::move(initial);
+  }
+  auto mgr_or = NuraftStateMgr::Open(std::move(state_options));
   if (!mgr_or.ok()) {
     spdlog::critical("state manager open failed: {}",
                      mgr_or.status().message());
@@ -626,6 +708,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   nuraft::ptr<MetaStateMachine> state_machine(std::move(*machine_or));
+  state_machine->AttachStateMgr(state_mgr);
 
   MetaAsioTransportConfig transport_config;
   transport_config.bind_address_ = raft_endpoint->host_;
@@ -698,12 +781,19 @@ int main(int argc, char** argv) {
   params.return_method_ = nuraft::raft_params::async_handler;
   params.parallel_log_appending_ = false;
   params.wait_for_sm_catchup_on_becoming_leader_ = true;
+  // Followers must attach their SM commit index to AppendEntries responses so
+  // a creation leader can prove the fixed genesis barrier. The leader-scoped
+  // cluster-create reconciler disables this mode outside wait-meta-barrier:
+  // on a leader NuRaft also changes every client completion from local commit
+  // to all-peer SM commit, which would otherwise destroy majority availability.
+  params.track_peers_sm_commit_idx_ = true;
 
   auto raft_logger =
       std::make_shared<MetaNuraftLogger>(options.raft_log_level_);
 
   nuraft::raft_server::init_options init_opts;
-  init_opts.skip_initial_election_timeout_ = !options.bootstrap_;
+  init_opts.skip_initial_election_timeout_ =
+      state_mgr->startup_mode() == NuraftStartupMode::kWaitingJoiner;
   // Construction necessarily precedes MetaCoordinator assembly because the
   // coordinator needs the raft_server. The relay retains every role edge
   // from that window and remains the shutdown lifetime barrier for callbacks
@@ -776,11 +866,12 @@ int main(int argc, char** argv) {
   leadership_relay->Attach(*coordinator);
   auto cluster_create_reconciler =
       std::make_shared<keylane::meta::MetaClusterCreateReconciler>(
-          foreign_executor, membership_gate, data_control_runtime_status);
+          foreign_executor, membership_gate, data_control_runtime_status,
+          server, static_cast<std::uint64_t>(observation_ttl_ms) * 1000);
   auto membership_reconciler =
       std::make_shared<keylane::meta::MetaMembershipReconciler>(
           foreign_executor, *proposal_executor, server, state_machine,
-          membership_gate);
+          state_mgr, membership_gate);
 
   if (exit_code == 0) {
     MetaDataControlServerOptions control_options;
@@ -904,12 +995,12 @@ int main(int argc, char** argv) {
 
   if (exit_code == 0) {
     // Register leader-scoped Data publication only after every configured
-    // listener has bound. In particular, the bootstrap reconciliation must
-    // not commit --ctl-addr before a failing Admin bind has rolled startup
-    // back.
-    coordinator->RunAsLeader(data_control);
-    coordinator->RunAsLeader(cluster_create_reconciler);
+    // listener has bound. In particular, initial reconciliation must not
+    // publish the durable advertised descriptor before a failing local Admin
+    // bind has rolled startup back.
     coordinator->RunAsLeader(membership_reconciler);
+    coordinator->RunAsLeader(cluster_create_reconciler);
+    coordinator->RunAsLeader(data_control);
   }
 
   if (exit_code == 0) {
@@ -919,10 +1010,11 @@ int main(int argc, char** argv) {
       ctl_display += options.ctl_addr_;
     }
     spdlog::info(
-        "node {} up: raft={} data-control={} ctl={} data-dir={} bootstrap={} "
+        "node {} up: raft={} data-control={} ctl={} data-dir={} startup={} "
         "tls={}",
         options.id_, options.raft_addr_, options.data_control_addr_,
-        ctl_display, options.data_dir_, options.bootstrap_,
+        ctl_display, options.data_dir_,
+        static_cast<int>(state_mgr->startup_mode()),
         transport_config.TlsEnabled());
     while (g_shutdown_requested == 0) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));

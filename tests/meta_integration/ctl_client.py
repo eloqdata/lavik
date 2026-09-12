@@ -310,7 +310,10 @@ def scripted_cluster_create_gate(workdir):
     with open(manifest, "w", encoding="utf-8") as output:
         output.write(
             "schema_version = 1\n\n"
-            "[[meta_members]]\nid = 1\n\n"
+            "[[meta_members]]\nid = 1\n"
+            'raft_endpoint = "tcp://127.0.0.1:7001"\n'
+            'data_control_endpoint = "tcp://127.0.0.1:7101"\n'
+            'ctl_endpoint = "tcp://127.0.0.1:7201"\n\n'
             "[[data_nodes]]\n"
             f'id = "{node_id}"\n'
             'client_endpoint = "tcp://127.0.0.1:6379"\n\n'
@@ -544,11 +547,16 @@ def dual_listener_rollback_gate(workdir):
     ctl_port = blocker.getsockname()[1]
     raft_port = H.free_port()
     data_control_port = H.free_port()
+    initial_manifest = os.path.join(directory, "initial-cluster.toml")
+    H.write_initial_meta_manifest(initial_manifest, [
+        (1, f"127.0.0.1:{raft_port}",
+         f"127.0.0.1:{data_control_port}", f"127.0.0.1:{ctl_port}")])
     try:
         proc = subprocess.run(
             [META, "--id", "1", "--addr", f"127.0.0.1:{raft_port}",
              "--data-control-addr", f"127.0.0.1:{data_control_port}",
-             "--data-dir", data_dir, "--bootstrap",
+             "--data-dir", data_dir,
+             "--initial-cluster-manifest", initial_manifest,
              "--ctl-socket", ctl_path,
              "--ctl-addr", f"127.0.0.1:{ctl_port}"] + H.raft_args(),
             capture_output=True, text=True, timeout=15)
@@ -690,12 +698,17 @@ def plaintext_gate(workdir):
     raft_port = H.free_port()
     data_control_port = H.free_port()
     ctl_port = H.free_port()
+    initial_manifest = os.path.join(directory, "initial-cluster.toml")
+    H.write_initial_meta_manifest(initial_manifest, [
+        (1, f"127.0.0.1:{raft_port}",
+         f"127.0.0.1:{data_control_port}", f"127.0.0.1:{ctl_port}")])
     log_path = os.path.join(directory, "node1.log")
     log_file = open(log_path, "wb")
     server = subprocess.Popen(
         [META, "--id", "1", "--addr", f"127.0.0.1:{raft_port}",
          "--data-control-addr", f"127.0.0.1:{data_control_port}",
-         "--data-dir", data_dir, "--bootstrap",
+         "--data-dir", data_dir,
+         "--initial-cluster-manifest", initial_manifest,
          "--ctl-addr", f"127.0.0.1:{ctl_port}"] + H.raft_args(),
         stdout=log_file, stderr=subprocess.STDOUT)
     client_args = ["--addr", f"127.0.0.1:{ctl_port}"]
@@ -772,12 +785,17 @@ def mtls_gate(workdir):
     raft_port = H.free_port()
     data_control_port = H.free_port()
     ctl_port = H.free_port()
+    initial_manifest = os.path.join(directory, "initial-cluster.toml")
+    H.write_initial_meta_manifest(initial_manifest, [
+        (1, f"127.0.0.1:{raft_port}",
+         f"127.0.0.1:{data_control_port}", f"127.0.0.1:{ctl_port}")])
     log_path = os.path.join(directory, "node1.log")
     log_file = open(log_path, "wb")
     server = subprocess.Popen(
         [META, "--id", "1", "--addr", f"127.0.0.1:{raft_port}",
          "--data-control-addr", f"127.0.0.1:{data_control_port}",
-         "--data-dir", data_dir, "--bootstrap",
+         "--data-dir", data_dir,
+         "--initial-cluster-manifest", initial_manifest,
          "--ctl-addr", f"127.0.0.1:{ctl_port}",
          "--ctl-tls-ca", ca_crt, "--ctl-tls-cert", server_cert,
          "--ctl-tls-key", server_key] + H.raft_args(),

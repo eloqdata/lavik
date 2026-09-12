@@ -1,10 +1,11 @@
 #pragma once
 
-// MetaCoordinator is the in-process API for control sessions and
-// failover/migration/placement reconcilers. It hides NuRaft entirely:
-// consumers see
-// commands, committed views, commit subscriptions, and reconciler lifecycle —
-// never a raft type.
+// MetaCoordinator is the in-process API for control sessions and ordinary
+// reconcilers: consumers see commands, committed views, commit subscriptions,
+// and reconciler lifecycle rather than Raft types. Process-wired membership
+// and genesis-barrier reconcilers additionally receive the raft_server for
+// configuration changes or peer progress, but still submit state-machine
+// effects only through the coordinator.
 //
 // ASSEMBLY, OWNERSHIP, AND DESTRUCTION ORDER
 //

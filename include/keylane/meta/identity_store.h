@@ -84,9 +84,9 @@ struct MetaMemberRecord {
   std::uint32_t server_id_ = 0;
   std::string principal_;
   std::string data_control_endpoint_;
-  // Null only for a UDS-managed sole bootstrap voter. Once populated this is
-  // immutable; changing a remote administrative identity requires member
-  // replacement instead of an uncoordinated address rewrite.
+  // Kept optional in the v1 store representation so old/malformed development
+  // state can fail at the config-directory boundary. Active configured
+  // members always populate it, and changing it requires member replacement.
   std::optional<std::string> ctl_endpoint_;
   bool retired_ = false;
   bool operator==(const MetaMemberRecord&) const = default;

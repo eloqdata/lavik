@@ -313,11 +313,11 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
     return MetaDomainRejectError(
         "data_control_endpoint is empty or exceeds its cap");
   }
-  const MetaMemberIdentity descriptor{static_cast<int>(cmd.server_id_),
-                                      cmd.principal_};
-  if (auto checked = MetaMemberIdentity::DecodeAux(descriptor.EncodeAux());
-      !checked.ok()) {
-    return MetaDomainRejectError(checked.status().message());
+  auto principal = ParseMetaPrincipal(cmd.principal_);
+  if (!principal.ok() || principal->role_ != MetaPrincipalRole::kMetaMember ||
+      principal->subject_id_ != std::to_string(cmd.server_id_)) {
+    return MetaDomainRejectError(
+        "Meta member principal does not match its server id");
   }
   auto canonical_endpoint =
       CanonicalMetaDataControlEndpoint(cmd.data_control_endpoint_);
@@ -581,9 +581,10 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
         data_control_endpoint->empty()) {
       return MetaFailStopError("invalid meta member in snapshot");
     }
-    const MetaMemberIdentity descriptor{static_cast<int>(*server_id),
-                                        std::string(*principal)};
-    if (!MetaMemberIdentity::DecodeAux(descriptor.EncodeAux()).ok()) {
+    auto parsed_principal = ParseMetaPrincipal(*principal);
+    if (!parsed_principal.ok() ||
+        parsed_principal->role_ != MetaPrincipalRole::kMetaMember ||
+        parsed_principal->subject_id_ != std::to_string(*server_id)) {
       return MetaFailStopError("invalid meta member descriptor in snapshot");
     }
     auto canonical_endpoint =
