@@ -284,8 +284,12 @@ class MetaControlledFailoverLifecycleGateTest : public testing::Test {
   }
 
   absl::Status StartRaft() {
+    const NuraftMemberConfig local{1, "127.0.0.1:9601", "keylane://meta/1",
+                                   "127.0.0.1:9701", "127.0.0.1:9801"};
     auto state_mgr =
-        NuraftStateMgr::Open(directory_.string(), 1, "127.0.0.1:9601");
+        NuraftStateMgr::Open({.data_dir_ = directory_.string(),
+                              .local_member_ = local,
+                              .initial_cluster_ = std::vector{local}});
     if (!state_mgr.ok()) return state_mgr.status();
     state_mgr_ = nuraft::ptr<NuraftStateMgr>(std::move(*state_mgr));
     auto machine = MetaStateMachine::Open(directory_.string());
@@ -448,12 +452,13 @@ class MetaControlledFailoverLifecycleGateTest : public testing::Test {
     if (!candidate.ok()) return candidate.status();
     runtime_status_->PublishCurrent(std::string(kFormerNode), Hex(source_boot_),
                                     source_session_, parent_history_,
+                                    /*replication_flow_count=*/2,
                                     data_generation_, data_generation_,
                                     view.applied_index(), source->full_state);
     runtime_status_->PublishCurrent(
         std::string(kCandidateNode), Hex(candidate_boot_), candidate_session_,
-        candidate_history_, data_generation_, data_generation_,
-        view.applied_index(), candidate->full_state);
+        candidate_history_, /*replication_flow_count=*/3, data_generation_,
+        data_generation_, view.applied_index(), candidate->full_state);
     const control::HeartbeatHealth healthy{
         .storage_ready = true,
         .population_ready = true,
@@ -517,6 +522,26 @@ class MetaControlledFailoverLifecycleGateTest : public testing::Test {
   std::optional<MetaOperationRecord> Operation() const {
     return coordinator_->CommittedView().operation().FindOperation(
         operation_id_);
+  }
+
+  bool CurrentDirectiveIsFrozenSource() const {
+    const auto operation = Operation();
+    if (!operation.has_value() || operation->current_directives_.size() != 1) {
+      return false;
+    }
+    const MetaDirectiveSpec& directive =
+        operation->current_directives_.front().spec_;
+    if (directive.kind_ != kMetaDirectiveAuthorizeSource) return false;
+    const auto request = control::DecodeFrozenSourceRequest(directive.payload_);
+    const auto preconditions =
+        control::DecodeFrozenSourcePreconditions(directive.preconditions_);
+    return request.ok() && preconditions.ok() &&
+           request->recovery_generation == intent_.recovery_generation_ &&
+           request->source_flow_count == intent_.flow_count_ &&
+           preconditions->excluded_group_term == intent_.group_term_ - 1 &&
+           preconditions->excluded_authority_version ==
+               intent_.authority_version_ &&
+           preconditions->excluded_grant_revision == intent_.grant_revision_;
   }
 
   std::optional<FailoverPhaseStage> Stage() const {
@@ -616,8 +641,8 @@ class MetaControlledFailoverLifecycleGateTest : public testing::Test {
     if (!projection.ok()) return projection.status();
     runtime_status_->PublishCurrent(
         std::string(kCandidateNode), Hex(candidate_boot_), candidate_session_,
-        candidate_history_, data_generation_, data_generation_,
-        view.applied_index(), projection->full_state);
+        candidate_history_, /*replication_flow_count=*/3, data_generation_,
+        data_generation_, view.applied_index(), projection->full_state);
     const auto grant = view.grant().GroupState(kGroup);
     if (!grant.has_value() || !grant->grant_.has_value()) {
       return absl::FailedPreconditionError("candidate grant is missing");
@@ -706,7 +731,9 @@ TEST_F(MetaControlledFailoverLifecycleGateTest,
                operation->current_directives_.size() == 1 &&
                operation->current_directives_.front().spec_.kind_ ==
                    kMetaDirectiveAuthorizeSource &&
-               operation->current_directives_.front().spec_.payload_.empty();
+               control::DecodeRebuildRequest(
+                   operation->current_directives_.front().spec_.payload_)
+                   .ok();
       },
       3s));
   ASSERT_TRUE(CommitCurrentDirective("source-held").ok());
@@ -759,16 +786,7 @@ TEST_F(MetaControlledFailoverLifecycleGateTest,
   }
   ASSERT_TRUE(PublishCurrentProjections().ok());
   ASSERT_TRUE(ObserveCandidate({21, 34}).ok());
-  ASSERT_TRUE(WaitFor(
-      [this] {
-        const auto operation = Operation();
-        return operation.has_value() &&
-               operation->current_directives_.size() == 1 &&
-               operation->current_directives_.front().spec_.kind_ ==
-                   kMetaDirectiveAuthorizeSource &&
-               !operation->current_directives_.front().spec_.payload_.empty();
-      },
-      3s));
+  ASSERT_TRUE(WaitFor([this] { return CurrentDirectiveIsFrozenSource(); }, 3s));
   ASSERT_TRUE(PublishCurrentProjections().ok());
   ASSERT_TRUE(CommitFrozenSourceResult().ok());
   ASSERT_TRUE(ObserveCandidate({21, 34}).ok());
@@ -853,7 +871,9 @@ TEST_F(MetaControlledFailoverLifecycleGateTest,
                operation->current_directives_.size() == 1 &&
                operation->current_directives_.front().spec_.kind_ ==
                    kMetaDirectiveAuthorizeSource &&
-               operation->current_directives_.front().spec_.payload_.empty();
+               control::DecodeRebuildRequest(
+                   operation->current_directives_.front().spec_.payload_)
+                   .ok();
       },
       3s));
   ASSERT_TRUE(CommitCurrentDirective("source-held").ok());
@@ -867,16 +887,7 @@ TEST_F(MetaControlledFailoverLifecycleGateTest,
 
   ASSERT_TRUE(PublishCurrentProjections().ok());
   ASSERT_TRUE(ObserveCandidate({20, 33}).ok());
-  ASSERT_TRUE(WaitFor(
-      [this] {
-        const auto operation = Operation();
-        return operation.has_value() &&
-               operation->current_directives_.size() == 1 &&
-               operation->current_directives_.front().spec_.kind_ ==
-                   kMetaDirectiveAuthorizeSource &&
-               !operation->current_directives_.front().spec_.payload_.empty();
-      },
-      3s));
+  ASSERT_TRUE(WaitFor([this] { return CurrentDirectiveIsFrozenSource(); }, 3s));
   ASSERT_TRUE(PublishCurrentProjections().ok());
   ASSERT_TRUE(CommitFrozenSourceResult().ok());
   ASSERT_TRUE(WaitFor(

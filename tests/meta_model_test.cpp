@@ -823,8 +823,9 @@ TEST(MetaOperationStore,
   using keylane::meta::SubmitOperation;
   using keylane::meta::TransitionOperationPhase;
 
-  const auto request = control::EncodeFrozenSourceRequest(
-      control::FrozenSourceRequest{.recovery_generation = 7});
+  const auto request =
+      control::EncodeFrozenSourceRequest(control::FrozenSourceRequest{
+          .recovery_generation = 7, .source_flow_count = 3});
   const auto preconditions = control::EncodeFrozenSourcePreconditions(
       control::FrozenSourcePreconditions{.excluded_group_term = 4,
                                          .excluded_authority_version = 9,
@@ -863,7 +864,8 @@ TEST(MetaOperationStore,
     return store.TransitionOperationPhase(transition, 2).ok();
   };
 
-  EXPECT_TRUE(accepted(base));  // existing active-authority form
+  base.payload_ = *control::EncodeRebuildRequest({.source_flow_count = 3});
+  EXPECT_TRUE(accepted(base));  // active-authority form
   MetaDirectiveSpec frozen = base;
   frozen.payload_ = *request;
   frozen.preconditions_ = *preconditions;
@@ -2673,13 +2675,15 @@ TEST(MetaStateApply,
   directive.grant_revision_ = 8;
   directive.kind_ = std::string(keylane::meta::kMetaDirectiveAuthorizeSource);
 
-  // The ordinary empty authorize-source remains tied to the active finite
-  // grant. A typed frozen request may never run before BeginGroupTerm fences
-  // that authority.
+  // The ordinary typed authorize-source remains tied to the active finite
+  // grant. A frozen request may never run before BeginGroupTerm fences that
+  // authority.
+  directive.payload_ = *control::EncodeRebuildRequest({.source_flow_count = 3});
   EXPECT_TRUE(
       keylane::meta::ValidateCommittedDirectiveAnchor(stores, directive).ok());
-  const auto payload = control::EncodeFrozenSourceRequest(
-      control::FrozenSourceRequest{.recovery_generation = 3});
+  const auto payload =
+      control::EncodeFrozenSourceRequest(control::FrozenSourceRequest{
+          .recovery_generation = 3, .source_flow_count = 3});
   const auto preconditions = control::EncodeFrozenSourcePreconditions(
       control::FrozenSourcePreconditions{.excluded_group_term = 1,
                                          .excluded_authority_version = 1,

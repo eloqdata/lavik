@@ -498,6 +498,10 @@ TEST(MetaFailoverValidationTest,
   hold_source.partition_replication_epoch_ =
       failover.partition_replication_epoch_;
   hold_source.kind_ = std::string(kMetaDirectiveAuthorizeSource);
+  auto hold_request = cluster::control::EncodeRebuildRequest(
+      {.source_flow_count = failover.flow_count_});
+  ASSERT_TRUE(hold_request.ok()) << hold_request.status();
+  hold_source.payload_ = std::move(*hold_request);
   TransitionOperationPhase dispatch_hold = transition_phase(
       FailoverPhase{.stage_ = FailoverPhaseStage::kSourceHolding}, 1,
       {hold_source});
@@ -581,7 +585,8 @@ TEST(MetaFailoverValidationTest,
       failover.partition_replication_epoch_;
   frozen_source.kind_ = std::string(kMetaDirectiveAuthorizeSource);
   auto frozen_request = cluster::control::EncodeFrozenSourceRequest(
-      {.recovery_generation = failover.recovery_generation_});
+      {.recovery_generation = failover.recovery_generation_,
+       .source_flow_count = failover.flow_count_});
   auto frozen_preconditions = cluster::control::EncodeFrozenSourcePreconditions(
       {.excluded_group_term = failover.group_term_ - 1,
        .excluded_authority_version = failover.authority_version_,
@@ -601,7 +606,8 @@ TEST(MetaFailoverValidationTest,
                 observations)),
             MetaFailureClass::kDomainReject);
   auto wrong_generation_request = cluster::control::EncodeFrozenSourceRequest(
-      {.recovery_generation = failover.recovery_generation_ + 1});
+      {.recovery_generation = failover.recovery_generation_ + 1,
+       .source_flow_count = failover.flow_count_});
   ASSERT_TRUE(wrong_generation_request.ok())
       << wrong_generation_request.status();
   auto wrong_frozen = dispatch_frozen;

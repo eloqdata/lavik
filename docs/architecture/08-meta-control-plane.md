@@ -343,10 +343,11 @@ flow count advertised with its boot/history in `ClientHello`. Meta commits that
 layout in both directives; projection and replay never infer it from the
 recipient's workers or a newer source session. Source authorization and the
 native target handshake both check it against the actual source layout.
-Only `promotion-prepare` carries preconditions; `revoke-sources` requires both
-fields empty, and all kinds require `force=false`. The prepare bodies bind parent
-history and required flow frontier to the committed old-authority exclusion term
-and hash.
+Frozen `authorize-source` and `promotion-prepare` carry preconditions; ordinary
+rebuild/authorization requests do not. `revoke-sources` requires both fields
+empty, and all kinds require `force=false`. The prepare bodies bind parent
+history and required flow frontier to the committed old-authority exclusion
+term and hash.
 Meta transition apply and Data admission reject malformed or misplaced bodies,
 so the replication adapter cannot silently ignore a predicate or override.
 Operation, durable directive, execution attempt, and assignment-incarnation

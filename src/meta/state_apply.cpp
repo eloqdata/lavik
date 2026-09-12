@@ -99,7 +99,7 @@ absl::Status ValidateCommittedDirectiveAnchorImpl(
       directive.kind_ == kMetaDirectiveInitializeEmptyPopulation;
   const bool maybe_frozen_source =
       directive.kind_ == kMetaDirectiveAuthorizeSource &&
-      (!directive.payload_.empty() || !directive.preconditions_.empty());
+      !directive.preconditions_.empty();
   std::optional<cluster::control::FrozenSourceRequest> frozen_request;
   std::optional<cluster::control::FrozenSourcePreconditions>
       frozen_preconditions;

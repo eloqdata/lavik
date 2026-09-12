@@ -449,7 +449,10 @@ TEST(MetaDirectiveValidationTest,
   authorize.target_node_id = kRemote;
   authorize.target_boot_id = kRemoteBoot;
   authorize.authority.assignment_id = remote_assignment;
-  authorize.payload.clear();
+  auto ordinary_request =
+      control::EncodeRebuildRequest({.source_flow_count = 3});
+  ASSERT_TRUE(ordinary_request.ok()) << ordinary_request.status();
+  authorize.payload = *ordinary_request;
   authorize.preconditions.clear();
   desired.current_directives.front().source_node_id = authorize.source_node_id;
   desired.current_directives.front().source_assignment_id =
@@ -458,7 +461,7 @@ TEST(MetaDirectiveValidationTest,
   desired.current_directives.front().target_node_id = authorize.target_node_id;
   desired.current_directives.front().target_boot_id = authorize.target_boot_id;
   desired.current_directives.front().authority = authorize.authority;
-  desired.current_directives.front().payload.clear();
+  desired.current_directives.front().payload = authorize.payload;
   desired.current_directives.front().preconditions.clear();
   EXPECT_TRUE(
       ValidateLiveDirective(authorize, desired, kLocal, kLocalBoot).ok());
@@ -469,8 +472,9 @@ TEST(MetaDirectiveValidationTest,
   EXPECT_EQ(ValidateLiveDirective(malformed_frozen, desired, kLocal, kLocalBoot)
                 .code(),
             absl::StatusCode::kInvalidArgument);
-  auto frozen_request = control::EncodeFrozenSourceRequest(
-      control::FrozenSourceRequest{.recovery_generation = 17});
+  auto frozen_request =
+      control::EncodeFrozenSourceRequest(control::FrozenSourceRequest{
+          .recovery_generation = 17, .source_flow_count = 3});
   auto frozen_preconditions = control::EncodeFrozenSourcePreconditions(
       control::FrozenSourcePreconditions{
           .excluded_group_term = 2,
@@ -491,7 +495,7 @@ TEST(MetaDirectiveValidationTest,
   EXPECT_EQ(
       ValidateLiveDirective(typed_frozen, desired, kLocal, kLocalBoot).code(),
       absl::StatusCode::kInvalidArgument);
-  desired.current_directives.front().payload.clear();
+  desired.current_directives.front().payload = authorize.payload;
   desired.current_directives.front().preconditions.clear();
 
   control::Directive stale_source = authorize;
@@ -514,7 +518,9 @@ TEST(MetaDirectiveValidationTest,
 
   control::Directive revoke = authorize;
   revoke.kind = control::WireDirectiveKind::kRevokeSources;
+  revoke.payload.clear();
   desired.current_directives.front().kind = revoke.kind;
+  desired.current_directives.front().payload.clear();
   EXPECT_TRUE(ValidateLiveDirective(revoke, desired, kLocal, kLocalBoot).ok());
 
   control::Directive initialize = live;

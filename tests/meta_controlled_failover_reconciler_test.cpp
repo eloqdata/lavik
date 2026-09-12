@@ -619,6 +619,7 @@ class ControlledFailoverPlannerTest : public testing::Test {
         .boot_id_ = Hex(intent_.former_owner_boot_id_),
         .session_id_ = Bytes<16>(0x51),
         .replication_history_id_ = intent_.parent_history_id_,
+        .replication_flow_count_ = intent_.flow_count_,
         .session_generation_ = 1,
         .leadership_generation_ = kLeadershipGeneration,
         .source_meta_applied_index_ = index_,
@@ -647,6 +648,9 @@ class ControlledFailoverPlannerTest : public testing::Test {
         .boot_id_ = Hex(intent_.candidate_boot_id_),
         .session_id_ = Bytes<16>(0x53),
         .replication_history_id_ = Bytes<20>(0x61),
+        // This is the candidate's future export layout; its applied frontier
+        // remains indexed by the old source's two-flow layout.
+        .replication_flow_count_ = intent_.flow_count_ + 1,
         .session_generation_ = 1,
         .leadership_generation_ = kLeadershipGeneration,
         .source_meta_applied_index_ = index_,
@@ -822,7 +826,10 @@ TEST_F(ControlledFailoverPlannerTest,
   InstallSourceHold();
   ApplyNext<TransitionOperationPhase>();
   ASSERT_EQ(Operation().current_directives_.size(), 1);
-  EXPECT_TRUE(Operation().current_directives_.front().spec_.payload_.empty());
+  const auto request = control::DecodeRebuildRequest(
+      Operation().current_directives_.front().spec_.payload_);
+  ASSERT_TRUE(request.ok()) << request.status();
+  EXPECT_EQ(request->source_flow_count, intent_.flow_count_);
   waiting = Plan();
   ASSERT_TRUE(waiting.ok()) << waiting.status();
   EXPECT_FALSE(waiting->has_value());
