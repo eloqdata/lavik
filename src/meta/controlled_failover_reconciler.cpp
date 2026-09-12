@@ -356,7 +356,7 @@ bool SourceRecoveryHolderReady(const MetaDataControlRuntimeNode* source,
                                const FailoverIntent& intent) {
   // The projected hold proves desired state, while the session history proves
   // that the same physical backlog still backs it. Data tears down or changes
-  // one of these observable facts on every #41 path that clears the armed
+  // one of these observable facts on every path that clears the armed
   // hold; accepting the FDS projection alone could retain a stale exact proof
   // after an in-place replication-history reset.
   return RuntimeNodeHealthy(source) &&

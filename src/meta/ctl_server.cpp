@@ -1734,7 +1734,8 @@ std::string ControlledFailoverError(std::string_view phase,
                       SingleLine(std::move(detail)));
 }
 
-// Admission selects exactly once from the #39 candidate plan and persists
+// Admission selects exactly once from the deterministic candidate plan and
+// persists
 // that immutable incarnation before releasing the global topology-workflow
 // gate. The connection is only a bounded waiter; all subsequent progress and
 // cleanup remain owned by the leader-scoped reconciler.

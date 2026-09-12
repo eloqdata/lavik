@@ -105,7 +105,8 @@
 //                             preflight/domain-rejected without proposing.
 //   failover 1 <group_id> <wait_ms> <attempt_timeout_ms>
 //                          -> starts one operator-triggered controlled
-//                             failover using the current #39 candidate plan.
+//                             failover using the current deterministic
+//                             candidate plan.
 //                             wait_ms bounds only this connection; the
 //                             separately persisted attempt timeout bounds each
 //                             Meta leader tenure's workflow execution.

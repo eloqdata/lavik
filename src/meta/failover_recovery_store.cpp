@@ -4,6 +4,8 @@
 #include <limits>
 #include <utility>
 
+#include "keylane/cluster/control_protocol.h"
+
 namespace keylane::meta {
 namespace {
 
@@ -11,13 +13,6 @@ template <typename Array>
 bool IsZero(const Array& value) {
   return std::all_of(value.begin(), value.end(),
                      [](std::uint8_t byte) { return byte == 0; });
-}
-
-bool IsCanonicalNodeId(std::string_view value) {
-  return value.size() == kMetaNodeIdBytes &&
-         std::all_of(value.begin(), value.end(), [](char ch) {
-           return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
-         });
 }
 
 absl::Status ValidateCommand(const SetFailoverRecovery& command,
@@ -32,7 +27,7 @@ absl::Status ValidateCommand(const SetFailoverRecovery& command,
   if (command.recovery_generation_ == 0) {
     return MetaDomainRejectError("recovery generation must be nonzero");
   }
-  if (!IsCanonicalNodeId(command.old_source_node_id_) ||
+  if (!cluster::control::IsCanonicalIdentity160(command.old_source_node_id_) ||
       IsZero(command.old_source_assignment_id_) ||
       IsZero(command.old_source_boot_incarnation_) ||
       IsZero(command.old_source_history_id_)) {

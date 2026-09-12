@@ -2373,8 +2373,8 @@ absl::Status ValidateFailoverProposal(
     // proposal hook is the final leader-local safety boundary. Reconstructing
     // the canonical submission from the same committed/observation cut keeps
     // a well-formed caller from substituting another compatible-looking
-    // replica, recovery generation, or policy pin after deterministic #39
-    // selection.
+    // replica, recovery generation, or policy pin after deterministic
+    // candidate selection.
     auto expected = BuildControlledFailoverSubmission(
         intent->group_id_, submit->operation_id_, submit->request_id_, view,
         observations, UnixMillisNow(), intent->attempt_timeout_ms_);
