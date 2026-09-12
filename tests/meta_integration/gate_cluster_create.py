@@ -1199,9 +1199,17 @@ def root_operation(meta, phase=None):
     return matches[-1] if matches else None
 
 
-def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False):
+class WireBypassed(Exception):
+    """The operation completed with the wire frame travelling a direct
+    reconnect instead of the test barrier, so this attempt could not
+    exercise the held-frame cut."""
+
+
+def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False,
+                      attempt=0):
     name = "recover-" + phase
-    scenario = os.path.join(workdir, name)
+    scenario = os.path.join(workdir, name if attempt == 0
+                            else f"{name}-retry-{attempt}")
     os.makedirs(scenario, mode=0o700)
     meta = H.Node(META, scenario, 1,
                   args=H.raft_args(snapshot_distance=100_000))
@@ -1251,6 +1259,14 @@ def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False):
                          lambda: root_operation(meta, "wait-data-projection"))
             data.start()
             if not proxy.blocked.wait(10):
+                # A projection advance between the first FDS install and the
+                # first lease challenge ends that session out of date; the
+                # reconnect then dials Meta's advertised endpoint directly
+                # and the frame never crosses this test-only barrier. The
+                # product path completed correctly, so retry the interception
+                # rather than fail it.
+                if root_operation(meta, "child-completed") is not None:
+                    raise WireBypassed(name)
                 raise H.Failure(f"{name}: control frame was not held")
         else:
             H.wait_until(f"{name}: durable cut", 10,
@@ -1321,6 +1337,19 @@ def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False):
         meta.force_kill()
 
 
+def run_wire_recovery_case(workdir, phase, wire, attempts=4):
+    for attempt in range(attempts):
+        try:
+            run_recovery_case(workdir, phase, wire=wire, attempt=attempt)
+        except WireBypassed:
+            H.log(f"recover-{phase}: frame bypassed the barrier, retrying "
+                  f"({attempt + 1}/{attempts})")
+            continue
+        return
+    raise H.Failure(f"recover-{phase}: control frame kept bypassing the "
+                    "barrier")
+
+
 def has_fault(binary, needle):
     # Release builds erase the hook and its arguments. Scan in bounded chunks
     # so these optional deterministic cuts also work with stripped binaries.
@@ -1366,8 +1395,8 @@ def main():
                 run_recovery_case(workdir, phase, snapshot=snapshot, crash=snapshot)
         else:
             H.log("SKIP phase-pause cuts: ordinary Release erases test hooks")
-        run_recovery_case(workdir, "wire-directive", wire="directive")
-        run_recovery_case(workdir, "wire-result", wire="result")
+        run_wire_recovery_case(workdir, "wire-directive", wire="directive")
+        run_wire_recovery_case(workdir, "wire-result", wire="result")
         H.log("PASS")
         return 0
     except Exception as error:  # noqa: BLE001 - logs are test evidence
