@@ -3,6 +3,7 @@
 #include "gtest/gtest.h"
 #include "keylane/meta/cluster_create.h"
 #include "keylane/meta/cluster_create_reconciler.h"
+#include "keylane/meta/control_projector.h"
 #include "keylane/meta/hash.h"
 
 namespace keylane::meta {
@@ -62,6 +63,7 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
         {std::string(40, '3'), "tcp://127.0.0.1:6373"},
         {std::string(40, '4'), "tcp://127.0.0.1:6374"},
     };
+    ConfigureDataEndpoints();
     manifest_.groups_ = {
         {"group-a", std::string(40, '1'), {std::string(40, '2')}},
         {"group-b", std::string(40, '3'), {std::string(40, '4')}},
@@ -86,6 +88,8 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
         MetaCommittedView(stores_, index_),
         *stores_.operation_.FindOperation(root_), runtime_, raft_);
   }
+
+  virtual void ConfigureDataEndpoints() {}
 
   void AdvanceToProjectionWait() {
     for (int step = 0; step < 100; ++step) {
@@ -234,6 +238,39 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
   MetaDataControlRuntimeSnapshot runtime_;
   MetaClusterCreateRaftView raft_;
 };
+
+class ClusterCreateTlsRecoveryTest : public ClusterCreateV1RecoveryTest {
+ protected:
+  void ConfigureDataEndpoints() override {
+    manifest_.data_nodes_[0].tls_endpoint_ = "tls://127.0.0.1:16371";
+    manifest_.data_nodes_[1].client_endpoint_.clear();
+    manifest_.data_nodes_[1].tls_endpoint_ = "tls://127.0.0.1:16372";
+  }
+};
+
+TEST_F(ClusterCreateTlsRecoveryTest, RecoversRegistrationAndProjectsTlsPorts) {
+  // Apply() round-trips the aggregate after every step. Recovery must compare
+  // both committed endpoints with the intent and preserve transport identity.
+  AdvanceToProjectionWait();
+  ASSERT_FALSE(HasFatalFailure());
+  const auto primary = stores_.identity_.FindNode(std::string(40, '1'));
+  const auto replica = stores_.identity_.FindNode(std::string(40, '2'));
+  ASSERT_TRUE(primary.has_value());
+  ASSERT_TRUE(replica.has_value());
+  EXPECT_EQ(primary->endpoints_, (std::vector<std::string>{
+                                    "tcp://127.0.0.1:6371",
+                                    "tls://127.0.0.1:16371"}));
+  EXPECT_EQ(replica->endpoints_,
+            (std::vector<std::string>{"tls://127.0.0.1:16372"}));
+  const auto projected = MetaControlProjector::ProjectNode(
+      MetaCommittedView(stores_, index_), replica->node_id_);
+  ASSERT_TRUE(projected.ok()) << projected.status();
+  ASSERT_EQ(projected->full_state.nodes.size(), 4U);
+  EXPECT_EQ(projected->full_state.nodes[0].port, 6371);
+  EXPECT_EQ(projected->full_state.nodes[0].tls_port, 16371);
+  EXPECT_EQ(projected->full_state.nodes[1].port, 0);
+  EXPECT_EQ(projected->full_state.nodes[1].tls_port, 16372);
+}
 
 TEST_F(ClusterCreateV1RecoveryTest,
        WaitsAtStableMetaBarrierUntilEveryRemoteIsRecentAndApplied) {

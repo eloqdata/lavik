@@ -75,14 +75,22 @@ def allocate_data_file(path, size=DATA_FILE_BYTES):
 
 
 class DataProcess:
-    def __init__(self, binary, workdir, node_id, seed, tls=None, workers=1):
+    def __init__(self, binary, workdir, node_id, seed, tls=None, workers=1,
+                 tls_only=False):
         self.binary = binary
         self.node_id = node_id
         self.workdir = workdir
-        self.redis_port = H.free_port()
+        if tls_only and tls is None:
+            raise H.Failure("TLS-only Data needs TLS credentials")
+        self.redis_port = 0 if tls_only else H.free_port()
         self.metrics_port = H.free_port()
         while self.metrics_port == self.redis_port:
             self.metrics_port = H.free_port()
+        self.tls_port = 0
+        if tls is not None:
+            self.tls_port = H.free_port()
+            while self.tls_port in (self.redis_port, self.metrics_port):
+                self.tls_port = H.free_port()
         self.seed = seed
         self.tls = tls
         self.workers = workers
@@ -120,6 +128,7 @@ class DataProcess:
             ca_cert, cert, key = self.tls
             args.extend([
                 "--tls-replication",
+                "--tls-port", str(self.tls_port),
                 "--tls-ca-cert-file", ca_cert,
                 "--tls-cert-file", cert,
                 "--tls-key-file", key,

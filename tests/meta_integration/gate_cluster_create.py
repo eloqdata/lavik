@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness as H  # noqa: E402
-from gate_data_control import DataProcess  # noqa: E402
+from gate_data_control import DataProcess, make_ca, make_leaf  # noqa: E402
 
 
 DATA_NODE = "0123456789abcdef0123456789abcdef01234567"
@@ -74,22 +75,24 @@ def command(environment, arguments, input_text=None, timeout=90, expected=0):
     return result.stdout
 
 
-def cluster_status(meta):
+def cluster_status(meta, admin=None):
     result = subprocess.run(
-        [CTL, "cluster-status", "--socket", meta.ctl_path, "--json"],
+        [CTL, "cluster-status", "--json"] +
+        (admin if admin is not None else ["--socket", meta.ctl_path]),
         capture_output=True, text=True, timeout=5)
     if result.returncode not in (0, 2):
         raise H.Failure(f"cluster-status failed: {result}")
     return json.loads(result.stdout)
 
 
-def wait_cluster_ready(meta, description, timeout):
-    """Observe asynchronous readiness without saturating Meta with CLI forks."""
+def wait_cluster_ready(meta, description, timeout, admin=None):
+    """Observe completed creation and readiness in the same status cut."""
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        last = cluster_status(meta)
-        if last.get("result") == "ready":
+        last = cluster_status(meta, admin=admin)
+        if (last.get("result") == "ready" and
+                last.get("cluster_state") == "created"):
             return
         if last.get("cluster_state") == "provisioning-failed":
             root = last.get("root_operation_id")
@@ -107,6 +110,8 @@ def create_request(meta, node_id, endpoint, group_id, meta_id=None,
     """Send a normalized public v1 envelope so CLI cannot hide races."""
     metas = meta if isinstance(meta, (list, tuple)) else [meta]
     operation_id = operation_id or os.urandom(16)
+    # Keep these direct admission/recovery cases on the persisted v3 format;
+    # real CLI cases exercise v4, which adds the Data TLS endpoint.
     payload = struct.pack(">H", 3) + operation_id + struct.pack(">I", len(metas))
     for member in sorted(metas, key=lambda item: item.id):
         member_id = member.id if meta_id is None else meta_id
@@ -851,15 +856,29 @@ def read_resp(reader):
     raise H.Failure(f"Data returned unknown RESP prefix {prefix!r}")
 
 
+def redis_connection(data):
+    if data.tls is None:
+        return socket.create_connection(endpoint_tuple(data), timeout=3.0)
+    ca, cert, key = data.tls
+    context = ssl.create_default_context(cafile=ca)
+    context.load_cert_chain(cert, key)
+    sock = socket.create_connection(("127.0.0.1", data.tls_port), timeout=3.0)
+    try:
+        return context.wrap_socket(sock, server_hostname="127.0.0.1")
+    except Exception:
+        sock.close()
+        raise
+
+
 def redis_call(data, arguments):
-    with socket.create_connection(endpoint_tuple(data), timeout=3.0) as sock:
+    with redis_connection(data) as sock:
         sock.settimeout(3.0)
         sock.sendall(encode_resp(arguments))
         return read_resp(sock.makefile("rb"))
 
 
 def redis_error(data, arguments):
-    with socket.create_connection(endpoint_tuple(data), timeout=3.0) as sock:
+    with redis_connection(data) as sock:
         sock.settimeout(3.0)
         sock.sendall(encode_resp(arguments))
         line = sock.makefile("rb").readline()
@@ -870,7 +889,7 @@ def redis_error(data, arguments):
 
 
 def readonly_get(data, key):
-    with socket.create_connection(endpoint_tuple(data), timeout=3.0) as sock:
+    with redis_connection(data) as sock:
         sock.settimeout(3.0)
         sock.sendall(encode_resp(["READONLY"]) + encode_resp(["GET", key]))
         reader = sock.makefile("rb")
@@ -1227,6 +1246,83 @@ def run_multi_group_case(workdir, automatic, interactive,
         meta.force_kill()
 
 
+def run_tls_create_case(workdir, tls_only):
+    """mTLS acceptance must lead to a populated replica and working writes."""
+    name = "tls-only-create" if tls_only else "tls-dual-create"
+    scenario = os.path.join(workdir, name)
+    os.makedirs(scenario, mode=0o700)
+    certdir = os.path.join(scenario, "certs")
+    ca, ca_key = make_ca(certdir)
+    meta_cert, meta_key = make_leaf(
+        certdir, ca, ca_key, "meta", "keylane://meta/1")
+    operator_cert, operator_key = make_leaf(
+        certdir, ca, ca_key, "operator", "keylane://operator/create-test")
+    meta = H.Node(META, scenario, 1, args=(
+        H.raft_args(snapshot_distance=100_000) +
+        H.tls_args(ca, meta_cert, meta_key) +
+        ["--ctl-tls-ca", ca, "--ctl-tls-cert", meta_cert,
+         "--ctl-tls-key", meta_key]))
+    nodes = []
+    for index, node_id in enumerate((PRIMARY_1, REPLICA_1)):
+        cert, key = make_leaf(
+            certdir, ca, ca_key, f"data-{index}", f"keylane://node/{node_id}")
+        nodes.append(DataProcess(
+            DATA, os.path.join(scenario, f"data-{index}"), node_id,
+            meta.data_control_endpoint, tls=(ca, cert, key), tls_only=tls_only))
+    manifest = os.path.join(scenario, "cluster.toml")
+    lines = (['schema_version = 1', 'slot_strategy = "contiguous-even"'] +
+             meta_manifest_lines(meta))
+    for node in nodes:
+        lines.extend(['[[data_nodes]]', f'id = "{node.node_id}"'])
+        if not tls_only:
+            lines.append(f'client_endpoint = "{node.advertised_endpoint}"')
+        lines.append(f'tls_endpoint = "tls://127.0.0.1:{node.tls_port}"')
+    lines.extend(['[[groups]]', 'id = "group-1"',
+                  f'primary = "{PRIMARY_1}"', f'replicas = ["{REPLICA_1}"]'])
+    with open(manifest, "w", encoding="utf-8") as output:
+        output.write("\n".join(lines) + "\n")
+    admin = ["--addr", meta.ctl_endpoint, "--tls-ca", ca,
+             "--tls-cert", operator_cert, "--tls-key", operator_key]
+    environment = os.environ.copy()
+    try:
+        meta.start(initial_cluster_manifest=manifest)
+        meta.wait_leader()
+        for node in nodes:
+            node.start()
+        created = command(environment, [
+            CTL, "cluster-create", "--manifest", manifest, "--yes"] + admin)
+        if "Cluster create accepted:" not in created:
+            raise H.Failure(f"{name} did not accept Genesis: {created}")
+        for node in nodes:
+            if f"tls://127.0.0.1:{node.tls_port}" not in created:
+                raise H.Failure(f"{name} plan omitted the Data TLS endpoint")
+        # A successful Admin reply only confirms Genesis. Observe the actual
+        # population/replication outcome so missing TLS ports cannot pass.
+        wait_cluster_ready(meta, f"{name} reaches READY", 30, admin=admin)
+        primary, replica = nodes
+        for ordinal in range(3):
+            key, value = f"tls-create-{ordinal}", f"replicated-{ordinal}"
+            if redis_call(primary, ["SET", key, value]) != "OK":
+                raise H.Failure(f"{name} primary write failed")
+            if redis_call(primary, ["GET", key]) != value:
+                raise H.Failure(f"{name} primary read failed")
+            H.wait_until(f"{name} replica receives {key}", 10,
+                         lambda: readonly_get(replica, key) == value)
+        H.log(f"{name}: mTLS Admin, Data control and replication reached READY")
+        for node in nodes:
+            node.terminate()
+        meta.terminate()
+    except Exception:
+        print(meta.log_tail(lines=100), file=sys.stderr)
+        for node in nodes:
+            print(node.log_tail(lines=100), file=sys.stderr)
+        raise
+    finally:
+        for node in nodes:
+            node.force_kill()
+        meta.force_kill()
+
+
 def run_group_id_probe_case(workdir):
     """An unusual Group id survives accepted Genesis and async creation."""
     scenario = os.path.join(workdir, "group-id-probe")
@@ -1496,6 +1592,8 @@ def main():
         run_multi_group_case(workdir, automatic=False, interactive=False,
                              block_replica_during_create=True)
         run_group_id_probe_case(workdir)
+        run_tls_create_case(workdir, tls_only=False)
+        run_tls_create_case(workdir, tls_only=True)
         if has_fault(DATA, b"KEYLANE_REPLICATION_PAUSE_FULLSYNC_BEFORE_CATALOG_ACK_MS"):
             run_multi_group_case(workdir, automatic=True, interactive=False,
                                  restart_replica_during_create=True)

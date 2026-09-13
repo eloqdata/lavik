@@ -229,6 +229,31 @@ Group ids and assigns boundaries with
 `floor(i*16384/N)..floor((i+1)*16384/N)-1`. The CLI displays the fully
 normalized order and range table before any mutation.
 
+For mTLS Data control and replication, configure each Data process with the
+[Data TLS credentials](#configure-data-nodes), `--tls-replication`, and a
+`--tls-port` listener. Add its advertised TLS address to its `[[data_nodes]]`
+entry before creating the cluster:
+
+```toml
+[[data_nodes]]
+id = "1111111111111111111111111111111111111111"
+client_endpoint = "tcp://127.0.0.1:6371"
+tls_endpoint = "tls://127.0.0.1:16371"
+```
+
+Here the Data process listens with `--port 6371 --tls-port 16371`. For a
+TLS-only listener, use `--port 0 --tls-port 16371` and omit `client_endpoint`
+from that node's manifest entry. At least one endpoint is required; when both
+are present they must use the same numeric host and distinct ports. Data socket
+addresses must be unique across the manifest, including across transports.
+Keep certificate paths and keys in process configuration. Meta and Admin
+descriptors retain their `tcp://` address spelling; their TLS mode comes from
+the process TLS options, independently of these Data listener tags.
+
+New clients encode creation intents as binary version 4. Meta also reads
+version 3 intents for recovery of existing TCP-only creation workflows; run
+the updated Meta and CLI together when creating a topology with TLS endpoints.
+
 Repeat `[[meta_members]]` for every first-wave voter. IDs and each endpoint
 class must be unique; entries are canonicalized by ID, all members are voters,
 and the principal is fixed as `keylane://meta/<id>`. At admission the manifest
