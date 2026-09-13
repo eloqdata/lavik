@@ -616,6 +616,71 @@ TEST(ClusterCreateOperatorTest, RejectsActiveCreateBeforeMutation) {
   EXPECT_FALSE(mutation_sent);
 }
 
+TEST(ClusterCreateOperatorTest,
+     LifecycleRejectionPrecedesMetaMembershipMismatch) {
+  const ClusterCreateManifestV1 manifest =
+      *ParseClusterCreateManifest(kValidManifest);
+  const ClusterHeadWireV1 head{
+      .responder_id_ = 1,
+      .role_ = ClusterMetaRole::kLeader,
+      .term_ = 2,
+      .leader_id_ = 1,
+      .config_index_ = 30,
+      .meta_members_ = {{.server_id_ = 1,
+                         .ctl_endpoint_ = "127.0.0.1:7201",
+                         .is_leader_ = true},
+                        {.server_id_ = 2, .ctl_endpoint_ = "127.0.0.1:7202"}},
+  };
+  // The original manifest remains valid after a Meta member is added, but no
+  // longer describes current membership. It must not hide the Genesis binding.
+  for (const auto state :
+       {ClusterStateWireV1::kUninitialized, ClusterStateWireV1::kNonPristine,
+        ClusterStateWireV1::kCreating, ClusterStateWireV1::kCreated,
+        ClusterStateWireV1::kProvisioningFailed}) {
+    SCOPED_TRACE(static_cast<int>(state));
+    ClusterStatusWireV1 status = EmptyStatus(head);
+    status.capture_.committed_index_ = 30;
+    status.cluster_state_ = state;
+    std::string_view expected_error = "already-created";
+    if (state == ClusterStateWireV1::kUninitialized) {
+      expected_error = "bad-request";
+    } else if (state == ClusterStateWireV1::kNonPristine) {
+      expected_error = "non-pristine";
+    } else {
+      status.root_operation_id_ = "00112233445566778899aabbccddeeff";
+      status.genesis_commit_index_ = 8;
+      status.lifecycle_revision_ = 2;
+      if (state == ClusterStateWireV1::kCreating) {
+        status.lifecycle_revision_ = 1;
+        status.cluster_create_phase_ = "register-data";
+      } else if (state == ClusterStateWireV1::kProvisioningFailed) {
+        status.provisioning_failure_summary_ = "initial population failed";
+      }
+    }
+    bool mutation_sent = false;
+    ClusterOperator op([&](const MetaAdminTarget&, std::string_view command,
+                           auto) -> absl::StatusOr<std::string> {
+      if (command == "clusterhead 1") return EncodeClusterHeadReply(head);
+      if (command == "clusterstatus 1") return EncodeClusterStatusReply(status);
+      mutation_sent = true;
+      return absl::InternalError("unexpected mutation");
+    });
+    ClusterStatusOptions options;
+    options.deadline_ =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+
+    auto outcome = op.Create({.transport_ = MetaAdminTarget::Transport::kUnix,
+                              .endpoint_ = "/tmp/meta.sock"},
+                             manifest, options);
+
+    EXPECT_EQ(outcome.status().code(), absl::StatusCode::kFailedPrecondition);
+    EXPECT_NE(outcome.status().message().find(expected_error),
+              std::string_view::npos)
+        << outcome.status();
+    EXPECT_FALSE(mutation_sent);
+  }
+}
+
 TEST(ClusterCreateOperatorTest, DoesNotWaitForRuntimeReadiness) {
   const ClusterCreateManifestV1 manifest =
       *ParseClusterCreateManifest(kValidManifest);

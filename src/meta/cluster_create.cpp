@@ -838,6 +838,17 @@ absl::StatusOr<ClusterCreateOutcome> ClusterOperator::Create(
         absl::UnavailableError(initial->retry_reason_));
   }
   const ClusterStatusWireV1& status = *initial->status_;
+  // Lifecycle admission survives Meta membership changes. Only a pristine,
+  // uninitialized cluster compares the manifest with the current Meta set.
+  if (status.cluster_state_ == ClusterStateWireV1::kNonPristine) {
+    return absl::FailedPreconditionError(
+        "cluster-create non-pristine: Uninitialized Meta contains "
+        "Data-cluster artifacts");
+  }
+  if (status.cluster_state_ != ClusterStateWireV1::kUninitialized) {
+    return absl::FailedPreconditionError(
+        "cluster-create already-created: Meta already owns a Data cluster");
+  }
   const bool meta_matches =
       status.meta_members_.size() == manifest.meta_members_.size() &&
       std::equal(status.meta_members_.begin(), status.meta_members_.end(),
@@ -849,15 +860,6 @@ absl::StatusOr<ClusterCreateOutcome> ClusterOperator::Create(
     return absl::FailedPreconditionError(
         "cluster-create bad-request: manifest does not match the committed "
         "Meta set");
-  }
-  if (status.cluster_state_ == ClusterStateWireV1::kNonPristine) {
-    return absl::FailedPreconditionError(
-        "cluster-create non-pristine: Uninitialized Meta contains "
-        "Data-cluster artifacts");
-  }
-  if (status.cluster_state_ != ClusterStateWireV1::kUninitialized) {
-    return absl::FailedPreconditionError(
-        "cluster-create already-created: Meta already owns a Data cluster");
   }
 
   if (std::chrono::steady_clock::now() >= options.deadline_) {
