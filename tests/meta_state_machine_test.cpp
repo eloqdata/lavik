@@ -23,6 +23,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -43,6 +44,7 @@
 #include "keylane/meta/state_apply.h"
 #include "keylane/meta/state_machine.h"
 #include "libnuraft/nuraft.hxx"
+#include "libnuraft/raft_server_handler.hxx"
 
 namespace {
 
@@ -60,10 +62,13 @@ using keylane::meta::SubmitOperation;
 std::filesystem::path MakeTestDir(const char* suite, const char* name) {
   const ::testing::TestInfo* info =
       ::testing::UnitTest::GetInstance()->current_test_info();
-  std::filesystem::path dir = std::filesystem::temp_directory_path() /
-                              ("keylane_meta_test_" + std::string(suite) + "_" +
-                               name + "_" + info->test_suite_name() + "_" +
-                               info->name() + "_" + std::to_string(::getpid()));
+  std::string test_name =
+      std::string(info->test_suite_name()) + "_" + info->name();
+  std::replace(test_name.begin(), test_name.end(), '/', '_');
+  std::filesystem::path dir =
+      std::filesystem::temp_directory_path() /
+      ("keylane_meta_test_" + std::string(suite) + "_" + name + "_" +
+       test_name + "_" + std::to_string(::getpid()));
   std::filesystem::remove_all(dir);
   return dir;
 }
@@ -715,7 +720,7 @@ class MetaServerIntegrationTest : public ::testing::Test {
     machine_ = nuraft::ptr<MetaStateMachine>(std::move(*machine));
   }
 
-  void LaunchServer(int snapshot_distance) {
+  void LaunchServer(int snapshot_distance, bool elect_leader = true) {
     scheduler_ = nuraft::cs_new<ThreadScheduler>();
 
     nuraft::raft_params params;
@@ -729,9 +734,13 @@ class MetaServerIntegrationTest : public ::testing::Test {
     nuraft::context* ctx = new nuraft::context(
         mgr_, machine_, /*listener=*/nullptr, /*logger=*/nullptr,
         nuraft::cs_new<NullRpcClientFactory>(), scheduler_, params);
-    server_ = nuraft::cs_new<nuraft::raft_server>(ctx);
-    ASSERT_TRUE(WaitFor([this] { return server_->is_leader(); },
-                        std::chrono::seconds(15)));
+    nuraft::raft_server::init_options options;
+    options.skip_initial_election_timeout_ = !elect_leader;
+    server_ = nuraft::cs_new<nuraft::raft_server>(ctx, options);
+    if (elect_leader) {
+      ASSERT_TRUE(WaitFor([this] { return server_->is_leader(); },
+                          std::chrono::seconds(15)));
+    }
   }
 
   void StartServer(int snapshot_distance) {
@@ -898,5 +907,99 @@ TEST_F(MetaServerIntegrationTest, AutoSnapshotOnCommitThread) {
   ASSERT_TRUE(
       WaitFor([this] { return NodeCount() == 13u; }, std::chrono::seconds(10)));
 }
+
+// Exercise the same request dispatcher as the peer transport, including term
+// updates and durable voted_for. Multi-member authentication and elections are
+// covered by gate_snapshot_vote; this seam isolates log-freshness decisions.
+class VoteRequestDriver : public nuraft::raft_server_handler {
+ public:
+  using nuraft::raft_server_handler::process_req;
+};
+
+class MetaVoteIntegrationTest
+    : public MetaServerIntegrationTest,
+      public ::testing::WithParamInterface<std::string> {};
+
+TEST_P(MetaVoteIntegrationTest, ComparesLogicalLogAfterCompaction) {
+  const std::string history = GetParam();
+  ASSERT_NO_FATAL_FAILURE(OpenStorage());
+  ASSERT_NO_FATAL_FAILURE(LaunchServer(/*snapshot_distance=*/0,
+                                       /*elect_leader=*/history != "Empty"));
+  uint64_t last_index = 0;
+  uint64_t last_term = 0;
+  if (history != "Empty") {
+    AppendAndWait(MakeRegister(0x11));
+    AppendAndWait(MakeRegister(0x22));
+    auto store = mgr_->load_log_store();
+    last_index = store->next_slot() - 1;
+    last_term = store->last_entry()->get_term();
+    ASSERT_GT(last_term, 0u);
+    if (history != "Wal") {
+      nuraft::raft_server::create_snapshot_options options;
+      options.serialize_commit_ = true;
+      ASSERT_EQ(server_->create_snapshot(options), last_index);
+      ASSERT_TRUE(
+          WaitFor([&] { return store->start_index() == last_index + 1; },
+                  std::chrono::seconds(10)));
+      ASSERT_EQ(store->next_slot(), store->start_index());
+      ASSERT_EQ(store->last_entry()->get_term(), 0u);
+      ASSERT_EQ(machine_->last_snapshot()->get_last_log_term(), last_term);
+      if (history == "SnapshotRestart" || history == "SnapshotWithTail") {
+        StopServer();
+        ASSERT_NO_FATAL_FAILURE(OpenStorage());
+        ASSERT_EQ(machine_->last_snapshot()->get_last_log_idx(), last_index);
+        ASSERT_EQ(machine_->last_snapshot()->get_last_log_term(), last_term);
+        ASSERT_NO_FATAL_FAILURE(
+            LaunchServer(/*snapshot_distance=*/0,
+                         /*elect_leader=*/history == "SnapshotWithTail"));
+        if (history == "SnapshotWithTail") {
+          AppendAndWait(MakeRegister(0x33));
+          store = mgr_->load_log_store();
+          ASSERT_GT(store->last_entry()->get_term(), last_term);
+          last_index = store->next_slot() - 1;
+          last_term = store->last_entry()->get_term();
+        } else {
+          ASSERT_EQ(mgr_->load_log_store()->next_slot(), last_index + 1);
+          ASSERT_EQ(mgr_->load_log_store()->last_entry()->get_term(), 0u);
+        }
+      }
+    }
+  }
+
+  // Keep real core threads, but stop timer callbacks so a local election
+  // cannot race the synthetic requests. Each request starts a fresh election
+  // term so a previous granted vote cannot mask the freshness decision.
+  scheduler_->Shutdown();
+  const auto vote = [&](uint64_t candidate_term, uint64_t candidate_index,
+                        bool expected_grant) {
+    SCOPED_TRACE(::testing::Message()
+                 << "candidate (" << candidate_term << ", " << candidate_index
+                 << "), voter (" << last_term << ", " << last_index << ")");
+    const uint64_t election_term = mgr_->read_state()->get_term() + 1;
+    nuraft::req_msg request(election_term,
+                            nuraft::msg_type::request_vote_request,
+                            /*src=*/2, /*dst=*/1, candidate_term,
+                            candidate_index, /*commit_idx=*/0);
+    auto response = VoteRequestDriver::process_req(server_.get(), request);
+    ASSERT_NE(response, nullptr);
+    EXPECT_EQ(response->get_accepted(), expected_grant);
+    EXPECT_EQ(mgr_->read_state()->get_voted_for(), expected_grant ? 2 : -1);
+  };
+  if (last_index > 0) {
+    vote(last_term - 1, last_index + 100, false);
+    vote(last_term, last_index - 1, false);
+  }
+  vote(last_term, last_index, true);
+  vote(last_term, last_index + 1, true);
+  vote(last_term + 1, last_index > 0 ? last_index - 1 : 0, true);
+}
+
+INSTANTIATE_TEST_SUITE_P(History, MetaVoteIntegrationTest,
+                         ::testing::Values("Empty", "Wal", "Snapshot",
+                                           "SnapshotRestart",
+                                           "SnapshotWithTail"),
+                         [](const ::testing::TestParamInfo<std::string>& info) {
+                           return info.param;
+                         });
 
 }  // namespace

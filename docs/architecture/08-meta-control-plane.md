@@ -397,11 +397,18 @@ yield/resume revalidation lifecycle.
 ## Durability and recovery
 
 The durable source of truth is the newest completed state-machine snapshot plus
-the following Raft WAL. Snapshot capture is serialized with commit and copies
-an exact applied-index cut; a writer thread performs serialization and file I/O
-after capture. A snapshot becomes eligible for log compaction only after its
-atomic durable publication succeeds. Incoming snapshots are size-bounded,
-decoded completely, and installed synchronously as one replacement state.
+the following Raft WAL. Snapshot capture serializes an exact applied-index cut
+under the state-machine mutex, excluding committed apply; a writer thread
+performs file I/O after capture. A snapshot becomes eligible for log compaction
+only after its atomic durable publication succeeds. Incoming snapshots are
+size-bounded, decoded completely, and installed synchronously as one replacement
+state.
+
+Election log freshness includes the compacted prefix: RequestVote compares the
+last logical log term first, then its index. When no WAL suffix remains, the
+snapshot's last-included index and term supply that boundary, including after
+restart. A surviving WAL suffix supplies its own last entry instead. Compaction
+therefore cannot make a current voter consider an older candidate up to date.
 
 WAL v1 uses checksum-protected `log-<first-index>.seg` files. Segments roll at
 a size trigger. Compaction writes the complete surviving suffix to a synced

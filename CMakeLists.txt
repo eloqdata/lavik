@@ -870,7 +870,7 @@ if (BUILD_TESTING)
       # allocator quarantine would turn it into a measurement of ASan retention
       # instead of the bounded live Raft queues it is intended to cover.
       set(KEYLANE_META_INTEGRATION_GATES
-        initial_meta initial_recovery leader_change recovery membership membership_recovery transport mtls stale_evidence
+        initial_meta initial_recovery snapshot_vote leader_change recovery membership membership_recovery transport mtls stale_evidence
         partition
       )
       if (NOT KEYLANE_ASAN_BUILD)
