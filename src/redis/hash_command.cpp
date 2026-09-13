@@ -72,6 +72,10 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
       operation.kind_ = request.kind_ == CommandKind::kHReplace
                             ? storage::HashOperationKind::kReplaceOnly
                             : storage::HashOperationKind::kSet;
+      // RESP arity gives the exact pair count. Reserve once instead of growing
+      // two arrays geometrically; these remain views into the owned request.
+      operation.fields_.reserve((args.size() - 2) / 2);
+      operation.values_.reserve((args.size() - 2) / 2);
       for (std::size_t i = 2; i < args.size(); i += 2) {
         operation.fields_.push_back(args[i]);
         operation.values_.push_back(args[i + 1]);

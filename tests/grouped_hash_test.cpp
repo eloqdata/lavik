@@ -98,6 +98,76 @@ TEST(GroupedHashTest, CompactPayloadHasAnExplicitLittleEndianHeader) {
   }
 }
 
+TEST(GroupedHashTest, CompactReaderPreservesBinaryViewsAndCopiedPosition) {
+  auto value = Value(3);
+  value.entries_[0].field_ = std::string("a\0b", 3);
+  value.entries_[0].value_ = std::string("\0x\xff", 3);
+  value.entries_[1].field_.clear();
+  value.entries_[1].value_.clear();
+  auto encoded = EncodeHashValue(value);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto reader = HashValueReader::Open(*encoded);
+  ASSERT_TRUE(reader.ok()) << reader.status();
+  ASSERT_EQ(reader->size(), value.entries_.size());
+  auto copy = *reader;
+  for (const auto& expected : value.entries_) {
+    auto entry = reader->Next();
+    ASSERT_TRUE(entry.ok()) << entry.status();
+    EXPECT_EQ(entry->field_, expected.field_);
+    EXPECT_EQ(entry->value_, expected.value_);
+    EXPECT_GE(entry->field_.data(), encoded->data());
+    EXPECT_LE(entry->value_.data() + entry->value_.size(),
+              encoded->data() + encoded->size());
+  }
+  EXPECT_EQ(reader->Next().status().code(), absl::StatusCode::kOutOfRange);
+  auto first = copy.Next();
+  ASSERT_TRUE(first.ok()) << first.status();
+  EXPECT_EQ(first->field_, value.entries_[0].field_);
+}
+
+TEST(GroupedHashTest, CompactReaderRejectsMalformedUnselectedBytes) {
+  auto encoded = EncodeHashValue(Value(2));
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto check = [](std::string_view payload) {
+    auto reader = HashValueReader::Open(payload);
+    if (!reader.ok()) return reader.status();
+    for (std::size_t i = 0; i < reader->size(); ++i) {
+      auto entry = reader->Next();
+      if (!entry.ok()) {
+        // A failed read must remain failed rather than skipping bad bytes.
+        EXPECT_EQ(reader->Next().status(), entry.status());
+        return entry.status();
+      }
+    }
+    return absl::OkStatus();
+  };
+  auto set_size = [](std::string& payload) {
+    for (std::size_t i = 0; i < 8; ++i)
+      payload[24 + i] = static_cast<char>(payload.size() >> (8 * i));
+  };
+  for (std::size_t length = 0; length < encoded->size(); ++length) {
+    auto broken = encoded->substr(0, length);
+    EXPECT_FALSE(check(broken).ok()) << length;
+    if (length >= kHashValueHeaderBytes) {
+      set_size(broken);
+      EXPECT_FALSE(check(broken).ok()) << length;
+    }
+  }
+  auto trailing = *encoded + "x";
+  set_size(trailing);
+  EXPECT_EQ(check(trailing).message(), "Hash value has trailing bytes");
+  for (std::size_t offset : {0, 8, 12, 16, 20, 24, 32, 36}) {
+    auto broken = *encoded;
+    for (std::size_t i = 0; i < 4; ++i) broken[offset + i] = '\xff';
+    EXPECT_FALSE(check(broken).ok()) << offset;
+  }
+  // Lowering the count can leave a syntactically valid first pair: the final
+  // Next must still reject the omitted pair, even for HKEYS/HVALS selection.
+  auto wrong_count = *encoded;
+  wrong_count[16] = 1;
+  EXPECT_EQ(check(wrong_count).message(), "Hash value has trailing bytes");
+}
+
 TEST(GroupedHashTest, RootRoundTripsAndRejectsMalformedEnvelopes) {
   const auto root = Root(100, 9);
   auto encoded = EncodeGroupedHashRoot(root);

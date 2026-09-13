@@ -6362,7 +6362,7 @@ void LargeHashDurabilityE2eTest::CheckOom(bool injected_storage_failure) {
     const std::vector<std::string> arguments =
         injected_storage_failure
             ? std::vector<std::string>{}
-            : std::vector<std::string>{"--max-memory", "96M",
+            : std::vector<std::string>{"--max-memory", "64M",
                                        "--maxmemory-clients", "64M"};
     const std::vector<std::pair<std::string, std::string>> environment =
         injected_storage_failure
@@ -6376,7 +6376,8 @@ void LargeHashDurabilityE2eTest::CheckOom(bool injected_storage_failure) {
     // Startup needs enough memory to reconstruct the durable side index.
     // In the real-limit variant a 12 MiB request fits the separate 32 MiB
     // per-worker client budget, but its group-write scratch cannot fit the
-    // 16 MiB per-worker storage budget. The injected variant stays small.
+    // worker's storage headroom. Full reads of the nine 1 MiB values also
+    // exceed that headroom. The injected variant stays small.
     const std::string replacement =
         injected_storage_failure ? "wrong" : std::string(12 * 1024 * 1024, 'w');
     EXPECT_TRUE(
@@ -6386,6 +6387,16 @@ void LargeHashDurabilityE2eTest::CheckOom(bool injected_storage_failure) {
                     .starts_with("-OOM "));
     EXPECT_TRUE(client.Command({"HSETNX", kKey, "new", replacement})
                     .starts_with("-OOM "));
+    if (!injected_storage_failure) {
+      // Full reads also need admitted decoded/output ownership. Failure must
+      // keep the stored Hash intact, including when successful reads transfer
+      // strings instead of copying them into their reply result.
+      for (const auto command : {"HGETALL", "HKEYS", "HVALS"}) {
+        const auto reply = client.Command({command, kKey});
+        EXPECT_TRUE(reply.starts_with("-OOM "))
+            << command << ": " << reply.substr(0, 120);
+      }
+    }
     if (injected_storage_failure) {
       ASSERT_EQ(client.Command({"MULTI"}), "+OK");
       ASSERT_EQ(client.Command({"HSET", kKey, "version", "wrong"}), "+QUEUED");

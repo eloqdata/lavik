@@ -59,7 +59,7 @@ absl::StatusOr<std::size_t> AppendHashEntrySize(std::size_t encoded_bytes,
   return encoded_bytes + 8 + field_bytes + value_bytes;
 }
 
-absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
+absl::StatusOr<HashValueReader> HashValueReader::Open(std::string_view payload) {
   if (payload.size() < kHashValueHeaderBytes) {
     return absl::InternalError("Hash value is truncated");
   }
@@ -91,30 +91,50 @@ absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
     return absl::InternalError("Hash element count exceeds encoded payload");
   }
 
+  return HashValueReader(payload, element_count);
+}
+
+absl::StatusOr<HashEntryView> HashValueReader::Next() {
+  if (remaining_ == 0) {
+    return absl::OutOfRangeError("Hash reader is exhausted");
+  }
+  std::size_t offset = offset_;
+  std::uint32_t field_bytes = 0;
+  std::uint32_t value_bytes = 0;
+  if (!ReadU32(payload_, &offset, &field_bytes) ||
+      !ReadU32(payload_, &offset, &value_bytes) || offset > payload_.size() ||
+      field_bytes > kMaxStringBytes || value_bytes > kMaxStringBytes ||
+      field_bytes > payload_.size() - offset ||
+      value_bytes > payload_.size() - offset - field_bytes) {
+    return absl::InternalError("Hash entry is truncated");
+  }
+  HashEntryView entry{.field_ = payload_.substr(offset, field_bytes),
+                      .value_ = payload_.substr(offset + field_bytes,
+                                               value_bytes)};
+  offset += field_bytes + value_bytes;
+  if (remaining_ == 1 && offset != payload_.size()) {
+    return absl::InternalError("Hash value has trailing bytes");
+  }
+  offset_ = offset;
+  --remaining_;
+  return entry;
+}
+
+absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
+  auto reader = HashValueReader::Open(payload);
+  if (!reader.ok()) return reader.status();
   HashValue value;
-  value.entries_.reserve(element_count);
-  for (std::uint32_t index = 0; index < element_count; ++index) {
+  value.entries_.reserve(reader->size());
+  for (std::size_t index = 0; index < reader->size(); ++index) {
+    auto view = reader->Next();
+    if (!view.ok()) return view.status();
     HashEntry entry;
-    std::uint32_t field_bytes = 0;
-    std::uint32_t value_bytes = 0;
-    if (!ReadU32(payload, &offset, &field_bytes) ||
-        !ReadU32(payload, &offset, &value_bytes) || offset > payload.size() ||
-        field_bytes > kMaxStringBytes || value_bytes > kMaxStringBytes ||
-        field_bytes > payload.size() - offset ||
-        value_bytes > payload.size() - offset - field_bytes) {
-      return absl::InternalError("Hash entry is truncated");
-    }
-    entry.field_.assign(payload.substr(offset, field_bytes));
-    offset += field_bytes;
-    entry.value_.assign(payload.substr(offset, value_bytes));
-    offset += value_bytes;
+    entry.field_.assign(view->field_);
+    entry.value_.assign(view->value_);
     // Digests use a process-random seed and are therefore reconstructed from
     // the durable field rather than encoded in the value.
     entry.digest_ = ComputeDigest(entry.field_);
     value.entries_.push_back(std::move(entry));
-  }
-  if (offset != payload.size()) {
-    return absl::InternalError("Hash value has trailing bytes");
   }
   return value;
 }

@@ -64,6 +64,69 @@ bool NeedsGroupedHash(const HashValue& value) {
   return false;
 }
 
+absl::StatusOr<HashResult> ReadCompactHashResult(
+    std::string_view payload, HashOperationKind kind, std::uint64_t count) {
+  auto reader = HashValueReader::Open(payload);
+  if (!reader.ok()) return reader.status();
+  if (reader->size() != count) {
+    return absl::InternalError(
+        "Hash element count does not match record metadata");
+  }
+  const bool fields = kind != HashOperationKind::kValues;
+  const bool values = kind != HashOperationKind::kKeys;
+  const std::size_t width = kind == HashOperationKind::kGetAll ? 2 : 1;
+  std::size_t retained = sizeof(HashResult);
+  auto add_bytes = [&](std::size_t bytes) {
+    if (bytes > std::numeric_limits<std::size_t>::max() - retained)
+      return false;
+    retained += bytes;
+    return true;
+  };
+  // Validate and admit before copying any strings. Full reads do not need
+  // lookup digests or a mutable HashEntry array. The second traversal copies
+  // only selected strings directly into the owned result; no view escapes the
+  // LoadedValue lease. Use the same conservative SSO accounting as other Hash
+  // results, and verify actual allocator capacities before ownership handoff.
+  const std::size_t inline_capacity = std::string{}.capacity();
+  auto inspect = *reader;
+  for (std::size_t i = 0; i < count; ++i) {
+    auto entry = inspect.Next();
+    if (!entry.ok()) return entry.status();
+    if (!add_bytes(width * sizeof(std::optional<std::string>)) ||
+        (fields && !add_bytes(std::max(entry->field_.size(), inline_capacity) +
+                              1)) ||
+        (values && !add_bytes(std::max(entry->value_.size(), inline_capacity) +
+                              1))) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError("OOM Hash output is too large");
+    }
+  }
+  auto reservation = TryReserveMemory(retained);
+  if (!reservation) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM Hash output retention");
+  }
+  HashResult result;
+  result.key_exists_ = true;
+  result.length_ = count;
+  result.values_.reserve(count * width);
+  for (std::size_t i = 0; i < count; ++i) {
+    auto entry = reader->Next();
+    if (!entry.ok()) return entry.status();
+    if (fields) result.values_.emplace_back(std::in_place, entry->field_);
+    if (values) result.values_.emplace_back(std::in_place, entry->value_);
+  }
+  retained = sizeof(HashResult) +
+             result.values_.capacity() * sizeof(result.values_[0]);
+  for (const auto& value : result.values_) retained += value->capacity() + 1;
+  if (retained > reservation->bytes()) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM Hash output retention");
+  }
+  result.retained_charge_.Adopt(&*reservation, retained);
+  return result;
+}
+
 }  // namespace
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLocked(
@@ -429,8 +492,15 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         co_return loaded.status();
       }
       const auto bytes = loaded->value();
-      auto decoded = DecodeHashValue(std::string_view(
-          reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+      const std::string_view payload(
+          reinterpret_cast<const char*>(bytes.data()), bytes.size());
+      if (operation.kind_ == HashOperationKind::kGetAll ||
+          operation.kind_ == HashOperationKind::kKeys ||
+          operation.kind_ == HashOperationKind::kValues) {
+        co_return ReadCompactHashResult(payload, operation.kind_,
+                                        location.logical_size_);
+      }
+      auto decoded = DecodeHashValue(payload);
       if (!decoded.ok()) co_return decoded.status();
       compact = std::move(*decoded);
       if (compact.entries_.size() != location.logical_size_) {
@@ -680,9 +750,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       case HashOperationKind::kGetAll:
       case HashOperationKind::kKeys:
       case HashOperationKind::kValues: {
-        // These results can outlive the operation (notably random reply streams
-        // and multi-key commands). Admit compact output before allocation and
-        // transfer grouped scratch only at the final, pure-read return.
+        // These results can outlive this command-local decoded snapshot. Move
+        // its strings into the result at this terminal read-only return, never
+        // borrow their storage. Admission must cover the transferred capacity,
+        // not just the size that a freshly copied string would allocate.
+        // Grouped scratch remains reserved through the ownership handoff.
         const auto width =
             operation.kind_ == HashOperationKind::kGetAll ? 2 : 1;
         std::size_t retained = sizeof(HashResult);
@@ -695,13 +767,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         for (const auto& entry : compact.entries_) {
           if (!add_bytes(width * sizeof(std::optional<std::string>)) ||
               (operation.kind_ != HashOperationKind::kValues &&
-               !add_bytes(
-                   std::max(entry.field_.size(), std::string{}.capacity()) +
-                   1)) ||
+               !add_bytes(entry.field_.capacity() + 1)) ||
               (operation.kind_ != HashOperationKind::kKeys &&
-               !add_bytes(
-                   std::max(entry.value_.size(), std::string{}.capacity()) +
-                   1))) {
+               !add_bytes(entry.value_.capacity() + 1))) {
             RecordMemoryRejection();
             co_return absl::ResourceExhaustedError(
                 "OOM Hash output is too large");
@@ -723,11 +791,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         }
         try {
           result.values_.reserve(compact.entries_.size() * width);
-          for (const HashEntry& entry : compact.entries_) {
+          for (HashEntry& entry : compact.entries_) {
             if (operation.kind_ != HashOperationKind::kValues)
-              result.values_.push_back(entry.field_);
+              result.values_.emplace_back(std::move(entry.field_));
             if (operation.kind_ != HashOperationKind::kKeys)
-              result.values_.push_back(entry.value_);
+              result.values_.emplace_back(std::move(entry.value_));
           }
         } catch (const std::bad_alloc&) {
           RecordMemoryRejection();

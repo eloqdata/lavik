@@ -116,6 +116,93 @@ TEST(HashReplaceE2e, SemanticsTtlBinaryFieldsAndUnchangedStandardCommands) {
   EXPECT_EQ(client.Command({"EXISTS", "hash"}).text_, "0");
 }
 
+TEST(HashReadOwnershipE2e, FullReadsPreserveCompactAndGroupedValues) {
+  PrivateDisk disk;
+  std::map<std::string, std::map<std::string, std::string>> hashes;
+  for (const unsigned count : {10u, 256u}) {
+    auto& fields = hashes["hash-" + std::to_string(count)];
+    fields[""] = "";
+    fields[std::string("binary\0field", 12)] = std::string("v\0x", 3);
+    fields[std::string(80, 'f')] = std::string(128, 'l');
+    for (unsigned i = 0; i < count; ++i)
+      fields["field" + std::to_string(i)] = std::string(128, 'a' + i % 26);
+  }
+  auto check_reads = [&](Client& client) {
+    for (const auto& [key, fields] : hashes) {
+      // Alternating full reads must not consume persistent/staged data. The
+      // returned strings survive destruction of each private decoded snapshot.
+      for (unsigned repeat = 0; repeat < 3; ++repeat) {
+        const auto all = client.Command({"HGETALL", key});
+        ASSERT_EQ(all.kind_, '*');
+        ASSERT_EQ(all.items_.size(), fields.size() * 2);
+        std::map<std::string, std::string> actual;
+        for (std::size_t i = 0; i < all.items_.size(); i += 2)
+          actual.emplace(all.items_[i].text_, all.items_[i + 1].text_);
+        EXPECT_EQ(actual, fields);
+        const auto keys = client.Command({"HKEYS", key});
+        const auto values = client.Command({"HVALS", key});
+        ASSERT_EQ(keys.items_.size(), fields.size());
+        ASSERT_EQ(values.items_.size(), fields.size());
+        std::set<std::string> actual_keys, expected_keys;
+        std::multiset<std::string> actual_values, expected_values;
+        for (const auto& item : keys.items_) actual_keys.insert(item.text_);
+        for (const auto& item : values.items_) actual_values.insert(item.text_);
+        for (const auto& [field, value] : fields) {
+          expected_keys.insert(field);
+          expected_values.insert(value);
+        }
+        EXPECT_EQ(actual_keys, expected_keys);
+        EXPECT_EQ(actual_values, expected_values);
+      }
+      EXPECT_EQ(client.Command({"HLEN", key}).text_,
+                std::to_string(fields.size()));
+    }
+  };
+  {
+    Server server(disk, 3);
+    Client client(server.port()), watcher(server.port());
+    ASSERT_EQ(client.Command({"SET", "string", "unchanged"}).text_, "OK");
+    for (const auto& [key, fields] : hashes) {
+      std::vector<std::string> args{"HSET", key};
+      for (const auto& [field, value] : fields) {
+        args.push_back(field);
+        args.push_back(value);
+      }
+      ASSERT_EQ(client.Command(args).text_, std::to_string(fields.size()));
+      ASSERT_EQ(watcher.Command({"WATCH", key}).text_, "OK");
+    }
+    check_reads(client);
+    ASSERT_EQ(watcher.Command({"MULTI"}).text_, "OK");
+    for (const auto& [key, fields] : hashes) {
+      ASSERT_EQ(watcher.Command({"HGETALL", key}).text_, "QUEUED");
+      ASSERT_EQ(watcher.Command({"HKEYS", key}).text_, "QUEUED");
+      ASSERT_EQ(watcher.Command({"HVALS", key}).text_, "QUEUED");
+    }
+    const auto replies = watcher.Command({"EXEC"});
+    ASSERT_EQ(replies.items_.size(), hashes.size() * 3);
+    std::size_t position = 0;
+    for (const auto& [key, fields] : hashes) {
+      EXPECT_EQ(replies.items_[position++].items_.size(), fields.size() * 2);
+      EXPECT_EQ(replies.items_[position++].items_.size(), fields.size());
+      EXPECT_EQ(replies.items_[position++].items_.size(), fields.size());
+    }
+    EXPECT_EQ(client.Command({"GET", "string"}).text_, "unchanged");
+    for (const auto* command : {"HGETALL", "HKEYS", "HVALS"}) {
+      EXPECT_TRUE(client.Command({command, "missing"}).items_.empty());
+      EXPECT_TRUE(client.Command({command, "string"})
+                      .text_.starts_with("WRONGTYPE"));
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // Cold recovery and a different worker layout exercise disk-backed reads,
+  // not just the append buffers observed immediately after HSET.
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  check_reads(client);
+  EXPECT_EQ(client.Command({"GET", "string"}).text_, "unchanged");
+}
+
 TEST(HashReplaceE2e, WatchExecAndLua) {
   PrivateDisk disk;
   Server server(disk);

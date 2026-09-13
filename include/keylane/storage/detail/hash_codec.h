@@ -22,6 +22,34 @@ struct HashValue {
   std::vector<HashEntry> entries_;
 };
 
+struct HashEntryView {
+  std::string_view field_;
+  std::string_view value_;
+};
+
+// Checked, allocation-free traversal of the compact encoding. The payload
+// must remain alive and unchanged while the reader or returned views are used.
+// Open validates the header; callers must consume size() successful Next calls
+// to validate every entry and reject trailing bytes. Copying a reader preserves
+// its position, allowing admission to precede construction of an owned result.
+// Like the owned decoder, it bounds individual fields/values, not aggregate
+// logical bytes; storage callers enforce their physical and memory envelopes.
+class HashValueReader {
+ public:
+  static absl::StatusOr<HashValueReader> Open(std::string_view payload);
+  std::size_t size() const { return size_; }
+  // Failure does not advance the reader. Calling past the last entry fails.
+  absl::StatusOr<HashEntryView> Next();
+
+ private:
+  HashValueReader(std::string_view payload, std::size_t count)
+      : payload_(payload), size_(count), remaining_(count) {}
+  std::string_view payload_;
+  std::size_t size_;
+  std::size_t remaining_;
+  std::size_t offset_ = kHashValueHeaderBytes;
+};
+
 // The compact encoding contains complete field/value pairs, never a mutation
 // log or a process-local digest. Fixed-width header fields and entry lengths
 // are little-endian; decoding reconstructs lookup digests.
