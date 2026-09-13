@@ -271,6 +271,14 @@ bool V1SlotMapMatches(const MetaStores& stores,
   return matches;
 }
 
+std::vector<std::string> V1DataEndpoints(
+    const ClusterCreateManifestV1::DataNode& node) {
+  std::vector<std::string> endpoints;
+  if (!node.client_endpoint_.empty()) endpoints.push_back(node.client_endpoint_);
+  if (!node.tls_endpoint_.empty()) endpoints.push_back(node.tls_endpoint_);
+  return endpoints;
+}
+
 absl::Status ValidateV1Nodes(const MetaStores& stores,
                              const ClusterCreateManifestV1& manifest,
                              bool require_all) {
@@ -279,8 +287,7 @@ absl::Status ValidateV1Nodes(const MetaStores& stores,
     if (declaration == nullptr || node.retired_ ||
         node.principal_ != absl::StrCat("keylane://node/", node.node_id_) ||
         node.role_ != DeclaredRole(manifest, node.node_id_) ||
-        node.endpoints_ !=
-            std::vector<std::string>{declaration->client_endpoint_}) {
+        node.endpoints_ != V1DataEndpoints(*declaration)) {
       return absl::FailedPreconditionError(absl::StrCat(
           "creation node differs from intent: node=", node.node_id_));
     }
@@ -780,7 +787,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
         command.node_id_ = node.node_id_;
         command.principal_ = absl::StrCat("keylane://node/", node.node_id_);
         command.role_ = DeclaredRole(*manifest, node.node_id_);
-        command.endpoints_ = {node.client_endpoint_};
+        command.endpoints_ = V1DataEndpoints(node);
         return Emit(std::move(command));
       }
     }

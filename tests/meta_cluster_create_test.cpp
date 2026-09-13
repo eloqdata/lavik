@@ -434,6 +434,84 @@ TEST(ClusterCreateProtocolTest, RoundTripsOnlyCanonicalV1Requests) {
       DecodeClusterCreateRequest("clustercreate 2 00", &decoded_root).ok());
 }
 
+TEST(ClusterCreateManifestTest, RoundTripsDualAndTlsOnlyListeners) {
+  for (const std::string host : {"127.0.0.1", "[::1]"}) {
+    for (const bool tls_only : {false, true}) {
+      const std::string tcp = "tcp://" + host + ":6379";
+      const std::string tls = "tls://" + host + ":16379";
+      const std::string declaration =
+          (tls_only ? "" : "client_endpoint = \"" + tcp + "\"\n") +
+          "tls_endpoint = \"" + tls + "\"";
+      auto manifest = ParseClusterCreateManifest(ReplaceOnce(
+          std::string(kValidManifest),
+          "client_endpoint = \"tcp://127.0.0.1:6379\"", declaration));
+      ASSERT_TRUE(manifest.ok()) << manifest.status();
+      EXPECT_EQ(manifest->data_nodes_[0].client_endpoint_, tls_only ? "" : tcp);
+      EXPECT_EQ(manifest->data_nodes_[0].tls_endpoint_, tls);
+      auto request = EncodeClusterCreateRequest(*manifest, OperationId(7));
+      ASSERT_TRUE(request.ok()) << request.status();
+      EXPECT_TRUE(request->starts_with("clustercreate 1 0004"));
+      MetaOperationId root{};
+      auto decoded = DecodeClusterCreateRequest(*request, &root);
+      ASSERT_TRUE(decoded.ok()) << decoded.status();
+      EXPECT_EQ(*decoded, *manifest);
+      EXPECT_EQ(root, OperationId(7));
+    }
+  }
+}
+
+TEST(ClusterCreateManifestTest, RejectsInvalidOrConflictingTlsListeners) {
+  for (const std::string tls : {
+           "", "tcp://127.0.0.1:16379", "tls://localhost:16379",
+           "tls://127.0.0.1:0", "tls://127.0.0.1:65536",
+           "tls://127.0.0.1:016379", "tls://127.0.0.2:16379",
+           "tls://127.0.0.1:6379", "tls://127.0.0.1:6380"}) {
+    SCOPED_TRACE(tls);
+    EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
+        std::string(kValidManifest),
+        "client_endpoint = \"tcp://127.0.0.1:6379\"",
+        "client_endpoint = \"tcp://127.0.0.1:6379\"\ntls_endpoint = \"" +
+            tls + "\""))
+                     .ok());
+  }
+  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
+      std::string(kValidManifest),
+      "client_endpoint = \"tcp://127.0.0.1:6379\"",
+      "tls_endpoint = \"tls://127.0.0.1:16379\"\n"
+      "tls_endpoint = \"tls://127.0.0.1:16380\""))
+                   .ok());
+  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
+      std::string(kValidManifest),
+      "client_endpoint = \"tcp://127.0.0.1:6379\"", ""))
+                   .ok());
+}
+
+TEST(ClusterCreateProtocolTest, ReadsPersistedV3IntentWithoutTlsEndpoints) {
+  // Frozen pre-TLS intent: decoding must not reinterpret its Group count as
+  // a TLS string length or prevent a stored Genesis from being recovered.
+  constexpr std::string_view request =
+      "clustercreate 1 "
+      "0003070707070707070707070707070707070000000100000001000000147463703a2f2f"
+      "3132372e302e302e313a37313031000000147463703a2f2f3132372e302e302e313a3733"
+      "3031000000147463703a2f2f3132372e302e302e313a3732303100000000000100000028"
+      "303132333435363738396162636465663031323334353637383961626364656630313233"
+      "34353637000000147463703a2f2f3132372e302e302e313a363337390000000100000006"
+      "6c6567616379000000283031323334353637383961626364656630313233343536373839"
+      "6162636465663031323334353637000000000000000100003fff000000066c6567616379";
+  MetaOperationId root{};
+  auto decoded = DecodeClusterCreateRequest(request, &root);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(root, OperationId(7));
+  ASSERT_EQ(decoded->data_nodes_.size(), 1U);
+  EXPECT_EQ(decoded->data_nodes_[0].node_id_, kNodeA);
+  EXPECT_EQ(decoded->data_nodes_[0].client_endpoint_, "tcp://127.0.0.1:6379");
+  EXPECT_TRUE(decoded->data_nodes_[0].tls_endpoint_.empty());
+  ASSERT_EQ(decoded->groups_.size(), 1U);
+  EXPECT_EQ(decoded->groups_[0].group_id_, "legacy");
+  EXPECT_EQ(decoded->slot_ranges_,
+            (std::vector<ClusterCreateManifestV1::SlotRange>{{0, 16383, "legacy"}}));
+}
+
 TEST(ClusterCreateProtocolTest, DecodesGenesisOutcome) {
   auto outcome = DecodeClusterCreateReply(
       "OK clustercreate 1 25 00112233445566778899aabbccddeeff");

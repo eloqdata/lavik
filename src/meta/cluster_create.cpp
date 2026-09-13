@@ -28,10 +28,10 @@ constexpr std::size_t kMaxManifestBytes = 64 * 1024;
 constexpr std::size_t kMaxAdminCommandBytes = 64 * 1024;
 constexpr std::size_t kMaxWireString = 64 * 1024;
 // Version 1 encoded one scalar Meta id; version 2 carried a server wait budget.
-// There is deliberately no migration: Genesis identity and acceptance are
-// safety-critical, so the current development format requires the complete
-// Meta descriptor set and caller-generated root id.
-constexpr std::uint16_t kWireVersion = 3;
+// Version 3 added the caller-generated root id; keep decoding it so persisted
+// creation operations can recover. Version 4 adds each Data TLS endpoint.
+// Versions 1/2 lack the atomic Genesis contract and remain unsupported.
+constexpr std::uint16_t kWireVersion = 4;
 constexpr std::uint32_t kMaxManifestItems = 16'384;
 
 absl::Status Invalid(std::string message) {
@@ -84,10 +84,10 @@ absl::StatusOr<std::vector<std::string>> ParseStringList(
   return values;
 }
 
-bool CanonicalEndpoint(std::string_view value) {
-  constexpr std::string_view kTcpPrefix = "tcp://";
-  if (!value.starts_with(kTcpPrefix)) return false;
-  value.remove_prefix(kTcpPrefix.size());
+bool CanonicalEndpoint(std::string_view value,
+                       std::string_view prefix = "tcp://") {
+  if (!value.starts_with(prefix)) return false;
+  value.remove_prefix(prefix.size());
   const auto endpoint = ParseNumericEndpoint(value);
   return endpoint.has_value() && FormatNumericEndpoint(*endpoint) == value;
 }
@@ -148,15 +148,35 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
     if (!IsCanonicalNodeId(node.node_id_)) {
       return Invalid("Data node id must be 40 lowercase hexadecimal bytes");
     }
-    if (!CanonicalEndpoint(node.client_endpoint_)) {
+    if (node.client_endpoint_.empty() && node.tls_endpoint_.empty()) {
+      return Invalid("Data node requires a client_endpoint or tls_endpoint");
+    }
+    if (!node.client_endpoint_.empty() &&
+        !CanonicalEndpoint(node.client_endpoint_)) {
       return Invalid(
           "client endpoint must be a canonical numeric tcp:// endpoint");
+    }
+    if (!node.tls_endpoint_.empty() &&
+        !CanonicalEndpoint(node.tls_endpoint_, "tls://")) {
+      return Invalid(
+          "TLS endpoint must be a canonical numeric tls:// endpoint");
+    }
+    if (!node.client_endpoint_.empty() && !node.tls_endpoint_.empty() &&
+        ParseNumericEndpoint(std::string_view(node.client_endpoint_).substr(6))
+                ->host_ !=
+            ParseNumericEndpoint(std::string_view(node.tls_endpoint_).substr(6))
+                ->host_) {
+      return Invalid("Data TCP and TLS endpoints must use the same host");
     }
     if (!node_ids.insert(node.node_id_).second) {
       return Invalid("duplicate Data node id");
     }
-    if (!endpoints.insert(node.client_endpoint_).second) {
-      return Invalid("duplicate Data client endpoint");
+    // A listener cannot serve two nodes or both transports. Compare socket
+    // addresses without the scheme so conflicts fail before Genesis commits.
+    for (const auto* endpoint : {&node.client_endpoint_, &node.tls_endpoint_}) {
+      if (!endpoint->empty() && !endpoints.insert(endpoint->substr(6)).second) {
+        return Invalid("duplicate Data listener endpoint");
+      }
     }
   }
 
@@ -449,8 +469,12 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
         }
         break;
       case Section::kData:
-        if (section_fields != std::set<std::string>{"client_endpoint", "id"})
-          return Invalid("data_nodes requires exactly id and client_endpoint");
+        if (!section_fields.contains("id") ||
+            (!section_fields.contains("client_endpoint") &&
+             !section_fields.contains("tls_endpoint"))) {
+          return Invalid(
+              "data_nodes requires id and client_endpoint or tls_endpoint");
+        }
         break;
       case Section::kGroup:
         if (!section_fields.contains("id") ||
@@ -558,6 +582,10 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
           auto value = ParseString(item);
           if (!value.ok()) return value.status();
           result.data_nodes_.back().client_endpoint_ = std::move(*value);
+        } else if (item.name == "tls_endpoint") {
+          auto value = ParseString(item);
+          if (!value.ok()) return value.status();
+          result.data_nodes_.back().tls_endpoint_ = std::move(*value);
         } else {
           return Invalid("unknown data_nodes field");
         }
@@ -657,6 +685,8 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
     if (absl::Status status = writer.String(node.client_endpoint_);
         !status.ok())
       return status;
+    if (absl::Status status = writer.String(node.tls_endpoint_); !status.ok())
+      return status;
   }
   writer.U32(static_cast<std::uint32_t>(manifest.groups_.size()));
   for (const auto& group : manifest.groups_) {
@@ -698,7 +728,7 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
   Reader reader(*bytes);
   auto version = reader.U16();
   if (!version.ok()) return version.status();
-  if (*version != kWireVersion)
+  if (*version != 3 && *version != kWireVersion)
     return Invalid("unsupported clustercreate version");
   auto root = reader.Raw(root_operation_id->size());
   if (!root.ok()) return root.status();
@@ -746,6 +776,11 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
     auto endpoint = reader.String();
     if (!endpoint.ok()) return endpoint.status();
     node.client_endpoint_ = std::move(*endpoint);
+    if (*version >= 4) {
+      auto tls_endpoint = reader.String();
+      if (!tls_endpoint.ok()) return tls_endpoint.status();
+      node.tls_endpoint_ = std::move(*tls_endpoint);
+    }
     manifest.data_nodes_.push_back(std::move(node));
   }
 

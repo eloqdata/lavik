@@ -426,7 +426,12 @@ int RunClusterCreate(const Options& options) {
             << '\n';
   for (const auto& node : manifest->data_nodes_) {
     std::cout << "  Data node: " << node.node_id_ << " @ "
-              << node.client_endpoint_ << '\n';
+              << node.client_endpoint_;
+    if (!node.tls_endpoint_.empty()) {
+      if (!node.client_endpoint_.empty()) std::cout << ", ";
+      std::cout << node.tls_endpoint_;
+    }
+    std::cout << '\n';
   }
   for (const auto& group : manifest->groups_) {
     std::cout << "  Group: " << group.group_id_

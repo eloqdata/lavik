@@ -723,11 +723,17 @@ errors, includes a status explanation and an operator next action.
 `keylane-ctl cluster-create` reuses the same private leader discovery and
 status-capture seam and accepts only manifest schema v1. A manifest names the
 complete initial Meta vector—id plus canonical numeric Raft, Data-control, and
-Admin endpoints—one or more canonical Data identities and numeric client
-endpoints, and one or more Groups with exactly one primary and optional
-replicas. Meta entries are sorted by id, all are voters, each endpoint class is
-unique, and the principal derives as `keylane://meta/<id>`. Slots are either
-generated with `contiguous-even` after sorting Group ids or supplied as a
+Admin endpoints—one or more canonical Data identities with advertised
+`client_endpoint` (`tcp://`) and/or `tls_endpoint` (`tls://`), and one or more
+Groups with exactly one primary and optional replicas. Every Data node has
+at least one numeric listener; dual listeners share a host and use distinct
+ports, and no two declarations share a Data socket address. Registration
+preserves the transport tags through the durable identity store and projection
+into separate TCP/TLS ports. TLS replication selects the advertised TLS port
+without falling back to plaintext; credentials and listener configuration
+remain process-local. Meta entries are sorted by id, all are voters, each
+endpoint class is unique, and the principal derives as `keylane://meta/<id>`.
+Slots are either generated with `contiguous-even` after sorting Group ids or supplied as a
 complete, non-overlapping `0..16383` range table. All
 declared Data belongs to exactly one Group and every Group owns at least one
 slot. The parser rejects unknown TOML structure and files over 64 KiB, then
@@ -735,7 +741,11 @@ sorts nodes, Groups, replicas and ranges and merges adjacent ranges belonging
 to the same Group. The CLI renders that canonical plan and requires exact
 lowercase `yes` unless `--yes` is present. Only this normalized multi-Group
 and multi-Meta shape is accepted under version 1; the earlier scalar-Meta
-payload has no compatibility decoder.
+payload has no compatibility decoder. The request and persisted intent use
+binary version 4, which carries both Data endpoint fields. Readers also accept
+version 3 intents, whose Data endpoints are TCP-only, so existing creation
+operations survive recovery. Versions 1 and 2 lack the atomic Genesis contract
+and remain unsupported.
 
 After an `Uninitialized` and pristine client check, the CLI generates a root
 operation id and sends one `clustercreate 1` request to the discovered leader.

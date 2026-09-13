@@ -1,8 +1,8 @@
 #pragma once
 
 // Raft-free manifest model for declarative cluster creation and the immutable
-// genesis Meta cohort. Local bind/storage/TLS configuration deliberately
-// stays outside this interface: the manifest describes only durable cluster
+// genesis Meta cohort. Local binds, storage configuration, and TLS credentials
+// stay outside this interface: the manifest describes only durable cluster
 // identity and advertised topology.
 
 #include <cstdint>
@@ -29,7 +29,10 @@ struct ClusterCreateManifestV1 {
 
   struct DataNode {
     std::string node_id_;
+    // At least one advertised listener is required. Both transports share
+    // one host in the Data topology, but have distinct, explicit ports.
     std::string client_endpoint_;
+    std::string tls_endpoint_;
     bool operator==(const DataNode&) const = default;
   };
 
@@ -79,7 +82,8 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
     const MetaOperationId& root_operation_id);
 
 // Strictly decodes the versioned binary request and returns the root id
-// separately from the normalized durable manifest.
+// separately from the normalized durable manifest. Version 3 intents remain
+// readable for recovery; version 4 also carries advertised Data TLS endpoints.
 absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
     std::string_view request, MetaOperationId* root_operation_id);
 
