@@ -69,7 +69,7 @@ operator --> keylane-ctl cluster-status
 | Storage and recovery | Own logical indexes and physical blocks, execute reads and appends, recover durable state, and reclaim obsolete data | `storage::StorageEngine` |
 | Function catalog | Stage one complete process-global Function definition set on every worker, commit its existing `FUNCTION DUMP` encoding, swap runtimes, and recover it before service readiness | `FunctionCatalog` |
 | Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
-| Cluster data plane | Admit, redirect, or refuse requests by slot ownership and finite authority; install static or Meta control; serve Redis Cluster discovery | `cluster::AuthorityGuard::CaptureAndAdmit` / `RegisterAndRecheck`, `cluster::TopologyCache`, `cluster::NodeControlInstaller`, `cluster::MetaControlClientService` |
+| Cluster data plane | Admit, redirect, or refuse requests by Meta-projected slot ownership and finite authority; serve Redis Cluster discovery | `cluster::AuthorityGuard::CaptureAndAdmit` / `RegisterAndRecheck`, `cluster::TopologyCache`, `cluster::NodeControlInstaller`, `cluster::MetaControlClientService` |
 | Meta control plane | Replicate metadata commands, project node-specific desired state, publish leader-scoped Data sessions, admit fresh observations, and expose authenticated administration plus stable cluster readiness | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer`, `meta::ClusterOperator` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
@@ -80,8 +80,8 @@ operator --> keylane-ctl cluster-status
 2. `RunServer` initializes the memory budget, signal handling, storage engine,
    replication manager, cluster topology/authority/node-controller runtime,
    command/storage bindings, metrics shards, transaction runtime, and Celer
-   service graph. Meta mode starts the outbound control client fenced; static
-   mode synchronously installs its configured topology.
+   service graph. Cluster mode always starts the outbound Meta control client
+   fenced; no topology or positive authority is restored locally.
 3. On every worker, `RedisService::Run` binds the memory and transaction shards
    and awaits `StorageEngine::InitializeWorker`. Recovery barriers ensure all
    workers finish recovery and allocator cleanup before the process becomes

@@ -1042,9 +1042,8 @@ class EmptyPopulationService final : public celer::Service {
 class StandaloneIdentityService final : public celer::Service {
  public:
   StandaloneIdentityService(keylane::ReplicationManager* first,
-                            keylane::ReplicationManager* second,
-                            keylane::ReplicationManager* static_cluster)
-      : first_(first), second_(second), static_cluster_(static_cluster) {}
+                            keylane::ReplicationManager* second)
+      : first_(first), second_(second) {}
 
   void Prepare(unsigned) override {}
 
@@ -1056,10 +1055,6 @@ class StandaloneIdentityService final : public celer::Service {
       result_ = co_await CheckLightweightQueries(
           *second_, keylane::ReplicaOfConfig{"127.0.0.1", 1},
           "configured standalone replica");
-    }
-    if (result_.ok()) {
-      result_ = co_await CheckLightweightQueries(*static_cluster_, std::nullopt,
-                                                 "static cluster primary");
     }
     if (!result_.ok()) {
       worker.RequestStop();
@@ -1079,93 +1074,6 @@ class StandaloneIdentityService final : public celer::Service {
         second_population.local_node_id_ != second_status.local_node_id_) {
       result_ = TestFailure(
           "default replication node identities were not unique canonical ids");
-      worker.RequestStop();
-      co_return result_;
-    }
-
-    const keylane::ReplicationStatus static_status =
-        co_await static_cluster_->Observe();
-    if (static_status.role_ != keylane::ReplicationRole::kMaster ||
-        static_status.upstream_.has_value() || static_cluster_->is_loading() ||
-        static_cluster_->reject_writes()) {
-      result_ = TestFailure(
-          "static cluster policy did not ignore a standalone initial "
-          "upstream while preserving storage-based readiness");
-      worker.RequestStop();
-      co_return result_;
-    }
-    keylane::ReplicationDirective set_upstream{
-        .kind_ = keylane::ReplicationDirective::Kind::kSetUpstream,
-        .upstream_ = keylane::ReplicaOfConfig{"127.0.0.1", 1},
-    };
-    result_ = co_await static_cluster_->ApplyDirective(set_upstream);
-    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
-      result_ = TestFailure(
-          "static cluster manager accepted a standalone upstream directive");
-      worker.RequestStop();
-      co_return result_;
-    }
-    set_upstream.kind_ = keylane::ReplicationDirective::Kind::kAddUpstream;
-    result_ = co_await static_cluster_->ApplyDirective(set_upstream);
-    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
-      result_ = TestFailure(
-          "static cluster manager accepted an added standalone upstream");
-      worker.RequestStop();
-      co_return result_;
-    }
-    auto manifest = keylane::PopulationManifest::Create({{0, 1}});
-    if (!manifest.ok()) {
-      result_ = manifest.status();
-      worker.RequestStop();
-      co_return result_;
-    }
-    const keylane::ClusterPopulationStatus static_population =
-        co_await static_cluster_->cluster_population_status();
-    auto rebuild = co_await static_cluster_->StartClusterRebuildDirective(
-        keylane::ReplicaOfConfig{"127.0.0.1", 1},
-        TargetDirective(static_population, *manifest), *manifest);
-    if (rebuild.status().code() != absl::StatusCode::kFailedPrecondition) {
-      result_ = TestFailure(
-          "static cluster manager accepted a Meta population rebuild");
-      worker.RequestStop();
-      co_return result_;
-    }
-    keylane::ClusterPromotionPrepareDirective promotion{
-        .identity_ = TargetDirective(static_population, *manifest).identity_,
-        .parent_history_id_ = std::string(40, 'a'),
-        .required_applied_next_lsns_ = {1},
-        .excluded_group_term_ = 1,
-    };
-    promotion.old_authority_exclusion_hash_.fill(1);
-    auto promotion_started =
-        co_await static_cluster_->StartClusterPromotionPrepareDirective(
-            std::move(promotion));
-    if (promotion_started.status().code() !=
-        absl::StatusCode::kFailedPrecondition) {
-      result_ = TestFailure(
-          "static cluster manager accepted a Meta promotion prepare");
-      worker.RequestStop();
-      co_return result_;
-    }
-    result_ =
-        co_await static_cluster_->ReconcileClusterPopulation(std::nullopt);
-    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
-      result_ =
-          TestFailure("static cluster manager accepted FDS reconciliation");
-      worker.RequestStop();
-      co_return result_;
-    }
-    result_ = co_await static_cluster_->CancelInProgressClusterPopulation();
-    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
-      result_ = TestFailure(
-          "static cluster manager accepted control-loss cancellation");
-      worker.RequestStop();
-      co_return result_;
-    }
-    result_ = co_await static_cluster_->CancelClusterRebuildForShutdown();
-    if (result_.code() != absl::StatusCode::kFailedPrecondition) {
-      result_ = TestFailure(
-          "static cluster manager accepted Meta population shutdown");
       worker.RequestStop();
       co_return result_;
     }
@@ -1197,7 +1105,6 @@ class StandaloneIdentityService final : public celer::Service {
  private:
   keylane::ReplicationManager* first_ = nullptr;
   keylane::ReplicationManager* second_ = nullptr;
-  keylane::ReplicationManager* static_cluster_ = nullptr;
   absl::Status result_ = absl::OkStatus();
 };
 
@@ -1327,7 +1234,7 @@ TEST(ReplicationManagerIntegrationTest,
   keylane::storage::StorageEngine storage(std::move(storage_options));
   ASSERT_TRUE(storage.Prepare(2).ok());
   keylane::ReplicationOptions options;
-  options.cluster_population_managed_ = true;
+  options.cluster_enabled_ = true;
   keylane::ReplicationManager replication(&storage, options, std::nullopt);
   CrossWorkerControlService service(replication);
   celer::Server server;
@@ -1617,7 +1524,6 @@ void RunPromotionPrepareCase(std::string_view fault_stage) {
 
   keylane::ReplicationOptions replication_options;
   replication_options.cluster_enabled_ = true;
-  replication_options.cluster_population_managed_ = true;
   replication_options.node_id_override_ = std::string(40, '9');
   keylane::ReplicationManager replication(&storage,
                                           std::move(replication_options),
@@ -1667,7 +1573,6 @@ TEST(ReplicationManagerIntegrationTest,
 
   keylane::ReplicationOptions replication_options;
   replication_options.cluster_enabled_ = true;
-  replication_options.cluster_population_managed_ = true;
   replication_options.node_id_override_ = expected_node_id;
   replication_options.listen_port_ = kReplicationPort;
   keylane::ReplicationManager replication(
@@ -1708,7 +1613,6 @@ TEST(ReplicationManagerIntegrationTest,
 
   keylane::ReplicationOptions replication_options;
   replication_options.cluster_enabled_ = true;
-  replication_options.cluster_population_managed_ = true;
   replication_options.node_id_override_ = expected_node_id;
   keylane::ReplicationManager replication(
       &storage, std::move(replication_options), std::nullopt);
@@ -1752,7 +1656,6 @@ TEST(ReplicationManagerIntegrationTest,
 
   keylane::ReplicationOptions replication_options;
   replication_options.cluster_enabled_ = true;
-  replication_options.cluster_population_managed_ = true;
   replication_options.node_id_override_ = expected_node_id;
   keylane::ReplicationManager replication(
       &storage, std::move(replication_options), std::nullopt);
@@ -1798,7 +1701,6 @@ void RunRecoverableEmptyPopulationFault(const char* environment_name,
 
   keylane::ReplicationOptions replication_options;
   replication_options.cluster_enabled_ = true;
-  replication_options.cluster_population_managed_ = true;
   replication_options.node_id_override_ = expected_node_id;
   keylane::ReplicationManager replication(
       &storage, std::move(replication_options), std::nullopt);
@@ -1849,12 +1751,7 @@ TEST(ReplicationManagerIntegrationTest,
                                     std::nullopt);
   keylane::ReplicationManager second(&storage, keylane::ReplicationOptions{},
                                      keylane::ReplicaOfConfig{"127.0.0.1", 1});
-  keylane::ReplicationOptions static_options;
-  static_options.cluster_enabled_ = true;
-  keylane::ReplicationManager static_cluster(
-      &storage, std::move(static_options),
-      keylane::ReplicaOfConfig{"127.0.0.1", 1});
-  StandaloneIdentityService service(&first, &second, &static_cluster);
+  StandaloneIdentityService service(&first, &second);
   celer::Server server;
   server.AddService(&service);
   celer::ServerOptions runtime;

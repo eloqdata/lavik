@@ -34,6 +34,10 @@ KFT1 or the scenario interface.
   waits, retained failure artifacts, and loopback port reservations. Real
   process tests use this support; a restart is a new `ChildProcess` using the
   same fixture configuration.
+- `test_topology_installer.h` is an in-process-only adapter for programmatic
+  `ServingState` values. It installs them through the real FDS projection seam
+  and grants only finite, session-scoped leases; production targets do not
+  compile or link it.
 
 KFT1 has two declared modes. `exact-model` is byte-for-byte replayable and is
 appropriate for checked-in regression inputs. `process-action-script` records
@@ -68,11 +72,10 @@ Runtime reset still spans all 16,384 physical partitions; an authorized source
 scans baseline data only for manifest members and sends empty handoffs for
 non-members.
 The Function-catalog row proves completion at the current native cut and uses
-the durable catalog generation installed by storage. Meta-managed population
-readiness is boot-scoped, so every restarted Meta-managed process begins
-`NOT_READY`. Static-file readiness follows storage recovery and can reuse a
-fully promoted population; a durable incomplete-full-sync fence still prevents
-that population from being exposed.
+the durable catalog generation installed by storage. Cluster population
+readiness is boot-scoped, so every restarted process begins `NOT_READY`; a
+durable incomplete-full-sync fence also prevents a mixed population from being
+exposed before a fresh full sync.
 
 | Safety claim | Stable invariant | Fast model coverage |
 |---|---|---|
@@ -112,16 +115,16 @@ all-flow cuts, ready/fail-stop publication, proof invalidation, and a fresh
 `NOT_READY` group after API reconstruction at each rebuild boundary.
 `rebuild_protocol_integration_test.cpp` also kills a real target after an
 acknowledged partial handoff, proves recovery rejects the mixed SSD population,
-performs a fresh full sync, and proves the static adapter can recover the fully
-promoted population while retaining the durable incomplete-sync fence. The
+performs a fresh full sync, and proves the completed population becomes visible
+while retaining the durable incomplete-sync fence. The
 production manager consumes that API through `NodeControlInstaller`; the Meta
 integration suites cover authenticated transport, lease, projection, and
 directive delivery, while the native manager suite covers the real storage
 transition.
 `replication_manager_integration_test.cpp` calls that manager seam directly in
 a real single-worker storage/runtime service. A stalling loopback native peer
-keeps attempts deterministic while the test proves that cluster startup ignores
-a standalone initial upstream, plus validation, REBUILDING status, exact and
+keeps attempts deterministic while the test proves validation, REBUILDING
+status, exact and
 endpoint-conflicting replay, monotonic whole-session supersession, cold-source
 rejection, and idempotent empty revocation without adding a test-only control
 protocol. `source_authorization_test.cpp` separately proves same-revision

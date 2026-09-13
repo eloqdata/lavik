@@ -126,7 +126,7 @@ redirects, capture, and response I/O.
 ## Create the first multi-Group cluster
 
 `keylane-ctl cluster-create` is the v1 topology-creation path for a fresh
-statically bootstrapped Meta cluster and one or more preconfigured Data
+manifest-bootstrapped Meta cluster and one or more preconfigured Data
 processes. It is not an import, expansion, or retry-existing command. One Meta
 Raft cluster permanently owns at most one logical Data cluster. Only lifecycle
 `uninitialized` accepts creation, and the environment must also contain no
@@ -157,6 +157,26 @@ keylane --cluster-enabled \
   --cluster-announce-ip 127.0.0.1 --port 6371 \
   --data-file /var/lib/keylane/data-primary-1/keylane.data
 ```
+
+### Migrate from the retired static Cluster configuration
+
+`cluster-static-nodes-file` and Redis `nodes.conf` topology are no longer a
+production control mode. To move an installation to the supported flow:
+
+1. Remove `cluster-static-nodes-file` from the Redis-style configuration (or
+   remove the equivalent CLI argument).
+2. Give every Data process its final `cluster-node-id` and at least one numeric
+   `cluster-meta-seed`.
+3. Start the manifest-bootstrapped Meta members and the configured Data
+   processes. Data remains fail closed until Cluster Create publishes its
+   topology and finite authority leases.
+4. Run `keylane-ctl cluster-create --manifest <path>` and follow
+   `cluster-status` until the new cluster is ready.
+
+This is a new, destructive Cluster Create workflow, not an in-place takeover.
+Existing static-cluster data and `nodes.conf` assignments are not imported or
+automatically adopted. Preserve the old media until a separately planned data
+migration has been completed and verified.
 
 Data reports LOADING while its unregistered control connection retries. Run
 the same release on Meta, Data and the CLI. Version 1 names the current
@@ -535,7 +555,7 @@ keylane-meta \
 ```
 
 Start every initial member with the equivalent member-specific certificate
-and the same manifest. The first election authenticates the complete static
+and the same manifest. The first election authenticates the complete manifest
 peer set; it does not join members sequentially. Omit the manifest from every
 later restart. A future dynamic joiner starts with mTLS but without a manifest,
 then enters through `addsrv` with all three endpoints.
@@ -554,8 +574,8 @@ worker or make WAL synchronization asynchronous.
 ## Configure Data nodes
 
 A Meta-managed Data process needs its committed 40-character lowercase hex
-node id and one or more numeric Data-control seeds. Static topology and Meta
-control are mutually exclusive. Before starting a new Data process, register
+node id and one or more numeric Data-control seeds. It is the only production
+Cluster control mode. Before starting a new Data process, register
 that identity and its client endpoint on the Meta leader. The endpoint is
 tagged `tcp://` or `tls://`; a dual-listener node may supply one of each, using
 the same numeric host:

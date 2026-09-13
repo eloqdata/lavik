@@ -152,24 +152,18 @@ acquire them.
 seeds selects the fail-closed population mode for a process that may own at
 most one replication group. The manager starts in `connecting`, ordinary reads
 and writes return LOADING, and storage starts without expiration authority.
-All cluster modes reject startup `replicaof`, `redis-replicaof`, and `load-rdb`;
+Cluster mode rejects startup `replicaof`, `redis-replicaof`, and `load-rdb`;
 runtime `REPLICAOF`/`SLAVEOF` (including `NO ONE`) and `ADDREPLICAOF` are also
 rejected, as are unauthenticated native and Redis replication exports. These
 restrictions prevent standalone role control or imported data from being
 mistaken for an authorized cluster population.
 
-The static `nodes.conf` adapter is not Meta-managed population mode. Its file
-is permanent local grant authority and its readiness follows storage recovery.
-After a complete promotion, a static process may therefore expose the durable
-population on restart. An incomplete destructive full sync remains fenced
-because that replacement-in-progress marker is itself durable.
-
-In Meta-managed mode the configured stable data-node identity is also the
+The configured stable data-node identity is also the
 ReplicationManager's local node identity. Status, the boot-scoped
 `ReplicationGroup`, and every native handshake therefore name the same node;
 boot and history identities remain freshly generated process incarnations.
-Standalone and static-file modes generate the local replication node identity
-at process start instead.
+Standalone mode generates the local replication node identity at process
+start instead.
 
 `ReplicationManager` exposes a callable boundary to the Data-side node
 controller: `cluster_population_status()` reports the local node/boot and the
@@ -373,8 +367,7 @@ returns its current boot identity and
 accepts the session only when that identity exactly matches its current ready
 population, an installed source authorization, and the connecting target node.
 A Meta-managed source rejects an anonymous or standalone native export and
-accepts only an exactly authorized `POPULATION` handshake. Static cluster mode
-has no replication lifecycle and rejects every native export.
+accepts only an exactly authorized `POPULATION` handshake.
 
 The steady-state source path is:
 
@@ -861,7 +854,7 @@ reattachment.
 
 | Setting or command | Current scope and behavior |
 |---|---|
-| `cluster-enabled` / `--cluster-enabled` | One-node-one-group, fail-closed startup; incompatible with startup `replicaof`, `redis-replicaof`, and `load-rdb`; the public manager also ignores a standalone initial upstream supplied by a direct embedder |
+| `cluster-enabled` / `--cluster-enabled` | Meta-managed one-node-one-group, fail-closed startup requiring a stable node id and at least one numeric Meta seed; incompatible with startup `replicaof`, `redis-replicaof`, and `load-rdb`; the public manager also ignores a standalone initial upstream supplied by a direct embedder |
 | Cluster control adapter | Node-controller-only source rebuild and source-less first-population admission/completion handles, population status, and source authorize/revoke APIs; Meta transport remains outside `ReplicationManager` |
 | `replicaof host port` / `REPLICAOF` | Standalone Redis-style config or runtime role change with native-first discovery; rejected in cluster-managed mode |
 | `redis-replicaof host port` / `--redis-replicaof` | Explicit standalone startup Redis PSYNC source; rejected in cluster-managed mode |
@@ -951,9 +944,7 @@ connection metrics.
 - A Meta-managed `ReplicationGroup`, its reset capability, and its ready token
   are current-boot state. Every such restart constructs a new `NOT_READY`
   group and remains LOADING even when storage recovered records written by a
-  prior boot; old directives and proof tokens cannot reactivate them. The
-  static-file adapter instead trusts its permanent local grant after storage
-  recovery and may reuse a fully promoted population, never an incomplete one.
+  prior boot; old directives and proof tokens cannot reactivate them.
 - The callable `ReplicationManager` adapter does not receive or authenticate
   Meta messages and does not itself publish candidate state to a quorum.
   `MetaControlClientService` owns the authenticated session, while

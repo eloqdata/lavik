@@ -6,10 +6,9 @@ namespace {
 std::unique_ptr<ClusterRuntime> g_cluster_runtime;
 }
 
-ClusterRuntime::ClusterRuntime(AuthorityGuard::LeaseMode lease_mode,
-                               std::unique_ptr<NodeControlActions> actions)
+ClusterRuntime::ClusterRuntime(std::unique_ptr<NodeControlActions> actions)
     : control_actions_(std::move(actions)),
-      authority_guard_(topology_cache_, lease_mode),
+      authority_guard_(topology_cache_),
       node_control_installer_(
           topology_cache_, authority_guard_,
           control_actions_ == nullptr

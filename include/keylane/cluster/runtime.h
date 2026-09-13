@@ -16,18 +16,13 @@
 namespace keylane::cluster {
 
 struct ClusterRuntime {
-  // Static mode is the compatibility default. Meta-controlled startup passes
-  // kFinite and a process-lifetime ReplicationManager adapter.
   explicit ClusterRuntime(
-      AuthorityGuard::LeaseMode lease_mode =
-          AuthorityGuard::LeaseMode::kPermanent,
       std::unique_ptr<NodeControlActions> actions = nullptr);
 
   TopologyCache topology_cache_;
   NullNodeControlActions null_control_actions_;
-  // Meta mode owns the ReplicationManager adapter for exactly as long as the
-  // installer can dispatch into it. Static mode leaves this null and uses the
-  // no-op adapter above.
+  // Production owns the ReplicationManager adapter for exactly as long as the
+  // installer can dispatch into it. Focused tests may use the no-op adapter.
   std::unique_ptr<NodeControlActions> control_actions_;
   AuthorityGuard authority_guard_;
   NodeControlInstaller node_control_installer_;

@@ -562,14 +562,15 @@ the stricter total-URI rule below. An IP or DNS SAN covers the advertised Raft
 endpoint. The NuRaft configuration
 identity descriptor, the CA-authenticated certificate, and the committed
 identity-store binding must all match the claimed source id; neither the
-configuration nor the store binding grants membership alone. During static
-genesis, the complete config descriptor may temporarily stand in for a
-not-yet-applied binding only while the durable initial-binding marker names
-that unchanged descriptor set. The membership reconciler commits missing
-bindings in server-id order; every member closes its local marker synchronously
-when committed log or snapshot apply proves convergence. Transport checks identity
-and reads recovery state without advancing that lifecycle. A dynamic waiting joiner
-has a second narrow catch-up window only while its durable waiting marker is
+configuration nor the store binding grants membership alone. During
+manifest-bootstrapped genesis, the complete config descriptor may temporarily
+stand in for a not-yet-applied binding only while the durable initial-binding
+marker names that unchanged descriptor set. The membership reconciler commits
+missing bindings in server-id order; every member closes its local marker
+synchronously when committed log or snapshot apply proves convergence.
+Transport checks identity and reads recovery state without advancing that
+lifecycle. A dynamic waiting joiner has a second narrow catch-up window only
+while its durable waiting marker is
 present. Replaying a pre-add config cannot close that window: the marker is
 removed only after the installed config includes the local id, every descriptor
 binding is visible, and the state machine has applied through that config
@@ -871,7 +872,7 @@ transition into or out of disabled mode.
 | Deterministic apply, stores, coordinator, observations, and administrative protocol implementations | `src/meta/` |
 | Volatile candidate replacement and internal deterministic plan selection | `include/keylane/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/keylane/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | Pure per-node projection and leader-scoped Data-session publisher | `include/keylane/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/keylane/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
-| Static initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `include/keylane/meta/nuraft_state_mgr.h`, `src/meta/nuraft_state_mgr.cpp`, `app/keylane_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
+| Manifest-bootstrapped initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `include/keylane/meta/nuraft_state_mgr.h`, `src/meta/nuraft_state_mgr.cpp`, `app/keylane_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
 | Atomic Genesis lifecycle, durable creation admission, Meta catch-up barrier, and leader-owned recovery | `include/keylane/meta/topology_store.h`, `src/meta/topology_store.cpp`, `src/meta/state_apply.cpp`, `src/meta/ctl_server.cpp`, `include/keylane/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `app/keylane_meta.cpp` |
 | Durable post-genesis Meta membership intent, exact-config recovery, leadership handoff, and identity retirement | `include/keylane/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |
 | Shared Meta/Data frame, object-transfer, and message formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |

@@ -866,10 +866,9 @@ Current test evidence includes:
   `ReplicationGroup`, its ready token, Data control state, or the process-global
   Function catalog proof. Meta control reconnects after every boot, but neither
   its full desired state nor its leases are restored from the data device;
-  recovered records alone never authorize Meta-managed cluster serving. The
-  static-file adapter instead supplies permanent local grant authority and
-  follows storage recovery, while still honoring a durable incomplete-full-sync
-  fence.
+  recovered records alone never authorize cluster serving. A durable
+  incomplete-full-sync fence also survives recovery and prevents a mixed
+  population from becoming visible.
 - The `tx-commit-append` crash hook exists to isolate a transaction after all
   tagged data is durable but before its decision is appended, but no current
   test arms that named hook directly.

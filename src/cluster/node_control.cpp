@@ -204,7 +204,7 @@ celer::Task<NodeDirectiveCompletion> NodeControlActions::StartDirective(
 celer::Task<absl::Status> NullNodeControlActions::ApplyDirective(
     NodeDirective /*directive*/) {
   co_return absl::FailedPreconditionError(
-      "the static control adapter does not execute Meta directives");
+      "the test control adapter does not execute Meta directives");
 }
 
 absl::Status NullNodeControlActions::DrainAssignment(
@@ -712,9 +712,9 @@ absl::Status NodeControlInstaller::InstallFullState(
         "directive-capable full desired state requires the asynchronous "
         "NodeControl transition");
   }
-  // Static topology has no directive producer, but advancing the token keeps
-  // this lower-level entry fail-closed if a caller violates that assembly
-  // contract while an async admission is suspended.
+  // The synchronous test seam has no directive producer, but advancing the
+  // token keeps this lower-level entry fail-closed if a caller violates that
+  // assembly contract while an async admission is suspended.
   InvalidateDirectiveAdmissions();
   FullStateEffects effects;
   absl::Status local = InstallFullStateLocal(std::move(prepared_state),

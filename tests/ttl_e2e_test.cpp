@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -306,13 +307,6 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
-void WriteFile(const std::string& path, std::string_view contents) {
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
-  output << contents;
-  output.flush();
-  if (!output) Fail("failed to write test file");
-}
-
 class ExpirationAuthorityService final : public celer::Service {
  public:
   explicit ExpirationAuthorityService(
@@ -429,17 +423,18 @@ int main(int argc, char** argv) {
     std::cerr << "usage: ttl_e2e_test /path/to/keylane\n";
     return 2;
   }
-  const std::string prefix = "/tmp/keylane-ttl-" + std::to_string(::getpid());
+  const std::string prefix =
+      (std::filesystem::temp_directory_path() /
+       ("keylane-ttl-" + std::to_string(::getpid())))
+          .string();
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   const std::string no_authority_data_path = prefix + "-no-authority.data";
   const std::string no_authority_log_path = prefix + "-no-authority.log";
-  const std::string static_nodes_path = prefix + "-nodes.conf";
   (void)::unlink(data_path.c_str());
   (void)::unlink(log_path.c_str());
   (void)::unlink(no_authority_data_path.c_str());
   (void)::unlink(no_authority_log_path.c_str());
-  (void)::unlink(static_nodes_path.c_str());
 
   try {
     const std::uint16_t port = FindFreePort();
@@ -736,9 +731,8 @@ int main(int argc, char** argv) {
 
     // Recovery without expiration authority must keep the expired winner on
     // disk and in the index. Reads still hide it by its absolute deadline, but
-    // only a later authority grant may mint the durable tombstone. A static
-    // cluster primary gives this test a serving data plane while deliberately
-    // withholding that authority.
+    // only a later authority grant may mint the durable tombstone. The direct
+    // storage fixture below observes both sides of that authority transition.
     const std::uint16_t no_authority_port = FindFreePort();
     CreateDataFile(no_authority_data_path, 192ULL * 1024 * 1024);
     {
@@ -751,40 +745,12 @@ int main(int argc, char** argv) {
       server.Stop();
     }
     std::this_thread::sleep_for(3100ms);
-    constexpr std::string_view kStaticNodeId =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    WriteFile(static_nodes_path,
-              std::string(kStaticNodeId) + " 127.0.0.1:" +
-                  std::to_string(no_authority_port) +
-                  "@0 master - 0 0 1 connected 0-16383\n"
-                  "vars currentEpoch 1 lastVoteEpoch 0\n");
-    {
-      ServerProcess server(
-          argv[1], no_authority_port, no_authority_data_path,
-          no_authority_log_path,
-          {"--cluster-enabled", "--cluster-static-nodes-file",
-           static_nodes_path});
-      RespClient client = Connect(no_authority_port);
-      const auto ready_deadline = std::chrono::steady_clock::now() + 30s;
-      std::string size;
-      do {
-        size = client.Command({"DBSIZE"});
-        if (size == ":1") break;
-        if (!size.starts_with("-LOADING")) break;
-        std::this_thread::sleep_for(20ms);
-      } while (std::chrono::steady_clock::now() < ready_deadline);
-      Expect(client.Command({"GET", "authority-deferred"}), "$-1",
-             "expired value hidden without authority");
-      Expect(size, ":1", "expired winner retained without authority");
-      server.Stop();
-    }
     VerifyDeferredExpirationAuthority(no_authority_data_path);
 
     (void)::unlink(data_path.c_str());
     (void)::unlink(log_path.c_str());
     (void)::unlink(no_authority_data_path.c_str());
     (void)::unlink(no_authority_log_path.c_str());
-    (void)::unlink(static_nodes_path.c_str());
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
@@ -794,7 +760,6 @@ int main(int argc, char** argv) {
     (void)::unlink(log_path.c_str());
     (void)::unlink(no_authority_data_path.c_str());
     (void)::unlink(no_authority_log_path.c_str());
-    (void)::unlink(static_nodes_path.c_str());
     return 1;
   }
 }

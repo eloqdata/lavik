@@ -352,14 +352,53 @@ TEST(RedisConfigTest, ParsesClusterEnabled) {
           .ok());
 }
 
+TEST(RedisConfigTest, RejectsRetiredStaticClusterDirectiveWithMigrationSteps) {
+  for (const std::vector<std::string>& directive : {
+           std::vector<std::string>{"cluster-static-nodes-file",
+                                    "/etc/keylane/nodes.conf"},
+           std::vector<std::string>{"CLUSTER-STATIC-NODES-FILE"},
+           std::vector<std::string>{"cluster-static-nodes-file", "one",
+                                    "two"},
+       }) {
+    ServerOptions options;
+    const absl::Status status =
+        ApplyRedisConfigDirective(directive, &options);
+    ASSERT_FALSE(status.ok());
+    EXPECT_NE(status.message().find("cluster-node-id"), std::string_view::npos);
+    EXPECT_NE(status.message().find("cluster-meta-seed"),
+              std::string_view::npos);
+    EXPECT_NE(status.message().find("keylane-ctl cluster-create --manifest"),
+              std::string_view::npos);
+    EXPECT_NE(status.message().find("not automatically migrate existing data"),
+              std::string_view::npos);
+  }
+}
+
+TEST(RedisConfigTest, RetiredStaticClusterConfigReportsSourceLine) {
+  TempConfigFile config(
+      "port 6379\n"
+      "cluster-static-nodes-file /etc/keylane/nodes.conf\n");
+  ServerOptions options;
+  const absl::Status status =
+      LoadRedisConfigFile(config.path().string(), &options);
+  ASSERT_FALSE(status.ok());
+  EXPECT_NE(status.message().find(":2: "), std::string_view::npos);
+  EXPECT_NE(status.message().find("keylane-ctl cluster-create --manifest"),
+            std::string_view::npos);
+}
+
 TEST(RedisConfigTest, ClusterModeRejectsStandalonePopulationSources) {
   ServerOptions options;
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"cluster-enabled", "yes"}, &options).ok());
-  ASSERT_TRUE(
-      ApplyRedisConfigDirective(
-          {"cluster-static-nodes-file", "/etc/keylane/nodes.conf"}, &options)
-          .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"cluster-node-id",
+                   "0123456789abcdef0123456789abcdef01234567"},
+                  &options)
+                  .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"cluster-meta-seed", "127.0.0.1:17001"}, &options)
+                  .ok());
   EXPECT_TRUE(ValidateServerOptions(options).ok());
 
   options.replicaof_ = keylane::ReplicaOfConfig{"keylane.local", 6379};
@@ -528,7 +567,8 @@ TEST(RedisConfigTest, AtomicallyRewritesFailoverManagedDirectives) {
 TEST(RedisConfigTest, ConfigRewritePreservesClusterEnabled) {
   TempConfigFile config(
       "cluster-enabled yes\n"
-      "cluster-static-nodes-file /etc/keylane/nodes.conf\n"
+      "cluster-node-id 0123456789abcdef0123456789abcdef01234567\n"
+      "cluster-meta-seed 127.0.0.1:17001\n"
       "replica-priority 80\n");
 
   absl::Status rewritten =
@@ -581,10 +621,14 @@ TEST(RedisConfigTest, AppliesClusterDirectives) {
   ServerOptions options;
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"cluster-enabled", "yes"}, &options).ok());
-  ASSERT_TRUE(
-      ApplyRedisConfigDirective(
-          {"cluster-static-nodes-file", "/etc/keylane/nodes.conf"}, &options)
-          .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"cluster-node-id",
+                   "0123456789abcdef0123456789abcdef01234567"},
+                  &options)
+                  .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"cluster-meta-seed", "127.0.0.1:17001"}, &options)
+                  .ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"cluster-announce-ip", "10.0.0.8"}, &options)
           .ok());
@@ -596,7 +640,6 @@ TEST(RedisConfigTest, AppliesClusterDirectives) {
           .ok());
 
   EXPECT_TRUE(options.cluster_enabled_);
-  EXPECT_EQ(options.cluster_static_nodes_file_, "/etc/keylane/nodes.conf");
   EXPECT_EQ(options.cluster_announce_ip_, "10.0.0.8");
   EXPECT_EQ(options.cluster_announce_port_, 7390);
   EXPECT_EQ(options.cluster_announce_tls_port_, 7391);
@@ -640,7 +683,7 @@ TEST(RedisConfigTest, AppliesMetaControlledClusterDirectives) {
   EXPECT_TRUE(ValidateServerOptions(options).ok());
 }
 
-TEST(RedisConfigTest, ValidatesExactlyOneClusterControlSource) {
+TEST(RedisConfigTest, RequiresCompleteMetaControlConfiguration) {
   ServerOptions options;
   options.cluster_enabled_ = true;
   EXPECT_FALSE(ValidateServerOptions(options).ok());
@@ -650,10 +693,8 @@ TEST(RedisConfigTest, ValidatesExactlyOneClusterControlSource) {
   options.cluster_node_id_ = "0123456789abcdef0123456789abcdef01234567";
   EXPECT_TRUE(ValidateServerOptions(options).ok());
 
-  options.cluster_static_nodes_file_ = "/etc/keylane/nodes.conf";
-  EXPECT_FALSE(ValidateServerOptions(options).ok());
   options.cluster_meta_seeds_.clear();
-  EXPECT_TRUE(ValidateServerOptions(options).ok());
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
 }
 
 TEST(RedisConfigTest, RejectsMalformedMetaNodeIdentityAndSeeds) {
@@ -714,18 +755,21 @@ TEST(RedisConfigTest, RejectsInvalidClusterDirectives) {
                    .ok());
 }
 
-TEST(RedisConfigTest, RequiresNodesFileWhenClusterEnabled) {
+TEST(RedisConfigTest, RequiresNodeIdAndMetaSeedWhenClusterEnabled) {
   ServerOptions options;
   options.cluster_enabled_ = true;
   EXPECT_FALSE(ValidateServerOptions(options).ok());
-  options.cluster_static_nodes_file_ = "/etc/keylane/nodes.conf";
+  options.cluster_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  options.cluster_meta_seeds_ = {"127.0.0.1:17001"};
   EXPECT_TRUE(ValidateServerOptions(options).ok());
 }
 
 TEST(RedisConfigTest, RejectsClusterWithReplicationUpstream) {
   ServerOptions options;
   options.cluster_enabled_ = true;
-  options.cluster_static_nodes_file_ = "/etc/keylane/nodes.conf";
+  options.cluster_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  options.cluster_meta_seeds_ = {"127.0.0.1:17001"};
   options.replicaof_ = keylane::ReplicaOfConfig{"keylane.local", 6379};
   EXPECT_FALSE(ValidateServerOptions(options).ok());
 
@@ -740,7 +784,8 @@ TEST(RedisConfigTest, RejectsClusterWithReplicationUpstream) {
 TEST(RedisConfigTest, ValidatesClusterAnnouncePortResolution) {
   ServerOptions options;
   options.cluster_enabled_ = true;
-  options.cluster_static_nodes_file_ = "/etc/keylane/nodes.conf";
+  options.cluster_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  options.cluster_meta_seeds_ = {"127.0.0.1:17001"};
 
   // TLS-only deployment: the zero announce ports follow the listen ports, so
   // the resolved TLS announce port is nonzero and the node is valid.

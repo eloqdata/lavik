@@ -138,8 +138,7 @@ TEST(MetaControlMapperTest, InstallsInitialEmptyTopologyAtEpochZero) {
   auto prepared = cluster::PrepareMetaFullState(desired, kNode1, 1);
   ASSERT_TRUE(prepared.ok()) << prepared.status();
   cluster::TopologyCache topology;
-  cluster::AuthorityGuard authority(
-      topology, cluster::AuthorityGuard::LeaseMode::kFinite);
+  cluster::AuthorityGuard authority(topology);
   cluster::NullNodeControlActions actions;
   cluster::NodeControlInstaller installer(topology, authority, actions);
   ASSERT_TRUE(installer.SetStorageReady(true).ok());

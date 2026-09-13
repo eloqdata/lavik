@@ -37,9 +37,8 @@ struct RequestView {
   // no keys OR key extraction failed: both admit locally (readiness still
   // applies), mirroring Redis getNodeByQuery returning myself for zero keys
   // and letting the command produce its own argument error. The Redis adapter
-  // separately binds eligible static global mutations to one representative
-  // owner slot and rejects every persistent global mutation without that
-  // group proof.
+  // rejects persistent zero-key mutations because no group-scoped authority
+  // can prove ownership for them.
   std::span<const std::uint16_t> slots_;
   bool is_write_ = false;
   bool connection_readonly_ = false;  // READONLY issued on this connection
@@ -182,22 +181,14 @@ using AuthorityInFlightGuards = absl::InlinedVector<InFlightGuard, 4>;
 
 class NodeControlInstaller;
 
-// Unique request-path authority interface. Dynamic mode combines committed
-// topology with a process-memory lease; static mode supplies a permanent
-// lease while retaining identical topology recheck semantics.
+// Unique request-path authority interface. Serving combines committed topology
+// with a session-scoped process-memory lease; topology alone never grants
+// authority.
 class AuthorityGuard {
  public:
-  enum class LeaseMode : std::uint8_t { kFinite, kPermanent };
-
-  AuthorityGuard(TopologyCache& topology, LeaseMode lease_mode);
+  explicit AuthorityGuard(TopologyCache& topology);
   AuthorityGuard(const AuthorityGuard&) = delete;
   AuthorityGuard& operator=(const AuthorityGuard&) = delete;
-
-  // Identifies the control model for policy decisions that cannot carry a
-  // keyed group proof (for example, process-wide catalog mutations). It does
-  // not grant authority by itself; callers must still inspect the committed
-  // ServingState and local role.
-  LeaseMode lease_mode() const noexcept { return lease_mode_; }
 
   // Captures a coherent serving verdict and lease generation at `now`.
   // Meta-managed local-primary requests fail closed when no exact unexpired
@@ -265,7 +256,6 @@ class AuthorityGuard {
   void InvalidateAll();
 
   TopologyCache& topology_;
-  const LeaseMode lease_mode_;
   mutable std::mutex mutex_;
   std::optional<SessionIdentity> session_;
   std::unordered_map<std::string, Lease> leases_;

@@ -110,9 +110,6 @@ int main(int argc, char** argv) {
                "Enable the Redis Cluster data plane and fail-closed "
                "population management")
       ->capture_default_str();
-  app.add_option("--cluster-static-nodes-file",
-                 options.cluster_static_nodes_file_,
-                 "Shared nodes.conf-format static cluster topology file");
   app.add_option("--cluster-meta-seed", options.cluster_meta_seeds_,
                  "Numeric Meta data-control endpoint; repeat for bootstrap");
   app.add_option("--cluster-node-id", options.cluster_node_id_,

@@ -45,7 +45,6 @@
 #include "celer/runtime/sync.h"
 #include "client_limit.h"
 #include "function_catalog.h"
-#include "keylane/cluster/control_port.h"
 #include "keylane/cluster/meta_client.h"
 #include "keylane/cluster/runtime.h"
 #include "keylane/command.h"
@@ -499,70 +498,6 @@ void CleanupShutdownSignalHandler() noexcept {
   }
 }
 
-// SIGHUP-driven reload of the static cluster topology. The reload
-// path must use its own eventfd: WaitForSignalOrServerStop treats any write to
-// the shutdown eventfd as a stop request. The handler is installed only while
-// the static control adapter is active.
-int g_reload_signal_event_fd = -1;
-// Owned by RunServer for the process lifetime; read only on the main thread.
-cluster::StaticClusterControl* g_static_cluster_control = nullptr;
-
-void ClusterReloadSignalHandler(int /*signal*/) {
-  if (g_reload_signal_event_fd < 0) {
-    return;
-  }
-  const std::uint64_t wake = 1;
-  const ssize_t result = write(g_reload_signal_event_fd, &wake, sizeof(wake));
-  (void)result;
-}
-
-absl::Status InstallClusterReloadSignalHandler() {
-  g_reload_signal_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-  if (g_reload_signal_event_fd < 0) {
-    return absl::Status(absl::StatusCode::kInternal, "eventfd setup failed");
-  }
-
-  struct sigaction action {};
-  sigemptyset(&action.sa_mask);
-  action.sa_handler = ClusterReloadSignalHandler;
-  if (sigaction(SIGHUP, &action, nullptr) != 0) {
-    close(g_reload_signal_event_fd);
-    g_reload_signal_event_fd = -1;
-    return absl::Status(absl::StatusCode::kInternal, "sigaction setup failed");
-  }
-  return absl::OkStatus();
-}
-
-void CleanupClusterReloadSignalHandler() noexcept {
-  struct sigaction action {};
-  sigemptyset(&action.sa_mask);
-  action.sa_handler = SIG_DFL;
-  (void)sigaction(SIGHUP, &action, nullptr);
-  if (g_reload_signal_event_fd >= 0) {
-    close(g_reload_signal_event_fd);
-    g_reload_signal_event_fd = -1;
-  }
-}
-
-// Reloads the static topology file. A failed reload keeps the previously
-// published ServingState (the RefreshTarget contract), so a bad edit never
-// half-applies a fence.
-void ReloadStaticClusterTarget() {
-  cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
-  if (g_static_cluster_control == nullptr || runtime == nullptr) return;
-  const absl::Status refreshed =
-      g_static_cluster_control->RefreshTarget(runtime->node_control_installer_);
-  if (refreshed.ok()) {
-    spdlog::info("cluster topology reloaded, serving version {}",
-                 runtime->topology_cache_.version());
-  } else {
-    spdlog::warn(
-        "cluster topology reload failed; keeping the previous serving state: "
-        "{}",
-        refreshed.message());
-  }
-}
-
 enum class WaitResult {
   kSignal,
   kStopped,
@@ -697,16 +632,13 @@ std::string_view ExecuteHelloFromContext(const void* authenticator,
 
 template <typename Server>
 WaitResult WaitForSignalOrServerStop(const Server& server) {
-  // A negative reload fd is simply never readable, so the poll list is fixed
-  // whether or not the static cluster adapter armed its SIGHUP handler.
-  pollfd fds[3] = {
+  pollfd fds[2] = {
       {.fd = g_signal_event_fd, .events = POLLIN, .revents = 0},
       {.fd = server.completion_fd(), .events = POLLIN, .revents = 0},
-      {.fd = g_reload_signal_event_fd, .events = POLLIN, .revents = 0},
   };
 
   while (true) {
-    const int rc = poll(fds, 3, -1);
+    const int rc = poll(fds, 2, -1);
     if (rc < 0) [[unlikely]] {
       if (errno == EINTR) {
         continue;
@@ -731,16 +663,6 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
         spdlog::warn("server completion eventfd read failed errno={}", errno);
       }
       return WaitResult::kStopped;
-    }
-    if ((fds[2].revents & POLLIN) != 0) {
-      std::uint64_t wake = 0;
-      const ssize_t result =
-          read(g_reload_signal_event_fd, &wake, sizeof(wake));
-      if (result < 0 && errno != EAGAIN) {
-        spdlog::warn("reload eventfd read failed errno={}", errno);
-      }
-      // Reload is not a stop: drain the event and keep waiting.
-      ReloadStaticClusterTarget();
     }
   }
 }
@@ -1156,20 +1078,7 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
     // this boundary. Publish readiness only after an optional startup RDB
     // import has also completed successfully on every worker.
     ready_.store(true, std::memory_order_release);
-    if (g_static_cluster_control != nullptr &&
-        cluster::GetClusterRuntime() != nullptr) {
-      // Flip the published ServingState to storage-ready; until this lands,
-      // the dispatch gate answers LOADING to every non-whitelisted command.
-      g_static_cluster_control->SetStorageReady(true);
-      const absl::Status published = g_static_cluster_control->RefreshTarget(
-          cluster::GetClusterRuntime()->node_control_installer_);
-      if (!published.ok()) {
-        // The gate keeps answering LOADING rather than serving against a
-        // state this node cannot prove ready.
-        spdlog::error("cluster storage-ready publication failed: {}",
-                      published.message());
-      }
-    } else if (cluster::GetClusterRuntime() != nullptr) {
+    if (cluster::GetClusterRuntime() != nullptr) {
       // Meta topology may not have arrived yet. The installer remembers this
       // process-local readiness bit and folds it into the first complete FDS;
       // it is never persisted as authority.
@@ -1488,18 +1397,9 @@ Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
       ready_.store(false, std::memory_order_release);
       cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
       if (runtime != nullptr) {
-        absl::Status fenced;
-        if (g_static_cluster_control != nullptr) {
-          // SIGHUP parses and publishes on the process main thread. Route the
-          // terminal transition through the static adapter so its writer lock
-          // spans NodeControl's asynchronous cancel/join boundary as well.
-          fenced = co_await g_static_cluster_control
-                       ->LoseStorageReadinessTransition(
-                           runtime->node_control_installer_);
-        } else {
-          fenced = co_await runtime->node_control_installer_
-                       .LoseStorageReadinessTransition();
-        }
+        const absl::Status fenced =
+            co_await runtime->node_control_installer_
+                .LoseStorageReadinessTransition();
         if (!fenced.ok()) {
           runtime_failure_cleanup_failed_.store(true,
                                                 std::memory_order_release);
@@ -2252,13 +2152,9 @@ int RunServer(ServerOptions options) {
     spdlog::error("configuration error: {}", validated.message());
     return 1;
   }
-  // Every cluster mode disables standalone replication control and export.
-  // Only Meta-managed mode delegates population lifecycle to NodeControl;
-  // static nodes.conf keeps its local storage-recovery readiness rather than
-  // waiting forever for a Meta directive it cannot receive.
+  // Cluster mode delegates population lifecycle to Meta/NodeControl and
+  // disables standalone replication control and export.
   options.replication_options_.cluster_enabled_ = options.cluster_enabled_;
-  options.replication_options_.cluster_population_managed_ =
-      options.cluster_enabled_ && !options.cluster_meta_seeds_.empty();
   auto allowed_max_clients = MaxClientsAllowedByFileLimit(options.max_clients_);
   if (!allowed_max_clients.ok()) {
     spdlog::error("maxclients file-descriptor setup failed: {}",
@@ -2519,7 +2415,7 @@ int RunServer(ServerOptions options) {
       options.replication_publish_queue_bytes_;
   options.replication_options_.redis_psync_ =
       options.redis_replicaof_.has_value();
-  if (options.cluster_enabled_ && !options.cluster_meta_seeds_.empty()) {
+  if (options.cluster_enabled_) {
     // The Meta session and native replication protocol must name the same
     // stable data node; boot and history incarnations remain manager-owned.
     options.replication_options_.node_id_override_ = options.cluster_node_id_;
@@ -2544,23 +2440,15 @@ int RunServer(ServerOptions options) {
   tx::TxRuntime::Create(options.thread_count_);
 
   // Redis Cluster data plane: install the process-wide runtime before any
-  // listener accepts a client. Static mode loads its file immediately;
-  // Meta-managed mode starts with no serving topology and stays fail-closed
-  // until its first authenticated complete state. In both modes storage starts
-  // unready, so non-whitelisted commands answer LOADING until recovery (and
-  // any startup RDB import) completes.
-  std::unique_ptr<cluster::StaticClusterControl> cluster_control;
+  // listener accepts a client. It starts without serving topology and stays
+  // fail-closed until Meta supplies an authenticated complete state. Storage
+  // also starts unready, so non-whitelisted commands answer LOADING until
+  // recovery completes.
   std::unique_ptr<cluster::MetaControlClientService> meta_control_client;
   if (options.cluster_enabled_) {
-    const bool meta_control = !options.cluster_meta_seeds_.empty();
-    std::unique_ptr<cluster::NodeControlActions> control_actions;
-    if (meta_control) {
-      control_actions =
-          cluster::CreateReplicationNodeControlActions(replication);
-    }
+    std::unique_ptr<cluster::NodeControlActions> control_actions =
+        cluster::CreateReplicationNodeControlActions(replication);
     auto runtime = std::make_unique<cluster::ClusterRuntime>(
-        meta_control ? cluster::AuthorityGuard::LeaseMode::kFinite
-                     : cluster::AuthorityGuard::LeaseMode::kPermanent,
         std::move(control_actions));
     // Announce-address defaults: an explicit announce ip wins; otherwise the
     // first non-wildcard bind address; a wildcard bind stays empty so
@@ -2579,54 +2467,24 @@ int RunServer(ServerOptions options) {
                                       ? options.cluster_announce_tls_port_
                                       : options.tls_port_;
     cluster::InstallClusterRuntime(std::move(runtime));
-    if (meta_control) {
-      auto created = cluster::MetaControlClientService::Create(
-          cluster::MetaControlClientOptions{
-              .seeds_ = options.cluster_meta_seeds_,
-              .node_id_ = options.cluster_node_id_,
-              .request_worker_count_ = options.thread_count_,
-              .tls_context_ =
-                  options.tls_replication_ ? tls_client_context : nullptr,
-          },
-          cluster::GetClusterRuntime()->node_control_installer_,
-          cluster::GetClusterRuntime()->topology_cache_, replication);
-      if (!created.ok()) {
-        spdlog::error("Meta control client setup failed: {}",
-                      created.status().message());
-        cluster::InstallClusterRuntime(nullptr);
-        CleanupShutdownSignalHandler();
-        return 1;
-      }
-      meta_control_client = std::move(*created);
-    } else {
-      std::string self_host = options.bind_addresses_.front();
-      if (self_host == "*") self_host = "0.0.0.0";
-      cluster_control = std::make_unique<cluster::StaticClusterControl>(
-          options.cluster_static_nodes_file_,
-          cluster::StaticClusterControl::SelfMatch{self_host, options.port_},
-          cluster::GetClusterRuntime()->announce_tls_port_,
-          options.thread_count_);
-      // A first-load failure is fatal: there is no previous ServingState to
-      // keep, and serving without one would answer every command CLUSTERDOWN.
-      const absl::Status loaded = cluster_control->RefreshTarget(
-          cluster::GetClusterRuntime()->node_control_installer_);
-      if (!loaded.ok()) {
-        spdlog::error("cluster topology load failed: {}", loaded.message());
-        cluster::InstallClusterRuntime(nullptr);
-        CleanupShutdownSignalHandler();
-        return 1;
-      }
-      g_static_cluster_control = cluster_control.get();
-      const absl::Status reload_installed = InstallClusterReloadSignalHandler();
-      if (!reload_installed.ok()) {
-        spdlog::error("cluster reload signal setup failed: {}",
-                      reload_installed.message());
-        g_static_cluster_control = nullptr;
-        cluster::InstallClusterRuntime(nullptr);
-        CleanupShutdownSignalHandler();
-        return 1;
-      }
+    auto created = cluster::MetaControlClientService::Create(
+        cluster::MetaControlClientOptions{
+            .seeds_ = options.cluster_meta_seeds_,
+            .node_id_ = options.cluster_node_id_,
+            .request_worker_count_ = options.thread_count_,
+            .tls_context_ =
+                options.tls_replication_ ? tls_client_context : nullptr,
+        },
+        cluster::GetClusterRuntime()->node_control_installer_,
+        cluster::GetClusterRuntime()->topology_cache_, replication);
+    if (!created.ok()) {
+      spdlog::error("Meta control client setup failed: {}",
+                    created.status().message());
+      cluster::InstallClusterRuntime(nullptr);
+      CleanupShutdownSignalHandler();
+      return 1;
     }
+    meta_control_client = std::move(*created);
   }
 
   celer::ServerOptions runtime_options;
@@ -2668,8 +2526,6 @@ int RunServer(ServerOptions options) {
   auto start_status = server.Start(runtime_options);
   if (!start_status.ok()) [[unlikely]] {
     spdlog::error("server start failed: {}", start_status.message());
-    g_static_cluster_control = nullptr;
-    CleanupClusterReloadSignalHandler();
     cluster::InstallClusterRuntime(nullptr);
     CleanupShutdownSignalHandler();
     return 1;
@@ -2751,8 +2607,6 @@ int RunServer(ServerOptions options) {
                                 shutdown_exit_code != 0
                             ? 1
                             : server.exit_code();
-  g_static_cluster_control = nullptr;
-  CleanupClusterReloadSignalHandler();
   cluster::InstallClusterRuntime(nullptr);
   CleanupShutdownSignalHandler();
   if (fast_process_exit) {

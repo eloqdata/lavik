@@ -379,7 +379,6 @@ endif()
 
 add_library(keylane_module
   src/cluster/authority.cpp
-  src/cluster/control_port.cpp
   src/cluster/meta_client.cpp
   src/cluster/meta_control.cpp
   src/cluster/node_control.cpp
@@ -1115,7 +1114,6 @@ if (BUILD_TESTING)
     tests/buffer_pool_test.cpp
     tests/cluster_authority_test.cpp
     tests/cluster_command_test.cpp
-    tests/cluster_control_port_test.cpp
     tests/cluster_topology_test.cpp
     tests/config_test.cpp
     tests/control_protocol_test.cpp
@@ -1167,6 +1165,13 @@ if (BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/replication
   )
   gtest_discover_tests(keylane_unit_tests)
+
+  add_test(
+    NAME keylane_cli.cluster_control_surface
+    COMMAND ${CMAKE_COMMAND}
+            -DKEYLANE_EXECUTABLE=$<TARGET_FILE:keylane>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_cluster_cli.cmake
+  )
 
   if (UNIX)
     find_program(KEYLANE_REDIS_SERVER_EXECUTABLE redis-server)
@@ -1471,22 +1476,5 @@ if (BUILD_TESTING)
       set_tests_properties(keylane_list_e2e PROPERTIES TIMEOUT 1200)
     endif()
 
-    add_executable(keylane_cluster_e2e_test
-      tests/cluster_e2e_test.cpp
-    )
-    target_link_libraries(keylane_cluster_e2e_test
-      PRIVATE keylane::module GTest::gtest
-    )
-    # argv[2] carries the redis-cli path for the real-client MOVED-following
-    # check; empty when the environment has no redis-cli, and the test skips
-    # that check.
-    add_test(
-      NAME keylane_cluster_e2e
-      COMMAND keylane_cluster_e2e_test $<TARGET_FILE:keylane>
-              "${KEYLANE_REDIS_CLI_EXECUTABLE}"
-    )
-    set_tests_properties(keylane_cluster_e2e PROPERTIES
-      TIMEOUT 300
-      RUN_SERIAL TRUE)
   endif()
 endif()
