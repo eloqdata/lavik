@@ -635,9 +635,7 @@ one numeric Meta seed. It refuses coexistence with either replication upstream
 directive (two topology sources never mix; runtime `REPLICAOF` is rejected
 separately at the command layer), and requires at least one reachable announced
 client port so MOVED and discovery can always name an endpoint — a TLS-only
-deployment is valid. The retired Redis-style `cluster-static-nodes-file`
-directive fails with steps for creating a new manifest-bootstrapped Meta
-cluster; `nodes.conf` data is not adopted or migrated in place.
+deployment is valid.
 
 Data-to-Meta mTLS is optional and all-or-none. When enabled, the Data client
 reuses its existing replication TLS CA/certificate/key and presents the

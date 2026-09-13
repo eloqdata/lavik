@@ -352,41 +352,6 @@ TEST(RedisConfigTest, ParsesClusterEnabled) {
           .ok());
 }
 
-TEST(RedisConfigTest, RejectsRetiredStaticClusterDirectiveWithMigrationSteps) {
-  for (const std::vector<std::string>& directive : {
-           std::vector<std::string>{"cluster-static-nodes-file",
-                                    "/etc/keylane/nodes.conf"},
-           std::vector<std::string>{"CLUSTER-STATIC-NODES-FILE"},
-           std::vector<std::string>{"cluster-static-nodes-file", "one",
-                                    "two"},
-       }) {
-    ServerOptions options;
-    const absl::Status status =
-        ApplyRedisConfigDirective(directive, &options);
-    ASSERT_FALSE(status.ok());
-    EXPECT_NE(status.message().find("cluster-node-id"), std::string_view::npos);
-    EXPECT_NE(status.message().find("cluster-meta-seed"),
-              std::string_view::npos);
-    EXPECT_NE(status.message().find("keylane-ctl cluster-create --manifest"),
-              std::string_view::npos);
-    EXPECT_NE(status.message().find("not automatically migrate existing data"),
-              std::string_view::npos);
-  }
-}
-
-TEST(RedisConfigTest, RetiredStaticClusterConfigReportsSourceLine) {
-  TempConfigFile config(
-      "port 6379\n"
-      "cluster-static-nodes-file /etc/keylane/nodes.conf\n");
-  ServerOptions options;
-  const absl::Status status =
-      LoadRedisConfigFile(config.path().string(), &options);
-  ASSERT_FALSE(status.ok());
-  EXPECT_NE(status.message().find(":2: "), std::string_view::npos);
-  EXPECT_NE(status.message().find("keylane-ctl cluster-create --manifest"),
-            std::string_view::npos);
-}
-
 TEST(RedisConfigTest, ClusterModeRejectsStandalonePopulationSources) {
   ServerOptions options;
   ASSERT_TRUE(
@@ -737,8 +702,6 @@ TEST(RedisConfigTest, RejectsInvalidClusterDirectives) {
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"cluster-enabled", "yes", "extra"}, &options)
           .ok());
-  EXPECT_FALSE(
-      ApplyRedisConfigDirective({"cluster-static-nodes-file"}, &options).ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"cluster-announce-ip"}, &options).ok());
   EXPECT_FALSE(

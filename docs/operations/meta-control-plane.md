@@ -158,26 +158,6 @@ keylane --cluster-enabled \
   --data-file /var/lib/keylane/data-primary-1/keylane.data
 ```
 
-### Migrate from the retired static Cluster configuration
-
-`cluster-static-nodes-file` and Redis `nodes.conf` topology are no longer a
-production control mode. To move an installation to the supported flow:
-
-1. Remove `cluster-static-nodes-file` from the Redis-style configuration (or
-   remove the equivalent CLI argument).
-2. Give every Data process its final `cluster-node-id` and at least one numeric
-   `cluster-meta-seed`.
-3. Start the manifest-bootstrapped Meta members and the configured Data
-   processes. Data remains fail closed until Cluster Create publishes its
-   topology and finite authority leases.
-4. Run `keylane-ctl cluster-create --manifest <path>` and follow
-   `cluster-status` until the new cluster is ready.
-
-This is a new, destructive Cluster Create workflow, not an in-place takeover.
-Existing static-cluster data and `nodes.conf` assignments are not imported or
-automatically adopted. Preserve the old media until a separately planned data
-migration has been completed and verified.
-
 Data reports LOADING while its unregistered control connection retries. Run
 the same release on Meta, Data and the CLI. Version 1 names the current
 multi-Group topology and full initial Meta directory; it does not provide

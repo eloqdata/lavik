@@ -443,13 +443,6 @@ absl::Status ApplyRedisConfigDirective(
     options->cluster_enabled_ = *enabled;
     return absl::OkStatus();
   }
-  if (name == "cluster-static-nodes-file") {
-    return absl::InvalidArgumentError(
-        "cluster-static-nodes-file is no longer supported; remove it, "
-        "configure cluster-node-id and at least one cluster-meta-seed, start "
-        "keylane-meta, then run keylane-ctl cluster-create --manifest <path>; "
-        "this does not automatically migrate existing data");
-  }
   if (name == "cluster-announce-ip" || name == "cluster-node-id" ||
       name == "cluster-meta-seed") {
     if (directive.size() != 2) return WrongArgumentCount(name);
