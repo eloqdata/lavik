@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-process static-Meta cluster-create and recovery gate.
+"""Real-process manifest-bootstrapped Meta cluster-create and recovery gate.
 
 Usage: gate_cluster_create.py META DATA CTL REDIS_CLI [workdir]
 """
@@ -566,9 +566,11 @@ def run_case(workdir, interactive):
         meta.force_kill()
 
 
-def run_static_multi_meta_create_case(workdir, count, late_voter):
-    """Every static vector creates through the same fixed Meta barrier."""
-    scenario = os.path.join(workdir, f"static-{count}-meta-create")
+def run_manifest_bootstrapped_multi_meta_case(workdir, count, late_voter):
+    """Every manifest vector creates through the same fixed Meta barrier."""
+    # Meta Admin uses Unix-domain sockets, so keep this scenario component
+    # short enough for sockaddr_un even when TMPDIR itself is long.
+    scenario = os.path.join(workdir, f"manifest-{count}")
     meta_workdir = os.path.join(scenario, "meta")
     os.makedirs(meta_workdir, mode=0o700)
     metas = H.make_nodes(
@@ -583,7 +585,7 @@ def run_static_multi_meta_create_case(workdir, count, late_voter):
     post_create_joiner = None
     try:
         # Data may start before any Meta process and remains fail closed while
-        # its unregistered session retries the static seed.
+        # its unregistered session retries the configured Meta seed.
         data.start()
         running = metas[:-1] if late_voter else metas
         for meta in running:
@@ -680,7 +682,8 @@ def run_static_multi_meta_create_case(workdir, count, late_voter):
                 raise H.Failure(
                     "post-create writes retained all-peer completion: "
                     f"{reply}")
-        H.log(f"static {count}-Meta barrier and Data-first create — OK")
+        H.log(f"manifest-bootstrapped {count}-Meta barrier and "
+              "Data-first create — OK")
         data.terminate()
         for meta in metas:
             meta.terminate()
@@ -967,6 +970,61 @@ def assert_redis_topology_and_replication(nodes):
         by_id[PRIMARY_1], ["MGET", keys["group-1"], keys["group-2"]])
     if not crossslot.startswith("CROSSSLOT"):
         raise H.Failure(f"cross-Group MGET returned {crossslot!r}")
+
+    rejected_library = (
+        "#!lua name=cluster_rejected\n"
+        "redis.register_function('cluster_rejected_value', "
+        "function(keys, args) return 1 end)")
+    for arguments, expected in (
+            (["REPLICAOF", "127.0.0.1", "1"],
+             "ERR REPLICAOF not allowed in cluster mode."),
+            (["FLUSHDB"], "ERR FLUSHDB is not allowed in cluster mode"),
+            (["FLUSHALL"], "ERR FLUSHALL is not allowed in cluster mode"),
+            (["FUNCTION", "LOAD", rejected_library],
+             "ERR FUNCTION LOAD is not allowed in cluster mode"),
+            (["FUNCTION", "DELETE", "missing-library"],
+             "ERR FUNCTION DELETE is not allowed in cluster mode"),
+            (["FUNCTION", "FLUSH"],
+             "ERR FUNCTION FLUSH is not allowed in cluster mode"),
+            (["FUNCTION", "RESTORE", "payload"],
+             "ERR FUNCTION RESTORE is not allowed in cluster mode")):
+        actual = redis_error(by_id[PRIMARY_1], arguments)
+        if actual != expected:
+            raise H.Failure(
+                f"cluster command policy for {arguments} returned {actual!r}")
+
+    with redis_connection(by_id[PRIMARY_1]) as sock:
+        sock.settimeout(3.0)
+        sock.sendall(
+            encode_resp(["MULTI"]) +
+            encode_resp(["FUNCTION", "LOAD", rejected_library]) +
+            encode_resp(["EXEC"]))
+        reader = sock.makefile("rb")
+        if read_resp(reader) != "OK":
+            raise H.Failure("primary rejected MULTI before policy check")
+        function_reply = reader.readline()
+        if function_reply != (
+                b"-ERR FUNCTION LOAD is not allowed in cluster mode\r\n"):
+            raise H.Failure(
+                "transactional FUNCTION LOAD returned "
+                f"{function_reply!r}")
+        exec_reply = reader.readline()
+        if exec_reply != (
+                b"-EXECABORT Transaction discarded because of previous "
+                b"errors.\r\n"):
+            raise H.Failure(
+                f"rejected FUNCTION LOAD did not abort EXEC: {exec_reply!r}")
+    if redis_call(by_id[PRIMARY_1], ["FUNCTION", "LIST"]) != []:
+        raise H.Failure("rejected FUNCTION LOAD changed the catalog")
+
+    source_host, source_port = endpoint_tuple(by_id[PRIMARY_1])
+    followed = command(
+        os.environ.copy(),
+        [REDIS_CLI, "-c", "--raw", "-h", source_host,
+         "-p", str(source_port), "GET", keys["group-2"]]).strip()
+    if followed != "ongoing-group-2":
+        raise H.Failure(
+            f"redis-cli did not follow MOVED to group-2: {followed!r}")
 
     info = redis_call(by_id[PRIMARY_1], ["CLUSTER", "INFO"])
     if "cluster_state:ok" not in info:
@@ -1582,8 +1640,10 @@ def main():
         run_unrelated_commit_case(workdir)
         for transports in (("unix", "unix"), ("tcp", "tcp"), ("unix", "tcp")):
             run_concurrent_case(workdir, transports)
-        run_static_multi_meta_create_case(workdir, 3, late_voter=True)
-        run_static_multi_meta_create_case(workdir, 5, late_voter=False)
+        run_manifest_bootstrapped_multi_meta_case(
+            workdir, 3, late_voter=True)
+        run_manifest_bootstrapped_multi_meta_case(
+            workdir, 5, late_voter=False)
         run_multi_group_case(workdir, automatic=True, interactive=True,
                              data_first=True)
         run_multi_group_case(workdir, automatic=False, interactive=False)

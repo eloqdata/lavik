@@ -37,7 +37,7 @@ struct MetaControlEndpoint {
   std::string host_;
   std::uint16_t port_ = 0;
   std::uint32_t server_id_ = 0;  // zero for an unresolved seed
-  // Empty only for unresolved static seeds. Learned entries retain the
+  // Empty only for unresolved configured seeds. Learned entries retain the
   // committed identity binding so TLS verification cannot trust a principal
   // synthesized solely from an untrusted ServerHello.
   std::optional<std::string> principal_;
@@ -60,7 +60,7 @@ absl::Status ValidateUniqueControlPrincipal(
     std::span<const std::string> uri_sans, std::string_view expected);
 
 // Pins a learned dial target to the exact committed member identity retained
-// from the previous directory. An unresolved static seed may bootstrap from
+// from the previous directory. An unresolved configured seed may bootstrap from
 // the authenticated ServerHello member; a learned endpoint may not replace
 // its principal merely by echoing a different value in that Hello.
 absl::Status ValidateDialedMetaIdentity(
@@ -107,7 +107,7 @@ class MetaReconnectBackoff {
 
 // Volatile discovery directory. A known leader is tried first, then the
 // committed in-memory directory, then configured seeds. Entries are
-// de-duplicated within the same identity; an unresolved static seed is kept
+// de-duplicated within the same identity; an unresolved configured seed is kept
 // even when its address matches a learned member, so legitimate endpoint
 // reuse can recover from a stale learned server id. Nothing is persisted by
 // the Data Node.

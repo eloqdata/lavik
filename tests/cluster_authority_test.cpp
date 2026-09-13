@@ -10,7 +10,9 @@
 #include <vector>
 
 #include "keylane/cluster/authority.h"
+#include "keylane/cluster/node_control.h"
 #include "keylane/cluster/topology.h"
+#include "cluster/test_topology_installer.h"
 
 namespace {
 
@@ -124,6 +126,19 @@ RequestView MakeRequest(std::span<const std::uint16_t> slots, bool is_write,
   request.loading_allowed_ = loading_allowed;
   return request;
 }
+
+struct TestAuthorityControl {
+  TestAuthorityControl()
+      : authority(cache),
+        installer(cache, authority, actions),
+        topology(installer, cache) {}
+
+  keylane::cluster::TopologyCache cache;
+  AuthorityGuard authority;
+  keylane::cluster::NullNodeControlActions actions;
+  keylane::cluster::NodeControlInstaller installer;
+  keylane::cluster::testing::TestTopologyInstaller topology;
+};
 
 // MOVED targets always carry the concrete advertised host plus both ports;
 // the Redis layer picks the port by the connection's TLS state.
@@ -444,18 +459,19 @@ TEST(GroupInFlightTest, MoveTransfersOwnership) {
 }
 
 TEST(AuthorityGuardTest, RegistrationHandshakeOwnsOneGuardPerGroup) {
-  keylane::cluster::TopologyCache cache;
-  cache.Publish(BuildState(kNodeA));
-  AuthorityGuard authority(cache, AuthorityGuard::LeaseMode::kPermanent);
+  TestAuthorityControl control;
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), {}).ok());
   const std::array<std::uint16_t, 2> duplicate_slots{kSlotInA, kSlotInA};
   const auto admission =
-      authority.CaptureAndAdmit(MakeRequest(duplicate_slots, /*is_write=*/true),
-                                keylane::cluster::MonotonicTime{});
+      control.authority.CaptureAndAdmit(
+          MakeRequest(duplicate_slots, /*is_write=*/true),
+          keylane::cluster::MonotonicTime{});
 
   AuthorityInFlightGuards guards;
   EXPECT_EQ(
-      authority.RegisterAndRecheck(admission, /*worker_stripe=*/2,
-                                   keylane::cluster::MonotonicTime{}, &guards),
+      control.authority.RegisterAndRecheck(
+          admission, /*worker_stripe=*/2,
+          keylane::cluster::MonotonicTime{}, &guards),
       RecheckResult::kOk);
   EXPECT_EQ(guards.size(), 1U);
   EXPECT_EQ(admission.state()->GroupInFlightCount(kGroupA), 1U);
@@ -464,53 +480,60 @@ TEST(AuthorityGuardTest, RegistrationHandshakeOwnsOneGuardPerGroup) {
   EXPECT_EQ(admission.state()->GroupInFlightCount(kGroupA), 0U);
 }
 
-TEST(AuthorityGuardTest, RejectedRegistrationReleasesItsGuard) {
-  keylane::cluster::TopologyCache cache;
-  cache.Publish(BuildState(kNodeA));
-  AuthorityGuard authority(cache, AuthorityGuard::LeaseMode::kPermanent);
+TEST(AuthorityGuardTest,
+     TopologyTransitionRejectsRegistrationAndReleasesItsGuard) {
+  TestAuthorityControl control;
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), {}).ok());
   const std::array<std::uint16_t, 1> slots{kSlotInA};
-  const auto admission = authority.CaptureAndAdmit(
+  const auto admission = control.authority.CaptureAndAdmit(
       MakeRequest(slots, /*is_write=*/true), keylane::cluster::MonotonicTime{});
 
   GroupView fenced = GroupA();
   fenced.granted_ = false;
-  cache.Publish(BuildState(kNodeA, std::move(fenced), GroupB()));
+  ASSERT_TRUE(control.topology
+                  .Install(BuildState(kNodeA, std::move(fenced), GroupB()), {})
+                  .ok());
   AuthorityInFlightGuards guards;
   EXPECT_EQ(
-      authority.RegisterAndRecheck(admission, /*worker_stripe=*/0,
-                                   keylane::cluster::MonotonicTime{}, &guards),
+      control.authority.RegisterAndRecheck(
+          admission, /*worker_stripe=*/0,
+          keylane::cluster::MonotonicTime{}, &guards),
       RecheckResult::kReject);
   EXPECT_TRUE(guards.empty());
   EXPECT_EQ(admission.state()->GroupInFlightCount(kGroupA), 0U);
 }
 
 TEST(AuthorityGuardTest, FinalMutationRecheckTracksAggregateOutcome) {
-  keylane::cluster::TopologyCache cache;
-  cache.Publish(BuildState(kNodeA));
-  AuthorityGuard authority(cache, AuthorityGuard::LeaseMode::kPermanent);
+  TestAuthorityControl control;
+  ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), {}).ok());
   const std::array<std::uint16_t, 1> slots{kSlotInA};
-  const auto started = authority.CaptureAndAdmit(
+  const auto started = control.authority.CaptureAndAdmit(
       MakeRequest(slots, /*is_write=*/true), keylane::cluster::MonotonicTime{});
-  const auto rejected = authority.CaptureAndAdmit(
+  const auto rejected = control.authority.CaptureAndAdmit(
       MakeRequest(slots, /*is_write=*/true), keylane::cluster::MonotonicTime{});
 
   EXPECT_EQ(
-      authority.RecheckAtMutation(started, keylane::cluster::MonotonicTime{}),
+      control.authority.RecheckAtMutation(
+          started, keylane::cluster::MonotonicTime{}),
       RecheckResult::kOk);
   EXPECT_TRUE(started.mutation_started());
   EXPECT_FALSE(started.final_recheck_failed());
 
   GroupView fenced = GroupA();
   fenced.granted_ = false;
-  cache.Publish(BuildState(kNodeA, std::move(fenced), GroupB()));
+  ASSERT_TRUE(control.topology
+                  .Install(BuildState(kNodeA, std::move(fenced), GroupB()), {})
+                  .ok());
   EXPECT_EQ(
-      authority.RecheckAtMutation(started, keylane::cluster::MonotonicTime{}),
+      control.authority.RecheckAtMutation(
+          started, keylane::cluster::MonotonicTime{}),
       RecheckResult::kReject);
   EXPECT_TRUE(started.mutation_started());
   EXPECT_TRUE(started.final_recheck_failed());
 
   EXPECT_EQ(
-      authority.RecheckAtMutation(rejected, keylane::cluster::MonotonicTime{}),
+      control.authority.RecheckAtMutation(
+          rejected, keylane::cluster::MonotonicTime{}),
       RecheckResult::kReject);
   EXPECT_FALSE(rejected.mutation_started());
   EXPECT_TRUE(rejected.final_recheck_failed());

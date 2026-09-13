@@ -95,14 +95,12 @@ inline constexpr GroupIndex kNoGroupIndex =
     std::numeric_limits<GroupIndex>::max();
 static_assert(kSlotCount < kNoGroupIndex);
 
-// One cluster node as the data plane sees it. Static mode builds this from its
-// topology file; Meta-managed mode builds it from an authenticated complete
-// desired state. Static mode applies the cluster-wide uniform TLS-port
-// assumption documented by control_port.h; Meta mode preserves each node's
-// committed endpoint independently.
+// One cluster node as the data plane sees it, built from an authenticated
+// complete desired state. Each node retains its independently committed
+// plaintext and TLS client endpoints.
 struct alignas(64) NodeDescriptor {
   NodeId node_id_;              // stable across restarts
-  bool link_connected_ = true;  // parsed from the file; not consulted in v1
+  bool link_connected_ = true;  // projected diagnostic; not consulted in v1
   std::uint16_t port_ = 0;
   std::uint16_t tls_port_ = 0;  // 0 = TLS not offered
   // kNoNodeIndex identifies a primary; replicas point at their primary in
@@ -137,7 +135,7 @@ struct alignas(64) NodeDescriptor {
 static_assert(sizeof(NodeDescriptor) == 64);
 static_assert(alignof(NodeDescriptor) == 64);
 
-// Slot range, both ends inclusive, as written in a nodes.conf node line.
+// Redis Cluster slot range, both ends inclusive.
 struct SlotRange {
   std::uint16_t first_ = 0;
   std::uint16_t last_ = 0;
@@ -227,14 +225,12 @@ class [[nodiscard]] InFlightGuard {
 };
 
 // Authority and readiness for one shard group. `group_id_` is opaque to the
-// data plane; the static adapter uses the primary's node id while Meta control
-// supplies the committed Meta group id through the node controller.
+// data plane and supplied by Meta through the node controller.
 struct GroupView {
   std::string group_id_;
   NodeIndex primary_node_index_ = kNoNodeIndex;
   // Meta creates a fresh assignment incarnation on remove/re-add. Monotonic
   // authority counters are compared only while this identity is unchanged.
-  // Static topology leaves it empty and uses a permanent local lease.
   AssignmentId assignment_id_;
   // This is the committed desired grant, not a live lease. A Meta-managed
   // primary serves only while AuthorityGuard also holds an unexpired lease.

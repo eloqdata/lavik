@@ -1,9 +1,9 @@
 #pragma once
 
-// Data-side control installation seam. Protocol clients and the static-file
-// adapter submit complete domain messages here; only this module publishes a
-// ServingState, changes live authority, revokes source capabilities, or
-// dispatches storage-mutating directives.
+// Data-side control installation seam. The Meta protocol client submits
+// complete domain messages here; only this module publishes a ServingState,
+// changes live authority, revokes source capabilities, or dispatches
+// storage-mutating directives.
 
 #include <cstdint>
 #include <functional>
@@ -58,8 +58,8 @@ struct PreparedFullState {
   // projection hash.
   Sha256Digest object_hash_{};
   // Exact member incarnations and manifest binding from the same decoded FDS.
-  // Static topology leaves this empty because it has no Meta directives or
-  // boot-local population proof to validate.
+  // Test-only projections may leave this empty when they exercise routing and
+  // authority without directives or boot-local population proof.
   std::vector<PreparedGroupControlIdentity> control_groups_;
 };
 
@@ -215,23 +215,19 @@ class NodeDirectiveCompletion {
 };
 
 // Narrow internal seam implemented by the ReplicationManager adapter in the
-// server. Tests use a recording adapter; static-only deployments use the
-// no-op adapter because they receive no Meta directives or source grants.
-// The two revocation entry points are intentional: static topology reload is
-// a non-suspending signal path and can use only the synchronous operation,
-// while Meta transitions must await ReplicationManager cleanup. A dynamic
-// adapter fails the synchronous entry rather than detach cleanup and report a
-// false success.
+// server. Tests may use a recording or no-op adapter. Meta transitions await
+// ReplicationManager cleanup; a dynamic adapter fails the synchronous entry
+// rather than detach cleanup and report a false success.
 class NodeControlActions {
  public:
   virtual ~NodeControlActions() = default;
-  // False only for a static adapter that can never receive or retain target
-  // population work. This permits its non-suspending readiness reload path;
-  // directive-capable adapters must use the runtime storage-loss barrier.
+  // False only for a test adapter that can never receive or retain target
+  // population work. Directive-capable adapters must use the runtime
+  // storage-loss barrier.
   virtual bool ReceivesDirectives() const noexcept { return true; }
   virtual absl::Status RevokeSourceAuthorizations() = 0;
   // Dynamic Meta transitions await this operation before acknowledging the
-  // transition. The default preserves the synchronous static/test adapter;
+  // transition. The default preserves the synchronous test adapter;
   // adapters backed by asynchronous subsystems must override it rather than
   // detach work and report completion early.
   virtual celer::Task<absl::Status> RevokeSourceAuthorizationsAndWait();
@@ -302,20 +298,18 @@ class NodeControlInstaller {
   NodeControlInstaller(const NodeControlInstaller&) = delete;
   NodeControlInstaller& operator=(const NodeControlInstaller&) = delete;
 
-  // Installs one completely decoded and validated snapshot through a static
+  // Installs one completely decoded and validated snapshot through a test
   // adapter that never receives directives. Directive-capable adapters must
   // use InstallFullStateTransition(), even when a particular snapshot appears
   // to require no cleanup: concurrent admission is what makes the synchronous
-  // path unsafe. The adapter owns serialization: Meta transitions run on
-  // worker 0, while static startup/reload holds StaticClusterControl's refresh
-  // mutex across this call and worker-0 readiness changes. Lower source
-  // indices and same-assignment counter regressions fail closed; same
-  // index/hash replay is idempotent.
+  // path unsafe. Meta transitions run on worker 0. Lower source indices and
+  // same-assignment counter regressions fail closed; same index/hash replay is
+  // idempotent.
   absl::Status InstallFullState(PreparedFullState prepared_state,
                                 ProjectionBasis projection_basis);
 
   // Applies a live lease at the caller's suspend-aware clock cut, or a
-  // committed fence only for a static adapter that never receives directives.
+  // committed fence through the synchronous test seam.
   // Requiring `now` prevents a delayed caller from reviving an already-expired
   // same-anchor lease. ReplicationManager-backed Meta grants/fences use the
   // asynchronous transitions below so cleanup is joined. In every case the
@@ -367,7 +361,7 @@ class NodeControlInstaller {
   // arrives between sessions and there is no current SessionIdentity.
   celer::Task<absl::Status> CancelPopulationForShutdownTransition();
 
-  // Synchronous static/test session-loss path. Memory authority is invalidated
+  // Synchronous test session-loss path. Memory authority is invalidated
   // even when a directive-capable adapter rejects the remaining cleanup; Meta
   // callers then use LoseSessionTransition(). It intentionally does not
   // synthesize or publish a fenced topology, because Meta remains the sole
@@ -394,7 +388,7 @@ class NodeControlInstaller {
   // local proof loss.
   celer::Task<absl::Status> RevokeSourceAuthorizationsTransition();
 
-  // Publishes startup/static local storage readiness together with the current
+  // Publishes initial local storage readiness together with the current
   // committed topology. Runtime true-to-false transitions must use
   // LoseStorageReadinessTransition(), whose cancellation work can suspend.
   // A process whose storage has failed cannot become ready again before

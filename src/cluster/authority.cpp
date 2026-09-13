@@ -84,11 +84,10 @@ Decision Admit(const ServingState* state, const RequestView& request) {
   }
 
   // No-key commands admit locally; readiness above is the only generic gate.
-  // The Redis adapter either binds an eligible static global mutation to one
-  // representative owner slot or rejects it, because an empty slot set cannot
-  // name authority or a drain cell. Callers also report key-extraction failure
-  // as empty so malformed commands reach their own argument error, matching
-  // Redis getNodeByQuery.
+  // The Redis adapter rejects persistent global mutations before this point,
+  // because an empty slot set cannot name authority or a drain cell. Callers
+  // also report key-extraction failure as empty so malformed commands reach
+  // their own argument error, matching Redis getNodeByQuery.
   if (request.slots_.empty()) {
     decision.kind_ = Decision::Kind::kServe;
     return decision;
@@ -187,8 +186,7 @@ bool AuthorityUnchanged(const ServingState& admitted,
   return true;
 }
 
-AuthorityGuard::AuthorityGuard(TopologyCache& topology, LeaseMode lease_mode)
-    : topology_(topology), lease_mode_(lease_mode) {}
+AuthorityGuard::AuthorityGuard(TopologyCache& topology) : topology_(topology) {}
 
 std::optional<AuthorityAnchor> AuthorityGuard::LocalPrimaryAnchor(
     const ServingState& state, std::string_view group_id) {
@@ -210,7 +208,6 @@ std::optional<AuthorityAnchor> AuthorityGuard::LocalPrimaryAnchor(
 bool AuthorityGuard::LeaseCoversLocked(const ServingState& state,
                                        std::span<const std::uint16_t> slots,
                                        MonotonicTime now) const {
-  if (lease_mode_ == LeaseMode::kPermanent) return true;
   if (!session_.has_value()) return false;
 
   // Redis admits only same-slot requests, but keeping this loop general makes
@@ -344,10 +341,6 @@ absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
                                         const AuthorityAnchor& anchor,
                                         MonotonicTime deadline,
                                         MonotonicTime now) {
-  if (lease_mode_ != LeaseMode::kFinite) {
-    return absl::FailedPreconditionError(
-        "a permanent/static authority guard does not accept lease grants");
-  }
   if (!session.complete()) {
     return absl::InvalidArgumentError("lease session identity is incomplete");
   }
@@ -389,7 +382,7 @@ absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
 bool AuthorityGuard::ExpireLease(const SessionIdentity& session,
                                  const AuthorityAnchor& anchor,
                                  MonotonicTime deadline, MonotonicTime now) {
-  if (lease_mode_ != LeaseMode::kFinite || now < deadline) return false;
+  if (now < deadline) return false;
   const std::lock_guard lock(mutex_);
   if (!session_.has_value() || *session_ != session) return false;
   const auto lease = leases_.find(anchor.group_id_);
@@ -405,7 +398,6 @@ bool AuthorityGuard::ExpireLease(const SessionIdentity& session,
 }
 
 void AuthorityGuard::InvalidateSession(const SessionIdentity& session) {
-  if (lease_mode_ != LeaseMode::kFinite) return;
   const std::lock_guard lock(mutex_);
   if (!session_.has_value() || *session_ != session) return;
   session_.reset();
@@ -415,7 +407,6 @@ void AuthorityGuard::InvalidateSession(const SessionIdentity& session) {
 
 void AuthorityGuard::InvalidateAnchorsChanged(const ServingState* before,
                                               const ServingState& after) {
-  if (lease_mode_ != LeaseMode::kFinite) return;
   const std::lock_guard lock(mutex_);
   bool invalidated = false;
   for (auto it = leases_.begin(); it != leases_.end();) {
@@ -436,7 +427,6 @@ void AuthorityGuard::InvalidateAnchorsChanged(const ServingState* before,
 }
 
 void AuthorityGuard::Fence(const AuthorityAnchor& anchor) {
-  if (lease_mode_ != LeaseMode::kFinite) return;
   const std::lock_guard lock(mutex_);
   const auto lease = leases_.find(anchor.group_id_);
   if (lease == leases_.end()) return;
@@ -445,7 +435,6 @@ void AuthorityGuard::Fence(const AuthorityAnchor& anchor) {
 }
 
 void AuthorityGuard::InvalidateLeases() {
-  if (lease_mode_ != LeaseMode::kFinite) return;
   const std::lock_guard lock(mutex_);
   if (leases_.empty()) return;
   leases_.clear();
@@ -453,7 +442,6 @@ void AuthorityGuard::InvalidateLeases() {
 }
 
 void AuthorityGuard::InvalidateAll() {
-  if (lease_mode_ != LeaseMode::kFinite) return;
   const std::lock_guard lock(mutex_);
   session_.reset();
   leases_.clear();

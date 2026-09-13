@@ -40,17 +40,12 @@ struct ReplicaOfConfig {
 };
 
 struct ReplicationOptions {
-  // Any Redis Cluster data plane disables standalone upstream control and
-  // every Redis PSYNC export. Static topology also disables native export;
-  // Meta-managed native export instead requires an exact population grant.
+  // Cluster mode is always Meta-managed. It disables standalone upstream
+  // control and Redis PSYNC export; native export requires an exact population
+  // grant from the active Meta session.
   bool cluster_enabled_ = false;
-  // Meta-managed replication is fail-closed and assigns this process to at
-  // most one replication group. It must not infer recovered storage as an
-  // activated population; only NodeControl may install the boot-local proof.
-  bool cluster_population_managed_ = false;
-  // Set only by the Meta control adapter to its validated 160-bit data-node
-  // identity. A missing value keeps standalone and static-file deployments on
-  // a fresh CSPRNG identity for each process boot.
+  // Set by the Meta control adapter to its validated 160-bit data-node
+  // identity. Standalone deployments use a fresh CSPRNG identity each boot.
   std::optional<std::string> node_id_override_;
   // Consulted only while this node has an upstream. REPLICAOF NO ONE opens
   // writes only after the shared promotion durability path succeeds.

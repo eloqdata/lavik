@@ -449,7 +449,7 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
         const GroupIndex existing = slot_to_group[slot];
         if (existing != kNoGroupIndex) {
           // Any double assignment is rejected, including within one group:
-          // neither the static file nor Meta can legitimately produce it.
+          // no committed Meta projection can legitimately produce it.
           const GroupView& owner = groups_[static_cast<std::size_t>(existing)];
           return absl::InvalidArgumentError(absl::StrCat(
               "slot ", slot, " is covered by both group '", owner.group_id_,
@@ -495,7 +495,7 @@ std::uint64_t TopologyCache::Publish(
   if (current != nullptr && state != nullptr &&
       current->content_hash() == state->content_hash()) {
     // Content-identical republish: keep the older snapshot and the version,
-    // so reload churn is invisible to observers (invariant 2). Note the
+    // so projection replay is invisible to observers (invariant 2). Note the
     // check-then-store is deliberately not serialized: two publishers racing
     // with different content simply produce two bumps with the last store
     // winning.

@@ -8,7 +8,7 @@ the owning node, or must refuse it with a standard cluster error. Ordinary
 requests never consult an external control plane; each node answers from its
 locally committed view of slot ownership, authority, and readiness.
 
-The module under `include/keylane/cluster/` and `src/cluster/` exposes six
+The module under `include/keylane/cluster/` and `src/cluster/` exposes five
 seams:
 
 - `TopologyCache` holds the committed `ServingState` and publishes it
@@ -24,8 +24,6 @@ seams:
   atomically publishes full state, installs finite leases and fences, drains
   retired request generations, revokes source capabilities, and dispatches
   typed replication directives.
-- `ClusterControlPort` supplies complete target state for the static-file
-  adapter and in-memory tests.
 - `MetaControlClientService` owns leader discovery and the one outbound
   Meta-to-Data control session. It maps authenticated wire values into the
   node controller; neither it nor replication writes `TopologyCache`
@@ -72,7 +70,7 @@ when equal even sequence reads surround it, so they cannot pair a newly stored
 snapshot with the preceding version. The cache also carries a monotonic logical
 version for publication ordering and tests. A content-identical republication
 (decided by a content hash over the semantic state) is a no-op that keeps the
-existing snapshot, version, and sequence, so reload churn is invisible.
+existing snapshot, version, and sequence, so projection replay is invisible.
 Authority decisions never consult the global version: admission captures the
 snapshot it decided against, and the owner-side re-check compares a per-group
 authority token — owner identity, term, grant, and readiness, precomputed at
@@ -230,16 +228,18 @@ process from becoming current even though the durable data files remain.
 
 The Data process connects outward from configured numeric seed endpoints. It
 tries the accepted leader hint, the latest in-memory committed directory, then
-the static seeds, with full-jitter exponential backoff from one to ten seconds.
+the configured bootstrap seeds, with full-jitter exponential backoff from one
+to ten seconds.
 An unresolved seed remains a fallback even when a learned member currently
 announces the same endpoint, because endpoint ownership can legitimately change
 across reconfiguration. A response replaces the in-memory directory atomically
 only after its member identities and the peer's authenticated URI principal
 agree. A learned dial target pins that exact prior committed principal against
-the new `ServerHello`; only an unresolved static seed may bootstrap its binding
-from the authenticated Hello. The hint and directory are intentionally not persisted. Connect, TLS,
-Hello, read progress, and write progress each have a ten-second bound; backoff
-resets only after an accepted session has produced a valid `HeartbeatAck`.
+the new `ServerHello`; only an unresolved configured seed may bootstrap its
+binding from the authenticated Hello. The hint and directory are intentionally
+not persisted. Connect, TLS, Hello, read progress, and write progress each have
+a ten-second bound; backoff resets only after an accepted session has produced
+a valid `HeartbeatAck`.
 
 The session uses control protocol v1 with framing independent of TCP packets.
 A fixed header carries type, length, per-direction sequence, and CRC32C. Frames
@@ -568,7 +568,7 @@ RESP3. Deliberately unsupported administrative mutations use stable Keylane
 | `SELECT` with a nonzero index | `-ERR SELECT is not allowed in cluster mode` |
 | `COPY` with a `DB` option | `-ERR Copying to another database is not allowed in cluster mode` |
 | `REPLICAOF` / `ADDREPLICAOF` | `-ERR REPLICAOF not allowed in cluster mode.` |
-| Unauthorised `FLUSHDB`, `FLUSHALL`, or catalog-changing `FUNCTION` subcommands | `-ERR <command> is not allowed in cluster mode` |
+| `FLUSHDB`, `FLUSHALL`, or catalog-changing `FUNCTION` subcommands | `-ERR <command> is not allowed in cluster mode` |
 | Unknown `CLUSTER` subcommand or wrong arity | `-ERR Unknown CLUSTER subcommand or wrong number of arguments for '<sub>'` |
 | Execution outcome undeterminable | No reply; the connection is closed |
 
@@ -588,19 +588,13 @@ slot, and `redis.call` access outside the admitted slot set is rejected with
 Redis's non-local-key error. Read-only global commands and process-local
 administration (INFO, CONFIG, DBSIZE, SCAN, SCRIPT cache management, and
 similar) keep node-local semantics and are governed only by readiness.
-Meta-managed nodes reject `FLUSHDB`, `FLUSHALL`, and catalog-changing
+Cluster nodes reject `FLUSHDB`, `FLUSHALL`, and catalog-changing
 `FUNCTION LOAD`, `DELETE`, `FLUSH`, and `RESTORE`: they mutate durable
 process-wide state but carry no slot from which finite authority can derive a
-group lease and drain cell. Static compatibility mode permits them only when
-this process is the sole granted local slot-owning primary group. It binds the
-request to that group's first slot, so the ordinary generation recheck and
-in-flight drain protect an SIGHUP role change. Static replicas, slotless
-primaries, and ambiguous multi-group configurations reject them because they
-cannot supply that drain proof. Queued Function catalog mutations contribute
-the representative slot to an `EXEC` union and pass through the same final
-recheck. `FUNCTION KILL` and `FUNCTION STATS` remain available while loading
-so an executing Function can be stopped or inspected; they do not mutate the
-catalog.
+group lease and drain cell. Queuing one in `MULTI` marks the transaction dirty,
+so `EXEC` aborts rather than creating a slotless authority exception.
+`FUNCTION KILL` and `FUNCTION STATS` remain available while loading so an
+executing Function can be stopped or inspected; they do not mutate the catalog.
 
 ## CLUSTER subcommands and discovery surface
 
@@ -621,62 +615,27 @@ is unchanged: it keeps the legacy replication-derived `CLUSTER NODES`/`SLOTS`
 shim that fakes full coverage, and its replica-redirect MOVED shim never runs
 in cluster mode because the two topology sources are mutually exclusive.
 
-## Control ports and configuration
+## Meta control and configuration
 
-`ClusterControlPort::RefreshTarget` is the synchronous static-control path. It
-reads the file adapter's target and asks `NodeControlInstaller` to publish only
-a complete, validated state; on error the previous state stays in effect.
-Meta-controlled state enters through the asynchronous client/session path and
-the same installer, which can wait for replication revocation and request
-drain before acknowledging a transition.
-
-`StaticClusterControl` loads a Redis `nodes.conf`-format file shared by every
-node. The file carries no `myself` mark; the local entry is identified by
-matching the process's bind host and port against node lines (wildcard binds
-match on port alone) and must match exactly one entry, or startup validation
-fails. Migration markers (`[slot-<-id]`, `[slot->-id]`) are rejected outright
-rather than silently misparsed — there is no importing/migrating flow to give
-them meaning. The bus port and gossip bookkeeping fields are validated and
-dropped; replica wiring is validated before groups are assembled. Only
-slot-owning primaries form groups, with the primary's node id as the group
-id, and statically configured primaries hold a permanent grant. Readiness
-follows storage recovery: the first publication is not ready, so the gate
-answers LOADING until recovery (and any startup RDB import) completes.
-Static topology does not wire a replication role lifecycle, so every static
-node starts without durable expiration authority and rejects both native and
-Redis replication export. Read paths still hide values after their absolute
-deadline. Recovery retains an expired winning record in the index and does not
-append a tombstone or reclaim it while authority is withheld; this preserves
-its suppression of older versions without creating a local durable mutation.
-Meta-managed mode authorizes native population transfer only through its
-fenced lifecycle. When an authoritative promotion later grants expiration,
-the ordinary active-expiration loop can durably retire those retained winners.
-
-The static adapter loads once at startup — a first-load failure is fatal —
-and reloads on SIGHUP, which wakes the main loop through its own eventfd
-(the shutdown eventfd treats any write as a stop request and is never
-shared). A failed reload keeps the previously published state; an identical
-file republishes nothing. Node ids come from the file, keeping `MYID` stable
-across restarts, and the file carries only data ports: every node is assumed
-to serve TLS on one cluster-wide configured port. `InMemoryClusterControl`
-publishes programmatically built states — including fenced or not-ready
-states the static adapter never produces — through the same seam for
-in-process tests.
+Meta-controlled state enters only through the asynchronous client/session path
+and `NodeControlInstaller`, which can wait for replication revocation and
+request drains before acknowledging a transition. Production startup never
+installs a local topology or positive authority. Read paths still hide expired
+values after their absolute deadline; without a valid lease, recovery cannot
+append the authoritative tombstone or reclaim the retained winner.
 
 Startup-only directives configure the subsystem: `cluster-enabled` (default
-`no`); exactly one of `cluster-static-nodes-file` or repeatable
-`cluster-meta-seed`; `cluster-node-id` for Meta mode; and
+`no`); repeatable `cluster-meta-seed`; required `cluster-node-id`; and
 `cluster-announce-ip`, `cluster-announce-port`, and
-`cluster-announce-tls-port`. Announce values
-default to the first non-wildcard bind address and the corresponding listen
-ports; a wildcard bind leaves the announce host empty so discovery self
-entries keep the startup-node convention. Meta mode requires a canonical
-40-character lowercase node id and at least one numeric seed. Static and Meta
-control are mutually exclusive. Both modes refuse coexistence with either
-replication upstream directive (two topology sources never mix; runtime
-`REPLICAOF` is rejected separately at the command layer), and require at least
-one reachable announced client port so MOVED and discovery can always name an
-endpoint — a TLS-only deployment is valid.
+`cluster-announce-tls-port`. Announce values default to the first non-wildcard
+bind address and the corresponding listen ports; a wildcard bind leaves the
+announce host empty so discovery self entries keep the startup-node convention.
+Cluster mode requires a canonical 40-character lowercase node id and at least
+one numeric Meta seed. It refuses coexistence with either replication upstream
+directive (two topology sources never mix; runtime `REPLICAOF` is rejected
+separately at the command layer), and requires at least one reachable announced
+client port so MOVED and discovery can always name an endpoint — a TLS-only
+deployment is valid.
 
 Data-to-Meta mTLS is optional and all-or-none. When enabled, the Data client
 reuses its existing replication TLS CA/certificate/key and presents the
@@ -691,8 +650,7 @@ partially configured.
 The data plane deliberately excludes: ASK/ASKING and the
 importing/migrating compatibility flow, the gossip bus protocol, protocol
 deltas, Data-side durable control journals, shard Pub/Sub, non-uniform TLS
-ports in static `nodes.conf` mode, dynamic node-id allocation, group-scoped
-authority for persistent
+ports, dynamic node-id allocation, group-scoped authority for persistent
 no-key mutations, and the remaining `CLUSTER` management subcommands
 (`SETSLOT`, `MEET`, `FAILOVER`, `ADDSLOTS`, and similar).
 
@@ -702,10 +660,8 @@ The admission decision matrix, builder and parser validation, content-hash
 publication semantics, finite lease lifecycle, frame and complete-object
 codecs, projection validation, drain behavior, TLS-aware endpoint selection,
 in-flight counter concurrency and cell sharing, and the CLUSTER wire texts and
-reply shapes are unit-tested through pure seams and the in-memory adapter. The
-three-node static-cluster end-to-end suite verifies routing, redirects,
-read-only replica admission, cluster-mode command restrictions, static export
-denial, expiration-authority state, INFO/CLUSTER replies, and topology reload.
+reply shapes are unit-tested through pure seams and the test-only finite-lease
+topology installer.
 A real-process plaintext Data-control gate starts three Meta members and a Data
 node, exercising follower-seed redirect, full-state install, heartbeat
 observation, leader failure and reconnect, stale-member restart, and graceful
@@ -714,8 +670,11 @@ selection. The cluster-create process gate starts one bootstrap Meta and two
 Groups of initially unregistered, fenced primary/replica Data nodes. It covers
 automatic and explicit slot layouts, interactive and `--yes` confirmation,
 real sparse-population initialization, native full rebuild and continued
-replication, Redis routing/redirect/cross-slot behavior, and exact node-level
-diagnostics when one replica is stopped.
+replication, Redis routing, `redis-cli` redirect following, cross-slot and
+cluster-command restrictions, READONLY replica access, discovery, and exact
+node-level diagnostics when one replica is stopped. Focused TTL and rebuild
+tests validate recovery without expiration authority and the durable
+incomplete-full-sync fence without a local topology source.
 
 ## Source map
 
@@ -727,14 +686,12 @@ diagnostics when one replica is stopped.
 | Meta/Data protocol framing, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Node controller, full-state validation, finite authority, drain, and typed replication adaptation | `include/keylane/cluster/node_control.h`, `include/keylane/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp` |
 | Meta discovery and outbound Data control session | `include/keylane/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
-| Control-port seam, nodes.conf adapter, and in-memory adapter | `include/keylane/cluster/control_port.h`, `src/cluster/control_port.cpp` |
 | Process-wide runtime installation | `include/keylane/cluster/runtime.h`, `src/cluster/runtime.cpp` |
 | Cluster admission gate, owner/final re-check plumbing, outcome finalization, EXEC/Lua/blocking integration, and mode-restricted command policies | `src/redis/command.cpp`, `src/redis/cluster_gate.h`, `src/redis/blocking_wait.cpp` |
 | CLUSTER subcommands and discovery replies | `src/redis/cluster_command.cpp`, `src/redis/cluster_command.h` |
 | Cluster wire error texts | `include/keylane/resp.h`, `src/redis/resp.cpp` |
 | Per-shard transaction validator hook | `include/keylane/tx/transaction.h`, `src/tx/transaction.cpp` |
-| Startup wiring, storage-ready publication, and SIGHUP reload | `src/redis/server.cpp` |
+| Startup wiring, storage-ready publication, and Meta control client ownership | `src/redis/server.cpp` |
 | Cluster configuration directives and validation | `include/keylane/server.h`, `src/config.cpp`, `app/keylane.cpp` |
-| Decision matrix, parser, publication, and concurrency unit tests | `tests/cluster_authority_test.cpp`, `tests/cluster_control_port_test.cpp`, `tests/cluster_topology_test.cpp`, `tests/cluster_command_test.cpp` |
+| Decision matrix, publication, finite-lease test adapter, and concurrency unit tests | `tests/cluster_authority_test.cpp`, `tests/cluster/test_topology_installer.h`, `tests/cluster_topology_test.cpp`, `tests/cluster_command_test.cpp` |
 | Real-process Meta/Data discovery, failover, mTLS, initial creation, and shutdown gates | `tests/meta_integration/gate_data_control.py`, `tests/meta_integration/gate_cluster_create.py` |
-| Static-cluster routing, admission, policy, and reload end-to-end suite | `tests/cluster_e2e_test.cpp` |

@@ -126,7 +126,7 @@ redirects, capture, and response I/O.
 ## Create the first multi-Group cluster
 
 `keylane-ctl cluster-create` is the v1 topology-creation path for a fresh
-statically bootstrapped Meta cluster and one or more preconfigured Data
+manifest-bootstrapped Meta cluster and one or more preconfigured Data
 processes. It is not an import, expansion, or retry-existing command. One Meta
 Raft cluster permanently owns at most one logical Data cluster. Only lifecycle
 `uninitialized` accepts creation, and the environment must also contain no
@@ -535,7 +535,7 @@ keylane-meta \
 ```
 
 Start every initial member with the equivalent member-specific certificate
-and the same manifest. The first election authenticates the complete static
+and the same manifest. The first election authenticates the complete manifest
 peer set; it does not join members sequentially. Omit the manifest from every
 later restart. A future dynamic joiner starts with mTLS but without a manifest,
 then enters through `addsrv` with all three endpoints.
@@ -554,8 +554,8 @@ worker or make WAL synchronization asynchronous.
 ## Configure Data nodes
 
 A Meta-managed Data process needs its committed 40-character lowercase hex
-node id and one or more numeric Data-control seeds. Static topology and Meta
-control are mutually exclusive. Before starting a new Data process, register
+node id and one or more numeric Data-control seeds. It is the only production
+Cluster control mode. Before starting a new Data process, register
 that identity and its client endpoint on the Meta leader. The endpoint is
 tagged `tcp://` or `tls://`; a dual-listener node may supply one of each, using
 the same numeric host:

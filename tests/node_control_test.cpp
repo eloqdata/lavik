@@ -410,8 +410,7 @@ class RecordingActions final : public NodeControlActions {
 
 struct DynamicControl {
   DynamicControl()
-      : guard(cache, AuthorityGuard::LeaseMode::kFinite),
-        installer(cache, guard, actions) {}
+      : guard(cache), installer(cache, guard, actions) {}
 
   TopologyCache cache;
   AuthorityGuard guard;
@@ -2540,22 +2539,6 @@ TEST(NodeControlInstallerTest,
   ASSERT_TRUE(rejected.result().has_value());
   EXPECT_EQ(rejected.result()->code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_EQ(control.actions.directives_.size(), 2U);
-}
-
-TEST(AuthorityGuardTest, StaticLeaseIsPermanentButTopologyStillRechecks) {
-  TopologyCache cache;
-  AuthorityGuard guard(cache, AuthorityGuard::LeaseMode::kPermanent);
-  cache.Publish(MakeState());
-  constexpr std::array<std::uint16_t, 1> slots{12};
-  const AuthorityAdmission admission =
-      guard.CaptureAndAdmit(WriteRequest(slots), MonotonicTime{});
-  EXPECT_EQ(admission.decision().kind_, Decision::Kind::kServe);
-  EXPECT_EQ(guard.Recheck(admission, MonotonicTime{} + 1000h),
-            RecheckResult::kOk);
-
-  cache.Publish(MakeState(Assignment(2), 2));
-  EXPECT_EQ(guard.Recheck(admission, MonotonicTime{} + 1000h),
-            RecheckResult::kReject);
 }
 
 }  // namespace

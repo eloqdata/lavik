@@ -433,7 +433,7 @@ absl::Status ApplyRedisConfigDirective(
     }
     return absl::OkStatus();
   }
-  // Redis Cluster data plane. All five directives are
+  // Redis Cluster data plane. These directives are
   // startup-only: runtime CONFIG SET goes through the separate
   // kRuntimeConfigs table and never reaches this function.
   if (name == "cluster-enabled") {
@@ -443,12 +443,10 @@ absl::Status ApplyRedisConfigDirective(
     options->cluster_enabled_ = *enabled;
     return absl::OkStatus();
   }
-  if (name == "cluster-static-nodes-file" || name == "cluster-announce-ip" ||
-      name == "cluster-node-id" || name == "cluster-meta-seed") {
+  if (name == "cluster-announce-ip" || name == "cluster-node-id" ||
+      name == "cluster-meta-seed") {
     if (directive.size() != 2) return WrongArgumentCount(name);
-    if (name == "cluster-static-nodes-file") {
-      options->cluster_static_nodes_file_ = directive[1];
-    } else if (name == "cluster-announce-ip") {
+    if (name == "cluster-announce-ip") {
       options->cluster_announce_ip_ = directive[1];
     } else if (name == "cluster-node-id") {
       options->cluster_node_id_ = directive[1];
@@ -632,41 +630,35 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
     return absl::InvalidArgumentError(
         "client-query-buffer-limit must be between 1mb and LONG_MAX bytes");
   }
-  // Redis Cluster data plane. Cluster mode owns the topology
-  // source of truth, so it is mutually exclusive with both replication
-  // upstream directives; runtime REPLICAOF is rejected separately at the
-  // command layer. The nodes file itself is parsed and matched against this
-  // node's address by the cluster control port at startup; validation here
-  // only requires it to be configured.
+  // Redis Cluster data plane. Meta owns the only supported topology and
+  // authority source, so cluster mode is mutually exclusive with both
+  // replication upstream directives; runtime REPLICAOF is rejected separately
+  // at the command layer.
   if (options.cluster_enabled_) {
-    const bool static_control = !options.cluster_static_nodes_file_.empty();
-    const bool meta_control = !options.cluster_meta_seeds_.empty();
-    if (static_control == meta_control) {
+    if (options.cluster_meta_seeds_.empty()) {
       return absl::InvalidArgumentError(
-          "cluster-enabled requires exactly one of cluster-static-nodes-file "
-          "or cluster-meta-seed");
+          "cluster-enabled requires at least one cluster-meta-seed for the "
+          "Meta-managed Cluster");
     }
-    if (meta_control) {
-      if (!IsLowerHexNodeId(options.cluster_node_id_)) {
-        return absl::InvalidArgumentError(
-            "Meta-controlled cluster mode requires cluster-node-id as 40 "
-            "lowercase hex characters");
+    if (!IsLowerHexNodeId(options.cluster_node_id_)) {
+      return absl::InvalidArgumentError(
+          "Meta-managed cluster mode requires cluster-node-id as 40 lowercase "
+          "hex characters");
+    }
+    for (const std::string& seed : options.cluster_meta_seeds_) {
+      if (!IsNumericEndpoint(seed)) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "cluster-meta-seed must be a numeric IP endpoint: ", seed));
       }
-      for (const std::string& seed : options.cluster_meta_seeds_) {
-        if (!IsNumericEndpoint(seed)) {
-          return absl::InvalidArgumentError(absl::StrCat(
-              "cluster-meta-seed must be a numeric IP endpoint: ", seed));
-        }
-      }
-      // The data-control connection reuses the replication TLS identity. An
-      // opted-in mTLS session cannot silently fall back to a CA-only client.
-      if (options.tls_replication_ &&
-          (options.tls_ca_cert_file_.empty() ||
-           options.tls_cert_file_.empty() || options.tls_key_file_.empty())) {
-        return absl::InvalidArgumentError(
-            "Meta data-control mTLS requires tls-ca-cert-file, "
-            "tls-cert-file, and tls-key-file");
-      }
+    }
+    // The data-control connection reuses the replication TLS identity. An
+    // opted-in mTLS session cannot silently fall back to a CA-only client.
+    if (options.tls_replication_ &&
+        (options.tls_ca_cert_file_.empty() || options.tls_cert_file_.empty() ||
+         options.tls_key_file_.empty())) {
+      return absl::InvalidArgumentError(
+          "Meta data-control mTLS requires tls-ca-cert-file, tls-cert-file, "
+          "and tls-key-file");
     }
     if (options.replicaof_.has_value() ||
         options.redis_replicaof_.has_value()) {

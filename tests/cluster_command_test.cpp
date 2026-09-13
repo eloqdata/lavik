@@ -20,6 +20,7 @@
 #include "keylane/resp.h"
 #include "keylane/resp_version.h"
 #include "keylane/storage/format.h"
+#include "cluster/test_topology_installer.h"
 
 namespace {
 
@@ -440,7 +441,7 @@ TEST(ClusterCommandTest, NodesMarksReplicaSelfAndAnnouncesWildcard) {
   // The replica is self: myself,slave, its primary's id, and the empty
   // wildcard-bind host. A is no longer myself and advertises its concrete
   // address. Self advertises the announce ports (MakeRuntime resolves 7000),
-  // not its file port 7002.
+  // not its projected port 7002.
   EXPECT_NE(payload.find(absl::StrCat(kNodeR, " :7000@0 myself,slave ", kNodeA,
                                       " 0 0 1 connected\n")),
             std::string_view::npos)
@@ -483,8 +484,7 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
       BuildThreeNodeState(false);
   ASSERT_NE(state, nullptr);
 
-  auto runtime = std::make_unique<cluster::ClusterRuntime>(
-      cluster::AuthorityGuard::LeaseMode::kFinite);
+  auto runtime = std::make_unique<cluster::ClusterRuntime>();
   ASSERT_TRUE(runtime->node_control_installer_.SetStorageReady(true).ok());
   cluster::Sha256Digest projection_hash{};
   projection_hash.fill(0x11);
@@ -568,7 +568,11 @@ TEST(ClusterRequestAuthorityTest,
   const std::shared_ptr<const cluster::ServingState> state =
       BuildThreeNodeState(false);
   ASSERT_NE(state, nullptr);
-  ClusterRuntimeGuard runtime_guard(MakeRuntime(state));
+  auto runtime = std::make_unique<cluster::ClusterRuntime>();
+  cluster::testing::TestTopologyInstaller topology(
+      runtime->node_control_installer_, runtime->topology_cache_);
+  ASSERT_TRUE(topology.Install(state, cluster::LeaseClockNow()).ok());
+  ClusterRuntimeGuard runtime_guard(std::move(runtime));
 
   keylane::CommandRequest request;
   request.kind_ = keylane::CommandKind::kBLPop;

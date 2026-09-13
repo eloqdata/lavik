@@ -716,8 +716,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
                        static_cast<std::uint32_t>(i), lock_mode);
   }
   transaction.Seal();
-  // Cluster owner-side re-check: the admission was captured at
-  // dispatch time; a SIGHUP topology reload may have fenced it since.
+  // Cluster owner-side re-check: the admission was captured at dispatch time;
+  // a newer Meta projection or lease transition may have fenced it since.
   // Single-shard executions (the only shape cluster admission allows) mutate
   // inside the one callback hop, so the pre-callback validator is airtight
   // there; multi-shard flows validate per hop and clear the hook before the

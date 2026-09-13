@@ -24,7 +24,6 @@ using keylane::test::ReadFile;
 using keylane::test::RespClient;
 using keylane::test::TempDirectory;
 using keylane::test::WaitUntil;
-using keylane::test::WriteFile;
 
 std::string g_keylane_binary;
 
@@ -333,7 +332,7 @@ TEST(RebuildProtocolIntegrationTest,
 }
 
 TEST(RebuildProtocolIntegrationTest,
-     TargetCrashDiscardsPartialAndStaticRecoveryUsesPromotedPopulation) {
+     TargetCrashDiscardsPartialAndFreshSyncRecoversPopulation) {
 #if !KEYLANE_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires a Debug/fault server for the partial handoff pause";
 #endif
@@ -350,11 +349,6 @@ TEST(RebuildProtocolIntegrationTest,
   PortReservation target_reservation;
   const std::uint16_t source_port = source_reservation.ReleaseForSpawn();
   const std::uint16_t target_port = target_reservation.ReleaseForSpawn();
-  const std::filesystem::path nodes = directory.path() / "nodes.conf";
-  WriteFile(nodes, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 127.0.0.1:" +
-                       std::to_string(target_port) +
-                       "@0 master - 0 0 1 connected 0-16383\n"
-                       "vars currentEpoch 1 lastVoteEpoch 0\n");
   ChildProcess source(
       ServerArguments(source_port, source_data), source_log,
       {{"KEYLANE_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS", "5000"}});
@@ -385,21 +379,6 @@ TEST(RebuildProtocolIntegrationTest,
     target.Stop(SIGKILL);
   }
 
-  auto cluster_arguments = ServerArguments(target_port, target_data);
-  cluster_arguments.push_back("--cluster-enabled");
-  cluster_arguments.push_back("--cluster-static-nodes-file");
-  cluster_arguments.push_back(nodes.string());
-  target = ChildProcess(cluster_arguments, target_log);
-  WaitForStartup(target_port, "partial cluster target recovery");
-  {
-    RespClient target_client = Connect(target_port);
-    EXPECT_TRUE(target_client.Command({"GET", key}).starts_with("-LOADING"));
-    EXPECT_TRUE(target_client.Command({"SET", key, "forbidden"})
-                    .starts_with("-LOADING"));
-  }
-  // Preserve the exact partial on-disk population for the fresh-sync check.
-  target.Stop(SIGKILL);
-
   target = ChildProcess(ServerArguments(target_port, target_data), target_log);
   WaitForStartup(target_port, "partial target standalone recovery");
   {
@@ -420,23 +399,6 @@ TEST(RebuildProtocolIntegrationTest,
     });
     ASSERT_EQ(target_client.Command({"READONLY"}), "+OK");
     EXPECT_EQ(target_client.Command({"GET", key}), "$17\r\nsource-population");
-  }
-
-  // The static adapter's nodes.conf is a permanent local authority, so after
-  // a complete promotion it may expose that durable population again once
-  // storage recovery finishes. This differs from Meta-managed mode, whose
-  // lease and population proof are boot-scoped. The incomplete replacement
-  // above remained fenced because that fence itself is durable.
-  target.Stop(SIGKILL);
-  target = ChildProcess(cluster_arguments, target_log);
-  WaitForStartup(target_port, "promoted cluster target recovery");
-  {
-    RespClient target_client = Connect(target_port);
-    WaitUntil("promoted static population ready", 20s, [&] {
-      return target_client.Command({"GET", key}) == "$17\r\nsource-population";
-    });
-    EXPECT_EQ(target_client.Command({"SET", key, "static-authority"}), "+OK");
-    EXPECT_EQ(target_client.Command({"GET", key}), "$16\r\nstatic-authority");
   }
 
   target.Stop(SIGINT);

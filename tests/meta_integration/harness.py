@@ -1012,19 +1012,6 @@ def bootstrap_cluster(nodes, mesh=None):
     return leader
 
 
-def bootstrap_static_cluster(nodes, raft_endpoints=None):
-    """Start all first-wave voters from one identical full Raft config."""
-    if not nodes:
-        raise Failure("static initial Meta cluster cannot be empty")
-    manifest = os.path.join(nodes[0].workdir, "initial-cluster.toml")
-    write_initial_cluster_manifest(manifest, nodes, raft_endpoints)
-    for node in nodes:
-        node.start(initial_cluster_manifest=manifest)
-    leader = find_leader(nodes, timeout=20)
-    log(f"{len(nodes)}-node static initial cluster converged")
-    return leader
-
-
 def bootstrap_meshed_cluster(nodes, mesh):
     """Bootstrap a cluster where EVERY node's advertised endpoint is a
     proxy port. The bootstrap node's endpoint is baked into the durable

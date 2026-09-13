@@ -12,7 +12,7 @@
 namespace keylane::cluster {
 namespace {
 
-// 40 lowercase hex chars, as a nodes.conf node line writes them. TestNodeId(0)
+// 40 lowercase hex chars, as Redis Cluster discovery writes them. TestNodeId(0)
 // stays all-zero; tests number real nodes from 1.
 NodeId TestNodeId(unsigned n) {
   std::string id(40, '0');
@@ -92,7 +92,7 @@ std::shared_ptr<const ServingState> MakeState(std::uint64_t epoch = 1) {
   return MakeState(epoch, [](GroupView&) {});
 }
 
-// Two primaries splitting the slot space at 5460/5461, the classic static
+// Two primaries split the slot space at 5460/5461, the classic Redis Cluster
 // test topology.
 ServingStateBuilder MakeTwoGroupBuilder() {
   ServingStateBuilder builder;

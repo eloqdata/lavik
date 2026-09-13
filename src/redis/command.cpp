@@ -686,8 +686,8 @@ Task<std::optional<std::string>> ReplicaMovedError(
 // ---- Redis Cluster data-plane gate ----
 //
 // When cluster mode is enabled, admission is decided by the process-wide
-// AuthorityGuard against the latest committed ServingState and (in Meta mode)
-// its in-memory lease. The legacy replica-MOVED shim above never runs. Cluster
+// AuthorityGuard against the latest committed ServingState and its in-memory
+// finite lease. The legacy replica-MOVED shim above never runs. Cluster
 // mode forbids standalone REPLICAOF control but the replication manager may
 // still have a Meta-authorized population source; that source never supplies
 // client redirection authority.
@@ -798,9 +798,8 @@ std::uint16_t ClusterDecisionClientPort(const cluster::Decision& decision,
 
 // These commands mutate process-wide durable state but carry no key from
 // which the cluster gate can derive an owner, lease, or in-flight drain cell.
-// Meta-managed nodes therefore reject them. Static compatibility mode permits
-// them only when one local primary group supplies a representative slot and
-// thus the ordinary owner re-check and in-flight drain proof.
+// Cluster mode therefore rejects them: finite authority is always group-scoped
+// and cannot authorize a process-wide mutation.
 std::string_view UnscopedClusterMutation(const CommandRequest& request) {
   switch (request.kind_) {
     case CommandKind::kFlushDb:
@@ -823,67 +822,6 @@ std::string_view UnscopedClusterMutation(const CommandRequest& request) {
     default:
       return {};
   }
-}
-
-// Bind a static global mutation to the sole local primary group before
-// admission. The representative slot makes the ordinary write recheck and
-// in-flight cell cover SIGHUP role changes while the command is suspended.
-// A topology race is harmless: CaptureAndAdmit reads the then-current state
-// and either validates this slot there or rejects/redirects it.
-void BindStaticGlobalMutationSlot(cluster::ClusterRuntime& runtime,
-                                  CommandRequest& request) {
-  if (runtime.authority_guard_.lease_mode() !=
-          cluster::AuthorityGuard::LeaseMode::kPermanent ||
-      !request.ClusterSlots().empty()) {
-    return;
-  }
-  const std::shared_ptr<const cluster::ServingState> state =
-      runtime.topology_cache_.Current();
-  if (state == nullptr || state->Self() == nullptr ||
-      !state->Self()->is_primary()) {
-    return;
-  }
-  const cluster::NodeIndex self = state->SelfNodeIndex();
-  const cluster::GroupView* local = nullptr;
-  for (const cluster::GroupView& group : state->Groups()) {
-    if (group.primary_node_index_ != self) continue;
-    if (local != nullptr || !group.granted_) return;
-    local = &group;
-  }
-  if (local != nullptr && !local->slot_ranges_.empty()) {
-    request.AddClusterSlot(local->slot_ranges_.front().first_);
-  }
-}
-
-// Static compatibility mode has no expiring Meta authority, but a global
-// mutation still needs an exact group owner and in-flight cell. A slotless
-// primary, replica, or node owning more than one group cannot supply that
-// proof and is rejected.
-bool StaticPrimaryOwnsGlobalMutation(
-    const cluster::ClusterRuntime& runtime,
-    const cluster::AuthorityAdmission& admission) {
-  if (runtime.authority_guard_.lease_mode() !=
-      cluster::AuthorityGuard::LeaseMode::kPermanent) {
-    return false;
-  }
-  const std::shared_ptr<const cluster::ServingState>& state = admission.state();
-  if (state == nullptr || state->Self() == nullptr ||
-      !state->Self()->is_primary()) {
-    return false;
-  }
-  const cluster::NodeIndex self = state->SelfNodeIndex();
-  std::size_t local_group_count = 0;
-  for (const cluster::GroupView& group : state->Groups()) {
-    if (group.primary_node_index_ != self) continue;
-    ++local_group_count;
-    if (!group.granted_) return false;
-  }
-  if (admission.slots().size() != 1 || local_group_count != 1) return false;
-  const cluster::GroupView* representative =
-      state->GroupForSlot(admission.slots().front());
-  return representative != nullptr &&
-         representative->primary_node_index_ == self &&
-         representative->granted_;
 }
 
 // Maps a non-serving admission decision to its wire reply.
@@ -929,10 +867,6 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
   PopulateClusterSlots(request);
   request.cluster_authority_admission_.reset();
-  const std::string_view unscoped_mutation = UnscopedClusterMutation(request);
-  if (!unscoped_mutation.empty()) {
-    BindStaticGlobalMutationSlot(*runtime, request);
-  }
   const bool is_write = ClusterRequestIsWrite(request);
   const cluster::RequestView view{
       .slots_ = request.ClusterSlots(),
@@ -943,13 +877,6 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
   auto admission = std::make_shared<const cluster::AuthorityAdmission>(
       runtime->authority_guard_.CaptureAndAdmit(view,
                                                 cluster::LeaseClockNow()));
-  if (admission->decision().kind_ == cluster::Decision::Kind::kServe &&
-      !unscoped_mutation.empty() &&
-      !StaticPrimaryOwnsGlobalMutation(*runtime, *admission)) {
-    reply->encoded_ = reply_builder.AppendError(absl::StrCat(
-        "ERR ", unscoped_mutation, " is not allowed in cluster mode"));
-    return true;
-  }
   if (!EmitClusterDecision(admission->decision(), request.connection_tls_,
                            reply_builder, reply)) {
     // Reads intentionally have no owner-side re-check, so retaining their
@@ -971,10 +898,9 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
 std::optional<CommandReply> RecheckClusterWriteAuthority(
     const CommandRequest& request, ReplyBuilder& reply_builder,
     cluster::AuthorityInFlightGuards* in_flights) {
-  const std::string_view unscoped_mutation = UnscopedClusterMutation(request);
   if (!cluster::ClusterEnabled() || request.replication_origin_ ||
       request.cluster_authority_admission_ == nullptr ||
-      (request.ClusterSlots().empty() && unscoped_mutation.empty()) ||
+      request.ClusterSlots().empty() ||
       !ClusterRequestIsWrite(request)) {
     return std::nullopt;
   }
@@ -982,15 +908,6 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
   for (;;) {
     const std::shared_ptr<const cluster::AuthorityAdmission> admission =
         request.cluster_authority_admission_;
-    if (request.ClusterSlots().empty()) {
-      // Dispatch must have rejected an unscoped mutation that could not bind
-      // one static owner group. Keep this owner-side seam fail-closed if a
-      // future queue/EXEC path reaches it without that proof.
-      CommandReply reply;
-      reply.encoded_ = reply_builder.AppendError(absl::StrCat(
-          "ERR ", unscoped_mutation, " is not allowed in cluster mode"));
-      return reply;
-    }
     // Requests execute on stable Celer workers, so the worker id is the exact
     // stripe identity required by the admitted ServingState.
     if (runtime->authority_guard_.RegisterAndRecheck(
@@ -1016,12 +933,6 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
     CommandReply reply;
     if (EmitClusterDecision(fresh->decision(), request.connection_tls_,
                             reply_builder, &reply)) {
-      return reply;
-    }
-    if (!unscoped_mutation.empty() &&
-        !StaticPrimaryOwnsGlobalMutation(*runtime, *fresh)) {
-      reply.encoded_ = reply_builder.AppendError(absl::StrCat(
-          "ERR ", unscoped_mutation, " is not allowed in cluster mode"));
       return reply;
     }
     request.cluster_authority_admission_ = std::move(fresh);
@@ -2907,8 +2818,7 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
     }
     // FLUSH owns its database gates and therefore returns before the generic
     // command-body authority choke point. Recheck here after every gate wait
-    // and retain the representative static group guard through
-    // detach/publication.
+    // and retain any group guards through detach/publication.
     cluster::AuthorityInFlightGuards cluster_in_flights;
     if (std::optional<CommandReply> fenced = RecheckClusterWriteAuthority(
             request, reply_builder, &cluster_in_flights);
@@ -9138,7 +9048,7 @@ Task<CommandReply> ExecuteExecBody(
   const bool reject_writes = g_replication != nullptr
                                  ? g_replication->reject_writes()
                                  : g_replica_read_only;
-  const bool source_static_write =
+  const bool source_declared_write =
       std::any_of(queued.begin(), queued.end(), [](const auto& command) {
         return !command.replication_origin_ && command.spec_ != nullptr &&
                (command.spec_->flags_ & kCmdWrite) != 0;
@@ -9146,7 +9056,7 @@ Task<CommandReply> ExecuteExecBody(
   // Dynamic Lua commands can be read-only at runtime. Execute them so the
   // script guard can return a per-command READONLY error only if a write is
   // actually attempted, preserving EXEC's continue-on-error replies.
-  if (source_static_write && reject_writes) {
+  if (source_declared_write && reject_writes) {
     co_await DropWatches(ctx);
     co_return BuiltReply(reply_builder.AppendError(
         "READONLY You can't write against a read only replica."));
@@ -9303,7 +9213,7 @@ Task<CommandReply> ExecuteExecBody(
   // Cluster mode: the whole transaction must touch one slot that this node
   // still owns. Queue time gated each command against the snapshot it was
   // admitted under; EXEC re-evaluates the union against the current cache
-  // because a reload may have moved the slot between queue and EXEC. The wire
+  // because Meta may have moved the slot between queue and EXEC. The wire
   // behavior is the documented Redis semantics (no local redis-server was
   // available to verify against): a transaction whose queued keys span slots
   // fails as a whole with CROSSSLOT, and a slot now owned elsewhere redirects
@@ -9318,18 +9228,6 @@ Task<CommandReply> ExecuteExecBody(
         continue;
       }
       if ((cmd.spec_->flags_ & kCmdNoKeys) != 0) {
-        // Static FUNCTION catalog mutations carry the representative group
-        // slot attached at queue-time admission. Re-admit that proof for EXEC
-        // so a SIGHUP demotion between QUEUED and EXEC cannot run keyless
-        // catalog work under obsolete primary authority.
-        if (IsFunctionCatalogMutation(cmd)) {
-          for (const std::uint16_t slot : cmd.ClusterSlots()) {
-            if (std::find(exec_cluster_slots.begin(), exec_cluster_slots.end(),
-                          slot) == exec_cluster_slots.end()) {
-              exec_cluster_slots.push_back(slot);
-            }
-          }
-        }
         continue;
       }
       const absl::StatusOr<KeyIndexView> keys =
@@ -11626,12 +11524,9 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
   }
   if (cluster::ClusterEnabled()) {
     const std::string_view unscoped_mutation = UnscopedClusterMutation(request);
-    cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
-    if (!unscoped_mutation.empty() &&
-        runtime->authority_guard_.lease_mode() ==
-            cluster::AuthorityGuard::LeaseMode::kFinite) {
+    if (!unscoped_mutation.empty()) {
       // Meta authority is deliberately finite per group and can never prove a
-      // process-wide durable mutation. Reject that permanent policy before
+      // process-wide durable mutation. Reject that policy before
       // the transient population LOADING gate so an unassigned/fenced node
       // cannot make the command appear potentially valid after recovery.
       if (ctx.in_multi_) ctx.multi_dirty_ = true;
@@ -12033,8 +11928,9 @@ Task<CommandReply> ExecuteCommandBody(
 
   // Cluster owner-side authority re-check (choke point 1 of 2): the
   // admission decision was made at dispatch time against a snapshot that a
-  // reload may have fenced while this request suspended on the admissions
-  // above. Nothing has executed yet, so a changed authority is safely answered
+  // Meta transition may have fenced while this request suspended on the
+  // admissions above. Nothing has executed yet, so a changed authority is
+  // safely answered
   // with a fresh redirect. Transaction-based writes re-check per shard via the
   // tx validator hook (choke point 2). Blocking writes deliberately skip this
   // command-lifetime guard: their per-attempt path registers only while it is
