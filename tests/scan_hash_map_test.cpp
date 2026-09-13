@@ -21,6 +21,245 @@ using keylane::storage::ScanHashMapEntryArena;
 
 }  // namespace
 
+TEST(ScanHashMapTest, EraseShrinksAndReleasesBucketsWithoutFurtherRequests) {
+  ScanHashMap<std::uint64_t> map;
+  ASSERT_TRUE(map.PreallocateForExpectedSize(576));
+  std::vector<ScanHashMap<std::uint64_t>::Entry*> entries;
+  for (std::size_t i = 0; i < 576; ++i) {
+    const std::string key = "shrink-" + std::to_string(i);
+    entries.push_back(map.InsertNew(ComputeDigest(key), key, i));
+    ASSERT_NE(entries.back(), nullptr);
+  }
+  ASSERT_EQ(map.allocated_bucket_count(), 64);
+  // Replacing live values with tombstone-like markers retains every slot.
+  for (auto* entry : entries) entry->assign(0);
+  EXPECT_FALSE(map.Maintain());
+  EXPECT_EQ(map.allocated_bucket_count(), 64);
+  for (std::size_t i = 1; i < entries.size(); ++i) {
+    if (i % 2 == 0) {
+      ASSERT_TRUE(map.Erase(entries[i]));
+    } else {
+      const std::string key = "shrink-" + std::to_string(i);
+      ASSERT_TRUE(map.Erase(ComputeDigest(key), key));
+    }
+  }
+  for (unsigned step = 0; step < 256 && map.Maintain(); ++step) {
+  }
+  EXPECT_FALSE(map.rehashing());
+  EXPECT_EQ(map.allocated_bucket_count(), 1);
+  EXPECT_EQ(map.FindAddress(reinterpret_cast<std::uintptr_t>(entries[0]),
+                            map.AddressHash(ComputeDigest("shrink-0"))),
+            entries[0]);
+  ASSERT_TRUE(map.Erase(entries[0]));
+  EXPECT_FALSE(map.has_allocated_storage());
+  EXPECT_EQ(map.InsertNew(ComputeDigest("reused"), "reused", 42)->value(), 42);
+}
+
+TEST(ScanHashMapTest, ShrinkingPreservesEveryCursorPosition) {
+  // Each initial bucket has one permanent entry and seven that are later
+  // erased. Try every possible pause in the original reverse-bit traversal,
+  // then resume before, during, and after two consecutive halvings.
+  std::array<std::vector<std::string>, 8> keys;
+  for (std::size_t candidate = 0, count = 0; count < 64; ++candidate) {
+    std::string key = "cursor-shrink-" + std::to_string(candidate);
+    auto& bucket = keys[ComputeDigest(key).value_ & 7];
+    if (bucket.size() == 8) continue;
+    bucket.push_back(std::move(key));
+    ++count;
+  }
+  bool saw_duplicate = false;
+  for (unsigned pause = 0; pause < 8; ++pause) {
+    for (unsigned migration = 0; migration <= 16; ++migration) {
+      SCOPED_TRACE(::testing::Message() << pause << "/" << migration);
+      ScanHashMap<std::uint64_t> map;
+      ASSERT_TRUE(map.PreallocateForExpectedSize(64));
+      for (unsigned bucket = 0; bucket < 8; ++bucket) {
+        for (unsigned slot = 0; slot < 8; ++slot) {
+          ASSERT_NE(map.InsertNew(ComputeDigest(keys[bucket][slot]),
+                                  keys[bucket][slot], slot == 0 ? bucket : 8),
+                    nullptr);
+        }
+      }
+      std::array<unsigned, 8> seen{};
+      auto observe = [&](auto& entry) {
+        if (entry.value() < 8) ++seen[entry.value()];
+      };
+      std::uint64_t cursor = 0;
+      for (unsigned step = 0; step < pause; ++step) {
+        cursor = map.Scan(cursor, observe);
+        ASSERT_NE(cursor, 0);
+      }
+      for (const auto& bucket : keys) {
+        for (unsigned slot = 1; slot < 8; ++slot) {
+          ASSERT_TRUE(map.Erase(ComputeDigest(bucket[slot]), bucket[slot]));
+        }
+      }
+      for (unsigned step = 0; step < migration; ++step) map.Maintain();
+      unsigned scans = 0;
+      do {
+        cursor = map.Scan(cursor, observe);
+        map.Maintain();
+        ASSERT_LE(++scans, 8);
+      } while (cursor != 0);
+      for (unsigned count : seen) {
+        EXPECT_GE(count, 1);
+        saw_duplicate |= count > 1;
+      }
+      for (unsigned step = 0; step < 32 && map.Maintain(); ++step) {
+      }
+      EXPECT_EQ(map.allocated_bucket_count(), 2);
+    }
+  }
+  EXPECT_TRUE(saw_duplicate);
+}
+
+TEST(ScanHashMapTest,
+     ShrinkMergesOverflowChainsAndKeepsExternalEntryAddresses) {
+  ScanHashMap<std::uint64_t> map;
+  ASSERT_TRUE(map.PreallocateForExpectedSize(144));
+  std::vector<ScanHashMap<std::uint64_t>::Entry*> entries;
+  // Distinct external digests alternate between old buckets 0 and 8, which
+  // merge into bucket 0. More than one overflow bucket is needed after merge.
+  for (std::size_t i = 0; i < 40; ++i) {
+    entries.push_back(map.InsertNew(Digest{i * 8}, "external", i, false));
+    ASSERT_NE(entries.back(), nullptr);
+  }
+  ASSERT_TRUE(map.Erase(entries.back()));
+  entries.pop_back();
+  ASSERT_TRUE(map.rehashing());
+  auto detached = map.Detach();
+  ScanHashMap<std::uint64_t> moved = std::move(detached);
+  for (unsigned step = 0; step < 64 && moved.Maintain(); ++step) {
+  }
+  ASSERT_EQ(moved.allocated_bucket_count(), 8);
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    EXPECT_EQ(moved.Find(Digest{i * 8}, "external"), entries[i]);
+    EXPECT_EQ(entries[i]->value(), i);
+  }
+  EXPECT_TRUE(map.empty());
+  EXPECT_FALSE(map.Maintain());
+  EXPECT_TRUE(detached.empty());
+  EXPECT_FALSE(detached.Maintain());
+}
+
+TEST(ScanHashMapTest, AdmissionRejectionDefersShrinkButNotErase) {
+  constexpr std::uint64_t kLimit = 4 * 1024 * 1024;
+  ASSERT_TRUE(keylane::InitMemoryLimit(kLimit, 1).ok());
+  keylane::BindMemoryAccountingShard(0);
+  struct RestoreLimit {
+    ~RestoreLimit() {
+      (void)keylane::InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+      keylane::BindMemoryAccountingShard(keylane::kMaxMemoryWorkers);
+    }
+  } restore;
+  // Cover both allocator-owned admission and the primary-index domain whose
+  // foreground writes normally have an enclosing storage admission permit.
+  for (bool externally_admitted : {false, true}) {
+    auto arena = std::make_shared<ScanHashMapEntryArena>(
+        ScanHashMapEntryArena::kMaximumPageId, externally_admitted);
+    ScanHashMap<std::uint64_t> map(arena);
+    ASSERT_TRUE(map.PreallocateForExpectedSize(576));
+    ASSERT_NE(map.InsertNew(ComputeDigest("keep"), "keep", 1), nullptr);
+    auto* removed = map.InsertNew(ComputeDigest("remove"), "remove", 2);
+    ASSERT_NE(removed, nullptr);
+    const auto memory = keylane::GetWorkerMemoryStats(0);
+    auto blocker = keylane::TryReserveMemory(memory.retained_limit_bytes_ -
+                                             memory.retained_bytes_);
+    ASSERT_TRUE(blocker.has_value());
+    EXPECT_TRUE(map.Erase(removed));
+    EXPECT_EQ(map.size(), 1);
+    EXPECT_EQ(map.allocated_bucket_count(), 64);
+    EXPECT_FALSE(map.rehashing());
+    EXPECT_FALSE(map.Maintain());
+    EXPECT_NE(std::as_const(map).Find(ComputeDigest("keep"), "keep"), nullptr);
+    blocker.reset();
+    for (unsigned step = 0; step < 256 && map.Maintain(); ++step) {
+    }
+    EXPECT_EQ(map.allocated_bucket_count(), 1);
+    EXPECT_FALSE(map.rehashing());
+  }
+}
+
+TEST(ScanHashMapTest, ShrinkMergeRetriesOverflowAdmissionWithoutLosingEntries) {
+  ASSERT_TRUE(keylane::InitMemoryLimit(4 * 1024 * 1024, 1).ok());
+  keylane::BindMemoryAccountingShard(0);
+  struct RestoreLimit {
+    ~RestoreLimit() {
+      (void)keylane::InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+      keylane::BindMemoryAccountingShard(keylane::kMaxMemoryWorkers);
+    }
+  } restore;
+  for (bool externally_admitted : {false, true}) {
+    auto arena = std::make_shared<ScanHashMapEntryArena>(
+        ScanHashMapEntryArena::kMaximumPageId, externally_admitted);
+    ScanHashMap<std::uint64_t> map(arena);
+    ASSERT_TRUE(map.PreallocateForExpectedSize(144));
+    for (unsigned i = 0; i < 24; ++i) {
+      ASSERT_NE(map.InsertNew(Digest{i * 8}, "external", i, false), nullptr);
+    }
+    ASSERT_TRUE(map.Erase(Digest{23 * 8}, "external"));
+    // Migrate old buckets 0..7. Bucket 8 needs to merge eleven entries into
+    // the already full destination chain, so no source slot may be cleared
+    // until the overflow allocation (including metadata) has been admitted.
+    for (unsigned i = 0; i < 8; ++i) ASSERT_TRUE(map.Maintain());
+    const auto memory = keylane::GetWorkerMemoryStats(0);
+    auto blocker = keylane::TryReserveMemory(memory.retained_limit_bytes_ -
+                                             memory.retained_bytes_);
+    ASSERT_TRUE(blocker.has_value());
+    EXPECT_FALSE(map.Maintain());
+    EXPECT_TRUE(map.rehashing());
+    std::array<unsigned, 23> seen{};
+    std::uint64_t cursor = 0;
+    do {
+      cursor = map.Scan(cursor, [&](auto& entry) { ++seen[entry.value()]; });
+    } while (cursor != 0);
+    for (unsigned count : seen) EXPECT_EQ(count, 1);
+    blocker.reset();
+    for (unsigned i = 0; i < 64 && map.Maintain(); ++i) {
+    }
+    EXPECT_FALSE(map.rehashing());
+    EXPECT_EQ(map.allocated_bucket_count(), 4);
+    for (unsigned i = 0; i < 23; ++i) {
+      auto* entry = map.Find(Digest{i * 8}, "external");
+      ASSERT_NE(entry, nullptr);
+      EXPECT_EQ(entry->value(), i);
+    }
+  }
+}
+
+TEST(ScanHashMapTest, ScanSurvivesAlternatingGrowthAndShrinkWithNewWrites) {
+  ScanHashMap<std::uint64_t> map;
+  constexpr unsigned kStable = 8;
+  for (unsigned i = 0; i < kStable; ++i) {
+    const std::string key = "stable-" + std::to_string(i);
+    ASSERT_NE(map.InsertOrAssign(ComputeDigest(key), key, i).entry_, nullptr);
+  }
+  for (unsigned round = 0; round < 16; ++round) {
+    std::array<unsigned, kStable> seen{};
+    std::uint64_t cursor = 0;
+    unsigned step = 0;
+    do {
+      cursor = map.Scan(cursor, [&](auto& entry) {
+        if (entry.value() < kStable) ++seen[entry.value()];
+      });
+      // Insert while any previous shrink is still active, then remove the
+      // temporary population while expansion may still be migrating.
+      for (unsigned i = 0; i < 300; ++i) {
+        const std::string key = "churn-" + std::to_string(i);
+        ASSERT_NE(map.InsertOrAssign(ComputeDigest(key), key, kStable).entry_,
+                  nullptr);
+      }
+      for (unsigned i = 0; i < 300; ++i) {
+        const std::string key = "churn-" + std::to_string(i);
+        ASSERT_TRUE(map.Erase(ComputeDigest(key), key));
+      }
+      for (unsigned i = 0; i < round; ++i) map.Maintain();
+      ASSERT_LE(++step, 128);
+    } while (cursor != 0);
+    for (unsigned count : seen) EXPECT_GE(count, 1);
+  }
+}
+
 TEST(ScanHashMapTest, SharedArenaReusesSlotsAndRejectsPageIdExhaustion) {
   auto arena = std::make_shared<ScanHashMapEntryArena>(1);
   ScanHashMap<std::uint64_t> first(arena);

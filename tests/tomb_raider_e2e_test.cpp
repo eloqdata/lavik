@@ -403,8 +403,9 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
-long long StatField(RespClient& client, std::string_view field) {
-  const std::string info = client.Command({"INFO", "stats"});
+long long InfoField(RespClient& client, std::string_view section,
+                    std::string_view field) {
+  const std::string info = client.Command({"INFO", section});
   const std::string needle = std::string(field) + ":";
   const std::size_t at = info.find(needle);
   if (at == std::string::npos) Fail("INFO missing " + std::string(field));
@@ -416,6 +417,146 @@ long long StatField(RespClient& client, std::string_view field) {
     Fail("INFO field malformed: " + std::string(field));
   }
   return value;
+}
+
+long long StatField(RespClient& client, std::string_view field) {
+  return InfoField(client, "stats", field);
+}
+
+void VerifyTtlReapingReducesMemory(RespClient& client) {
+  // Fill the index with exactly 100 MiB of inline key bytes, independently
+  // of value sizes, so reclamation must release both buckets and entry spans.
+  const std::size_t key_bytes = 1024;
+  const std::size_t expiring_keys = 100 * kMiB / key_bytes;
+  const long long minimum_memory_growth = 100 * kMiB;
+  const auto ttl = 15s;
+  const auto reap_timeout = 300s;
+  constexpr long long kRemainingAllowance = 8 * 1024;
+  Expect(client.Command({"TOMBRAIDER", "OFF"}), "+OK",
+         "memory test raider OFF");
+  const auto stopped_deadline = std::chrono::steady_clock::now() + 10s;
+  while (StatField(client, "tomb_raider_running") != 0) {
+    if (std::chrono::steady_clock::now() > stopped_deadline) {
+      Fail("memory test could not drain the previous tomb raider round");
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  Expect(client.Command({"DEFRAG", "PAUSE"}), "+OK",
+         "memory test defrag PAUSE");
+  const long long reaped_before = StatField(client, "tomb_raider_reaped");
+  auto key_for = [key_bytes](std::size_t index) {
+    constexpr std::string_view prefix = "{ttl-memory}:";
+    const std::string suffix = std::to_string(index);
+    return std::string(prefix) +
+           std::string(key_bytes - prefix.size() - suffix.size(), '0') + suffix;
+  };
+  const std::string survivor = key_for(expiring_keys);
+  Expect(client.Command({"SET", survivor, "alive"}), "+OK",
+         "memory survivor SET");
+  // INFO's retained-memory gauge is published by the 100 ms health loop.
+  // Warm its first arena span before measuring growth; the survivor keeps a
+  // span allocated after reaping. Defrag is paused so disk-block reclamation
+  // cannot supply an unrelated memory drop. RSS is deliberately not an
+  // assertion: mimalloc may retain freed pages even when Keylane releases
+  // ownership.
+  std::this_thread::sleep_for(300ms);
+  const long long warm_memory = InfoField(client, "memory", "used_memory");
+  const std::string ttl_ms = std::to_string(
+      std::chrono::duration_cast<std::chrono::milliseconds>(ttl).count());
+  std::cout << "TTL memory fixture: keys=" << expiring_keys
+            << " key-bytes=" << key_bytes
+            << " total-key-bytes=" << expiring_keys * key_bytes
+            << " warm=" << warm_memory << std::endl;
+  for (std::size_t i = 0; i < expiring_keys; ++i) {
+    const std::string key = key_for(i);
+    Expect(client.Command({"SET", key, "v", "PX", ttl_ms}), "+OK",
+           "memory TTL SET");
+    if ((i + 1) % 16384 == 0) {
+      std::cout << "TTL memory fixture written=" << i + 1 << std::endl;
+    }
+  }
+  // The same hash tag concentrates the bucket growth in one index.
+  // Requiring it to return near its warm footprint catches a missing shrink
+  // even if Erase still frees entries and individual overflow buckets.
+  const auto grown_deadline = std::chrono::steady_clock::now() + 5s;
+  long long populated_memory = 0;
+  do {
+    populated_memory = InfoField(client, "memory", "used_memory");
+    if (populated_memory >= warm_memory + minimum_memory_growth) break;
+    if (std::chrono::steady_clock::now() > grown_deadline) {
+      Fail("TTL fixture did not grow retained memory: warm=" +
+           std::to_string(warm_memory) +
+           " populated=" + std::to_string(populated_memory));
+    }
+    std::this_thread::sleep_for(50ms);
+  } while (true);
+  std::cout << "TTL memory fixture populated=" << populated_memory << std::endl;
+
+  const std::string last_key = key_for(expiring_keys - 1);
+  const auto expired_deadline = std::chrono::steady_clock::now() + ttl + 5s;
+  while (client.Command({"GET", last_key}) != "$-1") {
+    if (std::chrono::steady_clock::now() > expired_deadline) {
+      Fail("memory fixture TTL did not expire");
+    }
+    std::this_thread::sleep_for(50ms);
+  }
+  // Reads enqueue lazy-expiration candidates; active expiration writes their
+  // tombstones. No explicit DEL or FLUSH may stand in for that lifecycle.
+  for (std::size_t i = 0; i < expiring_keys; ++i) {
+    const std::string key = key_for(i);
+    Expect(client.Command({"GET", key}), "$-1", "memory expired GET");
+  }
+  if (StatField(client, "tomb_raider_reaped") != reaped_before) {
+    Fail("memory fixture was reaped before tomb raider was enabled");
+  }
+  Expect(client.Command({"TOMBRAIDER", "BLOCK-SLEEP", "0"}), "+OK",
+         "memory test raider pacing");
+  Expect(client.Command({"TOMBRAIDER", "INTERVAL", "10"}), "+OK",
+         "memory test raider interval");
+  const auto reaped_deadline = std::chrono::steady_clock::now() + reap_timeout;
+  auto next_progress = std::chrono::steady_clock::now();
+  while (true) {
+    const long long reaped =
+        StatField(client, "tomb_raider_reaped") - reaped_before;
+    if (reaped >= static_cast<long long>(expiring_keys)) break;
+    if (std::chrono::steady_clock::now() > reaped_deadline) {
+      Fail("memory fixture TTL tombstones were not all reaped: " +
+           std::to_string(reaped) + "/" + std::to_string(expiring_keys));
+    }
+    if (std::chrono::steady_clock::now() >= next_progress) {
+      std::cout << "TTL memory fixture reaped=" << reaped << "/"
+                << expiring_keys
+                << " used_memory=" << InfoField(client, "memory", "used_memory")
+                << std::endl;
+      next_progress = std::chrono::steady_clock::now() + 10s;
+    }
+    std::this_thread::sleep_for(50ms);
+  }
+  // Poll only administrative counters after reaping: no key lookup or write
+  // should be needed to finish the final incremental shrink in the background.
+  const auto reclaimed_deadline = std::chrono::steady_clock::now() + 30s;
+  long long reclaimed_memory = 0;
+  do {
+    reclaimed_memory = InfoField(client, "memory", "used_memory");
+    if (reclaimed_memory <= warm_memory + kRemainingAllowance &&
+        reclaimed_memory <= populated_memory - minimum_memory_growth) {
+      break;
+    }
+    if (std::chrono::steady_clock::now() > reclaimed_deadline) {
+      Fail("TTL reaping did not reclaim index memory: warm=" +
+           std::to_string(warm_memory) +
+           " populated=" + std::to_string(populated_memory) +
+           " reclaimed=" + std::to_string(reclaimed_memory));
+    }
+    std::this_thread::sleep_for(50ms);
+  } while (true);
+  Expect(client.Command({"GET", survivor}), "$5\r\nalive",
+         "memory survivor GET");
+  std::cout << "TTL tomb raider memory: warm=" << warm_memory
+            << " populated=" << populated_memory
+            << " reclaimed=" << reclaimed_memory << " bytes\n";
+  Expect(client.Command({"DEFRAG", "RESUME"}), "+OK",
+         "memory test defrag RESUME");
 }
 
 // Waits until tomb_raider_rounds advances past `floor`, so an assertion
@@ -463,7 +604,9 @@ int main(int argc, char** argv) {
 
   try {
     const std::uint16_t port = FindFreePort();
-    CreateDataFile(data_path, 192ULL * 1024 * 1024);
+    // The fixture needs room for both 100 MiB key populations: values
+    // and their later tombstones, while defrag is deliberately paused.
+    CreateDataFile(data_path, 1024 * kMiB);
     CreateDataFile(quiesce_path, 192ULL * 1024 * 1024);
     {
       ServerProcess server(argv[1], port, data_path, log_path);
@@ -590,6 +733,7 @@ int main(int argc, char** argv) {
       Expect(client.Command({"GET", "reapable"}), "$-1", "reapable GET");
       Expect(client.Command({"GET", "kept"}), "$-1", "kept GET");
       Expect(client.Command({"GET", "control"}), "$1\r\nc", "control GET");
+      VerifyTtlReapingReducesMemory(client);
       server.Stop();
     }
 

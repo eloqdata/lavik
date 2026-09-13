@@ -1314,7 +1314,7 @@ if (BUILD_TESTING)
       NAME keylane_tomb_raider_e2e
       COMMAND keylane_tomb_raider_e2e_test $<TARGET_FILE:keylane>
     )
-    set_tests_properties(keylane_tomb_raider_e2e PROPERTIES TIMEOUT 120)
+    set_tests_properties(keylane_tomb_raider_e2e PROPERTIES TIMEOUT 600)
 
     add_executable(keylane_multikey_e2e_test
       tests/multikey_e2e_test.cpp

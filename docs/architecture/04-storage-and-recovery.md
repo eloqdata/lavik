@@ -713,6 +713,15 @@ tombstones. The round state is process-local. A crash or shutdown can forfeit a
 round because recovery reconstructs the conservative tombstone and shielding
 state and the next round repeats the proof.
 
+Index capacity follows removal from the in-memory index: replacing a value with a
+tombstone retains its slot, while erasing the entry enables incremental bucket
+shrinking. Worker-local maintenance completes pending rehashes even without
+foreground requests or expiring keys, including on replicas. It shares the
+expiration pause/drain boundary used by stable scans and shutdown checkpoints.
+Shrinking preserves entry addresses and the cursor guarantee that continuously
+present entries are visited at least once; a cursor can revisit merged buckets.
+Memory admission can defer shrinking without preventing entry removal.
+
 The internal `QuiesceTombRaiderForReplica` boundary is stronger than the
 user-facing `TOMBRAIDER OFF`: it disables future rounds, requests an in-flight
 round to forfeit at its next safe phase or block checkpoint, and waits until no

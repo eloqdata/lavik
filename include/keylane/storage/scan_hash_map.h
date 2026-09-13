@@ -12,7 +12,7 @@
  *
  * The complete license text is in third_party/valkey/COPYING. This C++
  * specialization retains Valkey's cache-line bucket layout, incremental
- * two-table expansion, and stateless reverse-bit scan algorithm. It replaces
+ * two-table resizing, and stateless reverse-bit scan algorithm. It replaces
  * Valkey runtime dependencies and generic callbacks with Keylane-owned entries.
  */
 
@@ -1194,7 +1194,7 @@ class ScanHashMap {
     }
     if (!inserting) return required;
 
-    if (tables_[0].buckets_.empty()) {
+    if (!tables_[0].buckets_) {
       return add(required, sizeof(Bucket) + kSlowPathBookkeepingAllowance);
     }
     if (!Rehashing() &&
@@ -1241,7 +1241,7 @@ class ScanHashMap {
   bool empty() const noexcept { return size() == 0; }
 
   bool has_allocated_storage() const noexcept {
-    return !tables_[0].buckets_.empty() || !tables_[1].buckets_.empty();
+    return tables_[0].buckets_ || tables_[1].buckets_;
   }
 
   // Allocates the final direct-bucket table for an empty map whose population
@@ -1252,8 +1252,9 @@ class ScanHashMap {
   // remains unchanged, so the settled representation and lookup behavior are
   // identical to a map that reached the same size through ordinary growth.
   // Returns false without modifying the map if the requested population
-  // cannot be represented. A physical allocation failure is deliberately not
-  // converted into this validation result and remains fatal to the process.
+  // cannot be represented or admitted. A physical allocation failure is
+  // deliberately not converted into this validation result and remains fatal to
+  // the process.
   bool PreallocateForExpectedSize(std::size_t expected_entries) {
     assert(empty() && !has_allocated_storage());
     if (expected_entries == 0) return true;
@@ -1271,17 +1272,17 @@ class ScanHashMap {
     ScanHashMapEntryArena& arena = EnsureArena();
     Table prepared(arena.allocation_domain());
     prepared.exponent_ = static_cast<std::uint8_t>(exponent);
-    prepared.buckets_.resize(std::size_t{1} << exponent);
+    if (!prepared.AllocateBuckets(std::size_t{1} << exponent)) return false;
     tables_[0] = std::move(prepared);
     return true;
   }
 
-  // Includes both tables during incremental expansion. Primarily useful for
+  // Includes both tables during incremental resizing. Primarily useful for
   // capacity diagnostics and saturation tests.
   std::size_t allocated_bucket_count() const noexcept {
     return BucketCount(tables_[0]) + BucketCount(tables_[1]);
   }
-  // Exposes incremental-expansion state for capacity diagnostics and tests.
+  // Exposes incremental-rehash state for capacity diagnostics and tests.
   bool rehashing() const noexcept { return Rehashing(); }
 
   // Returns the low bucket-address bits callers must retain with an Entry
@@ -1338,7 +1339,7 @@ class ScanHashMap {
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       const Table& table = tables_[t];
-      if (table.buckets_.empty()) {
+      if (!table.buckets_) {
         continue;
       }
       const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
@@ -1380,7 +1381,7 @@ class ScanHashMap {
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
-      if (table.buckets_.empty()) {
+      if (!table.buckets_) {
         continue;
       }
       Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
@@ -1457,9 +1458,9 @@ class ScanHashMap {
   // emits a whole chain per cursor position, so an owner-serialized cursor
   // scan does not miss an entry that exists throughout while erases occur
   // between Scan calls. Scan and mutation are not thread-safe concurrently.
-  // The table itself never shrinks (the port dropped shrinking with deletion);
-  // slots are reused by later inserts, so footprint is bounded by the peak
-  // live count.
+  // Actual removal enables best-effort shrinking below 25% occupancy; a
+  // value replacement (including a tombstone) does not. Maintain() finishes
+  // reclamation when foreground traffic stops. Entry addresses stay stable.
   bool Erase(const Digest& digest, std::string_view key) {
     AdvanceRehashIfNeeded();
     const std::uint64_t hash = Hash(digest);
@@ -1467,7 +1468,7 @@ class ScanHashMap {
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
-      if (table.buckets_.empty()) {
+      if (!table.buckets_) {
         continue;
       }
       Bucket* top = &table.buckets_[hash & BucketMask(table)];
@@ -1482,6 +1483,8 @@ class ScanHashMap {
             DestroyEntry(entry, handle);
             --table.used_;
             FillBucketHole(&table, top, bucket, slot);
+            shrink_pending_ = true;
+            MaybeStartShrink();
             return true;
           }
         }
@@ -1490,6 +1493,8 @@ class ScanHashMap {
     return false;
   }
 
+  // Same reclamation and cursor guarantees as the key-based overload. The
+  // supplied address must still belong to this map.
   bool Erase(Entry* entry) {
     if (entry == nullptr) {
       return false;
@@ -1499,7 +1504,7 @@ class ScanHashMap {
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
-      if (table.buckets_.empty()) {
+      if (!table.buckets_) {
         continue;
       }
       Bucket* top = &table.buckets_[hash & BucketMask(table)];
@@ -1513,12 +1518,24 @@ class ScanHashMap {
             DestroyEntry(entry, handle);
             --table.used_;
             FillBucketHole(&table, top, bucket, slot);
+            shrink_pending_ = true;
+            MaybeStartShrink();
             return true;
           }
         }
       }
     }
     return false;
+  }
+
+  // Performs at most one source-chain migration, or starts a smaller table.
+  // Owners may call this between Scan calls to reclaim buckets without new
+  // requests. Returns false when settled or blocked by memory admission; a
+  // blocked attempt leaves entries intact and can be retried later. Like a
+  // mutation, this invalidates StableScanCursor but preserves Entry addresses.
+  bool Maintain() {
+    if (Rehashing()) return RehashStep();
+    return shrink_pending_ && MaybeStartShrink();
   }
 
   template <typename Fn>
@@ -1608,7 +1625,9 @@ class ScanHashMap {
 
   // A cursor of zero starts and completes a full scan. The owner may mutate,
   // rehash, or compact the map between Scan calls, and the callback may then
-  // be invoked more than once for an entry. Mutation from another thread
+  // be invoked more than once for an entry, including across shrinking. Every
+  // entry present throughout a complete scan is emitted at least once.
+  // Mutation from another thread
   // during this call, or from inside the callback, is unsupported.
   template <typename Fn>
   std::uint64_t Scan(std::uint64_t cursor, Fn&& fn) const {
@@ -1622,18 +1641,25 @@ class ScanHashMap {
       return NextCursor(cursor, mask);
     }
 
-    const Table& small = tables_[0];
-    const Table& large = tables_[1];
+    // The source is always table 0, but shrinking makes it the larger table.
+    // Visit a complete equivalence class under the smaller mask before moving
+    // the reverse-bit cursor; merged buckets can repeat, never disappear.
+    const bool shrinking = tables_[0].exponent_ > tables_[1].exponent_;
+    const Table& small = tables_[shrinking ? 1 : 0];
+    const Table& large = tables_[shrinking ? 0 : 1];
     const std::uint64_t small_mask = BucketMask(small);
     const std::uint64_t large_mask = BucketMask(large);
 
     const std::uint64_t small_index = cursor & small_mask;
-    if (small_index >= rehash_index_) {
+    if (shrinking || small_index >= rehash_index_) {
       EmitBucket(small, small_index, fn);
     }
 
     do {
-      EmitBucket(large, cursor & large_mask, fn);
+      const std::uint64_t large_index = cursor & large_mask;
+      if (!shrinking || large_index >= rehash_index_) {
+        EmitBucket(large, large_index, fn);
+      }
       cursor = NextCursor(cursor, large_mask);
     } while ((cursor & (small_mask ^ large_mask)) != 0);
 
@@ -1644,6 +1670,7 @@ class ScanHashMap {
     DestroyTable(tables_[0], true);
     DestroyTable(tables_[1], true);
     rehash_index_ = kNotRehashing;
+    shrink_pending_ = false;
   }
 
   // Moves every entry out into the returned map and leaves *this empty and
@@ -1651,7 +1678,7 @@ class ScanHashMap {
   // entries, so a caller can hand it to a background task and keep serving
   // reads from *this. O(1) — no entry is touched here.
   //
-  // Entry addresses are stable across expansion and ordinary assignment.
+  // Entry addresses are stable across resizing and ordinary assignment.
   // ReplaceValue deliberately returns the detached old object when a storage
   // policy changes concrete type, making the exceptional invalidation
   // explicit to its caller. A raw-pointer cache must likewise detect detach
@@ -1661,12 +1688,15 @@ class ScanHashMap {
     ScanHashMap detached(arena_);
     detached.tables_ = std::exchange(tables_, {});
     detached.rehash_index_ = std::exchange(rehash_index_, kNotRehashing);
+    detached.shrink_pending_ = std::exchange(shrink_pending_, false);
     return detached;
   }
 
  private:
   static constexpr std::size_t kEntriesPerBucket = 12;
   static constexpr std::size_t kTargetEntriesPerBucket = 9;
+  // Hysteresis leaves room for writes while a half-sized target is migrated.
+  static constexpr std::size_t kShrinkEntriesPerBucket = 3;
   static constexpr std::size_t kSlowPathBookkeepingAllowance = 4096;
   static constexpr std::size_t kNotRehashing =
       std::numeric_limits<std::size_t>::max();
@@ -1686,7 +1716,14 @@ class ScanHashMap {
       std::vector<BucketOwner, RetainedAllocator<BucketOwner>>;
   using OverflowFreeIds =
       std::vector<std::uint32_t, RetainedAllocator<std::uint32_t>>;
-  using DirectBuckets = std::vector<Bucket, RetainedAllocator<Bucket>>;
+  struct BucketArrayDeleter {
+    RetainedAllocationDomain domain_;
+    void operator()(Bucket* buckets) const noexcept {
+      static_assert(std::is_trivially_destructible_v<Bucket>);
+      DeallocateRetainedBytes(domain_, buckets, alignof(Bucket));
+    }
+  };
+  using DirectBuckets = std::unique_ptr<Bucket[], BucketArrayDeleter>;
 
   struct OverflowBuckets {
     explicit OverflowBuckets(RetainedAllocationDomain domain)
@@ -1703,11 +1740,27 @@ class ScanHashMap {
   struct Table {
     Table() = default;
     explicit Table(RetainedAllocationDomain domain)
-        : buckets_(RetainedAllocator<Bucket>(domain)),
+        : buckets_(nullptr, BucketArrayDeleter{domain}),
           overflow_(nullptr, RetainedObjectDeleter<OverflowBuckets>{
                                  RetainedAllocator<OverflowBuckets>(domain)}) {}
 
-    DirectBuckets buckets_;
+    // Direct tables never grow in place. An explicit array allocation gives
+    // optional shrinking a rejection channel without changing vector's fatal
+    // allocation contract or bypassing admission for later overflow growth.
+    bool AllocateBuckets(std::size_t count,
+                         bool independent_admission = false) {
+      assert(!buckets_);
+      auto domain = buckets_.get_deleter().domain_;
+      if (independent_admission) domain.externally_admitted_ = false;
+      auto* data = static_cast<Bucket*>(TryAllocateRetainedBytes(
+          domain, count * sizeof(Bucket), alignof(Bucket)));
+      if (data == nullptr) return false;
+      std::uninitialized_value_construct_n(data, count);
+      buckets_.reset(data);
+      return true;
+    }
+
+    DirectBuckets buckets_{nullptr, BucketArrayDeleter{}};
     OverflowOwner overflow_;
     std::uint8_t exponent_ = 0;
     std::size_t used_ = 0;
@@ -1816,8 +1869,9 @@ class ScanHashMap {
         return std::numeric_limits<std::size_t>::max();
       }
     }
+    // Aligned bucket allocation may consume one extra alignment unit.
     const std::size_t bucket_bytes =
-        AllocatorUsableSizeForRequest(sizeof(Bucket));
+        AllocatorUsableSizeForRequest(sizeof(Bucket)) + alignof(Bucket);
     if (bucket_bytes == std::numeric_limits<std::size_t>::max() ||
         count >
             (std::numeric_limits<std::size_t>::max() - total) / bucket_bytes) {
@@ -1827,11 +1881,36 @@ class ScanHashMap {
     return total;
   }
 
+  template <typename T>
+  static bool TryReserveOverflowVector(
+      std::vector<T, RetainedAllocator<T>>* values, std::size_t capacity,
+      RetainedAllocationDomain domain) {
+    std::optional<MemoryReservation> reservation;
+    if (!domain.externally_admitted_ && !domain.externally_accounted_) {
+      if (capacity > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+        return false;
+      }
+      reservation =
+          TryReserveMemory(AllocatorUsableSizeForRequest(capacity * sizeof(T)));
+      if (!reservation.has_value()) return false;
+    }
+    // Admission rejection must leave the source chain readable. vector's
+    // allocator has no fallible reserve, so construct already-admitted storage
+    // before moving its nonthrowing owners. Later growth uses the table's
+    // original domain again, not this vector's one-allocation permit.
+    domain.externally_admitted_ = true;
+    std::vector<T, RetainedAllocator<T>> prepared{RetainedAllocator<T>(domain)};
+    prepared.reserve(capacity);
+    for (T& value : *values) prepared.push_back(std::move(value));
+    *values = std::move(prepared);
+    return true;
+  }
+
   static bool PrepareChildCapacity(Table* table, std::size_t count) {
     if (count == 0) return true;
+    const RetainedAllocationDomain domain =
+        table->buckets_.get_deleter().domain_;
     if (table->overflow_ == nullptr) {
-      const RetainedAllocationDomain domain =
-          table->buckets_.get_allocator().domain();
       table->overflow_ = TryMakeRetainedUnique<OverflowBuckets>(domain, domain);
       if (table->overflow_ == nullptr) return false;
     }
@@ -1847,12 +1926,20 @@ class ScanHashMap {
       return false;
     }
     if (final_size > pool.free_ids_.capacity()) {
-      pool.free_ids_.reserve(
-          VectorCapacityFor(pool.free_ids_.capacity(), final_size));
+      if (!TryReserveOverflowVector(
+              &pool.free_ids_,
+              VectorCapacityFor(pool.free_ids_.capacity(), final_size),
+              domain)) {
+        return false;
+      }
     }
     if (final_size > pool.buckets_.capacity()) {
-      pool.buckets_.reserve(
-          VectorCapacityFor(pool.buckets_.capacity(), final_size));
+      if (!TryReserveOverflowVector(
+              &pool.buckets_,
+              VectorCapacityFor(pool.buckets_.capacity(), final_size),
+              domain)) {
+        return false;
+      }
     }
     return true;
   }
@@ -1863,7 +1950,7 @@ class ScanHashMap {
     std::uint32_t index = 0;
     if (!pool.free_ids_.empty()) {
       auto bucket =
-          TryMakeRetainedUnique<Bucket>(pool.buckets_.get_allocator().domain());
+          TryMakeRetainedUnique<Bucket>(table->buckets_.get_deleter().domain_);
       if (bucket == nullptr) return {};
       index = pool.free_ids_.back();
       pool.free_ids_.pop_back();
@@ -1872,7 +1959,7 @@ class ScanHashMap {
     } else {
       index = static_cast<std::uint32_t>(pool.buckets_.size());
       auto bucket =
-          TryMakeRetainedUnique<Bucket>(pool.buckets_.get_allocator().domain());
+          TryMakeRetainedUnique<Bucket>(table->buckets_.get_deleter().domain_);
       if (bucket == nullptr) return {};
       pool.buckets_.push_back(std::move(bucket));
     }
@@ -1889,7 +1976,7 @@ class ScanHashMap {
   }
 
   static std::size_t BucketCount(const Table& table) noexcept {
-    return table.buckets_.empty() ? 0 : std::size_t{1} << table.exponent_;
+    return !table.buckets_ ? 0 : std::size_t{1} << table.exponent_;
   }
 
   static std::uint64_t BucketMask(const Table& table) noexcept {
@@ -1975,19 +2062,21 @@ class ScanHashMap {
   // RehashStep is intentionally large and stays out of line. Keep its common
   // steady-state guard at the call site so every lookup does not pay a
   // call/return merely to discover that the recovered or settled table is not
-  // expanding. While expansion is active, reads and mutations still advance
-  // exactly one bucket before accessing either table.
+  // resizing. Reads and mutations advance at most one source bucket; a
+  // deferred shrink can also retry admission without another deletion.
   [[gnu::always_inline]] void AdvanceRehashIfNeeded() {
     if (Rehashing()) [[unlikely]] {
       RehashStep();
+    } else if (shrink_pending_) [[unlikely]] {
+      MaybeStartShrink();
     }
   }
 
   void EnsureTable() {
-    if (tables_[0].buckets_.empty()) {
+    if (!tables_[0].buckets_) {
       assert(arena_ != nullptr);
       tables_[0] = Table(arena_->allocation_domain());
-      tables_[0].buckets_.resize(1);
+      if (!tables_[0].AllocateBuckets(1)) std::terminate();
       tables_[0].exponent_ = 0;
     }
   }
@@ -2010,26 +2099,51 @@ class ScanHashMap {
     assert(arena_ != nullptr);
     tables_[1] = Table(arena_->allocation_domain());
     tables_[1].exponent_ = tables_[0].exponent_ + 1;
-    tables_[1].buckets_.resize(std::size_t{1} << tables_[1].exponent_);
+    if (!tables_[1].AllocateBuckets(std::size_t{1} << tables_[1].exponent_)) {
+      std::terminate();
+    }
     tables_[1].used_ = 0;
     rehash_index_ = 0;
   }
 
-  void RehashStep() {
-    if (!Rehashing()) {
-      return;
+  bool MaybeStartShrink() {
+    if (Rehashing()) return false;
+    if (empty()) {
+      const bool released = has_allocated_storage();
+      tables_ = {};
+      shrink_pending_ = false;
+      return released;
     }
+    const std::size_t buckets = BucketCount(tables_[0]);
+    if (buckets <= 1 || size() >= buckets * kShrinkEntriesPerBucket) {
+      shrink_pending_ = false;
+      return false;
+    }
+    Table prepared(arena_->allocation_domain());
+    prepared.exponent_ = tables_[0].exponent_ - 1;
+    // Deletion has no enclosing growth permit, even for a primary index.
+    // Reserve the temporary old+new footprint before publishing the target;
+    // rejection must never turn a successful Erase into a failed command.
+    if (!prepared.AllocateBuckets(buckets / 2, true)) return false;
+    tables_[1] = std::move(prepared);
+    rehash_index_ = 0;
+    return true;
+  }
+
+  bool RehashStep() {
+    if (!Rehashing()) return false;
 
     // A source chain can split into only two target chains when the direct
-    // table doubles. Prepare every overflow bucket before clearing a source
-    // slot, so deterministic admission failure merely delays maintenance and
+    // table doubles, or merge into one target chain when it halves. Prepare
+    // every overflow bucket before clearing a source slot, so deterministic
+    // admission failure merely delays maintenance and
     // never leaves a partially migrated map. Physical allocator exhaustion is
     // process-fatal. This also covers rehash work initiated by reads, which
     // have no enclosing write reservation.
     RehashPlan plan;
     if (!PrepareRehashPlan(&tables_[0].buckets_[rehash_index_], &tables_[1],
                            &plan)) {
-      return;
+      return false;
     }
 
     MoveBucket(&tables_[0].buckets_[rehash_index_], &tables_[1], plan);
@@ -2040,6 +2154,7 @@ class ScanHashMap {
       tables_[1] = Table(arena_->allocation_domain());
       rehash_index_ = kNotRehashing;
     }
+    return true;
   }
 
   static std::size_t FreeSlots(const Table& table,
@@ -2107,8 +2222,12 @@ class ScanHashMap {
 
   bool PrepareRehashPlan(Bucket* source, Table* target, RehashPlan* plan) {
     const std::size_t old_bucket_count = BucketCount(tables_[0]);
-    const std::array<std::size_t, 2> target_indexes = {
-        rehash_index_, rehash_index_ + old_bucket_count};
+    const bool shrinking = target->exponent_ < tables_[0].exponent_;
+    const std::array<std::size_t, 2> target_indexes =
+        shrinking
+            ? std::array<std::size_t, 2>{rehash_index_ & BucketMask(*target), 0}
+            : std::array<std::size_t, 2>{rehash_index_,
+                                         rehash_index_ + old_bucket_count};
     std::array<std::size_t, 2> demand{};
     for (Bucket* bucket = source; bucket != nullptr;
          bucket = Chained(*bucket) ? Child(tables_[0], bucket) : nullptr) {
@@ -2119,7 +2238,7 @@ class ScanHashMap {
             static_cast<std::size_t>(hash & BucketMask(*target));
         assert(index == target_indexes[0] || index == target_indexes[1]);
         const std::uint8_t split =
-            static_cast<std::uint8_t>(index == target_indexes[1]);
+            static_cast<std::uint8_t>(!shrinking && index == target_indexes[1]);
         plan->push_back(RehashMove{
             .handle_ = handle,
             .tag_ = HashTag(hash),
@@ -2146,7 +2265,7 @@ class ScanHashMap {
 
     std::optional<MemoryReservation> reservation;
     const RetainedAllocationDomain domain =
-        target->buckets_.get_allocator().domain();
+        target->buckets_.get_deleter().domain_;
     if (allocation_bytes != 0 && domain.externally_admitted_ &&
         !domain.externally_accounted_) {
       // Primary-index mutations admit composite growth at the storage layer,
@@ -2177,7 +2296,7 @@ class ScanHashMap {
 
   Entry* FindInTable(Table& table, const Digest& digest, std::string_view key,
                      std::uint64_t hash) {
-    if (table.buckets_.empty()) {
+    if (!table.buckets_) {
       return nullptr;
     }
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
@@ -2196,7 +2315,7 @@ class ScanHashMap {
 
   const Entry* FindInTable(const Table& table, const Digest& digest,
                            std::string_view key, std::uint64_t hash) const {
-    if (table.buckets_.empty()) return nullptr;
+    if (!table.buckets_) return nullptr;
     const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
@@ -2214,7 +2333,7 @@ class ScanHashMap {
   void AppendCandidates(Table& table, const Digest& digest,
                         std::string_view key, std::uint64_t hash,
                         std::vector<Entry*>* result) {
-    if (table.buckets_.empty()) {
+    if (!table.buckets_) {
       return;
     }
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
@@ -2367,7 +2486,7 @@ class ScanHashMap {
 
   template <typename Fn>
   void EmitBucket(const Table& table, std::uint64_t index, Fn& fn) const {
-    if (table.buckets_.empty()) {
+    if (!table.buckets_) {
       return;
     }
     const Bucket* bucket = &table.buckets_[index];
@@ -2391,7 +2510,7 @@ class ScanHashMap {
 
   template <typename Fn>
   bool EmitBucketWhile(const Table& table, std::uint64_t index, Fn& fn) const {
-    if (table.buckets_.empty()) return true;
+    if (!table.buckets_) return true;
     const Bucket* bucket = &table.buckets_[index];
     while (bucket != nullptr) {
       for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
@@ -2440,11 +2559,13 @@ class ScanHashMap {
     arena_ = std::move(other.arena_);
     tables_ = std::move(other.tables_);
     rehash_index_ = std::exchange(other.rehash_index_, kNotRehashing);
+    shrink_pending_ = std::exchange(other.shrink_pending_, false);
     other.tables_ = {};
   }
 
   std::array<Table, 2> tables_{};
   std::size_t rehash_index_ = kNotRehashing;
+  bool shrink_pending_ = false;
   std::shared_ptr<ScanHashMapEntryArena> arena_;
 };
 

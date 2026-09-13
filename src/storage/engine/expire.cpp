@@ -208,6 +208,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
   constexpr auto kInterval = std::chrono::milliseconds(10);
   constexpr std::size_t kMapStepsPerCycle = 256;
   constexpr std::size_t kDeletesPerCycle = 64;
+  constexpr std::size_t kIndexMaintenanceStepsPerCycle = 256;
   while (!store->worker_->stop_requested()) {
     absl::Status waited = co_await celer::SleepFor(*store->worker_, kInterval);
     if (!waited.ok()) {
@@ -222,19 +223,40 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
       bool* running_;
       ~CycleGuard() { *running_ = false; }
     } cycle_guard{&store->expiry_cycle_running_};
-#if KEYLANE_FAULTS_ENABLED
-    // Deterministic coverage for lazy-expiration replacement. Production
-    // builds without explicit test faults never expose an expiration switch.
-    if (std::getenv("KEYLANE_DISABLE_ACTIVE_EXPIRATION") != nullptr) continue;
-#endif
     if (expiration_pause_count_.load(std::memory_order_acquire) != 0) {
       continue;  // a stable-keyspace scan (KEYS) is in flight
     }
-    if (!expiration_authority_.load(std::memory_order_acquire)) continue;
     if (store->worker_->stop_requested() ||
         shutdown_flush_requested_.load(std::memory_order_acquire)) {
       break;
     }
+
+    // Resizing changes no logical state and also runs on replicas. Share the
+    // expiration pause/drain boundary so stable scans and shutdown checkpoints
+    // cannot race bucket migration. Keep this batch non-suspending on the
+    // owner; a stalled admission advances to the next map and retries on a
+    // later pass, while active rehashes retain their position across cycles.
+    for (std::size_t step = 0;
+         step < kIndexMaintenanceStepsPerCycle && !store->partitions_.empty();
+         ++step) {
+      auto& partition =
+          store->partitions_[store->index_maintenance_partition_cursor_];
+      if (partition.indexes_[store->index_maintenance_db_cursor_].Maintain()) {
+        continue;
+      }
+      if (++store->index_maintenance_db_cursor_ == kLogicalDatabaseCount) {
+        store->index_maintenance_db_cursor_ = 0;
+        if (++store->index_maintenance_partition_cursor_ ==
+            store->partitions_.size()) {
+          store->index_maintenance_partition_cursor_ = 0;
+        }
+      }
+    }
+#if KEYLANE_FAULTS_ENABLED
+    // Only logical expiration is disabled; index maintenance still runs.
+    if (std::getenv("KEYLANE_DISABLE_ACTIVE_EXPIRATION") != nullptr) continue;
+#endif
+    if (!expiration_authority_.load(std::memory_order_acquire)) continue;
 
     const std::uint64_t now_ms = UnixTimeMillis();
     for (std::size_t step = 0;

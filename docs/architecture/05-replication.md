@@ -511,8 +511,11 @@ Each `(partition, database)` moves through `unstarted`, `scanning`, and
 - a covered key, or any key in a tailing database, enters the ordered session
   command FIFO.
 
-Baseline values are captured under the key-ordering boundary. Large external
-values pin immutable extents and stream bounded value chunks between `begin`
+Baseline scans tolerate index growth and shrinking: continuously present keys
+remain enumerable, and per-key capture state suppresses repeated bucket visits
+while preserving concurrent after-images. Baseline values are captured under
+the key-ordering boundary. Large external values pin immutable extents and
+stream bounded value chunks between `begin`
 and `commit` frames. Grouped sources pin an immutable root and its complete
 group graph, measure the compact wire length page by page, and traverse the
 same graph again to emit chunks. Source state retains one admitted decoded

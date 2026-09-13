@@ -146,6 +146,23 @@ The `keylane_fault_injection_*` CTest cases independently compile the helper
 in Debug, ordinary Release and fault-enabled Release modes. Integration
 fixtures that require a hook must skip against ordinary Release servers.
 
+### TTL index memory reclamation
+
+The Tomb Raider suite checks that TTL expiration and tombstone reaping release
+retained index memory. It writes 102,400 inline keys of 1 KiB each (100 MiB of
+key bytes), with one-byte values:
+
+```bash
+cmake --build build-clang --target keylane keylane_tomb_raider_e2e_test -j 8
+ctest --test-dir build-clang -R '^keylane_tomb_raider_e2e$' --output-on-failure
+```
+
+Substitute the configured build directory as needed. The suite owns a
+temporary 1 GiB data file under `/tmp`, pauses defrag, and checks `used_memory`
+after all expiring keys have been reaped. One permanent key remains. It can
+take several minutes and has a 600-second CTest timeout. Process RSS is reported
+separately as `used_memory_rss` and is not the reclamation assertion.
+
 ### Large collection stress tests
 
 The opt-in aggregate-size tests exercise collections whose encoded contents

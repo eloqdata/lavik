@@ -1774,6 +1774,10 @@ class StorageEngine::Impl {
     std::size_t expiry_partition_cursor_ = 0;
     std::uint8_t expiry_db_cursor_ = 0;
     std::uint64_t expiry_scan_cursor_ = 0;
+    // Independent of TTL candidates: tombstone reaping can leave a shrinking
+    // index with no expiring keys and no subsequent foreground requests.
+    std::size_t index_maintenance_partition_cursor_ = 0;
+    std::uint8_t index_maintenance_db_cursor_ = 0;
     // True for the whole of one expiration cycle, scan through last tombstone.
     // QuiesceExpiration waits on it, which covers every suspension inside the
     // cycle's deletes — including block-allocation waits that release

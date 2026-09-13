@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 #include "../src/redis/list_command.h"
 #include "../src/redis/set_command.h"
@@ -2508,6 +2509,118 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
+  celer::Task<absl::Status> ExerciseFullSyncDuringTombstoneReaping() {
+    constexpr std::uint8_t kDb = 9;
+    constexpr std::uint64_t kSession = 0x534852494e4b;
+    constexpr std::size_t kKeys = 256;
+    constexpr std::size_t kPermanent = 16;
+    std::vector<std::string> keys;
+    const auto expire_at =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count() +
+        1000;
+    for (std::size_t i = 0; i < kKeys; ++i) {
+      keys.push_back("fullsync-shrink{ttl-reap}-" + std::to_string(i));
+      keylane::storage::SetOptions options;
+      if (i >= kPermanent) options.expire_at_ms_ = expire_at;
+      auto written =
+          co_await storage_->Set(kDb, keys.back(), "baseline", options);
+      if (!written.ok()) co_return written.status();
+    }
+    const auto partition_id = keylane::storage::StorageShardForKey(keys[0]);
+    auto session = storage_->BeginFullSyncSession(kSession);
+    if (!session.ok()) co_return session.status();
+    auto start = storage_->BeginPartitionReplication(kSession, partition_id);
+    if (!start.ok()) co_return start.status();
+    absl::Status status =
+        storage_->BeginPartitionDbReplication(kSession, partition_id, kDb);
+    if (!status.ok()) co_return status;
+    // Pause a real full-sync cursor after its first bucket. Reaping most of
+    // this same-slot population will cross several shrink thresholds before
+    // the next snapshot call, with a concurrent write using override capture.
+    auto first =
+        co_await storage_->SnapshotPartition(kSession, partition_id, kDb, 0, 1);
+    if (!first.ok()) co_return first.status();
+    Check(first->cursor_ != 0, "shrink fixture did not pause a full-sync scan");
+    std::unordered_map<std::string, unsigned> seen;
+    for (const auto& record : first->records_) ++seen[record.key_];
+    storage_->AcknowledgePartitionSnapshotRecords(kSession, partition_id,
+                                                  first->records_);
+    std::size_t rewritten_index = 0;
+    while (rewritten_index < kPermanent &&
+           seen.contains(keys[rewritten_index])) {
+      ++rewritten_index;
+    }
+    Check(rewritten_index < kPermanent,
+          "fixture needs an uncovered stable key");
+    auto rewritten =
+        co_await storage_->Set(kDb, keys[rewritten_index], "rewritten", {});
+    if (!rewritten.ok()) co_return rewritten.status();
+
+    const auto reaped_before = storage_->TombRaiderStats().reaped_;
+    status = co_await storage_->ConfigureTombRaider(
+        {.action_ = keylane::storage::TombRaiderConfigAction::kBlockSleep,
+         .value_ = 0});
+    if (!status.ok()) co_return status;
+    status = co_await storage_->ConfigureTombRaider(
+        {.action_ = keylane::storage::TombRaiderConfigAction::kInterval,
+         .value_ = 10});
+    if (!status.ok()) co_return status;
+    status = co_await storage_->ConfigureTombRaider(
+        {.action_ = keylane::storage::TombRaiderConfigAction::kOn});
+    if (!status.ok()) co_return status;
+    status =
+        co_await celer::SleepFor(*worker_, std::chrono::milliseconds(1100));
+    if (!status.ok()) co_return status;
+    for (std::size_t i = kPermanent; i < keys.size(); ++i) {
+      auto expired = co_await storage_->Get(kDb, keys[i]);
+      Check(absl::IsNotFound(expired.status()), "TTL fixture remained visible");
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (storage_->TombRaiderStats().reaped_ <
+           reaped_before + kKeys - kPermanent) {
+      Check(std::chrono::steady_clock::now() < deadline,
+            "TTL tombstones were not erased during full sync");
+      status =
+          co_await celer::SleepFor(*worker_, std::chrono::milliseconds(10));
+      if (!status.ok()) co_return status;
+    }
+    std::uint64_t cursor = first->cursor_;
+    unsigned batches = 0;
+    do {
+      auto batch = co_await storage_->SnapshotPartition(kSession, partition_id,
+                                                        kDb, cursor, 1);
+      if (!batch.ok()) co_return batch.status();
+      for (const auto& record : batch->records_) ++seen[record.key_];
+      storage_->AcknowledgePartitionSnapshotRecords(kSession, partition_id,
+                                                    batch->records_);
+      cursor = batch->cursor_;
+      Check(++batches <= kKeys,
+            "full-sync cursor failed to terminate after shrink");
+    } while (cursor != 0);
+    for (std::size_t i = 0; i < kPermanent; ++i) {
+      if (i == rewritten_index) continue;
+      Check(seen[keys[i]] == 1,
+            "full sync missed or duplicated a stable key during shrink");
+    }
+    auto overrides = co_await storage_->ReadPartitionFullSyncOverrides(
+        kSession, partition_id, kKeys + 1);
+    if (!overrides.ok()) co_return overrides.status();
+    bool saw_rewrite = false;
+    for (const auto& record : overrides->records_) {
+      if (record.key_ == keys[rewritten_index] && record.value_ == "rewritten")
+        saw_rewrite = true;
+    }
+    Check(saw_rewrite, "full sync lost the concurrent overwrite during shrink");
+    storage_->EndPartitionReplication(kSession, partition_id);
+    storage_->EndFullSyncSession(kSession);
+    status = co_await storage_->QuiesceTombRaiderForReplica();
+    if (!status.ok()) co_return status;
+    co_return absl::OkStatus();
+  }
+
   celer::Task<absl::Status> Exercise() {
     absl::Status status = co_await ExerciseMutationPrecondition();
     if (!status.ok()) co_return status;
@@ -2525,6 +2638,9 @@ class ReplicationLogService final : public celer::Service {
     if (!status.ok()) co_return status;
 
     status = co_await ExerciseFlushControlBarriers();
+    if (!status.ok()) co_return status;
+
+    status = co_await ExerciseFullSyncDuringTombstoneReaping();
     if (!status.ok()) co_return status;
 
     // The backlog is process memory only. Restart recovers primary records and
