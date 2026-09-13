@@ -22,6 +22,13 @@ UNIT = "keylane-ycsb-cpu12.service"
 COUNT = 100_000_000
 
 
+def host_snapshot(name):
+    state = {path: Path(path).read_text() for path in
+             ("/proc/interrupts", "/proc/net/softnet_stat", "/proc/stat")}
+    state["utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    (ROOT / name).write_text(json.dumps(state, indent=2) + "\n")
+
+
 def redis(*args):
     return bench.execute(["redis-cli", "--raw", "-h", bench.SERVER, "-p", "16379",
                           "-n", "0", *args], capture_output=True).stdout.strip()
@@ -113,6 +120,7 @@ def clear_load(expected):
     (ROOT / "cpu12-load.command.json").write_text(json.dumps(load, indent=2) + "\n")
     print("LOAD 100M records, 10 x 128B, client .5, no scan index", flush=True)
     bench.snapshot("hmset", ROOT / "cpu12-load.before.txt")
+    host_snapshot("cpu12-load.host-before.json")
     with (ROOT / "cpu12-load.log").open("w") as output:
         process = subprocess.run(["ssh", bench.CLIENT, shlex.join(args)], stdout=output,
                                  stderr=subprocess.STDOUT, timeout=7200)
@@ -123,6 +131,7 @@ def clear_load(expected):
     if process.returncode or load["failed"] or load["server"]["dbsize"] != COUNT:
         raise RuntimeError("Load incomplete or failed")
     bench.snapshot("hmset", ROOT / "cpu12-load.after.txt")
+    host_snapshot("cpu12-load.host-after.json")
     print(f"LOADED {COUNT} keys, {load['success_qps']:.0f} inserts/s, zero errors", flush=True)
 
 
@@ -147,8 +156,11 @@ def run():
             for target in (100000, 0):
                 label = f"cpu12-r{round_number}"
                 for phase in ("warmup", "measured"):
+                    stem = f"{label}-{workload.lower()}-target{target}-{phase}"
+                    host_snapshot(stem + ".host-before.json")
                     cell = bench.run("hmset", workload, 256, phase, target=target,
                                      measurement_interval="both", label=label)
+                    host_snapshot(stem + ".host-after.json")
                     if cell["failed"]:
                         raise RuntimeError("YCSB operation failure")
                     if phase == "measured":

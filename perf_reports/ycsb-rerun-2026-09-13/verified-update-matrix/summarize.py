@@ -155,6 +155,8 @@ def main():
     lines += report_lines()
     from hash_direct_summary import report_lines as direct_report_lines
     lines += direct_report_lines()
+    from cpu12_summary import report_lines as cpu12_report_lines
+    lines += cpu12_report_lines()
     lines += ["", "## 原始证据与复现", "",
               "[逐操作 CSV](verified-update-matrix/summary.csv) 包含平均、最小、最大、p50/p95/p99/p99.9/p99.99、成功次数、失败次数、源日志 SHA256。",
               "[环境信息](verified-update-matrix/environment.json)；[串行运行脚本](verified-update-matrix/run.py)；[汇总与计数核验脚本](verified-update-matrix/summarize.py)。", "",

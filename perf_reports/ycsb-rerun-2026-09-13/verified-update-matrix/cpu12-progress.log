@@ -1,0 +1,61 @@
+START cpu12-r1-hmset-c-c256-target100000-warmup
+DONE cpu12-r1-hmset-c-c256-target100000-warmup qps=98873 errors=0
+START cpu12-r1-hmset-c-c256-target100000-measured
+DONE cpu12-r1-hmset-c-c256-target100000-measured qps=99739 errors=0
+RESULT 1/12 cpu12-r1 C target=100000 READ qps=99739 p99/p999/p9999=465/1006/2553us
+START cpu12-r1-hmset-c-c256-warmup
+DONE cpu12-r1-hmset-c-c256-warmup qps=432713 errors=0
+START cpu12-r1-hmset-c-c256-measured
+DONE cpu12-r1-hmset-c-c256-measured qps=452120 errors=0
+RESULT 2/12 cpu12-r1 C target=0 READ qps=452120 p99/p999/p9999=1274/4071/16231us
+START cpu12-r1-hmset-a-c256-target100000-warmup
+DONE cpu12-r1-hmset-a-c256-target100000-warmup qps=98619 errors=0
+START cpu12-r1-hmset-a-c256-target100000-measured
+DONE cpu12-r1-hmset-a-c256-target100000-measured qps=99844 errors=0
+RESULT 3/12 cpu12-r1 A target=100000 READ qps=49915 p99/p999/p9999=475/2773/4667us; UPDATE qps=49929 p99/p999/p9999=502/2793/4675us
+START cpu12-r1-hmset-a-c256-warmup
+DONE cpu12-r1-hmset-a-c256-warmup qps=349284 errors=0
+START cpu12-r1-hmset-a-c256-measured
+DONE cpu12-r1-hmset-a-c256-measured qps=401316 errors=0
+RESULT 4/12 cpu12-r1 A target=0 READ qps=200688 p99/p999/p9999=3353/6115/13487us; UPDATE qps=200628 p99/p999/p9999=3415/6199/18127us
+START cpu12-r2-hmset-c-c256-target100000-warmup
+DONE cpu12-r2-hmset-c-c256-target100000-warmup qps=99059 errors=0
+START cpu12-r2-hmset-c-c256-target100000-measured
+DONE cpu12-r2-hmset-c-c256-target100000-measured qps=99852 errors=0
+RESULT 5/12 cpu12-r2 C target=100000 READ qps=99852 p99/p999/p9999=497/680/1478us
+START cpu12-r2-hmset-c-c256-warmup
+DONE cpu12-r2-hmset-c-c256-warmup qps=427350 errors=0
+START cpu12-r2-hmset-c-c256-measured
+DONE cpu12-r2-hmset-c-c256-measured qps=465116 errors=0
+RESULT 6/12 cpu12-r2 C target=0 READ qps=465116 p99/p999/p9999=1232/3543/12199us
+START cpu12-r2-hmset-a-c256-target100000-warmup
+DONE cpu12-r2-hmset-a-c256-target100000-warmup qps=99108 errors=0
+START cpu12-r2-hmset-a-c256-target100000-measured
+DONE cpu12-r2-hmset-a-c256-target100000-measured qps=99786 errors=0
+RESULT 7/12 cpu12-r2 A target=100000 READ qps=49899 p99/p999/p9999=522/2975/5307us; UPDATE qps=49888 p99/p999/p9999=568/3185/5723us
+START cpu12-r2-hmset-a-c256-warmup
+DONE cpu12-r2-hmset-a-c256-warmup qps=361141 errors=0
+START cpu12-r2-hmset-a-c256-measured
+DONE cpu12-r2-hmset-a-c256-measured qps=395820 errors=0
+RESULT 8/12 cpu12-r2 A target=0 READ qps=197846 p99/p999/p9999=3229/6127/11879us; UPDATE qps=197975 p99/p999/p9999=3329/6167/15439us
+START cpu12-r3-hmset-c-c256-target100000-warmup
+DONE cpu12-r3-hmset-c-c256-target100000-warmup qps=98961 errors=0
+START cpu12-r3-hmset-c-c256-target100000-measured
+DONE cpu12-r3-hmset-c-c256-target100000-measured qps=99792 errors=0
+RESULT 9/12 cpu12-r3 C target=100000 READ qps=99792 p99/p999/p9999=483/753/1611us
+START cpu12-r3-hmset-c-c256-warmup
+DONE cpu12-r3-hmset-c-c256-warmup qps=407332 errors=0
+START cpu12-r3-hmset-c-c256-measured
+DONE cpu12-r3-hmset-c-c256-measured qps=481139 errors=0
+RESULT 10/12 cpu12-r3 C target=0 READ qps=481139 p99/p999/p9999=795/3367/10223us
+START cpu12-r3-hmset-a-c256-target100000-warmup
+DONE cpu12-r3-hmset-a-c256-target100000-warmup qps=99088 errors=0
+START cpu12-r3-hmset-a-c256-target100000-measured
+DONE cpu12-r3-hmset-a-c256-target100000-measured qps=99743 errors=0
+RESULT 11/12 cpu12-r3 A target=100000 READ qps=49876 p99/p999/p9999=520/2853/5259us; UPDATE qps=49866 p99/p999/p9999=566/3055/5827us
+START cpu12-r3-hmset-a-c256-warmup
+DONE cpu12-r3-hmset-a-c256-warmup qps=342349 errors=0
+START cpu12-r3-hmset-a-c256-measured
+DONE cpu12-r3-hmset-a-c256-measured qps=398026 errors=0
+RESULT 12/12 cpu12-r3 A target=0 READ qps=199095 p99/p999/p9999=3133/6103/12039us; UPDATE qps=198931 p99/p999/p9999=3151/6111/11151us
+COMPLETE CPU12: 12 measured cells; isolated service remains running

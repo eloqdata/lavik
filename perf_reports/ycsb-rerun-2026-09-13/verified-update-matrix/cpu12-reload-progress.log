@@ -1,0 +1,3 @@
+CLEARED DB0: 100605038 old keys removed; RAID and Aerospike preserved
+LOAD 100M records, 10 x 128B, client .5, no scan index
+LOADED 100000000 keys, 521962 inserts/s, zero errors

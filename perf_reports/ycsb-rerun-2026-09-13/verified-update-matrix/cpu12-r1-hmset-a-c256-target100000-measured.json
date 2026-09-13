@@ -1,0 +1,179 @@
+{
+  "mode": "hmset",
+  "workload": "A",
+  "workers": 256,
+  "phase": "measured",
+  "label": "cpu12-r1",
+  "target_ops_sec": 100000,
+  "measurement_interval": "both",
+  "command": [
+    "/mnt/dev/YCSB-hreplace-dist/bin/ycsb",
+    "run",
+    "redis",
+    "-s",
+    "-threads",
+    "256",
+    "-P",
+    "/mnt/dev/YCSB-hreplace-dist/workloads/workloada",
+    "-target",
+    "100000",
+    "-p",
+    "recordcount=100000000",
+    "-p",
+    "operationcount=5000000",
+    "-p",
+    "fieldcount=10",
+    "-p",
+    "fieldlength=128",
+    "-p",
+    "fieldlengthdistribution=constant",
+    "-p",
+    "readallfields=true",
+    "-p",
+    "writeallfields=true",
+    "-p",
+    "insertorder=hashed",
+    "-p",
+    "requestdistribution=uniform",
+    "-p",
+    "readproportion=0.5",
+    "-p",
+    "updateproportion=0.5",
+    "-p",
+    "insertproportion=0",
+    "-p",
+    "scanproportion=0",
+    "-p",
+    "readmodifywriteproportion=0",
+    "-p",
+    "measurementtype=hdrhistogram",
+    "-p",
+    "measurement.interval=both",
+    "-p",
+    "hdrhistogram.percentiles=50,95,99,99.9,99.99",
+    "-p",
+    "status.interval=10",
+    "-p",
+    "redis.host=172.16.0.4",
+    "-p",
+    "redis.port=16379",
+    "-p",
+    "redis.scanindex=none",
+    "-p",
+    "redis.timeout=10000",
+    "-p",
+    "redis.cluster=false",
+    "-p",
+    "redis.updatecommand=hmset"
+  ],
+  "start_utc": "2026-09-13T14:48:22Z",
+  "runtime_ms": 50078,
+  "attempted": 5000000,
+  "succeeded": 5000000,
+  "failed": 0,
+  "success_qps": 99844.24298094971,
+  "metrics": {
+    "OVERALL": {
+      "RunTime(ms)": 50078,
+      "Throughput(ops/sec)": 99844.24298094971
+    },
+    "TOTAL_GCS_G1_Young_Generation": {
+      "Count": 141
+    },
+    "TOTAL_GC_TIME_G1_Young_Generation": {
+      "Time(ms)": 115
+    },
+    "TOTAL_GC_TIME_%_G1_Young_Generation": {
+      "Time(%)": 0.22964175885618437
+    },
+    "TOTAL_GCS_G1_Old_Generation": {
+      "Count": 0
+    },
+    "TOTAL_GC_TIME_G1_Old_Generation": {
+      "Time(ms)": 0
+    },
+    "TOTAL_GC_TIME_%_G1_Old_Generation": {
+      "Time(%)": 0.0
+    },
+    "TOTAL_GCs": {
+      "Count": 141
+    },
+    "TOTAL_GC_TIME": {
+      "Time(ms)": 115
+    },
+    "TOTAL_GC_TIME_%": {
+      "Time(%)": 0.22964175885618437
+    },
+    "READ": {
+      "Operations": 2499662,
+      "AverageLatency(us)": 311.846604060869,
+      "MinLatency(us)": 162,
+      "MaxLatency(us)": 9887,
+      "50thPercentileLatency(us)": 296,
+      "95thPercentileLatency(us)": 377,
+      "99thPercentileLatency(us)": 475,
+      "99.9PercentileLatency(us)": 2773,
+      "99.99PercentileLatency(us)": 4667,
+      "Return=OK": 2499662
+    },
+    "CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 24.859375,
+      "MinLatency(us)": 10,
+      "MaxLatency(us)": 653,
+      "50thPercentileLatency(us)": 15,
+      "95thPercentileLatency(us)": 33,
+      "99thPercentileLatency(us)": 452,
+      "99.9PercentileLatency(us)": 653,
+      "99.99PercentileLatency(us)": 653
+    },
+    "UPDATE": {
+      "Operations": 2500338,
+      "AverageLatency(us)": 319.64555672073135,
+      "MinLatency(us)": 169,
+      "MaxLatency(us)": 10815,
+      "50thPercentileLatency(us)": 303,
+      "95thPercentileLatency(us)": 387,
+      "99thPercentileLatency(us)": 502,
+      "99.9PercentileLatency(us)": 2793,
+      "99.99PercentileLatency(us)": 4675,
+      "Return=OK": 2500338
+    },
+    "Intended-READ": {
+      "Operations": 2499662,
+      "AverageLatency(us)": 391.0125044906071,
+      "MinLatency(us)": 199,
+      "MaxLatency(us)": 74047,
+      "50thPercentileLatency(us)": 355,
+      "95thPercentileLatency(us)": 439,
+      "99thPercentileLatency(us)": 802,
+      "99.9PercentileLatency(us)": 3925,
+      "99.99PercentileLatency(us)": 45151
+    },
+    "Intended-CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 25.11328125,
+      "MinLatency(us)": 10,
+      "MaxLatency(us)": 654,
+      "50thPercentileLatency(us)": 15,
+      "95thPercentileLatency(us)": 34,
+      "99thPercentileLatency(us)": 453,
+      "99.9PercentileLatency(us)": 654,
+      "99.99PercentileLatency(us)": 654
+    },
+    "Intended-UPDATE": {
+      "Operations": 2500338,
+      "AverageLatency(us)": 398.5479111224162,
+      "MinLatency(us)": 199,
+      "MaxLatency(us)": 74879,
+      "50thPercentileLatency(us)": 362,
+      "95thPercentileLatency(us)": 449,
+      "99thPercentileLatency(us)": 831,
+      "99.9PercentileLatency(us)": 3945,
+      "99.99PercentileLatency(us)": 43359
+    }
+  },
+  "sha256": "c089da69357fb640d80f4cd51b2738089abe2a078a0a5faed4459723cb94d303",
+  "exit_code": 0,
+  "end_utc": "2026-09-13T14:49:13Z"
+}

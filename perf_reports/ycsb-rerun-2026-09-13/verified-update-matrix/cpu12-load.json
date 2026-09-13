@@ -1,0 +1,232 @@
+{
+  "command": [
+    "/mnt/dev/YCSB-hreplace-dist/bin/ycsb",
+    "load",
+    "redis",
+    "-s",
+    "-threads",
+    "256",
+    "-P",
+    "/mnt/dev/YCSB-hreplace-dist/workloads/workloada",
+    "-p",
+    "recordcount=100000000",
+    "-p",
+    "insertstart=0",
+    "-p",
+    "insertcount=100000000",
+    "-p",
+    "fieldcount=10",
+    "-p",
+    "fieldlength=128",
+    "-p",
+    "fieldlengthdistribution=constant",
+    "-p",
+    "readallfields=true",
+    "-p",
+    "writeallfields=true",
+    "-p",
+    "insertorder=hashed",
+    "-p",
+    "requestdistribution=uniform",
+    "-p",
+    "redis.host=172.16.0.4",
+    "-p",
+    "redis.port=16379",
+    "-p",
+    "redis.scanindex=none",
+    "-p",
+    "redis.timeout=10000",
+    "-p",
+    "redis.cluster=false",
+    "-p",
+    "measurementtype=hdrhistogram",
+    "-p",
+    "measurement.interval=both",
+    "-p",
+    "hdrhistogram.percentiles=50,95,99,99.9,99.99",
+    "-p",
+    "status.interval=10"
+  ],
+  "start_utc": "2026-09-13T14:43:11Z",
+  "runtime_ms": 191585,
+  "attempted": 100000000,
+  "succeeded": 100000000,
+  "failed": 0,
+  "success_qps": 521961.53143513325,
+  "metrics": {
+    "OVERALL": {
+      "RunTime(ms)": 191585,
+      "Throughput(ops/sec)": 521961.53143513325
+    },
+    "TOTAL_GCS_G1_Young_Generation": {
+      "Count": 2001
+    },
+    "TOTAL_GC_TIME_G1_Young_Generation": {
+      "Time(ms)": 1868
+    },
+    "TOTAL_GC_TIME_%_G1_Young_Generation": {
+      "Time(%)": 0.975024140720829
+    },
+    "TOTAL_GCS_G1_Old_Generation": {
+      "Count": 0
+    },
+    "TOTAL_GC_TIME_G1_Old_Generation": {
+      "Time(ms)": 0
+    },
+    "TOTAL_GC_TIME_%_G1_Old_Generation": {
+      "Time(%)": 0.0
+    },
+    "TOTAL_GCs": {
+      "Count": 2001
+    },
+    "TOTAL_GC_TIME": {
+      "Time(ms)": 1868
+    },
+    "TOTAL_GC_TIME_%": {
+      "Time(%)": 0.975024140720829
+    },
+    "CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 93.890625,
+      "MinLatency(us)": 26,
+      "MaxLatency(us)": 615,
+      "50thPercentileLatency(us)": 89,
+      "95thPercentileLatency(us)": 144,
+      "99thPercentileLatency(us)": 228,
+      "99.9PercentileLatency(us)": 615,
+      "99.99PercentileLatency(us)": 615
+    },
+    "INSERT": {
+      "Operations": 100000000,
+      "AverageLatency(us)": 440.96420743,
+      "MinLatency(us)": 152,
+      "MaxLatency(us)": 78975,
+      "50thPercentileLatency(us)": 386,
+      "95thPercentileLatency(us)": 681,
+      "99thPercentileLatency(us)": 2121,
+      "99.9PercentileLatency(us)": 4087,
+      "99.99PercentileLatency(us)": 5915,
+      "Return=OK": 100000000
+    },
+    "Intended-CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 95.73828125,
+      "MinLatency(us)": 27,
+      "MaxLatency(us)": 616,
+      "50thPercentileLatency(us)": 91,
+      "95thPercentileLatency(us)": 150,
+      "99thPercentileLatency(us)": 229,
+      "99.9PercentileLatency(us)": 616,
+      "99.99PercentileLatency(us)": 616
+    },
+    "Intended-INSERT": {
+      "Operations": 100000000,
+      "AverageLatency(us)": 441.00128852,
+      "MinLatency(us)": 152,
+      "MaxLatency(us)": 78975,
+      "50thPercentileLatency(us)": 386,
+      "95thPercentileLatency(us)": 681,
+      "99thPercentileLatency(us)": 2121,
+      "99.9PercentileLatency(us)": 4087,
+      "99.99PercentileLatency(us)": 5915
+    }
+  },
+  "sha256": "081f2e9a189f6aac73d5455b551e7ac1b3e79329da86bd9f00dbabcf60ccd557",
+  "exit_code": 0,
+  "end_utc": "2026-09-13T14:46:23Z",
+  "server": {
+    "pid": 73095,
+    "cgroup": "0::/keylane.slice/keylane-bench.slice/keylane-ycsb-cpu12.service",
+    "affinities": {
+      "73095": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "73109": [
+        0
+      ],
+      "73110": [
+        1
+      ],
+      "73111": [
+        2
+      ],
+      "73112": [
+        3
+      ],
+      "73113": [
+        4
+      ],
+      "73114": [
+        5
+      ],
+      "73115": [
+        6
+      ],
+      "73116": [
+        7
+      ],
+      "73117": [
+        8
+      ],
+      "73118": [
+        9
+      ],
+      "73119": [
+        10
+      ],
+      "73120": [
+        11
+      ],
+      "73121": [
+        0
+      ],
+      "73122": [
+        7
+      ],
+      "73139": [
+        1
+      ],
+      "73140": [
+        11
+      ],
+      "73141": [
+        2
+      ],
+      "73142": [
+        3
+      ],
+      "73143": [
+        9
+      ],
+      "73144": [
+        5
+      ],
+      "73145": [
+        8
+      ],
+      "73146": [
+        4
+      ],
+      "73147": [
+        10
+      ],
+      "73148": [
+        6
+      ]
+    },
+    "defrag": "paused=0 max_active_per_device=8 block_sleep_ms=0 record_sleep_us=0 active_total=0 pending_total=0",
+    "dbsize": 100000000,
+    "keyspace": "# Keyspace\ndb0:keys=100000000"
+  }
+}

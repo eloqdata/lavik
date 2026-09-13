@@ -1,0 +1,117 @@
+{
+  "commit": "a1b90e60d674149072deebc1dcc50bc691769bcf",
+  "binary": "/mnt/dev/keylane/build/keylane",
+  "sha256": "8ded8812356d872eabb05bcd0ff828dcf8185771c50ef1d3b566d5d48403ab1d",
+  "server": {
+    "pid": 73095,
+    "cgroup": "0::/keylane.slice/keylane-bench.slice/keylane-ycsb-cpu12.service",
+    "affinities": {
+      "73095": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "73109": [
+        0
+      ],
+      "73110": [
+        1
+      ],
+      "73111": [
+        2
+      ],
+      "73112": [
+        3
+      ],
+      "73113": [
+        4
+      ],
+      "73114": [
+        5
+      ],
+      "73115": [
+        6
+      ],
+      "73116": [
+        7
+      ],
+      "73117": [
+        8
+      ],
+      "73118": [
+        9
+      ],
+      "73119": [
+        10
+      ],
+      "73120": [
+        11
+      ],
+      "73121": [
+        0
+      ],
+      "73122": [
+        7
+      ],
+      "73139": [
+        1
+      ],
+      "73140": [
+        11
+      ],
+      "73141": [
+        2
+      ],
+      "73142": [
+        3
+      ],
+      "73143": [
+        9
+      ],
+      "73144": [
+        5
+      ],
+      "73145": [
+        8
+      ],
+      "73146": [
+        4
+      ],
+      "73147": [
+        10
+      ],
+      "73148": [
+        6
+      ]
+    },
+    "defrag": "paused=0 max_active_per_device=8 block_sleep_ms=0 record_sleep_us=0 active_total=0 pending_total=0",
+    "dbsize": 100000000,
+    "keyspace": "# Keyspace\ndb0:keys=100000000"
+  },
+  "workers": 12,
+  "client_workers": 256,
+  "rates": [
+    100000,
+    0
+  ],
+  "rounds": 3,
+  "workloads": [
+    "C",
+    "A"
+  ],
+  "counts": {
+    "warmup": 1000000,
+    "measured": 5000000
+  },
+  "monitoring": "active\nactive\n",
+  "comparison_note": "Historical 16-worker results use an older main and aged dataset; not an IRQ-only causal A/B."
+}
