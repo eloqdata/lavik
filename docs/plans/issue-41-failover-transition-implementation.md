@@ -45,9 +45,10 @@
   `/mnt/local_nvme/keylane-issue41-redesign/build-debug`。
 - `keylane_unit_tests`、`keylane_meta_tests`、`keylane-meta`、`keylane-ctl`、`keylane`
   已完整编译。
-- 旧基线 `fee2bd9` 上 582 个 unit tests 和 453 个 Meta tests 通过；Meta tests 使用
-  NVMe build/TMPDIR 运行，耗时约 47.8 秒。分支 rebase 到 `a968d00` 后，由 W0
-  重新记录测试数量和结果，不能把旧数字当作当前 main 的 baseline。
+- 最新基线 `a968d00` 上 582 个 unit tests（86 suites，约 23.6 秒）和 468 个
+  Meta tests（44 suites，约 48.0 秒）通过。W0 的 process-support 5 个 tests 及
+  population、ReplicationManager、serving-generation、rebuild-failure、
+  rebuild-protocol 5 个独立 CTest cases 也全部通过（后五项约 130 秒）。
 - `keylane_cluster_replication_manager_integration_test` 已在 NVMe build 中完整编译；
   它的现有 fixture 已验证会忽略 `TMPDIR` 并硬编码 `/tmp`，因此未将中断的
   运行计为 baseline。W0 先对 test-support temp-root 做无行为变更的机械性修正，
@@ -55,7 +56,9 @@
   然后才改 failover 行为。
 - 后续 build、test workdir、日志和进程数据全部放在
   `/mnt/local_nvme/keylane-issue41-redesign/`；所有测试命令显式设置
-  `TMPDIR=/mnt/local_nvme/keylane-issue41-redesign/tmp`。
+  `TMPDIR=/mnt/local_nvme/keylane-issue41-redesign/tmp` 和
+  `KEYLANE_TEST_TMPDIR=/mnt/local_nvme/keylane-issue41-redesign/tmp`。W0 的六个
+  helper-based targets 未新建 `/tmp/keylane-*` 产物。
 
 旧分支只按函数级 diff 选择性移植：
 
@@ -110,6 +113,9 @@
 13. **Controlled Operation 有界终止**：Operation 在 Begin 前后都有 typed terminal
     path；无 Candidate、Group 已被其他 transition 占用、无合法 Owner/grant 或
     deadline 到达都不能留下永久 `Submitted` 记录。
+14. **Cluster lifecycle 隔离**：failover Operation 提交、八个 typed command 和
+    snapshot restore 都要求拓扑 lifecycle 为 `Created`；`Uninitialized`、`Creating`
+    和 `ProvisioningFailed` 不得与 failover 并行。
 
 ## 4. TDD seam
 
@@ -206,9 +212,12 @@ transition 明确不保存：
 - `MetaTopologyStore::Serialize/Deserialize` 在原 schema 中编码 optional transition；
   Group 排序和 deterministic bytes 规则不变。
 - `MetaStores::Serialize/Deserialize` 仍编码原七个 store blob；不增加 snapshot 模块。
+- 在最新 main 的 command v2、topology-store v2 和 grant-store v1 布局上原地修改；
+  同步替换 `MakeTopologyBlob` 等 raw-layout fixtures，不升级任何现有版本。
 
 aggregate restore 在发布任何 Store 前验证以下跨 Store invariant：
 
+- cluster lifecycle 必须为 `Created`，其他 lifecycle 不允许任何 active transition；
 - Controlled transition 引用 exact、nonterminal、`kind=failover` Operation，且
   typed intent 的 group/deadline 与 transition.controlled 一致；
 - Controlled 状态为 `current_term + 1 == target_term`、current active grant 存在；
@@ -264,6 +273,13 @@ transition：
 这一规则同时定义 Controlled 和 Uncontrolled 的 lease/policy 来源；后续若需要
 在 failover 中更换 policy，作为独立的已验证命令扩展。
 
+最新 main 尚无可直接复用的完整 grant-spec validator：grant-local 规则位于
+`MetaGrantStore::ValidateActivate`，member/policy/epoch 规则位于 aggregate
+`ActivateAuthority` dispatch。实现时提取共享纯 `ValidateMetaGrantSpec`，并把完整 authority
+activation 抽为支持 optional `activation_action_id` 的 aggregate kernel；普通 activation
+显式清除该 id，failover Commit 写入 winning action。`RetirePolicy` 同时扫描 active grant
+和 transition 中冻结的 successor policy。
+
 ## 6. 八个 typed commands 及原子效果
 
 `MetaCommandTag` 在 29 后追加 30–37；variant 顺序、codec switch、apply-result tag 上限
@@ -318,7 +334,9 @@ Operation `kind=failover`、typed intent group/deadline 和 exact revision；pre
   内部复用 operation terminal kernel。
 - Coordinator durability fail-safe 显式允许 typed `AbortControlledFailover`，但只允许
   exact Operation terminalization 和最多删除 matching transition 的 bounded/shrinking effect；
-  Commit、Degrade 和其他会扩大/转移 authority 的 failover command 仍拒绝。
+  它复用现有 candidate stores + `ApplyCommitted` 模拟并比较完整 before/after，确认 term、
+  Owner、grant 和 topology epoch 均未改变；Commit、Degrade 和其他会扩大/转移 authority
+  的 failover command 仍拒绝。
 - deadline、disconnect/grace、CandidatePrepared 和 action readiness 都只是 leader-local
   proposal gate；apply 只验证 command payload 中的 committed anchors/CAS。同时到来的
   Abort/Degrade/Commit 由 Raft apply 顺序决定。
@@ -326,6 +344,10 @@ Operation `kind=failover`、typed intent group/deadline 和 exact revision；pre
   evidence；通用 Operation Store 仍保留这些字段供 cluster-create/membership 使用。
 - active transition 期间，任何会改变 Owner、member assignment、term/grant、manifest、
   partition epoch、slot/config anchor 或 transition 引用 policy 的普通命令都必须拒绝。
+- `SubmitOperation(kind=failover)` 和八个 typed command 都在 deterministic apply 中
+  再检查 lifecycle=`Created`。每条会安装或改变 transition 的命令还要复用/泛化
+  `ValidateAffectedFullStateProjections`，在发布 committed state 前证明所有受影响 Data
+  projection 都能编码进协议上限。
 
 ## 7. Operation 请求模型和 operator 入口
 
@@ -333,7 +355,9 @@ Operation `kind=failover`、typed intent group/deadline 和 exact revision；pre
 
 - `FailoverOperationIntent` 只编码 operator 请求：group、absolute deadline 和必要的
   idempotency inputs；successor grant 由 Begin 按 §5.5 快照，不从 operator intent 传入；
-- `SubmitOperation(kind=failover)` 继续提供永久 operation-id 幂等；
+- dedicated failover operator handler 继续用底层 `SubmitOperation(kind=failover)` 提供
+  永久 operation-id 幂等；通用 `submitop`、`completeop`、`abortop` 在 Admin 和 apply
+  两层都拒绝 failover kind；
 - operation 可以在没有 phase blob 的情况下保持 `Submitted`，执行中状态由 Group
   transition 派生；Operation 在 Commit/Abort/Degrade 前始终保持 Submitted，status API
   看到 matching Controlled transition 时投影为 Running；现有 Store 允许从 Submitted
@@ -341,14 +365,19 @@ Operation `kind=failover`、typed intent group/deadline 和 exact revision；pre
 - `ValidateFailoverProposal` 只校验 request 和八个 typed command 所需的 volatile
   observation，不再校验 phase graph/directive receipt；
 - `keylane-ctl failover` 生成稳定 operation id、绝对 deadline 并提交请求；重复请求
-  返回同一 operation，不新建 transition。
+  返回同一 operation，不新建 transition。客户端复用最新 `ClusterOperator::Create`
+  已建立的 leader discovery、单次发送和 definitely-not-sent/uncertain-outcome 区分，
+  不在 CLI 重写重试逻辑；Raft-free request codec 进入 `keylane_meta_admin`。
 - executor 在 observation warmup 后发现无合格 Candidate、Group 已被其他
   transition 占用、无合法 current Owner/grant，或 request 在 Begin 前已过
   deadline 时，提交 pre-Begin `AbortControlledFailover`；每个已接受 request 都有
   terminal result。
 
 因此 Begin 不修改 Operation revision，后续 typed command 始终 CAS Submit 产生的
-exact revision；本期不新增 Running lifecycle primitive。
+exact revision；本期不新增 Running lifecycle primitive。`getop` 必须从一次 state-machine
+快照同时取得 Operation 和 matching Group transition 后派生 Running，不能连续读取两个
+Store。`cluster-status` 本期不新增 active-transition wire payload；它仍展示当前 committed
+状态，但 member role 必须从 Group 的 current Owner 动态派生，Cutover 后不能沿用初始角色。
 
 ## 8. Observation 和选主
 
@@ -667,6 +696,10 @@ availability gap；用测试明确记录，不在本期暗中实现 staged repla
 - Controlled request扫描和现有 transition执行共用一条有界循环；
 - 自动 failure detection 不进入本 reconciler。
 
+`app/keylane_meta.cpp` 按 membership、cluster-create、Data-control、failover 顺序注册；
+demotion/shutdown 逆序先停 failover，保证新 Leader 的 Data publisher 已能重新收集 observation
+后 executor 才开始。warmup/source grace 复用现有 `observation_ttl_ms`，不新增配置旋钮。
+
 leadership observation warmup 复用 Observation Store 已配置的 heartbeat/session grace
 上限，不再发明无界等待：Controlled 等待上限是
 `min(configured grace, operation deadline - now)`，deadline 先到则 Abort；Uncontrolled
@@ -775,7 +808,9 @@ Uncontrolled 没有总 deadline；没有 Candidate时保持 fenced transition无
 - current grant exact-spec CAS、lease/policy validation 和 policy-retirement reference test；
 - exact replay、stale precondition、任一半边失败均不改 state；
 - topology store 和 aggregate snapshot roundtrip；
-- MetaStateMachine snapshot/restart 保留同一 transition。
+- MetaStateMachine snapshot/restart 保留同一 transition；
+- 四种 `MetaClusterLifecycle` matrix 证明只有 `Created` 可 submit/begin/restore failover；
+- command v2、topology v2、grant v1 的 raw-layout fixtures 原地替换。
 
 再实现：durable types、topology optional transition、grant activation id、codec、
 `BeginUncontrolled` dispatch、successor grant snapshot/validator、snapshot、aggregate invariant 和
@@ -844,7 +879,9 @@ Cluster activation 不会 unmatched
 Candidate 失败、Source disconnect grace/recovery/incarnation replacement、deadline/commit Raft-order
 race、leader cancel/resume、proposal reply 丢失后重读 committed state。然后接 operator
 CLI/status，构建 `keylane-ctl`、`keylane_cluster_status_tests` 和新的 failover
-CLI/operator request/terminal-status tests。
+CLI/operator request/terminal-status tests。operator 路径复用 `ClusterOperator` 的 leader
+routing 与 uncertain-outcome seam；`getop` 用一次原子 committed cut 派生 Running，status
+在 Cutover 后按 topology Owner 渲染新角色。
 
 出口：正常路径 `loss=none`；Candidate failure 必 Abort；Source 仅断连先等 grace，
 确定失效只在 deadline 前 Degrade；无论是否 Begin，operator 总能读到 Controlled
@@ -875,7 +912,10 @@ same-history reconnect CONTINUE、history mismatch FULL、former-owner cleanup�
 传入 `keylane-meta`、Data binary、`keylane-ctl` 和 `redis-cli`；不放入只传
 `keylane-meta` 的 `KEYLANE_META_INTEGRATION_GATES` 列表。每个 case 至少启动 3 个
 Meta、一个 Group 的 3 个真实 Data Node 和 Redis client；先按 controlled、
-recovery、partition 三类拆分，测量后设置每个 CTest timeout。覆盖：
+recovery、partition 三类拆分，测量后设置每个 CTest timeout。driver 复用
+`gate_cluster_create.py`/`harness.py` 的 `DataProcess`、leader discovery 和
+`wait_cluster_ready`；Genesis 接受后必须等待 lifecycle=`Created` 且 READY 才开始
+failover。覆盖：
 
 - Controlled pause 时旧 Owner GET成功、SET返回 TRYAGAIN；
 - Cutover 后新 Owner SET/GET成功；
@@ -927,7 +967,7 @@ Redis research 和本 implementation plan；不将未跟踪状态当成“已在
 | Durable schema/codec | `include/keylane/meta/commands.h`, `src/meta/commands.cpp`, `include/keylane/meta/failover.h`, `src/meta/failover.cpp` |
 | Topology/grant/snapshot | `include/keylane/meta/topology_store.h`, `src/meta/topology_store.cpp`, `include/keylane/meta/grant_store.h`, `src/meta/grant_store.cpp`, `src/meta/state_apply.cpp` |
 | Operation/proposal | `include/keylane/meta/operation_store.h`, `src/meta/operation_store.cpp`, `src/meta/coordinator.cpp` |
-| Executor/admin/status | 新 `include/keylane/meta/failover_reconciler.h`, 新 `src/meta/failover_reconciler.cpp`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `src/meta/ctl_server.cpp`, cluster status相关文件；若抽取 typed submit/poll client，再改 `include/keylane/meta/admin_client.h`, `src/meta/admin_client.cpp` |
+| Executor/admin/status | 新 `include/keylane/meta/failover_reconciler.h`, 新 `src/meta/failover_reconciler.cpp`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `src/meta/ctl_server.cpp`, `include/keylane/meta/state_machine.h`, `src/meta/state_machine.cpp`, cluster status相关文件；typed submit/poll client 必须进入 Raft-free `include/keylane/meta/admin_client.h`, `src/meta/admin_client.cpp`/`keylane_meta_admin` |
 | Observation/planner | `include/keylane/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/keylane/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
 | FDS/wire/projector | `include/keylane/cluster/control_protocol.h`, `src/cluster/control_protocol.cpp`, `src/meta/control_projector.cpp`, `src/cluster/meta_control.cpp` |
 | NodeControl/client | `include/keylane/cluster/topology.h`, `include/keylane/cluster/node_control.h`, `src/cluster/node_control.cpp`, `include/keylane/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
@@ -956,6 +996,7 @@ control mutation入口。
 ```bash
 mkdir -p /mnt/local_nvme/keylane-issue41-redesign/tmp
 export TMPDIR=/mnt/local_nvme/keylane-issue41-redesign/tmp
+export KEYLANE_TEST_TMPDIR=/mnt/local_nvme/keylane-issue41-redesign/tmp
 export KEYLANE_ISSUE41_BUILD=/mnt/local_nvme/keylane-issue41-redesign/build-debug
 ```
 

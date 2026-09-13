@@ -10,15 +10,62 @@
 #include <chrono>
 #include <csignal>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "gtest/gtest.h"
 
 namespace keylane::test {
 namespace {
+
+class ScopedEnvironment {
+ public:
+  ScopedEnvironment(std::string name, std::string value)
+      : name_(std::move(name)) {
+    if (const char* previous = std::getenv(name_.c_str()); previous != nullptr) {
+      previous_ = previous;
+    }
+    if (::setenv(name_.c_str(), value.c_str(), 1) != 0) {
+      throw std::runtime_error("setenv failed");
+    }
+  }
+
+  ~ScopedEnvironment() {
+    if (previous_.has_value()) {
+      (void)::setenv(name_.c_str(), previous_->c_str(), 1);
+    } else {
+      (void)::unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
+
+TEST(ProcessSupportTest, CreatesTemporaryDirectoryUnderConfiguredRoot) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      ("keylane-process-support-root-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  ASSERT_TRUE(std::filesystem::create_directory(root));
+  {
+    ScopedEnvironment environment("KEYLANE_TEST_TMPDIR", root.string());
+    TempDirectory directory("configured-root");
+    EXPECT_EQ(directory.path().parent_path(), root);
+  }
+  EXPECT_TRUE(std::filesystem::remove(root));
+}
+
+TEST(ProcessSupportTest, RejectsEmptyConfiguredTemporaryRoot) {
+  ScopedEnvironment environment("KEYLANE_TEST_TMPDIR", "");
+  EXPECT_THROW((void)TempDirectory("empty-root"), std::runtime_error);
+}
 
 TEST(ProcessSupportTest, SpawnsWithEnvironmentAndControlsLifecycle) {
   TempDirectory directory("process-support");
