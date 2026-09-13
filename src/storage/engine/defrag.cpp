@@ -381,7 +381,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   auto& partition = PartitionForKey(key_store, key);
   auto& index = partition.indexes_[record.db_id_];
   const Digest digest = ComputeDigest(key);
-  if (record.hash_group_) {
+  if (record.auxiliary_group_) {
     const HashGroupId id{.prefix_ = record.group_prefix_,
                          .bits_ = record.group_prefix_bits_};
     auto lookup_object =

@@ -80,7 +80,7 @@ class PrivateDisk {
           offset = (offset / kDirectIoAlignment + 1) * kDirectIoAlignment;
           continue;
         }
-        if (record.hash_group_ && key == wanted) {
+        if (record.auxiliary_group_ && key == wanted) {
           result[record.mutation_sequence_].emplace(record.group_prefix_,
                                                     record.group_prefix_bits_);
         }

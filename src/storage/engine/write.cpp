@@ -2926,7 +2926,7 @@ acquire_active_stream:
       .external_ = external,
       .key_external_ = key_external,
       .grouped_ = grouped_root,
-      .hash_group_ = auxiliary,
+      .auxiliary_group_ = auxiliary,
       .group_retired_ = auxiliary && group->retired_,
       .group_incarnation_ = auxiliary ? group->incarnation_ : 0,
       .group_prefix_ = auxiliary ? group->id_.prefix_ : 0,

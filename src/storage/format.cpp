@@ -195,7 +195,7 @@ constexpr unsigned kRecordKeyExternalShift = 10;
 constexpr unsigned kRecordHasTxidShift = 11;
 constexpr unsigned kRecordHasExpiryShift = 12;
 constexpr unsigned kRecordGroupedShift = 13;
-constexpr unsigned kRecordHashGroupShift = 14;
+constexpr unsigned kRecordAuxiliaryGroupShift = 14;
 constexpr std::uint16_t kRecordKindMask = 0x3;
 constexpr std::uint16_t kRecordDbMask = 0xf;
 constexpr std::uint16_t kRecordTypeMask = 0x7;
@@ -258,23 +258,24 @@ constexpr std::uint16_t RecordMetadata(const RecordHeader& header) noexcept {
       (static_cast<std::uint16_t>(header.expire_at_ms_ != 0)
        << kRecordHasExpiryShift) |
       (static_cast<std::uint16_t>(header.grouped_) << kRecordGroupedShift) |
-      (static_cast<std::uint16_t>(header.hash_group_)
-       << kRecordHashGroupShift));
+      (static_cast<std::uint16_t>(header.auxiliary_group_)
+       << kRecordAuxiliaryGroupShift));
 }
 
-bool ValidHashGroupHeader(const RecordHeader& header) noexcept {
+bool ValidGroupedRecordHeader(const RecordHeader& header) noexcept {
   const bool hashed = header.value_type_ == ValueType::kHash ||
                       header.value_type_ == ValueType::kSet;
   const bool ordered = header.value_type_ == ValueType::kList ||
                        header.value_type_ == ValueType::kSortedSet;
-  if ((header.grouped_ || header.hash_group_) &&
+  if ((header.grouped_ || header.auxiliary_group_) &&
       (header.kind_ != RecordKind::kValue || (!hashed && !ordered) ||
        header.mutation_sequence_ == 0))
     return false;
-  if (header.grouped_ && (header.hash_group_ || header.logical_size_ == 0 ||
-                          (header.external_ && !header.key_external_)))
+  if (header.grouped_ &&
+      (header.auxiliary_group_ || header.logical_size_ == 0 ||
+       (header.external_ && !header.key_external_)))
     return false;
-  if (!header.hash_group_) {
+  if (!header.auxiliary_group_) {
     return header.group_incarnation_ == 0 && header.group_prefix_ == 0 &&
            header.group_prefix_bits_ == 0 && !header.group_retired_ &&
            header.group_batch_txid_ == 0;
@@ -621,13 +622,13 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
   const bool has_txid = header.txid_ != 0;
   const bool has_expiry = header.expire_at_ms_ != 0;
   const std::size_t fixed_header_bytes =
-      RecordFixedHeaderBytes(has_txid, has_expiry, header.hash_group_);
+      RecordFixedHeaderBytes(has_txid, has_expiry, header.auxiliary_group_);
   const std::size_t header_bytes =
       RecordHeaderBytes(key.size(), header.key_external_, has_txid, has_expiry,
-                        header.hash_group_);
+                        header.auxiliary_group_);
   const std::size_t total_disk_bytes =
       AlignRecord(header_bytes + header.payload_bytes_);
-  if (!ValidHashGroupHeader(header) || !ValidRecordKeySize(key.size()) ||
+  if (!ValidGroupedRecordHeader(header) || !ValidRecordKeySize(key.size()) ||
       key.size() != header.key_bytes_ ||
       (header.key_external_ && key.empty()) ||
       header.db_id_ >= kLogicalDatabaseCount ||
@@ -686,7 +687,7 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
     StoreRecordField(output, optional_offset, header.expire_at_ms_);
     optional_offset += kRecordHeaderOptionalBytes;
   }
-  if (header.hash_group_) {
+  if (header.auxiliary_group_) {
     StoreRecordField(output, optional_offset, header.group_incarnation_);
     StoreRecordField(output, optional_offset + 8, header.group_prefix_);
     StoreRecordField(
@@ -694,7 +695,7 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
         static_cast<std::uint64_t>(header.group_prefix_bits_) |
             (static_cast<std::uint64_t>(header.group_retired_) << 8));
     StoreRecordField(output, optional_offset + 24, header.group_batch_txid_);
-    optional_offset += kRecordHashGroupIdentityBytes;
+    optional_offset += kRecordAuxiliaryGroupIdentityBytes;
   }
   assert(optional_offset == fixed_header_bytes);
   std::size_t encoded_bytes = fixed_header_bytes;
@@ -727,7 +728,8 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
   }
   const bool has_txid = RecordMetadataBit(metadata, kRecordHasTxidShift);
   const bool has_expiry = RecordMetadataBit(metadata, kRecordHasExpiryShift);
-  const bool hash_group = RecordMetadataBit(metadata, kRecordHashGroupShift);
+  const bool auxiliary_group =
+      RecordMetadataBit(metadata, kRecordAuxiliaryGroupShift);
   const bool key_external =
       RecordMetadataBit(metadata, kRecordKeyExternalShift);
   const std::uint32_t key_bytes =
@@ -735,9 +737,9 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
   const std::uint32_t payload_bytes =
       LoadRecordField<std::uint32_t>(input, kRecordPayloadBytesOffset);
   const std::size_t fixed_header_bytes =
-      RecordFixedHeaderBytes(has_txid, has_expiry, hash_group);
+      RecordFixedHeaderBytes(has_txid, has_expiry, auxiliary_group);
   const std::size_t header_bytes = RecordHeaderBytes(
-      key_bytes, key_external, has_txid, has_expiry, hash_group);
+      key_bytes, key_external, has_txid, has_expiry, auxiliary_group);
   if (!ValidRecordKeySize(key_bytes) || header_bytes > kMaxRecordHeaderBytes ||
       header_bytes > input.size()) {
     return false;
@@ -759,7 +761,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
       .external_ = RecordMetadataBit(metadata, kRecordExternalShift),
       .key_external_ = key_external,
       .grouped_ = RecordMetadataBit(metadata, kRecordGroupedShift),
-      .hash_group_ = hash_group,
+      .auxiliary_group_ = auxiliary_group,
       .key_bytes_ = key_bytes,
       .logical_size_ =
           LoadRecordField<std::uint32_t>(input, kRecordLogicalSizeOffset),
@@ -788,7 +790,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
         LoadRecordField<std::uint64_t>(input, optional_offset);
     optional_offset += kRecordHeaderOptionalBytes;
   }
-  if (hash_group) {
+  if (auxiliary_group) {
     decoded.group_incarnation_ =
         LoadRecordField<std::uint64_t>(input, optional_offset);
     decoded.group_prefix_ =
@@ -803,11 +805,11 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
     decoded.group_retired_ = (bits & 0x100) != 0;
     decoded.group_batch_txid_ =
         LoadRecordField<std::uint64_t>(input, optional_offset + 24);
-    optional_offset += kRecordHashGroupIdentityBytes;
+    optional_offset += kRecordAuxiliaryGroupIdentityBytes;
   }
   assert(optional_offset == fixed_header_bytes);
 
-  if (!ValidHashGroupHeader(decoded) || (has_txid && decoded.txid_ == 0) ||
+  if (!ValidGroupedRecordHeader(decoded) || (has_txid && decoded.txid_ == 0) ||
       (has_expiry && decoded.expire_at_ms_ == 0) ||
       (decoded.kind_ != RecordKind::kValue &&
        decoded.kind_ != RecordKind::kTombstone &&

@@ -524,7 +524,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         // A batch prepare can survive without its decision. Never reuse that
         // id on the next boot and accidentally commit old prepared groups.
         AtomicMax(&recovery_max_txid_, record.group_batch_txid_);
-        if (record.hash_group_) {
+        if (record.auxiliary_group_) {
           // Cleaner promotion clears transaction tags, not the independent
           // object revision. Its globally allocated id must remain reserved
           // even when this is the only surviving physical record carrying it.
@@ -631,14 +631,14 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                                       ? OrderedCollectionKind::kList
                                       : OrderedCollectionKind::kSortedSet;
         std::optional<RecoveredGroupedRoot> grouped_root;
-        std::optional<RecoveredHashGroup> hash_group;
+        std::optional<RecoveredHashGroup> auxiliary_group;
         std::optional<RecoveredOrderedGroup> ordered_group;
-        if (record.hash_group_) {
+        if (record.auxiliary_group_) {
           // Value-only extents of an obsolete group may already have been
           // reclaimed while other live records retain this source block.
           // Its checked header contains all winner-selection metadata; touch
           // external values only after the complete root graph is selected.
-          hash_group = RecoveredHashGroup{
+          auxiliary_group = RecoveredHashGroup{
               .incarnation_ = record.group_incarnation_,
               .id_ = {.prefix_ = record.group_prefix_,
                       .bits_ = record.group_prefix_bits_},
@@ -658,14 +658,14 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             const std::string_view encoded(
                 reinterpret_cast<const char*>(payload) + key_prefix,
                 record.payload_bytes_ - key_prefix);
-            if (ordered && IsOrderedPageId(hash_group->id_)) {
+            if (ordered && IsOrderedPageId(auxiliary_group->id_)) {
               auto decoded = DecodeOrderedGroup(encoded);
               if (!decoded.ok()) co_return decoded.status();
               if (decoded->kind_ != ordered_kind ||
-                  decoded->incarnation_ != hash_group->incarnation_ ||
-                  decoded->id_ != hash_group->id_.prefix_ ||
-                  decoded->retired_ != hash_group->retired_ ||
-                  decoded->entries_.size() != hash_group->field_count_) {
+                  decoded->incarnation_ != auxiliary_group->incarnation_ ||
+                  decoded->id_ != auxiliary_group->id_.prefix_ ||
+                  decoded->retired_ != auxiliary_group->retired_ ||
+                  decoded->entries_.size() != auxiliary_group->field_count_) {
                 co_return absl::DataLossError(
                     "ordered page disagrees with its record identity");
               }
@@ -690,10 +690,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             } else {
               auto decoded = DecodeHashGroup(encoded);
               if (!decoded.ok()) co_return decoded.status();
-              if (decoded->incarnation_ != hash_group->incarnation_ ||
-                  decoded->id_ != hash_group->id_ ||
-                  decoded->retired_ != hash_group->retired_ ||
-                  decoded->value_.entries_.size() != hash_group->field_count_) {
+              if (decoded->incarnation_ != auxiliary_group->incarnation_ ||
+                  decoded->id_ != auxiliary_group->id_ ||
+                  decoded->retired_ != auxiliary_group->retired_ ||
+                  decoded->value_.entries_.size() !=
+                      auxiliary_group->field_count_) {
                 co_return absl::DataLossError(
                     "Hash group payload disagrees with its record identity");
               }
@@ -788,7 +789,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                     record.txid_ != 0, record.kind_, record.value_type_,
                     record.expire_at_ms_ != 0, record.grouped_)),
             .extents_ = extents,
-            .hash_group_ = hash_group,
+            .auxiliary_group_ = auxiliary_group,
             .ordered_group_ = ordered_group,
             .grouped_root_ = grouped_root};
         buffered_bytes += sizeof(RecoveryRecord) + recovered.key_.capacity();
@@ -859,7 +860,7 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
   }
 
   for (const RecoveryRecord& recovered : batch.records_) {
-    if (recovered.hash_group_.has_value()) {
+    if (recovered.auxiliary_group_.has_value()) {
       // Auxiliaries are not user-key versions. Keep committed and prepared
       // candidates separate from the root index until the global decision
       // barrier can adjudicate the entire graph together.
@@ -1158,7 +1159,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     for (auto it = lower;
          it != records.end() && it->db_id_ == *root_db && it->key_ == key;
          ++it) {
-      auto candidate = *it->hash_group_;
+      auto candidate = *it->auxiliary_group_;
       candidate.record_token_ =
           static_cast<std::uint64_t>(it - records.begin());
       candidates.push_back(candidate);
@@ -1212,7 +1213,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
   std::map<std::uint64_t, std::size_t> winners;
   std::vector<RecoveredHashGroup> member_candidates;
   for (std::size_t i = 0; i < records.size(); ++i) {
-    const auto& candidate = *records[i].hash_group_;
+    const auto& candidate = *records[i].auxiliary_group_;
     if (candidate.incarnation_ != root.incarnation_ ||
         candidate.sequence_ > revision ||
         (candidate.txid_ != 0 &&
@@ -1233,7 +1234,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
     }
     auto [position, inserted] = winners.emplace(candidate.id_.prefix_, i);
     if (inserted) continue;
-    const auto& previous = *records[position->second].hash_group_;
+    const auto& previous = *records[position->second].auxiliary_group_;
     if (candidate.sequence_ == previous.sequence_ &&
         (candidate.field_count_ != previous.field_count_ ||
          candidate.retired_ != previous.retired_)) {
@@ -1249,7 +1250,7 @@ StorageEngine::Impl::RecoverOrderedObject(WorkerStore& store,
   candidates.reserve(winners.size());
   for (const auto& [id, token] : winners) {
     auto& physical = records[token];
-    const auto& header = *physical.hash_group_;
+    const auto& header = *physical.auxiliary_group_;
     RecoveredOrderedGroup candidate{
         .incarnation_ = header.incarnation_,
         .id_ = id,
@@ -1363,7 +1364,7 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroups(
     // there is no reason to read their potentially huge bodies twice.
     if ((record.location_.value_type() == ValueType::kList ||
          record.location_.value_type() == ValueType::kSortedSet) &&
-        IsOrderedPageId(record.hash_group_->id_))
+        IsOrderedPageId(record.auxiliary_group_->id_))
       continue;
     if (record.extents_ == nullptr) {
       co_return absl::DataLossError(
@@ -1391,7 +1392,7 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroups(
     if (!prefix.ok()) co_return prefix.status();
     auto decoded = DecodeHashGroupMetadata(*prefix, encoded_bytes);
     if (!decoded.ok()) co_return decoded.status();
-    const RecoveredHashGroup& expected = *record.hash_group_;
+    const RecoveredHashGroup& expected = *record.auxiliary_group_;
     if (decoded->incarnation_ != expected.incarnation_ ||
         decoded->id_ != expected.id_ ||
         decoded->field_count_ != expected.field_count_ ||

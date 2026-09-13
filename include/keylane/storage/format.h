@@ -332,11 +332,12 @@ struct RecordHeader {
   // collection type, but are not interchangeable compact values. Group
   // identity lives outside the payload so recovery and GC can identify an
   // extent-backed group without reading its potentially very large value.
-  // Hash/Set use a high-bit hash prefix; List/Sorted Set use a nonzero stable
-  // page id in group_prefix_ with zero prefix bits. The hash_group_ flag names
-  // the shared auxiliary-record wire bit, not a restriction to Redis Hash.
+  // Hash/Set and Sorted Set member groups use a high-bit hash prefix; List
+  // and Sorted Set ordered pages use a nonzero stable page id in group_prefix_
+  // with zero prefix bits. Root and auxiliary markers are mutually exclusive
+  // and apply to all four collection types.
   bool grouped_ = false;
-  bool hash_group_ = false;
+  bool auxiliary_group_ = false;
   // Routing retirement is authoritative header metadata. Recovery must not
   // read an obsolete group's already-reclaimed value extents merely to learn
   // whether this identity still owns a range. Only auxiliary records use it.
@@ -432,30 +433,31 @@ constexpr std::size_t AlignRecord(std::size_t size) noexcept {
 // The durable record prefix stores fields at explicit offsets rather than
 // copying RecordHeader's C++ object representation. txid and expiration are
 // sparse extensions, so the overwhelmingly common standalone non-expiring
-// record pays only for the 72-byte base. A Hash group adds its incarnation
-// and routing identity; these bytes are covered by the header checksum.
+// record pays only for the 72-byte base. An auxiliary group adds its
+// incarnation and routing identity, covered by the header checksum.
 inline constexpr std::size_t kRecordHeaderBaseBytes = 72;
 inline constexpr std::size_t kRecordHeaderOptionalBytes = 8;
-inline constexpr std::size_t kRecordHashGroupIdentityBytes = 32;
+inline constexpr std::size_t kRecordAuxiliaryGroupIdentityBytes = 32;
 inline constexpr std::size_t kMaxRecordFixedHeaderBytes =
     kRecordHeaderBaseBytes + 2 * kRecordHeaderOptionalBytes;
-inline constexpr std::size_t kMaxHashGroupFixedHeaderBytes =
-    kMaxRecordFixedHeaderBytes + kRecordHashGroupIdentityBytes;
+inline constexpr std::size_t kMaxAuxiliaryGroupFixedHeaderBytes =
+    kMaxRecordFixedHeaderBytes + kRecordAuxiliaryGroupIdentityBytes;
 
-constexpr std::size_t RecordFixedHeaderBytes(bool has_txid, bool has_expiry,
-                                             bool hash_group = false) noexcept {
+constexpr std::size_t RecordFixedHeaderBytes(
+    bool has_txid, bool has_expiry, bool auxiliary_group = false) noexcept {
   return kRecordHeaderBaseBytes + (has_txid ? kRecordHeaderOptionalBytes : 0) +
          (has_expiry ? kRecordHeaderOptionalBytes : 0) +
-         (hash_group ? kRecordHashGroupIdentityBytes : 0);
+         (auxiliary_group ? kRecordAuxiliaryGroupIdentityBytes : 0);
 }
 
 constexpr std::size_t RecordHeaderBytes(std::size_t key_bytes,
                                         bool key_external = false,
                                         bool has_txid = false,
                                         bool has_expiry = false,
-                                        bool hash_group = false) noexcept {
-  return AlignRecord(RecordFixedHeaderBytes(has_txid, has_expiry, hash_group) +
-                     (key_external ? 0 : key_bytes));
+                                        bool auxiliary_group = false) noexcept {
+  return AlignRecord(
+      RecordFixedHeaderBytes(has_txid, has_expiry, auxiliary_group) +
+      (key_external ? 0 : key_bytes));
 }
 
 constexpr std::size_t MaxKeyBytes() noexcept { return kMaxStringBytes; }

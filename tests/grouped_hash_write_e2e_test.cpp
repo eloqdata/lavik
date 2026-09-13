@@ -47,7 +47,7 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
         offset = (offset / kDirectIoAlignment + 1) * kDirectIoAlignment;
         continue;
       }
-      if (stored_key == key && record.grouped_ && !record.hash_group_ &&
+      if (stored_key == key && record.grouped_ && !record.auxiliary_group_ &&
           record.mutation_sequence_ >= root_sequence) {
         Check(!record.external_ && !record.key_external_,
               "fixture root must be inline");
@@ -59,7 +59,8 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
         result.root_ = *root;
         root_sequence = record.mutation_sequence_;
       }
-      if (stored_key == key && record.hash_group_) auxiliary.push_back(record);
+      if (stored_key == key && record.auxiliary_group_)
+        auxiliary.push_back(record);
       Check(record.total_disk_bytes_ != 0, "fixture record has zero size");
       offset += record.total_disk_bytes_;
     }

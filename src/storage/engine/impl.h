@@ -361,7 +361,7 @@ struct RecoveryRecord {
   // Auxiliary records share their user key with the root, but must never
   // enter the top-level winner merge. Keep only checked routing metadata;
   // complete group values remain on disk throughout index reconstruction.
-  std::optional<RecoveredHashGroup> hash_group_;
+  std::optional<RecoveredHashGroup> auxiliary_group_;
   std::optional<RecoveredOrderedGroup> ordered_group_;
   std::optional<RecoveredGroupedRoot> grouped_root_;
   // Set only by complete graph reconstruction, then consumed by the bounded

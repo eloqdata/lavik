@@ -58,7 +58,7 @@ keylane::storage::RecordHeader GroupRecordHeader(std::string_view key,
       .value_type_ = ValueType::kHash,
       .external_ = external,
       .key_external_ = external_key,
-      .hash_group_ = true,
+      .auxiliary_group_ = true,
       .group_incarnation_ = 17,
       .group_prefix_ = std::uint64_t{1} << 63,
       .group_prefix_bits_ = 1,
@@ -89,7 +89,7 @@ TEST(StorageFormatTest, GroupIdentitySurvivesInlineAndExtentHeaderRoundTrips) {
         RecordHeader decoded;
         std::string_view decoded_key;
         ASSERT_TRUE(DecodeRecordHeader(bytes, &decoded, &decoded_key));
-        EXPECT_TRUE(decoded.hash_group_);
+        EXPECT_TRUE(decoded.auxiliary_group_);
         EXPECT_FALSE(decoded.grouped_);
         EXPECT_EQ(decoded.external_, external);
         EXPECT_EQ(decoded.key_external_, external_key);
@@ -101,7 +101,7 @@ TEST(StorageFormatTest, GroupIdentitySurvivesInlineAndExtentHeaderRoundTrips) {
         // Every byte of the sparse identity, including its reserved padding,
         // belongs to the checked header, not to unchecked recovery metadata.
         const auto identity = RecordFixedHeaderBytes(transaction, false);
-        for (std::size_t i = 0; i < kRecordHashGroupIdentityBytes; ++i) {
+        for (std::size_t i = 0; i < kRecordAuxiliaryGroupIdentityBytes; ++i) {
           bytes[identity + i] ^= std::byte{1};
           EXPECT_FALSE(DecodeRecordHeader(bytes, &decoded, &decoded_key));
           bytes[identity + i] ^= std::byte{1};
@@ -149,7 +149,7 @@ TEST(StorageFormatTest, GroupHeaderRejectsAmbiguousOrInvalidIdentity) {
   changed.expire_at_ms_ = 123;
   rejected(changed);
   changed = original;
-  changed.hash_group_ = false;
+  changed.auxiliary_group_ = false;
   rejected(changed);
   for (const unsigned bits : {0U, 64U}) {
     changed = original;
@@ -179,7 +179,7 @@ TEST(StorageFormatTest, GroupRetirementIsCheckedHeaderMetadata) {
     header.logical_size_ = 1;
     EXPECT_FALSE(EncodeRecordHeader(header, key, bytes));
     header.logical_size_ = 0;
-    header.hash_group_ = false;
+    header.auxiliary_group_ = false;
     header.group_incarnation_ = 0;
     header.group_prefix_ = 0;
     header.group_prefix_bits_ = 0;
@@ -232,7 +232,7 @@ TEST(StorageFormatTest, GroupedRootMarkerDoesNotCarryAGroupIdentity) {
   std::string_view decoded_key;
   ASSERT_TRUE(DecodeRecordHeader(bytes, &decoded, &decoded_key));
   EXPECT_TRUE(decoded.grouped_);
-  EXPECT_FALSE(decoded.hash_group_);
+  EXPECT_FALSE(decoded.auxiliary_group_);
   EXPECT_EQ(decoded.group_incarnation_, 0);
   root.group_incarnation_ = 17;
   EXPECT_FALSE(EncodeRecordHeader(root, key, bytes));
