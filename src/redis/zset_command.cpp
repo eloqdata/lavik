@@ -27,6 +27,7 @@
 #include "keylane/random_sample.h"
 #include "keylane/redis_parse.h"
 #include "keylane/resp.h"
+#include "keylane/storage/detail/ordered_compact_codec.h"
 #include "keylane/tx/transaction.h"
 
 namespace keylane {
@@ -287,7 +288,8 @@ absl::StatusOr<ZSet> Decode(
     std::uint64_t bits = 0;
     std::uint32_t size = 0;
     if (!Get64(in, &offset, &bits) || !Get32(in, &offset, &size) ||
-        offset > in.size() || size > in.size() - offset) {
+        offset > in.size() || size > storage::kMaxStringBytes ||
+        size > in.size() - offset) {
       return absl::InternalError("truncated persisted Sorted Set");
     }
     const double score = std::bit_cast<double>(bits);
@@ -305,16 +307,16 @@ absl::StatusOr<ZSet> Decode(
 absl::StatusOr<std::string> Encode(const ZSet& set) {
   if (set.size() > std::numeric_limits<std::uint32_t>::max())
     return absl::OutOfRangeError("Sorted Set cardinality is too large");
-  std::uint64_t bytes = 8;
-  for (const auto& element : set) {
-    if (element.member_.size() > storage::kMaxStringBytes ||
-        12 + element.member_.size() > storage::kMaxStringBytes - bytes) {
-      return absl::OutOfRangeError("Sorted Set exceeds storage limits");
-    }
-    bytes += 12 + element.member_.size();
-  }
   std::string out;
-  out.reserve(static_cast<std::size_t>(bytes));
+  std::size_t bytes = 8;
+  for (const auto& element : set) {
+    auto next = storage::AppendOrderedEntrySize(
+        storage::OrderedCollectionKind::kSortedSet, bytes,
+        element.member_.size(), out.max_size());
+    if (!next.ok()) return next.status();
+    bytes = *next;
+  }
+  out.reserve(bytes);
   out.append(kMagic);
   Put32(&out, static_cast<std::uint32_t>(set.size()));
   for (const auto& element : set) {

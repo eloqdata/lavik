@@ -248,8 +248,7 @@ absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes) {
       return absl::DataLossError(
           "Hash group inner count disagrees with envelope");
     }
-    auto decoded = DecodeHashValue(bytes.substr(kGroupHeaderBytes),
-                                   kHashGroupPayloadLimit);
+    auto decoded = DecodeHashValue(bytes.substr(kGroupHeaderBytes));
     if (!decoded.ok()) return absl::DataLossError(decoded.status().message());
     group.value_ = std::move(*decoded);
   }

@@ -95,6 +95,7 @@ TEST(RedisConfigTest, ParsesClientBufferPercentAndAbsoluteLimits) {
 
 TEST(RedisConfigTest, ParsesRedisClientQueryBufferLimitRange) {
   EXPECT_EQ(*ParseClientQueryBufferLimit("1gb"), 1ULL * 1024 * 1024 * 1024);
+  EXPECT_EQ(*ParseClientQueryBufferLimit("2gb"), 2ULL * 1024 * 1024 * 1024);
   EXPECT_EQ(*ParseClientQueryBufferLimit("1048576"), 1ULL * 1024 * 1024);
   EXPECT_FALSE(ParseClientQueryBufferLimit("1048575").ok());
   EXPECT_FALSE(ParseClientQueryBufferLimit("0").ok());

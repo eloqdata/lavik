@@ -4058,6 +4058,11 @@ TEST(ListE2eTest, MaxClientsRejectsBeforeTlsAndUpdatesAtRuntime) {
   EXPECT_EQ(first->Command({"CONFIG", "GET", "client-query-buffer-limit"}),
             BulkArray({"client-query-buffer-limit", "1073741824"}));
   EXPECT_EQ(
+      first->Command({"CONFIG", "SET", "client-query-buffer-limit", "2gb"}),
+      "+OK");
+  EXPECT_EQ(first->Command({"CONFIG", "GET", "client-query-buffer-limit"}),
+            BulkArray({"client-query-buffer-limit", "2147483648"}));
+  EXPECT_EQ(
       first->Command({"CONFIG", "SET", "client-query-buffer-limit", "2mb"}),
       "+OK");
   EXPECT_EQ(first->Command({"CONFIG", "GET", "client-query-buffer-limit"}),

@@ -125,6 +125,13 @@ member occupies an oversized group;
 its bounded-state encoder fills ordinary payload extents without constructing
 another full-size serialized value. The record payload envelope and the
 individual Redis field/value limits remain independently checked.
+The logical Hash, Set, List and Sorted Set codecs also represent complete
+multi-group values and do not impose a String or physical-record limit on
+their aggregate bytes. Each physical group validates its own envelope before
+decoding; full-image
+consumers remain subject to memory admission and their destination-buffer or
+transport limits. Client query-buffer limits apply to assembling requests,
+independently of the size accumulated under a collection key.
 
 Changed groups and their root have one logical publication boundary. After all
 storage waits, root preparation refreshes current GC coordinates and admits
@@ -259,9 +266,9 @@ before any physical write. Endpoint pops share the typed sparse mutation path ac
 single-key, multi-key and blocking commands. ZSCAN uses two pagewise passes and
 a bounded digest-prefix selection heap, retaining whole collision buckets and
 the requested output rather than all members. Range-removal, random and other GEO commands retain
-the full-logical-value callback and its compact materialization limits; their
-physical rewrite planner still restricts writes to changed pages and structural
-neighbours.
+the full-logical-value callback with aggregate memory admission and
+destination-buffer limits. Their physical rewrite planner still restricts
+writes to changed pages and structural neighbours.
 
 ## Recovery, reclamation and snapshots
 
@@ -377,6 +384,7 @@ API. Their implementation units remain under `src/storage/engine/`.
 | Responsibility | Source |
 |---|---|
 | Prefix snapshots, mutation planning and persistent routing | `include/keylane/storage/detail/grouped_hash.h`, `src/storage/engine/grouped_hash.cpp` |
+| Logical collection encodings and per-element validation | `include/keylane/storage/detail/hash_codec.h`, `ordered_compact_codec.h`; `src/storage/engine/hash_codec.cpp`, `ordered_compact_codec.cpp`, `list_tree.cpp`, `src/redis/zset_command.cpp` |
 | Bounded Hash/Set random reads and deterministic sparse Set pops | `src/storage/engine/grouped_hash_random.cpp`, `hash_tree.cpp` |
 | Sparse object index, group locations and immutable metadata ownership | `include/keylane/storage/detail/grouped_object_index.h`, `src/storage/engine/grouped_object_index.cpp` |
 | Physical reads, incremental publication, extent streaming and commit dependencies | `src/storage/engine/grouped_read.cpp`, `grouped_write.cpp`, `grouped_mutation.cpp`, `write.cpp`; `include/keylane/storage/detail/record_payload_cursor.h`, `grouped_commit.h` |

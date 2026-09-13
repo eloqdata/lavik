@@ -274,14 +274,15 @@ TEST(GroupedHashTest, LargeIndivisibleFieldDoesNotCauseRecursiveExplosion) {
 
 TEST(GroupedHashTest, MaximalIndividualValueLeavesRoomForGroupFraming) {
   // Check the actual 512 MiB boundary without allocating half a gigabyte just
-  // to exercise arithmetic. The compact legacy envelope cannot contain this
-  // entry; the group envelope must allow its name and framing overhead too.
+  // to exercise arithmetic. The group envelope must allow the field name and
+  // framing in addition to the maximal individual value.
   auto size = AppendHashEntrySize(kHashValueHeaderBytes, 6, kMaxStringBytes,
                                   kHashGroupPayloadLimit);
   ASSERT_TRUE(size.ok()) << size.status();
   EXPECT_EQ(*size, kHashValueHeaderBytes + 8 + 6 + kMaxStringBytes);
-  EXPECT_FALSE(
-      AppendHashEntrySize(kHashValueHeaderBytes, 6, kMaxStringBytes).ok());
+  EXPECT_FALSE(AppendHashEntrySize(kHashValueHeaderBytes, 6, kMaxStringBytes,
+                                   kMaxStringBytes)
+                   .ok());
   EXPECT_FALSE(AppendHashEntrySize(kHashValueHeaderBytes, 6,
                                    kMaxStringBytes + 1, kHashGroupPayloadLimit)
                    .ok());
@@ -373,16 +374,46 @@ TEST(GroupedHashTest, StreamingEncoderValidatesBeforeEmittingAnyBytes) {
   EXPECT_FALSE(HashGroupEncoder::Create(group).ok());
 }
 
-TEST(GroupedHashTest, CompactCodecHonorsExplicitAggregateBudget) {
-  auto value = Value(1, 128);
+TEST(GroupedHashTest, LogicalEncodingSizeCanExceedStringAndRecordLimits) {
+  const auto limit = std::string().max_size();
+  std::size_t bytes = kHashValueHeaderBytes;
+  for (unsigned i = 0; i < 3; ++i) {
+    auto next = AppendHashEntrySize(bytes, 6, kMaxStringBytes, limit);
+    ASSERT_TRUE(next.ok()) << next.status();
+    bytes = *next;
+  }
+  EXPECT_GT(bytes, kMaxRecordPayloadBytes);
+  EXPECT_EQ(bytes, kHashValueHeaderBytes + 3 * (8 + 6 + kMaxStringBytes));
+  EXPECT_FALSE(AppendHashEntrySize(0, kMaxStringBytes + 1, 0, limit).ok());
+  EXPECT_FALSE(AppendHashEntrySize(0, 0, kMaxStringBytes + 1, limit).ok());
+  EXPECT_FALSE(AppendHashEntrySize(limit - 7, 0, 0, limit).ok());
+  EXPECT_FALSE(AppendHashEntrySize(limit - 8, 1, 0, limit).ok());
+  EXPECT_FALSE(AppendHashEntrySize(limit - 8, 0, 1, limit).ok());
+  EXPECT_EQ(*AppendHashEntrySize(limit - 8, 0, 0, limit), limit);
+}
+
+TEST(GroupedHashTest, DISABLED_LargeLogicalValueRoundTripsBeyondRecordLimit) {
+  // This opt-in regression exercises the actual codec above both historical
+  // caps. Release the source strings before decoding to bound peak payload
+  // memory to roughly 2 GiB instead of retaining three complete copies.
+  constexpr std::size_t kValueBytes = kMaxRecordPayloadBytes / 3 + 1;
+  auto value = Value(3, kValueBytes);
   auto encoded = EncodeHashValue(value);
-  ASSERT_TRUE(encoded.ok());
-  EXPECT_TRUE(EncodeHashValue(value, encoded->size()).ok());
-  EXPECT_FALSE(EncodeHashValue(value, encoded->size() - 1).ok());
-  EXPECT_TRUE(DecodeHashValue(*encoded, encoded->size()).ok());
-  EXPECT_FALSE(DecodeHashValue(*encoded, encoded->size() - 1).ok());
-  EXPECT_FALSE(EncodeHashValue(value, kMaxRecordPayloadBytes + 1).ok());
-  EXPECT_FALSE(DecodeHashValue(*encoded, kMaxRecordPayloadBytes + 1).ok());
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  ASSERT_GT(encoded->size(), kMaxRecordPayloadBytes);
+  value.entries_.clear();
+
+  auto decoded = DecodeHashValue(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  ASSERT_EQ(decoded->entries_.size(), 3);
+  for (std::size_t i = 0; i < decoded->entries_.size(); ++i) {
+    const auto& entry = decoded->entries_[i];
+    EXPECT_EQ(entry.field_, "field-" + std::to_string(i));
+    EXPECT_EQ(entry.digest_, ComputeDigest(entry.field_));
+    EXPECT_EQ(entry.value_.size(), kValueBytes);
+    EXPECT_EQ(entry.value_.find_first_not_of(static_cast<char>('a' + i)),
+              std::string::npos);
+  }
 }
 
 TEST(GroupedHashTest, RejectsFieldsOutsideTheLeafBeingUpdated) {

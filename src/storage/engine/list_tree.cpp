@@ -1,5 +1,6 @@
 #include "impl.h"
 #include "keylane/storage/detail/grouped_scratch.h"
+#include "keylane/storage/detail/ordered_compact_codec.h"
 
 namespace keylane::storage {
 
@@ -50,7 +51,7 @@ absl::StatusOr<std::vector<std::string>> DecodeList(
   for (std::uint32_t index = 0; index < count; ++index) {
     std::uint32_t bytes = 0;
     if (!ReadU32(encoded, &offset, &bytes) || offset > encoded.size() ||
-        bytes > encoded.size() - offset) {
+        bytes > kMaxStringBytes || bytes > encoded.size() - offset) {
       return absl::InternalError("persisted List is truncated");
     }
     elements.emplace_back(encoded.substr(offset, bytes));
@@ -67,17 +68,15 @@ absl::StatusOr<std::string> EncodeList(std::span<const std::string> elements) {
       elements.size() > std::numeric_limits<std::uint32_t>::max()) {
     return absl::OutOfRangeError("invalid List element count");
   }
-  std::uint64_t bytes = kListHeaderBytes;
-  for (const std::string& element : elements) {
-    if (element.size() > kMaxStringBytes ||
-        bytes > kMaxStringBytes - sizeof(std::uint32_t) ||
-        element.size() > kMaxStringBytes - bytes - sizeof(std::uint32_t)) {
-      return absl::OutOfRangeError("List exceeds storage limits");
-    }
-    bytes += sizeof(std::uint32_t) + element.size();
-  }
   std::string output;
-  output.reserve(static_cast<std::size_t>(bytes));
+  std::size_t bytes = kListHeaderBytes;
+  for (const std::string& element : elements) {
+    auto next = AppendOrderedEntrySize(OrderedCollectionKind::kList, bytes,
+                                       element.size(), output.max_size());
+    if (!next.ok()) return next.status();
+    bytes = *next;
+  }
+  output.reserve(bytes);
   output.append(kListMagic);
   AppendU32(&output, static_cast<std::uint32_t>(elements.size()));
   for (const std::string& element : elements) {

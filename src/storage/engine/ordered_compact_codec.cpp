@@ -29,28 +29,41 @@ std::uint64_t Get(std::string_view input, std::size_t offset, unsigned width) {
 
 }  // namespace
 
+absl::StatusOr<std::size_t> AppendOrderedEntrySize(
+    OrderedCollectionKind kind, std::size_t encoded_bytes,
+    std::size_t item_bytes, std::size_t max_bytes) {
+  if (!ValidKind(kind))
+    return absl::InvalidArgumentError("invalid ordered collection kind");
+  const std::size_t framing =
+      kind == OrderedCollectionKind::kSortedSet ? 12 : 4;
+  if (item_bytes > kMaxStringBytes || max_bytes < framing ||
+      encoded_bytes > max_bytes - framing ||
+      item_bytes > max_bytes - encoded_bytes - framing) {
+    return absl::OutOfRangeError("ordered full-image exceeds encoding limits");
+  }
+  return encoded_bytes + framing + item_bytes;
+}
+
 absl::StatusOr<std::string> EncodeOrderedCompactValue(
-    OrderedCollectionKind kind, std::span<const OrderedCollectionEntry> entries,
-    std::size_t max_bytes) {
+    OrderedCollectionKind kind, std::span<const OrderedCollectionEntry> entries) {
   if (!ValidKind(kind) || entries.empty() ||
-      entries.size() > std::numeric_limits<std::uint32_t>::max() ||
-      max_bytes < 8 || max_bytes > kMaxRecordPayloadBytes) {
-    return absl::InvalidArgumentError("invalid ordered full-image count/limit");
+      entries.size() > std::numeric_limits<std::uint32_t>::max()) {
+    return absl::InvalidArgumentError("invalid ordered full-image kind/count");
   }
   const bool sorted = kind == OrderedCollectionKind::kSortedSet;
-  const std::size_t framing = sorted ? 12 : 4;
+  std::string encoded;
   std::size_t size = 8;
   for (const auto& entry : entries) {
-    if (entry.value_.size() > kMaxStringBytes || std::isnan(entry.score_) ||
-        (!sorted && std::bit_cast<std::uint64_t>(entry.score_) != 0) ||
-        framing > max_bytes - size ||
-        entry.value_.size() > max_bytes - size - framing) {
+    if (std::isnan(entry.score_) ||
+        (!sorted && std::bit_cast<std::uint64_t>(entry.score_) != 0)) {
       return absl::OutOfRangeError(
           "ordered full-image exceeds encoding limits");
     }
-    size += framing + entry.value_.size();
+    auto next = AppendOrderedEntrySize(kind, size, entry.value_.size(),
+                                       encoded.max_size());
+    if (!next.ok()) return next.status();
+    size = *next;
   }
-  std::string encoded;
   encoded.reserve(size);
   encoded.append(sorted ? "KZS1" : "KLL1");
   Put(encoded, entries.size(), 4);
@@ -64,11 +77,10 @@ absl::StatusOr<std::string> EncodeOrderedCompactValue(
 
 absl::StatusOr<std::vector<OrderedCollectionEntry>> DecodeOrderedCompactValue(
     OrderedCollectionKind kind, std::string_view encoded,
-    std::uint64_t expected_count, std::size_t max_bytes) {
+    std::uint64_t expected_count) {
   if (!ValidKind(kind) || expected_count == 0 ||
       expected_count > std::numeric_limits<std::uint32_t>::max() ||
-      encoded.size() < 8 || encoded.size() > max_bytes ||
-      max_bytes > kMaxRecordPayloadBytes) {
+      encoded.size() < 8) {
     return absl::DataLossError("invalid ordered full-image count/size");
   }
   const bool sorted = kind == OrderedCollectionKind::kSortedSet;

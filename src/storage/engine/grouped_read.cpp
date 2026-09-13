@@ -225,7 +225,7 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
     auto value = co_await LoadGroupedHashValue(store, partition, db_id, key,
                                                digest, snapshot, pinned);
     if (!value.ok()) co_return value.status();
-    encoded = EncodeHashValue(*value, kMaxRecordPayloadBytes);
+    encoded = EncodeHashValue(*value);
   }
   if (!encoded.ok()) co_return encoded.status();
   auto buffer = co_await store.buffers_.AcquireReadBuffer(encoded->size());

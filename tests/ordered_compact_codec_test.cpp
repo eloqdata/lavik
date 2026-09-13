@@ -48,12 +48,7 @@ TEST(OrderedCompactCodecTest, BoundsAndFramingFailClosed) {
   auto encoded =
       EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries);
   ASSERT_TRUE(encoded.ok());
-  EXPECT_FALSE(
-      EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries, 14)
-          .ok());
-  EXPECT_TRUE(
-      EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries, 15)
-          .ok());
+  EXPECT_EQ(encoded->size(), 15);
   for (std::size_t size = 0; size < encoded->size(); ++size) {
     EXPECT_FALSE(
         DecodeOrderedCompactValue(OrderedCollectionKind::kList,
@@ -88,6 +83,69 @@ TEST(OrderedCompactCodecTest, LargeItemAndInvalidScore) {
   entries.front().score_ = -0.0;
   EXPECT_FALSE(
       EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries).ok());
+}
+
+TEST(OrderedCompactCodecTest, SizingSeparatesItemsFromAggregateCapacity) {
+  const auto limit = std::string().max_size();
+  for (const auto kind : {OrderedCollectionKind::kList,
+                          OrderedCollectionKind::kSortedSet}) {
+    const std::size_t framing =
+        kind == OrderedCollectionKind::kSortedSet ? 12 : 4;
+    std::size_t bytes = 8;
+    for (unsigned i = 0; i < 3; ++i) {
+      auto next = AppendOrderedEntrySize(kind, bytes, kMaxStringBytes, limit);
+      ASSERT_TRUE(next.ok()) << next.status();
+      bytes = *next;
+    }
+    EXPECT_EQ(bytes, 8 + 3 * (framing + kMaxStringBytes));
+    EXPECT_GT(bytes, kMaxRecordPayloadBytes);
+    EXPECT_FALSE(AppendOrderedEntrySize(kind, 0, kMaxStringBytes + 1, limit)
+                     .ok());
+    EXPECT_FALSE(AppendOrderedEntrySize(kind, 0, 0, framing - 1).ok());
+    EXPECT_FALSE(AppendOrderedEntrySize(kind, limit - framing + 1, 0, limit)
+                     .ok());
+    EXPECT_FALSE(AppendOrderedEntrySize(kind, limit - framing, 1, limit).ok());
+    auto exact = AppendOrderedEntrySize(kind, limit - framing, 0, limit);
+    ASSERT_TRUE(exact.ok());
+    EXPECT_EQ(*exact, limit);
+  }
+}
+
+void CheckLargeLogicalRoundTrip(OrderedCollectionKind kind) {
+  // Opt-in boundary coverage retains only the source and encoding, then the
+  // encoding and decoded items, keeping payload memory near 2 GiB per case.
+  constexpr std::size_t kItemBytes = kMaxRecordPayloadBytes / 3 + 1;
+  std::vector<OrderedCollectionEntry> entries;
+  for (unsigned i = 0; i < 3; ++i) {
+    entries.push_back({.value_ = std::string(kItemBytes, 'a' + i),
+                        .score_ = kind == OrderedCollectionKind::kSortedSet
+                                      ? static_cast<double>(i)
+                                      : 0});
+  }
+  auto encoded = EncodeOrderedCompactValue(kind, entries);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  ASSERT_GT(encoded->size(), kMaxRecordPayloadBytes);
+  entries.clear();
+  auto decoded = DecodeOrderedCompactValue(kind, *encoded, 3);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  ASSERT_EQ(decoded->size(), 3);
+  for (std::size_t i = 0; i < decoded->size(); ++i) {
+    const auto& entry = (*decoded)[i];
+    EXPECT_EQ(entry.value_.size(), kItemBytes);
+    EXPECT_EQ(entry.value_.find_first_not_of(static_cast<char>('a' + i)),
+              std::string::npos);
+    EXPECT_EQ(entry.score_, kind == OrderedCollectionKind::kSortedSet
+                                ? static_cast<double>(i)
+                                : 0);
+  }
+}
+
+TEST(OrderedCompactCodecTest, DISABLED_LargeListRoundTripsBeyondRecordLimit) {
+  CheckLargeLogicalRoundTrip(OrderedCollectionKind::kList);
+}
+
+TEST(OrderedCompactCodecTest, DISABLED_LargeSortedSetRoundTripsBeyondRecordLimit) {
+  CheckLargeLogicalRoundTrip(OrderedCollectionKind::kSortedSet);
 }
 
 }  // namespace

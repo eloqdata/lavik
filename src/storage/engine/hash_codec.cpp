@@ -49,7 +49,7 @@ absl::StatusOr<std::size_t> AppendHashEntrySize(std::size_t encoded_bytes,
                                                 std::size_t field_bytes,
                                                 std::size_t value_bytes,
                                                 std::size_t max_bytes) {
-  if (max_bytes > kMaxRecordPayloadBytes || max_bytes < 8 ||
+  if (max_bytes < 8 ||
       field_bytes > kMaxStringBytes || value_bytes > kMaxStringBytes ||
       encoded_bytes > max_bytes - 8 ||
       field_bytes > max_bytes - encoded_bytes - 8 ||
@@ -59,10 +59,8 @@ absl::StatusOr<std::size_t> AppendHashEntrySize(std::size_t encoded_bytes,
   return encoded_bytes + 8 + field_bytes + value_bytes;
 }
 
-absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload,
-                                          std::size_t max_bytes) {
-  if (payload.size() < kHashValueHeaderBytes || payload.size() > max_bytes ||
-      max_bytes > kMaxRecordPayloadBytes) {
+absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
+  if (payload.size() < kHashValueHeaderBytes) {
     return absl::InternalError("Hash value is truncated");
   }
   // Do not memcpy a C++ header into durable group snapshots. Routing and
@@ -121,22 +119,21 @@ absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload,
   return value;
 }
 
-absl::StatusOr<std::string> EncodeHashValue(const HashValue& value,
-                                            std::size_t max_bytes) {
+absl::StatusOr<std::string> EncodeHashValue(const HashValue& value) {
   if (value.entries_.empty() ||
       value.entries_.size() > std::numeric_limits<std::uint32_t>::max()) {
     return absl::OutOfRangeError("invalid Hash element count");
   }
-  std::uint64_t bytes = kHashValueHeaderBytes;
+  std::string output;
+  std::size_t bytes = kHashValueHeaderBytes;
   for (const HashEntry& entry : value.entries_) {
     auto next = AppendHashEntrySize(bytes, entry.field_.size(),
-                                    entry.value_.size(), max_bytes);
+                                    entry.value_.size(), output.max_size());
     if (!next.ok()) return next.status();
     bytes = *next;
   }
 
-  std::string output;
-  output.reserve(static_cast<std::size_t>(bytes));
+  output.reserve(bytes);
   AppendU64(&output, kHashValueMagic);
   AppendU32(&output, kStorageFormatVersion);
   AppendU32(&output, kHashValueHeaderBytes);
