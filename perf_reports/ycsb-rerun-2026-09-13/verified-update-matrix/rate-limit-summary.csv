@@ -1,0 +1,5 @@
+database,histogram,actual_qps,target_qps,runtime_ms,log,sha256,Operations,AverageLatency(us),MinLatency(us),MaxLatency(us),50thPercentileLatency(us),95thPercentileLatency(us),99thPercentileLatency(us),99.9PercentileLatency(us),99.99PercentileLatency(us),Return=OK
+hmset,READ,99808.36793356756,100000,50096,hmset-c-c256-target100000-measured.log,15378591c8dc92aac29a4e2a641b1f1e612b927f474a3a6cc248c17f82b1d24b,5000000,335.4812938,211,52991,313,431,525,2331,25599,5000000
+hmset,Intended-READ,99808.36793356756,100000,50096,hmset-c-c256-target100000-measured.log,15378591c8dc92aac29a4e2a641b1f1e612b927f474a3a6cc248c17f82b1d24b,5000000,499.5834106,229,118591,372,494,740,38239,80831,
+aerospike,READ,99518.33127662116,100000,50242,aerospike-c-c256-target100000-measured.log,ccfd14bdf8a088a4a78e96d2123b7c7eb1a4ece7391683127bcceb814e83f6e1,5000000,296.5409208,210,30335,285,381,444,581,2367,5000000
+aerospike,Intended-READ,99518.33127662116,100000,50242,aerospike-c-c256-target100000-measured.log,ccfd14bdf8a088a4a78e96d2123b7c7eb1a4ece7391683127bcceb814e83f6e1,5000000,368.3800978,227,75711,344,443,515,2767,27039,

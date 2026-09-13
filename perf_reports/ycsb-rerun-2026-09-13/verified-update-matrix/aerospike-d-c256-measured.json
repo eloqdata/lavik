@@ -1,0 +1,141 @@
+{
+  "mode": "aerospike",
+  "workload": "D",
+  "workers": 256,
+  "phase": "measured",
+  "command": [
+    "/mnt/dev/YCSB-aerospike-dist/bin/ycsb",
+    "run",
+    "aerospike",
+    "-s",
+    "-threads",
+    "256",
+    "-P",
+    "/mnt/dev/YCSB-aerospike-dist/workloads/workloada",
+    "-p",
+    "recordcount=210000000",
+    "-p",
+    "operationcount=5000000",
+    "-p",
+    "fieldcount=10",
+    "-p",
+    "fieldlength=128",
+    "-p",
+    "fieldlengthdistribution=constant",
+    "-p",
+    "readallfields=true",
+    "-p",
+    "writeallfields=true",
+    "-p",
+    "insertorder=hashed",
+    "-p",
+    "requestdistribution=uniform",
+    "-p",
+    "readproportion=0.95",
+    "-p",
+    "updateproportion=0",
+    "-p",
+    "insertproportion=0.05",
+    "-p",
+    "scanproportion=0",
+    "-p",
+    "readmodifywriteproportion=0",
+    "-p",
+    "measurementtype=hdrhistogram",
+    "-p",
+    "measurement.interval=op",
+    "-p",
+    "hdrhistogram.percentiles=50,95,99,99.9,99.99",
+    "-p",
+    "status.interval=10",
+    "-p",
+    "insertstart=0",
+    "-p",
+    "insertcount=100000000",
+    "-p",
+    "as.host=172.16.0.4",
+    "-p",
+    "as.port=3000",
+    "-p",
+    "as.namespace=ycsb",
+    "-p",
+    "as.timeout=10000"
+  ],
+  "start_utc": "2026-09-13T13:01:57Z",
+  "runtime_ms": 13743,
+  "attempted": 5000000,
+  "succeeded": 5000000,
+  "failed": 0,
+  "success_qps": 363821.5818962381,
+  "metrics": {
+    "OVERALL": {
+      "RunTime(ms)": 13743,
+      "Throughput(ops/sec)": 363821.5818962381
+    },
+    "TOTAL_GCS_G1_Young_Generation": {
+      "Count": 58
+    },
+    "TOTAL_GC_TIME_G1_Young_Generation": {
+      "Time(ms)": 95
+    },
+    "TOTAL_GC_TIME_%_G1_Young_Generation": {
+      "Time(%)": 0.6912610056028523
+    },
+    "TOTAL_GCS_G1_Old_Generation": {
+      "Count": 0
+    },
+    "TOTAL_GC_TIME_G1_Old_Generation": {
+      "Time(ms)": 0
+    },
+    "TOTAL_GC_TIME_%_G1_Old_Generation": {
+      "Time(%)": 0.0
+    },
+    "TOTAL_GCs": {
+      "Count": 58
+    },
+    "TOTAL_GC_TIME": {
+      "Time(ms)": 95
+    },
+    "TOTAL_GC_TIME_%": {
+      "Time(%)": 0.6912610056028523
+    },
+    "READ": {
+      "Operations": 4750362,
+      "AverageLatency(us)": 612.2932126014817,
+      "MinLatency(us)": 173,
+      "MaxLatency(us)": 179839,
+      "50thPercentileLatency(us)": 544,
+      "95thPercentileLatency(us)": 1062,
+      "99thPercentileLatency(us)": 1516,
+      "99.9PercentileLatency(us)": 3777,
+      "99.99PercentileLatency(us)": 16207,
+      "Return=OK": 4750362
+    },
+    "CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 78.234375,
+      "MinLatency(us)": 27,
+      "MaxLatency(us)": 1116,
+      "50thPercentileLatency(us)": 55,
+      "95thPercentileLatency(us)": 165,
+      "99thPercentileLatency(us)": 270,
+      "99.9PercentileLatency(us)": 1116,
+      "99.99PercentileLatency(us)": 1116
+    },
+    "INSERT": {
+      "Operations": 249638,
+      "AverageLatency(us)": 483.4824626058533,
+      "MinLatency(us)": 156,
+      "MaxLatency(us)": 40127,
+      "50thPercentileLatency(us)": 421,
+      "95thPercentileLatency(us)": 896,
+      "99thPercentileLatency(us)": 1322,
+      "99.9PercentileLatency(us)": 3173,
+      "99.99PercentileLatency(us)": 12975,
+      "Return=OK": 249638
+    }
+  },
+  "sha256": "5439a8cd32854c759315c13d3c6604ead078ab5fa14af768324b958b34e951b6",
+  "exit_code": 0,
+  "end_utc": "2026-09-13T13:02:12Z"
+}

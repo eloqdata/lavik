@@ -1,0 +1,49 @@
+java -cp /mnt/dev/YCSB-aerospike-dist/aerospike-binding/conf:/mnt/dev/YCSB-aerospike-dist/conf:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-client-3.1.2.jar:/mnt/dev/YCSB-aerospike-dist/lib/htrace-core4-4.1.0-incubating.jar:/mnt/dev/YCSB-aerospike-dist/lib/jbcrypt-0.3m.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-mapper-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-binding-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/HdrHistogram-2.1.12.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-core-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/core-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/luaj-jse-3.0.jar:/mnt/dev/YCSB-aerospike-dist/lib/gnu-crypto-2.0.1.jar site.ycsb.Client -db site.ycsb.db.AerospikeClient -s -threads 256 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -p recordcount=100000000 -p operationcount=1000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.5 -p updateproportion=0.5 -p insertproportion=0 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000 -t
+Command line: -db site.ycsb.db.AerospikeClient -s -threads 256 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -p recordcount=100000000 -p operationcount=1000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.5 -p updateproportion=0.5 -p insertproportion=0 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+2026-09-13 13:00:57:776 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-09-13 13:01:00:451 2 sec: 1000000 operations; 362844.7 current ops/sec; [READ: Count=499702, Max=36383, Min=167, Avg=667.56, 50=567, 90=1015, 99=2000, 99.9=6947, 99.99=21167] [CLEANUP: Count=256, Max=582, Min=25, Avg=60.04, 50=46, 90=101, 99=244, 99.9=582, 99.99=582] [UPDATE: Count=500298, Max=25999, Min=154, Avg=514.13, 50=422, 90=845, 99=1787, 99.9=4041, 99.99=7135] 
+[OVERALL], RunTime(ms), 2756
+[OVERALL], Throughput(ops/sec), 362844.702467344
+[TOTAL_GCS_G1_Young_Generation], Count, 14
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 26
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.9433962264150944
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 14
+[TOTAL_GC_TIME], Time(ms), 26
+[TOTAL_GC_TIME_%], Time(%), 0.9433962264150944
+[READ], Operations, 499702
+[READ], AverageLatency(us), 667.5559613529664
+[READ], MinLatency(us), 167
+[READ], MaxLatency(us), 36383
+[READ], 50thPercentileLatency(us), 567
+[READ], 95thPercentileLatency(us), 1232
+[READ], 99thPercentileLatency(us), 2000
+[READ], 99.9PercentileLatency(us), 6947
+[READ], 99.99PercentileLatency(us), 21167
+[READ], Return=OK, 499702
+[CLEANUP], Operations, 256
+[CLEANUP], AverageLatency(us), 60.04296875
+[CLEANUP], MinLatency(us), 25
+[CLEANUP], MaxLatency(us), 582
+[CLEANUP], 50thPercentileLatency(us), 46
+[CLEANUP], 95thPercentileLatency(us), 150
+[CLEANUP], 99thPercentileLatency(us), 244
+[CLEANUP], 99.9PercentileLatency(us), 582
+[CLEANUP], 99.99PercentileLatency(us), 582
+[UPDATE], Operations, 500298
+[UPDATE], AverageLatency(us), 514.1294048746947
+[UPDATE], MinLatency(us), 154
+[UPDATE], MaxLatency(us), 25999
+[UPDATE], 50thPercentileLatency(us), 422
+[UPDATE], 95thPercentileLatency(us), 1058
+[UPDATE], 99thPercentileLatency(us), 1787
+[UPDATE], 99.9PercentileLatency(us), 4041
+[UPDATE], 99.99PercentileLatency(us), 7135
+[UPDATE], Return=OK, 500298

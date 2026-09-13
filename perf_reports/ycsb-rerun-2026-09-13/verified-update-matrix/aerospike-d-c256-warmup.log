@@ -1,0 +1,49 @@
+java -cp /mnt/dev/YCSB-aerospike-dist/aerospike-binding/conf:/mnt/dev/YCSB-aerospike-dist/conf:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-client-3.1.2.jar:/mnt/dev/YCSB-aerospike-dist/lib/htrace-core4-4.1.0-incubating.jar:/mnt/dev/YCSB-aerospike-dist/lib/jbcrypt-0.3m.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-mapper-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-binding-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/HdrHistogram-2.1.12.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-core-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/core-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/luaj-jse-3.0.jar:/mnt/dev/YCSB-aerospike-dist/lib/gnu-crypto-2.0.1.jar site.ycsb.Client -db site.ycsb.db.AerospikeClient -s -threads 256 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -p recordcount=200000000 -p operationcount=1000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.95 -p updateproportion=0 -p insertproportion=0.05 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p insertstart=0 -p insertcount=100000000 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000 -t
+Command line: -db site.ycsb.db.AerospikeClient -s -threads 256 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -p recordcount=200000000 -p operationcount=1000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.95 -p updateproportion=0 -p insertproportion=0.05 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p insertstart=0 -p insertcount=100000000 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+2026-09-13 13:01:54:078 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-09-13 13:01:56:973 2 sec: 1000000 operations; 339098 current ops/sec; [READ: Count=950250, Max=64895, Min=175, Avg=626.8, 50=550, 90=903, 99=1642, 99.9=6443, 99.99=21647] [CLEANUP: Count=256, Max=1873, Min=25, Avg=65.3, 50=41, 90=92, 99=293, 99.9=1873, 99.99=1873] [INSERT: Count=49750, Max=17311, Min=163, Avg=495.91, 50=430, 90=761, 99=1457, 99.9=3603, 99.99=7179] 
+[OVERALL], RunTime(ms), 2948
+[OVERALL], Throughput(ops/sec), 339213.02578018996
+[TOTAL_GCS_G1_Young_Generation], Count, 14
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 30
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 1.01763907734057
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 14
+[TOTAL_GC_TIME], Time(ms), 30
+[TOTAL_GC_TIME_%], Time(%), 1.01763907734057
+[READ], Operations, 950250
+[READ], AverageLatency(us), 626.7976816627204
+[READ], MinLatency(us), 175
+[READ], MaxLatency(us), 64895
+[READ], 50thPercentileLatency(us), 550
+[READ], 95thPercentileLatency(us), 1061
+[READ], 99thPercentileLatency(us), 1642
+[READ], 99.9PercentileLatency(us), 6443
+[READ], 99.99PercentileLatency(us), 21647
+[READ], Return=OK, 950250
+[CLEANUP], Operations, 256
+[CLEANUP], AverageLatency(us), 65.3046875
+[CLEANUP], MinLatency(us), 25
+[CLEANUP], MaxLatency(us), 1873
+[CLEANUP], 50thPercentileLatency(us), 41
+[CLEANUP], 95thPercentileLatency(us), 142
+[CLEANUP], 99thPercentileLatency(us), 293
+[CLEANUP], 99.9PercentileLatency(us), 1873
+[CLEANUP], 99.99PercentileLatency(us), 1873
+[INSERT], Operations, 49750
+[INSERT], AverageLatency(us), 495.9101105527638
+[INSERT], MinLatency(us), 163
+[INSERT], MaxLatency(us), 17311
+[INSERT], 50thPercentileLatency(us), 430
+[INSERT], 95thPercentileLatency(us), 911
+[INSERT], 99thPercentileLatency(us), 1457
+[INSERT], 99.9PercentileLatency(us), 3603
+[INSERT], 99.99PercentileLatency(us), 7179
+[INSERT], Return=OK, 49750

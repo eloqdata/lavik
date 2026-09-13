@@ -1,0 +1,37 @@
+java -cp /mnt/dev/YCSB-aerospike-dist/aerospike-binding/conf:/mnt/dev/YCSB-aerospike-dist/conf:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-client-3.1.2.jar:/mnt/dev/YCSB-aerospike-dist/lib/htrace-core4-4.1.0-incubating.jar:/mnt/dev/YCSB-aerospike-dist/lib/jbcrypt-0.3m.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-mapper-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-binding-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/HdrHistogram-2.1.12.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-core-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/core-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/luaj-jse-3.0.jar:/mnt/dev/YCSB-aerospike-dist/lib/gnu-crypto-2.0.1.jar site.ycsb.Client -db site.ycsb.db.AerospikeClient -threads 16 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -p recordcount=100000000 -p operationcount=100000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0 -p updateproportion=0 -p insertproportion=1 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -load
+Command line: -db site.ycsb.db.AerospikeClient -threads 16 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -p recordcount=100000000 -p operationcount=100000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0 -p updateproportion=0 -p insertproportion=1 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -load
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+[OVERALL], RunTime(ms), 1392416
+[OVERALL], Throughput(ops/sec), 71817.61772343898
+[TOTAL_GCS_G1_Young_Generation], Count, 1171
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 536
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.03849424309976329
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 1171
+[TOTAL_GC_TIME], Time(ms), 536
+[TOTAL_GC_TIME_%], Time(%), 0.03849424309976329
+[CLEANUP], Operations, 16
+[CLEANUP], AverageLatency(us), 123.0
+[CLEANUP], MinLatency(us), 94
+[CLEANUP], MaxLatency(us), 323
+[CLEANUP], 50thPercentileLatency(us), 105
+[CLEANUP], 95thPercentileLatency(us), 323
+[CLEANUP], 99thPercentileLatency(us), 323
+[CLEANUP], 99.9PercentileLatency(us), 323
+[CLEANUP], 99.99PercentileLatency(us), 323
+[INSERT], Operations, 100000000
+[INSERT], AverageLatency(us), 204.28493919
+[INSERT], MinLatency(us), 149
+[INSERT], MaxLatency(us), 225023
+[INSERT], 50thPercentileLatency(us), 200
+[INSERT], 95thPercentileLatency(us), 250
+[INSERT], 99thPercentileLatency(us), 286
+[INSERT], 99.9PercentileLatency(us), 336
+[INSERT], 99.99PercentileLatency(us), 619
+[INSERT], Return=OK, 100000000

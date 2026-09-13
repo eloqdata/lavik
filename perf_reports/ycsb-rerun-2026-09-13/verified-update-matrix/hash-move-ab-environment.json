@@ -1,0 +1,25 @@
+{
+  "started_utc": "2026-09-13T13:35:01Z",
+  "base_commit": "a968d002c839828102a44316d43eb7dd63f03f09",
+  "binaries": {
+    "baseline": {
+      "path": "/mnt/dev/keylane-hash-move-ab-Kxn3Ec/baseline/keylane",
+      "sha256": "4c8debe4371d7a5e8ad1ac026bcf8934ad9ad139eedfda70878c860e6862cb48"
+    },
+    "move": {
+      "path": "/mnt/dev/keylane-hash-move-ab-Kxn3Ec/optimized/keylane",
+      "sha256": "5d2c6ef77c77240eb01cf15d70eec0a5629b29d7477f28f1cf9a2278ad7dbe9c"
+    }
+  },
+  "tracked_diff": "diff --git a/src/storage/engine/hash_tree.cpp b/src/storage/engine/hash_tree.cpp\nindex ca3dcd0..669f43d 100644\n--- a/src/storage/engine/hash_tree.cpp\n+++ b/src/storage/engine/hash_tree.cpp\n@@ -680,9 +680,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(\n       case HashOperationKind::kGetAll:\n       case HashOperationKind::kKeys:\n       case HashOperationKind::kValues: {\n-        // These results can outlive the operation (notably random reply streams\n-        // and multi-key commands). Admit compact output before allocation and\n-        // transfer grouped scratch only at the final, pure-read return.\n+        // These results can outlive this command-local decoded snapshot. Move\n+        // its strings into the result at this terminal read-only return, never\n+        // borrow their storage. Admission must cover the transferred capacity,\n+        // not just the size that a freshly copied string would allocate.\n+        // Grouped scratch remains reserved through the ownership handoff.\n         const auto width =\n             operation.kind_ == HashOperationKind::kGetAll ? 2 : 1;\n         std::size_t retained = sizeof(HashResult);\n@@ -695,13 +697,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(\n         for (const auto& entry : compact.entries_) {\n           if (!add_bytes(width * sizeof(std::optional<std::string>)) ||\n               (operation.kind_ != HashOperationKind::kValues &&\n-               !add_bytes(\n-                   std::max(entry.field_.size(), std::string{}.capacity()) +\n-                   1)) ||\n+               !add_bytes(entry.field_.capacity() + 1)) ||\n               (operation.kind_ != HashOperationKind::kKeys &&\n-               !add_bytes(\n-                   std::max(entry.value_.size(), std::string{}.capacity()) +\n-                   1))) {\n+               !add_bytes(entry.value_.capacity() + 1))) {\n             RecordMemoryRejection();\n             co_return absl::ResourceExhaustedError(\n                 \"OOM Hash output is too large\");\n@@ -723,11 +721,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(\n         }\n         try {\n           result.values_.reserve(compact.entries_.size() * width);\n-          for (const HashEntry& entry : compact.entries_) {\n+          for (HashEntry& entry : compact.entries_) {\n             if (operation.kind_ != HashOperationKind::kValues)\n-              result.values_.push_back(entry.field_);\n+              result.values_.emplace_back(std::move(entry.field_));\n             if (operation.kind_ != HashOperationKind::kKeys)\n-              result.values_.push_back(entry.value_);\n+              result.values_.emplace_back(std::move(entry.value_));\n           }\n         } catch (const std::bad_alloc&) {\n           RecordMemoryRejection();\n",
+  "rates": [
+    100000,
+    0
+  ],
+  "rounds": 3,
+  "workers": 256,
+  "counts": {
+    "warmup": 1000000,
+    "measured": 5000000
+  }
+}

@@ -1,0 +1,93 @@
+Note: Google Test filter = HashE2eTest.*:LargeHashDurabilityE2eTest.RedisOomReplyDoesNotPartiallyUpdateLargeHash
+[==========] Running 3 tests from 2 test suites.
+[----------] Global test environment set-up.
+[----------] 1 test from LargeHashDurabilityE2eTest
+[ RUN      ] LargeHashDurabilityE2eTest.RedisOomReplyDoesNotPartiallyUpdateLargeHash
+/mnt/dev/keylane/tests/list_e2e_test.cpp:6389: Failure
+Value of: client.Command({command, kKey}).starts_with("-OOM ")
+  Actual: false
+Expected: true
+
+/mnt/dev/keylane/tests/list_e2e_test.cpp:6389: Failure
+Value of: client.Command({command, kKey}).starts_with("-OOM ")
+  Actual: false
+Expected: true
+
+/mnt/dev/keylane/tests/list_e2e_test.cpp:6389: Failure
+Value of: client.Command({command, kKey}).starts_with("-OOM ")
+  Actual: false
+Expected: true
+
+/mnt/dev/keylane/tests/list_e2e_test.cpp:6161: Failure
+Failed
+Server log tail:
+[2026-09-13 13:31:08.995] [keylane] [info] mimalloc recovery_purge_delay=1000 online_purge_delay=60000 arena_eager_commit=1 allow_thp=0
+[2026-09-13 13:31:08.995] [keylane] [info] keylane version=0.1.0-dev listening on 127.0.0.1:38531 tls_port=0 metrics_port=0 threads=2 maxclients=10000 maxclients_fd_reserve=256 pin_workers=true idle_timeout_ms=-1 busy_poll_us=20 foreground_budget_us=1000 background_budget_us=10 background_warrant_percent=1 spdk_max_completions_per_poll=8 spdk_foreground_pre_poll_us=5 registered_buffer_bytes=268435456 per worker storage_write_buffers=4 storage_read_buffer_bytes=1048576 replication_publish_queue_bytes=16777216 per worker max_memory=8589934592 maxmemory_clients=5% client_query_buffer_limit=1073741824 flush_max_ms=20 flush_size_bytes=131072 inline_key_max_bytes=4008 defrag_max_active_per_device=8 defrag_sleep_ms=0 defrag_record_sleep_us=0 defrag_paused=false shutdown_checkpoint=false replication_backlog_backpressure=true
+[2026-09-13 13:31:08.995] [keylane] [info] memory limit=8589934592 (8.00G) initial_used=0 initial_rss=6324224
+[2026-09-13 13:31:08.997] [keylane] [info] storage device id=0 path=/tmp/keylane-large-hash-durability-56721-RedisOomReplyDoesNotPartiallyUpdateLargeHash.data capacity-bytes=134217728 data-blocks=15 foreground-blocks=7 defrag-reserve-blocks=8 data-bytes=125829120
+[2026-09-13 13:31:08.997] [keylane] [info] storage capacity: data-blocks=15 foreground-blocks=7 defrag-reserve-blocks=8
+[2026-09-13 13:31:08.997] [keylane] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-13 13:31:08.997] [keylane] [info] storage flush submission size=131072 bytes
+[2026-09-13 13:31:09.062] [keylane] [info] storage device id=0 foreground-weight=7 home-workers=2
+[2026-09-13 13:31:09.067] [keylane] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596135826 Hz (2596.136 MHz) ticks-per-us=2596.136
+[2026-09-13 13:31:09.067] [keylane] [info] provided-buffer ring disabled; using per-connection io_uring recv
+[2026-09-13 13:31:09.067] [keylane] [info] provided-buffer ring disabled; using per-connection io_uring recv
+[2026-09-13 13:31:09.158] [keylane] [info] storage recovery: blocks=0/0 (100.0%) swept=15/15 records=0 rate=0 blocks/s 0.00M records/s eta=0.0s
+[2026-09-13 13:31:09.167] [keylane] [info] mimalloc recovery collection complete; online purge_delay=60000
+[2026-09-13 13:31:09.167] [keylane] [info] worker[0] direct-IO storage initialized
+[2026-09-13 13:31:09.167] [keylane] [info] worker[1] direct-IO storage initialized
+[2026-09-13 13:31:09.288] [keylane] [info] mimalloc recovery_purge_delay=1000 online_purge_delay=60000 arena_eager_commit=1 allow_thp=0
+[2026-09-13 13:31:09.288] [keylane] [info] keylane version=0.1.0-dev listening on 127.0.0.1:38531 tls_port=0 metrics_port=0 threads=2 maxclients=10000 maxclients_fd_reserve=256 pin_workers=true idle_timeout_ms=-1 busy_poll_us=20 foreground_budget_us=1000 background_budget_us=10 background_warrant_percent=1 spdk_max_completions_per_poll=8 spdk_foreground_pre_poll_us=5 registered_buffer_bytes=268435456 per worker storage_write_buffers=4 storage_read_buffer_bytes=1048576 replication_publish_queue_bytes=16777216 per worker max_memory=100663296 maxmemory_clients=67108864 client_query_buffer_limit=1073741824 flush_max_ms=20 flush_size_bytes=131072 inline_key_max_bytes=4008 defrag_max_active_per_device=8 defrag_sleep_ms=0 defrag_record_sleep_us=0 defrag_paused=false shutdown_checkpoint=false replication_backlog_backpressure=true
+[2026-09-13 13:31:09.288] [keylane] [info] memory limit=100663296 (96.00M) initial_used=0 initial_rss=6311936
+[2026-09-13 13:31:09.288] [keylane] [info] storage device id=0 path=/tmp/keylane-large-hash-durability-56721-RedisOomReplyDoesNotPartiallyUpdateLargeHash.data capacity-bytes=134217728 data-blocks=15 foreground-blocks=7 defrag-reserve-blocks=8 data-bytes=125829120
+[2026-09-13 13:31:09.288] [keylane] [info] storage capacity: data-blocks=15 foreground-blocks=7 defrag-reserve-blocks=8
+[2026-09-13 13:31:09.288] [keylane] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-13 13:31:09.288] [keylane] [info] storage flush submission size=131072 bytes
+[2026-09-13 13:31:09.352] [keylane] [info] storage device id=0 foreground-weight=7 home-workers=2
+[2026-09-13 13:31:09.356] [keylane] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596147621 Hz (2596.148 MHz) ticks-per-us=2596.148
+[2026-09-13 13:31:09.357] [keylane] [info] provided-buffer ring disabled; using per-connection io_uring recv
+[2026-09-13 13:31:09.357] [keylane] [info] provided-buffer ring disabled; using per-connection io_uring recv
+[2026-09-13 13:31:09.448] [keylane] [info] storage recovery: blocks=15/15 (100.0%) swept=15/15 records=19 rate=94 blocks/s 0.00M records/s eta=0.0s
+[2026-09-13 13:31:09.455] [keylane] [info] mimalloc recovery collection complete; online purge_delay=60000
+[2026-09-13 13:31:09.455] [keylane] [info] worker[0] direct-IO storage initialized
+[2026-09-13 13:31:09.455] [keylane] [info] worker[1] direct-IO storage initialized
+[2026-09-13 13:31:09.585] [keylane] [info] mimalloc recovery_purge_delay=1000 online_purge_delay=60000 arena_eager_commit=1 allow_thp=0
+[2026-09-13 13:31:09.585] [keylane] [info] keylane version=0.1.0-dev listening on 127.0.0.1:38531 tls_port=0 metrics_port=0 threads=3 maxclients=10000 maxclients_fd_reserve=256 pin_workers=true idle_timeout_ms=-1 busy_poll_us=20 foreground_budget_us=1000 background_budget_us=10 background_warrant_percent=1 spdk_max_completions_per_poll=8 spdk_foreground_pre_poll_us=5 registered_buffer_bytes=268435456 per worker storage_write_buffers=4 storage_read_buffer_bytes=1048576 replication_publish_queue_bytes=16777216 per worker max_memory=8589934592 maxmemory_clients=5% client_query_buffer_limit=1073741824 flush_max_ms=20 flush_size_bytes=131072 inline_key_max_bytes=4008 defrag_max_active_per_device=8 defrag_sleep_ms=0 defrag_record_sleep_us=0 defrag_paused=false shutdown_checkpoint=false replication_backlog_backpressure=true
+[2026-09-13 13:31:09.585] [keylane] [info] memory limit=8589934592 (8.00G) initial_used=0 initial_rss=6496256
+[2026-09-13 13:31:09.585] [keylane] [info] storage device id=0 path=/tmp/keylane-large-hash-durability-56721-RedisOomReplyDoesNotPartiallyUpdateLargeHash.data capacity-bytes=134217728 data-blocks=15 foreground-blocks=7 defrag-reserve-blocks=8 data-bytes=125829120
+[2026-09-13 13:31:09.585] [keylane] [info] storage capacity: data-blocks=15 foreground-blocks=7 defrag-reserve-blocks=8
+[2026-09-13 13:31:09.585] [keylane] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-13 13:31:09.585] [keylane] [info] storage flush submission size=131072 bytes
+[2026-09-13 13:31:09.650] [keylane] [info] storage device id=0 foreground-weight=7 home-workers=3
+[2026-09-13 13:31:09.654] [keylane] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596147707 Hz (2596.148 MHz) ticks-per-us=2596.148
+[2026-09-13 13:31:09.654] [keylane] [info] provided-buffer ring disabled; using per-connection io_uring recv
+[2026-09-13 13:31:09.655] [keylane] [info] provided-buffer ring disabled; using per-connection io_uring recv
+[2026-09-13 13:31:09.655] [keylane] [info] provided-buffer ring disabled; using per-connection io_uring recv
+[2026-09-13 13:31:09.748] [keylane] [info] storage recovery: blocks=15/15 (100.0%) swept=15/15 records=19 rate=93 blocks/s 0.00M records/s eta=0.0s
+[2026-09-13 13:31:09.754] [keylane] [info] mimalloc recovery collection complete; online purge_delay=60000
+[2026-09-13 13:31:09.754] [keylane] [info] worker[2] direct-IO storage initialized
+[2026-09-13 13:31:09.754] [keylane] [info] worker[1] direct-IO storage initialized
+[2026-09-13 13:31:09.754] [keylane] [info] worker[0] direct-IO storage initialized
+[2026-09-13 13:31:09.769] [keylane] [info] shutdown requested by signal 2
+[2026-09-13 13:31:09.854] [keylane] [info] replication targets quiesced before storage flush
+[2026-09-13 13:31:09.854] [keylane] [info] all active requests drained; flushing storage buffers
+[2026-09-13 13:31:09.874] [keylane] [info] all storage buffers durably flushed
+
+
+[  FAILED  ] LargeHashDurabilityE2eTest.RedisOomReplyDoesNotPartiallyUpdateLargeHash (947 ms)
+[----------] 1 test from LargeHashDurabilityE2eTest (947 ms total)
+
+[----------] 2 tests from HashE2eTest
+[ RUN      ] HashE2eTest.UpdatesTransactionsAndRecoversMonolithicValues
+[       OK ] HashE2eTest.UpdatesTransactionsAndRecoversMonolithicValues (883 ms)
+[ RUN      ] HashE2eTest.ExpiredShieldedWinnerDoesNotResurrectOlderString
+[       OK ] HashE2eTest.ExpiredShieldedWinnerDoesNotResurrectOlderString (6419 ms)
+[----------] 2 tests from HashE2eTest (7303 ms total)
+
+[----------] Global test environment tear-down
+[==========] 3 tests from 2 test suites ran. (8251 ms total)
+[  PASSED  ] 2 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] LargeHashDurabilityE2eTest.RedisOomReplyDoesNotPartiallyUpdateLargeHash
+
+ 1 FAILED TEST

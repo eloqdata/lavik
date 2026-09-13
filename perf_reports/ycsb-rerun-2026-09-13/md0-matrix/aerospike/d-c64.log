@@ -1,0 +1,47 @@
+java -cp /mnt/dev/YCSB-aerospike-dist/aerospike-binding/conf:/mnt/dev/YCSB-aerospike-dist/conf:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-client-3.1.2.jar:/mnt/dev/YCSB-aerospike-dist/lib/htrace-core4-4.1.0-incubating.jar:/mnt/dev/YCSB-aerospike-dist/lib/jbcrypt-0.3m.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-mapper-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-binding-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/HdrHistogram-2.1.12.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-core-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/core-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/luaj-jse-3.0.jar:/mnt/dev/YCSB-aerospike-dist/lib/gnu-crypto-2.0.1.jar site.ycsb.Client -db site.ycsb.db.AerospikeClient -threads 64 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloadd -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p recordcount=100000000 -p operationcount=100000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p requestdistribution=uniform -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -t
+Command line: -db site.ycsb.db.AerospikeClient -threads 64 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloadd -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p recordcount=100000000 -p operationcount=100000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p requestdistribution=uniform -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+[OVERALL], RunTime(ms), 681
+[OVERALL], Throughput(ops/sec), 146842.87812041116
+[TOTAL_GCS_G1_Young_Generation], Count, 3
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 5
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.7342143906020557
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 3
+[TOTAL_GC_TIME], Time(ms), 5
+[TOTAL_GC_TIME_%], Time(%), 0.7342143906020557
+[READ], Operations, 94999
+[READ], AverageLatency(us), 340.3439088832514
+[READ], MinLatency(us), 178
+[READ], MaxLatency(us), 6695
+[READ], 50thPercentileLatency(us), 318
+[READ], 95thPercentileLatency(us), 437
+[READ], 99thPercentileLatency(us), 667
+[READ], 99.9PercentileLatency(us), 3237
+[READ], 99.99PercentileLatency(us), 5351
+[READ], Return=OK, 94999
+[CLEANUP], Operations, 64
+[CLEANUP], AverageLatency(us), 56.53125
+[CLEANUP], MinLatency(us), 21
+[CLEANUP], MaxLatency(us), 321
+[CLEANUP], 50thPercentileLatency(us), 43
+[CLEANUP], 95thPercentileLatency(us), 133
+[CLEANUP], 99thPercentileLatency(us), 321
+[CLEANUP], 99.9PercentileLatency(us), 321
+[CLEANUP], 99.99PercentileLatency(us), 321
+[INSERT], Operations, 5001
+[INSERT], AverageLatency(us), 269.1771645670866
+[INSERT], MinLatency(us), 155
+[INSERT], MaxLatency(us), 4935
+[INSERT], 50thPercentileLatency(us), 242
+[INSERT], 95thPercentileLatency(us), 370
+[INSERT], 99thPercentileLatency(us), 724
+[INSERT], 99.9PercentileLatency(us), 2891
+[INSERT], 99.99PercentileLatency(us), 4935
+[INSERT], Return=OK, 5001

@@ -1,0 +1,50 @@
+java -cp /mnt/dev/YCSB-hreplace-dist/redis-binding/conf:/mnt/dev/YCSB-hreplace-dist/conf:/mnt/dev/YCSB-hreplace-dist/lib/htrace-core4-4.1.0-incubating.jar:/mnt/dev/YCSB-hreplace-dist/lib/slf4j-api-1.7.25.jar:/mnt/dev/YCSB-hreplace-dist/lib/jackson-mapper-asl-1.9.4.jar:/mnt/dev/YCSB-hreplace-dist/lib/HdrHistogram-2.1.12.jar:/mnt/dev/YCSB-hreplace-dist/lib/jackson-core-asl-1.9.4.jar:/mnt/dev/YCSB-hreplace-dist/lib/jedis-3.9.0.jar:/mnt/dev/YCSB-hreplace-dist/lib/core-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-hreplace-dist/lib/commons-pool2-2.11.1.jar:/mnt/dev/YCSB-hreplace-dist/lib/redis-binding-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.RedisClient -threads 256 -P /mnt/dev/YCSB-hreplace-dist/workloads/workloadd -p redis.host=172.16.0.4 -p redis.port=16379 -p redis.updatecommand=keylane.hreplace -p redis.cluster=false -p recordcount=100000000 -p operationcount=100000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p requestdistribution=uniform -p redis.scanindex=none -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -t
+Command line: -db site.ycsb.db.RedisClient -threads 256 -P /mnt/dev/YCSB-hreplace-dist/workloads/workloadd -p redis.host=172.16.0.4 -p redis.port=16379 -p redis.updatecommand=keylane.hreplace -p redis.cluster=false -p recordcount=100000000 -p operationcount=100000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p requestdistribution=uniform -p redis.scanindex=none -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
+SLF4J: Defaulting to no-operation (NOP) logger implementation
+SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+[OVERALL], RunTime(ms), 857
+[OVERALL], Throughput(ops/sec), 116686.11435239206
+[TOTAL_GCS_G1_Young_Generation], Count, 4
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 7
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.8168028004667445
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 4
+[TOTAL_GC_TIME], Time(ms), 7
+[TOTAL_GC_TIME_%], Time(%), 0.8168028004667445
+[READ], Operations, 95036
+[READ], AverageLatency(us), 1494.885969527337
+[READ], MinLatency(us), 231
+[READ], MaxLatency(us), 129087
+[READ], 50thPercentileLatency(us), 1330
+[READ], 95thPercentileLatency(us), 2435
+[READ], 99thPercentileLatency(us), 4955
+[READ], 99.9PercentileLatency(us), 55135
+[READ], 99.99PercentileLatency(us), 110655
+[READ], Return=OK, 95036
+[CLEANUP], Operations, 256
+[CLEANUP], AverageLatency(us), 35.78515625
+[CLEANUP], MinLatency(us), 12
+[CLEANUP], MaxLatency(us), 1159
+[CLEANUP], 50thPercentileLatency(us), 19
+[CLEANUP], 95thPercentileLatency(us), 53
+[CLEANUP], 99thPercentileLatency(us), 818
+[CLEANUP], 99.9PercentileLatency(us), 1159
+[CLEANUP], 99.99PercentileLatency(us), 1159
+[INSERT], Operations, 4964
+[INSERT], AverageLatency(us), 1608.624496373892
+[INSERT], MinLatency(us), 265
+[INSERT], MaxLatency(us), 66815
+[INSERT], 50thPercentileLatency(us), 1349
+[INSERT], 95thPercentileLatency(us), 2731
+[INSERT], 99thPercentileLatency(us), 6991
+[INSERT], 99.9PercentileLatency(us), 62783
+[INSERT], 99.99PercentileLatency(us), 66815
+[INSERT], Return=OK, 4964

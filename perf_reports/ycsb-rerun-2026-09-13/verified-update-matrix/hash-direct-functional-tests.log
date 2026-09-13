@@ -1,0 +1,27 @@
+Note: Google Test filter = HashReadOwnershipE2e.*:HashReplaceE2e.Semantics*:HashReplaceE2e.Watch*:HashReplaceE2e.GroupedReplacement*:GroupedHashWriteE2e.Oversized*:GroupedHashWriteE2e.SetUsesSame*
+[==========] Running 6 tests from 3 test suites.
+[----------] Global test environment set-up.
+[----------] 3 tests from HashReplaceE2e
+[ RUN      ] HashReplaceE2e.SemanticsTtlBinaryFieldsAndUnchangedStandardCommands
+[       OK ] HashReplaceE2e.SemanticsTtlBinaryFieldsAndUnchangedStandardCommands (206 ms)
+[ RUN      ] HashReplaceE2e.WatchExecAndLua
+[       OK ] HashReplaceE2e.WatchExecAndLua (208 ms)
+[ RUN      ] HashReplaceE2e.GroupedReplacementDemotionExtentsAndColdRecovery
+[       OK ] HashReplaceE2e.GroupedReplacementDemotionExtentsAndColdRecovery (1061 ms)
+[----------] 3 tests from HashReplaceE2e (1475 ms total)
+
+[----------] 1 test from HashReadOwnershipE2e
+[ RUN      ] HashReadOwnershipE2e.FullReadsPreserveCompactAndGroupedValues
+[       OK ] HashReadOwnershipE2e.FullReadsPreserveCompactAndGroupedValues (617 ms)
+[----------] 1 test from HashReadOwnershipE2e (617 ms total)
+
+[----------] 2 tests from GroupedHashWriteE2e
+[ RUN      ] GroupedHashWriteE2e.OversizedFieldSplitsIntoExtentBackedLeaf
+[       OK ] GroupedHashWriteE2e.OversizedFieldSplitsIntoExtentBackedLeaf (716 ms)
+[ RUN      ] GroupedHashWriteE2e.SetUsesSameGroupedLifecycleWithSetType
+[       OK ] GroupedHashWriteE2e.SetUsesSameGroupedLifecycleWithSetType (641 ms)
+[----------] 2 tests from GroupedHashWriteE2e (1358 ms total)
+
+[----------] Global test environment tear-down
+[==========] 6 tests from 3 test suites ran. (3451 ms total)
+[  PASSED  ] 6 tests.

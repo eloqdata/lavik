@@ -1,0 +1,67 @@
+ACTIVATE hash-direct-read-r1-move
+START hash-direct-read-r1-move-hmset-c-c256-target100000-warmup
+DONE hash-direct-read-r1-move-hmset-c-c256-target100000-warmup qps=99059 errors=0
+START hash-direct-read-r1-move-hmset-c-c256-target100000-measured
+DONE hash-direct-read-r1-move-hmset-c-c256-target100000-measured qps=99741 errors=0
+RESULT 1/12 hash-direct-read-r1-move target=100000 READ: qps=99741 p99/p999/p9999=501/1020/2515us
+START hash-direct-read-r1-move-hmset-c-c256-warmup
+DONE hash-direct-read-r1-move-hmset-c-c256-warmup qps=362319 errors=0
+START hash-direct-read-r1-move-hmset-c-c256-measured
+DONE hash-direct-read-r1-move-hmset-c-c256-measured qps=450167 errors=0
+RESULT 2/12 hash-direct-read-r1-move target=0 READ: qps=450167 p99/p999/p9999=1073/3287/9735us
+ACTIVATE hash-direct-read-r1-direct
+START hash-direct-read-r1-direct-hmset-c-c256-target100000-warmup
+DONE hash-direct-read-r1-direct-hmset-c-c256-target100000-warmup qps=99147 errors=0
+START hash-direct-read-r1-direct-hmset-c-c256-target100000-measured
+DONE hash-direct-read-r1-direct-hmset-c-c256-target100000-measured qps=99804 errors=0
+RESULT 3/12 hash-direct-read-r1-direct target=100000 READ: qps=99804 p99/p999/p9999=502/1050/2999us
+START hash-direct-read-r1-direct-hmset-c-c256-warmup
+DONE hash-direct-read-r1-direct-hmset-c-c256-warmup qps=420698 errors=0
+START hash-direct-read-r1-direct-hmset-c-c256-measured
+DONE hash-direct-read-r1-direct-hmset-c-c256-measured qps=453145 errors=0
+RESULT 4/12 hash-direct-read-r1-direct target=0 READ: qps=453145 p99/p999/p9999=1256/3653/8051us
+ACTIVATE hash-direct-read-r2-move
+START hash-direct-read-r2-move-hmset-c-c256-target100000-warmup
+DONE hash-direct-read-r2-move-hmset-c-c256-target100000-warmup qps=98883 errors=0
+START hash-direct-read-r2-move-hmset-c-c256-target100000-measured
+DONE hash-direct-read-r2-move-hmset-c-c256-target100000-measured qps=99798 errors=0
+RESULT 5/12 hash-direct-read-r2-move target=100000 READ: qps=99798 p99/p999/p9999=507/1006/2633us
+START hash-direct-read-r2-move-hmset-c-c256-warmup
+DONE hash-direct-read-r2-move-hmset-c-c256-warmup qps=303582 errors=0
+START hash-direct-read-r2-move-hmset-c-c256-measured
+DONE hash-direct-read-r2-move-hmset-c-c256-measured qps=440257 errors=0
+RESULT 6/12 hash-direct-read-r2-move target=0 READ: qps=440257 p99/p999/p9999=982/3357/7051us
+ACTIVATE hash-direct-read-r2-direct
+START hash-direct-read-r2-direct-hmset-c-c256-target100000-warmup
+DONE hash-direct-read-r2-direct-hmset-c-c256-target100000-warmup qps=99010 errors=0
+START hash-direct-read-r2-direct-hmset-c-c256-target100000-measured
+DONE hash-direct-read-r2-direct-hmset-c-c256-target100000-measured qps=99824 errors=0
+RESULT 7/12 hash-direct-read-r2-direct target=100000 READ: qps=99824 p99/p999/p9999=483/974/2667us
+START hash-direct-read-r2-direct-hmset-c-c256-warmup
+DONE hash-direct-read-r2-direct-hmset-c-c256-warmup qps=419111 errors=0
+START hash-direct-read-r2-direct-hmset-c-c256-measured
+DONE hash-direct-read-r2-direct-hmset-c-c256-measured qps=457289 errors=0
+RESULT 8/12 hash-direct-read-r2-direct target=0 READ: qps=457289 p99/p999/p9999=1125/3551/7479us
+ACTIVATE hash-direct-read-r3-move
+START hash-direct-read-r3-move-hmset-c-c256-target100000-warmup
+DONE hash-direct-read-r3-move-hmset-c-c256-target100000-warmup qps=99275 errors=0
+START hash-direct-read-r3-move-hmset-c-c256-target100000-measured
+DONE hash-direct-read-r3-move-hmset-c-c256-target100000-measured qps=99802 errors=0
+RESULT 9/12 hash-direct-read-r3-move target=100000 READ: qps=99802 p99/p999/p9999=498/1017/38719us
+START hash-direct-read-r3-move-hmset-c-c256-warmup
+DONE hash-direct-read-r3-move-hmset-c-c256-warmup qps=400481 errors=0
+START hash-direct-read-r3-move-hmset-c-c256-measured
+DONE hash-direct-read-r3-move-hmset-c-c256-measured qps=449115 errors=0
+RESULT 10/12 hash-direct-read-r3-move target=0 READ: qps=449115 p99/p999/p9999=1057/3093/7047us
+ACTIVATE hash-direct-read-r3-direct
+START hash-direct-read-r3-direct-hmset-c-c256-target100000-warmup
+DONE hash-direct-read-r3-direct-hmset-c-c256-target100000-warmup qps=98328 errors=0
+START hash-direct-read-r3-direct-hmset-c-c256-target100000-measured
+DONE hash-direct-read-r3-direct-hmset-c-c256-target100000-measured qps=99759 errors=0
+RESULT 11/12 hash-direct-read-r3-direct target=100000 READ: qps=99759 p99/p999/p9999=521/994/2659us
+START hash-direct-read-r3-direct-hmset-c-c256-warmup
+DONE hash-direct-read-r3-direct-hmset-c-c256-warmup qps=420875 errors=0
+START hash-direct-read-r3-direct-hmset-c-c256-measured
+DONE hash-direct-read-r3-direct-hmset-c-c256-measured qps=456746 errors=0
+RESULT 12/12 hash-direct-read-r3-direct target=0 READ: qps=456746 p99/p999/p9999=1169/3335/9303us
+COMPLETE hash-direct-read: 12 measured cells, normal server restored

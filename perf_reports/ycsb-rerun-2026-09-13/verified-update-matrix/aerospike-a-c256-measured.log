@@ -1,0 +1,50 @@
+java -cp /mnt/dev/YCSB-aerospike-dist/aerospike-binding/conf:/mnt/dev/YCSB-aerospike-dist/conf:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-client-3.1.2.jar:/mnt/dev/YCSB-aerospike-dist/lib/htrace-core4-4.1.0-incubating.jar:/mnt/dev/YCSB-aerospike-dist/lib/jbcrypt-0.3m.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-mapper-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-binding-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/HdrHistogram-2.1.12.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-core-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/core-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/luaj-jse-3.0.jar:/mnt/dev/YCSB-aerospike-dist/lib/gnu-crypto-2.0.1.jar site.ycsb.Client -db site.ycsb.db.AerospikeClient -s -threads 256 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -p recordcount=100000000 -p operationcount=5000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.5 -p updateproportion=0.5 -p insertproportion=0 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000 -t
+Command line: -db site.ycsb.db.AerospikeClient -s -threads 256 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -p recordcount=100000000 -p operationcount=5000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.5 -p updateproportion=0.5 -p insertproportion=0 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=op -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+2026-09-13 13:01:01:818 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-09-13 13:01:11:763 10 sec: 4455286 operations; 445528.6 current ops/sec; est completion in 2 second [READ: Count=2227971, Max=132607, Min=176, Avg=639.1, 50=565, 90=942, 99=1641, 99.9=4183, 99.99=14887] [UPDATE: Count=2231205, Max=125887, Min=154, Avg=483.2, 50=413, 90=757, 99=1433, 99.9=3019, 99.99=4531] 
+2026-09-13 13:01:13:667 11 sec: 5000000 operations; 285939.11 current ops/sec; [READ: Count=272596, Max=5251, Min=172, Avg=530.13, 50=472, 90=795, 99=1371, 99.9=2589, 99.99=4411] [CLEANUP: Count=256, Max=656, Min=26, Avg=70.52, 50=49, 90=132, 99=393, 99.9=656, 99.99=656] [UPDATE: Count=268228, Max=4119, Min=149, Avg=402.33, 50=348, 90=628, 99=1179, 99.9=2149, 99.99=3245] 
+[OVERALL], RunTime(ms), 11904
+[OVERALL], Throughput(ops/sec), 420026.8817204301
+[TOTAL_GCS_G1_Young_Generation], Count, 47
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 75
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.6300403225806451
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 47
+[TOTAL_GC_TIME], Time(ms), 75
+[TOTAL_GC_TIME_%], Time(%), 0.6300403225806451
+[READ], Operations, 2500567
+[READ], AverageLatency(us), 627.2171719454028
+[READ], MinLatency(us), 172
+[READ], MaxLatency(us), 132607
+[READ], 50thPercentileLatency(us), 554
+[READ], 95thPercentileLatency(us), 1093
+[READ], 99thPercentileLatency(us), 1616
+[READ], 99.9PercentileLatency(us), 4033
+[READ], 99.99PercentileLatency(us), 13095
+[READ], Return=OK, 2500567
+[CLEANUP], Operations, 256
+[CLEANUP], AverageLatency(us), 70.515625
+[CLEANUP], MinLatency(us), 26
+[CLEANUP], MaxLatency(us), 656
+[CLEANUP], 50thPercentileLatency(us), 49
+[CLEANUP], 95thPercentileLatency(us), 161
+[CLEANUP], 99thPercentileLatency(us), 393
+[CLEANUP], 99.9PercentileLatency(us), 656
+[CLEANUP], 99.99PercentileLatency(us), 656
+[UPDATE], Operations, 2499433
+[UPDATE], AverageLatency(us), 474.5254187649759
+[UPDATE], MinLatency(us), 149
+[UPDATE], MaxLatency(us), 125887
+[UPDATE], 50thPercentileLatency(us), 406
+[UPDATE], 95thPercentileLatency(us), 904
+[UPDATE], 99thPercentileLatency(us), 1408
+[UPDATE], 99.9PercentileLatency(us), 2957
+[UPDATE], 99.99PercentileLatency(us), 4423
+[UPDATE], Return=OK, 2499433

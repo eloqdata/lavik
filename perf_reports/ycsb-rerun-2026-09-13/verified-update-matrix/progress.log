@@ -1,0 +1,106 @@
+START hmset-a-c64-warmup
+DONE hmset-a-c64-warmup qps=161186 errors=0
+START hmset-a-c64-measured
+DONE hmset-a-c64-measured qps=163897 errors=0
+START hmset-a-c128-warmup
+DONE hmset-a-c128-warmup qps=267953 errors=0
+START hmset-a-c128-measured
+DONE hmset-a-c128-measured qps=267423 errors=0
+START hmset-a-c256-warmup
+DONE hmset-a-c256-warmup qps=327118 errors=0
+START hmset-a-c256-measured
+DONE hmset-a-c256-measured qps=359041 errors=0
+START hmset-a-c512-warmup
+DONE hmset-a-c512-warmup qps=338753 errors=0
+START hmset-a-c512-measured
+DONE hmset-a-c512-measured qps=388289 errors=0
+START hmset-b-c64-warmup
+DONE hmset-b-c64-warmup qps=172206 errors=0
+START hmset-b-c64-measured
+DONE hmset-b-c64-measured qps=168702 errors=0
+START hmset-b-c128-warmup
+DONE hmset-b-c128-warmup qps=285063 errors=0
+START hmset-b-c128-measured
+DONE hmset-b-c128-measured qps=298579 errors=0
+START hmset-b-c256-warmup
+DONE hmset-b-c256-warmup qps=392311 errors=0
+START hmset-b-c256-measured
+DONE hmset-b-c256-measured qps=400802 errors=0
+START hmset-b-c512-warmup
+DONE hmset-b-c512-warmup qps=257400 errors=0
+START hmset-b-c512-measured
+DONE hmset-b-c512-measured qps=453803 errors=0
+START hmset-c-c64-warmup
+DONE hmset-c-c64-warmup qps=163159 errors=0
+START hmset-c-c64-measured
+DONE hmset-c-c64-measured qps=165044 errors=0
+START hmset-c-c128-warmup
+DONE hmset-c-c128-warmup qps=287439 errors=0
+START hmset-c-c128-measured
+DONE hmset-c-c128-measured qps=294950 errors=0
+START hmset-c-c256-warmup
+DONE hmset-c-c256-warmup qps=382117 errors=0
+START hmset-c-c256-measured
+DONE hmset-c-c256-measured qps=424304 errors=0
+START hmset-c-c512-warmup
+DONE hmset-c-c512-warmup qps=441501 errors=0
+START hmset-c-c512-measured
+REUSE hmset-a-c256-warmup qps=327118 errors=0
+REUSE hmset-a-c256-measured qps=359041 errors=0
+REUSE hmset-b-c256-warmup qps=392311 errors=0
+REUSE hmset-b-c256-measured qps=400802 errors=0
+REUSE hmset-c-c256-warmup qps=382117 errors=0
+REUSE hmset-c-c256-measured qps=424304 errors=0
+START hmset-d-c256-warmup
+DONE hmset-d-c256-warmup qps=331016 errors=0
+START hmset-d-c256-measured
+DONE hmset-d-c256-measured qps=426949 errors=0
+START hreplace-a-c256-warmup
+DONE hreplace-a-c256-warmup qps=381098 errors=0
+START hreplace-a-c256-measured
+DONE hreplace-a-c256-measured qps=396731 errors=0
+START hreplace-b-c256-warmup
+DONE hreplace-b-c256-warmup qps=372301 errors=0
+START hreplace-b-c256-measured
+DONE hreplace-b-c256-measured qps=419076 errors=0
+START hreplace-c-c256-warmup
+DONE hreplace-c-c256-warmup qps=403226 errors=0
+START hreplace-c-c256-measured
+DONE hreplace-c-c256-measured qps=442478 errors=0
+START hreplace-d-c256-warmup
+DONE hreplace-d-c256-warmup qps=320821 errors=0
+START hreplace-d-c256-measured
+DONE hreplace-d-c256-measured qps=420415 errors=0
+REUSE hmset-a-c256-warmup qps=327118 errors=0
+REUSE hmset-a-c256-measured qps=359041 errors=0
+REUSE hmset-b-c256-warmup qps=392311 errors=0
+REUSE hmset-b-c256-measured qps=400802 errors=0
+REUSE hmset-c-c256-warmup qps=382117 errors=0
+REUSE hmset-c-c256-measured qps=424304 errors=0
+REUSE hmset-d-c256-warmup qps=331016 errors=0
+REUSE hmset-d-c256-measured qps=426949 errors=0
+REUSE hreplace-a-c256-warmup qps=381098 errors=0
+REUSE hreplace-a-c256-measured qps=396731 errors=0
+REUSE hreplace-b-c256-warmup qps=372301 errors=0
+REUSE hreplace-b-c256-measured qps=419076 errors=0
+REUSE hreplace-c-c256-warmup qps=403226 errors=0
+REUSE hreplace-c-c256-measured qps=442478 errors=0
+REUSE hreplace-d-c256-warmup qps=320821 errors=0
+REUSE hreplace-d-c256-measured qps=420415 errors=0
+START aerospike-a-c256-warmup
+DONE aerospike-a-c256-warmup qps=362845 errors=0
+START aerospike-a-c256-measured
+DONE aerospike-a-c256-measured qps=420027 errors=0
+START aerospike-b-c256-warmup
+DONE aerospike-b-c256-warmup qps=304692 errors=0
+START aerospike-b-c256-measured
+DONE aerospike-b-c256-measured qps=366972 errors=0
+START aerospike-c-c256-warmup
+DONE aerospike-c-c256-warmup qps=320616 errors=0
+START aerospike-c-c256-measured
+DONE aerospike-c-c256-measured qps=362897 errors=0
+START aerospike-d-c256-warmup
+DONE aerospike-d-c256-warmup qps=339213 errors=0
+START aerospike-d-c256-measured
+DONE aerospike-d-c256-measured qps=363822 errors=0
+COMPLETE 12 cells
