@@ -5,6 +5,7 @@ Usage: ctl_client.py /path/to/keylane-meta /path/to/keylane-ctl [workdir]
 """
 
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -179,6 +180,21 @@ def scripted_cluster_gate(workdir):
         encoded = value.encode()
         return struct.pack(">I", len(encoded)) + encoded
 
+    def lifecycle(state, revision, root=None, genesis=None, phase=None,
+                  failure=None):
+        payload = bytes([state]) + struct.pack(">Q", revision)
+        payload += bytes([root is not None])
+        if root is not None:
+            payload += wire_string(root)
+        payload += bytes([genesis is not None])
+        if genesis is not None:
+            payload += struct.pack(">Q", genesis)
+        for value in (phase, failure):
+            payload += bytes([value is not None])
+            if value is not None:
+                payload += wire_string(value)
+        return payload
+
     member = struct.pack(">IBB", 1, 0, 1)
     head_payload = (
         struct.pack(">HIBQBIQI", 1, 1, 1, 1, 1, 1, 1, 1) + member)
@@ -190,7 +206,8 @@ def scripted_cluster_gate(workdir):
         wire_string("data-1") + struct.pack(">QBQBB", 8, 1, 12, 1, 1))
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     status_payload = (
-        struct.pack(">HIQQQQ", 1, 1, 1, 1, 1, 1) +
+        struct.pack(">HIQQQQ", 2, 1, 1, 1, 1, 1) +
+        lifecycle(2, 2, "00112233445566778899aabbccddeeff", 1) +
         bytes([1, 1, 1, 1, 1]) + struct.pack(">I", 1) + member +
         struct.pack(">I", 1) + data_node +
         struct.pack(">I", 1) + group +
@@ -287,22 +304,28 @@ def scripted_cluster_gate(workdir):
         "truncated", lambda _: "OK clusterhead 1 ",
         ["--timeout-ms", "20", "--json"], expected=1,
         terminate_reply=False)
-    if truncated.stdout or "terminating its reply" not in truncated.stderr:
+    if (truncated.stdout or
+            "terminating its reply" not in truncated.stderr or
+            "status_explanation=" not in truncated.stderr or
+            "next_action=" not in truncated.stderr or
+            "preserve Meta data" not in truncated.stderr):
         raise H.Failure(
-            "truncated cluster reply was not fatal and stdout-clean: "
+            "truncated cluster reply omitted fatal status guidance: "
             f"stdout={truncated.stdout!r} stderr={truncated.stderr!r}")
     empty_close = run_server(
         "empty-close", lambda _: "", ["--timeout-ms", "20", "--json"],
         expected=3, terminate_reply=False)
-    if '"result":"retryable"' not in empty_close.stdout:
+    if ('"result":"retryable"' not in empty_close.stdout or
+            '"status_explanation":' not in empty_close.stdout or
+            '"next_action":' not in empty_close.stdout):
         raise H.Failure(
-            "empty connection close was not retryable: "
+            "empty connection close omitted retry guidance: "
             f"stdout={empty_close.stdout!r} stderr={empty_close.stderr!r}")
     H.log("keylane-ctl cluster-status scripted READY/0 and RETRYABLE/3 — OK")
 
 
 def scripted_cluster_create_gate(workdir):
-    """Pin confirmation, create routing, verification, and exit semantics."""
+    """Pin confirmation, Genesis routing, and exit semantics."""
     directory = os.path.join(workdir, "scripted-create")
     os.makedirs(directory, mode=0o700, exist_ok=True)
     node_id = "0123456789abcdef0123456789abcdef01234567"
@@ -346,11 +369,27 @@ def scripted_cluster_create_gate(workdir):
         encoded = value.encode()
         return struct.pack(">I", len(encoded)) + encoded
 
+    def lifecycle(state, revision, root=None, genesis=None, phase=None,
+                  failure=None):
+        payload = bytes([state]) + struct.pack(">Q", revision)
+        payload += bytes([root is not None])
+        if root is not None:
+            payload += wire_string(root)
+        payload += bytes([genesis is not None])
+        if genesis is not None:
+            payload += struct.pack(">Q", genesis)
+        for value in (phase, failure):
+            payload += bytes([value is not None])
+            if value is not None:
+                payload += wire_string(value)
+        return payload
+
     member = struct.pack(">IBB", 1, 0, 1)
     head_payload = (
         struct.pack(">HIBQBIQI", 1, 1, 1, 1, 1, 1, 1, 1) + member)
     empty_status = (
-        struct.pack(">HIQQQQ", 1, 1, 1, 1, 2, 0) +
+        struct.pack(">HIQQQQ", 2, 1, 1, 1, 2, 0) +
+        lifecycle(0, 0) +
         bytes([1, 1, 0, 0, 0]) + struct.pack(">I", 1) + member +
         struct.pack(">I", 0) * 4)
     data_node = (
@@ -361,7 +400,8 @@ def scripted_cluster_create_gate(workdir):
         wire_string(node_id) + struct.pack(">QBQBB", 1, 1, 22, 1, 1))
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     ready_status = (
-        struct.pack(">HIQQQQ", 1, 1, 1, 1, 22, 5) +
+        struct.pack(">HIQQQQ", 2, 1, 1, 1, 22, 5) +
+        lifecycle(2, 2, "00112233445566778899aabbccddeeff", 3) +
         bytes([1, 1, 1, 1, 1]) + struct.pack(">I", 1) + member +
         struct.pack(">I", 1) + data_node +
         struct.pack(">I", 1) + group +
@@ -370,58 +410,7 @@ def scripted_cluster_create_gate(workdir):
     empty_reply = "OK clusterstatus 1 " + empty_status.hex()
     ready_reply = "OK clusterstatus 1 " + ready_status.hex()
 
-    fake_bin = os.path.join(directory, "bin")
-    os.makedirs(fake_bin, mode=0o700)
-    redis_cli = os.path.join(fake_bin, "redis-cli")
-    with open(redis_cli, "w", encoding="utf-8") as output:
-        output.write("""#!/usr/bin/env python3
-import os
-import sys
-import time
-
-def slot(key):
-    begin = key.find("{")
-    if begin >= 0:
-        end = key.find("}", begin + 1)
-        if end > begin + 1:
-            key = key[begin + 1:end]
-    crc = 0
-    for byte in key.encode():
-        crc ^= byte << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xffff if crc & 0x8000 else (crc << 1) & 0xffff
-    return crc & 0x3fff
-
-if sys.argv[1:] == ["--version"]:
-    print("redis-cli test-double")
-    raise SystemExit(0)
-args = sys.argv[1:]
-command = args[args.index("-p") + 2:]
-if os.environ.get("KEYLANE_TEST_REDIS_STALL") == "1" and command == ["CLUSTER", "INFO"]:
-    time.sleep(1)
-if os.environ.get("KEYLANE_TEST_REDIS_LEAK_PIPE") == "1" and command == ["CLUSTER", "INFO"]:
-    if os.fork() == 0:
-        time.sleep(1)
-        os._exit(0)
-if command == ["CLUSTER", "INFO"]:
-    print("cluster_state:ok")
-elif command == ["CLUSTER", "SLOTS"]:
-    print("0\\n16383\\n127.0.0.1\\n6379\\n0123456789abcdef0123456789abcdef01234567")
-elif command[:2] == ["CLUSTER", "KEYSLOT"]:
-    print(slot(command[2]))
-elif command[0] == "SET":
-    print("OK")
-elif command[0] == "GET":
-    print("keylane-cluster-create-ok")
-elif command[0] == "DEL":
-    print("1")
-else:
-    print("unexpected redis-cli invocation", file=sys.stderr)
-    raise SystemExit(2)
-""")
-    os.chmod(redis_cli, 0o700)
     environment = os.environ.copy()
-    environment["PATH"] = fake_bin + os.pathsep + environment.get("PATH", "")
 
     def run_create_server(name, create_reply, expected, timeout_ms="2000",
                           process_environment=None):
@@ -456,7 +445,8 @@ else:
                         reply = empty_reply if status_count == 0 else ready_reply
                         status_count += 1
                     elif request.startswith("clustercreate 1 "):
-                        reply = create_reply
+                        operation = bytes.fromhex(request.split()[2])[2:18].hex()
+                        reply = create_reply.replace("{operation}", operation)
                     else:
                         reply = "ERR bad-request"
                     connection.sendall(reply.encode() + b"\n")
@@ -478,61 +468,50 @@ else:
         return result, requests
 
     created, requests = run_create_server(
-        "success", "OK clustercreate 1 22 1 67726f75702d31 22 "
-        "00112233445566778899aabbccddeeff",
+        "success", "OK clustercreate 1 22 {operation}",
         expected=0)
-    if ("Cluster READY: committed=22" not in created.stdout or
-            "group=group-1 operation=00112233445566778899aabbccddeeff" not in
-            created.stdout or
+    if ("Cluster create accepted: genesis committed=22 operation=" not in
+            created.stdout or "Run cluster-status" not in created.stdout or
             not any(request.startswith("clustercreate 1 ")
                     for request in requests)):
         raise H.Failure(
-            "cluster-create did not complete its real redis-cli verification: "
+            "cluster-create did not report atomic Genesis acceptance: "
             f"stdout={created.stdout!r} stderr={created.stderr!r} "
             f"requests={requests!r}")
 
     rejected, _ = run_create_server(
         "domain-reject",
-        "ERR clustercreate 1 preflight non-empty-cluster topology exists",
+        "ERR clustercreate 1 preflight non-pristine topology exists",
         expected=2)
     if "topology exists" not in rejected.stderr:
         raise H.Failure("cluster-create domain rejection lost its detail")
-    runtime_rejected, _ = run_create_server(
-        "runtime-reject",
-        "ERR clustercreate 1 wait-data-projection runtime-invalid "
-        "data session changed",
+    bad_request, _ = run_create_server(
+        "bad-request",
+        "ERR clustercreate 1 preflight bad-request manifest mismatch",
         expected=2)
-    if "data session changed" not in runtime_rejected.stderr:
-        raise H.Failure("cluster-create runtime rejection lost its detail")
+    if "manifest mismatch" not in bad_request.stderr:
+        raise H.Failure("cluster-create bad request used the local-error exit")
+    unavailable, _ = run_create_server(
+        "pre-commit-unavailable",
+        "ERR clustercreate 1 preflight pre-commit-failed reconciler unavailable",
+        expected=2)
+    if "reconciler unavailable" not in unavailable.stderr:
+        raise H.Failure("pre-commit rejection lost its stable classification")
     uncertain, _ = run_create_server(
         "uncertain",
-        "ERR clustercreate 1 initialize-data uncertain-outcome timed out",
+        "ERR clustercreate 1 proposal uncertain-outcome timed out",
         expected=3)
     if ("partially committed" not in uncertain.stderr or
-            "cluster-status" not in uncertain.stderr):
+            "cluster-status" not in uncertain.stderr or
+            re.search(r"operation=[0-9a-f]{32}", uncertain.stderr) is None):
         raise H.Failure("cluster-create uncertain outcome omitted recovery advice")
-    stalled_environment = environment.copy()
-    stalled_environment["KEYLANE_TEST_REDIS_STALL"] = "1"
-    timed_out, _ = run_create_server(
-        "redis-timeout",
-        "OK clustercreate 1 22 1 67726f75702d31 22 "
-        "00112233445566778899aabbccddeeff",
-        expected=3, timeout_ms="100", process_environment=stalled_environment)
-    if ("verification timed out" not in timed_out.stderr or
-            "cluster-status" not in timed_out.stderr):
-        raise H.Failure("post-commit redis timeout did not use exit 3 advice")
-    leaked_pipe_environment = environment.copy()
-    leaked_pipe_environment["KEYLANE_TEST_REDIS_LEAK_PIPE"] = "1"
-    leaked_pipe, _ = run_create_server(
-        "redis-leaked-pipe",
-        "OK clustercreate 1 22 1 67726f75702d31 22 "
-        "00112233445566778899aabbccddeeff",
-        expected=3, timeout_ms="100",
-        process_environment=leaked_pipe_environment)
-    if "verification timed out" not in leaked_pipe.stderr:
+    malformed, _ = run_create_server(
+        "malformed", "OK clustercreate 1 malformed", expected=3)
+    if ("cluster-status" not in malformed.stderr or
+            re.search(r"operation=[0-9a-f]{32}", malformed.stderr) is None):
         raise H.Failure(
-            "inherited redis-cli pipe descriptor escaped the deadline")
-    H.log("keylane-ctl cluster-create confirmation/create/redis/exit gates — OK")
+            "post-mutation protocol failure was not treated as uncertain")
+    H.log("keylane-ctl cluster-create atomic acceptance and exit gates — OK")
 
 
 def dual_listener_rollback_gate(workdir):
@@ -820,6 +799,33 @@ def mtls_gate(workdir):
         if not cluster.stdout.startswith("NOT READY\n"):
             raise H.Failure(f"unexpected mTLS cluster status: {cluster.stdout}")
 
+        create_manifest = os.path.join(directory, "cluster-create.toml")
+        create_node = "0123456789abcdef0123456789abcdef01234567"
+        with open(create_manifest, "w", encoding="utf-8") as output:
+            output.write(
+                "schema_version = 1\n\n"
+                "[[meta_members]]\nid = 1\n"
+                f'raft_endpoint = "tcp://127.0.0.1:{raft_port}"\n'
+                f'data_control_endpoint = "tcp://127.0.0.1:{data_control_port}"\n'
+                f'ctl_endpoint = "tcp://127.0.0.1:{ctl_port}"\n\n'
+                "[[data_nodes]]\n"
+                f'id = "{create_node}"\n'
+                f'client_endpoint = "tcp://127.0.0.1:{H.free_port()}"\n\n'
+                "[[groups]]\nid = \"group-1\"\n"
+                f'primary = "{create_node}"\n\n'
+                "[[slot_ranges]]\nfirst = 0\nlast = 16383\n"
+                'group = "group-1"\n')
+        created = run_cluster(
+            ["cluster-create", "--manifest", create_manifest, "--yes"] +
+            client_args, expected=0)
+        if "Cluster create accepted: genesis committed=" not in created.stdout:
+            raise H.Failure(
+                f"mTLS cluster-create did not confirm Genesis: {created}")
+        creating = run_cluster(["cluster-status"] + client_args, expected=2)
+        if "cluster_state=creating" not in creating.stdout:
+            raise H.Failure(
+                f"mTLS cluster-create did not expose lifecycle: {creating.stdout}")
+
         # The UDS seed supplies the remote leader address; its TLS options
         # must survive parsing and protect the learned TCP connection.
         seed_path = os.path.join(directory, "discovery.sock")
@@ -867,7 +873,8 @@ def mtls_gate(workdir):
             ["cluster-status", "--addr", f"127.0.0.1:{ctl_port}",
              "--tls-ca", client_cert, "--tls-cert", client_cert,
              "--tls-key", client_key], expected=1)
-        if bad_certificate.stdout or not bad_certificate.stderr:
+        if (bad_certificate.stdout or not bad_certificate.stderr or
+                "check the CA" not in bad_certificate.stderr):
             raise H.Failure(
                 "keylane-ctl cluster-status certificate failure did not stay fatal and "
                 f"stdout-clean: stdout={bad_certificate.stdout!r} "

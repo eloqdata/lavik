@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "absl/status/status.h"
+#include "absl/strings/cord.h"
 #include "keylane/numeric_endpoint.h"
 
 namespace keylane::meta {
@@ -27,6 +28,8 @@ namespace {
 
 constexpr std::size_t kMaxCommandBytes = 64 * 1024;
 constexpr std::size_t kMaxReplyBytes = 256 * 1024 * 1024;
+constexpr std::string_view kRequestNotSentPayload =
+    "type.googleapis.com/keylane.meta.admin-request-not-sent";
 
 class FileDescriptor {
  public:
@@ -405,22 +408,38 @@ absl::StatusOr<std::string> TlsReadLine(SSL* ssl, MetaAdminDeadline deadline) {
 
 }  // namespace
 
+absl::Status MarkMetaAdminRequestNotSent(absl::Status status) {
+  if (!status.ok()) {
+    status.SetPayload(kRequestNotSentPayload, absl::Cord("1"));
+  }
+  return status;
+}
+
+bool MetaAdminRequestDefinitelyNotSent(const absl::Status& status) {
+  return status.GetPayload(kRequestNotSentPayload).has_value();
+}
+
 absl::StatusOr<std::string> MetaAdminClient::RoundTrip(
     const MetaAdminTarget& target, std::string_view command,
     MetaAdminDeadline deadline) const {
-  if (command.empty()) return absl::InvalidArgumentError("empty command");
+  if (command.empty()) {
+    return MarkMetaAdminRequestNotSent(
+        absl::InvalidArgumentError("empty command"));
+  }
   if (command.find_first_of("\r\n") != std::string_view::npos) {
-    return absl::InvalidArgumentError("command must be exactly one line");
+    return MarkMetaAdminRequestNotSent(
+        absl::InvalidArgumentError("command must be exactly one line"));
   }
   if (command.size() + 1 > kMaxCommandBytes) {
-    return absl::ResourceExhaustedError("command exceeds 64 KiB limit");
+    return MarkMetaAdminRequestNotSent(
+        absl::ResourceExhaustedError("command exceeds 64 KiB limit"));
   }
   std::string wire(command);
   wire.push_back('\n');
 
   if (target.transport_ == MetaAdminTarget::Transport::kUnix) {
     auto fd = ConnectUnix(target.endpoint_, deadline);
-    if (!fd.ok()) return fd.status();
+    if (!fd.ok()) return MarkMetaAdminRequestNotSent(fd.status());
     if (absl::Status sent = PlainWriteAll(fd->get(), wire, deadline);
         !sent.ok()) {
       return sent;
@@ -429,11 +448,13 @@ absl::StatusOr<std::string> MetaAdminClient::RoundTrip(
   }
 
   auto endpoint = ParseEndpoint(target.endpoint_);
-  if (!endpoint.ok()) return endpoint.status();
+  if (!endpoint.ok()) {
+    return MarkMetaAdminRequestNotSent(endpoint.status());
+  }
   auto fd = Connect(endpoint->family_,
                     reinterpret_cast<const sockaddr*>(&endpoint->address_),
                     endpoint->length_, deadline);
-  if (!fd.ok()) return fd.status();
+  if (!fd.ok()) return MarkMetaAdminRequestNotSent(fd.status());
   if (target.transport_ == MetaAdminTarget::Transport::kTcpPlaintext) {
     if (absl::Status sent = PlainWriteAll(fd->get(), wire, deadline);
         !sent.ok()) {
@@ -442,13 +463,16 @@ absl::StatusOr<std::string> MetaAdminClient::RoundTrip(
     return PlainReadLine(fd->get(), deadline);
   }
   if (target.transport_ != MetaAdminTarget::Transport::kTcpMtls) {
-    return absl::InvalidArgumentError("unsupported Meta admin transport");
+    return MarkMetaAdminRequestNotSent(
+        absl::InvalidArgumentError("unsupported Meta admin transport"));
   }
   auto context = MakeTlsContext(target.tls_);
-  if (!context.ok()) return context.status();
+  if (!context.ok()) {
+    return MarkMetaAdminRequestNotSent(context.status());
+  }
   auto ssl =
       StartTls(context->get(), fd->get(), *endpoint, target.tls_, deadline);
-  if (!ssl.ok()) return ssl.status();
+  if (!ssl.ok()) return MarkMetaAdminRequestNotSent(ssl.status());
   if (absl::Status sent = TlsWriteAll(ssl->get(), wire, deadline); !sent.ok()) {
     return sent;
   }

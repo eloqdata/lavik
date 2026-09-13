@@ -1422,7 +1422,7 @@ absl::StatusOr<PrunePopulationManifest> ReadPrunePopulationManifestBody(
 
 absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command) {
   MetaWriter w;
-  w.WriteU16(kMetaFormatVersion);
+  w.WriteU16(kMetaCommandFormatVersion);
   auto status = std::visit(
       [&w](const auto& cmd) -> absl::Status {
         return WriteCommandBody(w, cmd);
@@ -1442,7 +1442,7 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
   MetaReader r(bytes);
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version != kMetaFormatVersion) {
+  if (*version != kMetaCommandFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   auto tag = r.ReadU16();

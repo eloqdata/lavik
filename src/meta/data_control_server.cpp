@@ -1610,22 +1610,23 @@ absl::Status ValidateCommittedConfigBindings(
 
 bool ActiveClusterCreateDeclaresNode(const MetaCommittedView& view,
                                      std::string_view node_id) {
-  for (const MetaOperationRecord& operation :
-       view.operation().LiveOperations()) {
-    if (operation.kind_ != kMetaClusterCreateOperationKind ||
-        operation.lifecycle_ == MetaOperationLifecycle::kCompleted ||
-        operation.lifecycle_ == MetaOperationLifecycle::kAborted) {
-      continue;
-    }
-    std::uint32_t timeout_ms = 0;
-    auto manifest = DecodeClusterCreateRequest(operation.intent_, &timeout_ms);
-    if (manifest.ok() &&
-        std::any_of(manifest->data_nodes_.begin(), manifest->data_nodes_.end(),
-                    [&](const auto& node) { return node.node_id_ == node_id; })) {
-      return true;
-    }
+  const auto& lifecycle = view.topology().ClusterLifecycle();
+  if (lifecycle.state_ != MetaClusterLifecycle::kCreating) return false;
+  const auto operation =
+      view.operation().FindOperation(lifecycle.root_operation_id_);
+  if (!operation.has_value() ||
+      operation->kind_ != kMetaClusterCreateOperationKind ||
+      operation->lifecycle_ == MetaOperationLifecycle::kCompleted ||
+      operation->lifecycle_ == MetaOperationLifecycle::kAborted) {
+    return false;
   }
-  return false;
+  MetaOperationId intent_root{};
+  auto manifest = DecodeClusterCreateRequest(operation->intent_, &intent_root);
+  return manifest.ok() && intent_root == lifecycle.root_operation_id_ &&
+         std::any_of(manifest->data_nodes_.begin(), manifest->data_nodes_.end(),
+                     [&](const auto& node) {
+                       return node.node_id_ == node_id;
+                     });
 }
 
 celer::Task<absl::Status> ReconcileLocalMetaMember(

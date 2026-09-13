@@ -1,31 +1,22 @@
 // Raft-free Meta CLI for direct commands, cluster readiness, and first-cluster
 // creation. Multi-step orchestration stays behind ClusterOperator/Meta Admin.
 
-#include <fcntl.h>
 #include <signal.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include <algorithm>
-#include <array>
 #include <cctype>
-#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <fstream>
 #include <iostream>
-#include <iterator>
-#include <limits>
-#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "keylane/meta/admin_client.h"
 #include "keylane/meta/cluster_create.h"
 #include "keylane/meta/cluster_status.h"
@@ -38,177 +29,39 @@ constexpr std::size_t kMaxCommandBytes = 64 * 1024;
 
 [[noreturn]] void Fail(std::string message);
 
-struct RedisCliResult {
-  int exit_code_ = -1;
-  std::string output_;
-  bool timed_out_ = false;
+struct StatusFailureGuidance {
+  std::string_view explanation_;
+  std::string_view next_action_;
 };
 
-class ClusterCreateTimeout final : public std::runtime_error {
- public:
-  using std::runtime_error::runtime_error;
-};
-
-RedisCliResult RunProcess(std::vector<std::string> arguments,
-                          std::chrono::steady_clock::time_point deadline) {
-  int output_pipe[2];
-  if (::pipe(output_pipe) != 0) Fail("cannot create redis-cli output pipe");
-  std::vector<char*> argv;
-  argv.reserve(arguments.size() + 1);
-  for (std::string& argument : arguments) argv.push_back(argument.data());
-  argv.push_back(nullptr);
-
-  const pid_t child = ::fork();
-  if (child < 0) {
-    (void)::close(output_pipe[0]);
-    (void)::close(output_pipe[1]);
-    Fail("cannot start redis-cli");
+StatusFailureGuidance ExplainStatusFailure(const absl::Status& status) {
+  switch (status.code()) {
+    case absl::StatusCode::kInvalidArgument:
+    case absl::StatusCode::kFailedPrecondition:
+      return {"the local status request or protocol configuration is invalid",
+              "check the endpoint, transport flags, and CLI/server versions; "
+              "then retry cluster-status"};
+    case absl::StatusCode::kUnauthenticated:
+    case absl::StatusCode::kPermissionDenied:
+      return {"Meta rejected the Admin connection identity",
+              "check the CA, client certificate, key, server identity, and "
+              "Admin authorization before retrying"};
+    case absl::StatusCode::kDataLoss:
+      return {"the status reply was truncated, incompatible, or corrupt",
+              "preserve Meta data; compare CLI/server versions and inspect "
+              "transport and Meta logs before retrying"};
+    case absl::StatusCode::kCancelled:
+    case absl::StatusCode::kDeadlineExceeded:
+    case absl::StatusCode::kUnavailable:
+    case absl::StatusCode::kAborted:
+      return {"no trustworthy Meta status cut was available",
+              "verify Meta Admin connectivity and quorum; then retry "
+              "cluster-status"};
+    default:
+      return {"cluster-status failed before a trustworthy cut was available",
+              "preserve the error details and inspect Meta logs before "
+              "retrying"};
   }
-  if (child == 0) {
-    (void)::close(output_pipe[0]);
-    if (::dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
-        ::dup2(output_pipe[1], STDERR_FILENO) < 0) {
-      _exit(126);
-    }
-    (void)::close(output_pipe[1]);
-    ::execvp(argv.front(), argv.data());
-    _exit(errno == ENOENT ? 127 : 126);
-  }
-  (void)::close(output_pipe[1]);
-  const int flags = ::fcntl(output_pipe[0], F_GETFL, 0);
-  if (flags < 0 || ::fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK) < 0) {
-    (void)::kill(child, SIGKILL);
-    while (::waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
-    }
-    (void)::close(output_pipe[0]);
-    Fail("cannot make redis-cli output nonblocking");
-  }
-
-  RedisCliResult result;
-  int status = 0;
-  bool child_exited = false;
-  bool output_closed = false;
-  std::array<char, 4096> buffer{};
-  while (!child_exited || !output_closed) {
-    for (;;) {
-      const ssize_t bytes =
-          ::read(output_pipe[0], buffer.data(), buffer.size());
-      if (bytes > 0) {
-        if (result.output_.size() + static_cast<std::size_t>(bytes) >
-            kMaxCommandBytes) {
-          if (!child_exited) {
-            (void)::kill(child, SIGKILL);
-            while (::waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
-            }
-          }
-          (void)::close(output_pipe[0]);
-          Fail("redis-cli output exceeds 64 KiB");
-        }
-        result.output_.append(buffer.data(), static_cast<std::size_t>(bytes));
-        continue;
-      }
-      if (bytes == 0) output_closed = true;
-      if (bytes < 0 && errno == EINTR) continue;
-      break;
-    }
-    if (!child_exited) {
-      const pid_t waited = ::waitpid(child, &status, WNOHANG);
-      if (waited == child) {
-        child_exited = true;
-      } else if (waited < 0 && errno != EINTR) {
-        (void)::kill(child, SIGKILL);
-        while (::waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
-        }
-        (void)::close(output_pipe[0]);
-        Fail("waitpid failed for redis-cli");
-      }
-    }
-    // Descendants may inherit stdout/stderr even after redis-cli itself exits.
-    // The one absolute deadline therefore bounds pipe drain as well as the
-    // direct child; otherwise a leaked descriptor can hang post-commit
-    // verification forever.
-    if (std::chrono::steady_clock::now() >= deadline) {
-      result.timed_out_ = true;
-      if (!child_exited) {
-        (void)::kill(child, SIGKILL);
-        while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
-        }
-        child_exited = true;
-      }
-      output_closed = true;
-    }
-    if (!child_exited || !output_closed) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-  }
-  (void)::close(output_pipe[0]);
-  if (WIFEXITED(status)) result.exit_code_ = WEXITSTATUS(status);
-  return result;
-}
-
-std::string TrimLineEnd(std::string value) {
-  while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) {
-    value.pop_back();
-  }
-  return value;
-}
-
-RedisCliResult RunRedisCli(const keylane::NumericEndpoint& endpoint,
-                           std::initializer_list<std::string_view> command,
-                           std::chrono::steady_clock::time_point deadline) {
-  std::vector<std::string> arguments{"redis-cli",
-                                     "-c",
-                                     "--raw",
-                                     "-h",
-                                     endpoint.host_,
-                                     "-p",
-                                     std::to_string(endpoint.port_)};
-  for (std::string_view argument : command) arguments.emplace_back(argument);
-  return RunProcess(std::move(arguments), deadline);
-}
-
-RedisCliResult RunRedisCliWithoutRedirects(
-    const keylane::NumericEndpoint& endpoint, std::vector<std::string> command,
-    std::chrono::steady_clock::time_point deadline) {
-  std::vector<std::string> arguments{
-      "redis-cli",    "--raw", "-h",
-      endpoint.host_, "-p",    std::to_string(endpoint.port_)};
-  arguments.insert(arguments.end(), std::make_move_iterator(command.begin()),
-                   std::make_move_iterator(command.end()));
-  return RunProcess(std::move(arguments), deadline);
-}
-
-std::uint16_t RedisKeySlot(std::string_view key) {
-  const std::size_t open = key.find('{');
-  if (open != std::string_view::npos) {
-    const std::size_t close = key.find('}', open + 1);
-    if (close != std::string_view::npos && close != open + 1) {
-      key = key.substr(open + 1, close - open - 1);
-    }
-  }
-  std::uint16_t crc = 0;
-  for (const unsigned char byte : key) {
-    crc = static_cast<std::uint16_t>(crc ^ (byte << 8));
-    for (unsigned bit = 0; bit < 8; ++bit) {
-      crc = static_cast<std::uint16_t>(
-          (crc & 0x8000U) != 0 ? (crc << 1) ^ 0x1021U : crc << 1);
-    }
-  }
-  return static_cast<std::uint16_t>(crc & 0x3fffU);
-}
-
-std::string RequireRedisCli(const keylane::NumericEndpoint& endpoint,
-                            std::initializer_list<std::string_view> command,
-                            std::chrono::steady_clock::time_point deadline,
-                            std::string_view check) {
-  RedisCliResult result = RunRedisCli(endpoint, command, deadline);
-  if (result.timed_out_) {
-    throw ClusterCreateTimeout(std::string(check) + " timed out");
-  }
-  if (result.exit_code_ != 0) {
-    Fail(std::string(check) + " failed: " + TrimLineEnd(result.output_));
-  }
-  return TrimLineEnd(std::move(result.output_));
 }
 
 struct Options {
@@ -250,7 +103,8 @@ void PrintUsage(const char* program) {
       "Direct commands are sent to the specified Meta node as one line.\n"
       "status reports that node's state; cluster-status discovers the leader\n"
       "and reports cluster readiness. cluster-create creates the v1 multi-\n"
-      "Data, multi-Group topology and verifies it with redis-cli. Options may "
+      "Data, multi-Group topology and returns after its Genesis commit. Use\n"
+      "cluster-status to follow creation and serving readiness. Options may\n"
       "precede\n"
       "either local cluster command.\n"
       "Durability recovery uses: abortop ID, archiveoperations SEQ..., then\n"
@@ -260,9 +114,9 @@ void PrintUsage(const char* program) {
       "cluster-status exits 0 for READY, 2 for NOT READY, 3 for RETRYABLE,\n"
       "and 1 for fatal errors. TCP discovery requires mTLS or explicit\n"
       "--allow-plaintext-admin; --json applies only to cluster-status.\n"
-      "cluster-create exits 0 after Redis verification, 2 for an explicit\n"
+      "cluster-create exits 0 after Genesis commit, 2 for an explicit\n"
       "Meta rejection, 3 for a possibly committed interruption/timeout, and\n"
-      "1 for local manifest, confirmation, dependency, or protocol errors.\n",
+      "1 for local manifest, confirmation, or pre-mutation transport errors.\n",
       program, program, program, program);
 }
 
@@ -495,11 +349,29 @@ int RunClusterStatus(const Options& options) {
                              std::chrono::milliseconds(options.timeout_ms_);
   keylane::meta::ClusterOperator cluster;
   auto outcome = cluster.Status(AdminTarget(options), status_options);
-  if (!outcome.ok()) Fail(std::string(outcome.status().message()));
+  if (!outcome.ok()) {
+    const StatusFailureGuidance guidance =
+        ExplainStatusFailure(outcome.status());
+    std::cerr << "keylane-ctl: cluster-status failed: "
+              << outcome.status().message() << '\n'
+              << "status=unavailable\n"
+              << "status_explanation=" << guidance.explanation_ << '\n'
+              << "next_action=" << guidance.next_action_ << '\n';
+    return 1;
+  }
   auto rendered = options.json_
                       ? keylane::meta::RenderClusterStatusJson(*outcome)
                       : keylane::meta::RenderClusterStatusText(*outcome);
-  if (!rendered.ok()) Fail(std::string(rendered.status().message()));
+  if (!rendered.ok()) {
+    std::cerr << "keylane-ctl: cluster-status rendering failed: "
+              << rendered.status().message() << '\n'
+              << "status=unavailable\n"
+              << "status_explanation=the received status was internally "
+                 "inconsistent\n"
+              << "next_action=preserve Meta data and inspect the server logs "
+                 "before retrying\n";
+    return 1;
+  }
   // Render completely before writing so fatal paths leave stdout empty.
   std::string output = std::move(*rendered);
   if (output.empty() || output.back() != '\n') output.push_back('\n');
@@ -530,172 +402,16 @@ std::string ReadManifest(const std::string& path) {
   return contents;
 }
 
-void VerifyClusterWithRedisCli(
-    const keylane::meta::ClusterCreateManifestV1& manifest,
-    std::chrono::steady_clock::time_point deadline) {
-  RedisCliResult version = RunProcess({"redis-cli", "--version"}, deadline);
-  if (version.timed_out_) {
-    throw ClusterCreateTimeout("redis-cli PATH preflight timed out");
-  }
-  if (version.exit_code_ == 127) {
-    Fail("redis-cli was not found on PATH");
-  }
-  if (version.exit_code_ != 0) {
-    Fail("redis-cli PATH preflight failed: " +
-         TrimLineEnd(std::move(version.output_)));
-  }
-
-  constexpr std::string_view kTcpPrefix = "tcp://";
-  std::map<std::string, keylane::NumericEndpoint> endpoints;
-  for (const auto& node : manifest.data_nodes_) {
-    auto endpoint = keylane::ParseNumericEndpoint(
-        std::string_view(node.client_endpoint_).substr(kTcpPrefix.size()));
-    if (!endpoint.has_value()) Fail("manifest Data endpoint became invalid");
-    endpoints.emplace(node.node_id_, std::move(*endpoint));
-  }
-  const auto group_by_id = [&](std::string_view group_id) {
-    return std::find_if(
-        manifest.groups_.begin(), manifest.groups_.end(),
-        [&](const auto& group) { return group.group_id_ == group_id; });
-  };
-  const auto key_in_range = [deadline](std::uint16_t first, std::uint16_t last,
-                                       std::string_view label) {
-    // Group ids are arbitrary bytes. Encoding keeps a literal '}' in an id
-    // from ending the Redis hash tag before the varying search ordinal.
-    constexpr std::string_view hex = "0123456789abcdef";
-    std::string prefix = "{keylane-create-";
-    for (const unsigned char byte : label) {
-      prefix.push_back(hex[byte >> 4]);
-      prefix.push_back(hex[byte & 15]);
-    }
-    prefix.push_back('-');
-    for (std::uint32_t ordinal = 0;; ++ordinal) {
-      if (std::chrono::steady_clock::now() >= deadline)
-        throw ClusterCreateTimeout("probe key search timed out");
-      std::string key = prefix + std::to_string(ordinal) + "}";
-      const std::uint16_t slot = RedisKeySlot(key);
-      if (slot >= first && slot <= last) return key;
-    }
-  };
-
-  std::vector<std::string> group_probe_keys;
-  group_probe_keys.reserve(manifest.groups_.size());
-  for (const auto& group : manifest.groups_) {
-    const auto endpoint = endpoints.find(group.primary_node_id_);
-    if (endpoint == endpoints.end())
-      Fail("manifest primary endpoint is absent");
-    const std::string info = RequireRedisCli(
-        endpoint->second, {"CLUSTER", "INFO"}, deadline, "CLUSTER INFO");
-    if (info.find("cluster_state:ok") == std::string::npos) {
-      Fail("CLUSTER INFO did not report cluster_state:ok for " +
-           group.group_id_);
-    }
-    const auto range =
-        std::find_if(manifest.slot_ranges_.begin(), manifest.slot_ranges_.end(),
-                     [&](const auto& candidate) {
-                       return candidate.group_id_ == group.group_id_;
-                     });
-    if (range == manifest.slot_ranges_.end())
-      Fail("manifest Group has no normalized Slot range");
-    const std::string probe_key =
-        key_in_range(range->first_, range->last_, group.group_id_);
-    group_probe_keys.push_back(probe_key);
-    const std::string observed_slot =
-        RequireRedisCli(endpoint->second, {"CLUSTER", "KEYSLOT", probe_key},
-                        deadline, "CLUSTER KEYSLOT");
-    if (observed_slot != std::to_string(RedisKeySlot(probe_key))) {
-      Fail("CLUSTER KEYSLOT disagreed with the Keylane CRC16 calculation");
-    }
-    const std::string probe_value = "keylane-cluster-create-ok";
-    const std::string set =
-        RequireRedisCli(endpoint->second, {"SET", probe_key, probe_value},
-                        deadline, "SET probe");
-    if (set != "OK") Fail("SET probe returned an unexpected reply");
-    const std::string get = RequireRedisCli(
-        endpoint->second, {"GET", probe_key}, deadline, "GET probe");
-    const std::string deleted = RequireRedisCli(
-        endpoint->second, {"DEL", probe_key}, deadline, "DEL probe cleanup");
-    if (get != probe_value || deleted != "1") {
-      Fail("redis-cli write/read/cleanup probe did not round-trip exactly");
-    }
-  }
-
-  const auto first_primary =
-      endpoints.find(manifest.groups_.front().primary_node_id_);
-  if (first_primary == endpoints.end())
-    Fail("manifest primary endpoint is absent");
-  const std::string slots = RequireRedisCli(
-      first_primary->second, {"CLUSTER", "SLOTS"}, deadline, "CLUSTER SLOTS");
-  std::vector<std::string_view> slot_lines;
-  std::string_view remaining = slots;
-  while (!remaining.empty()) {
-    const std::size_t newline = remaining.find('\n');
-    std::string_view line = remaining.substr(0, newline);
-    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-    slot_lines.push_back(line);
-    if (newline == std::string_view::npos) break;
-    remaining.remove_prefix(newline + 1);
-  }
-  std::size_t line = 0;
-  for (const auto& range : manifest.slot_ranges_) {
-    const auto group = group_by_id(range.group_id_);
-    if (group == manifest.groups_.end())
-      Fail("normalized Slot Group is absent");
-    const auto primary = endpoints.find(group->primary_node_id_);
-    if (primary == endpoints.end() || line + 5 > slot_lines.size() ||
-        slot_lines[line++] != std::to_string(range.first_) ||
-        slot_lines[line++] != std::to_string(range.last_) ||
-        slot_lines[line++] != primary->second.host_ ||
-        slot_lines[line++] != std::to_string(primary->second.port_) ||
-        slot_lines[line++] != group->primary_node_id_) {
-      Fail("CLUSTER SLOTS primary range differs from the manifest");
-    }
-    for (const std::string& replica_id : group->replica_node_ids_) {
-      const auto replica = endpoints.find(replica_id);
-      if (replica == endpoints.end() || line + 3 > slot_lines.size() ||
-          slot_lines[line++] != replica->second.host_ ||
-          slot_lines[line++] != std::to_string(replica->second.port_) ||
-          slot_lines[line++] != replica_id) {
-        Fail("CLUSTER SLOTS replica membership differs from the manifest");
-      }
-    }
-  }
-  if (line != slot_lines.size()) {
-    Fail("CLUSTER SLOTS returned unexpected trailing topology data");
-  }
-
-  if (manifest.groups_.size() > 1) {
-    const auto second_primary =
-        endpoints.find(manifest.groups_[1].primary_node_id_);
-    if (second_primary == endpoints.end())
-      Fail("second manifest primary endpoint is absent");
-    RedisCliResult moved = RunRedisCliWithoutRedirects(
-        first_primary->second, {"GET", group_probe_keys[1]}, deadline);
-    const std::string expected_moved =
-        "MOVED " + std::to_string(RedisKeySlot(group_probe_keys[1])) + " " +
-        keylane::FormatNumericEndpoint(second_primary->second);
-    if (moved.timed_out_ ||
-        moved.output_.find(expected_moved) == std::string::npos) {
-      Fail("wrong-Group request did not return the expected MOVED target");
-    }
-    RedisCliResult cross_slot = RunRedisCliWithoutRedirects(
-        first_primary->second,
-        {"MGET", group_probe_keys[0], group_probe_keys[1]}, deadline);
-    if (cross_slot.timed_out_ ||
-        cross_slot.output_.find("CROSSSLOT") == std::string::npos) {
-      Fail("cross-Group multi-key request did not return CROSSSLOT");
-    }
-  }
-}
-
 int RunClusterCreate(const Options& options) {
   auto manifest = keylane::meta::ParseClusterCreateManifest(
       ReadManifest(options.manifest_path_));
   if (!manifest.ok()) Fail(std::string(manifest.status().message()));
   // Encoding is part of local admission so an oversized normalized topology
   // is rejected before the destructive confirmation prompt.
-  auto encoded = keylane::meta::EncodeClusterCreateRequest(
-      *manifest, static_cast<std::uint32_t>(options.timeout_ms_));
+  keylane::meta::MetaOperationId size_check_id{};
+  size_check_id.fill(1);
+  auto encoded =
+      keylane::meta::EncodeClusterCreateRequest(*manifest, size_check_id);
   if (!encoded.ok()) Fail(std::string(encoded.status().message()));
 
   std::cout << "Cluster create plan (schema v1)\n";
@@ -765,20 +481,10 @@ int RunClusterCreate(const Options& options) {
     }
     return 1;
   }
-  try {
-    VerifyClusterWithRedisCli(*manifest, create_options.deadline_);
-  } catch (const ClusterCreateTimeout& error) {
-    std::cerr << "keylane-ctl: " << error.what() << '\n'
-              << "keylane-ctl: creation committed but verification timed out; "
-                 "run cluster-status before taking further action\n";
-    return 3;
-  }
-  std::cout << "Cluster READY: committed=" << outcome->committed_index_;
-  for (const auto& group : outcome->groups_) {
-    std::cout << " group=" << group.group_id_
-              << " operation=" << group.operation_id_;
-  }
-  std::cout << '\n';
+  std::cout << "Cluster create accepted: genesis committed="
+            << outcome->genesis_commit_index_
+            << " operation=" << outcome->operation_id_ << '\n'
+            << "Run cluster-status to follow creation and runtime readiness.\n";
   return 0;
 }
 

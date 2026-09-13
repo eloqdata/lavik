@@ -112,9 +112,10 @@ Connection options may also precede `cluster-status`, for example
 `keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock cluster-status`.
 The first human-readable line is `READY`, `NOT READY`, or `RETRYABLE`.
 Corresponding exits are 0, 2, and 3; invalid options, unsafe transport choices,
-TLS/identity failures, incompatible wire data, and corrupt status exit 1 with
-empty stdout. `cluster-status` requires `--allow-plaintext-admin` for TCP
-without TLS.
+TLS/identity failures, incompatible wire data, and corrupt status exit 1.
+Text and JSON status include `status_explanation` and `next_action`; fatal
+errors print equivalent guidance to stderr even when no trustworthy status cut
+exists. `cluster-status` requires `--allow-plaintext-admin` for TCP without TLS.
 Supplying `--tls-ca`, `--tls-cert`, and `--tls-key` together enables mTLS for
 every TCP connection, with the address verified against the server
 certificate's IP SAN. These credentials can accompany a Unix seed and secure
@@ -126,18 +127,15 @@ redirects, capture, and response I/O.
 
 `keylane-ctl cluster-create` is the v1 topology-creation path for a fresh
 statically bootstrapped Meta cluster and one or more preconfigured Data
-processes. It is
-not an import or expansion command: Meta must contain no Data identity, Group,
-Slot map, population manifest, or active cluster-create operation. Creation is
-destructive for every declared Data process.
-
-Install `redis-cli` on the operator host and make it available on `PATH`.
-The command checks every primary with `CLUSTER INFO`, `CLUSTER SLOTS`,
-`CLUSTER KEYSLOT`, and a temporary `SET`/`GET`/`DEL` round trip.
-For multiple Groups it also checks the expected `MOVED` target and a
-`CROSSSLOT` multi-key rejection. Define the initial Meta set in the same
-manifest shown below, then start every Meta process from that file before
-starting Data:
+processes. It is not an import, expansion, or retry-existing command. One Meta
+Raft cluster permanently owns at most one logical Data cluster. Only lifecycle
+`uninitialized` accepts creation, and the environment must also contain no
+Data identity (including retired identities), Group or Slot state, policy,
+grant, population manifest, or legacy creation operation. Meta identity,
+configuration, and audit records do not make the environment non-pristine.
+Creation is destructive for every declared Data process. Define the initial
+Meta set in the same manifest shown below, then start every Meta process from
+that file before starting Data:
 
 ```sh
 keylane-meta --id 1 --addr 127.0.0.1:7101 \
@@ -252,31 +250,35 @@ keylane-ctl cluster-create --manifest cluster.toml \
 
 Review the normalized plan and data-erasure warning, then enter exactly
 lowercase `yes`. EOF, any other input, or a failed parse exits before any Meta
-request. Automation may pass `--yes`. `--timeout-ms` is one absolute
-deadline for leader discovery, server-side reconciliation, Data
-initialization, READY polling, and Redis verification; its default is 120
-seconds. Remote TCP uses the same mTLS or explicit
-`--allow-plaintext-admin` policy as `cluster-status`; `--json` does
-not apply. The deadline bounds the client's wait, not the lifetime of an
-accepted durable creation task.
+request. Automation may pass `--yes`. `--timeout-ms` is one absolute deadline
+for leader discovery and the Genesis proposal response; its default is 120
+seconds. It does not wait for Data initialization or READY. Remote TCP uses
+the same mTLS or explicit `--allow-plaintext-admin` policy as
+`cluster-status`; `--json` does not apply.
 
-Exit 0 means the exact topology reached READY and the Redis probes passed.
-Exit 1 is a local manifest, confirmation, dependency, or protocol/verification
-failure. Exit 2 is an explicit Meta precondition or domain rejection. Exit 3
-means a timeout, lost leader, or connection failure occurred after creation
-may have begun. Do not submit a replacement creation after exit 3. The leader
-continues the accepted root operation in the background; after Meta restart or
-leader change the reconciler resumes from restored snapshot/WAL state without
-another request.
+Exit 0 means the root operation and lifecycle `creating` transition committed
+atomically. The CLI prints
+`Cluster create accepted: genesis committed=<index> operation=<id>` and returns
+immediately. Exit 1 is a local manifest/confirmation failure or a connection or
+protocol failure known to precede mutation. Exit 2 is an explicit Meta
+rejection. Exit 3 means the mutation was sent but its commit outcome is
+uncertain; preserve the printed/root operation id and run `cluster-status`
+before taking further action.
 
-Run `cluster-status` and `getop <operation-id>` using the per-Group ids
-printed after success, or the root id from the
-`cluster-create <id> phase=...` Meta log. A non-terminal record includes its
-phase; `recovery-required` means the retained v1 intent no longer matches
-safe execution conditions. Preserve Meta/Data logs and directories and
-investigate rather than reinitialize. A changed Data boot/history,
-invalidated attempt, or changed topology does not authorize another
-destructive reset.
+Do not issue another create after accepted or uncertain outcomes. The leader
+continues the accepted root in the background, and restart or leadership
+change resumes it from snapshot/WAL. All subsequent creates—whether their
+manifest is identical or different—are rejected as `already-created` once the
+lifecycle is `creating`, `created`, or `provisioning-failed`. The system has no
+attach, retry-existing, reset, or Meta reuse path.
+
+Run `cluster-status` to follow the root id, Genesis index, current phase, and
+runtime blockers; use `getop <root-operation-id>` while the operation remains
+retained. A non-terminal record includes its phase; `recovery-required` means
+the retained v1 intent no longer matches safe execution conditions. Preserve
+Meta/Data logs and directories and investigate rather than reinitialize. A
+changed Data boot/history, invalidated attempt, or changed topology does not
+authorize another destructive reset.
 
 Graceful Meta stop cancels result waits and leaves accepted work intact; it
 does not wait for an offline Data node. A deterministic Data failure fences
@@ -286,12 +288,25 @@ a changed source boot/history or a new boot on a replica still awaiting its
 result follows this failure path and reports the affected Group and node.
 The failure is retained across Meta restart; it does not automatically start
 a new destructive attempt. Meta recovery preserves successful
-population work and finishes bookkeeping without initializing it again. An
-exit-1 Redis verification failure can occur after Meta creation completed, so
-correct the local dependency and inspect status rather than rerunning
-creation. Meta-member addition/removal has a separate recovery driver; Data
+population work and finishes bookkeeping without initializing it again.
+Meta-member addition/removal has a separate recovery driver; Data
 migration and failover orchestration do not become recoverable merely because
 the operation journal exists.
+
+Interpret `cluster_state` independently from `READY / NOT READY / RETRYABLE`:
+
+| `cluster_state` | Meaning | Next action |
+|---|---|---|
+| `uninitialized` | No Genesis committed and no Data-cluster artifacts exist | Validate the manifest, then run `cluster-create` once |
+| `non-pristine` | Lifecycle is uninitialized but Data-cluster artifacts exist | Do not create; inspect the artifacts and rebuild the Meta data directory if this is discarded development state |
+| `creating` | Genesis committed and the durable workflow is running or awaiting recovery | Wait and rerun `cluster-status`; inspect the reported phase and Meta logs if it stops advancing |
+| `created` | Initial workflow completed; current Data runtime may still be NOT READY | Inspect ordinary blockers and Data sessions until READY |
+| `provisioning-failed` | Genesis committed but initialization failed deterministically after fencing | Do not rerun create; preserve data and inspect the failure summary, root operation, and Meta logs |
+
+`status_explanation` summarizes the current condition and `next_action` gives
+the same guidance in both text and JSON output. A `RETRYABLE` result means no
+stable leader-observed cut was available; verify quorum and Admin connectivity,
+then rerun `cluster-status`.
 
 During creation, `cluster-status` distinguishes `meta_catching_up`, a declared
 but not yet committed `data_unregistered`, an unregistered Data process whose
@@ -782,13 +797,16 @@ cluster; startup intentionally refuses to guess at a conversion.
 
 ## Binary replacement and format compatibility
 
-Meta durable schema and segmented WAL remain v1 while the first release is
-unpublished. The current layout replaces earlier development layouts in
-place; equal version numbers do not make incompatible builds safe to mix.
+The physical segmented-WAL container remains v1 while the first release is
+unpublished. Cluster lifecycle makes the `MetaTopologyStore` codec and Raft
+command envelope v2; older development directories therefore fail loudly at
+decode. Other durable stores retain their own exact version markers. Equal
+version numbers in any one layer do not make incompatible builds safe to mix.
 There is no mixed-format window or in-band format switch. For a binary-only
-change that preserves the format, replace one follower at a time, wait for
-catch-up, and replace the leader last. Before any replacement, back up every
-member and record the membership, term, commit index, and snapshot index.
+change that preserves every durable format, replace one follower at a time,
+wait for catch-up, and replace the leader last. Before any replacement, back
+up every member and record the membership, term, commit index, and snapshot
+index.
 
 For an incompatible pre-release format change, stop the old cluster and create
 fresh data directories with the new binary. Do not add a new-format process to

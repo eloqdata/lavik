@@ -19,6 +19,7 @@ using keylane::meta::ClusterOperator;
 using keylane::meta::ClusterStatusOptions;
 using keylane::meta::ClusterStatusResult;
 using keylane::meta::ClusterStatusWireV1;
+using keylane::meta::ClusterStateWireV1;
 using keylane::meta::DecodeClusterHeadReply;
 using keylane::meta::DecodeClusterStatusReply;
 using keylane::meta::EncodeClusterHeadReply;
@@ -34,6 +35,10 @@ ClusterStatusWireV1 ReadyStatus(std::vector<ClusterMetaMemberWireV1> members,
                      .config_index_ = 44,
                      .committed_index_ = 50,
                      .topology_epoch_ = 3};
+  status.cluster_state_ = ClusterStateWireV1::kCreated;
+  status.lifecycle_revision_ = 2;
+  status.root_operation_id_ = "00112233445566778899aabbccddeeff";
+  status.genesis_commit_index_ = 10;
   status.meta_available_ = true;
   status.meta_membership_stable_ = true;
   status.topology_converged_ = true;
@@ -75,6 +80,8 @@ TEST(MetaClusterStatusWireTest, RoundTripsStrictBoundedV1Messages) {
   };
   auto encoded_head = EncodeClusterHeadReply(head);
   ASSERT_TRUE(encoded_head.ok()) << encoded_head.status();
+  EXPECT_EQ(encoded_head->substr(std::string("OK clusterhead 1 ").size(), 4),
+            "0001");
   auto decoded_head = DecodeClusterHeadReply(*encoded_head);
   ASSERT_TRUE(decoded_head.ok()) << decoded_head.status();
   EXPECT_EQ(*decoded_head, head);
@@ -95,6 +102,9 @@ TEST(MetaClusterStatusWireTest, RoundTripsStrictBoundedV1Messages) {
       .code_ = "slots_unassigned", .scope_ = "cluster", .detail_ = "0..16383"});
   auto encoded_status = EncodeClusterStatusReply(status);
   ASSERT_TRUE(encoded_status.ok()) << encoded_status.status();
+  EXPECT_EQ(encoded_status->substr(
+                std::string("OK clusterstatus 1 ").size(), 4),
+            "0002");
   auto decoded_status = DecodeClusterStatusReply(*encoded_status);
   ASSERT_TRUE(decoded_status.ok()) << decoded_status.status();
   EXPECT_EQ(*decoded_status, status);
@@ -135,6 +145,45 @@ TEST(MetaClusterStatusWireTest, EnforcesReadinessBasisAndReadyTopology) {
   ClusterStatusWireV1 stale_owner = ready;
   stale_owner.data_nodes_.front().health_fresh_ = false;
   EXPECT_FALSE(EncodeClusterStatusReply(stale_owner).ok());
+}
+
+TEST(MetaClusterStatusWireTest, ReportsCreatingAndFailedLifecycle) {
+  ClusterStatusWireV1 status;
+  status.capture_.responder_id_ = 1;
+  status.meta_available_ = true;
+  status.meta_members_ = {{.server_id_ = 1, .is_leader_ = true}};
+  status.cluster_state_ = ClusterStateWireV1::kCreating;
+  status.lifecycle_revision_ = 1;
+  status.root_operation_id_ = "00112233445566778899aabbccddeeff";
+  status.genesis_commit_index_ = 12;
+  status.cluster_create_phase_ = "initialize-groups";
+
+  auto encoded = EncodeClusterStatusReply(status);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded = DecodeClusterStatusReply(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, status);
+
+  keylane::meta::ClusterStatusOutcome outcome{
+      .result_ = ClusterStatusResult::kNotReady, .status_ = status};
+  auto json = RenderClusterStatusJson(outcome);
+  ASSERT_TRUE(json.ok()) << json.status();
+  EXPECT_NE(json->find("\"cluster_state\":\"creating\""),
+            std::string::npos);
+  EXPECT_NE(json->find("\"next_action\":"), std::string::npos);
+
+  status.cluster_create_phase_.reset();
+  EXPECT_FALSE(EncodeClusterStatusReply(status).ok());
+  status.cluster_create_phase_ = "initialize-groups";
+  status.cluster_state_ = ClusterStateWireV1::kProvisioningFailed;
+  status.lifecycle_revision_ = 2;
+  status.cluster_create_phase_.reset();
+  status.provisioning_failure_summary_ = "cluster-create provisioning failed";
+  EXPECT_TRUE(EncodeClusterStatusReply(status).ok());
+  status.provisioning_failure_summary_ = "";
+  EXPECT_FALSE(EncodeClusterStatusReply(status).ok());
+  status.provisioning_failure_summary_ = "unsafe\nsummary";
+  EXPECT_FALSE(EncodeClusterStatusReply(status).ok());
 }
 
 TEST(MetaClusterStatusOperatorTest, FollowerSeedRedirectsOnceToLeader) {
@@ -521,6 +570,18 @@ TEST(MetaClusterStatusRenderTest, JsonUsesStableArraysAndStringU64) {
       json->starts_with("{\"schema_version\":1,\"result\":\"not_ready\""));
   EXPECT_NE(json->find("\"committed_index\":\"50\""), std::string::npos);
   EXPECT_LT(json->find("\"code\":\"a\""), json->find("\"code\":\"z\""));
+}
+
+TEST(MetaClusterStatusRenderTest, RejectsInconsistentLifecycleInput) {
+  ClusterStatusWireV1 status;
+  status.cluster_state_ = ClusterStateWireV1::kCreated;
+  status.lifecycle_revision_ = 2;
+  status.root_operation_id_ = "00112233445566778899aabbccddeeff";
+  keylane::meta::ClusterStatusOutcome outcome{
+      .result_ = ClusterStatusResult::kNotReady, .status_ = status};
+
+  EXPECT_FALSE(RenderClusterStatusJson(outcome).ok());
+  EXPECT_FALSE(RenderClusterStatusText(outcome).ok());
 }
 
 }  // namespace

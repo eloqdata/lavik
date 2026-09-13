@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 
 namespace keylane::meta {
@@ -36,6 +37,14 @@ struct MetaAdminTarget {
   std::string endpoint_;
   MetaAdminTlsOptions tls_;
 };
+
+// Attaches/queries transport evidence that the Admin command itself was not
+// written. ClusterCreate uses this distinction after leader discovery:
+// connect and TLS-handshake failures are safely pre-mutation, while any write
+// or reply failure remains uncertain. The marker survives StatusOr transport
+// adapters without relying on error-message parsing.
+absl::Status MarkMetaAdminRequestNotSent(absl::Status status);
+bool MetaAdminRequestDefinitelyNotSent(const absl::Status& status);
 
 class MetaAdminClient {
  public:

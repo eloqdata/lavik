@@ -226,19 +226,21 @@ MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {
   MetaCommittedStatusView view;
   view.applied_index_ = last_committed_idx_.load(std::memory_order_relaxed);
   view.topology_epoch_ = stores_.topology_.TopologyEpoch();
+  view.cluster_lifecycle_ = stores_.topology_.ClusterLifecycle();
+  view.cluster_non_pristine_ =
+      view.cluster_lifecycle_.state_ ==
+          MetaClusterLifecycle::kUninitialized &&
+      HasDataClusterArtifacts(stores_);
   view.active_cluster_create_operation_ =
-      stores_.operation_.HasActiveKind(kMetaClusterCreateOperationKind);
+      view.cluster_lifecycle_.state_ == MetaClusterLifecycle::kCreating;
   if (view.active_cluster_create_operation_) {
-    for (const MetaOperationRecord& operation :
-         stores_.operation_.LiveOperations()) {
-      if (operation.kind_ != kMetaClusterCreateOperationKind ||
-          operation.lifecycle_ == MetaOperationLifecycle::kCompleted ||
-          operation.lifecycle_ == MetaOperationLifecycle::kAborted) {
-        continue;
-      }
-      view.active_cluster_create_phase_ = operation.kind_phase_blob_;
-      std::uint32_t timeout = 0;
-      auto manifest = DecodeClusterCreateRequest(operation.intent_, &timeout);
+    const auto operation = stores_.operation_.FindOperation(
+        view.cluster_lifecycle_.root_operation_id_);
+    if (operation.has_value()) {
+      view.active_cluster_create_phase_ = operation->kind_phase_blob_;
+      MetaOperationId intent_root{};
+      auto manifest =
+          DecodeClusterCreateRequest(operation->intent_, &intent_root);
       if (manifest.ok()) {
         view.active_cluster_create_data_nodes_.reserve(
             manifest->data_nodes_.size());
@@ -246,7 +248,6 @@ MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {
           view.active_cluster_create_data_nodes_.push_back(node.node_id_);
         }
       }
-      break;
     }
   }
   view.meta_members_ = stores_.identity_.MetaMembers();

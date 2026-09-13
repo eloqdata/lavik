@@ -90,17 +90,15 @@
 //                             the current caught-up Leader, or a typed
 //                             retryable error. Capture is single-flight and
 //                             never probes followers.
-//   clustercreate 1 <hex>  -> leader-owned v1 single-Meta/multi-Group
-//                             creation workflow. The bounded payload contains
-//                             only normalized topology and a wait budget;
-//                             generated revisions, assignment, operation, and
-//                             epoch identities remain server-owned. Success
-//                             returns a committed index observing completion
-//                             and per-Group operation ids; failures name a
-//                             stage and stable code. Creation and membership
-//                             changes share admission across all Admin
-//                             listeners; a competing creator gets
-//                             preflight/domain-rejected without proposing.
+//   clustercreate 1 <hex>  -> leader-owned v1 multi-Meta/multi-Group Genesis.
+//                             The bounded payload contains the normalized
+//                             topology and caller-generated root operation id.
+//                             Success confirms the atomic root-operation plus
+//                             Creating lifecycle commit and returns immediately
+//                             with its index and operation id. All later creates
+//                             are already-created; failures name a stage and
+//                             stable code. Creation and membership changes share
+//                             admission across all Admin listeners.
 //   addsrv <id> <raft-ip:port> <data-control-ip:port> <ctl-ip:port>
 //          [<keylane://meta/id>]
 //                          -> persists a membership workflow before binding

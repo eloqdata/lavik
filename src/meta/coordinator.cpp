@@ -423,41 +423,69 @@ absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
                                       std::string_view actor_principal,
                                       std::string_view readable_time) {
   const MetaStores& stores = view.stores();
+  if (applied_index == std::numeric_limits<std::uint64_t>::max()) {
+    return IneffectiveFailSafeRecovery("the applied index is exhausted");
+  }
   if (const auto* complete = std::get_if<CompleteOperation>(&command)) {
-    if (!complete->result_.empty()) {
-      return IneffectiveFailSafeRecovery(
-          "CompleteOperation must use an empty result while recovery is "
-          "gated");
-    }
     const auto before =
         stores.operation_.FindOperation(complete->operation_id_);
-    MetaOperationStore candidate = stores.operation_;
-    const absl::Status applied = candidate.CompleteOperation(*complete);
-    const auto after = candidate.FindOperation(complete->operation_id_);
-    if (!applied.ok() || !before.has_value() || !after.has_value() ||
+    const bool creation_root =
+        before.has_value() &&
+        before->kind_ == kMetaClusterCreateOperationKind &&
+        stores.topology_.ClusterLifecycle().root_operation_id_ ==
+            complete->operation_id_;
+    if ((!creation_root && !complete->result_.empty()) ||
+        (creation_root && complete->result_ != "cluster-created")) {
+      return IneffectiveFailSafeRecovery(
+          "CompleteOperation result is not the bounded workflow outcome");
+    }
+    MetaStores candidate = stores;
+    const MetaApplyResult applied =
+        ApplyCommitted(candidate, applied_index + 1, command, actor_principal,
+                       readable_time);
+    const auto after =
+        candidate.operation_.FindOperation(complete->operation_id_);
+    if (applied.verdict_ != MetaAuditVerdict::kAccepted ||
+        !before.has_value() || !after.has_value() ||
         !IsNonTerminal(before->lifecycle_) ||
         after->lifecycle_ != MetaOperationLifecycle::kCompleted ||
-        after->revision_ != before->revision_ + 1) {
+        after->revision_ != before->revision_ + 1 ||
+        (creation_root &&
+         candidate.topology_.ClusterLifecycle().state_ !=
+             MetaClusterLifecycle::kCreated)) {
       return IneffectiveFailSafeRecovery(
-          "CompleteOperation does not terminalize the current live revision");
+          "CompleteOperation does not terminalize the full aggregate");
     }
     return absl::OkStatus();
   }
   if (const auto* abort = std::get_if<AbortOperation>(&command)) {
-    if (!abort->reason_.empty()) {
+    const auto before =
+        stores.operation_.FindOperation(abort->operation_id_);
+    const bool creation_root =
+        before.has_value() &&
+        before->kind_ == kMetaClusterCreateOperationKind &&
+        stores.topology_.ClusterLifecycle().root_operation_id_ ==
+            abort->operation_id_;
+    if (!creation_root && !abort->reason_.empty()) {
       return IneffectiveFailSafeRecovery(
           "AbortOperation must use an empty reason while recovery is gated");
     }
-    const auto before = stores.operation_.FindOperation(abort->operation_id_);
-    MetaOperationStore candidate = stores.operation_;
-    const absl::Status applied = candidate.AbortOperation(*abort);
-    const auto after = candidate.FindOperation(abort->operation_id_);
-    if (!applied.ok() || !before.has_value() || !after.has_value() ||
+    MetaStores candidate = stores;
+    const MetaApplyResult applied =
+        ApplyCommitted(candidate, applied_index + 1, command, actor_principal,
+                       readable_time);
+    const auto after =
+        candidate.operation_.FindOperation(abort->operation_id_);
+    if (applied.verdict_ != MetaAuditVerdict::kAccepted ||
+        !before.has_value() || !after.has_value() ||
         !IsNonTerminal(before->lifecycle_) ||
         after->lifecycle_ != MetaOperationLifecycle::kAborted ||
-        after->revision_ != before->revision_ + 1) {
+        after->revision_ != before->revision_ + 1 ||
+        (creation_root &&
+         candidate.topology_.ClusterLifecycle().state_ !=
+             MetaClusterLifecycle::kProvisioningFailed)) {
       return IneffectiveFailSafeRecovery(
-          "AbortOperation does not terminalize the current live revision");
+          "AbortOperation does not terminalize the full aggregate");
     }
     return absl::OkStatus();
   }
@@ -517,9 +545,6 @@ absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
     return absl::OkStatus();
   }
   if (std::holds_alternative<PruneAudit>(command)) {
-    if (applied_index == std::numeric_limits<std::uint64_t>::max()) {
-      return IneffectiveFailSafeRecovery("the applied index is exhausted");
-    }
     const auto before = stores.audit_.Serialize();
     if (!before.ok()) {
       return absl::InternalError(

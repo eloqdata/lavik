@@ -6,13 +6,11 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
-#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -21,6 +19,7 @@
 #include "keylane/CLI11.hpp"
 #include "keylane/meta/cluster_status.h"
 #include "keylane/numeric_endpoint.h"
+#include "openssl/rand.h"
 
 namespace keylane::meta {
 namespace {
@@ -28,11 +27,11 @@ namespace {
 constexpr std::size_t kMaxManifestBytes = 64 * 1024;
 constexpr std::size_t kMaxAdminCommandBytes = 64 * 1024;
 constexpr std::size_t kMaxWireString = 64 * 1024;
-// Version 1 encoded one scalar Meta id. There is deliberately no migration:
-// genesis membership is safety-critical, so only a complete descriptor set is
-// accepted by the current development format.
-constexpr std::uint16_t kWireVersion = 2;
-constexpr std::uint32_t kMaxClusterCreateTimeoutMs = 3'600'000;
+// Version 1 encoded one scalar Meta id; version 2 carried a server wait budget.
+// There is deliberately no migration: Genesis identity and acceptance are
+// safety-critical, so the current development format requires the complete
+// Meta descriptor set and caller-generated root id.
+constexpr std::uint16_t kWireVersion = 3;
 constexpr std::uint32_t kMaxManifestItems = 16'384;
 
 absl::Status Invalid(std::string message) {
@@ -267,6 +266,7 @@ class Writer {
     U16(static_cast<std::uint16_t>(value >> 16));
     U16(static_cast<std::uint16_t>(value));
   }
+  void Raw(std::string_view value) { bytes_.append(value); }
   absl::Status String(std::string_view value) {
     if (value.size() > kMaxWireString) {
       return Invalid("clustercreate string exceeds cap");
@@ -296,6 +296,12 @@ class Reader {
     auto low = U16();
     if (!low.ok()) return low.status();
     return (static_cast<std::uint32_t>(*high) << 16) | *low;
+  }
+  absl::StatusOr<std::string_view> Raw(std::size_t size) {
+    if (size > bytes_.size() - offset_) return Invalid("truncated request");
+    const std::string_view result = bytes_.substr(offset_, size);
+    offset_ += size;
+    return result;
   }
   absl::StatusOr<std::string> String() {
     auto size = U32();
@@ -357,66 +363,18 @@ absl::StatusOr<std::uint64_t> ParseU64(std::string_view text) {
   return result;
 }
 
-bool ReadyMatches(const ClusterStatusWireV1& status,
-                  const ClusterCreateManifestV1& manifest) {
-  if (!status.cluster_ready_ ||
-      status.meta_members_.size() != manifest.meta_members_.size() ||
-      status.data_nodes_.size() != manifest.data_nodes_.size() ||
-      status.groups_.size() != manifest.groups_.size() ||
-      status.slot_ranges_.size() != manifest.slot_ranges_.size()) {
-    return false;
-  }
-  for (std::size_t index = 0; index < manifest.meta_members_.size(); ++index) {
-    if (status.meta_members_[index].server_id_ !=
-        manifest.meta_members_[index].server_id_) {
-      return false;
-    }
-  }
+bool IsZero(const MetaOperationId& id) {
+  return std::all_of(id.begin(), id.end(),
+                     [](std::uint8_t byte) { return byte == 0; });
+}
 
-  std::map<std::string, std::pair<std::string, ClusterDataNodeRole>> expected;
-  for (const auto& group : manifest.groups_) {
-    expected.emplace(group.primary_node_id_,
-                     std::pair(group.group_id_, ClusterDataNodeRole::kPrimary));
-    for (const std::string& replica : group.replica_node_ids_) {
-      expected.emplace(
-          replica, std::pair(group.group_id_, ClusterDataNodeRole::kReplica));
-    }
+absl::StatusOr<MetaOperationId> GenerateOperationId() {
+  MetaOperationId id{};
+  if (RAND_bytes(id.data(), static_cast<int>(id.size())) != 1 || IsZero(id)) {
+    return absl::InternalError(
+        "failed to generate cluster-create operation id");
   }
-  for (const auto& node : status.data_nodes_) {
-    const auto found = expected.find(node.node_id_);
-    if (found == expected.end() || node.retired_ ||
-        node.group_id_ != std::optional<std::string>(found->second.first) ||
-        node.role_ != found->second.second || !node.current_session_ ||
-        !node.projection_current_ || !node.health_fresh_ ||
-        !node.population_current_ ||
-        (node.role_ == ClusterDataNodeRole::kPrimary &&
-         node.lease_status_ != ClusterLeaseStatus::kRecentlyGranted)) {
-      return false;
-    }
-  }
-  for (const auto& expected_group : manifest.groups_) {
-    const auto group = std::find_if(
-        status.groups_.begin(), status.groups_.end(), [&](const auto& item) {
-          return item.group_id_ == expected_group.group_id_;
-        });
-    if (group == status.groups_.end() || group->term_ != 1 ||
-        group->owner_node_id_ !=
-            std::optional<std::string>(expected_group.primary_node_id_) ||
-        group->config_epoch_ != 1 || !group->grant_revision_.has_value() ||
-        !group->serving_ready_ || !group->topology_converged_) {
-      return false;
-    }
-  }
-  for (std::size_t index = 0; index < manifest.slot_ranges_.size(); ++index) {
-    const auto& actual = status.slot_ranges_[index];
-    const auto& expected_range = manifest.slot_ranges_[index];
-    if (std::tie(actual.first_, actual.last_, actual.group_id_) !=
-        std::tie(expected_range.first_, expected_range.last_,
-                 expected_range.group_id_)) {
-      return false;
-    }
-  }
-  return true;
+  return id;
 }
 
 absl::Status ClusterCreateReplyError(std::string_view reply) {
@@ -437,10 +395,8 @@ absl::Status ClusterCreateReplyError(std::string_view reply) {
       reply.substr(stage_end + 1, code_end - stage_end - 1);
   const std::string detail(reply);
   if (code == "uncertain-outcome") return absl::AbortedError(detail);
-  if (code == "not-leader") return absl::UnavailableError(detail);
-  if (code == "bad-request") return Invalid(detail);
-  if (code == "runtime-invalid" || code == "non-empty-cluster" ||
-      code == "domain-rejected" || code == "data-rejected") {
+  if (code == "already-created" || code == "non-pristine" ||
+      code == "pre-commit-failed" || code == "bad-request") {
     return absl::FailedPreconditionError(detail);
   }
   return Invalid("unknown clustercreate error code");
@@ -660,7 +616,8 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
 }
 
 absl::StatusOr<std::string> EncodeClusterCreateRequest(
-    const ClusterCreateManifestV1& manifest, std::uint32_t wait_timeout_ms) {
+    const ClusterCreateManifestV1& manifest,
+    const MetaOperationId& root_operation_id) {
   ClusterCreateManifestV1 canonical = manifest;
   if (absl::Status status = ValidateAndNormalize(&canonical); !status.ok()) {
     return status;
@@ -668,12 +625,14 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
   if (canonical != manifest) {
     return Invalid("clustercreate request manifest is not normalized");
   }
-  if (wait_timeout_ms == 0 || wait_timeout_ms > kMaxClusterCreateTimeoutMs) {
-    return Invalid("clustercreate timeout is out of range");
-  }
+  if (IsZero(root_operation_id))
+    return Invalid("clustercreate root operation id is zero");
 
   Writer writer;
   writer.U16(kWireVersion);
+  writer.Raw(std::string_view(
+      reinterpret_cast<const char*>(root_operation_id.data()),
+      root_operation_id.size()));
   writer.U32(static_cast<std::uint32_t>(manifest.meta_members_.size()));
   for (const auto& member : manifest.meta_members_) {
     writer.U32(member.server_id_);
@@ -719,7 +678,6 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
     if (absl::Status status = writer.String(range.group_id_); !status.ok())
       return status;
   }
-  writer.U32(wait_timeout_ms);
   std::string request = "clustercreate 1 " + Hex(writer.bytes());
   if (request.size() + 1 > kMaxAdminCommandBytes) {
     return absl::ResourceExhaustedError(
@@ -729,9 +687,9 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
 }
 
 absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
-    std::string_view request, std::uint32_t* wait_timeout_ms) {
+    std::string_view request, MetaOperationId* root_operation_id) {
   constexpr std::string_view kPrefix = "clustercreate 1 ";
-  if (wait_timeout_ms == nullptr || !request.starts_with(kPrefix) ||
+  if (root_operation_id == nullptr || !request.starts_with(kPrefix) ||
       request.size() + 1 > kMaxAdminCommandBytes) {
     return Invalid("invalid clustercreate request envelope");
   }
@@ -742,6 +700,11 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
   if (!version.ok()) return version.status();
   if (*version != kWireVersion)
     return Invalid("unsupported clustercreate version");
+  auto root = reader.Raw(root_operation_id->size());
+  if (!root.ok()) return root.status();
+  std::copy(root->begin(), root->end(), root_operation_id->begin());
+  if (IsZero(*root_operation_id))
+    return Invalid("clustercreate root operation id is zero");
 
   ClusterCreateManifestV1 manifest;
   manifest.schema_version_ = 1;
@@ -827,17 +790,12 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
     range.group_id_ = std::move(*group);
     manifest.slot_ranges_.push_back(std::move(range));
   }
-  auto timeout = reader.U32();
-  if (!timeout.ok()) return timeout.status();
-  *wait_timeout_ms = *timeout;
   if (!reader.done()) return Invalid("trailing clustercreate request data");
   ClusterCreateManifestV1 canonical = manifest;
   if (absl::Status status = ValidateAndNormalize(&canonical); !status.ok())
     return status;
   if (canonical != manifest)
     return Invalid("clustercreate request is not canonical");
-  if (*wait_timeout_ms == 0 || *wait_timeout_ms > kMaxClusterCreateTimeoutMs)
-    return Invalid("clustercreate timeout is out of range");
   return manifest;
 }
 
@@ -848,48 +806,18 @@ absl::StatusOr<ClusterCreateOutcome> DecodeClusterCreateReply(
     return Invalid("invalid clustercreate reply");
   reply.remove_prefix(kPrefix.size());
   std::istringstream input{std::string(reply)};
-  std::string final_index_text;
-  std::string count_text;
-  if (!(input >> final_index_text >> count_text))
-    return Invalid("invalid clustercreate reply");
-  auto final_index = ParseU64(final_index_text);
-  auto count = ParseU64(count_text);
-  if (!final_index.ok() || !count.ok() || *final_index == 0 || *count == 0 ||
-      *count > kMaxManifestItems) {
-    return Invalid("invalid clustercreate reply");
-  }
+  std::string genesis_index_text;
   ClusterCreateOutcome outcome;
-  outcome.committed_index_ = *final_index;
-  outcome.groups_.reserve(static_cast<std::size_t>(*count));
-  for (std::uint64_t index = 0; index < *count; ++index) {
-    std::string group_hex;
-    std::string committed_text;
-    ClusterCreateOutcome::Group group;
-    if (!(input >> group_hex >> committed_text >> group.operation_id_))
-      return Invalid("invalid clustercreate reply");
-    auto group_id = Unhex(group_hex);
-    auto committed = ParseU64(committed_text);
-    if (!group_id.ok() || group_id->empty() || group_id->size() > 64 ||
-        !committed.ok() || *committed == 0 ||
-        !IsCanonicalOperationId(group.operation_id_)) {
-      return Invalid("invalid clustercreate reply");
-    }
-    group.group_id_ = std::move(*group_id);
-    group.committed_index_ = *committed;
-    outcome.groups_.push_back(std::move(group));
+  if (!(input >> genesis_index_text >> outcome.operation_id_))
+    return Invalid("invalid clustercreate reply");
+  auto genesis_index = ParseU64(genesis_index_text);
+  if (!genesis_index.ok() || *genesis_index == 0 ||
+      !IsCanonicalOperationId(outcome.operation_id_)) {
+    return Invalid("invalid clustercreate reply");
   }
+  outcome.genesis_commit_index_ = *genesis_index;
   std::string trailing;
   if (input >> trailing) return Invalid("invalid clustercreate reply");
-  if (std::any_of(outcome.groups_.begin(), outcome.groups_.end(),
-                  [&](const auto& group) {
-                    return group.committed_index_ > outcome.committed_index_;
-                  }) ||
-      !std::is_sorted(outcome.groups_.begin(), outcome.groups_.end(),
-                      [](const auto& left, const auto& right) {
-                        return left.group_id_ < right.group_id_;
-                      })) {
-    return Invalid("clustercreate reply is not canonical");
-  }
   return outcome;
 }
 
@@ -910,11 +838,17 @@ absl::StatusOr<ClusterCreateOutcome> ClusterOperator::Create(
         absl::UnavailableError(initial->retry_reason_));
   }
   const ClusterStatusWireV1& status = *initial->status_;
-  const bool create_active =
-      std::any_of(status.blockers_.begin(), status.blockers_.end(),
-                  [](const ClusterBlockerWireV1& blocker) {
-                    return blocker.code_ == kClusterCreateActiveBlockerCode;
-                  });
+  // Lifecycle admission survives Meta membership changes. Only a pristine,
+  // uninitialized cluster compares the manifest with the current Meta set.
+  if (status.cluster_state_ == ClusterStateWireV1::kNonPristine) {
+    return absl::FailedPreconditionError(
+        "cluster-create non-pristine: Uninitialized Meta contains "
+        "Data-cluster artifacts");
+  }
+  if (status.cluster_state_ != ClusterStateWireV1::kUninitialized) {
+    return absl::FailedPreconditionError(
+        "cluster-create already-created: Meta already owns a Data cluster");
+  }
   const bool meta_matches =
       status.meta_members_.size() == manifest.meta_members_.size() &&
       std::equal(status.meta_members_.begin(), status.meta_members_.end(),
@@ -922,53 +856,52 @@ absl::StatusOr<ClusterCreateOutcome> ClusterOperator::Create(
                  [](const auto& actual, const auto& expected) {
                    return actual.server_id_ == expected.server_id_;
                  });
-  if (!meta_matches || create_active || !status.data_nodes_.empty() ||
-      !status.groups_.empty() || !status.slot_ranges_.empty()) {
+  if (!meta_matches) {
     return absl::FailedPreconditionError(
-        "cluster-create requires the declared Meta set and an empty topology");
+        "cluster-create bad-request: manifest does not match the committed "
+        "Meta set");
   }
 
-  const auto now = std::chrono::steady_clock::now();
-  if (now >= options.deadline_) {
+  if (std::chrono::steady_clock::now() >= options.deadline_) {
     return BeforeMutationFailure(
         absl::DeadlineExceededError("cluster-create deadline expired"));
   }
-  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-      options.deadline_ - now);
-  // Leave the Admin transport enough of the caller's deadline to deliver the
-  // server's structured timeout, including its last node-level blocker.
-  constexpr std::int64_t kReplyReserveMs = 250;
-  const auto wait_ms = static_cast<std::uint32_t>(
-      std::clamp<std::int64_t>(remaining.count() - kReplyReserveMs, 1,
-                               std::numeric_limits<std::uint32_t>::max()));
-  auto request = EncodeClusterCreateRequest(manifest, wait_ms);
+  auto root_operation_id = GenerateOperationId();
+  if (!root_operation_id.ok()) return root_operation_id.status();
+  const std::string expected_id = Hex(std::string_view(
+      reinterpret_cast<const char*>(root_operation_id->data()),
+      root_operation_id->size()));
+  auto request = EncodeClusterCreateRequest(manifest, *root_operation_id);
   if (!request.ok()) return request.status();
   auto reply = round_trip_(leader, *request, options.deadline_);
-  if (!reply.ok()) return reply.status();
-  if (reply->starts_with("ERR clustercreate "))
-    return ClusterCreateReplyError(*reply);
-  auto outcome = DecodeClusterCreateReply(*reply);
-  if (!outcome.ok()) return outcome.status();
-
-  std::string last_blocker;
-  while (std::chrono::steady_clock::now() < options.deadline_) {
-    auto observed = Status(seed, options);
-    if (!observed.ok()) return observed.status();
-    if (observed->status_.has_value()) {
-      if (ReadyMatches(*observed->status_, manifest)) return *outcome;
-      if (!observed->status_->blockers_.empty()) {
-        const auto& blocker = observed->status_->blockers_.front();
-        last_blocker = " last_blocker=" + blocker.code_ +
-                       " scope=" + blocker.scope_ +
-                       " detail=" + blocker.detail_;
-      }
+  if (!reply.ok()) {
+    if (MetaAdminRequestDefinitelyNotSent(reply.status())) {
+      return BeforeMutationFailure(reply.status());
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    return absl::AbortedError(
+        "cluster-create proposal outcome is uncertain; operation=" +
+        expected_id + " detail=" + std::string(reply.status().message()));
   }
-  return absl::DeadlineExceededError(
-      "cluster-create committed but the requested topology did not become "
-      "READY;" +
-      last_blocker);
+  if (reply->starts_with("ERR clustercreate ")) {
+    absl::Status error = ClusterCreateReplyError(*reply);
+    if (error.code() == absl::StatusCode::kFailedPrecondition) return error;
+    return absl::AbortedError(
+        "cluster-create response did not prove a pre-commit rejection; "
+        "operation=" +
+        expected_id + " detail=" + std::string(error.message()));
+  }
+  auto outcome = DecodeClusterCreateReply(*reply);
+  if (!outcome.ok()) {
+    return absl::AbortedError(
+        "cluster-create response was not trustworthy; operation=" +
+        expected_id + " detail=" + std::string(outcome.status().message()));
+  }
+  if (outcome->operation_id_ != expected_id) {
+    return absl::AbortedError(
+        "cluster-create response named another operation; operation=" +
+        expected_id);
+  }
+  return *outcome;
 }
 
 }  // namespace keylane::meta

@@ -34,6 +34,66 @@ bool IsZero(const MetaHash256& hash) {
                      [](std::uint8_t byte) { return byte == 0; });
 }
 
+absl::Status CheckClusterRoot(const MetaOperationId& root_operation_id,
+                              std::uint64_t genesis_commit_index) {
+  if (IsZero(root_operation_id)) {
+    return MetaDomainRejectError("cluster create root operation id is zero");
+  }
+  if (genesis_commit_index == 0) {
+    return MetaDomainRejectError("cluster Genesis commit index is zero");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateClusterLifecycle(
+    const MetaClusterLifecycleState& lifecycle) {
+  const bool root_is_zero = IsZero(lifecycle.root_operation_id_);
+  switch (lifecycle.state_) {
+    case MetaClusterLifecycle::kUninitialized:
+      if (lifecycle.revision_ == 0 && root_is_zero &&
+          lifecycle.genesis_commit_index_ == 0 &&
+          lifecycle.terminal_outcome_ == MetaClusterTerminalOutcome::kNone &&
+          lifecycle.failure_summary_.empty()) {
+        return absl::OkStatus();
+      }
+      break;
+    case MetaClusterLifecycle::kCreating:
+      if (lifecycle.revision_ == 1 && !root_is_zero &&
+          lifecycle.genesis_commit_index_ != 0 &&
+          lifecycle.terminal_outcome_ == MetaClusterTerminalOutcome::kNone &&
+          lifecycle.failure_summary_.empty()) {
+        return absl::OkStatus();
+      }
+      break;
+    case MetaClusterLifecycle::kCreated:
+      if (lifecycle.revision_ == 2 && !root_is_zero &&
+          lifecycle.genesis_commit_index_ != 0 &&
+          lifecycle.terminal_outcome_ ==
+              MetaClusterTerminalOutcome::kCreated &&
+          lifecycle.failure_summary_.empty()) {
+        return absl::OkStatus();
+      }
+      break;
+    case MetaClusterLifecycle::kProvisioningFailed:
+      if (lifecycle.revision_ == 2 && !root_is_zero &&
+          lifecycle.genesis_commit_index_ != 0 &&
+          lifecycle.terminal_outcome_ ==
+              MetaClusterTerminalOutcome::kProvisioningFailed &&
+          !lifecycle.failure_summary_.empty() &&
+          lifecycle.failure_summary_.size() <=
+              kMaxMetaClusterFailureSummaryBytes &&
+          std::all_of(lifecycle.failure_summary_.begin(),
+                      lifecycle.failure_summary_.end(), [](char ch) {
+                        const auto byte = static_cast<unsigned char>(ch);
+                        return byte >= 0x20 && byte <= 0x7e;
+                      })) {
+        return absl::OkStatus();
+      }
+      break;
+  }
+  return MetaFailStopError("invalid cluster lifecycle in snapshot");
+}
+
 // The epoch rule: absolute values, strictly monotonic and gap-free —
 // the command must carry exactly current+1. Saturating at u64 max is a
 // rejection, never a wrap.
@@ -47,6 +107,90 @@ absl::Status CheckNextTopologyEpoch(std::uint64_t current,
 }
 
 }  // namespace
+
+absl::Status MetaTopologyStore::BeginClusterCreate(
+    const MetaOperationId& root_operation_id,
+    std::uint64_t genesis_commit_index) {
+  if (auto status = CheckClusterRoot(root_operation_id, genesis_commit_index);
+      !status.ok()) {
+    return status;
+  }
+  if (cluster_lifecycle_.state_ != MetaClusterLifecycle::kUninitialized &&
+      cluster_lifecycle_.root_operation_id_ == root_operation_id &&
+      cluster_lifecycle_.genesis_commit_index_ == genesis_commit_index &&
+      ValidateClusterLifecycle(cluster_lifecycle_).ok()) {
+    return absl::OkStatus();
+  }
+  if (cluster_lifecycle_.state_ != MetaClusterLifecycle::kUninitialized) {
+    return MetaDomainRejectError("cluster has already accepted creation");
+  }
+  cluster_lifecycle_.state_ = MetaClusterLifecycle::kCreating;
+  cluster_lifecycle_.revision_ = 1;
+  cluster_lifecycle_.root_operation_id_ = root_operation_id;
+  cluster_lifecycle_.genesis_commit_index_ = genesis_commit_index;
+  return absl::OkStatus();
+}
+
+absl::Status MetaTopologyStore::CompleteClusterCreate(
+    const MetaOperationId& root_operation_id) {
+  if (cluster_lifecycle_.state_ == MetaClusterLifecycle::kCreated &&
+      cluster_lifecycle_.revision_ == 2 &&
+      cluster_lifecycle_.root_operation_id_ == root_operation_id &&
+      cluster_lifecycle_.terminal_outcome_ ==
+          MetaClusterTerminalOutcome::kCreated &&
+      cluster_lifecycle_.failure_summary_.empty()) {
+    return absl::OkStatus();
+  }
+  if (cluster_lifecycle_.state_ != MetaClusterLifecycle::kCreating ||
+      cluster_lifecycle_.root_operation_id_ != root_operation_id) {
+    return MetaDomainRejectError(
+        "cluster create completion does not match the active root");
+  }
+  if (cluster_lifecycle_.revision_ == UINT64_MAX) {
+    return MetaDomainRejectError("cluster lifecycle revision exhausted");
+  }
+  cluster_lifecycle_.state_ = MetaClusterLifecycle::kCreated;
+  ++cluster_lifecycle_.revision_;
+  cluster_lifecycle_.terminal_outcome_ = MetaClusterTerminalOutcome::kCreated;
+  cluster_lifecycle_.failure_summary_.clear();
+  return absl::OkStatus();
+}
+
+absl::Status MetaTopologyStore::FailClusterCreate(
+    const MetaOperationId& root_operation_id, std::string failure_summary) {
+  if (failure_summary.empty() ||
+      failure_summary.size() > kMaxMetaClusterFailureSummaryBytes ||
+      std::any_of(failure_summary.begin(), failure_summary.end(), [](char ch) {
+        const auto byte = static_cast<unsigned char>(ch);
+        return byte < 0x20 || byte > 0x7e;
+      })) {
+    return MetaDomainRejectError(
+        "cluster failure summary is empty, unsafe, or over cap");
+  }
+  if (cluster_lifecycle_.state_ ==
+          MetaClusterLifecycle::kProvisioningFailed &&
+      cluster_lifecycle_.revision_ == 2 &&
+      cluster_lifecycle_.root_operation_id_ == root_operation_id &&
+      cluster_lifecycle_.terminal_outcome_ ==
+          MetaClusterTerminalOutcome::kProvisioningFailed &&
+      cluster_lifecycle_.failure_summary_ == failure_summary) {
+    return absl::OkStatus();
+  }
+  if (cluster_lifecycle_.state_ != MetaClusterLifecycle::kCreating ||
+      cluster_lifecycle_.root_operation_id_ != root_operation_id) {
+    return MetaDomainRejectError(
+        "cluster create failure does not match the active root");
+  }
+  if (cluster_lifecycle_.revision_ == UINT64_MAX) {
+    return MetaDomainRejectError("cluster lifecycle revision exhausted");
+  }
+  cluster_lifecycle_.state_ = MetaClusterLifecycle::kProvisioningFailed;
+  ++cluster_lifecycle_.revision_;
+  cluster_lifecycle_.terminal_outcome_ =
+      MetaClusterTerminalOutcome::kProvisioningFailed;
+  cluster_lifecycle_.failure_summary_ = std::move(failure_summary);
+  return absl::OkStatus();
+}
 
 absl::Status MetaTopologyStore::Apply(const CreateGroup& cmd) {
   if (auto st = CheckGroupId(cmd.group_id_); !st.ok()) return st;
@@ -479,13 +623,20 @@ std::vector<MetaTopologyGroupView> MetaTopologyStore::Groups() const {
   return result;
 }
 
-// Envelope: schema_version u16 | topology_epoch u64 | group count u32 |
-// sorted group records | retained-assignment count u32 | sorted
-// (node_id, assignment_id) entries | slot run count u32 | sorted runs. See
-// the header for the convention and the strictness contract.
+// Envelope: schema_version u16 | cluster lifecycle | topology_epoch u64 |
+// group count u32 | sorted group records | retained-assignment count u32 |
+// sorted (node_id, assignment_id) entries | slot run count u32 | sorted runs.
+// The lifecycle is intentionally in this store but independent of
+// topology_epoch: accepting Genesis is not itself a topology mutation.
 std::string MetaTopologyStore::Serialize() const {
   MetaWriter w;
-  w.WriteU16(kMetaFormatVersion);
+  w.WriteU16(kMetaTopologyStoreFormatVersion);
+  w.WriteU8(static_cast<std::uint8_t>(cluster_lifecycle_.state_));
+  w.WriteU64(cluster_lifecycle_.revision_);
+  WriteFixedArray(w, cluster_lifecycle_.root_operation_id_);
+  w.WriteU64(cluster_lifecycle_.genesis_commit_index_);
+  w.WriteU8(static_cast<std::uint8_t>(cluster_lifecycle_.terminal_outcome_));
+  w.WriteString(cluster_lifecycle_.failure_summary_);
   w.WriteU64(topology_epoch_);
   w.WriteCount(static_cast<std::uint32_t>(groups_.size()));
   for (const auto& [group_id, group] : groups_) {
@@ -539,8 +690,28 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   MetaReader r(bytes);
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version != kMetaFormatVersion) {
+  if (*version != kMetaTopologyStoreFormatVersion) {
     return MetaFailStopError("unknown schema_version");
+  }
+  auto lifecycle_state = r.ReadU8();
+  if (!lifecycle_state.ok()) return lifecycle_state.status();
+  auto lifecycle_revision = r.ReadU64();
+  if (!lifecycle_revision.ok()) return lifecycle_revision.status();
+  auto root_operation_id = ReadFixedArray<16>(r);
+  if (!root_operation_id.ok()) return root_operation_id.status();
+  auto genesis_commit_index = r.ReadU64();
+  if (!genesis_commit_index.ok()) return genesis_commit_index.status();
+  auto terminal_outcome = r.ReadU8();
+  if (!terminal_outcome.ok()) return terminal_outcome.status();
+  auto failure_summary = r.ReadString(kMaxMetaClusterFailureSummaryBytes);
+  if (!failure_summary.ok()) return failure_summary.status();
+  if (*lifecycle_state >
+          static_cast<std::uint8_t>(
+              MetaClusterLifecycle::kProvisioningFailed) ||
+      *terminal_outcome >
+          static_cast<std::uint8_t>(
+              MetaClusterTerminalOutcome::kProvisioningFailed)) {
+    return MetaFailStopError("unknown cluster lifecycle tag");
   }
   auto topology_epoch = r.ReadU64();
   if (!topology_epoch.ok()) return topology_epoch.status();
@@ -548,6 +719,19 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   if (!group_count.ok()) return group_count.status();
 
   MetaTopologyStore store;
+  store.cluster_lifecycle_.state_ =
+      static_cast<MetaClusterLifecycle>(*lifecycle_state);
+  store.cluster_lifecycle_.revision_ = *lifecycle_revision;
+  store.cluster_lifecycle_.root_operation_id_ = *root_operation_id;
+  store.cluster_lifecycle_.genesis_commit_index_ = *genesis_commit_index;
+  store.cluster_lifecycle_.terminal_outcome_ =
+      static_cast<MetaClusterTerminalOutcome>(*terminal_outcome);
+  store.cluster_lifecycle_.failure_summary_ = std::move(*failure_summary);
+  if (absl::Status status =
+          ValidateClusterLifecycle(store.cluster_lifecycle_);
+      !status.ok()) {
+    return status;
+  }
   store.topology_epoch_ = *topology_epoch;
   for (std::uint32_t i = 0; i < *group_count; ++i) {
     auto group_id = r.ReadString(kMaxMetaGroupIdBytes);

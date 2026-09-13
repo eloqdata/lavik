@@ -747,9 +747,9 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
   if (operation.kind_ != kMetaClusterCreateOperationKind ||
       IsTerminal(operation.lifecycle_))
     return std::nullopt;
-  std::uint32_t unused_timeout = 0;
+  MetaOperationId intent_root{};
   auto manifest =
-      DecodeClusterCreateRequest(operation.intent_, &unused_timeout);
+      DecodeClusterCreateRequest(operation.intent_, &intent_root);
   if (!manifest.ok())
     return Conflict("creation intent is not a recoverable v1 plan");
   const auto& stores = view.stores();
@@ -1092,10 +1092,13 @@ void MetaClusterCreateReconciler::Start(MetaLeaderContext& context) {
   // leader completion semantics here, before an earlier-registered reconciler
   // can run a genesis binding proposal on the worker executor.
   const auto view = context.CommittedView();
-  const auto live_operations = view.operation().LiveOperations();
+  const auto& lifecycle = view.topology().ClusterLifecycle();
+  const auto operation =
+      lifecycle.state_ == MetaClusterLifecycle::kCreating
+          ? view.operation().FindOperation(lifecycle.root_operation_id_)
+          : std::optional<MetaOperationRecord>{};
   SetPeerSmCommitTracking(
-      core, std::any_of(live_operations.begin(), live_operations.end(),
-                        IsWaitingAtMetaBarrier));
+      core, operation.has_value() && IsWaitingAtMetaBarrier(*operation));
   if (!core->executor_.Notify([core, context = &context]() noexcept {
         if (core->shutdown_) return;
         if (core->running_) std::terminate();
@@ -1154,15 +1157,13 @@ celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
     if (changed->exchange(false, std::memory_order_acq_rel))
       subscribed.view_ = context->CommittedView();
     const auto& view = subscribed.view_;
+    const auto& lifecycle = view.topology().ClusterLifecycle();
     const bool has_creation =
-        view.operation().HasActiveKind(kMetaClusterCreateOperationKind);
-    const auto operations = has_creation ? view.operation().LiveOperations()
-                                         : std::vector<MetaOperationRecord>{};
-    const auto operation = std::find_if(
-        operations.begin(), operations.end(), [](const auto& item) {
-          return item.kind_ == kMetaClusterCreateOperationKind &&
-                 !IsTerminal(item.lifecycle_);
-        });
+        lifecycle.state_ == MetaClusterLifecycle::kCreating;
+    const auto operation =
+        has_creation
+            ? view.operation().FindOperation(lifecycle.root_operation_id_)
+            : std::optional<MetaOperationRecord>{};
     // NuRaft's tracking switch has two inseparable effects: followers report
     // their SM commit index, while a leader delays every client completion
     // until all peers have applied it. Followers therefore keep the switch on,
@@ -1170,9 +1171,9 @@ celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
     // SubmitOperation committed before this point under normal majority
     // semantics; fresh heartbeats repopulate peer progress after enabling.
     const bool waiting_at_meta_barrier =
-        operation != operations.end() && IsWaitingAtMetaBarrier(*operation);
+        operation.has_value() && IsWaitingAtMetaBarrier(*operation);
     SetPeerSmCommitTracking(core, waiting_at_meta_barrier);
-    if (operation == operations.end())
+    if (!operation.has_value())
       lease.reset();
     else {
       if (lease == nullptr) lease = core->membership_gate_->TryAcquire();
@@ -1182,9 +1183,9 @@ celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
                               ? "submitted"
                               : operation->kind_phase_blob_;
         if (cut == kRootPhaseInitializeGroups) {
-          std::uint32_t timeout = 0;
+          MetaOperationId intent_root{};
           const auto manifest =
-              DecodeClusterCreateRequest(operation->intent_, &timeout);
+              DecodeClusterCreateRequest(operation->intent_, &intent_root);
           if (manifest.ok()) {
             for (const auto& declaration : manifest->groups_) {
               const auto child = view.operation().FindOperation(

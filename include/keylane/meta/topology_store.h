@@ -1,9 +1,9 @@
 #pragma once
 
 // MetaTopologyStore is the metadata control plane's committed topology store.
-// It holds four kinds of state: the group table (group_id -> GroupState), the
-// retained last-assignment identity per node, the 16384-entry slot map, and
-// the cluster-wide topology_epoch.
+// It holds the single logical Data cluster's lifecycle, the group table
+// (group_id -> GroupState), the retained last-assignment identity per node,
+// the 16384-entry slot map, and the cluster-wide topology_epoch.
 //
 // Invariants:
 //   - One-node-one-group: a node_id is a member of at most one group.
@@ -22,6 +22,11 @@
 //     carries new_topology_epoch (group lifecycle/membership, endpoint,
 //     replication state, slot map, and ActivateAuthority through the
 //     granular primitives) must carry exactly current + 1.
+//   - Cluster lifecycle has an independent revision. Only Uninitialized may
+//     enter Creating; Created and ProvisioningFailed are terminal. These
+//     transitions do not advance topology_epoch. The root operation id and
+//     Genesis commit index remain after operation archive/prune, so duplicate
+//     creation rejection never depends on operation retention.
 //   - Slot map is absolute: SetSlotMap replaces the whole map; ranges must be
 //     in bounds [0, kMetaSlotCount) and pairwise non-overlapping, and every
 //     referenced group (ranges and config_epochs) must exist. Partial
@@ -59,10 +64,11 @@
 // particular this store does NOT know whether a node_id is registered:
 // registration is the identity store's fact, cross-checked by the dispatcher.
 //
-// Serialization: u16 schema_version envelope; groups sorted by group_id,
-// members sorted by node_id; the retained last-assignment index sorted by
-// node_id; then the slot map as sorted runs. Byte output is deterministic so
-// equal states serialize to equal bytes.
+// Serialization: u16 schema_version envelope; lifecycle, then groups sorted
+// by group_id, members sorted by node_id, retained last-assignment index sorted
+// by node_id, and the slot map as sorted runs. Byte output is deterministic so
+// equal states serialize to equal bytes. Pre-release stores use no migration;
+// an older development data directory must be rebuilt.
 
 #include <array>
 #include <cstdint>
@@ -77,6 +83,35 @@
 #include "keylane/meta/commands.h"
 
 namespace keylane::meta {
+
+inline constexpr std::uint16_t kMetaTopologyStoreFormatVersion = 2;
+inline constexpr std::uint32_t kMaxMetaClusterFailureSummaryBytes = 512;
+
+// Durable lifecycle of the one logical Data cluster owned by a Meta Raft
+// cluster. Runtime readiness is intentionally not represented here.
+enum class MetaClusterLifecycle : std::uint8_t {
+  kUninitialized = 0,
+  kCreating = 1,
+  kCreated = 2,
+  kProvisioningFailed = 3,
+};
+
+enum class MetaClusterTerminalOutcome : std::uint8_t {
+  kNone = 0,
+  kCreated = 1,
+  kProvisioningFailed = 2,
+};
+
+struct MetaClusterLifecycleState {
+  MetaClusterLifecycle state_ = MetaClusterLifecycle::kUninitialized;
+  std::uint64_t revision_ = 0;
+  MetaOperationId root_operation_id_{};
+  std::uint64_t genesis_commit_index_ = 0;
+  MetaClusterTerminalOutcome terminal_outcome_ =
+      MetaClusterTerminalOutcome::kNone;
+  std::string failure_summary_;
+  bool operator==(const MetaClusterLifecycleState&) const = default;
+};
 
 // One member of a group. Query results are sorted by node_id.
 struct MetaGroupMember {
@@ -99,6 +134,18 @@ struct MetaTopologyGroupView {
 
 class MetaTopologyStore {
  public:
+  // Cluster creation has its own revision and never advances topology_epoch.
+  // Exact calls replay as no-ops; Created and ProvisioningFailed are terminal.
+  absl::Status BeginClusterCreate(const MetaOperationId& root_operation_id,
+                                  std::uint64_t genesis_commit_index);
+  absl::Status CompleteClusterCreate(
+      const MetaOperationId& root_operation_id);
+  absl::Status FailClusterCreate(const MetaOperationId& root_operation_id,
+                                 std::string failure_summary);
+  const MetaClusterLifecycleState& ClusterLifecycle() const {
+    return cluster_lifecycle_;
+  }
+
   // Domain-validated apply of the topology commands. Each returns
   // absl::OkStatus() on apply or idempotent accept, and a kDomainReject
   // status otherwise; state is unchanged on rejection.
@@ -176,6 +223,7 @@ class MetaTopologyStore {
   // Slot -> owning group_id; empty string = unassigned.
   std::array<std::string, kMetaSlotCount> slots_;
   std::uint64_t topology_epoch_ = 0;
+  MetaClusterLifecycleState cluster_lifecycle_;
 };
 
 }  // namespace keylane::meta

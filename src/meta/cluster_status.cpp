@@ -16,12 +16,14 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "keylane/meta/topology_store.h"
 #include "keylane/numeric_endpoint.h"
 
 namespace keylane::meta {
 namespace {
 
-constexpr std::uint16_t kWireVersion = 1;
+constexpr std::uint16_t kHeadWireVersion = 1;
+constexpr std::uint16_t kStatusWireVersion = 2;
 constexpr std::size_t kMaxItems = 65'536;
 constexpr std::size_t kMaxString = 64 * 1024;
 constexpr std::size_t kMaxWireReply = 256 * 1024 * 1024;
@@ -172,6 +174,63 @@ absl::StatusOr<std::optional<std::uint64_t>> OptionalU64(Reader& reader) {
   auto value = reader.U64();
   if (!value.ok()) return value.status();
   return std::optional<std::uint64_t>(*value);
+}
+
+bool IsCanonicalOperationId(std::string_view value) {
+  return value.size() == 32 &&
+         std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+           return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+         });
+}
+
+bool IsSafeFailureSummary(std::string_view value) {
+  return !value.empty() &&
+         value.size() <= kMaxMetaClusterFailureSummaryBytes &&
+         std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+           return ch >= 0x20 && ch <= 0x7e;
+         });
+}
+
+absl::Status ValidateClusterLifecycle(const ClusterStatusWireV1& status) {
+  const bool has_identity = status.root_operation_id_.has_value() &&
+                            status.genesis_commit_index_.has_value() &&
+                            *status.genesis_commit_index_ != 0 &&
+                            IsCanonicalOperationId(
+                                *status.root_operation_id_);
+  switch (status.cluster_state_) {
+    case ClusterStateWireV1::kUninitialized:
+    case ClusterStateWireV1::kNonPristine:
+      if (status.lifecycle_revision_ == 0 && !status.root_operation_id_ &&
+          !status.genesis_commit_index_ && !status.cluster_create_phase_ &&
+          !status.provisioning_failure_summary_) {
+        return absl::OkStatus();
+      }
+      break;
+    case ClusterStateWireV1::kCreating:
+      if (status.lifecycle_revision_ == 1 && has_identity &&
+          status.cluster_create_phase_.has_value() &&
+          !status.cluster_create_phase_->empty() &&
+          !status.provisioning_failure_summary_) {
+        return absl::OkStatus();
+      }
+      break;
+    case ClusterStateWireV1::kCreated:
+      if (status.lifecycle_revision_ == 2 && has_identity &&
+          !status.cluster_create_phase_ &&
+          !status.provisioning_failure_summary_) {
+        return absl::OkStatus();
+      }
+      break;
+    case ClusterStateWireV1::kProvisioningFailed:
+      if (status.lifecycle_revision_ == 2 && has_identity &&
+          !status.cluster_create_phase_ &&
+          status.provisioning_failure_summary_.has_value() &&
+          IsSafeFailureSummary(*status.provisioning_failure_summary_)) {
+        return absl::OkStatus();
+      }
+      break;
+  }
+  return absl::InvalidArgumentError("inconsistent cluster lifecycle status");
 }
 
 absl::Status WriteMember(Writer& writer,
@@ -572,6 +631,66 @@ std::string ResultName(ClusterStatusResult result) {
   return "retryable";
 }
 
+std::string_view ClusterStateName(ClusterStateWireV1 state) {
+  switch (state) {
+    case ClusterStateWireV1::kUninitialized:
+      return "uninitialized";
+    case ClusterStateWireV1::kCreating:
+      return "creating";
+    case ClusterStateWireV1::kCreated:
+      return "created";
+    case ClusterStateWireV1::kProvisioningFailed:
+      return "provisioning-failed";
+    case ClusterStateWireV1::kNonPristine:
+      return "non-pristine";
+  }
+  return "unknown";
+}
+
+std::string StatusExplanation(const ClusterStatusOutcome& outcome) {
+  if (!outcome.status_.has_value()) {
+    return "a stable Meta leader status cut was not available";
+  }
+  const auto& status = *outcome.status_;
+  switch (status.cluster_state_) {
+    case ClusterStateWireV1::kUninitialized:
+      return "no ClusterCreate Genesis has been committed";
+    case ClusterStateWireV1::kNonPristine:
+      return "Meta is Uninitialized but contains Data-cluster artifacts";
+    case ClusterStateWireV1::kCreating:
+      return "Genesis is committed and the creation workflow is still running";
+    case ClusterStateWireV1::kCreated:
+      return status.cluster_ready_
+                 ? "creation and current runtime readiness are healthy"
+                 : "creation completed but current runtime readiness is blocked";
+    case ClusterStateWireV1::kProvisioningFailed:
+      return "Genesis committed but deterministic provisioning failed";
+  }
+  return "cluster lifecycle is unknown";
+}
+
+std::string NextAction(const ClusterStatusOutcome& outcome) {
+  if (!outcome.status_.has_value()) {
+    return "retry cluster-status; if this persists, verify Meta quorum and Admin connectivity";
+  }
+  const auto& status = *outcome.status_;
+  switch (status.cluster_state_) {
+    case ClusterStateWireV1::kUninitialized:
+      return "run cluster-create with a validated manifest when ready";
+    case ClusterStateWireV1::kNonPristine:
+      return "do not rerun cluster-create; inspect artifacts and rebuild the Meta data directory";
+    case ClusterStateWireV1::kCreating:
+      return "wait and rerun cluster-status; inspect Meta logs if the phase stops advancing";
+    case ClusterStateWireV1::kCreated:
+      return status.cluster_ready_
+                 ? "none"
+                 : "inspect blockers and Data-node sessions, then rerun cluster-status";
+    case ClusterStateWireV1::kProvisioningFailed:
+      return "do not rerun cluster-create; preserve data and inspect the root operation and Meta logs";
+  }
+  return "inspect Meta logs before taking further action";
+}
+
 std::string LeaseName(ClusterLeaseStatus status) {
   switch (status) {
     case ClusterLeaseStatus::kRecentlyGranted:
@@ -606,7 +725,7 @@ absl::StatusOr<std::string> EncodeClusterHeadReply(
     return status;
   }
   Writer writer;
-  writer.U16(kWireVersion);
+  writer.U16(kHeadWireVersion);
   writer.U32(head.responder_id_);
   writer.U8(static_cast<std::uint8_t>(head.role_));
   writer.U64(head.term_);
@@ -632,7 +751,7 @@ absl::StatusOr<ClusterHeadWireV1> DecodeClusterHeadReply(
   Reader reader(*payload);
   auto version = reader.U16();
   if (!version.ok()) return version.status();
-  if (*version != kWireVersion) {
+  if (*version != kHeadWireVersion) {
     return absl::DataLossError("unsupported clusterhead payload version");
   }
   ClusterHeadWireV1 head;
@@ -714,13 +833,33 @@ absl::StatusOr<std::string> EncodeClusterStatusReply(
   if (absl::Status valid = ValidateStatusIdentity(status); !valid.ok()) {
     return valid;
   }
+  if (absl::Status valid = ValidateClusterLifecycle(status); !valid.ok()) {
+    return valid;
+  }
   Writer writer;
-  writer.U16(kWireVersion);
+  writer.U16(kStatusWireVersion);
   writer.U32(status.capture_.responder_id_);
   writer.U64(status.capture_.term_);
   writer.U64(status.capture_.config_index_);
   writer.U64(status.capture_.committed_index_);
   writer.U64(status.capture_.topology_epoch_);
+  writer.U8(static_cast<std::uint8_t>(status.cluster_state_));
+  writer.U64(status.lifecycle_revision_);
+  if (absl::Status wrote = OptionalString(writer, status.root_operation_id_);
+      !wrote.ok()) {
+    return wrote;
+  }
+  OptionalU64(writer, status.genesis_commit_index_);
+  if (absl::Status wrote =
+          OptionalString(writer, status.cluster_create_phase_);
+      !wrote.ok()) {
+    return wrote;
+  }
+  if (absl::Status wrote =
+          OptionalString(writer, status.provisioning_failure_summary_);
+      !wrote.ok()) {
+    return wrote;
+  }
   writer.Bool(status.meta_available_);
   writer.Bool(status.meta_membership_stable_);
   writer.Bool(status.topology_converged_);
@@ -798,7 +937,7 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
   Reader reader(*payload);
   auto version = reader.U16();
   if (!version.ok()) return version.status();
-  if (*version != kWireVersion) {
+  if (*version != kStatusWireVersion) {
     return absl::DataLossError("unsupported clusterstatus payload version");
   }
   ClusterStatusWireV1 status;
@@ -817,6 +956,28 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
   auto topology = reader.U64();
   if (!topology.ok()) return topology.status();
   status.capture_.topology_epoch_ = *topology;
+  auto cluster_state = reader.U8();
+  if (!cluster_state.ok()) return cluster_state.status();
+  if (*cluster_state >
+      static_cast<std::uint8_t>(ClusterStateWireV1::kNonPristine)) {
+    return absl::DataLossError("invalid cluster lifecycle state");
+  }
+  status.cluster_state_ = static_cast<ClusterStateWireV1>(*cluster_state);
+  auto lifecycle_revision = reader.U64();
+  if (!lifecycle_revision.ok()) return lifecycle_revision.status();
+  status.lifecycle_revision_ = *lifecycle_revision;
+  auto root_operation_id = OptionalString(reader);
+  if (!root_operation_id.ok()) return root_operation_id.status();
+  status.root_operation_id_ = std::move(*root_operation_id);
+  auto genesis_commit_index = OptionalU64(reader);
+  if (!genesis_commit_index.ok()) return genesis_commit_index.status();
+  status.genesis_commit_index_ = *genesis_commit_index;
+  auto cluster_create_phase = OptionalString(reader);
+  if (!cluster_create_phase.ok()) return cluster_create_phase.status();
+  status.cluster_create_phase_ = std::move(*cluster_create_phase);
+  auto failure_summary = OptionalString(reader);
+  if (!failure_summary.ok()) return failure_summary.status();
+  status.provisioning_failure_summary_ = std::move(*failure_summary);
   auto read_bool = [&reader](bool* output) -> absl::Status {
     auto value = reader.Bool();
     if (!value.ok()) return value.status();
@@ -937,6 +1098,9 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
       (status.meta_available_ && status.meta_membership_stable_ &&
        status.topology_converged_ && status.serving_ready_)) {
     return absl::DataLossError("inconsistent cluster readiness");
+  }
+  if (absl::Status valid = ValidateClusterLifecycle(status); !valid.ok()) {
+    return absl::DataLossError(valid.message());
   }
   if (absl::Status valid = ValidateStatusIdentity(status); !valid.ok()) {
     return absl::DataLossError(valid.message());
@@ -1111,11 +1275,30 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
     json += ",\"topology_converged\":false,\"serving_ready\":false";
     json += ",\"cluster_ready\":false,\"capture\":null";
     json += ",\"meta_members\":[],\"data_nodes\":[],\"groups\":[]";
+    json += ",\"cluster_state\":null,\"lifecycle_revision\":null";
+    json += ",\"root_operation_id\":null,\"genesis_commit_index\":null";
+    json += ",\"cluster_create_phase\":null";
+    json += ",\"provisioning_failure_summary\":null";
     json += ",\"slot_ranges\":[],\"blockers\":[],\"retry\":{";
-    json += "\"reason\":" + Quote(outcome.retry_reason_) + "}}";
+    json += "\"reason\":" + Quote(outcome.retry_reason_) + "}";
+    json += ",\"status_explanation\":" + Quote(StatusExplanation(outcome));
+    json += ",\"next_action\":" + Quote(NextAction(outcome)) + "}";
     return json;
   }
   const auto& status = *outcome.status_;
+  if (absl::Status valid = ValidateClusterLifecycle(status); !valid.ok()) {
+    return absl::DataLossError(valid.message());
+  }
+  json += ",\"cluster_state\":" + Quote(ClusterStateName(status.cluster_state_));
+  json += ",\"lifecycle_revision\":" + U64Json(status.lifecycle_revision_);
+  json += ",\"root_operation_id\":" +
+          OptionalStringJson(status.root_operation_id_);
+  json += ",\"genesis_commit_index\":" +
+          OptionalU64Json(status.genesis_commit_index_);
+  json += ",\"cluster_create_phase\":" +
+          OptionalStringJson(status.cluster_create_phase_);
+  json += ",\"provisioning_failure_summary\":" +
+          OptionalStringJson(status.provisioning_failure_summary_);
   json += ",\"meta_available\":" + BoolJson(status.meta_available_);
   json +=
       ",\"meta_membership_stable\":" + BoolJson(status.meta_membership_stable_);
@@ -1216,7 +1399,9 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
     json += ",\"detail\":" + Quote(blockers[ii].detail_) + "}";
   }
   json += "]";
-  json += ",\"retry\":null}";
+  json += ",\"retry\":null";
+  json += ",\"status_explanation\":" + Quote(StatusExplanation(outcome));
+  json += ",\"next_action\":" + Quote(NextAction(outcome)) + "}";
   return json;
 }
 
@@ -1232,12 +1417,32 @@ absl::StatusOr<std::string> RenderClusterStatusText(
       break;
     case ClusterStatusResult::kRetryable:
       text = "RETRYABLE\nreason=" + outcome.retry_reason_ + "\n";
+      text += "status_explanation=" + StatusExplanation(outcome) + "\n";
+      text += "next_action=" + NextAction(outcome) + "\n";
       return text;
   }
   if (!outcome.status_.has_value()) {
     return absl::DataLossError("stable status outcome has no snapshot");
   }
   const auto& status = *outcome.status_;
+  if (absl::Status valid = ValidateClusterLifecycle(status); !valid.ok()) {
+    return absl::DataLossError(valid.message());
+  }
+  text += "cluster_state=" + std::string(ClusterStateName(status.cluster_state_)) +
+          " lifecycle_revision=" +
+          std::to_string(status.lifecycle_revision_) + "\n";
+  if (status.root_operation_id_.has_value()) {
+    text += "root_operation=" + *status.root_operation_id_ +
+            " genesis_commit=" +
+            std::to_string(*status.genesis_commit_index_) + "\n";
+  }
+  if (status.cluster_create_phase_.has_value()) {
+    text += "cluster_create_phase=" + *status.cluster_create_phase_ + "\n";
+  }
+  if (status.provisioning_failure_summary_.has_value()) {
+    text += "provisioning_failure=" +
+            *status.provisioning_failure_summary_ + "\n";
+  }
   text +=
       "meta_available=" + std::string(status.meta_available_ ? "yes" : "no") +
       " membership_stable=" +
@@ -1256,6 +1461,8 @@ absl::StatusOr<std::string> RenderClusterStatusText(
     text += "blocker " + blocker.code_ + " " + blocker.scope_ + " " +
             blocker.detail_ + "\n";
   }
+  text += "status_explanation=" + StatusExplanation(outcome) + "\n";
+  text += "next_action=" + NextAction(outcome) + "\n";
   return text;
 }
 
