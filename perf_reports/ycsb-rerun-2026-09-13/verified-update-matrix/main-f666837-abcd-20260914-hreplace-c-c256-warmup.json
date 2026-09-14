@@ -1,0 +1,156 @@
+{
+  "mode": "hreplace",
+  "workload": "C",
+  "workers": 256,
+  "phase": "warmup",
+  "label": "main-f666837-abcd-20260914",
+  "requested_duration_seconds": 0,
+  "d_insert_start": null,
+  "target_ops_sec": 0,
+  "measurement_interval": "both",
+  "command": [
+    "/mnt/dev/YCSB-hreplace-dist/bin/ycsb",
+    "run",
+    "redis",
+    "-s",
+    "-threads",
+    "256",
+    "-P",
+    "/mnt/dev/YCSB-hreplace-dist/workloads/workloada",
+    "-p",
+    "recordcount=100000000",
+    "-p",
+    "operationcount=1000000",
+    "-p",
+    "fieldcount=10",
+    "-p",
+    "fieldlength=128",
+    "-p",
+    "fieldlengthdistribution=constant",
+    "-p",
+    "readallfields=true",
+    "-p",
+    "writeallfields=true",
+    "-p",
+    "insertorder=hashed",
+    "-p",
+    "requestdistribution=uniform",
+    "-p",
+    "readproportion=1",
+    "-p",
+    "updateproportion=0",
+    "-p",
+    "insertproportion=0",
+    "-p",
+    "scanproportion=0",
+    "-p",
+    "readmodifywriteproportion=0",
+    "-p",
+    "measurementtype=hdrhistogram",
+    "-p",
+    "measurement.interval=both",
+    "-p",
+    "hdrhistogram.percentiles=50,95,99,99.9,99.99",
+    "-p",
+    "status.interval=10",
+    "-p",
+    "redis.host=172.16.0.4",
+    "-p",
+    "redis.port=16379",
+    "-p",
+    "redis.scanindex=none",
+    "-p",
+    "redis.timeout=10000",
+    "-p",
+    "redis.cluster=false",
+    "-p",
+    "redis.updatecommand=keylane.hreplace"
+  ],
+  "start_utc": "2026-09-14T10:30:21Z",
+  "runtime_ms": 3229,
+  "attempted": 1000000,
+  "succeeded": 1000000,
+  "failed": 0,
+  "success_qps": 309693.4035305048,
+  "metrics": {
+    "OVERALL": {
+      "RunTime(ms)": 3229,
+      "Throughput(ops/sec)": 309693.4035305048
+    },
+    "TOTAL_GCS_G1_Young_Generation": {
+      "Count": 17
+    },
+    "TOTAL_GC_TIME_G1_Young_Generation": {
+      "Time(ms)": 34
+    },
+    "TOTAL_GC_TIME_%_G1_Young_Generation": {
+      "Time(%)": 1.0529575720037163
+    },
+    "TOTAL_GCS_G1_Old_Generation": {
+      "Count": 0
+    },
+    "TOTAL_GC_TIME_G1_Old_Generation": {
+      "Time(ms)": 0
+    },
+    "TOTAL_GC_TIME_%_G1_Old_Generation": {
+      "Time(%)": 0.0
+    },
+    "TOTAL_GCs": {
+      "Count": 17
+    },
+    "TOTAL_GC_TIME": {
+      "Time(ms)": 34
+    },
+    "TOTAL_GC_TIME_%": {
+      "Time(%)": 1.0529575720037163
+    },
+    "READ": {
+      "Operations": 1000000,
+      "AverageLatency(us)": 733.223055,
+      "MinLatency(us)": 222,
+      "MaxLatency(us)": 299519,
+      "50thPercentileLatency(us)": 463,
+      "95thPercentileLatency(us)": 2297,
+      "99thPercentileLatency(us)": 3855,
+      "99.9PercentileLatency(us)": 9079,
+      "99.99PercentileLatency(us)": 135423,
+      "Return=OK": 1000000
+    },
+    "CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 33.03125,
+      "MinLatency(us)": 14,
+      "MaxLatency(us)": 812,
+      "50thPercentileLatency(us)": 23,
+      "95thPercentileLatency(us)": 72,
+      "99thPercentileLatency(us)": 117,
+      "99.9PercentileLatency(us)": 812,
+      "99.99PercentileLatency(us)": 812
+    },
+    "Intended-READ": {
+      "Operations": 1000000,
+      "AverageLatency(us)": 733.259358,
+      "MinLatency(us)": 222,
+      "MaxLatency(us)": 299519,
+      "50thPercentileLatency(us)": 463,
+      "95thPercentileLatency(us)": 2297,
+      "99thPercentileLatency(us)": 3855,
+      "99.9PercentileLatency(us)": 9079,
+      "99.99PercentileLatency(us)": 135423
+    },
+    "Intended-CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 33.37109375,
+      "MinLatency(us)": 14,
+      "MaxLatency(us)": 813,
+      "50thPercentileLatency(us)": 24,
+      "95thPercentileLatency(us)": 72,
+      "99thPercentileLatency(us)": 118,
+      "99.9PercentileLatency(us)": 813,
+      "99.99PercentileLatency(us)": 813
+    }
+  },
+  "sha256": "033f39534cf2aca825fc084f1b82cd30e6af922adaa18049e86b5ccb79126033",
+  "exit_code": 0,
+  "end_utc": "2026-09-14T10:30:25Z"
+}

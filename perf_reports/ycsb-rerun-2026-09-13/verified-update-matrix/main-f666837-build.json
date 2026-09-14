@@ -1,0 +1,40 @@
+{
+  "main_commit": "f666837b0038ab65564a17cb3a0bca8530f8e1be",
+  "parent_main_commit": "b0606c57380a93fffd93f3c45de4403fb6b148a0",
+  "build_checkout_commit": "1b6c0d3b605cc0c8ffb9c1da4e134a269a747e69",
+  "source_equality_check": "git diff main HEAD -- . ':!perf_reports' returned no differences; tracked production worktree was clean",
+  "published_scope": [
+    "include/keylane/storage/scan_hash_map.h",
+    "src/storage/engine/defrag.cpp",
+    "tests/scan_hash_map_test.cpp"
+  ],
+  "report_not_pushed_with_code": true,
+  "binary": "/mnt/dev/keylane-main-f666837.siARSe/keylane",
+  "sha256": "9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266",
+  "configuration": {
+    "compiler": "/usr/bin/c++",
+    "build_type": "Release",
+    "KEYLANE_ENABLE_OPT": true,
+    "KEYLANE_MARCH": "native",
+    "KEYLANE_WITH_SPDK": false,
+    "KEYLANE_STATIC_CXX_RUNTIME": true,
+    "KEYLANE_STATIC_OPENSSL": true,
+    "KEYLANE_BUILD_FAULT_SERVER": false,
+    "KEYLANE_BUILD_META": true,
+    "KEYLANE_ENABLE_READ_LATENCY_TRACE": false,
+    "KEYLANE_ENABLE_SET_LATENCY_TRACE": false
+  },
+  "validation": {
+    "focused_unit_tests": {"passed": 56, "xml": "main-f666837-unit-tests.xml"},
+    "hash_string_extent_gc_tests": {"passed": 4, "xml": "main-f666837-hash-gc-tests.xml"},
+    "ttl_e2e": {"passed": 1, "xml": "main-f666837-ttl-tests.xml"},
+    "full_suite_rerun": false,
+    "clang_format_23_1": "unavailable; git diff --check passed"
+  },
+  "client_artifacts": {
+    "rechecked_on_client": "172.16.0.5",
+    "matches": "client-artifacts.json",
+    "changed_files": [],
+    "YCSB_PR_branch_modified": false
+  }
+}

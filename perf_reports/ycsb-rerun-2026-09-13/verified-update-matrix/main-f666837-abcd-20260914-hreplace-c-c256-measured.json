@@ -1,0 +1,158 @@
+{
+  "mode": "hreplace",
+  "workload": "C",
+  "workers": 256,
+  "phase": "measured",
+  "label": "main-f666837-abcd-20260914",
+  "requested_duration_seconds": 300,
+  "d_insert_start": null,
+  "target_ops_sec": 0,
+  "measurement_interval": "both",
+  "command": [
+    "/mnt/dev/YCSB-hreplace-dist/bin/ycsb",
+    "run",
+    "redis",
+    "-s",
+    "-threads",
+    "256",
+    "-P",
+    "/mnt/dev/YCSB-hreplace-dist/workloads/workloada",
+    "-p",
+    "recordcount=100000000",
+    "-p",
+    "operationcount=2000000000",
+    "-p",
+    "fieldcount=10",
+    "-p",
+    "fieldlength=128",
+    "-p",
+    "fieldlengthdistribution=constant",
+    "-p",
+    "readallfields=true",
+    "-p",
+    "writeallfields=true",
+    "-p",
+    "insertorder=hashed",
+    "-p",
+    "requestdistribution=uniform",
+    "-p",
+    "readproportion=1",
+    "-p",
+    "updateproportion=0",
+    "-p",
+    "insertproportion=0",
+    "-p",
+    "scanproportion=0",
+    "-p",
+    "readmodifywriteproportion=0",
+    "-p",
+    "measurementtype=hdrhistogram",
+    "-p",
+    "measurement.interval=both",
+    "-p",
+    "hdrhistogram.percentiles=50,95,99,99.9,99.99",
+    "-p",
+    "status.interval=10",
+    "-p",
+    "maxexecutiontime=300",
+    "-p",
+    "redis.host=172.16.0.4",
+    "-p",
+    "redis.port=16379",
+    "-p",
+    "redis.scanindex=none",
+    "-p",
+    "redis.timeout=10000",
+    "-p",
+    "redis.cluster=false",
+    "-p",
+    "redis.updatecommand=keylane.hreplace"
+  ],
+  "start_utc": "2026-09-14T10:30:25Z",
+  "runtime_ms": 300055,
+  "attempted": 164008948,
+  "succeeded": 164008948,
+  "failed": 0,
+  "success_qps": 546596.2840145973,
+  "metrics": {
+    "OVERALL": {
+      "RunTime(ms)": 300055,
+      "Throughput(ops/sec)": 546596.2840145973
+    },
+    "TOTAL_GCS_G1_Young_Generation": {
+      "Count": 2354
+    },
+    "TOTAL_GC_TIME_G1_Young_Generation": {
+      "Time(ms)": 1856
+    },
+    "TOTAL_GC_TIME_%_G1_Young_Generation": {
+      "Time(%)": 0.618553265234707
+    },
+    "TOTAL_GCS_G1_Old_Generation": {
+      "Count": 0
+    },
+    "TOTAL_GC_TIME_G1_Old_Generation": {
+      "Time(ms)": 0
+    },
+    "TOTAL_GC_TIME_%_G1_Old_Generation": {
+      "Time(%)": 0.0
+    },
+    "TOTAL_GCs": {
+      "Count": 2354
+    },
+    "TOTAL_GC_TIME": {
+      "Time(ms)": 1856
+    },
+    "TOTAL_GC_TIME_%": {
+      "Time(%)": 0.618553265234707
+    },
+    "READ": {
+      "Operations": 164008948,
+      "AverageLatency(us)": 466.624854809751,
+      "MinLatency(us)": 212,
+      "MaxLatency(us)": 53951,
+      "50thPercentileLatency(us)": 450,
+      "95thPercentileLatency(us)": 622,
+      "99thPercentileLatency(us)": 759,
+      "99.9PercentileLatency(us)": 2545,
+      "99.99PercentileLatency(us)": 3957,
+      "Return=OK": 164008948
+    },
+    "CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 5186.65234375,
+      "MinLatency(us)": 2290,
+      "MaxLatency(us)": 8759,
+      "50thPercentileLatency(us)": 5215,
+      "95thPercentileLatency(us)": 8139,
+      "99thPercentileLatency(us)": 8463,
+      "99.9PercentileLatency(us)": 8759,
+      "99.99PercentileLatency(us)": 8759
+    },
+    "Intended-READ": {
+      "Operations": 164008948,
+      "AverageLatency(us)": 466.66100475810623,
+      "MinLatency(us)": 212,
+      "MaxLatency(us)": 53951,
+      "50thPercentileLatency(us)": 450,
+      "95thPercentileLatency(us)": 622,
+      "99thPercentileLatency(us)": 759,
+      "99.9PercentileLatency(us)": 2545,
+      "99.99PercentileLatency(us)": 3957
+    },
+    "Intended-CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 5186.71484375,
+      "MinLatency(us)": 2290,
+      "MaxLatency(us)": 8759,
+      "50thPercentileLatency(us)": 5215,
+      "95thPercentileLatency(us)": 8139,
+      "99thPercentileLatency(us)": 8463,
+      "99.9PercentileLatency(us)": 8759,
+      "99.99PercentileLatency(us)": 8759
+    }
+  },
+  "sha256": "9bf5cc2f8e69c57ac961ff74c8f07f5b7746b09a915a2e071720b8067e45c232",
+  "exit_code": 0,
+  "end_utc": "2026-09-14T10:35:26Z"
+}

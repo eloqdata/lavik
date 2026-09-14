@@ -1,0 +1,140 @@
+{
+  "command": [
+    "sudo",
+    "-n",
+    "systemd-run",
+    "--unit",
+    "keylane-ycsb-cpu12.service",
+    "--collect",
+    "--slice=keylane-bench.slice",
+    "-p",
+    "AllowedCPUs=0-11",
+    "-p",
+    "CPUAffinity=0-11",
+    "-p",
+    "LimitNOFILE=20000",
+    "-p",
+    "TimeoutStopSec=180",
+    "-p",
+    "KillSignal=SIGTERM",
+    "-p",
+    "StandardOutput=append:/mnt/dev/keylane/perf_reports/ycsb-rerun-2026-09-13/verified-update-matrix/main-f666837-abcd-20260914-server.stdout",
+    "-p",
+    "StandardError=inherit",
+    "/usr/bin/taskset",
+    "-c",
+    "0-11",
+    "/mnt/dev/keylane-main-f666837.siARSe/keylane",
+    "--bind",
+    "172.16.0.4",
+    "--port",
+    "16379",
+    "--metrics-port",
+    "19100",
+    "--threads",
+    "12",
+    "--pin-workers",
+    "--shutdown-checkpoint",
+    "--log-dir",
+    "/mnt/dev/keylane-md0-keylane",
+    "--data-file",
+    "/dev/md0p1"
+  ],
+  "utc": "2026-09-14T10:25:09Z",
+  "server": {
+    "pid": 149966,
+    "binary": "/mnt/dev/keylane-main-f666837.siARSe/keylane",
+    "sha256": "9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266",
+    "dbsize": 100000000,
+    "defrag": "paused=0 max_active_per_device=8 block_sleep_ms=0 record_sleep_us=0 active_total=0 pending_total=0",
+    "affinities": {
+      "149966": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "149971": [
+        0
+      ],
+      "149972": [
+        1
+      ],
+      "149973": [
+        2
+      ],
+      "149974": [
+        3
+      ],
+      "149975": [
+        4
+      ],
+      "149976": [
+        5
+      ],
+      "149977": [
+        6
+      ],
+      "149978": [
+        7
+      ],
+      "149979": [
+        8
+      ],
+      "149980": [
+        9
+      ],
+      "149981": [
+        10
+      ],
+      "149982": [
+        11
+      ],
+      "149983": [
+        0
+      ],
+      "149984": [
+        3
+      ],
+      "149985": [
+        1
+      ],
+      "149986": [
+        7
+      ],
+      "149987": [
+        8
+      ],
+      "149988": [
+        10
+      ],
+      "149989": [
+        2
+      ],
+      "149990": [
+        6
+      ],
+      "149991": [
+        11
+      ],
+      "149992": [
+        9
+      ],
+      "149993": [
+        5
+      ],
+      "149994": [
+        4
+      ]
+    },
+    "cgroup": "0::/keylane.slice/keylane-bench.slice/keylane-ycsb-cpu12.service"
+  }
+}

@@ -3,8 +3,9 @@
 
 The preloaded first 100M keys are retained. No load/delete/partitioning is
 performed. D inserts into disjoint fresh ranges without changing the Uniform
-read range. A separate 1M-operation JVM warms server state before each 5M
-measurement; measured JVM startup/JIT remains part of the bounded experiment.
+read range. A separate 1M-operation JVM warms server state before each count-
+bounded (default 5M) or explicitly timed measurement. Every phase uses a new
+JVM; latency and runtime are retained exactly as reported by YCSB.
 """
 import hashlib
 import json
@@ -102,7 +103,12 @@ def snapshot(mode, path):
     path.write_text(execute(args, capture_output=True).stdout)
 
 
-def parse(path, expected):
+def parse(path, expected, *, duration_seconds=0):
+    """Validate a count-bounded run or a YCSB-terminated timed measurement.
+
+    Timed runs must reach the timer and emit complete final counters; a killed
+    client or an operation-cap exit must not masquerade as a five-minute run.
+    """
     text = path.read_text()
     values = {}
     for line in text.splitlines():
@@ -119,8 +125,11 @@ def parse(path, expected):
     attempted = sum(v for fields in operations.values() for k, v in fields.items() if k.startswith("Return="))
     succeeded = sum(fields.get("Return=OK", 0) for fields in operations.values())
     errors = attempted - succeeded
-    if runtime <= 0 or attempted != expected:
+    if runtime <= 0 or attempted <= 0 or (expected is not None and attempted != expected):
         raise RuntimeError(f"Incomplete run {path}: runtime={runtime}, attempted={attempted}")
+    if duration_seconds and (runtime < duration_seconds * 1000 or
+                             "Maximum time elapsed. Requesting stop for the workload." not in text):
+        raise RuntimeError(f"Timed run did not reach its YCSB timer: {path}")
     if any(op not in ("READ", "UPDATE", "INSERT") for op in operations):
         raise RuntimeError(f"Unexpected operation in A/B/C/D matrix: {path}")
     for fields in operations.values():
@@ -134,14 +143,26 @@ def parse(path, expected):
             "metrics": values, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-def run(mode, workload, workers, phase, *, target=0, measurement_interval="op", label=""):
+def run(mode, workload, workers, phase, *, target=0, measurement_interval="op", label="",
+        duration_seconds=0, d_insert_start=None):
+    """Run one cell; timed measurements use a non-binding 2B operation cap."""
+    if duration_seconds < 0 or (duration_seconds and phase != "measured"):
+        raise ValueError("Only formal measurements may use a positive time limit")
+    if d_insert_start is not None and (workload != "D" or d_insert_start < 100_000_000):
+        raise ValueError("An explicit transaction insert range is only valid for D")
+    operation_count = 2_000_000_000 if duration_seconds else COUNTS[phase]
+    expected = None if duration_seconds else operation_count
     rate_suffix = f"-target{target}" if target else ""
     prefix = f"{label}-" if label else ""
     name = f"{prefix}{mode}-{workload.lower()}-c{workers}{rate_suffix}-{phase}"
     saved_path = ROOT / f"{name}.json"
     if saved_path.exists():
         saved = json.loads(saved_path.read_text())
-        checked = parse(ROOT / f"{name}.log", COUNTS[phase])
+        checked = parse(ROOT / f"{name}.log", expected, duration_seconds=duration_seconds)
+        if saved.get("requested_duration_seconds", 0) != duration_seconds:
+            raise RuntimeError(f"Saved receipt has a different measurement duration: {name}")
+        if saved.get("d_insert_start") != d_insert_start:
+            raise RuntimeError(f"Saved receipt has a different D insert range: {name}")
         if saved.get("exit_code") != 0 or any(saved[k] != v for k, v in checked.items()):
             raise RuntimeError(f"Invalid saved receipt: {name}")
         print(f"REUSE {name} qps={saved['success_qps']:.0f} errors={saved['failed']}", flush=True)
@@ -149,13 +170,15 @@ def run(mode, workload, workers, phase, *, target=0, measurement_interval="op", 
     dist = "/mnt/dev/YCSB-aerospike-dist" if mode == "aerospike" else "/mnt/dev/YCSB-hreplace-dist"
     binding = "aerospike" if mode == "aerospike" else "redis"
     read, update, insert = WORKLOADS[workload]
-    props = {"recordcount": 100_000_000, "operationcount": COUNTS[phase],
+    props = {"recordcount": 100_000_000, "operationcount": operation_count,
              "fieldcount": 10, "fieldlength": 128, "fieldlengthdistribution": "constant",
              "readallfields": "true", "writeallfields": "true", "insertorder": "hashed",
              "requestdistribution": "uniform", "readproportion": read, "updateproportion": update,
              "insertproportion": insert, "scanproportion": 0, "readmodifywriteproportion": 0,
              "measurementtype": "hdrhistogram", "measurement.interval": measurement_interval,
              "hdrhistogram.percentiles": "50,95,99,99.9,99.99", "status.interval": 10}
+    if duration_seconds:
+        props["maxexecutiontime"] = duration_seconds
     if workload == "D":
         # CoreWorkload starts transaction inserts at recordcount; insertstart
         # and insertcount separately bound the Uniform read chooser. Distinct
@@ -163,6 +186,11 @@ def run(mode, workload, workers, phase, *, target=0, measurement_interval="op", 
         props.update({"recordcount": 200_000_000 + (20_000_000 if mode == "hreplace" else 0)
                       + (10_000_000 if phase == "measured" else 0),
                       "insertstart": 0, "insertcount": 100_000_000})
+        # A rerun must explicitly reserve fresh transaction IDs. The historical
+        # defaults above are retained only to reproduce historical receipts;
+        # reusing them would turn inserts into overwrites or CREATE_ONLY errors.
+        if d_insert_start is not None:
+            props["recordcount"] = d_insert_start
     if mode == "aerospike":
         props.update({"as.host": SERVER, "as.port": 3000, "as.namespace": "ycsb", "as.timeout": 10000})
     else:
@@ -177,6 +205,8 @@ def run(mode, workload, workers, phase, *, target=0, measurement_interval="op", 
         args += ["-p", f"{key}={value}"]
     receipt = {"mode": mode, "workload": workload, "workers": workers, "phase": phase,
                "label": label,
+               "requested_duration_seconds": duration_seconds,
+               "d_insert_start": d_insert_start,
                "target_ops_sec": target, "measurement_interval": measurement_interval,
                "command": args, "start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     (ROOT / f"{name}.command.json").write_text(json.dumps(receipt, indent=2) + "\n")
@@ -184,8 +214,8 @@ def run(mode, workload, workers, phase, *, target=0, measurement_interval="op", 
     snapshot(mode, ROOT / f"{name}.before.txt")
     with (ROOT / f"{name}.log").open("w") as output:
         process = subprocess.run(["ssh", CLIENT, shlex.join(args)], stdout=output,
-                                 stderr=subprocess.STDOUT, timeout=600)
-    receipt.update(parse(ROOT / f"{name}.log", COUNTS[phase]))
+                                 stderr=subprocess.STDOUT, timeout=max(600, duration_seconds + 120))
+    receipt.update(parse(ROOT / f"{name}.log", expected, duration_seconds=duration_seconds))
     receipt["exit_code"] = process.returncode
     receipt["end_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     snapshot(mode, ROOT / f"{name}.after.txt")

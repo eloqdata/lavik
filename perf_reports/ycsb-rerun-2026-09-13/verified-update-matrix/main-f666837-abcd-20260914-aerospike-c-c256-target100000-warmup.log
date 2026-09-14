@@ -1,0 +1,58 @@
+java -cp /mnt/dev/YCSB-aerospike-dist/aerospike-binding/conf:/mnt/dev/YCSB-aerospike-dist/conf:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-client-3.1.2.jar:/mnt/dev/YCSB-aerospike-dist/lib/htrace-core4-4.1.0-incubating.jar:/mnt/dev/YCSB-aerospike-dist/lib/jbcrypt-0.3m.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-mapper-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-binding-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/HdrHistogram-2.1.12.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-core-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/core-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/luaj-jse-3.0.jar:/mnt/dev/YCSB-aerospike-dist/lib/gnu-crypto-2.0.1.jar site.ycsb.Client -db site.ycsb.db.AerospikeClient -s -threads 256 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -target 100000 -p recordcount=100000000 -p operationcount=1000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=1 -p updateproportion=0 -p insertproportion=0 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=both -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000 -t
+Command line: -db site.ycsb.db.AerospikeClient -s -threads 256 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -target 100000 -p recordcount=100000000 -p operationcount=1000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=1 -p updateproportion=0 -p insertproportion=0 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=both -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+2026-09-14 11:12:39:271 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-09-14 11:12:49:230 10 sec: 978642 operations; 97864.2 current ops/sec; est completion in 1 second [READ: Count=978710, Max=79167, Min=172, Avg=308.59, 50=286, 90=371, 99=490, 99.9=1069, 99.99=29743] [Intended-READ: Count=979232, Max=144127, Min=223, Avg=534.4, 50=346, 90=433, 99=623, 99.9=55359, 99.99=110847] 
+2026-09-14 11:12:49:508 10 sec: 1000000 operations; 76827.34 current ops/sec; [READ: Count=21290, Max=1811, Min=210, Avg=294.52, 50=282, 90=359, 99=454, 99.9=540, 99.99=1082] [CLEANUP: Count=256, Max=351, Min=20, Avg=40.74, 50=33, 90=59, 99=180, 99.9=351, 99.99=351] [Intended-READ: Count=20768, Max=2475, Min=234, Avg=352.03, 50=341, 90=419, 99=512, 99.9=614, 99.99=1764] [Intended-CLEANUP: Count=256, Max=352, Min=20, Avg=40.98, 50=33, 90=60, 99=181, 99.9=352, 99.99=352] 
+[OVERALL], RunTime(ms), 10278
+[OVERALL], Throughput(ops/sec), 97295.1936174353
+[TOTAL_GCS_G1_Young_Generation], Count, 16
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 22
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.21404942595835766
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 16
+[TOTAL_GC_TIME], Time(ms), 22
+[TOTAL_GC_TIME_%], Time(%), 0.21404942595835766
+[READ], Operations, 1000000
+[READ], AverageLatency(us), 308.288323
+[READ], MinLatency(us), 172
+[READ], MaxLatency(us), 79167
+[READ], 50thPercentileLatency(us), 286
+[READ], 95thPercentileLatency(us), 406
+[READ], 99thPercentileLatency(us), 489
+[READ], 99.9PercentileLatency(us), 1044
+[READ], 99.99PercentileLatency(us), 29471
+[READ], Return=OK, 1000000
+[CLEANUP], Operations, 256
+[CLEANUP], AverageLatency(us), 40.7421875
+[CLEANUP], MinLatency(us), 20
+[CLEANUP], MaxLatency(us), 351
+[CLEANUP], 50thPercentileLatency(us), 33
+[CLEANUP], 95thPercentileLatency(us), 83
+[CLEANUP], 99thPercentileLatency(us), 180
+[CLEANUP], 99.9PercentileLatency(us), 351
+[CLEANUP], 99.99PercentileLatency(us), 351
+[Intended-READ], Operations, 1000000
+[Intended-READ], AverageLatency(us), 530.610496
+[Intended-READ], MinLatency(us), 223
+[Intended-READ], MaxLatency(us), 144127
+[Intended-READ], 50thPercentileLatency(us), 345
+[Intended-READ], 95thPercentileLatency(us), 471
+[Intended-READ], 99thPercentileLatency(us), 617
+[Intended-READ], 99.9PercentileLatency(us), 54847
+[Intended-READ], 99.99PercentileLatency(us), 110143
+[Intended-CLEANUP], Operations, 256
+[Intended-CLEANUP], AverageLatency(us), 40.98046875
+[Intended-CLEANUP], MinLatency(us), 20
+[Intended-CLEANUP], MaxLatency(us), 352
+[Intended-CLEANUP], 50thPercentileLatency(us), 33
+[Intended-CLEANUP], 95thPercentileLatency(us), 83
+[Intended-CLEANUP], 99thPercentileLatency(us), 181
+[Intended-CLEANUP], 99.9PercentileLatency(us), 352
+[Intended-CLEANUP], 99.99PercentileLatency(us), 352

@@ -1,0 +1,24 @@
+{
+  "observed_utc": "2026-09-14T03:42:34Z",
+  "client": "172.16.0.5",
+  "note": "Read-only artifact inventory during Aerospike recovery, outside scored windows. Local source HEAD is contextual evidence; artifact hashes identify the actual client jars.",
+  "local_ycsb_hreplace_source": {
+    "path": "/mnt/dev/YCSB-hreplace",
+    "commit": "a47bf01c4f197d2ff2eecbbebd9743da5a1cae47",
+    "tracked_worktree_clean": true
+  },
+  "sha256": {
+    "/mnt/dev/YCSB-hreplace-dist/lib/core-0.18.0-SNAPSHOT.jar": "b110f2bb5e6e1efa88166b46d9289588b0a6522e0a21a7c539694f09523bca4e",
+    "/mnt/dev/YCSB-hreplace-dist/lib/redis-binding-0.18.0-SNAPSHOT.jar": "1c730e7c6c044f3bcd70010c7127e99bb462f8a3f83085b97c7b152e23b40d45",
+    "/mnt/dev/YCSB-hreplace-dist/lib/jedis-3.9.0.jar": "6e2d300c31fccd2be59dbf21d3308348413ba6e2b3b1f21a1c08bb635f1ad14a",
+    "/mnt/dev/YCSB-aerospike-dist/lib/core-0.18.0-SNAPSHOT.jar": "6a38a159a1fb67b345a82015e4c8d50aa797bf6015ade84ff0c8647f995f2e25",
+    "/mnt/dev/YCSB-aerospike-dist/lib/aerospike-binding-0.18.0-SNAPSHOT.jar": "dcaeedfb02bc6e4644e8eb16d8885c5f129585fb751e7142ca10d6ddf880627e",
+    "/mnt/dev/YCSB-aerospike-dist/lib/aerospike-client-3.1.2.jar": "5a01832a8c415d2430bc1d0cba6d5e7c3601537b8b7370e161195b916e2b4206"
+  },
+  "core_bytecode_comparison": {
+    "class_counts": [75, 75],
+    "differing_classes": [],
+    "class_manifest_sha256": "7a8493dea2f18f407860d7cb9b003e9207a4c8bb198ad0cac44ab8c016752c59",
+    "method": "SHA256 each .class entry; compare both name-to-hash maps. Manifest digest uses Python json.dumps(map, sort_keys=True). Jar package hashes can differ despite identical class bytes."
+  }
+}

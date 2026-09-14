@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="4" failures="0" disabled="0" errors="0" time="12.268" timestamp="2026-09-14T10:24:32.760" name="AllTests">
+  <testsuite name="LargeHashDurabilityE2eTest" tests="1" failures="0" disabled="0" skipped="0" errors="0" time="3.462" timestamp="2026-09-14T10:24:32.760">
+    <testcase name="RepeatedExtentReplacementReclaimsBoundedStorage" file="/mnt/dev/keylane/tests/list_e2e_test.cpp" line="6261" status="run" result="completed" time="3.462" timestamp="2026-09-14T10:24:32.760" classname="LargeHashDurabilityE2eTest" />
+  </testsuite>
+  <testsuite name="HashE2eTest" tests="2" failures="0" disabled="0" skipped="0" errors="0" time="8.114" timestamp="2026-09-14T10:24:36.223">
+    <testcase name="UpdatesTransactionsAndRecoversMonolithicValues" file="/mnt/dev/keylane/tests/list_e2e_test.cpp" line="6473" status="run" result="completed" time="0.872" timestamp="2026-09-14T10:24:36.223" classname="HashE2eTest" />
+    <testcase name="ExpiredShieldedWinnerDoesNotResurrectOlderString" file="/mnt/dev/keylane/tests/list_e2e_test.cpp" line="6858" status="run" result="completed" time="7.242" timestamp="2026-09-14T10:24:37.096" classname="HashE2eTest" />
+  </testsuite>
+  <testsuite name="CollectionE2eTest" tests="1" failures="0" disabled="0" skipped="0" errors="0" time="0.69" timestamp="2026-09-14T10:24:44.338">
+    <testcase name="StringCommandsRecover" file="/mnt/dev/keylane/tests/list_e2e_test.cpp" line="8201" status="run" result="completed" time="0.69" timestamp="2026-09-14T10:24:44.338" classname="CollectionE2eTest" />
+  </testsuite>
+</testsuites>

@@ -1,0 +1,181 @@
+{
+  "mode": "aerospike",
+  "workload": "D",
+  "workers": 256,
+  "phase": "measured",
+  "label": "main-f666837-abcd-20260914",
+  "requested_duration_seconds": 300,
+  "d_insert_start": 16000000000,
+  "target_ops_sec": 0,
+  "measurement_interval": "both",
+  "command": [
+    "/mnt/dev/YCSB-aerospike-dist/bin/ycsb",
+    "run",
+    "aerospike",
+    "-s",
+    "-threads",
+    "256",
+    "-P",
+    "/mnt/dev/YCSB-aerospike-dist/workloads/workloada",
+    "-p",
+    "recordcount=16000000000",
+    "-p",
+    "operationcount=2000000000",
+    "-p",
+    "fieldcount=10",
+    "-p",
+    "fieldlength=128",
+    "-p",
+    "fieldlengthdistribution=constant",
+    "-p",
+    "readallfields=true",
+    "-p",
+    "writeallfields=true",
+    "-p",
+    "insertorder=hashed",
+    "-p",
+    "requestdistribution=uniform",
+    "-p",
+    "readproportion=0.95",
+    "-p",
+    "updateproportion=0",
+    "-p",
+    "insertproportion=0.05",
+    "-p",
+    "scanproportion=0",
+    "-p",
+    "readmodifywriteproportion=0",
+    "-p",
+    "measurementtype=hdrhistogram",
+    "-p",
+    "measurement.interval=both",
+    "-p",
+    "hdrhistogram.percentiles=50,95,99,99.9,99.99",
+    "-p",
+    "status.interval=10",
+    "-p",
+    "maxexecutiontime=300",
+    "-p",
+    "insertstart=0",
+    "-p",
+    "insertcount=100000000",
+    "-p",
+    "as.host=172.16.0.4",
+    "-p",
+    "as.port=3000",
+    "-p",
+    "as.namespace=ycsb",
+    "-p",
+    "as.timeout=10000"
+  ],
+  "start_utc": "2026-09-14T11:49:12Z",
+  "runtime_ms": 300034,
+  "attempted": 123753502,
+  "succeeded": 123753502,
+  "failed": 0,
+  "success_qps": 412464.9273082384,
+  "metrics": {
+    "OVERALL": {
+      "RunTime(ms)": 300034,
+      "Throughput(ops/sec)": 412464.9273082384
+    },
+    "TOTAL_GCS_G1_Young_Generation": {
+      "Count": 1122
+    },
+    "TOTAL_GC_TIME_G1_Young_Generation": {
+      "Time(ms)": 1220
+    },
+    "TOTAL_GC_TIME_%_G1_Young_Generation": {
+      "Time(%)": 0.4066205830005933
+    },
+    "TOTAL_GCS_G1_Old_Generation": {
+      "Count": 0
+    },
+    "TOTAL_GC_TIME_G1_Old_Generation": {
+      "Time(ms)": 0
+    },
+    "TOTAL_GC_TIME_%_G1_Old_Generation": {
+      "Time(%)": 0.0
+    },
+    "TOTAL_GCs": {
+      "Count": 1122
+    },
+    "TOTAL_GC_TIME": {
+      "Time(ms)": 1220
+    },
+    "TOTAL_GC_TIME_%": {
+      "Time(%)": 0.4066205830005933
+    },
+    "READ": {
+      "Operations": 117560621,
+      "AverageLatency(us)": 624.2185745344098,
+      "MinLatency(us)": 177,
+      "MaxLatency(us)": 217983,
+      "50thPercentileLatency(us)": 436,
+      "95thPercentileLatency(us)": 974,
+      "99thPercentileLatency(us)": 5551,
+      "99.9PercentileLatency(us)": 14495,
+      "99.99PercentileLatency(us)": 27055,
+      "Return=OK": 117560621
+    },
+    "CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 236.28125,
+      "MinLatency(us)": 27,
+      "MaxLatency(us)": 4899,
+      "50thPercentileLatency(us)": 41,
+      "95thPercentileLatency(us)": 1569,
+      "99thPercentileLatency(us)": 4079,
+      "99.9PercentileLatency(us)": 4899,
+      "99.99PercentileLatency(us)": 4899
+    },
+    "INSERT": {
+      "Operations": 6192881,
+      "AverageLatency(us)": 510.9142675275046,
+      "MinLatency(us)": 157,
+      "MaxLatency(us)": 85631,
+      "50thPercentileLatency(us)": 340,
+      "95thPercentileLatency(us)": 835,
+      "99thPercentileLatency(us)": 4943,
+      "99.9PercentileLatency(us)": 13551,
+      "99.99PercentileLatency(us)": 26127,
+      "Return=OK": 6192881
+    },
+    "Intended-READ": {
+      "Operations": 117560621,
+      "AverageLatency(us)": 624.2516161087649,
+      "MinLatency(us)": 177,
+      "MaxLatency(us)": 217983,
+      "50thPercentileLatency(us)": 436,
+      "95thPercentileLatency(us)": 974,
+      "99thPercentileLatency(us)": 5551,
+      "99.9PercentileLatency(us)": 14495,
+      "99.99PercentileLatency(us)": 27055
+    },
+    "Intended-CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 236.45703125,
+      "MinLatency(us)": 28,
+      "MaxLatency(us)": 4899,
+      "50thPercentileLatency(us)": 42,
+      "95thPercentileLatency(us)": 1570,
+      "99thPercentileLatency(us)": 4079,
+      "99.9PercentileLatency(us)": 4899,
+      "99.99PercentileLatency(us)": 4899
+    },
+    "Intended-INSERT": {
+      "Operations": 6192881,
+      "AverageLatency(us)": 510.94727058375577,
+      "MinLatency(us)": 157,
+      "MaxLatency(us)": 85631,
+      "50thPercentileLatency(us)": 340,
+      "95thPercentileLatency(us)": 835,
+      "99thPercentileLatency(us)": 4943,
+      "99.9PercentileLatency(us)": 13551,
+      "99.99PercentileLatency(us)": 26127
+    }
+  },
+  "sha256": "f5671f2c2fe9b0ee000c144bc8529b70722d40da6f595e78a86f75dc30f59eeb",
+  "exit_code": 0,
+  "end_utc": "2026-09-14T11:54:13Z"
+}
