@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -54,6 +55,15 @@ bool WaitUntil(const std::function<bool()>& predicate,
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   return predicate();
+}
+
+std::unique_ptr<const meta::MetaStores> StoresSnapshotOnHeap(
+    const meta::MetaStateMachine& machine) {
+  // These lifecycle tests retain several large snapshots. Direct initialization
+  // elides the return-value copy into heap storage; make_unique would first
+  // materialize a large stack temporary for its forwarding argument.
+  return std::unique_ptr<const meta::MetaStores>(
+      new const meta::MetaStores(machine.StoresSnapshot()));
 }
 
 struct Fixture {
@@ -1832,7 +1842,8 @@ TEST(MetaFailoverReconcilerPlannerTest,
 
 TEST(MetaFailoverReconcilerLifecycleTest,
      LostProposalReplyIsRecoveredFromCommittedTransitionAndCancellationJoins) {
-  Fixture fixture;
+  auto fixture_owner = std::make_unique<Fixture>();
+  Fixture& fixture = *fixture_owner;
   fixture.SubmitControlled();
 
   const std::filesystem::path test_dir =
@@ -1934,7 +1945,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
       [&] { return clock_calls.load(std::memory_order_acquire) >= 2; },
       std::chrono::seconds(2)));
 
-  const meta::MetaStores current = machine->StoresSnapshot();
+  const auto current_owner = StoresSnapshotOnHeap(*machine);
+  const meta::MetaStores& current = *current_owner;
   meta::MetaStoresFacts facts(current);
   const meta::MetaObservationIdentity owner_identity{fixture.owner,
                                                      fixture.owner_boot, 1};
@@ -2004,7 +2016,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
 
 TEST(MetaFailoverReconcilerLifecycleTest,
      LostCutoverReplyConvergesFromCommittedControlledCommit) {
-  Fixture fixture;
+  auto fixture_owner = std::make_unique<Fixture>();
+  Fixture& fixture = *fixture_owner;
   fixture.SubmitControlled();
 
   const std::filesystem::path test_dir =
@@ -2068,7 +2081,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   ASSERT_TRUE(
       observations.AdoptSession(candidate_identity, 999, Bytes<20>(0x43)).ok());
 
-  const meta::MetaStores submitted = machine->StoresSnapshot();
+  const auto submitted_owner = StoresSnapshotOnHeap(*machine);
+  const meta::MetaStores& submitted = *submitted_owner;
   const meta::MetaStoresFacts submitted_facts(submitted);
   auto owner_result = observations.ReplaceHeartbeat(
       owner_identity,
@@ -2096,7 +2110,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   ASSERT_NE(std::get_if<meta::BeginControlledFailover>(&**begin), nullptr);
   commit(**begin);
 
-  const meta::MetaStores begun = machine->StoresSnapshot();
+  const auto begun_owner = StoresSnapshotOnHeap(*machine);
+  const meta::MetaStores& begun = *begun_owner;
   const auto begun_group = begun.topology_.FindGroup("g1");
   ASSERT_TRUE(begun_group.has_value());
   ASSERT_TRUE(begun_group->failover_transition_.has_value());
@@ -2132,7 +2147,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   ASSERT_NE(std::get_if<meta::AuthorizeFailoverPrepare>(&**authorize), nullptr);
   commit(**authorize);
 
-  const meta::MetaStores authorized = machine->StoresSnapshot();
+  const auto authorized_owner = StoresSnapshotOnHeap(*machine);
+  const meta::MetaStores& authorized = *authorized_owner;
   const auto authorized_group = authorized.topology_.FindGroup("g1");
   ASSERT_TRUE(authorized_group.has_value());
   ASSERT_TRUE(authorized_group->failover_transition_.has_value());
@@ -2161,7 +2177,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   ASSERT_TRUE(candidate_result.failover_status_.ok())
       << candidate_result.failover_status_;
 
-  const meta::MetaStores before_cutover = machine->StoresSnapshot();
+  const auto before_cutover_owner = StoresSnapshotOnHeap(*machine);
+  const meta::MetaStores& before_cutover = *before_cutover_owner;
   IdSequence expected_ids{0xf0};
   const auto expected = meta::PlanFailoverStep(
       meta::MetaCommittedView(before_cutover, committed_index), observations,
@@ -2275,7 +2292,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   std::this_thread::sleep_for(std::chrono::milliseconds(750));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 1);
 
-  const meta::MetaStores after_cutover = machine->StoresSnapshot();
+  const auto after_cutover_owner = StoresSnapshotOnHeap(*machine);
+  const meta::MetaStores& after_cutover = *after_cutover_owner;
   const auto group = after_cutover.topology_.FindGroup("g1");
   ASSERT_TRUE(group.has_value());
   EXPECT_EQ(group->record_.owner_, fixture.candidate);

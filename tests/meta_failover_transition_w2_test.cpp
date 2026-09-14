@@ -1,5 +1,6 @@
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -154,8 +155,11 @@ void RegisterNode(Fixture& fixture, const std::string& node_id,
   AcceptFresh(fixture, meta::MetaCommand{node});
 }
 
-Fixture MakeFixture() {
-  Fixture fixture;
+std::unique_ptr<Fixture> MakeFixture() {
+  // Keep the large topology store off the stack: Debug builds can reserve a
+  // separate stack slot for every scoped fixture in the rejection matrix.
+  auto fixture_owner = std::make_unique<Fixture>();
+  Fixture& fixture = *fixture_owner;
   const meta::SubmitOperation root = ClusterCreateRoot();
   AcceptFresh(fixture, meta::MetaCommand{root});
 
@@ -224,7 +228,7 @@ Fixture MakeFixture() {
   AcceptFresh(fixture, meta::MetaCommand{activate});
 
   EXPECT_EQ(fixture.next_index, 11u);
-  return fixture;
+  return fixture_owner;
 }
 
 meta::MetaFailoverCandidateAction CandidateAction(const Fixture& fixture,
@@ -439,7 +443,8 @@ void ExpectCutover(const Fixture& fixture, std::uint64_t commit_index,
 
 TEST(MetaFailoverTransitionW2,
      ControlledBeginPersistsTransitionWithoutChangingAuthority) {
-  Fixture fixture = MakeFixture();
+  auto fixture_owner = MakeFixture();
+  Fixture& fixture = *fixture_owner;
   SubmitControlledOperation(fixture);
   const meta::BeginControlledFailover begin = MakeBeginControlled(fixture);
 
@@ -473,7 +478,8 @@ TEST(MetaFailoverTransitionW2,
 
 TEST(MetaFailoverTransitionW2,
      UncontrolledCandidateReplacementAndClearUseExactTransitionCas) {
-  Fixture fixture = MakeFixture();
+  auto fixture_owner = MakeFixture();
+  Fixture& fixture = *fixture_owner;
   const meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
   const std::uint64_t begin_index =
       AcceptFresh(fixture, meta::MetaCommand{begin});
@@ -528,7 +534,8 @@ TEST(MetaFailoverTransitionW2,
 
 TEST(MetaFailoverTransitionW2,
      UncontrolledCandidateClearRequiresAnInstalledCandidate) {
-  Fixture fixture = MakeFixture();
+  auto fixture_owner = MakeFixture();
+  Fixture& fixture = *fixture_owner;
   const meta::BeginUncontrolledFailover begin =
       MakeBeginUncontrolled(fixture, false);
   const std::uint64_t begin_index =
@@ -545,7 +552,8 @@ TEST(MetaFailoverTransitionW2,
 TEST(MetaFailoverTransitionW2,
      AuthorizationLatchesModeSpecificLossAndReplaysExactly) {
   {
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     SubmitControlledOperation(fixture);
     const meta::BeginControlledFailover begin = MakeBeginControlled(fixture);
     const std::uint64_t begin_index =
@@ -578,7 +586,8 @@ TEST(MetaFailoverTransitionW2,
   }
 
   {
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const meta::BeginUncontrolledFailover begin =
         MakeBeginUncontrolled(fixture);
     const std::uint64_t begin_index =
@@ -604,7 +613,8 @@ TEST(MetaFailoverTransitionW2,
 
 TEST(MetaFailoverTransitionW2,
      PreBeginTypedAbortTerminatesOnlyItsOperationAndSurvivesUnrelatedState) {
-  Fixture fixture = MakeFixture();
+  auto fixture_owner = MakeFixture();
+  Fixture& fixture = *fixture_owner;
   SubmitControlledOperation(fixture);
   const meta::AbortControlledFailover abort =
       MakeAbort(fixture, std::nullopt, "no eligible candidate");
@@ -636,7 +646,8 @@ TEST(MetaFailoverTransitionW2,
 TEST(MetaFailoverTransitionW2,
      PostBeginTypedAbortAtomicallyClearsTransitionAndRejectsPartialRepair) {
   {
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     SubmitControlledOperation(fixture);
     const meta::BeginControlledFailover begin = MakeBeginControlled(fixture);
     const std::uint64_t begin_index =
@@ -659,7 +670,8 @@ TEST(MetaFailoverTransitionW2,
   }
 
   {
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     SubmitControlledOperation(fixture);
     const meta::BeginControlledFailover begin = MakeBeginControlled(fixture);
     const std::uint64_t begin_index =
@@ -681,7 +693,8 @@ TEST(MetaFailoverTransitionW2,
 
 TEST(MetaFailoverTransitionW2,
      ControlledDegradeCanRetainOnlyTheExactLosslessAuthorizedAction) {
-  Fixture fixture = MakeFixture();
+  auto fixture_owner = MakeFixture();
+  Fixture& fixture = *fixture_owner;
   SubmitControlledOperation(fixture);
   const meta::BeginControlledFailover begin = MakeBeginControlled(fixture);
   const std::uint64_t begin_index =
@@ -733,7 +746,8 @@ TEST(MetaFailoverTransitionW2,
 
 TEST(MetaFailoverTransitionW2,
      ControlledDegradeClearsActionAndRejectsAStaleActionSnapshot) {
-  Fixture fixture = MakeFixture();
+  auto fixture_owner = MakeFixture();
+  Fixture& fixture = *fixture_owner;
   SubmitControlledOperation(fixture);
   const meta::BeginControlledFailover begin = MakeBeginControlled(fixture);
   const std::uint64_t begin_index =
@@ -767,7 +781,8 @@ TEST(MetaFailoverTransitionW2,
 
 TEST(MetaFailoverTransitionW2,
      ControlledCommitAtomicallyCutsOverAndCompletesItsOperation) {
-  Fixture fixture = MakeFixture();
+  auto fixture_owner = MakeFixture();
+  Fixture& fixture = *fixture_owner;
   SubmitControlledOperation(fixture);
   const meta::BeginControlledFailover begin = MakeBeginControlled(fixture);
   const std::uint64_t begin_index =
@@ -800,7 +815,8 @@ TEST(MetaFailoverTransitionW2,
 
 TEST(MetaFailoverTransitionW2,
      ControlledCommitRejectsTermOnlyPartialStateWithoutRepair) {
-  Fixture fixture = MakeFixture();
+  auto fixture_owner = MakeFixture();
+  Fixture& fixture = *fixture_owner;
   SubmitControlledOperation(fixture);
   const meta::BeginControlledFailover begin = MakeBeginControlled(fixture);
   const std::uint64_t begin_index =
@@ -832,7 +848,8 @@ TEST(MetaFailoverTransitionW2,
 
 TEST(MetaFailoverTransitionW2,
      UncontrolledCommitRequiresLatchedLossAndCutsOverWithoutAnOperation) {
-  Fixture fixture = MakeFixture();
+  auto fixture_owner = MakeFixture();
+  Fixture& fixture = *fixture_owner;
   const meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
   const std::uint64_t begin_index =
       AcceptFresh(fixture, meta::MetaCommand{begin});
@@ -895,7 +912,8 @@ TEST(MetaFailoverTransitionW2,
 
   {
     SCOPED_TRACE("BeginControlledFailover/stale-topology-anchor");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     SubmitControlledOperation(fixture);
     meta::BeginControlledFailover command = MakeBeginControlled(fixture);
     ++command.expected_membership_revision_;
@@ -904,7 +922,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("BeginControlledFailover/stale-operation-anchor");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     SubmitControlledOperation(fixture);
     meta::BeginControlledFailover command = MakeBeginControlled(fixture);
     ++command.expected_operation_revision_;
@@ -914,7 +933,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("BeginUncontrolledFailover/stale-authority-anchor");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     meta::BeginUncontrolledFailover command = MakeBeginUncontrolled(fixture);
     ++command.expected_grant_revision_;
     RejectFreshWithDetail(fixture, meta::MetaCommand{command},
@@ -923,7 +943,8 @@ TEST(MetaFailoverTransitionW2,
 
   {
     SCOPED_TRACE("SetUncontrolledCandidate/wrong-mode");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     meta::SetUncontrolledCandidate command;
     command.request_id_ = Filled<16>(0x90);
@@ -935,7 +956,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("SetUncontrolledCandidate/stale-transition-revision");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_uncontrolled(fixture);
     meta::SetUncontrolledCandidate command;
     command.request_id_ = Filled<16>(0x92);
@@ -948,7 +970,8 @@ TEST(MetaFailoverTransitionW2,
 
   {
     SCOPED_TRACE("AuthorizeFailoverPrepare/stale-transition-revision");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_uncontrolled(fixture);
     meta::AuthorizeFailoverPrepare command = MakeAuthorize(
         fixture, attempt.second - 1, *attempt.first.candidate_action_,
@@ -958,7 +981,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("AuthorizeFailoverPrepare/mode-specific-loss");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     const meta::AuthorizeFailoverPrepare command =
         MakeAuthorize(fixture, attempt.second, attempt.first.candidate_action_,
@@ -969,7 +993,8 @@ TEST(MetaFailoverTransitionW2,
 
   {
     SCOPED_TRACE("AbortControlledFailover/wrong-mode");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     SubmitControlledOperation(fixture);
     const auto attempt = install_uncontrolled(fixture);
     const meta::AbortControlledFailover command = MakeAbort(
@@ -980,7 +1005,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("AbortControlledFailover/stale-transition-revision");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     const meta::AbortControlledFailover command =
         MakeAbort(fixture, meta::MetaFailoverTransitionRef{
@@ -990,7 +1016,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("AbortControlledFailover/stale-operation-anchor");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     meta::AbortControlledFailover command = MakeAbort(
         fixture,
@@ -1002,7 +1029,8 @@ TEST(MetaFailoverTransitionW2,
 
   {
     SCOPED_TRACE("DegradeControlledFailover/wrong-mode");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     SubmitControlledOperation(fixture);
     const auto attempt = install_uncontrolled(fixture);
     const meta::DegradeControlledFailover command =
@@ -1013,7 +1041,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("DegradeControlledFailover/stale-transition-revision");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     const meta::DegradeControlledFailover command = MakeDegrade(
         fixture, attempt.second - 1, attempt.first.candidate_action_, false,
@@ -1023,7 +1052,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("DegradeControlledFailover/stale-operation-anchor");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     meta::DegradeControlledFailover command =
         MakeDegrade(fixture, attempt.second, attempt.first.candidate_action_,
@@ -1035,7 +1065,8 @@ TEST(MetaFailoverTransitionW2,
 
   {
     SCOPED_TRACE("CommitControlledFailover/wrong-mode");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     SubmitControlledOperation(fixture);
     const auto attempt = install_uncontrolled(fixture);
     const std::uint64_t authorized_revision =
@@ -1048,7 +1079,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("CommitControlledFailover/stale-transition-revision");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     const std::uint64_t authorized_revision =
         authorize_controlled(fixture, attempt);
@@ -1060,7 +1092,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("CommitControlledFailover/stale-topology-anchor");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     const std::uint64_t authorized_revision =
         authorize_controlled(fixture, attempt);
@@ -1073,7 +1106,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("CommitControlledFailover/stale-authority-anchor");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     const std::uint64_t authorized_revision =
         authorize_controlled(fixture, attempt);
@@ -1086,7 +1120,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("CommitControlledFailover/stale-operation-anchor");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     const std::uint64_t authorized_revision =
         authorize_controlled(fixture, attempt);
@@ -1101,7 +1136,8 @@ TEST(MetaFailoverTransitionW2,
 
   {
     SCOPED_TRACE("CommitUncontrolledFailover/wrong-mode");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
     const std::uint64_t authorized_revision =
         authorize_controlled(fixture, attempt);
@@ -1113,7 +1149,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("CommitUncontrolledFailover/stale-transition-revision");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_uncontrolled(fixture);
     const std::uint64_t authorized_revision =
         authorize_uncontrolled(fixture, attempt);
@@ -1125,7 +1162,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("CommitUncontrolledFailover/stale-topology-anchor");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_uncontrolled(fixture);
     const std::uint64_t authorized_revision =
         authorize_uncontrolled(fixture, attempt);
@@ -1138,7 +1176,8 @@ TEST(MetaFailoverTransitionW2,
   }
   {
     SCOPED_TRACE("CommitUncontrolledFailover/stale-authority-anchor");
-    Fixture fixture = MakeFixture();
+    auto fixture_owner = MakeFixture();
+    Fixture& fixture = *fixture_owner;
     const auto attempt = install_uncontrolled(fixture);
     const std::uint64_t authorized_revision =
         authorize_uncontrolled(fixture, attempt);
@@ -1153,7 +1192,8 @@ TEST(MetaFailoverTransitionW2,
 
 TEST(MetaFailoverTransitionW2,
      GenericOperationTerminalCommandsRejectFailoverOperations) {
-  Fixture fixture = MakeFixture();
+  auto fixture_owner = MakeFixture();
+  Fixture& fixture = *fixture_owner;
   SubmitControlledOperation(fixture);
 
   meta::CompleteOperation complete;
