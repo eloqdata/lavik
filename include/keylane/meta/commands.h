@@ -69,6 +69,10 @@ using MetaOperationId = std::array<std::uint8_t, 16>;
 using MetaAssignmentId = std::array<std::uint8_t, 16>;
 using MetaAttemptId = std::array<std::uint8_t, 16>;
 using MetaDirectiveId = std::array<std::uint8_t, 16>;
+
+// Opaque proposer-generated identities distinguish a durable transition from
+// each replaceable candidate action. Both survive Raft replay and snapshots
+// and have no ordering or structure beyond exact equality.
 using MetaFailoverTransitionId = std::array<std::uint8_t, 16>;
 using MetaFailoverActionId = std::array<std::uint8_t, 16>;
 
@@ -417,16 +421,25 @@ absl::Status ValidateMetaGrantSpec(const MetaGrantSpec& spec);
 
 inline constexpr std::uint32_t kMaxMetaFailoverFlowCount = 1024;
 
+// Committed execution semantics for a transition. Controlled mode preserves
+// the current owner's authority until cutover; Uncontrolled mode runs only
+// after that authority has been fenced.
 enum class MetaFailoverMode : std::uint8_t {
   kControlled = 1,
   kUncontrolled = 2,
 };
 
+// Durability claim attached to an authorized cutover. None asserts that the
+// accepted evidence proves no acknowledged write is lost; Unknown makes no
+// such assertion and does not itself mean that loss was observed.
 enum class MetaFailoverLoss : std::uint8_t {
   kNone = 1,
   kUnknown = 2,
 };
 
+// Exact Data process incarnation selected for promotion. The node, membership
+// assignment, and boot identities must all match current observations even
+// though the selection itself is durable.
 struct MetaFailoverCandidate {
   std::string node_id_;
   MetaAssignmentId assignment_id_{};
@@ -455,6 +468,9 @@ struct MetaFailoverAuthorization {
   bool operator==(const MetaFailoverAuthorization&) const = default;
 };
 
+// One replaceable candidate attempt within a durable transition. A missing
+// authorization retains the selection without permitting promotion
+// preparation.
 struct MetaFailoverCandidateAction {
   MetaFailoverActionId action_id_{};
   MetaFailoverCandidate candidate_;
@@ -463,12 +479,17 @@ struct MetaFailoverCandidateAction {
   bool operator==(const MetaFailoverCandidateAction&) const = default;
 };
 
+// Controlled-only durable binding to the operator operation and its absolute
+// admission deadline. Uncontrolled transitions never carry this value.
 struct MetaControlledFailover {
   MetaOperationId operation_id_{};
   std::uint64_t absolute_deadline_unix_ms_ = 0;
   bool operator==(const MetaControlledFailover&) const = default;
 };
 
+// Group-owned durable failover state. It survives Meta leadership changes and
+// is removed only by a matching abort or cutover; boot-local progress is
+// intentionally represented elsewhere.
 struct MetaFailoverTransition {
   MetaFailoverTransitionId transition_id_{};
   // The most recent transition-mutating Raft apply index.

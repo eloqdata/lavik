@@ -779,7 +779,7 @@ class FailoverFixture:
         self.scenario = scenario
         os.makedirs(scenario, mode=0o700)
         # AF_UNIX paths cap at roughly 108 bytes. Keep the fixed suffix short
-        # so an explicit, descriptive NVMe evidence directory remains valid.
+        # so sockets fit beneath either the case directory or configured root.
         meta_dir = os.path.join(scenario, "m")
         os.makedirs(meta_dir, mode=0o700)
         socket_root = os.environ.get("KEYLANE_FAILOVER_SOCKET_ROOT")

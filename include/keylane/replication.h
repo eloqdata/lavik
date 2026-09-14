@@ -209,11 +209,21 @@ struct ClusterPopulationStatus {
   std::string failure_reason_;
 };
 
+// Opaque identities copied from committed Meta state. A transition may span
+// candidate replacement, while an action identifies one exact candidate
+// attempt; ReplicationManager only compares them for equality.
 using ClusterFailoverTransitionId = std::array<std::uint8_t, 16>;
 using ClusterFailoverActionId = std::array<std::uint8_t, 16>;
+
+// Opaque boot-local handle and digest for retained prepared resources. They
+// are observations rather than durable identities and are discarded on
+// restart or action replacement.
 using ClusterPreparedContextId = std::array<std::uint8_t, 16>;
 using ClusterPreparedContextHash = std::array<std::uint8_t, 32>;
 
+// Wire-independent execution semantics derived from committed state.
+// Controlled actions prepare while the old owner remains authoritative;
+// Uncontrolled actions prepare only after that authority has been fenced.
 enum class ClusterFailoverMode : std::uint8_t {
   kControlled,
   kUncontrolled,
@@ -355,7 +365,8 @@ struct ClusterFailoverActivation {
 
 // Observable lifecycle of the currently installed candidate action. States
 // are boot-local and level-triggered; replacing or removing the desired action
-// discards this progress instead of carrying it into the next attempt.
+// discards this progress instead of carrying it into the next attempt. None
+// means no action is installed for this boot, not an unknown terminal outcome.
 enum class ClusterFailoverActionState : std::uint8_t {
   kNone,
   kWaitingForAuthorization,

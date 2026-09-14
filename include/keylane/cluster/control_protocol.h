@@ -732,16 +732,24 @@ struct WireSlotRange {
   friend bool operator==(const WireSlotRange&, const WireSlotRange&) = default;
 };
 
+// Control-protocol projection of committed transition semantics. Controlled
+// mode preserves the current owner's authority until cutover; Uncontrolled
+// mode requires that authority to be fenced first.
 enum class WireFailoverMode : std::uint8_t {
   kControlled = 1,
   kUncontrolled = 2,
 };
 
+// Wire form of the authorized cutover's durability claim. None means the
+// accepted evidence proves no acknowledged write is lost; Unknown carries no
+// such guarantee and does not itself report observed loss.
 enum class WireFailoverLoss : std::uint8_t {
   kNone = 1,
   kUnknown = 2,
 };
 
+// Exact candidate process incarnation projected by Meta. Receivers compare
+// the node, membership assignment, and boot identities as one identity.
 struct WireFailoverCandidate {
   std::string node_id;
   WireId128 assignment_id{};
@@ -751,6 +759,8 @@ struct WireFailoverCandidate {
                          const WireFailoverCandidate&) = default;
 };
 
+// Projected source lineage within which candidate progress was compared. It
+// fixes the expected frontier shape but deliberately carries no live frontier.
 struct WireFailoverCompatibilityDomain {
   std::uint64_t source_group_term = 0;
   std::string source_node_id;
@@ -763,6 +773,8 @@ struct WireFailoverCompatibilityDomain {
                          const WireFailoverCompatibilityDomain&) = default;
 };
 
+// Action-scoped, revision-stamped permission to prepare promotion, including
+// the durability claim that any cutover through it must retain.
 struct WireFailoverAuthorization {
   std::uint64_t authorized_revision = 0;
   WireFailoverLoss loss_if_cutover = WireFailoverLoss::kUnknown;
@@ -771,6 +783,8 @@ struct WireFailoverAuthorization {
                          const WireFailoverAuthorization&) = default;
 };
 
+// One replaceable candidate attempt projected from the durable transition.
+// Absence of authorization keeps the candidate selected but not executable.
 struct WireFailoverCandidateAction {
   WireId128 action_id{};
   WireFailoverCandidate candidate;
@@ -781,10 +795,12 @@ struct WireFailoverCandidateAction {
                          const WireFailoverCandidateAction&) = default;
 };
 
-// Data execution subset of the committed transition. Meta-only workflow data
-// such as the Controlled operation/deadline and successor grant stay out of
-// this protocol; after cutover the successor is the ordinary current grant.
-// Volatile source/candidate progress is likewise deliberately absent.
+// Data execution subset of the committed transition. This is a replaceable
+// FDS projection, not Data-owned durable state, and is resent after reconnect
+// or Meta leadership change. Meta-only workflow data such as the Controlled
+// operation/deadline and successor grant stay out of this protocol; after
+// cutover the successor is the ordinary current grant. Volatile
+// source/candidate progress is likewise deliberately absent.
 struct WireFailoverTransition {
   WireId128 transition_id{};
   std::uint64_t revision = 0;

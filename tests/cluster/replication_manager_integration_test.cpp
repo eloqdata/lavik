@@ -3848,7 +3848,6 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
 
   keylane::ReplicationOptions options;
   options.cluster_enabled_ = true;
-  options.cluster_enabled_ = true;
   options.node_id_override_ = std::string(40, '9');
   keylane::ReplicationManager replication(&storage, std::move(options),
                                           std::nullopt);
@@ -3978,7 +3977,6 @@ void RunFailoverActionWatchdogCase(std::string_view fault_variable,
 
   keylane::ReplicationOptions options;
   options.cluster_enabled_ = true;
-  options.cluster_enabled_ = true;
   options.node_id_override_ = std::string(40, '9');
   keylane::ReplicationManager replication(&storage, std::move(options),
                                           std::nullopt);
@@ -4034,7 +4032,6 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   keylane::ReplicationOptions options;
-  options.cluster_enabled_ = true;
   options.cluster_enabled_ = true;
   options.node_id_override_ = std::string(40, '9');
   keylane::ReplicationManager replication(&storage, std::move(options),
@@ -4152,7 +4149,6 @@ TEST(ReplicationManagerIntegrationTest,
 
   keylane::ReplicationOptions options;
   options.cluster_enabled_ = true;
-  options.cluster_enabled_ = true;
   options.node_id_override_ = std::string(40, '9');
   keylane::ReplicationManager replication(&storage, std::move(options),
                                           std::nullopt);
@@ -4201,7 +4197,6 @@ TEST(ReplicationManagerIntegrationTest,
 
   keylane::ReplicationOptions options;
   options.cluster_enabled_ = true;
-  options.cluster_enabled_ = true;
   options.node_id_override_ = local_node_id;
   options.listen_port_ = kReplicationPort;
   keylane::ReplicationManager replication(&storage, std::move(options),
@@ -4241,7 +4236,6 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   keylane::ReplicationOptions options;
-  options.cluster_enabled_ = true;
   options.cluster_enabled_ = true;
   options.node_id_override_ = local_node_id;
   keylane::ReplicationManager replication(&storage, std::move(options),

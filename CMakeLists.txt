@@ -961,7 +961,7 @@ if (BUILD_TESTING)
           )
           # Unix-domain listener paths have a platform limit near 108 bytes.
           # Process evidence stays in the descriptive per-case directory;
-          # only this unused auxiliary admin listener gets a short NVMe path.
+          # only this unused auxiliary admin listener gets a short build-tree path.
           set(failover_socket_root "${CMAKE_CURRENT_BINARY_DIR}/fs")
           file(MAKE_DIRECTORY "${failover_socket_root}")
           foreach(failover_case IN LISTS KEYLANE_FAILOVER_INTEGRATION_CASES)

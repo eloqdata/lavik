@@ -1034,7 +1034,8 @@ cmake --build "$KEYLANE_ISSUE41_BUILD" --target keylane_cluster_replication_mana
 2. 完整 unit/meta tests；
 3. `ctest --output-on-failure` 的 Meta、cluster 和分开注册的新 failover gate；
 4. 必要的 sanitizer/fault targets（按仓库现有可用配置）；
-5. 检查所有运行产物都在 NVMe；
+5. 检查本次运行的构建和临时产物都位于用户指定的 NVMe 根；实现只暴露
+   可配置路径，不硬编码存储介质；
 6. diff audit：无 recovery store/phase/proof/one-shot failover directive残留；
 7. 用 code-review workflow 并行做 Standards 与 #41 Spec 双轴审查；
 8. 修复所有 P0/P1，以及确认成立的 P2；复跑受影响 targeted tests；
@@ -1043,7 +1044,7 @@ cmake --build "$KEYLANE_ISSUE41_BUILD" --target keylane_cluster_replication_mana
     criterion → test evidence checklist；
 11. 确认 `CONTEXT.md`、`docs/adr/` 和 plan 等预期文档已纳入 diff，再按逻辑切片
     整理 commit；
-12. 创建 PR，正文包含 `Closes #41`、`Supersedes #57`，明确 #42/#45/#46
+12. 创建替代 PR，确保正文包含 `Closes #41`、`Supersedes #57`，明确 #42/#45/#46
     out-of-scope、测试命令、loss语义和首版 availability gap。
 
 ## 16. 主要风险及停止条件
@@ -1075,7 +1076,7 @@ cmake --build "$KEYLANE_ISSUE41_BUILD" --target keylane_cluster_replication_mana
 
 ## 17. 完成定义
 
-只有同时满足以下条件才创建 PR：
+只有同时满足以下条件才视为完成：
 
 - #41 acceptance criteria逐项有实现和测试证据；
 - Controlled/Uncontrolled/Cutover/Follow Owner真实进程闭环通过；
@@ -1084,7 +1085,7 @@ cmake --build "$KEYLANE_ISSUE41_BUILD" --target keylane_cluster_replication_mana
 - Meta Leader切换后仅依靠 Committed State + 重报 Observation继续；
 - Data新增面保持为 pause、action-bound activation、desired Follow Owner和必要的
   heartbeat/status adapter，没有第二套复制/failover引擎；
-- 所有临时产物位于 NVMe；
+- 本次验证的构建和临时产物位于用户指定的 NVMe 根；
 - full validation、Standards review、Spec review均通过；
 - architecture/operations文档与源码一致；
-- commit已推送且PR已创建。
+- commit已推送，替代PR正文与最终diff一致。
