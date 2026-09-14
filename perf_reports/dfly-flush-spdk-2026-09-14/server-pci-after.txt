@@ -1,0 +1,25 @@
+489e:00:00.0 Non-Volatile memory controller [0108]: Microsoft Corporation Device [1414:b111] (rev 01)
+	Subsystem: Microsoft Corporation Device [1414:ffff]
+	Kernel driver in use: vfio-pci
+66d9:00:00.0 Non-Volatile memory controller [0108]: Microsoft Corporation Device [1414:b111] (rev 01)
+	Subsystem: Microsoft Corporation Device [1414:ffff]
+	Kernel driver in use: vfio-pci
+9e72:00:00.0 Non-Volatile memory controller [0108]: Microsoft Corporation Device [1414:b111] (rev 01)
+	Subsystem: Microsoft Corporation Device [1414:ffff]
+	Kernel driver in use: vfio-pci
+b538:00:02.0 Ethernet controller [0200]: Mellanox Technologies MT28800 Family [ConnectX-5 Ex Virtual Function] [15b3:101a] (rev 80)
+	Subsystem: Mellanox Technologies MT28800 Family [ConnectX-5 Ex Virtual Function] [15b3:0127]
+	Kernel driver in use: mlx5_core
+	Kernel modules: mlx5_core
+b78e:00:00.0 Non-Volatile memory controller [0108]: Microsoft Corporation Device [1414:b111] (rev 01)
+	Subsystem: Microsoft Corporation Device [1414:ffff]
+	Kernel driver in use: vfio-pci
+c05b:00:00.0 Non-Volatile memory controller [0108]: Microsoft Corporation Device [1414:00a9]
+	Subsystem: Microsoft Corporation Device [1414:0000]
+	Kernel driver in use: nvme
+d95e:00:00.0 Non-Volatile memory controller [0108]: Microsoft Corporation Device [1414:b111] (rev 01)
+	Subsystem: Microsoft Corporation Device [1414:ffff]
+	Kernel driver in use: vfio-pci
+f70f:00:00.0 Non-Volatile memory controller [0108]: Microsoft Corporation Device [1414:b111] (rev 01)
+	Subsystem: Microsoft Corporation Device [1414:ffff]
+	Kernel driver in use: vfio-pci

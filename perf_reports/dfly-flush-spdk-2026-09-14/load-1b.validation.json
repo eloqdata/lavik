@@ -1,0 +1,57 @@
+{
+  "start_utc": "2026-09-14T17:06:43.326410+00:00",
+  "end_utc": "2026-09-14T17:27:21.982154+00:00",
+  "requests": 1000000000,
+  "gets": 0,
+  "sets": 1000000000,
+  "errors": 0,
+  "hit_rate": null,
+  "connections": 640,
+  "duration_ms": 1238268,
+  "wall_qps": 807579.6192746643,
+  "console_qps": 877735.0,
+  "p9999_total_bucket_ms": [
+    30.0,
+    35.0
+  ],
+  "operations": {
+    "Totals": {
+      "Count": 1000000000,
+      "Ops/sec": 807579.619275,
+      "Average Latency": 0.726991,
+      "Min Latency": 0.135,
+      "Max Latency": 219.29,
+      "Percentile Latencies": {
+        "p50.00": 0.56302,
+        "p99.00": 4.876875,
+        "p99.90": 14.127018
+      }
+    },
+    "Gets": {
+      "Count": 0,
+      "Ops/sec": 0.0,
+      "Average Latency": 0.0,
+      "Min Latency": 0.0,
+      "Max Latency": 0.0,
+      "Percentile Latencies": {
+        "p50.00": 0.0,
+        "p99.00": 0.0,
+        "p99.90": 0.0
+      }
+    },
+    "Sets": {
+      "Count": 1000000000,
+      "Ops/sec": 807579.619275,
+      "Average Latency": 0.726991,
+      "Min Latency": 0.135,
+      "Max Latency": 219.29,
+      "Percentile Latencies": {
+        "p50.00": 0.56302,
+        "p99.00": 4.876875,
+        "p99.90": 14.127018
+      }
+    }
+  },
+  "json_sha256": "1ce9925d34e7a73bc8a38096265118a469767375073e8573c0a5705cf7489579",
+  "log_sha256": "85564ad8bc64e23c607be1ae8aa7686dfbe78dfe56969c95ab646cb17d2c4fce"
+}

@@ -1,0 +1,152 @@
+{
+  "utc": "2026-09-14T17:09:20.483148+00:00",
+  "queues": {
+    "0": {
+      "irq": 144,
+      "configured": "13",
+      "effective": "13"
+    },
+    "1": {
+      "irq": 145,
+      "configured": "14",
+      "effective": "14"
+    },
+    "2": {
+      "irq": 146,
+      "configured": "15",
+      "effective": "15"
+    },
+    "3": {
+      "irq": 147,
+      "configured": "12",
+      "effective": "12"
+    },
+    "4": {
+      "irq": 148,
+      "configured": "13",
+      "effective": "13"
+    },
+    "5": {
+      "irq": 149,
+      "configured": "14",
+      "effective": "14"
+    },
+    "6": {
+      "irq": 150,
+      "configured": "15",
+      "effective": "15"
+    },
+    "7": {
+      "irq": 151,
+      "configured": "12",
+      "effective": "12"
+    },
+    "8": {
+      "irq": 152,
+      "configured": "13",
+      "effective": "13"
+    },
+    "9": {
+      "irq": 153,
+      "configured": "14",
+      "effective": "14"
+    },
+    "10": {
+      "irq": 154,
+      "configured": "15",
+      "effective": "15"
+    },
+    "11": {
+      "irq": 155,
+      "configured": "12",
+      "effective": "12"
+    },
+    "12": {
+      "irq": 156,
+      "configured": "13",
+      "effective": "13"
+    },
+    "13": {
+      "irq": 157,
+      "configured": "14",
+      "effective": "14"
+    },
+    "14": {
+      "irq": 158,
+      "configured": "15",
+      "effective": "15"
+    },
+    "15": {
+      "irq": 159,
+      "configured": "12",
+      "effective": "12"
+    }
+  },
+  "softnet_stat": "122eed52 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000\n10425e22 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000001 00000000 00000000\n116dec93 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000002 00000000 00000000\n1317d197 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000003 00000000 00000000\n10e68dce 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000004 00000000 00000000\n125a70a9 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000005 00000000 00000000\n0ef55274 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000006 00000000 00000000\n1040739a 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000007 00000000 00000000\n10ffc167 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000008 00000000 00000000\n107e48e8 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000009 00000000 00000000\n0fdb6c75 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0000000a 00000000 00000000\n12536f35 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0000000b 00000000 00000000\nf507d2e0 00000000 001d3c3b 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0000000c 00000000 00000000\nef524281 00000000 0018aa3a 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0000000d 00000000 00000000\nf2523411 00000000 00166dc8 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0000000e 00000000 00000000\nf843e0a4 00000000 001a2f0d 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 0000000f 00000000 00000000\n",
+  "rps_xps": {
+    "/sys/class/net/eth0/queues/rx-13/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-6/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-9/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-12/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-11/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-4/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-7/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-10/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-2/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-5/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-0/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-3/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-9/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-15/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-1/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-14/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-7/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-13/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-12/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-5/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-8/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-11/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-10/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-3/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-6/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-1/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-4/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-2/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-15/rps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-8/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/tx-14/xps_cpus": "0000",
+    "/sys/class/net/eth0/queues/rx-0/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/rx-13/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-6/xps_cpus": "0040",
+    "/sys/class/net/enP46392s1/queues/rx-9/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-12/xps_cpus": "1000",
+    "/sys/class/net/enP46392s1/queues/rx-11/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-4/xps_cpus": "0010",
+    "/sys/class/net/enP46392s1/queues/rx-7/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-10/xps_cpus": "0400",
+    "/sys/class/net/enP46392s1/queues/tx-2/xps_cpus": "0004",
+    "/sys/class/net/enP46392s1/queues/rx-5/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-0/xps_cpus": "0001",
+    "/sys/class/net/enP46392s1/queues/rx-3/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-9/xps_cpus": "0200",
+    "/sys/class/net/enP46392s1/queues/tx-15/xps_cpus": "8000",
+    "/sys/class/net/enP46392s1/queues/rx-1/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/rx-14/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-7/xps_cpus": "0080",
+    "/sys/class/net/enP46392s1/queues/tx-13/xps_cpus": "2000",
+    "/sys/class/net/enP46392s1/queues/rx-12/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-5/xps_cpus": "0020",
+    "/sys/class/net/enP46392s1/queues/rx-8/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-11/xps_cpus": "0800",
+    "/sys/class/net/enP46392s1/queues/rx-10/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-3/xps_cpus": "0008",
+    "/sys/class/net/enP46392s1/queues/rx-6/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-1/xps_cpus": "0002",
+    "/sys/class/net/enP46392s1/queues/rx-4/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/rx-2/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/rx-15/rps_cpus": "0000",
+    "/sys/class/net/enP46392s1/queues/tx-8/xps_cpus": "0100",
+    "/sys/class/net/enP46392s1/queues/tx-14/xps_cpus": "4000",
+    "/sys/class/net/enP46392s1/queues/rx-0/rps_cpus": "0000"
+  }
+}

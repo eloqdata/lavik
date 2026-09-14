@@ -1,0 +1,703 @@
+# HELP keylane_server_ready Whether storage recovery is complete and Redis requests are being accepted.
+# TYPE keylane_server_ready gauge
+keylane_server_ready 1
+# HELP keylane_commands_total Completed Redis commands.
+# TYPE keylane_commands_total counter
+keylane_commands_total 10
+# HELP keylane_command_calls_total Completed Redis commands by command.
+# TYPE keylane_command_calls_total counter
+keylane_command_calls_total{command="ping"} 1
+keylane_command_calls_total{command="dbsize"} 1
+keylane_command_calls_total{command="strlen"} 6
+keylane_command_calls_total{command="info"} 1
+keylane_command_calls_total{command="defrag"} 1
+# HELP keylane_command_duration_seconds Redis command execution latency, excluding socket response writes.
+# TYPE keylane_command_duration_seconds histogram
+keylane_command_duration_seconds_bucket{command="ping",le="0.000001"} 0
+keylane_command_duration_seconds_bucket{command="ping",le="0.000002"} 0
+keylane_command_duration_seconds_bucket{command="ping",le="0.000004"} 0
+keylane_command_duration_seconds_bucket{command="ping",le="0.000008"} 0
+keylane_command_duration_seconds_bucket{command="ping",le="0.000016"} 0
+keylane_command_duration_seconds_bucket{command="ping",le="0.000032"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.000064"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.000128"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.000256"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.000512"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.001"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.00125"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.0015"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.002"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.0025"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.003"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.0035"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.004"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.005"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.006"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.008"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.016"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.032"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.064"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.128"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.256"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="0.512"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="1"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="2"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="4"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="8"} 1
+keylane_command_duration_seconds_bucket{command="ping",le="+Inf"} 1
+keylane_command_duration_seconds_sum{command="ping"} 1.78165e-05
+keylane_command_duration_seconds_count{command="ping"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.000001"} 0
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.000002"} 0
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.000004"} 0
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.000008"} 0
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.000016"} 0
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.000032"} 0
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.000064"} 0
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.000128"} 0
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.000256"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.000512"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.001"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.00125"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.0015"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.002"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.0025"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.003"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.0035"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.004"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.005"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.006"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.008"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.016"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.032"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.064"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.128"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.256"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="0.512"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="1"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="2"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="4"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="8"} 1
+keylane_command_duration_seconds_bucket{command="dbsize",le="+Inf"} 1
+keylane_command_duration_seconds_sum{command="dbsize"} 0.00019526
+keylane_command_duration_seconds_count{command="dbsize"} 1
+keylane_command_duration_seconds_bucket{command="strlen",le="0.000001"} 0
+keylane_command_duration_seconds_bucket{command="strlen",le="0.000002"} 0
+keylane_command_duration_seconds_bucket{command="strlen",le="0.000004"} 0
+keylane_command_duration_seconds_bucket{command="strlen",le="0.000008"} 1
+keylane_command_duration_seconds_bucket{command="strlen",le="0.000016"} 3
+keylane_command_duration_seconds_bucket{command="strlen",le="0.000032"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.000064"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.000128"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.000256"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.000512"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.001"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.00125"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.0015"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.002"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.0025"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.003"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.0035"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.004"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.005"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.006"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.008"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.016"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.032"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.064"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.128"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.256"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="0.512"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="1"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="2"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="4"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="8"} 6
+keylane_command_duration_seconds_bucket{command="strlen",le="+Inf"} 6
+keylane_command_duration_seconds_sum{command="strlen"} 9.24775e-05
+keylane_command_duration_seconds_count{command="strlen"} 6
+keylane_command_duration_seconds_bucket{command="info",le="0.000001"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.000002"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.000004"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.000008"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.000016"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.000032"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.000064"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.000128"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.000256"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.000512"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.001"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.00125"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.0015"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.002"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.0025"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.003"} 0
+keylane_command_duration_seconds_bucket{command="info",le="0.0035"} 1
+keylane_command_duration_seconds_bucket{command="info",le="0.004"} 1
+keylane_command_duration_seconds_bucket{command="info",le="0.005"} 1
+keylane_command_duration_seconds_bucket{command="info",le="0.006"} 1
+keylane_command_duration_seconds_bucket{command="info",le="0.008"} 1
+keylane_command_duration_seconds_bucket{command="info",le="0.016"} 1
+keylane_command_duration_seconds_bucket{command="info",le="0.032"} 1
+keylane_command_duration_seconds_bucket{command="info",le="0.064"} 1
+keylane_command_duration_seconds_bucket{command="info",le="0.128"} 1
+keylane_command_duration_seconds_bucket{command="info",le="0.256"} 1
+keylane_command_duration_seconds_bucket{command="info",le="0.512"} 1
+keylane_command_duration_seconds_bucket{command="info",le="1"} 1
+keylane_command_duration_seconds_bucket{command="info",le="2"} 1
+keylane_command_duration_seconds_bucket{command="info",le="4"} 1
+keylane_command_duration_seconds_bucket{command="info",le="8"} 1
+keylane_command_duration_seconds_bucket{command="info",le="+Inf"} 1
+keylane_command_duration_seconds_sum{command="info"} 0.0034747
+keylane_command_duration_seconds_count{command="info"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.000001"} 0
+keylane_command_duration_seconds_bucket{command="defrag",le="0.000002"} 0
+keylane_command_duration_seconds_bucket{command="defrag",le="0.000004"} 0
+keylane_command_duration_seconds_bucket{command="defrag",le="0.000008"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.000016"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.000032"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.000064"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.000128"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.000256"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.000512"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.001"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.00125"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.0015"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.002"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.0025"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.003"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.0035"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.004"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.005"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.006"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.008"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.016"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.032"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.064"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.128"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.256"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="0.512"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="1"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="2"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="4"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="8"} 1
+keylane_command_duration_seconds_bucket{command="defrag",le="+Inf"} 1
+keylane_command_duration_seconds_sum{command="defrag"} 7.02044e-06
+keylane_command_duration_seconds_count{command="defrag"} 1
+# HELP keylane_storage_io_operations_total Completed storage I/O operations.
+# TYPE keylane_storage_io_operations_total counter
+keylane_storage_io_operations_total{operation="read"} 160680
+keylane_storage_io_operations_total{operation="write"} 28
+keylane_storage_io_operations_total{operation="fdatasync"} 28
+# HELP keylane_storage_io_bytes_total Bytes completed by storage reads and writes, or covered by successful fdatasync barriers.
+# TYPE keylane_storage_io_bytes_total counter
+keylane_storage_io_bytes_total{operation="read"} 58243407872
+keylane_storage_io_bytes_total{operation="write"} 114688
+keylane_storage_io_bytes_total{operation="fdatasync"} 114688
+# HELP keylane_connections Current TCP connections, including Redis clients, metrics scrapes, and replication.
+# TYPE keylane_connections gauge
+keylane_connections 11
+# HELP keylane_connected_clients Current Redis client connections.
+# TYPE keylane_connected_clients gauge
+keylane_connected_clients 10
+# HELP keylane_blocked_clients Redis clients waiting in blocking commands.
+# TYPE keylane_blocked_clients gauge
+keylane_blocked_clients 0
+# HELP keylane_replication_control_connections Current native replication control connections.
+# TYPE keylane_replication_control_connections gauge
+keylane_replication_control_connections 0
+# HELP keylane_replication_flow_connections Current native replication data-flow connections.
+# TYPE keylane_replication_flow_connections gauge
+keylane_replication_flow_connections 0
+# HELP keylane_cluster_control_connected Whether worker 0 currently holds an accepted Meta control session.
+# TYPE keylane_cluster_control_connected gauge
+keylane_cluster_control_connected 0
+# HELP keylane_cluster_control_reconnects_total Meta control reconnect rounds after the initial attempt.
+# TYPE keylane_cluster_control_reconnects_total counter
+keylane_cluster_control_reconnects_total 0
+# HELP keylane_cluster_control_protocol_errors_total Control sessions closed for invalid framing or protocol state.
+# TYPE keylane_cluster_control_protocol_errors_total counter
+keylane_cluster_control_protocol_errors_total 0
+# HELP keylane_cluster_control_full_states_applied_total Complete Meta projections installed by the data node.
+# TYPE keylane_cluster_control_full_states_applied_total counter
+keylane_cluster_control_full_states_applied_total 0
+# HELP keylane_cluster_control_lease_decisions_total Lease decisions received from Meta.
+# TYPE keylane_cluster_control_lease_decisions_total counter
+keylane_cluster_control_lease_decisions_total{decision="granted"} 0
+keylane_cluster_control_lease_decisions_total{decision="denied"} 0
+# HELP keylane_cluster_control_lease_expirations_total Locally detected control lease expirations.
+# TYPE keylane_cluster_control_lease_expirations_total counter
+keylane_cluster_control_lease_expirations_total 0
+# HELP keylane_cluster_control_directive_results_total Data-side directive execution results.
+# TYPE keylane_cluster_control_directive_results_total counter
+keylane_cluster_control_directive_results_total{result="success"} 0
+keylane_cluster_control_directive_results_total{result="failure"} 0
+# HELP keylane_storage_defrag_runs_total Completed defrag attempts.
+# TYPE keylane_storage_defrag_runs_total counter
+keylane_storage_defrag_runs_total{result="success"} 0
+keylane_storage_defrag_runs_total{result="resource_exhausted"} 0
+keylane_storage_defrag_runs_total{result="error"} 0
+# HELP keylane_storage_defrag_active Currently running defrag jobs.
+# TYPE keylane_storage_defrag_active gauge
+keylane_storage_defrag_active 0
+# HELP keylane_storage_defrag_pending Queued defrag jobs.
+# TYPE keylane_storage_defrag_pending gauge
+keylane_storage_defrag_pending 0
+# HELP keylane_storage_defrag_paused Whether relocation jobs are paused while candidates remain queued.
+# TYPE keylane_storage_defrag_paused gauge
+keylane_storage_defrag_paused 0
+# HELP keylane_storage_defrag_max_active_per_device Runtime maximum concurrent relocations per device.
+# TYPE keylane_storage_defrag_max_active_per_device gauge
+keylane_storage_defrag_max_active_per_device 8
+# HELP keylane_storage_defrag_block_sleep_seconds Runtime cooldown after each relocated block.
+# TYPE keylane_storage_defrag_block_sleep_seconds gauge
+keylane_storage_defrag_block_sleep_seconds 0
+# HELP keylane_storage_defrag_record_sleep_seconds Runtime pause after each record examined by defrag.
+# TYPE keylane_storage_defrag_record_sleep_seconds gauge
+keylane_storage_defrag_record_sleep_seconds 0
+# HELP keylane_memory_current_bytes Current process memory used for limit enforcement.
+# TYPE keylane_memory_current_bytes gauge
+keylane_memory_current_bytes 52682067392
+# HELP keylane_memory_used_bytes Allocator usable bytes used for limit enforcement.
+# TYPE keylane_memory_used_bytes gauge
+keylane_memory_used_bytes 52682067392
+# HELP keylane_memory_rss_bytes Resident process memory.
+# TYPE keylane_memory_rss_bytes gauge
+keylane_memory_rss_bytes 49444442112
+# HELP keylane_memory_committed_bytes Memory committed by the configured allocator.
+# TYPE keylane_memory_committed_bytes gauge
+keylane_memory_committed_bytes 56884920320
+# HELP keylane_memory_reserved_bytes Address space reserved by the configured allocator.
+# TYPE keylane_memory_reserved_bytes gauge
+keylane_memory_reserved_bytes 60138979328
+# HELP keylane_memory_max_bytes Configured process memory limit.
+# TYPE keylane_memory_max_bytes gauge
+keylane_memory_max_bytes 108053282816
+# HELP keylane_client_request_buffer_limit_bytes Effective ordinary client request-buffer limit.
+# TYPE keylane_client_request_buffer_limit_bytes gauge
+keylane_client_request_buffer_limit_bytes 5402664140
+# HELP keylane_client_buffered_request_bytes Ordinary client request bytes read but not yet retired.
+# TYPE keylane_client_buffered_request_bytes gauge
+keylane_client_buffered_request_bytes 0
+# HELP keylane_fullsync_reserved_memory_bytes Memory headroom reserved for active full-sync coverage maps.
+# TYPE keylane_fullsync_reserved_memory_bytes gauge
+keylane_fullsync_reserved_memory_bytes 0
+# HELP keylane_memory_admission_pending_bytes Worker-local headroom held while slow-path allocations become allocator-visible.
+# TYPE keylane_memory_admission_pending_bytes gauge
+keylane_memory_admission_pending_bytes 0
+# HELP keylane_memory_rejected_commands_total Commands rejected by the memory limit.
+# TYPE keylane_memory_rejected_commands_total counter
+keylane_memory_rejected_commands_total 0
+# HELP keylane_storage_capacity_bytes Usable data capacity.
+# TYPE keylane_storage_capacity_bytes gauge
+# HELP keylane_storage_available_bytes Space available to foreground writes after preserving the defrag reserve.
+# TYPE keylane_storage_available_bytes gauge
+# HELP keylane_filesystem_available_bytes Space available on the data file's filesystem.
+# TYPE keylane_filesystem_available_bytes gauge
+# HELP keylane_worker_retained_memory_bytes Retained bytes charged to this worker's admission share.
+# TYPE keylane_worker_retained_memory_bytes gauge
+# HELP keylane_worker_memory_admission_pending_bytes Headroom held by this worker while retained allocations become visible.
+# TYPE keylane_worker_memory_admission_pending_bytes gauge
+# HELP keylane_worker_fullsync_reserved_memory_bytes Retained headroom reserved by this worker's active full-sync coverage maps.
+# TYPE keylane_worker_fullsync_reserved_memory_bytes gauge
+# HELP keylane_worker_client_buffered_request_bytes Client request bytes currently charged to this worker's separate buffer quota.
+# TYPE keylane_worker_client_buffered_request_bytes gauge
+# HELP keylane_worker_memory_limit_bytes Retained-memory admission limit assigned to this worker.
+# TYPE keylane_worker_memory_limit_bytes gauge
+keylane_worker_retained_memory_bytes{worker="0"} 3290883296
+keylane_worker_memory_admission_pending_bytes{worker="0"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="0"} 0
+keylane_worker_client_buffered_request_bytes{worker="0"} 0
+keylane_worker_memory_limit_bytes{worker="0"} 6077997159
+keylane_worker_retained_memory_bytes{worker="1"} 3290799968
+keylane_worker_memory_admission_pending_bytes{worker="1"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="1"} 0
+keylane_worker_client_buffered_request_bytes{worker="1"} 0
+keylane_worker_memory_limit_bytes{worker="1"} 6077997159
+keylane_worker_retained_memory_bytes{worker="2"} 3290849120
+keylane_worker_memory_admission_pending_bytes{worker="2"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="2"} 0
+keylane_worker_client_buffered_request_bytes{worker="2"} 0
+keylane_worker_memory_limit_bytes{worker="2"} 6077997159
+keylane_worker_retained_memory_bytes{worker="3"} 3290905184
+keylane_worker_memory_admission_pending_bytes{worker="3"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="3"} 0
+keylane_worker_client_buffered_request_bytes{worker="3"} 0
+keylane_worker_memory_limit_bytes{worker="3"} 6077997159
+keylane_worker_retained_memory_bytes{worker="4"} 3290925792
+keylane_worker_memory_admission_pending_bytes{worker="4"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="4"} 0
+keylane_worker_client_buffered_request_bytes{worker="4"} 0
+keylane_worker_memory_limit_bytes{worker="4"} 6077997159
+keylane_worker_retained_memory_bytes{worker="5"} 3290878944
+keylane_worker_memory_admission_pending_bytes{worker="5"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="5"} 0
+keylane_worker_client_buffered_request_bytes{worker="5"} 0
+keylane_worker_memory_limit_bytes{worker="5"} 6077997159
+keylane_worker_retained_memory_bytes{worker="6"} 3290808416
+keylane_worker_memory_admission_pending_bytes{worker="6"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="6"} 0
+keylane_worker_client_buffered_request_bytes{worker="6"} 0
+keylane_worker_memory_limit_bytes{worker="6"} 6077997159
+keylane_worker_retained_memory_bytes{worker="7"} 3290848800
+keylane_worker_memory_admission_pending_bytes{worker="7"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="7"} 0
+keylane_worker_client_buffered_request_bytes{worker="7"} 0
+keylane_worker_memory_limit_bytes{worker="7"} 6077997158
+keylane_worker_retained_memory_bytes{worker="8"} 3294451376
+keylane_worker_memory_admission_pending_bytes{worker="8"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="8"} 0
+keylane_worker_client_buffered_request_bytes{worker="8"} 0
+keylane_worker_memory_limit_bytes{worker="8"} 6077997158
+keylane_worker_retained_memory_bytes{worker="9"} 3294428784
+keylane_worker_memory_admission_pending_bytes{worker="9"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="9"} 0
+keylane_worker_client_buffered_request_bytes{worker="9"} 0
+keylane_worker_memory_limit_bytes{worker="9"} 6077997158
+keylane_worker_retained_memory_bytes{worker="10"} 3294380016
+keylane_worker_memory_admission_pending_bytes{worker="10"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="10"} 0
+keylane_worker_client_buffered_request_bytes{worker="10"} 0
+keylane_worker_memory_limit_bytes{worker="10"} 6077997158
+keylane_worker_retained_memory_bytes{worker="11"} 3294378992
+keylane_worker_memory_admission_pending_bytes{worker="11"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="11"} 0
+keylane_worker_client_buffered_request_bytes{worker="11"} 0
+keylane_worker_memory_limit_bytes{worker="11"} 6077997158
+keylane_worker_retained_memory_bytes{worker="12"} 3294354480
+keylane_worker_memory_admission_pending_bytes{worker="12"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="12"} 0
+keylane_worker_client_buffered_request_bytes{worker="12"} 0
+keylane_worker_memory_limit_bytes{worker="12"} 6077997158
+keylane_worker_retained_memory_bytes{worker="13"} 3294400752
+keylane_worker_memory_admission_pending_bytes{worker="13"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="13"} 0
+keylane_worker_client_buffered_request_bytes{worker="13"} 0
+keylane_worker_memory_limit_bytes{worker="13"} 6077997158
+keylane_worker_retained_memory_bytes{worker="14"} 3294402608
+keylane_worker_memory_admission_pending_bytes{worker="14"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="14"} 0
+keylane_worker_client_buffered_request_bytes{worker="14"} 0
+keylane_worker_memory_limit_bytes{worker="14"} 6077997158
+keylane_worker_retained_memory_bytes{worker="15"} 3294370864
+keylane_worker_memory_admission_pending_bytes{worker="15"} 0
+keylane_worker_fullsync_reserved_memory_bytes{worker="15"} 0
+keylane_worker_client_buffered_request_bytes{worker="15"} 0
+keylane_worker_memory_limit_bytes{worker="15"} 6077997158
+# HELP keylane_replication_backlog_bytes Allocated shared in-memory replication backlog bytes.
+# TYPE keylane_replication_backlog_bytes gauge
+# HELP keylane_replication_backlog_capacity_bytes Configured shared in-memory replication backlog capacity.
+# TYPE keylane_replication_backlog_capacity_bytes gauge
+# HELP keylane_replication_backlog_chunks Allocated 8 MiB replication backlog chunks.
+# TYPE keylane_replication_backlog_chunks gauge
+# HELP keylane_replication_backlog_floor_lsn Oldest retained flow LSN.
+# TYPE keylane_replication_backlog_floor_lsn gauge
+# HELP keylane_replication_backlog_tail_lsn Newest published flow LSN.
+# TYPE keylane_replication_backlog_tail_lsn gauge
+# HELP keylane_replication_backlog_pinned_cursors Live replica ACK coverage claims.
+# TYPE keylane_replication_backlog_pinned_cursors gauge
+# HELP keylane_replication_backlog_active Whether this worker's shared replication history is active.
+# TYPE keylane_replication_backlog_active gauge
+# HELP keylane_replication_backlog_coverage_revocations_total Lagging coverage claims revoked at the hard cap when backpressure is disabled.
+# TYPE keylane_replication_backlog_coverage_revocations_total counter
+# HELP keylane_replication_backlog_backpressure_waits_total Backlog capacity conflicts that waited for retained cursor progress.
+# TYPE keylane_replication_backlog_backpressure_waits_total counter
+# HELP keylane_replication_backlog_backpressured Whether this worker is currently waiting for retained cursor progress.
+# TYPE keylane_replication_backlog_backpressured gauge
+# HELP keylane_replication_publish_queue_bytes Commands staged before the shared backlog.
+# TYPE keylane_replication_publish_queue_bytes gauge
+# HELP keylane_replication_publish_queue_capacity_bytes Configured publisher staging capacity.
+# TYPE keylane_replication_publish_queue_capacity_bytes gauge
+# HELP keylane_fullsync_publish_queue_bytes Commands awaiting durable target ACK in active full-sync sessions.
+# TYPE keylane_fullsync_publish_queue_bytes gauge
+# HELP keylane_fullsync_publish_queue_admitted_bytes Bytes reserved by writes that have not finished publication.
+# TYPE keylane_fullsync_publish_queue_admitted_bytes gauge
+# HELP keylane_fullsync_publish_queue_capacity_bytes Aggregate configured capacity of active full-sync session queues.
+# TYPE keylane_fullsync_publish_queue_capacity_bytes gauge
+# HELP keylane_fullsync_sessions Active full-sync sessions on this worker.
+# TYPE keylane_fullsync_sessions gauge
+# HELP keylane_fullsync_publish_queue_backpressure_waits_total Writes that waited for full-sync queue credit.
+# TYPE keylane_fullsync_publish_queue_backpressure_waits_total counter
+keylane_replication_backlog_bytes{worker="0"} 0
+keylane_replication_backlog_capacity_bytes{worker="0"} 0
+keylane_replication_backlog_chunks{worker="0"} 0
+keylane_replication_backlog_floor_lsn{worker="0"} 1
+keylane_replication_backlog_tail_lsn{worker="0"} 0
+keylane_replication_backlog_pinned_cursors{worker="0"} 0
+keylane_replication_backlog_active{worker="0"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="0"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="0"} 0
+keylane_replication_backlog_backpressured{worker="0"} 0
+keylane_replication_publish_queue_bytes{worker="0"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="0"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="0"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="0"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="0"} 0
+keylane_fullsync_sessions{worker="0"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="0"} 0
+keylane_replication_backlog_bytes{worker="1"} 0
+keylane_replication_backlog_capacity_bytes{worker="1"} 0
+keylane_replication_backlog_chunks{worker="1"} 0
+keylane_replication_backlog_floor_lsn{worker="1"} 1
+keylane_replication_backlog_tail_lsn{worker="1"} 0
+keylane_replication_backlog_pinned_cursors{worker="1"} 0
+keylane_replication_backlog_active{worker="1"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="1"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="1"} 0
+keylane_replication_backlog_backpressured{worker="1"} 0
+keylane_replication_publish_queue_bytes{worker="1"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="1"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="1"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="1"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="1"} 0
+keylane_fullsync_sessions{worker="1"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="1"} 0
+keylane_replication_backlog_bytes{worker="2"} 0
+keylane_replication_backlog_capacity_bytes{worker="2"} 0
+keylane_replication_backlog_chunks{worker="2"} 0
+keylane_replication_backlog_floor_lsn{worker="2"} 1
+keylane_replication_backlog_tail_lsn{worker="2"} 0
+keylane_replication_backlog_pinned_cursors{worker="2"} 0
+keylane_replication_backlog_active{worker="2"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="2"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="2"} 0
+keylane_replication_backlog_backpressured{worker="2"} 0
+keylane_replication_publish_queue_bytes{worker="2"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="2"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="2"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="2"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="2"} 0
+keylane_fullsync_sessions{worker="2"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="2"} 0
+keylane_replication_backlog_bytes{worker="3"} 0
+keylane_replication_backlog_capacity_bytes{worker="3"} 0
+keylane_replication_backlog_chunks{worker="3"} 0
+keylane_replication_backlog_floor_lsn{worker="3"} 1
+keylane_replication_backlog_tail_lsn{worker="3"} 0
+keylane_replication_backlog_pinned_cursors{worker="3"} 0
+keylane_replication_backlog_active{worker="3"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="3"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="3"} 0
+keylane_replication_backlog_backpressured{worker="3"} 0
+keylane_replication_publish_queue_bytes{worker="3"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="3"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="3"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="3"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="3"} 0
+keylane_fullsync_sessions{worker="3"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="3"} 0
+keylane_replication_backlog_bytes{worker="4"} 0
+keylane_replication_backlog_capacity_bytes{worker="4"} 0
+keylane_replication_backlog_chunks{worker="4"} 0
+keylane_replication_backlog_floor_lsn{worker="4"} 1
+keylane_replication_backlog_tail_lsn{worker="4"} 0
+keylane_replication_backlog_pinned_cursors{worker="4"} 0
+keylane_replication_backlog_active{worker="4"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="4"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="4"} 0
+keylane_replication_backlog_backpressured{worker="4"} 0
+keylane_replication_publish_queue_bytes{worker="4"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="4"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="4"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="4"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="4"} 0
+keylane_fullsync_sessions{worker="4"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="4"} 0
+keylane_replication_backlog_bytes{worker="5"} 0
+keylane_replication_backlog_capacity_bytes{worker="5"} 0
+keylane_replication_backlog_chunks{worker="5"} 0
+keylane_replication_backlog_floor_lsn{worker="5"} 1
+keylane_replication_backlog_tail_lsn{worker="5"} 0
+keylane_replication_backlog_pinned_cursors{worker="5"} 0
+keylane_replication_backlog_active{worker="5"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="5"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="5"} 0
+keylane_replication_backlog_backpressured{worker="5"} 0
+keylane_replication_publish_queue_bytes{worker="5"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="5"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="5"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="5"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="5"} 0
+keylane_fullsync_sessions{worker="5"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="5"} 0
+keylane_replication_backlog_bytes{worker="6"} 0
+keylane_replication_backlog_capacity_bytes{worker="6"} 0
+keylane_replication_backlog_chunks{worker="6"} 0
+keylane_replication_backlog_floor_lsn{worker="6"} 1
+keylane_replication_backlog_tail_lsn{worker="6"} 0
+keylane_replication_backlog_pinned_cursors{worker="6"} 0
+keylane_replication_backlog_active{worker="6"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="6"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="6"} 0
+keylane_replication_backlog_backpressured{worker="6"} 0
+keylane_replication_publish_queue_bytes{worker="6"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="6"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="6"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="6"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="6"} 0
+keylane_fullsync_sessions{worker="6"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="6"} 0
+keylane_replication_backlog_bytes{worker="7"} 0
+keylane_replication_backlog_capacity_bytes{worker="7"} 0
+keylane_replication_backlog_chunks{worker="7"} 0
+keylane_replication_backlog_floor_lsn{worker="7"} 1
+keylane_replication_backlog_tail_lsn{worker="7"} 0
+keylane_replication_backlog_pinned_cursors{worker="7"} 0
+keylane_replication_backlog_active{worker="7"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="7"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="7"} 0
+keylane_replication_backlog_backpressured{worker="7"} 0
+keylane_replication_publish_queue_bytes{worker="7"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="7"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="7"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="7"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="7"} 0
+keylane_fullsync_sessions{worker="7"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="7"} 0
+keylane_replication_backlog_bytes{worker="8"} 0
+keylane_replication_backlog_capacity_bytes{worker="8"} 0
+keylane_replication_backlog_chunks{worker="8"} 0
+keylane_replication_backlog_floor_lsn{worker="8"} 1
+keylane_replication_backlog_tail_lsn{worker="8"} 0
+keylane_replication_backlog_pinned_cursors{worker="8"} 0
+keylane_replication_backlog_active{worker="8"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="8"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="8"} 0
+keylane_replication_backlog_backpressured{worker="8"} 0
+keylane_replication_publish_queue_bytes{worker="8"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="8"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="8"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="8"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="8"} 0
+keylane_fullsync_sessions{worker="8"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="8"} 0
+keylane_replication_backlog_bytes{worker="9"} 0
+keylane_replication_backlog_capacity_bytes{worker="9"} 0
+keylane_replication_backlog_chunks{worker="9"} 0
+keylane_replication_backlog_floor_lsn{worker="9"} 1
+keylane_replication_backlog_tail_lsn{worker="9"} 0
+keylane_replication_backlog_pinned_cursors{worker="9"} 0
+keylane_replication_backlog_active{worker="9"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="9"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="9"} 0
+keylane_replication_backlog_backpressured{worker="9"} 0
+keylane_replication_publish_queue_bytes{worker="9"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="9"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="9"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="9"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="9"} 0
+keylane_fullsync_sessions{worker="9"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="9"} 0
+keylane_replication_backlog_bytes{worker="10"} 0
+keylane_replication_backlog_capacity_bytes{worker="10"} 0
+keylane_replication_backlog_chunks{worker="10"} 0
+keylane_replication_backlog_floor_lsn{worker="10"} 1
+keylane_replication_backlog_tail_lsn{worker="10"} 0
+keylane_replication_backlog_pinned_cursors{worker="10"} 0
+keylane_replication_backlog_active{worker="10"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="10"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="10"} 0
+keylane_replication_backlog_backpressured{worker="10"} 0
+keylane_replication_publish_queue_bytes{worker="10"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="10"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="10"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="10"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="10"} 0
+keylane_fullsync_sessions{worker="10"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="10"} 0
+keylane_replication_backlog_bytes{worker="11"} 0
+keylane_replication_backlog_capacity_bytes{worker="11"} 0
+keylane_replication_backlog_chunks{worker="11"} 0
+keylane_replication_backlog_floor_lsn{worker="11"} 1
+keylane_replication_backlog_tail_lsn{worker="11"} 0
+keylane_replication_backlog_pinned_cursors{worker="11"} 0
+keylane_replication_backlog_active{worker="11"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="11"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="11"} 0
+keylane_replication_backlog_backpressured{worker="11"} 0
+keylane_replication_publish_queue_bytes{worker="11"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="11"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="11"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="11"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="11"} 0
+keylane_fullsync_sessions{worker="11"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="11"} 0
+keylane_replication_backlog_bytes{worker="12"} 0
+keylane_replication_backlog_capacity_bytes{worker="12"} 0
+keylane_replication_backlog_chunks{worker="12"} 0
+keylane_replication_backlog_floor_lsn{worker="12"} 1
+keylane_replication_backlog_tail_lsn{worker="12"} 0
+keylane_replication_backlog_pinned_cursors{worker="12"} 0
+keylane_replication_backlog_active{worker="12"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="12"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="12"} 0
+keylane_replication_backlog_backpressured{worker="12"} 0
+keylane_replication_publish_queue_bytes{worker="12"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="12"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="12"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="12"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="12"} 0
+keylane_fullsync_sessions{worker="12"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="12"} 0
+keylane_replication_backlog_bytes{worker="13"} 0
+keylane_replication_backlog_capacity_bytes{worker="13"} 0
+keylane_replication_backlog_chunks{worker="13"} 0
+keylane_replication_backlog_floor_lsn{worker="13"} 1
+keylane_replication_backlog_tail_lsn{worker="13"} 0
+keylane_replication_backlog_pinned_cursors{worker="13"} 0
+keylane_replication_backlog_active{worker="13"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="13"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="13"} 0
+keylane_replication_backlog_backpressured{worker="13"} 0
+keylane_replication_publish_queue_bytes{worker="13"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="13"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="13"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="13"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="13"} 0
+keylane_fullsync_sessions{worker="13"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="13"} 0
+keylane_replication_backlog_bytes{worker="14"} 0
+keylane_replication_backlog_capacity_bytes{worker="14"} 0
+keylane_replication_backlog_chunks{worker="14"} 0
+keylane_replication_backlog_floor_lsn{worker="14"} 1
+keylane_replication_backlog_tail_lsn{worker="14"} 0
+keylane_replication_backlog_pinned_cursors{worker="14"} 0
+keylane_replication_backlog_active{worker="14"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="14"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="14"} 0
+keylane_replication_backlog_backpressured{worker="14"} 0
+keylane_replication_publish_queue_bytes{worker="14"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="14"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="14"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="14"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="14"} 0
+keylane_fullsync_sessions{worker="14"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="14"} 0
+keylane_replication_backlog_bytes{worker="15"} 0
+keylane_replication_backlog_capacity_bytes{worker="15"} 0
+keylane_replication_backlog_chunks{worker="15"} 0
+keylane_replication_backlog_floor_lsn{worker="15"} 1
+keylane_replication_backlog_tail_lsn{worker="15"} 0
+keylane_replication_backlog_pinned_cursors{worker="15"} 0
+keylane_replication_backlog_active{worker="15"} 0
+keylane_replication_backlog_coverage_revocations_total{worker="15"} 0
+keylane_replication_backlog_backpressure_waits_total{worker="15"} 0
+keylane_replication_backlog_backpressured{worker="15"} 0
+keylane_replication_publish_queue_bytes{worker="15"} 0
+keylane_replication_publish_queue_capacity_bytes{worker="15"} 16777216
+keylane_fullsync_publish_queue_bytes{worker="15"} 0
+keylane_fullsync_publish_queue_admitted_bytes{worker="15"} 0
+keylane_fullsync_publish_queue_capacity_bytes{worker="15"} 0
+keylane_fullsync_sessions{worker="15"} 0
+keylane_fullsync_publish_queue_backpressure_waits_total{worker="15"} 0
+keylane_storage_capacity_bytes{device="0",path="spdk://d95e:00:00.0/1"} 1919841992704
+keylane_storage_available_bytes{device="0",path="spdk://d95e:00:00.0/1"} 1780230389760
+keylane_storage_capacity_bytes{device="1",path="spdk://489e:00:00.0/1"} 1919841992704
+keylane_storage_available_bytes{device="1",path="spdk://489e:00:00.0/1"} 1710470725632
+keylane_storage_capacity_bytes{device="2",path="spdk://9e72:00:00.0/1"} 1919841992704
+keylane_storage_available_bytes{device="2",path="spdk://9e72:00:00.0/1"} 1710403616768
+keylane_storage_capacity_bytes{device="3",path="spdk://b78e:00:00.0/1"} 1919841992704
+keylane_storage_available_bytes{device="3",path="spdk://b78e:00:00.0/1"} 1710412005376
+keylane_storage_capacity_bytes{device="4",path="spdk://f70f:00:00.0/1"} 1919841992704
+keylane_storage_available_bytes{device="4",path="spdk://f70f:00:00.0/1"} 1780230389760
+keylane_storage_capacity_bytes{device="5",path="spdk://66d9:00:00.0/1"} 1919841992704
+keylane_storage_available_bytes{device="5",path="spdk://66d9:00:00.0/1"} 1710521057280

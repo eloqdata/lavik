@@ -1,0 +1,1680 @@
+I20260914 18:41:33.121677 300028 init.cc:144] /mnt/dev/dfly-get-issue20-20260909/dfly_bench-x86_64 running in opt mode.
+I20260914 18:41:33.122304 300029 uring_proactor.cc:263] IORing with 256 entries, allocated 24640 bytes, cq_entries is 512
+I20260914 18:41:33.123503 300028 proactor_pool.cc:149] Running 16 io threads
+I20260914 18:41:33.124883 300030 dfly_bench.cc:1512] Cluster spec: 51a70fe1be8bf4e2c8aa22548c623d3115a8e526 172.16.0.4:6379@0 myself,master - 0 0 1 connected 0-16383
+Connecting to 1 shard cluster
+I20260914 18:41:33.124961 300028 dfly_bench.cc:1624] Connecting to 1 shard cluster
+I20260914 18:41:33.124993 300029 dfly_bench.cc:1640] Seeding bitgen with seed 17864077645780634326
+I20260914 18:41:33.125001 300031 dfly_bench.cc:1640] Seeding bitgen with seed 4501897007716958014
+I20260914 18:41:33.125005 300033 dfly_bench.cc:1640] Seeding bitgen with seed 14196639322878607476
+I20260914 18:41:33.125020 300038 dfly_bench.cc:1640] Seeding bitgen with seed 5104587391907809550
+I20260914 18:41:33.125015 300035 dfly_bench.cc:1640] Seeding bitgen with seed 14997000447281730244
+I20260914 18:41:33.125039 300042 dfly_bench.cc:1640] Seeding bitgen with seed 591181080966387779
+I20260914 18:41:33.125010 300034 dfly_bench.cc:1640] Seeding bitgen with seed 7282089840361869749
+I20260914 18:41:33.125031 300040 dfly_bench.cc:1640] Seeding bitgen with seed 8543574502903850108
+I20260914 18:41:33.125034 300041 dfly_bench.cc:1640] Seeding bitgen with seed 14125229311408260344
+I20260914 18:41:33.125017 300039 dfly_bench.cc:1640] Seeding bitgen with seed 16532554455859499665
+I20260914 18:41:33.125051 300043 dfly_bench.cc:1640] Seeding bitgen with seed 10240605223356913643
+I20260914 18:41:33.124995 300030 dfly_bench.cc:1640] Seeding bitgen with seed 16553443226792598326
+I20260914 18:41:33.125017 300037 dfly_bench.cc:1640] Seeding bitgen with seed 4529221594527414182
+I20260914 18:41:33.125017 300036 dfly_bench.cc:1640] Seeding bitgen with seed 7765197739590663652
+I20260914 18:41:33.125044 300044 dfly_bench.cc:1640] Seeding bitgen with seed 476119186086517554
+I20260914 18:41:33.125003 300032 dfly_bench.cc:1640] Seeding bitgen with seed 2374140562606152737
+Coordinated omission mode - the rate is determined by the server
+I20260914 18:41:33.209561 300028 dfly_bench.cc:1686] Coordinated omission mode - the rate is determined by the server
+I20260914 18:41:33.212987 300031 dfly_bench.cc:1418] Started watching
+5s: 1.7% done, RPS(now/agg): 776927/776927, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 1.67%, done_max: 1.67%, p99_lat(us): 5978, max_pending: 1
+I20260914 18:41:38.213689 300031 dfly_bench.cc:1466] 5s: 1.7% done, RPS(now/agg): 776927/776927, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 1.67%, done_max: 1.67%, p99_lat(us): 5978, max_pending: 1
+10s: 3.3% done, RPS(now/agg): 738703/757815, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 3.33%, done_max: 3.33%, p99_lat(us): 6313, max_pending: 1
+I20260914 18:41:43.214650 300031 dfly_bench.cc:1466] 10s: 3.3% done, RPS(now/agg): 738703/757815, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 3.33%, done_max: 3.33%, p99_lat(us): 6313, max_pending: 1
+15s: 5.0% done, RPS(now/agg): 777470/764317, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 5.00%, done_max: 5.00%, p99_lat(us): 6162, max_pending: 1
+I20260914 18:41:48.215709 300031 dfly_bench.cc:1466] 15s: 5.0% done, RPS(now/agg): 777470/764317, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 5.00%, done_max: 5.00%, p99_lat(us): 6162, max_pending: 1
+20s: 6.7% done, RPS(now/agg): 779451/768061, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 6.67%, done_max: 6.67%, p99_lat(us): 6107, max_pending: 1
+I20260914 18:41:53.216475 300031 dfly_bench.cc:1466] 20s: 6.7% done, RPS(now/agg): 779451/768061, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 6.67%, done_max: 6.67%, p99_lat(us): 6107, max_pending: 1
+25s: 8.3% done, RPS(now/agg): 775170/769483, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 8.33%, done_max: 8.33%, p99_lat(us): 6201, max_pending: 1
+I20260914 18:41:58.217540 300031 dfly_bench.cc:1466] 25s: 8.3% done, RPS(now/agg): 775170/769483, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 8.33%, done_max: 8.33%, p99_lat(us): 6201, max_pending: 1
+30s: 10.0% done, RPS(now/agg): 779043/771077, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 10.00%, done_max: 10.00%, p99_lat(us): 5983, max_pending: 1
+I20260914 18:42:03.218293 300031 dfly_bench.cc:1466] 30s: 10.0% done, RPS(now/agg): 779043/771077, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 10.00%, done_max: 10.00%, p99_lat(us): 5983, max_pending: 1
+35s: 11.7% done, RPS(now/agg): 778291/772085, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 11.67%, done_max: 11.67%, p99_lat(us): 6066, max_pending: 1
+I20260914 18:42:08.218973 300031 dfly_bench.cc:1466] 35s: 11.7% done, RPS(now/agg): 778291/772085, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 11.67%, done_max: 11.67%, p99_lat(us): 6066, max_pending: 1
+40s: 13.3% done, RPS(now/agg): 778314/772844, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 13.34%, done_max: 13.34%, p99_lat(us): 6089, max_pending: 1
+I20260914 18:42:13.219739 300031 dfly_bench.cc:1466] 40s: 13.3% done, RPS(now/agg): 778314/772844, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 13.34%, done_max: 13.34%, p99_lat(us): 6089, max_pending: 1
+45s: 15.0% done, RPS(now/agg): 778671/773491, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 15.00%, done_max: 15.00%, p99_lat(us): 6105, max_pending: 1
+I20260914 18:42:18.220436 300031 dfly_bench.cc:1466] 45s: 15.0% done, RPS(now/agg): 778671/773491, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 15.00%, done_max: 15.00%, p99_lat(us): 6105, max_pending: 1
+50s: 16.7% done, RPS(now/agg): 777130/773840, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 16.67%, done_max: 16.67%, p99_lat(us): 6173, max_pending: 1
+I20260914 18:42:23.221393 300031 dfly_bench.cc:1466] 50s: 16.7% done, RPS(now/agg): 777130/773840, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 16.67%, done_max: 16.67%, p99_lat(us): 6173, max_pending: 1
+55s: 18.3% done, RPS(now/agg): 779186/774312, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 18.34%, done_max: 18.34%, p99_lat(us): 6074, max_pending: 1
+I20260914 18:42:28.222178 300031 dfly_bench.cc:1466] 55s: 18.3% done, RPS(now/agg): 779186/774312, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 18.34%, done_max: 18.34%, p99_lat(us): 6074, max_pending: 1
+60s: 20.0% done, RPS(now/agg): 778807/774673, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 20.00%, done_max: 20.00%, p99_lat(us): 6120, max_pending: 1
+I20260914 18:42:33.223213 300031 dfly_bench.cc:1466] 60s: 20.0% done, RPS(now/agg): 778807/774673, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 20.00%, done_max: 20.00%, p99_lat(us): 6120, max_pending: 1
+65s: 21.7% done, RPS(now/agg): 770349/774341, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 21.67%, done_max: 21.67%, p99_lat(us): 6091, max_pending: 1
+I20260914 18:42:38.224261 300031 dfly_bench.cc:1466] 65s: 21.7% done, RPS(now/agg): 770349/774341, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 21.67%, done_max: 21.67%, p99_lat(us): 6091, max_pending: 1
+70s: 23.3% done, RPS(now/agg): 777550/774559, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 23.34%, done_max: 23.34%, p99_lat(us): 5992, max_pending: 1
+I20260914 18:42:43.225340 300031 dfly_bench.cc:1466] 70s: 23.3% done, RPS(now/agg): 777550/774559, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 23.34%, done_max: 23.34%, p99_lat(us): 5992, max_pending: 1
+75s: 25.0% done, RPS(now/agg): 779993/774921, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 25.00%, done_max: 25.00%, p99_lat(us): 6018, max_pending: 1
+I20260914 18:42:48.226783 300031 dfly_bench.cc:1466] 75s: 25.0% done, RPS(now/agg): 779993/774921, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 25.00%, done_max: 25.00%, p99_lat(us): 6018, max_pending: 1
+80s: 26.7% done, RPS(now/agg): 780498/775260, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 26.67%, done_max: 26.67%, p99_lat(us): 6111, max_pending: 1
+I20260914 18:42:53.228056 300031 dfly_bench.cc:1466] 80s: 26.7% done, RPS(now/agg): 780498/775260, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 26.67%, done_max: 26.67%, p99_lat(us): 6111, max_pending: 1
+85s: 28.3% done, RPS(now/agg): 778802/775468, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 28.34%, done_max: 28.34%, p99_lat(us): 5986, max_pending: 1
+I20260914 18:42:58.229477 300031 dfly_bench.cc:1466] 85s: 28.3% done, RPS(now/agg): 778802/775468, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 28.34%, done_max: 28.34%, p99_lat(us): 5986, max_pending: 1
+90s: 30.0% done, RPS(now/agg): 780679/775758, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 30.01%, done_max: 30.01%, p99_lat(us): 5990, max_pending: 1
+I20260914 18:43:03.230840 300031 dfly_bench.cc:1466] 90s: 30.0% done, RPS(now/agg): 780679/775758, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 30.01%, done_max: 30.01%, p99_lat(us): 5990, max_pending: 1
+95s: 31.7% done, RPS(now/agg): 782454/776102, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 31.67%, done_max: 31.67%, p99_lat(us): 5966, max_pending: 1
+I20260914 18:43:08.232156 300031 dfly_bench.cc:1466] 95s: 31.7% done, RPS(now/agg): 782454/776102, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 31.67%, done_max: 31.67%, p99_lat(us): 5966, max_pending: 1
+100s: 33.3% done, RPS(now/agg): 776659/776130, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 33.34%, done_max: 33.34%, p99_lat(us): 6199, max_pending: 1
+I20260914 18:43:13.233553 300031 dfly_bench.cc:1466] 100s: 33.3% done, RPS(now/agg): 776659/776130, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 33.34%, done_max: 33.34%, p99_lat(us): 6199, max_pending: 1
+105s: 35.0% done, RPS(now/agg): 775764/776105, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 35.01%, done_max: 35.01%, p99_lat(us): 6081, max_pending: 1
+I20260914 18:43:18.235307 300031 dfly_bench.cc:1466] 105s: 35.0% done, RPS(now/agg): 775764/776105, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 35.01%, done_max: 35.01%, p99_lat(us): 6081, max_pending: 1
+110s: 36.7% done, RPS(now/agg): 776708/776133, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 36.67%, done_max: 36.67%, p99_lat(us): 6163, max_pending: 1
+I20260914 18:43:23.236924 300031 dfly_bench.cc:1466] 110s: 36.7% done, RPS(now/agg): 776708/776133, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 36.67%, done_max: 36.67%, p99_lat(us): 6163, max_pending: 1
+115s: 38.3% done, RPS(now/agg): 750739/775022, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 38.34%, done_max: 38.34%, p99_lat(us): 6047, max_pending: 1
+I20260914 18:43:28.238555 300031 dfly_bench.cc:1466] 115s: 38.3% done, RPS(now/agg): 750739/775022, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 38.34%, done_max: 38.34%, p99_lat(us): 6047, max_pending: 1
+120s: 40.0% done, RPS(now/agg): 779030/775189, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 40.01%, done_max: 40.01%, p99_lat(us): 6078, max_pending: 1
+I20260914 18:43:33.240006 300031 dfly_bench.cc:1466] 120s: 40.0% done, RPS(now/agg): 779030/775189, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 40.01%, done_max: 40.01%, p99_lat(us): 6078, max_pending: 1
+125s: 41.7% done, RPS(now/agg): 775566/775198, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 41.68%, done_max: 41.68%, p99_lat(us): 6111, max_pending: 1
+I20260914 18:43:38.241593 300031 dfly_bench.cc:1466] 125s: 41.7% done, RPS(now/agg): 775566/775198, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 41.68%, done_max: 41.68%, p99_lat(us): 6111, max_pending: 1
+130s: 43.3% done, RPS(now/agg): 779672/775370, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 43.34%, done_max: 43.34%, p99_lat(us): 5999, max_pending: 1
+I20260914 18:43:43.242970 300031 dfly_bench.cc:1466] 130s: 43.3% done, RPS(now/agg): 779672/775370, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 43.34%, done_max: 43.34%, p99_lat(us): 5999, max_pending: 1
+135s: 45.0% done, RPS(now/agg): 770600/775187, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 45.01%, done_max: 45.01%, p99_lat(us): 6180, max_pending: 1
+I20260914 18:43:48.244740 300031 dfly_bench.cc:1466] 135s: 45.0% done, RPS(now/agg): 770600/775187, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 45.01%, done_max: 45.01%, p99_lat(us): 6180, max_pending: 1
+140s: 46.7% done, RPS(now/agg): 776114/775215, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 46.68%, done_max: 46.68%, p99_lat(us): 6099, max_pending: 1
+I20260914 18:43:53.246268 300031 dfly_bench.cc:1466] 140s: 46.7% done, RPS(now/agg): 776114/775215, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 46.68%, done_max: 46.68%, p99_lat(us): 6099, max_pending: 1
+145s: 48.3% done, RPS(now/agg): 778460/775327, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 48.34%, done_max: 48.34%, p99_lat(us): 5987, max_pending: 1
+I20260914 18:43:58.248113 300031 dfly_bench.cc:1466] 145s: 48.3% done, RPS(now/agg): 778460/775327, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 48.34%, done_max: 48.34%, p99_lat(us): 5987, max_pending: 1
+150s: 50.0% done, RPS(now/agg): 776303/775354, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 50.01%, done_max: 50.01%, p99_lat(us): 6236, max_pending: 1
+I20260914 18:44:03.249768 300031 dfly_bench.cc:1466] 150s: 50.0% done, RPS(now/agg): 776303/775354, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 50.01%, done_max: 50.01%, p99_lat(us): 6236, max_pending: 1
+155s: 51.7% done, RPS(now/agg): 776073/775372, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 51.68%, done_max: 51.68%, p99_lat(us): 6137, max_pending: 1
+I20260914 18:44:08.252048 300031 dfly_bench.cc:1466] 155s: 51.7% done, RPS(now/agg): 776073/775372, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 51.68%, done_max: 51.68%, p99_lat(us): 6137, max_pending: 1
+160s: 53.3% done, RPS(now/agg): 777780/775443, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 53.35%, done_max: 53.35%, p99_lat(us): 6126, max_pending: 1
+I20260914 18:44:13.253688 300031 dfly_bench.cc:1466] 160s: 53.3% done, RPS(now/agg): 777780/775443, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 53.35%, done_max: 53.35%, p99_lat(us): 6126, max_pending: 1
+165s: 55.0% done, RPS(now/agg): 778826/775541, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 55.01%, done_max: 55.01%, p99_lat(us): 5938, max_pending: 1
+I20260914 18:44:18.255477 300031 dfly_bench.cc:1466] 165s: 55.0% done, RPS(now/agg): 778826/775541, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 55.01%, done_max: 55.01%, p99_lat(us): 5938, max_pending: 1
+170s: 56.7% done, RPS(now/agg): 781233/775703, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 56.68%, done_max: 56.68%, p99_lat(us): 6071, max_pending: 1
+I20260914 18:44:23.257476 300031 dfly_bench.cc:1466] 170s: 56.7% done, RPS(now/agg): 781233/775703, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 56.68%, done_max: 56.68%, p99_lat(us): 6071, max_pending: 1
+175s: 58.3% done, RPS(now/agg): 777032/775741, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 58.35%, done_max: 58.35%, p99_lat(us): 6164, max_pending: 1
+I20260914 18:44:28.259317 300031 dfly_bench.cc:1466] 175s: 58.3% done, RPS(now/agg): 777032/775741, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 58.35%, done_max: 58.35%, p99_lat(us): 6164, max_pending: 1
+180s: 60.0% done, RPS(now/agg): 776153/775749, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 60.02%, done_max: 60.02%, p99_lat(us): 6098, max_pending: 1
+I20260914 18:44:33.261350 300031 dfly_bench.cc:1466] 180s: 60.0% done, RPS(now/agg): 776153/775749, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 60.02%, done_max: 60.02%, p99_lat(us): 6098, max_pending: 1
+185s: 61.7% done, RPS(now/agg): 775854/775751, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 61.68%, done_max: 61.68%, p99_lat(us): 6081, max_pending: 1
+I20260914 18:44:38.263525 300031 dfly_bench.cc:1466] 185s: 61.7% done, RPS(now/agg): 775854/775751, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 61.68%, done_max: 61.68%, p99_lat(us): 6081, max_pending: 1
+190s: 63.4% done, RPS(now/agg): 743761/774905, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 63.35%, done_max: 63.35%, p99_lat(us): 6325, max_pending: 1
+I20260914 18:44:43.265558 300031 dfly_bench.cc:1466] 190s: 63.4% done, RPS(now/agg): 743761/774905, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 63.35%, done_max: 63.35%, p99_lat(us): 6325, max_pending: 1
+195s: 65.0% done, RPS(now/agg): 773750/774872, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 65.02%, done_max: 65.02%, p99_lat(us): 6347, max_pending: 1
+I20260914 18:44:48.267591 300031 dfly_bench.cc:1466] 195s: 65.0% done, RPS(now/agg): 773750/774872, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 65.02%, done_max: 65.02%, p99_lat(us): 6347, max_pending: 1
+200s: 66.7% done, RPS(now/agg): 777898/774947, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 66.69%, done_max: 66.69%, p99_lat(us): 6096, max_pending: 1
+I20260914 18:44:53.269651 300031 dfly_bench.cc:1466] 200s: 66.7% done, RPS(now/agg): 777898/774947, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 66.69%, done_max: 66.69%, p99_lat(us): 6096, max_pending: 1
+205s: 68.4% done, RPS(now/agg): 779132/775046, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 68.35%, done_max: 68.35%, p99_lat(us): 5986, max_pending: 1
+I20260914 18:44:58.271965 300031 dfly_bench.cc:1466] 205s: 68.4% done, RPS(now/agg): 779132/775046, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 68.35%, done_max: 68.35%, p99_lat(us): 5986, max_pending: 1
+210s: 70.0% done, RPS(now/agg): 778185/775120, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 70.02%, done_max: 70.02%, p99_lat(us): 6107, max_pending: 1
+I20260914 18:45:03.274114 300031 dfly_bench.cc:1466] 210s: 70.0% done, RPS(now/agg): 778185/775120, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 70.02%, done_max: 70.02%, p99_lat(us): 6107, max_pending: 1
+215s: 71.7% done, RPS(now/agg): 780186/775238, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 71.69%, done_max: 71.69%, p99_lat(us): 5991, max_pending: 1
+I20260914 18:45:08.276357 300031 dfly_bench.cc:1466] 215s: 71.7% done, RPS(now/agg): 780186/775238, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 71.69%, done_max: 71.69%, p99_lat(us): 5991, max_pending: 1
+220s: 73.4% done, RPS(now/agg): 780145/775350, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 73.35%, done_max: 73.35%, p99_lat(us): 5950, max_pending: 1
+I20260914 18:45:13.278853 300031 dfly_bench.cc:1466] 220s: 73.4% done, RPS(now/agg): 780145/775350, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 73.35%, done_max: 73.35%, p99_lat(us): 5950, max_pending: 1
+225s: 75.0% done, RPS(now/agg): 765067/775118, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 75.02%, done_max: 75.02%, p99_lat(us): 6358, max_pending: 1
+I20260914 18:45:18.280864 300031 dfly_bench.cc:1466] 225s: 75.0% done, RPS(now/agg): 765067/775118, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 75.02%, done_max: 75.02%, p99_lat(us): 6358, max_pending: 1
+230s: 76.7% done, RPS(now/agg): 773219/775077, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 76.69%, done_max: 76.69%, p99_lat(us): 6343, max_pending: 1
+I20260914 18:45:23.283258 300031 dfly_bench.cc:1466] 230s: 76.7% done, RPS(now/agg): 773219/775077, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 76.69%, done_max: 76.69%, p99_lat(us): 6343, max_pending: 1
+235s: 78.4% done, RPS(now/agg): 780861/775200, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 78.36%, done_max: 78.36%, p99_lat(us): 6017, max_pending: 1
+I20260914 18:45:28.285588 300031 dfly_bench.cc:1466] 235s: 78.4% done, RPS(now/agg): 780861/775200, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 78.36%, done_max: 78.36%, p99_lat(us): 6017, max_pending: 1
+240s: 80.0% done, RPS(now/agg): 778323/775261, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 80.02%, done_max: 80.02%, p99_lat(us): 6104, max_pending: 1
+I20260914 18:45:33.287806 300031 dfly_bench.cc:1466] 240s: 80.0% done, RPS(now/agg): 778323/775261, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 80.02%, done_max: 80.02%, p99_lat(us): 6104, max_pending: 1
+245s: 81.7% done, RPS(now/agg): 778935/775336, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 81.69%, done_max: 81.69%, p99_lat(us): 6001, max_pending: 1
+I20260914 18:45:38.290154 300031 dfly_bench.cc:1466] 245s: 81.7% done, RPS(now/agg): 778935/775336, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 81.69%, done_max: 81.69%, p99_lat(us): 6001, max_pending: 1
+250s: 83.4% done, RPS(now/agg): 778891/775408, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 83.36%, done_max: 83.36%, p99_lat(us): 6042, max_pending: 1
+I20260914 18:45:43.292394 300031 dfly_bench.cc:1466] 250s: 83.4% done, RPS(now/agg): 778891/775408, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 83.36%, done_max: 83.36%, p99_lat(us): 6042, max_pending: 1
+255s: 85.0% done, RPS(now/agg): 781315/775523, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 85.03%, done_max: 85.03%, p99_lat(us): 5855, max_pending: 1
+I20260914 18:45:48.294679 300031 dfly_bench.cc:1466] 255s: 85.0% done, RPS(now/agg): 781315/775523, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 85.03%, done_max: 85.03%, p99_lat(us): 5855, max_pending: 1
+260s: 86.7% done, RPS(now/agg): 781899/775643, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 86.69%, done_max: 86.69%, p99_lat(us): 5980, max_pending: 1
+I20260914 18:45:53.297036 300031 dfly_bench.cc:1466] 260s: 86.7% done, RPS(now/agg): 781899/775643, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 86.69%, done_max: 86.69%, p99_lat(us): 5980, max_pending: 1
+265s: 88.4% done, RPS(now/agg): 776214/775654, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 88.36%, done_max: 88.36%, p99_lat(us): 6118, max_pending: 1
+I20260914 18:45:58.299589 300031 dfly_bench.cc:1466] 265s: 88.4% done, RPS(now/agg): 776214/775654, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 88.36%, done_max: 88.36%, p99_lat(us): 6118, max_pending: 1
+270s: 90.0% done, RPS(now/agg): 774733/775634, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 90.03%, done_max: 90.03%, p99_lat(us): 6159, max_pending: 1
+I20260914 18:46:03.302398 300031 dfly_bench.cc:1466] 270s: 90.0% done, RPS(now/agg): 774733/775634, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 90.03%, done_max: 90.03%, p99_lat(us): 6159, max_pending: 1
+275s: 91.7% done, RPS(now/agg): 781626/775740, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 91.70%, done_max: 91.70%, p99_lat(us): 5984, max_pending: 1
+I20260914 18:46:08.305099 300031 dfly_bench.cc:1466] 275s: 91.7% done, RPS(now/agg): 781626/775740, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 91.70%, done_max: 91.70%, p99_lat(us): 5984, max_pending: 1
+280s: 93.4% done, RPS(now/agg): 742925/775154, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 93.36%, done_max: 93.36%, p99_lat(us): 6210, max_pending: 1
+I20260914 18:46:13.307411 300031 dfly_bench.cc:1466] 280s: 93.4% done, RPS(now/agg): 742925/775154, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 93.36%, done_max: 93.36%, p99_lat(us): 6210, max_pending: 1
+285s: 95.0% done, RPS(now/agg): 775649/775163, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 95.03%, done_max: 95.03%, p99_lat(us): 6141, max_pending: 1
+I20260914 18:46:18.309536 300031 dfly_bench.cc:1466] 285s: 95.0% done, RPS(now/agg): 775649/775163, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 95.03%, done_max: 95.03%, p99_lat(us): 6141, max_pending: 1
+290s: 96.7% done, RPS(now/agg): 768869/775051, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 96.70%, done_max: 96.70%, p99_lat(us): 6269, max_pending: 1
+I20260914 18:46:23.312512 300031 dfly_bench.cc:1466] 290s: 96.7% done, RPS(now/agg): 768869/775051, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 96.70%, done_max: 96.70%, p99_lat(us): 6269, max_pending: 1
+295s: 98.4% done, RPS(now/agg): 771595/774990, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 98.37%, done_max: 98.37%, p99_lat(us): 6249, max_pending: 1
+I20260914 18:46:28.315742 300031 dfly_bench.cc:1466] 295s: 98.4% done, RPS(now/agg): 771595/774990, errs: 0, hitrate: 0.0%, clients: 640
+done_min: 98.37%, done_max: 98.37%, p99_lat(us): 6249, max_pending: 1
+I20260914 18:46:33.212813 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.212882 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.212883 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.212922 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213008 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213030 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213042 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213040 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213110 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213037 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213011 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213132 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213009 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213163 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213150 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213188 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213040 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213156 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213246 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213136 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213194 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213119 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213286 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213289 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213219 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213270 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213326 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213296 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213333 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213292 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213344 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213166 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213367 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213038 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213377 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213455 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213464 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213426 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213486 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213404 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213318 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213368 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213546 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213231 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213496 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213444 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213580 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213591 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213395 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213625 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213629 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213644 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213449 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213563 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213383 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213294 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213686 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213529 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213732 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213688 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213593 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213754 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213217 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213759 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213770 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213743 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213635 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213382 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213500 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213709 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213685 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213510 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213581 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213449 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213704 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213835 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213721 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213824 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213801 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213848 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213779 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213713 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213632 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213822 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213860 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213817 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213868 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213845 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213836 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213850 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213829 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213862 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213915 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213879 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213935 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213871 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213938 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213917 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213956 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213901 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213932 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213873 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213891 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213992 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213958 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214003 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213902 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213922 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214020 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213943 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214026 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214036 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213979 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213981 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214066 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213907 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213845 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214032 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214035 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213922 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214008 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214032 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213902 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214089 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.213975 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213968 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214128 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214154 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214164 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214172 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214180 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214123 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214128 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214201 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214072 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213907 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214223 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214237 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.213994 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214244 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214136 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214092 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214121 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214258 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214221 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214262 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214027 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214264 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214136 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214303 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214126 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214304 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214131 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214301 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214321 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214252 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214300 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214192 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214118 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214291 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214323 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214362 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214226 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214362 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214308 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214144 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214380 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214360 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214402 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214368 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214265 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214406 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214421 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214071 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214357 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214419 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214326 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214340 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214442 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214447 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214448 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214423 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214454 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214380 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214460 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214387 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214417 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214478 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214439 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214488 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214380 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214465 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214382 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214424 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214509 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214383 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214538 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214540 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214490 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214476 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214481 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214334 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214500 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214489 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214347 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214448 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214581 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214565 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214589 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214632 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214572 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214640 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214648 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214656 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214658 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214557 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214591 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214679 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214499 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214692 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214689 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214696 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214700 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214506 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214711 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214715 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214432 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214718 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214571 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214738 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214736 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214578 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214560 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214689 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214771 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214740 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214708 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214794 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214705 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214649 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214748 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214596 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214805 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214738 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214766 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214670 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214828 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214504 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214802 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214540 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214772 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214830 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214802 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214573 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214780 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214880 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214819 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214840 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214859 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214843 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214816 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214895 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214895 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214908 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214887 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214823 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214926 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214890 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214901 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214955 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214905 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214974 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214977 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214984 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214900 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214993 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214756 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214995 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214936 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214937 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215021 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214846 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214906 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214993 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215004 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214959 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214920 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214944 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.214913 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214901 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215034 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215054 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215078 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215029 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215091 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215049 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215096 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215041 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214869 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214600 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.214907 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215113 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215137 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215142 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215116 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215031 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215149 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215160 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215065 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215022 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215034 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215164 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215181 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215193 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215101 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215202 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215083 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215152 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215117 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215224 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215153 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215248 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215123 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215193 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215268 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215283 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215288 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215299 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215188 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215306 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215303 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215157 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215317 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215240 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215083 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215242 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215337 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215340 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215342 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215350 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215086 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215222 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215325 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215360 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215364 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215313 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215373 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215050 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215384 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215270 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215345 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215415 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215427 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215404 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215380 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215440 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215204 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215344 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215157 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215441 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215327 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215349 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215447 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215451 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215401 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215457 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215492 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215199 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215381 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215440 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215484 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215504 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215456 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215523 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215533 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215529 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215412 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215497 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215409 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215448 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215509 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215571 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215540 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215569 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215551 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215507 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215571 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215430 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215586 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215582 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215512 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215518 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215613 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215610 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215642 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215579 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215502 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215616 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215652 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215612 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215564 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215564 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215684 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215489 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215585 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215700 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215606 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215683 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215622 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215463 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215698 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215584 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215709 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215725 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215674 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215709 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215716 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215721 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215649 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215701 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215739 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215742 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215611 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215719 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215740 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215780 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215751 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215749 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215728 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215801 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215691 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215763 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215699 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215775 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215763 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215828 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215772 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215770 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215835 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215822 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215795 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215775 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215848 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215862 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215837 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215867 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215742 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215862 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215941 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215766 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215873 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215873 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215929 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215917 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215888 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215982 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215824 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215984 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215996 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215966 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215950 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216012 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215936 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215806 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216019 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216017 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215865 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215870 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215896 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215973 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215973 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216039 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216041 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216023 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216038 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.215806 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216058 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216039 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216089 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216077 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216099 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216059 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216053 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216053 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216054 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216114 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216046 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216107 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216122 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216048 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.215972 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216140 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216109 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216078 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216151 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216123 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216157 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216164 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216161 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216121 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216090 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216135 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216123 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216171 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216161 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216148 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216148 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216207 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216190 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216078 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216073 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216226 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216064 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216202 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216202 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216238 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216243 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216148 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216204 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216249 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216257 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216223 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216164 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216224 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216281 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216249 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216303 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216310 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216185 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216233 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216269 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216189 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216245 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216324 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216306 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216209 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216307 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216336 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216277 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216334 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216336 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216354 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216301 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216280 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216351 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216343 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216343 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216325 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216361 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216404 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216337 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216419 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216416 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216425 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216302 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216325 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216364 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216418 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216423 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216396 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216427 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216455 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216507 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216459 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216518 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216370 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216470 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216533 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216385 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216411 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216562 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216565 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216529 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216378 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216464 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216481 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216457 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216385 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216589 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216455 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216583 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216542 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216465 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216584 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216552 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216482 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216630 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216428 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216639 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216553 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216588 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216629 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216643 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216588 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216640 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216663 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216589 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216650 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216603 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216549 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216655 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216665 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216675 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216671 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216655 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216636 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216691 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216713 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216636 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216684 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216707 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216703 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216723 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216662 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216704 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216686 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216715 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216745 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216711 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216756 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216737 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216755 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216796 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216672 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216814 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216604 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216728 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216797 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216751 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216722 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216786 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216747 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216818 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216851 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216717 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216809 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216835 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216812 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216688 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216869 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216730 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216816 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216858 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216876 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216800 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216835 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216884 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216886 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216871 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216866 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216929 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216883 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216920 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216888 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216876 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216918 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216925 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216945 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216867 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216907 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216956 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216953 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216980 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216985 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216959 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216991 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216998 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217002 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216952 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217003 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216914 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216879 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216948 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216876 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217027 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217020 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217023 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217057 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216948 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217047 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.216936 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217043 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217041 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217073 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217087 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217094 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217025 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.216966 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217108 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217113 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217082 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217022 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217084 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217124 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217077 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217127 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217020 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217134 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217134 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217149 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217156 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217140 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217082 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217103 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217000 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217126 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217068 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217036 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217135 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217137 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217201 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217180 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217154 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217098 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217163 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217207 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217183 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217222 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217132 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217208 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217166 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217186 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217190 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217238 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217212 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217152 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217238 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217238 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217229 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217252 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217288 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217263 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217285 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217223 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217311 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217304 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217319 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217310 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217317 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217259 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217293 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217298 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217285 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217345 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217348 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217335 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217344 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217344 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217281 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217366 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217343 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217383 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217393 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217296 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217399 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217305 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217336 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217403 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217433 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217411 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217366 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217455 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217408 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217459 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217448 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217303 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217423 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217475 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217407 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217378 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217489 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217386 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217502 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217476 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217491 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217449 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217499 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217528 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217535 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217499 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217451 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217531 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217545 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217563 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217490 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217554 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217556 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217578 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217538 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217540 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217471 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217589 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217576 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217607 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217555 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217597 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217622 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217504 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217604 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217561 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217628 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217602 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217608 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217641 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217653 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217505 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217674 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217653 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217633 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217598 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217614 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217646 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217656 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217604 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217667 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217731 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217706 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217692 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217671 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217738 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217743 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217700 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217696 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217702 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217749 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217752 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217760 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217764 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217686 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217747 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217777 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217792 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217772 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217785 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217751 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217762 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217808 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217772 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217814 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217821 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217808 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217840 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217753 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217818 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217834 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217854 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217870 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217819 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217834 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217882 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217862 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217787 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217916 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217891 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217924 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217921 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217836 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217945 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217895 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217941 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217896 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217878 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217927 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217962 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217882 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217831 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217944 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217980 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217957 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217978 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217994 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217973 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217969 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217969 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217973 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217994 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218014 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218009 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218024 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218010 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218035 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218037 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218030 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218022 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218015 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218060 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218065 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218063 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.217983 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218078 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218086 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218043 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218098 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218111 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218056 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218122 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.217974 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218096 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218092 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218067 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218101 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218122 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218142 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218135 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218143 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218174 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218176 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218109 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218194 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218163 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218204 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218206 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218137 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218196 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218199 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218236 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218245 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218258 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218138 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218263 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218266 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218194 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218182 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218283 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218288 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218299 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218175 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218302 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218187 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218308 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218096 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218178 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218228 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218218 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218309 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218328 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218309 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218325 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218225 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218333 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218360 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218341 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218326 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218319 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218304 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218364 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218348 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218356 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218382 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218357 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218372 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218343 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218407 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218412 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218360 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218408 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218422 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218417 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218403 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218355 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218437 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218425 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218452 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218410 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218462 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218461 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218497 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218503 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218427 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218430 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218410 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218530 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218468 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218534 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218492 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218441 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218521 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218536 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218521 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218549 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218528 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218469 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218564 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218573 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218578 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218554 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218588 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218580 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218595 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218590 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218581 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218611 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218603 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218602 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218626 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218581 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218621 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218631 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218638 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218636 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218645 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218652 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218639 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218600 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218607 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218633 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218664 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218658 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218674 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218670 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218679 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218686 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218669 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218698 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218683 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218683 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218719 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218700 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218708 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218695 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218734 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218740 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218735 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218740 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218740 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218756 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218776 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218740 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218792 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218797 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218811 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218765 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218741 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.218830 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218817 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218772 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218786 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218757 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218827 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218861 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218798 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218863 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218865 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218883 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218870 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218868 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218868 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218870 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218901 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218895 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218917 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218930 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218910 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218874 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218910 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218914 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218888 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218921 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218954 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218961 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218962 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218968 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218973 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218964 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218991 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218989 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.218995 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219000 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219028 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219038 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219043 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219058 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219081 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219084 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219084 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219096 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219103 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219121 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219125 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219141 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219165 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219188 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219208 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219228 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219249 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219259 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219269 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219269 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219290 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219300 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219303 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219324 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219600 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219614 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219672 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219686 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219823 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219846 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219811 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219852 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219868 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219831 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219842 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219879 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219892 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219903 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219915 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219823 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219871 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219847 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219875 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219842 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219862 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219864 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219887 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219901 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219843 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219955 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219889 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219975 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219892 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219950 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219985 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219995 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220000 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219944 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.219964 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220000 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220013 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220011 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219964 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219992 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220013 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.219986 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220034 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220005 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220036 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220052 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220048 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220052 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220002 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220093 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220047 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220058 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220064 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220060 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220093 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220116 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220121 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220117 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220119 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220122 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220124 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220148 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220144 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220129 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220118 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220151 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220124 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220140 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220176 300034 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220182 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220178 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220193 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220134 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220206 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220140 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220209 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220146 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220216 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220224 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220178 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220201 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220255 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220228 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220211 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220230 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220227 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220263 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220266 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220206 300034 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220300 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220297 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220283 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220242 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220285 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220305 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220306 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220321 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220335 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220285 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220304 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220347 300034 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.220335 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220341 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220304 300042 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220369 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220377 300042 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220343 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220371 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220418 300042 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.220383 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220363 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220510 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220352 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220340 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220363 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220381 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220438 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220538 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220450 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220388 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220506 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220564 300030 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220517 300033 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220582 300033 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220554 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220575 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220561 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220579 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220543 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220572 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220616 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220579 300030 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220535 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220631 300033 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.220634 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220389 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220610 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220564 300031 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220647 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220664 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220654 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220655 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220659 300031 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220659 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220655 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220691 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220703 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220709 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220664 300030 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.220721 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220700 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220731 300031 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.220715 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220747 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220767 300029 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220767 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220778 300029 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220826 300029 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.220861 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220870 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220877 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.220886 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220908 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.220928 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.221520 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.221527 300038 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.221534 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.221536 300038 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.221544 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.221553 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.221572 300038 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.221776 300043 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.221787 300043 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.221827 300043 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.221909 300039 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.221912 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.221925 300039 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.221927 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.221932 300037 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.221941 300037 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.221966 300039 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.221978 300037 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.222519 300040 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.222532 300040 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.222551 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.222563 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.222574 300035 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.222564 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.222579 300041 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.222570 300040 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.222587 300036 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.222604 300041 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.222576 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.222609 300036 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.222596 300035 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.222641 300032 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.222642 300041 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.222654 300032 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.222656 300035 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.222668 300044 dfly_bench.cc:926] Done queuing 4294967295 requests, which took 300.0s. Waiting for server processing
+I20260914 18:46:33.222651 300036 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.222683 300044 dfly_bench.cc:1001] ReceiveFb done
+I20260914 18:46:33.222705 300032 dfly_bench.cc:1126] Total hits: 0
+I20260914 18:46:33.222729 300044 dfly_bench.cc:1126] Total hits: 0
+300s: 100.0% done, RPS(now/agg): 751439/774598, errs: 0, hitrate: 0.0%, clients: 0
+done_min: 100.00%, done_max: 100.03%, p99_lat(us): 6278, max_pending: 0
+I20260914 18:46:33.318053 300031 dfly_bench.cc:1466] 300s: 100.0% done, RPS(now/agg): 751439/774598, errs: 0, hitrate: 0.0%, clients: 0
+done_min: 100.00%, done_max: 100.03%, p99_lat(us): 6278, max_pending: 0
+I20260914 18:46:33.318190 300028 dfly_bench.cc:1711] Resetting all threads
+
+Total time: 5m0.009750881s. Overall number of requests: 232459212, QPS: 774447, P99 lat: 6103.93us
+I20260914 18:46:33.320055 300028 dfly_bench.cc:1721] 
+Total time: 5m0.009750881s. Overall number of requests: 232459212, QPS: 774447, P99 lat: 6103.93us
+Latency summary, all times are in usec:
+Count: 232459212 Average: 823.3709
+Min: 139.0000  Median: 586.8349  Max: 213730.0000
+------------------------------------------------------
+[     120,     140 ) 1   0.000%   0.000% 
+[     140,     160 ) 755   0.000%   0.000% 
+[     160,     180 ) 20812   0.009%   0.009% 
+[     180,     200 ) 141890   0.061%   0.070% 
+[     200,     250 ) 2139230   0.920%   0.991% 
+[     250,     300 ) 6391724   2.750%   3.740% #
+[     300,     350 ) 11014979   4.738%   8.479% #
+[     350,     400 ) 15758489   6.779%  15.258% #
+[     400,     450 ) 19162777   8.244%  23.501% ##
+[     450,     500 ) 21431867   9.220%  32.721% ##
+[     500,     600 ) 46256816  19.899%  52.620% ####
+[     600,     700 ) 39868056  17.151%  69.770% ###
+[     700,     800 ) 25549929  10.991%  80.761% ##
+[     800,     900 ) 13584416   5.844%  86.605% #
+[     900,    1000 ) 6588118   2.834%  89.439% #
+[    1000,    1200 ) 5389062   2.318%  91.758% 
+[    1200,    1400 ) 2391530   1.029%  92.786% 
+[    1400,    1600 ) 1410892   0.607%  93.393% 
+[    1600,    1800 ) 1067555   0.459%  93.853% 
+[    1800,    2000 ) 936452   0.403%  94.255% 
+[    2000,    2500 ) 2036756   0.876%  95.132% 
+[    2500,    3000 ) 1786906   0.769%  95.900% 
+[    3000,    3500 ) 1602336   0.689%  96.590% 
+[    3500,    4000 ) 1427791   0.614%  97.204% 
+[    4000,    4500 ) 1256722   0.541%  97.744% 
+[    4500,    5000 ) 1090115   0.469%  98.213% 
+[    5000,    6000 ) 1708997   0.735%  98.949% 
+[    6000,    7000 ) 1151164   0.495%  99.444% 
+[    7000,    8000 ) 690667   0.297%  99.741% 
+[    8000,    9000 ) 316380   0.136%  99.877% 
+[    9000,   10000 ) 134813   0.058%  99.935% 
+[   10000,   12000 ) 97607   0.042%  99.977% 
+[   12000,   14000 ) 24319   0.010%  99.987% 
+[   14000,   16000 ) 5940   0.003%  99.990% 
+[   16000,   18000 ) 2918   0.001%  99.991% 
+[   18000,   20000 ) 2330   0.001%  99.992% 
+[   20000,   25000 ) 5434   0.002%  99.995% 
+[   25000,   30000 ) 3181   0.001%  99.996% 
+[   30000,   35000 ) 2359   0.001%  99.997% 
+[   35000,   40000 ) 1341   0.001%  99.998% 
+[   40000,   45000 ) 793   0.000%  99.998% 
+[   45000,   50000 ) 664   0.000%  99.998% 
+[   50000,   60000 ) 616   0.000%  99.998% 
+[   60000,   70000 ) 605   0.000%  99.999% 
+[   70000,   80000 ) 735   0.000%  99.999% 
+[   80000,   90000 ) 581   0.000%  99.999% 
+[   90000,  100000 ) 423   0.000%  99.999% 
+[  100000,  120000 ) 553   0.000% 100.000% 
+[  120000,  140000 ) 588   0.000% 100.000% 
+[  140000,  160000 ) 37   0.000% 100.000% 
+[  160000,  180000 ) 66   0.000% 100.000% 
+[  180000,  200000 ) 80   0.000% 100.000% 
+[  200000,  250000 ) 45   0.000% 100.000% 
+I20260914 18:46:33.320081 300028 dfly_bench.cc:1730] Latency summary, all times are in usec:
+Count: 232459212 Average: 823.3709
+Min: 139.0000  Median: 586.8349  Max: 213730.0000
+------------------------------------------------------
+[     120,     140 ) 1   0.000%   0.000% 
+[     140,     160 ) 755   0.000%   0.000% 
+[     160,     180 ) 20812   0.009%   0.009% 
+[     180,     200 ) 141890   0.061%   0.070% 
+[     200,     250 ) 2139230   0.920%   0.991% 
+[     250,     300 ) 6391724   2.750%   3.740% #
+[     300,     350 ) 11014979   4.738%   8.479% #
+[     350,     400 ) 15758489   6.779%  15.258% #
+[     400,     450 ) 19162777   8.244%  23.501% ##
+[     450,     500 ) 21431867   9.220%  32.721% ##
+[     500,     600 ) 46256816  19.899%  52.620% ####
+[     600,     700 ) 39868056  17.151%  69.770% ###
+[     700,     800 ) 25549929  10.991%  80.761% ##
+[     800,     900 ) 13584416   5.844%  86.605% #
+[     900,    1000 ) 6588118   2.834%  89.439% #
+[    1000,    1200 ) 5389062   2.318%  91.758% 
+[    1200,    1400 ) 2391530   1.029%  92.786% 
+[    1400,    1600 ) 1410892   0.607%  93.393% 
+[    1600,    1800 ) 1067555   0.459%  93.853% 
+[    1800,    2000 ) 936452   0.403%  94.255% 
+[    2000,    2500 ) 2036756   0.876%  95.132% 
+[    2500,    3000 ) 1786906   0.769%  95.900% 
+[    3000,    3500 ) 1602336   0.689%  96.590% 
+[    3500,    4000 ) 1427791   0.614%  97.204% 
+[    4000,    4500 ) 1256722   0.541%  97.744% 
+[    4500,    5000 ) 1090115   0.469%  98.213% 
+[    5000,    6000 ) 1708997   0.735%  98.949% 
+[    6000,    7000 ) 1151164   0.495%  99.444% 
+[    7000,    8000 ) 690667   0.297%  99.741% 
+[    8000,    9000 ) 316380   0.136%  99.877% 
+[    9000,   10000 ) 134813   0.058%  99.935% 
+[   10000,   12000 ) 97607   0.042%  99.977% 
+[   12000,   14000 ) 24319   0.010%  99.987% 
+[   14000,   16000 ) 5940   0.003%  99.990% 
+[   16000,   18000 ) 2918   0.001%  99.991% 
+[   18000,   20000 ) 2330   0.001%  99.992% 
+[   20000,   25000 ) 5434   0.002%  99.995% 
+[   25000,   30000 ) 3181   0.001%  99.996% 
+[   30000,   35000 ) 2359   0.001%  99.997% 
+[   35000,   40000 ) 1341   0.001%  99.998% 
+[   40000,   45000 ) 793   0.000%  99.998% 
+[   45000,   50000 ) 664   0.000%  99.998% 
+[   50000,   60000 ) 616   0.000%  99.998% 
+[   60000,   70000 ) 605   0.000%  99.999% 
+[   70000,   80000 ) 735   0.000%  99.999% 
+[   80000,   90000 ) 581   0.000%  99.999% 
+[   90000,  100000 ) 423   0.000%  99.999% 
+[  100000,  120000 ) 553   0.000% 100.000% 
+[  120000,  140000 ) 588   0.000% 100.000% 
+[  140000,  160000 ) 37   0.000% 100.000% 
+[  160000,  180000 ) 66   0.000% 100.000% 
+[  180000,  200000 ) 80   0.000% 100.000% 
+[  200000,  250000 ) 45   0.000% 100.000% 

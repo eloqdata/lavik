@@ -1,0 +1,177 @@
+{
+  "configuration": {
+    "server": "172.16.0.4",
+    "port": 6379,
+    "clients": 40,
+    "threads": 16,
+    "pipeline": 1,
+    "ratio": "0:1"
+  },
+  "ALL STATS": {
+    "Runtime": {
+      "Total duration": 3007
+    },
+    "Totals": {
+      "Count": 3236969,
+      "Ops/sec": 1076477.884935,
+      "Average Latency": 0.590522,
+      "Min Latency": 0.216000,
+      "Max Latency": 14.167000,
+      "Percentile Latencies": {
+        "p50.00": 0.571467,
+        "p99.00": 0.981062,
+        "p99.90": 3.196130
+      },
+      "Time-Serie": {
+        "0": {
+          "Count": 1066521,
+          "Ops/sec": 1066521.000000,
+          "Average Latency": 0.596773,
+          "Min Latency": 0.216000,
+          "Max Latency": 14.167000,
+          "p50.00": 0.573611,
+          "p99.00": 1.083362,
+          "p99.90": 3.770393
+        },
+        "1": {
+          "Count": 1077144,
+          "Ops/sec": 1077144.000000,
+          "Average Latency": 0.591197,
+          "Min Latency": 0.232000,
+          "Max Latency": 4.554000,
+          "p50.00": 0.565309,
+          "p99.00": 1.474424,
+          "p99.90": 3.316737
+        },
+        "2": {
+          "Count": 1092089,
+          "Ops/sec": 1092089.000000,
+          "Average Latency": 0.582864,
+          "Min Latency": 0.239000,
+          "Max Latency": 4.096000,
+          "p50.00": 0.575147,
+          "p99.00": 0.866669,
+          "p99.90": 1.572414
+        },
+        "3": {
+          "Count": 1215,
+          "Ops/sec": 1215.000000,
+          "Average Latency": 1.387230,
+          "Min Latency": 0.345000,
+          "Max Latency": 6.668000,
+          "p50.00": 0.791209,
+          "p99.00": 5.666667,
+          "p99.90": 6.666667
+        }
+      }
+    },
+    "Sets": {
+      "Count": 0,
+      "Ops/sec": 0.000000,
+      "Average Latency": 0.000000,
+      "Min Latency": 0.000000,
+      "Max Latency": 0.000000,
+      "Percentile Latencies": {
+        "p50.00": 0.000000,
+        "p99.00": 0.000000,
+        "p99.90": 0.000000
+      },
+      "Time-Serie": {
+        "0": {
+          "Count": 0,
+          "Ops/sec": 0.000000,
+          "Average Latency": 0.000000,
+          "Min Latency": 0.000000,
+          "Max Latency": 0.000000,
+          "p50.00": 0.000000,
+          "p99.00": 0.000000,
+          "p99.90": 0.000000
+        },
+        "1": {
+          "Count": 0,
+          "Ops/sec": 0.000000,
+          "Average Latency": 0.000000,
+          "Min Latency": 0.000000,
+          "Max Latency": 0.000000,
+          "p50.00": 0.000000,
+          "p99.00": 0.000000,
+          "p99.90": 0.000000
+        },
+        "2": {
+          "Count": 0,
+          "Ops/sec": 0.000000,
+          "Average Latency": 0.000000,
+          "Min Latency": 0.000000,
+          "Max Latency": 0.000000,
+          "p50.00": 0.000000,
+          "p99.00": 0.000000,
+          "p99.90": 0.000000
+        },
+        "3": {
+          "Count": 0,
+          "Ops/sec": 0.000000,
+          "Average Latency": 0.000000,
+          "Min Latency": 0.000000,
+          "Max Latency": 0.000000,
+          "p50.00": 0.000000,
+          "p99.00": 0.000000,
+          "p99.90": 0.000000
+        }
+      }
+    },
+    "Gets": {
+      "Count": 3236969,
+      "Ops/sec": 1076477.884935,
+      "Average Latency": 0.590522,
+      "Min Latency": 0.216000,
+      "Max Latency": 14.167000,
+      "Percentile Latencies": {
+        "p50.00": 0.571467,
+        "p99.00": 0.981062,
+        "p99.90": 3.196130
+      },
+      "Time-Serie": {
+        "0": {
+          "Count": 1066521,
+          "Ops/sec": 1066521.000000,
+          "Average Latency": 0.596773,
+          "Min Latency": 0.216000,
+          "Max Latency": 14.167000,
+          "p50.00": 0.573611,
+          "p99.00": 1.083362,
+          "p99.90": 3.770393
+        },
+        "1": {
+          "Count": 1077144,
+          "Ops/sec": 1077144.000000,
+          "Average Latency": 0.591197,
+          "Min Latency": 0.232000,
+          "Max Latency": 4.554000,
+          "p50.00": 0.565309,
+          "p99.00": 1.474424,
+          "p99.90": 3.316737
+        },
+        "2": {
+          "Count": 1092089,
+          "Ops/sec": 1092089.000000,
+          "Average Latency": 0.582864,
+          "Min Latency": 0.239000,
+          "Max Latency": 4.096000,
+          "p50.00": 0.575147,
+          "p99.00": 0.866669,
+          "p99.90": 1.572414
+        },
+        "3": {
+          "Count": 1215,
+          "Ops/sec": 1215.000000,
+          "Average Latency": 1.387230,
+          "Min Latency": 0.345000,
+          "Max Latency": 6.668000,
+          "p50.00": 0.791209,
+          "p99.00": 5.666667,
+          "p99.90": 6.666667
+        }
+      }
+    }
+  }
+}

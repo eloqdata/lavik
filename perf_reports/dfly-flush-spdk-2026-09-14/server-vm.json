@@ -1,0 +1,6 @@
+{
+  "vmSize": "Standard_L16aos_v4",
+  "location": "japaneast",
+  "osType": "Linux",
+  "zone": "3"
+}
