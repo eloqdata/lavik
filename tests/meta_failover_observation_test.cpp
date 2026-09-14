@@ -279,4 +279,51 @@ TEST(MetaFailoverObservationStore,
           .has_value());
 }
 
+TEST(MetaFailoverObservationStore,
+     FailoverLookupKeyIsChargedAgainstBothByteBudgets) {
+  constexpr std::uint64_t kChargedBytes = 121;
+  FailoverFacts facts;
+  facts.transition_ = Controlled(facts);
+  const auto identity = CandidateIdentity(facts);
+
+  // CandidatePrepared retains three copies of the 40-byte node id (identity,
+  // failover_by_node_ key, and payload) plus the one-byte group id.
+  meta::MetaObservationStore::Limits per_node_limits;
+  per_node_limits.max_retained_bytes_total_ = 1000;
+  per_node_limits.max_retained_bytes_per_node_ = kChargedBytes - 1;
+  meta::MetaObservationStore per_node_limited(per_node_limits);
+  ASSERT_TRUE(per_node_limited.AdoptSession(identity, 999).ok());
+  EXPECT_FALSE(
+      per_node_limited
+          .Ingest({.identity_ = identity, .payload_ = CandidatePrepared(facts)},
+                  facts, 1000)
+          .ok());
+  EXPECT_EQ(per_node_limited.retained_bytes(), 0u);
+
+  meta::MetaObservationStore::Limits total_limits;
+  total_limits.max_retained_bytes_total_ = kChargedBytes - 1;
+  total_limits.max_retained_bytes_per_node_ = 1000;
+  meta::MetaObservationStore total_limited(total_limits);
+  ASSERT_TRUE(total_limited.AdoptSession(identity, 999).ok());
+  EXPECT_FALSE(
+      total_limited
+          .Ingest({.identity_ = identity, .payload_ = CandidatePrepared(facts)},
+                  facts, 1000)
+          .ok());
+  EXPECT_EQ(total_limited.retained_bytes(), 0u);
+
+  total_limits.max_retained_bytes_total_ = kChargedBytes;
+  total_limits.max_retained_bytes_per_node_ = kChargedBytes;
+  meta::MetaObservationStore exact_boundary(total_limits);
+  ASSERT_TRUE(exact_boundary.AdoptSession(identity, 999).ok());
+  ASSERT_TRUE(
+      exact_boundary
+          .Ingest({.identity_ = identity, .payload_ = CandidatePrepared(facts)},
+                  facts, 1000)
+          .ok());
+  EXPECT_EQ(exact_boundary.retained_bytes(), kChargedBytes);
+  EXPECT_EQ(exact_boundary.retained_bytes_for_node(facts.candidate_),
+            kChargedBytes);
+}
+
 }  // namespace

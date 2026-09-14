@@ -921,10 +921,10 @@ TEST(MetaModelCommands, RetirePolicyRoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
-// operation journal. operation_id is the client-provided
-// stable UUID and permanent idempotency key; operation_seq = the raft log
-// index of the SubmitOperation command, assigned by apply, and appears
-// in commands only as an archive reference.
+// operation journal. operation_id is the client-provided stable UUID and
+// idempotency key while its live/archive record is retained; operation_seq is
+// the raft log index of the SubmitOperation command, assigned by apply, and
+// appears in commands only as an archive reference.
 // ---------------------------------------------------------------------------
 
 keylane::meta::MetaOperationId MakeOperationId(std::uint8_t seed) {
@@ -2819,8 +2819,8 @@ TEST(MetaStateApply, SubmitOperationSeqIsLogIndexAndActorPersisted) {
   EXPECT_EQ(record->actor_.principal_, kActorPrincipal);
   EXPECT_EQ(record->actor_.readable_time_, kReadableTime);
 
-  // Permanent idempotency: same id + same intent_hash -> idempotent accept,
-  // no second record, no audit growth on the same index.
+  // Retained-record idempotency: same id + same intent_hash -> idempotent
+  // accept, no second record, no audit growth on the same index.
   ApplyOk(stores, 3, MetaCommand{cmd});
   EXPECT_EQ(stores.operation_.LiveCount(), 1u);
   EXPECT_EQ(stores.audit_.size(), 1u);

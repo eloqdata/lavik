@@ -24,8 +24,8 @@ enum class CandidateSelectionBasis : std::uint8_t {
 };
 
 // Immutable result of one internal failover-planning call. It is deliberately
-// not an operation or RPC contract: future failover orchestration consumes the
-// selected observation immediately and owns any later validation it needs.
+// not an operation or RPC contract: the committed failover reconciler consumes
+// the selected observation immediately and owns every later revalidation.
 struct CandidatePlan {
   CandidatePlanDisposition disposition_ =
       CandidatePlanDisposition::kNoEligibleCandidates;

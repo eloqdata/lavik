@@ -204,10 +204,9 @@ struct MetaSourcePausedObs {
 
 struct MetaCandidatePreparedObs {
   // Leader-local authenticated session generation, copied by the observation
-  // store rather than accepted from the wire. It lets the reconciler
-  // distinguish an exact Prepared re-report after promotion's required
-  // history-rotation reconnect from a stale observation withdrawn by a
-  // disconnect.
+  // store rather than accepted from the wire. It binds Prepared to the current
+  // adopted session so a disconnect or superseding session cannot leave stale
+  // action evidence usable by the reconciler.
   std::uint64_t session_generation_ = 0;
   std::string group_id_;
   MetaFailoverTransitionId transition_id_{};
@@ -438,9 +437,15 @@ class MetaObservationStore {
                       const MetaCommittedFacts& facts, int64_t now_unix_ms);
 
   // Replaces common liveness/health and the role-derived candidate state under
-  // one lock. Absence or rejection of candidate evidence clears every older
-  // candidate for this node, so a promotion heartbeat cannot preserve the
-  // node's previous replica role.
+  // one lock. After identity/current-generation admission, candidate and
+  // transition evidence are replace-or-clear: absence or component rejection
+  // clears the corresponding older observation, so a promotion or failed
+  // report cannot preserve a stale role/action fact. Rejecting the heartbeat's
+  // identity leaves the replacement session's state untouched. The final
+  // overload also atomically replaces the session's trusted installed-FDS
+  // projection marker; nullopt clears it. The shorter overloads deliberately
+  // supply nullopt for fields they do not carry and therefore clear them.
+  // Component statuses report partial admission independently.
   HeartbeatReplaceResult ReplaceHeartbeat(
       const MetaObservationIdentity& identity, MetaNodeHealthObs health,
       std::optional<MetaCandidateProgressObs> candidate,
@@ -486,15 +491,22 @@ class MetaObservationStore {
   std::vector<MetaCandidateProgressObs> LiveCandidateProgressFor(
       std::string_view group_id, const MetaCommittedFacts& facts,
       int64_t now_unix_ms) const;
-  // Callers making an authority decision must pass their fixed decision time;
-  // omitting it retains the unexpired-agnostic diagnostic view used by legacy
-  // inspection paths.
+  // Passing a fixed decision time applies the store-wide observation TTL.
+  // Omitting it returns the committed-anchor-matching observation so a caller
+  // can apply its own freshness window, such as failover source grace;
+  // diagnostics may use the same unexpired-agnostic view.
   std::optional<MetaObservation> LatestForNode(
       std::string_view node_id, const MetaCommittedFacts& facts,
       std::optional<int64_t> now_unix_ms = std::nullopt) const;
   std::vector<MetaOperationEvidenceObs> EvidenceForOperation(
       const MetaOperationId& id, const MetaCommittedFacts& facts,
       int64_t now_unix_ms) const;
+  // Returns only TTL-fresh transition evidence that still matches committed
+  // transition, action, membership, boot, and current-session anchors.
+  // SourcePaused is keyed by transition; candidate outcomes additionally bind
+  // the exact action so evidence from a superseded attempt cannot be reused.
+  // Authority decisions correlate candidate results with SessionStateFor's
+  // trusted installed-FDS projection marker.
   std::optional<MetaSourcePausedObs> SourcePausedFor(
       const MetaFailoverTransitionId& transition_id,
       const MetaCommittedFacts& facts, int64_t now_unix_ms) const;
@@ -507,6 +519,9 @@ class MetaObservationStore {
       const MetaFailoverActionId& action_id, const MetaCommittedFacts& facts,
       int64_t now_unix_ms) const;
 
+  // Exposes leader-local authenticated session state for failover liveness
+  // decisions. Disconnect latches and installed-FDS projection markers are
+  // volatile and are reset at a Meta leadership edge.
   std::optional<uint64_t> CurrentGeneration(std::string_view node_id) const;
   std::optional<MetaObservedSessionState> SessionStateFor(
       std::string_view node_id) const;

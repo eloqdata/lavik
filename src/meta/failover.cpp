@@ -365,6 +365,10 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
     if (proposal_now_unix_ms < 0) {
       return Invalid("failover proposal time is invalid");
     }
+    if (!transition->candidate_action_.has_value() &&
+        !set->candidate_action_.has_value()) {
+      return Invalid("uncontrolled failover candidate is absent");
+    }
     MetaStoresFacts facts(view.stores());
     if (transition->candidate_action_.has_value()) {
       const MetaFailoverCandidateAction& current =

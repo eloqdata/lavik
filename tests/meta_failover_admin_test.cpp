@@ -217,6 +217,70 @@ TEST(MetaFailoverOperatorTest, DistinguishesDefinitelyNotSentFromUncertain) {
             std::string_view::npos);
 }
 
+TEST(MetaFailoverOperatorTest,
+     UncertainAndUntrustworthyErrorsPreserveTheExpectedOperationId) {
+  const std::string head = *EncodeClusterHeadReply(LeaderHead());
+  const std::string status = *EncodeClusterStatusReply(ReadyStatus());
+  const MetaOperationId operation_id = Bytes<16>(0x41);
+  const std::array<std::string_view, 5> replies = {
+      "ERR failover 1 proposal timeout",
+      "ERR failover 1 proposal cancelled",
+      "ERR failover 1 proposal propose-failed",
+      "ERR failover 1 proposal uncertain-outcome",
+      "ERR failover 1 unexpected-stage",
+  };
+
+  for (std::string_view reply : replies) {
+    SCOPED_TRACE(reply);
+    ClusterOperator op([&](const MetaAdminTarget&, std::string_view command,
+                           MetaAdminDeadline) -> absl::StatusOr<std::string> {
+      if (command == "clusterhead 1") return head;
+      if (command == "clusterstatus 1") return status;
+      return std::string(reply);
+    });
+    MetaAdminTarget seed{.transport_ = MetaAdminTarget::Transport::kUnix,
+                         .endpoint_ = "/meta.sock"};
+    ClusterStatusOptions status_options;
+    status_options.deadline_ =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    auto outcome =
+        op.Failover(seed,
+                    {.group_id_ = "group-a",
+                     .operation_id_ = operation_id,
+                     .absolute_deadline_unix_ms_ = 1'800'000'000'000},
+                    status_options);
+
+    EXPECT_EQ(outcome.status().code(), absl::StatusCode::kAborted);
+    EXPECT_NE(outcome.status().message().find(
+                  "operation=41414141414141414141414141414141"),
+              std::string_view::npos);
+  }
+}
+
+TEST(MetaFailoverOperatorTest, ProposalResourceExhaustionIsADefiniteRejection) {
+  const std::string head = *EncodeClusterHeadReply(LeaderHead());
+  const std::string status = *EncodeClusterStatusReply(ReadyStatus());
+  ClusterOperator op([&](const MetaAdminTarget&, std::string_view command,
+                         MetaAdminDeadline) -> absl::StatusOr<std::string> {
+    if (command == "clusterhead 1") return head;
+    if (command == "clusterstatus 1") return status;
+    return "ERR failover 1 proposal resource-exhausted";
+  });
+  MetaAdminTarget seed{.transport_ = MetaAdminTarget::Transport::kUnix,
+                       .endpoint_ = "/meta.sock"};
+  ClusterStatusOptions status_options;
+  status_options.deadline_ =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  auto outcome = op.Failover(seed,
+                             {.group_id_ = "group-a",
+                              .operation_id_ = Bytes<16>(0x51),
+                              .absolute_deadline_unix_ms_ = 1'800'000'000'000},
+                             status_options);
+
+  EXPECT_EQ(outcome.status().code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(outcome.status().message(), "proposal resource-exhausted");
+}
+
 TEST(MetaFailoverOperatorTest, ExactRetryIdentityRequiresDeadlinePair) {
   int calls = 0;
   ClusterOperator op([&](const MetaAdminTarget&, std::string_view,

@@ -1,9 +1,9 @@
 # Issue #41 Failover Transition 实施计划
 
-> 状态：本地实施计划 v2，2026-09-13；已纳入实现前设计复核结论。
+> 状态：本地实施计划 v3，2026-09-14；已纳入实现前设计复核和实施中安全审计结论。
 >
 > 实现分支：`codex/issue-41-failover-transition`，基线
-> `a968d002c839828102a44316d43eb7dd63f03f09`（最新 `origin/main`，已包含 #40
+> `646460ac53be4a618a160dcde0ee1dcdd76bdd34`（`origin/main`，已包含 #40
 > 和原子 Cluster Create）。
 >
 > 关联 issue：[#41](https://github.com/thweetkomputer/keylane/issues/41)、
@@ -39,16 +39,13 @@
 
 ## 2. 已验证基线和分支策略
 
-- 当前分支从最新 `origin/main` 新建；旧分支
+- 当前分支从 `origin/main` 新建，并在实施前按要求 rebase 到 `646460a`；旧分支
   `codex/issue-41-controlled-failover` 原样保留，不能整体合并或 rebase 到实现分支。
 - Debug 构建目录位于
   `/mnt/local_nvme/keylane-issue41-redesign/build-debug`。
-- `keylane_unit_tests`、`keylane_meta_tests`、`keylane-meta`、`keylane-ctl`、`keylane`
-  已完整编译。
-- 最新基线 `a968d00` 上 582 个 unit tests（86 suites，约 23.6 秒）和 468 个
-  Meta tests（44 suites，约 48.0 秒）通过。W0 的 process-support 5 个 tests 及
-  population、ReplicationManager、serving-generation、rebuild-failure、
-  rebuild-protocol 5 个独立 CTest cases 也全部通过（后五项约 130 秒）。
+- 基线与最终树都使用同一组 unit、Meta、process-support、population、
+  ReplicationManager、serving-generation、rebuild-failure 和 rebuild-protocol
+  目标；最终精确结果记录在 PR，而不是用本计划替代验证日志。
 - `keylane_cluster_replication_manager_integration_test` 已在 NVMe build 中完整编译；
   它的现有 fixture 已验证会忽略 `TMPDIR` 并硬编码 `/tmp`，因此未将中断的
   运行计为 baseline。W0 先对 test-support temp-root 做无行为变更的机械性修正，
@@ -78,6 +75,12 @@
 - candidate attempt history、failed set、fallback cursor；
 - serving/rebuild/cleanup phase；
 - 给通用 `BeginGroupTerm` 或 `ActivateAuthority` 增加 failover-operation coupling。
+
+实施中确认了一个独立的 Meta session 生命周期前提：外部 shutdown/demotion 可以在
+session coroutine 恢复前回收 Celer `Connection` storage。供应商指针因此更新到已包含
+storage-borrow primitive 的 `celer@f45d90c`；Admin/Data-control 各自用 frame-owned
+move-only token 同时持有 session 注册和 storage borrow，覆盖正常完成以及 `Spawn` 在首次
+resume 前拒绝 task。该修复不引入 failover durable state，也不带回旧分支的 workflow。
 
 ## 3. 实现红线
 
@@ -356,8 +359,9 @@ Operation `kind=failover`、typed intent group/deadline 和 exact revision；pre
 - `FailoverOperationIntent` 只编码 operator 请求：group、absolute deadline 和必要的
   idempotency inputs；successor grant 由 Begin 按 §5.5 快照，不从 operator intent 传入；
 - dedicated failover operator handler 继续用底层 `SubmitOperation(kind=failover)` 提供
-  永久 operation-id 幂等；通用 `submitop`、`completeop`、`abortop` 在 Admin 和 apply
-  两层都拒绝 failover kind；
+  live/archive retention window 内的 operation-id 幂等；archive 被 prune 后该 id 可以
+  重新使用。通用 `submitop`、`completeop`、`abortop` 在 Admin 和 apply 两层都拒绝
+  failover kind；
 - operation 可以在没有 phase blob 的情况下保持 `Submitted`，执行中状态由 Group
   transition 派生；Operation 在 Commit/Abort/Degrade 前始终保持 Submitted，status API
   看到 matching Controlled transition 时投影为 Running；现有 Store 允许从 Submitted
@@ -751,8 +755,10 @@ Failure policy：
 2. deadline 前 Source 已确定替换，或 disconnect/absence source grace 已过：
    Degrade。Candidate 同时失败时在 Degrade 中清 action；仅当它仍 fresh/eligible、
    已授权 `none` 且无 failure/replacement 证据时才声明 retain；
-3. Source 仍健康时，Candidate disconnect/restart/population change/ActionFailed/terminal
-   promotion failure：Abort；不等 Candidate 重启，不降级。
+3. Source 仍健康或尚处在 bounded grace、还没有被确定为失败时，Candidate 的明确
+   disconnect/restart/population change/ActionFailed/terminal promotion failure立即 Abort；
+   不等 Candidate 重启，也不等待 Source grace 来把它重新解释成 Degrade。单纯因新
+   Leader 尚未收到 Candidate 重报而推导出的 absence 仍等待 warmup。
 
 Source 不发 Candidate `ActionFailed`；它的 disconnect/grace/incarnation facts 由 Meta
 从 authenticated session 推导。
@@ -760,6 +766,13 @@ Source 不发 Candidate `ActionFailed`；它的 disconnect/grace/incarnation fac
   Begin 后的 Abort 使用 exact transition form；
 - Abort、Degrade、Authorize、Commit 竞争由 Raft顺序和 transition revision裁决；
 - 每个失败原因写入 Controlled Operation terminal result并对 operator可见。
+
+absolute deadline 是 Leader 的 proposal-admission cutoff，而不是 replicated apply
+读取的墙钟。reconciler 在 cutoff 后只规划 Abort，proposal hook 也拒绝新的 Begin、
+Authorize、Degrade 和 Controlled Commit；cutoff 前已 admission 的命令与 Abort 仍由
+Raft log顺序裁决，并可能在墙钟 deadline 后才获得 quorum commit。若要求严格的
+wall-clock commit cutoff，就必须引入 replicated time oracle或改变 transition协议；让
+各副本在 apply/replay时读取本机时钟会破坏确定性。
 
 ### 11.2 Uncontrolled 推导
 
@@ -944,8 +957,11 @@ failover。覆盖：
 - Cutover后新 Owner再次失败时，已知 availability gap得到明确、非误导性断言。
 
 结构化日志至少包含 transition id、action id、group、mode、event、loss、commit index；
-candidate replacement、domain fallback、degradation、Cutover都记录。日志at-least-once，
-committed audit为权威；metrics不使用 node/action/transition等高基数 label。
+candidate replacement、domain fallback、degradation、Cutover都记录。opaque token值采用
+canonical percent encoding；日志at-least-once并按commit index去重。无法从post-state
+重建原分类或 action id 的 candidate replacement 与 post-Begin Abort exact replay 不重复发
+state-dependent 事件，committed audit仍为权威；metrics不使用node/action/transition等高基数
+label。
 
 同步更新：
 
@@ -964,8 +980,9 @@ committed audit为权威；metrics不使用 node/action/transition等高基数 l
 - 必要时 `docs/operations/README.md`。
 
 W9 建立 issue #41 acceptance criterion → unit/integration/process test 的逐条证据表。提交
-前显式 `git add` 本分支预期交付的新文档：`CONTEXT.md`、`docs/adr/`、
-Redis research 和本 implementation plan；不将未跟踪状态当成“已在提交中”。
+前显式 `git add` 本分支预期交付的新文档：`CONTEXT.md`、`docs/adr/` 和本
+implementation plan；Redis 行为调查保留在 issue/PR 上下文，不将一次性调查写入
+架构文档，也不将未跟踪状态当成“已在提交中”。
 
 ## 13. 文件级改动地图
 
@@ -1053,10 +1070,10 @@ cmake --build "$KEYLANE_ISSUE41_BUILD" --target keylane_cluster_replication_mana
 9. 最终一次完整验证保持全绿；
 10. 检查 architecture claims、public API comments、stale comments 和 issue acceptance
     criterion → test evidence checklist；
-11. 将预期交付的 untracked `CONTEXT.md`、`docs/adr/`、research/plan 文档纳入
-    diff，再按逻辑切片整理 commit，push `codex/issue-41-failover-transition`；
-12. 创建 PR，正文包含 `Closes #41`、明确 #42/#45/#46 out-of-scope、测试命令、loss
-    语义、首版 availability gap和旧分支未整体复用的说明。
+11. 将预期交付的 untracked `CONTEXT.md`、`docs/adr/` 和 plan 文档纳入 diff，
+    再按逻辑切片整理 commit，push `codex/issue-41-failover-transition`；
+12. 创建 PR，正文包含 `Closes #41`、`Supersedes #57`，明确 #42/#45/#46
+    out-of-scope、测试命令、loss语义、首版 availability gap和旧分支未整体复用的说明。
 
 ## 16. 主要风险及停止条件
 
@@ -1073,7 +1090,7 @@ cmake --build "$KEYLANE_ISSUE41_BUILD" --target keylane_cluster_replication_mana
 | generic source cleanup误杀旧 Owner有价值的下游 flow | 拆 source admission、established export、mutation drain、ingress cancel effects；partition fault test观察旧flow |
 | prepared context在action replacement后迟到激活 | action id进入prepared context、grant、FDS和activation四处精确匹配；FullStateApplied barrier test |
 | FDS/lease 在 promotion 完成前打开 write admission，或 Cluster 调用 standalone expiration 配对 | FDS 只 pin intent；lease 只进 NodeControl 不可服务 provisional slot；activation final recheck 后才 `AuthorityGuard::RenewLease`；抽取纯 promotion kernel，Cluster 不 `ResumeExpiration`；counter=0、FDS/lease 乱序、失败/过期始终 fenced 及 deadline-aware authority regression tests |
-| prepare旋转history后计划内重连会被误判为candidate失败 | 仅为installed exact authorized action桥接原session；Cutover/Abort/replacement后强制以child history重连；覆盖wrong-child、boot/action/FDS mismatch和跨Meta Leader重报 |
+| prepare旋转history后普通role暂时消失会被误判为candidate失败 | 仅为installed exact authorized action桥接原session的Prepared；Cutover/Abort/replacement后回到普通child-history身份；覆盖wrong-child、boot/action/FDS mismatch和跨Meta Leader重报 |
 | 误把 Tomb Raider 当成 frontier mutation，引入不必要 Data 机制 | 本期不新增 TR pause/enable；保留默认 OFF/configure 和既有 role-transition quiesce 回归 |
 | command replay 先检查已失效 precondition，或 compound apply 半写 | 八命令统一 exact post-state-first；Commit 内核前 aggregate shortcut；bounded copy 上注入 topology/grant/operation failure并比较完整 pre/post state |
 | leader change后空 Observation被误判成节点失败 | leadership warmup；Candidate explicit disconnect、Source explicit disconnect/incarnation replacement、pure absence/grace 分开测试 |

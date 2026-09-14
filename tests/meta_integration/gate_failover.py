@@ -670,12 +670,44 @@ def wait_serving_owner(fixture, owner, connected_nodes, timeout=90):
         raise H.Failure(f"{error}; status={latest}") from error
 
 
+_FAILOVER_LOG_SAFE_BYTES = frozenset(
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:")
+
+
+def decode_failover_log_token(token):
+    """Strict inverse of Meta's canonical percent-encoded log token."""
+    try:
+        encoded = token.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise H.Failure(f"non-ASCII failover log token: {token!r}") from error
+    decoded = bytearray()
+    index = 0
+    while index < len(encoded):
+        byte = encoded[index]
+        if byte in _FAILOVER_LOG_SAFE_BYTES:
+            decoded.append(byte)
+            index += 1
+            continue
+        if (byte != ord("%") or index + 2 >= len(encoded) or
+                chr(encoded[index + 1]) not in "0123456789ABCDEF" or
+                chr(encoded[index + 2]) not in "0123456789ABCDEF"):
+            raise H.Failure(
+                f"non-canonical failover log token: {token!r}")
+        value = int(encoded[index + 1:index + 3], 16)
+        if value in _FAILOVER_LOG_SAFE_BYTES:
+            raise H.Failure(
+                f"over-escaped failover log token: {token!r}")
+        decoded.append(value)
+        index += 3
+    return bytes(decoded).decode("utf-8", errors="surrogateescape")
+
+
 def failover_log_records(metas):
     text = "\n".join(meta.log_tail(lines=2000) for meta in metas)
     pattern = re.compile(
         rf"failover event=(?P<event>[a-z-]+) "
         r"mode=(?P<mode>controlled|uncontrolled) "
-        rf"group={re.escape(GROUP)} "
+        r"group=(?P<group>[^ \n]+) "
         r"transition=(?P<transition>[0-9a-f]{32}|none) "
         r"action=(?P<action>[0-9a-f]{32}|none) "
         r"loss=(?P<loss>none|unknown|pending) "
@@ -683,13 +715,23 @@ def failover_log_records(metas):
     records = []
     for match in pattern.finditer(text):
         record = match.groupdict()
+        record["group"] = decode_failover_log_token(record["group"])
+        if record["group"] != GROUP:
+            continue
         candidate = re.search(
-            r"(?:^| )candidate=([0-9a-f]{40})(?: |$)",
+            r"(?:^| )candidate=([^ \n]+)(?: |$)",
             record["detail"])
         record["candidate"] = (
-            None if candidate is None else candidate.group(1))
-        reason = re.search(r"(?:^| )reason=(.*)$", record["detail"])
-        record["reason"] = None if reason is None else reason.group(1)
+            None if candidate is None else
+            decode_failover_log_token(candidate.group(1)))
+        if (record["candidate"] is not None and
+                re.fullmatch(r"[0-9a-f]{40}", record["candidate"]) is None):
+            raise H.Failure(
+                f"invalid candidate in failover log: {record!r}")
+        reason = re.search(r"(?:^| )reason=([^ \n]+)$", record["detail"])
+        record["reason"] = (
+            None if reason is None else
+            decode_failover_log_token(reason.group(1)))
         records.append(record)
     return text, records
 
@@ -702,8 +744,8 @@ def require_unique_failover_event(metas, event, mode, *, loss=None):
         if (record["event"] == event and record["mode"] == mode and
             (loss is None or record["loss"] == loss))
     ]
-    keys = ("event", "mode", "transition", "action", "loss", "index",
-            "candidate", "reason")
+    keys = ("event", "mode", "group", "transition", "action", "loss",
+            "index", "candidate", "reason")
     distinct = {tuple(record[key] for key in keys) for record in matches}
     if len(distinct) != 1:
         raise H.Failure(
@@ -1551,7 +1593,7 @@ def run_lease_fence(meta_binary, data_binary, ctl, redis_cli, workdir,
     fixture = FailoverFixture(
         meta_binary, data_binary, ctl,
         os.path.join(workdir, "lease-fence"), require_fault_hook,
-        pause_after_begin_ms=None, pause_after_authorize_ms=8_000,
+        pause_after_begin_ms=None, pause_after_authorize_ms=40_000,
         proxy_data_control=True)
     old_write_probe = None
     replica_write_probes = {}
@@ -1605,6 +1647,24 @@ def run_lease_fence(meta_binary, data_binary, ctl, redis_cli, workdir,
         if not fixture.by_id[OWNER].alive():
             raise H.Failure(
                 "old Owner exited when its Meta control plane was blackholed")
+
+        # The deterministic cut must outlast both half-open session detection
+        # and the configured source grace. Observe that boundary explicitly so
+        # this gate cannot accidentally exercise an ordinary controlled
+        # cutover when either timeout changes.
+        source_loss_deadline = time.monotonic() + 35
+
+        def source_loss_observed():
+            status = fixture.cluster_status(source_loss_deadline)
+            source = next(
+                (node for node in status.get("data_nodes", [])
+                 if node.get("node_id") == OWNER), {})
+            return (not source.get("current_session") and
+                    not source.get("health_fresh"))
+
+        H.wait_until(
+            "old Owner Meta session and observation grace expire", 35,
+            source_loss_observed)
         wait_serving_owner(
             fixture, successor,
             tuple(fixture.by_id[node_id]

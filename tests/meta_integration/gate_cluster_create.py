@@ -959,6 +959,15 @@ def assert_redis_topology_and_replication(nodes):
         H.wait_until(
             f"{group_id} replica observes a later primary write", 20,
             lambda: readonly_get(replica, key) == ongoing)
+        with open(replica.log_path, "r", encoding="utf-8",
+                  errors="replace") as replica_log:
+            replica_log_text = replica_log.read()
+            apply_context_error = (
+                "replica command arrived outside its apply context")
+            if apply_context_error in replica_log_text:
+                raise H.Failure(
+                    f"{group_id} Follow Owner CONTINUE left the retained "
+                    "population fenced and fell back to FULL")
 
     moved = redis_error(by_id[PRIMARY_1], ["GET", keys["group-2"]])
     expected_endpoint = endpoint_tuple(by_id[PRIMARY_2])

@@ -3576,7 +3576,8 @@ class StorageEngine::Impl {
   // Drops every invalid exact-capability prefix before replication admission.
   // These are cancelled attempts rather than delete work and consume none of
   // the cycle's mutation budget.
-  std::size_t DiscardStaleExpirationCandidates(WorkerStore& store) noexcept;
+  std::size_t DiscardStaleExpirationCandidates(
+      WorkerStore& store, std::size_t max_candidates) noexcept;
 
   Task<absl::Status> ExpireCandidate(WorkerStore& store,
                                      WorkerStore::ExpireCandidate candidate);

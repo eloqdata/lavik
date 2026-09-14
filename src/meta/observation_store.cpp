@@ -148,7 +148,7 @@ std::uint64_t ChargedBytes(const MetaObservation& observation) {
   }
   if (const auto* failover =
           std::get_if<MetaFailoverObservationObs>(&observation.payload_)) {
-    return identity_node +
+    return 2 * identity_node +
            std::visit(
                [&](const auto& payload) -> std::uint64_t {
                  using Payload = std::decay_t<decltype(payload)>;
@@ -587,7 +587,7 @@ struct MetaObservationStore::Impl {
                                             now_unix_ms});
   }
 
-  // Drops every observation of one node from all four buckets, auditing each
+  // Drops every observation of one node from all five buckets, auditing each
   // drop. Buckets left empty are erased so TotalObservations stays exact.
   void PurgeNode(const std::string& node_id, const std::string& detail,
                  std::int64_t now_unix_ms, std::size_t ring_capacity) {

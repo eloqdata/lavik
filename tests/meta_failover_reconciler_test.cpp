@@ -581,6 +581,37 @@ TEST(MetaFailoverReconcilerPlannerTest,
 }
 
 TEST(MetaFailoverReconcilerPlannerTest,
+     ControlledCandidateDisconnectAbortsWhileSourceIsInGrace) {
+  Fixture fixture;
+  BeginControlled(fixture);
+  const auto transition = fixture.Transition();
+
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.owner, fixture.owner_boot, 1}, 1'010);
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.candidate, fixture.candidate_boot, 1}, 1'020);
+
+  IdSequence ids{0xb3};
+  const auto planned = meta::PlanFailoverStep(
+      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
+      fixture.observations,
+      {.now_unix_ms_ = 1'050,
+       .leadership_started_unix_ms_ = 900,
+       .observation_grace_ms_ = 100,
+       .next_id_ = [&] { return ids.Next(); }});
+
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  const auto* abort = std::get_if<meta::AbortControlledFailover>(&**planned);
+  ASSERT_NE(abort, nullptr);
+  EXPECT_EQ(abort->expected_transition_,
+            (meta::MetaFailoverTransitionRef{transition.transition_id_,
+                                             transition.revision_}));
+  EXPECT_NE(abort->reason_.find("candidate"), std::string::npos);
+  EXPECT_EQ(ids.consumed(), 1);
+}
+
+TEST(MetaFailoverReconcilerPlannerTest,
      ControlledCandidateNewBootAbortsWithoutWaitingForDisconnectGrace) {
   Fixture fixture;
   BeginControlled(fixture);
@@ -609,6 +640,101 @@ TEST(MetaFailoverReconcilerPlannerTest,
             (meta::MetaFailoverTransitionRef{transition.transition_id_,
                                              transition.revision_}));
   EXPECT_NE(abort->reason_.find("candidate"), std::string::npos);
+  EXPECT_EQ(ids.consumed(), 1);
+}
+
+TEST(MetaFailoverReconcilerPlannerTest,
+     ControlledCandidateNewBootAbortsWhileSourceIsInGrace) {
+  Fixture fixture;
+  BeginControlled(fixture);
+  const auto transition = fixture.Transition();
+
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.owner, fixture.owner_boot, 1}, 1'010);
+  fixture.ReportCandidate(fixture.candidate, fixture.candidate_assignment,
+                          Bytes<20>(0x34), 1'020, {10, 20}, std::nullopt,
+                          std::nullopt, 2);
+
+  IdSequence ids{0xb3};
+  const auto planned = meta::PlanFailoverStep(
+      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
+      fixture.observations,
+      {.now_unix_ms_ = 1'050,
+       .leadership_started_unix_ms_ = 900,
+       .observation_grace_ms_ = 100,
+       .next_id_ = [&] { return ids.Next(); }});
+
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  const auto* abort = std::get_if<meta::AbortControlledFailover>(&**planned);
+  ASSERT_NE(abort, nullptr);
+  EXPECT_EQ(abort->expected_transition_,
+            (meta::MetaFailoverTransitionRef{transition.transition_id_,
+                                             transition.revision_}));
+  EXPECT_NE(abort->reason_.find("candidate"), std::string::npos);
+  EXPECT_EQ(ids.consumed(), 1);
+}
+
+TEST(MetaFailoverReconcilerPlannerTest,
+     ControlledCandidateActionFailureAbortsWhileSourceIsInGrace) {
+  Fixture fixture;
+  BeginControlled(fixture);
+  const auto transition = fixture.Transition();
+
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.owner, fixture.owner_boot, 1}, 1'010);
+  fixture.ReportActionFailed(1'020);
+
+  IdSequence ids{0xb3};
+  const auto planned = meta::PlanFailoverStep(
+      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
+      fixture.observations,
+      {.now_unix_ms_ = 1'050,
+       .leadership_started_unix_ms_ = 900,
+       .observation_grace_ms_ = 100,
+       .next_id_ = [&] { return ids.Next(); }});
+
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  const auto* abort = std::get_if<meta::AbortControlledFailover>(&**planned);
+  ASSERT_NE(abort, nullptr);
+  EXPECT_EQ(abort->expected_transition_,
+            (meta::MetaFailoverTransitionRef{transition.transition_id_,
+                                             transition.revision_}));
+  EXPECT_NE(abort->reason_.find("candidate"), std::string::npos);
+  EXPECT_EQ(ids.consumed(), 1);
+}
+
+TEST(MetaFailoverReconcilerPlannerTest,
+     ControlledSourceFailureDegradesEvenWhenCandidateAlsoFails) {
+  Fixture fixture;
+  BeginControlled(fixture);
+  const auto transition = fixture.Transition();
+
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.owner, fixture.owner_boot, 1}, 1'010);
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.candidate, fixture.candidate_boot, 1}, 1'020);
+
+  IdSequence ids{0xb3};
+  const auto planned = meta::PlanFailoverStep(
+      meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
+      fixture.observations,
+      {.now_unix_ms_ = 1'110,
+       .leadership_started_unix_ms_ = 900,
+       .observation_grace_ms_ = 100,
+       .next_id_ = [&] { return ids.Next(); }});
+
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  const auto* degrade =
+      std::get_if<meta::DegradeControlledFailover>(&**planned);
+  ASSERT_NE(degrade, nullptr);
+  EXPECT_EQ(degrade->expected_transition_,
+            (meta::MetaFailoverTransitionRef{transition.transition_id_,
+                                             transition.revision_}));
+  EXPECT_FALSE(degrade->retain_candidate_action_);
+  EXPECT_NE(degrade->reason_.find("source"), std::string::npos);
   EXPECT_EQ(ids.consumed(), 1);
 }
 
@@ -1628,9 +1754,9 @@ TEST(MetaFailoverReconcilerPlannerTest,
   fixture.observations.InvalidateCandidateOnDisconnect(
       {fixture.candidate, fixture.candidate_boot, 1}, 1'008);
 
-  // Automatic Owner-failure detection is tracked separately. Apply the
-  // detector's durable output explicitly so this test covers the recovery
-  // seam after every follower has withdrawn its old recoverable population.
+  // Owner-failure detection is outside this executor's scope. Apply its
+  // committed output explicitly so this test covers the recovery seam after
+  // every follower has withdrawn its old recoverable population.
   BeginUncontrolled(fixture, std::nullopt, 0xd0);
   IdSequence wait_ids{0xd2};
   planned = meta::PlanFailoverStep(

@@ -230,8 +230,8 @@ absl::StatusOr<MetaSubmitResult> MetaOperationStore::SubmitOperation(
       return MetaDomainRejectError("duplicate operation policy reference");
     }
   }
-  // Permanent idempotency on the client-provided id, across live records and
-  // archive tombstones.
+  // Retention-window idempotency on the client-provided id, across live
+  // records and archive tombstones.
   if (const auto it = live_.find(command.operation_id_); it != live_.end()) {
     if (it->second.intent_hash_ != command.intent_hash_ ||
         it->second.intent_ != command.intent_) {

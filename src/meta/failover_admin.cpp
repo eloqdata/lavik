@@ -164,7 +164,8 @@ absl::StatusOr<MetaOperationId> GenerateOperationId() {
   return result;
 }
 
-absl::Status FailoverReplyError(std::string_view reply) {
+absl::Status FailoverReplyError(std::string_view reply,
+                                std::string_view expected_operation_id) {
   constexpr std::string_view kErrorPrefix = "ERR failover 1 ";
   if (!reply.starts_with(kErrorPrefix)) {
     return absl::DataLossError("malformed failover reply");
@@ -176,10 +177,25 @@ absl::Status FailoverReplyError(std::string_view reply) {
   if (reply.starts_with("preflight ") || reply == "proposal rejected") {
     return absl::FailedPreconditionError(std::string(reply));
   }
+  if (reply == "proposal resource-exhausted") {
+    return absl::ResourceExhaustedError(std::string(reply));
+  }
   if (reply == "proposal not-leader") {
     return absl::UnavailableError(std::string(reply));
   }
-  return absl::AbortedError(std::string(reply));
+  if (reply.starts_with("proposal ")) {
+    // Once Meta enters the proposal stage, timeout, cancellation, and generic
+    // proposal failures cannot prove whether Raft admitted the operation. Keep
+    // the caller-generated identity in the error so an operator can query or
+    // retry that exact operation instead of accidentally creating another.
+    return absl::AbortedError(
+        "controlled failover outcome is uncertain; operation=" +
+        std::string(expected_operation_id) + " detail=" + std::string(reply));
+  }
+  // Unknown stages/tokens are an untrustworthy protocol response rather than
+  // a definite server rejection. The caller converts DataLoss to an uncertain
+  // result that retains the generated operation id.
+  return absl::DataLossError(std::string(reply));
 }
 
 }  // namespace
@@ -333,7 +349,7 @@ absl::StatusOr<FailoverOutcome> ClusterOperator::Failover(
         " detail=" + std::string(reply.status().message()));
   }
   if (reply->starts_with("ERR ")) {
-    absl::Status error = FailoverReplyError(*reply);
+    absl::Status error = FailoverReplyError(*reply, expected_id);
     if (error.code() == absl::StatusCode::kDataLoss) {
       return absl::AbortedError(
           "controlled failover response is untrustworthy; operation=" +

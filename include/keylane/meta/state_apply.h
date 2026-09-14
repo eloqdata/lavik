@@ -36,10 +36,11 @@
 //   1. principal vs grant: the target node of AssignNodeToGroup,
 //      GrantAuthority, and ActivateAuthority must be a registered, non-retired
 //      node (identity store).
-//   2. RetirePolicy: rejected while either an active grant or a non-terminal
-//      operation's structured policy-reference list names the version.
-//      Operation intents remain opaque; callers must put safety-relevant
-//      policy dependencies in that committed list.
+//   2. RetirePolicy: rejected while an active grant, an active failover
+//      transition's frozen successor grant, or a non-terminal operation's
+//      structured policy-reference list names the version. Operation intents
+//      remain opaque; callers must put safety-relevant policy dependencies in
+//      that committed list.
 //   3. ActivateAuthority atomicity: grant-store ValidateActivate plus every
 //      topology-side check (topology_epoch exactly current+1, new owner is a
 //      group member and registered active, grant policy version active) all
@@ -83,6 +84,18 @@
 //      must observe both halves; lifecycle, rather than retained operation
 //      history or manifest equality, permanently rejects another Genesis.
 //      Creating also holds the existing Meta-membership workflow gate.
+//  11. An active failover transition freezes its group membership,
+//      replication-state, slot/config, term, and authority anchors. Ordinary
+//      commands that would change those anchors reject until the transition
+//      terminates; exact replay and the documented same-grant semantic no-op
+//      remain admissible.
+//  12. Failover Begin requires no active transition and validates its frozen
+//      committed anchors; every post-Begin mutation validates the exact
+//      transition revision. Mutations spanning topology, grant, and/or
+//      operation state stage their complete result in a candidate aggregate,
+//      validate affected FullDesiredState projections, and publish atomically.
+//      Restore revalidates transition-id uniqueness, frozen owner/grant/policy
+//      anchors, and the Controlled transition's exact pristine operation link.
 //
 // MetaStores is the committed aggregate that snapshots serialize as one
 // versioned envelope: per-store length-prefixed versioned blobs in a fixed

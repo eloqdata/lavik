@@ -5,10 +5,11 @@
 //
 // Identity and idempotency:
 //   - operation_id is the CLIENT-PROVIDED stable UUID and the operation's
-//     PERMANENT idempotency key. SubmitOperation resolves by id across both
-//     the live records and the archive tombstones: same id + same intent_hash
-//     returns the existing record (or archived summary) unchanged; same id +
-//     different intent_hash is payload reuse and rejects.
+//     idempotency key while its live record or archive tombstone is retained.
+//     SubmitOperation resolves by id across both sets: same id + same
+//     intent_hash returns the existing record (or archived summary) unchanged;
+//     same id + different intent_hash is payload reuse and rejects. Explicit
+//     archive pruning ends that retry window and permits later id reuse.
 //   - operation_seq is the raft log index of the SubmitOperation command,
 //     handed in by the apply caller. This requires no separate counter and is
 //     naturally unique, monotonic, and consistent across nodes. It is a pure

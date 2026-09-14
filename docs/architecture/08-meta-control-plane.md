@@ -154,9 +154,11 @@ its candidate as owner with the frozen grant, advances authority, topology, and
 config epochs, places the action id on the grant for Data activation, and
 clears the transition. Controlled Commit also completes its operation with
 `failover-completed` and requires loss `none`; uncontrolled Commit records the
-transition's `unknown` loss policy. Controlled Abort terminates the operation
-and clears its matching transition. Its pre-Begin form gives a submitted
-operation a terminal path when planning cannot safely install a transition.
+transition's latched loss policy: `none` only for an exact healthy action
+retained from lossless controlled authorization, otherwise `unknown`.
+Controlled Abort terminates the operation and clears its matching transition.
+Its pre-Begin form gives a submitted operation a terminal path when planning
+cannot safely install a transition.
 Every command validates exact pre-state or exact post-state replay, so a stale
 leader proposal cannot advance a replaced action or transition.
 
@@ -249,27 +251,40 @@ shorter than the observation TTL. This covers a healthy Data process that just
 misses the winning election round without delaying explicit disconnect or
 typed action-failure evidence.
 
+The absolute Controlled deadline is a leader-side proposal-admission cutoff,
+not a clock read during replicated apply. At or after the cutoff the planner
+only proposes Abort, and the proposal hook rejects a newly admitted Begin,
+authorization, degradation, or Controlled cutover. An entry admitted before
+the cutoff and a deadline Abort are still resolved by Raft log order; the
+earlier entry may obtain quorum after the wall-clock deadline. This preserves
+deterministic apply and replay without introducing a replicated time oracle.
+
 A controlled request selects a candidate in the exact current-source domain,
 then preserves the owner while waiting for its paused stable frontier and the
 candidate to cover it. Only then does it authorize lossless preparation and
 commit a matching prepared action. Deadline expiry aborts the controlled
-operation. Candidate failure while the source remains usable also aborts
-immediately; it does not wait for that candidate to restart. Source absence or
-disconnect beyond the observation grace, or definite source boot/history
-replacement, degrades the transition to uncontrolled, fences the old
-authority, and records the controlled operation as failed. An uncontrolled
-transition never aborts: a missing candidate waits, and a failed, disconnected,
-or replaced candidate causes a fresh action to be selected from the best
-remaining compatibility domain.
+operation. An explicit Candidate failure while the Source is healthy or still
+inside its bounded recovery grace also aborts immediately; it neither waits
+for that Candidate to restart nor waits to reinterpret the failure as a Source
+failure. Source absence or disconnect beyond the observation grace, or definite
+source boot/history replacement, instead degrades the transition to
+uncontrolled, fences the old authority, and records the controlled operation
+as failed. An uncontrolled
+transition never aborts: a missing candidate waits. A failed, disconnected, or
+replaced action is removed immediately; Meta installs the best eligible
+replacement when one exists, or clears the candidate and waits without relying
+on the failed process to restart.
 
 The loss contract matches Redis Cluster's asynchronous replication tier.
 Controlled cutover reaches the old owner's drained frontier and records
-`loss=none`. Uncontrolled cutover proceeds from the best eligible observable
-replica and records `loss=unknown`; writes acknowledged only by the unavailable
-owner may be lost. The current implementation does not automatically begin an
+`loss=none`. A newly selected or replacement uncontrolled action records
+`loss=unknown`; an exact healthy action already authorized lossless may retain
+`none` when controlled failover degrades. Unknown-loss cutover proceeds from
+the best eligible observable replica, so writes acknowledged only by the
+unavailable owner may be lost. Meta does not automatically begin an
 uncontrolled transition from ordinary owner-health failure. Controlled
-failover can degrade after its source fails, but autonomous failure detection
-and emergency Begin remain a known availability gap.
+failover can degrade after its source fails; autonomous failure detection and
+emergency Begin are outside this control flow.
 
 `MetaControlProjector` is a pure function over one atomic committed view. It
 produces a canonical node-specific `FullDesiredState`: the global Meta/Data
@@ -343,6 +358,12 @@ Consequently anonymous/redirect work is capped at 4096, and projection/FDS
 holders are capped at one per committed node-record slot (validated active at
 claim time) even when a peer stalls or that record retires before session
 cleanup.
+An accepted Data-control or Admin session borrows its Celer `Connection`
+storage before spawning the session coroutine. During frame destruction, its
+owner unregisters the task and releases the borrow after body-local Connection
+users have unwound. Shutdown, demotion, or a watchdog may retire the transport
+immediately, but Celer cannot reclaim the borrowed storage while suspended
+session code can still resume and dereference it.
 Those per-node objects also share one weighted 2 GiB projection budget derived
 as two overlapping generations times encoded-plus-decoded 512 MiB size
 classes. Each build reserves the encoded/decoded pair before projection and
@@ -495,8 +516,8 @@ replication epoch state.
 The compatibility `history` field remains reporter-local; the internal
 selector uses the separately stored source assignment, boot, and history.
 Failover source/action observations additionally match the exact live
-transition revision, candidate action, reporter incarnation, and population
-anchors. Operation evidence for directive-based workflows also
+transition identity, candidate action where applicable, reporter incarnation,
+and population anchors. Operation evidence for directive-based workflows also
 matches the committed operation and its replication-history binding. The
 typed candidate/evidence query results include the authenticated reporter boot
 alongside node and assignment, so a reconciler never joins a payload to a
@@ -807,7 +828,10 @@ cluster and committed Group, generates an operation id and absolute transition
 deadline, and submits one `failover 1` request. Its success point is the
 operation commit, not Data cutover. A caller retrying this mutation must retain
 both the operation id and absolute deadline; recomputing either changes the
-intent. `getop` derives `submitted` versus `running` from the operation and
+intent. Timeout, cancellation, or a generic failure after proposal begins is
+reported as uncertain together with that operation id; pre-append resource
+gates remain definite `ResourceExhausted` rejections. `getop` derives
+`submitted` versus `running` from the operation and
 matching Group transition in one committed snapshot, then reports the durable
 completed or aborted result. Generic `submitop`, `completeop`, and `abortop`
 cannot create or terminate failover because its aggregate changes must use the
@@ -1008,14 +1032,24 @@ advances the committed chain anchor only through an explicitly named record.
 `SetAuditPolicy` is itself replicated and always audited, including a
 transition into or out of disabled mode.
 
-Accepted failover transition commands also emit one structured process log:
+Accepted failover transition commands normally emit one structured process log:
 `failover event=<...> mode=<...> group=<...> transition=<...> action=<...>
 loss=<none|unknown|pending> commit_index=<...>`. Candidate and source details
-or bounded reasons are appended where relevant. Entries whose cut may lose
-acknowledged writes use warning severity; lossless transition entries use
-informational severity. The line is derived from the pre-apply aggregate and
-emitted only for an accepted commit, so it is suitable for reconstructing the
-durable election/cutover sequence alongside the audit chain.
+or bounded reasons are appended where relevant. Opaque variable token values
+use canonical percent encoding, so embedded whitespace, control bytes, or `=`
+cannot change field boundaries; fixed enum, numeric, and hexadecimal values
+remain directly readable. Entries whose cut may lose acknowledged writes use
+warning severity; lossless transition entries use informational severity.
+
+The line is derived from the pre-apply aggregate and emitted only for an
+accepted commit. Process-log collection is at least once, so consumers
+deduplicate by `commit_index`. Two exact post-effect replays deliberately
+suppress their duplicate state-dependent event: `SetUncontrolledCandidate`
+cannot recover whether the original event selected or replaced a candidate,
+and a post-Begin `AbortControlledFailover` cannot recover the cleared action
+identifier. The deterministic committed audit record remains authoritative,
+and the process log reconstructs the election/cutover sequence alongside that
+audit chain rather than replacing it.
 
 ## Source map
 
@@ -1031,6 +1065,7 @@ durable election/cutover sequence alongside the audit chain.
 | Durable post-genesis Meta membership intent, exact-config recovery, leadership handoff, and identity retirement | `include/keylane/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |
 | Shared Meta/Data frame, object-transfer, failover observation, transition, and activation formats | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
+| Meta session transport retirement and Connection-storage lifetime | `src/meta/ctl_server.cpp`, `src/meta/data_control_server.cpp`, `celer/include/celer/net/connection.h`, `celer/src/runtime/worker.cpp` |
 | Foreign-thread typed completion ingress and worker wakeup | `celer/include/celer/runtime/foreign_executor.h`, `celer/src/runtime/foreign_executor.cpp`, `celer/include/celer/runtime/cross_core.h`, `celer/src/runtime/worker.cpp` |
 | TLS identity, RBAC, Unix peer credentials, Admin transport, cluster status, controlled failover, and initial cluster creation | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `include/keylane/meta/admin_client.h`, `include/keylane/meta/cluster_status.h`, `include/keylane/meta/cluster_create.h`, `include/keylane/meta/failover_admin.h`, `app/keylane_meta.cpp`, `app/keylane_ctl.cpp`, `celer/src/net/` |
 | Recovery, partition, membership, failover, and security gates | `tests/meta_*`, `tests/meta_integration/` |

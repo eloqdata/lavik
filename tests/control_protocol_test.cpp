@@ -654,8 +654,8 @@ TEST(ControlProtocolCodecTest,
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::Directive>(*decoded), directive);
 
-  // Kind 5 was never released and belonged to the retired one-shot promotion
-  // path. It must not remain accidentally admissible above the active range.
+  // Kind 5 is outside the active enum range and must not become accidentally
+  // admissible.
   directive.kind = static_cast<control::WireDirectiveKind>(5);
   EXPECT_EQ(
       control::EncodeMessage(control::WireMessage{directive}).status().code(),

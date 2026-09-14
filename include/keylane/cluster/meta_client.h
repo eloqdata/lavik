@@ -202,6 +202,10 @@ struct ClusterFailoverReconcileInput {
                          const ClusterFailoverReconcileInput&) = default;
 };
 
+// Converts one normalized group projection into native replication intents.
+// `use_tls` selects the committed owner's TLS replication port for follow-owner
+// relationships; false selects its plaintext port. It does not configure the
+// Meta control connection itself.
 absl::StatusOr<ClusterFailoverReconcileInput> TranslateClusterFailoverControl(
     const DesiredClusterControl& desired,
     const ReplicationIdentity& local_identity, bool use_tls = false);
@@ -353,7 +357,9 @@ class MetaControlClientService final : public celer::Service {
 
 // Process-lifetime adapter used by NodeControlInstaller. It dispatches only
 // normalized directives through ReplicationManager on worker 0; the installer
-// remains the sole component allowed to invoke it.
+// remains the sole component allowed to invoke it. `use_tls` fixes whether
+// follow-owner intents select committed TLS or plaintext replication endpoints
+// and must match the Data-to-Data replication listener configuration.
 std::unique_ptr<NodeControlActions> CreateReplicationNodeControlActions(
     ReplicationManager& replication, bool use_tls);
 

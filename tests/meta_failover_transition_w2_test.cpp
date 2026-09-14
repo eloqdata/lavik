@@ -527,6 +527,22 @@ TEST(MetaFailoverTransitionW2,
 }
 
 TEST(MetaFailoverTransitionW2,
+     UncontrolledCandidateClearRequiresAnInstalledCandidate) {
+  Fixture fixture = MakeFixture();
+  const meta::BeginUncontrolledFailover begin =
+      MakeBeginUncontrolled(fixture, false);
+  const std::uint64_t begin_index =
+      AcceptFresh(fixture, meta::MetaCommand{begin});
+
+  meta::SetUncontrolledCandidate clear;
+  clear.request_id_ = Filled<16>(0x57);
+  clear.group_id_ = "g1";
+  clear.expected_transition_ = {fixture.transition_id, begin_index};
+  RejectFreshWithDetail(fixture, meta::MetaCommand{clear},
+                        "uncontrolled failover candidate is absent");
+}
+
+TEST(MetaFailoverTransitionW2,
      AuthorizationLatchesModeSpecificLossAndReplaysExactly) {
   {
     Fixture fixture = MakeFixture();

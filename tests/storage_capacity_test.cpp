@@ -39,8 +39,7 @@ class ExpirationAuthorityTestPeer {
     return StorageEngine::Impl::ValidateExpirationAuthority(&grant);
   }
 
-  static absl::Status VerifyStaleQueuePruning(StorageEngine& storage,
-                                              std::size_t stale_count) {
+  static absl::Status VerifyStaleQueueBudget(StorageEngine& storage) {
     auto* impl = storage.impl_.get();
     auto& store = impl->CurrentStore();
     if (!store.expired_candidates_.empty()) {
@@ -60,7 +59,8 @@ class ExpirationAuthorityTestPeer {
       return absl::FailedPreconditionError(
           "stale queue test did not replace its exact authority");
     }
-    for (std::size_t index = 0; index < stale_count; ++index) {
+    constexpr std::size_t kStaleCount = 2;
+    for (std::size_t index = 0; index < kStaleCount; ++index) {
       StorageEngine::Impl::WorkerStore::ExpireCandidate candidate;
       candidate.expiration_authority_ = stale;
       store.expired_candidates_.push_back(std::move(candidate));
@@ -69,14 +69,24 @@ class ExpirationAuthorityTestPeer {
     candidate.expiration_authority_ = current;
     store.expired_candidates_.push_back(std::move(candidate));
 
-    const std::size_t discarded = impl->DiscardStaleExpirationCandidates(store);
+    if (impl->DiscardStaleExpirationCandidates(store, 0) != 0 ||
+        store.expired_candidates_.size() != kStaleCount + 1) {
+      store.expired_candidates_.clear();
+      return absl::FailedPreconditionError(
+          "zero remaining budget consumed a stale expiration candidate");
+    }
+    const std::size_t first = impl->DiscardStaleExpirationCandidates(store, 1);
+    const bool retained_stale =
+        store.expired_candidates_.size() == kStaleCount &&
+        store.expired_candidates_.front().expiration_authority_ == stale;
+    const std::size_t second = impl->DiscardStaleExpirationCandidates(store, 1);
     const bool preserved_current =
         store.expired_candidates_.size() == 1 &&
         store.expired_candidates_.front().expiration_authority_ == current;
     store.expired_candidates_.clear();
-    if (discarded != stale_count || !preserved_current) {
+    if (first != 1 || !retained_stale || second != 1 || !preserved_current) {
       return absl::FailedPreconditionError(
-          "stale exact grants were not pruned ahead of current work");
+          "stale exact grants did not consume the candidate budget");
     }
     return absl::OkStatus();
   }
@@ -199,11 +209,11 @@ class FiniteExpirationAuthorityService final : public celer::Service {
           "finite active-expiration authority changed Tomb Raider admission");
       co_return Finish();
     }
-    // More than the production 64-delete cycle budget proves stale queue
-    // entries are cancellation cleanup, not attempted mutations.
+    // Cancellation cleanup obeys the same per-cycle work budget as actual and
+    // failed deletion attempts; a zero remaining budget is a strict no-op.
     result_ =
-        keylane::storage::ExpirationAuthorityTestPeer::VerifyStaleQueuePruning(
-            *storage_, 65);
+        keylane::storage::ExpirationAuthorityTestPeer::VerifyStaleQueueBudget(
+            *storage_);
     if (!result_.ok()) co_return Finish();
     result_ =
         storage_->SetExpirationAuthorityUntil(FarFutureExpirationDeadline());

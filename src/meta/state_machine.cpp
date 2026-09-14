@@ -42,6 +42,33 @@ std::string HexId(const std::array<std::uint8_t, N>& id) {
   return result;
 }
 
+bool IsSafeLogTokenByte(std::uint8_t byte) {
+  return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+         (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
+         byte == '.' || byte == ':';
+}
+
+// Failover logs use whitespace-delimited key=value tokens. Percent-encode
+// every byte outside a deliberately small ASCII alphabet so opaque committed
+// identifiers cannot inject fields or record boundaries. '%' is encoded too,
+// making the representation canonical and reversible.
+std::string LogToken(std::string_view value) {
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string result;
+  result.reserve(value.size());
+  for (const char character : value) {
+    const auto byte = static_cast<std::uint8_t>(character);
+    if (IsSafeLogTokenByte(byte)) {
+      result.push_back(character);
+      continue;
+    }
+    result.push_back('%');
+    result.push_back(kHex[byte >> 4]);
+    result.push_back(kHex[byte & 0x0f]);
+  }
+  return result;
+}
+
 struct FailoverCommitLog {
   std::string message_;
   bool data_loss_possible_ = false;
@@ -73,7 +100,8 @@ std::optional<FailoverCommitLog> DescribeFailoverCommit(
           transition = HexId(cmd.transition_id_);
           action = HexId(cmd.candidate_action_.action_id_);
           loss = "none";
-          detail = " candidate=" + cmd.candidate_action_.candidate_.node_id_;
+          detail = " candidate=" +
+                   LogToken(cmd.candidate_action_.candidate_.node_id_);
         } else if constexpr (std::is_same_v<Command,
                                             BeginUncontrolledFailover>) {
           event = "begin";
@@ -98,8 +126,27 @@ std::optional<FailoverCommitLog> DescribeFailoverCommit(
                   .has_value()) {
             previous = &*group_before->failover_transition_->candidate_action_;
           }
+          const bool exact_post_effect =
+              cmd.candidate_action_.has_value() && previous != nullptr &&
+              group_before->failover_transition_->transition_id_ ==
+                  cmd.expected_transition_.transition_id_ &&
+              group_before->failover_transition_->revision_ == commit_index &&
+              *previous == *cmd.candidate_action_;
+          if (exact_post_effect) {
+            // Apply accepts the same index against its exact post-state. The
+            // original event depended on the overwritten previous action, so
+            // replay cannot reconstruct it and must not emit a conflicting
+            // selected/fallback/replaced classification at the same index.
+            return std::nullopt;
+          }
           if (!cmd.candidate_action_.has_value()) {
+            // A fresh clear requires an installed candidate. If none is
+            // visible, this can only become an accepted command through the
+            // exact post-effect replay path; suppress that duplicate event
+            // because the cleared action identity is no longer reconstructible.
+            if (previous == nullptr) return std::nullopt;
             event = "candidate-cleared";
+            action = HexId(previous->action_id_);
           } else {
             action = HexId(cmd.candidate_action_->action_id_);
             if (previous == nullptr) {
@@ -112,7 +159,8 @@ std::optional<FailoverCommitLog> DescribeFailoverCommit(
             detail = absl::StrCat(
                 " source_group_term=",
                 cmd.candidate_action_->domain_.source_group_term_,
-                " candidate=", cmd.candidate_action_->candidate_.node_id_);
+                " candidate=",
+                LogToken(cmd.candidate_action_->candidate_.node_id_));
           }
           loss = "unknown";
           data_loss_possible = true;
@@ -135,16 +183,27 @@ std::optional<FailoverCommitLog> DescribeFailoverCommit(
           if (cmd.expected_transition_.has_value()) {
             transition = HexId(cmd.expected_transition_->transition_id_);
             const auto group_before = before.topology_.FindGroup(cmd.group_id_);
-            if (group_before.has_value() &&
-                group_before->failover_transition_.has_value() &&
-                group_before->failover_transition_->candidate_action_
-                    .has_value()) {
-              action = HexId(group_before->failover_transition_
-                                 ->candidate_action_->action_id_);
+            if (!group_before.has_value() ||
+                !group_before->failover_transition_.has_value() ||
+                group_before->failover_transition_->transition_id_ !=
+                    cmd.expected_transition_->transition_id_ ||
+                group_before->failover_transition_->revision_ !=
+                    cmd.expected_transition_->revision_ ||
+                group_before->failover_transition_->mode_ !=
+                    MetaFailoverMode::kControlled ||
+                !group_before->failover_transition_->candidate_action_
+                     .has_value()) {
+              // A post-Begin Abort clears the transition that supplied its
+              // action id. Exact replay is accepted against that post-state,
+              // but emitting action=none would conflict with the original
+              // event at the same commit index.
+              return std::nullopt;
             }
+            action = HexId(group_before->failover_transition_->candidate_action_
+                               ->action_id_);
           }
           loss = "none";
-          detail = " reason=" + cmd.reason_;
+          detail = " reason=" + LogToken(cmd.reason_);
         } else if constexpr (std::is_same_v<Command,
                                             DegradeControlledFailover>) {
           event = "degrade";
@@ -156,7 +215,7 @@ std::optional<FailoverCommitLog> DescribeFailoverCommit(
           }
           loss = cmd.retain_candidate_action_ ? "none" : "unknown";
           data_loss_possible = !cmd.retain_candidate_action_;
-          detail = " reason=" + cmd.reason_;
+          detail = " reason=" + LogToken(cmd.reason_);
         } else if constexpr (std::is_same_v<Command,
                                             CommitControlledFailover>) {
           event = "cutover";
@@ -165,7 +224,7 @@ std::optional<FailoverCommitLog> DescribeFailoverCommit(
           transition = HexId(cmd.expected_transition_.transition_id_);
           action = HexId(cmd.action_id_);
           loss = "none";
-          detail = " candidate=" + cmd.expected_candidate_.node_id_;
+          detail = " candidate=" + LogToken(cmd.expected_candidate_.node_id_);
         } else if constexpr (std::is_same_v<Command,
                                             CommitUncontrolledFailover>) {
           event = "cutover";
@@ -176,16 +235,17 @@ std::optional<FailoverCommitLog> DescribeFailoverCommit(
           loss = cmd.loss_if_cutover_ == MetaFailoverLoss::kNone ? "none"
                                                                  : "unknown";
           data_loss_possible = cmd.loss_if_cutover_ != MetaFailoverLoss::kNone;
-          detail = " candidate=" + cmd.expected_candidate_.node_id_;
+          detail = " candidate=" + LogToken(cmd.expected_candidate_.node_id_);
         } else {
           return std::nullopt;
         }
 
         return FailoverCommitLog{
-            .message_ = absl::StrCat(
-                "failover event=", event, " mode=", mode, " group=", group,
-                " transition=", transition, " action=", action, " loss=", loss,
-                " commit_index=", commit_index, detail),
+            .message_ = absl::StrCat("failover event=", event, " mode=", mode,
+                                     " group=", LogToken(group),
+                                     " transition=", transition,
+                                     " action=", action, " loss=", loss,
+                                     " commit_index=", commit_index, detail),
             .data_loss_possible_ = data_loss_possible,
         };
       },

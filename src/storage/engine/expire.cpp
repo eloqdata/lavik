@@ -60,6 +60,7 @@ namespace {
 
 constexpr absl::string_view kExpirationAuthorityCancellationTypeUrl =
     "type.googleapis.com/keylane.storage.ExpirationAuthorityCancellation";
+constexpr std::size_t kMaxQueuedExpiredCandidates = 4096;
 
 std::chrono::nanoseconds BootTimeSinceEpoch() noexcept {
   timespec now{};
@@ -228,7 +229,6 @@ void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
                                                 std::uint8_t db_id,
                                                 const RecordIndex::Entry& entry,
                                                 std::string_view known_key) {
-  constexpr std::size_t kMaxQueuedExpiredCandidates = 4096;
   auto expiration_authority = CurrentExpirationAuthority();
   if (expiration_authority == nullptr ||
       store.expired_candidates_.size() >= kMaxQueuedExpiredCandidates ||
@@ -264,9 +264,9 @@ void StorageEngine::Impl::AdvanceExpiryMap(WorkerStore& store) {
 }
 
 std::size_t StorageEngine::Impl::DiscardStaleExpirationCandidates(
-    WorkerStore& store) noexcept {
+    WorkerStore& store, std::size_t max_candidates) noexcept {
   std::size_t discarded = 0;
-  while (!store.expired_candidates_.empty() &&
+  while (discarded < max_candidates && !store.expired_candidates_.empty() &&
          !ExpirationAuthorityIsValid(
              store.expired_candidates_.front().expiration_authority_.get())) {
     store.expired_candidates_.pop_front();
@@ -502,10 +502,24 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     // Only logical expiration is disabled; index maintenance still runs.
     if (std::getenv("KEYLANE_DISABLE_ACTIVE_EXPIRATION") != nullptr) continue;
 #endif
+    // Revoked grants may leave a full queue that would otherwise hide every
+    // candidate discovered under the replacement grant. Retire the stale
+    // prefix before advancing a scan cursor, under the same operator-visible
+    // budget as actual and failed deletion attempts. If the budget cannot
+    // reach the first live grant, leave both queue and scan position for the
+    // next cycle.
+    std::size_t processed = DiscardStaleExpirationCandidates(*store, deletes);
+    if (!store->expired_candidates_.empty() &&
+        !ExpirationAuthorityIsValid(
+            store->expired_candidates_.front().expiration_authority_.get())) {
+      continue;
+    }
     if (CurrentExpirationAuthority() == nullptr) continue;
 
     const std::uint64_t now_ms = UnixTimeMillis();
-    for (std::size_t step = 0; step < map_steps && !store->partitions_.empty();
+    for (std::size_t step = 0;
+         step < map_steps && !store->partitions_.empty() &&
+         store->expired_candidates_.size() < kMaxQueuedExpiredCandidates;
          ++step) {
       auto& partition = store->partitions_[store->expiry_partition_cursor_];
       const std::uint8_t db_id = store->expiry_db_cursor_;
@@ -572,15 +586,15 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     // preserves fairness before candidate deletion begins.
     co_await celer::Yield(*store->worker_);
 
-    std::size_t deleted = 0;
     bool warned_failure = false;
-    while (deleted < deletes && !store->expired_candidates_.empty()) {
+    while (processed < deletes && !store->expired_candidates_.empty()) {
       // A revoked, replaced, or elapsed grant can leave a queue prefix behind.
       // Drop that prefix before asking full-sync consumers for replacement
-      // credit; cancelled attempts neither block a saturated consumer nor
-      // consume one of this cycle's configured actual-delete slots.
-      (void)DiscardStaleExpirationCandidates(*store);
-      if (store->expired_candidates_.empty()) break;
+      // credit. Cancellation cleanup shares the configured per-cycle work
+      // bound with actual and failed deletion attempts.
+      processed +=
+          DiscardStaleExpirationCandidates(*store, deletes - processed);
+      if (processed == deletes || store->expired_candidates_.empty()) break;
       const WorkerStore::ExpireCandidate& front =
           store->expired_candidates_.front();
       std::size_t replacement_bytes = kFullSyncReplacementMetadataBytes;
@@ -615,11 +629,11 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
                        store->worker_->id(), expired.ToString());
           warned_failure = true;
         }
-        ++deleted;
+        ++processed;
         co_await celer::Yield(*store->worker_);
         continue;
       }
-      ++deleted;
+      ++processed;
       co_await celer::Yield(*store->worker_);
     }
   }

@@ -1,5 +1,6 @@
-// Raft-free Meta CLI for direct commands, cluster readiness, and first-cluster
-// creation. Multi-step orchestration stays behind ClusterOperator/Meta Admin.
+// Raft-free Meta CLI for direct commands, cluster readiness, first-cluster
+// creation, and controlled failover admission. Multi-step orchestration stays
+// behind the operator APIs and committed Meta workflows.
 
 #include <signal.h>
 
@@ -127,7 +128,7 @@ void PrintUsage(const char* program) {
       "1 for local manifest, confirmation, or pre-mutation transport errors.\n"
       "failover exits 0 after request commit, 2 for an explicit rejection,\n"
       "3 for an uncertain proposal outcome, and 1 for local/transport "
-      "errors.\n",
+      "errors known to occur before submission.\n",
       program, program, program, program, program);
 }
 
@@ -559,7 +560,8 @@ int RunFailover(const Options& options) {
     std::cerr << "keylane-ctl: failover failed: " << outcome.status().message()
               << '\n';
     if (outcome.status().code() == absl::StatusCode::kInvalidArgument ||
-        outcome.status().code() == absl::StatusCode::kFailedPrecondition) {
+        outcome.status().code() == absl::StatusCode::kFailedPrecondition ||
+        outcome.status().code() == absl::StatusCode::kResourceExhausted) {
       return 2;
     }
     if (outcome.status().code() == absl::StatusCode::kAborted) return 3;

@@ -1560,9 +1560,8 @@ void FinishLeaderTask(MetaDataControlServer::Core& core,
   NotifyShutdownDrained(core);
 }
 
-void RemoveSession(MetaDataControlServer::Core& core,
-                   celer::Connection* connection, std::string_view node_id = {},
-                   const control::WireId128* session_id = nullptr) {
+void UnregisterSession(MetaDataControlServer::Core& core,
+                       celer::Connection* connection) {
   const auto session =
       std::find(core.sessions_.begin(), core.sessions_.end(), connection);
   if (session != core.sessions_.end()) {
@@ -1570,6 +1569,12 @@ void RemoveSession(MetaDataControlServer::Core& core,
     core.sessions_.pop_back();
     core.live_session_tasks_.fetch_sub(1, std::memory_order_relaxed);
   }
+}
+
+void RemoveSessionBindings(MetaDataControlServer::Core& core,
+                           celer::Connection* connection,
+                           std::string_view node_id,
+                           const control::WireId128* session_id) {
   if (const auto authority =
           core.authority_session_generation_.find(connection);
       authority != core.authority_session_generation_.end()) {
@@ -1590,7 +1595,6 @@ void RemoveSession(MetaDataControlServer::Core& core,
     // otherwise late teardown could erase the replacement's current status.
     core.options_.runtime_status_->Remove(node_id, session_id);
   }
-  NotifyShutdownDrained(core);
 }
 
 void CloseConnectionNow(celer::Worker& worker, celer::Connection* connection,
@@ -2946,6 +2950,35 @@ celer::Task<absl::Status> RunEstablishedSession(
 
 }  // namespace
 
+class MetaDataControlServer::SessionConnectionBorrow {
+ public:
+  SessionConnectionBorrow(CorePtr core, celer::Connection* connection)
+      : core_(std::move(core)), connection_(connection) {
+    core_->sessions_.push_back(connection_);
+    core_->live_session_tasks_.fetch_add(1, std::memory_order_relaxed);
+    celer::BorrowConnectionStorage(connection_);
+  }
+
+  SessionConnectionBorrow(SessionConnectionBorrow&& other) noexcept
+      : core_(std::move(other.core_)), connection_(other.connection_) {
+    other.connection_ = nullptr;
+  }
+  SessionConnectionBorrow(const SessionConnectionBorrow&) = delete;
+  SessionConnectionBorrow& operator=(const SessionConnectionBorrow&) = delete;
+  SessionConnectionBorrow& operator=(SessionConnectionBorrow&&) = delete;
+
+  ~SessionConnectionBorrow() {
+    if (connection_ == nullptr) return;
+    UnregisterSession(*core_, connection_);
+    celer::ReleaseConnectionStorage(connection_);
+    NotifyShutdownDrained(*core_);
+  }
+
+ private:
+  CorePtr core_;
+  celer::Connection* connection_;
+};
+
 detail::PendingHandshakeLimiter::Permit::Permit(Permit&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)) {}
 
@@ -3407,10 +3440,13 @@ celer::Task<absl::Status> MetaDataControlServer::AcceptLoop(CorePtr core) {
                              "too many pending data-control handshakes"));
       continue;
     }
-    core->sessions_.push_back(connection);
-    core->live_session_tasks_.fetch_add(1, std::memory_order_relaxed);
-    core->worker_->Spawn(SessionLoop(core, celer::TcpStream(connection),
-                                     connection, std::move(*handshake_permit)));
+    // Frame ownership closes the accept/shutdown race: even if Spawn rejects
+    // the task before its body runs, destruction unregisters the session and
+    // releases its storage borrow.
+    core->worker_->Spawn(
+        SessionLoop(core, celer::TcpStream(connection), connection,
+                    std::move(*handshake_permit),
+                    SessionConnectionBorrow(core, connection)));
   }
   if (core->shutdown_accept_wake_fd_ >= 0) {
     (void)::shutdown(core->shutdown_accept_wake_fd_, SHUT_RDWR);
@@ -3425,16 +3461,21 @@ celer::Task<absl::Status> MetaDataControlServer::AcceptLoop(CorePtr core) {
 
 celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     CorePtr core, celer::TcpStream stream, celer::Connection* connection,
-    detail::PendingHandshakeLimiter::Permit handshake_permit) {
+    detail::PendingHandshakeLimiter::Permit handshake_permit,
+    SessionConnectionBorrow borrow) {
+  // This frame-owned parameter keeps the task registered and the Connection
+  // storage pinned through final suspend, including when shutdown prevents
+  // the coroutine body from starting.
+  (void)borrow;
   std::string node_id;
   std::optional<MetaObservationIdentity> observation_identity;
   std::optional<control::WireId128> status_session_id;
   bool accepted_session = false;
   bool redirected_session = false;
-  // Declared before every session-local transport/subscription object so its
-  // destructor runs last. Generation/shutdown waiters are therefore released
-  // only after the complete SessionLoop (including commit subscription and
-  // writer) has stopped touching the leader context and socket.
+  // Declared before every body-local transport/subscription object so its
+  // destructor clears semantic bindings only after the commit subscription
+  // and writer stop touching the leader context. The frame-owned borrow keeps
+  // the task registered through final suspend.
   struct SessionCompletionGuard {
     CorePtr core_;
     celer::Connection* connection_;
@@ -3454,10 +3495,10 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
         core_->observations_->InvalidateCandidateOnDisconnect(
             **observation_identity_, NowUnixMillis());
       }
-      RemoveSession(*core_, connection_, *node_id_,
-                    status_session_id_->has_value()
-                        ? &status_session_id_->value()
-                        : nullptr);
+      RemoveSessionBindings(*core_, connection_, *node_id_,
+                            status_session_id_->has_value()
+                                ? &status_session_id_->value()
+                                : nullptr);
     }
   } completion{core,
                connection,
@@ -3768,11 +3809,9 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
     core->protocol_errors_.fetch_add(1, std::memory_order_relaxed);
   }
   // CloseConnectionNow above deliberately runs before joining the detached
-  // publisher/directive tasks. Their drain yields back to Worker, which may
-  // reclaim the retired Connection before this coroutine resumes. Do not send
-  // the stale TcpStream through `finish` and attempt a second close here; the
-  // completion guard only compares the opaque connection address and remains
-  // safe after Celer releases its storage.
+  // publisher/directive tasks. The session borrow keeps storage live during
+  // that drain; returning directly still records that the worker owns
+  // transport retirement and avoids a redundant stream close.
   co_return session_status;
 }
 

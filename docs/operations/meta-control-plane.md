@@ -377,10 +377,13 @@ query, so use leader discovery again after a leadership change. Generic
 `abortop`, `completeop`, and `submitop` reject the failover kind as
 `workflow-owned`; there is no operator abort command for an accepted failover.
 
-Exit 2 is an explicit preflight or proposal rejection. Exit 3 means the
-mutation may have committed; preserve the printed operation id and resolve it
-with `getop` before submitting another failover. Exit 1 is a local, transport,
-TLS, or malformed-protocol failure known not to be an explicit Meta rejection.
+Exit 2 is an explicit preflight or proposal rejection, including a
+`resource-exhausted` durability/resource gate that rejects before Raft append.
+Exit 3 means the mutation may have committed; the error retains the generated
+operation id, which must be resolved with `getop` before submitting another
+failover. Exit 1 is a local, discovery, TLS, or transport failure known to occur
+before submission. A malformed or otherwise untrustworthy response after
+submission is exit 3 because the commit outcome cannot be inferred from it.
 
 During a healthy controlled transition, the old owner continues reads and
 lease renewal but all source mutations, including `PUBLISH`, return `TRYAGAIN
@@ -392,17 +395,17 @@ non-owner follow the new owner through native CONTINUE or FULL. The former
 owner retires its old source backlog locally when it consumes that relationship;
 no separate cleanup command is required.
 
-Version 1 may start destructive FULL on several followers concurrently when
-none can CONTINUE from the new owner. Those followers withdraw their old Ready
-and Candidate observations until FULL finishes. If the new owner fails during
-that window, Meta may report no eligible Candidate and an uncontrolled
-transition will wait rather than cut over without a current recovery
-observation. Node count alone does not show that a recoverable population
-remains: monitor follower population readiness and candidate observations
-before planned work on a newly promoted owner, and treat simultaneous FULL
-activity as a second-failure availability risk. There is no Meta rebuild queue
-or Data admission controller to serialize these replacements in v1; staged
-replacement is tracked by issue #45.
+Post-cutover reconciliation may start destructive FULL on several followers
+concurrently when none can CONTINUE from the new owner. Those followers
+withdraw their old Ready and Candidate observations until FULL finishes. If
+the new owner fails during that window, Meta may report no eligible Candidate
+and an uncontrolled transition will wait rather than cut over without a
+current recovery observation. Node count alone does not show that a
+recoverable population remains: monitor follower population readiness and
+candidate observations before planned work on a newly promoted owner, and
+treat simultaneous FULL activity as a second-failure availability risk. There
+is no Meta rebuild queue or Data admission controller to serialize these
+replacements.
 
 If the candidate is confirmed unavailable while the old owner is still usable,
 Meta aborts the controlled operation immediately and service remains on the old
@@ -411,18 +414,23 @@ source remains unavailable beyond the observation grace, or its boot/history
 is definitely replaced, Meta records the controlled request as aborted, fences
 the old authority, and continues the same Group transition in uncontrolled
 mode. An uncontrolled candidate failure selects a fresh action instead of
-waiting for that process to restart. A Meta leader change temporarily waits for
-fresh boot-scoped observations, then resumes from the committed Group
-transition. The warmup covers the configured election upper bound plus Data's
-maximum reconnect sleep (and is never shorter than the observation TTL); do
-not infer failure solely from that bounded interval. An explicit
-current-session disconnect or typed action failure still takes effect
-immediately.
+waiting for that process to restart when an eligible replacement exists;
+otherwise Meta clears the failed action and waits with no candidate. A Meta
+leader change temporarily waits for fresh boot-scoped observations, then
+resumes from the committed Group transition. The warmup covers the configured
+election upper bound plus Data's maximum reconnect sleep (and is never shorter
+than the observation TTL); do not infer failure solely from that bounded
+interval. A candidate's current-session disconnect or typed action failure
+takes effect immediately. An exact source disconnect starts its independent
+grace and degrades only if that grace expires or replacement evidence appears.
 
 Uncontrolled recovery has Redis Cluster-grade asynchronous loss semantics. It
 tries eligible compatibility domains from newest source term to older terms,
 selects the strongest candidate inside one comparable domain, and records
-`loss=unknown`. Writes acknowledged only by the failed owner may be absent.
+`loss=unknown` for every newly selected action. An exact healthy action already
+authorized lossless may instead retain `loss=none` across controlled
+degradation. Writes acknowledged only by the failed owner may be absent on an
+unknown-loss cutover.
 There is currently no automatic owner-failure detector that starts an
 uncontrolled transition for an unrelated outage; only a controlled transition
 already in progress can degrade automatically. Treat this as an availability
@@ -432,7 +440,15 @@ For postmortems, search Meta logs for `failover event=`. Accepted transition
 commits carry `mode`, `group`, `transition`, `action`, `loss`, and
 `commit_index`; candidate selection/replacement/domain fallback and bounded
 abort/degrade reasons add their relevant source or candidate fields. Entries
-with possible data loss are warnings. Correlate this sequence with the durable
+with possible data loss are warnings. Opaque variable values are canonical
+percent-encoded, so split fields on whitespace and the first `=` before
+decoding values; embedded whitespace, control bytes, and `=` cannot create new
+fields. Collection is at least once, including when logs from several Meta
+replicas are combined, so deduplicate records by `commit_index`. Exact
+post-effect replay suppresses the state-dependent event for
+`SetUncontrolledCandidate` and post-Begin `AbortControlledFailover`, because
+their original candidate classification or action identifier is no longer in
+the post-state. Correlate the resulting sequence with the authoritative durable
 audit chain and the terminal `getop` result.
 
 For plaintext remote administration, configure a listener and connect without

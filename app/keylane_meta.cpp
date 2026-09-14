@@ -878,8 +878,9 @@ int main(int argc, char** argv) {
   // A replacement leader starts with no volatile observations. Its absence
   // warmup must span both the Raft election and Data's longest reconnect
   // sleep; otherwise a healthy prepared candidate can be aborted just before
-  // it redials the new leader. Explicit disconnect/action-failure evidence
-  // remains immediate and does not wait for this pure-absence bound.
+  // it redials the new leader. Candidate disconnect and typed action-failure
+  // evidence remain immediate; an exact source disconnect uses its independent
+  // recovery grace.
   failover_options.observation_grace_ms_ = std::max<std::int64_t>(
       observation_ttl_ms,
       static_cast<std::int64_t>(options.election_ms_high_) +
@@ -1041,7 +1042,7 @@ int main(int argc, char** argv) {
 
   // Stop durable workflows before draining Admin waiters. Local accepted
   // proposals/API entries may finish, but no remote Data or membership result
-  // is needed to join; the next leader reconstructs work from the journal.
+  // is needed to join; the next leader reconstructs work from committed state.
   failover_reconciler->Shutdown();
   cluster_create_reconciler->Shutdown();
   membership_reconciler->Shutdown();

@@ -6,10 +6,11 @@
 // Per group the store keeps: the current group_term, the current grant
 // (owner, term, authority_version, lease parameters, policy reference), and
 // the fenced flag. INVARIANT: fenced_ == (no grant). A group is created
-// fenced and grantless; BeginGroupTerm(T) is the only term-advancing command
-// and re-enters the fenced/grantless state; ActivateAuthority installs a grant
-// under the CURRENT nonzero term (it deliberately carries no new term) and
-// unfences; RevokeGrant/FenceGroup drop the grant and fence.
+// fenced and grantless; BeginGroupTerm(T) is the only term-advancing store
+// primitive and re-enters the fenced/grantless state; typed failover aggregate
+// commands reuse it. ActivateAuthority is the shared grant-install primitive:
+// it uses the CURRENT nonzero term, deliberately carries no new term, and
+// unfences. RevokeGrant/FenceGroup drop the grant and fence.
 //
 // authority_version strictly increases per group across activations and
 // survives revocation (last_authority_version_ is kept when the grant is
@@ -25,12 +26,12 @@
 //     prior value. The policy reference's existence in the policy store is a
 //     cross-store fact the apply dispatcher checks (this store records the
 //     reference and answers PolicyInUse).
-//   - ActivateAuthority: the failover/migration atomic commit point. Split
-//     into ValidateActivate (pure, all rejections) and ApplyGrantPart (the
-//     install) so the apply dispatcher can atomically write the topology-store
-//     part (owner, topology_epoch, config_epoch live in the topology store)
-//     between the two. expected_term must equal the current term; the term
-//     does not move. ApplyGrantPart assumes a successful ValidateActivate and
+//   - ActivateAuthority: the authority-install kernel used directly and by
+//     typed failover cutover. It is split into ValidateActivate (pure, all
+//     rejections) and ApplyGrantPart (the install) so the apply dispatcher can
+//     atomically write the topology-store part (owner, topology_epoch, and
+//     config_epoch) between the two. expected_term must equal the current term;
+//     the term does not move. ApplyGrantPart assumes successful validation and
 //     FAILS STOP on a term mismatch (contract violation = apply-layer bug).
 //   - RevokeGrant/FenceGroup: CAS on the current term; drop the grant, fence.
 //
@@ -113,15 +114,19 @@ class MetaGrantStore {
   // replay is a no-op and preserves the original revision.
   absl::Status GrantAuthority(const GrantAuthority& command,
                               std::uint64_t committed_index);
-  // Pure validation of ActivateAuthority; every rejection lives here.
+  // Pure validation of ActivateAuthority; every rejection lives here. A
+  // present activation_action_id must be the nonzero failover action whose
+  // prepared context authorizes this cutover. It participates in exact replay
+  // matching; nullopt denotes an ordinary activation and clears the binding.
   absl::Status ValidateActivate(const ActivateAuthority& command,
                                 std::uint64_t committed_index,
                                 std::optional<MetaFailoverActionId>
                                     activation_action_id = std::nullopt) const;
   // Installs the grant part of ActivateAuthority, using committed_index as
-  // the new grant_revision. Caller must have run ValidateActivate successfully
-  // for the same command and index against the current state; a term mismatch
-  // here is an apply-layer bug and fails stop.
+  // the new grant_revision and persisting activation_action_id on the grant.
+  // Caller must have run ValidateActivate successfully with the same command,
+  // index, and optional action binding against the current state; a term
+  // mismatch here is an apply-layer bug and fails stop.
   absl::Status ApplyGrantPart(
       const ActivateAuthority& command, std::uint64_t committed_index,
       std::optional<MetaFailoverActionId> activation_action_id = std::nullopt);

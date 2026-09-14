@@ -154,7 +154,7 @@ struct DesiredClusterControl {
   // its explicit population workflow instead of starting a second ingress.
   bool steady_replication_enabled_ = false;
   // Derived from current_directives in the same FDS. While true, the exact
-  // #40 population attempt owns target ingress; ordinary Follow Owner is held
+  // population directive owns target ingress; ordinary Follow Owner is held
   // until a later complete FDS removes the directive.
   bool population_transition_expected_ = false;
 

@@ -30,8 +30,10 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -47,6 +49,8 @@
 #include "keylane/meta/state_machine.h"
 #include "libnuraft/nuraft.hxx"
 #include "libnuraft/raft_server_handler.hxx"
+#include "spdlog/sinks/ostream_sink.h"
+#include "spdlog/spdlog.h"
 
 namespace {
 
@@ -89,6 +93,37 @@ bool WaitFor(const std::function<bool()>& predicate,
   }
   return predicate();
 }
+
+class ScopedLogCapture {
+ public:
+  ScopedLogCapture()
+      : original_(spdlog::default_logger()),
+        sink_(std::make_shared<spdlog::sinks::ostream_sink_mt>(stream_)),
+        logger_(std::make_shared<spdlog::logger>("meta-sm-test", sink_)) {
+    logger_->set_level(spdlog::level::trace);
+    logger_->set_pattern("%v");
+    spdlog::set_default_logger(logger_);
+  }
+
+  ~ScopedLogCapture() {
+    logger_->flush();
+    spdlog::set_default_logger(std::move(original_));
+  }
+
+  std::string Take() {
+    logger_->flush();
+    std::string result = stream_.str();
+    stream_.str("");
+    stream_.clear();
+    return result;
+  }
+
+ private:
+  std::ostringstream stream_;
+  std::shared_ptr<spdlog::logger> original_;
+  std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
+  std::shared_ptr<spdlog::logger> logger_;
+};
 
 // ---------------------------------------------------------------------------
 // Command builders (same field conventions as meta_stores_test.cpp)
@@ -397,6 +432,7 @@ TEST_F(MetaStateMachineTest,
   std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
 
   const std::string owner = MakeNodeId(0x11);
+  const std::string group_id = "g1\ntransition=forged value";
   const keylane::meta::MetaAssignmentId owner_assignment = MakeRequestId(0x31);
   const keylane::meta::MetaGrantSpec successor_grant{5000, "p", 0};
 
@@ -405,8 +441,8 @@ TEST_F(MetaStateMachineTest,
   manifest.meta_members_ = {{1, "tcp://127.0.0.1:7101", "tcp://127.0.0.1:7301",
                              "tcp://127.0.0.1:7201"}};
   manifest.data_nodes_ = {{owner, "tcp://127.0.0.1:6379"}};
-  manifest.groups_ = {{"g1", owner, {}}};
-  manifest.slot_ranges_ = {{0, 16383, "g1"}};
+  manifest.groups_ = {{group_id, owner, {}}};
+  manifest.slot_ranges_ = {{0, 16383, group_id}};
 
   SubmitOperation root;
   root.request_id_ = MakeRequestId(0x01);
@@ -433,14 +469,14 @@ TEST_F(MetaStateMachineTest,
   node.role_ = keylane::meta::MetaNodeRole::kPrimary;
   Commit(*machine, 3, node);
 
-  CreateGroup group = MakeCreateGroup("g1", 1);
+  CreateGroup group = MakeCreateGroup(group_id, 1);
   group.actor_ = root.actor_;
   Commit(*machine, 4, group);
 
   keylane::meta::AssignNodeToGroup assign;
   assign.request_id_ = MakeRequestId(0x05);
   assign.actor_ = root.actor_;
-  assign.group_id_ = "g1";
+  assign.group_id_ = group_id;
   assign.node_id_ = owner;
   assign.assignment_id_ = owner_assignment;
   assign.role_ = keylane::meta::MetaNodeRole::kPrimary;
@@ -461,7 +497,7 @@ TEST_F(MetaStateMachineTest,
   keylane::meta::BeginGroupTerm begin_term;
   begin_term.request_id_ = MakeRequestId(0x07);
   begin_term.actor_ = root.actor_;
-  begin_term.group_id_ = "g1";
+  begin_term.group_id_ = group_id;
   begin_term.expected_term_ = 0;
   begin_term.new_term_ = 1;
   Commit(*machine, 7, begin_term);
@@ -469,7 +505,7 @@ TEST_F(MetaStateMachineTest,
   keylane::meta::ActivateAuthority activate;
   activate.request_id_ = MakeRequestId(0x08);
   activate.actor_ = root.actor_;
-  activate.group_id_ = "g1";
+  activate.group_id_ = group_id;
   activate.expected_term_ = 1;
   activate.new_owner_ = owner;
   activate.grant_ = successor_grant;
@@ -481,7 +517,7 @@ TEST_F(MetaStateMachineTest,
   keylane::meta::BeginUncontrolledFailover begin;
   begin.request_id_ = MakeRequestId(0x09);
   begin.actor_ = root.actor_;
-  begin.group_id_ = "g1";
+  begin.group_id_ = group_id;
   begin.transition_id_ = MakeRequestId(0x41);
   begin.target_term_ = 2;
   begin.successor_grant_ = successor_grant;
@@ -500,7 +536,7 @@ TEST_F(MetaStateMachineTest,
   const MetaStores committed = machine->StoresSnapshot();
   ASSERT_EQ(committed.topology_.ClusterLifecycle().state_,
             keylane::meta::MetaClusterLifecycle::kCreated);
-  const auto committed_group = committed.topology_.FindGroup("g1");
+  const auto committed_group = committed.topology_.FindGroup(group_id);
   ASSERT_TRUE(committed_group.has_value());
   ASSERT_TRUE(committed_group->failover_transition_.has_value());
   const keylane::meta::MetaFailoverTransition committed_transition =
@@ -510,7 +546,7 @@ TEST_F(MetaStateMachineTest,
   EXPECT_EQ(committed_transition.target_term_, 2u);
   EXPECT_FALSE(committed_transition.candidate_action_.has_value());
 
-  const auto committed_grant = committed.grant_.GroupState("g1");
+  const auto committed_grant = committed.grant_.GroupState(group_id);
   ASSERT_TRUE(committed_grant.has_value());
   EXPECT_EQ(committed_grant->group_term_, 2u);
   EXPECT_TRUE(committed_grant->fenced_);
@@ -525,12 +561,12 @@ TEST_F(MetaStateMachineTest,
   EXPECT_EQ(machine->last_commit_index(), 9u);
 
   const MetaStores restored = machine->StoresSnapshot();
-  const auto restored_group = restored.topology_.FindGroup("g1");
+  const auto restored_group = restored.topology_.FindGroup(group_id);
   ASSERT_TRUE(restored_group.has_value());
   ASSERT_TRUE(restored_group->failover_transition_.has_value());
   EXPECT_EQ(*restored_group->failover_transition_, committed_transition);
   EXPECT_EQ(restored_group->record_.group_term_, 2u);
-  const auto restored_grant = restored.grant_.GroupState("g1");
+  const auto restored_grant = restored.grant_.GroupState(group_id);
   ASSERT_TRUE(restored_grant.has_value());
   EXPECT_EQ(restored_grant->group_term_, 2u);
   EXPECT_TRUE(restored_grant->fenced_);
@@ -541,13 +577,61 @@ TEST_F(MetaStateMachineTest,
   // term or transition revision a second time.
   Commit(*machine, 9, begin);
   const MetaStores replayed = machine->StoresSnapshot();
-  const auto replayed_group = replayed.topology_.FindGroup("g1");
+  const auto replayed_group = replayed.topology_.FindGroup(group_id);
   ASSERT_TRUE(replayed_group.has_value());
   ASSERT_TRUE(replayed_group->failover_transition_.has_value());
   EXPECT_EQ(*replayed_group->failover_transition_, committed_transition);
   EXPECT_EQ(replayed_group->record_.group_term_, 2u);
   EXPECT_EQ(replayed.audit_.size(), 9u);
   EXPECT_EQ(machine->last_commit_index(), 9u);
+
+  keylane::meta::MetaBootIncarnation boot{};
+  boot.fill(0x61);
+  keylane::meta::MetaReplicationHistoryId history{};
+  history.fill(0x62);
+  keylane::meta::MetaFailoverCandidateAction selected_action;
+  selected_action.action_id_ = MakeRequestId(0x51);
+  selected_action.candidate_ = {owner, owner_assignment, boot};
+  selected_action.domain_ = {
+      1, owner, owner_assignment, boot, history, 1,
+  };
+
+  keylane::meta::SetUncontrolledCandidate select;
+  select.request_id_ = MakeRequestId(0x52);
+  select.group_id_ = group_id;
+  select.expected_transition_ = {begin.transition_id_, 9};
+  select.candidate_action_ = selected_action;
+
+  ScopedLogCapture logs;
+  Commit(*machine, 10, select);
+  const std::string selected_log = logs.Take();
+  EXPECT_NE(selected_log.find("failover event=candidate-selected"),
+            std::string::npos);
+  EXPECT_NE(
+      selected_log.find("group=g1%0Atransition%3Dforged%20value transition="),
+      std::string::npos);
+  EXPECT_EQ(selected_log.find("group=g1\ntransition=forged value"),
+            std::string::npos);
+
+  // State-dependent candidate event classification cannot be reconstructed
+  // after the previous action is overwritten. Exact post-effect replay is
+  // therefore intentionally silent instead of relabelling index 10 as a
+  // replacement.
+  Commit(*machine, 10, select);
+  EXPECT_EQ(logs.Take().find("failover event="), std::string::npos);
+
+  keylane::meta::MetaFailoverCandidateAction fallback_action = selected_action;
+  fallback_action.action_id_ = MakeRequestId(0x53);
+  fallback_action.domain_.source_history_id_.fill(0x63);
+  keylane::meta::SetUncontrolledCandidate fallback = select;
+  fallback.request_id_ = MakeRequestId(0x54);
+  fallback.expected_transition_.revision_ = 10;
+  fallback.candidate_action_ = fallback_action;
+  Commit(*machine, 11, fallback);
+  EXPECT_NE(logs.Take().find("failover event=domain-fallback"),
+            std::string::npos);
+  Commit(*machine, 11, fallback);
+  EXPECT_EQ(logs.Take().find("failover event="), std::string::npos);
 }
 
 TEST_F(MetaStateMachineTest, SnapshotExactCutPoint) {

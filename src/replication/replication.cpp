@@ -14,6 +14,7 @@
 #include <atomic>
 #include <bitset>
 #include <cassert>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -167,6 +168,28 @@ std::uint64_t SecondsSince(std::uint64_t started_nanos) noexcept {
   const std::uint64_t now = SteadyNanos();
   return now > started_nanos ? (now - started_nanos) / 1'000'000'000 : 0;
 }
+
+#if KEYLANE_FAULTS_ENABLED
+// A configured path turns the corresponding promotion stall into a
+// deterministic coroutine barrier. Tests observe the created file, then
+// supersede the action through the public reconciliation API. The runner
+// resumes only after that action is no longer current, eliminating timing as
+// evidence for which side of the durability boundary was exercised.
+absl::Status SignalPromotionFaultBarrier(const char* variable) {
+  const char* path = std::getenv(variable);
+  if (path == nullptr || *path == '\0') return absl::OkStatus();
+  const int fd = ::open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return absl::InternalError(absl::StrCat(
+        "could not signal promotion fault barrier: ", std::strerror(errno)));
+  }
+  if (::close(fd) != 0) {
+    return absl::InternalError(absl::StrCat(
+        "could not close promotion fault barrier: ", std::strerror(errno)));
+  }
+  return absl::OkStatus();
+}
+#endif
 // A disk-backed full sync of a multi-terabyte dataset can legitimately run
 // for hours. Only a flow that stops making protocol progress is timed out;
 // there is deliberately no wall-clock limit on the whole synchronization.
@@ -2133,7 +2156,7 @@ bool IsRetainedControlledDegrade(
   }
 
   // DegradeControlledFailover retains the exact candidate action while its
-  // atomic term fence changes only these four projection fields. Normalize
+  // atomic term fence changes only these five projection fields. Normalize
   // them before comparing so candidate, source lineage, population, and
   // transition identities remain immutable execution anchors.
   DesiredClusterFailoverAction current_copy = current;
@@ -2530,6 +2553,12 @@ struct ClusterPromotionPrepareContext {
   const ClusterPromotionPrepareDirective directive_;
   const std::shared_ptr<detail::ClusterPromotionPrepareCompletionState>
       completion_;
+  // Worker zero may cancel an FDS-owned preparation only before the runner
+  // crosses into storage durability/history mutation. Past that point the
+  // caller must join the result and retire any child history rather than
+  // pretending that the physical outcome is known.
+  bool cancellation_requested_ = false;
+  bool durability_mutation_started_ = false;
 };
 
 struct ClusterSourcePauseContext {
@@ -3943,6 +3972,29 @@ class ReplicationManager::ReplicationGroup {
   }
 #endif
 
+#if KEYLANE_FAULTS_ENABLED
+  Task<absl::StatusOr<bool>> WaitAtPromotionFaultBarrier(
+      const std::shared_ptr<ClusterPromotionPrepareContext>& context,
+      const char* signal_variable) {
+    const char* signal_path = std::getenv(signal_variable);
+    if (signal_path == nullptr || *signal_path == '\0') co_return false;
+    absl::Status signalled = SignalPromotionFaultBarrier(signal_variable);
+    if (!signalled.ok()) co_return signalled;
+    for (;;) {
+      AssertStateOwner();
+      const bool exact_action_current =
+          cluster_failover_action_ != nullptr &&
+          cluster_failover_action_->prepare_directive_.has_value() &&
+          *cluster_failover_action_->prepare_directive_ == context->directive_;
+      if (!exact_action_current || context->cancellation_requested_) break;
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+    co_return true;
+  }
+#endif
+
   Task<absl::Status> RunClusterPromotionPrepare(
       std::shared_ptr<ClusterPromotionPrepareContext> context,
       std::shared_ptr<ClusterRebuildContext> population,
@@ -3958,13 +4010,51 @@ class ReplicationManager::ReplicationGroup {
       context->completion_->Resolve(terminal);
       return terminal;
     };
+    const auto cancellation_requested = [&] {
+      return context->cancellation_requested_ &&
+             !context->durability_mutation_started_;
+    };
+    const auto finish_cancelled = [&] {
+      const absl::Status cancelled = absl::CancelledError(
+          "cluster promotion preparation was superseded before durability");
+      AssertStateOwner();
+      if (cluster_promotion_prepare_ == context &&
+          cluster_rebuild_ == population) {
+        replica_reconfiguration_running_ = false;
+        // A self-origin Candidate was a fenced primary population before
+        // preparation. Restore that boot-local shape so a replacement action
+        // can enter the same promotion kernel; authority remains governed by
+        // its committed grant, and expiration remains disabled.
+        if (native_population && !cluster_control_stopping_ &&
+            !failed_stopped_.load(std::memory_order_relaxed)) {
+          StoreRole(ReplicationRole::kMaster, std::memory_order_release);
+          if (!storage_->ReplicaRecoveryFenced()) {
+            storage_->SetReplicaLoading(false);
+          }
+        }
+      }
+      context->completion_->Resolve(cancelled);
+      return cancelled;
+    };
 
 #if KEYLANE_FAULTS_ENABLED
     if (KEYLANE_FAULT_MATCHES("KEYLANE_REPLICATION_STALL_PROMOTION_ACTION",
                               context->directive_.identity_.attempt_id_)) {
-      absl::Status stalled = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(200));
-      if (!stalled.ok()) co_return fail_stop(stalled, "fault stall");
+      auto barrier = co_await WaitAtPromotionFaultBarrier(
+          context,
+          "KEYLANE_REPLICATION_PROMOTION_PRE_DURABILITY_BARRIER_ACK_PATH");
+      if (!barrier.ok()) co_return fail_stop(barrier.status(), "fault barrier");
+      if (!*barrier) {
+        auto remaining = std::chrono::milliseconds(200);
+        while (remaining > std::chrono::milliseconds::zero() &&
+               !cancellation_requested()) {
+          constexpr auto kSlice = std::chrono::milliseconds(1);
+          absl::Status stalled =
+              co_await celer::SleepFor(*celer::ThisWorker().self_, kSlice);
+          if (!stalled.ok()) co_return fail_stop(stalled, "fault stall");
+          remaining -= kSlice;
+        }
+      }
     }
 #endif
 
@@ -3983,8 +4073,13 @@ class ReplicationManager::ReplicationGroup {
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return fail_stop(waited, "coordinator join");
     }
+    // Admission already detached the old target session. Even a cancellation
+    // that arrives before source revocation must join those flows before the
+    // Ready population can be handed to another action.
+    if (cancellation_requested()) co_return finish_cancelled();
 
     while (!CloseAllCommandDbGates()) {
+      if (cancellation_requested()) co_return finish_cancelled();
       absl::Status waited = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return fail_stop(waited, "command drain");
@@ -3992,19 +4087,23 @@ class ReplicationManager::ReplicationGroup {
     struct CommandGateGuard {
       ~CommandGateGuard() { OpenAllCommandDbGates(); }
     } command_gate;
+    if (cancellation_requested()) co_return finish_cancelled();
     while (CommandDbOperationsActive()) {
+      if (cancellation_requested()) co_return finish_cancelled();
       absl::Status waited = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return fail_stop(waited, "command drain");
     }
     auto catalog_guard = co_await AcquireFunctionCatalogOperation();
     (void)catalog_guard;
+    if (cancellation_requested()) co_return finish_cancelled();
     absl::Status quiesced = co_await storage_->QuiesceExpiration();
     if (!quiesced.ok()) co_return fail_stop(quiesced, "expiration quiesce");
     struct ExpirationResumeGuard {
       storage::StorageEngine* storage_;
       ~ExpirationResumeGuard() { storage_->ResumeExpiration(); }
     } expiration_resume{storage_};
+    if (cancellation_requested()) co_return finish_cancelled();
 
     std::vector<std::uint64_t> frozen;
     if (native_population) {
@@ -4027,6 +4126,7 @@ class ReplicationManager::ReplicationGroup {
       }
       frozen = std::move(*frozen_snapshot);
     }
+    if (cancellation_requested()) co_return finish_cancelled();
     if (frozen.size() !=
         context->directive_.required_applied_next_lsns_.size()) {
       co_return fail_stop(absl::FailedPreconditionError(
@@ -4042,6 +4142,7 @@ class ReplicationManager::ReplicationGroup {
             "frontier freeze");
       }
     }
+    if (cancellation_requested()) co_return finish_cancelled();
     storage::PromotionBase promotion_base{
         .group_id_ = context->directive_.identity_.group_id_,
         .parent_history_id_ = context->directive_.parent_history_id_,
@@ -4055,6 +4156,30 @@ class ReplicationManager::ReplicationGroup {
             context->directive_.identity_.directive_id_, ":",
             context->directive_.identity_.attempt_id_),
     };
+    // This assignment and the first durability call are consecutive on the
+    // owner worker. Once set, FDS supersession must wait for a known terminal
+    // outcome and retire any child publisher; early cancellation would make
+    // the durable PromotionBase/history outcome unknowable.
+    context->durability_mutation_started_ = true;
+#if KEYLANE_FAULTS_ENABLED
+    if (KEYLANE_FAULT_MATCHES(
+            "KEYLANE_REPLICATION_STALL_PROMOTION_AFTER_DURABILITY_BOUNDARY",
+            context->directive_.identity_.attempt_id_)) {
+      auto barrier = co_await WaitAtPromotionFaultBarrier(
+          context,
+          "KEYLANE_REPLICATION_PROMOTION_POST_DURABILITY_BARRIER_ACK_PATH");
+      if (!barrier.ok()) {
+        co_return fail_stop(barrier.status(), "durability fault barrier");
+      }
+      if (!*barrier) {
+        absl::Status stalled = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, std::chrono::milliseconds(200));
+        if (!stalled.ok()) {
+          co_return fail_stop(stalled, "durability fault stall");
+        }
+      }
+    }
+#endif
     auto prepared = co_await PreparePromotion(std::move(promotion_base));
     if (!prepared.ok()) {
       co_return fail_stop(prepared.status(), "durability/history preparation");
@@ -4587,6 +4712,18 @@ class ReplicationManager::ReplicationGroup {
     return std::chrono::seconds(30);
   }
 
+  void RequestFailoverPromotionCancellation(
+      const std::shared_ptr<ClusterFailoverActionContext>& action) {
+    AssertStateOwner();
+    if (!action->prepare_directive_.has_value() ||
+        cluster_promotion_prepare_ == nullptr ||
+        cluster_promotion_prepare_->directive_ != *action->prepare_directive_ ||
+        cluster_promotion_prepare_->durability_mutation_started_) {
+      return;
+    }
+    cluster_promotion_prepare_->cancellation_requested_ = true;
+  }
+
   Task<absl::Status> WaitForFailoverActionRetry(
       const std::shared_ptr<ClusterFailoverActionContext>& context,
       std::chrono::steady_clock::time_point watchdog_deadline) {
@@ -4636,9 +4773,9 @@ class ReplicationManager::ReplicationGroup {
     std::vector<std::uint64_t> minimum_frontier(
         context->desired_.domain_.flow_count_, 1);
 #if KEYLANE_FAULTS_ENABLED
-    // The existing #40 fixture seeds a complete Ready population before this
-    // action enters production validation. It is compiled out of ordinary
-    // binaries and still passes through every exact domain check below.
+    // The fault fixture seeds a complete Ready population before this action
+    // enters production validation. It is compiled out of ordinary binaries
+    // and still passes through every exact domain check below.
     ClusterPromotionPrepareDirective seed =
         BuildFailoverPrepareDirective(context->desired_, minimum_frontier);
     if (KEYLANE_FAULT_MATCHES(
@@ -4780,6 +4917,25 @@ class ReplicationManager::ReplicationGroup {
         co_return started.status();
       }
 
+      // Reconciliation can supersede the action while admission is suspended
+      // inside Start*PromotionPrepare. Forward that already-observed cancel to
+      // the exact preparation before waiting for its private completion.
+      if (context->cancelled_) {
+        RequestFailoverPromotionCancellation(context);
+      }
+#if KEYLANE_FAULTS_ENABLED
+      const std::string_view attempt_id =
+          context->prepare_directive_->identity_.attempt_id_;
+      if (KEYLANE_FAULT_MATCHES("KEYLANE_REPLICATION_STALL_PROMOTION_ACTION",
+                                attempt_id) ||
+          KEYLANE_FAULT_MATCHES(
+              "KEYLANE_REPLICATION_STALL_PROMOTION_AFTER_DURABILITY_BOUNDARY",
+              attempt_id)) {
+        (void)SignalPromotionFaultBarrier(
+            "KEYLANE_REPLICATION_FAILOVER_RUNNER_WAITING_ACK_PATH");
+      }
+#endif
+
       std::optional<ClusterPromotionPrepareCompletion::Result> result;
       while (!(result = (*started)->result()).has_value()) {
         (void)watchdog_expired();
@@ -4790,6 +4946,10 @@ class ReplicationManager::ReplicationGroup {
           co_return waited;
         }
       }
+#if KEYLANE_FAULTS_ENABLED
+      (void)SignalPromotionFaultBarrier(
+          "KEYLANE_REPLICATION_FAILOVER_RUNNER_TERMINAL_ACK_PATH");
+#endif
       if (!result->ok()) {
         PublishFailoverActionFailure(context, "promotion-prepare",
                                      result->status().ToString());
@@ -4948,6 +5108,7 @@ class ReplicationManager::ReplicationGroup {
           cluster_failover_action_;
       previous->cancelled_ = true;
       cluster_failover_action_.reset();
+      RequestFailoverPromotionCancellation(previous);
       while (!previous->runner_finished_) {
         absl::Status waited = co_await celer::SleepFor(
             *celer::ThisWorker().self_, std::chrono::milliseconds(1));
@@ -4964,12 +5125,21 @@ class ReplicationManager::ReplicationGroup {
         retained_failover_prepared_context_ = previous->prepared_;
         retained_failover_desired_action_ = previous->desired_;
       } else {
-        retire_abandoned_prepared_history =
-            previous->prepared_child_history_created_;
-        if (previous->prepare_directive_.has_value() &&
+        const bool exact_prepare_retained =
+            previous->prepare_directive_.has_value() &&
             cluster_promotion_prepare_ != nullptr &&
             cluster_promotion_prepare_->directive_ ==
-                *previous->prepare_directive_) {
+                *previous->prepare_directive_;
+        // After the durability boundary, failure can occur after the child
+        // publisher was created but before Prepared evidence reached the
+        // action runner. Its terminal result alone therefore cannot prove
+        // that no active child exists; conservatively drain and retire the
+        // current non-cutover history before acknowledging supersession.
+        retire_abandoned_prepared_history =
+            previous->prepared_child_history_created_ ||
+            (exact_prepare_retained &&
+             cluster_promotion_prepare_->durability_mutation_started_);
+        if (exact_prepare_retained) {
           cluster_promotion_prepare_.reset();
         }
         retained_failover_activation_action_id_.reset();
@@ -5423,21 +5593,12 @@ class ReplicationManager::ReplicationGroup {
           "follow-owner source incarnation is incomplete");
     }
 
-    std::uint64_t revision = next_cluster_follow_directive_revision_;
-    if (cluster_rebuild_ != nullptr) {
-      const std::uint64_t current_revision =
-          cluster_rebuild_->directive_.identity_.directive_revision_;
-      if (current_revision == std::numeric_limits<std::uint64_t>::max()) {
-        return absl::OutOfRangeError(
-            "follow-owner population revision cannot advance");
-      }
-      revision = std::max(revision, current_revision + 1);
-    }
-    if (revision == 0 ||
-        revision == std::numeric_limits<std::uint64_t>::max()) {
-      return absl::OutOfRangeError(
-          "follow-owner population revision is exhausted");
-    }
+    // ReplicationGroup owns the accepted-version watermark even after a
+    // failed CONTINUE invalidates and releases cluster_rebuild_. Deriving the
+    // next revision from that owner prevents every FULL retry from being
+    // rejected forever as stale after the transient context disappears.
+    auto revision = cluster_group_->NextDirectiveRevision(desired.group_term_);
+    if (!revision.ok()) return revision.status();
 
     RebuildDirective directive{
         .identity_ =
@@ -5445,7 +5606,7 @@ class ReplicationManager::ReplicationGroup {
                 .group_id_ = desired.group_id_,
                 .assignment_id_ = desired.local_assignment_id_,
                 .term_ = desired.group_term_,
-                .directive_revision_ = revision,
+                .directive_revision_ = *revision,
                 .authority_id_ =
                     absl::StrCat("steady-follow:", desired.group_id_),
                 .source_node_id_ = desired.owner_node_id_,
@@ -5461,7 +5622,8 @@ class ReplicationManager::ReplicationGroup {
                 .directive_id_ =
                     absl::StrCat("steady-follow-owner:", desired.owner_node_id_,
                                  ":", desired.owner_assignment_id_),
-                .attempt_id_ = absl::StrCat("steady-follow-attempt:", revision),
+                .attempt_id_ =
+                    absl::StrCat("steady-follow-attempt:", *revision),
                 .manifest_revision_ = desired.manifest_revision_,
                 .manifest_id_ = desired.manifest_id_,
                 .partition_replication_epoch_ =
@@ -5491,7 +5653,6 @@ class ReplicationManager::ReplicationGroup {
         std::move(*authorization));
     cluster_rebuild_ = population;
     session->cluster_rebuild_ = std::move(population);
-    next_cluster_follow_directive_revision_ = revision + 1;
     native_dataset_valid_.store(false, std::memory_order_release);
     applied_frontier_.reset();
     upstream_node_id_.reset();
@@ -5550,9 +5711,9 @@ class ReplicationManager::ReplicationGroup {
     const bool previous_was_follower =
         previous != nullptr && !previous_was_owner;
     // The level-triggered adapter may be installed over an already-running
-    // legacy/#40 coordinator on its first FDS. Treat that ingress as the
-    // relationship being replaced too; otherwise two sessions can race while
-    // the new exact Owner/scope is being installed.
+    // pre-FDS population coordinator on its first FDS. Treat that ingress as
+    // the relationship being replaced too; otherwise two sessions can race
+    // while the new exact Owner/scope is being installed.
     const bool legacy_ingress =
         previous == nullptr &&
         (upstream_.has_value() || active_replica_session_ != nullptr ||
@@ -5568,11 +5729,13 @@ class ReplicationManager::ReplicationGroup {
         (next != nullptr || previous_was_follower || legacy_ingress);
 
     if (must_fence_target) {
-      // Close serving before cancellation can suspend. Replacement retains the
-      // physical population and ReadyToken, but no removed or stale follower
-      // relationship may keep serving while its session is being joined.
+      // Close serving before cancellation can suspend. The role generation
+      // fences clients, and StopClusterFollowIngress joins every old apply
+      // before a replacement coordinator starts. Keep storage on the live
+      // Ready root: replica_loading is owned by a destructive FULL after it
+      // installs per-partition apply contexts; setting it here would route
+      // same-history CONTINUE writes through contexts that do not exist.
       StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
-      storage_->SetReplicaLoading(true);
       storage_->SetExpirationAuthority(false);
       source_authorizations_.RevokeAll();
       retained_failover_activation_action_id_.reset();
@@ -5889,7 +6052,14 @@ class ReplicationManager::ReplicationGroup {
     // control session in this boot may consume it.
     const std::shared_ptr<ClusterFailoverActionContext> action =
         std::move(cluster_failover_action_);
-    if (action != nullptr) action->cancelled_ = true;
+    if (action != nullptr) {
+      action->cancelled_ = true;
+      // The action runner forwards cancellation once after admission. Shutdown
+      // can arrive after that check while the detached preparation is still at
+      // a reversible barrier, so route it through the same exact-context
+      // handshake used by ordinary FDS supersession.
+      RequestFailoverPromotionCancellation(action);
+    }
     retained_failover_activation_action_id_.reset();
     retained_failover_prepared_context_.reset();
     retained_failover_desired_action_.reset();
@@ -7911,7 +8081,9 @@ class ReplicationManager::ReplicationGroup {
     }
     StoreRole(ReplicationRole::kMaster, std::memory_order_release);
     storage_->SetReplicaLoading(false);
-    storage_->SetExpirationAuthority(true);
+    // Population readiness does not convey a write lease. NodeControl enables
+    // a finite expiration capability only after the matching FDS and lease
+    // deadline pass their final activation recheck.
     context->completion_->Resolve(absl::OkStatus());
     co_return absl::OkStatus();
   }
@@ -13569,7 +13741,6 @@ class ReplicationManager::ReplicationGroup {
   // is the FDS-derived source admission set; on a non-Owner it pins the
   // reconnecting coordinator and its exact target scope.
   std::shared_ptr<ClusterFollowOwnerContext> cluster_follow_owner_;
-  std::uint64_t next_cluster_follow_directive_revision_ = 1;
   detail::SourceAuthorizationLedger source_authorizations_;
   // Source authorization and handshake publication run on worker zero under
   // master_mutex_. A revoke uses the same registry gate; this count keeps

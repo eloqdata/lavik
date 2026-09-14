@@ -374,9 +374,11 @@ using HeartbeatRoleInformation =
 
 // Failover progress is orthogonal to the steady-state role payload: a
 // controlled source still requests lease renewal while reporting its stable
-// pause, and a candidate still advertises catch-up progress while reporting a
-// completed or failed action. All values are boot-local observations; only
-// the transition projected in FullDesiredState is durable.
+// pause. Candidate action progress can coexist with ReplicaCandidate, but
+// history rotation or terminal failure may suppress that ordinary role while
+// the independent failover observation reports Prepared or Failed. All values
+// are boot-local observations; only the transition projected in
+// FullDesiredState is durable.
 struct SourcePaused {
   WireId128 transition_id{};
   std::string source_node_id;

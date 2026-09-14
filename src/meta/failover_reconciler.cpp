@@ -179,7 +179,7 @@ SourceAvailability SourceState(const MetaFailoverCandidateAction& action,
   if (!latest.has_value()) {
     // A same-incarnation reconnect purges the older generation's reports.
     // Give the replacement session only the remainder of the original
-    // disconnect grace to produce its first heartbeat; adopting a session is
+    // disconnect grace to produce its first heartbeat; adopting a session
     // does not itself establish that the source is healthy, and repeated
     // reconnects do not restart the clock.
     if (session->disconnected_boot_id_ ==
@@ -203,11 +203,13 @@ SourceAvailability SourceState(const MetaFailoverCandidateAction& action,
 
 struct CandidateState {
   CandidateAvailability availability_ = CandidateAvailability::kWarmup;
+  bool explicit_failure_ = false;
   std::optional<MetaCandidateProgressObs> progress_;
 };
 
-CandidateState UnavailableCandidate() {
+CandidateState UnavailableCandidate(bool explicit_failure = false) {
   return {.availability_ = CandidateAvailability::kUnavailable,
+          .explicit_failure_ = explicit_failure,
           .progress_ = std::nullopt};
 }
 
@@ -233,13 +235,13 @@ CandidateState CurrentCandidateState(
   }
   if (!session->connected_ ||
       session->current_boot_id_ != action.candidate_.boot_id_) {
-    return UnavailableCandidate();
+    return UnavailableCandidate(true);
   }
   if (observations
           .ActionFailedFor(transition.transition_id_, action.action_id_, facts,
                            context.now_unix_ms_)
           .has_value()) {
-    return UnavailableCandidate();
+    return UnavailableCandidate(true);
   }
 
   const auto prepared = observations.CandidatePreparedFor(
@@ -251,7 +253,7 @@ CandidateState CurrentCandidateState(
   // state has no action for this node/boot. Therefore any same-boot latch
   // visible here was recorded after this action became active and is terminal
   // for the action, even if a later session reports Prepared again.
-  if (same_boot_disconnect) return UnavailableCandidate();
+  if (same_boot_disconnect) return UnavailableCandidate(true);
   if (prepared.has_value()) {
     return HealthyCandidate();
   }
@@ -290,7 +292,8 @@ CandidateState CurrentCandidateState(
       // projection must not clear a candidate selected atomically with an
       // uncontrolled term fence, and authorized preparation has its own
       // typed failure/watchdog outcome.
-      return omission_is_terminal ? UnavailableCandidate() : WarmupCandidate();
+      return omission_is_terminal ? UnavailableCandidate(true)
+                                  : WarmupCandidate();
     }
     return HealthyCandidate(*same_node);
   }
@@ -307,7 +310,8 @@ CandidateState CurrentCandidateState(
     // intentionally suppress the ordinary role while prepare is in flight.
     // At that point only disconnect or typed ActionFailed is terminal; the
     // action watchdog supplies the bounded failure outcome.
-    return omission_is_terminal ? UnavailableCandidate() : WarmupCandidate();
+    return omission_is_terminal ? UnavailableCandidate(true)
+                                : WarmupCandidate();
   }
   return WarmupComplete(context) ? UnavailableCandidate() : WarmupCandidate();
 }
@@ -507,8 +511,13 @@ absl::StatusOr<std::optional<MetaCommand>> PlanControlledTransition(
                           : "controlled failover source became unavailable";
     return MetaCommand{std::move(command)};
   }
-  if (source == SourceAvailability::kHealthy &&
-      candidate.availability_ == CandidateAvailability::kUnavailable) {
+  // An affirmative Candidate failure terminates the operator-requested
+  // attempt even while Source liveness is inside grace. Inferred Candidate
+  // absence is terminal only while Source is known healthy; once Source is
+  // definitively unavailable or replaced, the branch above must degrade into
+  // the recovery needed to restore service.
+  if (candidate.availability_ == CandidateAvailability::kUnavailable &&
+      (source == SourceAvailability::kHealthy || candidate.explicit_failure_)) {
     return AbortControlled(
         *operation, group.group_id_, TransitionRef(transition),
         "controlled failover candidate became unavailable", context);

@@ -591,6 +591,25 @@ TEST(MetaFailoverValidationTest,
 }
 
 TEST(MetaFailoverValidationTest,
+     RejectsUncontrolledCandidateClearWhenNoActionIsInstalled) {
+  ProposalFixture fixture;
+  fixture.BeginUncontrolledWithoutCandidate();
+  const MetaFailoverTransition transition = fixture.Transition();
+
+  SetUncontrolledCandidate clear;
+  clear.request_id_ = Bytes<16>(0x57);
+  clear.group_id_ = "g1";
+  clear.expected_transition_ = {transition.transition_id_,
+                                transition.revision_};
+
+  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
+                MetaCommand(clear),
+                MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                fixture.observations, 1'011)),
+            MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
      KeepsUncontrolledReplacementWhenDisconnectedActionReprepares) {
   ProposalFixture fixture;
   fixture.AddAlternate();

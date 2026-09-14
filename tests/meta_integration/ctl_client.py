@@ -670,6 +670,21 @@ def scripted_failover_gate(workdir):
         raise H.Failure(
             "failover uncertain response omitted operation recovery identity")
 
+    proposal_timeout, _, decoded = run_server(
+        "proposal-timeout", "ERR failover 1 proposal timeout", expected=3)
+    if (not decoded or decoded[0][0] not in proposal_timeout.stderr or
+            "outcome is uncertain" not in proposal_timeout.stderr):
+        raise H.Failure(
+            "failover proposal timeout omitted operation recovery identity")
+
+    resource_rejected, _, _ = run_server(
+        "resource-rejected",
+        "ERR failover 1 proposal resource-exhausted", expected=2)
+    if ("resource-exhausted" not in resource_rejected.stderr or
+            "outcome is uncertain" in resource_rejected.stderr):
+        raise H.Failure(
+            "pre-append failover resource gate used uncertain exit semantics")
+
     missing_group = run_cluster(
         ["failover", "--socket", os.path.join(directory, "unused.sock")],
         expected=1)

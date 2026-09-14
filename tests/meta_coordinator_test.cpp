@@ -36,8 +36,10 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -55,6 +57,8 @@
 #include "keylane/meta/observation_store.h"
 #include "keylane/meta/state_machine.h"
 #include "libnuraft/nuraft.hxx"
+#include "spdlog/sinks/ostream_sink.h"
+#include "spdlog/spdlog.h"
 
 // Trusted test peer for the passkey-protected principal boundary. Tests use
 // the same privileged construction path as ctl and authenticated sessions.
@@ -127,6 +131,38 @@ bool WaitFor(const std::function<bool()>& predicate,
   }
   return predicate();
 }
+
+class ScopedLogCapture {
+ public:
+  ScopedLogCapture()
+      : original_(spdlog::default_logger()),
+        sink_(std::make_shared<spdlog::sinks::ostream_sink_mt>(stream_)),
+        logger_(
+            std::make_shared<spdlog::logger>("meta-coordinator-test", sink_)) {
+    logger_->set_level(spdlog::level::trace);
+    logger_->set_pattern("%v");
+    spdlog::set_default_logger(logger_);
+  }
+
+  ~ScopedLogCapture() {
+    logger_->flush();
+    spdlog::set_default_logger(std::move(original_));
+  }
+
+  std::string Take() {
+    logger_->flush();
+    std::string result = stream_.str();
+    stream_.str("");
+    stream_.clear();
+    return result;
+  }
+
+ private:
+  std::ostringstream stream_;
+  std::shared_ptr<spdlog::logger> original_;
+  std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
+  std::shared_ptr<spdlog::logger> logger_;
+};
 
 MetaRequestId MakeRequestId(std::uint8_t seed) {
   MetaRequestId id{};
@@ -1314,9 +1350,14 @@ TEST_F(MetaCoordinatorServerTest,
   abort.group_id_ = "g1";
   abort.expected_transition_ = transition;
   abort.reason_ = "fail-safe cancelled controlled failover";
+  ScopedLogCapture logs;
   auto aborted = ProposeSync(abort);
   ASSERT_TRUE(aborted.ok()) << aborted.status();
   EXPECT_EQ(aborted->verdict_, MetaAuditVerdict::kAccepted);
+  const std::string first_abort_log = logs.Take();
+  EXPECT_NE(first_abort_log.find("failover event=abort"), std::string::npos);
+  EXPECT_NE(first_abort_log.find("action=a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"),
+            std::string::npos);
 
   const auto after = machine_->StoresSnapshot();
   const auto operation = after.operation_.FindOperation(failover.operation_id_);
@@ -1332,6 +1373,16 @@ TEST_F(MetaCoordinatorServerTest,
   const auto after_grant = after.grant_.Serialize();
   ASSERT_TRUE(after_grant.ok()) << after_grant.status();
   EXPECT_EQ(*after_grant, *before_grant);
+
+  const auto abort_audit = after.audit_.Find(aborted->log_index_);
+  ASSERT_TRUE(abort_audit.has_value());
+  abort.actor_.principal_ = abort_audit->record_.actor_principal_;
+  abort.actor_.readable_time_ = abort_audit->record_.readable_time_;
+  auto encoded_abort = MetaStateMachine::EncodeCommand(MetaCommand{abort});
+  ASSERT_TRUE(encoded_abort.ok()) << encoded_abort.status();
+  machine_->commit(aborted->log_index_, **encoded_abort);
+  EXPECT_EQ(logs.Take().find("failover event=abort"), std::string::npos)
+      << "exact replay cannot relabel the cleared action as none";
 
   abort.request_id_ = MakeRequestId(0xb7);
   const std::uint64_t before_retry = machine_->last_commit_index();

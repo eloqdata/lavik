@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -66,11 +67,10 @@ absl::Status ValidateIdentity(const RebuildIdentity& identity,
     return absl::InvalidArgumentError(
         "population identity fields must all be nonempty");
   }
-  const bool source_fields_empty =
-      identity.source_node_id_.empty() &&
-      identity.source_assignment_id_.empty() &&
-      identity.source_boot_id_.empty() &&
-      identity.source_history_id_.empty();
+  const bool source_fields_empty = identity.source_node_id_.empty() &&
+                                   identity.source_assignment_id_.empty() &&
+                                   identity.source_boot_id_.empty() &&
+                                   identity.source_history_id_.empty();
   if (source_less) {
     if (!source_fields_empty || identity.target_history_id_.empty()) {
       return absl::InvalidArgumentError(
@@ -188,6 +188,26 @@ class ReplicationGroup::Impl {
   absl::Status ValidateRebuild(const RebuildDirective& directive,
                                const PopulationManifest& manifest) const {
     return ValidatePopulation(directive, manifest, false);
+  }
+
+  absl::StatusOr<std::uint64_t> NextDirectiveRevision(
+      std::uint64_t term) const {
+    if (term == 0) {
+      return absl::InvalidArgumentError("rebuild term must be nonzero");
+    }
+    if (!last_directive_.has_value() ||
+        term > last_directive_->identity_.term_) {
+      return 1;
+    }
+    if (term < last_directive_->identity_.term_) {
+      return absl::FailedPreconditionError("stale rebuild term");
+    }
+    const std::uint64_t accepted_revision =
+        last_directive_->identity_.directive_revision_;
+    if (accepted_revision == std::numeric_limits<std::uint64_t>::max()) {
+      return absl::OutOfRangeError("rebuild directive revision cannot advance");
+    }
+    return accepted_revision + 1;
   }
 
   absl::Status ValidateEmptyPopulation(
@@ -594,20 +614,24 @@ absl::Status ReplicationGroup::ValidateRebuild(
   return impl_->ValidateRebuild(directive, manifest);
 }
 
+absl::StatusOr<std::uint64_t> ReplicationGroup::NextDirectiveRevision(
+    std::uint64_t term) const {
+  return impl_->NextDirectiveRevision(term);
+}
+
 absl::StatusOr<DestructiveResetAuthorization> ReplicationGroup::BeginRebuild(
     const RebuildDirective& directive, const PopulationManifest& manifest) {
   return impl_->BeginRebuild(directive, manifest);
 }
 
 absl::Status ReplicationGroup::ValidateEmptyPopulation(
-    const RebuildIdentity& identity,
-    const PopulationManifest& manifest) const {
+    const RebuildIdentity& identity, const PopulationManifest& manifest) const {
   return impl_->ValidateEmptyPopulation(identity, manifest);
 }
 
 absl::StatusOr<DestructiveResetAuthorization>
-ReplicationGroup::BeginEmptyPopulation(
-    const RebuildIdentity& identity, const PopulationManifest& manifest) {
+ReplicationGroup::BeginEmptyPopulation(const RebuildIdentity& identity,
+                                       const PopulationManifest& manifest) {
   return impl_->BeginEmptyPopulation(identity, manifest);
 }
 

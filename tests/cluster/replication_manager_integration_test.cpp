@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "celer/net/connection.h"
 #include "celer/net/server.h"
 #include "celer/runtime/cross_core.h"
@@ -62,6 +63,24 @@ void EnsureTxRuntime() {
   if (keylane::tx::TxRuntime::Get() == nullptr) {
     keylane::tx::TxRuntime::Create(1);
   }
+}
+
+celer::Task<absl::Status> AwaitFaultBarrier(const std::filesystem::path& path,
+                                            std::string_view description) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  do {
+    std::error_code error;
+    if (std::filesystem::exists(path, error)) co_return absl::OkStatus();
+    if (error) {
+      co_return absl::InternalError(absl::StrCat(
+          "could not observe ", description, ": ", error.message()));
+    }
+    absl::Status waited = co_await celer::SleepFor(
+        *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+    if (!waited.ok()) co_return waited;
+  } while (std::chrono::steady_clock::now() < deadline);
+  co_return TestFailure(absl::StrCat(description, " was not acknowledged"));
 }
 
 celer::Task<absl::Status> CheckLightweightQueries(
@@ -1103,6 +1122,53 @@ class EmptyPopulationService final : public celer::Service {
           "empty population did not publish the source-less ReadyToken");
     }
 
+    // Ready is only a population fact. Before NodeControl installs a finite
+    // write lease, an expired read must not acquire background mutation
+    // authority. Queueing the same key after a finite grant proves the test is
+    // observing expiration admission rather than a dormant worker.
+    constexpr std::string_view kLeaseProbeKey = "empty-lease-probe-{foo}";
+    absl::Status configured = storage_->ConfigureActiveExpiration(
+        keylane::storage::ActiveExpirationConfigKey::kIntervalMs, 1);
+    if (!configured.ok()) co_return configured;
+    configured = storage_->ConfigureActiveExpiration(
+        keylane::storage::ActiveExpirationConfigKey::kDeletesPerCycle, 1);
+    if (!configured.ok()) co_return configured;
+    auto lease_probe = co_await storage_->Set(
+        0, kLeaseProbeKey, "expired",
+        keylane::storage::SetOptions{.expire_at_ms_ = 1});
+    if (!lease_probe.ok()) co_return lease_probe.status();
+    auto absent = co_await storage_->Get(0, kLeaseProbeKey);
+    if (absent.ok() || absent.status().code() != absl::StatusCode::kNotFound) {
+      co_return TestFailure("expiration lease probe was not logically absent");
+    }
+    absl::Status waited = co_await celer::SleepFor(
+        *celer::ThisWorker().self_, std::chrono::milliseconds(50));
+    if (!waited.ok()) co_return waited;
+    if (storage_->LocalSize(0) != 1) {
+      co_return TestFailure(
+          "empty population installed expiration authority without a lease");
+    }
+    absl::Status expiration =
+        co_await replication_->EnableClusterExpirationAuthorityUntil(
+            std::chrono::nanoseconds::max() - std::chrono::nanoseconds(1));
+    if (!expiration.ok()) co_return expiration;
+    absent = co_await storage_->Get(0, kLeaseProbeKey);
+    if (absent.ok() || absent.status().code() != absl::StatusCode::kNotFound) {
+      co_return TestFailure("finite expiration lease revived an expired key");
+    }
+    for (std::size_t attempt = 0; attempt < 1000 && storage_->LocalSize(0) != 0;
+         ++attempt) {
+      waited = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                        std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+    expiration = co_await replication_->RevokeClusterExpirationAuthority();
+    if (!expiration.ok()) co_return expiration;
+    if (storage_->LocalSize(0) != 0) {
+      co_return TestFailure(
+          "finite expiration lease did not admit queued cleanup");
+    }
+
     // A completed replay must reuse the original result, not start another
     // destructive reset. Keep post-initialization data and its DB epoch as
     // observable evidence that neither replay nor a rejected mismatch resets.
@@ -1759,6 +1825,14 @@ enum class PreparedActionDisposition {
   kReplace,
   kRemoveWhilePreparing,
   kReplaceWhilePreparing,
+  kRemoveAfterDurabilityBoundary,
+  kRemoveAfterDurabilityBoundaryWithPublicationFailure,
+};
+
+struct PromotionFaultBarrierPaths {
+  std::filesystem::path prepare_entered_;
+  std::filesystem::path runner_waiting_;
+  std::filesystem::path runner_terminal_;
 };
 
 class FailoverActionReconcileService final : public celer::Service {
@@ -1767,11 +1841,13 @@ class FailoverActionReconcileService final : public celer::Service {
       keylane::storage::StorageEngine* storage,
       keylane::ReplicationManager* replication, bool expect_watchdog = false,
       PreparedActionDisposition disposition =
-          PreparedActionDisposition::kRetainForActivation)
+          PreparedActionDisposition::kRetainForActivation,
+      PromotionFaultBarrierPaths fault_barriers = {})
       : storage_(storage),
         replication_(replication),
         expect_watchdog_(expect_watchdog),
-        disposition_(disposition) {}
+        disposition_(disposition),
+        fault_barriers_(std::move(fault_barriers)) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) {
@@ -1790,7 +1866,25 @@ class FailoverActionReconcileService final : public celer::Service {
     }
     replication_->RequestShutdown();
     absl::Status quiesced = co_await replication_->QuiesceForShutdown();
-    if (result_.ok() && !quiesced.ok()) result_ = quiesced;
+    const bool expected_prepare_fail_stop =
+        disposition_ ==
+        PreparedActionDisposition::
+            kRemoveAfterDurabilityBoundaryWithPublicationFailure;
+    if (result_.ok() && expected_prepare_fail_stop) {
+      constexpr std::string_view kExpectedShutdownFailure =
+          "replication is failed-stopped until restart: cluster "
+          "promotion-prepare evidence publication outcome is uncertain: "
+          "injected promotion-prepare evidence publication failure";
+      if (quiesced.code() != absl::StatusCode::kFailedPrecondition ||
+          quiesced.message() != kExpectedShutdownFailure) {
+        result_ = TestFailure(absl::StrCat(
+            "post-durability fail-stop returned an unexpected shutdown "
+            "result: ",
+            quiesced.ToString()));
+      }
+    } else if (result_.ok() && !quiesced.ok()) {
+      result_ = quiesced;
+    }
     if (result_.ok()) {
       const keylane::ClusterFailoverActionStatus status =
           co_await replication_->cluster_failover_action_status();
@@ -1895,9 +1989,20 @@ class FailoverActionReconcileService final : public celer::Service {
       if (!reconciled.ok()) co_return reconciled;
     }
     const bool remove_while_preparing =
-        disposition_ == PreparedActionDisposition::kRemoveWhilePreparing;
+        disposition_ == PreparedActionDisposition::kRemoveWhilePreparing ||
+        disposition_ ==
+            PreparedActionDisposition::kRemoveAfterDurabilityBoundary ||
+        disposition_ ==
+            PreparedActionDisposition::
+                kRemoveAfterDurabilityBoundaryWithPublicationFailure;
     const bool replace_while_preparing =
         disposition_ == PreparedActionDisposition::kReplaceWhilePreparing;
+    const bool remove_after_durability =
+        disposition_ ==
+            PreparedActionDisposition::kRemoveAfterDurabilityBoundary ||
+        disposition_ ==
+            PreparedActionDisposition::
+                kRemoveAfterDurabilityBoundaryWithPublicationFailure;
     if (remove_while_preparing || replace_while_preparing) {
       const auto preparing_deadline =
           std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1914,6 +2019,15 @@ class FailoverActionReconcileService final : public celer::Service {
         co_return TestFailure(
             "failover action did not enter the in-flight prepare cut");
       }
+      absl::Status barrier = co_await AwaitFaultBarrier(
+          fault_barriers_.prepare_entered_,
+          remove_after_durability ? "post-durability promotion barrier"
+                                  : "pre-durability promotion barrier");
+      if (!barrier.ok()) co_return barrier;
+      barrier =
+          co_await AwaitFaultBarrier(fault_barriers_.runner_waiting_,
+                                     "failover runner completion-wait barrier");
+      if (!barrier.ok()) co_return barrier;
 
       keylane::ClusterFailoverActionId replacement_action_id{};
       replacement_action_id.fill(3);
@@ -1927,25 +2041,89 @@ class FailoverActionReconcileService final : public celer::Service {
       reconciled = co_await replication_->ReconcileClusterFailoverAction(
           std::move(replacement));
       if (!reconciled.ok()) co_return reconciled;
+      barrier = co_await AwaitFaultBarrier(
+          fault_barriers_.runner_terminal_,
+          "superseded failover runner terminal barrier");
+      if (!barrier.ok()) co_return barrier;
       status = co_await replication_->cluster_failover_action_status();
       if (replace_while_preparing) {
         if (!status.action_.has_value() ||
             status.action_->action_id_ != replacement_action_id ||
             status.state_ !=
-                keylane::ClusterFailoverActionState::kWaitingForAuthorization) {
+                keylane::ClusterFailoverActionState::kWaitingForAuthorization ||
+            !status.failure_class_.empty() || !status.failure_detail_.empty() ||
+            status.prepared_.has_value()) {
           co_return TestFailure(
-              "replacement action was not installed after in-flight cleanup");
+              "cancelled action published a terminal observation into its "
+              "replacement");
         }
       } else if (status.action_.has_value() ||
-                 status.state_ != keylane::ClusterFailoverActionState::kNone) {
+                 status.state_ != keylane::ClusterFailoverActionState::kNone ||
+                 !status.failure_class_.empty() ||
+                 !status.failure_detail_.empty() ||
+                 status.prepared_.has_value()) {
         co_return TestFailure(
-            "in-flight action removal retained boot-local progress");
+            "cancelled action retained or published boot-local progress");
       }
       if (!co_await EveryReplicationLogIs(
               keylane::storage::ReplicationLogState::kDisabled)) {
         co_return TestFailure(
-            "in-flight action cleanup retained the late child backlog");
+            "in-flight action cleanup left an obsolete replication log");
       }
+      if (disposition_ ==
+              PreparedActionDisposition::
+                  kRemoveAfterDurabilityBoundaryWithPublicationFailure &&
+          !(co_await replication_->Observe()).failed_stopped_) {
+        co_return TestFailure(
+            "injected post-durability failure did not fail-stop the node");
+      }
+      if (remove_after_durability) {
+        co_return absl::OkStatus();
+      }
+
+      // Before durability mutation, supersession is a local cancellation
+      // boundary rather than a request to finish obsolete preparation. Reuse
+      // the same Ready population to prove that cleanup preserved the
+      // candidate and released promotion admission for the next action.
+      keylane::DesiredClusterFailoverAction successor = action;
+      successor.action_id_ = replacement_action_id;
+      ++successor.transition_revision_;
+      successor.authorized_revision_.reset();
+      if (remove_while_preparing) {
+        reconciled =
+            co_await replication_->ReconcileClusterFailoverAction(successor);
+        if (!reconciled.ok()) co_return reconciled;
+      }
+      ++successor.transition_revision_;
+      successor.authorized_revision_ = successor.transition_revision_;
+      reconciled =
+          co_await replication_->ReconcileClusterFailoverAction(successor);
+      if (!reconciled.ok()) co_return reconciled;
+
+      const auto successor_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      do {
+        status = co_await replication_->cluster_failover_action_status();
+        if (status.state_ == keylane::ClusterFailoverActionState::kPrepared ||
+            status.state_ == keylane::ClusterFailoverActionState::kFailed) {
+          break;
+        }
+        absl::Status waited = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!waited.ok()) co_return waited;
+      } while (std::chrono::steady_clock::now() < successor_deadline);
+      if (!status.action_.has_value() || *status.action_ != successor ||
+          status.state_ != keylane::ClusterFailoverActionState::kPrepared ||
+          !status.prepared_.has_value()) {
+        co_return TestFailure(absl::StrCat(
+            "in-flight action cleanup did not release the Ready population "
+            "for its successor: state=",
+            static_cast<int>(status.state_), " failure-class=",
+            status.failure_class_, " detail=", status.failure_detail_));
+      }
+      reconciled =
+          co_await replication_->ReconcileClusterFailoverAction(std::nullopt);
+      if (!reconciled.ok()) co_return reconciled;
       co_return absl::OkStatus();
     }
     const auto deadline = std::chrono::steady_clock::now() + 10s;
@@ -2273,14 +2451,27 @@ class FailoverActionReconcileService final : public celer::Service {
   bool expect_watchdog_ = false;
   PreparedActionDisposition disposition_ =
       PreparedActionDisposition::kRetainForActivation;
+  PromotionFaultBarrierPaths fault_barriers_;
   absl::Status result_ = absl::OkStatus();
+};
+
+enum class NativeActionDisposition {
+  kPrepare,
+  kCancelWhilePreparing,
+  kShutdownWhilePreparing,
 };
 
 class NativeFailoverActionService final : public celer::Service {
  public:
-  NativeFailoverActionService(keylane::storage::StorageEngine* storage,
-                              keylane::ReplicationManager* replication)
-      : storage_(storage), replication_(replication) {}
+  NativeFailoverActionService(
+      keylane::storage::StorageEngine* storage,
+      keylane::ReplicationManager* replication,
+      NativeActionDisposition disposition = NativeActionDisposition::kPrepare,
+      PromotionFaultBarrierPaths fault_barriers = {})
+      : storage_(storage),
+        replication_(replication),
+        disposition_(disposition),
+        fault_barriers_(std::move(fault_barriers)) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) {
@@ -2307,6 +2498,17 @@ class NativeFailoverActionService final : public celer::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
+  celer::Task<bool> EveryReplicationLogIs(
+      keylane::storage::ReplicationLogState expected) {
+    for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+      const auto state = co_await celer::SubmitTo(worker, [this] {
+        return storage_->LocalReplicationLogInfo().state_;
+      });
+      if (state != expected) co_return false;
+    }
+    co_return true;
+  }
+
   celer::Task<absl::Status> Exercise() {
     const keylane::ReplicationIdentity local =
         co_await replication_->ObserveIdentity();
@@ -2372,6 +2574,86 @@ class NativeFailoverActionService final : public celer::Service {
         co_await replication_->ReconcileClusterFailoverAction(action);
     if (!reconciled.ok()) co_return reconciled;
     keylane::ClusterFailoverActionStatus status;
+    if (disposition_ != NativeActionDisposition::kPrepare) {
+      const auto preparing_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      do {
+        status = co_await replication_->cluster_failover_action_status();
+        if (status.state_ == keylane::ClusterFailoverActionState::kPreparing) {
+          break;
+        }
+        absl::Status waited = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!waited.ok()) co_return waited;
+      } while (std::chrono::steady_clock::now() < preparing_deadline);
+      if (status.state_ != keylane::ClusterFailoverActionState::kPreparing) {
+        co_return TestFailure(
+            "self-origin action did not enter the in-flight prepare cut");
+      }
+      absl::Status barrier = co_await AwaitFaultBarrier(
+          fault_barriers_.prepare_entered_,
+          "self-origin pre-durability promotion barrier");
+      if (!barrier.ok()) co_return barrier;
+      barrier = co_await AwaitFaultBarrier(
+          fault_barriers_.runner_waiting_,
+          "self-origin failover runner completion-wait barrier");
+      if (!barrier.ok()) co_return barrier;
+
+      if (disposition_ == NativeActionDisposition::kShutdownWhilePreparing) {
+        reconciled = co_await replication_->CancelClusterRebuildForShutdown();
+      } else {
+        reconciled =
+            co_await replication_->ReconcileClusterFailoverAction(std::nullopt);
+      }
+      if (!reconciled.ok()) co_return reconciled;
+      barrier = co_await AwaitFaultBarrier(
+          fault_barriers_.runner_terminal_,
+          "self-origin superseded failover runner terminal barrier");
+      if (!barrier.ok()) co_return barrier;
+      status = co_await replication_->cluster_failover_action_status();
+      if (status.state_ != keylane::ClusterFailoverActionState::kNone ||
+          status.action_.has_value() || !status.failure_class_.empty() ||
+          !status.failure_detail_.empty() || status.prepared_.has_value()) {
+        co_return TestFailure(
+            "cancelled self-origin action published a terminal observation");
+      }
+      if (disposition_ == NativeActionDisposition::kShutdownWhilePreparing) {
+        auto promotion_base = storage_->RecoverPromotionBase();
+        if (!promotion_base.ok()) co_return promotion_base.status();
+        const keylane::ReplicationStatus stopped =
+            co_await replication_->Observe();
+        if (promotion_base->has_value()) {
+          co_return TestFailure(
+              "shutdown let a superseded self-origin prepare cross the "
+              "durability boundary");
+        }
+        if (stopped.role_ == keylane::ReplicationRole::kMaster ||
+            !replication_->is_loading()) {
+          co_return TestFailure(
+              "shutdown reopened a cancelled self-origin primary role");
+        }
+        co_return absl::OkStatus();
+      }
+
+      const keylane::ReplicationStatus restored =
+          co_await replication_->Observe();
+      if (restored.role_ != keylane::ReplicationRole::kMaster ||
+          restored.local_history_id_ != local.local_history_id_ ||
+          replication_->is_loading() ||
+          !co_await EveryReplicationLogIs(
+              keylane::storage::ReplicationLogState::kActive)) {
+        co_return TestFailure(
+            "safe self-origin cancellation did not restore its original "
+            "fenced primary population");
+      }
+
+      action.action_id_.fill(6);
+      ++action.transition_revision_;
+      action.authorized_revision_ = action.transition_revision_;
+      reconciled =
+          co_await replication_->ReconcileClusterFailoverAction(action);
+      if (!reconciled.ok()) co_return reconciled;
+    }
     const auto deadline = std::chrono::steady_clock::now() + 10s;
     do {
       status = co_await replication_->cluster_failover_action_status();
@@ -2398,6 +2680,8 @@ class NativeFailoverActionService final : public celer::Service {
 
   keylane::storage::StorageEngine* storage_ = nullptr;
   keylane::ReplicationManager* replication_ = nullptr;
+  NativeActionDisposition disposition_ = NativeActionDisposition::kPrepare;
+  PromotionFaultBarrierPaths fault_barriers_;
   absl::Status result_ = absl::OkStatus();
 };
 
@@ -2729,7 +3013,7 @@ class FollowOwnerReconcileService final : public celer::Service {
           "destructive FollowOwner FULL retained a Ready candidate proof");
     }
 
-    // Every follower applies this decision independently: v1 has no Meta
+    // Every follower applies this decision independently: there is no Meta
     // rebuild queue or Data-side admission controller that stages destructive
     // FULL across members. Consequently all followers may reach this exact
     // candidate-ineligible state together. If the new Owner fails before any
@@ -3367,25 +3651,91 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
       disposition == PreparedActionDisposition::kReplaceWhilePreparing;
   const bool remove_while_preparing =
       disposition == PreparedActionDisposition::kRemoveWhilePreparing;
-  const bool stall_prepare = replace_while_preparing || remove_while_preparing;
+  const bool remove_after_durability =
+      disposition ==
+          PreparedActionDisposition::kRemoveAfterDurabilityBoundary ||
+      disposition == PreparedActionDisposition::
+                         kRemoveAfterDurabilityBoundaryWithPublicationFailure;
+  const bool fail_after_child_history =
+      disposition == PreparedActionDisposition::
+                         kRemoveAfterDurabilityBoundaryWithPublicationFailure;
+  const bool stall_before_durability =
+      replace_while_preparing || remove_while_preparing;
+  const bool stall_promotion =
+      stall_before_durability || remove_after_durability;
+  keylane::test::TempDirectory directory(fixture_name);
+  PromotionFaultBarrierPaths fault_barriers{
+      .prepare_entered_ = directory.path() / "promotion-prepare-entered",
+      .runner_waiting_ = directory.path() / "failover-runner-waiting",
+      .runner_terminal_ = directory.path() / "failover-runner-terminal",
+  };
   ASSERT_EQ(::setenv("KEYLANE_REPLICATION_SEED_READY_PROMOTION_CANDIDATE",
                      "02020202020202020202020202020202", 1),
             0);
-  if (stall_prepare) {
+  if (stall_before_durability) {
     ASSERT_EQ(::setenv("KEYLANE_REPLICATION_STALL_PROMOTION_ACTION",
                        "02020202020202020202020202020202", 1),
               0);
+    ASSERT_EQ(
+        ::setenv("KEYLANE_REPLICATION_PROMOTION_PRE_DURABILITY_BARRIER_ACK_"
+                 "PATH",
+                 fault_barriers.prepare_entered_.c_str(), 1),
+        0);
+  }
+  if (remove_after_durability) {
+    ASSERT_EQ(::setenv("KEYLANE_REPLICATION_STALL_PROMOTION_AFTER_DURABILITY_"
+                       "BOUNDARY",
+                       "02020202020202020202020202020202", 1),
+              0);
+    ASSERT_EQ(
+        ::setenv("KEYLANE_REPLICATION_PROMOTION_POST_DURABILITY_BARRIER_ACK_"
+                 "PATH",
+                 fault_barriers.prepare_entered_.c_str(), 1),
+        0);
+  }
+  if (stall_promotion) {
+    ASSERT_EQ(::setenv("KEYLANE_REPLICATION_FAILOVER_RUNNER_WAITING_ACK_PATH",
+                       fault_barriers.runner_waiting_.c_str(), 1),
+              0);
+    ASSERT_EQ(::setenv("KEYLANE_REPLICATION_FAILOVER_RUNNER_TERMINAL_ACK_PATH",
+                       fault_barriers.runner_terminal_.c_str(), 1),
+              0);
+  }
+  if (fail_after_child_history) {
+    ASSERT_EQ(::setenv("KEYLANE_REPLICATION_FAIL_PROMOTION_PREPARE_AT",
+                       "evidence-publication", 1),
+              0);
   }
   struct SeedReset {
-    bool stall_prepare_;
+    bool stall_before_durability_;
+    bool stall_after_durability_;
+    bool fail_after_child_history_;
+    bool promotion_barriers_;
     ~SeedReset() {
       (void)::unsetenv("KEYLANE_REPLICATION_SEED_READY_PROMOTION_CANDIDATE");
-      if (stall_prepare_) {
+      if (stall_before_durability_) {
         (void)::unsetenv("KEYLANE_REPLICATION_STALL_PROMOTION_ACTION");
+        (void)::unsetenv(
+            "KEYLANE_REPLICATION_PROMOTION_PRE_DURABILITY_BARRIER_ACK_PATH");
+      }
+      if (stall_after_durability_) {
+        (void)::unsetenv(
+            "KEYLANE_REPLICATION_STALL_PROMOTION_AFTER_DURABILITY_BOUNDARY");
+        (void)::unsetenv(
+            "KEYLANE_REPLICATION_PROMOTION_POST_DURABILITY_BARRIER_ACK_PATH");
+      }
+      if (fail_after_child_history_) {
+        (void)::unsetenv("KEYLANE_REPLICATION_FAIL_PROMOTION_PREPARE_AT");
+      }
+      if (promotion_barriers_) {
+        (void)::unsetenv(
+            "KEYLANE_REPLICATION_FAILOVER_RUNNER_WAITING_ACK_PATH");
+        (void)::unsetenv(
+            "KEYLANE_REPLICATION_FAILOVER_RUNNER_TERMINAL_ACK_PATH");
       }
     }
-  } seed_reset{stall_prepare};
-  keylane::test::TempDirectory directory(fixture_name);
+  } seed_reset{stall_before_durability, remove_after_durability,
+               fail_after_child_history, stall_promotion};
   const std::filesystem::path data = directory.path() / "node.data";
   keylane::test::CreateDataFile(data, 128 * kMiB);
 
@@ -3409,8 +3759,8 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
   EnsureTxRuntime();
 
   FailoverActionReconcileService service(&storage, &replication,
-                                         /*expect_watchdog=*/false,
-                                         disposition);
+                                         /*expect_watchdog=*/false, disposition,
+                                         std::move(fault_barriers));
   celer::Server server;
   server.AddService(&service);
   celer::ServerOptions runtime;
@@ -3442,17 +3792,32 @@ TEST(ReplicationManagerIntegrationTest,
 }
 
 TEST(ReplicationManagerIntegrationTest,
-     InFlightFailoverActionRemovalRetiresLateChildReplicationLogs) {
+     InFlightFailoverActionRemovalBeforeDurabilityPreservesPopulation) {
   RunFailoverActionDispositionCase(
       PreparedActionDisposition::kRemoveWhilePreparing,
       "cluster-failover-inflight-remove");
 }
 
 TEST(ReplicationManagerIntegrationTest,
-     InFlightFailoverActionReplacementRetiresLateChildReplicationLogs) {
+     InFlightFailoverActionReplacementBeforeDurabilityPreservesPopulation) {
   RunFailoverActionDispositionCase(
       PreparedActionDisposition::kReplaceWhilePreparing,
       "cluster-failover-inflight-replace");
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     InFlightFailoverActionRemovalAfterDurabilityJoinsAndRetiresChild) {
+  RunFailoverActionDispositionCase(
+      PreparedActionDisposition::kRemoveAfterDurabilityBoundary,
+      "cluster-failover-inflight-post-durability-remove");
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     InFlightFailoverActionFailureAfterDurabilityRetiresChild) {
+  RunFailoverActionDispositionCase(
+      PreparedActionDisposition::
+          kRemoveAfterDurabilityBoundaryWithPublicationFailure,
+      "cluster-failover-inflight-post-durability-failure");
 }
 
 void RunFailoverActionWatchdogCase(std::string_view fault_variable,
@@ -3573,6 +3938,87 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(server.Start(runtime).ok());
   server.WaitUntilStopped();
   EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+void RunInFlightSelfOriginActionCase(NativeActionDisposition disposition,
+                                     std::string_view fixture_name) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug/fault build for the prepare stall";
+#endif
+  keylane::test::TempDirectory directory(fixture_name);
+  PromotionFaultBarrierPaths fault_barriers{
+      .prepare_entered_ = directory.path() / "promotion-prepare-entered",
+      .runner_waiting_ = directory.path() / "failover-runner-waiting",
+      .runner_terminal_ = directory.path() / "failover-runner-terminal",
+  };
+  ASSERT_EQ(::setenv("KEYLANE_REPLICATION_STALL_PROMOTION_ACTION",
+                     "05050505050505050505050505050505", 1),
+            0);
+  ASSERT_EQ(::setenv("KEYLANE_REPLICATION_PROMOTION_PRE_DURABILITY_BARRIER_ACK_"
+                     "PATH",
+                     fault_barriers.prepare_entered_.c_str(), 1),
+            0);
+  ASSERT_EQ(::setenv("KEYLANE_REPLICATION_FAILOVER_RUNNER_WAITING_ACK_PATH",
+                     fault_barriers.runner_waiting_.c_str(), 1),
+            0);
+  ASSERT_EQ(::setenv("KEYLANE_REPLICATION_FAILOVER_RUNNER_TERMINAL_ACK_PATH",
+                     fault_barriers.runner_terminal_.c_str(), 1),
+            0);
+  struct StallReset {
+    ~StallReset() {
+      (void)::unsetenv("KEYLANE_REPLICATION_STALL_PROMOTION_ACTION");
+      (void)::unsetenv(
+          "KEYLANE_REPLICATION_PROMOTION_PRE_DURABILITY_BARRIER_ACK_PATH");
+      (void)::unsetenv("KEYLANE_REPLICATION_FAILOVER_RUNNER_WAITING_ACK_PATH");
+      (void)::unsetenv("KEYLANE_REPLICATION_FAILOVER_RUNNER_TERMINAL_ACK_PATH");
+    }
+  } stall_reset;
+
+  const std::filesystem::path data = directory.path() / "node.data";
+  keylane::test::CreateDataFile(data, 128 * kMiB);
+  keylane::storage::StorageEngineOptions storage_options;
+  storage_options.data_files_ = {data.string()};
+  storage_options.expiration_authority_ = false;
+  storage_options.buffers_.registered_bytes_ = 64 * kMiB;
+  storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
+  keylane::storage::StorageEngine storage(std::move(storage_options));
+  keylane::InitWorkerMetrics(1);
+  ASSERT_TRUE(keylane::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(storage.Prepare(1).ok());
+
+  keylane::ReplicationOptions options;
+  options.cluster_enabled_ = true;
+  options.node_id_override_ = std::string(40, '9');
+  keylane::ReplicationManager replication(&storage, std::move(options),
+                                          std::nullopt);
+  keylane::InitStorage(&storage, &replication);
+  EnsureTxRuntime();
+
+  NativeFailoverActionService service(&storage, &replication, disposition,
+                                      std::move(fault_barriers));
+  celer::Server server;
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     InFlightSelfOriginActionRemovalPreservesPopulationForSuccessor) {
+  RunInFlightSelfOriginActionCase(
+      NativeActionDisposition::kCancelWhilePreparing,
+      "cluster-native-failover-action-cancel");
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     ShutdownCancelsSelfOriginActionBeforeDurability) {
+  RunInFlightSelfOriginActionCase(
+      NativeActionDisposition::kShutdownWhilePreparing,
+      "cluster-native-failover-action-shutdown");
 }
 
 TEST(ReplicationManagerIntegrationTest,

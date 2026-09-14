@@ -73,12 +73,11 @@ cutover.
 _Avoid_: Old primary
 
 **Controlled Pause**:
-A reversible, boot-scoped write barrier held by the Source Owner for one
-Failover Transition. It drains admitted mutations and then prevents every
-dataset or replication-frontier mutation, including expiry and any background
-work that can advance that frontier. Tomb Raider's physical cleanup does not
-advance the frontier and is outside this barrier. The pause survives Meta
-session replacement but not a Data Node restart.
+A reversible, boot-scoped Source Owner write barrier for one Failover
+Transition: it drains admitted mutations and blocks every operation that can
+mutate the dataset or advance the replication frontier, including expiry and
+background work. Frontier-neutral physical cleanup remains allowed; the pause
+survives Meta session replacement but not a Data Node restart.
 
 **Failover Observation**:
 A Node Incarnation's current progress toward one Failover Transition, reported
@@ -101,11 +100,10 @@ continue. It makes that population incarnation ineligible until its boot or
 population identity changes; transient retries are not Action Failures.
 
 **Preserved Replica**:
-A non-Candidate Group member, including a fenced node still named as the
-committed Owner, that retains its usable population before an Uncontrolled
-Failover reaches Cutover. It remains fenced without starting destructive
-replacement, while an already established compatible source flow may continue
-best effort.
+A non-Candidate Group member whose usable population is retained until an
+Uncontrolled Failover reaches Cutover, including a fenced node still named as
+the committed Owner. It remains fenced and avoids destructive replacement,
+while compatible replication already in progress may continue best effort.
 
 **Promotion Authorization**:
 A one-way committed latch allowing the current Candidate Action to begin
@@ -115,23 +113,22 @@ frontier; the frontier itself remains an Observation.
 
 **Desired-state cleanup**:
 Removal or replacement of a Candidate Action in committed state. Data Nodes
-converge by reconciling the latest Full Desired State, immediately when
-connected or after reconnect, rather than requiring a delivered one-shot abort
-message. A Data Node acknowledges the Full Desired State only after the old
-action can no longer publish progress or activate; destructive replication
+reconcile the latest Full Desired State across live and reconnected sessions,
+without requiring one-shot abort delivery, and acknowledge it only after the
+old action can no longer publish progress or activate; destructive replication
 catch-up may continue asynchronously.
 
 **Follow Owner**:
-The ordinary desired state for every non-Owner Group member. A member first
-fences its former role and preserves its usable local population until the new
-Owner is authenticated and export-ready, then uses the native replication
-engine to continue when compatible or rebuild otherwise.
+The ordinary desired state in which every non-Owner fences its former role and
+preserves usable local data until the new Owner is authenticated and
+export-ready. It then continues compatible replication or rebuilds from that
+Owner.
 
 **Redundancy Restoration**:
-The ordinary post-Cutover reconciliation in which non-Owners Follow Owner and
-become usable replicas again. It is not a Failover Transition phase or a Meta
-operation; its progress is derived from current Observations, and the full
-desired state makes it resumable after either Meta or Data reconnects.
+Ordinary post-Cutover reconciliation in which non-Owners Follow Owner and
+become usable replicas again; it is neither a Failover Transition phase nor a
+Meta operation. Current Observations expose its progress, and Full Desired
+State makes it resumable after either Meta or Data reconnects.
 _Avoid_: Rebuild operation, failover rebuild phase
 
 **Uncontrolled Executor**:
@@ -141,9 +138,8 @@ failure detector that decides when to begin an Uncontrolled Failover.
 
 **Cutover**:
 The committed change that makes a prepared Candidate the Owner under a new
-Group term and authority. The installed authority retains the Candidate Action
-identity that produced it, preventing activation from consuming stale prepared
-state. Cutover also removes the Failover Transition; subsequent Redundancy
-Restoration is steady-state reconciliation. A failure after Cutover is a new
-primary failure.
+Group term and authority tied to the originating Candidate Action, preventing
+stale prepared state from activating. It removes the Failover Transition;
+Redundancy Restoration follows as steady-state reconciliation, and any failure
+after Cutover is treated as a new Owner failure.
 _Avoid_: Promotion Preparation

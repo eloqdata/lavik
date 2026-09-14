@@ -1638,10 +1638,10 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 // ---------------------------------------------------------------------------
-// term/grant. BeginGroupTerm writes
-// both halves (grant store term state machine + the committed GroupRecord in
-// the topology store); ActivateAuthority is the atomic failover/migration
-// commit point (file header item 3).
+// term/grant. BeginGroupTerm and ActivateAuthority are shared aggregate
+// kernels: they update the grant store together with the committed GroupRecord
+// in the topology store. Typed failover commands reuse the same kernels for
+// fencing and cutover (file header item 3).
 // ---------------------------------------------------------------------------
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -1789,9 +1789,8 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 // ---------------------------------------------------------------------------
-// failover transition. The codec lands before the aggregate kernels so every
-// variant has a deterministic audit identity while the vertical slices below
-// replace these fail-closed stubs one command at a time.
+// Failover transitions are aggregate commands: each variant has a stable audit
+// identity and validates every affected store before publishing any mutation.
 // ---------------------------------------------------------------------------
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -1970,6 +1969,14 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   if (!TransitionMatches(current, cmd.expected_transition_) ||
       current.mode_ != MetaFailoverMode::kUncontrolled) {
     return Rejected("uncontrolled failover transition CAS mismatch",
+                    std::move(summary));
+  }
+  // Clearing an installed action is an auditable lifecycle event. A no-op
+  // null-to-null revision advance has no action identity to attribute and
+  // would make an exact replay indistinguishable from that first application.
+  if (!cmd.candidate_action_.has_value() &&
+      !current.candidate_action_.has_value()) {
+    return Rejected("uncontrolled failover candidate is absent",
                     std::move(summary));
   }
   if (cmd.candidate_action_.has_value()) {
@@ -2288,9 +2295,10 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 // ---------------------------------------------------------------------------
-// policy. Retirement checks both committed reference owners: active grants
-// and live operations. Operation policy references are structured fields on
-// SubmitOperation; apply never interprets opaque operation intents.
+// policy. Retirement checks all committed reference owners: active grants,
+// active failover successor grants, and live operations. Operation policy
+// references are structured fields on SubmitOperation; apply never interprets
+// opaque operation intents.
 // ---------------------------------------------------------------------------
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -2335,7 +2343,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 // ---------------------------------------------------------------------------
-// operation journal + upgrade. The operation store owns the lifecycle
+// operation journal. The operation store owns the lifecycle
 // machine. The dispatcher supplies the log index and actor, validates policy
 // dependencies on submit, and rechecks evidence against committed identity,
 // topology, term, manifest, partition-replication, and history anchors before

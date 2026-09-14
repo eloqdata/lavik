@@ -364,13 +364,16 @@ the action watchdog, or disconnect instead of interpreting that gap as loss.
 
 An independent optional failover observation accompanies that role payload.
 `SourcePaused` reports the controlled source's exact history and stable
-next-LSN vector while the same heartbeat still renews its lease;
-`CandidatePrepared` reports the exact action and boot-local prepared-context
-identity/hash while the node still reports candidate progress; `ActionFailed`
-reports a bounded class and detail for that exact action. These observations
-are session/boot scoped and volatile. They disappear on FDS replacement,
-disconnect, or Meta leadership change and are regenerated from current Data
-state rather than restored by a new leader.
+next-LSN vector while the same heartbeat still renews its lease. A candidate
+may suppress its ordinary role while rotating history after authorization;
+`CandidatePrepared` then reports the exact action and boot-local prepared-
+context identity/hash independently. `ActionFailed` reports a bounded class
+and detail for that exact action. Candidate action observations are withdrawn
+on candidate disconnect or an incompatible projection/incarnation change.
+`SourcePaused` is source-lineage scoped and may survive an exact source
+disconnect only through its independent grace. All failover observations are
+volatile, disappear on Meta leadership change, and are regenerated from
+current Data state rather than restored by a new leader.
 
 After the initial projection is applied and validated, Meta also publishes a
 compact leader-local runtime record for cluster status and leader-owned

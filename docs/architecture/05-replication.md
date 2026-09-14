@@ -236,11 +236,19 @@ kernel. The resulting boot-local context freezes the parent frontier and
 population/catalog proof and creates the child history, but keeps the node
 `syncing`, LOADING, unable to expire, and closed to export. A replaced or
 removed action withdraws its observation and joins preparation; exact replay
-is idempotent. Because history rotation precedes publication of the prepared
-observation, the existing authenticated Meta session may bridge only that
-exact installed, authorized action: a prepared status must name the resulting
-child history. Boot, action, child-history, or desired-state mismatch closes
-the session normally. Cutover or cancellation removes the action and therefore
+is idempotent. Before storage durability or history mutation begins,
+supersession or shutdown cancels the exact preparation after joining its
+detached target flows and releases admission. Ordinary supersession preserves
+the Ready population and frontier for a successor action; a self-origin
+candidate also returns to its fenced primary role. Shutdown keeps that role
+closed and retires the population. Once durability mutation begins,
+supersession instead joins the known terminal outcome and retires any
+non-cutover child history before acknowledging the FDS. Because history
+rotation precedes publication of the prepared
+observation, the existing authenticated Meta session may bridge only that exact
+installed, authorized action: a prepared status must name the resulting child
+history. Boot, action, child-history, or desired-state mismatch closes the
+session normally. Cutover or cancellation removes the action and therefore
 forces reauthentication under the current history; the bridge never rewrites
 the session identity used by ordinary progress evidence.
 
@@ -266,15 +274,14 @@ and locally retires its former source history/backlog before following the new
 owner. This cleanup is a Data-owned consequence of desired topology, not
 another Meta failover phase.
 
-Version 1 does not stage these post-cutover replacements. Every follower may
-independently discover that CONTINUE is impossible and enter destructive FULL
-against the new owner at the same time. Once FULL withdraws those followers'
-old Ready proofs and before any replacement finishes, a second failure of the
-new owner can leave Meta with no eligible Candidate. An uncontrolled transition
-then waits for an eligible population instead of manufacturing recovery proof.
-There is no Meta rebuild queue or Data-side admission controller that preserves
-one follower while the others replace their populations; staged replacement is
-the follow-up tracked by issue #45.
+Post-cutover replacements are not staged. Every follower may independently
+discover that CONTINUE is impossible and enter destructive FULL against the new
+owner at the same time. Once FULL withdraws those followers' old Ready proofs
+and before any replacement finishes, a second failure of the new owner can
+leave Meta with no eligible Candidate. An uncontrolled transition then waits
+for an eligible population instead of manufacturing recovery proof. There is
+no Meta rebuild queue or Data-side admission controller that preserves one
+follower while the others replace their populations.
 
 ## Single-group population coordination contract
 
@@ -954,11 +961,13 @@ connection metrics.
   only an exact authorized population handshake from its named target.
 - Controlled failover authorizes preparation only after the candidate covers
   the old owner's drained stable frontier and records loss as `none`.
-  Uncontrolled failover may proceed without the old owner, selects the best
-  comparable eligible observation available to Meta, and records loss as
-  `unknown`. Like Redis Cluster's asynchronous replication, acknowledged writes
-  not present on the selected replica can be lost; no cross-node durable commit
-  quorum is implied.
+  An uncontrolled action selected after fencing may proceed without the old
+  owner, chooses the best comparable eligible observation available to Meta,
+  and records loss as `unknown`. A healthy action already authorized lossless
+  by controlled failover may survive degradation with `loss=none`; every new
+  or replacement uncontrolled action is `unknown`. Like Redis Cluster's
+  asynchronous replication, acknowledged writes not present on the selected
+  replica can be lost; no cross-node durable commit quorum is implied.
 - All native flows continue together or full-sync together. A target publishes
   online only after all partitions and the all-flow cut validate.
 - Applied progress is next-unapplied LSN per logical source flow. Ordinary

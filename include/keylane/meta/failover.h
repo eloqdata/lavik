@@ -1,9 +1,8 @@
 #pragma once
 
-// Typed state carried inside the generic MetaOperationRecord for one
-// top-level failover. The journal remains operation-kind agnostic; this codec
-// gives the failover reconciler a strict, replayable contract without adding
-// nested promotion operations.
+// Typed durable intent for an operator-requested controlled failover. The
+// generic operation journal stores only this stable request identity; the
+// topology-owned MetaFailoverTransition carries election and execution state.
 
 #include <cstdint>
 #include <string>
@@ -24,7 +23,8 @@ inline constexpr std::string_view kFailoverCompletedResult =
 // Durable operator request stored in MetaOperationRecord. The Group's
 // failover transition owns the durable election and Candidate Action state;
 // live liveness, frontier, and prepared observations remain leader-local. The
-// operation intent stays stable for permanent operation-id idempotency.
+// operation intent stays stable so retries deduplicate throughout the live and
+// archived-record retention window.
 struct FailoverOperationIntent {
   std::string group_id_;
   std::uint64_t absolute_deadline_unix_ms_ = 0;

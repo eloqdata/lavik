@@ -1205,7 +1205,7 @@ celer::Task<std::string> HandleAbortOp(
   co_return reply;
 }
 
-// Non-linearizable read of the committed journal (see the header).
+// Non-linearizable read of committed operator state (see the header).
 std::string HandleGetOp(nuraft::ptr<MetaStateMachine> state_machine,
                         const MetaOperationId& id) {
   std::optional<MetaOperationRecord> record = state_machine->FindOperation(id);
@@ -2627,6 +2627,39 @@ celer::Task<std::string> DispatchCommand(
 
 }  // namespace
 
+class MetaCtlServer::SessionConnectionBorrow {
+ public:
+  SessionConnectionBorrow(CorePtr core, celer::Connection* connection)
+      : core_(std::move(core)), connection_(connection) {
+    core_->sessions_.push_back(connection_);
+    celer::BorrowConnectionStorage(connection_);
+  }
+
+  SessionConnectionBorrow(SessionConnectionBorrow&& other) noexcept
+      : core_(std::move(other.core_)), connection_(other.connection_) {
+    other.connection_ = nullptr;
+  }
+  SessionConnectionBorrow(const SessionConnectionBorrow&) = delete;
+  SessionConnectionBorrow& operator=(const SessionConnectionBorrow&) = delete;
+  SessionConnectionBorrow& operator=(SessionConnectionBorrow&&) = delete;
+
+  ~SessionConnectionBorrow() {
+    if (connection_ == nullptr) return;
+    const auto session = std::find(core_->sessions_.begin(),
+                                   core_->sessions_.end(), connection_);
+    if (session != core_->sessions_.end()) {
+      *session = core_->sessions_.back();
+      core_->sessions_.pop_back();
+    }
+    celer::ReleaseConnectionStorage(connection_);
+    NotifyCtlShutdownDrained(*core_);
+  }
+
+ private:
+  CorePtr core_;
+  celer::Connection* connection_;
+};
+
 // static
 absl::Status MetaCtlServer::ValidateOptions(
     const MetaCtlServerOptions& options) {
@@ -2885,8 +2918,11 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
       (void)core->listener_.Close();
       break;
     }
-    core->sessions_.push_back(connection);
-    worker.Spawn(SessionLoop(core, celer::TcpStream(connection), connection));
+    // Frame ownership closes the accept/shutdown race: even if Spawn rejects
+    // the task before its body runs, destruction unregisters the session and
+    // releases its storage borrow.
+    worker.Spawn(SessionLoop(core, celer::TcpStream(connection), connection,
+                             SessionConnectionBorrow(core, connection)));
   }
   if (core->shutdown_accept_wake_fd_ >= 0) {
     (void)::shutdown(core->shutdown_accept_wake_fd_, SHUT_RDWR);
@@ -2900,18 +2936,12 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
 }
 
 celer::Task<absl::Status> MetaCtlServer::SessionLoop(
-    CorePtr core, celer::TcpStream stream, celer::Connection* connection) {
-  const auto remove_session = [&] {
-    std::vector<celer::Connection*>& sessions = core->sessions_;
-    for (auto it = sessions.begin(); it != sessions.end(); ++it) {
-      if (*it == connection) {
-        *it = sessions.back();
-        sessions.pop_back();
-        NotifyCtlShutdownDrained(*core);
-        return;
-      }
-    }
-  };
+    CorePtr core, celer::TcpStream stream, celer::Connection* connection,
+    SessionConnectionBorrow borrow) {
+  // This frame-owned parameter unregisters the task and releases the
+  // Connection during frame destruction, after body-local users have unwound.
+  // It also covers shutdown before the coroutine body starts.
+  (void)borrow;
   absl::StatusOr<MetaPrincipalIdentity> identity =
       absl::UnauthenticatedError("ctl session was not authenticated");
   if (core->options_.transport_ == MetaCtlServerOptions::Transport::kUnix) {
@@ -2923,7 +2953,6 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
       spdlog::warn("ctl rejected Unix peer: SO_PEERCRED failed: {}",
                    std::strerror(errno));
       (void)stream.Close();
-      remove_session();
       co_return absl::UnauthenticatedError("SO_PEERCRED failed");
     }
     identity = AuthenticateLocalOperator(credentials.uid,
@@ -2936,13 +2965,11 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
       spdlog::warn("ctl rejected TCP peer during mTLS handshake: {}",
                    tls.message());
       (void)stream.Close();
-      remove_session();
       co_return tls;
     }
     auto sans = stream.PeerCertificateUriSans();
     if (!sans.ok()) {
       (void)stream.Close();
-      remove_session();
       co_return sans.status();
     }
     identity = AuthenticateMetaUriSans(*sans);
@@ -2962,7 +2989,6 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
     spdlog::warn("ctl rejected unauthenticated peer: {}",
                  identity.status().message());
     (void)stream.Close();
-    remove_session();
     co_return identity.status();
   }
   AuthenticatedPrincipal authenticated(identity->principal_,
@@ -3045,7 +3071,6 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
     }
   }
 
-  remove_session();
   (void)stream.Close();
   co_return absl::OkStatus();
 }

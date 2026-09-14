@@ -22,8 +22,8 @@
 //     replaced only through an exact transition-id/revision reference.
 //   - topology_epoch is strictly monotonic and gap-free: every command that
 //     carries new_topology_epoch (group lifecycle/membership, endpoint,
-//     replication state, slot map, and ActivateAuthority through the
-//     granular primitives) must carry exactly current + 1.
+//     replication state, slot map, authority activation, and failover cutover
+//     through the granular primitives) must carry exactly current + 1.
 //   - Cluster lifecycle has an independent revision. Only Uninitialized may
 //     enter Creating; Created and ProvisioningFailed are terminal. These
 //     transitions do not advance topology_epoch. The root operation id and

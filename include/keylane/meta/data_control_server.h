@@ -199,10 +199,18 @@ struct MetaHeartbeatObservationResult {
   std::string detail;
 };
 
-// Atomically replaces boot, health, and role-derived candidate state from one
-// authenticated heartbeat. The reporter history comes from ClientHello; the
-// candidate payload carries an independent rebuild-source lineage. Authority
-// and no-role payloads clear any prior candidate for the node.
+// Processes one authenticated heartbeat under a single observation-store lock.
+// Boot and health are admitted independently. After identity/current-generation
+// admission, candidate and transition evidence are replace-or-clear, so
+// absence or component rejection clears the matching prior fact; rejecting a
+// stale session identity leaves replacement-session state untouched. The
+// longest overload also replaces the trusted candidate-action marker derived
+// from the exact installed FDS; nullopt clears that marker. The shorter
+// overloads intentionally clear failover evidence and/or the marker they
+// cannot supply. Reporter history comes from ClientHello, while candidate
+// payloads carry their independent rebuild-source lineage. The aggregate
+// result reports any component rejection without rolling back valid
+// boot/health data.
 MetaHeartbeatObservationResult IngestHeartbeatObservations(
     MetaObservationStore& observations, const MetaCommittedFacts& facts,
     std::string_view node_id, const MetaBootIncarnation& boot,
@@ -292,7 +300,8 @@ struct MetaDataControlServerOptions {
 
 struct MetaDataControlMetricsSnapshot {
   // Includes handshaking and follower-redirect tasks. Shutdown reaches zero
-  // only after every SessionLoop has run its completion path.
+  // only as every SessionLoop frame is destroyed, including a task rejected
+  // before its coroutine body starts.
   std::uint64_t live_session_tasks_ = 0;
   // Sessions bound to an accepted leadership generation, including initial
   // FDS handshakes not yet counted in active_sessions_.
@@ -538,6 +547,7 @@ class MetaDataControlServer final : public MetaReconciler {
 
  private:
   friend class MetaDataControlServerTestPeer;
+  class SessionConnectionBorrow;
   using CorePtr = std::shared_ptr<Core>;
 
   explicit MetaDataControlServer(CorePtr core) : core_(std::move(core)) {}
@@ -556,7 +566,8 @@ class MetaDataControlServer final : public MetaReconciler {
   static celer::Task<absl::Status> AcceptLoop(CorePtr core);
   static celer::Task<absl::Status> SessionLoop(
       CorePtr core, celer::TcpStream stream, celer::Connection* connection,
-      detail::PendingHandshakeLimiter::Permit handshake_permit);
+      detail::PendingHandshakeLimiter::Permit handshake_permit,
+      SessionConnectionBorrow borrow);
 
   CorePtr core_;
 };
