@@ -1,0 +1,703 @@
+{
+  "tests": 67,
+  "failures": 0,
+  "disabled": 1,
+  "errors": 0,
+  "timestamp": "2026-09-13T15:46:27Z",
+  "time": "1.993s",
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "GroupedHashTest",
+      "tests": 32,
+      "failures": 0,
+      "disabled": 1,
+      "errors": 0,
+      "timestamp": "2026-09-13T15:46:27Z",
+      "time": "1.955s",
+      "testsuite": [
+        {
+          "name": "PrefixBoundsIncludeZeroAndFullWidth",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 68,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "CompactPayloadHasAnExplicitLittleEndianHeader",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 80,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "CompactEncodingMatchesAppendReferenceAtUnalignedLengths",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 101,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "CompactReaderPreservesBinaryViewsAndCopiedPosition",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 142,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "CompactReaderRejectsMalformedUnselectedBytes",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 169,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "RootRoundTripsAndRejectsMalformedEnvelopes",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 212,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "RejectsInnerCountBeforeDecodingEntryStorage",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 237,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "ReplayCommandSequenceIsIndependentOfGroupRevision",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 254,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "CompleteSnapshotsAreBinarySafeAndNotMutationLogs",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 282,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "EmptyLeafAndRetiredLeafAreDifferentStates",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 314,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "DuplicateFieldsAreRejectedBeforePublication",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 330,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "PromotionRoutesEveryFieldToOneBoundedGroup",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 344,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0.014s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "LargeIndivisibleFieldDoesNotCauseRecursiveExplosion",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 376,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "MaximalIndividualValueLeavesRoomForGroupFraming",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 386,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "StreamingEncoderBorrowsTheLargeValueAndMatchesCodec",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 414,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0.018s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "StreamingEncoderDistinguishesEmptySpansFromEnd",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 446,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "StreamingEncoderValidatesBeforeEmittingAnyBytes",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 476,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "LogicalEncodingSizeCanExceedStringAndRecordLimits",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 488,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "DISABLED_LargeLogicalValueRoundTripsBeyondRecordLimit",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 506,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:27Z",
+          "time": "1.82s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "RejectsFieldsOutsideTheLeafBeingUpdated",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 530,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "DurableRoutingDoesNotDependOnProcessLookupSeed",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 538,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "RecoverySelectsEachGroupSequenceIndependently",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 559,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "RecoveryFiltersUncommittedFutureAndOtherIncarnations",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 583,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "SplitRecoveryIsOldOrNewAndNeverAPartialDirectory",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 602,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "EmptyLeafRemainsRoutableAfterDeletingItsLastField",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 638,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "RelocationUsesLsnOnlyWithinTheSameLogicalVersion",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 656,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "RejectsCountsGapsOverlapsAndMalformedIdentities",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 678,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "SingleFieldUpdateWritesOnlyItsGroup",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 697,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "DuplicateMutationOperandsPreserveRedisCounts",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 729,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "NoopAndSetIfAbsentDoNotRewriteGroups",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 758,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "MutationSplitIncludesOldLeafRetirement",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 780,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0s",
+          "classname": "GroupedHashTest"
+        },
+        {
+          "name": "RandomizedPartialWritesRecoverAgainstReferenceHash",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 804,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:28Z",
+          "time": "0.099s",
+          "classname": "GroupedHashTest"
+        }
+      ]
+    },
+    {
+      "name": "GroupedObjectIndexTest",
+      "tests": 35,
+      "failures": 0,
+      "disabled": 0,
+      "errors": 0,
+      "timestamp": "2026-09-13T15:46:29Z",
+      "time": "0.038s",
+      "testsuite": [
+        {
+          "name": "PhysicalGroupsUseRevisionNotSourceCommandSequence",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 95,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "PublishOomPreservesExistingKeyAndCanBeRetried",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 185,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "PartialConstructionFailureUnwindsGroupEntries",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 216,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0.015s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "RealMaxmemoryFailureAfterPartialBuildCanBeRetried",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 248,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0.015s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "DetachedMetadataStaysChargedUntilLastReaderReleasesIt",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 289,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "ExtentManifestBytesAreIncludedInRetainedAccounting",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 313,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "ManifestReaderRetainsItsOwnMemoryCharge",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 372,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "StoresOneCompactPhysicalIndexEntryPerGroup",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 400,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "NonGroupedRootBypassesSideTable",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 424,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "LookupRequiresPhysicalRootAndPopulationVersion",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 435,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "PublishAndRollbackAreCompareAndSwap",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 479,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "UndoPlaceholderRestoresWithoutAllocationAtMaxmemory",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 503,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "SettlingOlderUndoDoesNotEraseRepublishedView",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 525,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "StaleUndoClearCannotRemoveCurrentView",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 545,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "RecreatedKeyRejectsOldWriterDespiteMatchingSequence",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 563,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "DetachPreservesOldPopulationAndSharesArena",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 579,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "MetadataHandleOutlivesRemovalWithoutPretendingToPinDisk",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 605,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "RejectsIncompleteDuplicateAndStaleGroupLocations",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 622,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "ExternalGroupManifestIsSparseAndRequired",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 660,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "ArenaCapacityFailurePublishesNothing",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 687,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "RetainedMetadataIsReleasedWithLastHandle",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 703,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "MaxmemoryRejectsConstructionWithoutTerminating",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 720,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "RejectsConflictingAllocationsBeforeCompactingLocations",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 728,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "MultipleGroupsCanShareOnePackedRecordsBlock",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 747,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "IncrementalUpdateSharesUntouchedPagesAndRoutingNodes",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 764,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0.004s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "SplitRetainsParentMarkerAcrossFurtherMutations",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 803,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "RootRelocationSharesAllMetadataAndRefreshesGroupGc",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 859,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "ReservedPublicationAndFinalizationAllocateNothing",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 896,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "IncrementalMetadataOomLeavesPublishedObjectIntact",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 920,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "DirectoryIncrementalValidationRejectsPartialSplits",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 951,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "RetiredMarkerCanKeepAnExternalParentKey",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 965,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "GroupRecoveryRequiresOuterAndCommandBatchDecisions",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 1007,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "RootPhysicalFinalizationKeepsPendingDecision",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 1030,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "FailedPublishedDecisionCannotBeRead",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 1050,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        },
+        {
+          "name": "MetadataOnlyUpdateSharesHashDirectoryAndPhysicalPages",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_object_index_test.cpp",
+          "line": 1075,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:46:29Z",
+          "time": "0s",
+          "classname": "GroupedObjectIndexTest"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,149 @@
+diff --git a/tests/grouped_hash_test.cpp b/tests/grouped_hash_test.cpp
+index 91ea4c4..af6279e 100644
+--- a/tests/grouped_hash_test.cpp
++++ b/tests/grouped_hash_test.cpp
+@@ -98,6 +98,57 @@ TEST(GroupedHashTest, CompactPayloadHasAnExplicitLittleEndianHeader) {
+   }
+ }
+ 
++TEST(GroupedHashTest, CompactEncodingMatchesAppendReferenceAtUnalignedLengths) {
++  HashValue value;
++  for (const std::size_t length : {0, 1, 7, 15, 16, 127, 128, 255, 256, 65537}) {
++    auto& entry = value.entries_.emplace_back();
++    entry.field_.resize(length);
++    entry.value_.resize(length + 1);
++    for (std::size_t i = 0; i < entry.field_.size(); ++i)
++      entry.field_[i] = static_cast<char>(i);
++    for (std::size_t i = 0; i < entry.value_.size(); ++i)
++      entry.value_[i] = static_cast<char>(255 - i);
++  }
++  // Independent append-based reference checks every durable byte, including
++  // binary strings, multi-byte lengths, and headers starting at odd offsets.
++  // A round trip alone could miss matching encoder/decoder format mistakes.
++  std::size_t bytes = kHashValueHeaderBytes;
++  for (const auto& entry : value.entries_)
++    bytes += 8 + entry.field_.size() + entry.value_.size();
++  std::string reference;
++  auto append_integer = [&](std::uint64_t number, std::size_t width) {
++    for (std::size_t i = 0; i < width; ++i)
++      reference.push_back(static_cast<char>(number >> (8 * i)));
++  };
++  append_integer(kHashValueMagic, 8);
++  append_integer(kStorageFormatVersion, 4);
++  append_integer(kHashValueHeaderBytes, 4);
++  append_integer(value.entries_.size(), 4);
++  append_integer(0, 4);
++  append_integer(bytes, 8);
++  for (const auto& entry : value.entries_) {
++    append_integer(entry.field_.size(), 4);
++    append_integer(entry.value_.size(), 4);
++    reference.append(entry.field_);
++    reference.append(entry.value_);
++  }
++  auto encoded = EncodeHashValue(value);
++  ASSERT_TRUE(encoded.ok()) << encoded.status();
++  EXPECT_EQ(*encoded, reference);
++  EXPECT_EQ((*encoded)[encoded->size()], '\0');
++  EXPECT_FALSE(EncodeHashValue(HashValue{}).ok());
++  std::vector<HashEntryView> views;
++  for (const auto& entry : value.entries_)
++    views.push_back({entry.field_, entry.value_});
++  auto from_views = EncodeHashEntryViews(views);
++  ASSERT_TRUE(from_views.ok()) << from_views.status();
++  EXPECT_EQ(*from_views, reference);
++  EXPECT_FALSE(EncodeHashEntryViews({}).ok());
++  // Returned bytes must not borrow the source storage.
++  value.entries_.clear();
++  EXPECT_EQ(*from_views, reference);
++}
++
+ TEST(GroupedHashTest, CompactReaderPreservesBinaryViewsAndCopiedPosition) {
+   auto value = Value(3);
+   value.entries_[0].field_ = std::string("a\0b", 3);
+diff --git a/tests/grouped_hash_write_e2e_test.cpp b/tests/grouped_hash_write_e2e_test.cpp
+index eec17b8..b0ed779 100644
+--- a/tests/grouped_hash_write_e2e_test.cpp
++++ b/tests/grouped_hash_write_e2e_test.cpp
+@@ -116,6 +116,82 @@ TEST(HashReplaceE2e, SemanticsTtlBinaryFieldsAndUnchangedStandardCommands) {
+   EXPECT_EQ(client.Command({"EXISTS", "hash"}).text_, "0");
+ }
+ 
++TEST(HashReplaceE2e, InlineAndHeapScratchPreserveLastDuplicateAfterRecovery) {
++  PrivateDisk disk;
++  std::map<std::string, std::map<std::string, std::string>> expected;
++  {
++    Server server(disk);
++    Client client(server.port());
++    // Exercise both sides of the small ordering-scratch boundary, including
++    // duplicate empty/binary fields and values that do and do not fit SSO.
++    for (unsigned count : {1, 15, 16, 17, 65}) {
++      const auto key = "replace-" + std::to_string(count);
++      ASSERT_EQ(client.Command({"HSET", key, "old-field", "old"}).text_, "1");
++      std::vector<std::string> args{"KEYLANE.HREPLACE", key};
++      for (unsigned i = 0; i < count; ++i) {
++        std::string field = i % 3 == 0
++                                ? ""
++                                : std::string("f\0", 2) + std::to_string(i % 7);
++        std::string value = i % 4 == 0 ? "" : std::string(i * 3, 'v');
++        expected[key][field] = value;
++        args.push_back(std::move(field));
++        args.push_back(std::move(value));
++      }
++      ASSERT_EQ(client.Command(args).text_, "OK");
++      EXPECT_EQ(client.Command({"HLEN", key}).text_,
++                std::to_string(expected[key].size()));
++      EXPECT_EQ(client.Command({"HEXISTS", key, "old-field"}).text_, "0");
++      for (const auto& [field, value] : expected[key])
++        EXPECT_EQ(client.Command({"HGET", key, field}).text_, value);
++    }
++    client.Durable();
++    ASSERT_EQ(server.Wait(true), 0) << server.Log();
++  }
++  Server recovered(disk, 3);
++  Client client(recovered.port());
++  for (const auto& [key, fields] : expected) {
++    EXPECT_EQ(client.Command({"HLEN", key}).text_, std::to_string(fields.size()));
++    EXPECT_EQ(client.Command({"HEXISTS", key, "old-field"}).text_, "0");
++    for (const auto& [field, value] : fields)
++      EXPECT_EQ(client.Command({"HGET", key, field}).text_, value);
++  }
++}
++
++TEST(HashReplaceE2e, PromotionUsesFinalDeduplicatedBytes) {
++  PrivateDisk disk;
++  constexpr std::size_t boundary =
++      kGroupedHashPromotionBytes - kHashValueHeaderBytes - 9;
++  {
++    Server server(disk);
++    Client client(server.port());
++    for (const std::size_t size : {boundary - 1, boundary, boundary + 1}) {
++      const auto key = "boundary-" + std::to_string(size);
++      ASSERT_EQ(client.Command({"HSET", key, "old", "old"}).text_, "1");
++      // Only the final duplicate participates in promotion. The overwritten
++      // large value must neither force grouping nor leak into the after-image.
++      ASSERT_EQ(client.Command({"KEYLANE.HREPLACE", key, "x",
++                                std::string(32 * 1024, 'd'), "x",
++                                std::string(size, 'v')}).text_, "OK");
++      EXPECT_EQ(client.Command({"HLEN", key}).text_, "1");
++      EXPECT_EQ(client.Command({"HGET", key, "x"}).text_, std::string(size, 'v'));
++    }
++    client.Durable();
++    ASSERT_EQ(server.Wait(true), 0) << server.Log();
++  }
++  for (const std::size_t size : {boundary - 1, boundary, boundary + 1}) {
++    const auto key = "boundary-" + std::to_string(size);
++    EXPECT_EQ(disk.Auxiliaries(key).empty(), size < boundary);
++  }
++  Server recovered(disk, 3);
++  Client client(recovered.port());
++  for (const std::size_t size : {boundary - 1, boundary, boundary + 1}) {
++    const auto key = "boundary-" + std::to_string(size);
++    EXPECT_EQ(client.Command({"HLEN", key}).text_, "1");
++    EXPECT_EQ(client.Command({"HGET", key, "x"}).text_, std::string(size, 'v'));
++    EXPECT_EQ(client.Command({"HEXISTS", key, "old"}).text_, "0");
++  }
++}
++
+ TEST(HashReadOwnershipE2e, FullReadsPreserveCompactAndGroupedValues) {
+   PrivateDisk disk;
+   std::map<std::string, std::map<std::string, std::string>> hashes;

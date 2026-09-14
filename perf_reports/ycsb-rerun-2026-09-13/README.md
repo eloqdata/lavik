@@ -1,334 +1,162 @@
-# YCSB：Aerospike、Keylane HMSET、Keylane HREPLACE
+# YCSB：HREPLACE 两组微优化未达到吞吐与长尾的共同目标
 
-本页使用 2026-09-13 串行复测的原始 YCSB 客户端结果。此前 100K 操作短测不作为本页性能依据。
+本轮按“不改算法、不动 mutex”尝试了两组 HREPLACE 代码优化，均未作为成功优化保留。生产源码和运行二进制已经恢复到原基线；此前已合并的 Hash 读取去复制、直接构造全字段读取结果、写参数预分配仍然保留。
 
-完成 **12/12 组**；每组独立 1M 操作预热，随后独立 JVM 执行 5M 次测量操作。累计测量失败 **0** 次。
+新测的不限速 Workload A 中，现有 Keylane HREPLACE 基线为 **436,719 QPS**，Aerospike 为 **434,480 QPS**，中位数仅差 **0.52%**，不足以证明稳定吞吐领先。Keylane 的 READ/UPDATE p9999 为 **9.887 / 9.935 ms**，低于 Aerospike 的 **30.527 / 27.951 ms**；但 100K 限速时 Keylane 的混合长尾明显更高。不能把不限速下的结果概括为所有负载档位都优于 Aerospike，也不能把基线已有的表现算作本轮新代码的收益。
 
-## Workload 与测量口径
+证据截至 **2026-09-13 16:46:51 UTC**。两组 Keylane 交替试验共 48 个计分单元，加上 Aerospike 12 个单元，共 **300M 正式操作＋60M 预热操作，全部成功**；另外的初测与 perf 采样不计入评分。
 
-| 名称 | READ | UPDATE | INSERT |
-|---|---:|---:|---:|
-| A | 50% | 50% | 0 |
-| B | 95% | 5% | 0 |
-| C | 100% | 0 | 0 |
-| D（Uniform 变体） | 95% | 0 | 5% |
+## 两库与两种 Hash 更新模式
 
-按最终要求仅报告 256 workers 的 A/B/C/D；不再测其他并发或纯 UPDATE。标准 YCSB D 默认 latest，这里按要求使用 Uniform。
+256 个 YCSB 客户端线程，Uniform，查询原始 100M key 域，每条 10 个 field × 128 字节，全部字段读取/更新。A 为 50% READ / 50% UPDATE；C 为纯读；不含 INSERT。
 
-- READ/UPDATE 访问原来加载的前 100,000,000 个 key，Uniform、hashed key order、10 个 field × 128 字节。历史 D 留下的少量额外 key 不进入读取范围。
-- D 的插入编号使用未用过的范围：HMSET/Aero warmup 从 200M 开始、measured 从 210M 开始；HREPLACE 配置复测从 220M/230M 开始。`insertstart=0,insertcount=100M` 保持相同 Uniform 读取范围；仅 D 的 `recordcount` 用于控制插入起点。不会把稀疏新范围当成已加载的读 key。
-- `readallfields=true`、`writeallfields=true`；读取整条记录，UPDATE 发送全部十个 field。YCSB 默认单字段更新与本次参数不同。
-- HMSET 与 KEYLANE.HREPLACE 使用同一 Jedis 3.9.0 binding，`redis.scanindex=none`。HMSET 合并字段，HREPLACE 替换已存在 Hash。Aero binding UPDATE 使用 REPLACE_ONLY（已检查实际 jar 字节码）。
-- C 是 HGETALL/读全部 bins；HREPLACE 列的 C/D 只是一轮相同读/插入路径的复测，不执行 HREPLACE（该选项仅影响 UPDATE）。
-- 表中并发是 YCSB workers；Redis 每个 worker 一条连接，Aero 客户端可能维护额外连接。
-- 每个时刻只运行一个 YCSB JVM、一个数据库服务。Keylane GC/defrag 开启；Aerospike 使用原生回收。客户端 Prometheus/Grafana 保持启用。
-- 延迟全部来自 YCSB operation HDR，单位毫秒；p999 = p99.9。成功和失败分开，QPS 使用实际成功次数 / 同一运行时间。服务端 metrics 只用于状态核验。
-- 这是一次有限操作数复测，预热 JVM 与测量 JVM 分开，测量包含新 JVM 的 JIT 过程；不代表持续稳态容量或多次重复的置信区间。
+单元格式：**操作 QPS；p99 / p999 / p9999（ms）**。所有延迟都来自 **YCSB operation histogram**，不是服务端内部计时，也不是 Intended histogram。各列取三轮独立指标的中位数，不是合并 HDR 的百分位，所以 READ/UPDATE QPS 的中位数之和不必等于总 QPS 中位数。
 
-## 测试环境
+| Workload | 限速 | 操作 | Aerospike CE（本轮） | Keylane HMSET（前批参考） | Keylane HREPLACE（本轮基线） |
+|---|---|---|---:|---:|---:|
+| C | 不限速 | READ | 363,346；4.843 / 10.399 / 21.231 | 493,243；0.792 / 3.289 / 6.467 | 479,065；0.975 / 3.325 / 7.635 |
+| A | 不限速 | 总 QPS | 434,480 | 396,825 | 436,719 |
+| A | 不限速 | READ | 217,205；3.379 / 13.639 / 30.527 | 198,380；3.273 / 6.179 / 14.375 | 218,339；3.289 / 5.943 / 9.887 |
+| A | 不限速 | UPDATE | 217,275；2.793 / 12.159 / 27.951 | 198,445；3.367 / 6.207 / 13.991 | 218,380；2.397 / 4.955 / 9.935 |
+| C | 100K | READ | 99,453；0.474 / 0.635 / 2.335 | 99,820；0.472 / 0.700 / 1.599 | 99,804；0.471 / 0.678 / 1.608 |
+| A | 100K | 总 QPS | 99,275 | 99,798 | 99,804 |
+| A | 100K | READ | 49,601；0.442 / 0.586 / 1.561 | 49,906；0.525 / 3.405 / 6.375 | 49,885；0.934 / 5.811 / 9.135 |
+| A | 100K | UPDATE | 49,639；0.359 / 0.487 / 1.419 | 49,925；0.558 / 3.431 / 6.503 | 49,891；0.587 / 2.439 / 4.131 |
 
-- 服务端 `.4`：AMD EPYC 9V74，16 vCPU / 8 核（SMT），约 125 GiB 内存；客户端 `.5`：AMD EPYC 9V45，16 vCPU / 16 核。以本轮 lscpu 为准。
-- 六块 NVMe → `/dev/md0` RAID0，512 KiB chunk。Keylane io_uring 使用 `/dev/md0p1`，Aero CE 8.1.2.4 使用 `/dev/md0p2` 原始块设备。
-- 两者共享同组物理 NVMe，但分区容量不同：p1 约 9.47 TiB，Keylane 持久化标签实际可用约 5.24 TiB（之前初始化时确定）；p2 约 1.003 TiB。阵列/分区起点保存在环境证据中。
-- Keylane commit `a968d002c839828102a44316d43eb7dd63f03f09`，16 pinned workers，默认 busy-poll 20us，flush 128KiB，defrag 未暂停。
-- Aerospike：RF=1，indexes-memory-budget=64G，flush-size=128K，max-write-cache=8G，原配置与全部硬件信息见环境证据。
+100K 是全客户端读写合计的目标速率，不是每条连接或每类操作各 100K。HMSET 列保留此前 12＋4 配置的三轮结果，**本轮没有重新测试 HMSET**，不用于判定本轮代码收益。HREPLACE 列统一选取最后一组交替试验的三轮 baseline，不挑选较早或较快的一轮。Aerospike 不再采用旧的单轮延迟。
 
-## QPS 与 p99 / p99.9 / p99.99
+HREPLACE 基线三轮 A 不限速 QPS 为 440,917 / 403,779 / 436,719；Aerospike 为 428,192 / 434,480 / 442,517，运行间波动大于 0.52% 的中位数差。每次计分仅 5M 操作，不能把这组短测当作长期稳定容量上限。
 
-每格为 **成功 QPS；p99 / p99.9 / p99.99（ms）**。TOTAL 只列吞吐，不拼接读写百分位。
+## 本轮两组候选及处理
 
-| Workload | 并发 | 操作 | Aerospike | Keylane HMSET | Keylane HREPLACE |
-|---|---:|---|---:|---:|---:|
-| A | 256 | TOTAL | 420,027 | 359,041 | 396,731 |
-| A | 256 | READ | 210,061；1.616 / 4.033 / 13.095 | 179,613；3.009 / 7.015 / 17.919 | 198,236；3.551 / 7.151 / 19.439 |
-| A | 256 | UPDATE | 209,966；1.408 / 2.957 / 4.423 | 179,427；3.069 / 7.023 / 17.727 | 198,495；2.845 / 6.115 / 20.815 |
-| B | 256 | TOTAL | 366,972 | 400,802 | 419,076 |
-| B | 256 | READ | 348,611；1.401 / 3.971 / 52.991 | 380,921；2.185 / 4.735 / 16.943 | 398,112；1.486 / 3.829 / 17.903 |
-| B | 256 | UPDATE | 18,362；1.214 / 3.119 / 52.511 | 19,880；2.245 / 4.927 / 66.751 | 20,965；1.334 / 3.741 / 24.399 |
-| C | 256 | TOTAL | 362,897 | 424,304 | 442,478 |
-| C | 256 | READ | 362,897；1.423 / 3.833 / 26.399 | 424,304；1.455 / 4.001 / 23.615 | 442,478；1.105 / 3.195 / 9.687 |
-| D | 256 | TOTAL | 363,822 | 426,949 | 420,415 |
-| D | 256 | READ | 345,657；1.516 / 3.777 / 16.207 | 405,606；1.155 / 3.433 / 12.879 | 399,370；1.303 / 4.211 / 16.831 |
-| D | 256 | INSERT | 18,165；1.322 / 3.173 / 12.975 | 21,343；0.939 / 2.673 / 11.559 | 21,045；1.069 / 3.815 / 15.391 |
+### 1. 内联排序索引、原位构造 HashEntry：不保留
 
-## 只读限速 100K ops/s（256 workers）
+保留同一套按字段排序、重复字段取最后值的 O(n log n) 算法；小请求将排序索引放入内联缓冲区，HashEntry 在已预留的数组位置构造。锁、持久化格式和 HSET/HMSET 语义均未改动。
 
-完成 2/2 个数据库。使用 YCSB `-target 100000`，这是所有 worker 合计的目标速率。每库 1M 操作预热、5M 操作测量，读最初的 100M key；未做写入。
+三轮 A 不限速 QPS 中位数 444,879 → 444,484（−0.09%），UPDATE p9999 10.519 → 15.447 ms；C 不限速 QPS 中位数 486,760 → 476,872（−2.03%）。没有观察到满足目标的收益。
 
-以下对比原始 C 的不限速结果与本轮 100K 限速结果，全部使用 YCSB READ operation 延迟，单位 ms；不限速数据来自上面的单轮矩阵。
+证据：[逐轮结果](verified-update-matrix/cpu12-hreplace-prep.results.json)、[指标 CSV](verified-update-matrix/cpu12-hreplace-prep.summary.csv)、[中位数](verified-update-matrix/cpu12-hreplace-prep.medians.json)、[环境与源码差异](verified-update-matrix/cpu12-hreplace-prep.environment.json)、[候选补丁](verified-update-matrix/cpu12-hreplace-prep.rejected.patch)。
 
-| 数据库 | 目标 ops/s | 实际 QPS | 平均 ms | p99 ms | p99.9 ms | p99.99 ms | 失败 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Keylane | 不限速 | 424,304 | 0.557 | 1.455 | 4.001 | 23.615 | 0 |
-| Keylane | 100,000 | 99,808 | 0.335 | 0.525 | 2.331 | 25.599 | 0 |
-| Aerospike | 不限速 | 362,897 | 0.605 | 1.423 | 3.833 | 26.399 | 0 |
-| Aerospike | 100,000 | 99,518 | 0.297 | 0.444 | 0.581 | 2.367 | 0 |
+### 2. 小 Hash 从字段视图直接编码：同样不保留
 
-限速时额外设置 `measurement.interval=both`，同时记录从计划发起时刻算起的 `Intended-READ`；它包含客户端错过发起计划的延迟，不能与 READ 或服务端指标混为一谈。
+保留排序、去重、16 KiB 分组阈值和原编码算法。小 Hash 直接从字段视图生成拥有全部字节的最终 payload；视图在同步准备函数返回前销毁，不跨 await。大 Hash 仍构造拥有字段/值的 HashEntry，走原来的分组、extent、事务与恢复路径。内存准入和发布前校验不变。
 
-| 数据库 | Intended p99 ms | Intended p99.9 ms | Intended p99.99 ms |
-|---|---:|---:|---:|
-| Keylane | 0.740 | 38.239 | 80.831 |
-| Aerospike | 0.515 | 2.767 | 27.039 |
+对本例 10 个短字段名、每值 128 字节的小 Hash，准备路径省去排序索引数组、HashEntry 数组和 10 个 value 字符串的中间堆分配；这不是对整个请求总分配数的测量。编码仍为逐字段写入相同的长度和字节，没有使用上一批未通过的 resize-and-overwrite 编码改动。
 
-[限速逐项 CSV](verified-update-matrix/rate-limit-summary.csv) 包含两种延迟口径、所有百分位及原始日志校验值；[运行脚本](verified-update-matrix/rate_limit.py)。
+| Workload | 限速 | 操作 | 基线 | 直接编码候选 |
+|---|---|---|---:|---:|
+| C | 不限速 | READ | 479,065；0.975 / 3.325 / 7.635 | 482,625；0.897 / 3.455 / 10.839 |
+| A | 不限速 | 总 QPS | 436,719 | 440,762 |
+| A | 不限速 | READ | 218,339；3.289 / 5.943 / 9.887 | 220,318；3.339 / 6.027 / 10.151 |
+| A | 不限速 | UPDATE | 218,380；2.397 / 4.955 / 9.935 | 220,444；2.333 / 5.035 / 11.575 |
+| C | 100K | READ | 99,804；0.471 / 0.678 / 1.608 | 99,796；0.460 / 0.662 / 1.459 |
+| A | 100K | 总 QPS | 99,804 | 99,777 |
+| A | 100K | READ | 49,885；0.934 / 5.811 / 9.135 | 49,881；0.824 / 4.831 / 9.207 |
+| A | 100K | UPDATE | 49,891；0.587 / 2.439 / 4.131 | 49,879；0.477 / 2.505 / 4.451 |
 
+A 不限速总 QPS 中位数提高 0.93%，但 READ/UPDATE p999、p9999 中位数均未改善，UPDATE p9999 增加约 16.51%。C 不限速吞吐中位数提高 0.74%，p9999 却从 7.635 升到 10.839 ms。100K 下也并非所有尾延迟都改善。按本次共同目标，不保留该候选；这不是断言视图方案在所有条件下必然更慢，而是本次证据不足以支持上线。
 
-## Hash 全量读取：消除第二次复制的 A/B 复测
+| 轮次 | A 基线 QPS | A 候选 QPS | 配对变化 | UPDATE p9999：基线 → 候选（ms） |
+|---|---:|---:|---:|---:|
+| 1 | 440,917 | 424,520 | -3.72% | 10.319 → 11.575 |
+| 2 | 403,779 | 440,762 | 9.16% | 9.935 → 13.823 |
+| 3 | 436,719 | 443,302 | 1.51% | 8.139 → 10.191 |
 
-完成 12/12 组测量。256 连接，Workload C，Uniform，原有 100M key、10 × 128B；每组 1M 预热 + 5M 测量，GC/defrag 和客户端监控保持开启。仅 READ，没有重新 load 或写入。
+证据：[逐轮结果](verified-update-matrix/cpu12-hreplace-views.results.json)、[完整指标 CSV](verified-update-matrix/cpu12-hreplace-views.summary.csv)、[中位数](verified-update-matrix/cpu12-hreplace-views.medians.json)、[环境、源码差异与二进制 SHA](verified-update-matrix/cpu12-hreplace-views.environment.json)、[候选补丁](verified-update-matrix/cpu12-hreplace-views.rejected.patch)、[当时的测试补丁](verified-update-matrix/cpu12-hreplace-views.tests.patch)。
 
-基线是上述 main commit 的原二进制；修改版只改变 Hash/Set 共用的全量读取结果组装：移动已经解码的字符串，并按实际 capacity 预留内存。未改变磁盘格式、Hash 写路径、普通 SET/GET 或 mutex。两版二进制 SHA256 和完整源码差异见 [A/B 环境证据](verified-update-matrix/hash-move-ab-environment.json)。
+## perf 与后台活动：局部成本下降不等于长尾改善
 
-每轮依次运行基线和修改版；每版重新启动后分别运行 100K 限速、不限速，两档各有独立预热。共交替三轮，测量期间没有编译或正确性测试。测量 JVM 与预热 JVM 分开，仍包含测量 JVM 自身的 JIT/GC；有限时长结果不等于稳定容量上限。
+独立运行 1M 预热＋20M A 操作，采用 `perf record -F 99 -e cpu-clock:u --call-graph dwarf,8192`，仅采样对应 Keylane PID。这台 VM 不支持 cycles/instructions 硬件 PMU。两份 profile 都没有丢失样本，均排除在上表评分之外；perf 正常以 SIGINT 停止，凭据中的退出码 −2 对应这个信号。
 
-### 三轮汇总
+| on-CPU 指标 | HREPLACE 基线 | 直接编码候选 |
+|---|---:|---:|
+| 分配入口 self 占比 | 2.83% | 1.95% |
+| 字符串构造调用链占比 | 3.00% | 1.42% |
+| RecordIndex FindCandidates self 占比 | 2.98% | 5.02% |
+| CRC self 占比 | 3.45% | 4.10% |
+| memmove self 占比 | 3.29% | 3.94% |
+| 同一采样窗口完成的 defrag 次数 | 1,856 | 2,841 |
 
-以下每个数是三轮对应指标的中位数；百分位不是将三轮请求合并后计算的百分位。延迟全部为 YCSB READ operation，单位 ms。Intended-READ 另存 CSV，不混入本表。
+占比来自各自采样窗口，调用链彼此包含，不能相加，也不能当作精确的单请求成本变化。采样看到了分配/构造成本降低，同时也有不同的 GC 工作量；它不包含 off-CPU 等待，不能证明 YCSB 尖峰的主因。
 
-| 限速 | 版本 | 轮数 | QPS | 平均 ms | p99 ms | p999 ms | p9999 ms |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 100K | 基线 | 3 | 99,757 | 0.333 | 0.519 | 1.044 | 2.679 |
-| 100K | 消除复制 | 3 | 99,794 | 0.331 | 0.508 | 1.027 | 2.599 |
-| 不限速 | 基线 | 3 | 450,572 | 0.526 | 1.126 | 3.691 | 11.015 |
-| 不限速 | 消除复制 | 3 | 454,752 | 0.519 | 1.026 | 3.101 | 7.415 |
+计分窗口中的后台工作量也不同。直接编码试验三轮 A 不限速，基线/候选完成的 defrag 次数分别为 **533/1,112、2,006/715、687/698**。第二轮基线仅 403,779 QPS，当时前后快照均有 8 个活跃 defrag；其 JVM GC 总时间为 101 ms，占约 0.82%。这些是观察到的背景差异，不是证明服务端 GC 或 Java GC 导致尖峰的分段耗时证据。
 
-### 逐轮结果
+因此，不能把小幅 QPS 变化全部归因于代码。后续若继续优化，应先量化混合负载下后台整理、块分配与写缓冲等待的关系；本轮没有改 mutex、关闭 GC，或改变调度算法来换取分数。
 
-| 轮次 | 限速 | 版本 | QPS | 平均 ms | p99 ms | p999 ms | p9999 ms | 失败 |
-|---:|---|---|---:|---:|---:|---:|---:|---:|
-| 1 | 100K | 基线 | 99,808 | 0.330 | 0.534 | 0.989 | 2.585 | 0 |
-| 1 | 不限速 | 基线 | 450,572 | 0.526 | 1.126 | 3.189 | 11.015 | 0 |
-| 1 | 100K | 消除复制 | 99,794 | 0.331 | 0.508 | 1.078 | 2.673 | 0 |
-| 1 | 不限速 | 消除复制 | 454,752 | 0.517 | 1.026 | 3.065 | 7.351 | 0 |
-| 2 | 100K | 基线 | 99,757 | 0.333 | 0.507 | 2.543 | 5.383 | 0 |
-| 2 | 不限速 | 基线 | 452,899 | 0.522 | 0.966 | 3.691 | 7.651 | 0 |
-| 2 | 100K | 消除复制 | 99,790 | 0.330 | 0.486 | 0.982 | 2.599 | 0 |
-| 2 | 不限速 | 消除复制 | 444,642 | 0.535 | 1.290 | 3.519 | 13.639 | 0 |
-| 3 | 100K | 基线 | 99,619 | 0.336 | 0.519 | 1.044 | 2.679 | 0 |
-| 3 | 不限速 | 基线 | 434,329 | 0.544 | 1.336 | 3.897 | 15.823 | 0 |
-| 3 | 100K | 消除复制 | 99,806 | 0.334 | 0.529 | 1.027 | 2.427 | 0 |
-| 3 | 不限速 | 消除复制 | 456,371 | 0.519 | 1.018 | 3.101 | 7.415 | 0 |
-
-### 结论与正确性核验
-
-不限速 QPS 的三轮中位数变化为 +0.93%，逐轮配对变化为 +0.93%、-1.82%、+5.07%。中位数长尾较低，但逐轮存在反向波动；当前样本不足以把中位数改善认定为稳定收益。100K 限速下吞吐受目标速率约束，延迟变化较小。
-
-本轮未修改的基线在 100K 下 p9999 为 2.585 / 5.383 / 2.679 ms，上轮单次测量为 25.599 ms。不能把跨轮环境/JVM/调度波动全部归功于消除复制，也不能据此宣称极端尖峰已解决。
-
-正确性最终通过 9 项针对性测试：compact/grouped 全量重复读、空/二进制/长字段、WATCH/EXEC、原有 Hash 写入与重启恢复、超大字段和共用 Set 路径，以及真实内存限制下的 OOM。普通 SET/GET 的功能检查通过，但本次未另外测它们的性能。
-
-OOM 测试用临时服务器的预算由 96M 收紧到 64M，使全量读工作集确实触发拒绝；原 96M 仍容得下读取，不能用来断言必须 OOM。该调整只属于测试夹具，不改变 YCSB 服务端配置。
-
-[6 项功能测试](verified-update-matrix/hash-move-functional-tests.log)；[3 项 Hash/OOM 回归](verified-update-matrix/hash-move-oom-tests.log)；[原 96M 夹具断言记录](verified-update-matrix/hash-move-oom-fixture-96m.log)。
+证据：[基线 self](verified-update-matrix/cpu12-perf-hreplace-baseline-a.perf-self.txt)、[基线调用链](verified-update-matrix/cpu12-perf-hreplace-baseline-a.perf-children.txt)、[候选 self](verified-update-matrix/cpu12-perf-hreplace-views-a.perf-self.txt)、[候选调用链](verified-update-matrix/cpu12-perf-hreplace-views-a.perf-children.txt)、[逐轮背景计数](verified-update-matrix/cpu12-hreplace-views.background.csv)、[背景计数脚本](verified-update-matrix/cpu12_background_summary.py)。原始 perf 栈文件可能包含采样内存且体积较大，仅保留在本机，由 .gitignore 排除；可分享的符号摘要、命令、SHA 和 YCSB 日志均在同一证据目录。
 
+## 机器、存储与 CPU 放置
 
-[全部指标 CSV](verified-update-matrix/hash-move-ab-summary.csv)；[A/B 运行脚本](verified-update-matrix/hash_move_ab.py)；[原始结果索引](verified-update-matrix/hash-move-ab-results.json)。
+| 项目 | 配置 |
+|---|---|
+| 服务端 | 172.16.0.4，AMD EPYC 9V74，16 逻辑 CPU / 8 物理核（SMT），约 125 GiB |
+| 客户端 | 172.16.0.5，AMD EPYC 9V45，16 逻辑 CPU / 16 物理核，约 32 GiB，Java 17；Prometheus/Grafana 保持运行 |
+| 磁盘 | 六块 NVMe 的 /dev/md0 RAID0，512 KiB chunk；本轮没有清盘或更改分区 |
+| Keylane | io_uring，/dev/md0p1，原有设备标签容量保留；12 workers，CPU 0–11 |
+| Aerospike | CE 8.1.2.4，/dev/md0p2，CPU 0–15 均可用；RF=1，indexes-memory-budget=64G，flush-size=128K，max-write-cache=8G |
 
+CPU 0–11 是前 6 个完整物理核心，12–15 是后 2 个，不能称作 12 个物理核心。两库串行测量，不同时施压。
 
-## 增量优化：专用全量解码与写参数预分配
+Keylane 位于独立 `keylane-bench.slice`，AllowedCPUs/CPUAffinity=0–11；`system.slice`、`user.slice`、`init.scope` 的运行时 AllowedCPUs=12–15，全局 unbound workqueue 使用后四 CPU。enP46392s1 的 mlx5 MSI IRQ 轮流分配到 CPU 12–15，RPS/XPS 保留原值，irqbalance 停用。固定 per-CPU 内核线程和 managed NVMe IRQ 不保证全部迁移。
 
-两项分开归因：第一项用 C 比较上一轮的消除复制版与专用解码版；第三项用 A（50% READ / 50% UPDATE）比较专用解码版与再加参数预分配版。第二组不是与原 main 比较。
+**本轮 Aerospike 也在独立的 benchmark slice 中，但可使用 0–15，并未限制为 12 workers。** 当前相同的全局 IRQ/housekeeping 放置在两库测试时都保留；因此 Aero 可以使用、也会与 IRQ/housekeeping 共享后四 CPU。这不是两库相同的 CPU 资源隔离，也不同于更早 Aero 单轮的 IRQ 状态；不应把历史到本轮的 Aero 延迟变化归为数据库版本变化。
 
-均为 256 连接、Uniform、原有 100M key 范围、10 × 128B。每组独立 1M 预热＋5M 测量，100K 为全客户端合计目标，不限速不设 target。每轮基线→候选版，交替三轮；每版重启，GC/defrag、客户端 Prometheus/Grafana 保持开启。A 用 HMSET 更新全部字段，无 INSERT，无 reload；A 的读写量分别按实际成功计数统计。
+Keylane 保持 100,000,000 keys。Aerospike namespace 启动时为 100,304,416 records，额外历史记录未清理，仍占用索引和磁盘。客户端查询域、字段数与值大小相同，但两库物理数据状态不完全相同。Keylane 此前完成过清库重载；本轮两库均未重新 load。GC/数据老化和进程恢复状态无法视为相同。
 
-所有延迟来自 YCSB operation；Intended-operation 另列于 CSV。汇总是三轮各指标的中位数，不是合并请求得到的百分位；各列独立取中位数，因此读写 QPS 中位数之和不一定等于总 QPS 中位数，逐轮计数则可加和。测量 JVM 独立启动，包含自身 JIT/GC；短期调度、缓存和后台回收波动仍可能影响结果。基线总在每轮先运行，不能据此声称排除了顺序效应。
+## 启动与客户端配置
 
-实现保持拥有型返回值、完整编码校验、内存 admission、磁盘格式和 mutex 不变。专用路径只处理 compact HGETALL/HKEYS/HVALS（包括共用 Set 路径），grouped 继续原路径。HSET/HMSET/HREPLACE 的参数仍为请求持有的 string_view；预分配仅避免 vector 扩容，不改写入算法或整值读写方式。普通 SET/GET 代码未改，本轮没有单独测试其性能。
+Keylane 等效进程参数：
 
-局部分配计数（不是服务端总分配或耗时）：10×128B 全读由 12 次/2810B 降至 11 次/2090B，少一个 HashEntry 数组及 10 个 field digest 计算；两组写参数数组由 10 次/992B 降至 2 次/320B。证据：[计数输出](verified-update-matrix/hash-direct-allocations.log)、[计数程序](verified-update-matrix/hash_direct_allocations.cpp)。
+```bash
+taskset -c 0-11 /mnt/dev/keylane/build/keylane \
+  --bind 172.16.0.4 --port 16379 --metrics-port 19100 \
+  --threads 12 --pin-workers --shutdown-checkpoint \
+  --log-dir /mnt/dev/keylane-md0-keylane --data-file /dev/md0p1
+```
 
-### 第一项：C 专用解码
+实际由 `keylane-ycsb-cpu12.service` 启动，LimitNOFILE=20000；不要直接在被限制到 CPU 12–15 的 user.slice 中启动。GC/defrag 状态为 `paused=0 max_active_per_device=8 block_sleep_ms=0 record_sleep_us=0`。启动/核验见 [cpu12_run.py](verified-update-matrix/cpu12_run.py)，CPU/IRQ 放置和原策略恢复见 [cpu12_affinity.py](verified-update-matrix/cpu12_affinity.py)。这些运行时隔离设置会在主机重启后清除。
 
-完成 12/12 个测量单元；[二进制 SHA256、源码差异及环境](verified-update-matrix/hash-direct-read-environment.json)，[原始结果](verified-update-matrix/hash-direct-read-results.json)。
+Aerospike 等效命令为 `/usr/bin/asd --config-file /mnt/dev/aerospike-md0.conf --foreground`，本次通过 `aerospike-ycsb-compare.service`、独立 slice、AllowedCPUs/CPUAffinity=0–15、LimitNOFILE=20000 启动。完整 namespace/network 配置与服务命令保存在 [本轮 Aero 环境凭据](verified-update-matrix/cpu12-hreplace-aero.environment.json)，[复测脚本](verified-update-matrix/cpu12_aero_compare.py) 会等待恢复结束、核验 record 数及 stop-writes，再开始测试，结束后恢复 Keylane。
 
-| 限速 | 版本 | 操作 | 轮数 | 总 QPS | 操作 QPS | 平均 ms | p99 ms | p999 ms | p9999 ms |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| 100K | 前版：已消除复制 | READ | 3 | 99,798 | 99,798 | 0.333 | 0.501 | 1.017 | 2.633 |
-| 100K | 专用解码 | READ | 3 | 99,804 | 99,804 | 0.329 | 0.502 | 0.994 | 2.667 |
-| 不限速 | 前版：已消除复制 | READ | 3 | 449,115 | 449,115 | 0.518 | 1.057 | 3.287 | 7.051 |
-| 不限速 | 专用解码 | READ | 3 | 456,746 | 456,746 | 0.515 | 1.169 | 3.551 | 8.051 |
+共同 YCSB 参数：
 
-逐轮记录（单位 ms）：
+```properties
+recordcount=100000000
+fieldcount=10
+fieldlength=128
+fieldlengthdistribution=constant
+readallfields=true
+writeallfields=true
+insertorder=hashed
+requestdistribution=uniform
+insertproportion=0
+scanproportion=0
+readmodifywriteproportion=0
+measurementtype=hdrhistogram
+measurement.interval=both
+hdrhistogram.percentiles=50,95,99,99.9,99.99
+```
 
-| 轮次 | 限速 | 版本 | 操作 | 操作 QPS | 平均 | p99 | p999 | p9999 | 失败 |
-|---:|---|---|---|---:|---:|---:|---:|---:|---:|
-| 1 | 100K | 前版：已消除复制 | READ | 99,741 | 0.331 | 0.501 | 1.020 | 2.515 | 0 |
-| 1 | 不限速 | 前版：已消除复制 | READ | 450,167 | 0.522 | 1.073 | 3.287 | 9.735 | 0 |
-| 1 | 100K | 专用解码 | READ | 99,804 | 0.327 | 0.502 | 1.050 | 2.999 | 0 |
-| 1 | 不限速 | 专用解码 | READ | 453,145 | 0.516 | 1.256 | 3.653 | 8.051 | 0 |
-| 2 | 100K | 前版：已消除复制 | READ | 99,798 | 0.333 | 0.507 | 1.006 | 2.633 | 0 |
-| 2 | 不限速 | 前版：已消除复制 | READ | 440,257 | 0.518 | 0.982 | 3.357 | 7.051 | 0 |
-| 2 | 100K | 专用解码 | READ | 99,824 | 0.329 | 0.483 | 0.974 | 2.667 | 0 |
-| 2 | 不限速 | 专用解码 | READ | 457,289 | 0.514 | 1.125 | 3.551 | 7.479 | 0 |
-| 3 | 100K | 前版：已消除复制 | READ | 99,802 | 0.339 | 0.498 | 1.017 | 38.719 | 0 |
-| 3 | 不限速 | 前版：已消除复制 | READ | 449,115 | 0.518 | 1.057 | 3.093 | 7.047 | 0 |
-| 3 | 100K | 专用解码 | READ | 99,759 | 0.337 | 0.521 | 0.994 | 2.659 | 0 |
-| 3 | 不限速 | 专用解码 | READ | 456,746 | 0.515 | 1.169 | 3.335 | 9.303 | 0 |
+A 设 readproportion=0.5、updateproportion=0.5；C 设 readproportion=1、updateproportion=0。使用 `-threads 256`，限速组另加 `-target 100000`。每个单元分别用独立 JVM 做 1M 预热和 5M 正式操作；每轮基线→候选，两版均重启，顺序 C→A、各自 100K→不限速。正式测量没有 perf、编译或正确性测试。Aero 恢复一次后按相同 C/A、100K/不限速顺序测三轮。
 
-不限速总 QPS 三轮中位数变化 +1.70%；逐轮配对变化为 +0.66%、+3.87%、+1.70%。分配减少是确定的代码变化，吞吐和极端长尾的稳定收益仍需按逐轮一致性判断，不能只挑最好的一轮。
+Keylane 客户端是 .5 的 `/mnt/dev/YCSB-hreplace-dist/bin/ycsb`（Jedis 3.9.0），设 `redis.scanindex=none`、`redis.updatecommand=keylane.hreplace`；HMSET 前批设为 `hmset`。Aerospike 用 `/mnt/dev/YCSB-aerospike-dist/bin/ycsb`，UPDATE 为 REPLACE_ONLY，并提交全部字段。HREPLACE 与 REPLACE_ONLY 都是只替换已存在记录；HMSET 仍为字段合并语义，需要读取旧 Hash。本轮未修改 YCSB binding 或其上游 PR 分支。
 
-本轮不限速 READ 的 p9999 中位数为 7.051 → 8.051 ms；不能把这项改动称为极端长尾优化。100K 下也保留了所有尖峰：只读前版有 38.719 ms，A 的预分配版 UPDATE 有 49.983 ms。它们的来源尚未归因，本实验不证明分配就是主要瓶颈。
+## 构建、正确性与复现证据
 
-### 第三项：A 写参数预分配
+基线生产代码与 main `b3c55ca` 相同，包含 `63f868a` 的 Hash 优化及后续集合大小修复；保留二进制构建于 `a1b90e6`，其后的这两次 main 提交仅改报告/工具。构建使用 GCC 13、Release/O3、C++23、march=native、LTO 和静态 C++/OpenSSL，候选保持相同构建选项。
 
-完成 12/12 个测量单元；[二进制 SHA256、源码差异及环境](verified-update-matrix/hash-direct-reserve-environment.json)，[原始结果](verified-update-matrix/hash-direct-reserve-results.json)。
+| 版本 | SHA256 | 处理 |
+|---|---|---|
+| 基线 | 8ded8812356d872eabb05bcd0ff828dcf8185771c50ef1d3b566d5d48403ab1d | 当前运行 |
+| 内联准备候选 | e41c8c9259b6b036a69369dcc58f280d43128852eac1477639304cc00089bf65 | 不保留生产改动 |
+| 直接编码候选 | 4365296b8206f9f3668b4c1e80fe1755e7b95df0c5a1d3118c1a82bed1e25bc5 | 不保留生产改动 |
 
-| 限速 | 版本 | 操作 | 轮数 | 总 QPS | 操作 QPS | 平均 ms | p99 ms | p999 ms | p9999 ms |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| 100K | 专用解码 | READ | 3 | 99,798 | 49,882 | 0.337 | 0.619 | 3.717 | 7.451 |
-| 100K | 专用解码 | UPDATE | 3 | 99,798 | 49,916 | 0.352 | 0.705 | 3.771 | 7.611 |
-| 100K | 专用解码＋参数预分配 | READ | 3 | 99,749 | 49,886 | 0.338 | 0.677 | 3.839 | 7.207 |
-| 100K | 专用解码＋参数预分配 | UPDATE | 3 | 99,749 | 49,873 | 0.353 | 0.784 | 4.021 | 7.483 |
-| 不限速 | 专用解码 | READ | 3 | 368,406 | 184,209 | 0.639 | 2.915 | 6.719 | 12.375 |
-| 不限速 | 专用解码 | UPDATE | 3 | 368,406 | 184,196 | 0.660 | 3.047 | 6.763 | 11.151 |
-| 不限速 | 专用解码＋参数预分配 | READ | 3 | 369,440 | 184,738 | 0.635 | 2.803 | 6.803 | 13.527 |
-| 不限速 | 专用解码＋参数预分配 | UPDATE | 3 | 369,440 | 184,702 | 0.655 | 2.901 | 6.883 | 15.927 |
+直接编码候选通过 77 项正确性测试：67 项 Hash codec/旁表单测（含显式启用的 >1 GiB 编解码）、7 项 HREPLACE/全字段读取端到端、3 项 compact Hash/Set/String 事务或恢复。覆盖不同参数数目、重复/二进制/空字段、16 KiB 边界、TTL、WATCH/EXEC/Lua、复制、分组/extent 和冷恢复。2 项依赖注错的测试在普通 Release 下跳过，不能算通过。候选的逐字节视图编码测试随实现归档；通用重复字段和分组边界回归测试保留。没有测量普通 String SET/GET 的吞吐，本轮通过恢复原生产二进制避免交付未验证的性能变化。
 
-逐轮记录（单位 ms）：
-
-| 轮次 | 限速 | 版本 | 操作 | 操作 QPS | 平均 | p99 | p999 | p9999 | 失败 |
-|---:|---|---|---|---:|---:|---:|---:|---:|---:|
-| 1 | 100K | 专用解码 | READ | 49,859 | 0.335 | 0.596 | 3.717 | 7.295 | 0 |
-| 1 | 100K | 专用解码 | UPDATE | 49,947 | 0.348 | 0.640 | 3.771 | 7.307 | 0 |
-| 1 | 不限速 | 专用解码 | READ | 185,233 | 0.635 | 2.923 | 6.719 | 12.375 | 0 |
-| 1 | 不限速 | 专用解码 | UPDATE | 185,220 | 0.659 | 3.089 | 6.803 | 15.311 | 0 |
-| 1 | 100K | 专用解码＋参数预分配 | READ | 49,938 | 0.355 | 0.767 | 4.919 | 49.311 | 0 |
-| 1 | 100K | 专用解码＋参数预分配 | UPDATE | 49,893 | 0.369 | 0.837 | 4.939 | 49.983 | 0 |
-| 1 | 不限速 | 专用解码＋参数预分配 | READ | 184,738 | 0.632 | 2.803 | 6.547 | 11.559 | 0 |
-| 1 | 不限速 | 专用解码＋参数预分配 | UPDATE | 184,702 | 0.649 | 2.837 | 6.611 | 11.935 | 0 |
-| 2 | 100K | 专用解码 | READ | 49,930 | 0.337 | 0.619 | 3.639 | 7.451 | 0 |
-| 2 | 100K | 专用解码 | UPDATE | 49,867 | 0.352 | 0.705 | 3.759 | 7.611 | 0 |
-| 2 | 不限速 | 专用解码 | READ | 184,209 | 0.641 | 2.915 | 6.735 | 15.959 | 0 |
-| 2 | 不限速 | 专用解码 | UPDATE | 184,196 | 0.662 | 3.047 | 6.739 | 11.151 | 0 |
-| 2 | 100K | 专用解码＋参数预分配 | READ | 49,886 | 0.338 | 0.677 | 3.809 | 7.207 | 0 |
-| 2 | 100K | 专用解码＋参数预分配 | UPDATE | 49,863 | 0.353 | 0.784 | 4.021 | 7.483 | 0 |
-| 2 | 不限速 | 专用解码＋参数预分配 | READ | 185,595 | 0.636 | 2.801 | 6.815 | 13.527 | 0 |
-| 2 | 不限速 | 专用解码＋参数预分配 | UPDATE | 185,738 | 0.657 | 2.901 | 6.907 | 16.943 | 0 |
-| 3 | 100K | 专用解码 | READ | 49,882 | 0.344 | 0.702 | 4.975 | 22.191 | 0 |
-| 3 | 100K | 专用解码 | UPDATE | 49,916 | 0.359 | 0.803 | 5.119 | 22.959 | 0 |
-| 3 | 不限速 | 专用解码 | READ | 183,307 | 0.639 | 2.909 | 6.711 | 10.191 | 0 |
-| 3 | 不限速 | 专用解码 | UPDATE | 183,451 | 0.660 | 3.003 | 6.763 | 10.479 | 0 |
-| 3 | 100K | 专用解码＋参数预分配 | READ | 49,863 | 0.336 | 0.626 | 3.839 | 7.163 | 0 |
-| 3 | 100K | 专用解码＋参数预分配 | UPDATE | 49,873 | 0.350 | 0.686 | 3.873 | 7.447 | 0 |
-| 3 | 不限速 | 专用解码＋参数预分配 | READ | 183,394 | 0.635 | 2.977 | 6.803 | 15.431 | 0 |
-| 3 | 不限速 | 专用解码＋参数预分配 | UPDATE | 183,255 | 0.655 | 3.087 | 6.883 | 15.927 | 0 |
-
-不限速总 QPS 三轮中位数变化 +0.28%；逐轮配对变化为 -0.27%、+0.79%、-0.03%。分配减少是确定的代码变化，吞吐和极端长尾的稳定收益仍需按逐轮一致性判断，不能只挑最好的一轮。
-
-本轮不限速 UPDATE 的 p9999 中位数为 11.151 → 15.927 ms；不能把这项改动称为极端长尾优化。100K 下也保留了所有尖峰：只读前版有 38.719 ms，A 的预分配版 UPDATE 有 49.983 ms。它们的来源尚未归因，本实验不证明分配就是主要瓶颈。
-
-[全部百分位与 Intended 指标 CSV](verified-update-matrix/hash-direct-summary.csv)；[交替运行脚本](verified-update-matrix/hash_direct_ab.py)。
-
-正确性：专用解码版通过 65 项 codec/旁表单测及 9 项端到端回归，覆盖二进制/空 field/value、compact/grouped 全量读、WATCH/EXEC、写入与重启、超大值、Set 共用路径和真实 OOM。
-
-[单测](verified-update-matrix/hash-direct-unit-tests.log)、[功能回归](verified-update-matrix/hash-direct-functional-tests.log)、[OOM 回归](verified-update-matrix/hash-direct-oom-tests.log)。
-
-参数预分配版再次通过相同的 9 项端到端回归：[功能](verified-update-matrix/hash-reserve-functional-tests.log)、[OOM](verified-update-matrix/hash-reserve-oom-tests.log)。
-
-
-## 最新 main：清库重灌与 12＋4 CPU 分配
-
-已完成 12/12 组测量。代码基于 `a1b90e60d674149072deebc1dcc50bc691769bcf`，二进制 SHA256 `8ded8812356d872eabb05bcd0ff828dcf8185771c50ef1d3b566d5d48403ab1d`。合并时保留上游取消逻辑 Hash 总大小限制的修复；66 项 codec/旁表单测（含超过 1 GiB 的实际编解码）和 9 项端到端回归通过。
-
-只清空 Keylane DB0 的 100,605,038 条旧测试记录：使用 FLUSHDB SYNC，等待同步回收，重启确认 DBSIZE=0，再从 .5 load 100M 条、每条 10×128B。没有格式化/丢弃原始设备，不改变 RAID/分区或 Aerospike 数据；这是逻辑清库，不是物理安全擦除。100M 次 load 全部成功，吞吐 521,962 inserts/s，完成后 DBSIZE=100M。
-
-### 放置与复现
-
-服务器 16 个逻辑 CPU 对应 8 个物理核心：0–11 是前 6 个完整物理核心，12–15 是后 2 个。Keylane 使用 taskset -c 0-11、--threads 12、--pin-workers，运行在独立的 keylane-bench.slice；system.slice、user.slice、init.scope 的运行时 AllowedCPUs 均为 12-15。可迁移任务的 affinity、全局 unbound workqueue 掩码也移到 12-15。
-
-将 enP46392s1 的 17 个 mlx5 MSI IRQ（含 16 个 completion 队列）轮流分配到 CPU 12–15。irqbalance 原本停用；RPS/XPS 保留原值。固定 per-CPU 内核线程及 managed NVMe IRQ 未宣称全部迁移，这不是 boot-time 完全隔离。GC/defrag 与 .5 的 Prometheus/Grafana 保持开启；客户端 CPU 放置、256 workers、Uniform、无 scan index、全字段读写不变。
-
-当前常驻服务为 keylane-ycsb-cpu12.service。启动/验证使用 cpu12_run.py start/verify；重灌命令为 cpu12_run.py clear-load --expected-old-count 100605038，带旧计数和单次清理凭据保护，不能直接重复执行。测量使用 cpu12_run.py run。恢复原放置前需停止该服务，再以 sudo 运行 cpu12_affinity.py restore；原始策略和任务 affinity 已保存，重启会清除这些 runtime 设置。旧 16-worker runner 不能在 user.slice=12-15 下直接使用。
-
-每轮依次 C、A，每种负载依次 100K 与不限速；每组独立 1M 预热＋5M 测量。三轮连续使用同一个 12-worker 服务，A 只更新、不插入。
-
-### 与上次 16-worker 结果并列
-
-这不是只改变 IRQ 的严格 A/B：最新 main、清库重灌、worker 数、后台任务/网卡 IRQ 放置、重启顺序均有变化。16-worker 的 C 是上次专用解码版（未加不参与只读的写参数预分配），A 是两项改动版。只能比较这组整体配置效果，不能将变化独立归因于 IRQ 或某项代码。
-
-下表是逐轮指标的中位数，非合并 HDR 百分位；所有延迟为 YCSB operation、单位 ms，Intended 指标另存 CSV。各列独立取中位数，读写 QPS 中位数之和不必等于总 QPS 中位数。
-
-| Workload | 限速 | 操作 | 配置 | 轮数 | 总 QPS | 操作 QPS | 平均 ms | p99 ms | p999 ms | p9999 ms |
-|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| C | 100K | READ | 原16 | 3 | 99,804 | 99,804 | 0.329 | 0.502 | 0.994 | 2.667 |
-| C | 100K | READ | 新12＋4 | 3 | 99,792 | 99,792 | 0.315 | 0.483 | 0.753 | 1.611 |
-| C | 不限速 | READ | 原16 | 3 | 456,746 | 456,746 | 0.515 | 1.169 | 3.551 | 8.051 |
-| C | 不限速 | READ | 新12＋4 | 3 | 465,116 | 465,116 | 0.490 | 1.232 | 3.543 | 12.199 |
-| A | 100K | READ | 原16 | 3 | 99,749 | 49,886 | 0.338 | 0.677 | 3.839 | 7.207 |
-| A | 100K | READ | 新12＋4 | 3 | 99,786 | 49,899 | 0.313 | 0.520 | 2.853 | 5.259 |
-| A | 100K | UPDATE | 原16 | 3 | 99,749 | 49,873 | 0.353 | 0.784 | 4.021 | 7.483 |
-| A | 100K | UPDATE | 新12＋4 | 3 | 99,786 | 49,888 | 0.323 | 0.566 | 3.055 | 5.723 |
-| A | 不限速 | READ | 原16 | 3 | 369,440 | 184,738 | 0.635 | 2.803 | 6.803 | 13.527 |
-| A | 不限速 | READ | 新12＋4 | 3 | 398,026 | 199,095 | 0.585 | 3.229 | 6.115 | 12.039 |
-| A | 不限速 | UPDATE | 原16 | 3 | 369,440 | 184,702 | 0.655 | 2.901 | 6.883 | 15.927 |
-| A | 不限速 | UPDATE | 新12＋4 | 3 | 398,026 | 198,931 | 0.603 | 3.329 | 6.167 | 15.439 |
-
-### 新配置逐轮数据
-
-| 轮 | Workload | 限速 | 操作 | 操作 QPS | p99 ms | p999 ms | p9999 ms | 失败 |
-|---:|---|---|---|---:|---:|---:|---:|---:|
-| 1 | C | 100K | READ | 99,739 | 0.465 | 1.006 | 2.553 | 0 |
-| 1 | C | 不限速 | READ | 452,120 | 1.274 | 4.071 | 16.231 | 0 |
-| 1 | A | 100K | READ | 49,915 | 0.475 | 2.773 | 4.667 | 0 |
-| 1 | A | 100K | UPDATE | 49,929 | 0.502 | 2.793 | 4.675 | 0 |
-| 1 | A | 不限速 | READ | 200,688 | 3.353 | 6.115 | 13.487 | 0 |
-| 1 | A | 不限速 | UPDATE | 200,628 | 3.415 | 6.199 | 18.127 | 0 |
-| 2 | C | 100K | READ | 99,852 | 0.497 | 0.680 | 1.478 | 0 |
-| 2 | C | 不限速 | READ | 465,116 | 1.232 | 3.543 | 12.199 | 0 |
-| 2 | A | 100K | READ | 49,899 | 0.522 | 2.975 | 5.307 | 0 |
-| 2 | A | 100K | UPDATE | 49,888 | 0.568 | 3.185 | 5.723 | 0 |
-| 2 | A | 不限速 | READ | 197,846 | 3.229 | 6.127 | 11.879 | 0 |
-| 2 | A | 不限速 | UPDATE | 197,975 | 3.329 | 6.167 | 15.439 | 0 |
-| 3 | C | 100K | READ | 99,792 | 0.483 | 0.753 | 1.611 | 0 |
-| 3 | C | 不限速 | READ | 481,139 | 0.795 | 3.367 | 10.223 | 0 |
-| 3 | A | 100K | READ | 49,876 | 0.520 | 2.853 | 5.259 | 0 |
-| 3 | A | 100K | UPDATE | 49,866 | 0.566 | 3.055 | 5.827 | 0 |
-| 3 | A | 不限速 | READ | 199,095 | 3.133 | 6.103 | 12.039 | 0 |
-| 3 | A | 不限速 | UPDATE | 198,931 | 3.151 | 6.111 | 11.151 | 0 |
-
-### 放置效果核验
-
-| 轮 | Workload | 限速 | NIC IRQ 增量：CPU 0–11 | CPU 12–15 | softnet dropped | time-squeeze | 后4 CPU 忙碌% | 后4 IRQ/softirq% |
-|---:|---|---|---:|---:|---:|---:|---:|---:|
-| 1 | C | 100K | 0 | 9590415 | 0 | 0 | 17.0 | 15.5 |
-| 1 | C | 不限速 | 0 | 1922376 | 0 | 4542 | 45.6 | 42.7 |
-| 1 | A | 100K | 0 | 11513406 | 0 | 0 | 20.3 | 17.9 |
-| 1 | A | 不限速 | 0 | 3487676 | 0 | 632 | 55.6 | 51.5 |
-| 2 | C | 100K | 0 | 9214948 | 0 | 0 | 16.0 | 14.5 |
-| 2 | C | 不限速 | 0 | 1966067 | 0 | 5924 | 52.7 | 49.9 |
-| 2 | A | 100K | 0 | 11109239 | 0 | 0 | 18.0 | 15.6 |
-| 2 | A | 不限速 | 0 | 3473719 | 0 | 752 | 54.6 | 49.9 |
-| 3 | C | 100K | 0 | 9784889 | 0 | 0 | 16.5 | 15.0 |
-| 3 | C | 不限速 | 0 | 1793539 | 0 | 3999 | 48.2 | 44.8 |
-| 3 | A | 100K | 0 | 11542714 | 0 | 0 | 21.8 | 19.5 |
-| 3 | A | 不限速 | 0 | 3498239 | 0 | 590 | 57.7 | 52.4 |
-
-### 本轮结论
-
-与上述历史中位数相比，不限速 C 总吞吐 +1.83%，A 总吞吐 +7.74%。100K 的 C READ p9999 为 2.667 → 1.611 ms，A UPDATE 为 7.483 → 5.723 ms。
-
-不限速 C READ p9999 却从 8.051 升至 12.199 ms；不能宣称该配置全面改善极端长尾。固定 100K 和饱和压力的取舍必须分开看，历史对照也无法分离 CPU 放置、代码和数据状态的影响。
-
-12 个测量窗口中，网卡 completion IRQ 落在 CPU 0–11 的总增量为 0，softnet dropped 总增量为 0。不限速窗口仍有 time-squeeze；这证实网卡 IRQ 放置生效，但不是 YCSB 尖峰来源的分段归因。
-
-CPU 百分比来自 /proc/stat 两次快照差值，在对应 CPU 集合内加权平均；忙碌为 100% 减 idle/iowait。time-squeeze 表示一次 softirq 处理用完预算，不等于丢包，也不能仅凭它判定 YCSB 尖峰来源。以上 IRQ/softnet 是服务端计数，延迟仍完全取客户端 YCSB。
-
-[环境与二进制](verified-update-matrix/cpu12-environment.json)；[原始放置](verified-update-matrix/cpu12-affinity-original.json)；[应用凭据](verified-update-matrix/cpu12-affinity-applied.json)；[清库凭据](verified-update-matrix/cpu12-clear-db0.json)；[load 结果](verified-update-matrix/cpu12-load.json)。
-
-[完整指标 CSV](verified-update-matrix/cpu12-summary.csv)；[逐轮结果](verified-update-matrix/cpu12-results.json)；[放置脚本](verified-update-matrix/cpu12_affinity.py)；[重灌/测量脚本](verified-update-matrix/cpu12_run.py)。
-
-
-## 原始证据与复现
-
-[逐操作 CSV](verified-update-matrix/summary.csv) 包含平均、最小、最大、p50/p95/p99/p99.9/p99.99、成功次数、失败次数、源日志 SHA256。
-[环境信息](verified-update-matrix/environment.json)；[串行运行脚本](verified-update-matrix/run.py)；[汇总与计数核验脚本](verified-update-matrix/summarize.py)。
-
-`verified-update-matrix/` 保留每组 warmup/measured 的原始 log、完整客户端命令、开始结束 UTC、解析 JSON 和前后服务端状态快照。
-
-脚本使用现有两份数据，依次停止/启动本轮数据库，并复用验证通过的已完成日志；不会清盘或 load。D 会插入新 key。若移走 D 的结果重测，必须分配新的插入编号范围，不能重复使用本轮范围。执行前确认没有其他压测。
-
-## 对之前结果的更正
-
-之前 `md0-matrix/` 的 100K 操作仅耗时约 0.4–1.3 秒，包含新 JVM 启动影响，旧脚本没有保证两库串行。其 D 在多次独立 JVM 中重复从同一编号插入，Aero 返回 CREATE_ONLY 冲突；Redis HMSET upsert 则掩盖了重复插入。旧数据保留审计，不用于当前比较。
-之前 perf 选择了 sudo 包装进程，空采样不能据此归因于 perf 权限限制；需要选择实际 keylane PID 重新验证。
+- [候选单测](verified-update-matrix/cpu12-hreplace-views.unit-tests.json)、[HREPLACE/读取测试](verified-update-matrix/cpu12-hreplace-views.hash-tests.json)、[Hash/Set/String 测试](verified-update-matrix/cpu12-hreplace-views.collection-tests.json)。回退后再次通过 77 项，仍有 2 项 Release 注错测试跳过：[恢复版单测](verified-update-matrix/cpu12-hreplace-restored.unit-tests.json)、[恢复版 HREPLACE/读取](verified-update-matrix/cpu12-hreplace-restored.hash-tests.json)、[恢复版 Hash/Set/String](verified-update-matrix/cpu12-hreplace-restored.collection-tests.json)。
+- [Aero 三轮原始结果](verified-update-matrix/cpu12-hreplace-aero.results.json)、[Aero 完整指标 CSV](verified-update-matrix/cpu12-hreplace-aero.summary.csv)、[两库汇总](verified-update-matrix/cpu12-hreplace-views.comparison.json)。
+- [交替测试脚本](verified-update-matrix/cpu12_codec_ab.py)、[校验/汇总脚本](verified-update-matrix/cpu12_codec_summary.py)、[两库校验脚本](verified-update-matrix/cpu12_hreplace_compare_summary.py)、[采样脚本](verified-update-matrix/cpu12_perf.py)。交替脚本需指定 `--mode hreplace`，并使用新的 `--label`，不会覆盖已有试验。
+- 原始同名 .log、.command.json、.before.txt、.after.txt 与汇总均在 `verified-update-matrix/`；日志记录实际客户端命令、成功/失败计数、普通/Intended 分位数、时间戳和 SHA。主表不混用两类直方图。
+- [最终恢复凭据：原二进制 SHA、生产源码无差异、100M keys、defrag 开启](verified-update-matrix/cpu12-hreplace-restored.final.json)、[Aero 结束后的服务状态](verified-update-matrix/cpu12-hreplace-aero.restored.json)、[此前清库凭据](verified-update-matrix/cpu12-clear-db0.json)、[100M 加载结果](verified-update-matrix/cpu12-load.json)。
+- HMSET 前批来自 [cpu12-codec.medians.json](verified-update-matrix/cpu12-codec.medians.json) 的 baseline；其 resize-and-overwrite 候选因纯读回退已撤回，结果与 [旧候选补丁](verified-update-matrix/cpu12-codec.rejected.patch) 仅留作审计。
+- 本轮只维护这份报告；已有的 `md0-matrix/README.md`、旧 16-worker、旧短测及中间版本文件未改动，不进入本轮结论。不要用旧 `summarize.py` 重建覆盖本页。保留回归测试、报告及复测证据，两组候选的生产代码均已回退。

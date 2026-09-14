@@ -1,0 +1,4 @@
+# Raw stacks are large and can contain sampled request bytes. Keep them local;
+# publish only symbol summaries and bounded non-secret experiment receipts.
+*.perf.data
+*.perf.data.old

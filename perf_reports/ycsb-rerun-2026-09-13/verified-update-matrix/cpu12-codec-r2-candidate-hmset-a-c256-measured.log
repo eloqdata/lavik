@@ -1,0 +1,80 @@
+java -cp /mnt/dev/YCSB-hreplace-dist/redis-binding/conf:/mnt/dev/YCSB-hreplace-dist/conf:/mnt/dev/YCSB-hreplace-dist/lib/htrace-core4-4.1.0-incubating.jar:/mnt/dev/YCSB-hreplace-dist/lib/slf4j-api-1.7.25.jar:/mnt/dev/YCSB-hreplace-dist/lib/jackson-mapper-asl-1.9.4.jar:/mnt/dev/YCSB-hreplace-dist/lib/HdrHistogram-2.1.12.jar:/mnt/dev/YCSB-hreplace-dist/lib/jackson-core-asl-1.9.4.jar:/mnt/dev/YCSB-hreplace-dist/lib/jedis-3.9.0.jar:/mnt/dev/YCSB-hreplace-dist/lib/core-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-hreplace-dist/lib/commons-pool2-2.11.1.jar:/mnt/dev/YCSB-hreplace-dist/lib/redis-binding-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.RedisClient -s -threads 256 -P /mnt/dev/YCSB-hreplace-dist/workloads/workloada -p recordcount=100000000 -p operationcount=5000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.5 -p updateproportion=0.5 -p insertproportion=0 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=both -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p redis.host=172.16.0.4 -p redis.port=16379 -p redis.scanindex=none -p redis.timeout=10000 -p redis.cluster=false -p redis.updatecommand=hmset -t
+Command line: -db site.ycsb.db.RedisClient -s -threads 256 -P /mnt/dev/YCSB-hreplace-dist/workloads/workloada -p recordcount=100000000 -p operationcount=5000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.5 -p updateproportion=0.5 -p insertproportion=0 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=both -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p redis.host=172.16.0.4 -p redis.port=16379 -p redis.scanindex=none -p redis.timeout=10000 -p redis.cluster=false -p redis.updatecommand=hmset -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
+SLF4J: Defaulting to no-operation (NOP) logger implementation
+SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
+2026-09-13 15:35:14:649 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-09-13 15:35:24:579 10 sec: 4257320 operations; 425689.43 current ops/sec; est completion in 2 second [READ: Count=2128238, Max=45343, Min=152, Avg=581.42, 50=510, 90=699, 99=2983, 99.9=6243, 99.99=12751] [UPDATE: Count=2132723, Max=47743, Min=178, Avg=598.56, 50=521, 90=718, 99=3043, 99.9=6263, 99.99=12919] [Intended-READ: Count=2132924, Max=45343, Min=152, Avg=581.39, 50=510, 90=699, 99=2979, 99.9=6243, 99.99=12631] [Intended-UPDATE: Count=2135295, Max=47743, Min=178, Avg=598.55, 50=521, 90=718, 99=3041, 99.9=6263, 99.99=12919] 
+2026-09-13 15:35:26:883 12 sec: 5000000 operations; 322343.75 current ops/sec; [READ: Count=370694, Max=10527, Min=197, Avg=524.03, 50=462, 90=653, 99=2645, 99.9=5755, 99.99=8143] [CLEANUP: Count=256, Max=748, Min=15, Avg=45.55, 50=30, 90=87, 99=142, 99.9=748, 99.99=748] [UPDATE: Count=368345, Max=10831, Min=188, Avg=533.32, 50=470, 90=663, 99=2659, 99.9=5811, 99.99=7991] [Intended-READ: Count=366008, Max=10527, Min=197, Avg=523.71, 50=461, 90=652, 99=2673, 99.9=5763, 99.99=8159] [Intended-CLEANUP: Count=256, Max=749, Min=15, Avg=46.05, 50=32, 90=88, 99=142, 99.9=749, 99.99=749] [Intended-UPDATE: Count=365773, Max=10831, Min=189, Avg=533.17, 50=470, 90=662, 99=2675, 99.9=5827, 99.99=7991] 
+[OVERALL], RunTime(ms), 12304
+[OVERALL], Throughput(ops/sec), 406371.911573472
+[TOTAL_GCS_G1_Young_Generation], Count, 115
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 109
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.8858907672301691
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 115
+[TOTAL_GC_TIME], Time(ms), 109
+[TOTAL_GC_TIME_%], Time(%), 0.8858907672301691
+[READ], Operations, 2498932
+[READ], AverageLatency(us), 572.9028565002969
+[READ], MinLatency(us), 152
+[READ], MaxLatency(us), 45343
+[READ], 50thPercentileLatency(us), 503
+[READ], 95thPercentileLatency(us), 800
+[READ], 99thPercentileLatency(us), 2939
+[READ], 99.9PercentileLatency(us), 6183
+[READ], 99.99PercentileLatency(us), 11487
+[READ], Return=OK, 2498932
+[CLEANUP], Operations, 256
+[CLEANUP], AverageLatency(us), 45.546875
+[CLEANUP], MinLatency(us), 15
+[CLEANUP], MaxLatency(us), 748
+[CLEANUP], 50thPercentileLatency(us), 30
+[CLEANUP], 95thPercentileLatency(us), 112
+[CLEANUP], 99thPercentileLatency(us), 142
+[CLEANUP], 99.9PercentileLatency(us), 748
+[CLEANUP], 99.99PercentileLatency(us), 748
+[UPDATE], Operations, 2501068
+[UPDATE], AverageLatency(us), 588.9528857272173
+[UPDATE], MinLatency(us), 178
+[UPDATE], MaxLatency(us), 47743
+[UPDATE], 50thPercentileLatency(us), 514
+[UPDATE], 95thPercentileLatency(us), 838
+[UPDATE], 99thPercentileLatency(us), 2993
+[UPDATE], 99.9PercentileLatency(us), 6199
+[UPDATE], 99.99PercentileLatency(us), 11671
+[UPDATE], Return=OK, 2501068
+[Intended-READ], Operations, 2498932
+[Intended-READ], AverageLatency(us), 572.9376117477386
+[Intended-READ], MinLatency(us), 152
+[Intended-READ], MaxLatency(us), 45343
+[Intended-READ], 50thPercentileLatency(us), 503
+[Intended-READ], 95thPercentileLatency(us), 800
+[Intended-READ], 99thPercentileLatency(us), 2939
+[Intended-READ], 99.9PercentileLatency(us), 6183
+[Intended-READ], 99.99PercentileLatency(us), 11487
+[Intended-CLEANUP], Operations, 256
+[Intended-CLEANUP], AverageLatency(us), 46.046875
+[Intended-CLEANUP], MinLatency(us), 15
+[Intended-CLEANUP], MaxLatency(us), 749
+[Intended-CLEANUP], 50thPercentileLatency(us), 32
+[Intended-CLEANUP], 95thPercentileLatency(us), 113
+[Intended-CLEANUP], 99thPercentileLatency(us), 142
+[Intended-CLEANUP], 99.9PercentileLatency(us), 749
+[Intended-CLEANUP], 99.99PercentileLatency(us), 749
+[Intended-UPDATE], Operations, 2501068
+[Intended-UPDATE], AverageLatency(us), 588.9879051669127
+[Intended-UPDATE], MinLatency(us), 178
+[Intended-UPDATE], MaxLatency(us), 47743
+[Intended-UPDATE], 50thPercentileLatency(us), 514
+[Intended-UPDATE], 95thPercentileLatency(us), 838
+[Intended-UPDATE], 99thPercentileLatency(us), 2993
+[Intended-UPDATE], 99.9PercentileLatency(us), 6199
+[Intended-UPDATE], 99.99PercentileLatency(us), 11671

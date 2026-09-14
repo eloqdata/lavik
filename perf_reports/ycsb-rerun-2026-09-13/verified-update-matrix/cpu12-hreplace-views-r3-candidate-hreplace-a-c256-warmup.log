@@ -1,0 +1,79 @@
+java -cp /mnt/dev/YCSB-hreplace-dist/redis-binding/conf:/mnt/dev/YCSB-hreplace-dist/conf:/mnt/dev/YCSB-hreplace-dist/lib/htrace-core4-4.1.0-incubating.jar:/mnt/dev/YCSB-hreplace-dist/lib/slf4j-api-1.7.25.jar:/mnt/dev/YCSB-hreplace-dist/lib/jackson-mapper-asl-1.9.4.jar:/mnt/dev/YCSB-hreplace-dist/lib/HdrHistogram-2.1.12.jar:/mnt/dev/YCSB-hreplace-dist/lib/jackson-core-asl-1.9.4.jar:/mnt/dev/YCSB-hreplace-dist/lib/jedis-3.9.0.jar:/mnt/dev/YCSB-hreplace-dist/lib/core-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-hreplace-dist/lib/commons-pool2-2.11.1.jar:/mnt/dev/YCSB-hreplace-dist/lib/redis-binding-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.RedisClient -s -threads 256 -P /mnt/dev/YCSB-hreplace-dist/workloads/workloada -p recordcount=100000000 -p operationcount=1000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.5 -p updateproportion=0.5 -p insertproportion=0 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=both -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p redis.host=172.16.0.4 -p redis.port=16379 -p redis.scanindex=none -p redis.timeout=10000 -p redis.cluster=false -p redis.updatecommand=keylane.hreplace -t
+Command line: -db site.ycsb.db.RedisClient -s -threads 256 -P /mnt/dev/YCSB-hreplace-dist/workloads/workloada -p recordcount=100000000 -p operationcount=1000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.5 -p updateproportion=0.5 -p insertproportion=0 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=both -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p redis.host=172.16.0.4 -p redis.port=16379 -p redis.scanindex=none -p redis.timeout=10000 -p redis.cluster=false -p redis.updatecommand=keylane.hreplace -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
+SLF4J: Defaulting to no-operation (NOP) logger implementation
+SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
+2026-09-13 16:35:06:509 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-09-13 16:35:08:908 2 sec: 1000000 operations; 405679.51 current ops/sec; [READ: Count=500413, Max=27311, Min=215, Avg=622.7, 50=509, 90=757, 99=3453, 99.9=7027, 99.99=17839] [CLEANUP: Count=256, Max=869, Min=12, Avg=35.4, 50=24, 90=60, 99=147, 99.9=869, 99.99=869] [UPDATE: Count=499587, Max=30223, Min=160, Avg=479.09, 50=383, 90=609, 99=2577, 99.9=6235, 99.99=18399] [Intended-READ: Count=500413, Max=27311, Min=215, Avg=622.74, 50=509, 90=757, 99=3453, 99.9=7027, 99.99=17839] [Intended-CLEANUP: Count=256, Max=871, Min=12, Avg=35.85, 50=24, 90=60, 99=149, 99.9=871, 99.99=871] [Intended-UPDATE: Count=499587, Max=30223, Min=160, Avg=479.12, 50=383, 90=609, 99=2577, 99.9=6235, 99.99=18399] 
+[OVERALL], RunTime(ms), 2466
+[OVERALL], Throughput(ops/sec), 405515.00405515
+[TOTAL_GCS_G1_Young_Generation], Count, 20
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 30
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 1.2165450121654502
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 20
+[TOTAL_GC_TIME], Time(ms), 30
+[TOTAL_GC_TIME_%], Time(%), 1.2165450121654502
+[READ], Operations, 500413
+[READ], AverageLatency(us), 622.6984790562994
+[READ], MinLatency(us), 215
+[READ], MaxLatency(us), 27311
+[READ], 50thPercentileLatency(us), 509
+[READ], 95thPercentileLatency(us), 1120
+[READ], 99thPercentileLatency(us), 3453
+[READ], 99.9PercentileLatency(us), 7027
+[READ], 99.99PercentileLatency(us), 17839
+[READ], Return=OK, 500413
+[CLEANUP], Operations, 256
+[CLEANUP], AverageLatency(us), 35.40234375
+[CLEANUP], MinLatency(us), 12
+[CLEANUP], MaxLatency(us), 869
+[CLEANUP], 50thPercentileLatency(us), 24
+[CLEANUP], 95thPercentileLatency(us), 77
+[CLEANUP], 99thPercentileLatency(us), 147
+[CLEANUP], 99.9PercentileLatency(us), 869
+[CLEANUP], 99.99PercentileLatency(us), 869
+[UPDATE], Operations, 499587
+[UPDATE], AverageLatency(us), 479.08580287317324
+[UPDATE], MinLatency(us), 160
+[UPDATE], MaxLatency(us), 30223
+[UPDATE], 50thPercentileLatency(us), 383
+[UPDATE], 95thPercentileLatency(us), 965
+[UPDATE], 99thPercentileLatency(us), 2577
+[UPDATE], 99.9PercentileLatency(us), 6235
+[UPDATE], 99.99PercentileLatency(us), 18399
+[UPDATE], Return=OK, 499587
+[Intended-READ], Operations, 500413
+[Intended-READ], AverageLatency(us), 622.7390595368225
+[Intended-READ], MinLatency(us), 215
+[Intended-READ], MaxLatency(us), 27311
+[Intended-READ], 50thPercentileLatency(us), 509
+[Intended-READ], 95thPercentileLatency(us), 1120
+[Intended-READ], 99thPercentileLatency(us), 3453
+[Intended-READ], 99.9PercentileLatency(us), 7027
+[Intended-READ], 99.99PercentileLatency(us), 17839
+[Intended-CLEANUP], Operations, 256
+[Intended-CLEANUP], AverageLatency(us), 35.8515625
+[Intended-CLEANUP], MinLatency(us), 12
+[Intended-CLEANUP], MaxLatency(us), 871
+[Intended-CLEANUP], 50thPercentileLatency(us), 24
+[Intended-CLEANUP], 95thPercentileLatency(us), 78
+[Intended-CLEANUP], 99thPercentileLatency(us), 149
+[Intended-CLEANUP], 99.9PercentileLatency(us), 871
+[Intended-CLEANUP], 99.99PercentileLatency(us), 871
+[Intended-UPDATE], Operations, 499587
+[Intended-UPDATE], AverageLatency(us), 479.12361810855765
+[Intended-UPDATE], MinLatency(us), 160
+[Intended-UPDATE], MaxLatency(us), 30223
+[Intended-UPDATE], 50thPercentileLatency(us), 383
+[Intended-UPDATE], 95thPercentileLatency(us), 965
+[Intended-UPDATE], 99thPercentileLatency(us), 2577
+[Intended-UPDATE], 99.9PercentileLatency(us), 6235
+[Intended-UPDATE], 99.99PercentileLatency(us), 18399

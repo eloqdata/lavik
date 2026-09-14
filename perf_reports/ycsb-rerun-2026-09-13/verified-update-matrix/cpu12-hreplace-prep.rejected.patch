@@ -1,0 +1,76 @@
+diff --git a/src/storage/engine/hash_tree.cpp b/src/storage/engine/hash_tree.cpp
+index 8409d5b..d5b57d2 100644
+--- a/src/storage/engine/hash_tree.cpp
++++ b/src/storage/engine/hash_tree.cpp
+@@ -4,6 +4,7 @@
+ #include <random>
+ #include <set>
+ 
++#include "absl/container/inlined_vector.h"
+ #include "impl.h"
+ #include "keylane/glob.h"
+ #include "keylane/memory.h"
+@@ -64,6 +65,35 @@ bool NeedsGroupedHash(const HashValue& value) {
+   return false;
+ }
+ 
++void PrepareReplacementHash(const HashOperation& operation, HashValue& value) {
++  // Sort request positions, not owned values: duplicate fields use the last
++  // argument in O(n log n), without loading the old Hash. Inline scratch avoids
++  // an allocation for small replacements; larger requests use the same sort.
++  // Keep this synchronous preparation out of the coroutine's persistent state:
++  // no ordering scratch or borrowed argument survives an await.
++  absl::InlinedVector<std::size_t, 16> order(operation.fields_.size());
++  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
++  std::sort(order.begin(), order.end(), [&](auto a, auto b) {
++    return operation.fields_[a] == operation.fields_[b]
++               ? a < b
++               : operation.fields_[a] < operation.fields_[b];
++  });
++  value.entries_.reserve(order.size());
++  for (std::size_t i = 0; i < order.size(); ++i) {
++    const auto position = order[i];
++    const auto field = operation.fields_[position];
++    if (i + 1 < order.size() && field == operation.fields_[order[i + 1]])
++      continue;
++    // Construct in the reserved slot to avoid moving temporary SSO strings.
++    // The caller owns this unpublished value and discards it on allocation
++    // failure, so a partially initialized entry cannot reach the live index.
++    auto& entry = value.entries_.emplace_back();
++    entry.digest_ = ComputeDigest(field);
++    entry.field_.assign(field);
++    entry.value_.assign(operation.values_[position]);
++  }
++}
++
+ absl::StatusOr<HashResult> ReadCompactHashResult(
+     std::string_view payload, HashOperationKind kind, std::uint64_t count) {
+   auto reader = HashValueReader::Open(payload);
+@@ -636,26 +666,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
+ 
+     switch (operation.kind_) {
+       case HashOperationKind::kReplaceOnly: {
+-        // Sort request positions, not owned values: duplicate fields use the
+-        // last argument, in O(n log n) without reading any old Hash payload.
+-        std::vector<std::size_t> order(operation.fields_.size());
+-        for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+-        std::sort(order.begin(), order.end(), [&](auto a, auto b) {
+-          return operation.fields_[a] == operation.fields_[b]
+-                     ? a < b
+-                     : operation.fields_[a] < operation.fields_[b];
+-        });
+-        compact.entries_.reserve(order.size());
+-        for (std::size_t i = 0; i < order.size(); ++i) {
+-          const auto position = order[i];
+-          const auto field = operation.fields_[position];
+-          if (i + 1 < order.size() && field == operation.fields_[order[i + 1]])
+-            continue;
+-          compact.entries_.push_back(
+-              HashEntry{.digest_ = ComputeDigest(field),
+-                        .field_ = std::string(field),
+-                        .value_ = std::string(operation.values_[position])});
+-        }
++        PrepareReplacementHash(operation, compact);
+         // Identical replacements still write and invalidate WATCH. Comparing
+         // old values would defeat the explicit read-free replacement contract.
+         result.changed_ = true;

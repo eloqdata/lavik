@@ -1,0 +1,123 @@
+{
+  "tests": 8,
+  "failures": 0,
+  "disabled": 0,
+  "errors": 0,
+  "timestamp": "2026-09-13T15:58:56Z",
+  "time": "5.009s",
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "HashReplaceE2e",
+      "tests": 7,
+      "failures": 0,
+      "disabled": 0,
+      "errors": 0,
+      "timestamp": "2026-09-13T15:58:56Z",
+      "time": "4.402s",
+      "testsuite": [
+        {
+          "name": "SemanticsTtlBinaryFieldsAndUnchangedStandardCommands",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 86,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:58:56Z",
+          "time": "0.205s",
+          "classname": "HashReplaceE2e"
+        },
+        {
+          "name": "InlineAndHeapScratchPreserveLastDuplicateAfterRecovery",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 119,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:58:56Z",
+          "time": "0.561s",
+          "classname": "HashReplaceE2e"
+        },
+        {
+          "name": "WatchExecAndLua",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 246,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:58:57Z",
+          "time": "0.213s",
+          "classname": "HashReplaceE2e"
+        },
+        {
+          "name": "GroupedReplacementDemotionExtentsAndColdRecovery",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 274,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:58:57Z",
+          "time": "1.022s",
+          "classname": "HashReplaceE2e"
+        },
+        {
+          "name": "AuxiliaryOomPreservesOldHashInsideExec",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 312,
+          "status": "RUN",
+          "result": "SKIPPED",
+          "timestamp": "2026-09-13T15:58:58Z",
+          "time": "0s",
+          "classname": "HashReplaceE2e",
+          "skipped": [
+            {
+              "message": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp:314\nrequires Debug\/fault server\n"
+            }
+          ]
+        },
+        {
+          "name": "NativeReplicationPreservesReplacementAndAbsoluteTtl",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 347,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:58:58Z",
+          "time": "2.399s",
+          "classname": "HashReplaceE2e"
+        },
+        {
+          "name": "ColdReplacementDoesNotLoadOldPayload",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 767,
+          "status": "RUN",
+          "result": "SKIPPED",
+          "timestamp": "2026-09-13T15:59:00Z",
+          "time": "0s",
+          "classname": "HashReplaceE2e",
+          "skipped": [
+            {
+              "message": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp:769\nrequires payload read fault hook\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "HashReadOwnershipE2e",
+      "tests": 1,
+      "failures": 0,
+      "disabled": 0,
+      "errors": 0,
+      "timestamp": "2026-09-13T15:59:00Z",
+      "time": "0.606s",
+      "testsuite": [
+        {
+          "name": "FullReadsPreserveCompactAndGroupedValues",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 159,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:59:00Z",
+          "time": "0.606s",
+          "classname": "HashReadOwnershipE2e"
+        }
+      ]
+    }
+  ]
+}

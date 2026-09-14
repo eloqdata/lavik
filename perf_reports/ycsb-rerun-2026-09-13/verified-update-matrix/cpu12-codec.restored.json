@@ -1,0 +1,97 @@
+{
+  "pid": 81189,
+  "cgroup": "0::/keylane.slice/keylane-bench.slice/keylane-ycsb-cpu12.service",
+  "affinities": {
+    "81189": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "81194": [
+      0
+    ],
+    "81195": [
+      1
+    ],
+    "81196": [
+      2
+    ],
+    "81197": [
+      3
+    ],
+    "81198": [
+      4
+    ],
+    "81199": [
+      5
+    ],
+    "81200": [
+      6
+    ],
+    "81201": [
+      7
+    ],
+    "81202": [
+      8
+    ],
+    "81203": [
+      9
+    ],
+    "81204": [
+      10
+    ],
+    "81205": [
+      11
+    ],
+    "81206": [
+      0
+    ],
+    "81207": [
+      9
+    ],
+    "81208": [
+      7
+    ],
+    "81209": [
+      4
+    ],
+    "81210": [
+      11
+    ],
+    "81211": [
+      8
+    ],
+    "81212": [
+      6
+    ],
+    "81213": [
+      2
+    ],
+    "81214": [
+      1
+    ],
+    "81215": [
+      5
+    ],
+    "81216": [
+      10
+    ],
+    "81217": [
+      3
+    ]
+  },
+  "defrag": "paused=0 max_active_per_device=8 block_sleep_ms=0 record_sleep_us=0 active_total=0 pending_total=0",
+  "dbsize": 100000000,
+  "keyspace": "# Keyspace\ndb0:keys=100000000",
+  "binary_sha256": "8ded8812356d872eabb05bcd0ff828dcf8185771c50ef1d3b566d5d48403ab1d",
+  "decision": "Restore baseline: candidate failed the read-performance guardrail"
+}

@@ -1,0 +1,104 @@
+{
+  "tests": 6,
+  "failures": 0,
+  "disabled": 0,
+  "errors": 0,
+  "timestamp": "2026-09-13T15:24:15Z",
+  "time": "4.14s",
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "HashReplaceE2e",
+      "tests": 1,
+      "failures": 0,
+      "disabled": 0,
+      "errors": 0,
+      "timestamp": "2026-09-13T15:24:15Z",
+      "time": "0.198s",
+      "testsuite": [
+        {
+          "name": "WatchExecAndLua",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 206,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:24:15Z",
+          "time": "0.198s",
+          "classname": "HashReplaceE2e"
+        }
+      ]
+    },
+    {
+      "name": "HashReadOwnershipE2e",
+      "tests": 1,
+      "failures": 0,
+      "disabled": 0,
+      "errors": 0,
+      "timestamp": "2026-09-13T15:24:15Z",
+      "time": "0.635s",
+      "testsuite": [
+        {
+          "name": "FullReadsPreserveCompactAndGroupedValues",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 119,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:24:15Z",
+          "time": "0.635s",
+          "classname": "HashReadOwnershipE2e"
+        }
+      ]
+    },
+    {
+      "name": "GroupedHashWriteE2e",
+      "tests": 4,
+      "failures": 0,
+      "disabled": 0,
+      "errors": 0,
+      "timestamp": "2026-09-13T15:24:16Z",
+      "time": "3.306s",
+      "testsuite": [
+        {
+          "name": "PromotionAndPointUpdateOnlyRewriteOneGroup",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 359,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:24:16Z",
+          "time": "1.262s",
+          "classname": "GroupedHashWriteE2e"
+        },
+        {
+          "name": "ConditionalIncrementDeleteAndNewIncarnation",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 393,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:24:17Z",
+          "time": "0.617s",
+          "classname": "GroupedHashWriteE2e"
+        },
+        {
+          "name": "OversizedFieldSplitsIntoExtentBackedLeaf",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 459,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:24:17Z",
+          "time": "0.781s",
+          "classname": "GroupedHashWriteE2e"
+        },
+        {
+          "name": "SetUsesSameGroupedLifecycleWithSetType",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_write_e2e_test.cpp",
+          "line": 482,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:24:18Z",
+          "time": "0.645s",
+          "classname": "GroupedHashWriteE2e"
+        }
+      ]
+    }
+  ]
+}

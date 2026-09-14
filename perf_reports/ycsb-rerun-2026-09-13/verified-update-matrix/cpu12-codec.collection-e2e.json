@@ -1,0 +1,53 @@
+{
+  "tests": 2,
+  "failures": 0,
+  "disabled": 0,
+  "errors": 0,
+  "timestamp": "2026-09-13T15:24:16Z",
+  "time": "2.227s",
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "HashE2eTest",
+      "tests": 1,
+      "failures": 0,
+      "disabled": 0,
+      "errors": 0,
+      "timestamp": "2026-09-13T15:24:16Z",
+      "time": "1.103s",
+      "testsuite": [
+        {
+          "name": "UpdatesTransactionsAndRecoversMonolithicValues",
+          "file": "\/mnt\/dev\/keylane\/tests\/list_e2e_test.cpp",
+          "line": 6473,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:24:16Z",
+          "time": "1.103s",
+          "classname": "HashE2eTest"
+        }
+      ]
+    },
+    {
+      "name": "SetE2eTest",
+      "tests": 1,
+      "failures": 0,
+      "disabled": 0,
+      "errors": 0,
+      "timestamp": "2026-09-13T15:24:17Z",
+      "time": "1.123s",
+      "testsuite": [
+        {
+          "name": "Redis72CommandsTransactionsAndRecovery",
+          "file": "\/mnt\/dev\/keylane\/tests\/list_e2e_test.cpp",
+          "line": 6684,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:24:17Z",
+          "time": "1.123s",
+          "classname": "SetE2eTest"
+        }
+      ]
+    }
+  ]
+}

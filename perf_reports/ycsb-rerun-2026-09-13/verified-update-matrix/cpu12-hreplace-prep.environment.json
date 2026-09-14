@@ -1,0 +1,34 @@
+{
+  "commit": "b3c55caa6dc4a79276044f1a3cec1636b881f7f8",
+  "source_diff": "diff --git a/src/storage/engine/hash_tree.cpp b/src/storage/engine/hash_tree.cpp\nindex 8409d5b..d5b57d2 100644\n--- a/src/storage/engine/hash_tree.cpp\n+++ b/src/storage/engine/hash_tree.cpp\n@@ -4,6 +4,7 @@\n #include <random>\n #include <set>\n \n+#include \"absl/container/inlined_vector.h\"\n #include \"impl.h\"\n #include \"keylane/glob.h\"\n #include \"keylane/memory.h\"\n@@ -64,6 +65,35 @@ bool NeedsGroupedHash(const HashValue& value) {\n   return false;\n }\n \n+void PrepareReplacementHash(const HashOperation& operation, HashValue& value) {\n+  // Sort request positions, not owned values: duplicate fields use the last\n+  // argument in O(n log n), without loading the old Hash. Inline scratch avoids\n+  // an allocation for small replacements; larger requests use the same sort.\n+  // Keep this synchronous preparation out of the coroutine's persistent state:\n+  // no ordering scratch or borrowed argument survives an await.\n+  absl::InlinedVector<std::size_t, 16> order(operation.fields_.size());\n+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;\n+  std::sort(order.begin(), order.end(), [&](auto a, auto b) {\n+    return operation.fields_[a] == operation.fields_[b]\n+               ? a < b\n+               : operation.fields_[a] < operation.fields_[b];\n+  });\n+  value.entries_.reserve(order.size());\n+  for (std::size_t i = 0; i < order.size(); ++i) {\n+    const auto position = order[i];\n+    const auto field = operation.fields_[position];\n+    if (i + 1 < order.size() && field == operation.fields_[order[i + 1]])\n+      continue;\n+    // Construct in the reserved slot to avoid moving temporary SSO strings.\n+    // The caller owns this unpublished value and discards it on allocation\n+    // failure, so a partially initialized entry cannot reach the live index.\n+    auto& entry = value.entries_.emplace_back();\n+    entry.digest_ = ComputeDigest(field);\n+    entry.field_.assign(field);\n+    entry.value_.assign(operation.values_[position]);\n+  }\n+}\n+\n absl::StatusOr<HashResult> ReadCompactHashResult(\n     std::string_view payload, HashOperationKind kind, std::uint64_t count) {\n   auto reader = HashValueReader::Open(payload);\n@@ -636,26 +666,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(\n \n     switch (operation.kind_) {\n       case HashOperationKind::kReplaceOnly: {\n-        // Sort request positions, not owned values: duplicate fields use the\n-        // last argument, in O(n log n) without reading any old Hash payload.\n-        std::vector<std::size_t> order(operation.fields_.size());\n-        for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;\n-        std::sort(order.begin(), order.end(), [&](auto a, auto b) {\n-          return operation.fields_[a] == operation.fields_[b]\n-                     ? a < b\n-                     : operation.fields_[a] < operation.fields_[b];\n-        });\n-        compact.entries_.reserve(order.size());\n-        for (std::size_t i = 0; i < order.size(); ++i) {\n-          const auto position = order[i];\n-          const auto field = operation.fields_[position];\n-          if (i + 1 < order.size() && field == operation.fields_[order[i + 1]])\n-            continue;\n-          compact.entries_.push_back(\n-              HashEntry{.digest_ = ComputeDigest(field),\n-                        .field_ = std::string(field),\n-                        .value_ = std::string(operation.values_[position])});\n-        }\n+        PrepareReplacementHash(operation, compact);\n         // Identical replacements still write and invalidate WATCH. Comparing\n         // old values would defeat the explicit read-free replacement contract.\n         result.changed_ = true;\n",
+  "variants": {
+    "baseline": {
+      "path": "/mnt/dev/keylane-perf-hreplace.Y97A2k/keylane-baseline",
+      "sha256": "8ded8812356d872eabb05bcd0ff828dcf8185771c50ef1d3b566d5d48403ab1d"
+    },
+    "candidate": {
+      "path": "/mnt/dev/keylane-perf-hreplace.Y97A2k/keylane-candidate",
+      "sha256": "e41c8c9259b6b036a69369dcc58f280d43128852eac1477639304cc00089bf65"
+    }
+  },
+  "rounds": 3,
+  "order": [
+    "baseline",
+    "candidate"
+  ],
+  "workloads": [
+    "C",
+    "A"
+  ],
+  "rates": [
+    100000,
+    0
+  ],
+  "counts": {
+    "warmup": 1000000,
+    "measured": 5000000
+  },
+  "mode": "hreplace",
+  "monitoring": "active\nactive\n",
+  "note": "Same 12+4 policy, no reload, no perf or compilation during scored runs"
+}

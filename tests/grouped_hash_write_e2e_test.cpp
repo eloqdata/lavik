@@ -116,6 +116,82 @@ TEST(HashReplaceE2e, SemanticsTtlBinaryFieldsAndUnchangedStandardCommands) {
   EXPECT_EQ(client.Command({"EXISTS", "hash"}).text_, "0");
 }
 
+TEST(HashReplaceE2e, DifferentRequestSizesPreserveLastDuplicateAfterRecovery) {
+  PrivateDisk disk;
+  std::map<std::string, std::map<std::string, std::string>> expected;
+  {
+    Server server(disk);
+    Client client(server.port());
+    // Cover different argument counts, including duplicate empty/binary fields
+    // and values that do and do not fit the string implementation's SSO buffer.
+    for (unsigned count : {1, 15, 16, 17, 65}) {
+      const auto key = "replace-" + std::to_string(count);
+      ASSERT_EQ(client.Command({"HSET", key, "old-field", "old"}).text_, "1");
+      std::vector<std::string> args{"KEYLANE.HREPLACE", key};
+      for (unsigned i = 0; i < count; ++i) {
+        std::string field = i % 3 == 0
+                                ? ""
+                                : std::string("f\0", 2) + std::to_string(i % 7);
+        std::string value = i % 4 == 0 ? "" : std::string(i * 3, 'v');
+        expected[key][field] = value;
+        args.push_back(std::move(field));
+        args.push_back(std::move(value));
+      }
+      ASSERT_EQ(client.Command(args).text_, "OK");
+      EXPECT_EQ(client.Command({"HLEN", key}).text_,
+                std::to_string(expected[key].size()));
+      EXPECT_EQ(client.Command({"HEXISTS", key, "old-field"}).text_, "0");
+      for (const auto& [field, value] : expected[key])
+        EXPECT_EQ(client.Command({"HGET", key, field}).text_, value);
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  for (const auto& [key, fields] : expected) {
+    EXPECT_EQ(client.Command({"HLEN", key}).text_, std::to_string(fields.size()));
+    EXPECT_EQ(client.Command({"HEXISTS", key, "old-field"}).text_, "0");
+    for (const auto& [field, value] : fields)
+      EXPECT_EQ(client.Command({"HGET", key, field}).text_, value);
+  }
+}
+
+TEST(HashReplaceE2e, PromotionUsesFinalDeduplicatedBytes) {
+  PrivateDisk disk;
+  constexpr std::size_t boundary =
+      kGroupedHashPromotionBytes - kHashValueHeaderBytes - 9;
+  {
+    Server server(disk);
+    Client client(server.port());
+    for (const std::size_t size : {boundary - 1, boundary, boundary + 1}) {
+      const auto key = "boundary-" + std::to_string(size);
+      ASSERT_EQ(client.Command({"HSET", key, "old", "old"}).text_, "1");
+      // Only the final duplicate participates in promotion. The overwritten
+      // large value must neither force grouping nor leak into the after-image.
+      ASSERT_EQ(client.Command({"KEYLANE.HREPLACE", key, "x",
+                                std::string(32 * 1024, 'd'), "x",
+                                std::string(size, 'v')}).text_, "OK");
+      EXPECT_EQ(client.Command({"HLEN", key}).text_, "1");
+      EXPECT_EQ(client.Command({"HGET", key, "x"}).text_, std::string(size, 'v'));
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  for (const std::size_t size : {boundary - 1, boundary, boundary + 1}) {
+    const auto key = "boundary-" + std::to_string(size);
+    EXPECT_EQ(disk.Auxiliaries(key).empty(), size < boundary);
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  for (const std::size_t size : {boundary - 1, boundary, boundary + 1}) {
+    const auto key = "boundary-" + std::to_string(size);
+    EXPECT_EQ(client.Command({"HLEN", key}).text_, "1");
+    EXPECT_EQ(client.Command({"HGET", key, "x"}).text_, std::string(size, 'v'));
+    EXPECT_EQ(client.Command({"HEXISTS", key, "old"}).text_, "0");
+  }
+}
+
 TEST(HashReadOwnershipE2e, FullReadsPreserveCompactAndGroupedValues) {
   PrivateDisk disk;
   std::map<std::string, std::map<std::string, std::string>> hashes;

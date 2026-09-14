@@ -1,0 +1,32 @@
+{
+  "tests": 1,
+  "failures": 0,
+  "disabled": 1,
+  "errors": 0,
+  "timestamp": "2026-09-13T15:24:14Z",
+  "time": "2.023s",
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "GroupedHashTest",
+      "tests": 1,
+      "failures": 0,
+      "disabled": 1,
+      "errors": 0,
+      "timestamp": "2026-09-13T15:24:14Z",
+      "time": "2.023s",
+      "testsuite": [
+        {
+          "name": "DISABLED_LargeLogicalValueRoundTripsBeyondRecordLimit",
+          "file": "\/mnt\/dev\/keylane\/tests\/grouped_hash_test.cpp",
+          "line": 506,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-09-13T15:24:14Z",
+          "time": "2.023s",
+          "classname": "GroupedHashTest"
+        }
+      ]
+    }
+  ]
+}

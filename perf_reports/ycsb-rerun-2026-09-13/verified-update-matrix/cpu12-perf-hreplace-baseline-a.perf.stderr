@@ -1,0 +1,2 @@
+[ perf record: Woken up 143706 times to write data ]
+[ perf record: Captured and wrote 212.711 MB /mnt/dev/keylane/perf_reports/ycsb-rerun-2026-09-13/verified-update-matrix/cpu12-perf-hreplace-baseline-a.perf.data (26407 samples) ]

@@ -98,6 +98,47 @@ TEST(GroupedHashTest, CompactPayloadHasAnExplicitLittleEndianHeader) {
   }
 }
 
+TEST(GroupedHashTest, CompactEncodingMatchesAppendReferenceAtUnalignedLengths) {
+  HashValue value;
+  for (const std::size_t length : {0, 1, 7, 15, 16, 127, 128, 255, 256, 65537}) {
+    auto& entry = value.entries_.emplace_back();
+    entry.field_.resize(length);
+    entry.value_.resize(length + 1);
+    for (std::size_t i = 0; i < entry.field_.size(); ++i)
+      entry.field_[i] = static_cast<char>(i);
+    for (std::size_t i = 0; i < entry.value_.size(); ++i)
+      entry.value_[i] = static_cast<char>(255 - i);
+  }
+  // Independent append-based reference checks every durable byte, including
+  // binary strings, multi-byte lengths, and headers starting at odd offsets.
+  // A round trip alone could miss matching encoder/decoder format mistakes.
+  std::size_t bytes = kHashValueHeaderBytes;
+  for (const auto& entry : value.entries_)
+    bytes += 8 + entry.field_.size() + entry.value_.size();
+  std::string reference;
+  auto append_integer = [&](std::uint64_t number, std::size_t width) {
+    for (std::size_t i = 0; i < width; ++i)
+      reference.push_back(static_cast<char>(number >> (8 * i)));
+  };
+  append_integer(kHashValueMagic, 8);
+  append_integer(kStorageFormatVersion, 4);
+  append_integer(kHashValueHeaderBytes, 4);
+  append_integer(value.entries_.size(), 4);
+  append_integer(0, 4);
+  append_integer(bytes, 8);
+  for (const auto& entry : value.entries_) {
+    append_integer(entry.field_.size(), 4);
+    append_integer(entry.value_.size(), 4);
+    reference.append(entry.field_);
+    reference.append(entry.value_);
+  }
+  auto encoded = EncodeHashValue(value);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  EXPECT_EQ(*encoded, reference);
+  EXPECT_EQ((*encoded)[encoded->size()], '\0');
+  EXPECT_FALSE(EncodeHashValue(HashValue{}).ok());
+}
+
 TEST(GroupedHashTest, CompactReaderPreservesBinaryViewsAndCopiedPosition) {
   auto value = Value(3);
   value.entries_[0].field_ = std::string("a\0b", 3);
