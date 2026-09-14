@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -354,12 +355,13 @@ class FollowOwnerSource {
  public:
   FollowOwnerSource(std::string source_node_id, std::string source_boot_id,
                     std::string source_history_id, std::string group_token,
-                    bool export_ready)
+                    bool export_ready, std::string flow_mode = "FULL")
       : source_node_id_(std::move(source_node_id)),
         source_boot_id_(std::move(source_boot_id)),
         source_history_id_(std::move(source_history_id)),
         group_token_(std::move(group_token)),
-        export_ready_(export_ready) {
+        export_ready_(export_ready),
+        flow_mode_(std::move(flow_mode)) {
     listener_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listener_ < 0) {
       error_.store(errno == 0 ? EIO : errno, std::memory_order_release);
@@ -395,14 +397,18 @@ class FollowOwnerSource {
 
   ~FollowOwnerSource() {
     thread_.request_stop();
+    if (listener_ >= 0) (void)::shutdown(listener_, SHUT_RDWR);
+    if (thread_.joinable()) thread_.join();
     {
       std::lock_guard lock(connections_mutex_);
       for (int connection : connections_) {
         (void)::shutdown(connection, SHUT_RDWR);
       }
     }
-    if (listener_ >= 0) (void)::shutdown(listener_, SHUT_RDWR);
-    if (thread_.joinable()) thread_.join();
+    for (std::jthread& handler : handlers_) handler.request_stop();
+    for (std::jthread& handler : handlers_) {
+      if (handler.joinable()) handler.join();
+    }
     if (listener_ >= 0) (void)::close(listener_);
   }
 
@@ -418,6 +424,12 @@ class FollowOwnerSource {
   }
   bool saw_follow_scope() const noexcept {
     return saw_follow_scope_.load(std::memory_order_acquire);
+  }
+  bool saw_resume_proof() const noexcept {
+    return saw_resume_proof_.load(std::memory_order_acquire);
+  }
+  bool sent_continue() const noexcept {
+    return sent_continue_.load(std::memory_order_acquire);
   }
   int error() const noexcept { return error_.load(std::memory_order_acquire); }
 
@@ -453,14 +465,16 @@ class FollowOwnerSource {
         std::lock_guard lock(connections_mutex_);
         connections_.push_back(connection);
       }
-      HandleConnection(connection, stop);
-      {
-        std::lock_guard lock(connections_mutex_);
-        const auto found =
-            std::find(connections_.begin(), connections_.end(), connection);
-        if (found != connections_.end()) connections_.erase(found);
-      }
-      (void)::close(connection);
+      handlers_.emplace_back([this, connection](std::stop_token handler_stop) {
+        HandleConnection(connection, handler_stop);
+        {
+          std::lock_guard lock(connections_mutex_);
+          const auto found =
+              std::find(connections_.begin(), connections_.end(), connection);
+          if (found != connections_.end()) connections_.erase(found);
+        }
+        (void)::close(connection);
+      });
     }
   }
 
@@ -501,9 +515,16 @@ class FollowOwnerSource {
           controls_.fetch_add(1, std::memory_order_acq_rel);
         } else if (request.find("KLFLOW") != std::string::npos) {
           flows_.fetch_add(1, std::memory_order_acq_rel);
-          const std::string response = "+KLFLOW 1 0 FULL\r\n";
-          (void)::send(connection, response.data(), response.size(),
-                       MSG_NOSIGNAL);
+          const std::string response = "+KLFLOW 1 0 " + flow_mode_ + "\r\n";
+          const ssize_t sent = ::send(connection, response.data(),
+                                      response.size(), MSG_NOSIGNAL);
+          if (sent != static_cast<ssize_t>(response.size())) {
+            error_.store(errno == 0 ? EIO : errno, std::memory_order_release);
+            return;
+          }
+          if (flow_mode_ == "CONTINUE") {
+            sent_continue_.store(true, std::memory_order_release);
+          }
           replied = true;
         }
       }
@@ -511,6 +532,10 @@ class FollowOwnerSource {
       constexpr std::string_view kFollow = "$6\r\nFOLLOW\r\n";
       if (request.find(kFollow) == std::string::npos) continue;
       saw_follow_scope_.store(true, std::memory_order_release);
+      if (request.find(RespBulk(group_token_)) != std::string::npos &&
+          request.find(RespBulk(source_history_id_)) != std::string::npos) {
+        saw_resume_proof_.store(true, std::memory_order_release);
+      }
       const std::string response = "+KLFULLRESYNC 1 " + source_node_id_ + " " +
                                    group_token_ + " " + source_boot_id_ + " " +
                                    source_history_id_ + " 1 " +
@@ -532,13 +557,17 @@ class FollowOwnerSource {
   std::string source_history_id_;
   std::string group_token_;
   bool export_ready_ = false;
+  std::string flow_mode_;
   std::jthread thread_;
+  std::vector<std::jthread> handlers_;
   std::mutex connections_mutex_;
   std::vector<int> connections_;
   std::atomic<unsigned> controls_{0};
   std::atomic<unsigned> flows_{0};
   std::atomic<unsigned> closed_{0};
   std::atomic<bool> saw_follow_scope_{false};
+  std::atomic<bool> saw_resume_proof_{false};
+  std::atomic<bool> sent_continue_{false};
   std::atomic<int> error_{0};
 };
 
@@ -1824,6 +1853,7 @@ enum class PreparedActionDisposition {
   kRemove,
   kReplace,
   kRemoveWhilePreparing,
+  kRemoveWhilePreparingThenResumeFollow,
   kReplaceWhilePreparing,
   kRemoveAfterDurabilityBoundary,
   kRemoveAfterDurabilityBoundaryWithPublicationFailure,
@@ -1842,12 +1872,14 @@ class FailoverActionReconcileService final : public celer::Service {
       keylane::ReplicationManager* replication, bool expect_watchdog = false,
       PreparedActionDisposition disposition =
           PreparedActionDisposition::kRetainForActivation,
-      PromotionFaultBarrierPaths fault_barriers = {})
+      PromotionFaultBarrierPaths fault_barriers = {},
+      FollowOwnerSource* continuation_source = nullptr)
       : storage_(storage),
         replication_(replication),
         expect_watchdog_(expect_watchdog),
         disposition_(disposition),
-        fault_barriers_(std::move(fault_barriers)) {}
+        fault_barriers_(std::move(fault_barriers)),
+        continuation_source_(continuation_source) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) {
@@ -1991,6 +2023,8 @@ class FailoverActionReconcileService final : public celer::Service {
     const bool remove_while_preparing =
         disposition_ == PreparedActionDisposition::kRemoveWhilePreparing ||
         disposition_ ==
+            PreparedActionDisposition::kRemoveWhilePreparingThenResumeFollow ||
+        disposition_ ==
             PreparedActionDisposition::kRemoveAfterDurabilityBoundary ||
         disposition_ ==
             PreparedActionDisposition::
@@ -2079,6 +2113,66 @@ class FailoverActionReconcileService final : public celer::Service {
       }
       if (remove_after_durability) {
         co_return absl::OkStatus();
+      }
+
+      if (continuation_source_ != nullptr) {
+        keylane::DesiredClusterUpstream follow{
+            .group_id_ = action.group_id_,
+            .group_term_ = action.domain_.source_group_term_,
+            .local_node_id_ = action.candidate_node_id_,
+            .local_assignment_id_ = action.candidate_assignment_id_,
+            .local_boot_id_ = action.candidate_boot_id_,
+            .owner_node_id_ = action.domain_.source_node_id_,
+            .owner_assignment_id_ = action.domain_.source_assignment_id_,
+            .owner_endpoint_ =
+                keylane::ReplicaOfConfig{"127.0.0.1",
+                                         continuation_source_->port()},
+            .manifest_revision_ = action.manifest_revision_,
+            .manifest_id_ = action.manifest_id_,
+            .partition_replication_epoch_ = action.partition_replication_epoch_,
+            .members_ =
+                {
+                    {action.candidate_node_id_,
+                     action.candidate_assignment_id_},
+                    {action.domain_.source_node_id_,
+                     action.domain_.source_assignment_id_},
+                },
+        };
+        reconciled = co_await replication_->ReconcileClusterFollowOwner(follow);
+        if (!reconciled.ok()) co_return reconciled;
+        const auto follow_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while ((!continuation_source_->saw_resume_proof() ||
+                !continuation_source_->sent_continue()) &&
+               std::chrono::steady_clock::now() < follow_deadline) {
+          absl::Status waited = co_await celer::SleepFor(
+              *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+          if (!waited.ok()) co_return waited;
+        }
+        if (!continuation_source_->saw_resume_proof() ||
+            !continuation_source_->sent_continue()) {
+          co_return TestFailure(
+              "cancelled replica Candidate did not enter FollowOwner "
+              "CONTINUE from its retained proof");
+        }
+        const keylane::ClusterPopulationStatus retained =
+            co_await replication_->cluster_population_status();
+        if (retained.state_ != keylane::ReplicationGroupState::kReady ||
+            !retained.ready_token_.has_value()) {
+          co_return TestFailure(
+              "matching FollowOwner replaced the cancelled Candidate's "
+              "Ready population");
+        }
+        auto continued_write = co_await storage_->Set(
+            0, "cancelled-candidate-continue", "applied");
+        if (!continued_write.ok()) {
+          co_return TestFailure(absl::StrCat(
+              "cancelled Candidate retained a destructive FULL write fence: ",
+              continued_write.status().ToString()));
+        }
+        reconciled =
+            co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
+        if (!reconciled.ok()) co_return reconciled;
       }
 
       // Before durability mutation, supersession is a local cancellation
@@ -2452,6 +2546,7 @@ class FailoverActionReconcileService final : public celer::Service {
   PreparedActionDisposition disposition_ =
       PreparedActionDisposition::kRetainForActivation;
   PromotionFaultBarrierPaths fault_barriers_;
+  FollowOwnerSource* continuation_source_ = nullptr;
   absl::Status result_ = absl::OkStatus();
 };
 
@@ -3650,7 +3745,9 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
   const bool replace_while_preparing =
       disposition == PreparedActionDisposition::kReplaceWhilePreparing;
   const bool remove_while_preparing =
-      disposition == PreparedActionDisposition::kRemoveWhilePreparing;
+      disposition == PreparedActionDisposition::kRemoveWhilePreparing ||
+      disposition ==
+          PreparedActionDisposition::kRemoveWhilePreparingThenResumeFollow;
   const bool remove_after_durability =
       disposition ==
           PreparedActionDisposition::kRemoveAfterDurabilityBoundary ||
@@ -3758,9 +3855,19 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
   keylane::InitStorage(&storage, &replication);
   EnsureTxRuntime();
 
-  FailoverActionReconcileService service(&storage, &replication,
-                                         /*expect_watchdog=*/false, disposition,
-                                         std::move(fault_barriers));
+  std::unique_ptr<FollowOwnerSource> continuation_source;
+  if (disposition ==
+      PreparedActionDisposition::kRemoveWhilePreparingThenResumeFollow) {
+    continuation_source = std::make_unique<FollowOwnerSource>(
+        std::string(40, 'a'), std::string(40, 'b'), std::string(40, 'c'),
+        HexString(std::string(40, 'd')), /*export_ready=*/true, "CONTINUE");
+    ASSERT_NE(continuation_source->port(), 0);
+    ASSERT_EQ(continuation_source->error(), 0)
+        << std::strerror(continuation_source->error());
+  }
+  FailoverActionReconcileService service(
+      &storage, &replication, /*expect_watchdog=*/false, disposition,
+      std::move(fault_barriers), continuation_source.get());
   celer::Server server;
   server.AddService(&service);
   celer::ServerOptions runtime;
@@ -3796,6 +3903,13 @@ TEST(ReplicationManagerIntegrationTest,
   RunFailoverActionDispositionCase(
       PreparedActionDisposition::kRemoveWhilePreparing,
       "cluster-failover-inflight-remove");
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     CancelledReplicaCandidateCanResumeFollowOwnerContinuation) {
+  RunFailoverActionDispositionCase(
+      PreparedActionDisposition::kRemoveWhilePreparingThenResumeFollow,
+      "cluster-failover-inflight-cancel-follow");
 }
 
 TEST(ReplicationManagerIntegrationTest,

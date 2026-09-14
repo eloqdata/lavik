@@ -3965,6 +3965,7 @@ class ReplicationManager::ReplicationGroup {
       applied_frontier_ = std::move(frontier);
       upstream_node_id_ = directive.identity_.source_node_id_;
       upstream_history_id_ = directive.parent_history_id_;
+      group_id_ = PopulationGroupToken(directive.identity_.group_id_);
       source_worker_count_ = directive.required_applied_next_lsns_.size();
       native_dataset_valid_.store(true, std::memory_order_release);
     }
@@ -4028,9 +4029,18 @@ class ReplicationManager::ReplicationGroup {
         if (native_population && !cluster_control_stopping_ &&
             !failed_stopped_.load(std::memory_order_relaxed)) {
           StoreRole(ReplicationRole::kMaster, std::memory_order_release);
-          if (!storage_->ReplicaRecoveryFenced()) {
-            storage_->SetReplicaLoading(false);
-          }
+        } else if (!native_population && !cluster_control_stopping_ &&
+                   !failed_stopped_.load(std::memory_order_relaxed)) {
+          StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
+        }
+        // Both native and replica Candidates retain their proven population
+        // when preparation is cancelled before durability. The next
+        // FollowOwner may therefore resume with CONTINUE, whose ordinary
+        // command applies do not install a destructive FULL write context.
+        if (!cluster_control_stopping_ &&
+            !failed_stopped_.load(std::memory_order_relaxed) &&
+            !storage_->ReplicaRecoveryFenced()) {
+          storage_->SetReplicaLoading(false);
         }
       }
       context->completion_->Resolve(cancelled);
@@ -11146,6 +11156,14 @@ class ReplicationManager::ReplicationGroup {
                 session->cluster_rebuild_->state_.store(
                     ReplicationGroupState::kReady, std::memory_order_release);
                 native_dataset_valid_.store(true, std::memory_order_release);
+                if (session->cluster_follow_ != nullptr) {
+                  // A backlog-gap latch is needed only until one fresh FULL
+                  // publishes a complete replacement population. Clearing it
+                  // here, rather than at admission, keeps retries destructive
+                  // until success while allowing later reconnects to resume.
+                  session->cluster_follow_->force_full_.store(
+                      false, std::memory_order_release);
+                }
               } else {
                 const absl::Status replaced = absl::CancelledError(
                     "cluster readiness completed after session supersession");
