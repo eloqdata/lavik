@@ -1,10 +1,6 @@
 # Issue #41 Failover Transition 实施计划
 
-> 状态：本地实施计划 v3，2026-09-14；已纳入实现前设计复核和实施中安全审计结论。
->
-> 实现分支：`codex/issue-41-failover-transition`，基线
-> `646460ac53be4a618a160dcde0ee1dcdd76bdd34`（`origin/main`，已包含 #40
-> 和原子 Cluster Create）。
+> 状态：实施计划 v3，2026-09-14；已纳入实现前设计复核和实施中安全审计结论。
 >
 > 关联 issue：[#41](https://github.com/thweetkomputer/keylane/issues/41)、
 > [#42](https://github.com/thweetkomputer/keylane/issues/42)、
@@ -37,27 +33,13 @@
 - standalone cleanup/rebuild operation；
 - mixed-version schema negotiation。
 
-## 2. 已验证基线和分支策略
+## 2. 实施策略
 
-- 当前分支从 `origin/main` 新建，并在实施前按要求 rebase 到 `646460a`；旧分支
-  `codex/issue-41-controlled-failover` 原样保留，不能整体合并或 rebase 到实现分支。
-- Debug 构建目录位于
-  `/mnt/local_nvme/keylane-issue41-redesign/build-debug`。
-- 基线与最终树都使用同一组 unit、Meta、process-support、population、
-  ReplicationManager、serving-generation、rebuild-failure 和 rebuild-protocol
-  目标；最终精确结果记录在 PR，而不是用本计划替代验证日志。
-- `keylane_cluster_replication_manager_integration_test` 已在 NVMe build 中完整编译；
-  它的现有 fixture 已验证会忽略 `TMPDIR` 并硬编码 `/tmp`，因此未将中断的
-  运行计为 baseline。W0 先对 test-support temp-root 做无行为变更的机械性修正，
-  再在 NVMe 上运行并记录 ReplicationManager/population/process-support baseline，
-  然后才改 failover 行为。
-- 后续 build、test workdir、日志和进程数据全部放在
-  `/mnt/local_nvme/keylane-issue41-redesign/`；所有测试命令显式设置
-  `TMPDIR=/mnt/local_nvme/keylane-issue41-redesign/tmp` 和
-  `KEYLANE_TEST_TMPDIR=/mnt/local_nvme/keylane-issue41-redesign/tmp`。W0 的六个
-  helper-based targets 未新建 `/tmp/keylane-*` 产物。
+实现以已经包含 #40 和原子 Cluster Create 的当前 `main` 为基线，先固定相同的
+unit、Meta、process-support、population、ReplicationManager、serving-generation、
+rebuild-failure 和 rebuild-protocol 验证集合；最终精确结果记录在 PR。
 
-旧分支只按函数级 diff 选择性移植：
+现有实现只复用以下行为边界和底层机制，不复用另一套 durable workflow：
 
 - Cluster prepared promotion 的严格 activation 校验；
 - finite lease 对 active-expiration/frontier-mutating storage authority 的约束；
@@ -66,7 +48,7 @@
 - FDS replacement 中旧 action admission/join barrier；
 - 相应的 race/fault 测试场景。
 
-以下旧设计不得移植：
+以下设计不进入本期实现：
 
 - `MetaFailoverRecoveryStore` 和第八个 snapshot store；
 - committed phase、frontier、proof、recovery generation；
@@ -76,11 +58,9 @@
 - serving/rebuild/cleanup phase；
 - 给通用 `BeginGroupTerm` 或 `ActivateAuthority` 增加 failover-operation coupling。
 
-实施中确认了一个独立的 Meta session 生命周期前提：外部 shutdown/demotion 可以在
-session coroutine 恢复前回收 Celer `Connection` storage。供应商指针因此更新到已包含
-storage-borrow primitive 的 `celer@f45d90c`；Admin/Data-control 各自用 frame-owned
-move-only token 同时持有 session 注册和 storage borrow，覆盖正常完成以及 `Spawn` 在首次
-resume 前拒绝 task。该修复不引入 failover durable state，也不带回旧分支的 workflow。
+验证按后续 TDD seam 分片推进：每个切片先固定失败测试，再实现最小纵向闭环，最后
+执行全量构建、测试、格式和文档一致性检查。实现期间发现的机器环境、临时路径、
+单次调查和会话交接信息仅记录在 issue 或 PR，不进入本计划。
 
 ## 3. 实现红线
 
@@ -627,7 +607,7 @@ enable/resume 机制，也不为 Controlled Pause 新增 pause API；失去 auth
 
 ### 10.3 Activation
 
-从旧分支选择性改写一个薄的 `ActivateClusterPreparedPromotion` adapter：
+在现有 promotion kernel 上增加一个薄的 `ActivateClusterPreparedPromotion` adapter：
 
 - FDS reconcile 只校验并 pin pending activation intent（Data boot、assignment、population、
   child history、durability token、grant `activation_action_id` 与 prepared action）；它不直接
@@ -804,20 +784,20 @@ Uncontrolled 没有总 deadline；没有 Candidate时保持 fenced transition无
 
 ## 12. 实施波次
 
-### W0：测试工作区和独立 baseline
+### W0：测试隔离和独立 baseline
 
 在任何 failover 行为改动前，先让相关 test-support helper 支持
 `KEYLANE_TEST_TMPDIR`（未设置时保留现有默认），并用 helper unit test 证明所有子目录
 位于指定 root。这个机械性切片不改产品行为。
 
-然后在 `/mnt/local_nvme/keylane-issue41-redesign/` 下完整运行并记录：
+然后用调用方提供的非根盘测试根目录完整运行并记录：
 
 - `keylane_cluster_replication_manager_integration_test`；
 - `keylane_cluster_population_integration_test`；
 - `keylane_process_support_tests`；
 - serving-generation/rebuild integration 中本期会受影响的现有 cases。
 
-出口：上述 baseline 全绿，运行时无新建 `/tmp/keylane-*` 产物；结果写回 §2。
+出口：上述 baseline 全绿，运行时没有绕过显式测试根目录；精确结果记录在 PR。
 
 ### W1：Committed foundation——candidate-null Uncontrolled tracer bullet
 
@@ -886,8 +866,8 @@ Meta 授权作为 volatile SourcePaused/frontier coverage 的 committed certific
 exact lease 先只进入 NodeControl 不可服务 provisional slot、activation + final recheck 后才
 `AuthorityGuard::RenewLease`、lease-before-FDS 后 matching FDS+fresh lease 的 liveness、
 Cluster activation 不会 unmatched
-`ResumeExpiration`、deadline-aware expiration authority 和 lease-expiry race RED；再改写旧分支
-可复用内核。
+`ResumeExpiration`、deadline-aware expiration authority 和 lease-expiry race RED；再复用
+现有 promotion 内核。
 
 出口：未授权永不 prepare，旧 action永不 activate，matching Cutover仅激活一次，failure
 在 bounded watchdog后报告且同 population不热循环。
@@ -979,10 +959,8 @@ label。
 - `docs/operations/meta-control-plane.md`；
 - 必要时 `docs/operations/README.md`。
 
-W9 建立 issue #41 acceptance criterion → unit/integration/process test 的逐条证据表。提交
-前显式 `git add` 本分支预期交付的新文档：`CONTEXT.md`、`docs/adr/` 和本
-implementation plan；Redis 行为调查保留在 issue/PR 上下文，不将一次性调查写入
-架构文档，也不将未跟踪状态当成“已在提交中”。
+W9 建立 issue #41 acceptance criterion → unit/integration/process test 的逐条证据表。
+Redis 行为调查保留在 issue/PR 上下文，不将一次性调查写入架构文档。
 
 ## 13. 文件级改动地图
 
@@ -1015,14 +993,9 @@ control mutation入口。
 6. 必要时简化刚改的代码，但不改变行为；
 7. 再进入下一条行为。
 
-统一环境：
-
-```bash
-mkdir -p /mnt/local_nvme/keylane-issue41-redesign/tmp
-export TMPDIR=/mnt/local_nvme/keylane-issue41-redesign/tmp
-export KEYLANE_TEST_TMPDIR=/mnt/local_nvme/keylane-issue41-redesign/tmp
-export KEYLANE_ISSUE41_BUILD=/mnt/local_nvme/keylane-issue41-redesign/build-debug
-```
+统一环境由测试调用方提供独立的 build root 和非根盘 temp root，并显式设置
+`TMPDIR`、`TEMP`、`TMP` 与 `KEYLANE_TEST_TMPDIR`。计划和测试代码都不固化某台机器的
+绝对路径。
 
 Targeted 目标：
 
@@ -1043,11 +1016,9 @@ cmake --build "$KEYLANE_ISSUE41_BUILD" --target keylane_cluster_replication_mana
 `keylane_process_support_tests`。W6 另外构建 `keylane_cluster_status_tests`、`keylane-ctl`，
 并运行 failover CLI/operator 精确测试。
 
-真实进程 gate 显式传入
-`/mnt/local_nvme/keylane-issue41-redesign/runs/<case>`，不依赖根盘默认临时目录。
-实现新测试前先审计它调用的 helper：仅设置 `TMPDIR` 不能覆盖硬编码 `/tmp`；若复用
-`tests/support` 中的硬编码临时目录，先让 helper 支持 `KEYLANE_TEST_TMPDIR`（保留默认
-行为）并增加 helper test。新增测试不得直接写 `/tmp`。
+真实进程 gate 显式传入 case-specific test root，不依赖系统默认临时目录。实现新测试前
+先审计它调用的 helper：若 helper 有固化临时路径，先让它支持
+`KEYLANE_TEST_TMPDIR`（保留默认行为）并增加 helper test。
 
 ## 15. 最终验证和 PR
 
@@ -1070,10 +1041,10 @@ cmake --build "$KEYLANE_ISSUE41_BUILD" --target keylane_cluster_replication_mana
 9. 最终一次完整验证保持全绿；
 10. 检查 architecture claims、public API comments、stale comments 和 issue acceptance
     criterion → test evidence checklist；
-11. 将预期交付的 untracked `CONTEXT.md`、`docs/adr/` 和 plan 文档纳入 diff，
-    再按逻辑切片整理 commit，push `codex/issue-41-failover-transition`；
+11. 确认 `CONTEXT.md`、`docs/adr/` 和 plan 等预期文档已纳入 diff，再按逻辑切片
+    整理 commit；
 12. 创建 PR，正文包含 `Closes #41`、`Supersedes #57`，明确 #42/#45/#46
-    out-of-scope、测试命令、loss语义、首版 availability gap和旧分支未整体复用的说明。
+    out-of-scope、测试命令、loss语义和首版 availability gap。
 
 ## 16. 主要风险及停止条件
 

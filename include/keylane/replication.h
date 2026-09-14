@@ -322,6 +322,9 @@ struct ClusterPromotionPrepared {
   bool operator==(const ClusterPromotionPrepared&) const = default;
 };
 
+// Boot-local proof that the exact transition action completed promotion
+// preparation. The opaque id/hash bind activation to the retained replication
+// resources without exposing their representation across NodeControl.
 struct ClusterFailoverPreparedContext {
   ClusterFailoverTransitionId transition_id_{};
   ClusterFailoverActionId action_id_{};
@@ -350,6 +353,9 @@ struct ClusterFailoverActivation {
   bool operator==(const ClusterFailoverActivation&) const = default;
 };
 
+// Observable lifecycle of the currently installed candidate action. States
+// are boot-local and level-triggered; replacing or removing the desired action
+// discards this progress instead of carrying it into the next attempt.
 enum class ClusterFailoverActionState : std::uint8_t {
   kNone,
   kWaitingForAuthorization,

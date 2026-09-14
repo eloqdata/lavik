@@ -67,19 +67,29 @@ struct PreparedGroupControlIdentity {
 
 struct FailoverTransitionIdTag;
 struct FailoverActionIdTag;
+// Opaque identities keep a durable transition distinct from each replaceable
+// candidate action while preserving the exact 128-bit Meta representation.
 using FailoverTransitionId = ControlId128<FailoverTransitionIdTag>;
 using FailoverActionId = ControlId128<FailoverActionIdTag>;
 
+// Execution semantics projected from the committed transition. Controlled
+// actions preserve the current Owner's authority until Cutover; Uncontrolled
+// actions run after that authority has been fenced.
 enum class PreparedFailoverMode : std::uint8_t {
   kControlled,
   kUncontrolled,
 };
 
+// Operator-visible durability guarantee attached to an authorized promotion.
+// Unknown permits recovery from the best available replica without asserting
+// that it contains every acknowledged write.
 enum class PreparedFailoverLoss : std::uint8_t {
   kNone,
   kUnknown,
 };
 
+// Exact process incarnation selected for promotion. All three identities must
+// still match before NodeControl may install or activate the action.
 struct PreparedFailoverCandidate {
   NodeId node_id_;
   AssignmentId assignment_id_;
@@ -89,6 +99,9 @@ struct PreparedFailoverCandidate {
                          const PreparedFailoverCandidate&) = default;
 };
 
+// Source lineage in which candidate progress is comparable. LSN vectors from
+// different domains must never be ranked against one another; flow_count also
+// fixes the vector shape expected by the promotion adapter.
 struct PreparedFailoverCompatibilityDomain {
   std::uint64_t source_group_term_ = 0;
   NodeId source_node_id_;
@@ -101,6 +114,8 @@ struct PreparedFailoverCompatibilityDomain {
                          const PreparedFailoverCompatibilityDomain&) = default;
 };
 
+// Revision-scoped permission to begin promotion preparation, including the
+// loss classification that a Cutover using this authorization must report.
 struct PreparedFailoverAuthorization {
   std::uint64_t authorized_revision_ = 0;
   PreparedFailoverLoss loss_if_cutover_ = PreparedFailoverLoss::kUnknown;
@@ -109,6 +124,9 @@ struct PreparedFailoverAuthorization {
                          const PreparedFailoverAuthorization&) = default;
 };
 
+// One replaceable candidate attempt within a durable transition. Absence of
+// authorization keeps the selected candidate inert while Meta gathers the
+// observations needed to authorize preparation.
 struct PreparedFailoverAction {
   FailoverActionId action_id_;
   PreparedFailoverCandidate candidate_;

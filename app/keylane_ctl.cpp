@@ -115,7 +115,7 @@ void PrintUsage(const char* program) {
       "Data, multi-Group topology and returns after its Genesis commit. Use\n"
       "cluster-status to follow creation and serving readiness. Options may\n"
       "precede\n"
-      "either local cluster command.\n"
+      "any local cluster command.\n"
       "Durability recovery uses: abortop ID, archiveoperations SEQ..., then\n"
       "exportoperations and pruneoperations SEQ....\n"
       "Exit status is 0 for an OK reply, 2 for an ERR reply, and 1 for a\n"
