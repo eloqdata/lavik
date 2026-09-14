@@ -21,6 +21,114 @@ using keylane::storage::ScanHashMapEntryArena;
 
 }  // namespace
 
+TEST(ScanHashMapTest, CandidatePredicateOnlySeesMatchingKeys) {
+  ScanHashMap<std::uint64_t> map;
+  unsigned calls = 0;
+  auto accept = [&](const auto&) {
+    ++calls;
+    return true;
+  };
+  EXPECT_EQ(map.FindCandidateIf(ComputeDigest("missing"), "missing", accept),
+            nullptr);
+  EXPECT_EQ(calls, 0);
+  auto* entry = map.InsertNew(ComputeDigest("present"), "present", 42);
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(map.FindCandidateIf(ComputeDigest("missing"), "missing", accept),
+            nullptr);
+  EXPECT_EQ(calls, 0);
+  EXPECT_EQ(map.FindCandidateIf(ComputeDigest("present"), "present", accept),
+            entry);
+  EXPECT_EQ(calls, 1);
+  EXPECT_EQ(map.FindCandidateIf(ComputeDigest("present"), "present",
+                               [](const auto&) { return false; }),
+            nullptr);
+  EXPECT_EQ(map.Find(ComputeDigest("present"), "present"), entry);
+}
+
+TEST(ScanHashMapTest, CandidatePredicateFiltersExternalIdentityAndStopsEarly) {
+  ScanHashMap<std::uint64_t> map;
+  ASSERT_TRUE(map.PreallocateForExpectedSize(576));
+  const Digest digest{7};
+  // External entries intentionally share the same in-memory digest/length.
+  // Their values stand in for independently verified physical identities.
+  for (std::uint64_t i = 0; i < 32; ++i) {
+    ASSERT_NE(map.InsertNew(digest, "external", i, false), nullptr);
+  }
+  ASSERT_NE(map.InsertNew(digest, "different-length", 100, false), nullptr);
+  auto candidates = map.FindCandidates(digest, "external");
+  ASSERT_EQ(candidates.size(), 32);
+  unsigned calls = 0;
+  EXPECT_EQ(map.FindCandidateIf(digest, "external", [&](const auto&) {
+              ++calls;
+              return true;
+            }),
+            candidates.front());
+  EXPECT_EQ(calls, 1);
+  calls = 0;
+  auto target = std::make_unique<std::uint64_t>(candidates[20]->value());
+  EXPECT_EQ(map.FindCandidateIf(
+                digest, "external",
+                [wanted = std::move(target), &calls](const auto& candidate) {
+                  ++calls;
+                  return candidate.value() == *wanted;
+                }),
+            candidates[20]);
+  EXPECT_EQ(calls, 21);
+  calls = 0;
+  EXPECT_EQ(map.FindCandidateIf(digest, "external", [&](const auto&) {
+              ++calls;
+              return false;
+            }),
+            nullptr);
+  EXPECT_EQ(calls, 32);
+}
+
+TEST(ScanHashMapTest, CandidatePredicateContinuesIntoRehashTable) {
+  ScanHashMap<std::uint64_t> map;
+  ASSERT_TRUE(map.PreallocateForExpectedSize(576));
+  std::uint64_t inserted = 0;
+  while (!map.rehashing() && inserted < 2048) {
+    ASSERT_NE(map.InsertNew(Digest{inserted}, "external", inserted, false),
+              nullptr);
+    ++inserted;
+  }
+  ASSERT_TRUE(map.rehashing());
+  ASSERT_GT(inserted, 63);
+  // Bucket 63 has not moved during the initial migration steps. Add a second
+  // candidate to the new table and reject the old-table candidate first.
+  auto* wanted = map.InsertNew(Digest{63}, "external", 9999, false);
+  ASSERT_NE(wanted, nullptr);
+  ASSERT_TRUE(map.rehashing());
+  std::vector<std::uint64_t> visited;
+  EXPECT_EQ(map.FindCandidateIf(Digest{63}, "external", [&](const auto& entry) {
+              visited.push_back(entry.value());
+              return entry.value() == 9999;
+            }),
+            wanted);
+  EXPECT_EQ(visited, (std::vector<std::uint64_t>{63, 9999}));
+  ASSERT_TRUE(map.rehashing());
+  for (unsigned i = 0; i < 512 && map.Maintain(); ++i) {
+  }
+  ASSERT_FALSE(map.rehashing());
+  EXPECT_EQ(map.FindCandidateIf(Digest{63}, "external",
+                               [](const auto& entry) {
+                                 return entry.value() == 9999;
+                               }),
+            wanted);
+}
+
+TEST(ScanHashMapTest, CandidatePredicateExceptionLeavesEntriesUsable) {
+  ScanHashMap<std::uint64_t> map;
+  auto* entry = map.InsertNew(ComputeDigest("kept"), "kept", 1);
+  ASSERT_NE(entry, nullptr);
+  EXPECT_THROW(map.FindCandidateIf(ComputeDigest("kept"), "kept",
+                                   [](const auto&) -> bool { throw 7; }),
+               int);
+  EXPECT_EQ(map.Find(ComputeDigest("kept"), "kept"), entry);
+  EXPECT_TRUE(map.Erase(entry));
+  EXPECT_TRUE(map.empty());
+}
+
 TEST(ScanHashMapTest, EraseShrinksAndReleasesBucketsWithoutFurtherRequests) {
   ScanHashMap<std::uint64_t> map;
   ASSERT_TRUE(map.PreallocateForExpectedSize(576));

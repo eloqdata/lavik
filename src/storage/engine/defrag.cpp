@@ -496,14 +496,14 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
                 relocated.record_offset() + relocated.total_disk_bytes()),
         });
   }
-  RecordIndex::Entry* current = nullptr;
-  for (RecordIndex::Entry* candidate : index.FindCandidates(digest, key)) {
-    if (MaterializeIndexLocation(*candidate)
-            .SamePhysicalRecord(source_location)) {
-      current = candidate;
-      break;
-    }
-  }
+  // The source's physical identity resolves external-key digest collisions
+  // without IO. Selection does not suspend under store state, so stop at the
+  // first matching record instead of allocating/materializing all candidates.
+  RecordIndex::Entry* current = index.FindCandidateIf(
+      digest, key, [&](const RecordIndex::Entry& candidate) {
+        return MaterializeIndexLocation(candidate)
+            .SamePhysicalRecord(source_location);
+      });
   if (current == nullptr) {
     co_return std::optional<RelocationDurabilityFence>{};
   }

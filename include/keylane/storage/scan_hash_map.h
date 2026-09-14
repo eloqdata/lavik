@@ -1317,6 +1317,28 @@ class ScanHashMap {
     return result;
   }
 
+  // Returns the first key candidate accepted by a synchronous predicate, in
+  // the same old-table/new-table order as FindCandidates. External keys still
+  // require the caller's identity check: digest/length equality is not exact
+  // key equality. No candidate container is allocated, though the initial
+  // rehash step retains its ordinary maintenance/allocation behavior.
+  // The predicate receives a const Entry and must not suspend or structurally
+  // mutate this map. Async verification must snapshot candidates instead;
+  // returned pointers have the same owner/lifetime constraints as Find.
+  template <typename Predicate>
+  Entry* FindCandidateIf(const Digest& digest, std::string_view key,
+                         Predicate&& accept) {
+    AdvanceRehashIfNeeded();
+    const std::uint64_t hash = Hash(digest);
+    if (Entry* found =
+            FindCandidateInTable(tables_[0], digest, key, hash, accept)) {
+      return found;
+    }
+    return Rehashing()
+               ? FindCandidateInTable(tables_[1], digest, key, hash, accept)
+               : nullptr;
+  }
+
   bool Contains(const Entry* entry, std::uint32_t hash) const noexcept {
     return FindAddress(reinterpret_cast<std::uintptr_t>(entry), hash) !=
            nullptr;
@@ -2347,6 +2369,26 @@ class ScanHashMap {
       }
       bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
     }
+  }
+
+  template <typename Predicate>
+  Entry* FindCandidateInTable(Table& table, const Digest& digest,
+                              std::string_view key, std::uint64_t hash,
+                              Predicate& accept) {
+    if (!table.buckets_) return nullptr;
+    Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+    const std::uint8_t tag = HashTag(hash);
+    while (bucket != nullptr) {
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
+          Entry* entry = Resolve(bucket->entries_[slot]);
+          if (KeyEquals(*entry, digest, key) && accept(std::as_const(*entry)))
+            return entry;
+        }
+      }
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+    }
+    return nullptr;
   }
 
   Entry* FindWithoutStep(const Digest& digest, std::string_view key) {
