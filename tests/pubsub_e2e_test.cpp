@@ -11,6 +11,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -169,7 +170,8 @@ void CreateDataFile(const std::string& path) {
 class Server {
  public:
   Server(const std::string& binary, std::uint16_t port, const std::string& data,
-         const std::string& log, std::string requirepass = {}) {
+         const std::string& log, std::string requirepass = {},
+         std::vector<std::pair<std::string, std::string>> environment = {}) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ != 0) return;
@@ -193,6 +195,9 @@ class Server {
     if (!requirepass.empty()) {
       args.push_back("--requirepass");
       args.push_back(std::move(requirepass));
+    }
+    for (const auto& [name, value] : environment) {
+      if (::setenv(name.c_str(), value.c_str(), 1) != 0) _exit(127);
     }
     std::vector<char*> argv;
     for (std::string& arg : args) argv.push_back(arg.data());
@@ -284,9 +289,15 @@ void WaitForReplica(RespClient* replica) {
 int main(int argc, char** argv) {
   try {
     if (argc != 2) Fail("usage: pubsub_e2e_test KEYLANE_BINARY");
-    char directory[] = "/tmp/keylane-pubsub-e2e-XXXXXX";
-    if (::mkdtemp(directory) == nullptr) Fail("mkdtemp failed");
-    const std::string root(directory);
+    const char* temporary_root = std::getenv("TMPDIR");
+    std::string directory_template =
+        std::string(temporary_root != nullptr ? temporary_root : "/tmp") +
+        "/keylane-pubsub-e2e-XXXXXX";
+    std::vector<char> directory(directory_template.begin(),
+                                directory_template.end());
+    directory.push_back('\0');
+    if (::mkdtemp(directory.data()) == nullptr) Fail("mkdtemp failed");
+    const std::string root(directory.data());
     const std::string source_data = root + "/source.data";
     const std::string replica_data = root + "/replica.data";
     const std::string auth_data = root + "/auth.data";
@@ -295,7 +306,13 @@ int main(int argc, char** argv) {
     CreateDataFile(auth_data);
     const std::uint16_t source_port = FreePort();
     const std::uint16_t replica_port = FreePort();
-    Server source(argv[1], source_port, source_data, root + "/source.log");
+    std::vector<std::pair<std::string, std::string>> source_environment;
+#if !defined(NDEBUG)
+    source_environment.emplace_back(
+        "KEYLANE_EXEC_REJECT_EPHEMERAL_FINAL_RECHECK_ONCE", "1");
+#endif
+    Server source(argv[1], source_port, source_data, root + "/source.log", {},
+                  std::move(source_environment));
     Server replica(argv[1], replica_port, replica_data, root + "/replica.log");
 
     RespClient source_client = Connect(source_port);
@@ -570,16 +587,46 @@ int main(int argc, char** argv) {
     Expect(replica_pattern_subscriber.Command({"PUNSUBSCRIBE"}),
            Subscription("punsubscribe", "rep*", 0),
            "replica pattern unsubscribe");
+    RespClient source_replication_subscriber = Connect(source_port);
+    Expect(source_replication_subscriber.Command({"SUBSCRIBE", "replicated"}),
+           Subscription("subscribe", "replicated", 1),
+           "source replicated subscribe");
     Expect(replica_client.Command({"PUBLISH", "replicated", "local-only"}),
            ":1", "replica local publish");
     Expect(replica_subscriber.ReadPush(), Message("replicated", "local-only"),
            "replica local message");
 
+#if !defined(NDEBUG)
+    // This deterministic final-check fault is compiled into Debug only. A
+    // failed replication check must not leak the captured PUBLISH to either the
+    // source's local subscribers or the replica backlog. The next direct
+    // publication is an ordering barrier on both paths: it must be the first
+    // message either subscriber observes.
+    RespClient rejected_exec_client = Connect(source_port);
+    Expect(rejected_exec_client.Command({"MULTI"}), "+OK",
+           "rejected publish-only multi");
+    Expect(
+        rejected_exec_client.Command({"PUBLISH", "replicated", "rejected-tx"}),
+        "+QUEUED", "queue rejected publish-only transaction");
+    Expect(rejected_exec_client.Command({"EXEC"}),
+           "-ERR EXEC replication failed: cluster authority changed",
+           "reject publish-only exec at final check");
+    Expect(source_client.Command({"PUBLISH", "replicated", "after-reject"}),
+           ":1", "publish barrier after rejected exec");
+    Expect(source_replication_subscriber.ReadPush(),
+           Message("replicated", "after-reject"),
+           "rejected exec did not publish locally");
+    Expect(replica_subscriber.ReadPush(), Message("replicated", "after-reject"),
+           "rejected exec did not enter the replica backlog");
+#endif
+
     // A PUBLISH-only EXEC uses the channel-sharded ephemeral source flow.
     Expect(source_client.Command({"MULTI"}), "+OK", "publish-only multi");
     Expect(source_client.Command({"PUBLISH", "replicated", "tx-only"}),
            "+QUEUED", "queue publish-only transaction");
-    Expect(source_client.Command({"EXEC"}), "*1\r\n:0", "publish-only exec");
+    Expect(source_client.Command({"EXEC"}), "*1\r\n:1", "publish-only exec");
+    Expect(source_replication_subscriber.ReadPush(),
+           Message("replicated", "tx-only"), "publish-only exec local message");
     Expect(replica_subscriber.ReadPush(), Message("replicated", "tx-only"),
            "replicated publish-only exec message");
 
@@ -590,7 +637,9 @@ int main(int argc, char** argv) {
            "queue mixed write");
     Expect(source_client.Command({"PUBLISH", "replicated", "tx-mixed"}),
            "+QUEUED", "queue mixed publish");
-    Expect(source_client.Command({"EXEC"}), "*2\r\n+OK\r\n:0", "mixed exec");
+    Expect(source_client.Command({"EXEC"}), "*2\r\n+OK\r\n:1", "mixed exec");
+    Expect(source_replication_subscriber.ReadPush(),
+           Message("replicated", "tx-mixed"), "mixed exec local message");
     Expect(replica_subscriber.ReadPush(), Message("replicated", "tx-mixed"),
            "replicated mixed exec message");
     const auto read_deadline = std::chrono::steady_clock::now() + 10s;

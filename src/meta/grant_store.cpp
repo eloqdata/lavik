@@ -1,5 +1,7 @@
 #include "keylane/meta/grant_store.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <limits>
 
@@ -21,29 +23,24 @@ namespace {
   std::abort();
 }
 
-bool LeaseDurationIsWireRepresentable(std::uint64_t lease_duration_ms) {
-  return lease_duration_ms != 0 &&
-         lease_duration_ms <= std::numeric_limits<std::uint32_t>::max();
-}
-
-absl::Status ValidateLeaseDuration(std::uint64_t lease_duration_ms) {
-  if (!LeaseDurationIsWireRepresentable(lease_duration_ms)) {
-    return MetaDomainRejectError(
-        "lease duration must fit the nonzero control-protocol u32 domain");
-  }
-  return absl::OkStatus();
+template <std::size_t N>
+bool IsZero(const std::array<std::uint8_t, N>& value) {
+  return std::all_of(value.begin(), value.end(),
+                     [](std::uint8_t byte) { return byte == 0; });
 }
 
 }  // namespace
 
-bool MetaGrantStore::GrantMatches(const Entry& entry,
-                                  const ActivateAuthority& command,
-                                  std::uint64_t committed_index) {
+bool MetaGrantStore::GrantMatches(
+    const Entry& entry, const ActivateAuthority& command,
+    std::uint64_t committed_index,
+    const std::optional<MetaFailoverActionId>& activation_action_id) {
   (void)committed_index;
   return !entry.fenced_ && entry.grant_.has_value() &&
          entry.grant_->owner_ == command.new_owner_ &&
          entry.grant_->term_ == command.expected_term_ &&
          entry.grant_->authority_version_ == command.new_authority_version_ &&
+         entry.grant_->activation_action_id_ == activation_action_id &&
          entry.grant_->spec_ == command.grant_;
 }
 
@@ -105,9 +102,7 @@ absl::Status MetaGrantStore::BeginGroupTerm(
 absl::Status MetaGrantStore::GrantAuthority(
     const keylane::meta::GrantAuthority& command,
     std::uint64_t committed_index) {
-  if (absl::Status lease =
-          ValidateLeaseDuration(command.grant_.lease_duration_ms_);
-      !lease.ok()) {
+  if (absl::Status lease = ValidateMetaGrantSpec(command.grant_); !lease.ok()) {
     return lease;
   }
   const auto it = groups_.find(command.group_id_);
@@ -143,10 +138,12 @@ absl::Status MetaGrantStore::GrantAuthority(
 
 absl::Status MetaGrantStore::ValidateActivate(
     const keylane::meta::ActivateAuthority& command,
-    std::uint64_t committed_index) const {
-  if (absl::Status lease =
-          ValidateLeaseDuration(command.grant_.lease_duration_ms_);
-      !lease.ok()) {
+    std::uint64_t committed_index,
+    std::optional<MetaFailoverActionId> activation_action_id) const {
+  if (activation_action_id.has_value() && IsZero(*activation_action_id)) {
+    return MetaDomainRejectError("failover activation action id is zero");
+  }
+  if (absl::Status lease = ValidateMetaGrantSpec(command.grant_); !lease.ok()) {
     return lease;
   }
   if (command.expected_term_ == 0) {
@@ -163,7 +160,7 @@ absl::Status MetaGrantStore::ValidateActivate(
   if (command.expected_term_ != entry.group_term_) {
     return MetaDomainRejectError("expected term does not match current term");
   }
-  if (GrantMatches(entry, command, committed_index)) {
+  if (GrantMatches(entry, command, committed_index, activation_action_id)) {
     return absl::OkStatus();  // replay: already installed, idempotent accept
   }
   if (command.new_authority_version_ <= entry.last_authority_version_) {
@@ -177,18 +174,23 @@ absl::Status MetaGrantStore::ValidateActivate(
 
 absl::Status MetaGrantStore::ApplyGrantPart(
     const keylane::meta::ActivateAuthority& command,
-    std::uint64_t committed_index) {
+    std::uint64_t committed_index,
+    std::optional<MetaFailoverActionId> activation_action_id) {
+  if (activation_action_id.has_value() && IsZero(*activation_action_id)) {
+    FatalGrantContractViolation("failover activation action id is zero",
+                                command.group_id_);
+  }
   const auto it = groups_.find(command.group_id_);
   if (it == groups_.end() || command.expected_term_ == 0 ||
       command.expected_term_ != it->second.group_term_) {
     FatalGrantContractViolation("term mismatch", command.group_id_);
   }
-  if (!LeaseDurationIsWireRepresentable(command.grant_.lease_duration_ms_)) {
-    FatalGrantContractViolation("lease duration is not wire-representable",
-                                command.group_id_);
+  if (absl::Status status = ValidateMetaGrantSpec(command.grant_);
+      !status.ok()) {
+    FatalGrantContractViolation(status.message(), command.group_id_);
   }
   Entry& entry = it->second;
-  if (GrantMatches(entry, command, committed_index)) {
+  if (GrantMatches(entry, command, committed_index, activation_action_id)) {
     return absl::OkStatus();  // replay no-op
   }
   if (committed_index == 0 || committed_index <= entry.last_grant_revision_) {
@@ -199,6 +201,7 @@ absl::Status MetaGrantStore::ApplyGrantPart(
   grant.term_ = entry.group_term_;  // activate never moves the term
   grant.authority_version_ = command.new_authority_version_;
   grant.grant_revision_ = committed_index;
+  grant.activation_action_id_ = std::move(activation_action_id);
   grant.spec_ = command.grant_;
   entry.last_authority_version_ = command.new_authority_version_;
   entry.last_grant_revision_ = committed_index;
@@ -277,11 +280,16 @@ absl::StatusOr<std::string> MetaGrantStore::Serialize() const {
   w.WriteU16(kMetaFormatVersion);
   w.WriteCount(static_cast<std::uint32_t>(groups_.size()));
   for (const auto& [group_id, entry] : groups_) {
-    if (entry.grant_.has_value() &&
-        !LeaseDurationIsWireRepresentable(
-            entry.grant_->spec_.lease_duration_ms_)) {
-      return MetaDomainRejectError(
-          "grant store contains an unprojectable lease duration");
+    if (entry.grant_.has_value()) {
+      if (absl::Status status = ValidateMetaGrantSpec(entry.grant_->spec_);
+          !status.ok()) {
+        return status;
+      }
+      if (entry.grant_->activation_action_id_.has_value() &&
+          IsZero(*entry.grant_->activation_action_id_)) {
+        return MetaDomainRejectError(
+            "grant store contains a zero failover activation action id");
+      }
     }
     w.WriteString(group_id);
     w.WriteU64(entry.group_term_);
@@ -293,6 +301,10 @@ absl::StatusOr<std::string> MetaGrantStore::Serialize() const {
       ww.WriteU64(g.term_);
       ww.WriteU64(g.authority_version_);
       ww.WriteU64(g.grant_revision_);
+      ww.WriteOptional(g.activation_action_id_,
+                       [](MetaWriter& www, const MetaFailoverActionId& id) {
+                         WriteFixedArray(www, id);
+                       });
       ww.WriteU64(g.spec_.lease_duration_ms_);
       ww.WriteString(g.spec_.policy_id_);
       ww.WriteU64(g.spec_.policy_version_);
@@ -345,6 +357,12 @@ absl::StatusOr<MetaGrantStore> MetaGrantStore::Deserialize(
         return absl::StatusOr<MetaGroupGrant>(grant_revision.status());
       }
       g.grant_revision_ = *grant_revision;
+      auto activation_action_id = rr.ReadOptional<MetaFailoverActionId>(
+          [](MetaReader& rrr) { return ReadFixedArray<16>(rrr); });
+      if (!activation_action_id.ok()) {
+        return absl::StatusOr<MetaGroupGrant>(activation_action_id.status());
+      }
+      g.activation_action_id_ = std::move(*activation_action_id);
       auto lease = rr.ReadU64();
       if (!lease.ok()) return absl::StatusOr<MetaGroupGrant>(lease.status());
       g.spec_.lease_duration_ms_ = *lease;
@@ -377,11 +395,15 @@ absl::StatusOr<MetaGrantStore> MetaGrantStore::Deserialize(
          entry.grant_->grant_revision_ != entry.last_grant_revision_)) {
       return MetaFailStopError("grant revision inconsistent with entry");
     }
-    if (entry.grant_.has_value() &&
-        !LeaseDurationIsWireRepresentable(
-            entry.grant_->spec_.lease_duration_ms_)) {
-      return MetaFailStopError(
-          "grant lease duration is not control-wire representable");
+    if (entry.grant_.has_value()) {
+      if (absl::Status status = ValidateMetaGrantSpec(entry.grant_->spec_);
+          !status.ok()) {
+        return MetaFailStopError(status.message());
+      }
+      if (entry.grant_->activation_action_id_.has_value() &&
+          IsZero(*entry.grant_->activation_action_id_)) {
+        return MetaFailStopError("grant failover activation action id is zero");
+      }
     }
     if (!store.groups_.emplace(std::string(*group_id), std::move(entry))
              .second) {

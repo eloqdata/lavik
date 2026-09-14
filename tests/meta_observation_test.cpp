@@ -6,9 +6,9 @@
 // nodes, stale/future session generations, boot mismatch, old/future/exact
 // group terms, manifest or partition-replication-epoch mismatch, unbound
 // history, unknown/terminal
-// operations, disconnect/generation-adoption purge, commit-driven revalidation with
-// read-path re-filtering, TTL expiry, entry/domain/byte capacity bounds, exact
-// resource accounting across every removal path, and the audit ring.
+// operations, disconnect/generation-adoption purge, commit-driven revalidation
+// with read-path re-filtering, TTL expiry, entry/domain/byte capacity bounds,
+// exact resource accounting across every removal path, and the audit ring.
 
 #include <cstdint>
 #include <map>
@@ -64,9 +64,8 @@ class FakeCommittedFacts : public MetaCommittedFacts {
   keylane::meta::MetaHash256 CurrentPopulationManifestDigest(
       std::string_view group_id) const override {
     const auto it = group_manifest_digests_.find(std::string(group_id));
-    return it != group_manifest_digests_.end()
-               ? it->second
-               : keylane::meta::MetaHash256{};
+    return it != group_manifest_digests_.end() ? it->second
+                                               : keylane::meta::MetaHash256{};
   }
   std::uint64_t CurrentPartitionReplicationEpoch(
       std::string_view group_id) const override {
@@ -79,12 +78,16 @@ class FakeCommittedFacts : public MetaCommittedFacts {
         assignments_.find({std::string(group_id), std::string(node_id)});
     return it != assignments_.end() && it->second == assignment_id;
   }
-  bool IsOwnerAssignment(
-      std::string_view group_id, std::string_view node_id,
-      const MetaAssignmentId& assignment_id) const override {
+  bool IsOwnerAssignment(std::string_view group_id, std::string_view node_id,
+                         const MetaAssignmentId& assignment_id) const override {
     const auto it = owners_.find(std::string(group_id));
     return it != owners_.end() && it->second == node_id &&
            AssignmentMatches(group_id, node_id, assignment_id);
+  }
+  bool MayReportFencedOwnerCandidate(
+      const MetaCandidateProgressObs& candidate) const override {
+    return allow_fenced_owner_candidates_ && candidate.group_term_ != 0 &&
+           candidate.source_group_term_ == candidate.group_term_ - 1;
   }
   bool OperationNonTerminal(const MetaOperationId& id) const override {
     return nonterminal_ops_.contains(id);
@@ -97,13 +100,13 @@ class FakeCommittedFacts : public MetaCommittedFacts {
   }
 
   std::set<std::string> active_nodes_;
-  std::map<std::string, keylane::meta::MetaHash256>
-      group_manifest_digests_;
+  std::map<std::string, keylane::meta::MetaHash256> group_manifest_digests_;
   std::map<std::string, std::string> owners_;
   std::map<std::string, std::uint64_t> group_terms_;
   std::map<std::string, std::uint64_t> group_manifests_;
   std::map<std::string, std::uint64_t> group_partition_epochs_;
   std::map<std::pair<std::string, std::string>, MetaAssignmentId> assignments_;
+  bool allow_fenced_owner_candidates_ = false;
   std::set<MetaOperationId> nonterminal_ops_;
   std::map<MetaOperationId, std::set<MetaReplicationHistoryId>>
       bound_histories_;
@@ -284,6 +287,67 @@ TEST(MetaObservationStore, AdoptSessionRejectsEqualOrOlderGeneration) {
       RingHas(store, MetaObsAuditKind::kRejected, "stale-session-generation"));
 }
 
+TEST(MetaObservationStore,
+     ExactDisconnectIsLatchedAcrossReplacementSessionUntilLeaderReset) {
+  MetaObservationStore store;
+  const auto first = Ident("n1", 0x0a, 1);
+  MetaReplicationHistoryId first_history{};
+  first_history.fill(0x31);
+  ASSERT_TRUE(store.AdoptSession(first, 1000, first_history).ok());
+
+  store.InvalidateCandidateOnDisconnect(first, 1010);
+  auto state = store.SessionStateFor("n1");
+  ASSERT_TRUE(state.has_value());
+  EXPECT_FALSE(state->connected_);
+  EXPECT_EQ(state->current_history_id_, first_history);
+  EXPECT_EQ(state->disconnected_unix_ms_, 1010);
+  EXPECT_EQ(state->disconnected_boot_id_, first.boot_incarnation_);
+  EXPECT_EQ(state->disconnected_generation_, first.session_generation_);
+
+  const auto replacement = Ident("n1", 0x0b, 2);
+  MetaReplicationHistoryId replacement_history{};
+  replacement_history.fill(0x32);
+  ASSERT_TRUE(store.AdoptSession(replacement, 1020, replacement_history).ok());
+  state = store.SessionStateFor("n1");
+  ASSERT_TRUE(state.has_value());
+  EXPECT_TRUE(state->connected_);
+  EXPECT_EQ(state->current_boot_id_, replacement.boot_incarnation_);
+  EXPECT_EQ(state->current_history_id_, replacement_history);
+  EXPECT_EQ(state->current_generation_, replacement.session_generation_);
+  EXPECT_EQ(state->disconnected_boot_id_, first.boot_incarnation_);
+  EXPECT_EQ(state->disconnected_generation_, first.session_generation_);
+
+  // A late close notification for the old session cannot disconnect the
+  // replacement or overwrite the exact latch.
+  store.InvalidateCandidateOnDisconnect(first, 1030);
+  state = store.SessionStateFor("n1");
+  ASSERT_TRUE(state.has_value());
+  EXPECT_TRUE(state->connected_);
+  EXPECT_EQ(state->disconnected_unix_ms_, 1010);
+
+  store.ResetForLeadershipChange();
+  EXPECT_FALSE(store.SessionStateFor("n1").has_value());
+}
+
+TEST(MetaObservationStore,
+     InvalidReplacementHistoryDoesNotPurgeTheCurrentSession) {
+  MetaObservationStore store;
+  const auto current = Ident("n1", 0x0a, 1);
+  MetaReplicationHistoryId history{};
+  history.fill(0x41);
+  ASSERT_TRUE(store.AdoptSession(current, 1000, history).ok());
+
+  MetaReplicationHistoryId empty_history{};
+  EXPECT_FALSE(
+      store.AdoptSession(Ident("n1", 0x0b, 2), 1010, empty_history).ok());
+  const auto state = store.SessionStateFor("n1");
+  ASSERT_TRUE(state.has_value());
+  EXPECT_EQ(state->current_boot_id_, current.boot_incarnation_);
+  EXPECT_EQ(state->current_generation_, current.session_generation_);
+  EXPECT_EQ(state->current_history_id_, history);
+  EXPECT_TRUE(state->connected_);
+}
+
 TEST(MetaObservationStore, IngestRejectsUnregisteredNode) {
   MetaObservationStore store;
   FakeCommittedFacts facts = MakeFreshFacts();  // "ghost" is not registered
@@ -372,8 +436,7 @@ TEST(MetaObservationStore, NewGenerationAtomicallyPurgesOldObservations) {
   const auto candidates = store.CandidateProgressFor("g1", facts);
   ASSERT_EQ(candidates.size(), 1u);
   EXPECT_EQ(candidates.front().boot_incarnation_, Boot(0x0b));
-  const auto evidence =
-      store.EvidenceForOperation(OpId(0x51), facts, 2003);
+  const auto evidence = store.EvidenceForOperation(OpId(0x51), facts, 2003);
   ASSERT_EQ(evidence.size(), 1u);
   EXPECT_EQ(evidence.front().boot_incarnation_, Boot(0x0b));
   EXPECT_EQ(store.size(), 3);
@@ -387,9 +450,8 @@ TEST(MetaObservationStore,
   ASSERT_TRUE(store.AdoptSession(current, 1000).ok());
   ASSERT_TRUE(store.Ingest(BootObs(current), facts, 1000).ok());
   ASSERT_TRUE(store.Ingest(HealthObs(current), facts, 1001).ok());
-  ASSERT_TRUE(store
-                  .Ingest(CandidateObs(current, "g1", 3, 7, 42), facts, 1002)
-                  .ok());
+  ASSERT_TRUE(
+      store.Ingest(CandidateObs(current, "g1", 3, 7, 42), facts, 1002).ok());
 
   store.InvalidateCandidateOnDisconnect(Ident("n1", 0x0a, 1), 1003);
   ASSERT_EQ(store.CandidateProgressFor("g1", facts).size(), 1u);
@@ -531,6 +593,7 @@ TEST(MetaObservationStore, CommittedOwnerCannotRemainACandidate) {
   MetaObservation candidate =
       CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42);
   auto& payload = std::get<MetaCandidateProgressObs>(candidate.payload_);
+  payload.source_group_term_ = 3;
   payload.source_node_id_ = std::string(40, 'f');
   payload.source_assignment_id_ = Assignment(0xf1);
   payload.source_boot_incarnation_ = Boot(0xf2);
@@ -541,6 +604,99 @@ TEST(MetaObservationStore, CommittedOwnerCannotRemainACandidate) {
   ExpectDomainReject(store.Ingest(std::move(candidate), facts, 1001));
   EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kRejected,
                       "candidate-is-committed-owner"));
+}
+
+TEST(MetaObservationStore,
+     FencedHistoricalOwnerRequiresExactBootLocalSelfOrigin) {
+  const std::string owner(40, '1');
+  const MetaObservationIdentity first_session = Ident(owner, 0x0a, 1);
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  facts.active_nodes_.erase("n1");
+  facts.active_nodes_.insert(owner);
+  facts.assignments_.erase({"g1", "n1"});
+  facts.assignments_[{"g1", owner}] = Assignment(0x31);
+  facts.owners_["g1"] = owner;
+  facts.allow_fenced_owner_candidates_ = true;
+  ASSERT_TRUE(store.AdoptSession(first_session, 1000, History(42)).ok());
+
+  const auto self_origin = [&](MetaObservationIdentity identity) {
+    MetaObservation candidate =
+        CandidateObs(std::move(identity), "g1", 3, 7, 42);
+    auto& payload = std::get<MetaCandidateProgressObs>(candidate.payload_);
+    // An uncontrolled T -> T+1 fence retains the old topology owner while
+    // revoking its grant. Its only admissible candidate lineage is the
+    // authenticated current boot's own T population, never an inferred disk
+    // population or target-term authority.
+    payload.source_group_term_ = 2;
+    payload.source_node_id_ = owner;
+    payload.source_assignment_id_ = Assignment(0x31);
+    payload.source_boot_incarnation_ = Boot(0x0a);
+    payload.source_replication_history_id_ = History(42);
+    payload.applied_next_lsns_ = {10};
+    payload.storage_ready_ = true;
+    payload.population_ready_ = true;
+    return candidate;
+  };
+
+  EXPECT_TRUE(store.Ingest(self_origin(first_session), facts, 1001).ok());
+
+  MetaObservation wrong_source = self_origin(first_session);
+  std::get<MetaCandidateProgressObs>(wrong_source.payload_).source_node_id_ =
+      std::string(40, '2');
+  ExpectDomainReject(store.Ingest(std::move(wrong_source), facts, 1002));
+
+  MetaObservation wrong_boot = self_origin(first_session);
+  std::get<MetaCandidateProgressObs>(wrong_boot.payload_)
+      .source_boot_incarnation_ = Boot(0x0b);
+  ExpectDomainReject(store.Ingest(std::move(wrong_boot), facts, 1003));
+
+  MetaObservation wrong_history = self_origin(first_session);
+  std::get<MetaCandidateProgressObs>(wrong_history.payload_)
+      .source_replication_history_id_ = History(43);
+  ExpectDomainReject(store.Ingest(std::move(wrong_history), facts, 1004));
+
+  MetaObservation target_term_source = self_origin(first_session);
+  std::get<MetaCandidateProgressObs>(target_term_source.payload_)
+      .source_group_term_ = 3;
+  ExpectDomainReject(store.Ingest(std::move(target_term_source), facts, 1005));
+
+  // A restart loses the boot-local proof even when membership and durable
+  // historical-owner intent are unchanged.
+  const MetaObservationIdentity restarted = Ident(owner, 0x0b, 2);
+  ASSERT_TRUE(store.AdoptSession(restarted, 1006, History(42)).ok());
+  MetaObservation stale_boot = self_origin(restarted);
+  ExpectDomainReject(store.Ingest(std::move(stale_boot), facts, 1007));
+}
+
+TEST(MetaObservationStore,
+     TypedCandidateSourceTermMustBePresentAndNotFromTheFuture) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  ASSERT_TRUE(store.AdoptSession(Ident("n1", 0x0a, 1), 1000).ok());
+
+  auto make_candidate = [&] {
+    MetaObservation candidate =
+        CandidateObs(Ident("n1", 0x0a, 1), "g1", 3, 7, 42);
+    auto& payload = std::get<MetaCandidateProgressObs>(candidate.payload_);
+    payload.source_node_id_ = std::string(40, 'f');
+    payload.source_assignment_id_ = Assignment(0xf1);
+    payload.source_boot_incarnation_ = Boot(0xf2);
+    payload.source_replication_history_id_ = History(0xf3);
+    payload.applied_next_lsns_ = {10};
+    payload.storage_ready_ = true;
+    payload.population_ready_ = true;
+    return candidate;
+  };
+
+  MetaObservation missing = make_candidate();
+  ExpectDomainReject(store.Ingest(std::move(missing), facts, 1001));
+  MetaObservation future = make_candidate();
+  std::get<MetaCandidateProgressObs>(future.payload_).source_group_term_ = 4;
+  ExpectDomainReject(store.Ingest(std::move(future), facts, 1002));
+  MetaObservation current = make_candidate();
+  std::get<MetaCandidateProgressObs>(current.payload_).source_group_term_ = 3;
+  EXPECT_TRUE(store.Ingest(std::move(current), facts, 1003).ok());
 }
 
 TEST(MetaObservationStore,
@@ -796,8 +952,7 @@ TEST(MetaObservationStore, EvidenceLatestWinsPerNodeAndPhase) {
                   .ok());
 
   // (n1,p1) was replaced, (n1,p2) and (n2,p1) coexist: 3 entries.
-  const auto evidence =
-      store.EvidenceForOperation(OpId(0x51), facts, 1003);
+  const auto evidence = store.EvidenceForOperation(OpId(0x51), facts, 1003);
   ASSERT_EQ(evidence.size(), 3);
   // (node, phase)-sorted: (n1,p1) first, carrying the replacement payload.
   EXPECT_EQ(evidence[0].kind_phase_, "p1");
@@ -950,11 +1105,10 @@ TEST(MetaObservationStore, DefaultResourceLimitsTrackWireAndDomainCaps) {
             keylane::meta::kMaxMetaOperationEvidencePerRecord);
   EXPECT_EQ(limits.max_evidence_per_operation_,
             keylane::meta::kMaxMetaOperationEvidencePerRecord);
-  EXPECT_EQ(
-      limits.max_retained_bytes_total_,
-      static_cast<std::uint64_t>(keylane::meta::kMaxMetaNodes) *
-          (keylane::cluster::control::kMaxFrameBytes +
-           keylane::cluster::control::kMaxIdentifierBytes));
+  EXPECT_EQ(limits.max_retained_bytes_total_,
+            static_cast<std::uint64_t>(keylane::meta::kMaxMetaNodes) *
+                (keylane::cluster::control::kMaxFrameBytes +
+                 keylane::cluster::control::kMaxIdentifierBytes));
   EXPECT_EQ(limits.max_retained_bytes_per_node_,
             keylane::cluster::control::kMaxOperationEvidenceTransferBytes +
                 keylane::cluster::control::kMaxFrameBytes +
@@ -987,7 +1141,7 @@ TEST(MetaObservationStore, RevalidateAllPurgesCommitStaleObservations) {
   facts.active_nodes_.erase("n2");
 
   store.RevalidateAll(facts, 2000);
-  EXPECT_EQ(store.size(), 1);  // only n1's boot survives
+  EXPECT_EQ(store.size(), 1);             // only n1's boot survives
   EXPECT_EQ(store.retained_bytes(), 4u);  // identity and boot index: 2 + 2
   EXPECT_EQ(store.retained_bytes_for_node("n1"), 4u);
   EXPECT_EQ(store.retained_bytes_for_node("n2"), 0u);
@@ -1077,7 +1231,7 @@ TEST(MetaObservationStore, SweepExpiredDropsEntriesOlderThanTtl) {
   store.SweepExpired(2000);
   EXPECT_EQ(store.size(), 2);  // ages 1000 and 500: boundary survives
   store.SweepExpired(2001);
-  EXPECT_EQ(store.size(), 1);  // the boot (age 1001 > ttl) is gone
+  EXPECT_EQ(store.size(), 1);             // the boot (age 1001 > ttl) is gone
   EXPECT_EQ(store.retained_bytes(), 6u);  // n1 identity/index + "ok"
   EXPECT_EQ(store.retained_bytes_for_node("n1"), 6u);
   EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kTtlExpired, "ttl-expired"));
@@ -1100,8 +1254,7 @@ TEST(MetaObservationStore,
                   .ok());
 
   EXPECT_EQ(store.EvidenceForOperation(OpId(0x51), facts, 2000).size(), 1u);
-  EXPECT_TRUE(
-      store.EvidenceForOperation(OpId(0x51), facts, 2001).empty());
+  EXPECT_TRUE(store.EvidenceForOperation(OpId(0x51), facts, 2001).empty());
   EXPECT_EQ(store.size(), 1u)
       << "freshness filtering must not depend on destructive cleanup";
 }
@@ -1181,8 +1334,7 @@ TEST(MetaObservationStore,
   ExpectDomainReject(
       store.Ingest(HealthObs(Ident("n1", 0x0a, 1), "xx"), facts, 1001));
   ExpectDomainReject(store.Ingest(BootObs(Ident("n2", 0x0a, 1)), facts, 1001));
-  EXPECT_TRUE(
-      RingHas(store, MetaObsAuditKind::kRejected, "store-bytes-full"));
+  EXPECT_TRUE(RingHas(store, MetaObsAuditKind::kRejected, "store-bytes-full"));
   EXPECT_EQ(store.size(), 1u);
   EXPECT_EQ(store.retained_bytes(), 5u);
   const auto latest = store.LatestForNode("n1", facts);

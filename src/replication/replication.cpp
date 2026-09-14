@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1511,7 +1512,8 @@ absl::StatusOr<std::string> EncodeRedisExportCommand(
     }
     if (!child.args_.empty() &&
         EqualCaseInsensitive(child.args_[0], "KEYLANE.HREPLACE")) {
-      output += EncodeRespCommand(std::vector<std::string>{"DEL", child.args_[1]});
+      output +=
+          EncodeRespCommand(std::vector<std::string>{"DEL", child.args_[1]});
       child.args_[0] = "HSET";
     }
     output += EncodeRespCommand(child.args_);
@@ -1957,8 +1959,7 @@ absl::Status ConfigureConnectedFd(int fd) {
 
 Task<absl::StatusOr<TcpStream>> ConnectTcp(
     std::string_view host, std::uint16_t port,
-    const std::shared_ptr<celer::TlsContext>& tls_context,
-    SocketSet* sockets) {
+    const std::shared_ptr<celer::TlsContext>& tls_context, SocketSet* sockets) {
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -1991,8 +1992,7 @@ Task<absl::StatusOr<TcpStream>> ConnectTcp(
           "replication connection was cancelled before connect");
     }
 
-    int connect_result =
-        ::connect(fd, address->ai_addr, address->ai_addrlen);
+    int connect_result = ::connect(fd, address->ai_addr, address->ai_addrlen);
     if (connect_result != 0 && errno == EINPROGRESS) {
       // The old blocking connect could pin worker zero through process
       // shutdown. Poll in short slices so a thread-safe SocketSet cancellation
@@ -2084,6 +2084,147 @@ bool IsReplicationId(std::string_view value) {
            return (digit >= '0' && digit <= '9') ||
                   (digit >= 'a' && digit <= 'f');
          });
+}
+
+template <std::size_t Size>
+bool IsZeroBytes(const std::array<std::uint8_t, Size>& value) noexcept {
+  return std::all_of(value.begin(), value.end(),
+                     [](std::uint8_t byte) { return byte == 0; });
+}
+
+template <std::size_t Size>
+std::string HexBytes(const std::array<std::uint8_t, Size>& value) {
+  constexpr char kHex[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(value.size() * 2);
+  for (std::uint8_t byte : value) {
+    result.push_back(kHex[byte >> 4]);
+    result.push_back(kHex[byte & 0x0f]);
+  }
+  return result;
+}
+
+bool SameFailoverActionExceptAuthorization(
+    const DesiredClusterFailoverAction& lhs,
+    const DesiredClusterFailoverAction& rhs) {
+  DesiredClusterFailoverAction lhs_copy = lhs;
+  DesiredClusterFailoverAction rhs_copy = rhs;
+  lhs_copy.transition_revision_ = rhs_copy.transition_revision_ = 0;
+  lhs_copy.authorized_revision_.reset();
+  rhs_copy.authorized_revision_.reset();
+  return lhs_copy == rhs_copy;
+}
+
+bool IsRetainedControlledDegrade(
+    const DesiredClusterFailoverAction& current,
+    const DesiredClusterFailoverAction& replacement) {
+  if (current.mode_ != ClusterFailoverMode::kControlled ||
+      replacement.mode_ != ClusterFailoverMode::kUncontrolled ||
+      current.transition_revision_ >= replacement.transition_revision_ ||
+      current.committed_group_term_ ==
+          std::numeric_limits<std::uint64_t>::max() ||
+      current.committed_group_term_ + 1 != current.target_term_ ||
+      replacement.committed_group_term_ != current.target_term_ ||
+      !current.committed_grant_active_ || replacement.committed_grant_active_ ||
+      !replacement.authorized_revision_.has_value() ||
+      (current.authorized_revision_.has_value() &&
+       current.authorized_revision_ != replacement.authorized_revision_)) {
+    return false;
+  }
+
+  // DegradeControlledFailover retains the exact candidate action while its
+  // atomic term fence changes only these four projection fields. Normalize
+  // them before comparing so candidate, source lineage, population, and
+  // transition identities remain immutable execution anchors.
+  DesiredClusterFailoverAction current_copy = current;
+  DesiredClusterFailoverAction replacement_copy = replacement;
+  current_copy.transition_revision_ = replacement_copy.transition_revision_ = 0;
+  current_copy.authorized_revision_.reset();
+  replacement_copy.authorized_revision_.reset();
+  current_copy.mode_ = replacement_copy.mode_ =
+      ClusterFailoverMode::kUncontrolled;
+  current_copy.committed_group_term_ = replacement_copy.committed_group_term_ =
+      0;
+  current_copy.committed_grant_active_ =
+      replacement_copy.committed_grant_active_ = false;
+  return current_copy == replacement_copy;
+}
+
+void AppendHashU64(std::string& bytes, std::uint64_t value) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    bytes.push_back(static_cast<char>(value >> shift));
+  }
+}
+
+void AppendHashBytes(std::string& bytes, std::span<const std::uint8_t> value) {
+  AppendHashU64(bytes, value.size());
+  bytes.append(reinterpret_cast<const char*>(value.data()), value.size());
+}
+
+void AppendHashString(std::string& bytes, std::string_view value) {
+  AppendHashU64(bytes, value.size());
+  bytes.append(value);
+}
+
+ClusterPreparedContextHash ComputePreparedContextHash(
+    const DesiredClusterFailoverAction& desired,
+    const ClusterPreparedContextId& context_id,
+    const ClusterPromotionPrepared& prepared) {
+  std::string bytes("KEYLANE_FAILOVER_PREPARED_V1");
+  AppendHashBytes(bytes, desired.transition_id_);
+  AppendHashBytes(bytes, desired.action_id_);
+  AppendHashBytes(bytes, context_id);
+  AppendHashString(bytes, prepared.parent_history_id_);
+  AppendHashU64(bytes, prepared.frozen_applied_next_lsns_.size());
+  for (std::uint64_t cursor : prepared.frozen_applied_next_lsns_) {
+    AppendHashU64(bytes, cursor);
+  }
+  AppendHashU64(bytes, prepared.population_generation_);
+  AppendHashU64(bytes, prepared.population_digest_);
+  AppendHashU64(bytes, prepared.catalog_generation_);
+  AppendHashU64(bytes, prepared.catalog_dump_crc64_);
+  AppendHashString(bytes, prepared.child_history_id_);
+  return cluster::control::ComputeSha256(bytes);
+}
+
+ClusterPromotionPrepareDirective BuildFailoverPrepareDirective(
+    const DesiredClusterFailoverAction& desired,
+    std::vector<std::uint64_t> current_frontier) {
+  const std::string transition = HexBytes(desired.transition_id_);
+  const std::string action = HexBytes(desired.action_id_);
+  ClusterPromotionPrepareDirective directive{
+      .identity_ =
+          {
+              .group_id_ = desired.group_id_,
+              .assignment_id_ = desired.candidate_assignment_id_,
+              .term_ = desired.target_term_,
+              .directive_revision_ = *desired.authorized_revision_,
+              .authority_id_ = transition,
+              .source_node_id_ = desired.domain_.source_node_id_,
+              .source_assignment_id_ = desired.domain_.source_assignment_id_,
+              .source_boot_id_ = desired.domain_.source_boot_id_,
+              .source_history_id_ = desired.domain_.source_history_id_,
+              .target_node_id_ = desired.candidate_node_id_,
+              .target_boot_id_ = desired.candidate_boot_id_,
+              .target_history_id_ = {},
+              .operation_id_ = transition,
+              .directive_id_ = action,
+              .attempt_id_ = action,
+              .manifest_revision_ = desired.manifest_revision_,
+              .manifest_id_ = desired.manifest_id_,
+              .partition_replication_epoch_ =
+                  desired.partition_replication_epoch_,
+          },
+      .parent_history_id_ = desired.domain_.source_history_id_,
+      .required_applied_next_lsns_ = std::move(current_frontier),
+      .excluded_group_term_ = desired.target_term_,
+  };
+  const std::string authorization =
+      absl::StrCat("KEYLANE_FAILOVER_ACTION_V1", transition, action, ":",
+                   *desired.authorized_revision_);
+  directive.old_authority_exclusion_hash_ =
+      cluster::control::ComputeSha256(authorization);
+  return directive;
 }
 
 std::string PopulationGroupToken(std::string_view group_id) {
@@ -2391,6 +2532,65 @@ struct ClusterPromotionPrepareContext {
       completion_;
 };
 
+struct ClusterSourcePauseContext {
+  explicit ClusterSourcePauseContext(DesiredClusterSourcePause desired)
+      : desired_(std::move(desired)) {}
+
+  DesiredClusterSourcePause desired_;
+  std::optional<std::vector<std::uint64_t>> stable_next_lsns_;
+  std::string failure_detail_;
+  bool expiration_pause_held_ = false;
+};
+
+struct ClusterFailoverActionContext {
+  explicit ClusterFailoverActionContext(DesiredClusterFailoverAction desired)
+      : desired_(std::move(desired)) {}
+
+  DesiredClusterFailoverAction desired_;
+  ClusterFailoverActionState state_ =
+      ClusterFailoverActionState::kWaitingForAuthorization;
+  std::optional<ClusterFailoverPreparedContext> prepared_;
+  std::optional<ClusterPromotionPrepareDirective> prepare_directive_;
+  std::string failure_class_;
+  std::string failure_detail_;
+  bool cancelled_ = false;
+  bool runner_started_ = false;
+  bool runner_finished_ = true;
+  bool failure_published_ = false;
+  // This private cleanup fact is distinct from Prepared observation. A
+  // replacement may cancel the action after the durability kernel creates a
+  // child history but before the action is still allowed to publish it.
+  bool prepared_child_history_created_ = false;
+};
+
+struct ClusterFollowOwnerContext {
+  ClusterFollowOwnerContext(DesiredClusterUpstream desired,
+                            PopulationManifest manifest)
+      : desired_(std::move(desired)), manifest_(std::move(manifest)) {}
+
+  const DesiredClusterUpstream desired_;
+  const PopulationManifest manifest_;
+  // A matching-history handshake can still discover that one source flow no
+  // longer retains the requested cursor. The first session fails before any
+  // reset and sets this latch; its fixed-delay retry then enters the ordinary
+  // FULL path under a fresh boot-local population attempt.
+  std::atomic<bool> force_full_{false};
+};
+
+struct ClusterSteadyExport {
+  std::string group_id_;
+  std::uint64_t group_term_ = 0;
+  std::string target_node_id_;
+  std::string target_assignment_id_;
+  std::string source_node_id_;
+  std::string source_assignment_id_;
+  std::uint64_t manifest_revision_ = 0;
+  PopulationManifestId manifest_id_;
+  std::uint64_t partition_replication_epoch_ = 0;
+
+  bool operator==(const ClusterSteadyExport&) const = default;
+};
+
 struct ReplicaSession {
   explicit ReplicaSession(SocketSet* shutdown_sockets)
       : sockets_(shutdown_sockets) {}
@@ -2410,6 +2610,7 @@ struct ReplicaSession {
   std::string flow_capability_;
   unsigned source_worker_count_ = 0;
   std::shared_ptr<ClusterRebuildContext> cluster_rebuild_;
+  std::shared_ptr<ClusterFollowOwnerContext> cluster_follow_;
   std::shared_ptr<detail::ReplicaAppliedFrontier> applied_frontier_;
   // No flow may consume data until every KLFLOW response selected the same
   // session mode. FULL then has a second barrier: flow zero drains old client
@@ -2447,8 +2648,8 @@ struct ReplicaSession {
     flow_phases_.assign(flow_count, FlowProtocolPhase::kAwaitMode);
     requested_cursors_.resize(flow_count);
     for (unsigned flow = 0; flow < flow_count; ++flow) {
-      requested_cursors_[flow] = {
-          .lsn_ = requested[flow], .fragment_index_ = 0};
+      requested_cursors_[flow] = {.lsn_ = requested[flow],
+                                  .fragment_index_ = 0};
     }
     fullsync_cuts_.assign(flow_count, std::nullopt);
   }
@@ -2782,7 +2983,8 @@ struct MasterSession {
                 std::string host, std::uint16_t port,
                 std::string source_history_id, bool allow_continue,
                 std::vector<std::uint64_t> applied,
-                std::shared_ptr<const ClusterRebuildContext> population_export)
+                std::shared_ptr<const ClusterRebuildContext> population_export,
+                std::optional<ClusterSteadyExport> steady_export = std::nullopt)
       : id_(id),
         flow_capability_(NewReplicationId()),
         node_id_(std::move(node_id)),
@@ -2792,6 +2994,7 @@ struct MasterSession {
         allow_continue_(allow_continue),
         applied_(std::move(applied)),
         population_export_(std::move(population_export)),
+        steady_export_(std::move(steady_export)),
         flow_fds_(worker_count, -1),
         flows_(worker_count),
         flow_resume_possible_(worker_count, -1),
@@ -3082,6 +3285,10 @@ struct MasterSession {
   // transfer set immutable even if a later control-plane event revokes the
   // manager's authorization while cancellation is propagating to flow workers.
   const std::shared_ptr<const ClusterRebuildContext> population_export_;
+  // Present only for an export admitted by the current steady FDS
+  // relationship. Reconciliation can therefore revoke a removed member
+  // without conflating it with a one-shot population rebuild export.
+  const std::optional<ClusterSteadyExport> steady_export_;
 
  private:
   mutable std::mutex mutex_;
@@ -3604,8 +3811,7 @@ class ReplicationManager::ReplicationGroup {
       co_return authorization.status();
     }
     auto context = std::make_shared<ClusterRebuildContext>(
-        std::move(directive), std::move(manifest),
-        std::move(*authorization));
+        std::move(directive), std::move(manifest), std::move(*authorization));
     bool install_failed = false;
     {
       AssertStateOwner();
@@ -3633,8 +3839,7 @@ class ReplicationManager::ReplicationGroup {
       LatchReplicationFailure(reason);
       co_return absl::AbortedError(reason);
     }
-    celer::ThisWorker().self_->Spawn(
-        RunEmptyPopulationInitialization(context));
+    celer::ThisWorker().self_->Spawn(RunEmptyPopulationInitialization(context));
     co_return context->completion_;
   }
 
@@ -3660,7 +3865,8 @@ class ReplicationManager::ReplicationGroup {
     absl::Status storage_ready =
         co_await storage_->BeginReplicaFullSync(kFaultFullSyncSession);
     if (!storage_ready.ok()) co_return storage_ready;
-    storage_ready = co_await GlobalFunctionCatalog().ReplaceFromLibraryCodes({});
+    storage_ready =
+        co_await GlobalFunctionCatalog().ReplaceFromLibraryCodes({});
     if (!storage_ready.ok()) co_return storage_ready;
     storage_ready = co_await storage_->CompleteReplicaFullSync(
         kFaultFullSyncSession,
@@ -3687,8 +3893,8 @@ class ReplicationManager::ReplicationGroup {
     if (!authorization.ok()) co_return authorization.status();
     auto population = std::make_shared<ClusterRebuildContext>(
         rebuild, *manifest, std::move(*authorization));
-    for (std::uint32_t partition = 0;
-         partition < kReplicationPartitionCount; ++partition) {
+    for (std::uint32_t partition = 0; partition < kReplicationPartitionCount;
+         ++partition) {
       const std::uint64_t target_epoch = partition + 1;
       absl::Status recorded = cluster_group_->RecordPartitionReset(
           rebuild.identity_, partition, target_epoch);
@@ -3713,8 +3919,8 @@ class ReplicationManager::ReplicationGroup {
 
     auto frontier = std::make_shared<detail::ReplicaAppliedFrontier>(
         directive.required_applied_next_lsns_.size(), storage_->worker_count());
-    absl::Status frontier_installed = frontier->InstallNextLsns(
-        directive.required_applied_next_lsns_);
+    absl::Status frontier_installed =
+        frontier->InstallNextLsns(directive.required_applied_next_lsns_);
     if (!frontier_installed.ok()) co_return frontier_installed;
     population->ready_token_ = *ready;
     population->state_.store(ReplicationGroupState::kReady,
@@ -3741,11 +3947,11 @@ class ReplicationManager::ReplicationGroup {
       std::shared_ptr<ClusterPromotionPrepareContext> context,
       std::shared_ptr<ClusterRebuildContext> population,
       std::shared_ptr<detail::ReplicaAppliedFrontier> frontier,
-      std::shared_ptr<ReplicaSession> session) {
+      std::shared_ptr<ReplicaSession> session, bool native_population) {
     auto fail_stop = [&](absl::Status status, std::string_view boundary) {
-      const std::string reason = absl::StrCat(
-          "cluster promotion-prepare ", boundary,
-          " outcome is uncertain: ", status.message());
+      const std::string reason =
+          absl::StrCat("cluster promotion-prepare ", boundary,
+                       " outcome is uncertain: ", status.message());
       (void)cluster_group_->FailStop(population->directive_.identity_);
       LatchReplicationFailure(reason);
       const absl::Status terminal = absl::InternalError(reason);
@@ -3753,8 +3959,16 @@ class ReplicationManager::ReplicationGroup {
       return terminal;
     };
 
-    absl::Status revoked =
-        co_await RevokeClusterRebuildSourceAuthorizations();
+#if KEYLANE_FAULTS_ENABLED
+    if (KEYLANE_FAULT_MATCHES("KEYLANE_REPLICATION_STALL_PROMOTION_ACTION",
+                              context->directive_.identity_.attempt_id_)) {
+      absl::Status stalled = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(200));
+      if (!stalled.ok()) co_return fail_stop(stalled, "fault stall");
+    }
+#endif
+
+    absl::Status revoked = co_await RevokeClusterRebuildSourceAuthorizations();
     if (!revoked.ok()) co_return fail_stop(revoked, "source revocation");
     if (session != nullptr) {
       absl::Status stopped = co_await CancelAndWaitForReplicaFlows(session);
@@ -3792,17 +4006,32 @@ class ReplicationManager::ReplicationGroup {
       ~ExpirationResumeGuard() { storage_->ResumeExpiration(); }
     } expiration_resume{storage_};
 
-    auto frozen_snapshot = frontier->TrySnapshot();
-    if (!frozen_snapshot.ok()) {
-      co_return fail_stop(frozen_snapshot.status(), "frontier freeze");
+    std::vector<std::uint64_t> frozen;
+    if (native_population) {
+      auto watermark = co_await CaptureNativeReplicationWatermark();
+      if (!watermark.ok()) {
+        co_return fail_stop(watermark.status(), "native frontier freeze");
+      }
+      if (!watermark->has_value() ||
+          (*watermark)->history_id_ != context->directive_.parent_history_id_) {
+        co_return fail_stop(
+            absl::FailedPreconditionError(
+                "native candidate history changed during preparation"),
+            "native frontier freeze");
+      }
+      frozen = std::move((*watermark)->next_lsns_);
+    } else {
+      auto frozen_snapshot = frontier->TrySnapshot();
+      if (!frozen_snapshot.ok()) {
+        co_return fail_stop(frozen_snapshot.status(), "frontier freeze");
+      }
+      frozen = std::move(*frozen_snapshot);
     }
-    std::vector<std::uint64_t> frozen = std::move(*frozen_snapshot);
     if (frozen.size() !=
         context->directive_.required_applied_next_lsns_.size()) {
-      co_return fail_stop(
-          absl::FailedPreconditionError(
-              "joined candidate frontier changed flow layout"),
-          "frontier freeze");
+      co_return fail_stop(absl::FailedPreconditionError(
+                              "joined candidate frontier changed flow layout"),
+                          "frontier freeze");
     }
     for (std::size_t flow = 0; flow < frozen.size(); ++flow) {
       if (frozen[flow] <
@@ -3858,8 +4087,8 @@ class ReplicationManager::ReplicationGroup {
     co_return absl::OkStatus();
   }
 
-  Task<absl::StatusOr<std::shared_ptr<
-      detail::ClusterPromotionPrepareCompletionState>>>
+  Task<absl::StatusOr<
+      std::shared_ptr<detail::ClusterPromotionPrepareCompletionState>>>
   StartClusterPromotionPrepareDirective(
       ClusterPromotionPrepareDirective directive) {
     if (celer::ThisWorker().id_ != 0) {
@@ -3873,19 +4102,20 @@ class ReplicationManager::ReplicationGroup {
           "promotion prepare requires Meta-managed population mode");
     }
     const RebuildIdentity& identity = directive.identity_;
-    const bool zero_exclusion = std::all_of(
-        directive.old_authority_exclusion_hash_.begin(),
-        directive.old_authority_exclusion_hash_.end(),
-        [](std::uint8_t byte) { return byte == 0; });
+    const bool zero_exclusion =
+        std::all_of(directive.old_authority_exclusion_hash_.begin(),
+                    directive.old_authority_exclusion_hash_.end(),
+                    [](std::uint8_t byte) { return byte == 0; });
     if (identity.group_id_.empty() || identity.assignment_id_.empty() ||
         identity.term_ == 0 || identity.directive_revision_ == 0 ||
         identity.authority_id_.empty() || identity.source_node_id_.empty() ||
         identity.source_assignment_id_.empty() ||
-        identity.source_boot_id_.empty() || identity.source_history_id_.empty() ||
+        identity.source_boot_id_.empty() ||
+        identity.source_history_id_.empty() ||
         identity.target_node_id_ != node_id_ ||
-        identity.target_boot_id_ != boot_id_ || identity.operation_id_.empty() ||
-        identity.directive_id_.empty() || identity.attempt_id_.empty() ||
-        identity.manifest_revision_ == 0 ||
+        identity.target_boot_id_ != boot_id_ ||
+        identity.operation_id_.empty() || identity.directive_id_.empty() ||
+        identity.attempt_id_.empty() || identity.manifest_revision_ == 0 ||
         identity.partition_replication_epoch_ == 0 ||
         directive.parent_history_id_.empty() ||
         directive.parent_history_id_ != identity.source_history_id_ ||
@@ -3973,8 +4203,8 @@ class ReplicationManager::ReplicationGroup {
         }
       }
 
-      context =
-          std::make_shared<ClusterPromotionPrepareContext>(std::move(directive));
+      context = std::make_shared<ClusterPromotionPrepareContext>(
+          std::move(directive));
       cluster_promotion_prepare_ = context;
       replica_reconfiguration_running_ = true;
       source_authorizations_.RevokeAll();
@@ -3991,8 +4221,1406 @@ class ReplicationManager::ReplicationGroup {
     storage_->SetExpirationAuthority(false);
     if (session != nullptr) session->Cancel();
     celer::ThisWorker().self_->Spawn(RunClusterPromotionPrepare(
-        context, population, std::move(frontier), std::move(session)));
+        context, population, std::move(frontier), std::move(session),
+        /*native_population=*/false));
     co_return context->completion_;
+  }
+
+  Task<absl::StatusOr<
+      std::shared_ptr<detail::ClusterPromotionPrepareCompletionState>>>
+  StartNativeClusterFailoverPromotionPrepare(
+      ClusterPromotionPrepareDirective directive) {
+    AssertStateOwner();
+    if (cluster_promotion_prepare_ != nullptr) {
+      if (cluster_promotion_prepare_->directive_ == directive) {
+        co_return cluster_promotion_prepare_->completion_;
+      }
+      co_return absl::FailedPreconditionError(
+          "another promotion-prepare identity is retained for this boot");
+    }
+    if (failed_stopped_.load(std::memory_order_relaxed)) {
+      co_return absl::FailedPreconditionError(absl::StrCat(
+          "replication is failed-stopped until restart: ", failure_reason_));
+    }
+    if (replica_reconfiguration_running_ ||
+        active_replica_session_ != nullptr || upstream_.has_value() ||
+        role_.load(std::memory_order_acquire) != ReplicationRole::kMaster) {
+      co_return absl::FailedPreconditionError(
+          "native failover candidate is not a stable primary population");
+    }
+    std::shared_ptr<ClusterRebuildContext> population = cluster_rebuild_;
+    if (population == nullptr ||
+        population->state_.load(std::memory_order_acquire) !=
+            ReplicationGroupState::kReady ||
+        !population->ready_token_.has_value()) {
+      co_return absl::FailedPreconditionError(
+          "native failover candidate population is not ready");
+    }
+    const RebuildIdentity& ready = population->ready_token_->identity();
+    const RebuildIdentity& requested = directive.identity_;
+    if (ready.group_id_ != requested.group_id_ ||
+        ready.assignment_id_ != requested.assignment_id_ ||
+        !population->ready_token_->CanCarryForwardToTerm(requested.term_) ||
+        ready.target_node_id_ != requested.target_node_id_ ||
+        ready.target_boot_id_ != requested.target_boot_id_ ||
+        ready.manifest_revision_ != requested.manifest_revision_ ||
+        ready.manifest_id_ != requested.manifest_id_ ||
+        ready.partition_replication_epoch_ !=
+            requested.partition_replication_epoch_ ||
+        requested.source_node_id_ != node_id_ ||
+        requested.source_assignment_id_ != ready.assignment_id_ ||
+        requested.source_boot_id_ != boot_id_) {
+      co_return absl::FailedPreconditionError(
+          "native failover action does not match the ready population");
+    }
+
+    auto context =
+        std::make_shared<ClusterPromotionPrepareContext>(std::move(directive));
+    cluster_promotion_prepare_ = context;
+    replica_reconfiguration_running_ = true;
+    source_authorizations_.RevokeAll();
+    role_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
+    storage_->SetReplicaLoading(true);
+    storage_->SetExpirationAuthority(false);
+    celer::ThisWorker().self_->Spawn(RunClusterPromotionPrepare(
+        context, std::move(population), nullptr, nullptr,
+        /*native_population=*/true));
+    co_return context->completion_;
+  }
+
+  absl::Status ValidateClusterSourcePause(
+      const DesiredClusterSourcePause& desired) const {
+    if (IsZeroBytes(desired.transition_id_) ||
+        desired.transition_revision_ == 0 || desired.group_id_.empty() ||
+        desired.source_node_id_ != node_id_ ||
+        desired.source_assignment_id_.empty() ||
+        desired.source_boot_id_ != boot_id_ ||
+        desired.source_history_id_.empty() || desired.source_group_term_ == 0 ||
+        desired.flow_count_ == 0 ||
+        desired.flow_count_ > cluster::control::kMaxCandidateFlows ||
+        desired.manifest_revision_ == 0 ||
+        IsZeroBytes(desired.manifest_id_.bytes_) ||
+        desired.partition_replication_epoch_ == 0) {
+      return absl::InvalidArgumentError(
+          "cluster source pause identity is incomplete");
+    }
+    return absl::OkStatus();
+  }
+
+  bool SourcePausePopulationMatches(
+      const DesiredClusterSourcePause& desired) const {
+    AssertStateOwner();
+    if (failed_stopped_.load(std::memory_order_relaxed) ||
+        replica_reconfiguration_running_ || cluster_rebuild_ == nullptr ||
+        cluster_rebuild_->state_.load(std::memory_order_acquire) !=
+            ReplicationGroupState::kReady ||
+        !cluster_rebuild_->ready_token_.has_value() ||
+        role_.load(std::memory_order_acquire) != ReplicationRole::kMaster ||
+        upstream_.has_value() ||
+        !native_dataset_valid_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    const ReadyToken& ready = *cluster_rebuild_->ready_token_;
+    const RebuildIdentity& identity = ready.identity();
+    std::uint64_t current_group_term = identity.term_;
+    if (activated_failover_activation_.has_value() &&
+        activated_failover_activation_->group_id_ == identity.group_id_ &&
+        activated_failover_activation_->candidate_assignment_id_ ==
+            identity.assignment_id_ &&
+        activated_failover_activation_->manifest_revision_ ==
+            identity.manifest_revision_ &&
+        activated_failover_activation_->manifest_id_ == identity.manifest_id_ &&
+        activated_failover_activation_->partition_replication_epoch_ ==
+            identity.partition_replication_epoch_) {
+      current_group_term = activated_failover_activation_->target_term_;
+    }
+    return identity.group_id_ == desired.group_id_ &&
+           identity.assignment_id_ == desired.source_assignment_id_ &&
+           identity.target_node_id_ == desired.source_node_id_ &&
+           identity.target_boot_id_ == desired.source_boot_id_ &&
+           desired.source_group_term_ == current_group_term &&
+           identity.manifest_revision_ == desired.manifest_revision_ &&
+           identity.manifest_id_ == desired.manifest_id_ &&
+           identity.partition_replication_epoch_ ==
+               desired.partition_replication_epoch_ &&
+           desired.flow_count_ == storage_->worker_count();
+  }
+
+  Task<absl::Status> CaptureClusterSourcePause(
+      const std::shared_ptr<ClusterSourcePauseContext>& context) {
+    AssertStateOwner();
+    if (cluster_source_pause_ != context) {
+      co_return absl::AbortedError("cluster source pause was replaced");
+    }
+    context->stable_next_lsns_.reset();
+    context->failure_detail_.clear();
+    if (!SourcePausePopulationMatches(context->desired_)) {
+      const absl::Status mismatch = absl::FailedPreconditionError(
+          "cluster source pause does not match the ready owner population");
+      context->failure_detail_ = mismatch.ToString();
+      co_return mismatch;
+    }
+
+    auto watermark = co_await CaptureNativeReplicationWatermark();
+    if (cluster_source_pause_ != context) {
+      co_return absl::AbortedError("cluster source pause was replaced");
+    }
+    if (!watermark.ok()) {
+      context->failure_detail_ = watermark.status().ToString();
+      co_return watermark.status();
+    }
+    if (!watermark->has_value()) {
+      const absl::Status unavailable = absl::UnavailableError(
+          "native source frontier is not currently available");
+      context->failure_detail_ = unavailable.ToString();
+      co_return unavailable;
+    }
+    if ((*watermark)->history_id_ != context->desired_.source_history_id_ ||
+        (*watermark)->next_lsns_.size() != context->desired_.flow_count_) {
+      const absl::Status mismatch = absl::FailedPreconditionError(
+          "captured native source frontier changed compatibility domain");
+      context->failure_detail_ = mismatch.ToString();
+      co_return mismatch;
+    }
+    context->stable_next_lsns_ = std::move((*watermark)->next_lsns_);
+    co_return absl::OkStatus();
+  }
+
+  Task<absl::Status> ReconcileClusterSourcePause(
+      std::optional<DesiredClusterSourcePause> desired) {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, desired = std::move(desired)]() mutable {
+            return ReconcileClusterSourcePause(std::move(desired));
+          });
+    }
+    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "source pause reconciliation requires Meta-managed population mode");
+    }
+    if (cluster_control_stopping_) {
+      co_return absl::CancelledError(
+          "source pause reconciliation stopped for process shutdown");
+    }
+    AssertStateOwner();
+
+    if (!desired.has_value()) {
+      const std::shared_ptr<ClusterSourcePauseContext> previous =
+          std::move(cluster_source_pause_);
+      if (previous != nullptr && previous->expiration_pause_held_) {
+        previous->expiration_pause_held_ = false;
+        storage_->ResumeExpiration();
+      }
+      co_return absl::OkStatus();
+    }
+    if (absl::Status valid = ValidateClusterSourcePause(*desired);
+        !valid.ok()) {
+      co_return valid;
+    }
+    if (!SourcePausePopulationMatches(*desired)) {
+      co_return absl::FailedPreconditionError(
+          "cluster source pause does not match the ready owner population");
+    }
+    if (cluster_source_pause_ != nullptr &&
+        cluster_source_pause_->desired_ == *desired &&
+        cluster_source_pause_->stable_next_lsns_.has_value()) {
+      co_return absl::OkStatus();
+    }
+
+    auto next =
+        std::make_shared<ClusterSourcePauseContext>(std::move(*desired));
+    if (cluster_source_pause_ != nullptr &&
+        cluster_source_pause_->expiration_pause_held_) {
+      next->expiration_pause_held_ = true;
+      cluster_source_pause_->expiration_pause_held_ = false;
+    }
+    cluster_source_pause_ = next;
+    if (!next->expiration_pause_held_) {
+      absl::Status quiesced = co_await storage_->QuiesceExpiration();
+      if (!quiesced.ok()) {
+        if (cluster_source_pause_ == next) {
+          next->failure_detail_ = quiesced.ToString();
+        }
+        co_return quiesced;
+      }
+      if (cluster_source_pause_ != next) {
+        storage_->ResumeExpiration();
+        co_return absl::AbortedError("cluster source pause was replaced");
+      }
+      next->expiration_pause_held_ = true;
+    }
+    co_return co_await CaptureClusterSourcePause(next);
+  }
+
+  Task<ClusterSourcePauseStatus> cluster_source_pause_status() const {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this] { return cluster_source_pause_status(); });
+    }
+    AssertStateOwner();
+    ClusterSourcePauseStatus result;
+    const std::shared_ptr<ClusterSourcePauseContext> context =
+        cluster_source_pause_;
+    if (context == nullptr) co_return result;
+    result.desired_ = context->desired_;
+    result.failure_detail_ = context->failure_detail_;
+    if (!context->stable_next_lsns_.has_value() ||
+        !SourcePausePopulationMatches(context->desired_)) {
+      co_return result;
+    }
+    const ReplicationIdentity current = co_await identity();
+    if (cluster_source_pause_ != context ||
+        current.local_node_id_ != context->desired_.source_node_id_ ||
+        current.boot_id_ != context->desired_.source_boot_id_ ||
+        current.local_history_id_ != context->desired_.source_history_id_) {
+      if (cluster_source_pause_ == context) {
+        context->stable_next_lsns_.reset();
+        context->failure_detail_ =
+            "native source identity changed after pause capture";
+        result.failure_detail_ = context->failure_detail_;
+      }
+      co_return result;
+    }
+    result.stable_next_lsns_ = context->stable_next_lsns_;
+    co_return result;
+  }
+
+  bool FailoverPopulationMatches(
+      const DesiredClusterFailoverAction& desired) const {
+    AssertStateOwner();
+    if (cluster_rebuild_ == nullptr ||
+        cluster_rebuild_->state_.load(std::memory_order_acquire) !=
+            ReplicationGroupState::kReady ||
+        !cluster_rebuild_->ready_token_.has_value()) {
+      return false;
+    }
+    const RebuildIdentity& ready = cluster_rebuild_->ready_token_->identity();
+    return ready.group_id_ == desired.group_id_ &&
+           ready.assignment_id_ == desired.candidate_assignment_id_ &&
+           ready.target_node_id_ == desired.candidate_node_id_ &&
+           ready.target_boot_id_ == desired.candidate_boot_id_ &&
+           ready.manifest_revision_ == desired.manifest_revision_ &&
+           ready.manifest_id_ == desired.manifest_id_ &&
+           ready.partition_replication_epoch_ ==
+               desired.partition_replication_epoch_;
+  }
+
+  bool FailoverReplicaDomainMatches(
+      const DesiredClusterFailoverAction& desired) const {
+    AssertStateOwner();
+    if (!FailoverPopulationMatches(desired)) return false;
+    const ReadyToken& ready = *cluster_rebuild_->ready_token_;
+    const RebuildIdentity& identity = ready.identity();
+    return identity.term_ == desired.domain_.source_group_term_ &&
+           identity.source_node_id_ == desired.domain_.source_node_id_ &&
+           identity.source_assignment_id_ ==
+               desired.domain_.source_assignment_id_ &&
+           identity.source_boot_id_ == desired.domain_.source_boot_id_ &&
+           identity.source_history_id_ == desired.domain_.source_history_id_ &&
+           ready.cut_vector().size() == desired.domain_.flow_count_ &&
+           applied_frontier_ != nullptr &&
+           applied_frontier_->size() == desired.domain_.flow_count_;
+  }
+
+  bool IsNativeSelfOriginDomain(
+      const DesiredClusterFailoverAction& desired) const {
+    return desired.mode_ == ClusterFailoverMode::kUncontrolled &&
+           desired.domain_.source_node_id_ == node_id_ &&
+           desired.domain_.source_assignment_id_ ==
+               desired.candidate_assignment_id_ &&
+           desired.domain_.source_boot_id_ == boot_id_ &&
+           desired.domain_.source_group_term_ !=
+               std::numeric_limits<std::uint64_t>::max() &&
+           desired.domain_.source_group_term_ + 1 == desired.target_term_ &&
+           desired.domain_.flow_count_ == storage_->worker_count();
+  }
+
+  bool ReadyPopulationIsSuppressed(
+      const DesiredClusterFailoverAction& failed) const {
+    AssertStateOwner();
+    if (!FailoverPopulationMatches(failed)) return false;
+    const ReadyToken& ready = *cluster_rebuild_->ready_token_;
+    const RebuildIdentity& identity = ready.identity();
+    const bool replica_domain =
+        identity.term_ == failed.domain_.source_group_term_ &&
+        identity.source_node_id_ == failed.domain_.source_node_id_ &&
+        identity.source_assignment_id_ ==
+            failed.domain_.source_assignment_id_ &&
+        identity.source_boot_id_ == failed.domain_.source_boot_id_ &&
+        identity.source_history_id_ == failed.domain_.source_history_id_ &&
+        ready.cut_vector().size() == failed.domain_.flow_count_;
+    const bool self_origin_domain = IsNativeSelfOriginDomain(failed);
+    return replica_domain || self_origin_domain;
+  }
+
+  void PublishFailoverActionFailure(
+      const std::shared_ptr<ClusterFailoverActionContext>& context,
+      std::string failure_class, std::string failure_detail) {
+    AssertStateOwner();
+    if (context->failure_published_ || context->cancelled_ ||
+        cluster_failover_action_ != context) {
+      return;
+    }
+    context->state_ = ClusterFailoverActionState::kFailed;
+    context->failure_class_ = std::move(failure_class);
+    context->failure_detail_ = std::move(failure_detail);
+    context->failure_published_ = true;
+    failed_failover_candidate_ = context->desired_;
+  }
+
+  std::chrono::milliseconds FailoverActionWatchdog() const {
+#if KEYLANE_FAULTS_ENABLED
+    if (const char* configured =
+            std::getenv("KEYLANE_REPLICATION_ACTION_WATCHDOG_MS");
+        configured != nullptr) {
+      std::uint64_t parsed = 0;
+      const std::string_view text(configured);
+      const auto [end, error] =
+          std::from_chars(text.data(), text.data() + text.size(), parsed);
+      if (error == std::errc{} && end == text.data() + text.size() &&
+          parsed > 0 && parsed <= 60'000) {
+        return std::chrono::milliseconds(parsed);
+      }
+    }
+#endif
+    return std::chrono::seconds(30);
+  }
+
+  Task<absl::Status> WaitForFailoverActionRetry(
+      const std::shared_ptr<ClusterFailoverActionContext>& context,
+      std::chrono::steady_clock::time_point watchdog_deadline) {
+    constexpr auto kRetry = std::chrono::milliseconds(1000);
+    constexpr auto kSlice = std::chrono::milliseconds(10);
+    auto remaining = kRetry;
+    while (remaining > std::chrono::milliseconds::zero()) {
+      if (context->cancelled_ || cluster_control_stopping_) {
+        co_return absl::CancelledError(
+            "cluster failover action was replaced or stopped");
+      }
+      if (std::chrono::steady_clock::now() >= watchdog_deadline) {
+        PublishFailoverActionFailure(
+            context, "watchdog",
+            "promotion preparation exceeded the boot-local watchdog");
+        co_return absl::DeadlineExceededError(context->failure_detail_);
+      }
+      const auto wait = std::min(remaining, kSlice);
+      absl::Status waited =
+          co_await celer::SleepFor(*celer::ThisWorker().self_, wait);
+      if (!waited.ok()) co_return waited;
+      remaining -= wait;
+    }
+    co_return absl::OkStatus();
+  }
+
+  Task<absl::Status> RunClusterFailoverAction(
+      std::shared_ptr<ClusterFailoverActionContext> context) {
+    AssertStateOwner();
+    const auto finish = [&] { context->runner_finished_ = true; };
+    // RunClusterFailoverAction is spawned only after an exact authorized FDS
+    // has been installed for this local node/assignment/boot. That is the
+    // action's first local execution boundary: time spent offline or awaiting
+    // authorization is excluded, while population loss and all later
+    // transient retries remain bounded by this one non-refreshable deadline.
+    const auto watchdog_deadline =
+        std::chrono::steady_clock::now() + FailoverActionWatchdog();
+    const auto watchdog_expired = [&] {
+      if (std::chrono::steady_clock::now() < watchdog_deadline) {
+        return false;
+      }
+      PublishFailoverActionFailure(
+          context, "watchdog",
+          "promotion preparation exceeded the boot-local watchdog");
+      return true;
+    };
+    std::vector<std::uint64_t> minimum_frontier(
+        context->desired_.domain_.flow_count_, 1);
+#if KEYLANE_FAULTS_ENABLED
+    // The existing #40 fixture seeds a complete Ready population before this
+    // action enters production validation. It is compiled out of ordinary
+    // binaries and still passes through every exact domain check below.
+    ClusterPromotionPrepareDirective seed =
+        BuildFailoverPrepareDirective(context->desired_, minimum_frontier);
+    if (KEYLANE_FAULT_MATCHES(
+            "KEYLANE_REPLICATION_SEED_READY_PROMOTION_CANDIDATE",
+            seed.identity_.attempt_id_)) {
+      absl::Status seeded =
+          co_await SeedReadyPromotionCandidateForFaultTest(seed);
+      if (!seeded.ok()) {
+        PublishFailoverActionFailure(context, "population-seed",
+                                     seeded.ToString());
+        finish();
+        co_return seeded;
+      }
+    }
+#endif
+
+    for (;;) {
+      if (context->cancelled_ || cluster_control_stopping_) {
+        finish();
+        co_return absl::CancelledError(
+            "cluster failover action was replaced or stopped");
+      }
+      if (watchdog_expired()) {
+        finish();
+        co_return absl::DeadlineExceededError(context->failure_detail_);
+      }
+      if (!FailoverPopulationMatches(context->desired_)) {
+        context->state_ = ClusterFailoverActionState::kWaitingForPopulation;
+        absl::Status waited =
+            co_await WaitForFailoverActionRetry(context, watchdog_deadline);
+        if (!waited.ok()) {
+          finish();
+          co_return waited;
+        }
+        continue;
+      }
+      const bool native_population =
+          !FailoverReplicaDomainMatches(context->desired_) &&
+          IsNativeSelfOriginDomain(context->desired_);
+      std::vector<std::uint64_t> current_frontier;
+      if (native_population) {
+        auto watermark = co_await CaptureNativeReplicationWatermark();
+        if (!watermark.ok()) {
+          context->state_ = ClusterFailoverActionState::kRetrying;
+          absl::Status waited =
+              co_await WaitForFailoverActionRetry(context, watchdog_deadline);
+          if (!waited.ok()) {
+            finish();
+            co_return waited;
+          }
+          continue;
+        }
+        if (!watermark->has_value()) {
+          context->state_ = ClusterFailoverActionState::kWaitingForPopulation;
+          absl::Status waited =
+              co_await WaitForFailoverActionRetry(context, watchdog_deadline);
+          if (!waited.ok()) {
+            finish();
+            co_return waited;
+          }
+          continue;
+        }
+        if ((*watermark)->history_id_ !=
+                context->desired_.domain_.source_history_id_ ||
+            (*watermark)->next_lsns_.size() !=
+                context->desired_.domain_.flow_count_) {
+          PublishFailoverActionFailure(
+              context, "population-domain",
+              "native population no longer matches its self-origin domain");
+          finish();
+          co_return absl::FailedPreconditionError(context->failure_detail_);
+        }
+        current_frontier = std::move((*watermark)->next_lsns_);
+      } else {
+        if (!FailoverReplicaDomainMatches(context->desired_)) {
+          PublishFailoverActionFailure(
+              context, "population-domain",
+              "ready population does not match the committed compatibility "
+              "domain");
+          finish();
+          co_return absl::FailedPreconditionError(context->failure_detail_);
+        }
+        auto current = applied_frontier_->TrySnapshot();
+        if (!current.ok()) {
+          context->state_ = ClusterFailoverActionState::kRetrying;
+          absl::Status waited =
+              co_await WaitForFailoverActionRetry(context, watchdog_deadline);
+          if (!waited.ok()) {
+            finish();
+            co_return waited;
+          }
+          continue;
+        }
+        current_frontier = std::move(*current);
+      }
+      ClusterPromotionPrepareDirective directive =
+          BuildFailoverPrepareDirective(context->desired_,
+                                        std::move(current_frontier));
+      context->prepare_directive_ = directive;
+      context->state_ = ClusterFailoverActionState::kPreparing;
+      absl::StatusOr<
+          std::shared_ptr<detail::ClusterPromotionPrepareCompletionState>>
+          started{absl::UnknownError("failover promotion was not dispatched")};
+#if KEYLANE_FAULTS_ENABLED
+      if (KEYLANE_FAULT_MATCHES(
+              "KEYLANE_REPLICATION_RETRY_FAILOVER_PROMOTION_ADMISSION",
+              directive.identity_.attempt_id_)) {
+        started = absl::UnavailableError(
+            "injected retryable failover promotion admission failure");
+      } else
+#endif
+          if (native_population) {
+        started = co_await StartNativeClusterFailoverPromotionPrepare(
+            std::move(directive));
+      } else {
+        started = co_await StartClusterPromotionPrepareDirective(
+            std::move(directive));
+      }
+      if (!started.ok()) {
+        const bool transient =
+            absl::IsUnavailable(started.status()) ||
+            absl::IsResourceExhausted(started.status()) ||
+            (absl::IsFailedPrecondition(started.status()) &&
+             !failed_stopped_.load(std::memory_order_relaxed) &&
+             cluster_promotion_prepare_ == nullptr);
+        if (transient) {
+          context->state_ = ClusterFailoverActionState::kRetrying;
+          absl::Status waited =
+              co_await WaitForFailoverActionRetry(context, watchdog_deadline);
+          if (!waited.ok()) {
+            finish();
+            co_return waited;
+          }
+          continue;
+        }
+        PublishFailoverActionFailure(context, "promotion-admission",
+                                     started.status().ToString());
+        finish();
+        co_return started.status();
+      }
+
+      std::optional<ClusterPromotionPrepareCompletion::Result> result;
+      while (!(result = (*started)->result()).has_value()) {
+        (void)watchdog_expired();
+        absl::Status waited = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, std::chrono::milliseconds(10));
+        if (!waited.ok()) {
+          finish();
+          co_return waited;
+        }
+      }
+      if (!result->ok()) {
+        PublishFailoverActionFailure(context, "promotion-prepare",
+                                     result->status().ToString());
+        finish();
+        co_return result->status();
+      }
+      context->prepared_child_history_created_ = true;
+      if (!context->failure_published_ && !context->cancelled_ &&
+          cluster_failover_action_ == context) {
+        auto context_id = cluster::control::GenerateId128();
+        if (!context_id.ok()) {
+          PublishFailoverActionFailure(context, "prepared-context",
+                                       context_id.status().ToString());
+          finish();
+          co_return context_id.status();
+        }
+        context->prepared_ = ClusterFailoverPreparedContext{
+            .transition_id_ = context->desired_.transition_id_,
+            .action_id_ = context->desired_.action_id_,
+            .context_id_ = *context_id,
+            .context_hash_ = ComputePreparedContextHash(context->desired_,
+                                                        *context_id, **result),
+            .promotion_ = **result,
+        };
+        context->state_ = ClusterFailoverActionState::kPrepared;
+      }
+      finish();
+      co_return absl::OkStatus();
+    }
+  }
+
+  absl::Status ValidateClusterFailoverAction(
+      const DesiredClusterFailoverAction& desired) const {
+    const ClusterFailoverCompatibilityDomain& domain = desired.domain_;
+    if (IsZeroBytes(desired.transition_id_) ||
+        IsZeroBytes(desired.action_id_) || desired.transition_revision_ == 0 ||
+        desired.target_term_ == 0 || desired.committed_group_term_ == 0 ||
+        desired.group_id_.empty() || desired.candidate_node_id_ != node_id_ ||
+        desired.candidate_assignment_id_.empty() ||
+        desired.candidate_boot_id_ != boot_id_ ||
+        domain.source_group_term_ == 0 ||
+        domain.source_group_term_ > desired.target_term_ ||
+        domain.source_node_id_.empty() ||
+        domain.source_assignment_id_.empty() ||
+        domain.source_boot_id_.empty() || domain.source_history_id_.empty() ||
+        domain.flow_count_ == 0 ||
+        domain.flow_count_ > cluster::control::kMaxCandidateFlows ||
+        desired.manifest_revision_ == 0 ||
+        IsZeroBytes(desired.manifest_id_.bytes_) ||
+        desired.partition_replication_epoch_ == 0 ||
+        (desired.authorized_revision_.has_value() &&
+         (*desired.authorized_revision_ == 0 ||
+          *desired.authorized_revision_ > desired.transition_revision_))) {
+      return absl::InvalidArgumentError(
+          "cluster failover action identity is incomplete");
+    }
+    if (desired.mode_ == ClusterFailoverMode::kControlled) {
+      if (desired.committed_group_term_ ==
+              std::numeric_limits<std::uint64_t>::max() ||
+          desired.committed_group_term_ + 1 != desired.target_term_) {
+        return absl::FailedPreconditionError(
+            "controlled failover action does not target the successor term");
+      }
+    } else if (desired.mode_ == ClusterFailoverMode::kUncontrolled) {
+      if (desired.committed_group_term_ != desired.target_term_ ||
+          desired.committed_grant_active_) {
+        return absl::FailedPreconditionError(
+            "uncontrolled failover action requires the fenced target term");
+      }
+    } else {
+      return absl::InvalidArgumentError("unknown cluster failover mode");
+    }
+    return absl::OkStatus();
+  }
+
+  Task<absl::Status> ReconcileClusterFailoverAction(
+      std::optional<DesiredClusterFailoverAction> desired,
+      std::optional<ClusterFailoverActionId> pending_activation_action_id) {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, desired = std::move(desired),
+              pending_activation_action_id]() mutable {
+            return ReconcileClusterFailoverAction(std::move(desired),
+                                                  pending_activation_action_id);
+          });
+    }
+    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "failover action reconciliation requires Meta-managed population "
+          "mode");
+    }
+    if (desired.has_value()) {
+      absl::Status validated = ValidateClusterFailoverAction(*desired);
+      if (!validated.ok()) co_return validated;
+    }
+    if (pending_activation_action_id.has_value() &&
+        IsZeroBytes(*pending_activation_action_id)) {
+      co_return absl::InvalidArgumentError(
+          "pending failover activation action id is zero");
+    }
+    if (desired.has_value() && pending_activation_action_id.has_value()) {
+      co_return absl::FailedPreconditionError(
+          "an active failover transition cannot also be pending activation");
+    }
+    if (cluster_control_stopping_) {
+      co_return absl::CancelledError(
+          "failover action reconciliation stopped for process shutdown");
+    }
+
+    AssertStateOwner();
+    if (cluster_failover_action_ != nullptr && desired.has_value() &&
+        cluster_failover_action_->desired_.transition_id_ ==
+            desired->transition_id_ &&
+        cluster_failover_action_->desired_.action_id_ == desired->action_id_) {
+      DesiredClusterFailoverAction& current =
+          cluster_failover_action_->desired_;
+      const bool retained_controlled_degrade =
+          IsRetainedControlledDegrade(current, *desired);
+      if (!SameFailoverActionExceptAuthorization(current, *desired) &&
+          !retained_controlled_degrade) {
+        co_return absl::FailedPreconditionError(
+            "committed failover action changed immutable execution anchors");
+      }
+      if (desired->transition_revision_ < current.transition_revision_ ||
+          (current.authorized_revision_.has_value() &&
+           current.authorized_revision_ != desired->authorized_revision_)) {
+        co_return absl::FailedPreconditionError(
+            "committed failover action authorization regressed or changed");
+      }
+      current.transition_revision_ = desired->transition_revision_;
+      current.authorized_revision_ = desired->authorized_revision_;
+      if (retained_controlled_degrade) {
+        current.mode_ = desired->mode_;
+        current.committed_group_term_ = desired->committed_group_term_;
+        current.committed_grant_active_ = desired->committed_grant_active_;
+      }
+      if (current.authorized_revision_.has_value() &&
+          !cluster_failover_action_->runner_started_ &&
+          !cluster_failover_action_->failure_published_) {
+        cluster_failover_action_->state_ =
+            ClusterFailoverActionState::kWaitingForPopulation;
+        cluster_failover_action_->runner_started_ = true;
+        cluster_failover_action_->runner_finished_ = false;
+        celer::ThisWorker().self_->Spawn(
+            RunClusterFailoverAction(cluster_failover_action_));
+      }
+      co_return absl::OkStatus();
+    }
+
+    bool retire_abandoned_prepared_history = false;
+    if (cluster_failover_action_ != nullptr) {
+      // Status is withdrawn before any join. A stale task may still finish its
+      // private durability work, but it can no longer reach the heartbeat or
+      // activation seams once FDS replacement begins.
+      const std::shared_ptr<ClusterFailoverActionContext> previous =
+          cluster_failover_action_;
+      previous->cancelled_ = true;
+      cluster_failover_action_.reset();
+      while (!previous->runner_finished_) {
+        absl::Status waited = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!waited.ok()) co_return waited;
+      }
+      const bool retain_for_activation =
+          pending_activation_action_id ==
+              std::optional<ClusterFailoverActionId>(
+                  previous->desired_.action_id_) &&
+          previous->state_ == ClusterFailoverActionState::kPrepared &&
+          previous->prepared_.has_value();
+      if (retain_for_activation) {
+        retained_failover_activation_action_id_ = previous->desired_.action_id_;
+        retained_failover_prepared_context_ = previous->prepared_;
+        retained_failover_desired_action_ = previous->desired_;
+      } else {
+        retire_abandoned_prepared_history =
+            previous->prepared_child_history_created_;
+        if (previous->prepare_directive_.has_value() &&
+            cluster_promotion_prepare_ != nullptr &&
+            cluster_promotion_prepare_->directive_ ==
+                *previous->prepare_directive_) {
+          cluster_promotion_prepare_.reset();
+        }
+        retained_failover_activation_action_id_.reset();
+        retained_failover_prepared_context_.reset();
+        retained_failover_desired_action_.reset();
+      }
+    } else if (pending_activation_action_id !=
+               retained_failover_activation_action_id_) {
+      // A newer ordinary grant or a mismatched failover grant makes any
+      // retained prepared context unconsumable. Once activation succeeds the
+      // child history is the live Owner history and must not be retired by
+      // later context cleanup; before activation it belongs only to this
+      // abandoned handoff.
+      const bool retained_was_activated =
+          retained_failover_activation_action_id_.has_value() &&
+          retained_failover_prepared_context_.has_value() &&
+          activated_failover_activation_.has_value() &&
+          activated_failover_prepared_context_.has_value() &&
+          activated_failover_activation_->action_id_ ==
+              *retained_failover_activation_action_id_ &&
+          *activated_failover_prepared_context_ ==
+              *retained_failover_prepared_context_;
+      retire_abandoned_prepared_history =
+          retained_failover_prepared_context_.has_value() &&
+          !retained_was_activated;
+      cluster_promotion_prepare_.reset();
+      retained_failover_activation_action_id_.reset();
+      retained_failover_prepared_context_.reset();
+      retained_failover_desired_action_.reset();
+    }
+    if (retire_abandoned_prepared_history) {
+      // Withdraw every activation handle before suspending so an interleaved
+      // request cannot consume the child while its source sessions and logs
+      // are being joined. PromotionBase has no safe targeted clear API; it is
+      // durable recovery evidence and is deliberately left intact.
+      absl::Status retired = co_await RetireSourceHistory();
+      if (!retired.ok()) {
+        const std::string failure = absl::StrCat(
+            "abandoned failover child history could not be retired: ",
+            retired.message());
+        LatchReplicationFailure(failure);
+        co_return absl::InternalError(failure);
+      }
+    }
+    if (desired.has_value()) {
+      cluster_failover_action_ =
+          std::make_shared<ClusterFailoverActionContext>(std::move(*desired));
+      retained_failover_activation_action_id_.reset();
+      retained_failover_prepared_context_.reset();
+      retained_failover_desired_action_.reset();
+      if (cluster_failover_action_->desired_.authorized_revision_.has_value()) {
+        cluster_failover_action_->state_ =
+            ClusterFailoverActionState::kWaitingForPopulation;
+        cluster_failover_action_->runner_started_ = true;
+        cluster_failover_action_->runner_finished_ = false;
+        celer::ThisWorker().self_->Spawn(
+            RunClusterFailoverAction(cluster_failover_action_));
+      }
+    }
+    co_return absl::OkStatus();
+  }
+
+  Task<ClusterFailoverActionStatus> cluster_failover_action_status() const {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this] { return cluster_failover_action_status(); });
+    }
+    AssertStateOwner();
+    ClusterFailoverActionStatus result;
+    if (cluster_failover_action_ == nullptr) co_return result;
+    result.state_ = cluster_failover_action_->state_;
+    result.action_ = cluster_failover_action_->desired_;
+    result.prepared_ = cluster_failover_action_->prepared_;
+    result.failure_class_ = cluster_failover_action_->failure_class_;
+    result.failure_detail_ = cluster_failover_action_->failure_detail_;
+    co_return result;
+  }
+
+  Task<std::optional<ClusterFailoverPreparedContext>>
+  FindClusterFailoverPreparedContext(
+      const ClusterFailoverActionId& action_id) const {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(0, [this, action_id] {
+        return FindClusterFailoverPreparedContext(action_id);
+      });
+    }
+    AssertStateOwner();
+    if (retained_failover_activation_action_id_ != action_id) {
+      co_return std::nullopt;
+    }
+    co_return retained_failover_prepared_context_;
+  }
+
+  absl::Status ValidateClusterFailoverActivation(
+      const ClusterFailoverActivation& activation) const {
+    if (IsZeroBytes(activation.action_id_) || activation.group_id_.empty() ||
+        activation.candidate_node_id_ != node_id_ ||
+        activation.candidate_assignment_id_.empty() ||
+        activation.candidate_boot_id_ != boot_id_ ||
+        activation.target_term_ == 0 || activation.manifest_revision_ == 0 ||
+        IsZeroBytes(activation.manifest_id_.bytes_) ||
+        activation.partition_replication_epoch_ == 0) {
+      return absl::InvalidArgumentError(
+          "cluster failover activation identity is incomplete");
+    }
+    return absl::OkStatus();
+  }
+
+  bool ClusterActivationPopulationMatches(
+      const ClusterFailoverActivation& activation) const {
+    AssertStateOwner();
+    if (failed_stopped_.load(std::memory_order_relaxed) ||
+        replica_reconfiguration_running_ || cluster_rebuild_ == nullptr ||
+        cluster_rebuild_->state_.load(std::memory_order_acquire) !=
+            ReplicationGroupState::kReady ||
+        !cluster_rebuild_->ready_token_.has_value() || upstream_.has_value() ||
+        !native_dataset_valid_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    const ReadyToken& ready = *cluster_rebuild_->ready_token_;
+    const RebuildIdentity& identity = ready.identity();
+    return identity.group_id_ == activation.group_id_ &&
+           identity.assignment_id_ == activation.candidate_assignment_id_ &&
+           identity.target_node_id_ == activation.candidate_node_id_ &&
+           identity.target_boot_id_ == activation.candidate_boot_id_ &&
+           ready.CanCarryForwardToTerm(activation.target_term_) &&
+           identity.manifest_revision_ == activation.manifest_revision_ &&
+           identity.manifest_id_ == activation.manifest_id_ &&
+           identity.partition_replication_epoch_ ==
+               activation.partition_replication_epoch_;
+  }
+
+  Task<absl::Status> ActivateClusterPreparedPromotion(
+      ClusterFailoverActivation activation) {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, activation = std::move(activation)]() mutable {
+            return ActivateClusterPreparedPromotion(std::move(activation));
+          });
+    }
+    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "cluster promotion activation requires Meta-managed population "
+          "mode");
+    }
+    if (cluster_control_stopping_) {
+      co_return absl::CancelledError(
+          "cluster promotion activation stopped for process shutdown");
+    }
+    if (absl::Status valid = ValidateClusterFailoverActivation(activation);
+        !valid.ok()) {
+      co_return valid;
+    }
+    AssertStateOwner();
+    if (!ClusterActivationPopulationMatches(activation)) {
+      co_return absl::FailedPreconditionError(
+          "cluster activation does not match the ready population");
+    }
+
+    const ReplicationIdentity current = co_await identity();
+    AssertStateOwner();
+    if (!ClusterActivationPopulationMatches(activation)) {
+      co_return absl::FailedPreconditionError(
+          "cluster activation population changed during validation");
+    }
+    if (activated_failover_activation_.has_value() &&
+        *activated_failover_activation_ == activation) {
+      if (!activated_failover_prepared_context_.has_value() ||
+          current.local_history_id_ != activated_failover_prepared_context_
+                                           ->promotion_.child_history_id_ ||
+          role_.load(std::memory_order_acquire) != ReplicationRole::kMaster ||
+          storage_->ReplicaRecoveryFenced() || is_loading()) {
+        co_return absl::FailedPreconditionError(
+            "activated cluster promotion no longer matches local state");
+      }
+      co_return absl::OkStatus();
+    }
+
+    if (retained_failover_activation_action_id_ !=
+            std::optional<ClusterFailoverActionId>(activation.action_id_) ||
+        !retained_failover_prepared_context_.has_value() ||
+        !retained_failover_desired_action_.has_value()) {
+      co_return absl::FailedPreconditionError(
+          "cluster activation has no matching retained prepared action");
+    }
+    const DesiredClusterFailoverAction& desired =
+        *retained_failover_desired_action_;
+    const ClusterFailoverPreparedContext& prepared =
+        *retained_failover_prepared_context_;
+    if (desired.action_id_ != activation.action_id_ ||
+        desired.group_id_ != activation.group_id_ ||
+        desired.candidate_node_id_ != activation.candidate_node_id_ ||
+        desired.candidate_assignment_id_ !=
+            activation.candidate_assignment_id_ ||
+        desired.candidate_boot_id_ != activation.candidate_boot_id_ ||
+        desired.target_term_ != activation.target_term_ ||
+        desired.manifest_revision_ != activation.manifest_revision_ ||
+        desired.manifest_id_ != activation.manifest_id_ ||
+        desired.partition_replication_epoch_ !=
+            activation.partition_replication_epoch_ ||
+        prepared.action_id_ != activation.action_id_ ||
+        current.local_history_id_ != prepared.promotion_.child_history_id_) {
+      co_return absl::FailedPreconditionError(
+          "cluster activation does not match prepared action anchors");
+    }
+    if (cluster_promotion_prepare_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "cluster activation lost its private prepare context");
+    }
+    const auto terminal = cluster_promotion_prepare_->completion_->result();
+    if (!terminal.has_value() || !terminal->ok() ||
+        **terminal != prepared.promotion_) {
+      co_return absl::FailedPreconditionError(
+          "cluster activation prepare evidence is not terminal and exact");
+    }
+    if (role_.load(std::memory_order_acquire) != ReplicationRole::kSyncing ||
+        !is_loading() || storage_->ReplicaRecoveryFenced()) {
+      co_return absl::FailedPreconditionError(
+          "cluster prepared promotion is not safely fenced for activation");
+    }
+
+    ActivatePreparedPromotionRole();
+    if (is_loading()) {
+      co_return absl::FailedPreconditionError(
+          "cluster promotion remained recovery-fenced during activation");
+    }
+    activated_failover_activation_ = activation;
+    activated_failover_prepared_context_ = prepared;
+    co_return absl::OkStatus();
+  }
+
+  Task<absl::Status> EnableClusterExpirationAuthorityUntil(
+      std::chrono::nanoseconds deadline_since_boot) {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(0, [this, deadline_since_boot] {
+        return EnableClusterExpirationAuthorityUntil(deadline_since_boot);
+      });
+    }
+    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "finite expiration authority requires Meta-managed population mode");
+    }
+    AssertStateOwner();
+    if (cluster_control_stopping_ ||
+        role_.load(std::memory_order_acquire) != ReplicationRole::kMaster ||
+        is_loading() || storage_->ReplicaRecoveryFenced() ||
+        cluster_rebuild_ == nullptr ||
+        cluster_rebuild_->state_.load(std::memory_order_acquire) !=
+            ReplicationGroupState::kReady ||
+        !cluster_rebuild_->ready_token_.has_value()) {
+      co_return absl::FailedPreconditionError(
+          "finite expiration authority requires an active ready owner");
+    }
+    co_return storage_->SetExpirationAuthorityUntil(deadline_since_boot);
+  }
+
+  Task<absl::Status> RevokeClusterExpirationAuthority() {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this] { return RevokeClusterExpirationAuthority(); });
+    }
+    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "expiration revocation requires Meta-managed population mode");
+    }
+    storage_->SetExpirationAuthority(false);
+    absl::Status drained = co_await storage_->QuiesceExpiration();
+    if (!drained.ok()) co_return drained;
+    storage_->ResumeExpiration();
+    co_return absl::OkStatus();
+  }
+
+  absl::StatusOr<std::pair<DesiredClusterUpstream, PopulationManifest>>
+  NormalizeClusterFollowOwner(DesiredClusterUpstream desired) const {
+    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+      return absl::FailedPreconditionError(
+          "follow-owner reconciliation requires Meta-managed population "
+          "mode");
+    }
+    if (desired.group_id_.empty() || desired.group_term_ == 0 ||
+        desired.local_node_id_ != node_id_ ||
+        desired.local_assignment_id_.empty() ||
+        desired.local_boot_id_ != boot_id_ || desired.owner_node_id_.empty() ||
+        desired.owner_assignment_id_.empty() ||
+        desired.manifest_revision_ == 0 ||
+        IsZeroBytes(desired.manifest_id_.bytes_) ||
+        desired.partition_replication_epoch_ == 0) {
+      return absl::InvalidArgumentError(
+          "follow-owner desired identity is incomplete or belongs to another "
+          "local boot");
+    }
+    const bool local_is_owner =
+        desired.local_node_id_ == desired.owner_node_id_;
+    if (local_is_owner) {
+      if (desired.local_assignment_id_ != desired.owner_assignment_id_ ||
+          desired.owner_endpoint_.has_value()) {
+        return absl::InvalidArgumentError(
+            "local Owner follow scope has a conflicting assignment or "
+            "upstream endpoint");
+      }
+    } else if (!desired.owner_endpoint_.has_value() ||
+               desired.owner_endpoint_->host_.empty() ||
+               desired.owner_endpoint_->port_ == 0) {
+      return absl::InvalidArgumentError(
+          "follower desired state has no usable Owner endpoint");
+    }
+
+    std::sort(desired.members_.begin(), desired.members_.end(),
+              [](const ClusterReplicationMember& left,
+                 const ClusterReplicationMember& right) {
+                return std::tie(left.node_id_, left.assignment_id_) <
+                       std::tie(right.node_id_, right.assignment_id_);
+              });
+    if (desired.members_.empty() ||
+        std::any_of(desired.members_.begin(), desired.members_.end(),
+                    [](const ClusterReplicationMember& member) {
+                      return member.node_id_.empty() ||
+                             member.assignment_id_.empty();
+                    }) ||
+        std::adjacent_find(desired.members_.begin(), desired.members_.end(),
+                           [](const ClusterReplicationMember& left,
+                              const ClusterReplicationMember& right) {
+                             return left.node_id_ == right.node_id_;
+                           }) != desired.members_.end()) {
+      return absl::InvalidArgumentError(
+          "follow-owner membership is empty, incomplete, or duplicated");
+    }
+    const auto local = std::find_if(
+        desired.members_.begin(), desired.members_.end(),
+        [&](const ClusterReplicationMember& member) {
+          return member.node_id_ == desired.local_node_id_ &&
+                 member.assignment_id_ == desired.local_assignment_id_;
+        });
+    const auto owner = std::find_if(
+        desired.members_.begin(), desired.members_.end(),
+        [&](const ClusterReplicationMember& member) {
+          return member.node_id_ == desired.owner_node_id_ &&
+                 member.assignment_id_ == desired.owner_assignment_id_;
+        });
+    if (local == desired.members_.end() || owner == desired.members_.end()) {
+      return absl::FailedPreconditionError(
+          "follow-owner local member or Owner is absent from the exact "
+          "membership");
+    }
+
+    std::sort(desired.manifest_entries_.begin(),
+              desired.manifest_entries_.end(),
+              [](const PopulationManifestEntry& left,
+                 const PopulationManifestEntry& right) {
+                return left.partition_id_ < right.partition_id_;
+              });
+    auto manifest = PopulationManifest::Create(desired.manifest_entries_);
+    if (!manifest.ok()) return manifest.status();
+    if (manifest->id() != desired.manifest_id_) {
+      return absl::FailedPreconditionError(
+          "follow-owner manifest entries do not match their FDS digest");
+    }
+    return std::make_pair(std::move(desired), std::move(*manifest));
+  }
+
+  bool ClusterFollowReadyPopulationMatches(
+      const DesiredClusterUpstream& desired) const {
+    AssertStateOwner();
+    if (cluster_rebuild_ == nullptr ||
+        cluster_rebuild_->state_.load(std::memory_order_acquire) !=
+            ReplicationGroupState::kReady ||
+        !cluster_rebuild_->ready_token_.has_value()) {
+      return false;
+    }
+    const ReadyToken& ready = *cluster_rebuild_->ready_token_;
+    const RebuildIdentity& identity = ready.identity();
+    return identity.group_id_ == desired.group_id_ &&
+           identity.assignment_id_ == desired.local_assignment_id_ &&
+           identity.target_node_id_ == desired.local_node_id_ &&
+           identity.target_boot_id_ == desired.local_boot_id_ &&
+           ready.CanCarryForwardToTerm(desired.group_term_) &&
+           identity.manifest_revision_ == desired.manifest_revision_ &&
+           identity.manifest_id_ == desired.manifest_id_ &&
+           identity.partition_replication_epoch_ ==
+               desired.partition_replication_epoch_;
+  }
+
+  Task<absl::Status> StopClusterFollowIngress(
+      const std::shared_ptr<ClusterFollowOwnerContext>& previous) {
+    AssertStateOwner();
+    std::shared_ptr<ReplicaSession> session;
+    if (active_replica_session_ != nullptr &&
+        active_replica_session_->cluster_follow_ == previous) {
+      session = std::move(active_replica_session_);
+    }
+    SetDesiredUpstream(std::nullopt);
+    role_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    if (session != nullptr) session->Cancel();
+
+    if (session != nullptr) {
+      absl::Status stopped = co_await CancelAndWaitForReplicaFlows(session);
+      if (!stopped.ok()) co_return stopped;
+      if (std::optional<std::string> uncertain = session->FailStopReason();
+          uncertain.has_value()) {
+        co_return absl::InternalError(*uncertain);
+      }
+      const std::shared_ptr<ClusterRebuildContext> population =
+          session->cluster_rebuild_;
+      if (population != nullptr && cluster_rebuild_ == population &&
+          population->state_.load(std::memory_order_acquire) ==
+              ReplicationGroupState::kRebuilding) {
+        if (session->session_id_ != 0) {
+          absl::Status aborted =
+              co_await storage_->AbortReplicaRoot(session->session_id_);
+          if (!aborted.ok()) co_return aborted;
+        }
+        absl::Status invalidated =
+            cluster_group_->InvalidateProof(population->directive_.identity_);
+        if (!invalidated.ok()) co_return invalidated;
+        population->state_.store(ReplicationGroupState::kNotReady,
+                                 std::memory_order_release);
+        population->ready_token_.reset();
+        population->completion_->Resolve(absl::CancelledError(
+            "steady follow population attempt was replaced"));
+        cluster_rebuild_.reset();
+        applied_frontier_.reset();
+        upstream_node_id_.reset();
+        upstream_history_id_.reset();
+        native_dataset_valid_.store(false, std::memory_order_release);
+      }
+    }
+    while (coordinator_started_) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+    co_return absl::OkStatus();
+  }
+
+  absl::Status BeginClusterFollowFullPopulation(
+      const std::shared_ptr<ReplicaSession>& session,
+      std::string source_boot_id, std::string source_history_id,
+      std::uint32_t source_flow_count) {
+    AssertStateOwner();
+    if (session == nullptr || session->cluster_follow_ == nullptr ||
+        active_replica_session_ != session ||
+        cluster_follow_owner_ != session->cluster_follow_ ||
+        session->cancelled()) {
+      return absl::CancelledError(
+          "follow-owner source became stale before FULL admission");
+    }
+    const DesiredClusterUpstream& desired = session->cluster_follow_->desired_;
+    if (source_boot_id.empty() || source_history_id.empty() ||
+        source_flow_count == 0) {
+      return absl::InvalidArgumentError(
+          "follow-owner source incarnation is incomplete");
+    }
+
+    std::uint64_t revision = next_cluster_follow_directive_revision_;
+    if (cluster_rebuild_ != nullptr) {
+      const std::uint64_t current_revision =
+          cluster_rebuild_->directive_.identity_.directive_revision_;
+      if (current_revision == std::numeric_limits<std::uint64_t>::max()) {
+        return absl::OutOfRangeError(
+            "follow-owner population revision cannot advance");
+      }
+      revision = std::max(revision, current_revision + 1);
+    }
+    if (revision == 0 ||
+        revision == std::numeric_limits<std::uint64_t>::max()) {
+      return absl::OutOfRangeError(
+          "follow-owner population revision is exhausted");
+    }
+
+    RebuildDirective directive{
+        .identity_ =
+            {
+                .group_id_ = desired.group_id_,
+                .assignment_id_ = desired.local_assignment_id_,
+                .term_ = desired.group_term_,
+                .directive_revision_ = revision,
+                .authority_id_ =
+                    absl::StrCat("steady-follow:", desired.group_id_),
+                .source_node_id_ = desired.owner_node_id_,
+                .source_assignment_id_ = desired.owner_assignment_id_,
+                .source_boot_id_ = std::move(source_boot_id),
+                .source_history_id_ = std::move(source_history_id),
+                .target_node_id_ = desired.local_node_id_,
+                .target_boot_id_ = desired.local_boot_id_,
+                .target_history_id_ = {},
+                .operation_id_ =
+                    absl::StrCat("steady-follow:", desired.group_id_, ":",
+                                 desired.group_term_),
+                .directive_id_ =
+                    absl::StrCat("steady-follow-owner:", desired.owner_node_id_,
+                                 ":", desired.owner_assignment_id_),
+                .attempt_id_ = absl::StrCat("steady-follow-attempt:", revision),
+                .manifest_revision_ = desired.manifest_revision_,
+                .manifest_id_ = desired.manifest_id_,
+                .partition_replication_epoch_ =
+                    desired.partition_replication_epoch_,
+            },
+        .flow_count_ = source_flow_count,
+        .safe_source_active_ = true,
+    };
+    absl::Status validated = cluster_group_->ValidateRebuild(
+        directive, session->cluster_follow_->manifest_);
+    if (!validated.ok()) return validated;
+
+    const std::shared_ptr<ClusterRebuildContext> previous = cluster_rebuild_;
+    if (previous != nullptr) {
+      absl::Status invalidated =
+          cluster_group_->InvalidateProof(previous->directive_.identity_);
+      if (!invalidated.ok()) return invalidated;
+      previous->state_.store(ReplicationGroupState::kNotReady,
+                             std::memory_order_release);
+      previous->ready_token_.reset();
+    }
+    auto authorization = cluster_group_->BeginRebuild(
+        directive, session->cluster_follow_->manifest_);
+    if (!authorization.ok()) return authorization.status();
+    auto population = std::make_shared<ClusterRebuildContext>(
+        std::move(directive), session->cluster_follow_->manifest_,
+        std::move(*authorization));
+    cluster_rebuild_ = population;
+    session->cluster_rebuild_ = std::move(population);
+    next_cluster_follow_directive_revision_ = revision + 1;
+    native_dataset_valid_.store(false, std::memory_order_release);
+    applied_frontier_.reset();
+    upstream_node_id_.reset();
+    upstream_history_id_.reset();
+    source_authorizations_.RevokeAll();
+    retained_failover_activation_action_id_.reset();
+    retained_failover_prepared_context_.reset();
+    retained_failover_desired_action_.reset();
+    activated_failover_activation_.reset();
+    activated_failover_prepared_context_.reset();
+    cluster_promotion_prepare_.reset();
+    return absl::OkStatus();
+  }
+
+  Task<absl::Status> ReconcileClusterFollowOwner(
+      std::optional<DesiredClusterUpstream> desired) {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, desired = std::move(desired)]() mutable {
+            return ReconcileClusterFollowOwner(std::move(desired));
+          });
+    }
+    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "follow-owner reconciliation requires Meta-managed population "
+          "mode");
+    }
+    if (cluster_control_stopping_) {
+      co_return absl::CancelledError(
+          "follow-owner reconciliation stopped for process shutdown");
+    }
+
+    std::shared_ptr<ClusterFollowOwnerContext> next;
+    if (desired.has_value()) {
+      auto normalized = NormalizeClusterFollowOwner(std::move(*desired));
+      if (!normalized.ok()) co_return normalized.status();
+      next = std::make_shared<ClusterFollowOwnerContext>(
+          std::move(normalized->first), std::move(normalized->second));
+      if (cluster_follow_owner_ != nullptr &&
+          cluster_follow_owner_->desired_ == next->desired_) {
+        if (next->desired_.local_node_id_ != next->desired_.owner_node_id_ &&
+            !coordinator_started_ && !replication_shutdown_requested_ &&
+            !failed_stopped_.load(std::memory_order_relaxed)) {
+          SetDesiredUpstream(next->desired_.owner_endpoint_);
+          StartCoordinator();
+        }
+        co_return absl::OkStatus();
+      }
+    }
+
+    const std::shared_ptr<ClusterFollowOwnerContext> previous =
+        std::move(cluster_follow_owner_);
+    const bool previous_was_owner =
+        previous != nullptr &&
+        previous->desired_.local_node_id_ == previous->desired_.owner_node_id_;
+    const bool previous_was_follower =
+        previous != nullptr && !previous_was_owner;
+    // The level-triggered adapter may be installed over an already-running
+    // legacy/#40 coordinator on its first FDS. Treat that ingress as the
+    // relationship being replaced too; otherwise two sessions can race while
+    // the new exact Owner/scope is being installed.
+    const bool legacy_ingress =
+        previous == nullptr &&
+        (upstream_.has_value() || active_replica_session_ != nullptr ||
+         coordinator_started_);
+    const bool local_was_source =
+        role_.load(std::memory_order_acquire) == ReplicationRole::kMaster &&
+        !upstream_.has_value();
+    const bool next_is_owner =
+        next != nullptr &&
+        next->desired_.local_node_id_ == next->desired_.owner_node_id_;
+    const bool must_fence_target =
+        !next_is_owner &&
+        (next != nullptr || previous_was_follower || legacy_ingress);
+
+    if (must_fence_target) {
+      // Close serving before cancellation can suspend. Replacement retains the
+      // physical population and ReadyToken, but no removed or stale follower
+      // relationship may keep serving while its session is being joined.
+      StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
+      storage_->SetReplicaLoading(true);
+      storage_->SetExpirationAuthority(false);
+      source_authorizations_.RevokeAll();
+      retained_failover_activation_action_id_.reset();
+      retained_failover_prepared_context_.reset();
+      retained_failover_desired_action_.reset();
+      activated_failover_activation_.reset();
+      activated_failover_prepared_context_.reset();
+      cluster_promotion_prepare_.reset();
+    }
+
+    if (previous_was_follower || legacy_ingress) {
+      absl::Status stopped = co_await StopClusterFollowIngress(previous);
+      if (!stopped.ok()) {
+        const std::string failure = absl::StrCat(
+            "follow-owner ingress replacement could not be joined: ",
+            stopped.message());
+        LatchReplicationFailure(failure);
+        co_return absl::InternalError(failure);
+      }
+    }
+    if (previous_was_owner) {
+      absl::Status revoked =
+          co_await RevokeClusterRebuildSourceAuthorizations();
+      if (!revoked.ok()) co_return revoked;
+    }
+    if (next == nullptr) co_return absl::OkStatus();
+
+    if (next_is_owner) {
+      SetDesiredUpstream(std::nullopt);
+      cluster_follow_owner_ = std::move(next);
+      co_return absl::OkStatus();
+    }
+
+    if (local_was_source) {
+      absl::Status retired = co_await RetireSourceHistory();
+      if (!retired.ok()) {
+        const std::string failure =
+            absl::StrCat("former Owner source history could not be retired: ",
+                         retired.message());
+        LatchReplicationFailure(failure);
+        co_return absl::InternalError(failure);
+      }
+    }
+    cluster_follow_owner_ = std::move(next);
+    SetDesiredUpstream(cluster_follow_owner_->desired_.owner_endpoint_);
+    role_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    StartCoordinator();
+    co_return absl::OkStatus();
   }
 
   Task<absl::Status> RetireClusterPopulation(
@@ -4075,20 +5703,48 @@ class ReplicationManager::ReplicationGroup {
       const bool desired_attempt_still_live =
           matches_attempt && desired->population_transition_expected_ &&
           state == ReplicationGroupState::kRebuilding;
+      const bool desired_follow_attempt_still_live =
+          matches_attempt && state == ReplicationGroupState::kRebuilding &&
+          cluster_follow_owner_ != nullptr &&
+          active_replica_session_ != nullptr &&
+          active_replica_session_->cluster_follow_ == cluster_follow_owner_ &&
+          active_replica_session_->cluster_rebuild_ == context;
       // A term transition fences authority but does not change the physical
       // population. Preserve a completed proof across that transition when
       // membership incarnation and immutable manifest remain exact; the Data
       // controller re-anchors its heartbeat proof to the newer FDS term.
       const bool desired_ready_population =
           matches_population && completed_ready;
-      if (desired_attempt_still_live || desired_ready_population ||
-          (preserve_any_ready && completed_ready)) {
+      // ReconcileClusterControl runs before population reconciliation for one
+      // FDS. A steady FollowOwner FULL has no operation directive flag, so its
+      // exact active session/context ownership is the proof that this
+      // rebuilding attempt is still desired. Replacement or removal changes
+      // that ownership and continues through the retirement path below.
+      if (desired_attempt_still_live || desired_follow_attempt_still_live ||
+          desired_ready_population || (preserve_any_ready && completed_ready)) {
         co_return absl::OkStatus();
       }
       if (replica_reconfiguration_running_) {
         co_return absl::AbortedError(
             "cluster population changed during FDS reconciliation");
       }
+
+      // Population retirement is also an abort boundary for a controlled
+      // source pause. Release only this context's nesting level before the
+      // population becomes unobservable.
+      if (cluster_source_pause_ != nullptr) {
+        const std::shared_ptr<ClusterSourcePauseContext> source_pause =
+            std::move(cluster_source_pause_);
+        if (source_pause->expiration_pause_held_) {
+          source_pause->expiration_pause_held_ = false;
+          storage_->ResumeExpiration();
+        }
+      }
+      retained_failover_activation_action_id_.reset();
+      retained_failover_prepared_context_.reset();
+      retained_failover_desired_action_.reset();
+      activated_failover_activation_.reset();
+      activated_failover_prepared_context_.reset();
 
       // Close every externally observable proof before the first suspension.
       // The moved session gives this transition exclusive ownership of flow
@@ -4214,7 +5870,37 @@ class ReplicationManager::ReplicationGroup {
       co_return absl::FailedPreconditionError(
           "population shutdown requires Meta-managed population mode");
     }
+    AssertStateOwner();
     cluster_control_stopping_ = true;
+    cluster_follow_owner_.reset();
+    SetDesiredUpstream(std::nullopt);
+
+    const std::shared_ptr<ClusterSourcePauseContext> source_pause =
+        std::move(cluster_source_pause_);
+    if (source_pause != nullptr && source_pause->expiration_pause_held_) {
+      source_pause->expiration_pause_held_ = false;
+      storage_->ResumeExpiration();
+    }
+
+    // A desired action may be polling for its population or awaiting the
+    // shared promotion kernel. Withdraw its observation first, then join its
+    // runner before population retirement touches the same private prepare
+    // context. Shutdown never preserves an activation handoff: no later
+    // control session in this boot may consume it.
+    const std::shared_ptr<ClusterFailoverActionContext> action =
+        std::move(cluster_failover_action_);
+    if (action != nullptr) action->cancelled_ = true;
+    retained_failover_activation_action_id_.reset();
+    retained_failover_prepared_context_.reset();
+    retained_failover_desired_action_.reset();
+    activated_failover_activation_.reset();
+    activated_failover_prepared_context_.reset();
+    while (action != nullptr && !action->runner_finished_) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+
     co_return co_await RetireClusterPopulation(
         std::nullopt, /*preserve_any_ready=*/false,
         "cluster population was retired for process shutdown");
@@ -4341,6 +6027,10 @@ class ReplicationManager::ReplicationGroup {
           cluster_rebuild_->ready_token_.has_value()) {
         result.ready_token_ = cluster_rebuild_->ready_token_;
         frontier = applied_frontier_;
+        if (failed_failover_candidate_.has_value() &&
+            ReadyPopulationIsSuppressed(*failed_failover_candidate_)) {
+          result.failover_candidate_eligible_ = false;
+        }
       }
       result.failure_reason_ = failure_reason_;
     }
@@ -4529,12 +6219,12 @@ class ReplicationManager::ReplicationGroup {
     for (const auto& session : sessions) session->Cancel();
     auto next_warning =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (active_master_controls_.load(std::memory_order_acquire) >
-               preserved_control_count ||
-           std::any_of(sessions.begin(), sessions.end(),
-                       [](const auto& session) {
-                         return session->connected_flows() != 0;
-                       })) {
+    while (
+        active_master_controls_.load(std::memory_order_acquire) >
+            preserved_control_count ||
+        std::any_of(sessions.begin(), sessions.end(), [](const auto& session) {
+          return session->connected_flows() != 0;
+        })) {
       absl::Status waited = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
@@ -4601,8 +6291,8 @@ class ReplicationManager::ReplicationGroup {
       const std::size_t flow_capacity = BacklogCapacityForFlow(
           worker, backlog_size_bytes_.load(std::memory_order_acquire));
       absl::Status enabled = co_await celer::SubmitTaskTo(
-          worker, [this, child_log_epoch,
-                   flow_capacity]() -> Task<absl::Status> {
+          worker,
+          [this, child_log_epoch, flow_capacity]() -> Task<absl::Status> {
             co_return co_await storage_->EnableReplicationLog(child_log_epoch,
                                                               flow_capacity);
           });
@@ -4628,18 +6318,28 @@ class ReplicationManager::ReplicationGroup {
     };
   }
 
-  // Standalone/Sentinel has no external authority commit between prepare and
-  // activation, so its synchronous command invokes this immediately. The
-  // Cluster preparation contract intentionally has no public activation entry
-  // point.
-  void ActivatePreparedPromotion() {
+  // Opens the prepared publisher/storage role without assuming ownership of
+  // any expiration pause or authority capability. Cluster uses this kernel
+  // between provisional lease validation and NodeControl's final lease/FDS
+  // recheck; standalone adds its own expiration pairing below.
+  void ActivatePreparedPromotionRole() {
     {
       AssertStateOwner();
-      pending_promotion_.reset();
       StoreRole(ReplicationRole::kMaster, std::memory_order_release);
     }
     if (!storage_->ReplicaRecoveryFenced()) {
       storage_->SetReplicaLoading(false);
+    }
+  }
+
+  // Standalone/Sentinel has no external authority commit between prepare and
+  // activation, so its synchronous command also consumes the expiration pause
+  // that SetUpstream acquired and restores permanent expiration authority.
+  void ActivatePreparedPromotion() {
+    AssertStateOwner();
+    pending_promotion_.reset();
+    ActivatePreparedPromotionRole();
+    if (!storage_->ReplicaRecoveryFenced()) {
       storage_->SetExpirationAuthority(true);
     }
     storage_->ResumeExpiration();
@@ -4877,8 +6577,7 @@ class ReplicationManager::ReplicationGroup {
         } else if (applied_frontier_ != nullptr) {
           auto snapshot = applied_frontier_->TrySnapshot();
           if (!snapshot.ok()) co_return snapshot.status();
-          promotion_base.parent_frontier_.flow_cursors_ =
-              std::move(*snapshot);
+          promotion_base.parent_frontier_.flow_cursors_ = std::move(*snapshot);
         }
         promotion_base.storage_accumulator_ = absl::StrCat(
             "role-epoch:", role_epoch_.load(std::memory_order_relaxed));
@@ -5635,7 +7334,7 @@ class ReplicationManager::ReplicationGroup {
           "Redis replication export stopped for process shutdown");
     }
     ScopedSocketSetMembership source_socket(&source_sockets_,
-                                             stream.NativeFd());
+                                            stream.NativeFd());
     if (args.size() != 3 || !EqualCaseInsensitive(args[0], "PSYNC")) {
       co_return absl::InvalidArgumentError("invalid Redis PSYNC handshake");
     }
@@ -5833,9 +7532,8 @@ class ReplicationManager::ReplicationGroup {
     // Start all storage workers even if the socket fails immediately: every
     // producer owns the matching EndRdbSnapshot cleanup.
     rdb_queue->Start();
-    const std::string full_resync_header =
-        absl::StrCat("+FULLRESYNC ", node_id_, " 0\r\n$EOF:", eof_token,
-                     "\r\n");
+    const std::string full_resync_header = absl::StrCat(
+        "+FULLRESYNC ", node_id_, " 0\r\n$EOF:", eof_token, "\r\n");
     status = co_await WriteText(stream, full_resync_header);
     if (status.ok()) {
       // RDB v10 is accepted by Redis 7.0 and later. Keylane's value opcodes
@@ -5974,8 +7672,7 @@ class ReplicationManager::ReplicationGroup {
       absl::Status aborted = co_await storage_->AbortReplicaRoot(session_id);
       if (!aborted.ok()) {
         const std::string reason = absl::StrCat(
-            "empty population abort outcome is uncertain: ",
-            aborted.message());
+            "empty population abort outcome is uncertain: ", aborted.message());
         (void)cluster_group_->FailStop(context->directive_.identity_);
         storage_->FenceRequestServingUntilRestart();
         LatchReplicationFailure(reason);
@@ -6044,7 +7741,8 @@ class ReplicationManager::ReplicationGroup {
           context, session_id, root_started, promoted, prepared);
     }
 
-    absl::Status invalidated = co_await storage_->BeginReplicaFullSync(session_id);
+    absl::Status invalidated =
+        co_await storage_->BeginReplicaFullSync(session_id);
     if (!invalidated.ok()) {
       co_return co_await FinishEmptyPopulationFailure(
           context, session_id, root_started, promoted, invalidated);
@@ -6118,11 +7816,10 @@ class ReplicationManager::ReplicationGroup {
           co_return co_await FinishEmptyPopulationFailure(
               context, session_id, root_started, promoted, handed_off);
         }
-        absl::Status recorded_handoff =
-            cluster_group_->RecordPartitionHandoff(
-                context->directive_.identity_, partition.partition_id_,
-                context->manifest_.logical_epochs()[partition.partition_id_],
-                partition.replication_epoch_);
+        absl::Status recorded_handoff = cluster_group_->RecordPartitionHandoff(
+            context->directive_.identity_, partition.partition_id_,
+            context->manifest_.logical_epochs()[partition.partition_id_],
+            partition.replication_epoch_);
         if (!recorded_handoff.ok()) {
           co_return co_await FinishEmptyPopulationFailure(
               context, session_id, root_started, promoted, recorded_handoff);
@@ -6151,8 +7848,7 @@ class ReplicationManager::ReplicationGroup {
 
     absl::Status promotion;
     if (ShouldInjectReplicaPromotionFailure()) {
-      promotion =
-          absl::InternalError("injected replica promotion failure");
+      promotion = absl::InternalError("injected replica promotion failure");
     } else {
       // Keep co_await out of a conditional expression. GCC has historically
       // mis-lowered that shape in this coroutine-heavy translation unit.
@@ -6183,12 +7879,12 @@ class ReplicationManager::ReplicationGroup {
             context, session_id, root_started, promoted, enabled);
       }
     }
-    absl::Status group_ready = cluster_group_->MarkStoragePromoted(
-        context->directive_.identity_);
-    auto ready = group_ready.ok()
-                     ? cluster_group_->PublishReady(
-                           context->directive_.identity_)
-                     : absl::StatusOr<ReadyToken>(group_ready);
+    absl::Status group_ready =
+        cluster_group_->MarkStoragePromoted(context->directive_.identity_);
+    auto ready =
+        group_ready.ok()
+            ? cluster_group_->PublishReady(context->directive_.identity_)
+            : absl::StatusOr<ReadyToken>(group_ready);
     if (!ready.ok()) {
       co_return co_await FinishEmptyPopulationFailure(
           context, session_id, root_started, promoted, ready.status());
@@ -6517,8 +8213,8 @@ class ReplicationManager::ReplicationGroup {
     while (storage_->ReplicaRecoveryFenced()) {
       {
         AssertStateOwner();
-        if (replication_shutdown_requested_ ||
-            !RedisSourceRegistered(source) || redis_topology_fault_ ||
+        if (replication_shutdown_requested_ || !RedisSourceRegistered(source) ||
+            redis_topology_fault_ ||
             source->role_epoch_ !=
                 role_epoch_.load(std::memory_order_relaxed)) {
           co_return absl::CancelledError(
@@ -6715,8 +8411,7 @@ class ReplicationManager::ReplicationGroup {
       }
       {
         AssertStateOwner();
-        if (replication_shutdown_requested_ ||
-            !RedisSourceRegistered(source) ||
+        if (replication_shutdown_requested_ || !RedisSourceRegistered(source) ||
             source->role_epoch_ !=
                 role_epoch_.load(std::memory_order_relaxed)) {
           source->coordinator_started_ = false;
@@ -6846,6 +8541,11 @@ class ReplicationManager::ReplicationGroup {
         role_epoch = role_epoch_.load(std::memory_order_relaxed);
         session = std::make_shared<ReplicaSession>(&outbound_sockets_);
         session->cluster_rebuild_ = cluster_rebuild_;
+        if (cluster_follow_owner_ != nullptr &&
+            cluster_follow_owner_->desired_.local_node_id_ !=
+                cluster_follow_owner_->desired_.owner_node_id_) {
+          session->cluster_follow_ = cluster_follow_owner_;
+        }
         active_replica_session_ = session;
       }
       StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
@@ -6930,15 +8630,21 @@ class ReplicationManager::ReplicationGroup {
         if (cluster_attempt_must_retire &&
             cluster_rebuild_ == cluster_context) {
           cluster_rebuild_.reset();
-          SetDesiredUpstream(std::nullopt);
+          if (session->cluster_follow_ == nullptr ||
+              cluster_follow_owner_ != session->cluster_follow_) {
+            SetDesiredUpstream(std::nullopt);
+          }
           upstream_node_id_.reset();
           upstream_history_id_.reset();
         }
         replica_session_teardown_running_ = false;
+        const bool current_follow =
+            session->cluster_follow_ != nullptr &&
+            cluster_follow_owner_ == session->cluster_follow_;
         retry = !replication_shutdown_requested_ && upstream_.has_value() &&
                 role_epoch_.load(std::memory_order_relaxed) == role_epoch &&
                 !fail_stop.has_value() &&
-                (cluster_context == nullptr ||
+                (current_follow || cluster_context == nullptr ||
                  (cluster_ready && !cluster_proof_invalidated));
       }
       if (cluster_attempt_must_retire) {
@@ -7463,9 +9169,9 @@ class ReplicationManager::ReplicationGroup {
       const std::shared_ptr<ReplicaSession>& session) {
     session->active_flows_.fetch_add(1, std::memory_order_acq_rel);
     ReplicaFlowActivityGuard activity(&session->active_flows_);
-    auto connected = co_await ConnectTcp(
-        source->upstream_.host_, source->upstream_.port_, tls_context_,
-        &session->sockets_);
+    auto connected =
+        co_await ConnectTcp(source->upstream_.host_, source->upstream_.port_,
+                            tls_context_, &session->sockets_);
     if (!connected.ok()) co_return connected.status();
     TcpStream stream = std::move(*connected);
     const int fd = stream.NativeFd();
@@ -7571,7 +9277,17 @@ class ReplicationManager::ReplicationGroup {
         replica_incarnation_,
         boot_id_,
         applied_vector};
-    if (session->cluster_rebuild_ != nullptr) {
+    if (session->cluster_follow_ != nullptr) {
+      const DesiredClusterUpstream& desired =
+          session->cluster_follow_->desired_;
+      sync_args.insert(
+          sync_args.end(),
+          {"FOLLOW", desired.group_id_, desired.local_assignment_id_,
+           desired.owner_assignment_id_, absl::StrCat(desired.group_term_),
+           desired.owner_node_id_, absl::StrCat(desired.manifest_revision_),
+           desired.manifest_id_.Hex(),
+           absl::StrCat(desired.partition_replication_epoch_)});
+    } else if (session->cluster_rebuild_ != nullptr) {
       const RebuildIdentity& identity =
           session->cluster_rebuild_->directive_.identity_;
       sync_args.insert(
@@ -7603,17 +9319,20 @@ class ReplicationManager::ReplicationGroup {
     const std::vector<std::string_view> words = SplitWords(*response);
     std::uint64_t session_id = 0;
     unsigned source_workers = 0;
+    const bool scoped_cluster_handshake = session->cluster_follow_ != nullptr ||
+                                          session->cluster_rebuild_ != nullptr;
     const bool source_group_valid =
-        session->cluster_rebuild_ == nullptr
-            ? words.size() == 8 && IsReplicationId(words[3])
-            : words.size() == 8 && IsPopulationGroupToken(words[3]);
+        scoped_cluster_handshake
+            ? words.size() == 8 && IsPopulationGroupToken(words[3])
+            : words.size() == 8 && IsReplicationId(words[3]);
     if (words.size() != 8 || words[0] != "+KLFULLRESYNC" ||
         !ParseUnsigned(words[1], &session_id) || session_id == 0 ||
         !IsReplicationId(words[2]) || !source_group_valid ||
         !IsReplicationId(words[4]) || !IsReplicationId(words[5]) ||
         !ParseUnsigned(words[6], &source_workers) || source_workers == 0 ||
         !IsReplicationId(words[7])) {
-      if (session->cluster_rebuild_ != nullptr) {
+      if (session->cluster_follow_ == nullptr &&
+          session->cluster_rebuild_ != nullptr) {
         (void)co_await InvalidateReplicaContinuation(session, false);
       }
       session->sockets_.Remove(control_fd);
@@ -7626,7 +9345,18 @@ class ReplicationManager::ReplicationGroup {
       control.Close().IgnoreError();
       co_return absl::CancelledError("replication role epoch was replaced");
     }
-    if (session->cluster_rebuild_ != nullptr) {
+    if (session->cluster_follow_ != nullptr) {
+      const DesiredClusterUpstream& desired =
+          session->cluster_follow_->desired_;
+      if (words[2] != desired.owner_node_id_ ||
+          words[3] != PopulationGroupToken(desired.group_id_)) {
+        session->sockets_.Remove(control_fd);
+        control.Close().IgnoreError();
+        co_return absl::FailedPreconditionError(
+            "native source node/group does not match the steady Owner "
+            "relationship");
+      }
+    } else if (session->cluster_rebuild_ != nullptr) {
       const RebuildDirective& directive = session->cluster_rebuild_->directive_;
       if (words[2] != directive.identity_.source_node_id_ ||
           words[3] != PopulationGroupToken(directive.identity_.group_id_) ||
@@ -7641,10 +9371,23 @@ class ReplicationManager::ReplicationGroup {
             "match the cluster rebuild directive");
       }
     }
-    const bool local_population_matches_response =
-        session->cluster_rebuild_ == nullptr && resume_proof_advertised &&
-        requested_group == words[3] && requested_history == words[5] &&
-        requested_flow_count == source_workers;
+    bool local_population_matches_response =
+        resume_proof_advertised && requested_group == words[3] &&
+        requested_history == words[5] && requested_flow_count == source_workers;
+    if (session->cluster_follow_ != nullptr &&
+        (!local_population_matches_response ||
+         session->cluster_follow_->force_full_.load(
+             std::memory_order_acquire))) {
+      absl::Status admitted = BeginClusterFollowFullPopulation(
+          session, std::string(words[4]), std::string(words[5]),
+          source_workers);
+      if (!admitted.ok()) {
+        session->sockets_.Remove(control_fd);
+        control.Close().IgnoreError();
+        co_return admitted;
+      }
+      local_population_matches_response = false;
+    }
     if (!local_population_matches_response) {
       // Publishing a new source context makes it eligible for the next
       // reconnect. Persist the destructive fence first, so a disconnect
@@ -7692,8 +9435,7 @@ class ReplicationManager::ReplicationGroup {
     }
     auto next_frontier = std::make_shared<detail::ReplicaAppliedFrontier>(
         source_workers, storage_->worker_count());
-    absl::Status installed =
-        next_frontier->InstallNextLsns(*initial_next_lsns);
+    absl::Status installed = next_frontier->InstallNextLsns(*initial_next_lsns);
     if (!installed.ok()) {
       session->sockets_.Remove(control_fd);
       control.Close().IgnoreError();
@@ -7915,6 +9657,23 @@ class ReplicationManager::ReplicationGroup {
         *celer::ThisWorker().self_);
     if (!agreed.ok()) co_return agreed;
     if (!fullsync) co_return absl::OkStatus();
+
+    if (flow_id == 0 && session->cluster_follow_ != nullptr &&
+        session->cluster_rebuild_ != nullptr &&
+        session->cluster_rebuild_->state_.load(std::memory_order_acquire) ==
+            ReplicationGroupState::kReady) {
+      // The authenticated source matched our history but no longer retains
+      // every requested cursor. Do not invalidate the usable population in a
+      // flow worker. Fail this session before BeginReplicaFullSync and let the
+      // fixed-delay coordinator retry install a fresh FULL authorization on
+      // worker zero.
+      session->cluster_follow_->force_full_.store(true,
+                                                  std::memory_order_release);
+      const absl::Status retry = absl::UnavailableError(
+          "steady Owner no longer retains the requested continuation");
+      session->fullsync_begin_complete_->Abort(retry);
+      co_return retry;
+    }
 
     if (flow_id == 0 && session->cluster_rebuild_ != nullptr &&
         session->cluster_rebuild_->state_.load(std::memory_order_acquire) ==
@@ -9407,8 +11166,8 @@ class ReplicationManager::ReplicationGroup {
               "KEYLANE_REPLICATION_FAIL_PROMOTION_PREPARE_AT", stage)) {
         return false;
       }
-      return !promotion_prepare_fault_used_.exchange(
-          true, std::memory_order_acq_rel);
+      return !promotion_prepare_fault_used_.exchange(true,
+                                                     std::memory_order_acq_rel);
     });
     (void)stage;
     return false;
@@ -10954,7 +12713,7 @@ class ReplicationManager::ReplicationGroup {
           "native replication source stopped for process shutdown");
     }
     ScopedSocketSetMembership source_socket(&source_sockets_,
-                                             stream.NativeFd());
+                                            stream.NativeFd());
     ReplicationConnectionMetricGuard connection_metric(
         EqualCaseInsensitive(args.front(), "KLPSYNC")
             ? ReplicationConnectionKind::kControl
@@ -10970,10 +12729,14 @@ class ReplicationManager::ReplicationGroup {
                                         std::uint64_t client_id) {
     const bool population_handshake =
         args.size() == 26 && args[8] == "POPULATION";
+    const bool follow_handshake = args.size() == 17 && args[8] == "FOLLOW";
+    const bool requested_group_valid =
+        args.size() > 4 && (args[3] == "?" || IsReplicationId(args[3]) ||
+                            ((population_handshake || follow_handshake) &&
+                             IsPopulationGroupToken(args[3])));
     if ((!cluster_enabled_ && args.size() != 8) ||
-        (cluster_enabled_ && !population_handshake) ||
-        args[1] != kProtocolVersion ||
-        (args[3] != "?" && !IsReplicationId(args[3])) ||
+        (cluster_enabled_ && !population_handshake && !follow_handshake) ||
+        args[1] != kProtocolVersion || !requested_group_valid ||
         (args[4] != "?" && !IsReplicationId(args[4])) ||
         (args[5] != "?" && !IsReplicationId(args[5])) ||
         (args[6] != "?" && !IsReplicationId(args[6]))) {
@@ -10992,6 +12755,7 @@ class ReplicationManager::ReplicationGroup {
           "replication source stopped for process shutdown");
     }
     std::optional<RebuildIdentity> requested_population;
+    std::optional<ClusterSteadyExport> requested_follow;
     if (population_handshake) {
       RebuildIdentity identity;
       identity.group_id_ = args[9];
@@ -11019,7 +12783,30 @@ class ReplicationManager::ReplicationGroup {
       identity.manifest_id_ = *manifest;
       requested_population = std::move(identity);
     }
-    if (population_handshake) {
+    if (follow_handshake) {
+      ClusterSteadyExport relationship;
+      relationship.group_id_ = args[9];
+      relationship.target_assignment_id_ = args[10];
+      relationship.source_assignment_id_ = args[11];
+      relationship.source_node_id_ = args[13];
+      auto manifest = ParsePopulationManifestId(args[15]);
+      if (!ParseUnsigned(args[12], &relationship.group_term_) ||
+          relationship.group_term_ == 0 || relationship.group_id_.empty() ||
+          relationship.target_assignment_id_.empty() ||
+          relationship.source_assignment_id_.empty() ||
+          relationship.source_node_id_.empty() ||
+          !ParseUnsigned(args[14], &relationship.manifest_revision_) ||
+          relationship.manifest_revision_ == 0 || !manifest.ok() ||
+          !ParseUnsigned(args[16],
+                         &relationship.partition_replication_epoch_) ||
+          relationship.partition_replication_epoch_ == 0) {
+        co_return absl::InvalidArgumentError(
+            "invalid steady FOLLOW identity in KLPSYNC handshake");
+      }
+      relationship.manifest_id_ = *manifest;
+      requested_follow = std::move(relationship);
+    }
+    if (population_handshake || follow_handshake) {
       AssertStateOwner();
       // This is the admission side of the revoke barrier. If this handler
       // observes an open gate, a later revoker sees active_master_controls_
@@ -11061,6 +12848,9 @@ class ReplicationManager::ReplicationGroup {
             "failed to identify KLPSYNC replica endpoint");
       }
     }
+    if (requested_follow.has_value()) {
+      requested_follow->target_node_id_ = replica_node_id;
+    }
     const std::uint64_t session_id =
         next_master_session_id_.fetch_add(1, std::memory_order_relaxed);
     SetClientReplicationSession(client_id, session_id);
@@ -11084,6 +12874,7 @@ class ReplicationManager::ReplicationGroup {
       }
 
       std::shared_ptr<const ClusterRebuildContext> authorized_population;
+      std::optional<ClusterSteadyExport> authorized_follow;
       if (requested_population.has_value()) {
         const RebuildIdentity& requested = *requested_population;
         AssertStateOwner();
@@ -11119,6 +12910,50 @@ class ReplicationManager::ReplicationGroup {
         // replication Group id. The target compares this response with the
         // same authorized directive before accepting any source bytes.
         source_group_id = PopulationGroupToken(requested.group_id_);
+      } else if (requested_follow.has_value()) {
+        const ClusterSteadyExport& requested = *requested_follow;
+        AssertStateOwner();
+        const std::shared_ptr<ClusterFollowOwnerContext> relationship =
+            cluster_follow_owner_;
+        const bool target_allowed =
+            relationship != nullptr &&
+            std::any_of(relationship->desired_.members_.begin(),
+                        relationship->desired_.members_.end(),
+                        [&](const ClusterReplicationMember& member) {
+                          return member.node_id_ == requested.target_node_id_ &&
+                                 member.assignment_id_ ==
+                                     requested.target_assignment_id_;
+                        });
+        const bool authorized =
+            relationship != nullptr && target_allowed &&
+            relationship->desired_.local_node_id_ == node_id_ &&
+            relationship->desired_.owner_node_id_ == node_id_ &&
+            relationship->desired_.local_assignment_id_ ==
+                requested.source_assignment_id_ &&
+            relationship->desired_.owner_assignment_id_ ==
+                requested.source_assignment_id_ &&
+            relationship->desired_.group_id_ == requested.group_id_ &&
+            relationship->desired_.group_term_ == requested.group_term_ &&
+            relationship->desired_.manifest_revision_ ==
+                requested.manifest_revision_ &&
+            relationship->desired_.manifest_id_ == requested.manifest_id_ &&
+            relationship->desired_.partition_replication_epoch_ ==
+                requested.partition_replication_epoch_ &&
+            requested.source_node_id_ == node_id_ &&
+            requested.target_node_id_ != node_id_ && args[6] != "?" &&
+            IsReplicationId(args[6]) && cluster_rebuild_ != nullptr &&
+            cluster_rebuild_->state_.load(std::memory_order_relaxed) ==
+                ReplicationGroupState::kReady &&
+            cluster_rebuild_->ready_token_.has_value() &&
+            ClusterFollowReadyPopulationMatches(relationship->desired_);
+        if (!authorized) {
+          co_return absl::PermissionDeniedError(
+              "steady cluster export is not authorized by the exact current "
+              "Owner/member relationship");
+        }
+        authorized_population = cluster_rebuild_;
+        authorized_follow = requested;
+        source_group_id = PopulationGroupToken(requested.group_id_);
       }
 
       const bool allow_continue =
@@ -11129,8 +12964,8 @@ class ReplicationManager::ReplicationGroup {
       session = std::make_shared<MasterSession>(
           session_id, storage_->worker_count(), std::move(replica_node_id),
           std::move(replica_host), replica_port, source_history_id,
-          allow_continue, std::move(*applied),
-          std::move(authorized_population));
+          allow_continue, std::move(*applied), std::move(authorized_population),
+          std::move(authorized_follow));
       if (!session->SetControl(stream.NativeFd())) {
         co_return absl::InternalError("failed to register control connection");
       }
@@ -11160,11 +12995,10 @@ class ReplicationManager::ReplicationGroup {
             "cluster population export authorization was revoked");
       }
     }
-    const std::string resync_reply =
-        absl::StrCat("+KLFULLRESYNC ", session_id, " ", node_id_, " ",
-                     source_group_id, " ", boot_id_, " ", source_history_id,
-                     " ", storage_->worker_count(), " ",
-                     session->flow_capability_, "\r\n");
+    const std::string resync_reply = absl::StrCat(
+        "+KLFULLRESYNC ", session_id, " ", node_id_, " ", source_group_id, " ",
+        boot_id_, " ", source_history_id, " ", storage_->worker_count(), " ",
+        session->flow_capability_, "\r\n");
     absl::Status sent = co_await WriteText(stream, resync_reply);
     if (!sent.ok()) {
       (void)co_await RemoveMasterSession(session);
@@ -11273,8 +13107,7 @@ class ReplicationManager::ReplicationGroup {
         !ParseUnsigned(args[3], &flow_id) ||
         flow_id != celer::ThisWorker().id_ ||
         !ParseUnsigned(args[4], &next_lsn) || next_lsn == 0 ||
-        !ParseUnsigned(args[5], &fragment_index) ||
-        !IsReplicationId(args[6])) {
+        !ParseUnsigned(args[5], &fragment_index) || !IsReplicationId(args[6])) {
       co_return absl::InvalidArgumentError("invalid KLFLOW handshake");
     }
     std::shared_ptr<MasterSession> session;
@@ -11708,6 +13541,35 @@ class ReplicationManager::ReplicationGroup {
   // Retained through control-session replacement so exact directive replay
   // returns the original terminal evidence without repeating storage effects.
   std::shared_ptr<ClusterPromotionPrepareContext> cluster_promotion_prepare_;
+  // Controlled failover owns one nestable active-expiration pause across FDS
+  // replay/replacement. The stable frontier is observable only while every
+  // source and population anchor remains exact.
+  std::shared_ptr<ClusterSourcePauseContext> cluster_source_pause_;
+  // Current committed action projected by FDS. Its runner and every public
+  // observation are owner-local, so desired-state replacement can withdraw
+  // stale progress synchronously before joining asynchronous preparation.
+  std::shared_ptr<ClusterFailoverActionContext> cluster_failover_action_;
+  // Cutover removes the transition before its finite lease arrives. Only the
+  // exact action copied into the committed grant may keep the private prepared
+  // context across that desired-state replacement.
+  std::optional<ClusterFailoverActionId>
+      retained_failover_activation_action_id_;
+  std::optional<ClusterFailoverPreparedContext>
+      retained_failover_prepared_context_;
+  std::optional<DesiredClusterFailoverAction> retained_failover_desired_action_;
+  // Successful activation remains boot-local so exact lease/FDS replay cannot
+  // repeat promotion. It is retired with the physical population.
+  std::optional<ClusterFailoverActivation> activated_failover_activation_;
+  std::optional<ClusterFailoverPreparedContext>
+      activated_failover_prepared_context_;
+  // Terminal action failure suppresses the same boot/assignment/population
+  // domain even after Meta replaces the action id, preventing hot reselection.
+  std::optional<DesiredClusterFailoverAction> failed_failover_candidate_;
+  // One steady post-Cutover relationship serves both roles. On the Owner it
+  // is the FDS-derived source admission set; on a non-Owner it pins the
+  // reconnecting coordinator and its exact target scope.
+  std::shared_ptr<ClusterFollowOwnerContext> cluster_follow_owner_;
+  std::uint64_t next_cluster_follow_directive_revision_ = 1;
   detail::SourceAuthorizationLedger source_authorizations_;
   // Source authorization and handshake publication run on worker zero under
   // master_mutex_. A revoke uses the same registry gate; this count keeps
@@ -11827,7 +13689,7 @@ class ReplicationManager::ReplicationGroup {
   // of the worker-affine source session registry. Process shutdown cancels it
   // before request drain so transport teardown releases backlog retention.
   SocketSet source_sockets_;
-  celer::AsyncMutex redis_fullsync_mutex_;       // worker 0 only
+  celer::AsyncMutex redis_fullsync_mutex_;  // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};
   std::atomic<unsigned> active_master_controls_{0};
   mutable celer::CrossWorkerMutex master_mutex_;
@@ -11920,6 +13782,53 @@ ReplicationManager::StartClusterPromotionPrepareDirective(
       std::move(directive));
   if (!started.ok()) co_return started.status();
   co_return ClusterPromotionPrepareCompletion(std::move(*started));
+}
+
+Task<absl::Status> ReplicationManager::ReconcileClusterSourcePause(
+    std::optional<DesiredClusterSourcePause> desired) {
+  return group_->ReconcileClusterSourcePause(std::move(desired));
+}
+
+Task<ClusterSourcePauseStatus> ReplicationManager::cluster_source_pause_status()
+    const {
+  return group_->cluster_source_pause_status();
+}
+
+Task<absl::Status> ReplicationManager::ReconcileClusterFailoverAction(
+    std::optional<DesiredClusterFailoverAction> desired,
+    std::optional<ClusterFailoverActionId> pending_activation_action_id) {
+  return group_->ReconcileClusterFailoverAction(std::move(desired),
+                                                pending_activation_action_id);
+}
+
+Task<ClusterFailoverActionStatus>
+ReplicationManager::cluster_failover_action_status() const {
+  return group_->cluster_failover_action_status();
+}
+
+Task<std::optional<ClusterFailoverPreparedContext>>
+ReplicationManager::FindClusterFailoverPreparedContext(
+    const ClusterFailoverActionId& action_id) const {
+  return group_->FindClusterFailoverPreparedContext(action_id);
+}
+
+Task<absl::Status> ReplicationManager::ActivateClusterPreparedPromotion(
+    ClusterFailoverActivation activation) {
+  return group_->ActivateClusterPreparedPromotion(std::move(activation));
+}
+
+Task<absl::Status> ReplicationManager::EnableClusterExpirationAuthorityUntil(
+    std::chrono::nanoseconds deadline_since_boot) {
+  return group_->EnableClusterExpirationAuthorityUntil(deadline_since_boot);
+}
+
+Task<absl::Status> ReplicationManager::RevokeClusterExpirationAuthority() {
+  return group_->RevokeClusterExpirationAuthority();
+}
+
+Task<absl::Status> ReplicationManager::ReconcileClusterFollowOwner(
+    std::optional<DesiredClusterUpstream> desired) {
+  return group_->ReconcileClusterFollowOwner(std::move(desired));
 }
 
 Task<absl::Status> ReplicationManager::ApplyClusterRebuildDirective(

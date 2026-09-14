@@ -37,8 +37,10 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "keylane/meta/cluster_create.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/encoding.h"
+#include "keylane/meta/hash.h"
 #include "keylane/meta/nuraft_log_store.h"
 #include "keylane/meta/nuraft_state_mgr.h"
 #include "keylane/meta/state_apply.h"
@@ -386,6 +388,166 @@ TEST_F(MetaStateMachineTest, SnapshotIsDurableAcrossRestart) {
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 1u);
   EXPECT_EQ(stores.audit_.size(), 3u);
   EXPECT_TRUE(stores.audit_.VerifyChain());
+}
+
+TEST_F(MetaStateMachineTest,
+       UncontrolledFailoverTransitionIsDurableAcrossSnapshotRestart) {
+  auto opened = Open();
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
+
+  const std::string owner = MakeNodeId(0x11);
+  const keylane::meta::MetaAssignmentId owner_assignment = MakeRequestId(0x31);
+  const keylane::meta::MetaGrantSpec successor_grant{5000, "p", 0};
+
+  keylane::meta::ClusterCreateManifestV1 manifest;
+  manifest.schema_version_ = 1;
+  manifest.meta_members_ = {{1, "tcp://127.0.0.1:7101", "tcp://127.0.0.1:7301",
+                             "tcp://127.0.0.1:7201"}};
+  manifest.data_nodes_ = {{owner, "tcp://127.0.0.1:6379"}};
+  manifest.groups_ = {{"g1", owner, {}}};
+  manifest.slot_ranges_ = {{0, 16383, "g1"}};
+
+  SubmitOperation root;
+  root.request_id_ = MakeRequestId(0x01);
+  root.actor_.principal_ = std::string(kEntryPrincipal);
+  root.actor_.readable_time_ = std::string(kEntryReadableTime);
+  root.operation_id_ = MakeRequestId(0x02);
+  root.kind_ = std::string(keylane::meta::kMetaClusterCreateOperationKind);
+  const auto intent =
+      keylane::meta::EncodeClusterCreateRequest(manifest, root.operation_id_);
+  ASSERT_TRUE(intent.ok()) << intent.status();
+  root.intent_ = *intent;
+  root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
+  Commit(*machine, 1, root);
+
+  keylane::meta::CompleteOperation complete;
+  complete.request_id_ = MakeRequestId(0x03);
+  complete.actor_ = root.actor_;
+  complete.operation_id_ = root.operation_id_;
+  complete.expected_revision_ = 0;
+  complete.result_ = "cluster-created";
+  Commit(*machine, 2, complete);
+
+  RegisterNode node = MakeRegister(0x11);
+  node.role_ = keylane::meta::MetaNodeRole::kPrimary;
+  Commit(*machine, 3, node);
+
+  CreateGroup group = MakeCreateGroup("g1", 1);
+  group.actor_ = root.actor_;
+  Commit(*machine, 4, group);
+
+  keylane::meta::AssignNodeToGroup assign;
+  assign.request_id_ = MakeRequestId(0x05);
+  assign.actor_ = root.actor_;
+  assign.group_id_ = "g1";
+  assign.node_id_ = owner;
+  assign.assignment_id_ = owner_assignment;
+  assign.role_ = keylane::meta::MetaNodeRole::kPrimary;
+  assign.expected_revision_ = 1;
+  assign.new_topology_epoch_ = 2;
+  Commit(*machine, 5, assign);
+
+  keylane::meta::PutPolicy policy;
+  policy.request_id_ = MakeRequestId(0x06);
+  policy.actor_ = root.actor_;
+  policy.policy_id_ = successor_grant.policy_id_;
+  policy.version_ = successor_grant.policy_version_;
+  policy.content_ = R"({"lease_ms":5000})";
+  policy.content_hash_ =
+      keylane::meta::MetaPolicyStore::ContentHash(policy.content_);
+  Commit(*machine, 6, policy);
+
+  keylane::meta::BeginGroupTerm begin_term;
+  begin_term.request_id_ = MakeRequestId(0x07);
+  begin_term.actor_ = root.actor_;
+  begin_term.group_id_ = "g1";
+  begin_term.expected_term_ = 0;
+  begin_term.new_term_ = 1;
+  Commit(*machine, 7, begin_term);
+
+  keylane::meta::ActivateAuthority activate;
+  activate.request_id_ = MakeRequestId(0x08);
+  activate.actor_ = root.actor_;
+  activate.group_id_ = "g1";
+  activate.expected_term_ = 1;
+  activate.new_owner_ = owner;
+  activate.grant_ = successor_grant;
+  activate.new_authority_version_ = 1;
+  activate.new_topology_epoch_ = 3;
+  activate.new_config_epoch_ = 1;
+  Commit(*machine, 8, activate);
+
+  keylane::meta::BeginUncontrolledFailover begin;
+  begin.request_id_ = MakeRequestId(0x09);
+  begin.actor_ = root.actor_;
+  begin.group_id_ = "g1";
+  begin.transition_id_ = MakeRequestId(0x41);
+  begin.target_term_ = 2;
+  begin.successor_grant_ = successor_grant;
+  begin.expected_owner_node_id_ = owner;
+  begin.expected_owner_assignment_id_ = owner_assignment;
+  begin.expected_membership_revision_ = 2;
+  begin.expected_group_term_ = 1;
+  begin.expected_authority_version_ = 1;
+  begin.expected_grant_revision_ = 8;
+  begin.expected_population_manifest_revision_ = 0;
+  begin.expected_population_manifest_digest_.fill(0);
+  begin.expected_partition_replication_epoch_ = 0;
+  begin.expected_config_epoch_ = 1;
+  Commit(*machine, 9, begin);
+
+  const MetaStores committed = machine->StoresSnapshot();
+  ASSERT_EQ(committed.topology_.ClusterLifecycle().state_,
+            keylane::meta::MetaClusterLifecycle::kCreated);
+  const auto committed_group = committed.topology_.FindGroup("g1");
+  ASSERT_TRUE(committed_group.has_value());
+  ASSERT_TRUE(committed_group->failover_transition_.has_value());
+  const keylane::meta::MetaFailoverTransition committed_transition =
+      *committed_group->failover_transition_;
+  EXPECT_EQ(committed_transition.transition_id_, begin.transition_id_);
+  EXPECT_EQ(committed_transition.revision_, 9u);
+  EXPECT_EQ(committed_transition.target_term_, 2u);
+  EXPECT_FALSE(committed_transition.candidate_action_.has_value());
+
+  const auto committed_grant = committed.grant_.GroupState("g1");
+  ASSERT_TRUE(committed_grant.has_value());
+  EXPECT_EQ(committed_grant->group_term_, 2u);
+  EXPECT_TRUE(committed_grant->fenced_);
+  EXPECT_FALSE(committed_grant->grant_.has_value());
+
+  CreateSnapshot(*machine, /*log_idx=*/9, /*log_term=*/4);
+  machine.reset();
+
+  auto reopened = Open();
+  ASSERT_TRUE(reopened.ok()) << reopened.status();
+  machine = std::move(*reopened);
+  EXPECT_EQ(machine->last_commit_index(), 9u);
+
+  const MetaStores restored = machine->StoresSnapshot();
+  const auto restored_group = restored.topology_.FindGroup("g1");
+  ASSERT_TRUE(restored_group.has_value());
+  ASSERT_TRUE(restored_group->failover_transition_.has_value());
+  EXPECT_EQ(*restored_group->failover_transition_, committed_transition);
+  EXPECT_EQ(restored_group->record_.group_term_, 2u);
+  const auto restored_grant = restored.grant_.GroupState("g1");
+  ASSERT_TRUE(restored_grant.has_value());
+  EXPECT_EQ(restored_grant->group_term_, 2u);
+  EXPECT_TRUE(restored_grant->fenced_);
+  EXPECT_FALSE(restored_grant->grant_.has_value());
+
+  // If the Raft core presents the snapshot's final entry again, exact-index
+  // replay must validate the installed post-state instead of advancing the
+  // term or transition revision a second time.
+  Commit(*machine, 9, begin);
+  const MetaStores replayed = machine->StoresSnapshot();
+  const auto replayed_group = replayed.topology_.FindGroup("g1");
+  ASSERT_TRUE(replayed_group.has_value());
+  ASSERT_TRUE(replayed_group->failover_transition_.has_value());
+  EXPECT_EQ(*replayed_group->failover_transition_, committed_transition);
+  EXPECT_EQ(replayed_group->record_.group_term_, 2u);
+  EXPECT_EQ(replayed.audit_.size(), 9u);
+  EXPECT_EQ(machine->last_commit_index(), 9u);
 }
 
 TEST_F(MetaStateMachineTest, SnapshotExactCutPoint) {

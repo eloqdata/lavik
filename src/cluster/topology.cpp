@@ -203,6 +203,7 @@ std::uint64_t ComputeContentHash(
     HashBool(hash, group->granted_);
     HashBool(hash, group->population_ready_);
     HashBool(hash, group->storage_ready_);
+    HashBool(hash, group->mutations_paused_);
     HashU64(hash, group->config_epoch_);
   }
 

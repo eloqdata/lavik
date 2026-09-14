@@ -17,8 +17,8 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
-#include <csignal>
 #include <condition_variable>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -474,7 +474,7 @@ absl::Status InstallShutdownSignalHandler() {
     return absl::Status(absl::StatusCode::kInternal, "eventfd setup failed");
   }
 
-  struct sigaction action {};
+  struct sigaction action{};
   sigemptyset(&action.sa_mask);
   action.sa_handler = ShutdownSignalHandler;
   if (sigaction(SIGINT, &action, nullptr) != 0 ||
@@ -487,7 +487,7 @@ absl::Status InstallShutdownSignalHandler() {
 }
 
 void CleanupShutdownSignalHandler() noexcept {
-  struct sigaction action {};
+  struct sigaction action{};
   sigemptyset(&action.sa_mask);
   action.sa_handler = SIG_DFL;
   (void)sigaction(SIGINT, &action, nullptr);
@@ -1380,8 +1380,7 @@ Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
   while (!worker.stop_requested()) {
     if (!replication_quiesce_handled &&
         replication_quiesce_requested_.load(std::memory_order_acquire)) {
-      absl::Status quiesced =
-          co_await replication_->QuiesceForShutdown();
+      absl::Status quiesced = co_await replication_->QuiesceForShutdown();
       {
         std::lock_guard lock(replication_quiesce_mutex_);
         replication_quiesce_status_ = std::move(quiesced);
@@ -1397,9 +1396,8 @@ Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
       ready_.store(false, std::memory_order_release);
       cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
       if (runtime != nullptr) {
-        const absl::Status fenced =
-            co_await runtime->node_control_installer_
-                .LoseStorageReadinessTransition();
+        const absl::Status fenced = co_await runtime->node_control_installer_
+                                        .LoseStorageReadinessTransition();
         if (!fenced.ok()) {
           runtime_failure_cleanup_failed_.store(true,
                                                 std::memory_order_release);
@@ -2208,7 +2206,7 @@ int RunServer(ServerOptions options) {
         ++skipped;
       }
     }
-    struct stat rdb_info {};
+    struct stat rdb_info{};
     if (::stat(options.load_rdb_file_.c_str(), &rdb_info) != 0) {
       spdlog::error("cannot identify replacement RDB '{}': {}",
                     options.load_rdb_file_, std::strerror(errno));
@@ -2228,7 +2226,7 @@ int RunServer(ServerOptions options) {
         }
         continue;
       }
-      struct stat info {};
+      struct stat info{};
       if (::stat(path.c_str(), &info) != 0) {
         spdlog::error("cannot identify replacement storage path '{}': {}", path,
                       std::strerror(errno));
@@ -2447,9 +2445,10 @@ int RunServer(ServerOptions options) {
   std::unique_ptr<cluster::MetaControlClientService> meta_control_client;
   if (options.cluster_enabled_) {
     std::unique_ptr<cluster::NodeControlActions> control_actions =
-        cluster::CreateReplicationNodeControlActions(replication);
-    auto runtime = std::make_unique<cluster::ClusterRuntime>(
-        std::move(control_actions));
+        cluster::CreateReplicationNodeControlActions(replication,
+                                                     options.tls_replication_);
+    auto runtime =
+        std::make_unique<cluster::ClusterRuntime>(std::move(control_actions));
     // Announce-address defaults: an explicit announce ip wins; otherwise the
     // first non-wildcard bind address; a wildcard bind stays empty so
     // discovery self entries keep the "use the startup node" convention.

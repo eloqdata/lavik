@@ -662,12 +662,85 @@ void detail::RecordEquivalentTransferBoundary(
   *validated_index = std::max(*validated_index, applied_index);
 }
 
+detail::MetaPublisherTransferDisposition detail::ClassifyPublisherSupersession(
+    bool receiver_can_apply) noexcept {
+  return receiver_can_apply
+             ? MetaPublisherTransferDisposition::
+                   kAwaitExactAppliedAndRetryInSession
+             : MetaPublisherTransferDisposition::kRetryBeforeApplyInSession;
+}
+
+absl::StatusOr<std::optional<MetaObservedFailoverProjection>>
+detail::FailoverProjectionForHeartbeat(
+    const control::FullDesiredState& installed, std::string_view node_id,
+    const MetaBootIncarnation& boot) {
+  std::optional<MetaObservedFailoverProjection> result;
+  for (const control::WireDesiredGroup& group : installed.groups) {
+    if (!group.failover_transition.has_value() ||
+        !group.failover_transition->candidate_action.has_value()) {
+      continue;
+    }
+    const control::WireFailoverTransition& transition =
+        *group.failover_transition;
+    const control::WireFailoverCandidateAction& action =
+        *transition.candidate_action;
+    if (action.candidate.node_id != node_id) continue;
+    auto candidate_boot = ParseIdentity<20>(
+        action.candidate.boot_id, "installed failover candidate boot id");
+    if (!candidate_boot.ok()) return candidate_boot.status();
+    if (*candidate_boot != boot) continue;
+    if (result.has_value()) {
+      return absl::FailedPreconditionError(
+          "installed FDS binds one Data incarnation to multiple failover "
+          "candidate actions");
+    }
+    result = MetaObservedFailoverProjection{
+        .group_id_ = group.group_id,
+        .group_term_ = group.group_term,
+        .transition_id_ = transition.transition_id,
+        .transition_revision_ = transition.revision,
+        .action_id_ = action.action_id,
+        .candidate_node_id_ = action.candidate.node_id,
+        .candidate_assignment_id_ = action.candidate.assignment_id,
+        .candidate_boot_id_ = *candidate_boot,
+    };
+  }
+  return result;
+}
+
 MetaHeartbeatObservationResult IngestHeartbeatObservations(
     MetaObservationStore& observations, const MetaCommittedFacts& facts,
     std::string_view node_id, const MetaBootIncarnation& boot,
     const MetaReplicationHistoryId& session_history, std::uint64_t generation,
     const control::HeartbeatHealth& health,
     const control::HeartbeatRoleInformation& role_information,
+    std::int64_t now_unix_ms) {
+  return IngestHeartbeatObservations(
+      observations, facts, node_id, boot, session_history, generation, health,
+      role_information, std::nullopt, now_unix_ms);
+}
+
+MetaHeartbeatObservationResult IngestHeartbeatObservations(
+    MetaObservationStore& observations, const MetaCommittedFacts& facts,
+    std::string_view node_id, const MetaBootIncarnation& boot,
+    const MetaReplicationHistoryId& session_history, std::uint64_t generation,
+    const control::HeartbeatHealth& health,
+    const control::HeartbeatRoleInformation& role_information,
+    const std::optional<control::FailoverObservation>& failover_observation,
+    std::int64_t now_unix_ms) {
+  return IngestHeartbeatObservations(
+      observations, facts, node_id, boot, session_history, generation, health,
+      role_information, failover_observation, std::nullopt, now_unix_ms);
+}
+
+MetaHeartbeatObservationResult IngestHeartbeatObservations(
+    MetaObservationStore& observations, const MetaCommittedFacts& facts,
+    std::string_view node_id, const MetaBootIncarnation& boot,
+    const MetaReplicationHistoryId& session_history, std::uint64_t generation,
+    const control::HeartbeatHealth& health,
+    const control::HeartbeatRoleInformation& role_information,
+    const std::optional<control::FailoverObservation>& failover_observation,
+    std::optional<MetaObservedFailoverProjection> failover_projection,
     std::int64_t now_unix_ms) {
   (void)observations.MaybeSweepExpired(now_unix_ms);
   const MetaObservationIdentity identity{std::string(node_id), boot,
@@ -730,6 +803,7 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
           .population_manifest_digest_ = candidate.manifest_digest,
           .partition_replication_epoch_ = candidate.partition_replication_epoch,
           .replication_history_id_ = session_history,
+          .source_group_term_ = candidate.source_group_term,
           .source_node_id_ = candidate.source_node_id,
           .source_assignment_id_ = candidate.source_assignment_id,
           .source_boot_incarnation_ = *source_boot,
@@ -745,9 +819,90 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
       candidate_observation = std::move(progress);
     }
   }
+
+  std::optional<MetaFailoverObservationObs> failover_observation_value;
+  if (failover_observation.has_value()) {
+    std::visit(
+        [&](const auto& wire) {
+          using Wire = std::decay_t<decltype(wire)>;
+          const auto committed =
+              facts.FailoverTransitionById(wire.transition_id);
+          if (!committed.has_value()) {
+            record_rejection("failover", absl::FailedPreconditionError(
+                                             "transition is not committed"));
+            return;
+          }
+          if constexpr (std::is_same_v<Wire, control::SourcePaused>) {
+            auto source_boot =
+                ParseIdentity<20>(wire.source_boot_id, "paused source boot id");
+            auto source_history = ParseIdentity<20>(wire.source_history_id,
+                                                    "paused source history id");
+            if (!source_boot.ok()) {
+              record_rejection("failover", source_boot.status());
+              return;
+            }
+            if (!source_history.ok()) {
+              record_rejection("failover", source_history.status());
+              return;
+            }
+            failover_observation_value = MetaFailoverObservationObs{
+                .payload_ = MetaSourcePausedObs{
+                    .group_id_ = committed->group_id_,
+                    .transition_id_ = wire.transition_id,
+                    .source_node_id_ = wire.source_node_id,
+                    .source_assignment_id_ = wire.source_assignment_id,
+                    .source_boot_id_ = *source_boot,
+                    .source_history_id_ = *source_history,
+                    .source_group_term_ = wire.source_group_term,
+                    .stable_next_lsns_ = wire.stable_next_lsns,
+                }};
+          } else {
+            auto candidate_boot = ParseIdentity<20>(
+                wire.candidate_boot_id, "failover candidate boot id");
+            if (!candidate_boot.ok()) {
+              record_rejection("failover", candidate_boot.status());
+              return;
+            }
+            if constexpr (std::is_same_v<Wire, control::CandidatePrepared>) {
+              failover_observation_value = MetaFailoverObservationObs{
+                  .payload_ = MetaCandidatePreparedObs{
+                      .group_id_ = committed->group_id_,
+                      .transition_id_ = wire.transition_id,
+                      .action_id_ = wire.action_id,
+                      .candidate_node_id_ = wire.candidate_node_id,
+                      .candidate_assignment_id_ = wire.candidate_assignment_id,
+                      .candidate_boot_id_ = *candidate_boot,
+                      .prepared_context_id_ = wire.prepared_context_id,
+                      .prepared_context_hash_ = wire.prepared_context_hash,
+                  }};
+            } else {
+              failover_observation_value = MetaFailoverObservationObs{
+                  .payload_ = MetaActionFailedObs{
+                      .group_id_ = committed->group_id_,
+                      .transition_id_ = wire.transition_id,
+                      .action_id_ = wire.action_id,
+                      .candidate_node_id_ = wire.candidate_node_id,
+                      .candidate_assignment_id_ = wire.candidate_assignment_id,
+                      .candidate_boot_id_ = *candidate_boot,
+                      .population_manifest_revision_ =
+                          wire.population_manifest_revision,
+                      .population_manifest_digest_ =
+                          wire.population_manifest_digest,
+                      .partition_replication_epoch_ =
+                          wire.partition_replication_epoch,
+                      .failure_class_ = wire.failure_class,
+                      .failure_detail_ = wire.failure_detail,
+                  }};
+            }
+          }
+        },
+        *failover_observation);
+  }
   MetaObservationStore::HeartbeatReplaceResult replaced =
       observations.ReplaceHeartbeat(identity, std::move(health_observation),
-                                    std::move(candidate_observation), facts,
+                                    std::move(candidate_observation),
+                                    std::move(failover_observation_value),
+                                    std::move(failover_projection), facts,
                                     now_unix_ms);
   if (!replaced.boot_status_.ok()) {
     record_rejection("boot", replaced.boot_status_);
@@ -757,6 +912,9 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
   }
   if (!replaced.candidate_status_.ok()) {
     record_rejection("candidate", replaced.candidate_status_);
+  }
+  if (!replaced.failover_status_.ok()) {
+    record_rejection("failover", replaced.failover_status_);
   }
   return result;
 }
@@ -1623,10 +1781,9 @@ bool ActiveClusterCreateDeclaresNode(const MetaCommittedView& view,
   MetaOperationId intent_root{};
   auto manifest = DecodeClusterCreateRequest(operation->intent_, &intent_root);
   return manifest.ok() && intent_root == lifecycle.root_operation_id_ &&
-         std::any_of(manifest->data_nodes_.begin(), manifest->data_nodes_.end(),
-                     [&](const auto& node) {
-                       return node.node_id_ == node_id;
-                     });
+         std::any_of(
+             manifest->data_nodes_.begin(), manifest->data_nodes_.end(),
+             [&](const auto& node) { return node.node_id_ == node_id; });
 }
 
 celer::Task<absl::Status> ReconcileLocalMetaMember(
@@ -1773,18 +1930,18 @@ celer::Task<absl::Status> SendFullState(
 celer::Task<absl::Status> AbortSupersededReplacement(
     SessionIo& io, const control::WireId128& object_id, bool transfer_active) {
   if (transfer_active) {
-    if (absl::Status aborted =
-            co_await io.Send(control::MessagePriority::kReliable,
-                             control::WireMessage(control::TransferAbort{
-                                 .object_id = object_id,
-                                 .reason = 1,
-                             }));
+    if (absl::Status aborted = co_await io.Send(
+            control::MessagePriority::kReliable,
+            control::WireMessage(control::TransferAbort{
+                .object_id = object_id,
+                .reason =
+                    control::TransferAbortReason::kFullDesiredStateSuperseded,
+            }));
         !aborted.ok()) {
       co_return aborted;
     }
   }
-  co_return absl::AbortedError(
-      "FullDesiredState was superseded before directive dispatch");
+  co_return absl::OkStatus();
 }
 
 celer::Task<absl::Status> EnsureCurrentBeforeDirectiveDispatch(
@@ -2023,9 +2180,10 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
   co_return disposition;
 }
 
-celer::Task<absl::Status> SendReplacementFullStateLive(
-    const std::shared_ptr<LiveSessionState>& state,
-    const NodeControlBatch& installed, const NodeControlBatch& replacement) {
+celer::Task<absl::StatusOr<detail::MetaPublisherTransferDisposition>>
+SendReplacementFullStateLive(const std::shared_ptr<LiveSessionState>& state,
+                             const NodeControlBatch& installed,
+                             const NodeControlBatch& replacement) {
   const std::string_view bytes = replacement.encoded_full_state;
   if (bytes.size() > control::kMaxFullDesiredStateBytes) {
     co_return absl::ResourceExhaustedError(
@@ -2041,8 +2199,8 @@ celer::Task<absl::Status> SendReplacementFullStateLive(
         co_await CheckLiveTransferBoundary(state, installed, replacement);
     if (!boundary.ok()) co_return boundary.status();
     if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
-      co_return absl::AbortedError(
-          "FullDesiredState was superseded before its direct frame");
+      co_return detail::ClassifyPublisherSupersession(
+          /*receiver_can_apply=*/false);
     }
 
     // Arm before the single frame for the same reason the streamed path arms
@@ -2071,11 +2229,18 @@ celer::Task<absl::Status> SendReplacementFullStateLive(
       co_return boundary.status();
     }
     if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
-      ClearPublisherApplied(state);
-      co_return absl::AbortedError(
-          "FullDesiredState was superseded after its direct frame");
+      if (absl::Status applied = co_await AwaitPublisherApplied(state);
+          !applied.ok()) {
+        co_return applied;
+      }
+      co_return detail::ClassifyPublisherSupersession(
+          /*receiver_can_apply=*/true);
     }
-    co_return co_await AwaitPublisherApplied(state);
+    if (absl::Status applied = co_await AwaitPublisherApplied(state);
+        !applied.ok()) {
+      co_return applied;
+    }
+    co_return detail::MetaPublisherTransferDisposition::kApplied;
   }
 
   auto object_id = control::GenerateId128();
@@ -2098,8 +2263,13 @@ celer::Task<absl::Status> SendReplacementFullStateLive(
     co_return boundary.status();
   }
   if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
-    co_return co_await AbortSupersededReplacement(*state->io_, *object_id,
-                                                  /*transfer_active=*/true);
+    if (absl::Status aborted = co_await AbortSupersededReplacement(
+            *state->io_, *object_id, /*transfer_active=*/true);
+        !aborted.ok()) {
+      co_return aborted;
+    }
+    co_return detail::ClassifyPublisherSupersession(
+        /*receiver_can_apply=*/false);
   }
 
   for (std::size_t offset = 0; offset < bytes.size();
@@ -2122,8 +2292,13 @@ celer::Task<absl::Status> SendReplacementFullStateLive(
       co_return boundary.status();
     }
     if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
-      co_return co_await AbortSupersededReplacement(*state->io_, *object_id,
-                                                    /*transfer_active=*/true);
+      if (absl::Status aborted = co_await AbortSupersededReplacement(
+              *state->io_, *object_id, /*transfer_active=*/true);
+          !aborted.ok()) {
+        co_return aborted;
+      }
+      co_return detail::ClassifyPublisherSupersession(
+          /*receiver_can_apply=*/false);
     }
   }
 
@@ -2152,11 +2327,18 @@ celer::Task<absl::Status> SendReplacementFullStateLive(
     co_return boundary.status();
   }
   if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
-    ClearPublisherApplied(state);
-    co_return absl::AbortedError(
-        "FullDesiredState was superseded after TransferEnd");
+    if (absl::Status applied = co_await AwaitPublisherApplied(state);
+        !applied.ok()) {
+      co_return applied;
+    }
+    co_return detail::ClassifyPublisherSupersession(
+        /*receiver_can_apply=*/true);
   }
-  co_return co_await AwaitPublisherApplied(state);
+  if (absl::Status applied = co_await AwaitPublisherApplied(state);
+      !applied.ok()) {
+    co_return applied;
+  }
+  co_return detail::MetaPublisherTransferDisposition::kApplied;
 }
 
 celer::Task<absl::Status> RunDirectiveSender(
@@ -2274,10 +2456,18 @@ celer::Task<absl::Status> SessionPublisherBody(
 
     state->core_->options_.runtime_status_->Remove(state->node_id_,
                                                    &state->session_id_);
-    if (absl::Status sent =
-            co_await SendReplacementFullStateLive(state, *installed, *latest);
-        !sent.ok()) {
-      co_return sent;
+    auto published =
+        co_await SendReplacementFullStateLive(state, *installed, *latest);
+    if (!published.ok()) {
+      co_return published.status();
+    }
+    if (*published ==
+        detail::MetaPublisherTransferDisposition::kRetryBeforeApplyInSession) {
+      // A started transfer was reset with an object-local TransferAbort. If no
+      // frame was visible yet, there was nothing to reset. In both cases keep
+      // the authenticated session and its boot observation while the next
+      // iteration projects the latest commit.
+      continue;
     }
     state->core_->full_states_sent_.fetch_add(1, std::memory_order_relaxed);
     state->installed_ = RetainProjection(std::move(*latest));
@@ -2286,6 +2476,14 @@ celer::Task<absl::Status> SessionPublisherBody(
     // coroutine-local reference would turn the intended two-generation bound
     // into three simultaneous projection charges.
     installed.reset();
+
+    if (*published == detail::MetaPublisherTransferDisposition::
+                          kAwaitExactAppliedAndRetryInSession) {
+      // Data installed this exact intermediate object and its Applied was
+      // consumed above. Retain it as the real session baseline, but skip
+      // directive/lease publication until the newest FDS is also installed.
+      continue;
+    }
 
     // Data has applied this object, but a commit may have landed behind its
     // End/Ack exchange. Re-enter the publisher before rebuilding receipt
@@ -2590,6 +2788,13 @@ celer::Task<absl::Status> RunEstablishedSession(
       // Observation ingestion is independent from publisher progress and
       // lease validation. In particular, a rejected challenge or candidate
       // cannot suppress an otherwise valid boot/health observation.
+      const std::shared_ptr<const NodeControlBatch> installed =
+          state->installed_;
+      auto failover_projection = detail::FailoverProjectionForHeartbeat(
+          installed->full_state, state->node_id_, boot_id);
+      if (!failover_projection.ok()) {
+        co_return failover_projection.status();
+      }
       const std::uint64_t committed_high_water =
           state->core_->coordinator_->CommittedHighWater();
       if (committed_high_water > state->validated_committed_high_water_ &&
@@ -2609,7 +2814,8 @@ celer::Task<absl::Status> RunEstablishedSession(
       MetaHeartbeatObservationResult observation = IngestHeartbeatObservations(
           *state->core_->observations_, facts, state->node_id_, boot_id,
           replication_history_id, session_generation, heartbeat->health,
-          heartbeat->role_information, heartbeat_received_unix_ms);
+          heartbeat->role_information, heartbeat->failover_observation,
+          std::move(*failover_projection), heartbeat_received_unix_ms);
       state->core_->options_.runtime_status_->RecordHealth(
           state->node_id_, state->session_id_, heartbeat->health,
           heartbeat_received_unix_ms);
@@ -2621,8 +2827,6 @@ celer::Task<absl::Status> RunEstablishedSession(
             1, std::memory_order_relaxed);
       }
 
-      const std::shared_ptr<const NodeControlBatch> installed =
-          state->installed_;
       const bool leader_valid =
           AuthoritySessionsAllowed(*state->core_,
                                    state->leadership_generation_) &&
@@ -3435,8 +3639,8 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   const std::uint64_t session_generation = ++next_generation;
   observation_identity =
       MetaObservationIdentity{node_id, *boot_id, session_generation};
-  const absl::Status adopted =
-      core->observations_->AdoptSession(*observation_identity, NowUnixMillis());
+  const absl::Status adopted = core->observations_->AdoptSession(
+      *observation_identity, NowUnixMillis(), *replication_history_id);
   if (!adopted.ok()) co_return finish(adopted);
 
   std::deque<control::WireMessage> deferred;
@@ -3560,7 +3764,16 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
       session_status.code() == absl::StatusCode::kAlreadyExists ||
       session_status.code() == absl::StatusCode::kPermissionDenied ||
       session_status.code() == absl::StatusCode::kOutOfRange;
-  co_return finish(std::move(session_status), protocol_error);
+  if (protocol_error) {
+    core->protocol_errors_.fetch_add(1, std::memory_order_relaxed);
+  }
+  // CloseConnectionNow above deliberately runs before joining the detached
+  // publisher/directive tasks. Their drain yields back to Worker, which may
+  // reclaim the retired Connection before this coroutine resumes. Do not send
+  // the stale TcpStream through `finish` and attempt a second close here; the
+  // completion guard only compares the opaque connection address and remains
+  // safe after Celer releases its storage.
+  co_return session_status;
 }
 
 }  // namespace keylane::meta

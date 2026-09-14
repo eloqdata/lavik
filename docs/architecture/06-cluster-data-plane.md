@@ -22,8 +22,9 @@ seams:
   owning node, MOVED target, and client-facing endpoint selection.
 - `NodeControlInstaller` is the only state-changing seam. It validates and
   atomically publishes full state, installs finite leases and fences, drains
-  retired request generations, revokes source capabilities, and dispatches
-  typed replication directives.
+  retired or controlled-paused request generations, revokes source
+  capabilities, and reconciles typed replication directives, failover actions,
+  activation, and the steady follow-owner relationship.
 - `MetaControlClientService` owns leader discovery and the one outbound
   Meta-to-Data control session. It maps authenticated wire values into the
   node controller; neither it nor replication writes `TopologyCache`
@@ -87,6 +88,13 @@ Readiness is per group and deliberately excludes the grant bit: a fenced
 group is not "still loading", it has no safe owner. Keyed requests consult
 only the groups their slots map to, so one group's recovery does not stall
 traffic owned by healthy groups; keyless commands consult the aggregate.
+Meta does not serialize a Data process's boot-local population proof. During
+an FDS replacement, NodeControl carries an existing positive proof only across
+an exact match of the Group, local and Owner assignments, Group term, manifest,
+and partition replication epoch. Explicit readiness loss or any changed anchor
+clears it before publication. Consequently a Controlled Failover pause can
+close mutation admission without manufacturing a transient LOADING interval or
+revoking an otherwise unchanged finite lease.
 
 ## Admission and fencing
 
@@ -107,17 +115,20 @@ slot without a general-purpose vector allocation or footprint.
    this node's fenced group — CLUSTERDOWN. This outranks the cross-slot
    check, matching Redis.
 3. Cross-slot: the remaining keys hash to other slots — CROSSSLOT.
-4. Ownership: this node's granted group owns the slot — serve; a READONLY
-   connection on a replica of the owning group serves reads locally as an
-   explicitly stale read; otherwise MOVED to the primary. A fenced remote
-   primary still receives the redirect: the target applies its own grant
-   gate and answers CLUSTERDOWN, so a redirect never lands a client on a
-   writable fenced node.
+4. Ownership: this node's granted group owns the slot — serve, except that a
+   write during its controlled-failover mutation pause returns `TRYAGAIN
+   Failover in progress`; a READONLY connection on a replica of the owning
+   group serves reads locally as an explicitly stale read; otherwise MOVED to
+   the primary. A fenced remote primary still receives the redirect: the
+   target applies its own grant gate and answers CLUSTERDOWN, so a redirect
+   never lands a client on a writable fenced node.
 
 Commands without keys — including commands whose key extraction fails, such
 as a malformed `EVAL` numkeys — admit locally (readiness still applies) and
 produce their own argument errors, the same treatment Redis gives zero-key
-commands.
+commands. Runtime `PUBLISH` is the exception: it derives a slot from the
+channel so controlled failover can pause and drain it like every other source
+mutation.
 
 Admission alone cannot fence writes: a request admitted just before a
 topology change could mutate afterwards. Two owner-side re-check choke points
@@ -210,12 +221,15 @@ immediate EXEC and Lua forms never enter the waiter registry and remain inside
 the enclosing transaction or script authority window.
 
 The node controller retains the replaced immutable snapshot as a drain token.
-A new lease, source authorization, or destructive rebuild for that group is
-refused until the old counter reaches zero. An explicit Fence is acknowledged
-only after the local fence is published, source export capabilities are
-revoked and joined, and the old request generation has drained. This makes the
-acknowledgement a usable old-authority exclusion proof rather than a transport
-receipt.
+A new lease, source authorization, destructive rebuild, or controlled source
+frontier for that group is refused until the old counter reaches zero. An
+explicit Fence is acknowledged only after the local fence is published, source
+export capabilities are revoked and joined, and the old request generation has
+drained. A controlled transition instead keeps the owner/grant serving reads
+and established replication, rejects new mutations with TRYAGAIN, drains the
+old mutation counter, and then quiesces expiration before capturing its stable
+frontier. These acknowledgements and observations describe completed local
+barriers rather than mere transport receipt.
 
 ## Meta control session and finite authority
 
@@ -277,11 +291,28 @@ ownership.
 Control protocol v1 has no delta format. Initial connection, reconnection, and
 every semantic projection change transfer a complete `FullDesiredState`. The
 object contains global topology plus each group's partition replication epoch
-and the receiving node's policies, immutable population manifests, and current
-directives. The source applied index is a
-diagnostic/order watermark; the projection SHA-256 is the semantic dependency
-for leases and directives. A higher index with identical semantic content is
-therefore harmless. Lower indexes reject, exact index/object replays are
+and the receiving node's policies, immutable population manifests, current
+directives, optional failover transition, optional grant activation action,
+complete membership/owner relationship, and `steady_replication_enabled`.
+Meta sets that bit only when the committed cluster lifecycle is `Created`;
+Genesis keeps it false so explicit population directives exclusively own
+ingress. Even when true, Data defers follow-owner reconciliation while an
+active failover transition or a current local initialize/rebuild directive owns
+ingress, then consumes the later complete FDS after that blocker disappears.
+When a newer committed projection supersedes an incomplete object transfer,
+Meta aborts only that matching FDS object and retries on the same authenticated
+session. Data treats only the named FDS-supersession reason for its exact active
+object as non-terminal; an unknown reason, another object kind, or a mismatched
+object fails the session. If a direct FDS frame or streamed `TransferEnd` is
+already visible, Meta instead consumes that object's exact `FullStateApplied`
+and adopts the intermediate projection as the actual session baseline before
+retrying the newest projection. Normal projection churn therefore does not
+manufacture a candidate disconnect, while a real session loss remains terminal
+for a selected action.
+The source applied index is a diagnostic/order watermark; the projection
+SHA-256 is the semantic dependency for leases and directives. A higher index
+with identical semantic content is therefore harmless. Lower indexes reject,
+exact index/object replays are
 idempotent, and one index naming different bytes invalidates memory authority
 and closes the session. Installation validates and builds the entire immutable
 state before one publication; partial transfer never changes serving state. A
@@ -293,12 +324,17 @@ the active-grant bit: they classify the heartbeat role while `grant_active`
 alone authorizes serving. Protocol v1 has no redundant member-role field that
 could disagree with them.
 
-Heartbeat carries common health followed by exactly one tagged role payload:
-no role information, an authority lease request, or replica candidate
-progress. A committed owner with an active renewable grant sends only the
-lease request; without one it sends no role information and never falls
-through to candidate reporting. A non-owner member with a coherent live Ready
-frontier sends only candidate progress. Candidate
+Heartbeat carries common health followed by exactly one tagged steady-state
+role payload: no role information, an authority lease request, or replica
+candidate progress. A committed owner with an active renewable grant sends
+only the lease request. An inactive topology owner normally sends no role
+information. The narrow exception is the historical owner retained by an
+active uncontrolled target-term fence: with no grant and a coherent live Ready
+frontier, it may report candidate progress using its authenticated current
+boot/history and its own assignment at the preceding term as source lineage.
+This lets the best surviving population re-enter selection without treating a
+fenced owner as active authority. Other non-owner members with coherent live
+Ready frontiers also send only candidate progress. Candidate
 progress includes the exact local membership assignment, manifest revision and
 digest, partition replication epoch, completed rebuild source lineage, and a
 typed bounded next-LSN vector sampled after successful apply. Candidate and
@@ -316,6 +352,25 @@ session completion path immediately withdraws the exact generation's
 candidate. Generation replacement, boot replacement, committed freshness
 changes, and Meta leadership changes independently invalidate it, so the
 selector never waits for TTL after a known disconnect or role change.
+For an active failover candidate, Meta records the exact group term,
+transition revision, action, assignment, and boot from the session's installed
+FDS under the same observation-store lock as that heartbeat. A missing or
+different role is terminal only when this marker matches the current
+unauthorized action; a heartbeat based on an older projection remains warmup
+evidence and cannot erase a candidate selected atomically with an uncontrolled
+term fence. After authorization, Data legitimately suppresses its ordinary
+role while rotating history, so Meta waits for Prepared, typed ActionFailed,
+the action watchdog, or disconnect instead of interpreting that gap as loss.
+
+An independent optional failover observation accompanies that role payload.
+`SourcePaused` reports the controlled source's exact history and stable
+next-LSN vector while the same heartbeat still renews its lease;
+`CandidatePrepared` reports the exact action and boot-local prepared-context
+identity/hash while the node still reports candidate progress; `ActionFailed`
+reports a bounded class and detail for that exact action. These observations
+are session/boot scoped and volatile. They disappear on FDS replacement,
+disconnect, or Meta leadership change and are regenerated from current Data
+state rather than restored by a new leader.
 
 After the initial projection is applied and validated, Meta also publishes a
 compact leader-local runtime record for cluster status and leader-owned
@@ -427,33 +482,35 @@ retirement has an uncertain outcome, the barrier returns that failure; the
 process skips the normal checkpoint and exits unsuccessfully rather than
 recording an unsafe state as a clean shutdown.
 
-Directives carry distinct 128-bit operation, directive, attempt, target
-assignment, and source assignment identities. The common assignment field
-continues to denote the target membership incarnation; the explicit source
+Population directives carry distinct 128-bit operation, directive, attempt,
+target assignment, and source assignment identities. The common assignment
+field denotes the target membership incarnation; the explicit source
 assignment denotes the exporting membership incarnation. The proposer never
 reuses either membership id for a later incarnation, while Meta durably retains
-only the current or most recent value per node to catch direct replay.
-The other IDs distinguish workflow, durable command, and execution attempt.
-The wire recipient is separate from the rebuild target: rebuild runs at the
-target, while authorize/revoke runs at the source without rewriting the common
-source/target identity used by native replication. The node controller checks
-the exact installed projection, full authority anchor, recipient boot, exact
-target and source member assignments, local source/target role, manifest
-revision/digest/content, partition replication epoch, and one-group constraint
-before calling `ReplicationManager`. A directive that passes the first check
-holds an admission token across readiness publication and the possibly
-suspending `ReplicationManager` registration, then rechecks its generation and
-all anchors immediately before crossing that action seam. FDS replacement,
-fencing, session invalidation, lease expiry, and externally observed population
-proof loss advance the generation before publishing their invalidating
-boundary. Their async transition waits for every older token to reject or
-finish registration and only then performs its final revoke/cancel pass. Thus a
-directive cannot appear behind the cleanup represented by `FullStateApplied` or
-`FenceAck` even when its action adapter suspended after validation. A boot-local
-fence floor also rejects directives through the fenced counter tuple: rebuilds
-compare the local target assignment, while source authorize/revoke compares the
-local source assignment. A fresh assignment or a strictly newer committed
-counter tuple is therefore distinguishable from replay of fenced authority.
+only the current or most recent value per node to catch direct replay. The
+other IDs distinguish workflow, durable command, and execution attempt. The
+wire recipient is separate from the rebuild target: rebuild runs at the target,
+while authorize/revoke runs at the source without rewriting the common
+source/target identity used by native replication.
+
+The node controller checks the exact installed projection, full authority
+anchor, recipient boot, exact target and source member assignments, local
+source/target role, manifest revision/digest/content, partition replication
+epoch, and one-group constraint before calling `ReplicationManager`. A
+directive that passes the first check holds an admission token across readiness
+publication and the possibly suspending manager registration, then rechecks
+its generation and all anchors immediately before crossing that action seam.
+FDS replacement, fencing, session invalidation, lease expiry, and externally
+observed population proof loss advance the generation before publishing their
+invalidating boundary. Their async transition waits for every older token to
+reject or finish registration and only then performs its final revoke/cancel
+pass. Thus a directive cannot appear behind the cleanup represented by
+`FullStateApplied` or `FenceAck` even when its action adapter suspended after
+validation. A boot-local fence floor also rejects directives through the
+fenced counter tuple: rebuilds compare the local target assignment, while
+source authorize/revoke compares the local source assignment. A fresh
+assignment or a strictly newer committed counter tuple is therefore
+distinguishable from replay of fenced authority.
 The bounded worker timer may still be queued briefly after a host resume, so a
 renewal also compares the old deadline with `CLOCK_BOOTTIME` synchronously. If
 the old lease is already due, the renewal path runs that exact expiration
@@ -462,18 +519,16 @@ timer, and joins source/directive cleanup before considering the replacement
 grant. A same-anchor heartbeat can extend only a lease that never expired, so
 pre-expiry admissions cannot be revived by a delayed timer.
 
-The encoded directive schema retains bounded `payload`, `preconditions`, and
-`force` fields. V1 appends `initialize-empty-population` as directive value 4
-and `promotion-prepare` as value 5, preserving the earlier wire values.
-Initialization uses its payload for exactly one canonical target
-replication-history id and has no source node, source authorization, or
-replication connection; zero-valued wire source fields normalize to an empty
-domain source. Promotion prepare instead owns versioned typed payload and
-precondition codecs that bind parent history, required per-flow frontier,
-excluded group term, and old-authority-exclusion hash. Other v1 kinds require
-both strings empty, and every kind requires `force=false`. Meta and NodeControl
-repeat these checks before the action seam, so the native adapter never treats
-an unknown predicate or forced operation as satisfied.
+The encoded population-directive schema retains bounded `payload`,
+`preconditions`, and `force` fields. `initialize-empty-population` uses its
+payload for exactly one canonical target replication-history id and has no
+source node, source authorization, or replication connection; zero-valued wire
+source fields normalize to an empty domain source. Rebuild and
+source-authorization payloads freeze the source flow count reported by its
+authenticated boot. Meta and NodeControl repeat the typed checks before the
+action seam, so the native adapter never treats an unknown predicate or forced
+operation as satisfied. Failover preparation does not use this directive or
+receipt channel; its action is embedded in the Group transition in FDS.
 
 Initialization reuses the ordinary directive, FDS, operation receipt, and
 population-proof lifecycles. NodeControl first closes readiness and serving,
@@ -519,16 +574,34 @@ state mutex. Other workers request population observations through the
 replication owner's asynchronous API, while data-flow progress remains
 worker-local and independently sampled.
 
-`promotion-prepare` is target-executed and storage-mutating like rebuild, but
-is admitted only from an ownerless, grantless FDS whose candidate population
-is already Ready. Its terminal success bytes are a versioned
-`PromotionPreparedEvidence` containing the frozen parent frontier,
-population/catalog durability tokens, and child history. The same bytes are
-sent in completed operation evidence and the terminal result; Meta commits the
-result receipt before the Failover operation can enter `promotion-prepared`.
-The boot-local completion prevents result replay from repeating durability or
-history creation. Prepare never opens writes, expiration, or source export,
-and protocol v1 has no `activate-promotion` directive.
+The FDS failover transition is a separate level-triggered control object. It
+names the transition/revision, controlled or uncontrolled mode, target term,
+and optional candidate action with exact candidate boot, compatibility domain,
+and one-way authorization. NodeControl derives source pause only for the exact
+controlled owner and derives candidate work only for the exact named candidate.
+The manager catches up through the existing native coordinator and returns a
+boot-local prepared-context identity/hash or a typed failure observation. A
+changed action cancels and joins the old candidate before the replacement can
+report progress. The one legal exception is a retained controlled degradation:
+the exact same authorized action survives while its installed authority
+context changes to the fenced target term, preserving any prepared child
+history for uncontrolled cutover. Any changed candidate, source lineage, or
+population anchor still replaces and cleans up the attempt.
+
+After Meta atomically cuts over, FDS clears the transition and carries its
+action id on the new grant. NodeControl retains only that action's prepared
+context and activates it provisionally on the first matching finite lease. It
+rechecks FDS/session/deadline around role activation and expiration capability
+installation before publishing the request lease. Exact replay is a no-op and
+any mismatch remains fenced. There is no separate activation directive or RPC.
+
+The same post-cutover FDS projects the complete owner, endpoint, membership,
+manifest, and population epoch as a steady follow-owner relationship. The new
+owner authorizes the exact replicas; every non-owner connects directly and the
+native handshake chooses CONTINUE or FULL. A former owner fences its role,
+revokes export, and retires its old backlog locally before it begins following.
+This relation is resent after reconnect or Meta leadership change, so cleanup
+and replica attachment do not depend on an ephemeral post-commit message.
 
 A completed population is content-scoped by group, membership assignment,
 immutable manifest, and partition replication epoch. `BeginGroupTerm` fences
@@ -657,11 +730,12 @@ no-key mutations, and the remaining `CLUSTER` management subcommands
 ## Verification
 
 The admission decision matrix, builder and parser validation, content-hash
-publication semantics, finite lease lifecycle, frame and complete-object
-codecs, projection validation, drain behavior, TLS-aware endpoint selection,
-in-flight counter concurrency and cell sharing, and the CLUSTER wire texts and
-reply shapes are unit-tested through pure seams and the test-only finite-lease
-topology installer.
+publication semantics, finite lease lifecycle, controlled mutation pause,
+failover action/activation, follow-owner reconciliation, frame and
+complete-object codecs, projection validation, drain behavior, TLS-aware
+endpoint selection, in-flight counter concurrency and cell sharing, and the
+CLUSTER wire texts and reply shapes are unit-tested through pure seams and the
+test-only finite-lease topology installer.
 A real-process plaintext Data-control gate starts three Meta members and a Data
 node, exercising follower-seed redirect, full-state install, heartbeat
 observation, leader failure and reconnect, stale-member restart, and graceful
@@ -683,15 +757,15 @@ incomplete-full-sync fence without a local topology source.
 | ServingState model, builder validation, topology cache, content hash, striped in-flight cells, and routing functions | `include/keylane/cluster/topology.h`, `src/cluster/topology.cpp` |
 | Admission decision and owner-side authority re-check | `include/keylane/cluster/authority.h`, `src/cluster/authority.cpp` |
 | Final logical-mutation precondition and WATCH/publication seam | `include/keylane/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp` |
-| Meta/Data protocol framing, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
-| Node controller, full-state validation, finite authority, drain, and typed replication adaptation | `include/keylane/cluster/node_control.h`, `include/keylane/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp` |
+| Meta/Data protocol framing, independent failover observations, transition/activation projection, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
+| Node controller, full-state validation, controlled pause, provisional activation, finite authority, drain, follow-owner reconciliation, and typed replication adaptation | `include/keylane/cluster/node_control.h`, `include/keylane/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp`, `include/keylane/replication.h`, `src/replication/replication.cpp` |
 | Meta discovery and outbound Data control session | `include/keylane/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
 | Process-wide runtime installation | `include/keylane/cluster/runtime.h`, `src/cluster/runtime.cpp` |
-| Cluster admission gate, owner/final re-check plumbing, outcome finalization, EXEC/Lua/blocking integration, and mode-restricted command policies | `src/redis/command.cpp`, `src/redis/cluster_gate.h`, `src/redis/blocking_wait.cpp` |
+| Cluster admission gate, controlled TRYAGAIN/PUBLISH handling, owner/final re-check plumbing, outcome finalization, EXEC/Lua/blocking integration, and mode-restricted command policies | `src/redis/command.cpp`, `src/redis/cluster_gate.h`, `src/redis/blocking_wait.cpp` |
 | CLUSTER subcommands and discovery replies | `src/redis/cluster_command.cpp`, `src/redis/cluster_command.h` |
 | Cluster wire error texts | `include/keylane/resp.h`, `src/redis/resp.cpp` |
 | Per-shard transaction validator hook | `include/keylane/tx/transaction.h`, `src/tx/transaction.cpp` |
 | Startup wiring, storage-ready publication, and Meta control client ownership | `src/redis/server.cpp` |
 | Cluster configuration directives and validation | `include/keylane/server.h`, `src/config.cpp`, `app/keylane.cpp` |
-| Decision matrix, publication, finite-lease test adapter, and concurrency unit tests | `tests/cluster_authority_test.cpp`, `tests/cluster/test_topology_installer.h`, `tests/cluster_topology_test.cpp`, `tests/cluster_command_test.cpp` |
-| Real-process Meta/Data discovery, failover, mTLS, initial creation, and shutdown gates | `tests/meta_integration/gate_data_control.py`, `tests/meta_integration/gate_cluster_create.py` |
+| Decision matrix, parser, publication, finite-lease test installation, failover projection/activation, and concurrency unit tests | `tests/cluster_authority_test.cpp`, `tests/cluster/test_topology_installer.h`, `tests/cluster_topology_test.cpp`, `tests/cluster_command_test.cpp`, `tests/control_protocol_test.cpp`, `tests/meta_client_test.cpp`, `tests/meta_control_test.cpp`, `tests/node_control_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp` |
+| Real-process Meta/Data discovery, committed failover, mTLS, initial creation, and shutdown gates | `tests/meta_integration/gate_data_control.py`, `tests/meta_integration/gate_cluster_create.py`, `tests/meta_integration/gate_failover.py` |

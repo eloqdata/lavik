@@ -13,13 +13,17 @@
 
 namespace {
 
+using keylane::meta::CandidateCompatibilityDomain;
 using keylane::meta::CandidatePlanDisposition;
 using keylane::meta::CandidatePlanFor;
+using keylane::meta::CandidatePlanForDomain;
 using keylane::meta::CandidateSelectionBasis;
 using keylane::meta::MetaAssignmentId;
 using keylane::meta::MetaBootIncarnation;
 using keylane::meta::MetaCandidateProgressObs;
 using keylane::meta::MetaCommittedFacts;
+using keylane::meta::MetaFailoverCandidate;
+using keylane::meta::MetaFailoverCandidateAction;
 using keylane::meta::MetaHash256;
 using keylane::meta::MetaNodeHealthObs;
 using keylane::meta::MetaObservation;
@@ -27,6 +31,7 @@ using keylane::meta::MetaObservationIdentity;
 using keylane::meta::MetaObservationStore;
 using keylane::meta::MetaOperationId;
 using keylane::meta::MetaReplicationHistoryId;
+using keylane::meta::UncontrolledCandidatePlanFor;
 
 template <std::size_t N>
 std::array<std::uint8_t, N> Bytes(std::uint8_t value) {
@@ -70,9 +75,8 @@ class PlanFacts final : public MetaCommittedFacts {
   bool OperationNonTerminal(const MetaOperationId&) const override {
     return false;
   }
-  bool HistoryBoundToOperation(
-      const MetaOperationId&,
-      const MetaReplicationHistoryId&) const override {
+  bool HistoryBoundToOperation(const MetaOperationId&,
+                               const MetaReplicationHistoryId&) const override {
     return false;
   }
 
@@ -93,6 +97,7 @@ MetaCandidateProgressObs Candidate(std::string node, std::uint8_t identity,
       .population_manifest_digest_ = Bytes<32>(0x44),
       .partition_replication_epoch_ = 13,
       .replication_history_id_ = Bytes<20>(identity + 20),
+      .source_group_term_ = 7,
       .source_node_id_ = Node('f'),
       .source_assignment_id_ = Bytes<16>(0xf1),
       .source_boot_incarnation_ = Bytes<20>(0xf2),
@@ -105,9 +110,9 @@ MetaCandidateProgressObs Candidate(std::string node, std::uint8_t identity,
 
 void Admit(MetaObservationStore& store, PlanFacts& facts,
            MetaCandidateProgressObs candidate, std::int64_t now) {
-  const MetaObservationIdentity identity{
-      candidate.node_id_, candidate.boot_incarnation_,
-      candidate.session_generation_};
+  const MetaObservationIdentity identity{candidate.node_id_,
+                                         candidate.boot_incarnation_,
+                                         candidate.session_generation_};
   facts.active_.insert(candidate.node_id_);
   facts.assignments_[candidate.node_id_] = candidate.assignment_id_;
   ASSERT_TRUE(store.AdoptSession(identity, now - 1).ok());
@@ -171,6 +176,98 @@ TEST(MetaCandidatePlanTest, RefusesMixedSourceLineages) {
   EXPECT_EQ(plan.disposition_,
             CandidatePlanDisposition::kMultipleCompatibilityDomains);
   EXPECT_FALSE(plan.selected_.has_value());
+}
+
+TEST(MetaCandidatePlanTest,
+     ControlledSelectionUsesOnlyTheRequiredCompatibilityDomain) {
+  MetaObservationStore store;
+  PlanFacts facts;
+  auto required = Candidate(Node('a'), 1, {10, 10});
+  const auto domain = CandidateCompatibilityDomain(required);
+  Admit(store, facts, required, 1000);
+  auto unrelated = Candidate(Node('b'), 2, {100, 100});
+  unrelated.source_replication_history_id_ = Bytes<20>(0xaa);
+  Admit(store, facts, std::move(unrelated), 1000);
+
+  const auto plan = CandidatePlanForDomain("g", domain, facts, store, 1001);
+  ASSERT_EQ(plan.disposition_, CandidatePlanDisposition::kSelected);
+  ASSERT_TRUE(plan.selected_.has_value());
+  EXPECT_EQ(plan.selected_->node_id_, Node('a'));
+}
+
+TEST(MetaCandidatePlanTest,
+     UncontrolledSelectionPrefersNewestDomainWithoutComparingLsns) {
+  MetaObservationStore store;
+  PlanFacts facts;
+  auto older = Candidate(Node('a'), 1, {100, 100});
+  older.source_group_term_ = 6;
+  Admit(store, facts, std::move(older), 1000);
+  auto newer = Candidate(Node('b'), 2, {1, 1});
+  newer.source_group_term_ = 7;
+  Admit(store, facts, std::move(newer), 1000);
+
+  const auto plan = UncontrolledCandidatePlanFor("g", facts, store, 1001);
+  ASSERT_EQ(plan.disposition_, CandidatePlanDisposition::kSelected);
+  ASSERT_TRUE(plan.selected_.has_value());
+  EXPECT_EQ(plan.selected_->node_id_, Node('b'));
+}
+
+TEST(MetaCandidatePlanTest,
+     UncontrolledSelectionFallsBackAfterNewestDomainDisappears) {
+  MetaObservationStore store;
+  PlanFacts facts;
+  auto older = Candidate(Node('a'), 1, {50, 50});
+  older.source_group_term_ = 6;
+  Admit(store, facts, older, 1000);
+  auto newer = Candidate(Node('b'), 2, {1, 1});
+  newer.source_group_term_ = 7;
+  Admit(store, facts, newer, 1000);
+
+  store.InvalidateCandidateOnDisconnect(
+      {newer.node_id_, newer.boot_incarnation_, newer.session_generation_},
+      1001);
+  const auto plan = UncontrolledCandidatePlanFor("g", facts, store, 1001);
+  ASSERT_EQ(plan.disposition_, CandidatePlanDisposition::kSelected);
+  ASSERT_TRUE(plan.selected_.has_value());
+  EXPECT_EQ(plan.selected_->node_id_, Node('a'));
+}
+
+TEST(MetaCandidatePlanTest,
+     UncontrolledSameTermDomainsUseCanonicalDomainIdentity) {
+  MetaObservationStore store;
+  PlanFacts facts;
+  auto later_domain = Candidate(Node('a'), 1, {100, 100});
+  later_domain.source_node_id_ = Node('f');
+  Admit(store, facts, std::move(later_domain), 1000);
+  auto earlier_domain = Candidate(Node('b'), 2, {1, 1});
+  earlier_domain.source_node_id_ = Node('e');
+  Admit(store, facts, std::move(earlier_domain), 1000);
+
+  const auto plan = UncontrolledCandidatePlanFor("g", facts, store, 1001);
+  ASSERT_EQ(plan.disposition_, CandidatePlanDisposition::kSelected);
+  ASSERT_TRUE(plan.selected_.has_value());
+  EXPECT_EQ(plan.selected_->node_id_, Node('b'));
+}
+
+TEST(MetaCandidatePlanTest,
+     UncontrolledReplacementExcludesTheExactFailedActionPopulation) {
+  MetaObservationStore store;
+  PlanFacts facts;
+  auto failed = Candidate(Node('a'), 1, {11, 11});
+  const MetaFailoverCandidateAction failed_action{
+      .action_id_ = Bytes<16>(0xa1),
+      .candidate_ =
+          MetaFailoverCandidate{failed.node_id_, failed.assignment_id_,
+                                failed.boot_incarnation_},
+      .domain_ = CandidateCompatibilityDomain(failed)};
+  Admit(store, facts, failed, 1000);
+  Admit(store, facts, Candidate(Node('b'), 2, {10, 10}), 1000);
+
+  const auto plan =
+      UncontrolledCandidatePlanFor("g", facts, store, 1001, failed_action);
+  ASSERT_EQ(plan.disposition_, CandidatePlanDisposition::kSelected);
+  ASSERT_TRUE(plan.selected_.has_value());
+  EXPECT_EQ(plan.selected_->node_id_, Node('b'));
 }
 
 TEST(MetaCandidatePlanTest, TtlIsAppliedAtTheFixedPlanningInstant) {

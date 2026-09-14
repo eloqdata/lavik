@@ -610,10 +610,16 @@ enable/resume 机制，也不为 Controlled Pause 新增 pause API；失去 auth
   bounded watchdog 到期才报告 `ActionFailed`。
 - watchdog只从本地 action已经具备执行条件时计时；等待 Meta authorization或新的 FDS不算
   Candidate失败。
-- prepare创建 child history后，当前 control session 的 ClientHello history已经过时；完成
-  prepare时主动关闭并重建 Meta session，以当前 child history重新认证，同时保留同 boot的
-  action-local prepared context。Leader change测试必须证明重连后仍能重报 CandidatePrepared，
-  且 pre-Cutover child history不得提前把 `source_group_term` 声明为 target term。
+- prepare创建 child history后，当前 control session 的 ClientHello history已经过时。为了避免
+  计划内重连被 Meta 解释成真实 candidate failure，Data 在 installed FDS 仍精确包含同一个
+  authorized action 时，允许原 session 暂时跨过这一次 history rotation：`Preparing` 只允许
+  无 prepared context 的窗口，`Prepared` 还必须证明 context 的 transition/action 和 child
+  history 精确匹配。boot/action/FDS/child history 任一不匹配都立即关闭 session；Cutover、Abort
+  或 replacement FDS 撤掉 action 后也按普通 identity-change 路径重连，以 child history重新
+  认证。这个 bridge 只允许发布 action-scoped `CandidatePrepared`，不会把普通 progress 的
+  authenticated parent history 改写成 child，也不会让 pre-Cutover child history提前把
+  `source_group_term` 声明为 target term。Leader change测试必须证明 Prepared proof 可重报，
+  而真实 candidate disconnect 仍立即终止或换人。
 
 ### 10.3 Activation
 
@@ -698,10 +704,11 @@ availability gap；用测试明确记录，不在本期暗中实现 staged repla
 
 `app/keylane_meta.cpp` 按 membership、cluster-create、Data-control、failover 顺序注册；
 demotion/shutdown 逆序先停 failover，保证新 Leader 的 Data publisher 已能重新收集 observation
-后 executor 才开始。warmup/source grace 复用现有 `observation_ttl_ms`，不新增配置旋钮。
+后 executor 才开始。warmup/source grace 不新增配置旋钮；它从现有时序派生为
+`max(observation_ttl_ms, election_ms_high + Data reconnect maximum window)`，避免新 Leader
+在健康 Data 错过一次选举轮次、尚处于有界 reconnect backoff 时误判失败。
 
-leadership observation warmup 复用 Observation Store 已配置的 heartbeat/session grace
-上限，不再发明无界等待：Controlled 等待上限是
+leadership observation warmup 复用上述有界 recovery grace，不发明无界等待：Controlled 等待上限是
 `min(configured grace, operation deadline - now)`，deadline 先到则 Abort；Uncontrolled
 在新 Leader 刚就任时先等同一 configured grace，之后仍未重报才将 action 判为
 unavailable。当前 Leader 亲眼看到 exact Candidate session disconnect 则不再等 warmup。
@@ -1066,7 +1073,7 @@ cmake --build "$KEYLANE_ISSUE41_BUILD" --target keylane_cluster_replication_mana
 | generic source cleanup误杀旧 Owner有价值的下游 flow | 拆 source admission、established export、mutation drain、ingress cancel effects；partition fault test观察旧flow |
 | prepared context在action replacement后迟到激活 | action id进入prepared context、grant、FDS和activation四处精确匹配；FullStateApplied barrier test |
 | FDS/lease 在 promotion 完成前打开 write admission，或 Cluster 调用 standalone expiration 配对 | FDS 只 pin intent；lease 只进 NodeControl 不可服务 provisional slot；activation final recheck 后才 `AuthorityGuard::RenewLease`；抽取纯 promotion kernel，Cluster 不 `ResumeExpiration`；counter=0、FDS/lease 乱序、失败/过期始终 fenced 及 deadline-aware authority regression tests |
-| prepare旋转history后旧Meta session无法上报current proof | prepare完成后以child history重建ClientHello；跨Meta Leader切换重报测试 |
+| prepare旋转history后计划内重连会被误判为candidate失败 | 仅为installed exact authorized action桥接原session；Cutover/Abort/replacement后强制以child history重连；覆盖wrong-child、boot/action/FDS mismatch和跨Meta Leader重报 |
 | 误把 Tomb Raider 当成 frontier mutation，引入不必要 Data 机制 | 本期不新增 TR pause/enable；保留默认 OFF/configure 和既有 role-transition quiesce 回归 |
 | command replay 先检查已失效 precondition，或 compound apply 半写 | 八命令统一 exact post-state-first；Commit 内核前 aggregate shortcut；bounded copy 上注入 topology/grant/operation failure并比较完整 pre/post state |
 | leader change后空 Observation被误判成节点失败 | leadership warmup；Candidate explicit disconnect、Source explicit disconnect/incarnation replacement、pure absence/grace 分开测试 |

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -37,6 +38,40 @@ struct ReplicaOfConfig {
   std::uint16_t port_ = 0;
 
   bool operator==(const ReplicaOfConfig&) const = default;
+};
+
+// One committed Group membership incarnation used by steady native
+// replication. Node ids identify authenticated peers; assignment ids prevent
+// remove/re-add of the same node from inheriting an old relationship.
+struct ClusterReplicationMember {
+  std::string node_id_;
+  std::string assignment_id_;
+
+  bool operator==(const ClusterReplicationMember&) const = default;
+};
+
+// Level-triggered steady relationship installed from one complete FDS. The
+// same value is meaningful on both sides: the Owner authorizes the listed
+// downstream incarnations, while every other local member connects to the
+// exact Owner endpoint. Source boot/history are intentionally absent because
+// they are learned from the authenticated live handshake, not committed
+// topology.
+struct DesiredClusterUpstream {
+  std::string group_id_;
+  std::uint64_t group_term_ = 0;
+  std::string local_node_id_;
+  std::string local_assignment_id_;
+  std::string local_boot_id_;
+  std::string owner_node_id_;
+  std::string owner_assignment_id_;
+  std::optional<ReplicaOfConfig> owner_endpoint_;
+  std::uint64_t manifest_revision_ = 0;
+  PopulationManifestId manifest_id_;
+  std::vector<PopulationManifestEntry> manifest_entries_;
+  std::uint64_t partition_replication_epoch_ = 0;
+  std::vector<ClusterReplicationMember> members_;
+
+  bool operator==(const DesiredClusterUpstream&) const = default;
 };
 
 struct ReplicationOptions {
@@ -166,15 +201,102 @@ struct ClusterPopulationStatus {
   // It is present only when the Ready population and frontier still agree;
   // heartbeat construction omits candidate evidence when sampling is busy.
   std::optional<std::vector<std::uint64_t>> applied_next_lsns_;
+  // A terminal failover action suppresses the same boot-local population and
+  // compatibility domain from candidate selection. A changed population or
+  // domain is eligible again; a process restart naturally drops the latch.
+  bool failover_candidate_eligible_ = true;
   // Nonempty exactly while state_ is kFailedStopped.
   std::string failure_reason_;
 };
 
-// One exact Meta promotion-prepare request after the control envelope and its
-// versioned opaque fields have been validated. RebuildIdentity is reused for
-// the candidate, source, manifest, operation, directive, and attempt anchors;
-// the additional fields bind the committed authority-exclusion proof and the
-// live parent frontier that prepare must freeze.
+using ClusterFailoverTransitionId = std::array<std::uint8_t, 16>;
+using ClusterFailoverActionId = std::array<std::uint8_t, 16>;
+using ClusterPreparedContextId = std::array<std::uint8_t, 16>;
+using ClusterPreparedContextHash = std::array<std::uint8_t, 32>;
+
+enum class ClusterFailoverMode : std::uint8_t {
+  kControlled,
+  kUncontrolled,
+};
+
+// Exact committed controlled-failover intent for the current source. Mutation
+// admission is drained by NodeControl before this reaches ReplicationManager;
+// this layer owns only the nestable active-expiration pause and stable native
+// replication frontier.
+struct DesiredClusterSourcePause {
+  ClusterFailoverTransitionId transition_id_{};
+  std::uint64_t transition_revision_ = 0;
+  std::string group_id_;
+  std::string source_node_id_;
+  std::string source_assignment_id_;
+  std::string source_boot_id_;
+  std::string source_history_id_;
+  std::uint64_t source_group_term_ = 0;
+  std::uint32_t flow_count_ = 0;
+  std::uint64_t manifest_revision_ = 0;
+  PopulationManifestId manifest_id_;
+  std::uint64_t partition_replication_epoch_ = 0;
+
+  bool operator==(const DesiredClusterSourcePause&) const = default;
+};
+
+// Boot-local observation for one desired source pause. A missing stable vector
+// means the desired intent is retained but has not produced SourcePaused; the
+// caller may replay it after a transient capture failure without opening an
+// expiration window.
+struct ClusterSourcePauseStatus {
+  std::optional<DesiredClusterSourcePause> desired_;
+  std::optional<std::vector<std::uint64_t>> stable_next_lsns_;
+  std::string failure_detail_;
+};
+
+// Exact source lineage within which Meta compared candidate progress. Data
+// validates this against its live Ready population but never receives the
+// volatile SourcePaused frontier that authorized the action.
+struct ClusterFailoverCompatibilityDomain {
+  std::uint64_t source_group_term_ = 0;
+  std::string source_node_id_;
+  std::string source_assignment_id_;
+  std::string source_boot_id_;
+  std::string source_history_id_;
+  std::uint32_t flow_count_ = 0;
+
+  bool operator==(const ClusterFailoverCompatibilityDomain&) const = default;
+};
+
+// Wire-independent, level-triggered execution subset of one committed
+// candidate action. A missing authorized_revision pins the intent without
+// allowing promotion preparation. Population fields come from the same FDS
+// and prevent an action from crossing assignment or immutable data identity.
+struct DesiredClusterFailoverAction {
+  ClusterFailoverTransitionId transition_id_{};
+  ClusterFailoverActionId action_id_{};
+  std::uint64_t transition_revision_ = 0;
+  ClusterFailoverMode mode_ = ClusterFailoverMode::kControlled;
+  std::uint64_t target_term_ = 0;
+  // Current authority cut from the same FDS. Controlled preparation occurs
+  // while the preceding term may still be granted; Uncontrolled preparation
+  // requires target_term already installed and grantless.
+  std::uint64_t committed_group_term_ = 0;
+  bool committed_grant_active_ = false;
+  std::optional<std::uint64_t> authorized_revision_;
+  std::string group_id_;
+  std::string candidate_node_id_;
+  std::string candidate_assignment_id_;
+  std::string candidate_boot_id_;
+  ClusterFailoverCompatibilityDomain domain_;
+  std::uint64_t manifest_revision_ = 0;
+  PopulationManifestId manifest_id_;
+  std::uint64_t partition_replication_epoch_ = 0;
+
+  bool operator==(const DesiredClusterFailoverAction&) const = default;
+};
+
+// Exact boot-local promotion-preparation input derived from an installed
+// desired Candidate Action. RebuildIdentity is reused for the candidate,
+// source, manifest, transition, action, and attempt anchors; the additional
+// fields bind committed authority exclusion and the live parent frontier that
+// preparation must freeze.
 struct ClusterPromotionPrepareDirective {
   RebuildIdentity identity_;
   std::string parent_history_id_;
@@ -185,7 +307,7 @@ struct ClusterPromotionPrepareDirective {
   bool operator==(const ClusterPromotionPrepareDirective&) const = default;
 };
 
-// Boot-local proof returned after the shared promotion kernel has made the
+// Boot-local result returned after the shared promotion kernel has made the
 // parent frontier durable, committed PromotionBase, retired the parent
 // history, and created the child publisher. It grants no serving authority.
 struct ClusterPromotionPrepared {
@@ -198,6 +320,55 @@ struct ClusterPromotionPrepared {
   std::string child_history_id_;
 
   bool operator==(const ClusterPromotionPrepared&) const = default;
+};
+
+struct ClusterFailoverPreparedContext {
+  ClusterFailoverTransitionId transition_id_{};
+  ClusterFailoverActionId action_id_{};
+  ClusterPreparedContextId context_id_{};
+  ClusterPreparedContextHash context_hash_{};
+  ClusterPromotionPrepared promotion_;
+
+  bool operator==(const ClusterFailoverPreparedContext&) const = default;
+};
+
+// Exact cutover intent presented to the boot-local promotion adapter after a
+// finite lease has been validated provisionally by NodeControl. The adapter
+// opens only the prepared storage role; lease and expiration authority remain
+// separate final-commit steps owned by NodeControl.
+struct ClusterFailoverActivation {
+  ClusterFailoverActionId action_id_{};
+  std::string group_id_;
+  std::string candidate_node_id_;
+  std::string candidate_assignment_id_;
+  std::string candidate_boot_id_;
+  std::uint64_t target_term_ = 0;
+  std::uint64_t manifest_revision_ = 0;
+  PopulationManifestId manifest_id_;
+  std::uint64_t partition_replication_epoch_ = 0;
+
+  bool operator==(const ClusterFailoverActivation&) const = default;
+};
+
+enum class ClusterFailoverActionState : std::uint8_t {
+  kNone,
+  kWaitingForAuthorization,
+  kWaitingForPopulation,
+  kPreparing,
+  kRetrying,
+  kPrepared,
+  kFailed,
+};
+
+// Boot-local heartbeat input for the current committed action. A replacement
+// or removal first makes the old status unobservable, then joins its local
+// admission before FullStateApplied may be acknowledged.
+struct ClusterFailoverActionStatus {
+  ClusterFailoverActionState state_ = ClusterFailoverActionState::kNone;
+  std::optional<DesiredClusterFailoverAction> action_;
+  std::optional<ClusterFailoverPreparedContext> prepared_;
+  std::string failure_class_;
+  std::string failure_detail_;
 };
 
 // FDS-owned subset of population identity. Assignment and immutable manifest
@@ -247,9 +418,9 @@ class ClusterRebuildCompletion {
   std::shared_ptr<detail::ClusterRebuildCompletionState> state_;
 };
 
-// Pollable completion for one exact promotion-prepare attempt. Exact replay
-// shares this state, so a lost DirectiveResult cannot repeat durability or
-// history-creation side effects.
+// Pollable completion for one exact promotion-preparation attempt. Exact
+// Candidate Action replay shares this state, so repeated FDS reconciliation
+// cannot repeat durability or history-creation side effects.
 class ClusterPromotionPrepareCompletion {
  public:
   using Result = absl::StatusOr<ClusterPromotionPrepared>;
@@ -367,6 +538,68 @@ class ReplicationManager {
   celer::Task<absl::StatusOr<ClusterPromotionPrepareCompletion>>
   StartClusterPromotionPrepareDirective(
       ClusterPromotionPrepareDirective directive);
+
+  // Reconciles the controlled source's transition-scoped pause after
+  // NodeControl has published paused mutation admission and drained earlier
+  // work. Replacement retains the existing expiration pause while recapturing
+  // exact evidence; null releases exactly the pause owned by this context.
+  celer::Task<absl::Status> ReconcileClusterSourcePause(
+      std::optional<DesiredClusterSourcePause> desired);
+
+  // Returns SourcePaused input only after the native history and all flow
+  // frontiers match the current desired source incarnation.
+  celer::Task<ClusterSourcePauseStatus> cluster_source_pause_status() const;
+
+  // Reconciles the current committed candidate action. Authorization is a
+  // one-way gate; exact replay is a no-op. Replacement/removal withdraws old
+  // progress immediately and returns only after its prepare admission can no
+  // longer publish and any abandoned prepared child history has been joined
+  // and disabled. Cutover may name the exact prepared action as a pending
+  // activation; that context and its child log are retained but no longer
+  // reported as transition progress. Catch-up remains owned by the ordinary
+  // population coordinator and does not delay this desired-state boundary.
+  celer::Task<absl::Status> ReconcileClusterFailoverAction(
+      std::optional<DesiredClusterFailoverAction> desired,
+      std::optional<ClusterFailoverActionId> pending_activation_action_id =
+          std::nullopt);
+
+  // Returns a coherent boot-local action observation. Meta may publish only a
+  // matching Prepared or Failed terminal state; waiting/retrying states are
+  // local diagnostics and are never durable workflow progress.
+  celer::Task<ClusterFailoverActionStatus> cluster_failover_action_status()
+      const;
+
+  // Returns the private boot-local context retained across a successful
+  // Cutover FDS. This is an activation precondition lookup, not a heartbeat
+  // observation: transition progress disappears as soon as the transition is
+  // removed, while only the grant's exact action id may retrieve the context.
+  celer::Task<std::optional<ClusterFailoverPreparedContext>>
+  FindClusterFailoverPreparedContext(
+      const ClusterFailoverActionId& action_id) const;
+
+  // Activates only a retained prepared context whose action, population, boot,
+  // target term, and live child history all still match. Exact replay is a
+  // no-op. This never resumes expiration or installs lease authority.
+  celer::Task<absl::Status> ActivateClusterPreparedPromotion(
+      ClusterFailoverActivation activation);
+
+  // Installs finite active-expiration authority after NodeControl's final
+  // lease/FDS recheck. The absolute deadline uses CLOCK_BOOTTIME semantics.
+  celer::Task<absl::Status> EnableClusterExpirationAuthorityUntil(
+      std::chrono::nanoseconds deadline_since_boot);
+
+  // Revokes future active-expiration work and drains any already-entered
+  // cycle without disturbing an outer controlled-source pause.
+  celer::Task<absl::Status> RevokeClusterExpirationAuthority();
+
+  // Reconciles the ordinary post-Cutover relationship without a Meta rebuild
+  // operation. Exact replay leaves a healthy coordinator/export untouched;
+  // replacement first cancels and joins the old relationship. A follower
+  // preserves its usable population until the new Owner has authenticated and
+  // published an export-ready native incarnation, then the existing
+  // CONTINUE/FULL machinery decides whether replacement is necessary.
+  celer::Task<absl::Status> ReconcileClusterFollowOwner(
+      std::optional<DesiredClusterUpstream> desired);
 
   // Convenience wrapper that starts and awaits one full rebuild. Production
   // NodeControl uses StartClusterRebuildDirective so wire admission and later

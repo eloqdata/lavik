@@ -14,7 +14,7 @@ or safety boundaries.
 | [Tomb Raider scheduling](tomb-raider.md) | Configuring or operating tombstone cleanup schedules |
 | [Active expiration tuning](active-expiration.md) | Inspecting or changing TTL scan and index-maintenance pacing |
 | [Prometheus metrics](metrics.md) | Integrating metrics, interpreting exported values, or changing monitoring behavior |
-| [Meta control plane](meta-control-plane.md) | Creating the first multi-Group cluster, starting plaintext or mTLS Meta clusters, changing membership, replacing binaries, handling snapshot/WAL incidents, and exporting audit or operation archives |
+| [Meta control plane](meta-control-plane.md) | Creating the first multi-Group cluster, running and diagnosing controlled failover, starting plaintext or mTLS Meta clusters, changing membership, replacing binaries, handling snapshot/WAL incidents, and exporting audit or operation archives |
 | [Network IRQ affinity tuning](irq-affinity-tuning.md) | Measuring or changing host IRQ placement for latency tuning |
 | [Monitoring stack](../../deploy/monitoring/README.md) | Running the repository's Prometheus and Grafana deployment |
 

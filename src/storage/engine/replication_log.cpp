@@ -707,7 +707,8 @@ bool StorageEngine::Impl::TryEnqueueReplicationCommand(
 }
 
 Task<absl::Status> StorageEngine::Impl::PublishEphemeralReplicationCommand(
-    std::uint16_t partition_id, std::vector<std::string> args) {
+    std::uint16_t partition_id, std::vector<std::string> args,
+    MutationPrecondition mutation_precondition) {
   if (partition_id >= kLogicalStorageShards ||
       partition_id % worker_count_ != celer::ThisWorker().id_) {
     co_return absl::FailedPreconditionError(
@@ -734,6 +735,14 @@ Task<absl::Status> StorageEngine::Impl::PublishEphemeralReplicationCommand(
   if (!publication.ok()) {
     ReleaseReplicationPublisherAdmission(*admission, *staging_bytes);
     co_return publication.status();
+  }
+  // Admission may suspend behind backlog or full-sync backpressure. Validate
+  // external authority only after that wait and after all allocation, leaving
+  // no suspension between this check and the synchronous publication cut.
+  absl::Status permitted = mutation_precondition.Validate();
+  if (!permitted.ok()) {
+    ReleaseReplicationPublisherAdmission(*admission, *staging_bytes);
+    co_return permitted;
   }
   absl::Status published =
       PublishPreparedReplicationCommand(*admission, std::move(*publication));

@@ -119,8 +119,7 @@ struct Fixture {
   std::uint64_t directive_revision = 0;
 };
 
-Fixture CompleteFixture(
-    std::string operation_kind = "population-rebuild") {
+Fixture CompleteFixture(std::string operation_kind = "population-rebuild") {
   Fixture fixture;
   std::uint64_t index = 1;
 
@@ -408,6 +407,125 @@ TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   EXPECT_EQ(*decoded, state);
 }
 
+TEST(MetaControlProjector, ProjectsCommittedFailoverExecutionSubset) {
+  Fixture fixture = CompleteFixture();
+  keylane::meta::MetaFailoverTransition transition;
+  transition.transition_id_ = Bytes<16>(0xa1);
+  transition.mode_ = keylane::meta::MetaFailoverMode::kControlled;
+  transition.target_term_ = 2;
+  transition.successor_grant_ = {
+      .lease_duration_ms_ = 7'000,
+      .policy_id_ = "unused-policy",
+      .policy_version_ = 1,
+  };
+  transition.candidate_action_ = keylane::meta::MetaFailoverCandidateAction{
+      .action_id_ = Bytes<16>(0xa2),
+      .candidate_ = {.node_id_ = fixture.source,
+                     .assignment_id_ = fixture.source_assignment,
+                     .boot_id_ = fixture.source_boot},
+      .domain_ = {.source_group_term_ = 1,
+                  .source_node_id_ = fixture.target,
+                  .source_assignment_id_ = fixture.target_assignment,
+                  .source_boot_id_ = fixture.target_boot,
+                  .source_history_id_ = fixture.source_history,
+                  .flow_count_ = 3},
+      .authorization_ = keylane::meta::MetaFailoverAuthorization{
+          .authorized_revision_ = 100,
+          .loss_if_cutover_ = keylane::meta::MetaFailoverLoss::kNone}};
+  transition.controlled_ = keylane::meta::MetaControlledFailover{
+      .operation_id_ = fixture.operation_id,
+      .absolute_deadline_unix_ms_ = 30'000,
+  };
+  ASSERT_TRUE(fixture.stores.topology_
+                  .InstallFailoverTransition("group-a", transition, 100)
+                  .ok());
+
+  const auto projected = MetaControlProjector::ProjectNode(
+      MetaCommittedView(std::move(fixture.stores), 100), fixture.source);
+  ASSERT_TRUE(projected.ok()) << projected.status();
+  ASSERT_EQ(projected->full_state.groups.size(), 2u);
+  const control::WireDesiredGroup& group = projected->full_state.groups[0];
+  ASSERT_TRUE(group.failover_transition.has_value());
+  const control::WireFailoverTransition& wire = *group.failover_transition;
+  EXPECT_EQ(wire.transition_id, transition.transition_id_);
+  EXPECT_EQ(wire.revision, 100u);
+  EXPECT_EQ(wire.mode, control::WireFailoverMode::kControlled);
+  EXPECT_EQ(wire.target_term, 2u);
+  ASSERT_TRUE(wire.candidate_action.has_value());
+  EXPECT_EQ(wire.candidate_action->action_id, Bytes<16>(0xa2));
+  EXPECT_EQ(wire.candidate_action->candidate.node_id, fixture.source);
+  EXPECT_EQ(wire.candidate_action->candidate.assignment_id,
+            fixture.source_assignment);
+  EXPECT_EQ(wire.candidate_action->candidate.boot_id, Hex(fixture.source_boot));
+  EXPECT_EQ(wire.candidate_action->domain.source_group_term, 1u);
+  EXPECT_EQ(wire.candidate_action->domain.source_node_id, fixture.target);
+  EXPECT_EQ(wire.candidate_action->domain.source_assignment_id,
+            fixture.target_assignment);
+  EXPECT_EQ(wire.candidate_action->domain.source_boot_id,
+            Hex(fixture.target_boot));
+  EXPECT_EQ(wire.candidate_action->domain.source_history_id,
+            Hex(fixture.source_history));
+  ASSERT_TRUE(wire.candidate_action->authorization.has_value());
+  EXPECT_EQ(wire.candidate_action->authorization->authorized_revision, 100u);
+  EXPECT_EQ(wire.candidate_action->authorization->loss_if_cutover,
+            control::WireFailoverLoss::kNone);
+
+  // Successor grant policy and Controlled-operation scheduling state are
+  // Meta-only until Cutover. Data receives the installed grant separately
+  // through the ordinary current-grant projection.
+  const auto successor_policy = std::find_if(
+      projected->full_state.policies.begin(),
+      projected->full_state.policies.end(), [](const control::WirePolicy& p) {
+        return p.policy_id == "unused-policy" && p.version == 1;
+      });
+  EXPECT_EQ(successor_policy, projected->full_state.policies.end());
+  const auto decoded =
+      control::DecodeFullDesiredState(projected->encoded_full_state);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, projected->full_state);
+}
+
+TEST(MetaControlProjector, ProjectsCurrentGrantActivationActionIdentity) {
+  Fixture fixture = CompleteFixture();
+  keylane::meta::BeginGroupTerm begin;
+  begin.group_id_ = "group-a";
+  begin.expected_term_ = 1;
+  begin.new_term_ = 2;
+  ASSERT_TRUE(fixture.stores.grant_.BeginGroupTerm(begin).ok());
+  ASSERT_TRUE(fixture.stores.topology_.SetGroupTerm("group-a", 2).ok());
+
+  keylane::meta::ActivateAuthority activate;
+  activate.group_id_ = "group-a";
+  activate.expected_term_ = 2;
+  activate.new_owner_ = fixture.target;
+  activate.grant_ = {.lease_duration_ms_ = 5'000,
+                     .policy_id_ = "lease-policy",
+                     .policy_version_ = 3};
+  activate.new_authority_version_ = 2;
+  activate.new_topology_epoch_ = 8;
+  activate.new_config_epoch_ = 13;
+  const keylane::meta::MetaFailoverActionId action_id = Bytes<16>(0xb1);
+  ASSERT_TRUE(
+      fixture.stores.grant_.ValidateActivate(activate, 100, action_id).ok());
+  ASSERT_TRUE(fixture.stores.topology_.SetAuthorityVersion("group-a", 2).ok());
+  ASSERT_TRUE(fixture.stores.topology_.SetTopologyEpoch(8).ok());
+  ASSERT_TRUE(fixture.stores.topology_.SetGroupConfigEpoch("group-a", 13).ok());
+  ASSERT_TRUE(
+      fixture.stores.grant_.ApplyGrantPart(activate, 100, action_id).ok());
+
+  // Project the other member so the fixture's deliberately old target-only
+  // directive is outside this node-specific batch.
+  const auto projected = MetaControlProjector::ProjectNode(
+      MetaCommittedView(std::move(fixture.stores), 100), fixture.source);
+  ASSERT_TRUE(projected.ok()) << projected.status();
+  ASSERT_EQ(projected->full_state.groups.size(), 2u);
+  const control::WireDesiredGroup& group = projected->full_state.groups[0];
+  EXPECT_TRUE(group.grant_active);
+  ASSERT_TRUE(group.activation_action_id.has_value());
+  EXPECT_EQ(*group.activation_action_id, action_id);
+  EXPECT_FALSE(group.failover_transition.has_value());
+}
+
 TEST(MetaControlProjector, ProjectedManifestPassesDataPlaneValidation) {
   const Fixture fixture = CompleteFixture();
   const auto projected = MetaControlProjector::ProjectNode(
@@ -421,6 +539,25 @@ TEST(MetaControlProjector, ProjectedManifestPassesDataPlaneValidation) {
   ASSERT_EQ(prepared->control_groups_.size(), 2u);
   EXPECT_EQ(prepared->control_groups_.front().manifest_digest_,
             fixture.manifest_digest);
+}
+
+TEST(MetaControlProjector,
+     EnablesSteadyReplicationOnlyAfterClusterCreationCompletes) {
+  Fixture fixture = CompleteFixture();
+  auto creating = MetaControlProjector::ProjectNode(
+      MetaCommittedView(fixture.stores, 99), fixture.target);
+  ASSERT_TRUE(creating.ok()) << creating.status();
+  ASSERT_FALSE(creating->full_state.groups.empty());
+  EXPECT_FALSE(creating->full_state.groups.front().steady_replication_enabled);
+
+  const keylane::meta::MetaOperationId root = Bytes<16>(0xc1);
+  ASSERT_TRUE(fixture.stores.topology_.BeginClusterCreate(root, 1).ok());
+  ASSERT_TRUE(fixture.stores.topology_.CompleteClusterCreate(root).ok());
+  auto created = MetaControlProjector::ProjectNode(
+      MetaCommittedView(std::move(fixture.stores), 100), fixture.target);
+  ASSERT_TRUE(created.ok()) << created.status();
+  ASSERT_FALSE(created->full_state.groups.empty());
+  EXPECT_TRUE(created->full_state.groups.front().steady_replication_enabled);
 }
 
 TEST(MetaControlProjector,

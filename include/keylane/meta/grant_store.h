@@ -75,6 +75,10 @@ struct MetaGroupGrant {
   // Raft apply index of the activation or last committed spec change.
   // Heartbeat lease renewal is ephemeral and never changes this value.
   std::uint64_t grant_revision_ = 0;
+  // Set only by failover cutover. Data activation must match this committed
+  // action to the boot-local prepared context; ordinary authority activation
+  // clears it, while same-owner grant renewal preserves it.
+  std::optional<MetaFailoverActionId> activation_action_id_;
   MetaGrantSpec spec_;  // lease parameters + committed policy reference
   bool operator==(const MetaGroupGrant&) const = default;
 };
@@ -111,13 +115,16 @@ class MetaGrantStore {
                               std::uint64_t committed_index);
   // Pure validation of ActivateAuthority; every rejection lives here.
   absl::Status ValidateActivate(const ActivateAuthority& command,
-                                std::uint64_t committed_index) const;
+                                std::uint64_t committed_index,
+                                std::optional<MetaFailoverActionId>
+                                    activation_action_id = std::nullopt) const;
   // Installs the grant part of ActivateAuthority, using committed_index as
   // the new grant_revision. Caller must have run ValidateActivate successfully
   // for the same command and index against the current state; a term mismatch
   // here is an apply-layer bug and fails stop.
-  absl::Status ApplyGrantPart(const ActivateAuthority& command,
-                              std::uint64_t committed_index);
+  absl::Status ApplyGrantPart(
+      const ActivateAuthority& command, std::uint64_t committed_index,
+      std::optional<MetaFailoverActionId> activation_action_id = std::nullopt);
   absl::Status RevokeGrant(const RevokeGrant& command);
   absl::Status FenceGroup(const FenceGroup& command);
 
@@ -146,8 +153,10 @@ class MetaGrantStore {
 
   // The already-applied check of ActivateAuthority: the installed grant is
   // exactly what the command asks for.
-  static bool GrantMatches(const Entry& entry, const ActivateAuthority& command,
-                           std::uint64_t committed_index);
+  static bool GrantMatches(
+      const Entry& entry, const ActivateAuthority& command,
+      std::uint64_t committed_index,
+      const std::optional<MetaFailoverActionId>& activation_action_id);
 
   std::uint32_t max_groups_;
   std::map<std::string, Entry> groups_;

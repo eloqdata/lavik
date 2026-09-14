@@ -27,12 +27,8 @@ constexpr std::size_t kFrameCrcOffset = 24;
 constexpr std::size_t kTransferChunkEnvelopeBytes = 16 + 8 + 4;
 constexpr std::size_t kMaxTransferChunkBytes =
     kMaxFramePayloadBytes - kTransferChunkEnvelopeBytes;
-constexpr std::size_t kMaxPromotionFlowCount = 1024;
 constexpr std::uint16_t kDirectiveBodySchemaVersion = 1;
 constexpr std::string_view kRebuildRequestMagic = "KLRR";
-constexpr std::string_view kPromotionRequestMagic = "KLPR";
-constexpr std::string_view kPromotionPreconditionsMagic = "KLPC";
-constexpr std::string_view kPromotionEvidenceMagic = "KLPE";
 
 // Protocol-v1 heartbeat role tags are exhaustive. Unknown tags fail closed so
 // adding a role requires an explicit codec update on both peers.
@@ -40,6 +36,12 @@ enum class HeartbeatRoleKind : std::uint8_t {
   kNone = 0,
   kAuthorityLeaseRequest = 1,
   kReplicaCandidate = 2,
+};
+
+enum class FailoverObservationKind : std::uint8_t {
+  kSourcePaused = 1,
+  kCandidatePrepared = 2,
+  kActionFailed = 3,
 };
 
 absl::StatusOr<std::uint64_t> TransferCap(TransferKind kind) {
@@ -284,6 +286,11 @@ bool IsZeroHash(const WireHash256& hash) noexcept {
                      [](std::uint8_t byte) { return byte == 0; });
 }
 
+bool IsZeroId(const WireId128& id) noexcept {
+  return std::all_of(id.begin(), id.end(),
+                     [](std::uint8_t byte) { return byte == 0; });
+}
+
 absl::Status WriteSchemaHeader(Writer& writer, std::string_view magic) {
   if (magic.size() != 4) return ProtocolError("invalid schema magic");
   writer.Raw(magic);
@@ -302,36 +309,6 @@ absl::Status ReadSchemaHeader(Reader& reader, std::string_view magic) {
     return ProtocolError("unknown directive body schema version");
   }
   return absl::OkStatus();
-}
-
-absl::Status WriteFlowVector(Writer& writer,
-                             std::span<const std::uint64_t> cursors) {
-  if (cursors.empty() || cursors.size() > kMaxPromotionFlowCount) {
-    return ProtocolError("promotion flow vector has invalid cardinality");
-  }
-  writer.U32(static_cast<std::uint32_t>(cursors.size()));
-  for (const std::uint64_t cursor : cursors) {
-    if (cursor == 0) return ProtocolError("promotion flow cursor must be nonzero");
-    writer.U64(cursor);
-  }
-  return absl::OkStatus();
-}
-
-absl::StatusOr<std::vector<std::uint64_t>> ReadFlowVector(Reader& reader) {
-  auto count = reader.U32();
-  if (!count.ok()) return count.status();
-  if (*count == 0 || *count > kMaxPromotionFlowCount) {
-    return ProtocolError("promotion flow vector has invalid cardinality");
-  }
-  std::vector<std::uint64_t> cursors;
-  cursors.reserve(*count);
-  for (std::uint32_t i = 0; i < *count; ++i) {
-    auto cursor = reader.U64();
-    if (!cursor.ok()) return cursor.status();
-    if (*cursor == 0) return ProtocolError("promotion flow cursor must be nonzero");
-    cursors.push_back(*cursor);
-  }
-  return cursors;
 }
 
 absl::Status FillRandom(void* output, std::size_t bytes) {
@@ -668,166 +645,6 @@ absl::StatusOr<RebuildRequest> DecodeRebuildRequest(std::string_view encoded) {
   }
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return RebuildRequest{.source_flow_count = *count};
-}
-
-absl::StatusOr<std::string> EncodePromotionPrepareRequest(
-    const PromotionPrepareRequest& request) {
-  Writer writer;
-  if (absl::Status status = WriteSchemaHeader(writer, kPromotionRequestMagic);
-      !status.ok()) {
-    return status;
-  }
-  if (absl::Status status = WriteIdentity(
-          writer, request.parent_history_id, "promotion parent history id");
-      !status.ok()) {
-    return status;
-  }
-  if (absl::Status status =
-          WriteFlowVector(writer, request.required_applied_next_lsns);
-      !status.ok()) {
-    return status;
-  }
-  return std::move(writer).Take();
-}
-
-absl::StatusOr<PromotionPrepareRequest> DecodePromotionPrepareRequest(
-    std::string_view encoded) {
-  Reader reader(encoded);
-  if (absl::Status status = ReadSchemaHeader(reader, kPromotionRequestMagic);
-      !status.ok()) {
-    return status;
-  }
-  PromotionPrepareRequest request;
-  auto parent = ReadIdentity(reader, "promotion parent history id");
-  if (!parent.ok()) return parent.status();
-  request.parent_history_id = std::move(*parent);
-  auto cursors = ReadFlowVector(reader);
-  if (!cursors.ok()) return cursors.status();
-  request.required_applied_next_lsns = std::move(*cursors);
-  if (absl::Status status = Finish(reader); !status.ok()) return status;
-  return request;
-}
-
-absl::StatusOr<std::string> EncodePromotionPreparePreconditions(
-    const PromotionPreparePreconditions& preconditions) {
-  if (preconditions.excluded_group_term == 0) {
-    return ProtocolError("excluded group term must be nonzero");
-  }
-  if (IsZeroHash(preconditions.old_authority_exclusion_hash)) {
-    return ProtocolError("old authority exclusion hash must be nonzero");
-  }
-  Writer writer;
-  if (absl::Status status =
-          WriteSchemaHeader(writer, kPromotionPreconditionsMagic);
-      !status.ok()) {
-    return status;
-  }
-  writer.U64(preconditions.excluded_group_term);
-  writer.Fixed(preconditions.old_authority_exclusion_hash);
-  return std::move(writer).Take();
-}
-
-absl::StatusOr<PromotionPreparePreconditions>
-DecodePromotionPreparePreconditions(std::string_view encoded) {
-  Reader reader(encoded);
-  if (absl::Status status =
-          ReadSchemaHeader(reader, kPromotionPreconditionsMagic);
-      !status.ok()) {
-    return status;
-  }
-  PromotionPreparePreconditions preconditions;
-  auto term = reader.U64();
-  if (!term.ok()) return term.status();
-  preconditions.excluded_group_term = *term;
-  auto exclusion_hash = reader.Fixed<32>();
-  if (!exclusion_hash.ok()) return exclusion_hash.status();
-  preconditions.old_authority_exclusion_hash = *exclusion_hash;
-  if (absl::Status status = Finish(reader); !status.ok()) return status;
-  if (preconditions.excluded_group_term == 0 ||
-      IsZeroHash(preconditions.old_authority_exclusion_hash)) {
-    return ProtocolError("incomplete promotion preconditions");
-  }
-  return preconditions;
-}
-
-absl::StatusOr<std::string> EncodePromotionPreparedEvidence(
-    const PromotionPreparedEvidence& evidence) {
-  if (evidence.population_generation == 0 ||
-      evidence.catalog_generation == 0) {
-    return ProtocolError(
-        "promotion population and catalog generations must be nonzero");
-  }
-  if (evidence.parent_history_id == evidence.child_history_id) {
-    return ProtocolError(
-        "promotion child history must differ from its parent history");
-  }
-  Writer writer;
-  if (absl::Status status = WriteSchemaHeader(writer, kPromotionEvidenceMagic);
-      !status.ok()) {
-    return status;
-  }
-  if (absl::Status status = WriteIdentity(
-          writer, evidence.parent_history_id, "promotion parent history id");
-      !status.ok()) {
-    return status;
-  }
-  if (absl::Status status =
-          WriteFlowVector(writer, evidence.frozen_applied_next_lsns);
-      !status.ok()) {
-    return status;
-  }
-  writer.U64(evidence.population_generation);
-  writer.U64(evidence.population_digest);
-  writer.U64(evidence.catalog_generation);
-  writer.U64(evidence.catalog_dump_crc64);
-  if (absl::Status status = WriteIdentity(
-          writer, evidence.child_history_id, "promotion child history id");
-      !status.ok()) {
-    return status;
-  }
-  return std::move(writer).Take();
-}
-
-absl::StatusOr<PromotionPreparedEvidence> DecodePromotionPreparedEvidence(
-    std::string_view encoded) {
-  Reader reader(encoded);
-  if (absl::Status status = ReadSchemaHeader(reader, kPromotionEvidenceMagic);
-      !status.ok()) {
-    return status;
-  }
-  PromotionPreparedEvidence evidence;
-  auto parent = ReadIdentity(reader, "promotion parent history id");
-  if (!parent.ok()) return parent.status();
-  evidence.parent_history_id = std::move(*parent);
-  auto cursors = ReadFlowVector(reader);
-  if (!cursors.ok()) return cursors.status();
-  evidence.frozen_applied_next_lsns = std::move(*cursors);
-  auto population_generation = reader.U64();
-  if (!population_generation.ok()) return population_generation.status();
-  evidence.population_generation = *population_generation;
-  auto population_digest = reader.U64();
-  if (!population_digest.ok()) return population_digest.status();
-  evidence.population_digest = *population_digest;
-  auto catalog_generation = reader.U64();
-  if (!catalog_generation.ok()) return catalog_generation.status();
-  evidence.catalog_generation = *catalog_generation;
-  auto catalog_dump_crc64 = reader.U64();
-  if (!catalog_dump_crc64.ok()) return catalog_dump_crc64.status();
-  evidence.catalog_dump_crc64 = *catalog_dump_crc64;
-  auto child = ReadIdentity(reader, "promotion child history id");
-  if (!child.ok()) return child.status();
-  evidence.child_history_id = std::move(*child);
-  if (absl::Status status = Finish(reader); !status.ok()) return status;
-  if (evidence.population_generation == 0 ||
-      evidence.catalog_generation == 0) {
-    return ProtocolError(
-        "promotion population and catalog generations must be nonzero");
-  }
-  if (evidence.parent_history_id == evidence.child_history_id) {
-    return ProtocolError(
-        "promotion child history must differ from its parent history");
-  }
-  return evidence;
 }
 
 absl::StatusOr<FrameHeader> ParseFrameHeader(std::string_view encoded_header) {
@@ -1246,6 +1063,255 @@ absl::StatusOr<LeaseChallenge> ReadLeaseChallenge(Reader& reader) {
   return challenge;
 }
 
+absl::Status WriteHeartbeatFlowVector(Writer& writer,
+                                      std::span<const std::uint64_t> next_lsns,
+                                      std::string_view field) {
+  if (next_lsns.empty() || next_lsns.size() > kMaxCandidateFlows) {
+    return ResourceLimit(std::string(field) +
+                         " count is outside its protocol cap");
+  }
+  writer.U16(static_cast<std::uint16_t>(next_lsns.size()));
+  for (const std::uint64_t next_lsn : next_lsns) {
+    if (next_lsn == 0) {
+      return ProtocolError(std::string(field) + " contains a zero next LSN");
+    }
+    writer.U64(next_lsn);
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<std::uint64_t>> ReadHeartbeatFlowVector(
+    Reader& reader, std::string_view field) {
+  auto count = reader.U16();
+  if (!count.ok()) return count.status();
+  if (*count == 0 || *count > kMaxCandidateFlows) {
+    return ResourceLimit(std::string(field) +
+                         " count is outside its protocol cap");
+  }
+  std::vector<std::uint64_t> next_lsns;
+  next_lsns.reserve(*count);
+  for (std::uint16_t flow = 0; flow < *count; ++flow) {
+    auto next_lsn = reader.U64();
+    if (!next_lsn.ok()) return next_lsn.status();
+    if (*next_lsn == 0) {
+      return ProtocolError(std::string(field) + " contains a zero next LSN");
+    }
+    next_lsns.push_back(*next_lsn);
+  }
+  return next_lsns;
+}
+
+absl::Status WriteFailoverObservation(Writer& writer,
+                                      const FailoverObservation& observation) {
+  if (const auto* paused = std::get_if<SourcePaused>(&observation)) {
+    if (IsZeroId(paused->transition_id) ||
+        IsZeroId(paused->source_assignment_id) ||
+        paused->source_group_term == 0) {
+      return ProtocolError("source-paused observation has an empty anchor");
+    }
+    writer.U8(
+        static_cast<std::uint8_t>(FailoverObservationKind::kSourcePaused));
+    writer.Fixed(paused->transition_id);
+    if (absl::Status status = WriteIdentity(writer, paused->source_node_id,
+                                            "paused source node id");
+        !status.ok()) {
+      return status;
+    }
+    writer.Fixed(paused->source_assignment_id);
+    if (absl::Status status = WriteIdentity(writer, paused->source_boot_id,
+                                            "paused source boot id");
+        !status.ok()) {
+      return status;
+    }
+    if (absl::Status status = WriteIdentity(writer, paused->source_history_id,
+                                            "paused source history id");
+        !status.ok()) {
+      return status;
+    }
+    writer.U64(paused->source_group_term);
+    return WriteHeartbeatFlowVector(writer, paused->stable_next_lsns,
+                                    "paused stable frontier");
+  }
+
+  if (const auto* prepared = std::get_if<CandidatePrepared>(&observation)) {
+    if (IsZeroId(prepared->transition_id) || IsZeroId(prepared->action_id) ||
+        IsZeroId(prepared->candidate_assignment_id) ||
+        IsZeroId(prepared->prepared_context_id) ||
+        IsZeroHash(prepared->prepared_context_hash)) {
+      return ProtocolError(
+          "candidate-prepared observation has an empty anchor");
+    }
+    writer.U8(
+        static_cast<std::uint8_t>(FailoverObservationKind::kCandidatePrepared));
+    writer.Fixed(prepared->transition_id);
+    writer.Fixed(prepared->action_id);
+    if (absl::Status status = WriteIdentity(writer, prepared->candidate_node_id,
+                                            "prepared candidate node id");
+        !status.ok()) {
+      return status;
+    }
+    writer.Fixed(prepared->candidate_assignment_id);
+    if (absl::Status status = WriteIdentity(writer, prepared->candidate_boot_id,
+                                            "prepared candidate boot id");
+        !status.ok()) {
+      return status;
+    }
+    writer.Fixed(prepared->prepared_context_id);
+    writer.Fixed(prepared->prepared_context_hash);
+    return absl::OkStatus();
+  }
+
+  const ActionFailed& failed = std::get<ActionFailed>(observation);
+  if (IsZeroId(failed.transition_id) || IsZeroId(failed.action_id) ||
+      IsZeroId(failed.candidate_assignment_id) ||
+      failed.population_manifest_revision == 0 ||
+      IsZeroHash(failed.population_manifest_digest) ||
+      failed.partition_replication_epoch == 0 || failed.failure_class.empty() ||
+      failed.failure_detail.empty()) {
+    return ProtocolError("action-failed observation has an empty anchor");
+  }
+  writer.U8(static_cast<std::uint8_t>(FailoverObservationKind::kActionFailed));
+  writer.Fixed(failed.transition_id);
+  writer.Fixed(failed.action_id);
+  if (absl::Status status = WriteIdentity(writer, failed.candidate_node_id,
+                                          "failed candidate node id");
+      !status.ok()) {
+    return status;
+  }
+  writer.Fixed(failed.candidate_assignment_id);
+  if (absl::Status status = WriteIdentity(writer, failed.candidate_boot_id,
+                                          "failed candidate boot id");
+      !status.ok()) {
+    return status;
+  }
+  writer.U64(failed.population_manifest_revision);
+  writer.Fixed(failed.population_manifest_digest);
+  writer.U64(failed.partition_replication_epoch);
+  if (absl::Status status =
+          writer.String(failed.failure_class, kMaxFailoverFailureClassBytes,
+                        "failover failure class");
+      !status.ok()) {
+    return status;
+  }
+  return writer.String(failed.failure_detail, kMaxFailoverFailureDetailBytes,
+                       "failover failure detail");
+}
+
+absl::StatusOr<FailoverObservation> ReadFailoverObservation(Reader& reader) {
+  auto kind = reader.U8();
+  if (!kind.ok()) return kind.status();
+  if (*kind ==
+      static_cast<std::uint8_t>(FailoverObservationKind::kSourcePaused)) {
+    SourcePaused paused;
+    auto transition_id = reader.Fixed<16>();
+    if (!transition_id.ok()) return transition_id.status();
+    paused.transition_id = *transition_id;
+    auto source_node_id = ReadIdentity(reader, "paused source node id");
+    if (!source_node_id.ok()) return source_node_id.status();
+    paused.source_node_id = std::move(*source_node_id);
+    auto assignment_id = reader.Fixed<16>();
+    if (!assignment_id.ok()) return assignment_id.status();
+    paused.source_assignment_id = *assignment_id;
+    auto boot_id = ReadIdentity(reader, "paused source boot id");
+    if (!boot_id.ok()) return boot_id.status();
+    paused.source_boot_id = std::move(*boot_id);
+    auto history_id = ReadIdentity(reader, "paused source history id");
+    if (!history_id.ok()) return history_id.status();
+    paused.source_history_id = std::move(*history_id);
+    auto source_group_term = reader.U64();
+    if (!source_group_term.ok()) return source_group_term.status();
+    paused.source_group_term = *source_group_term;
+    auto frontier = ReadHeartbeatFlowVector(reader, "paused stable frontier");
+    if (!frontier.ok()) return frontier.status();
+    paused.stable_next_lsns = std::move(*frontier);
+    if (IsZeroId(paused.transition_id) ||
+        IsZeroId(paused.source_assignment_id) ||
+        paused.source_group_term == 0) {
+      return ProtocolError("source-paused observation has an empty anchor");
+    }
+    return FailoverObservation{std::move(paused)};
+  }
+
+  if (*kind ==
+      static_cast<std::uint8_t>(FailoverObservationKind::kCandidatePrepared)) {
+    CandidatePrepared prepared;
+    auto transition_id = reader.Fixed<16>();
+    if (!transition_id.ok()) return transition_id.status();
+    prepared.transition_id = *transition_id;
+    auto action_id = reader.Fixed<16>();
+    if (!action_id.ok()) return action_id.status();
+    prepared.action_id = *action_id;
+    auto node_id = ReadIdentity(reader, "prepared candidate node id");
+    if (!node_id.ok()) return node_id.status();
+    prepared.candidate_node_id = std::move(*node_id);
+    auto assignment_id = reader.Fixed<16>();
+    if (!assignment_id.ok()) return assignment_id.status();
+    prepared.candidate_assignment_id = *assignment_id;
+    auto boot_id = ReadIdentity(reader, "prepared candidate boot id");
+    if (!boot_id.ok()) return boot_id.status();
+    prepared.candidate_boot_id = std::move(*boot_id);
+    auto context_id = reader.Fixed<16>();
+    if (!context_id.ok()) return context_id.status();
+    prepared.prepared_context_id = *context_id;
+    auto context_hash = reader.Fixed<32>();
+    if (!context_hash.ok()) return context_hash.status();
+    prepared.prepared_context_hash = *context_hash;
+    if (IsZeroId(prepared.transition_id) || IsZeroId(prepared.action_id) ||
+        IsZeroId(prepared.candidate_assignment_id) ||
+        IsZeroId(prepared.prepared_context_id) ||
+        IsZeroHash(prepared.prepared_context_hash)) {
+      return ProtocolError(
+          "candidate-prepared observation has an empty anchor");
+    }
+    return FailoverObservation{std::move(prepared)};
+  }
+
+  if (*kind ==
+      static_cast<std::uint8_t>(FailoverObservationKind::kActionFailed)) {
+    ActionFailed failed;
+    auto transition_id = reader.Fixed<16>();
+    if (!transition_id.ok()) return transition_id.status();
+    failed.transition_id = *transition_id;
+    auto action_id = reader.Fixed<16>();
+    if (!action_id.ok()) return action_id.status();
+    failed.action_id = *action_id;
+    auto node_id = ReadIdentity(reader, "failed candidate node id");
+    if (!node_id.ok()) return node_id.status();
+    failed.candidate_node_id = std::move(*node_id);
+    auto assignment_id = reader.Fixed<16>();
+    if (!assignment_id.ok()) return assignment_id.status();
+    failed.candidate_assignment_id = *assignment_id;
+    auto boot_id = ReadIdentity(reader, "failed candidate boot id");
+    if (!boot_id.ok()) return boot_id.status();
+    failed.candidate_boot_id = std::move(*boot_id);
+    auto manifest_revision = reader.U64();
+    if (!manifest_revision.ok()) return manifest_revision.status();
+    failed.population_manifest_revision = *manifest_revision;
+    auto manifest_digest = reader.Fixed<32>();
+    if (!manifest_digest.ok()) return manifest_digest.status();
+    failed.population_manifest_digest = *manifest_digest;
+    auto replication_epoch = reader.U64();
+    if (!replication_epoch.ok()) return replication_epoch.status();
+    failed.partition_replication_epoch = *replication_epoch;
+    auto failure_class = reader.String(kMaxFailoverFailureClassBytes);
+    if (!failure_class.ok()) return failure_class.status();
+    failed.failure_class = std::move(*failure_class);
+    auto failure_detail = reader.String(kMaxFailoverFailureDetailBytes);
+    if (!failure_detail.ok()) return failure_detail.status();
+    failed.failure_detail = std::move(*failure_detail);
+    if (IsZeroId(failed.transition_id) || IsZeroId(failed.action_id) ||
+        IsZeroId(failed.candidate_assignment_id) ||
+        failed.population_manifest_revision == 0 ||
+        IsZeroHash(failed.population_manifest_digest) ||
+        failed.partition_replication_epoch == 0 ||
+        failed.failure_class.empty() || failed.failure_detail.empty()) {
+      return ProtocolError("action-failed observation has an empty anchor");
+    }
+    return FailoverObservation{std::move(failed)};
+  }
+  return ProtocolError("unknown failover observation kind");
+}
+
 absl::Status WriteLeaseGranted(Writer& writer, const LeaseGranted& grant) {
   writer.Fixed(grant.nonce);
   writer.U32(grant.leader_id);
@@ -1550,7 +1616,7 @@ absl::StatusOr<WireMessage> DecodeTransferEnd(std::string_view bytes) {
 absl::StatusOr<std::string> Encode(const TransferAbort& abort) {
   Writer writer;
   writer.Fixed(abort.object_id);
-  writer.U16(abort.reason);
+  writer.U16(static_cast<std::uint16_t>(abort.reason));
   return std::move(writer).Take();
 }
 
@@ -1562,7 +1628,7 @@ absl::StatusOr<WireMessage> DecodeTransferAbort(std::string_view bytes) {
   abort.object_id = *object_id;
   auto reason = reader.U16();
   if (!reason.ok()) return reason.status();
-  abort.reason = *reason;
+  abort.reason = static_cast<TransferAbortReason>(*reason);
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return WireMessage{abort};
 }
@@ -1604,24 +1670,25 @@ absl::StatusOr<std::string> Encode(const Heartbeat& heartbeat) {
       !status.ok()) {
     return status;
   }
-  if (std::holds_alternative<NoRoleInformation>(
-          heartbeat.role_information)) {
+  if (std::holds_alternative<NoRoleInformation>(heartbeat.role_information)) {
     writer.U8(static_cast<std::uint8_t>(HeartbeatRoleKind::kNone));
-  } else if (const auto* authority =
-                 std::get_if<AuthorityLeaseRequest>(
-                     &heartbeat.role_information)) {
-    writer.U8(static_cast<std::uint8_t>(
-        HeartbeatRoleKind::kAuthorityLeaseRequest));
-    if (absl::Status status =
-            WriteLeaseChallenge(writer, authority->challenge);
+  } else if (const auto* authority = std::get_if<AuthorityLeaseRequest>(
+                 &heartbeat.role_information)) {
+    writer.U8(
+        static_cast<std::uint8_t>(HeartbeatRoleKind::kAuthorityLeaseRequest));
+    if (absl::Status status = WriteLeaseChallenge(writer, authority->challenge);
         !status.ok()) {
       return status;
     }
   } else {
-    writer.U8(
-        static_cast<std::uint8_t>(HeartbeatRoleKind::kReplicaCandidate));
+    writer.U8(static_cast<std::uint8_t>(HeartbeatRoleKind::kReplicaCandidate));
     const CandidateProgress& candidate =
         std::get<ReplicaCandidate>(heartbeat.role_information).progress;
+    if (candidate.source_group_term == 0 ||
+        candidate.source_group_term > candidate.group_term) {
+      return ProtocolError(
+          "candidate source term must be nonzero and not exceed group term");
+    }
     if (absl::Status status = writer.String(
             candidate.group_id, kMaxIdentifierBytes, "candidate group id");
         !status.ok()) {
@@ -1629,6 +1696,7 @@ absl::StatusOr<std::string> Encode(const Heartbeat& heartbeat) {
     }
     writer.Fixed(candidate.assignment_id);
     writer.U64(candidate.group_term);
+    writer.U64(candidate.source_group_term);
     writer.U64(candidate.manifest_revision);
     writer.Fixed(candidate.manifest_digest);
     writer.U64(candidate.partition_replication_epoch);
@@ -1637,38 +1705,41 @@ absl::StatusOr<std::string> Encode(const Heartbeat& heartbeat) {
         !IsCanonicalIdentity160(candidate.source_history_id)) {
       return ProtocolError("candidate source lineage is not canonical");
     }
-    if (absl::Status status = writer.String(
-            candidate.source_node_id, kMaxIdentifierBytes,
-            "candidate source node id");
+    if (absl::Status status =
+            writer.String(candidate.source_node_id, kMaxIdentifierBytes,
+                          "candidate source node id");
         !status.ok()) {
       return status;
     }
     writer.Fixed(candidate.source_assignment_id);
-    if (absl::Status status = writer.String(
-            candidate.source_boot_id, kMaxIdentifierBytes,
-            "candidate source boot id");
+    if (absl::Status status =
+            writer.String(candidate.source_boot_id, kMaxIdentifierBytes,
+                          "candidate source boot id");
         !status.ok()) {
       return status;
     }
-    if (absl::Status status = writer.String(
-            candidate.source_history_id, kMaxIdentifierBytes,
-            "candidate source history id");
+    if (absl::Status status =
+            writer.String(candidate.source_history_id, kMaxIdentifierBytes,
+                          "candidate source history id");
         !status.ok()) {
       return status;
     }
-    if (candidate.applied_next_lsns.empty() ||
-        candidate.applied_next_lsns.size() > kMaxCandidateFlows) {
-      return ResourceLimit(
-          "candidate flow vector count is outside its protocol cap");
+    if (absl::Status status = WriteHeartbeatFlowVector(
+            writer, candidate.applied_next_lsns, "candidate flow vector");
+        !status.ok()) {
+      return status;
     }
-    writer.U16(
-        static_cast<std::uint16_t>(candidate.applied_next_lsns.size()));
-    for (std::uint64_t next_lsn : candidate.applied_next_lsns) {
-      if (next_lsn == 0) {
-        return ProtocolError("candidate next LSN must be nonzero");
-      }
-      writer.U64(next_lsn);
+  }
+  writer.Bool(heartbeat.failover_observation.has_value());
+  if (heartbeat.failover_observation.has_value()) {
+    if (absl::Status status =
+            WriteFailoverObservation(writer, *heartbeat.failover_observation);
+        !status.ok()) {
+      return status;
     }
+  }
+  if (writer.size() > kMaxFramePayloadBytes) {
+    return ResourceLimit("heartbeat exceeds the single-frame payload cap");
   }
   return std::move(writer).Take();
 }
@@ -1699,14 +1770,14 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
   heartbeat.health.summary = std::move(*summary);
   auto role_kind = reader.U8();
   if (!role_kind.ok()) return role_kind.status();
-  if (*role_kind == static_cast<std::uint8_t>(
-                        HeartbeatRoleKind::kAuthorityLeaseRequest)) {
+  if (*role_kind ==
+      static_cast<std::uint8_t>(HeartbeatRoleKind::kAuthorityLeaseRequest)) {
     auto challenge = ReadLeaseChallenge(reader);
     if (!challenge.ok()) return challenge.status();
     heartbeat.role_information =
         AuthorityLeaseRequest{.challenge = std::move(*challenge)};
-  } else if (*role_kind == static_cast<std::uint8_t>(
-                               HeartbeatRoleKind::kReplicaCandidate)) {
+  } else if (*role_kind ==
+             static_cast<std::uint8_t>(HeartbeatRoleKind::kReplicaCandidate)) {
     CandidateProgress candidate;
     auto group_id = reader.String(kMaxIdentifierBytes);
     if (!group_id.ok()) return group_id.status();
@@ -1717,6 +1788,14 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
     auto group_term = reader.U64();
     if (!group_term.ok()) return group_term.status();
     candidate.group_term = *group_term;
+    auto source_group_term = reader.U64();
+    if (!source_group_term.ok()) return source_group_term.status();
+    candidate.source_group_term = *source_group_term;
+    if (candidate.source_group_term == 0 ||
+        candidate.source_group_term > candidate.group_term) {
+      return ProtocolError(
+          "candidate source term must be nonzero and not exceed group term");
+    }
     auto manifest_revision = reader.U64();
     if (!manifest_revision.ok()) return manifest_revision.status();
     candidate.manifest_revision = *manifest_revision;
@@ -1745,26 +1824,23 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
     candidate.source_node_id = std::move(*source_node_id);
     candidate.source_boot_id = std::move(*source_boot_id);
     candidate.source_history_id = std::move(*source_history_id);
-    auto flow_count = reader.U16();
-    if (!flow_count.ok()) return flow_count.status();
-    if (*flow_count == 0 || *flow_count > kMaxCandidateFlows) {
-      return ResourceLimit(
-          "candidate flow vector count is outside its protocol cap");
-    }
-    candidate.applied_next_lsns.reserve(*flow_count);
-    for (std::uint16_t flow = 0; flow < *flow_count; ++flow) {
-      auto next_lsn = reader.U64();
-      if (!next_lsn.ok()) return next_lsn.status();
-      if (*next_lsn == 0) {
-        return ProtocolError("candidate next LSN must be nonzero");
-      }
-      candidate.applied_next_lsns.push_back(*next_lsn);
-    }
+    auto next_lsns = ReadHeartbeatFlowVector(reader, "candidate flow vector");
+    if (!next_lsns.ok()) return next_lsns.status();
+    candidate.applied_next_lsns = std::move(*next_lsns);
     heartbeat.role_information =
         ReplicaCandidate{.progress = std::move(candidate)};
   } else if (*role_kind !=
              static_cast<std::uint8_t>(HeartbeatRoleKind::kNone)) {
     return ProtocolError("unknown heartbeat role-information kind");
+  }
+  auto has_failover_observation = reader.Bool();
+  if (!has_failover_observation.ok()) {
+    return has_failover_observation.status();
+  }
+  if (*has_failover_observation) {
+    auto observation = ReadFailoverObservation(reader);
+    if (!observation.ok()) return observation.status();
+    heartbeat.failover_observation = std::move(*observation);
   }
   if (absl::Status status = Finish(reader); !status.ok()) return status;
   return WireMessage{std::move(heartbeat)};
@@ -2073,8 +2149,8 @@ absl::StatusOr<std::string> Encode(const Directive& directive) {
   writer.Fixed(directive.manifest_digest);
   writer.U64(directive.partition_replication_epoch);
   const auto kind = static_cast<std::uint8_t>(directive.kind);
-  if (kind < 1 ||
-      kind > static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
+  if (kind < 1 || kind > static_cast<std::uint8_t>(
+                             WireDirectiveKind::kInitializeEmptyPopulation)) {
     return ProtocolError("unknown directive kind");
   }
   writer.U8(kind);
@@ -2147,9 +2223,8 @@ absl::StatusOr<WireMessage> DecodeDirective(std::string_view bytes) {
   directive.partition_replication_epoch = *partition_replication_epoch;
   auto kind = reader.U8();
   if (!kind.ok()) return kind.status();
-  if (*kind < 1 ||
-      *kind >
-          static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
+  if (*kind < 1 || *kind > static_cast<std::uint8_t>(
+                               WireDirectiveKind::kInitializeEmptyPopulation)) {
     return ProtocolError("unknown directive kind");
   }
   directive.kind = static_cast<WireDirectiveKind>(*kind);
@@ -2534,6 +2609,207 @@ absl::StatusOr<WireDesiredMember> ReadDesiredMember(Reader& reader) {
   return member;
 }
 
+absl::Status ValidateFailoverTransition(
+    const WireFailoverTransition& transition, const WireDesiredGroup& group) {
+  if (IsZeroId(transition.transition_id) || transition.revision == 0 ||
+      transition.target_term == 0) {
+    return ProtocolError("failover transition has an empty identity");
+  }
+  if (transition.mode != WireFailoverMode::kControlled &&
+      transition.mode != WireFailoverMode::kUncontrolled) {
+    return ProtocolError("unknown failover transition mode");
+  }
+  if (transition.candidate_action.has_value()) {
+    const WireFailoverCandidateAction& action = *transition.candidate_action;
+    if (IsZeroId(action.action_id) ||
+        !IsCanonicalIdentity160(action.candidate.node_id) ||
+        IsZeroId(action.candidate.assignment_id) ||
+        !IsCanonicalIdentity160(action.candidate.boot_id) ||
+        action.domain.source_group_term == 0 ||
+        action.domain.source_group_term >= transition.target_term ||
+        !IsCanonicalIdentity160(action.domain.source_node_id) ||
+        IsZeroId(action.domain.source_assignment_id) ||
+        !IsCanonicalIdentity160(action.domain.source_boot_id) ||
+        !IsCanonicalIdentity160(action.domain.source_history_id)) {
+      return ProtocolError("failover candidate action is invalid");
+    }
+    if (action.domain.flow_count == 0 ||
+        action.domain.flow_count > kMaxCandidateFlows) {
+      return ResourceLimit(
+          "failover compatibility flow count is outside its protocol cap");
+    }
+    const auto candidate =
+        std::find_if(group.members.begin(), group.members.end(),
+                     [&action](const WireDesiredMember& member) {
+                       return member.node_id == action.candidate.node_id;
+                     });
+    if (candidate == group.members.end() ||
+        candidate->assignment_id != action.candidate.assignment_id) {
+      return ProtocolError(
+          "failover candidate is not the projected member incarnation");
+    }
+    if (action.authorization.has_value()) {
+      const WireFailoverAuthorization& authorization = *action.authorization;
+      if (authorization.authorized_revision == 0 ||
+          authorization.authorized_revision > transition.revision ||
+          (authorization.loss_if_cutover != WireFailoverLoss::kNone &&
+           authorization.loss_if_cutover != WireFailoverLoss::kUnknown)) {
+        return ProtocolError("failover authorization is invalid");
+      }
+    }
+  }
+
+  if (transition.mode == WireFailoverMode::kControlled) {
+    if (!group.grant_active ||
+        group.group_term == std::numeric_limits<std::uint64_t>::max() ||
+        transition.target_term != group.group_term + 1 ||
+        !group.owner_node_id.has_value() ||
+        !group.owner_assignment_id.has_value() ||
+        !transition.candidate_action.has_value()) {
+      return ProtocolError(
+          "controlled failover disagrees with current group authority");
+    }
+    const WireFailoverCandidateAction& action = *transition.candidate_action;
+    if (action.domain.source_group_term != group.group_term ||
+        action.domain.source_node_id != *group.owner_node_id ||
+        action.domain.source_assignment_id != *group.owner_assignment_id ||
+        action.candidate.node_id == *group.owner_node_id ||
+        (action.authorization.has_value() &&
+         action.authorization->loss_if_cutover != WireFailoverLoss::kNone)) {
+      return ProtocolError("controlled failover lineage is inconsistent");
+    }
+  } else if (group.grant_active || transition.target_term != group.group_term) {
+    return ProtocolError(
+        "uncontrolled failover disagrees with fenced group authority");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status WriteFailoverTransition(Writer& writer,
+                                     const WireFailoverTransition& transition,
+                                     const WireDesiredGroup& group) {
+  if (absl::Status status = ValidateFailoverTransition(transition, group);
+      !status.ok()) {
+    return status;
+  }
+  writer.Fixed(transition.transition_id);
+  writer.U64(transition.revision);
+  writer.U8(static_cast<std::uint8_t>(transition.mode));
+  writer.U64(transition.target_term);
+  writer.Bool(transition.candidate_action.has_value());
+  if (transition.candidate_action.has_value()) {
+    const WireFailoverCandidateAction& action = *transition.candidate_action;
+    writer.Fixed(action.action_id);
+    if (absl::Status status = WriteIdentity(writer, action.candidate.node_id,
+                                            "failover candidate node id");
+        !status.ok()) {
+      return status;
+    }
+    writer.Fixed(action.candidate.assignment_id);
+    if (absl::Status status = WriteIdentity(writer, action.candidate.boot_id,
+                                            "failover candidate boot id");
+        !status.ok()) {
+      return status;
+    }
+    writer.U64(action.domain.source_group_term);
+    if (absl::Status status = WriteIdentity(
+            writer, action.domain.source_node_id, "failover source node id");
+        !status.ok()) {
+      return status;
+    }
+    writer.Fixed(action.domain.source_assignment_id);
+    if (absl::Status status = WriteIdentity(
+            writer, action.domain.source_boot_id, "failover source boot id");
+        !status.ok()) {
+      return status;
+    }
+    if (absl::Status status =
+            WriteIdentity(writer, action.domain.source_history_id,
+                          "failover source history id");
+        !status.ok()) {
+      return status;
+    }
+    writer.U32(action.domain.flow_count);
+    writer.Bool(action.authorization.has_value());
+    if (action.authorization.has_value()) {
+      writer.U64(action.authorization->authorized_revision);
+      writer.U8(
+          static_cast<std::uint8_t>(action.authorization->loss_if_cutover));
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<WireFailoverTransition> ReadFailoverTransition(
+    Reader& reader, const WireDesiredGroup& group) {
+  WireFailoverTransition transition;
+  auto transition_id = reader.Fixed<16>();
+  if (!transition_id.ok()) return transition_id.status();
+  transition.transition_id = *transition_id;
+  auto revision = reader.U64();
+  if (!revision.ok()) return revision.status();
+  transition.revision = *revision;
+  auto mode = reader.U8();
+  if (!mode.ok()) return mode.status();
+  transition.mode = static_cast<WireFailoverMode>(*mode);
+  auto target_term = reader.U64();
+  if (!target_term.ok()) return target_term.status();
+  transition.target_term = *target_term;
+  auto has_action = reader.Bool();
+  if (!has_action.ok()) return has_action.status();
+  if (*has_action) {
+    WireFailoverCandidateAction action;
+    auto action_id = reader.Fixed<16>();
+    if (!action_id.ok()) return action_id.status();
+    action.action_id = *action_id;
+    auto candidate_node = ReadIdentity(reader, "failover candidate node id");
+    if (!candidate_node.ok()) return candidate_node.status();
+    action.candidate.node_id = std::move(*candidate_node);
+    auto candidate_assignment = reader.Fixed<16>();
+    if (!candidate_assignment.ok()) return candidate_assignment.status();
+    action.candidate.assignment_id = *candidate_assignment;
+    auto candidate_boot = ReadIdentity(reader, "failover candidate boot id");
+    if (!candidate_boot.ok()) return candidate_boot.status();
+    action.candidate.boot_id = std::move(*candidate_boot);
+    auto source_group_term = reader.U64();
+    if (!source_group_term.ok()) return source_group_term.status();
+    action.domain.source_group_term = *source_group_term;
+    auto source_node = ReadIdentity(reader, "failover source node id");
+    if (!source_node.ok()) return source_node.status();
+    action.domain.source_node_id = std::move(*source_node);
+    auto source_assignment = reader.Fixed<16>();
+    if (!source_assignment.ok()) return source_assignment.status();
+    action.domain.source_assignment_id = *source_assignment;
+    auto source_boot = ReadIdentity(reader, "failover source boot id");
+    if (!source_boot.ok()) return source_boot.status();
+    action.domain.source_boot_id = std::move(*source_boot);
+    auto source_history = ReadIdentity(reader, "failover source history id");
+    if (!source_history.ok()) return source_history.status();
+    action.domain.source_history_id = std::move(*source_history);
+    auto flow_count = reader.U32();
+    if (!flow_count.ok()) return flow_count.status();
+    action.domain.flow_count = *flow_count;
+    auto has_authorization = reader.Bool();
+    if (!has_authorization.ok()) return has_authorization.status();
+    if (*has_authorization) {
+      WireFailoverAuthorization authorization;
+      auto authorized_revision = reader.U64();
+      if (!authorized_revision.ok()) return authorized_revision.status();
+      authorization.authorized_revision = *authorized_revision;
+      auto loss = reader.U8();
+      if (!loss.ok()) return loss.status();
+      authorization.loss_if_cutover = static_cast<WireFailoverLoss>(*loss);
+      action.authorization = authorization;
+    }
+    transition.candidate_action = std::move(action);
+  }
+  if (absl::Status status = ValidateFailoverTransition(transition, group);
+      !status.ok()) {
+    return status;
+  }
+  return transition;
+}
+
 absl::Status WriteDesiredGroup(Writer& writer, const WireDesiredGroup& group) {
   if (absl::Status status =
           writer.String(group.group_id, kMaxIdentifierBytes, "group id");
@@ -2572,6 +2848,15 @@ absl::Status WriteDesiredGroup(Writer& writer, const WireDesiredGroup& group) {
   writer.U64(group.grant_revision);
   writer.U32(group.grant_duration_ms);
   writer.Bool(group.grant_active);
+  if (group.activation_action_id.has_value() &&
+      (!group.grant_active || IsZeroId(*group.activation_action_id))) {
+    return ProtocolError(
+        "grant activation action requires a nonzero active grant");
+  }
+  writer.Bool(group.activation_action_id.has_value());
+  if (group.activation_action_id.has_value()) {
+    writer.Fixed(*group.activation_action_id);
+  }
   writer.U64(group.config_epoch);
   if (absl::Status status =
           WriteCount(writer, group.slot_ranges.size(), kMaxManifestEntries,
@@ -2595,6 +2880,11 @@ absl::Status WriteDesiredGroup(Writer& writer, const WireDesiredGroup& group) {
     return status;
   }
   writer.U64(group.grant_policy_version);
+  writer.Bool(group.steady_replication_enabled);
+  writer.Bool(group.failover_transition.has_value());
+  if (group.failover_transition.has_value()) {
+    return WriteFailoverTransition(writer, *group.failover_transition, group);
+  }
   return absl::OkStatus();
 }
 
@@ -2639,6 +2929,17 @@ absl::StatusOr<WireDesiredGroup> ReadDesiredGroup(Reader& reader) {
   if (!group.owner_node_id.has_value() && group.grant_active) {
     return ProtocolError("grantless group cannot carry an active grant");
   }
+  auto has_activation_action = reader.Bool();
+  if (!has_activation_action.ok()) return has_activation_action.status();
+  if (*has_activation_action) {
+    auto action_id = reader.Fixed<16>();
+    if (!action_id.ok()) return action_id.status();
+    if (!group.grant_active || IsZeroId(*action_id)) {
+      return ProtocolError(
+          "grant activation action requires a nonzero active grant");
+    }
+    group.activation_action_id = *action_id;
+  }
   auto config_epoch = reader.U64();
   if (!config_epoch.ok()) return config_epoch.status();
   group.config_epoch = *config_epoch;
@@ -2673,6 +2974,20 @@ absl::StatusOr<WireDesiredGroup> ReadDesiredGroup(Reader& reader) {
   auto policy_version = reader.U64();
   if (!policy_version.ok()) return policy_version.status();
   group.grant_policy_version = *policy_version;
+  auto steady_replication_enabled = reader.Bool();
+  if (!steady_replication_enabled.ok()) {
+    return steady_replication_enabled.status();
+  }
+  group.steady_replication_enabled = *steady_replication_enabled;
+  auto has_failover_transition = reader.Bool();
+  if (!has_failover_transition.ok()) {
+    return has_failover_transition.status();
+  }
+  if (*has_failover_transition) {
+    auto transition = ReadFailoverTransition(reader, group);
+    if (!transition.ok()) return transition.status();
+    group.failover_transition = std::move(*transition);
+  }
   return group;
 }
 
@@ -2819,8 +3134,8 @@ absl::Status WriteProjectedDirective(Writer& writer,
   writer.Fixed(directive.manifest_digest);
   writer.U64(directive.partition_replication_epoch);
   const auto kind = static_cast<std::uint8_t>(directive.kind);
-  if (kind < 1 ||
-      kind > static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
+  if (kind < 1 || kind > static_cast<std::uint8_t>(
+                             WireDirectiveKind::kInitializeEmptyPopulation)) {
     return ProtocolError("unknown directive kind");
   }
   writer.U8(kind);
@@ -2888,9 +3203,8 @@ absl::StatusOr<WireProjectedDirective> ReadProjectedDirective(Reader& reader) {
   directive.partition_replication_epoch = *partition_replication_epoch;
   auto kind = reader.U8();
   if (!kind.ok()) return kind.status();
-  if (*kind < 1 ||
-      *kind >
-          static_cast<std::uint8_t>(WireDirectiveKind::kPromotionPrepare)) {
+  if (*kind < 1 || *kind > static_cast<std::uint8_t>(
+                               WireDirectiveKind::kInitializeEmptyPopulation)) {
     return ProtocolError("unknown directive kind");
   }
   directive.kind = static_cast<WireDirectiveKind>(*kind);
@@ -2953,12 +3267,12 @@ bool CanonicalProjectedDirectiveLess(
     const WireProjectedDirective& right) noexcept {
 #define KEYLANE_COMPARE_DIRECTIVE(call) \
   if (const int order = (call); order != 0) return order < 0
-  KEYLANE_COMPARE_DIRECTIVE(CompareEncodedString(left.authority.group_id,
-                                                 right.authority.group_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareEncodedString(left.authority.group_id, right.authority.group_id));
   KEYLANE_COMPARE_DIRECTIVE(CompareFixed(left.authority.assignment_id,
                                          right.authority.assignment_id));
-  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.group_term,
-                                          right.authority.group_term));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareScalar(left.authority.group_term, right.authority.group_term));
   KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.authority_version,
                                           right.authority.authority_version));
   KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.grant_revision,
@@ -2981,23 +3295,22 @@ bool CanonicalProjectedDirectiveLess(
       CompareRawBytes(left.target_boot_id, right.target_boot_id));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareRawBytes(left.source_node_id, right.source_node_id));
-  KEYLANE_COMPARE_DIRECTIVE(CompareFixed(left.source_assignment_id,
-                                         right.source_assignment_id));
+  KEYLANE_COMPARE_DIRECTIVE(
+      CompareFixed(left.source_assignment_id, right.source_assignment_id));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareRawBytes(left.source_boot_id, right.source_boot_id));
   KEYLANE_COMPARE_DIRECTIVE(CompareRawBytes(
-      left.source_replication_history_id,
-      right.source_replication_history_id));
+      left.source_replication_history_id, right.source_replication_history_id));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareScalar(left.manifest_revision, right.manifest_revision));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareFixed(left.manifest_digest, right.manifest_digest));
   KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.partition_replication_epoch,
                                           right.partition_replication_epoch));
-  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(static_cast<std::uint8_t>(left.kind),
-                                          static_cast<std::uint8_t>(right.kind)));
   KEYLANE_COMPARE_DIRECTIVE(
-      CompareEncodedString(left.payload, right.payload));
+      CompareScalar(static_cast<std::uint8_t>(left.kind),
+                    static_cast<std::uint8_t>(right.kind)));
+  KEYLANE_COMPARE_DIRECTIVE(CompareEncodedString(left.payload, right.payload));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareEncodedString(left.preconditions, right.preconditions));
   KEYLANE_COMPARE_DIRECTIVE(
@@ -3069,12 +3382,12 @@ absl::StatusOr<WireHash256> ComputeDirectiveSetDigest(
 
 namespace {
 
-absl::Status WriteFullDesiredStateBody(
-    Writer& writer, const FullDesiredState& state,
-    std::uint64_t source_meta_applied_index,
-    const WireHash256& projection_hash,
-    const WireHash256& directive_set_digest,
-    bool normalize_directive_basis) {
+absl::Status WriteFullDesiredStateBody(Writer& writer,
+                                       const FullDesiredState& state,
+                                       std::uint64_t source_meta_applied_index,
+                                       const WireHash256& projection_hash,
+                                       const WireHash256& directive_set_digest,
+                                       bool normalize_directive_basis) {
   writer.U16(kProtocolVersion);
   writer.U64(source_meta_applied_index);
   writer.U64(state.topology_epoch);
@@ -3215,8 +3528,8 @@ absl::StatusOr<std::string> EncodeFullDesiredState(
 
   Writer writer;
   if (absl::Status status = WriteFullDesiredStateBody(
-          writer, state, state.source_meta_applied_index,
-          state.projection_hash, state.directive_set_digest, false);
+          writer, state, state.source_meta_applied_index, state.projection_hash,
+          state.directive_set_digest, false);
       !status.ok()) {
     return status;
   }
@@ -3332,8 +3645,7 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
   return state;
 }
 
-absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
-    std::string&& encoded) {
+absl::StatusOr<FullDesiredState> DecodeFullDesiredState(std::string&& encoded) {
   auto decoded = DecodeFullDesiredState(std::string_view(encoded));
   // A transferred FDS is already duplicated by its decoded owning strings.
   // Release the contiguous wire allocation before returning it to callers so
@@ -3345,8 +3657,7 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
 
 absl::StatusOr<WireHash256> ComputeProjectionHash(
     const FullDesiredState& state) {
-  auto directive_digest =
-      ComputeDirectiveSetDigest(state.current_directives);
+  auto directive_digest = ComputeDirectiveSetDigest(state.current_directives);
   if (!directive_digest.ok()) return directive_digest.status();
   return ComputeProjectionHashImpl(state, *directive_digest);
 }

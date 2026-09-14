@@ -237,6 +237,11 @@ struct GroupView {
   bool granted_ = true;  // false = fenced: this group must not serve
   bool population_ready_ = true;
   bool storage_ready_ = true;
+  // A controlled failover pause closes only new client-side mutations. It is
+  // deliberately separate from `granted_`: the old owner keeps its finite
+  // lease, reads, and established replication exports while NodeControl
+  // drains requests admitted before the pause publication.
+  bool mutations_paused_ = false;
   std::uint64_t group_term_ = 0;
   std::uint64_t authority_version_ = 0;
   std::uint64_t grant_revision_ = 0;

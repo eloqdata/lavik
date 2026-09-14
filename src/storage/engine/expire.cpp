@@ -1,3 +1,8 @@
+#include <time.h>
+
+#include <exception>
+
+#include "absl/strings/cord.h"
 #include "impl.h"
 
 namespace keylane::storage {
@@ -51,6 +56,145 @@ absl::Status StorageEngine::Impl::ConfigureActiveExpiration(
   return absl::OkStatus();
 }
 
+namespace {
+
+constexpr absl::string_view kExpirationAuthorityCancellationTypeUrl =
+    "type.googleapis.com/keylane.storage.ExpirationAuthorityCancellation";
+
+std::chrono::nanoseconds BootTimeSinceEpoch() noexcept {
+  timespec now{};
+  if (::clock_gettime(CLOCK_BOOTTIME, &now) != 0) {
+    // Mixing clock epochs could extend a finite authority after suspend. The
+    // supported runtime is Linux, where CLOCK_BOOTTIME is always available.
+    std::terminate();
+  }
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::seconds(now.tv_sec) + std::chrono::nanoseconds(now.tv_nsec));
+}
+
+}  // namespace
+
+bool StorageEngine::Impl::ExpirationAuthorityIsValid(
+    const ExpirationAuthorityGrant* authority) noexcept {
+  if (authority == nullptr ||
+      !authority->active_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  return authority->deadline_since_boot_ == std::chrono::nanoseconds::max() ||
+         BootTimeSinceEpoch() < authority->deadline_since_boot_;
+}
+
+std::shared_ptr<StorageEngine::Impl::ExpirationAuthorityGrant>
+StorageEngine::Impl::CurrentExpirationAuthority() const noexcept {
+  auto authority = active_expiration_authority_.load(std::memory_order_acquire);
+  return ExpirationAuthorityIsValid(authority.get()) ? std::move(authority)
+                                                     : nullptr;
+}
+
+absl::Status StorageEngine::Impl::ValidateExpirationAuthority(
+    const void* context) {
+  const auto* authority = static_cast<const ExpirationAuthorityGrant*>(context);
+  if (ExpirationAuthorityIsValid(authority)) return absl::OkStatus();
+  absl::Status cancelled = absl::FailedPreconditionError(
+      "expiration authority was revoked or expired");
+  // The payload survives the storage append unchanged and distinguishes this
+  // expected cancellation from an unrelated failure that happened while the
+  // same token was concurrently revoked or expired.
+  cancelled.SetPayload(kExpirationAuthorityCancellationTypeUrl,
+                       absl::Cord("cancelled"));
+  return cancelled;
+}
+
+bool StorageEngine::Impl::IsExpirationAuthorityCancellation(
+    const absl::Status& status) noexcept {
+  return status.code() == absl::StatusCode::kFailedPrecondition &&
+         status.GetPayload(kExpirationAuthorityCancellationTypeUrl).has_value();
+}
+
+void StorageEngine::Impl::SetExpirationAuthority(bool authority) noexcept {
+  auto current = active_expiration_authority_.load(std::memory_order_acquire);
+  const auto valid_permanent = [](const ExpirationAuthorityGrant* grant) {
+    return grant != nullptr && grant->active_.load(std::memory_order_acquire) &&
+           grant->deadline_since_boot_ == std::chrono::nanoseconds::max();
+  };
+  if (authority && valid_permanent(current.get())) {
+    // Repeating the legacy enable must not invalidate work admitted under the
+    // same permanent authority. This is both the common call path and the
+    // allocation-free behavior callers had before exact grants existed.
+    expiration_authority_.store(true, std::memory_order_release);
+    return;
+  }
+
+  std::shared_ptr<ExpirationAuthorityGrant> replacement;
+  if (authority) {
+    try {
+      replacement = std::make_shared<ExpirationAuthorityGrant>(
+          std::chrono::nanoseconds::max());
+    } catch (const std::bad_alloc&) {
+      // The legacy API cannot report allocation failure. Installing no grant
+      // is the only fail-closed outcome, and a later call may retry.
+    }
+  }
+
+  if (!authority) {
+    expiration_authority_.store(false, std::memory_order_release);
+  }
+  for (;;) {
+    if (authority && valid_permanent(current.get())) {
+      // A concurrent enabler may have installed the permanent grant after the
+      // first load. Preserve its identity instead of replacing it again.
+      expiration_authority_.store(true, std::memory_order_release);
+      return;
+    }
+    if (current != nullptr) {
+      // Invalidate before publishing its replacement. Work already carrying
+      // the old capability will then fail its final mutation precondition.
+      current->active_.store(false, std::memory_order_release);
+    }
+    if (active_expiration_authority_.compare_exchange_weak(
+            current, replacement, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      if (authority) {
+        expiration_authority_.store(replacement != nullptr,
+                                    std::memory_order_release);
+      }
+      return;
+    }
+  }
+}
+
+absl::Status StorageEngine::Impl::SetExpirationAuthorityUntil(
+    std::chrono::nanoseconds deadline_since_boot) noexcept {
+  if (BootTimeSinceEpoch() >= deadline_since_boot) {
+    return absl::DeadlineExceededError(
+        "expiration authority deadline has already elapsed");
+  }
+  std::shared_ptr<ExpirationAuthorityGrant> replacement;
+  try {
+    replacement =
+        std::make_shared<ExpirationAuthorityGrant>(deadline_since_boot);
+  } catch (const std::bad_alloc&) {
+    return absl::ResourceExhaustedError(
+        "failed to allocate expiration authority grant");
+  }
+  if (BootTimeSinceEpoch() >= deadline_since_boot) {
+    return absl::DeadlineExceededError(
+        "expiration authority deadline elapsed during installation");
+  }
+
+  auto current = active_expiration_authority_.load(std::memory_order_acquire);
+  for (;;) {
+    if (current != nullptr) {
+      current->active_.store(false, std::memory_order_release);
+    }
+    if (active_expiration_authority_.compare_exchange_weak(
+            current, replacement, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      return absl::OkStatus();
+    }
+  }
+}
+
 Task<absl::Status> StorageEngine::Impl::QuiesceExpiration() {
   expiration_pause_count_.fetch_add(1, std::memory_order_acq_rel);
   // Drain the in-flight expiration cycle on every worker. The flag spans a
@@ -85,7 +229,8 @@ void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
                                                 const RecordIndex::Entry& entry,
                                                 std::string_view known_key) {
   constexpr std::size_t kMaxQueuedExpiredCandidates = 4096;
-  if (!expiration_authority_.load(std::memory_order_acquire) ||
+  auto expiration_authority = CurrentExpirationAuthority();
+  if (expiration_authority == nullptr ||
       store.expired_candidates_.size() >= kMaxQueuedExpiredCandidates ||
       entry.value_.kind() != RecordKind::kValue || ExpireAt(entry) == 0) {
     return;
@@ -102,6 +247,7 @@ void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
       .mutation_sequence_ = entry.value_.mutation_sequence_,
       .expire_at_ms_ = ExpireAt(entry),
       .key_ = std::string(key),
+      .expiration_authority_ = std::move(expiration_authority),
   });
 }
 
@@ -117,11 +263,30 @@ void StorageEngine::Impl::AdvanceExpiryMap(WorkerStore& store) {
   }
 }
 
+std::size_t StorageEngine::Impl::DiscardStaleExpirationCandidates(
+    WorkerStore& store) noexcept {
+  std::size_t discarded = 0;
+  while (!store.expired_candidates_.empty() &&
+         !ExpirationAuthorityIsValid(
+             store.expired_candidates_.front().expiration_authority_.get())) {
+    store.expired_candidates_.pop_front();
+    ++discarded;
+  }
+  return discarded;
+}
+
 Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
     WorkerStore& store, WorkerStore::ExpireCandidate candidate) {
   if (candidate.partition_id_ >= kLogicalStorageShards ||
       candidate.db_id_ >= kLogicalDatabaseCount ||
       expiration_pause_count_.load(std::memory_order_acquire) != 0) {
+    co_return absl::OkStatus();
+  }
+  const MutationPrecondition expiration_precondition(
+      candidate.expiration_authority_, &ValidateExpirationAuthority);
+  if (!expiration_precondition.Validate().ok()) {
+    // Revocation and deadline expiry are ordinary maintenance cancellation.
+    // The still-indexed key may be rediscovered under a later exact grant.
     co_return absl::OkStatus();
   }
   auto& partition = PartitionFor(store, candidate.partition_id_);
@@ -151,12 +316,27 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   // older live version for this record to hide, and recovery still observes
   // its own expiration timestamp. This is the full-disk escape valve that
   // lets expiration free blocks which can then accept durable tombstones.
-  absl::Status durable = co_await AppendLocked(
-      store, partition, candidate.db_id_, candidate.key_, candidate.digest_, {},
-      RecordKind::kTombstone, ValueType::kNone, 0, nullptr, 0);
-  if (durable.ok() || durable.code() != absl::StatusCode::kResourceExhausted) {
-    co_return durable;
+  absl::Status durable;
+#if KEYLANE_FAULTS_ENABLED
+  std::optional<absl::Status> injected_durable;
+  if (expiration_test_hook_) {
+    injected_durable =
+        expiration_test_hook_(ExpirationTestPoint::kBeforeDurableAppend);
   }
+  if (injected_durable.has_value()) {
+    durable = std::move(*injected_durable);
+  } else {
+#endif
+    durable = co_await AppendLocked(
+        store, partition, candidate.db_id_, candidate.key_, candidate.digest_,
+        {}, RecordKind::kTombstone, ValueType::kNone, 0, nullptr, 0, nullptr,
+        nullptr, nullptr, nullptr, true, nullptr, &expiration_precondition);
+#if KEYLANE_FAULTS_ENABLED
+  }
+#endif
+  if (IsExpirationAuthorityCancellation(durable)) co_return absl::OkStatus();
+  if (durable.ok() || durable.code() != absl::StatusCode::kResourceExhausted)
+    co_return durable;
 
   // Append may release store_state_mutex_ while acquiring space or pinning
   // transaction dependencies. The key hold excludes logical writes, but GC
@@ -202,6 +382,17 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
     }
   }
 
+  // Append can fail before reaching its publication precondition. The
+  // disk-full fallback has its own no-await mutation cut and must validate the
+  // same capability immediately before its first side effect.
+#if KEYLANE_FAULTS_ENABLED
+  if (expiration_test_hook_) {
+    (void)expiration_test_hook_(ExpirationTestPoint::kBeforeDiskFullFallback);
+  }
+#endif
+  if (!expiration_precondition.Validate().ok()) {
+    co_return absl::OkStatus();
+  }
   tx::CurrentTxShard().MarkWatched(candidate.db_id_,
                                    tx::FingerprintOf(candidate.digest_));
   const std::uint64_t sequence = ++partition.mutation_sequence_;
@@ -311,7 +502,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     // Only logical expiration is disabled; index maintenance still runs.
     if (std::getenv("KEYLANE_DISABLE_ACTIVE_EXPIRATION") != nullptr) continue;
 #endif
-    if (!expiration_authority_.load(std::memory_order_acquire)) continue;
+    if (CurrentExpirationAuthority() == nullptr) continue;
 
     const std::uint64_t now_ms = UnixTimeMillis();
     for (std::size_t step = 0; step < map_steps && !store->partitions_.empty();
@@ -384,6 +575,12 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     std::size_t deleted = 0;
     bool warned_failure = false;
     while (deleted < deletes && !store->expired_candidates_.empty()) {
+      // A revoked, replaced, or elapsed grant can leave a queue prefix behind.
+      // Drop that prefix before asking full-sync consumers for replacement
+      // credit; cancelled attempts neither block a saturated consumer nor
+      // consume one of this cycle's configured actual-delete slots.
+      (void)DiscardStaleExpirationCandidates(*store);
+      if (store->expired_candidates_.empty()) break;
       const WorkerStore::ExpireCandidate& front =
           store->expired_candidates_.front();
       std::size_t replacement_bytes = kFullSyncReplacementMetadataBytes;

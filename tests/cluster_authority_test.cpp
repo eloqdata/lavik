@@ -9,10 +9,10 @@
 #include <thread>
 #include <vector>
 
+#include "cluster/test_topology_installer.h"
 #include "keylane/cluster/authority.h"
 #include "keylane/cluster/node_control.h"
 #include "keylane/cluster/topology.h"
-#include "cluster/test_topology_installer.h"
 
 namespace {
 
@@ -157,6 +157,59 @@ TEST(ClusterAuthorityTest, PrimaryServesKeyedReadAndWriteWhenReady) {
             Decision::Kind::kServe);
   EXPECT_EQ(Admit(state.get(), MakeRequest(slots, /*is_write=*/true)).kind_,
             Decision::Kind::kServe);
+}
+
+TEST(ClusterAuthorityTest,
+     ControlledPauseKeepsReadsButReturnsTryAgainForWrites) {
+  GroupView group_a = GroupA();
+  group_a.mutations_paused_ = true;
+  const auto state = BuildState(kNodeA, group_a, GroupB());
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+
+  EXPECT_EQ(Admit(state.get(), MakeRequest(slots, /*is_write=*/false)).kind_,
+            Decision::Kind::kServe);
+  EXPECT_EQ(Admit(state.get(), MakeRequest(slots, /*is_write=*/true)).kind_,
+            Decision::Kind::kTryAgain);
+}
+
+TEST(GroupInFlightTest,
+     PauseRejectsUnregisteredCaptureButDrainsAlreadyRegisteredMutation) {
+  TestAuthorityControl control;
+  const auto unpaused = BuildState(kNodeA);
+  ASSERT_TRUE(control.topology.Install(unpaused, {}).ok());
+  const std::array<std::uint16_t, 1> slots{kSlotInA};
+
+  auto stale = control.authority.CaptureAndAdmit(MakeRequest(slots, true), {});
+  ASSERT_EQ(stale.decision().kind_, Decision::Kind::kServe);
+
+  auto registered =
+      control.authority.CaptureAndAdmit(MakeRequest(slots, true), {});
+  AuthorityInFlightGuards in_flights;
+  ASSERT_EQ(
+      control.authority.RegisterAndRecheck(registered, 0, {}, &in_flights),
+      RecheckResult::kOk);
+  ASSERT_EQ(in_flights.size(), 1u);
+
+  GroupView paused_group = GroupA();
+  paused_group.mutations_paused_ = true;
+  const auto paused = BuildState(kNodeA, paused_group, GroupB());
+  // This is the lower-level publication/registration handshake itself. The
+  // initial adapter install supplied a real finite session lease; publishing
+  // the pause directly avoids asking NodeControl to drain the very guard this
+  // test intentionally keeps alive.
+  control.cache.Publish(paused);
+
+  AuthorityInFlightGuards rejected;
+  EXPECT_EQ(control.authority.RegisterAndRecheck(stale, 0, {}, &rejected),
+            RecheckResult::kReject);
+  EXPECT_TRUE(rejected.empty());
+  // The pause-only publication preserves authority for work that registered
+  // before it, and the shared cell remains visible to the drain side.
+  EXPECT_EQ(control.authority.RecheckAtMutation(registered, {}),
+            RecheckResult::kOk);
+  EXPECT_EQ(paused->GroupInFlightCount(kGroupA), 1u);
+  in_flights.clear();
+  EXPECT_EQ(paused->GroupInFlightCount(kGroupA), 0u);
 }
 
 TEST(ClusterAuthorityTest, NullStateLoadsEverythingExceptAllowlist) {
@@ -462,17 +515,15 @@ TEST(AuthorityGuardTest, RegistrationHandshakeOwnsOneGuardPerGroup) {
   TestAuthorityControl control;
   ASSERT_TRUE(control.topology.Install(BuildState(kNodeA), {}).ok());
   const std::array<std::uint16_t, 2> duplicate_slots{kSlotInA, kSlotInA};
-  const auto admission =
-      control.authority.CaptureAndAdmit(
-          MakeRequest(duplicate_slots, /*is_write=*/true),
-          keylane::cluster::MonotonicTime{});
+  const auto admission = control.authority.CaptureAndAdmit(
+      MakeRequest(duplicate_slots, /*is_write=*/true),
+      keylane::cluster::MonotonicTime{});
 
   AuthorityInFlightGuards guards;
-  EXPECT_EQ(
-      control.authority.RegisterAndRecheck(
-          admission, /*worker_stripe=*/2,
-          keylane::cluster::MonotonicTime{}, &guards),
-      RecheckResult::kOk);
+  EXPECT_EQ(control.authority.RegisterAndRecheck(
+                admission, /*worker_stripe=*/2,
+                keylane::cluster::MonotonicTime{}, &guards),
+            RecheckResult::kOk);
   EXPECT_EQ(guards.size(), 1U);
   EXPECT_EQ(admission.state()->GroupInFlightCount(kGroupA), 1U);
 
@@ -494,11 +545,10 @@ TEST(AuthorityGuardTest,
                   .Install(BuildState(kNodeA, std::move(fenced), GroupB()), {})
                   .ok());
   AuthorityInFlightGuards guards;
-  EXPECT_EQ(
-      control.authority.RegisterAndRecheck(
-          admission, /*worker_stripe=*/0,
-          keylane::cluster::MonotonicTime{}, &guards),
-      RecheckResult::kReject);
+  EXPECT_EQ(control.authority.RegisterAndRecheck(
+                admission, /*worker_stripe=*/0,
+                keylane::cluster::MonotonicTime{}, &guards),
+            RecheckResult::kReject);
   EXPECT_TRUE(guards.empty());
   EXPECT_EQ(admission.state()->GroupInFlightCount(kGroupA), 0U);
 }
@@ -512,10 +562,9 @@ TEST(AuthorityGuardTest, FinalMutationRecheckTracksAggregateOutcome) {
   const auto rejected = control.authority.CaptureAndAdmit(
       MakeRequest(slots, /*is_write=*/true), keylane::cluster::MonotonicTime{});
 
-  EXPECT_EQ(
-      control.authority.RecheckAtMutation(
-          started, keylane::cluster::MonotonicTime{}),
-      RecheckResult::kOk);
+  EXPECT_EQ(control.authority.RecheckAtMutation(
+                started, keylane::cluster::MonotonicTime{}),
+            RecheckResult::kOk);
   EXPECT_TRUE(started.mutation_started());
   EXPECT_FALSE(started.final_recheck_failed());
 
@@ -524,17 +573,15 @@ TEST(AuthorityGuardTest, FinalMutationRecheckTracksAggregateOutcome) {
   ASSERT_TRUE(control.topology
                   .Install(BuildState(kNodeA, std::move(fenced), GroupB()), {})
                   .ok());
-  EXPECT_EQ(
-      control.authority.RecheckAtMutation(
-          started, keylane::cluster::MonotonicTime{}),
-      RecheckResult::kReject);
+  EXPECT_EQ(control.authority.RecheckAtMutation(
+                started, keylane::cluster::MonotonicTime{}),
+            RecheckResult::kReject);
   EXPECT_TRUE(started.mutation_started());
   EXPECT_TRUE(started.final_recheck_failed());
 
-  EXPECT_EQ(
-      control.authority.RecheckAtMutation(
-          rejected, keylane::cluster::MonotonicTime{}),
-      RecheckResult::kReject);
+  EXPECT_EQ(control.authority.RecheckAtMutation(
+                rejected, keylane::cluster::MonotonicTime{}),
+            RecheckResult::kReject);
   EXPECT_FALSE(rejected.mutation_started());
   EXPECT_TRUE(rejected.final_recheck_failed());
 }

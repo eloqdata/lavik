@@ -27,6 +27,7 @@
 
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -44,8 +45,10 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "keylane/meta/cluster_create.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/coordinator.h"
+#include "keylane/meta/failover.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/nuraft_log_store.h"
 #include "keylane/meta/nuraft_state_mgr.h"
@@ -138,6 +141,13 @@ MetaOperationId MakeOperationId(std::uint8_t seed) {
   for (std::size_t i = 0; i < id.size(); ++i) {
     id[i] = static_cast<std::uint8_t>(seed ^ static_cast<std::uint8_t>(i));
   }
+  return id;
+}
+
+template <std::size_t N>
+std::array<std::uint8_t, N> MakeFixedId(std::uint8_t seed) {
+  std::array<std::uint8_t, N> id{};
+  id.fill(seed);
   return id;
 }
 
@@ -676,6 +686,22 @@ struct ServerKnobs {
 
 class MetaCoordinatorServerTest : public ::testing::Test {
  protected:
+  struct FailSafeControlledFailoverState {
+    std::string owner_ = MakeNodeId(0x91);
+    std::string candidate_ = MakeNodeId(0x92);
+    keylane::meta::MetaAssignmentId owner_assignment_ = MakeFixedId<16>(0xa1);
+    keylane::meta::MetaAssignmentId candidate_assignment_ =
+        MakeFixedId<16>(0xa2);
+    keylane::meta::MetaOperationId operation_id_ = MakeOperationId(0xa3);
+    keylane::meta::MetaFailoverTransitionId transition_id_ =
+        MakeFixedId<16>(0xa4);
+    keylane::meta::MetaGrantSpec grant_{5000, "fail-safe-policy", 0};
+    keylane::meta::MetaFailoverCandidateAction action_;
+    std::uint64_t deadline_unix_ms_ = 2'000'000'000'000ULL;
+    std::uint64_t grant_revision_ = 0;
+    std::uint64_t transition_revision_ = 0;
+  };
+
   void SetUp() override { dir_ = MakeTestDir("w5", "server"); }
   void TearDown() override {
     StopServer();
@@ -807,6 +833,158 @@ class MetaCoordinatorServerTest : public ::testing::Test {
   absl::StatusOr<MetaApplyResult> ProposeSync(const MetaCommand& cmd) {
     return RunTaskSync(
         coordinator_->Propose(MetaCommand(cmd), TestPrincipal()));
+  }
+
+  void ProposeAccepted(const MetaCommand& command,
+                       std::uint64_t* log_index = nullptr) {
+    auto result = ProposeSync(command);
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_EQ(result->verdict_, MetaAuditVerdict::kAccepted) << result->detail_;
+    if (log_index != nullptr) *log_index = result->log_index_;
+  }
+
+  void SeedControlledFailover(FailSafeControlledFailoverState& state,
+                              bool begin_transition) {
+    keylane::meta::ClusterCreateManifestV1 manifest;
+    manifest.schema_version_ = 1;
+    manifest.meta_members_ = {{1, "tcp://127.0.0.1:7101",
+                               "tcp://127.0.0.1:7301", "tcp://127.0.0.1:7201"}};
+    manifest.data_nodes_ = {{state.owner_, "tcp://127.0.0.1:6379"}};
+    manifest.groups_ = {{"g1", state.owner_, {}}};
+    manifest.slot_ranges_ = {{0, 16383, "g1"}};
+
+    SubmitOperation root;
+    root.request_id_ = MakeRequestId(0x91);
+    root.operation_id_ = MakeOperationId(0x91);
+    root.kind_ = std::string(keylane::meta::kMetaClusterCreateOperationKind);
+    auto root_intent =
+        keylane::meta::EncodeClusterCreateRequest(manifest, root.operation_id_);
+    ASSERT_TRUE(root_intent.ok()) << root_intent.status();
+    root.intent_ = *root_intent;
+    root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
+    ProposeAccepted(root);
+
+    keylane::meta::CompleteOperation complete_root;
+    complete_root.request_id_ = MakeRequestId(0x92);
+    complete_root.operation_id_ = root.operation_id_;
+    complete_root.expected_revision_ = 0;
+    complete_root.result_ = "cluster-created";
+    ProposeAccepted(complete_root);
+
+    RegisterNode owner = MakeRegister(0x91);
+    owner.node_id_ = state.owner_;
+    owner.principal_ = "keylane://node/" + state.owner_;
+    owner.role_ = keylane::meta::MetaNodeRole::kPrimary;
+    ProposeAccepted(owner);
+
+    RegisterNode candidate = MakeRegister(0x92);
+    candidate.node_id_ = state.candidate_;
+    candidate.principal_ = "keylane://node/" + state.candidate_;
+    candidate.role_ = keylane::meta::MetaNodeRole::kReplica;
+    ProposeAccepted(candidate);
+
+    CreateGroup group;
+    group.request_id_ = MakeRequestId(0x93);
+    group.group_id_ = "g1";
+    group.new_topology_epoch_ = 1;
+    ProposeAccepted(group);
+
+    keylane::meta::AssignNodeToGroup assign_owner;
+    assign_owner.request_id_ = MakeRequestId(0x94);
+    assign_owner.group_id_ = "g1";
+    assign_owner.node_id_ = state.owner_;
+    assign_owner.assignment_id_ = state.owner_assignment_;
+    assign_owner.role_ = keylane::meta::MetaNodeRole::kPrimary;
+    assign_owner.expected_revision_ = 1;
+    assign_owner.new_topology_epoch_ = 2;
+    ProposeAccepted(assign_owner);
+
+    keylane::meta::AssignNodeToGroup assign_candidate;
+    assign_candidate.request_id_ = MakeRequestId(0x95);
+    assign_candidate.group_id_ = "g1";
+    assign_candidate.node_id_ = state.candidate_;
+    assign_candidate.assignment_id_ = state.candidate_assignment_;
+    assign_candidate.role_ = keylane::meta::MetaNodeRole::kReplica;
+    assign_candidate.expected_revision_ = 2;
+    assign_candidate.new_topology_epoch_ = 3;
+    ProposeAccepted(assign_candidate);
+
+    keylane::meta::PutPolicy policy;
+    policy.request_id_ = MakeRequestId(0x96);
+    policy.policy_id_ = state.grant_.policy_id_;
+    policy.version_ = state.grant_.policy_version_;
+    policy.content_ = R"({"lease_ms":5000})";
+    policy.content_hash_ =
+        keylane::meta::MetaPolicyStore::ContentHash(policy.content_);
+    ProposeAccepted(policy);
+
+    BeginGroupTerm term;
+    term.request_id_ = MakeRequestId(0x97);
+    term.group_id_ = "g1";
+    term.expected_term_ = 0;
+    term.new_term_ = 1;
+    ProposeAccepted(term);
+
+    keylane::meta::ActivateAuthority activate;
+    activate.request_id_ = MakeRequestId(0x98);
+    activate.group_id_ = "g1";
+    activate.expected_term_ = 1;
+    activate.new_owner_ = state.owner_;
+    activate.grant_ = state.grant_;
+    activate.new_authority_version_ = 1;
+    activate.new_topology_epoch_ = 4;
+    activate.new_config_epoch_ = 1;
+    ProposeAccepted(activate, &state.grant_revision_);
+
+    keylane::meta::FailoverOperationIntent intent;
+    intent.group_id_ = "g1";
+    intent.absolute_deadline_unix_ms_ = state.deadline_unix_ms_;
+    auto encoded_intent = keylane::meta::EncodeFailoverOperationIntent(intent);
+    ASSERT_TRUE(encoded_intent.ok()) << encoded_intent.status();
+    SubmitOperation submit;
+    submit.request_id_ = MakeRequestId(0x99);
+    submit.operation_id_ = state.operation_id_;
+    submit.kind_ = std::string(keylane::meta::kFailoverOperationKind);
+    submit.intent_ = *encoded_intent;
+    submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
+    ProposeAccepted(submit);
+
+    state.action_.action_id_ = MakeFixedId<16>(0xa5);
+    state.action_.candidate_.node_id_ = state.candidate_;
+    state.action_.candidate_.assignment_id_ = state.candidate_assignment_;
+    state.action_.candidate_.boot_id_ =
+        MakeFixedId<keylane::meta::kMetaBootIncarnationBytes>(0xa6);
+    state.action_.domain_.source_group_term_ = 1;
+    state.action_.domain_.source_node_id_ = state.owner_;
+    state.action_.domain_.source_assignment_id_ = state.owner_assignment_;
+    state.action_.domain_.source_boot_id_ =
+        MakeFixedId<keylane::meta::kMetaBootIncarnationBytes>(0xa7);
+    state.action_.domain_.source_history_id_ =
+        MakeFixedId<keylane::meta::kMetaReplicationHistoryIdBytes>(0xa8);
+    state.action_.domain_.flow_count_ = 2;
+
+    if (!begin_transition) return;
+    keylane::meta::BeginControlledFailover begin;
+    begin.request_id_ = MakeRequestId(0x9a);
+    begin.group_id_ = "g1";
+    begin.transition_id_ = state.transition_id_;
+    begin.target_term_ = 2;
+    begin.successor_grant_ = state.grant_;
+    begin.candidate_action_ = state.action_;
+    begin.operation_id_ = state.operation_id_;
+    begin.expected_operation_revision_ = 0;
+    begin.absolute_deadline_unix_ms_ = state.deadline_unix_ms_;
+    begin.expected_owner_node_id_ = state.owner_;
+    begin.expected_owner_assignment_id_ = state.owner_assignment_;
+    begin.expected_membership_revision_ = 3;
+    begin.expected_group_term_ = 1;
+    begin.expected_authority_version_ = 1;
+    begin.expected_grant_revision_ = state.grant_revision_;
+    begin.expected_population_manifest_revision_ = 0;
+    begin.expected_population_manifest_digest_.fill(0);
+    begin.expected_partition_replication_epoch_ = 0;
+    begin.expected_config_epoch_ = 1;
+    ProposeAccepted(begin, &state.transition_revision_);
   }
 
   std::filesystem::path dir_;
@@ -987,6 +1165,180 @@ TEST_F(MetaCoordinatorServerTest, FailSafeSnapshotFailureGate) {
   auto recovery = ProposeSync(prune);
   ASSERT_TRUE(recovery.ok()) << recovery.status();
   EXPECT_EQ(recovery->verdict_, MetaAuditVerdict::kAccepted);
+}
+
+TEST_F(MetaCoordinatorServerTest,
+       FailSafeGateAllowsEffectivePreBeginControlledAbortOnlyOnce) {
+  StartServer();
+  MakeCoordinator();
+  WaitLeader();
+
+  FailSafeControlledFailoverState failover;
+  SeedControlledFailover(failover, /*begin_transition=*/false);
+  const auto before = machine_->StoresSnapshot();
+  const auto before_group = before.topology_.FindGroup("g1");
+  const auto before_grant = before.grant_.Serialize();
+  ASSERT_TRUE(before_group.has_value());
+  ASSERT_TRUE(before_grant.ok()) << before_grant.status();
+
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
+  MetaCoordinatorOptions options;
+  options.max_consecutive_snapshot_failures_ = 0;
+  MakeCoordinator(options);
+
+  keylane::meta::AbortControlledFailover abort;
+  abort.request_id_ = MakeRequestId(0xb1);
+  abort.operation_id_ = failover.operation_id_;
+  abort.expected_operation_revision_ = 0;
+  abort.group_id_ = "g1";
+  abort.reason_ = "no eligible candidate";
+  auto aborted = ProposeSync(abort);
+  ASSERT_TRUE(aborted.ok()) << aborted.status();
+  EXPECT_EQ(aborted->verdict_, MetaAuditVerdict::kAccepted);
+
+  const auto after = machine_->StoresSnapshot();
+  const auto operation = after.operation_.FindOperation(failover.operation_id_);
+  ASSERT_TRUE(operation.has_value());
+  EXPECT_EQ(operation->lifecycle_,
+            keylane::meta::MetaOperationLifecycle::kAborted);
+  EXPECT_EQ(operation->revision_, 1u);
+  EXPECT_EQ(operation->terminal_result_, abort.reason_);
+  EXPECT_FALSE(operation->data_loss_possible_);
+  EXPECT_EQ(after.topology_.FindGroup("g1"), before_group);
+  const auto after_grant = after.grant_.Serialize();
+  ASSERT_TRUE(after_grant.ok()) << after_grant.status();
+  EXPECT_EQ(*after_grant, *before_grant);
+
+  // A fresh request id cannot turn the idempotent post-state into another WAL
+  // recovery record: fail-safe recovery must make forward progress each time.
+  abort.request_id_ = MakeRequestId(0xb2);
+  const std::uint64_t before_retry = machine_->last_commit_index();
+  auto retried = ProposeSync(abort);
+  ASSERT_FALSE(retried.ok());
+  EXPECT_EQ(retried.status().code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_retry);
+}
+
+TEST_F(MetaCoordinatorServerTest,
+       FailSafeGateAllowsExactPostBeginControlledAbortButNotCutover) {
+  StartServer();
+  MakeCoordinator();
+  WaitLeader();
+
+  FailSafeControlledFailoverState failover;
+  SeedControlledFailover(failover, /*begin_transition=*/true);
+  const auto before = machine_->StoresSnapshot();
+  const auto before_group = before.topology_.FindGroup("g1");
+  const auto before_grant = before.grant_.Serialize();
+  ASSERT_TRUE(before_group.has_value());
+  ASSERT_TRUE(before_group->failover_transition_.has_value());
+  ASSERT_TRUE(before_grant.ok()) << before_grant.status();
+
+  {
+    std::lock_guard<std::mutex> lock(role_mu_);
+    forward_target_ = nullptr;
+  }
+  coordinator_.reset();
+  MetaCoordinatorOptions options;
+  options.max_consecutive_snapshot_failures_ = 0;
+  MakeCoordinator(options);
+
+  const keylane::meta::MetaFailoverTransitionRef transition{
+      failover.transition_id_, failover.transition_revision_};
+  keylane::meta::AbortControlledFailover stale_abort;
+  stale_abort.request_id_ = MakeRequestId(0xb3);
+  stale_abort.operation_id_ = failover.operation_id_;
+  stale_abort.expected_operation_revision_ = 0;
+  stale_abort.group_id_ = "g1";
+  stale_abort.expected_transition_ = keylane::meta::MetaFailoverTransitionRef{
+      failover.transition_id_, failover.transition_revision_ - 1};
+  stale_abort.reason_ = "stale transition must not be cleared";
+  const std::uint64_t before_stale_abort = machine_->last_commit_index();
+  auto stale_aborted = ProposeSync(stale_abort);
+  ASSERT_FALSE(stale_aborted.ok());
+  EXPECT_EQ(stale_aborted.status().code(),
+            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_stale_abort);
+
+  keylane::meta::DegradeControlledFailover degrade;
+  degrade.request_id_ = MakeRequestId(0xb4);
+  degrade.operation_id_ = failover.operation_id_;
+  degrade.expected_operation_revision_ = 0;
+  degrade.group_id_ = "g1";
+  degrade.expected_transition_ = transition;
+  degrade.expected_candidate_action_ = failover.action_;
+  degrade.reason_ = "source unavailable";
+  const std::uint64_t before_degrade = machine_->last_commit_index();
+  auto degraded = ProposeSync(degrade);
+  ASSERT_FALSE(degraded.ok());
+  EXPECT_EQ(degraded.status().code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_degrade);
+
+  keylane::meta::CommitControlledFailover commit;
+  commit.request_id_ = MakeRequestId(0xb5);
+  commit.operation_id_ = failover.operation_id_;
+  commit.expected_operation_revision_ = 0;
+  commit.group_id_ = "g1";
+  commit.expected_transition_ = transition;
+  commit.action_id_ = failover.action_.action_id_;
+  commit.authorized_revision_ = failover.transition_revision_;
+  commit.expected_candidate_ = failover.action_.candidate_;
+  commit.successor_grant_ = failover.grant_;
+  commit.expected_owner_node_id_ = failover.owner_;
+  commit.expected_owner_assignment_id_ = failover.owner_assignment_;
+  commit.expected_membership_revision_ = 3;
+  commit.expected_group_term_ = 1;
+  commit.expected_authority_version_ = 1;
+  commit.expected_grant_revision_ = failover.grant_revision_;
+  commit.expected_population_manifest_revision_ = 0;
+  commit.expected_population_manifest_digest_.fill(0);
+  commit.expected_partition_replication_epoch_ = 0;
+  commit.expected_config_epoch_ = 1;
+  commit.new_authority_version_ = 2;
+  commit.new_topology_epoch_ = 5;
+  commit.new_config_epoch_ = 2;
+  const std::uint64_t before_commit = machine_->last_commit_index();
+  auto committed = ProposeSync(commit);
+  ASSERT_FALSE(committed.ok());
+  EXPECT_EQ(committed.status().code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_commit);
+
+  keylane::meta::AbortControlledFailover abort;
+  abort.request_id_ = MakeRequestId(0xb6);
+  abort.operation_id_ = failover.operation_id_;
+  abort.expected_operation_revision_ = 0;
+  abort.group_id_ = "g1";
+  abort.expected_transition_ = transition;
+  abort.reason_ = "fail-safe cancelled controlled failover";
+  auto aborted = ProposeSync(abort);
+  ASSERT_TRUE(aborted.ok()) << aborted.status();
+  EXPECT_EQ(aborted->verdict_, MetaAuditVerdict::kAccepted);
+
+  const auto after = machine_->StoresSnapshot();
+  const auto operation = after.operation_.FindOperation(failover.operation_id_);
+  ASSERT_TRUE(operation.has_value());
+  EXPECT_EQ(operation->lifecycle_,
+            keylane::meta::MetaOperationLifecycle::kAborted);
+  EXPECT_EQ(operation->revision_, 1u);
+  EXPECT_EQ(operation->terminal_result_, abort.reason_);
+  EXPECT_FALSE(operation->data_loss_possible_);
+  auto expected_group = *before_group;
+  expected_group.failover_transition_.reset();
+  EXPECT_EQ(after.topology_.FindGroup("g1"), expected_group);
+  const auto after_grant = after.grant_.Serialize();
+  ASSERT_TRUE(after_grant.ok()) << after_grant.status();
+  EXPECT_EQ(*after_grant, *before_grant);
+
+  abort.request_id_ = MakeRequestId(0xb7);
+  const std::uint64_t before_retry = machine_->last_commit_index();
+  auto retried = ProposeSync(abort);
+  ASSERT_FALSE(retried.ok());
+  EXPECT_EQ(retried.status().code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(machine_->last_commit_index(), before_retry);
 }
 
 TEST_F(MetaCoordinatorServerTest,
@@ -1235,9 +1587,11 @@ TEST_F(MetaCoordinatorServerTest, ValidateHooksObserveAndRejectBeforeAppend) {
     const MetaObservationStore* obs_seen_ = nullptr;
   };
   std::vector<HookObservation> observations_log;
+  std::vector<std::int64_t> hook_times;
   coordinator_->AddValidateHook(
       [&](const MetaCommand& cmd, const keylane::meta::MetaCommittedView& view,
-          const MetaObservationStore& obs) -> absl::Status {
+          const MetaObservationStore& obs,
+          std::int64_t proposal_now_unix_ms) -> absl::Status {
         HookObservation record;
         if (const auto* create = std::get_if<CreateGroup>(&cmd)) {
           record.group_id_seen_ = create->group_id_;
@@ -1245,11 +1599,14 @@ TEST_F(MetaCoordinatorServerTest, ValidateHooksObserveAndRejectBeforeAppend) {
         record.node_count_seen_ = view.identity().NodeCount();
         record.obs_seen_ = &obs;
         observations_log.push_back(std::move(record));
+        hook_times.push_back(proposal_now_unix_ms);
         return absl::OkStatus();
       });
   coordinator_->AddValidateHook(
-      [](const MetaCommand& cmd, const keylane::meta::MetaCommittedView&,
-         const MetaObservationStore&) -> absl::Status {
+      [&](const MetaCommand& cmd, const keylane::meta::MetaCommittedView&,
+          const MetaObservationStore&,
+          std::int64_t proposal_now_unix_ms) -> absl::Status {
+        hook_times.push_back(proposal_now_unix_ms);
         if (const auto* create = std::get_if<CreateGroup>(&cmd);
             create != nullptr && create->group_id_ == "forbidden") {
           return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -1286,6 +1643,9 @@ TEST_F(MetaCoordinatorServerTest, ValidateHooksObserveAndRejectBeforeAppend) {
   EXPECT_EQ(observations_log[1].group_id_seen_, "g1");
   EXPECT_EQ(observations_log[1].node_count_seen_, 1u);
   EXPECT_EQ(observations_log[1].obs_seen_, &observations_);
+  ASSERT_EQ(hook_times.size(), 4u);
+  EXPECT_EQ(hook_times[0], hook_times[1]);
+  EXPECT_EQ(hook_times[2], hook_times[3]);
   EXPECT_TRUE(machine_->StoresSnapshot().topology_.GroupExists("g1"));
 }
 

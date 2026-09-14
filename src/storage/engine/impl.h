@@ -1140,7 +1140,7 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
                            .controller_id_ = device->controller_id_,
                            .io_queue_count_ = device->io_queue_count_};
   }
-  struct stat file_info {};
+  struct stat file_info{};
   if (::stat(path.c_str(), &file_info) != 0) {
     return absl::Status(
         absl::StatusCode::kInternal,
@@ -1252,6 +1252,24 @@ inline Task<absl::Status> PauseGroupedWriteForTest(Worker& worker,
 
 class StorageEngine::Impl {
  public:
+  struct ExpirationAuthorityGrant {
+    explicit ExpirationAuthorityGrant(
+        std::chrono::nanoseconds deadline_since_boot)
+        : deadline_since_boot_(deadline_since_boot) {}
+
+    std::atomic<bool> active_{true};
+    const std::chrono::nanoseconds deadline_since_boot_;
+  };
+
+#if KEYLANE_FAULTS_ENABLED
+  enum class ExpirationTestPoint : std::uint8_t {
+    kBeforeDurableAppend,
+    kBeforeDiskFullFallback,
+  };
+  using ExpirationTestHook =
+      std::function<std::optional<absl::Status>(ExpirationTestPoint point)>;
+#endif
+
   explicit Impl(StorageEngineOptions options) : options_(std::move(options)) {
     shutdown_checkpoint_enabled_.store(options_.shutdown_checkpoint_,
                                        std::memory_order_relaxed);
@@ -1261,6 +1279,12 @@ class StorageEngine::Impl {
         options_.replication_backlog_backpressure_, std::memory_order_relaxed);
     expiration_authority_.store(options_.expiration_authority_,
                                 std::memory_order_relaxed);
+    if (options_.expiration_authority_) {
+      active_expiration_authority_.store(
+          std::make_shared<ExpirationAuthorityGrant>(
+              std::chrono::nanoseconds::max()),
+          std::memory_order_relaxed);
+    }
     const TombRaiderMode mode =
         options_.expiration_authority_ && options_.tomb_raider_interval_ms_ != 0
             ? TombRaiderMode::kInterval
@@ -1588,6 +1612,9 @@ class StorageEngine::Impl {
       std::uint64_t mutation_sequence_ = 0;
       std::uint64_t expire_at_ms_ = 0;
       std::string key_;
+      // Revoking or replacing the grant invalidates this exact queued work;
+      // a later grant cannot authorize a candidate admitted by its predecessor.
+      std::shared_ptr<ExpirationAuthorityGrant> expiration_authority_;
     };
 
     Worker* worker_ = nullptr;
@@ -2180,9 +2207,21 @@ class StorageEngine::Impl {
     expiration_pause_count_.fetch_sub(1, std::memory_order_acq_rel);
   }
 
-  void SetExpirationAuthority(bool authority) noexcept {
-    expiration_authority_.store(authority, std::memory_order_release);
-  }
+  void SetExpirationAuthority(bool authority) noexcept;
+
+  absl::Status SetExpirationAuthorityUntil(
+      std::chrono::nanoseconds deadline_since_boot) noexcept;
+
+  std::shared_ptr<ExpirationAuthorityGrant> CurrentExpirationAuthority()
+      const noexcept;
+
+  static bool ExpirationAuthorityIsValid(
+      const ExpirationAuthorityGrant* authority) noexcept;
+
+  static absl::Status ValidateExpirationAuthority(const void* context);
+
+  static bool IsExpirationAuthorityCancellation(
+      const absl::Status& status) noexcept;
 
   std::uint32_t ExpirationPauseCount() const noexcept {
     return expiration_pause_count_.load(std::memory_order_acquire);
@@ -2569,7 +2608,8 @@ class StorageEngine::Impl {
       std::size_t logical_bytes);
   bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
   Task<absl::Status> PublishEphemeralReplicationCommand(
-      std::uint16_t partition_id, std::vector<std::string> args);
+      std::uint16_t partition_id, std::vector<std::string> args,
+      MutationPrecondition mutation_precondition);
   absl::StatusOr<PreparedReplicationCommandPublication>
   PrepareAdmittedReplicationCommand(
       const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
@@ -2700,6 +2740,8 @@ class StorageEngine::Impl {
   void LatchRuntimeFailure() noexcept { FenceRequestServingUntilRestart(); }
 
  private:
+  friend class ExpirationAuthorityTestPeer;
+
   struct DurableSystemState {
     std::uint64_t generation_ = 0;
     CatalogDurabilityToken catalog_token_{};
@@ -3485,8 +3527,7 @@ class StorageEngine::Impl {
       const ExplicitWriteRoot* explicit_root = nullptr,
       TxUndoLog* replacement_undo = nullptr,
       WorkerStore::PartitionStore* known_partition = nullptr,
-      const GroupRecordWrite* group = nullptr,
-      bool mark_watched = false,
+      const GroupRecordWrite* group = nullptr, bool mark_watched = false,
       const MutationPrecondition* mutation_precondition = nullptr);
 
   absl::StatusOr<RecordIndex::Entry*> ReplaceIndexLocation(
@@ -3531,6 +3572,11 @@ class StorageEngine::Impl {
   void CompleteShutdownFlush(const absl::Status& status);
 
   void AdvanceExpiryMap(WorkerStore& store);
+
+  // Drops every invalid exact-capability prefix before replication admission.
+  // These are cancelled attempts rather than delete work and consume none of
+  // the cycle's mutation budget.
+  std::size_t DiscardStaleExpirationCandidates(WorkerStore& store) noexcept;
 
   Task<absl::Status> ExpireCandidate(WorkerStore& store,
                                      WorkerStore::ExpireCandidate candidate);
@@ -3757,7 +3803,18 @@ class StorageEngine::Impl {
   std::optional<std::string> recovered_catalog_dump_;
   std::optional<absl::Status> system_state_failure_;
   std::atomic<bool> system_state_root_failure_injected_{false};
+  // Tomb Raider retains the pre-existing coarse authority switch. Finite
+  // capabilities govern active expiration only and deliberately do not alter
+  // Tomb Raider admission, scheduling, or an in-flight cleanup round.
   std::atomic<bool> expiration_authority_{true};
+  std::atomic<std::shared_ptr<ExpirationAuthorityGrant>>
+      active_expiration_authority_;
+#if KEYLANE_FAULTS_ENABLED
+  // Unit tests use this synchronous hook to revoke an exact grant after the
+  // early check without relying on scheduler timing. It is absent from
+  // production builds and never supplies production behavior.
+  ExpirationTestHook expiration_test_hook_;
+#endif
   std::atomic<std::uint32_t> expiration_pause_count_{0};
   // Independent process-wide knobs; no worker cursor or candidate queue is
   // mutated by CONFIG. A cycle keeps its sampled budgets across suspensions.

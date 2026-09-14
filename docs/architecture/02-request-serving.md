@@ -110,7 +110,8 @@ racing closure is either rejected or remains visible to the drain.
    population. When cluster mode is enabled, the cluster admission gate runs
    next and independently decides from the committed `cluster::ServingState`
    whether to serve locally, serve a stale replica read, redirect with MOVED,
-   or refuse with CROSSSLOT, CLUSTERDOWN, or LOADING. Cluster mode disables the
+   or refuse with CROSSSLOT, CLUSTERDOWN, LOADING, or a controlled-failover
+   `TRYAGAIN`. Cluster mode disables the
    standalone replica-MOVED shim: a population source transfers data but never
    supplies client-routing authority. The cluster gate also runs at `MULTI`
    queue time so a rejected command aborts the queued transaction. An admitted
@@ -312,6 +313,15 @@ rechecked on the destination worker. Encoded RESP2 and RESP3 message bodies are
 shared between recipients where possible; each session receives frames in its
 negotiated version.
 
+In cluster mode `PUBLISH` derives the channel's hash slot and is a runtime-only
+mutation even though it writes no durable key. It therefore participates in
+authority admission, in-flight draining, final publication recheck, and EXEC's
+mutation union. During a controlled failover it returns `TRYAGAIN Failover in
+progress`; a publication that already crossed admission either completes under
+the drained old-owner generation or fails its final authority check before
+replication publication and local delivery. Subscription delivery itself does
+not hold mutation authority.
+
 After the first subscription, the connection enters a two-coroutine serving
 mode. A dedicated reader continues parsing allowed commands and enqueues their
 replies, while the original serving coroutine is the only socket writer and
@@ -395,7 +405,7 @@ real server executable.
 | Incremental RESP parser and version-aware reusable reply builder | `include/keylane/resp.h`, `src/redis/resp.cpp` |
 | Command request/reply contracts, dispatch, replay, and gate interfaces | `include/keylane/command.h` |
 | Static command classification and key extraction | `include/keylane/command_table.h`, `src/redis/command_table.cpp` |
-| Admission, role checks, database/replication gates, transaction integration, routing, and replay | `src/redis/command.cpp` |
+| Admission, controlled-failover pause, role checks, database/replication gates, transaction integration, PUBLISH fencing, routing, and replay | `src/redis/command.cpp`, `src/redis/blocking_wait.cpp` |
 | Cluster admission gate, CLUSTER subcommands, and discovery replies | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_command.cpp` |
 | Final logical-mutation precondition and WATCH/publication seam | `include/keylane/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp` |
 | Type-family command handlers | `src/redis/string_command.cpp`, `src/redis/list_command.cpp`, `src/redis/hash_command.cpp`, `src/redis/set_command.cpp`, `src/redis/zset_command.cpp`, `src/redis/stream_command.cpp`, `src/redis/sort_command.cpp` |

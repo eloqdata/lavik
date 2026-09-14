@@ -34,9 +34,8 @@ constexpr auto kLeaseExpiryRecheckInterval = std::chrono::milliseconds(25);
 
 MonotonicDuration LeaseExpiryRecheckInterval(MonotonicDuration grant) {
   const MonotonicDuration quarter = std::max(grant / 4, MonotonicDuration{1});
-  return std::min(quarter,
-                  std::chrono::duration_cast<MonotonicDuration>(
-                      kLeaseExpiryRecheckInterval));
+  return std::min(quarter, std::chrono::duration_cast<MonotonicDuration>(
+                               kLeaseExpiryRecheckInterval));
 }
 
 AuthorityAnchor AnchorFor(const GroupView& group) {
@@ -63,6 +62,64 @@ bool LocalMember(const ServingState& state, const GroupView& group) {
   return std::find(group.replica_node_indices_.begin(),
                    group.replica_node_indices_.end(),
                    state.SelfNodeIndex()) != group.replica_node_indices_.end();
+}
+
+struct BootLocalPopulationAnchor {
+  std::string group_id_;
+  NodeId local_node_id_;
+  AssignmentId local_assignment_id_;
+  NodeId owner_node_id_;
+  AssignmentId owner_assignment_id_;
+  std::uint64_t group_term_ = 0;
+  std::uint64_t manifest_revision_ = 0;
+  Sha256Digest manifest_digest_{};
+  std::uint64_t partition_replication_epoch_ = 0;
+
+  friend bool operator==(const BootLocalPopulationAnchor&,
+                         const BootLocalPopulationAnchor&) = default;
+};
+
+std::optional<BootLocalPopulationAnchor> PopulationAnchorFor(
+    const ServingState& state, const GroupView& group,
+    std::span<const PreparedGroupControlIdentity> control_groups) {
+  const NodeDescriptor* self = state.Self();
+  const NodeDescriptor* owner = state.NodeAt(group.primary_node_index_);
+  if (self == nullptr || owner == nullptr || !LocalMember(state, group)) {
+    return std::nullopt;
+  }
+  const auto control_group =
+      std::find_if(control_groups.begin(), control_groups.end(),
+                   [&](const PreparedGroupControlIdentity& candidate) {
+                     return candidate.group_id_ == group.group_id_;
+                   });
+  if (control_group == control_groups.end()) return std::nullopt;
+  const auto local_member = std::find_if(
+      control_group->members_.begin(), control_group->members_.end(),
+      [&](const PreparedMemberAssignment& member) {
+        return member.node_id_ == self->node_id_;
+      });
+  const auto owner_member = std::find_if(
+      control_group->members_.begin(), control_group->members_.end(),
+      [&](const PreparedMemberAssignment& member) {
+        return member.node_id_ == owner->node_id_;
+      });
+  if (local_member == control_group->members_.end() ||
+      owner_member == control_group->members_.end() ||
+      owner_member->assignment_id_ != group.assignment_id_) {
+    return std::nullopt;
+  }
+  return BootLocalPopulationAnchor{
+      .group_id_ = group.group_id_,
+      .local_node_id_ = self->node_id_,
+      .local_assignment_id_ = local_member->assignment_id_,
+      .owner_node_id_ = owner->node_id_,
+      .owner_assignment_id_ = owner_member->assignment_id_,
+      .group_term_ = control_group->group_term_,
+      .manifest_revision_ = control_group->manifest_revision_,
+      .manifest_digest_ = control_group->manifest_digest_,
+      .partition_replication_epoch_ =
+          control_group->partition_replication_epoch_,
+  };
 }
 
 // Rebuilds an immutable state while preserving every semantic field and the
@@ -99,55 +156,62 @@ MonotonicTime SaturatingLeaseDeadline(const AuthorityMessage& message) {
              : message.sent_at_ + message.granted_duration_;
 }
 
+std::optional<EstablishedExportScope> ExportScopeFor(
+    const DesiredClusterControl& desired) {
+  if (!desired.owner_.has_value()) return std::nullopt;
+  EstablishedExportScope result{
+      .group_id_ = desired.identity_.group_id_,
+      .source_ = *desired.owner_,
+      .manifest_revision_ = desired.identity_.manifest_revision_,
+      .manifest_digest_ = desired.identity_.manifest_digest_,
+      .partition_replication_epoch_ =
+          desired.identity_.partition_replication_epoch_,
+      .downstream_members_ = {},
+  };
+  for (const PreparedMemberAssignment& member : desired.identity_.members_) {
+    if (member.node_id_ != desired.owner_->node_id_) {
+      result.downstream_members_.push_back(member);
+    }
+  }
+  std::sort(
+      result.downstream_members_.begin(), result.downstream_members_.end(),
+      [](const PreparedMemberAssignment& a, const PreparedMemberAssignment& b) {
+        if (a.node_id_ != b.node_id_) return a.node_id_ < b.node_id_;
+        return a.assignment_id_ < b.assignment_id_;
+      });
+  return result;
+}
+
 }  // namespace
+
+bool SameEstablishedExportScope(const DesiredClusterControl& left,
+                                const DesiredClusterControl& right) {
+  return ExportScopeFor(left) == ExportScopeFor(right);
+}
 
 NodeDirectiveCompletion NodeDirectiveCompletion::Rejected(absl::Status result) {
   if (result.ok()) {
     result = absl::InternalError(
         "a rejected directive completion cannot contain success");
   }
-  auto terminal =
-      std::make_shared<const TerminalResult>(std::move(result));
+  auto terminal = std::make_shared<const absl::Status>(std::move(result));
   return NodeDirectiveCompletion(
-      [terminal = std::move(terminal)]() { return *terminal; }, false,
-      ResultPollTag{});
+      [terminal = std::move(terminal)]() { return *terminal; }, false);
 }
 
 NodeDirectiveCompletion NodeDirectiveCompletion::StartedTerminal(
     absl::Status result) {
-  TerminalResult terminal_result = result.ok()
-                                       ? TerminalResult(std::string{})
-                                       : TerminalResult(std::move(result));
-  return StartedTerminalResult(std::move(terminal_result));
-}
-
-NodeDirectiveCompletion NodeDirectiveCompletion::StartedTerminalResult(
-    TerminalResult result) {
-  auto terminal =
-      std::make_shared<const TerminalResult>(std::move(result));
+  auto terminal = std::make_shared<const absl::Status>(std::move(result));
   return NodeDirectiveCompletion(
-      [terminal = std::move(terminal)]() { return *terminal; }, true,
-      ResultPollTag{});
-}
-
-NodeDirectiveCompletion NodeDirectiveCompletion::FromResultPoll(
-    ResultPoll poll) {
-  return NodeDirectiveCompletion(std::move(poll), true, ResultPollTag{});
-}
-
-std::optional<NodeDirectiveCompletion::TerminalResult>
-NodeDirectiveCompletion::terminal_result() const {
-  if (!result_poll_) {
-    return TerminalResult(absl::FailedPreconditionError(
-        "directive completion handle is empty"));
-  }
-  return result_poll_();
+      [terminal = std::move(terminal)]() { return *terminal; }, true);
 }
 
 std::optional<absl::Status> NodeDirectiveCompletion::result() const {
-  std::optional<TerminalResult> terminal = terminal_result();
-  if (!terminal.has_value()) return std::nullopt;
-  return terminal->ok() ? absl::OkStatus() : terminal->status();
+  if (!poll_) {
+    return absl::FailedPreconditionError(
+        "directive completion handle is empty");
+  }
+  return poll_();
 }
 
 celer::Task<absl::Status> NodeDirectiveCompletion::Await() const {
@@ -179,6 +243,26 @@ celer::Task<absl::Status>
 NodeControlActions::ClearSourceAuthorizationsForSessionReplacementAndWait(
     bool /*preserve_established_exports*/) {
   co_return RevokeSourceAuthorizations();
+}
+
+celer::Task<absl::Status> NodeControlActions::ReconcileClusterControl(
+    std::optional<DesiredClusterControl> /*desired*/) {
+  co_return absl::OkStatus();
+}
+
+celer::Task<absl::Status> NodeControlActions::ActivatePreparedPromotion(
+    PreparedFailoverActivation /*activation*/) {
+  co_return absl::FailedPreconditionError(
+      "the control adapter cannot activate a prepared promotion");
+}
+
+celer::Task<absl::Status> NodeControlActions::EnableExpirationAuthorityUntil(
+    MonotonicTime /*deadline*/) {
+  co_return absl::OkStatus();
+}
+
+celer::Task<absl::Status> NodeControlActions::RevokeExpirationAuthority() {
+  co_return absl::OkStatus();
 }
 
 celer::Task<absl::Status> NodeControlActions::ReconcilePopulation(
@@ -313,6 +397,200 @@ NodeControlInstaller::DesiredLocalPopulation() const {
   return desired;
 }
 
+absl::StatusOr<std::optional<DesiredClusterControl>>
+NodeControlInstaller::DesiredLocalClusterControl() const {
+  const std::shared_ptr<const ServingState> current = topology_.Current();
+  if (current == nullptr || current->Self() == nullptr) {
+    return std::optional<DesiredClusterControl>{};
+  }
+  std::optional<DesiredClusterControl> desired;
+  for (const DesiredClusterControl& control : desired_cluster_controls_) {
+    const bool local_member = std::any_of(
+        control.identity_.members_.begin(), control.identity_.members_.end(),
+        [&](const PreparedMemberAssignment& member) {
+          return member.node_id_ == current->Self()->node_id_;
+        });
+    if (!local_member) continue;
+    if (desired.has_value()) {
+      return absl::FailedPreconditionError(
+          "one Data process cannot reconcile more than one local Group");
+    }
+    desired = control;
+  }
+  return desired;
+}
+
+absl::StatusOr<std::optional<DesiredClusterControl>>
+NodeControlInstaller::ValidateLeaseGrantContext(const AuthorityMessage& message,
+                                                MonotonicTime now) {
+  if (!projection_basis_.has_value() ||
+      message.projection_ != *projection_basis_) {
+    return absl::FailedPreconditionError(
+        "lease grant does not name the exact installed Meta projection");
+  }
+  if (const absl::Status anchor =
+          ValidateAnchor(message.anchor_, /*require_local_owner=*/true);
+      !anchor.ok()) {
+    return anchor;
+  }
+  if (storage_failed_) {
+    return absl::FailedPreconditionError(
+        "storage failed during this boot; lease recovery requires restart");
+  }
+  if (RejectedByFence(message.anchor_)) {
+    return absl::FailedPreconditionError(
+        "lease grant does not advance the in-memory fence floor");
+  }
+  if (!message.session_.complete()) {
+    return absl::InvalidArgumentError(
+        "lease grant session identity is incomplete");
+  }
+  if (message.granted_duration_ <= MonotonicDuration::zero()) {
+    return absl::InvalidArgumentError("lease grant duration must be positive");
+  }
+  const MonotonicTime deadline = SaturatingLeaseDeadline(message);
+  if (deadline == MonotonicTime::max()) {
+    return absl::InvalidArgumentError(
+        "Meta lease grant must have a finite deadline");
+  }
+  if (deadline <= now) {
+    return absl::DeadlineExceededError(
+        "lease grant expired before it could be installed");
+  }
+  if (source_revocation_transitions_ != 0 ||
+      DrainPending(message.anchor_.group_id_)) {
+    return absl::UnavailableError(
+        "authority cleanup or retired assignment requests have not drained");
+  }
+
+  const std::shared_ptr<const ServingState> current = topology_.Current();
+  const GroupView* group = current == nullptr
+                               ? nullptr
+                               : current->FindGroup(message.anchor_.group_id_);
+  if (current == nullptr || current->Self() == nullptr || group == nullptr ||
+      group->primary_node_index_ != current->SelfNodeIndex() ||
+      !group->granted_ || !group->population_ready_ || !group->storage_ready_) {
+    return absl::FailedPreconditionError(
+        "lease grant targets an unready or fenced assignment");
+  }
+
+  auto desired = DesiredLocalClusterControl();
+  if (!desired.ok()) return desired.status();
+  // Static and older in-process test adapters have no desired-control layer.
+  // Meta-managed projections always populate it and therefore take the
+  // stronger committed owner/action validation below.
+  if (!desired->has_value()) return *desired;
+  const DesiredClusterControl& control = **desired;
+  // The committed policy duration is a ceiling. Meta shortens each grant to
+  // its remaining leadership-validity window; accepting that smaller value is
+  // safe, while accepting a larger value could outlive committed authority.
+  if (control.identity_.group_id_ != message.anchor_.group_id_ ||
+      control.identity_.group_term_ != message.anchor_.group_term_ ||
+      control.identity_.authority_version_ !=
+          message.anchor_.authority_version_ ||
+      control.identity_.grant_revision_ != message.anchor_.grant_revision_ ||
+      !control.owner_.has_value() ||
+      control.owner_->node_id_ != current->Self()->node_id_ ||
+      control.owner_->assignment_id_ != message.anchor_.assignment_id_ ||
+      !control.grant_active_ || control.grant_duration_ms_ == 0 ||
+      message.granted_duration_ >
+          std::chrono::duration_cast<MonotonicDuration>(
+              std::chrono::milliseconds(control.grant_duration_ms_))) {
+    const std::string desired_owner =
+        control.owner_.has_value() ? control.owner_->node_id_.ToHexString()
+                                   : "<none>";
+    const std::string desired_assignment =
+        control.owner_.has_value()
+            ? control.owner_->assignment_id_.ToHexString()
+            : "<none>";
+    return absl::FailedPreconditionError(absl::StrCat(
+        "lease grant disagrees with committed desired owner authority: ",
+        "message={group=", message.anchor_.group_id_,
+        ",assignment=", message.anchor_.assignment_id_.ToHexString(),
+        ",term=", message.anchor_.group_term_,
+        ",authority=", message.anchor_.authority_version_,
+        ",grant=", message.anchor_.grant_revision_, ",duration_ms=",
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            message.granted_duration_)
+            .count(),
+        "} desired={group=", control.identity_.group_id_,
+        ",owner=", desired_owner, ",owner_assignment=", desired_assignment,
+        ",term=", control.identity_.group_term_,
+        ",authority=", control.identity_.authority_version_,
+        ",grant=", control.identity_.grant_revision_,
+        ",grant_active=", control.grant_active_ ? "true" : "false",
+        ",duration_ms=", control.grant_duration_ms_,
+        "} local_node=", current->Self()->node_id_.ToHexString()));
+  }
+  if (control.activation_action_id_.has_value() &&
+      control.activation_action_id_->empty()) {
+    return absl::DataLossError(
+        "committed successor grant has an empty activation action id");
+  }
+  return *desired;
+}
+
+void NodeControlInstaller::RetireLeaseSchedule(std::string_view group_id) {
+  const auto schedule = lease_expiry_schedules_.find(std::string(group_id));
+  if (schedule == lease_expiry_schedules_.end()) return;
+  schedule->second->active_ = false;
+  if (schedule->second->timer_generation_ ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    std::terminate();
+  }
+  ++schedule->second->timer_generation_;
+  lease_expiry_schedules_.erase(schedule);
+}
+
+void NodeControlInstaller::RetireAllLeaseSchedules() {
+  for (auto& [unused_group_id, schedule] : lease_expiry_schedules_) {
+    (void)unused_group_id;
+    schedule->active_ = false;
+    if (schedule->timer_generation_ ==
+        std::numeric_limits<std::uint64_t>::max()) {
+      std::terminate();
+    }
+    ++schedule->timer_generation_;
+  }
+  lease_expiry_schedules_.clear();
+}
+
+celer::Task<absl::Status> NodeControlInstaller::FailClosedLeaseGrantTransition(
+    const AuthorityMessage& message, absl::Status failure) {
+  assert(!failure.ok());
+  ControlTransitionGuard transition_guard(*this);
+  InvalidateDirectiveAdmissions();
+  authority_.InvalidateSession(message.session_);
+  RetireLeaseSchedule(message.anchor_.group_id_);
+
+  std::vector<AuthorityAnchor> anchors;
+  const std::shared_ptr<const ServingState> current = topology_.Current();
+  if (current != nullptr) {
+    const GroupView* group = current->FindGroup(message.anchor_.group_id_);
+    if (group != nullptr &&
+        group->primary_node_index_ == current->SelfNodeIndex() &&
+        AnchorFor(*group) == message.anchor_) {
+      RememberDrain(current, message.anchor_);
+      anchors.push_back(message.anchor_);
+    }
+  }
+
+  absl::Status cleanup = co_await actions_.RevokeExpirationAuthority();
+  cleanup =
+      FirstFailure(std::move(cleanup), co_await WaitForDirectiveAdmissions());
+  cleanup = FirstFailure(
+      std::move(cleanup),
+      co_await actions_.ClearSourceAuthorizationsForSessionReplacementAndWait(
+          /*preserve_established_exports=*/false));
+  for (const AuthorityAnchor& anchor : anchors) {
+    cleanup =
+        FirstFailure(std::move(cleanup), actions_.DrainAssignment(anchor));
+  }
+  cleanup =
+      FirstFailure(std::move(cleanup), co_await WaitForPendingDrains(anchors));
+  co_return FirstFailure(std::move(failure), std::move(cleanup));
+}
+
 absl::Status NodeControlInstaller::ValidateDirectiveAnchor(
     const NodeDirective& directive) const {
   const std::shared_ptr<const ServingState> current = topology_.Current();
@@ -354,8 +632,7 @@ absl::Status NodeControlInstaller::ValidateDirectiveAnchor(
 
   const NodeId& local_node_id = current->Self()->node_id_;
   if (directive.kind_ == NodeDirective::Kind::kReplication ||
-      initializes_empty ||
-      directive.kind_ == NodeDirective::Kind::kPromotionPrepare) {
+      initializes_empty) {
     if (directive.target_node_id_ != local_node_id) {
       return absl::FailedPreconditionError(
           "population directive does not execute on its target");
@@ -380,15 +657,9 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
   }
   const bool initializes_empty =
       directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation;
-  const bool promotion =
-      directive.kind_ == NodeDirective::Kind::kPromotionPrepare;
   if (directive.force_) {
     return absl::InvalidArgumentError(
         "directive force is reserved in control protocol v1");
-  }
-  if (promotion != directive.promotion_prepare_.has_value()) {
-    return absl::InvalidArgumentError(
-        "directive kind does not match its decoded payload schema");
   }
   const bool initialization_payload_valid =
       directive.payload_.size() == 40 &&
@@ -398,31 +669,11 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
                            (value >= 'a' && value <= 'f');
                   });
   if (initializes_empty
-          ? (!initialization_payload_valid ||
-             !directive.preconditions_.empty())
+          ? (!initialization_payload_valid || !directive.preconditions_.empty())
           : (!directive.payload_.empty() ||
              !directive.preconditions_.empty())) {
     return absl::InvalidArgumentError(
         "directive kind does not match its opaque field schema");
-  }
-  if (promotion) {
-    const PromotionPrepareInput& input = *directive.promotion_prepare_;
-    const bool zero_exclusion =
-        std::all_of(input.old_authority_exclusion_hash_.begin(),
-                    input.old_authority_exclusion_hash_.end(),
-                    [](std::uint8_t byte) { return byte == 0; });
-    if (input.parent_history_id_.empty() ||
-        input.parent_history_id_ !=
-            directive.source_replication_history_id_.ToHexString() ||
-        input.required_applied_next_lsns_.empty() ||
-        std::any_of(input.required_applied_next_lsns_.begin(),
-                    input.required_applied_next_lsns_.end(),
-                    [](std::uint64_t cursor) { return cursor == 0; }) ||
-        input.excluded_group_term_ != directive.anchor_.group_term_ ||
-        zero_exclusion) {
-      return absl::InvalidArgumentError(
-          "promotion prepare payload or preconditions are incomplete");
-    }
   }
   if (const absl::Status projection = ValidateProjection(directive.projection_);
       !projection.ok()) {
@@ -459,8 +710,7 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
   // capability merely because a later directive names a different target.
   AuthorityAnchor local_anchor = directive.anchor_;
   if (directive.kind_ != NodeDirective::Kind::kReplication &&
-      !initializes_empty &&
-      directive.kind_ != NodeDirective::Kind::kPromotionPrepare) {
+      !initializes_empty) {
     local_anchor.assignment_id_ = directive.source_assignment_id_;
   }
   if (RejectedByFence(local_anchor)) {
@@ -485,20 +735,6 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
          current->GroupInFlightCount(directive.anchor_.group_id_) != 0)) {
       return absl::UnavailableError(
           "population target still has in-flight requests");
-    }
-  } else if (directive.kind_ == NodeDirective::Kind::kPromotionPrepare) {
-    // Grantless FDS deliberately omits the group from ServingState. The
-    // control identity checked above still binds candidate, term, manifest,
-    // and population epoch; ReplicationManager owns the boot-local ReadyToken
-    // check before durability work begins.
-    if (!directive.storage_mutating_ || group != nullptr) {
-      return absl::FailedPreconditionError(
-          "promotion prepare requires a fenced ownerless group");
-    }
-    if (DrainPending(directive.anchor_.group_id_) ||
-        current->GroupInFlightCount(directive.anchor_.group_id_) != 0) {
-      return absl::UnavailableError(
-          "promotion candidate still has in-flight requests");
     }
   } else if (directive.kind_ == NodeDirective::Kind::kAuthorizeSource &&
              DrainPending(directive.anchor_.group_id_)) {
@@ -783,6 +1019,39 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
       }
     }
   }
+  if (!prepared_state.desired_cluster_controls_.empty()) {
+    std::set<std::string> desired_group_ids;
+    for (const DesiredClusterControl& desired :
+         prepared_state.desired_cluster_controls_) {
+      if (desired.identity_.group_id_.empty() ||
+          !desired_group_ids.insert(desired.identity_.group_id_).second) {
+        return absl::InvalidArgumentError(
+            "prepared desired cluster control is empty or duplicated");
+      }
+      const auto identity = std::find_if(
+          prepared_state.control_groups_.begin(),
+          prepared_state.control_groups_.end(),
+          [&](const PreparedGroupControlIdentity& candidate) {
+            return candidate.group_id_ == desired.identity_.group_id_;
+          });
+      if (identity == prepared_state.control_groups_.end() ||
+          *identity != desired.identity_) {
+        return absl::InvalidArgumentError(
+            "prepared desired cluster control disagrees with group identity");
+      }
+      if (desired.owner_.has_value() &&
+          std::find(desired.identity_.members_.begin(),
+                    desired.identity_.members_.end(),
+                    *desired.owner_) == desired.identity_.members_.end()) {
+        return absl::InvalidArgumentError(
+            "prepared desired cluster control owner is not a member");
+      }
+      if (desired.grant_active_ && !desired.owner_.has_value()) {
+        return absl::InvalidArgumentError(
+            "prepared active cluster control has no owner");
+      }
+    }
+  }
   if (projection_basis_.has_value()) {
     if (projection_basis.source_meta_applied_index_ <
         projection_basis_->source_meta_applied_index_) {
@@ -825,6 +1094,36 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
 
   const std::shared_ptr<const ServingState> before = topology_.Current();
   if (before != nullptr) {
+    std::set<std::string> carried_ready_groups;
+    for (const GroupView& old_group : before->Groups()) {
+      if (!old_group.population_ready_) continue;
+      const GroupView* new_group = next->FindGroup(old_group.group_id_);
+      if (new_group == nullptr || new_group->population_ready_) continue;
+      const auto old_anchor =
+          PopulationAnchorFor(*before, old_group, std::span(control_groups_));
+      const auto new_anchor = PopulationAnchorFor(
+          *next, *new_group, std::span(prepared_state.control_groups_));
+      if (old_anchor.has_value() && old_anchor == new_anchor) {
+        carried_ready_groups.insert(old_group.group_id_);
+      }
+    }
+    if (!carried_ready_groups.empty()) {
+      // Meta deliberately omits boot-local ReadyToken state, so its local-
+      // member projection is always false. That normalization is not a new
+      // negative observation. Preserve an already verified bit only within
+      // this installer boot and only across the exact population identity;
+      // SetPopulationReadinessTransition remains the sole path that can clear
+      // it without changing a durable population anchor.
+      next = RebuildState(*next, [&](GroupView& group) {
+        if (carried_ready_groups.contains(group.group_id_)) {
+          group.population_ready_ = true;
+        }
+      });
+      if (next == nullptr) {
+        return absl::InternalError(
+            "cannot carry boot-local population readiness");
+      }
+    }
     if (next->topology_epoch() < before->topology_epoch()) {
       return absl::FailedPreconditionError("topology epoch regressed");
     }
@@ -838,20 +1137,19 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
       if (new_group == prepared_state.control_groups_.end()) continue;
       if (new_group->partition_replication_epoch_ <
           old_group.partition_replication_epoch_) {
-        return absl::FailedPreconditionError(absl::StrCat(
-            "partition replication epoch regressed for group '",
-            old_group.group_id_, "'"));
+        return absl::FailedPreconditionError(
+            absl::StrCat("partition replication epoch regressed for group '",
+                         old_group.group_id_, "'"));
       }
-      const bool shares_member_incarnation =
-          std::any_of(old_group.members_.begin(), old_group.members_.end(),
-                      [&](const PreparedMemberAssignment& old_member) {
-                        return std::any_of(
-                            new_group->members_.begin(),
-                            new_group->members_.end(),
-                            [&](const PreparedMemberAssignment& new_member) {
-                              return old_member == new_member;
-                            });
-                      });
+      const bool shares_member_incarnation = std::any_of(
+          old_group.members_.begin(), old_group.members_.end(),
+          [&](const PreparedMemberAssignment& old_member) {
+            return std::any_of(new_group->members_.begin(),
+                               new_group->members_.end(),
+                               [&](const PreparedMemberAssignment& new_member) {
+                                 return old_member == new_member;
+                               });
+          });
       if (shares_member_incarnation &&
           (new_group->config_epoch_ < old_group.config_epoch_ ||
            new_group->group_term_ < old_group.group_term_ ||
@@ -865,9 +1163,9 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
       if (shares_member_incarnation &&
           new_group->manifest_revision_ == old_group.manifest_revision_ &&
           new_group->manifest_digest_ != old_group.manifest_digest_) {
-        return absl::DataLossError(absl::StrCat(
-            "same manifest revision changed digest for group '",
-            old_group.group_id_, "'"));
+        return absl::DataLossError(
+            absl::StrCat("same manifest revision changed digest for group '",
+                         old_group.group_id_, "'"));
       }
     }
     for (const GroupView& old_group : before->Groups()) {
@@ -892,31 +1190,64 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
   bool revoke_sources = false;
   bool preserve_established_exports = false;
   if (before != nullptr) {
+    bool saw_desired_export_scope = false;
+    bool all_desired_export_scopes_preserved = true;
+    if (before->Self() != nullptr && !desired_cluster_controls_.empty() &&
+        !prepared_state.desired_cluster_controls_.empty()) {
+      for (const DesiredClusterControl& old_control :
+           desired_cluster_controls_) {
+        if (!old_control.owner_.has_value() ||
+            old_control.owner_->node_id_ != before->Self()->node_id_) {
+          continue;
+        }
+        saw_desired_export_scope = true;
+        const auto new_control =
+            std::find_if(prepared_state.desired_cluster_controls_.begin(),
+                         prepared_state.desired_cluster_controls_.end(),
+                         [&](const DesiredClusterControl& candidate) {
+                           return candidate.identity_.group_id_ ==
+                                  old_control.identity_.group_id_;
+                         });
+        all_desired_export_scopes_preserved =
+            all_desired_export_scopes_preserved &&
+            new_control != prepared_state.desired_cluster_controls_.end() &&
+            SameEstablishedExportScope(old_control, *new_control);
+      }
+    }
+    if (saw_desired_export_scope) {
+      preserve_established_exports = all_desired_export_scopes_preserved;
+    }
+
+    bool saw_legacy_export_scope = false;
+    bool all_legacy_export_scopes_preserved = true;
     for (const GroupView& old_group : before->Groups()) {
       if (!SameLocalAssignment(*before, old_group)) continue;
       const GroupView* new_group = next->FindGroup(old_group.group_id_);
       const PreparedGroupControlIdentity* old_control =
           FindControlGroup(old_group.group_id_);
-      const auto new_control = std::find_if(
-          prepared_state.control_groups_.begin(),
-          prepared_state.control_groups_.end(),
-          [&](const PreparedGroupControlIdentity& candidate) {
-            return candidate.group_id_ == old_group.group_id_;
-          });
-      // Desired-state projection intentionally excludes the boot-local
-      // ReadyToken. A live replacement therefore normalizes population_ready
-      // to false until the heartbeat reapplies the proof. An already-online
-      // native export may span only that normalization, and only when the
-      // complete durable group/member/population identity remains byte-exact.
-      preserve_established_exports =
-          old_group.primary_node_index_ == before->SelfNodeIndex() &&
-          new_group != nullptr &&
-          new_group->primary_node_index_ == next->SelfNodeIndex() &&
-          new_group->granted_ == old_group.granted_ &&
-          new_group->storage_ready_ == old_group.storage_ready_ &&
-          old_control != nullptr &&
-          new_control != prepared_state.control_groups_.end() &&
-          *old_control == *new_control;
+      const auto new_control =
+          std::find_if(prepared_state.control_groups_.begin(),
+                       prepared_state.control_groups_.end(),
+                       [&](const PreparedGroupControlIdentity& candidate) {
+                         return candidate.group_id_ == old_group.group_id_;
+                       });
+      // Desired-state projection excludes the boot-local ReadyToken. The
+      // installer above reattaches it only for an equal population anchor;
+      // legacy export retention is stricter and additionally requires the
+      // complete durable group/member identity to remain byte-exact.
+      if (!saw_desired_export_scope) {
+        saw_legacy_export_scope = true;
+        all_legacy_export_scopes_preserved =
+            all_legacy_export_scopes_preserved &&
+            old_group.primary_node_index_ == before->SelfNodeIndex() &&
+            new_group != nullptr &&
+            new_group->primary_node_index_ == next->SelfNodeIndex() &&
+            new_group->granted_ == old_group.granted_ &&
+            new_group->storage_ready_ == old_group.storage_ready_ &&
+            old_control != nullptr &&
+            new_control != prepared_state.control_groups_.end() &&
+            *old_control == *new_control;
+      }
       const bool authority_changed =
           new_group == nullptr ||
           new_group->primary_node_index_ != next->SelfNodeIndex() ||
@@ -924,30 +1255,42 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
           new_group->granted_ != old_group.granted_ ||
           new_group->population_ready_ != old_group.population_ready_ ||
           new_group->storage_ready_ != old_group.storage_ready_;
+      const bool pause_started =
+          new_group != nullptr &&
+          new_group->primary_node_index_ == next->SelfNodeIndex() &&
+          AnchorFor(*new_group) == AnchorFor(old_group) &&
+          !old_group.mutations_paused_ && new_group->mutations_paused_;
+      if (pause_started) {
+        effects->pause_drains_.push_back(AnchorFor(old_group));
+      }
       if (authority_changed) {
         retired.push_back(AnchorFor(old_group));
         revoke_sources = true;
       }
+    }
+    if (!saw_desired_export_scope && saw_legacy_export_scope) {
+      preserve_established_exports = all_legacy_export_scopes_preserved;
     }
   }
 
   // Invalidation precedes publication, closing the race in which a request
   // could observe old topology after the controller has accepted a revoking
   // assignment change.
-  if (projection_basis_.has_value() && projection_basis_->projection_hash_ !=
-                                           projection_basis.projection_hash_) {
-    // Every live lease names the node-specific semantic projection. A higher
-    // diagnostic applied index with the same projection is harmless; a hash
-    // change requires a fresh challenge even when authority counters happen
-    // to be unchanged.
-    authority_.InvalidateLeases();
-  }
+  // Projection changes gate future Meta messages through ValidateProjection,
+  // but they are not authority changes. In particular, publishing a
+  // Controlled Pause must keep the current finite lease alive so reads and
+  // heartbeats continue while mutations drain.
   authority_.InvalidateAnchorsChanged(before.get(), *next);
   topology_.Publish(next);
   projection_basis_ = projection_basis;
   object_hash_ = prepared_state.object_hash_;
   control_groups_ = std::move(prepared_state.control_groups_);
+  desired_cluster_controls_ =
+      std::move(prepared_state.desired_cluster_controls_);
   for (const AuthorityAnchor& anchor : retired) {
+    RememberDrain(before, anchor);
+  }
+  for (const AuthorityAnchor& anchor : effects->pause_drains_) {
     RememberDrain(before, anchor);
   }
   effects->revoke_sources_ = revoke_sources;
@@ -973,6 +1316,9 @@ celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
   absl::StatusOr<std::optional<PopulationReadiness>> desired_population(
       std::optional<PopulationReadiness>{});
   if (local.ok()) desired_population = DesiredLocalPopulation();
+  absl::StatusOr<std::optional<DesiredClusterControl>> desired_cluster_control(
+      std::optional<DesiredClusterControl>{});
+  if (local.ok()) desired_cluster_control = DesiredLocalClusterControl();
 
   // Every replacement clears new export admission. An exact live FDS may keep
   // an established ONLINE export quarantined until this replacement validates
@@ -983,11 +1329,40 @@ celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
   // but before an invalidated native session and partial storage root are
   // joined.
   absl::Status actions = co_await WaitForDirectiveAdmissions();
+  if (effects.revoke_sources_) {
+    RetireAllLeaseSchedules();
+    actions = FirstFailure(std::move(actions),
+                           co_await actions_.RevokeExpirationAuthority());
+  }
   actions = FirstFailure(
       std::move(actions),
-      co_await actions_
-          .ClearSourceAuthorizationsForSessionReplacementAndWait(
-              local.ok() && effects.preserve_established_exports_));
+      co_await actions_.ClearSourceAuthorizationsForSessionReplacementAndWait(
+          local.ok() && effects.preserve_established_exports_));
+  if (!effects.pause_drains_.empty()) {
+    actions =
+        FirstFailure(std::move(actions),
+                     co_await WaitForPendingDrains(effects.pause_drains_));
+  }
+  const std::optional<DesiredClusterControl> reconciled_cluster_control =
+      !storage_failed_ && desired_cluster_control.ok()
+          ? *desired_cluster_control
+          : std::optional<DesiredClusterControl>{};
+  std::optional<DesiredClusterControl> effective_cluster_control =
+      reconciled_cluster_control;
+  if (effective_cluster_control.has_value()) {
+    effective_cluster_control->population_transition_expected_ =
+        local_population_transition_expected;
+  }
+  if (!cluster_control_reconciled_ ||
+      effective_cluster_control != reconciled_cluster_control_) {
+    absl::Status reconciled =
+        co_await actions_.ReconcileClusterControl(effective_cluster_control);
+    if (reconciled.ok()) {
+      reconciled_cluster_control_ = std::move(effective_cluster_control);
+      cluster_control_reconciled_ = true;
+    }
+    actions = FirstFailure(std::move(actions), std::move(reconciled));
+  }
   // Even an internally inconsistent FDS must leave the local population
   // fail-closed and join the old session's work before the failed transfer
   // tears down its socket.
@@ -1013,6 +1388,10 @@ celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
   }
   absl::Status desired =
       desired_population.ok() ? absl::OkStatus() : desired_population.status();
+  if (!desired_cluster_control.ok()) {
+    desired =
+        FirstFailure(std::move(desired), desired_cluster_control.status());
+  }
   co_return FirstFailure(std::move(local),
                          FirstFailure(std::move(desired), std::move(actions)));
 }
@@ -1088,10 +1467,8 @@ celer::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
   }
   const MonotonicTime deadline = SaturatingLeaseDeadline(message);
   MonotonicTime now = LeaseClockNow();
-  if (deadline <= now) {
-    co_return absl::DeadlineExceededError(
-        "lease grant expired before it could be installed");
-  }
+  auto initial = ValidateLeaseGrantContext(message, now);
+  if (!initial.ok()) co_return initial.status();
 
   // A CLOCK_MONOTONIC-backed worker timer may still be asleep after host
   // suspend even though CLOCK_BOOTTIME says the lease is already due. Finish
@@ -1107,16 +1484,76 @@ celer::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
       co_return expired;
     }
     now = LeaseClockNow();
-    if (deadline <= now) {
-      co_return absl::DeadlineExceededError(
-          "lease grant expired during prior-authority cleanup");
+    initial = ValidateLeaseGrantContext(message, now);
+    if (!initial.ok()) co_return initial.status();
+  }
+
+  const std::optional<DesiredClusterControl> pinned_desired = *initial;
+  const std::uint64_t pinned_generation = directive_admission_generation_;
+  if (pinned_desired.has_value() &&
+      pinned_desired->activation_action_id_.has_value()) {
+    const std::shared_ptr<const ServingState> current = topology_.Current();
+    assert(current != nullptr && current->Self() != nullptr &&
+           pinned_desired->owner_.has_value());
+    PreparedFailoverActivation activation{
+        .action_id_ = *pinned_desired->activation_action_id_,
+        .group_id_ = message.anchor_.group_id_,
+        .candidate_node_id_ = current->Self()->node_id_,
+        .candidate_assignment_id_ = message.anchor_.assignment_id_,
+        .candidate_boot_id_ = message.session_.data_boot_id_,
+        .target_term_ = pinned_desired->identity_.group_term_,
+        .manifest_revision_ = pinned_desired->identity_.manifest_revision_,
+        .manifest_digest_ = pinned_desired->identity_.manifest_digest_,
+        .partition_replication_epoch_ =
+            pinned_desired->identity_.partition_replication_epoch_,
+    };
+    if (absl::Status activated =
+            co_await actions_.ActivatePreparedPromotion(std::move(activation));
+        !activated.ok()) {
+      co_return co_await FailClosedLeaseGrantTransition(message,
+                                                        std::move(activated));
+    }
+    now = LeaseClockNow();
+    auto rechecked = ValidateLeaseGrantContext(message, now);
+    if (!rechecked.ok()) {
+      co_return co_await FailClosedLeaseGrantTransition(message,
+                                                        rechecked.status());
+    }
+    if (directive_admission_generation_ != pinned_generation ||
+        *rechecked != pinned_desired) {
+      co_return co_await FailClosedLeaseGrantTransition(
+          message, absl::FailedPreconditionError(
+                       "promotion activation crossed a changed control "
+                       "projection or session"));
     }
   }
 
-  if (absl::Status installed = ApplyAuthority(message, LeaseClockNow());
-      !installed.ok()) {
-    co_return installed;
+  if (absl::Status expiration =
+          co_await actions_.EnableExpirationAuthorityUntil(deadline);
+      !expiration.ok()) {
+    co_return co_await FailClosedLeaseGrantTransition(message,
+                                                      std::move(expiration));
   }
+  now = LeaseClockNow();
+  auto final = ValidateLeaseGrantContext(message, now);
+  if (!final.ok()) {
+    co_return co_await FailClosedLeaseGrantTransition(message, final.status());
+  }
+  if (directive_admission_generation_ != pinned_generation ||
+      *final != pinned_desired) {
+    co_return co_await FailClosedLeaseGrantTransition(
+        message,
+        absl::FailedPreconditionError(
+            "expiration activation crossed a changed control projection or "
+            "session"));
+  }
+  if (absl::Status installed = authority_.RenewLease(
+          message.session_, message.anchor_, deadline, now);
+      !installed.ok()) {
+    co_return co_await FailClosedLeaseGrantTransition(message,
+                                                      std::move(installed));
+  }
+
   if (deadline != MonotonicTime::max()) {
     std::shared_ptr<LeaseExpirySchedule> schedule;
     bool spawn_timer = false;
@@ -1145,8 +1582,7 @@ celer::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
       schedule->anchor_ = message.anchor_;
       schedule->deadline_ = deadline;
       schedule->recheck_interval_ = recheck_interval;
-      if (deadline < old_deadline ||
-          recheck_interval < old_recheck_interval) {
+      if (deadline < old_deadline || recheck_interval < old_recheck_interval) {
         ++schedule->timer_generation_;
         spawn_timer = true;
       }
@@ -1197,14 +1633,15 @@ celer::Task<absl::Status> NodeControlInstaller::ExpireLeaseAt(
   co_return co_await FinishExpiredLeaseTransition(schedule, LeaseClockNow());
 }
 
-celer::Task<absl::Status>
-NodeControlInstaller::FinishExpiredLeaseTransition(
+celer::Task<absl::Status> NodeControlInstaller::FinishExpiredLeaseTransition(
     std::shared_ptr<LeaseExpirySchedule> schedule, MonotonicTime now) {
   if (!schedule->active_) co_return absl::OkStatus();
   if (now < schedule->deadline_) {
     co_return absl::FailedPreconditionError(
         "lease expiration transition ran before its exact deadline");
   }
+  ControlTransitionGuard transition_guard(*this);
+  InvalidateDirectiveAdmissions();
   const bool expired = authority_.ExpireLease(
       schedule->session_, schedule->anchor_, schedule->deadline_, now);
   schedule->active_ = false;
@@ -1214,7 +1651,8 @@ NodeControlInstaller::FinishExpiredLeaseTransition(
       installed->second == schedule) {
     lease_expiry_schedules_.erase(installed);
   }
-  if (!expired) co_return absl::OkStatus();
+  absl::Status result = co_await actions_.RevokeExpirationAuthority();
+  if (!expired) co_return result;
   const AuthorityAnchor anchor = schedule->anchor_;
   const std::shared_ptr<const ServingState> current = topology_.Current();
   if (current != nullptr) {
@@ -1223,9 +1661,8 @@ NodeControlInstaller::FinishExpiredLeaseTransition(
       RememberDrain(current, anchor);
     }
   }
-  ControlTransitionGuard transition_guard(*this);
-  InvalidateDirectiveAdmissions();
-  absl::Status result = co_await WaitForDirectiveAdmissions();
+  result =
+      FirstFailure(std::move(result), co_await WaitForDirectiveAdmissions());
   // Lease expiry removes mutation authority and prevents every new source
   // handshake, but an exact population export that is already ONLINE may stay
   // quarantined until renewal. A committed fence or population-identity change
@@ -1294,9 +1731,12 @@ celer::Task<absl::Status> NodeControlInstaller::ApplyFenceTransition(
   // guard through NodeControlActions::StartDirective; after they either reject
   // or finish registering, the final cancel below sees every target attempt.
   InvalidateDirectiveAdmissions();
+  RetireLeaseSchedule(message.anchor_.group_id_);
   auto transitioned = ApplyFenceLocal(message);
   if (!transitioned.ok()) co_return transitioned.status();
   absl::Status result = co_await WaitForDirectiveAdmissions();
+  result = FirstFailure(std::move(result),
+                        co_await actions_.RevokeExpirationAuthority());
   result = FirstFailure(std::move(result),
                         co_await actions_.RevokeSourceAuthorizationsAndWait());
   result = FirstFailure(std::move(result),
@@ -1403,6 +1843,7 @@ absl::Status NodeControlInstaller::InvalidateSessionNow(
   // already inside NodeControlActions when this generation advanced.
   InvalidateDirectiveAdmissions();
   authority_.InvalidateSession(session);
+  RetireAllLeaseSchedules();
   return absl::OkStatus();
 }
 
@@ -1411,7 +1852,10 @@ NodeControlInstaller::CancelPopulationForShutdownTransition() {
   ControlTransitionGuard transition_guard(*this);
   InvalidateDirectiveAdmissions();
   authority_.InvalidateAll();
+  RetireAllLeaseSchedules();
   absl::Status result = co_await WaitForDirectiveAdmissions();
+  result = FirstFailure(std::move(result),
+                        co_await actions_.RevokeExpirationAuthority());
   co_return FirstFailure(std::move(result),
                          co_await actions_.CancelPopulationForShutdown());
 }
@@ -1428,11 +1872,12 @@ celer::Task<absl::Status> NodeControlInstaller::LoseSessionTransition(
   const std::vector<AuthorityAnchor> anchors = RememberCurrentLocalDrains();
   ControlTransitionGuard transition_guard(*this);
   absl::Status result = co_await WaitForDirectiveAdmissions();
+  result = FirstFailure(std::move(result),
+                        co_await actions_.RevokeExpirationAuthority());
   result = FirstFailure(
       std::move(result),
-      co_await actions_
-          .ClearSourceAuthorizationsForSessionReplacementAndWait(
-              /*preserve_established_exports=*/true));
+      co_await actions_.ClearSourceAuthorizationsForSessionReplacementAndWait(
+          /*preserve_established_exports=*/true));
   result = FirstFailure(std::move(result),
                         co_await actions_.CancelInProgressPopulation());
   for (const AuthorityAnchor& anchor : anchors) {
@@ -1527,7 +1972,12 @@ NodeControlInstaller::SetPopulationReadinessTransitionImpl(
   const bool revoking = readiness_lost;
   if (revoking) {
     if (invalidate_directive_admissions) InvalidateDirectiveAdmissions();
-    if (!owner_drains.empty()) authority_.InvalidateLeases();
+    if (!owner_drains.empty()) {
+      authority_.InvalidateLeases();
+      for (const AuthorityAnchor& anchor : owner_drains) {
+        RetireLeaseSchedule(anchor.group_id_);
+      }
+    }
   }
   ControlTransitionGuard transition_guard(*this, revoking);
   topology_.Publish(next);
@@ -1543,6 +1993,10 @@ NodeControlInstaller::SetPopulationReadinessTransitionImpl(
     if (invalidate_directive_admissions) {
       result = FirstFailure(std::move(result),
                             co_await WaitForDirectiveAdmissions());
+    }
+    if (!owner_drains.empty()) {
+      result = FirstFailure(std::move(result),
+                            co_await actions_.RevokeExpirationAuthority());
     }
     result =
         FirstFailure(std::move(result),
@@ -1575,6 +2029,7 @@ absl::Status NodeControlInstaller::SetStorageReady(bool ready) {
   if (!ready) {
     InvalidateDirectiveAdmissions();
     authority_.InvalidateAll();
+    RetireAllLeaseSchedules();
     result = actions_.RevokeSourceAuthorizations();
   }
   const std::shared_ptr<const ServingState> changed =
@@ -1614,6 +2069,7 @@ NodeControlInstaller::LoseStorageReadinessTransition() {
   storage_ready_ = false;
   InvalidateDirectiveAdmissions();
   authority_.InvalidateAll();
+  RetireAllLeaseSchedules();
   const std::shared_ptr<const ServingState> current = topology_.Current();
   const std::vector<AuthorityAnchor> anchors = RememberCurrentLocalDrains();
 
@@ -1637,6 +2093,8 @@ NodeControlInstaller::LoseStorageReadinessTransition() {
   result = FirstFailure(
       std::move(result),
       co_await WaitForControlTransitionsBefore(transition_guard.id()));
+  result = FirstFailure(std::move(result),
+                        co_await actions_.RevokeExpirationAuthority());
   result = FirstFailure(std::move(result),
                         co_await actions_.RevokeSourceAuthorizationsAndWait());
   // Admissions that had already returned no longer own a token, but their

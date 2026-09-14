@@ -104,8 +104,6 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
   const bool zero_manifest = IsZero(directive.population_manifest_digest_);
   const bool initializes_empty =
       directive.kind_ == kMetaDirectiveInitializeEmptyPopulation;
-  const bool promotion_prepare =
-      directive.kind_ == kMetaDirectivePromotionPrepare;
   const bool rebuild = directive.kind_ == kMetaDirectiveRebuild ||
                        directive.kind_ == kMetaDirectiveAuthorizeSource;
   const bool absent_source =
@@ -133,16 +131,12 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
       : rebuild
           ? cluster::control::DecodeRebuildRequest(directive.payload_).ok() &&
                 directive.preconditions_.empty()
-      : promotion_prepare
-          ? !directive.payload_.empty() && !directive.preconditions_.empty() &&
-                directive.storage_mutating_
           : directive.payload_.empty() && directive.preconditions_.empty();
   return !IsZero(directive.directive_id_) && !IsZero(directive.attempt_id_) &&
          directive.recipient_node_id_.size() == kMetaNodeIdBytes &&
          directive.target_node_id_.size() == kMetaNodeIdBytes &&
          !IsZero(directive.target_boot_id_) &&
-         !IsZero(directive.assignment_id_) &&
-         source_valid &&
+         !IsZero(directive.assignment_id_) && source_valid &&
          !directive.group_id_.empty() &&
          directive.group_id_.size() <= kMaxMetaGroupIdBytes &&
          directive.group_term_ != 0 && directive.authority_version_ != 0 &&
@@ -153,9 +147,7 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
          directive.payload_.size() <= kMaxMetaPayloadBytes &&
          directive.preconditions_.size() <=
              kMaxMetaDirectivePreconditionsBytes &&
-         payload_valid &&
-         !directive.force_ &&
-         RecipientMatchesKind(directive);
+         payload_valid && !directive.force_ && RecipientMatchesKind(directive);
 }
 
 bool EvidenceSummaryWellFormed(const MetaEvidenceSummary& evidence) {
@@ -328,8 +320,7 @@ std::vector<MetaOperationRecord> MetaOperationStore::LiveOperations() const {
 
 bool MetaOperationStore::HasActiveKind(std::string_view kind) const {
   return std::any_of(live_.begin(), live_.end(), [&](const auto& entry) {
-    return entry.second.kind_ == kind &&
-           !IsTerminal(entry.second.lifecycle_);
+    return entry.second.kind_ == kind && !IsTerminal(entry.second.lifecycle_);
   });
 }
 

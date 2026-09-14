@@ -35,6 +35,11 @@ struct CandidatePlan {
   std::vector<std::string> maximal_node_ids_;
 };
 
+// Returns the exact lineage domain in which this candidate's per-flow LSNs
+// are comparable. Callers must only pass a validated typed observation.
+MetaFailoverCompatibilityDomain CandidateCompatibilityDomain(
+    const MetaCandidateProgressObs& candidate);
+
 // Selects a completed replica population at one fixed receive-time cut. The
 // selector depends only on committed group facts plus member-scoped semantic
 // anchors and non-extendable observation TTLs; unrelated heartbeat traffic
@@ -43,5 +48,22 @@ CandidatePlan CandidatePlanFor(std::string_view group_id,
                                const MetaCommittedFacts& facts,
                                const MetaObservationStore& observations,
                                std::int64_t now_unix_ms);
+
+// Controlled failover compares only replicas copied from the exact current
+// source incarnation. Other live domains are ignored, never compared by LSN.
+CandidatePlan CandidatePlanForDomain(
+    std::string_view group_id,
+    const MetaFailoverCompatibilityDomain& required_domain,
+    const MetaCommittedFacts& facts, const MetaObservationStore& observations,
+    std::int64_t now_unix_ms);
+
+// Uncontrolled failover considers compatibility domains newest source term
+// first and falls back one exact domain at a time. Domains at the same term
+// use canonical identity order, so every Meta leader makes the same choice.
+CandidatePlan UncontrolledCandidatePlanFor(
+    std::string_view group_id, const MetaCommittedFacts& facts,
+    const MetaObservationStore& observations, std::int64_t now_unix_ms,
+    const std::optional<MetaFailoverCandidateAction>& excluded_action =
+        std::nullopt);
 
 }  // namespace keylane::meta

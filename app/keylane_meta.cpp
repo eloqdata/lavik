@@ -73,6 +73,7 @@
 #include "libnuraft/srv_config.hxx"
 #pragma GCC diagnostic pop
 
+#include "keylane/cluster/meta_client.h"
 #include "keylane/meta/cluster_create.h"
 #include "keylane/meta/cluster_create_reconciler.h"
 #include "keylane/meta/coordinator.h"
@@ -80,6 +81,7 @@
 #include "keylane/meta/data_control_runtime_status.h"
 #include "keylane/meta/data_control_server.h"
 #include "keylane/meta/failover.h"
+#include "keylane/meta/failover_reconciler.h"
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/membership_reconciler.h"
 #include "keylane/meta/nuraft_asio_transport.h"
@@ -520,7 +522,7 @@ void ShutdownSignalHandler(int signal) {
 }
 
 absl::Status InstallShutdownSignalHandlers() {
-  struct sigaction action {};
+  struct sigaction action{};
   sigemptyset(&action.sa_mask);
   action.sa_handler = ShutdownSignalHandler;
   if (::sigaction(SIGINT, &action, nullptr) != 0 ||
@@ -872,6 +874,19 @@ int main(int argc, char** argv) {
       std::make_shared<keylane::meta::MetaMembershipReconciler>(
           foreign_executor, *proposal_executor, server, state_machine,
           state_mgr, membership_gate);
+  keylane::meta::MetaFailoverReconcilerOptions failover_options;
+  // A replacement leader starts with no volatile observations. Its absence
+  // warmup must span both the Raft election and Data's longest reconnect
+  // sleep; otherwise a healthy prepared candidate can be aborted just before
+  // it redials the new leader. Explicit disconnect/action-failure evidence
+  // remains immediate and does not wait for this pure-absence bound.
+  failover_options.observation_grace_ms_ = std::max<std::int64_t>(
+      observation_ttl_ms,
+      static_cast<std::int64_t>(options.election_ms_high_) +
+          keylane::cluster::MetaReconnectBackoff::MaximumWindow().count());
+  auto failover_reconciler =
+      std::make_shared<keylane::meta::MetaFailoverReconciler>(
+          foreign_executor, std::move(failover_options));
 
   if (exit_code == 0) {
     MetaDataControlServerOptions control_options;
@@ -1001,6 +1016,7 @@ int main(int argc, char** argv) {
     coordinator->RunAsLeader(membership_reconciler);
     coordinator->RunAsLeader(cluster_create_reconciler);
     coordinator->RunAsLeader(data_control);
+    coordinator->RunAsLeader(failover_reconciler);
   }
 
   if (exit_code == 0) {
@@ -1026,6 +1042,7 @@ int main(int argc, char** argv) {
   // Stop durable workflows before draining Admin waiters. Local accepted
   // proposals/API entries may finish, but no remote Data or membership result
   // is needed to join; the next leader reconstructs work from the journal.
+  failover_reconciler->Shutdown();
   cluster_create_reconciler->Shutdown();
   membership_reconciler->Shutdown();
   // Stop both ingress surfaces first, then synchronously revoke the

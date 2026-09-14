@@ -12,42 +12,22 @@
 namespace keylane::meta {
 namespace {
 
-struct CompatibilityDomain {
-  std::uint64_t manifest_revision_ = 0;
-  MetaHash256 manifest_digest_{};
-  std::uint64_t partition_epoch_ = 0;
-  std::string source_node_id_;
-  MetaAssignmentId source_assignment_id_{};
-  MetaBootIncarnation source_boot_incarnation_{};
-  MetaReplicationHistoryId source_history_id_{};
-  std::size_t flow_count_ = 0;
+bool DomainCanonicalLess(const MetaFailoverCompatibilityDomain& left,
+                         const MetaFailoverCompatibilityDomain& right) {
+  return std::tie(left.source_group_term_, left.source_node_id_,
+                  left.source_assignment_id_, left.source_boot_id_,
+                  left.source_history_id_, left.flow_count_) <
+         std::tie(right.source_group_term_, right.source_node_id_,
+                  right.source_assignment_id_, right.source_boot_id_,
+                  right.source_history_id_, right.flow_count_);
+}
 
-  friend bool operator<(const CompatibilityDomain& left,
-                        const CompatibilityDomain& right) {
-    return std::tie(left.manifest_revision_, left.manifest_digest_,
-                    left.partition_epoch_, left.source_node_id_,
-                    left.source_assignment_id_,
-                    left.source_boot_incarnation_, left.source_history_id_,
-                    left.flow_count_) <
-           std::tie(right.manifest_revision_, right.manifest_digest_,
-                    right.partition_epoch_, right.source_node_id_,
-                    right.source_assignment_id_,
-                    right.source_boot_incarnation_, right.source_history_id_,
-                    right.flow_count_);
+bool NewestDomainFirst(const MetaFailoverCompatibilityDomain& left,
+                       const MetaFailoverCompatibilityDomain& right) {
+  if (left.source_group_term_ != right.source_group_term_) {
+    return left.source_group_term_ > right.source_group_term_;
   }
-};
-
-CompatibilityDomain DomainOf(const MetaCandidateProgressObs& candidate) {
-  return {
-      .manifest_revision_ = candidate.population_manifest_revision_,
-      .manifest_digest_ = candidate.population_manifest_digest_,
-      .partition_epoch_ = candidate.partition_replication_epoch_,
-      .source_node_id_ = candidate.source_node_id_,
-      .source_assignment_id_ = candidate.source_assignment_id_,
-      .source_boot_incarnation_ = candidate.source_boot_incarnation_,
-      .source_history_id_ = candidate.source_replication_history_id_,
-      .flow_count_ = candidate.applied_next_lsns_.size(),
-  };
+  return DomainCanonicalLess(left, right);
 }
 
 bool StrictlyDominates(const MetaCandidateProgressObs& left,
@@ -63,36 +43,14 @@ bool StrictlyDominates(const MetaCandidateProgressObs& left,
   return greater;
 }
 
-}  // namespace
-
-CandidatePlan CandidatePlanFor(std::string_view group_id,
-                               const MetaCommittedFacts& facts,
-                               const MetaObservationStore& observations,
-                               std::int64_t now_unix_ms) {
+CandidatePlan SelectWithinDomain(
+    std::vector<MetaCandidateProgressObs> candidates) {
   CandidatePlan plan;
-  if (facts.CurrentGroupTerm(group_id) == 0) {
-    plan.disposition_ = CandidatePlanDisposition::kGroupUnknown;
-    return plan;
-  }
-
-  std::vector<MetaCandidateProgressObs> candidates =
-      observations.LiveCandidateProgressFor(group_id, facts, now_unix_ms);
   if (candidates.empty()) return plan;
   std::sort(candidates.begin(), candidates.end(),
             [](const auto& left, const auto& right) {
               return left.node_id_ < right.node_id_;
             });
-
-  const CompatibilityDomain domain = DomainOf(candidates.front());
-  if (std::any_of(candidates.begin() + 1, candidates.end(),
-                  [&](const auto& candidate) {
-                    const CompatibilityDomain other = DomainOf(candidate);
-                    return domain < other || other < domain;
-                  })) {
-    plan.disposition_ =
-        CandidatePlanDisposition::kMultipleCompatibilityDomains;
-    return plan;
-  }
 
   std::vector<std::size_t> maximal;
   for (std::size_t candidate = 0; candidate < candidates.size(); ++candidate) {
@@ -114,8 +72,8 @@ CandidatePlan CandidatePlanFor(std::string_view group_id,
   if (maximal.size() == 1) {
     plan.selection_basis_ = CandidateSelectionBasis::kUniqueGreatest;
   } else {
-    const bool equal = std::all_of(
-        maximal.begin() + 1, maximal.end(), [&](std::size_t index) {
+    const bool equal =
+        std::all_of(maximal.begin() + 1, maximal.end(), [&](std::size_t index) {
           return candidates[index].applied_next_lsns_ ==
                  candidates[maximal.front()].applied_next_lsns_;
         });
@@ -128,8 +86,8 @@ CandidatePlan CandidatePlanFor(std::string_view group_id,
           candidates[selected].applied_next_lsns_.size(), 0);
       for (std::size_t index : maximal) {
         for (std::size_t flow = 0; flow < envelope.size(); ++flow) {
-          envelope[flow] = std::max(
-              envelope[flow], candidates[index].applied_next_lsns_[flow]);
+          envelope[flow] = std::max(envelope[flow],
+                                    candidates[index].applied_next_lsns_[flow]);
         }
       }
       auto deficit = [&](std::size_t index) {
@@ -152,6 +110,113 @@ CandidatePlan CandidatePlanFor(std::string_view group_id,
   }
   plan.disposition_ = CandidatePlanDisposition::kSelected;
   plan.selected_ = std::move(candidates[selected]);
+  return plan;
+}
+
+}  // namespace
+
+MetaFailoverCompatibilityDomain CandidateCompatibilityDomain(
+    const MetaCandidateProgressObs& candidate) {
+  return {
+      .source_group_term_ = candidate.source_group_term_,
+      .source_node_id_ = candidate.source_node_id_,
+      .source_assignment_id_ = candidate.source_assignment_id_,
+      .source_boot_id_ = candidate.source_boot_incarnation_,
+      .source_history_id_ = candidate.source_replication_history_id_,
+      .flow_count_ =
+          static_cast<std::uint32_t>(candidate.applied_next_lsns_.size()),
+  };
+}
+
+CandidatePlan CandidatePlanFor(std::string_view group_id,
+                               const MetaCommittedFacts& facts,
+                               const MetaObservationStore& observations,
+                               std::int64_t now_unix_ms) {
+  CandidatePlan plan;
+  if (facts.CurrentGroupTerm(group_id) == 0) {
+    plan.disposition_ = CandidatePlanDisposition::kGroupUnknown;
+    return plan;
+  }
+
+  std::vector<MetaCandidateProgressObs> candidates =
+      observations.LiveCandidateProgressFor(group_id, facts, now_unix_ms);
+  if (candidates.empty()) return plan;
+
+  const MetaFailoverCompatibilityDomain domain =
+      CandidateCompatibilityDomain(candidates.front());
+  if (std::any_of(candidates.begin() + 1, candidates.end(),
+                  [&](const auto& candidate) {
+                    return CandidateCompatibilityDomain(candidate) != domain;
+                  })) {
+    plan.disposition_ = CandidatePlanDisposition::kMultipleCompatibilityDomains;
+    return plan;
+  }
+  return SelectWithinDomain(std::move(candidates));
+}
+
+CandidatePlan CandidatePlanForDomain(
+    std::string_view group_id,
+    const MetaFailoverCompatibilityDomain& required_domain,
+    const MetaCommittedFacts& facts, const MetaObservationStore& observations,
+    std::int64_t now_unix_ms) {
+  CandidatePlan plan;
+  if (facts.CurrentGroupTerm(group_id) == 0) {
+    plan.disposition_ = CandidatePlanDisposition::kGroupUnknown;
+    return plan;
+  }
+  std::vector<MetaCandidateProgressObs> candidates =
+      observations.LiveCandidateProgressFor(group_id, facts, now_unix_ms);
+  std::erase_if(candidates, [&](const auto& candidate) {
+    return CandidateCompatibilityDomain(candidate) != required_domain;
+  });
+  return SelectWithinDomain(std::move(candidates));
+}
+
+CandidatePlan UncontrolledCandidatePlanFor(
+    std::string_view group_id, const MetaCommittedFacts& facts,
+    const MetaObservationStore& observations, std::int64_t now_unix_ms,
+    const std::optional<MetaFailoverCandidateAction>& excluded_action) {
+  CandidatePlan plan;
+  if (facts.CurrentGroupTerm(group_id) == 0) {
+    plan.disposition_ = CandidatePlanDisposition::kGroupUnknown;
+    return plan;
+  }
+  std::vector<MetaCandidateProgressObs> candidates =
+      observations.LiveCandidateProgressFor(group_id, facts, now_unix_ms);
+  if (excluded_action.has_value()) {
+    std::erase_if(candidates, [&](const auto& candidate) {
+      return candidate.node_id_ == excluded_action->candidate_.node_id_ &&
+             candidate.assignment_id_ ==
+                 excluded_action->candidate_.assignment_id_ &&
+             candidate.boot_incarnation_ ==
+                 excluded_action->candidate_.boot_id_ &&
+             CandidateCompatibilityDomain(candidate) ==
+                 excluded_action->domain_;
+    });
+  }
+  if (candidates.empty()) return plan;
+
+  std::vector<MetaFailoverCompatibilityDomain> domains;
+  domains.reserve(candidates.size());
+  for (const auto& candidate : candidates) {
+    const auto domain = CandidateCompatibilityDomain(candidate);
+    if (std::ranges::find(domains, domain) == domains.end()) {
+      domains.push_back(domain);
+    }
+  }
+  std::sort(domains.begin(), domains.end(), NewestDomainFirst);
+
+  for (const auto& domain : domains) {
+    std::vector<MetaCandidateProgressObs> exact;
+    std::ranges::copy_if(
+        candidates, std::back_inserter(exact), [&](const auto& candidate) {
+          return CandidateCompatibilityDomain(candidate) == domain;
+        });
+    CandidatePlan selected = SelectWithinDomain(std::move(exact));
+    if (selected.disposition_ == CandidatePlanDisposition::kSelected) {
+      return selected;
+    }
+  }
   return plan;
 }
 

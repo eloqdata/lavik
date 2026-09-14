@@ -46,6 +46,7 @@
 #include <variant>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "keylane/meta/encoding.h"
 
@@ -68,6 +69,8 @@ using MetaOperationId = std::array<std::uint8_t, 16>;
 using MetaAssignmentId = std::array<std::uint8_t, 16>;
 using MetaAttemptId = std::array<std::uint8_t, 16>;
 using MetaDirectiveId = std::array<std::uint8_t, 16>;
+using MetaFailoverTransitionId = std::array<std::uint8_t, 16>;
+using MetaFailoverActionId = std::array<std::uint8_t, 16>;
 
 // Content-addressing hashes (policy content, intent, evidence): SHA-256.
 using MetaHash256 = std::array<std::uint8_t, 32>;
@@ -135,13 +138,10 @@ inline constexpr std::string_view kMetaDirectiveRevokeSources =
     "revoke-sources";
 inline constexpr std::string_view kMetaDirectiveInitializeEmptyPopulation =
     "initialize-empty-population";
-inline constexpr std::string_view kMetaDirectivePromotionPrepare =
-    "promotion-prepare";
 
 inline constexpr bool IsMetaPopulationDirective(std::string_view kind) {
   return kind == kMetaDirectiveRebuild ||
-         kind == kMetaDirectiveInitializeEmptyPopulation ||
-         kind == kMetaDirectivePromotionPrepare;
+         kind == kMetaDirectiveInitializeEmptyPopulation;
 }
 
 inline constexpr bool IsMetaSourceDirective(std::string_view kind) {
@@ -155,8 +155,8 @@ inline constexpr bool IsKnownMetaDirective(std::string_view kind) {
 
 // Directive kinds define their own bounded payload contracts.
 // initialize-empty-population carries the authenticated target history ID;
-// promotion-prepare owns versioned payload and precondition bodies. Every kind
-// rejects force=true at Meta transition apply and again at Data admission.
+// rebuild and authorize-source carry the source layout. Every kind rejects
+// force=true at Meta transition apply and again at Data admission.
 inline constexpr std::uint32_t kMaxMetaDirectivePreconditionsBytes =
     kMaxMetaPayloadBytes;
 // Receipt retention shares the operation evidence horizon: both are
@@ -222,6 +222,14 @@ enum class MetaCommandTag : std::uint16_t {
   kPrunePopulationManifest = 27,
   kCommitDirectiveResult = 28,
   kPruneTerminalReceipts = 29,
+  kBeginControlledFailover = 30,
+  kBeginUncontrolledFailover = 31,
+  kSetUncontrolledCandidate = 32,
+  kAuthorizeFailoverPrepare = 33,
+  kAbortControlledFailover = 34,
+  kDegradeControlledFailover = 35,
+  kCommitControlledFailover = 36,
+  kCommitUncontrolledFailover = 37,
 };
 
 // ---------------------------------------------------------------------------
@@ -393,6 +401,267 @@ struct MetaGrantSpec {
   bool operator==(const MetaGrantSpec&) const = default;
 };
 
+// Intrinsic grant validation shared by ordinary authority installation and
+// failover successor snapshots. Policy existence is an aggregate-store fact,
+// so version zero is valid here when that exact version is active.
+absl::Status ValidateMetaGrantSpec(const MetaGrantSpec& spec);
+
+// ---------------------------------------------------------------------------
+// Failover transition values and typed commands.
+//
+// These are durable pure values shared by the Raft command codec and the
+// topology snapshot codec. Runtime observations and progress frontiers are
+// intentionally absent: after a Meta leader change they must be reported
+// again by the current Data-node boots.
+// ---------------------------------------------------------------------------
+
+inline constexpr std::uint32_t kMaxMetaFailoverFlowCount = 1024;
+
+enum class MetaFailoverMode : std::uint8_t {
+  kControlled = 1,
+  kUncontrolled = 2,
+};
+
+enum class MetaFailoverLoss : std::uint8_t {
+  kNone = 1,
+  kUnknown = 2,
+};
+
+struct MetaFailoverCandidate {
+  std::string node_id_;
+  MetaAssignmentId assignment_id_{};
+  MetaBootIncarnation boot_id_{};
+  bool operator==(const MetaFailoverCandidate&) const = default;
+};
+
+// Exact source lineage within which per-flow progress is comparable. Group
+// replication anchors are deliberately not duplicated here: an active
+// transition locks those fields in the owning GroupState.
+struct MetaFailoverCompatibilityDomain {
+  std::uint64_t source_group_term_ = 0;
+  std::string source_node_id_;
+  MetaAssignmentId source_assignment_id_{};
+  MetaBootIncarnation source_boot_id_{};
+  MetaReplicationHistoryId source_history_id_{};
+  std::uint32_t flow_count_ = 0;
+  bool operator==(const MetaFailoverCompatibilityDomain&) const = default;
+};
+
+// A committed, action-scoped permission to run Promotion Preparation. The
+// revision is assigned from the AuthorizeFailoverPrepare Raft apply index.
+struct MetaFailoverAuthorization {
+  std::uint64_t authorized_revision_ = 0;
+  MetaFailoverLoss loss_if_cutover_ = MetaFailoverLoss::kUnknown;
+  bool operator==(const MetaFailoverAuthorization&) const = default;
+};
+
+struct MetaFailoverCandidateAction {
+  MetaFailoverActionId action_id_{};
+  MetaFailoverCandidate candidate_;
+  MetaFailoverCompatibilityDomain domain_;
+  std::optional<MetaFailoverAuthorization> authorization_;
+  bool operator==(const MetaFailoverCandidateAction&) const = default;
+};
+
+struct MetaControlledFailover {
+  MetaOperationId operation_id_{};
+  std::uint64_t absolute_deadline_unix_ms_ = 0;
+  bool operator==(const MetaControlledFailover&) const = default;
+};
+
+struct MetaFailoverTransition {
+  MetaFailoverTransitionId transition_id_{};
+  // The most recent transition-mutating Raft apply index.
+  std::uint64_t revision_ = 0;
+  MetaFailoverMode mode_ = MetaFailoverMode::kUncontrolled;
+  std::uint64_t target_term_ = 0;
+  MetaGrantSpec successor_grant_;
+  std::optional<MetaFailoverCandidateAction> candidate_action_;
+  std::optional<MetaControlledFailover> controlled_;
+  bool operator==(const MetaFailoverTransition&) const = default;
+};
+
+// CAS identity used by every mutation after Begin. Both fields are required;
+// a stable transition id alone cannot authorize a stale leader proposal.
+struct MetaFailoverTransitionRef {
+  MetaFailoverTransitionId transition_id_{};
+  std::uint64_t revision_ = 0;
+  bool operator==(const MetaFailoverTransitionRef&) const = default;
+};
+
+// Validates the intrinsic, cross-field invariants of a durable transition.
+// Cross-store facts such as membership and active policy existence remain the
+// aggregate apply/restore layer's responsibility.
+absl::Status ValidateMetaFailoverTransition(
+    const MetaFailoverTransition& transition);
+
+// Canonical field codec shared with MetaTopologyStore. The writer rejects an
+// invalid locally constructed value as a domain error; the reader classifies
+// corrupt or intrinsically invalid committed bytes as fail-stop.
+absl::Status WriteMetaFailoverTransition(
+    MetaWriter& writer, const MetaFailoverTransition& transition);
+absl::StatusOr<MetaFailoverTransition> ReadMetaFailoverTransition(
+    MetaReader& reader);
+
+// Both Begin commands carry the same exact Group/grant/config anchors. The
+// fields are intentionally command-only: once accepted, GroupState remains
+// the single source of truth and conflicting ordinary mutations are blocked
+// while the transition is active.
+struct BeginControlledFailover {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  std::string group_id_;
+  MetaFailoverTransitionId transition_id_{};
+  std::uint64_t target_term_ = 0;
+  MetaGrantSpec successor_grant_;
+  MetaFailoverCandidateAction candidate_action_;
+  MetaOperationId operation_id_{};
+  std::uint64_t expected_operation_revision_ = 0;
+  std::uint64_t absolute_deadline_unix_ms_ = 0;
+  std::string expected_owner_node_id_;
+  MetaAssignmentId expected_owner_assignment_id_{};
+  std::uint64_t expected_membership_revision_ = 0;
+  std::uint64_t expected_group_term_ = 0;
+  std::uint64_t expected_authority_version_ = 0;
+  std::uint64_t expected_grant_revision_ = 0;
+  std::uint64_t expected_population_manifest_revision_ = 0;
+  MetaHash256 expected_population_manifest_digest_{};
+  std::uint64_t expected_partition_replication_epoch_ = 0;
+  std::uint64_t expected_config_epoch_ = 0;
+  bool operator==(const BeginControlledFailover&) const = default;
+};
+
+struct BeginUncontrolledFailover {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  std::string group_id_;
+  MetaFailoverTransitionId transition_id_{};
+  std::uint64_t target_term_ = 0;
+  MetaGrantSpec successor_grant_;
+  std::optional<MetaFailoverCandidateAction> candidate_action_;
+  std::string expected_owner_node_id_;
+  MetaAssignmentId expected_owner_assignment_id_{};
+  std::uint64_t expected_membership_revision_ = 0;
+  std::uint64_t expected_group_term_ = 0;
+  std::uint64_t expected_authority_version_ = 0;
+  std::uint64_t expected_grant_revision_ = 0;
+  std::uint64_t expected_population_manifest_revision_ = 0;
+  MetaHash256 expected_population_manifest_digest_{};
+  std::uint64_t expected_partition_replication_epoch_ = 0;
+  std::uint64_t expected_config_epoch_ = 0;
+  bool operator==(const BeginUncontrolledFailover&) const = default;
+};
+
+struct SetUncontrolledCandidate {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  std::string group_id_;
+  MetaFailoverTransitionRef expected_transition_;
+  // null clears the current action. A replacement must be unauthorized; an
+  // authorization can only be installed by AuthorizeFailoverPrepare.
+  std::optional<MetaFailoverCandidateAction> candidate_action_;
+  bool operator==(const SetUncontrolledCandidate&) const = default;
+};
+
+struct AuthorizeFailoverPrepare {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  std::string group_id_;
+  MetaFailoverTransitionRef expected_transition_;
+  MetaFailoverActionId action_id_{};
+  MetaFailoverLoss loss_if_cutover_ = MetaFailoverLoss::kUnknown;
+  bool operator==(const AuthorizeFailoverPrepare&) const = default;
+};
+
+// A null expected_transition is the pre-Begin form. It terminates the exact
+// submitted Controlled Operation without touching any unrelated transition.
+struct AbortControlledFailover {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  MetaOperationId operation_id_{};
+  std::uint64_t expected_operation_revision_ = 0;
+  std::string group_id_;
+  std::optional<MetaFailoverTransitionRef> expected_transition_;
+  std::string reason_;  // nonempty, bounded by kMaxMetaAbortReasonBytes
+  bool operator==(const AbortControlledFailover&) const = default;
+};
+
+struct DegradeControlledFailover {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  MetaOperationId operation_id_{};
+  std::uint64_t expected_operation_revision_ = 0;
+  std::string group_id_;
+  MetaFailoverTransitionRef expected_transition_;
+  // Full current-action CAS, including its optional authorization. Retention
+  // is legal only for an action already authorized with loss=none.
+  std::optional<MetaFailoverCandidateAction> expected_candidate_action_;
+  bool retain_candidate_action_ = false;
+  std::string reason_;  // Controlled Operation terminal result
+  bool operator==(const DegradeControlledFailover&) const = default;
+};
+
+// Controlled and Uncontrolled Commit share the exact candidate/action and
+// cutover anchors below. The candidate is a CAS copy, not a second source of
+// truth: apply requires it to equal transition.candidate_action.candidate.
+struct CommitControlledFailover {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  MetaOperationId operation_id_{};
+  std::uint64_t expected_operation_revision_ = 0;
+  std::string group_id_;
+  MetaFailoverTransitionRef expected_transition_;
+  MetaFailoverActionId action_id_{};
+  std::uint64_t authorized_revision_ = 0;
+  MetaFailoverCandidate expected_candidate_;
+  // Exact copy of the transition's frozen successor grant. Commit clears the
+  // transition, so retaining this CAS in the command is necessary to verify
+  // the complete post-state on replay.
+  MetaGrantSpec successor_grant_;
+  std::string expected_owner_node_id_;
+  MetaAssignmentId expected_owner_assignment_id_{};
+  std::uint64_t expected_membership_revision_ = 0;
+  std::uint64_t expected_group_term_ = 0;
+  std::uint64_t expected_authority_version_ = 0;
+  std::uint64_t expected_grant_revision_ = 0;
+  std::uint64_t expected_population_manifest_revision_ = 0;
+  MetaHash256 expected_population_manifest_digest_{};
+  std::uint64_t expected_partition_replication_epoch_ = 0;
+  std::uint64_t expected_config_epoch_ = 0;
+  std::uint64_t new_authority_version_ = 0;
+  std::uint64_t new_topology_epoch_ = 0;
+  std::uint64_t new_config_epoch_ = 0;
+  bool operator==(const CommitControlledFailover&) const = default;
+};
+
+struct CommitUncontrolledFailover {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  std::string group_id_;
+  MetaFailoverTransitionRef expected_transition_;
+  MetaFailoverActionId action_id_{};
+  std::uint64_t authorized_revision_ = 0;
+  // Copied from the committed authorization so the audit summary remains a
+  // pure function of this terminal command after the transition is cleared.
+  MetaFailoverLoss loss_if_cutover_ = MetaFailoverLoss::kUnknown;
+  MetaFailoverCandidate expected_candidate_;
+  MetaGrantSpec successor_grant_;
+  std::string expected_owner_node_id_;
+  MetaAssignmentId expected_owner_assignment_id_{};
+  std::uint64_t expected_membership_revision_ = 0;
+  std::uint64_t expected_group_term_ = 0;
+  std::uint64_t expected_authority_version_ = 0;
+  std::uint64_t expected_grant_revision_ = 0;
+  std::uint64_t expected_population_manifest_revision_ = 0;
+  MetaHash256 expected_population_manifest_digest_{};
+  std::uint64_t expected_partition_replication_epoch_ = 0;
+  std::uint64_t expected_config_epoch_ = 0;
+  std::uint64_t new_authority_version_ = 0;
+  std::uint64_t new_topology_epoch_ = 0;
+  std::uint64_t new_config_epoch_ = 0;
+  bool operator==(const CommitUncontrolledFailover&) const = default;
+};
+
 struct BeginGroupTerm {
   MetaRequestId request_id_{};
   ActorContext actor_;
@@ -554,8 +823,8 @@ struct MetaDirectiveSpec {
   std::uint64_t partition_replication_epoch_ = 0;
   std::string kind_;
   // V1 uses payload for initialize-empty-population's authenticated target
-  // history and versioned bodies for rebuild/authorize-source source layouts
-  // and promotion-prepare. Only promotion-prepare carries preconditions.
+  // history and versioned bodies for rebuild/authorize-source source layouts.
+  // No executable V1 directive carries preconditions.
   std::string payload_;
   std::string preconditions_;
   // Active classification used to exclude concurrent mutations of the same
@@ -730,16 +999,18 @@ struct PrunePopulationManifest {
   bool operator==(const PrunePopulationManifest&) const = default;
 };
 
-using MetaCommand =
-    std::variant<RegisterNode, UpdateNode, RetireNode, CreateGroup,
-                 AssignNodeToGroup, RemoveNodeFromGroup, SetSlotMap,
-                 BeginGroupTerm, GrantAuthority, ActivateAuthority, RevokeGrant,
-                 FenceGroup, PutPolicy, RetirePolicy, SubmitOperation,
-                 TransitionOperationPhase, CompleteOperation, AbortOperation,
-                 ArchiveOperations, PruneAudit, PruneOperationArchive,
-                 BindMetaMember, RetireMetaMember, SetGroupReplicationState,
-                 SetAuditPolicy, PutPopulationManifest, PrunePopulationManifest,
-                 CommitDirectiveResult, PruneTerminalReceipts>;
+using MetaCommand = std::variant<
+    RegisterNode, UpdateNode, RetireNode, CreateGroup, AssignNodeToGroup,
+    RemoveNodeFromGroup, SetSlotMap, BeginGroupTerm, GrantAuthority,
+    ActivateAuthority, RevokeGrant, FenceGroup, PutPolicy, RetirePolicy,
+    SubmitOperation, TransitionOperationPhase, CompleteOperation,
+    AbortOperation, ArchiveOperations, PruneAudit, PruneOperationArchive,
+    BindMetaMember, RetireMetaMember, SetGroupReplicationState, SetAuditPolicy,
+    PutPopulationManifest, PrunePopulationManifest, CommitDirectiveResult,
+    PruneTerminalReceipts, BeginControlledFailover, BeginUncontrolledFailover,
+    SetUncontrolledCandidate, AuthorizeFailoverPrepare, AbortControlledFailover,
+    DegradeControlledFailover, CommitControlledFailover,
+    CommitUncontrolledFailover>;
 
 // Encode produces the full envelope. Fails (kDomainReject class) when a field
 // exceeds its cap or the total exceeds kMaxMetaCommandBytes; the encoding is

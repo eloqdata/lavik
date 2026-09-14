@@ -44,12 +44,58 @@ absl::Status Invalid(std::string message) {
 }
 
 bool IsCanonicalNumericHost(std::string_view host) {
-  const std::string encoded =
-      host.find(':') == std::string_view::npos
-          ? absl::StrCat(host, ":1")
-          : absl::StrCat("[", host, "]:1");
+  const std::string encoded = host.find(':') == std::string_view::npos
+                                  ? absl::StrCat(host, ":1")
+                                  : absl::StrCat("[", host, "]:1");
   const auto parsed = keylane::ParseNumericEndpoint(encoded);
   return parsed.has_value() && parsed->host_ == host;
+}
+
+PreparedFailoverTransition ToPreparedFailoverTransition(
+    const control::WireFailoverTransition& source) {
+  PreparedFailoverTransition prepared{
+      .transition_id_ = FailoverTransitionId::FromBytes(source.transition_id),
+      .revision_ = source.revision,
+      .mode_ = source.mode == control::WireFailoverMode::kControlled
+                   ? PreparedFailoverMode::kControlled
+                   : PreparedFailoverMode::kUncontrolled,
+      .target_term_ = source.target_term,
+      .candidate_action_ = std::nullopt,
+  };
+  if (!source.candidate_action.has_value()) return prepared;
+  const control::WireFailoverCandidateAction& action = *source.candidate_action;
+  prepared.candidate_action_ = PreparedFailoverAction{
+      .action_id_ = FailoverActionId::FromBytes(action.action_id),
+      .candidate_ =
+          {
+              .node_id_ = *NodeId::Parse(action.candidate.node_id),
+              .assignment_id_ =
+                  AssignmentId::FromBytes(action.candidate.assignment_id),
+              .boot_id_ = *NodeId::Parse(action.candidate.boot_id),
+          },
+      .domain_ =
+          {
+              .source_group_term_ = action.domain.source_group_term,
+              .source_node_id_ = *NodeId::Parse(action.domain.source_node_id),
+              .source_assignment_id_ =
+                  AssignmentId::FromBytes(action.domain.source_assignment_id),
+              .source_boot_id_ = *NodeId::Parse(action.domain.source_boot_id),
+              .source_history_id_ =
+                  *NodeId::Parse(action.domain.source_history_id),
+              .flow_count_ = action.domain.flow_count,
+          },
+      .authorization_ = std::nullopt,
+  };
+  if (action.authorization.has_value()) {
+    prepared.candidate_action_->authorization_ = PreparedFailoverAuthorization{
+        .authorized_revision_ = action.authorization->authorized_revision,
+        .loss_if_cutover_ = action.authorization->loss_if_cutover ==
+                                    control::WireFailoverLoss::kNone
+                                ? PreparedFailoverLoss::kNone
+                                : PreparedFailoverLoss::kUnknown,
+    };
+  }
+  return prepared;
 }
 
 }  // namespace
@@ -77,17 +123,22 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     return Invalid("projection hash does not match the semantic content");
   }
 
-  std::set<std::pair<std::uint64_t, Sha256Digest>> manifests;
+  std::map<std::pair<std::uint64_t, Sha256Digest>,
+           std::vector<PopulationManifestEntry>>
+      manifests;
   for (const control::WireManifestDocument& document : desired.manifests) {
     std::vector<PopulationManifestEntry> entries;
     entries.reserve(document.entries.size());
     for (const control::WireManifestEntry& entry : document.entries) {
       entries.push_back({entry.partition_id, entry.logical_epoch});
     }
-    auto manifest = PopulationManifest::Create(std::move(entries));
+    auto manifest = PopulationManifest::Create(entries);
     if (!manifest.ok() || document.revision == 0 ||
         manifest->id().bytes_ != document.digest ||
-        !manifests.emplace(document.revision, document.digest).second) {
+        !manifests
+             .emplace(std::make_pair(document.revision, document.digest),
+                      std::move(entries))
+             .second) {
       return Invalid("manifest document is non-canonical or duplicated");
     }
   }
@@ -234,6 +285,8 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
 
   std::vector<PreparedGroupControlIdentity> control_groups;
   control_groups.reserve(desired.groups.size());
+  std::vector<DesiredClusterControl> desired_cluster_controls;
+  desired_cluster_controls.reserve(desired.groups.size());
   for (const control::WireDesiredGroup& source : desired.groups) {
     PreparedGroupControlIdentity control_group{
         .group_id_ = source.group_id,
@@ -253,6 +306,48 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
           .assignment_id_ = AssignmentId::FromBytes(member.assignment_id),
       });
     }
+    DesiredClusterControl desired_control{
+        .identity_ = control_group,
+        .owner_ = std::nullopt,
+        .grant_active_ = source.grant_active,
+        .grant_duration_ms_ = source.grant_duration_ms,
+        .grant_policy_id_ = source.grant_policy_id,
+        .grant_policy_version_ = source.grant_policy_version,
+        .activation_action_id_ = std::nullopt,
+        .failover_transition_ = std::nullopt,
+        .owner_endpoint_ = std::nullopt,
+        .manifest_entries_ = {},
+        .steady_replication_enabled_ = source.steady_replication_enabled,
+        .population_transition_expected_ = false,
+    };
+    if (source.owner_node_id.has_value()) {
+      desired_control.owner_ = PreparedMemberAssignment{
+          .node_id_ = *NodeId::Parse(*source.owner_node_id),
+          .assignment_id_ =
+              AssignmentId::FromBytes(*source.owner_assignment_id),
+      };
+      const control::WireDataEndpoint& endpoint =
+          desired.nodes[node_indices.at(*source.owner_node_id)];
+      desired_control.owner_endpoint_ = PreparedReplicationEndpoint{
+          .node_id_ = desired_control.owner_->node_id_,
+          .host_ = endpoint.host,
+          .port_ = endpoint.port,
+          .tls_port_ = endpoint.tls_port,
+      };
+    }
+    if (source.manifest_revision != 0) {
+      desired_control.manifest_entries_ =
+          manifests.at({source.manifest_revision, source.manifest_digest});
+    }
+    if (source.activation_action_id.has_value()) {
+      desired_control.activation_action_id_ =
+          FailoverActionId::FromBytes(*source.activation_action_id);
+    }
+    if (source.failover_transition.has_value()) {
+      desired_control.failover_transition_ =
+          ToPreparedFailoverTransition(*source.failover_transition);
+    }
+    desired_cluster_controls.push_back(std::move(desired_control));
     control_groups.push_back(std::move(control_group));
 
     // Durable owner intent remains available for heartbeat role
@@ -275,6 +370,10 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     // this node can redirect their slots without claiming to serve them.
     group.population_ready_ = source.grant_active && !local_member;
     group.storage_ready_ = false;
+    group.mutations_paused_ = source.owner_node_id == local_node_id &&
+                              source.failover_transition.has_value() &&
+                              source.failover_transition->mode ==
+                                  control::WireFailoverMode::kControlled;
     group.group_term_ = source.group_term;
     group.authority_version_ = source.authority_version;
     group.grant_revision_ = source.grant_revision;
@@ -297,6 +396,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
       .serving_state_ = std::move(*state),
       .object_hash_ = desired.object_hash,
       .control_groups_ = std::move(control_groups),
+      .desired_cluster_controls_ = std::move(desired_cluster_controls),
   };
 }
 

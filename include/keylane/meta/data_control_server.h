@@ -169,6 +169,28 @@ bool TransferBoundaryNeedsProjectionValidation(
 void RecordEquivalentTransferBoundary(std::uint64_t applied_index,
                                       std::uint64_t* validated_index) noexcept;
 
+enum class MetaPublisherTransferDisposition : std::uint8_t {
+  kApplied,
+  kRetryBeforeApplyInSession,
+  kAwaitExactAppliedAndRetryInSession,
+};
+
+// Once a direct FDS frame or TransferEnd is visible, Data may already be
+// installing it and its exact FullStateApplied remains part of the stream.
+// Earlier supersession aborts an active object, if any. Both paths retry on the
+// authenticated session rather than converting projection churn into a node
+// disconnect.
+MetaPublisherTransferDisposition ClassifyPublisherSupersession(
+    bool receiver_can_apply) noexcept;
+
+// Extracts the exact candidate action, if any, from the already-applied FDS
+// that underlies a node heartbeat. The authenticated session supplies `boot`;
+// Data cannot claim this marker in the heartbeat wire payload.
+absl::StatusOr<std::optional<MetaObservedFailoverProjection>>
+FailoverProjectionForHeartbeat(
+    const cluster::control::FullDesiredState& installed,
+    std::string_view node_id, const MetaBootIncarnation& boot);
+
 }  // namespace detail
 
 struct MetaHeartbeatObservationResult {
@@ -187,6 +209,25 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
     const MetaReplicationHistoryId& session_history, std::uint64_t generation,
     const cluster::control::HeartbeatHealth& health,
     const cluster::control::HeartbeatRoleInformation& role_information,
+    std::int64_t now_unix_ms);
+MetaHeartbeatObservationResult IngestHeartbeatObservations(
+    MetaObservationStore& observations, const MetaCommittedFacts& facts,
+    std::string_view node_id, const MetaBootIncarnation& boot,
+    const MetaReplicationHistoryId& session_history, std::uint64_t generation,
+    const cluster::control::HeartbeatHealth& health,
+    const cluster::control::HeartbeatRoleInformation& role_information,
+    const std::optional<cluster::control::FailoverObservation>&
+        failover_observation,
+    std::int64_t now_unix_ms);
+MetaHeartbeatObservationResult IngestHeartbeatObservations(
+    MetaObservationStore& observations, const MetaCommittedFacts& facts,
+    std::string_view node_id, const MetaBootIncarnation& boot,
+    const MetaReplicationHistoryId& session_history, std::uint64_t generation,
+    const cluster::control::HeartbeatHealth& health,
+    const cluster::control::HeartbeatRoleInformation& role_information,
+    const std::optional<cluster::control::FailoverObservation>&
+        failover_observation,
+    std::optional<MetaObservedFailoverProjection> failover_projection,
     std::int64_t now_unix_ms);
 
 // Validates a typed operation-evidence envelope against the authenticated
@@ -403,9 +444,9 @@ enum class MetaReplacementDisposition : std::uint8_t {
 };
 
 // Compares the semantic projection being transferred with the newest atomic
-// committed projection. A superseded object must not reach its apply wait or
-// directive dispatch: abort it while active, or close the session if its End
-// frame has already committed at the receiver.
+// committed projection. A superseded object must not reach directive dispatch:
+// abort it while it is still incomplete, or consume its exact Applied before
+// publishing the latest replacement if Data could already install it.
 MetaReplacementDisposition EvaluateReplacementDisposition(
     const cluster::control::FullDesiredState& replacement,
     const cluster::control::FullDesiredState& latest);

@@ -75,10 +75,14 @@ struct Options {
   bool timeout_explicit_ = false;
   bool cluster_status_ = false;
   bool cluster_create_ = false;
+  bool failover_ = false;
   bool json_ = false;
   bool yes_ = false;
   bool allow_plaintext_admin_ = false;
   std::string manifest_path_;
+  std::string failover_group_;
+  int failover_timeout_ms_ = 120'000;
+  bool failover_timeout_explicit_ = false;
   std::vector<std::string> command_;
 };
 
@@ -99,6 +103,10 @@ void PrintUsage(const char* program) {
       "  %s cluster-create --manifest FILE (--socket PATH | --addr IP:PORT)\n"
       "     [--tls-ca FILE --tls-cert FILE --tls-key FILE]\n"
       "     [--allow-plaintext-admin] [--timeout-ms N] [--yes]\n"
+      "  %s failover GROUP (--socket PATH | --addr IP:PORT)\n"
+      "     [--tls-ca FILE --tls-cert FILE --tls-key FILE]\n"
+      "     [--allow-plaintext-admin] [--timeout-ms N]\n"
+      "     [--failover-timeout-ms N]\n"
       "\n"
       "Direct commands are sent to the specified Meta node as one line.\n"
       "status reports that node's state; cluster-status discovers the leader\n"
@@ -116,8 +124,11 @@ void PrintUsage(const char* program) {
       "--allow-plaintext-admin; --json applies only to cluster-status.\n"
       "cluster-create exits 0 after Genesis commit, 2 for an explicit\n"
       "Meta rejection, 3 for a possibly committed interruption/timeout, and\n"
-      "1 for local manifest, confirmation, or pre-mutation transport errors.\n",
-      program, program, program, program);
+      "1 for local manifest, confirmation, or pre-mutation transport errors.\n"
+      "failover exits 0 after request commit, 2 for an explicit rejection,\n"
+      "3 for an uncertain proposal outcome, and 1 for local/transport "
+      "errors.\n",
+      program, program, program, program, program);
 }
 
 bool ParseInt(std::string_view text, int min, int max, int* result) {
@@ -155,18 +166,29 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
     }
     if (!argument.starts_with("--")) {
       if (!options.cluster_status_ && !options.cluster_create_ &&
-          argument == "cluster-status") {
+          !options.failover_ && argument == "cluster-status") {
         options.cluster_status_ = true;
         continue;
       }
       if (!options.cluster_status_ && !options.cluster_create_ &&
-          argument == "cluster-create") {
+          !options.failover_ && argument == "cluster-create") {
         options.cluster_create_ = true;
         continue;
       }
-      if (options.cluster_status_ || options.cluster_create_) {
-        Fail(std::string(options.cluster_status_ ? "cluster-status"
-                                                 : "cluster-create") +
+      if (!options.cluster_status_ && !options.cluster_create_ &&
+          !options.failover_ && argument == "failover") {
+        options.failover_ = true;
+        continue;
+      }
+      if (options.failover_ && options.failover_group_.empty()) {
+        options.failover_group_ = std::string(argument);
+        continue;
+      }
+      if (options.cluster_status_ || options.cluster_create_ ||
+          options.failover_) {
+        Fail(std::string(options.cluster_status_   ? "cluster-status"
+                         : options.cluster_create_ ? "cluster-create"
+                                                   : "failover") +
              " does not take positional arguments");
       }
       // Direct command operands belong to the server, even when they look
@@ -223,14 +245,26 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
       options.timeout_explicit_ = true;
       continue;
     }
+    if (argument == "--failover-timeout-ms" ||
+        argument.starts_with("--failover-timeout-ms=")) {
+      const std::string_view value =
+          OptionValue(argc, argv, &index, argument, "--failover-timeout-ms");
+      if (!ParseInt(value, 1, 86'400'000, &options.failover_timeout_ms_)) {
+        Fail(
+            "--failover-timeout-ms must be an integer from 1 through 86400000");
+      }
+      options.failover_timeout_explicit_ = true;
+      continue;
+    }
     Fail("unknown option: " + std::string(argument));
   }
 
   for (; index < argc; ++index) options.command_.emplace_back(argv[index]);
-  if (options.cluster_status_ || options.cluster_create_) {
+  if (options.cluster_status_ || options.cluster_create_ || options.failover_) {
     if (!options.command_.empty()) {
-      Fail(std::string(options.cluster_status_ ? "cluster-status"
-                                               : "cluster-create") +
+      Fail(std::string(options.cluster_status_   ? "cluster-status"
+                       : options.cluster_create_ ? "cluster-create"
+                                                 : "failover") +
            " does not take positional arguments");
     }
     if (options.cluster_create_ && options.manifest_path_.empty()) {
@@ -239,13 +273,25 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
     if (options.cluster_status_ && !options.manifest_path_.empty()) {
       Fail("--manifest applies only to cluster-create");
     }
-    if (options.cluster_status_ && options.yes_) {
+    if (options.failover_ && options.failover_group_.empty()) {
+      Fail("failover requires GROUP");
+    }
+    if (!options.failover_ && options.failover_timeout_explicit_) {
+      Fail("--failover-timeout-ms applies only to failover");
+    }
+    if (options.failover_ && !options.manifest_path_.empty()) {
+      Fail("--manifest applies only to cluster-create");
+    }
+    if ((options.cluster_status_ || options.failover_) && options.yes_) {
       Fail("--yes applies only to cluster-create");
+    }
+    if ((options.cluster_create_ || options.failover_) && options.json_) {
+      Fail("--json applies only to cluster-status");
     }
   } else {
     if (options.command_.empty()) Fail("a Meta command is required");
     if (options.json_ || options.allow_plaintext_admin_ || options.yes_ ||
-        !options.manifest_path_.empty()) {
+        !options.manifest_path_.empty() || options.failover_timeout_explicit_) {
       Fail("cluster-only options cannot be used with a direct command");
     }
   }
@@ -257,14 +303,15 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
   const bool tls_all = !options.tls_ca_.empty() && !options.tls_cert_.empty() &&
                        !options.tls_key_.empty();
   if ((options.cluster_status_ || options.cluster_create_ ||
-       !options.address_.empty()) &&
+       options.failover_ || !options.address_.empty()) &&
       tls_any != tls_all) {
     Fail("--tls-ca, --tls-cert, and --tls-key must be given together");
   }
-  if (options.cluster_status_ || options.cluster_create_) {
+  if (options.cluster_status_ || options.cluster_create_ || options.failover_) {
     if (!options.tls_server_name_.empty()) {
       Fail(
-          "cluster-status/cluster-create does not accept --tls-server-name; "
+          "cluster-status/cluster-create/failover does not accept "
+          "--tls-server-name; "
           "discovered Meta endpoints are verified by IP SAN");
     }
     // With a Unix seed, TLS credentials authorize any discovered remote
@@ -278,9 +325,6 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
       if (!tls_all && !options.allow_plaintext_admin_) {
         Fail("plaintext TCP admin requires --allow-plaintext-admin");
       }
-    }
-    if (options.cluster_create_ && options.json_) {
-      Fail("--json applies only to cluster-status");
     }
     if (options.cluster_create_ && !options.timeout_explicit_) {
       options.timeout_ms_ = 120000;
@@ -493,9 +537,46 @@ int RunClusterCreate(const Options& options) {
   return 0;
 }
 
+int RunFailover(const Options& options) {
+  keylane::meta::ClusterStatusOptions cluster_options;
+  cluster_options.tls_.ca_file_ = options.tls_ca_;
+  cluster_options.tls_.certificate_file_ = options.tls_cert_;
+  cluster_options.tls_.private_key_file_ = options.tls_key_;
+  cluster_options.allow_plaintext_admin_ = options.allow_plaintext_admin_;
+  cluster_options.deadline_ = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(options.timeout_ms_);
+  keylane::meta::FailoverRequestOptions request{
+      .group_id_ = options.failover_group_,
+      .transition_timeout_ =
+          std::chrono::milliseconds(options.failover_timeout_ms_),
+      .operation_id_ = std::nullopt,
+      .absolute_deadline_unix_ms_ = std::nullopt,
+  };
+  keylane::meta::ClusterOperator cluster;
+  auto outcome =
+      cluster.Failover(AdminTarget(options), request, cluster_options);
+  if (!outcome.ok()) {
+    std::cerr << "keylane-ctl: failover failed: " << outcome.status().message()
+              << '\n';
+    if (outcome.status().code() == absl::StatusCode::kInvalidArgument ||
+        outcome.status().code() == absl::StatusCode::kFailedPrecondition) {
+      return 2;
+    }
+    if (outcome.status().code() == absl::StatusCode::kAborted) return 3;
+    return 1;
+  }
+  std::cout << "Controlled failover accepted: commit="
+            << outcome->submission_commit_index_
+            << " operation=" << outcome->operation_id_ << '\n'
+            << "Use getop " << outcome->operation_id_
+            << " to follow the terminal result.\n";
+  return 0;
+}
+
 int Run(const Options& options) {
   if (options.cluster_status_) return RunClusterStatus(options);
   if (options.cluster_create_) return RunClusterCreate(options);
+  if (options.failover_) return RunFailover(options);
   const auto target = AdminTarget(options);
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(options.timeout_ms_);

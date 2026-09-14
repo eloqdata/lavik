@@ -16,6 +16,7 @@
 #include "absl/status/statusor.h"
 #include "keylane/meta/admin_client.h"
 #include "keylane/meta/cluster_create.h"
+#include "keylane/meta/failover_admin.h"
 
 namespace keylane::meta {
 
@@ -114,8 +115,7 @@ enum class ClusterStateWireV1 : std::uint8_t {
 
 struct ClusterStatusWireV1 {
   ClusterCaptureWireV1 capture_;
-  ClusterStateWireV1 cluster_state_ =
-      ClusterStateWireV1::kUninitialized;
+  ClusterStateWireV1 cluster_state_ = ClusterStateWireV1::kUninitialized;
   std::uint64_t lifecycle_revision_ = 0;
   std::optional<std::string> root_operation_id_;
   std::optional<std::uint64_t> genesis_commit_index_;
@@ -185,6 +185,13 @@ class ClusterOperator {
   // carries the caller-generated root operation id for status correlation.
   absl::StatusOr<ClusterCreateOutcome> Create(
       const MetaAdminTarget& seed, const ClusterCreateManifestV1& manifest,
+      const ClusterStatusOptions& options) const;
+
+  // Submits one idempotent controlled-failover request to the discovered
+  // leader and returns after that request is committed. Execution and
+  // terminalization remain owned by the leader-scoped reconciler.
+  absl::StatusOr<FailoverOutcome> Failover(
+      const MetaAdminTarget& seed, const FailoverRequestOptions& request,
       const ClusterStatusOptions& options) const;
 
  private:

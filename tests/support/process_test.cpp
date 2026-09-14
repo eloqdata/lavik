@@ -27,7 +27,8 @@ class ScopedEnvironment {
  public:
   ScopedEnvironment(std::string name, std::string value)
       : name_(std::move(name)) {
-    if (const char* previous = std::getenv(name_.c_str()); previous != nullptr) {
+    if (const char* previous = std::getenv(name_.c_str());
+        previous != nullptr) {
       previous_ = previous;
     }
     if (::setenv(name_.c_str(), value.c_str(), 1) != 0) {

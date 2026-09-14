@@ -356,6 +356,9 @@ struct alignas(std::max_align_t) CommandRequest {
   std::uint8_t cluster_slot_sample_count_ : 2 = 0;
   std::uint8_t write_admission_role_epoch_valid_ : 1 = false;
   std::uint8_t serving_generation_valid_ : 1 = false;
+  // Source-side EXEC captures PUBLISH for ordered replication and delays its
+  // local delivery until that publication commits.
+  std::uint8_t defer_pubsub_delivery_ : 1 = false;
   // Captured when a client write chooses its source-publication path. A DB
   // gate that reopens under a different role must reject the stale request
   // before mutation, including when writable replicas are enabled. Its valid
