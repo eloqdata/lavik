@@ -11,7 +11,9 @@
 //
 // Freshness and lifecycle:
 //   - Every observation arrives on a trusted {node_id, boot_incarnation,
-//     session_generation} triple. boot_incarnation is opaque and is NEVER
+//     session_generation} triple. ClientHello additionally authenticates the
+//     current replication history for failover source-lineage decisions.
+//     boot_incarnation is opaque and is NEVER
 //     ordered by value; ordering comes from session_generation, a
 //     controller-local monotonic sequence issued by the authenticated
 //     session layer; tests inject it directly through the ctl adapter.
@@ -53,6 +55,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -68,6 +71,46 @@ struct MetaObservationIdentity {
   std::string node_id_;
   MetaBootIncarnation boot_incarnation_;
   uint64_t session_generation_ = 0;
+};
+
+// Exact candidate action contained in the FDS that underlay one authenticated
+// heartbeat. This is leader-local session context, not Data-supplied evidence:
+// it distinguishes an old-projection heartbeat that has not seen a newly
+// committed action from an exact-action heartbeat that affirmatively omitted
+// the candidate role.
+struct MetaObservedFailoverProjection {
+  std::string group_id_;
+  std::uint64_t group_term_ = 0;
+  MetaFailoverTransitionId transition_id_{};
+  std::uint64_t transition_revision_ = 0;
+  MetaFailoverActionId action_id_{};
+  std::string candidate_node_id_;
+  MetaAssignmentId candidate_assignment_id_{};
+  MetaBootIncarnation candidate_boot_id_{};
+
+  bool operator==(const MetaObservedFailoverProjection&) const = default;
+};
+
+// Leader-local authenticated session fact used to distinguish a node that has
+// not re-reported after a Meta leadership change from an exact session that
+// this leader observed disconnecting. The last-disconnect latch survives a
+// later session adoption within the same leadership epoch. Fresh generic
+// CandidateProgress may clear a pre-attempt latch while no committed action
+// binds that boot; once an action is committed, neither generic progress nor
+// Prepared from a replacement session can revive it.
+struct MetaObservedSessionState {
+  MetaBootIncarnation current_boot_id_{};
+  // Authenticated from ClientHello together with the boot id. Failover must
+  // treat a same-boot history rotation as a new source incarnation rather
+  // than infer lineage from whichever replicas happen to be reporting.
+  std::optional<MetaReplicationHistoryId> current_history_id_;
+  std::uint64_t current_generation_ = 0;
+  bool connected_ = false;
+  std::optional<std::int64_t> disconnected_unix_ms_;
+  std::optional<MetaBootIncarnation> disconnected_boot_id_;
+  std::optional<std::uint64_t> disconnected_generation_;
+  std::optional<MetaObservedFailoverProjection> heartbeat_failover_projection_;
+  bool operator==(const MetaObservedSessionState&) const = default;
 };
 
 // ------------------------------------------------------------- payload types
@@ -89,7 +132,7 @@ struct MetaNodeHealthObs {
 struct MetaCandidateProgressObs {
   // Copied from the authenticated observation identity so group queries keep
   // the complete reporter incarnation instead of returning an anonymous
-  // proof that a reconciler would have to join against another query.
+  // observation that a reconciler would have to join against another query.
   std::string node_id_;
   MetaBootIncarnation boot_incarnation_{};
   std::uint64_t session_generation_ = 0;
@@ -102,6 +145,10 @@ struct MetaCandidateProgressObs {
   // Reporter-local history remains the compatibility/diagnostic `history`
   // field. Candidate comparison uses the independent rebuild source lineage.
   MetaReplicationHistoryId replication_history_id_{};
+  // This is the term of the copied source population, not necessarily the
+  // reporter's current assignment term. After an uncontrolled fence the two
+  // intentionally differ while older recoverable data remains eligible.
+  std::uint64_t source_group_term_ = 0;
   std::string source_node_id_;
   MetaAssignmentId source_assignment_id_{};
   MetaBootIncarnation source_boot_incarnation_{};
@@ -137,6 +184,69 @@ struct MetaOperationEvidenceObs {
   bool operator==(const MetaOperationEvidenceObs&) const = default;
 };
 
+// Transition-scoped heartbeat facts are soft evidence. They are intentionally
+// separate from role_information because a source still requests ordinary
+// leases while paused and a candidate still reports its recoverable frontier
+// while preparing an action.
+struct MetaSourcePausedObs {
+  std::string group_id_;
+  MetaFailoverTransitionId transition_id_{};
+  std::string source_node_id_;
+  MetaAssignmentId source_assignment_id_{};
+  MetaBootIncarnation source_boot_id_{};
+  MetaReplicationHistoryId source_history_id_{};
+  std::uint64_t source_group_term_ = 0;
+  std::vector<std::uint64_t> stable_next_lsns_;
+  std::int64_t received_unix_ms_ = 0;
+  std::int64_t expires_unix_ms_ = 0;
+  bool operator==(const MetaSourcePausedObs&) const = default;
+};
+
+struct MetaCandidatePreparedObs {
+  // Leader-local authenticated session generation, copied by the observation
+  // store rather than accepted from the wire. It binds Prepared to the current
+  // adopted session so a disconnect or superseding session cannot leave stale
+  // action evidence usable by the reconciler.
+  std::uint64_t session_generation_ = 0;
+  std::string group_id_;
+  MetaFailoverTransitionId transition_id_{};
+  MetaFailoverActionId action_id_{};
+  std::string candidate_node_id_;
+  MetaAssignmentId candidate_assignment_id_{};
+  MetaBootIncarnation candidate_boot_id_{};
+  MetaRequestId prepared_context_id_{};
+  MetaHash256 prepared_context_hash_{};
+  std::int64_t received_unix_ms_ = 0;
+  std::int64_t expires_unix_ms_ = 0;
+  bool operator==(const MetaCandidatePreparedObs&) const = default;
+};
+
+struct MetaActionFailedObs {
+  std::string group_id_;
+  MetaFailoverTransitionId transition_id_{};
+  MetaFailoverActionId action_id_{};
+  std::string candidate_node_id_;
+  MetaAssignmentId candidate_assignment_id_{};
+  MetaBootIncarnation candidate_boot_id_{};
+  std::uint64_t population_manifest_revision_ = 0;
+  MetaHash256 population_manifest_digest_{};
+  std::uint64_t partition_replication_epoch_ = 0;
+  std::string failure_class_;
+  std::string failure_detail_;
+  std::int64_t received_unix_ms_ = 0;
+  std::int64_t expires_unix_ms_ = 0;
+  bool operator==(const MetaActionFailedObs&) const = default;
+};
+
+using MetaFailoverObservationPayload =
+    std::variant<MetaSourcePausedObs, MetaCandidatePreparedObs,
+                 MetaActionFailedObs>;
+
+struct MetaFailoverObservationObs {
+  MetaFailoverObservationPayload payload_;
+  bool operator==(const MetaFailoverObservationObs&) const = default;
+};
+
 // Canonical conversion used after EvidenceForOperation returns a validated,
 // TTL-fresh, self-contained observation. The manifest digest comes from the
 // same committed view used for that query; every observation/session anchor
@@ -147,7 +257,7 @@ MetaEvidenceSummary SummarizeOperationEvidence(
 
 using MetaObservationPayload =
     std::variant<MetaNodeBootObs, MetaNodeHealthObs, MetaCandidateProgressObs,
-                 MetaOperationEvidenceObs>;
+                 MetaOperationEvidenceObs, MetaFailoverObservationObs>;
 
 struct MetaObservation {
   MetaObservationIdentity identity_;
@@ -189,6 +299,14 @@ class MetaCommittedFacts {
   virtual bool IsOwnerAssignment(
       std::string_view group_id, std::string_view node_id,
       const MetaAssignmentId& assignment_id) const = 0;
+  // True only for the retained historical owner under an exact active
+  // uncontrolled target-term fence. Observation admission additionally
+  // verifies boot-local self-origin lineage against the authenticated
+  // session; this committed predicate never admits an active grant owner.
+  virtual bool MayReportFencedOwnerCandidate(
+      const MetaCandidateProgressObs&) const {
+    return false;
+  }
   // True when the operation exists (including archived summaries) and is not
   // in a terminal lifecycle state.
   virtual bool OperationNonTerminal(const MetaOperationId& id) const = 0;
@@ -197,6 +315,26 @@ class MetaCommittedFacts {
   virtual bool HistoryBoundToOperation(
       const MetaOperationId& id,
       const MetaReplicationHistoryId& history_id) const = 0;
+  // True when any committed active transition binds this exact node boot as
+  // its current Candidate Action. The conservative default preserves a
+  // disconnect latch for adapters that cannot inspect failover state.
+  virtual bool IsCurrentFailoverCandidate(std::string_view,
+                                          const MetaBootIncarnation&) const {
+    return true;
+  }
+
+  struct FailoverTransitionView {
+    std::string group_id_;
+    MetaFailoverTransition transition_;
+  };
+
+  // Finds an active transition by its globally unique identity. The default
+  // keeps older test/admin adapters conservative: without committed context,
+  // transition-scoped evidence is rejected.
+  virtual std::optional<FailoverTransitionView> FailoverTransitionById(
+      const MetaFailoverTransitionId&) const {
+    return std::nullopt;
+  }
 };
 
 // ------------------------------------------------------------ event auditing
@@ -222,6 +360,7 @@ class MetaObservationStore {
     absl::Status boot_status_;
     absl::Status health_status_;
     absl::Status candidate_status_;
+    absl::Status failover_status_;
   };
 
   struct Limits {
@@ -236,10 +375,8 @@ class MetaObservationStore {
     // Operation evidence is latest-wins by (operation, node, kind/phase).
     // One reporter and one operation domain may each retain no more distinct
     // phase keys than a durable operation record can ever consume.
-    size_t max_evidence_phases_per_node_ =
-        kMaxMetaOperationEvidencePerRecord;
-    size_t max_evidence_per_operation_ =
-        kMaxMetaOperationEvidencePerRecord;
+    size_t max_evidence_phases_per_node_ = kMaxMetaOperationEvidencePerRecord;
+    size_t max_evidence_per_operation_ = kMaxMetaOperationEvidencePerRecord;
     size_t max_observations_total_ = 65536;
     // Charged bytes include every variable-length observation field and its
     // lookup-key copies; fixed container overhead remains count-bounded by
@@ -276,18 +413,22 @@ class MetaObservationStore {
   void ResetForLeadershipChange();
 
   // Session lifecycle (trusted session layer only). Adopting a generation
-  // atomically purges all of the node's older observations. Generations must
-  // increase monotonically per node; adopting an older/equal generation is a
-  // domain rejection.
+  // atomically purges all of the node's older observations. Production passes
+  // the ClientHello replication history; the optional form exists for legacy
+  // diagnostic/test adapters that never make source-lineage decisions.
+  // Generations must increase monotonically per node; adopting an older/equal
+  // generation is a domain rejection.
   absl::Status AdoptSession(const MetaObservationIdentity& identity,
-                            int64_t now_unix_ms);
+                            int64_t now_unix_ms,
+                            std::optional<MetaReplicationHistoryId>
+                                replication_history_id = std::nullopt);
 
-  // Immediately withdraws candidate evidence when the exact authenticated
-  // session disconnects. A stale completion from an older generation cannot
-  // clear a replacement session's candidate; health and diagnostic evidence
-  // retain their ordinary TTL semantics.
-  void InvalidateCandidateOnDisconnect(
-      const MetaObservationIdentity& identity, int64_t now_unix_ms);
+  // Records an exact authenticated disconnect and immediately withdraws
+  // candidate evidence. A stale completion from an older generation cannot
+  // disconnect a replacement session or clear its candidate; source and
+  // diagnostic evidence retain their ordinary TTL semantics.
+  void InvalidateCandidateOnDisconnect(const MetaObservationIdentity& identity,
+                                       int64_t now_unix_ms);
 
   // Ingest one observation. Validates identity (registered active node,
   // current generation) and freshness (facts) before storing; rejection is
@@ -296,12 +437,29 @@ class MetaObservationStore {
                       const MetaCommittedFacts& facts, int64_t now_unix_ms);
 
   // Replaces common liveness/health and the role-derived candidate state under
-  // one lock. Absence or rejection of candidate evidence clears every older
-  // candidate for this node, so a promotion heartbeat cannot preserve the
-  // node's previous replica role.
+  // one lock. After identity/current-generation admission, candidate and
+  // transition evidence are replace-or-clear: absence or component rejection
+  // clears the corresponding older observation, so a promotion or failed
+  // report cannot preserve a stale role/action fact. Rejecting the heartbeat's
+  // identity leaves the replacement session's state untouched. The final
+  // overload also atomically replaces the session's trusted installed-FDS
+  // projection marker; nullopt clears it. The shorter overloads deliberately
+  // supply nullopt for fields they do not carry and therefore clear them.
+  // Component statuses report partial admission independently.
   HeartbeatReplaceResult ReplaceHeartbeat(
       const MetaObservationIdentity& identity, MetaNodeHealthObs health,
       std::optional<MetaCandidateProgressObs> candidate,
+      const MetaCommittedFacts& facts, int64_t now_unix_ms);
+  HeartbeatReplaceResult ReplaceHeartbeat(
+      const MetaObservationIdentity& identity, MetaNodeHealthObs health,
+      std::optional<MetaCandidateProgressObs> candidate,
+      std::optional<MetaFailoverObservationObs> failover,
+      const MetaCommittedFacts& facts, int64_t now_unix_ms);
+  HeartbeatReplaceResult ReplaceHeartbeat(
+      const MetaObservationIdentity& identity, MetaNodeHealthObs health,
+      std::optional<MetaCandidateProgressObs> candidate,
+      std::optional<MetaFailoverObservationObs> failover,
+      std::optional<MetaObservedFailoverProjection> failover_projection,
       const MetaCommittedFacts& facts, int64_t now_unix_ms);
 
   // Commit-driven invalidation: drop observations whose node, assignment,
@@ -333,13 +491,40 @@ class MetaObservationStore {
   std::vector<MetaCandidateProgressObs> LiveCandidateProgressFor(
       std::string_view group_id, const MetaCommittedFacts& facts,
       int64_t now_unix_ms) const;
+  // Passing a fixed decision time applies the store-wide observation TTL.
+  // Omitting it returns the committed-anchor-matching observation so a caller
+  // can apply its own freshness window, such as failover source grace;
+  // diagnostics may use the same unexpired-agnostic view.
   std::optional<MetaObservation> LatestForNode(
-      std::string_view node_id, const MetaCommittedFacts& facts) const;
+      std::string_view node_id, const MetaCommittedFacts& facts,
+      std::optional<int64_t> now_unix_ms = std::nullopt) const;
   std::vector<MetaOperationEvidenceObs> EvidenceForOperation(
       const MetaOperationId& id, const MetaCommittedFacts& facts,
       int64_t now_unix_ms) const;
+  // Returns only TTL-fresh transition evidence that still matches committed
+  // transition, action, membership, boot, and current-session anchors.
+  // SourcePaused is keyed by transition; candidate outcomes additionally bind
+  // the exact action so evidence from a superseded attempt cannot be reused.
+  // Authority decisions correlate candidate results with SessionStateFor's
+  // trusted installed-FDS projection marker.
+  std::optional<MetaSourcePausedObs> SourcePausedFor(
+      const MetaFailoverTransitionId& transition_id,
+      const MetaCommittedFacts& facts, int64_t now_unix_ms) const;
+  std::optional<MetaCandidatePreparedObs> CandidatePreparedFor(
+      const MetaFailoverTransitionId& transition_id,
+      const MetaFailoverActionId& action_id, const MetaCommittedFacts& facts,
+      int64_t now_unix_ms) const;
+  std::optional<MetaActionFailedObs> ActionFailedFor(
+      const MetaFailoverTransitionId& transition_id,
+      const MetaFailoverActionId& action_id, const MetaCommittedFacts& facts,
+      int64_t now_unix_ms) const;
 
+  // Exposes leader-local authenticated session state for failover liveness
+  // decisions. Disconnect latches and installed-FDS projection markers are
+  // volatile and are reset at a Meta leadership edge.
   std::optional<uint64_t> CurrentGeneration(std::string_view node_id) const;
+  std::optional<MetaObservedSessionState> SessionStateFor(
+      std::string_view node_id) const;
 
   std::vector<MetaObsAuditEvent> AuditRing() const;
   size_t size() const;
@@ -357,6 +542,9 @@ class MetaObservationStore {
   void ClearCandidatesForNodeLocked(std::string_view node_id,
                                     int64_t now_unix_ms,
                                     std::string_view detail);
+  void ClearCandidateFailoverForNodeLocked(std::string_view node_id,
+                                           int64_t now_unix_ms,
+                                           std::string_view detail);
   void SweepExpiredLocked(int64_t now_unix_ms);
 
   Limits limits_;

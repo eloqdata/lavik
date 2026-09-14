@@ -57,6 +57,7 @@ control::FullDesiredState DesiredState() {
       .partition_replication_epoch = 13,
       .grant_policy_id = "lease-policy",
       .grant_policy_version = 1,
+      .steady_replication_enabled = true,
   }};
   auto manifest = keylane::PopulationManifest::Create({});
   EXPECT_TRUE(manifest.ok()) << manifest.status();
@@ -109,6 +110,16 @@ TEST(MetaControlMapperTest, BuildsCompleteImmutableServingState) {
             DesiredState().groups[0].manifest_digest);
   EXPECT_EQ(prepared->control_groups_[0].partition_replication_epoch_,
             DesiredState().groups[0].partition_replication_epoch);
+  ASSERT_EQ(prepared->desired_cluster_controls_.size(), 1U);
+  const cluster::DesiredClusterControl& desired_control =
+      prepared->desired_cluster_controls_.front();
+  ASSERT_TRUE(desired_control.owner_endpoint_.has_value());
+  EXPECT_EQ(desired_control.owner_endpoint_->node_id_.ToHexString(), kNode1);
+  EXPECT_EQ(desired_control.owner_endpoint_->host_, "10.0.0.1");
+  EXPECT_EQ(desired_control.owner_endpoint_->port_, 7001);
+  EXPECT_EQ(desired_control.owner_endpoint_->tls_port_, 17001);
+  EXPECT_TRUE(desired_control.manifest_entries_.empty());
+  EXPECT_TRUE(desired_control.steady_replication_enabled_);
 }
 
 TEST(MetaControlMapperTest, SourceIndexDoesNotBecomeTopologyEpoch) {

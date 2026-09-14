@@ -62,6 +62,7 @@ using keylane::meta::MetaReplacementDisposition;
 using keylane::meta::MetaStores;
 using keylane::meta::UnfencedSupersededAuthorities;
 using keylane::meta::detail::BoundNodeSessionRegistry;
+using keylane::meta::detail::FailoverProjectionForHeartbeat;
 using keylane::meta::detail::MetaCommittedViewCache;
 using keylane::meta::detail::PendingHandshakeLimiter;
 using keylane::meta::detail::RecordEquivalentTransferBoundary;
@@ -253,8 +254,8 @@ TEST(MetaDataControlRuntimeStatusTest,
 TEST(MetaDataControlRuntimeStatusTest, UnregisteredRetryEvidenceIsBounded) {
   MetaDataControlRuntimeStatus status;
   status.BeginLeadership(/*leadership_generation=*/11);
-  for (std::size_t index = 0;
-       index < control::kMaxProjectedNodes + 1; ++index) {
+  for (std::size_t index = 0; index < control::kMaxProjectedNodes + 1;
+       ++index) {
     status.NoteUnregisteredRetry("declared-" + std::to_string(index),
                                  /*leadership_generation=*/11);
   }
@@ -312,6 +313,18 @@ TEST(MetaTransferBoundaryTest,
 
   EXPECT_TRUE(TransferBoundaryNeedsProjectionValidation(
       /*published_index=*/21, /*committed_high_water=*/21, validated));
+}
+
+TEST(MetaTransferBoundaryTest,
+     SupersessionRetriesInSessionAndPreservesAVisibleObjectsAppliedAck) {
+  EXPECT_EQ(keylane::meta::detail::ClassifyPublisherSupersession(
+                /*receiver_can_apply=*/false),
+            keylane::meta::detail::MetaPublisherTransferDisposition::
+                kRetryBeforeApplyInSession);
+  EXPECT_EQ(keylane::meta::detail::ClassifyPublisherSupersession(
+                /*receiver_can_apply=*/true),
+            keylane::meta::detail::MetaPublisherTransferDisposition::
+                kAwaitExactAppliedAndRetryInSession);
 }
 
 control::FullDesiredState Desired() {
@@ -395,6 +408,27 @@ class EvidenceFacts final : public HeartbeatFacts {
       const keylane::meta::MetaOperationId& id,
       const keylane::meta::MetaReplicationHistoryId& history) const override {
     return id == Bytes<16>(0x33) && history == Bytes<20>(0x44);
+  }
+};
+
+class FailoverHeartbeatFacts final : public HeartbeatFacts {
+ public:
+  std::optional<FailoverTransitionView> FailoverTransitionById(
+      const keylane::meta::MetaFailoverTransitionId& id) const override {
+    if (id != Bytes<16>(0x31)) return std::nullopt;
+    keylane::meta::MetaFailoverCandidateAction action;
+    action.action_id_ = Bytes<16>(0x32);
+    action.candidate_ = {Identity('1'), Bytes<16>(0x22), Bytes<20>(0x22)};
+    action.domain_ = {
+        6, Identity('3'), Bytes<16>(0x33), Bytes<20>(0x44), Bytes<20>(0x55), 1};
+    keylane::meta::MetaFailoverTransition transition;
+    transition.transition_id_ = id;
+    transition.revision_ = 8;
+    transition.mode_ = keylane::meta::MetaFailoverMode::kUncontrolled;
+    transition.target_term_ = 7;
+    transition.successor_grant_ = {5000, "p", 0};
+    transition.candidate_action_ = action;
+    return FailoverTransitionView{"group-a", std::move(transition)};
   }
 };
 
@@ -1015,6 +1049,45 @@ TEST(MetaDataControlFenceTest,
 }
 
 TEST(MetaHeartbeatObservationTest,
+     DerivesCandidateActionBasisOnlyForExactInstalledBoot) {
+  control::FullDesiredState installed;
+  control::WireDesiredGroup group;
+  group.group_id = "group-a";
+  group.group_term = 8;
+  group.failover_transition = control::WireFailoverTransition{
+      .transition_id = Bytes<16>(0x31),
+      .revision = 17,
+      .mode = control::WireFailoverMode::kUncontrolled,
+      .target_term = 8,
+      .candidate_action =
+          control::WireFailoverCandidateAction{
+              .action_id = Bytes<16>(0x32),
+              .candidate = {.node_id = Identity('1'),
+                            .assignment_id = Bytes<16>(0x33),
+                            .boot_id = Identity('2')},
+          },
+  };
+  installed.groups.push_back(std::move(group));
+
+  const auto exact =
+      FailoverProjectionForHeartbeat(installed, Identity('1'), Bytes<20>(0x22));
+  ASSERT_TRUE(exact.ok()) << exact.status();
+  ASSERT_TRUE(exact->has_value());
+  EXPECT_EQ((*exact)->group_id_, "group-a");
+  EXPECT_EQ((*exact)->group_term_, 8u);
+  EXPECT_EQ((*exact)->transition_id_, Bytes<16>(0x31));
+  EXPECT_EQ((*exact)->transition_revision_, 17u);
+  EXPECT_EQ((*exact)->action_id_, Bytes<16>(0x32));
+  EXPECT_EQ((*exact)->candidate_assignment_id_, Bytes<16>(0x33));
+  EXPECT_EQ((*exact)->candidate_boot_id_, Bytes<20>(0x22));
+
+  const auto old_boot =
+      FailoverProjectionForHeartbeat(installed, Identity('1'), Bytes<20>(0x23));
+  ASSERT_TRUE(old_boot.ok()) << old_boot.status();
+  EXPECT_FALSE(old_boot->has_value());
+}
+
+TEST(MetaHeartbeatObservationTest,
      ReporterHistoryIsIndependentAndRoleReplacementClearsCandidate) {
   MetaObservationStore observations;
   HeartbeatFacts facts;
@@ -1027,6 +1100,7 @@ TEST(MetaHeartbeatObservationTest,
       .group_id = "group-a",
       .assignment_id = Bytes<16>(0x22),
       .group_term = 7,
+      .source_group_term = 7,
       .manifest_revision = 9,
       .manifest_digest = {},
       .partition_replication_epoch = 4,
@@ -1042,13 +1116,26 @@ TEST(MetaHeartbeatObservationTest,
       .active_groups = 1,
       .summary = "ok",
   };
+  const keylane::meta::MetaObservedFailoverProjection projection_basis{
+      .group_id_ = "group-a",
+      .group_term_ = 7,
+      .transition_id_ = Bytes<16>(0x71),
+      .transition_revision_ = 12,
+      .action_id_ = Bytes<16>(0x72),
+      .candidate_node_id_ = Identity('1'),
+      .candidate_assignment_id_ = Bytes<16>(0x22),
+      .candidate_boot_id_ = boot,
+  };
 
   const auto first = IngestHeartbeatObservations(
       observations, facts, Identity('1'), boot, Bytes<20>(0x66), 1, health,
-      control::ReplicaCandidate{candidate},
+      control::ReplicaCandidate{candidate}, std::nullopt, projection_basis,
       /*now_unix_ms=*/1001);
   EXPECT_EQ(first.status, control::ObservationStatus::kAccepted);
   EXPECT_EQ(observations.size(), 3u);
+  const auto session = observations.SessionStateFor(Identity('1'));
+  ASSERT_TRUE(session.has_value());
+  EXPECT_EQ(session->heartbeat_failover_projection_, projection_basis);
   const auto latest = observations.LatestForNode(Identity('1'), facts);
   ASSERT_TRUE(latest.has_value());
   ASSERT_TRUE(std::holds_alternative<keylane::meta::MetaCandidateProgressObs>(
@@ -1088,6 +1175,7 @@ TEST(MetaHeartbeatObservationTest,
   EXPECT_EQ(progress.front().assignment_id_, Bytes<16>(0x22));
   EXPECT_EQ(progress.front().partition_replication_epoch_, 4u);
   EXPECT_EQ(progress.front().replication_history_id_, Bytes<20>(0x55));
+  EXPECT_EQ(progress.front().source_group_term_, 7u);
   EXPECT_EQ(progress.front().source_replication_history_id_, Bytes<20>(0x55));
   EXPECT_EQ(progress.front().applied_next_lsns_,
             (std::vector<std::uint64_t>{10}));
@@ -1099,6 +1187,43 @@ TEST(MetaHeartbeatObservationTest,
       /*now_unix_ms=*/1005);
   EXPECT_EQ(authority.status, control::ObservationStatus::kAccepted);
   EXPECT_TRUE(observations.CandidateProgressFor("group-a", facts).empty());
+}
+
+TEST(MetaHeartbeatObservationTest,
+     BridgesActionObservationWithoutRequiringCandidateRolePayload) {
+  MetaObservationStore observations;
+  FailoverHeartbeatFacts facts;
+  const auto boot = Bytes<20>(0x22);
+  ASSERT_TRUE(observations
+                  .AdoptSession({Identity('1'), boot, 1},
+                                /*now_unix_ms=*/1000)
+                  .ok());
+  const control::HeartbeatHealth health{
+      .storage_ready = true,
+      .population_ready = true,
+      .active_groups = 1,
+      .summary = "ok",
+  };
+  control::CandidatePrepared prepared{
+      .transition_id = Bytes<16>(0x31),
+      .action_id = Bytes<16>(0x32),
+      .candidate_node_id = Identity('1'),
+      .candidate_assignment_id = Bytes<16>(0x22),
+      .candidate_boot_id = Identity('2'),
+      .prepared_context_id = Bytes<16>(0x41),
+      .prepared_context_hash = Bytes<32>(0x42),
+  };
+
+  const auto result = IngestHeartbeatObservations(
+      observations, facts, Identity('1'), boot, Bytes<20>(0x66), 1, health,
+      control::NoRoleInformation{}, control::FailoverObservation{prepared},
+      /*now_unix_ms=*/1001);
+  EXPECT_EQ(result.status, control::ObservationStatus::kAccepted)
+      << result.detail;
+  const auto observed = observations.CandidatePreparedFor(
+      Bytes<16>(0x31), Bytes<16>(0x32), facts, 1001);
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->prepared_context_id_, prepared.prepared_context_id);
 }
 
 TEST(MetaOperationEvidenceTest,

@@ -26,6 +26,7 @@
 namespace keylane {
 
 class BlockingWakeCascade;
+class CapturedPubSubPublication;
 
 namespace cluster {
 class AuthorityAdmission;
@@ -79,6 +80,9 @@ class ReplicationCommandCapture {
   void MarkHandled();
   void Record(std::uint8_t db_id, std::vector<std::string> args);
   CapturedReplicationEffects Take();
+  void SetCapturedPubSubPublication(
+      std::shared_ptr<CapturedPubSubPublication> publication);
+  std::shared_ptr<CapturedPubSubPublication> TakeCapturedPubSubPublication();
 
  private:
   std::shared_ptr<RetainedMemoryCharge> prepared_charge_;
@@ -86,6 +90,11 @@ class ReplicationCommandCapture {
   mutable std::mutex mutex_;
   bool handled_ = false;
   std::vector<CapturedReplicationCommand> commands_;
+  // A source-side EXEC must publish its replication envelope before local
+  // subscriber-visible delivery. Keep the command-time recipient snapshot
+  // beside the corresponding replication effects so every failure path drops
+  // both together without changing CommandRequest's fixed-size hot layout.
+  std::shared_ptr<CapturedPubSubPublication> pubsub_publication_;
 };
 
 struct CapturedBlockingNotification {
@@ -356,6 +365,9 @@ struct alignas(std::max_align_t) CommandRequest {
   std::uint8_t cluster_slot_sample_count_ : 2 = 0;
   std::uint8_t write_admission_role_epoch_valid_ : 1 = false;
   std::uint8_t serving_generation_valid_ : 1 = false;
+  // Source-side EXEC captures PUBLISH for ordered replication and delays its
+  // local delivery until that publication commits.
+  std::uint8_t defer_pubsub_delivery_ : 1 = false;
   // Captured when a client write chooses its source-publication path. A DB
   // gate that reopens under a different role must reject the stale request
   // before mutation, including when writable replicas are enabled. Its valid

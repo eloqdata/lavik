@@ -503,6 +503,9 @@ TEST(MetaIdentityStore, DeserializeRejectsInvariantViolations) {
 using keylane::meta::CreateGroup;
 using keylane::meta::MetaClusterLifecycle;
 using keylane::meta::MetaClusterTerminalOutcome;
+using keylane::meta::MetaFailoverMode;
+using keylane::meta::MetaFailoverTransition;
+using keylane::meta::MetaFailoverTransitionRef;
 using keylane::meta::MetaOperationId;
 using keylane::meta::MetaTopologyStore;
 
@@ -524,6 +527,16 @@ CreateGroup MakeCreateGroup(const std::string& group_id,
   cmd.group_id_ = group_id;
   cmd.new_topology_epoch_ = new_topology_epoch;
   return cmd;
+}
+
+MetaFailoverTransition MakeUncontrolledTransition(std::uint8_t seed) {
+  MetaFailoverTransition transition;
+  transition.transition_id_.fill(seed);
+  transition.revision_ = 999;  // The store replaces this with the apply index.
+  transition.mode_ = MetaFailoverMode::kUncontrolled;
+  transition.target_term_ = 8;
+  transition.successor_grant_ = {5000, "failover-policy", 3};
+  return transition;
 }
 
 // ---------------------------------------------------------------------------
@@ -581,8 +594,7 @@ TEST(MetaTopologyStore, ClusterLifecycleFailureIsBoundedAndSerialized) {
             "initial population failed");
   ExpectDomainReject(store.FailClusterCreate(
       root,
-      std::string(keylane::meta::kMaxMetaClusterFailureSummaryBytes + 1,
-                  'x')));
+      std::string(keylane::meta::kMaxMetaClusterFailureSummaryBytes + 1, 'x')));
   ExpectDomainReject(store.FailClusterCreate(root, ""));
   ExpectDomainReject(store.FailClusterCreate(root, "unsafe\nsummary"));
 }
@@ -665,6 +677,96 @@ TEST(MetaTopologyStore, CreateGroupEnforcesGroupCap) {
   ExpectDomainReject(store.Apply(
       MakeCreateGroup("group-over", keylane::meta::kMaxMetaGroups + 1)));
   EXPECT_EQ(store.TopologyEpoch(), keylane::meta::kMaxMetaGroups);
+}
+
+TEST(MetaTopologyStore, InstallFailoverTransitionCreatesQueryableState) {
+  MetaTopologyStore store;
+  ASSERT_TRUE(store.Apply(MakeCreateGroup("group-a", 1)).ok());
+
+  MetaFailoverTransition expected = MakeUncontrolledTransition(0x51);
+  ExpectDomainReject(store.InstallFailoverTransition("group-a", expected, 0));
+  MetaFailoverTransition invalid = expected;
+  invalid.transition_id_.fill(0);
+  ExpectDomainReject(store.InstallFailoverTransition("group-a", invalid, 42));
+  EXPECT_FALSE(store.FindGroup("group-a")->failover_transition_.has_value());
+
+  ASSERT_TRUE(store
+                  .InstallFailoverTransition("group-a", expected,
+                                             /*committed_index=*/42)
+                  .ok());
+  expected.revision_ = 42;
+  ASSERT_TRUE(store.InstallFailoverTransition("group-a", expected, 42).ok());
+
+  MetaFailoverTransition conflict = MakeUncontrolledTransition(0x52);
+  ExpectDomainReject(store.InstallFailoverTransition("group-a", conflict, 43));
+
+  const auto view = store.FindGroup("group-a");
+  ASSERT_TRUE(view.has_value());
+  EXPECT_EQ(view->failover_transition_, expected);
+  EXPECT_EQ(view->revision_, 1u);  // Membership CAS is independent.
+}
+
+TEST(MetaTopologyStore, ReplaceFailoverTransitionUsesExactRevisionCas) {
+  MetaTopologyStore store;
+  ASSERT_TRUE(store.Apply(MakeCreateGroup("group-a", 1)).ok());
+  const MetaFailoverTransition initial = MakeUncontrolledTransition(0x51);
+  ASSERT_TRUE(store.InstallFailoverTransition("group-a", initial, 42).ok());
+
+  const MetaFailoverTransitionRef initial_ref{initial.transition_id_, 42};
+  MetaFailoverTransition replacement = initial;
+  replacement.successor_grant_.lease_duration_ms_ = 6000;
+  ASSERT_TRUE(
+      store.ReplaceFailoverTransition("group-a", initial_ref, replacement, 50)
+          .ok());
+  replacement.revision_ = 50;
+  EXPECT_EQ(store.FindGroup("group-a")->failover_transition_, replacement);
+
+  // The caller's old precondition is stale after the first apply, but the
+  // complete post-state proves this is an exact replay.
+  ASSERT_TRUE(
+      store.ReplaceFailoverTransition("group-a", initial_ref, replacement, 50)
+          .ok());
+
+  MetaFailoverTransition conflict = replacement;
+  conflict.successor_grant_.lease_duration_ms_ = 7000;
+  ExpectDomainReject(store.ReplaceFailoverTransition(
+      "group-a", MetaFailoverTransitionRef{initial.transition_id_, 49},
+      conflict, 51));
+  EXPECT_EQ(store.FindGroup("group-a")->failover_transition_, replacement);
+
+  ExpectDomainReject(store.ReplaceFailoverTransition(
+      "group-a", MetaFailoverTransitionRef{initial.transition_id_, 50},
+      conflict, 50));
+  EXPECT_EQ(store.FindGroup("group-a")->failover_transition_, replacement);
+
+  MetaFailoverTransition different_identity = conflict;
+  different_identity.transition_id_.fill(0x52);
+  ExpectDomainReject(store.ReplaceFailoverTransition(
+      "group-a", MetaFailoverTransitionRef{initial.transition_id_, 50},
+      different_identity, 51));
+  EXPECT_EQ(store.FindGroup("group-a")->failover_transition_, replacement);
+}
+
+TEST(MetaTopologyStore, ClearFailoverTransitionIsCasBoundAndIdempotent) {
+  MetaTopologyStore store;
+  ASSERT_TRUE(store.Apply(MakeCreateGroup("group-a", 1)).ok());
+  const MetaFailoverTransition first = MakeUncontrolledTransition(0x51);
+  ASSERT_TRUE(store.InstallFailoverTransition("group-a", first, 42).ok());
+
+  ExpectDomainReject(store.ClearFailoverTransition(
+      "group-a", MetaFailoverTransitionRef{first.transition_id_, 41}));
+  ASSERT_TRUE(store.FindGroup("group-a")->failover_transition_.has_value());
+
+  const MetaFailoverTransitionRef first_ref{first.transition_id_, 42};
+  ASSERT_TRUE(store.ClearFailoverTransition("group-a", first_ref).ok());
+  EXPECT_FALSE(store.FindGroup("group-a")->failover_transition_.has_value());
+  ASSERT_TRUE(store.ClearFailoverTransition("group-a", first_ref).ok());
+
+  const MetaFailoverTransition second = MakeUncontrolledTransition(0x52);
+  ASSERT_TRUE(store.InstallFailoverTransition("group-a", second, 50).ok());
+  ExpectDomainReject(store.ClearFailoverTransition("group-a", first_ref));
+  EXPECT_EQ(store.FindGroup("group-a")->failover_transition_->transition_id_,
+            second.transition_id_);
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,6 +1274,20 @@ TEST(MetaTopologyStore, SerializationRoundTrip) {
   EXPECT_EQ(loaded->Serialize(), bytes);
 }
 
+TEST(MetaTopologyStore, FailoverTransitionSerializationRoundTrip) {
+  MetaTopologyStore store;
+  ASSERT_TRUE(store.Apply(MakeCreateGroup("group-a", 1)).ok());
+  MetaFailoverTransition transition = MakeUncontrolledTransition(0x51);
+  ASSERT_TRUE(store.InstallFailoverTransition("group-a", transition, 42).ok());
+  transition.revision_ = 42;
+
+  const auto loaded = MetaTopologyStore::Deserialize(store.Serialize());
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  ASSERT_TRUE(loaded->FindGroup("group-a").has_value());
+  EXPECT_EQ(loaded->FindGroup("group-a")->failover_transition_, transition);
+  EXPECT_EQ(loaded->Serialize(), store.Serialize());
+}
+
 TEST(MetaTopologyStore, EmptyTopologyRoundTrip) {
   const MetaTopologyStore store;
   const auto loaded = MetaTopologyStore::Deserialize(store.Serialize());
@@ -1227,6 +1343,7 @@ struct TopologyBlobGroup {
   std::string owner;
   std::uint64_t revision = 1;
   std::vector<MetaGroupMember> members;
+  std::optional<std::string> encoded_failover_transition;
 };
 
 std::string MakeTopologyBlob(
@@ -1238,8 +1355,7 @@ std::string MakeTopologyBlob(
   w.WriteU64(0);
   keylane::meta::WriteFixedArray(w, MetaOperationId{});
   w.WriteU64(0);
-  w.WriteU8(
-      static_cast<std::uint8_t>(MetaClusterTerminalOutcome::kNone));
+  w.WriteU8(static_cast<std::uint8_t>(MetaClusterTerminalOutcome::kNone));
   w.WriteString("");
   w.WriteU64(topology_epoch);
   w.WriteCount(static_cast<std::uint32_t>(groups.size()));
@@ -1253,6 +1369,13 @@ std::string MakeTopologyBlob(
     w.WriteU64(0);  // partition_replication_epoch
     w.WriteU64(0);  // config_epoch
     w.WriteU64(group.revision);
+    w.WriteOptional(
+        group.encoded_failover_transition,
+        [](keylane::meta::MetaWriter& ww, const std::string& encoded) {
+          // The bytes are deliberately supplied by the caller rather than
+          // re-encoded here so corrupt transition invariants can be tested.
+          ww.WriteRaw(encoded);
+        });
     w.WriteList(group.members, [](keylane::meta::MetaWriter& ww,
                                   const MetaGroupMember& member) {
       ww.WriteString(member.node_id_);
@@ -1278,6 +1401,32 @@ std::string MakeTopologyBlob(
     ww.WriteString(run.group_id_);
   });
   return w.buffer();
+}
+
+TEST(MetaTopologyStore, CurrentRawLayoutFixtureDecodes) {
+  const auto loaded = MetaTopologyStore::Deserialize(
+      MakeTopologyBlob(1, {TopologyBlobGroup{"group-a"}}, {}));
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  ASSERT_TRUE(loaded->FindGroup("group-a").has_value());
+  EXPECT_FALSE(loaded->FindGroup("group-a")->failover_transition_.has_value());
+}
+
+TEST(MetaTopologyStore, DeserializeRejectsInvalidFailoverTransition) {
+  MetaFailoverTransition transition = MakeUncontrolledTransition(0x51);
+  transition.revision_ = 42;
+  keylane::meta::MetaWriter transition_writer;
+  ASSERT_TRUE(
+      keylane::meta::WriteMetaFailoverTransition(transition_writer, transition)
+          .ok());
+  std::string encoded = transition_writer.TakeBuffer();
+  ASSERT_GT(encoded.size(), 24u);
+  encoded[24] = '\x7f';  // unknown MetaFailoverMode tag
+
+  TopologyBlobGroup group{"group-a"};
+  group.encoded_failover_transition = std::move(encoded);
+  ExpectStoreFailStop(MetaTopologyStore::Deserialize(
+                          MakeTopologyBlob(1, {std::move(group)}, {}))
+                          .status());
 }
 
 TEST(MetaTopologyStore, DeserializeRejectsInvariantViolations) {

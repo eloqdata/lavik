@@ -244,6 +244,29 @@ class ReplicationLogService final : public celer::Service {
       co_return absl::FailedPreconditionError(
           "accepted storage mutation precondition did not publish SET");
     }
+
+    auto rejected_ephemeral_probe =
+        std::make_shared<MutationPreconditionProbe>();
+    const keylane::storage::MutationPrecondition
+        rejected_ephemeral_precondition(
+            std::shared_ptr<const void>(rejected_ephemeral_probe),
+            &ValidateMutationPreconditionProbe);
+    absl::Status status = co_await storage_->EnableReplicationLog(27, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    const auto before_ephemeral = storage_->LocalReplicationLogInfo();
+    status = co_await storage_->PublishEphemeralReplicationCommand(
+        0, {"PUBLISH", "mutation-precondition-channel", "blocked"},
+        rejected_ephemeral_precondition);
+    const auto after_ephemeral = storage_->LocalReplicationLogInfo();
+    if (!absl::IsFailedPrecondition(status) ||
+        rejected_ephemeral_probe->calls_ != 1 ||
+        after_ephemeral.tail_lsn_ != before_ephemeral.tail_lsn_ ||
+        after_ephemeral.publish_queue_bytes_ != 0) {
+      co_return absl::FailedPreconditionError(
+          "rejected ephemeral mutation entered the replication publisher");
+    }
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
     co_return absl::OkStatus();
   }
 

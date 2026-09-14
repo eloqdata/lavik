@@ -10,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <ranges>
 #include <stdexcept>
 #include <system_error>
 #include <type_traits>
@@ -203,6 +204,31 @@ bool MetaStoresFacts::IsOwnerAssignment(
                      });
 }
 
+bool MetaStoresFacts::MayReportFencedOwnerCandidate(
+    const MetaCandidateProgressObs& candidate) const {
+  const auto group =
+      stores_.topology_.FindGroup(std::string(candidate.group_id_));
+  const auto grant = stores_.grant_.GroupState(candidate.group_id_);
+  if (!group.has_value() || !grant.has_value() ||
+      !group->failover_transition_.has_value() ||
+      group->failover_transition_->mode_ != MetaFailoverMode::kUncontrolled ||
+      group->failover_transition_->target_term_ != group->record_.group_term_ ||
+      candidate.group_term_ != group->record_.group_term_ ||
+      candidate.source_group_term_ ==
+          std::numeric_limits<std::uint64_t>::max() ||
+      candidate.source_group_term_ + 1 != candidate.group_term_ ||
+      group->record_.owner_ != candidate.node_id_ ||
+      grant->group_term_ != group->record_.group_term_ || !grant->fenced_ ||
+      grant->grant_.has_value()) {
+    return false;
+  }
+  return std::ranges::any_of(
+      group->members_, [&](const MetaGroupMember& member) {
+        return member.node_id_ == candidate.node_id_ &&
+               member.assignment_id_ == candidate.assignment_id_;
+      });
+}
+
 bool MetaStoresFacts::OperationNonTerminal(const MetaOperationId& id) const {
   // Archived tombstones resolve to terminal summaries, so only a live
   // non-terminal record answers true.
@@ -221,6 +247,32 @@ bool MetaStoresFacts::HistoryBoundToOperation(
                      record->replication_history_id_.end(),
                      [](std::uint8_t byte) { return byte != 0; }) &&
          record->replication_history_id_ == history_id;
+}
+
+bool MetaStoresFacts::IsCurrentFailoverCandidate(
+    std::string_view node_id, const MetaBootIncarnation& boot_id) const {
+  return std::ranges::any_of(
+      stores_.topology_.Groups(), [&](const MetaTopologyGroupView& group) {
+        return group.failover_transition_.has_value() &&
+               group.failover_transition_->candidate_action_.has_value() &&
+               group.failover_transition_->candidate_action_->candidate_
+                       .node_id_ == node_id &&
+               group.failover_transition_->candidate_action_->candidate_
+                       .boot_id_ == boot_id;
+      });
+}
+
+std::optional<MetaCommittedFacts::FailoverTransitionView>
+MetaStoresFacts::FailoverTransitionById(
+    const MetaFailoverTransitionId& transition_id) const {
+  for (const MetaTopologyGroupView& group : stores_.topology_.Groups()) {
+    if (group.failover_transition_.has_value() &&
+        group.failover_transition_->transition_id_ == transition_id) {
+      return FailoverTransitionView{group.group_id_,
+                                    *group.failover_transition_};
+    }
+  }
+  return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
@@ -367,14 +419,14 @@ void FailProposeDispatch(const std::shared_ptr<ProposeWaiter>& waiter) {
 
 MetaCommandTag CommandTagOf(const MetaCommand& command) {
   // The MetaCommand variant is declared in tag order (commands.h:
-  // kRegisterNode=1 .. kPruneTerminalReceipts=29); pin both ends and the size
-  // so a
-  // future reorder breaks the build here instead of mislabeling results.
-  static_assert(std::variant_size_v<MetaCommand> == 29);
+  // kRegisterNode=1 .. kCommitUncontrolledFailover=37); pin both ends and the
+  // size so a future reorder breaks the build here instead of mislabeling
+  // results.
+  static_assert(std::variant_size_v<MetaCommand> == 37);
   static_assert(
       std::is_same_v<std::variant_alternative_t<0, MetaCommand>, RegisterNode>);
-  static_assert(std::is_same_v<std::variant_alternative_t<28, MetaCommand>,
-                               PruneTerminalReceipts>);
+  static_assert(std::is_same_v<std::variant_alternative_t<36, MetaCommand>,
+                               CommitUncontrolledFailover>);
   return static_cast<MetaCommandTag>(command.index() + 1);
 }
 
@@ -440,9 +492,8 @@ absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
           "CompleteOperation result is not the bounded workflow outcome");
     }
     MetaStores candidate = stores;
-    const MetaApplyResult applied =
-        ApplyCommitted(candidate, applied_index + 1, command, actor_principal,
-                       readable_time);
+    const MetaApplyResult applied = ApplyCommitted(
+        candidate, applied_index + 1, command, actor_principal, readable_time);
     const auto after =
         candidate.operation_.FindOperation(complete->operation_id_);
     if (applied.verdict_ != MetaAuditVerdict::kAccepted ||
@@ -450,17 +501,15 @@ absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
         !IsNonTerminal(before->lifecycle_) ||
         after->lifecycle_ != MetaOperationLifecycle::kCompleted ||
         after->revision_ != before->revision_ + 1 ||
-        (creation_root &&
-         candidate.topology_.ClusterLifecycle().state_ !=
-             MetaClusterLifecycle::kCreated)) {
+        (creation_root && candidate.topology_.ClusterLifecycle().state_ !=
+                              MetaClusterLifecycle::kCreated)) {
       return IneffectiveFailSafeRecovery(
           "CompleteOperation does not terminalize the full aggregate");
     }
     return absl::OkStatus();
   }
   if (const auto* abort = std::get_if<AbortOperation>(&command)) {
-    const auto before =
-        stores.operation_.FindOperation(abort->operation_id_);
+    const auto before = stores.operation_.FindOperation(abort->operation_id_);
     const bool creation_root =
         before.has_value() &&
         before->kind_ == kMetaClusterCreateOperationKind &&
@@ -471,21 +520,86 @@ absl::Status ValidateFailSafeRecovery(const MetaCommand& command,
           "AbortOperation must use an empty reason while recovery is gated");
     }
     MetaStores candidate = stores;
-    const MetaApplyResult applied =
-        ApplyCommitted(candidate, applied_index + 1, command, actor_principal,
-                       readable_time);
-    const auto after =
-        candidate.operation_.FindOperation(abort->operation_id_);
+    const MetaApplyResult applied = ApplyCommitted(
+        candidate, applied_index + 1, command, actor_principal, readable_time);
+    const auto after = candidate.operation_.FindOperation(abort->operation_id_);
     if (applied.verdict_ != MetaAuditVerdict::kAccepted ||
         !before.has_value() || !after.has_value() ||
         !IsNonTerminal(before->lifecycle_) ||
         after->lifecycle_ != MetaOperationLifecycle::kAborted ||
         after->revision_ != before->revision_ + 1 ||
-        (creation_root &&
-         candidate.topology_.ClusterLifecycle().state_ !=
-             MetaClusterLifecycle::kProvisioningFailed)) {
+        (creation_root && candidate.topology_.ClusterLifecycle().state_ !=
+                              MetaClusterLifecycle::kProvisioningFailed)) {
       return IneffectiveFailSafeRecovery(
           "AbortOperation does not terminalize the full aggregate");
+    }
+    return absl::OkStatus();
+  }
+  if (const auto* abort = std::get_if<AbortControlledFailover>(&command)) {
+    const auto before_operation =
+        stores.operation_.FindOperation(abort->operation_id_);
+    if (!before_operation.has_value() ||
+        !IsNonTerminal(before_operation->lifecycle_)) {
+      return IneffectiveFailSafeRecovery(
+          "AbortControlledFailover does not target a live operation");
+    }
+
+    // Model the only topology effect this recovery command may have. The
+    // pre-Begin form must leave topology byte-for-byte unchanged; the
+    // post-Begin form may remove only the exact transition that belongs to
+    // the operation it terminalizes.
+    MetaTopologyStore expected_topology = stores.topology_;
+    if (abort->expected_transition_.has_value()) {
+      const auto before_group = stores.topology_.FindGroup(abort->group_id_);
+      if (!before_group.has_value() ||
+          !before_group->failover_transition_.has_value() ||
+          before_group->failover_transition_->transition_id_ !=
+              abort->expected_transition_->transition_id_ ||
+          before_group->failover_transition_->revision_ !=
+              abort->expected_transition_->revision_ ||
+          before_group->failover_transition_->mode_ !=
+              MetaFailoverMode::kControlled ||
+          !before_group->failover_transition_->controlled_.has_value() ||
+          before_group->failover_transition_->controlled_->operation_id_ !=
+              abort->operation_id_) {
+        return IneffectiveFailSafeRecovery(
+            "AbortControlledFailover does not name the exact controlled "
+            "transition");
+      }
+      if (absl::Status cleared = expected_topology.ClearFailoverTransition(
+              abort->group_id_, *abort->expected_transition_);
+          !cleared.ok()) {
+        return IneffectiveFailSafeRecovery(
+            "AbortControlledFailover cannot clear its transition");
+      }
+    }
+
+    const auto before_grant = stores.grant_.Serialize();
+    if (!before_grant.ok()) {
+      return absl::InternalError(
+          "meta: cannot evaluate fail-safe failover authority state");
+    }
+    MetaStores candidate = stores;
+    const MetaApplyResult applied = ApplyCommitted(
+        candidate, applied_index + 1, command, actor_principal, readable_time);
+    const auto after_operation =
+        candidate.operation_.FindOperation(abort->operation_id_);
+    const auto after_grant = candidate.grant_.Serialize();
+    if (!after_grant.ok()) {
+      return absl::InternalError(
+          "meta: cannot evaluate fail-safe failover authority state");
+    }
+    if (applied.verdict_ != MetaAuditVerdict::kAccepted ||
+        !after_operation.has_value() ||
+        after_operation->lifecycle_ != MetaOperationLifecycle::kAborted ||
+        after_operation->revision_ != before_operation->revision_ + 1 ||
+        after_operation->terminal_result_ != abort->reason_ ||
+        after_operation->data_loss_possible_ ||
+        candidate.topology_.Serialize() != expected_topology.Serialize() ||
+        *after_grant != *before_grant) {
+      return IneffectiveFailSafeRecovery(
+          "AbortControlledFailover does not exclusively terminalize its "
+          "operation and optional transition");
     }
     return absl::OkStatus();
   }
@@ -1173,6 +1287,10 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   std::uint64_t high_water = 0;
   MetaCommittedView view(AtomicStoresSnapshot(applied_index, high_water),
                          applied_index);
+  // All semantic hooks evaluate volatile observations against one proposal
+  // instant. Re-reading wall time in individual hooks could otherwise make
+  // command admission depend on hook order around the same TTL boundary.
+  const std::int64_t proposal_now_unix_ms = NowUnixMs();
   // Reuse one stamp for emergency candidate evaluation and the real command;
   // audit-size admission must model exactly the record that would be appended.
   const std::string readable_time = FormatReadableTime();
@@ -1259,7 +1377,8 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   // ValidateProposal plugins run leader-locally. The first rejection aborts
   // the proposal before anything is encoded or appended.
   for (const MetaValidateHook& hook : hooks_) {
-    const absl::Status status = hook(command, view, observations_);
+    const absl::Status status =
+        hook(command, view, observations_, proposal_now_unix_ms);
     if (!status.ok()) co_return status;
   }
 

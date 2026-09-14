@@ -649,6 +649,245 @@ TEST(MetaModelCommands, FenceGroupRoundTrip) {
   ExpectRoundTrip(cmd);
 }
 
+keylane::meta::MetaOperationId MakeOperationId(std::uint8_t seed);
+
+keylane::meta::MetaFailoverCandidate MakeFailoverCandidate(std::uint8_t seed) {
+  keylane::meta::MetaFailoverCandidate candidate;
+  candidate.node_id_ = seed == 1 ? "0123456789abcdef0123456789abcdef01234567"
+                                 : "89abcdef0123456789abcdef0123456789abcdef";
+  candidate.assignment_id_.fill(static_cast<std::uint8_t>(seed + 0x10));
+  candidate.boot_id_.fill(static_cast<std::uint8_t>(seed + 0x20));
+  return candidate;
+}
+
+keylane::meta::MetaFailoverCandidateAction MakeFailoverAction(
+    std::uint8_t seed, bool authorized = false) {
+  keylane::meta::MetaFailoverCandidateAction action;
+  action.action_id_.fill(static_cast<std::uint8_t>(seed + 0x30));
+  action.candidate_ = MakeFailoverCandidate(seed);
+  action.domain_.source_group_term_ = 41;
+  action.domain_.source_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  action.domain_.source_assignment_id_.fill(0x41);
+  action.domain_.source_boot_id_.fill(0x42);
+  action.domain_.source_history_id_.fill(0x43);
+  action.domain_.flow_count_ = 3;
+  if (authorized) {
+    action.authorization_ = keylane::meta::MetaFailoverAuthorization{
+        .authorized_revision_ = 88,
+        .loss_if_cutover_ = keylane::meta::MetaFailoverLoss::kNone};
+  }
+  return action;
+}
+
+template <typename Command>
+void SetFailoverGroupAnchors(Command& command) {
+  command.expected_owner_node_id_ = "0123456789abcdef0123456789abcdef01234567";
+  command.expected_owner_assignment_id_.fill(0x41);
+  command.expected_membership_revision_ = 7;
+  command.expected_group_term_ = 41;
+  command.expected_authority_version_ = 5;
+  command.expected_grant_revision_ = 71;
+  command.expected_population_manifest_revision_ = 9;
+  command.expected_population_manifest_digest_.fill(0x44);
+  command.expected_partition_replication_epoch_ = 11;
+  command.expected_config_epoch_ = 13;
+}
+
+template <typename Command>
+void ExpectFailoverCommandRoundTrip(
+    const Command& command, keylane::meta::MetaCommandTag expected_tag) {
+  ExpectRoundTrip(command);
+  const std::string bytes = MustEncode(command);
+  ASSERT_GE(bytes.size(), 4u);
+  const auto* raw = reinterpret_cast<const unsigned char*>(bytes.data());
+  EXPECT_EQ(static_cast<std::uint16_t>(raw[0] | (raw[1] << 8)),
+            keylane::meta::kMetaCommandFormatVersion);
+  EXPECT_EQ(static_cast<std::uint16_t>(raw[2] | (raw[3] << 8)),
+            static_cast<std::uint16_t>(expected_tag));
+}
+
+TEST(MetaModelCommands, FailoverTransitionValueRoundTrips) {
+  keylane::meta::MetaFailoverTransition transition;
+  transition.transition_id_.fill(0x51);
+  transition.revision_ = 88;
+  transition.mode_ = keylane::meta::MetaFailoverMode::kControlled;
+  transition.target_term_ = 42;
+  transition.successor_grant_ = {5000, "failover-policy", 3};
+  transition.candidate_action_ = MakeFailoverAction(2, true);
+  transition.controlled_ = keylane::meta::MetaControlledFailover{
+      .operation_id_ = MakeOperationId(0x31),
+      .absolute_deadline_unix_ms_ = 1'800'000'000'000};
+
+  keylane::meta::MetaWriter writer;
+  ASSERT_TRUE(
+      keylane::meta::WriteMetaFailoverTransition(writer, transition).ok());
+  keylane::meta::MetaReader reader(writer.buffer());
+  const auto decoded = keylane::meta::ReadMetaFailoverTransition(reader);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, transition);
+  EXPECT_TRUE(reader.Finish().ok());
+
+  transition.mode_ = keylane::meta::MetaFailoverMode::kUncontrolled;
+  transition.candidate_action_.reset();
+  transition.controlled_.reset();
+  keylane::meta::MetaWriter candidate_null_writer;
+  ASSERT_TRUE(keylane::meta::WriteMetaFailoverTransition(candidate_null_writer,
+                                                         transition)
+                  .ok());
+  keylane::meta::MetaReader candidate_null_reader(
+      candidate_null_writer.buffer());
+  const auto candidate_null =
+      keylane::meta::ReadMetaFailoverTransition(candidate_null_reader);
+  ASSERT_TRUE(candidate_null.ok()) << candidate_null.status();
+  EXPECT_EQ(*candidate_null, transition);
+  EXPECT_TRUE(candidate_null_reader.Finish().ok());
+}
+
+TEST(MetaModelCommands, TypedFailoverCommandsRoundTrip) {
+  keylane::meta::BeginControlledFailover controlled;
+  controlled.request_id_ = MakeRequestId(0x91);
+  controlled.group_id_ = "group-a";
+  controlled.transition_id_.fill(0x51);
+  controlled.target_term_ = 42;
+  controlled.successor_grant_ = {5000, "failover-policy", 3};
+  controlled.candidate_action_ = MakeFailoverAction(2);
+  controlled.operation_id_ = MakeOperationId(0x31);
+  controlled.expected_operation_revision_ = 0;
+  controlled.absolute_deadline_unix_ms_ = 1'800'000'000'000;
+  SetFailoverGroupAnchors(controlled);
+  ExpectFailoverCommandRoundTrip(
+      controlled, keylane::meta::MetaCommandTag::kBeginControlledFailover);
+
+  keylane::meta::BeginUncontrolledFailover uncontrolled;
+  uncontrolled.request_id_ = MakeRequestId(0x92);
+  uncontrolled.group_id_ = "group-a";
+  uncontrolled.transition_id_.fill(0x52);
+  uncontrolled.target_term_ = 42;
+  uncontrolled.successor_grant_ = {5000, "failover-policy", 3};
+  uncontrolled.candidate_action_ = std::nullopt;
+  SetFailoverGroupAnchors(uncontrolled);
+  // A current grant may reference the first active policy version (zero), and
+  // an otherwise valid group may not have installed a population manifest or
+  // advanced its partition-replication epoch yet. The command still carries
+  // exact CAS anchors for those zero values.
+  uncontrolled.successor_grant_.policy_version_ = 0;
+  uncontrolled.expected_population_manifest_revision_ = 0;
+  uncontrolled.expected_population_manifest_digest_ = {};
+  uncontrolled.expected_partition_replication_epoch_ = 0;
+  ExpectFailoverCommandRoundTrip(
+      uncontrolled, keylane::meta::MetaCommandTag::kBeginUncontrolledFailover);
+
+  keylane::meta::SetUncontrolledCandidate set_candidate;
+  set_candidate.request_id_ = MakeRequestId(0x93);
+  set_candidate.group_id_ = "group-a";
+  set_candidate.expected_transition_ = {{}, 88};
+  set_candidate.expected_transition_.transition_id_.fill(0x52);
+  set_candidate.candidate_action_ = MakeFailoverAction(2);
+  ExpectFailoverCommandRoundTrip(
+      set_candidate, keylane::meta::MetaCommandTag::kSetUncontrolledCandidate);
+
+  keylane::meta::AuthorizeFailoverPrepare authorize;
+  authorize.request_id_ = MakeRequestId(0x94);
+  authorize.group_id_ = "group-a";
+  authorize.expected_transition_ = set_candidate.expected_transition_;
+  authorize.action_id_ = set_candidate.candidate_action_->action_id_;
+  authorize.loss_if_cutover_ = keylane::meta::MetaFailoverLoss::kUnknown;
+  ExpectFailoverCommandRoundTrip(
+      authorize, keylane::meta::MetaCommandTag::kAuthorizeFailoverPrepare);
+
+  keylane::meta::AbortControlledFailover abort;
+  abort.request_id_ = MakeRequestId(0x95);
+  abort.operation_id_ = controlled.operation_id_;
+  abort.expected_operation_revision_ = 0;
+  abort.group_id_ = "group-a";
+  abort.expected_transition_ = std::nullopt;
+  abort.reason_ = "no eligible candidate before deadline";
+  ExpectFailoverCommandRoundTrip(
+      abort, keylane::meta::MetaCommandTag::kAbortControlledFailover);
+
+  keylane::meta::DegradeControlledFailover degrade;
+  degrade.request_id_ = MakeRequestId(0x96);
+  degrade.operation_id_ = controlled.operation_id_;
+  degrade.expected_operation_revision_ = 0;
+  degrade.group_id_ = "group-a";
+  degrade.expected_transition_ = set_candidate.expected_transition_;
+  degrade.expected_candidate_action_ = MakeFailoverAction(2, true);
+  degrade.retain_candidate_action_ = true;
+  degrade.reason_ = "source incarnation was replaced";
+  ExpectFailoverCommandRoundTrip(
+      degrade, keylane::meta::MetaCommandTag::kDegradeControlledFailover);
+
+  keylane::meta::CommitControlledFailover commit_controlled;
+  commit_controlled.request_id_ = MakeRequestId(0x97);
+  commit_controlled.operation_id_ = controlled.operation_id_;
+  commit_controlled.expected_operation_revision_ = 0;
+  commit_controlled.group_id_ = "group-a";
+  commit_controlled.expected_transition_ = set_candidate.expected_transition_;
+  commit_controlled.action_id_ = degrade.expected_candidate_action_->action_id_;
+  commit_controlled.authorized_revision_ = 88;
+  commit_controlled.expected_candidate_ =
+      degrade.expected_candidate_action_->candidate_;
+  commit_controlled.successor_grant_ = controlled.successor_grant_;
+  SetFailoverGroupAnchors(commit_controlled);
+  commit_controlled.new_authority_version_ = 6;
+  commit_controlled.new_topology_epoch_ = 101;
+  commit_controlled.new_config_epoch_ = 14;
+  ExpectFailoverCommandRoundTrip(
+      commit_controlled,
+      keylane::meta::MetaCommandTag::kCommitControlledFailover);
+
+  keylane::meta::CommitUncontrolledFailover commit_uncontrolled;
+  commit_uncontrolled.request_id_ = MakeRequestId(0x98);
+  commit_uncontrolled.group_id_ = "group-a";
+  commit_uncontrolled.expected_transition_ = set_candidate.expected_transition_;
+  commit_uncontrolled.action_id_ =
+      degrade.expected_candidate_action_->action_id_;
+  commit_uncontrolled.authorized_revision_ = 88;
+  commit_uncontrolled.loss_if_cutover_ = keylane::meta::MetaFailoverLoss::kNone;
+  commit_uncontrolled.expected_candidate_ =
+      degrade.expected_candidate_action_->candidate_;
+  commit_uncontrolled.successor_grant_ = uncontrolled.successor_grant_;
+  SetFailoverGroupAnchors(commit_uncontrolled);
+  commit_uncontrolled.expected_group_term_ = 42;
+  commit_uncontrolled.new_authority_version_ = 6;
+  commit_uncontrolled.new_topology_epoch_ = 101;
+  commit_uncontrolled.new_config_epoch_ = 14;
+  ExpectFailoverCommandRoundTrip(
+      commit_uncontrolled,
+      keylane::meta::MetaCommandTag::kCommitUncontrolledFailover);
+}
+
+TEST(MetaModelCommands, FailoverCodecRejectsInvalidValues) {
+  keylane::meta::SetUncontrolledCandidate set_candidate;
+  set_candidate.group_id_ = "group-a";
+  set_candidate.expected_transition_.transition_id_.fill(0x52);
+  set_candidate.expected_transition_.revision_ = 88;
+  set_candidate.candidate_action_ = MakeFailoverAction(2, true);
+  ExpectEncodeDomainReject(set_candidate);
+
+  keylane::meta::AuthorizeFailoverPrepare authorize;
+  authorize.group_id_ = "group-a";
+  authorize.expected_transition_ = set_candidate.expected_transition_;
+  authorize.action_id_.fill(0x71);
+  authorize.loss_if_cutover_ = keylane::meta::MetaFailoverLoss::kUnknown;
+  std::string encoded = MustEncode(authorize);
+  encoded.back() = static_cast<char>(0x7f);
+  ExpectDecodeFailStop(encoded);
+
+  keylane::meta::MetaFailoverTransition malformed_transition;
+  malformed_transition.transition_id_.fill(0x52);
+  malformed_transition.revision_ = 88;
+  malformed_transition.mode_ = keylane::meta::MetaFailoverMode::kControlled;
+  malformed_transition.target_term_ = 42;
+  malformed_transition.successor_grant_ = {5000, "failover-policy", 0};
+  keylane::meta::MetaWriter writer;
+  const auto malformed =
+      keylane::meta::WriteMetaFailoverTransition(writer, malformed_transition);
+  ASSERT_FALSE(malformed.ok());
+  EXPECT_EQ(keylane::meta::MetaFailureClassOf(malformed),
+            keylane::meta::MetaFailureClass::kDomainReject);
+}
+
 // ---------------------------------------------------------------------------
 // Policy documents are versioned and content-hash addressed.
 // ---------------------------------------------------------------------------
@@ -682,10 +921,10 @@ TEST(MetaModelCommands, RetirePolicyRoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
-// operation journal. operation_id is the client-provided
-// stable UUID and permanent idempotency key; operation_seq = the raft log
-// index of the SubmitOperation command, assigned by apply, and appears
-// in commands only as an archive reference.
+// operation journal. operation_id is the client-provided stable UUID and
+// idempotency key while its live/archive record is retained; operation_seq is
+// the raft log index of the SubmitOperation command, assigned by apply, and
+// appears in commands only as an archive reference.
 // ---------------------------------------------------------------------------
 
 keylane::meta::MetaOperationId MakeOperationId(std::uint8_t seed) {
@@ -1882,8 +2121,7 @@ TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
   moved.new_topology_epoch_ = 8;
   moved.config_epochs_ = {{"g1", 2}, {"g2", 2}};
   const std::string before = DomainStateBytes(stores);
-  MetaApplyResult source_live =
-      ApplyRejected(stores, 13, MetaCommand{moved});
+  MetaApplyResult source_live = ApplyRejected(stores, 13, MetaCommand{moved});
   EXPECT_NE(source_live.detail_.find("fenced"), std::string::npos);
   EXPECT_EQ(DomainStateBytes(stores), before);
 
@@ -1898,8 +2136,7 @@ TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
   MetaApplyResult destination_live =
       ApplyRejected(stores, 15, MetaCommand{moved});
   EXPECT_NE(destination_live.detail_.find("g2"), std::string::npos);
-  EXPECT_EQ(stores.topology_.SlotOwner(5000),
-            std::optional<std::string>("g1"));
+  EXPECT_EQ(stores.topology_.SlotOwner(5000), std::optional<std::string>("g1"));
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 7u);
 
   keylane::meta::FenceGroup fence_g2;
@@ -1908,8 +2145,7 @@ TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
   fence_g2.expected_term_ = 1;
   ApplyOk(stores, 16, MetaCommand{fence_g2});
   ApplyOk(stores, 17, MetaCommand{moved});
-  EXPECT_EQ(stores.topology_.SlotOwner(5000),
-            std::optional<std::string>("g2"));
+  EXPECT_EQ(stores.topology_.SlotOwner(5000), std::optional<std::string>("g2"));
   EXPECT_EQ(stores.topology_.FindGroup("g1")->config_epoch_, 2u);
   EXPECT_EQ(stores.topology_.FindGroup("g2")->config_epoch_, 2u);
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 8u);
@@ -1925,8 +2161,7 @@ TEST(MetaStateApply, SetSlotMapCannotChangeActiveGrantConfigEpoch) {
   change_config.new_topology_epoch_ = 4;
   change_config.config_epochs_ = {{"g1", 8}};
   const std::string before = DomainStateBytes(stores);
-  MetaApplyResult active =
-      ApplyRejected(stores, 7, MetaCommand{change_config});
+  MetaApplyResult active = ApplyRejected(stores, 7, MetaCommand{change_config});
   EXPECT_NE(active.detail_.find("fenced"), std::string::npos);
   EXPECT_EQ(DomainStateBytes(stores), before);
 
@@ -2095,11 +2330,9 @@ keylane::meta::SubmitOperation MakeClusterCreateSubmit(
     std::uint8_t seed, std::string group_id = "group-a") {
   keylane::meta::ClusterCreateManifestV1 manifest;
   manifest.schema_version_ = 1;
-  manifest.meta_members_ = {
-      {1, "tcp://127.0.0.1:7101", "tcp://127.0.0.1:7301",
-       "tcp://127.0.0.1:7201"}};
-  manifest.data_nodes_ = {{std::string(40, '1'),
-                           "tcp://127.0.0.1:6379"}};
+  manifest.meta_members_ = {{1, "tcp://127.0.0.1:7101", "tcp://127.0.0.1:7301",
+                             "tcp://127.0.0.1:7201"}};
+  manifest.data_nodes_ = {{std::string(40, '1'), "tcp://127.0.0.1:6379"}};
   manifest.groups_ = {{group_id, std::string(40, '1'), {}}};
   manifest.slot_ranges_ = {{0, 16383, group_id}};
   const auto operation_id = MakeOperationId(seed);
@@ -2130,8 +2363,7 @@ TEST(MetaStateApply, ClusterCreateRootAtomicallyOwnsLifecycle) {
   ApplyOk(stores, 11, MetaCommand{root});
 
   const auto& creating = stores.topology_.ClusterLifecycle();
-  EXPECT_EQ(creating.state_,
-            keylane::meta::MetaClusterLifecycle::kCreating);
+  EXPECT_EQ(creating.state_, keylane::meta::MetaClusterLifecycle::kCreating);
   EXPECT_EQ(creating.root_operation_id_, root.operation_id_);
   EXPECT_EQ(creating.genesis_commit_index_, 11u);
   EXPECT_EQ(creating.revision_, 1u);
@@ -2141,15 +2373,15 @@ TEST(MetaStateApply, ClusterCreateRootAtomicallyOwnsLifecycle) {
   // A different request is rejected even when its manifest is identical.
   const auto second = MakeClusterCreateSubmit(0x72);
   ApplyRejected(stores, 12, MetaCommand{second});
-  EXPECT_FALSE(stores.operation_.FindOperation(second.operation_id_)
-                   .has_value());
+  EXPECT_FALSE(
+      stores.operation_.FindOperation(second.operation_id_).has_value());
   EXPECT_EQ(stores.topology_.ClusterLifecycle().root_operation_id_,
             root.operation_id_);
 
   const auto different = MakeClusterCreateSubmit(0x73, "group-b");
   ApplyRejected(stores, 13, MetaCommand{different});
-  EXPECT_FALSE(stores.operation_.FindOperation(different.operation_id_)
-                   .has_value());
+  EXPECT_FALSE(
+      stores.operation_.FindOperation(different.operation_id_).has_value());
 
   keylane::meta::CompleteOperation complete;
   complete.request_id_ = MakeRequestId(0x74);
@@ -2204,8 +2436,7 @@ TEST(MetaStateApply, ClusterCreateAbortAtomicallyRecordsSafeFailure) {
   EXPECT_EQ(failed.terminal_outcome_,
             keylane::meta::MetaClusterTerminalOutcome::kProvisioningFailed);
   EXPECT_EQ(failed.failure_summary_.find("hunter2"), std::string::npos);
-  EXPECT_NE(failed.failure_summary_.find("root-operation="),
-            std::string::npos);
+  EXPECT_NE(failed.failure_summary_.find("root-operation="), std::string::npos);
 }
 
 TEST(MetaStateApply, MetaStoresDeserializeRejectsGroupStoreDrift) {
@@ -2235,16 +2466,15 @@ TEST(MetaStateApply, SnapshotValidatesClusterLifecycleAggregate) {
     root.intent_ = other.intent_;
     root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 10).ok());
-    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 10)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.BeginClusterCreate(root.operation_id_, 10).ok());
     ExpectAggregateSnapshotFailStop(stores);
   }
   {
     // Uninitialized plus artifacts is reported as non-pristine by status; it
     // is not structural snapshot corruption.
     MetaStores stores;
-    ASSERT_TRUE(stores.policy_.Apply(MakePutPolicy("legacy", 1, "{}"))
-                    .ok());
+    ASSERT_TRUE(stores.policy_.Apply(MakePutPolicy("legacy", 1, "{}")).ok());
     const auto restored = MetaStores::Deserialize(MustSerialize(stores));
     ASSERT_TRUE(restored.ok()) << restored.status();
     EXPECT_EQ(restored->topology_.ClusterLifecycle().state_,
@@ -2304,8 +2534,8 @@ TEST(MetaStateApply, ClusterRootTerminalizationRequiresExactGenesisAnchor) {
     MetaStores stores;
     const auto root = MakeClusterCreateSubmit(0x75);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 28).ok());
-    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 29)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.BeginClusterCreate(root.operation_id_, 29).ok());
     keylane::meta::CompleteOperation complete;
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
@@ -2322,8 +2552,8 @@ TEST(MetaStateApply, ClusterRootTerminalizationRequiresExactGenesisAnchor) {
     auto root = MakeClusterCreateSubmit(0x76);
     root.kind_ = "migration";
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 31).ok());
-    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 31)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.BeginClusterCreate(root.operation_id_, 31).ok());
     keylane::meta::AbortOperation abort;
     abort.operation_id_ = root.operation_id_;
     abort.expected_revision_ = 0;
@@ -2342,8 +2572,8 @@ TEST(MetaStateApply, ClusterRootTerminalizationRequiresExactGenesisAnchor) {
     root.intent_ = other.intent_;
     root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 33).ok());
-    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 33)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.BeginClusterCreate(root.operation_id_, 33).ok());
     keylane::meta::CompleteOperation complete;
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
@@ -2358,8 +2588,8 @@ TEST(MetaStateApply, ClusterRootTerminalizationRequiresExactGenesisAnchor) {
     MetaStores stores;
     const auto root = MakeClusterCreateSubmit(0x79);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 35).ok());
-    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 36)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.BeginClusterCreate(root.operation_id_, 36).ok());
     keylane::meta::AbortOperation abort;
     abort.operation_id_ = root.operation_id_;
     abort.expected_revision_ = 0;
@@ -2391,8 +2621,8 @@ TEST(MetaStateApply, ClusterRootTerminalReplayRejectsEitherMissingHalf) {
     MetaStores stores;
     const auto root = MakeClusterCreateSubmit(0x76);
     ApplyOk(stores, 32, MetaCommand{root});
-    ASSERT_TRUE(stores.topology_.CompleteClusterCreate(root.operation_id_)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.CompleteClusterCreate(root.operation_id_).ok());
     keylane::meta::CompleteOperation complete;
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
@@ -2421,9 +2651,9 @@ TEST(MetaStateApply, ClusterRootTerminalReplayRejectsEitherMissingHalf) {
     const auto root = MakeClusterCreateSubmit(0x7a);
     ApplyOk(stores, 36, MetaCommand{root});
     ASSERT_TRUE(stores.topology_
-                    .FailClusterCreate(root.operation_id_,
-                                       ClusterCreateFailureSummaryForTest(
-                                           root.operation_id_))
+                    .FailClusterCreate(
+                        root.operation_id_,
+                        ClusterCreateFailureSummaryForTest(root.operation_id_))
                     .ok());
     keylane::meta::AbortOperation abort;
     abort.operation_id_ = root.operation_id_;
@@ -2442,15 +2672,15 @@ TEST(MetaStateApply, ClusterRootTerminalReplayRejectsInvalidGenesisAnchor) {
     auto root = MakeClusterCreateSubmit(0x7b);
     root.kind_ = "migration";
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 38).ok());
-    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 38)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.BeginClusterCreate(root.operation_id_, 38).ok());
     keylane::meta::CompleteOperation complete;
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
     complete.result_ = "cluster-created";
     ASSERT_TRUE(stores.operation_.CompleteOperation(complete).ok());
-    ASSERT_TRUE(stores.topology_.CompleteClusterCreate(root.operation_id_)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.CompleteClusterCreate(root.operation_id_).ok());
 
     ApplyRejected(stores, 39, MetaCommand{complete});
   }
@@ -2461,15 +2691,15 @@ TEST(MetaStateApply, ClusterRootTerminalReplayRejectsInvalidGenesisAnchor) {
     root.intent_ = other.intent_;
     root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 40).ok());
-    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 40)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.BeginClusterCreate(root.operation_id_, 40).ok());
     keylane::meta::CompleteOperation complete;
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
     complete.result_ = "cluster-created";
     ASSERT_TRUE(stores.operation_.CompleteOperation(complete).ok());
-    ASSERT_TRUE(stores.topology_.CompleteClusterCreate(root.operation_id_)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.CompleteClusterCreate(root.operation_id_).ok());
 
     ApplyRejected(stores, 41, MetaCommand{complete});
   }
@@ -2477,8 +2707,8 @@ TEST(MetaStateApply, ClusterRootTerminalReplayRejectsInvalidGenesisAnchor) {
     MetaStores stores;
     const auto root = MakeClusterCreateSubmit(0x7e);
     ASSERT_TRUE(stores.operation_.SubmitOperation(root, 42).ok());
-    ASSERT_TRUE(stores.topology_.BeginClusterCreate(root.operation_id_, 43)
-                    .ok());
+    ASSERT_TRUE(
+        stores.topology_.BeginClusterCreate(root.operation_id_, 43).ok());
     keylane::meta::AbortOperation abort;
     abort.operation_id_ = root.operation_id_;
     abort.expected_revision_ = 0;
@@ -2512,8 +2742,8 @@ TEST(MetaStateApply, ClusterRootSubmitReplayRejectsASingleStoreEffect) {
 
     ApplyRejected(stores, 32, MetaCommand{root});
 
-    EXPECT_FALSE(stores.operation_.FindOperation(root.operation_id_)
-                     .has_value());
+    EXPECT_FALSE(
+        stores.operation_.FindOperation(root.operation_id_).has_value());
   }
 }
 
@@ -2589,8 +2819,8 @@ TEST(MetaStateApply, SubmitOperationSeqIsLogIndexAndActorPersisted) {
   EXPECT_EQ(record->actor_.principal_, kActorPrincipal);
   EXPECT_EQ(record->actor_.readable_time_, kReadableTime);
 
-  // Permanent idempotency: same id + same intent_hash -> idempotent accept,
-  // no second record, no audit growth on the same index.
+  // Retained-record idempotency: same id + same intent_hash -> idempotent
+  // accept, no second record, no audit growth on the same index.
   ApplyOk(stores, 3, MetaCommand{cmd});
   EXPECT_EQ(stores.operation_.LiveCount(), 1u);
   EXPECT_EQ(stores.audit_.size(), 1u);

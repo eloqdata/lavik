@@ -1,12 +1,14 @@
 #include "keylane/meta/observation_store.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <deque>
 #include <limits>
 #include <map>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -46,8 +48,21 @@ constexpr std::uint32_t kMaxObsFieldBytes = kMaxMetaPayloadBytes;
 // byte-bounded.
 constexpr std::size_t kMaxAuditDetailBytes = 256;
 
-bool ObservationExpired(const MetaObservation& observation,
-                        int64_t now_unix_ms, int64_t ttl_ms) {
+template <std::size_t N>
+bool IsZeroIdentity(const std::array<std::uint8_t, N>& value) {
+  return std::ranges::all_of(value,
+                             [](std::uint8_t byte) { return byte == 0; });
+}
+
+std::int64_t ObservationExpiry(std::int64_t received_unix_ms,
+                               std::int64_t ttl_ms) {
+  return received_unix_ms > std::numeric_limits<std::int64_t>::max() - ttl_ms
+             ? std::numeric_limits<std::int64_t>::max()
+             : received_unix_ms + ttl_ms;
+}
+
+bool ObservationExpired(const MetaObservation& observation, int64_t now_unix_ms,
+                        int64_t ttl_ms) {
   // Backwards wall-clock movement is conservative: it cannot expire evidence.
   // Avoid subtracting until the ordering check has ruled out underflow.
   return now_unix_ms > observation.received_unix_ms_ &&
@@ -124,13 +139,36 @@ std::uint64_t ChargedBytes(const MetaObservation& observation) {
   if (const auto* candidate =
           std::get_if<MetaCandidateProgressObs>(&observation.payload_)) {
     return identity_node + bytes(candidate->node_id_) +
-           2 * bytes(candidate->group_id_) +
-           bytes(candidate->source_node_id_) +
+           2 * bytes(candidate->group_id_) + bytes(candidate->source_node_id_) +
            static_cast<std::uint64_t>(candidate->applied_next_lsns_.size()) *
                sizeof(std::uint64_t) +
            bytes(candidate->applied_flow_vector_) +
-           bytes(candidate->backlog_coverage_) +
-           bytes(candidate->readiness_) + identity_node;
+           bytes(candidate->backlog_coverage_) + bytes(candidate->readiness_) +
+           identity_node;
+  }
+  if (const auto* failover =
+          std::get_if<MetaFailoverObservationObs>(&observation.payload_)) {
+    return 2 * identity_node +
+           std::visit(
+               [&](const auto& payload) -> std::uint64_t {
+                 using Payload = std::decay_t<decltype(payload)>;
+                 if constexpr (std::is_same_v<Payload, MetaSourcePausedObs>) {
+                   return bytes(payload.group_id_) +
+                          bytes(payload.source_node_id_) +
+                          payload.stable_next_lsns_.size() *
+                              sizeof(std::uint64_t);
+                 } else if constexpr (std::is_same_v<
+                                          Payload, MetaCandidatePreparedObs>) {
+                   return bytes(payload.group_id_) +
+                          bytes(payload.candidate_node_id_);
+                 } else {
+                   return bytes(payload.group_id_) +
+                          bytes(payload.candidate_node_id_) +
+                          bytes(payload.failure_class_) +
+                          bytes(payload.failure_detail_);
+                 }
+               },
+               failover->payload_);
   }
   const auto& evidence =
       std::get<MetaOperationEvidenceObs>(observation.payload_);
@@ -139,10 +177,8 @@ std::uint64_t ChargedBytes(const MetaObservation& observation) {
          bytes(evidence.group_id_) + identity_node;
 }
 
-bool ExceedsReplacementBudget(std::uint64_t current,
-                              std::uint64_t replaced,
-                              std::uint64_t incoming,
-                              std::uint64_t limit) {
+bool ExceedsReplacementBudget(std::uint64_t current, std::uint64_t replaced,
+                              std::uint64_t incoming, std::uint64_t limit) {
   assert(current >= replaced);
   // Written without addition so a caller-supplied UINT64_MAX limit cannot
   // turn an overflowing sum into an admission.
@@ -152,13 +188,21 @@ bool ExceedsReplacementBudget(std::uint64_t current,
 }  // namespace
 
 struct MetaObservationStore::Impl {
-  // The trusted session triple of one node, fixed at AdoptSession time:
-  // boot_incarnation may never change within a generation (a reboot comes
-  // back with a new generation), so a mismatch under the current generation
-  // is an identity violation, not an ordering question.
+  // The trusted session identity of one node, fixed at AdoptSession time:
+  // boot and ClientHello history may never change within a generation (a
+  // reboot or history rotation reconnects with a new generation), so a
+  // mismatch under the current generation is an identity violation, not an
+  // ordering question.
   struct Session {
     MetaBootIncarnation boot_incarnation_{};
+    std::optional<MetaReplicationHistoryId> replication_history_id_;
     std::uint64_t generation_ = 0;
+    bool connected_ = true;
+    std::optional<std::int64_t> disconnected_unix_ms_;
+    std::optional<MetaBootIncarnation> disconnected_boot_id_;
+    std::optional<std::uint64_t> disconnected_generation_;
+    std::optional<MetaObservedFailoverProjection>
+        heartbeat_failover_projection_;
   };
 
   // Latest-wins key for operation evidence: each (node, kind_phase) pair
@@ -324,8 +368,11 @@ struct MetaObservationStore::Impl {
             facts.CurrentPopulationManifestDigest(candidate->group_id_)) {
           return MetaDomainRejectError("manifest-digest-mismatch");
         }
-        if (facts.IsOwnerAssignment(candidate->group_id_, candidate->node_id_,
-                                    candidate->assignment_id_)) {
+        const bool candidate_is_owner =
+            facts.IsOwnerAssignment(candidate->group_id_, candidate->node_id_,
+                                    candidate->assignment_id_);
+        if (candidate_is_owner &&
+            !facts.MayReportFencedOwnerCandidate(*candidate)) {
           return MetaDomainRejectError("candidate-is-committed-owner");
         }
         if (!cluster::control::IsCanonicalIdentity160(
@@ -333,13 +380,31 @@ struct MetaObservationStore::Impl {
           return MetaDomainRejectError("bad-candidate-source-node");
         }
         const auto is_zero = [](const auto& value) {
-          return std::ranges::all_of(value,
-                                     [](std::uint8_t byte) { return byte == 0; });
+          return std::ranges::all_of(
+              value, [](std::uint8_t byte) { return byte == 0; });
         };
         if (is_zero(candidate->source_assignment_id_) ||
             is_zero(candidate->source_boot_incarnation_) ||
-            is_zero(candidate->source_replication_history_id_)) {
+            is_zero(candidate->source_replication_history_id_) ||
+            candidate->source_group_term_ == 0 ||
+            candidate->source_group_term_ > candidate->group_term_) {
           return MetaDomainRejectError("empty-candidate-source-lineage");
+        }
+        if (candidate_is_owner) {
+          const auto session = sessions_.find(observation.identity_.node_id_);
+          if (session == sessions_.end() ||
+              !session->second.replication_history_id_.has_value() ||
+              candidate->source_node_id_ != candidate->node_id_ ||
+              candidate->source_assignment_id_ != candidate->assignment_id_ ||
+              candidate->source_boot_incarnation_ !=
+                  observation.identity_.boot_incarnation_ ||
+              candidate->source_replication_history_id_ !=
+                  candidate->replication_history_id_ ||
+              candidate->replication_history_id_ !=
+                  *session->second.replication_history_id_) {
+            return MetaDomainRejectError(
+                "fenced-owner-candidate-lineage-mismatch");
+          }
         }
         if (candidate->applied_next_lsns_.size() >
             cluster::control::kMaxCandidateFlows) {
@@ -354,20 +419,117 @@ struct MetaObservationStore::Impl {
       // history is scoped to a data-plane boot. Typed heartbeat candidates
       // carry an independent source history anchor used by CandidatePlanFor;
       // these legacy opaque fields remain diagnostic-only for ctl clients.
-      if (const absl::Status size =
-              CheckFieldSize(candidate->applied_flow_vector_,
-                             kMaxObsFieldBytes, "flow");
+      if (const absl::Status size = CheckFieldSize(
+              candidate->applied_flow_vector_, kMaxObsFieldBytes, "flow");
           !size.ok()) {
         return size;
       }
-      if (const absl::Status size =
-              CheckFieldSize(candidate->backlog_coverage_, kMaxObsFieldBytes,
-                             "backlog");
+      if (const absl::Status size = CheckFieldSize(
+              candidate->backlog_coverage_, kMaxObsFieldBytes, "backlog");
           !size.ok()) {
         return size;
       }
       return CheckFieldSize(candidate->readiness_, kMaxObsFieldBytes,
                             "readiness");
+    }
+    if (const auto* failover =
+            std::get_if<MetaFailoverObservationObs>(&payload)) {
+      return std::visit(
+          [&](const auto& fact) -> absl::Status {
+            using Fact = std::decay_t<decltype(fact)>;
+            if (fact.group_id_.empty() ||
+                fact.group_id_.size() > kMaxMetaGroupIdBytes ||
+                IsZeroIdentity(fact.transition_id_)) {
+              return MetaDomainRejectError("bad-failover-observation-id");
+            }
+            const auto committed =
+                facts.FailoverTransitionById(fact.transition_id_);
+            if (!committed.has_value() ||
+                committed->group_id_ != fact.group_id_) {
+              return MetaDomainRejectError("failover-transition-mismatch");
+            }
+            const MetaFailoverTransition& transition = committed->transition_;
+            if constexpr (std::is_same_v<Fact, MetaSourcePausedObs>) {
+              if (transition.mode_ != MetaFailoverMode::kControlled ||
+                  !transition.candidate_action_.has_value()) {
+                return MetaDomainRejectError(
+                    "source-paused-requires-controlled-transition");
+              }
+              const MetaFailoverCompatibilityDomain& domain =
+                  transition.candidate_action_->domain_;
+              if (fact.source_node_id_ != observation.identity_.node_id_ ||
+                  fact.source_boot_id_ !=
+                      observation.identity_.boot_incarnation_ ||
+                  fact.source_group_term_ != domain.source_group_term_ ||
+                  fact.source_node_id_ != domain.source_node_id_ ||
+                  fact.source_assignment_id_ != domain.source_assignment_id_ ||
+                  fact.source_boot_id_ != domain.source_boot_id_ ||
+                  fact.source_history_id_ != domain.source_history_id_ ||
+                  !facts.IsOwnerAssignment(fact.group_id_, fact.source_node_id_,
+                                           fact.source_assignment_id_)) {
+                return MetaDomainRejectError("source-paused-anchor-mismatch");
+              }
+              if (fact.stable_next_lsns_.size() != domain.flow_count_ ||
+                  std::ranges::any_of(
+                      fact.stable_next_lsns_,
+                      [](std::uint64_t lsn) { return lsn == 0; })) {
+                return MetaDomainRejectError("source-paused-frontier-invalid");
+              }
+              return absl::OkStatus();
+            } else {
+              if (IsZeroIdentity(fact.action_id_) ||
+                  !transition.candidate_action_.has_value() ||
+                  transition.candidate_action_->action_id_ != fact.action_id_) {
+                return MetaDomainRejectError("failover-action-mismatch");
+              }
+              const MetaFailoverCandidate& candidate =
+                  transition.candidate_action_->candidate_;
+              if (fact.candidate_node_id_ != observation.identity_.node_id_ ||
+                  fact.candidate_boot_id_ !=
+                      observation.identity_.boot_incarnation_ ||
+                  fact.candidate_node_id_ != candidate.node_id_ ||
+                  fact.candidate_assignment_id_ != candidate.assignment_id_ ||
+                  fact.candidate_boot_id_ != candidate.boot_id_ ||
+                  !facts.AssignmentMatches(fact.group_id_,
+                                           fact.candidate_node_id_,
+                                           fact.candidate_assignment_id_)) {
+                return MetaDomainRejectError(
+                    "failover-candidate-anchor-mismatch");
+              }
+              if constexpr (std::is_same_v<Fact, MetaCandidatePreparedObs>) {
+                if (IsZeroIdentity(fact.prepared_context_id_) ||
+                    IsZeroIdentity(fact.prepared_context_hash_)) {
+                  return MetaDomainRejectError(
+                      "prepared-context-identity-missing");
+                }
+                return absl::OkStatus();
+              } else {
+                if (fact.population_manifest_revision_ !=
+                        facts.CurrentPopulationManifestRevision(
+                            fact.group_id_) ||
+                    fact.population_manifest_digest_ !=
+                        facts.CurrentPopulationManifestDigest(fact.group_id_) ||
+                    fact.partition_replication_epoch_ !=
+                        facts.CurrentPartitionReplicationEpoch(
+                            fact.group_id_)) {
+                  return MetaDomainRejectError(
+                      "action-failed-population-mismatch");
+                }
+                if (fact.failure_class_.empty() ||
+                    CheckFieldSize(fact.failure_class_,
+                                   cluster::control::kMaxIdentifierBytes,
+                                   "failure_class")
+                            .ok() == false ||
+                    CheckFieldSize(fact.failure_detail_, kMaxObsFieldBytes,
+                                   "failure_detail")
+                            .ok() == false) {
+                  return MetaDomainRejectError("action-failed-detail-invalid");
+                }
+                return absl::OkStatus();
+              }
+            }
+          },
+          failover->payload_);
     }
     const auto& evidence = std::get<MetaOperationEvidenceObs>(payload);
     if (evidence.node_id_ != observation.identity_.node_id_) {
@@ -396,8 +558,7 @@ struct MetaObservationStore::Impl {
     }
     if (const absl::Status size =
             CheckFieldSize(evidence.kind_phase_,
-                           cluster::control::kMaxIdentifierBytes,
-                           "kind_phase");
+                           cluster::control::kMaxIdentifierBytes, "kind_phase");
         !size.ok()) {
       return size;
     }
@@ -421,12 +582,12 @@ struct MetaObservationStore::Impl {
     while (audit_ring_.size() >= ring_capacity) {
       audit_ring_.pop_front();  // bounded ring: the oldest event is sacrificed
     }
-    audit_ring_.push_back(
-        MetaObsAuditEvent{kind, BoundedDetail(node_id),
-                          BoundedDetail(std::move(detail)), now_unix_ms});
+    audit_ring_.push_back(MetaObsAuditEvent{kind, BoundedDetail(node_id),
+                                            BoundedDetail(std::move(detail)),
+                                            now_unix_ms});
   }
 
-  // Drops every observation of one node from all four buckets, auditing each
+  // Drops every observation of one node from all five buckets, auditing each
   // drop. Buckets left empty are erased so TotalObservations stays exact.
   void PurgeNode(const std::string& node_id, const std::string& detail,
                  std::int64_t now_unix_ms, std::size_t ring_capacity) {
@@ -441,6 +602,13 @@ struct MetaObservationStore::Impl {
         it != health_by_node_.end()) {
       AccountErase(it->second, false);
       health_by_node_.erase(it);
+      Audit(MetaObsAuditKind::kStalePurged, node_id, detail, now_unix_ms,
+            ring_capacity);
+    }
+    if (const auto it = failover_by_node_.find(node_id);
+        it != failover_by_node_.end()) {
+      AccountErase(it->second, false);
+      failover_by_node_.erase(it);
       Audit(MetaObsAuditKind::kStalePurged, node_id, detail, now_unix_ms,
             ring_capacity);
     }
@@ -483,6 +651,9 @@ struct MetaObservationStore::Impl {
   std::map<std::string, Session> sessions_;
   std::map<std::string, MetaObservation> boot_by_node_;
   std::map<std::string, MetaObservation> health_by_node_;
+  // One replace-or-clear transition fact per authenticated heartbeat source.
+  // Query paths join it back to the active committed transition/action.
+  std::map<std::string, MetaObservation> failover_by_node_;
   // group_id -> node_id -> that node's latest candidate for the group;
   // per-group node count is the bounded candidate set (Limits).
   std::map<std::string, std::map<std::string, MetaObservation>>
@@ -510,11 +681,20 @@ void MetaObservationStore::ResetForLeadershipChange() {
 }
 
 absl::Status MetaObservationStore::AdoptSession(
-    const MetaObservationIdentity& identity, int64_t now_unix_ms) {
+    const MetaObservationIdentity& identity, int64_t now_unix_ms,
+    std::optional<MetaReplicationHistoryId> replication_history_id) {
   std::lock_guard<std::mutex> lock(mutex_);
   Impl& impl = *impl_;
-  if (identity.node_id_.empty() || identity.node_id_.size() > kMetaNodeIdBytes) {
+  if (identity.node_id_.empty() ||
+      identity.node_id_.size() > kMetaNodeIdBytes) {
     const std::string detail = "bad-node-id";
+    impl.Audit(MetaObsAuditKind::kRejected, identity.node_id_, detail,
+               now_unix_ms, limits_.audit_ring_capacity_);
+    return MetaDomainRejectError(detail);
+  }
+  if (replication_history_id.has_value() &&
+      IsZeroIdentity(*replication_history_id)) {
+    const std::string detail = "empty-replication-history-id";
     impl.Audit(MetaObsAuditKind::kRejected, identity.node_id_, detail,
                now_unix_ms, limits_.audit_ring_capacity_);
     return MetaDomainRejectError(detail);
@@ -546,8 +726,20 @@ absl::Status MetaObservationStore::AdoptSession(
                  "superseded-by-generation:" +
                      std::to_string(identity.session_generation_),
                  now_unix_ms, limits_.audit_ring_capacity_);
-  impl.sessions_[identity.node_id_] =
-      Impl::Session{identity.boot_incarnation_, identity.session_generation_};
+  Impl::Session replacement{.boot_incarnation_ = identity.boot_incarnation_,
+                            .replication_history_id_ = replication_history_id,
+                            .generation_ = identity.session_generation_,
+                            .connected_ = true,
+                            .disconnected_unix_ms_ = std::nullopt,
+                            .disconnected_boot_id_ = std::nullopt,
+                            .disconnected_generation_ = std::nullopt,
+                            .heartbeat_failover_projection_ = std::nullopt};
+  if (it != impl.sessions_.end()) {
+    replacement.disconnected_unix_ms_ = it->second.disconnected_unix_ms_;
+    replacement.disconnected_boot_id_ = it->second.disconnected_boot_id_;
+    replacement.disconnected_generation_ = it->second.disconnected_generation_;
+  }
+  impl.sessions_[identity.node_id_] = std::move(replacement);
   return absl::OkStatus();
 }
 
@@ -560,8 +752,14 @@ void MetaObservationStore::InvalidateCandidateOnDisconnect(
       session->second.boot_incarnation_ != identity.boot_incarnation_) {
     return;
   }
+  session->second.connected_ = false;
+  session->second.disconnected_unix_ms_ = now_unix_ms;
+  session->second.disconnected_boot_id_ = identity.boot_incarnation_;
+  session->second.disconnected_generation_ = identity.session_generation_;
   ClearCandidatesForNodeLocked(identity.node_id_, now_unix_ms,
                                "session-disconnected");
+  ClearCandidateFailoverForNodeLocked(identity.node_id_, now_unix_ms,
+                                      "session-disconnected");
 }
 
 absl::Status MetaObservationStore::Ingest(MetaObservation observation,
@@ -571,9 +769,9 @@ absl::Status MetaObservationStore::Ingest(MetaObservation observation,
   return IngestLocked(std::move(observation), facts, now_unix_ms);
 }
 
-absl::Status MetaObservationStore::IngestLocked(
-    MetaObservation observation, const MetaCommittedFacts& facts,
-    int64_t now_unix_ms) {
+absl::Status MetaObservationStore::IngestLocked(MetaObservation observation,
+                                                const MetaCommittedFacts& facts,
+                                                int64_t now_unix_ms) {
   Impl& impl = *impl_;
   if (auto* candidate =
           std::get_if<MetaCandidateProgressObs>(&observation.payload_);
@@ -581,6 +779,14 @@ absl::Status MetaObservationStore::IngestLocked(
     // Preserve the administrative/test observation adapter: it predates the
     // explicit payload copy but still arrives through a trusted identity.
     candidate->session_generation_ = observation.identity_.session_generation_;
+  }
+  if (auto* failover =
+          std::get_if<MetaFailoverObservationObs>(&observation.payload_)) {
+    if (auto* prepared =
+            std::get_if<MetaCandidatePreparedObs>(&failover->payload_)) {
+      // This value is session-layer evidence, not a Data-supplied claim.
+      prepared->session_generation_ = observation.identity_.session_generation_;
+    }
   }
   const absl::Status valid = impl.Validate(observation, facts);
   if (!valid.ok()) {
@@ -634,6 +840,10 @@ absl::Status MetaObservationStore::IngestLocked(
   if (std::holds_alternative<MetaNodeHealthObs>(observation.payload_)) {
     return store_latest(impl.health_by_node_);
   }
+  if (std::holds_alternative<MetaFailoverObservationObs>(
+          observation.payload_)) {
+    return store_latest(impl.failover_by_node_);
+  }
   if (const auto* candidate =
           std::get_if<MetaCandidateProgressObs>(&observation.payload_)) {
     auto group_it = impl.candidates_by_group_.find(candidate->group_id_);
@@ -646,10 +856,9 @@ absl::Status MetaObservationStore::IngestLocked(
       // Hard caps fail safe: a NEW node beyond the bounded
       // per-group candidate set or the total cap is rejected, never silently
       // squeezed in; refreshing an existing key never grows the state.
-      const std::size_t group_size =
-          group_it == impl.candidates_by_group_.end()
-              ? 0
-              : group_it->second.size();
+      const std::size_t group_size = group_it == impl.candidates_by_group_.end()
+                                         ? 0
+                                         : group_it->second.size();
       if (group_size >= limits_.max_candidates_per_group_) {
         return reject("candidate-set-full:group=" + candidate->group_id_);
       }
@@ -690,10 +899,9 @@ absl::Status MetaObservationStore::IngestLocked(
       std::get<MetaOperationEvidenceObs>(observation.payload_);
   auto op_it = impl.evidence_by_operation_.find(evidence.operation_id_);
   const Impl::EvidenceKey key{node_id, evidence.kind_phase_};
-  auto existing =
-      op_it == impl.evidence_by_operation_.end()
-          ? std::map<Impl::EvidenceKey, MetaObservation>::iterator{}
-          : op_it->second.find(key);
+  auto existing = op_it == impl.evidence_by_operation_.end()
+                      ? std::map<Impl::EvidenceKey, MetaObservation>::iterator{}
+                      : op_it->second.find(key);
   const bool is_new = op_it == impl.evidence_by_operation_.end() ||
                       existing == op_it->second.end();
   if (is_new) {
@@ -758,10 +966,53 @@ void MetaObservationStore::ClearCandidatesForNodeLocked(
   }
 }
 
+void MetaObservationStore::ClearCandidateFailoverForNodeLocked(
+    std::string_view node_id, int64_t now_unix_ms, std::string_view detail) {
+  const auto it = impl_->failover_by_node_.find(std::string(node_id));
+  if (it == impl_->failover_by_node_.end()) return;
+  const auto& failover =
+      std::get<MetaFailoverObservationObs>(it->second.payload_);
+  if (std::holds_alternative<MetaSourcePausedObs>(failover.payload_)) {
+    // A disconnected old source observation remains usable on a best-effort
+    // basis until its independent grace/TTL expires. Candidate action
+    // observations have no such grace.
+    return;
+  }
+  impl_->AccountErase(it->second, false);
+  impl_->failover_by_node_.erase(it);
+  if (!detail.empty()) {
+    impl_->Audit(MetaObsAuditKind::kStalePurged, std::string(node_id),
+                 std::string(detail), now_unix_ms,
+                 limits_.audit_ring_capacity_);
+  }
+}
+
 MetaObservationStore::HeartbeatReplaceResult
 MetaObservationStore::ReplaceHeartbeat(
     const MetaObservationIdentity& identity, MetaNodeHealthObs health,
     std::optional<MetaCandidateProgressObs> candidate,
+    const MetaCommittedFacts& facts, int64_t now_unix_ms) {
+  return ReplaceHeartbeat(identity, std::move(health), std::move(candidate),
+                          std::nullopt, std::nullopt, facts, now_unix_ms);
+}
+
+MetaObservationStore::HeartbeatReplaceResult
+MetaObservationStore::ReplaceHeartbeat(
+    const MetaObservationIdentity& identity, MetaNodeHealthObs health,
+    std::optional<MetaCandidateProgressObs> candidate,
+    std::optional<MetaFailoverObservationObs> failover,
+    const MetaCommittedFacts& facts, int64_t now_unix_ms) {
+  return ReplaceHeartbeat(identity, std::move(health), std::move(candidate),
+                          std::move(failover), std::nullopt, facts,
+                          now_unix_ms);
+}
+
+MetaObservationStore::HeartbeatReplaceResult
+MetaObservationStore::ReplaceHeartbeat(
+    const MetaObservationIdentity& identity, MetaNodeHealthObs health,
+    std::optional<MetaCandidateProgressObs> candidate,
+    std::optional<MetaFailoverObservationObs> failover,
+    std::optional<MetaObservedFailoverProjection> failover_projection,
     const MetaCommittedFacts& facts, int64_t now_unix_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
   const absl::Status identity_status = impl_->CheckIdentity(identity, facts);
@@ -773,8 +1024,15 @@ MetaObservationStore::ReplaceHeartbeat(
                  limits_.audit_ring_capacity_);
     return {.boot_status_ = rejected,
             .health_status_ = rejected,
-            .candidate_status_ = rejected};
+            .candidate_status_ = rejected,
+            .failover_status_ = rejected};
   }
+
+  // The projection marker and role replacement describe the same heartbeat.
+  // Publishing them under this lock prevents a planner from observing an
+  // exact-action omission paired with candidate state from another frame.
+  impl_->sessions_.at(identity.node_id_).heartbeat_failover_projection_ =
+      std::move(failover_projection);
 
   HeartbeatReplaceResult result;
   result.boot_status_ = IngestLocked(
@@ -793,15 +1051,53 @@ MetaObservationStore::ReplaceHeartbeat(
                                    : "heartbeat-role-has-no-candidate");
   if (candidate.has_value() && result.boot_status_.ok() &&
       result.health_status_.ok()) {
-    result.candidate_status_ = IngestLocked(
-        MetaObservation{.identity_ = identity,
-                        .payload_ = std::move(*candidate)},
-        facts, now_unix_ms);
+    result.candidate_status_ =
+        IngestLocked(MetaObservation{.identity_ = identity,
+                                     .payload_ = std::move(*candidate)},
+                     facts, now_unix_ms);
+    if (result.candidate_status_.ok() &&
+        !facts.IsCurrentFailoverCandidate(identity.node_id_,
+                                          identity.boot_incarnation_)) {
+      auto session = impl_->sessions_.find(identity.node_id_);
+      if (session != impl_->sessions_.end() &&
+          session->second.boot_incarnation_ == identity.boot_incarnation_ &&
+          session->second.generation_ == identity.session_generation_ &&
+          session->second.disconnected_boot_id_ ==
+              std::optional(identity.boot_incarnation_)) {
+        // Fresh generic progress before an action is selected is a new
+        // eligibility observation, not a revival of an older attempt. Once
+        // committed state binds this boot to an action, its disconnect latch
+        // is never cleared and that action cannot be resurrected by reconnect.
+        session->second.disconnected_unix_ms_.reset();
+        session->second.disconnected_boot_id_.reset();
+        session->second.disconnected_generation_.reset();
+      }
+    }
   } else if (candidate.has_value()) {
     result.candidate_status_ = absl::FailedPreconditionError(
         "candidate requires accepted heartbeat boot and health");
   } else {
     result.candidate_status_ = absl::OkStatus();
+  }
+
+  // Transition evidence is also replace-or-clear. Clearing first makes a
+  // malformed new report fail closed instead of retaining a stale fact.
+  if (const auto existing = impl_->failover_by_node_.find(identity.node_id_);
+      existing != impl_->failover_by_node_.end()) {
+    impl_->AccountErase(existing->second, false);
+    impl_->failover_by_node_.erase(existing);
+  }
+  if (failover.has_value() && result.boot_status_.ok() &&
+      result.health_status_.ok()) {
+    result.failover_status_ =
+        IngestLocked(MetaObservation{.identity_ = identity,
+                                     .payload_ = std::move(*failover)},
+                     facts, now_unix_ms);
+  } else if (failover.has_value()) {
+    result.failover_status_ = absl::FailedPreconditionError(
+        "failover observation requires accepted heartbeat boot and health");
+  } else {
+    result.failover_status_ = absl::OkStatus();
   }
   return result;
 }
@@ -834,6 +1130,7 @@ void MetaObservationStore::RevalidateAll(const MetaCommittedFacts& facts,
   };
   revalidate_map(impl.boot_by_node_);
   revalidate_map(impl.health_by_node_);
+  revalidate_map(impl.failover_by_node_);
   for (auto group_it = impl.candidates_by_group_.begin();
        group_it != impl.candidates_by_group_.end();) {
     revalidate_map(group_it->second);
@@ -881,10 +1178,9 @@ bool MetaObservationStore::MaybeSweepExpired(int64_t now_unix_ms) {
   // node heartbeats into N complete map scans. A backwards wall-clock step
   // starts a new cadence epoch; expiry itself remains conservative because
   // SweepExpiredLocked uses the caller's current wall time.
-  const std::int64_t interval_ms =
-      std::max<std::int64_t>(
-          1, std::min<std::int64_t>(1000, std::max<std::int64_t>(
-                                                1, limits_.ttl_ms_ / 4)));
+  const std::int64_t interval_ms = std::max<std::int64_t>(
+      1, std::min<std::int64_t>(
+             1000, std::max<std::int64_t>(1, limits_.ttl_ms_ / 4)));
   if (impl.last_periodic_sweep_unix_ms_.has_value() &&
       now_unix_ms >= *impl.last_periodic_sweep_unix_ms_ &&
       now_unix_ms - *impl.last_periodic_sweep_unix_ms_ < interval_ms) {
@@ -920,6 +1216,7 @@ void MetaObservationStore::SweepExpiredLocked(int64_t now_unix_ms) {
   };
   sweep_map(impl.boot_by_node_);
   sweep_map(impl.health_by_node_);
+  sweep_map(impl.failover_by_node_);
   for (auto group_it = impl.candidates_by_group_.begin();
        group_it != impl.candidates_by_group_.end();) {
     sweep_map(group_it->second);
@@ -1003,9 +1300,9 @@ MetaObservationStore::CandidateProgressFor(
 }
 
 std::vector<MetaCandidateProgressObs>
-MetaObservationStore::LiveCandidateProgressFor(
-    std::string_view group_id, const MetaCommittedFacts& facts,
-    int64_t now_unix_ms) const {
+MetaObservationStore::LiveCandidateProgressFor(std::string_view group_id,
+                                               const MetaCommittedFacts& facts,
+                                               int64_t now_unix_ms) const {
   std::lock_guard<std::mutex> lock(mutex_);
   const Impl& impl = *impl_;
   std::vector<MetaCandidateProgressObs> out;
@@ -1034,13 +1331,16 @@ MetaObservationStore::LiveCandidateProgressFor(
 }
 
 std::optional<MetaObservation> MetaObservationStore::LatestForNode(
-    std::string_view node_id, const MetaCommittedFacts& facts) const {
+    std::string_view node_id, const MetaCommittedFacts& facts,
+    std::optional<int64_t> now_unix_ms) const {
   std::lock_guard<std::mutex> lock(mutex_);
   const Impl& impl = *impl_;
   const std::string node_key(node_id);
   const MetaObservation* newest = nullptr;
   auto consider = [&](const MetaObservation& observation) {
-    if (!impl.Validate(observation, facts).ok()) {
+    if (!impl.Validate(observation, facts).ok() ||
+        (now_unix_ms.has_value() &&
+         ObservationExpired(observation, *now_unix_ms, limits_.ttl_ms_))) {
       return;
     }
     if (newest == nullptr ||
@@ -1054,6 +1354,10 @@ std::optional<MetaObservation> MetaObservationStore::LatestForNode(
   }
   if (const auto it = impl.health_by_node_.find(node_key);
       it != impl.health_by_node_.end()) {
+    consider(it->second);
+  }
+  if (const auto it = impl.failover_by_node_.find(node_key);
+      it != impl.failover_by_node_.end()) {
     consider(it->second);
   }
   for (const auto& [group_id, by_node] : impl.candidates_by_group_) {
@@ -1075,9 +1379,9 @@ std::optional<MetaObservation> MetaObservationStore::LatestForNode(
 }
 
 std::vector<MetaOperationEvidenceObs>
-MetaObservationStore::EvidenceForOperation(
-    const MetaOperationId& id, const MetaCommittedFacts& facts,
-    int64_t now_unix_ms) const {
+MetaObservationStore::EvidenceForOperation(const MetaOperationId& id,
+                                           const MetaCommittedFacts& facts,
+                                           int64_t now_unix_ms) const {
   std::lock_guard<std::mutex> lock(mutex_);
   const Impl& impl = *impl_;
   std::vector<MetaOperationEvidenceObs> out;
@@ -1095,6 +1399,88 @@ MetaObservationStore::EvidenceForOperation(
   return out;
 }
 
+std::optional<MetaSourcePausedObs> MetaObservationStore::SourcePausedFor(
+    const MetaFailoverTransitionId& transition_id,
+    const MetaCommittedFacts& facts, int64_t now_unix_ms) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const Impl& impl = *impl_;
+  for (const auto& [node_id, observation] : impl.failover_by_node_) {
+    (void)node_id;
+    if (ObservationExpired(observation, now_unix_ms, limits_.ttl_ms_) ||
+        !impl.Validate(observation, facts).ok()) {
+      continue;
+    }
+    const auto& failover =
+        std::get<MetaFailoverObservationObs>(observation.payload_);
+    const auto* source = std::get_if<MetaSourcePausedObs>(&failover.payload_);
+    if (source == nullptr || source->transition_id_ != transition_id) continue;
+    MetaSourcePausedObs result = *source;
+    result.received_unix_ms_ = observation.received_unix_ms_;
+    result.expires_unix_ms_ =
+        ObservationExpiry(observation.received_unix_ms_, limits_.ttl_ms_);
+    return result;
+  }
+  return std::nullopt;
+}
+
+std::optional<MetaCandidatePreparedObs>
+MetaObservationStore::CandidatePreparedFor(
+    const MetaFailoverTransitionId& transition_id,
+    const MetaFailoverActionId& action_id, const MetaCommittedFacts& facts,
+    int64_t now_unix_ms) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const Impl& impl = *impl_;
+  for (const auto& [node_id, observation] : impl.failover_by_node_) {
+    (void)node_id;
+    if (ObservationExpired(observation, now_unix_ms, limits_.ttl_ms_) ||
+        !impl.Validate(observation, facts).ok()) {
+      continue;
+    }
+    const auto& failover =
+        std::get<MetaFailoverObservationObs>(observation.payload_);
+    const auto* prepared =
+        std::get_if<MetaCandidatePreparedObs>(&failover.payload_);
+    if (prepared == nullptr || prepared->transition_id_ != transition_id ||
+        prepared->action_id_ != action_id) {
+      continue;
+    }
+    MetaCandidatePreparedObs result = *prepared;
+    result.received_unix_ms_ = observation.received_unix_ms_;
+    result.expires_unix_ms_ =
+        ObservationExpiry(observation.received_unix_ms_, limits_.ttl_ms_);
+    return result;
+  }
+  return std::nullopt;
+}
+
+std::optional<MetaActionFailedObs> MetaObservationStore::ActionFailedFor(
+    const MetaFailoverTransitionId& transition_id,
+    const MetaFailoverActionId& action_id, const MetaCommittedFacts& facts,
+    int64_t now_unix_ms) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const Impl& impl = *impl_;
+  for (const auto& [node_id, observation] : impl.failover_by_node_) {
+    (void)node_id;
+    if (ObservationExpired(observation, now_unix_ms, limits_.ttl_ms_) ||
+        !impl.Validate(observation, facts).ok()) {
+      continue;
+    }
+    const auto& failover =
+        std::get<MetaFailoverObservationObs>(observation.payload_);
+    const auto* failed = std::get_if<MetaActionFailedObs>(&failover.payload_);
+    if (failed == nullptr || failed->transition_id_ != transition_id ||
+        failed->action_id_ != action_id) {
+      continue;
+    }
+    MetaActionFailedObs result = *failed;
+    result.received_unix_ms_ = observation.received_unix_ms_;
+    result.expires_unix_ms_ =
+        ObservationExpiry(observation.received_unix_ms_, limits_.ttl_ms_);
+    return result;
+  }
+  return std::nullopt;
+}
+
 std::optional<uint64_t> MetaObservationStore::CurrentGeneration(
     std::string_view node_id) const {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -1103,6 +1489,25 @@ std::optional<uint64_t> MetaObservationStore::CurrentGeneration(
     return std::nullopt;
   }
   return it->second.generation_;
+}
+
+std::optional<MetaObservedSessionState> MetaObservationStore::SessionStateFor(
+    std::string_view node_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = impl_->sessions_.find(std::string(node_id));
+  if (it == impl_->sessions_.end()) {
+    return std::nullopt;
+  }
+  return MetaObservedSessionState{
+      .current_boot_id_ = it->second.boot_incarnation_,
+      .current_history_id_ = it->second.replication_history_id_,
+      .current_generation_ = it->second.generation_,
+      .connected_ = it->second.connected_,
+      .disconnected_unix_ms_ = it->second.disconnected_unix_ms_,
+      .disconnected_boot_id_ = it->second.disconnected_boot_id_,
+      .disconnected_generation_ = it->second.disconnected_generation_,
+      .heartbeat_failover_projection_ =
+          it->second.heartbeat_failover_projection_};
 }
 
 std::vector<MetaObsAuditEvent> MetaObservationStore::AuditRing() const {

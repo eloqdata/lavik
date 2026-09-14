@@ -514,6 +514,191 @@ def scripted_cluster_create_gate(workdir):
     H.log("keylane-ctl cluster-create atomic acceptance and exit gates — OK")
 
 
+def scripted_failover_gate(workdir):
+    """Pin failover request identity, deadline, and uncertain exit semantics."""
+    directory = os.path.join(workdir, "scripted-failover")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+
+    def wire_string(value):
+        encoded = value.encode()
+        return struct.pack(">I", len(encoded)) + encoded
+
+    def lifecycle(state, revision, root=None, genesis=None, phase=None,
+                  failure=None):
+        payload = bytes([state]) + struct.pack(">Q", revision)
+        payload += bytes([root is not None])
+        if root is not None:
+            payload += wire_string(root)
+        payload += bytes([genesis is not None])
+        if genesis is not None:
+            payload += struct.pack(">Q", genesis)
+        for value in (phase, failure):
+            payload += bytes([value is not None])
+            if value is not None:
+                payload += wire_string(value)
+        return payload
+
+    member = struct.pack(">IBB", 1, 0, 1)
+    head_payload = (
+        struct.pack(">HIBQBIQI", 1, 1, 1, 1, 1, 1, 1, 1) + member)
+    node_id = "0123456789abcdef0123456789abcdef01234567"
+    data_node = (
+        wire_string(node_id) + bytes([0, 0, 1]) +
+        wire_string("group-1") + bytes([1, 1, 1, 1, 0]))
+    group = (
+        wire_string("group-1") + struct.pack(">Q", 4) + bytes([1]) +
+        wire_string(node_id) + struct.pack(">QBQBB", 8, 1, 12, 1, 1))
+    slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
+    status_payload = (
+        struct.pack(">HIQQQQ", 2, 1, 1, 1, 50, 3) +
+        lifecycle(2, 2, "00112233445566778899aabbccddeeff", 3) +
+        bytes([1, 1, 1, 1, 1]) + struct.pack(">I", 1) + member +
+        struct.pack(">I", 1) + data_node +
+        struct.pack(">I", 1) + group +
+        struct.pack(">I", 1) + slot_range + struct.pack(">I", 0))
+    head_reply = "OK clusterhead 1 " + head_payload.hex()
+    status_reply = "OK clusterstatus 1 " + status_payload.hex()
+
+    def decode_request(command):
+        prefix = "failover 1 "
+        if not command.startswith(prefix):
+            raise H.Failure(f"unexpected failover command: {command!r}")
+        try:
+            payload = bytes.fromhex(command[len(prefix):])
+        except ValueError as error:
+            raise H.Failure("failover request was not lowercase hex") from error
+        if command[len(prefix):] != command[len(prefix):].lower():
+            raise H.Failure("failover request used non-canonical hex")
+        if len(payload) < 26:
+            raise H.Failure("failover request was truncated")
+        operation = payload[:16].hex()
+        group_size = struct.unpack(">H", payload[16:18])[0]
+        expected_size = 16 + 2 + group_size + 8
+        if len(payload) != expected_size:
+            raise H.Failure("failover request has trailing or missing bytes")
+        group_id = payload[18:18 + group_size].decode()
+        deadline = struct.unpack(">Q", payload[-8:])[0]
+        return operation, group_id, deadline
+
+    def run_server(name, mutation_reply, expected):
+        path = os.path.join(directory, name + ".sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(8)
+        listener.settimeout(0.1)
+        stopped = threading.Event()
+        errors = []
+        requests = []
+        decoded = []
+
+        def serve():
+            while not stopped.is_set():
+                try:
+                    connection, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError as error:
+                    if not stopped.is_set():
+                        errors.append(error)
+                    return
+                with connection:
+                    reader = connection.makefile("rb")
+                    command = reader.readline().decode().rstrip("\n")
+                    requests.append(command)
+                    if command == "clusterhead 1":
+                        reply = head_reply
+                    elif command == "clusterstatus 1":
+                        reply = status_reply
+                    elif command.startswith("failover 1 "):
+                        try:
+                            request = decode_request(command)
+                            decoded.append(request)
+                            reply = mutation_reply.replace("{operation}",
+                                                           request[0])
+                        except H.Failure as error:
+                            errors.append(error)
+                            reply = "ERR bad-request"
+                    else:
+                        reply = "ERR bad-request"
+                    connection.sendall(reply.encode() + b"\n")
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            before = int(time.time() * 1000)
+            result = run_cluster(
+                ["failover", "group-1", "--socket", path,
+                 "--failover-timeout-ms", "5000", "--timeout-ms", "2000"],
+                expected=expected, timeout=5)
+            after = int(time.time() * 1000)
+        finally:
+            stopped.set()
+            listener.close()
+            thread.join(timeout=2)
+        if thread.is_alive() or errors:
+            raise H.Failure(f"scripted failover server failed: {errors}")
+        if decoded:
+            operation, group_id, deadline = decoded[0]
+            if (group_id != "group-1" or deadline < before + 4_500 or
+                    deadline > after + 5_500):
+                raise H.Failure(
+                    "failover request lost group/deadline binding: "
+                    f"decoded={decoded[0]!r} before={before} after={after}")
+            if len(operation) != 32 or operation == "0" * 32:
+                raise H.Failure("failover operation id is not a fresh id")
+        return result, requests, decoded
+
+    accepted, requests, decoded = run_server(
+        "success", "OK failover 1 51 {operation}", expected=0)
+    if (not decoded or
+            "Controlled failover accepted: commit=51 operation=" not in
+            accepted.stdout or "Use getop " not in accepted.stdout or
+            not any(request.startswith("failover 1 ") for request in requests)):
+        raise H.Failure(
+            "failover success omitted its durable recovery identity: "
+            f"stdout={accepted.stdout!r} requests={requests!r}")
+
+    rejected, _, _ = run_server(
+        "rejected", "ERR failover 1 preflight no-candidate", expected=2)
+    if "no-candidate" not in rejected.stderr:
+        raise H.Failure("failover preflight rejection lost its cause")
+
+    uncertain, _, decoded = run_server(
+        "uncertain", "OK failover 1 malformed", expected=3)
+    if (not decoded or decoded[0][0] not in uncertain.stderr or
+            "untrustworthy" not in uncertain.stderr):
+        raise H.Failure(
+            "failover uncertain response omitted operation recovery identity")
+
+    proposal_timeout, _, decoded = run_server(
+        "proposal-timeout", "ERR failover 1 proposal timeout", expected=3)
+    if (not decoded or decoded[0][0] not in proposal_timeout.stderr or
+            "outcome is uncertain" not in proposal_timeout.stderr):
+        raise H.Failure(
+            "failover proposal timeout omitted operation recovery identity")
+
+    resource_rejected, _, _ = run_server(
+        "resource-rejected",
+        "ERR failover 1 proposal resource-exhausted", expected=2)
+    if ("resource-exhausted" not in resource_rejected.stderr or
+            "outcome is uncertain" in resource_rejected.stderr):
+        raise H.Failure(
+            "pre-append failover resource gate used uncertain exit semantics")
+
+    missing_group = run_cluster(
+        ["failover", "--socket", os.path.join(directory, "unused.sock")],
+        expected=1)
+    if missing_group.stdout or "requires GROUP" not in missing_group.stderr:
+        raise H.Failure("failover accepted a missing group")
+    bad_timeout = run_cluster(
+        ["failover", "group-1", "--socket",
+         os.path.join(directory, "unused.sock"),
+         "--failover-timeout-ms", "0"], expected=1)
+    if (bad_timeout.stdout or "1 through 86400000" not in bad_timeout.stderr):
+        raise H.Failure("failover accepted an invalid transition timeout")
+    H.log("keylane-ctl failover request, deadline, and exit gates — OK")
+
+
 def dual_listener_rollback_gate(workdir):
     directory = os.path.join(workdir, "rollback")
     data_dir = os.path.join(directory, "node1")
@@ -911,6 +1096,7 @@ def main():
         raw_argument_gate(workdir)
         scripted_cluster_gate(workdir)
         scripted_cluster_create_gate(workdir)
+        scripted_failover_gate(workdir)
         dual_listener_rollback_gate(workdir)
         unix_gate(workdir)
         plaintext_gate(workdir)

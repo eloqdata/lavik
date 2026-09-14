@@ -314,9 +314,11 @@ TEST(MetaAuditStore, DeserializeRejectsCorruptionAndChainBreaks) {
 using keylane::meta::ActivateAuthority;
 using keylane::meta::BeginGroupTerm;
 using keylane::meta::GrantAuthority;
+using keylane::meta::MetaFailoverActionId;
 using keylane::meta::MetaGrantSpec;
 using keylane::meta::MetaGrantStore;
 using keylane::meta::RevokeGrant;
+using keylane::meta::ValidateMetaGrantSpec;
 
 MetaGrantSpec MakeSpec(std::uint64_t lease_ms = 30000,
                        std::string policy_id = "policy/leader-lease",
@@ -326,6 +328,21 @@ MetaGrantSpec MakeSpec(std::uint64_t lease_ms = 30000,
   spec.policy_id_ = std::move(policy_id);
   spec.policy_version_ = policy_version;
   return spec;
+}
+
+TEST(MetaGrantStore, SharedGrantSpecValidationMatchesControlWireDomain) {
+  EXPECT_TRUE(ValidateMetaGrantSpec(MakeSpec()).ok());
+  EXPECT_TRUE(
+      ValidateMetaGrantSpec(MakeSpec(std::numeric_limits<std::uint32_t>::max()))
+          .ok());
+
+  EXPECT_EQ(MetaFailureClassOf(ValidateMetaGrantSpec(MakeSpec(/*lease_ms=*/0))),
+            MetaFailureClass::kDomainReject);
+  EXPECT_EQ(MetaFailureClassOf(ValidateMetaGrantSpec(
+                MakeSpec(static_cast<std::uint64_t>(
+                             std::numeric_limits<std::uint32_t>::max()) +
+                         1))),
+            MetaFailureClass::kDomainReject);
 }
 
 BeginGroupTerm MakeBeginTerm(std::string group_id, std::uint64_t expected,
@@ -435,6 +452,76 @@ TEST(MetaGrantStore, ActivateInstallsGrantWithoutMovingTerm) {
   EXPECT_EQ(state->grant_->spec_, MakeSpec());
   EXPECT_EQ(state->last_authority_version_, 1);
   EXPECT_EQ(state->last_grant_revision_, 10);
+}
+
+TEST(MetaGrantStore, ActivationActionIdentityIsInstalledPreservedAndCleared) {
+  MetaGrantStore store;
+  ASSERT_TRUE(store.AddGroup("g1").ok());
+  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
+
+  MetaFailoverActionId action_id{};
+  action_id.fill(0x5a);
+  ActivateAuthority failover = MakeActivate("g1", 1, "node-a", 1);
+  ASSERT_TRUE(store.ValidateActivate(failover, 10, action_id).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(failover, 10, action_id).ok());
+  ASSERT_EQ(store.GroupState("g1")->grant_->activation_action_id_, action_id);
+
+  GrantAuthority renew;
+  renew.group_id_ = "g1";
+  renew.node_id_ = "node-a";
+  renew.term_ = 1;
+  renew.authority_version_ = 1;
+  renew.grant_ = MakeSpec(/*lease_ms=*/31000);
+  ASSERT_TRUE(store.GrantAuthority(renew, 11).ok());
+  ASSERT_EQ(store.GroupState("g1")->grant_->activation_action_id_, action_id);
+
+  const auto encoded = store.Serialize();
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  const auto restored = MetaGrantStore::Deserialize(*encoded);
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  ASSERT_EQ(restored->GroupState("g1")->grant_->activation_action_id_,
+            action_id);
+
+  ActivateAuthority ordinary = MakeActivate("g1", 1, "node-a", 2);
+  ASSERT_TRUE(store.ValidateActivate(ordinary, 12).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(ordinary, 12).ok());
+  EXPECT_FALSE(
+      store.GroupState("g1")->grant_->activation_action_id_.has_value());
+}
+
+TEST(MetaGrantStore, RejectsZeroPresentActivationActionIdentity) {
+  MetaGrantStore store;
+  ASSERT_TRUE(store.AddGroup("g1").ok());
+  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
+  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
+  const MetaFailoverActionId zero_action{};
+
+  EXPECT_EQ(
+      MetaFailureClassOf(store.ValidateActivate(activate, 10, zero_action)),
+      MetaFailureClass::kDomainReject);
+  EXPECT_DEATH(store.ApplyGrantPart(activate, 10, zero_action), "");
+}
+
+TEST(MetaGrantStore, DeserializeRejectsZeroPresentActivationActionIdentity) {
+  MetaGrantStore store;
+  ASSERT_TRUE(store.AddGroup("g1").ok());
+  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
+  MetaFailoverActionId action_id{};
+  action_id.fill(0x5a);
+  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
+  ASSERT_TRUE(store.ValidateActivate(activate, 10, action_id).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, 10, action_id).ok());
+
+  auto bytes = store.Serialize();
+  ASSERT_TRUE(bytes.ok()) << bytes.status();
+  const std::string encoded_action(16, static_cast<char>(0x5a));
+  const std::size_t offset = bytes->find(encoded_action);
+  ASSERT_NE(offset, std::string::npos);
+  bytes->replace(offset, encoded_action.size(), encoded_action.size(), '\0');
+
+  const auto restored = MetaGrantStore::Deserialize(*bytes);
+  ASSERT_FALSE(restored.ok());
+  EXPECT_EQ(MetaFailureClassOf(restored.status()), MetaFailureClass::kFailStop);
 }
 
 TEST(MetaGrantStore, RejectsLeaseDurationOutsideControlWireDomain) {
@@ -716,10 +803,11 @@ TEST(MetaGrantStore, DeserializeRejectsUnprojectableLeaseDuration) {
   writer.WriteBool(false);
   writer.WriteU8(1);  // active grant present
   writer.WriteString("node-a");
-  writer.WriteU64(1);   // grant term
-  writer.WriteU64(1);   // authority version
-  writer.WriteU64(10);  // grant revision
-  writer.WriteU64(0);   // lease duration cannot be projected to the wire
+  writer.WriteU64(1);       // grant term
+  writer.WriteU64(1);       // authority version
+  writer.WriteU64(10);      // grant revision
+  writer.WriteBool(false);  // no failover activation action
+  writer.WriteU64(0);       // lease duration cannot be projected to the wire
   writer.WriteString("policy/leader-lease");
   writer.WriteU64(7);
 
@@ -809,8 +897,8 @@ TEST(MetaOperationStore, SubmitCreatesSubmittedRecordKeyedByClientId) {
   EXPECT_EQ(store.FindOperationBySeq(100)->operation_id_, id);
   EXPECT_EQ(store.ActiveCount(), 1);
   EXPECT_TRUE(store.HasActiveKind("failover"));
-  EXPECT_FALSE(store.HasActiveKind(
-      keylane::meta::kMetaClusterCreateOperationKind));
+  EXPECT_FALSE(
+      store.HasActiveKind(keylane::meta::kMetaClusterCreateOperationKind));
   EXPECT_TRUE(store.OperationKnown(id));
   EXPECT_FALSE(store.OperationKnown(MakeOperationId(9)));
 }
@@ -887,9 +975,9 @@ TEST(MetaOperationStore, DirectiveRevisionTracksOnlySemanticChanges) {
   TransitionOperationPhase unsupported = unchanged;
   unsupported.expected_revision_ = 2;
   unsupported.current_directives_[0].payload_ = "not-interpreted-in-v1";
-  EXPECT_EQ(MetaFailureClassOf(
-                store.TransitionOperationPhase(unsupported, 103)),
-            MetaFailureClass::kDomainReject);
+  EXPECT_EQ(
+      MetaFailureClassOf(store.TransitionOperationPhase(unsupported, 103)),
+      MetaFailureClass::kDomainReject);
 
   TransitionOperationPhase changed = unchanged;
   changed.expected_revision_ = 2;

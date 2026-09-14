@@ -150,6 +150,63 @@ std::string Hex(const std::array<std::uint8_t, N>& bytes) {
   return result;
 }
 
+absl::StatusOr<control::WireFailoverTransition> ProjectFailoverTransition(
+    const MetaFailoverTransition& source) {
+  if (absl::Status status = ValidateMetaFailoverTransition(source);
+      !status.ok()) {
+    return Inconsistent(absl::StrCat("invalid committed failover transition: ",
+                                     status.message()));
+  }
+
+  control::WireFailoverTransition projected;
+  projected.transition_id = source.transition_id_;
+  projected.revision = source.revision_;
+  switch (source.mode_) {
+    case MetaFailoverMode::kControlled:
+      projected.mode = control::WireFailoverMode::kControlled;
+      break;
+    case MetaFailoverMode::kUncontrolled:
+      projected.mode = control::WireFailoverMode::kUncontrolled;
+      break;
+  }
+  projected.target_term = source.target_term_;
+  if (source.candidate_action_.has_value()) {
+    const MetaFailoverCandidateAction& action = *source.candidate_action_;
+    control::WireFailoverCandidateAction projected_action;
+    projected_action.action_id = action.action_id_;
+    projected_action.candidate = {
+        .node_id = action.candidate_.node_id_,
+        .assignment_id = action.candidate_.assignment_id_,
+        .boot_id = Hex(action.candidate_.boot_id_),
+    };
+    projected_action.domain = {
+        .source_group_term = action.domain_.source_group_term_,
+        .source_node_id = action.domain_.source_node_id_,
+        .source_assignment_id = action.domain_.source_assignment_id_,
+        .source_boot_id = Hex(action.domain_.source_boot_id_),
+        .source_history_id = Hex(action.domain_.source_history_id_),
+        .flow_count = action.domain_.flow_count_,
+    };
+    if (action.authorization_.has_value()) {
+      control::WireFailoverLoss loss;
+      switch (action.authorization_->loss_if_cutover_) {
+        case MetaFailoverLoss::kNone:
+          loss = control::WireFailoverLoss::kNone;
+          break;
+        case MetaFailoverLoss::kUnknown:
+          loss = control::WireFailoverLoss::kUnknown;
+          break;
+      }
+      projected_action.authorization = control::WireFailoverAuthorization{
+          .authorized_revision = action.authorization_->authorized_revision_,
+          .loss_if_cutover = loss,
+      };
+    }
+    projected.candidate_action = std::move(projected_action);
+  }
+  return projected;
+}
+
 absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
     const MetaDirectiveSpec& directive) {
   if ((directive.kind_ == kMetaDirectiveRebuild ||
@@ -170,18 +227,6 @@ absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
           "initialize-empty-population directive must be storage-mutating");
     }
     return control::WireDirectiveKind::kInitializeEmptyPopulation;
-  }
-  if (directive.kind_ == kMetaDirectivePromotionPrepare) {
-    if (!directive.storage_mutating_) {
-      return Invalid("promotion-prepare directive must be storage-mutating");
-    }
-    if (!control::DecodePromotionPrepareRequest(directive.payload_).ok() ||
-        !control::DecodePromotionPreparePreconditions(
-             directive.preconditions_)
-             .ok()) {
-      return Invalid("promotion-prepare directive has an invalid typed body");
-    }
-    return control::WireDirectiveKind::kPromotionPrepare;
   }
   if (directive.kind_ == kMetaDirectiveAuthorizeSource) {
     if (directive.storage_mutating_) {
@@ -219,10 +264,9 @@ absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
   if (IsZero(operation.operation_id_) || IsZero(source.directive_id_) ||
       IsZero(source.attempt_id_) || IsZero(source.assignment_id_) ||
       IsZero(source.target_boot_id_) ||
-      (!initializes_empty &&
-       (IsZero(source.source_assignment_id_) ||
-        IsZero(source.source_boot_id_) ||
-        IsZero(source.source_replication_history_id_))) ||
+      (!initializes_empty && (IsZero(source.source_assignment_id_) ||
+                              IsZero(source.source_boot_id_) ||
+                              IsZero(source.source_replication_history_id_))) ||
       current.directive_revision_ == 0) {
     return Inconsistent("current directive contains an empty identity");
   }
@@ -235,8 +279,7 @@ absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
   if (!kind.ok()) return kind.status();
   const bool executes_on_target =
       *kind == control::WireDirectiveKind::kRebuild ||
-      *kind == control::WireDirectiveKind::kInitializeEmptyPopulation ||
-      *kind == control::WireDirectiveKind::kPromotionPrepare;
+      *kind == control::WireDirectiveKind::kInitializeEmptyPopulation;
   const std::string& expected_recipient =
       executes_on_target ? source.target_node_id_ : source.source_node_id_;
   if (source.recipient_node_id_ != expected_recipient) {
@@ -318,12 +361,10 @@ bool ClusterCreateDirectiveReady(const MetaOperationRecord& operation,
       });
   if (authorize == operation.current_directives_.end()) return false;
   return std::any_of(
-      operation.terminal_receipts_.begin(),
-      operation.terminal_receipts_.end(),
+      operation.terminal_receipts_.begin(), operation.terminal_receipts_.end(),
       [&](const MetaTerminalReceipt& receipt) {
         return receipt.key_.operation_id_ == operation.operation_id_ &&
-               receipt.key_.directive_id_ ==
-                   authorize->spec_.directive_id_ &&
+               receipt.key_.directive_id_ == authorize->spec_.directive_id_ &&
                receipt.key_.attempt_id_ == authorize->spec_.attempt_id_ &&
                receipt.key_.directive_revision_ ==
                    authorize->directive_revision_ &&
@@ -395,6 +436,9 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     projected.manifest_digest = source.record_.population_manifest_digest_;
     projected.partition_replication_epoch =
         source.record_.partition_replication_epoch_;
+    projected.steady_replication_enabled =
+        view.topology().ClusterLifecycle().state_ ==
+        MetaClusterLifecycle::kCreated;
 
     for (const MetaGroupMember& member : source.members_) {
       if (!active_nodes.contains(member.node_id_)) {
@@ -458,6 +502,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
                          " lease duration is not wire-representable"));
       }
       projected.grant_active = true;
+      projected.activation_action_id = active.activation_action_id_;
       projected.grant_revision = active.grant_revision_;
       projected.grant_duration_ms =
           static_cast<std::uint32_t>(active.spec_.lease_duration_ms_);
@@ -468,6 +513,12 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     } else if (!grant->fenced_) {
       return Inconsistent(absl::StrCat("group ", source.group_id_,
                                        " is grantless but not fenced"));
+    }
+
+    if (source.failover_transition_.has_value()) {
+      auto transition = ProjectFailoverTransition(*source.failover_transition_);
+      if (!transition.ok()) return transition.status();
+      projected.failover_transition = std::move(*transition);
     }
 
     if (absl::Status status = AddManifestReference(projected.manifest_revision,
@@ -658,6 +709,19 @@ std::size_t NodeControlBatchRetainedBytes(
     if (group.owner_node_id.has_value()) add_string(*group.owner_node_id);
     add_array(group.slot_ranges.capacity(), sizeof(control::WireSlotRange));
     add_string(group.grant_policy_id);
+    if (group.failover_transition.has_value()) {
+      const control::WireFailoverTransition& transition =
+          *group.failover_transition;
+      if (transition.candidate_action.has_value()) {
+        const control::WireFailoverCandidateAction& action =
+            *transition.candidate_action;
+        add_string(action.candidate.node_id);
+        add_string(action.candidate.boot_id);
+        add_string(action.domain.source_node_id);
+        add_string(action.domain.source_boot_id);
+        add_string(action.domain.source_history_id);
+      }
+    }
   }
 
   add_array(state.manifests.capacity(), sizeof(control::WireManifestDocument));

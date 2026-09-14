@@ -12,15 +12,16 @@
 #include <utility>
 #include <vector>
 
-#include "../src/redis/cluster_gate.h"
 #include "../src/redis/blocking_wait.h"
+#include "../src/redis/cluster_gate.h"
 #include "absl/strings/str_cat.h"
+#include "cluster/test_topology_installer.h"
 #include "keylane/cluster/runtime.h"
 #include "keylane/cluster/topology.h"
 #include "keylane/resp.h"
 #include "keylane/resp_version.h"
+#include "keylane/session.h"
 #include "keylane/storage/format.h"
-#include "cluster/test_topology_installer.h"
 
 namespace {
 
@@ -72,7 +73,8 @@ cluster::GroupView MakeGroup(std::string_view group_id,
 // range. full_coverage extends B's range to 16383 so the state has complete
 // slot coverage; otherwise only [0,200] is assigned. Self defaults to A.
 std::shared_ptr<const cluster::ServingState> BuildThreeNodeState(
-    bool full_coverage, std::string_view self_id = kNodeA) {
+    bool full_coverage, std::string_view self_id = kNodeA,
+    bool pause_group_a = false) {
   cluster::ServingStateBuilder builder;
   builder.SetTopologyEpoch(1);
   if (self_id == kNodeA) {
@@ -87,8 +89,10 @@ std::shared_ptr<const cluster::ServingState> BuildThreeNodeState(
   builder.AddNode(
       MakeNode(kNodeB, "127.0.0.2", 7001, 17002, cluster::kNoNodeIndex, 2));
   builder.AddNode(MakeNode(kNodeR, "127.0.0.3", 7002, 17003, kNodeAIndex, 1));
-  builder.AddGroup(MakeGroup("group-a", kNodeAIndex, {kNodeRIndex},
-                             {cluster::SlotRange{0, 100}}));
+  cluster::GroupView group_a = MakeGroup("group-a", kNodeAIndex, {kNodeRIndex},
+                                         {cluster::SlotRange{0, 100}});
+  group_a.mutations_paused_ = pause_group_a;
+  builder.AddGroup(std::move(group_a));
   const std::uint16_t last =
       full_coverage ? static_cast<std::uint16_t>(cluster::kSlotCount - 1)
                     : static_cast<std::uint16_t>(200);
@@ -172,6 +176,33 @@ std::string RunClusterCommand(
   return encoded;
 }
 
+std::string RunDispatch(keylane::ConnectionContext& context,
+                        std::vector<std::string> args) {
+  auto request = keylane::BuildCommandRequest(
+      keylane::RespCommand{.args_ = std::move(args)}, context.selected_db_);
+  EXPECT_TRUE(request.ok()) << request.status();
+  if (!request.ok()) return {};
+  keylane::ReplyBuilder builder(context.resp_version());
+  auto task = keylane::DispatchCommand(context, *request, builder);
+  auto handle = std::move(task).ReleaseHandle();
+  handle.resume();
+  EXPECT_TRUE(handle.done());
+  std::string encoded;
+  if (handle.done()) encoded = std::string(handle.promise().value_.encoded_);
+  handle.destroy();
+  return encoded;
+}
+
+std::string ChannelInGroupARange(std::uint16_t different_from = 101) {
+  for (std::uint32_t suffix = 0; suffix < 100000; ++suffix) {
+    const std::string candidate = "issue41-channel-" + std::to_string(suffix);
+    const std::uint16_t slot = keylane::storage::RedisSlot(candidate);
+    if (slot <= 100 && slot != different_from) return candidate;
+  }
+  ADD_FAILURE() << "failed to find deterministic channel in group-a range";
+  return "issue41-channel-fallback";
+}
+
 // Extracts the payload of a $<len>\r\n<payload>\r\n reply, failing the test
 // when the framing does not match exactly.
 std::string_view BulkPayload(std::string_view reply) {
@@ -212,6 +243,18 @@ TEST(ClusterCommandTest, KeySlotWorksWithoutClusterState) {
   // Subcommand matching is case-insensitive.
   EXPECT_EQ(RunClusterCommand(MakeRequest({"cluster", "keyslot", "foo"})),
             keylane::EncodeInteger(keylane::storage::RedisSlot("foo")));
+}
+
+TEST(ClusterCommandTest, PublishUsesItsChannelSlotAndHonorsControlledPause) {
+  const auto state = BuildThreeNodeState(/*full_coverage=*/true, kNodeA,
+                                         /*pause_group_a=*/true);
+  ASSERT_NE(state, nullptr);
+  ClusterRuntimeGuard guard(MakeRuntime(state));
+  keylane::ConnectionContext context;
+
+  EXPECT_EQ(
+      RunDispatch(context, {"PUBLISH", ChannelInGroupARange(), "payload"}),
+      "-TRYAGAIN Failover in progress\r\n");
 }
 
 TEST(ClusterCommandTest, SubcommandErrorsMatchRedis) {
@@ -525,14 +568,16 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
   };
   const auto now = cluster::LeaseClockNow();
   ASSERT_TRUE(runtime->node_control_installer_
-                  .ApplyAuthority({
-                      .kind_ = cluster::AuthorityMessage::Kind::kLeaseGrant,
-                      .session_ = session,
-                      .projection_ = projection,
-                      .anchor_ = anchor,
-                      .sent_at_ = now,
-                      .granted_duration_ = std::chrono::hours(1),
-                  }, now)
+                  .ApplyAuthority(
+                      {
+                          .kind_ = cluster::AuthorityMessage::Kind::kLeaseGrant,
+                          .session_ = session,
+                          .projection_ = projection,
+                          .anchor_ = anchor,
+                          .sent_at_ = now,
+                          .granted_duration_ = std::chrono::hours(1),
+                      },
+                      now)
                   .ok());
 
   keylane::CommandRequest request;

@@ -190,6 +190,11 @@ class ReplicationGroup {
   absl::Status ValidateRebuild(const RebuildDirective& directive,
                                const PopulationManifest& manifest) const;
 
+  // Returns a fresh directive revision for the supplied authority term. The
+  // accepted-version watermark survives proof invalidation, so callers must
+  // derive retries here rather than shadowing it in a transient session.
+  absl::StatusOr<std::uint64_t> NextDirectiveRevision(std::uint64_t term) const;
+
   // Validates a fresh directive and enters REBUILDING. An exact retry while
   // rebuilding is idempotent. The node permanently rejects a different group
   // assignment during this boot.

@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
@@ -848,7 +849,8 @@ struct TransferValue {
 // Optional, transport-agnostic guard evaluated at the storage mutation
 // linearization seam after all potentially suspending lock, allocation, and
 // read work. The owning command supplies an immutable shared context so the
-// check remains valid across worker hops and coroutine suspension. Background
+// check remains valid across worker hops and coroutine suspension. Active
+// expiration uses it for its finite authority capability; other background
 // maintenance and replica replay leave it empty. A pointer passed to any
 // Task-returning StorageEngine API must remain alive until that Task completes;
 // transaction initialization instead copies the value into each shard receipt.
@@ -1240,9 +1242,13 @@ class StorageEngine {
   bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
   // Publishes one runtime-only command on the worker owning partition_id. It
   // is appended to that source flow's online backlog and every active
-  // full-sync FIFO, but never becomes persistent keyspace state.
+  // full-sync FIFO, but never becomes persistent keyspace state. The explicit
+  // precondition is checked after publisher admission, immediately before the
+  // synchronous publication cut; pass an empty precondition when no external
+  // mutation authority applies.
   celer::Task<absl::Status> PublishEphemeralReplicationCommand(
-      std::uint16_t partition_id, std::vector<std::string> args);
+      std::uint16_t partition_id, std::vector<std::string> args,
+      MutationPrecondition mutation_precondition);
   // Preallocates the online-backlog command and its active-full-sync copy.
   // An absent fullsync_projection copies args, an empty projection omits the
   // event from full sync, and a non-empty projection replaces only the
@@ -1557,8 +1563,21 @@ class StorageEngine {
   // already-entered expiration append is rejected) or successfully quiesce
   // expiration and keep it paused across the transition. Re-enable only after
   // the stable local population is authoritative and its recovery fence is
-  // clear; this call never grants client mutation authority by itself.
+  // clear. Disabling also cancels queued or suspended work carrying the old
+  // capability. A false-to-true transition installs a fresh permanent
+  // capability, while repeating true for the current valid permanent grant is
+  // idempotent; replacing a finite grant with permanent still cancels the
+  // finite capability. This call never grants client mutation authority by
+  // itself.
   void SetExpirationAuthority(bool authority) noexcept;
+  // Installs a fresh, revocable active-expiration capability whose absolute
+  // deadline is measured from Linux CLOCK_BOOTTIME. Queued work carries that
+  // exact capability to the storage mutation cut, so expiration, revocation,
+  // or replacement cannot be bypassed by a delayed cycle. Calling this again
+  // replaces the previous capability. This does not grant client mutation
+  // authority or affect Tomb Raider.
+  absl::Status SetExpirationAuthorityUntil(
+      std::chrono::nanoseconds deadline_since_boot) noexcept;
   std::uint32_t ExpirationPauseCount() const noexcept;
 
   // Process-wide runtime settings, readable and writable from any worker.
@@ -1599,6 +1618,7 @@ class StorageEngine {
                             const Digest& digest);
 
  private:
+  friend class ExpirationAuthorityTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };

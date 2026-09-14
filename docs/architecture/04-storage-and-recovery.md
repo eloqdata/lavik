@@ -698,6 +698,23 @@ These settings neither grant expiration authority nor bypass pause/drain
 boundaries. Defaults, ranges, and commands are documented in
 [Active expiration tuning](../operations/active-expiration.md).
 
+Standalone authority uses a permanent in-memory expiration capability.
+Meta-managed owners instead receive a revocable capability whose absolute
+deadline uses Linux `CLOCK_BOOTTIME` and cannot outlive the matching finite
+serving lease. Each queued expiration candidate carries the exact capability
+through the final storage mutation precondition. Expiry, replacement, or
+revocation therefore cancels delayed work without turning that cancellation
+into a storage failure; a later grant installs a distinct capability.
+
+`QuiesceExpiration` is a nestable drain independent of authority revocation.
+Controlled failover holds it after request mutation drain while the old owner
+captures a stable replication frontier, and a replacement of that same pause
+transfers the hold without reopening expiration between desired states. The
+hold is released only when the source-pause intent disappears. Tomb Raider is
+not governed by the finite capability or this pause, but Meta-managed cluster
+startup never launches Tomb Raider because it starts without expiration
+authority.
+
 The preferred deletion is a durable tombstone, which remains safe if the wall
 clock later moves backward. If foreground space is completely exhausted, an
 unshielded expired value can be removed only from memory and physical live-byte
@@ -812,6 +829,9 @@ failure skips the checkpoint rather than weakening cold recovery.
   filters recovery.
 - Recovery considers an expired or tombstone winner before older versions;
   cleanup cannot remove its suppression while an older live record remains.
+- Meta-managed active expiration carries the exact finite lease capability to
+  the storage mutation boundary; deadline expiry, revocation, or replacement
+  cannot be bypassed by work queued under an older grant.
 - Allocation epochs accompany physical references, reads, accounting, and
   relocations so delayed work cannot affect a later incarnation of one block.
 - Fixed-metadata and storage write ambiguity is fail-stop. The first worker or
@@ -939,7 +959,7 @@ current source code are authoritative for present storage behavior.
 | Staged and disk reads, bounded BatchGet waves, validation, pins, relocation retry, external-value assembly, and disk-backed reply leases | `src/storage/engine/read.cpp`, `include/keylane/storage/engine.h` |
 | Periodic flush snapshots, data-before-header ordering, alternating header commits, dirty-tail ordering, and retirement settlement | `src/storage/engine/flush.cpp` |
 | Extent reclaim, defrag candidate selection, relocation durability fences, source retirement, and pacing | `src/storage/engine/defrag.cpp` |
-| Lazy and active expiration, authority and quiescence, durable tombstones, and the full-device escape valve | `src/storage/engine/expire.cpp` |
+| Lazy and active expiration, permanent and finite authority capabilities, nestable quiescence, durable tombstones, and the full-device escape valve | `include/keylane/storage/engine.h`, `src/storage/engine/expire.cpp`, `src/cluster/node_control.cpp`, `src/replication/replication.cpp` |
 | Tombstone and shielding mark/sweep/reap lifecycle, startup authority check, internal replica quiescence, and runtime role limitation | `include/keylane/storage/engine.h`, `src/storage/engine/tomb_raider.cpp`, `src/storage/engine/init.cpp`, `src/replication/replication.cpp` |
 | Durable database and replica-partition epoch advance, bounded index detach, replica reset/promotion/abort, and detached-index reclaim | `src/storage/engine/flush_db.cpp`, `src/storage/engine/replication.cpp` |
 | Transaction-generation rotation, promotion, readiness, and cold retirement | `src/storage/engine/tx_cleaner.cpp`, `include/keylane/storage/tx_cleaner.h` |

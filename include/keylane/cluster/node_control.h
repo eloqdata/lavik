@@ -22,6 +22,7 @@
 #include "celer/runtime/task.h"
 #include "keylane/cluster/authority.h"
 #include "keylane/cluster/topology.h"
+#include "keylane/replication_group.h"
 
 namespace keylane::cluster {
 
@@ -31,6 +32,19 @@ struct PreparedMemberAssignment {
 
   friend bool operator==(const PreparedMemberAssignment&,
                          const PreparedMemberAssignment&) = default;
+};
+
+// Complete committed client endpoint for a Group Owner. Keeping both ports
+// lets the process-local replication policy choose plain TCP or TLS without
+// leaking that runtime choice into Meta's committed desired state.
+struct PreparedReplicationEndpoint {
+  NodeId node_id_;
+  std::string host_;
+  std::uint16_t port_ = 0;
+  std::uint16_t tls_port_ = 0;
+
+  friend bool operator==(const PreparedReplicationEndpoint&,
+                         const PreparedReplicationEndpoint&) = default;
 };
 
 // Member-specific identities retained beside the routing-optimized
@@ -51,6 +65,163 @@ struct PreparedGroupControlIdentity {
                          const PreparedGroupControlIdentity&) = default;
 };
 
+struct FailoverTransitionIdTag;
+struct FailoverActionIdTag;
+// Opaque identities keep a durable transition distinct from each replaceable
+// candidate action while preserving the exact 128-bit Meta representation.
+using FailoverTransitionId = ControlId128<FailoverTransitionIdTag>;
+using FailoverActionId = ControlId128<FailoverActionIdTag>;
+
+// Execution semantics projected from the committed transition. Controlled
+// actions preserve the current Owner's authority until Cutover; Uncontrolled
+// actions run after that authority has been fenced.
+enum class PreparedFailoverMode : std::uint8_t {
+  kControlled,
+  kUncontrolled,
+};
+
+// Operator-visible durability guarantee attached to an authorized promotion.
+// Unknown permits recovery from the best available replica without asserting
+// that it contains every acknowledged write.
+enum class PreparedFailoverLoss : std::uint8_t {
+  kNone,
+  kUnknown,
+};
+
+// Exact process incarnation selected for promotion. All three identities must
+// still match before NodeControl may install or activate the action.
+struct PreparedFailoverCandidate {
+  NodeId node_id_;
+  AssignmentId assignment_id_;
+  NodeId boot_id_;
+
+  friend bool operator==(const PreparedFailoverCandidate&,
+                         const PreparedFailoverCandidate&) = default;
+};
+
+// Source lineage in which candidate progress is comparable. LSN vectors from
+// different domains must never be ranked against one another; flow_count also
+// fixes the vector shape expected by the promotion adapter.
+struct PreparedFailoverCompatibilityDomain {
+  std::uint64_t source_group_term_ = 0;
+  NodeId source_node_id_;
+  AssignmentId source_assignment_id_;
+  NodeId source_boot_id_;
+  NodeId source_history_id_;
+  std::uint32_t flow_count_ = 0;
+
+  friend bool operator==(const PreparedFailoverCompatibilityDomain&,
+                         const PreparedFailoverCompatibilityDomain&) = default;
+};
+
+// Revision-scoped permission to begin promotion preparation, including the
+// loss classification that a Cutover using this authorization must report.
+struct PreparedFailoverAuthorization {
+  std::uint64_t authorized_revision_ = 0;
+  PreparedFailoverLoss loss_if_cutover_ = PreparedFailoverLoss::kUnknown;
+
+  friend bool operator==(const PreparedFailoverAuthorization&,
+                         const PreparedFailoverAuthorization&) = default;
+};
+
+// One replaceable candidate attempt within a durable transition. Absence of
+// authorization keeps the selected candidate inert while Meta gathers the
+// observations needed to authorize preparation.
+struct PreparedFailoverAction {
+  FailoverActionId action_id_;
+  PreparedFailoverCandidate candidate_;
+  PreparedFailoverCompatibilityDomain domain_;
+  std::optional<PreparedFailoverAuthorization> authorization_;
+
+  friend bool operator==(const PreparedFailoverAction&,
+                         const PreparedFailoverAction&) = default;
+};
+
+// Wire-independent committed execution subset. Operator/deadline and
+// successor-grant audit fields do not drive Data behavior and intentionally do
+// not cross this seam.
+struct PreparedFailoverTransition {
+  FailoverTransitionId transition_id_;
+  std::uint64_t revision_ = 0;
+  PreparedFailoverMode mode_ = PreparedFailoverMode::kUncontrolled;
+  std::uint64_t target_term_ = 0;
+  std::optional<PreparedFailoverAction> candidate_action_;
+
+  friend bool operator==(const PreparedFailoverTransition&,
+                         const PreparedFailoverTransition&) = default;
+};
+
+// Complete, normalized desired control for one Group. It is kept separate
+// from ServingState because a fenced Group still has an Owner and useful
+// replication relationships even though it has no routable serving slots.
+struct DesiredClusterControl {
+  PreparedGroupControlIdentity identity_;
+  std::optional<PreparedMemberAssignment> owner_;
+  bool grant_active_ = false;
+  std::uint32_t grant_duration_ms_ = 0;
+  std::string grant_policy_id_;
+  std::uint64_t grant_policy_version_ = 0;
+  std::optional<FailoverActionId> activation_action_id_;
+  std::optional<PreparedFailoverTransition> failover_transition_;
+  // These are derived from the same complete FDS as identity_. They make the
+  // post-Cutover Follow Owner relationship self-contained at the one
+  // NodeControlActions seam; no adapter may consult a second topology view.
+  std::optional<PreparedReplicationEndpoint> owner_endpoint_;
+  std::vector<PopulationManifestEntry> manifest_entries_;
+  // Committed lifecycle gate projected in the FDS. False keeps Genesis on
+  // its explicit population workflow instead of starting a second ingress.
+  bool steady_replication_enabled_ = false;
+  // Derived from current_directives in the same FDS. While true, the exact
+  // population directive owns target ingress; ordinary Follow Owner is held
+  // until a later complete FDS removes the directive.
+  bool population_transition_expected_ = false;
+
+  friend bool operator==(const DesiredClusterControl&,
+                         const DesiredClusterControl&) = default;
+};
+
+// Exact, wire-independent promotion activation derived from one committed
+// successor grant and the control session that delivered it. Replication owns
+// the boot-local prepared context; NodeControl owns the ordering that keeps
+// this action provisional until finite expiration and request authority are
+// installed against the same FDS.
+struct PreparedFailoverActivation {
+  FailoverActionId action_id_;
+  std::string group_id_;
+  NodeId candidate_node_id_;
+  AssignmentId candidate_assignment_id_;
+  NodeId candidate_boot_id_;
+  std::uint64_t target_term_ = 0;
+  std::uint64_t manifest_revision_ = 0;
+  Sha256Digest manifest_digest_{};
+  std::uint64_t partition_replication_epoch_ = 0;
+
+  friend bool operator==(const PreparedFailoverActivation&,
+                         const PreparedFailoverActivation&) = default;
+};
+
+// Stable, FDS-derived portion of an already authenticated source export.
+// Source boot/history remain owned by the native live session: they are
+// Observation, so committed FDS must neither invent nor replace them. Within
+// one Data boot this scope decides whether that live session may be retained.
+struct EstablishedExportScope {
+  std::string group_id_;
+  PreparedMemberAssignment source_;
+  std::uint64_t manifest_revision_ = 0;
+  Sha256Digest manifest_digest_{};
+  std::uint64_t partition_replication_epoch_ = 0;
+  std::vector<PreparedMemberAssignment> downstream_members_;
+
+  friend bool operator==(const EstablishedExportScope&,
+                         const EstablishedExportScope&) = default;
+};
+
+// Authority counters, lease state, and failover control are deliberately not
+// export identity. Changing only those values must close new admission without
+// tearing down an already ONLINE compatible data flow.
+bool SameEstablishedExportScope(const DesiredClusterControl& left,
+                                const DesiredClusterControl& right);
+
 struct PreparedFullState {
   std::shared_ptr<const ServingState> serving_state_;
   // SHA-256 of the complete wire object, including its diagnostic source
@@ -61,6 +232,10 @@ struct PreparedFullState {
   // Test-only projections may leave this empty when they exercise routing and
   // authority without directives or boot-local population proof.
   std::vector<PreparedGroupControlIdentity> control_groups_;
+  // Full level-triggered execution intent is deliberately separate from the
+  // stable population identity above. Dynamic Meta projections populate this;
+  // static topology leaves it empty.
+  std::vector<DesiredClusterControl> desired_cluster_controls_;
 };
 
 struct AuthorityMessage {
@@ -98,20 +273,6 @@ struct PopulationReadiness {
                          const PopulationReadiness&) = default;
 };
 
-// Wire-independent promotion input admitted only after the enclosing current
-// directive has matched the installed FDS exactly. Keeping the decoded value
-// here lets NodeControl and ReplicationManager share one domain seam without
-// teaching either layer about control-protocol envelopes.
-struct PromotionPrepareInput {
-  std::string parent_history_id_;
-  std::vector<std::uint64_t> required_applied_next_lsns_;
-  std::uint64_t excluded_group_term_ = 0;
-  Sha256Digest old_authority_exclusion_hash_{};
-
-  friend bool operator==(const PromotionPrepareInput&,
-                         const PromotionPrepareInput&) = default;
-};
-
 // Fully normalized execution request. Transport clients resolve the source
 // endpoint and referenced manifest from the same FullDesiredState that
 // supplied `projection_`; the action adapter therefore never looks through a
@@ -122,7 +283,6 @@ struct NodeDirective {
     kAuthorizeSource,
     kRevokeSources,
     kInitializeEmptyPopulation,
-    kPromotionPrepare,
   };
 
   ProjectionBasis projection_;
@@ -147,11 +307,9 @@ struct NodeDirective {
   Sha256Digest manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
   std::vector<NodeManifestEntry> manifest_entries_;
-  std::optional<PromotionPrepareInput> promotion_prepare_;
   // Rebuild/authorize-source payloads are decoded into flow_count_ above.
   // Empty-population initialization retains its authenticated target history
-  // in payload_. Promotion-prepare is decoded into promotion_prepare_ and its
-  // raw opaque fields are cleared; other V1 kinds require both strings empty.
+  // in payload_; other V1 kinds require both strings empty.
   std::string payload_;
   std::string preconditions_;
   // Population directives set this to drive non-serving-target admission and
@@ -170,22 +328,13 @@ struct NodeDirective {
 class NodeDirectiveCompletion {
  public:
   using Poll = std::function<std::optional<absl::Status>()>;
-  using TerminalResult = absl::StatusOr<std::string>;
-  using ResultPoll = std::function<std::optional<TerminalResult>()>;
 
   NodeDirectiveCompletion() = default;
   // A directly constructed completion represents work that crossed the
   // NodeControl admission boundary. Tests and native adapters use this form
   // for deferred execution; validation failures must use Rejected().
   explicit NodeDirectiveCompletion(Poll poll)
-      : result_poll_([poll = std::move(poll)]() mutable
-                         -> std::optional<TerminalResult> {
-          std::optional<absl::Status> status = poll();
-          if (!status.has_value()) return std::nullopt;
-          if (!status->ok()) return TerminalResult(*status);
-          return TerminalResult(std::string{});
-        }),
-        started_(true) {}
+      : poll_(std::move(poll)), started_(true) {}
 
   // Constructs a terminal controller/admission rejection. `result` must be a
   // failure; an accidental success is converted to an internal error.
@@ -193,24 +342,17 @@ class NodeDirectiveCompletion {
   // Constructs work that started and reached a terminal result before its
   // completion handle was returned.
   static NodeDirectiveCompletion StartedTerminal(absl::Status result);
-  // Constructs a started terminal result while preserving opaque canonical
-  // success bytes for DirectiveResult and OperationEvidence publication.
-  static NodeDirectiveCompletion StartedTerminalResult(TerminalResult result);
-  // Adapts a native asynchronous action that publishes typed success bytes.
-  static NodeDirectiveCompletion FromResultPoll(ResultPoll poll);
 
-  bool valid() const noexcept { return static_cast<bool>(result_poll_); }
+  bool valid() const noexcept { return static_cast<bool>(poll_); }
   bool started() const noexcept { return started_; }
   std::optional<absl::Status> result() const;
-  std::optional<TerminalResult> terminal_result() const;
   celer::Task<absl::Status> Await() const;
 
  private:
-  struct ResultPollTag {};
-  NodeDirectiveCompletion(ResultPoll poll, bool started, ResultPollTag)
-      : result_poll_(std::move(poll)), started_(started) {}
+  NodeDirectiveCompletion(Poll poll, bool started)
+      : poll_(std::move(poll)), started_(started) {}
 
-  ResultPoll result_poll_;
+  Poll poll_;
   bool started_ = false;
 };
 
@@ -239,6 +381,26 @@ class NodeControlActions {
   virtual celer::Task<absl::Status>
   ClearSourceAuthorizationsForSessionReplacementAndWait(
       bool preserve_established_exports = false);
+  // Converges all failover and steady-state replication capabilities for the
+  // one Group assigned to this Data process. Replacement/removal is expressed
+  // by a changed value/nullopt, never by a one-shot cleanup directive. The
+  // task must return only after superseded admission and result publication
+  // can no longer escape the FullStateApplied barrier.
+  virtual celer::Task<absl::Status> ReconcileClusterControl(
+      std::optional<DesiredClusterControl> desired);
+  // Opens the exact boot-local promotion prepared by `action_id`. This grants
+  // neither a write lease nor active expiration authority; NodeControl does
+  // both only after a post-await FDS/session/deadline recheck.
+  virtual celer::Task<absl::Status> ActivatePreparedPromotion(
+      PreparedFailoverActivation activation);
+  // Installs the same absolute CLOCK_BOOTTIME deadline used by the request
+  // lease. Returning success means expiration can run only until that finite
+  // cut; it does not imply request authority.
+  virtual celer::Task<absl::Status> EnableExpirationAuthorityUntil(
+      MonotonicTime deadline);
+  // Closes active expiration and joins work that entered before the close.
+  // Every asynchronous authority-loss barrier invokes this before returning.
+  virtual celer::Task<absl::Status> RevokeExpirationAuthority();
   // Retires an in-progress or ready target population unless it still names
   // the desired local assignment, term, manifest, and partition replication
   // epoch. Completion includes
@@ -444,6 +606,9 @@ class NodeControlInstaller {
     bool revoke_sources_ = false;
     bool preserve_established_exports_ = false;
     std::vector<AuthorityAnchor> retired_;
+    // A Controlled Pause retires only the old mutation admission snapshot,
+    // not authority or the established replication export.
+    std::vector<AuthorityAnchor> pause_drains_;
   };
 
   struct LeaseExpirySchedule {
@@ -468,6 +633,14 @@ class NodeControlInstaller {
                                          bool replay_lookup = false);
   absl::StatusOr<std::optional<PopulationReadiness>> DesiredLocalPopulation()
       const;
+  absl::StatusOr<std::optional<DesiredClusterControl>>
+  DesiredLocalClusterControl() const;
+  absl::StatusOr<std::optional<DesiredClusterControl>>
+  ValidateLeaseGrantContext(const AuthorityMessage& message, MonotonicTime now);
+  celer::Task<absl::Status> FailClosedLeaseGrantTransition(
+      const AuthorityMessage& message, absl::Status failure);
+  void RetireLeaseSchedule(std::string_view group_id);
+  void RetireAllLeaseSchedules();
   const PreparedGroupControlIdentity* FindControlGroup(
       std::string_view group_id) const;
   const PreparedMemberAssignment* FindMemberAssignment(
@@ -530,6 +703,9 @@ class NodeControlInstaller {
   std::optional<ProjectionBasis> projection_basis_;
   std::optional<Sha256Digest> object_hash_;
   std::vector<PreparedGroupControlIdentity> control_groups_;
+  std::vector<DesiredClusterControl> desired_cluster_controls_;
+  std::optional<DesiredClusterControl> reconciled_cluster_control_;
+  bool cluster_control_reconciled_ = false;
   std::unordered_map<std::string, RejectThrough> reject_through_;
   std::vector<PendingDrain> pending_drains_;
   std::unordered_map<std::string, std::shared_ptr<LeaseExpirySchedule>>

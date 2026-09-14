@@ -292,8 +292,8 @@ RebuildDirective NativePopulationDirective(const NodeDirective& directive,
 
 class ReplicationNodeControlActions final : public NodeControlActions {
  public:
-  explicit ReplicationNodeControlActions(ReplicationManager& replication)
-      : replication_(replication) {}
+  ReplicationNodeControlActions(ReplicationManager& replication, bool use_tls)
+      : replication_(replication), use_tls_(use_tls) {}
 
   absl::Status RevokeSourceAuthorizations() override {
     return absl::FailedPreconditionError(
@@ -313,6 +313,60 @@ class ReplicationNodeControlActions final : public NodeControlActions {
             preserve_established_exports);
   }
 
+  celer::Task<absl::Status> ReconcileClusterControl(
+      std::optional<DesiredClusterControl> desired) override {
+    if (!desired.has_value()) {
+      absl::Status result =
+          co_await replication_.ReconcileClusterFailoverAction(std::nullopt,
+                                                               std::nullopt);
+      absl::Status pause_status =
+          co_await replication_.ReconcileClusterSourcePause(std::nullopt);
+      if (result.ok()) result = std::move(pause_status);
+      absl::Status follow_status =
+          co_await replication_.ReconcileClusterFollowOwner(std::nullopt);
+      if (result.ok()) result = std::move(follow_status);
+      co_return result;
+    }
+    const ReplicationIdentity local_identity =
+        co_await replication_.ObserveIdentity();
+    auto translated = detail::TranslateClusterFailoverControl(
+        *desired, local_identity, use_tls_);
+    if (!translated.ok()) co_return translated.status();
+    absl::Status result = co_await replication_.ReconcileClusterFailoverAction(
+        std::move(translated->candidate_action_),
+        translated->pending_activation_action_id_);
+    // Always attempt every applicable level-triggered intent so replacement
+    // or removal cannot strand cleanup behind another subsystem's failure.
+    // Returning the first failure keeps FullStateApplied fail closed.
+    absl::Status pause_status =
+        co_await replication_.ReconcileClusterSourcePause(
+            std::move(translated->source_pause_));
+    if (result.ok()) result = std::move(pause_status);
+    if (translated->reconcile_follow_owner_) {
+      absl::Status follow_status =
+          co_await replication_.ReconcileClusterFollowOwner(
+              std::move(translated->follow_owner_));
+      if (result.ok()) result = std::move(follow_status);
+    }
+    co_return result;
+  }
+
+  celer::Task<absl::Status> ActivatePreparedPromotion(
+      PreparedFailoverActivation activation) override {
+    co_return co_await replication_.ActivateClusterPreparedPromotion(
+        detail::TranslateClusterFailoverActivation(activation));
+  }
+
+  celer::Task<absl::Status> EnableExpirationAuthorityUntil(
+      MonotonicTime deadline) override {
+    co_return co_await replication_.EnableClusterExpirationAuthorityUntil(
+        deadline.time_since_epoch());
+  }
+
+  celer::Task<absl::Status> RevokeExpirationAuthority() override {
+    co_return co_await replication_.RevokeClusterExpirationAuthority();
+  }
+
   celer::Task<absl::Status> ReconcilePopulation(
       std::optional<PopulationReadiness> desired,
       bool population_transition_expected) override {
@@ -325,8 +379,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
           .manifest_revision_ = desired->manifest_revision_,
           .manifest_id_ = PopulationManifestId{desired->manifest_digest_},
           .partition_replication_epoch_ = desired->partition_replication_epoch_,
-          .population_transition_expected_ =
-              population_transition_expected,
+          .population_transition_expected_ = population_transition_expected,
       };
     }
     co_return co_await replication_.ReconcileClusterPopulation(
@@ -398,50 +451,6 @@ class ReplicationNodeControlActions final : public NodeControlActions {
       co_return NodeDirectiveCompletion(
           [completion = std::move(*started)]() { return completion.result(); });
     }
-    if (directive.kind_ == NodeDirective::Kind::kPromotionPrepare) {
-      const PromotionPrepareInput& prepare = *directive.promotion_prepare_;
-      auto started =
-          co_await replication_.StartClusterPromotionPrepareDirective(
-              ClusterPromotionPrepareDirective{
-                  .identity_ = std::move(rebuild.identity_),
-                  .parent_history_id_ = prepare.parent_history_id_,
-                  .required_applied_next_lsns_ =
-                      prepare.required_applied_next_lsns_,
-                  .excluded_group_term_ = prepare.excluded_group_term_,
-                  .old_authority_exclusion_hash_ =
-                      prepare.old_authority_exclusion_hash_,
-              });
-      if (!started.ok()) {
-        co_return NodeDirectiveCompletion::StartedTerminal(started.status());
-      }
-      co_return NodeDirectiveCompletion::FromResultPoll(
-          [completion = std::move(*started)]() mutable
-              -> std::optional<NodeDirectiveCompletion::TerminalResult> {
-            std::optional<ClusterPromotionPrepareCompletion::Result> result =
-                completion.result();
-            if (!result.has_value()) return std::nullopt;
-            if (!result->ok()) {
-              return NodeDirectiveCompletion::TerminalResult(result->status());
-            }
-            const ClusterPromotionPrepared& prepared = **result;
-            auto encoded = control::EncodePromotionPreparedEvidence(
-                control::PromotionPreparedEvidence{
-                    .parent_history_id = prepared.parent_history_id_,
-                    .frozen_applied_next_lsns =
-                        prepared.frozen_applied_next_lsns_,
-                    .population_generation = prepared.population_generation_,
-                    .population_digest = prepared.population_digest_,
-                    .catalog_generation = prepared.catalog_generation_,
-                    .catalog_dump_crc64 = prepared.catalog_dump_crc64_,
-                    .child_history_id = prepared.child_history_id_,
-                });
-            if (!encoded.ok()) {
-              return NodeDirectiveCompletion::TerminalResult(encoded.status());
-            }
-            return NodeDirectiveCompletion::TerminalResult(
-                std::move(*encoded));
-          });
-    }
     auto started = co_await replication_.StartClusterRebuildDirective(
         ReplicaOfConfig{.host_ = std::move(directive.source_host_),
                         .port_ = directive.source_port_},
@@ -471,9 +480,383 @@ class ReplicationNodeControlActions final : public NodeControlActions {
 
  private:
   ReplicationManager& replication_;
+  const bool use_tls_;
 };
 
 }  // namespace
+
+absl::StatusOr<detail::ClusterFailoverReconcileInput>
+detail::TranslateClusterFailoverControl(
+    const DesiredClusterControl& desired,
+    const ReplicationIdentity& local_identity, bool use_tls) {
+  detail::ClusterFailoverReconcileInput translated;
+  // The activation id belongs to the committed owner's grant. It is a local
+  // handoff only on that owner; every other member merely observes the grant's
+  // provenance. In particular, a later candidate must not reconcile the old
+  // owner's activation id alongside its own new action.
+  const bool local_is_committed_owner =
+      desired.owner_.has_value() &&
+      desired.owner_->node_id_.ToHexString() == local_identity.local_node_id_;
+  if (local_is_committed_owner && desired.activation_action_id_.has_value()) {
+    translated.pending_activation_action_id_ =
+        desired.activation_action_id_->bytes();
+  }
+
+  if (!desired.failover_transition_.has_value()) {
+    if (!desired.steady_replication_enabled_ ||
+        desired.population_transition_expected_) {
+      return translated;
+    }
+    translated.reconcile_follow_owner_ = true;
+    if (!desired.owner_.has_value()) return translated;
+    const auto local = std::find_if(
+        desired.identity_.members_.begin(), desired.identity_.members_.end(),
+        [&](const PreparedMemberAssignment& member) {
+          return member.node_id_.ToHexString() == local_identity.local_node_id_;
+        });
+    if (local == desired.identity_.members_.end()) {
+      return absl::FailedPreconditionError(
+          "local Data identity is absent from its desired Group membership");
+    }
+    if (!desired.owner_endpoint_.has_value() ||
+        desired.owner_endpoint_->node_id_ != desired.owner_->node_id_ ||
+        desired.owner_endpoint_->host_.empty()) {
+      return absl::FailedPreconditionError(
+          "desired Group Owner has no matching committed endpoint");
+    }
+    const bool local_is_owner = local->node_id_ == desired.owner_->node_id_;
+    std::optional<ReplicaOfConfig> owner_endpoint;
+    if (!local_is_owner) {
+      const std::uint16_t port = use_tls ? desired.owner_endpoint_->tls_port_
+                                         : desired.owner_endpoint_->port_;
+      if (port == 0) {
+        return absl::FailedPreconditionError(
+            use_tls ? "desired Group Owner offers no TLS replication port"
+                    : "desired Group Owner offers no plain replication port");
+      }
+      owner_endpoint = ReplicaOfConfig{.host_ = desired.owner_endpoint_->host_,
+                                       .port_ = port};
+    }
+    DesiredClusterUpstream follow{
+        .group_id_ = desired.identity_.group_id_,
+        .group_term_ = desired.identity_.group_term_,
+        .local_node_id_ = local->node_id_.ToHexString(),
+        .local_assignment_id_ = local->assignment_id_.ToHexString(),
+        .local_boot_id_ = local_identity.boot_id_,
+        .owner_node_id_ = desired.owner_->node_id_.ToHexString(),
+        .owner_assignment_id_ = desired.owner_->assignment_id_.ToHexString(),
+        .owner_endpoint_ = std::move(owner_endpoint),
+        .manifest_revision_ = desired.identity_.manifest_revision_,
+        .manifest_id_ =
+            PopulationManifestId{desired.identity_.manifest_digest_},
+        .manifest_entries_ = desired.manifest_entries_,
+        .partition_replication_epoch_ =
+            desired.identity_.partition_replication_epoch_,
+        .members_ = {},
+    };
+    follow.members_.reserve(desired.identity_.members_.size());
+    for (const PreparedMemberAssignment& member : desired.identity_.members_) {
+      follow.members_.push_back(ClusterReplicationMember{
+          .node_id_ = member.node_id_.ToHexString(),
+          .assignment_id_ = member.assignment_id_.ToHexString(),
+      });
+    }
+    translated.follow_owner_ = std::move(follow);
+    return translated;
+  }
+
+  // Candidate preparation owns its existing native ingress. Reconfiguring
+  // the ordinary relationship before Cutover could cancel that exact Ready
+  // population or make promotion activation observe a live upstream.
+  if (!desired.failover_transition_->candidate_action_.has_value()) {
+    return translated;
+  }
+  const PreparedFailoverTransition& transition = *desired.failover_transition_;
+  const PreparedFailoverAction& action = *transition.candidate_action_;
+  if (action.candidate_.node_id_.ToHexString() ==
+          local_identity.local_node_id_ &&
+      action.candidate_.boot_id_.ToHexString() == local_identity.boot_id_) {
+    translated.candidate_action_ = DesiredClusterFailoverAction{
+        .transition_id_ = transition.transition_id_.bytes(),
+        .action_id_ = action.action_id_.bytes(),
+        .transition_revision_ = transition.revision_,
+        .mode_ = transition.mode_ == PreparedFailoverMode::kControlled
+                     ? ClusterFailoverMode::kControlled
+                     : ClusterFailoverMode::kUncontrolled,
+        .target_term_ = transition.target_term_,
+        .committed_group_term_ = desired.identity_.group_term_,
+        .committed_grant_active_ = desired.grant_active_,
+        .authorized_revision_ =
+            action.authorization_.has_value()
+                ? std::optional<std::uint64_t>(
+                      action.authorization_->authorized_revision_)
+                : std::nullopt,
+        .group_id_ = desired.identity_.group_id_,
+        .candidate_node_id_ = action.candidate_.node_id_.ToHexString(),
+        .candidate_assignment_id_ =
+            action.candidate_.assignment_id_.ToHexString(),
+        .candidate_boot_id_ = action.candidate_.boot_id_.ToHexString(),
+        .domain_ =
+            {
+                .source_group_term_ = action.domain_.source_group_term_,
+                .source_node_id_ = action.domain_.source_node_id_.ToHexString(),
+                .source_assignment_id_ =
+                    action.domain_.source_assignment_id_.ToHexString(),
+                .source_boot_id_ = action.domain_.source_boot_id_.ToHexString(),
+                .source_history_id_ =
+                    action.domain_.source_history_id_.ToHexString(),
+                .flow_count_ = action.domain_.flow_count_,
+            },
+        .manifest_revision_ = desired.identity_.manifest_revision_,
+        .manifest_id_ =
+            PopulationManifestId{desired.identity_.manifest_digest_},
+        .partition_replication_epoch_ =
+            desired.identity_.partition_replication_epoch_,
+    };
+  }
+
+  const std::optional<PreparedMemberAssignment>& owner = desired.owner_;
+  const PreparedFailoverCompatibilityDomain& domain = action.domain_;
+  if (transition.mode_ == PreparedFailoverMode::kControlled &&
+      owner.has_value() && owner->node_id_ == domain.source_node_id_ &&
+      owner->assignment_id_ == domain.source_assignment_id_ &&
+      domain.source_group_term_ == desired.identity_.group_term_ &&
+      domain.source_node_id_.ToHexString() == local_identity.local_node_id_ &&
+      domain.source_boot_id_.ToHexString() == local_identity.boot_id_ &&
+      domain.source_history_id_.ToHexString() ==
+          local_identity.local_history_id_) {
+    translated.source_pause_ = DesiredClusterSourcePause{
+        .transition_id_ = transition.transition_id_.bytes(),
+        .transition_revision_ = transition.revision_,
+        .group_id_ = desired.identity_.group_id_,
+        .source_node_id_ = domain.source_node_id_.ToHexString(),
+        .source_assignment_id_ = domain.source_assignment_id_.ToHexString(),
+        .source_boot_id_ = domain.source_boot_id_.ToHexString(),
+        .source_history_id_ = domain.source_history_id_.ToHexString(),
+        .source_group_term_ = domain.source_group_term_,
+        .flow_count_ = domain.flow_count_,
+        .manifest_revision_ = desired.identity_.manifest_revision_,
+        .manifest_id_ =
+            PopulationManifestId{desired.identity_.manifest_digest_},
+        .partition_replication_epoch_ =
+            desired.identity_.partition_replication_epoch_,
+    };
+  }
+  return translated;
+}
+
+ClusterFailoverActivation detail::TranslateClusterFailoverActivation(
+    const PreparedFailoverActivation& activation) {
+  return ClusterFailoverActivation{
+      .action_id_ = activation.action_id_.bytes(),
+      .group_id_ = activation.group_id_,
+      .candidate_node_id_ = activation.candidate_node_id_.ToHexString(),
+      .candidate_assignment_id_ =
+          activation.candidate_assignment_id_.ToHexString(),
+      .candidate_boot_id_ = activation.candidate_boot_id_.ToHexString(),
+      .target_term_ = activation.target_term_,
+      .manifest_revision_ = activation.manifest_revision_,
+      .manifest_id_ = PopulationManifestId{activation.manifest_digest_},
+      .partition_replication_epoch_ = activation.partition_replication_epoch_,
+  };
+}
+
+absl::StatusOr<std::optional<control::FailoverObservation>>
+detail::ProjectClusterFailoverObservation(
+    const ClusterFailoverActionStatus& status) {
+  if (status.state_ != ClusterFailoverActionState::kPrepared &&
+      status.state_ != ClusterFailoverActionState::kFailed) {
+    return std::optional<control::FailoverObservation>{};
+  }
+  if (!status.action_.has_value()) {
+    return absl::FailedPreconditionError(
+        "terminal failover action status is missing its committed action");
+  }
+  const DesiredClusterFailoverAction& action = *status.action_;
+  const auto candidate_node = NodeId::Parse(action.candidate_node_id_);
+  const auto candidate_assignment =
+      AssignmentId::Parse(action.candidate_assignment_id_);
+  const auto candidate_boot = NodeId::Parse(action.candidate_boot_id_);
+  if (!candidate_node.has_value() || !candidate_assignment.has_value() ||
+      !candidate_boot.has_value()) {
+    return absl::FailedPreconditionError(
+        "terminal failover action has a non-canonical candidate identity");
+  }
+
+  if (status.state_ == ClusterFailoverActionState::kFailed) {
+    return std::optional<control::FailoverObservation>(control::ActionFailed{
+        .transition_id = action.transition_id_,
+        .action_id = action.action_id_,
+        .candidate_node_id = candidate_node->ToHexString(),
+        .candidate_assignment_id = candidate_assignment->bytes(),
+        .candidate_boot_id = candidate_boot->ToHexString(),
+        .population_manifest_revision = action.manifest_revision_,
+        .population_manifest_digest = action.manifest_id_.bytes_,
+        .partition_replication_epoch = action.partition_replication_epoch_,
+        .failure_class = status.failure_class_,
+        .failure_detail = status.failure_detail_,
+    });
+  }
+
+  if (!status.prepared_.has_value()) {
+    return absl::FailedPreconditionError(
+        "prepared failover action status is missing its exact context");
+  }
+  const ClusterFailoverPreparedContext& prepared = *status.prepared_;
+  if (prepared.transition_id_ != action.transition_id_ ||
+      prepared.action_id_ != action.action_id_ ||
+      prepared.promotion_.parent_history_id_ !=
+          action.domain_.source_history_id_) {
+    return absl::FailedPreconditionError(
+        "prepared failover context does not match its committed action");
+  }
+  return std::optional<control::FailoverObservation>(control::CandidatePrepared{
+      .transition_id = prepared.transition_id_,
+      .action_id = prepared.action_id_,
+      .candidate_node_id = candidate_node->ToHexString(),
+      .candidate_assignment_id = candidate_assignment->bytes(),
+      .candidate_boot_id = candidate_boot->ToHexString(),
+      .prepared_context_id = prepared.context_id_,
+      .prepared_context_hash = prepared.context_hash_,
+  });
+}
+
+absl::StatusOr<std::optional<control::FailoverObservation>>
+detail::ProjectClusterSourcePauseObservation(
+    const ClusterSourcePauseStatus& status) {
+  if (!status.desired_.has_value() || !status.stable_next_lsns_.has_value() ||
+      !status.failure_detail_.empty()) {
+    return std::optional<control::FailoverObservation>{};
+  }
+  const DesiredClusterSourcePause& desired = *status.desired_;
+  if (desired.flow_count_ == 0 ||
+      status.stable_next_lsns_->size() != desired.flow_count_) {
+    return std::optional<control::FailoverObservation>{};
+  }
+  const auto source_node = NodeId::Parse(desired.source_node_id_);
+  const auto source_assignment =
+      AssignmentId::Parse(desired.source_assignment_id_);
+  const auto source_boot = NodeId::Parse(desired.source_boot_id_);
+  const auto source_history = NodeId::Parse(desired.source_history_id_);
+  if (!source_node.has_value() || !source_assignment.has_value() ||
+      !source_boot.has_value() || !source_history.has_value()) {
+    return absl::FailedPreconditionError(
+        "stable source pause has a non-canonical source identity");
+  }
+  return std::optional<control::FailoverObservation>(control::SourcePaused{
+      .transition_id = desired.transition_id_,
+      .source_node_id = source_node->ToHexString(),
+      .source_assignment_id = source_assignment->bytes(),
+      .source_boot_id = source_boot->ToHexString(),
+      .source_history_id = source_history->ToHexString(),
+      .source_group_term = desired.source_group_term_,
+      .stable_next_lsns = *status.stable_next_lsns_,
+  });
+}
+
+bool detail::ReplicationIdentityRequiresMetaReconnect(
+    const ReplicationIdentity& established,
+    const ReplicationIdentity& latest) noexcept {
+  return latest.local_node_id_ != established.local_node_id_ ||
+         latest.boot_id_ != established.boot_id_ ||
+         latest.local_history_id_ != established.local_history_id_;
+}
+
+bool detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+    const ReplicationIdentity& established, const ReplicationIdentity& latest,
+    const ClusterFailoverActionStatus& status,
+    std::span<const control::WireDesiredGroup> groups) noexcept {
+  if (established.local_node_id_ != latest.local_node_id_ ||
+      established.boot_id_ != latest.boot_id_ ||
+      established.local_history_id_ == latest.local_history_id_ ||
+      !status.action_.has_value()) {
+    return false;
+  }
+  const DesiredClusterFailoverAction& action = *status.action_;
+  const auto group = std::ranges::find_if(
+      groups, [&](const control::WireDesiredGroup& candidate) {
+        return candidate.group_id == action.group_id_;
+      });
+  if (group == groups.end() || !group->failover_transition.has_value()) {
+    return false;
+  }
+  const control::WireFailoverTransition& transition =
+      *group->failover_transition;
+  if (!transition.candidate_action.has_value()) return false;
+  const control::WireFailoverCandidateAction& wire_action =
+      *transition.candidate_action;
+  ClusterFailoverMode wire_mode;
+  if (transition.mode == control::WireFailoverMode::kControlled) {
+    wire_mode = ClusterFailoverMode::kControlled;
+  } else if (transition.mode == control::WireFailoverMode::kUncontrolled) {
+    wire_mode = ClusterFailoverMode::kUncontrolled;
+  } else {
+    return false;
+  }
+  const std::optional<std::uint64_t> authorized_revision =
+      wire_action.authorization.has_value()
+          ? std::optional(wire_action.authorization->authorized_revision)
+          : std::nullopt;
+  const ClusterFailoverCompatibilityDomain& domain = action.domain_;
+  const control::WireFailoverCompatibilityDomain& wire_domain =
+      wire_action.domain;
+  const bool exact_action =
+      transition.transition_id == action.transition_id_ &&
+      transition.revision == action.transition_revision_ &&
+      wire_mode == action.mode_ &&
+      transition.target_term == action.target_term_ &&
+      group->group_term == action.committed_group_term_ &&
+      group->grant_active == action.committed_grant_active_ &&
+      wire_action.action_id == action.action_id_ &&
+      authorized_revision == action.authorized_revision_ &&
+      action.authorized_revision_.has_value() &&
+      wire_action.candidate.node_id == action.candidate_node_id_ &&
+      AssignmentId::FromBytes(wire_action.candidate.assignment_id)
+              .ToHexString() == action.candidate_assignment_id_ &&
+      wire_action.candidate.boot_id == action.candidate_boot_id_ &&
+      action.candidate_node_id_ == latest.local_node_id_ &&
+      action.candidate_boot_id_ == latest.boot_id_ &&
+      wire_domain.source_group_term == domain.source_group_term_ &&
+      wire_domain.source_node_id == domain.source_node_id_ &&
+      AssignmentId::FromBytes(wire_domain.source_assignment_id).ToHexString() ==
+          domain.source_assignment_id_ &&
+      wire_domain.source_boot_id == domain.source_boot_id_ &&
+      wire_domain.source_history_id == domain.source_history_id_ &&
+      wire_domain.flow_count == domain.flow_count_ &&
+      group->manifest_revision == action.manifest_revision_ &&
+      group->manifest_digest == action.manifest_id_.bytes_ &&
+      group->partition_replication_epoch == action.partition_replication_epoch_;
+  if (!exact_action) return false;
+
+  if (status.state_ == ClusterFailoverActionState::kPreparing) {
+    return !status.prepared_.has_value();
+  }
+  if (status.state_ != ClusterFailoverActionState::kPrepared ||
+      !status.prepared_.has_value()) {
+    return false;
+  }
+  const ClusterFailoverPreparedContext& prepared = *status.prepared_;
+  return prepared.transition_id_ == action.transition_id_ &&
+         prepared.action_id_ == action.action_id_ &&
+         prepared.promotion_.parent_history_id_ ==
+             action.domain_.source_history_id_ &&
+         prepared.promotion_.child_history_id_ == latest.local_history_id_;
+}
+
+detail::MetaSessionReplicationIdentityDecision
+detail::EvaluateMetaSessionReplicationIdentity(
+    const ReplicationIdentity& established, const ReplicationIdentity& latest,
+    const ClusterFailoverActionStatus& status,
+    std::span<const control::WireDesiredGroup> groups) noexcept {
+  if (!ReplicationIdentityRequiresMetaReconnect(established, latest)) {
+    return {};
+  }
+  if (FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+          established, latest, status, groups)) {
+    return {.requires_reconnect_ = false, .suppress_ordinary_role_ = true};
+  }
+  return {.requires_reconnect_ = true, .suppress_ordinary_role_ = false};
+}
 
 absl::StatusOr<MetaControlEndpoint> ParseNumericControlEndpoint(
     std::string_view endpoint) {
@@ -537,7 +920,6 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
   switch (directive.kind) {
     case control::WireDirectiveKind::kRebuild:
     case control::WireDirectiveKind::kInitializeEmptyPopulation:
-    case control::WireDirectiveKind::kPromotionPrepare:
       if (directive.recipient_node_id != directive.target_node_id ||
           directive.recipient_boot_id != directive.target_boot_id) {
         return absl::FailedPreconditionError(
@@ -725,7 +1107,7 @@ std::chrono::milliseconds MetaReconnectBackoff::Next(
   const std::uint64_t choices = static_cast<std::uint64_t>(current.count()) + 1;
   const auto delay =
       std::chrono::milliseconds(static_cast<std::int64_t>(entropy % choices));
-  window_ = std::min(window_ * 2, std::chrono::milliseconds(10000));
+  window_ = std::min(window_ * 2, MaximumWindow());
   return delay;
 }
 
@@ -807,8 +1189,131 @@ bool MetaLeaseChallengeRotation::IsCommittedOwner(
     std::span<const control::WireDesiredGroup> groups,
     std::string_view local_node_id) noexcept {
   return std::ranges::any_of(groups, [&](const auto& group) {
-    return group.owner_node_id.has_value() &&
-           *group.owner_node_id == local_node_id;
+    if (!group.owner_node_id.has_value() ||
+        *group.owner_node_id != local_node_id) {
+      return false;
+    }
+    const bool fenced_historical_owner =
+        !group.grant_active && group.owner_assignment_id.has_value() &&
+        std::ranges::any_of(group.members,
+                            [&](const auto& member) {
+                              return member.node_id == local_node_id &&
+                                     member.assignment_id ==
+                                         *group.owner_assignment_id;
+                            }) &&
+        group.failover_transition.has_value() &&
+        group.failover_transition->mode ==
+            control::WireFailoverMode::kUncontrolled &&
+        group.failover_transition->target_term == group.group_term;
+    return !fenced_historical_owner;
+  });
+}
+
+absl::StatusOr<std::optional<control::CandidateProgress>>
+detail::ProjectReplicaCandidateProgress(
+    std::span<const control::WireDesiredGroup> groups,
+    std::string_view local_node_id, const ReplicationIdentity& current_identity,
+    const PopulationReadiness& readiness, const RebuildIdentity& identity,
+    std::span<const std::uint64_t> applied_next_lsns,
+    bool failover_candidate_eligible) {
+  if (!failover_candidate_eligible) {
+    return std::optional<control::CandidateProgress>{};
+  }
+  const auto group = std::ranges::find_if(
+      groups, [&](const control::WireDesiredGroup& candidate) {
+        return candidate.group_id == readiness.group_id_;
+      });
+  if (group == groups.end() || group->group_term != readiness.group_term_ ||
+      group->manifest_revision != readiness.manifest_revision_ ||
+      group->manifest_digest != readiness.manifest_digest_ ||
+      group->partition_replication_epoch !=
+          readiness.partition_replication_epoch_) {
+    return absl::FailedPreconditionError(
+        "candidate readiness does not match the installed FDS");
+  }
+  const auto local_member = std::ranges::find_if(
+      group->members, [&](const control::WireDesiredMember& member) {
+        return member.node_id == local_node_id &&
+               member.assignment_id == readiness.assignment_id_.bytes();
+      });
+  if (local_member == group->members.end()) {
+    return absl::FailedPreconditionError(
+        "candidate readiness does not match the local member assignment");
+  }
+
+  const bool topology_owner =
+      group->owner_node_id.has_value() &&
+      *group->owner_node_id == local_node_id &&
+      group->owner_assignment_id.has_value() &&
+      *group->owner_assignment_id == local_member->assignment_id;
+  const bool fenced_historical_owner =
+      topology_owner && !group->grant_active &&
+      group->failover_transition.has_value() &&
+      group->failover_transition->mode ==
+          control::WireFailoverMode::kUncontrolled &&
+      group->failover_transition->target_term == group->group_term;
+  if (topology_owner && !fenced_historical_owner) {
+    return std::optional<control::CandidateProgress>{};
+  }
+
+  if (current_identity.local_node_id_ != local_node_id ||
+      identity.group_id_ != readiness.group_id_ ||
+      identity.assignment_id_ != readiness.assignment_id_.ToHexString() ||
+      identity.target_node_id_ != local_node_id ||
+      identity.target_boot_id_ != current_identity.boot_id_ ||
+      readiness.group_term_ < identity.term_ ||
+      identity.manifest_revision_ != readiness.manifest_revision_ ||
+      identity.manifest_id_.bytes_ != readiness.manifest_digest_ ||
+      identity.partition_replication_epoch_ !=
+          readiness.partition_replication_epoch_ ||
+      applied_next_lsns.empty() ||
+      std::ranges::any_of(
+          applied_next_lsns, [](std::uint64_t lsn) { return lsn == 0; })) {
+    return absl::FailedPreconditionError(
+        "candidate population identity is incomplete or stale");
+  }
+
+  std::uint64_t source_group_term = identity.term_;
+  std::string source_node_id = identity.source_node_id_;
+  control::WireId128 source_assignment_id{};
+  std::string source_boot_id = identity.source_boot_id_;
+  std::string source_history_id = identity.source_history_id_;
+  if (fenced_historical_owner) {
+    if (readiness.group_term_ <= 1 ||
+        !control::IsCanonicalIdentity160(current_identity.boot_id_) ||
+        !control::IsCanonicalIdentity160(current_identity.local_history_id_)) {
+      return absl::FailedPreconditionError(
+          "fenced historical owner has no exact boot-local source lineage");
+    }
+    source_group_term = readiness.group_term_ - 1;
+    source_node_id = std::string(local_node_id);
+    source_assignment_id = local_member->assignment_id;
+    source_boot_id = current_identity.boot_id_;
+    source_history_id = current_identity.local_history_id_;
+  } else {
+    const auto source_assignment =
+        AssignmentId::Parse(identity.source_assignment_id_);
+    if (!source_assignment.has_value()) {
+      return absl::FailedPreconditionError(
+          "Ready population source assignment is not canonical");
+    }
+    source_assignment_id = source_assignment->bytes();
+  }
+
+  return std::optional<control::CandidateProgress>(control::CandidateProgress{
+      .group_id = readiness.group_id_,
+      .assignment_id = readiness.assignment_id_.bytes(),
+      .group_term = readiness.group_term_,
+      .source_group_term = source_group_term,
+      .manifest_revision = readiness.manifest_revision_,
+      .manifest_digest = readiness.manifest_digest_,
+      .partition_replication_epoch = readiness.partition_replication_epoch_,
+      .source_node_id = std::move(source_node_id),
+      .source_assignment_id = source_assignment_id,
+      .source_boot_id = std::move(source_boot_id),
+      .source_history_id = std::move(source_history_id),
+      .applied_next_lsns = std::vector<std::uint64_t>(applied_next_lsns.begin(),
+                                                      applied_next_lsns.end()),
   });
 }
 
@@ -832,6 +1337,16 @@ std::optional<std::size_t> MetaLeaseChallengeRotation::Next(
     return index;
   }
   return std::nullopt;
+}
+
+detail::MetaTransferAbortDisposition detail::ClassifyMetaTransferAbort(
+    const control::TransferAbort& abort,
+    std::optional<control::TransferKind> active_kind) noexcept {
+  return abort.reason == control::TransferAbortReason::
+                             kFullDesiredStateSuperseded &&
+                 active_kind == control::TransferKind::kFullDesiredState
+             ? MetaTransferAbortDisposition::kContinueAuthenticatedSession
+             : MetaTransferAbortDisposition::kFailSession;
 }
 
 void detail::MetaHeartbeatProjectionGate::RequestPause(
@@ -917,8 +1432,7 @@ struct MetaControlClientService::Impl {
     // watchdog once receipt is known, but still waits for pending_heartbeat_
     // to clear after the transition finishes.
     bool heartbeat_ack_observed_ = false;
-    std::unique_ptr<control::ControlDeadlineWatchdog>
-        heartbeat_ack_deadline_;
+    std::unique_ptr<control::ControlDeadlineWatchdog> heartbeat_ack_deadline_;
     std::unique_ptr<control::ControlDeadlineWatchdog>
         inbound_transfer_deadline_;
     std::deque<DirectiveWork> directive_queue_;
@@ -930,7 +1444,6 @@ struct MetaControlClientService::Impl {
     std::size_t active_tasks_ = 0;
     std::size_t directive_completion_tasks_ = 0;
     std::size_t target_population_completion_tasks_ = 0;
-    std::size_t promotion_prepare_tasks_ = 0;
     std::size_t source_completion_tasks_ = 0;
     std::uint64_t directive_generation_ = 1;
     detail::MetaHeartbeatProjectionGate heartbeat_projection_gate_;
@@ -1138,8 +1651,8 @@ struct MetaControlClientService::Impl {
       std::chrono::milliseconds progress_timeout,
       std::optional<control::WireMessage> first = std::nullopt) {
     if (!first.has_value()) {
-      auto read = co_await ReadWithDeadline(
-          frames, deadline, progress_timeout, "initial FullDesiredState");
+      auto read = co_await ReadWithDeadline(frames, deadline, progress_timeout,
+                                            "initial FullDesiredState");
       if (!read.ok()) co_return read.status();
       first = std::move(*read);
     }
@@ -1184,8 +1697,7 @@ struct MetaControlClientService::Impl {
                  directive.recipient_boot_id == local_boot_id;
         });
     absl::Status installed = co_await installer_.InstallFullStateTransition(
-        std::move(*prepared), basis,
-        local_population_transition_expected);
+        std::move(*prepared), basis, local_population_transition_expected);
     if (!installed.ok()) co_return installed;
     directory_ = std::move(refreshed_directory);
     RecordClusterControlFullStateApplied();
@@ -1258,8 +1770,6 @@ struct MetaControlClientService::Impl {
         return "revoke-sources";
       case control::WireDirectiveKind::kInitializeEmptyPopulation:
         return "initialize-empty-population";
-      case control::WireDirectiveKind::kPromotionPrepare:
-        return "promotion-prepare";
     }
     return "unknown";
   }
@@ -1270,8 +1780,7 @@ struct MetaControlClientService::Impl {
     const bool executes_on_target =
         directive.kind == control::WireDirectiveKind::kRebuild ||
         directive.kind ==
-            control::WireDirectiveKind::kInitializeEmptyPopulation ||
-        directive.kind == control::WireDirectiveKind::kPromotionPrepare;
+            control::WireDirectiveKind::kInitializeEmptyPopulation;
     const std::string kind_phase =
         absl::StrCat(DirectiveKindName(directive.kind), ":", phase);
     control::OperationEvidence report{
@@ -1341,9 +1850,6 @@ struct MetaControlClientService::Impl {
       case control::WireDirectiveKind::kInitializeEmptyPopulation:
         kind = NodeDirective::Kind::kInitializeEmptyPopulation;
         break;
-      case control::WireDirectiveKind::kPromotionPrepare:
-        kind = NodeDirective::Kind::kPromotionPrepare;
-        break;
       default:
         return absl::InvalidArgumentError("unknown directive kind");
     }
@@ -1356,26 +1862,6 @@ struct MetaControlClientService::Impl {
       if (!request.ok()) return request.status();
       flow_count = request->source_flow_count;
     }
-    std::optional<PromotionPrepareInput> promotion_prepare;
-    if (kind == NodeDirective::Kind::kPromotionPrepare) {
-      auto request =
-          control::DecodePromotionPrepareRequest(directive.payload);
-      if (!request.ok()) return request.status();
-      flow_count = static_cast<std::uint32_t>(
-          request->required_applied_next_lsns.size());
-      auto preconditions = control::DecodePromotionPreparePreconditions(
-          directive.preconditions);
-      if (!preconditions.ok()) return preconditions.status();
-      promotion_prepare = PromotionPrepareInput{
-          .parent_history_id_ = std::move(request->parent_history_id),
-          .required_applied_next_lsns_ =
-              std::move(request->required_applied_next_lsns),
-          .excluded_group_term_ = preconditions->excluded_group_term,
-          .old_authority_exclusion_hash_ =
-              preconditions->old_authority_exclusion_hash,
-      };
-    }
-
     const auto target_node = NodeId::Parse(directive.target_node_id);
     const auto target_boot = NodeId::Parse(directive.target_boot_id);
     const auto source_node = NodeId::Parse(directive.source_node_id);
@@ -1464,13 +1950,8 @@ struct MetaControlClientService::Impl {
         .manifest_digest_ = directive.manifest_digest,
         .partition_replication_epoch_ = directive.partition_replication_epoch,
         .manifest_entries_ = std::move(manifest_entries),
-        .promotion_prepare_ = std::move(promotion_prepare),
-        .payload_ = rebuild || kind == NodeDirective::Kind::kPromotionPrepare
-                        ? std::string{}
-                        : directive.payload,
-        .preconditions_ = kind == NodeDirective::Kind::kPromotionPrepare
-                              ? std::string{}
-                              : directive.preconditions,
+        .payload_ = rebuild ? std::string{} : directive.payload,
+        .preconditions_ = directive.preconditions,
         .storage_mutating_ = directive.storage_mutating,
         .force_ = directive.force,
     };
@@ -1511,25 +1992,16 @@ struct MetaControlClientService::Impl {
   celer::Task<absl::Status> SendTerminalDirectiveResult(
       control::ControlSessionWriter& writer,
       const std::shared_ptr<SessionState>& state,
-      const control::Directive& directive,
-      const NodeDirectiveCompletion::TerminalResult& applied,
+      const control::Directive& directive, const absl::Status& applied,
       bool started) {
-    const absl::Status status = applied.ok() ? absl::OkStatus()
-                                             : applied.status();
-    const bool promotion =
-        directive.kind == control::WireDirectiveKind::kPromotionPrepare;
-    // Status-only directives retain their v1 terminal bytes. Only promotion
-    // owns an opaque typed success result, so extending the completion seam
-    // must not change rebuild/source receipt hashes during a rolling upgrade.
-    const std::string result = applied.ok()
-                                   ? (promotion ? *applied : std::string("ok"))
-                                   : std::string(status.message());
+    const std::string result =
+        applied.ok() ? "ok" : std::string(applied.message());
     control::DirectiveResult response{
         .session_id = directive.session_id,
         .recipient_boot_id = directive.recipient_boot_id,
         .assignment_id = directive.authority.assignment_id,
         .identity = directive.identity,
-        .status = ClassifyDirectiveResultStatus(status, started),
+        .status = ClassifyDirectiveResultStatus(applied, started),
         .result_hash = control::ComputeSha256(result),
         .result = result,
     };
@@ -1541,7 +2013,7 @@ struct MetaControlClientService::Impl {
         .identity_ = response.identity,
         .result_hash_ = response.result_hash,
     });
-    RecordClusterControlDirectiveResult(status.ok());
+    RecordClusterControlDirectiveResult(applied.ok());
     co_return co_await SendDirectiveResult(writer, response);
   }
 
@@ -1557,35 +2029,15 @@ struct MetaControlClientService::Impl {
     }
     while (result.ok() && !state->closing_ &&
            generation == state->directive_generation_) {
-      std::optional<NodeDirectiveCompletion::TerminalResult> terminal =
-          completion.terminal_result();
+      std::optional<absl::Status> terminal = completion.result();
       if (terminal.has_value()) {
-        if (directive.kind == control::WireDirectiveKind::kPromotionPrepare &&
-            terminal->ok()) {
-          auto prepared = control::DecodePromotionPreparedEvidence(**terminal);
-          if (!prepared.ok()) {
-            result = prepared.status();
-            break;
-          }
-          // Promotion creates a new child history during the same control
-          // session. Adopt it before the heartbeat task resumes its ordinary
-          // history-stability check.
-          state->replication_identity_.local_history_id_ =
-              prepared->child_history_id;
-        }
         result = co_await SendDirectiveCompleted(*state->writer_, directive);
         if (result.ok() && completion.started()) {
-          const bool promotion =
-              directive.kind == control::WireDirectiveKind::kPromotionPrepare;
           std::string terminal_evidence =
-              terminal->ok()
-                  ? (promotion ? **terminal : std::string("succeeded"))
-                  : std::string(terminal->status().message());
-          const std::string_view terminal_phase =
-              promotion ? "prepared" : "completed";
+              terminal->ok() ? "succeeded" : std::string(terminal->message());
           result = co_await SendOperationEvidence(
               *state->writer_,
-              EvidenceForDirective(directive, terminal_phase,
+              EvidenceForDirective(directive, "completed",
                                    std::move(terminal_evidence)));
         }
         if (result.ok()) {
@@ -1601,9 +2053,6 @@ struct MetaControlClientService::Impl {
     --state->directive_completion_tasks_;
     if (target_population_work) {
       --state->target_population_completion_tasks_;
-      if (directive.kind == control::WireDirectiveKind::kPromotionPrepare) {
-        --state->promotion_prepare_tasks_;
-      }
     } else {
       --state->source_completion_tasks_;
     }
@@ -1623,10 +2072,7 @@ struct MetaControlClientService::Impl {
       const bool target_population_work =
           work.normalized_.kind_ == NodeDirective::Kind::kReplication ||
           work.normalized_.kind_ ==
-              NodeDirective::Kind::kInitializeEmptyPopulation ||
-          work.normalized_.kind_ == NodeDirective::Kind::kPromotionPrepare;
-      const bool promotion =
-          work.normalized_.kind_ == NodeDirective::Kind::kPromotionPrepare;
+              NodeDirective::Kind::kInitializeEmptyPopulation;
       // Target-population completions may overlap only other target admissions,
       // which is the path ReplicationManager uses for exact replay and rebuild
       // supersession. Source authorization/revocation remains a serialized
@@ -1638,11 +2084,9 @@ struct MetaControlClientService::Impl {
         co_await state->tasks_changed_.Wait();
       }
       if (state->closing_ || !state->directive_dispatch_enabled_) break;
-      if (promotion) ++state->promotion_prepare_tasks_;
       auto started = co_await StartDirective(*state->writer_, work.wire_,
                                              std::move(work.normalized_));
       if (!started.ok()) {
-        if (promotion) --state->promotion_prepare_tasks_;
         result = started.status();
         break;
       }
@@ -1760,8 +2204,8 @@ struct MetaControlClientService::Impl {
         !installed.ok()) {
       co_return installed;
     }
-    state->desired_ = std::make_shared<control::FullDesiredState>(
-        std::move(replacement));
+    state->desired_ =
+        std::make_shared<control::FullDesiredState>(std::move(replacement));
     state->accepted_directives_.clear();
     state->challenge_rotation_.Reset();
     if (absl::Status applied = co_await SendApplied(writer, *state->desired_);
@@ -1912,13 +2356,19 @@ struct MetaControlClientService::Impl {
       const ReplicationIdentity latest =
           co_await replication_.ObserveIdentity();
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
-      if (latest.boot_id_ != state->boot_id_ ||
-          (latest.local_history_id_ !=
-               state->replication_identity_.local_history_id_ &&
-           state->promotion_prepare_tasks_ == 0)) {
-        result = absl::FailedPreconditionError(
-            "replication boot or history changed during the Meta session");
-        break;
+      if (detail::ReplicationIdentityRequiresMetaReconnect(
+              state->replication_identity_, latest)) {
+        const ClusterFailoverActionStatus identity_transition_status =
+            co_await replication_.cluster_failover_action_status();
+        if (state->heartbeat_projection_gate_.pause_requested()) continue;
+        if (detail::EvaluateMetaSessionReplicationIdentity(
+                state->replication_identity_, latest,
+                identity_transition_status, state->desired_->groups)
+                .requires_reconnect_) {
+          result = absl::FailedPreconditionError(
+              "replication boot or history changed during the Meta session");
+          break;
+        }
       }
       ClusterPopulationStatus population =
           co_await replication_.cluster_population_status();
@@ -1951,11 +2401,58 @@ struct MetaControlClientService::Impl {
         if (state->heartbeat_projection_gate_.pause_requested()) continue;
       }
 
+      ClusterSourcePauseStatus source_pause_status =
+          co_await replication_.cluster_source_pause_status();
+      if (state->heartbeat_projection_gate_.pause_requested()) continue;
+      // A first identity mismatch may have sampled Preparing before the native
+      // action published Prepared or Failed. Resample after the other awaited
+      // heartbeat inputs, then use this one action snapshot for both the final
+      // identity decision and the observation placed on the wire.
+      ClusterFailoverActionStatus failover_status =
+          co_await replication_.cluster_failover_action_status();
+      if (state->heartbeat_projection_gate_.pause_requested()) continue;
+      const ReplicationIdentity after_failover_status =
+          co_await replication_.ObserveIdentity();
+      if (state->heartbeat_projection_gate_.pause_requested()) continue;
+      const detail::MetaSessionReplicationIdentityDecision identity_decision =
+          detail::EvaluateMetaSessionReplicationIdentity(
+              state->replication_identity_, after_failover_status,
+              failover_status, state->desired_->groups);
+      if (identity_decision.requires_reconnect_) {
+        result = absl::FailedPreconditionError(
+            "replication boot or history changed during failover heartbeat "
+            "projection");
+        break;
+      }
+      auto failover_observation =
+          detail::ProjectClusterFailoverObservation(failover_status);
+      if (!failover_observation.ok()) {
+        result = failover_observation.status();
+        break;
+      }
+      auto source_pause_observation =
+          detail::ProjectClusterSourcePauseObservation(source_pause_status);
+      if (!source_pause_observation.ok()) {
+        result = source_pause_observation.status();
+        break;
+      }
+      if (failover_observation->has_value() &&
+          source_pause_observation->has_value()) {
+        result = absl::FailedPreconditionError(
+            "one Data incarnation cannot report both candidate action and "
+            "source pause evidence");
+        break;
+      }
+      if (source_pause_observation->has_value()) {
+        failover_observation = std::move(source_pause_observation);
+      }
+
       control::Heartbeat heartbeat{
           .session_id = state->session_.session_id_.bytes(),
           .heartbeat_sequence = heartbeat_sequence,
           .health = {},
           .role_information = control::NoRoleInformation{},
+          .failover_observation = std::move(*failover_observation),
       };
       heartbeat.health.active_groups = static_cast<std::uint32_t>(std::count_if(
           state->desired_->groups.begin(), state->desired_->groups.end(),
@@ -1969,14 +2466,15 @@ struct MetaControlClientService::Impl {
       heartbeat.health.population_ready = readiness->has_value();
       heartbeat.health.summary = population.failure_reason_;
       const bool local_is_committed_owner =
-          MetaLeaseChallengeRotation::IsCommittedOwner(
-              state->desired_->groups, options_.node_id_);
+          MetaLeaseChallengeRotation::IsCommittedOwner(state->desired_->groups,
+                                                       options_.node_id_);
       const std::optional<std::size_t> local_group_index =
           state->challenge_rotation_.Next(state->desired_->groups,
                                           options_.node_id_);
       std::uint32_t challenged_grant_duration_ms = 0;
       std::optional<control::LeaseChallenge> heartbeat_challenge;
-      if (local_group_index.has_value()) {
+      if (!identity_decision.suppress_ordinary_role_ &&
+          local_group_index.has_value()) {
         const control::WireDesiredGroup& local_group =
             state->desired_->groups[*local_group_index];
         auto nonce = control::GenerateId128();
@@ -1994,36 +2492,23 @@ struct MetaControlClientService::Impl {
             state->session_.session_id_.bytes(), state->boot_id_,
             *heartbeat_challenge);
         if (!result.ok()) break;
-      } else if (!local_is_committed_owner && readiness->has_value() &&
+      } else if (!identity_decision.suppress_ordinary_role_ &&
+                 !local_is_committed_owner && readiness->has_value() &&
                  population.ready_token_.has_value() &&
                  population.applied_next_lsns_.has_value()) {
-        const ReadyToken& ready = *population.ready_token_;
-        const RebuildIdentity& identity = ready.identity();
-        const auto source_assignment =
-            AssignmentId::Parse(identity.source_assignment_id_);
-        if (!source_assignment.has_value()) {
-          result = absl::FailedPreconditionError(
-              "Ready population source assignment is not canonical");
+        auto candidate = detail::ProjectReplicaCandidateProgress(
+            state->desired_->groups, options_.node_id_, after_failover_status,
+            **readiness, population.ready_token_->identity(),
+            *population.applied_next_lsns_,
+            population.failover_candidate_eligible_);
+        if (!candidate.ok()) {
+          result = candidate.status();
           break;
         }
-        heartbeat.role_information = control::ReplicaCandidate{
-            .progress =
-                {
-                    .group_id = identity.group_id_,
-                    .assignment_id = (*readiness)->assignment_id_.bytes(),
-                    .group_term = (*readiness)->group_term_,
-                    .manifest_revision = (*readiness)->manifest_revision_,
-                    .manifest_digest = (*readiness)->manifest_digest_,
-                    .partition_replication_epoch =
-                        (*readiness)->partition_replication_epoch_,
-                    .source_node_id = identity.source_node_id_,
-                    .source_assignment_id = source_assignment->bytes(),
-                    .source_boot_id = identity.source_boot_id_,
-                    .source_history_id = identity.source_history_id_,
-                    .applied_next_lsns =
-                        std::move(*population.applied_next_lsns_),
-                },
-        };
+        if (candidate->has_value()) {
+          heartbeat.role_information =
+              control::ReplicaCandidate{.progress = std::move(**candidate)};
+        }
       }
       result = FitHeartbeatToSingleFrame(heartbeat);
       if (!result.ok()) {
@@ -2075,8 +2560,7 @@ struct MetaControlClientService::Impl {
           state->pending_heartbeat_.has_value() &&
           state->pending_heartbeat_->sequence_ == heartbeat_sequence;
       if (ack_still_pending && !state->heartbeat_ack_observed_) {
-        result =
-            state->heartbeat_ack_deadline_->Arm(state->progress_timeout_);
+        result = state->heartbeat_ack_deadline_->Arm(state->progress_timeout_);
         if (!result.ok()) break;
       }
       while (!state->closing_ && state->pending_heartbeat_.has_value() &&
@@ -2202,9 +2686,13 @@ struct MetaControlClientService::Impl {
         co_return absl::InvalidArgumentError(
             "out-of-date decision does not match the pending challenge");
       }
+      // A commit can overtake the heartbeat projected from the preceding FDS.
+      // The publisher on this same session will deliver the replacement; do
+      // not tear the session down and thereby revoke source exports needed by
+      // that very transition. The old finite lease is not renewed and normal
+      // FDS installation still invalidates stale authority before Ack.
       state->challenge_tracker_.Cancel();
-      co_return absl::FailedPreconditionError(
-          "Meta reports the installed projection out of date");
+      RecordClusterControlLeaseDenial();
     } else if (pending.challenge_.has_value()) {
       co_return absl::InvalidArgumentError(
           "HeartbeatAck omitted the lease decision");
@@ -2332,9 +2820,9 @@ struct MetaControlClientService::Impl {
     if (options_.tls_context_ != nullptr) {
       auto sans = stream.PeerCertificateUriSans();
       if (!sans.ok()) co_return sans.status();
-      const std::string& expected_principal =
-          endpoint.principal_.has_value() ? *endpoint.principal_
-                                          : *hello_member->principal;
+      const std::string& expected_principal = endpoint.principal_.has_value()
+                                                  ? *endpoint.principal_
+                                                  : *hello_member->principal;
       if (absl::Status identity =
               ValidateUniqueControlPrincipal(*sans, expected_principal);
           !identity.ok()) {
@@ -2452,8 +2940,12 @@ struct MetaControlClientService::Impl {
         if (is_transfer) {
           const bool starts =
               std::holds_alternative<control::TransferStart>(*incoming);
-          const bool aborts =
-              std::holds_alternative<control::TransferAbort>(*incoming);
+          const auto* abort = std::get_if<control::TransferAbort>(&*incoming);
+          const bool aborts = abort != nullptr;
+          // LargeObjectReassembler clears the sink when it consumes Abort, so
+          // retain the authenticated object's type for the session decision.
+          const std::optional<control::TransferKind> aborted_kind =
+              aborts ? transfer_sink.kind() : std::nullopt;
           const bool advances =
               starts ||
               std::holds_alternative<control::TransferChunk>(*incoming);
@@ -2488,6 +2980,14 @@ struct MetaControlClientService::Impl {
           if (starts) transfer_active = true;
           if (aborts) {
             transfer_active = false;
+            if (detail::ClassifyMetaTransferAbort(*abort, aborted_kind) ==
+                detail::MetaTransferAbortDisposition::
+                    kContinueAuthenticatedSession) {
+              // The old projection remains installed. Heartbeat production is
+              // intentionally untouched while Meta retries the latest FDS on
+              // this authenticated session.
+              continue;
+            }
             co_return absl::AbortedError(
                 "Meta aborted an inbound control transfer");
           }
@@ -2633,8 +3133,7 @@ struct MetaControlClientService::Impl {
       // is independent of this control socket. NodeControl first closes and
       // drains action admission, then resolves that exact attempt before this
       // client joins the executor.
-      shutdown_cancel =
-          co_await CancelPopulationForShutdown();
+      shutdown_cancel = co_await CancelPopulationForShutdown();
     } else {
       immediate_invalidation = installer_.InvalidateSessionNow(session);
     }
@@ -2655,7 +3154,7 @@ struct MetaControlClientService::Impl {
       cleanup_status = std::move(cleanup);
     }
     co_return detail::MetaSessionRunResult(std::move(session_status),
-                                          std::move(cleanup_status));
+                                           std::move(cleanup_status));
   }
 
   MetaControlClientOptions options_;
@@ -2746,8 +3245,7 @@ celer::Task<absl::Status> MetaControlClientService::Run(celer::Worker& worker,
       const detail::MetaSessionRunResult session =
           co_await impl_->RunSession(worker, endpoint, &valid_ack);
       const absl::Status& reported = session.report_status();
-      if (!reported.ok() &&
-          reported.code() != absl::StatusCode::kCancelled) {
+      if (!reported.ok() && reported.code() != absl::StatusCode::kCancelled) {
         spdlog::warn("Meta control session to {} ended: {}",
                      EndpointText(endpoint.host_, endpoint.port_),
                      reported.message());
@@ -2811,8 +3309,8 @@ absl::Status MetaControlClientService::WaitUntilQuiesced() {
 }
 
 std::unique_ptr<NodeControlActions> CreateReplicationNodeControlActions(
-    ReplicationManager& replication) {
-  return std::make_unique<ReplicationNodeControlActions>(replication);
+    ReplicationManager& replication, bool use_tls) {
+  return std::make_unique<ReplicationNodeControlActions>(replication, use_tls);
 }
 
 }  // namespace keylane::cluster

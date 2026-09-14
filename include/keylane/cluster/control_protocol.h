@@ -56,6 +56,10 @@ inline constexpr std::size_t kMaxManifestEntries = 16384;
 inline constexpr std::size_t kMaxProjectedPolicies = 4096;
 inline constexpr std::size_t kMaxProjectedDirectives = 4096;
 inline constexpr std::size_t kMaxCandidateFlows = 1024;
+inline constexpr std::size_t kMaxFailoverFailureClassBytes = 64;
+// Heartbeats are single-frame messages. Keeping failure detail below 4 KiB
+// leaves room for a maximal CandidateProgress plus one ActionFailed report.
+inline constexpr std::size_t kMaxFailoverFailureDetailBytes = 4096;
 
 using WireId128 = std::array<std::uint8_t, 16>;
 using WireHash256 = std::array<std::uint8_t, 32>;
@@ -218,9 +222,17 @@ struct TransferEnd {
   friend bool operator==(const TransferEnd&, const TransferEnd&) = default;
 };
 
+enum class TransferAbortReason : std::uint16_t {
+  kUnspecified = 0,
+  // The sender found a newer committed FullDesiredState before this object
+  // became installable. The receiver may discard only the matching active FDS
+  // object and keep the authenticated session for its replacement.
+  kFullDesiredStateSuperseded = 1,
+};
+
 struct TransferAbort {
   WireId128 object_id{};
-  std::uint16_t reason = 0;
+  TransferAbortReason reason = TransferAbortReason::kUnspecified;
 
   friend bool operator==(const TransferAbort&, const TransferAbort&) = default;
 };
@@ -306,6 +318,9 @@ struct CandidateProgress {
   std::string group_id;
   WireId128 assignment_id{};
   std::uint64_t group_term = 0;
+  // Term of the live source lineage that produced this population. It may be
+  // older than group_term after an uncontrolled fence, but never newer.
+  std::uint64_t source_group_term = 0;
   std::uint64_t manifest_revision = 0;
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
@@ -357,11 +372,62 @@ struct ReplicaCandidate {
 using HeartbeatRoleInformation =
     std::variant<NoRoleInformation, AuthorityLeaseRequest, ReplicaCandidate>;
 
+// Failover progress is orthogonal to the steady-state role payload: a
+// controlled source still requests lease renewal while reporting its stable
+// pause. Candidate action progress can coexist with ReplicaCandidate, but
+// history rotation or terminal failure may suppress that ordinary role while
+// the independent failover observation reports Prepared or Failed. All values
+// are boot-local observations; only the transition projected in
+// FullDesiredState is durable.
+struct SourcePaused {
+  WireId128 transition_id{};
+  std::string source_node_id;
+  WireId128 source_assignment_id{};
+  std::string source_boot_id;
+  std::string source_history_id;
+  std::uint64_t source_group_term = 0;
+  std::vector<std::uint64_t> stable_next_lsns;
+
+  friend bool operator==(const SourcePaused&, const SourcePaused&) = default;
+};
+
+struct CandidatePrepared {
+  WireId128 transition_id{};
+  WireId128 action_id{};
+  std::string candidate_node_id;
+  WireId128 candidate_assignment_id{};
+  std::string candidate_boot_id;
+  WireId128 prepared_context_id{};
+  WireHash256 prepared_context_hash{};
+
+  friend bool operator==(const CandidatePrepared&,
+                         const CandidatePrepared&) = default;
+};
+
+struct ActionFailed {
+  WireId128 transition_id{};
+  WireId128 action_id{};
+  std::string candidate_node_id;
+  WireId128 candidate_assignment_id{};
+  std::string candidate_boot_id;
+  std::uint64_t population_manifest_revision = 0;
+  WireHash256 population_manifest_digest{};
+  std::uint64_t partition_replication_epoch = 0;
+  std::string failure_class;
+  std::string failure_detail;
+
+  friend bool operator==(const ActionFailed&, const ActionFailed&) = default;
+};
+
+using FailoverObservation =
+    std::variant<SourcePaused, CandidatePrepared, ActionFailed>;
+
 struct Heartbeat {
   WireId128 session_id{};
   std::uint64_t heartbeat_sequence = 0;
   HeartbeatHealth health;
   HeartbeatRoleInformation role_information = NoRoleInformation{};
+  std::optional<FailoverObservation> failover_observation;
 
   friend bool operator==(const Heartbeat&, const Heartbeat&) = default;
 };
@@ -482,8 +548,7 @@ class LeaseChallengeTracker {
  public:
   absl::Status Begin(WireId128 session_id, std::string data_boot_id,
                      LeaseChallenge challenge);
-  absl::Status MarkWritten(const WireId128& nonce,
-                           std::int64_t lease_now_ms);
+  absl::Status MarkWritten(const WireId128& nonce, std::int64_t lease_now_ms);
   absl::StatusOr<std::int64_t> AcceptGrant(const WireId128& session_id,
                                            const LeaseGranted& grant,
                                            std::int64_t lease_now_ms);
@@ -535,7 +600,6 @@ enum class WireDirectiveKind : std::uint8_t {
   // Source-less destructive initialization of the target's first committed
   // population. Existing values are wire-stable; new kinds append only.
   kInitializeEmptyPopulation = 4,
-  kPromotionPrepare = 5,
 };
 
 // Versioned payload shared by rebuild and authorize-source. The envelope binds
@@ -552,52 +616,6 @@ struct RebuildRequest {
 // counts, and trailing bytes are rejected rather than inferred locally.
 absl::StatusOr<std::string> EncodeRebuildRequest(const RebuildRequest& request);
 absl::StatusOr<RebuildRequest> DecodeRebuildRequest(std::string_view encoded);
-
-// Versioned opaque bodies carried by a promotion-prepare directive and its
-// successful terminal result. They intentionally exclude envelope identity:
-// the enclosing Directive/DirectiveResult remains the single source of truth
-// for operation, attempt, recipient, assignment, and authority anchors.
-struct PromotionPrepareRequest {
-  std::string parent_history_id;
-  std::vector<std::uint64_t> required_applied_next_lsns;
-
-  friend bool operator==(const PromotionPrepareRequest&,
-                         const PromotionPrepareRequest&) = default;
-};
-
-struct PromotionPreparePreconditions {
-  std::uint64_t excluded_group_term = 0;
-  WireHash256 old_authority_exclusion_hash{};
-
-  friend bool operator==(const PromotionPreparePreconditions&,
-                         const PromotionPreparePreconditions&) = default;
-};
-
-struct PromotionPreparedEvidence {
-  std::string parent_history_id;
-  std::vector<std::uint64_t> frozen_applied_next_lsns;
-  std::uint64_t population_generation = 0;
-  std::uint64_t population_digest = 0;
-  std::uint64_t catalog_generation = 0;
-  std::uint64_t catalog_dump_crc64 = 0;
-  std::string child_history_id;
-
-  friend bool operator==(const PromotionPreparedEvidence&,
-                         const PromotionPreparedEvidence&) = default;
-};
-
-absl::StatusOr<std::string> EncodePromotionPrepareRequest(
-    const PromotionPrepareRequest& request);
-absl::StatusOr<PromotionPrepareRequest> DecodePromotionPrepareRequest(
-    std::string_view encoded);
-absl::StatusOr<std::string> EncodePromotionPreparePreconditions(
-    const PromotionPreparePreconditions& preconditions);
-absl::StatusOr<PromotionPreparePreconditions>
-DecodePromotionPreparePreconditions(std::string_view encoded);
-absl::StatusOr<std::string> EncodePromotionPreparedEvidence(
-    const PromotionPreparedEvidence& evidence);
-absl::StatusOr<PromotionPreparedEvidence> DecodePromotionPreparedEvidence(
-    std::string_view encoded);
 
 struct Directive {
   WireId128 session_id{};
@@ -617,9 +635,9 @@ struct Directive {
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
-  // V1 uses typed payloads for rebuild/authorize-source source layouts and
-  // promotion-prepare, and a target history id for initialize-empty-population.
-  // Only promotion-prepare carries preconditions.
+  // V1 uses typed payloads for rebuild/authorize-source source layouts and a
+  // target history id for initialize-empty-population. Preconditions remain
+  // reserved.
   std::string payload;
   std::string preconditions;
   // Active V1 classification: population mutations set it; source
@@ -714,6 +732,86 @@ struct WireSlotRange {
   friend bool operator==(const WireSlotRange&, const WireSlotRange&) = default;
 };
 
+// Control-protocol projection of committed transition semantics. Controlled
+// mode preserves the current owner's authority until cutover; Uncontrolled
+// mode requires that authority to be fenced first.
+enum class WireFailoverMode : std::uint8_t {
+  kControlled = 1,
+  kUncontrolled = 2,
+};
+
+// Wire form of the authorized cutover's durability claim. None means the
+// accepted evidence proves no acknowledged write is lost; Unknown carries no
+// such guarantee and does not itself report observed loss.
+enum class WireFailoverLoss : std::uint8_t {
+  kNone = 1,
+  kUnknown = 2,
+};
+
+// Exact candidate process incarnation projected by Meta. Receivers compare
+// the node, membership assignment, and boot identities as one identity.
+struct WireFailoverCandidate {
+  std::string node_id;
+  WireId128 assignment_id{};
+  std::string boot_id;
+
+  friend bool operator==(const WireFailoverCandidate&,
+                         const WireFailoverCandidate&) = default;
+};
+
+// Projected source lineage within which candidate progress was compared. It
+// fixes the expected frontier shape but deliberately carries no live frontier.
+struct WireFailoverCompatibilityDomain {
+  std::uint64_t source_group_term = 0;
+  std::string source_node_id;
+  WireId128 source_assignment_id{};
+  std::string source_boot_id;
+  std::string source_history_id;
+  std::uint32_t flow_count = 0;
+
+  friend bool operator==(const WireFailoverCompatibilityDomain&,
+                         const WireFailoverCompatibilityDomain&) = default;
+};
+
+// Action-scoped, revision-stamped permission to prepare promotion, including
+// the durability claim that any cutover through it must retain.
+struct WireFailoverAuthorization {
+  std::uint64_t authorized_revision = 0;
+  WireFailoverLoss loss_if_cutover = WireFailoverLoss::kUnknown;
+
+  friend bool operator==(const WireFailoverAuthorization&,
+                         const WireFailoverAuthorization&) = default;
+};
+
+// One replaceable candidate attempt projected from the durable transition.
+// Absence of authorization keeps the candidate selected but not executable.
+struct WireFailoverCandidateAction {
+  WireId128 action_id{};
+  WireFailoverCandidate candidate;
+  WireFailoverCompatibilityDomain domain;
+  std::optional<WireFailoverAuthorization> authorization;
+
+  friend bool operator==(const WireFailoverCandidateAction&,
+                         const WireFailoverCandidateAction&) = default;
+};
+
+// Data execution subset of the committed transition. This is a replaceable
+// FDS projection, not Data-owned durable state, and is resent after reconnect
+// or Meta leadership change. Meta-only workflow data such as the Controlled
+// operation/deadline and successor grant stay out of this protocol; after
+// cutover the successor is the ordinary current grant. Volatile
+// source/candidate progress is likewise deliberately absent.
+struct WireFailoverTransition {
+  WireId128 transition_id{};
+  std::uint64_t revision = 0;
+  WireFailoverMode mode = WireFailoverMode::kUncontrolled;
+  std::uint64_t target_term = 0;
+  std::optional<WireFailoverCandidateAction> candidate_action;
+
+  friend bool operator==(const WireFailoverTransition&,
+                         const WireFailoverTransition&) = default;
+};
+
 struct WireDesiredGroup {
   std::string group_id;
   std::vector<WireDesiredMember> members;
@@ -727,6 +825,9 @@ struct WireDesiredGroup {
   std::uint64_t grant_revision = 0;
   std::uint32_t grant_duration_ms = 0;
   bool grant_active = false;
+  // Present only on a failover-installed current grant. Data may activate a
+  // prepared promotion only when this matches its boot-local action context.
+  std::optional<WireId128> activation_action_id;
   std::uint64_t config_epoch = 0;
   std::vector<WireSlotRange> slot_ranges;
   std::uint64_t manifest_revision = 0;
@@ -737,6 +838,11 @@ struct WireDesiredGroup {
   std::uint64_t partition_replication_epoch = 0;
   std::string grant_policy_id;
   std::uint64_t grant_policy_version = 0;
+  // Genesis population directives exclusively own replication ingress.
+  // Meta enables this only after the committed cluster lifecycle is Created;
+  // failover and population actions may still temporarily supersede it.
+  bool steady_replication_enabled = false;
+  std::optional<WireFailoverTransition> failover_transition;
 
   friend bool operator==(const WireDesiredGroup&,
                          const WireDesiredGroup&) = default;
@@ -789,9 +895,9 @@ struct WireProjectedDirective {
   WireHash256 manifest_digest{};
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
-  // V1 uses typed payloads for rebuild/authorize-source source layouts and
-  // promotion-prepare, and a target history id for initialize-empty-population.
-  // Only promotion-prepare carries preconditions.
+  // V1 uses typed payloads for rebuild/authorize-source source layouts and a
+  // target history id for initialize-empty-population. Preconditions remain
+  // reserved.
   std::string payload;
   std::string preconditions;
   // Active V1 classification: population mutations set it; source

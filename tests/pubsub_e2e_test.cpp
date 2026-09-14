@@ -11,6 +11,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -169,7 +170,8 @@ void CreateDataFile(const std::string& path) {
 class Server {
  public:
   Server(const std::string& binary, std::uint16_t port, const std::string& data,
-         const std::string& log, std::string requirepass = {}) {
+         const std::string& log, std::string requirepass = {},
+         std::vector<std::pair<std::string, std::string>> environment = {}) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ != 0) return;
@@ -193,6 +195,9 @@ class Server {
     if (!requirepass.empty()) {
       args.push_back("--requirepass");
       args.push_back(std::move(requirepass));
+    }
+    for (const auto& [name, value] : environment) {
+      if (::setenv(name.c_str(), value.c_str(), 1) != 0) _exit(127);
     }
     std::vector<char*> argv;
     for (std::string& arg : args) argv.push_back(arg.data());
@@ -279,14 +284,69 @@ void WaitForReplica(RespClient* replica) {
   Fail("replica did not become online");
 }
 
+void ExpectExecPublishUsesCommandTimeSubscriptions(RespClient* publisher,
+                                                   std::uint16_t source_port,
+                                                   std::string_view channel,
+                                                   std::string_view label) {
+  RespClient subscriber = Connect(source_port);
+  Expect(subscriber.Command({"MULTI"}), "+OK", std::string(label) + " multi");
+  Expect(subscriber.Command({"PUBLISH", channel, "before-subscribe"}),
+         "+QUEUED", std::string(label) + " queue publish");
+  Expect(subscriber.Command({"SUBSCRIBE", channel}), "+QUEUED",
+         std::string(label) + " queue subscribe");
+  Expect(subscriber.Command({"EXEC"}),
+         "*2\r\n:0\r\n" + Subscription("subscribe", channel, 1),
+         std::string(label) + " exec");
+
+  // The second publication is both an observable ordering barrier and proof
+  // that the subscription established later in EXEC is live. If the deferred
+  // first PUBLISH is incorrectly resolved against the final subscription
+  // table, ReadPush observes before-subscribe instead and fails.
+  Expect(publisher->Command({"PUBLISH", channel, "after-subscribe"}), ":1",
+         std::string(label) + " publish barrier");
+  Expect(subscriber.ReadPush(), Message(channel, "after-subscribe"),
+         std::string(label) + " excludes later subscriber");
+  Expect(subscriber.Command({"UNSUBSCRIBE", channel}),
+         Subscription("unsubscribe", channel, 0),
+         std::string(label) + " unsubscribe");
+}
+
+void ExpectExecPublishPrecedesLaterUnsubscribe(RespClient* subscriber,
+                                               std::string_view channel) {
+  ExpectContains(subscriber->Command({"HELLO", "3"}), "$5\r\nproto\r\n:3",
+                 "unsubscribe-order HELLO 3");
+  Expect(subscriber->Command({"SUBSCRIBE", channel}),
+         Resp3Subscription("subscribe", channel, 1),
+         "unsubscribe-order subscribe");
+  Expect(subscriber->Command({"MULTI"}), "+OK", "unsubscribe-order multi");
+  Expect(subscriber->Command({"PUBLISH", channel, "before-unsubscribe"}),
+         "+QUEUED", "unsubscribe-order queue publish");
+  Expect(subscriber->Command({"UNSUBSCRIBE", channel}), "+QUEUED",
+         "unsubscribe-order queue unsubscribe");
+  subscriber->SendPipeline({{"EXEC"}});
+  Expect(subscriber->ReadPush(), Resp3Message(channel, "before-unsubscribe"),
+         "unsubscribe-order captured message");
+  Expect(subscriber->ReadPush(),
+         "*2\r\n:1\r\n" + Resp3Subscription("unsubscribe", channel, 0),
+         "unsubscribe-order exec count");
+  Expect(subscriber->Command({"PING"}), "+PONG",
+         "unsubscribe-order exits subscribed mode");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
     if (argc != 2) Fail("usage: pubsub_e2e_test KEYLANE_BINARY");
-    char directory[] = "/tmp/keylane-pubsub-e2e-XXXXXX";
-    if (::mkdtemp(directory) == nullptr) Fail("mkdtemp failed");
-    const std::string root(directory);
+    const char* temporary_root = std::getenv("TMPDIR");
+    std::string directory_template =
+        std::string(temporary_root != nullptr ? temporary_root : "/tmp") +
+        "/keylane-pubsub-e2e-XXXXXX";
+    std::vector<char> directory(directory_template.begin(),
+                                directory_template.end());
+    directory.push_back('\0');
+    if (::mkdtemp(directory.data()) == nullptr) Fail("mkdtemp failed");
+    const std::string root(directory.data());
     const std::string source_data = root + "/source.data";
     const std::string replica_data = root + "/replica.data";
     const std::string auth_data = root + "/auth.data";
@@ -295,7 +355,13 @@ int main(int argc, char** argv) {
     CreateDataFile(auth_data);
     const std::uint16_t source_port = FreePort();
     const std::uint16_t replica_port = FreePort();
-    Server source(argv[1], source_port, source_data, root + "/source.log");
+    std::vector<std::pair<std::string, std::string>> source_environment;
+#if !defined(NDEBUG)
+    source_environment.emplace_back(
+        "KEYLANE_EXEC_REJECT_EPHEMERAL_FINAL_RECHECK_ONCE", "1");
+#endif
+    Server source(argv[1], source_port, source_data, root + "/source.log", {},
+                  std::move(source_environment));
     Server replica(argv[1], replica_port, replica_data, root + "/replica.log");
 
     RespClient source_client = Connect(source_port);
@@ -308,6 +374,9 @@ int main(int argc, char** argv) {
            "$14\r\nsentinel-probe", "get client name");
     ExpectContains(source_client.Command({"CLIENT", "LIST"}),
                    "name=sentinel-probe", "client list name");
+
+    ExpectExecPublishUsesCommandTimeSubscriptions(
+        &source_client, source_port, "tx-order-standalone", "standalone");
 
     RespClient resp3_client = Connect(source_port);
     const std::string hello3 =
@@ -570,16 +639,52 @@ int main(int argc, char** argv) {
     Expect(replica_pattern_subscriber.Command({"PUNSUBSCRIBE"}),
            Subscription("punsubscribe", "rep*", 0),
            "replica pattern unsubscribe");
+    RespClient source_replication_subscriber = Connect(source_port);
+    Expect(source_replication_subscriber.Command({"SUBSCRIBE", "replicated"}),
+           Subscription("subscribe", "replicated", 1),
+           "source replicated subscribe");
     Expect(replica_client.Command({"PUBLISH", "replicated", "local-only"}),
            ":1", "replica local publish");
     Expect(replica_subscriber.ReadPush(), Message("replicated", "local-only"),
            "replica local message");
 
+#if !defined(NDEBUG)
+    // This deterministic final-check fault is compiled into Debug only. A
+    // failed replication check must not leak the captured PUBLISH to either the
+    // source's local subscribers or the replica backlog. The next direct
+    // publication is an ordering barrier on both paths: it must be the first
+    // message either subscriber observes.
+    RespClient rejected_exec_client = Connect(source_port);
+    Expect(rejected_exec_client.Command({"MULTI"}), "+OK",
+           "rejected publish-only multi");
+    Expect(
+        rejected_exec_client.Command({"PUBLISH", "replicated", "rejected-tx"}),
+        "+QUEUED", "queue rejected publish-only transaction");
+    Expect(rejected_exec_client.Command({"EXEC"}),
+           "-ERR EXEC replication failed: cluster authority changed",
+           "reject publish-only exec at final check");
+    Expect(source_client.Command({"PUBLISH", "replicated", "after-reject"}),
+           ":1", "publish barrier after rejected exec");
+    Expect(source_replication_subscriber.ReadPush(),
+           Message("replicated", "after-reject"),
+           "rejected exec did not publish locally");
+    Expect(replica_subscriber.ReadPush(), Message("replicated", "after-reject"),
+           "rejected exec did not enter the replica backlog");
+#endif
+
+    ExpectExecPublishUsesCommandTimeSubscriptions(
+        &source_client, source_port, "tx-order-replicated", "replicated");
+    RespClient unsubscribe_order_subscriber = Connect(source_port);
+    ExpectExecPublishPrecedesLaterUnsubscribe(&unsubscribe_order_subscriber,
+                                              "tx-order-unsubscribe");
+
     // A PUBLISH-only EXEC uses the channel-sharded ephemeral source flow.
     Expect(source_client.Command({"MULTI"}), "+OK", "publish-only multi");
     Expect(source_client.Command({"PUBLISH", "replicated", "tx-only"}),
            "+QUEUED", "queue publish-only transaction");
-    Expect(source_client.Command({"EXEC"}), "*1\r\n:0", "publish-only exec");
+    Expect(source_client.Command({"EXEC"}), "*1\r\n:1", "publish-only exec");
+    Expect(source_replication_subscriber.ReadPush(),
+           Message("replicated", "tx-only"), "publish-only exec local message");
     Expect(replica_subscriber.ReadPush(), Message("replicated", "tx-only"),
            "replicated publish-only exec message");
 
@@ -590,7 +695,9 @@ int main(int argc, char** argv) {
            "queue mixed write");
     Expect(source_client.Command({"PUBLISH", "replicated", "tx-mixed"}),
            "+QUEUED", "queue mixed publish");
-    Expect(source_client.Command({"EXEC"}), "*2\r\n+OK\r\n:0", "mixed exec");
+    Expect(source_client.Command({"EXEC"}), "*2\r\n+OK\r\n:1", "mixed exec");
+    Expect(source_replication_subscriber.ReadPush(),
+           Message("replicated", "tx-mixed"), "mixed exec local message");
     Expect(replica_subscriber.ReadPush(), Message("replicated", "tx-mixed"),
            "replicated mixed exec message");
     const auto read_deadline = std::chrono::steady_clock::now() + 10s;

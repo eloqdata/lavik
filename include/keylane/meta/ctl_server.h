@@ -1,8 +1,8 @@
 #pragma once
 
 // MetaCtlServer: authorized line-protocol administration and observation
-// surface of keylane-meta, served on the celer worker that also drives the
-// meta Raft transport.
+// surface of keylane-meta, served on its Celer control worker. NuRaft's Asio
+// peer transport has an independent runtime.
 //
 // Local administration defaults to a mode-0600 AF_UNIX socket and derives
 // its actor from SO_PEERCRED. Remote TCP administration supports plaintext on
@@ -45,11 +45,12 @@
 //                             / "ERR not-found".
 //                             Non-terminal creation/membership workflows
 //                             additionally include phase=<durable
-//                             phase/recovery reason>. Reads the committed
-//                             operation journal directly; this is NOT a
-//                             linearizable read (no read-index round or leader
-//                             lease check), so a stale follower may answer from
-//                             an older commit index.
+//                             phase/recovery reason>. Failover running state is
+//                             derived from the operation and matching topology
+//                             transition in one committed snapshot. This is NOT
+//                             a linearizable read (no read-index round or
+//                             leader lease check), so a stale follower may
+//                             answer from an older commit index.
 //   registernode <node_id40hex> <principal> <primary|replica>
 //                <data-endpoint> [<data-endpoint>]
 //                          -> propose RegisterNode with zero capability mask;
@@ -95,10 +96,17 @@
 //                             topology and caller-generated root operation id.
 //                             Success confirms the atomic root-operation plus
 //                             Creating lifecycle commit and returns immediately
-//                             with its index and operation id. All later creates
-//                             are already-created; failures name a stage and
-//                             stable code. Creation and membership changes share
-//                             admission across all Admin listeners.
+//                             with its index and operation id. All later
+//                             creates are already-created; failures name a
+//                             stage and stable code. Creation and membership
+//                             changes share admission across all Admin
+//                             listeners.
+//   failover 1 <hex>       -> submit one bounded canonical controlled-failover
+//                             request with its caller-generated operation id
+//                             and absolute deadline. Success confirms only the
+//                             request commit; getop observes later transition
+//                             progress and completion. Typed errors distinguish
+//                             definite rejection from uncertain submission.
 //   addsrv <id> <raft-ip:port> <data-control-ip:port> <ctl-ip:port>
 //          [<keylane://meta/id>]
 //                          -> persists a membership workflow before binding
@@ -386,7 +394,7 @@ class MetaCtlServer {
   // worker asynchronously; check status() afterwards.
   void Start();
   // Cancels result waits and drains local sessions; committed background
-  // creation is not aborted or rolled back when an Admin waiter goes away.
+  // workflows are not aborted or rolled back when an Admin waiter goes away.
   void Shutdown();
 
   // Result of the asynchronous bind: kUnavailable until the worker reports.
@@ -394,6 +402,7 @@ class MetaCtlServer {
 
  private:
   struct Core;
+  class SessionConnectionBorrow;
   using CorePtr = std::shared_ptr<Core>;
 
   explicit MetaCtlServer(CorePtr core) : core_(std::move(core)) {}
@@ -401,7 +410,8 @@ class MetaCtlServer {
   static celer::Task<absl::Status> AcceptLoop(CorePtr core);
   static celer::Task<absl::Status> SessionLoop(CorePtr core,
                                                celer::TcpStream stream,
-                                               celer::Connection* connection);
+                                               celer::Connection* connection,
+                                               SessionConnectionBorrow borrow);
 
   CorePtr core_;
 };

@@ -79,6 +79,10 @@ using namespace celer;
 
 namespace {
 
+std::optional<CommandReply> RecheckClusterWriteAuthority(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    cluster::AuthorityInFlightGuards* in_flights);
+
 storage::StorageEngine* g_storage = nullptr;
 ReplicationManager* g_replication = nullptr;
 ClientLimit* g_client_limit = nullptr;
@@ -467,7 +471,33 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
   }
 
   if (request.kind_ == CommandKind::kPublish) {
+    cluster::AuthorityInFlightGuards cluster_in_flights;
+    if (cluster::ClusterEnabled() && !request.replication_origin_ &&
+        request.replication_capture_ == nullptr) {
+      if (std::optional<CommandReply> rejected = RecheckClusterWriteAuthority(
+              request, reply_builder, &cluster_in_flights);
+          rejected.has_value()) {
+        co_return std::move(*rejected);
+      }
+    }
     if (request.replication_capture_ != nullptr) {
+      if (request.defer_pubsub_delivery_) {
+        auto captured = co_await CapturePubSubPublication(args[1], args[2]);
+        if (!captured.ok()) {
+          co_return BuiltReply(
+              reply_builder.AppendError(captured.status().message()));
+        }
+        CaptureReplicationCommand(request, request.args_);
+        const std::uint64_t receivers = CapturedPubSubReceiverCount(*captured);
+        request.replication_capture_->SetCapturedPubSubPublication(
+            std::move(*captured));
+        // Subscriber membership and the reply count belong to this command's
+        // position in EXEC. Only physical delivery waits for replication to
+        // commit, so a later SUBSCRIBE cannot receive this message.
+        co_return BuiltReply(reply_builder.AppendInteger(
+            static_cast<long long>(std::min<std::uint64_t>(
+                receivers, std::numeric_limits<long long>::max()))));
+      }
       CaptureReplicationCommand(request, request.args_);
     } else if (!request.replication_origin_ && g_storage != nullptr &&
                (g_replication == nullptr || !g_replication->is_replica())) {
@@ -478,16 +508,26 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
       // them. Keep the replicated command name canonical even when the client
       // used mixed or lower case.
       replication_args[0] = "PUBLISH";
+      storage::MutationPrecondition mutation_precondition =
+          ClusterMutationPrecondition(request);
       absl::Status published = co_await celer::SubmitTaskTo(
           source_worker,
-          [partition_id, args = std::move(replication_args)]() mutable {
-            return g_storage->PublishEphemeralReplicationCommand(
-                partition_id, std::move(args));
+          [partition_id, args = std::move(replication_args),
+           mutation_precondition = std::move(
+               mutation_precondition)]() mutable -> Task<absl::Status> {
+            co_return co_await g_storage->PublishEphemeralReplicationCommand(
+                partition_id, std::move(args),
+                std::move(mutation_precondition));
           });
       if (!published.ok()) {
-        co_return BuiltReply(reply_builder.AppendError(
+        CommandReply reply = BuiltReply(reply_builder.AppendError(
             absl::StrCat("ERR ephemeral replication publish failed: ",
                          published.message())));
+        if (IsClusterAuthorityChanged(published)) {
+          co_return FinalizeClusterMutationReply(request, reply_builder,
+                                                 std::move(reply));
+        }
+        co_return reply;
       }
     }
     const std::uint64_t receivers = co_await PublishChannel(args[1], args[2]);
@@ -750,7 +790,8 @@ bool LoadingAllowedCommand(const CommandRequest& request) {
 // matching Redis); the *_ro forms carry kCmdReadOnly instead.
 bool ClusterRequestIsWrite(const CommandRequest& request) {
   return request.spec_ != nullptr &&
-         (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0;
+         (request.spec_->flags_ &
+          (kCmdWrite | kCmdMayReplicate | kCmdDynamicWrite)) != 0;
 }
 
 // Extracts the command's distinct Redis hash slots in first-occurrence order
@@ -761,6 +802,10 @@ bool ClusterRequestIsWrite(const CommandRequest& request) {
 // ReplicaMovedError precedent.
 void PopulateClusterSlots(CommandRequest& request) {
   request.ClearClusterSlots();
+  if (request.kind_ == CommandKind::kPublish && request.args_.size() >= 2) {
+    request.AddClusterSlot(storage::RedisSlot(request.args_[1]));
+    return;
+  }
   if (request.spec_ == nullptr || (request.spec_->flags_ & kCmdNoKeys) != 0) {
     return;
   }
@@ -852,6 +897,10 @@ bool EmitClusterDecision(const cluster::Decision& decision, bool connection_tls,
       reply->encoded_ = reply_builder.AppendError(
           "LOADING Redis is loading the dataset in memory");
       return true;
+    case cluster::Decision::Kind::kTryAgain:
+      reply->encoded_ =
+          reply_builder.AppendError("TRYAGAIN Failover in progress");
+      return true;
     case cluster::Decision::Kind::kCloseConnection:
       reply->close_connection_ = true;
       return true;
@@ -872,7 +921,8 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
       .slots_ = request.ClusterSlots(),
       .is_write_ = is_write,
       .connection_readonly_ = ctx.cluster_readonly_,
-      .loading_allowed_ = LoadingAllowedCommand(request),
+      .loading_allowed_ = LoadingAllowedCommand(request) &&
+                          request.kind_ != CommandKind::kPublish,
   };
   auto admission = std::make_shared<const cluster::AuthorityAdmission>(
       runtime->authority_guard_.CaptureAndAdmit(view,
@@ -900,8 +950,7 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
     cluster::AuthorityInFlightGuards* in_flights) {
   if (!cluster::ClusterEnabled() || request.replication_origin_ ||
       request.cluster_authority_admission_ == nullptr ||
-      request.ClusterSlots().empty() ||
-      !ClusterRequestIsWrite(request)) {
+      request.ClusterSlots().empty() || !ClusterRequestIsWrite(request)) {
     return std::nullopt;
   }
   cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
@@ -2618,7 +2667,7 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
                     ReplicationPublisherAdmission::WorkerToken{
                         .worker_ = scope.worker_,
                         .token_ = std::move(*token),
-                    };
+                };
                 co_return absl::OkStatus();
               }};
         });
@@ -3967,9 +4016,8 @@ Task<absl::StatusOr<storage::RestoreRawResult>> ApplyPreparedRestore(
           db, key, *digest, value.raw_, replace, tx, replication,
           mutation_precondition);
     }
-    co_return co_await g_storage->RestoreRawValue(db, key, value.raw_, replace,
-                                                  replication,
-                                                  mutation_precondition);
+    co_return co_await g_storage->RestoreRawValue(
+        db, key, value.raw_, replace, replication, mutation_precondition);
   }
   storage::CollectionPageReader next =
       [&value]() -> Task<absl::StatusOr<storage::CollectionPage>> {
@@ -7741,8 +7789,8 @@ PrepareFunctionMutationPublication(const CommandRequest& request) {
   co_return co_await SubmitTaskTo(
       0,
       [admission = std::move(admission), args = std::move(args)]() mutable
-      -> Task<
-          absl::StatusOr<std::optional<PreparedFunctionMutationPublication>>> {
+          -> Task<absl::StatusOr<
+              std::optional<PreparedFunctionMutationPublication>>> {
         auto publication = g_storage->PrepareAdmittedReplicationCommand(
             admission, storage::ReplicationEventKind::kCatalogMutation, 0,
             std::move(args), std::vector<std::string>{});
@@ -9087,6 +9135,10 @@ Task<CommandReply> ExecuteExecBody(
       std::any_of(queued.begin(), queued.end(), ExecCommandMayWrite);
   const bool has_replicable =
       std::any_of(queued.begin(), queued.end(), ExecCommandMayReplicate);
+  const bool has_cluster_mutation =
+      has_write || std::any_of(queued.begin(), queued.end(), [](const auto& c) {
+        return c.spec_ != nullptr && (c.spec_->flags_ & kCmdMayReplicate) != 0;
+      });
   auto blocking_notifications =
       std::make_shared<BlockingNotificationCapture>(g_storage->worker_count());
   for (CommandRequest& command : queued) {
@@ -9140,6 +9192,7 @@ Task<CommandReply> ExecuteExecBody(
       if (ExecCommandMayReplicate(command)) {
         command.replication_capture_ =
             std::make_shared<ReplicationCommandCapture>();
+        command.defer_pubsub_delivery_ = command.kind_ == CommandKind::kPublish;
       }
     }
   }
@@ -9281,6 +9334,18 @@ Task<CommandReply> ExecuteExecBody(
         continue;
       }
       if ((cmd.spec_->flags_ & kCmdNoKeys) != 0) {
+        // PUBLISH is protocol-level keyless, but its channel is routed through
+        // the slot captured at queue-time admission. Re-admit that slot for
+        // EXEC so a Meta transition between QUEUED and EXEC cannot publish
+        // under obsolete owner authority.
+        if (cmd.kind_ == CommandKind::kPublish) {
+          for (const std::uint16_t slot : cmd.ClusterSlots()) {
+            if (std::find(exec_cluster_slots.begin(), exec_cluster_slots.end(),
+                          slot) == exec_cluster_slots.end()) {
+              exec_cluster_slots.push_back(slot);
+            }
+          }
+        }
         continue;
       }
       const absl::StatusOr<KeyIndexView> keys =
@@ -9299,7 +9364,7 @@ Task<CommandReply> ExecuteExecBody(
       co_await DropWatches(ctx);
       co_return BuiltReply(AppendCrossSlotError(reply_builder));
     }
-    if (!exec_cluster_slots.empty() && has_write) {
+    if (!exec_cluster_slots.empty() && has_cluster_mutation) {
       cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
       const cluster::RequestView view{
           .slots_ = exec_cluster_slots,
@@ -9362,6 +9427,7 @@ Task<CommandReply> ExecuteExecBody(
   std::vector<ReplyChunkSource> reply_chunks(queued.size());
   std::optional<std::uint8_t> select_db;
   bool close_after_exec = false;
+  bool captured_replication_published = false;
   auto finalize_exec_reply = [&](CommandReply reply) {
     reply.close_connection_ = reply.close_connection_ || close_after_exec;
     return FinalizeClusterMutationReply(queued.front(), reply_builder,
@@ -9577,6 +9643,7 @@ Task<CommandReply> ExecuteExecBody(
         }
         return false;
       }
+      captured_replication_published = true;
       return catalog_mutation_committed;
     };
     auto enter_catalog_replication_participant =
@@ -10097,7 +10164,25 @@ Task<CommandReply> ExecuteExecBody(
           source_worker,
           [storage_admission = std::move(storage_admission), event_kind,
            partition_id, effects = std::move(effects),
-           fullsync_projection = std::move(fullsync_projection)]() mutable {
+           fullsync_projection = std::move(fullsync_projection),
+           exec_admission]() mutable {
+            KEYLANE_FAULT_INJECT(
+                static std::atomic<bool> reject_ephemeral_once = false;
+                if (event_kind == storage::ReplicationEventKind::kEphemeral &&
+                    std::getenv(
+                        "KEYLANE_EXEC_REJECT_EPHEMERAL_FINAL_RECHECK_ONCE") !=
+                        nullptr &&
+                    !reject_ephemeral_once.exchange(
+                        true, std::memory_order_acq_rel)) {
+                  return ClusterAuthorityChangedStatus();
+                });
+            if (exec_admission != nullptr &&
+                cluster::GetClusterRuntime()
+                        ->authority_guard_.RecheckAtMutation(
+                            *exec_admission, cluster::LeaseClockNow()) !=
+                    cluster::RecheckResult::kOk) {
+              return ClusterAuthorityChangedStatus();
+            }
             return g_storage->PublishLateAdmittedReplicationCommand(
                 storage_admission, event_kind, partition_id, std::move(effects),
                 std::move(fullsync_projection));
@@ -10112,7 +10197,42 @@ Task<CommandReply> ExecuteExecBody(
         reply.close_connection_ = true;
         co_return reply;
       }
+      captured_replication_published = true;
     }
+  }
+
+  bool has_deferred_publish = false;
+  for (std::size_t index = 0; index < queued.size(); ++index) {
+    has_deferred_publish =
+        has_deferred_publish ||
+        (queued[index].defer_pubsub_delivery_ && !replies[index].empty() &&
+         replies[index].front() != '-');
+  }
+  if (has_deferred_publish && !captured_replication_published) {
+    co_await DropWatches(ctx);
+    CommandReply reply = BuiltReply(reply_builder.AppendError(
+        "ERR EXEC replication failed before captured PUBLISH delivery"));
+    reply.close_connection_ = true;
+    co_return finalize_exec_reply(std::move(reply));
+  }
+
+  // Captured source-side PUBLISH effects become subscriber-visible only after
+  // the durable transaction or keyless late publication above has committed.
+  // Each snapshot retains the subscription membership and RESP encoding from
+  // the command's logical position in EXEC; later subscription changes cannot
+  // reorder Pub/Sub semantics. The committed cut authorizes completion even
+  // if the finite lease changes while cross-worker delivery is in flight.
+  for (std::size_t index = 0; index < queued.size(); ++index) {
+    const CommandRequest& command = queued[index];
+    if (!command.defer_pubsub_delivery_ || replies[index].empty() ||
+        replies[index].front() == '-') {
+      continue;
+    }
+    assert(command.replication_capture_ != nullptr);
+    auto publication =
+        command.replication_capture_->TakeCapturedPubSubPublication();
+    assert(publication != nullptr);
+    (void)co_await DeliverCapturedPubSubPublication(std::move(publication));
   }
 
   absl::Status notified = co_await FlushBlockingNotifications(
@@ -10466,6 +10586,19 @@ void ReplicationCommandCapture::Record(std::uint8_t db_id,
 CapturedReplicationEffects ReplicationCommandCapture::Take() {
   std::lock_guard lock(mutex_);
   return CapturedReplicationEffects{handled_, std::move(commands_)};
+}
+
+void ReplicationCommandCapture::SetCapturedPubSubPublication(
+    std::shared_ptr<CapturedPubSubPublication> publication) {
+  std::lock_guard lock(mutex_);
+  assert(pubsub_publication_ == nullptr);
+  pubsub_publication_ = std::move(publication);
+}
+
+std::shared_ptr<CapturedPubSubPublication>
+ReplicationCommandCapture::TakeCapturedPubSubPublication() {
+  std::lock_guard lock(mutex_);
+  return std::exchange(pubsub_publication_, nullptr);
 }
 
 void CaptureReplicationCommand(const CommandRequest& request,

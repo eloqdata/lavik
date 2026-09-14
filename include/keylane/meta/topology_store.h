@@ -17,11 +17,13 @@
 //     (FindGroupOfNode, FindGroup) and lets the apply dispatcher enforce.
 //   - revision_ is the membership CAS token of a group: 1 at creation,
 //     expected_revision+1 after each applied membership change. It does not
-//     move for record-field or slot-map changes.
+//     move for record-field, failover-transition, or slot-map changes. An
+//     active failover transition has its own Raft-index revision and is
+//     replaced only through an exact transition-id/revision reference.
 //   - topology_epoch is strictly monotonic and gap-free: every command that
 //     carries new_topology_epoch (group lifecycle/membership, endpoint,
-//     replication state, slot map, and ActivateAuthority through the
-//     granular primitives) must carry exactly current + 1.
+//     replication state, slot map, authority activation, and failover cutover
+//     through the granular primitives) must carry exactly current + 1.
 //   - Cluster lifecycle has an independent revision. Only Uninitialized may
 //     enter Creating; Created and ProvisioningFailed are terminal. These
 //     transitions do not advance topology_epoch. The root operation id and
@@ -64,11 +66,12 @@
 // particular this store does NOT know whether a node_id is registered:
 // registration is the identity store's fact, cross-checked by the dispatcher.
 //
-// Serialization: u16 schema_version envelope; lifecycle, then groups sorted
-// by group_id, members sorted by node_id, retained last-assignment index sorted
-// by node_id, and the slot map as sorted runs. Byte output is deterministic so
-// equal states serialize to equal bytes. Pre-release stores use no migration;
-// an older development data directory must be rebuilt.
+// Serialization: u16 schema_version envelope; lifecycle, then groups (including
+// optional failover transitions) sorted by group_id, members sorted by node_id,
+// retained last-assignment index sorted by node_id, and the slot map as sorted
+// runs. Byte output is deterministic so equal states serialize to equal bytes.
+// Pre-release stores use no migration; an older development data directory
+// must be rebuilt.
 
 #include <array>
 #include <cstdint>
@@ -121,11 +124,13 @@ struct MetaGroupMember {
   bool operator==(const MetaGroupMember&) const = default;
 };
 
-// Read view of one group: the committed GroupRecord plus the topology
-// store's own bookkeeping (config_epoch, membership CAS revision, members).
+// Read view of one group: the committed GroupRecord, any active failover
+// transition, and the topology store's own bookkeeping (config_epoch,
+// membership CAS revision, members).
 struct MetaTopologyGroupView {
   std::string group_id_;
   MetaGroupRecord record_;
+  std::optional<MetaFailoverTransition> failover_transition_;
   std::uint64_t config_epoch_ = 0;
   std::uint64_t revision_ = 0;  // 1 at creation, +1 per membership change
   std::vector<MetaGroupMember> members_;
@@ -138,8 +143,7 @@ class MetaTopologyStore {
   // Exact calls replay as no-ops; Created and ProvisioningFailed are terminal.
   absl::Status BeginClusterCreate(const MetaOperationId& root_operation_id,
                                   std::uint64_t genesis_commit_index);
-  absl::Status CompleteClusterCreate(
-      const MetaOperationId& root_operation_id);
+  absl::Status CompleteClusterCreate(const MetaOperationId& root_operation_id);
   absl::Status FailClusterCreate(const MetaOperationId& root_operation_id,
                                  std::string failure_summary);
   const MetaClusterLifecycleState& ClusterLifecycle() const {
@@ -174,6 +178,28 @@ class MetaTopologyStore {
                                             std::uint64_t epoch);
   absl::Status SetGroupConfigEpoch(const std::string& group_id,
                                    std::uint64_t config_epoch);
+  // Installs the only active transition for a group. committed_index becomes
+  // the transition revision regardless of the caller's input value. An exact
+  // replay at that index is a no-op; another active transition conflicts.
+  // Membership and cross-store facts are intentionally caller-owned.
+  absl::Status InstallFailoverTransition(
+      const std::string& group_id, const MetaFailoverTransition& transition,
+      std::uint64_t committed_index);
+  // Replaces the transition named by the exact id/revision reference and
+  // records committed_index as its strictly newer revision. Replacement
+  // cannot change transition identity. The complete post-state is checked
+  // before the current-revision CAS so an exact Raft replay is a no-op.
+  absl::Status ReplaceFailoverTransition(
+      const std::string& group_id,
+      const MetaFailoverTransitionRef& expected_transition,
+      const MetaFailoverTransition& replacement, std::uint64_t committed_index);
+  // Clears only the exact transition id/revision. An already-empty slot is
+  // accepted because this primitive is idempotent. Compound commands must
+  // still prove their other post-state in the aggregate layer: absence alone
+  // cannot distinguish replay of an old clear from a later cleared state.
+  absl::Status ClearFailoverTransition(
+      const std::string& group_id,
+      const MetaFailoverTransitionRef& expected_transition);
   absl::Status SetTopologyEpoch(std::uint64_t new_topology_epoch);
   // Read-only preflight for cross-store transactions such as UpdateNode.
   // Accepts current (replay) or current+1 (fresh apply).
@@ -202,6 +228,7 @@ class MetaTopologyStore {
  private:
   struct GroupState {
     MetaGroupRecord record_;
+    std::optional<MetaFailoverTransition> failover_transition_;
     std::uint64_t config_epoch_ = 0;
     std::uint64_t revision_ = 0;
     struct MemberState {

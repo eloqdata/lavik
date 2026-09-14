@@ -115,8 +115,13 @@ Decision Admit(const ServingState* state, const RequestView& request) {
   if (self_index == group->primary_node_index_) {
     // A fenced group has no safe owner: the primary must not serve and there
     // is no other authority to redirect to.
-    decision.kind_ = group->granted_ ? Decision::Kind::kServe
-                                     : Decision::Kind::kClusterDownUnbound;
+    if (!group->granted_) {
+      decision.kind_ = Decision::Kind::kClusterDownUnbound;
+    } else if (request.is_write_ && group->mutations_paused_) {
+      decision.kind_ = Decision::Kind::kTryAgain;
+    } else {
+      decision.kind_ = Decision::Kind::kServe;
+    }
     return decision;
   }
 
@@ -185,6 +190,31 @@ bool AuthorityUnchanged(const ServingState& admitted,
   }
   return true;
 }
+
+namespace {
+
+// A pause is an admission barrier, not an authority change: work that already
+// registered its GroupInFlight guard must finish so NodeControl can drain to a
+// stable replication frontier. A request that merely captured the old state
+// but has not registered yet must observe the pause and retry instead.
+bool MutationAdmissionUnchanged(const ServingState& admitted,
+                                const ServingState* current,
+                                std::span<const std::uint16_t> slots) {
+  if (&admitted == current) return true;
+  if (current == nullptr) return slots.empty();
+  for (const std::uint16_t slot : slots) {
+    const GroupView* before = admitted.GroupForSlot(slot);
+    const GroupView* now = current->GroupForSlot(slot);
+    if (before == nullptr || now == nullptr ||
+        before->group_id_ != now->group_id_ ||
+        before->mutations_paused_ != now->mutations_paused_) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
 
 AuthorityGuard::AuthorityGuard(TopologyCache& topology) : topology_(topology) {}
 
@@ -315,8 +345,8 @@ RecheckResult AuthorityGuard::RegisterAndRecheck(
   // brackets registration against a concurrent publisher's drain.
   std::uint64_t unused_version = 0;
   std::uint64_t publication_before = 0;
-  (void)CurrentCachedWithVersion(topology_, &unused_version,
-                                 &publication_before);
+  const std::shared_ptr<const ServingState> registration_state =
+      CurrentCachedWithVersion(topology_, &unused_version, &publication_before);
 
   const std::shared_ptr<const ServingState>& admitted_state = admission.state();
   if (admitted_state == nullptr) return RecheckResult::kReject;
@@ -330,6 +360,8 @@ RecheckResult AuthorityGuard::RegisterAndRecheck(
   }
 
   if (topology_.publication_sequence() == publication_before &&
+      MutationAdmissionUnchanged(*admitted_state, registration_state.get(),
+                                 admission.slots()) &&
       Recheck(admission, now) == RecheckResult::kOk) {
     return RecheckResult::kOk;
   }

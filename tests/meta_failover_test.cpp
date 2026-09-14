@@ -1,16 +1,17 @@
-#include "keylane/meta/failover.h"
-
 #include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
-#include <string_view>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "keylane/meta/coordinator.h"
-#include "keylane/meta/encoding.h"
+#include "keylane/meta/failover.h"
+#include "keylane/meta/failover_reconciler.h"
 #include "keylane/meta/hash.h"
+#include "keylane/meta/state_apply.h"
 
 namespace keylane::meta {
 namespace {
@@ -22,475 +23,919 @@ std::array<std::uint8_t, N> Bytes(std::uint8_t value) {
   return result;
 }
 
-template <std::size_t N>
-std::string Hex(const std::array<std::uint8_t, N>& bytes) {
-  constexpr std::string_view kDigits = "0123456789abcdef";
-  std::string result(bytes.size() * 2, '\0');
-  for (std::size_t index = 0; index < bytes.size(); ++index) {
-    result[index * 2] = kDigits[bytes[index] >> 4];
-    result[index * 2 + 1] = kDigits[bytes[index] & 0x0f];
-  }
-  return result;
-}
-
-int64_t UnixMillisNow() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
-FailoverIntent Intent() {
-  return FailoverIntent{
+FailoverOperationIntent OperationIntent() {
+  return FailoverOperationIntent{
       .group_id_ = "group-a",
-      .former_owner_node_id_ = std::string(40, 'a'),
-      .former_owner_assignment_id_ = Bytes<16>(1),
-      .former_owner_boot_id_ = Bytes<20>(2),
-      .candidate_node_id_ = std::string(40, 'b'),
-      .candidate_assignment_id_ = Bytes<16>(3),
-      .candidate_boot_id_ = Bytes<20>(4),
-      .group_term_ = 2,
-      .authority_version_ = 1,
-      .grant_revision_ = 11,
-      .population_manifest_revision_ = 13,
-      .population_manifest_digest_ = Bytes<32>(6),
-      .partition_replication_epoch_ = 17,
-      .parent_history_id_ = Bytes<20>(7),
+      .absolute_deadline_unix_ms_ = 1'800'000'000'000,
   };
 }
 
-TEST(MetaFailoverCodecTest, RoundTripsIntentAndPromotionPreparingPhase) {
-  const FailoverIntent intent = Intent();
-  auto encoded_intent = EncodeFailoverIntent(intent);
-  ASSERT_TRUE(encoded_intent.ok()) << encoded_intent.status();
-  auto decoded_intent = DecodeFailoverIntent(*encoded_intent);
-  ASSERT_TRUE(decoded_intent.ok()) << decoded_intent.status();
-  EXPECT_EQ(*decoded_intent, intent);
-
-  const FailoverPhase phase{
-      .stage_ = FailoverPhaseStage::kPromotionPreparing,
-      .old_authority_exclusion_hash_ = Bytes<32>(8),
-      .required_applied_next_lsns_ = {19, 23},
-  };
-  auto encoded_phase = EncodeFailoverPhase(phase);
-  ASSERT_TRUE(encoded_phase.ok()) << encoded_phase.status();
-  auto decoded_phase = DecodeFailoverPhase(*encoded_phase);
-  ASSERT_TRUE(decoded_phase.ok()) << decoded_phase.status();
-  EXPECT_EQ(*decoded_phase, phase);
+SubmitOperation FailoverSubmit() {
+  auto intent = EncodeFailoverOperationIntent(OperationIntent());
+  EXPECT_TRUE(intent.ok()) << intent.status();
+  SubmitOperation submit;
+  submit.operation_id_ = Bytes<16>(9);
+  submit.kind_ = std::string(kFailoverOperationKind);
+  if (intent.ok()) submit.intent_ = *intent;
+  submit.intent_hash_ = MetaSha256(submit.intent_);
+  return submit;
 }
 
-TEST(MetaFailoverCodecTest, RejectsUnknownVersionTrailingBytesAndBadStageData) {
-  auto encoded = EncodeFailoverIntent(Intent());
+std::string NodeId(std::uint8_t suffix) {
+  std::string id(40, '0');
+  constexpr char kHex[] = "0123456789abcdef";
+  id[38] = kHex[(suffix >> 4) & 0x0f];
+  id[39] = kHex[suffix & 0x0f];
+  return id;
+}
+
+struct ProposalFixture {
+  MetaStores stores;
+  MetaObservationStore observations;
+  std::string owner = NodeId(1);
+  std::string candidate = NodeId(2);
+  std::string alternate = NodeId(3);
+  MetaAssignmentId owner_assignment = Bytes<16>(0x21);
+  MetaAssignmentId candidate_assignment = Bytes<16>(0x22);
+  MetaAssignmentId alternate_assignment = Bytes<16>(0x23);
+  MetaBootIncarnation owner_boot = Bytes<20>(0x31);
+  MetaBootIncarnation candidate_boot = Bytes<20>(0x32);
+  MetaBootIncarnation alternate_boot = Bytes<20>(0x33);
+  MetaReplicationHistoryId source_history = Bytes<20>(0x41);
+  MetaGrantSpec grant{5'000, "failover-policy", 0};
+  MetaOperationId operation_id = Bytes<16>(0x51);
+  std::uint64_t next_index = 1;
+  std::uint8_t next_id = 0x80;
+
+  ProposalFixture() {
+    const MetaOperationId root = Bytes<16>(0x01);
+    EXPECT_TRUE(stores.topology_.BeginClusterCreate(root, 1).ok());
+    EXPECT_TRUE(stores.topology_.CompleteClusterCreate(root).ok());
+    Register(owner, MetaNodeRole::kPrimary, 6379, 0x02);
+    Register(candidate, MetaNodeRole::kReplica, 6380, 0x03);
+
+    CreateGroup group;
+    group.request_id_ = Bytes<16>(0x04);
+    group.group_id_ = "g1";
+    group.new_topology_epoch_ = 1;
+    Apply(group);
+
+    AssignNodeToGroup assign_owner;
+    assign_owner.request_id_ = Bytes<16>(0x05);
+    assign_owner.group_id_ = "g1";
+    assign_owner.node_id_ = owner;
+    assign_owner.assignment_id_ = owner_assignment;
+    assign_owner.role_ = MetaNodeRole::kPrimary;
+    assign_owner.expected_revision_ = 1;
+    assign_owner.new_topology_epoch_ = 2;
+    Apply(assign_owner);
+
+    AssignNodeToGroup assign_candidate;
+    assign_candidate.request_id_ = Bytes<16>(0x06);
+    assign_candidate.group_id_ = "g1";
+    assign_candidate.node_id_ = candidate;
+    assign_candidate.assignment_id_ = candidate_assignment;
+    assign_candidate.role_ = MetaNodeRole::kReplica;
+    assign_candidate.expected_revision_ = 2;
+    assign_candidate.new_topology_epoch_ = 3;
+    Apply(assign_candidate);
+
+    PutPolicy policy;
+    policy.request_id_ = Bytes<16>(0x07);
+    policy.policy_id_ = grant.policy_id_;
+    policy.version_ = grant.policy_version_;
+    policy.content_ = R"({"lease_ms":5000})";
+    policy.content_hash_ = MetaPolicyStore::ContentHash(policy.content_);
+    Apply(policy);
+
+    BeginGroupTerm begin_term;
+    begin_term.request_id_ = Bytes<16>(0x08);
+    begin_term.group_id_ = "g1";
+    begin_term.expected_term_ = 0;
+    begin_term.new_term_ = 1;
+    Apply(begin_term);
+
+    ActivateAuthority activate;
+    activate.request_id_ = Bytes<16>(0x09);
+    activate.group_id_ = "g1";
+    activate.expected_term_ = 1;
+    activate.new_owner_ = owner;
+    activate.grant_ = grant;
+    activate.new_authority_version_ = 1;
+    activate.new_topology_epoch_ = 4;
+    activate.new_config_epoch_ = 1;
+    Apply(activate);
+  }
+
+  template <typename Command>
+  void Apply(const Command& command) {
+    const MetaApplyResult result = ApplyCommitted(
+        stores, next_index++, MetaCommand{command},
+        "keylane://test/failover-proposal", "2026-09-13T00:00:00Z");
+    ASSERT_EQ(result.verdict_, MetaAuditVerdict::kAccepted) << result.detail_;
+  }
+
+  void Register(const std::string& node_id, MetaNodeRole role,
+                std::uint16_t port, std::uint8_t request_seed) {
+    RegisterNode node;
+    node.request_id_ = Bytes<16>(request_seed);
+    node.node_id_ = node_id;
+    node.principal_ = "keylane://node/" + node_id;
+    node.endpoints_ = {"tcp://127.0.0.1:" + std::to_string(port)};
+    node.role_ = role;
+    Apply(node);
+  }
+
+  void AddAlternate() {
+    Register(alternate, MetaNodeRole::kReplica, 6381, 0x0a);
+    const auto group = stores.topology_.FindGroup("g1");
+    ASSERT_TRUE(group.has_value());
+    AssignNodeToGroup assign;
+    assign.request_id_ = Bytes<16>(0x0b);
+    assign.group_id_ = "g1";
+    assign.node_id_ = alternate;
+    assign.assignment_id_ = alternate_assignment;
+    assign.role_ = MetaNodeRole::kReplica;
+    assign.expected_revision_ = group->revision_;
+    assign.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
+    Apply(assign);
+  }
+
+  MetaFailoverCompatibilityDomain Domain() const {
+    return {.source_group_term_ = 1,
+            .source_node_id_ = owner,
+            .source_assignment_id_ = owner_assignment,
+            .source_boot_id_ = owner_boot,
+            .source_history_id_ = source_history,
+            .flow_count_ = 2};
+  }
+
+  MetaCandidateProgressObs CandidateProgress(
+      std::uint64_t generation = 1,
+      std::vector<std::uint64_t> frontier = {10, 20}) const {
+    const auto group = stores.topology_.FindGroup("g1");
+    EXPECT_TRUE(group.has_value());
+    return {.node_id_ = candidate,
+            .boot_incarnation_ = candidate_boot,
+            .session_generation_ = generation,
+            .group_id_ = "g1",
+            .assignment_id_ = candidate_assignment,
+            .group_term_ = group->record_.group_term_,
+            .population_manifest_revision_ =
+                group->record_.population_manifest_revision_,
+            .population_manifest_digest_ =
+                group->record_.population_manifest_digest_,
+            .partition_replication_epoch_ =
+                group->record_.partition_replication_epoch_,
+            .replication_history_id_ = Bytes<20>(0x43),
+            .source_group_term_ = Domain().source_group_term_,
+            .source_node_id_ = Domain().source_node_id_,
+            .source_assignment_id_ = Domain().source_assignment_id_,
+            .source_boot_incarnation_ = Domain().source_boot_id_,
+            .source_replication_history_id_ = Domain().source_history_id_,
+            .applied_next_lsns_ = std::move(frontier),
+            .storage_ready_ = true,
+            .population_ready_ = true};
+  }
+
+  void ReportOwner(
+      std::int64_t now,
+      std::optional<MetaFailoverObservationObs> failover = std::nullopt,
+      std::uint64_t generation = 1) {
+    MetaStoresFacts facts(stores);
+    const MetaObservationIdentity identity{owner, owner_boot, generation};
+    if (observations.CurrentGeneration(owner) != std::optional(generation)) {
+      ASSERT_TRUE(
+          observations.AdoptSession(identity, now - 1, source_history).ok());
+    }
+    const auto result = observations.ReplaceHeartbeat(
+        identity,
+        {.storage_ready_ = true,
+         .population_ready_ = true,
+         .active_groups_ = 1},
+        std::nullopt, std::move(failover), facts, now);
+    ASSERT_TRUE(result.boot_status_.ok()) << result.boot_status_;
+    ASSERT_TRUE(result.failover_status_.ok()) << result.failover_status_;
+  }
+
+  void ReportCandidate(
+      std::int64_t now,
+      std::optional<MetaFailoverObservationObs> failover = std::nullopt,
+      std::uint64_t generation = 1,
+      std::vector<std::uint64_t> frontier = {10, 20}) {
+    MetaStoresFacts facts(stores);
+    const MetaObservationIdentity identity{candidate, candidate_boot,
+                                           generation};
+    if (observations.CurrentGeneration(candidate) !=
+        std::optional(generation)) {
+      ASSERT_TRUE(
+          observations.AdoptSession(identity, now - 1, Bytes<20>(0x43)).ok());
+    }
+    const auto result = observations.ReplaceHeartbeat(
+        identity,
+        {.storage_ready_ = true,
+         .population_ready_ = true,
+         .active_groups_ = 1},
+        CandidateProgress(generation, std::move(frontier)), std::move(failover),
+        facts, now);
+    ASSERT_TRUE(result.candidate_status_.ok()) << result.candidate_status_;
+    ASSERT_TRUE(result.failover_status_.ok()) << result.failover_status_;
+  }
+
+  void ReportAlternate(std::int64_t now) {
+    MetaStoresFacts facts(stores);
+    const MetaObservationIdentity identity{alternate, alternate_boot, 1};
+    if (observations.CurrentGeneration(alternate) !=
+        std::optional<std::uint64_t>(1)) {
+      ASSERT_TRUE(
+          observations.AdoptSession(identity, now - 1, Bytes<20>(0x44)).ok());
+    }
+    MetaCandidateProgressObs progress = CandidateProgress();
+    progress.node_id_ = alternate;
+    progress.boot_incarnation_ = alternate_boot;
+    progress.assignment_id_ = alternate_assignment;
+    progress.replication_history_id_ = Bytes<20>(0x44);
+    const auto result = observations.ReplaceHeartbeat(
+        identity,
+        {.storage_ready_ = true,
+         .population_ready_ = true,
+         .active_groups_ = 1},
+        std::move(progress), std::nullopt, facts, now);
+    ASSERT_TRUE(result.candidate_status_.ok()) << result.candidate_status_;
+  }
+
+  void SubmitControlled(std::uint64_t deadline) {
+    auto intent = EncodeFailoverOperationIntent({"g1", deadline});
+    ASSERT_TRUE(intent.ok()) << intent.status();
+    SubmitOperation submit;
+    submit.request_id_ = Bytes<16>(0x52);
+    submit.operation_id_ = operation_id;
+    submit.kind_ = std::string(kFailoverOperationKind);
+    submit.intent_ = *intent;
+    submit.intent_hash_ = MetaSha256(*intent);
+    Apply(submit);
+  }
+
+  BeginUncontrolledFailover UncontrolledBegin(bool with_candidate) const {
+    const auto group = stores.topology_.FindGroup("g1");
+    const auto grant_state = stores.grant_.GroupState("g1");
+    EXPECT_TRUE(group.has_value());
+    EXPECT_TRUE(grant_state.has_value());
+    EXPECT_TRUE(grant_state->grant_.has_value());
+    BeginUncontrolledFailover begin;
+    begin.request_id_ = Bytes<16>(0x53);
+    begin.group_id_ = "g1";
+    begin.transition_id_ = Bytes<16>(0x54);
+    begin.target_term_ = group->record_.group_term_ + 1;
+    begin.successor_grant_ = grant_state->grant_->spec_;
+    if (with_candidate) {
+      begin.candidate_action_ = MetaFailoverCandidateAction{
+          .action_id_ = Bytes<16>(0x55),
+          .candidate_ = {candidate, candidate_assignment, candidate_boot},
+          .domain_ = Domain()};
+    }
+    begin.expected_owner_node_id_ = group->record_.owner_;
+    begin.expected_owner_assignment_id_ = owner_assignment;
+    begin.expected_membership_revision_ = group->revision_;
+    begin.expected_group_term_ = group->record_.group_term_;
+    begin.expected_authority_version_ = group->record_.authority_version_;
+    begin.expected_grant_revision_ = grant_state->last_grant_revision_;
+    begin.expected_population_manifest_revision_ =
+        group->record_.population_manifest_revision_;
+    begin.expected_population_manifest_digest_ =
+        group->record_.population_manifest_digest_;
+    begin.expected_partition_replication_epoch_ =
+        group->record_.partition_replication_epoch_;
+    begin.expected_config_epoch_ = group->config_epoch_;
+    return begin;
+  }
+
+  void BeginUncontrolledWithoutCandidate() {
+    Apply(UncontrolledBegin(/*with_candidate=*/false));
+  }
+
+  MetaFailoverTransition Transition() const {
+    const auto group = stores.topology_.FindGroup("g1");
+    EXPECT_TRUE(group.has_value());
+    EXPECT_TRUE(group->failover_transition_.has_value());
+    return *group->failover_transition_;
+  }
+
+  void ReportSourcePaused(std::int64_t now,
+                          std::vector<std::uint64_t> stable = {10, 20}) {
+    const auto transition = Transition();
+    const auto& domain = transition.candidate_action_->domain_;
+    MetaSourcePausedObs paused{
+        .group_id_ = "g1",
+        .transition_id_ = transition.transition_id_,
+        .source_node_id_ = domain.source_node_id_,
+        .source_assignment_id_ = domain.source_assignment_id_,
+        .source_boot_id_ = domain.source_boot_id_,
+        .source_history_id_ = domain.source_history_id_,
+        .source_group_term_ = domain.source_group_term_,
+        .stable_next_lsns_ = std::move(stable)};
+    ReportOwner(now, MetaFailoverObservationObs{.payload_ = paused});
+  }
+
+  void ReportPrepared(std::int64_t now, std::uint64_t generation = 1) {
+    const auto transition = Transition();
+    const auto& action = *transition.candidate_action_;
+    MetaCandidatePreparedObs prepared{
+        .group_id_ = "g1",
+        .transition_id_ = transition.transition_id_,
+        .action_id_ = action.action_id_,
+        .candidate_node_id_ = action.candidate_.node_id_,
+        .candidate_assignment_id_ = action.candidate_.assignment_id_,
+        .candidate_boot_id_ = action.candidate_.boot_id_,
+        .prepared_context_id_ = Bytes<16>(0x61),
+        .prepared_context_hash_ = Bytes<32>(0x62)};
+    ReportCandidate(now, MetaFailoverObservationObs{.payload_ = prepared},
+                    generation);
+  }
+
+  absl::StatusOr<std::optional<MetaCommand>> Plan(std::int64_t now) {
+    return PlanFailoverStep(
+        MetaCommittedView(stores, next_index - 1), observations,
+        {.now_unix_ms_ = now,
+         .leadership_started_unix_ms_ = now - 101,
+         .observation_grace_ms_ = 100,
+         .next_id_ = [&]() -> absl::StatusOr<MetaRequestId> {
+           return Bytes<16>(next_id++);
+         }});
+  }
+};
+
+TEST(MetaFailoverOperationIntentCodecTest, RoundTripsCanonicalRequest) {
+  const FailoverOperationIntent intent = OperationIntent();
+
+  auto first = EncodeFailoverOperationIntent(intent);
+  ASSERT_TRUE(first.ok()) << first.status();
+  auto second = EncodeFailoverOperationIntent(intent);
+  ASSERT_TRUE(second.ok()) << second.status();
+  EXPECT_EQ(*second, *first);
+
+  auto decoded = DecodeFailoverOperationIntent(*first);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, intent);
+}
+
+TEST(MetaFailoverOperationIntentCodecTest,
+     RejectsInvalidLocallyConstructedRequest) {
+  FailoverOperationIntent intent = OperationIntent();
+  intent.group_id_.clear();
+  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverOperationIntent(intent)),
+            MetaFailureClass::kDomainReject);
+  EXPECT_EQ(MetaFailureClassOf(EncodeFailoverOperationIntent(intent).status()),
+            MetaFailureClass::kDomainReject);
+
+  intent = OperationIntent();
+  intent.group_id_ = std::string(kMaxMetaGroupIdBytes + 1, 'g');
+  EXPECT_EQ(MetaFailureClassOf(EncodeFailoverOperationIntent(intent).status()),
+            MetaFailureClass::kDomainReject);
+
+  intent = OperationIntent();
+  intent.absolute_deadline_unix_ms_ = 0;
+  EXPECT_EQ(MetaFailureClassOf(EncodeFailoverOperationIntent(intent).status()),
+            MetaFailureClass::kDomainReject);
+
+  intent.absolute_deadline_unix_ms_ =
+      static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1;
+  EXPECT_EQ(MetaFailureClassOf(EncodeFailoverOperationIntent(intent).status()),
+            MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverOperationIntentCodecTest,
+     FailsStopOnUnknownVersionTrailingBytesAndInvalidDecodedRequest) {
+  auto encoded = EncodeFailoverOperationIntent(OperationIntent());
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   (*encoded)[4] = '\x02';
-  EXPECT_EQ(MetaFailureClassOf(DecodeFailoverIntent(*encoded).status()),
-            MetaFailureClass::kFailStop);
+  EXPECT_EQ(
+      MetaFailureClassOf(DecodeFailoverOperationIntent(*encoded).status()),
+      MetaFailureClass::kFailStop);
 
-  encoded = EncodeFailoverIntent(Intent());
+  encoded = EncodeFailoverOperationIntent(OperationIntent());
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   encoded->push_back('\0');
-  EXPECT_EQ(MetaFailureClassOf(DecodeFailoverIntent(*encoded).status()),
-            MetaFailureClass::kFailStop);
+  EXPECT_EQ(
+      MetaFailureClassOf(DecodeFailoverOperationIntent(*encoded).status()),
+      MetaFailureClass::kFailStop);
 
-  FailoverPhase invalid{
-      .stage_ = FailoverPhaseStage::kPromotionPrepared,
-      .old_authority_exclusion_hash_ = Bytes<32>(8),
-      .required_applied_next_lsns_ = {19},
-  };
-  EXPECT_EQ(MetaFailureClassOf(EncodeFailoverPhase(invalid).status()),
-            MetaFailureClass::kDomainReject);
+  encoded = EncodeFailoverOperationIntent(OperationIntent());
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  encoded->replace(encoded->size() - sizeof(std::uint64_t),
+                   sizeof(std::uint64_t), sizeof(std::uint64_t), '\0');
+  EXPECT_EQ(
+      MetaFailureClassOf(DecodeFailoverOperationIntent(*encoded).status()),
+      MetaFailureClass::kFailStop);
 }
 
-TEST(MetaFailoverValidationTest,
-     ValidatesTypedSubmitAndRejectsSkippingAuthorityExclusion) {
+TEST(MetaFailoverValidationTest, AcceptsOnlyCanonicalRequestOnlySubmit) {
   MetaObservationStore observations;
   MetaStores stores;
-  SubmitOperation submit;
-  submit.operation_id_ = Bytes<16>(9);
-  submit.kind_ = std::string(kFailoverOperationKind);
-  submit.intent_ = "not-a-failover-intent";
-  submit.intent_hash_ = MetaSha256(submit.intent_);
-  submit.replication_history_id_ = Intent().parent_history_id_;
-  EXPECT_EQ(MetaFailureClassOf(
-                ValidateFailoverProposal(MetaCommand(submit),
-                                         MetaCommittedView(stores, 0),
-                                         observations)),
-            MetaFailureClass::kDomainReject);
+  SubmitOperation submit = FailoverSubmit();
 
-  auto intent = EncodeFailoverIntent(Intent());
-  ASSERT_TRUE(intent.ok()) << intent.status();
-  submit.intent_ = *intent;
-  submit.intent_hash_ = MetaSha256(submit.intent_);
   EXPECT_TRUE(ValidateFailoverProposal(MetaCommand(submit),
                                        MetaCommittedView(stores, 0),
-                                       observations)
+                                       observations, 1'000)
                   .ok());
-  ASSERT_TRUE(stores.operation_.SubmitOperation(submit, 1).ok());
 
-  FailoverPhase skipped{
-      .stage_ = FailoverPhaseStage::kPromotionPreparing,
-      .old_authority_exclusion_hash_ = Bytes<32>(8),
-      .required_applied_next_lsns_ = {19, 23},
-  };
-  auto encoded_skipped = EncodeFailoverPhase(skipped);
-  ASSERT_TRUE(encoded_skipped.ok()) << encoded_skipped.status();
+  SubmitOperation malformed = submit;
+  malformed.intent_ = "not-a-failover-request";
+  malformed.intent_hash_ = MetaSha256(malformed.intent_);
+  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
+                MetaCommand(malformed), MetaCommittedView(stores, 0),
+                observations, 1'000)),
+            MetaFailureClass::kDomainReject);
+
+  SubmitOperation wrong_hash = submit;
+  wrong_hash.intent_hash_ = Bytes<32>(4);
+  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
+                MetaCommand(wrong_hash), MetaCommittedView(stores, 0),
+                observations, 1'000)),
+            MetaFailureClass::kDomainReject);
+
+  SubmitOperation history_bound = submit;
+  history_bound.replication_history_id_ = Bytes<20>(7);
+  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
+                MetaCommand(history_bound), MetaCommittedView(stores, 0),
+                observations, 1'000)),
+            MetaFailureClass::kDomainReject);
+
+  SubmitOperation policy_bound = submit;
+  policy_bound.policy_references_.push_back({"policy", 1});
+  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
+                MetaCommand(policy_bound), MetaCommittedView(stores, 0),
+                observations, 1'000)),
+            MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest, RejectsGenericMutationOfFailoverOperation) {
+  MetaObservationStore observations;
+  MetaStores stores;
+  SubmitOperation submit = FailoverSubmit();
+  ASSERT_TRUE(stores.operation_.SubmitOperation(submit, 1).ok());
+  const MetaCommittedView view(stores, 1);
+
   TransitionOperationPhase transition;
   transition.operation_id_ = submit.operation_id_;
-  transition.kind_phase_blob_ = *encoded_skipped;
-  EXPECT_EQ(MetaFailureClassOf(
-                ValidateFailoverProposal(MetaCommand(transition),
-                                         MetaCommittedView(stores, 1),
-                                         observations)),
+  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
+                MetaCommand(transition), view, observations, 1'000)),
+            MetaFailureClass::kDomainReject);
+
+  CompleteOperation complete;
+  complete.operation_id_ = submit.operation_id_;
+  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
+                MetaCommand(complete), view, observations, 1'000)),
+            MetaFailureClass::kDomainReject);
+
+  AbortOperation abort;
+  abort.operation_id_ = submit.operation_id_;
+  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
+                MetaCommand(abort), view, observations, 1'000)),
             MetaFailureClass::kDomainReject);
 }
 
 TEST(MetaFailoverValidationTest,
-     RejectsPromotionPrepareOwnedByAnotherOperationKind) {
-  MetaObservationStore observations;
-  MetaStores stores;
-  SubmitOperation submit;
-  submit.operation_id_ = Bytes<16>(9);
-  submit.kind_ = "maintenance";
-  submit.intent_ = "opaque";
-  submit.intent_hash_ = MetaSha256(submit.intent_);
-  submit.replication_history_id_ = Bytes<20>(7);
-  ASSERT_TRUE(stores.operation_.SubmitOperation(submit, 1).ok());
+     RejectsControlledBeginWhenCandidateDisconnectsAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.SubmitControlled(5'000);
+  fixture.ReportOwner(1'000);
+  fixture.ReportCandidate(1'000);
+  const auto planned = fixture.Plan(1'001);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<BeginControlledFailover>(&**planned), nullptr);
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  **planned,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'001)
+                  .ok());
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 5'000)),
+      MetaFailureClass::kDomainReject);
 
-  TransitionOperationPhase transition;
-  transition.operation_id_ = submit.operation_id_;
-  transition.current_directives_.push_back(
-      MetaDirectiveSpec{.kind_ = "promotion-prepare"});
-  EXPECT_EQ(MetaFailureClassOf(
-                ValidateFailoverProposal(MetaCommand(transition),
-                                         MetaCommittedView(stores, 1),
-                                         observations)),
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.candidate, fixture.candidate_boot, 1}, 1'002);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1'002)),
+      MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
+     AcceptsControlledBeginAfterSameSessionCandidateProgressAdvances) {
+  ProposalFixture fixture;
+  fixture.SubmitControlled(5'000);
+  fixture.ReportOwner(1'000);
+  fixture.ReportCandidate(1'000);
+  const auto planned = fixture.Plan(1'001);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<BeginControlledFailover>(&**planned), nullptr);
+
+  fixture.ReportCandidate(1'002, std::nullopt, 1, {11, 21});
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  **planned,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'002)
+                  .ok());
+}
+
+TEST(MetaFailoverValidationTest,
+     RejectsControlledBeginWhenSourceHeartbeatExpiresAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.SubmitControlled(100'000);
+  fixture.ReportOwner(1'000);
+  fixture.ReportCandidate(1'000);
+  const auto planned = fixture.Plan(1'001);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<BeginControlledFailover>(&**planned), nullptr);
+
+  // Keep the candidate observation live while only the source heartbeat crosses
+  // the observation TTL. The long operation deadline isolates source
+  // freshness from the independent controlled-failover deadline gate.
+  fixture.ReportCandidate(31'001);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 31'001)),
+      MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
+     RejectsUncontrolledCandidateSetWhenSelectionIsWithdrawnAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.BeginUncontrolledWithoutCandidate();
+  fixture.ReportCandidate(1'010);
+  const auto planned = fixture.Plan(1'011);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<SetUncontrolledCandidate>(&**planned), nullptr);
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  **planned,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'011)
+                  .ok());
+
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.candidate, fixture.candidate_boot, 1}, 1'012);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1'012)),
+      MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
+     RejectsUncontrolledCandidateClearWhenNoActionIsInstalled) {
+  ProposalFixture fixture;
+  fixture.BeginUncontrolledWithoutCandidate();
+  const MetaFailoverTransition transition = fixture.Transition();
+
+  SetUncontrolledCandidate clear;
+  clear.request_id_ = Bytes<16>(0x57);
+  clear.group_id_ = "g1";
+  clear.expected_transition_ = {transition.transition_id_,
+                                transition.revision_};
+
+  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
+                MetaCommand(clear),
+                MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                fixture.observations, 1'011)),
             MetaFailureClass::kDomainReject);
 }
 
 TEST(MetaFailoverValidationTest,
-     AcceptsOrderedPrepareAndExactPreparedReceiptEvidence) {
-  const FailoverIntent failover = Intent();
-  MetaObservationStore observations;
-  MetaStores stores;
+     KeepsUncontrolledReplacementWhenDisconnectedActionReprepares) {
+  ProposalFixture fixture;
+  fixture.AddAlternate();
+  fixture.BeginUncontrolledWithoutCandidate();
+  fixture.ReportCandidate(1'010);
+  auto planned = fixture.Plan(1'011);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<SetUncontrolledCandidate>(&**planned), nullptr);
+  fixture.Apply(**planned);
 
-  RegisterNode register_candidate;
-  register_candidate.node_id_ = failover.candidate_node_id_;
-  register_candidate.principal_ =
-      "keylane://node/" + failover.candidate_node_id_;
-  register_candidate.endpoints_ = {"127.0.0.1:6379"};
-  register_candidate.role_ = MetaNodeRole::kReplica;
-  ASSERT_TRUE(stores.identity_.Apply(register_candidate).ok());
+  fixture.ReportCandidate(1'020);
+  planned = fixture.Plan(1'021);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<AuthorizeFailoverPrepare>(&**planned), nullptr);
+  fixture.Apply(**planned);
 
-  CreateGroup create;
-  create.group_id_ = failover.group_id_;
-  create.new_topology_epoch_ = 1;
-  ASSERT_TRUE(stores.topology_.Apply(create).ok());
-  ASSERT_TRUE(stores.grant_.AddGroup(failover.group_id_).ok());
-
-  AssignNodeToGroup former;
-  former.group_id_ = failover.group_id_;
-  former.node_id_ = failover.former_owner_node_id_;
-  former.assignment_id_ = failover.former_owner_assignment_id_;
-  former.expected_revision_ = 1;
-  former.new_topology_epoch_ = 2;
-  ASSERT_TRUE(stores.topology_.Apply(former).ok());
-  AssignNodeToGroup candidate;
-  candidate.group_id_ = failover.group_id_;
-  candidate.node_id_ = failover.candidate_node_id_;
-  candidate.assignment_id_ = failover.candidate_assignment_id_;
-  candidate.role_ = MetaNodeRole::kReplica;
-  candidate.expected_revision_ = 2;
-  candidate.new_topology_epoch_ = 3;
-  ASSERT_TRUE(stores.topology_.Apply(candidate).ok());
-
-  BeginGroupTerm first_term;
-  first_term.group_id_ = failover.group_id_;
-  first_term.new_term_ = 1;
-  ASSERT_TRUE(stores.grant_.BeginGroupTerm(first_term).ok());
-  ActivateAuthority old_authority;
-  old_authority.group_id_ = failover.group_id_;
-  old_authority.expected_term_ = 1;
-  old_authority.new_owner_ = failover.former_owner_node_id_;
-  old_authority.grant_.lease_duration_ms_ = 5000;
-  old_authority.grant_.policy_id_ = "lease-policy";
-  old_authority.grant_.policy_version_ = 1;
-  old_authority.new_authority_version_ = failover.authority_version_;
-  ASSERT_TRUE(stores.grant_.ValidateActivate(old_authority,
-                                             failover.grant_revision_)
-                  .ok());
-  ASSERT_TRUE(stores.grant_.ApplyGrantPart(old_authority,
-                                           failover.grant_revision_)
-                  .ok());
-  ASSERT_TRUE(stores.topology_
-                  .SetOwner(failover.group_id_,
-                            failover.former_owner_node_id_)
-                  .ok());
-  ASSERT_TRUE(stores.topology_.SetGroupTerm(failover.group_id_, 1).ok());
-  ASSERT_TRUE(stores.topology_
-                  .SetAuthorityVersion(failover.group_id_,
-                                       failover.authority_version_)
-                  .ok());
-  BeginGroupTerm excluded;
-  excluded.group_id_ = failover.group_id_;
-  excluded.expected_term_ = 1;
-  excluded.new_term_ = failover.group_term_;
-  ASSERT_TRUE(stores.grant_.BeginGroupTerm(excluded).ok());
-  ASSERT_TRUE(stores.topology_
-                  .SetGroupTerm(failover.group_id_, failover.group_term_)
-                  .ok());
-  ASSERT_TRUE(stores.topology_
-                  .SetPopulationManifest(
-                      failover.group_id_,
-                      failover.population_manifest_revision_,
-                      failover.population_manifest_digest_)
-                  .ok());
-  ASSERT_TRUE(stores.topology_
-                  .SetPartitionReplicationEpoch(
-                      failover.group_id_,
-                      failover.partition_replication_epoch_)
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.candidate, fixture.candidate_boot, 1}, 1'030);
+  fixture.ReportAlternate(1'030);
+  planned = fixture.Plan(1'031);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  const auto* replacement = std::get_if<SetUncontrolledCandidate>(&**planned);
+  ASSERT_NE(replacement, nullptr);
+  ASSERT_TRUE(replacement->candidate_action_.has_value());
+  EXPECT_EQ(replacement->candidate_action_->candidate_.node_id_,
+            fixture.alternate);
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  **planned,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'031)
                   .ok());
 
-  auto encoded_intent = EncodeFailoverIntent(failover);
-  ASSERT_TRUE(encoded_intent.ok()) << encoded_intent.status();
-  SubmitOperation submit;
-  submit.operation_id_ = Bytes<16>(9);
-  submit.kind_ = std::string(kFailoverOperationKind);
-  submit.intent_ = *encoded_intent;
-  submit.intent_hash_ = MetaSha256(submit.intent_);
-  submit.replication_history_id_ = failover.parent_history_id_;
-  ASSERT_TRUE(stores.operation_.SubmitOperation(submit, 1).ok());
-
-  auto transition_phase = [&](FailoverPhase phase,
-                              std::uint64_t expected_revision,
-                              std::vector<MetaDirectiveSpec> directives = {},
-                              std::vector<MetaEvidenceSummary> evidence = {}) {
-    auto encoded = EncodeFailoverPhase(phase);
-    EXPECT_TRUE(encoded.ok()) << encoded.status();
-    TransitionOperationPhase transition;
-    transition.operation_id_ = submit.operation_id_;
-    transition.expected_revision_ = expected_revision;
-    if (encoded.ok()) transition.kind_phase_blob_ = *encoded;
-    transition.current_directives_ = std::move(directives);
-    transition.evidence_ = std::move(evidence);
-    return transition;
-  };
-
-  const MetaHash256 exclusion_hash = Bytes<32>(8);
-  TransitionOperationPhase phase1 = transition_phase(
-      FailoverPhase{.stage_ = FailoverPhaseStage::kOldAuthorityExcluded,
-                    .old_authority_exclusion_hash_ = exclusion_hash},
-      0);
-  ASSERT_TRUE(ValidateFailoverProposal(MetaCommand(phase1),
-                                       MetaCommittedView(stores, 1),
-                                       observations)
+  fixture.ReportPrepared(1'032, 2);
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  **planned,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'032)
                   .ok());
-  ASSERT_TRUE(stores.operation_.TransitionOperationPhase(phase1, 2).ok());
+}
 
-  const std::vector<std::uint64_t> required = {19, 23};
-  TransitionOperationPhase phase2 = transition_phase(
-      FailoverPhase{.stage_ = FailoverPhaseStage::kCandidateCaughtUp,
-                    .old_authority_exclusion_hash_ = exclusion_hash,
-                    .required_applied_next_lsns_ = required},
-      1);
-  ASSERT_TRUE(ValidateFailoverProposal(MetaCommand(phase2),
-                                       MetaCommittedView(stores, 2),
-                                       observations)
-                  .ok());
-  ASSERT_TRUE(stores.operation_.TransitionOperationPhase(phase2, 3).ok());
-
-  auto payload = cluster::control::EncodePromotionPrepareRequest(
-      {.parent_history_id = Hex(failover.parent_history_id_),
-       .required_applied_next_lsns = required});
-  auto preconditions =
-      cluster::control::EncodePromotionPreparePreconditions(
-          {.excluded_group_term = failover.group_term_,
-           .old_authority_exclusion_hash = exclusion_hash});
-  ASSERT_TRUE(payload.ok()) << payload.status();
-  ASSERT_TRUE(preconditions.ok()) << preconditions.status();
-  MetaDirectiveSpec directive;
-  directive.directive_id_ = Bytes<16>(10);
-  directive.attempt_id_ = Bytes<16>(11);
-  directive.recipient_node_id_ = failover.candidate_node_id_;
-  directive.target_node_id_ = failover.candidate_node_id_;
-  directive.target_boot_id_ = failover.candidate_boot_id_;
-  directive.assignment_id_ = failover.candidate_assignment_id_;
-  directive.source_node_id_ = failover.former_owner_node_id_;
-  directive.source_assignment_id_ = failover.former_owner_assignment_id_;
-  directive.source_boot_id_ = failover.former_owner_boot_id_;
-  directive.source_replication_history_id_ = failover.parent_history_id_;
-  directive.group_id_ = failover.group_id_;
-  directive.group_term_ = failover.group_term_;
-  directive.authority_version_ = failover.authority_version_;
-  directive.grant_revision_ = failover.grant_revision_;
-  directive.population_manifest_revision_ =
-      failover.population_manifest_revision_;
-  directive.population_manifest_digest_ =
-      failover.population_manifest_digest_;
-  directive.partition_replication_epoch_ =
-      failover.partition_replication_epoch_;
-  directive.kind_ = "promotion-prepare";
-  directive.payload_ = *payload;
-  directive.preconditions_ = *preconditions;
-  directive.storage_mutating_ = true;
-  TransitionOperationPhase phase3 = transition_phase(
-      FailoverPhase{.stage_ = FailoverPhaseStage::kPromotionPreparing,
-                    .old_authority_exclusion_hash_ = exclusion_hash,
-                    .required_applied_next_lsns_ = required},
-      2, {directive});
-
-  const auto expect_directive_rejected = [&](MetaDirectiveSpec changed) {
-    TransitionOperationPhase stale = phase3;
-    stale.current_directives_ = {std::move(changed)};
-    EXPECT_EQ(MetaFailureClassOf(
-                  ValidateFailoverProposal(MetaCommand(stale),
-                                           MetaCommittedView(stores, 3),
-                                           observations)),
-              MetaFailureClass::kDomainReject);
-  };
-  MetaDirectiveSpec changed = directive;
-  changed.assignment_id_ = Bytes<16>(0x31);
-  expect_directive_rejected(std::move(changed));
-  changed = directive;
-  changed.target_boot_id_ = Bytes<20>(0x41);
-  expect_directive_rejected(std::move(changed));
-  changed = directive;
-  ++changed.group_term_;
-  expect_directive_rejected(std::move(changed));
-  changed = directive;
-  ++changed.population_manifest_revision_;
-  expect_directive_rejected(std::move(changed));
-  changed = directive;
-  ++changed.partition_replication_epoch_;
-  expect_directive_rejected(std::move(changed));
-  changed = directive;
-  changed.source_replication_history_id_ = Bytes<20>(0x71);
-  expect_directive_rejected(std::move(changed));
-  changed = directive;
-  auto changed_frontier = cluster::control::EncodePromotionPrepareRequest(
-      {.parent_history_id = Hex(failover.parent_history_id_),
-       .required_applied_next_lsns = {19, 24}});
-  ASSERT_TRUE(changed_frontier.ok()) << changed_frontier.status();
-  changed.payload_ = *changed_frontier;
-  expect_directive_rejected(std::move(changed));
-
-  ASSERT_TRUE(ValidateFailoverProposal(MetaCommand(phase3),
-                                       MetaCommittedView(stores, 3),
-                                       observations)
-                  .ok());
-  ASSERT_TRUE(stores.operation_.TransitionOperationPhase(phase3, 4).ok());
-
-  auto result = cluster::control::EncodePromotionPreparedEvidence(
-      {.parent_history_id = Hex(failover.parent_history_id_),
-       .frozen_applied_next_lsns = {20, 24},
-       .population_generation = 31,
-       .population_digest = 37,
-       .catalog_generation = 41,
-       .catalog_dump_crc64 = 43,
-       .child_history_id = std::string(40, 'c')});
-  ASSERT_TRUE(result.ok()) << result.status();
-  CommitDirectiveResult receipt;
-  receipt.operation_id_ = submit.operation_id_;
-  receipt.directive_id_ = directive.directive_id_;
-  receipt.attempt_id_ = directive.attempt_id_;
-  receipt.directive_revision_ = 4;
-  receipt.recipient_node_id_ = failover.candidate_node_id_;
-  receipt.recipient_boot_id_ = failover.candidate_boot_id_;
-  receipt.assignment_id_ = failover.candidate_assignment_id_;
-  receipt.result_hash_ = MetaSha256(*result);
-  receipt.result_ = *result;
-  ASSERT_TRUE(stores.operation_.CommitDirectiveResult(receipt, 5).ok());
-
-  MetaOperationEvidenceObs observed_evidence{
-      .node_id_ = failover.candidate_node_id_,
-      .boot_incarnation_ = failover.candidate_boot_id_,
-      .assignment_id_ = failover.candidate_assignment_id_,
-      .operation_id_ = submit.operation_id_,
-      .kind_phase_ = "promotion-prepare:prepared",
-      .evidence_hash_ = receipt.result_hash_,
-      .evidence_ = *result,
-      .group_id_ = failover.group_id_,
-      .group_term_ = failover.group_term_,
-      .population_manifest_revision_ =
-          failover.population_manifest_revision_,
-      .partition_replication_epoch_ =
-          failover.partition_replication_epoch_,
-      .replication_history_id_ = failover.parent_history_id_,
-  };
-  const MetaEvidenceSummary evidence = SummarizeOperationEvidence(
-      observed_evidence, failover.population_manifest_digest_);
-  TransitionOperationPhase phase4 = transition_phase(
-      FailoverPhase{.stage_ = FailoverPhaseStage::kPromotionPrepared,
-                    .old_authority_exclusion_hash_ = exclusion_hash,
-                    .required_applied_next_lsns_ = required,
-                    .prepared_result_hash_ = receipt.result_hash_},
-      4, {}, {evidence});
-
-  EXPECT_EQ(MetaFailureClassOf(
-                ValidateFailoverProposal(MetaCommand(phase4),
-                                         MetaCommittedView(stores, 5),
-                                         observations)),
-            MetaFailureClass::kDomainReject);
-
-  const int64_t now_unix_ms = UnixMillisNow();
-  ASSERT_TRUE(observations
-                  .AdoptSession({failover.candidate_node_id_,
-                                 failover.candidate_boot_id_, 1},
-                                now_unix_ms)
-                  .ok());
-  MetaObservation observation{
-      .identity_ = {failover.candidate_node_id_, failover.candidate_boot_id_,
-                    1},
-      .payload_ = observed_evidence,
-      .received_unix_ms_ = 1000,
-  };
-  ASSERT_TRUE(observations
-                  .Ingest(std::move(observation), MetaStoresFacts(stores),
-                          now_unix_ms)
-                  .ok());
-  EXPECT_TRUE(ValidateFailoverProposal(MetaCommand(phase4),
-                                       MetaCommittedView(stores, 5),
-                                       observations)
+TEST(MetaFailoverValidationTest,
+     RejectsUncontrolledBeginWhenCandidateIsWithdrawnAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.ReportCandidate(1'000);
+  const MetaCommand begin = fixture.UncontrolledBegin(/*with_candidate=*/true);
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  begin,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'001)
                   .ok());
 
-  MetaObservationStore::Limits stale_limits;
-  stale_limits.ttl_ms_ = 1;
-  MetaObservationStore stale_observations(stale_limits);
-  ASSERT_TRUE(stale_observations
-                  .AdoptSession({failover.candidate_node_id_,
-                                 failover.candidate_boot_id_, 1},
-                                now_unix_ms - 1000)
-                  .ok());
-  MetaObservation stale_observation{
-      .identity_ = {failover.candidate_node_id_, failover.candidate_boot_id_,
-                    1},
-      .payload_ = observed_evidence,
-  };
-  ASSERT_TRUE(stale_observations
-                  .Ingest(std::move(stale_observation),
-                          MetaStoresFacts(stores), now_unix_ms - 1000)
-                  .ok());
-  EXPECT_EQ(MetaFailureClassOf(
-                ValidateFailoverProposal(MetaCommand(phase4),
-                                         MetaCommittedView(stores, 5),
-                                         stale_observations)),
-            MetaFailureClass::kDomainReject);
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.candidate, fixture.candidate_boot, 1}, 1'002);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          begin, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1'002)),
+      MetaFailureClass::kDomainReject);
+}
 
-  ASSERT_TRUE(stores.operation_.TransitionOperationPhase(phase4, 6).ok());
-  const auto committed = stores.operation_.FindOperation(submit.operation_id_);
-  ASSERT_TRUE(committed.has_value());
-  observations.ResetForLeadershipChange();
-  EXPECT_TRUE(ValidateFailoverProposal(MetaCommand(phase4),
-                                       MetaCommittedView(stores, 6),
-                                       observations)
-                  .ok())
-      << "an already committed phase replay needs no former leader evidence";
-  ASSERT_TRUE(stores.operation_.TransitionOperationPhase(phase4, 6).ok());
-  const auto replayed = stores.operation_.FindOperation(submit.operation_id_);
-  ASSERT_TRUE(replayed.has_value());
-  EXPECT_EQ(replayed->operation_id_, committed->operation_id_);
-  EXPECT_EQ(replayed->revision_, committed->revision_);
-  EXPECT_EQ(replayed->kind_phase_blob_, committed->kind_phase_blob_);
-  EXPECT_EQ(replayed->evidence_, committed->evidence_);
-  EXPECT_EQ(replayed->terminal_receipts_, committed->terminal_receipts_);
+TEST(MetaFailoverValidationTest,
+     RejectsAuthorizationWhenCandidateObservationIsWithdrawnAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.SubmitControlled(5'000);
+  fixture.ReportOwner(1'000);
+  fixture.ReportCandidate(1'000);
+  auto planned = fixture.Plan(1'001);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<BeginControlledFailover>(&**planned), nullptr);
+  fixture.Apply(**planned);
+
+  fixture.ReportSourcePaused(1'010);
+  fixture.ReportCandidate(1'010);
+  planned = fixture.Plan(1'011);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<AuthorizeFailoverPrepare>(&**planned), nullptr);
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  **planned,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'011)
+                  .ok());
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 5'000)),
+      MetaFailureClass::kDomainReject);
+
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.candidate, fixture.candidate_boot, 1}, 1'012);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1'012)),
+      MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
+     RejectsAuthorizationWhenSourcePauseIsWithdrawnAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.SubmitControlled(5'000);
+  fixture.ReportOwner(1'000);
+  fixture.ReportCandidate(1'000);
+  auto planned = fixture.Plan(1'001);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  fixture.Apply(**planned);
+
+  fixture.ReportSourcePaused(1'010);
+  fixture.ReportCandidate(1'010);
+  planned = fixture.Plan(1'011);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<AuthorizeFailoverPrepare>(&**planned), nullptr);
+
+  fixture.ReportOwner(1'012);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1'012)),
+      MetaFailureClass::kDomainReject);
+}
+
+TEST(
+    MetaFailoverValidationTest,
+    RejectsRetainingCandidateOnDegradeWhenObservationIsWithdrawnAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.SubmitControlled(5'000);
+  fixture.ReportOwner(1'000);
+  fixture.ReportCandidate(1'000);
+  auto planned = fixture.Plan(1'001);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  fixture.Apply(**planned);
+
+  fixture.ReportSourcePaused(1'010);
+  fixture.ReportCandidate(1'010);
+  planned = fixture.Plan(1'011);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<AuthorizeFailoverPrepare>(&**planned), nullptr);
+  fixture.Apply(**planned);
+
+  ASSERT_TRUE(fixture.observations
+                  .AdoptSession({fixture.owner, fixture.owner_boot, 2}, 1'020,
+                                Bytes<20>(0x99))
+                  .ok());
+  planned = fixture.Plan(1'021);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  const auto* degrade = std::get_if<DegradeControlledFailover>(&**planned);
+  ASSERT_NE(degrade, nullptr);
+  ASSERT_TRUE(degrade->retain_candidate_action_);
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  **planned,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'021)
+                  .ok());
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 5'000)),
+      MetaFailureClass::kDomainReject);
+
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.candidate, fixture.candidate_boot, 1}, 1'022);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1'022)),
+      MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
+     RejectsDegradeWhenExactSourceRecoversAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.SubmitControlled(5'000);
+  fixture.ReportOwner(1'000);
+  fixture.ReportCandidate(1'000);
+  auto planned = fixture.Plan(1'001);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<BeginControlledFailover>(&**planned), nullptr);
+  fixture.Apply(**planned);
+
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.owner, fixture.owner_boot, 1}, 1'010);
+  fixture.ReportCandidate(1'110);
+  planned = fixture.Plan(1'110);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  const auto* degrade = std::get_if<DegradeControlledFailover>(&**planned);
+  ASSERT_NE(degrade, nullptr);
+  ASSERT_FALSE(degrade->retain_candidate_action_);
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  **planned,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'110)
+                  .ok());
+
+  // Planning from an expired disconnect is only a negative observation. If
+  // the exact source lineage proves itself healthy before Raft proposal, the
+  // stale degradation must not fence a source that has recovered.
+  fixture.ReportOwner(1'111, std::nullopt, 2);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1'111)),
+      MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
+     RejectsControlledCommitWhenPreparedObservationIsWithdrawnAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.SubmitControlled(5'000);
+  fixture.ReportOwner(1'000);
+  fixture.ReportCandidate(1'000);
+  auto planned = fixture.Plan(1'001);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  fixture.Apply(**planned);
+
+  fixture.ReportSourcePaused(1'010);
+  fixture.ReportCandidate(1'010);
+  planned = fixture.Plan(1'011);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  fixture.Apply(**planned);
+
+  fixture.ReportPrepared(1'020);
+  planned = fixture.Plan(1'021);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<CommitControlledFailover>(&**planned), nullptr);
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  **planned,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'021)
+                  .ok());
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 5'000)),
+      MetaFailureClass::kDomainReject);
+
+  fixture.ReportCandidate(1'022);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1'022)),
+      MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
+     RejectsControlledCommitWhenDisconnectedActionRepreparesAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.SubmitControlled(5'000);
+  fixture.ReportOwner(1'000);
+  fixture.ReportCandidate(1'000);
+  auto planned = fixture.Plan(1'001);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  fixture.Apply(**planned);
+
+  fixture.ReportSourcePaused(1'010);
+  fixture.ReportCandidate(1'010);
+  planned = fixture.Plan(1'011);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  fixture.Apply(**planned);
+
+  fixture.ReportPrepared(1'020);
+  planned = fixture.Plan(1'021);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<CommitControlledFailover>(&**planned), nullptr);
+
+  fixture.observations.InvalidateCandidateOnDisconnect(
+      {fixture.candidate, fixture.candidate_boot, 1}, 1'022);
+  fixture.ReportPrepared(1'023, 2);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1'023)),
+      MetaFailureClass::kDomainReject);
+}
+
+TEST(MetaFailoverValidationTest,
+     RejectsUncontrolledCommitWhenPreparedObservationIsWithdrawnAfterPlanning) {
+  ProposalFixture fixture;
+  fixture.BeginUncontrolledWithoutCandidate();
+  fixture.ReportCandidate(1'010);
+  auto planned = fixture.Plan(1'011);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<SetUncontrolledCandidate>(&**planned), nullptr);
+  fixture.Apply(**planned);
+
+  fixture.ReportCandidate(1'020);
+  planned = fixture.Plan(1'021);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<AuthorizeFailoverPrepare>(&**planned), nullptr);
+  fixture.Apply(**planned);
+
+  fixture.ReportPrepared(1'030);
+  planned = fixture.Plan(1'031);
+  ASSERT_TRUE(planned.ok()) << planned.status();
+  ASSERT_TRUE(planned->has_value());
+  ASSERT_NE(std::get_if<CommitUncontrolledFailover>(&**planned), nullptr);
+  EXPECT_TRUE(ValidateFailoverProposal(
+                  **planned,
+                  MetaCommittedView(fixture.stores, fixture.next_index - 1),
+                  fixture.observations, 1'031)
+                  .ok());
+
+  fixture.ReportCandidate(1'032);
+  EXPECT_EQ(
+      MetaFailureClassOf(ValidateFailoverProposal(
+          **planned, MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 1'032)),
+      MetaFailureClass::kDomainReject);
 }
 
 }  // namespace

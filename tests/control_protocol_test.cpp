@@ -40,6 +40,68 @@ WireHash256 Sha256(std::string_view bytes) {
   return control::ComputeSha256(bytes);
 }
 
+control::FullDesiredState FailoverFullState() {
+  control::FullDesiredState state;
+  state.source_meta_applied_index = 91;
+  state.topology_epoch = 23;
+  state.nodes = {
+      {.node_id = std::string(40, 'a'), .host = "127.0.0.1", .port = 6379},
+      {.node_id = std::string(40, 'b'), .host = "127.0.0.2", .port = 6380},
+  };
+
+  control::WireDesiredGroup group;
+  group.group_id = "group-a";
+  group.members = {
+      {.node_id = state.nodes[0].node_id, .assignment_id = Id(5)},
+      {.node_id = state.nodes[1].node_id, .assignment_id = Id(6)},
+  };
+  group.owner_node_id = state.nodes[0].node_id;
+  group.owner_assignment_id = Id(5);
+  group.group_term = 7;
+  group.authority_version = 9;
+  group.grant_revision = 11;
+  group.grant_duration_ms = 3'000;
+  group.grant_active = true;
+  group.activation_action_id = Id(19);
+  group.config_epoch = 13;
+  group.grant_policy_id = "current-grant";
+  group.grant_policy_version = 2;
+  group.steady_replication_enabled = true;
+  group.failover_transition = control::WireFailoverTransition{
+      .transition_id = Id(20),
+      .revision = 25,
+      .mode = control::WireFailoverMode::kControlled,
+      .target_term = 8,
+      .candidate_action =
+          control::WireFailoverCandidateAction{
+              .action_id = Id(21),
+              .candidate = {.node_id = state.nodes[1].node_id,
+                            .assignment_id = Id(6),
+                            .boot_id = std::string(40, 'c')},
+              .domain = {.source_group_term = 7,
+                         .source_node_id = state.nodes[0].node_id,
+                         .source_assignment_id = Id(5),
+                         .source_boot_id = std::string(40, 'd'),
+                         .source_history_id = std::string(40, 'e'),
+                         .flow_count = 3},
+              .authorization =
+                  control::WireFailoverAuthorization{
+                      .authorized_revision = 24,
+                      .loss_if_cutover = control::WireFailoverLoss::kNone}},
+  };
+  state.groups.push_back(std::move(group));
+  state.policies = {
+      {.policy_id = "current-grant",
+       .version = 2,
+       .content_hash = Sha256("current"),
+       .content = "current"},
+  };
+  state.directive_set_digest =
+      *control::ComputeDirectiveSetDigest(state.current_directives);
+  state.projection_hash = *control::ComputeProjectionHash(state);
+  return state;
+}
+
 void AppendBe16(std::string* bytes, std::uint16_t value) {
   bytes->push_back(static_cast<char>(value >> 8));
   bytes->push_back(static_cast<char>(value));
@@ -67,8 +129,7 @@ absl::StatusOr<WireHash256> LegacyDirectiveSetDigest(
         .source_node_id = source.source_node_id,
         .source_assignment_id = source.source_assignment_id,
         .source_boot_id = source.source_boot_id,
-        .source_replication_history_id =
-            source.source_replication_history_id,
+        .source_replication_history_id = source.source_replication_history_id,
         .manifest_revision = source.manifest_revision,
         .manifest_digest = source.manifest_digest,
         .partition_replication_epoch = source.partition_replication_epoch,
@@ -120,6 +181,7 @@ class RecordingSink final : public LargeObjectSink {
   absl::Status Begin(const TransferStart& start) override {
     ++begin_count_;
     start_ = start;
+    bytes_.clear();
     return absl::OkStatus();
   }
 
@@ -136,7 +198,10 @@ class RecordingSink final : public LargeObjectSink {
     return absl::OkStatus();
   }
 
-  void Abort() noexcept override { ++abort_count_; }
+  void Abort() noexcept override {
+    ++abort_count_;
+    bytes_.clear();
+  }
 
   int begin_count_ = 0;
   int commit_count_ = 0;
@@ -275,6 +340,7 @@ TEST(ControlProtocolCodecTest, RoundTripsTypedReplicaCandidate) {
               .group_id = "group-a",
               .assignment_id = Id(4),
               .group_term = 7,
+              .source_group_term = 6,
               .manifest_revision = 12,
               .manifest_digest = Sha256("manifest"),
               .partition_replication_epoch = 13,
@@ -286,8 +352,7 @@ TEST(ControlProtocolCodecTest, RoundTripsTypedReplicaCandidate) {
           },
   };
 
-  auto encoded =
-      control::EncodeMessage(control::WireMessage{heartbeat});
+  auto encoded = control::EncodeMessage(control::WireMessage{heartbeat});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   auto decoded = control::DecodeMessage(MessageType::kHeartbeat, *encoded);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
@@ -303,6 +368,7 @@ TEST(ControlProtocolCodecTest, RejectsMalformedTypedCandidateAndRoleTag) {
               .group_id = "group-a",
               .assignment_id = Id(4),
               .group_term = 7,
+              .source_group_term = 6,
               .manifest_revision = 12,
               .manifest_digest = Sha256("manifest"),
               .partition_replication_epoch = 13,
@@ -325,35 +391,211 @@ TEST(ControlProtocolCodecTest, RejectsMalformedTypedCandidateAndRoleTag) {
 
   std::string trailing = *encoded;
   trailing.push_back('\0');
-  EXPECT_EQ(control::DecodeMessage(MessageType::kHeartbeat, trailing)
-                .status()
-                .code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(
+      control::DecodeMessage(MessageType::kHeartbeat, trailing).status().code(),
+      absl::StatusCode::kInvalidArgument);
 
   control::Heartbeat no_role;
   no_role.heartbeat_sequence = 2;
   encoded = control::EncodeMessage(control::WireMessage{no_role});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  encoded->back() = static_cast<char>(99);
-  EXPECT_EQ(control::DecodeMessage(MessageType::kHeartbeat, *encoded)
-                .status()
-                .code(),
-            absl::StatusCode::kInvalidArgument);
+  ASSERT_GE(encoded->size(), 2u);
+  (*encoded)[encoded->size() - 2] = static_cast<char>(99);
+  EXPECT_EQ(
+      control::DecodeMessage(MessageType::kHeartbeat, *encoded).status().code(),
+      absl::StatusCode::kInvalidArgument);
 
   auto* candidate =
       std::get_if<control::ReplicaCandidate>(&heartbeat.role_information);
   ASSERT_NE(candidate, nullptr);
   candidate->progress.applied_next_lsns.clear();
-  EXPECT_EQ(control::EncodeMessage(control::WireMessage{heartbeat})
-                .status()
-                .code(),
-            absl::StatusCode::kResourceExhausted);
-  candidate->progress.applied_next_lsns.assign(
-      control::kMaxCandidateFlows + 1, 1);
-  EXPECT_EQ(control::EncodeMessage(control::WireMessage{heartbeat})
-                .status()
-                .code(),
-            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{heartbeat}).status().code(),
+      absl::StatusCode::kResourceExhausted);
+  candidate->progress.applied_next_lsns.assign(control::kMaxCandidateFlows + 1,
+                                               1);
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{heartbeat}).status().code(),
+      absl::StatusCode::kResourceExhausted);
+
+  candidate->progress.applied_next_lsns = {1};
+  candidate->progress.source_group_term = 0;
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{heartbeat}).status().code(),
+      absl::StatusCode::kInvalidArgument);
+  candidate->progress.source_group_term = 8;
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{heartbeat}).status().code(),
+      absl::StatusCode::kInvalidArgument);
+}
+
+TEST(ControlProtocolCodecTest, MaximumCandidateProgressStillFitsOneFrame) {
+  control::Heartbeat heartbeat;
+  heartbeat.session_id = Id(1);
+  heartbeat.heartbeat_sequence = 1;
+  heartbeat.role_information = control::ReplicaCandidate{
+      .progress =
+          {
+              .group_id = "group-a",
+              .assignment_id = Id(2),
+              .group_term = 7,
+              .source_group_term = 6,
+              .manifest_revision = 8,
+              .manifest_digest = Sha256("manifest"),
+              .partition_replication_epoch = 9,
+              .source_node_id = std::string(40, 'a'),
+              .source_assignment_id = Id(3),
+              .source_boot_id = std::string(40, 'b'),
+              .source_history_id = std::string(40, 'c'),
+              .applied_next_lsns =
+                  std::vector<std::uint64_t>(control::kMaxCandidateFlows, 1),
+          },
+  };
+
+  const auto payload = control::EncodeMessage(control::WireMessage{heartbeat});
+  ASSERT_TRUE(payload.ok()) << payload.status();
+  EXPECT_LE(payload->size(), control::kMaxFramePayloadBytes);
+  control::FrameEncoder encoder;
+  EXPECT_TRUE(encoder.Encode(control::MessageType::kHeartbeat, *payload).ok());
+}
+
+TEST(ControlProtocolCodecTest,
+     RoundTripsTypedFailoverObservationsBesideSteadyRole) {
+  control::Heartbeat heartbeat;
+  heartbeat.session_id = Id(1);
+  heartbeat.heartbeat_sequence = 1;
+  heartbeat.role_information = control::AuthorityLeaseRequest{
+      .challenge = {.nonce = Id(2),
+                    .projection_hash = Sha256("projection"),
+                    .group_id = "group-a",
+                    .assignment_id = Id(3),
+                    .group_term = 7,
+                    .authority_version = 8,
+                    .grant_revision = 9}};
+  heartbeat.failover_observation =
+      control::SourcePaused{.transition_id = Id(4),
+                            .source_node_id = std::string(40, 'a'),
+                            .source_assignment_id = Id(3),
+                            .source_boot_id = std::string(40, 'b'),
+                            .source_history_id = std::string(40, 'c'),
+                            .source_group_term = 7,
+                            .stable_next_lsns = {11, 22, 33}};
+
+  for (int kind = 0; kind < 3; ++kind) {
+    if (kind == 1) {
+      heartbeat.failover_observation = control::CandidatePrepared{
+          .transition_id = Id(4),
+          .action_id = Id(5),
+          .candidate_node_id = std::string(40, 'd'),
+          .candidate_assignment_id = Id(6),
+          .candidate_boot_id = std::string(40, 'e'),
+          .prepared_context_id = Id(7),
+          .prepared_context_hash = Sha256("prepared-context")};
+    } else if (kind == 2) {
+      heartbeat.failover_observation = control::ActionFailed{
+          .transition_id = Id(4),
+          .action_id = Id(5),
+          .candidate_node_id = std::string(40, 'd'),
+          .candidate_assignment_id = Id(6),
+          .candidate_boot_id = std::string(40, 'e'),
+          .population_manifest_revision = 10,
+          .population_manifest_digest = Sha256("manifest"),
+          .partition_replication_epoch = 11,
+          .failure_class = "durability",
+          .failure_detail = "storage barrier failed"};
+    }
+    const auto encoded =
+        control::EncodeMessage(control::WireMessage{heartbeat});
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    const auto decoded =
+        control::DecodeMessage(control::MessageType::kHeartbeat, *encoded);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    EXPECT_EQ(std::get<control::Heartbeat>(*decoded), heartbeat);
+  }
+}
+
+TEST(ControlProtocolCodecTest,
+     FailoverObservationValidationAndSingleFrameBudgetAreStrict) {
+  control::Heartbeat heartbeat;
+  heartbeat.session_id = Id(1);
+  heartbeat.heartbeat_sequence = 1;
+  heartbeat.failover_observation =
+      control::SourcePaused{.transition_id = Id(2),
+                            .source_node_id = std::string(40, 'a'),
+                            .source_assignment_id = Id(3),
+                            .source_boot_id = std::string(40, 'b'),
+                            .source_history_id = std::string(40, 'c'),
+                            .source_group_term = 7,
+                            .stable_next_lsns = std::vector<std::uint64_t>(
+                                control::kMaxCandidateFlows, 1)};
+  auto encoded = control::EncodeMessage(control::WireMessage{heartbeat});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  EXPECT_LE(encoded->size(), control::kMaxFramePayloadBytes);
+  constexpr std::size_t kObservationTagOffset = 16 + 8 + 3 + 4 + 4 + 1 + 1;
+  ASSERT_GT(encoded->size(), kObservationTagOffset);
+  std::string unknown_kind = *encoded;
+  unknown_kind[kObservationTagOffset] = static_cast<char>(99);
+  EXPECT_EQ(
+      control::DecodeMessage(control::MessageType::kHeartbeat, unknown_kind)
+          .status()
+          .code(),
+      absl::StatusCode::kInvalidArgument);
+
+  auto* paused =
+      std::get_if<control::SourcePaused>(&*heartbeat.failover_observation);
+  ASSERT_NE(paused, nullptr);
+  paused->stable_next_lsns.back() = 0;
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{heartbeat}).status().code(),
+      absl::StatusCode::kInvalidArgument);
+  paused->stable_next_lsns.back() = 1;
+
+  heartbeat.role_information = control::ReplicaCandidate{
+      .progress = {.group_id = "group-a",
+                   .assignment_id = Id(4),
+                   .group_term = 8,
+                   .source_group_term = 7,
+                   .manifest_revision = 10,
+                   .manifest_digest = Sha256("manifest"),
+                   .partition_replication_epoch = 11,
+                   .source_node_id = std::string(40, 'a'),
+                   .source_assignment_id = Id(3),
+                   .source_boot_id = std::string(40, 'b'),
+                   .source_history_id = std::string(40, 'c'),
+                   .applied_next_lsns = std::vector<std::uint64_t>(
+                       control::kMaxCandidateFlows, 1)}};
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{heartbeat}).status().code(),
+      absl::StatusCode::kResourceExhausted);
+
+  heartbeat.failover_observation = control::ActionFailed{
+      .transition_id = Id(2),
+      .action_id = Id(5),
+      .candidate_node_id = std::string(40, 'd'),
+      .candidate_assignment_id = Id(4),
+      .candidate_boot_id = std::string(40, 'e'),
+      .population_manifest_revision = 10,
+      .population_manifest_digest = Sha256("manifest"),
+      .partition_replication_epoch = 11,
+      .failure_class = std::string(control::kMaxFailoverFailureClassBytes, 'f'),
+      .failure_detail =
+          std::string(control::kMaxFailoverFailureDetailBytes, 'd')};
+  encoded = control::EncodeMessage(control::WireMessage{heartbeat});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  EXPECT_LE(encoded->size(), control::kMaxFramePayloadBytes);
+
+  auto* failed =
+      std::get_if<control::ActionFailed>(&*heartbeat.failover_observation);
+  ASSERT_NE(failed, nullptr);
+  failed->action_id = {};
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{heartbeat}).status().code(),
+      absl::StatusCode::kInvalidArgument);
+  failed->action_id = Id(5);
+  failed->failure_detail.push_back('x');
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{heartbeat}).status().code(),
+      absl::StatusCode::kResourceExhausted);
 }
 
 TEST(ControlProtocolCodecTest, HeartbeatReplayIsExactAndGapFree) {
@@ -411,6 +653,14 @@ TEST(ControlProtocolCodecTest,
   auto decoded = control::DecodeMessage(MessageType::kDirective, *encoded);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::Directive>(*decoded), directive);
+
+  // Kind 5 is outside the active enum range and must not become accidentally
+  // admissible.
+  directive.kind = static_cast<control::WireDirectiveKind>(5);
+  EXPECT_EQ(
+      control::EncodeMessage(control::WireMessage{directive}).status().code(),
+      absl::StatusCode::kInvalidArgument);
+  directive.kind = control::WireDirectiveKind::kAuthorizeSource;
 
   control::DirectiveReceipt receipt{
       .session_id = directive.session_id,
@@ -757,6 +1007,78 @@ TEST(ControlProtocolFullStateTest,
   EXPECT_EQ(*decoded, state);
 }
 
+TEST(ControlProtocolFullStateTest,
+     RoundTripsTypedFailoverStateAndCoversItInProjectionHash) {
+  control::FullDesiredState state = FailoverFullState();
+  const auto original_hash = state.projection_hash;
+
+  auto encoded = control::EncodeFullDesiredState(state);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  EXPECT_LE(encoded->size(), control::kMaxFramePayloadBytes);
+  auto decoded = control::DecodeFullDesiredState(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  state.object_hash = Sha256(*encoded);
+  EXPECT_EQ(*decoded, state);
+
+  state.groups[0].steady_replication_enabled = false;
+  const auto lifecycle_change = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(lifecycle_change.ok()) << lifecycle_change.status();
+  EXPECT_NE(*lifecycle_change, original_hash);
+  state.groups[0].steady_replication_enabled = true;
+
+  ASSERT_TRUE(state.groups[0].failover_transition.has_value());
+  ++state.groups[0].failover_transition->revision;
+  const auto transition_change = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(transition_change.ok()) << transition_change.status();
+  EXPECT_NE(*transition_change, original_hash);
+
+  state.groups[0].failover_transition.reset();
+  state.groups[0].activation_action_id = Id(21);
+  const auto activation_change = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(activation_change.ok()) << activation_change.status();
+  EXPECT_NE(*activation_change, original_hash);
+}
+
+TEST(ControlProtocolFullStateTest, RejectsMalformedFailoverState) {
+  control::FullDesiredState state = FailoverFullState();
+  ASSERT_TRUE(state.groups[0].failover_transition.has_value());
+  auto& transition = *state.groups[0].failover_transition;
+
+  transition.mode = static_cast<control::WireFailoverMode>(99);
+  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  transition.mode = control::WireFailoverMode::kControlled;
+
+  ASSERT_TRUE(transition.candidate_action.has_value());
+  transition.candidate_action->domain.source_group_term =
+      transition.target_term;
+  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  transition.candidate_action->domain.source_group_term = 7;
+
+  transition.candidate_action->authorization->loss_if_cutover =
+      control::WireFailoverLoss::kUnknown;
+  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+            absl::StatusCode::kInvalidArgument);
+  transition.candidate_action->authorization->loss_if_cutover =
+      control::WireFailoverLoss::kNone;
+
+  transition.candidate_action.reset();
+  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  state = FailoverFullState();
+  state.groups[0].failover_transition.reset();
+  state.groups[0].activation_action_id = WireId128{};
+  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  state.groups[0].activation_action_id = Id(1);
+  state.groups[0].grant_active = false;
+  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
 TEST(ControlProtocolFullStateTest, RoundTripsEmptyTopologyAtEpochZero) {
   control::FullDesiredState state;
   state.source_meta_applied_index = 1;
@@ -846,11 +1168,10 @@ TEST(ControlProtocolFullStateTest,
   ASSERT_TRUE(frame.ok()) << frame.status();
   EXPECT_EQ(frame->type, control::MessageType::kFullDesiredState);
 
-  auto decoded = control::DecodeMessage(
-      control::MessageType::kFullDesiredState, frame->payload);
+  auto decoded = control::DecodeMessage(control::MessageType::kFullDesiredState,
+                                        frame->payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
-  const auto* full_state =
-      std::get_if<control::FullDesiredState>(&*decoded);
+  const auto* full_state = std::get_if<control::FullDesiredState>(&*decoded);
   ASSERT_NE(full_state, nullptr);
   state.object_hash = Sha256(*encoded);
   EXPECT_EQ(*full_state, state);
@@ -966,86 +1287,6 @@ TEST(ControlProtocolFullStateTest,
   EXPECT_NE(*semantic_change, *original);
 }
 
-TEST(ControlProtocolPromotionPrepareTest,
-     RoundTripsVersionedRequestPreconditionsAndPreparedEvidence) {
-  const control::PromotionPrepareRequest request{
-      .parent_history_id = std::string(40, 'a'),
-      .required_applied_next_lsns = {17, 29, 41},
-  };
-  auto encoded_request = control::EncodePromotionPrepareRequest(request);
-  ASSERT_TRUE(encoded_request.ok()) << encoded_request.status();
-  auto decoded_request =
-      control::DecodePromotionPrepareRequest(*encoded_request);
-  ASSERT_TRUE(decoded_request.ok()) << decoded_request.status();
-  EXPECT_EQ(*decoded_request, request);
-
-  const control::PromotionPreparePreconditions preconditions{
-      .excluded_group_term = 7,
-      .old_authority_exclusion_hash = Sha256("old-authority-excluded"),
-  };
-  auto encoded_preconditions =
-      control::EncodePromotionPreparePreconditions(preconditions);
-  ASSERT_TRUE(encoded_preconditions.ok()) << encoded_preconditions.status();
-  auto decoded_preconditions =
-      control::DecodePromotionPreparePreconditions(*encoded_preconditions);
-  ASSERT_TRUE(decoded_preconditions.ok()) << decoded_preconditions.status();
-  EXPECT_EQ(*decoded_preconditions, preconditions);
-
-  const control::PromotionPreparedEvidence evidence{
-      .parent_history_id = request.parent_history_id,
-      .frozen_applied_next_lsns = request.required_applied_next_lsns,
-      .population_generation = 3,
-      .population_digest = 5,
-      .catalog_generation = 11,
-      .catalog_dump_crc64 = 13,
-      .child_history_id = std::string(40, 'b'),
-  };
-  auto encoded_evidence = control::EncodePromotionPreparedEvidence(evidence);
-  ASSERT_TRUE(encoded_evidence.ok()) << encoded_evidence.status();
-  auto decoded_evidence =
-      control::DecodePromotionPreparedEvidence(*encoded_evidence);
-  ASSERT_TRUE(decoded_evidence.ok()) << decoded_evidence.status();
-  EXPECT_EQ(*decoded_evidence, evidence);
-}
-
-TEST(ControlProtocolPromotionPrepareTest,
-     RejectsIncompleteOrNonCanonicalPromotionProofs) {
-  control::PromotionPrepareRequest request{
-      .parent_history_id = std::string(40, 'a'),
-      .required_applied_next_lsns = {17, 29},
-  };
-  request.required_applied_next_lsns[1] = 0;
-  EXPECT_EQ(control::EncodePromotionPrepareRequest(request).status().code(),
-            absl::StatusCode::kInvalidArgument);
-
-  request.required_applied_next_lsns[1] = 29;
-  auto encoded = control::EncodePromotionPrepareRequest(request);
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  encoded->push_back('\0');
-  EXPECT_EQ(control::DecodePromotionPrepareRequest(*encoded).status().code(),
-            absl::StatusCode::kInvalidArgument);
-
-  control::PromotionPreparedEvidence evidence{
-      .parent_history_id = std::string(40, 'a'),
-      .frozen_applied_next_lsns = {17, 29},
-      .population_generation = 0,
-      .catalog_generation = 1,
-      .child_history_id = std::string(40, 'b'),
-  };
-  EXPECT_EQ(control::EncodePromotionPreparedEvidence(evidence).status().code(),
-            absl::StatusCode::kInvalidArgument);
-
-  evidence.population_generation = 1;
-  evidence.catalog_generation = 0;
-  EXPECT_EQ(control::EncodePromotionPreparedEvidence(evidence).status().code(),
-            absl::StatusCode::kInvalidArgument);
-
-  evidence.catalog_generation = 1;
-  evidence.child_history_id = evidence.parent_history_id;
-  EXPECT_EQ(control::EncodePromotionPreparedEvidence(evidence).status().code(),
-            absl::StatusCode::kInvalidArgument);
-}
-
 TEST(ControlProtocolFullStateTest,
      StreamingDirectiveDigestMatchesV1ByteSortAcrossFieldsAndPermutations) {
   const control::WireProjectedDirective base{
@@ -1129,12 +1370,18 @@ TEST(ControlProtocolFullStateTest,
 TEST(ControlProtocolFullStateTest, RoundTripsCommittedGrantlessGroup) {
   control::FullDesiredState state;
   state.topology_epoch = 1;
-  state.groups.push_back({.group_id = "grantless",
-                          .group_term = 3,
-                          .authority_version = 4,
-                          .grant_revision = 5,
-                          .grant_active = false,
-                          .config_epoch = 6});
+  state.groups.push_back(
+      {.group_id = "grantless",
+       .group_term = 3,
+       .authority_version = 4,
+       .grant_revision = 5,
+       .grant_active = false,
+       .config_epoch = 6,
+       .failover_transition = control::WireFailoverTransition{
+           .transition_id = Id(1),
+           .revision = 7,
+           .mode = control::WireFailoverMode::kUncontrolled,
+           .target_term = 3}});
   auto directive_digest =
       control::ComputeDirectiveSetDigest(state.current_directives);
   ASSERT_TRUE(directive_digest.ok()) << directive_digest.status();
@@ -1151,6 +1398,11 @@ TEST(ControlProtocolFullStateTest, RoundTripsCommittedGrantlessGroup) {
   EXPECT_FALSE(decoded->groups[0].owner_node_id.has_value());
   EXPECT_FALSE(decoded->groups[0].owner_assignment_id.has_value());
   EXPECT_FALSE(decoded->groups[0].grant_active);
+  ASSERT_TRUE(decoded->groups[0].failover_transition.has_value());
+  EXPECT_EQ(decoded->groups[0].failover_transition->mode,
+            control::WireFailoverMode::kUncontrolled);
+  EXPECT_FALSE(
+      decoded->groups[0].failover_transition->candidate_action.has_value());
 
   state.groups[0].grant_active = true;
   EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
@@ -1197,6 +1449,69 @@ TEST(ControlProtocolTransferTest, StreamsOneBoundedObjectAndChecksDigest) {
   EXPECT_EQ(sink.commit_count_, 1);
   EXPECT_EQ(sink.abort_count_, 0);
   EXPECT_FALSE(reassembler.active());
+}
+
+TEST(ControlProtocolTransferTest,
+     NamedSupersessionAbortResetsOnlyItsExactActiveObject) {
+  RecordingSink sink;
+  LargeObjectReassembler reassembler(sink);
+  const TransferStart first{
+      .kind = TransferKind::kFullDesiredState,
+      .object_id = Id(7),
+      .total_length = 3,
+      .sha256 = Sha256("old"),
+  };
+  ASSERT_TRUE(reassembler.Accept(first).ok());
+  ASSERT_TRUE(reassembler
+                  .Accept(TransferChunk{
+                      .object_id = first.object_id, .offset = 0, .bytes = "o"})
+                  .ok());
+
+  EXPECT_EQ(
+      reassembler
+          .Accept(control::TransferAbort{
+              .object_id = Id(8),
+              .reason =
+                  control::TransferAbortReason::kFullDesiredStateSuperseded})
+          .code(),
+      absl::StatusCode::kFailedPrecondition);
+  EXPECT_TRUE(reassembler.active());
+  ASSERT_TRUE(
+      reassembler
+          .Accept(control::TransferAbort{
+              .object_id = first.object_id,
+              .reason =
+                  control::TransferAbortReason::kFullDesiredStateSuperseded})
+          .ok());
+  EXPECT_FALSE(reassembler.active());
+  EXPECT_EQ(sink.abort_count_, 1);
+
+  const control::TransferAbort named_abort{
+      .object_id = first.object_id,
+      .reason = control::TransferAbortReason::kFullDesiredStateSuperseded,
+  };
+  auto encoded = control::EncodeMessage(control::WireMessage(named_abort));
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded =
+      control::DecodeMessage(control::MessageType::kTransferAbort, *encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(std::get<control::TransferAbort>(*decoded), named_abort);
+
+  const TransferStart latest{
+      .kind = TransferKind::kFullDesiredState,
+      .object_id = Id(9),
+      .total_length = 3,
+      .sha256 = Sha256("new"),
+  };
+  ASSERT_TRUE(reassembler.Accept(latest).ok());
+  ASSERT_TRUE(
+      reassembler
+          .Accept(TransferChunk{
+              .object_id = latest.object_id, .offset = 0, .bytes = "new"})
+          .ok());
+  ASSERT_TRUE(reassembler.Accept(TransferEnd{latest.object_id}).ok());
+  EXPECT_EQ(sink.bytes_, "new");
+  EXPECT_EQ(sink.commit_count_, 1);
 }
 
 TEST(ControlProtocolTransferTest, RejectsOversizeAndAbortsDigestMismatch) {

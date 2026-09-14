@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -22,6 +23,7 @@
 #include "celer/runtime/sync.h"
 #include "celer/runtime/worker.h"
 #include "keylane/glob.h"
+#include "keylane/memory.h"
 #include "keylane/resp.h"
 
 namespace keylane {
@@ -72,6 +74,9 @@ class PubSubSession : public std::enable_shared_from_this<PubSubSession> {
   }
   std::size_t subscription_count() const noexcept {
     return channels_.size() + patterns_.size();
+  }
+  bool live() const noexcept {
+    return registered_ && !closed_ && !exit_enqueued_;
   }
   RespVersion version() const noexcept { return version_; }
   void SetVersion(RespVersion version) noexcept {
@@ -138,6 +143,26 @@ class PubSubSession : public std::enable_shared_from_this<PubSubSession> {
   bool exit_enqueued_ = false;
   bool reader_started_ = false;
   bool reader_done_ = true;
+};
+
+// This command-time snapshot intentionally keeps only weak session references:
+// delaying publication must not extend a disconnected connection's lifetime.
+// Frames retain the RESP version observed at PUBLISH, while the destination
+// worker remains the sole owner allowed to inspect or enqueue to each session.
+// Per-worker charges bound snapshots that accumulate across a large EXEC.
+class CapturedPubSubPublication {
+ public:
+  struct Recipient {
+    std::weak_ptr<PubSubSession> session_;
+    std::shared_ptr<const std::string> encoded_;
+  };
+
+  explicit CapturedPubSubPublication(unsigned worker_count)
+      : per_worker_(worker_count), charges_(worker_count) {}
+
+  std::vector<std::vector<Recipient>> per_worker_;
+  std::vector<RetainedMemoryCharge> charges_;
+  std::atomic<std::uint64_t> receiver_count_{0};
 };
 
 namespace {
@@ -255,6 +280,373 @@ std::uint64_t DeliverLocal(
   }
   return receivers;
 }
+
+struct LocalPubSubCapture {
+  std::vector<CapturedPubSubPublication::Recipient> recipients_;
+  RetainedMemoryCharge charge_;
+};
+
+bool AddCaptureBytes(std::size_t increment, std::size_t* bytes) {
+  if (increment > std::numeric_limits<std::size_t>::max() - *bytes) {
+    return false;
+  }
+  *bytes += increment;
+  return true;
+}
+
+absl::StatusOr<LocalPubSubCapture> CaptureLocal(
+    std::string_view channel, std::string_view payload,
+    const std::shared_ptr<const EncodedFrames>& encoded) {
+  WorkerPubSubRegistry& registry = LocalRegistry();
+  std::size_t recipient_count = 0;
+  std::size_t retained_bytes = 128;
+  bool exact_resp2 = false;
+  bool exact_resp3 = false;
+  if (auto found = registry.channels_.find(channel);
+      found != registry.channels_.end()) {
+    for (const auto& session : found->second) {
+      const auto& frame = SelectFrame(*encoded, session->version());
+      if (frame != nullptr && session->live() &&
+          session->subscribed_to(channel)) {
+        ++recipient_count;
+        if (session->version() == RespVersion::k3)
+          exact_resp3 = true;
+        else
+          exact_resp2 = true;
+      }
+    }
+  }
+  const auto add_encoded_frame = [&](std::size_t pattern_bytes) {
+    std::size_t bytes = channel.size();
+    if (!AddCaptureBytes(payload.size(), &bytes) ||
+        !AddCaptureBytes(pattern_bytes, &bytes) ||
+        !AddCaptureBytes(128, &bytes)) {
+      return false;
+    }
+    return AddCaptureBytes(bytes, &retained_bytes);
+  };
+  if ((exact_resp2 && !add_encoded_frame(0)) ||
+      (exact_resp3 && !add_encoded_frame(0))) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "OOM deferred Pub/Sub snapshot size overflow");
+  }
+  for (const auto& [pattern, sessions] : registry.patterns_) {
+    if (!RedisGlobMatch(pattern, channel)) continue;
+    bool pattern_resp2 = false;
+    bool pattern_resp3 = false;
+    for (const auto& session : sessions) {
+      const auto& frame = SelectFrame(*encoded, session->version());
+      if (frame != nullptr && session->live() &&
+          session->subscribed_to_pattern(pattern)) {
+        ++recipient_count;
+        if (session->version() == RespVersion::k3)
+          pattern_resp3 = true;
+        else
+          pattern_resp2 = true;
+      }
+    }
+    if ((pattern_resp2 && !add_encoded_frame(pattern.size())) ||
+        (pattern_resp3 && !add_encoded_frame(pattern.size()))) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError(
+          "OOM deferred Pub/Sub snapshot size overflow");
+    }
+  }
+  if (recipient_count == 0) return LocalPubSubCapture{};
+  if (recipient_count > std::numeric_limits<std::size_t>::max() /
+                            sizeof(CapturedPubSubPublication::Recipient) ||
+      !AddCaptureBytes(
+          recipient_count * sizeof(CapturedPubSubPublication::Recipient),
+          &retained_bytes)) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "OOM deferred Pub/Sub snapshot size overflow");
+  }
+  auto reservation = TryReserveMemory(retained_bytes);
+  if (!reservation) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "OOM preparing deferred Pub/Sub snapshot");
+  }
+
+  try {
+    LocalPubSubCapture capture;
+    capture.recipients_.reserve(recipient_count);
+    if (auto found = registry.channels_.find(channel);
+        found != registry.channels_.end()) {
+      for (const auto& session : found->second) {
+        const auto& frame = SelectFrame(*encoded, session->version());
+        if (frame != nullptr && session->live() &&
+            session->subscribed_to(channel)) {
+          capture.recipients_.push_back(
+              {.session_ = session, .encoded_ = frame});
+        }
+      }
+    }
+    for (const auto& [pattern, sessions] : registry.patterns_) {
+      if (!RedisGlobMatch(pattern, channel)) continue;
+      bool pattern_resp2 = false;
+      bool pattern_resp3 = false;
+      for (const auto& session : sessions) {
+        if (!session->live() || !session->subscribed_to_pattern(pattern)) {
+          continue;
+        }
+        if (session->version() == RespVersion::k3)
+          pattern_resp3 = true;
+        else
+          pattern_resp2 = true;
+      }
+      const EncodedFrames pattern_message{
+          .resp2_ = pattern_resp2
+                        ? EncodePatternMessage(RespVersion::k2, pattern,
+                                               channel, payload)
+                        : nullptr,
+          .resp3_ = pattern_resp3
+                        ? EncodePatternMessage(RespVersion::k3, pattern,
+                                               channel, payload)
+                        : nullptr,
+      };
+      for (const auto& session : sessions) {
+        const auto& frame = SelectFrame(pattern_message, session->version());
+        if (frame != nullptr && session->live() &&
+            session->subscribed_to_pattern(pattern)) {
+          capture.recipients_.push_back(
+              {.session_ = session, .encoded_ = frame});
+        }
+      }
+    }
+    assert(capture.recipients_.size() == recipient_count);
+    capture.charge_.Adopt(&*reservation, retained_bytes);
+    return capture;
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "OOM allocating deferred Pub/Sub snapshot");
+  }
+}
+
+class CapturePubSubOperation
+    : public std::enable_shared_from_this<CapturePubSubOperation> {
+ public:
+  CapturePubSubOperation(Worker* origin, unsigned participants,
+                         std::shared_ptr<const std::string> channel,
+                         std::shared_ptr<const std::string> payload,
+                         std::shared_ptr<const EncodedFrames> encoded)
+      : origin_(origin),
+        remaining_(participants),
+        channel_(std::move(channel)),
+        payload_(std::move(payload)),
+        encoded_(std::move(encoded)),
+        publication_(std::make_shared<CapturedPubSubPublication>(participants)),
+        errors_(participants, absl::OkStatus()) {}
+
+  class Awaiter {
+   public:
+    explicit Awaiter(std::shared_ptr<CapturePubSubOperation> operation)
+        : operation_(std::move(operation)) {}
+
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<> handle) {
+      operation_->handle_ = handle;
+      operation_->Dispatch();
+      return true;
+    }
+    absl::StatusOr<std::shared_ptr<CapturedPubSubPublication>> await_resume()
+        const {
+      for (const absl::Status& error : operation_->errors_) {
+        if (!error.ok()) return error;
+      }
+      return operation_->publication_;
+    }
+
+   private:
+    std::shared_ptr<CapturePubSubOperation> operation_;
+  };
+
+  Awaiter Wait() { return Awaiter(shared_from_this()); }
+
+  void Complete(unsigned worker,
+                absl::StatusOr<LocalPubSubCapture> capture) noexcept {
+    if (!capture.ok()) {
+      errors_[worker] = capture.status();
+    } else {
+      publication_->receiver_count_.fetch_add(capture->recipients_.size(),
+                                              std::memory_order_relaxed);
+      publication_->per_worker_[worker] = std::move(capture->recipients_);
+      publication_->charges_[worker] = std::move(capture->charge_);
+    }
+    if (remaining_.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    if (ThisWorker().id_ == origin_->id()) {
+      origin_->Enqueue(handle_);
+      return;
+    }
+    auto context = std::make_unique<std::shared_ptr<CapturePubSubOperation>>(
+        shared_from_this());
+    PostNotification(
+        ThisWorker().cross_core_, origin_->id(),
+        RemoteNotification{
+            .context_ = context.release(),
+            .value_ = 0,
+            .run_fn_ =
+                [](void* raw, std::uint64_t) noexcept {
+                  std::unique_ptr<std::shared_ptr<CapturePubSubOperation>>
+                      operation(
+                          static_cast<std::shared_ptr<CapturePubSubOperation>*>(
+                              raw));
+                  (*operation)->origin_->Enqueue((*operation)->handle_);
+                },
+        });
+  }
+
+ private:
+  struct Capture {
+    std::shared_ptr<CapturePubSubOperation> operation_;
+    unsigned worker_ = 0;
+  };
+
+  void Dispatch() {
+    const CurrentWorker& current = ThisWorker();
+    for (unsigned worker = 0; worker < g_worker_count; ++worker) {
+      if (worker == current.id_) {
+        Complete(worker, CaptureLocal(*channel_, *payload_, encoded_));
+        continue;
+      }
+      auto capture = std::make_unique<Capture>(
+          Capture{.operation_ = shared_from_this(), .worker_ = worker});
+      PostNotification(
+          current.cross_core_, worker,
+          RemoteNotification{
+              .context_ = capture.release(),
+              .value_ = 0,
+              .run_fn_ =
+                  [](void* raw, std::uint64_t) noexcept {
+                    std::unique_ptr<Capture> capture(
+                        static_cast<Capture*>(raw));
+                    auto& operation = capture->operation_;
+                    operation->Complete(
+                        capture->worker_,
+                        CaptureLocal(*operation->channel_, *operation->payload_,
+                                     operation->encoded_));
+                  },
+          });
+    }
+  }
+
+  Worker* origin_ = nullptr;
+  std::atomic<unsigned> remaining_;
+  std::coroutine_handle<> handle_{};
+  std::shared_ptr<const std::string> channel_;
+  std::shared_ptr<const std::string> payload_;
+  std::shared_ptr<const EncodedFrames> encoded_;
+  std::shared_ptr<CapturedPubSubPublication> publication_;
+  std::vector<absl::Status> errors_;
+};
+
+class DeliverCapturedPubSubOperation
+    : public std::enable_shared_from_this<DeliverCapturedPubSubOperation> {
+ public:
+  DeliverCapturedPubSubOperation(
+      Worker* origin, unsigned participants,
+      std::shared_ptr<CapturedPubSubPublication> publication)
+      : origin_(origin),
+        remaining_(participants),
+        publication_(std::move(publication)) {}
+
+  class Awaiter {
+   public:
+    explicit Awaiter(std::shared_ptr<DeliverCapturedPubSubOperation> operation)
+        : operation_(std::move(operation)) {}
+
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<> handle) {
+      operation_->handle_ = handle;
+      operation_->Dispatch();
+      return true;
+    }
+    void await_resume() const noexcept {}
+
+   private:
+    std::shared_ptr<DeliverCapturedPubSubOperation> operation_;
+  };
+
+  Awaiter Wait() { return Awaiter(shared_from_this()); }
+
+  void Complete() noexcept {
+    if (remaining_.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    if (ThisWorker().id_ == origin_->id()) {
+      origin_->Enqueue(handle_);
+      return;
+    }
+    auto context =
+        std::make_unique<std::shared_ptr<DeliverCapturedPubSubOperation>>(
+            shared_from_this());
+    PostNotification(
+        ThisWorker().cross_core_, origin_->id(),
+        RemoteNotification{
+            .context_ = context.release(),
+            .value_ = 0,
+            .run_fn_ =
+                [](void* raw, std::uint64_t) noexcept {
+                  std::unique_ptr<
+                      std::shared_ptr<DeliverCapturedPubSubOperation>>
+                      operation(
+                          static_cast<
+                              std::shared_ptr<DeliverCapturedPubSubOperation>*>(
+                              raw));
+                  (*operation)->origin_->Enqueue((*operation)->handle_);
+                },
+        });
+  }
+
+ private:
+  struct Delivery {
+    std::shared_ptr<DeliverCapturedPubSubOperation> operation_;
+    unsigned worker_ = 0;
+  };
+
+  void DeliverLocalSnapshot(unsigned worker) {
+    for (const auto& recipient : publication_->per_worker_[worker]) {
+      if (auto session = recipient.session_.lock(); session != nullptr) {
+        // Membership is intentionally not rechecked: it was frozen at the
+        // PUBLISH position. Enqueue still rejects dead or backpressured
+        // sessions through the ordinary bounded-delivery path.
+        (void)session->Enqueue(recipient.encoded_);
+      }
+    }
+  }
+
+  void Dispatch() {
+    const CurrentWorker& current = ThisWorker();
+    for (unsigned worker = 0; worker < g_worker_count; ++worker) {
+      if (worker == current.id_) {
+        DeliverLocalSnapshot(worker);
+        Complete();
+        continue;
+      }
+      auto delivery = std::make_unique<Delivery>(
+          Delivery{.operation_ = shared_from_this(), .worker_ = worker});
+      PostNotification(current.cross_core_, worker,
+                       RemoteNotification{
+                           .context_ = delivery.release(),
+                           .value_ = 0,
+                           .run_fn_ =
+                               [](void* raw, std::uint64_t) noexcept {
+                                 std::unique_ptr<Delivery> delivery(
+                                     static_cast<Delivery*>(raw));
+                                 delivery->operation_->DeliverLocalSnapshot(
+                                     delivery->worker_);
+                                 delivery->operation_->Complete();
+                               },
+                       });
+    }
+  }
+
+  Worker* origin_ = nullptr;
+  std::atomic<unsigned> remaining_;
+  std::coroutine_handle<> handle_{};
+  std::shared_ptr<CapturedPubSubPublication> publication_;
+};
 
 class PublishOperation : public std::enable_shared_from_this<PublishOperation> {
  public:
@@ -674,6 +1066,32 @@ Task<std::uint64_t> PublishChannel(std::string_view channel,
       ThisWorker().self_, g_worker_count, owned_channel, owned_payload,
       EncodeMessages(channel, payload));
   co_return co_await operation->Wait();
+}
+
+Task<absl::StatusOr<std::shared_ptr<CapturedPubSubPublication>>>
+CapturePubSubPublication(std::string_view channel, std::string_view payload) {
+  auto owned_channel = std::make_shared<const std::string>(channel);
+  auto owned_payload = std::make_shared<const std::string>(payload);
+  auto operation = std::make_shared<CapturePubSubOperation>(
+      ThisWorker().self_, g_worker_count, owned_channel, owned_payload,
+      EncodeMessages(channel, payload));
+  co_return co_await operation->Wait();
+}
+
+std::uint64_t CapturedPubSubReceiverCount(
+    const std::shared_ptr<CapturedPubSubPublication>& publication) noexcept {
+  return publication == nullptr
+             ? 0
+             : publication->receiver_count_.load(std::memory_order_acquire);
+}
+
+Task<absl::Status> DeliverCapturedPubSubPublication(
+    std::shared_ptr<CapturedPubSubPublication> publication) {
+  if (publication == nullptr) co_return absl::OkStatus();
+  auto operation = std::make_shared<DeliverCapturedPubSubOperation>(
+      ThisWorker().self_, g_worker_count, std::move(publication));
+  co_await operation->Wait();
+  co_return absl::OkStatus();
 }
 
 void EnqueuePubSubReply(const std::shared_ptr<PubSubSession>& session,

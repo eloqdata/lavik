@@ -17,15 +17,16 @@ Celer owns the worker and socket lifecycle underneath those Keylane modules.
 A separate `keylane-meta` executable runs the [Raft-backed meta control
 plane](08-meta-control-plane.md). It owns committed cluster metadata,
 leader-local observations, authenticated administration, and coordination
-plus process-lifetime Data-control sessions. Initial creation and Meta-member
-addition/removal are durable operations recovered by the current leader, independent of an Admin client's
-connection or wait deadline. It links the pinned NuRaft
-submodule, whose native Asio service owns Raft peer communication; Celer owns
-the separate administrative and Data-node sessions. The Raft-free
+plus process-lifetime Data-control sessions. Initial creation, Meta-member
+addition/removal, and per-Group failover are recovered by the current leader,
+independent of an Admin client's connection or wait deadline. It links the
+pinned NuRaft submodule, whose native Asio service owns Raft peer communication;
+Celer owns the separate administrative and Data-node sessions. The Raft-free
 `keylane-ctl` operator client sends direct administrative commands; its
 `cluster-status` command discovers the current Meta leader and reads one stable
-cluster-readiness cut through that surface. NuRaft is linked only into
-`keylane-meta`: the data-plane executable, operator client, their supporting
+cluster-readiness cut through that surface; `failover` submits a durable
+controlled transition and `getop` follows its operator-visible outcome. NuRaft
+is linked only into `keylane-meta`: the data-plane executable, operator client, their supporting
 libraries, and their focused tests never see consensus code, and the build
 enforces that boundary at configure time.
 
@@ -50,9 +51,9 @@ snapshots.
 
 keylane-meta Raft leader <-- framed control session --> Data NodeControl
        committed view       full state / lease /        topology, authority,
-                            directive / observation      replication actions
+                            directive / observation      failover/replication
 
-operator --> keylane-ctl cluster-status
+operator --> keylane-ctl cluster-status / failover / getop
                          |
                     Meta Admin seed --> current Meta leader
                       clusterhead           clusterstatus
@@ -68,9 +69,9 @@ operator --> keylane-ctl cluster-status
 | Transaction coordination | Serialize conflicting key access across workers and execute single- or multi-shard command hops | `tx::TxRuntime`, `tx::Transaction`, `tx::TxShard` |
 | Storage and recovery | Own logical indexes and physical blocks, execute reads and appends, recover durable state, and reclaim obsolete data | `storage::StorageEngine` |
 | Function catalog | Stage one complete process-global Function definition set on every worker, commit its existing `FUNCTION DUMP` encoding, swap runtimes, and recover it before service readiness | `FunctionCatalog` |
-| Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
-| Cluster data plane | Admit, redirect, or refuse requests by Meta-projected slot ownership and finite authority; serve Redis Cluster discovery | `cluster::AuthorityGuard::CaptureAndAdmit` / `RegisterAndRecheck`, `cluster::TopologyCache`, `cluster::NodeControlInstaller`, `cluster::MetaControlClientService` |
-| Meta control plane | Replicate metadata commands, project node-specific desired state, publish leader-scoped Data sessions, admit fresh observations, and expose authenticated administration plus stable cluster readiness | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer`, `meta::ClusterOperator` |
+| Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, prepare and activate a Meta-selected successor, follow the committed owner, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
+| Cluster data plane | Admit, redirect, pause, or refuse requests by Meta-projected slot ownership, failover state, and finite authority; reconcile failover actions and owner following; serve Redis Cluster discovery | `cluster::AuthorityGuard::CaptureAndAdmit` / `RegisterAndRecheck`, `cluster::TopologyCache`, `cluster::NodeControlInstaller`, `cluster::MetaControlClientService` |
+| Meta control plane | Replicate metadata commands, project node-specific desired state, publish leader-scoped Data sessions, reconcile committed failover transitions from fresh observations, and expose authenticated administration plus stable cluster readiness | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer`, `meta::MetaFailoverReconciler` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
 ## Process lifecycle
@@ -149,6 +150,26 @@ evidence, and block accounting before the Redis service advertises readiness.
 The metrics service can exist during startup but receives the same readiness
 state explicitly.
 
+### Meta-managed failover
+
+Each Group may carry one committed `FailoverTransition` beside its current
+topology and authority. A leader-scoped, level-triggered reconciler derives the
+next typed Raft command from that transition plus fresh Data observations, so a
+new Meta leader resumes the same transition without recovering process-local
+workflow state. Controlled failover keeps the current owner and lease while
+Data pauses and drains mutations, catches the chosen replica through a stable
+frontier, and prepares it without opening service. Cutover atomically commits
+the successor owner, grant, action-bound activation identity, and cleared
+transition. Uncontrolled failover fences first, selects the best eligible
+observed compatibility domain, and replaces a failed candidate immediately.
+
+The successor activates its boot-local prepared context only under the matching
+committed grant and finite lease. Subsequent full desired state makes every
+other replica follow the new owner through the existing native continuation or
+full-sync path. A former owner retires its old source history and backlog when
+it consumes that follow-owner relationship; Meta does not orchestrate backlog
+cleanup as another durable phase.
+
 ## Cross-cutting invariants
 
 - Worker-affine mutable state is accessed on its owner worker; cross-worker
@@ -193,9 +214,12 @@ state explicitly.
 - Meta decisions derive from one committed view plus observations accepted by
   the current leader session generation. Observations are never Raft state and
   are purged on role changes or when their committed node, assignment, term,
-  manifest, or partition replication epoch anchor becomes stale. Operation
-  evidence additionally binds committed operation/history state; candidate
-  history is instead checked against the authenticated `ClientHello` session.
+  manifest, or partition replication epoch anchor becomes stale. Failover
+  source-pause, prepared-candidate, and action-failure observations remain
+  independent of the steady-state heartbeat role and are re-reported after a
+  Meta leader change. Operation evidence additionally binds committed
+  operation/history state; candidate history is instead checked against the
+  authenticated `ClientHello` session.
 - Data nodes restore no positive serving authority, desired-state checkpoint,
   or directive outcome from their data files. Each restart begins fenced with
   a new boot identity; only a current Meta session and unexpired in-memory
@@ -234,7 +258,7 @@ those deployment boundaries remain unknown here.
 | Claim | Repository source |
 |---|---|
 | Language level, targets, dependencies, source units, and test entry points | `CMakeLists.txt` |
-| Meta control-plane composition and the NuRaft layering boundary | `CMakeLists.txt`, `app/keylane_meta.cpp`, `include/keylane/meta/`, `src/meta/`, `.gitmodules` |
+| Meta control-plane composition, failover reconciler, and NuRaft layering boundary | `CMakeLists.txt`, `app/keylane_meta.cpp`, `include/keylane/meta/`, `src/meta/`, `.gitmodules` |
 | CLI/config parsing and top-level process entry | `app/keylane.cpp`, `include/keylane/config.h`, `src/config.cpp` |
 | Module construction, worker startup barriers, readiness, and shutdown ordering | `include/keylane/server.h`, `src/redis/server.cpp` |
 | Celer runtime and service dependency | `.gitmodules`, `celer/include/celer/runtime/`, `celer/include/celer/net/`, `celer/src/` |
@@ -243,8 +267,8 @@ those deployment boundaries remain unknown here.
 | Pub/Sub sessions, worker-local registries, fan-out, and bounded output | `include/keylane/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | Transaction boundary | `include/keylane/tx/`, `src/tx/` |
 | Storage boundary and focused lifecycle units | `include/keylane/storage/engine.h`, `include/keylane/storage/format.h`, `src/storage/engine/`, `src/storage/format.cpp` |
-| Replication manager, protocol, Sentinel-visible role state, and log boundary | `include/keylane/replication.h`, `include/keylane/replication_command.h`, `src/replication/`, `src/storage/engine/replication_log.cpp`, `tests/sentinel_e2e_test.cpp` |
-| Cluster topology, authority, node control, and Meta/Data session | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_gate.h`, `src/redis/server.cpp` |
+| Replication manager, cluster failover/follow-owner adapters, protocol, Sentinel-visible role state, and log boundary | `include/keylane/replication.h`, `include/keylane/replication_command.h`, `src/replication/`, `src/storage/engine/replication_log.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/sentinel_e2e_test.cpp` |
+| Cluster topology, authority, controlled mutation pause, node control, and Meta/Data session | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_gate.h`, `src/redis/command.cpp`, `src/redis/blocking_wait.cpp`, `src/redis/server.cpp` |
 | Memory accounting, slow log, command statistics, and Prometheus service | `include/keylane/memory.h`, `src/memory.cpp`, `include/keylane/metrics.h`, `src/metrics.cpp`, `include/keylane/slowlog.h`, `src/redis/slowlog.cpp` |
 | Build, release, and package commands | `scripts/build_debug.sh`, `scripts/build_release.sh`, `scripts/package_release.sh`, `docs/operations/building-and-packaging.md` |
 | Keylane process deployment unit or orchestration manifest | Unknown; `deploy/` contains the monitoring stack, not the Keylane process definition |

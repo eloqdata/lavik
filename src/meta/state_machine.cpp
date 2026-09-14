@@ -4,13 +4,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <optional>
+#include <string>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "keylane/fault_injection.h"
 #include "keylane/meta/cluster_create.h"
 #include "keylane/meta/commands.h"
@@ -24,6 +29,228 @@ namespace keylane::meta {
 namespace {
 
 constexpr uint32_t kSnapshotMagic = 0x4D534E31;  // "MSN1"
+
+template <std::size_t N>
+std::string HexId(const std::array<std::uint8_t, N>& id) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(N * 2);
+  for (const std::uint8_t byte : id) {
+    result.push_back(kHex[byte >> 4]);
+    result.push_back(kHex[byte & 0x0f]);
+  }
+  return result;
+}
+
+bool IsSafeLogTokenByte(std::uint8_t byte) {
+  return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+         (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
+         byte == '.' || byte == ':';
+}
+
+// Failover logs use whitespace-delimited key=value tokens. Percent-encode
+// every byte outside a deliberately small ASCII alphabet so opaque committed
+// identifiers cannot inject fields or record boundaries. '%' is encoded too,
+// making the representation canonical and reversible.
+std::string LogToken(std::string_view value) {
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string result;
+  result.reserve(value.size());
+  for (const char character : value) {
+    const auto byte = static_cast<std::uint8_t>(character);
+    if (IsSafeLogTokenByte(byte)) {
+      result.push_back(character);
+      continue;
+    }
+    result.push_back('%');
+    result.push_back(kHex[byte >> 4]);
+    result.push_back(kHex[byte & 0x0f]);
+  }
+  return result;
+}
+
+struct FailoverCommitLog {
+  std::string message_;
+  bool data_loss_possible_ = false;
+};
+
+// Build the event from the pre-apply aggregate so candidate replacement and
+// domain fallback remain distinguishable after the command overwrites the
+// transition. The line is emitted only if deterministic apply accepts the
+// entry; its fields deliberately mirror the durable audit identifiers.
+std::optional<FailoverCommitLog> DescribeFailoverCommit(
+    const MetaCommand& command, const MetaStores& before,
+    std::uint64_t commit_index) {
+  return std::visit(
+      [&]<typename Command>(
+          const Command& cmd) -> std::optional<FailoverCommitLog> {
+        std::string event;
+        std::string mode;
+        std::string group;
+        std::string transition = "none";
+        std::string action = "none";
+        std::string loss = "pending";
+        std::string detail;
+        bool data_loss_possible = false;
+
+        if constexpr (std::is_same_v<Command, BeginControlledFailover>) {
+          event = "begin";
+          mode = "controlled";
+          group = cmd.group_id_;
+          transition = HexId(cmd.transition_id_);
+          action = HexId(cmd.candidate_action_.action_id_);
+          loss = "none";
+          detail = " candidate=" +
+                   LogToken(cmd.candidate_action_.candidate_.node_id_);
+        } else if constexpr (std::is_same_v<Command,
+                                            BeginUncontrolledFailover>) {
+          event = "begin";
+          mode = "uncontrolled";
+          group = cmd.group_id_;
+          transition = HexId(cmd.transition_id_);
+          if (cmd.candidate_action_.has_value()) {
+            action = HexId(cmd.candidate_action_->action_id_);
+          }
+          loss = "unknown";
+          data_loss_possible = true;
+        } else if constexpr (std::is_same_v<Command,
+                                            SetUncontrolledCandidate>) {
+          mode = "uncontrolled";
+          group = cmd.group_id_;
+          transition = HexId(cmd.expected_transition_.transition_id_);
+          const auto group_before = before.topology_.FindGroup(cmd.group_id_);
+          const MetaFailoverCandidateAction* previous = nullptr;
+          if (group_before.has_value() &&
+              group_before->failover_transition_.has_value() &&
+              group_before->failover_transition_->candidate_action_
+                  .has_value()) {
+            previous = &*group_before->failover_transition_->candidate_action_;
+          }
+          const bool exact_post_effect =
+              cmd.candidate_action_.has_value() && previous != nullptr &&
+              group_before->failover_transition_->transition_id_ ==
+                  cmd.expected_transition_.transition_id_ &&
+              group_before->failover_transition_->revision_ == commit_index &&
+              *previous == *cmd.candidate_action_;
+          if (exact_post_effect) {
+            // Apply accepts the same index against its exact post-state. The
+            // original event depended on the overwritten previous action, so
+            // replay cannot reconstruct it and must not emit a conflicting
+            // selected/fallback/replaced classification at the same index.
+            return std::nullopt;
+          }
+          if (!cmd.candidate_action_.has_value()) {
+            // A fresh clear requires an installed candidate. If none is
+            // visible, this can only become an accepted command through the
+            // exact post-effect replay path; suppress that duplicate event
+            // because the cleared action identity is no longer reconstructible.
+            if (previous == nullptr) return std::nullopt;
+            event = "candidate-cleared";
+            action = HexId(previous->action_id_);
+          } else {
+            action = HexId(cmd.candidate_action_->action_id_);
+            if (previous == nullptr) {
+              event = "candidate-selected";
+            } else if (previous->domain_ != cmd.candidate_action_->domain_) {
+              event = "domain-fallback";
+            } else {
+              event = "candidate-replaced";
+            }
+            detail = absl::StrCat(
+                " source_group_term=",
+                cmd.candidate_action_->domain_.source_group_term_,
+                " candidate=",
+                LogToken(cmd.candidate_action_->candidate_.node_id_));
+          }
+          loss = "unknown";
+          data_loss_possible = true;
+        } else if constexpr (std::is_same_v<Command,
+                                            AuthorizeFailoverPrepare>) {
+          event = "authorize";
+          mode = cmd.loss_if_cutover_ == MetaFailoverLoss::kNone
+                     ? "controlled"
+                     : "uncontrolled";
+          group = cmd.group_id_;
+          transition = HexId(cmd.expected_transition_.transition_id_);
+          action = HexId(cmd.action_id_);
+          loss = cmd.loss_if_cutover_ == MetaFailoverLoss::kNone ? "none"
+                                                                 : "unknown";
+          data_loss_possible = cmd.loss_if_cutover_ != MetaFailoverLoss::kNone;
+        } else if constexpr (std::is_same_v<Command, AbortControlledFailover>) {
+          event = "abort";
+          mode = "controlled";
+          group = cmd.group_id_;
+          if (cmd.expected_transition_.has_value()) {
+            transition = HexId(cmd.expected_transition_->transition_id_);
+            const auto group_before = before.topology_.FindGroup(cmd.group_id_);
+            if (!group_before.has_value() ||
+                !group_before->failover_transition_.has_value() ||
+                group_before->failover_transition_->transition_id_ !=
+                    cmd.expected_transition_->transition_id_ ||
+                group_before->failover_transition_->revision_ !=
+                    cmd.expected_transition_->revision_ ||
+                group_before->failover_transition_->mode_ !=
+                    MetaFailoverMode::kControlled ||
+                !group_before->failover_transition_->candidate_action_
+                     .has_value()) {
+              // A post-Begin Abort clears the transition that supplied its
+              // action id. Exact replay is accepted against that post-state,
+              // but emitting action=none would conflict with the original
+              // event at the same commit index.
+              return std::nullopt;
+            }
+            action = HexId(group_before->failover_transition_->candidate_action_
+                               ->action_id_);
+          }
+          loss = "none";
+          detail = " reason=" + LogToken(cmd.reason_);
+        } else if constexpr (std::is_same_v<Command,
+                                            DegradeControlledFailover>) {
+          event = "degrade";
+          mode = "uncontrolled";
+          group = cmd.group_id_;
+          transition = HexId(cmd.expected_transition_.transition_id_);
+          if (cmd.expected_candidate_action_.has_value()) {
+            action = HexId(cmd.expected_candidate_action_->action_id_);
+          }
+          loss = cmd.retain_candidate_action_ ? "none" : "unknown";
+          data_loss_possible = !cmd.retain_candidate_action_;
+          detail = " reason=" + LogToken(cmd.reason_);
+        } else if constexpr (std::is_same_v<Command,
+                                            CommitControlledFailover>) {
+          event = "cutover";
+          mode = "controlled";
+          group = cmd.group_id_;
+          transition = HexId(cmd.expected_transition_.transition_id_);
+          action = HexId(cmd.action_id_);
+          loss = "none";
+          detail = " candidate=" + LogToken(cmd.expected_candidate_.node_id_);
+        } else if constexpr (std::is_same_v<Command,
+                                            CommitUncontrolledFailover>) {
+          event = "cutover";
+          mode = "uncontrolled";
+          group = cmd.group_id_;
+          transition = HexId(cmd.expected_transition_.transition_id_);
+          action = HexId(cmd.action_id_);
+          loss = cmd.loss_if_cutover_ == MetaFailoverLoss::kNone ? "none"
+                                                                 : "unknown";
+          data_loss_possible = cmd.loss_if_cutover_ != MetaFailoverLoss::kNone;
+          detail = " candidate=" + LogToken(cmd.expected_candidate_.node_id_);
+        } else {
+          return std::nullopt;
+        }
+
+        return FailoverCommitLog{
+            .message_ = absl::StrCat("failover event=", event, " mode=", mode,
+                                     " group=", LogToken(group),
+                                     " transition=", transition,
+                                     " action=", action, " loss=", loss,
+                                     " commit_index=", commit_index, detail),
+            .data_loss_possible_ = data_loss_possible,
+        };
+      },
+      command);
+}
 
 void PutLe32(std::vector<uint8_t>& out, uint32_t value) {
   out.push_back(static_cast<uint8_t>(value));
@@ -228,8 +455,7 @@ MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {
   view.topology_epoch_ = stores_.topology_.TopologyEpoch();
   view.cluster_lifecycle_ = stores_.topology_.ClusterLifecycle();
   view.cluster_non_pristine_ =
-      view.cluster_lifecycle_.state_ ==
-          MetaClusterLifecycle::kUninitialized &&
+      view.cluster_lifecycle_.state_ == MetaClusterLifecycle::kUninitialized &&
       HasDataClusterArtifacts(stores_);
   view.active_cluster_create_operation_ =
       view.cluster_lifecycle_.state_ == MetaClusterLifecycle::kCreating;
@@ -329,8 +555,10 @@ nuraft::ptr<nuraft::buffer> MetaStateMachine::commit(nuraft::ulong log_idx,
   const ActorContext actor =
       std::visit([](const auto& cmd) { return cmd.actor_; }, *decoded);
   MetaApplyResult applied;
+  std::optional<FailoverCommitLog> failover_log;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    failover_log = DescribeFailoverCommit(*decoded, stores_, log_idx);
     applied = ApplyCommitted(stores_, log_idx, *decoded, actor.principal_,
                              actor.readable_time_);
     // Publish the cursor while the same state lock still protects the effects
@@ -353,6 +581,14 @@ nuraft::ptr<nuraft::buffer> MetaStateMachine::commit(nuraft::ulong log_idx,
     std::lock_guard<std::mutex> sink_lock(sink_mutex_);
     if (commit_event_sink_) {
       commit_event_sink_(log_idx, applied);
+    }
+  }
+  if (failover_log.has_value() &&
+      applied.verdict_ == MetaAuditVerdict::kAccepted) {
+    if (failover_log->data_loss_possible_) {
+      spdlog::warn("{}", failover_log->message_);
+    } else {
+      spdlog::info("{}", failover_log->message_);
     }
   }
   const std::string completion = EncodeMetaApplyResult(applied);

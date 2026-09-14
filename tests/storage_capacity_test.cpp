@@ -3,12 +3,118 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "../src/storage/engine/impl.h"
+#include "celer/net/server.h"
+#include "keylane/memory.h"
+#include "keylane/metrics.h"
 #include "keylane/storage/engine.h"
+#include "keylane/tx/tx_shard.h"
+
+namespace keylane::storage {
+
+class ExpirationAuthorityTestPeer {
+ public:
+  static std::shared_ptr<const void> CurrentGrant(
+      const StorageEngine& storage) {
+    return std::static_pointer_cast<const void>(
+        storage.impl_->active_expiration_authority_.load(
+            std::memory_order_acquire));
+  }
+
+  static bool IsCancellation(const absl::Status& status) {
+    return StorageEngine::Impl::IsExpirationAuthorityCancellation(status);
+  }
+
+  static absl::Status RevokedGrantStatus() {
+    StorageEngine::Impl::ExpirationAuthorityGrant grant(
+        std::chrono::nanoseconds::max());
+    grant.active_.store(false, std::memory_order_release);
+    return StorageEngine::Impl::ValidateExpirationAuthority(&grant);
+  }
+
+  static absl::Status VerifyStaleQueueBudget(StorageEngine& storage) {
+    auto* impl = storage.impl_.get();
+    auto& store = impl->CurrentStore();
+    if (!store.expired_candidates_.empty()) {
+      return absl::FailedPreconditionError(
+          "stale queue test did not start with an empty queue");
+    }
+    auto stale = impl->CurrentExpirationAuthority();
+    if (stale == nullptr) {
+      return absl::FailedPreconditionError(
+          "stale queue test has no initial authority");
+    }
+    absl::Status replaced = storage.SetExpirationAuthorityUntil(
+        std::chrono::nanoseconds::max() - std::chrono::nanoseconds(1));
+    if (!replaced.ok()) return replaced;
+    auto current = impl->CurrentExpirationAuthority();
+    if (current == nullptr || current == stale) {
+      return absl::FailedPreconditionError(
+          "stale queue test did not replace its exact authority");
+    }
+    constexpr std::size_t kStaleCount = 2;
+    for (std::size_t index = 0; index < kStaleCount; ++index) {
+      StorageEngine::Impl::WorkerStore::ExpireCandidate candidate;
+      candidate.expiration_authority_ = stale;
+      store.expired_candidates_.push_back(std::move(candidate));
+    }
+    StorageEngine::Impl::WorkerStore::ExpireCandidate candidate;
+    candidate.expiration_authority_ = current;
+    store.expired_candidates_.push_back(std::move(candidate));
+
+    if (impl->DiscardStaleExpirationCandidates(store, 0) != 0 ||
+        store.expired_candidates_.size() != kStaleCount + 1) {
+      store.expired_candidates_.clear();
+      return absl::FailedPreconditionError(
+          "zero remaining budget consumed a stale expiration candidate");
+    }
+    const std::size_t first = impl->DiscardStaleExpirationCandidates(store, 1);
+    const bool retained_stale =
+        store.expired_candidates_.size() == kStaleCount &&
+        store.expired_candidates_.front().expiration_authority_ == stale;
+    const std::size_t second = impl->DiscardStaleExpirationCandidates(store, 1);
+    const bool preserved_current =
+        store.expired_candidates_.size() == 1 &&
+        store.expired_candidates_.front().expiration_authority_ == current;
+    store.expired_candidates_.clear();
+    if (first != 1 || !retained_stale || second != 1 || !preserved_current) {
+      return absl::FailedPreconditionError(
+          "stale exact grants did not consume the candidate budget");
+    }
+    return absl::OkStatus();
+  }
+
+#if KEYLANE_FAULTS_ENABLED
+  using Point = StorageEngine::Impl::ExpirationTestPoint;
+  using Hook = StorageEngine::Impl::ExpirationTestHook;
+
+  static void SetHook(StorageEngine& storage, Hook hook) {
+    storage.impl_->expiration_test_hook_ = std::move(hook);
+  }
+
+  static celer::Task<absl::Status> ResumeAndExpireFront(
+      StorageEngine& storage) {
+    auto& store = storage.impl_->CurrentStore();
+    if (store.expired_candidates_.empty()) {
+      co_return absl::NotFoundError("no queued expiration candidate");
+    }
+    auto candidate = std::move(store.expired_candidates_.front());
+    store.expired_candidates_.pop_front();
+    storage.impl_->ResumeExpiration();
+    co_return co_await storage.impl_->ExpireCandidate(store,
+                                                      std::move(candidate));
+  }
+#endif
+};
+
+}  // namespace keylane::storage
 
 namespace {
 
@@ -37,7 +143,7 @@ bool GrowFile(const std::string& path, std::uint64_t bytes) {
 }
 
 std::uint64_t FileSize(const std::string& path) {
-  struct stat info {};
+  struct stat info{};
   return ::stat(path.c_str(), &info) == 0
              ? static_cast<std::uint64_t>(info.st_size)
              : 0;
@@ -61,6 +167,230 @@ struct Cleanup {
   }
 };
 
+constexpr std::chrono::nanoseconds FarFutureExpirationDeadline() {
+  // Permanent authority is represented by max(); max()-1 remains a finite
+  // capability without making deterministic tests depend on wall scheduling.
+  return std::chrono::nanoseconds::max() - std::chrono::nanoseconds(1);
+}
+
+class FiniteExpirationAuthorityService final : public celer::Service {
+ public:
+  FiniteExpirationAuthorityService(keylane::storage::StorageEngine* storage,
+                                   celer::Server* server)
+      : storage_(storage), server_(server) {}
+
+  void Prepare(unsigned thread_count) override {
+    if (thread_count != 1) {
+      result_ = absl::FailedPreconditionError(
+          "finite expiration authority test requires one worker");
+    }
+  }
+
+  celer::Task<absl::Status> Run(celer::Worker& worker,
+                                celer::ServiceContext) override {
+    keylane::BindMemoryAccountingShard(worker.id());
+    keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
+    result_ = co_await storage_->InitializeWorker(worker);
+    if (!result_.ok()) co_return Finish();
+
+    result_ = co_await storage_->QuiesceExpiration();
+    if (!result_.ok()) co_return Finish();
+    expiration_paused_ = true;
+
+    result_ =
+        storage_->SetExpirationAuthorityUntil(FarFutureExpirationDeadline());
+    if (!result_.ok()) co_return Finish();
+    const absl::Status tomb_raider = co_await storage_->ConfigureTombRaider(
+        keylane::storage::TombRaiderConfigUpdate{
+            .action_ = keylane::storage::TombRaiderConfigAction::kInterval,
+            .value_ = 60'000});
+    if (tomb_raider.code() != absl::StatusCode::kFailedPrecondition) {
+      result_ = absl::FailedPreconditionError(
+          "finite active-expiration authority changed Tomb Raider admission");
+      co_return Finish();
+    }
+    // Cancellation cleanup obeys the same per-cycle work budget as actual and
+    // failed deletion attempts; a zero remaining budget is a strict no-op.
+    result_ =
+        keylane::storage::ExpirationAuthorityTestPeer::VerifyStaleQueueBudget(
+            *storage_);
+    if (!result_.ok()) co_return Finish();
+    result_ =
+        storage_->SetExpirationAuthorityUntil(FarFutureExpirationDeadline());
+    if (!result_.ok()) co_return Finish();
+#if KEYLANE_FAULTS_ENABLED
+    result_ = co_await ExerciseDurableFinalPrecondition();
+    if (!result_.ok()) co_return Finish();
+    result_ = co_await ExerciseUnrelatedDurableFailure();
+    if (!result_.ok()) co_return Finish();
+    result_ = co_await ExerciseDiskFullFallbackPrecondition();
+    if (!result_.ok()) co_return Finish();
+    result_ = co_await ExerciseCurrentGrant();
+#endif
+    co_return Finish();
+  }
+
+  void Stop() noexcept override {}
+
+  void FinalizeWorker(celer::Worker& worker) noexcept override {
+    storage_->FinalizeWorker(worker);
+  }
+
+  const absl::Status& result() const noexcept { return result_; }
+
+ private:
+  celer::Task<absl::Status> SeedExpired(std::string_view key) {
+    auto seeded = co_await storage_->Set(
+        0, key, "value", keylane::storage::SetOptions{.expire_at_ms_ = 1});
+    if (!seeded.ok()) co_return seeded.status();
+    co_return co_await QueueExpired(key);
+  }
+
+#if KEYLANE_FAULTS_ENABLED
+  celer::Task<absl::Status> ExerciseDurableFinalPrecondition() {
+    constexpr std::string_view kKey = "expiration-final-{foo}";
+    absl::Status prepared = co_await SeedExpired(kKey);
+    if (!prepared.ok()) co_return prepared;
+    bool reached_final_append = false;
+    keylane::storage::ExpirationAuthorityTestPeer::SetHook(
+        *storage_, [&](auto point) -> std::optional<absl::Status> {
+          if (point == keylane::storage::ExpirationAuthorityTestPeer::Point::
+                           kBeforeDurableAppend) {
+            reached_final_append = true;
+            storage_->SetExpirationAuthority(false);
+          }
+          return std::nullopt;
+        });
+    expiration_paused_ = false;
+    const absl::Status expired = co_await keylane::storage::
+        ExpirationAuthorityTestPeer::ResumeAndExpireFront(*storage_);
+    keylane::storage::ExpirationAuthorityTestPeer::SetHook(*storage_, {});
+    absl::Status paused = co_await storage_->QuiesceExpiration();
+    expiration_paused_ = paused.ok();
+    if (!paused.ok()) co_return paused;
+    if (!expired.ok() || !reached_final_append || storage_->LocalSize(0) != 1) {
+      co_return absl::FailedPreconditionError(
+          "revocation at the durable publication cut was not cancelled");
+    }
+    co_return storage_->SetExpirationAuthorityUntil(
+        FarFutureExpirationDeadline());
+  }
+
+  celer::Task<absl::Status> ExerciseUnrelatedDurableFailure() {
+    constexpr std::string_view kKey = "expiration-internal-{foo}";
+    absl::Status prepared = co_await SeedExpired(kKey);
+    if (!prepared.ok()) co_return prepared;
+    bool injected = false;
+    keylane::storage::ExpirationAuthorityTestPeer::SetHook(
+        *storage_, [&](auto point) -> std::optional<absl::Status> {
+          if (point != keylane::storage::ExpirationAuthorityTestPeer::Point::
+                           kBeforeDurableAppend) {
+            return std::nullopt;
+          }
+          injected = true;
+          storage_->SetExpirationAuthority(false);
+          return absl::InternalError("injected unrelated append failure");
+        });
+    expiration_paused_ = false;
+    const absl::Status expired = co_await keylane::storage::
+        ExpirationAuthorityTestPeer::ResumeAndExpireFront(*storage_);
+    keylane::storage::ExpirationAuthorityTestPeer::SetHook(*storage_, {});
+    absl::Status paused = co_await storage_->QuiesceExpiration();
+    expiration_paused_ = paused.ok();
+    if (!paused.ok()) co_return paused;
+    if (!injected || expired.code() != absl::StatusCode::kInternal ||
+        storage_->LocalSize(0) != 2) {
+      co_return absl::FailedPreconditionError(
+          "authority revocation swallowed an unrelated append failure");
+    }
+    co_return storage_->SetExpirationAuthorityUntil(
+        FarFutureExpirationDeadline());
+  }
+
+  celer::Task<absl::Status> ExerciseDiskFullFallbackPrecondition() {
+    constexpr std::string_view kKey = "expiration-fallback-{foo}";
+    absl::Status prepared = co_await SeedExpired(kKey);
+    if (!prepared.ok()) co_return prepared;
+    bool forced_disk_full = false;
+    bool reached_fallback = false;
+    keylane::storage::ExpirationAuthorityTestPeer::SetHook(
+        *storage_, [&](auto point) -> std::optional<absl::Status> {
+          using Point = keylane::storage::ExpirationAuthorityTestPeer::Point;
+          if (point == Point::kBeforeDurableAppend) {
+            forced_disk_full = true;
+            return absl::ResourceExhaustedError("injected full device");
+          }
+          reached_fallback = true;
+          storage_->SetExpirationAuthority(false);
+          return std::nullopt;
+        });
+    expiration_paused_ = false;
+    const absl::Status expired = co_await keylane::storage::
+        ExpirationAuthorityTestPeer::ResumeAndExpireFront(*storage_);
+    keylane::storage::ExpirationAuthorityTestPeer::SetHook(*storage_, {});
+    absl::Status paused = co_await storage_->QuiesceExpiration();
+    expiration_paused_ = paused.ok();
+    if (!paused.ok()) co_return paused;
+    if (!expired.ok() || !forced_disk_full || !reached_fallback ||
+        storage_->LocalSize(0) != 3) {
+      co_return absl::FailedPreconditionError(
+          "disk-full fallback did not recheck exact expiration authority");
+    }
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> ExerciseCurrentGrant() {
+    constexpr std::string_view kKey = "expiration-current-{foo}";
+    absl::Status granted =
+        storage_->SetExpirationAuthorityUntil(FarFutureExpirationDeadline());
+    if (!granted.ok()) co_return granted;
+    absl::Status prepared = co_await SeedExpired(kKey);
+    if (!prepared.ok()) co_return prepared;
+    expiration_paused_ = false;
+    const absl::Status expired = co_await keylane::storage::
+        ExpirationAuthorityTestPeer::ResumeAndExpireFront(*storage_);
+    absl::Status paused = co_await storage_->QuiesceExpiration();
+    expiration_paused_ = paused.ok();
+    if (!paused.ok()) co_return paused;
+    if (!expired.ok() || storage_->LocalSize(0) != 3) {
+      co_return absl::FailedPreconditionError(
+          "candidate carrying the current grant was not expired");
+    }
+    co_return absl::OkStatus();
+  }
+#endif
+
+  celer::Task<absl::Status> QueueExpired(std::string_view key) {
+    auto result = co_await storage_->Get(0, key);
+    if (result.ok() || result.status().code() != absl::StatusCode::kNotFound) {
+      co_return absl::FailedPreconditionError(
+          "expired candidate was not logically absent");
+    }
+    co_return absl::OkStatus();
+  }
+
+  absl::Status Finish() {
+#if KEYLANE_FAULTS_ENABLED
+    keylane::storage::ExpirationAuthorityTestPeer::SetHook(*storage_, {});
+#endif
+    ResumeExpiration();
+    server_->RequestStop();
+    return result_;
+  }
+
+  void ResumeExpiration() {
+    if (!expiration_paused_) return;
+    storage_->ResumeExpiration();
+    expiration_paused_ = false;
+  }
+
+  keylane::storage::StorageEngine* storage_ = nullptr;
+  celer::Server* server_ = nullptr;
+  bool expiration_paused_ = false;
+  absl::Status result_ =
+      absl::UnknownError("finite expiration authority test did not run");
+};
+
 }  // namespace
 
 TEST(StorageEngineRuntimeFailureTest,
@@ -73,6 +403,95 @@ TEST(StorageEngineRuntimeFailureTest,
 
   EXPECT_TRUE(engine.ReplicaRecoveryFenced());
   EXPECT_TRUE(engine.RuntimeFailureLatched());
+}
+
+TEST(StorageExpirationAuthorityTest, RejectsElapsedFiniteAuthority) {
+  keylane::storage::StorageEngine engine({});
+
+  const absl::Status status =
+      engine.SetExpirationAuthorityUntil(std::chrono::nanoseconds::zero());
+
+  EXPECT_EQ(status.code(), absl::StatusCode::kDeadlineExceeded);
+}
+
+TEST(StorageExpirationAuthorityTest,
+     RecognizesOnlyMarkedAuthorityCancellation) {
+  const absl::Status cancelled =
+      keylane::storage::ExpirationAuthorityTestPeer::RevokedGrantStatus();
+
+  EXPECT_TRUE(
+      keylane::storage::ExpirationAuthorityTestPeer::IsCancellation(cancelled));
+  EXPECT_FALSE(keylane::storage::ExpirationAuthorityTestPeer::IsCancellation(
+      absl::InternalError("unrelated storage failure")));
+  EXPECT_FALSE(keylane::storage::ExpirationAuthorityTestPeer::IsCancellation(
+      absl::DataLossError("unrelated storage corruption")));
+  EXPECT_FALSE(keylane::storage::ExpirationAuthorityTestPeer::IsCancellation(
+      absl::FailedPreconditionError("unmarked precondition")));
+}
+
+TEST(StorageExpirationAuthorityTest, LegacyPermanentGrantIsIdempotent) {
+  keylane::storage::StorageEngineOptions options;
+  options.expiration_authority_ = false;
+  keylane::storage::StorageEngine engine(std::move(options));
+
+  engine.SetExpirationAuthority(true);
+  auto first =
+      keylane::storage::ExpirationAuthorityTestPeer::CurrentGrant(engine);
+  ASSERT_NE(first, nullptr);
+  engine.SetExpirationAuthority(true);
+  auto repeated =
+      keylane::storage::ExpirationAuthorityTestPeer::CurrentGrant(engine);
+
+  EXPECT_EQ(first.get(), repeated.get());
+
+  engine.SetExpirationAuthority(false);
+  engine.SetExpirationAuthority(true);
+  auto reenabled =
+      keylane::storage::ExpirationAuthorityTestPeer::CurrentGrant(engine);
+  EXPECT_NE(first.get(), reenabled.get());
+
+  ASSERT_TRUE(
+      engine.SetExpirationAuthorityUntil(FarFutureExpirationDeadline()).ok());
+  auto finite =
+      keylane::storage::ExpirationAuthorityTestPeer::CurrentGrant(engine);
+  engine.SetExpirationAuthority(true);
+  auto permanent =
+      keylane::storage::ExpirationAuthorityTestPeer::CurrentGrant(engine);
+  EXPECT_NE(finite.get(), permanent.get());
+}
+
+TEST(StorageExpirationAuthorityTest,
+     FiniteAuthorityIsExactCancellableAndIndependentOfTombRaider) {
+  const std::string path =
+      (std::filesystem::temp_directory_path() /
+       ("keylane-expiration-authority-" + std::to_string(::getpid()) + ".data"))
+          .string();
+  Cleanup cleanup{{path}};
+  ASSERT_CHECK(CreateFile(path, 96 * kMiB),
+               "failed to create expiration-authority storage file");
+
+  keylane::storage::StorageEngineOptions options;
+  options.data_files_ = {path};
+  options.buffers_.registered_bytes_ = 64 * kMiB;
+  options.expiration_authority_ = false;
+  options.tomb_raider_interval_ms_ = 0;
+  options.tx_cleaner_cooldown_ms_ = 0;
+  keylane::storage::StorageEngine storage(std::move(options));
+  keylane::InitWorkerMetrics(1);
+  ASSERT_TRUE(keylane::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(storage.Prepare(1).ok());
+  keylane::tx::TxRuntime::Create(1);
+
+  celer::Server server;
+  FiniteExpirationAuthorityService service(&storage, &server);
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result().ok()) << service.result();
 }
 
 TEST(StorageCapacityTest, ValidatesAndPreservesDeviceCapacities) {

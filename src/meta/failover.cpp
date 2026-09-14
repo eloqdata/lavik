@@ -1,18 +1,18 @@
 #include "keylane/meta/failover.h"
 
 #include <algorithm>
-#include <array>
-#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "keylane/cluster/control_protocol.h"
+#include "keylane/meta/candidate_plan.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/encoding.h"
 #include "keylane/meta/hash.h"
@@ -20,39 +20,8 @@
 namespace keylane::meta {
 namespace {
 
-constexpr std::string_view kIntentMagic = "KLFI";
-constexpr std::string_view kPhaseMagic = "KLFP";
+constexpr std::string_view kOperationIntentMagic = "KLFO";
 constexpr std::uint16_t kFailoverSchemaVersion = 1;
-constexpr std::uint32_t kMaxFailoverFlowCount = 1024;
-
-int64_t UnixMillisNow() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
-std::optional<FailoverPhaseStage> NextPreparationStage(
-    FailoverPhaseStage stage) {
-  switch (stage) {
-    case FailoverPhaseStage::kOldAuthorityExcluded:
-      return FailoverPhaseStage::kCandidateCaughtUp;
-    case FailoverPhaseStage::kCandidateCaughtUp:
-      return FailoverPhaseStage::kPromotionPreparing;
-    case FailoverPhaseStage::kPromotionPreparing:
-      return FailoverPhaseStage::kPromotionPrepared;
-    case FailoverPhaseStage::kPromotionPrepared:
-    case FailoverPhaseStage::kAuthorityActivated:
-    case FailoverPhaseStage::kServing:
-      return std::nullopt;
-  }
-  return std::nullopt;
-}
-
-template <std::size_t N>
-bool IsZero(const std::array<std::uint8_t, N>& value) {
-  return std::all_of(value.begin(), value.end(),
-                     [](std::uint8_t byte) { return byte == 0; });
-}
 
 absl::Status Invalid(std::string_view message) {
   return MetaDomainRejectError(message);
@@ -62,65 +31,21 @@ absl::Status Corrupt(std::string_view message) {
   return MetaFailStopError(message);
 }
 
-void WriteHeader(MetaWriter& writer, std::string_view magic) {
-  writer.WriteRaw(magic);
+void WriteHeader(MetaWriter& writer) {
+  writer.WriteRaw(kOperationIntentMagic);
   writer.WriteU16(kFailoverSchemaVersion);
 }
 
-absl::Status ReadHeader(MetaReader& reader, std::string_view magic) {
-  auto actual = reader.ReadRaw(magic.size());
-  if (!actual.ok()) return actual.status();
-  if (*actual != magic) return Corrupt("unknown failover blob magic");
+absl::Status ReadHeader(MetaReader& reader) {
+  auto magic = reader.ReadRaw(kOperationIntentMagic.size());
+  if (!magic.ok()) return magic.status();
+  if (*magic != kOperationIntentMagic) {
+    return Corrupt("unknown failover blob magic");
+  }
   auto version = reader.ReadU16();
   if (!version.ok()) return version.status();
   if (*version != kFailoverSchemaVersion) {
     return Corrupt("unknown failover blob version");
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidateIntent(const FailoverIntent& intent) {
-  if (intent.group_id_.empty() ||
-      intent.group_id_.size() > kMaxMetaGroupIdBytes ||
-      !cluster::control::IsCanonicalIdentity160(
-          intent.former_owner_node_id_) ||
-      !cluster::control::IsCanonicalIdentity160(intent.candidate_node_id_) ||
-      intent.former_owner_node_id_ == intent.candidate_node_id_ ||
-      IsZero(intent.former_owner_assignment_id_) ||
-      IsZero(intent.former_owner_boot_id_) ||
-      IsZero(intent.candidate_assignment_id_) ||
-      IsZero(intent.candidate_boot_id_) || intent.group_term_ == 0 ||
-      intent.authority_version_ == 0 || intent.grant_revision_ == 0 ||
-      intent.population_manifest_revision_ == 0 ||
-      IsZero(intent.population_manifest_digest_) ||
-      intent.partition_replication_epoch_ == 0 ||
-      IsZero(intent.parent_history_id_)) {
-    return Invalid("failover intent identity is incomplete");
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidatePhase(const FailoverPhase& phase) {
-  const auto stage = static_cast<std::uint8_t>(phase.stage_);
-  if (stage < 1 || stage > 6 ||
-      IsZero(phase.old_authority_exclusion_hash_)) {
-    return Invalid("failover phase identity is incomplete");
-  }
-  const bool has_frontier = !phase.required_applied_next_lsns_.empty();
-  if (phase.required_applied_next_lsns_.size() > kMaxFailoverFlowCount ||
-      std::any_of(phase.required_applied_next_lsns_.begin(),
-                  phase.required_applied_next_lsns_.end(),
-                  [](std::uint64_t cursor) { return cursor == 0; })) {
-    return Invalid("failover phase frontier is invalid");
-  }
-  if (stage == 1 && (has_frontier || !IsZero(phase.prepared_result_hash_))) {
-    return Invalid("old-authority-excluded phase carries future evidence");
-  }
-  if (stage >= 2 && !has_frontier) {
-    return Invalid("failover phase is missing the catch-up frontier");
-  }
-  if ((stage < 4) != IsZero(phase.prepared_result_hash_)) {
-    return Invalid("failover phase has an inconsistent prepared result hash");
   }
   return absl::OkStatus();
 }
@@ -130,422 +55,488 @@ absl::Status DecodeValidation(absl::Status status) {
   return Corrupt(status.message());
 }
 
-template <std::size_t N>
-std::string Hex(const std::array<std::uint8_t, N>& bytes) {
-  constexpr std::string_view kHex = "0123456789abcdef";
-  std::string result(bytes.size() * 2, '\0');
-  for (std::size_t i = 0; i < bytes.size(); ++i) {
-    result[i * 2] = kHex[bytes[i] >> 4];
-    result[i * 2 + 1] = kHex[bytes[i] & 0x0f];
-  }
-  return result;
+bool IsZero(const MetaReplicationHistoryId& history) {
+  return std::ranges::all_of(history,
+                             [](std::uint8_t byte) { return byte == 0; });
 }
 
-absl::Status ValidateCommittedAnchors(const FailoverIntent& intent,
-                                      const MetaCommittedView& view) {
-  const auto group = view.topology().FindGroup(intent.group_id_);
-  const auto grant = view.grant().GroupState(intent.group_id_);
-  if (!group.has_value() || !grant.has_value() || !grant->fenced_ ||
-      grant->grant_.has_value() ||
-      grant->group_term_ != intent.group_term_ ||
-      grant->last_authority_version_ != intent.authority_version_ ||
-      grant->last_grant_revision_ != intent.grant_revision_ ||
-      group->record_.owner_ != intent.former_owner_node_id_ ||
-      group->record_.group_term_ != intent.group_term_ ||
-      group->record_.authority_version_ != intent.authority_version_ ||
-      group->record_.population_manifest_revision_ !=
-          intent.population_manifest_revision_ ||
-      group->record_.population_manifest_digest_ !=
-          intent.population_manifest_digest_ ||
-      group->record_.partition_replication_epoch_ !=
-          intent.partition_replication_epoch_) {
-    return Invalid(
-        "failover anchors do not match the committed fenced group state");
+const MetaOperationId* GenericOperationId(const MetaCommand& command) {
+  if (const auto* phase = std::get_if<TransitionOperationPhase>(&command)) {
+    return &phase->operation_id_;
   }
-  const auto member_matches = [&](std::string_view node_id,
-                                  const MetaAssignmentId& assignment) {
-    return std::any_of(group->members_.begin(), group->members_.end(),
-                       [&](const MetaGroupMember& member) {
-                         return member.node_id_ == node_id &&
-                                member.assignment_id_ == assignment;
-                       });
-  };
-  if (!member_matches(intent.former_owner_node_id_,
-                      intent.former_owner_assignment_id_) ||
-      !member_matches(intent.candidate_node_id_,
-                      intent.candidate_assignment_id_)) {
-    return Invalid("failover member assignment is stale");
+  if (const auto* complete = std::get_if<CompleteOperation>(&command)) {
+    return &complete->operation_id_;
   }
-  return absl::OkStatus();
+  if (const auto* abort = std::get_if<AbortOperation>(&command)) {
+    return &abort->operation_id_;
+  }
+  return nullptr;
 }
 
-absl::Status ValidatePreparingDirective(
-    const MetaDirectiveSpec& directive, const FailoverIntent& intent,
-    const FailoverPhase& phase) {
-  if (directive.kind_ != "promotion-prepare" ||
-      directive.recipient_node_id_ != intent.candidate_node_id_ ||
-      directive.target_node_id_ != intent.candidate_node_id_ ||
-      directive.target_boot_id_ != intent.candidate_boot_id_ ||
-      directive.assignment_id_ != intent.candidate_assignment_id_ ||
-      directive.source_node_id_ != intent.former_owner_node_id_ ||
-      directive.source_assignment_id_ !=
-          intent.former_owner_assignment_id_ ||
-      directive.source_boot_id_ != intent.former_owner_boot_id_ ||
-      directive.source_replication_history_id_ != intent.parent_history_id_ ||
-      directive.group_id_ != intent.group_id_ ||
-      directive.group_term_ != intent.group_term_ ||
-      directive.authority_version_ != intent.authority_version_ ||
-      directive.grant_revision_ != intent.grant_revision_ ||
-      directive.population_manifest_revision_ !=
-          intent.population_manifest_revision_ ||
-      directive.population_manifest_digest_ !=
-          intent.population_manifest_digest_ ||
-      directive.partition_replication_epoch_ !=
-          intent.partition_replication_epoch_ ||
-      !directive.storage_mutating_ || directive.force_) {
-    return Invalid("promotion-prepare directive changed failover anchors");
+absl::StatusOr<MetaCandidateProgressObs> ExactCandidateProgress(
+    std::string_view group_id, const MetaFailoverCandidateAction& action,
+    const MetaCommittedFacts& facts, const MetaObservationStore& observations,
+    std::int64_t now_unix_ms, bool action_is_committed) {
+  if (now_unix_ms < 0) {
+    return Invalid("failover proposal time is invalid");
   }
-  auto request = cluster::control::DecodePromotionPrepareRequest(
-      directive.payload_);
-  auto preconditions =
-      cluster::control::DecodePromotionPreparePreconditions(
-          directive.preconditions_);
-  if (!request.ok() || !preconditions.ok() ||
-      request->parent_history_id != Hex(intent.parent_history_id_) ||
-      request->required_applied_next_lsns !=
-          phase.required_applied_next_lsns_ ||
-      preconditions->excluded_group_term != intent.group_term_ ||
-      preconditions->old_authority_exclusion_hash !=
-          phase.old_authority_exclusion_hash_) {
-    return Invalid("promotion-prepare payload or preconditions are stale");
+  const auto session = observations.SessionStateFor(action.candidate_.node_id_);
+  if (!session.has_value() || !session->connected_ ||
+      session->current_boot_id_ != action.candidate_.boot_id_) {
+    return Invalid("failover candidate session is absent or replaced");
   }
-  return absl::OkStatus();
-}
-
-const MetaTerminalReceipt* FindSuccessfulReceipt(
-    const MetaOperationRecord& operation,
-    const MetaCurrentDirective& directive) {
-  const auto found = std::find_if(
-      operation.terminal_receipts_.begin(), operation.terminal_receipts_.end(),
-      [&](const MetaTerminalReceipt& receipt) {
-        return receipt.key_.operation_id_ == operation.operation_id_ &&
-               receipt.key_.directive_id_ == directive.spec_.directive_id_ &&
-               receipt.key_.attempt_id_ == directive.spec_.attempt_id_ &&
-               receipt.key_.directive_revision_ ==
-                   directive.directive_revision_ &&
-               receipt.status_ == MetaDirectiveResultStatus::kSucceeded;
+  // A disconnect before Begin/Set does not poison a newly allocated action:
+  // current-session progress is the observation from which that action is
+  // created. Once the action is committed, however, same-boot generic progress
+  // cannot erase an observed disconnect and revive the old action.
+  if (action_is_committed && session->disconnected_boot_id_ ==
+                                 std::optional(action.candidate_.boot_id_)) {
+    return Invalid("failover candidate action was disconnected");
+  }
+  const auto candidates =
+      observations.LiveCandidateProgressFor(group_id, facts, now_unix_ms);
+  const auto candidate = std::ranges::find_if(
+      candidates, [&](const MetaCandidateProgressObs& progress) {
+        return progress.node_id_ == action.candidate_.node_id_ &&
+               progress.assignment_id_ == action.candidate_.assignment_id_ &&
+               progress.boot_incarnation_ == action.candidate_.boot_id_ &&
+               progress.session_generation_ == session->current_generation_ &&
+               CandidateCompatibilityDomain(progress) == action.domain_;
       });
-  return found == operation.terminal_receipts_.end() ? nullptr : &*found;
+  if (candidate == candidates.end()) {
+    return Invalid(
+        "failover candidate progress is expired or incompatible with the "
+        "action");
+  }
+  return *candidate;
 }
 
-absl::Status ValidatePreparedTransition(
-    const TransitionOperationPhase& transition,
-    const MetaOperationRecord& operation, const FailoverIntent& intent,
-    const FailoverPhase& phase, const MetaCommittedView& view,
-    const MetaObservationStore& observations) {
-  if (!transition.current_directives_.empty() ||
-      transition.evidence_.size() != 1 ||
-      operation.current_directives_.size() != 1) {
+absl::Status RequireExactCurrentSource(
+    std::string_view group_id, const MetaFailoverCompatibilityDomain& domain,
+    const MetaCommittedFacts& facts, const MetaObservationStore& observations,
+    std::int64_t now_unix_ms) {
+  const auto session = observations.SessionStateFor(domain.source_node_id_);
+  if (!session.has_value() || !session->connected_ ||
+      session->current_boot_id_ != domain.source_boot_id_) {
+    return Invalid("controlled failover source session is absent or replaced");
+  }
+  if (session->current_history_id_ !=
+          std::optional(domain.source_history_id_) ||
+      domain.source_group_term_ != facts.CurrentGroupTerm(group_id) ||
+      !facts.IsOwnerAssignment(group_id, domain.source_node_id_,
+                               domain.source_assignment_id_)) {
+    return Invalid("controlled failover source lineage is no longer current");
+  }
+  const auto latest =
+      observations.LatestForNode(domain.source_node_id_, facts, now_unix_ms);
+  if (!latest.has_value() ||
+      latest->identity_.boot_incarnation_ != domain.source_boot_id_ ||
+      latest->identity_.session_generation_ != session->current_generation_) {
     return Invalid(
-        "promotion-prepared requires one prior directive and one evidence");
+        "controlled failover source has not reported from its current "
+        "session");
   }
-  const MetaCurrentDirective& current = operation.current_directives_.front();
-  const MetaTerminalReceipt* receipt =
-      FindSuccessfulReceipt(operation, current);
-  if (receipt == nullptr ||
-      receipt->recipient_node_id_ != intent.candidate_node_id_ ||
-      receipt->recipient_boot_id_ != intent.candidate_boot_id_ ||
-      receipt->assignment_id_ != intent.candidate_assignment_id_ ||
-      receipt->result_hash_ != phase.prepared_result_hash_) {
+  return absl::OkStatus();
+}
+
+std::optional<MetaFailoverTransition> ExactTransition(
+    const MetaCommittedView& view, const std::string& group_id,
+    const MetaFailoverTransitionRef& expected) {
+  const auto group = view.topology().FindGroup(group_id);
+  if (!group.has_value() || !group->failover_transition_.has_value()) {
+    return std::nullopt;
+  }
+  const MetaFailoverTransition& transition = *group->failover_transition_;
+  if (transition.transition_id_ != expected.transition_id_ ||
+      transition.revision_ != expected.revision_) {
+    return std::nullopt;
+  }
+  return transition;
+}
+
+bool FrontierCovers(const std::vector<std::uint64_t>& applied,
+                    const std::vector<std::uint64_t>& stable) {
+  if (applied.size() != stable.size()) return false;
+  for (std::size_t flow = 0; flow < stable.size(); ++flow) {
+    if (applied[flow] < stable[flow]) return false;
+  }
+  return true;
+}
+
+bool SameCandidatePopulation(const MetaFailoverCandidateAction& lhs,
+                             const MetaFailoverCandidateAction& rhs) {
+  return lhs.candidate_ == rhs.candidate_ && lhs.domain_ == rhs.domain_;
+}
+
+absl::StatusOr<MetaCandidatePreparedObs> ExactCandidatePrepared(
+    const MetaFailoverTransition& transition,
+    const MetaFailoverCandidateAction& action, const MetaCommittedFacts& facts,
+    const MetaObservationStore& observations, std::int64_t now_unix_ms) {
+  if (now_unix_ms < 0) {
+    return Invalid("failover proposal time is invalid");
+  }
+  const auto session = observations.SessionStateFor(action.candidate_.node_id_);
+  if (!session.has_value() || !session->connected_ ||
+      session->current_boot_id_ != action.candidate_.boot_id_) {
+    return Invalid("failover candidate session is absent or replaced");
+  }
+  const auto prepared = observations.CandidatePreparedFor(
+      transition.transition_id_, action.action_id_, facts, now_unix_ms);
+  if (!prepared.has_value() ||
+      prepared->candidate_node_id_ != action.candidate_.node_id_ ||
+      prepared->candidate_assignment_id_ != action.candidate_.assignment_id_ ||
+      prepared->candidate_boot_id_ != action.candidate_.boot_id_ ||
+      prepared->session_generation_ != session->current_generation_) {
     return Invalid(
-        "promotion-prepared is missing its exact successful receipt");
+        "failover candidate prepared observation is absent or inexact");
   }
-  auto prepared =
-      cluster::control::DecodePromotionPreparedEvidence(receipt->result_);
-  if (!prepared.ok() ||
-      prepared->parent_history_id != Hex(intent.parent_history_id_) ||
-      prepared->frozen_applied_next_lsns.size() !=
-          phase.required_applied_next_lsns_.size()) {
-    return Invalid("promotion prepared result does not match its parent");
+  if (session->disconnected_boot_id_ ==
+      std::optional(action.candidate_.boot_id_)) {
+    return Invalid("failover candidate action was disconnected");
   }
-  for (std::size_t flow = 0;
-       flow < prepared->frozen_applied_next_lsns.size(); ++flow) {
-    if (prepared->frozen_applied_next_lsns[flow] <
-        phase.required_applied_next_lsns_[flow]) {
-      return Invalid("promotion prepared frontier is behind its requirement");
+  return *prepared;
+}
+
+template <typename CommitCommand>
+absl::Status ValidateCommitProposal(const CommitCommand& commit,
+                                    const MetaCommittedView& view,
+                                    const MetaObservationStore& observations,
+                                    std::int64_t proposal_now_unix_ms) {
+  constexpr bool kControlled =
+      std::is_same_v<CommitCommand, CommitControlledFailover>;
+  const auto transition =
+      ExactTransition(view, commit.group_id_, commit.expected_transition_);
+  if (!transition.has_value() ||
+      transition->mode_ != (kControlled ? MetaFailoverMode::kControlled
+                                        : MetaFailoverMode::kUncontrolled) ||
+      !transition->candidate_action_.has_value()) {
+    return Invalid("failover commit transition pre-state is stale");
+  }
+  const MetaFailoverCandidateAction& action = *transition->candidate_action_;
+  if (action.action_id_ != commit.action_id_ ||
+      action.candidate_ != commit.expected_candidate_ ||
+      !action.authorization_.has_value() ||
+      action.authorization_->authorized_revision_ !=
+          commit.authorized_revision_) {
+    return Invalid("failover commit action pre-state is stale");
+  }
+  if constexpr (kControlled) {
+    if (!transition->controlled_.has_value() ||
+        transition->controlled_->operation_id_ != commit.operation_id_ ||
+        action.authorization_->loss_if_cutover_ != MetaFailoverLoss::kNone ||
+        proposal_now_unix_ms < 0 ||
+        static_cast<std::uint64_t>(proposal_now_unix_ms) >=
+            transition->controlled_->absolute_deadline_unix_ms_) {
+      return Invalid("controlled failover commit deadline or mode is invalid");
     }
+  } else if (action.authorization_->loss_if_cutover_ !=
+             commit.loss_if_cutover_) {
+    return Invalid("uncontrolled failover commit loss authorization is stale");
   }
-  // A terminal receipt proves what was committed to the operation journal;
-  // the current-session observation proves those bytes were actually reported
-  // by this exact candidate boot. Requiring both prevents a proposer from
-  // fabricating a matching summary from committed fields alone.
-  const MetaStoresFacts facts(view.stores());
-  const std::vector<MetaOperationEvidenceObs> observed =
-      observations.EvidenceForOperation(operation.operation_id_, facts,
-                                        UnixMillisNow());
-  const auto exact = std::find_if(
-      observed.begin(), observed.end(),
-      [&](const MetaOperationEvidenceObs& evidence) {
-        return evidence.kind_phase_ == "promotion-prepare:prepared" &&
-               evidence.node_id_ == intent.candidate_node_id_ &&
-               evidence.boot_incarnation_ == intent.candidate_boot_id_ &&
-               evidence.assignment_id_ == intent.candidate_assignment_id_ &&
-               evidence.operation_id_ == operation.operation_id_ &&
-               evidence.evidence_hash_ == receipt->result_hash_ &&
-               evidence.evidence_ == receipt->result_ &&
-               evidence.group_id_ == intent.group_id_ &&
-               evidence.group_term_ == intent.group_term_ &&
-               evidence.population_manifest_revision_ ==
-                   intent.population_manifest_revision_ &&
-               evidence.partition_replication_epoch_ ==
-                   intent.partition_replication_epoch_ &&
-               evidence.replication_history_id_ == intent.parent_history_id_;
-      });
-  if (exact == observed.end()) {
-    return Invalid(
-        "promotion-prepared is missing fresh exact candidate evidence");
+
+  MetaStoresFacts facts(view.stores());
+  if (observations
+          .ActionFailedFor(transition->transition_id_, action.action_id_, facts,
+                           proposal_now_unix_ms)
+          .has_value()) {
+    return Invalid("failover candidate action has reported failure");
   }
-  if (transition.evidence_.front() != SummarizeOperationEvidence(
-                                          *exact,
-                                          intent.population_manifest_digest_)) {
-    return Invalid("promotion-prepared evidence summary changed its anchors");
-  }
+  auto prepared = ExactCandidatePrepared(*transition, action, facts,
+                                         observations, proposal_now_unix_ms);
+  if (!prepared.ok()) return prepared.status();
   return absl::OkStatus();
 }
 
 }  // namespace
 
-absl::StatusOr<std::string> EncodeFailoverIntent(const FailoverIntent& intent) {
-  if (absl::Status status = ValidateIntent(intent); !status.ok()) return status;
+absl::Status ValidateFailoverOperationIntent(
+    const FailoverOperationIntent& intent) {
+  if (intent.group_id_.empty() ||
+      intent.group_id_.size() > kMaxMetaGroupIdBytes ||
+      intent.absolute_deadline_unix_ms_ == 0 ||
+      intent.absolute_deadline_unix_ms_ >
+          static_cast<std::uint64_t>(
+              std::numeric_limits<std::int64_t>::max())) {
+    return Invalid("failover operation intent is invalid");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> EncodeFailoverOperationIntent(
+    const FailoverOperationIntent& intent) {
+  if (absl::Status status = ValidateFailoverOperationIntent(intent);
+      !status.ok()) {
+    return status;
+  }
   MetaWriter writer;
-  WriteHeader(writer, kIntentMagic);
+  WriteHeader(writer);
   writer.WriteString(intent.group_id_);
-  writer.WriteString(intent.former_owner_node_id_);
-  WriteFixedArray(writer, intent.former_owner_assignment_id_);
-  WriteFixedArray(writer, intent.former_owner_boot_id_);
-  writer.WriteString(intent.candidate_node_id_);
-  WriteFixedArray(writer, intent.candidate_assignment_id_);
-  WriteFixedArray(writer, intent.candidate_boot_id_);
-  writer.WriteU64(intent.group_term_);
-  writer.WriteU64(intent.authority_version_);
-  writer.WriteU64(intent.grant_revision_);
-  writer.WriteU64(intent.population_manifest_revision_);
-  WriteFixedArray(writer, intent.population_manifest_digest_);
-  writer.WriteU64(intent.partition_replication_epoch_);
-  WriteFixedArray(writer, intent.parent_history_id_);
+  writer.WriteU64(intent.absolute_deadline_unix_ms_);
   return std::move(writer).TakeBuffer();
 }
 
-absl::StatusOr<FailoverIntent> DecodeFailoverIntent(std::string_view encoded) {
+absl::StatusOr<FailoverOperationIntent> DecodeFailoverOperationIntent(
+    std::string_view encoded) {
   MetaReader reader(encoded);
-  if (absl::Status status = ReadHeader(reader, kIntentMagic); !status.ok()) {
-    return status;
-  }
-  FailoverIntent intent;
-  auto group = reader.ReadString(kMaxMetaGroupIdBytes);
-  if (!group.ok()) return group.status();
-  intent.group_id_ = *group;
-  auto former = reader.ReadString(kMetaNodeIdBytes);
-  if (!former.ok()) return former.status();
-  intent.former_owner_node_id_ = *former;
-  auto former_assignment = ReadFixedArray<16>(reader);
-  if (!former_assignment.ok()) return former_assignment.status();
-  intent.former_owner_assignment_id_ = *former_assignment;
-  auto former_boot = ReadFixedArray<20>(reader);
-  if (!former_boot.ok()) return former_boot.status();
-  intent.former_owner_boot_id_ = *former_boot;
-  auto candidate = reader.ReadString(kMetaNodeIdBytes);
-  if (!candidate.ok()) return candidate.status();
-  intent.candidate_node_id_ = *candidate;
-  auto candidate_assignment = ReadFixedArray<16>(reader);
-  if (!candidate_assignment.ok()) return candidate_assignment.status();
-  intent.candidate_assignment_id_ = *candidate_assignment;
-  auto candidate_boot = ReadFixedArray<20>(reader);
-  if (!candidate_boot.ok()) return candidate_boot.status();
-  intent.candidate_boot_id_ = *candidate_boot;
-  auto term = reader.ReadU64();
-  if (!term.ok()) return term.status();
-  intent.group_term_ = *term;
-  auto authority = reader.ReadU64();
-  if (!authority.ok()) return authority.status();
-  intent.authority_version_ = *authority;
-  auto grant = reader.ReadU64();
-  if (!grant.ok()) return grant.status();
-  intent.grant_revision_ = *grant;
-  auto manifest_revision = reader.ReadU64();
-  if (!manifest_revision.ok()) return manifest_revision.status();
-  intent.population_manifest_revision_ = *manifest_revision;
-  auto manifest = ReadFixedArray<32>(reader);
-  if (!manifest.ok()) return manifest.status();
-  intent.population_manifest_digest_ = *manifest;
-  auto population_epoch = reader.ReadU64();
-  if (!population_epoch.ok()) return population_epoch.status();
-  intent.partition_replication_epoch_ = *population_epoch;
-  auto history = ReadFixedArray<20>(reader);
-  if (!history.ok()) return history.status();
-  intent.parent_history_id_ = *history;
+  if (absl::Status status = ReadHeader(reader); !status.ok()) return status;
+
+  FailoverOperationIntent intent;
+  auto group_id = reader.ReadString(kMaxMetaGroupIdBytes);
+  if (!group_id.ok()) return group_id.status();
+  intent.group_id_ = std::move(*group_id);
+  auto deadline = reader.ReadU64();
+  if (!deadline.ok()) return deadline.status();
+  intent.absolute_deadline_unix_ms_ = *deadline;
   if (absl::Status status = reader.Finish(); !status.ok()) return status;
-  if (absl::Status status = DecodeValidation(ValidateIntent(intent));
+  if (absl::Status status =
+          DecodeValidation(ValidateFailoverOperationIntent(intent));
       !status.ok()) {
     return status;
   }
   return intent;
 }
 
-absl::StatusOr<std::string> EncodeFailoverPhase(const FailoverPhase& phase) {
-  if (absl::Status status = ValidatePhase(phase); !status.ok()) return status;
-  MetaWriter writer;
-  WriteHeader(writer, kPhaseMagic);
-  writer.WriteU8(static_cast<std::uint8_t>(phase.stage_));
-  WriteFixedArray(writer, phase.old_authority_exclusion_hash_);
-  writer.WriteList(phase.required_applied_next_lsns_,
-                   [](MetaWriter& output, std::uint64_t cursor) {
-                     output.WriteU64(cursor);
-                   });
-  WriteFixedArray(writer, phase.prepared_result_hash_);
-  return std::move(writer).TakeBuffer();
-}
-
-absl::StatusOr<FailoverPhase> DecodeFailoverPhase(std::string_view encoded) {
-  MetaReader reader(encoded);
-  if (absl::Status status = ReadHeader(reader, kPhaseMagic); !status.ok()) {
-    return status;
-  }
-  FailoverPhase phase;
-  auto stage = reader.ReadU8();
-  if (!stage.ok()) return stage.status();
-  phase.stage_ = static_cast<FailoverPhaseStage>(*stage);
-  auto exclusion = ReadFixedArray<32>(reader);
-  if (!exclusion.ok()) return exclusion.status();
-  phase.old_authority_exclusion_hash_ = *exclusion;
-  auto frontier = reader.ReadList<std::uint64_t>(
-      kMaxFailoverFlowCount,
-      [](MetaReader& input) { return input.ReadU64(); });
-  if (!frontier.ok()) return frontier.status();
-  phase.required_applied_next_lsns_ = std::move(*frontier);
-  auto prepared = ReadFixedArray<32>(reader);
-  if (!prepared.ok()) return prepared.status();
-  phase.prepared_result_hash_ = *prepared;
-  if (absl::Status status = reader.Finish(); !status.ok()) return status;
-  if (absl::Status status = DecodeValidation(ValidatePhase(phase));
-      !status.ok()) {
-    return status;
-  }
-  return phase;
-}
-
-absl::Status ValidateFailoverProposal(
-    const MetaCommand& command, const MetaCommittedView& view,
-    const MetaObservationStore& observations) {
+absl::Status ValidateFailoverProposal(const MetaCommand& command,
+                                      const MetaCommittedView& view,
+                                      const MetaObservationStore& observations,
+                                      std::int64_t proposal_now_unix_ms) {
   if (const auto* submit = std::get_if<SubmitOperation>(&command)) {
     if (submit->kind_ != kFailoverOperationKind) return absl::OkStatus();
-    auto intent = DecodeFailoverIntent(submit->intent_);
+    const auto intent = DecodeFailoverOperationIntent(submit->intent_);
     if (!intent.ok() || submit->intent_hash_ != MetaSha256(submit->intent_) ||
-        submit->replication_history_id_ != intent->parent_history_id_) {
-      return Invalid("failover submit contains invalid typed intent anchors");
+        !IsZero(submit->replication_history_id_) ||
+        !submit->policy_references_.empty()) {
+      return Invalid("failover submit requires canonical request-only intent");
     }
     return absl::OkStatus();
   }
 
-  const auto* transition =
-      std::get_if<TransitionOperationPhase>(&command);
-  if (transition == nullptr) return absl::OkStatus();
-  const auto operation =
-      view.operation().FindOperation(transition->operation_id_);
-  if (!operation.has_value()) {
+  if (const auto* begin = std::get_if<BeginControlledFailover>(&command)) {
+    if (proposal_now_unix_ms < 0 ||
+        static_cast<std::uint64_t>(proposal_now_unix_ms) >=
+            begin->absolute_deadline_unix_ms_) {
+      return Invalid("controlled failover begin deadline has expired");
+    }
+    const auto group = view.topology().FindGroup(begin->group_id_);
+    if (!group.has_value() || group->failover_transition_.has_value()) {
+      return Invalid("controlled failover begin pre-state is stale");
+    }
+    MetaStoresFacts facts(view.stores());
+    if (absl::Status source = RequireExactCurrentSource(
+            begin->group_id_, begin->candidate_action_.domain_, facts,
+            observations, proposal_now_unix_ms);
+        !source.ok()) {
+      return source;
+    }
+    if (auto candidate = ExactCandidateProgress(
+            begin->group_id_, begin->candidate_action_, facts, observations,
+            proposal_now_unix_ms, /*action_is_committed=*/false);
+        !candidate.ok()) {
+      return candidate.status();
+    }
     return absl::OkStatus();
   }
-  const auto is_promotion_prepare = [](const auto& directive) {
-    if constexpr (std::is_same_v<std::decay_t<decltype(directive)>,
-                                 MetaCurrentDirective>) {
-      return directive.spec_.kind_ == "promotion-prepare";
-    } else {
-      return directive.kind_ == "promotion-prepare";
-    }
-  };
-  const bool owns_promotion_prepare =
-      std::any_of(transition->current_directives_.begin(),
-                  transition->current_directives_.end(),
-                  is_promotion_prepare) ||
-      std::any_of(operation->current_directives_.begin(),
-                  operation->current_directives_.end(), is_promotion_prepare);
-  if (operation->kind_ != kFailoverOperationKind) {
-    return owns_promotion_prepare
-               ? Invalid(
-                     "promotion-prepare belongs only to a failover operation")
-               : absl::OkStatus();
-  }
-  if (view.operation().TransitionAlreadyApplied(*transition)) {
-    return absl::OkStatus();
-  }
-  if (operation->revision_ != transition->expected_revision_) {
-    return Invalid("failover transition expected_revision mismatch");
-  }
-  auto intent = DecodeFailoverIntent(operation->intent_);
-  auto next = DecodeFailoverPhase(transition->kind_phase_blob_);
-  if (!intent.ok() || !next.ok() ||
-      operation->intent_hash_ != MetaSha256(operation->intent_) ||
-      operation->replication_history_id_ != intent->parent_history_id_) {
-    return Invalid("committed failover operation contains invalid typed state");
-  }
-  if (static_cast<std::uint8_t>(next->stage_) >
-      static_cast<std::uint8_t>(FailoverPhaseStage::kPromotionPrepared)) {
-    return Invalid("failover phase is outside the preparation workflow");
-  }
 
-  std::optional<FailoverPhase> previous;
-  if (!operation->kind_phase_blob_.empty()) {
-    auto decoded = DecodeFailoverPhase(operation->kind_phase_blob_);
-    if (!decoded.ok()) {
-      return Invalid("committed failover phase is invalid");
+  if (const auto* begin = std::get_if<BeginUncontrolledFailover>(&command)) {
+    const auto group = view.topology().FindGroup(begin->group_id_);
+    if (!group.has_value() || group->failover_transition_.has_value()) {
+      return Invalid("uncontrolled failover begin pre-state is stale");
     }
-    previous = std::move(*decoded);
-  }
-  const std::optional<FailoverPhaseStage> expected_stage =
-      previous.has_value()
-          ? NextPreparationStage(previous->stage_)
-          : std::optional(FailoverPhaseStage::kOldAuthorityExcluded);
-  if (!expected_stage.has_value() || next->stage_ != *expected_stage) {
-    return Invalid("failover transition skipped or repeated a phase");
-  }
-  if (previous.has_value() &&
-      (previous->old_authority_exclusion_hash_ !=
-           next->old_authority_exclusion_hash_ ||
-       (static_cast<std::uint8_t>(previous->stage_) >=
-            static_cast<std::uint8_t>(
-                FailoverPhaseStage::kCandidateCaughtUp) &&
-        previous->required_applied_next_lsns_ !=
-            next->required_applied_next_lsns_))) {
-    return Invalid("failover transition changed an earlier phase proof");
-  }
-  if (absl::Status anchors = ValidateCommittedAnchors(*intent, view);
-      !anchors.ok()) {
-    return anchors;
-  }
-
-  switch (next->stage_) {
-    case FailoverPhaseStage::kOldAuthorityExcluded:
-    case FailoverPhaseStage::kCandidateCaughtUp:
-      if (!transition->current_directives_.empty() ||
-          !transition->evidence_.empty()) {
-        return Invalid("preparing-independent failover phase carries work");
+    if (begin->candidate_action_.has_value()) {
+      MetaStoresFacts facts(view.stores());
+      if (auto candidate = ExactCandidateProgress(
+              begin->group_id_, *begin->candidate_action_, facts, observations,
+              proposal_now_unix_ms,
+              /*action_is_committed=*/false);
+          !candidate.ok()) {
+        return candidate.status();
       }
+    }
+    return absl::OkStatus();
+  }
+
+  if (const auto* set = std::get_if<SetUncontrolledCandidate>(&command)) {
+    const auto transition =
+        ExactTransition(view, set->group_id_, set->expected_transition_);
+    if (!transition.has_value() ||
+        transition->mode_ != MetaFailoverMode::kUncontrolled) {
+      return Invalid("uncontrolled candidate set pre-state is stale");
+    }
+    if (proposal_now_unix_ms < 0) {
+      return Invalid("failover proposal time is invalid");
+    }
+    if (!transition->candidate_action_.has_value() &&
+        !set->candidate_action_.has_value()) {
+      return Invalid("uncontrolled failover candidate is absent");
+    }
+    MetaStoresFacts facts(view.stores());
+    if (transition->candidate_action_.has_value()) {
+      const MetaFailoverCandidateAction& current =
+          *transition->candidate_action_;
+      const bool failed =
+          observations
+              .ActionFailedFor(transition->transition_id_, current.action_id_,
+                               facts, proposal_now_unix_ms)
+              .has_value();
+      if (!failed && (ExactCandidateProgress(set->group_id_, current, facts,
+                                             observations, proposal_now_unix_ms,
+                                             /*action_is_committed=*/true)
+                          .ok() ||
+                      ExactCandidatePrepared(*transition, current, facts,
+                                             observations, proposal_now_unix_ms)
+                          .ok())) {
+        return Invalid(
+            "uncontrolled candidate set would replace a healthy action");
+      }
+      if (set->candidate_action_.has_value() &&
+          SameCandidatePopulation(current, *set->candidate_action_)) {
+        return Invalid(
+            "uncontrolled candidate replacement reuses the failed "
+            "population");
+      }
+    }
+    if (set->candidate_action_.has_value()) {
+      if (auto candidate = ExactCandidateProgress(
+              set->group_id_, *set->candidate_action_, facts, observations,
+              proposal_now_unix_ms, /*action_is_committed=*/false);
+          !candidate.ok()) {
+        return candidate.status();
+      }
+    }
+    return absl::OkStatus();
+  }
+
+  if (const auto* authorize = std::get_if<AuthorizeFailoverPrepare>(&command)) {
+    const auto transition = ExactTransition(view, authorize->group_id_,
+                                            authorize->expected_transition_);
+    if (!transition.has_value() || !transition->candidate_action_.has_value() ||
+        transition->candidate_action_->action_id_ != authorize->action_id_ ||
+        transition->candidate_action_->authorization_.has_value()) {
+      return Invalid("failover authorization pre-state is stale");
+    }
+    if (transition->mode_ == MetaFailoverMode::kControlled) {
+      if (!transition->controlled_.has_value() || proposal_now_unix_ms < 0 ||
+          static_cast<std::uint64_t>(proposal_now_unix_ms) >=
+              transition->controlled_->absolute_deadline_unix_ms_) {
+        return Invalid("controlled failover authorization deadline expired");
+      }
+      if (authorize->loss_if_cutover_ != MetaFailoverLoss::kNone) {
+        return Invalid("controlled failover authorization must be lossless");
+      }
+    } else if (authorize->loss_if_cutover_ != MetaFailoverLoss::kUnknown) {
+      return Invalid("uncontrolled failover authorization loss is invalid");
+    }
+
+    MetaStoresFacts facts(view.stores());
+    const MetaFailoverCandidateAction& action = *transition->candidate_action_;
+    if (observations
+            .ActionFailedFor(transition->transition_id_, action.action_id_,
+                             facts, proposal_now_unix_ms)
+            .has_value()) {
+      return Invalid("failover candidate action has reported failure");
+    }
+    auto progress = ExactCandidateProgress(authorize->group_id_, action, facts,
+                                           observations, proposal_now_unix_ms,
+                                           /*action_is_committed=*/true);
+    if (!progress.ok()) return progress.status();
+
+    if (transition->mode_ == MetaFailoverMode::kControlled) {
+      const auto paused = observations.SourcePausedFor(
+          transition->transition_id_, facts, proposal_now_unix_ms);
+      if (!paused.has_value()) {
+        return Invalid(
+            "controlled failover source pause observation is absent");
+      }
+      if (!FrontierCovers(progress->applied_next_lsns_,
+                          paused->stable_next_lsns_)) {
+        return Invalid(
+            "controlled failover candidate no longer covers the paused "
+            "frontier");
+      }
+    }
+    return absl::OkStatus();
+  }
+
+  if (const auto* degrade = std::get_if<DegradeControlledFailover>(&command)) {
+    const auto transition = ExactTransition(view, degrade->group_id_,
+                                            degrade->expected_transition_);
+    if (!transition.has_value() ||
+        transition->mode_ != MetaFailoverMode::kControlled ||
+        !transition->controlled_.has_value() ||
+        transition->controlled_->operation_id_ != degrade->operation_id_ ||
+        transition->candidate_action_ != degrade->expected_candidate_action_) {
+      return Invalid("controlled failover degrade pre-state is stale");
+    }
+    if (proposal_now_unix_ms < 0 ||
+        static_cast<std::uint64_t>(proposal_now_unix_ms) >=
+            transition->controlled_->absolute_deadline_unix_ms_) {
+      return Invalid("controlled failover degrade deadline has expired");
+    }
+
+    MetaStoresFacts facts(view.stores());
+    if (!transition->candidate_action_.has_value()) {
+      return Invalid("controlled failover degrade has no candidate action");
+    }
+    // Source unavailability remains a negative, grace-derived planner
+    // decision: the command deliberately carries no timestamp certificate and
+    // proposal validation does not require evidence that an absent source
+    // stayed absent. An exact, fresh recovery is positive contrary evidence,
+    // however, and must invalidate a Degrade planned before that recovery. The
+    // proposal hook separately rechecks any candidate capability the command
+    // retains; deterministic apply/CAS still arbitrates a concurrent Abort or
+    // Commit.
+    if (RequireExactCurrentSource(degrade->group_id_,
+                                  transition->candidate_action_->domain_, facts,
+                                  observations, proposal_now_unix_ms)
+            .ok()) {
+      return Invalid("controlled failover source recovered before degradation");
+    }
+    if (!degrade->retain_candidate_action_) return absl::OkStatus();
+
+    if (!transition->candidate_action_->authorization_.has_value() ||
+        transition->candidate_action_->authorization_->loss_if_cutover_ !=
+            MetaFailoverLoss::kNone) {
+      return Invalid(
+          "controlled failover degrade cannot retain an unauthorized or "
+          "lossy action");
+    }
+    const MetaFailoverCandidateAction& action = *transition->candidate_action_;
+    if (observations
+            .ActionFailedFor(transition->transition_id_, action.action_id_,
+                             facts, proposal_now_unix_ms)
+            .has_value()) {
+      return Invalid("failover candidate action has reported failure");
+    }
+    if (ExactCandidateProgress(degrade->group_id_, action, facts, observations,
+                               proposal_now_unix_ms,
+                               /*action_is_committed=*/true)
+            .ok() ||
+        ExactCandidatePrepared(*transition, action, facts, observations,
+                               proposal_now_unix_ms)
+            .ok()) {
       return absl::OkStatus();
-    case FailoverPhaseStage::kPromotionPreparing:
-      if (transition->current_directives_.size() != 1 ||
-          !transition->evidence_.empty()) {
-        return Invalid("promotion-preparing requires one current directive");
-      }
-      return ValidatePreparingDirective(
-          transition->current_directives_.front(), *intent, *next);
-    case FailoverPhaseStage::kPromotionPrepared:
-      return ValidatePreparedTransition(*transition, *operation, *intent,
-                                        *next, view, observations);
-    case FailoverPhaseStage::kAuthorityActivated:
-    case FailoverPhaseStage::kServing:
-      return Invalid("failover phase is outside the preparation workflow");
+    }
+    return Invalid(
+        "controlled failover retained candidate observations are "
+        "stale or inexact");
   }
-  return Invalid("unknown failover phase");
+
+  if (const auto* commit = std::get_if<CommitControlledFailover>(&command)) {
+    return ValidateCommitProposal(*commit, view, observations,
+                                  proposal_now_unix_ms);
+  }
+  if (const auto* commit = std::get_if<CommitUncontrolledFailover>(&command)) {
+    return ValidateCommitProposal(*commit, view, observations,
+                                  proposal_now_unix_ms);
+  }
+
+  const MetaOperationId* operation_id = GenericOperationId(command);
+  if (operation_id == nullptr) return absl::OkStatus();
+  const auto operation = view.operation().FindOperation(*operation_id);
+  if (operation.has_value() && operation->kind_ == kFailoverOperationKind) {
+    return Invalid("failover operation is owned by typed commands");
+  }
+  return absl::OkStatus();
 }
 
 }  // namespace keylane::meta

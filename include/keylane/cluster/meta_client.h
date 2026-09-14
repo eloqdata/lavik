@@ -5,6 +5,7 @@
 // complete projection from the current Meta leader before acquiring a lease.
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -17,6 +18,7 @@
 #include "absl/status/statusor.h"
 #include "celer/net/service.h"
 #include "keylane/cluster/control_protocol.h"
+#include "keylane/replication.h"
 
 namespace celer {
 class TlsContext;
@@ -32,6 +34,9 @@ class NodeControlActions;
 class NodeControlInstaller;
 class TopologyCache;
 struct AuthorityAnchor;
+struct DesiredClusterControl;
+struct PopulationReadiness;
+struct PreparedFailoverActivation;
 
 struct MetaControlEndpoint {
   std::string host_;
@@ -97,6 +102,12 @@ std::string EncodeRebuildAuthorityIdentity(const AuthorityAnchor& anchor);
 // session has produced a valid HeartbeatAck.
 class MetaReconnectBackoff {
  public:
+  // Shared with Meta's new-leader observation warmup so a live Data process
+  // cannot be declared absent while still inside a permitted reconnect sleep.
+  static constexpr std::chrono::milliseconds MaximumWindow() noexcept {
+    return std::chrono::seconds(10);
+  }
+
   std::chrono::milliseconds Next(std::uint64_t entropy) noexcept;
   void Reset() noexcept { window_ = std::chrono::milliseconds(1000); }
   std::chrono::milliseconds window() const noexcept { return window_; }
@@ -142,9 +153,10 @@ class MetaEndpointDirectory {
 // renewals to the first group.
 class MetaLeaseChallengeRotation {
  public:
-  // Owner role is independent of whether its current grant is renewable. A
-  // projected owner with an inactive grant must send no role payload instead
-  // of falling through to replica candidate reporting.
+  // Owner role is normally independent of whether its current grant is
+  // renewable. The only exception is an exact uncontrolled target-term fence:
+  // its retained owner is historical topology, not active authority, and may
+  // report its boot-local population as a recovery candidate.
   static bool IsCommittedOwner(
       std::span<const control::WireDesiredGroup> groups,
       std::string_view local_node_id) noexcept;
@@ -159,6 +171,103 @@ class MetaLeaseChallengeRotation {
 };
 
 namespace detail {
+
+enum class MetaTransferAbortDisposition : std::uint8_t {
+  kFailSession,
+  kContinueAuthenticatedSession,
+};
+
+// Called only after LargeObjectReassembler has validated the active object id
+// and consumed the abort. The narrow named reason is object-local; every other
+// reason/type pair remains a terminal protocol event.
+MetaTransferAbortDisposition ClassifyMetaTransferAbort(
+    const control::TransferAbort& abort,
+    std::optional<control::TransferKind> active_kind) noexcept;
+
+// Exact native-manager input derived from one normalized FDS Group and the
+// current Data incarnation. An action belongs only to its named candidate, a
+// source pause only to the exact controlled Owner, and a grant activation id
+// becomes a local pending activation only for the committed Owner.
+struct ClusterFailoverReconcileInput {
+  std::optional<DesiredClusterFailoverAction> candidate_action_;
+  std::optional<DesiredClusterSourcePause> source_pause_;
+  std::optional<ClusterFailoverActionId> pending_activation_action_id_;
+  // An active transition owns candidate catch-up and deliberately leaves the
+  // ordinary relationship untouched. Once the transition is absent, true
+  // means follow_owner_ (including nullopt for removal) must be reconciled.
+  bool reconcile_follow_owner_ = false;
+  std::optional<DesiredClusterUpstream> follow_owner_;
+
+  friend bool operator==(const ClusterFailoverReconcileInput&,
+                         const ClusterFailoverReconcileInput&) = default;
+};
+
+// Converts one normalized group projection into native replication intents.
+// `use_tls` selects the committed owner's TLS replication port for follow-owner
+// relationships; false selects its plaintext port. It does not configure the
+// Meta control connection itself.
+absl::StatusOr<ClusterFailoverReconcileInput> TranslateClusterFailoverControl(
+    const DesiredClusterControl& desired,
+    const ReplicationIdentity& local_identity, bool use_tls = false);
+
+ClusterFailoverActivation TranslateClusterFailoverActivation(
+    const PreparedFailoverActivation& activation);
+
+// Projects only exact terminal native outcomes. Waiting/retrying states remain
+// local diagnostics and therefore produce no Meta observation.
+absl::StatusOr<std::optional<control::FailoverObservation>>
+ProjectClusterFailoverObservation(const ClusterFailoverActionStatus& status);
+
+// Emits SourcePaused only after the native pause owns an exact desired
+// incarnation and has captured its complete stable frontier.
+absl::StatusOr<std::optional<control::FailoverObservation>>
+ProjectClusterSourcePauseObservation(const ClusterSourcePauseStatus& status);
+
+// A boot or history change ordinarily replaces the session. The caller
+// separately recognizes the narrow exact FDS-owned failover bridge needed to
+// publish a completed rotation safely.
+bool ReplicationIdentityRequiresMetaReconnect(
+    const ReplicationIdentity& established,
+    const ReplicationIdentity& latest) noexcept;
+
+// Native failover preparation rotates history before its level-triggered
+// Prepared observation is publishable. The authenticated session may bridge
+// only that exact action while it remains in the installed FDS; removal at
+// Cutover (or any identity/action mismatch) forces the normal reconnect.
+bool FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+    const ReplicationIdentity& established, const ReplicationIdentity& latest,
+    const ClusterFailoverActionStatus& status,
+    std::span<const control::WireDesiredGroup> groups) noexcept;
+
+// One heartbeat must either reconnect, use its ordinary role projection, or
+// remain on the old authenticated history solely to publish failover progress.
+// The last case suppresses ReplicaCandidate and lease claims until the FDS
+// removes the action and the client reauthenticates with the child history.
+struct MetaSessionReplicationIdentityDecision {
+  bool requires_reconnect_ = false;
+  bool suppress_ordinary_role_ = false;
+
+  friend bool operator==(const MetaSessionReplicationIdentityDecision&,
+                         const MetaSessionReplicationIdentityDecision&) =
+      default;
+};
+
+MetaSessionReplicationIdentityDecision EvaluateMetaSessionReplicationIdentity(
+    const ReplicationIdentity& established, const ReplicationIdentity& latest,
+    const ClusterFailoverActionStatus& status,
+    std::span<const control::WireDesiredGroup> groups) noexcept;
+
+// Builds ordinary replica progress from the current Ready population. During
+// an exact uncontrolled fence, the retained historical owner reports a
+// boot-local self-origin lineage; active owners and terminally failed
+// populations remain ineligible.
+absl::StatusOr<std::optional<control::CandidateProgress>>
+ProjectReplicaCandidateProgress(
+    std::span<const control::WireDesiredGroup> groups,
+    std::string_view local_node_id, const ReplicationIdentity& current_identity,
+    const PopulationReadiness& readiness, const RebuildIdentity& ready_identity,
+    std::span<const std::uint64_t> applied_next_lsns,
+    bool failover_candidate_eligible);
 
 // Separates a retriable connection/session failure from failure of the local
 // authority and population cleanup that followed an accepted session. A stop
@@ -248,8 +357,10 @@ class MetaControlClientService final : public celer::Service {
 
 // Process-lifetime adapter used by NodeControlInstaller. It dispatches only
 // normalized directives through ReplicationManager on worker 0; the installer
-// remains the sole component allowed to invoke it.
+// remains the sole component allowed to invoke it. `use_tls` fixes whether
+// follow-owner intents select committed TLS or plaintext replication endpoints
+// and must match the Data-to-Data replication listener configuration.
 std::unique_ptr<NodeControlActions> CreateReplicationNodeControlActions(
-    ReplicationManager& replication);
+    ReplicationManager& replication, bool use_tls);
 
 }  // namespace keylane::cluster

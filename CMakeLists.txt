@@ -185,6 +185,7 @@ if (KEYLANE_BUILD_META)
     src/meta/admin_client.cpp
     src/meta/cluster_create.cpp
     src/meta/cluster_status.cpp
+    src/meta/failover_admin.cpp
   )
   target_include_directories(keylane_meta_admin PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -601,6 +602,7 @@ if (KEYLANE_BUILD_META)
     src/meta/data_control_runtime_status.cpp
     src/meta/encoding.cpp
     src/meta/failover.cpp
+    src/meta/failover_reconciler.cpp
     src/meta/grant_store.cpp
     src/meta/identity_verifier.cpp
     src/meta/identity_store.cpp
@@ -788,6 +790,7 @@ if (BUILD_TESTING)
     add_executable(keylane_cluster_status_tests
       tests/meta_cluster_create_test.cpp
       tests/meta_cluster_status_test.cpp
+      tests/meta_failover_admin_test.cpp
     )
     target_link_libraries(keylane_cluster_status_tests PRIVATE
       keylane_meta_admin
@@ -807,6 +810,11 @@ if (BUILD_TESTING)
       tests/meta_candidate_plan_test.cpp
       tests/meta_control_projector_test.cpp
       tests/meta_data_control_server_test.cpp
+      tests/meta_failover_transition_apply_test.cpp
+      tests/meta_failover_transition_w2_test.cpp
+      tests/meta_failover_aggregate_revision_test.cpp
+      tests/meta_failover_observation_test.cpp
+      tests/meta_failover_reconciler_test.cpp
       tests/meta_failover_test.cpp
       tests/meta_journal_test.cpp
       tests/meta_model_test.cpp
@@ -929,6 +937,63 @@ if (BUILD_TESTING)
           TIMEOUT 300
           RUN_SERIAL TRUE
         )
+
+        # keylane-meta's deterministic failover seams follow the ordinary
+        # !NDEBUG policy; KEYLANE_BUILD_FAULT_SERVER instruments only Data.
+        # Do not register a Release gate that can only fail its required-hook
+        # precondition.
+        if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+          # Failover needs the complete Meta <-> Data <-> Redis surface, so
+          # these cases are deliberately not part of the Meta-only gate loop
+          # above. Keep each failure mode independently addressable and its
+          # process files isolated below the build tree. TMPDIR asks the
+          # Python harness for a unique child on every run; a failed child is
+          # retained with its precise path, while a successful rerun cannot
+          # inherit durable state from an older one.
+          set(KEYLANE_FAILOVER_INTEGRATION_CASES
+            controlled
+            leader-resume
+            prepared-leader-resume
+            live-leader-demotion
+            candidate-abort
+            lease-fence
+            source-degrade-reselect
+          )
+          # Unix-domain listener paths have a platform limit near 108 bytes.
+          # Process evidence stays in the descriptive per-case directory;
+          # only this unused auxiliary admin listener gets a short build-tree path.
+          set(failover_socket_root "${CMAKE_CURRENT_BINARY_DIR}/fs")
+          file(MAKE_DIRECTORY "${failover_socket_root}")
+          foreach(failover_case IN LISTS KEYLANE_FAILOVER_INTEGRATION_CASES)
+            string(REPLACE "-" "_" failover_test_suffix "${failover_case}")
+            set(failover_workdir
+              "${CMAKE_CURRENT_BINARY_DIR}/meta-integration/failover/${failover_case}")
+            file(MAKE_DIRECTORY "${failover_workdir}")
+            add_test(
+              NAME meta_integration.gate_failover_${failover_test_suffix}
+              COMMAND ${CMAKE_COMMAND} -E env
+                      "TMPDIR=${failover_workdir}"
+                      "KEYLANE_TEST_TMPDIR=${failover_workdir}"
+                      "PYTHONPYCACHEPREFIX=${failover_workdir}/pycache"
+                      "KEYLANE_FAILOVER_SOCKET_ROOT=${failover_socket_root}"
+                      ${KEYLANE_PYTHON3_EXECUTABLE}
+                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_failover.py
+                      $<TARGET_FILE:keylane-meta>
+                      $<TARGET_FILE:keylane>
+                      $<TARGET_FILE:keylane-ctl>
+                      ${KEYLANE_CLUSTER_CREATE_REDIS_CLI}
+                      --case=${failover_case}
+                      --require-fault-hook
+            )
+            set_tests_properties(
+              meta_integration.gate_failover_${failover_test_suffix}
+              PROPERTIES
+              LABELS "meta-integration;failover"
+              TIMEOUT 180
+              RUN_SERIAL TRUE
+            )
+          endforeach()
+        endif()
       endif()
     else()
       message(STATUS "python3 not found; meta integration tests are disabled")

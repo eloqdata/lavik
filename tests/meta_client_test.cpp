@@ -92,6 +92,8 @@ TEST(MetaControlIdentityTest, UnresolvedSeedBootstrapsFromServerHello) {
 
 TEST(MetaReconnectBackoffTest, UsesFullJitterAndResetsOnlyExplicitly) {
   MetaReconnectBackoff backoff;
+  EXPECT_EQ(MetaReconnectBackoff::MaximumWindow(),
+            std::chrono::milliseconds(10000));
   EXPECT_EQ(backoff.window(), std::chrono::milliseconds(1000));
   EXPECT_EQ(backoff.Next(0), std::chrono::milliseconds(0));
   EXPECT_EQ(backoff.window(), std::chrono::milliseconds(2000));
@@ -99,9 +101,9 @@ TEST(MetaReconnectBackoffTest, UsesFullJitterAndResetsOnlyExplicitly) {
   EXPECT_EQ(backoff.window(), std::chrono::milliseconds(4000));
   (void)backoff.Next(999999);
   (void)backoff.Next(999999);
-  EXPECT_EQ(backoff.window(), std::chrono::milliseconds(10000));
+  EXPECT_EQ(backoff.window(), MetaReconnectBackoff::MaximumWindow());
   (void)backoff.Next(999999);
-  EXPECT_EQ(backoff.window(), std::chrono::milliseconds(10000));
+  EXPECT_EQ(backoff.window(), MetaReconnectBackoff::MaximumWindow());
 
   backoff.Reset();
   EXPECT_EQ(backoff.window(), std::chrono::milliseconds(1000));
@@ -298,6 +300,133 @@ TEST(MetaLeaseChallengeRotationTest, HandlesProjectionReplacementAndNoOwner) {
       replacement, "2222222222222222222222222222222222222222"));
 }
 
+TEST(MetaLeaseChallengeRotationTest,
+     FencedUncontrolledHistoricalOwnerMayReportCandidateProgress) {
+  constexpr char kLocal[] = "1111111111111111111111111111111111111111";
+  control::WireId128 assignment{};
+  assignment[0] = 1;
+  control::WireId128 transition_id{};
+  transition_id[0] = 2;
+  control::WireDesiredGroup group{
+      .group_id = "group-a",
+      .members = {{.node_id = kLocal, .assignment_id = assignment}},
+      .owner_node_id = kLocal,
+      .owner_assignment_id = assignment,
+      .group_term = 8,
+      .grant_active = false,
+      .failover_transition =
+          control::WireFailoverTransition{
+              .transition_id = transition_id,
+              .revision = 9,
+              .mode = control::WireFailoverMode::kUncontrolled,
+              .target_term = 8,
+          },
+  };
+  const std::array groups{group};
+
+  // BeginUncontrolled keeps the old owner as durable topology history while
+  // fencing its grant. That history must not suppress the ordinary candidate
+  // branch: the former owner may be the only surviving/latest population.
+  EXPECT_FALSE(MetaLeaseChallengeRotation::IsCommittedOwner(groups, kLocal));
+
+  // The exception is deliberately transition-scoped. A controlled or
+  // target-term-mismatched projection must continue suppressing an owner from
+  // the candidate role, as must any projection carrying active authority.
+  group.failover_transition->mode = control::WireFailoverMode::kControlled;
+  EXPECT_TRUE(
+      MetaLeaseChallengeRotation::IsCommittedOwner(std::array{group}, kLocal));
+  group.failover_transition->mode = control::WireFailoverMode::kUncontrolled;
+  group.failover_transition->target_term = 9;
+  EXPECT_TRUE(
+      MetaLeaseChallengeRotation::IsCommittedOwner(std::array{group}, kLocal));
+  group.failover_transition->target_term = 8;
+  group.grant_active = true;
+  EXPECT_TRUE(
+      MetaLeaseChallengeRotation::IsCommittedOwner(std::array{group}, kLocal));
+}
+
+TEST(MetaCandidateProjectionTest,
+     FencedHistoricalOwnerUsesAuthenticatedSelfOriginLineage) {
+  constexpr char kLocal[] = "1111111111111111111111111111111111111111";
+  constexpr char kBoot[] = "2222222222222222222222222222222222222222";
+  constexpr char kHistory[] = "3333333333333333333333333333333333333333";
+  const control::WireId128 assignment = [] {
+    control::WireId128 value{};
+    value[0] = 1;
+    return value;
+  }();
+  const control::WireHash256 manifest = control::ComputeSha256("manifest");
+  control::WireDesiredGroup group{
+      .group_id = "group-a",
+      .members = {{.node_id = kLocal, .assignment_id = assignment}},
+      .owner_node_id = kLocal,
+      .owner_assignment_id = assignment,
+      .group_term = 8,
+      .grant_active = false,
+      .manifest_revision = 4,
+      .manifest_digest = manifest,
+      .partition_replication_epoch = 6,
+      .failover_transition =
+          control::WireFailoverTransition{
+              .transition_id = {},
+              .revision = 9,
+              .mode = control::WireFailoverMode::kUncontrolled,
+              .target_term = 8,
+          },
+  };
+  const PopulationReadiness readiness{
+      .group_id_ = group.group_id,
+      .assignment_id_ = AssignmentId::FromBytes(assignment),
+      .group_term_ = group.group_term,
+      .manifest_revision_ = group.manifest_revision,
+      .manifest_digest_ = group.manifest_digest,
+      .partition_replication_epoch_ = group.partition_replication_epoch,
+  };
+  RebuildIdentity ready{
+      .group_id_ = group.group_id,
+      .assignment_id_ = readiness.assignment_id_.ToHexString(),
+      .term_ = 7,
+      .target_node_id_ = kLocal,
+      .target_boot_id_ = kBoot,
+      .manifest_revision_ = group.manifest_revision,
+      .manifest_id_ = PopulationManifestId{.bytes_ = manifest},
+      .partition_replication_epoch_ = group.partition_replication_epoch,
+  };
+  const ReplicationIdentity current{
+      .local_node_id_ = kLocal,
+      .boot_id_ = kBoot,
+      .local_history_id_ = kHistory,
+  };
+  const std::array<std::uint64_t, 2> frontier{10, 20};
+
+  auto projected = detail::ProjectReplicaCandidateProgress(
+      std::array{group}, kLocal, current, readiness, ready, frontier,
+      /*failover_candidate_eligible=*/true);
+  ASSERT_TRUE(projected.ok()) << projected.status();
+  ASSERT_TRUE(projected->has_value());
+  EXPECT_EQ((*projected)->group_term, 8u);
+  EXPECT_EQ((*projected)->source_group_term, 7u);
+  EXPECT_EQ((*projected)->source_node_id, kLocal);
+  EXPECT_EQ((*projected)->source_assignment_id, assignment);
+  EXPECT_EQ((*projected)->source_boot_id, kBoot);
+  EXPECT_EQ((*projected)->source_history_id, kHistory);
+  EXPECT_EQ((*projected)->applied_next_lsns,
+            (std::vector<std::uint64_t>{10, 20}));
+
+  projected = detail::ProjectReplicaCandidateProgress(
+      std::array{group}, kLocal, current, readiness, ready, frontier,
+      /*failover_candidate_eligible=*/false);
+  ASSERT_TRUE(projected.ok()) << projected.status();
+  EXPECT_FALSE(projected->has_value());
+
+  group.failover_transition->mode = control::WireFailoverMode::kControlled;
+  projected = detail::ProjectReplicaCandidateProgress(
+      std::array{group}, kLocal, current, readiness, ready, frontier,
+      /*failover_candidate_eligible=*/true);
+  ASSERT_TRUE(projected.ok()) << projected.status();
+  EXPECT_FALSE(projected->has_value());
+}
+
 TEST(MetaHeartbeatProjectionGateTest,
      HoldsProducerAndConsumesOnlyTheOldOutstandingAck) {
   detail::MetaHeartbeatProjectionGate gate;
@@ -320,6 +449,30 @@ TEST(MetaHeartbeatProjectionGateTest,
   gate.MarkQuiesced(false);
   EXPECT_FALSE(gate.pause_requested());
   EXPECT_FALSE(gate.quiesced());
+}
+
+TEST(MetaInboundTransferAbortTest,
+     SupersededFullStateKeepsTheAuthenticatedSessionAndHeartbeat) {
+  const control::TransferAbort superseded{
+      .object_id = {},
+      .reason = control::TransferAbortReason::kFullDesiredStateSuperseded,
+  };
+
+  EXPECT_EQ(
+      detail::ClassifyMetaTransferAbort(
+          superseded, control::TransferKind::kFullDesiredState),
+      detail::MetaTransferAbortDisposition::kContinueAuthenticatedSession);
+
+  // The reason is object-specific. It must not turn an interrupted Directive
+  // into a session-local retry, and every unknown reason stays fail closed.
+  EXPECT_EQ(detail::ClassifyMetaTransferAbort(
+                superseded, control::TransferKind::kDirectivePayload),
+            detail::MetaTransferAbortDisposition::kFailSession);
+  control::TransferAbort unknown = superseded;
+  unknown.reason = static_cast<control::TransferAbortReason>(99);
+  EXPECT_EQ(detail::ClassifyMetaTransferAbort(
+                unknown, control::TransferKind::kFullDesiredState),
+            detail::MetaTransferAbortDisposition::kFailSession);
 }
 
 TEST(MetaDirectiveValidationTest,
@@ -483,8 +636,7 @@ TEST(MetaDirectiveValidationTest,
   EXPECT_TRUE(ValidateLiveDirective(revoke, desired, kLocal, kLocalBoot).ok());
 
   control::Directive initialize = live;
-  initialize.kind =
-      control::WireDirectiveKind::kInitializeEmptyPopulation;
+  initialize.kind = control::WireDirectiveKind::kInitializeEmptyPopulation;
   initialize.source_node_id = std::string(40, '0');
   initialize.source_assignment_id = {};
   initialize.source_boot_id = std::string(40, '0');
@@ -494,11 +646,9 @@ TEST(MetaDirectiveValidationTest,
   initialize.authority.assignment_id = projected.authority.assignment_id;
   desired.current_directives.front() = projected;
   desired.current_directives.front().kind = initialize.kind;
-  desired.current_directives.front().source_node_id =
-      initialize.source_node_id;
+  desired.current_directives.front().source_node_id = initialize.source_node_id;
   desired.current_directives.front().source_assignment_id = {};
-  desired.current_directives.front().source_boot_id =
-      initialize.source_boot_id;
+  desired.current_directives.front().source_boot_id = initialize.source_boot_id;
   desired.current_directives.front().source_replication_history_id =
       initialize.source_replication_history_id;
   desired.current_directives.front().payload = initialize.payload;
@@ -512,10 +662,10 @@ TEST(MetaDirectiveValidationTest,
   stale_initialize_boot.target_boot_id = kRemoteBoot;
   desired.current_directives.front().recipient_boot_id = kRemoteBoot;
   desired.current_directives.front().target_boot_id = kRemoteBoot;
-  EXPECT_EQ(ValidateLiveDirective(stale_initialize_boot, desired, kLocal,
-                                  kLocalBoot)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(
+      ValidateLiveDirective(stale_initialize_boot, desired, kLocal, kLocalBoot)
+          .code(),
+      absl::StatusCode::kFailedPrecondition);
   desired.current_directives.front().recipient_boot_id = kLocalBoot;
   desired.current_directives.front().target_boot_id = kLocalBoot;
 
@@ -560,6 +710,748 @@ TEST(MetaDirectiveResultTest, SeparatesRejectionsFromExecutionFailures) {
             control::DirectiveResultStatus::kFailed);
 }
 
+TEST(MetaFailoverControlAdapterTest,
+     TranslatesTheExactActionOnlyForItsCandidateIncarnation) {
+  constexpr char kSource[] = "1111111111111111111111111111111111111111";
+  constexpr char kCandidate[] = "2222222222222222222222222222222222222222";
+  constexpr char kCandidateBoot[] = "3333333333333333333333333333333333333333";
+  constexpr char kSourceBoot[] = "4444444444444444444444444444444444444444";
+  constexpr char kSourceHistory[] = "5555555555555555555555555555555555555555";
+  control::WireId128 transition_id{};
+  transition_id[0] = 0x11;
+  control::WireId128 action_id{};
+  action_id[0] = 0x22;
+  control::WireId128 active_grant_action_id{};
+  active_grant_action_id[0] = 0x23;
+  control::WireId128 source_assignment{};
+  source_assignment[0] = 0x33;
+  control::WireId128 candidate_assignment{};
+  candidate_assignment[0] = 0x44;
+  const control::WireHash256 manifest = control::ComputeSha256("manifest-a");
+  DesiredClusterControl desired{
+      .identity_ =
+          {
+              .group_id_ = "group-a",
+              .group_term_ = 8,
+              .authority_version_ = 12,
+              .grant_revision_ = 14,
+              .config_epoch_ = 16,
+              .manifest_revision_ = 18,
+              .manifest_digest_ = manifest,
+              .partition_replication_epoch_ = 20,
+              .members_ = {{.node_id_ = *NodeId::Parse(kSource),
+                            .assignment_id_ =
+                                AssignmentId::FromBytes(source_assignment)},
+                           {.node_id_ = *NodeId::Parse(kCandidate),
+                            .assignment_id_ =
+                                AssignmentId::FromBytes(candidate_assignment)}},
+          },
+      .owner_ =
+          PreparedMemberAssignment{
+              .node_id_ = *NodeId::Parse(kSource),
+              .assignment_id_ = AssignmentId::FromBytes(source_assignment),
+          },
+      .grant_active_ = true,
+      .grant_duration_ms_ = 5000,
+      .grant_policy_id_ = "default",
+      .grant_policy_version_ = 3,
+      // A prior failover's action remains bound to the current owner's grant
+      // while this new candidate action is prepared.
+      .activation_action_id_ =
+          FailoverActionId::FromBytes(active_grant_action_id),
+      .failover_transition_ =
+          PreparedFailoverTransition{
+              .transition_id_ = FailoverTransitionId::FromBytes(transition_id),
+              .revision_ = 23,
+              .mode_ = PreparedFailoverMode::kControlled,
+              .target_term_ = 9,
+              .candidate_action_ =
+                  PreparedFailoverAction{
+                      .action_id_ = FailoverActionId::FromBytes(action_id),
+                      .candidate_ =
+                          {
+                              .node_id_ = *NodeId::Parse(kCandidate),
+                              .assignment_id_ =
+                                  AssignmentId::FromBytes(candidate_assignment),
+                              .boot_id_ = *NodeId::Parse(kCandidateBoot),
+                          },
+                      .domain_ =
+                          {
+                              .source_group_term_ = 8,
+                              .source_node_id_ = *NodeId::Parse(kSource),
+                              .source_assignment_id_ =
+                                  AssignmentId::FromBytes(source_assignment),
+                              .source_boot_id_ = *NodeId::Parse(kSourceBoot),
+                              .source_history_id_ =
+                                  *NodeId::Parse(kSourceHistory),
+                              .flow_count_ = 2,
+                          },
+                      .authorization_ =
+                          PreparedFailoverAuthorization{
+                              .authorized_revision_ = 21,
+                              .loss_if_cutover_ = PreparedFailoverLoss::kNone,
+                          },
+                  },
+          },
+  };
+
+  auto translated = detail::TranslateClusterFailoverControl(
+      desired, ReplicationIdentity{.local_node_id_ = kCandidate,
+                                   .boot_id_ = kCandidateBoot,
+                                   .local_history_id_ = kCandidate});
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  ASSERT_TRUE(translated->candidate_action_.has_value());
+  // The prior owner's grant provenance is not a pending activation on the new
+  // candidate. Passing both ids to ReplicationManager is an impossible local
+  // state even though they legally coexist in committed Group state.
+  EXPECT_FALSE(translated->pending_activation_action_id_.has_value());
+  const DesiredClusterFailoverAction& action = *translated->candidate_action_;
+  EXPECT_EQ(action.transition_id_, transition_id);
+  EXPECT_EQ(action.action_id_, action_id);
+  EXPECT_EQ(action.transition_revision_, 23u);
+  EXPECT_EQ(action.mode_, ClusterFailoverMode::kControlled);
+  EXPECT_EQ(action.target_term_, 9u);
+  EXPECT_EQ(action.committed_group_term_, 8u);
+  EXPECT_TRUE(action.committed_grant_active_);
+  EXPECT_EQ(action.authorized_revision_, 21u);
+  EXPECT_EQ(action.group_id_, "group-a");
+  EXPECT_EQ(action.candidate_node_id_, kCandidate);
+  EXPECT_EQ(action.candidate_assignment_id_,
+            AssignmentId::FromBytes(candidate_assignment).ToHexString());
+  EXPECT_EQ(action.candidate_boot_id_, kCandidateBoot);
+  EXPECT_EQ(action.domain_.source_group_term_, 8u);
+  EXPECT_EQ(action.domain_.source_node_id_, kSource);
+  EXPECT_EQ(action.domain_.source_assignment_id_,
+            AssignmentId::FromBytes(source_assignment).ToHexString());
+  EXPECT_EQ(action.domain_.source_boot_id_, kSourceBoot);
+  EXPECT_EQ(action.domain_.source_history_id_, kSourceHistory);
+  EXPECT_EQ(action.domain_.flow_count_, 2u);
+  EXPECT_EQ(action.manifest_revision_, 18u);
+  EXPECT_EQ(action.manifest_id_.bytes_, manifest);
+  EXPECT_EQ(action.partition_replication_epoch_, 20u);
+
+  translated = detail::TranslateClusterFailoverControl(
+      desired, ReplicationIdentity{.local_node_id_ = kSource,
+                                   .boot_id_ = kSourceBoot,
+                                   .local_history_id_ = kSourceHistory});
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->candidate_action_.has_value());
+  ASSERT_TRUE(translated->pending_activation_action_id_.has_value());
+  EXPECT_EQ(*translated->pending_activation_action_id_, active_grant_action_id);
+  ASSERT_TRUE(translated->source_pause_.has_value());
+  const DesiredClusterSourcePause& pause = *translated->source_pause_;
+  EXPECT_EQ(pause.transition_id_, transition_id);
+  EXPECT_EQ(pause.transition_revision_, 23u);
+  EXPECT_EQ(pause.group_id_, "group-a");
+  EXPECT_EQ(pause.source_node_id_, kSource);
+  EXPECT_EQ(pause.source_assignment_id_,
+            AssignmentId::FromBytes(source_assignment).ToHexString());
+  EXPECT_EQ(pause.source_boot_id_, kSourceBoot);
+  EXPECT_EQ(pause.source_history_id_, kSourceHistory);
+  EXPECT_EQ(pause.source_group_term_, 8u);
+  EXPECT_EQ(pause.flow_count_, 2u);
+  EXPECT_EQ(pause.manifest_revision_, 18u);
+  EXPECT_EQ(pause.manifest_id_.bytes_, manifest);
+  EXPECT_EQ(pause.partition_replication_epoch_, 20u);
+
+  ReplicationIdentity mismatched_source{
+      .local_node_id_ = kSource,
+      .boot_id_ = kSourceBoot,
+      .local_history_id_ = kSourceHistory,
+  };
+  mismatched_source.boot_id_ = kCandidateBoot;
+  translated =
+      detail::TranslateClusterFailoverControl(desired, mismatched_source);
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->source_pause_.has_value());
+
+  mismatched_source.boot_id_ = kSourceBoot;
+  mismatched_source.local_history_id_ = kCandidate;
+  translated =
+      detail::TranslateClusterFailoverControl(desired, mismatched_source);
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->source_pause_.has_value());
+
+  desired.owner_->assignment_id_ =
+      AssignmentId::FromBytes(candidate_assignment);
+  translated = detail::TranslateClusterFailoverControl(
+      desired, ReplicationIdentity{.local_node_id_ = kSource,
+                                   .boot_id_ = kSourceBoot,
+                                   .local_history_id_ = kSourceHistory});
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->source_pause_.has_value());
+
+  desired.owner_->assignment_id_ = AssignmentId::FromBytes(source_assignment);
+  desired.failover_transition_->mode_ = PreparedFailoverMode::kUncontrolled;
+  translated = detail::TranslateClusterFailoverControl(
+      desired, ReplicationIdentity{.local_node_id_ = kSource,
+                                   .boot_id_ = kSourceBoot,
+                                   .local_history_id_ = kSourceHistory});
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->source_pause_.has_value());
+}
+
+TEST(MetaFailoverControlAdapterTest,
+     OmitsAnotherCandidateAndRetainsCutoverActivation) {
+  constexpr char kCandidate[] = "1111111111111111111111111111111111111111";
+  constexpr char kCandidateBoot[] = "2222222222222222222222222222222222222222";
+  constexpr char kLocal[] = "3333333333333333333333333333333333333333";
+  control::WireId128 transition_id{};
+  transition_id[0] = 0x71;
+  control::WireId128 action_id{};
+  action_id[0] = 0x72;
+  DesiredClusterControl desired{
+      .failover_transition_ =
+          PreparedFailoverTransition{
+              .transition_id_ = FailoverTransitionId::FromBytes(transition_id),
+              .revision_ = 1,
+              .mode_ = PreparedFailoverMode::kUncontrolled,
+              .target_term_ = 2,
+              .candidate_action_ =
+                  PreparedFailoverAction{
+                      .action_id_ = FailoverActionId::FromBytes(action_id),
+                      .candidate_ =
+                          {
+                              .node_id_ = *NodeId::Parse(kCandidate),
+                              .boot_id_ = *NodeId::Parse(kCandidateBoot),
+                          },
+                  },
+          },
+  };
+  const ReplicationIdentity local{
+      .local_node_id_ = kLocal,
+      .boot_id_ = kCandidateBoot,
+      .local_history_id_ = kLocal,
+  };
+
+  auto translated = detail::TranslateClusterFailoverControl(desired, local);
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->candidate_action_.has_value());
+  EXPECT_FALSE(translated->source_pause_.has_value());
+  EXPECT_FALSE(translated->pending_activation_action_id_.has_value());
+
+  desired.failover_transition_.reset();
+  desired.grant_active_ = true;
+  desired.activation_action_id_ = FailoverActionId::FromBytes(action_id);
+  desired.owner_ = PreparedMemberAssignment{
+      .node_id_ = *NodeId::Parse(kLocal),
+  };
+  translated = detail::TranslateClusterFailoverControl(desired, local);
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->candidate_action_.has_value());
+  EXPECT_FALSE(translated->source_pause_.has_value());
+  ASSERT_TRUE(translated->pending_activation_action_id_.has_value());
+  EXPECT_EQ(*translated->pending_activation_action_id_, action_id);
+
+  translated = detail::TranslateClusterFailoverControl(
+      desired, ReplicationIdentity{.local_node_id_ = kCandidate,
+                                   .boot_id_ = kCandidateBoot,
+                                   .local_history_id_ = kCandidate});
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->pending_activation_action_id_.has_value());
+}
+
+TEST(MetaFailoverControlAdapterTest,
+     ReconcilesSteadyOwnerOnlyAfterTransitionFinishes) {
+  constexpr char kOwner[] = "1111111111111111111111111111111111111111";
+  constexpr char kReplica[] = "2222222222222222222222222222222222222222";
+  constexpr char kReplicaBoot[] = "3333333333333333333333333333333333333333";
+  control::WireId128 owner_assignment{};
+  owner_assignment[0] = 0x41;
+  control::WireId128 replica_assignment{};
+  replica_assignment[0] = 0x42;
+  const auto manifest = PopulationManifest::Create({{3, 7}, {9, 11}});
+  ASSERT_TRUE(manifest.ok()) << manifest.status();
+  DesiredClusterControl desired{
+      .identity_ =
+          {
+              .group_id_ = "group-a",
+              .group_term_ = 8,
+              .manifest_revision_ = 18,
+              .manifest_digest_ = manifest->id().bytes_,
+              .partition_replication_epoch_ = 20,
+              .members_ =
+                  {
+                      {.node_id_ = *NodeId::Parse(kOwner),
+                       .assignment_id_ =
+                           AssignmentId::FromBytes(owner_assignment)},
+                      {.node_id_ = *NodeId::Parse(kReplica),
+                       .assignment_id_ =
+                           AssignmentId::FromBytes(replica_assignment)},
+                  },
+          },
+      .owner_ =
+          PreparedMemberAssignment{
+              .node_id_ = *NodeId::Parse(kOwner),
+              .assignment_id_ = AssignmentId::FromBytes(owner_assignment),
+          },
+      .owner_endpoint_ =
+          PreparedReplicationEndpoint{
+              .node_id_ = *NodeId::Parse(kOwner),
+              .host_ = "10.0.0.1",
+              .port_ = 7001,
+              .tls_port_ = 17001,
+          },
+      .manifest_entries_ = {{3, 7}, {9, 11}},
+      .steady_replication_enabled_ = true,
+  };
+  const ReplicationIdentity replica{
+      .local_node_id_ = kReplica,
+      .boot_id_ = kReplicaBoot,
+      .local_history_id_ = kReplica,
+  };
+
+  auto translated = detail::TranslateClusterFailoverControl(desired, replica,
+                                                            /*use_tls=*/false);
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_TRUE(translated->reconcile_follow_owner_);
+  ASSERT_TRUE(translated->follow_owner_.has_value());
+  EXPECT_EQ(translated->follow_owner_->local_node_id_, kReplica);
+  EXPECT_EQ(translated->follow_owner_->local_assignment_id_,
+            AssignmentId::FromBytes(replica_assignment).ToHexString());
+  EXPECT_EQ(translated->follow_owner_->local_boot_id_, kReplicaBoot);
+  EXPECT_EQ(translated->follow_owner_->owner_node_id_, kOwner);
+  EXPECT_EQ(translated->follow_owner_->owner_assignment_id_,
+            AssignmentId::FromBytes(owner_assignment).ToHexString());
+  EXPECT_EQ(translated->follow_owner_->owner_endpoint_,
+            (ReplicaOfConfig{"10.0.0.1", 7001}));
+  EXPECT_EQ(translated->follow_owner_->manifest_entries_,
+            (std::vector<PopulationManifestEntry>{{3, 7}, {9, 11}}));
+  ASSERT_EQ(translated->follow_owner_->members_.size(), 2U);
+
+  translated = detail::TranslateClusterFailoverControl(desired, replica,
+                                                       /*use_tls=*/true);
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  ASSERT_TRUE(translated->follow_owner_.has_value());
+  EXPECT_EQ(translated->follow_owner_->owner_endpoint_,
+            (ReplicaOfConfig{"10.0.0.1", 17001}));
+
+  translated = detail::TranslateClusterFailoverControl(
+      desired,
+      ReplicationIdentity{.local_node_id_ = kOwner,
+                          .boot_id_ = kReplicaBoot,
+                          .local_history_id_ = kOwner},
+      /*use_tls=*/false);
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_TRUE(translated->reconcile_follow_owner_);
+  ASSERT_TRUE(translated->follow_owner_.has_value());
+  EXPECT_EQ(translated->follow_owner_->local_node_id_, kOwner);
+  EXPECT_FALSE(translated->follow_owner_->owner_endpoint_.has_value());
+
+  desired.population_transition_expected_ = true;
+  translated = detail::TranslateClusterFailoverControl(desired, replica,
+                                                       /*use_tls=*/false);
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->reconcile_follow_owner_);
+  EXPECT_FALSE(translated->follow_owner_.has_value());
+  desired.population_transition_expected_ = false;
+
+  desired.failover_transition_ = PreparedFailoverTransition{};
+  translated = detail::TranslateClusterFailoverControl(desired, replica,
+                                                       /*use_tls=*/false);
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->reconcile_follow_owner_);
+  EXPECT_FALSE(translated->follow_owner_.has_value());
+}
+
+TEST(MetaFailoverControlAdapterTest, TranslatesExactPromotionActivation) {
+  constexpr char kCandidate[] = "1111111111111111111111111111111111111111";
+  constexpr char kBoot[] = "2222222222222222222222222222222222222222";
+  control::WireId128 action_id{};
+  action_id[0] = 0x51;
+  control::WireId128 assignment{};
+  assignment[0] = 0x52;
+  Sha256Digest manifest{};
+  manifest[0] = 0x53;
+  const PreparedFailoverActivation prepared{
+      .action_id_ = FailoverActionId::FromBytes(action_id),
+      .group_id_ = "group-a",
+      .candidate_node_id_ = *NodeId::Parse(kCandidate),
+      .candidate_assignment_id_ = AssignmentId::FromBytes(assignment),
+      .candidate_boot_id_ = *NodeId::Parse(kBoot),
+      .target_term_ = 9,
+      .manifest_revision_ = 18,
+      .manifest_digest_ = manifest,
+      .partition_replication_epoch_ = 20,
+  };
+
+  EXPECT_EQ(detail::TranslateClusterFailoverActivation(prepared),
+            (ClusterFailoverActivation{
+                .action_id_ = action_id,
+                .group_id_ = "group-a",
+                .candidate_node_id_ = kCandidate,
+                .candidate_assignment_id_ =
+                    AssignmentId::FromBytes(assignment).ToHexString(),
+                .candidate_boot_id_ = kBoot,
+                .target_term_ = 9,
+                .manifest_revision_ = 18,
+                .manifest_id_ = PopulationManifestId{manifest},
+                .partition_replication_epoch_ = 20,
+            }));
+}
+
+TEST(MetaFailoverHeartbeatTest, ProjectsExactPreparedContext) {
+  ClusterFailoverTransitionId transition_id{};
+  transition_id[0] = 0x11;
+  ClusterFailoverActionId action_id{};
+  action_id[0] = 0x22;
+  ClusterPreparedContextId context_id{};
+  context_id[0] = 0x33;
+  ClusterPreparedContextHash context_hash{};
+  context_hash[0] = 0x44;
+  control::WireId128 assignment{};
+  assignment[0] = 0x55;
+  constexpr char kCandidate[] = "2222222222222222222222222222222222222222";
+  constexpr char kCandidateBoot[] = "3333333333333333333333333333333333333333";
+  constexpr char kSourceHistory[] = "4444444444444444444444444444444444444444";
+  ClusterFailoverActionStatus status{
+      .state_ = ClusterFailoverActionState::kPrepared,
+      .action_ =
+          DesiredClusterFailoverAction{
+              .transition_id_ = transition_id,
+              .action_id_ = action_id,
+              .candidate_node_id_ = kCandidate,
+              .candidate_assignment_id_ =
+                  AssignmentId::FromBytes(assignment).ToHexString(),
+              .candidate_boot_id_ = kCandidateBoot,
+              .domain_ = {.source_history_id_ = kSourceHistory},
+          },
+      .prepared_ =
+          ClusterFailoverPreparedContext{
+              .transition_id_ = transition_id,
+              .action_id_ = action_id,
+              .context_id_ = context_id,
+              .context_hash_ = context_hash,
+              .promotion_ = {.parent_history_id_ = kSourceHistory},
+          },
+  };
+
+  auto observation = detail::ProjectClusterFailoverObservation(status);
+  ASSERT_TRUE(observation.ok()) << observation.status();
+  ASSERT_TRUE(observation->has_value());
+  const auto* prepared =
+      std::get_if<control::CandidatePrepared>(&**observation);
+  ASSERT_NE(prepared, nullptr);
+  EXPECT_EQ(prepared->transition_id, transition_id);
+  EXPECT_EQ(prepared->action_id, action_id);
+  EXPECT_EQ(prepared->candidate_node_id, kCandidate);
+  EXPECT_EQ(prepared->candidate_assignment_id, assignment);
+  EXPECT_EQ(prepared->candidate_boot_id, kCandidateBoot);
+  EXPECT_EQ(prepared->prepared_context_id, context_id);
+  EXPECT_EQ(prepared->prepared_context_hash, context_hash);
+}
+
+TEST(MetaFailoverHeartbeatTest, ProjectsOnlyAnExactStableSourcePause) {
+  ClusterFailoverTransitionId transition_id{};
+  transition_id[0] = 0x91;
+  control::WireId128 assignment{};
+  assignment[0] = 0x92;
+  constexpr char kSource[] = "8888888888888888888888888888888888888888";
+  constexpr char kSourceBoot[] = "9999999999999999999999999999999999999999";
+  constexpr char kSourceHistory[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  ClusterSourcePauseStatus status{
+      .desired_ =
+          DesiredClusterSourcePause{
+              .transition_id_ = transition_id,
+              .transition_revision_ = 17,
+              .group_id_ = "group-a",
+              .source_node_id_ = kSource,
+              .source_assignment_id_ =
+                  AssignmentId::FromBytes(assignment).ToHexString(),
+              .source_boot_id_ = kSourceBoot,
+              .source_history_id_ = kSourceHistory,
+              .source_group_term_ = 11,
+              .flow_count_ = 2,
+          },
+      .stable_next_lsns_ = std::vector<std::uint64_t>{31, 47},
+  };
+
+  auto observation = detail::ProjectClusterSourcePauseObservation(status);
+  ASSERT_TRUE(observation.ok()) << observation.status();
+  ASSERT_TRUE(observation->has_value());
+  const auto* paused = std::get_if<control::SourcePaused>(&**observation);
+  ASSERT_NE(paused, nullptr);
+  EXPECT_EQ(paused->transition_id, transition_id);
+  EXPECT_EQ(paused->source_node_id, kSource);
+  EXPECT_EQ(paused->source_assignment_id, assignment);
+  EXPECT_EQ(paused->source_boot_id, kSourceBoot);
+  EXPECT_EQ(paused->source_history_id, kSourceHistory);
+  EXPECT_EQ(paused->source_group_term, 11u);
+  EXPECT_EQ(paused->stable_next_lsns, (std::vector<std::uint64_t>{31, 47}));
+
+  status.stable_next_lsns_.reset();
+  observation = detail::ProjectClusterSourcePauseObservation(status);
+  ASSERT_TRUE(observation.ok()) << observation.status();
+  EXPECT_FALSE(observation->has_value());
+
+  status.stable_next_lsns_ = std::vector<std::uint64_t>{31, 47};
+  status.failure_detail_ = "source population identity changed";
+  observation = detail::ProjectClusterSourcePauseObservation(status);
+  ASSERT_TRUE(observation.ok()) << observation.status();
+  EXPECT_FALSE(observation->has_value());
+
+  status.failure_detail_.clear();
+  status.stable_next_lsns_ = std::vector<std::uint64_t>{31};
+  observation = detail::ProjectClusterSourcePauseObservation(status);
+  ASSERT_TRUE(observation.ok()) << observation.status();
+  EXPECT_FALSE(observation->has_value());
+
+  status.stable_next_lsns_ = std::vector<std::uint64_t>{31, 47};
+  status.desired_.reset();
+  observation = detail::ProjectClusterSourcePauseObservation(status);
+  ASSERT_TRUE(observation.ok()) << observation.status();
+  EXPECT_FALSE(observation->has_value());
+}
+
+TEST(MetaFailoverHeartbeatTest, ProjectsFailureFromTheExactActionPopulation) {
+  ClusterFailoverTransitionId transition_id{};
+  transition_id[0] = 0x61;
+  ClusterFailoverActionId action_id{};
+  action_id[0] = 0x62;
+  control::WireId128 assignment{};
+  assignment[0] = 0x63;
+  ClusterPreparedContextHash manifest{};
+  manifest[0] = 0x64;
+  constexpr char kCandidate[] = "6666666666666666666666666666666666666666";
+  constexpr char kCandidateBoot[] = "7777777777777777777777777777777777777777";
+  ClusterFailoverActionStatus status{
+      .state_ = ClusterFailoverActionState::kFailed,
+      .action_ =
+          DesiredClusterFailoverAction{
+              .transition_id_ = transition_id,
+              .action_id_ = action_id,
+              .group_id_ = "group-a",
+              .candidate_node_id_ = kCandidate,
+              .candidate_assignment_id_ =
+                  AssignmentId::FromBytes(assignment).ToHexString(),
+              .candidate_boot_id_ = kCandidateBoot,
+              .manifest_revision_ = 71,
+              .manifest_id_ = PopulationManifestId{manifest},
+              .partition_replication_epoch_ = 72,
+          },
+      .prepared_ = std::nullopt,
+      .failure_class_ = "prepare_durability",
+      .failure_detail_ = "promotion base could not be persisted",
+  };
+
+  auto observation = detail::ProjectClusterFailoverObservation(status);
+  ASSERT_TRUE(observation.ok()) << observation.status();
+  ASSERT_TRUE(observation->has_value());
+  const auto* failed = std::get_if<control::ActionFailed>(&**observation);
+  ASSERT_NE(failed, nullptr);
+  EXPECT_EQ(failed->transition_id, transition_id);
+  EXPECT_EQ(failed->action_id, action_id);
+  EXPECT_EQ(failed->candidate_node_id, kCandidate);
+  EXPECT_EQ(failed->candidate_assignment_id, assignment);
+  EXPECT_EQ(failed->candidate_boot_id, kCandidateBoot);
+  EXPECT_EQ(failed->population_manifest_revision, 71u);
+  EXPECT_EQ(failed->population_manifest_digest, manifest);
+  EXPECT_EQ(failed->partition_replication_epoch, 72u);
+  EXPECT_EQ(failed->failure_class, "prepare_durability");
+  EXPECT_EQ(failed->failure_detail, "promotion base could not be persisted");
+}
+
+TEST(MetaFailoverHeartbeatTest,
+     ExactPreparingAndPreparedActionsBridgeHistoryRotationUntilCutover) {
+  const ReplicationIdentity established{
+      .local_node_id_ = "1111111111111111111111111111111111111111",
+      .boot_id_ = "2222222222222222222222222222222222222222",
+      .local_history_id_ = "3333333333333333333333333333333333333333",
+  };
+  ReplicationIdentity child = established;
+  child.local_history_id_ = "4444444444444444444444444444444444444444";
+
+  EXPECT_TRUE(
+      detail::ReplicationIdentityRequiresMetaReconnect(established, child));
+
+  control::WireId128 transition_id{};
+  transition_id[0] = 0x11;
+  control::WireId128 action_id{};
+  action_id[0] = 0x12;
+  control::WireId128 candidate_assignment{};
+  candidate_assignment[0] = 0x13;
+  control::WireId128 source_assignment{};
+  source_assignment[0] = 0x14;
+  control::WireHash256 manifest{};
+  manifest[0] = 0x15;
+  constexpr char kSource[] = "5555555555555555555555555555555555555555";
+  constexpr char kSourceBoot[] = "6666666666666666666666666666666666666666";
+  constexpr char kSourceHistory[] = "7777777777777777777777777777777777777777";
+
+  DesiredClusterFailoverAction action{
+      .transition_id_ = transition_id,
+      .action_id_ = action_id,
+      .transition_revision_ = 7,
+      .mode_ = ClusterFailoverMode::kControlled,
+      .target_term_ = 9,
+      .committed_group_term_ = 8,
+      .committed_grant_active_ = true,
+      .authorized_revision_ = 7,
+      .group_id_ = "group-a",
+      .candidate_node_id_ = child.local_node_id_,
+      .candidate_assignment_id_ =
+          AssignmentId::FromBytes(candidate_assignment).ToHexString(),
+      .candidate_boot_id_ = child.boot_id_,
+      .domain_ = {.source_group_term_ = 8,
+                  .source_node_id_ = kSource,
+                  .source_assignment_id_ =
+                      AssignmentId::FromBytes(source_assignment).ToHexString(),
+                  .source_boot_id_ = kSourceBoot,
+                  .source_history_id_ = kSourceHistory,
+                  .flow_count_ = 2},
+      .manifest_revision_ = 10,
+      .manifest_id_ = PopulationManifestId{manifest},
+      .partition_replication_epoch_ = 11,
+  };
+  control::WireDesiredGroup group{
+      .group_id = "group-a",
+      .owner_node_id = std::string(kSource),
+      .owner_assignment_id = source_assignment,
+      .group_term = 8,
+      .authority_version = 3,
+      .grant_revision = 4,
+      .grant_duration_ms = 5000,
+      .grant_active = true,
+      .manifest_revision = 10,
+      .manifest_digest = manifest,
+      .partition_replication_epoch = 11,
+      .failover_transition =
+          control::WireFailoverTransition{
+              .transition_id = transition_id,
+              .revision = 7,
+              .mode = control::WireFailoverMode::kControlled,
+              .target_term = 9,
+              .candidate_action =
+                  control::WireFailoverCandidateAction{
+                      .action_id = action_id,
+                      .candidate = {.node_id = child.local_node_id_,
+                                    .assignment_id = candidate_assignment,
+                                    .boot_id = child.boot_id_},
+                      .domain = {.source_group_term = 8,
+                                 .source_node_id = kSource,
+                                 .source_assignment_id = source_assignment,
+                                 .source_boot_id = kSourceBoot,
+                                 .source_history_id = kSourceHistory,
+                                 .flow_count = 2},
+                      .authorization =
+                          control::WireFailoverAuthorization{
+                              .authorized_revision = 7,
+                              .loss_if_cutover =
+                                  control::WireFailoverLoss::kNone}}},
+  };
+  std::array groups{group};
+
+  ClusterFailoverActionStatus preparing{
+      .state_ = ClusterFailoverActionState::kPreparing,
+      .action_ = action,
+  };
+  EXPECT_TRUE(detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+      established, child, preparing, groups));
+  EXPECT_EQ(
+      detail::EvaluateMetaSessionReplicationIdentity(established, child,
+                                                     preparing, groups),
+      (detail::MetaSessionReplicationIdentityDecision{
+          .requires_reconnect_ = false, .suppress_ordinary_role_ = true}));
+
+  ClusterFailoverActionStatus prepared{
+      .state_ = ClusterFailoverActionState::kPrepared,
+      .action_ = action,
+      .prepared_ =
+          ClusterFailoverPreparedContext{
+              .transition_id_ = transition_id,
+              .action_id_ = action_id,
+              .promotion_ = {.parent_history_id_ = kSourceHistory,
+                             .child_history_id_ = child.local_history_id_}},
+  };
+  EXPECT_TRUE(detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+      established, child, prepared, groups));
+  EXPECT_EQ(
+      detail::EvaluateMetaSessionReplicationIdentity(established, child,
+                                                     prepared, groups),
+      (detail::MetaSessionReplicationIdentityDecision{
+          .requires_reconnect_ = false, .suppress_ordinary_role_ = true}));
+
+  auto wrong_child = prepared;
+  wrong_child.prepared_->promotion_.child_history_id_ =
+      established.local_history_id_;
+  EXPECT_FALSE(
+      detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+          established, child, wrong_child, groups));
+
+  auto wrong_parent = prepared;
+  wrong_parent.prepared_->promotion_.parent_history_id_ =
+      established.local_history_id_;
+  EXPECT_FALSE(
+      detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+          established, child, wrong_parent, groups));
+  auto wrong_parent_observation =
+      detail::ProjectClusterFailoverObservation(wrong_parent);
+  ASSERT_FALSE(wrong_parent_observation.ok());
+  EXPECT_EQ(wrong_parent_observation.status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  auto wrong_action = prepared;
+  wrong_action.action_->action_id_[0] ^= 0xff;
+  EXPECT_FALSE(
+      detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+          established, child, wrong_action, groups));
+
+  groups[0].failover_transition->revision++;
+  EXPECT_FALSE(
+      detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+          established, child, prepared, groups));
+  groups[0] = group;
+
+  groups[0]
+      .failover_transition->candidate_action->authorization
+      ->authorized_revision++;
+  EXPECT_FALSE(
+      detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+          established, child, prepared, groups));
+  groups[0] = group;
+
+  groups[0].failover_transition->candidate_action->authorization.reset();
+  EXPECT_FALSE(
+      detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+          established, child, prepared, groups));
+  groups[0] = group;
+
+  groups[0].failover_transition.reset();
+  EXPECT_FALSE(
+      detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+          established, child, prepared, groups));
+  EXPECT_EQ(
+      detail::EvaluateMetaSessionReplicationIdentity(established, child,
+                                                     prepared, groups),
+      (detail::MetaSessionReplicationIdentityDecision{
+          .requires_reconnect_ = true, .suppress_ordinary_role_ = false}));
+
+  ReplicationIdentity restarted = established;
+  restarted.boot_id_ = "8888888888888888888888888888888888888888";
+  EXPECT_TRUE(
+      detail::ReplicationIdentityRequiresMetaReconnect(established, restarted));
+  groups[0] = group;
+  EXPECT_FALSE(
+      detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
+          established, restarted, prepared, groups));
+}
+
+TEST(MetaFailoverHeartbeatTest, WaitingStatesAreNotWorkflowEvidence) {
+  constexpr std::array states{
+      ClusterFailoverActionState::kNone,
+      ClusterFailoverActionState::kWaitingForAuthorization,
+      ClusterFailoverActionState::kWaitingForPopulation,
+      ClusterFailoverActionState::kPreparing,
+      ClusterFailoverActionState::kRetrying,
+  };
+  for (const ClusterFailoverActionState state : states) {
+    auto observation = detail::ProjectClusterFailoverObservation(
+        ClusterFailoverActionStatus{.state_ = state});
+    ASSERT_TRUE(observation.ok()) << observation.status();
+    EXPECT_FALSE(observation->has_value());
+  }
+}
+
 TEST(MetaCandidateProgressTest,
      HeartbeatPreservesWholeTypedCandidateWhileShorteningSummary) {
   control::WireId128 assignment{};
@@ -579,6 +1471,7 @@ TEST(MetaCandidateProgressTest,
                       .group_id = "group-a",
                       .assignment_id = assignment,
                       .group_term = 1,
+                      .source_group_term = 1,
                       .manifest_revision = 1,
                       .manifest_digest = {},
                       .partition_replication_epoch = 2,
@@ -604,7 +1497,6 @@ TEST(MetaCandidateProgressTest,
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   EXPECT_LE(encoded->size(), control::kMaxFramePayloadBytes);
   EXPECT_LT(heartbeat.health.summary.size(), control::kMaxFramePayloadBytes);
-
 }
 
 TEST(MetaAuthorityIdentityTest, UsesVersionedUnambiguousEncoding) {

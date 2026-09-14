@@ -535,13 +535,12 @@ std::optional<CommandReply> RegisterClusterBlockingWriteAttemptImpl(
   };
   for (;;) {
     auto admission = std::make_shared<const cluster::AuthorityAdmission>(
-        runtime->authority_guard_.CaptureAndAdmit(
-            view, cluster::LeaseClockNow()));
+        runtime->authority_guard_.CaptureAndAdmit(view,
+                                                  cluster::LeaseClockNow()));
     const cluster::Decision& decision = admission->decision();
     if (decision.kind_ == cluster::Decision::Kind::kServe) {
       if (runtime->authority_guard_.RegisterAndRecheck(
-              *admission, celer::ThisWorker().id_,
-              cluster::LeaseClockNow(),
+              *admission, celer::ThisWorker().id_, cluster::LeaseClockNow(),
               guards) == cluster::RecheckResult::kOk) {
         // Per-type mutation callbacks still perform their owner-side recheck;
         // point them at the same fresh proof protected by `guards`.
@@ -574,6 +573,10 @@ std::optional<CommandReply> RegisterClusterBlockingWriteAttemptImpl(
       case cluster::Decision::Kind::kLoading:
         reply.encoded_ = reply_builder.AppendError(
             "LOADING Redis is loading the dataset in memory");
+        break;
+      case cluster::Decision::Kind::kTryAgain:
+        reply.encoded_ =
+            reply_builder.AppendError("TRYAGAIN Failover in progress");
         break;
       case cluster::Decision::Kind::kCloseConnection:
       case cluster::Decision::Kind::kServeStaleRead:
@@ -930,8 +933,8 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
       // drain the retired assignment independently of dormant clients.
       cluster::AuthorityInFlightGuards attempt_guards;
       if (std::optional<CommandReply> fenced =
-              RegisterClusterBlockingWriteAttempt(
-                  request, reply_builder, &attempt_guards);
+              RegisterClusterBlockingWriteAttempt(request, reply_builder,
+                                                  &attempt_guards);
           fenced.has_value()) {
         co_return std::move(*fenced);
       }

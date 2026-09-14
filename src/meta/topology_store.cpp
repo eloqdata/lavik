@@ -68,8 +68,7 @@ absl::Status ValidateClusterLifecycle(
     case MetaClusterLifecycle::kCreated:
       if (lifecycle.revision_ == 2 && !root_is_zero &&
           lifecycle.genesis_commit_index_ != 0 &&
-          lifecycle.terminal_outcome_ ==
-              MetaClusterTerminalOutcome::kCreated &&
+          lifecycle.terminal_outcome_ == MetaClusterTerminalOutcome::kCreated &&
           lifecycle.failure_summary_.empty()) {
         return absl::OkStatus();
       }
@@ -167,8 +166,7 @@ absl::Status MetaTopologyStore::FailClusterCreate(
     return MetaDomainRejectError(
         "cluster failure summary is empty, unsafe, or over cap");
   }
-  if (cluster_lifecycle_.state_ ==
-          MetaClusterLifecycle::kProvisioningFailed &&
+  if (cluster_lifecycle_.state_ == MetaClusterLifecycle::kProvisioningFailed &&
       cluster_lifecycle_.revision_ == 2 &&
       cluster_lifecycle_.root_operation_id_ == root_operation_id &&
       cluster_lifecycle_.terminal_outcome_ ==
@@ -559,6 +557,105 @@ absl::Status MetaTopologyStore::SetGroupConfigEpoch(
   return absl::OkStatus();
 }
 
+absl::Status MetaTopologyStore::InstallFailoverTransition(
+    const std::string& group_id, const MetaFailoverTransition& transition,
+    std::uint64_t committed_index) {
+  const auto it = groups_.find(group_id);
+  if (it == groups_.end()) {
+    return MetaDomainRejectError(absl::StrCat("unknown group ", group_id));
+  }
+  if (committed_index == 0) {
+    return MetaDomainRejectError("failover transition revision is zero");
+  }
+
+  MetaFailoverTransition installed = transition;
+  installed.revision_ = committed_index;
+  if (auto status = ValidateMetaFailoverTransition(installed); !status.ok()) {
+    return status;
+  }
+
+  GroupState& group = it->second;
+  if (group.failover_transition_ == installed) {
+    return absl::OkStatus();
+  }
+  if (group.failover_transition_.has_value()) {
+    return MetaDomainRejectError("group already has a failover transition");
+  }
+  group.failover_transition_ = std::move(installed);
+  return absl::OkStatus();
+}
+
+absl::Status MetaTopologyStore::ReplaceFailoverTransition(
+    const std::string& group_id,
+    const MetaFailoverTransitionRef& expected_transition,
+    const MetaFailoverTransition& replacement, std::uint64_t committed_index) {
+  const auto it = groups_.find(group_id);
+  if (it == groups_.end()) {
+    return MetaDomainRejectError(absl::StrCat("unknown group ", group_id));
+  }
+  if (IsZero(expected_transition.transition_id_) ||
+      expected_transition.revision_ == 0) {
+    return MetaDomainRejectError("invalid failover transition reference");
+  }
+  if (committed_index == 0) {
+    return MetaDomainRejectError("failover transition revision is zero");
+  }
+
+  MetaFailoverTransition installed = replacement;
+  installed.revision_ = committed_index;
+  if (installed.transition_id_ != expected_transition.transition_id_) {
+    return MetaDomainRejectError(
+        "failover replacement cannot change transition identity");
+  }
+  if (auto status = ValidateMetaFailoverTransition(installed); !status.ok()) {
+    return status;
+  }
+
+  GroupState& group = it->second;
+  if (group.failover_transition_ == installed) {
+    return absl::OkStatus();
+  }
+  if (!group.failover_transition_.has_value()) {
+    return MetaDomainRejectError("group has no active failover transition");
+  }
+  const MetaFailoverTransition& current = *group.failover_transition_;
+  if (current.transition_id_ != expected_transition.transition_id_ ||
+      current.revision_ != expected_transition.revision_) {
+    return MetaDomainRejectError("stale failover transition reference");
+  }
+  if (committed_index <= current.revision_) {
+    return MetaDomainRejectError(
+        "failover transition revision must strictly increase");
+  }
+  group.failover_transition_ = std::move(installed);
+  return absl::OkStatus();
+}
+
+absl::Status MetaTopologyStore::ClearFailoverTransition(
+    const std::string& group_id,
+    const MetaFailoverTransitionRef& expected_transition) {
+  const auto it = groups_.find(group_id);
+  if (it == groups_.end()) {
+    return MetaDomainRejectError(absl::StrCat("unknown group ", group_id));
+  }
+  if (IsZero(expected_transition.transition_id_) ||
+      expected_transition.revision_ == 0) {
+    return MetaDomainRejectError("invalid failover transition reference");
+  }
+
+  GroupState& group = it->second;
+  if (!group.failover_transition_.has_value()) {
+    return absl::OkStatus();
+  }
+  if (group.failover_transition_->transition_id_ !=
+          expected_transition.transition_id_ ||
+      group.failover_transition_->revision_ != expected_transition.revision_) {
+    return MetaDomainRejectError("stale failover transition reference");
+  }
+  group.failover_transition_.reset();
+  return absl::OkStatus();
+}
+
 absl::Status MetaTopologyStore::SetTopologyEpoch(
     std::uint64_t new_topology_epoch) {
   // Same value already held: idempotent no-op accept.
@@ -585,6 +682,7 @@ std::optional<MetaTopologyGroupView> MetaTopologyStore::FindGroup(
   MetaTopologyGroupView view;
   view.group_id_ = group_id;
   view.record_ = group.record_;
+  view.failover_transition_ = group.failover_transition_;
   view.config_epoch_ = group.config_epoch_;
   view.revision_ = group.revision_;
   view.members_.reserve(group.members_.size());
@@ -649,6 +747,14 @@ std::string MetaTopologyStore::Serialize() const {
     w.WriteU64(group.record_.partition_replication_epoch_);
     w.WriteU64(group.config_epoch_);
     w.WriteU64(group.revision_);
+    w.WriteOptional(
+        group.failover_transition_,
+        [](MetaWriter& nested, const MetaFailoverTransition& transition) {
+          // Store mutation and snapshot restore both validate this value, so
+          // the infallible topology serializer cannot encounter a codec
+          // domain error here.
+          (void)WriteMetaFailoverTransition(nested, transition);
+        });
     w.WriteCount(static_cast<std::uint32_t>(group.members_.size()));
     for (const auto& [node_id, member] : group.members_) {
       w.WriteString(node_id);
@@ -705,9 +811,8 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   if (!terminal_outcome.ok()) return terminal_outcome.status();
   auto failure_summary = r.ReadString(kMaxMetaClusterFailureSummaryBytes);
   if (!failure_summary.ok()) return failure_summary.status();
-  if (*lifecycle_state >
-          static_cast<std::uint8_t>(
-              MetaClusterLifecycle::kProvisioningFailed) ||
+  if (*lifecycle_state > static_cast<std::uint8_t>(
+                             MetaClusterLifecycle::kProvisioningFailed) ||
       *terminal_outcome >
           static_cast<std::uint8_t>(
               MetaClusterTerminalOutcome::kProvisioningFailed)) {
@@ -727,8 +832,7 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   store.cluster_lifecycle_.terminal_outcome_ =
       static_cast<MetaClusterTerminalOutcome>(*terminal_outcome);
   store.cluster_lifecycle_.failure_summary_ = std::move(*failure_summary);
-  if (absl::Status status =
-          ValidateClusterLifecycle(store.cluster_lifecycle_);
+  if (absl::Status status = ValidateClusterLifecycle(store.cluster_lifecycle_);
       !status.ok()) {
     return status;
   }
@@ -752,6 +856,9 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     if (!config_epoch.ok()) return config_epoch.status();
     auto revision = r.ReadU64();
     if (!revision.ok()) return revision.status();
+    auto failover_transition = r.ReadOptional<MetaFailoverTransition>(
+        [](MetaReader& nested) { return ReadMetaFailoverTransition(nested); });
+    if (!failover_transition.ok()) return failover_transition.status();
     auto members = r.ReadList<MetaGroupMember>(
         kMaxMetaNodes, [](MetaReader& rr) -> absl::StatusOr<MetaGroupMember> {
           auto node_id = rr.ReadString(kMetaNodeIdBytes);
@@ -789,6 +896,7 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     group.record_.partition_replication_epoch_ = *partition_epoch;
     group.config_epoch_ = *config_epoch;
     group.revision_ = *revision;
+    group.failover_transition_ = std::move(*failover_transition);
     if ((group.record_.population_manifest_revision_ == 0) !=
         IsZero(group.record_.population_manifest_digest_)) {
       return MetaFailStopError(

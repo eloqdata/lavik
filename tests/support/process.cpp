@@ -11,6 +11,7 @@
 
 #include <cerrno>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -109,7 +110,14 @@ std::string ReadFile(const std::filesystem::path& path) {
 }
 
 TempDirectory::TempDirectory(std::string_view label) {
-  std::string pattern = "/tmp/keylane-" + std::string(label) + "-XXXXXX";
+  std::filesystem::path root = "/tmp";
+  if (const char* configured = std::getenv("KEYLANE_TEST_TMPDIR");
+      configured != nullptr) {
+    if (configured[0] == '\0') Fail("KEYLANE_TEST_TMPDIR is empty");
+    root = configured;
+  }
+  std::string pattern =
+      (root / ("keylane-" + std::string(label) + "-XXXXXX")).string();
   std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
   mutable_pattern.push_back('\0');
   char* created = ::mkdtemp(mutable_pattern.data());

@@ -314,9 +314,9 @@ result follows this failure path and reports the affected Group and node.
 The failure is retained across Meta restart; it does not automatically start
 a new destructive attempt. Meta recovery preserves successful
 population work and finishes bookkeeping without initializing it again.
-Meta-member addition/removal has a separate recovery driver; Data
-migration and failover orchestration do not become recoverable merely because
-the operation journal exists.
+Meta-member addition/removal and per-Group failover have separate recovery
+drivers. Other Data migrations do not become recoverable merely because the
+operation journal exists.
 
 Interpret `cluster_state` independently from `READY / NOT READY / RETRYABLE`:
 
@@ -340,6 +340,116 @@ identity that has never contacted the current leader (`data_unobserved`). If a
 previously accepted or actively retrying node lacks a current accepted session,
 the blocker is `data_session_missing`. Later Group blockers continue to name
 missing projection, health, or population evidence.
+
+## Run a controlled Group failover
+
+Use controlled failover for planned maintenance while the current owner is
+healthy. The command discovers the current Meta leader, verifies that the
+cluster is `created` and the Group exists, submits one durable operation, and
+returns without waiting for cutover:
+
+```sh
+keylane-ctl failover group-1 \
+  --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  --failover-timeout-ms 120000
+```
+
+`--failover-timeout-ms` is the absolute workflow budget and accepts 1 through
+86,400,000 ms; its default is 120 seconds. It is separate from
+`--timeout-ms`, which bounds leader discovery and the Admin request/response
+and defaults to five seconds. The CLI generates one operation id and absolute
+deadline. An embedding that retries must preserve that exact pair; extending
+the deadline on retry changes the request.
+
+Exit 0 means only that the operation was committed. The CLI prints its commit
+index and operation id; follow the latter on the current leader:
+
+```sh
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  getop <operation-id>
+```
+
+The expected replies are `OK submitted` before a Group transition is installed,
+`OK running` while the controlled transition owns the Group, `OK completed
+failover-completed` after cutover, or `OK aborted <reason>` after a controlled
+failure. `getop` is a committed local read rather than a linearizable follower
+query, so use leader discovery again after a leadership change. Generic
+`abortop`, `completeop`, and `submitop` reject the failover kind as
+`workflow-owned`; there is no operator abort command for an accepted failover.
+
+Exit 2 is an explicit preflight or proposal rejection, including a
+`resource-exhausted` durability/resource gate that rejects before Raft append.
+Exit 3 means the mutation may have committed; the error retains the generated
+operation id, which must be resolved with `getop` before submitting another
+failover. Exit 1 is a local, discovery, TLS, or transport failure known to occur
+before submission. A malformed or otherwise untrustworthy response after
+submission is exit 3 because the commit outcome cannot be inferred from it.
+
+During a healthy controlled transition, the old owner continues reads and
+lease renewal but all source mutations, including `PUBLISH`, return `TRYAGAIN
+Failover in progress`. Work admitted before the pause drains before Meta uses
+the stable source frontier. The chosen candidate must catch up through that
+frontier and prepare before the atomic cutover, so a completed controlled
+failover records `loss=none`. After cutover, full desired state makes every
+non-owner follow the new owner through native CONTINUE or FULL. The former
+owner retires its old source backlog locally when it consumes that relationship;
+no separate cleanup command is required.
+
+Post-cutover reconciliation may start destructive FULL on several followers
+concurrently when none can CONTINUE from the new owner. Those followers
+withdraw their old Ready and Candidate observations until FULL finishes. If
+the new owner fails during that window, Meta may report no eligible Candidate
+and an uncontrolled transition will wait rather than cut over without a
+current recovery observation. Node count alone does not show that a
+recoverable population remains: monitor follower population readiness and
+candidate observations before planned work on a newly promoted owner, and
+treat simultaneous FULL activity as a second-failure availability risk. There
+is no Meta rebuild queue or Data admission controller to serialize these
+replacements.
+
+If the candidate is confirmed unavailable while the old owner is still usable,
+Meta aborts the controlled operation immediately and service remains on the old
+owner. The absolute deadline also aborts the controlled operation. If the
+source remains unavailable beyond the observation grace, or its boot/history
+is definitely replaced, Meta records the controlled request as aborted, fences
+the old authority, and continues the same Group transition in uncontrolled
+mode. An uncontrolled candidate failure selects a fresh action instead of
+waiting for that process to restart when an eligible replacement exists;
+otherwise Meta clears the failed action and waits with no candidate. A Meta
+leader change temporarily waits for fresh boot-scoped observations, then
+resumes from the committed Group transition. The warmup covers the configured
+election upper bound plus Data's maximum reconnect sleep (and is never shorter
+than the observation TTL); do not infer failure solely from that bounded
+interval. A candidate's current-session disconnect or typed action failure
+takes effect immediately. An exact source disconnect starts its independent
+grace and degrades only if that grace expires or replacement evidence appears.
+
+Uncontrolled recovery has Redis Cluster-grade asynchronous loss semantics. It
+tries eligible compatibility domains from newest source term to older terms,
+selects the strongest candidate inside one comparable domain, and records
+`loss=unknown` for every newly selected action. An exact healthy action already
+authorized lossless may instead retain `loss=none` across controlled
+degradation. Writes acknowledged only by the failed owner may be absent on an
+unknown-loss cutover.
+There is currently no automatic owner-failure detector that starts an
+uncontrolled transition for an unrelated outage; only a controlled transition
+already in progress can degrade automatically. Treat this as an availability
+gap when planning failure detection and RTO.
+
+For postmortems, search Meta logs for `failover event=`. Accepted transition
+commits carry `mode`, `group`, `transition`, `action`, `loss`, and
+`commit_index`; candidate selection/replacement/domain fallback and bounded
+abort/degrade reasons add their relevant source or candidate fields. Entries
+with possible data loss are warnings. Opaque variable values are canonical
+percent-encoded, so split fields on whitespace and the first `=` before
+decoding values; embedded whitespace, control bytes, and `=` cannot create new
+fields. Collection is at least once, including when logs from several Meta
+replicas are combined, so deduplicate records by `commit_index`. Exact
+post-effect replay suppresses the state-dependent event for
+`SetUncontrolledCandidate` and post-Begin `AbortControlledFailover`, because
+their original candidate classification or action identifier is no longer in
+the post-state. Correlate the resulting sequence with the authoritative durable
+audit chain and the terminal `getop` result.
 
 For plaintext remote administration, configure a listener and connect without
 TLS arguments:
@@ -824,9 +934,12 @@ cluster; startup intentionally refuses to guess at a conversion.
 
 The physical segmented-WAL container remains v1 while the first release is
 unpublished. Cluster lifecycle makes the `MetaTopologyStore` codec and Raft
-command envelope v2; older development directories therefore fail loudly at
-decode. Other durable stores retain their own exact version markers. Equal
-version numbers in any one layer do not make incompatible builds safe to mix.
+command envelope v2. Per-Group failover transitions and their typed commands
+extend that pre-release v2 layout in place without another version bump or an
+old-v2 decoder; development directories from a different v2 layout therefore
+fail loudly or must be rebuilt. Other durable stores retain their own exact
+version markers. Equal version numbers in any one layer do not make
+incompatible builds safe to mix.
 There is no mixed-format window or in-band format switch. For a binary-only
 change that preserves every durable format, replace one follower at a time,
 wait for catch-up, and replace the leader last. Before any replacement, back
@@ -892,9 +1005,12 @@ large enough prefix first, then run `pruneaudit <through-index>`. The proposed
 prune must make the serialized audit window smaller after accounting for the
 prune command's own audit record.
 
-For retained live operations, use this bounded sequence. Keep the original
-operation id and sequence returned by `submitop`; `getop` does not return the
-sequence and is not a linearizable read on a follower.
+For retained live generic operations, use this bounded sequence. Keep the
+original operation id and sequence returned by `submitop`; `getop` does not
+return the sequence and is not a linearizable read on a follower. Cluster
+Create, Meta membership, and failover are workflow-owned and reject
+`abortop`/`completeop`; their dedicated reconcilers, rather than this fail-safe
+escape hatch, own safe terminalization.
 
 ```sh
 keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \

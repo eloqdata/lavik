@@ -330,8 +330,9 @@ TEST(ReplicationGroupTest,
 
   keylane::ReplicationGroup restarted("target-1", "target-boot-2");
   EXPECT_EQ(restarted.state(), keylane::ReplicationGroupState::kNotReady);
-  EXPECT_EQ(restarted.BeginEmptyPopulation(identity, Manifest()).status().code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(
+      restarted.BeginEmptyPopulation(identity, Manifest()).status().code(),
+      absl::StatusCode::kFailedPrecondition);
 
   identity.target_boot_id_ = "target-boot-2";
   EXPECT_TRUE(restarted.BeginEmptyPopulation(identity, Manifest()).ok());
@@ -360,6 +361,30 @@ TEST(ReplicationGroupTest, RejectsStaleIdentityAndAttemptReuse) {
   ASSERT_TRUE(group.Abort(second.identity_).ok());
   EXPECT_EQ(group.BeginRebuild(first, Manifest()).status().code(),
             absl::StatusCode::kFailedPrecondition);
+}
+
+TEST(ReplicationGroupTest,
+     DerivesFreshRevisionFromWatermarkAfterProofInvalidation) {
+  keylane::ReplicationGroup group("target-1", "target-boot-1");
+  auto initial = group.NextDirectiveRevision(7);
+  ASSERT_TRUE(initial.ok()) << initial.status();
+  EXPECT_EQ(*initial, 1);
+
+  auto first = Directive();
+  first.identity_.directive_revision_ = 41;
+  ASSERT_TRUE(group.BeginRebuild(first, Manifest()).ok());
+  ASSERT_TRUE(group.Abort(first.identity_).ok());
+
+  auto same_term = group.NextDirectiveRevision(7);
+  ASSERT_TRUE(same_term.ok()) << same_term.status();
+  EXPECT_EQ(*same_term, 42);
+  auto newer_term = group.NextDirectiveRevision(8);
+  ASSERT_TRUE(newer_term.ok()) << newer_term.status();
+  EXPECT_EQ(*newer_term, 1);
+  EXPECT_EQ(group.NextDirectiveRevision(6).status().code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(group.NextDirectiveRevision(0).status().code(),
+            absl::StatusCode::kInvalidArgument);
 }
 
 TEST(ReplicationGroupTest, RejectsTargetLocalEpochFromPreviousAttempt) {

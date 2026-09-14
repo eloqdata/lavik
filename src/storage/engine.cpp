@@ -146,6 +146,11 @@ void StorageEngine::SetExpirationAuthority(bool authority) noexcept {
   impl_->SetExpirationAuthority(authority);
 }
 
+absl::Status StorageEngine::SetExpirationAuthorityUntil(
+    std::chrono::nanoseconds deadline_since_boot) noexcept {
+  return impl_->SetExpirationAuthorityUntil(deadline_since_boot);
+}
+
 std::uint32_t StorageEngine::ExpirationPauseCount() const noexcept {
   return impl_->ExpirationPauseCount();
 }
@@ -380,9 +385,10 @@ bool StorageEngine::TryEnqueueReplicationCommand(
 }
 
 Task<absl::Status> StorageEngine::PublishEphemeralReplicationCommand(
-    std::uint16_t partition_id, std::vector<std::string> args) {
-  return impl_->PublishEphemeralReplicationCommand(partition_id,
-                                                   std::move(args));
+    std::uint16_t partition_id, std::vector<std::string> args,
+    MutationPrecondition mutation_precondition) {
+  return impl_->PublishEphemeralReplicationCommand(
+      partition_id, std::move(args), std::move(mutation_precondition));
 }
 
 absl::StatusOr<PreparedReplicationCommandPublication>

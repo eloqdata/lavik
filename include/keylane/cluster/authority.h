@@ -40,6 +40,8 @@ struct RequestView {
   // rejects persistent zero-key mutations because no group-scoped authority
   // can prove ownership for them.
   std::span<const std::uint16_t> slots_;
+  // Includes runtime-only mutations such as PUBLISH that advance the
+  // replication frontier even though they do not change the keyspace.
   bool is_write_ = false;
   bool connection_readonly_ = false;  // READONLY issued on this connection
   // Whitelisted during recovery (PING/INFO/CLUSTER/CONFIG/... — the Redis
@@ -55,6 +57,7 @@ struct Decision {
     kClusterDownUnbound,  // first key's slot has no owner
     kCrossSlot,           // keys span multiple slots
     kLoading,             // no ready ServingState / storage not ready
+    kTryAgain,            // controlled failover paused local mutations
     kCloseConnection,     // execution outcome undeterminable (never from Admit)
   };
   Kind kind_ = Kind::kServe;

@@ -1,6 +1,7 @@
 #include "keylane/meta/commands.h"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -527,6 +528,1114 @@ absl::StatusOr<MetaGrantSpec> ReadGrantSpec(MetaReader& r) {
   auto policy_version = r.ReadU64();
   if (!policy_version.ok()) return policy_version.status();
   return MetaGrantSpec{*lease, std::move(*policy_id), *policy_version};
+}
+
+template <std::size_t N>
+bool IsZero(const std::array<std::uint8_t, N>& value) {
+  return std::all_of(value.begin(), value.end(),
+                     [](std::uint8_t byte) { return byte == 0; });
+}
+
+bool IsCanonicalNodeId(std::string_view value) {
+  return value.size() == kMetaNodeIdBytes &&
+         std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+           return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+         });
+}
+
+absl::Status ValidateFailoverGroupId(std::string_view group_id) {
+  if (group_id.empty() || group_id.size() > kMaxMetaGroupIdBytes) {
+    return MetaDomainRejectError("failover group_id is empty or over cap");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFailoverCandidate(const MetaFailoverCandidate& candidate) {
+  if (!IsCanonicalNodeId(candidate.node_id_) ||
+      IsZero(candidate.assignment_id_) || IsZero(candidate.boot_id_)) {
+    return MetaDomainRejectError("invalid failover candidate identity");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFailoverDomain(
+    const MetaFailoverCompatibilityDomain& domain) {
+  if (domain.source_group_term_ == 0 ||
+      !IsCanonicalNodeId(domain.source_node_id_) ||
+      IsZero(domain.source_assignment_id_) || IsZero(domain.source_boot_id_) ||
+      IsZero(domain.source_history_id_) || domain.flow_count_ == 0 ||
+      domain.flow_count_ > kMaxMetaFailoverFlowCount) {
+    return MetaDomainRejectError("invalid failover compatibility domain");
+  }
+  return absl::OkStatus();
+}
+
+bool IsValidFailoverLoss(MetaFailoverLoss loss) {
+  return loss == MetaFailoverLoss::kNone || loss == MetaFailoverLoss::kUnknown;
+}
+
+absl::Status ValidateFailoverAuthorization(
+    const MetaFailoverAuthorization& authorization) {
+  if (authorization.authorized_revision_ == 0 ||
+      !IsValidFailoverLoss(authorization.loss_if_cutover_)) {
+    return MetaDomainRejectError("invalid failover authorization");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFailoverAction(const MetaFailoverCandidateAction& action) {
+  if (IsZero(action.action_id_)) {
+    return MetaDomainRejectError("failover action id is zero");
+  }
+  if (auto status = ValidateFailoverCandidate(action.candidate_);
+      !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverDomain(action.domain_); !status.ok()) {
+    return status;
+  }
+  if (action.authorization_.has_value()) {
+    return ValidateFailoverAuthorization(*action.authorization_);
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFailoverTransitionRef(
+    const MetaFailoverTransitionRef& transition) {
+  if (IsZero(transition.transition_id_) || transition.revision_ == 0) {
+    return MetaDomainRejectError("invalid failover transition reference");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFailoverDeadline(std::uint64_t deadline_unix_ms) {
+  if (deadline_unix_ms == 0 ||
+      deadline_unix_ms > static_cast<std::uint64_t>(
+                             std::numeric_limits<std::int64_t>::max())) {
+    return MetaDomainRejectError("invalid failover absolute deadline");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFailoverTransitionImpl(
+    const MetaFailoverTransition& transition) {
+  if (IsZero(transition.transition_id_) || transition.revision_ == 0 ||
+      transition.target_term_ == 0) {
+    return MetaDomainRejectError("invalid failover transition identity");
+  }
+  if (transition.mode_ != MetaFailoverMode::kControlled &&
+      transition.mode_ != MetaFailoverMode::kUncontrolled) {
+    return MetaDomainRejectError("invalid failover transition mode");
+  }
+  if (auto status = ValidateMetaGrantSpec(transition.successor_grant_);
+      !status.ok()) {
+    return status;
+  }
+  if (transition.candidate_action_.has_value()) {
+    if (auto status = ValidateFailoverAction(*transition.candidate_action_);
+        !status.ok()) {
+      return status;
+    }
+    const MetaFailoverCandidateAction& action = *transition.candidate_action_;
+    if (action.domain_.source_group_term_ >= transition.target_term_) {
+      return MetaDomainRejectError(
+          "failover source term must precede the target term");
+    }
+    if (action.authorization_.has_value() &&
+        action.authorization_->authorized_revision_ > transition.revision_) {
+      return MetaDomainRejectError(
+          "failover authorization revision exceeds transition revision");
+    }
+  }
+
+  if (transition.mode_ == MetaFailoverMode::kControlled) {
+    if (!transition.controlled_.has_value() ||
+        !transition.candidate_action_.has_value()) {
+      return MetaDomainRejectError(
+          "controlled failover requires operation and candidate action");
+    }
+    if (IsZero(transition.controlled_->operation_id_)) {
+      return MetaDomainRejectError("controlled failover operation id is zero");
+    }
+    if (auto status = ValidateFailoverDeadline(
+            transition.controlled_->absolute_deadline_unix_ms_);
+        !status.ok()) {
+      return status;
+    }
+    const MetaFailoverCandidateAction& action = *transition.candidate_action_;
+    if (action.candidate_.node_id_ == action.domain_.source_node_id_) {
+      return MetaDomainRejectError(
+          "controlled failover candidate must differ from source");
+    }
+    if (action.authorization_.has_value() &&
+        action.authorization_->loss_if_cutover_ != MetaFailoverLoss::kNone) {
+      return MetaDomainRejectError(
+          "controlled failover authorization must be lossless");
+    }
+  } else if (transition.controlled_.has_value()) {
+    return MetaDomainRejectError(
+        "uncontrolled failover cannot reference a controlled operation");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status FailStopDecodedFailover(absl::Status status) {
+  if (status.ok()) return status;
+  return MetaFailStopError(status.message());
+}
+
+void WriteFailoverCandidateUnchecked(MetaWriter& writer,
+                                     const MetaFailoverCandidate& candidate) {
+  writer.WriteString(candidate.node_id_);
+  WriteFixedArray(writer, candidate.assignment_id_);
+  WriteFixedArray(writer, candidate.boot_id_);
+}
+
+absl::StatusOr<MetaFailoverCandidate> ReadFailoverCandidate(
+    MetaReader& reader) {
+  auto node_id = ReadNodeId(reader);
+  if (!node_id.ok()) return node_id.status();
+  auto assignment_id = ReadFixedArray<16>(reader);
+  if (!assignment_id.ok()) return assignment_id.status();
+  auto boot_id = ReadFixedArray<kMetaBootIncarnationBytes>(reader);
+  if (!boot_id.ok()) return boot_id.status();
+  MetaFailoverCandidate candidate{std::move(*node_id), *assignment_id,
+                                  *boot_id};
+  if (auto status =
+          FailStopDecodedFailover(ValidateFailoverCandidate(candidate));
+      !status.ok()) {
+    return status;
+  }
+  return candidate;
+}
+
+void WriteFailoverDomainUnchecked(
+    MetaWriter& writer, const MetaFailoverCompatibilityDomain& domain) {
+  writer.WriteU64(domain.source_group_term_);
+  writer.WriteString(domain.source_node_id_);
+  WriteFixedArray(writer, domain.source_assignment_id_);
+  WriteFixedArray(writer, domain.source_boot_id_);
+  WriteFixedArray(writer, domain.source_history_id_);
+  writer.WriteU32(domain.flow_count_);
+}
+
+absl::StatusOr<MetaFailoverCompatibilityDomain> ReadFailoverDomain(
+    MetaReader& reader) {
+  auto source_group_term = reader.ReadU64();
+  if (!source_group_term.ok()) return source_group_term.status();
+  auto source_node_id = ReadNodeId(reader);
+  if (!source_node_id.ok()) return source_node_id.status();
+  auto source_assignment_id = ReadFixedArray<16>(reader);
+  if (!source_assignment_id.ok()) return source_assignment_id.status();
+  auto source_boot_id = ReadFixedArray<kMetaBootIncarnationBytes>(reader);
+  if (!source_boot_id.ok()) return source_boot_id.status();
+  auto source_history_id =
+      ReadFixedArray<kMetaReplicationHistoryIdBytes>(reader);
+  if (!source_history_id.ok()) return source_history_id.status();
+  auto flow_count = reader.ReadU32();
+  if (!flow_count.ok()) return flow_count.status();
+  MetaFailoverCompatibilityDomain domain{
+      *source_group_term, std::move(*source_node_id), *source_assignment_id,
+      *source_boot_id,    *source_history_id,         *flow_count};
+  if (auto status = FailStopDecodedFailover(ValidateFailoverDomain(domain));
+      !status.ok()) {
+    return status;
+  }
+  return domain;
+}
+
+void WriteFailoverAuthorizationUnchecked(
+    MetaWriter& writer, const MetaFailoverAuthorization& authorization) {
+  writer.WriteU64(authorization.authorized_revision_);
+  writer.WriteU8(static_cast<std::uint8_t>(authorization.loss_if_cutover_));
+}
+
+absl::StatusOr<MetaFailoverAuthorization> ReadFailoverAuthorization(
+    MetaReader& reader) {
+  auto revision = reader.ReadU64();
+  if (!revision.ok()) return revision.status();
+  auto loss = reader.ReadU8();
+  if (!loss.ok()) return loss.status();
+  MetaFailoverAuthorization authorization{*revision,
+                                          static_cast<MetaFailoverLoss>(*loss)};
+  if (auto status =
+          FailStopDecodedFailover(ValidateFailoverAuthorization(authorization));
+      !status.ok()) {
+    return status;
+  }
+  return authorization;
+}
+
+void WriteFailoverActionUnchecked(MetaWriter& writer,
+                                  const MetaFailoverCandidateAction& action) {
+  WriteFixedArray(writer, action.action_id_);
+  WriteFailoverCandidateUnchecked(writer, action.candidate_);
+  WriteFailoverDomainUnchecked(writer, action.domain_);
+  writer.WriteOptional(
+      action.authorization_,
+      [](MetaWriter& nested, const MetaFailoverAuthorization& authorization) {
+        WriteFailoverAuthorizationUnchecked(nested, authorization);
+      });
+}
+
+absl::StatusOr<MetaFailoverCandidateAction> ReadFailoverAction(
+    MetaReader& reader) {
+  auto action_id = ReadFixedArray<16>(reader);
+  if (!action_id.ok()) return action_id.status();
+  auto candidate = ReadFailoverCandidate(reader);
+  if (!candidate.ok()) return candidate.status();
+  auto domain = ReadFailoverDomain(reader);
+  if (!domain.ok()) return domain.status();
+  auto authorization = reader.ReadOptional<MetaFailoverAuthorization>(
+      [](MetaReader& nested) { return ReadFailoverAuthorization(nested); });
+  if (!authorization.ok()) return authorization.status();
+  MetaFailoverCandidateAction action{*action_id, std::move(*candidate),
+                                     std::move(*domain),
+                                     std::move(*authorization)};
+  if (auto status = FailStopDecodedFailover(ValidateFailoverAction(action));
+      !status.ok()) {
+    return status;
+  }
+  return action;
+}
+
+void WriteFailoverTransitionRefUnchecked(
+    MetaWriter& writer, const MetaFailoverTransitionRef& transition) {
+  WriteFixedArray(writer, transition.transition_id_);
+  writer.WriteU64(transition.revision_);
+}
+
+absl::StatusOr<MetaFailoverTransitionRef> ReadFailoverTransitionRef(
+    MetaReader& reader) {
+  auto transition_id = ReadFixedArray<16>(reader);
+  if (!transition_id.ok()) return transition_id.status();
+  auto revision = reader.ReadU64();
+  if (!revision.ok()) return revision.status();
+  MetaFailoverTransitionRef transition{*transition_id, *revision};
+  if (auto status =
+          FailStopDecodedFailover(ValidateFailoverTransitionRef(transition));
+      !status.ok()) {
+    return status;
+  }
+  return transition;
+}
+
+void WriteFailoverTransitionUnchecked(
+    MetaWriter& writer, const MetaFailoverTransition& transition) {
+  WriteFixedArray(writer, transition.transition_id_);
+  writer.WriteU64(transition.revision_);
+  writer.WriteU8(static_cast<std::uint8_t>(transition.mode_));
+  writer.WriteU64(transition.target_term_);
+  (void)WriteGrantSpec(writer, transition.successor_grant_);
+  writer.WriteOptional(
+      transition.candidate_action_,
+      [](MetaWriter& nested, const MetaFailoverCandidateAction& action) {
+        WriteFailoverActionUnchecked(nested, action);
+      });
+  writer.WriteOptional(
+      transition.controlled_,
+      [](MetaWriter& nested, const MetaControlledFailover& controlled) {
+        WriteFixedArray(nested, controlled.operation_id_);
+        nested.WriteU64(controlled.absolute_deadline_unix_ms_);
+      });
+}
+
+absl::StatusOr<MetaFailoverTransition> ReadFailoverTransitionUnchecked(
+    MetaReader& reader) {
+  auto transition_id = ReadFixedArray<16>(reader);
+  if (!transition_id.ok()) return transition_id.status();
+  auto revision = reader.ReadU64();
+  if (!revision.ok()) return revision.status();
+  auto mode = reader.ReadU8();
+  if (!mode.ok()) return mode.status();
+  auto target_term = reader.ReadU64();
+  if (!target_term.ok()) return target_term.status();
+  auto successor_grant = ReadGrantSpec(reader);
+  if (!successor_grant.ok()) return successor_grant.status();
+  auto action = reader.ReadOptional<MetaFailoverCandidateAction>(
+      [](MetaReader& nested) { return ReadFailoverAction(nested); });
+  if (!action.ok()) return action.status();
+  auto controlled = reader.ReadOptional<MetaControlledFailover>(
+      [](MetaReader& nested) -> absl::StatusOr<MetaControlledFailover> {
+        auto operation_id = ReadFixedArray<16>(nested);
+        if (!operation_id.ok()) return operation_id.status();
+        auto deadline = nested.ReadU64();
+        if (!deadline.ok()) return deadline.status();
+        return MetaControlledFailover{*operation_id, *deadline};
+      });
+  if (!controlled.ok()) return controlled.status();
+  return MetaFailoverTransition{
+      *transition_id,
+      *revision,
+      static_cast<MetaFailoverMode>(*mode),
+      *target_term,
+      std::move(*successor_grant),
+      std::move(*action),
+      std::move(*controlled),
+  };
+}
+
+template <typename Command>
+absl::Status ValidateFailoverGroupAnchors(const Command& command) {
+  const bool manifest_digest_is_zero =
+      IsZero(command.expected_population_manifest_digest_);
+  if (!IsCanonicalNodeId(command.expected_owner_node_id_) ||
+      IsZero(command.expected_owner_assignment_id_) ||
+      command.expected_membership_revision_ == 0 ||
+      command.expected_group_term_ == 0 ||
+      command.expected_authority_version_ == 0 ||
+      command.expected_grant_revision_ == 0 ||
+      ((command.expected_population_manifest_revision_ == 0) !=
+       manifest_digest_is_zero) ||
+      command.expected_config_epoch_ == 0) {
+    return MetaDomainRejectError("invalid failover group anchors");
+  }
+  return absl::OkStatus();
+}
+
+template <typename Command>
+void WriteFailoverGroupAnchorsUnchecked(MetaWriter& writer,
+                                        const Command& command) {
+  writer.WriteString(command.expected_owner_node_id_);
+  WriteFixedArray(writer, command.expected_owner_assignment_id_);
+  writer.WriteU64(command.expected_membership_revision_);
+  writer.WriteU64(command.expected_group_term_);
+  writer.WriteU64(command.expected_authority_version_);
+  writer.WriteU64(command.expected_grant_revision_);
+  writer.WriteU64(command.expected_population_manifest_revision_);
+  WriteFixedArray(writer, command.expected_population_manifest_digest_);
+  writer.WriteU64(command.expected_partition_replication_epoch_);
+  writer.WriteU64(command.expected_config_epoch_);
+}
+
+template <typename Command>
+absl::Status ReadFailoverGroupAnchors(MetaReader& reader, Command& command) {
+  auto owner_node_id = ReadNodeId(reader);
+  if (!owner_node_id.ok()) return owner_node_id.status();
+  auto owner_assignment_id = ReadFixedArray<16>(reader);
+  if (!owner_assignment_id.ok()) return owner_assignment_id.status();
+  auto membership_revision = reader.ReadU64();
+  if (!membership_revision.ok()) return membership_revision.status();
+  auto group_term = reader.ReadU64();
+  if (!group_term.ok()) return group_term.status();
+  auto authority_version = reader.ReadU64();
+  if (!authority_version.ok()) return authority_version.status();
+  auto grant_revision = reader.ReadU64();
+  if (!grant_revision.ok()) return grant_revision.status();
+  auto manifest_revision = reader.ReadU64();
+  if (!manifest_revision.ok()) return manifest_revision.status();
+  auto manifest_digest = ReadFixedArray<32>(reader);
+  if (!manifest_digest.ok()) return manifest_digest.status();
+  auto partition_epoch = reader.ReadU64();
+  if (!partition_epoch.ok()) return partition_epoch.status();
+  auto config_epoch = reader.ReadU64();
+  if (!config_epoch.ok()) return config_epoch.status();
+
+  command.expected_owner_node_id_ = std::move(*owner_node_id);
+  command.expected_owner_assignment_id_ = *owner_assignment_id;
+  command.expected_membership_revision_ = *membership_revision;
+  command.expected_group_term_ = *group_term;
+  command.expected_authority_version_ = *authority_version;
+  command.expected_grant_revision_ = *grant_revision;
+  command.expected_population_manifest_revision_ = *manifest_revision;
+  command.expected_population_manifest_digest_ = *manifest_digest;
+  command.expected_partition_replication_epoch_ = *partition_epoch;
+  command.expected_config_epoch_ = *config_epoch;
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFailoverOperation(
+    const MetaOperationId& operation_id,
+    std::uint64_t expected_operation_revision) {
+  if (IsZero(operation_id) || expected_operation_revision ==
+                                  std::numeric_limits<std::uint64_t>::max()) {
+    return MetaDomainRejectError("invalid controlled failover operation CAS");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFailoverReason(std::string_view reason) {
+  if (reason.empty() || reason.size() > kMaxMetaAbortReasonBytes) {
+    return MetaDomainRejectError("failover reason is empty or over cap");
+  }
+  return absl::OkStatus();
+}
+
+template <typename Command>
+absl::Status ValidateFailoverBeginBase(const Command& command) {
+  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
+    return status;
+  }
+  if (IsZero(command.transition_id_)) {
+    return MetaDomainRejectError("failover transition id is zero");
+  }
+  if (auto status = ValidateMetaGrantSpec(command.successor_grant_);
+      !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverGroupAnchors(command); !status.ok()) {
+    return status;
+  }
+  if (command.expected_group_term_ ==
+          std::numeric_limits<std::uint64_t>::max() ||
+      command.target_term_ != command.expected_group_term_ + 1) {
+    return MetaDomainRejectError(
+        "failover target term must be exactly expected group term plus one");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateCommand(const BeginControlledFailover& command) {
+  if (auto status = ValidateFailoverBeginBase(command); !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverAction(command.candidate_action_);
+      !status.ok()) {
+    return status;
+  }
+  if (command.candidate_action_.authorization_.has_value()) {
+    return MetaDomainRejectError(
+        "controlled failover begin action must be unauthorized");
+  }
+  if (command.candidate_action_.candidate_.node_id_ ==
+      command.expected_owner_node_id_) {
+    return MetaDomainRejectError(
+        "controlled failover candidate must differ from owner");
+  }
+  if (command.candidate_action_.domain_.source_group_term_ !=
+          command.expected_group_term_ ||
+      command.candidate_action_.domain_.source_node_id_ !=
+          command.expected_owner_node_id_ ||
+      command.candidate_action_.domain_.source_assignment_id_ !=
+          command.expected_owner_assignment_id_) {
+    return MetaDomainRejectError(
+        "controlled failover domain does not match the owner anchor");
+  }
+  if (auto status = ValidateFailoverOperation(
+          command.operation_id_, command.expected_operation_revision_);
+      !status.ok()) {
+    return status;
+  }
+  return ValidateFailoverDeadline(command.absolute_deadline_unix_ms_);
+}
+
+absl::Status ValidateCommand(const BeginUncontrolledFailover& command) {
+  if (auto status = ValidateFailoverBeginBase(command); !status.ok()) {
+    return status;
+  }
+  if (command.candidate_action_.has_value()) {
+    if (auto status = ValidateFailoverAction(*command.candidate_action_);
+        !status.ok()) {
+      return status;
+    }
+    if (command.candidate_action_->authorization_.has_value()) {
+      return MetaDomainRejectError(
+          "uncontrolled failover begin action must be unauthorized");
+    }
+    if (command.candidate_action_->domain_.source_group_term_ >=
+        command.target_term_) {
+      return MetaDomainRejectError(
+          "failover source term must precede the target term");
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateCommand(const SetUncontrolledCandidate& command) {
+  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverTransitionRef(command.expected_transition_);
+      !status.ok()) {
+    return status;
+  }
+  if (command.candidate_action_.has_value()) {
+    if (auto status = ValidateFailoverAction(*command.candidate_action_);
+        !status.ok()) {
+      return status;
+    }
+    if (command.candidate_action_->authorization_.has_value()) {
+      return MetaDomainRejectError(
+          "candidate replacement must not carry authorization");
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateCommand(const AuthorizeFailoverPrepare& command) {
+  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverTransitionRef(command.expected_transition_);
+      !status.ok()) {
+    return status;
+  }
+  if (IsZero(command.action_id_) ||
+      !IsValidFailoverLoss(command.loss_if_cutover_)) {
+    return MetaDomainRejectError("invalid failover authorization command");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateCommand(const AbortControlledFailover& command) {
+  if (auto status = ValidateFailoverOperation(
+          command.operation_id_, command.expected_operation_revision_);
+      !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
+    return status;
+  }
+  if (command.expected_transition_.has_value()) {
+    if (auto status =
+            ValidateFailoverTransitionRef(*command.expected_transition_);
+        !status.ok()) {
+      return status;
+    }
+  }
+  return ValidateFailoverReason(command.reason_);
+}
+
+absl::Status ValidateCommand(const DegradeControlledFailover& command) {
+  if (auto status = ValidateFailoverOperation(
+          command.operation_id_, command.expected_operation_revision_);
+      !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverTransitionRef(command.expected_transition_);
+      !status.ok()) {
+    return status;
+  }
+  if (command.expected_candidate_action_.has_value()) {
+    const MetaFailoverCandidateAction& action =
+        *command.expected_candidate_action_;
+    if (auto status = ValidateFailoverAction(action); !status.ok()) {
+      return status;
+    }
+    if (action.candidate_.node_id_ == action.domain_.source_node_id_ ||
+        (action.authorization_.has_value() &&
+         action.authorization_->loss_if_cutover_ != MetaFailoverLoss::kNone) ||
+        (action.authorization_.has_value() &&
+         action.authorization_->authorized_revision_ >
+             command.expected_transition_.revision_)) {
+      return MetaDomainRejectError(
+          "invalid controlled failover action snapshot");
+    }
+  }
+  if (command.retain_candidate_action_ &&
+      (!command.expected_candidate_action_.has_value() ||
+       !command.expected_candidate_action_->authorization_.has_value() ||
+       command.expected_candidate_action_->authorization_->loss_if_cutover_ !=
+           MetaFailoverLoss::kNone)) {
+    return MetaDomainRejectError(
+        "retained candidate must have lossless authorization");
+  }
+  return ValidateFailoverReason(command.reason_);
+}
+
+template <typename Command>
+absl::Status ValidateFailoverCommitBase(const Command& command) {
+  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverTransitionRef(command.expected_transition_);
+      !status.ok()) {
+    return status;
+  }
+  if (IsZero(command.action_id_) || command.authorized_revision_ == 0 ||
+      command.authorized_revision_ > command.expected_transition_.revision_) {
+    return MetaDomainRejectError("invalid failover commit authorization CAS");
+  }
+  if (auto status = ValidateFailoverCandidate(command.expected_candidate_);
+      !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateMetaGrantSpec(command.successor_grant_);
+      !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverGroupAnchors(command); !status.ok()) {
+    return status;
+  }
+  if (command.expected_authority_version_ ==
+          std::numeric_limits<std::uint64_t>::max() ||
+      command.new_authority_version_ !=
+          command.expected_authority_version_ + 1 ||
+      command.expected_config_epoch_ ==
+          std::numeric_limits<std::uint64_t>::max() ||
+      command.new_config_epoch_ != command.expected_config_epoch_ + 1 ||
+      command.new_topology_epoch_ == 0) {
+    return MetaDomainRejectError("invalid failover cutover epochs");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateCommand(const CommitControlledFailover& command) {
+  if (auto status = ValidateFailoverCommitBase(command); !status.ok()) {
+    return status;
+  }
+  if (auto status = ValidateFailoverOperation(
+          command.operation_id_, command.expected_operation_revision_);
+      !status.ok()) {
+    return status;
+  }
+  if (command.expected_candidate_.node_id_ == command.expected_owner_node_id_) {
+    return MetaDomainRejectError(
+        "controlled failover candidate must differ from owner");
+  }
+  if (command.expected_group_term_ ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    return MetaDomainRejectError("controlled failover group term overflow");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateCommand(const CommitUncontrolledFailover& command) {
+  if (auto status = ValidateFailoverCommitBase(command); !status.ok()) {
+    return status;
+  }
+  if (!IsValidFailoverLoss(command.loss_if_cutover_)) {
+    return MetaDomainRejectError("invalid uncontrolled failover loss result");
+  }
+  return absl::OkStatus();
+}
+
+template <typename Command>
+void WriteFailoverCommitBaseUnchecked(MetaWriter& writer,
+                                      const Command& command) {
+  writer.WriteString(command.group_id_);
+  WriteFailoverTransitionRefUnchecked(writer, command.expected_transition_);
+  WriteFixedArray(writer, command.action_id_);
+  writer.WriteU64(command.authorized_revision_);
+  WriteFailoverCandidateUnchecked(writer, command.expected_candidate_);
+  (void)WriteGrantSpec(writer, command.successor_grant_);
+  WriteFailoverGroupAnchorsUnchecked(writer, command);
+  writer.WriteU64(command.new_authority_version_);
+  writer.WriteU64(command.new_topology_epoch_);
+  writer.WriteU64(command.new_config_epoch_);
+}
+
+template <typename Command>
+absl::Status ReadFailoverCommitBase(MetaReader& reader, Command& command) {
+  auto group_id = ReadGroupId(reader);
+  if (!group_id.ok()) return group_id.status();
+  auto transition = ReadFailoverTransitionRef(reader);
+  if (!transition.ok()) return transition.status();
+  auto action_id = ReadFixedArray<16>(reader);
+  if (!action_id.ok()) return action_id.status();
+  auto authorized_revision = reader.ReadU64();
+  if (!authorized_revision.ok()) return authorized_revision.status();
+  auto candidate = ReadFailoverCandidate(reader);
+  if (!candidate.ok()) return candidate.status();
+  auto successor_grant = ReadGrantSpec(reader);
+  if (!successor_grant.ok()) return successor_grant.status();
+  command.group_id_ = std::move(*group_id);
+  command.expected_transition_ = *transition;
+  command.action_id_ = *action_id;
+  command.authorized_revision_ = *authorized_revision;
+  command.expected_candidate_ = std::move(*candidate);
+  command.successor_grant_ = std::move(*successor_grant);
+  if (auto status = ReadFailoverGroupAnchors(reader, command); !status.ok()) {
+    return status;
+  }
+  auto authority_version = reader.ReadU64();
+  if (!authority_version.ok()) return authority_version.status();
+  auto topology_epoch = reader.ReadU64();
+  if (!topology_epoch.ok()) return topology_epoch.status();
+  auto config_epoch = reader.ReadU64();
+  if (!config_epoch.ok()) return config_epoch.status();
+  command.new_authority_version_ = *authority_version;
+  command.new_topology_epoch_ = *topology_epoch;
+  command.new_config_epoch_ = *config_epoch;
+  return absl::OkStatus();
+}
+
+absl::Status WriteCommandBody(MetaWriter& writer,
+                              const BeginControlledFailover& command) {
+  if (auto status = ValidateCommand(command); !status.ok()) return status;
+  if (auto status =
+          WriteCommandHeader(writer, MetaCommandTag::kBeginControlledFailover,
+                             command.request_id_, command.actor_);
+      !status.ok()) {
+    return status;
+  }
+  writer.WriteString(command.group_id_);
+  WriteFixedArray(writer, command.transition_id_);
+  writer.WriteU64(command.target_term_);
+  (void)WriteGrantSpec(writer, command.successor_grant_);
+  WriteFailoverActionUnchecked(writer, command.candidate_action_);
+  WriteFixedArray(writer, command.operation_id_);
+  writer.WriteU64(command.expected_operation_revision_);
+  writer.WriteU64(command.absolute_deadline_unix_ms_);
+  WriteFailoverGroupAnchorsUnchecked(writer, command);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<BeginControlledFailover> ReadBeginControlledFailoverBody(
+    MetaReader& reader) {
+  auto header = ReadCommandHeader(reader);
+  if (!header.ok()) return header.status();
+  auto group_id = ReadGroupId(reader);
+  if (!group_id.ok()) return group_id.status();
+  auto transition_id = ReadFixedArray<16>(reader);
+  if (!transition_id.ok()) return transition_id.status();
+  auto target_term = reader.ReadU64();
+  if (!target_term.ok()) return target_term.status();
+  auto grant = ReadGrantSpec(reader);
+  if (!grant.ok()) return grant.status();
+  auto action = ReadFailoverAction(reader);
+  if (!action.ok()) return action.status();
+  auto operation_id = ReadFixedArray<16>(reader);
+  if (!operation_id.ok()) return operation_id.status();
+  auto operation_revision = reader.ReadU64();
+  if (!operation_revision.ok()) return operation_revision.status();
+  auto deadline = reader.ReadU64();
+  if (!deadline.ok()) return deadline.status();
+  BeginControlledFailover command;
+  command.request_id_ = header->request_id_;
+  command.actor_ = std::move(header->actor_);
+  command.group_id_ = std::move(*group_id);
+  command.transition_id_ = *transition_id;
+  command.target_term_ = *target_term;
+  command.successor_grant_ = std::move(*grant);
+  command.candidate_action_ = std::move(*action);
+  command.operation_id_ = *operation_id;
+  command.expected_operation_revision_ = *operation_revision;
+  command.absolute_deadline_unix_ms_ = *deadline;
+  if (auto status = ReadFailoverGroupAnchors(reader, command); !status.ok()) {
+    return status;
+  }
+  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
+      !status.ok()) {
+    return status;
+  }
+  return command;
+}
+
+absl::Status WriteCommandBody(MetaWriter& writer,
+                              const BeginUncontrolledFailover& command) {
+  if (auto status = ValidateCommand(command); !status.ok()) return status;
+  if (auto status =
+          WriteCommandHeader(writer, MetaCommandTag::kBeginUncontrolledFailover,
+                             command.request_id_, command.actor_);
+      !status.ok()) {
+    return status;
+  }
+  writer.WriteString(command.group_id_);
+  WriteFixedArray(writer, command.transition_id_);
+  writer.WriteU64(command.target_term_);
+  (void)WriteGrantSpec(writer, command.successor_grant_);
+  writer.WriteOptional(
+      command.candidate_action_,
+      [](MetaWriter& nested, const MetaFailoverCandidateAction& action) {
+        WriteFailoverActionUnchecked(nested, action);
+      });
+  WriteFailoverGroupAnchorsUnchecked(writer, command);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<BeginUncontrolledFailover> ReadBeginUncontrolledFailoverBody(
+    MetaReader& reader) {
+  auto header = ReadCommandHeader(reader);
+  if (!header.ok()) return header.status();
+  auto group_id = ReadGroupId(reader);
+  if (!group_id.ok()) return group_id.status();
+  auto transition_id = ReadFixedArray<16>(reader);
+  if (!transition_id.ok()) return transition_id.status();
+  auto target_term = reader.ReadU64();
+  if (!target_term.ok()) return target_term.status();
+  auto grant = ReadGrantSpec(reader);
+  if (!grant.ok()) return grant.status();
+  auto action = reader.ReadOptional<MetaFailoverCandidateAction>(
+      [](MetaReader& nested) { return ReadFailoverAction(nested); });
+  if (!action.ok()) return action.status();
+  BeginUncontrolledFailover command;
+  command.request_id_ = header->request_id_;
+  command.actor_ = std::move(header->actor_);
+  command.group_id_ = std::move(*group_id);
+  command.transition_id_ = *transition_id;
+  command.target_term_ = *target_term;
+  command.successor_grant_ = std::move(*grant);
+  command.candidate_action_ = std::move(*action);
+  if (auto status = ReadFailoverGroupAnchors(reader, command); !status.ok()) {
+    return status;
+  }
+  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
+      !status.ok()) {
+    return status;
+  }
+  return command;
+}
+
+absl::Status WriteCommandBody(MetaWriter& writer,
+                              const SetUncontrolledCandidate& command) {
+  if (auto status = ValidateCommand(command); !status.ok()) return status;
+  if (auto status =
+          WriteCommandHeader(writer, MetaCommandTag::kSetUncontrolledCandidate,
+                             command.request_id_, command.actor_);
+      !status.ok()) {
+    return status;
+  }
+  writer.WriteString(command.group_id_);
+  WriteFailoverTransitionRefUnchecked(writer, command.expected_transition_);
+  writer.WriteOptional(
+      command.candidate_action_,
+      [](MetaWriter& nested, const MetaFailoverCandidateAction& action) {
+        WriteFailoverActionUnchecked(nested, action);
+      });
+  return absl::OkStatus();
+}
+
+absl::StatusOr<SetUncontrolledCandidate> ReadSetUncontrolledCandidateBody(
+    MetaReader& reader) {
+  auto header = ReadCommandHeader(reader);
+  if (!header.ok()) return header.status();
+  auto group_id = ReadGroupId(reader);
+  if (!group_id.ok()) return group_id.status();
+  auto transition = ReadFailoverTransitionRef(reader);
+  if (!transition.ok()) return transition.status();
+  auto action = reader.ReadOptional<MetaFailoverCandidateAction>(
+      [](MetaReader& nested) { return ReadFailoverAction(nested); });
+  if (!action.ok()) return action.status();
+  SetUncontrolledCandidate command;
+  command.request_id_ = header->request_id_;
+  command.actor_ = std::move(header->actor_);
+  command.group_id_ = std::move(*group_id);
+  command.expected_transition_ = *transition;
+  command.candidate_action_ = std::move(*action);
+  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
+      !status.ok()) {
+    return status;
+  }
+  return command;
+}
+
+absl::Status WriteCommandBody(MetaWriter& writer,
+                              const AuthorizeFailoverPrepare& command) {
+  if (auto status = ValidateCommand(command); !status.ok()) return status;
+  if (auto status =
+          WriteCommandHeader(writer, MetaCommandTag::kAuthorizeFailoverPrepare,
+                             command.request_id_, command.actor_);
+      !status.ok()) {
+    return status;
+  }
+  writer.WriteString(command.group_id_);
+  WriteFailoverTransitionRefUnchecked(writer, command.expected_transition_);
+  WriteFixedArray(writer, command.action_id_);
+  writer.WriteU8(static_cast<std::uint8_t>(command.loss_if_cutover_));
+  return absl::OkStatus();
+}
+
+absl::StatusOr<AuthorizeFailoverPrepare> ReadAuthorizeFailoverPrepareBody(
+    MetaReader& reader) {
+  auto header = ReadCommandHeader(reader);
+  if (!header.ok()) return header.status();
+  auto group_id = ReadGroupId(reader);
+  if (!group_id.ok()) return group_id.status();
+  auto transition = ReadFailoverTransitionRef(reader);
+  if (!transition.ok()) return transition.status();
+  auto action_id = ReadFixedArray<16>(reader);
+  if (!action_id.ok()) return action_id.status();
+  auto loss = reader.ReadU8();
+  if (!loss.ok()) return loss.status();
+  AuthorizeFailoverPrepare command;
+  command.request_id_ = header->request_id_;
+  command.actor_ = std::move(header->actor_);
+  command.group_id_ = std::move(*group_id);
+  command.expected_transition_ = *transition;
+  command.action_id_ = *action_id;
+  command.loss_if_cutover_ = static_cast<MetaFailoverLoss>(*loss);
+  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
+      !status.ok()) {
+    return status;
+  }
+  return command;
+}
+
+absl::Status WriteCommandBody(MetaWriter& writer,
+                              const AbortControlledFailover& command) {
+  if (auto status = ValidateCommand(command); !status.ok()) return status;
+  if (auto status =
+          WriteCommandHeader(writer, MetaCommandTag::kAbortControlledFailover,
+                             command.request_id_, command.actor_);
+      !status.ok()) {
+    return status;
+  }
+  WriteFixedArray(writer, command.operation_id_);
+  writer.WriteU64(command.expected_operation_revision_);
+  writer.WriteString(command.group_id_);
+  writer.WriteOptional(
+      command.expected_transition_,
+      [](MetaWriter& nested, const MetaFailoverTransitionRef& transition) {
+        WriteFailoverTransitionRefUnchecked(nested, transition);
+      });
+  writer.WriteString(command.reason_);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<AbortControlledFailover> ReadAbortControlledFailoverBody(
+    MetaReader& reader) {
+  auto header = ReadCommandHeader(reader);
+  if (!header.ok()) return header.status();
+  auto operation_id = ReadFixedArray<16>(reader);
+  if (!operation_id.ok()) return operation_id.status();
+  auto operation_revision = reader.ReadU64();
+  if (!operation_revision.ok()) return operation_revision.status();
+  auto group_id = ReadGroupId(reader);
+  if (!group_id.ok()) return group_id.status();
+  auto transition = reader.ReadOptional<MetaFailoverTransitionRef>(
+      [](MetaReader& nested) { return ReadFailoverTransitionRef(nested); });
+  if (!transition.ok()) return transition.status();
+  auto reason = ReadBoundedString(reader, kMaxMetaAbortReasonBytes);
+  if (!reason.ok()) return reason.status();
+  AbortControlledFailover command;
+  command.request_id_ = header->request_id_;
+  command.actor_ = std::move(header->actor_);
+  command.operation_id_ = *operation_id;
+  command.expected_operation_revision_ = *operation_revision;
+  command.group_id_ = std::move(*group_id);
+  command.expected_transition_ = std::move(*transition);
+  command.reason_ = std::move(*reason);
+  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
+      !status.ok()) {
+    return status;
+  }
+  return command;
+}
+
+absl::Status WriteCommandBody(MetaWriter& writer,
+                              const DegradeControlledFailover& command) {
+  if (auto status = ValidateCommand(command); !status.ok()) return status;
+  if (auto status =
+          WriteCommandHeader(writer, MetaCommandTag::kDegradeControlledFailover,
+                             command.request_id_, command.actor_);
+      !status.ok()) {
+    return status;
+  }
+  WriteFixedArray(writer, command.operation_id_);
+  writer.WriteU64(command.expected_operation_revision_);
+  writer.WriteString(command.group_id_);
+  WriteFailoverTransitionRefUnchecked(writer, command.expected_transition_);
+  writer.WriteOptional(
+      command.expected_candidate_action_,
+      [](MetaWriter& nested, const MetaFailoverCandidateAction& action) {
+        WriteFailoverActionUnchecked(nested, action);
+      });
+  writer.WriteBool(command.retain_candidate_action_);
+  writer.WriteString(command.reason_);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<DegradeControlledFailover> ReadDegradeControlledFailoverBody(
+    MetaReader& reader) {
+  auto header = ReadCommandHeader(reader);
+  if (!header.ok()) return header.status();
+  auto operation_id = ReadFixedArray<16>(reader);
+  if (!operation_id.ok()) return operation_id.status();
+  auto operation_revision = reader.ReadU64();
+  if (!operation_revision.ok()) return operation_revision.status();
+  auto group_id = ReadGroupId(reader);
+  if (!group_id.ok()) return group_id.status();
+  auto transition = ReadFailoverTransitionRef(reader);
+  if (!transition.ok()) return transition.status();
+  auto action = reader.ReadOptional<MetaFailoverCandidateAction>(
+      [](MetaReader& nested) { return ReadFailoverAction(nested); });
+  if (!action.ok()) return action.status();
+  auto retain =
+      reader.ReadBool("invalid retained failover candidate presence tag");
+  if (!retain.ok()) return retain.status();
+  auto reason = ReadBoundedString(reader, kMaxMetaAbortReasonBytes);
+  if (!reason.ok()) return reason.status();
+  DegradeControlledFailover command;
+  command.request_id_ = header->request_id_;
+  command.actor_ = std::move(header->actor_);
+  command.operation_id_ = *operation_id;
+  command.expected_operation_revision_ = *operation_revision;
+  command.group_id_ = std::move(*group_id);
+  command.expected_transition_ = *transition;
+  command.expected_candidate_action_ = std::move(*action);
+  command.retain_candidate_action_ = *retain;
+  command.reason_ = std::move(*reason);
+  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
+      !status.ok()) {
+    return status;
+  }
+  return command;
+}
+
+absl::Status WriteCommandBody(MetaWriter& writer,
+                              const CommitControlledFailover& command) {
+  if (auto status = ValidateCommand(command); !status.ok()) return status;
+  if (auto status =
+          WriteCommandHeader(writer, MetaCommandTag::kCommitControlledFailover,
+                             command.request_id_, command.actor_);
+      !status.ok()) {
+    return status;
+  }
+  WriteFixedArray(writer, command.operation_id_);
+  writer.WriteU64(command.expected_operation_revision_);
+  WriteFailoverCommitBaseUnchecked(writer, command);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<CommitControlledFailover> ReadCommitControlledFailoverBody(
+    MetaReader& reader) {
+  auto header = ReadCommandHeader(reader);
+  if (!header.ok()) return header.status();
+  auto operation_id = ReadFixedArray<16>(reader);
+  if (!operation_id.ok()) return operation_id.status();
+  auto operation_revision = reader.ReadU64();
+  if (!operation_revision.ok()) return operation_revision.status();
+  CommitControlledFailover command;
+  command.request_id_ = header->request_id_;
+  command.actor_ = std::move(header->actor_);
+  command.operation_id_ = *operation_id;
+  command.expected_operation_revision_ = *operation_revision;
+  if (auto status = ReadFailoverCommitBase(reader, command); !status.ok()) {
+    return status;
+  }
+  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
+      !status.ok()) {
+    return status;
+  }
+  return command;
+}
+
+absl::Status WriteCommandBody(MetaWriter& writer,
+                              const CommitUncontrolledFailover& command) {
+  if (auto status = ValidateCommand(command); !status.ok()) return status;
+  if (auto status = WriteCommandHeader(
+          writer, MetaCommandTag::kCommitUncontrolledFailover,
+          command.request_id_, command.actor_);
+      !status.ok()) {
+    return status;
+  }
+  WriteFailoverCommitBaseUnchecked(writer, command);
+  writer.WriteU8(static_cast<std::uint8_t>(command.loss_if_cutover_));
+  return absl::OkStatus();
+}
+
+absl::StatusOr<CommitUncontrolledFailover> ReadCommitUncontrolledFailoverBody(
+    MetaReader& reader) {
+  auto header = ReadCommandHeader(reader);
+  if (!header.ok()) return header.status();
+  CommitUncontrolledFailover command;
+  command.request_id_ = header->request_id_;
+  command.actor_ = std::move(header->actor_);
+  if (auto status = ReadFailoverCommitBase(reader, command); !status.ok()) {
+    return status;
+  }
+  auto loss = reader.ReadU8();
+  if (!loss.ok()) return loss.status();
+  command.loss_if_cutover_ = static_cast<MetaFailoverLoss>(*loss);
+  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
+      !status.ok()) {
+    return status;
+  }
+  return command;
 }
 
 // Shared codec for the {group_id, expected_term} command pair.
@@ -1420,6 +2529,45 @@ absl::StatusOr<PrunePopulationManifest> ReadPrunePopulationManifestBody(
 
 }  // namespace
 
+absl::Status ValidateMetaGrantSpec(const MetaGrantSpec& spec) {
+  if (spec.lease_duration_ms_ == 0 ||
+      spec.lease_duration_ms_ > std::numeric_limits<std::uint32_t>::max()) {
+    return MetaDomainRejectError(
+        "lease duration must fit the nonzero control-protocol u32 domain");
+  }
+  if (spec.policy_id_.empty() ||
+      spec.policy_id_.size() > kMaxMetaPolicyIdBytes) {
+    return MetaDomainRejectError("grant policy_id is empty or over cap");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateMetaFailoverTransition(
+    const MetaFailoverTransition& transition) {
+  return ValidateFailoverTransitionImpl(transition);
+}
+
+absl::Status WriteMetaFailoverTransition(
+    MetaWriter& writer, const MetaFailoverTransition& transition) {
+  if (auto status = ValidateFailoverTransitionImpl(transition); !status.ok()) {
+    return status;
+  }
+  WriteFailoverTransitionUnchecked(writer, transition);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<MetaFailoverTransition> ReadMetaFailoverTransition(
+    MetaReader& reader) {
+  auto transition = ReadFailoverTransitionUnchecked(reader);
+  if (!transition.ok()) return transition.status();
+  if (auto status =
+          FailStopDecodedFailover(ValidateFailoverTransitionImpl(*transition));
+      !status.ok()) {
+    return status;
+  }
+  return transition;
+}
+
 absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command) {
   MetaWriter w;
   w.WriteU16(kMetaCommandFormatVersion);
@@ -1620,6 +2768,54 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
     }
     case MetaCommandTag::kPruneTerminalReceipts: {
       auto body = ReadPruneTerminalReceiptsBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kBeginControlledFailover: {
+      auto body = ReadBeginControlledFailoverBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kBeginUncontrolledFailover: {
+      auto body = ReadBeginUncontrolledFailoverBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kSetUncontrolledCandidate: {
+      auto body = ReadSetUncontrolledCandidateBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kAuthorizeFailoverPrepare: {
+      auto body = ReadAuthorizeFailoverPrepareBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kAbortControlledFailover: {
+      auto body = ReadAbortControlledFailoverBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kDegradeControlledFailover: {
+      auto body = ReadDegradeControlledFailoverBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kCommitControlledFailover: {
+      auto body = ReadCommitControlledFailoverBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kCommitUncontrolledFailover: {
+      auto body = ReadCommitUncontrolledFailoverBody(r);
       if (!body.ok()) return body.status();
       command = std::move(*body);
       break;

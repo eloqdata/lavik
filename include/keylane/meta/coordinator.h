@@ -97,6 +97,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -214,10 +215,17 @@ class MetaStoresFacts : public MetaCommittedFacts {
                          const MetaAssignmentId& assignment_id) const override;
   bool IsOwnerAssignment(std::string_view group_id, std::string_view node_id,
                          const MetaAssignmentId& assignment_id) const override;
+  bool MayReportFencedOwnerCandidate(
+      const MetaCandidateProgressObs& candidate) const override;
   bool OperationNonTerminal(const MetaOperationId& id) const override;
   bool HistoryBoundToOperation(
       const MetaOperationId& id,
       const MetaReplicationHistoryId& history_id) const override;
+  bool IsCurrentFailoverCandidate(
+      std::string_view node_id,
+      const MetaBootIncarnation& boot_id) const override;
+  std::optional<FailoverTransitionView> FailoverTransitionById(
+      const MetaFailoverTransitionId& transition_id) const override;
 
  private:
   const MetaStores& stores_;
@@ -306,11 +314,14 @@ struct MetaSubscriptionStart {
 // approves must be baked into the command as an immutable evidence summary;
 // apply never re-checks hooks. Hooks receive the same atomic view Propose
 // used for its fail-safe gates and the leader-local observation store (read
-// it only on the coordinator's owner thread, see the file header).
+// it only on the coordinator's owner thread, see the file header). The final
+// argument is one wall-clock cut shared by every hook for that proposal, so
+// TTL/deadline outcomes cannot depend on hook registration order.
 // ---------------------------------------------------------------------------
 
 using MetaValidateHook = std::function<absl::Status(
-    const MetaCommand&, const MetaCommittedView&, const MetaObservationStore&)>;
+    const MetaCommand&, const MetaCommittedView&, const MetaObservationStore&,
+    std::int64_t proposal_now_unix_ms)>;
 
 // ---------------------------------------------------------------------------
 // RunAsLeader: reconciler lifecycle.

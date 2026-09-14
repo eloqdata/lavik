@@ -51,6 +51,8 @@
 #include "keylane/meta/commands.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/data_control_runtime_status.h"
+#include "keylane/meta/failover.h"
+#include "keylane/meta/failover_admin.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/identity_verifier.h"
 #include "keylane/meta/membership_reconciler.h"
@@ -417,9 +419,9 @@ std::string BuildClusterStatusReply(
   status.lifecycle_revision_ = view.cluster_lifecycle_.revision_;
   switch (view.cluster_lifecycle_.state_) {
     case MetaClusterLifecycle::kUninitialized:
-      status.cluster_state_ =
-          view.cluster_non_pristine_ ? ClusterStateWireV1::kNonPristine
-                                     : ClusterStateWireV1::kUninitialized;
+      status.cluster_state_ = view.cluster_non_pristine_
+                                  ? ClusterStateWireV1::kNonPristine
+                                  : ClusterStateWireV1::kUninitialized;
       break;
     case MetaClusterLifecycle::kCreating:
       status.cluster_state_ = ClusterStateWireV1::kCreating;
@@ -431,20 +433,18 @@ std::string BuildClusterStatusReply(
       status.cluster_state_ = ClusterStateWireV1::kProvisioningFailed;
       break;
   }
-  if (view.cluster_lifecycle_.state_ !=
-      MetaClusterLifecycle::kUninitialized) {
-    status.root_operation_id_ = HexEncode(std::string_view(
-        reinterpret_cast<const char*>(
-            view.cluster_lifecycle_.root_operation_id_.data()),
-        view.cluster_lifecycle_.root_operation_id_.size()));
+  if (view.cluster_lifecycle_.state_ != MetaClusterLifecycle::kUninitialized) {
+    status.root_operation_id_ = HexEncode(
+        std::string_view(reinterpret_cast<const char*>(
+                             view.cluster_lifecycle_.root_operation_id_.data()),
+                         view.cluster_lifecycle_.root_operation_id_.size()));
     status.genesis_commit_index_ =
         view.cluster_lifecycle_.genesis_commit_index_;
   }
   if (view.cluster_lifecycle_.state_ == MetaClusterLifecycle::kCreating) {
-    status.cluster_create_phase_ =
-        view.active_cluster_create_phase_.empty()
-            ? std::string("submitted")
-            : view.active_cluster_create_phase_;
+    status.cluster_create_phase_ = view.active_cluster_create_phase_.empty()
+                                       ? std::string("submitted")
+                                       : view.active_cluster_create_phase_;
   }
   if (view.cluster_lifecycle_.state_ ==
       MetaClusterLifecycle::kProvisioningFailed) {
@@ -554,6 +554,13 @@ std::string BuildClusterStatusReply(
           });
       if (membership != group.topology_.members_.end()) {
         node.group_id_ = group.topology_.group_id_;
+        // Node registration role is only a bootstrap hint. Once a Group
+        // exists, its committed Owner is the sole role authority; otherwise
+        // cluster-status would continue labelling the original primary as
+        // primary after a successful cutover.
+        node.role_ = group.topology_.record_.owner_ == record.node_id_
+                         ? ClusterDataNodeRole::kPrimary
+                         : ClusterDataNodeRole::kReplica;
         break;
       }
     }
@@ -1078,7 +1085,8 @@ celer::Task<std::string> HandleSubmitOp(
     const MetaReplicationHistoryId& replication_history_id) {
   if (kind == kMetaMembershipOperationKind ||
       kind == kMetaClusterCreateOperationKind ||
-      kind == kMetaClusterCreateV1GroupOperationKind) {
+      kind == kMetaClusterCreateV1GroupOperationKind ||
+      kind == kFailoverOperationKind) {
     co_return "ERR workflow-owned";
   }
   SubmitOperation command;
@@ -1128,7 +1136,8 @@ celer::Task<std::string> HandleCompleteOp(
   // leave would allow a second workflow to overtake its uncertain outcome.
   if (record->kind_ == kMetaMembershipOperationKind ||
       record->kind_ == kMetaClusterCreateOperationKind ||
-      record->kind_ == kMetaClusterCreateV1GroupOperationKind)
+      record->kind_ == kMetaClusterCreateV1GroupOperationKind ||
+      record->kind_ == kFailoverOperationKind)
     co_return "ERR workflow-owned";
   if (IsTerminal(record->lifecycle_)) {
     co_return "ERR terminal";
@@ -1170,7 +1179,8 @@ celer::Task<std::string> HandleAbortOp(
   }
   if (record->kind_ == kMetaMembershipOperationKind ||
       record->kind_ == kMetaClusterCreateOperationKind ||
-      record->kind_ == kMetaClusterCreateV1GroupOperationKind)
+      record->kind_ == kMetaClusterCreateV1GroupOperationKind ||
+      record->kind_ == kFailoverOperationKind)
     co_return "ERR workflow-owned";
   if (IsTerminal(record->lifecycle_)) {
     co_return "ERR terminal";
@@ -1195,17 +1205,38 @@ celer::Task<std::string> HandleAbortOp(
   co_return reply;
 }
 
-// Non-linearizable read of the committed journal (see the header).
+// Non-linearizable read of committed operator state (see the header).
 std::string HandleGetOp(nuraft::ptr<MetaStateMachine> state_machine,
                         const MetaOperationId& id) {
-  const std::optional<MetaOperationRecord> record =
-      state_machine->FindOperation(id);
+  std::optional<MetaOperationRecord> record = state_machine->FindOperation(id);
   if (!record.has_value()) {
     return "ERR not-found";
   }
   if (IsTerminal(record->lifecycle_)) {
     return std::string("OK ") + LifecycleName(record->lifecycle_) + " " +
            record->terminal_result_;
+  }
+  if (record->kind_ == kFailoverOperationKind) {
+    // The displayed Running state is derived rather than persisted. Re-read
+    // the operation and transition from one aggregate cut so Admin cannot
+    // combine a pre-Cutover operation with a post-Cutover topology (or the
+    // reverse) across two individually valid reads.
+    const MetaStores stores = state_machine->StoresSnapshot();
+    record = stores.operation_.FindOperation(id);
+    if (!record.has_value()) return "ERR not-found";
+    if (IsTerminal(record->lifecycle_)) {
+      return std::string("OK ") + LifecycleName(record->lifecycle_) + " " +
+             record->terminal_result_;
+    }
+    const bool running = std::ranges::any_of(
+        stores.topology_.Groups(), [&](const MetaTopologyGroupView& group) {
+          return group.failover_transition_.has_value() &&
+                 group.failover_transition_->mode_ ==
+                     MetaFailoverMode::kControlled &&
+                 group.failover_transition_->controlled_.has_value() &&
+                 group.failover_transition_->controlled_->operation_id_ == id;
+        });
+    return running ? "OK running" : "OK submitted";
   }
   if (record->kind_ == kMetaClusterCreateOperationKind ||
       record->kind_ == kMetaClusterCreateV1GroupOperationKind ||
@@ -1216,6 +1247,56 @@ std::string HandleGetOp(nuraft::ptr<MetaStateMachine> state_machine,
                             : record->kind_phase_blob_);
   }
   return std::string("OK ") + LifecycleName(record->lifecycle_);
+}
+
+std::string FailoverError(std::string_view stage, std::string_view code) {
+  return absl::StrCat("ERR failover 1 ", stage, " ", code);
+}
+
+celer::Task<std::string> HandleFailover(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    AuthenticatedPrincipal principal, const FailoverAdminRequestV1& request) {
+  const MetaStores before = state_machine->StoresSnapshot();
+  if (before.topology_.ClusterLifecycle().state_ !=
+      MetaClusterLifecycle::kCreated) {
+    co_return FailoverError("preflight", "cluster-not-created");
+  }
+  if (!before.topology_.FindGroup(request.group_id_).has_value()) {
+    co_return FailoverError("preflight", "group-not-found");
+  }
+
+  auto intent = EncodeFailoverOperationIntent(
+      {.group_id_ = request.group_id_,
+       .absolute_deadline_unix_ms_ = request.absolute_deadline_unix_ms_});
+  if (!intent.ok()) co_return FailoverError("decode", "bad-request");
+
+  SubmitOperation command;
+  command.request_id_ = MakeRequestId();
+  command.operation_id_ = request.operation_id_;
+  command.kind_ = std::string(kFailoverOperationKind);
+  command.intent_ = *intent;
+  command.intent_hash_ = MetaSha256(command.intent_);
+  const std::string reply =
+      co_await ProposeCommand(coordinator, std::move(principal), command);
+  if (!reply.starts_with("OK ")) {
+    const std::string_view code = reply.starts_with("ERR ")
+                                      ? std::string_view(reply).substr(4)
+                                      : std::string_view("malformed-reply");
+    co_return FailoverError("proposal", code);
+  }
+
+  const auto committed = state_machine->FindOperation(request.operation_id_);
+  if (!committed.has_value() || committed->kind_ != kFailoverOperationKind ||
+      committed->intent_ != command.intent_ ||
+      committed->intent_hash_ != command.intent_hash_) {
+    co_return FailoverError("proposal", "uncertain-outcome");
+  }
+  co_return absl::StrCat(
+      "OK failover 1 ", std::string_view(reply).substr(3), " ",
+      HexEncode(std::string_view(
+          reinterpret_cast<const char*>(request.operation_id_.data()),
+          request.operation_id_.size())));
 }
 
 celer::Task<std::string> HandleRegisterNode(
@@ -1530,12 +1611,12 @@ std::string ClusterAlreadyCreatedError(
     std::string_view stage, const MetaClusterLifecycleState& lifecycle) {
   return ClusterCreateError(
       stage, "already-created",
-      absl::StrCat("Meta already owns a Data cluster; operation=",
-                   HexEncode(std::string_view(
-                       reinterpret_cast<const char*>(
-                           lifecycle.root_operation_id_.data()),
-                       lifecycle.root_operation_id_.size())),
-                   " genesis=", lifecycle.genesis_commit_index_));
+      absl::StrCat(
+          "Meta already owns a Data cluster; operation=",
+          HexEncode(std::string_view(reinterpret_cast<const char*>(
+                                         lifecycle.root_operation_id_.data()),
+                                     lifecycle.root_operation_id_.size())),
+          " genesis=", lifecycle.genesis_commit_index_));
 }
 
 // Admission persists the whole plan BEFORE topology mutation. The leader
@@ -1545,20 +1626,19 @@ celer::Task<std::string> HandleClusterCreate(
     const nuraft::ptr<MetaStateMachine>& state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
     const std::shared_ptr<MetaMembershipGate>& membership_gate,
-    AuthenticatedPrincipal principal,
-    const ClusterCreateManifestV1& manifest,
+    AuthenticatedPrincipal principal, const ClusterCreateManifestV1& manifest,
     const MetaOperationId& root_operation_id, const bool* shutdown) {
-  const std::string id = HexEncode(std::string_view(
-      reinterpret_cast<const char*>(root_operation_id.data()),
-      root_operation_id.size()));
+  const std::string id = HexEncode(
+      std::string_view(reinterpret_cast<const char*>(root_operation_id.data()),
+                       root_operation_id.size()));
   if (*shutdown)
     co_return ClusterCreateError("preflight", "pre-commit-failed",
                                  "Meta is shutting down");
   const auto observed = state_machine->StoresSnapshot();
   if (observed.topology_.ClusterLifecycle().state_ !=
       MetaClusterLifecycle::kUninitialized) {
-    co_return ClusterAlreadyCreatedError(
-        "preflight", observed.topology_.ClusterLifecycle());
+    co_return ClusterAlreadyCreatedError("preflight",
+                                         observed.topology_.ClusterLifecycle());
   }
   auto create_lease = membership_gate->TryAcquire();
   if (create_lease == nullptr) {
@@ -1577,9 +1657,8 @@ celer::Task<std::string> HandleClusterCreate(
     co_return ClusterAlreadyCreatedError("preflight", lifecycle);
   }
   if (before.operation_.HasActiveKind(kMetaMembershipOperationKind)) {
-    co_return ClusterCreateError(
-        "preflight", "pre-commit-failed",
-        "a Meta membership workflow is active");
+    co_return ClusterCreateError("preflight", "pre-commit-failed",
+                                 "a Meta membership workflow is active");
   }
   MetaClusterCreateRaftView raft_view;
   raft_view.local_server_id_ = server->get_id();
@@ -1626,8 +1705,8 @@ celer::Task<std::string> HandleClusterCreate(
     const auto after = state_machine->StoresSnapshot();
     if (after.topology_.ClusterLifecycle().state_ !=
         MetaClusterLifecycle::kUninitialized) {
-      co_return ClusterAlreadyCreatedError(
-          "proposal", after.topology_.ClusterLifecycle());
+      co_return ClusterAlreadyCreatedError("proposal",
+                                           after.topology_.ClusterLifecycle());
     }
     if (HasDataClusterArtifacts(after)) {
       co_return ClusterCreateError(
@@ -2255,7 +2334,7 @@ celer::Task<std::string> DispatchCommand(
   if (command == "status") {
     access = MetaAccess::kStatus;
   } else if (command == "clusterhead" || command == "clusterstatus" ||
-             command == "clustercreate") {
+             command == "clustercreate" || command == "failover") {
     // Cluster-wide topology and readiness are operator-only even though the
     // legacy local status verb is also visible to a Data-node identity.
     if (identity.role_ != MetaPrincipalRole::kOperator) {
@@ -2338,6 +2417,17 @@ celer::Task<std::string> DispatchCommand(
     co_return co_await HandleClusterCreate(
         server, state_machine, coordinator, membership_gate,
         std::move(principal), *manifest, root_operation_id, shutdown);
+  }
+  if (command == "failover") {
+    if (tokens.size() != 3 || tokens[1] != "1") {
+      co_return FailoverError("decode", "bad-request");
+    }
+    auto request = DecodeFailoverAdminRequest(line);
+    if (!request.ok()) {
+      co_return FailoverError("decode", "bad-request");
+    }
+    co_return co_await HandleFailover(coordinator, std::move(state_machine),
+                                      std::move(principal), *request);
   }
   if (command == "submitop" || command == "completeop" ||
       command == "abortop" || command == "archiveoperations" ||
@@ -2536,6 +2626,39 @@ celer::Task<std::string> DispatchCommand(
 }
 
 }  // namespace
+
+class MetaCtlServer::SessionConnectionBorrow {
+ public:
+  SessionConnectionBorrow(CorePtr core, celer::Connection* connection)
+      : core_(std::move(core)), connection_(connection) {
+    core_->sessions_.push_back(connection_);
+    celer::BorrowConnectionStorage(connection_);
+  }
+
+  SessionConnectionBorrow(SessionConnectionBorrow&& other) noexcept
+      : core_(std::move(other.core_)), connection_(other.connection_) {
+    other.connection_ = nullptr;
+  }
+  SessionConnectionBorrow(const SessionConnectionBorrow&) = delete;
+  SessionConnectionBorrow& operator=(const SessionConnectionBorrow&) = delete;
+  SessionConnectionBorrow& operator=(SessionConnectionBorrow&&) = delete;
+
+  ~SessionConnectionBorrow() {
+    if (connection_ == nullptr) return;
+    const auto session = std::find(core_->sessions_.begin(),
+                                   core_->sessions_.end(), connection_);
+    if (session != core_->sessions_.end()) {
+      *session = core_->sessions_.back();
+      core_->sessions_.pop_back();
+    }
+    celer::ReleaseConnectionStorage(connection_);
+    NotifyCtlShutdownDrained(*core_);
+  }
+
+ private:
+  CorePtr core_;
+  celer::Connection* connection_;
+};
 
 // static
 absl::Status MetaCtlServer::ValidateOptions(
@@ -2795,8 +2918,11 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
       (void)core->listener_.Close();
       break;
     }
-    core->sessions_.push_back(connection);
-    worker.Spawn(SessionLoop(core, celer::TcpStream(connection), connection));
+    // Frame ownership closes the accept/shutdown race: even if Spawn rejects
+    // the task before its body runs, destruction unregisters the session and
+    // releases its storage borrow.
+    worker.Spawn(SessionLoop(core, celer::TcpStream(connection), connection,
+                             SessionConnectionBorrow(core, connection)));
   }
   if (core->shutdown_accept_wake_fd_ >= 0) {
     (void)::shutdown(core->shutdown_accept_wake_fd_, SHUT_RDWR);
@@ -2810,18 +2936,12 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
 }
 
 celer::Task<absl::Status> MetaCtlServer::SessionLoop(
-    CorePtr core, celer::TcpStream stream, celer::Connection* connection) {
-  const auto remove_session = [&] {
-    std::vector<celer::Connection*>& sessions = core->sessions_;
-    for (auto it = sessions.begin(); it != sessions.end(); ++it) {
-      if (*it == connection) {
-        *it = sessions.back();
-        sessions.pop_back();
-        NotifyCtlShutdownDrained(*core);
-        return;
-      }
-    }
-  };
+    CorePtr core, celer::TcpStream stream, celer::Connection* connection,
+    SessionConnectionBorrow borrow) {
+  // This frame-owned parameter unregisters the task and releases the
+  // Connection during frame destruction, after body-local users have unwound.
+  // It also covers shutdown before the coroutine body starts.
+  (void)borrow;
   absl::StatusOr<MetaPrincipalIdentity> identity =
       absl::UnauthenticatedError("ctl session was not authenticated");
   if (core->options_.transport_ == MetaCtlServerOptions::Transport::kUnix) {
@@ -2833,7 +2953,6 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
       spdlog::warn("ctl rejected Unix peer: SO_PEERCRED failed: {}",
                    std::strerror(errno));
       (void)stream.Close();
-      remove_session();
       co_return absl::UnauthenticatedError("SO_PEERCRED failed");
     }
     identity = AuthenticateLocalOperator(credentials.uid,
@@ -2846,13 +2965,11 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
       spdlog::warn("ctl rejected TCP peer during mTLS handshake: {}",
                    tls.message());
       (void)stream.Close();
-      remove_session();
       co_return tls;
     }
     auto sans = stream.PeerCertificateUriSans();
     if (!sans.ok()) {
       (void)stream.Close();
-      remove_session();
       co_return sans.status();
     }
     identity = AuthenticateMetaUriSans(*sans);
@@ -2872,7 +2989,6 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
     spdlog::warn("ctl rejected unauthenticated peer: {}",
                  identity.status().message());
     (void)stream.Close();
-    remove_session();
     co_return identity.status();
   }
   AuthenticatedPrincipal authenticated(identity->principal_,
@@ -2955,7 +3071,6 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
     }
   }
 
-  remove_session();
   (void)stream.Close();
   co_return absl::OkStatus();
 }
