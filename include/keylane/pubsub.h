@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "celer/runtime/task.h"
 #include "keylane/resp.h"
 
@@ -21,6 +22,7 @@ class TcpStream;
 namespace keylane {
 
 class PubSubSession;
+class CapturedPubSubPublication;
 
 // Initializes one worker-local subscription registry per runtime worker.
 void PreparePubSub(unsigned worker_count);
@@ -60,6 +62,17 @@ celer::Task<std::uint64_t> PubSubNumPat();
 // all recipients.
 celer::Task<std::uint64_t> PublishChannel(std::string_view channel,
                                           std::string_view payload);
+
+// Captures the live subscription matches and their reply protocol at the
+// command's logical execution point without making the message visible. The
+// frozen receiver count is independent of later SUBSCRIBE/UNSUBSCRIBE changes;
+// delivery still uses each session's owner worker and bounded output queue.
+celer::Task<absl::StatusOr<std::shared_ptr<CapturedPubSubPublication>>>
+CapturePubSubPublication(std::string_view channel, std::string_view payload);
+std::uint64_t CapturedPubSubReceiverCount(
+    const std::shared_ptr<CapturedPubSubPublication>& publication) noexcept;
+celer::Task<absl::Status> DeliverCapturedPubSubPublication(
+    std::shared_ptr<CapturedPubSubPublication> publication);
 
 void EnqueuePubSubReply(const std::shared_ptr<PubSubSession>& session,
                         std::string encoded);

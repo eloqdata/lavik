@@ -481,12 +481,24 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
       }
     }
     if (request.replication_capture_ != nullptr) {
-      CaptureReplicationCommand(request, request.args_);
       if (request.defer_pubsub_delivery_) {
-        // EXEC replaces this placeholder after its replication publication
-        // commits. Until then no subscriber-visible side effect may escape.
-        co_return BuiltReply(reply_builder.AppendInteger(0));
+        auto captured = co_await CapturePubSubPublication(args[1], args[2]);
+        if (!captured.ok()) {
+          co_return BuiltReply(
+              reply_builder.AppendError(captured.status().message()));
+        }
+        CaptureReplicationCommand(request, request.args_);
+        const std::uint64_t receivers = CapturedPubSubReceiverCount(*captured);
+        request.replication_capture_->SetCapturedPubSubPublication(
+            std::move(*captured));
+        // Subscriber membership and the reply count belong to this command's
+        // position in EXEC. Only physical delivery waits for replication to
+        // commit, so a later SUBSCRIBE cannot receive this message.
+        co_return BuiltReply(reply_builder.AppendInteger(
+            static_cast<long long>(std::min<std::uint64_t>(
+                receivers, std::numeric_limits<long long>::max()))));
       }
+      CaptureReplicationCommand(request, request.args_);
     } else if (!request.replication_origin_ && g_storage != nullptr &&
                (g_replication == nullptr || !g_replication->is_replica())) {
       const std::uint16_t partition_id = storage::RedisSlot(args[1]);
@@ -10206,21 +10218,21 @@ Task<CommandReply> ExecuteExecBody(
 
   // Captured source-side PUBLISH effects become subscriber-visible only after
   // the durable transaction or keyless late publication above has committed.
-  // That cut authorizes completion even if the finite lease changes while the
-  // cross-worker delivery itself is in flight.
+  // Each snapshot retains the subscription membership and RESP encoding from
+  // the command's logical position in EXEC; later subscription changes cannot
+  // reorder Pub/Sub semantics. The committed cut authorizes completion even
+  // if the finite lease changes while cross-worker delivery is in flight.
   for (std::size_t index = 0; index < queued.size(); ++index) {
     const CommandRequest& command = queued[index];
     if (!command.defer_pubsub_delivery_ || replies[index].empty() ||
         replies[index].front() == '-') {
       continue;
     }
-    assert(command.args_.size() >= 3);
-    const std::uint64_t receivers =
-        co_await PublishChannel(command.args_[1], command.args_[2]);
-    ReplyBuilder local_builder(command.resp_version_);
-    replies[index] = std::string(local_builder.AppendInteger(
-        static_cast<long long>(std::min<std::uint64_t>(
-            receivers, std::numeric_limits<long long>::max()))));
+    assert(command.replication_capture_ != nullptr);
+    auto publication =
+        command.replication_capture_->TakeCapturedPubSubPublication();
+    assert(publication != nullptr);
+    (void)co_await DeliverCapturedPubSubPublication(std::move(publication));
   }
 
   absl::Status notified = co_await FlushBlockingNotifications(
@@ -10574,6 +10586,19 @@ void ReplicationCommandCapture::Record(std::uint8_t db_id,
 CapturedReplicationEffects ReplicationCommandCapture::Take() {
   std::lock_guard lock(mutex_);
   return CapturedReplicationEffects{handled_, std::move(commands_)};
+}
+
+void ReplicationCommandCapture::SetCapturedPubSubPublication(
+    std::shared_ptr<CapturedPubSubPublication> publication) {
+  std::lock_guard lock(mutex_);
+  assert(pubsub_publication_ == nullptr);
+  pubsub_publication_ = std::move(publication);
+}
+
+std::shared_ptr<CapturedPubSubPublication>
+ReplicationCommandCapture::TakeCapturedPubSubPublication() {
+  std::lock_guard lock(mutex_);
+  return std::exchange(pubsub_publication_, nullptr);
 }
 
 void CaptureReplicationCommand(const CommandRequest& request,

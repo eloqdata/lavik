@@ -988,10 +988,14 @@ connection metrics.
 - Meta-managed `PUBLISH`, including its `EXEC` form, is a slot-scoped runtime
   mutation. Controlled failover drains its authority guard and rechecks at
   replication publication before freezing the old source frontier. An `EXEC`
-  capture delays local subscriber delivery until that durable or ephemeral
-  publication cut succeeds, then delivers exactly once even if authority
-  changes while delivery is in flight; a rejected final check exposes neither
-  a local message nor a replica-backlog event.
+  capture freezes local subscriber membership, protocol encoding, and receiver
+  count at each `PUBLISH` position, delays delivery until that durable or
+  ephemeral publication cut succeeds, then makes one bounded enqueue attempt
+  for each captured match even if authority changes while delivery is in
+  flight. Later subscription commands cannot join or leave that captured
+  publication; session closure and output backpressure retain their ordinary
+  delivery behavior, while a rejected final check exposes neither a local
+  message nor a replica-backlog event.
 - Publication admission must reject before mutation when the complete event
   cannot fit. Retention pressure either waits for ACK progress or, when
   configured not to backpressure, revokes a lagging consumer's coverage and

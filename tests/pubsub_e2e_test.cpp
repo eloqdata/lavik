@@ -284,6 +284,55 @@ void WaitForReplica(RespClient* replica) {
   Fail("replica did not become online");
 }
 
+void ExpectExecPublishUsesCommandTimeSubscriptions(RespClient* publisher,
+                                                   std::uint16_t source_port,
+                                                   std::string_view channel,
+                                                   std::string_view label) {
+  RespClient subscriber = Connect(source_port);
+  Expect(subscriber.Command({"MULTI"}), "+OK", std::string(label) + " multi");
+  Expect(subscriber.Command({"PUBLISH", channel, "before-subscribe"}),
+         "+QUEUED", std::string(label) + " queue publish");
+  Expect(subscriber.Command({"SUBSCRIBE", channel}), "+QUEUED",
+         std::string(label) + " queue subscribe");
+  Expect(subscriber.Command({"EXEC"}),
+         "*2\r\n:0\r\n" + Subscription("subscribe", channel, 1),
+         std::string(label) + " exec");
+
+  // The second publication is both an observable ordering barrier and proof
+  // that the subscription established later in EXEC is live. If the deferred
+  // first PUBLISH is incorrectly resolved against the final subscription
+  // table, ReadPush observes before-subscribe instead and fails.
+  Expect(publisher->Command({"PUBLISH", channel, "after-subscribe"}), ":1",
+         std::string(label) + " publish barrier");
+  Expect(subscriber.ReadPush(), Message(channel, "after-subscribe"),
+         std::string(label) + " excludes later subscriber");
+  Expect(subscriber.Command({"UNSUBSCRIBE", channel}),
+         Subscription("unsubscribe", channel, 0),
+         std::string(label) + " unsubscribe");
+}
+
+void ExpectExecPublishPrecedesLaterUnsubscribe(RespClient* subscriber,
+                                               std::string_view channel) {
+  ExpectContains(subscriber->Command({"HELLO", "3"}), "$5\r\nproto\r\n:3",
+                 "unsubscribe-order HELLO 3");
+  Expect(subscriber->Command({"SUBSCRIBE", channel}),
+         Resp3Subscription("subscribe", channel, 1),
+         "unsubscribe-order subscribe");
+  Expect(subscriber->Command({"MULTI"}), "+OK", "unsubscribe-order multi");
+  Expect(subscriber->Command({"PUBLISH", channel, "before-unsubscribe"}),
+         "+QUEUED", "unsubscribe-order queue publish");
+  Expect(subscriber->Command({"UNSUBSCRIBE", channel}), "+QUEUED",
+         "unsubscribe-order queue unsubscribe");
+  subscriber->SendPipeline({{"EXEC"}});
+  Expect(subscriber->ReadPush(), Resp3Message(channel, "before-unsubscribe"),
+         "unsubscribe-order captured message");
+  Expect(subscriber->ReadPush(),
+         "*2\r\n:1\r\n" + Resp3Subscription("unsubscribe", channel, 0),
+         "unsubscribe-order exec count");
+  Expect(subscriber->Command({"PING"}), "+PONG",
+         "unsubscribe-order exits subscribed mode");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -325,6 +374,9 @@ int main(int argc, char** argv) {
            "$14\r\nsentinel-probe", "get client name");
     ExpectContains(source_client.Command({"CLIENT", "LIST"}),
                    "name=sentinel-probe", "client list name");
+
+    ExpectExecPublishUsesCommandTimeSubscriptions(
+        &source_client, source_port, "tx-order-standalone", "standalone");
 
     RespClient resp3_client = Connect(source_port);
     const std::string hello3 =
@@ -619,6 +671,12 @@ int main(int argc, char** argv) {
     Expect(replica_subscriber.ReadPush(), Message("replicated", "after-reject"),
            "rejected exec did not enter the replica backlog");
 #endif
+
+    ExpectExecPublishUsesCommandTimeSubscriptions(
+        &source_client, source_port, "tx-order-replicated", "replicated");
+    RespClient unsubscribe_order_subscriber = Connect(source_port);
+    ExpectExecPublishPrecedesLaterUnsubscribe(&unsubscribe_order_subscriber,
+                                              "tx-order-unsubscribe");
 
     // A PUBLISH-only EXEC uses the channel-sharded ephemeral source flow.
     Expect(source_client.Command({"MULTI"}), "+OK", "publish-only multi");

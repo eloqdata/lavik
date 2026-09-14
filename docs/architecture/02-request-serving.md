@@ -311,7 +311,11 @@ Channel and pattern indexes are worker-local. `PUBLISH` fans out to every
 worker registry and counts live matching subscriptions after membership is
 rechecked on the destination worker. Encoded RESP2 and RESP3 message bodies are
 shared between recipients where possible; each session receives frames in its
-negotiated version.
+negotiated version. A source-side `EXEC` that must await replication captures
+the matching sessions, protocol encodings, and receiver count at the
+`PUBLISH` command's position. It makes those captured frames visible only after
+replication publication succeeds, so later subscription changes in the same
+transaction cannot reorder delivery.
 
 In cluster mode `PUBLISH` derives the channel's hash slot and is a runtime-only
 mutation even though it writes no durable key. It therefore participates in

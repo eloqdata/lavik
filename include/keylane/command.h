@@ -26,6 +26,7 @@
 namespace keylane {
 
 class BlockingWakeCascade;
+class CapturedPubSubPublication;
 
 namespace cluster {
 class AuthorityAdmission;
@@ -79,6 +80,9 @@ class ReplicationCommandCapture {
   void MarkHandled();
   void Record(std::uint8_t db_id, std::vector<std::string> args);
   CapturedReplicationEffects Take();
+  void SetCapturedPubSubPublication(
+      std::shared_ptr<CapturedPubSubPublication> publication);
+  std::shared_ptr<CapturedPubSubPublication> TakeCapturedPubSubPublication();
 
  private:
   std::shared_ptr<RetainedMemoryCharge> prepared_charge_;
@@ -86,6 +90,11 @@ class ReplicationCommandCapture {
   mutable std::mutex mutex_;
   bool handled_ = false;
   std::vector<CapturedReplicationCommand> commands_;
+  // A source-side EXEC must publish its replication envelope before local
+  // subscriber-visible delivery. Keep the command-time recipient snapshot
+  // beside the corresponding replication effects so every failure path drops
+  // both together without changing CommandRequest's fixed-size hot layout.
+  std::shared_ptr<CapturedPubSubPublication> pubsub_publication_;
 };
 
 struct CapturedBlockingNotification {
