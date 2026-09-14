@@ -2,6 +2,55 @@
 
 namespace keylane::storage {
 
+std::uint32_t StorageEngine::Impl::ActiveExpirationConfigValue(
+    ActiveExpirationConfigKey key) const noexcept {
+  switch (key) {
+    case ActiveExpirationConfigKey::kIntervalMs:
+      return active_expiration_interval_ms_.load(std::memory_order_relaxed);
+    case ActiveExpirationConfigKey::kMapStepsPerCycle:
+      return active_expiration_map_steps_per_cycle_.load(
+          std::memory_order_relaxed);
+    case ActiveExpirationConfigKey::kDeletesPerCycle:
+      return active_expiration_deletes_per_cycle_.load(
+          std::memory_order_relaxed);
+    case ActiveExpirationConfigKey::kIndexMaintenanceStepsPerCycle:
+      return active_expiration_index_maintenance_steps_per_cycle_.load(
+          std::memory_order_relaxed);
+  }
+  std::unreachable();
+}
+
+absl::Status StorageEngine::Impl::ConfigureActiveExpiration(
+    ActiveExpirationConfigKey key, std::uint64_t value) {
+  // Zero would busy-poll the timer or indefinitely starve one maintenance
+  // phase. Pacing is independent of the existing authority/pause boundaries.
+  if (value == 0 || value > std::numeric_limits<std::uint32_t>::max()) {
+    return absl::InvalidArgumentError(
+        "active expiration value must be between 1 and 4294967295");
+  }
+  const auto bounded = static_cast<std::uint32_t>(value);
+  switch (key) {
+    case ActiveExpirationConfigKey::kIntervalMs:
+      active_expiration_interval_ms_.store(bounded, std::memory_order_relaxed);
+      break;
+    case ActiveExpirationConfigKey::kMapStepsPerCycle:
+      active_expiration_map_steps_per_cycle_.store(bounded,
+                                                   std::memory_order_relaxed);
+      break;
+    case ActiveExpirationConfigKey::kDeletesPerCycle:
+      active_expiration_deletes_per_cycle_.store(bounded,
+                                                 std::memory_order_relaxed);
+      break;
+    case ActiveExpirationConfigKey::kIndexMaintenanceStepsPerCycle:
+      active_expiration_index_maintenance_steps_per_cycle_.store(
+          bounded, std::memory_order_relaxed);
+      break;
+    default:
+      return absl::InvalidArgumentError("unknown active expiration setting");
+  }
+  return absl::OkStatus();
+}
+
 Task<absl::Status> StorageEngine::Impl::QuiesceExpiration() {
   expiration_pause_count_.fetch_add(1, std::memory_order_acq_rel);
   // Drain the in-flight expiration cycle on every worker. The flag spans a
@@ -205,12 +254,10 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
 }
 
 Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
-  constexpr auto kInterval = std::chrono::milliseconds(10);
-  constexpr std::size_t kMapStepsPerCycle = 256;
-  constexpr std::size_t kDeletesPerCycle = 64;
-  constexpr std::size_t kIndexMaintenanceStepsPerCycle = 256;
   while (!store->worker_->stop_requested()) {
-    absl::Status waited = co_await celer::SleepFor(*store->worker_, kInterval);
+    const auto interval = std::chrono::milliseconds(
+        ActiveExpirationConfigValue(ActiveExpirationConfigKey::kIntervalMs));
+    absl::Status waited = co_await celer::SleepFor(*store->worker_, interval);
     if (!waited.ok()) {
       co_return waited;
     }
@@ -231,14 +278,22 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
       break;
     }
 
+    // Sample once after waking: CONFIG can run while this cycle yields, but
+    // cannot extend an in-flight batch by repeatedly raising its budget.
+    const std::size_t map_steps = ActiveExpirationConfigValue(
+        ActiveExpirationConfigKey::kMapStepsPerCycle);
+    const std::size_t deletes = ActiveExpirationConfigValue(
+        ActiveExpirationConfigKey::kDeletesPerCycle);
+    const std::size_t maintenance_steps = ActiveExpirationConfigValue(
+        ActiveExpirationConfigKey::kIndexMaintenanceStepsPerCycle);
+
     // Resizing changes no logical state and also runs on replicas. Share the
     // expiration pause/drain boundary so stable scans and shutdown checkpoints
     // cannot race bucket migration. Keep this batch non-suspending on the
     // owner; a stalled admission advances to the next map and retries on a
     // later pass, while active rehashes retain their position across cycles.
     for (std::size_t step = 0;
-         step < kIndexMaintenanceStepsPerCycle && !store->partitions_.empty();
-         ++step) {
+         step < maintenance_steps && !store->partitions_.empty(); ++step) {
       auto& partition =
           store->partitions_[store->index_maintenance_partition_cursor_];
       if (partition.indexes_[store->index_maintenance_db_cursor_].Maintain()) {
@@ -259,8 +314,8 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     if (!expiration_authority_.load(std::memory_order_acquire)) continue;
 
     const std::uint64_t now_ms = UnixTimeMillis();
-    for (std::size_t step = 0;
-         step < kMapStepsPerCycle && !store->partitions_.empty(); ++step) {
+    for (std::size_t step = 0; step < map_steps && !store->partitions_.empty();
+         ++step) {
       auto& partition = store->partitions_[store->expiry_partition_cursor_];
       const std::uint8_t db_id = store->expiry_db_cursor_;
       if (partition.expiring_key_count_[db_id] == 0) {
@@ -322,13 +377,13 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     // Yielding once per map makes a complete pass depend on hundreds of
     // thousands of scheduler turns, so a key scanned just before its TTL can
     // remain uncollected for longer than a full-device reclaim can tolerate.
-    // The fixed empty-map bound keeps this batch short while one yield
+    // The per-cycle empty-map bound limits this batch while one yield
     // preserves fairness before candidate deletion begins.
     co_await celer::Yield(*store->worker_);
 
     std::size_t deleted = 0;
     bool warned_failure = false;
-    while (deleted < kDeletesPerCycle && !store->expired_candidates_.empty()) {
+    while (deleted < deletes && !store->expired_candidates_.empty()) {
       const WorkerStore::ExpireCandidate& front =
           store->expired_candidates_.front();
       std::size_t replacement_bytes = kFullSyncReplacementMetadataBytes;

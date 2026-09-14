@@ -683,11 +683,20 @@ recovery capacity.
 
 ### Expiry and tombstones
 
-Read paths treat an expired value as absent immediately. On an expiration
-authority node, each worker also runs a bounded 10 ms active cycle that scans
-at most 256 map steps and deletes at most 64 validated candidates. The worker
-rechecks mutation sequence and deadline under the key's exclusive lock before
-acting.
+Read paths treat an expired value as absent immediately. Each worker starts a
+bounded expiration/index-maintenance coroutine after recovery, including when
+no keys have TTLs. Only expiration-authority nodes scan for expired values and
+process deletion candidates; maps without expiring keys are skipped. Before
+acting, the worker rechecks mutation sequence and deadline under the key's
+exclusive lock.
+
+The coroutine's interval and per-cycle scan, deletion, and index-maintenance
+budgets are process-wide runtime settings exposed through `CONFIG SET/GET`.
+Workers sample budgets after waking and retain them for that cycle; changing
+the interval affects the next sleep without interrupting an existing one.
+These settings neither grant expiration authority nor bypass pause/drain
+boundaries. Defaults, ranges, and commands are documented in
+[Active expiration tuning](../operations/active-expiration.md).
 
 The preferred deletion is a durable tombstone, which remains safe if the wall
 clock later moves backward. If foreground space is completely exhausted, an

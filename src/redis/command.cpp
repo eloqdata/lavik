@@ -1269,6 +1269,14 @@ constexpr std::string_view kTombRaiderSleepConfig = "tomb-raider-sleep-ms";
 constexpr std::string_view kTombRaiderDailyTimeConfig =
     "tomb-raider-daily-time";
 constexpr std::string_view kTxCleanerCooldownConfig = "tx-cleaner-cooldown-ms";
+constexpr std::string_view kActiveExpirationIntervalConfig =
+    "active-expiration-interval-ms";
+constexpr std::string_view kActiveExpirationMapStepsConfig =
+    "active-expiration-map-steps-per-cycle";
+constexpr std::string_view kActiveExpirationDeletesConfig =
+    "active-expiration-deletes-per-cycle";
+constexpr std::string_view kActiveExpirationIndexMaintenanceStepsConfig =
+    "active-expiration-index-maintenance-steps-per-cycle";
 constexpr std::string_view kShutdownCheckpointConfig = "shutdown-checkpoint";
 constexpr std::string_view kForegroundBudgetConfig = "foreground-budget-us";
 constexpr std::string_view kBackgroundBudgetConfig = "background-budget-us";
@@ -1302,6 +1310,10 @@ enum class RuntimeConfigKey : std::uint8_t {
   kTombRaiderSleep,
   kTombRaiderDailyTime,
   kTxCleanerCooldown,
+  kActiveExpirationInterval,
+  kActiveExpirationMapSteps,
+  kActiveExpirationDeletes,
+  kActiveExpirationIndexMaintenanceSteps,
   kShutdownCheckpoint,
   kForegroundBudget,
   kBackgroundBudget,
@@ -1352,6 +1364,15 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kTombRaiderDailyTime},
     RuntimeConfigDescriptor{kTxCleanerCooldownConfig,
                             RuntimeConfigKey::kTxCleanerCooldown},
+    RuntimeConfigDescriptor{kActiveExpirationIntervalConfig,
+                            RuntimeConfigKey::kActiveExpirationInterval},
+    RuntimeConfigDescriptor{kActiveExpirationMapStepsConfig,
+                            RuntimeConfigKey::kActiveExpirationMapSteps},
+    RuntimeConfigDescriptor{kActiveExpirationDeletesConfig,
+                            RuntimeConfigKey::kActiveExpirationDeletes},
+    RuntimeConfigDescriptor{
+        kActiveExpirationIndexMaintenanceStepsConfig,
+        RuntimeConfigKey::kActiveExpirationIndexMaintenanceSteps},
     RuntimeConfigDescriptor{kShutdownCheckpointConfig,
                             RuntimeConfigKey::kShutdownCheckpoint},
     RuntimeConfigDescriptor{kForegroundBudgetConfig,
@@ -1380,6 +1401,23 @@ constexpr std::array kRuntimeConfigs{
 absl::StatusOr<std::uint32_t> ParseDailySecond(std::string_view text);
 std::string FormatDailySecond(std::uint32_t daily_second);
 std::string_view TombRaiderModeName(storage::TombRaiderMode mode);
+
+std::optional<storage::ActiveExpirationConfigKey> ActiveExpirationKey(
+    RuntimeConfigKey key) {
+  using Key = storage::ActiveExpirationConfigKey;
+  switch (key) {
+    case RuntimeConfigKey::kActiveExpirationInterval:
+      return Key::kIntervalMs;
+    case RuntimeConfigKey::kActiveExpirationMapSteps:
+      return Key::kMapStepsPerCycle;
+    case RuntimeConfigKey::kActiveExpirationDeletes:
+      return Key::kDeletesPerCycle;
+    case RuntimeConfigKey::kActiveExpirationIndexMaintenanceSteps:
+      return Key::kIndexMaintenanceStepsPerCycle;
+    default:
+      return std::nullopt;
+  }
+}
 
 std::optional<bool> ParseConfigYesNo(std::string_view value) {
   if (CmpCaseInsensitive(value, "yes")) return true;
@@ -1514,6 +1552,12 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           return FormatDailySecond(tomb_raider->daily_second_);
         case RuntimeConfigKey::kTxCleanerCooldown:
           return std::to_string(g_storage->TxCleanerCooldownMs());
+        case RuntimeConfigKey::kActiveExpirationInterval:
+        case RuntimeConfigKey::kActiveExpirationMapSteps:
+        case RuntimeConfigKey::kActiveExpirationDeletes:
+        case RuntimeConfigKey::kActiveExpirationIndexMaintenanceSteps:
+          return std::to_string(g_storage->ActiveExpirationConfigValue(
+              *ActiveExpirationKey(key)));
         case RuntimeConfigKey::kShutdownCheckpoint:
           return g_storage->ShutdownCheckpointEnabled() ? "yes" : "no";
         case RuntimeConfigKey::kForegroundBudget:
@@ -1760,6 +1804,15 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       }
       if (configured.ok()) {
         configured = co_await g_storage->ConfigureTombRaider(update);
+      }
+    } else if (const auto expiration_key = ActiveExpirationKey(config->key_);
+               expiration_key.has_value()) {
+      if (!ParseUint64(args[3], &value)) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured =
+            g_storage->ConfigureActiveExpiration(*expiration_key, value);
       }
     } else if (config->key_ == RuntimeConfigKey::kTxCleanerCooldown) {
       if (!ParseUint64(args[3], &value) ||

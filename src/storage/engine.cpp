@@ -150,6 +150,16 @@ std::uint32_t StorageEngine::ExpirationPauseCount() const noexcept {
   return impl_->ExpirationPauseCount();
 }
 
+std::uint32_t StorageEngine::ActiveExpirationConfigValue(
+    ActiveExpirationConfigKey key) const noexcept {
+  return impl_->ActiveExpirationConfigValue(key);
+}
+
+absl::Status StorageEngine::ConfigureActiveExpiration(
+    ActiveExpirationConfigKey key, std::uint64_t value) {
+  return impl_->ConfigureActiveExpiration(key, value);
+}
+
 TombRaiderTotals StorageEngine::TombRaiderStats() const noexcept {
   return impl_->TombRaiderStats();
 }

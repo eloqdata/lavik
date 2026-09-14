@@ -12,6 +12,7 @@ or safety boundaries.
 | [Building and packaging](building-and-packaging.md) | Building locally, producing release artifacts, or changing package contents |
 | [Multi-device storage](multi-device-storage.md) | Provisioning storage paths, expanding a storage set, or diagnosing membership and capacity constraints |
 | [Tomb Raider scheduling](tomb-raider.md) | Configuring or operating tombstone cleanup schedules |
+| [Active expiration tuning](active-expiration.md) | Inspecting or changing TTL scan and index-maintenance pacing |
 | [Prometheus metrics](metrics.md) | Integrating metrics, interpreting exported values, or changing monitoring behavior |
 | [Meta control plane](meta-control-plane.md) | Creating the first multi-Group cluster, starting plaintext or mTLS Meta clusters, changing membership, replacing binaries, handling snapshot/WAL incidents, and exporting audit or operation archives |
 | [Network IRQ affinity tuning](irq-affinity-tuning.md) | Measuring or changing host IRQ placement for latency tuning |

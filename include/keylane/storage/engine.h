@@ -76,6 +76,14 @@ struct StorageEngineOptions {
   RegisteredBufferPoolOptions buffers_{};
 };
 
+// Runtime pacing for the worker-local expiration/index-maintenance coroutine.
+enum class ActiveExpirationConfigKey : std::uint8_t {
+  kIntervalMs,
+  kMapStepsPerCycle,
+  kDeletesPerCycle,
+  kIndexMaintenanceStepsPerCycle,
+};
+
 enum class DefragConfigAction : std::uint8_t {
   kPause,
   kResume,
@@ -1552,6 +1560,17 @@ class StorageEngine {
   // clear; this call never grants client mutation authority by itself.
   void SetExpirationAuthority(bool authority) noexcept;
   std::uint32_t ExpirationPauseCount() const noexcept;
+
+  // Process-wide runtime settings, readable and writable from any worker.
+  // Values must be positive uint32 integers; invalid updates leave state
+  // intact. Each cycle snapshots its budgets after waking. Interval changes
+  // apply to the next sleep and do not interrupt one already in progress. These
+  // settings do not change expiration authority or persist across engine
+  // lifetimes.
+  std::uint32_t ActiveExpirationConfigValue(
+      ActiveExpirationConfigKey key) const noexcept;
+  absl::Status ConfigureActiveExpiration(ActiveExpirationConfigKey key,
+                                         std::uint64_t value);
 
   // Lifetime totals of the tomb raider (rounds run, tombstone entries
   // reaped, stale shielding bits cleared).

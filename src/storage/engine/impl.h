@@ -2139,6 +2139,11 @@ class StorageEngine::Impl {
 
   Task<absl::Status> ConfigureDefrag(DefragConfigUpdate update);
 
+  std::uint32_t ActiveExpirationConfigValue(
+      ActiveExpirationConfigKey key) const noexcept;
+  absl::Status ConfigureActiveExpiration(ActiveExpirationConfigKey key,
+                                         std::uint64_t value);
+
   bool ShutdownCheckpointEnabled() const noexcept {
     return shutdown_checkpoint_enabled_.load(std::memory_order_acquire);
   }
@@ -3754,6 +3759,13 @@ class StorageEngine::Impl {
   std::atomic<bool> system_state_root_failure_injected_{false};
   std::atomic<bool> expiration_authority_{true};
   std::atomic<std::uint32_t> expiration_pause_count_{0};
+  // Independent process-wide knobs; no worker cursor or candidate queue is
+  // mutated by CONFIG. A cycle keeps its sampled budgets across suspensions.
+  std::atomic<std::uint32_t> active_expiration_interval_ms_{10};
+  std::atomic<std::uint32_t> active_expiration_map_steps_per_cycle_{256};
+  std::atomic<std::uint32_t> active_expiration_deletes_per_cycle_{64};
+  std::atomic<std::uint32_t>
+      active_expiration_index_maintenance_steps_per_cycle_{256};
   // Background tasks that settle accounting through cross-worker hops
   // (retired-record settlement, detached-index reclaim, a tomb raider
   // round). A frame parked on such a hop is registered with the remote

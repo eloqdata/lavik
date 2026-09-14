@@ -58,7 +58,25 @@ class RespClient {
       request += "\r\n";
     }
     SendAll(request);
+    return ReadReply();
+  }
+
+ private:
+  std::string ReadReply() {
     const std::string line = ReadLine();
+    if (line.starts_with('*') || line.starts_with('%')) {
+      if (line == "*-1") return line;
+      std::size_t count = 0;
+      const auto [end, error] =
+          std::from_chars(line.data() + 1, line.data() + line.size(), count);
+      if (error != std::errc{} || end != line.data() + line.size()) {
+        Fail("malformed aggregate reply length");
+      }
+      if (line.starts_with('%')) count *= 2;
+      std::string reply = line;
+      for (std::size_t i = 0; i < count; ++i) reply += "\r\n" + ReadReply();
+      return reply;
+    }
     if (!line.starts_with('$') || line == "$-1") {
       return line;
     }
@@ -78,7 +96,6 @@ class RespClient {
     return line + "\r\n" + payload;
   }
 
- private:
   void SendAll(std::string_view bytes) {
     while (!bytes.empty()) {
       const ssize_t sent =
@@ -184,7 +201,8 @@ class ServerProcess {
  public:
   ServerProcess(const std::string& binary, std::uint16_t port,
                 const std::string& data_path, const std::string& log_path,
-                std::vector<std::string> extra_arguments = {}) {
+                std::vector<std::string> extra_arguments = {},
+                unsigned thread_count = 1) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -201,7 +219,7 @@ class ServerProcess {
           "--port",
           std::to_string(port),
           "--threads",
-          "1",
+          std::to_string(thread_count),
           "--recv-buffers-per-worker",
           "0",
           "--flush-max-ms",
@@ -307,6 +325,66 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
+std::string ConfigPair(std::string_view name, std::string_view value,
+                       bool resp3 = false) {
+  return std::string(resp3 ? "%1" : "*2") + "\r\n$" +
+         std::to_string(name.size()) + "\r\n" + std::string(name) + "\r\n$" +
+         std::to_string(value.size()) + "\r\n" + std::string(value);
+}
+
+void VerifyExpirationConfig(RespClient& client, std::uint16_t port) {
+  struct Setting {
+    std::string_view name;
+    std::string_view initial;
+    std::string_view updated;
+  };
+  constexpr Setting settings[]{
+      {"active-expiration-interval-ms", "10", "20"},
+      {"active-expiration-map-steps-per-cycle", "256", "512"},
+      {"active-expiration-deletes-per-cycle", "64", "8"},
+      {"active-expiration-index-maintenance-steps-per-cycle", "256", "128"},
+  };
+  std::string defaults = "*8";
+  for (const auto& setting : settings) {
+    defaults += ConfigPair(setting.name, setting.initial).substr(2);
+  }
+  Expect(client.Command({"CONFIG", "GET", "ACTIVE-EXPIRATION-*"}), defaults,
+         "expiration wildcard defaults");
+
+  RespClient other = Connect(port);
+  if (!other.Command({"HELLO", "3"}).starts_with('%')) {
+    Fail("HELLO 3 did not return a map");
+  }
+  for (const auto& setting : settings) {
+    Expect(client.Command({"CONFIG", "SET", setting.name, setting.updated}),
+           "+OK", "set expiration config");
+    Expect(other.Command({"CONFIG", "GET", setting.name}),
+           ConfigPair(setting.name, setting.updated, true),
+           "shared expiration config in RESP3");
+    for (std::string_view invalid :
+         {"0", "-1", "1.5", "", "abc", "4294967296", "18446744073709551616"}) {
+      if (!client.Command({"CONFIG", "SET", setting.name, invalid})
+               .starts_with("-ERR")) {
+        Fail("invalid expiration config was accepted");
+      }
+      Expect(client.Command({"CONFIG", "GET", setting.name}),
+             ConfigPair(setting.name, setting.updated),
+             "invalid expiration config preserves previous value");
+    }
+    Expect(client.Command({"CONFIG", "SET", setting.name, "1"}), "+OK",
+           "minimum expiration config");
+    Expect(client.Command({"CONFIG", "GET", setting.name}),
+           ConfigPair(setting.name, "1"), "minimum expiration config GET");
+    Expect(client.Command({"CONFIG", "SET", setting.name, setting.initial}),
+           "+OK", "restore expiration config");
+  }
+  Expect(other.Command({"CONFIG", "GET", "active-expiration-*"}),
+         "%4" + defaults.substr(2), "expiration wildcard RESP3");
+  Expect(
+      client.Command({"config", "set", "ACTIVE-EXPIRATION-INTERVAL-MS", "10"}),
+      "+OK", "case-insensitive expiration SET");
+}
+
 class ExpirationAuthorityService final : public celer::Service {
  public:
   explicit ExpirationAuthorityService(
@@ -349,15 +427,25 @@ class ExpirationAuthorityService final : public celer::Service {
     }
 
     if (result_.ok()) {
-      storage_->SetExpirationAuthority(true);
-      // The read remains logically absent but now queues the recovered winner
-      // for the already-running active-expiration worker.
-      auto hidden = co_await storage_->Get(0, "authority-deferred");
-      if (hidden.ok() ||
-          hidden.status().code() != absl::StatusCode::kNotFound) {
-        result_ = absl::FailedPreconditionError(
-            "read exposed the expired winner after authority grant");
+      // Change pacing on the already-running coroutine. With one full map
+      // pass per cycle it can discover the recovered key without a read
+      // queuing a candidate, including after authority was initially withheld.
+      using Key = keylane::storage::ActiveExpirationConfigKey;
+      result_ = storage_->ConfigureActiveExpiration(Key::kIntervalMs, 1);
+      if (result_.ok()) {
+        result_ = storage_->ConfigureActiveExpiration(Key::kMapStepsPerCycle,
+                                                      16'384 * 16);
       }
+      if (result_.ok()) {
+        result_ = storage_->ConfigureActiveExpiration(Key::kDeletesPerCycle, 1);
+      }
+      if (result_.ok()) {
+        result_ = storage_->ConfigureActiveExpiration(
+            Key::kIndexMaintenanceStepsPerCycle, 1);
+      }
+    }
+    if (result_.ok()) {
+      storage_->SetExpirationAuthority(true);
     }
     for (unsigned attempt = 0;
          result_.ok() && storage_->LocalSize(0) != 0 && attempt < 5'000;
@@ -394,6 +482,28 @@ void VerifyDeferredExpirationAuthority(const std::string& data_path) {
   options.tomb_raider_interval_ms_ = 0;
   options.tx_cleaner_cooldown_ms_ = 0;
   keylane::storage::StorageEngine storage(std::move(options));
+  // Exercise the largest supported settings before workers can consume them;
+  // a live UINT32_MAX interval would intentionally leave a very long sleep.
+  using Key = keylane::storage::ActiveExpirationConfigKey;
+  constexpr std::uint64_t maximum = std::numeric_limits<std::uint32_t>::max();
+  for (Key key : {Key::kIntervalMs, Key::kMapStepsPerCycle,
+                  Key::kDeletesPerCycle, Key::kIndexMaintenanceStepsPerCycle}) {
+    const auto initial = storage.ActiveExpirationConfigValue(key);
+    if (!storage.ConfigureActiveExpiration(key, maximum).ok() ||
+        storage.ActiveExpirationConfigValue(key) != maximum) {
+      Fail("maximum expiration config was not retained");
+    }
+    for (std::uint64_t invalid : {std::uint64_t{0}, maximum + 1,
+                                  std::numeric_limits<std::uint64_t>::max()}) {
+      if (storage.ConfigureActiveExpiration(key, invalid).ok() ||
+          storage.ActiveExpirationConfigValue(key) != maximum) {
+        Fail("invalid expiration config changed storage settings");
+      }
+    }
+    if (!storage.ConfigureActiveExpiration(key, initial).ok()) {
+      Fail("failed to restore expiration config before recovery");
+    }
+  }
   keylane::InitWorkerMetrics(1);
   absl::Status status = keylane::InitMemoryLimit(512ULL * 1024 * 1024, 1);
   if (!status.ok()) Fail(std::string(status.message()));
@@ -443,6 +553,7 @@ int main(int argc, char** argv) {
       ServerProcess server(argv[1], port, data_path, log_path);
       RespClient client = Connect(port);
       Expect(client.Command({"PING"}), "+PONG", "PING");
+      VerifyExpirationConfig(client, port);
 
       Expect(client.Command({"SET", "conditional", "old"}), "+OK",
              "initial SET");
@@ -696,6 +807,9 @@ int main(int argc, char** argv) {
              "large STRLEN");
       Expect(client.Command({"GET", "restart-large"}),
              "$9437184\r\n" + large_value, "large GET");
+      Expect(client.Command(
+                 {"CONFIG", "SET", "active-expiration-interval-ms", "37"}),
+             "+OK", "change expiration config before restart");
       server.Stop();
     }
 
@@ -703,6 +817,9 @@ int main(int argc, char** argv) {
     {
       ServerProcess server(argv[1], port, data_path, log_path);
       RespClient client = Connect(port);
+      Expect(client.Command({"CONFIG", "GET", "active-expiration-interval-ms"}),
+             ConfigPair("active-expiration-interval-ms", "10"),
+             "expiration config resets on restart");
       Expect(client.Command({"GET", "restart-dead"}), "$-1",
              "expired while stopped");
       Expect(client.Command({"TTL", "restart-dead"}), ":-2",
@@ -722,8 +839,9 @@ int main(int argc, char** argv) {
     }
 
     {
-      ServerProcess server(argv[1], port, data_path, log_path);
+      ServerProcess server(argv[1], port, data_path, log_path, {}, 2);
       RespClient client = Connect(port);
+      VerifyExpirationConfig(client, port);
       Expect(client.Command({"GET", "restart-large"}), "$5\r\nsmall",
              "large extent reclaim restart");
       server.Stop();
