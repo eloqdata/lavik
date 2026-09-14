@@ -24,6 +24,8 @@
 #include <utility>
 #include <vector>
 
+#include "support/test_data_path.h"
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -465,20 +467,22 @@ int main(int argc, char** argv) {
     return 1;
   }
   const std::string suffix = std::to_string(::getpid());
-  const std::string data_path = "/tmp/keylane-multikey-" + suffix + ".data";
-  const std::string log_path = "/tmp/keylane-multikey-" + suffix + ".log";
-  const std::string source_data =
-      "/tmp/keylane-multikey-repl-source-" + suffix + ".data";
-  const std::string replica_data =
-      "/tmp/keylane-multikey-repl-replica-" + suffix + ".data";
-  const std::string gate_source_data =
-      "/tmp/keylane-multikey-gate-source-" + suffix + ".data";
-  const std::string gate_replica_data =
-      "/tmp/keylane-multikey-gate-replica-" + suffix + ".data";
-  const std::string standby_data =
-      "/tmp/keylane-multikey-standby-" + suffix + ".data";
+  const std::string data_path =
+      keylane::test::TestDataPath("keylane-multikey-" + suffix + ".data");
+  const std::string log_path =
+      keylane::test::TestDataPath("keylane-multikey-" + suffix + ".log");
+  const std::string source_data = keylane::test::TestDataPath(
+      "keylane-multikey-repl-source-" + suffix + ".data");
+  const std::string replica_data = keylane::test::TestDataPath(
+      "keylane-multikey-repl-replica-" + suffix + ".data");
+  const std::string gate_source_data = keylane::test::TestDataPath(
+      "keylane-multikey-gate-source-" + suffix + ".data");
+  const std::string gate_replica_data = keylane::test::TestDataPath(
+      "keylane-multikey-gate-replica-" + suffix + ".data");
+  const std::string standby_data = keylane::test::TestDataPath(
+      "keylane-multikey-standby-" + suffix + ".data");
   const std::string gate_log_path =
-      "/tmp/keylane-multikey-gate-" + suffix + ".log";
+      keylane::test::TestDataPath("keylane-multikey-gate-" + suffix + ".log");
   (void)::unlink(data_path.c_str());
   (void)::unlink(log_path.c_str());
   (void)::unlink(source_data.c_str());

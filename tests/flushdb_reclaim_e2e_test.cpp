@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "keylane/storage/format.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -470,8 +471,8 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  const std::string prefix =
-      "/tmp/keylane-flushdb-reclaim-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPath(
+      "keylane-flushdb-reclaim-" + std::to_string(::getpid()));
   const std::string data_path = prefix + ".data";
   const std::string unequal_path_a = prefix + "-unequal-a.data";
   const std::string unequal_path_b = prefix + "-unequal-b.data";

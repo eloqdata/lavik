@@ -28,9 +28,8 @@ std::string ReadFile(const std::filesystem::path& path);
 
 class TempDirectory {
  public:
-  // Creates a uniquely named directory below KEYLANE_TEST_TMPDIR when that
-  // variable is set, or /tmp otherwise. An empty value is rejected and the
-  // configured root must exist.
+  // Creates a uniquely named directory below KEYLANE_TEST_DATA_DIR, or /tmp
+  // when that variable is unset or empty. The configured root must exist.
   // Normal destruction recursively removes the directory; Preserve or stack
   // unwinding retains it for failure diagnosis.
   explicit TempDirectory(std::string_view label);

@@ -1125,7 +1125,8 @@ def make_workdir(argv, prefix):
         workdir = argv[2]
         os.makedirs(workdir, exist_ok=True)
         return workdir, True
-    return tempfile.mkdtemp(prefix=prefix), False
+    test_data_dir = os.environ.get("KEYLANE_TEST_DATA_DIR") or "/tmp"
+    return tempfile.mkdtemp(prefix=prefix, dir=test_data_dir), False
 
 
 def cleanup(workdir, keep):

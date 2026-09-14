@@ -23,6 +23,7 @@
 #include "keylane/storage/engine.h"
 #include "keylane/storage/format.h"
 #include "keylane/tx/tx_shard.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -918,10 +919,10 @@ int main(int argc, char** argv) {
     else
       Check(argc == 1, "usage: replica_abort [--large-list|--large-hash]");
     const bool large = large_type != ValueType::kNone;
-    ScopedDataFile data_file(
-        std::string(large ? "/mnt/dev/keylane-native-large-"
-                          : "/tmp/keylane-replica-abort-reclaim-") +
-        std::to_string(::getpid()) + ".data");
+    const std::string prefix =
+        large ? "/mnt/dev/keylane-native-large-"
+              : keylane::test::TestDataPath("keylane-replica-abort-reclaim-");
+    ScopedDataFile data_file(prefix + std::to_string(::getpid()) + ".data");
     data_file.Create(large);
     const auto result = Run(data_file.path(), large_type);
     if (result != 0 || large) return result;

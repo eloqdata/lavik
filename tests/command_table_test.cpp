@@ -17,6 +17,7 @@
 #include "keylane/command.h"
 #include "keylane/glob.h"
 #include "keylane/storage/engine.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -973,8 +974,8 @@ TEST(CommandTableTest, ReplicationGateCandidatesAreClassified) {
 // for the replication transaction order gate. Needs a real storage engine so
 // OwnerForKey can spread keys over several shards.
 TEST(CommandTableTest, RequestSpansMultipleShardsDecision) {
-  const std::string path =
-      "/tmp/keylane-command-table-" + std::to_string(::getpid()) + ".data";
+  const std::string path = keylane::test::TestDataPath(
+      "keylane-command-table-" + std::to_string(::getpid()) + ".data");
   const int fd =
       ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   ASSERT_GE(fd, 0);

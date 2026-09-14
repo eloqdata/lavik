@@ -4,7 +4,8 @@ set -euo pipefail
 keylane_bin=$1
 redis_server=$2
 redis_cli=$3
-case_dir=$(mktemp -d /tmp/keylane-redis-cluster-e2e-XXXXXX)
+case_template=${KEYLANE_TEST_DATA_DIR:-/tmp}/keylane-redis-cluster-e2e-XXXXXX
+case_dir=$(mktemp -d "${case_template}")
 redis_pids=()
 keylane_pid=
 
@@ -27,7 +28,7 @@ cleanup() {
     kill "${redis_pids[@]}" 2>/dev/null || true
     wait "${redis_pids[@]}" 2>/dev/null || true
   fi
-  if [[ $case_dir == /tmp/keylane-redis-cluster-e2e-* ]]; then
+  if [[ $case_dir == "${case_template%XXXXXX}"* ]]; then
     rm -rf -- "$case_dir"
   fi
 }

@@ -10,7 +10,8 @@ case ${4:-} in
   backpressure) extra_args+=(--redis-export-backpressure) ;;
   *) echo "unknown test mode: $4" >&2; exit 2 ;;
 esac
-case_dir=$(mktemp -d /tmp/keylane-redis-export-e2e-XXXXXX)
+case_template=${KEYLANE_TEST_DATA_DIR:-/tmp}/keylane-redis-export-e2e-XXXXXX
+case_dir=$(mktemp -d "${case_template}")
 keylane_pid=
 redis_pid=
 
@@ -24,7 +25,7 @@ cleanup() {
   [[ -z ${keylane_pid} ]] || kill "${keylane_pid}" 2>/dev/null || true
   [[ -z ${redis_pid} ]] || wait "${redis_pid}" 2>/dev/null || true
   [[ -z ${keylane_pid} ]] || wait "${keylane_pid}" 2>/dev/null || true
-  if [[ ${case_dir} == /tmp/keylane-redis-export-e2e-* ]]; then
+  if [[ ${case_dir} == "${case_template%XXXXXX}"* ]]; then
     rm -rf -- "${case_dir}"
   fi
 }

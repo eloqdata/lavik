@@ -12,6 +12,7 @@
 
 #include "gtest/gtest.h"
 #include "keylane/rdb.h"
+#include "support/test_data_path.h"
 
 namespace keylane::rdb {
 namespace {
@@ -48,22 +49,23 @@ TEST(RdbCollectionTest, FourTypesRoundTripAcrossPagesAndEmptyRoutes) {
       fragment += Drain(*encoder);
     }
     ASSERT_TRUE(encoder->Finish().ok());
-    char path[] = "/tmp/keylane-rdb-collection-XXXXXX";
-    const int fd = ::mkstemp(path);
+    std::string path =
+        keylane::test::TestDataPath("keylane-rdb-collection-XXXXXX");
+    const int fd = ::mkstemp(path.data());
     ASSERT_GE(fd, 0);
     ::close(fd);
     struct RemoveFile {
-      const char* path;
-      ~RemoveFile() { std::remove(path); }
+      std::string path;
+      ~RemoveFile() { std::remove(path.c_str()); }
     } cleanup{path};
-    auto writer = FileWriter::Open(path);
+    auto writer = FileWriter::Open(path.c_str());
     ASSERT_TRUE(writer.ok()) << writer.status();
     // Every possible split must remain legal at the file sink, including
     // inside length prefixes, scores and empty-string boundaries.
     for (const char byte : fragment)
       ASSERT_TRUE(writer->WriteFragment(std::string_view(&byte, 1)).ok());
     ASSERT_TRUE(writer->Finish().ok());
-    auto reader = FileReader::Open(path);
+    auto reader = FileReader::Open(path.c_str());
     ASSERT_TRUE(reader.ok()) << reader.status();
     auto result = reader->Next();
     ASSERT_TRUE(result.ok()) << result.status();
@@ -217,15 +219,15 @@ TEST(RdbCollectionTest, PageRetentionMovesWithOutputLifetime) {
 class CollectionImportFile {
  public:
   CollectionImportFile() {
-    const int fd = ::mkstemp(path_);
+    const int fd = ::mkstemp(path_.data());
     if (fd < 0) throw std::runtime_error("RDB import test tempfile failed");
     ::close(fd);
   }
-  ~CollectionImportFile() { std::remove(path_); }
-  const char* path() const { return path_; }
+  ~CollectionImportFile() { std::remove(path_.c_str()); }
+  const char* path() const { return path_.c_str(); }
 
  private:
-  char path_[64] = "/tmp/keylane-rdb-import-XXXXXX";
+  std::string path_ = keylane::test::TestDataPath("keylane-rdb-import-XXXXXX");
 };
 
 void WriteImportFixture(const char* path, ValueType type, bool duplicate) {

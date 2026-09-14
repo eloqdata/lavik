@@ -53,6 +53,22 @@ a different build directory. It enables the non-packageable fault-server
 variant so crash-safety hooks remain available even though RelWithDebInfo may
 define `NDEBUG`.
 
+Tests place disposable data under `/tmp` by default. Set
+`KEYLANE_TEST_DATA_DIR` to an existing, writable directory to relocate test
+devices, logs, snapshots, and other generated artifacts for CTest, direct
+test-binary, shell, and Python test runs:
+
+```bash
+KEYLANE_TEST_DATA_DIR=/path/to/test-data \
+  ctest --test-dir <build-dir> --output-on-failure
+```
+
+An unset or empty value uses `/tmp`. Trailing directory separators are
+accepted. An explicit work-directory argument to a Python harness takes
+precedence over this environment variable. The focused failover gates inherit
+the same setting; their auxiliary Unix sockets use short build-directory
+paths to stay within the platform's socket-name limit.
+
 The focused large-Hash durability suite uses its own temporary 128 MiB files
 and local child servers. Run it against a Debug build or a build configured
 with `KEYLANE_BUILD_FAULT_SERVER=ON` to exercise the crash injections:

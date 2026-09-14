@@ -29,6 +29,7 @@
 #include "keylane/command_table.h"
 #include "keylane/rdb.h"
 #include "keylane/storage/format.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -815,8 +816,9 @@ std::string BulkArray(const std::vector<std::string_view>& values) {
 
 TEST(ListE2eTest, FreshMinimumStorageUsesImplicitEmptyCatalog) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-minimum-storage-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-minimum-storage-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -893,7 +895,8 @@ TEST(ListE2eTest, FunctionCatalogCrashRecoverySelectsCommittedRoot) {
 
   for (std::size_t case_index = 0; case_index < std::size(cases);
        ++case_index) {
-    const std::string prefix = "/tmp/keylane-function-catalog-crash-" +
+    const std::string prefix = keylane::test::TestDataPathPrefix() +
+                               "keylane-function-catalog-crash-" +
                                std::to_string(::getpid()) + "-" +
                                std::to_string(case_index);
     const std::string first_path = prefix + "-0.data";
@@ -960,8 +963,9 @@ TEST(ListE2eTest, AmbiguousCatalogRootCommitFencesAllClientsUntilRestart) {
       "#!lua name=ambiguous_catalog\n"
       "redis.register_function('ambiguous_catalog_value', function(keys, "
       "args) return 'new' end)";
-  const std::string prefix =
-      "/tmp/keylane-function-catalog-ambiguous-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-function-catalog-ambiguous-" +
+                             std::to_string(::getpid());
   const std::string first_path = prefix + "-0.data";
   const std::string second_path = prefix + "-1.data";
   const std::string log_path = prefix + ".log";
@@ -1011,8 +1015,9 @@ TEST(ListE2eTest, AmbiguousCatalogRootCommitFencesAllClientsUntilRestart) {
 
 TEST(ListE2eTest, PersistsStreamApproximateTrimNodeBoundaries) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-stream-trim-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-stream-trim-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1060,8 +1065,8 @@ TEST(ListE2eTest, PersistsStreamApproximateTrimNodeBoundaries) {
 
 TEST(ListE2eTest, PersistsLogicalLengthSeparatelyFromSerializedBytes) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-list-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-list-e2e-" + std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1147,8 +1152,9 @@ TEST(ListE2eTest, PersistsLogicalLengthSeparatelyFromSerializedBytes) {
 
 TEST(ListE2eTest, BlockingAndStreamedCommandsDoNotHoldFlushDbGate) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-db-gate-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-db-gate-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1267,8 +1273,9 @@ TEST(ListE2eTest, BlockingAndStreamedCommandsDoNotHoldFlushDbGate) {
 
 TEST(ListE2eTest, StreamBlockingRegistryBroadcastsAndKeepsGroupFifo) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-stream-wait-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-stream-wait-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1349,8 +1356,9 @@ TEST(ListE2eTest, StreamBlockingRegistryBroadcastsAndKeepsGroupFifo) {
 
 TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-client-unblock-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-client-unblock-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1486,8 +1494,9 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
 
 TEST(ListE2eTest, DisconnectCancelsActiveBlockingWait) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-blocking-disconnect-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-blocking-disconnect-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1532,8 +1541,9 @@ TEST(ListE2eTest, DisconnectCancelsActiveBlockingWait) {
 
 TEST(ListE2eTest, PipelineFlushesRepliesBeforeBlockingCommand) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-blocking-pipeline-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-blocking-pipeline-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1598,8 +1608,9 @@ TEST(ListE2eTest, PipelineFlushesRepliesBeforeBlockingCommand) {
 
 TEST(ListE2eTest, ExecWakesBlockersOnlyForFinalValueTypes) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-exec-final-type-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-exec-final-type-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1696,8 +1707,9 @@ TEST(ListE2eTest, ExecWakesBlockersOnlyForFinalValueTypes) {
 
 TEST(ListE2eTest, CircularBlockingMovesDrainBeforeTriggerReply) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-circular-blocking-move-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-circular-blocking-move-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1767,8 +1779,9 @@ TEST(ListE2eTest, CircularBlockingMovesDrainBeforeTriggerReply) {
 
 TEST(ListE2eTest, BlockingMovesDoNotDirtyWatchBeforeWakeAndCountChanges) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-blocking-watch-dirty-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-blocking-watch-dirty-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1870,8 +1883,9 @@ TEST(ListE2eTest, BlockingMovesDoNotDirtyWatchBeforeWakeAndCountChanges) {
 
 TEST(ListE2eTest, CommandsLargeKeyTransactionsAndCrashRecovery) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-list-complete-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-list-complete-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -2367,8 +2381,8 @@ TEST(ListE2eTest, CommandsLargeKeyTransactionsAndCrashRecovery) {
 
 TEST(ListE2eTest, SortsCollectionsAndStoresResultsAtomically) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-sort-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-sort-e2e-" + std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -2471,9 +2485,9 @@ TEST(ListE2eTest, SortsCollectionsAndStoresResultsAtomically) {
 
 TEST(ListE2eTest, NativeFlowCapabilityRejectsSessionHijack) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-replication-flow-capability-e2e-" +
-      std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-replication-flow-capability-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -2554,9 +2568,9 @@ TEST(ListE2eTest, NativeFlowCapabilityRejectsSessionHijack) {
 
 TEST(ListE2eTest, GracefulShutdownCancelsBackpressuredNativeSource) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-native-source-shutdown-e2e-" +
-      std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-native-source-shutdown-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -2661,8 +2675,9 @@ TEST(ListE2eTest, GracefulShutdownCancelsBackpressuredNativeSource) {
 
 TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-replication-session-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-replication-session-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -3354,8 +3369,8 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
 
 TEST(ListE2eTest, WaitsForNativeReplicaAcknowledgementsAcrossFlows) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-wait-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-wait-e2e-" + std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string second_replica_data = prefix + "-second-replica.data";
@@ -3514,8 +3529,9 @@ TEST(ListE2eTest, ControlDisconnectBeforeFirstFlowCannotResumeEmptyDataset) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-control-drop-fullsync-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-control-drop-fullsync-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -3564,8 +3580,9 @@ TEST(ListE2eTest, ControlDisconnectBeforeFirstFlowCannotResumeEmptyDataset) {
 
 TEST(ListE2eTest, ExecReusesAdmissionAndAccountsForReplicatedChildren) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-exec-admission-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-exec-admission-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -3656,8 +3673,9 @@ TEST(ListE2eTest, ExecReusesAdmissionAndAccountsForReplicatedChildren) {
 
 TEST(ListE2eTest, ClientKillDisconnectsReplicaSocketsAndReplicaReconnects) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-client-kill-replica-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-client-kill-replica-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -3794,8 +3812,9 @@ TEST(ListE2eTest, ClientKillDisconnectsReplicaSocketsAndReplicaReconnects) {
 
 TEST(ListE2eTest, ExpiredDisconnectedReplicaDisablesHistoryAndFullSyncs) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-expired-replica-lease-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-expired-replica-lease-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -3906,8 +3925,9 @@ TEST(ListE2eTest, ExpiredDisconnectedReplicaDisablesHistoryAndFullSyncs) {
 
 TEST(ListE2eTest, ReplicationUsesConfiguredTlsForControlAndEveryFlow) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-replication-tls-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-replication-tls-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string mismatch_data = prefix + "-mismatch.data";
@@ -4019,8 +4039,9 @@ TEST(ListE2eTest, ReplicationUsesConfiguredTlsForControlAndEveryFlow) {
 
 TEST(ListE2eTest, MaxClientsRejectsBeforeTlsAndUpdatesAtRuntime) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-maxclients-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-maxclients-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -4142,7 +4163,8 @@ TEST(ListE2eTest, FlushDbDuringFullSyncCancelsAndRestartsWithoutOldKeys) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix = "/tmp/keylane-replication-flush-fullsync-e2e-" +
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-replication-flush-fullsync-e2e-" +
                              std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
@@ -4226,8 +4248,9 @@ TEST(ListE2eTest, FullSyncInstallsOnlyTheFinalFunctionCatalog) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-function-fullsync-cut-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-function-fullsync-cut-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -4344,7 +4367,8 @@ TEST(ListE2eTest, FlushAllDuringFullSyncRestartsEveryDatabaseEpoch) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix = "/tmp/keylane-replication-flushall-fullsync-e2e-" +
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-replication-flushall-fullsync-e2e-" +
                              std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
@@ -4412,8 +4436,9 @@ TEST(ListE2eTest, FullSyncHandoffProjectsNonIdempotentTailExactlyOnce) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-replication-handoff-tail-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-replication-handoff-tail-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -4542,8 +4567,9 @@ TEST(ListE2eTest, PromotionDrainsAdmittedReplicaApplyBeforeClosingDbGate) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-promotion-apply-drain-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-promotion-apply-drain-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -4623,7 +4649,8 @@ TEST(ListE2eTest, PromotionDrainsCompleteReplicaTransaction) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix = "/tmp/keylane-promotion-transaction-drain-e2e-" +
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-promotion-transaction-drain-e2e-" +
                              std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
@@ -4700,8 +4727,9 @@ TEST(ListE2eTest, PromotionDrainsCompleteReplicaControlBarrier) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-promotion-control-drain-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-promotion-control-drain-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -4773,7 +4801,8 @@ TEST(ListE2eTest, PromotionDrainsCompleteReplicaControlBarrier) {
 
 TEST(ListE2eTest, RedisPsyncFullSyncActivatesBeforeOnlineWrites) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix = "/tmp/keylane-redis-fullsync-activation-e2e-" +
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-redis-fullsync-activation-e2e-" +
                              std::to_string(::getpid());
   const std::string replica_data = prefix + "-replica.data";
   const std::string replica_log = prefix + "-replica.log";
@@ -4859,8 +4888,9 @@ TEST(ListE2eTest, RedisPsyncFullSyncActivatesBeforeOnlineWrites) {
 #if !defined(NDEBUG) || KEYLANE_TEST_FAULTS_AVAILABLE
 TEST(ListE2eTest, DemotionCancelsRedisExportWaitingForDatabaseGates) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-redis-export-demotion-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-redis-export-demotion-e2e-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -4914,8 +4944,9 @@ TEST(ListE2eTest, DemotionCancelsRedisExportWaitingForDatabaseGates) {
 
 TEST(ListE2eTest, DemotionCancelsNativeFullSyncHoldingDatabaseGates) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-native-fullsync-demotion-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-native-fullsync-demotion-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string target_data = prefix + "-target.data";
   const std::string source_log = prefix + "-source.log";
@@ -4977,8 +5008,9 @@ TEST(ListE2eTest, DemotionCancelsNativeFullSyncHoldingDatabaseGates) {
 
 TEST(ListE2eTest, DemotionDrainsCatalogExecBeforeDisablingSourceHistory) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-catalog-exec-demotion-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-catalog-exec-demotion-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string target_data = prefix + "-target.data";
   const std::string source_log = prefix + "-source.log";
@@ -5066,8 +5098,9 @@ TEST(ListE2eTest, WriteDelayedAcrossRoleEpochIsRejected) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-role-write-admission-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-role-write-admission-e2e-" +
+                             std::to_string(::getpid());
   const std::string target_data = prefix + "-target.data";
   const std::string target_log = prefix + "-target.log";
   FileCleanup target_cleanup(target_data);
@@ -5111,8 +5144,9 @@ TEST(ListE2eTest, SwitchingUpstreamLoadsDestructivelyAndNoOneRemainsFenced) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-replication-root-switch-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-replication-root-switch-e2e-" +
+                             std::to_string(::getpid());
   const std::string first_data = prefix + "-first.data";
   const std::string second_data = prefix + "-second.data";
   const std::string replica_data = prefix + "-replica.data";
@@ -5238,8 +5272,9 @@ TEST(ListE2eTest, SwitchingUpstreamLoadsDestructivelyAndNoOneRemainsFenced) {
 
 TEST(ListE2eTest, PublisherBackpressurePreservesHistoryAndReplica) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-replication-history-gap-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-replication-history-gap-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -5323,8 +5358,9 @@ TEST(ListE2eTest, PublisherBackpressurePreservesHistoryAndReplica) {
 // connections do not own the key they write, which is the case being changed.
 TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-single-key-admission-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-single-key-admission-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -5483,8 +5519,9 @@ TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
 // empty queue -- is covered by PublisherBackpressurePreservesHistoryAndReplica.
 TEST(ListE2eTest, SingleKeyWritesKeepAdmissionAndOrderUnderATightWaterline) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-single-key-backpressure-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-single-key-backpressure-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -5612,8 +5649,9 @@ TEST(ListE2eTest, SingleKeyWritesKeepAdmissionAndOrderUnderATightWaterline) {
 // must match. Before the collapse the second round cost three times the first.
 TEST(ListE2eTest, AttachingAReplicaAddsNoCrossCoreHopsToSingleKeyWrites) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-single-key-hops-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-single-key-hops-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -5724,8 +5762,9 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   GTEST_SKIP() << "requires a Debug or fault-instrumented server";
 #endif
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-multi-replica-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-multi-replica-e2e-" +
+                             std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string first_data = prefix + "-first.data";
   const std::string second_data = prefix + "-second.data";
@@ -6138,8 +6177,9 @@ class LargeHashDurabilityE2eTest : public ::testing::Test {
   void SetUp() override {
     ASSERT_FALSE(g_keylane_binary.empty());
     const std::string prefix =
-        "/tmp/keylane-large-hash-durability-" + std::to_string(::getpid()) +
-        "-" + ::testing::UnitTest::GetInstance()->current_test_info()->name();
+        keylane::test::TestDataPathPrefix() + "keylane-large-hash-durability-" +
+        std::to_string(::getpid()) + "-" +
+        ::testing::UnitTest::GetInstance()->current_test_info()->name();
     data_path_ = prefix + ".data";
     log_path_ = prefix + ".log";
     const int fd =
@@ -6472,8 +6512,8 @@ TEST_F(LargeHashDurabilityE2eTest,
 
 TEST(HashE2eTest, UpdatesTransactionsAndRecoversMonolithicValues) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-hash-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-hash-e2e-" + std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -6633,8 +6673,9 @@ TEST(HashE2eTest, UpdatesTransactionsAndRecoversMonolithicValues) {
 
 TEST(SetE2eTest, ScanCursorDoesNotSkipAfterEarlierMembersAreDeleted) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-set-scan-stable-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-set-scan-stable-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -6683,8 +6724,8 @@ TEST(SetE2eTest, ScanCursorDoesNotSkipAfterEarlierMembersAreDeleted) {
 
 TEST(SetE2eTest, Redis72CommandsTransactionsAndRecovery) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-set-e2e-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-set-e2e-" + std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -6857,8 +6898,9 @@ TEST(SetE2eTest, Redis72CommandsTransactionsAndRecovery) {
 
 TEST(HashE2eTest, ExpiredShieldedWinnerDoesNotResurrectOlderString) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-expired-shield-recovery-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-expired-shield-recovery-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -6929,8 +6971,9 @@ TEST(HashE2eTest, ExpiredShieldedWinnerDoesNotResurrectOlderString) {
 
 TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-memory-recovery-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-memory-recovery-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -7002,8 +7045,9 @@ TEST(CollectionE2eTest, ExecPartialWritesRollbackDurably) {
   GTEST_SKIP() << "transaction write fault injection is debug-only";
 #else
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-exec-command-rollback-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-exec-command-rollback-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -7072,8 +7116,9 @@ TEST(CollectionE2eTest, ExecStoreReplacementRollbackDurably) {
   GTEST_SKIP() << "transaction write fault injection is debug-only";
 #else
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-exec-store-rollback-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-exec-store-rollback-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -7141,8 +7186,9 @@ TEST(CollectionE2eTest, ExecStoreReplacementRollbackDurably) {
 
 TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-compact-collections-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-compact-collections-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -8200,8 +8246,9 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
 
 TEST(CollectionE2eTest, StringCommandsRecover) {
   ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-string-commands-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPathPrefix() +
+                             "keylane-string-commands-" +
+                             std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);

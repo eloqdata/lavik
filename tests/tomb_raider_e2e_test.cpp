@@ -30,6 +30,7 @@
 #include "keylane/metrics.h"
 #include "keylane/storage/engine.h"
 #include "keylane/tx/tx_shard.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -593,8 +594,8 @@ int main(int argc, char** argv) {
     std::cerr << "usage: tomb_raider_e2e_test /path/to/keylane\n";
     return 2;
   }
-  const std::string prefix =
-      "/tmp/keylane-tombraider-" + std::to_string(::getpid());
+  const std::string prefix = keylane::test::TestDataPath(
+      "keylane-tombraider-" + std::to_string(::getpid()));
   const std::string data_path = prefix + ".data";
   const std::string quiesce_path = prefix + ".quiesce.data";
   const std::string log_path = prefix + ".log";

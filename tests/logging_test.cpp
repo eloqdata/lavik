@@ -10,6 +10,7 @@
 #include <string>
 
 #include "spdlog/spdlog.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -18,7 +19,7 @@ class LoggingTest : public ::testing::Test {
   LoggingTest() {
     const auto suffix =
         std::chrono::steady_clock::now().time_since_epoch().count();
-    temp_dir_ = std::filesystem::temp_directory_path() /
+    temp_dir_ = keylane::test::TestDataDirectory() /
                 ("keylane-logging-test-" + std::to_string(suffix));
     std::filesystem::create_directories(temp_dir_);
   }

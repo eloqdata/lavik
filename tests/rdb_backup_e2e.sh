@@ -3,7 +3,8 @@ set -euo pipefail
 
 keylane_bin=$1
 redis_cli=$2
-case_dir=$(mktemp -d /tmp/keylane-rdb-backup-e2e.XXXXXX)
+case_dir=$(mktemp -d \
+  "${KEYLANE_TEST_DATA_DIR:-/tmp}/keylane-rdb-backup-e2e.XXXXXX")
 source_pid=
 import_pid=
 

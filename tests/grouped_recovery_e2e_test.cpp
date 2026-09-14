@@ -27,6 +27,7 @@
 #include "keylane/storage/detail/grouped_hash.h"
 #include "keylane/storage/detail/ordered_compact_codec.h"
 #include "keylane/storage/format.h"
+#include "support/test_data_path.h"
 
 namespace {
 using namespace keylane::storage;
@@ -50,7 +51,8 @@ void WriteAt(int fd, std::span<const std::byte> bytes, std::uint64_t offset) {
 class RecordImage {
  public:
   RecordImage() {
-    std::string pattern = "/tmp/keylane-grouped-recovery-XXXXXX";
+    std::string pattern =
+        keylane::test::TestDataPath("keylane-grouped-recovery-XXXXXX");
     fd_ = ::mkstemp(pattern.data());
     Check(fd_ >= 0, "mkstemp failed");
     path_ = std::move(pattern);
@@ -369,8 +371,9 @@ class ChildServer {
                                     "--logtostderr",
                                     "--data-file",
                                     image.path()};
-      args.insert(args.end(), {"--rdb-dir", "/tmp", "--dbfilename",
-                               dump_.substr(dump_.rfind('/') + 1)});
+      args.insert(args.end(),
+                  {"--rdb-dir", keylane::test::TestDataDirectory().string(),
+                   "--dbfilename", dump_.substr(dump_.rfind('/') + 1)});
       if (!defrag) args.emplace_back("--defrag-paused");
       if (checkpoint) args.emplace_back("--shutdown-checkpoint");
       std::vector<char*> argv;

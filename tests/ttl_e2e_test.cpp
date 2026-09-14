@@ -30,6 +30,7 @@
 #include "keylane/metrics.h"
 #include "keylane/storage/engine.h"
 #include "keylane/tx/tx_shard.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -534,9 +535,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string prefix =
-      (std::filesystem::temp_directory_path() /
-       ("keylane-ttl-" + std::to_string(::getpid())))
-          .string();
+      keylane::test::TestDataPath("keylane-ttl-" + std::to_string(::getpid()));
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   const std::string no_authority_data_path = prefix + "-no-authority.data";

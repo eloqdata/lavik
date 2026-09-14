@@ -59,6 +59,7 @@
 #include "libnuraft/nuraft.hxx"
 #include "spdlog/sinks/ostream_sink.h"
 #include "spdlog/spdlog.h"
+#include "support/test_data_path.h"
 
 // Trusted test peer for the passkey-protected principal boundary. Tests use
 // the same privileged construction path as ctl and authenticated sessions.
@@ -109,7 +110,7 @@ constexpr std::string_view kTestPrincipal = "keylane://operator/test-entry";
 std::filesystem::path MakeTestDir(const char* suite, const char* name) {
   const ::testing::TestInfo* info =
       ::testing::UnitTest::GetInstance()->current_test_info();
-  std::filesystem::path dir = std::filesystem::temp_directory_path() /
+  std::filesystem::path dir = keylane::test::TestDataDirectory() /
                               ("keylane_meta_test_" + std::string(suite) + "_" +
                                name + "_" + info->test_suite_name() + "_" +
                                info->name() + "_" + std::to_string(::getpid()));

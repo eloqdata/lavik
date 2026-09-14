@@ -23,6 +23,7 @@
 
 #include "gtest/gtest.h"
 #include "keylane/storage/format.h"
+#include "support/test_data_path.h"
 
 namespace grouped_e2e {
 using namespace keylane::storage;
@@ -35,9 +36,10 @@ inline void Check(bool condition, std::string_view message) {
 
 class PrivateDisk {
  public:
-  explicit PrivateDisk(std::uint64_t bytes = 64 * kStorageBlockBytes,
-                       std::string_view directory = "/tmp") {
-    path_ = std::string(directory) + "/keylane-grouped-write-XXXXXX";
+  explicit PrivateDisk(
+      std::uint64_t bytes = 64 * kStorageBlockBytes,
+      std::filesystem::path directory = keylane::test::TestDataDirectory()) {
+    path_ = (directory / "keylane-grouped-write-XXXXXX").string();
     const int fd = ::mkstemp(path_.data());
     Check(fd >= 0, "mkstemp failed");
     Check(bytes <= INT64_MAX, "private disk size exceeds off_t");

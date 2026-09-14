@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "support/test_data_path.h"
 
 namespace keylane::rdb {
 namespace {
@@ -116,8 +117,8 @@ TEST(RdbTest, UpgradesLegacyKeylaneStreamEncoding) {
 class TempFile {
  public:
   explicit TempFile(std::string_view contents) {
-    char path[] = "/tmp/keylane-rdb-test-XXXXXX";
-    const int fd = ::mkstemp(path);
+    std::string path = keylane::test::TestDataPath("keylane-rdb-test-XXXXXX");
+    const int fd = ::mkstemp(path.data());
     EXPECT_GE(fd, 0);
     path_ = path;
     std::size_t written = 0;
