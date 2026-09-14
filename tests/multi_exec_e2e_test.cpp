@@ -22,6 +22,8 @@
 #include <utility>
 #include <vector>
 
+#include "support/test_data_path.h"
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -407,8 +409,10 @@ int main(int argc, char** argv) {
     return 1;
   }
   const std::string suffix = std::to_string(::getpid());
-  const std::string data_path = "/tmp/keylane-multiexec-" + suffix + ".data";
-  const std::string log_path = "/tmp/keylane-multiexec-" + suffix + ".log";
+  const std::string data_path =
+      keylane::test::TestDataPath("keylane-multiexec-" + suffix + ".data");
+  const std::string log_path =
+      keylane::test::TestDataPath("keylane-multiexec-" + suffix + ".log");
   (void)::unlink(data_path.c_str());
   (void)::unlink(log_path.c_str());
 

@@ -21,6 +21,7 @@
 #include "celer/runtime/task.h"
 #include "celer/runtime/worker.h"
 #include "gtest/gtest.h"
+#include "support/test_data_path.h"
 
 namespace celer {
 namespace {
@@ -207,7 +208,7 @@ class AcceptUnixService final : public Service {
 
 std::filesystem::path MakeSecureUnixTestDirectory(std::string_view suffix) {
   const std::filesystem::path directory =
-      std::filesystem::temp_directory_path() /
+      keylane::test::TestDataDirectory() /
       ("keylane-celer-uds-" + std::to_string(::getpid()) + "-" +
        std::string(suffix));
   std::filesystem::remove_all(directory);

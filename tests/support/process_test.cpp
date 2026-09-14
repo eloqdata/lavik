@@ -1,4 +1,5 @@
 #include "tests/support/process.h"
+#include "tests/support/test_data_path.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -49,23 +50,23 @@ class ScopedEnvironment {
   std::optional<std::string> previous_;
 };
 
-TEST(ProcessSupportTest, CreatesTemporaryDirectoryUnderConfiguredRoot) {
-  const std::filesystem::path root =
-      std::filesystem::temp_directory_path() /
-      ("keylane-process-support-root-" + std::to_string(::getpid()));
-  std::filesystem::remove_all(root);
-  ASSERT_TRUE(std::filesystem::create_directory(root));
+TEST(ProcessSupportTest, AcceptsConfiguredRootWithTrailingSeparator) {
+  TempDirectory root("process-support-root");
   {
-    ScopedEnvironment environment("KEYLANE_TEST_TMPDIR", root.string());
+    ScopedEnvironment environment("KEYLANE_TEST_DATA_DIR",
+                                  root.path().string() + "/");
     TempDirectory directory("configured-root");
-    EXPECT_EQ(directory.path().parent_path(), root);
+    EXPECT_TRUE(std::filesystem::equivalent(directory.path().parent_path(),
+                                           root.path()));
   }
-  EXPECT_TRUE(std::filesystem::remove(root));
+  EXPECT_TRUE(std::filesystem::is_empty(root.path()));
 }
 
-TEST(ProcessSupportTest, RejectsEmptyConfiguredTemporaryRoot) {
-  ScopedEnvironment environment("KEYLANE_TEST_TMPDIR", "");
-  EXPECT_THROW((void)TempDirectory("empty-root"), std::runtime_error);
+TEST(ProcessSupportTest, DefaultsToTmpForEmptyConfiguredRoot) {
+  ScopedEnvironment environment("KEYLANE_TEST_DATA_DIR", "");
+  TempDirectory directory("empty-root");
+  EXPECT_TRUE(std::filesystem::equivalent(directory.path().parent_path(),
+                                         "/tmp"));
 }
 
 TEST(ProcessSupportTest, SpawnsWithEnvironmentAndControlsLifecycle) {
@@ -83,6 +84,12 @@ TEST(ProcessSupportTest, SpawnsWithEnvironmentAndControlsLifecycle) {
   child.Resume();
   child.Stop(SIGTERM);
   EXPECT_EQ(child.pid(), -1);
+}
+
+TEST(ProcessSupportTest, CreatesTemporaryDirectoriesUnderTestDataRoot) {
+  TempDirectory directory("configured-root");
+  EXPECT_TRUE(std::filesystem::equivalent(directory.path().parent_path(),
+                                         TestDataDirectory()));
 }
 
 TEST(ProcessSupportTest, HoldsPortUntilExplicitRelease) {

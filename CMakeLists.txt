@@ -946,10 +946,10 @@ if (BUILD_TESTING)
           # Failover needs the complete Meta <-> Data <-> Redis surface, so
           # these cases are deliberately not part of the Meta-only gate loop
           # above. Keep each failure mode independently addressable and its
-          # process files isolated below the build tree. TMPDIR asks the
-          # Python harness for a unique child on every run; a failed child is
-          # retained with its precise path, while a successful rerun cannot
-          # inherit durable state from an older one.
+          # process files in a unique child of KEYLANE_TEST_DATA_DIR (or /tmp)
+          # on every run. A failed child is retained with its precise path,
+          # while a successful rerun cannot inherit older durable state.
+          # Let the harness read the caller's environment at test runtime.
           set(KEYLANE_FAILOVER_INTEGRATION_CASES
             controlled
             leader-resume
@@ -972,8 +972,6 @@ if (BUILD_TESTING)
             add_test(
               NAME meta_integration.gate_failover_${failover_test_suffix}
               COMMAND ${CMAKE_COMMAND} -E env
-                      "TMPDIR=${failover_workdir}"
-                      "KEYLANE_TEST_TMPDIR=${failover_workdir}"
                       "PYTHONPYCACHEPREFIX=${failover_workdir}/pycache"
                       "KEYLANE_FAILOVER_SOCKET_ROOT=${failover_socket_root}"
                       ${KEYLANE_PYTHON3_EXECUTABLE}

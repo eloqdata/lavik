@@ -569,7 +569,7 @@ def run_case(workdir, interactive):
 def run_manifest_bootstrapped_multi_meta_case(workdir, count, late_voter):
     """Every manifest vector creates through the same fixed Meta barrier."""
     # Meta Admin uses Unix-domain sockets, so keep this scenario component
-    # short enough for sockaddr_un even when TMPDIR itself is long.
+    # short enough for sockaddr_un even when the test-data root is long.
     scenario = os.path.join(workdir, f"manifest-{count}")
     meta_workdir = os.path.join(scenario, "meta")
     os.makedirs(meta_workdir, mode=0o700)

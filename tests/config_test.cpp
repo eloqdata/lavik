@@ -12,6 +12,7 @@
 
 #include "keylane/command.h"
 #include "keylane/server.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -31,7 +32,7 @@ class TempConfigFile {
   explicit TempConfigFile(std::string_view contents) {
     const auto suffix =
         std::chrono::steady_clock::now().time_since_epoch().count();
-    path_ = std::filesystem::temp_directory_path() /
+    path_ = keylane::test::TestDataDirectory() /
             ("keylane-config-test-" + std::to_string(suffix) + ".conf");
     std::ofstream output(path_);
     output << contents;

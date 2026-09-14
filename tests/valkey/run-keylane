@@ -6,8 +6,10 @@ REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 KEYLANE_BIN=${KEYLANE_BIN:-$REPO_ROOT/build/keylane}
 KEYLANE_HOST=${KEYLANE_HOST:-127.0.0.1}
 KEYLANE_PORT=${KEYLANE_PORT:-16379}
-DATA_FILE=$(mktemp "${TMPDIR:-/tmp}/keylane-valkey.XXXXXX.data")
-LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/keylane-valkey.XXXXXX.log")
+DATA_FILE=$(mktemp \
+  "${KEYLANE_TEST_DATA_DIR:-/tmp}/keylane-valkey.XXXXXX.data")
+LOG_FILE=$(mktemp \
+  "${KEYLANE_TEST_DATA_DIR:-/tmp}/keylane-valkey.XXXXXX.log")
 SERVER_PID=
 
 cleanup() {

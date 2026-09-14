@@ -27,6 +27,7 @@
 #include "keylane/meta/nuraft_log_store.h"
 #include "keylane/meta/state_apply.h"
 #include "keylane/meta/state_machine.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -1847,7 +1848,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   fixture.SubmitControlled();
 
   const std::filesystem::path test_dir =
-      std::filesystem::temp_directory_path() /
+      keylane::test::TestDataDirectory() /
       ("keylane_failover_reconciler_lifecycle_" + std::to_string(::getpid()));
   std::error_code cleanup_error;
   std::filesystem::remove_all(test_dir, cleanup_error);
@@ -2021,7 +2022,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   fixture.SubmitControlled();
 
   const std::filesystem::path test_dir =
-      std::filesystem::temp_directory_path() /
+      keylane::test::TestDataDirectory() /
       ("keylane_failover_reconciler_cutover_lifecycle_" +
        std::to_string(::getpid()));
   std::error_code cleanup_error;

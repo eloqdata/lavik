@@ -28,6 +28,7 @@
 #include "keylane/meta/nuraft_state_mgr.h"
 #include "keylane/meta/state_machine.h"
 #include "libnuraft/nuraft.hxx"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -60,7 +61,7 @@ class OneShotLogFault final : public NuraftLogFaultInjector {
 std::filesystem::path MakeTestDir(const char* suite, const char* name) {
   const ::testing::TestInfo* info =
       ::testing::UnitTest::GetInstance()->current_test_info();
-  std::filesystem::path dir = std::filesystem::temp_directory_path() /
+  std::filesystem::path dir = keylane::test::TestDataDirectory() /
                               ("keylane_meta_test_" + std::string(suite) + "_" +
                                name + "_" + info->test_suite_name() + "_" +
                                info->name() + "_" + std::to_string(::getpid()));

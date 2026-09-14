@@ -5,7 +5,8 @@ Usage:
   gate_failover.py META DATA CTL REDIS_CLI --case=CASE [workdir]
 
 The optional workdir is retained for diagnosis.  CTest and callers that care
-where process data is allocated should pass it explicitly (or set TMPDIR).
+where process data is allocated should pass it explicitly or set
+KEYLANE_TEST_DATA_DIR.
 """
 
 import argparse

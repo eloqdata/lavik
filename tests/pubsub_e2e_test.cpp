@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+#include "support/test_data_path.h"
+
 namespace {
 using namespace std::chrono_literals;
 
@@ -338,15 +340,10 @@ void ExpectExecPublishPrecedesLaterUnsubscribe(RespClient* subscriber,
 int main(int argc, char** argv) {
   try {
     if (argc != 2) Fail("usage: pubsub_e2e_test KEYLANE_BINARY");
-    const char* temporary_root = std::getenv("TMPDIR");
-    std::string directory_template =
-        std::string(temporary_root != nullptr ? temporary_root : "/tmp") +
-        "/keylane-pubsub-e2e-XXXXXX";
-    std::vector<char> directory(directory_template.begin(),
-                                directory_template.end());
-    directory.push_back('\0');
+    std::string directory =
+        keylane::test::TestDataPath("keylane-pubsub-e2e-XXXXXX");
     if (::mkdtemp(directory.data()) == nullptr) Fail("mkdtemp failed");
-    const std::string root(directory.data());
+    const std::string root(directory);
     const std::string source_data = root + "/source.data";
     const std::string replica_data = root + "/replica.data";
     const std::string auth_data = root + "/auth.data";

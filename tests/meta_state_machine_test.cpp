@@ -51,6 +51,7 @@
 #include "libnuraft/raft_server_handler.hxx"
 #include "spdlog/sinks/ostream_sink.h"
 #include "spdlog/spdlog.h"
+#include "support/test_data_path.h"
 
 namespace {
 
@@ -72,7 +73,7 @@ std::filesystem::path MakeTestDir(const char* suite, const char* name) {
       std::string(info->test_suite_name()) + "_" + info->name();
   std::replace(test_name.begin(), test_name.end(), '/', '_');
   std::filesystem::path dir =
-      std::filesystem::temp_directory_path() /
+      keylane::test::TestDataDirectory() /
       ("keylane_meta_test_" + std::string(suite) + "_" + name + "_" +
        test_name + "_" + std::to_string(::getpid()));
   std::filesystem::remove_all(dir);
