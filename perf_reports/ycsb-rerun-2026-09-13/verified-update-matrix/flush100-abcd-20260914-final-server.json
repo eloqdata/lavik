@@ -1,0 +1,46 @@
+{
+  "pid": 187792,
+  "exe": "/mnt/dev/keylane-main-f666837.siARSe/keylane",
+  "sha256": "9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266",
+  "workers": {
+    "187798": 0,
+    "187799": 1,
+    "187800": 2,
+    "187801": 3,
+    "187802": 4,
+    "187803": 5,
+    "187804": 6,
+    "187805": 7,
+    "187806": 8,
+    "187807": 9,
+    "187808": 10,
+    "187809": 11
+  },
+  "argv": [
+    "/mnt/dev/keylane-main-f666837.siARSe/keylane",
+    "--bind",
+    "172.16.0.4",
+    "--port",
+    "16379",
+    "--metrics-port",
+    "19100",
+    "--threads",
+    "12",
+    "--pin-workers",
+    "--shutdown-checkpoint",
+    "--log-dir",
+    "/mnt/dev/keylane-md0-keylane",
+    "--data-file",
+    "/dev/md0p1"
+  ],
+  "defrag": {
+    "paused": 0,
+    "max_active_per_device": 8,
+    "block_sleep_ms": 0,
+    "record_sleep_us": 0,
+    "active_total": 0,
+    "pending_total": 0
+  },
+  "dbsize": 119483607,
+  "active_expiration": "active-expiration-interval-ms\n10\nactive-expiration-map-steps-per-cycle\n256\nactive-expiration-deletes-per-cycle\n64\nactive-expiration-index-maintenance-steps-per-cycle\n256"
+}

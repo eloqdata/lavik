@@ -1,0 +1,31 @@
+[2026-09-14 16:01:34.162] [keylane] [info] mimalloc recovery_purge_delay=1000 online_purge_delay=60000 arena_eager_commit=1 allow_thp=0
+[2026-09-14 16:01:34.162] [keylane] [info] keylane version=0.1.0-dev listening on 172.16.0.4:16379 tls_port=0 metrics_port=19100 threads=12 maxclients=10000 maxclients_fd_reserve=256 pin_workers=true idle_timeout_ms=-1 busy_poll_us=20 foreground_budget_us=1000 background_budget_us=10 background_warrant_percent=1 spdk_max_completions_per_poll=8 spdk_foreground_pre_poll_us=5 registered_buffer_bytes=268435456 per worker storage_write_buffers=4 storage_read_buffer_bytes=1048576 replication_publish_queue_bytes=16777216 per worker max_memory=0 maxmemory_clients=5% client_query_buffer_limit=1073741824 flush_max_ms=100 flush_size_bytes=131072 inline_key_max_bytes=4008 defrag_max_active_per_device=8 defrag_sleep_ms=0 defrag_record_sleep_us=0 defrag_paused=false shutdown_checkpoint=true replication_backlog_backpressure=true
+[2026-09-14 16:01:34.162] [keylane] [info] memory limit=108053282816 (100.63G) initial_used=0 initial_rss=6537216
+[2026-09-14 16:01:34.162] [keylane] [info] storage path /dev/md0p1 has 4656154542080 trailing bytes beyond its persisted capacity; ignoring them
+[2026-09-14 16:01:34.170] [keylane] [info] storage device id=0 path=/dev/md0p1 capacity-bytes=5759140102144 data-blocks=686542 foreground-blocks=686534 defrag-reserve-blocks=8 data-bytes=5759131713536
+[2026-09-14 16:01:34.170] [keylane] [info] storage capacity: data-blocks=686542 foreground-blocks=686534 defrag-reserve-blocks=8
+[2026-09-14 16:01:34.170] [keylane] [info] storage direct-I/O alignment=512 bytes
+[2026-09-14 16:01:34.170] [keylane] [info] storage flush submission size=131072 bytes
+[2026-09-14 16:01:34.234] [keylane] [info] storage device id=0 foreground-weight=686534 home-workers=12
+[2026-09-14 16:01:34.240] [keylane] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596135677 Hz (2596.136 MHz) ticks-per-us=2596.136
+[2026-09-14 16:01:35.447] [keylane] [info] loaded shutdown checkpoint generation=88 entries=109732242 accounting-entries=27483 blocks=960 scan-workers=12
+[2026-09-14 16:01:35.634] [keylane] [info] storage recovery: blocks=27517/27517 (100.0%) swept=686542/686542 records=0 rate=18834 blocks/s 0.00M records/s eta=0.0s
+[2026-09-14 16:01:35.644] [keylane] [info] mimalloc recovery collection complete; online purge_delay=60000
+[2026-09-14 16:01:35.644] [keylane] [info] worker[1] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[9] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[7] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[6] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[3] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[10] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[4] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[5] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[8] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[11] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[2] direct-IO storage initialized
+[2026-09-14 16:01:35.644] [keylane] [info] worker[0] direct-IO storage initialized
+[2026-09-14 16:42:39.127] [keylane] [info] shutdown requested by signal 15
+[2026-09-14 16:42:39.182] [keylane] [info] replication targets quiesced before storage flush
+[2026-09-14 16:42:39.182] [keylane] [info] all active requests drained; flushing storage buffers
+[2026-09-14 16:42:41.606] [keylane] [info] published shutdown checkpoint generation=89 entries=119483607 accounting-entries=29325 blocks=1044
+[2026-09-14 16:42:41.606] [keylane] [info] all storage buffers durably flushed
+[2026-09-14 16:42:41.606] [keylane] [info] durable shutdown checkpoint permits OS-reclaimed worker state
