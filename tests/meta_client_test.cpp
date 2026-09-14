@@ -721,6 +721,8 @@ TEST(MetaFailoverControlAdapterTest,
   transition_id[0] = 0x11;
   control::WireId128 action_id{};
   action_id[0] = 0x22;
+  control::WireId128 active_grant_action_id{};
+  active_grant_action_id[0] = 0x23;
   control::WireId128 source_assignment{};
   source_assignment[0] = 0x33;
   control::WireId128 candidate_assignment{};
@@ -753,7 +755,10 @@ TEST(MetaFailoverControlAdapterTest,
       .grant_duration_ms_ = 5000,
       .grant_policy_id_ = "default",
       .grant_policy_version_ = 3,
-      .activation_action_id_ = std::nullopt,
+      // A prior failover's action remains bound to the current owner's grant
+      // while this new candidate action is prepared.
+      .activation_action_id_ =
+          FailoverActionId::FromBytes(active_grant_action_id),
       .failover_transition_ =
           PreparedFailoverTransition{
               .transition_id_ = FailoverTransitionId::FromBytes(transition_id),
@@ -796,6 +801,9 @@ TEST(MetaFailoverControlAdapterTest,
                                    .local_history_id_ = kCandidate});
   ASSERT_TRUE(translated.ok()) << translated.status();
   ASSERT_TRUE(translated->candidate_action_.has_value());
+  // The prior owner's grant provenance is not a pending activation on the new
+  // candidate. Passing both ids to ReplicationManager is an impossible local
+  // state even though they legally coexist in committed Group state.
   EXPECT_FALSE(translated->pending_activation_action_id_.has_value());
   const DesiredClusterFailoverAction& action = *translated->candidate_action_;
   EXPECT_EQ(action.transition_id_, transition_id);
@@ -828,6 +836,8 @@ TEST(MetaFailoverControlAdapterTest,
                                    .local_history_id_ = kSourceHistory});
   ASSERT_TRUE(translated.ok()) << translated.status();
   EXPECT_FALSE(translated->candidate_action_.has_value());
+  ASSERT_TRUE(translated->pending_activation_action_id_.has_value());
+  EXPECT_EQ(*translated->pending_activation_action_id_, active_grant_action_id);
   ASSERT_TRUE(translated->source_pause_.has_value());
   const DesiredClusterSourcePause& pause = *translated->source_pause_;
   EXPECT_EQ(pause.transition_id_, transition_id);
@@ -921,13 +931,24 @@ TEST(MetaFailoverControlAdapterTest,
   EXPECT_FALSE(translated->pending_activation_action_id_.has_value());
 
   desired.failover_transition_.reset();
+  desired.grant_active_ = true;
   desired.activation_action_id_ = FailoverActionId::FromBytes(action_id);
+  desired.owner_ = PreparedMemberAssignment{
+      .node_id_ = *NodeId::Parse(kLocal),
+  };
   translated = detail::TranslateClusterFailoverControl(desired, local);
   ASSERT_TRUE(translated.ok()) << translated.status();
   EXPECT_FALSE(translated->candidate_action_.has_value());
   EXPECT_FALSE(translated->source_pause_.has_value());
   ASSERT_TRUE(translated->pending_activation_action_id_.has_value());
   EXPECT_EQ(*translated->pending_activation_action_id_, action_id);
+
+  translated = detail::TranslateClusterFailoverControl(
+      desired, ReplicationIdentity{.local_node_id_ = kCandidate,
+                                   .boot_id_ = kCandidateBoot,
+                                   .local_history_id_ = kCandidate});
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  EXPECT_FALSE(translated->pending_activation_action_id_.has_value());
 }
 
 TEST(MetaFailoverControlAdapterTest,

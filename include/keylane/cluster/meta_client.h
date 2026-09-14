@@ -186,8 +186,8 @@ MetaTransferAbortDisposition ClassifyMetaTransferAbort(
 
 // Exact native-manager input derived from one normalized FDS Group and the
 // current Data incarnation. An action belongs only to its named candidate, a
-// source pause only to the exact controlled Owner, and the activation id is
-// retained independently after Cutover removes the transition.
+// source pause only to the exact controlled Owner, and a grant activation id
+// becomes a local pending activation only for the committed Owner.
 struct ClusterFailoverReconcileInput {
   std::optional<DesiredClusterFailoverAction> candidate_action_;
   std::optional<DesiredClusterSourcePause> source_pause_;

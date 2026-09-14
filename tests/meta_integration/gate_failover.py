@@ -1176,6 +1176,66 @@ def run_controlled(meta_binary, data_binary, ctl, redis_cli, workdir,
         H.log("controlled cutover: new Owner wrote; old Owner and peer "
               "followed; operation terminal; structured events=" +
               ",".join(sorted(events)))
+
+        # A successful cutover deliberately leaves its action id on the new
+        # owner's grant. The next transition must treat that id as authority
+        # provenance for the current owner, not as a pending activation on its
+        # newly selected candidate.
+        second_operation_id = fixture.submit_failover()
+        if second_operation_id == operation_id:
+            raise H.Failure("second controlled failover reused operation id")
+        wait_operation(
+            fixture, second_operation_id,
+            "OK completed failover-completed",
+            "second controlled operation reaches its durable terminal result",
+            timeout=30)
+
+        second_owner = None
+        latest = None
+        deadline = time.monotonic() + 90
+
+        def second_cutover_converged():
+            nonlocal latest, second_owner
+            latest = fixture.cluster_status(deadline)
+            groups = {item.get("group_id"): item
+                      for item in latest.get("groups", [])}
+            members = {item.get("node_id"): item
+                       for item in latest.get("data_nodes", [])}
+            group = groups.get(GROUP, {})
+            second_owner = group.get("owner_node_id")
+            return (latest.get("result") == "ready" and
+                    group.get("term") == "3" and
+                    second_owner in (OWNER, CANDIDATE, FOLLOWER) and
+                    second_owner != successor and
+                    all(members.get(node.node_id, {}).get("current_session")
+                        and members.get(node.node_id, {}).get(
+                            "projection_current")
+                        for node in fixture.data_nodes))
+
+        try:
+            H.wait_until(
+                f"{GROUP} reaches a second cutover and all Data nodes "
+                "converge", 90, second_cutover_converged)
+        except H.Failure as error:
+            raise H.Failure(f"{error}; status={latest}") from error
+
+        repeated_value = "after-second-cutover"
+        if (redis_call(fixture.by_id[second_owner],
+                       ["SET", key, repeated_value]) != "OK" or
+                redis_call(fixture.by_id[second_owner],
+                           ["GET", key]) != repeated_value):
+            raise H.Failure(
+                "second controlled failover Owner did not serve writes")
+        for follower_id in (
+                node_id for node_id in (OWNER, CANDIDATE, FOLLOWER)
+                if node_id != second_owner):
+            H.wait_until(
+                f"non-Owner {follower_id[:8]} follows the second Owner", 30,
+                lambda follower_id=follower_id:
+                readonly_get(fixture.by_id[follower_id], key) ==
+                repeated_value)
+        H.log("repeated controlled cutover: term 3 served and every follower "
+              "converged")
         fixture.require_expected_processes_alive()
         fixture.clean_shutdown()
     except Exception:

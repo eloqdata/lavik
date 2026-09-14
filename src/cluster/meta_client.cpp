@@ -490,7 +490,14 @@ detail::TranslateClusterFailoverControl(
     const DesiredClusterControl& desired,
     const ReplicationIdentity& local_identity, bool use_tls) {
   detail::ClusterFailoverReconcileInput translated;
-  if (desired.activation_action_id_.has_value()) {
+  // The activation id belongs to the committed owner's grant. It is a local
+  // handoff only on that owner; every other member merely observes the grant's
+  // provenance. In particular, a later candidate must not reconcile the old
+  // owner's activation id alongside its own new action.
+  const bool local_is_committed_owner =
+      desired.owner_.has_value() &&
+      desired.owner_->node_id_.ToHexString() == local_identity.local_node_id_;
+  if (local_is_committed_owner && desired.activation_action_id_.has_value()) {
     translated.pending_activation_action_id_ =
         desired.activation_action_id_->bytes();
   }
