@@ -815,7 +815,11 @@ NodeControlInstaller::ControlTransitionGuard::ControlTransitionGuard(
 NodeControlInstaller::ControlTransitionGuard::~ControlTransitionGuard() {
   if (owner_ == nullptr) return;
   assert(owner_->source_revocation_transitions_ != 0);
-  assert(owner_->active_control_transitions_.erase(id_) == 1);
+  // The drain barrier reads this set independently of the count below. Retire
+  // the transition in Release too, where assert expressions are not evaluated.
+  const auto erased = owner_->active_control_transitions_.erase(id_);
+  assert(erased == 1);
+  (void)erased;
   --owner_->source_revocation_transitions_;
 }
 
