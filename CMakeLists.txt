@@ -148,8 +148,10 @@ foreach(open_ssl_cache_var IN ITEMS OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
 endforeach()
 find_package(OpenSSL REQUIRED)
 
-if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/celer/CMakeLists.txt")
-  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/celer" "${CMAKE_CURRENT_BINARY_DIR}/celer")
+set(KEYLANE_CELER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/celer" CACHE PATH
+    "Celer checkout to build (allows an isolated runtime worktree)")
+if (EXISTS "${KEYLANE_CELER_SOURCE_DIR}/CMakeLists.txt")
+  add_subdirectory("${KEYLANE_CELER_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/celer")
 else()
   message(FATAL_ERROR "celer submodule not found; run git submodule update --init --recursive")
 endif()
@@ -1004,7 +1006,7 @@ if (BUILD_TESTING)
   # only uses celer public headers). The suite deliberately sleeps past armed
   # deadlines to catch stale-timeout dispatches, hence the 90s budget.
   add_executable(celer_connect_timer_check
-    celer/example/connect_timer_check.cpp
+    "${KEYLANE_CELER_SOURCE_DIR}/example/connect_timer_check.cpp"
   )
   target_link_libraries(celer_connect_timer_check PRIVATE celer::core)
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

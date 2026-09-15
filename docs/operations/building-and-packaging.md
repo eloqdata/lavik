@@ -20,6 +20,12 @@ and `libcrypto.a`).
 
 For a different local CPU target, configure CMake directly with
 `-DKEYLANE_MARCH=<target>`. An empty value disables the explicit `-march` flag.
+
+Use `-DKEYLANE_CELER_SOURCE_DIR=/absolute/path/to/celer-worktree` to build and
+test a separate Celer checkout without replacing the repository's submodule.
+The default remains the pinned `celer/` checkout. Record both revisions when
+comparing performance with an alternate runtime.
+
 When aggressive optimization is enabled, CMake's IPO support configures both
 compilation and linking for the non-Debug server and every bundled runtime
 library that feeds it, including Celer and the C libraries. Test-only
@@ -38,6 +44,37 @@ cmake --build <build-dir> --target keylane-meta keylane-ctl
 
 The downloadable release archive below continues to contain only `keylane`;
 build the Meta and operator binaries from source for this release.
+
+### Experimental DPDK networking
+
+The pinned Celer includes an optional FreeBSD/DPDK IPv4 TCP backend for
+AArch64 and x86-64. The default network backend remains Linux TCP/io_uring.
+Initialize the required dependencies explicitly; SPDK uses Celer's direct DPDK
+submodule, so its nested DPDK checkout is not needed:
+
+```bash
+git submodule update --init celer third_party/mimalloc third_party/nuraft
+git -C third_party/nuraft submodule update --init asio
+git -C celer submodule update --init third_party/liburing third_party/abseil \
+  third_party/spdk third_party/dpdk
+git -C celer/third_party/spdk submodule update --init isa-l isa-l-crypto
+cmake -S . -B build-dpdk-net -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DKEYLANE_ENABLE_OPT=OFF \
+  -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+  -DCELER_WITH_DPDK=ON -DBUILD_TESTING=OFF
+cmake --build build-dpdk-net --target keylane -j4
+```
+
+CMake invokes the BSD build helper automatically; Python 3 remains a build
+dependency. See Celer's [prototype runbook](../../celer/docs/dpdk-prototype.md)
+for prerequisites, TAP setup, physical-device selection, poll/adaptive mode,
+and queue configuration. The default device is a virtual TAP. Ordinary data
+files still use io_uring; `KEYLANE_WITH_SPDK=ON` independently enables NVMe
+storage. Use a fresh disposable file and disable the metrics listener with
+`--metrics-port=0` for the initial standalone SET/GET run. TLS, replication,
+and cluster use are outside this prototype's validation scope.
+
+### AddressSanitizer builds
 
 AddressSanitizer builds use Clang so coroutine symmetric transfers remain tail
 calls under sanitizer instrumentation:
