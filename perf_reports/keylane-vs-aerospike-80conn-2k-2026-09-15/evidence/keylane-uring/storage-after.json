@@ -1,0 +1,39 @@
+{
+  "table": {
+    "label": "gpt",
+    "id": "0E39CBB3-4B3E-48BE-A6DA-DB454B52E156",
+    "device": "/dev/md127",
+    "unit": "sectors",
+    "firstlba": 34,
+    "lastlba": 22496661470,
+    "grain": "3145728",
+    "sectorsize": 512,
+    "partitions": [
+      {
+        "node": "/dev/md127p1",
+        "start": 12288,
+        "size": 268435456,
+        "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        "uuid": "33F27D15-2EAD-4A86-94B0-F858D315334F",
+        "name": "aerospike-bench80"
+      },
+      {
+        "node": "/dev/md127p2",
+        "start": 268449792,
+        "size": 4294967296,
+        "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        "uuid": "6AE73491-1ED8-4633-8CC6-03063E710483",
+        "name": "keylane-uring-bench80"
+      }
+    ]
+  },
+  "array_uuid": "ea9bc790:01bcea07:35f053d1:cb4fa74e",
+  "partition": "/dev/md127p2",
+  "partuuid": "6ae73491-1ed8-4633-8cc6-03063e710483",
+  "bytes": 2199023255552,
+  "start_bytes": 137446293504,
+  "fully_zeroed": true,
+  "zero_seconds": 502.2991568510042,
+  "filesystem": null,
+  "aerospike_header_sha256": "ebcc4494d4b73f352fd811707c1ac8c05ab7841a18e5fe0436ab88869687219e"
+}

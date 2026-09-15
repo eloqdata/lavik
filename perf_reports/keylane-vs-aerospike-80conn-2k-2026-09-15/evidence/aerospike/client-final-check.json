@@ -1,0 +1,6 @@
+{
+  "unix": 1789488231.561981,
+  "code": 0,
+  "stdout": "[\n  {\n    \"argv\": [\n      \"pgrep\",\n      \"-a\",\n      \"-x\",\n      \"asbench\"\n    ],\n    \"code\": 1,\n    \"stdout\": \"\",\n    \"stderr\": \"\"\n  },\n  {\n    \"argv\": [\n      \"ss\",\n      \"-Htinp\",\n      \"state\",\n      \"established\",\n      \"dst\",\n      \"172.16.0.6\",\n      \"dport\",\n      \"=\",\n      \":3000\"\n    ],\n    \"code\": 0,\n    \"stdout\": \"\",\n    \"stderr\": \"\"\n  }\n]\n",
+  "stderr": ""
+}

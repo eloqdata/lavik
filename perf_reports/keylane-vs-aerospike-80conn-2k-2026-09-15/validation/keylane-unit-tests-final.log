@@ -1,0 +1,1610 @@
+Running main() from /mnt/dev/keylane/bld-clang18-release-grouped/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 613 tests from 87 test suites.
+[----------] Global test environment set-up.
+[----------] 1 test from BufferPoolTest
+[ RUN      ] BufferPoolTest.StorageWriteBufferWaiterIsReusable
+[2026-09-15 16:31:07.012] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596160164 Hz (2596.160 MHz) ticks-per-us=2596.160
+[2026-09-15 16:31:07.012] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] BufferPoolTest.StorageWriteBufferWaiterIsReusable (9 ms)
+[----------] 1 test from BufferPoolTest (9 ms total)
+
+[----------] 24 tests from ClusterAuthorityTest
+[ RUN      ] ClusterAuthorityTest.PrimaryServesKeyedReadAndWriteWhenReady
+[       OK ] ClusterAuthorityTest.PrimaryServesKeyedReadAndWriteWhenReady (0 ms)
+[ RUN      ] ClusterAuthorityTest.ControlledPauseKeepsReadsButReturnsTryAgainForWrites
+[       OK ] ClusterAuthorityTest.ControlledPauseKeepsReadsButReturnsTryAgainForWrites (0 ms)
+[ RUN      ] ClusterAuthorityTest.NullStateLoadsEverythingExceptAllowlist
+[       OK ] ClusterAuthorityTest.NullStateLoadsEverythingExceptAllowlist (0 ms)
+[ RUN      ] ClusterAuthorityTest.UnreadyOwningGroupLoadsKeyedRequests
+[       OK ] ClusterAuthorityTest.UnreadyOwningGroupLoadsKeyedRequests (0 ms)
+[ RUN      ] ClusterAuthorityTest.KeyedReadinessIsPerGroup
+[       OK ] ClusterAuthorityTest.KeyedReadinessIsPerGroup (0 ms)
+[ RUN      ] ClusterAuthorityTest.NoKeyCommandsServeWhenReady
+[       OK ] ClusterAuthorityTest.NoKeyCommandsServeWhenReady (0 ms)
+[ RUN      ] ClusterAuthorityTest.UnboundFirstSlotYieldsClusterDown
+[       OK ] ClusterAuthorityTest.UnboundFirstSlotYieldsClusterDown (0 ms)
+[ RUN      ] ClusterAuthorityTest.UnboundFirstSlotOutranksCrossSlot
+[       OK ] ClusterAuthorityTest.UnboundFirstSlotOutranksCrossSlot (0 ms)
+[ RUN      ] ClusterAuthorityTest.UnboundNonFirstSlotIsCrossSlot
+[       OK ] ClusterAuthorityTest.UnboundNonFirstSlotIsCrossSlot (0 ms)
+[ RUN      ] ClusterAuthorityTest.CrossSlotRejected
+[       OK ] ClusterAuthorityTest.CrossSlotRejected (0 ms)
+[ RUN      ] ClusterAuthorityTest.SameSlotKeysServe
+[       OK ] ClusterAuthorityTest.SameSlotKeysServe (0 ms)
+[ RUN      ] ClusterAuthorityTest.DifferentSlotsInSameGroupAreCrossSlot
+[       OK ] ClusterAuthorityTest.DifferentSlotsInSameGroupAreCrossSlot (0 ms)
+[ RUN      ] ClusterAuthorityTest.UnreadyNonFirstGroupLoadsBeforeCrossSlot
+[       OK ] ClusterAuthorityTest.UnreadyNonFirstGroupLoadsBeforeCrossSlot (0 ms)
+[ RUN      ] ClusterAuthorityTest.FencedPrimaryReportsClusterDown
+[       OK ] ClusterAuthorityTest.FencedPrimaryReportsClusterDown (0 ms)
+[ RUN      ] ClusterAuthorityTest.ReplicaReadWithReadonlyServesStale
+[       OK ] ClusterAuthorityTest.ReplicaReadWithReadonlyServesStale (0 ms)
+[ RUN      ] ClusterAuthorityTest.ReplicaReadWithoutReadonlyMoves
+[       OK ] ClusterAuthorityTest.ReplicaReadWithoutReadonlyMoves (0 ms)
+[ RUN      ] ClusterAuthorityTest.ReplicaWriteMovesRegardlessOfReadonly
+[       OK ] ClusterAuthorityTest.ReplicaWriteMovesRegardlessOfReadonly (0 ms)
+[ RUN      ] ClusterAuthorityTest.NonMemberMovesToPrimary
+[       OK ] ClusterAuthorityTest.NonMemberMovesToPrimary (0 ms)
+[ RUN      ] ClusterAuthorityTest.AuthorityUnchangedAcrossEqualStates
+[       OK ] ClusterAuthorityTest.AuthorityUnchangedAcrossEqualStates (0 ms)
+[ RUN      ] ClusterAuthorityTest.AuthorityUnchangedWithNullCurrent
+[       OK ] ClusterAuthorityTest.AuthorityUnchangedWithNullCurrent (0 ms)
+[ RUN      ] ClusterAuthorityTest.AuthorityUnchangedIgnoresUnrelatedGroupChanges
+[       OK ] ClusterAuthorityTest.AuthorityUnchangedIgnoresUnrelatedGroupChanges (0 ms)
+[ RUN      ] ClusterAuthorityTest.AuthorityUnchangedDetectsInvolvedGroupChanges
+[       OK ] ClusterAuthorityTest.AuthorityUnchangedDetectsInvolvedGroupChanges (1 ms)
+[ RUN      ] ClusterAuthorityTest.AuthorityUnchangedDetectsCoverageTransitions
+[       OK ] ClusterAuthorityTest.AuthorityUnchangedDetectsCoverageTransitions (0 ms)
+[ RUN      ] ClusterAuthorityTest.AuthorityUnchangedChecksEverySlot
+[       OK ] ClusterAuthorityTest.AuthorityUnchangedChecksEverySlot (0 ms)
+[----------] 24 tests from ClusterAuthorityTest (10 ms total)
+
+[----------] 5 tests from GroupInFlightTest
+[ RUN      ] GroupInFlightTest.PauseRejectsUnregisteredCaptureButDrainsAlreadyRegisteredMutation
+[       OK ] GroupInFlightTest.PauseRejectsUnregisteredCaptureButDrainsAlreadyRegisteredMutation (0 ms)
+[ RUN      ] GroupInFlightTest.CountsAndDrains
+[       OK ] GroupInFlightTest.CountsAndDrains (0 ms)
+[ RUN      ] GroupInFlightTest.AllocatesOneStripePerConfiguredWorker
+[       OK ] GroupInFlightTest.AllocatesOneStripePerConfiguredWorker (0 ms)
+[ RUN      ] GroupInFlightTest.MoveTransfersOwnership
+[       OK ] GroupInFlightTest.MoveTransfersOwnership (0 ms)
+[ RUN      ] GroupInFlightTest.ConcurrentEnterExit
+[       OK ] GroupInFlightTest.ConcurrentEnterExit (4 ms)
+[----------] 5 tests from GroupInFlightTest (6 ms total)
+
+[----------] 3 tests from AuthorityGuardTest
+[ RUN      ] AuthorityGuardTest.RegistrationHandshakeOwnsOneGuardPerGroup
+[       OK ] AuthorityGuardTest.RegistrationHandshakeOwnsOneGuardPerGroup (0 ms)
+[ RUN      ] AuthorityGuardTest.TopologyTransitionRejectsRegistrationAndReleasesItsGuard
+[       OK ] AuthorityGuardTest.TopologyTransitionRejectsRegistrationAndReleasesItsGuard (0 ms)
+[ RUN      ] AuthorityGuardTest.FinalMutationRecheckTracksAggregateOutcome
+[       OK ] AuthorityGuardTest.FinalMutationRecheckTracksAggregateOutcome (0 ms)
+[----------] 3 tests from AuthorityGuardTest (1 ms total)
+
+[----------] 17 tests from ClusterCommandTest
+[ RUN      ] ClusterCommandTest.KeySlotWorksWithoutClusterState
+[       OK ] ClusterCommandTest.KeySlotWorksWithoutClusterState (0 ms)
+[ RUN      ] ClusterCommandTest.PublishUsesItsChannelSlotAndHonorsControlledPause
+[       OK ] ClusterCommandTest.PublishUsesItsChannelSlotAndHonorsControlledPause (0 ms)
+[ RUN      ] ClusterCommandTest.SubcommandErrorsMatchRedis
+[       OK ] ClusterCommandTest.SubcommandErrorsMatchRedis (0 ms)
+[ RUN      ] ClusterCommandTest.MyIdReportsSelfNodeId
+[       OK ] ClusterCommandTest.MyIdReportsSelfNodeId (0 ms)
+[ RUN      ] ClusterCommandTest.MyIdIsEmptyWithoutSelf
+[       OK ] ClusterCommandTest.MyIdIsEmptyWithoutSelf (0 ms)
+[ RUN      ] ClusterCommandTest.InfoReportsPinnedFieldSet
+[       OK ] ClusterCommandTest.InfoReportsPinnedFieldSet (0 ms)
+[ RUN      ] ClusterCommandTest.InfoReportsCoverageGap
+[       OK ] ClusterCommandTest.InfoReportsCoverageGap (0 ms)
+[ RUN      ] ClusterCommandTest.InfoWithoutStateFailsAndZeroes
+[       OK ] ClusterCommandTest.InfoWithoutStateFailsAndZeroes (0 ms)
+[ RUN      ] ClusterCommandTest.SlotsGroupsRangesByOwningGroup
+[       OK ] ClusterCommandTest.SlotsGroupsRangesByOwningGroup (0 ms)
+[ RUN      ] ClusterCommandTest.SlotsSelectsTlsPortForTlsConnections
+[       OK ] ClusterCommandTest.SlotsSelectsTlsPortForTlsConnections (0 ms)
+[ RUN      ] ClusterCommandTest.SlotsCompactsAdjacentRanges
+[       OK ] ClusterCommandTest.SlotsCompactsAdjacentRanges (0 ms)
+[ RUN      ] ClusterCommandTest.SlotsIsEmptyWithoutState
+[       OK ] ClusterCommandTest.SlotsIsEmptyWithoutState (0 ms)
+[ RUN      ] ClusterCommandTest.NodesLinesMatchRedisFormat
+[       OK ] ClusterCommandTest.NodesLinesMatchRedisFormat (0 ms)
+[ RUN      ] ClusterCommandTest.NodesUsesTlsPortsForTlsConnections
+[       OK ] ClusterCommandTest.NodesUsesTlsPortsForTlsConnections (0 ms)
+[ RUN      ] ClusterCommandTest.NodesMarksReplicaSelfAndAnnouncesWildcard
+[       OK ] ClusterCommandTest.NodesMarksReplicaSelfAndAnnouncesWildcard (0 ms)
+[ RUN      ] ClusterCommandTest.NodesCompactsSlotRangesAndFlagsLinkState
+[       OK ] ClusterCommandTest.NodesCompactsSlotRangesAndFlagsLinkState (0 ms)
+[ RUN      ] ClusterCommandTest.NodesIsEmptyWithoutState
+[       OK ] ClusterCommandTest.NodesIsEmptyWithoutState (0 ms)
+[----------] 17 tests from ClusterCommandTest (0 ms total)
+
+[----------] 2 tests from ClusterRequestAuthorityTest
+[ RUN      ] ClusterRequestAuthorityTest.SessionLossRevokesCapturedWriteAdmission
+[       OK ] ClusterRequestAuthorityTest.SessionLossRevokesCapturedWriteAdmission (0 ms)
+[ RUN      ] ClusterRequestAuthorityTest.BlockingAttemptRegistersOnlyItsConcreteMutationWindow
+[       OK ] ClusterRequestAuthorityTest.BlockingAttemptRegistersOnlyItsConcreteMutationWindow (0 ms)
+[----------] 2 tests from ClusterRequestAuthorityTest (0 ms total)
+
+[----------] 2 tests from NodeIdTest
+[ RUN      ] NodeIdTest.ParsesAndFormatsCanonicalRedisIdentity
+[       OK ] NodeIdTest.ParsesAndFormatsCanonicalRedisIdentity (0 ms)
+[ RUN      ] NodeIdTest.DistinguishesAbsentFromAnAllZeroIdentity
+[       OK ] NodeIdTest.DistinguishesAbsentFromAnAllZeroIdentity (0 ms)
+[----------] 2 tests from NodeIdTest (0 ms total)
+
+[----------] 1 test from NodeDescriptorTest
+[ RUN      ] NodeDescriptorTest.PreservesInlineAndOverflowHosts
+[       OK ] NodeDescriptorTest.PreservesInlineAndOverflowHosts (0 ms)
+[----------] 1 test from NodeDescriptorTest (0 ms total)
+
+[----------] 15 tests from ServingStateBuilderTest
+[ RUN      ] ServingStateBuilderTest.RejectsMalformedNodeIds
+[       OK ] ServingStateBuilderTest.RejectsMalformedNodeIds (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsZeroInFlightStripes
+[       OK ] ServingStateBuilderTest.RejectsZeroInFlightStripes (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsDuplicateNodeId
+[       OK ] ServingStateBuilderTest.RejectsDuplicateNodeId (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsEmptyAndDuplicateGroupId
+[       OK ] ServingStateBuilderTest.RejectsEmptyAndDuplicateGroupId (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsUnknownPrimaryNode
+[       OK ] ServingStateBuilderTest.RejectsUnknownPrimaryNode (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsUnknownReplicaNode
+[       OK ] ServingStateBuilderTest.RejectsUnknownReplicaNode (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsOutOfRangeSelfAndReplicaPrimaryIndices
+[       OK ] ServingStateBuilderTest.RejectsOutOfRangeSelfAndReplicaPrimaryIndices (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsInconsistentGroupNodeRoles
+[       OK ] ServingStateBuilderTest.RejectsInconsistentGroupNodeRoles (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsInvertedSlotRange
+[       OK ] ServingStateBuilderTest.RejectsInvertedSlotRange (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsSlotRangeBeyondSlotCount
+[       OK ] ServingStateBuilderTest.RejectsSlotRangeBeyondSlotCount (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsOverlappingSlotsAcrossGroups
+[       OK ] ServingStateBuilderTest.RejectsOverlappingSlotsAcrossGroups (0 ms)
+[ RUN      ] ServingStateBuilderTest.RejectsOverlappingRangesWithinGroup
+[       OK ] ServingStateBuilderTest.RejectsOverlappingRangesWithinGroup (0 ms)
+[ RUN      ] ServingStateBuilderTest.AddSlotRangeAttachesToExistingGroup
+[       OK ] ServingStateBuilderTest.AddSlotRangeAttachesToExistingGroup (0 ms)
+[ RUN      ] ServingStateBuilderTest.AddSlotRangeToUnknownGroupIsDropped
+[       OK ] ServingStateBuilderTest.AddSlotRangeToUnknownGroupIsDropped (0 ms)
+[ RUN      ] ServingStateBuilderTest.SelfMayBeAbsent
+[       OK ] ServingStateBuilderTest.SelfMayBeAbsent (0 ms)
+[----------] 15 tests from ServingStateBuilderTest (0 ms total)
+
+[----------] 7 tests from ServingStateTest
+[ RUN      ] ServingStateTest.AccessorsRoundTrip
+[       OK ] ServingStateTest.AccessorsRoundTrip (0 ms)
+[ RUN      ] ServingStateTest.CoverageCompleteWhenAllSlotsBound
+[       OK ] ServingStateTest.CoverageCompleteWhenAllSlotsBound (0 ms)
+[ RUN      ] ServingStateTest.CoverageGapIsReported
+[       OK ] ServingStateTest.CoverageGapIsReported (0 ms)
+[ RUN      ] ServingStateTest.FullyReadyTracksStorageAndPopulation
+[       OK ] ServingStateTest.FullyReadyTracksStorageAndPopulation (0 ms)
+[ RUN      ] ServingStateTest.ContentHashIsOrderIndependent
+[       OK ] ServingStateTest.ContentHashIsOrderIndependent (0 ms)
+[ RUN      ] ServingStateTest.ContentHashCoversEverySemanticField
+[       OK ] ServingStateTest.ContentHashCoversEverySemanticField (1 ms)
+[ RUN      ] ServingStateTest.AuthorityToken
+[       OK ] ServingStateTest.AuthorityToken (1 ms)
+[----------] 7 tests from ServingStateTest (5 ms total)
+
+[----------] 10 tests from TopologyCacheTest
+[ RUN      ] TopologyCacheTest.PublishSharesCellsOnlyForTokenUnchangedGroups
+[       OK ] TopologyCacheTest.PublishSharesCellsOnlyForTokenUnchangedGroups (0 ms)
+[ RUN      ] TopologyCacheTest.ContentIdenticalRepublishKeepsInFlightCells
+[       OK ] TopologyCacheTest.ContentIdenticalRepublishKeepsInFlightCells (0 ms)
+[ RUN      ] TopologyCacheTest.PublishSwapsAndBumpsVersion
+[       OK ] TopologyCacheTest.PublishSwapsAndBumpsVersion (0 ms)
+[ RUN      ] TopologyCacheTest.ContentIdenticalRepublishKeepsVersionAndSnapshot
+[       OK ] TopologyCacheTest.ContentIdenticalRepublishKeepsVersionAndSnapshot (0 ms)
+[ RUN      ] TopologyCacheTest.VersionsIncreaseMonotonicallyUnderOnePublisher
+[       OK ] TopologyCacheTest.VersionsIncreaseMonotonicallyUnderOnePublisher (2 ms)
+[ RUN      ] TopologyCacheTest.ConcurrentPublishAndCurrentSmoke
+[       OK ] TopologyCacheTest.ConcurrentPublishAndCurrentSmoke (11 ms)
+[ RUN      ] TopologyCacheTest.CachedReaderTracksVersionAndSnapshot
+[       OK ] TopologyCacheTest.CachedReaderTracksVersionAndSnapshot (0 ms)
+[ RUN      ] TopologyCacheTest.CachedReaderIsScopedToCacheInstance
+[       OK ] TopologyCacheTest.CachedReaderIsScopedToCacheInstance (0 ms)
+[ RUN      ] TopologyCacheTest.PublicationSequenceBracketsCompletedPairs
+[       OK ] TopologyCacheTest.PublicationSequenceBracketsCompletedPairs (0 ms)
+[ RUN      ] TopologyCacheTest.CachedReaderConsistentUnderConcurrentPublish
+[       OK ] TopologyCacheTest.CachedReaderConsistentUnderConcurrentPublish (444 ms)
+[----------] 10 tests from TopologyCacheTest (460 ms total)
+
+[----------] 3 tests from ClusterRouterTest
+[ RUN      ] ClusterRouterTest.PrimaryForSlot
+[       OK ] ClusterRouterTest.PrimaryForSlot (0 ms)
+[ RUN      ] ClusterRouterTest.ClientPortFollowsConnectionTlsState
+[       OK ] ClusterRouterTest.ClientPortFollowsConnectionTlsState (0 ms)
+[ RUN      ] ClusterRouterTest.EndpointFormatsHostAndPort
+[       OK ] ClusterRouterTest.EndpointFormatsHostAndPort (0 ms)
+[----------] 3 tests from ClusterRouterTest (0 ms total)
+
+[----------] 29 tests from RedisConfigTest
+[ RUN      ] RedisConfigTest.TokenizesQuotesEscapesAndComments
+[       OK ] RedisConfigTest.TokenizesQuotesEscapesAndComments (0 ms)
+[ RUN      ] RedisConfigTest.ParsesRedisMemorySizes
+[       OK ] RedisConfigTest.ParsesRedisMemorySizes (0 ms)
+[ RUN      ] RedisConfigTest.ParsesClientBufferPercentAndAbsoluteLimits
+[       OK ] RedisConfigTest.ParsesClientBufferPercentAndAbsoluteLimits (0 ms)
+[ RUN      ] RedisConfigTest.ParsesRedisClientQueryBufferLimitRange
+[       OK ] RedisConfigTest.ParsesRedisClientQueryBufferLimitRange (0 ms)
+[ RUN      ] RedisConfigTest.AppliesSupportedDirectives
+[       OK ] RedisConfigTest.AppliesSupportedDirectives (0 ms)
+[ RUN      ] RedisConfigTest.AppliesLoggingDirectivesAndAliases
+[       OK ] RedisConfigTest.AppliesLoggingDirectivesAndAliases (0 ms)
+[ RUN      ] RedisConfigTest.RejectsInvalidLoggingConfiguration
+[       OK ] RedisConfigTest.RejectsInvalidLoggingConfiguration (0 ms)
+[ RUN      ] RedisConfigTest.RejectsInvalidAndUnsupportedDirectives
+[       OK ] RedisConfigTest.RejectsInvalidAndUnsupportedDirectives (0 ms)
+[ RUN      ] RedisConfigTest.ParsesClusterEnabled
+[       OK ] RedisConfigTest.ParsesClusterEnabled (0 ms)
+[ RUN      ] RedisConfigTest.ClusterModeRejectsStandalonePopulationSources
+[       OK ] RedisConfigTest.ClusterModeRejectsStandalonePopulationSources (0 ms)
+[ RUN      ] RedisConfigTest.AppliesAndValidatesTlsAndPasswordDirectives
+[       OK ] RedisConfigTest.AppliesAndValidatesTlsAndPasswordDirectives (0 ms)
+[ RUN      ] RedisConfigTest.RejectsLoadRdbWithReplicaOf
+[       OK ] RedisConfigTest.RejectsLoadRdbWithReplicaOf (0 ms)
+[ RUN      ] RedisConfigTest.ParsesRedisPsyncFollower
+[       OK ] RedisConfigTest.ParsesRedisPsyncFollower (0 ms)
+[ RUN      ] RedisConfigTest.RejectsConflictingRedisPsyncSources
+[       OK ] RedisConfigTest.RejectsConflictingRedisPsyncSources (0 ms)
+[ RUN      ] RedisConfigTest.RejectsLoadRdbReplaceWithoutSource
+[       OK ] RedisConfigTest.RejectsLoadRdbReplaceWithoutSource (0 ms)
+[ RUN      ] RedisConfigTest.RejectsInvalidRdbOutputNames
+[       OK ] RedisConfigTest.RejectsInvalidRdbOutputNames (0 ms)
+[ RUN      ] RedisConfigTest.LoadsFileAndReportsLineNumber
+[       OK ] RedisConfigTest.LoadsFileAndReportsLineNumber (0 ms)
+[ RUN      ] RedisConfigTest.AtomicallyRewritesFailoverManagedDirectives
+[       OK ] RedisConfigTest.AtomicallyRewritesFailoverManagedDirectives (13 ms)
+[ RUN      ] RedisConfigTest.ConfigRewritePreservesClusterEnabled
+[       OK ] RedisConfigTest.ConfigRewritePreservesClusterEnabled (6 ms)
+[ RUN      ] RedisConfigTest.RewriteRequiresConfigurationFile
+[       OK ] RedisConfigTest.RewriteRequiresConfigurationFile (0 ms)
+[ RUN      ] RedisConfigTest.AppliesClusterDirectives
+[       OK ] RedisConfigTest.AppliesClusterDirectives (0 ms)
+[ RUN      ] RedisConfigTest.AppliesMetaControlledClusterDirectives
+[       OK ] RedisConfigTest.AppliesMetaControlledClusterDirectives (0 ms)
+[ RUN      ] RedisConfigTest.RequiresCompleteMetaControlConfiguration
+[       OK ] RedisConfigTest.RequiresCompleteMetaControlConfiguration (0 ms)
+[ RUN      ] RedisConfigTest.RejectsMalformedMetaNodeIdentityAndSeeds
+[       OK ] RedisConfigTest.RejectsMalformedMetaNodeIdentityAndSeeds (0 ms)
+[ RUN      ] RedisConfigTest.MetaControlMtlsRequiresCompleteClientIdentity
+[       OK ] RedisConfigTest.MetaControlMtlsRequiresCompleteClientIdentity (0 ms)
+[ RUN      ] RedisConfigTest.RejectsInvalidClusterDirectives
+[       OK ] RedisConfigTest.RejectsInvalidClusterDirectives (0 ms)
+[ RUN      ] RedisConfigTest.RequiresNodeIdAndMetaSeedWhenClusterEnabled
+[       OK ] RedisConfigTest.RequiresNodeIdAndMetaSeedWhenClusterEnabled (0 ms)
+[ RUN      ] RedisConfigTest.RejectsClusterWithReplicationUpstream
+[       OK ] RedisConfigTest.RejectsClusterWithReplicationUpstream (0 ms)
+[ RUN      ] RedisConfigTest.ValidatesClusterAnnouncePortResolution
+[       OK ] RedisConfigTest.ValidatesClusterAnnouncePortResolution (0 ms)
+[----------] 29 tests from RedisConfigTest (19 ms total)
+
+[----------] 1 test from ReplicaOfCommandTest
+[ RUN      ] ReplicaOfCommandTest.ParsesFollowAndNoOneForms
+[       OK ] ReplicaOfCommandTest.ParsesFollowAndNoOneForms (0 ms)
+[----------] 1 test from ReplicaOfCommandTest (0 ms total)
+
+[----------] 2 tests from ControlProtocolFrameTest
+[ RUN      ] ControlProtocolFrameTest.EncodesNetworkOrderAndChecksCrcAndSequence
+[       OK ] ControlProtocolFrameTest.EncodesNetworkOrderAndChecksCrcAndSequence (0 ms)
+[ RUN      ] ControlProtocolFrameTest.RejectsFramesAboveTheTotalFrameCap
+[       OK ] ControlProtocolFrameTest.RejectsFramesAboveTheTotalFrameCap (0 ms)
+[----------] 2 tests from ControlProtocolFrameTest (0 ms total)
+
+[----------] 13 tests from ControlProtocolCodecTest
+[ RUN      ] ControlProtocolCodecTest.RoundTripsHeartbeatChallengeAndGrant
+[       OK ] ControlProtocolCodecTest.RoundTripsHeartbeatChallengeAndGrant (0 ms)
+[ RUN      ] ControlProtocolCodecTest.RoundTripsTypedReplicaCandidate
+[       OK ] ControlProtocolCodecTest.RoundTripsTypedReplicaCandidate (0 ms)
+[ RUN      ] ControlProtocolCodecTest.RejectsMalformedTypedCandidateAndRoleTag
+[       OK ] ControlProtocolCodecTest.RejectsMalformedTypedCandidateAndRoleTag (0 ms)
+[ RUN      ] ControlProtocolCodecTest.MaximumCandidateProgressStillFitsOneFrame
+[       OK ] ControlProtocolCodecTest.MaximumCandidateProgressStillFitsOneFrame (0 ms)
+[ RUN      ] ControlProtocolCodecTest.RoundTripsTypedFailoverObservationsBesideSteadyRole
+[       OK ] ControlProtocolCodecTest.RoundTripsTypedFailoverObservationsBesideSteadyRole (0 ms)
+[ RUN      ] ControlProtocolCodecTest.FailoverObservationValidationAndSingleFrameBudgetAreStrict
+[       OK ] ControlProtocolCodecTest.FailoverObservationValidationAndSingleFrameBudgetAreStrict (0 ms)
+[ RUN      ] ControlProtocolCodecTest.HeartbeatReplayIsExactAndGapFree
+[       OK ] ControlProtocolCodecTest.HeartbeatReplayIsExactAndGapFree (0 ms)
+[ RUN      ] ControlProtocolCodecTest.DirectiveLifecycleKeepsRecipientDistinctFromRebuildTarget
+[       OK ] ControlProtocolCodecTest.DirectiveLifecycleKeepsRecipientDistinctFromRebuildTarget (0 ms)
+[ RUN      ] ControlProtocolCodecTest.RoundTripsSourceLessPopulationInitialization
+[       OK ] ControlProtocolCodecTest.RoundTripsSourceLessPopulationInitialization (0 ms)
+[ RUN      ] ControlProtocolCodecTest.HelloRequiresBoundedSourceFlowCount
+[       OK ] ControlProtocolCodecTest.HelloRequiresBoundedSourceFlowCount (0 ms)
+[ RUN      ] ControlProtocolCodecTest.RebuildPayloadRequiresExactVersionedSourceLayout
+[       OK ] ControlProtocolCodecTest.RebuildPayloadRequiresExactVersionedSourceLayout (0 ms)
+[ RUN      ] ControlProtocolCodecTest.OperationEvidenceCarriesSessionBootAssignmentAndFreshnessAnchors
+[       OK ] ControlProtocolCodecTest.OperationEvidenceCarriesSessionBootAssignmentAndFreshnessAnchors (0 ms)
+[ RUN      ] ControlProtocolCodecTest.OperationEvidenceUsesObjectTransferWhenLarge
+[       OK ] ControlProtocolCodecTest.OperationEvidenceUsesObjectTransferWhenLarge (2 ms)
+[----------] 13 tests from ControlProtocolCodecTest (2 ms total)
+
+[----------] 1 test from ControlProtocolLeaseTest
+[ RUN      ] ControlProtocolLeaseTest.GrantMatchesOnceAndUsesOriginalSendTime
+[       OK ] ControlProtocolLeaseTest.GrantMatchesOnceAndUsesOriginalSendTime (0 ms)
+[----------] 1 test from ControlProtocolLeaseTest (0 ms total)
+
+[----------] 11 tests from ControlProtocolFullStateTest
+[ RUN      ] ControlProtocolFullStateTest.RoundTripsTypedProjectionAndDerivesObjectHash
+[       OK ] ControlProtocolFullStateTest.RoundTripsTypedProjectionAndDerivesObjectHash (0 ms)
+[ RUN      ] ControlProtocolFullStateTest.RoundTripsTypedFailoverStateAndCoversItInProjectionHash
+[       OK ] ControlProtocolFullStateTest.RoundTripsTypedFailoverStateAndCoversItInProjectionHash (0 ms)
+[ RUN      ] ControlProtocolFullStateTest.RejectsMalformedFailoverState
+[       OK ] ControlProtocolFullStateTest.RejectsMalformedFailoverState (0 ms)
+[ RUN      ] ControlProtocolFullStateTest.RoundTripsEmptyTopologyAtEpochZero
+[       OK ] ControlProtocolFullStateTest.RoundTripsEmptyTopologyAtEpochZero (0 ms)
+[ RUN      ] ControlProtocolFullStateTest.ConsumingDecodeReleasesTransferredWireStorage
+[       OK ] ControlProtocolFullStateTest.ConsumingDecodeReleasesTransferredWireStorage (1 ms)
+[ RUN      ] ControlProtocolFullStateTest.FrameSizedProjectionRoundTripsAsTypedMessage
+[       OK ] ControlProtocolFullStateTest.FrameSizedProjectionRoundTripsAsTypedMessage (0 ms)
+[ RUN      ] ControlProtocolFullStateTest.ProjectionHashExcludesAppliedIndexButCoversSemantics
+[       OK ] ControlProtocolFullStateTest.ProjectionHashExcludesAppliedIndexButCoversSemantics (0 ms)
+[ RUN      ] ControlProtocolFullStateTest.DirectiveSetDigestIsOrderIndependentAndIgnoresProjectionBasis
+[       OK ] ControlProtocolFullStateTest.DirectiveSetDigestIsOrderIndependentAndIgnoresProjectionBasis (0 ms)
+[ RUN      ] ControlProtocolFullStateTest.StreamingDirectiveDigestMatchesV1ByteSortAcrossFieldsAndPermutations
+[       OK ] ControlProtocolFullStateTest.StreamingDirectiveDigestMatchesV1ByteSortAcrossFieldsAndPermutations (2 ms)
+[ RUN      ] ControlProtocolFullStateTest.RoundTripsCommittedGrantlessGroup
+[       OK ] ControlProtocolFullStateTest.RoundTripsCommittedGrantlessGroup (0 ms)
+[ RUN      ] ControlProtocolFullStateTest.RejectsNonCanonicalManifestDocuments
+[       OK ] ControlProtocolFullStateTest.RejectsNonCanonicalManifestDocuments (0 ms)
+[----------] 11 tests from ControlProtocolFullStateTest (4 ms total)
+
+[----------] 4 tests from ControlProtocolTransferTest
+[ RUN      ] ControlProtocolTransferTest.StreamsOneBoundedObjectAndChecksDigest
+[       OK ] ControlProtocolTransferTest.StreamsOneBoundedObjectAndChecksDigest (0 ms)
+[ RUN      ] ControlProtocolTransferTest.NamedSupersessionAbortResetsOnlyItsExactActiveObject
+[       OK ] ControlProtocolTransferTest.NamedSupersessionAbortResetsOnlyItsExactActiveObject (0 ms)
+[ RUN      ] ControlProtocolTransferTest.RejectsOversizeAndAbortsDigestMismatch
+[       OK ] ControlProtocolTransferTest.RejectsOversizeAndAbortsDigestMismatch (0 ms)
+[ RUN      ] ControlProtocolTransferTest.EnforcesPerEnvelopeTransferCaps
+[       OK ] ControlProtocolTransferTest.EnforcesPerEnvelopeTransferCaps (0 ms)
+[----------] 4 tests from ControlProtocolTransferTest (0 ms total)
+
+[----------] 2 tests from ControlProtocolIdentityTest
+[ RUN      ] ControlProtocolIdentityTest.GeneratesCanonicalIndependentIdentities
+[       OK ] ControlProtocolIdentityTest.GeneratesCanonicalIndependentIdentities (0 ms)
+[ RUN      ] ControlProtocolIdentityTest.UsesStandardSha256
+[       OK ] ControlProtocolIdentityTest.UsesStandardSha256 (0 ms)
+[----------] 2 tests from ControlProtocolIdentityTest (0 ms total)
+
+[----------] 3 tests from ControlWriteQueueTest
+[ RUN      ] ControlWriteQueueTest.AuthorityOvertakesEarlierBulkAndSoftWork
+[       OK ] ControlWriteQueueTest.AuthorityOvertakesEarlierBulkAndSoftWork (0 ms)
+[ RUN      ] ControlWriteQueueTest.RejectsOverflowWithoutDiscardingQueuedMessage
+[       OK ] ControlWriteQueueTest.RejectsOverflowWithoutDiscardingQueuedMessage (0 ms)
+[ RUN      ] ControlWriteQueueTest.RejectsMessageThatRequiresObjectTransfer
+[       OK ] ControlWriteQueueTest.RejectsMessageThatRequiresObjectTransfer (0 ms)
+[----------] 3 tests from ControlWriteQueueTest (0 ms total)
+
+[----------] 1 test from ControlDeadlineWatchdogTest
+[ RUN      ] ControlDeadlineWatchdogTest.RearmUsesOneLiveTaskAndDisarmOrDestructionSuppressesExpiry
+[       OK ] ControlDeadlineWatchdogTest.RearmUsesOneLiveTaskAndDisarmOrDestructionSuppressesExpiry (302 ms)
+[----------] 1 test from ControlDeadlineWatchdogTest (302 ms total)
+
+[----------] 6 tests from ControlSessionWriterTest
+[ RUN      ] ControlSessionWriterTest.AuthorityOvertakesTransferBetweenBulkChunks
+[       OK ] ControlSessionWriterTest.AuthorityOvertakesTransferBetweenBulkChunks (0 ms)
+[ RUN      ] ControlSessionWriterTest.TransferReservationMakesQueueBoundReal
+[       OK ] ControlSessionWriterTest.TransferReservationMakesQueueBoundReal (0 ms)
+[ RUN      ] ControlSessionWriterTest.SerializesTransfersAndRetainsPendingPayloadOwner
+[       OK ] ControlSessionWriterTest.SerializesTransfersAndRetainsPendingPayloadOwner (0 ms)
+[ RUN      ] ControlSessionWriterTest.TerminalWriteErrorPoisonsQueuedAndFutureWork
+[       OK ] ControlSessionWriterTest.TerminalWriteErrorPoisonsQueuedAndFutureWork (0 ms)
+[ RUN      ] ControlSessionWriterTest.OversizedSingleFrameFailsWithoutPoisoningWriter
+[       OK ] ControlSessionWriterTest.OversizedSingleFrameFailsWithoutPoisoningWriter (0 ms)
+[ RUN      ] ControlSessionWriterTest.FullDesiredStateUsesOneFrameUntilItsPayloadRequiresStreaming
+[       OK ] ControlSessionWriterTest.FullDesiredStateUsesOneFrameUntilItsPayloadRequiresStreaming (0 ms)
+[----------] 6 tests from ControlSessionWriterTest (2 ms total)
+
+[----------] 2 tests from RemoteNotificationTest
+[ RUN      ] RemoteNotificationTest.AggregateInitializationZeroesOmittedFields
+[       OK ] RemoteNotificationTest.AggregateInitializationZeroesOmittedFields (0 ms)
+[ RUN      ] RemoteNotificationTest.BothDequeuePathsOverwriteAllScratchFields
+[       OK ] RemoteNotificationTest.BothDequeuePathsOverwriteAllScratchFields (0 ms)
+[----------] 2 tests from RemoteNotificationTest (0 ms total)
+
+[----------] 1 test from SpscRingTest
+[ RUN      ] SpscRingTest.RefreshesCachedHeadAfterConsumerProgress
+[       OK ] SpscRingTest.RefreshesCachedHeadAfterConsumerProgress (0 ms)
+[----------] 1 test from SpscRingTest (0 ms total)
+
+[----------] 4 tests from CrossCoreActiveSenderTest
+[ RUN      ] CrossCoreActiveSenderTest.BitmapAddressesAndClearsSenderGroups
+[       OK ] CrossCoreActiveSenderTest.BitmapAddressesAndClearsSenderGroups (94 ms)
+[ RUN      ] CrossCoreActiveSenderTest.RepeatedPostsBatchLaterLanePublications
+[       OK ] CrossCoreActiveSenderTest.RepeatedPostsBatchLaterLanePublications (0 ms)
+[ RUN      ] CrossCoreActiveSenderTest.SelfPostActivatesImmediately
+[       OK ] CrossCoreActiveSenderTest.SelfPostActivatesImmediately (0 ms)
+[ RUN      ] CrossCoreActiveSenderTest.ConcurrentDrainReactivatesNonemptyLanes
+[       OK ] CrossCoreActiveSenderTest.ConcurrentDrainReactivatesNonemptyLanes (1 ms)
+[----------] 4 tests from CrossCoreActiveSenderTest (95 ms total)
+
+[----------] 1 test from CrossWorkerMutexTest
+[ RUN      ] CrossWorkerMutexTest.SuspendsOnlyTheContendingCoroutine
+[2026-09-15 16:31:07.933] [info] provided-buffer ring disabled; using per-connection receive buffers
+[2026-09-15 16:31:07.933] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] CrossWorkerMutexTest.SuspendsOnlyTheContendingCoroutine (2 ms)
+[----------] 1 test from CrossWorkerMutexTest (2 ms total)
+
+[----------] 4 tests from DeviceAffinityTest
+[ RUN      ] DeviceAffinityTest.RejectsInsufficientQpairCapacity
+[       OK ] DeviceAffinityTest.RejectsInsufficientQpairCapacity (0 ms)
+[ RUN      ] DeviceAffinityTest.SingleControllerCoversEveryWorker
+[       OK ] DeviceAffinityTest.SingleControllerCoversEveryWorker (0 ms)
+[ RUN      ] DeviceAffinityTest.AllocatesWorkersByCapacityWeightAndQpairCap
+[       OK ] DeviceAffinityTest.AllocatesWorkersByCapacityWeightAndQpairCap (0 ms)
+[ RUN      ] DeviceAffinityTest.AssignsEveryControllerWhenControllersExceedWorkers
+[       OK ] DeviceAffinityTest.AssignsEveryControllerWhenControllersExceedWorkers (0 ms)
+[----------] 4 tests from DeviceAffinityTest (0 ms total)
+
+[----------] 3 tests from ForeignExecutorTest
+[ RUN      ] ForeignExecutorTest.TypedNotificationsUseTargetWorkerMpscMailbox
+[       OK ] ForeignExecutorTest.TypedNotificationsUseTargetWorkerMpscMailbox (22 ms)
+[ RUN      ] ForeignExecutorTest.ResumeSchedulesCoroutineWithoutCallableWrapper
+[       OK ] ForeignExecutorTest.ResumeSchedulesCoroutineWithoutCallableWrapper (0 ms)
+[ RUN      ] ForeignExecutorTest.RejectsInvalidRuntimeAndWorker
+[       OK ] ForeignExecutorTest.RejectsInvalidRuntimeAndWorker (0 ms)
+[----------] 3 tests from ForeignExecutorTest (22 ms total)
+
+[----------] 31 tests from GroupedHashTest
+[ RUN      ] GroupedHashTest.PrefixBoundsIncludeZeroAndFullWidth
+[       OK ] GroupedHashTest.PrefixBoundsIncludeZeroAndFullWidth (0 ms)
+[ RUN      ] GroupedHashTest.CompactPayloadHasAnExplicitLittleEndianHeader
+[       OK ] GroupedHashTest.CompactPayloadHasAnExplicitLittleEndianHeader (0 ms)
+[ RUN      ] GroupedHashTest.CompactEncodingMatchesAppendReferenceAtUnalignedLengths
+[       OK ] GroupedHashTest.CompactEncodingMatchesAppendReferenceAtUnalignedLengths (0 ms)
+[ RUN      ] GroupedHashTest.CompactReaderPreservesBinaryViewsAndCopiedPosition
+[       OK ] GroupedHashTest.CompactReaderPreservesBinaryViewsAndCopiedPosition (0 ms)
+[ RUN      ] GroupedHashTest.CompactReaderRejectsMalformedUnselectedBytes
+[       OK ] GroupedHashTest.CompactReaderRejectsMalformedUnselectedBytes (0 ms)
+[ RUN      ] GroupedHashTest.RootRoundTripsAndRejectsMalformedEnvelopes
+[       OK ] GroupedHashTest.RootRoundTripsAndRejectsMalformedEnvelopes (0 ms)
+[ RUN      ] GroupedHashTest.RejectsInnerCountBeforeDecodingEntryStorage
+[       OK ] GroupedHashTest.RejectsInnerCountBeforeDecodingEntryStorage (0 ms)
+[ RUN      ] GroupedHashTest.ReplayCommandSequenceIsIndependentOfGroupRevision
+[       OK ] GroupedHashTest.ReplayCommandSequenceIsIndependentOfGroupRevision (0 ms)
+[ RUN      ] GroupedHashTest.CompleteSnapshotsAreBinarySafeAndNotMutationLogs
+[       OK ] GroupedHashTest.CompleteSnapshotsAreBinarySafeAndNotMutationLogs (0 ms)
+[ RUN      ] GroupedHashTest.EmptyLeafAndRetiredLeafAreDifferentStates
+[       OK ] GroupedHashTest.EmptyLeafAndRetiredLeafAreDifferentStates (0 ms)
+[ RUN      ] GroupedHashTest.DuplicateFieldsAreRejectedBeforePublication
+[       OK ] GroupedHashTest.DuplicateFieldsAreRejectedBeforePublication (0 ms)
+[ RUN      ] GroupedHashTest.PromotionRoutesEveryFieldToOneBoundedGroup
+[       OK ] GroupedHashTest.PromotionRoutesEveryFieldToOneBoundedGroup (10 ms)
+[ RUN      ] GroupedHashTest.LargeIndivisibleFieldDoesNotCauseRecursiveExplosion
+[       OK ] GroupedHashTest.LargeIndivisibleFieldDoesNotCauseRecursiveExplosion (0 ms)
+[ RUN      ] GroupedHashTest.MaximalIndividualValueLeavesRoomForGroupFraming
+[       OK ] GroupedHashTest.MaximalIndividualValueLeavesRoomForGroupFraming (0 ms)
+[ RUN      ] GroupedHashTest.StreamingEncoderBorrowsTheLargeValueAndMatchesCodec
+[       OK ] GroupedHashTest.StreamingEncoderBorrowsTheLargeValueAndMatchesCodec (14 ms)
+[ RUN      ] GroupedHashTest.StreamingEncoderDistinguishesEmptySpansFromEnd
+[       OK ] GroupedHashTest.StreamingEncoderDistinguishesEmptySpansFromEnd (0 ms)
+[ RUN      ] GroupedHashTest.StreamingEncoderValidatesBeforeEmittingAnyBytes
+[       OK ] GroupedHashTest.StreamingEncoderValidatesBeforeEmittingAnyBytes (0 ms)
+[ RUN      ] GroupedHashTest.LogicalEncodingSizeCanExceedStringAndRecordLimits
+[       OK ] GroupedHashTest.LogicalEncodingSizeCanExceedStringAndRecordLimits (0 ms)
+[ DISABLED ] GroupedHashTest.DISABLED_LargeLogicalValueRoundTripsBeyondRecordLimit
+[ RUN      ] GroupedHashTest.RejectsFieldsOutsideTheLeafBeingUpdated
+[       OK ] GroupedHashTest.RejectsFieldsOutsideTheLeafBeingUpdated (0 ms)
+[ RUN      ] GroupedHashTest.DurableRoutingDoesNotDependOnProcessLookupSeed
+[       OK ] GroupedHashTest.DurableRoutingDoesNotDependOnProcessLookupSeed (0 ms)
+[ RUN      ] GroupedHashTest.RecoverySelectsEachGroupSequenceIndependently
+[       OK ] GroupedHashTest.RecoverySelectsEachGroupSequenceIndependently (0 ms)
+[ RUN      ] GroupedHashTest.RecoveryFiltersUncommittedFutureAndOtherIncarnations
+[       OK ] GroupedHashTest.RecoveryFiltersUncommittedFutureAndOtherIncarnations (0 ms)
+[ RUN      ] GroupedHashTest.SplitRecoveryIsOldOrNewAndNeverAPartialDirectory
+[       OK ] GroupedHashTest.SplitRecoveryIsOldOrNewAndNeverAPartialDirectory (0 ms)
+[ RUN      ] GroupedHashTest.EmptyLeafRemainsRoutableAfterDeletingItsLastField
+[       OK ] GroupedHashTest.EmptyLeafRemainsRoutableAfterDeletingItsLastField (0 ms)
+[ RUN      ] GroupedHashTest.RelocationUsesLsnOnlyWithinTheSameLogicalVersion
+[       OK ] GroupedHashTest.RelocationUsesLsnOnlyWithinTheSameLogicalVersion (0 ms)
+[ RUN      ] GroupedHashTest.RejectsCountsGapsOverlapsAndMalformedIdentities
+[       OK ] GroupedHashTest.RejectsCountsGapsOverlapsAndMalformedIdentities (0 ms)
+[ RUN      ] GroupedHashTest.SingleFieldUpdateWritesOnlyItsGroup
+[       OK ] GroupedHashTest.SingleFieldUpdateWritesOnlyItsGroup (0 ms)
+[ RUN      ] GroupedHashTest.DuplicateMutationOperandsPreserveRedisCounts
+[       OK ] GroupedHashTest.DuplicateMutationOperandsPreserveRedisCounts (0 ms)
+[ RUN      ] GroupedHashTest.NoopAndSetIfAbsentDoNotRewriteGroups
+[       OK ] GroupedHashTest.NoopAndSetIfAbsentDoNotRewriteGroups (0 ms)
+[ RUN      ] GroupedHashTest.MutationSplitIncludesOldLeafRetirement
+[       OK ] GroupedHashTest.MutationSplitIncludesOldLeafRetirement (0 ms)
+[ RUN      ] GroupedHashTest.RandomizedPartialWritesRecoverAgainstReferenceHash
+[       OK ] GroupedHashTest.RandomizedPartialWritesRecoverAgainstReferenceHash (90 ms)
+[----------] 31 tests from GroupedHashTest (116 ms total)
+
+[----------] 3 tests from GroupedCommitDecisionTest
+[ RUN      ] GroupedCommitDecisionTest.PrePublicationCheckDoesNotPromiseDurability
+[       OK ] GroupedCommitDecisionTest.PrePublicationCheckDoesNotPromiseDurability (0 ms)
+[ RUN      ] GroupedCommitDecisionTest.OneFailedParticipantRejectsTheWholeCommit
+[       OK ] GroupedCommitDecisionTest.OneFailedParticipantRejectsTheWholeCommit (0 ms)
+[ RUN      ] GroupedCommitDecisionTest.DurableDecisionCannotBeReversedByLateFailure
+[       OK ] GroupedCommitDecisionTest.DurableDecisionCannotBeReversedByLateFailure (0 ms)
+[----------] 3 tests from GroupedCommitDecisionTest (0 ms total)
+
+[----------] 19 tests from GroupedCollectionTest
+[ RUN      ] GroupedCollectionTest.RootAndPageRoundTripBothKinds
+[       OK ] GroupedCollectionTest.RootAndPageRoundTripBothKinds (0 ms)
+[ RUN      ] GroupedCollectionTest.IndexedSortedSetRootBindsBothGraphsAndKeepsV1
+[       OK ] GroupedCollectionTest.IndexedSortedSetRootBindsBothGraphsAndKeepsV1 (0 ms)
+[ RUN      ] GroupedCollectionTest.MemberScoresAreExactAndRejectMalformedValues
+[       OK ] GroupedCollectionTest.MemberScoresAreExactAndRejectMalformedValues (0 ms)
+[ RUN      ] GroupedCollectionTest.CodecsRejectTruncationReservedBitsAndInvalidIdentity
+[       OK ] GroupedCollectionTest.CodecsRejectTruncationReservedBitsAndInvalidIdentity (0 ms)
+[ RUN      ] GroupedCollectionTest.SortedSetChecksOrderBinaryTiesNanAndDuplicateMembers
+[       OK ] GroupedCollectionTest.SortedSetChecksOrderBinaryTiesNanAndDuplicateMembers (0 ms)
+[ RUN      ] GroupedCollectionTest.ExtentEncoderBorrowsOversizedItemAndPreservesEmptyItem
+[       OK ] GroupedCollectionTest.ExtentEncoderBorrowsOversizedItemAndPreservesEmptyItem (23 ms)
+[ RUN      ] GroupedCollectionTest.SplitPreservesOrderIdsAndNeighbourLinks
+[       OK ] GroupedCollectionTest.SplitPreservesOrderIdsAndNeighbourLinks (0 ms)
+[ RUN      ] GroupedCollectionTest.DirectoryRecoversCommittedSequenceBeforeRelocationLsn
+[       OK ] GroupedCollectionTest.DirectoryRecoversCommittedSequenceBeforeRelocationLsn (0 ms)
+[ RUN      ] GroupedCollectionTest.DirectoryRejectsMissingCyclesDisconnectedAndWrongCounts
+[       OK ] GroupedCollectionTest.DirectoryRejectsMissingCyclesDisconnectedAndWrongCounts (0 ms)
+[ RUN      ] GroupedCollectionTest.EveryListSpliceMatchesVectorAndReplaysOnlyWithCommit
+[       OK ] GroupedCollectionTest.EveryListSpliceMatchesVectorAndReplaysOnlyWithCommit (0 ms)
+[ RUN      ] GroupedCollectionTest.SpliceRejectsStaleMissingDuplicateAndInvalidInput
+[       OK ] GroupedCollectionTest.SpliceRejectsStaleMissingDuplicateAndInvalidInput (0 ms)
+[ RUN      ] GroupedCollectionTest.SortedSetSpliceChecksBoundsAndRepositionsCompleteEntries
+[       OK ] GroupedCollectionTest.SortedSetSpliceChecksBoundsAndRepositionsCompleteEntries (0 ms)
+[ RUN      ] GroupedCollectionTest.EveryPartialStructuralBatchKeepsOldRootRecoverable
+[       OK ] GroupedCollectionTest.EveryPartialStructuralBatchKeepsOldRootRecoverable (0 ms)
+[ RUN      ] GroupedCollectionTest.RetirementEvidenceCannotDisappearBeforeOlderPage
+[       OK ] GroupedCollectionTest.RetirementEvidenceCannotDisappearBeforeOlderPage (0 ms)
+[ RUN      ] GroupedCollectionTest.EnvelopeOnlyDecodeAndDualDecisionRetirement
+[       OK ] GroupedCollectionTest.EnvelopeOnlyDecodeAndDualDecisionRetirement (0 ms)
+[ RUN      ] GroupedCollectionTest.StreamingMetadataRebuildsBoundsAcrossAnyFraming
+[       OK ] GroupedCollectionTest.StreamingMetadataRebuildsBoundsAcrossAnyFraming (0 ms)
+[ RUN      ] GroupedCollectionTest.StreamingMetadataRejectsTruncationAndInvalidScores
+[       OK ] GroupedCollectionTest.StreamingMetadataRejectsTruncationAndInvalidScores (0 ms)
+[ RUN      ] GroupedCollectionTest.ScoreBoundsSeekGapsTiesInfinitiesAndExclusiveEnds
+[       OK ] GroupedCollectionTest.ScoreBoundsSeekGapsTiesInfinitiesAndExclusiveEnds (0 ms)
+[ RUN      ] GroupedCollectionTest.RecoveryRejectsInvalidAndNonMonotoneScoreBounds
+[       OK ] GroupedCollectionTest.RecoveryRejectsInvalidAndNonMonotoneScoreBounds (0 ms)
+[----------] 19 tests from GroupedCollectionTest (24 ms total)
+
+[----------] 4 tests from GroupedSortedRewriteTest
+[ RUN      ] GroupedSortedRewriteTest.ScoreMovingAcrossWholeSetTouchesOnlyEnds
+[       OK ] GroupedSortedRewriteTest.ScoreMovingAcrossWholeSetTouchesOnlyEnds (0 ms)
+[ RUN      ] GroupedSortedRewriteTest.EmptyPageRetiresAndUpdatesBothNeighbours
+[       OK ] GroupedSortedRewriteTest.EmptyPageRetiresAndUpdatesBothNeighbours (0 ms)
+[ RUN      ] GroupedSortedRewriteTest.SplitAndDisjointEditsPreserveUntouchedPages
+[       OK ] GroupedSortedRewriteTest.SplitAndDisjointEditsPreserveUntouchedPages (0 ms)
+[ RUN      ] GroupedSortedRewriteTest.NoopDeletionAndInvalidOrder
+[       OK ] GroupedSortedRewriteTest.NoopDeletionAndInvalidOrder (0 ms)
+[----------] 4 tests from GroupedSortedRewriteTest (0 ms total)
+
+[----------] 5 tests from OrderedCompactCodecTest
+[ RUN      ] OrderedCompactCodecTest.ListUsesExistingLogicalWireImage
+[       OK ] OrderedCompactCodecTest.ListUsesExistingLogicalWireImage (0 ms)
+[ RUN      ] OrderedCompactCodecTest.SortedScoresRetainInfinityAndNegativeZero
+[       OK ] OrderedCompactCodecTest.SortedScoresRetainInfinityAndNegativeZero (0 ms)
+[ RUN      ] OrderedCompactCodecTest.BoundsAndFramingFailClosed
+[       OK ] OrderedCompactCodecTest.BoundsAndFramingFailClosed (0 ms)
+[ RUN      ] OrderedCompactCodecTest.LargeItemAndInvalidScore
+[       OK ] OrderedCompactCodecTest.LargeItemAndInvalidScore (11 ms)
+[ RUN      ] OrderedCompactCodecTest.SizingSeparatesItemsFromAggregateCapacity
+[       OK ] OrderedCompactCodecTest.SizingSeparatesItemsFromAggregateCapacity (0 ms)
+[ DISABLED ] OrderedCompactCodecTest.DISABLED_LargeListRoundTripsBeyondRecordLimit
+[ DISABLED ] OrderedCompactCodecTest.DISABLED_LargeSortedSetRoundTripsBeyondRecordLimit
+[----------] 5 tests from OrderedCompactCodecTest (11 ms total)
+
+[----------] 11 tests from CollectionCompactStream
+[ RUN      ] CollectionCompactStream.EncoderIsByteCompatibleWithEveryLegacyType
+[       OK ] CollectionCompactStream.EncoderIsByteCompatibleWithEveryLegacyType (0 ms)
+[ RUN      ] CollectionCompactStream.DecoderHandlesEveryTwoChunkBoundary
+[       OK ] CollectionCompactStream.DecoderHandlesEveryTwoChunkBoundary (0 ms)
+[ RUN      ] CollectionCompactStream.OneByteInputAndEveryTruncatedEofAreChecked
+[       OK ] CollectionCompactStream.OneByteInputAndEveryTruncatedEofAreChecked (0 ms)
+[ RUN      ] CollectionCompactStream.EveryHeaderByteIsValidatedAgainstTransport
+[       OK ] CollectionCompactStream.EveryHeaderByteIsValidatedAgainstTransport (0 ms)
+[ RUN      ] CollectionCompactStream.SetValuesNanAndInconsistentContainersFailClosed
+[       OK ] CollectionCompactStream.SetValuesNanAndInconsistentContainersFailClosed (0 ms)
+[ RUN      ] CollectionCompactStream.PagesPauseBeforeLargeEntryAndTransferAdmission
+[       OK ] CollectionCompactStream.PagesPauseBeforeLargeEntryAndTransferAdmission (85 ms)
+[ RUN      ] CollectionCompactStream.AdmissionRejectsBeforeAllocatingAnnouncedHugeString
+[       OK ] CollectionCompactStream.AdmissionRejectsBeforeAllocatingAnnouncedHugeString (0 ms)
+[ RUN      ] CollectionCompactStream.HashGroupFramingLimitIsCheckedBeforeAllocation
+[       OK ] CollectionCompactStream.HashGroupFramingLimitIsCheckedBeforeAllocation (0 ms)
+[ RUN      ] CollectionCompactStream.VectorAdmissionFailureAndMoveKeepOneReceipt
+[       OK ] CollectionCompactStream.VectorAdmissionFailureAndMoveKeepOneReceipt (0 ms)
+[ RUN      ] CollectionCompactStream.DeclaredTotalsAndPageBudgetsCannotBeBypassed
+[       OK ] CollectionCompactStream.DeclaredTotalsAndPageBudgetsCannotBeBypassed (0 ms)
+[ RUN      ] CollectionCompactStream.AggregateEncodingExceedsOneGibWithoutWholeValueBuffer
+[       OK ] CollectionCompactStream.AggregateEncodingExceedsOneGibWithoutWholeValueBuffer (75 ms)
+[----------] 11 tests from CollectionCompactStream (161 ms total)
+
+[----------] 5 tests from GroupedOrderedObjectTest
+[ RUN      ] GroupedOrderedObjectTest.BothKindsRetainRetiredPhysicalRecordsAndRanks
+[       OK ] GroupedOrderedObjectTest.BothKindsRetainRetiredPhysicalRecordsAndRanks (0 ms)
+[ RUN      ] GroupedOrderedObjectTest.MemberIndexSharesPhysicalLifecycleAndOldViews
+[       OK ] GroupedOrderedObjectTest.MemberIndexSharesPhysicalLifecycleAndOldViews (0 ms)
+[ RUN      ] GroupedOrderedObjectTest.UpdatesSameCommandRevisionAndPreservesOldView
+[       OK ] GroupedOrderedObjectTest.UpdatesSameCommandRevisionAndPreservesOldView (0 ms)
+[ RUN      ] GroupedOrderedObjectTest.MetadataOnlyUpdateSharesDirectoryAndPhysicalPages
+[       OK ] GroupedOrderedObjectTest.MetadataOnlyUpdateSharesDirectoryAndPhysicalPages (0 ms)
+[ RUN      ] GroupedOrderedObjectTest.InvalidTypeMissingMarkerAndOomCannotPublish
+[       OK ] GroupedOrderedObjectTest.InvalidTypeMissingMarkerAndOomCannotPublish (0 ms)
+[----------] 5 tests from GroupedOrderedObjectTest (0 ms total)
+
+[----------] 5 tests from RecordPayloadCursorTest
+[ RUN      ] RecordPayloadCursorTest.StreamsEmptySpansAndExternalKeyPrefix
+[       OK ] RecordPayloadCursorTest.StreamsEmptySpansAndExternalKeyPrefix (0 ms)
+[ RUN      ] RecordPayloadCursorTest.RejectsTruncationAndStickyFailures
+[       OK ] RecordPayloadCursorTest.RejectsTruncationAndStickyFailures (0 ms)
+[ RUN      ] RecordPayloadCursorTest.RejectsTrailingAndOversizedProducerSpans
+[       OK ] RecordPayloadCursorTest.RejectsTrailingAndOversizedProducerSpans (0 ms)
+[ RUN      ] RecordPayloadCursorTest.RefusesUnconsumedAndOverlongOutput
+[       OK ] RecordPayloadCursorTest.RefusesUnconsumedAndOverlongOutput (0 ms)
+[ RUN      ] RecordPayloadCursorTest.ConsumesBorrowedHashFramingAcrossExtentBoundary
+[       OK ] RecordPayloadCursorTest.ConsumesBorrowedHashFramingAcrossExtentBoundary (4 ms)
+[----------] 5 tests from RecordPayloadCursorTest (4 ms total)
+
+[----------] 35 tests from GroupedObjectIndexTest
+[ RUN      ] GroupedObjectIndexTest.PhysicalGroupsUseRevisionNotSourceCommandSequence
+[       OK ] GroupedObjectIndexTest.PhysicalGroupsUseRevisionNotSourceCommandSequence (0 ms)
+[ RUN      ] GroupedObjectIndexTest.PublishOomPreservesExistingKeyAndCanBeRetried
+[       OK ] GroupedObjectIndexTest.PublishOomPreservesExistingKeyAndCanBeRetried (0 ms)
+[ RUN      ] GroupedObjectIndexTest.PartialConstructionFailureUnwindsGroupEntries
+[       OK ] GroupedObjectIndexTest.PartialConstructionFailureUnwindsGroupEntries (14 ms)
+[ RUN      ] GroupedObjectIndexTest.RealMaxmemoryFailureAfterPartialBuildCanBeRetried
+[       OK ] GroupedObjectIndexTest.RealMaxmemoryFailureAfterPartialBuildCanBeRetried (14 ms)
+[ RUN      ] GroupedObjectIndexTest.DetachedMetadataStaysChargedUntilLastReaderReleasesIt
+[       OK ] GroupedObjectIndexTest.DetachedMetadataStaysChargedUntilLastReaderReleasesIt (0 ms)
+[ RUN      ] GroupedObjectIndexTest.ExtentManifestBytesAreIncludedInRetainedAccounting
+[       OK ] GroupedObjectIndexTest.ExtentManifestBytesAreIncludedInRetainedAccounting (0 ms)
+[ RUN      ] GroupedObjectIndexTest.ManifestReaderRetainsItsOwnMemoryCharge
+[       OK ] GroupedObjectIndexTest.ManifestReaderRetainsItsOwnMemoryCharge (0 ms)
+[ RUN      ] GroupedObjectIndexTest.StoresOneCompactPhysicalIndexEntryPerGroup
+[       OK ] GroupedObjectIndexTest.StoresOneCompactPhysicalIndexEntryPerGroup (0 ms)
+[ RUN      ] GroupedObjectIndexTest.NonGroupedRootBypassesSideTable
+[       OK ] GroupedObjectIndexTest.NonGroupedRootBypassesSideTable (0 ms)
+[ RUN      ] GroupedObjectIndexTest.LookupRequiresPhysicalRootAndPopulationVersion
+[       OK ] GroupedObjectIndexTest.LookupRequiresPhysicalRootAndPopulationVersion (0 ms)
+[ RUN      ] GroupedObjectIndexTest.PublishAndRollbackAreCompareAndSwap
+[       OK ] GroupedObjectIndexTest.PublishAndRollbackAreCompareAndSwap (0 ms)
+[ RUN      ] GroupedObjectIndexTest.UndoPlaceholderRestoresWithoutAllocationAtMaxmemory
+[       OK ] GroupedObjectIndexTest.UndoPlaceholderRestoresWithoutAllocationAtMaxmemory (0 ms)
+[ RUN      ] GroupedObjectIndexTest.SettlingOlderUndoDoesNotEraseRepublishedView
+[       OK ] GroupedObjectIndexTest.SettlingOlderUndoDoesNotEraseRepublishedView (0 ms)
+[ RUN      ] GroupedObjectIndexTest.StaleUndoClearCannotRemoveCurrentView
+[       OK ] GroupedObjectIndexTest.StaleUndoClearCannotRemoveCurrentView (0 ms)
+[ RUN      ] GroupedObjectIndexTest.RecreatedKeyRejectsOldWriterDespiteMatchingSequence
+[       OK ] GroupedObjectIndexTest.RecreatedKeyRejectsOldWriterDespiteMatchingSequence (0 ms)
+[ RUN      ] GroupedObjectIndexTest.DetachPreservesOldPopulationAndSharesArena
+[       OK ] GroupedObjectIndexTest.DetachPreservesOldPopulationAndSharesArena (0 ms)
+[ RUN      ] GroupedObjectIndexTest.MetadataHandleOutlivesRemovalWithoutPretendingToPinDisk
+[       OK ] GroupedObjectIndexTest.MetadataHandleOutlivesRemovalWithoutPretendingToPinDisk (0 ms)
+[ RUN      ] GroupedObjectIndexTest.RejectsIncompleteDuplicateAndStaleGroupLocations
+[       OK ] GroupedObjectIndexTest.RejectsIncompleteDuplicateAndStaleGroupLocations (0 ms)
+[ RUN      ] GroupedObjectIndexTest.ExternalGroupManifestIsSparseAndRequired
+[       OK ] GroupedObjectIndexTest.ExternalGroupManifestIsSparseAndRequired (0 ms)
+[ RUN      ] GroupedObjectIndexTest.ArenaCapacityFailurePublishesNothing
+[       OK ] GroupedObjectIndexTest.ArenaCapacityFailurePublishesNothing (0 ms)
+[ RUN      ] GroupedObjectIndexTest.RetainedMetadataIsReleasedWithLastHandle
+[       OK ] GroupedObjectIndexTest.RetainedMetadataIsReleasedWithLastHandle (0 ms)
+[ RUN      ] GroupedObjectIndexTest.MaxmemoryRejectsConstructionWithoutTerminating
+[       OK ] GroupedObjectIndexTest.MaxmemoryRejectsConstructionWithoutTerminating (0 ms)
+[ RUN      ] GroupedObjectIndexTest.RejectsConflictingAllocationsBeforeCompactingLocations
+[       OK ] GroupedObjectIndexTest.RejectsConflictingAllocationsBeforeCompactingLocations (0 ms)
+[ RUN      ] GroupedObjectIndexTest.MultipleGroupsCanShareOnePackedRecordsBlock
+[       OK ] GroupedObjectIndexTest.MultipleGroupsCanShareOnePackedRecordsBlock (0 ms)
+[ RUN      ] GroupedObjectIndexTest.IncrementalUpdateSharesUntouchedPagesAndRoutingNodes
+[       OK ] GroupedObjectIndexTest.IncrementalUpdateSharesUntouchedPagesAndRoutingNodes (4 ms)
+[ RUN      ] GroupedObjectIndexTest.SplitRetainsParentMarkerAcrossFurtherMutations
+[       OK ] GroupedObjectIndexTest.SplitRetainsParentMarkerAcrossFurtherMutations (0 ms)
+[ RUN      ] GroupedObjectIndexTest.RootRelocationSharesAllMetadataAndRefreshesGroupGc
+[       OK ] GroupedObjectIndexTest.RootRelocationSharesAllMetadataAndRefreshesGroupGc (0 ms)
+[ RUN      ] GroupedObjectIndexTest.ReservedPublicationAndFinalizationAllocateNothing
+[       OK ] GroupedObjectIndexTest.ReservedPublicationAndFinalizationAllocateNothing (0 ms)
+[ RUN      ] GroupedObjectIndexTest.IncrementalMetadataOomLeavesPublishedObjectIntact
+[       OK ] GroupedObjectIndexTest.IncrementalMetadataOomLeavesPublishedObjectIntact (0 ms)
+[ RUN      ] GroupedObjectIndexTest.DirectoryIncrementalValidationRejectsPartialSplits
+[       OK ] GroupedObjectIndexTest.DirectoryIncrementalValidationRejectsPartialSplits (0 ms)
+[ RUN      ] GroupedObjectIndexTest.RetiredMarkerCanKeepAnExternalParentKey
+[       OK ] GroupedObjectIndexTest.RetiredMarkerCanKeepAnExternalParentKey (0 ms)
+[ RUN      ] GroupedObjectIndexTest.GroupRecoveryRequiresOuterAndCommandBatchDecisions
+[       OK ] GroupedObjectIndexTest.GroupRecoveryRequiresOuterAndCommandBatchDecisions (0 ms)
+[ RUN      ] GroupedObjectIndexTest.RootPhysicalFinalizationKeepsPendingDecision
+[       OK ] GroupedObjectIndexTest.RootPhysicalFinalizationKeepsPendingDecision (0 ms)
+[ RUN      ] GroupedObjectIndexTest.FailedPublishedDecisionCannotBeRead
+[       OK ] GroupedObjectIndexTest.FailedPublishedDecisionCannotBeRead (0 ms)
+[ RUN      ] GroupedObjectIndexTest.MetadataOnlyUpdateSharesHashDirectoryAndPhysicalPages
+[       OK ] GroupedObjectIndexTest.MetadataOnlyUpdateSharesHashDirectoryAndPhysicalPages (0 ms)
+[----------] 35 tests from GroupedObjectIndexTest (36 ms total)
+
+[----------] 3 tests from GroupedScratchBudgetTest
+[ RUN      ] GroupedScratchBudgetTest.RejectsOverflowAndMissingExtentMetadata
+[       OK ] GroupedScratchBudgetTest.RejectsOverflowAndMissingExtentMetadata (0 ms)
+[ RUN      ] GroupedScratchBudgetTest.AdmitsSelectedScratchBeforeAllocation
+[       OK ] GroupedScratchBudgetTest.AdmitsSelectedScratchBeforeAllocation (0 ms)
+[ RUN      ] GroupedScratchBudgetTest.RetainedIndexMetadataNeedsNoLiveBlock
+[       OK ] GroupedScratchBudgetTest.RetainedIndexMetadataNeedsNoLiveBlock (0 ms)
+[----------] 3 tests from GroupedScratchBudgetTest (0 ms total)
+
+[----------] 7 tests from LocalSharedPtrTest
+[ RUN      ] LocalSharedPtrTest.EmptyAndNullOperationsDoNotOwnAnything
+[       OK ] LocalSharedPtrTest.EmptyAndNullOperationsDoNotOwnAnything (0 ms)
+[ RUN      ] LocalSharedPtrTest.CopyMoveAndConstConversionShareOneLifetime
+[       OK ] LocalSharedPtrTest.CopyMoveAndConstConversionShareOneLifetime (0 ms)
+[ RUN      ] LocalSharedPtrTest.AssignmentReleasesOldObjectAndHandlesSelfAssignment
+[       OK ] LocalSharedPtrTest.AssignmentReleasesOldObjectAndHandlesSelfAssignment (0 ms)
+[ RUN      ] LocalSharedPtrTest.StatefulAllocatorOwnsOneCombinedAllocation
+[       OK ] LocalSharedPtrTest.StatefulAllocatorOwnsOneCombinedAllocation (0 ms)
+[ RUN      ] LocalSharedPtrTest.AllocationAndConstructorFailuresDoNotLeak
+[       OK ] LocalSharedPtrTest.AllocationAndConstructorFailuresDoNotLeak (0 ms)
+[ RUN      ] LocalSharedPtrTest.CombinedAllocationPreservesObjectAlignment
+[       OK ] LocalSharedPtrTest.CombinedAllocationPreservesObjectAlignment (0 ms)
+[ RUN      ] LocalSharedPtrTest.SharedSubtreesOutliveEitherRoot
+[       OK ] LocalSharedPtrTest.SharedSubtreesOutliveEitherRoot (0 ms)
+[----------] 7 tests from LocalSharedPtrTest (0 ms total)
+
+[----------] 7 tests from LoggingTest
+[ RUN      ] LoggingTest.DefaultsToRotatingFileOnly
+[       OK ] LoggingTest.DefaultsToRotatingFileOnly (0 ms)
+[ RUN      ] LoggingTest.LogToStderrDisablesFileSink
+[       OK ] LoggingTest.LogToStderrDisablesFileSink (0 ms)
+[ RUN      ] LoggingTest.AlsoLogToStderrWritesBothDestinations
+[       OK ] LoggingTest.AlsoLogToStderrWritesBothDestinations (0 ms)
+[ RUN      ] LoggingTest.LogToStderrWinsWhenBothFlagsAreEnabled
+[       OK ] LoggingTest.LogToStderrWinsWhenBothFlagsAreEnabled (0 ms)
+[ RUN      ] LoggingTest.WarningFlushesEarlierInfoMessages
+[       OK ] LoggingTest.WarningFlushesEarlierInfoMessages (0 ms)
+[ RUN      ] LoggingTest.NormalShutdownFlushesInfoMessages
+[       OK ] LoggingTest.NormalShutdownFlushesInfoMessages (0 ms)
+[ RUN      ] LoggingTest.RetainsConfiguredTotalFileCountDuringRotation
+[       OK ] LoggingTest.RetainsConfiguredTotalFileCountDuringRotation (2 ms)
+[----------] 7 tests from LoggingTest (3 ms total)
+
+[----------] 1 test from LuaEvalTest
+[ RUN      ] LuaEvalTest.CatalogSwapKeepsSuspendedExecutionRuntimeAlive
+[       OK ] LuaEvalTest.CatalogSwapKeepsSuspendedExecutionRuntimeAlive (0 ms)
+[----------] 1 test from LuaEvalTest (0 ms total)
+
+[----------] 9 tests from MemoryTest
+[ RUN      ] MemoryTest.RetainedAdmissionLeavesTenPercentOutsideRetainedState
+[       OK ] MemoryTest.RetainedAdmissionLeavesTenPercentOutsideRetainedState (0 ms)
+[ RUN      ] MemoryTest.ClientBuffersHaveAWorkerLocalFivePercentLimit
+[       OK ] MemoryTest.ClientBuffersHaveAWorkerLocalFivePercentLimit (0 ms)
+[ RUN      ] MemoryTest.TinyLimitsRetainAProtocolRecoveryAllowance
+[       OK ] MemoryTest.TinyLimitsRetainAProtocolRecoveryAllowance (0 ms)
+[ RUN      ] MemoryTest.FullSyncCreditMovesBetweenReservationAndLiveAllocation
+[       OK ] MemoryTest.FullSyncCreditMovesBetweenReservationAndLiveAllocation (0 ms)
+[ RUN      ] MemoryTest.ClientBufferLimitAcceptsPercentAbsoluteAndDisabledModes
+[       OK ] MemoryTest.ClientBufferLimitAcceptsPercentAbsoluteAndDisabledModes (0 ms)
+[ RUN      ] MemoryTest.CrossWorkerRetainedReleaseReturnsBytesToExplicitOrigin
+[       OK ] MemoryTest.CrossWorkerRetainedReleaseReturnsBytesToExplicitOrigin (0 ms)
+[ RUN      ] MemoryTest.WorkerSnapshotsMatchAdmissionShares
+[       OK ] MemoryTest.WorkerSnapshotsMatchAdmissionShares (0 ms)
+[ RUN      ] MemoryTest.RetainedChargeTransfersOwnershipWithoutGlobalNewHooks
+[       OK ] MemoryTest.RetainedChargeTransfersOwnershipWithoutGlobalNewHooks (0 ms)
+[ RUN      ] MemoryTest.SharedReservationIsDischargedBeforeCrossWorkerDestruction
+[       OK ] MemoryTest.SharedReservationIsDischargedBeforeCrossWorkerDestruction (0 ms)
+[----------] 9 tests from MemoryTest (0 ms total)
+
+[----------] 12 tests from MetaControlMapperTest
+[ RUN      ] MetaControlMapperTest.BuildsCompleteImmutableServingState
+[       OK ] MetaControlMapperTest.BuildsCompleteImmutableServingState (1 ms)
+[ RUN      ] MetaControlMapperTest.SourceIndexDoesNotBecomeTopologyEpoch
+[       OK ] MetaControlMapperTest.SourceIndexDoesNotBecomeTopologyEpoch (0 ms)
+[ RUN      ] MetaControlMapperTest.InstallsInitialEmptyTopologyAtEpochZero
+[       OK ] MetaControlMapperTest.InstallsInitialEmptyTopologyAtEpochZero (0 ms)
+[ RUN      ] MetaControlMapperTest.AcceptsCommittedOwnerlessGroupBeforeActivation
+[       OK ] MetaControlMapperTest.AcceptsCommittedOwnerlessGroupBeforeActivation (0 ms)
+[ RUN      ] MetaControlMapperTest.AcceptsFencedGroupWithOwnerIntentAndHistoricalAuthorityCounters
+[       OK ] MetaControlMapperTest.AcceptsFencedGroupWithOwnerIntentAndHistoricalAuthorityCounters (0 ms)
+[ RUN      ] MetaControlMapperTest.RejectsOwnerAssignmentMismatch
+[       OK ] MetaControlMapperTest.RejectsOwnerAssignmentMismatch (0 ms)
+[ RUN      ] MetaControlMapperTest.RejectsNodeAssignedToMultipleGroups
+[       OK ] MetaControlMapperTest.RejectsNodeAssignedToMultipleGroups (0 ms)
+[ RUN      ] MetaControlMapperTest.RejectsMissingLocalNodeAndZeroHashes
+[       OK ] MetaControlMapperTest.RejectsMissingLocalNodeAndZeroHashes (0 ms)
+[ RUN      ] MetaControlMapperTest.RejectsNonNumericOrNonCanonicalNodeHosts
+[       OK ] MetaControlMapperTest.RejectsNonNumericOrNonCanonicalNodeHosts (0 ms)
+[ RUN      ] MetaControlMapperTest.RejectsNonCanonicalGrantLeaseParameters
+[       OK ] MetaControlMapperTest.RejectsNonCanonicalGrantLeaseParameters (0 ms)
+[ RUN      ] MetaControlMapperTest.RejectsTamperedMissingAndDuplicatePolicies
+[       OK ] MetaControlMapperTest.RejectsTamperedMissingAndDuplicatePolicies (0 ms)
+[ RUN      ] MetaControlMapperTest.RejectsMalformedMemberIncarnationsAndConfigEpoch
+[       OK ] MetaControlMapperTest.RejectsMalformedMemberIncarnationsAndConfigEpoch (0 ms)
+[----------] 12 tests from MetaControlMapperTest (2 ms total)
+
+[----------] 1 test from MetaControlEndpointTest
+[ RUN      ] MetaControlEndpointTest.ParsesOnlyNumericUnambiguousEndpoints
+[       OK ] MetaControlEndpointTest.ParsesOnlyNumericUnambiguousEndpoints (0 ms)
+[----------] 1 test from MetaControlEndpointTest (0 ms total)
+
+[----------] 3 tests from MetaControlIdentityTest
+[ RUN      ] MetaControlIdentityTest.RequiresExactlyOneMatchingUriSan
+[       OK ] MetaControlIdentityTest.RequiresExactlyOneMatchingUriSan (0 ms)
+[ RUN      ] MetaControlIdentityTest.LearnedDialTargetPinsItsExactPrincipal
+[       OK ] MetaControlIdentityTest.LearnedDialTargetPinsItsExactPrincipal (0 ms)
+[ RUN      ] MetaControlIdentityTest.UnresolvedSeedBootstrapsFromServerHello
+[       OK ] MetaControlIdentityTest.UnresolvedSeedBootstrapsFromServerHello (0 ms)
+[----------] 3 tests from MetaControlIdentityTest (0 ms total)
+
+[----------] 1 test from MetaReconnectBackoffTest
+[ RUN      ] MetaReconnectBackoffTest.UsesFullJitterAndResetsOnlyExplicitly
+[       OK ] MetaReconnectBackoffTest.UsesFullJitterAndResetsOnlyExplicitly (0 ms)
+[----------] 1 test from MetaReconnectBackoffTest (0 ms total)
+
+[----------] 2 tests from MetaSessionRunResultTest
+[ RUN      ] MetaSessionRunResultTest.StopRacingAFailedConnectionIgnoresTheOperationalError
+[       OK ] MetaSessionRunResultTest.StopRacingAFailedConnectionIgnoresTheOperationalError (0 ms)
+[ RUN      ] MetaSessionRunResultTest.StopAfterSessionReturnStillPropagatesCleanupFailure
+[       OK ] MetaSessionRunResultTest.StopAfterSessionReturnStillPropagatesCleanupFailure (0 ms)
+[----------] 2 tests from MetaSessionRunResultTest (0 ms total)
+
+[----------] 4 tests from MetaEndpointDirectoryTest
+[ RUN      ] MetaEndpointDirectoryTest.OrdersLeaderThenDirectoryThenSeedsWithoutDupes
+[       OK ] MetaEndpointDirectoryTest.OrdersLeaderThenDirectoryThenSeedsWithoutDupes (0 ms)
+[ RUN      ] MetaEndpointDirectoryTest.KeepsUnresolvedSeedFallbackForLegitimateEndpointReuse
+[       OK ] MetaEndpointDirectoryTest.KeepsUnresolvedSeedFallbackForLegitimateEndpointReuse (0 ms)
+[ RUN      ] MetaEndpointDirectoryTest.FullStateRefreshPreservesOnlyLiveLeaderHint
+[       OK ] MetaEndpointDirectoryTest.FullStateRefreshPreservesOnlyLiveLeaderHint (0 ms)
+[ RUN      ] MetaEndpointDirectoryTest.RejectsMissingOrMismatchedPrincipalBinding
+[       OK ] MetaEndpointDirectoryTest.RejectsMissingOrMismatchedPrincipalBinding (0 ms)
+[----------] 4 tests from MetaEndpointDirectoryTest (0 ms total)
+
+[----------] 3 tests from MetaLeaseChallengeRotationTest
+[ RUN      ] MetaLeaseChallengeRotationTest.VisitsEveryLocallyOwnedActiveGrant
+[       OK ] MetaLeaseChallengeRotationTest.VisitsEveryLocallyOwnedActiveGrant (0 ms)
+[ RUN      ] MetaLeaseChallengeRotationTest.HandlesProjectionReplacementAndNoOwner
+[       OK ] MetaLeaseChallengeRotationTest.HandlesProjectionReplacementAndNoOwner (0 ms)
+[ RUN      ] MetaLeaseChallengeRotationTest.FencedUncontrolledHistoricalOwnerMayReportCandidateProgress
+[       OK ] MetaLeaseChallengeRotationTest.FencedUncontrolledHistoricalOwnerMayReportCandidateProgress (0 ms)
+[----------] 3 tests from MetaLeaseChallengeRotationTest (0 ms total)
+
+[----------] 1 test from MetaCandidateProjectionTest
+[ RUN      ] MetaCandidateProjectionTest.FencedHistoricalOwnerUsesAuthenticatedSelfOriginLineage
+[       OK ] MetaCandidateProjectionTest.FencedHistoricalOwnerUsesAuthenticatedSelfOriginLineage (0 ms)
+[----------] 1 test from MetaCandidateProjectionTest (0 ms total)
+
+[----------] 1 test from MetaHeartbeatProjectionGateTest
+[ RUN      ] MetaHeartbeatProjectionGateTest.HoldsProducerAndConsumesOnlyTheOldOutstandingAck
+[       OK ] MetaHeartbeatProjectionGateTest.HoldsProducerAndConsumesOnlyTheOldOutstandingAck (0 ms)
+[----------] 1 test from MetaHeartbeatProjectionGateTest (0 ms total)
+
+[----------] 1 test from MetaInboundTransferAbortTest
+[ RUN      ] MetaInboundTransferAbortTest.SupersededFullStateKeepsTheAuthenticatedSessionAndHeartbeat
+[       OK ] MetaInboundTransferAbortTest.SupersededFullStateKeepsTheAuthenticatedSessionAndHeartbeat (0 ms)
+[----------] 1 test from MetaInboundTransferAbortTest (0 ms total)
+
+[----------] 1 test from MetaDirectiveValidationTest
+[ RUN      ] MetaDirectiveValidationTest.RequiresExactInstalledDirectiveAndKindSpecificRecipient
+[       OK ] MetaDirectiveValidationTest.RequiresExactInstalledDirectiveAndKindSpecificRecipient (0 ms)
+[----------] 1 test from MetaDirectiveValidationTest (0 ms total)
+
+[----------] 1 test from MetaDirectiveResultTest
+[ RUN      ] MetaDirectiveResultTest.SeparatesRejectionsFromExecutionFailures
+[       OK ] MetaDirectiveResultTest.SeparatesRejectionsFromExecutionFailures (0 ms)
+[----------] 1 test from MetaDirectiveResultTest (0 ms total)
+
+[----------] 4 tests from MetaFailoverControlAdapterTest
+[ RUN      ] MetaFailoverControlAdapterTest.TranslatesTheExactActionOnlyForItsCandidateIncarnation
+[       OK ] MetaFailoverControlAdapterTest.TranslatesTheExactActionOnlyForItsCandidateIncarnation (0 ms)
+[ RUN      ] MetaFailoverControlAdapterTest.OmitsAnotherCandidateAndRetainsCutoverActivation
+[       OK ] MetaFailoverControlAdapterTest.OmitsAnotherCandidateAndRetainsCutoverActivation (0 ms)
+[ RUN      ] MetaFailoverControlAdapterTest.ReconcilesSteadyOwnerOnlyAfterTransitionFinishes
+[       OK ] MetaFailoverControlAdapterTest.ReconcilesSteadyOwnerOnlyAfterTransitionFinishes (0 ms)
+[ RUN      ] MetaFailoverControlAdapterTest.TranslatesExactPromotionActivation
+[       OK ] MetaFailoverControlAdapterTest.TranslatesExactPromotionActivation (0 ms)
+[----------] 4 tests from MetaFailoverControlAdapterTest (0 ms total)
+
+[----------] 5 tests from MetaFailoverHeartbeatTest
+[ RUN      ] MetaFailoverHeartbeatTest.ProjectsExactPreparedContext
+[       OK ] MetaFailoverHeartbeatTest.ProjectsExactPreparedContext (0 ms)
+[ RUN      ] MetaFailoverHeartbeatTest.ProjectsOnlyAnExactStableSourcePause
+[       OK ] MetaFailoverHeartbeatTest.ProjectsOnlyAnExactStableSourcePause (0 ms)
+[ RUN      ] MetaFailoverHeartbeatTest.ProjectsFailureFromTheExactActionPopulation
+[       OK ] MetaFailoverHeartbeatTest.ProjectsFailureFromTheExactActionPopulation (0 ms)
+[ RUN      ] MetaFailoverHeartbeatTest.ExactPreparingAndPreparedActionsBridgeHistoryRotationUntilCutover
+[       OK ] MetaFailoverHeartbeatTest.ExactPreparingAndPreparedActionsBridgeHistoryRotationUntilCutover (0 ms)
+[ RUN      ] MetaFailoverHeartbeatTest.WaitingStatesAreNotWorkflowEvidence
+[       OK ] MetaFailoverHeartbeatTest.WaitingStatesAreNotWorkflowEvidence (0 ms)
+[----------] 5 tests from MetaFailoverHeartbeatTest (0 ms total)
+
+[----------] 1 test from MetaCandidateProgressTest
+[ RUN      ] MetaCandidateProgressTest.HeartbeatPreservesWholeTypedCandidateWhileShorteningSummary
+[       OK ] MetaCandidateProgressTest.HeartbeatPreservesWholeTypedCandidateWhileShorteningSummary (0 ms)
+[----------] 1 test from MetaCandidateProgressTest (0 ms total)
+
+[----------] 1 test from MetaAuthorityIdentityTest
+[ RUN      ] MetaAuthorityIdentityTest.UsesVersionedUnambiguousEncoding
+[       OK ] MetaAuthorityIdentityTest.UsesVersionedUnambiguousEncoding (0 ms)
+[----------] 1 test from MetaAuthorityIdentityTest (0 ms total)
+
+[----------] 1 test from EstablishedExportScopeTest
+[ RUN      ] EstablishedExportScopeTest.SeparatesStableDataFlowIdentityFromAuthorityAndFailoverControl
+[       OK ] EstablishedExportScopeTest.SeparatesStableDataFlowIdentityFromAuthorityAndFailoverControl (0 ms)
+[----------] 1 test from EstablishedExportScopeTest (0 ms total)
+
+[----------] 49 tests from NodeControlInstallerTest
+[ RUN      ] NodeControlInstallerTest.FullStateReconcilesChangedClusterControlAfterSourceCleanupOnly
+[       OK ] NodeControlInstallerTest.FullStateReconcilesChangedClusterControlAfterSourceCleanupOnly (0 ms)
+[ RUN      ] NodeControlInstallerTest.GrantlessControlPreservesEstablishedExportWithStablePopulationScope
+[       OK ] NodeControlInstallerTest.GrantlessControlPreservesEstablishedExportWithStablePopulationScope (0 ms)
+[ RUN      ] NodeControlInstallerTest.ControlledPausePreservesFiniteLeaseAndRejectsOnlyMutations
+[       OK ] NodeControlInstallerTest.ControlledPausePreservesFiniteLeaseAndRejectsOnlyMutations (1 ms)
+[ RUN      ] NodeControlInstallerTest.MetaProjectionDoesNotCarryReadinessAcrossPopulationAnchorChanges
+[       OK ] NodeControlInstallerTest.MetaProjectionDoesNotCarryReadinessAcrossPopulationAnchorChanges (5 ms)
+[ RUN      ] NodeControlInstallerTest.ControlledPausePublishesThenDrainsBeforeReconcileAndFullStateAck
+[2026-09-15 16:31:08.329] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.ControlledPausePublishesThenDrainsBeforeReconcileAndFullStateAck (1 ms)
+[ RUN      ] NodeControlInstallerTest.ProvisionalFailoverGrantDoesNotCreateLeaseBeforeExactActivation
+[2026-09-15 16:31:08.331] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.ProvisionalFailoverGrantDoesNotCreateLeaseBeforeExactActivation (0 ms)
+[ RUN      ] NodeControlInstallerTest.FdsReplacementDuringPromotionActivationFailsFinalRecheckWithoutLease
+[2026-09-15 16:31:08.331] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.FdsReplacementDuringPromotionActivationFailsFinalRecheckWithoutLease (0 ms)
+[ RUN      ] NodeControlInstallerTest.FdsReplacementDuringExpirationEnableFailsTheLastRecheckWithoutLease
+[2026-09-15 16:31:08.332] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.FdsReplacementDuringExpirationEnableFailsTheLastRecheckWithoutLease (0 ms)
+[ RUN      ] NodeControlInstallerTest.SessionLossDuringPromotionActivationFailsFinalRecheckWithoutLease
+[2026-09-15 16:31:08.333] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.SessionLossDuringPromotionActivationFailsFinalRecheckWithoutLease (0 ms)
+[ RUN      ] NodeControlInstallerTest.SessionLossDuringExpirationEnableFailsFinalRecheckWithoutLease
+[2026-09-15 16:31:08.333] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.SessionLossDuringExpirationEnableFailsFinalRecheckWithoutLease (0 ms)
+[ RUN      ] NodeControlInstallerTest.GrantExpiringDuringPromotionActivationNeverEnablesExpirationOrLease
+[2026-09-15 16:31:08.334] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.GrantExpiringDuringPromotionActivationNeverEnablesExpirationOrLease (20 ms)
+[ RUN      ] NodeControlInstallerTest.RestartedCutoverWinnerCannotReusePriorBootActivationActionOrLease
+[2026-09-15 16:31:08.354] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.RestartedCutoverWinnerCannotReusePriorBootActivationActionOrLease (1 ms)
+[ RUN      ] NodeControlInstallerTest.SteadyOwnerGrantSkipsPromotionAndEnablesFiniteExpirationFirst
+[2026-09-15 16:31:08.355] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.SteadyOwnerGrantSkipsPromotionAndEnablesFiniteExpirationFirst (0 ms)
+[ RUN      ] NodeControlInstallerTest.RejectedDesiredAuthorityIncludesMessageAndDesiredGrantContexts
+[2026-09-15 16:31:08.356] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.RejectedDesiredAuthorityIncludesMessageAndDesiredGrantContexts (0 ms)
+[ RUN      ] NodeControlInstallerTest.AcceptsLeadershipBoundedLeaseShorterThanCommittedMaximum
+[2026-09-15 16:31:08.356] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.AcceptsLeadershipBoundedLeaseShorterThanCommittedMaximum (0 ms)
+[ RUN      ] NodeControlInstallerTest.RejectsLeaseLongerThanCommittedMaximumWithBothDurations
+[2026-09-15 16:31:08.357] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.RejectsLeaseLongerThanCommittedMaximumWithBothDurations (0 ms)
+[ RUN      ] NodeControlInstallerTest.SessionLossRevokesFiniteExpirationAuthorityAndTheWriteLease
+[2026-09-15 16:31:08.357] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.SessionLossRevokesFiniteExpirationAuthorityAndTheWriteLease (0 ms)
+[ RUN      ] NodeControlInstallerTest.FiniteAuthorityRequiresAnExactLeaseGrant
+[       OK ] NodeControlInstallerTest.FiniteAuthorityRequiresAnExactLeaseGrant (0 ms)
+[ RUN      ] NodeControlInstallerTest.SuspendAwareLeaseClockJumpRejectsOldAuthoritySynchronously
+[       OK ] NodeControlInstallerTest.SuspendAwareLeaseClockJumpRejectsOldAuthoritySynchronously (0 ms)
+[ RUN      ] NodeControlInstallerTest.SameAuthorityRenewalExtendsDeadlineWithoutInvalidatingAdmission
+[       OK ] NodeControlInstallerTest.SameAuthorityRenewalExtendsDeadlineWithoutInvalidatingAdmission (0 ms)
+[ RUN      ] NodeControlInstallerTest.PopulationProofLossInvalidatesLeaseAndRevokesOnlyOnTransition
+[       OK ] NodeControlInstallerTest.PopulationProofLossInvalidatesLeaseAndRevokesOnlyOnTransition (1 ms)
+[ RUN      ] NodeControlInstallerTest.CountsOneLocalExpirationPerExpiredLease
+[       OK ] NodeControlInstallerTest.CountsOneLocalExpirationPerExpiredLease (0 ms)
+[ RUN      ] NodeControlInstallerTest.SessionLossInvalidatesWithoutPublishingTopology
+[       OK ] NodeControlInstallerTest.SessionLossInvalidatesWithoutPublishingTopology (0 ms)
+[ RUN      ] NodeControlInstallerTest.FenceInvalidatesBeforePublishingAndRejectsOldAuthorityForThisBoot
+[       OK ] NodeControlInstallerTest.FenceInvalidatesBeforePublishingAndRejectsOldAuthorityForThisBoot (0 ms)
+[ RUN      ] NodeControlInstallerTest.AsyncFencePublishesBeforeRevocationAndCompletesAfterOldWorkDrains
+[       OK ] NodeControlInstallerTest.AsyncFencePublishesBeforeRevocationAndCompletesAfterOldWorkDrains (0 ms)
+[ RUN      ] NodeControlInstallerTest.AsyncFenceSuspendsWorkerCoroutineUntilRetiredCounterReachesZero
+[2026-09-15 16:31:08.362] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.AsyncFenceSuspendsWorkerCoroutineUntilRetiredCounterReachesZero (1 ms)
+[ RUN      ] NodeControlInstallerTest.FenceWaitsForSuspendedDirectiveAdmissionBeforeFinalCancellation
+[2026-09-15 16:31:08.364] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.FenceWaitsForSuspendedDirectiveAdmissionBeforeFinalCancellation (1 ms)
+[ RUN      ] NodeControlInstallerTest.SessionInvalidationDuringReadinessAwaitPreventsDirectiveAction
+[2026-09-15 16:31:08.365] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.SessionInvalidationDuringReadinessAwaitPreventsDirectiveAction (0 ms)
+[ RUN      ] NodeControlInstallerTest.StorageLossWaitsForAdmissionCancelsTargetAndLatchesFailure
+[2026-09-15 16:31:08.366] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.StorageLossWaitsForAdmissionCancelsTargetAndLatchesFailure (1 ms)
+[ RUN      ] NodeControlInstallerTest.StorageLossJoinsEarlierControlTransitionBeforeFinalCleanup
+[2026-09-15 16:31:08.367] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.StorageLossJoinsEarlierControlTransitionBeforeFinalCleanup (1 ms)
+[ RUN      ] NodeControlInstallerTest.StorageLossRetainsAnUncertainCleanupFailure
+[       OK ] NodeControlInstallerTest.StorageLossRetainsAnUncertainCleanupFailure (0 ms)
+[ RUN      ] NodeControlInstallerTest.LeaseTimerExpiresExactLeaseButCannotRevokeItsRenewal
+[2026-09-15 16:31:08.369] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.LeaseTimerExpiresExactLeaseButCannotRevokeItsRenewal (185 ms)
+[ RUN      ] NodeControlInstallerTest.ExpiredLeaseCannotBeRevivedBeforeDelayedTimerRuns
+[2026-09-15 16:31:08.554] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] NodeControlInstallerTest.ExpiredLeaseCannotBeRevivedBeforeDelayedTimerRuns (40 ms)
+[ RUN      ] NodeControlInstallerTest.FullStateIsIdempotentAndSameIndexEquivocationLosesTheSession
+[       OK ] NodeControlInstallerTest.FullStateIsIdempotentAndSameIndexEquivocationLosesTheSession (0 ms)
+[ RUN      ] NodeControlInstallerTest.AsyncOnlyAdapterRejectsEvenAnEmptySynchronousFullState
+[       OK ] NodeControlInstallerTest.AsyncOnlyAdapterRejectsEvenAnEmptySynchronousFullState (0 ms)
+[ RUN      ] NodeControlInstallerTest.DirectiveCapableAdapterRejectsSynchronousFenceAndSessionCleanup
+[       OK ] NodeControlInstallerTest.DirectiveCapableAdapterRejectsSynchronousFenceAndSessionCleanup (0 ms)
+[ RUN      ] NodeControlInstallerTest.FullStateRejectsIndexAndDomainRegressions
+[       OK ] NodeControlInstallerTest.FullStateRejectsIndexAndDomainRegressions (1 ms)
+[ RUN      ] NodeControlInstallerTest.OwnerlessGroupRejectsSameMembershipControlCounterRegression
+[       OK ] NodeControlInstallerTest.OwnerlessGroupRejectsSameMembershipControlCounterRegression (0 ms)
+[ RUN      ] NodeControlInstallerTest.StorageReadinessIsLocalAndRepublishedAtomically
+[       OK ] NodeControlInstallerTest.StorageReadinessIsLocalAndRepublishedAtomically (0 ms)
+[ RUN      ] NodeControlInstallerTest.NewAuthorityWaitsForRetiredInFlightMutationsToDrain
+[       OK ] NodeControlInstallerTest.NewAuthorityWaitsForRetiredInFlightMutationsToDrain (0 ms)
+[ RUN      ] NodeControlInstallerTest.MetaFullStateAlwaysJoinsSourcesAndAuthorityChangeDrainsOldWork
+[       OK ] NodeControlInstallerTest.MetaFullStateAlwaysJoinsSourcesAndAuthorityChangeDrainsOldWork (1 ms)
+[ RUN      ] NodeControlInstallerTest.GrantlessFullStateRetainsMemberPopulationIdentityAndAcceptsProof
+[       OK ] NodeControlInstallerTest.GrantlessFullStateRetainsMemberPopulationIdentityAndAcceptsProof (0 ms)
+[ RUN      ] NodeControlInstallerTest.SessionLossTracksOldWorkAndBlocksSourceAuthorizationUntilDrain
+[       OK ] NodeControlInstallerTest.SessionLossTracksOldWorkAndBlocksSourceAuthorizationUntilDrain (0 ms)
+[ RUN      ] NodeControlInstallerTest.SessionInvalidationClosesLeaseBeforeAsynchronousCleanup
+[       OK ] NodeControlInstallerTest.SessionInvalidationClosesLeaseBeforeAsynchronousCleanup (0 ms)
+[ RUN      ] NodeControlInstallerTest.ShutdownPrejoinInvalidatesLeaseAndUsesDedicatedActionSeam
+[       OK ] NodeControlInstallerTest.ShutdownPrejoinInvalidatesLeaseAndUsesDedicatedActionSeam (0 ms)
+[ RUN      ] NodeControlInstallerTest.DirectiveRequiresCurrentProjectionAndAuthority
+[       OK ] NodeControlInstallerTest.DirectiveRequiresCurrentProjectionAndAuthority (1 ms)
+[ RUN      ] NodeControlInstallerTest.EmptyPopulationUsesTheExistingPopulationAdmissionWithoutASource
+[       OK ] NodeControlInstallerTest.EmptyPopulationUsesTheExistingPopulationAdmissionWithoutASource (0 ms)
+[ RUN      ] NodeControlInstallerTest.SourceDirectiveFenceFloorUsesTheLocalSourceAssignment
+[       OK ] NodeControlInstallerTest.SourceDirectiveFenceFloorUsesTheLocalSourceAssignment (1 ms)
+[ RUN      ] NodeControlInstallerTest.ReplicaReadinessAndRebuildUseTargetMemberAssignment
+[       OK ] NodeControlInstallerTest.ReplicaReadinessAndRebuildUseTargetMemberAssignment (3 ms)
+[----------] 49 tests from NodeControlInstallerTest (289 ms total)
+
+[----------] 14 tests from RespParserTest
+[ RUN      ] RespParserTest.AcceptsMoreThan1024ArrayElements
+[       OK ] RespParserTest.AcceptsMoreThan1024ArrayElements (0 ms)
+[ RUN      ] RespParserTest.ParsingDoesNotConsumeMaxmemoryAdmission
+[       OK ] RespParserTest.ParsingDoesNotConsumeMaxmemoryAdmission (0 ms)
+[ RUN      ] RespParserTest.DoesNotAllocateDeclaredBulkBeforePayloadArrives
+[       OK ] RespParserTest.DoesNotAllocateDeclaredBulkBeforePayloadArrives (0 ms)
+[ RUN      ] RespParserTest.EnforcesConfiguredQueryBufferLimitAcrossFragments
+[       OK ] RespParserTest.EnforcesConfiguredQueryBufferLimitAcrossFragments (0 ms)
+[ RUN      ] RespParserTest.AcceptsCommandExactlyAtConfiguredQueryBufferLimit
+[       OK ] RespParserTest.AcceptsCommandExactlyAtConfiguredQueryBufferLimit (0 ms)
+[ RUN      ] RespParserTest.AppliesLowerRuntimeLimitToIncompleteCommand
+[       OK ] RespParserTest.AppliesLowerRuntimeLimitToIncompleteCommand (0 ms)
+[ RUN      ] RespParserTest.RejectsArrayLengthsAboveValkeyLimit
+[       OK ] RespParserTest.RejectsArrayLengthsAboveValkeyLimit (0 ms)
+[ RUN      ] RespParserTest.DoesNotEagerlyAllocateDeclaredArrayLength
+[       OK ] RespParserTest.DoesNotEagerlyAllocateDeclaredArrayLength (0 ms)
+[ RUN      ] RespParserTest.IncrementallyParsesEveryByteExactlyOnce
+[       OK ] RespParserTest.IncrementallyParsesEveryByteExactlyOnce (0 ms)
+[ RUN      ] RespParserTest.ReturnsPipelinedCommandsInWireOrder
+[       OK ] RespParserTest.ReturnsPipelinedCommandsInWireOrder (0 ms)
+[ RUN      ] RespParserTest.ConsumesFillerAndEmptyArraysAcrossFragments
+[       OK ] RespParserTest.ConsumesFillerAndEmptyArraysAcrossFragments (0 ms)
+[ RUN      ] RespParserTest.RejectsSplitMalformedBulkTerminator
+[       OK ] RespParserTest.RejectsSplitMalformedBulkTerminator (0 ms)
+[ RUN      ] RespParserTest.AcceptsInlineCommandsQuotesAndEscapesIncrementally
+[       OK ] RespParserTest.AcceptsInlineCommandsQuotesAndEscapesIncrementally (0 ms)
+[ RUN      ] RespParserTest.AcceptsResp3ScalarAndVerbatimArguments
+[       OK ] RespParserTest.AcceptsResp3ScalarAndVerbatimArguments (0 ms)
+[----------] 14 tests from RespParserTest (0 ms total)
+
+[----------] 4 tests from ReplyBuilderTest
+[ RUN      ] ReplyBuilderTest.EncodesScalarAndCompositeReplies
+[       OK ] ReplyBuilderTest.EncodesScalarAndCompositeReplies (0 ms)
+[ RUN      ] ReplyBuilderTest.ReusesBoundedCapacityAndReleasesOversizedBuffer
+[       OK ] ReplyBuilderTest.ReusesBoundedCapacityAndReleasesOversizedBuffer (0 ms)
+[ RUN      ] ReplyBuilderTest.EncodesProtocolSpecificResp3Types
+[       OK ] ReplyBuilderTest.EncodesProtocolSpecificResp3Types (0 ms)
+[ RUN      ] ReplyBuilderTest.DegradesSemanticTypesToResp2
+[       OK ] ReplyBuilderTest.DegradesSemanticTypesToResp2 (0 ms)
+[----------] 4 tests from ReplyBuilderTest (0 ms total)
+
+[----------] 5 tests from ClusterErrorTest
+[ RUN      ] ClusterErrorTest.MovedErrorCarriesSlotAndConcreteEndpoint
+[       OK ] ClusterErrorTest.MovedErrorCarriesSlotAndConcreteEndpoint (0 ms)
+[ RUN      ] ClusterErrorTest.CrossSlotErrorIsVerbatim
+[       OK ] ClusterErrorTest.CrossSlotErrorIsVerbatim (0 ms)
+[ RUN      ] ClusterErrorTest.ClusterDownUnboundErrorIsVerbatim
+[       OK ] ClusterErrorTest.ClusterDownUnboundErrorIsVerbatim (0 ms)
+[ RUN      ] ClusterErrorTest.TryAgainErrorWrapsMessage
+[       OK ] ClusterErrorTest.TryAgainErrorWrapsMessage (0 ms)
+[ RUN      ] ClusterErrorTest.MessageBuildersMatchBuilderForms
+[       OK ] ClusterErrorTest.MessageBuildersMatchBuilderForms (0 ms)
+[----------] 5 tests from ClusterErrorTest (0 ms total)
+
+[----------] 29 tests from ScanHashMapTest
+[ RUN      ] ScanHashMapTest.CandidatePredicateOnlySeesMatchingKeys
+[       OK ] ScanHashMapTest.CandidatePredicateOnlySeesMatchingKeys (0 ms)
+[ RUN      ] ScanHashMapTest.CandidatePredicateFiltersExternalIdentityAndStopsEarly
+[       OK ] ScanHashMapTest.CandidatePredicateFiltersExternalIdentityAndStopsEarly (0 ms)
+[ RUN      ] ScanHashMapTest.CandidatePredicateContinuesIntoRehashTable
+[       OK ] ScanHashMapTest.CandidatePredicateContinuesIntoRehashTable (0 ms)
+[ RUN      ] ScanHashMapTest.CandidatePredicateExceptionLeavesEntriesUsable
+[       OK ] ScanHashMapTest.CandidatePredicateExceptionLeavesEntriesUsable (0 ms)
+[ RUN      ] ScanHashMapTest.EraseShrinksAndReleasesBucketsWithoutFurtherRequests
+[       OK ] ScanHashMapTest.EraseShrinksAndReleasesBucketsWithoutFurtherRequests (0 ms)
+[ RUN      ] ScanHashMapTest.ShrinkingPreservesEveryCursorPosition
+[       OK ] ScanHashMapTest.ShrinkingPreservesEveryCursorPosition (0 ms)
+[ RUN      ] ScanHashMapTest.ShrinkMergesOverflowChainsAndKeepsExternalEntryAddresses
+[       OK ] ScanHashMapTest.ShrinkMergesOverflowChainsAndKeepsExternalEntryAddresses (0 ms)
+[ RUN      ] ScanHashMapTest.AdmissionRejectionDefersShrinkButNotErase
+[       OK ] ScanHashMapTest.AdmissionRejectionDefersShrinkButNotErase (0 ms)
+[ RUN      ] ScanHashMapTest.ShrinkMergeRetriesOverflowAdmissionWithoutLosingEntries
+[       OK ] ScanHashMapTest.ShrinkMergeRetriesOverflowAdmissionWithoutLosingEntries (0 ms)
+[ RUN      ] ScanHashMapTest.ScanSurvivesAlternatingGrowthAndShrinkWithNewWrites
+[       OK ] ScanHashMapTest.ScanSurvivesAlternatingGrowthAndShrinkWithNewWrites (1 ms)
+[ RUN      ] ScanHashMapTest.SharedArenaReusesSlotsAndRejectsPageIdExhaustion
+[       OK ] ScanHashMapTest.SharedArenaReusesSlotsAndRejectsPageIdExhaustion (0 ms)
+[ RUN      ] ScanHashMapTest.ReportsPhysicalAllocationOnlyOnSlowPath
+[       OK ] ScanHashMapTest.ReportsPhysicalAllocationOnlyOnSlowPath (0 ms)
+[ RUN      ] ScanHashMapTest.DirectoryCapacityDoesNotInflateEmptyArena
+[       OK ] ScanHashMapTest.DirectoryCapacityDoesNotInflateEmptyArena (0 ms)
+[ RUN      ] ScanHashMapTest.PreallocatesSettledTableForKnownPopulation
+[       OK ] ScanHashMapTest.PreallocatesSettledTableForKnownPopulation (0 ms)
+[ RUN      ] ScanHashMapTest.KnownEmptyPopulationAllocatesNothing
+[       OK ] ScanHashMapTest.KnownEmptyPopulationAllocatesNothing (0 ms)
+[ RUN      ] ScanHashMapTest.UnrepresentablePreallocationLeavesMapEmpty
+[       OK ] ScanHashMapTest.UnrepresentablePreallocationLeavesMapEmpty (0 ms)
+[ RUN      ] ScanHashMapTest.RetainedArenaAccountingFollowsStorageLifetime
+[       OK ] ScanHashMapTest.RetainedArenaAccountingFollowsStorageLifetime (0 ms)
+[ RUN      ] ScanHashMapTest.AccountsForOverflowPoolVectorGrowth
+[       OK ] ScanHashMapTest.AccountsForOverflowPoolVectorGrowth (8 ms)
+[ RUN      ] ScanHashMapTest.AmortizesAlignmentAcrossSixteenLogicalPages
+[       OK ] ScanHashMapTest.AmortizesAlignmentAcrossSixteenLogicalPages (0 ms)
+[ RUN      ] ScanHashMapTest.RehashDefersOverflowAllocationWhenAdmissionIsFull
+[       OK ] ScanHashMapTest.RehashDefersOverflowAllocationWhenAdmissionIsFull (0 ms)
+[ RUN      ] ScanHashMapTest.InsertScanMoveDetachAndErase
+[       OK ] ScanHashMapTest.InsertScanMoveDetachAndErase (12 ms)
+[ RUN      ] ScanHashMapTest.ExternalKeyStoresOnlyDigestAndLogicalLength
+[       OK ] ScanHashMapTest.ExternalKeyStoresOnlyDigestAndLogicalLength (0 ms)
+[ RUN      ] ScanHashMapTest.InlineShortKeyComparisonCoversEveryByte
+[       OK ] ScanHashMapTest.InlineShortKeyComparisonCoversEveryByte (0 ms)
+[ RUN      ] ScanHashMapTest.KeyMetadataVarintUsesExpectedWidths
+[       OK ] ScanHashMapTest.KeyMetadataVarintUsesExpectedWidths (0 ms)
+[ RUN      ] ScanHashMapTest.SaturatedAddressSpaceUsesBucketChains
+[       OK ] ScanHashMapTest.SaturatedAddressSpaceUsesBucketChains (0 ms)
+[ RUN      ] ScanHashMapTest.ScanDoesNotMissStableEntriesWhenMutationOccursBetweenCalls
+[       OK ] ScanHashMapTest.ScanDoesNotMissStableEntriesWhenMutationOccursBetweenCalls (10 ms)
+[ RUN      ] ScanHashMapTest.ForEachWhileStopsImmediately
+[       OK ] ScanHashMapTest.ForEachWhileStopsImmediately (0 ms)
+[ RUN      ] ScanHashMapTest.StableScanResumesWithoutRepeatingEntries
+[       OK ] ScanHashMapTest.StableScanResumesWithoutRepeatingEntries (2 ms)
+[ RUN      ] ScanHashMapTest.FairRandomEntrySamplesExistingEntries
+[       OK ] ScanHashMapTest.FairRandomEntrySamplesExistingEntries (0 ms)
+[----------] 29 tests from ScanHashMapTest (37 ms total)
+
+[----------] 8 tests from SourceAuthorizationLedgerTest
+[ RUN      ] SourceAuthorizationLedgerTest.SameRevisionAllowsMultipleTargetsUntilRevocation
+[       OK ] SourceAuthorizationLedgerTest.SameRevisionAllowsMultipleTargetsUntilRevocation (0 ms)
+[ RUN      ] SourceAuthorizationLedgerTest.RevocationRejectsTheOldRevisionButAllowsANewerCompleteIdentity
+[       OK ] SourceAuthorizationLedgerTest.RevocationRejectsTheOldRevisionButAllowsANewerCompleteIdentity (0 ms)
+[ RUN      ] SourceAuthorizationLedgerTest.SessionCleanupAllowsCurrentRevisionReplayWithoutErasingARevokeFloor
+[       OK ] SourceAuthorizationLedgerTest.SessionCleanupAllowsCurrentRevisionReplayWithoutErasingARevokeFloor (0 ms)
+[ RUN      ] SourceAuthorizationLedgerTest.NewRevisionRequiresWholeSessionRevocationBeforeInstallation
+[       OK ] SourceAuthorizationLedgerTest.NewRevisionRequiresWholeSessionRevocationBeforeInstallation (0 ms)
+[ RUN      ] SourceAuthorizationLedgerTest.SameRevisionRejectsConflictingSourceScope
+[       OK ] SourceAuthorizationLedgerTest.SameRevisionRejectsConflictingSourceScope (0 ms)
+[ RUN      ] SourceAuthorizationLedgerTest.AuthorizationIsBoundToTheExactDirectiveIdentity
+[       OK ] SourceAuthorizationLedgerTest.AuthorizationIsBoundToTheExactDirectiveIdentity (0 ms)
+[ RUN      ] SourceAuthorizationLedgerTest.SiblingAuthorizationMatchesTheTargetsRebuildIdentity
+[       OK ] SourceAuthorizationLedgerTest.SiblingAuthorizationMatchesTheTargetsRebuildIdentity (0 ms)
+[ RUN      ] SourceAuthorizationLedgerTest.EmptyRevocationIsAnIdempotentNoOp
+[       OK ] SourceAuthorizationLedgerTest.EmptyRevocationIsAnIdempotentNoOp (0 ms)
+[----------] 8 tests from SourceAuthorizationLedgerTest (0 ms total)
+
+[----------] 17 tests from CommandTableTest
+[ RUN      ] CommandTableTest.LookupFlagsArityAndKeyPositions
+[       OK ] CommandTableTest.LookupFlagsArityAndKeyPositions (0 ms)
+[ RUN      ] CommandTableTest.ResolvesEvalKeys
+[       OK ] CommandTableTest.ResolvesEvalKeys (0 ms)
+[ RUN      ] CommandTableTest.ResolvesStreamReadMovableKeys
+[       OK ] CommandTableTest.ResolvesStreamReadMovableKeys (0 ms)
+[ RUN      ] CommandTableTest.ResolvesSortStoreDestination
+[       OK ] CommandTableTest.ResolvesSortStoreDestination (0 ms)
+[ RUN      ] CommandTableTest.AcceptsExtendedPendingIdleForm
+[       OK ] CommandTableTest.AcceptsExtendedPendingIdleForm (0 ms)
+[ RUN      ] CommandTableTest.StreamHelpHasNoKey
+[       OK ] CommandTableTest.StreamHelpHasNoKey (0 ms)
+[ RUN      ] CommandTableTest.ResolvesSortedSetAggregateKeys
+[       OK ] CommandTableTest.ResolvesSortedSetAggregateKeys (0 ms)
+[ RUN      ] CommandTableTest.ResolvesSortedSetAndGeoStoreKeys
+[       OK ] CommandTableTest.ResolvesSortedSetAndGeoStoreKeys (0 ms)
+[ RUN      ] CommandTableTest.ResolvesMovableListPopKeys
+[       OK ] CommandTableTest.ResolvesMovableListPopKeys (0 ms)
+[ RUN      ] CommandTableTest.ResolvesMovableSortedSetPopKeys
+[       OK ] CommandTableTest.ResolvesMovableSortedSetPopKeys (0 ms)
+[ RUN      ] CommandTableTest.RedisGlobTrailingHyphenIsRangeEndpoint
+[       OK ] CommandTableTest.RedisGlobTrailingHyphenIsRangeEndpoint (0 ms)
+[ RUN      ] CommandTableTest.RedisGlobOnlyCaretNegatesAndEscapesPrecedeRanges
+[       OK ] CommandTableTest.RedisGlobOnlyCaretNegatesAndEscapesPrecedeRanges (0 ms)
+[ RUN      ] CommandTableTest.RedisGlobMatchesValkeyReference
+[       OK ] CommandTableTest.RedisGlobMatchesValkeyReference (12 ms)
+[ RUN      ] CommandTableTest.ResolvesSInterCardKeysAndRedis72Errors
+[       OK ] CommandTableTest.ResolvesSInterCardKeysAndRedis72Errors (0 ms)
+[ RUN      ] CommandTableTest.ReplicationGateCandidatesAreClassified
+[       OK ] CommandTableTest.ReplicationGateCandidatesAreClassified (0 ms)
+[ RUN      ] CommandTableTest.RequestSpansMultipleShardsDecision
+[2026-09-15 16:31:08.663] [info] storage device id=0 path=/tmp/keylane-command-table-178326.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:08.663] [info] storage capacity: data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8
+[2026-09-15 16:31:08.663] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:08.663] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:08.711] [info] storage device id=0 foreground-weight=2 home-workers=4
+[       OK ] CommandTableTest.RequestSpansMultipleShardsDecision (75 ms)
+[ RUN      ] CommandTableTest.ClusterArityLeavesSubcommandChecksToTheHandler
+[       OK ] CommandTableTest.ClusterArityLeavesSubcommandChecksToTheHandler (0 ms)
+[----------] 17 tests from CommandTableTest (89 ms total)
+
+[----------] 5 tests from RandomSampleTest
+[ RUN      ] RandomSampleTest.ChoosesValkeyStrategies
+[       OK ] RandomSampleTest.ChoosesValkeyStrategies (0 ms)
+[ RUN      ] RandomSampleTest.CompactUniqueSelectionIsOrderedAndDistinct
+[       OK ] RandomSampleTest.CompactUniqueSelectionIsOrderedAndDistinct (0 ms)
+[ RUN      ] RandomSampleTest.GenericStrategiesReturnRequestedDistinctRanks
+[       OK ] RandomSampleTest.GenericStrategiesReturnRequestedDistinctRanks (0 ms)
+[ RUN      ] RandomSampleTest.FloydSelectionReturnsRequestedDistinctRanks
+[       OK ] RandomSampleTest.FloydSelectionReturnsRequestedDistinctRanks (0 ms)
+[ RUN      ] RandomSampleTest.SequentialSelectionUsesConstantSamplingState
+[       OK ] RandomSampleTest.SequentialSelectionUsesConstantSamplingState (0 ms)
+[----------] 5 tests from RandomSampleTest (0 ms total)
+
+[----------] 15 tests from RdbTest
+[ RUN      ] RdbTest.StreamEncoderSupportsRedisSevenCompatibilityHeader
+[       OK ] RdbTest.StreamEncoderSupportsRedisSevenCompatibilityHeader (0 ms)
+[ RUN      ] RdbTest.UpgradesLegacyKeylaneStreamEncoding
+[       OK ] RdbTest.UpgradesLegacyKeylaneStreamEncoding (0 ms)
+[ RUN      ] RdbTest.AcceptsRedisDumpVersionsOneThroughEleven
+[       OK ] RdbTest.AcceptsRedisDumpVersionsOneThroughEleven (0 ms)
+[ RUN      ] RdbTest.ReadsCompleteFilesVersionsOneThroughEleven
+[       OK ] RdbTest.ReadsCompleteFilesVersionsOneThroughEleven (0 ms)
+[ RUN      ] RdbTest.ReadsFileMetadataDatabasesAndExpirations
+[       OK ] RdbTest.ReadsFileMetadataDatabasesAndExpirations (0 ms)
+[ RUN      ] RdbTest.WritesAtomicRedisCompatibleFileFromIndependentFragments
+[       OK ] RdbTest.WritesAtomicRedisCompatibleFileFromIndependentFragments (11 ms)
+[ RUN      ] RdbTest.ReadsHistoricalSecondExpirationWithoutChecksum
+[       OK ] RdbTest.ReadsHistoricalSecondExpirationWithoutChecksum (0 ms)
+[ RUN      ] RdbTest.SkipsSelfDescribingUnsupportedRedisData
+[       OK ] RdbTest.SkipsSelfDescribingUnsupportedRedisData (0 ms)
+[ RUN      ] RdbTest.EncodesAndDecodesRedisFunctionDump
+[       OK ] RdbTest.EncodesAndDecodesRedisFunctionDump (0 ms)
+[ RUN      ] RdbTest.ComputesFunctionDumpSizeAcrossLengthEncodings
+[       OK ] RdbTest.ComputesFunctionDumpSizeAcrossLengthEncodings (0 ms)
+[ RUN      ] RdbTest.RejectsCorruptAndUnsupportedCompleteFiles
+[       OK ] RdbTest.RejectsCorruptAndUnsupportedCompleteFiles (0 ms)
+[ RUN      ] RdbTest.AcceptsRedis72PackedFixturesAndEmitsVersionEleven
+[       OK ] RdbTest.AcceptsRedis72PackedFixturesAndEmitsVersionEleven (0 ms)
+[ RUN      ] RdbTest.AcceptsHistoricalCollectionEncodings
+[       OK ] RdbTest.AcceptsHistoricalCollectionEncodings (0 ms)
+[ RUN      ] RdbTest.AcceptsAllRedisStreamEncodings
+[       OK ] RdbTest.AcceptsAllRedisStreamEncodings (0 ms)
+[ RUN      ] RdbTest.RejectsChecksumAndMalformedObjects
+[       OK ] RdbTest.RejectsChecksumAndMalformedObjects (0 ms)
+[----------] 15 tests from RdbTest (13 ms total)
+
+[----------] 6 tests from RdbCollectionTest
+[ RUN      ] RdbCollectionTest.FourTypesRoundTripAcrossPagesAndEmptyRoutes
+[       OK ] RdbCollectionTest.FourTypesRoundTripAcrossPagesAndEmptyRoutes (23 ms)
+[ RUN      ] RdbCollectionTest.LargeMemberIsBorrowedNotSerializedAgain
+[       OK ] RdbCollectionTest.LargeMemberIsBorrowedNotSerializedAgain (0 ms)
+[ RUN      ] RdbCollectionTest.RejectsMalformedPagesBeforeEmission
+[       OK ] RdbCollectionTest.RejectsMalformedPagesBeforeEmission (0 ms)
+[ RUN      ] RdbCollectionTest.RequiresExplicitEofAndAcceptsInfinityButNotNan
+[       OK ] RdbCollectionTest.RequiresExplicitEofAndAcceptsInfinityButNotNan (0 ms)
+[ RUN      ] RdbCollectionTest.AggregateCountUsesRdb64BitLengthWithoutAllocation
+[       OK ] RdbCollectionTest.AggregateCountUsesRdb64BitLengthWithoutAllocation (0 ms)
+[ RUN      ] RdbCollectionTest.PageRetentionMovesWithOutputLifetime
+[       OK ] RdbCollectionTest.PageRetentionMovesWithOutputLifetime (0 ms)
+[----------] 6 tests from RdbCollectionTest (23 ms total)
+
+[----------] 5 tests from RdbCollectionImportTest
+[ RUN      ] RdbCollectionImportTest.FourTypesConsumeAdmittedPagesAndRewind
+[       OK ] RdbCollectionImportTest.FourTypesConsumeAdmittedPagesAndRewind (750 ms)
+[ RUN      ] RdbCollectionImportTest.RejectsDuplicateIdentityAcrossPagesBeforeMutation
+[       OK ] RdbCollectionImportTest.RejectsDuplicateIdentityAcrossPagesBeforeMutation (246 ms)
+[ RUN      ] RdbCollectionImportTest.QuicklistDrainsNodesWithoutAnAggregateString
+[       OK ] RdbCollectionImportTest.QuicklistDrainsNodesWithoutAnAggregateString (6 ms)
+[ RUN      ] RdbCollectionImportTest.PageAdmissionRejectsBeforeAllocatingThePage
+[       OK ] RdbCollectionImportTest.PageAdmissionRejectsBeforeAllocatingThePage (81 ms)
+[ RUN      ] RdbCollectionImportTest.PackedHashMeasuresEntriesBeforeDecoding
+[       OK ] RdbCollectionImportTest.PackedHashMeasuresEntriesBeforeDecoding (6 ms)
+[----------] 5 tests from RdbCollectionImportTest (1092 ms total)
+
+[----------] 1 test from RecoveryMemoryTest
+[ RUN      ] RecoveryMemoryTest.DividesTemporaryBatchTargetAcrossWorkers
+[       OK ] RecoveryMemoryTest.DividesTemporaryBatchTargetAcrossWorkers (0 ms)
+[----------] 1 test from RecoveryMemoryTest (0 ms total)
+
+[----------] 11 tests from RecordLocationTest
+[ RUN      ] RecordLocationTest.PackedMetadataRoundTripsMaximumValues
+[       OK ] RecordLocationTest.PackedMetadataRoundTripsMaximumValues (0 ms)
+[ RUN      ] RecordLocationTest.PackedMetadataKeepsValueTypeAndMutableFlags
+[       OK ] RecordLocationTest.PackedMetadataKeepsValueTypeAndMutableFlags (0 ms)
+[ RUN      ] RecordLocationTest.DefaultLocationRetainsEmptyValueSemantics
+[       OK ] RecordLocationTest.DefaultLocationRetainsEmptyValueSemantics (0 ms)
+[ RUN      ] RecordLocationTest.GroupedRepresentationSurvivesIndexAndExpiryChanges
+[       OK ] RecordLocationTest.GroupedRepresentationSurvivesIndexAndExpiryChanges (0 ms)
+[ RUN      ] RecordLocationTest.PackedBlockIdentityRoundTripsMaximumValues
+[       OK ] RecordLocationTest.PackedBlockIdentityRoundTripsMaximumValues (0 ms)
+[ RUN      ] RecordLocationTest.CompactIndexValueMaterializesCompleteBlockIdentity
+[       OK ] RecordLocationTest.CompactIndexValueMaterializesCompleteBlockIdentity (0 ms)
+[ RUN      ] RecordLocationTest.RemoteMaterializationRejectsReusedBlockByEpoch
+[       OK ] RecordLocationTest.RemoteMaterializationRejectsReusedBlockByEpoch (0 ms)
+[ RUN      ] RecordLocationTest.RecordIndexAllocatesExpirySubtypeOnlyWhenNeeded
+[       OK ] RecordLocationTest.RecordIndexAllocatesExpirySubtypeOnlyWhenNeeded (0 ms)
+[ RUN      ] RecordLocationTest.TxUndoLogRetargetsSharedHandleInConstantTime
+[       OK ] RecordLocationTest.TxUndoLogRetargetsSharedHandleInConstantTime (0 ms)
+[ RUN      ] RecordLocationTest.TxUndoPrefixRetargetDoesNotRequireAddressCache
+[       OK ] RecordLocationTest.TxUndoPrefixRetargetDoesNotRequireAddressCache (0 ms)
+[ RUN      ] RecordLocationTest.IndexKeyMatchingPreservesTailAndCollisionSemantics
+[       OK ] RecordLocationTest.IndexKeyMatchingPreservesTailAndCollisionSemantics (0 ms)
+[----------] 11 tests from RecordLocationTest (0 ms total)
+
+[----------] 2 tests from RequestGateTest
+[ RUN      ] RequestGateTest.CloseRejectsNewEntriesAndWaitsForEveryWorker
+[       OK ] RequestGateTest.CloseRejectsNewEntriesAndWaitsForEveryWorker (0 ms)
+[ RUN      ] RequestGateTest.ConcurrentCloseCannotLoseAnAdmittedEntry
+[       OK ] RequestGateTest.ConcurrentCloseCannotLoseAnAdmittedEntry (0 ms)
+[----------] 2 tests from RequestGateTest (0 ms total)
+
+[----------] 9 tests from ReplicationCommandTest
+[ RUN      ] ReplicationCommandTest.PreparedCaptureChargeFollowsMovedEffects
+[       OK ] ReplicationCommandTest.PreparedCaptureChargeFollowsMovedEffects (0 ms)
+[ RUN      ] ReplicationCommandTest.CapturePreparationOomPreservesEarlierEffects
+[       OK ] ReplicationCommandTest.CapturePreparationOomPreservesEarlierEffects (0 ms)
+[ RUN      ] ReplicationCommandTest.UnusedCapturePreparationDoesNotBurdenNextCommand
+[       OK ] ReplicationCommandTest.UnusedCapturePreparationDoesNotBurdenNextCommand (0 ms)
+[ RUN      ] ReplicationCommandTest.SetAlreadyCarriesFinalExpirationSemantics
+[       OK ] ReplicationCommandTest.SetAlreadyCarriesFinalExpirationSemantics (0 ms)
+[ RUN      ] ReplicationCommandTest.OtherWritesStillReceiveExpirationEffect
+[       OK ] ReplicationCommandTest.OtherWritesStillReceiveExpirationEffect (0 ms)
+[ RUN      ] ReplicationCommandTest.StagingBudgetIncludesShortArgumentOwners
+[       OK ] ReplicationCommandTest.StagingBudgetIncludesShortArgumentOwners (0 ms)
+[ RUN      ] ReplicationCommandTest.TransactionReservationCoversMaterializedPrefix
+[       OK ] ReplicationCommandTest.TransactionReservationCoversMaterializedPrefix (0 ms)
+[ RUN      ] ReplicationCommandTest.TransactionEnvelopeRoundTripsCanonicalBitmap
+[       OK ] ReplicationCommandTest.TransactionEnvelopeRoundTripsCanonicalBitmap (0 ms)
+[ RUN      ] ReplicationCommandTest.EnforcesCompleteEncodingLimit
+[       OK ] ReplicationCommandTest.EnforcesCompleteEncodingLimit (0 ms)
+[----------] 9 tests from ReplicationCommandTest (0 ms total)
+
+[----------] 3 tests from PopulationManifestTest
+[ RUN      ] PopulationManifestTest.CanonicalizesSparseEntriesAndHasStableSha256Identity
+[       OK ] PopulationManifestTest.CanonicalizesSparseEntriesAndHasStableSha256Identity (0 ms)
+[ RUN      ] PopulationManifestTest.SupportsEmptyAndFullDesiredPopulations
+[       OK ] PopulationManifestTest.SupportsEmptyAndFullDesiredPopulations (0 ms)
+[ RUN      ] PopulationManifestTest.RejectsDuplicateAndInvalidEntries
+[       OK ] PopulationManifestTest.RejectsDuplicateAndInvalidEntries (0 ms)
+[----------] 3 tests from PopulationManifestTest (0 ms total)
+
+[----------] 19 tests from ReplicationGroupTest
+[ RUN      ] ReplicationGroupTest.RequiresBootScopedSafeSourceAuthorization
+[       OK ] ReplicationGroupTest.RequiresBootScopedSafeSourceAuthorization (0 ms)
+[ RUN      ] ReplicationGroupTest.RejectsFlowLayoutOutsideTheWorkerDomain
+[       OK ] ReplicationGroupTest.RejectsFlowLayoutOutsideTheWorkerDomain (0 ms)
+[ RUN      ] ReplicationGroupTest.ResetAuthorizationIsValidOnlyForTheActiveAttempt
+[       OK ] ReplicationGroupTest.ResetAuthorizationIsValidOnlyForTheActiveAttempt (0 ms)
+[ RUN      ] ReplicationGroupTest.RejectsASecondGroupAssignmentForTheSameNode
+[       OK ] ReplicationGroupTest.RejectsASecondGroupAssignmentForTheSameNode (0 ms)
+[ RUN      ] ReplicationGroupTest.PublishesReadinessOnlyFromCompleteCurrentAttempt
+[       OK ] ReplicationGroupTest.PublishesReadinessOnlyFromCompleteCurrentAttempt (1 ms)
+[ RUN      ] ReplicationGroupTest.EmptyPopulationPublishesReadinessWithoutASourceFlowCut
+[       OK ] ReplicationGroupTest.EmptyPopulationPublishesReadinessWithoutASourceFlowCut (1 ms)
+[ RUN      ] ReplicationGroupTest.RestartDropsEmptyPopulationProofAndRejectsThePriorBootDirective
+[       OK ] ReplicationGroupTest.RestartDropsEmptyPopulationProofAndRejectsThePriorBootDirective (1 ms)
+[ RUN      ] ReplicationGroupTest.RejectsStaleIdentityAndAttemptReuse
+[       OK ] ReplicationGroupTest.RejectsStaleIdentityAndAttemptReuse (0 ms)
+[ RUN      ] ReplicationGroupTest.DerivesFreshRevisionFromWatermarkAfterProofInvalidation
+[       OK ] ReplicationGroupTest.DerivesFreshRevisionFromWatermarkAfterProofInvalidation (0 ms)
+[ RUN      ] ReplicationGroupTest.RejectsTargetLocalEpochFromPreviousAttempt
+[       OK ] ReplicationGroupTest.RejectsTargetLocalEpochFromPreviousAttempt (0 ms)
+[ RUN      ] ReplicationGroupTest.InvalidatePublishedProofRequiresFreshAttempt
+[       OK ] ReplicationGroupTest.InvalidatePublishedProofRequiresFreshAttempt (1 ms)
+[ RUN      ] ReplicationGroupTest.RestartDropsProofAtEveryRebuildBoundary
+[       OK ] ReplicationGroupTest.RestartDropsProofAtEveryRebuildBoundary (1 ms)
+[ RUN      ] ReplicationGroupTest.RejectsConflictingSameTermButAcceptsNewAuthorityTerm
+[       OK ] ReplicationGroupTest.RejectsConflictingSameTermButAcceptsNewAuthorityTerm (0 ms)
+[ RUN      ] ReplicationGroupTest.ReadyPopulationCarriesForwardAcrossAuthorityTermAdvance
+[       OK ] ReplicationGroupTest.ReadyPopulationCarriesForwardAcrossAuthorityTermAdvance (1 ms)
+[ RUN      ] ReplicationGroupTest.AcceptsOnlyMonotonicDirectiveRevisionsWithinAnAuthorityTerm
+[       OK ] ReplicationGroupTest.AcceptsOnlyMonotonicDirectiveRevisionsWithinAnAuthorityTerm (0 ms)
+[ RUN      ] ReplicationGroupTest.ValidatesNewerActiveDirectiveWithoutRevokingOldAttempt
+[       OK ] ReplicationGroupTest.ValidatesNewerActiveDirectiveWithoutRevokingOldAttempt (0 ms)
+[ RUN      ] ReplicationGroupTest.RequiresResetAndEpochMatchingHandoffForEveryPhysicalPartition
+[       OK ] ReplicationGroupTest.RequiresResetAndEpochMatchingHandoffForEveryPhysicalPartition (1 ms)
+[ RUN      ] ReplicationGroupTest.ConflictingFlowCutVectorCannotBeRewritten
+[       OK ] ReplicationGroupTest.ConflictingFlowCutVectorCannotBeRewritten (0 ms)
+[ RUN      ] ReplicationGroupTest.FailureLatchPreventsEveryLaterAttempt
+[       OK ] ReplicationGroupTest.FailureLatchPreventsEveryLaterAttempt (0 ms)
+[----------] 19 tests from ReplicationGroupTest (11 ms total)
+
+[----------] 10 tests from ReplicaAppliedFrontierTest
+[ RUN      ] ReplicaAppliedFrontierTest.ReconnectLayoutMismatchResetsEveryFlow
+[       OK ] ReplicaAppliedFrontierTest.ReconnectLayoutMismatchResetsEveryFlow (0 ms)
+[ RUN      ] ReplicaAppliedFrontierTest.AdvancesOnlyTheCompletedEvent
+[       OK ] ReplicaAppliedFrontierTest.AdvancesOnlyTheCompletedEvent (0 ms)
+[ RUN      ] ReplicaAppliedFrontierTest.BatchValidationPrecedesPublication
+[       OK ] ReplicaAppliedFrontierTest.BatchValidationPrecedesPublication (0 ms)
+[ RUN      ] ReplicaAppliedFrontierTest.SnapshotNeverAcceptsHalfPublishedBatch
+[       OK ] ReplicaAppliedFrontierTest.SnapshotNeverAcceptsHalfPublishedBatch (0 ms)
+[ RUN      ] ReplicaAppliedFrontierTest.LifecycleInstallPublishesOneVector
+[       OK ] ReplicaAppliedFrontierTest.LifecycleInstallPublishesOneVector (0 ms)
+[ RUN      ] ReplicaAppliedFrontierTest.ScratchReuseKeepsLayoutsAndResultsIndependent
+[       OK ] ReplicaAppliedFrontierTest.ScratchReuseKeepsLayoutsAndResultsIndependent (0 ms)
+[ RUN      ] ReplicaAppliedFrontierTest.DiagnosticOffsetRemainsAvailableDuringBatch
+[       OK ] ReplicaAppliedFrontierTest.DiagnosticOffsetRemainsAvailableDuringBatch (0 ms)
+[ RUN      ] ReplicaAppliedFrontierTest.DiagnosticOffsetSaturatesWithoutWrapping
+[       OK ] ReplicaAppliedFrontierTest.DiagnosticOffsetSaturatesWithoutWrapping (0 ms)
+[ RUN      ] ReplicaAppliedFrontierTest.DiagnosticOffsetReflectsResetAndReplacement
+[       OK ] ReplicaAppliedFrontierTest.DiagnosticOffsetReflectsResetAndReplacement (0 ms)
+[ RUN      ] ReplicaAppliedFrontierTest.PublicationSequenceNeverWraps
+[       OK ] ReplicaAppliedFrontierTest.PublicationSequenceNeverWraps (0 ms)
+[----------] 10 tests from ReplicaAppliedFrontierTest (0 ms total)
+
+[----------] 3 tests from RingBufferTest
+[ RUN      ] RingBufferTest.PreservesFifoAcrossWrapAndResize
+[       OK ] RingBufferTest.PreservesFifoAcrossWrapAndResize (0 ms)
+[ RUN      ] RingBufferTest.ClearReleasesContentsAndRetainsCapacity
+[       OK ] RingBufferTest.ClearReleasesContentsAndRetainsCapacity (0 ms)
+[ RUN      ] RingBufferTest.PreparedPushUsesReservedSlotWithoutGrowth
+[       OK ] RingBufferTest.PreparedPushUsesReservedSlotWithoutGrowth (0 ms)
+[----------] 3 tests from RingBufferTest (0 ms total)
+
+[----------] 3 tests from TxLockTest
+[ RUN      ] TxLockTest.IntentAndHoldCompatibility
+[       OK ] TxLockTest.IntentAndHoldCompatibility (0 ms)
+[ RUN      ] TxLockTest.QueueOrdersByTransactionId
+[       OK ] TxLockTest.QueueOrdersByTransactionId (0 ms)
+[ RUN      ] TxLockTest.QueuesConflictsWithoutBlockingOtherKeys
+[       OK ] TxLockTest.QueuesConflictsWithoutBlockingOtherKeys (0 ms)
+[----------] 3 tests from TxLockTest (0 ms total)
+
+[----------] 1 test from StorageStateTest
+[ RUN      ] StorageStateTest.PromotionBaseEqualityIncludesDurabilityFrontier
+[       OK ] StorageStateTest.PromotionBaseEqualityIncludesDurabilityFrontier (0 ms)
+[----------] 1 test from StorageStateTest (0 ms total)
+
+[----------] 16 tests from StorageFormatTest
+[ RUN      ] StorageFormatTest.ComputesStableProcessLocalDigests
+[       OK ] StorageFormatTest.ComputesStableProcessLocalDigests (0 ms)
+[ RUN      ] StorageFormatTest.GroupIdentitySurvivesInlineAndExtentHeaderRoundTrips
+[       OK ] StorageFormatTest.GroupIdentitySurvivesInlineAndExtentHeaderRoundTrips (0 ms)
+[ RUN      ] StorageFormatTest.GroupHeaderRejectsAmbiguousOrInvalidIdentity
+[       OK ] StorageFormatTest.GroupHeaderRejectsAmbiguousOrInvalidIdentity (0 ms)
+[ RUN      ] StorageFormatTest.GroupRetirementIsCheckedHeaderMetadata
+[       OK ] StorageFormatTest.GroupRetirementIsCheckedHeaderMetadata (0 ms)
+[ RUN      ] StorageFormatTest.GroupBatchDecisionRequiresAnEnclosingTransaction
+[       OK ] StorageFormatTest.GroupBatchDecisionRequiresAnEnclosingTransaction (0 ms)
+[ RUN      ] StorageFormatTest.GroupedRootMarkerDoesNotCarryAGroupIdentity
+[       OK ] StorageFormatTest.GroupedRootMarkerDoesNotCarryAGroupIdentity (0 ms)
+[ RUN      ] StorageFormatTest.CollectionGroupHeadersKeepTypeAndRoutingSemantics
+[       OK ] StorageFormatTest.CollectionGroupHeadersKeepTypeAndRoutingSemantics (0 ms)
+[ RUN      ] StorageFormatTest.GroupedRootsAllowCollectionsButRejectStringsAndStreams
+[       OK ] StorageFormatTest.GroupedRootsAllowCollectionsButRejectStringsAndStreams (0 ms)
+[ RUN      ] StorageFormatTest.RestoresCheckpointDigestSeedBeforeHashing
+[       OK ] StorageFormatTest.RestoresCheckpointDigestSeedBeforeHashing (0 ms)
+[ RUN      ] StorageFormatTest.KeepsRuntimeAndRecoveryKeyLimitsIdentical
+[       OK ] StorageFormatTest.KeepsRuntimeAndRecoveryKeyLimitsIdentical (0 ms)
+[ RUN      ] StorageFormatTest.ComputesRedisClusterSlotsAndHashTags
+[       OK ] StorageFormatTest.ComputesRedisClusterSlotsAndHashTags (0 ms)
+[ RUN      ] StorageFormatTest.EncodesAndValidatesPersistentMetadata
+[       OK ] StorageFormatTest.EncodesAndValidatesPersistentMetadata (0 ms)
+[ RUN      ] StorageFormatTest.EncodesOutOfIndexKeyWithoutHeaderBytes
+[       OK ] StorageFormatTest.EncodesOutOfIndexKeyWithoutHeaderBytes (0 ms)
+[ RUN      ] StorageFormatTest.UsesSparseRecordHeaderExtensions
+[       OK ] StorageFormatTest.UsesSparseRecordHeaderExtensions (0 ms)
+[ RUN      ] StorageFormatTest.EncodesMemoryReplicationFrames
+[       OK ] StorageFormatTest.EncodesMemoryReplicationFrames (0 ms)
+[ RUN      ] StorageFormatTest.RejectsOversizedInlineHeaderBeforeChecksumCopy
+[       OK ] StorageFormatTest.RejectsOversizedInlineHeaderBeforeChecksumCopy (0 ms)
+[----------] 16 tests from StorageFormatTest (0 ms total)
+
+[----------] 1 test from StorageEngineRuntimeFailureTest
+[ RUN      ] StorageEngineRuntimeFailureTest.PermanentRequestFenceAlsoPublishesTheMonitorLatch
+[       OK ] StorageEngineRuntimeFailureTest.PermanentRequestFenceAlsoPublishesTheMonitorLatch (0 ms)
+[----------] 1 test from StorageEngineRuntimeFailureTest (0 ms total)
+
+[----------] 4 tests from StorageExpirationAuthorityTest
+[ RUN      ] StorageExpirationAuthorityTest.RejectsElapsedFiniteAuthority
+[       OK ] StorageExpirationAuthorityTest.RejectsElapsedFiniteAuthority (0 ms)
+[ RUN      ] StorageExpirationAuthorityTest.RecognizesOnlyMarkedAuthorityCancellation
+[       OK ] StorageExpirationAuthorityTest.RecognizesOnlyMarkedAuthorityCancellation (0 ms)
+[ RUN      ] StorageExpirationAuthorityTest.LegacyPermanentGrantIsIdempotent
+[       OK ] StorageExpirationAuthorityTest.LegacyPermanentGrantIsIdempotent (0 ms)
+[ RUN      ] StorageExpirationAuthorityTest.FiniteAuthorityIsExactCancellableAndIndependentOfTombRaider
+[2026-09-15 16:31:09.881] [info] storage device id=0 path=/tmp/keylane-expiration-authority-178326.data capacity-bytes=100663296 data-blocks=11 foreground-blocks=3 defrag-reserve-blocks=8 data-bytes=92274688
+[2026-09-15 16:31:09.881] [info] storage capacity: data-blocks=11 foreground-blocks=3 defrag-reserve-blocks=8
+[2026-09-15 16:31:09.881] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:09.881] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:09.941] [info] storage device id=0 foreground-weight=3 home-workers=1
+[2026-09-15 16:31:09.941] [info] provided-buffer ring disabled; using per-connection receive buffers
+[2026-09-15 16:31:09.961] [info] storage recovery: blocks=0/0 (100.0%) swept=11/11 records=0 rate=0 blocks/s 0.00M records/s eta=0.0s
+[       OK ] StorageExpirationAuthorityTest.FiniteAuthorityIsExactCancellableAndIndependentOfTombRaider (115 ms)
+[----------] 4 tests from StorageExpirationAuthorityTest (115 ms total)
+
+[----------] 3 tests from StorageCapacityTest
+[ RUN      ] StorageCapacityTest.ValidatesAndPreservesDeviceCapacities
+[2026-09-15 16:31:10.003] [info] storage device id=0 path=/tmp/keylane-storage-capacity-178326-unequal-a.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.003] [info] storage device id=1 path=/tmp/keylane-storage-capacity-178326-unequal-b.data capacity-bytes=100663296 data-blocks=11 foreground-blocks=3 defrag-reserve-blocks=8 data-bytes=92274688
+[2026-09-15 16:31:10.003] [info] storage capacity: data-blocks=21 foreground-blocks=5 defrag-reserve-blocks=16
+[2026-09-15 16:31:10.003] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.003] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.062] [info] storage device id=0 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.062] [info] storage device id=1 foreground-weight=3 home-workers=1
+[2026-09-15 16:31:10.085] [info] storage path /tmp/keylane-storage-capacity-178326-unequal-b.data has 8388608 trailing bytes beyond its persisted capacity; ignoring them
+[2026-09-15 16:31:10.085] [info] storage device id=0 path=/tmp/keylane-storage-capacity-178326-unequal-a.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.085] [info] storage device id=1 path=/tmp/keylane-storage-capacity-178326-unequal-b.data capacity-bytes=100663296 data-blocks=11 foreground-blocks=3 defrag-reserve-blocks=8 data-bytes=92274688
+[2026-09-15 16:31:10.085] [info] storage capacity: data-blocks=21 foreground-blocks=5 defrag-reserve-blocks=16
+[2026-09-15 16:31:10.085] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.085] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.142] [info] storage device id=0 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.142] [info] storage device id=1 foreground-weight=3 home-workers=1
+[2026-09-15 16:31:10.166] [info] storage device id=0 path=/tmp/keylane-storage-capacity-178326-minimum.data capacity-bytes=83886080 data-blocks=9 foreground-blocks=1 defrag-reserve-blocks=8 data-bytes=75497472
+[2026-09-15 16:31:10.166] [info] storage capacity: data-blocks=9 foreground-blocks=1 defrag-reserve-blocks=8
+[2026-09-15 16:31:10.166] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.166] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.223] [info] storage device id=0 foreground-weight=1 home-workers=1
+[2026-09-15 16:31:10.244] [warning] resetting all Keylane data on storage path /tmp/keylane-storage-capacity-178326-minimum.data
+[2026-09-15 16:31:10.257] [info] storage device id=0 path=/tmp/keylane-storage-capacity-178326-minimum.data capacity-bytes=83886080 data-blocks=9 foreground-blocks=1 defrag-reserve-blocks=8 data-bytes=75497472
+[2026-09-15 16:31:10.257] [info] storage capacity: data-blocks=9 foreground-blocks=1 defrag-reserve-blocks=8
+[2026-09-15 16:31:10.257] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.257] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.313] [info] storage device id=0 foreground-weight=1 home-workers=1
+[       OK ] StorageCapacityTest.ValidatesAndPreservesDeviceCapacities (339 ms)
+[ RUN      ] StorageCapacityTest.ExpandsAnInitializedStorageSet
+[2026-09-15 16:31:10.338] [info] storage device id=0 path=/tmp/keylane-storage-expansion-178326-original.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.338] [info] storage capacity: data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8
+[2026-09-15 16:31:10.338] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.338] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.393] [info] storage device id=0 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.482] [info] expanded storage set from 1 to 2 devices
+[2026-09-15 16:31:10.482] [info] storage device id=0 path=/tmp/keylane-storage-expansion-178326-original.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.482] [info] storage device id=1 path=/tmp/keylane-storage-expansion-178326-added.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.482] [info] storage capacity: data-blocks=20 foreground-blocks=4 defrag-reserve-blocks=16
+[2026-09-15 16:31:10.482] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.482] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.538] [info] storage device id=0 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.538] [info] storage device id=1 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.559] [info] storage device id=0 path=/tmp/keylane-storage-expansion-178326-original.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.559] [info] storage device id=1 path=/tmp/keylane-storage-expansion-178326-added.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.559] [info] storage capacity: data-blocks=20 foreground-blocks=4 defrag-reserve-blocks=16
+[2026-09-15 16:31:10.559] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.559] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.614] [info] storage device id=0 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.614] [info] storage device id=1 foreground-weight=2 home-workers=1
+[       OK ] StorageCapacityTest.ExpandsAnInitializedStorageSet (302 ms)
+[ RUN      ] StorageCapacityTest.RejectsForeignDeviceDuringExpansion
+[2026-09-15 16:31:10.640] [info] storage device id=0 path=/tmp/keylane-storage-foreign-178326-first.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.640] [info] storage capacity: data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8
+[2026-09-15 16:31:10.640] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.640] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.697] [info] storage device id=0 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.720] [info] storage device id=0 path=/tmp/keylane-storage-foreign-178326-foreign.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.720] [info] storage capacity: data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8
+[2026-09-15 16:31:10.720] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.720] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.777] [info] storage device id=0 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.797] [warning] resetting all Keylane data on storage path /tmp/keylane-storage-foreign-178326-first.data
+[2026-09-15 16:31:10.808] [warning] resetting all Keylane data on storage path /tmp/keylane-storage-foreign-178326-foreign.data
+[2026-09-15 16:31:10.847] [info] storage device id=0 path=/tmp/keylane-storage-foreign-178326-first.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.847] [info] storage device id=1 path=/tmp/keylane-storage-foreign-178326-foreign.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.847] [info] storage capacity: data-blocks=20 foreground-blocks=4 defrag-reserve-blocks=16
+[2026-09-15 16:31:10.847] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.847] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.903] [info] storage device id=0 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.903] [info] storage device id=1 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.924] [info] storage device id=0 path=/tmp/keylane-storage-foreign-178326-first.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.924] [info] storage device id=1 path=/tmp/keylane-storage-foreign-178326-foreign.data capacity-bytes=92274688 data-blocks=10 foreground-blocks=2 defrag-reserve-blocks=8 data-bytes=83886080
+[2026-09-15 16:31:10.924] [info] storage capacity: data-blocks=20 foreground-blocks=4 defrag-reserve-blocks=16
+[2026-09-15 16:31:10.924] [info] storage direct-I/O alignment=4096 bytes
+[2026-09-15 16:31:10.924] [info] storage flush submission size=131072 bytes
+[2026-09-15 16:31:10.980] [info] storage device id=0 foreground-weight=2 home-workers=1
+[2026-09-15 16:31:10.981] [info] storage device id=1 foreground-weight=2 home-workers=1
+[       OK ] StorageCapacityTest.RejectsForeignDeviceDuringExpansion (367 ms)
+[----------] 3 tests from StorageCapacityTest (1009 ms total)
+
+[----------] 1 test from TxCleanerTest
+[ RUN      ] TxCleanerTest.ReclaimsOnlyACompletelySettledGeneration
+[       OK ] TxCleanerTest.ReclaimsOnlyACompletelySettledGeneration (0 ms)
+[----------] 1 test from TxCleanerTest (0 ms total)
+
+[----------] 3 tests from TcpListenerAcceptTest
+[ RUN      ] TcpListenerAcceptTest.AcceptedConnectionDisablesNagle
+[2026-09-15 16:31:11.004] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] TcpListenerAcceptTest.AcceptedConnectionDisablesNagle (0 ms)
+[ RUN      ] TcpListenerAcceptTest.UnixSocketAcceptsAndExposesPeerCredentials
+[2026-09-15 16:31:11.005] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] TcpListenerAcceptTest.UnixSocketAcceptsAndExposesPeerCredentials (0 ms)
+[ RUN      ] TcpListenerAcceptTest.UnixClosePreservesReplacementPath
+[2026-09-15 16:31:11.005] [info] provided-buffer ring disabled; using per-connection receive buffers
+[       OK ] TcpListenerAcceptTest.UnixClosePreservesReplacementPath (0 ms)
+[----------] 3 tests from TcpListenerAcceptTest (1 ms total)
+
+[----------] Global test environment tear-down
+[==========] 613 tests from 87 test suites ran. (3997 ms total)
+[  PASSED  ] 613 tests.
+
+  YOU HAVE 3 DISABLED TESTS
+

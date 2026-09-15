@@ -1,0 +1,33 @@
+Logs: /tmp/celer-dpdk-smoke-d9u2n7c0
+[2026-09-15 16:35:26.663] [info] celer echo server listening on 198.18.0.2:16390 threads=2 idle_timeout_ms=-1
+VMBUS_BUS: vmbus_scan_one(): 7ced8deb-25f2-7ced-8deb-25f27ced8deb already registered
+VMBUS_BUS: vmbus_scan_one(): 000d3a52-b2f1-000d-3a52-b2f1000d3a52 already registered
+DPDK net_tap: 2 workers, 1 RX/TX pairs, poll, IPv4 198.18.0.2, RX steering hash
+[2026-09-15 16:35:26.993] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596136314 Hz (2596.136 MHz) ticks-per-us=2596.136
+[2026-09-15 16:35:26.993] [info] provided-buffer ring disabled; using per-connection receive buffers
+[2026-09-15 16:35:26.993] [info] provided-buffer ring disabled; using per-connection receive buffers
+celer0: Ethernet address: 02:00:00:00:00:02
+celer0: Ethernet address: 02:00:00:00:00:02
+celer0: link state changed to UP
+celer0: link state changed to UP
+[2026-09-15 16:35:31.005] [info] shutdown requested by signal 15
+DPDK worker 0: rx=2339 tx=4053 forward_rx=2808 forward_tx=0 drops=0 waits=0 arms=0 notifications=0
+DPDK worker 1: rx=2808 tx=0 forward_rx=0 forward_tx=2226 drops=0 waits=0 arms=0 notifications=0
+
+PASS poll: 2 workers, 100 streams, half-close, 80 idle wakeups, RX/TX forwarding, shutdown with live sockets
+[2026-09-15 16:35:31.126] [info] celer echo server listening on 198.18.0.2:16390 threads=2 idle_timeout_ms=-1
+VMBUS_BUS: vmbus_scan_one(): 7ced8deb-25f2-7ced-8deb-25f27ced8deb already registered
+VMBUS_BUS: vmbus_scan_one(): 000d3a52-b2f1-000d-3a52-b2f1000d3a52 already registered
+DPDK net_tap: 2 workers, 1 RX/TX pairs, adaptive, IPv4 198.18.0.2, RX steering hash
+[2026-09-15 16:35:31.457] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596135328 Hz (2596.135 MHz) ticks-per-us=2596.135
+[2026-09-15 16:35:31.457] [info] provided-buffer ring disabled; using per-connection receive buffers
+[2026-09-15 16:35:31.457] [info] provided-buffer ring disabled; using per-connection receive buffers
+celer0: Ethernet address: 02:00:00:00:00:02
+celer0: Ethernet address: 02:00:00:00:00:02
+celer0: link state changed to UP
+celer0: link state changed to UP
+[2026-09-15 16:35:32.768] [info] shutdown requested by signal 15
+DPDK worker 0: rx=2257 tx=4102 forward_rx=2836 forward_tx=0 drops=0 waits=632 arms=2620 notifications=654
+DPDK worker 1: rx=2836 tx=0 forward_rx=0 forward_tx=2325 drops=0 waits=394 arms=0 notifications=0
+
+PASS adaptive: 2 workers, 100 streams, half-close, 80 idle wakeups, RX/TX forwarding, shutdown with live sockets

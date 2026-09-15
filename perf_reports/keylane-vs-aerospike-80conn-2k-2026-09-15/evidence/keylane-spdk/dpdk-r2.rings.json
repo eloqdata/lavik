@@ -1,0 +1,23 @@
+{
+  "workers": 12,
+  "io_uring_fds": 12,
+  "state": {
+    "dot4_device": "000d3a52-b2f1-000d-3a52-b2f1000d3a52",
+    "dot4_vf": "0cba:00:02.0",
+    "dot4_vf_name": "enP3258s1",
+    "dot6_vf": "1641:00:02.0",
+    "dot6_vf_name": "enP5697s2",
+    "dot6_driver": "uio_hv_generic",
+    "hugepages": "4096",
+    "vfio_unsafe": "Y",
+    "nvme_drivers": {
+      "6943:00:00.0": "vfio-pci",
+      "0490:00:00.0": "vfio-pci",
+      "2b6b:00:00.0": "vfio-pci",
+      "06a5:00:00.0": "vfio-pci",
+      "7138:00:00.0": "vfio-pci",
+      "44e8:00:00.0": "vfio-pci"
+    },
+    "system_nvme_driver": "nvme"
+  }
+}

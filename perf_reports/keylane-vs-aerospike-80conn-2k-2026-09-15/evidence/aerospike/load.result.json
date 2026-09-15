@@ -1,0 +1,22 @@
+{
+  "label": "load",
+  "operation": "write",
+  "count": 10000000,
+  "hdr_seconds": 31.382,
+  "qps": 318654.0054808489,
+  "mean_us": 572.5013913,
+  "percentiles_us": {
+    "50": 331,
+    "95": 1508,
+    "99": 2693,
+    "99.9": 4543,
+    "99.99": 6075,
+    "100": 252543
+  },
+  "errors": 0,
+  "misses": 0,
+  "server_count_matches": true,
+  "cpu_client_cores": 5.422160697214963,
+  "process_seconds": 31.475280393002322,
+  "connections_configured": 640
+}

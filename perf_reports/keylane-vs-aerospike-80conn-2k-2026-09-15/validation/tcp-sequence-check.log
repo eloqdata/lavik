@@ -1,0 +1,3 @@
+celer0: Ethernet address: 02:00:00:00:00:02
+celer0: link state changed to UP
+PASS: ghost ACK rejected; 3 GiB acknowledged on fast path; slow-path request accepted

@@ -1,0 +1,1 @@
+default kernel/uring; inactive DMA; immutable selection: PASS

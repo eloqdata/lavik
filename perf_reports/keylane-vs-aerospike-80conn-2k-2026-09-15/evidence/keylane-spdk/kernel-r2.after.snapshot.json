@@ -1,0 +1,40 @@
+{
+  "utc": "2026-09-15T14:04:40.376943+00:00",
+  "dbsize": 500000000,
+  "probes": {
+    "1": {
+      "length": 2048,
+      "sha256": "95437efd4af785fb1fb4257861f5c07bf9af9a4eb965961830d3d67c6e07611d"
+    },
+    "2": {
+      "length": 2048,
+      "sha256": "d80b80972d194729328742ec9b081e76c6f5ff83d7e89246064c19f6f04b49a2"
+    },
+    "918237": {
+      "length": 2048,
+      "sha256": "947602b5b93b74c5f186c78b35895b724a9e3bb6343ca14f7c953b9149857b80"
+    },
+    "4162087": {
+      "length": 2048,
+      "sha256": "ed1790d6a4cda5620f90820d4a5f73163c51766d2f565d1973c44d7e16300526"
+    },
+    "250000000": {
+      "length": 2048,
+      "sha256": "9f9d667aad30ab8c6d34c812482cae22117f6e7bccb6064e630c49afc7399185"
+    },
+    "374912341": {
+      "length": 2048,
+      "sha256": "54d0194be8bb4cb2a79b1ca651e202470a70e67e9b9d157b83a2e11e2a286bd0"
+    },
+    "499999999": {
+      "length": 2048,
+      "sha256": "65387290db8db326f09ece92970298b57afdf6b62958c63cb0b9c5ecf2fc5f17"
+    },
+    "500000000": {
+      "length": 2048,
+      "sha256": "14d36be70ea3fbe0ff3e98dc5f3e2c91cd0b98ee43b6378f1fd7352937b6af71"
+    }
+  },
+  "info": "# Server\r\nkeylane_version:0.1.0-dev\r\nredis_mode:standalone\r\nprocess_id:136418\r\nrun_id:7a2c97391df4b64fb071062eedebf0a0e096c0ec\r\ntcp_port:6379\r\nworker_threads:12\r\nuptime_in_seconds:335\r\n\r\n# Clients\r\nconnected_clients:1\r\nmaxclients:10000\r\nblocked_clients:0\r\n\r\n# Memory\r\nused_memory:26921769408\r\nused_memory_human:25.07G\r\nused_memory_rss:24868663296\r\nused_memory_rss_human:23.16G\r\nused_memory_peak:26921769408\r\nused_memory_peak_human:25.07G\r\nmaxmemory:108053279540\r\nmaxmemory_human:100.63G\r\nmaxmemory_clients:5402663977\r\nclient_buffered_request_bytes:14\r\nfullsync_reserved_memory:0\r\nmemory_admission_pending:0\r\nmaxmemory_policy:noeviction\r\nnumber_of_cached_scripts:0\r\nallocator_allocated:26921769408\r\nallocator_active:29070983168\r\nallocator_resident:24868663296\r\nallocator_reserved:30070800384\r\nmem_fragmentation_ratio:0.855446\r\noom_rejected_commands:0\r\n\r\n# Persistence\r\nrdb_changes_since_last_save:0\r\n\r\n# Stats\r\ntotal_commands_processed:75997954\r\ntomb_raider_rounds:0\r\ntomb_raider_reaped:0\r\ntomb_raider_refreshed:0\r\ntomb_raider_enabled:1\r\ntomb_raider_running:0\r\ntomb_raider_mode:interval\r\ntomb_raider_interval_ms:86400000\r\ntomb_raider_block_sleep_ms:10\r\ntomb_raider_daily_second:0\r\n\r\ndefrag_max_active_per_device:8\r\ndefrag_paused:0\r\ndefrag_block_sleep_ms:0\r\ndefrag_record_sleep_us:0\r\ndefrag_active:0\r\ndefrag_pending:0\r\n\r\ntx_cleaner_rounds:1\r\ntx_cleaner_failures:0\r\ntx_cleaner_retired_generations:0\r\ntx_cleaner_retired_blocks:0\r\ntx_cleaner_cooldown_ms:60000\r\ntx_cleaner_running:0\r\n\r\ntx_commit_batches:0\r\ntx_commit_batch_transactions:0\r\ntx_commit_input_fences:0\r\ntx_commit_merged_fences:0\r\ntx_commit_queue_depth:0\r\ntx_commit_queue_peak:0\r\ntx_commit_backpressure_waits:0\r\ntx_commit_queue_high_watermark:4096\r\n\r\nstorage_dirty_staging_bytes:0\r\nstorage_expiration_pause_count:0\r\nstorage_flushes_pending:0\r\nstorage_tx_commits_pending:0\r\nstorage_durability_pending:0\r\n\r\n# Commandstats\r\ncmdstat_ping:calls=1,usec=15,usec_per_call=15.16,rejected_calls=0,failed_calls=0\r\ncmdstat_dbsize:calls=2,usec=611,usec_per_call=305.78,rejected_calls=0,failed_calls=0\r\ncmdstat_get:calls=75997945,usec=5907361619,usec_per_call=77.73,rejected_calls=0,failed_calls=0\r\ncmdstat_info:calls=6,usec=5650,usec_per_call=941.76,rejected_calls=0,failed_calls=0\r\n\r\n# Replication\r\nrole:master\r\nkeylane_replication_state:master\r\nkeylane_replication_failed_stopped:0\r\nkeylane_replication_role_epoch:0\r\nkeylane_replication_group_id:0793c3c550eda4df0a244446ace5c20ffb8bbf62\r\nkeylane_replication_boot_id:6a8632d99060b2e815e42bf8beb6d85670854ac4\r\nkeylane_replica_incarnation:220457ba6def45a1d2330e255420cbd2f6c9616f\r\nkeylane_function_catalog_generation:0\r\nkeylane_function_catalog_crc64:0\r\nmaster_replid:9bb080dec5746b69ad381b9f6f9ba3ce3034f0d3\r\nmaster_replid2:0000000000000000000000000000000000000000\r\nmaster_repl_offset:0\r\nsecond_repl_offset:-1\r\nconnected_slaves:0\r\n\r\n# Transactions\r\ntx_fastpath_runs:0\r\ntx_queued_runs:0\r\ntx_schedule_retries:0\r\ntx_ids_allocated:0\r\n\r\n# Cluster\r\ncluster_enabled:0\r\n\r\n# Keyspace\r\ndb0:keys=500000000\r\n\r\n",
+  "commandstats": "# Commandstats\r\ncmdstat_ping:calls=1,usec=15,usec_per_call=15.16,rejected_calls=0,failed_calls=0\r\ncmdstat_dbsize:calls=2,usec=611,usec_per_call=305.78,rejected_calls=0,failed_calls=0\r\ncmdstat_get:calls=75997945,usec=5907361619,usec_per_call=77.73,rejected_calls=0,failed_calls=0\r\ncmdstat_info:calls=7,usec=8407,usec_per_call=1201.01,rejected_calls=0,failed_calls=0\r\n\r\n"
+}

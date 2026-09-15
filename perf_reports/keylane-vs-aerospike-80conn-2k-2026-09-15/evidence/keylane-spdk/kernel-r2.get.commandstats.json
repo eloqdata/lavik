@@ -1,0 +1,4 @@
+{
+  "before": "# Commandstats\r\ncmdstat_ping:calls=1,usec=15,usec_per_call=15.16,rejected_calls=0,failed_calls=0\r\ncmdstat_dbsize:calls=1,usec=290,usec_per_call=290.05,rejected_calls=0,failed_calls=0\r\ncmdstat_get:calls=4802704,usec=371217318,usec_per_call=77.29,rejected_calls=0,failed_calls=0\r\ncmdstat_info:calls=4,usec=4491,usec_per_call=1122.84,rejected_calls=0,failed_calls=0\r\n\r\n",
+  "after": "# Commandstats\r\ncmdstat_ping:calls=1,usec=15,usec_per_call=15.16,rejected_calls=0,failed_calls=0\r\ncmdstat_dbsize:calls=1,usec=290,usec_per_call=290.05,rejected_calls=0,failed_calls=0\r\ncmdstat_get:calls=75997937,usec=5907360842,usec_per_call=77.73,rejected_calls=0,failed_calls=0\r\ncmdstat_info:calls=5,usec=5087,usec_per_call=1017.46,rejected_calls=0,failed_calls=0\r\n\r\n"
+}

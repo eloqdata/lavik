@@ -1,0 +1,4277 @@
+{
+  "snapshot_seconds": 300.26925046299584,
+  "server_cpu_cores": 7.830205711622643,
+  "physical_read_count": 63770357,
+  "physical_read_bytes": 162639173120,
+  "physical_read_iops": 212377.24775903698,
+  "physical_read_bytes_per_second": 541644450.3365592,
+  "physical_read_ios_per_success": 1.0036686662282888,
+  "physical_read_bytes_per_success": 2559.744835077874,
+  "physical_read_mean_ms": 0.06708886701073354,
+  "cache_read_pct_range": [
+    0.0,
+    0.0
+  ],
+  "server_rss_kib_final": 1020300,
+  "index_bytes_final": 640000000,
+  "data_bytes_final": 21120000000,
+  "client_threads": [
+    {
+      "generator": "client",
+      "tid": "550615",
+      "comm": "asbench",
+      "cores": 0.053613179598803996
+    },
+    {
+      "generator": "client",
+      "tid": "550623",
+      "comm": "asbench",
+      "cores": 0.053613179598803996
+    },
+    {
+      "generator": "client",
+      "tid": "550627",
+      "comm": "asbench",
+      "cores": 0.053613179598803996
+    },
+    {
+      "generator": "client",
+      "tid": "550636",
+      "comm": "asbench",
+      "cores": 0.053613179598803996
+    },
+    {
+      "generator": "client",
+      "tid": "550625",
+      "comm": "asbench",
+      "cores": 0.053579074522723334
+    },
+    {
+      "generator": "client",
+      "tid": "550629",
+      "comm": "asbench",
+      "cores": 0.053579074522723334
+    },
+    {
+      "generator": "client",
+      "tid": "550631",
+      "comm": "asbench",
+      "cores": 0.053579074522723334
+    },
+    {
+      "generator": "client",
+      "tid": "550632",
+      "comm": "asbench",
+      "cores": 0.053579074522723334
+    },
+    {
+      "generator": "client",
+      "tid": "550634",
+      "comm": "asbench",
+      "cores": 0.053579074522723334
+    },
+    {
+      "generator": "client",
+      "tid": "550641",
+      "comm": "asbench",
+      "cores": 0.053579074522723334
+    },
+    {
+      "generator": "client",
+      "tid": "550644",
+      "comm": "asbench",
+      "cores": 0.053579074522723334
+    },
+    {
+      "generator": "client",
+      "tid": "550653",
+      "comm": "asbench",
+      "cores": 0.053579074522723334
+    },
+    {
+      "generator": "client",
+      "tid": "550655",
+      "comm": "asbench",
+      "cores": 0.053579074522723334
+    },
+    {
+      "generator": "client",
+      "tid": "550580",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550613",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550614",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550616",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550617",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550619",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550621",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550639",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550642",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550647",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550650",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550652",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550656",
+      "comm": "asbench",
+      "cores": 0.053544969446642665
+    },
+    {
+      "generator": "client",
+      "tid": "550605",
+      "comm": "asbench",
+      "cores": 0.053510864370561996
+    },
+    {
+      "generator": "client",
+      "tid": "550620",
+      "comm": "asbench",
+      "cores": 0.053510864370561996
+    },
+    {
+      "generator": "client",
+      "tid": "550624",
+      "comm": "asbench",
+      "cores": 0.053510864370561996
+    },
+    {
+      "generator": "client",
+      "tid": "550628",
+      "comm": "asbench",
+      "cores": 0.053510864370561996
+    },
+    {
+      "generator": "client",
+      "tid": "550630",
+      "comm": "asbench",
+      "cores": 0.053510864370561996
+    },
+    {
+      "generator": "client",
+      "tid": "550635",
+      "comm": "asbench",
+      "cores": 0.053510864370561996
+    },
+    {
+      "generator": "client",
+      "tid": "550637",
+      "comm": "asbench",
+      "cores": 0.053510864370561996
+    },
+    {
+      "generator": "client",
+      "tid": "550640",
+      "comm": "asbench",
+      "cores": 0.053510864370561996
+    },
+    {
+      "generator": "client",
+      "tid": "550645",
+      "comm": "asbench",
+      "cores": 0.053510864370561996
+    },
+    {
+      "generator": "client",
+      "tid": "550646",
+      "comm": "asbench",
+      "cores": 0.053510864370561996
+    },
+    {
+      "generator": "client",
+      "tid": "550579",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550583",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550585",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550600",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550606",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550608",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550612",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550618",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550626",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550633",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550643",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550649",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550651",
+      "comm": "asbench",
+      "cores": 0.053476759294481334
+    },
+    {
+      "generator": "client",
+      "tid": "550582",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550584",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550587",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550589",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550592",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550593",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550595",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550596",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550597",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550601",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550607",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550610",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550611",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550622",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550638",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550648",
+      "comm": "asbench",
+      "cores": 0.05344265421840067
+    },
+    {
+      "generator": "client",
+      "tid": "550578",
+      "comm": "asbench",
+      "cores": 0.05340854914232001
+    },
+    {
+      "generator": "client",
+      "tid": "550586",
+      "comm": "asbench",
+      "cores": 0.05340854914232001
+    },
+    {
+      "generator": "client",
+      "tid": "550590",
+      "comm": "asbench",
+      "cores": 0.05340854914232001
+    },
+    {
+      "generator": "client",
+      "tid": "550591",
+      "comm": "asbench",
+      "cores": 0.05340854914232001
+    },
+    {
+      "generator": "client",
+      "tid": "550594",
+      "comm": "asbench",
+      "cores": 0.05340854914232001
+    },
+    {
+      "generator": "client",
+      "tid": "550598",
+      "comm": "asbench",
+      "cores": 0.05340854914232001
+    },
+    {
+      "generator": "client",
+      "tid": "550602",
+      "comm": "asbench",
+      "cores": 0.05340854914232001
+    },
+    {
+      "generator": "client",
+      "tid": "550604",
+      "comm": "asbench",
+      "cores": 0.05340854914232001
+    },
+    {
+      "generator": "client",
+      "tid": "550654",
+      "comm": "asbench",
+      "cores": 0.05340854914232001
+    },
+    {
+      "generator": "client",
+      "tid": "550657",
+      "comm": "asbench",
+      "cores": 0.05340854914232001
+    },
+    {
+      "generator": "client",
+      "tid": "550581",
+      "comm": "asbench",
+      "cores": 0.05337444406623935
+    },
+    {
+      "generator": "client",
+      "tid": "550588",
+      "comm": "asbench",
+      "cores": 0.05337444406623935
+    },
+    {
+      "generator": "client",
+      "tid": "550599",
+      "comm": "asbench",
+      "cores": 0.05337444406623935
+    },
+    {
+      "generator": "client",
+      "tid": "550603",
+      "comm": "asbench",
+      "cores": 0.05337444406623935
+    },
+    {
+      "generator": "client",
+      "tid": "550609",
+      "comm": "asbench",
+      "cores": 0.05337444406623935
+    },
+    {
+      "generator": "client",
+      "tid": "550577",
+      "comm": "asbench",
+      "cores": 3.410507608066412e-05
+    },
+    {
+      "generator": "client",
+      "tid": "550574",
+      "comm": "asbench",
+      "cores": 0.0
+    },
+    {
+      "generator": "client",
+      "tid": "550576",
+      "comm": "tend",
+      "cores": 0.0
+    }
+  ],
+  "tcp_samples": [
+    {
+      "generator": "client",
+      "elapsed": 30.410002403019462,
+      "total": 81,
+      "data": 80,
+      "metadata": 1,
+      "flows": [
+        {
+          "local_port": 51614,
+          "bytes_sent": 1755,
+          "bytes_received": 3131
+        },
+        {
+          "local_port": 51620,
+          "bytes_sent": 6586783,
+          "bytes_received": 174339216
+        },
+        {
+          "local_port": 51624,
+          "bytes_sent": 6293140,
+          "bytes_received": 166566969
+        },
+        {
+          "local_port": 51630,
+          "bytes_sent": 6578409,
+          "bytes_received": 174117570
+        },
+        {
+          "local_port": 51634,
+          "bytes_sent": 6105673,
+          "bytes_received": 161605026
+        },
+        {
+          "local_port": 51646,
+          "bytes_sent": 5976034,
+          "bytes_received": 158173695
+        },
+        {
+          "local_port": 51648,
+          "bytes_sent": 6126845,
+          "bytes_received": 162165414
+        },
+        {
+          "local_port": 51662,
+          "bytes_sent": 6338565,
+          "bytes_received": 167769294
+        },
+        {
+          "local_port": 51666,
+          "bytes_sent": 6232073,
+          "bytes_received": 164950626
+        },
+        {
+          "local_port": 51672,
+          "bytes_sent": 6291165,
+          "bytes_received": 166514694
+        },
+        {
+          "local_port": 51686,
+          "bytes_sent": 6119656,
+          "bytes_received": 161975133
+        },
+        {
+          "local_port": 51700,
+          "bytes_sent": 6088767,
+          "bytes_received": 161157552
+        },
+        {
+          "local_port": 51708,
+          "bytes_sent": 5931636,
+          "bytes_received": 156998553
+        },
+        {
+          "local_port": 51718,
+          "bytes_sent": 6352785,
+          "bytes_received": 168145674
+        },
+        {
+          "local_port": 51720,
+          "bytes_sent": 5975955,
+          "bytes_received": 158171604
+        },
+        {
+          "local_port": 51724,
+          "bytes_sent": 6535433,
+          "bytes_received": 172980066
+        },
+        {
+          "local_port": 51726,
+          "bytes_sent": 6269519,
+          "bytes_received": 165941760
+        },
+        {
+          "local_port": 51742,
+          "bytes_sent": 6051637,
+          "bytes_received": 160174782
+        },
+        {
+          "local_port": 51748,
+          "bytes_sent": 6121157,
+          "bytes_received": 162014862
+        },
+        {
+          "local_port": 51750,
+          "bytes_sent": 6221487,
+          "bytes_received": 164670432
+        },
+        {
+          "local_port": 51762,
+          "bytes_sent": 6091137,
+          "bytes_received": 161220282
+        },
+        {
+          "local_port": 51772,
+          "bytes_sent": 6190203,
+          "bytes_received": 163842396
+        },
+        {
+          "local_port": 51780,
+          "bytes_sent": 5996890,
+          "bytes_received": 158725719
+        },
+        {
+          "local_port": 51794,
+          "bytes_sent": 6400501,
+          "bytes_received": 169408638
+        },
+        {
+          "local_port": 51806,
+          "bytes_sent": 6276234,
+          "bytes_received": 166119495
+        },
+        {
+          "local_port": 51820,
+          "bytes_sent": 6439053,
+          "bytes_received": 170429046
+        },
+        {
+          "local_port": 51826,
+          "bytes_sent": 5954467,
+          "bytes_received": 157602852
+        },
+        {
+          "local_port": 51840,
+          "bytes_sent": 6966378,
+          "bytes_received": 184386471
+        },
+        {
+          "local_port": 51846,
+          "bytes_sent": 7239323,
+          "bytes_received": 191610876
+        },
+        {
+          "local_port": 51862,
+          "bytes_sent": 6097062,
+          "bytes_received": 161377107
+        },
+        {
+          "local_port": 51876,
+          "bytes_sent": 6703229,
+          "bytes_received": 177421350
+        },
+        {
+          "local_port": 51890,
+          "bytes_sent": 6637501,
+          "bytes_received": 175681638
+        },
+        {
+          "local_port": 51904,
+          "bytes_sent": 6748180,
+          "bytes_received": 178611129
+        },
+        {
+          "local_port": 51914,
+          "bytes_sent": 6008029,
+          "bytes_received": 159020550
+        },
+        {
+          "local_port": 51918,
+          "bytes_sent": 6760899,
+          "bytes_received": 178947780
+        },
+        {
+          "local_port": 51928,
+          "bytes_sent": 6153547,
+          "bytes_received": 162872172
+        },
+        {
+          "local_port": 51932,
+          "bytes_sent": 6101802,
+          "bytes_received": 161502567
+        },
+        {
+          "local_port": 51934,
+          "bytes_sent": 6610957,
+          "bytes_received": 174979062
+        },
+        {
+          "local_port": 51940,
+          "bytes_sent": 6690352,
+          "bytes_received": 177080517
+        },
+        {
+          "local_port": 51946,
+          "bytes_sent": 6166503,
+          "bytes_received": 163215096
+        },
+        {
+          "local_port": 51958,
+          "bytes_sent": 6739569,
+          "bytes_received": 178383210
+        },
+        {
+          "local_port": 51964,
+          "bytes_sent": 6402239,
+          "bytes_received": 169454640
+        },
+        {
+          "local_port": 51968,
+          "bytes_sent": 5960234,
+          "bytes_received": 157755495
+        },
+        {
+          "local_port": 51972,
+          "bytes_sent": 6634420,
+          "bytes_received": 175600089
+        },
+        {
+          "local_port": 51974,
+          "bytes_sent": 6943152,
+          "bytes_received": 183771717
+        },
+        {
+          "local_port": 51990,
+          "bytes_sent": 6754342,
+          "bytes_received": 178774227
+        },
+        {
+          "local_port": 52006,
+          "bytes_sent": 6117365,
+          "bytes_received": 161914494
+        },
+        {
+          "local_port": 52008,
+          "bytes_sent": 5958417,
+          "bytes_received": 157707402
+        },
+        {
+          "local_port": 52012,
+          "bytes_sent": 6193205,
+          "bytes_received": 163921854
+        },
+        {
+          "local_port": 52024,
+          "bytes_sent": 6329006,
+          "bytes_received": 167516283
+        },
+        {
+          "local_port": 52034,
+          "bytes_sent": 6159551,
+          "bytes_received": 163031088
+        },
+        {
+          "local_port": 52042,
+          "bytes_sent": 5876494,
+          "bytes_received": 155539035
+        },
+        {
+          "local_port": 52048,
+          "bytes_sent": 6478395,
+          "bytes_received": 171470364
+        },
+        {
+          "local_port": 52052,
+          "bytes_sent": 5905566,
+          "bytes_received": 156308523
+        },
+        {
+          "local_port": 52060,
+          "bytes_sent": 6561740,
+          "bytes_received": 173676369
+        },
+        {
+          "local_port": 52070,
+          "bytes_sent": 5991439,
+          "bytes_received": 158581440
+        },
+        {
+          "local_port": 52076,
+          "bytes_sent": 6400343,
+          "bytes_received": 169406547
+        },
+        {
+          "local_port": 52086,
+          "bytes_sent": 6028332,
+          "bytes_received": 159557937
+        },
+        {
+          "local_port": 52088,
+          "bytes_sent": 5941195,
+          "bytes_received": 157251564
+        },
+        {
+          "local_port": 52094,
+          "bytes_sent": 6274891,
+          "bytes_received": 166083948
+        },
+        {
+          "local_port": 52096,
+          "bytes_sent": 6108280,
+          "bytes_received": 161674029
+        },
+        {
+          "local_port": 52108,
+          "bytes_sent": 6849379,
+          "bytes_received": 181289700
+        },
+        {
+          "local_port": 52110,
+          "bytes_sent": 6261303,
+          "bytes_received": 165724296
+        },
+        {
+          "local_port": 52122,
+          "bytes_sent": 6693354,
+          "bytes_received": 177159975
+        },
+        {
+          "local_port": 52128,
+          "bytes_sent": 6440712,
+          "bytes_received": 170472957
+        },
+        {
+          "local_port": 52136,
+          "bytes_sent": 6661201,
+          "bytes_received": 176308938
+        },
+        {
+          "local_port": 52144,
+          "bytes_sent": 6448454,
+          "bytes_received": 170677875
+        },
+        {
+          "local_port": 52154,
+          "bytes_sent": 6845824,
+          "bytes_received": 181195605
+        },
+        {
+          "local_port": 52158,
+          "bytes_sent": 6422068,
+          "bytes_received": 169979481
+        },
+        {
+          "local_port": 52172,
+          "bytes_sent": 7183075,
+          "bytes_received": 190122084
+        },
+        {
+          "local_port": 52178,
+          "bytes_sent": 7143812,
+          "bytes_received": 189082857
+        },
+        {
+          "local_port": 52190,
+          "bytes_sent": 6606928,
+          "bytes_received": 174872421
+        },
+        {
+          "local_port": 52202,
+          "bytes_sent": 6111914,
+          "bytes_received": 161770215
+        },
+        {
+          "local_port": 52214,
+          "bytes_sent": 6340461,
+          "bytes_received": 167819478
+        },
+        {
+          "local_port": 52226,
+          "bytes_sent": 6730247,
+          "bytes_received": 178136472
+        },
+        {
+          "local_port": 52242,
+          "bytes_sent": 6957214,
+          "bytes_received": 184146006
+        },
+        {
+          "local_port": 52250,
+          "bytes_sent": 6118550,
+          "bytes_received": 161945859
+        },
+        {
+          "local_port": 52254,
+          "bytes_sent": 6180960,
+          "bytes_received": 163597749
+        },
+        {
+          "local_port": 52260,
+          "bytes_sent": 6305938,
+          "bytes_received": 166905711
+        },
+        {
+          "local_port": 52274,
+          "bytes_sent": 6692011,
+          "bytes_received": 177124428
+        },
+        {
+          "local_port": 52286,
+          "bytes_sent": 5932531,
+          "bytes_received": 157033088
+        }
+      ]
+    },
+    {
+      "generator": "client",
+      "elapsed": 60.627324583008885,
+      "total": 81,
+      "data": 80,
+      "metadata": 1,
+      "flows": [
+        {
+          "local_port": 51614,
+          "bytes_sent": 3285,
+          "bytes_received": 5261
+        },
+        {
+          "local_port": 51620,
+          "bytes_sent": 13089747,
+          "bytes_received": 346461972
+        },
+        {
+          "local_port": 51624,
+          "bytes_sent": 12515180,
+          "bytes_received": 331254129
+        },
+        {
+          "local_port": 51630,
+          "bytes_sent": 13164876,
+          "bytes_received": 348450513
+        },
+        {
+          "local_port": 51634,
+          "bytes_sent": 12155256,
+          "bytes_received": 321727533
+        },
+        {
+          "local_port": 51646,
+          "bytes_sent": 11895899,
+          "bytes_received": 314864871
+        },
+        {
+          "local_port": 51648,
+          "bytes_sent": 12218614,
+          "bytes_received": 323404515
+        },
+        {
+          "local_port": 51662,
+          "bytes_sent": 12624279,
+          "bytes_received": 334143891
+        },
+        {
+          "local_port": 51666,
+          "bytes_sent": 12456562,
+          "bytes_received": 329702607
+        },
+        {
+          "local_port": 51672,
+          "bytes_sent": 12552152,
+          "bytes_received": 332232717
+        },
+        {
+          "local_port": 51686,
+          "bytes_sent": 12173189,
+          "bytes_received": 322202190
+        },
+        {
+          "local_port": 51700,
+          "bytes_sent": 12121128,
+          "bytes_received": 320824221
+        },
+        {
+          "local_port": 51708,
+          "bytes_sent": 11809236,
+          "bytes_received": 312568953
+        },
+        {
+          "local_port": 51718,
+          "bytes_sent": 12654536,
+          "bytes_received": 334942653
+        },
+        {
+          "local_port": 51720,
+          "bytes_sent": 11918572,
+          "bytes_received": 315462897
+        },
+        {
+          "local_port": 51724,
+          "bytes_sent": 13010431,
+          "bytes_received": 344362608
+        },
+        {
+          "local_port": 51726,
+          "bytes_sent": 12508307,
+          "bytes_received": 331072212
+        },
+        {
+          "local_port": 51742,
+          "bytes_sent": 12055400,
+          "bytes_received": 319084509
+        },
+        {
+          "local_port": 51748,
+          "bytes_sent": 12176823,
+          "bytes_received": 322298376
+        },
+        {
+          "local_port": 51750,
+          "bytes_sent": 12352361,
+          "bytes_received": 326944578
+        },
+        {
+          "local_port": 51762,
+          "bytes_sent": 12131556,
+          "bytes_received": 321100233
+        },
+        {
+          "local_port": 51772,
+          "bytes_sent": 12368398,
+          "bytes_received": 327369051
+        },
+        {
+          "local_port": 51780,
+          "bytes_sent": 11951120,
+          "bytes_received": 316324389
+        },
+        {
+          "local_port": 51794,
+          "bytes_sent": 12796578,
+          "bytes_received": 338702271
+        },
+        {
+          "local_port": 51806,
+          "bytes_sent": 12551836,
+          "bytes_received": 332224353
+        },
+        {
+          "local_port": 51820,
+          "bytes_sent": 12845874,
+          "bytes_received": 340007055
+        },
+        {
+          "local_port": 51826,
+          "bytes_sent": 11889895,
+          "bytes_received": 314703864
+        },
+        {
+          "local_port": 51840,
+          "bytes_sent": 13891123,
+          "bytes_received": 367673076
+        },
+        {
+          "local_port": 51846,
+          "bytes_sent": 14401779,
+          "bytes_received": 381189300
+        },
+        {
+          "local_port": 51862,
+          "bytes_sent": 12164262,
+          "bytes_received": 321965907
+        },
+        {
+          "local_port": 51876,
+          "bytes_sent": 13364193,
+          "bytes_received": 353726106
+        },
+        {
+          "local_port": 51890,
+          "bytes_sent": 13202559,
+          "bytes_received": 349447920
+        },
+        {
+          "local_port": 51904,
+          "bytes_sent": 13489645,
+          "bytes_received": 357046614
+        },
+        {
+          "local_port": 51914,
+          "bytes_sent": 11975531,
+          "bytes_received": 316970508
+        },
+        {
+          "local_port": 51918,
+          "bytes_sent": 13470922,
+          "bytes_received": 356551047
+        },
+        {
+          "local_port": 51928,
+          "bytes_sent": 12257403,
+          "bytes_received": 324431196
+        },
+        {
+          "local_port": 51932,
+          "bytes_sent": 12169081,
+          "bytes_received": 322093458
+        },
+        {
+          "local_port": 51934,
+          "bytes_sent": 13226338,
+          "bytes_received": 350077311
+        },
+        {
+          "local_port": 51940,
+          "bytes_sent": 13335200,
+          "bytes_received": 352958709
+        },
+        {
+          "local_port": 51946,
+          "bytes_sent": 12307015,
+          "bytes_received": 325744344
+        },
+        {
+          "local_port": 51958,
+          "bytes_sent": 13410645,
+          "bytes_received": 354955614
+        },
+        {
+          "local_port": 51964,
+          "bytes_sent": 12748862,
+          "bytes_received": 337439307
+        },
+        {
+          "local_port": 51968,
+          "bytes_sent": 11863983,
+          "bytes_received": 314018016
+        },
+        {
+          "local_port": 51972,
+          "bytes_sent": 13191025,
+          "bytes_received": 349142634
+        },
+        {
+          "local_port": 51974,
+          "bytes_sent": 13689120,
+          "bytes_received": 362326389
+        },
+        {
+          "local_port": 51990,
+          "bytes_sent": 13439006,
+          "bytes_received": 355706283
+        },
+        {
+          "local_port": 52006,
+          "bytes_sent": 12180536,
+          "bytes_received": 322396653
+        },
+        {
+          "local_port": 52008,
+          "bytes_sent": 11892423,
+          "bytes_received": 314770776
+        },
+        {
+          "local_port": 52012,
+          "bytes_sent": 12332216,
+          "bytes_received": 326411373
+        },
+        {
+          "local_port": 52024,
+          "bytes_sent": 12596787,
+          "bytes_received": 333414132
+        },
+        {
+          "local_port": 52034,
+          "bytes_sent": 12243657,
+          "bytes_received": 324067362
+        },
+        {
+          "local_port": 52042,
+          "bytes_sent": 11700137,
+          "bytes_received": 309681282
+        },
+        {
+          "local_port": 52048,
+          "bytes_sent": 12897224,
+          "bytes_received": 341366205
+        },
+        {
+          "local_port": 52052,
+          "bytes_sent": 11752119,
+          "bytes_received": 311057160
+        },
+        {
+          "local_port": 52060,
+          "bytes_sent": 13035948,
+          "bytes_received": 345038001
+        },
+        {
+          "local_port": 52070,
+          "bytes_sent": 11946617,
+          "bytes_received": 316205202
+        },
+        {
+          "local_port": 52076,
+          "bytes_sent": 12795709,
+          "bytes_received": 338679270
+        },
+        {
+          "local_port": 52086,
+          "bytes_sent": 12023484,
+          "bytes_received": 318239745
+        },
+        {
+          "local_port": 52088,
+          "bytes_sent": 11841547,
+          "bytes_received": 313424172
+        },
+        {
+          "local_port": 52094,
+          "bytes_sent": 12548439,
+          "bytes_received": 332134440
+        },
+        {
+          "local_port": 52096,
+          "bytes_sent": 12146329,
+          "bytes_received": 321491250
+        },
+        {
+          "local_port": 52108,
+          "bytes_sent": 13632635,
+          "bytes_received": 360831324
+        },
+        {
+          "local_port": 52110,
+          "bytes_sent": 12478050,
+          "bytes_received": 330271359
+        },
+        {
+          "local_port": 52122,
+          "bytes_sent": 13338044,
+          "bytes_received": 353033985
+        },
+        {
+          "local_port": 52128,
+          "bytes_sent": 12850061,
+          "bytes_received": 340117878
+        },
+        {
+          "local_port": 52136,
+          "bytes_sent": 13276977,
+          "bytes_received": 351417642
+        },
+        {
+          "local_port": 52144,
+          "bytes_sent": 12907731,
+          "bytes_received": 341644308
+        },
+        {
+          "local_port": 52154,
+          "bytes_sent": 13660048,
+          "bytes_received": 361556901
+        },
+        {
+          "local_port": 52158,
+          "bytes_sent": 12807401,
+          "bytes_received": 338988738
+        },
+        {
+          "local_port": 52172,
+          "bytes_sent": 14351456,
+          "bytes_received": 379857333
+        },
+        {
+          "local_port": 52178,
+          "bytes_sent": 14265109,
+          "bytes_received": 377571870
+        },
+        {
+          "local_port": 52190,
+          "bytes_sent": 13194343,
+          "bytes_received": 349230456
+        },
+        {
+          "local_port": 52202,
+          "bytes_sent": 12175796,
+          "bytes_received": 322271193
+        },
+        {
+          "local_port": 52214,
+          "bytes_sent": 12606030,
+          "bytes_received": 333658779
+        },
+        {
+          "local_port": 52226,
+          "bytes_sent": 13441929,
+          "bytes_received": 355783650
+        },
+        {
+          "local_port": 52242,
+          "bytes_sent": 13857785,
+          "bytes_received": 366790674
+        },
+        {
+          "local_port": 52250,
+          "bytes_sent": 12200997,
+          "bytes_received": 322938222
+        },
+        {
+          "local_port": 52254,
+          "bytes_sent": 12311044,
+          "bytes_received": 325850985
+        },
+        {
+          "local_port": 52260,
+          "bytes_sent": 12532086,
+          "bytes_received": 331701603
+        },
+        {
+          "local_port": 52274,
+          "bytes_sent": 13304785,
+          "bytes_received": 352153674
+        },
+        {
+          "local_port": 52286,
+          "bytes_sent": 11812185,
+          "bytes_received": 312657854
+        }
+      ]
+    },
+    {
+      "generator": "client",
+      "elapsed": 91.0186480070115,
+      "total": 81,
+      "data": 80,
+      "metadata": 1,
+      "flows": [
+        {
+          "local_port": 51614,
+          "bytes_sent": 4815,
+          "bytes_received": 7391
+        },
+        {
+          "local_port": 51620,
+          "bytes_sent": 19661204,
+          "bytes_received": 520397625
+        },
+        {
+          "local_port": 51624,
+          "bytes_sent": 18818195,
+          "bytes_received": 498084564
+        },
+        {
+          "local_port": 51630,
+          "bytes_sent": 19790053,
+          "bytes_received": 523808046
+        },
+        {
+          "local_port": 51634,
+          "bytes_sent": 18231304,
+          "bytes_received": 482550525
+        },
+        {
+          "local_port": 51646,
+          "bytes_sent": 17846021,
+          "bytes_received": 472352718
+        },
+        {
+          "local_port": 51648,
+          "bytes_sent": 18336532,
+          "bytes_received": 485335737
+        },
+        {
+          "local_port": 51662,
+          "bytes_sent": 18941198,
+          "bytes_received": 501340251
+        },
+        {
+          "local_port": 51666,
+          "bytes_sent": 18711466,
+          "bytes_received": 495259623
+        },
+        {
+          "local_port": 51672,
+          "bytes_sent": 18821118,
+          "bytes_received": 498161931
+        },
+        {
+          "local_port": 51686,
+          "bytes_sent": 18300034,
+          "bytes_received": 484369695
+        },
+        {
+          "local_port": 51700,
+          "bytes_sent": 18204681,
+          "bytes_received": 481845858
+        },
+        {
+          "local_port": 51708,
+          "bytes_sent": 17719068,
+          "bytes_received": 468992481
+        },
+        {
+          "local_port": 51718,
+          "bytes_sent": 19016722,
+          "bytes_received": 503339247
+        },
+        {
+          "local_port": 51720,
+          "bytes_sent": 17871538,
+          "bytes_received": 473028111
+        },
+        {
+          "local_port": 51724,
+          "bytes_sent": 19532197,
+          "bytes_received": 516983022
+        },
+        {
+          "local_port": 51726,
+          "bytes_sent": 18793231,
+          "bytes_received": 497423808
+        },
+        {
+          "local_port": 51742,
+          "bytes_sent": 18081678,
+          "bytes_received": 478590171
+        },
+        {
+          "local_port": 51748,
+          "bytes_sent": 18287631,
+          "bytes_received": 484041408
+        },
+        {
+          "local_port": 51750,
+          "bytes_sent": 18511991,
+          "bytes_received": 489979848
+        },
+        {
+          "local_port": 51762,
+          "bytes_sent": 18203891,
+          "bytes_received": 481824948
+        },
+        {
+          "local_port": 51772,
+          "bytes_sent": 18598970,
+          "bytes_received": 492282039
+        },
+        {
+          "local_port": 51780,
+          "bytes_sent": 17946746,
+          "bytes_received": 475018743
+        },
+        {
+          "local_port": 51794,
+          "bytes_sent": 19218093,
+          "bytes_received": 508669206
+        },
+        {
+          "local_port": 51806,
+          "bytes_sent": 18857774,
+          "bytes_received": 499132155
+        },
+        {
+          "local_port": 51820,
+          "bytes_sent": 19305151,
+          "bytes_received": 510973488
+        },
+        {
+          "local_port": 51826,
+          "bytes_sent": 17868773,
+          "bytes_received": 472954926
+        },
+        {
+          "local_port": 51840,
+          "bytes_sent": 20870141,
+          "bytes_received": 552396198
+        },
+        {
+          "local_port": 51846,
+          "bytes_sent": 21640391,
+          "bytes_received": 572783448
+        },
+        {
+          "local_port": 51862,
+          "bytes_sent": 18253108,
+          "bytes_received": 483127641
+        },
+        {
+          "local_port": 51876,
+          "bytes_sent": 20059917,
+          "bytes_received": 530950902
+        },
+        {
+          "local_port": 51890,
+          "bytes_sent": 19815570,
+          "bytes_received": 524483439
+        },
+        {
+          "local_port": 51904,
+          "bytes_sent": 20263974,
+          "bytes_received": 536351955
+        },
+        {
+          "local_port": 51914,
+          "bytes_sent": 17976292,
+          "bytes_received": 475800777
+        },
+        {
+          "local_port": 51918,
+          "bytes_sent": 20232295,
+          "bytes_received": 535513464
+        },
+        {
+          "local_port": 51928,
+          "bytes_sent": 18404867,
+          "bytes_received": 487144452
+        },
+        {
+          "local_port": 51932,
+          "bytes_sent": 18266459,
+          "bytes_received": 483481020
+        },
+        {
+          "local_port": 51934,
+          "bytes_sent": 19856808,
+          "bytes_received": 525574941
+        },
+        {
+          "local_port": 51940,
+          "bytes_sent": 20065289,
+          "bytes_received": 531093090
+        },
+        {
+          "local_port": 51946,
+          "bytes_sent": 18468462,
+          "bytes_received": 488827707
+        },
+        {
+          "local_port": 51958,
+          "bytes_sent": 20214915,
+          "bytes_received": 535053444
+        },
+        {
+          "local_port": 51964,
+          "bytes_sent": 19137039,
+          "bytes_received": 506523840
+        },
+        {
+          "local_port": 51968,
+          "bytes_sent": 17802413,
+          "bytes_received": 471198486
+        },
+        {
+          "local_port": 51972,
+          "bytes_sent": 19839823,
+          "bytes_received": 525125376
+        },
+        {
+          "local_port": 51974,
+          "bytes_sent": 20459973,
+          "bytes_received": 541539726
+        },
+        {
+          "local_port": 51990,
+          "bytes_sent": 20209543,
+          "bytes_received": 534911256
+        },
+        {
+          "local_port": 52006,
+          "bytes_sent": 18285656,
+          "bytes_received": 483989133
+        },
+        {
+          "local_port": 52008,
+          "bytes_sent": 17839938,
+          "bytes_received": 472191711
+        },
+        {
+          "local_port": 52012,
+          "bytes_sent": 18494216,
+          "bytes_received": 489509373
+        },
+        {
+          "local_port": 52024,
+          "bytes_sent": 18911020,
+          "bytes_received": 500541489
+        },
+        {
+          "local_port": 52034,
+          "bytes_sent": 18366868,
+          "bytes_received": 486138681
+        },
+        {
+          "local_port": 52042,
+          "bytes_sent": 17578448,
+          "bytes_received": 465270501
+        },
+        {
+          "local_port": 52048,
+          "bytes_sent": 19346152,
+          "bytes_received": 512058717
+        },
+        {
+          "local_port": 52052,
+          "bytes_sent": 17657606,
+          "bytes_received": 467365683
+        },
+        {
+          "local_port": 52060,
+          "bytes_sent": 19546733,
+          "bytes_received": 517367766
+        },
+        {
+          "local_port": 52070,
+          "bytes_sent": 17910406,
+          "bytes_received": 474056883
+        },
+        {
+          "local_port": 52076,
+          "bytes_sent": 19216829,
+          "bytes_received": 508635750
+        },
+        {
+          "local_port": 52086,
+          "bytes_sent": 18065167,
+          "bytes_received": 478153152
+        },
+        {
+          "local_port": 52088,
+          "bytes_sent": 17766705,
+          "bytes_received": 470253354
+        },
+        {
+          "local_port": 52094,
+          "bytes_sent": 18852323,
+          "bytes_received": 498987876
+        },
+        {
+          "local_port": 52096,
+          "bytes_sent": 18210211,
+          "bytes_received": 481992228
+        },
+        {
+          "local_port": 52108,
+          "bytes_sent": 20441329,
+          "bytes_received": 541046250
+        },
+        {
+          "local_port": 52110,
+          "bytes_sent": 18762658,
+          "bytes_received": 496614591
+        },
+        {
+          "local_port": 52122,
+          "bytes_sent": 20025947,
+          "bytes_received": 530051772
+        },
+        {
+          "local_port": 52128,
+          "bytes_sent": 19302070,
+          "bytes_received": 510891939
+        },
+        {
+          "local_port": 52136,
+          "bytes_sent": 19918902,
+          "bytes_received": 527218467
+        },
+        {
+          "local_port": 52144,
+          "bytes_sent": 19379095,
+          "bytes_received": 512930664
+        },
+        {
+          "local_port": 52154,
+          "bytes_sent": 20482646,
+          "bytes_received": 542139843
+        },
+        {
+          "local_port": 52158,
+          "bytes_sent": 19239423,
+          "bytes_received": 509233776
+        },
+        {
+          "local_port": 52172,
+          "bytes_sent": 21558073,
+          "bytes_received": 570604626
+        },
+        {
+          "local_port": 52178,
+          "bytes_sent": 21444629,
+          "bytes_received": 567601950
+        },
+        {
+          "local_port": 52190,
+          "bytes_sent": 19823944,
+          "bytes_received": 524705085
+        },
+        {
+          "local_port": 52202,
+          "bytes_sent": 18268276,
+          "bytes_received": 483529113
+        },
+        {
+          "local_port": 52214,
+          "bytes_sent": 18968295,
+          "bytes_received": 502057464
+        },
+        {
+          "local_port": 52226,
+          "bytes_sent": 20178891,
+          "bytes_received": 534099948
+        },
+        {
+          "local_port": 52242,
+          "bytes_sent": 20790588,
+          "bytes_received": 550290561
+        },
+        {
+          "local_port": 52250,
+          "bytes_sent": 18297427,
+          "bytes_received": 484300692
+        },
+        {
+          "local_port": 52254,
+          "bytes_sent": 18473676,
+          "bytes_received": 488965713
+        },
+        {
+          "local_port": 52260,
+          "bytes_sent": 18833363,
+          "bytes_received": 498486036
+        },
+        {
+          "local_port": 52274,
+          "bytes_sent": 19959192,
+          "bytes_received": 528284877
+        },
+        {
+          "local_port": 52286,
+          "bytes_sent": 17718383,
+          "bytes_received": 468985196
+        }
+      ]
+    },
+    {
+      "generator": "client",
+      "elapsed": 121.41001839301316,
+      "total": 81,
+      "data": 80,
+      "metadata": 1,
+      "flows": [
+        {
+          "local_port": 51614,
+          "bytes_sent": 6396,
+          "bytes_received": 9592
+        },
+        {
+          "local_port": 51620,
+          "bytes_sent": 26202009,
+          "bytes_received": 693524061
+        },
+        {
+          "local_port": 51624,
+          "bytes_sent": 25085739,
+          "bytes_received": 663976140
+        },
+        {
+          "local_port": 51630,
+          "bytes_sent": 26399351,
+          "bytes_received": 698745288
+        },
+        {
+          "local_port": 51634,
+          "bytes_sent": 24309564,
+          "bytes_received": 643432065
+        },
+        {
+          "local_port": 51646,
+          "bytes_sent": 23794800,
+          "bytes_received": 629807109
+        },
+        {
+          "local_port": 51648,
+          "bytes_sent": 24457847,
+          "bytes_received": 647356872
+        },
+        {
+          "local_port": 51662,
+          "bytes_sent": 25264279,
+          "bytes_received": 668701800
+        },
+        {
+          "local_port": 51666,
+          "bytes_sent": 24945830,
+          "bytes_received": 660272979
+        },
+        {
+          "local_port": 51672,
+          "bytes_sent": 25122553,
+          "bytes_received": 664950546
+        },
+        {
+          "local_port": 51686,
+          "bytes_sent": 24408156,
+          "bytes_received": 646041633
+        },
+        {
+          "local_port": 51700,
+          "bytes_sent": 24274804,
+          "bytes_received": 642514116
+        },
+        {
+          "local_port": 51708,
+          "bytes_sent": 23622343,
+          "bytes_received": 625242456
+        },
+        {
+          "local_port": 51718,
+          "bytes_sent": 25361449,
+          "bytes_received": 671273730
+        },
+        {
+          "local_port": 51720,
+          "bytes_sent": 23854998,
+          "bytes_received": 631400451
+        },
+        {
+          "local_port": 51724,
+          "bytes_sent": 26049855,
+          "bytes_received": 689494704
+        },
+        {
+          "local_port": 51726,
+          "bytes_sent": 25061407,
+          "bytes_received": 663332112
+        },
+        {
+          "local_port": 51742,
+          "bytes_sent": 24123677,
+          "bytes_received": 638511942
+        },
+        {
+          "local_port": 51748,
+          "bytes_sent": 24385404,
+          "bytes_received": 645439425
+        },
+        {
+          "local_port": 51750,
+          "bytes_sent": 24668777,
+          "bytes_received": 652939842
+        },
+        {
+          "local_port": 51762,
+          "bytes_sent": 24272197,
+          "bytes_received": 642443022
+        },
+        {
+          "local_port": 51772,
+          "bytes_sent": 24808291,
+          "bytes_received": 656632548
+        },
+        {
+          "local_port": 51780,
+          "bytes_sent": 23926414,
+          "bytes_received": 633290715
+        },
+        {
+          "local_port": 51794,
+          "bytes_sent": 25624045,
+          "bytes_received": 678224214
+        },
+        {
+          "local_port": 51806,
+          "bytes_sent": 25155891,
+          "bytes_received": 665832948
+        },
+        {
+          "local_port": 51820,
+          "bytes_sent": 25748707,
+          "bytes_received": 681523812
+        },
+        {
+          "local_port": 51826,
+          "bytes_sent": 23830192,
+          "bytes_received": 630743877
+        },
+        {
+          "local_port": 51840,
+          "bytes_sent": 27833122,
+          "bytes_received": 736694847
+        },
+        {
+          "local_port": 51846,
+          "bytes_sent": 28884770,
+          "bytes_received": 764530239
+        },
+        {
+          "local_port": 51862,
+          "bytes_sent": 24340611,
+          "bytes_received": 644253828
+        },
+        {
+          "local_port": 51876,
+          "bytes_sent": 26761013,
+          "bytes_received": 708317886
+        },
+        {
+          "local_port": 51890,
+          "bytes_sent": 26415625,
+          "bytes_received": 699176034
+        },
+        {
+          "local_port": 51904,
+          "bytes_sent": 27044070,
+          "bytes_received": 715809939
+        },
+        {
+          "local_port": 51914,
+          "bytes_sent": 23970654,
+          "bytes_received": 634461675
+        },
+        {
+          "local_port": 51918,
+          "bytes_sent": 26998961,
+          "bytes_received": 714615978
+        },
+        {
+          "local_port": 51928,
+          "bytes_sent": 24539375,
+          "bytes_received": 649514784
+        },
+        {
+          "local_port": 51932,
+          "bytes_sent": 24359097,
+          "bytes_received": 644743122
+        },
+        {
+          "local_port": 51934,
+          "bytes_sent": 26482301,
+          "bytes_received": 700940838
+        },
+        {
+          "local_port": 51940,
+          "bytes_sent": 26862133,
+          "bytes_received": 710994366
+        },
+        {
+          "local_port": 51946,
+          "bytes_sent": 24627223,
+          "bytes_received": 651842067
+        },
+        {
+          "local_port": 51958,
+          "bytes_sent": 27091549,
+          "bytes_received": 717066630
+        },
+        {
+          "local_port": 51964,
+          "bytes_sent": 25511786,
+          "bytes_received": 675252903
+        },
+        {
+          "local_port": 51968,
+          "bytes_sent": 23732232,
+          "bytes_received": 628151037
+        },
+        {
+          "local_port": 51972,
+          "bytes_sent": 26444381,
+          "bytes_received": 699939249
+        },
+        {
+          "local_port": 51974,
+          "bytes_sent": 27236909,
+          "bytes_received": 720914070
+        },
+        {
+          "local_port": 51990,
+          "bytes_sent": 26932206,
+          "bytes_received": 712849083
+        },
+        {
+          "local_port": 52006,
+          "bytes_sent": 24375845,
+          "bytes_received": 645186414
+        },
+        {
+          "local_port": 52008,
+          "bytes_sent": 23817552,
+          "bytes_received": 630409317
+        },
+        {
+          "local_port": 52012,
+          "bytes_sent": 24664827,
+          "bytes_received": 652837383
+        },
+        {
+          "local_port": 52024,
+          "bytes_sent": 25223989,
+          "bytes_received": 667635390
+        },
+        {
+          "local_port": 52034,
+          "bytes_sent": 24494108,
+          "bytes_received": 648316641
+        },
+        {
+          "local_port": 52042,
+          "bytes_sent": 23440801,
+          "bytes_received": 620437338
+        },
+        {
+          "local_port": 52048,
+          "bytes_sent": 25797529,
+          "bytes_received": 682816050
+        },
+        {
+          "local_port": 52052,
+          "bytes_sent": 23547135,
+          "bytes_received": 623251824
+        },
+        {
+          "local_port": 52060,
+          "bytes_sent": 26050171,
+          "bytes_received": 689503068
+        },
+        {
+          "local_port": 52070,
+          "bytes_sent": 23907296,
+          "bytes_received": 632784693
+        },
+        {
+          "local_port": 52076,
+          "bytes_sent": 25622386,
+          "bytes_received": 678182394
+        },
+        {
+          "local_port": 52086,
+          "bytes_sent": 24092788,
+          "bytes_received": 637694361
+        },
+        {
+          "local_port": 52088,
+          "bytes_sent": 23710744,
+          "bytes_received": 627582285
+        },
+        {
+          "local_port": 52094,
+          "bytes_sent": 25149650,
+          "bytes_received": 665667759
+        },
+        {
+          "local_port": 52096,
+          "bytes_sent": 24269748,
+          "bytes_received": 642378201
+        },
+        {
+          "local_port": 52108,
+          "bytes_sent": 27238884,
+          "bytes_received": 720966345
+        },
+        {
+          "local_port": 52110,
+          "bytes_sent": 25029886,
+          "bytes_received": 662497803
+        },
+        {
+          "local_port": 52122,
+          "bytes_sent": 26713613,
+          "bytes_received": 707063286
+        },
+        {
+          "local_port": 52128,
+          "bytes_sent": 25746653,
+          "bytes_received": 681469446
+        },
+        {
+          "local_port": 52136,
+          "bytes_sent": 26570228,
+          "bytes_received": 703268121
+        },
+        {
+          "local_port": 52144,
+          "bytes_sent": 25844771,
+          "bytes_received": 684066468
+        },
+        {
+          "local_port": 52154,
+          "bytes_sent": 27325152,
+          "bytes_received": 723249717
+        },
+        {
+          "local_port": 52158,
+          "bytes_sent": 25670734,
+          "bytes_received": 679459995
+        },
+        {
+          "local_port": 52172,
+          "bytes_sent": 28758844,
+          "bytes_received": 761197185
+        },
+        {
+          "local_port": 52178,
+          "bytes_sent": 28626914,
+          "bytes_received": 757705215
+        },
+        {
+          "local_port": 52190,
+          "bytes_sent": 26460497,
+          "bytes_received": 700363722
+        },
+        {
+          "local_port": 52202,
+          "bytes_sent": 24359018,
+          "bytes_received": 644741031
+        },
+        {
+          "local_port": 52214,
+          "bytes_sent": 25298249,
+          "bytes_received": 669600930
+        },
+        {
+          "local_port": 52226,
+          "bytes_sent": 26899579,
+          "bytes_received": 711985500
+        },
+        {
+          "local_port": 52242,
+          "bytes_sent": 27715570,
+          "bytes_received": 733583439
+        },
+        {
+          "local_port": 52250,
+          "bytes_sent": 24441968,
+          "bytes_received": 646936581
+        },
+        {
+          "local_port": 52254,
+          "bytes_sent": 24645551,
+          "bytes_received": 652325088
+        },
+        {
+          "local_port": 52260,
+          "bytes_sent": 25102566,
+          "bytes_received": 664421523
+        },
+        {
+          "local_port": 52274,
+          "bytes_sent": 26603803,
+          "bytes_received": 704156796
+        },
+        {
+          "local_port": 52286,
+          "bytes_sent": 23617866,
+          "bytes_received": 625134803
+        }
+      ]
+    },
+    {
+      "generator": "client",
+      "elapsed": 151.62706273200456,
+      "total": 81,
+      "data": 80,
+      "metadata": 1,
+      "flows": [
+        {
+          "local_port": 51614,
+          "bytes_sent": 7926,
+          "bytes_received": 11722
+        },
+        {
+          "local_port": 51620,
+          "bytes_sent": 32711214,
+          "bytes_received": 865809915
+        },
+        {
+          "local_port": 51624,
+          "bytes_sent": 31322947,
+          "bytes_received": 829064772
+        },
+        {
+          "local_port": 51630,
+          "bytes_sent": 32951295,
+          "bytes_received": 872164464
+        },
+        {
+          "local_port": 51634,
+          "bytes_sent": 30374315,
+          "bytes_received": 803956044
+        },
+        {
+          "local_port": 51646,
+          "bytes_sent": 29732598,
+          "bytes_received": 786970851
+        },
+        {
+          "local_port": 51648,
+          "bytes_sent": 30555462,
+          "bytes_received": 808750707
+        },
+        {
+          "local_port": 51662,
+          "bytes_sent": 31548571,
+          "bytes_received": 835036668
+        },
+        {
+          "local_port": 51666,
+          "bytes_sent": 31154282,
+          "bytes_received": 824600487
+        },
+        {
+          "local_port": 51672,
+          "bytes_sent": 31361973,
+          "bytes_received": 830097726
+        },
+        {
+          "local_port": 51686,
+          "bytes_sent": 30478121,
+          "bytes_received": 806703618
+        },
+        {
+          "local_port": 51700,
+          "bytes_sent": 30312932,
+          "bytes_received": 802331337
+        },
+        {
+          "local_port": 51708,
+          "bytes_sent": 29522458,
+          "bytes_received": 781408791
+        },
+        {
+          "local_port": 51718,
+          "bytes_sent": 31667150,
+          "bytes_received": 838177350
+        },
+        {
+          "local_port": 51720,
+          "bytes_sent": 29768780,
+          "bytes_received": 787928529
+        },
+        {
+          "local_port": 51724,
+          "bytes_sent": 32523668,
+          "bytes_received": 860845881
+        },
+        {
+          "local_port": 51726,
+          "bytes_sent": 31280524,
+          "bytes_received": 827941905
+        },
+        {
+          "local_port": 51742,
+          "bytes_sent": 30119935,
+          "bytes_received": 797223024
+        },
+        {
+          "local_port": 51748,
+          "bytes_sent": 30447548,
+          "bytes_received": 805894401
+        },
+        {
+          "local_port": 51750,
+          "bytes_sent": 30800125,
+          "bytes_received": 815226534
+        },
+        {
+          "local_port": 51762,
+          "bytes_sent": 30326362,
+          "bytes_received": 802688898
+        },
+        {
+          "local_port": 51772,
+          "bytes_sent": 30957809,
+          "bytes_received": 819400170
+        },
+        {
+          "local_port": 51780,
+          "bytes_sent": 29884752,
+          "bytes_received": 790998117
+        },
+        {
+          "local_port": 51794,
+          "bytes_sent": 31984730,
+          "bytes_received": 846581079
+        },
+        {
+          "local_port": 51806,
+          "bytes_sent": 31411190,
+          "bytes_received": 831400419
+        },
+        {
+          "local_port": 51820,
+          "bytes_sent": 32164297,
+          "bytes_received": 851333922
+        },
+        {
+          "local_port": 51826,
+          "bytes_sent": 29751163,
+          "bytes_received": 787462236
+        },
+        {
+          "local_port": 51840,
+          "bytes_sent": 34773904,
+          "bytes_received": 920408016
+        },
+        {
+          "local_port": 51846,
+          "bytes_sent": 36068003,
+          "bytes_received": 954658596
+        },
+        {
+          "local_port": 51862,
+          "bytes_sent": 30404019,
+          "bytes_received": 804742260
+        },
+        {
+          "local_port": 51876,
+          "bytes_sent": 33430667,
+          "bytes_received": 884854743
+        },
+        {
+          "local_port": 51890,
+          "bytes_sent": 32970887,
+          "bytes_received": 872683032
+        },
+        {
+          "local_port": 51904,
+          "bytes_sent": 33787510,
+          "bytes_received": 894297699
+        },
+        {
+          "local_port": 51914,
+          "bytes_sent": 29936418,
+          "bytes_received": 792365631
+        },
+        {
+          "local_port": 51918,
+          "bytes_sent": 33744297,
+          "bytes_received": 893153922
+        },
+        {
+          "local_port": 51928,
+          "bytes_sent": 30636516,
+          "bytes_received": 810896073
+        },
+        {
+          "local_port": 51932,
+          "bytes_sent": 30433723,
+          "bytes_received": 805528476
+        },
+        {
+          "local_port": 51934,
+          "bytes_sent": 33054390,
+          "bytes_received": 874893219
+        },
+        {
+          "local_port": 51940,
+          "bytes_sent": 33519621,
+          "bytes_received": 887207118
+        },
+        {
+          "local_port": 51946,
+          "bytes_sent": 30767182,
+          "bytes_received": 814354587
+        },
+        {
+          "local_port": 51958,
+          "bytes_sent": 33766575,
+          "bytes_received": 893743584
+        },
+        {
+          "local_port": 51964,
+          "bytes_sent": 31849403,
+          "bytes_received": 842999196
+        },
+        {
+          "local_port": 51968,
+          "bytes_sent": 29646883,
+          "bytes_received": 784702116
+        },
+        {
+          "local_port": 51972,
+          "bytes_sent": 33016154,
+          "bytes_received": 873883266
+        },
+        {
+          "local_port": 51974,
+          "bytes_sent": 34028460,
+          "bytes_received": 900675249
+        },
+        {
+          "local_port": 51990,
+          "bytes_sent": 33624217,
+          "bytes_received": 889975602
+        },
+        {
+          "local_port": 52006,
+          "bytes_sent": 30451103,
+          "bytes_received": 805988496
+        },
+        {
+          "local_port": 52008,
+          "bytes_sent": 29726910,
+          "bytes_received": 786820299
+        },
+        {
+          "local_port": 52012,
+          "bytes_sent": 30811580,
+          "bytes_received": 815531820
+        },
+        {
+          "local_port": 52024,
+          "bytes_sent": 31517603,
+          "bytes_received": 834216996
+        },
+        {
+          "local_port": 52034,
+          "bytes_sent": 30614949,
+          "bytes_received": 810325230
+        },
+        {
+          "local_port": 52042,
+          "bytes_sent": 29261126,
+          "bytes_received": 774491763
+        },
+        {
+          "local_port": 52048,
+          "bytes_sent": 32248274,
+          "bytes_received": 853556655
+        },
+        {
+          "local_port": 52052,
+          "bytes_sent": 29401825,
+          "bytes_received": 778217925
+        },
+        {
+          "local_port": 52060,
+          "bytes_sent": 32562299,
+          "bytes_received": 861868380
+        },
+        {
+          "local_port": 52070,
+          "bytes_sent": 29839564,
+          "bytes_received": 789802065
+        },
+        {
+          "local_port": 52076,
+          "bytes_sent": 31982518,
+          "bytes_received": 846522531
+        },
+        {
+          "local_port": 52086,
+          "bytes_sent": 30088651,
+          "bytes_received": 796394988
+        },
+        {
+          "local_port": 52088,
+          "bytes_sent": 29590872,
+          "bytes_received": 783219597
+        },
+        {
+          "local_port": 52094,
+          "bytes_sent": 31402974,
+          "bytes_received": 831182955
+        },
+        {
+          "local_port": 52096,
+          "bytes_sent": 30298159,
+          "bytes_received": 801940320
+        },
+        {
+          "local_port": 52108,
+          "bytes_sent": 33989276,
+          "bytes_received": 899638113
+        },
+        {
+          "local_port": 52110,
+          "bytes_sent": 31260695,
+          "bytes_received": 827417064
+        },
+        {
+          "local_port": 52122,
+          "bytes_sent": 33388007,
+          "bytes_received": 883723512
+        },
+        {
+          "local_port": 52128,
+          "bytes_sent": 32159794,
+          "bytes_received": 851214735
+        },
+        {
+          "local_port": 52136,
+          "bytes_sent": 33181106,
+          "bytes_received": 878247183
+        },
+        {
+          "local_port": 52144,
+          "bytes_sent": 32268419,
+          "bytes_received": 854089860
+        },
+        {
+          "local_port": 52154,
+          "bytes_sent": 34147513,
+          "bytes_received": 903826386
+        },
+        {
+          "local_port": 52158,
+          "bytes_sent": 32071472,
+          "bytes_received": 848876997
+        },
+        {
+          "local_port": 52172,
+          "bytes_sent": 35944526,
+          "bytes_received": 951390363
+        },
+        {
+          "local_port": 52178,
+          "bytes_sent": 35773649,
+          "bytes_received": 946867530
+        },
+        {
+          "local_port": 52190,
+          "bytes_sent": 33060710,
+          "bytes_received": 875060499
+        },
+        {
+          "local_port": 52202,
+          "bytes_sent": 30426692,
+          "bytes_received": 805342377
+        },
+        {
+          "local_port": 52214,
+          "bytes_sent": 31587992,
+          "bytes_received": 836082168
+        },
+        {
+          "local_port": 52226,
+          "bytes_sent": 33576817,
+          "bytes_received": 888721002
+        },
+        {
+          "local_port": 52242,
+          "bytes_sent": 34588175,
+          "bytes_received": 915489984
+        },
+        {
+          "local_port": 52250,
+          "bytes_sent": 30512723,
+          "bytes_received": 807619476
+        },
+        {
+          "local_port": 52254,
+          "bytes_sent": 30770579,
+          "bytes_received": 814444500
+        },
+        {
+          "local_port": 52260,
+          "bytes_sent": 31330847,
+          "bytes_received": 829273872
+        },
+        {
+          "local_port": 52274,
+          "bytes_sent": 33252759,
+          "bytes_received": 880143720
+        },
+        {
+          "local_port": 52286,
+          "bytes_sent": 29513636,
+          "bytes_received": 781186133
+        }
+      ]
+    },
+    {
+      "generator": "client",
+      "elapsed": 182.01863587001571,
+      "total": 81,
+      "data": 80,
+      "metadata": 1,
+      "flows": [
+        {
+          "local_port": 51614,
+          "bytes_sent": 9456,
+          "bytes_received": 13852
+        },
+        {
+          "local_port": 51620,
+          "bytes_sent": 39317352,
+          "bytes_received": 1040663517
+        },
+        {
+          "local_port": 51624,
+          "bytes_sent": 37646897,
+          "bytes_received": 996449322
+        },
+        {
+          "local_port": 51630,
+          "bytes_sent": 39575129,
+          "bytes_received": 1047486450
+        },
+        {
+          "local_port": 51634,
+          "bytes_sent": 36457473,
+          "bytes_received": 964967226
+        },
+        {
+          "local_port": 51646,
+          "bytes_sent": 35682009,
+          "bytes_received": 944441970
+        },
+        {
+          "local_port": 51648,
+          "bytes_sent": 36683650,
+          "bytes_received": 970953759
+        },
+        {
+          "local_port": 51662,
+          "bytes_sent": 37860355,
+          "bytes_received": 1002099204
+        },
+        {
+          "local_port": 51666,
+          "bytes_sent": 37428146,
+          "bytes_received": 990659343
+        },
+        {
+          "local_port": 51672,
+          "bytes_sent": 37653533,
+          "bytes_received": 996627057
+        },
+        {
+          "local_port": 51686,
+          "bytes_sent": 36630957,
+          "bytes_received": 969559062
+        },
+        {
+          "local_port": 51700,
+          "bytes_sent": 36415603,
+          "bytes_received": 963858996
+        },
+        {
+          "local_port": 51708,
+          "bytes_sent": 35433080,
+          "bytes_received": 937853229
+        },
+        {
+          "local_port": 51718,
+          "bytes_sent": 37987150,
+          "bytes_received": 1005455259
+        },
+        {
+          "local_port": 51720,
+          "bytes_sent": 35730673,
+          "bytes_received": 945730026
+        },
+        {
+          "local_port": 51724,
+          "bytes_sent": 39026790,
+          "bytes_received": 1032972819
+        },
+        {
+          "local_port": 51726,
+          "bytes_sent": 37563078,
+          "bytes_received": 994230771
+        },
+        {
+          "local_port": 51742,
+          "bytes_sent": 36145423,
+          "bytes_received": 956707776
+        },
+        {
+          "local_port": 51748,
+          "bytes_sent": 36582767,
+          "bytes_received": 968285643
+        },
+        {
+          "local_port": 51750,
+          "bytes_sent": 37013396,
+          "bytes_received": 979681593
+        },
+        {
+          "local_port": 51762,
+          "bytes_sent": 36401462,
+          "bytes_received": 963486798
+        },
+        {
+          "local_port": 51772,
+          "bytes_sent": 37171633,
+          "bytes_received": 983869866
+        },
+        {
+          "local_port": 51780,
+          "bytes_sent": 35861418,
+          "bytes_received": 949190631
+        },
+        {
+          "local_port": 51794,
+          "bytes_sent": 38408615,
+          "bytes_received": 1016610744
+        },
+        {
+          "local_port": 51806,
+          "bytes_sent": 37728188,
+          "bytes_received": 998600961
+        },
+        {
+          "local_port": 51820,
+          "bytes_sent": 38630684,
+          "bytes_received": 1022488545
+        },
+        {
+          "local_port": 51826,
+          "bytes_sent": 35720640,
+          "bytes_received": 945464469
+        },
+        {
+          "local_port": 51840,
+          "bytes_sent": 41756714,
+          "bytes_received": 1105229415
+        },
+        {
+          "local_port": 51846,
+          "bytes_sent": 43300690,
+          "bytes_received": 1146095919
+        },
+        {
+          "local_port": 51862,
+          "bytes_sent": 36495314,
+          "bytes_received": 965968815
+        },
+        {
+          "local_port": 51876,
+          "bytes_sent": 40126391,
+          "bytes_received": 1062077448
+        },
+        {
+          "local_port": 51890,
+          "bytes_sent": 39630508,
+          "bytes_received": 1048952241
+        },
+        {
+          "local_port": 51904,
+          "bytes_sent": 40557731,
+          "bytes_received": 1073494308
+        },
+        {
+          "local_port": 51914,
+          "bytes_sent": 35946422,
+          "bytes_received": 951440547
+        },
+        {
+          "local_port": 51918,
+          "bytes_sent": 40522181,
+          "bytes_received": 1072553358
+        },
+        {
+          "local_port": 51928,
+          "bytes_sent": 36804599,
+          "bytes_received": 974155080
+        },
+        {
+          "local_port": 51932,
+          "bytes_sent": 36541055,
+          "bytes_received": 967179504
+        },
+        {
+          "local_port": 51934,
+          "bytes_sent": 39680910,
+          "bytes_received": 1050286299
+        },
+        {
+          "local_port": 51940,
+          "bytes_sent": 40196069,
+          "bytes_received": 1063921710
+        },
+        {
+          "local_port": 51946,
+          "bytes_sent": 36925153,
+          "bytes_received": 977345946
+        },
+        {
+          "local_port": 51958,
+          "bytes_sent": 40450133,
+          "bytes_received": 1070646366
+        },
+        {
+          "local_port": 51964,
+          "bytes_sent": 38238607,
+          "bytes_received": 1012113003
+        },
+        {
+          "local_port": 51968,
+          "bytes_sent": 35578756,
+          "bytes_received": 941709033
+        },
+        {
+          "local_port": 51972,
+          "bytes_sent": 39684623,
+          "bytes_received": 1050384576
+        },
+        {
+          "local_port": 51974,
+          "bytes_sent": 40973192,
+          "bytes_received": 1084490877
+        },
+        {
+          "local_port": 51990,
+          "bytes_sent": 40418770,
+          "bytes_received": 1069816239
+        },
+        {
+          "local_port": 52006,
+          "bytes_sent": 36539159,
+          "bytes_received": 967129320
+        },
+        {
+          "local_port": 52008,
+          "bytes_sent": 35687302,
+          "bytes_received": 944584158
+        },
+        {
+          "local_port": 52012,
+          "bytes_sent": 36981717,
+          "bytes_received": 978843102
+        },
+        {
+          "local_port": 52024,
+          "bytes_sent": 37828834,
+          "bytes_received": 1001264895
+        },
+        {
+          "local_port": 52034,
+          "bytes_sent": 36746613,
+          "bytes_received": 972620286
+        },
+        {
+          "local_port": 52042,
+          "bytes_sent": 35145915,
+          "bytes_received": 930252444
+        },
+        {
+          "local_port": 52048,
+          "bytes_sent": 38709210,
+          "bytes_received": 1024566999
+        },
+        {
+          "local_port": 52052,
+          "bytes_sent": 35328326,
+          "bytes_received": 935080563
+        },
+        {
+          "local_port": 52060,
+          "bytes_sent": 39076718,
+          "bytes_received": 1034294331
+        },
+        {
+          "local_port": 52070,
+          "bytes_sent": 35814255,
+          "bytes_received": 947942304
+        },
+        {
+          "local_port": 52076,
+          "bytes_sent": 38406166,
+          "bytes_received": 1016545923
+        },
+        {
+          "local_port": 52086,
+          "bytes_sent": 36115087,
+          "bytes_received": 955904832
+        },
+        {
+          "local_port": 52088,
+          "bytes_sent": 35528196,
+          "bytes_received": 940370793
+        },
+        {
+          "local_port": 52094,
+          "bytes_sent": 37718945,
+          "bytes_received": 998356314
+        },
+        {
+          "local_port": 52096,
+          "bytes_sent": 36400988,
+          "bytes_received": 963472161
+        },
+        {
+          "local_port": 52108,
+          "bytes_sent": 40827437,
+          "bytes_received": 1080632982
+        },
+        {
+          "local_port": 52110,
+          "bytes_sent": 37557943,
+          "bytes_received": 994094856
+        },
+        {
+          "local_port": 52122,
+          "bytes_sent": 40083336,
+          "bytes_received": 1060939944
+        },
+        {
+          "local_port": 52128,
+          "bytes_sent": 38625470,
+          "bytes_received": 1022350539
+        },
+        {
+          "local_port": 52136,
+          "bytes_sent": 39835592,
+          "bytes_received": 1054380477
+        },
+        {
+          "local_port": 52144,
+          "bytes_sent": 38741442,
+          "bytes_received": 1025420127
+        },
+        {
+          "local_port": 52154,
+          "bytes_sent": 41010875,
+          "bytes_received": 1085488284
+        },
+        {
+          "local_port": 52158,
+          "bytes_sent": 38512105,
+          "bytes_received": 1019352045
+        },
+        {
+          "local_port": 52172,
+          "bytes_sent": 43137555,
+          "bytes_received": 1141778004
+        },
+        {
+          "local_port": 52178,
+          "bytes_sent": 42941003,
+          "bytes_received": 1136575596
+        },
+        {
+          "local_port": 52190,
+          "bytes_sent": 39682648,
+          "bytes_received": 1050332301
+        },
+        {
+          "local_port": 52202,
+          "bytes_sent": 36516012,
+          "bytes_received": 966516657
+        },
+        {
+          "local_port": 52214,
+          "bytes_sent": 37958552,
+          "bytes_received": 1004698317
+        },
+        {
+          "local_port": 52226,
+          "bytes_sent": 40319783,
+          "bytes_received": 1067196216
+        },
+        {
+          "local_port": 52242,
+          "bytes_sent": 41485191,
+          "bytes_received": 1098042648
+        },
+        {
+          "local_port": 52250,
+          "bytes_sent": 36641148,
+          "bytes_received": 969830892
+        },
+        {
+          "local_port": 52254,
+          "bytes_sent": 36923573,
+          "bytes_received": 977306217
+        },
+        {
+          "local_port": 52260,
+          "bytes_sent": 37655982,
+          "bytes_received": 996689787
+        },
+        {
+          "local_port": 52274,
+          "bytes_sent": 39915382,
+          "bytes_received": 1056492387
+        },
+        {
+          "local_port": 52286,
+          "bytes_sent": 35422994,
+          "bytes_received": 937597115
+        }
+      ]
+    },
+    {
+      "generator": "client",
+      "elapsed": 212.410022829019,
+      "total": 81,
+      "data": 80,
+      "metadata": 1,
+      "flows": [
+        {
+          "local_port": 51614,
+          "bytes_sent": 11037,
+          "bytes_received": 16053
+        },
+        {
+          "local_port": 51620,
+          "bytes_sent": 45855708,
+          "bytes_received": 1213723041
+        },
+        {
+          "local_port": 51624,
+          "bytes_sent": 43915784,
+          "bytes_received": 1162376445
+        },
+        {
+          "local_port": 51630,
+          "bytes_sent": 46188140,
+          "bytes_received": 1222521969
+        },
+        {
+          "local_port": 51634,
+          "bytes_sent": 42543396,
+          "bytes_received": 1126051593
+        },
+        {
+          "local_port": 51646,
+          "bytes_sent": 41646588,
+          "bytes_received": 1102314561
+        },
+        {
+          "local_port": 51648,
+          "bytes_sent": 42814840,
+          "bytes_received": 1133236269
+        },
+        {
+          "local_port": 51662,
+          "bytes_sent": 44182725,
+          "bytes_received": 1169441934
+        },
+        {
+          "local_port": 51666,
+          "bytes_sent": 43695058,
+          "bytes_received": 1156534191
+        },
+        {
+          "local_port": 51672,
+          "bytes_sent": 43939958,
+          "bytes_received": 1163016291
+        },
+        {
+          "local_port": 51686,
+          "bytes_sent": 42728730,
+          "bytes_received": 1130959170
+        },
+        {
+          "local_port": 51700,
+          "bytes_sent": 42485963,
+          "bytes_received": 1124531436
+        },
+        {
+          "local_port": 51708,
+          "bytes_sent": 41346151,
+          "bytes_received": 1094362488
+        },
+        {
+          "local_port": 51718,
+          "bytes_sent": 44337644,
+          "bytes_received": 1173542385
+        },
+        {
+          "local_port": 51720,
+          "bytes_sent": 41688774,
+          "bytes_received": 1103431155
+        },
+        {
+          "local_port": 51724,
+          "bytes_sent": 45537575,
+          "bytes_received": 1205302584
+        },
+        {
+          "local_port": 51726,
+          "bytes_sent": 43826909,
+          "bytes_received": 1160024070
+        },
+        {
+          "local_port": 51742,
+          "bytes_sent": 42176678,
+          "bytes_received": 1116345171
+        },
+        {
+          "local_port": 51748,
+          "bytes_sent": 42676195,
+          "bytes_received": 1129566564
+        },
+        {
+          "local_port": 51750,
+          "bytes_sent": 43222322,
+          "bytes_received": 1144021647
+        },
+        {
+          "local_port": 51762,
+          "bytes_sent": 42485963,
+          "bytes_received": 1124531436
+        },
+        {
+          "local_port": 51772,
+          "bytes_sent": 43386879,
+          "bytes_received": 1148377200
+        },
+        {
+          "local_port": 51780,
+          "bytes_sent": 41848591,
+          "bytes_received": 1107661248
+        },
+        {
+          "local_port": 51794,
+          "bytes_sent": 44819860,
+          "bytes_received": 1186305849
+        },
+        {
+          "local_port": 51806,
+          "bytes_sent": 44036259,
+          "bytes_received": 1165565220
+        },
+        {
+          "local_port": 51820,
+          "bytes_sent": 45094385,
+          "bytes_received": 1193572074
+        },
+        {
+          "local_port": 51826,
+          "bytes_sent": 41696358,
+          "bytes_received": 1103631891
+        },
+        {
+          "local_port": 51840,
+          "bytes_sent": 48738813,
+          "bytes_received": 1290034086
+        },
+        {
+          "local_port": 51846,
+          "bytes_sent": 50516155,
+          "bytes_received": 1337077404
+        },
+        {
+          "local_port": 51862,
+          "bytes_sent": 42591823,
+          "bytes_received": 1127333376
+        },
+        {
+          "local_port": 51876,
+          "bytes_sent": 46811608,
+          "bytes_received": 1239024141
+        },
+        {
+          "local_port": 51890,
+          "bytes_sent": 46228746,
+          "bytes_received": 1223596743
+        },
+        {
+          "local_port": 51904,
+          "bytes_sent": 47332376,
+          "bytes_received": 1252808013
+        },
+        {
+          "local_port": 51914,
+          "bytes_sent": 41943154,
+          "bytes_received": 1110164175
+        },
+        {
+          "local_port": 51918,
+          "bytes_sent": 47296036,
+          "bytes_received": 1251846153
+        },
+        {
+          "local_port": 51928,
+          "bytes_sent": 42940213,
+          "bytes_received": 1136554686
+        },
+        {
+          "local_port": 51932,
+          "bytes_sent": 42647597,
+          "bytes_received": 1128809622
+        },
+        {
+          "local_port": 51934,
+          "bytes_sent": 46305929,
+          "bytes_received": 1225639650
+        },
+        {
+          "local_port": 51940,
+          "bytes_sent": 46904196,
+          "bytes_received": 1241474793
+        },
+        {
+          "local_port": 51946,
+          "bytes_sent": 43088654,
+          "bytes_received": 1140483675
+        },
+        {
+          "local_port": 51958,
+          "bytes_sent": 47184567,
+          "bytes_received": 1248895752
+        },
+        {
+          "local_port": 51964,
+          "bytes_sent": 44624809,
+          "bytes_received": 1181143170
+        },
+        {
+          "local_port": 51968,
+          "bytes_sent": 41520188,
+          "bytes_received": 1098968961
+        },
+        {
+          "local_port": 51972,
+          "bytes_sent": 46278832,
+          "bytes_received": 1224922437
+        },
+        {
+          "local_port": 51974,
+          "bytes_sent": 47925982,
+          "bytes_received": 1268519787
+        },
+        {
+          "local_port": 51990,
+          "bytes_sent": 47137957,
+          "bytes_received": 1247662062
+        },
+        {
+          "local_port": 52006,
+          "bytes_sent": 42639776,
+          "bytes_received": 1128602613
+        },
+        {
+          "local_port": 52008,
+          "bytes_sent": 41646588,
+          "bytes_received": 1102314561
+        },
+        {
+          "local_port": 52012,
+          "bytes_sent": 43164415,
+          "bytes_received": 1142488944
+        },
+        {
+          "local_port": 52024,
+          "bytes_sent": 44149545,
+          "bytes_received": 1168563714
+        },
+        {
+          "local_port": 52034,
+          "bytes_sent": 42885150,
+          "bytes_received": 1135097259
+        },
+        {
+          "local_port": 52042,
+          "bytes_sent": 40995312,
+          "bytes_received": 1085076357
+        },
+        {
+          "local_port": 52048,
+          "bytes_sent": 45179626,
+          "bytes_received": 1195828263
+        },
+        {
+          "local_port": 52052,
+          "bytes_sent": 41206716,
+          "bytes_received": 1090671873
+        },
+        {
+          "local_port": 52060,
+          "bytes_sent": 45603935,
+          "bytes_received": 1207059024
+        },
+        {
+          "local_port": 52070,
+          "bytes_sent": 41792185,
+          "bytes_received": 1106168274
+        },
+        {
+          "local_port": 52076,
+          "bytes_sent": 44816937,
+          "bytes_received": 1186228482
+        },
+        {
+          "local_port": 52086,
+          "bytes_sent": 42153847,
+          "bytes_received": 1115740872
+        },
+        {
+          "local_port": 52088,
+          "bytes_sent": 41452406,
+          "bytes_received": 1097174883
+        },
+        {
+          "local_port": 52094,
+          "bytes_sent": 44025673,
+          "bytes_received": 1165285026
+        },
+        {
+          "local_port": 52096,
+          "bytes_sent": 42487938,
+          "bytes_received": 1124583711
+        },
+        {
+          "local_port": 52108,
+          "bytes_sent": 47632260,
+          "bytes_received": 1260745449
+        },
+        {
+          "local_port": 52110,
+          "bytes_sent": 43817350,
+          "bytes_received": 1159771059
+        },
+        {
+          "local_port": 52122,
+          "bytes_sent": 46777243,
+          "bytes_received": 1238114556
+        },
+        {
+          "local_port": 52128,
+          "bytes_sent": 45085616,
+          "bytes_received": 1193339973
+        },
+        {
+          "local_port": 52136,
+          "bytes_sent": 46489920,
+          "bytes_received": 1230509589
+        },
+        {
+          "local_port": 52144,
+          "bytes_sent": 45213122,
+          "bytes_received": 1196714847
+        },
+        {
+          "local_port": 52154,
+          "bytes_sent": 47875659,
+          "bytes_received": 1267187820
+        },
+        {
+          "local_port": 52158,
+          "bytes_sent": 44953449,
+          "bytes_received": 1189841730
+        },
+        {
+          "local_port": 52172,
+          "bytes_sent": 50319840,
+          "bytes_received": 1331881269
+        },
+        {
+          "local_port": 52178,
+          "bytes_sent": 50110332,
+          "bytes_received": 1326335937
+        },
+        {
+          "local_port": 52190,
+          "bytes_sent": 46301742,
+          "bytes_received": 1225528827
+        },
+        {
+          "local_port": 52202,
+          "bytes_sent": 42617419,
+          "bytes_received": 1128010860
+        },
+        {
+          "local_port": 52214,
+          "bytes_sent": 44271758,
+          "bytes_received": 1171798491
+        },
+        {
+          "local_port": 52226,
+          "bytes_sent": 47049556,
+          "bytes_received": 1245322233
+        },
+        {
+          "local_port": 52242,
+          "bytes_sent": 48404722,
+          "bytes_received": 1281191247
+        },
+        {
+          "local_port": 52250,
+          "bytes_sent": 42754563,
+          "bytes_received": 1131640836
+        },
+        {
+          "local_port": 52254,
+          "bytes_sent": 43089128,
+          "bytes_received": 1140496221
+        },
+        {
+          "local_port": 52260,
+          "bytes_sent": 43910886,
+          "bytes_received": 1162246803
+        },
+        {
+          "local_port": 52274,
+          "bytes_sent": 46584799,
+          "bytes_received": 1233020880
+        },
+        {
+          "local_port": 52286,
+          "bytes_sent": 41334801,
+          "bytes_received": 1094072918
+        }
+      ]
+    },
+    {
+      "generator": "client",
+      "elapsed": 242.6283226259984,
+      "total": 81,
+      "data": 80,
+      "metadata": 1,
+      "flows": [
+        {
+          "local_port": 51614,
+          "bytes_sent": 12567,
+          "bytes_received": 18183
+        },
+        {
+          "local_port": 51620,
+          "bytes_sent": 52368626,
+          "bytes_received": 1386109263
+        },
+        {
+          "local_port": 51624,
+          "bytes_sent": 50154098,
+          "bytes_received": 1327494351
+        },
+        {
+          "local_port": 51630,
+          "bytes_sent": 52769630,
+          "bytes_received": 1396723179
+        },
+        {
+          "local_port": 51634,
+          "bytes_sent": 48594875,
+          "bytes_received": 1286224284
+        },
+        {
+          "local_port": 51646,
+          "bytes_sent": 47572931,
+          "bytes_received": 1259175108
+        },
+        {
+          "local_port": 51648,
+          "bytes_sent": 48898314,
+          "bytes_received": 1294255815
+        },
+        {
+          "local_port": 51662,
+          "bytes_sent": 50448452,
+          "bytes_received": 1335285417
+        },
+        {
+          "local_port": 51666,
+          "bytes_sent": 49884629,
+          "bytes_received": 1320361950
+        },
+        {
+          "local_port": 51672,
+          "bytes_sent": 50198496,
+          "bytes_received": 1328669493
+        },
+        {
+          "local_port": 51686,
+          "bytes_sent": 48796167,
+          "bytes_received": 1291552152
+        },
+        {
+          "local_port": 51700,
+          "bytes_sent": 48520457,
+          "bytes_received": 1284254562
+        },
+        {
+          "local_port": 51708,
+          "bytes_sent": 47239867,
+          "bytes_received": 1250359452
+        },
+        {
+          "local_port": 51718,
+          "bytes_sent": 50654563,
+          "bytes_received": 1340740836
+        },
+        {
+          "local_port": 51720,
+          "bytes_sent": 47629969,
+          "bytes_received": 1260684810
+        },
+        {
+          "local_port": 51724,
+          "bytes_sent": 52002145,
+          "bytes_received": 1376409114
+        },
+        {
+          "local_port": 51726,
+          "bytes_sent": 50043893,
+          "bytes_received": 1324577406
+        },
+        {
+          "local_port": 51742,
+          "bytes_sent": 48161481,
+          "bytes_received": 1274753058
+        },
+        {
+          "local_port": 51748,
+          "bytes_sent": 48734152,
+          "bytes_received": 1289910717
+        },
+        {
+          "local_port": 51750,
+          "bytes_sent": 49343084,
+          "bytes_received": 1306028145
+        },
+        {
+          "local_port": 51762,
+          "bytes_sent": 48529147,
+          "bytes_received": 1284484572
+        },
+        {
+          "local_port": 51772,
+          "bytes_sent": 49564047,
+          "bytes_received": 1311876672
+        },
+        {
+          "local_port": 51780,
+          "bytes_sent": 47803137,
+          "bytes_received": 1265268282
+        },
+        {
+          "local_port": 51794,
+          "bytes_sent": 51160795,
+          "bytes_received": 1354139964
+        },
+        {
+          "local_port": 51806,
+          "bytes_sent": 50271413,
+          "bytes_received": 1330599486
+        },
+        {
+          "local_port": 51820,
+          "bytes_sent": 51533280,
+          "bytes_received": 1363999029
+        },
+        {
+          "local_port": 51826,
+          "bytes_sent": 47640476,
+          "bytes_received": 1260962913
+        },
+        {
+          "local_port": 51840,
+          "bytes_sent": 55640569,
+          "bytes_received": 1472712210
+        },
+        {
+          "local_port": 51846,
+          "bytes_sent": 57717558,
+          "bytes_received": 1527686691
+        },
+        {
+          "local_port": 51862,
+          "bytes_sent": 48632005,
+          "bytes_received": 1287207054
+        },
+        {
+          "local_port": 51876,
+          "bytes_sent": 53444685,
+          "bytes_received": 1414590774
+        },
+        {
+          "local_port": 51890,
+          "bytes_sent": 52824298,
+          "bytes_received": 1398170151
+        },
+        {
+          "local_port": 51904,
+          "bytes_sent": 54046112,
+          "bytes_received": 1430509557
+        },
+        {
+          "local_port": 51914,
+          "bytes_sent": 47899833,
+          "bytes_received": 1267827666
+        },
+        {
+          "local_port": 51918,
+          "bytes_sent": 53989706,
+          "bytes_received": 1429016583
+        },
+        {
+          "local_port": 51928,
+          "bytes_sent": 49029138,
+          "bytes_received": 1297718511
+        },
+        {
+          "local_port": 51932,
+          "bytes_sent": 48710531,
+          "bytes_received": 1289285508
+        },
+        {
+          "local_port": 51934,
+          "bytes_sent": 52893186,
+          "bytes_received": 1399993503
+        },
+        {
+          "local_port": 51940,
+          "bytes_sent": 53518076,
+          "bytes_received": 1416533313
+        },
+        {
+          "local_port": 51946,
+          "bytes_sent": 49200963,
+          "bytes_received": 1302266436
+        },
+        {
+          "local_port": 51958,
+          "bytes_sent": 53804846,
+          "bytes_received": 1424123643
+        },
+        {
+          "local_port": 51964,
+          "bytes_sent": 50985020,
+          "bytes_received": 1349487489
+        },
+        {
+          "local_port": 51968,
+          "bytes_sent": 47433180,
+          "bytes_received": 1255476129
+        },
+        {
+          "local_port": 51972,
+          "bytes_sent": 52851711,
+          "bytes_received": 1398895728
+        },
+        {
+          "local_port": 51974,
+          "bytes_sent": 54682536,
+          "bytes_received": 1447354653
+        },
+        {
+          "local_port": 51990,
+          "bytes_sent": 53828072,
+          "bytes_received": 1424740488
+        },
+        {
+          "local_port": 52006,
+          "bytes_sent": 48717483,
+          "bytes_received": 1289469516
+        },
+        {
+          "local_port": 52008,
+          "bytes_sent": 47593629,
+          "bytes_received": 1259722950
+        },
+        {
+          "local_port": 52012,
+          "bytes_sent": 49299792,
+          "bytes_received": 1304882277
+        },
+        {
+          "local_port": 52024,
+          "bytes_sent": 50435180,
+          "bytes_received": 1334934129
+        },
+        {
+          "local_port": 52034,
+          "bytes_sent": 48991771,
+          "bytes_received": 1296729468
+        },
+        {
+          "local_port": 52042,
+          "bytes_sent": 46815953,
+          "bytes_received": 1239141237
+        },
+        {
+          "local_port": 52048,
+          "bytes_sent": 51618600,
+          "bytes_received": 1366257309
+        },
+        {
+          "local_port": 52052,
+          "bytes_sent": 47061722,
+          "bytes_received": 1245644247
+        },
+        {
+          "local_port": 52060,
+          "bytes_sent": 52114957,
+          "bytes_received": 1379395062
+        },
+        {
+          "local_port": 52070,
+          "bytes_sent": 47741596,
+          "bytes_received": 1263641484
+        },
+        {
+          "local_port": 52076,
+          "bytes_sent": 51157556,
+          "bytes_received": 1354054233
+        },
+        {
+          "local_port": 52086,
+          "bytes_sent": 48153818,
+          "bytes_received": 1274550231
+        },
+        {
+          "local_port": 52088,
+          "bytes_sent": 47350388,
+          "bytes_received": 1253284761
+        },
+        {
+          "local_port": 52094,
+          "bytes_sent": 50258852,
+          "bytes_received": 1330267017
+        },
+        {
+          "local_port": 52096,
+          "bytes_sent": 48518798,
+          "bytes_received": 1284210651
+        },
+        {
+          "local_port": 52108,
+          "bytes_sent": 54423574,
+          "bytes_received": 1440500355
+        },
+        {
+          "local_port": 52110,
+          "bytes_sent": 50033465,
+          "bytes_received": 1324301394
+        },
+        {
+          "local_port": 52122,
+          "bytes_sent": 53401788,
+          "bytes_received": 1413455361
+        },
+        {
+          "local_port": 52128,
+          "bytes_sent": 51481693,
+          "bytes_received": 1362633606
+        },
+        {
+          "local_port": 52136,
+          "bytes_sent": 53079073,
+          "bytes_received": 1404915717
+        },
+        {
+          "local_port": 52144,
+          "bytes_sent": 51644828,
+          "bytes_received": 1366951521
+        },
+        {
+          "local_port": 52154,
+          "bytes_sent": 54651094,
+          "bytes_received": 1446522435
+        },
+        {
+          "local_port": 52158,
+          "bytes_sent": 51326695,
+          "bytes_received": 1358533155
+        },
+        {
+          "local_port": 52172,
+          "bytes_sent": 57432605,
+          "bytes_received": 1520144454
+        },
+        {
+          "local_port": 52178,
+          "bytes_sent": 57198291,
+          "bytes_received": 1513942548
+        },
+        {
+          "local_port": 52190,
+          "bytes_sent": 52854081,
+          "bytes_received": 1398960549
+        },
+        {
+          "local_port": 52202,
+          "bytes_sent": 48675455,
+          "bytes_received": 1288357104
+        },
+        {
+          "local_port": 52214,
+          "bytes_sent": 50576353,
+          "bytes_received": 1338670746
+        },
+        {
+          "local_port": 52226,
+          "bytes_sent": 53705543,
+          "bytes_received": 1421495256
+        },
+        {
+          "local_port": 52242,
+          "bytes_sent": 55263265,
+          "bytes_received": 1462725594
+        },
+        {
+          "local_port": 52250,
+          "bytes_sent": 48849255,
+          "bytes_received": 1292957304
+        },
+        {
+          "local_port": 52254,
+          "bytes_sent": 49205071,
+          "bytes_received": 1302375168
+        },
+        {
+          "local_port": 52260,
+          "bytes_sent": 50145487,
+          "bytes_received": 1327268523
+        },
+        {
+          "local_port": 52274,
+          "bytes_sent": 53224512,
+          "bytes_received": 1408763157
+        },
+        {
+          "local_port": 52286,
+          "bytes_sent": 47222750,
+          "bytes_received": 1249917239
+        }
+      ]
+    },
+    {
+      "generator": "client",
+      "elapsed": 273.0192168180074,
+      "total": 81,
+      "data": 80,
+      "metadata": 1,
+      "flows": [
+        {
+          "local_port": 51614,
+          "bytes_sent": 14097,
+          "bytes_received": 20313
+        },
+        {
+          "local_port": 51620,
+          "bytes_sent": 58917884,
+          "bytes_received": 1559457345
+        },
+        {
+          "local_port": 51624,
+          "bytes_sent": 56415796,
+          "bytes_received": 1493231193
+        },
+        {
+          "local_port": 51630,
+          "bytes_sent": 59365656,
+          "bytes_received": 1571309133
+        },
+        {
+          "local_port": 51634,
+          "bytes_sent": 54689567,
+          "bytes_received": 1447540752
+        },
+        {
+          "local_port": 51646,
+          "bytes_sent": 53536246,
+          "bytes_received": 1417014243
+        },
+        {
+          "local_port": 51648,
+          "bytes_sent": 55027213,
+          "bytes_received": 1456477686
+        },
+        {
+          "local_port": 51662,
+          "bytes_sent": 56756444,
+          "bytes_received": 1502247585
+        },
+        {
+          "local_port": 51666,
+          "bytes_sent": 56136689,
+          "bytes_received": 1485843690
+        },
+        {
+          "local_port": 51672,
+          "bytes_sent": 56506725,
+          "bytes_received": 1495637934
+        },
+        {
+          "local_port": 51686,
+          "bytes_sent": 54902472,
+          "bytes_received": 1453175997
+        },
+        {
+          "local_port": 51700,
+          "bytes_sent": 54592792,
+          "bytes_received": 1444979277
+        },
+        {
+          "local_port": 51708,
+          "bytes_sent": 53170792,
+          "bytes_received": 1407341277
+        },
+        {
+          "local_port": 51718,
+          "bytes_sent": 56986176,
+          "bytes_received": 1508328213
+        },
+        {
+          "local_port": 51720,
+          "bytes_sent": 53608610,
+          "bytes_received": 1418929599
+        },
+        {
+          "local_port": 51724,
+          "bytes_sent": 58510639,
+          "bytes_received": 1548678240
+        },
+        {
+          "local_port": 51726,
+          "bytes_sent": 56309541,
+          "bytes_received": 1490418798
+        },
+        {
+          "local_port": 51742,
+          "bytes_sent": 54197239,
+          "bytes_received": 1434509640
+        },
+        {
+          "local_port": 51748,
+          "bytes_sent": 54826395,
+          "bytes_received": 1451162364
+        },
+        {
+          "local_port": 51750,
+          "bytes_sent": 55496236,
+          "bytes_received": 1468891953
+        },
+        {
+          "local_port": 51762,
+          "bytes_sent": 54612621,
+          "bytes_received": 1445504118
+        },
+        {
+          "local_port": 51772,
+          "bytes_sent": 55772973,
+          "bytes_received": 1476216726
+        },
+        {
+          "local_port": 51780,
+          "bytes_sent": 53789362,
+          "bytes_received": 1423713807
+        },
+        {
+          "local_port": 51794,
+          "bytes_sent": 57566826,
+          "bytes_received": 1523697063
+        },
+        {
+          "local_port": 51806,
+          "bytes_sent": 56570952,
+          "bytes_received": 1497337917
+        },
+        {
+          "local_port": 51820,
+          "bytes_sent": 57990424,
+          "bytes_received": 1534909005
+        },
+        {
+          "local_port": 51826,
+          "bytes_sent": 53598656,
+          "bytes_received": 1418666133
+        },
+        {
+          "local_port": 51840,
+          "bytes_sent": 62647553,
+          "bytes_received": 1658175546
+        },
+        {
+          "local_port": 51846,
+          "bytes_sent": 64887045,
+          "bytes_received": 1717451214
+        },
+        {
+          "local_port": 51862,
+          "bytes_sent": 54720061,
+          "bytes_received": 1448347878
+        },
+        {
+          "local_port": 51876,
+          "bytes_sent": 60147914,
+          "bytes_received": 1592014215
+        },
+        {
+          "local_port": 51890,
+          "bytes_sent": 59412819,
+          "bytes_received": 1572557460
+        },
+        {
+          "local_port": 51904,
+          "bytes_sent": 60811356,
+          "bytes_received": 1609574433
+        },
+        {
+          "local_port": 51914,
+          "bytes_sent": 53895854,
+          "bytes_received": 1426532475
+        },
+        {
+          "local_port": 51918,
+          "bytes_sent": 60764351,
+          "bytes_received": 1608330288
+        },
+        {
+          "local_port": 51928,
+          "bytes_sent": 55159854,
+          "bytes_received": 1459988475
+        },
+        {
+          "local_port": 51932,
+          "bytes_sent": 54833742,
+          "bytes_received": 1451356827
+        },
+        {
+          "local_port": 51934,
+          "bytes_sent": 59497349,
+          "bytes_received": 1574794830
+        },
+        {
+          "local_port": 51940,
+          "bytes_sent": 60186545,
+          "bytes_received": 1593036714
+        },
+        {
+          "local_port": 51946,
+          "bytes_sent": 55361304,
+          "bytes_received": 1465320525
+        },
+        {
+          "local_port": 51958,
+          "bytes_sent": 60497963,
+          "bytes_received": 1601279436
+        },
+        {
+          "local_port": 51964,
+          "bytes_sent": 57351077,
+          "bytes_received": 1517986542
+        },
+        {
+          "local_port": 51968,
+          "bytes_sent": 53381248,
+          "bytes_received": 1412911701
+        },
+        {
+          "local_port": 51972,
+          "bytes_sent": 59458402,
+          "bytes_received": 1573763967
+        },
+        {
+          "local_port": 51974,
+          "bytes_sent": 61478669,
+          "bytes_received": 1627237110
+        },
+        {
+          "local_port": 51990,
+          "bytes_sent": 60553974,
+          "bytes_received": 1602764046
+        },
+        {
+          "local_port": 52006,
+          "bytes_sent": 54829397,
+          "bytes_received": 1451241822
+        },
+        {
+          "local_port": 52008,
+          "bytes_sent": 53558603,
+          "bytes_received": 1417605996
+        },
+        {
+          "local_port": 52012,
+          "bytes_sent": 55477908,
+          "bytes_received": 1468406841
+        },
+        {
+          "local_port": 52024,
+          "bytes_sent": 56748070,
+          "bytes_received": 1502025939
+        },
+        {
+          "local_port": 52034,
+          "bytes_sent": 55132283,
+          "bytes_received": 1459258716
+        },
+        {
+          "local_port": 52042,
+          "bytes_sent": 52669221,
+          "bytes_received": 1394065518
+        },
+        {
+          "local_port": 52048,
+          "bytes_sent": 58089016,
+          "bytes_received": 1537518573
+        },
+        {
+          "local_port": 52052,
+          "bytes_sent": 52954964,
+          "bytes_received": 1401630756
+        },
+        {
+          "local_port": 52060,
+          "bytes_sent": 58657895,
+          "bytes_received": 1552575864
+        },
+        {
+          "local_port": 52070,
+          "bytes_sent": 53726794,
+          "bytes_received": 1422057735
+        },
+        {
+          "local_port": 52076,
+          "bytes_sent": 57563271,
+          "bytes_received": 1523602968
+        },
+        {
+          "local_port": 52086,
+          "bytes_sent": 54172512,
+          "bytes_received": 1433855157
+        },
+        {
+          "local_port": 52088,
+          "bytes_sent": 53273097,
+          "bytes_received": 1410049122
+        },
+        {
+          "local_port": 52094,
+          "bytes_sent": 56556495,
+          "bytes_received": 1496955264
+        },
+        {
+          "local_port": 52096,
+          "bytes_sent": 54574227,
+          "bytes_received": 1444487892
+        },
+        {
+          "local_port": 52108,
+          "bytes_sent": 61212123,
+          "bytes_received": 1620182076
+        },
+        {
+          "local_port": 52110,
+          "bytes_sent": 56295716,
+          "bytes_received": 1490052873
+        },
+        {
+          "local_port": 52122,
+          "bytes_sent": 60094984,
+          "bytes_received": 1590613245
+        },
+        {
+          "local_port": 52128,
+          "bytes_sent": 57977152,
+          "bytes_received": 1534557717
+        },
+        {
+          "local_port": 52136,
+          "bytes_sent": 59709069,
+          "bytes_received": 1580398710
+        },
+        {
+          "local_port": 52144,
+          "bytes_sent": 58093282,
+          "bytes_received": 1537631487
+        },
+        {
+          "local_port": 52154,
+          "bytes_sent": 61483883,
+          "bytes_received": 1627375116
+        },
+        {
+          "local_port": 52158,
+          "bytes_sent": 57794583,
+          "bytes_received": 1529725416
+        },
+        {
+          "local_port": 52172,
+          "bytes_sent": 64630532,
+          "bytes_received": 1710661737
+        },
+        {
+          "local_port": 52178,
+          "bytes_sent": 64358140,
+          "bytes_received": 1703451969
+        },
+        {
+          "local_port": 52190,
+          "bytes_sent": 59477836,
+          "bytes_received": 1574278353
+        },
+        {
+          "local_port": 52202,
+          "bytes_sent": 54772912,
+          "bytes_received": 1449746757
+        },
+        {
+          "local_port": 52214,
+          "bytes_sent": 56865938,
+          "bytes_received": 1505145711
+        },
+        {
+          "local_port": 52226,
+          "bytes_sent": 60428759,
+          "bytes_received": 1599447720
+        },
+        {
+          "local_port": 52242,
+          "bytes_sent": 62152776,
+          "bytes_received": 1645079613
+        },
+        {
+          "local_port": 52250,
+          "bytes_sent": 54970096,
+          "bytes_received": 1454965893
+        },
+        {
+          "local_port": 52254,
+          "bytes_sent": 55366992,
+          "bytes_received": 1465471077
+        },
+        {
+          "local_port": 52260,
+          "bytes_sent": 56418008,
+          "bytes_received": 1493289741
+        },
+        {
+          "local_port": 52274,
+          "bytes_sent": 59902540,
+          "bytes_received": 1585519569
+        },
+        {
+          "local_port": 52286,
+          "bytes_sent": 53147355,
+          "bytes_received": 1406731784
+        }
+      ]
+    }
+  ],
+  "ten_second_qps": [
+    206615.88466060552,
+    211979.77362603598,
+    211966.23461867706,
+    211844.91390788645,
+    211599.28344148753,
+    211886.65365782706,
+    211914.916050252,
+    211687.69262521734,
+    211974.89685075625,
+    211669.80914573144,
+    211736.6072232326,
+    211943.7252813327,
+    211639.6956838909,
+    211868.58929146934,
+    211838.9276467464,
+    212166.96760207118,
+    211854.39744316388,
+    212309.1622747222,
+    211916.72852267633,
+    211286.79837766438,
+    211936.23475149856,
+    211858.39715905758,
+    211552.60186303142,
+    211162.88232004238,
+    211406.93391314286,
+    211828.9784135717,
+    211621.39739746152,
+    211744.39472089015,
+    211883.99851322235
+  ]
+}

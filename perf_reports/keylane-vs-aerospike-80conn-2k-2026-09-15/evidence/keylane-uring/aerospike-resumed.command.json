@@ -1,0 +1,19 @@
+{
+  "time": 1789492106.9162054,
+  "supervisor_pid": 182888,
+  "argv": [
+    "sudo",
+    "-n",
+    "prlimit",
+    "--nofile=65536:65536",
+    "--",
+    "taskset",
+    "-c",
+    "0-11",
+    "/usr/bin/asd",
+    "--foreground",
+    "--config-file",
+    "/mnt/dev/keylane/perf_reports/dfly-nic-dpdk-10g-2026-09-15/aerospike-80conn-10m2k/aerospike.conf"
+  ],
+  "partuuid": "33f27d15-2ead-4a86-94b0-f858d315334f"
+}

@@ -1,0 +1,34 @@
+{
+  "label": "dpdk-r1.get",
+  "count": 91950871,
+  "wall_seconds": 300.005,
+  "qps": 306497.7950367494,
+  "reported_qps": 306502.32,
+  "average_us": 260.65137545026624,
+  "accumulated_latency_ms": 23967121,
+  "percentiles_ms": {
+    "p50.00": 0.263,
+    "p95.00": 0.303,
+    "p99.00": 0.319,
+    "p99.90": 0.359,
+    "p99.99": 0.727,
+    "Histogram log format": {
+      "Compressed Histogram": "HISTFAAAApZ4nC1R30tUURDeM2d27tzZ4/HuVWxbllIzX7QXiaCnIKSHnnqLHnrqP+gvsDKJnsJMCjbpB5ksZiUlYiFWEhIoBRIRFSHSQ1hImIn40Jy77l3mzp0f38z3TaX/elMuZ8/m6j/YfUswB96cyB1brwe64BlUb5v11WR09cyTD5fhzqW72F+7H1V35mXy1l83Ofeo4fPjtcLWr8H42mKNpl5dwJ3n4zD+4oFZenl65/2h8cU988Nu8ym9m7HL/8ynG2b2XO3k0tGBns2u6sHVtiv7B8sLpZWWn01zTbPF6eRbsum/u9duorBdWC+oVxhw04WRwo94VKoyItvxdrwRX5TZeIHv8Uy0Fu1EN6OR6A+NRcv0ha7SVr6PlvKD+b78GE7hit2wNX0m7YCdg1l4C0Pw23w0NTNhhsywOX+qt/f44e6Ojkpra3PS0d7sS57TtOTItzgnLOwoIUeELEQsiQijY/BCCOAgUUuAaiFYImAUlzADEpOXEHGachKSqH9k1AZgA1oDhiOwGbZ+aodwkjoEIeO0VPNgM2CLwVHXAFowpG4jEO5GAdlCKNd6rFfrOB2YYVAW10pNQoNCKJGwAqCOTXQkG4VVDO3NPJOVZ41p95HOzp7O9k4JhLm+AEbsy6mX7orzGfWwZchSAGcNxRAIIntfaq+k5XKSBn7K04WxQMbrciqkgobyPKeku4iIhzyBUYp50h3SOqk6hbrSghIE4wJYZYHCIMCWwsbaRzpetdODOQOUtAobPRgpWhLEd4og+7yqYimchtlZ9M7HEGUTrA7SPh1AemkjxK4xXEvhJVH9sAH0jhCBV0BwEZNhFcOynk+o0WlVPuEi+iaANsS9gQ0WMSiufpHkoeGifDVYdPgf7BF+vA=="
+    }
+  },
+  "cpu": {
+    "cpu_user_seconds": 171.266,
+    "cpu_sys_seconds": 1185.613,
+    "cpu_total_seconds": 1356.879,
+    "cpu_wall_seconds": 300.005,
+    "cpu_cores_used": 4.523,
+    "avg_cpu_utilization_pct": 56.535,
+    "peak_cpu_utilization_pct": 467.776,
+    "threads_counted": 8
+  },
+  "errors": 0,
+  "misses": 0,
+  "csv_count_matches": true,
+  "server_count_matches": true,
+  "connections": 80
+}

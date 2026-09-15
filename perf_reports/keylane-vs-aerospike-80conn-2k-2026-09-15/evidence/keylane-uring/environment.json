@@ -1,0 +1,20 @@
+{
+  "binary": "/mnt/dev/keylane-nic-dpdk-20260915/build-kernel/keylane",
+  "sha256": "d82031f774c7125c0acf293075984bdb681fc1f05cc0563ebcc21cd29ed510f1",
+  "keylane_head": "e1fbccb4adaa01a7ff221775d3b4b66c6e62ce5a",
+  "celer_head": "0d27a6d586958714451d7d94d0281b7753fd7712",
+  "boot_id": "27962773-1d7c-46ed-9966-577bb4fce389",
+  "count": 500000000,
+  "value_size": 2048,
+  "network": "kernel",
+  "storage": "uring",
+  "kernel_bypass_compiled": false,
+  "workers": 12,
+  "cpu_set": "0-11",
+  "connections": 80,
+  "client_threads": 8,
+  "pipeline": 1,
+  "seconds": 300,
+  "rounds": 3,
+  "memtier_sha256": "9b6ee614dae154c64b17a067a10236b3e6532f7ca52c43b547b87101556dd7d4"
+}

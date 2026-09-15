@@ -222,40 +222,27 @@ Redis-style configuration file as its first argument.
 
 ## Benchmark
 
-The table below is a same-hardware comparison using two NVMe devices, 200 million
-keys, uniformly random 1,000–4,000-byte values, 80 client connections, pipeline
-depth 1, and an unlimited 300-second `memtier_benchmark` window. The server and
-client were separate Azure `Standard_L16s_v3` VMs with 16 vCPUs. Online defrag
-or each competitor's configured reclamation/compaction remained enabled.
+Read-only measurements on one server and one client, with **80 connections,
+one outstanding request per connection, and 2 KiB (2,048-byte) values**.
+Each configuration ran three 300-second rounds; the server CPU budget was
+12 logical CPUs (6 physical cores with SMT).
 
-Each value is **QPS (p99 latency in ms)**:
-
-| System | GET | 1:1 GET/SET | SET |
+| Configuration | Records | GET/s | Mean latency (µs) |
 |---|---:|---:|---:|
-| **Keylane — SPDK** | **310,387 (0.455)** | **352,442 (0.631)** | 392,284 (0.999) |
-| **Keylane — raw io_uring** | 278,925 (0.503) | 328,831 (0.655) | **393,733 (1.015)** |
-| **Keylane — XFS/io_uring** | 272,727 (0.519) | 326,110 (0.687) | 385,324 (1.055) |
-| Microsoft Garnet Storage Tier | 205,297 (2.303) | 209,366 (2.511) | 361,960 (1.583) |
-| Dragonfly Tiered Storage | 187,653 (2.911) | 207,248 (4.015) | 199,234 (4.639) |
-| Tendis | 68,860 (2.063) | 102,213 (1.439) | 160,642 (1.335) |
-| Apache Kvrocks | 70,672 (2.479) | 88,084 (2.207) | 110,167 (1.759) |
-| Pika | 86,669 (1.775) | 75,324 (3.615) | 79,537 (4.223) |
-| KeyDB On Flash | 6,146 (18.047) | 5,197 (29.311) | 5,395 (24.447) |
+| Keylane: kernel network + io_uring, raw RAID0 | 500 million | 218,223 | 366.23 |
+| Keylane: kernel network + SPDK | 500 million | 237,099 | 337.04 |
+| Keylane: DPDK + SPDK | 500 million | 303,841 | 262.93 |
+| Aerospike CE: kernel network, raw RAID0 | 10 million | 212,075 | 376.80 |
 
-The mixed-workload QPS counts individual Redis commands; it is not a
-two-command transaction rate.
+Keylane used 1.024 TB of values and memtier/RESP; Aerospike used 20.48 GB
+and asbench/native protocol with its read caches disabled. Dataset size,
+record layout, storage topology, and client tools differ. The figures compare
+these specific configurations; all formal rounds completed with zero errors
+and misses. The io_uring row uses the default build with kernel bypass disabled.
 
-In this environment, Keylane SPDK delivered 1.51x the GET throughput, 1.68x the
-mixed throughput, and 1.08x the SET throughput of the fastest non-Keylane row
-(Garnet). Raw io_uring narrowly led SPDK on pure writes, while SPDK led on read
-and mixed workloads.
-
-These numbers are measurements, not universal product rankings. The systems
-used different storage engines, cache budgets, and durability settings; some
-competitor configurations disabled WAL or binlog. Consult the
-[full comparison report](perf_reports/keylane-vs-dragonfly-tiering-2026-08-11.en.md)
-for exact versions, configuration, workload order, fairness constraints, and
-reproduction commands.
+See the [Keylane–Aerospike report](perf_reports/keylane-vs-aerospike-80conn-2k-2026-09-15/README.md)
+for per-round results, versions, commands, raw evidence, and an offline
+verification script.
 
 ### One million QPS on a 16-vCPU server
 

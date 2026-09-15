@@ -1,0 +1,31 @@
+{
+  "label": "read-r3",
+  "operation": "read",
+  "count": 63537260,
+  "hdr_seconds": 300.005,
+  "qps": 211787.3368777187,
+  "mean_us": 377.31810920080596,
+  "percentiles_us": {
+    "50": 374,
+    "95": 475,
+    "99": 538,
+    "99.9": 624,
+    "99.99": 697,
+    "100": 5747
+  },
+  "errors": 0,
+  "misses": 0,
+  "server_count_matches": true,
+  "cpu_client_cores": 4.279279035349411,
+  "process_seconds_max": 300.01346741701127,
+  "connections_configured": 80,
+  "generators": 1,
+  "hdr_windows": [
+    {
+      "start": "203678.641",
+      "end": "203978.646",
+      "count": 63537260
+    }
+  ],
+  "synchronous": true
+}

@@ -1,0 +1,33 @@
+{
+  "time": 1789490239.4120665,
+  "sources": {
+    "keylane": "e1fbccb4adaa01a7ff221775d3b4b66c6e62ce5a",
+    "celer": "0d27a6d586958714451d7d94d0281b7753fd7712"
+  },
+  "keylane_unit_tests_passed": 613,
+  "disabled_unit_tests": 3,
+  "celer_default_checks_passed": 3,
+  "runtime_smoke": {
+    "kernel_only": "2 starts with recovery",
+    "bypass_binary": "kernel, kernel, dpdk, dpdk, kernel with recovery; disposable file and TAP"
+  },
+  "dpdk_workers_tested": 128,
+  "dpdk_over_capacity_rejected": 129,
+  "freebsd_tcp_sequence": "ghost ACK rejected, fast-path 3 GiB ACK stream, valid slow-path request accepted",
+  "physical_nic_binding_changed": false,
+  "spdk_nvme_runtime_rerun": false,
+  "logs_sha256": {
+    "keylane-unit-tests-final.log": "e4d408f4c132ebf84e0166102fe2fac2d4c92ce8b90ea0c6f6ebf3e97cdd340d",
+    "keylane-kernel-runtime-final.log": "2f9cb0f141424d0dea4da4c4b173a36d789a533ee4d79e0a295f1117b7b766cd",
+    "keylane-bypass-runtime-final.log": "f1a9eaafe2ca6538d744451f63480afbb26aa19b9f4cd00c4cd272c32cf5fd16",
+    "celer-default-tests.log": "0f0a97abaa15406d30d0be4c54150ce9f9844ba26418f3fcc53f45806e2154f5",
+    "bypass-selection.log": "d73e84d0c7cbe7a2dabc098c36955e15b1c059eca42b0c5fbdca97059d467a82",
+    "bypass-connection-storage.log": "38075589f810349dd0c33f08a1832a7942de088a6ff546d15883319210ce8a15",
+    "tcp-sequence-check.log": "39f7e5e856a905c3f6323b88ff7a9a9704bc4469b5472bbb21ca8cbc9c86cc3c",
+    "bypass-startup-0.log": "9b7ca12d8f9fdafd1567f59682eca42ba8515c52e8bca7d99a56eb28b9334b28",
+    "bypass-startup-1.log": "6cf005ef043b6c53829801e359451216540da956ec05151cfcafd22a64e2ba0f",
+    "bypass-workers-128.log": "975d3f11df4236b7d66810d0100a21db349003b4bbdadf92058791da5896a6d4",
+    "bypass-workers-129.log": "de6cd0b2e837edac98e352b75c7316d972f650ef2c697ba434836955b099c7ec",
+    "dpdk-stream-loss.log": "79074e3ac79fcf4f5bbed5eb6d71b3a8cc2b14a8ef2d7157da56f6d6261504f6"
+  }
+}
