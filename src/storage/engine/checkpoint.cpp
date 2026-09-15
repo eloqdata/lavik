@@ -1304,19 +1304,20 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const StorageDevice& device = devices_[device_index];
-#ifdef CELER_WITH_SPDK_STORAGE
-    const auto& owners = device_owners_[device_index];
-    const auto owner =
-        std::lower_bound(owners.begin(), owners.end(), store.worker_->id());
-    next_device_offsets[device_index] =
-        owner == owners.end() || *owner != store.worker_->id()
-            ? device.data_block_count_
-            : static_cast<std::uint64_t>(owner - owners.begin());
-#else
-    next_device_offsets[device_index] = (store.worker_->id() + worker_count_ -
-                                         device_linear_begin % worker_count_) %
-                                        worker_count_;
-#endif
+    if (celer::SpdkStorageEnabled()) {
+      const auto& owners = device_owners_[device_index];
+      const auto owner =
+          std::lower_bound(owners.begin(), owners.end(), store.worker_->id());
+      next_device_offsets[device_index] =
+          owner == owners.end() || *owner != store.worker_->id()
+              ? device.data_block_count_
+              : static_cast<std::uint64_t>(owner - owners.begin());
+    } else {
+      next_device_offsets[device_index] =
+          (store.worker_->id() + worker_count_ -
+           device_linear_begin % worker_count_) %
+          worker_count_;
+    }
     device_linear_begin += device.data_block_count_;
   }
 
@@ -1330,11 +1331,11 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
       std::uint64_t& next_device_offset = next_device_offsets[device_index];
       if (next_device_offset >= device.data_block_count_) continue;
       const std::uint64_t device_offset = next_device_offset;
-#ifdef CELER_WITH_SPDK_STORAGE
-      next_device_offset += device_owners_[device_index].size();
-#else
-      next_device_offset += worker_count_;
-#endif
+      if (celer::SpdkStorageEnabled()) {
+        next_device_offset += device_owners_[device_index].size();
+      } else {
+        next_device_offset += worker_count_;
+      }
       scanned_block = true;
       const std::uint32_t local =
           static_cast<std::uint32_t>(device.data_block_begin_ + device_offset);
@@ -1486,18 +1487,18 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
         co_return absl::InternalError(
             "checkpoint body block has an invalid owner");
       }
-#ifdef CELER_WITH_SPDK_STORAGE
-      const auto& device_owners =
-          device_owners_[DeviceIndexForBlock(body.block_id_)];
-      if (!std::binary_search(device_owners.begin(), device_owners.end(),
-                              body.shard_id_)) {
-        // The checkpoint requires the original worker topology. A shard that
-        // cannot open the controller it used at shutdown cannot safely take
-        // over this read merely to avoid a cross-core installation hop.
-        co_return absl::InternalError(
-            "checkpoint owner has no qpair for its body block");
+      if (celer::SpdkStorageEnabled()) {
+        const auto& device_owners =
+            device_owners_[DeviceIndexForBlock(body.block_id_)];
+        if (!std::binary_search(device_owners.begin(), device_owners.end(),
+                                body.shard_id_)) {
+          // The checkpoint requires the original worker topology. A shard that
+          // cannot open the controller it used at shutdown cannot safely take
+          // over this read merely to avoid a cross-core installation hop.
+          co_return absl::InternalError(
+              "checkpoint owner has no qpair for its body block");
+        }
       }
-#endif
       body_blocks_by_owner[body.shard_id_].push_back(body.block_id_);
     }
     for (unsigned shard = 0; shard < worker_count_; ++shard) {

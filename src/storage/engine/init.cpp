@@ -1051,39 +1051,39 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         static_cast<unsigned>(options_.data_files_.size()));
   }
   if (status.ok()) {
-#ifdef CELER_WITH_SPDK_STORAGE
-    store.files_.resize(options_.data_files_.size());
-    for (std::size_t i = 0; i < store.files_.size(); ++i) {
-      store.files_[i] = FixedFile{.index_ = static_cast<std::uint32_t>(i)};
-    }
-    for (std::size_t device_index = 0; device_index < devices_.size();
-         ++device_index) {
-      const StorageDevice& device = devices_[device_index];
-      if (!std::binary_search(device_owners_[device_index].begin(),
-                              device_owners_[device_index].end(),
-                              static_cast<std::uint16_t>(worker.id()))) {
-        continue;
+    if (celer::SpdkStorageEnabled()) {
+      store.files_.resize(options_.data_files_.size());
+      for (std::size_t i = 0; i < store.files_.size(); ++i) {
+        store.files_[i] = FixedFile{.index_ = static_cast<std::uint32_t>(i)};
       }
-      FixedFile file{.index_ = device.file_index_};
-      status = co_await celer::OpenFixedFile(worker, device.path_,
-                                             O_RDWR | O_DIRECT, 0, file);
-      if (!status.ok()) {
-        break;
+      for (std::size_t device_index = 0; device_index < devices_.size();
+           ++device_index) {
+        const StorageDevice& device = devices_[device_index];
+        if (!std::binary_search(device_owners_[device_index].begin(),
+                                device_owners_[device_index].end(),
+                                static_cast<std::uint16_t>(worker.id()))) {
+          continue;
+        }
+        FixedFile file{.index_ = device.file_index_};
+        status = co_await celer::OpenFixedFile(worker, device.path_,
+                                               O_RDWR | O_DIRECT, 0, file);
+        if (!status.ok()) {
+          break;
+        }
+        store.files_[device.file_index_] = file;
       }
-      store.files_[device.file_index_] = file;
-    }
-#else
-    store.files_.reserve(options_.data_files_.size());
-    for (std::size_t i = 0; i < options_.data_files_.size(); ++i) {
-      FixedFile file{.index_ = static_cast<std::uint32_t>(i)};
-      status = co_await celer::OpenFixedFile(worker, options_.data_files_[i],
-                                             O_RDWR | O_DIRECT, 0, file);
-      if (!status.ok()) {
-        break;
+    } else {
+      store.files_.reserve(options_.data_files_.size());
+      for (std::size_t i = 0; i < options_.data_files_.size(); ++i) {
+        FixedFile file{.index_ = static_cast<std::uint32_t>(i)};
+        status = co_await celer::OpenFixedFile(worker, options_.data_files_[i],
+                                               O_RDWR | O_DIRECT, 0, file);
+        if (!status.ok()) {
+          break;
+        }
+        store.files_.push_back(file);
       }
-      store.files_.push_back(file);
     }
-#endif
   }
   if (!status.ok()) {
     Fail(status);
@@ -1935,199 +1935,201 @@ void StorageEngine::Impl::Fail(const absl::Status& status) {
 }
 
 absl::Status StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
-#ifdef CELER_WITH_SPDK_STORAGE
-  struct ControllerPlan {
-    std::string id_;
-    unsigned io_queue_count_ = 0;
-    std::uint64_t weight_ = 0;
-    std::vector<std::size_t> devices_;
-    std::vector<std::uint16_t> workers_;
-  };
+  if (celer::SpdkStorageEnabled()) {
+    struct ControllerPlan {
+      std::string id_;
+      unsigned io_queue_count_ = 0;
+      std::uint64_t weight_ = 0;
+      std::vector<std::size_t> devices_;
+      std::vector<std::uint16_t> workers_;
+    };
 
-  std::map<std::string, ControllerPlan> grouped;
-  for (std::size_t device_index = 0; device_index < devices_.size();
-       ++device_index) {
-    const StorageDevice& device = devices_[device_index];
-    if (device.controller_id_.empty() || device.io_queue_count_ == 0) {
-      return absl::FailedPreconditionError(
-          "SPDK controller did not report an available I/O qpair: " +
-          device.path_);
-    }
-    auto [entry, inserted] = grouped.try_emplace(
-        device.controller_id_,
-        ControllerPlan{.id_ = device.controller_id_,
-                       .io_queue_count_ = device.io_queue_count_,
-                       .weight_ = 0,
-                       .devices_ = {},
-                       .workers_ = {}});
-    ControllerPlan& controller = entry->second;
-    if (!inserted && controller.io_queue_count_ != device.io_queue_count_) {
-      return absl::FailedPreconditionError(
-          "SPDK namespaces on one controller reported inconsistent qpair "
-          "counts: " +
-          device.controller_id_);
-    }
-    controller.devices_.push_back(device_index);
-    controller.weight_ += ForegroundBlocksForDevice(device_index);
-  }
-  if (grouped.empty()) {
-    return absl::FailedPreconditionError("SPDK storage has no controllers");
-  }
-
-  std::vector<ControllerPlan*> controllers;
-  controllers.reserve(grouped.size());
-  for (auto& [_, controller] : grouped) {
-    controllers.push_back(&controller);
-  }
-  std::vector<ControllerAffinityInput> inputs;
-  inputs.reserve(controllers.size());
-  for (const ControllerPlan* controller : controllers) {
-    inputs.push_back(ControllerAffinityInput{
-        .id_ = controller->id_,
-        .foreground_weight_ = controller->weight_,
-        .io_qpair_count_ = controller->io_queue_count_,
-    });
-  }
-  auto planned = PlanControllerAffinity(inputs, worker_count_);
-  if (!planned.ok()) return planned.status();
-
-  device_owners_.assign(devices_.size(), {});
-  auto assign_controller = [this](ControllerPlan& controller, unsigned worker) {
-    controller.workers_.push_back(static_cast<std::uint16_t>(worker));
-    for (const std::size_t device_index : controller.devices_) {
-      stores_[worker]->home_devices_.push_back(device_index);
-      device_owners_[device_index].push_back(
-          static_cast<std::uint16_t>(worker));
-    }
-  };
-
-  for (unsigned worker = 0; worker < worker_count_; ++worker) {
-    for (const std::size_t controller : planned->worker_controllers_[worker]) {
-      assign_controller(*controllers[controller], worker);
-    }
-  }
-
-  for (std::size_t device_index = 0; device_index < devices_.size();
-       ++device_index) {
-    auto& owners = device_owners_[device_index];
-    std::sort(owners.begin(), owners.end());
-    assert(!owners.empty());
-    device_allocators_[device_index]->owner_ =
-        owners[devices_[device_index].id_ % owners.size()];
-  }
-  for (auto& store : stores_) {
-    if (store->home_devices_.empty()) {
-      return absl::InternalError(
-          "SPDK controller assignment left a worker without a qpair");
-    }
-    store->home_device_allocations_.assign(store->home_devices_.size(), 0);
-  }
-  for (const ControllerPlan* controller : controllers) {
-    std::string workers;
-    for (const std::uint16_t worker : controller->workers_) {
-      if (!workers.empty()) workers += ',';
-      workers += std::to_string(worker);
-    }
-    spdlog::info(
-        "SPDK controller={} io-qpairs={} foreground-weight={} owners=[{}]",
-        controller->id_, controller->io_queue_count_, controller->weight_,
-        workers);
-  }
-  return absl::OkStatus();
-#else
-  std::vector<std::size_t> usable_devices;
-  std::uint64_t total_weight = 0;
-  for (std::size_t device_index = 0; device_index < devices_.size();
-       ++device_index) {
-    const std::uint64_t weight = ForegroundBlocksForDevice(device_index);
-    if (weight != 0) {
-      usable_devices.push_back(device_index);
-      total_weight += weight;
-    }
-  }
-  assert(!usable_devices.empty());
-
-  if (worker_count_ >= usable_devices.size()) {
-    std::vector<unsigned> quotas(devices_.size(), 0);
-    for (const std::size_t device_index : usable_devices) {
-      quotas[device_index] = 1;
-    }
-    const unsigned remaining_workers =
-        worker_count_ - static_cast<unsigned>(usable_devices.size());
-    std::vector<std::pair<std::uint64_t, std::size_t>> remainders;
-    remainders.reserve(usable_devices.size());
-    unsigned assigned_workers = static_cast<unsigned>(usable_devices.size());
-    for (const std::size_t device_index : usable_devices) {
-      const std::uint64_t weighted =
-          remaining_workers * ForegroundBlocksForDevice(device_index);
-      quotas[device_index] += static_cast<unsigned>(weighted / total_weight);
-      assigned_workers += static_cast<unsigned>(weighted / total_weight);
-      remainders.emplace_back(weighted % total_weight, device_index);
-    }
-    std::sort(remainders.begin(), remainders.end(),
-              [](const auto& left, const auto& right) {
-                if (left.first != right.first) {
-                  return left.first > right.first;
-                }
-                return left.second < right.second;
-              });
-    for (unsigned i = assigned_workers; i < worker_count_; ++i) {
-      ++quotas[remainders[i - assigned_workers].second];
-    }
-
-    std::vector<unsigned> quota_remaining = quotas;
-    std::vector<std::int64_t> smooth_current(devices_.size(), 0);
-    for (unsigned worker = 0; worker < worker_count_; ++worker) {
-      std::size_t selected = usable_devices.front();
-      bool selected_valid = false;
-      for (const std::size_t device_index : usable_devices) {
-        smooth_current[device_index] += quotas[device_index];
-        if (quota_remaining[device_index] != 0 &&
-            (!selected_valid ||
-             smooth_current[device_index] > smooth_current[selected])) {
-          selected = device_index;
-          selected_valid = true;
-        }
+    std::map<std::string, ControllerPlan> grouped;
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      const StorageDevice& device = devices_[device_index];
+      if (device.controller_id_.empty() || device.io_queue_count_ == 0) {
+        return absl::FailedPreconditionError(
+            "SPDK controller did not report an available I/O qpair: " +
+            device.path_);
       }
-      assert(selected_valid);
-      smooth_current[selected] -= worker_count_;
-      --quota_remaining[selected];
-      stores_[worker]->home_devices_.push_back(selected);
+      auto [entry, inserted] = grouped.try_emplace(
+          device.controller_id_,
+          ControllerPlan{.id_ = device.controller_id_,
+                         .io_queue_count_ = device.io_queue_count_,
+                         .weight_ = 0,
+                         .devices_ = {},
+                         .workers_ = {}});
+      ControllerPlan& controller = entry->second;
+      if (!inserted && controller.io_queue_count_ != device.io_queue_count_) {
+        return absl::FailedPreconditionError(
+            "SPDK namespaces on one controller reported inconsistent qpair "
+            "counts: " +
+            device.controller_id_);
+      }
+      controller.devices_.push_back(device_index);
+      controller.weight_ += ForegroundBlocksForDevice(device_index);
     }
-  } else {
-    std::sort(usable_devices.begin(), usable_devices.end(),
-              [this](std::size_t left, std::size_t right) {
-                return ForegroundBlocksForDevice(left) >
-                       ForegroundBlocksForDevice(right);
-              });
-    std::vector<std::uint64_t> worker_weights(worker_count_, 0);
-    for (const std::size_t device_index : usable_devices) {
-      const auto lightest =
-          std::min_element(worker_weights.begin(), worker_weights.end());
-      const unsigned worker =
-          static_cast<unsigned>(lightest - worker_weights.begin());
-      stores_[worker]->home_devices_.push_back(device_index);
-      *lightest += ForegroundBlocksForDevice(device_index);
+    if (grouped.empty()) {
+      return absl::FailedPreconditionError("SPDK storage has no controllers");
     }
-  }
 
-  std::vector<unsigned> home_workers(devices_.size(), 0);
-  for (auto& store : stores_) {
-    assert(!store->home_devices_.empty());
-    store->home_device_allocations_.assign(store->home_devices_.size(), 0);
-    for (const std::size_t device_index : store->home_devices_) {
-      ++home_workers[device_index];
+    std::vector<ControllerPlan*> controllers;
+    controllers.reserve(grouped.size());
+    for (auto& [_, controller] : grouped) {
+      controllers.push_back(&controller);
     }
+    std::vector<ControllerAffinityInput> inputs;
+    inputs.reserve(controllers.size());
+    for (const ControllerPlan* controller : controllers) {
+      inputs.push_back(ControllerAffinityInput{
+          .id_ = controller->id_,
+          .foreground_weight_ = controller->weight_,
+          .io_qpair_count_ = controller->io_queue_count_,
+      });
+    }
+    auto planned = PlanControllerAffinity(inputs, worker_count_);
+    if (!planned.ok()) return planned.status();
+
+    device_owners_.assign(devices_.size(), {});
+    auto assign_controller = [this](ControllerPlan& controller,
+                                    unsigned worker) {
+      controller.workers_.push_back(static_cast<std::uint16_t>(worker));
+      for (const std::size_t device_index : controller.devices_) {
+        stores_[worker]->home_devices_.push_back(device_index);
+        device_owners_[device_index].push_back(
+            static_cast<std::uint16_t>(worker));
+      }
+    };
+
+    for (unsigned worker = 0; worker < worker_count_; ++worker) {
+      for (const std::size_t controller :
+           planned->worker_controllers_[worker]) {
+        assign_controller(*controllers[controller], worker);
+      }
+    }
+
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      auto& owners = device_owners_[device_index];
+      std::sort(owners.begin(), owners.end());
+      assert(!owners.empty());
+      device_allocators_[device_index]->owner_ =
+          owners[devices_[device_index].id_ % owners.size()];
+    }
+    for (auto& store : stores_) {
+      if (store->home_devices_.empty()) {
+        return absl::InternalError(
+            "SPDK controller assignment left a worker without a qpair");
+      }
+      store->home_device_allocations_.assign(store->home_devices_.size(), 0);
+    }
+    for (const ControllerPlan* controller : controllers) {
+      std::string workers;
+      for (const std::uint16_t worker : controller->workers_) {
+        if (!workers.empty()) workers += ',';
+        workers += std::to_string(worker);
+      }
+      spdlog::info(
+          "SPDK controller={} io-qpairs={} foreground-weight={} owners=[{}]",
+          controller->id_, controller->io_queue_count_, controller->weight_,
+          workers);
+    }
+    return absl::OkStatus();
+  } else {
+    std::vector<std::size_t> usable_devices;
+    std::uint64_t total_weight = 0;
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      const std::uint64_t weight = ForegroundBlocksForDevice(device_index);
+      if (weight != 0) {
+        usable_devices.push_back(device_index);
+        total_weight += weight;
+      }
+    }
+    assert(!usable_devices.empty());
+
+    if (worker_count_ >= usable_devices.size()) {
+      std::vector<unsigned> quotas(devices_.size(), 0);
+      for (const std::size_t device_index : usable_devices) {
+        quotas[device_index] = 1;
+      }
+      const unsigned remaining_workers =
+          worker_count_ - static_cast<unsigned>(usable_devices.size());
+      std::vector<std::pair<std::uint64_t, std::size_t>> remainders;
+      remainders.reserve(usable_devices.size());
+      unsigned assigned_workers = static_cast<unsigned>(usable_devices.size());
+      for (const std::size_t device_index : usable_devices) {
+        const std::uint64_t weighted =
+            remaining_workers * ForegroundBlocksForDevice(device_index);
+        quotas[device_index] += static_cast<unsigned>(weighted / total_weight);
+        assigned_workers += static_cast<unsigned>(weighted / total_weight);
+        remainders.emplace_back(weighted % total_weight, device_index);
+      }
+      std::sort(remainders.begin(), remainders.end(),
+                [](const auto& left, const auto& right) {
+                  if (left.first != right.first) {
+                    return left.first > right.first;
+                  }
+                  return left.second < right.second;
+                });
+      for (unsigned i = assigned_workers; i < worker_count_; ++i) {
+        ++quotas[remainders[i - assigned_workers].second];
+      }
+
+      std::vector<unsigned> quota_remaining = quotas;
+      std::vector<std::int64_t> smooth_current(devices_.size(), 0);
+      for (unsigned worker = 0; worker < worker_count_; ++worker) {
+        std::size_t selected = usable_devices.front();
+        bool selected_valid = false;
+        for (const std::size_t device_index : usable_devices) {
+          smooth_current[device_index] += quotas[device_index];
+          if (quota_remaining[device_index] != 0 &&
+              (!selected_valid ||
+               smooth_current[device_index] > smooth_current[selected])) {
+            selected = device_index;
+            selected_valid = true;
+          }
+        }
+        assert(selected_valid);
+        smooth_current[selected] -= worker_count_;
+        --quota_remaining[selected];
+        stores_[worker]->home_devices_.push_back(selected);
+      }
+    } else {
+      std::sort(usable_devices.begin(), usable_devices.end(),
+                [this](std::size_t left, std::size_t right) {
+                  return ForegroundBlocksForDevice(left) >
+                         ForegroundBlocksForDevice(right);
+                });
+      std::vector<std::uint64_t> worker_weights(worker_count_, 0);
+      for (const std::size_t device_index : usable_devices) {
+        const auto lightest =
+            std::min_element(worker_weights.begin(), worker_weights.end());
+        const unsigned worker =
+            static_cast<unsigned>(lightest - worker_weights.begin());
+        stores_[worker]->home_devices_.push_back(device_index);
+        *lightest += ForegroundBlocksForDevice(device_index);
+      }
+    }
+
+    std::vector<unsigned> home_workers(devices_.size(), 0);
+    for (auto& store : stores_) {
+      assert(!store->home_devices_.empty());
+      store->home_device_allocations_.assign(store->home_devices_.size(), 0);
+      for (const std::size_t device_index : store->home_devices_) {
+        ++home_workers[device_index];
+      }
+    }
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      spdlog::info("storage device id={} foreground-weight={} home-workers={}",
+                   devices_[device_index].id_,
+                   ForegroundBlocksForDevice(device_index),
+                   home_workers[device_index]);
+    }
+    return absl::OkStatus();
   }
-  for (std::size_t device_index = 0; device_index < devices_.size();
-       ++device_index) {
-    spdlog::info("storage device id={} foreground-weight={} home-workers={}",
-                 devices_[device_index].id_,
-                 ForegroundBlocksForDevice(device_index),
-                 home_workers[device_index]);
-  }
-  return absl::OkStatus();
-#endif
 }
 
 Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(

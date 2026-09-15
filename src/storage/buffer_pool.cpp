@@ -297,42 +297,42 @@ absl::Status RegisteredBufferPool::Init(
   absl::Status status = worker.RegisterBuffers(iovecs);
   bool buffers_registered = status.ok();
   if (!status.ok()) {
-#ifdef CELER_WITH_SPDK_STORAGE
-    // SPDK registration is a DMA-addressability check; memory that fails it
-    // cannot be handed to the device at all, so plain IO would fail the same
-    // way. Fail fast instead of degrading.
-    celer::FreeStorageBuffer(sentinel, options.alignment_);
-    for (const celer::FixedBuffer& buffer : write_buffers) {
-      celer::FreeStorageBuffer(buffer.data_, options.alignment_);
-    }
-    for (const celer::FixedBuffer& buffer : read_buffers) {
-      celer::FreeStorageBuffer(buffer.data_, options.alignment_);
-    }
-    return status;
-#else
-    // The buffers themselves are fine; only the fixed-IO fast path is lost.
-    // Keep the pool and submit plain (non-fixed) reads and writes instead.
-    rlimit memlock{};
-    if (::getrlimit(RLIMIT_MEMLOCK, &memlock) == 0) {
-      spdlog::warn(
-          "worker {}: io_uring buffer registration failed ({}); requested "
-          "registered bytes={} RLIMIT_MEMLOCK soft={} hard={}; falling back "
-          "to the same reusable buffers with unregistered IO",
-          worker.id(), status.message(), options.registered_bytes_,
-          memlock.rlim_cur == RLIM_INFINITY
-              ? std::numeric_limits<std::uint64_t>::max()
-              : static_cast<std::uint64_t>(memlock.rlim_cur),
-          memlock.rlim_max == RLIM_INFINITY
-              ? std::numeric_limits<std::uint64_t>::max()
-              : static_cast<std::uint64_t>(memlock.rlim_max));
+    if (celer::SpdkStorageEnabled()) {
+      // SPDK registration is a DMA-addressability check; memory that fails it
+      // cannot be handed to the device at all, so plain IO would fail the same
+      // way. Fail fast instead of degrading.
+      celer::FreeStorageBuffer(sentinel, options.alignment_);
+      for (const celer::FixedBuffer& buffer : write_buffers) {
+        celer::FreeStorageBuffer(buffer.data_, options.alignment_);
+      }
+      for (const celer::FixedBuffer& buffer : read_buffers) {
+        celer::FreeStorageBuffer(buffer.data_, options.alignment_);
+      }
+      return status;
     } else {
-      spdlog::warn(
-          "worker {}: io_uring buffer registration failed ({}); requested "
-          "registered bytes={}; falling back to the same reusable buffers "
-          "with unregistered IO",
-          worker.id(), status.message(), options.registered_bytes_);
+      // The buffers themselves are fine; only the fixed-IO fast path is lost.
+      // Keep the pool and submit plain (non-fixed) reads and writes instead.
+      rlimit memlock{};
+      if (::getrlimit(RLIMIT_MEMLOCK, &memlock) == 0) {
+        spdlog::warn(
+            "worker {}: io_uring buffer registration failed ({}); requested "
+            "registered bytes={} RLIMIT_MEMLOCK soft={} hard={}; falling back "
+            "to the same reusable buffers with unregistered IO",
+            worker.id(), status.message(), options.registered_bytes_,
+            memlock.rlim_cur == RLIM_INFINITY
+                ? std::numeric_limits<std::uint64_t>::max()
+                : static_cast<std::uint64_t>(memlock.rlim_cur),
+            memlock.rlim_max == RLIM_INFINITY
+                ? std::numeric_limits<std::uint64_t>::max()
+                : static_cast<std::uint64_t>(memlock.rlim_max));
+      } else {
+        spdlog::warn(
+            "worker {}: io_uring buffer registration failed ({}); requested "
+            "registered bytes={}; falling back to the same reusable buffers "
+            "with unregistered IO",
+            worker.id(), status.message(), options.registered_bytes_);
+      }
     }
-#endif
   }
 
   worker_ = &worker;

@@ -36,6 +36,12 @@ instead consume admitted pages.
 
 ## Ownership and runtime state
 
+The startup storage selection controls buffer allocation, I/O submission and
+device eligibility together. It is fixed before preparation and cannot change
+while buffers or workers exist. An executable with SPDK support can also use
+io_uring storage; kernel paths require io_uring and `spdk://` paths require SPDK.
+The selection does not alter the durable format.
+
 Storage separates three ownership domains:
 
 - A logical partition is one of the 16,384 Redis hash slots. Its current key

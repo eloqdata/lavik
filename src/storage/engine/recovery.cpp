@@ -21,25 +21,25 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
     auto destination = std::span<std::byte>(
         reinterpret_cast<std::byte*>(key.data() + offset), key.size() - offset);
     absl::Status read;
-#ifdef CELER_WITH_SPDK_STORAGE
-    const auto& owners = device_owners_[DeviceIndexForBlock(ref.block_id_)];
-    const unsigned owner = owners[ref.block_id_ % owners.size()];
-    if (owner == store.worker_->id()) {
+    if (celer::SpdkStorageEnabled()) {
+      const auto& owners = device_owners_[DeviceIndexForBlock(ref.block_id_)];
+      const unsigned owner = owners[ref.block_id_ % owners.size()];
+      if (owner == store.worker_->id()) {
+        read = co_await ReadRecoveryExtentInto(
+            store, ref, static_cast<std::uint32_t>(index), destination);
+      } else {
+        read = co_await celer::SubmitTaskTo(
+            owner,
+            [this, owner, ref, index, destination]() -> Task<absl::Status> {
+              co_return co_await ReadRecoveryExtentInto(
+                  *stores_[owner], ref, static_cast<std::uint32_t>(index),
+                  destination);
+            });
+      }
+    } else {
       read = co_await ReadRecoveryExtentInto(
           store, ref, static_cast<std::uint32_t>(index), destination);
-    } else {
-      read = co_await celer::SubmitTaskTo(
-          owner,
-          [this, owner, ref, index, destination]() -> Task<absl::Status> {
-            co_return co_await ReadRecoveryExtentInto(
-                *stores_[owner], ref, static_cast<std::uint32_t>(index),
-                destination);
-          });
     }
-#else
-    read = co_await ReadRecoveryExtentInto(
-        store, ref, static_cast<std::uint32_t>(index), destination);
-#endif
     if (!read.ok()) co_return read;
     offset += std::min<std::size_t>(ref.payload_bytes_, destination.size());
   }
@@ -133,30 +133,30 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadRecoveryPayloadSlice(
     const auto destination = std::span<std::byte>(
         reinterpret_cast<std::byte*>(result.data() + copied), count);
     absl::Status read;
-#ifdef CELER_WITH_SPDK_STORAGE
-    // Scan-time extent owners may not be published yet. Use an eligible
-    // device reader, exactly as external-key recovery does.
-    const auto& owners = device_owners_[DeviceIndexForBlock(ref.block_id_)];
-    const unsigned owner = owners[ref.block_id_ % owners.size()];
-    if (owner != store.worker_->id()) {
-      read = co_await celer::SubmitTaskTo(
-          owner,
-          [this, owner, ref, index, destination, slice_offset,
-           ordered]() -> Task<absl::Status> {
-            co_return co_await ReadRecoveryExtentInto(
-                *stores_[owner], ref, static_cast<std::uint32_t>(index),
-                destination, slice_offset, ordered);
-          });
+    if (celer::SpdkStorageEnabled()) {
+      // Scan-time extent owners may not be published yet. Use an eligible
+      // device reader, exactly as external-key recovery does.
+      const auto& owners = device_owners_[DeviceIndexForBlock(ref.block_id_)];
+      const unsigned owner = owners[ref.block_id_ % owners.size()];
+      if (owner != store.worker_->id()) {
+        read = co_await celer::SubmitTaskTo(
+            owner,
+            [this, owner, ref, index, destination, slice_offset,
+             ordered]() -> Task<absl::Status> {
+              co_return co_await ReadRecoveryExtentInto(
+                  *stores_[owner], ref, static_cast<std::uint32_t>(index),
+                  destination, slice_offset, ordered);
+            });
+      } else {
+        read = co_await ReadRecoveryExtentInto(
+            store, ref, static_cast<std::uint32_t>(index), destination,
+            slice_offset, ordered);
+      }
     } else {
       read = co_await ReadRecoveryExtentInto(
           store, ref, static_cast<std::uint32_t>(index), destination,
           slice_offset, ordered);
     }
-#else
-    read = co_await ReadRecoveryExtentInto(store, ref,
-                                           static_cast<std::uint32_t>(index),
-                                           destination, slice_offset, ordered);
-#endif
     if (!read.ok()) co_return read;
     copied += count;
   }
@@ -168,30 +168,23 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadRecoveryPayloadSlice(
 
 std::uint16_t StorageEngine::Impl::RecoveredBlockOwner(
     const BlockHeader& block, std::uint64_t block_id) const noexcept {
-#ifdef CELER_WITH_SPDK_STORAGE
-  const auto& owners = device_owners_[DeviceIndexForBlock(block_id)];
-  if (block.layout_worker_count_ == worker_count_ &&
-      std::binary_search(owners.begin(), owners.end(), block.writer_id_)) {
-    return static_cast<std::uint16_t>(block.writer_id_);
-  }
-#else
-  // writer_id belongs to the topology that wrote the block and may be
-  // greater than the current worker count after a scale-down.
-  if (block.layout_worker_count_ == worker_count_ &&
-      block.writer_id_ < worker_count_) {
-    return static_cast<std::uint16_t>(block.writer_id_);
-  }
-#endif
   std::uint64_t mixed =
       block_id ^ (block.allocation_epoch_ + 0x9e3779b97f4a7c15ULL);
   mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
   mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
   mixed ^= mixed >> 31;
-#ifdef CELER_WITH_SPDK_STORAGE
-  return owners[mixed % owners.size()];
-#else
+  if (celer::SpdkStorageEnabled()) {
+    const auto& owners = device_owners_[DeviceIndexForBlock(block_id)];
+    if (block.layout_worker_count_ == worker_count_ &&
+        std::binary_search(owners.begin(), owners.end(), block.writer_id_))
+      return static_cast<std::uint16_t>(block.writer_id_);
+    return owners[mixed % owners.size()];
+  }
+  // A durable writer ID may exceed the current topology after a scale-down.
+  if (block.layout_worker_count_ == worker_count_ &&
+      block.writer_id_ < worker_count_)
+    return static_cast<std::uint16_t>(block.writer_id_);
   return static_cast<std::uint16_t>(mixed % worker_count_);
-#endif
 }
 
 void StorageEngine::Impl::ReportRecoveryProgress(std::uint64_t records,
@@ -341,19 +334,20 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const StorageDevice& device = devices_[device_index];
-#ifdef CELER_WITH_SPDK_STORAGE
-    const auto& owners = device_owners_[device_index];
-    const auto owner =
-        std::lower_bound(owners.begin(), owners.end(), store.worker_->id());
-    next_device_offsets[device_index] =
-        owner == owners.end() || *owner != store.worker_->id()
-            ? device.data_block_count_
-            : static_cast<std::uint64_t>(owner - owners.begin());
-#else
-    next_device_offsets[device_index] = (store.worker_->id() + worker_count_ -
-                                         device_linear_begin % worker_count_) %
-                                        worker_count_;
-#endif
+    if (celer::SpdkStorageEnabled()) {
+      const auto& owners = device_owners_[device_index];
+      const auto owner =
+          std::lower_bound(owners.begin(), owners.end(), store.worker_->id());
+      next_device_offsets[device_index] =
+          owner == owners.end() || *owner != store.worker_->id()
+              ? device.data_block_count_
+              : static_cast<std::uint64_t>(owner - owners.begin());
+    } else {
+      next_device_offsets[device_index] =
+          (store.worker_->id() + worker_count_ -
+           device_linear_begin % worker_count_) %
+          worker_count_;
+    }
     device_linear_begin += device.data_block_count_;
   }
   while (true) {
@@ -366,11 +360,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         continue;
       }
       const std::uint64_t device_offset = next_device_offset;
-#ifdef CELER_WITH_SPDK_STORAGE
-      next_device_offset += device_owners_[device_index].size();
-#else
-      next_device_offset += worker_count_;
-#endif
+      if (celer::SpdkStorageEnabled()) {
+        next_device_offset += device_owners_[device_index].size();
+      } else {
+        next_device_offset += worker_count_;
+      }
       scanned_block = true;
       const std::uint32_t local_block =
           static_cast<std::uint32_t>(device.data_block_begin_ + device_offset);

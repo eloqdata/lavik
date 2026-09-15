@@ -72,6 +72,14 @@ int main(int argc, char** argv) {
 
   app.add_option("config", config_file,
                  "Redis-style configuration file (must be the first argument)");
+  app.add_option("--network", options.network_backend_,
+                 "Network backend: kernel or dpdk")
+      ->check(CLI::IsMember({"kernel", "dpdk"}))
+      ->capture_default_str();
+  app.add_option("--storage", options.storage_backend_,
+                 "Storage backend: uring or spdk")
+      ->check(CLI::IsMember({"uring", "spdk"}))
+      ->capture_default_str();
   app.add_option("-b,--bind", options.bind_addresses_,
                  "Bind address or hostname; repeat for multiple addresses")
       ->capture_default_str();

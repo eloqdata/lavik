@@ -8,6 +8,12 @@ Optimized local builds use the current machine's instruction set by default:
 ./scripts/build_release.sh
 ```
 
+`KEYLANE_KERNEL_BYPASS` defaults to `OFF`: Keylane and `keylane-meta` build
+with kernel networking and io_uring and do not configure or link DPDK, SPDK or
+the private FreeBSD stack. Set `-DKEYLANE_KERNEL_BYPASS=ON` to include both
+bypass capabilities. Keylane drives Celer's internal capability flags from
+this single option, including when reconfiguring an existing build directory.
+
 This configures `KEYLANE_MARCH=native`, including Celer, mimalloc, and the
 Abseil CRC translation units used by the durable storage format. The latter is
 important because Abseil compiles its hardware CRC engine only when the target
@@ -31,7 +37,8 @@ compilation and linking for the non-Debug server and every bundled runtime
 library that feeds it, including Celer and the C libraries. Test-only
 executables omit IPO because their deliberately oversized coroutine stress
 cases can trigger GCC compiler failures; they still link against the optimized
-production libraries. Debug builds also omit IPO to keep iteration time
+production libraries. Clang test links enable its LLVM bitcode reader without
+compiling the test sources with IPO. Debug builds also omit IPO to keep iteration time
 predictable. LTO is not required for functional correctness.
 
 When `KEYLANE_BUILD_META=ON`, the source build also provides `keylane-meta`
@@ -61,7 +68,7 @@ git -C celer/third_party/spdk submodule update --init isa-l isa-l-crypto
 cmake -S . -B build-dpdk-net -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo -DKEYLANE_ENABLE_OPT=OFF \
   -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
-  -DCELER_WITH_DPDK=ON -DBUILD_TESTING=OFF
+  -DKEYLANE_KERNEL_BYPASS=ON -DBUILD_TESTING=OFF
 cmake --build build-dpdk-net --target keylane -j4
 ```
 
@@ -69,10 +76,54 @@ CMake invokes the BSD build helper automatically; Python 3 remains a build
 dependency. See Celer's [prototype runbook](../../celer/docs/dpdk-prototype.md)
 for prerequisites, TAP setup, physical-device selection, poll/adaptive mode,
 and queue configuration. The default device is a virtual TAP. Ordinary data
-files still use io_uring; `KEYLANE_WITH_SPDK=ON` independently enables NVMe
-storage. Use a fresh disposable file and disable the metrics listener with
+files use `--storage=uring`; the bypass build also supports
+`--storage=spdk` and `spdk://` NVMe paths. Select `--network=dpdk` explicitly;
+compiling support alone leaves the default kernel network active. Use a fresh
+disposable file and disable the metrics listener with
 `--metrics-port=0` for the initial standalone SET/GET run. TLS, replication,
 and cluster use are outside this prototype's validation scope.
+
+The default DPDK build supports up to 128 network workers. Set
+`-DCELER_DPDK_MAX_WORKERS=N` to change this capacity (1–1023); Celer builds a
+matching FreeBSD stack and DPDK with `N+1` lcore registration slots, and links
+SPDK against that same DPDK. An external `CELER_DPDK_PREFIX` must have enough
+slots or configuration fails. This is a build capacity, not the active thread
+count; `--threads` chooses that at startup. RSS still requires a queue pair per
+worker; hash steering can use fewer queues. See Celer's
+[worker capacity guide](../../celer/docs/dpdk-prototype.md#worker-capacity).
+
+### Runtime backend selection
+
+Build with `-DKEYLANE_KERNEL_BYPASS=ON` to include all four
+combinations in one executable. Startup defaults are `--network=kernel
+--storage=uring`, independent of build capabilities.
+
+| Network | Storage | Flags |
+|---|---|---|
+| Kernel TCP | Kernel file/block I/O | `--network=kernel --storage=uring` |
+| Kernel TCP | SPDK NVMe | `--network=kernel --storage=spdk` |
+| DPDK/FreeBSD TCP | Kernel file/block I/O | `--network=dpdk --storage=uring` |
+| DPDK/FreeBSD TCP | SPDK NVMe | `--network=dpdk --storage=spdk` |
+
+SPDK selection requires every `--data-file` to use `spdk://`; io_uring requires
+kernel paths. Unsupported compiled capabilities and mismatched paths fail
+before device initialization. Existing SPDK launch commands must now include
+`--storage=spdk`, and existing DPDK network commands must include
+`--network=dpdk`. Backend selection is not a live `CONFIG SET` option.
+
+Device binding remains an operator step. Supply the complete selected NIC and
+NVMe allowlist in `CELER_EAL_ARGS` before launch; either accelerator can be the
+first EAL user. With neither selected, EAL and its device discovery are inactive.
+Changing modes requires a clean process stop and appropriate device binding.
+The private TCP stack still has the prototype compatibility limits above.
+
+The disposable-file regression covers kernel networking and recovery:
+
+```bash
+python3 tests/runtime_backends_smoke.py build-dpdk-net/keylane
+# Optional TAP test, without physical NIC rebinding:
+sudo python3 tests/runtime_backends_smoke.py build-dpdk-net/keylane --dpdk
+```
 
 ### AddressSanitizer builds
 

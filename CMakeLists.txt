@@ -35,7 +35,9 @@ set(KEYLANE_MARCH "native" CACHE STRING
 option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" OFF)
 option(KEYLANE_ENABLE_SET_LATENCY_TRACE "Enable detailed SET latency tracing" OFF)
 option(KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT "Count cross-core SubmitTaskTo transfers (test builds only)" OFF)
-option(KEYLANE_WITH_SPDK "Use the SPDK userspace NVMe storage backend" OFF)
+option(KEYLANE_KERNEL_BYPASS
+  "Include DPDK networking and SPDK storage (selected independently at startup)"
+  OFF)
 option(KEYLANE_BUILD_FAULT_SERVER
   "Build the non-packageable server variant used by deterministic fault tests"
   OFF)
@@ -132,7 +134,10 @@ else()
 endif()
 
 set(CELER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(CELER_WITH_SPDK_STORAGE ${KEYLANE_WITH_SPDK} CACHE BOOL "" FORCE)
+# Keylane exposes one opt-in dependency boundary. Force both Celer capabilities
+# from it so turning bypass off in an existing build also removes those deps.
+set(CELER_WITH_DPDK ${KEYLANE_KERNEL_BYPASS} CACHE BOOL "" FORCE)
+set(CELER_WITH_SPDK_STORAGE ${KEYLANE_KERNEL_BYPASS} CACHE BOOL "" FORCE)
 # This must be set before Celer's first find_package(OpenSSL). Static release
 # artifacts can then run without libssl.so or libcrypto.so on the target.
 set(OPENSSL_USE_STATIC_LIBS ${KEYLANE_STATIC_OPENSSL} CACHE BOOL
@@ -484,6 +489,7 @@ target_precompile_headers(keylane_module PRIVATE
 
 target_compile_features(keylane_module PUBLIC cxx_std_23)
 target_compile_definitions(keylane_module PUBLIC
+  $<$<BOOL:${KEYLANE_KERNEL_BYPASS}>:KEYLANE_KERNEL_BYPASS=1>
   KEYLANE_ASAN_BUILD=$<BOOL:${KEYLANE_ASAN_BUILD}>
   KEYLANE_ENABLE_READ_LATENCY_TRACE=$<BOOL:${KEYLANE_ENABLE_READ_LATENCY_TRACE}>
   KEYLANE_ENABLE_SET_LATENCY_TRACE=$<BOOL:${KEYLANE_ENABLE_SET_LATENCY_TRACE}>
@@ -689,8 +695,20 @@ if (BUILD_TESTING)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO FALSE)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL FALSE)
 
+  if (KEYLANE_ENABLE_OPT AND KEYLANE_IPO_SUPPORTED AND
+      CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Test sources stay ordinary objects, but their production dependencies
+    # contain LLVM bitcode. Enable the linker plugin when consuming those
+    # archives; otherwise Clang with GNU ld cannot read the production graph.
+    add_link_options("$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-flto=thin>")
+  endif()
+
   include(FetchContent)
 
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME keylane_runtime_backends
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_backends_smoke.py $<TARGET_FILE:keylane>)
+  set_tests_properties(keylane_runtime_backends PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
   add_test(NAME keylane_version COMMAND keylane --version)
   set_tests_properties(keylane_version PROPERTIES
     PASS_REGULAR_EXPRESSION "keylane ${KEYLANE_VERSION}")

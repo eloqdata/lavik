@@ -3747,10 +3747,8 @@ class StorageEngine::Impl {
   unsigned worker_count_ = 0;
   std::uint64_t total_data_blocks_ = 0;
   std::vector<StorageDevice> devices_;
-#ifdef CELER_WITH_SPDK_STORAGE
-  // Workers that own a qpair for each device's physical controller.
+  // Populated only for SPDK: workers owning a qpair for each controller.
   std::vector<std::vector<std::uint16_t>> device_owners_;
-#endif
   // Which worker owns each block, by device and local block id. A record
   // carries its block's owner in its index entry, but an extent reference has
   // no such field, so this is how a worker holding a manifest finds the worker

@@ -14,7 +14,14 @@ of networked services. Redis serving, metrics, replication, transaction
 coordination, the cluster data plane, and storage are composed in `RunServer`;
 Celer owns the worker and socket lifecycle underneath those Keylane modules.
 
-Linux TCP/io_uring is the default transport. The optional DPDK build serves
+Network and storage backends are independently selected at startup and remain
+fixed for the process lifetime, including storage preparation before workers
+start. The default build includes only Linux TCP and io_uring. The opt-in
+`KEYLANE_KERNEL_BYPASS` build includes DPDK and SPDK together; it does not
+activate them. Startup defaults remain Linux TCP and io_uring, including for
+the Meta control plane. Each worker owns one io_uring shared by kernel
+network/storage I/O, timers and wakeups; the DPDK adapter borrows that ring.
+The optional DPDK network backend serves
 plaintext IPv4 TCP through Celer's private FreeBSD stack while preserving the
 same RESP stream interface and worker ownership. Software packet forwarding
 allows connection owners to outnumber hardware queue pairs. File I/O and

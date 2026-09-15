@@ -610,6 +610,21 @@ absl::Status ApplyRedisConfigDirective(
 }
 
 absl::Status ValidateServerOptions(const ServerOptions& options) {
+  if (options.network_backend_ != "kernel" &&
+      options.network_backend_ != "dpdk")
+    return absl::InvalidArgumentError("network must be kernel or dpdk");
+  if (options.storage_backend_ != "uring" && options.storage_backend_ != "spdk")
+    return absl::InvalidArgumentError("storage must be uring or spdk");
+#ifndef KEYLANE_KERNEL_BYPASS
+  if (options.network_backend_ == "dpdk" || options.storage_backend_ == "spdk")
+    return absl::InvalidArgumentError(
+        "DPDK/SPDK support requires a build with KEYLANE_KERNEL_BYPASS=ON");
+#endif
+  for (const auto& path : options.data_files_) {
+    if (path.starts_with("spdk://") != (options.storage_backend_ == "spdk"))
+      return absl::InvalidArgumentError(
+          "data-file path does not match selected storage backend");
+  }
   const absl::Status logging = ValidateLoggingOptions(options.logging_);
   if (!logging.ok()) return logging;
   if (options.bind_addresses_.empty()) {
@@ -809,7 +824,7 @@ absl::Status RewriteRedisConfigFile(const std::string& path,
   static std::mutex rewrite_mutex;
   const std::lock_guard lock(rewrite_mutex);
 
-  struct stat metadata {};
+  struct stat metadata{};
   if (::stat(path.c_str(), &metadata) != 0) {
     return absl::NotFoundError(absl::StrCat("cannot stat configuration file '",
                                             path, "': ", std::strerror(errno)));

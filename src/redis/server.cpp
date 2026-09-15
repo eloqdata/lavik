@@ -2150,6 +2150,17 @@ int RunServer(ServerOptions options) {
     spdlog::error("configuration error: {}", validated.message());
     return 1;
   }
+  const auto backends = celer::ConfigureIoBackends(
+      {.dpdk_network = options.network_backend_ == "dpdk",
+       .spdk_storage = options.storage_backend_ == "spdk"});
+  if (!backends.ok()) {
+    spdlog::error("I/O backend configuration failed: {}", backends.message());
+    return 1;
+  }
+  // Freeze before metadata probes or DMA buffers, which can precede workers.
+  celer::FreezeIoBackends();
+  spdlog::info("I/O backends: network={} storage={} rings=one-per-worker",
+               options.network_backend_, options.storage_backend_);
   // Cluster mode delegates population lifecycle to Meta/NodeControl and
   // disables standalone replication control and export.
   options.replication_options_.cluster_enabled_ = options.cluster_enabled_;

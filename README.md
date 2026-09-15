@@ -118,19 +118,18 @@ sudo apt-get install -y build-essential cmake git libssl-dev
 ### Build from source
 
 ```bash
-git clone --recursive https://github.com/thweetkomputer/keylane.git
+git clone https://github.com/thweetkomputer/keylane.git
 cd keylane
+git submodule update --init celer third_party/mimalloc third_party/nuraft
+git -C third_party/nuraft submodule update --init asio
+git -C celer submodule update --init third_party/liburing third_party/abseil
 
 ./scripts/build_release.sh
 sudo install -m 0755 build/keylane /usr/local/bin/keylane
 ```
 
-If the repository was cloned without submodules, initialize them before
-building:
-
-```bash
-git submodule update --init --recursive
-```
+These commands initialize the default build's dependencies. DPDK/SPDK
+dependencies are only needed for the optional kernel bypass build below.
 
 The local release build uses `-march=native`. To create a portable archive for
 the current architecture instead, run:
@@ -143,21 +142,26 @@ The archive is written under `dist/` using an `x86-64-v2` or `armv8-a` CPU
 baseline. See [Building and packaging](docs/operations/building-and-packaging.md)
 for compiler, sanitizer, CPU-target, and packaging details.
 
-### Optional SPDK build
+### Optional kernel bypass build
 
-The default build uses io_uring for both regular files and raw block devices.
-For userspace NVMe access, install the SPDK dependencies for the target host and
-build with:
+The default build includes kernel networking and io_uring storage only;
+`keylane-meta` and ordinary Keylane deployments need no DPDK/SPDK dependencies.
+For DPDK networking or userspace NVMe access, install the bypass dependencies
+described in the build guide and enable both capabilities with:
 
 ```bash
-cmake -S . -B build-spdk \
+cmake -S . -B build-bypass \
   -DCMAKE_BUILD_TYPE=Release \
   -DKEYLANE_ENABLE_OPT=ON \
-  -DKEYLANE_WITH_SPDK=ON
-cmake --build build-spdk --target keylane -j"$(nproc)"
+  -DKEYLANE_KERNEL_BYPASS=ON
+cmake --build build-bypass --target keylane -j"$(nproc)"
 ```
 
-SPDK device paths use the form `spdk://<PCI-domain>:<bus>:<device>.<function>/<nsid>`.
+Select `--storage=spdk` at startup; compiling support alone keeps io_uring as
+the default. SPDK device paths use the form
+`spdk://<PCI-domain>:<bus>:<device>.<function>/<nsid>`.
+Networking is selected independently with `--network=kernel|dpdk`; see
+[runtime backend selection](docs/operations/building-and-packaging.md#runtime-backend-selection).
 SPDK requires exclusive device ownership, host driver binding, DMA-capable
 memory, and deployment-specific CPU/IRQ planning.
 

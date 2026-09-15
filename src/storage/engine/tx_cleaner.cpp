@@ -182,11 +182,11 @@ Task<absl::Status> StorageEngine::Impl::BeforeGroupedTransaction(
       std::uint64_t free = 0;
       std::uint64_t capacity = 0;
       for (std::size_t index = 0; index < devices_.size(); ++index) {
-#ifdef CELER_WITH_SPDK_STORAGE
-        if (std::find(store.home_devices_.begin(), store.home_devices_.end(),
-                      index) == store.home_devices_.end())
-          continue;
-#endif
+        if (celer::SpdkStorageEnabled()) {
+          if (std::find(store.home_devices_.begin(), store.home_devices_.end(),
+                        index) == store.home_devices_.end())
+            continue;
+        }
         const auto available = co_await celer::SubmitTo(
             device_allocators_[index]->owner_, [this, index] {
               const auto& allocator = *device_allocators_[index];
