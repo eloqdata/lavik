@@ -836,9 +836,10 @@ durable schemas below.
 
 Commands, stores, records, operation intents, exports, snapshots, and the
 physical segmented WAL carry exact v1 format markers. Admin binary payloads
-and the cluster-status JSON schema also use v1. These unreleased schemas are
-replaced in place, without a legacy decoder or mixed-layout negotiation;
-an equal marker does not make earlier development state interchangeable.
+and the cluster-status JSON schema also use v1. Before Keylane's first stable
+release, these development schemas are replaced in place without a legacy
+decoder or mixed-layout negotiation. Equal markers do not make earlier
+development state interchangeable.
 Policy snapshots retain only registered-family raw histories and
 typed-decodable current values.
 

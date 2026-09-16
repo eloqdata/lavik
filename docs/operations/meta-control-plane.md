@@ -989,8 +989,8 @@ cluster; startup intentionally refuses to guess at a conversion.
 
 ## Binary replacement and format compatibility
 
-All Keylane-owned durable and control formats use v1 while the first release
-is unpublished, including the Raft command envelope, topology store,
+Before the first stable release, all Keylane-owned durable and control formats
+use v1, including the Raft command envelope, topology store,
 segmented-WAL container, membership descriptors and intents, cluster-create
 intents, and cluster-status binary/JSON payloads. There is no decoder for
 superseded pre-release layouts. Development directories from an incompatible

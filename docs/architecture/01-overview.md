@@ -236,9 +236,9 @@ cleanup as another durable phase.
   interrupted replacement is sufficient to reopen service.
 - Readiness follows recovery and optional import; shutdown drains admitted
   requests and every replication storage mutator before the final flush.
-- Keylane-owned durable and control formats use v1 while unreleased, with
-  in-place schema replacement and no compatibility promise for earlier
-  development layouts. Incompatible data directories must be recreated.
+- Before the first stable release, Keylane-owned durable and control formats
+  use v1 with in-place schema replacement and no compatibility promise for
+  earlier development layouts. Incompatible data directories must be recreated.
   External standards such as Redis RESP/RDB retain their own versioning.
 - Replication and full-sync queues use admission/backpressure. They must not
   silently drop an already accepted logical write.
