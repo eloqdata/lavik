@@ -10,7 +10,6 @@
 // access, no IO.
 
 #include <cstdint>
-#include <limits>
 #include <string>
 
 #include "absl/status/status.h"
@@ -313,37 +312,9 @@ TEST(MetaAuditStore, DeserializeRejectsCorruptionAndChainBreaks) {
 
 using keylane::meta::ActivateAuthority;
 using keylane::meta::BeginGroupTerm;
-using keylane::meta::GrantAuthority;
 using keylane::meta::MetaFailoverActionId;
-using keylane::meta::MetaGrantSpec;
 using keylane::meta::MetaGrantStore;
 using keylane::meta::RevokeGrant;
-using keylane::meta::ValidateMetaGrantSpec;
-
-MetaGrantSpec MakeSpec(std::uint64_t lease_ms = 30000,
-                       std::string policy_id = "policy/leader-lease",
-                       std::uint64_t policy_version = 7) {
-  MetaGrantSpec spec;
-  spec.lease_duration_ms_ = lease_ms;
-  spec.policy_id_ = std::move(policy_id);
-  spec.policy_version_ = policy_version;
-  return spec;
-}
-
-TEST(MetaGrantStore, SharedGrantSpecValidationMatchesControlWireDomain) {
-  EXPECT_TRUE(ValidateMetaGrantSpec(MakeSpec()).ok());
-  EXPECT_TRUE(
-      ValidateMetaGrantSpec(MakeSpec(std::numeric_limits<std::uint32_t>::max()))
-          .ok());
-
-  EXPECT_EQ(MetaFailureClassOf(ValidateMetaGrantSpec(MakeSpec(/*lease_ms=*/0))),
-            MetaFailureClass::kDomainReject);
-  EXPECT_EQ(MetaFailureClassOf(ValidateMetaGrantSpec(
-                MakeSpec(static_cast<std::uint64_t>(
-                             std::numeric_limits<std::uint32_t>::max()) +
-                         1))),
-            MetaFailureClass::kDomainReject);
-}
 
 BeginGroupTerm MakeBeginTerm(std::string group_id, std::uint64_t expected,
                              std::uint64_t new_term) {
@@ -363,7 +334,6 @@ ActivateAuthority MakeActivate(std::string group_id,
   cmd.group_id_ = std::move(group_id);
   cmd.expected_term_ = expected_term;
   cmd.new_owner_ = std::move(new_owner);
-  cmd.grant_ = MakeSpec();
   cmd.new_authority_version_ = new_authority_version;
   cmd.new_topology_epoch_ = 100;
   cmd.new_config_epoch_ = 200;
@@ -376,10 +346,6 @@ TEST(MetaGrantStore, CommandsOnUnknownGroupReject) {
             MetaFailureClass::kDomainReject);
   ActivateAuthority activate = MakeActivate("g1", 0, "node-a", 1);
   EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate, 1)),
-            MetaFailureClass::kDomainReject);
-  GrantAuthority grant;
-  grant.group_id_ = "g1";
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(grant, 1)),
             MetaFailureClass::kDomainReject);
   RevokeGrant revoke;
   revoke.group_id_ = "g1";
@@ -449,7 +415,6 @@ TEST(MetaGrantStore, ActivateInstallsGrantWithoutMovingTerm) {
   EXPECT_EQ(state->grant_->term_, 1);
   EXPECT_EQ(state->grant_->authority_version_, 1);
   EXPECT_EQ(state->grant_->grant_revision_, 10);
-  EXPECT_EQ(state->grant_->spec_, MakeSpec());
   EXPECT_EQ(state->last_authority_version_, 1);
   EXPECT_EQ(state->last_grant_revision_, 10);
 }
@@ -464,15 +429,6 @@ TEST(MetaGrantStore, ActivationActionIdentityIsInstalledPreservedAndCleared) {
   ActivateAuthority failover = MakeActivate("g1", 1, "node-a", 1);
   ASSERT_TRUE(store.ValidateActivate(failover, 10, action_id).ok());
   ASSERT_TRUE(store.ApplyGrantPart(failover, 10, action_id).ok());
-  ASSERT_EQ(store.GroupState("g1")->grant_->activation_action_id_, action_id);
-
-  GrantAuthority renew;
-  renew.group_id_ = "g1";
-  renew.node_id_ = "node-a";
-  renew.term_ = 1;
-  renew.authority_version_ = 1;
-  renew.grant_ = MakeSpec(/*lease_ms=*/31000);
-  ASSERT_TRUE(store.GrantAuthority(renew, 11).ok());
   ASSERT_EQ(store.GroupState("g1")->grant_->activation_action_id_, action_id);
 
   const auto encoded = store.Serialize();
@@ -522,39 +478,6 @@ TEST(MetaGrantStore, DeserializeRejectsZeroPresentActivationActionIdentity) {
   const auto restored = MetaGrantStore::Deserialize(*bytes);
   ASSERT_FALSE(restored.ok());
   EXPECT_EQ(MetaFailureClassOf(restored.status()), MetaFailureClass::kFailStop);
-}
-
-TEST(MetaGrantStore, RejectsLeaseDurationOutsideControlWireDomain) {
-  MetaGrantStore store;
-  ASSERT_TRUE(store.AddGroup("g1").ok());
-  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
-
-  ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  activate.grant_.lease_duration_ms_ = 0;
-  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate, 10)),
-            MetaFailureClass::kDomainReject);
-  activate.grant_.lease_duration_ms_ =
-      static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1;
-  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate, 10)),
-            MetaFailureClass::kDomainReject);
-
-  activate.grant_.lease_duration_ms_ =
-      std::numeric_limits<std::uint32_t>::max();
-  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
-
-  GrantAuthority renew;
-  renew.group_id_ = "g1";
-  renew.node_id_ = "node-a";
-  renew.term_ = 1;
-  renew.authority_version_ = 1;
-  renew.grant_ = MakeSpec(/*lease_ms=*/0);
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(renew, 11)),
-            MetaFailureClass::kDomainReject);
-  renew.grant_.lease_duration_ms_ =
-      static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1;
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(renew, 11)),
-            MetaFailureClass::kDomainReject);
 }
 
 TEST(MetaGrantStore, ActivateRejectsZeroServingTerm) {
@@ -614,48 +537,6 @@ TEST(MetaGrantStore, ActivateReplayIdempotentAndVersionConflictRejected) {
   EXPECT_EQ(state->group_term_, 1);
 }
 
-TEST(MetaGrantStore, GrantAuthorityRenewsLeaseForSameOwnerOnly) {
-  MetaGrantStore store;
-  ASSERT_TRUE(store.AddGroup("g1").ok());
-  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
-  // No grant exists while fenced: renewal rejects.
-  GrantAuthority renew;
-  renew.group_id_ = "g1";
-  renew.node_id_ = "node-a";
-  renew.term_ = 1;
-  renew.authority_version_ = 1;
-  renew.grant_ = MakeSpec(/*lease_ms=*/60000);
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(renew, 11)),
-            MetaFailureClass::kDomainReject);
-
-  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
-  ASSERT_TRUE(store.GrantAuthority(renew, 11).ok());
-  auto state = store.GroupState("g1");
-  EXPECT_EQ(state->grant_->spec_.lease_duration_ms_, 60000);
-  EXPECT_EQ(state->grant_->term_, 1);               // unchanged
-  EXPECT_EQ(state->grant_->authority_version_, 1);  // unchanged
-  EXPECT_EQ(state->grant_->grant_revision_, 11);
-  // Replay installs the same spec again: idempotent.
-  ASSERT_TRUE(store.GrantAuthority(renew, 11).ok());
-  EXPECT_EQ(store.GroupState("g1")->grant_->grant_revision_, 11);
-  // Owner/term/authority_version are CAS tokens; each mismatch rejects.
-  GrantAuthority wrong_owner = renew;
-  wrong_owner.node_id_ = "node-b";
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(wrong_owner, 12)),
-            MetaFailureClass::kDomainReject);
-  GrantAuthority wrong_term = renew;
-  wrong_term.term_ = 2;
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(wrong_term, 12)),
-            MetaFailureClass::kDomainReject);
-  GrantAuthority wrong_version = renew;
-  wrong_version.authority_version_ = 2;
-  EXPECT_EQ(MetaFailureClassOf(store.GrantAuthority(wrong_version, 12)),
-            MetaFailureClass::kDomainReject);
-  EXPECT_EQ(store.GroupState("g1")->grant_->spec_.lease_duration_ms_, 60000);
-}
-
 TEST(MetaGrantStore, RevokeAndFenceDropTheGrant) {
   MetaGrantStore store;
   ASSERT_TRUE(store.AddGroup("g1").ok());
@@ -694,19 +575,19 @@ TEST(MetaGrantStore, FactQueriesTrackGrantState) {
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   EXPECT_EQ(store.CurrentGroupTerm("g1"), 1);
-  EXPECT_FALSE(store.PolicyInUse("policy/leader-lease", 7));
   const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
   ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
   ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
-  // PolicyInUse feeds the RetirePolicy guard.
-  EXPECT_TRUE(store.PolicyInUse("policy/leader-lease", 7));
-  EXPECT_FALSE(store.PolicyInUse("policy/leader-lease", 8));
-  EXPECT_FALSE(store.PolicyInUse("policy/other", 7));
+  const auto active = store.GroupState("g1");
+  ASSERT_TRUE(active.has_value());
+  ASSERT_TRUE(active->grant_.has_value());
+  EXPECT_EQ(active->grant_->owner_, "node-a");
+  EXPECT_EQ(active->grant_->grant_revision_, 10);
   RevokeGrant revoke;
   revoke.group_id_ = "g1";
   revoke.expected_term_ = 1;
   ASSERT_TRUE(store.RevokeGrant(revoke).ok());
-  EXPECT_FALSE(store.PolicyInUse("policy/leader-lease", 7));
+  EXPECT_FALSE(store.GroupState("g1")->grant_.has_value());
 }
 
 TEST(MetaGrantStore, RemoveGroupLifecycle) {
@@ -766,7 +647,6 @@ TEST(MetaGrantStore, SerializationRoundTripPreservesState) {
   EXPECT_EQ(restored->GroupState("g1"), store.GroupState("g1"));
   EXPECT_EQ(restored->GroupState("g2"), store.GroupState("g2"));
   EXPECT_EQ(restored->GroupCount(), 2);
-  EXPECT_TRUE(restored->PolicyInUse("policy/leader-lease", 7));
   // Behavior continues identically after restore: replay idempotency and CAS
   // checks are unaffected by a snapshot round-trip.
   ASSERT_TRUE(restored->ValidateActivate(activate, 10).ok());  // replay no-op
@@ -792,7 +672,7 @@ TEST(MetaGrantStore, DeserializeRejectsCorruption) {
             MetaFailureClass::kFailStop);
 }
 
-TEST(MetaGrantStore, DeserializeRejectsUnprojectableLeaseDuration) {
+TEST(MetaGrantStore, DeserializeRejectsLegacyGrantSpecFields) {
   keylane::meta::MetaWriter writer;
   writer.WriteU16(keylane::meta::kMetaFormatVersion);
   writer.WriteCount(1);
@@ -807,7 +687,9 @@ TEST(MetaGrantStore, DeserializeRejectsUnprojectableLeaseDuration) {
   writer.WriteU64(1);       // authority version
   writer.WriteU64(10);      // grant revision
   writer.WriteBool(false);  // no failover activation action
-  writer.WriteU64(0);       // lease duration cannot be projected to the wire
+  // Grant specs were removed from the current format. A legacy suffix is not
+  // accepted by the strict decoder; there is no compatibility path.
+  writer.WriteU64(30000);
   writer.WriteString("policy/leader-lease");
   writer.WriteU64(7);
 

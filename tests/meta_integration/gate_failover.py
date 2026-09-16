@@ -93,7 +93,8 @@ class IdentityDropProxy:
         self._listener = None
         self._pairs = {}
         self._held = set()
-        self._drop = False
+        self._drop_upstream = False
+        self._drop_downstream = False
         self._running = False
         self._accept_thread = None
         self._ready = threading.Event()
@@ -111,14 +112,24 @@ class IdentityDropProxy:
         if not self._ready.wait(timeout=3.0) or self._listener is None:
             raise H.Failure(f"control proxy {self.name} failed to listen")
 
-    def drop_blocked(self):
-        """Blackhole an established Owner without exposing transport EOF."""
+    def drop_blocked(self, direction="both"):
+        """Blackhole Owner traffic without exposing transport EOF.
+
+        ``upstream`` is Data-to-Meta, ``downstream`` is Meta-to-Data, and
+        ``both`` cuts both directions. New sessions cannot finish their
+        handshake when ClientHello itself is in the selected direction.
+        """
+        if direction not in ("upstream", "downstream", "both"):
+            raise H.Failure(
+                f"invalid Data-control partition direction {direction!r}")
         with self._lock:
-            self._drop = True
+            self._drop_upstream = direction in ("upstream", "both")
+            self._drop_downstream = direction in ("downstream", "both")
 
     def heal(self):
         with self._lock:
-            self._drop = False
+            self._drop_upstream = False
+            self._drop_downstream = False
             held = list(self._held)
             blocked_pairs = [
                 pair for pair, identity in self._pairs.items()
@@ -181,7 +192,7 @@ class IdentityDropProxy:
                 return
             connection.settimeout(None)
             with self._lock:
-                drop = self._drop and identity == self.blocked
+                drop = self._drop_upstream and identity == self.blocked
                 if drop:
                     self._held.add(connection)
             if drop:
@@ -194,7 +205,7 @@ class IdentityDropProxy:
             with self._lock:
                 # Recheck after dialing: a concurrent partition must not leak
                 # a just-classified Owner session through the cut.
-                late_drop = self._drop and identity == self.blocked
+                late_drop = self._drop_upstream and identity == self.blocked
                 if late_drop:
                     self._held.add(connection)
                 else:
@@ -218,7 +229,10 @@ class IdentityDropProxy:
                 data = source.recv(65536)
                 with self._lock:
                     identity = self._pairs.get(pair)
-                    dropping = self._drop and identity == self.blocked
+                    upstream = source is pair[0]
+                    dropping = identity == self.blocked and (
+                        self._drop_upstream if upstream
+                        else self._drop_downstream)
                 if not data:
                     # In a network partition, Meta observing EOF must not
                     # notify Data. Its local finite lease is the safety proof
@@ -231,8 +245,10 @@ class IdentityDropProxy:
         except OSError:
             with self._lock:
                 identity = self._pairs.get(pair)
-                preserve_half_open = (
-                    self._drop and identity == self.blocked)
+                upstream = source is pair[0]
+                preserve_half_open = identity == self.blocked and (
+                    self._drop_upstream if upstream
+                    else self._drop_downstream)
         finally:
             if not preserve_half_open:
                 self._cut_pair(pair)
@@ -312,7 +328,8 @@ def meta_manifest_lines(metas):
     return lines
 
 
-def write_manifest(path, metas, data_nodes):
+def write_manifest(path, metas, data_nodes, *,
+                   automatic_uncontrolled_failover_enabled=None):
     by_id = {node.node_id: node for node in data_nodes}
     replicas = sorted(node_id for node_id in by_id if node_id != OWNER)
     replica_list = ", ".join(f'"{node_id}"' for node_id in replicas)
@@ -336,6 +353,14 @@ def write_manifest(path, metas, data_nodes):
         f'group = "{GROUP}"',
         "",
     ])
+    if automatic_uncontrolled_failover_enabled is not None:
+        enabled = ("true" if automatic_uncontrolled_failover_enabled
+                   else "false")
+        lines.extend([
+            "[bootstrap_policy]",
+            f"automatic_uncontrolled_failover_enabled = {enabled}",
+            "",
+        ])
     with open(path, "w", encoding="utf-8") as output:
         output.write("\n".join(lines))
 
@@ -733,6 +758,10 @@ def failover_log_records(metas):
         record["reason"] = (
             None if reason is None else
             decode_failover_log_token(reason.group(1)))
+        suspect = re.search(r"(?:^| )suspect_ms=([0-9]+)(?: |$)",
+                            record["detail"])
+        record["suspect_ms"] = (
+            None if suspect is None else int(suspect.group(1)))
         records.append(record)
     return text, records
 
@@ -746,7 +775,7 @@ def require_unique_failover_event(metas, event, mode, *, loss=None):
             (loss is None or record["loss"] == loss))
     ]
     keys = ("event", "mode", "group", "transition", "action", "loss",
-            "index", "candidate", "reason")
+            "index", "candidate", "reason", "suspect_ms")
     distinct = {tuple(record[key] for key in keys) for record in matches}
     if len(distinct) != 1:
         raise H.Failure(
@@ -912,12 +941,20 @@ class FailoverFixture:
                 time.sleep(min(0.05, max(0, deadline - time.monotonic())))
         raise H.Failure("getop exhausted its global deadline")
 
-    def start_created(self, add_follower=True):
+    def start_created(self, add_follower=True, *,
+                      automatic_uncontrolled_failover_enabled=False):
         # Keep this failover gate independent of #40's explicit Genesis
         # replica-initialization operation. Once the Owner-only topology is
         # Created, both replicas enter through the production steady
         # FollowOwner path that failover also relies on after cutover.
-        write_manifest(self.manifest, self.metas, self.data_nodes[:1])
+        # Disable automatic failover during that deliberately serial topology
+        # construction. The controlled #41 gates must not be preempted by an
+        # unrelated detector decision, while the automatic gate explicitly
+        # enables its short test Policy only after all replicas are current.
+        write_manifest(
+            self.manifest, self.metas, self.data_nodes[:1],
+            automatic_uncontrolled_failover_enabled=
+            automatic_uncontrolled_failover_enabled)
         for proxy in self.control_proxies:
             proxy.start()
         for meta in self.metas:
@@ -1061,11 +1098,11 @@ class FailoverFixture:
         if unexpected:
             raise H.Failure("unexpected process exit: " + ", ".join(unexpected))
 
-    def partition_owner_control(self):
+    def partition_owner_control(self, direction="both"):
         if not self.control_proxies:
             raise H.Failure("fixture has no Data-control partition proxies")
         for proxy in self.control_proxies:
-            proxy.drop_blocked()
+            proxy.drop_blocked(direction)
 
     def heal_owner_control(self):
         for proxy in self.control_proxies:

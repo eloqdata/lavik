@@ -59,15 +59,22 @@ control::WireMessage OversizedDirective() {
   };
 }
 
-absl::StatusOr<std::string> FullStatePayload(std::size_t policy_bytes) {
+absl::StatusOr<std::string> FullStatePayload(std::size_t padding_bytes) {
   control::FullDesiredState state;
   state.source_meta_applied_index = 1;
-  if (policy_bytes != 0) {
-    std::string content(policy_bytes, 'p');
-    state.policies.push_back({.policy_id = "policy",
-                              .version = 1,
-                              .content_hash = control::ComputeSha256(content),
-                              .content = std::move(content)});
+  state.authority_lease_duration_ms = 3000;
+  state.data_heartbeat_interval_ms = 1000;
+  if (padding_bytes != 0) {
+    control::WireManifestDocument manifest;
+    manifest.revision = 1;
+    const std::size_t entry_count = std::min<std::size_t>(
+        padding_bytes / 10 + 1, control::kMaxManifestEntries);
+    manifest.entries.reserve(entry_count);
+    for (std::size_t i = 0; i < entry_count; ++i) {
+      manifest.entries.push_back(
+          {.partition_id = static_cast<std::uint16_t>(i), .logical_epoch = 1});
+    }
+    state.manifests.push_back(std::move(manifest));
   }
   auto directives =
       control::ComputeDirectiveSetDigest(state.current_directives);
@@ -440,8 +447,8 @@ struct OversizedWriterScenario {
 };
 
 struct FullStateWriterScenario {
-  celer::Task<absl::Status> WriteFrame(
-      control::WireMessage message, std::function<void()> before_write) {
+  celer::Task<absl::Status> WriteFrame(control::WireMessage message,
+                                       std::function<void()> before_write) {
     if (before_write) before_write();
     frames_.push_back(std::move(message));
     co_return absl::OkStatus();
@@ -653,8 +660,8 @@ TEST(ControlSessionWriterTest,
   EXPECT_EQ(start->kind, control::TransferKind::kFullDesiredState);
   EXPECT_EQ(start->total_length, scenario->large_bytes_.size());
   EXPECT_EQ(start->sha256, control::ComputeSha256(scenario->large_bytes_));
-  EXPECT_TRUE(std::holds_alternative<control::TransferEnd>(
-      scenario->frames_.back()));
+  EXPECT_TRUE(
+      std::holds_alternative<control::TransferEnd>(scenario->frames_.back()));
   EXPECT_TRUE(std::all_of(
       scenario->frames_.begin() + 2, scenario->frames_.end() - 1,
       [](const control::WireMessage& frame) {

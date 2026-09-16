@@ -504,32 +504,6 @@ absl::StatusOr<SetGroupReplicationState> ReadSetGroupReplicationStateBody(
   return cmd;
 }
 
-// ---------------------------------------------------------------------------
-// term/grant codecs.
-// ---------------------------------------------------------------------------
-
-absl::Status WriteGrantSpec(MetaWriter& w, const MetaGrantSpec& grant) {
-  if (auto st =
-          CheckCap("policy_id", grant.policy_id_.size(), kMaxMetaPolicyIdBytes);
-      !st.ok()) {
-    return st;
-  }
-  w.WriteU64(grant.lease_duration_ms_);
-  w.WriteString(grant.policy_id_);
-  w.WriteU64(grant.policy_version_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<MetaGrantSpec> ReadGrantSpec(MetaReader& r) {
-  auto lease = r.ReadU64();
-  if (!lease.ok()) return lease.status();
-  auto policy_id = ReadBoundedString(r, kMaxMetaPolicyIdBytes);
-  if (!policy_id.ok()) return policy_id.status();
-  auto policy_version = r.ReadU64();
-  if (!policy_version.ok()) return policy_version.status();
-  return MetaGrantSpec{*lease, std::move(*policy_id), *policy_version};
-}
-
 template <std::size_t N>
 bool IsZero(const std::array<std::uint8_t, N>& value) {
   return std::all_of(value.begin(), value.end(),
@@ -626,10 +600,6 @@ absl::Status ValidateFailoverTransitionImpl(
   if (transition.mode_ != MetaFailoverMode::kControlled &&
       transition.mode_ != MetaFailoverMode::kUncontrolled) {
     return MetaDomainRejectError("invalid failover transition mode");
-  }
-  if (auto status = ValidateMetaGrantSpec(transition.successor_grant_);
-      !status.ok()) {
-    return status;
   }
   if (transition.candidate_action_.has_value()) {
     if (auto status = ValidateFailoverAction(*transition.candidate_action_);
@@ -826,7 +796,6 @@ void WriteFailoverTransitionUnchecked(
   writer.WriteU64(transition.revision_);
   writer.WriteU8(static_cast<std::uint8_t>(transition.mode_));
   writer.WriteU64(transition.target_term_);
-  (void)WriteGrantSpec(writer, transition.successor_grant_);
   writer.WriteOptional(
       transition.candidate_action_,
       [](MetaWriter& nested, const MetaFailoverCandidateAction& action) {
@@ -850,8 +819,6 @@ absl::StatusOr<MetaFailoverTransition> ReadFailoverTransitionUnchecked(
   if (!mode.ok()) return mode.status();
   auto target_term = reader.ReadU64();
   if (!target_term.ok()) return target_term.status();
-  auto successor_grant = ReadGrantSpec(reader);
-  if (!successor_grant.ok()) return successor_grant.status();
   auto action = reader.ReadOptional<MetaFailoverCandidateAction>(
       [](MetaReader& nested) { return ReadFailoverAction(nested); });
   if (!action.ok()) return action.status();
@@ -865,13 +832,8 @@ absl::StatusOr<MetaFailoverTransition> ReadFailoverTransitionUnchecked(
       });
   if (!controlled.ok()) return controlled.status();
   return MetaFailoverTransition{
-      *transition_id,
-      *revision,
-      static_cast<MetaFailoverMode>(*mode),
-      *target_term,
-      std::move(*successor_grant),
-      std::move(*action),
-      std::move(*controlled),
+      *transition_id, *revision,          static_cast<MetaFailoverMode>(*mode),
+      *target_term,   std::move(*action), std::move(*controlled),
   };
 }
 
@@ -969,10 +931,6 @@ absl::Status ValidateFailoverBeginBase(const Command& command) {
   if (IsZero(command.transition_id_)) {
     return MetaDomainRejectError("failover transition id is zero");
   }
-  if (auto status = ValidateMetaGrantSpec(command.successor_grant_);
-      !status.ok()) {
-    return status;
-  }
   if (auto status = ValidateFailoverGroupAnchors(command); !status.ok()) {
     return status;
   }
@@ -1023,7 +981,18 @@ absl::Status ValidateCommand(const BeginUncontrolledFailover& command) {
   if (auto status = ValidateFailoverBeginBase(command); !status.ok()) {
     return status;
   }
+  if (static_cast<std::uint8_t>(command.trigger_reason_) >
+      static_cast<std::uint8_t>(
+          MetaAutomaticFailoverReason::kPopulationUnready)) {
+    return MetaDomainRejectError("unknown automatic failover trigger reason");
+  }
+  const bool automatic =
+      command.trigger_reason_ != MetaAutomaticFailoverReason::kManual;
   if (command.candidate_action_.has_value()) {
+    if (automatic) {
+      return MetaDomainRejectError(
+          "automatic uncontrolled failover begin must be candidate-less");
+    }
     if (auto status = ValidateFailoverAction(*command.candidate_action_);
         !status.ok()) {
       return status;
@@ -1036,6 +1005,29 @@ absl::Status ValidateCommand(const BeginUncontrolledFailover& command) {
         command.target_term_) {
       return MetaDomainRejectError(
           "failover source term must precede the target term");
+    }
+  }
+  if (automatic != (command.suspect_duration_ms_ != 0)) {
+    return MetaDomainRejectError(
+        "automatic failover reason and suspect duration must be paired");
+  }
+  const bool has_preempted_operation =
+      command.preempted_operation_id_.has_value();
+  if (has_preempted_operation !=
+      command.expected_preempted_operation_revision_.has_value()) {
+    return MetaDomainRejectError(
+        "preempted operation id and expected revision must be paired");
+  }
+  if (has_preempted_operation) {
+    if (!automatic) {
+      return MetaDomainRejectError(
+          "only automatic failover may preempt a controlled operation");
+    }
+    if (auto status = ValidateFailoverOperation(
+            *command.preempted_operation_id_,
+            *command.expected_preempted_operation_revision_);
+        !status.ok()) {
+      return status;
     }
   }
   return absl::OkStatus();
@@ -1153,10 +1145,6 @@ absl::Status ValidateFailoverCommitBase(const Command& command) {
       !status.ok()) {
     return status;
   }
-  if (auto status = ValidateMetaGrantSpec(command.successor_grant_);
-      !status.ok()) {
-    return status;
-  }
   if (auto status = ValidateFailoverGroupAnchors(command); !status.ok()) {
     return status;
   }
@@ -1211,7 +1199,6 @@ void WriteFailoverCommitBaseUnchecked(MetaWriter& writer,
   WriteFixedArray(writer, command.action_id_);
   writer.WriteU64(command.authorized_revision_);
   WriteFailoverCandidateUnchecked(writer, command.expected_candidate_);
-  (void)WriteGrantSpec(writer, command.successor_grant_);
   WriteFailoverGroupAnchorsUnchecked(writer, command);
   writer.WriteU64(command.new_authority_version_);
   writer.WriteU64(command.new_topology_epoch_);
@@ -1230,14 +1217,11 @@ absl::Status ReadFailoverCommitBase(MetaReader& reader, Command& command) {
   if (!authorized_revision.ok()) return authorized_revision.status();
   auto candidate = ReadFailoverCandidate(reader);
   if (!candidate.ok()) return candidate.status();
-  auto successor_grant = ReadGrantSpec(reader);
-  if (!successor_grant.ok()) return successor_grant.status();
   command.group_id_ = std::move(*group_id);
   command.expected_transition_ = *transition;
   command.action_id_ = *action_id;
   command.authorized_revision_ = *authorized_revision;
   command.expected_candidate_ = std::move(*candidate);
-  command.successor_grant_ = std::move(*successor_grant);
   if (auto status = ReadFailoverGroupAnchors(reader, command); !status.ok()) {
     return status;
   }
@@ -1265,7 +1249,6 @@ absl::Status WriteCommandBody(MetaWriter& writer,
   writer.WriteString(command.group_id_);
   WriteFixedArray(writer, command.transition_id_);
   writer.WriteU64(command.target_term_);
-  (void)WriteGrantSpec(writer, command.successor_grant_);
   WriteFailoverActionUnchecked(writer, command.candidate_action_);
   WriteFixedArray(writer, command.operation_id_);
   writer.WriteU64(command.expected_operation_revision_);
@@ -1284,8 +1267,6 @@ absl::StatusOr<BeginControlledFailover> ReadBeginControlledFailoverBody(
   if (!transition_id.ok()) return transition_id.status();
   auto target_term = reader.ReadU64();
   if (!target_term.ok()) return target_term.status();
-  auto grant = ReadGrantSpec(reader);
-  if (!grant.ok()) return grant.status();
   auto action = ReadFailoverAction(reader);
   if (!action.ok()) return action.status();
   auto operation_id = ReadFixedArray<16>(reader);
@@ -1300,7 +1281,6 @@ absl::StatusOr<BeginControlledFailover> ReadBeginControlledFailoverBody(
   command.group_id_ = std::move(*group_id);
   command.transition_id_ = *transition_id;
   command.target_term_ = *target_term;
-  command.successor_grant_ = std::move(*grant);
   command.candidate_action_ = std::move(*action);
   command.operation_id_ = *operation_id;
   command.expected_operation_revision_ = *operation_revision;
@@ -1327,11 +1307,18 @@ absl::Status WriteCommandBody(MetaWriter& writer,
   writer.WriteString(command.group_id_);
   WriteFixedArray(writer, command.transition_id_);
   writer.WriteU64(command.target_term_);
-  (void)WriteGrantSpec(writer, command.successor_grant_);
   writer.WriteOptional(
       command.candidate_action_,
       [](MetaWriter& nested, const MetaFailoverCandidateAction& action) {
         WriteFailoverActionUnchecked(nested, action);
+      });
+  writer.WriteU8(static_cast<std::uint8_t>(command.trigger_reason_));
+  writer.WriteU64(command.suspect_duration_ms_);
+  writer.WriteOptional(
+      command.preempted_operation_id_,
+      [&command](MetaWriter& nested, const MetaOperationId& operation_id) {
+        WriteFixedArray(nested, operation_id);
+        nested.WriteU64(*command.expected_preempted_operation_revision_);
       });
   WriteFailoverGroupAnchorsUnchecked(writer, command);
   return absl::OkStatus();
@@ -1347,19 +1334,38 @@ absl::StatusOr<BeginUncontrolledFailover> ReadBeginUncontrolledFailoverBody(
   if (!transition_id.ok()) return transition_id.status();
   auto target_term = reader.ReadU64();
   if (!target_term.ok()) return target_term.status();
-  auto grant = ReadGrantSpec(reader);
-  if (!grant.ok()) return grant.status();
   auto action = reader.ReadOptional<MetaFailoverCandidateAction>(
       [](MetaReader& nested) { return ReadFailoverAction(nested); });
   if (!action.ok()) return action.status();
+  auto trigger_reason = reader.ReadU8();
+  if (!trigger_reason.ok()) return trigger_reason.status();
+  auto suspect_duration_ms = reader.ReadU64();
+  if (!suspect_duration_ms.ok()) return suspect_duration_ms.status();
+  using PreemptedOperation = std::pair<MetaOperationId, std::uint64_t>;
+  auto preempted_operation = reader.ReadOptional<PreemptedOperation>(
+      [](MetaReader& nested) -> absl::StatusOr<PreemptedOperation> {
+        auto operation_id = ReadFixedArray<16>(nested);
+        if (!operation_id.ok()) return operation_id.status();
+        auto expected_revision = nested.ReadU64();
+        if (!expected_revision.ok()) return expected_revision.status();
+        return PreemptedOperation{*operation_id, *expected_revision};
+      });
+  if (!preempted_operation.ok()) return preempted_operation.status();
   BeginUncontrolledFailover command;
   command.request_id_ = header->request_id_;
   command.actor_ = std::move(header->actor_);
   command.group_id_ = std::move(*group_id);
   command.transition_id_ = *transition_id;
   command.target_term_ = *target_term;
-  command.successor_grant_ = std::move(*grant);
   command.candidate_action_ = std::move(*action);
+  command.trigger_reason_ =
+      static_cast<MetaAutomaticFailoverReason>(*trigger_reason);
+  command.suspect_duration_ms_ = *suspect_duration_ms;
+  if (preempted_operation->has_value()) {
+    command.preempted_operation_id_ = (*preempted_operation)->first;
+    command.expected_preempted_operation_revision_ =
+        (*preempted_operation)->second;
+  }
   if (auto status = ReadFailoverGroupAnchors(reader, command); !status.ok()) {
     return status;
   }
@@ -1689,43 +1695,6 @@ absl::StatusOr<BeginGroupTerm> ReadBeginGroupTermBody(MetaReader& r) {
   return cmd;
 }
 
-absl::Status WriteCommandBody(MetaWriter& w, const GrantAuthority& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kGrantAuthority,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
-  if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
-  w.WriteU64(cmd.term_);
-  w.WriteU64(cmd.authority_version_);
-  return WriteGrantSpec(w, cmd.grant_);
-}
-
-absl::StatusOr<GrantAuthority> ReadGrantAuthorityBody(MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
-  auto node_id = ReadNodeId(r);
-  if (!node_id.ok()) return node_id.status();
-  auto term = r.ReadU64();
-  if (!term.ok()) return term.status();
-  auto authority_version = r.ReadU64();
-  if (!authority_version.ok()) return authority_version.status();
-  auto grant = ReadGrantSpec(r);
-  if (!grant.ok()) return grant.status();
-  GrantAuthority cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.group_id_ = std::move(*group_id);
-  cmd.node_id_ = std::move(*node_id);
-  cmd.term_ = *term;
-  cmd.authority_version_ = *authority_version;
-  cmd.grant_ = std::move(*grant);
-  return cmd;
-}
-
 absl::Status WriteCommandBody(MetaWriter& w, const ActivateAuthority& cmd) {
   if (auto st = WriteCommandHeader(w, MetaCommandTag::kActivateAuthority,
                                    cmd.request_id_, cmd.actor_);
@@ -1735,7 +1704,6 @@ absl::Status WriteCommandBody(MetaWriter& w, const ActivateAuthority& cmd) {
   if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
   w.WriteU64(cmd.expected_term_);
   if (auto st = WriteNodeId(w, cmd.new_owner_); !st.ok()) return st;
-  if (auto st = WriteGrantSpec(w, cmd.grant_); !st.ok()) return st;
   w.WriteU64(cmd.new_authority_version_);
   w.WriteU64(cmd.new_topology_epoch_);
   w.WriteU64(cmd.new_config_epoch_);
@@ -1751,8 +1719,6 @@ absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
   if (!expected_term.ok()) return expected_term.status();
   auto new_owner = ReadNodeId(r);
   if (!new_owner.ok()) return new_owner.status();
-  auto grant = ReadGrantSpec(r);
-  if (!grant.ok()) return grant.status();
   auto authority_version = r.ReadU64();
   if (!authority_version.ok()) return authority_version.status();
   auto topology_epoch = r.ReadU64();
@@ -1765,7 +1731,6 @@ absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
   cmd.group_id_ = std::move(*group_id);
   cmd.expected_term_ = *expected_term;
   cmd.new_owner_ = std::move(*new_owner);
-  cmd.grant_ = std::move(*grant);
   cmd.new_authority_version_ = *authority_version;
   cmd.new_topology_epoch_ = *topology_epoch;
   cmd.new_config_epoch_ = *config_epoch;
@@ -1812,7 +1777,6 @@ absl::Status WriteCommandBody(MetaWriter& w, const PutPolicy& cmd) {
   w.WriteString(cmd.policy_id_);
   w.WriteU64(cmd.version_);
   w.WriteString(cmd.content_);
-  WriteFixedArray(w, cmd.content_hash_);
   return absl::OkStatus();
 }
 
@@ -1825,46 +1789,12 @@ absl::StatusOr<PutPolicy> ReadPutPolicyBody(MetaReader& r) {
   if (!version.ok()) return version.status();
   auto content = ReadBoundedString(r, kMaxMetaPayloadBytes);
   if (!content.ok()) return content.status();
-  auto content_hash = ReadFixedArray<32>(r);
-  if (!content_hash.ok()) return content_hash.status();
   PutPolicy cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.policy_id_ = std::move(*policy_id);
   cmd.version_ = *version;
   cmd.content_ = std::move(*content);
-  cmd.content_hash_ = *content_hash;
-  return cmd;
-}
-
-absl::Status WriteCommandBody(MetaWriter& w, const RetirePolicy& cmd) {
-  if (auto st =
-          CheckCap("policy_id", cmd.policy_id_.size(), kMaxMetaPolicyIdBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kRetirePolicy,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  w.WriteString(cmd.policy_id_);
-  w.WriteU64(cmd.version_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<RetirePolicy> ReadRetirePolicyBody(MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto policy_id = ReadBoundedString(r, kMaxMetaPolicyIdBytes);
-  if (!policy_id.ok()) return policy_id.status();
-  auto version = r.ReadU64();
-  if (!version.ok()) return version.status();
-  RetirePolicy cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.policy_id_ = std::move(*policy_id);
-  cmd.version_ = *version;
   return cmd;
 }
 
@@ -1890,17 +1820,6 @@ absl::Status WriteEvidenceSummary(MetaWriter& w,
   return absl::OkStatus();
 }
 
-absl::Status WritePolicyReference(MetaWriter& w,
-                                  const MetaPolicyReference& reference) {
-  if (auto st = CheckCap("operation policy_id", reference.policy_id_.size(),
-                         kMaxMetaPolicyIdBytes);
-      !st.ok()) {
-    return st;
-  }
-  WriteMetaPolicyReference(w, reference);
-  return absl::OkStatus();
-}
-
 absl::Status WriteCommandBody(MetaWriter& w, const SubmitOperation& cmd) {
   if (auto st = CheckCap("kind", cmd.kind_.size(), kMaxMetaOperationKindBytes);
       !st.ok()) {
@@ -1909,18 +1828,6 @@ absl::Status WriteCommandBody(MetaWriter& w, const SubmitOperation& cmd) {
   if (auto st = CheckCap("intent", cmd.intent_.size(), kMaxMetaPayloadBytes);
       !st.ok()) {
     return st;
-  }
-  if (auto st = CheckCap("policy_references", cmd.policy_references_.size(),
-                         kMaxMetaPolicyReferencesPerOperation);
-      !st.ok()) {
-    return st;
-  }
-  for (const MetaPolicyReference& reference : cmd.policy_references_) {
-    if (auto st = CheckCap("operation policy_id", reference.policy_id_.size(),
-                           kMaxMetaPolicyIdBytes);
-        !st.ok()) {
-      return st;
-    }
   }
   if (auto st = WriteCommandHeader(w, MetaCommandTag::kSubmitOperation,
                                    cmd.request_id_, cmd.actor_);
@@ -1932,10 +1839,6 @@ absl::Status WriteCommandBody(MetaWriter& w, const SubmitOperation& cmd) {
   w.WriteString(cmd.intent_);
   WriteFixedArray(w, cmd.intent_hash_);
   WriteFixedArray(w, cmd.replication_history_id_);
-  w.WriteList(cmd.policy_references_,
-              [](MetaWriter& ww, const MetaPolicyReference& reference) {
-                (void)WritePolicyReference(ww, reference);
-              });
   return absl::OkStatus();
 }
 
@@ -1952,10 +1855,6 @@ absl::StatusOr<SubmitOperation> ReadSubmitOperationBody(MetaReader& r) {
   if (!intent_hash.ok()) return intent_hash.status();
   auto replication_history = ReadFixedArray<kMetaReplicationHistoryIdBytes>(r);
   if (!replication_history.ok()) return replication_history.status();
-  auto policy_references = r.ReadList<MetaPolicyReference>(
-      kMaxMetaPolicyReferencesPerOperation,
-      [](MetaReader& rr) { return ReadMetaPolicyReference(rr); });
-  if (!policy_references.ok()) return policy_references.status();
   SubmitOperation cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -1964,7 +1863,6 @@ absl::StatusOr<SubmitOperation> ReadSubmitOperationBody(MetaReader& r) {
   cmd.intent_ = std::move(*intent);
   cmd.intent_hash_ = *intent_hash;
   cmd.replication_history_id_ = *replication_history;
-  cmd.policy_references_ = std::move(*policy_references);
   return cmd;
 }
 
@@ -2529,19 +2427,6 @@ absl::StatusOr<PrunePopulationManifest> ReadPrunePopulationManifestBody(
 
 }  // namespace
 
-absl::Status ValidateMetaGrantSpec(const MetaGrantSpec& spec) {
-  if (spec.lease_duration_ms_ == 0 ||
-      spec.lease_duration_ms_ > std::numeric_limits<std::uint32_t>::max()) {
-    return MetaDomainRejectError(
-        "lease duration must fit the nonzero control-protocol u32 domain");
-  }
-  if (spec.policy_id_.empty() ||
-      spec.policy_id_.size() > kMaxMetaPolicyIdBytes) {
-    return MetaDomainRejectError("grant policy_id is empty or over cap");
-  }
-  return absl::OkStatus();
-}
-
 absl::Status ValidateMetaFailoverTransition(
     const MetaFailoverTransition& transition) {
   return ValidateFailoverTransitionImpl(transition);
@@ -2581,6 +2466,14 @@ absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command) {
     return MetaDomainRejectError("command exceeds kMaxMetaCommandBytes");
   }
   return w.TakeBuffer();
+}
+
+MetaCommandTag MetaCommandTagOf(const MetaCommand& command) noexcept {
+  static_assert(std::variant_size_v<MetaCommand> == 35);
+  const std::size_t index = command.index();
+  if (index < 8) return static_cast<MetaCommandTag>(index + 1);
+  if (index < 12) return static_cast<MetaCommandTag>(index + 2);
+  return static_cast<MetaCommandTag>(index + 3);
 }
 
 absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
@@ -2646,12 +2539,6 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
       command = std::move(*body);
       break;
     }
-    case MetaCommandTag::kGrantAuthority: {
-      auto body = ReadGrantAuthorityBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
-      break;
-    }
     case MetaCommandTag::kActivateAuthority: {
       auto body = ReadActivateAuthorityBody(r);
       if (!body.ok()) return body.status();
@@ -2672,12 +2559,6 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
     }
     case MetaCommandTag::kPutPolicy: {
       auto body = ReadPutPolicyBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
-      break;
-    }
-    case MetaCommandTag::kRetirePolicy: {
-      auto body = ReadRetirePolicyBody(r);
       if (!body.ok()) return body.status();
       command = std::move(*body);
       break;

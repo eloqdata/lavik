@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "gtest/gtest.h"
 #include "keylane/cluster/control_protocol.h"
@@ -36,6 +37,8 @@ control::FullDesiredState DesiredState() {
   control::FullDesiredState desired;
   desired.source_meta_applied_index = 42;
   desired.topology_epoch = 17;
+  desired.authority_lease_duration_ms = 1'000;
+  desired.data_heartbeat_interval_ms = 333;
   desired.nodes = {
       {.node_id = kNode1, .host = "10.0.0.1", .port = 7001, .tls_port = 17001},
       {.node_id = kNode2, .host = "10.0.0.2", .port = 7002, .tls_port = 17002},
@@ -49,14 +52,11 @@ control::FullDesiredState DesiredState() {
       .group_term = 7,
       .authority_version = 8,
       .grant_revision = 40,
-      .grant_duration_ms = 1000,
       .grant_active = true,
       .config_epoch = 12,
       .slot_ranges = {{0, 8191}},
       .manifest_revision = 5,
       .partition_replication_epoch = 13,
-      .grant_policy_id = "lease-policy",
-      .grant_policy_version = 1,
       .steady_replication_enabled = true,
   }};
   auto manifest = keylane::PopulationManifest::Create({});
@@ -69,13 +69,6 @@ control::FullDesiredState DesiredState() {
         .entries = {},
     });
   }
-  const std::string policy_content = "lease policy";
-  desired.policies.push_back({
-      .policy_id = "lease-policy",
-      .version = 1,
-      .content_hash = control::ComputeSha256(policy_content),
-      .content = policy_content,
-  });
   Rehash(&desired);
   return desired;
 }
@@ -111,6 +104,7 @@ TEST(MetaControlMapperTest, BuildsCompleteImmutableServingState) {
   EXPECT_EQ(prepared->control_groups_[0].partition_replication_epoch_,
             DesiredState().groups[0].partition_replication_epoch);
   ASSERT_EQ(prepared->desired_cluster_controls_.size(), 1U);
+  EXPECT_EQ(prepared->authority_lease_duration_ms_, 1'000U);
   const cluster::DesiredClusterControl& desired_control =
       prepared->desired_cluster_controls_.front();
   ASSERT_TRUE(desired_control.owner_endpoint_.has_value());
@@ -142,6 +136,8 @@ TEST(MetaControlMapperTest, InstallsInitialEmptyTopologyAtEpochZero) {
   control::FullDesiredState desired;
   desired.source_meta_applied_index = 1;
   desired.topology_epoch = 0;
+  desired.authority_lease_duration_ms = 1'000;
+  desired.data_heartbeat_interval_ms = 333;
   desired.nodes = {
       {.node_id = kNode1, .host = "10.0.0.1", .port = 7001, .tls_port = 17001}};
   Rehash(&desired);
@@ -168,6 +164,8 @@ TEST(MetaControlMapperTest, AcceptsCommittedOwnerlessGroupBeforeActivation) {
   control::FullDesiredState desired;
   desired.source_meta_applied_index = 2;
   desired.topology_epoch = 1;
+  desired.authority_lease_duration_ms = 1'000;
+  desired.data_heartbeat_interval_ms = 333;
   desired.nodes = {
       {.node_id = kNode1, .host = "10.0.0.1", .port = 7001, .tls_port = 17001}};
   desired.groups = {{.group_id = "group-pending"}};
@@ -189,9 +187,6 @@ TEST(MetaControlMapperTest,
   auto desired = DesiredState();
   auto& group = desired.groups.front();
   group.grant_active = false;
-  group.grant_duration_ms = 0;
-  group.grant_policy_id.clear();
-  group.grant_policy_version = 0;
   Rehash(&desired);
 
   auto prepared = cluster::PrepareMetaFullState(desired, kNode1, 1);
@@ -254,62 +249,14 @@ TEST(MetaControlMapperTest, RejectsNonNumericOrNonCanonicalNodeHosts) {
   EXPECT_TRUE(cluster::PrepareMetaFullState(desired, kNode1, 1).ok());
 }
 
-TEST(MetaControlMapperTest, RejectsNonCanonicalGrantLeaseParameters) {
+TEST(MetaControlMapperTest, RejectsInconsistentGlobalLeaseTimingScalars) {
   auto desired = DesiredState();
-  desired.groups[0].grant_duration_ms = 0;
-  desired.object_hash = {};
-  auto projection_hash = control::ComputeProjectionHash(desired);
-  ASSERT_TRUE(projection_hash.ok()) << projection_hash.status();
-  desired.projection_hash = *projection_hash;
-  auto encoded = control::EncodeFullDesiredState(desired);
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  desired.object_hash = control::ComputeSha256(*encoded);
-  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
-            absl::StatusCode::kInvalidArgument);
+  desired.data_heartbeat_interval_ms = 334;
 
-  desired = DesiredState();
-  desired.groups[0].grant_active = false;
-  desired.object_hash = {};
-  projection_hash = control::ComputeProjectionHash(desired);
-  ASSERT_TRUE(projection_hash.ok()) << projection_hash.status();
-  desired.projection_hash = *projection_hash;
-  encoded = control::EncodeFullDesiredState(desired);
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  desired.object_hash = control::ComputeSha256(*encoded);
-  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
-            absl::StatusCode::kInvalidArgument);
-}
-
-TEST(MetaControlMapperTest, RejectsTamperedMissingAndDuplicatePolicies) {
-  auto desired = DesiredState();
-  desired.policies[0].content.append(" tampered");
-  Rehash(&desired);
-  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
-            absl::StatusCode::kInvalidArgument);
-
-  desired = DesiredState();
-  desired.policies.clear();
-  Rehash(&desired);
-  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
-            absl::StatusCode::kInvalidArgument);
-
-  desired = DesiredState();
-  desired.policies.push_back(desired.policies.front());
-  Rehash(&desired);
-  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
-            absl::StatusCode::kInvalidArgument);
-
-  desired = DesiredState();
-  desired.policies[0].policy_id.clear();
-  Rehash(&desired);
-  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
-            absl::StatusCode::kInvalidArgument);
-
-  desired = DesiredState();
-  desired.policies[0].version = 0;
-  Rehash(&desired);
-  EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
-            absl::StatusCode::kInvalidArgument);
+  const auto prepared = cluster::PrepareMetaFullState(desired, kNode1, 1);
+  EXPECT_EQ(prepared.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_NE(prepared.status().message().find("heartbeat cadence"),
+            std::string_view::npos);
 }
 
 TEST(MetaControlMapperTest, RejectsMalformedMemberIncarnationsAndConfigEpoch) {

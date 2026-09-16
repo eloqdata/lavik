@@ -108,7 +108,8 @@ def run_case(binary, workdir, snapshot, crash_point=None):
             raise H.Failure("two of four members elected a leader")
         for node in minority:
             try:
-                reply = node.putpolicy("minority-proof", 1, "test", timeout=2)
+                reply = node.put_automatic_uncontrolled_failover_policy(
+                    1, timeout=2)
             except (OSError, H.Failure):
                 continue
             if reply.startswith("OK "):

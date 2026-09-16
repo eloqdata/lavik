@@ -291,9 +291,25 @@ ownership.
 Control protocol v1 has no delta format. Initial connection, reconnection, and
 every semantic projection change transfer a complete `FullDesiredState`. The
 object contains global topology plus each group's partition replication epoch
-and the receiving node's policies, immutable population manifests, current
-directives, optional failover transition, optional grant activation action,
-complete membership/owner relationship, and `steady_replication_enabled`.
+and the cluster-wide resolved Authority Lease duration and heartbeat cadence,
+immutable population manifests, current directives, optional failover
+transition, optional grant activation action, complete membership/owner
+relationship, and `steady_replication_enabled`. Policy ids, versions, and raw
+documents remain in Meta Committed State and never cross this Seam. Meta may
+cap the typed Policy duration by its leadership-validity bound, then derives
+cadence as exactly `max(1 ms, duration / 3)` before computing the projection
+hash. Data rejects zero duration, a different cadence, or a cadence beyond the
+negotiated observation TTL rather than applying a local Policy interpretation.
+Replacing FDS changes future renewal and cadence but does not retroactively
+shorten an already installed finite lease. That old lease may bridge normal
+projection convergence; if its remaining time is insufficient, local expiry
+self-fences until a valid lease under the replacement is installed.
+An exact Grant that reaches Data at or after its local deadline is consumed but
+not installed, and Data ends that Meta control session. Reusing the session for
+the next heartbeat would falsely make its higher sequence a causal confirmation
+of the rejected Grant. Session invalidation revokes any older retained
+authority before reauthentication begins a new causal sequence; a later valid
+Grant removes the local fence without a separate self-fence report.
 Meta sets that bit only when the committed cluster lifecycle is `Created`;
 Genesis keeps it false so explicit population directives exclusively own
 ingress. Even when true, Data defers follow-owner reconciliation while an
@@ -343,7 +359,19 @@ exact projection and complete group authority anchor. `sent_at` is captured
 immediately before the first socket write, and the granted duration is applied
 to that monotonic timestamp, so a delayed response cannot extend authority.
 Business heartbeat sequences accept only the next message or an exact replay
-of the preceding message; the latter receives the cached exact ack. Invalid
+of the preceding message; the latter receives the cached exact ack. Data does
+not send heartbeat `N+1` until it has processed Ack `N`, so `N+1` is causal
+evidence that the immediately preceding lease decision reached Data. Meta
+retains it as a confirmed Authority Lease only when Ack `N` granted a nonzero
+lease for this authenticated session/boot and the exact installed Owner,
+assignment, Group term, authority, grant, and projection. Ack write alone and
+a cached Ack replay do not confirm authority. Meta records Owner heartbeat and
+causal-progress receive times on the same steady clock used by detector
+debounce, retains the original time when later heartbeats repeat a confirmation,
+and advances it only for a strictly higher confirmed Ack. Once that causal
+progress is older than the effective lease duration, otherwise-fresh health
+traffic is classified as `heartbeat_expired`; wall-clock corrections do not
+participate in either Owner freshness decision. Invalid
 challenge content changes only the lease decision and cannot suppress common
 health observation. Meta derives role from the installed committed projection,
 not from the payload tag; an authority/no-role heartbeat atomically clears any
@@ -390,8 +418,8 @@ controller projection. A heartbeat already written under the old projection
 is detached from lease authority; its exact ack may still be consumed for wire
 progress, but its lease decision is ignored. Heartbeats resume only after the
 new desired object is installed and `FullStateApplied` is written, so an old
-Ready proof cannot be evaluated against a new assignment, manifest, or
-population epoch.
+Ack cannot causally confirm the replacement projection and an old Ready proof
+cannot be evaluated against a new assignment, manifest, or population epoch.
 
 Directive execution also emits typed, volatile `OperationEvidence` for the
 started and completed phases. Each report is bound to the current session and
@@ -439,12 +467,17 @@ Meta's leadership expiry and every granted lease are bounded by the Raft
 election lower bound `D`, and a leader stops sessions synchronously on
 demotion. Data constructs and rechecks lease deadlines with Linux
 `CLOCK_BOOTTIME`, so suspend time consumes rather than preserves authority.
+Expiry self-fences memory authority without waiting for a lost-session signal,
+an Automatic Failover Detector decision, or a further Meta message.
 The worker's relative timer rechecks that suspend-aware deadline in slices no
 larger than 25 ms or one quarter of the granted duration, whichever is
 smaller. Request admission therefore rejects at the first post-resume touch,
-while source-capability invalidation begins within one bounded slice rather
-than waiting out the pre-suspend remainder of a long lease. Tying the slice to
-the grant avoids imposing a fixed 25 ms lag on deliberately short leases.
+while the source's native admission check compares the same absolute deadline
+under its session-publication mutex and cannot wait for the timer at all. The
+timer closes the O(1) source-admission gate within one bounded slice without
+discarding current FDS capabilities or already-published population sessions.
+Tying the slice to the grant avoids imposing a fixed 25 ms lag on deliberately
+short leases.
 Before issuing the first otherwise-valid lease for each group, boot, authority
 anchor, and leadership generation, Meta waits `2D` on the same suspend-aware
 clock: one maximum prior lease plus a second `D` safety margin. This remains
@@ -452,7 +485,24 @@ safe under the deliberately loose assumption that the Meta host's elapsed-time
 clock advances no more than twice as fast as the prior Data host's; scheduling
 delay can only postpone a grant. The leader-local evidence resets on leadership
 or process restart, so a later owner cannot overlap a predecessor even when no
-Fence acknowledgement is available.
+Fence acknowledgement is available. Before the first socket send of each
+Grant Ack, Meta records a delivery-ambiguous finite window from the exact
+heartbeat receive cut. A higher-sequence heartbeat confirming the Grant makes
+the Owner serviceable and collapses preceding ordered possibilities into that
+exact installed lease window. Meta retains both an unconfirmed maximum and
+the confirmed installed window across a same-authority FDS or duration
+replacement because Data deliberately keeps that lease. Confirmation of a
+later shorter Grant replaces the older installed window. Cached-Ack replay
+does not refresh either deadline; a session or authority change clears them.
+If confirmation never arrives, the last possible window expires to
+`heartbeat_expired`.
+
+The corresponding handoff-pending marker is also session-, authority-, and
+heartbeat-sequence-bound and survives same-authority FDS replacement. Health
+denials cannot bypass the wait: exact unhealthy challenges mature the same
+suspend-aware guard and remain handoff-pending until `2D`; only then may a
+written `NodeNotReady` retire the marker. This avoids both a pre-send ABA
+window and permanent handoff blocking when the Owner remains unhealthy.
 
 NuRaft's peer-liveness timer uses active `CLOCK_MONOTONIC` time, which does not
 advance while a Meta host is suspended. Data control therefore also compares
@@ -506,10 +556,16 @@ its generation and all anchors immediately before crossing that action seam.
 FDS replacement, fencing, session invalidation, lease expiry, and externally
 observed population proof loss advance the generation before publishing their
 invalidating boundary. Their async transition waits for every older token to
-reject or finish registration and only then performs its final revoke/cancel
-pass. Thus a directive cannot appear behind the cleanup represented by
+reject or finish registration. Fencing, population identity loss, and explicit
+revocation then perform their required source/target cleanup. Session loss also
+retires session-scoped target directives, but preserves the exact live
+level-triggered `FollowOwner` attempt whose own history rotation requires the
+Meta session to reconnect. Ordinary lease expiry instead closes only new source
+admission and preserves current capabilities plus sessions already published
+by the source. Thus a directive cannot appear behind the cleanup represented by
 `FullStateApplied` or `FenceAck` even when its action adapter suspended after
-validation. A boot-local fence floor also rejects directives through the
+validation. A
+boot-local fence floor also rejects directives through the
 fenced counter tuple: rebuilds compare the local target assignment, while
 source authorize/revoke compares the local source assignment. A fresh
 assignment or a strictly newer committed counter tuple is therefore
@@ -518,9 +574,10 @@ The bounded worker timer may still be queued briefly after a host resume, so a
 renewal also compares the old deadline with `CLOCK_BOOTTIME` synchronously. If
 the old lease is already due, the renewal path runs that exact expiration
 transition first: it advances the authority generation, retires the stale
-timer, and joins source/directive cleanup before considering the replacement
-grant. A same-anchor heartbeat can extend only a lease that never expired, so
-pre-expiry admissions cannot be revived by a delayed timer.
+timer, closes new source admission, joins older directive admissions, and
+drains retired requests before considering the replacement grant. A
+same-anchor heartbeat can extend only a lease that never expired, so pre-expiry
+admissions cannot be revived by a delayed timer.
 
 The encoded population-directive schema retains bounded `payload`,
 `preconditions`, and `force` fields. `initialize-empty-population` uses its
@@ -612,9 +669,12 @@ authority but does not mutate that content, so FDS reconciliation preserves a
 matching Ready population across a term-only change only when the epoch remains
 unchanged, and reports its candidate proof under the newer committed term. An
 epoch-only change first revokes Ready and serving eligibility and requires a
-new rebuild before another lease can be granted. In-progress rebuilds remain
-term-scoped and are cancelled unless the FDS
-still carries their exact term and a rebuild successor. Grantless groups have
+new rebuild before another lease can be granted. Explicit rebuild directives
+remain term-scoped and are cancelled unless the FDS still carries their exact
+term and rebuild successor. A steady FollowOwner FULL may instead finish across
+a forward term-only fence when the physical population anchors and its exact
+active follow/session/rebuild ownership remain unchanged; Owner, assignment,
+manifest, or partition-epoch replacement still retires it. Grantless groups have
 no `ServingState` owner or bound slots, but their committed membership remains
 in the controller identity view so this preservation is possible. For any
 member incarnation retained across projections, NodeControl also requires the
@@ -733,8 +793,9 @@ no-key mutations, and the remaining `CLUSTER` management subcommands
 ## Verification
 
 The admission decision matrix, builder and parser validation, content-hash
-publication semantics, finite lease lifecycle, controlled mutation pause,
-failover action/activation, follow-owner reconciliation, frame and
+publication semantics, resolved lease/cadence validation, causal heartbeat
+sequencing, finite lease self-fencing, controlled mutation pause, failover
+action/activation, follow-owner reconciliation, frame and
 complete-object codecs, projection validation, drain behavior, TLS-aware
 endpoint selection, in-flight counter concurrency and cell sharing, and the
 CLUSTER wire texts and reply shapes are unit-tested through pure seams and the
@@ -760,9 +821,9 @@ incomplete-full-sync fence without a local topology source.
 | ServingState model, builder validation, topology cache, content hash, striped in-flight cells, and routing functions | `include/keylane/cluster/topology.h`, `src/cluster/topology.cpp` |
 | Admission decision and owner-side authority re-check | `include/keylane/cluster/authority.h`, `src/cluster/authority.cpp` |
 | Final logical-mutation precondition and WATCH/publication seam | `include/keylane/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp` |
-| Meta/Data protocol framing, independent failover observations, transition/activation projection, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
+| Meta/Data protocol framing, resolved Authority Lease/cadence fields, independent failover observations, transition/activation projection, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Node controller, full-state validation, controlled pause, provisional activation, finite authority, drain, follow-owner reconciliation, and typed replication adaptation | `include/keylane/cluster/node_control.h`, `include/keylane/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp`, `include/keylane/replication.h`, `src/replication/replication.cpp` |
-| Meta discovery and outbound Data control session | `include/keylane/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
+| Meta discovery, outbound Data control session, stop-and-wait causal heartbeat cadence, and finite-lease expiry | `include/keylane/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
 | Process-wide runtime installation | `include/keylane/cluster/runtime.h`, `src/cluster/runtime.cpp` |
 | Cluster admission gate, controlled TRYAGAIN/PUBLISH handling, owner/final re-check plumbing, outcome finalization, EXEC/Lua/blocking integration, and mode-restricted command policies | `src/redis/command.cpp`, `src/redis/cluster_gate.h`, `src/redis/blocking_wait.cpp` |
 | CLUSTER subcommands and discovery replies | `src/redis/cluster_command.cpp`, `src/redis/cluster_command.h` |

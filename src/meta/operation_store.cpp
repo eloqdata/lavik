@@ -215,21 +215,6 @@ absl::StatusOr<MetaSubmitResult> MetaOperationStore::SubmitOperation(
   if (command.intent_.size() > kMaxMetaPayloadBytes) {
     return MetaDomainRejectError("operation intent exceeds its cap");
   }
-  if (command.policy_references_.size() >
-      kMaxMetaPolicyReferencesPerOperation) {
-    return MetaDomainRejectError("operation policy reference cap exceeded");
-  }
-  std::set<std::pair<std::string, std::uint64_t>> references;
-  for (const MetaPolicyReference& reference : command.policy_references_) {
-    if (reference.policy_id_.empty() ||
-        reference.policy_id_.size() > kMaxMetaPolicyIdBytes ||
-        reference.version_ == 0) {
-      return MetaDomainRejectError("invalid operation policy reference");
-    }
-    if (!references.emplace(reference.policy_id_, reference.version_).second) {
-      return MetaDomainRejectError("duplicate operation policy reference");
-    }
-  }
   // Retention-window idempotency on the client-provided id, across live
   // records and archive tombstones.
   if (const auto it = live_.find(command.operation_id_); it != live_.end()) {
@@ -272,7 +257,6 @@ absl::StatusOr<MetaSubmitResult> MetaOperationStore::SubmitOperation(
   record.intent_ = command.intent_;
   record.intent_hash_ = command.intent_hash_;
   record.replication_history_id_ = command.replication_history_id_;
-  record.policy_references_ = command.policy_references_;
   record.actor_ = command.actor_;
   live_.emplace(command.operation_id_, std::move(record));
   live_by_seq_.emplace(operation_seq, command.operation_id_);
@@ -358,20 +342,6 @@ bool MetaOperationStore::TransitionAlreadyApplied(
          DirectiveSpecsMatch(record.current_directives_,
                              command.current_directives_) &&
          EvidenceTailMatches(record, command.evidence_);
-}
-
-bool MetaOperationStore::PolicyInUse(std::string_view policy_id,
-                                     std::uint64_t version) const {
-  for (const auto& [id, record] : live_) {
-    (void)id;
-    if (IsTerminal(record.lifecycle_)) continue;
-    for (const MetaPolicyReference& reference : record.policy_references_) {
-      if (reference.policy_id_ == policy_id && reference.version_ == version) {
-        return true;
-      }
-    }
-  }
-  return false;
 }
 
 bool MetaOperationStore::PopulationManifestInUse(
@@ -807,15 +777,6 @@ absl::Status ReadStoreSchemaVersion(MetaReader& r) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<MetaPolicyReference> ReadStoredPolicyReference(MetaReader& r) {
-  auto reference = ReadMetaPolicyReference(r);
-  if (!reference.ok()) return reference.status();
-  if (reference->policy_id_.empty() || reference->version_ == 0) {
-    return MetaFailStopError("invalid operation policy reference");
-  }
-  return reference;
-}
-
 absl::Status ReadLifecycle(MetaReader& r, MetaOperationLifecycle& out) {
   auto tag = r.ReadU8();
   if (!tag.ok()) return tag.status();
@@ -889,7 +850,6 @@ void WriteRecord(MetaWriter& w, const MetaOperationRecord& record) {
   w.WriteString(record.intent_);
   WriteFixedArray(w, record.intent_hash_);
   WriteFixedArray(w, record.replication_history_id_);
-  w.WriteList(record.policy_references_, WriteMetaPolicyReference);
   w.WriteU8(static_cast<std::uint8_t>(record.lifecycle_));
   w.WriteString(record.kind_phase_blob_);
   w.WriteList(record.current_directives_,
@@ -925,11 +885,6 @@ absl::StatusOr<MetaOperationRecord> ReadRecord(MetaReader& r) {
   auto replication_history = ReadFixedArray<kMetaReplicationHistoryIdBytes>(r);
   if (!replication_history.ok()) return replication_history.status();
   record.replication_history_id_ = *replication_history;
-  auto policy_references = r.ReadList<MetaPolicyReference>(
-      kMaxMetaPolicyReferencesPerOperation,
-      [](MetaReader& rr) { return ReadStoredPolicyReference(rr); });
-  if (!policy_references.ok()) return policy_references.status();
-  record.policy_references_ = std::move(*policy_references);
   if (absl::Status status = ReadLifecycle(r, record.lifecycle_); !status.ok()) {
     return status;
   }
@@ -1087,14 +1042,6 @@ absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
     if (store.live_by_seq_.contains(record.operation_seq_) ||
         store.archived_by_seq_.contains(record.operation_seq_)) {
       return MetaFailStopError("duplicate operation_seq in snapshot");
-    }
-    std::set<std::pair<std::string, std::uint64_t>> policy_references;
-    for (const MetaPolicyReference& reference : record.policy_references_) {
-      if (!policy_references.emplace(reference.policy_id_, reference.version_)
-               .second) {
-        return MetaFailStopError(
-            "duplicate operation policy reference in snapshot");
-      }
     }
     for (const MetaEvidenceSummary& evidence : record.evidence_) {
       if (!EvidenceSummaryWellFormed(evidence) ||

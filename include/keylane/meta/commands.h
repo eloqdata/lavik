@@ -76,7 +76,8 @@ using MetaDirectiveId = std::array<std::uint8_t, 16>;
 using MetaFailoverTransitionId = std::array<std::uint8_t, 16>;
 using MetaFailoverActionId = std::array<std::uint8_t, 16>;
 
-// Content-addressing hashes (policy content, intent, evidence): SHA-256.
+// Content-addressing hashes (intent, evidence, manifests, projections):
+// SHA-256. Policy replay identity is its bounded exact raw document.
 using MetaHash256 = std::array<std::uint8_t, 32>;
 
 // boot_incarnation: opaque fixed-length value, compared only for equality and
@@ -113,7 +114,6 @@ inline constexpr std::uint32_t kMaxMetaActorReadableTimeBytes = 128;
 inline constexpr std::uint32_t kMaxMetaEndpointsPerNode = 2;
 inline constexpr std::uint32_t kMaxMetaEndpointBytes = 256;
 inline constexpr std::uint32_t kMaxMetaPolicyIdBytes = 128;
-inline constexpr std::uint32_t kMaxMetaPolicyReferencesPerOperation = 16;
 inline constexpr std::uint32_t kMaxMetaOperationKindBytes = 64;
 // Cluster creation is a v1-only protocol. This existing workflow kind remains
 // the single durable root type rather than introducing a parallel topology
@@ -125,10 +125,11 @@ inline constexpr std::string_view kMetaClusterCreateV1GroupOperationKind =
 inline constexpr std::string_view kMetaMembershipOperationKind =
     "meta-membership-workflow-v1";
 inline constexpr std::uint32_t kMaxMetaEvidenceSummariesPerCommand = 64;
-// A declarative create installs one source authorization and one rebuild per
-// replica in a single revision. This remains below both the terminal-receipt
-// cap and projected-directive cap, while the 64 KiB Admin request is the
-// tighter admission bound for cluster-create.
+// A declarative create installs source authorization first, then retains each
+// acknowledged authorization while adding the replica's rebuild at a later
+// operation revision. The resulting maximum of two current directives per
+// replica remains below both the terminal-receipt and projected-directive
+// caps, while the 64 KiB Admin request is the tighter admission bound.
 inline constexpr std::uint32_t kMaxMetaDirectivesPerOperation = 1024;
 inline constexpr std::uint32_t kMaxMetaDirectiveKindBytes = 64;
 // Durable directive names and their execution-side classification live with
@@ -188,11 +189,14 @@ enum class MetaAuditPolicy : std::uint8_t {
 };
 
 // Version of the Raft command/WAL envelope, independent from individual
-// store codecs. Version 2 makes the ClusterCreate lifecycle cut explicit:
-// an older WAL whose opaque root intent predates the caller-owned Genesis id
-// must fail stop at decode instead of partially rebuilding Uninitialized
-// state. This changes no command tag.
-inline constexpr std::uint16_t kMetaCommandFormatVersion = 2;
+// store codecs. Version 4 removes retired Policy commands, caller-supplied
+// Policy content hashes and references, and the durable grant specification,
+// records automatic-failover trigger provenance on uncontrolled begins, and
+// optionally carries a CAS witness for the pristine Submitted Controlled
+// requests that apply preempts atomically for the affected Group.
+// Older WALs fail stop at decode; Keylane has no compatibility path for these
+// pre-release formats. Removed command-tag values remain reserved.
+inline constexpr std::uint16_t kMetaCommandFormatVersion = 4;
 
 // Wire tag per command. Tags are append-only and never reused.
 enum class MetaCommandTag : std::uint16_t {
@@ -204,12 +208,12 @@ enum class MetaCommandTag : std::uint16_t {
   kRemoveNodeFromGroup = 6,
   kSetSlotMap = 7,
   kBeginGroupTerm = 8,
-  kGrantAuthority = 9,
+  // 9 was GrantAuthority and remains reserved.
   kActivateAuthority = 10,
   kRevokeGrant = 11,
   kFenceGroup = 12,
   kPutPolicy = 13,
-  kRetirePolicy = 14,
+  // 14 was RetirePolicy and remains reserved.
   kSubmitOperation = 15,
   kTransitionOperationPhase = 16,
   kCompleteOperation = 17,
@@ -387,28 +391,12 @@ absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes);
 
 // ---------------------------------------------------------------------------
 // term/grant: BeginGroupTerm(T) raises group_term exactly once and enters the
-// no-grant/fenced state; GrantAuthority updates the same owner's committed
-// grant specification and revision without moving owner/term (runtime lease
-// renewal remains heartbeat/session state); ActivateAuthority is the direct
-// authority-install/migration command. It validates expected_term and reuses
-// the same atomic owner + grant + authority_version + epochs kernel as typed
-// failover Commit, while deliberately carrying NO new term.
+// no-grant/fenced state. ActivateAuthority is the direct authority-install
+// command. It validates expected_term and reuses the same atomic owner + grant
+// + authority_version + epochs kernel as typed failover Commit, while
+// deliberately carrying NO new term. Lease configuration is current global
+// Policy and is not retained in an authority command or grant.
 // ---------------------------------------------------------------------------
-
-// Lease parameters plus the committed policy-version reference every grant
-// must carry. Apply rejects references to policy versions that are not
-// committed.
-struct MetaGrantSpec {
-  std::uint64_t lease_duration_ms_ = 0;
-  std::string policy_id_;
-  std::uint64_t policy_version_ = 0;
-  bool operator==(const MetaGrantSpec&) const = default;
-};
-
-// Intrinsic grant validation shared by ordinary authority installation and
-// failover successor snapshots. Policy existence is an aggregate-store fact,
-// so version zero is valid here when that exact version is active.
-absl::Status ValidateMetaGrantSpec(const MetaGrantSpec& spec);
 
 // ---------------------------------------------------------------------------
 // Failover transition values and typed commands.
@@ -496,7 +484,6 @@ struct MetaFailoverTransition {
   std::uint64_t revision_ = 0;
   MetaFailoverMode mode_ = MetaFailoverMode::kUncontrolled;
   std::uint64_t target_term_ = 0;
-  MetaGrantSpec successor_grant_;
   std::optional<MetaFailoverCandidateAction> candidate_action_;
   std::optional<MetaControlledFailover> controlled_;
   bool operator==(const MetaFailoverTransition&) const = default;
@@ -511,8 +498,8 @@ struct MetaFailoverTransitionRef {
 };
 
 // Validates the intrinsic, cross-field invariants of a durable transition.
-// Cross-store facts such as membership and active policy existence remain the
-// aggregate apply/restore layer's responsibility.
+// Cross-store facts such as membership remain the aggregate apply/restore
+// layer's responsibility.
 absl::Status ValidateMetaFailoverTransition(
     const MetaFailoverTransition& transition);
 
@@ -534,7 +521,6 @@ struct BeginControlledFailover {
   std::string group_id_;
   MetaFailoverTransitionId transition_id_{};
   std::uint64_t target_term_ = 0;
-  MetaGrantSpec successor_grant_;
   MetaFailoverCandidateAction candidate_action_;
   MetaOperationId operation_id_{};
   std::uint64_t expected_operation_revision_ = 0;
@@ -552,14 +538,59 @@ struct BeginControlledFailover {
   bool operator==(const BeginControlledFailover&) const = default;
 };
 
+// Replicated provenance for an uncontrolled failover. Manual requests carry
+// kManual/0; an automatic request carries the exact serviceability reason and
+// the accumulated suspect duration observed by the proposing leader. These
+// fields are audit evidence, not inputs to deterministic transition apply.
+enum class MetaAutomaticFailoverReason : std::uint8_t {
+  kManual = 0,
+  kSessionMissing = 1,
+  kHeartbeatExpired = 2,
+  kDraining = 3,
+  kStorageUnready = 4,
+  kPopulationUnready = 5,
+};
+
+inline constexpr std::string_view MetaAutomaticFailoverReasonName(
+    MetaAutomaticFailoverReason reason) {
+  switch (reason) {
+    case MetaAutomaticFailoverReason::kManual:
+      return "manual";
+    case MetaAutomaticFailoverReason::kSessionMissing:
+      return "session_missing";
+    case MetaAutomaticFailoverReason::kHeartbeatExpired:
+      return "heartbeat_expired";
+    case MetaAutomaticFailoverReason::kDraining:
+      return "draining";
+    case MetaAutomaticFailoverReason::kStorageUnready:
+      return "storage_unready";
+    case MetaAutomaticFailoverReason::kPopulationUnready:
+      return "population_unready";
+  }
+  return "unknown";
+}
+
 struct BeginUncontrolledFailover {
   MetaRequestId request_id_{};
   ActorContext actor_;
   std::string group_id_;
   MetaFailoverTransitionId transition_id_{};
   std::uint64_t target_term_ = 0;
-  MetaGrantSpec successor_grant_;
+  // Operator-initiated manual recovery may seed an already selected Candidate.
+  // Automatic detection must begin candidate-less so the fenced transition's
+  // reconciler selects from observations current after the Begin commit.
   std::optional<MetaFailoverCandidateAction> candidate_action_;
+  MetaAutomaticFailoverReason trigger_reason_ =
+      MetaAutomaticFailoverReason::kManual;
+  std::uint64_t suspect_duration_ms_ = 0;
+  // An automatic Begin may carry one proposer-observed pristine Submitted
+  // Controlled request as a CAS witness. Apply deterministically terminalizes
+  // every pristine request for this Group, including requests committed after
+  // proposal construction. Both optionals must be present or absent; the
+  // revision is an explicit operation CAS even though pristine requests
+  // currently have revision zero.
+  std::optional<MetaOperationId> preempted_operation_id_;
+  std::optional<std::uint64_t> expected_preempted_operation_revision_;
   std::string expected_owner_node_id_;
   MetaAssignmentId expected_owner_assignment_id_{};
   std::uint64_t expected_membership_revision_ = 0;
@@ -635,10 +666,6 @@ struct CommitControlledFailover {
   MetaFailoverActionId action_id_{};
   std::uint64_t authorized_revision_ = 0;
   MetaFailoverCandidate expected_candidate_;
-  // Exact copy of the transition's frozen successor grant. Commit clears the
-  // transition, so retaining this CAS in the command is necessary to verify
-  // the complete post-state on replay.
-  MetaGrantSpec successor_grant_;
   std::string expected_owner_node_id_;
   MetaAssignmentId expected_owner_assignment_id_{};
   std::uint64_t expected_membership_revision_ = 0;
@@ -666,7 +693,6 @@ struct CommitUncontrolledFailover {
   // pure function of this terminal command after the transition is cleared.
   MetaFailoverLoss loss_if_cutover_ = MetaFailoverLoss::kUnknown;
   MetaFailoverCandidate expected_candidate_;
-  MetaGrantSpec successor_grant_;
   std::string expected_owner_node_id_;
   MetaAssignmentId expected_owner_assignment_id_{};
   std::uint64_t expected_membership_revision_ = 0;
@@ -692,24 +718,12 @@ struct BeginGroupTerm {
   bool operator==(const BeginGroupTerm&) const = default;
 };
 
-struct GrantAuthority {
-  MetaRequestId request_id_{};
-  ActorContext actor_;
-  std::string group_id_;
-  std::string node_id_;  // current owner; apply verifies it is unchanged
-  std::uint64_t term_ = 0;
-  std::uint64_t authority_version_ = 0;
-  MetaGrantSpec grant_;
-  bool operator==(const GrantAuthority&) const = default;
-};
-
 struct ActivateAuthority {
   MetaRequestId request_id_{};
   ActorContext actor_;
   std::string group_id_;
   std::uint64_t expected_term_ = 0;  // CAS on the current term; no new term
   std::string new_owner_;            // node_id
-  MetaGrantSpec grant_;
   std::uint64_t new_authority_version_ = 0;
   std::uint64_t new_topology_epoch_ = 0;
   std::uint64_t new_config_epoch_ = 0;
@@ -733,11 +747,7 @@ struct FenceGroup {
 };
 
 // ---------------------------------------------------------------------------
-// policy: versioned documents addressed by content hash.
-// RetirePolicy must be rejected by apply while a version is still referenced
-// by an active grant, an active failover transition's successor grant, or a
-// non-terminal operation — the schema carries just the (policy_id, version)
-// pair.
+// policy: immutable raw documents in one of the compiled-in Policy families.
 // ---------------------------------------------------------------------------
 
 struct PutPolicy {
@@ -746,16 +756,7 @@ struct PutPolicy {
   std::string policy_id_;
   std::uint64_t version_ = 0;
   std::string content_;  // bounded by kMaxMetaPayloadBytes
-  MetaHash256 content_hash_{};
   bool operator==(const PutPolicy&) const = default;
-};
-
-struct RetirePolicy {
-  MetaRequestId request_id_{};
-  ActorContext actor_;
-  std::string policy_id_;
-  std::uint64_t version_ = 0;
-  bool operator==(const RetirePolicy&) const = default;
 };
 
 // ---------------------------------------------------------------------------
@@ -787,15 +788,6 @@ struct MetaEvidenceSummary {
   bool operator==(const MetaEvidenceSummary&) const = default;
 };
 
-// A committed policy dependency of a non-terminal operation. Keeping the
-// reference structured (rather than interpreting the opaque intent) lets
-// apply deterministically prevent retirement while work is live.
-struct MetaPolicyReference {
-  std::string policy_id_;
-  std::uint64_t version_ = 0;
-  bool operator==(const MetaPolicyReference&) const = default;
-};
-
 struct SubmitOperation {
   MetaRequestId request_id_{};
   ActorContext actor_;
@@ -806,7 +798,6 @@ struct SubmitOperation {
   // All-zero means no replication-history binding. Evidence carrying a
   // history id is accepted only when it matches this committed anchor.
   MetaReplicationHistoryId replication_history_id_{};
-  std::vector<MetaPolicyReference> policy_references_;
   bool operator==(const SubmitOperation&) const = default;
 };
 
@@ -1023,16 +1014,21 @@ struct PrunePopulationManifest {
 
 using MetaCommand = std::variant<
     RegisterNode, UpdateNode, RetireNode, CreateGroup, AssignNodeToGroup,
-    RemoveNodeFromGroup, SetSlotMap, BeginGroupTerm, GrantAuthority,
-    ActivateAuthority, RevokeGrant, FenceGroup, PutPolicy, RetirePolicy,
-    SubmitOperation, TransitionOperationPhase, CompleteOperation,
-    AbortOperation, ArchiveOperations, PruneAudit, PruneOperationArchive,
-    BindMetaMember, RetireMetaMember, SetGroupReplicationState, SetAuditPolicy,
+    RemoveNodeFromGroup, SetSlotMap, BeginGroupTerm, ActivateAuthority,
+    RevokeGrant, FenceGroup, PutPolicy, SubmitOperation,
+    TransitionOperationPhase, CompleteOperation, AbortOperation,
+    ArchiveOperations, PruneAudit, PruneOperationArchive, BindMetaMember,
+    RetireMetaMember, SetGroupReplicationState, SetAuditPolicy,
     PutPopulationManifest, PrunePopulationManifest, CommitDirectiveResult,
     PruneTerminalReceipts, BeginControlledFailover, BeginUncontrolledFailover,
     SetUncontrolledCandidate, AuthorizeFailoverPrepare, AbortControlledFailover,
     DegradeControlledFailover, CommitControlledFailover,
     CommitUncontrolledFailover>;
+
+// Returns the append-only wire tag for a command alternative. The variant is
+// kept in tag order, while removed tag values remain permanent holes; callers
+// must use this helper instead of deriving a tag directly from variant index.
+MetaCommandTag MetaCommandTagOf(const MetaCommand& command) noexcept;
 
 // Encode produces the full envelope. Fails (kDomainReject class) when a field
 // exceeds its cap or the total exceeds kMaxMetaCommandBytes; the encoding is

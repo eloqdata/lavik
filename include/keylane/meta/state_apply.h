@@ -33,69 +33,64 @@
 //
 // Cross-store invariants enforced HERE (the stores expose fact queries; this
 // layer is the only place that sees all seven stores):
-//   1. principal vs grant: the target node of AssignNodeToGroup,
-//      GrantAuthority, and ActivateAuthority must be a registered, non-retired
-//      node (identity store).
-//   2. RetirePolicy: rejected while an active grant, an active failover
-//      transition's frozen successor grant, or a non-terminal operation's
-//      structured policy-reference list names the version. Operation intents
-//      remain opaque; callers must put safety-relevant policy dependencies in
-//      that committed list.
-//   3. ActivateAuthority atomicity: grant-store ValidateActivate plus every
+//   1. principal vs grant: the target node of AssignNodeToGroup and
+//      ActivateAuthority must be a registered, non-retired node (identity
+//      store).
+//   2. ActivateAuthority atomicity: grant-store ValidateActivate plus every
 //      topology-side check (topology_epoch exactly current+1, new owner is a
-//      group member and registered active, grant policy version active) all
-//      run BEFORE any write; only then the grant half (ApplyGrantPart) and
+//      group member and registered active) all run BEFORE any write; only then
+//      the grant half (ApplyGrantPart) and
 //      the topology half (owner, authority_version, topology_epoch,
 //      config_epoch) are written in order. Any rejection leaves both halves
 //      untouched.
-//   4. one-node-one-group cross-store half: an AssignNodeToGroup that would
+//   3. one-node-one-group cross-store half: an AssignNodeToGroup that would
 //      move a node into a group it is not currently a member of requires the
 //      node to hold no current membership and no active grant. "Grant owner
 //      => member of the group" is maintained by the ActivateAuthority member
-//      check (3) and by rejecting RemoveNodeFromGroup of a grant owner, so
+//      check (2) and by rejecting RemoveNodeFromGroup of a grant owner, so
 //      the grant fact is read through the node's current group. Operation
 //      intents remain opaque and do not create implicit node obligations.
-//   5. The policy version referenced by GrantAuthority/ActivateAuthority must
-//      be committed and non-retired (policy store IsVersionActive).
-//   6. Remaining cross-domain facts: group existence and membership CAS live
+//   4. A Created cluster always has both registered current global Policies.
+//   5. Remaining cross-domain facts: group existence and membership CAS live
 //      in the stores; RetireNode is additionally rejected while the node
-//      still holds group membership (which, by the invariant in (4), also
+//      still holds group membership (which, by the invariant in (3), also
 //      covers an active grant).
-//   7. TransitionOperationPhase is applied to a candidate operation store and
+//   6. TransitionOperationPhase is applied to a candidate operation store and
 //      the exact FullDesiredState for every old/new directive recipient is
 //      projected and encoded before commit. This aggregate check prevents
 //      individually valid operations from making a node's projection exceed
 //      protocol count, field, or total-object limits; rejection leaves the
 //      operation store unchanged.
-//   8. Live directives remain valid after later committed mutations. After
+//   7. Live directives remain valid after later committed mutations. After
 //      every accepted command, apply rechecks their exact source/target
 //      assignments, active term/authority/grant revision, and population
 //      identity, removes stale attempts, and bumps each affected operation's
 //      CAS revision once. CommitDirectiveResult repeats the same check before
 //      first commit; snapshot recovery and projection reject any stale entry
 //      that bypassed this invariant.
-//   9. SetSlotMap first constructs the complete candidate topology and rejects
+//   8. SetSlotMap first constructs the complete candidate topology and rejects
 //      any slot-ownership or config-epoch change that affects a group with an
 //      active grant. Source and destination groups must be fenced before the
 //      cut, so no lease issued for the old projection can span a slot move.
-//  10. A root ClusterCreate submission and the topology store's transition
+//   9. A root ClusterCreate submission and the topology store's transition
 //      from Uninitialized to Creating are one aggregate apply. Root completion
 //      or abort atomically enters Created or ProvisioningFailed. Exact replay
 //      must observe both halves; lifecycle, rather than retained operation
 //      history or manifest equality, permanently rejects another Genesis.
 //      Creating also holds the existing Meta-membership workflow gate.
-//  11. An active failover transition freezes its group membership,
+//  10. An active failover transition freezes its group membership,
 //      replication-state, slot/config, term, and authority anchors. Ordinary
 //      commands that would change those anchors reject until the transition
 //      terminates; exact replay and the documented same-grant semantic no-op
 //      remain admissible.
-//  12. Failover Begin requires no active transition and validates its frozen
+//  11. Failover Begin requires no active transition and validates its frozen
 //      committed anchors; every post-Begin mutation validates the exact
 //      transition revision. Mutations spanning topology, grant, and/or
 //      operation state stage their complete result in a candidate aggregate,
 //      validate affected FullDesiredState projections, and publish atomically.
-//      Restore revalidates transition-id uniqueness, frozen owner/grant/policy
-//      anchors, and the Controlled transition's exact pristine operation link.
+//      Restore revalidates transition-id uniqueness, coherence with the
+//      Group's current authority and membership, and the Controlled
+//      transition's exact pristine operation link.
 //
 // MetaStores is the committed aggregate that snapshots serialize as one
 // versioned envelope: per-store length-prefixed versioned blobs in a fixed

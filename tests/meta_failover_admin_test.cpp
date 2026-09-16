@@ -109,7 +109,8 @@ ClusterStatusWireV1 ReadyStatus() {
                             .config_epoch_ = 8,
                             .grant_revision_ = 12,
                             .serving_ready_ = true,
-                            .topology_converged_ = true});
+                            .topology_converged_ = true,
+                            .effective_threshold_ms_ = 1'000});
   status.slot_ranges_.push_back(
       {.first_ = 0, .last_ = 16'383, .group_id_ = "group-a"});
   return status;

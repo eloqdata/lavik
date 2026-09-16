@@ -23,7 +23,7 @@ namespace keylane::meta {
 namespace {
 
 constexpr std::uint16_t kHeadWireVersion = 1;
-constexpr std::uint16_t kStatusWireVersion = 2;
+constexpr std::uint16_t kStatusWireVersion = 3;
 constexpr std::size_t kMaxItems = 65'536;
 constexpr std::size_t kMaxString = 64 * 1024;
 constexpr std::size_t kMaxWireReply = 256 * 1024 * 1024;
@@ -184,19 +184,83 @@ bool IsCanonicalOperationId(std::string_view value) {
 }
 
 bool IsSafeFailureSummary(std::string_view value) {
-  return !value.empty() &&
-         value.size() <= kMaxMetaClusterFailureSummaryBytes &&
-         std::all_of(value.begin(), value.end(), [](unsigned char ch) {
-           return ch >= 0x20 && ch <= 0x7e;
-         });
+  return !value.empty() && value.size() <= kMaxMetaClusterFailureSummaryBytes &&
+         std::all_of(value.begin(), value.end(),
+                     [](unsigned char ch) { return ch >= 0x20 && ch <= 0x7e; });
+}
+
+bool IsAutomaticFailoverReason(std::string_view value) {
+  static constexpr std::array<std::string_view, 5> kReasons = {
+      "session_missing", "heartbeat_expired", "draining", "storage_unready",
+      "population_unready"};
+  return std::find(kReasons.begin(), kReasons.end(), value) != kReasons.end();
+}
+
+bool IsAutomaticFailoverBlocker(std::string_view value) {
+  static constexpr std::array<std::string_view, 7> kBlockers = {
+      "leader_ineligible",     "leadership_warmup",  "authority_handoff",
+      "failover_transition",   "stale_owner_anchor", "causal_lease_pending",
+      "indeterminate_evidence"};
+  return std::find(kBlockers.begin(), kBlockers.end(), value) !=
+         kBlockers.end();
+}
+
+absl::Status ValidateAutomaticFailoverDiagnostics(
+    const ClusterGroupWireV1& group, bool allow_pre_policy_diagnostics) {
+  const bool has_reason = group.current_reason_.has_value();
+  const bool has_blocker = group.blocked_reason_.has_value();
+  if (has_reason && !IsAutomaticFailoverReason(*group.current_reason_)) {
+    return absl::InvalidArgumentError(
+        "invalid clusterstatus automatic failover reason");
+  }
+  if (has_blocker && !IsAutomaticFailoverBlocker(*group.blocked_reason_)) {
+    return absl::InvalidArgumentError(
+        "invalid clusterstatus automatic failover blocker");
+  }
+  switch (group.automatic_failover_state_) {
+    case ClusterAutomaticFailoverState::kDisabled:
+      // Before Genesis, a legally non-pristine topology may contain Groups
+      // without either required Policy. DISABLED with a zero threshold is the
+      // only honest diagnostic for that pre-Policy state.
+      if (!has_reason && !has_blocker && group.suspect_elapsed_ms_ == 0 &&
+          (group.effective_threshold_ms_ != 0 ||
+           allow_pre_policy_diagnostics)) {
+        return absl::OkStatus();
+      }
+      break;
+    case ClusterAutomaticFailoverState::kHealthy:
+      if (!has_reason && !has_blocker && group.suspect_elapsed_ms_ == 0 &&
+          group.effective_threshold_ms_ != 0) {
+        return absl::OkStatus();
+      }
+      break;
+    case ClusterAutomaticFailoverState::kSuspect:
+      if (has_reason && !has_blocker && group.effective_threshold_ms_ != 0 &&
+          group.suspect_elapsed_ms_ < group.effective_threshold_ms_) {
+        return absl::OkStatus();
+      }
+      break;
+    case ClusterAutomaticFailoverState::kBlocked:
+      if (!has_reason && has_blocker && group.effective_threshold_ms_ != 0) {
+        return absl::OkStatus();
+      }
+      break;
+    case ClusterAutomaticFailoverState::kTriggering:
+      if (has_reason && !has_blocker && group.effective_threshold_ms_ != 0 &&
+          group.suspect_elapsed_ms_ >= group.effective_threshold_ms_) {
+        return absl::OkStatus();
+      }
+      break;
+  }
+  return absl::InvalidArgumentError(
+      "inconsistent clusterstatus automatic failover diagnostics");
 }
 
 absl::Status ValidateClusterLifecycle(const ClusterStatusWireV1& status) {
   const bool has_identity = status.root_operation_id_.has_value() &&
                             status.genesis_commit_index_.has_value() &&
                             *status.genesis_commit_index_ != 0 &&
-                            IsCanonicalOperationId(
-                                *status.root_operation_id_);
+                            IsCanonicalOperationId(*status.root_operation_id_);
   switch (status.cluster_state_) {
     case ClusterStateWireV1::kUninitialized:
     case ClusterStateWireV1::kNonPristine:
@@ -399,6 +463,16 @@ absl::Status ValidateStatusIdentity(const ClusterStatusWireV1& status) {
   for (const auto& group : status.groups_) {
     if (group.group_id_.empty()) {
       return absl::InvalidArgumentError("empty clusterstatus group id");
+    }
+    if (static_cast<std::uint8_t>(group.automatic_failover_state_) >
+        static_cast<std::uint8_t>(ClusterAutomaticFailoverState::kTriggering)) {
+      return absl::InvalidArgumentError(
+          "invalid clusterstatus automatic failover state");
+    }
+    if (absl::Status valid = ValidateAutomaticFailoverDiagnostics(
+            group, status.cluster_state_ == ClusterStateWireV1::kNonPristine);
+        !valid.ok()) {
+      return valid;
     }
     if (group.owner_node_id_.has_value() &&
         !std::binary_search(node_ids.begin(), node_ids.end(),
@@ -662,7 +736,8 @@ std::string StatusExplanation(const ClusterStatusOutcome& outcome) {
     case ClusterStateWireV1::kCreated:
       return status.cluster_ready_
                  ? "creation and current runtime readiness are healthy"
-                 : "creation completed but current runtime readiness is blocked";
+                 : "creation completed but current runtime readiness is "
+                   "blocked";
     case ClusterStateWireV1::kProvisioningFailed:
       return "Genesis committed but deterministic provisioning failed";
   }
@@ -671,22 +746,26 @@ std::string StatusExplanation(const ClusterStatusOutcome& outcome) {
 
 std::string NextAction(const ClusterStatusOutcome& outcome) {
   if (!outcome.status_.has_value()) {
-    return "retry cluster-status; if this persists, verify Meta quorum and Admin connectivity";
+    return "retry cluster-status; if this persists, verify Meta quorum and "
+           "Admin connectivity";
   }
   const auto& status = *outcome.status_;
   switch (status.cluster_state_) {
     case ClusterStateWireV1::kUninitialized:
       return "run cluster-create with a validated manifest when ready";
     case ClusterStateWireV1::kNonPristine:
-      return "do not rerun cluster-create; inspect artifacts and rebuild the Meta data directory";
+      return "do not rerun cluster-create; inspect artifacts and rebuild the "
+             "Meta data directory";
     case ClusterStateWireV1::kCreating:
-      return "wait and rerun cluster-status; inspect Meta logs if the phase stops advancing";
+      return "wait and rerun cluster-status; inspect Meta logs if the phase "
+             "stops advancing";
     case ClusterStateWireV1::kCreated:
-      return status.cluster_ready_
-                 ? "none"
-                 : "inspect blockers and Data-node sessions, then rerun cluster-status";
+      return status.cluster_ready_ ? "none"
+                                   : "inspect blockers and Data-node sessions, "
+                                     "then rerun cluster-status";
     case ClusterStateWireV1::kProvisioningFailed:
-      return "do not rerun cluster-create; preserve data and inspect the root operation and Meta logs";
+      return "do not rerun cluster-create; preserve data and inspect the root "
+             "operation and Meta logs";
   }
   return "inspect Meta logs before taking further action";
 }
@@ -709,6 +788,23 @@ std::string_view DataNodeRoleName(ClusterDataNodeRole role) {
       return "primary";
     case ClusterDataNodeRole::kReplica:
       return "replica";
+  }
+  return "unknown";
+}
+
+std::string_view AutomaticFailoverStateName(
+    ClusterAutomaticFailoverState state) {
+  switch (state) {
+    case ClusterAutomaticFailoverState::kDisabled:
+      return "disabled";
+    case ClusterAutomaticFailoverState::kHealthy:
+      return "healthy";
+    case ClusterAutomaticFailoverState::kSuspect:
+      return "suspect";
+    case ClusterAutomaticFailoverState::kBlocked:
+      return "blocked";
+    case ClusterAutomaticFailoverState::kTriggering:
+      return "triggering";
   }
   return "unknown";
 }
@@ -850,8 +946,7 @@ absl::StatusOr<std::string> EncodeClusterStatusReply(
     return wrote;
   }
   OptionalU64(writer, status.genesis_commit_index_);
-  if (absl::Status wrote =
-          OptionalString(writer, status.cluster_create_phase_);
+  if (absl::Status wrote = OptionalString(writer, status.cluster_create_phase_);
       !wrote.ok()) {
     return wrote;
   }
@@ -903,6 +998,15 @@ absl::StatusOr<std::string> EncodeClusterStatusReply(
     OptionalU64(writer, group.grant_revision_);
     writer.Bool(group.serving_ready_);
     writer.Bool(group.topology_converged_);
+    writer.U8(static_cast<std::uint8_t>(group.automatic_failover_state_));
+    if (absl::Status wrote = OptionalString(writer, group.current_reason_);
+        !wrote.ok())
+      return wrote;
+    writer.U64(group.suspect_elapsed_ms_);
+    writer.U64(group.effective_threshold_ms_);
+    if (absl::Status wrote = OptionalString(writer, group.blocked_reason_);
+        !wrote.ok())
+      return wrote;
   }
   if (absl::Status counted = Count(writer, status.slot_ranges_.size());
       !counted.ok())
@@ -1051,6 +1155,28 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
       return read;
     if (absl::Status read = read_bool(&group.topology_converged_); !read.ok())
       return read;
+    auto automatic_failover_state = reader.U8();
+    if (!automatic_failover_state.ok()) {
+      return automatic_failover_state.status();
+    }
+    if (*automatic_failover_state >
+        static_cast<std::uint8_t>(ClusterAutomaticFailoverState::kTriggering)) {
+      return absl::DataLossError("invalid automatic failover state");
+    }
+    group.automatic_failover_state_ =
+        static_cast<ClusterAutomaticFailoverState>(*automatic_failover_state);
+    auto current_reason = OptionalString(reader);
+    if (!current_reason.ok()) return current_reason.status();
+    group.current_reason_ = std::move(*current_reason);
+    auto suspect_elapsed_ms = reader.U64();
+    if (!suspect_elapsed_ms.ok()) return suspect_elapsed_ms.status();
+    group.suspect_elapsed_ms_ = *suspect_elapsed_ms;
+    auto effective_threshold_ms = reader.U64();
+    if (!effective_threshold_ms.ok()) return effective_threshold_ms.status();
+    group.effective_threshold_ms_ = *effective_threshold_ms;
+    auto blocked_reason = OptionalString(reader);
+    if (!blocked_reason.ok()) return blocked_reason.status();
+    group.blocked_reason_ = std::move(*blocked_reason);
     status.groups_.push_back(std::move(group));
   }
   auto range_count = Count(reader);
@@ -1268,7 +1394,7 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::CaptureStatus(
 absl::StatusOr<std::string> RenderClusterStatusJson(
     const ClusterStatusOutcome& outcome) {
   std::string json =
-      "{\"schema_version\":1,\"result\":" + Quote(ResultName(outcome.result_)) +
+      "{\"schema_version\":2,\"result\":" + Quote(ResultName(outcome.result_)) +
       ",\"readiness_basis\":\"meta_observed_v1\"";
   if (!outcome.status_.has_value()) {
     json += ",\"meta_available\":false,\"meta_membership_stable\":false";
@@ -1289,10 +1415,11 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
   if (absl::Status valid = ValidateClusterLifecycle(status); !valid.ok()) {
     return absl::DataLossError(valid.message());
   }
-  json += ",\"cluster_state\":" + Quote(ClusterStateName(status.cluster_state_));
+  json +=
+      ",\"cluster_state\":" + Quote(ClusterStateName(status.cluster_state_));
   json += ",\"lifecycle_revision\":" + U64Json(status.lifecycle_revision_);
-  json += ",\"root_operation_id\":" +
-          OptionalStringJson(status.root_operation_id_);
+  json +=
+      ",\"root_operation_id\":" + OptionalStringJson(status.root_operation_id_);
   json += ",\"genesis_commit_index\":" +
           OptionalU64Json(status.genesis_commit_index_);
   json += ",\"cluster_create_phase\":" +
@@ -1365,8 +1492,15 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
     json += ",\"config_epoch\":" + U64Json(group.config_epoch_);
     json += ",\"grant_revision\":" + OptionalU64Json(group.grant_revision_);
     json += ",\"serving_ready\":" + BoolJson(group.serving_ready_);
+    json += ",\"topology_converged\":" + BoolJson(group.topology_converged_);
+    json += ",\"automatic_failover_state\":" +
+            Quote(AutomaticFailoverStateName(group.automatic_failover_state_));
+    json += ",\"current_reason\":" + OptionalStringJson(group.current_reason_);
+    json += ",\"suspect_elapsed_ms\":" + U64Json(group.suspect_elapsed_ms_);
     json +=
-        ",\"topology_converged\":" + BoolJson(group.topology_converged_) + "}";
+        ",\"effective_threshold_ms\":" + U64Json(group.effective_threshold_ms_);
+    json += ",\"blocked_reason\":" + OptionalStringJson(group.blocked_reason_);
+    json += "}";
   }
   json += ']';
 
@@ -1428,20 +1562,21 @@ absl::StatusOr<std::string> RenderClusterStatusText(
   if (absl::Status valid = ValidateClusterLifecycle(status); !valid.ok()) {
     return absl::DataLossError(valid.message());
   }
-  text += "cluster_state=" + std::string(ClusterStateName(status.cluster_state_)) +
-          " lifecycle_revision=" +
-          std::to_string(status.lifecycle_revision_) + "\n";
+  text +=
+      "cluster_state=" + std::string(ClusterStateName(status.cluster_state_)) +
+      " lifecycle_revision=" + std::to_string(status.lifecycle_revision_) +
+      "\n";
   if (status.root_operation_id_.has_value()) {
     text += "root_operation=" + *status.root_operation_id_ +
-            " genesis_commit=" +
-            std::to_string(*status.genesis_commit_index_) + "\n";
+            " genesis_commit=" + std::to_string(*status.genesis_commit_index_) +
+            "\n";
   }
   if (status.cluster_create_phase_.has_value()) {
     text += "cluster_create_phase=" + *status.cluster_create_phase_ + "\n";
   }
   if (status.provisioning_failure_summary_.has_value()) {
-    text += "provisioning_failure=" +
-            *status.provisioning_failure_summary_ + "\n";
+    text +=
+        "provisioning_failure=" + *status.provisioning_failure_summary_ + "\n";
   }
   text +=
       "meta_available=" + std::string(status.meta_available_ ? "yes" : "no") +
@@ -1460,6 +1595,23 @@ absl::StatusOr<std::string> RenderClusterStatusText(
   for (const auto& blocker : blockers) {
     text += "blocker " + blocker.code_ + " " + blocker.scope_ + " " +
             blocker.detail_ + "\n";
+  }
+  auto groups = status.groups_;
+  std::sort(groups.begin(), groups.end(),
+            [](const auto& left, const auto& right) {
+              return left.group_id_ < right.group_id_;
+            });
+  for (const auto& group : groups) {
+    text += "automatic_failover group=" + group.group_id_ + " state=" +
+            std::string(
+                AutomaticFailoverStateName(group.automatic_failover_state_)) +
+            " current_reason=" +
+            (group.current_reason_.has_value() ? *group.current_reason_ : "-") +
+            " suspect_elapsed_ms=" + std::to_string(group.suspect_elapsed_ms_) +
+            " effective_threshold_ms=" +
+            std::to_string(group.effective_threshold_ms_) + " blocked_reason=" +
+            (group.blocked_reason_.has_value() ? *group.blocked_reason_ : "-") +
+            "\n";
   }
   text += "status_explanation=" + StatusExplanation(outcome) + "\n";
   text += "next_action=" + NextAction(outcome) + "\n";

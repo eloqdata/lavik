@@ -1461,7 +1461,6 @@ absl::StatusOr<std::string> Encode(const ServerHello& hello) {
       return status;
     }
   }
-  writer.U32(hello.heartbeat_interval_ms);
   writer.U32(hello.observation_ttl_ms);
   writer.U32(hello.session_progress_timeout_ms);
   return std::move(writer).Take();
@@ -1509,9 +1508,6 @@ absl::StatusOr<WireMessage> DecodeServerHello(std::string_view bytes) {
     if (!endpoint.ok()) return endpoint.status();
     hello.directory.push_back(std::move(*endpoint));
   }
-  auto heartbeat_interval = reader.U32();
-  if (!heartbeat_interval.ok()) return heartbeat_interval.status();
-  hello.heartbeat_interval_ms = *heartbeat_interval;
   auto observation_ttl = reader.U32();
   if (!observation_ttl.ok()) return observation_ttl.status();
   hello.observation_ttl_ms = *observation_ttl;
@@ -2846,7 +2842,6 @@ absl::Status WriteDesiredGroup(Writer& writer, const WireDesiredGroup& group) {
   writer.U64(group.group_term);
   writer.U64(group.authority_version);
   writer.U64(group.grant_revision);
-  writer.U32(group.grant_duration_ms);
   writer.Bool(group.grant_active);
   if (group.activation_action_id.has_value() &&
       (!group.grant_active || IsZeroId(*group.activation_action_id))) {
@@ -2874,12 +2869,6 @@ absl::Status WriteDesiredGroup(Writer& writer, const WireDesiredGroup& group) {
   writer.U64(group.manifest_revision);
   writer.Fixed(group.manifest_digest);
   writer.U64(group.partition_replication_epoch);
-  if (absl::Status status = writer.String(
-          group.grant_policy_id, kMaxIdentifierBytes, "grant policy id");
-      !status.ok()) {
-    return status;
-  }
-  writer.U64(group.grant_policy_version);
   writer.Bool(group.steady_replication_enabled);
   writer.Bool(group.failover_transition.has_value());
   if (group.failover_transition.has_value()) {
@@ -2920,9 +2909,6 @@ absl::StatusOr<WireDesiredGroup> ReadDesiredGroup(Reader& reader) {
   auto grant_revision = reader.U64();
   if (!grant_revision.ok()) return grant_revision.status();
   group.grant_revision = *grant_revision;
-  auto grant_duration = reader.U32();
-  if (!grant_duration.ok()) return grant_duration.status();
-  group.grant_duration_ms = *grant_duration;
   auto grant_active = reader.Bool();
   if (!grant_active.ok()) return grant_active.status();
   group.grant_active = *grant_active;
@@ -2968,12 +2954,6 @@ absl::StatusOr<WireDesiredGroup> ReadDesiredGroup(Reader& reader) {
     return partition_replication_epoch.status();
   }
   group.partition_replication_epoch = *partition_replication_epoch;
-  auto policy_id = reader.String(kMaxIdentifierBytes);
-  if (!policy_id.ok()) return policy_id.status();
-  group.grant_policy_id = std::move(*policy_id);
-  auto policy_version = reader.U64();
-  if (!policy_version.ok()) return policy_version.status();
-  group.grant_policy_version = *policy_version;
   auto steady_replication_enabled = reader.Bool();
   if (!steady_replication_enabled.ok()) {
     return steady_replication_enabled.status();
@@ -3049,34 +3029,6 @@ absl::StatusOr<WireManifestDocument> ReadManifest(Reader& reader) {
         "manifest entries must be strictly sorted by partition id");
   }
   return manifest;
-}
-
-absl::Status WritePolicy(Writer& writer, const WirePolicy& policy) {
-  if (absl::Status status =
-          writer.String(policy.policy_id, kMaxIdentifierBytes, "policy id");
-      !status.ok()) {
-    return status;
-  }
-  writer.U64(policy.version);
-  writer.Fixed(policy.content_hash);
-  return writer.String(policy.content, kMaxOpaqueFieldBytes, "policy content");
-}
-
-absl::StatusOr<WirePolicy> ReadPolicy(Reader& reader) {
-  WirePolicy policy;
-  auto policy_id = reader.String(kMaxIdentifierBytes);
-  if (!policy_id.ok()) return policy_id.status();
-  policy.policy_id = std::move(*policy_id);
-  auto version = reader.U64();
-  if (!version.ok()) return version.status();
-  policy.version = *version;
-  auto content_hash = reader.Fixed<32>();
-  if (!content_hash.ok()) return content_hash.status();
-  policy.content_hash = *content_hash;
-  auto content = reader.String(kMaxOpaqueFieldBytes);
-  if (!content.ok()) return content.status();
-  policy.content = std::move(*content);
-  return policy;
 }
 
 absl::Status WriteProjectedDirective(Writer& writer,
@@ -3388,9 +3340,18 @@ absl::Status WriteFullDesiredStateBody(Writer& writer,
                                        const WireHash256& projection_hash,
                                        const WireHash256& directive_set_digest,
                                        bool normalize_directive_basis) {
+  const std::uint32_t expected_heartbeat_interval =
+      std::max(std::uint32_t{1}, state.authority_lease_duration_ms / 3);
+  if (state.authority_lease_duration_ms == 0 ||
+      state.data_heartbeat_interval_ms != expected_heartbeat_interval) {
+    return ProtocolError(
+        "FullDesiredState lease duration and heartbeat cadence are invalid");
+  }
   writer.U16(kProtocolVersion);
   writer.U64(source_meta_applied_index);
   writer.U64(state.topology_epoch);
+  writer.U32(state.authority_lease_duration_ms);
+  writer.U32(state.data_heartbeat_interval_ms);
   writer.Fixed(projection_hash);
 
   if (absl::Status status = WriteCount(writer, state.meta_directory.size(),
@@ -3434,17 +3395,6 @@ absl::Status WriteFullDesiredStateBody(Writer& writer,
   }
   for (const WireManifestDocument& manifest : state.manifests) {
     if (absl::Status status = WriteManifest(writer, manifest); !status.ok()) {
-      return status;
-    }
-  }
-
-  if (absl::Status status = WriteCount(writer, state.policies.size(),
-                                       kMaxProjectedPolicies, "policies");
-      !status.ok()) {
-    return status;
-  }
-  for (const WirePolicy& policy : state.policies) {
-    if (absl::Status status = WritePolicy(writer, policy); !status.ok()) {
       return status;
     }
   }
@@ -3559,6 +3509,16 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
   auto topology_epoch = reader.U64();
   if (!topology_epoch.ok()) return topology_epoch.status();
   state.topology_epoch = *topology_epoch;
+  auto authority_lease_duration_ms = reader.U32();
+  if (!authority_lease_duration_ms.ok()) {
+    return authority_lease_duration_ms.status();
+  }
+  state.authority_lease_duration_ms = *authority_lease_duration_ms;
+  auto data_heartbeat_interval_ms = reader.U32();
+  if (!data_heartbeat_interval_ms.ok()) {
+    return data_heartbeat_interval_ms.status();
+  }
+  state.data_heartbeat_interval_ms = *data_heartbeat_interval_ms;
   auto projection_hash = reader.Fixed<32>();
   if (!projection_hash.ok()) return projection_hash.status();
   state.projection_hash = *projection_hash;
@@ -3598,15 +3558,6 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
     auto manifest = ReadManifest(reader);
     if (!manifest.ok()) return manifest.status();
     state.manifests.push_back(std::move(*manifest));
-  }
-
-  auto policy_count = ReadCount(reader, kMaxProjectedPolicies, "policies");
-  if (!policy_count.ok()) return policy_count.status();
-  state.policies.reserve(*policy_count);
-  for (std::uint32_t i = 0; i < *policy_count; ++i) {
-    auto policy = ReadPolicy(reader);
-    if (!policy.ok()) return policy.status();
-    state.policies.push_back(std::move(*policy));
   }
 
   auto directive_count =

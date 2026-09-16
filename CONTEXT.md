@@ -57,6 +57,63 @@ A current Node Incarnation's replaceable report to the Meta Leader. It is
 reacquired after Meta Leader replacement and is not Committed State.
 _Avoid_: Proof, committed evidence
 
+**Policy**:
+A versioned, cluster-wide configuration held in Committed State. Each policy
+family defines the decision boundary at which its current version takes effect
+for every Group. A new current version does not retroactively cancel an
+automatic failover command that has already entered submission.
+_Avoid_: Per-Group policy, Grant policy
+
+**Bootstrap Policy Defaults**:
+Typed values in the initial cluster manifest used by cluster creation to
+register any required global Policy that has not already been pre-seeded.
+They never overwrite committed Policy and are not an ongoing configuration
+source after cluster creation.
+_Avoid_: Active policy, process policy
+
+**Owner Serviceability**:
+The Meta Leader's current assessment that the Owner can hold or regain serving
+authority from current authenticated Observations and finite-lease evidence.
+It is not Committed State or proof that a request has succeeded.
+_Avoid_: Owner health, availability proof
+
+**Authority Lease**:
+A finite, boot-local serving capability installed by a Data Owner from a Meta
+acknowledgement. Its effective duration is bounded by both the current global
+Policy and the Meta Leader's local leadership-validity limit; expiry causes
+the Data Node to fence itself without a separate report to Meta.
+_Avoid_: Authority grant, Leader lease
+
+**Automatic Failover Detector**:
+The Meta Leader-local state machine that evaluates Owner Serviceability,
+accumulates SUSPECT time, and may submit an Uncontrolled Failover. It neither
+persists suspicion nor executes the resulting Failover Transition.
+_Avoid_: Uncontrolled Executor
+
+**SUSPECT**:
+A Meta Leader-local accumulated interval in which the same committed Owner
+authority is assessed as not serviceable. It is discarded on Meta leadership
+replacement and never becomes Committed State.
+_Avoid_: Failure record, durable suspicion
+
+**Indeterminate**:
+The Meta Leader lacks current causal evidence to classify an Owner as either
+serviceable or unserviceable. It freezes any SUSPECT time already accumulated
+for the same Owner authority. When the uncertainty is a known possible
+Authority Lease, it is bounded by that installed lease's effective duration
+and known expiry becomes an Unserviceable heartbeat timeout. A torn
+runtime/session join has no provable deadline and remains Indeterminate until a
+coherent cut arrives; elapsed time never manufactures failure evidence. A
+leadership, authority, or relevant Policy change instead discards SUSPECT time.
+_Avoid_: Unhealthy, failed
+
+**BLOCKED**:
+The automatic failover detector cannot currently advance its decision because
+of an explicit control-plane condition or Indeterminate evidence. BLOCKED is a
+leader-local diagnostic state and does not itself change cluster readiness or
+serving authority.
+_Avoid_: Failed, not ready
+
 **Controlled Failover**:
 An operator-initiated Failover Transition that preserves service on the
 current Owner until its Candidate is ready for cutover.

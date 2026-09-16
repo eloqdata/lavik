@@ -17,21 +17,6 @@ absl::StatusOr<ActorContext> ReadActorContext(MetaReader& reader) {
   return ActorContext{std::string(*principal), std::string(*readable_time)};
 }
 
-void WriteMetaPolicyReference(MetaWriter& writer,
-                              const MetaPolicyReference& reference) {
-  writer.WriteString(reference.policy_id_);
-  writer.WriteU64(reference.version_);
-}
-
-absl::StatusOr<MetaPolicyReference> ReadMetaPolicyReference(
-    MetaReader& reader) {
-  auto policy_id = reader.ReadString(kMaxMetaPolicyIdBytes);
-  if (!policy_id.ok()) return policy_id.status();
-  auto version = reader.ReadU64();
-  if (!version.ok()) return version.status();
-  return MetaPolicyReference{std::string(*policy_id), *version};
-}
-
 void WriteMetaEvidenceSummary(MetaWriter& writer,
                               const MetaEvidenceSummary& evidence) {
   writer.WriteString(evidence.node_id_);

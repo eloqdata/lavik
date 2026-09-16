@@ -53,7 +53,6 @@ inline constexpr std::size_t kMaxIdentifierBytes = 1024;
 inline constexpr std::size_t kMaxProjectedNodes = 4096;
 inline constexpr std::size_t kMaxProjectedGroups = 512;
 inline constexpr std::size_t kMaxManifestEntries = 16384;
-inline constexpr std::size_t kMaxProjectedPolicies = 4096;
 inline constexpr std::size_t kMaxProjectedDirectives = 4096;
 inline constexpr std::size_t kMaxCandidateFlows = 1024;
 inline constexpr std::size_t kMaxFailoverFailureClassBytes = 64;
@@ -183,7 +182,6 @@ struct ServerHello {
   std::uint64_t session_generation = 0;
   std::optional<std::uint32_t> leader_id;
   std::vector<WireMetaEndpoint> directory;
-  std::uint32_t heartbeat_interval_ms = 0;
   std::uint32_t observation_ttl_ms = 0;
   std::uint32_t session_progress_timeout_ms = 0;
 
@@ -798,9 +796,10 @@ struct WireFailoverCandidateAction {
 // Data execution subset of the committed transition. This is a replaceable
 // FDS projection, not Data-owned durable state, and is resent after reconnect
 // or Meta leadership change. Meta-only workflow data such as the Controlled
-// operation/deadline and successor grant stay out of this protocol; after
-// cutover the successor is the ordinary current grant. Volatile
-// source/candidate progress is likewise deliberately absent.
+// operation/deadline stays out of this protocol; after cutover the
+// failover-installed Grant is represented by the ordinary current Grant and
+// its optional activation action. Volatile source/candidate progress is
+// likewise deliberately absent.
 struct WireFailoverTransition {
   WireId128 transition_id{};
   std::uint64_t revision = 0;
@@ -823,7 +822,6 @@ struct WireDesiredGroup {
   std::uint64_t group_term = 0;
   std::uint64_t authority_version = 0;
   std::uint64_t grant_revision = 0;
-  std::uint32_t grant_duration_ms = 0;
   bool grant_active = false;
   // Present only on a failover-installed current grant. Data may activate a
   // prepared promotion only when this matches its boot-local action context.
@@ -836,8 +834,6 @@ struct WireDesiredGroup {
   // part of population identity even when immutable manifest content stays
   // unchanged.
   std::uint64_t partition_replication_epoch = 0;
-  std::string grant_policy_id;
-  std::uint64_t grant_policy_version = 0;
   // Genesis population directives exclusively own replication ingress.
   // Meta enables this only after the committed cluster lifecycle is Created;
   // failover and population actions may still temporarily supersede it.
@@ -865,15 +861,6 @@ struct WireManifestDocument {
 
   friend bool operator==(const WireManifestDocument&,
                          const WireManifestDocument&) = default;
-};
-
-struct WirePolicy {
-  std::string policy_id;
-  std::uint64_t version = 0;
-  WireHash256 content_hash{};
-  std::string content;
-
-  friend bool operator==(const WirePolicy&, const WirePolicy&) = default;
 };
 
 // Session-independent form used inside a projection. The live Directive
@@ -918,13 +905,17 @@ struct WireProjectedDirective {
 struct FullDesiredState {
   std::uint64_t source_meta_applied_index = 0;
   std::uint64_t topology_epoch = 0;
+  // These are resolved by the current Meta Leader from one global Policy and
+  // its local leadership-validity limit. Data consumes only these scalars and
+  // never interprets Policy identity or documents.
+  std::uint32_t authority_lease_duration_ms = 0;
+  std::uint32_t data_heartbeat_interval_ms = 0;
   WireHash256 projection_hash{};
   WireHash256 object_hash{};
   std::vector<WireMetaEndpoint> meta_directory;
   std::vector<WireDataEndpoint> nodes;
   std::vector<WireDesiredGroup> groups;
   std::vector<WireManifestDocument> manifests;
-  std::vector<WirePolicy> policies;
   std::vector<WireProjectedDirective> current_directives;
   WireHash256 directive_set_digest{};
 

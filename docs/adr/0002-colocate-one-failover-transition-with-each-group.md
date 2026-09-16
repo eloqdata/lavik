@@ -4,6 +4,10 @@
 
 Accepted
 
+ADR 0015 later supersedes only the embedded successor Grant specification and
+Policy-reference part of this decision. Transition ownership and lifecycle
+remain as described here.
+
 `MetaTopologyStore` owns at most one optional Failover Transition beside each
 Group's current topology record. Controlled and uncontrolled failover share
 this committed state shape but apply different failure policies, and the

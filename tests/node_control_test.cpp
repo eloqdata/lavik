@@ -219,6 +219,7 @@ PreparedFullState FullState(
   EXPECT_NE(group, nullptr);
   PreparedFullState prepared{
       .serving_state_ = std::move(state),
+      .authority_lease_duration_ms_ = 5'000,
       .object_hash_ = Digest(object_hash),
   };
   if (group != nullptr) {
@@ -248,6 +249,7 @@ PreparedFullState LocalSourceFullState(
   EXPECT_NE(group, nullptr);
   PreparedFullState prepared{
       .serving_state_ = std::move(state),
+      .authority_lease_duration_ms_ = 5'000,
       .object_hash_ = Digest(object_hash),
   };
   if (group != nullptr) {
@@ -332,6 +334,14 @@ class RecordingActions final : public NodeControlActions {
     co_return revoke_status_;
   }
 
+  celer::Task<absl::Status> RefreshSourceAuthorizationsForFdsReplacementAndWait(
+      bool preserve_current_population_exports,
+      std::size_t expected_authorization_replays) override {
+    expected_authorization_replays_.push_back(expected_authorization_replays);
+    co_return co_await ClearSourceAuthorizationsForSessionReplacementAndWait(
+        preserve_current_population_exports);
+  }
+
   celer::Task<absl::Status> ReconcileClusterControl(
       std::optional<DesiredClusterControl> desired) override {
     ++cluster_control_reconciliations_;
@@ -388,14 +398,35 @@ class RecordingActions final : public NodeControlActions {
     co_return expiration_authority_enable_status_;
   }
 
+  celer::Task<absl::Status> EnableSourceAdmissionForLease(
+      MonotonicTime deadline) override {
+    ++source_admission_enables_;
+    source_admission_deadline_ = deadline;
+    control_events_.push_back("enable-source-admission");
+    source_admission_enable_entered_ = true;
+    if (on_source_admission_enable_) on_source_admission_enable_();
+    while (block_source_admission_enable_) {
+      celer::Worker* worker = celer::ThisWorker().self_;
+      if (worker == nullptr) {
+        co_return absl::FailedPreconditionError(
+            "blocked source admission enable requires a Celer worker");
+      }
+      co_await celer::Yield(*worker);
+    }
+    co_return source_admission_enable_status_;
+  }
+
   celer::Task<absl::Status> RevokeExpirationAuthority() override {
     ++expiration_authority_revocations_;
     control_events_.push_back("revoke-expiration");
     co_return expiration_authority_revoke_status_;
   }
 
-  celer::Task<absl::Status> CancelInProgressPopulation() override {
+  celer::Task<absl::Status> CancelInProgressPopulation(
+      bool preserve_current_follow_attempt) override {
     ++population_cancellations_;
+    population_cancellation_preserve_follow_.push_back(
+        preserve_current_follow_attempt);
     population_events_.push_back("cancel");
     co_return population_reconcile_status_;
   }
@@ -448,12 +479,15 @@ class RecordingActions final : public NodeControlActions {
   int async_revocations_ = 0;
   int session_clears_ = 0;
   std::vector<bool> preserve_established_exports_;
+  std::vector<std::size_t> expected_authorization_replays_;
   int cluster_control_reconciliations_ = 0;
   int population_reconciliations_ = 0;
   int population_cancellations_ = 0;
+  std::vector<bool> population_cancellation_preserve_follow_;
   int population_shutdown_cancellations_ = 0;
   int promotion_activations_ = 0;
   int expiration_authority_enables_ = 0;
+  int source_admission_enables_ = 0;
   int expiration_authority_revocations_ = 0;
   bool block_revocation_ = false;
   bool revocation_entered_ = false;
@@ -472,6 +506,7 @@ class RecordingActions final : public NodeControlActions {
   std::optional<PopulationReadiness> desired_population_;
   std::optional<PreparedFailoverActivation> promotion_activation_;
   std::optional<MonotonicTime> expiration_authority_deadline_;
+  std::optional<MonotonicTime> source_admission_deadline_;
   std::optional<absl::Status> deferred_directive_result_;
   std::optional<NodeDirective> completed_population_;
   bool population_transition_expected_ = false;
@@ -480,17 +515,21 @@ class RecordingActions final : public NodeControlActions {
   bool promotion_activation_entered_ = false;
   bool block_expiration_authority_enable_ = false;
   bool expiration_authority_enable_entered_ = false;
+  bool block_source_admission_enable_ = false;
+  bool source_admission_enable_entered_ = false;
   std::function<void()> on_async_revocation_;
   std::function<void()> on_cluster_control_reconcile_;
   std::function<void()> on_apply_directive_;
   std::function<void()> on_promotion_activation_;
   std::function<void()> on_expiration_authority_enable_;
+  std::function<void()> on_source_admission_enable_;
   absl::Status revoke_status_ = absl::OkStatus();
   absl::Status directive_status_ = absl::OkStatus();
   absl::Status population_reconcile_status_ = absl::OkStatus();
   absl::Status cluster_control_reconcile_status_ = absl::OkStatus();
   absl::Status promotion_activation_status_ = absl::OkStatus();
   absl::Status expiration_authority_enable_status_ = absl::OkStatus();
+  absl::Status source_admission_enable_status_ = absl::OkStatus();
   absl::Status expiration_authority_revoke_status_ = absl::OkStatus();
   absl::Status drain_status_ = absl::OkStatus();
 };
@@ -527,9 +566,6 @@ DesiredClusterControl DesiredControl(std::string group_id = "group-a") {
               .assignment_id_ = Assignment(1),
           },
       .grant_active_ = true,
-      .grant_duration_ms_ = 5000,
-      .grant_policy_id_ = "default",
-      .grant_policy_version_ = 3,
       .steady_replication_enabled_ = true,
   };
 }
@@ -544,13 +580,12 @@ PreparedFullState WithDesiredControl(PreparedFullState prepared) {
 }
 
 PreparedFullState ActivationFullState(FailoverActionId action_id,
-                                      std::uint32_t grant_duration_ms = 5000,
+                                      std::uint32_t lease_duration_ms = 5000,
                                       std::uint8_t object_hash = 3) {
   PreparedFullState prepared =
       WithDesiredControl(FullState(MakeState(), object_hash));
   prepared.desired_cluster_controls_.front().activation_action_id_ = action_id;
-  prepared.desired_cluster_controls_.front().grant_duration_ms_ =
-      grant_duration_ms;
+  prepared.authority_lease_duration_ms_ = lease_duration_ms;
   return prepared;
 }
 
@@ -558,6 +593,7 @@ PreparedFullState FencedFullState(DesiredClusterControl desired,
                                   std::uint8_t object_hash = 4) {
   PreparedFullState prepared{
       .serving_state_ = MakeLocalOwnerlessState(),
+      .authority_lease_duration_ms_ = 5'000,
       .object_hash_ = Digest(object_hash),
       .control_groups_ = {desired.identity_},
       .desired_cluster_controls_ = {std::move(desired)},
@@ -694,9 +730,6 @@ TEST(EstablishedExportScopeTest,
   ++control_only.identity_.grant_revision_;
   ++control_only.identity_.config_epoch_;
   control_only.grant_active_ = false;
-  control_only.grant_duration_ms_ = 0;
-  control_only.grant_policy_id_.clear();
-  control_only.grant_policy_version_ = 0;
   control_only.activation_action_id_ = ShortId<FailoverActionId>(1);
   control_only.failover_transition_ = PreparedFailoverTransition{
       .transition_id_ = ShortId<FailoverTransitionId>(2),
@@ -788,9 +821,6 @@ TEST(NodeControlInstallerTest,
   ++fenced.identity_.grant_revision_;
   ++fenced.identity_.config_epoch_;
   fenced.grant_active_ = false;
-  fenced.grant_duration_ms_ = 0;
-  fenced.grant_policy_id_.clear();
-  fenced.grant_policy_version_ = 0;
   fenced.failover_transition_ = PreparedFailoverTransition{
       .transition_id_ = ShortId<FailoverTransitionId>(2),
       .revision_ = 19,
@@ -834,7 +864,7 @@ TEST(NodeControlInstallerTest,
                                    .projection_ = Basis(10, 2),
                                    .anchor_ = Anchor(*active),
                                    .sent_at_ = MonotonicTime{},
-                                   .granted_duration_ = 10s},
+                                   .granted_duration_ = 5s},
                                   MonotonicTime{})
                   .ok());
   constexpr std::array<std::uint16_t, 1> slots{12};
@@ -909,7 +939,7 @@ TEST(NodeControlInstallerTest,
                              .projection_ = Basis(10, 2),
                              .anchor_ = Anchor(*ready),
                              .sent_at_ = MonotonicTime{},
-                             .granted_duration_ = 10s},
+                             .granted_duration_ = 5s},
                             MonotonicTime{})
             .ok());
 
@@ -1096,13 +1126,14 @@ class ProvisionalActivationService final : public celer::Service {
     kReplacementDuringExpirationEnable,
     kSessionLossDuringPromotionActivation,
     kSessionLossDuringExpirationEnable,
+    kSessionLossDuringSourceAdmissionEnable,
     kExpiresDuringActivation,
     kRestartedWinnerWithPriorBootAction,
     kSteadyOwner,
     kRevocationBoundaries,
     kMismatchedDesiredAuthority,
-    kShorterLeadershipBoundedLease,
-    kLeaseLongerThanCommittedMaximum,
+    kLeaseShorterThanResolvedDuration,
+    kLeaseLongerThanResolvedDuration,
   };
 
   ProvisionalActivationService(celer::Server* server, Scenario scenario)
@@ -1132,13 +1163,13 @@ class ProvisionalActivationService final : public celer::Service {
         scenario_ != Scenario::kSteadyOwner &&
         scenario_ != Scenario::kRevocationBoundaries &&
         scenario_ != Scenario::kMismatchedDesiredAuthority &&
-        scenario_ != Scenario::kShorterLeadershipBoundedLease &&
-        scenario_ != Scenario::kLeaseLongerThanCommittedMaximum;
+        scenario_ != Scenario::kLeaseShorterThanResolvedDuration &&
+        scenario_ != Scenario::kLeaseLongerThanResolvedDuration;
     const std::uint32_t desired_duration_ms =
         scenario_ == Scenario::kExpiresDuringActivation ? 5 : 5000;
     const std::uint32_t granted_duration_ms =
-        scenario_ == Scenario::kShorterLeadershipBoundedLease ? 300
-        : scenario_ == Scenario::kLeaseLongerThanCommittedMaximum
+        scenario_ == Scenario::kLeaseShorterThanResolvedDuration ? 300
+        : scenario_ == Scenario::kLeaseLongerThanResolvedDuration
             ? 6000
             : desired_duration_ms;
     PreparedFullState prepared =
@@ -1194,17 +1225,25 @@ class ProvisionalActivationService final : public celer::Service {
         .sent_at_ = LeaseClockNow(),
         .granted_duration_ = std::chrono::milliseconds(granted_duration_ms),
     };
+    control_.actions.on_source_admission_enable_ = [this] {
+      lease_installed_before_source_admission_ = CanWrite();
+    };
 
     if (scenario_ == Scenario::kBlockedSuccess ||
         scenario_ == Scenario::kProjectionReplacement ||
         scenario_ == Scenario::kReplacementDuringExpirationEnable ||
         scenario_ == Scenario::kSessionLossDuringPromotionActivation ||
-        scenario_ == Scenario::kSessionLossDuringExpirationEnable) {
+        scenario_ == Scenario::kSessionLossDuringExpirationEnable ||
+        scenario_ == Scenario::kSessionLossDuringSourceAdmissionEnable) {
       const bool block_expiration =
           scenario_ == Scenario::kReplacementDuringExpirationEnable ||
           scenario_ == Scenario::kSessionLossDuringExpirationEnable;
-      control_.actions.block_promotion_activation_ = !block_expiration;
+      const bool block_source =
+          scenario_ == Scenario::kSessionLossDuringSourceAdmissionEnable;
+      control_.actions.block_promotion_activation_ =
+          !block_expiration && !block_source;
       control_.actions.block_expiration_authority_enable_ = block_expiration;
+      control_.actions.block_source_admission_enable_ = block_source;
       worker.Spawn(ApplyGrant());
       while (control_.actions.block_promotion_activation_ &&
              !control_.actions.promotion_activation_entered_) {
@@ -1212,6 +1251,10 @@ class ProvisionalActivationService final : public celer::Service {
       }
       while (control_.actions.block_expiration_authority_enable_ &&
              !control_.actions.expiration_authority_enable_entered_) {
+        co_await celer::Yield(worker);
+      }
+      while (control_.actions.block_source_admission_enable_ &&
+             !control_.actions.source_admission_enable_entered_) {
         co_await celer::Yield(worker);
       }
       no_lease_before_activation_ = !CanWrite();
@@ -1226,12 +1269,14 @@ class ProvisionalActivationService final : public celer::Service {
                 std::move(replacement), Basis(11, 4));
       }
       if (scenario_ == Scenario::kSessionLossDuringPromotionActivation ||
-          scenario_ == Scenario::kSessionLossDuringExpirationEnable) {
+          scenario_ == Scenario::kSessionLossDuringExpirationEnable ||
+          scenario_ == Scenario::kSessionLossDuringSourceAdmissionEnable) {
         session_loss_result_ =
             control_.installer.InvalidateSessionNow(grant_.session_);
       }
       control_.actions.block_promotion_activation_ = false;
       control_.actions.block_expiration_authority_enable_ = false;
+      control_.actions.block_source_admission_enable_ = false;
       while (!grant_returned_) co_await celer::Yield(worker);
     } else if (scenario_ == Scenario::kExpiresDuringActivation) {
       control_.actions.on_promotion_activation_ = [] {
@@ -1287,6 +1332,7 @@ class ProvisionalActivationService final : public celer::Service {
   bool grant_returned_ = false;
   bool writable_after_ = false;
   bool session_revoked_expiration_ = false;
+  bool lease_installed_before_source_admission_ = false;
   AuthorityMessage grant_;
   absl::Status grant_result_ =
       absl::UnknownError("provisional grant did not run");
@@ -1419,6 +1465,27 @@ TEST(NodeControlInstallerTest,
 }
 
 TEST(NodeControlInstallerTest,
+     SessionLossDuringSourceAdmissionEnableFailsClosedAfterInstalledLease) {
+  celer::Server server;
+  ProvisionalActivationService service(
+      &server, ProvisionalActivationService::Scenario::
+                   kSessionLossDuringSourceAdmissionEnable);
+  RunProvisionalActivationService(service, server);
+
+  ASSERT_TRUE(service.session_loss_result_.ok())
+      << service.session_loss_result_;
+  EXPECT_TRUE(service.lease_installed_before_source_admission_);
+  EXPECT_EQ(service.grant_result_.code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(service.grant_result_.message(),
+            "source admission activation crossed a changed or expired "
+            "control session");
+  EXPECT_FALSE(service.writable_after_);
+  EXPECT_EQ(service.control_.actions.source_admission_enables_, 1);
+  EXPECT_GE(service.control_.actions.expiration_authority_revocations_, 1);
+}
+
+TEST(NodeControlInstallerTest,
      GrantExpiringDuringPromotionActivationNeverEnablesExpirationOrLease) {
   celer::Server server;
   ProvisionalActivationService service(
@@ -1462,8 +1529,15 @@ TEST(NodeControlInstallerTest,
   EXPECT_TRUE(service.writable_after_);
   EXPECT_EQ(service.control_.actions.promotion_activations_, 0);
   EXPECT_EQ(service.control_.actions.expiration_authority_enables_, 1);
+  EXPECT_EQ(service.control_.actions.source_admission_enables_, 1);
+  EXPECT_TRUE(service.lease_installed_before_source_admission_);
+  ASSERT_GE(service.control_.actions.control_events_.size(), 2U);
+  EXPECT_EQ(
+      service.control_.actions
+          .control_events_[service.control_.actions.control_events_.size() - 2],
+      "enable-expiration");
   EXPECT_EQ(service.control_.actions.control_events_.back(),
-            "enable-expiration");
+            "enable-source-admission");
 }
 
 TEST(NodeControlInstallerTest,
@@ -1485,26 +1559,29 @@ TEST(NodeControlInstallerTest,
   EXPECT_NE(message.find("duration_ms=5000"), std::string::npos) << message;
 }
 
-TEST(NodeControlInstallerTest,
-     AcceptsLeadershipBoundedLeaseShorterThanCommittedMaximum) {
+TEST(NodeControlInstallerTest, RejectsLeaseShorterThanFdsResolvedDuration) {
   celer::Server server;
-  ProvisionalActivationService service(
-      &server,
-      ProvisionalActivationService::Scenario::kShorterLeadershipBoundedLease);
+  ProvisionalActivationService service(&server,
+                                       ProvisionalActivationService::Scenario::
+                                           kLeaseShorterThanResolvedDuration);
   RunProvisionalActivationService(service, server);
 
-  ASSERT_TRUE(service.grant_result_.ok()) << service.grant_result_;
-  EXPECT_TRUE(service.writable_after_);
-  EXPECT_EQ(service.control_.actions.expiration_authority_deadline_,
-            service.grant_.sent_at_ + 300ms);
+  EXPECT_EQ(service.grant_result_.code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_FALSE(service.writable_after_);
+  EXPECT_EQ(service.control_.actions.expiration_authority_enables_, 0);
+  const std::string message(service.grant_result_.message());
+  EXPECT_NE(message.find("duration_ms=300"), std::string::npos) << message;
+  EXPECT_NE(message.find("effective_duration_ms=5000"), std::string::npos)
+      << message;
 }
 
 TEST(NodeControlInstallerTest,
-     RejectsLeaseLongerThanCommittedMaximumWithBothDurations) {
+     RejectsLeaseLongerThanFdsResolvedDurationWithBothDurations) {
   celer::Server server;
   ProvisionalActivationService service(
       &server,
-      ProvisionalActivationService::Scenario::kLeaseLongerThanCommittedMaximum);
+      ProvisionalActivationService::Scenario::kLeaseLongerThanResolvedDuration);
   RunProvisionalActivationService(service, server);
 
   EXPECT_EQ(service.grant_result_.code(),
@@ -1573,8 +1650,6 @@ class LeaseExpiryService final : public celer::Service {
       server_->RequestStop();
       co_return result_;
     }
-    control_.actions.block_session_clear_ = true;
-
     absl::Status slept = co_await celer::SleepFor(worker, 10ms);
     if (!slept.ok()) {
       result_ = slept;
@@ -1614,25 +1689,13 @@ class LeaseExpiryService final : public celer::Service {
         control_.guard.CaptureAndAdmit(WriteRequest(slots), LeaseClockNow())
             .decision()
             .kind_ == Decision::Kind::kClusterDownUnbound;
+    expiry_preserved_source_capabilities_ =
+        control_.actions.session_clears_ == 0;
     grant.sent_at_ = LeaseClockNow();
     grant.granted_duration_ = 100ms;
-    renewal_blocked_during_expiry_ =
-        (co_await control_.installer.ApplyLeaseGrantTransition(grant)).code() ==
-        absl::StatusCode::kUnavailable;
-    directive_blocked_during_expiry_ =
-        (co_await control_.installer.ApplyDirective(NodeDirective{})).code() ==
-        absl::StatusCode::kUnavailable;
-    control_.actions.block_session_clear_ = false;
-    while (!control_.actions.session_clear_exited_) {
-      co_await celer::Yield(worker);
-    }
-    grant.sent_at_ = LeaseClockNow();
     renewal_succeeded_after_expiry_ =
         (co_await control_.installer.ApplyLeaseGrantTransition(grant)).ok();
-    revocations_ = control_.actions.session_clears_;
-    preserved_established_export_ =
-        control_.actions.preserve_established_exports_.size() == 1 &&
-        control_.actions.preserve_established_exports_.front();
+    revocations_ = control_.actions.expiration_authority_revocations_;
     expirations_after_ = GetClusterControlMetrics().lease_expirations_;
     result_ = absl::OkStatus();
     server_->RequestStop();
@@ -1646,11 +1709,9 @@ class LeaseExpiryService final : public celer::Service {
   bool prepared_ = false;
   bool old_timer_preserved_lease_ = false;
   bool expired_ = false;
-  bool renewal_blocked_during_expiry_ = false;
-  bool directive_blocked_during_expiry_ = false;
   bool renewal_succeeded_after_expiry_ = false;
+  bool expiry_preserved_source_capabilities_ = false;
   int revocations_ = 0;
-  bool preserved_established_export_ = false;
   std::uint64_t expirations_before_ = 0;
   std::uint64_t expirations_after_ = 0;
   absl::Status result_ = absl::UnknownError("lease expiry service did not run");
@@ -2207,6 +2268,55 @@ TEST(NodeControlInstallerTest, FiniteAuthorityRequiresAnExactLeaseGrant) {
 }
 
 TEST(NodeControlInstallerTest,
+     ShorterFdsLeaseCeilingPreservesOldDeadlineAndBoundsRenewal) {
+  DynamicControl control;
+  ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
+  ASSERT_TRUE(
+      control.installer
+          .InstallFullState(WithDesiredControl(FullState(MakeState(), 3)),
+                            Basis(10, 2))
+          .ok());
+
+  const MonotonicTime now{};
+  const auto state = control.cache.Current();
+  AuthorityMessage grant{
+      .kind_ = AuthorityMessage::Kind::kLeaseGrant,
+      .session_ = Session(1),
+      .projection_ = Basis(10, 2),
+      .anchor_ = Anchor(*state),
+      .sent_at_ = now,
+      .granted_duration_ = 5s,
+  };
+  ASSERT_TRUE(control.installer.ApplyAuthority(grant, now).ok());
+
+  PreparedFullState replacement = WithDesiredControl(FullState(MakeState(), 4));
+  replacement.authority_lease_duration_ms_ = 1'000;
+  ASSERT_TRUE(
+      control.installer.InstallFullState(std::move(replacement), Basis(11, 3))
+          .ok());
+
+  constexpr std::array<std::uint16_t, 1> slots{12};
+  EXPECT_EQ(control.guard.CaptureAndAdmit(WriteRequest(slots), now + 2s)
+                .decision()
+                .kind_,
+            Decision::Kind::kServe);
+
+  grant.projection_ = Basis(11, 3);
+  grant.sent_at_ = now + 2s;
+  grant.granted_duration_ = 2s;
+  EXPECT_EQ(control.installer.ApplyAuthority(grant, now + 2s).code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(control.guard.CaptureAndAdmit(WriteRequest(slots), now + 4s)
+                .decision()
+                .kind_,
+            Decision::Kind::kServe);
+  EXPECT_EQ(control.guard.CaptureAndAdmit(WriteRequest(slots), now + 6s)
+                .decision()
+                .kind_,
+            Decision::Kind::kClusterDownUnbound);
+}
+
+TEST(NodeControlInstallerTest,
      SuspendAwareLeaseClockJumpRejectsOldAuthoritySynchronously) {
   DynamicControl control;
   ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
@@ -2509,6 +2619,8 @@ TEST(NodeControlInstallerTest,
   EXPECT_EQ(service.control_.actions.async_revocations_, 1);
   EXPECT_EQ(service.control_.actions.expiration_authority_revocations_, 1);
   EXPECT_EQ(service.control_.actions.population_cancellations_, 1);
+  EXPECT_EQ(service.control_.actions.population_cancellation_preserve_follow_,
+            (std::vector<bool>{false}));
   const std::vector<std::string> expected_events{"start", "cancel"};
   EXPECT_EQ(service.control_.actions.population_events_, expected_events);
 }
@@ -2621,11 +2733,9 @@ TEST(NodeControlInstallerTest,
   EXPECT_TRUE(service.result_.ok()) << service.result_;
   EXPECT_TRUE(service.old_timer_preserved_lease_);
   EXPECT_TRUE(service.expired_);
-  EXPECT_TRUE(service.renewal_blocked_during_expiry_);
-  EXPECT_TRUE(service.directive_blocked_during_expiry_);
   EXPECT_TRUE(service.renewal_succeeded_after_expiry_);
+  EXPECT_TRUE(service.expiry_preserved_source_capabilities_);
   EXPECT_EQ(service.revocations_, 1);
-  EXPECT_TRUE(service.preserved_established_export_);
   EXPECT_EQ(service.expirations_after_, service.expirations_before_ + 1);
 }
 
@@ -2645,9 +2755,10 @@ TEST(NodeControlInstallerTest,
   EXPECT_TRUE(service.old_admitted_);
   EXPECT_TRUE(service.old_rejected_after_renewal_);
   EXPECT_TRUE(service.new_admission_serves_);
-  EXPECT_EQ(service.control_.actions.session_clears_, 1);
-  ASSERT_EQ(service.control_.actions.preserve_established_exports_.size(), 1U);
-  EXPECT_TRUE(service.control_.actions.preserve_established_exports_.front());
+  EXPECT_EQ(service.control_.actions.session_clears_, 0);
+  EXPECT_TRUE(service.control_.actions.preserve_established_exports_.empty());
+  EXPECT_EQ(service.control_.actions.expiration_authority_revocations_, 1);
+  EXPECT_EQ(service.control_.actions.source_admission_enables_, 2);
   EXPECT_EQ(service.control_.actions.drained_.size(), 1u);
   EXPECT_EQ(service.expirations_after_, service.expirations_before_ + 1);
 }
@@ -2879,7 +2990,7 @@ TEST(NodeControlInstallerTest,
 }
 
 TEST(NodeControlInstallerTest,
-     MetaFullStateAlwaysJoinsSourcesAndAuthorityChangeDrainsOldWork) {
+     ExactFdsRefreshPreservesSourceExportsAndAuthorityChangeDrainsOldWork) {
   DynamicControl control;
   ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
   ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
@@ -2896,15 +3007,18 @@ TEST(NodeControlInstallerTest,
             kPartitionReplicationEpoch);
   EXPECT_FALSE(control.actions.population_transition_expected_);
 
-  // An exact FDS replay on a reconnected session still joins any source
-  // exports left by the previous session before it can be acknowledged.
+  // An exact FDS refresh preserves already-published source exports while
+  // clearing the ledger and reserving every capability expected to replay.
   ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
                               FullState(MakeState(), 3), Basis(10, 2),
-                              /*local_population_transition_expected=*/true))
+                              /*local_population_transition_expected=*/true,
+                              /*expected_source_authorization_replays=*/2))
                   .ok());
   EXPECT_EQ(control.actions.session_clears_, 2);
   ASSERT_EQ(control.actions.preserve_established_exports_.size(), 2U);
   EXPECT_TRUE(control.actions.preserve_established_exports_.back());
+  ASSERT_EQ(control.actions.expected_authorization_replays_.size(), 2U);
+  EXPECT_EQ(control.actions.expected_authorization_replays_.back(), 2U);
   EXPECT_TRUE(control.actions.population_transition_expected_);
 
   // A replacement FDS omits the boot-local ReadyToken. The installer carries
@@ -3007,6 +3121,8 @@ TEST(NodeControlInstallerTest,
                               Session(1), "control transport closed"))
                   .ok());
   EXPECT_EQ(control.actions.population_cancellations_, 1);
+  EXPECT_EQ(control.actions.population_cancellation_preserve_follow_,
+            (std::vector<bool>{true}));
 
   NodeDirective authorize{
       .projection_ = Basis(10, 2),

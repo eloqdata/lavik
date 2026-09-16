@@ -4,8 +4,8 @@
 // term, grant, and fence state.
 //
 // Per group the store keeps: the current group_term, the current grant
-// (owner, term, authority_version, lease parameters, policy reference), and
-// the fenced flag. INVARIANT: fenced_ == (no grant). A group is created
+// (owner, term, authority_version, grant revision, optional activation action),
+// and the fenced flag. INVARIANT: fenced_ == (no grant). A group is created
 // fenced and grantless; BeginGroupTerm(T) is the only term-advancing store
 // primitive and re-enters the fenced/grantless state; typed failover aggregate
 // commands reuse it. ActivateAuthority is the shared grant-install primitive:
@@ -19,13 +19,6 @@
 // Command semantics (all absolute values, with CAS via expected_* fields):
 //   - BeginGroupTerm(expected=T-1, new=T): T must be exactly expected+1 and
 //     expected must equal the current term; promotes and fences.
-//   - GrantAuthority: same-owner committed grant-spec update (distinct from
-//     the heartbeat path's memory-only lease renewal). CAS on term and
-//     authority_version; owner and term never change. A changed spec records
-//     its committed log index as grant_revision; an exact replay preserves the
-//     prior value. The policy reference's existence in the policy store is a
-//     cross-store fact the apply dispatcher checks (this store records the
-//     reference and answers PolicyInUse).
 //   - ActivateAuthority: the authority-install kernel used directly and by
 //     typed failover cutover. It is split into ValidateActivate (pure, all
 //     rejections) and ApplyGrantPart (the install) so the apply dispatcher can
@@ -40,13 +33,11 @@
 // whether its post-effect is already present with identical content and then
 // accepts as a no-op; only genuinely conflicting content is rejected (a
 // kDomainReject absl::Status). A semantic no-op never moves a CAS token.
-// GrantAuthority records the current committed log index as grant_revision
-// when its spec changes; an exact renewal replay preserves the first index.
 // RevokeGrant/FenceGroup do not advance term or authority-version tokens;
 // BeginGroupTerm and ActivateAuthority carry explicit already-applied checks.
 //
-// Cross-store invariants (grant vs topology owner/epochs, policy reference
-// existence, principal-vs-grant) are NOT enforced here: the store exposes
+// Cross-store invariants (grant vs topology owner/epochs and
+// principal-vs-grant) are NOT enforced here: the store exposes
 // fact queries and the apply dispatcher orchestrates. Apply is a pure
 // in-memory function: no IO, no locks, no clock, no observation access.
 // Snapshot serialization is the versioned strict
@@ -73,14 +64,13 @@ struct MetaGroupGrant {
   std::string owner_;  // node_id
   std::uint64_t term_ = 0;
   std::uint64_t authority_version_ = 0;
-  // Raft apply index of the activation or last committed spec change.
+  // Raft apply index of the activation that installed this grant.
   // Heartbeat lease renewal is ephemeral and never changes this value.
   std::uint64_t grant_revision_ = 0;
   // Set only by failover cutover. Data activation must match this committed
   // action to the boot-local prepared context; ordinary authority activation
-  // clears it, while same-owner grant renewal preserves it.
+  // clears it.
   std::optional<MetaFailoverActionId> activation_action_id_;
-  MetaGrantSpec spec_;  // lease parameters + committed policy reference
   bool operator==(const MetaGroupGrant&) const = default;
 };
 
@@ -110,10 +100,6 @@ class MetaGrantStore {
   absl::Status RemoveGroup(std::string_view group_id);
 
   absl::Status BeginGroupTerm(const BeginGroupTerm& command);
-  // A changed grant spec records committed_index as grant_revision; an exact
-  // replay is a no-op and preserves the original revision.
-  absl::Status GrantAuthority(const GrantAuthority& command,
-                              std::uint64_t committed_index);
   // Pure validation of ActivateAuthority; every rejection lives here. A
   // present activation_action_id must be the nonzero failover action whose
   // prepared context authorizes this cutover. It participates in exact replay
@@ -133,12 +119,11 @@ class MetaGrantStore {
   absl::Status RevokeGrant(const RevokeGrant& command);
   absl::Status FenceGroup(const FenceGroup& command);
 
-  // Fact queries (observation freshness and the policy-retire guard).
+  // Fact queries used by observation freshness and aggregate validation.
   std::optional<MetaGroupGrantState> GroupState(
       std::string_view group_id) const;
   std::optional<std::uint64_t> CurrentGroupTerm(
       std::string_view group_id) const;
-  bool PolicyInUse(std::string_view policy_id, std::uint64_t version) const;
   std::size_t GroupCount() const { return groups_.size(); }
 
   // Snapshot serialization: versioned strict encoding; decode enforces caps

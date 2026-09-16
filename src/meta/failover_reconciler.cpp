@@ -111,18 +111,14 @@ absl::StatusOr<MetaRequestId> NextId(
   return *id;
 }
 
-bool ActiveGrantMatchesGroup(const MetaCommittedView& view,
-                             const MetaTopologyGroupView& group,
+bool ActiveGrantMatchesGroup(const MetaTopologyGroupView& group,
                              const MetaGroupGrantState& grant) {
   return grant.grant_.has_value() && !grant.fenced_ &&
          grant.group_term_ == group.record_.group_term_ &&
          grant.grant_->owner_ == group.record_.owner_ &&
          grant.grant_->term_ == group.record_.group_term_ &&
          grant.grant_->authority_version_ == group.record_.authority_version_ &&
-         grant.grant_->grant_revision_ == grant.last_grant_revision_ &&
-         ValidateMetaGrantSpec(grant.grant_->spec_).ok() &&
-         view.policy().IsVersionActive(grant.grant_->spec_.policy_id_,
-                                       grant.grant_->spec_.policy_version_);
+         grant.grant_->grant_revision_ == grant.last_grant_revision_;
 }
 
 bool ControlledDomainMatchesOwner(const MetaFailoverCompatibilityDomain& domain,
@@ -414,7 +410,6 @@ absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
   command.action_id_ = action.action_id_;
   command.authorized_revision_ = action.authorization_->authorized_revision_;
   command.expected_candidate_ = action.candidate_;
-  command.successor_grant_ = transition.successor_grant_;
   SetGroupAnchors(command, group, grant);
   command.new_authority_version_ = *authority;
   command.new_topology_epoch_ = *topology;
@@ -452,7 +447,6 @@ absl::StatusOr<std::optional<MetaCommand>> CommitUncontrolled(
   command.authorized_revision_ = action.authorization_->authorized_revision_;
   command.loss_if_cutover_ = action.authorization_->loss_if_cutover_;
   command.expected_candidate_ = action.candidate_;
-  command.successor_grant_ = transition.successor_grant_;
   SetGroupAnchors(command, group, grant);
   command.new_authority_version_ = *authority;
   command.new_topology_epoch_ = *topology;
@@ -703,7 +697,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanSubmittedControlled(
                            context);
   }
   const auto grant = view.grant().GroupState(intent->group_id_);
-  if (!grant.has_value() || !ActiveGrantMatchesGroup(view, *group, *grant)) {
+  if (!grant.has_value() || !ActiveGrantMatchesGroup(*group, *grant)) {
     return AbortControlled(operation, intent->group_id_, std::nullopt,
                            "controlled failover grant is unavailable", context);
   }
@@ -747,7 +741,6 @@ absl::StatusOr<std::optional<MetaCommand>> PlanSubmittedControlled(
   command.group_id_ = intent->group_id_;
   command.transition_id_ = *transition_id;
   command.target_term_ = group->record_.group_term_ + 1;
-  command.successor_grant_ = grant->grant_->spec_;
   command.candidate_action_ =
       CandidateActionFrom(*candidate.selected_, *action_id);
   command.operation_id_ = operation.operation_id_;
@@ -819,6 +812,10 @@ struct MetaFailoverReconciler::Core {
   // One leader-local deterministic cut lets process tests observe Data's
   // committed post-Begin pause without changing the durable transition.
   bool test_pause_after_begin_applied_ = false;
+  // Candidate-less automatic Begin commits before the ordinary failover
+  // reconciler owns the transition. This cut lets process tests kill that
+  // leader at the exact candidate-less transition recovery boundary.
+  bool test_pause_after_automatic_begin_applied_ = false;
   // Lease fencing needs a later cut where the exact prepared action is
   // already durably authorized and therefore retained across degradation.
   bool test_pause_after_authorize_applied_ = false;
@@ -917,6 +914,41 @@ celer::Task<absl::Status> MetaFailoverReconciler::Run(
     }
 
 #if KEYLANE_FAULTS_ENABLED
+    if (!core->test_pause_after_automatic_begin_applied_) {
+      const auto delay = TestPauseDelay(
+          "KEYLANE_TEST_PAUSE_FAILOVER_AFTER_AUTOMATIC_BEGIN_MS");
+      const auto groups = subscribed.view_.topology().Groups();
+      const auto paused_group =
+          std::ranges::find_if(groups, [](const auto& group) {
+            if (!group.failover_transition_.has_value()) return false;
+            const MetaFailoverTransition& transition =
+                *group.failover_transition_;
+            return transition.mode_ == MetaFailoverMode::kUncontrolled &&
+                   !transition.candidate_action_.has_value();
+          });
+      if (delay != std::chrono::milliseconds::zero() &&
+          paused_group != groups.end()) {
+        core->test_pause_after_automatic_begin_applied_ = true;
+        spdlog::info(
+            "failover reconciliation paused after automatic uncontrolled "
+            "Begin group={} delay_ms={}",
+            paused_group->group_id_, delay.count());
+        auto remaining = delay;
+        constexpr auto kSlice = std::chrono::milliseconds(25);
+        while (!core->cancelled_ && remaining > std::chrono::milliseconds(0)) {
+          const auto slice = std::min(remaining, kSlice);
+          const auto slept =
+              co_await celer::SleepFor(*celer::ThisWorker().self_, slice);
+          if (!slept.ok()) {
+            core->cancelled_ = true;
+            break;
+          }
+          remaining -= slice;
+        }
+        changed->store(true, std::memory_order_release);
+        continue;
+      }
+    }
     if (!core->test_pause_after_begin_applied_) {
       const auto delay =
           TestPauseDelay("KEYLANE_TEST_PAUSE_FAILOVER_AFTER_BEGIN_MS");

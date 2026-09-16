@@ -116,6 +116,12 @@ TLS/identity failures, incompatible wire data, and corrupt status exit 1.
 Text and JSON status include `status_explanation` and `next_action`; fatal
 errors print equivalent guidance to stderr even when no trustworthy status cut
 exists. `cluster-status` requires `--allow-plaintext-admin` for TCP without TLS.
+Each Group also reports `automatic_failover_state`, an exact current failure
+reason when present, elapsed debounce milliseconds, the effective threshold,
+and a blocker code when blocked. The `triggering` state records that a Begin is
+being submitted. These fields are leader-local diagnostics: they contain no
+Policy document, identity, or version and do not independently make the
+cluster unready.
 Supplying `--tls-ca`, `--tls-cert`, and `--tls-key` together enables mTLS for
 every TCP connection, with the address verified against the server
 certificate's IP SAN. These credentials can accompany a Unix seed and secure
@@ -130,9 +136,10 @@ manifest-bootstrapped Meta cluster and one or more preconfigured Data
 processes. It is not an import, expansion, or retry-existing command. One Meta
 Raft cluster permanently owns at most one logical Data cluster. Only lifecycle
 `uninitialized` accepts creation, and the environment must also contain no
-Data identity (including retired identities), Group or Slot state, policy,
-grant, population manifest, or legacy creation operation. Meta identity,
-configuration, and audit records do not make the environment non-pristine.
+Data identity (including retired identities), Group or Slot state, grant,
+population manifest, or prior creation operation. Meta identity,
+configuration, audit records, and valid pre-seeded registered Policies do not
+make the environment non-pristine.
 Creation is destructive for every declared Data process. Define the initial
 Meta set in the same manifest shown below, then start every Meta process from
 that file before starting Data:
@@ -173,6 +180,11 @@ An automatically allocated two-Group topology is:
 schema_version = 1
 slot_strategy = "contiguous-even"
 
+[bootstrap_policy]
+automatic_uncontrolled_failover_enabled = true
+automatic_uncontrolled_failover_suspect_after_ms = 5000
+authority_lease_duration_ms = 5000
+
 [[meta_members]]
 id = 1
 raft_endpoint = "tcp://127.0.0.1:7101"
@@ -205,6 +217,15 @@ id = "group-2"
 primary = "3333333333333333333333333333333333333333"
 replicas = ["4444444444444444444444444444444444444444"]
 ```
+
+The optional `[bootstrap_policy]` section supplies version-1 values for either
+registered Policy family when that family has not been pre-seeded. Omitted
+fields use the values above. These values are creation defaults only: a valid
+pre-seeded current Policy is preserved, and changing the manifest later does
+not reconfigure a created cluster. Automatic failover `suspect_after_ms` must
+be 1,000–86,400,000; Authority Lease `duration_ms` must be
+100–86,400,000. Unknown fields, malformed values, and out-of-range values make
+the manifest invalid.
 
 To choose Slots explicitly, omit `slot_strategy` and add a complete table:
 
@@ -250,9 +271,9 @@ Keep certificate paths and keys in process configuration. Meta and Admin
 descriptors retain their `tcp://` address spelling; their TLS mode comes from
 the process TLS options, independently of these Data listener tags.
 
-New clients encode creation intents as binary version 4. Meta also reads
-version 3 intents for recovery of existing TCP-only creation workflows; run
-the updated Meta and CLI together when creating a topology with TLS endpoints.
+The CLI and Meta use only the current binary version 5 creation intent. Older
+intent layouts have no decoder or mixed-version recovery contract; run the
+updated Meta and CLI together.
 
 Repeat `[[meta_members]]` for every first-wave voter. IDs and each endpoint
 class must be unique; entries are canonicalized by ID, all members are voters,
@@ -431,15 +452,26 @@ selects the strongest candidate inside one comparable domain, and records
 authorized lossless may instead retain `loss=none` across controlled
 degradation. Writes acknowledged only by the failed owner may be absent on an
 unknown-loss cutover.
-There is currently no automatic owner-failure detector that starts an
-uncontrolled transition for an unrelated outage; only a controlled transition
-already in progress can degrade automatically. Treat this as an availability
-gap when planning failure detection and RTO.
+The current Meta Leader also runs an Automatic Failover Detector for every
+Created Group. Only a current authenticated Owner heartbeat matching the exact
+boot, assignment, projection, term, authority, grant, storage, population, and
+causally confirmed lease can prove serviceability. Exact `session_missing`,
+`heartbeat_expired`, `draining`, `storage_unready`, or `population_unready`
+evidence sustained for the current Policy's debounce interval submits an
+uncontrolled Begin. Candidate availability does not delay the committed term
+fence; the ordinary uncontrolled executor selects a recovery candidate later.
+Silent loss takes approximately the observation TTL plus the full debounce and
+proposal latency. A Meta Leader replacement intentionally discards accumulated
+suspicion, reacquires observations, and gives the failure a fresh full
+debounce. Inspect the per-Group detector fields in `cluster-status` when
+diagnosing RTO rather than inferring progress from process reachability.
 
 For postmortems, search Meta logs for `failover event=`. Accepted transition
 commits carry `mode`, `group`, `transition`, `action`, `loss`, and
 `commit_index`; candidate selection/replacement/domain fallback and bounded
-abort/degrade reasons add their relevant source or candidate fields. Entries
+abort/degrade reasons add their relevant source or candidate fields. An
+automatic Begin additionally records its exact trigger `reason` and
+`suspect_ms` duration. Entries
 with possible data loss are warnings. Opaque variable values are canonical
 percent-encoded, so split fields on whitespace and the first `=` before
 decoding values; embedded whitespace, control bytes, and `=` cannot create new
@@ -694,30 +726,50 @@ operations intended for controlled bootstrap and recovery workflows:
 
 ```text
 putpolicy <policy-id> <version> <content>
+getpolicy <policy-id>
 setslotmap <first> <last> <group-id> <config-epoch>
-activateauthority <group-id> <expected-term> <owner-node-id> <lease-ms> \
-                  <policy-id> <policy-version> \
+activateauthority <group-id> <expected-term> <owner-node-id> \
                   <new-authority-version> <new-config-epoch>
 fencegroup <group-id> <expected-term>
 ```
 
-`putpolicy` computes the content hash inside the trusted Meta proposer;
-`content` is one non-empty, whitespace-free token. `setslotmap` replaces the
-entire slot map with one inclusive range—it is not an incremental assignment
-command—and sets the named group's absolute config epoch. Both slot endpoints
-must be within 0–16383. If the replacement changes a group's slot coverage or
-config epoch, every affected source and destination group must first be
-fenced; apply rejects the whole map while any such group has an active grant.
-Activate fresh authorities only after the complete replacement commits.
+`putpolicy` accepts only a compiled-in Policy id and that family's strict,
+compact JSON document. It stores and compares the bounded raw bytes directly;
+Policy commands and state contain no content hash. Versions start at 1 and
+advance consecutively. `getpolicy` returns the current version and its exact
+raw document. The only accepted families and update forms are:
+
+```sh
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  putpolicy keylane.automatic-uncontrolled-failover-v1 2 \
+  '{"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000}'
+keylane-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  putpolicy keylane.authority-lease-v1 2 \
+  '{"kind":"authority-lease-v1","duration_ms":5000}'
+```
+
+The same 1,000–86,400,000 ms automatic threshold and 100–86,400,000 ms lease
+range apply to runtime updates. Field reordering is accepted, but whitespace,
+missing/duplicate/unknown fields, other ids or `kind` values, type mismatches,
+and non-consecutive versions are rejected. `setslotmap` replaces the entire
+slot map with one inclusive
+range—it is not an incremental assignment command—and sets the named group's
+absolute config epoch. Both slot endpoints must be within 0–16383. If the
+replacement changes a group's slot coverage or config epoch, every affected
+source and destination group must first be fenced; apply rejects the whole map
+while any such group has an active grant. Activate fresh authorities only
+after the complete replacement commits.
 
 `activateauthority` is the atomic owner/grant commit. The term must already
-have been established with `begingroupterm`, the owner must hold a current
-assignment, and the policy version must already be committed and active. Term,
-authority version, config epoch, policy version, and lease duration are
-absolute values, not increments. Raft apply checks them against committed
-state, rejects stale or conflicting transitions without changing authority,
-and may accept an identical domain effect idempotently. Only the cluster-wide
-topology epoch is derived by the leader from its committed snapshot.
+have been established with `begingroupterm`, and the owner must hold a current
+assignment. Term, authority version, and config epoch are absolute values, not
+increments. Raft apply checks them against committed state, rejects stale or
+conflicting transitions without changing authority, and may accept an
+identical domain effect idempotently. The Data projection resolves lease
+duration from the current global Authority Lease Policy and caps it by the
+local Meta leadership-validity interval; grants do not store a duration or
+Policy reference. Only the cluster-wide topology epoch is derived by the
+leader from its committed snapshot.
 `fencegroup` removes the grant under the explicit expected-term CAS. Treat
 `setslotmap`, `activateauthority`, and `fencegroup` as dangerous: verify the
 current leader and intended group/owner before issuing them, and do not retry
@@ -933,10 +985,11 @@ cluster; startup intentionally refuses to guess at a conversion.
 ## Binary replacement and format compatibility
 
 The physical segmented-WAL container remains v1 while the first release is
-unpublished. Cluster lifecycle makes the `MetaTopologyStore` codec and Raft
-command envelope v2. Per-Group failover transitions and their typed commands
-extend that pre-release v2 layout in place without another version bump or an
-old-v2 decoder; development directories from a different v2 layout therefore
+unpublished. The current Raft command envelope is v4 and the
+`MetaTopologyStore` codec is v2; cluster-create intents are v5. These formats
+remove Policy hashes/references and grant-local lease configuration, and add
+the automatic Begin provenance described above. There is no decoder for the
+superseded pre-release layouts; development directories from another layout
 fail loudly or must be rebuilt. Other durable stores retain their own exact
 version markers. Equal version numbers in any one layer do not make
 incompatible builds safe to mix.

@@ -28,6 +28,7 @@
 #include "celer/net/server.h"
 #include "celer/runtime/cross_core.h"
 #include "gtest/gtest.h"
+#include "keylane/cluster/lease_clock.h"
 #include "keylane/command.h"
 #include "keylane/fault_injection.h"
 #include "keylane/memory.h"
@@ -131,7 +132,8 @@ std::string HexString(std::string_view value) {
 class StallingNativeSource {
  public:
   StallingNativeSource(std::string expected_target_node_id,
-                       std::uint16_t target_port)
+                       std::uint16_t target_port,
+                       unsigned lease_suspended_responses = 0)
       : expected_client_identity_(RespBulk("?" + expected_target_node_id + ":" +
                                            std::to_string(target_port))),
         expected_population_target_(RespBulk(expected_target_node_id)),
@@ -140,7 +142,8 @@ class StallingNativeSource {
         first_response_("+KLFULLRESYNC 1 " + std::string(40, 'a') + " " +
                         std::string(40, 'e') + " " + std::string(40, 'b') +
                         " " + std::string(40, 'c') + " 1 " +
-                        std::string(40, 'f') + "\r\n") {
+                        std::string(40, 'f') + "\r\n"),
+        lease_suspended_responses_(lease_suspended_responses) {
     listener_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listener_ < 0) {
       error_.store(errno == 0 ? EIO : errno, std::memory_order_release);
@@ -235,7 +238,16 @@ class StallingNativeSource {
       connection_.store(connection, std::memory_order_release);
       const unsigned accepted =
           accepted_.fetch_add(1, std::memory_order_acq_rel) + 1;
-      if (accepted == 1) {
+      if (accepted <= lease_suspended_responses_) {
+        constexpr std::string_view kSuspended = "-KLLEASESUSPENDED\r\n";
+        const ssize_t sent = ::send(connection, kSuspended.data(),
+                                    kSuspended.size(), MSG_NOSIGNAL);
+        if (sent != static_cast<ssize_t>(kSuspended.size())) {
+          error_.store(errno == 0 ? EIO : errno, std::memory_order_release);
+          (void)::close(connection);
+          return;
+        }
+      } else if (accepted == lease_suspended_responses_ + 1) {
         // Read the complete identity prefix before answering so this test also
         // pins the pre-release POPULATION field order at the network boundary.
         constexpr std::string_view kDirectiveIdentity =
@@ -336,6 +348,7 @@ class StallingNativeSource {
   const std::string expected_population_target_;
   const std::string expected_population_epoch_;
   const std::string first_response_;
+  const unsigned lease_suspended_responses_ = 0;
   std::jthread thread_;
   std::atomic<int> connection_{-1};
   std::atomic<unsigned> accepted_{0};
@@ -939,7 +952,8 @@ class ReplicationManagerService final : public celer::Service {
           "directive removal reconciliation permanently closed admission");
     }
     absl::Status session_cancelled =
-        co_await replication_->CancelInProgressClusterPopulation();
+        co_await replication_->CancelInProgressClusterPopulation(
+            /*preserve_current_follow_attempt=*/false);
     if (!session_cancelled.ok() || (co_await after_removal->Await()).code() !=
                                        absl::StatusCode::kCancelled) {
       co_return TestFailure(
@@ -983,6 +997,100 @@ class ReplicationManagerService final : public celer::Service {
   keylane::ReplicationManager* replication_ = nullptr;
   StallingNativeSource* source_ = nullptr;
   std::string expected_node_id_;
+  absl::Status result_ = absl::OkStatus();
+};
+
+class TargetLeaseAdmissionRetryService final : public celer::Service {
+ public:
+  TargetLeaseAdmissionRetryService(keylane::storage::StorageEngine* storage,
+                                   keylane::ReplicationManager* replication,
+                                   StallingNativeSource* source,
+                                   unsigned expected_connections,
+                                   absl::StatusCode expected_terminal)
+      : storage_(storage),
+        replication_(replication),
+        source_(source),
+        expected_connections_(expected_connections),
+        expected_terminal_(expected_terminal) {}
+
+  void Prepare(unsigned thread_count) override {
+    if (thread_count != 1) {
+      result_ = TestFailure("target lease retry test requires one worker");
+    }
+  }
+
+  celer::Task<absl::Status> Run(celer::Worker& worker,
+                                celer::ServiceContext) override {
+    keylane::BindMemoryAccountingShard(worker.id());
+    keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
+    if (result_.ok()) result_ = co_await storage_->InitializeWorker(worker);
+    if (result_.ok()) {
+      replication_->StorageReady(worker);
+      result_ = co_await Exercise(worker);
+    }
+    replication_->RequestShutdown();
+    const absl::Status quiesced = co_await replication_->QuiesceForShutdown();
+    if (result_.ok() && !quiesced.ok()) result_ = quiesced;
+    worker.RequestStop();
+    co_return result_;
+  }
+
+  void Stop() noexcept override {}
+  const absl::Status& result() const noexcept { return result_; }
+
+ private:
+  celer::Task<absl::Status> Exercise(celer::Worker& worker) {
+    if (source_->port() == 0 || source_->error() != 0) {
+      co_return TestFailure("scripted native source failed to start");
+    }
+    const keylane::ClusterPopulationStatus initial =
+        co_await replication_->cluster_population_status();
+    auto manifest =
+        keylane::PopulationManifest::Create({{42, 9}, {16'383, 11}});
+    if (!manifest.ok()) co_return manifest.status();
+    keylane::RebuildDirective directive = TargetDirective(initial, *manifest);
+    const keylane::ReplicaOfConfig upstream{"127.0.0.1", source_->port()};
+    const auto started_at = std::chrono::steady_clock::now();
+    auto started = co_await replication_->StartClusterRebuildDirective(
+        upstream, directive, *manifest);
+    if (!started.ok()) co_return started.status();
+    const absl::Status terminal = co_await started->Await();
+    const auto elapsed = std::chrono::steady_clock::now() - started_at;
+    if (terminal.code() != expected_terminal_) {
+      co_return TestFailure(absl::StrCat("target lease retry returned ",
+                                         terminal, " instead of status code ",
+                                         static_cast<int>(expected_terminal_)));
+    }
+    absl::Status reached = co_await WaitForPeerCount(
+        worker, *source_, false, expected_connections_,
+        "target did not perform the expected bounded lease retries");
+    if (!reached.ok()) co_return reached;
+    const auto minimum =
+        std::chrono::milliseconds(800 * (expected_connections_ - 1));
+    if (elapsed < minimum) {
+      co_return TestFailure("lease admission retries did not use fixed delay");
+    }
+    const unsigned accepted_at_terminal = source_->accepted();
+    absl::Status waited = co_await celer::SleepFor(worker, 1200ms);
+    if (!waited.ok()) co_return waited;
+    if (source_->accepted() != accepted_at_terminal) {
+      co_return TestFailure(
+          "terminal non-lease/protocol failure started another retry");
+    }
+    const keylane::ClusterPopulationStatus population =
+        co_await replication_->cluster_population_status();
+    if (population.state_ != keylane::ReplicationGroupState::kNotReady ||
+        population.ready_token_.has_value()) {
+      co_return TestFailure("terminal retry outcome retained a rebuild proof");
+    }
+    co_return absl::OkStatus();
+  }
+
+  keylane::storage::StorageEngine* storage_ = nullptr;
+  keylane::ReplicationManager* replication_ = nullptr;
+  StallingNativeSource* source_ = nullptr;
+  unsigned expected_connections_ = 0;
+  absl::StatusCode expected_terminal_ = absl::StatusCode::kUnknown;
   absl::Status result_ = absl::OkStatus();
 };
 
@@ -2988,6 +3096,59 @@ class FollowOwnerReconcileService final : public celer::Service {
                           : absl::DeadlineExceededError(std::string(failure));
   }
 
+  celer::Task<absl::Status> RestartSteadyFollowFull(
+      celer::Worker& worker, const keylane::DesiredClusterUpstream& desired) {
+    const unsigned controls_before = replacement_->controls();
+    absl::Status reconciled =
+        co_await replication_->ReconcileClusterFollowOwner(desired);
+    if (!reconciled.ok()) co_return reconciled;
+    absl::Status waited = co_await WaitUntil(
+        worker, [&] { return replacement_->controls() > controls_before; },
+        "replacement population did not restart its control handshake");
+    if (!waited.ok()) co_return waited;
+
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    do {
+      const keylane::ClusterPopulationStatus population =
+          co_await replication_->cluster_population_status();
+      if (population.state_ == keylane::ReplicationGroupState::kRebuilding &&
+          !population.ready_token_.has_value() &&
+          replication_->upstream().has_value()) {
+        co_return absl::OkStatus();
+      }
+      waited = co_await celer::SleepFor(worker, 1ms);
+      if (!waited.ok()) co_return waited;
+    } while (std::chrono::steady_clock::now() < deadline);
+    co_return absl::DeadlineExceededError(
+        "replacement population did not restart steady FollowOwner FULL");
+  }
+
+  celer::Task<absl::Status> VerifyPopulationReplacementRetiresFull(
+      celer::Worker& worker,
+      const keylane::DesiredClusterUpstream& follow_desired,
+      keylane::DesiredClusterPopulation population_replacement,
+      std::string_view replacement_kind) {
+    const unsigned closed_before = replacement_->closed();
+    absl::Status reconciled = co_await replication_->ReconcileClusterPopulation(
+        std::move(population_replacement));
+    if (!reconciled.ok()) co_return reconciled;
+    absl::Status waited = co_await WaitUntil(
+        worker, [&] { return replacement_->closed() > closed_before; },
+        "population replacement did not close steady FollowOwner ingress");
+    if (!waited.ok()) co_return waited;
+
+    const keylane::ClusterPopulationStatus population =
+        co_await replication_->cluster_population_status();
+    if (population.state_ != keylane::ReplicationGroupState::kNotReady ||
+        population.ready_token_.has_value() ||
+        replication_->upstream().has_value()) {
+      co_return TestFailure(absl::StrCat(
+          replacement_kind,
+          " replacement preserved a stale steady FollowOwner FULL"));
+    }
+    co_return co_await RestartSteadyFollowFull(worker, follow_desired);
+  }
+
   celer::Task<absl::Status> Exercise(celer::Worker& worker) {
     const keylane::ReplicationIdentity local =
         co_await replication_->ObserveIdentity();
@@ -3108,6 +3269,28 @@ class FollowOwnerReconcileService final : public celer::Service {
           "destructive FollowOwner FULL retained a Ready candidate proof");
     }
 
+    // A steady FollowOwner FULL rotates the local replication history, which
+    // deliberately makes the Data-to-Meta session reconnect. That session
+    // replacement must retire session-scoped population directives without
+    // cancelling the level-triggered FDS relationship that caused the
+    // rotation; otherwise every sufficiently slow FULL cancels itself before
+    // it can publish a replacement population.
+    const unsigned replacement_closed_at_control_loss = replacement_->closed();
+    reconciled = co_await replication_->CancelInProgressClusterPopulation(
+        /*preserve_current_follow_attempt=*/true);
+    const keylane::ClusterPopulationStatus after_control_loss =
+        co_await replication_->cluster_population_status();
+    if (!reconciled.ok() ||
+        after_control_loss.state_ !=
+            keylane::ReplicationGroupState::kRebuilding ||
+        after_control_loss.ready_token_.has_value() ||
+        !replication_->upstream().has_value() ||
+        replacement_->closed() != replacement_closed_at_control_loss) {
+      co_return TestFailure(
+          "Meta session replacement cancelled its current steady "
+          "FollowOwner FULL");
+    }
+
     // Every follower applies this decision independently: there is no Meta
     // rebuild queue or Data-side admission controller that stages destructive
     // FULL across members. Consequently all followers may reach this exact
@@ -3117,8 +3300,10 @@ class FollowOwnerReconcileService final : public celer::Service {
 
     // NodeControl applies steady replication before population readiness for
     // one FDS. The ordinary FollowOwner FULL attempt is not backed by an
-    // operation directive, so the following exact population reconciliation
-    // must preserve it even though population_transition_expected is false.
+    // operation directive, so the following population reconciliation must
+    // preserve it even though population_transition_expected is false. A
+    // candidate-less failover Begin advances only the authority term; it does
+    // not change the physical population being copied.
     keylane::DesiredClusterPopulation desired_population{
         .group_id_ = desired.group_id_,
         .assignment_id_ = desired.local_assignment_id_,
@@ -3128,6 +3313,7 @@ class FollowOwnerReconcileService final : public celer::Service {
         .partition_replication_epoch_ = desired.partition_replication_epoch_,
         .population_transition_expected_ = false,
     };
+    ++desired_population.term_;
     reconciled =
         co_await replication_->ReconcileClusterPopulation(desired_population);
     const keylane::ClusterPopulationStatus after_population_reconcile =
@@ -3137,9 +3323,58 @@ class FollowOwnerReconcileService final : public celer::Service {
             keylane::ReplicationGroupState::kRebuilding ||
         !replication_->upstream().has_value() || replacement_->closed() != 0) {
       co_return TestFailure(
-          "exact FDS population reconciliation retired its steady "
-          "FollowOwner FULL attempt");
+          "candidate-less term fence retired its steady FollowOwner FULL "
+          "attempt");
     }
+
+    // The authority-only exception is deliberately narrow. Replacing the
+    // Owner still replaces the exact session/context ownership and must cancel
+    // the in-flight FULL before connecting to the new source.
+    const unsigned replacement_closed_before = replacement_->closed();
+    const unsigned unavailable_controls_before = unavailable_->controls();
+    reconciled = co_await replication_->ReconcileClusterFollowOwner(desired);
+    if (!reconciled.ok()) co_return reconciled;
+    waited = co_await WaitUntil(
+        worker,
+        [&] {
+          return replacement_->closed() > replacement_closed_before &&
+                 unavailable_->controls() > unavailable_controls_before;
+        },
+        "owner replacement did not retire the in-flight steady FULL");
+    if (!waited.ok()) co_return waited;
+    const keylane::ClusterPopulationStatus after_owner_replacement =
+        co_await replication_->cluster_population_status();
+    if (after_owner_replacement.state_ !=
+            keylane::ReplicationGroupState::kNotReady ||
+        after_owner_replacement.ready_token_.has_value()) {
+      co_return TestFailure(
+          "owner replacement preserved a stale steady FollowOwner FULL");
+    }
+    reconciled = co_await RestartSteadyFollowFull(worker, replacement);
+    if (!reconciled.ok()) co_return reconciled;
+
+    keylane::DesiredClusterPopulation population_replacement =
+        desired_population;
+    population_replacement.assignment_id_ = "replacement-assignment";
+    reconciled = co_await VerifyPopulationReplacementRetiresFull(
+        worker, replacement, std::move(population_replacement), "assignment");
+    if (!reconciled.ok()) co_return reconciled;
+
+    auto replacement_manifest = keylane::PopulationManifest::Create({{0, 2}});
+    if (!replacement_manifest.ok()) co_return replacement_manifest.status();
+    population_replacement = desired_population;
+    ++population_replacement.manifest_revision_;
+    population_replacement.manifest_id_ = replacement_manifest->id();
+    reconciled = co_await VerifyPopulationReplacementRetiresFull(
+        worker, replacement, std::move(population_replacement), "manifest");
+    if (!reconciled.ok()) co_return reconciled;
+
+    population_replacement = desired_population;
+    ++population_replacement.partition_replication_epoch_;
+    reconciled = co_await VerifyPopulationReplacementRetiresFull(
+        worker, replacement, std::move(population_replacement),
+        "partition epoch");
+    if (!reconciled.ok()) co_return reconciled;
 
     reconciled =
         co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
@@ -3158,12 +3393,20 @@ class FollowOwnerReconcileService final : public celer::Service {
   absl::Status result_ = absl::OkStatus();
 };
 
+struct SourceAuthorizationFaultBarrierPaths {
+  std::filesystem::path admission_entered_;
+  std::filesystem::path revocation_closed_;
+};
+
 class FollowOwnerSourceAuthorizationService final : public celer::Service {
  public:
   FollowOwnerSourceAuthorizationService(
       keylane::storage::StorageEngine* storage,
-      keylane::ReplicationManager* replication)
-      : storage_(storage), replication_(replication) {}
+      keylane::ReplicationManager* replication,
+      SourceAuthorizationFaultBarrierPaths fault_barriers = {})
+      : storage_(storage),
+        replication_(replication),
+        fault_barriers_(std::move(fault_barriers)) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) {
@@ -3272,6 +3515,13 @@ class FollowOwnerSourceAuthorizationService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
+  celer::Task<absl::Status> RunSourceRevocation(RequestResult* result) {
+    result->status_ =
+        co_await replication_->RevokeClusterRebuildSourceAuthorizations();
+    result->done_ = true;
+    co_return absl::OkStatus();
+  }
+
   celer::Task<absl::StatusOr<std::string>> ReadPeerLine(
       celer::Worker& worker, int peer, std::string_view description) {
     std::string response;
@@ -3354,6 +3604,329 @@ class FollowOwnerSourceAuthorizationService final : public celer::Service {
     if (absl::Status ready = co_await initialized->Await(); !ready.ok()) {
       co_return ready;
     }
+    auto watermark = co_await replication_->CaptureNativeReplicationWatermark();
+    if (!watermark.ok() || !watermark->has_value() ||
+        (*watermark)->next_lsns_.size() != 1) {
+      co_return watermark.ok()
+          ? TestFailure("source history was not export-ready")
+          : watermark.status();
+    }
+
+    // POPULATION capability currentness and finite lease admission are
+    // independent. Expiry closes only new handshakes; it neither scans the FDS
+    // ledger nor cancels a session already published under the exact
+    // capability. The wire marker lets a target distinguish this transient
+    // edge from arbitrary peer/protocol failure.
+    const std::string population_target_node(40, 'a');
+    const std::string population_target_boot(40, 'b');
+    keylane::RebuildDirective source_authorization{
+        .identity_ =
+            {
+                .group_id_ = identity.group_id_,
+                .assignment_id_ = "population-target-assignment",
+                .term_ = 2,
+                .directive_revision_ = 10,
+                .authority_id_ = "population-source-authority",
+                .source_node_id_ = local.local_node_id_,
+                .source_assignment_id_ = identity.assignment_id_,
+                .source_boot_id_ = local.boot_id_,
+                .source_history_id_ = (*watermark)->history_id_,
+                .target_node_id_ = population_target_node,
+                .target_boot_id_ = population_target_boot,
+                .operation_id_ = "population-operation",
+                .directive_id_ = "population-authorize-directive",
+                .attempt_id_ = "population-authorize-attempt",
+                .manifest_revision_ = identity.manifest_revision_,
+                .manifest_id_ = identity.manifest_id_,
+                .partition_replication_epoch_ =
+                    identity.partition_replication_epoch_,
+            },
+        .flow_count_ = 1,
+        .safe_source_active_ = true,
+    };
+    absl::Status authorized =
+        co_await replication_->AuthorizeClusterRebuildSource(
+            source_authorization);
+    if (!authorized.ok()) co_return authorized;
+    const auto population_control_args = [&] {
+      return std::vector<std::string>{
+          "KLPSYNC",
+          "1",
+          "?" + population_target_node + ":6380",
+          "?",
+          "?",
+          std::string(40, 'c'),
+          population_target_boot,
+          "?",
+          "POPULATION",
+          identity.group_id_,
+          "population-target-assignment",
+          identity.assignment_id_,
+          "2",
+          "11",
+          "population-source-authority",
+          local.local_node_id_,
+          local.boot_id_,
+          (*watermark)->history_id_,
+          population_target_node,
+          population_target_boot,
+          "population-operation",
+          "population-rebuild-directive",
+          "population-rebuild-attempt",
+          "1",
+          manifest->id().Hex(),
+          "1",
+      };
+    };
+    if (!fault_barriers_.admission_entered_.empty()) {
+      // Hold one authorized KLPSYNC after its optimistic gate check but before
+      // registry publication. Strong revoke must close the shared gate, wait
+      // for that unpublished control, and force its second check to return the
+      // typed pre-mutation retry marker instead of publishing stale authority.
+      const auto crossing_deadline =
+          keylane::cluster::LeaseClockNow() + std::chrono::seconds(30);
+      absl::Status enabled =
+          co_await replication_->EnableClusterRebuildSourceAdmissionUntil(
+              crossing_deadline.time_since_epoch());
+      if (!enabled.ok()) co_return enabled;
+      auto crossing = OpenPeer(worker);
+      if (!crossing.ok()) co_return crossing.status();
+      auto crossing_result = std::make_shared<RequestResult>();
+      retained_requests_.push_back(crossing_result);
+      worker.Spawn(RunNativeRequest(crossing->stream_,
+                                    population_control_args(), 96,
+                                    crossing_result.get()));
+      absl::Status barrier = co_await AwaitFaultBarrier(
+          fault_barriers_.admission_entered_,
+          "population source admission publication barrier");
+      if (!barrier.ok()) {
+        (void)::shutdown(crossing->peer_fd_, SHUT_RDWR);
+        (void)co_await WaitDone(worker, *crossing_result,
+                                "failed admission barrier cleanup");
+        co_return barrier;
+      }
+
+      // Population bootstrap may itself execute an empty strong retirement.
+      // Discard any earlier acknowledgement so the next file creation proves
+      // that this exact concurrently spawned revoker closed the gate.
+      std::error_code stale_ack_error;
+      (void)std::filesystem::remove(fault_barriers_.revocation_closed_,
+                                    stale_ack_error);
+      if (stale_ack_error) {
+        co_return absl::InternalError(absl::StrCat(
+            "could not reset population source revocation barrier: ",
+            stale_ack_error.message()));
+      }
+      auto revocation_result = std::make_shared<RequestResult>();
+      retained_requests_.push_back(revocation_result);
+      worker.Spawn(RunSourceRevocation(revocation_result.get()));
+      barrier = co_await AwaitFaultBarrier(
+          fault_barriers_.revocation_closed_,
+          "population source revocation gate barrier");
+      if (!barrier.ok()) co_return barrier;
+      if (revocation_result->done_) {
+        co_return TestFailure(
+            "source revocation did not join the unpublished KLPSYNC");
+      }
+      std::error_code release_error;
+      const bool released = std::filesystem::remove(
+          fault_barriers_.admission_entered_, release_error);
+      if (!released || release_error) {
+        co_return absl::InternalError(absl::StrCat(
+            "could not release population source admission barrier: ",
+            release_error.message()));
+      }
+
+      auto crossing_reply = co_await ReadPeerLine(
+          worker, crossing->peer_fd_, "revoked population source response");
+      if (!crossing_reply.ok()) co_return crossing_reply.status();
+      if (*crossing_reply != "-KLLEASESUSPENDED") {
+        co_return TestFailure(
+            "revocation crossing did not return the lease-suspended marker");
+      }
+      absl::Status waited = co_await WaitDone(
+          worker, *crossing_result, "revoked population source completion");
+      if (!waited.ok()) co_return waited;
+      if (crossing_result->status_.code() != absl::StatusCode::kUnavailable) {
+        co_return TestFailure(
+            "revocation crossing returned an unsafe terminal status");
+      }
+      waited = co_await WaitDone(worker, *revocation_result,
+                                 "population source revocation completion");
+      if (!waited.ok()) co_return waited;
+      if (!revocation_result->status_.ok()) {
+        co_return revocation_result->status_;
+      }
+      co_return absl::OkStatus();
+    }
+    auto suspended = OpenPeer(worker);
+    if (!suspended.ok()) co_return suspended.status();
+    RequestResult suspended_result;
+    worker.Spawn(RunNativeRequest(suspended->stream_, population_control_args(),
+                                  91, &suspended_result));
+    auto suspended_reply = co_await ReadPeerLine(
+        worker, suspended->peer_fd_, "suspended population source response");
+    if (!suspended_reply.ok()) co_return suspended_reply.status();
+    if (*suspended_reply != "-KLLEASESUSPENDED") {
+      co_return TestFailure(
+          "lease-suspended population source did not return its wire marker");
+    }
+    absl::Status waited = co_await WaitDone(
+        worker, suspended_result, "suspended population source completion");
+    if (!waited.ok()) co_return waited;
+    if (suspended_result.status_.code() != absl::StatusCode::kUnavailable) {
+      co_return TestFailure(
+          "lease-suspended population source returned the wrong status");
+    }
+
+    // Meta may renew the lease only after the first target attempt observes
+    // the suspended admission gate. The still-current capability must retain
+    // the history it names across that gap; otherwise renewal reopens an
+    // authorization that no target can satisfy.
+    waited = co_await celer::SleepFor(worker, 100ms);
+    if (!waited.ok()) co_return waited;
+    const keylane::ReplicationIdentity retained =
+        co_await replication_->ObserveIdentity();
+    if (retained.local_history_id_ != (*watermark)->history_id_) {
+      co_return TestFailure(
+          "current population source capability did not retain its history");
+    }
+
+    const auto live_deadline =
+        keylane::cluster::LeaseClockNow() + std::chrono::seconds(5);
+    absl::Status enabled =
+        co_await replication_->EnableClusterRebuildSourceAdmissionUntil(
+            live_deadline.time_since_epoch());
+    if (!enabled.ok()) co_return enabled;
+
+    // FDS installation clears the old capability before its authorize-source
+    // directive replays. A target that independently received its rebuild may
+    // race into this exact gap: native admission must expose the typed retry
+    // marker, while the replay reservation keeps the named source history
+    // alive even though no export session exists yet.
+    absl::Status refreshed =
+        co_await replication_
+            ->RefreshClusterRebuildSourceAuthorizationsForFdsReplacement(
+                /*preserve_established_exports=*/true,
+                /*expected_authorization_replays=*/1);
+    if (!refreshed.ok()) co_return refreshed;
+    auto replay_gap = OpenPeer(worker);
+    if (!replay_gap.ok()) co_return replay_gap.status();
+    RequestResult replay_gap_result;
+    worker.Spawn(RunNativeRequest(replay_gap->stream_,
+                                  population_control_args(), 95,
+                                  &replay_gap_result));
+    auto replay_gap_reply = co_await ReadPeerLine(
+        worker, replay_gap->peer_fd_, "FDS replay-gap population response");
+    if (!replay_gap_reply.ok()) co_return replay_gap_reply.status();
+    if (*replay_gap_reply != "-KLLEASESUSPENDED") {
+      co_return TestFailure(
+          "FDS replay gap did not return the lease-suspended marker");
+    }
+    waited = co_await WaitDone(worker, replay_gap_result,
+                               "FDS replay-gap population completion");
+    if (!waited.ok()) co_return waited;
+    if (replay_gap_result.status_.code() != absl::StatusCode::kUnavailable) {
+      co_return TestFailure("FDS replay gap returned the wrong status");
+    }
+    waited = co_await celer::SleepFor(worker, 20ms);
+    if (!waited.ok()) co_return waited;
+    const keylane::ReplicationIdentity replay_gap_identity =
+        co_await replication_->ObserveIdentity();
+    if (replay_gap_identity.local_history_id_ != (*watermark)->history_id_) {
+      co_return TestFailure(
+          "FDS replay reservation did not retain source history");
+    }
+    authorized = co_await replication_->AuthorizeClusterRebuildSource(
+        source_authorization);
+    if (!authorized.ok()) co_return authorized;
+
+    auto established = OpenPeer(worker);
+    if (!established.ok()) co_return established.status();
+    RequestResult established_result;
+    worker.Spawn(RunNativeRequest(established->stream_,
+                                  population_control_args(), 92,
+                                  &established_result));
+    auto established_reply = co_await ReadPeerLine(
+        worker, established->peer_fd_, "admitted population source response");
+    if (!established_reply.ok()) co_return established_reply.status();
+    if (!established_reply->starts_with("+KLFULLRESYNC ")) {
+      co_return TestFailure("valid lease did not admit the population source");
+    }
+    // A later FDS may retain this exact authorization while adding the target
+    // rebuild directive. The target can already have received KLFULLRESYNC but
+    // not yet published every flow/ONLINE marker when the source installs that
+    // FDS. Exact-scope replacement must grandfather that published POPULATION
+    // session; otherwise the target observes an unclassified peer-close after
+    // admission and cannot safely retry it as a lease edge.
+    refreshed =
+        co_await replication_
+            ->RefreshClusterRebuildSourceAuthorizationsForFdsReplacement(
+                /*preserve_established_exports=*/true,
+                /*expected_authorization_replays=*/1);
+    if (!refreshed.ok()) co_return refreshed;
+    waited = co_await celer::SleepFor(worker, 20ms);
+    if (!waited.ok()) co_return waited;
+    if (established_result.done_) {
+      co_return TestFailure(
+          "exact FDS refresh cancelled an admitted pre-ONLINE population "
+          "session");
+    }
+    authorized = co_await replication_->AuthorizeClusterRebuildSource(
+        source_authorization);
+    if (!authorized.ok()) co_return authorized;
+    absl::Status expiration =
+        co_await replication_->RevokeClusterExpirationAuthority();
+    if (!expiration.ok()) co_return expiration;
+    waited = co_await celer::SleepFor(worker, 20ms);
+    if (!waited.ok()) co_return waited;
+    if (established_result.done_) {
+      co_return TestFailure(
+          "lease expiry cancelled an already-published population session");
+    }
+    auto after_expiry = OpenPeer(worker);
+    if (!after_expiry.ok()) co_return after_expiry.status();
+    RequestResult after_expiry_result;
+    worker.Spawn(RunNativeRequest(after_expiry->stream_,
+                                  population_control_args(), 93,
+                                  &after_expiry_result));
+    auto after_expiry_reply = co_await ReadPeerLine(
+        worker, after_expiry->peer_fd_, "post-expiry population response");
+    if (!after_expiry_reply.ok()) co_return after_expiry_reply.status();
+    if (*after_expiry_reply != "-KLLEASESUSPENDED") {
+      co_return TestFailure("lease expiry did not close new source admission");
+    }
+    // Native admission checks the absolute deadline synchronously. This stays
+    // closed after the cut even when no expiry timer invokes the cleanup API.
+    const auto short_deadline =
+        keylane::cluster::LeaseClockNow() + std::chrono::milliseconds(5);
+    enabled = co_await replication_->EnableClusterRebuildSourceAdmissionUntil(
+        short_deadline.time_since_epoch());
+    if (!enabled.ok()) co_return enabled;
+    waited = co_await celer::SleepFor(worker, 10ms);
+    if (!waited.ok()) co_return waited;
+    auto deadline_expired = OpenPeer(worker);
+    if (!deadline_expired.ok()) co_return deadline_expired.status();
+    RequestResult deadline_expired_result;
+    worker.Spawn(RunNativeRequest(deadline_expired->stream_,
+                                  population_control_args(), 94,
+                                  &deadline_expired_result));
+    auto deadline_expired_reply = co_await ReadPeerLine(
+        worker, deadline_expired->peer_fd_, "deadline-expired source response");
+    if (!deadline_expired_reply.ok()) co_return deadline_expired_reply.status();
+    if (*deadline_expired_reply != "-KLLEASESUSPENDED") {
+      co_return TestFailure(
+          "native admission ignored an elapsed source lease deadline");
+    }
+    absl::Status cleared =
+        co_await replication_
+            ->ClearClusterRebuildSourceAuthorizationsForSessionReplacement(
+                /*preserve_established_exports=*/true);
+    if (!cleared.ok()) co_return cleared;
+    waited = co_await WaitDone(worker, established_result,
+                               "strong population source cleanup");
+    if (!waited.ok()) co_return waited;
+
     keylane::DesiredClusterUpstream desired{
         .group_id_ = identity.group_id_,
         .group_term_ = 2,
@@ -3375,13 +3948,6 @@ class FollowOwnerSourceAuthorizationService final : public celer::Service {
     absl::Status reconciled =
         co_await replication_->ReconcileClusterFollowOwner(desired);
     if (!reconciled.ok()) co_return reconciled;
-    auto watermark = co_await replication_->CaptureNativeReplicationWatermark();
-    if (!watermark.ok() || !watermark->has_value() ||
-        (*watermark)->next_lsns_.size() != 1) {
-      co_return watermark.ok()
-          ? TestFailure("source history was not export-ready")
-          : watermark.status();
-    }
     const std::string group_token = HexString(identity.group_id_);
     const auto control_args = [&](std::string node, std::string assignment,
                                   std::string incarnation, std::string boot,
@@ -3442,7 +4008,7 @@ class FollowOwnerSourceAuthorizationService final : public celer::Service {
 
     reconciled = co_await replication_->ReconcileClusterFollowOwner(desired);
     if (!reconciled.ok()) co_return reconciled;
-    absl::Status waited = co_await celer::SleepFor(worker, 20ms);
+    waited = co_await celer::SleepFor(worker, 20ms);
     if (!waited.ok()) co_return waited;
     if (first_control.done_ || second_control.done_) {
       co_return TestFailure(
@@ -3515,6 +4081,8 @@ class FollowOwnerSourceAuthorizationService final : public celer::Service {
 
   keylane::storage::StorageEngine* storage_ = nullptr;
   keylane::ReplicationManager* replication_ = nullptr;
+  SourceAuthorizationFaultBarrierPaths fault_barriers_;
+  std::vector<std::shared_ptr<RequestResult>> retained_requests_;
   std::vector<int> peer_fds_;
   absl::Status result_ = absl::OkStatus();
 };
@@ -3562,6 +4130,67 @@ TEST(ReplicationManagerIntegrationTest,
   ASSERT_TRUE(server.Start(runtime).ok());
   server.WaitUntilStopped();
   EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+void RunTargetLeaseAdmissionRetryCase(unsigned suspended_responses,
+                                      unsigned expected_connections,
+                                      absl::StatusCode expected_terminal,
+                                      std::string_view directory_name) {
+  const std::string expected_node_id(40, '9');
+  constexpr std::uint16_t kReplicationPort = 6380;
+  keylane::test::TempDirectory directory{std::string(directory_name)};
+  const std::filesystem::path data = directory.path() / "node.data";
+  keylane::test::CreateDataFile(data, 128 * kMiB);
+
+  StallingNativeSource source(expected_node_id, kReplicationPort,
+                              suspended_responses);
+  ASSERT_NE(source.port(), 0);
+  ASSERT_EQ(source.error(), 0) << std::strerror(source.error());
+  keylane::storage::StorageEngineOptions storage_options;
+  storage_options.data_files_ = {data.string()};
+  storage_options.expiration_authority_ = false;
+  storage_options.buffers_.registered_bytes_ = 64 * kMiB;
+  storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
+  keylane::storage::StorageEngine storage(std::move(storage_options));
+  keylane::InitWorkerMetrics(1);
+  ASSERT_TRUE(keylane::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(storage.Prepare(1).ok());
+
+  keylane::ReplicationOptions replication_options;
+  replication_options.cluster_enabled_ = true;
+  replication_options.node_id_override_ = expected_node_id;
+  replication_options.listen_port_ = kReplicationPort;
+  keylane::ReplicationManager replication(
+      &storage, std::move(replication_options), std::nullopt);
+  keylane::InitStorage(&storage, &replication);
+  EnsureTxRuntime();
+
+  TargetLeaseAdmissionRetryService service(
+      &storage, &replication, &source, expected_connections, expected_terminal);
+  celer::Server server;
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result().ok()) << service.result();
+  EXPECT_EQ(source.error(), 0) << std::strerror(source.error());
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     PopulationTargetRetriesOnlyExplicitLeaseMarkerBeforeMutation) {
+  RunTargetLeaseAdmissionRetryCase(
+      /*suspended_responses=*/1, /*expected_connections=*/2,
+      absl::StatusCode::kFailedPrecondition, "target-lease-marker-retry");
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     PopulationTargetBoundsLeaseMarkerRetriesBeforeMutation) {
+  RunTargetLeaseAdmissionRetryCase(
+      /*suspended_responses=*/4, /*expected_connections=*/4,
+      absl::StatusCode::kUnavailable, "target-lease-marker-retry-limit");
 }
 
 TEST(ReplicationManagerIntegrationTest,
@@ -4244,6 +4873,64 @@ TEST(ReplicationManagerIntegrationTest,
   EnsureTxRuntime();
 
   FollowOwnerSourceAuthorizationService service(&storage, &replication);
+  celer::Server server;
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     PopulationSourceRevokeWinsAdmissionPublicationCrossing) {
+#if !KEYLANE_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a Debug/fault build for the admission barrier";
+#endif
+  keylane::test::TempDirectory directory(
+      "population-source-revoke-admission-crossing");
+  SourceAuthorizationFaultBarrierPaths fault_barriers{
+      .admission_entered_ = directory.path() / "admission-entered",
+      .revocation_closed_ = directory.path() / "revocation-closed",
+  };
+  ASSERT_EQ(::setenv("KEYLANE_REPLICATION_SOURCE_ADMISSION_BARRIER_PATH",
+                     fault_barriers.admission_entered_.c_str(), 1),
+            0);
+  ASSERT_EQ(::setenv("KEYLANE_REPLICATION_SOURCE_REVOCATION_BARRIER_ACK_PATH",
+                     fault_barriers.revocation_closed_.c_str(), 1),
+            0);
+  struct FaultReset {
+    ~FaultReset() {
+      (void)::unsetenv("KEYLANE_REPLICATION_SOURCE_ADMISSION_BARRIER_PATH");
+      (void)::unsetenv(
+          "KEYLANE_REPLICATION_SOURCE_REVOCATION_BARRIER_ACK_PATH");
+    }
+  } fault_reset;
+
+  const std::filesystem::path data = directory.path() / "node.data";
+  keylane::test::CreateDataFile(data, 128 * kMiB);
+  keylane::storage::StorageEngineOptions storage_options;
+  storage_options.data_files_ = {data.string()};
+  storage_options.expiration_authority_ = false;
+  storage_options.buffers_.registered_bytes_ = 64 * kMiB;
+  storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
+  keylane::storage::StorageEngine storage(std::move(storage_options));
+  keylane::InitWorkerMetrics(1);
+  ASSERT_TRUE(keylane::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(storage.Prepare(1).ok());
+
+  keylane::ReplicationOptions options;
+  options.cluster_enabled_ = true;
+  options.node_id_override_ = std::string(40, '9');
+  keylane::ReplicationManager replication(&storage, std::move(options),
+                                          std::nullopt);
+  keylane::InitStorage(&storage, &replication);
+  EnsureTxRuntime();
+
+  FollowOwnerSourceAuthorizationService service(&storage, &replication,
+                                                fault_barriers);
   celer::Server server;
   server.AddService(&service);
   celer::ServerOptions runtime;

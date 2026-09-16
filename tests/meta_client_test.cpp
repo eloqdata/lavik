@@ -300,6 +300,16 @@ TEST(MetaLeaseChallengeRotationTest, HandlesProjectionReplacementAndNoOwner) {
       replacement, "2222222222222222222222222222222222222222"));
 }
 
+TEST(MetaLeaseGrantValidationTest, RequiresExactResolvedFdsDuration) {
+  EXPECT_TRUE(detail::ValidateResolvedLeaseGrantDuration(5000, 5000).ok());
+  EXPECT_EQ(detail::ValidateResolvedLeaseGrantDuration(300, 5000).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(detail::ValidateResolvedLeaseGrantDuration(6000, 5000).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(detail::ValidateResolvedLeaseGrantDuration(0, 0).code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
 TEST(MetaLeaseChallengeRotationTest,
      FencedUncontrolledHistoricalOwnerMayReportCandidateProgress) {
   constexpr char kLocal[] = "1111111111111111111111111111111111111111";
@@ -752,9 +762,6 @@ TEST(MetaFailoverControlAdapterTest,
               .assignment_id_ = AssignmentId::FromBytes(source_assignment),
           },
       .grant_active_ = true,
-      .grant_duration_ms_ = 5000,
-      .grant_policy_id_ = "default",
-      .grant_policy_version_ = 3,
       // A prior failover's action remains bound to the current owner's grant
       // while this new candidate action is prepared.
       .activation_action_id_ =
@@ -1310,7 +1317,6 @@ TEST(MetaFailoverHeartbeatTest,
       .group_term = 8,
       .authority_version = 3,
       .grant_revision = 4,
-      .grant_duration_ms = 5000,
       .grant_active = true,
       .manifest_revision = 10,
       .manifest_digest = manifest,

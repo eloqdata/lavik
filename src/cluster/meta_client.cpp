@@ -313,6 +313,15 @@ class ReplicationNodeControlActions final : public NodeControlActions {
             preserve_established_exports);
   }
 
+  celer::Task<absl::Status> RefreshSourceAuthorizationsForFdsReplacementAndWait(
+      bool preserve_current_population_exports,
+      std::size_t expected_authorization_replays) override {
+    co_return co_await replication_
+        .RefreshClusterRebuildSourceAuthorizationsForFdsReplacement(
+            preserve_current_population_exports,
+            expected_authorization_replays);
+  }
+
   celer::Task<absl::Status> ReconcileClusterControl(
       std::optional<DesiredClusterControl> desired) override {
     if (!desired.has_value()) {
@@ -363,6 +372,12 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         deadline.time_since_epoch());
   }
 
+  celer::Task<absl::Status> EnableSourceAdmissionForLease(
+      MonotonicTime deadline) override {
+    co_return co_await replication_.EnableClusterRebuildSourceAdmissionUntil(
+        deadline.time_since_epoch());
+  }
+
   celer::Task<absl::Status> RevokeExpirationAuthority() override {
     co_return co_await replication_.RevokeClusterExpirationAuthority();
   }
@@ -386,8 +401,10 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         std::move(translated));
   }
 
-  celer::Task<absl::Status> CancelInProgressPopulation() override {
-    co_return co_await replication_.CancelInProgressClusterPopulation();
+  celer::Task<absl::Status> CancelInProgressPopulation(
+      bool preserve_current_follow_attempt) override {
+    co_return co_await replication_.CancelInProgressClusterPopulation(
+        preserve_current_follow_attempt);
   }
 
   celer::Task<absl::Status> CancelPopulationForShutdown() override {
@@ -1020,6 +1037,18 @@ control::DirectiveResultStatus ClassifyDirectiveResultStatus(
                  : control::DirectiveResultStatus::kRejected;
 }
 
+absl::Status detail::ValidateResolvedLeaseGrantDuration(
+    std::uint32_t granted_duration_ms, std::uint32_t challenged_duration_ms) {
+  if (challenged_duration_ms == 0 ||
+      granted_duration_ms != challenged_duration_ms) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "lease grant duration does not equal the challenged FDS duration: ",
+        "granted_ms=", granted_duration_ms,
+        ",challenged_ms=", challenged_duration_ms));
+  }
+  return absl::OkStatus();
+}
+
 absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat) {
   const auto fits = [&]() -> absl::StatusOr<bool> {
     auto encoded = control::EncodeMessage(control::WireMessage(heartbeat));
@@ -1399,7 +1428,7 @@ struct MetaControlClientService::Impl {
   struct PendingHeartbeat {
     std::uint64_t sequence_ = 0;
     std::optional<control::LeaseChallenge> challenge_;
-    std::uint32_t challenged_grant_duration_ms_ = 0;
+    std::uint32_t challenged_authority_lease_duration_ms_ = 0;
   };
 
   struct PendingResult {
@@ -1419,6 +1448,7 @@ struct MetaControlClientService::Impl {
     ReplicationIdentity replication_identity_;
     std::shared_ptr<const control::FullDesiredState> desired_;
     std::chrono::milliseconds heartbeat_interval_{};
+    std::chrono::milliseconds observation_ttl_{};
     std::chrono::milliseconds progress_timeout_{};
     std::uint32_t meta_server_id_ = 0;
     std::uint64_t raft_term_ = 0;
@@ -1696,8 +1726,17 @@ struct MetaControlClientService::Impl {
                  directive.recipient_node_id == options_.node_id_ &&
                  directive.recipient_boot_id == local_boot_id;
         });
+    const std::size_t expected_source_authorization_replays = std::count_if(
+        desired.current_directives.begin(), desired.current_directives.end(),
+        [&](const control::WireProjectedDirective& directive) {
+          return directive.kind ==
+                     control::WireDirectiveKind::kAuthorizeSource &&
+                 directive.recipient_node_id == options_.node_id_ &&
+                 directive.recipient_boot_id == local_boot_id;
+        });
     absl::Status installed = co_await installer_.InstallFullStateTransition(
-        std::move(*prepared), basis, local_population_transition_expected);
+        std::move(*prepared), basis, local_population_transition_expected,
+        expected_source_authorization_replays);
     if (!installed.ok()) co_return installed;
     directory_ = std::move(refreshed_directory);
     RecordClusterControlFullStateApplied();
@@ -2181,6 +2220,11 @@ struct MetaControlClientService::Impl {
       const std::shared_ptr<SessionState>& state,
       control::ControlSessionWriter& writer,
       control::FullDesiredState replacement) {
+    if (std::chrono::milliseconds(replacement.data_heartbeat_interval_ms) >
+        state->observation_ttl_) {
+      co_return absl::InvalidArgumentError(
+          "replacement FDS heartbeat interval exceeds observation TTL");
+    }
     DisableDirectiveDispatch(state);
     RequestHeartbeatPause(state);
     if (absl::Status quiesced = co_await WaitForHeartbeatQuiesced(state);
@@ -2206,6 +2250,8 @@ struct MetaControlClientService::Impl {
     }
     state->desired_ =
         std::make_shared<control::FullDesiredState>(std::move(replacement));
+    state->heartbeat_interval_ =
+        std::chrono::milliseconds(state->desired_->data_heartbeat_interval_ms);
     state->accepted_directives_.clear();
     state->challenge_rotation_.Reset();
     if (absl::Status applied = co_await SendApplied(writer, *state->desired_);
@@ -2471,7 +2517,7 @@ struct MetaControlClientService::Impl {
       const std::optional<std::size_t> local_group_index =
           state->challenge_rotation_.Next(state->desired_->groups,
                                           options_.node_id_);
-      std::uint32_t challenged_grant_duration_ms = 0;
+      std::uint32_t challenged_authority_lease_duration_ms = 0;
       std::optional<control::LeaseChallenge> heartbeat_challenge;
       if (!identity_decision.suppress_ordinary_role_ &&
           local_group_index.has_value()) {
@@ -2487,7 +2533,8 @@ struct MetaControlClientService::Impl {
         heartbeat.role_information = control::AuthorityLeaseRequest{
             .challenge = *heartbeat_challenge,
         };
-        challenged_grant_duration_ms = local_group.grant_duration_ms;
+        challenged_authority_lease_duration_ms =
+            state->desired_->authority_lease_duration_ms;
         result = state->challenge_tracker_.Begin(
             state->session_.session_id_.bytes(), state->boot_id_,
             *heartbeat_challenge);
@@ -2518,7 +2565,8 @@ struct MetaControlClientService::Impl {
       state->pending_heartbeat_ = PendingHeartbeat{
           .sequence_ = heartbeat_sequence,
           .challenge_ = heartbeat_challenge,
-          .challenged_grant_duration_ms_ = challenged_grant_duration_ms,
+          .challenged_authority_lease_duration_ms_ =
+              challenged_authority_lease_duration_ms,
       };
       state->heartbeat_ack_observed_ = false;
       auto sent_at_ms = std::make_shared<std::optional<std::int64_t>>();
@@ -2617,13 +2665,24 @@ struct MetaControlClientService::Impl {
           grant->leader_id != state->meta_server_id_ ||
           grant->raft_term != state->raft_term_ ||
           grant->leadership_generation == 0 ||
-          grant->data_boot_id != state->boot_id_ ||
-          grant->granted_duration_ms > pending.challenged_grant_duration_ms_) {
+          grant->data_boot_id != state->boot_id_) {
         co_return absl::InvalidArgumentError(
-            "lease grant does not match the accepted leader or policy");
+            "lease grant does not match the accepted leader or FDS authority");
+      }
+      if (absl::Status exact_duration =
+              detail::ValidateResolvedLeaseGrantDuration(
+                  grant->granted_duration_ms,
+                  pending.challenged_authority_lease_duration_ms_);
+          !exact_duration.ok()) {
+        co_return exact_duration;
       }
       auto deadline_ms = state->challenge_tracker_.AcceptGrant(
           state->session_.session_id_.bytes(), *grant, LeaseClockMillis());
+      // An exact but expired Grant is consumed by the tracker and must still
+      // end this session. Continuing with heartbeat N+1 would make Meta treat
+      // it as causal proof that Data installed Ack N. Session invalidation
+      // revokes any older retained authority before reauthentication starts a
+      // new causal sequence whose first valid Grant can safely restore service.
       if (!deadline_ms.ok()) co_return deadline_ms.status();
       const std::int64_t grant_ms = grant->granted_duration_ms;
       const auto grant_sent_at =
@@ -2836,8 +2895,7 @@ struct MetaControlClientService::Impl {
     if (!hello->leader_id.has_value() ||
         *hello->leader_id != hello->meta_server_id ||
         IsZero(hello->session_id) || hello->session_generation == 0 ||
-        hello->heartbeat_interval_ms == 0 ||
-        hello->observation_ttl_ms < hello->heartbeat_interval_ms ||
+        hello->observation_ttl_ms == 0 ||
         hello->session_progress_timeout_ms == 0) {
       co_return absl::InvalidArgumentError("invalid accepted ServerHello");
     }
@@ -2862,6 +2920,10 @@ struct MetaControlClientService::Impl {
       auto initial =
           co_await ReceiveFullState(frames, socket_deadline, progress_timeout);
       if (!initial.ok()) co_return initial.status();
+      if (initial->data_heartbeat_interval_ms > hello->observation_ttl_ms) {
+        co_return absl::InvalidArgumentError(
+            "initial FDS heartbeat interval exceeds observation TTL");
+      }
       if (stopping_.load(std::memory_order_acquire)) {
         co_return absl::CancelledError("Meta control client stopped");
       }
@@ -2883,8 +2945,10 @@ struct MetaControlClientService::Impl {
       state->replication_identity_ = replication_identity;
       state->desired_ =
           std::make_shared<control::FullDesiredState>(std::move(*initial));
-      state->heartbeat_interval_ =
-          std::chrono::milliseconds(hello->heartbeat_interval_ms);
+      state->heartbeat_interval_ = std::chrono::milliseconds(
+          state->desired_->data_heartbeat_interval_ms);
+      state->observation_ttl_ =
+          std::chrono::milliseconds(hello->observation_ttl_ms);
       state->progress_timeout_ = progress_timeout;
       state->meta_server_id_ = hello->meta_server_id;
       state->raft_term_ = hello->raft_term;

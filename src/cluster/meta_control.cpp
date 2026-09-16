@@ -24,10 +24,6 @@
 namespace keylane::cluster {
 namespace {
 
-// Projected policy ids retain the durable Meta command cap even though the
-// generic protocol identifier codec also serves longer endpoint fields.
-constexpr std::size_t kMaxProjectedPolicyIdBytes = 128;
-
 bool IsZero(const control::WireId128& value) {
   return std::all_of(value.begin(), value.end(),
                      [](std::uint8_t byte) { return byte == 0; });
@@ -143,18 +139,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     }
   }
 
-  std::set<std::pair<std::string, std::uint64_t>> policies;
-  for (const control::WirePolicy& policy : desired.policies) {
-    if (policy.policy_id.empty() ||
-        policy.policy_id.size() > kMaxProjectedPolicyIdBytes ||
-        policy.version == 0 || policy.content.empty() ||
-        policy.content.size() > control::kMaxOpaqueFieldBytes ||
-        control::ComputeSha256(policy.content) != policy.content_hash ||
-        !policies.emplace(policy.policy_id, policy.version).second) {
-      return Invalid("policy document is non-canonical or duplicated");
-    }
-  }
-
   ServingStateBuilder builder;
   builder.SetInFlightStripeCount(request_worker_count);
   std::map<std::string, NodeIndex> node_indices;
@@ -190,22 +174,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   std::set<std::string> assigned_nodes;
   for (const control::WireDesiredGroup& group : desired.groups) {
     if (group.group_id.empty()) return Invalid("group id is empty");
-    if (group.grant_active) {
-      if (group.grant_duration_ms == 0 || group.grant_policy_id.empty() ||
-          group.grant_policy_version == 0) {
-        return Invalid(absl::StrCat("active grant for group ", group.group_id,
-                                    " has no duration or policy identity"));
-      }
-      if (!policies.contains(
-              {group.grant_policy_id, group.grant_policy_version})) {
-        return Invalid(absl::StrCat("active grant for group ", group.group_id,
-                                    " references an absent policy"));
-      }
-    } else if (group.grant_duration_ms != 0 || !group.grant_policy_id.empty() ||
-               group.grant_policy_version != 0) {
-      return Invalid(absl::StrCat("inactive grant for group ", group.group_id,
-                                  " carries live lease parameters"));
-    }
     if ((group.manifest_revision == 0) != IsZero(group.manifest_digest)) {
       return Invalid(absl::StrCat("group ", group.group_id,
                                   " has a partial manifest identity"));
@@ -310,9 +278,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
         .identity_ = control_group,
         .owner_ = std::nullopt,
         .grant_active_ = source.grant_active,
-        .grant_duration_ms_ = source.grant_duration_ms,
-        .grant_policy_id_ = source.grant_policy_id,
-        .grant_policy_version_ = source.grant_policy_version,
         .activation_action_id_ = std::nullopt,
         .failover_transition_ = std::nullopt,
         .owner_endpoint_ = std::nullopt,
@@ -394,6 +359,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   if (!state.ok()) return Invalid(std::string(state.status().message()));
   return PreparedFullState{
       .serving_state_ = std::move(*state),
+      .authority_lease_duration_ms_ = desired.authority_lease_duration_ms,
       .object_hash_ = desired.object_hash,
       .control_groups_ = std::move(control_groups),
       .desired_cluster_controls_ = std::move(desired_cluster_controls),

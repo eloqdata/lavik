@@ -113,6 +113,11 @@ std::optional<FailoverCommitLog> DescribeFailoverCommit(
           }
           loss = "unknown";
           data_loss_possible = true;
+          if (cmd.trigger_reason_ != MetaAutomaticFailoverReason::kManual) {
+            detail = absl::StrCat(
+                " suspect_ms=", cmd.suspect_duration_ms_, " reason=",
+                LogToken(MetaAutomaticFailoverReasonName(cmd.trigger_reason_)));
+          }
         } else if constexpr (std::is_same_v<Command,
                                             SetUncontrolledCandidate>) {
           mode = "uncontrolled";
@@ -478,6 +483,12 @@ MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {
   }
   view.meta_members_ = stores_.identity_.MetaMembers();
   view.data_nodes_ = stores_.identity_.Nodes();
+  const auto automatic_policy =
+      stores_.policy_.CurrentAutomaticUncontrolledFailover();
+  const auto authority_lease_policy = stores_.policy_.CurrentAuthorityLease();
+  if (automatic_policy.has_value()) {
+    view.automatic_failover_threshold_ms_ = automatic_policy->suspect_after_ms_;
+  }
   for (MetaTopologyGroupView topology : stores_.topology_.Groups()) {
     auto grant = stores_.grant_.GroupState(topology.group_id_);
     // Cross-store validation guarantees the grant half exists for every
@@ -490,11 +501,8 @@ MetaCommittedStatusView MetaStateMachine::StatusSnapshot() const {
     group.manifest_present_ = record.population_manifest_revision_ != 0 &&
                               stores_.population_manifest_.Contains(
                                   record.population_manifest_digest_);
-    if (group.grant_.grant_.has_value()) {
-      const MetaGrantSpec& spec = group.grant_.grant_->spec_;
-      group.policy_active_ = stores_.policy_.IsVersionActive(
-          spec.policy_id_, spec.policy_version_);
-    }
+    group.policy_active_ =
+        automatic_policy.has_value() && authority_lease_policy.has_value();
     view.groups_.push_back(std::move(group));
   }
   for (std::uint32_t slot = 0; slot < kMetaSlotCount;) {

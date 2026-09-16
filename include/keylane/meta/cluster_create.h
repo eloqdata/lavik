@@ -12,6 +12,7 @@
 
 #include "absl/status/statusor.h"
 #include "keylane/meta/commands.h"
+#include "keylane/meta/policy_store.h"
 
 namespace keylane::meta {
 
@@ -19,6 +20,16 @@ namespace keylane::meta {
 // vectors are in canonical order and slot_ranges_ is the complete derived
 // table even when the manifest requested automatic allocation.
 struct ClusterCreateManifestV1 {
+  struct BootstrapPolicy {
+    bool automatic_uncontrolled_failover_enabled_ =
+        kDefaultAutomaticFailoverEnabled;
+    std::uint64_t automatic_uncontrolled_failover_suspect_after_ms_ =
+        kDefaultAutomaticFailoverSuspectAfterMs;
+    std::uint64_t authority_lease_duration_ms_ =
+        kDefaultAuthorityLeaseDurationMs;
+    bool operator==(const BootstrapPolicy&) const = default;
+  };
+
   struct MetaMember {
     std::uint32_t server_id_ = 0;
     std::string raft_endpoint_;
@@ -51,6 +62,7 @@ struct ClusterCreateManifestV1 {
   };
 
   std::uint32_t schema_version_ = 0;
+  BootstrapPolicy bootstrap_policy_;
   std::vector<MetaMember> meta_members_;
   bool slots_generated_ = false;
   std::vector<DataNode> data_nodes_;
@@ -81,9 +93,9 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
     const ClusterCreateManifestV1& manifest,
     const MetaOperationId& root_operation_id);
 
-// Strictly decodes the versioned binary request and returns the root id
-// separately from the normalized durable manifest. Version 3 intents remain
-// readable for recovery; version 4 also carries advertised Data TLS endpoints.
+// Strictly decodes the current binary request and returns the root id
+// separately from the normalized durable manifest. Older intents are outside
+// the current-format product contract.
 absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
     std::string_view request, MetaOperationId* root_operation_id);
 

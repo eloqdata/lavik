@@ -5,9 +5,11 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "absl/strings/str_cat.h"
 #include "keylane/meta/cluster_create.h"
@@ -320,6 +322,13 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
     }
   }
 
+  if (lifecycle.state_ == MetaClusterLifecycle::kCreated &&
+      (!stores.policy_.CurrentAutomaticUncontrolledFailover().has_value() ||
+       !stores.policy_.CurrentAuthorityLease().has_value())) {
+    return MetaFailStopError(
+        "Created cluster lacks a registered current global Policy");
+  }
+
   if (stores.topology_.GroupCount() != stores.grant_.GroupCount()) {
     return MetaFailStopError(
         "topology and grant stores have different group sets");
@@ -368,13 +377,6 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
         return MetaFailStopError(
             "active failover transition identity is not globally unique");
       }
-      if (!stores.policy_.IsVersionActive(
-              transition.successor_grant_.policy_id_,
-              transition.successor_grant_.policy_version_)) {
-        return MetaFailStopError(
-            "active failover transition references a missing or retired "
-            "successor policy");
-      }
       if (group.record_.owner_.empty() ||
           !stores.identity_.IsActiveNode(group.record_.owner_) ||
           !IsMember(group, group.record_.owner_) ||
@@ -395,8 +397,7 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
         if (group.record_.group_term_ ==
                 std::numeric_limits<std::uint64_t>::max() ||
             transition.target_term_ != group.record_.group_term_ + 1 ||
-            grant->fenced_ || !grant->grant_.has_value() ||
-            grant->grant_->spec_ != transition.successor_grant_) {
+            grant->fenced_ || !grant->grant_.has_value()) {
           return MetaFailStopError(
               "controlled failover transition disagrees with current "
               "authority");
@@ -424,7 +425,6 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
             !operation->current_directives_.empty() ||
             !operation->terminal_receipts_.empty() ||
             !operation->evidence_.empty() ||
-            !operation->policy_references_.empty() ||
             std::any_of(operation->replication_history_id_.begin(),
                         operation->replication_history_id_.end(),
                         [](std::uint8_t byte) { return byte != 0; })) {
@@ -478,12 +478,6 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
       return MetaFailStopError(absl::StrCat(
           "active grant owner is inconsistent for group ", group.group_id_));
     }
-    if (!stores.policy_.IsVersionActive(active.spec_.policy_id_,
-                                        active.spec_.policy_version_)) {
-      return MetaFailStopError(
-          absl::StrCat("active grant for group ", group.group_id_,
-                       " references a missing or retired policy"));
-    }
   }
 
   for (const MetaOperationRecord& operation :
@@ -497,8 +491,7 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
       const bool common_shape =
           intent.ok() &&
           operation.intent_hash_ == MetaSha256(operation.intent_) &&
-          zero_history && operation.policy_references_.empty() &&
-          operation.kind_phase_blob_.empty() &&
+          zero_history && operation.kind_phase_blob_.empty() &&
           operation.current_directives_.empty() &&
           operation.terminal_receipts_.empty() && operation.evidence_.empty();
       const bool submitted =
@@ -522,13 +515,6 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
     if (operation.lifecycle_ == MetaOperationLifecycle::kCompleted ||
         operation.lifecycle_ == MetaOperationLifecycle::kAborted) {
       continue;
-    }
-    for (const MetaPolicyReference& reference : operation.policy_references_) {
-      if (!stores.policy_.IsVersionActive(reference.policy_id_,
-                                          reference.version_)) {
-        return MetaFailStopError(
-            "non-terminal operation references a missing or retired policy");
-      }
     }
     for (const MetaEvidenceSummary& evidence : operation.evidence_) {
       const auto evidence_group =
@@ -684,11 +670,16 @@ bool IsPristineSubmittedFailoverOperation(
          operation.kind_phase_blob_.empty() &&
          operation.current_directives_.empty() &&
          operation.terminal_receipts_.empty() && operation.evidence_.empty() &&
-         operation.policy_references_.empty() &&
          std::all_of(operation.replication_history_id_.begin(),
                      operation.replication_history_id_.end(),
                      [](std::uint8_t byte) { return byte == 0; });
 }
+
+// This terminal result is part of the replicated Begin post-effect. It is
+// intentionally independent of leader-local observations so replay and
+// snapshot restoration see one stable reason for automatic preemption.
+constexpr std::string_view kAutomaticFailoverPreemptionReason =
+    "preempted by automatic uncontrolled failover";
 
 bool FailoverOperationIntentMatches(const MetaOperationRecord& operation,
                                     std::string_view group_id,
@@ -701,6 +692,84 @@ bool FailoverOperationIntentMatches(const MetaOperationRecord& operation,
   if (!intent.ok() || intent->group_id_ != group_id) return false;
   if (deadline != nullptr) *deadline = intent->absolute_deadline_unix_ms_;
   return true;
+}
+
+std::vector<MetaOperationRecord> PreemptableControlledRequests(
+    const MetaStores& stores, std::string_view group_id) {
+  std::vector<MetaOperationRecord> requests;
+  for (const MetaOperationRecord& operation :
+       stores.operation_.LiveOperations()) {
+    if (IsPristineSubmittedFailoverOperation(operation) &&
+        FailoverOperationIntentMatches(operation, group_id)) {
+      requests.push_back(operation);
+    }
+  }
+  // operation_seq is the durable submission order; the id tie-break keeps the
+  // traversal total even for a malformed in-memory aggregate that reused a
+  // sequence. Apply remains deterministic before fail-stop validation.
+  std::sort(requests.begin(), requests.end(),
+            [](const auto& left, const auto& right) {
+              return std::tie(left.operation_seq_, left.operation_id_) <
+                     std::tie(right.operation_seq_, right.operation_id_);
+            });
+  return requests;
+}
+
+absl::Status ValidateAutomaticFailoverPreemption(
+    const MetaStores& stores, const BeginUncontrolledFailover& command) {
+  const bool has_operation = command.preempted_operation_id_.has_value();
+  if (has_operation !=
+      command.expected_preempted_operation_revision_.has_value()) {
+    return MetaDomainRejectError(
+        "preempted operation id and expected revision must be paired");
+  }
+  if (!has_operation) return absl::OkStatus();
+  if (command.trigger_reason_ == MetaAutomaticFailoverReason::kManual) {
+    return MetaDomainRejectError(
+        "manual uncontrolled failover cannot preempt a controlled request");
+  }
+
+  const auto operation =
+      stores.operation_.FindOperation(*command.preempted_operation_id_);
+  if (!operation.has_value() ||
+      !IsPristineSubmittedFailoverOperation(*operation) ||
+      operation->revision_ != *command.expected_preempted_operation_revision_) {
+    return MetaDomainRejectError(
+        "preempted controlled failover operation CAS mismatch");
+  }
+  if (!FailoverOperationIntentMatches(*operation, command.group_id_)) {
+    return MetaDomainRejectError(
+        "preempted controlled failover operation targets another group");
+  }
+  return absl::OkStatus();
+}
+
+bool AutomaticFailoverPreemptionEffectPresent(
+    const MetaStores& stores, const BeginUncontrolledFailover& command) {
+  if (command.trigger_reason_ == MetaAutomaticFailoverReason::kManual) {
+    return !command.preempted_operation_id_.has_value() &&
+           !command.expected_preempted_operation_revision_.has_value();
+  }
+  bool hinted_effect_present = true;
+  if (command.preempted_operation_id_.has_value()) {
+    if (!command.expected_preempted_operation_revision_.has_value() ||
+        *command.expected_preempted_operation_revision_ ==
+            std::numeric_limits<std::uint64_t>::max()) {
+      return false;
+    }
+    const auto operation =
+        stores.operation_.FindOperation(*command.preempted_operation_id_);
+    hinted_effect_present =
+        operation.has_value() &&
+        FailoverOperationIntentMatches(*operation, command.group_id_) &&
+        operation->lifecycle_ == MetaOperationLifecycle::kAborted &&
+        operation->revision_ ==
+            *command.expected_preempted_operation_revision_ + 1 &&
+        operation->terminal_result_ == kAutomaticFailoverPreemptionReason &&
+        !operation->data_loss_possible_;
+  }
+  return hinted_effect_present &&
+         PreemptableControlledRequests(stores, command.group_id_).empty();
 }
 
 bool FailoverAbortEffectPresent(const MetaStores& stores,
@@ -792,19 +861,9 @@ absl::Status ValidateFailoverBeginAnchors(
   if (active.owner_ != cmd.expected_owner_node_id_ ||
       active.term_ != cmd.expected_group_term_ ||
       active.authority_version_ != cmd.expected_authority_version_ ||
-      active.grant_revision_ != cmd.expected_grant_revision_ ||
-      active.spec_ != cmd.successor_grant_) {
+      active.grant_revision_ != cmd.expected_grant_revision_) {
     return MetaDomainRejectError(
-        "failover successor grant does not match the active grant");
-  }
-  if (absl::Status status = ValidateMetaGrantSpec(cmd.successor_grant_);
-      !status.ok()) {
-    return status;
-  }
-  if (!stores.policy_.IsVersionActive(cmd.successor_grant_.policy_id_,
-                                      cmd.successor_grant_.policy_version_)) {
-    return MetaDomainRejectError(
-        "failover successor grant policy is not active");
+        "failover authority does not match the active grant");
   }
   if (candidate_action != nullptr) {
     if constexpr (std::is_same_v<BeginCommand, BeginControlledFailover>) {
@@ -835,7 +894,6 @@ MetaFailoverTransition ControlledTransitionFrom(
   transition.revision_ = revision;
   transition.mode_ = MetaFailoverMode::kControlled;
   transition.target_term_ = cmd.target_term_;
-  transition.successor_grant_ = cmd.successor_grant_;
   transition.candidate_action_ = cmd.candidate_action_;
   transition.controlled_ =
       MetaControlledFailover{cmd.operation_id_, cmd.absolute_deadline_unix_ms_};
@@ -876,7 +934,6 @@ bool BeginControlledEffectPresent(const MetaStores& stores,
          active.term_ == cmd.expected_group_term_ &&
          active.authority_version_ == cmd.expected_authority_version_ &&
          active.grant_revision_ == cmd.expected_grant_revision_ &&
-         active.spec_ == cmd.successor_grant_ &&
          ValidateFailoverCandidateAgainstGroup(stores, *group,
                                                cmd.candidate_action_)
              .ok() &&
@@ -894,7 +951,6 @@ MetaFailoverTransition UncontrolledTransitionFrom(
   transition.revision_ = revision;
   transition.mode_ = MetaFailoverMode::kUncontrolled;
   transition.target_term_ = cmd.target_term_;
-  transition.successor_grant_ = cmd.successor_grant_;
   transition.candidate_action_ = cmd.candidate_action_;
   return transition;
 }
@@ -928,16 +984,16 @@ bool BeginUncontrolledEffectPresent(const MetaStores& stores,
       grant->group_term_ != cmd.target_term_ ||
       grant->last_authority_version_ != cmd.expected_authority_version_ ||
       grant->last_grant_revision_ != cmd.expected_grant_revision_ ||
-      !grant->fenced_ || grant->grant_.has_value() ||
-      !stores.policy_.IsVersionActive(cmd.successor_grant_.policy_id_,
-                                      cmd.successor_grant_.policy_version_)) {
+      !grant->fenced_ || grant->grant_.has_value()) {
     return false;
   }
   const bool candidate_valid = !cmd.candidate_action_.has_value() ||
                                ValidateFailoverCandidateAgainstGroup(
                                    stores, *group, *cmd.candidate_action_)
                                    .ok();
-  return candidate_valid && AllCurrentDirectivesHaveCommittedAnchors(stores) &&
+  return candidate_valid &&
+         AutomaticFailoverPreemptionEffectPresent(stores, cmd) &&
+         AllCurrentDirectivesHaveCommittedAnchors(stores) &&
          ValidateDecodedAggregate(stores).ok();
 }
 
@@ -994,10 +1050,6 @@ bool FailoverCommitEffectPresent(const MetaStores& stores,
       active.authority_version_ != command.new_authority_version_ ||
       active.grant_revision_ != log_index ||
       active.activation_action_id_ != command.action_id_ ||
-      active.spec_ != command.successor_grant_ ||
-      !stores.policy_.IsVersionActive(
-          command.successor_grant_.policy_id_,
-          command.successor_grant_.policy_version_) ||
       !AllCurrentDirectivesHaveCommittedAnchors(stores)) {
     return false;
   }
@@ -1035,8 +1087,7 @@ absl::Status ValidateFailoverCommitPrestate(
       action.candidate_ != command.expected_candidate_ ||
       !action.authorization_.has_value() ||
       action.authorization_->authorized_revision_ !=
-          command.authorized_revision_ ||
-      transition.successor_grant_ != command.successor_grant_) {
+          command.authorized_revision_) {
     return MetaDomainRejectError("failover commit action CAS mismatch");
   }
   if constexpr (kControlled) {
@@ -1079,8 +1130,7 @@ absl::Status ValidateFailoverCommitPrestate(
         grant_state.fenced_ || !grant_state.grant_.has_value() ||
         grant_state.grant_->owner_ != command.expected_owner_node_id_ ||
         grant_state.grant_->grant_revision_ !=
-            command.expected_grant_revision_ ||
-        grant_state.grant_->spec_ != command.successor_grant_) {
+            command.expected_grant_revision_) {
       return MetaDomainRejectError(
           "controlled failover current authority is stale");
     }
@@ -1095,11 +1145,6 @@ absl::Status ValidateFailoverCommitPrestate(
              !grant_state.fenced_ || grant_state.grant_.has_value()) {
     return MetaDomainRejectError(
         "uncontrolled failover is not fenced in its target term");
-  }
-  if (!stores.policy_.IsVersionActive(
-          command.successor_grant_.policy_id_,
-          command.successor_grant_.policy_version_)) {
-    return MetaDomainRejectError("failover successor policy is not active");
   }
   return absl::OkStatus();
 }
@@ -1155,7 +1200,6 @@ ApplyOutcome ApplyFailoverCommit(MetaStores& stores, std::uint64_t log_index,
   activate.group_id_ = command.group_id_;
   activate.expected_term_ = target_term;
   activate.new_owner_ = command.expected_candidate_.node_id_;
-  activate.grant_ = command.successor_grant_;
   activate.new_authority_version_ = command.new_authority_version_;
   activate.new_topology_epoch_ = command.new_topology_epoch_;
   activate.new_config_epoch_ = command.new_config_epoch_;
@@ -1197,7 +1241,7 @@ ApplyOutcome ApplyFailoverCommit(MetaStores& stores, std::uint64_t log_index,
 // field, so live legacy create operations are also treated as artifacts.
 bool HasDataClusterArtifactsImpl(const MetaStores& stores) {
   if (stores.identity_.NodeCount() != 0 || stores.topology_.GroupCount() != 0 ||
-      stores.policy_.PolicyCount() != 0 || stores.grant_.GroupCount() != 0 ||
+      stores.grant_.GroupCount() != 0 ||
       stores.population_manifest_.Size() != 0) {
     return true;
   }
@@ -1270,8 +1314,7 @@ bool ActivateEffectPresent(
   const bool grant_half =
       grant.owner_ == cmd.new_owner_ && grant.term_ == cmd.expected_term_ &&
       grant.authority_version_ == cmd.new_authority_version_ &&
-      grant.activation_action_id_ == activation_action_id &&
-      grant.spec_ == cmd.grant_;
+      grant.activation_action_id_ == activation_action_id;
   const bool topology_half =
       view.record_.owner_ == cmd.new_owner_ &&
       view.record_.authority_version_ == cmd.new_authority_version_ &&
@@ -1317,12 +1360,6 @@ absl::Status ApplyAuthorityActivationKernel(
     if (!stores.identity_.IsActiveNode(cmd.new_owner_)) {
       return MetaDomainRejectError(absl::StrCat(
           "new owner ", cmd.new_owner_, " is not a registered active node"));
-    }
-    if (!stores.policy_.IsVersionActive(cmd.grant_.policy_id_,
-                                        cmd.grant_.policy_version_)) {
-      return MetaDomainRejectError(absl::StrCat(
-          "policy ", cmd.grant_.policy_id_, " version ",
-          cmd.grant_.policy_version_, " is not committed and active"));
     }
   }
   if (absl::Status status = stores.grant_.ApplyGrantPart(
@@ -1678,52 +1715,13 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
-                      const GrantAuthority& cmd) {
-  std::string summary = absl::StrCat(
-      "GrantAuthority group=", cmd.group_id_, " node=", cmd.node_id_,
-      " term=", cmd.term_, " authority_version=", cmd.authority_version_,
-      " policy=", cmd.grant_.policy_id_, "@", cmd.grant_.policy_version_);
-  // Item 1: the renewing owner must be a registered, non-retired node.
-  if (!stores.identity_.IsActiveNode(cmd.node_id_)) {
-    return Rejected(
-        absl::StrCat("node ", cmd.node_id_, " is not a registered active node"),
-        std::move(summary));
-  }
-  // Item 5: the grant's policy reference must be committed and non-retired.
-  if (!stores.policy_.IsVersionActive(cmd.grant_.policy_id_,
-                                      cmd.grant_.policy_version_)) {
-    return Rejected(absl::StrCat("policy ", cmd.grant_.policy_id_, " version ",
-                                 cmd.grant_.policy_version_,
-                                 " is not committed and active"),
-                    std::move(summary));
-  }
-  if (GroupHasActiveFailover(stores, cmd.group_id_)) {
-    const auto state = stores.grant_.GroupState(cmd.group_id_);
-    const bool semantic_noop =
-        state.has_value() && state->grant_.has_value() && !state->fenced_ &&
-        state->grant_->owner_ == cmd.node_id_ &&
-        state->grant_->term_ == cmd.term_ &&
-        state->grant_->authority_version_ == cmd.authority_version_ &&
-        state->grant_->spec_ == cmd.grant_;
-    if (!semantic_noop) {
-      return Rejected(
-          "grant change is blocked by an active failover transition",
-          std::move(summary));
-    }
-  }
-  return FromStatus(stores.grant_.GrantAuthority(cmd, log_index),
-                    std::move(summary));
-}
-
-ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                       const ActivateAuthority& cmd) {
   std::string summary = absl::StrCat(
       "ActivateAuthority group=", cmd.group_id_, " owner=", cmd.new_owner_,
       " expected_term=", cmd.expected_term_,
       " authority_version=", cmd.new_authority_version_,
       " topology_epoch=", cmd.new_topology_epoch_,
-      " config_epoch=", cmd.new_config_epoch_,
-      " policy=", cmd.grant_.policy_id_, "@", cmd.grant_.policy_version_);
+      " config_epoch=", cmd.new_config_epoch_);
   const auto view = stores.topology_.FindGroup(cmd.group_id_);
   const auto grant_state = stores.grant_.GroupState(cmd.group_id_);
   const bool effect_present =
@@ -1848,10 +1846,15 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                       const BeginUncontrolledFailover& cmd) {
-  std::string summary =
-      absl::StrCat("BeginUncontrolledFailover group=", cmd.group_id_,
-                   " transition=", HexBytes(cmd.transition_id_),
-                   " target_term=", cmd.target_term_);
+  std::string summary = absl::StrCat(
+      "BeginUncontrolledFailover group=", cmd.group_id_,
+      " transition=", HexBytes(cmd.transition_id_),
+      " target_term=", cmd.target_term_,
+      " trigger=", MetaAutomaticFailoverReasonName(cmd.trigger_reason_),
+      " suspect_ms=", cmd.suspect_duration_ms_, " preempted_operation=",
+      cmd.preempted_operation_id_.has_value()
+          ? HexBytes(*cmd.preempted_operation_id_)
+          : std::string("none"));
   // Typed failover commands are meaningful only after Genesis has reached
   // Created. This is a deterministic apply gate, not merely a proposer-side
   // convenience, so a new Meta leader cannot resume work in another cluster
@@ -1860,12 +1863,26 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     return Rejected("failover requires cluster lifecycle Created",
                     std::move(summary));
   }
+  // ApplyCommitted is also a public typed seam used independently of the WAL
+  // decoder. Preserve the durable shape invariant here so bypassing command
+  // encoding cannot install a preselected automatic Candidate.
+  if (cmd.trigger_reason_ != MetaAutomaticFailoverReason::kManual &&
+      cmd.candidate_action_.has_value()) {
+    return Rejected(
+        "automatic uncontrolled failover begin must be candidate-less",
+        std::move(summary));
+  }
 
   // Replay is checked against the complete compound post-state before any
   // precondition. A later log index carrying the same payload is not a replay:
   // the persisted transition revision still names the original entry.
   if (BeginUncontrolledEffectPresent(stores, cmd, log_index)) {
     return Accepted(std::move(summary));
+  }
+
+  if (absl::Status status = ValidateAutomaticFailoverPreemption(stores, cmd);
+      !status.ok()) {
+    return Rejected(status, std::move(summary));
   }
 
   const auto group = stores.topology_.FindGroup(cmd.group_id_);
@@ -1906,6 +1923,23 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
           cmd.group_id_, transition, log_index);
       !status.ok()) {
     return Rejected(status, std::move(summary));
+  }
+  // The optional command pair is a proposer-observed CAS witness, not the
+  // complete mutation set. Apply scans the bounded journal so any pristine
+  // request that won the append race after proposal construction is aborted
+  // in the same candidate aggregate as the emergency transition.
+  if (cmd.trigger_reason_ != MetaAutomaticFailoverReason::kManual) {
+    for (const MetaOperationRecord& operation :
+         PreemptableControlledRequests(candidate, cmd.group_id_)) {
+      AbortOperation abort;
+      abort.operation_id_ = operation.operation_id_;
+      abort.expected_revision_ = operation.revision_;
+      abort.reason_ = std::string(kAutomaticFailoverPreemptionReason);
+      if (absl::Status status = candidate.operation_.AbortOperation(abort);
+          !status.ok()) {
+        return Rejected(status, std::move(summary));
+      }
+    }
   }
 
   // Advancing the group term invalidates every directive anchored to the old
@@ -2237,8 +2271,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       group->record_.group_term_ == std::numeric_limits<std::uint64_t>::max() ||
       current.target_term_ != group->record_.group_term_ + 1 ||
       grant->group_term_ != group->record_.group_term_ || grant->fenced_ ||
-      !grant->grant_.has_value() ||
-      grant->grant_->spec_ != current.successor_grant_) {
+      !grant->grant_.has_value()) {
     return Rejected("controlled failover degrade CAS mismatch",
                     std::move(summary));
   }
@@ -2295,10 +2328,8 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 // ---------------------------------------------------------------------------
-// policy. Retirement checks all committed reference owners: active grants,
-// active failover successor grants, and live operations. Operation policy
-// references are structured fields on SubmitOperation; apply never interprets
-// opaque operation intents.
+// Global registered Policy families. Raw content is validated and versioned
+// entirely by MetaPolicyStore.
 // ---------------------------------------------------------------------------
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -2310,42 +2341,10 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                    " version=", cmd.version_, " bytes=", cmd.content_.size()));
 }
 
-ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
-                      const RetirePolicy& cmd) {
-  (void)log_index;
-  std::string summary = absl::StrCat("RetirePolicy policy=", cmd.policy_id_,
-                                     " version=", cmd.version_);
-  if (stores.grant_.PolicyInUse(cmd.policy_id_, cmd.version_)) {
-    return Rejected(
-        absl::StrCat("policy ", cmd.policy_id_, " version ", cmd.version_,
-                     " is referenced by an active grant"),
-        std::move(summary));
-  }
-  if (stores.operation_.PolicyInUse(cmd.policy_id_, cmd.version_)) {
-    return Rejected(
-        absl::StrCat("policy ", cmd.policy_id_, " version ", cmd.version_,
-                     " is referenced by a non-terminal operation"),
-        std::move(summary));
-  }
-  for (const MetaTopologyGroupView& group : stores.topology_.Groups()) {
-    if (group.failover_transition_.has_value() &&
-        group.failover_transition_->successor_grant_.policy_id_ ==
-            cmd.policy_id_ &&
-        group.failover_transition_->successor_grant_.policy_version_ ==
-            cmd.version_) {
-      return Rejected(
-          absl::StrCat("policy ", cmd.policy_id_, " version ", cmd.version_,
-                       " is frozen by an active failover transition"),
-          std::move(summary));
-    }
-  }
-  return FromStatus(stores.policy_.Apply(cmd), std::move(summary));
-}
-
 // ---------------------------------------------------------------------------
 // operation journal. The operation store owns the lifecycle
-// machine. The dispatcher supplies the log index and actor, validates policy
-// dependencies on submit, and rechecks evidence against committed identity,
+// machine. The dispatcher supplies the log index and actor and rechecks
+// evidence against committed identity,
 // topology, term, manifest, partition-replication, and history anchors before
 // each transition.
 // ---------------------------------------------------------------------------
@@ -2359,6 +2358,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       absl::StrCat("SubmitOperation kind=", cmd.kind_,
                    " id=", HexBytes(cmd.operation_id_), " seq=", log_index);
   const bool creation = cmd.kind_ == kMetaClusterCreateOperationKind;
+  std::optional<std::string> failover_group_id;
   const auto& lifecycle = stores.topology_.ClusterLifecycle();
   if (cmd.kind_ == kFailoverOperationKind &&
       lifecycle.state_ != MetaClusterLifecycle::kCreated) {
@@ -2368,7 +2368,6 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   if (cmd.kind_ == kFailoverOperationKind) {
     const auto intent = DecodeFailoverOperationIntent(cmd.intent_);
     if (!intent.ok() || cmd.intent_hash_ != MetaSha256(cmd.intent_) ||
-        !cmd.policy_references_.empty() ||
         std::any_of(cmd.replication_history_id_.begin(),
                     cmd.replication_history_id_.end(),
                     [](std::uint8_t byte) { return byte != 0; })) {
@@ -2376,6 +2375,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
           "failover submission requires canonical request-only intent",
           std::move(summary));
     }
+    failover_group_id = intent->group_id_;
   }
   const bool reuses_genesis_id =
       lifecycle.state_ != MetaClusterLifecycle::kUninitialized &&
@@ -2430,6 +2430,19 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     stores.topology_ = std::move(candidate.topology_);
     return Accepted(std::move(summary));
   }
+  // Begin and Submit may be adjacent in either Raft order. Begin preempts all
+  // earlier pristine requests; once its transition is active, this gate keeps
+  // every later new request out. Permanent-id replay above remains legal so a
+  // client can still discover the abort of a request it already submitted.
+  if (failover_group_id.has_value()) {
+    const auto group = stores.topology_.FindGroup(*failover_group_id);
+    if (group.has_value() && group->failover_transition_.has_value()) {
+      return Rejected(
+          "controlled submission conflicts with active failover "
+          "transition",
+          std::move(summary));
+    }
+  }
   // Creation intent is the first committed mutation and its durable
   // reservation survives a lost proposer/leader. The entry-layer gate is
   // only fast rejection; two different creation ids must not both commit.
@@ -2452,15 +2465,6 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     if (HasDataClusterArtifactsImpl(stores)) {
       return Rejected("cluster creation requires pristine unreserved state",
                       std::move(summary));
-    }
-  }
-  for (const MetaPolicyReference& reference : cmd.policy_references_) {
-    if (!stores.policy_.IsVersionActive(reference.policy_id_,
-                                        reference.version_)) {
-      return Rejected(
-          absl::StrCat("operation references uncommitted or retired policy ",
-                       reference.policy_id_, " version ", reference.version_),
-          std::move(summary));
     }
   }
   // The journal persists the submitter's ActorContext; it is injected by the
@@ -2612,6 +2616,17 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       !LiveClusterCreateRootMatchesLifecycle(*operation, lifecycle)) {
     return Rejected("cluster-create completion root anchor mismatch",
                     std::move(summary));
+  }
+  // Creation installs both compiled-in global Policy families before any
+  // authority. Keep that ordering as an apply invariant as well as a planner
+  // convention: otherwise a malformed or stale trusted command can commit a
+  // Created state that only fails closed after a snapshot restore, while WAL
+  // replay alone would continue serving the invalid aggregate.
+  if (!stores.policy_.CurrentAutomaticUncontrolledFailover().has_value() ||
+      !stores.policy_.CurrentAuthorityLease().has_value()) {
+    return Rejected(
+        "cluster-create completion requires both current global Policies",
+        std::move(summary));
   }
   const bool operation_effect_applied =
       operation->lifecycle_ == MetaOperationLifecycle::kCompleted &&
@@ -2912,10 +2927,7 @@ MetaApplyResult ApplyCommitted(MetaStores& stores, std::uint64_t log_index,
                                std::string_view readable_time) {
   MetaApplyResult result;
   result.log_index_ = log_index;
-  // The variant alternative order matches the MetaCommandTag declaration
-  // order exactly (tags 1..37), so the tag is the alternative index + 1. The
-  // tests pin this mapping per command.
-  result.command_tag_ = static_cast<MetaCommandTag>(command.index() + 1);
+  result.command_tag_ = MetaCommandTagOf(command);
 
   // Guards for caller-contract violations (see the header): reject before
   // dispatch so committed state stays unchanged and identical on every node.

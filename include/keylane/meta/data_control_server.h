@@ -5,6 +5,7 @@
 // return the committed Meta directory; only the reconciler installed through
 // MetaCoordinator::RunAsLeader may create authority-bearing sessions.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -36,6 +37,7 @@ namespace keylane::meta {
 
 class MetaObservationStore;
 class MetaCommittedFacts;
+struct NodeControlBatch;
 
 namespace detail {
 
@@ -183,6 +185,25 @@ enum class MetaPublisherTransferDisposition : std::uint8_t {
 MetaPublisherTransferDisposition ClassifyPublisherSupersession(
     bool receiver_can_apply) noexcept;
 
+// Worker-confined handoff between the sole established-session reader and
+// publisher. Once Data acknowledges an FDS, the reader may not consume the
+// next business message until the publisher has adopted that exact object as
+// the session's installed projection.
+class MetaPublisherAdoptionGate {
+ public:
+  // Latches that an applied receipt is visible and the reader must yield.
+  // Repeated receipts leave the latch set.
+  void ObserveAppliedReceipt() noexcept;
+  // Clears the latch after the publisher installs that exact FDS as the
+  // session baseline. Repeated completion is harmless.
+  void MarkProjectionAdopted() noexcept;
+  // True while the reader must not consume another business message.
+  bool pending() const noexcept;
+
+ private:
+  bool pending_ = false;
+};
+
 // Extracts the exact candidate action, if any, from the already-applied FDS
 // that underlies a node heartbeat. The authenticated session supplies `boot`;
 // Data cannot claim this marker in the heartbeat wire payload.
@@ -190,6 +211,36 @@ absl::StatusOr<std::optional<MetaObservedFailoverProjection>>
 FailoverProjectionForHeartbeat(
     const cluster::control::FullDesiredState& installed,
     std::string_view node_id, const MetaBootIncarnation& boot);
+
+// Extracts the exact committed Owner authority from the already-applied FDS.
+// This marker is server-derived session context, not a Data claim.
+absl::StatusOr<std::optional<MetaObservedOwnerProjection>>
+OwnerProjectionForHeartbeat(const cluster::control::FullDesiredState& installed,
+                            std::string_view node_id);
+
+// A higher-sequence heartbeat is the protocol receipt for the previous Ack.
+// Convert that receipt into trusted lease evidence only when the granted Ack
+// names the same authenticated boot and exact Owner projection that still
+// underlies the new heartbeat.
+std::optional<MetaCausallyConfirmedLease> ConfirmedLeaseForHeartbeat(
+    const std::optional<cluster::control::HeartbeatAck>& previous_ack,
+    std::uint64_t heartbeat_sequence, std::string_view authenticated_boot_id,
+    const std::optional<MetaObservedOwnerProjection>& owner_projection);
+
+// Applies this Meta process's leadership-validity ceiling to a deterministic
+// Policy projection, then rebuilds every hash/basis/encoded byte that the
+// scalar influences. Local Raft timing must never enter committed apply.
+absl::Status ApplyLeadershipValidityLimit(NodeControlBatch& batch,
+                                          std::uint32_t leadership_validity_ms);
+
+// Bounds an established session's complete-message read without confusing an
+// expected heartbeat-idle period with stalled I/O. Data must report inside the
+// observation TTL; the additional fixed progress budget lets a frame that
+// starts at that boundary finish. The implementation widens before addition so
+// the two wire-sized millisecond values cannot wrap.
+std::chrono::milliseconds EstablishedSessionReadTimeout(
+    std::uint32_t observation_ttl_ms,
+    std::uint32_t session_progress_timeout_ms) noexcept;
 
 }  // namespace detail
 
@@ -200,17 +251,16 @@ struct MetaHeartbeatObservationResult {
 };
 
 // Processes one authenticated heartbeat under a single observation-store lock.
-// Boot and health are admitted independently. After identity/current-generation
-// admission, candidate and transition evidence are replace-or-clear, so
-// absence or component rejection clears the matching prior fact; rejecting a
-// stale session identity leaves replacement-session state untouched. The
-// longest overload also replaces the trusted candidate-action marker derived
-// from the exact installed FDS; nullopt clears that marker. The shorter
-// overloads intentionally clear failover evidence and/or the marker they
-// cannot supply. Reporter history comes from ClientHello, while candidate
-// payloads carry their independent rebuild-source lineage. The aggregate
-// result reports any component rejection without rolling back valid
-// boot/health data.
+// Boot and free-form diagnostic health are admitted independently, while the
+// fixed-size typed health, sequence, installed-FDS marker, and causal lease
+// confirmation form one session cut for Owner serviceability. Candidate and
+// transition evidence are replace-or-clear, so absence or component rejection
+// clears the matching prior fact; rejecting a stale session identity leaves
+// replacement-session state untouched. The shorter overloads intentionally
+// clear failover evidence and/or markers they cannot supply. Reporter history
+// comes from ClientHello, while candidate payloads carry their independent
+// rebuild-source lineage. The complete production seam supplies Unix time for
+// generic observation TTLs and steady time for Owner freshness.
 MetaHeartbeatObservationResult IngestHeartbeatObservations(
     MetaObservationStore& observations, const MetaCommittedFacts& facts,
     std::string_view node_id, const MetaBootIncarnation& boot,
@@ -237,6 +287,19 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
         failover_observation,
     std::optional<MetaObservedFailoverProjection> failover_projection,
     std::int64_t now_unix_ms);
+MetaHeartbeatObservationResult IngestHeartbeatObservations(
+    MetaObservationStore& observations, const MetaCommittedFacts& facts,
+    std::string_view node_id, const MetaBootIncarnation& boot,
+    const MetaReplicationHistoryId& session_history, std::uint64_t generation,
+    const cluster::control::HeartbeatHealth& health,
+    const cluster::control::HeartbeatRoleInformation& role_information,
+    const std::optional<cluster::control::FailoverObservation>&
+        failover_observation,
+    std::optional<MetaObservedFailoverProjection> failover_projection,
+    std::optional<MetaObservedOwnerProjection> owner_projection,
+    std::uint64_t heartbeat_sequence,
+    std::optional<MetaCausallyConfirmedLease> confirmed_lease,
+    std::int64_t now_unix_ms, std::uint64_t now_steady_ms);
 
 // Validates a typed operation-evidence envelope against the authenticated
 // session, then ingests it as volatile leader-local evidence. The reporter
@@ -265,11 +328,18 @@ struct MetaDataControlServerOptions {
   std::string tls_cert_file_;
   std::string tls_key_file_;
 
-  std::uint32_t heartbeat_interval_ms_ = 1000;
+  // Must cover the largest heartbeat interval derivable from the local
+  // leadership-validity ceiling. A current Authority Lease Policy may request
+  // any shorter duration without making its projected FDS unusable by Data.
   std::uint32_t observation_ttl_ms_ = 30000;
+  // Fixed frame/write and authority-response progress budget. An established
+  // session's ordinary read-idle deadline additionally includes the
+  // observation TTL, because a valid resolved heartbeat cadence may exceed
+  // this value.
   std::uint32_t session_progress_timeout_ms_ = 10000;
   // Upper bound supplied by process assembly from NuRaft's configured
-  // leadership-expiry window. A committed grant may request less.
+  // leadership-expiry window. The current global Authority Lease Policy may
+  // request less.
   std::uint32_t leadership_validity_ms_ = 0;
   // Added to the maximum prior lease before a replacement authority may be
   // granted. Process assembly supplies at least one full maximum-lease window,
@@ -366,6 +436,16 @@ class MetaLeaseHandoffGuard {
   cluster::control::LeaseDecision Enforce(
       cluster::control::LeaseDecision decision, std::string_view node_id,
       std::int64_t now_lease_clock_ms);
+
+  // Applies the same quarantine before returning NodeNotReady. The ordinary
+  // evaluator intentionally reports health first, but an unhealthy current
+  // Owner still sends an exact authority challenge; observing that candidate
+  // here lets the finite handoff wait mature without allowing the health
+  // denial to masquerade as handoff completion.
+  cluster::control::LeaseDecision Enforce(
+      cluster::control::LeaseDecision decision,
+      const std::optional<cluster::control::LeaseChallenge>& challenge,
+      const MetaLeaseEvaluation& evaluation, std::int64_t now_lease_clock_ms);
   void Reset() noexcept { entries_.clear(); }
 
  private:

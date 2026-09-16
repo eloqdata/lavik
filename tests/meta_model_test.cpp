@@ -360,7 +360,7 @@ TEST(MetaModelCommands, EnvelopeStartsWithFormatVersionThenTag) {
   const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
   const std::uint16_t version = static_cast<std::uint16_t>(p[0] | (p[1] << 8));
   const std::uint16_t tag = static_cast<std::uint16_t>(p[2] | (p[3] << 8));
-  EXPECT_EQ(version, 2);
+  EXPECT_EQ(version, 4);
   EXPECT_EQ(version, keylane::meta::kMetaCommandFormatVersion);
   EXPECT_EQ(tag, static_cast<std::uint16_t>(
                      keylane::meta::MetaCommandTag::kRegisterNode));
@@ -368,10 +368,9 @@ TEST(MetaModelCommands, EnvelopeStartsWithFormatVersionThenTag) {
 
 TEST(MetaModelCommands, UnknownFormatVersionFails) {
   const std::string bytes = MustEncode(MakeRegisterNode());
-  // Version 1 is the previous development WAL envelope. Rejecting it at
-  // command decode prevents an old opaque ClusterCreate intent from replaying
-  // into only the operation half of the new lifecycle aggregate.
-  for (const std::uint16_t bad_version : {0, 1, 3, 0x7FFF, 0xFFFF}) {
+  // Earlier development WAL envelopes retain removed fields. There is no
+  // compatibility decoder for those pre-release formats.
+  for (const std::uint16_t bad_version : {0, 1, 2, 3, 5, 0x7FFF, 0xFFFF}) {
     std::string corrupt = bytes;
     corrupt[0] = static_cast<char>(bad_version & 0xFF);
     corrupt[1] = static_cast<char>((bad_version >> 8) & 0xFF);
@@ -381,10 +380,14 @@ TEST(MetaModelCommands, UnknownFormatVersionFails) {
 
 TEST(MetaModelCommands, UnknownCommandTagFails) {
   const std::string bytes = MustEncode(MakeRegisterNode());
-  std::string corrupt = bytes;
-  corrupt[2] = '\xFF';  // tag u16 = 0xFFFF
-  corrupt[3] = '\xFF';
-  ExpectDecodeFailStop(corrupt);
+  // Removed tags remain holes instead of being reused for a different durable
+  // command type.
+  for (const std::uint16_t bad_tag : {9, 14, 0xFFFF}) {
+    std::string corrupt = bytes;
+    corrupt[2] = static_cast<char>(bad_tag & 0xFF);
+    corrupt[3] = static_cast<char>((bad_tag >> 8) & 0xFF);
+    ExpectDecodeFailStop(corrupt);
+  }
 }
 
 TEST(MetaModelCommands, TruncatedCommandFails) {
@@ -591,28 +594,12 @@ TEST(MetaModelCommands, BeginGroupTermRoundTrip) {
   ExpectRoundTrip(cmd);
 }
 
-TEST(MetaModelCommands, GrantAuthorityRoundTrip) {
-  keylane::meta::GrantAuthority cmd;
-  cmd.request_id_ = MakeRequestId(0x41);
-  cmd.group_id_ = "0123456789abcdef0123456789abcdef01234567";
-  cmd.node_id_ = "89abcdef0123456789abcdef0123456789abcdef";
-  cmd.term_ = 42;
-  cmd.authority_version_ = 4;
-  cmd.grant_.lease_duration_ms_ = 5000;
-  cmd.grant_.policy_id_ = "migration-policy";
-  cmd.grant_.policy_version_ = 3;
-  ExpectRoundTrip(cmd);
-}
-
 TEST(MetaModelCommands, ActivateAuthorityRoundTrip) {
   keylane::meta::ActivateAuthority cmd;
   cmd.request_id_ = MakeRequestId(0x42);
   cmd.group_id_ = "0123456789abcdef0123456789abcdef01234567";
   cmd.expected_term_ = 42;
   cmd.new_owner_ = "89abcdef0123456789abcdef0123456789abcdef";
-  cmd.grant_.lease_duration_ms_ = 5000;
-  cmd.grant_.policy_id_ = "failover-policy";
-  cmd.grant_.policy_version_ = 1;
   cmd.new_authority_version_ = 5;
   cmd.new_topology_epoch_ = 102;
   cmd.new_config_epoch_ = 12;
@@ -712,7 +699,6 @@ TEST(MetaModelCommands, FailoverTransitionValueRoundTrips) {
   transition.revision_ = 88;
   transition.mode_ = keylane::meta::MetaFailoverMode::kControlled;
   transition.target_term_ = 42;
-  transition.successor_grant_ = {5000, "failover-policy", 3};
   transition.candidate_action_ = MakeFailoverAction(2, true);
   transition.controlled_ = keylane::meta::MetaControlledFailover{
       .operation_id_ = MakeOperationId(0x31),
@@ -749,7 +735,6 @@ TEST(MetaModelCommands, TypedFailoverCommandsRoundTrip) {
   controlled.group_id_ = "group-a";
   controlled.transition_id_.fill(0x51);
   controlled.target_term_ = 42;
-  controlled.successor_grant_ = {5000, "failover-policy", 3};
   controlled.candidate_action_ = MakeFailoverAction(2);
   controlled.operation_id_ = MakeOperationId(0x31);
   controlled.expected_operation_revision_ = 0;
@@ -763,19 +748,34 @@ TEST(MetaModelCommands, TypedFailoverCommandsRoundTrip) {
   uncontrolled.group_id_ = "group-a";
   uncontrolled.transition_id_.fill(0x52);
   uncontrolled.target_term_ = 42;
-  uncontrolled.successor_grant_ = {5000, "failover-policy", 3};
   uncontrolled.candidate_action_ = std::nullopt;
+  uncontrolled.trigger_reason_ =
+      keylane::meta::MetaAutomaticFailoverReason::kHeartbeatExpired;
+  uncontrolled.suspect_duration_ms_ = 5000;
+  uncontrolled.preempted_operation_id_ = MakeOperationId(0x32);
+  uncontrolled.expected_preempted_operation_revision_ = 0;
   SetFailoverGroupAnchors(uncontrolled);
-  // A current grant may reference the first active policy version (zero), and
-  // an otherwise valid group may not have installed a population manifest or
-  // advanced its partition-replication epoch yet. The command still carries
-  // exact CAS anchors for those zero values.
-  uncontrolled.successor_grant_.policy_version_ = 0;
+  // A valid group may not have installed a population manifest or advanced
+  // its partition-replication epoch yet. The command still carries exact CAS
+  // anchors for those zero values.
   uncontrolled.expected_population_manifest_revision_ = 0;
   uncontrolled.expected_population_manifest_digest_ = {};
   uncontrolled.expected_partition_replication_epoch_ = 0;
   ExpectFailoverCommandRoundTrip(
       uncontrolled, keylane::meta::MetaCommandTag::kBeginUncontrolledFailover);
+
+  keylane::meta::BeginUncontrolledFailover manual_uncontrolled = uncontrolled;
+  manual_uncontrolled.request_id_ = MakeRequestId(0x99);
+  manual_uncontrolled.transition_id_.fill(0x59);
+  manual_uncontrolled.candidate_action_ = MakeFailoverAction(2);
+  manual_uncontrolled.trigger_reason_ =
+      keylane::meta::MetaAutomaticFailoverReason::kManual;
+  manual_uncontrolled.suspect_duration_ms_ = 0;
+  manual_uncontrolled.preempted_operation_id_.reset();
+  manual_uncontrolled.expected_preempted_operation_revision_.reset();
+  ExpectFailoverCommandRoundTrip(
+      manual_uncontrolled,
+      keylane::meta::MetaCommandTag::kBeginUncontrolledFailover);
 
   keylane::meta::SetUncontrolledCandidate set_candidate;
   set_candidate.request_id_ = MakeRequestId(0x93);
@@ -827,7 +827,6 @@ TEST(MetaModelCommands, TypedFailoverCommandsRoundTrip) {
   commit_controlled.authorized_revision_ = 88;
   commit_controlled.expected_candidate_ =
       degrade.expected_candidate_action_->candidate_;
-  commit_controlled.successor_grant_ = controlled.successor_grant_;
   SetFailoverGroupAnchors(commit_controlled);
   commit_controlled.new_authority_version_ = 6;
   commit_controlled.new_topology_epoch_ = 101;
@@ -846,7 +845,6 @@ TEST(MetaModelCommands, TypedFailoverCommandsRoundTrip) {
   commit_uncontrolled.loss_if_cutover_ = keylane::meta::MetaFailoverLoss::kNone;
   commit_uncontrolled.expected_candidate_ =
       degrade.expected_candidate_action_->candidate_;
-  commit_uncontrolled.successor_grant_ = uncontrolled.successor_grant_;
   SetFailoverGroupAnchors(commit_uncontrolled);
   commit_uncontrolled.expected_group_term_ = 42;
   commit_uncontrolled.new_authority_version_ = 6;
@@ -858,6 +856,38 @@ TEST(MetaModelCommands, TypedFailoverCommandsRoundTrip) {
 }
 
 TEST(MetaModelCommands, FailoverCodecRejectsInvalidValues) {
+  keylane::meta::BeginUncontrolledFailover automatic;
+  automatic.group_id_ = "group-a";
+  automatic.transition_id_.fill(0x51);
+  automatic.target_term_ = 42;
+  automatic.trigger_reason_ =
+      keylane::meta::MetaAutomaticFailoverReason::kHeartbeatExpired;
+  automatic.suspect_duration_ms_ = 5000;
+  SetFailoverGroupAnchors(automatic);
+
+  automatic.candidate_action_ = MakeFailoverAction(2);
+  ExpectEncodeDomainReject(automatic);
+  automatic.candidate_action_.reset();
+
+  automatic.preempted_operation_id_ = MakeOperationId(0x33);
+  ExpectEncodeDomainReject(automatic);
+
+  automatic.preempted_operation_id_.reset();
+  automatic.expected_preempted_operation_revision_ = 0;
+  ExpectEncodeDomainReject(automatic);
+
+  automatic.preempted_operation_id_ = MakeOperationId(0x33);
+  automatic.trigger_reason_ =
+      keylane::meta::MetaAutomaticFailoverReason::kManual;
+  automatic.suspect_duration_ms_ = 0;
+  ExpectEncodeDomainReject(automatic);
+
+  automatic.trigger_reason_ =
+      keylane::meta::MetaAutomaticFailoverReason::kHeartbeatExpired;
+  automatic.suspect_duration_ms_ = 5000;
+  automatic.preempted_operation_id_ = keylane::meta::MetaOperationId{};
+  ExpectEncodeDomainReject(automatic);
+
   keylane::meta::SetUncontrolledCandidate set_candidate;
   set_candidate.group_id_ = "group-a";
   set_candidate.expected_transition_.transition_id_.fill(0x52);
@@ -873,23 +903,10 @@ TEST(MetaModelCommands, FailoverCodecRejectsInvalidValues) {
   std::string encoded = MustEncode(authorize);
   encoded.back() = static_cast<char>(0x7f);
   ExpectDecodeFailStop(encoded);
-
-  keylane::meta::MetaFailoverTransition malformed_transition;
-  malformed_transition.transition_id_.fill(0x52);
-  malformed_transition.revision_ = 88;
-  malformed_transition.mode_ = keylane::meta::MetaFailoverMode::kControlled;
-  malformed_transition.target_term_ = 42;
-  malformed_transition.successor_grant_ = {5000, "failover-policy", 0};
-  keylane::meta::MetaWriter writer;
-  const auto malformed =
-      keylane::meta::WriteMetaFailoverTransition(writer, malformed_transition);
-  ASSERT_FALSE(malformed.ok());
-  EXPECT_EQ(keylane::meta::MetaFailureClassOf(malformed),
-            keylane::meta::MetaFailureClass::kDomainReject);
 }
 
 // ---------------------------------------------------------------------------
-// Policy documents are versioned and content-hash addressed.
+// Policy documents are versioned raw content.
 // ---------------------------------------------------------------------------
 
 keylane::meta::MetaHash256 MakeHash(std::uint8_t seed) {
@@ -906,17 +923,6 @@ TEST(MetaModelCommands, PutPolicyRoundTrip) {
   cmd.policy_id_ = "migration-policy";
   cmd.version_ = 3;
   cmd.content_ = "{\"phases\":[\"prepare\",\"move\",\"cutover\"]}";
-  cmd.content_hash_ = MakeHash(0x5A);
-  ExpectRoundTrip(cmd);
-}
-
-TEST(MetaModelCommands, RetirePolicyRoundTrip) {
-  // Apply refuses to retire a version still referenced by an active
-  // grant or a non-terminal operation — domain validation, not the codec.
-  keylane::meta::RetirePolicy cmd;
-  cmd.request_id_ = MakeRequestId(0x51);
-  cmd.policy_id_ = "migration-policy";
-  cmd.version_ = 2;
   ExpectRoundTrip(cmd);
 }
 
@@ -1049,7 +1055,18 @@ TEST(MetaModelCommands, DirectiveResultReceiptCommandsRoundTrip) {
 
 TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
   EXPECT_EQ(keylane::meta::kMetaFormatVersion, 1);
-  EXPECT_EQ(keylane::meta::kMetaCommandFormatVersion, 2);
+  EXPECT_EQ(keylane::meta::kMetaCommandFormatVersion, 4);
+  // Removed command tags are permanent holes: 9 was GrantAuthority and 14
+  // was RetirePolicy. Later tags must never shift into those values.
+  EXPECT_EQ(static_cast<std::uint16_t>(
+                keylane::meta::MetaCommandTag::kActivateAuthority),
+            10);
+  EXPECT_EQ(
+      static_cast<std::uint16_t>(keylane::meta::MetaCommandTag::kPutPolicy),
+      13);
+  EXPECT_EQ(static_cast<std::uint16_t>(
+                keylane::meta::MetaCommandTag::kSubmitOperation),
+            15);
 
   keylane::meta::PruneAudit audit;
   audit.through_log_index_ = 42;
@@ -1105,7 +1122,6 @@ TEST(MetaModelCommands, EncodeRejectsOverCapPayload) {
   cmd.policy_id_ = "migration-policy";
   cmd.version_ = 1;
   cmd.content_ = std::string(keylane::meta::kMaxMetaPayloadBytes + 1, 'x');
-  cmd.content_hash_ = MakeHash(0x01);
   ExpectEncodeDomainReject(cmd);
   // Exactly at the cap it still encodes (bounds are inclusive).
   cmd.content_.resize(keylane::meta::kMaxMetaPayloadBytes);
@@ -1507,7 +1523,6 @@ keylane::meta::PutPolicy MakePutPolicy(const std::string& policy_id,
   cmd.policy_id_ = policy_id;
   cmd.version_ = version;
   cmd.content_ = content;
-  cmd.content_hash_ = keylane::meta::MetaPolicyStore::ContentHash(content);
   return cmd;
 }
 
@@ -1537,20 +1552,18 @@ keylane::meta::AssignNodeToGroup MakeAssign(const std::string& group_id,
 }
 
 // A fully valid ActivateAuthority against the state built by the fixture
-// helpers: group with term 1 begun, policy committed, owner a member.
-keylane::meta::ActivateAuthority MakeActivate(
-    const std::string& group_id, std::uint64_t expected_term,
-    std::uint32_t owner_node, std::uint64_t authority_version,
-    std::uint64_t topology_epoch, std::uint64_t config_epoch,
-    const std::string& policy_id = "p", std::uint64_t policy_version = 1) {
+// helpers: group with term 1 begun and owner a member.
+keylane::meta::ActivateAuthority MakeActivate(const std::string& group_id,
+                                              std::uint64_t expected_term,
+                                              std::uint32_t owner_node,
+                                              std::uint64_t authority_version,
+                                              std::uint64_t topology_epoch,
+                                              std::uint64_t config_epoch) {
   keylane::meta::ActivateAuthority cmd;
   cmd.request_id_ = MakeRequestId(0x42);
   cmd.group_id_ = group_id;
   cmd.expected_term_ = expected_term;
   cmd.new_owner_ = MakeNodeId(owner_node);
-  cmd.grant_.lease_duration_ms_ = 5000;
-  cmd.grant_.policy_id_ = policy_id;
-  cmd.grant_.policy_version_ = policy_version;
   cmd.new_authority_version_ = authority_version;
   cmd.new_topology_epoch_ = topology_epoch;
   cmd.new_config_epoch_ = config_epoch;
@@ -1558,15 +1571,18 @@ keylane::meta::ActivateAuthority MakeActivate(
 }
 
 // Registers node, creates group (topology_epoch 1), assigns the node
-// (membership revision 1 -> 2, topology_epoch 2), commits policy p@1, and
-// begins group term 1.
+// (membership revision 1 -> 2, topology_epoch 2), commits Authority Lease
+// Policy version 1, and begins group term 1.
 // Consumes log indexes 1..5.
 void SetupActivatedGroupPrerequisites(MetaStores& stores, std::uint32_t node,
                                       const std::string& group_id) {
   ApplyOk(stores, 1, MakeRegisterFor(node));
   ApplyOk(stores, 2, MakeCreateGroup(group_id, 1));
   ApplyOk(stores, 3, MakeAssign(group_id, node, 1));
-  ApplyOk(stores, 4, MakePutPolicy("p", 1, "{\"lease_ms\":5000}"));
+  ApplyOk(
+      stores, 4,
+      MakePutPolicy(std::string(keylane::meta::kAuthorityLeasePolicyId), 1,
+                    "{\"kind\":\"authority-lease-v1\",\"duration_ms\":5000}"));
   keylane::meta::BeginGroupTerm begin;
   begin.request_id_ = MakeRequestId(0x40);
   begin.group_id_ = group_id;
@@ -1701,104 +1717,6 @@ TEST(MetaStateApply, BeginGroupTermRaisesTermInBothStores) {
 
   // A stale-term activation is now rejected on both paths: the term moved on.
   ApplyRejected(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 2, 4, 2)});
-}
-
-TEST(MetaStateApply, GrantAuthorityRenewsLeaseWithCommittedPolicy) {
-  MetaStores stores;
-  SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 1)});
-
-  keylane::meta::GrantAuthority renew;
-  renew.request_id_ = MakeRequestId(0x44);
-  renew.group_id_ = "g1";
-  renew.node_id_ = MakeNodeId(1);
-  renew.term_ = 1;
-  renew.authority_version_ = 1;
-  renew.grant_.lease_duration_ms_ = 9000;
-  renew.grant_.policy_id_ = "p";
-  renew.grant_.policy_version_ = 1;
-  ApplyOk(stores, 7, renew);
-  EXPECT_EQ(stores.grant_.GroupState("g1")->grant_->spec_.lease_duration_ms_,
-            9000u);
-
-  // Renewal referencing an uncommitted policy version is rejected.
-  renew.grant_.policy_version_ = 99;
-  ApplyRejected(stores, 8, renew);
-  renew.grant_.policy_version_ = 1;
-
-  // Renewal naming an unregistered node: rejected (principal-vs-grant, the
-  // node must be registered and active).
-  renew.node_id_ = MakeNodeId(9);
-  ApplyRejected(stores, 9, renew);
-
-  // Replay of the accepted renewal at its own index: idempotent accept.
-  renew.node_id_ = MakeNodeId(1);
-  const std::string domain_before = DomainStateBytes(stores);
-  ApplyOk(stores, 7, renew);
-  EXPECT_EQ(DomainStateBytes(stores), domain_before);
-}
-
-TEST(MetaStateApply, RetirePolicyRejectedWhileReferencedByActiveGrant) {
-  MetaStores stores;
-  SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 1)});
-
-  keylane::meta::RetirePolicy retire;
-  retire.request_id_ = MakeRequestId(0x51);
-  retire.policy_id_ = "p";
-  retire.version_ = 1;
-
-  // A version referenced by an active grant cannot retire. Non-terminal
-  // operation references are covered separately through their structured
-  // dependency list.
-  ApplyRejected(stores, 7, retire);
-  EXPECT_TRUE(stores.policy_.IsVersionActive("p", 1));
-
-  keylane::meta::RevokeGrant revoke;
-  revoke.request_id_ = MakeRequestId(0x43);
-  revoke.group_id_ = "g1";
-  revoke.expected_term_ = 1;
-  ApplyOk(stores, 8, revoke);
-
-  ApplyOk(stores, 9, retire);
-  EXPECT_FALSE(stores.policy_.IsVersionActive("p", 1));
-  EXPECT_TRUE(stores.policy_.IsVersionPresent("p", 1));  // content-retaining
-
-  // Replay of the retire at its own index: idempotent accept, no new audit.
-  ApplyOk(stores, 9, retire);
-  EXPECT_EQ(stores.audit_.size(), 9u);
-}
-
-TEST(MetaStateApply, RetirePolicyRejectedWhileLiveOperationReferencesIt) {
-  MetaStores stores;
-  ApplyOk(stores, 1, MakePutPolicy("p", 1, "policy"));
-  keylane::meta::SubmitOperation submit;
-  submit.request_id_ = MakeRequestId(0x71);
-  submit.operation_id_.fill(0x41);
-  submit.kind_ = "migration";
-  submit.intent_ = "policy-bound";
-  submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
-  submit.policy_references_ = {{"p", 1}};
-  ApplyOk(stores, 2, submit);
-
-  keylane::meta::RetirePolicy retire;
-  retire.request_id_ = MakeRequestId(0x72);
-  retire.policy_id_ = "p";
-  retire.version_ = 1;
-  ApplyRejected(stores, 3, retire);
-
-  keylane::meta::CompleteOperation complete;
-  complete.request_id_ = MakeRequestId(0x73);
-  complete.operation_id_ = submit.operation_id_;
-  complete.result_ = "done";
-  ApplyOk(stores, 4, complete);
-  ApplyOk(stores, 5, retire);
-  EXPECT_FALSE(stores.policy_.IsVersionActive("p", 1));
-
-  // The original submit remains an accepted replay after its dependency can
-  // legally retire; the duplicate cannot mutate the terminal record.
-  ApplyOk(stores, 2, submit);
-  EXPECT_EQ(stores.audit_.size(), 5u);
 }
 
 TEST(MetaStateApply, TransitionEvidenceMustMatchCommittedAnchors) {
@@ -2222,8 +2140,6 @@ TEST(MetaStateApply, ActivateAuthorityRejectionLeavesBothHalvesUntouched) {
     cmd.new_owner_ = MakeNodeId(99);
     expect_rejected_untouched(std::move(cmd));
   }
-  // Grant policy version not committed.
-  expect_rejected_untouched(MakeActivate("g1", 1, 1, 1, 3, 1, "p", 99));
   // authority_version not strictly increasing.
   expect_rejected_untouched(MakeActivate("g1", 1, 1, 0, 3, 1));
   // A serving owner must have a nonzero configuration epoch on the wire.
@@ -2235,7 +2151,10 @@ TEST(MetaStateApply, ActivateAuthorityRequiresABegunNonzeroTerm) {
   ApplyOk(stores, 1, MakeRegisterFor(1));
   ApplyOk(stores, 2, MakeCreateGroup("g1", 1));
   ApplyOk(stores, 3, MakeAssign("g1", 1, 1));
-  ApplyOk(stores, 4, MakePutPolicy("p", 1, "lease-policy"));
+  ApplyOk(
+      stores, 4,
+      MakePutPolicy(std::string(keylane::meta::kAuthorityLeasePolicyId), 1,
+                    "{\"kind\":\"authority-lease-v1\",\"duration_ms\":5000}"));
 
   ApplyRejected(stores, 5, MetaCommand{MakeActivate("g1", 0, 1, 1, 3, 1)});
   const auto grant = stores.grant_.GroupState("g1");
@@ -2349,6 +2268,26 @@ keylane::meta::SubmitOperation MakeClusterCreateSubmit(
   return cmd;
 }
 
+keylane::meta::PutPolicy MakeAutomaticFailoverPolicy(
+    std::uint64_t version = 1) {
+  return MakePutPolicy(
+      std::string(keylane::meta::kAutomaticUncontrolledFailoverPolicyId),
+      version,
+      "{\"kind\":\"automatic-uncontrolled-failover-v1\",\"enabled\":true,"
+      "\"suspect_after_ms\":5000}");
+}
+
+keylane::meta::PutPolicy MakeAuthorityLeasePolicy(std::uint64_t version = 1) {
+  return MakePutPolicy(
+      std::string(keylane::meta::kAuthorityLeasePolicyId), version,
+      "{\"kind\":\"authority-lease-v1\",\"duration_ms\":5000}");
+}
+
+void SeedRequiredCurrentPolicies(MetaStores& stores) {
+  ASSERT_TRUE(stores.policy_.Apply(MakeAutomaticFailoverPolicy()).ok());
+  ASSERT_TRUE(stores.policy_.Apply(MakeAuthorityLeasePolicy()).ok());
+}
+
 std::string ClusterCreateFailureSummaryForTest(
     const keylane::meta::MetaOperationId& id) {
   return absl::StrCat(
@@ -2388,6 +2327,7 @@ TEST(MetaStateApply, ClusterCreateRootAtomicallyOwnsLifecycle) {
   complete.operation_id_ = root.operation_id_;
   complete.expected_revision_ = 0;
   complete.result_ = "cluster-created";
+  SeedRequiredCurrentPolicies(stores);
   ApplyOk(stores, 14, MetaCommand{complete});
   EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
             keylane::meta::MetaClusterLifecycle::kCreated);
@@ -2416,6 +2356,129 @@ TEST(MetaStateApply, ClusterCreateRootAtomicallyOwnsLifecycle) {
   recycled.operation_id_ = root.operation_id_;
   ApplyRejected(stores, 18, MetaCommand{recycled});
   EXPECT_FALSE(stores.operation_.OperationKnown(root.operation_id_));
+}
+
+TEST(MetaStateApply,
+     ClusterCreateCompletionRequiresBothCurrentPoliciesDuringWalApply) {
+  const auto expect_rejected = [](bool install_automatic) {
+    MetaStores stores;
+    const auto root = MakeClusterCreateSubmit(
+        install_automatic ? std::uint8_t{0x6a} : std::uint8_t{0x6b});
+    ApplyOk(stores, 1, MetaCommand{root});
+    ApplyOk(stores, 2,
+            MetaCommand{install_automatic ? MakeAutomaticFailoverPolicy()
+                                          : MakeAuthorityLeasePolicy()});
+
+    keylane::meta::CompleteOperation complete;
+    complete.request_id_ = MakeRequestId(0x6c);
+    complete.operation_id_ = root.operation_id_;
+    complete.expected_revision_ = 0;
+    complete.result_ = "cluster-created";
+    ApplyRejected(stores, 3, MetaCommand{complete});
+
+    EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kCreating);
+    ASSERT_TRUE(
+        stores.operation_.FindOperation(root.operation_id_).has_value());
+    EXPECT_EQ(stores.operation_.FindOperation(root.operation_id_)->lifecycle_,
+              keylane::meta::MetaOperationLifecycle::kSubmitted);
+    const auto restored = MetaStores::Deserialize(MustSerialize(stores));
+    EXPECT_TRUE(restored.ok()) << restored.status();
+  };
+
+  expect_rejected(/*install_automatic=*/true);
+  expect_rejected(/*install_automatic=*/false);
+}
+
+TEST(MetaStateApply,
+     PreseededCurrentPoliciesRemainPristineAndSurviveGenesisAdmission) {
+  const std::string automatic_raw =
+      R"({"suspect_after_ms":9000,"enabled":false,"kind":"automatic-uncontrolled-failover-v1"})";
+  const std::string lease_raw =
+      R"({"duration_ms":7000,"kind":"authority-lease-v1"})";
+
+  for (const bool seed_both_families : {false, true}) {
+    SCOPED_TRACE(seed_both_families ? "both families" : "one family");
+    MetaStores stores;
+    std::uint64_t log_index = 1;
+    ApplyOk(
+        stores, log_index++,
+        MakePutPolicy(
+            std::string(keylane::meta::kAutomaticUncontrolledFailoverPolicyId),
+            1, automatic_raw));
+    if (seed_both_families) {
+      ApplyOk(stores, log_index++,
+              MakePutPolicy(std::string(keylane::meta::kAuthorityLeasePolicyId),
+                            1, lease_raw));
+    }
+    EXPECT_FALSE(keylane::meta::HasDataClusterArtifacts(stores));
+
+    const auto root = MakeClusterCreateSubmit(
+        seed_both_families ? std::uint8_t{0x6d} : std::uint8_t{0x6e});
+    ApplyOk(stores, log_index, MetaCommand{root});
+
+    EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kCreating);
+    ASSERT_TRUE(
+        stores.policy_
+            .FindVersion(
+                std::string(
+                    keylane::meta::kAutomaticUncontrolledFailoverPolicyId),
+                1)
+            .has_value());
+    EXPECT_EQ(
+        stores.policy_
+            .FindVersion(
+                std::string(
+                    keylane::meta::kAutomaticUncontrolledFailoverPolicyId),
+                1)
+            ->content_,
+        automatic_raw);
+    EXPECT_EQ(
+        stores.policy_.CurrentAutomaticUncontrolledFailover(),
+        (keylane::meta::MetaAutomaticUncontrolledFailoverPolicy{
+            .version_ = 1, .enabled_ = false, .suspect_after_ms_ = 9000}));
+    if (seed_both_families) {
+      ASSERT_TRUE(
+          stores.policy_
+              .FindVersion(std::string(keylane::meta::kAuthorityLeasePolicyId),
+                           1)
+              .has_value());
+      EXPECT_EQ(stores.policy_
+                    .FindVersion(
+                        std::string(keylane::meta::kAuthorityLeasePolicyId), 1)
+                    ->content_,
+                lease_raw);
+      EXPECT_EQ(stores.policy_.CurrentAuthorityLease(),
+                (keylane::meta::MetaAuthorityLeasePolicy{
+                    .version_ = 1, .duration_ms_ = 7000}));
+    }
+  }
+}
+
+TEST(MetaStateApply,
+     AcceptedPolicyPutRemainsSuccessfulAfterBoundedHistoryEviction) {
+  MetaStores stores;
+  MetaApplyResult first_result;
+  const std::uint64_t last_version =
+      keylane::meta::kMaxMetaPolicyVersionsPerPolicy + 1;
+  for (std::uint64_t version = 1; version <= last_version; ++version) {
+    const MetaApplyResult result = ApplyOk(
+        stores, version, MetaCommand{MakeAutomaticFailoverPolicy(version)});
+    if (version == 1) first_result = result;
+  }
+
+  EXPECT_EQ(first_result.verdict_, MetaAuditVerdict::kAccepted);
+  EXPECT_FALSE(
+      stores.policy_
+          .FindVersion(
+              std::string(
+                  keylane::meta::kAutomaticUncontrolledFailoverPolicyId),
+              1)
+          .has_value());
+  EXPECT_EQ(stores.policy_.LatestVersion(std::string(
+                keylane::meta::kAutomaticUncontrolledFailoverPolicyId)),
+            std::optional<std::uint64_t>(last_version));
 }
 
 TEST(MetaStateApply, ClusterCreateAbortAtomicallyRecordsSafeFailure) {
@@ -2474,7 +2537,12 @@ TEST(MetaStateApply, SnapshotValidatesClusterLifecycleAggregate) {
     // Uninitialized plus artifacts is reported as non-pristine by status; it
     // is not structural snapshot corruption.
     MetaStores stores;
-    ASSERT_TRUE(stores.policy_.Apply(MakePutPolicy("legacy", 1, "{}")).ok());
+    ASSERT_TRUE(stores.policy_
+                    .Apply(MakePutPolicy(
+                        std::string(keylane::meta::kAuthorityLeasePolicyId), 1,
+                        "{\"kind\":\"authority-lease-v1\","
+                        "\"duration_ms\":5000}"))
+                    .ok());
     const auto restored = MetaStores::Deserialize(MustSerialize(stores));
     ASSERT_TRUE(restored.ok()) << restored.status();
     EXPECT_EQ(restored->topology_.ClusterLifecycle().state_,
@@ -2501,6 +2569,7 @@ TEST(MetaStateApply, SnapshotValidatesClusterLifecycleAggregate) {
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
     complete.result_ = "cluster-created";
+    SeedRequiredCurrentPolicies(stores);
     ApplyOk(stores, 41, MetaCommand{complete});
 
     const auto extra = MakeClusterCreateSubmit(0x7a);
@@ -2763,36 +2832,12 @@ TEST(MetaStateApply,
   }
 }
 
-TEST(MetaStateApply, MetaStoresDeserializeRejectsDanglingActiveReferences) {
-  {
-    MetaStores stores;
-    SetupActivatedGroupPrerequisites(stores, 1, "g1");
-    ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 1)});
-    keylane::meta::RetirePolicy retire;
-    retire.policy_id_ = "p";
-    retire.version_ = 1;
-    ASSERT_TRUE(stores.policy_.Apply(retire).ok());
-    ExpectAggregateSnapshotFailStop(stores);
-  }
-  {
-    MetaStores stores;
-    ApplyOk(stores, 1, MakeCreateGroup("g1", 1));
-    ASSERT_TRUE(
-        stores.topology_.SetPopulationManifest("g1", 1, MakeHash(0x91)).ok());
-    ExpectAggregateSnapshotFailStop(stores);
-  }
-  {
-    MetaStores stores;
-    ApplyOk(stores, 1, MakePutPolicy("p", 1, "operation-policy"));
-    keylane::meta::SubmitOperation submit = MakeSubmit(0x91, 0x92);
-    submit.policy_references_ = {{"p", 1}};
-    ApplyOk(stores, 2, MetaCommand{submit});
-    keylane::meta::RetirePolicy retire;
-    retire.policy_id_ = "p";
-    retire.version_ = 1;
-    ASSERT_TRUE(stores.policy_.Apply(retire).ok());
-    ExpectAggregateSnapshotFailStop(stores);
-  }
+TEST(MetaStateApply, MetaStoresDeserializeRejectsDanglingManifestReference) {
+  MetaStores stores;
+  ApplyOk(stores, 1, MakeCreateGroup("g1", 1));
+  ASSERT_TRUE(
+      stores.topology_.SetPopulationManifest("g1", 1, MakeHash(0x91)).ok());
+  ExpectAggregateSnapshotFailStop(stores);
 }
 
 TEST(MetaStateApply,
@@ -3125,19 +3170,6 @@ TEST(MetaStateApply, AuthorityAnchorMutationsInvalidateLiveDirectives) {
   }
   {
     InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
-    keylane::meta::GrantAuthority renew;
-    renew.group_id_ = "g1";
-    renew.node_id_ = MakeNodeId(3);
-    renew.term_ = 1;
-    renew.authority_version_ = 1;
-    renew.grant_.lease_duration_ms_ = 9000;
-    renew.grant_.policy_id_ = "p";
-    renew.grant_.policy_version_ = 1;
-    ApplyOk(fixture.stores, 13, MetaCommand{renew});
-    ExpectDirectiveInvalidated(fixture);
-  }
-  {
-    InstalledDirectiveFixture fixture = MakeInstalledDirectiveFixture();
     ApplyOk(fixture.stores, 13, MetaCommand{MakeActivate("g1", 1, 3, 2, 6, 2)});
     ExpectDirectiveInvalidated(fixture);
   }
@@ -3434,135 +3466,6 @@ TEST(MetaStateApply,
   EXPECT_EQ(stores.audit_.size(), audit_size_before + 1);
 }
 
-TEST(MetaStateApply,
-     TransitionRejectsAggregateRecipientProjectionOverPolicyCapAtomically) {
-  namespace control = keylane::cluster::control;
-
-  MetaStores stores;
-  SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 1, 3, 1)});
-
-  // The active grant contributes p@1 to every node projection. Build exactly
-  // the remaining number of distinct policy references across operations;
-  // every individual operation remains within its own reference cap.
-  constexpr std::size_t kOperationPolicyCount =
-      control::kMaxProjectedPolicies - 1;
-  std::vector<std::string> policy_ids;
-  policy_ids.reserve(kOperationPolicyCount + 1);
-  std::uint64_t log_index = 7;
-  for (std::size_t ordinal = 0; ordinal <= kOperationPolicyCount; ++ordinal) {
-    policy_ids.push_back(absl::StrCat("projection-policy-", ordinal));
-    ASSERT_TRUE(
-        stores.policy_.Apply(MakePutPolicy(policy_ids.back(), 1, "x")).ok());
-  }
-
-  const auto make_operation_id = [](std::size_t ordinal) {
-    keylane::meta::MetaOperationId id{};
-    for (std::size_t byte = 0; byte < sizeof(ordinal); ++byte) {
-      id[byte] = static_cast<std::uint8_t>(ordinal >> (byte * 8));
-    }
-    id.back() = 0xa5;
-    return id;
-  };
-  const auto make_directive = [] {
-    keylane::meta::MetaDirectiveSpec directive;
-    directive.directive_id_.fill(1);
-    directive.attempt_id_.fill(2);
-    directive.recipient_node_id_ = MakeNodeId(1);
-    directive.target_node_id_ = MakeNodeId(1);
-    directive.target_boot_id_.fill(1);
-    directive.assignment_id_.fill(1);
-    directive.source_node_id_ = MakeNodeId(1);
-    directive.source_assignment_id_.fill(1);
-    directive.source_boot_id_.fill(2);
-    directive.source_replication_history_id_.fill(3);
-    directive.group_id_ = "g1";
-    directive.group_term_ = 1;
-    directive.authority_version_ = 1;
-    directive.grant_revision_ = 6;
-    directive.kind_ = "authorize-source";
-    directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
-    return directive;
-  };
-
-  std::size_t policy_cursor = 0;
-  std::size_t operation_ordinal = 1;
-  const std::size_t directly_seeded_policy_count =
-      kOperationPolicyCount -
-      keylane::meta::kMaxMetaPolicyReferencesPerOperation;
-  // As above, direct store setup avoids repeatedly encoding a growing FDS.
-  // The transition that reaches the exact boundary still uses ApplyCommitted.
-  while (policy_cursor < directly_seeded_policy_count) {
-    keylane::meta::SubmitOperation submit = MakeSubmit(0x70, 0x71);
-    submit.operation_id_ = make_operation_id(operation_ordinal++);
-    submit.intent_hash_ = keylane::meta::MetaSha256(submit.intent_);
-    submit.replication_history_id_.fill(3);
-    const std::size_t end = std::min(
-        policy_cursor + keylane::meta::kMaxMetaPolicyReferencesPerOperation,
-        directly_seeded_policy_count);
-    for (; policy_cursor < end; ++policy_cursor) {
-      submit.policy_references_.push_back({policy_ids[policy_cursor], 1});
-    }
-    ASSERT_TRUE(stores.operation_.SubmitOperation(submit, log_index++).ok());
-
-    keylane::meta::TransitionOperationPhase transition;
-    transition.operation_id_ = submit.operation_id_;
-    transition.kind_phase_blob_ = "dispatch";
-    transition.current_directives_ = {make_directive()};
-    ASSERT_TRUE(
-        stores.operation_.TransitionOperationPhase(transition, log_index++)
-            .ok());
-  }
-
-  keylane::meta::SubmitOperation boundary_operation = MakeSubmit(0x74, 0x75);
-  boundary_operation.operation_id_ = make_operation_id(operation_ordinal++);
-  boundary_operation.intent_hash_ =
-      keylane::meta::MetaSha256(boundary_operation.intent_);
-  boundary_operation.replication_history_id_.fill(3);
-  for (; policy_cursor < kOperationPolicyCount; ++policy_cursor) {
-    boundary_operation.policy_references_.push_back(
-        {policy_ids[policy_cursor], 1});
-  }
-  ApplyOk(stores, log_index++, MetaCommand{boundary_operation});
-  keylane::meta::TransitionOperationPhase boundary_transition;
-  boundary_transition.operation_id_ = boundary_operation.operation_id_;
-  boundary_transition.kind_phase_blob_ = "dispatch";
-  boundary_transition.current_directives_ = {make_directive()};
-  ApplyOk(stores, log_index++, MetaCommand{boundary_transition});
-
-  const auto boundary = keylane::meta::MetaControlProjector::ProjectNode(
-      keylane::meta::MetaCommittedView(stores, log_index - 1), MakeNodeId(1));
-  ASSERT_TRUE(boundary.ok()) << boundary.status();
-  EXPECT_EQ(boundary->full_state.policies.size(),
-            control::kMaxProjectedPolicies);
-
-  keylane::meta::SubmitOperation overflow = MakeSubmit(0x72, 0x73);
-  overflow.operation_id_ = make_operation_id(operation_ordinal);
-  overflow.intent_hash_ = keylane::meta::MetaSha256(overflow.intent_);
-  overflow.replication_history_id_.fill(3);
-  overflow.policy_references_ = {{policy_ids.back(), 1}};
-  ApplyOk(stores, log_index++, MetaCommand{overflow});
-
-  keylane::meta::TransitionOperationPhase transition;
-  transition.operation_id_ = overflow.operation_id_;
-  transition.kind_phase_blob_ = "would-overflow";
-  transition.current_directives_ = {make_directive()};
-  const std::string domain_before = DomainStateBytes(stores);
-  const std::size_t audit_size_before = stores.audit_.size();
-
-  const MetaApplyResult rejected =
-      ApplyRejected(stores, log_index, MetaCommand{transition});
-  EXPECT_NE(rejected.detail_.find("policies exceeds its entry cap"),
-            std::string::npos)
-      << rejected.detail_;
-  EXPECT_EQ(DomainStateBytes(stores), domain_before);
-  const auto record = stores.operation_.FindOperation(overflow.operation_id_);
-  ASSERT_TRUE(record.has_value());
-  EXPECT_EQ(record->revision_, 0u);
-  EXPECT_TRUE(record->current_directives_.empty());
-  EXPECT_EQ(stores.audit_.size(), audit_size_before + 1);
-}
-
 TEST(MetaStateApply, ArchiveOperationsRejectsNonTerminal) {
   MetaStores stores;
   ApplyOk(stores, 1, MetaCommand{MakeSubmit(0x66, 0x31)});
@@ -3632,8 +3535,12 @@ std::vector<ScriptedCommand> MakeCommandScript() {
   push(MakeCreateGroup("g2", 2), accept);
   push(MakeCreateGroup("g1", 3), reject);  // existing group, epoch mismatch
   // policy
-  push(MakePutPolicy("p", 1, "{\"lease_ms\":5000}"), accept);
-  push(MakePutPolicy("p", 1, "{\"lease_ms\":9999}"),
+  const std::string authority_policy_id(keylane::meta::kAuthorityLeasePolicyId);
+  push(MakePutPolicy(authority_policy_id, 1,
+                     "{\"kind\":\"authority-lease-v1\",\"duration_ms\":5000}"),
+       accept);
+  push(MakePutPolicy(authority_policy_id, 1,
+                     "{\"kind\":\"authority-lease-v1\",\"duration_ms\":9999}"),
        reject);  // version slot immutable
   // topology: membership
   push(MakeAssign("g1", 1, 1, 3), accept);
@@ -3653,36 +3560,14 @@ std::vector<ScriptedCommand> MakeCommandScript() {
     begin.new_term_ = 3;  // not expected+1
     push(begin, reject);
   }
-  // activation + renewal
+  // activation
   const keylane::meta::ActivateAuthority activate =
       MakeActivate("g1", 1, 1, 1, 5, 1);
   push(activate, accept);
   push(activate, accept);  // same content, new index: idempotent path
-  {
-    keylane::meta::GrantAuthority renew;
-    renew.request_id_ = MakeRequestId(0x44);
-    renew.group_id_ = "g1";
-    renew.node_id_ = MakeNodeId(1);
-    renew.term_ = 1;
-    renew.authority_version_ = 1;
-    renew.grant_.lease_duration_ms_ = 7000;
-    renew.grant_.policy_id_ = "p";
-    renew.grant_.policy_version_ = 1;
-    push(renew, accept);
-    renew.request_id_ = MakeRequestId(0x45);
-    renew.grant_.policy_version_ = 99;  // not committed
-    push(renew, reject);
-  }
-  {
-    keylane::meta::RetirePolicy retire;
-    retire.request_id_ = MakeRequestId(0x51);
-    retire.policy_id_ = "p";
-    retire.version_ = 1;
-    push(retire, reject);  // referenced by the active grant
-  }
   // operation lifecycle
   const keylane::meta::SubmitOperation submit = MakeSubmit(0x60, 0x11);
-  push(submit, accept);  // index 20: operation_seq == 20
+  push(submit, accept);  // index 17: operation_seq == 17
   {
     keylane::meta::SubmitOperation reuse = MakeSubmit(0x60, 0x12);
     push(std::move(reuse), reject);  // id reused with a different intent
@@ -3707,7 +3592,7 @@ std::vector<ScriptedCommand> MakeCommandScript() {
   {
     keylane::meta::ArchiveOperations archive;
     archive.request_id_ = MakeRequestId(0x64);
-    archive.operation_seqs_ = {20};
+    archive.operation_seqs_ = {17};
     push(archive, accept);
     push(archive, accept);  // already archived: idempotent
   }
@@ -3771,14 +3656,8 @@ std::vector<ScriptedCommand> MakeCommandScript() {
     push(retire, accept);
     push(MakeAssign("g2", 2, 1), reject);  // retired node
   }
-  // The grant was revoked before the topology cut, so its policy reference is
-  // clear. FenceGroup remains replay-idempotent on the already-fenced group.
+  // FenceGroup remains replay-idempotent on the already-fenced group.
   {
-    keylane::meta::RetirePolicy retire;
-    retire.request_id_ = MakeRequestId(0x52);
-    retire.policy_id_ = "p";
-    retire.version_ = 1;
-    push(retire, accept);
     keylane::meta::FenceGroup fence;
     fence.request_id_ = MakeRequestId(0x46);
     fence.group_id_ = "g1";

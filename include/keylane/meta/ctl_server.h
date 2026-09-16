@@ -63,15 +63,16 @@
 //                             same non-linearizable read semantics as getop.
 //   putpolicy <policy_id> <version> <content>
 //                          -> commit one immutable policy version; content is
-//                             a whitespace-free token and its SHA-256 is
-//                             computed by this trusted proposer.
+//                             a strict compact JSON token in a registered
+//                             family.
+//   getpolicy <policy_id>  -> leader-only current raw Policy as
+//                             "OK version=<n> content=<json>" or not-found.
 //   setslotmap <first> <last> <group_id> <config_epoch>
 //                          -> replace the absolute slot map with one inclusive
 //                             range and set that group's absolute config
 //                             epoch. This deliberately narrow bootstrap form
 //                             does not imply incremental slot mutation.
 //   activateauthority <group_id> <expected_term> <owner_node_id>
-//                     <lease_ms> <policy_id> <policy_version>
 //                     <new_authority_version> <new_config_epoch>
 //                          -> atomically activate the committed owner/grant;
 //                             the topology epoch is derived from the local
@@ -247,6 +248,9 @@ class raft_server;
 
 namespace keylane::meta {
 
+class MetaAutomaticFailoverDiagnosticsRegistry;
+struct MetaAutomaticFailoverDiagnosticsSnapshot;
+
 class MetaMembershipGate;
 class MetaProposalExecutor;
 
@@ -270,6 +274,19 @@ struct MetaClusterStatusBracket {
 
 bool IsStableClusterStatusBracket(const MetaClusterStatusBracket& before,
                                   const MetaClusterStatusBracket& after);
+
+// Requires detector diagnostics, volatile authority continuity, and the
+// committed status view to describe one evaluation cut before they are joined
+// into clusterstatus.
+bool IsCurrentAutomaticFailoverDiagnostics(
+    const MetaDataControlRuntimeSnapshot& runtime,
+    const MetaAutomaticFailoverDiagnosticsSnapshot& detector,
+    std::uint64_t committed_applied_index);
+
+// Parses the canonical positive decimal representation accepted by the
+// putpolicy Admin Adapter. Leading zeroes are rejected so one version has one
+// wire spelling; overflow and a null output are also rejected.
+bool ParseAdminPolicyVersion(std::string_view text, std::uint64_t* version);
 
 // Classifies a registered node with no current session. Prior parsed Hello or
 // accepted-session evidence distinguishes a missing session from a process
@@ -356,6 +373,11 @@ struct MetaCtlServerOptions {
   std::string local_ctl_endpoint_;
   std::shared_ptr<MetaClusterStatusService> cluster_status_service_;
   std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status_;
+  // Complete, generation-bracketed detector cuts published by the
+  // leader-scoped automatic failover reconciler. The Admin server owns no
+  // detector timers and exposes no Policy contents through status.
+  std::shared_ptr<MetaAutomaticFailoverDiagnosticsRegistry>
+      automatic_failover_diagnostics_;
   // Shared background owner; listeners submit durable intent and only wait.
   std::shared_ptr<MetaClusterCreateReconciler> cluster_create_reconciler_;
   std::shared_ptr<class MetaMembershipReconciler> membership_reconciler_;

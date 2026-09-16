@@ -36,8 +36,10 @@ class MetaControlProjector {
   // A publisher can derive lease-challenge candidates without another Meta
   // read: they are exactly the groups whose owner_node_id equals the requested
   // node and whose grant_active bit is set, using that group's owner assignment
-  // and grant duration. Fenced owner identity remains projected for heartbeat
-  // role classification but cannot produce a challenge.
+  // and the projected global Authority Lease Policy ceiling. Fenced owner
+  // identity remains projected for heartbeat role classification but cannot
+  // produce a challenge. The leader publisher may only lower the projected
+  // ceiling to its local leadership-validity limit.
   static absl::StatusOr<NodeControlBatch> ProjectNode(
       const MetaCommittedView& view, std::string_view node_id);
 };

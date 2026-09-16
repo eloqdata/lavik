@@ -126,7 +126,7 @@ struct MetaGroupMember {
 
 // Read view of one group: the committed GroupRecord, any active failover
 // transition, and the topology store's own bookkeeping (config_epoch,
-// membership CAS revision, members).
+// membership CAS revision, members). Members are sorted by node_id_.
 struct MetaTopologyGroupView {
   std::string group_id_;
   MetaGroupRecord record_;

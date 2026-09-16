@@ -245,6 +245,11 @@ class AuthorityGuard {
   absl::Status RenewLease(const SessionIdentity& session,
                           const AuthorityAnchor& anchor, MonotonicTime deadline,
                           MonotonicTime now);
+  // NodeControl uses this after an awaited dependent activation to prove that
+  // the exact lease it installed still exists and remains live.
+  bool HasExactLease(const SessionIdentity& session,
+                     const AuthorityAnchor& anchor, MonotonicTime deadline,
+                     MonotonicTime now) const;
   // Removes only the exact lease instance named by its original deadline.
   // A renewal changes that deadline, so a stale timer cannot revoke the
   // replacement lease. Returns true exactly once for a due lease.

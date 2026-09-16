@@ -40,8 +40,7 @@ bool MetaGrantStore::GrantMatches(
          entry.grant_->owner_ == command.new_owner_ &&
          entry.grant_->term_ == command.expected_term_ &&
          entry.grant_->authority_version_ == command.new_authority_version_ &&
-         entry.grant_->activation_action_id_ == activation_action_id &&
-         entry.grant_->spec_ == command.grant_;
+         entry.grant_->activation_action_id_ == activation_action_id;
 }
 
 absl::Status MetaGrantStore::AddGroup(std::string_view group_id) {
@@ -65,7 +64,7 @@ absl::Status MetaGrantStore::RemoveGroup(std::string_view group_id) {
   }
   if (it->second.grant_.has_value()) {
     // A live grant must be revoked/fenced first; dropping the entry would
-    // lose the authority fact (PolicyInUse, obs freshness).
+    // lose the authority fact used by observation freshness.
     return MetaDomainRejectError("group still has an active grant");
   }
   groups_.erase(it);
@@ -99,52 +98,12 @@ absl::Status MetaGrantStore::BeginGroupTerm(
   return absl::OkStatus();
 }
 
-absl::Status MetaGrantStore::GrantAuthority(
-    const keylane::meta::GrantAuthority& command,
-    std::uint64_t committed_index) {
-  if (absl::Status lease = ValidateMetaGrantSpec(command.grant_); !lease.ok()) {
-    return lease;
-  }
-  const auto it = groups_.find(command.group_id_);
-  if (it == groups_.end()) {
-    return MetaDomainRejectError("unknown group");
-  }
-  Entry& entry = it->second;
-  if (!entry.grant_.has_value()) {
-    return MetaDomainRejectError("group has no active grant to renew");
-  }
-  MetaGroupGrant& grant = *entry.grant_;
-  if (grant.owner_ != command.node_id_) {
-    return MetaDomainRejectError("grant renewal must come from the owner");
-  }
-  if (command.term_ != grant.term_ ||
-      command.authority_version_ != grant.authority_version_) {
-    return MetaDomainRejectError(
-        "grant CAS token (term/authority_version) mismatch");
-  }
-  if (grant.spec_ == command.grant_) {
-    // A replay of the committed spec change or a semantically redundant
-    // command must not create a new authority anchor.
-    return absl::OkStatus();
-  }
-  if (committed_index == 0 || committed_index <= entry.last_grant_revision_) {
-    return MetaDomainRejectError("grant revision must strictly increase");
-  }
-  grant.spec_ = command.grant_;
-  grant.grant_revision_ = committed_index;
-  entry.last_grant_revision_ = committed_index;
-  return absl::OkStatus();
-}
-
 absl::Status MetaGrantStore::ValidateActivate(
     const keylane::meta::ActivateAuthority& command,
     std::uint64_t committed_index,
     std::optional<MetaFailoverActionId> activation_action_id) const {
   if (activation_action_id.has_value() && IsZero(*activation_action_id)) {
     return MetaDomainRejectError("failover activation action id is zero");
-  }
-  if (absl::Status lease = ValidateMetaGrantSpec(command.grant_); !lease.ok()) {
-    return lease;
   }
   if (command.expected_term_ == 0) {
     return MetaDomainRejectError(
@@ -185,10 +144,6 @@ absl::Status MetaGrantStore::ApplyGrantPart(
       command.expected_term_ != it->second.group_term_) {
     FatalGrantContractViolation("term mismatch", command.group_id_);
   }
-  if (absl::Status status = ValidateMetaGrantSpec(command.grant_);
-      !status.ok()) {
-    FatalGrantContractViolation(status.message(), command.group_id_);
-  }
   Entry& entry = it->second;
   if (GrantMatches(entry, command, committed_index, activation_action_id)) {
     return absl::OkStatus();  // replay no-op
@@ -202,7 +157,6 @@ absl::Status MetaGrantStore::ApplyGrantPart(
   grant.authority_version_ = command.new_authority_version_;
   grant.grant_revision_ = committed_index;
   grant.activation_action_id_ = std::move(activation_action_id);
-  grant.spec_ = command.grant_;
   entry.last_authority_version_ = command.new_authority_version_;
   entry.last_grant_revision_ = committed_index;
   entry.grant_ = std::move(grant);
@@ -263,28 +217,12 @@ std::optional<std::uint64_t> MetaGrantStore::CurrentGroupTerm(
   return it->second.group_term_;
 }
 
-bool MetaGrantStore::PolicyInUse(std::string_view policy_id,
-                                 std::uint64_t version) const {
-  for (const auto& [group_id, entry] : groups_) {
-    if (entry.grant_.has_value() &&
-        entry.grant_->spec_.policy_id_ == policy_id &&
-        entry.grant_->spec_.policy_version_ == version) {
-      return true;
-    }
-  }
-  return false;
-}
-
 absl::StatusOr<std::string> MetaGrantStore::Serialize() const {
   MetaWriter w;
   w.WriteU16(kMetaFormatVersion);
   w.WriteCount(static_cast<std::uint32_t>(groups_.size()));
   for (const auto& [group_id, entry] : groups_) {
     if (entry.grant_.has_value()) {
-      if (absl::Status status = ValidateMetaGrantSpec(entry.grant_->spec_);
-          !status.ok()) {
-        return status;
-      }
       if (entry.grant_->activation_action_id_.has_value() &&
           IsZero(*entry.grant_->activation_action_id_)) {
         return MetaDomainRejectError(
@@ -305,9 +243,6 @@ absl::StatusOr<std::string> MetaGrantStore::Serialize() const {
                        [](MetaWriter& www, const MetaFailoverActionId& id) {
                          WriteFixedArray(www, id);
                        });
-      ww.WriteU64(g.spec_.lease_duration_ms_);
-      ww.WriteString(g.spec_.policy_id_);
-      ww.WriteU64(g.spec_.policy_version_);
     });
   }
   return w.TakeBuffer();
@@ -363,19 +298,6 @@ absl::StatusOr<MetaGrantStore> MetaGrantStore::Deserialize(
         return absl::StatusOr<MetaGroupGrant>(activation_action_id.status());
       }
       g.activation_action_id_ = std::move(*activation_action_id);
-      auto lease = rr.ReadU64();
-      if (!lease.ok()) return absl::StatusOr<MetaGroupGrant>(lease.status());
-      g.spec_.lease_duration_ms_ = *lease;
-      auto policy_id = rr.ReadString(kMaxMetaPolicyIdBytes);
-      if (!policy_id.ok()) {
-        return absl::StatusOr<MetaGroupGrant>(policy_id.status());
-      }
-      g.spec_.policy_id_ = std::string(*policy_id);
-      auto policy_version = rr.ReadU64();
-      if (!policy_version.ok()) {
-        return absl::StatusOr<MetaGroupGrant>(policy_version.status());
-      }
-      g.spec_.policy_version_ = *policy_version;
       return absl::StatusOr<MetaGroupGrant>(std::move(g));
     });
     if (!grant.ok()) return grant.status();
@@ -396,10 +318,6 @@ absl::StatusOr<MetaGrantStore> MetaGrantStore::Deserialize(
       return MetaFailStopError("grant revision inconsistent with entry");
     }
     if (entry.grant_.has_value()) {
-      if (absl::Status status = ValidateMetaGrantSpec(entry.grant_->spec_);
-          !status.ok()) {
-        return MetaFailStopError(status.message());
-      }
       if (entry.grant_->activation_action_id_.has_value() &&
           IsZero(*entry.grant_->activation_action_id_)) {
         return MetaFailStopError("grant failover activation action id is zero");

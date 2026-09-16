@@ -11,6 +11,8 @@ namespace {
 class ClusterCreateV1RecoveryTest : public testing::Test {
  protected:
   void Apply(MetaCommand command) {
+    SCOPED_TRACE("command_tag=" + std::to_string(static_cast<std::uint16_t>(
+                                      MetaCommandTagOf(command))));
     std::visit([&](auto& c) { c.request_id_.fill(1); }, command);
     const auto result = ApplyCommitted(stores_, ++index_, command,
                                        "keylane://operator/test", "now");
@@ -192,7 +194,7 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
     Apply(ResultFor(operation, directive, status));
   }
 
-  void StartFirstReplicaBatch() {
+  void StartFirstAuthorizationBatch() {
     AdvanceToProjectionWait();
     PublishRuntime();
     ApplyPlanned();  // root: initialize-groups
@@ -202,7 +204,18 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
     ASSERT_EQ(child.current_directives_.size(), 1);
     CommitResult(child, child.current_directives_.front(),
                  MetaDirectiveResultStatus::kSucceeded);
-    ApplyPlanned();  // group-a: authorize and rebuild replica
+    ApplyPlanned();  // group-a: authorize replica source
+  }
+
+  void StartFirstReplicaBatch() {
+    StartFirstAuthorizationBatch();
+    auto child = GroupOperation("group-a");
+    ASSERT_EQ(child.current_directives_.size(), 1);
+    ASSERT_EQ(child.current_directives_.front().spec_.kind_,
+              kMetaDirectiveAuthorizeSource);
+    CommitResult(child, child.current_directives_.front(),
+                 MetaDirectiveResultStatus::kSucceeded);
+    ApplyPlanned();  // group-a: retain authorization and rebuild replica
   }
 
   void ExpectIncarnationFailure(std::string_view node_id) {
@@ -257,9 +270,9 @@ TEST_F(ClusterCreateTlsRecoveryTest, RecoversRegistrationAndProjectsTlsPorts) {
   const auto replica = stores_.identity_.FindNode(std::string(40, '2'));
   ASSERT_TRUE(primary.has_value());
   ASSERT_TRUE(replica.has_value());
-  EXPECT_EQ(primary->endpoints_, (std::vector<std::string>{
-                                    "tcp://127.0.0.1:6371",
-                                    "tls://127.0.0.1:16371"}));
+  EXPECT_EQ(primary->endpoints_,
+            (std::vector<std::string>{"tcp://127.0.0.1:6371",
+                                      "tls://127.0.0.1:16371"}));
   EXPECT_EQ(replica->endpoints_,
             (std::vector<std::string>{"tls://127.0.0.1:16372"}));
   const auto projected = MetaControlProjector::ProjectNode(
@@ -302,7 +315,7 @@ TEST_F(ClusterCreateV1RecoveryTest,
   ASSERT_TRUE(ready.ok() && ready->has_value()) << ready.status();
   const auto* phase = std::get_if<TransitionOperationPhase>(&**ready);
   ASSERT_NE(phase, nullptr);
-  EXPECT_EQ(phase->kind_phase_blob_, "register-data");
+  EXPECT_EQ(phase->kind_phase_blob_, "policy");
 }
 
 TEST_F(ClusterCreateV1RecoveryTest,
@@ -326,6 +339,15 @@ TEST_F(ClusterCreateV1RecoveryTest,
     ASSERT_FALSE(HasFatalFailure());
   }
   EXPECT_EQ(slot_map_commands, 1);
+  EXPECT_EQ(stores_.policy_.CurrentAutomaticUncontrolledFailover(),
+            (MetaAutomaticUncontrolledFailoverPolicy{
+                .version_ = 1,
+                .enabled_ = kDefaultAutomaticFailoverEnabled,
+                .suspect_after_ms_ = kDefaultAutomaticFailoverSuspectAfterMs}));
+  EXPECT_EQ(
+      stores_.policy_.CurrentAuthorityLease(),
+      (MetaAuthorityLeasePolicy{
+          .version_ = 1, .duration_ms_ = kDefaultAuthorityLeaseDurationMs}));
   ASSERT_EQ(stores_.population_manifest_.Size(), 2);
   for (const auto& declaration : manifest_.groups_) {
     const auto group = stores_.topology_.FindGroup(declaration.group_id_);
@@ -342,7 +364,29 @@ TEST_F(ClusterCreateV1RecoveryTest,
 }
 
 TEST_F(ClusterCreateV1RecoveryTest,
-       WaitsForLiveSourceLayoutBeforePlanningReplicaBatch) {
+       PreservesValidPoliciesPreseededBeforeBootstrap) {
+  PutPolicy automatic;
+  automatic.policy_id_ = kAutomaticUncontrolledFailoverPolicyId;
+  automatic.version_ = 1;
+  automatic.content_ =
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":false,"suspect_after_ms":9000})";
+  Apply(automatic);
+  PutPolicy lease;
+  lease.policy_id_ = kAuthorityLeasePolicyId;
+  lease.version_ = 1;
+  lease.content_ = R"({"kind":"authority-lease-v1","duration_ms":7000})";
+  Apply(lease);
+
+  AdvanceToProjectionWait();
+  EXPECT_EQ(stores_.policy_.CurrentAutomaticUncontrolledFailover(),
+            (MetaAutomaticUncontrolledFailoverPolicy{
+                .version_ = 1, .enabled_ = false, .suspect_after_ms_ = 9000}));
+  EXPECT_EQ(stores_.policy_.CurrentAuthorityLease(),
+            (MetaAuthorityLeasePolicy{.version_ = 1, .duration_ms_ = 7000}));
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       WaitsForLiveSourceLayoutBeforePlanningSourceAuthorization) {
   AdvanceToProjectionWait();
   PublishRuntime();
   ApplyPlanned();  // root: initialize-groups
@@ -361,7 +405,9 @@ TEST_F(ClusterCreateV1RecoveryTest,
   runtime_.nodes_.insert(runtime_.nodes_.begin(), primary);
   ApplyPlanned();
   child = GroupOperation("group-a");
-  ASSERT_EQ(child.current_directives_.size(), 2);
+  ASSERT_EQ(child.current_directives_.size(), 1);
+  EXPECT_EQ(child.current_directives_.front().spec_.kind_,
+            kMetaDirectiveAuthorizeSource);
   for (const auto& directive : child.current_directives_) {
     auto request =
         cluster::control::DecodeRebuildRequest(directive.spec_.payload_);
@@ -371,18 +417,35 @@ TEST_F(ClusterCreateV1RecoveryTest,
 }
 
 TEST_F(ClusterCreateV1RecoveryTest,
-       InitializesGroupsInOrderWithOneReplicaRevision) {
-  StartFirstReplicaBatch();
+       AuthorizesEverySourceBeforeCommittingReplicaRebuilds) {
+  AdvanceToProjectionWait();
+  PublishRuntime();
+  ApplyPlanned();  // root: initialize-groups
+  ApplyPlanned();  // group-a: submit
+  ApplyPlanned();  // group-a: initialize primary
   auto first = GroupOperation("group-a");
-  ASSERT_EQ(first.current_directives_.size(), 2);
-  EXPECT_EQ(first.current_directives_[0].spec_.kind_,
+  ASSERT_EQ(first.current_directives_.size(), 1);
+  CommitResult(first, first.current_directives_.front(),
+               MetaDirectiveResultStatus::kSucceeded);
+  ApplyPlanned();  // group-a: authorize source only
+
+  first = GroupOperation("group-a");
+  ASSERT_EQ(first.current_directives_.size(), 1);
+  ASSERT_EQ(first.current_directives_.front().spec_.kind_,
             kMetaDirectiveAuthorizeSource);
+  const MetaCurrentDirective authorize = first.current_directives_.front();
+  CommitResult(first, authorize, MetaDirectiveResultStatus::kSucceeded);
+  ApplyPlanned();  // group-a: retain authorization and add rebuild
+
+  first = GroupOperation("group-a");
+  ASSERT_EQ(first.current_directives_.size(), 2);
+  EXPECT_EQ(first.current_directives_[0], authorize);
   EXPECT_EQ(first.current_directives_[1].spec_.kind_, kMetaDirectiveRebuild);
-  EXPECT_EQ(first.current_directives_[0].directive_revision_,
-            first.current_directives_[1].directive_revision_);
+  EXPECT_GT(first.current_directives_[1].directive_revision_,
+            authorize.directive_revision_);
   // The fixture's primary has three source flows and its target two workers.
   // Apply round-trips the stores, so this also checks that replay preserves
-  // the source layout in both halves of the authorization/rebuild pair.
+  // the source layout across both durable phases.
   for (const auto& directive : first.current_directives_) {
     auto request =
         cluster::control::DecodeRebuildRequest(directive.spec_.payload_);
@@ -392,8 +455,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
   EXPECT_FALSE(stores_.operation_.FindOperation(
       detail::ClusterCreateV1GroupOperationId(root_, "group-b")));
 
-  for (const auto& directive : first.current_directives_)
-    CommitResult(first, directive, MetaDirectiveResultStatus::kSucceeded);
+  CommitResult(first, first.current_directives_[1],
+               MetaDirectiveResultStatus::kSucceeded);
   ApplyPlanned();  // group-a: population-ready and remove directives
   ApplyPlanned();  // group-a: completed
   EXPECT_EQ(GroupOperation("group-a").lifecycle_,
@@ -408,9 +471,27 @@ TEST_F(ClusterCreateV1RecoveryTest,
   StartFirstReplicaBatch();
   auto first = GroupOperation("group-a");
   ASSERT_EQ(first.current_directives_.size(), 2);
-  CommitResult(first, first.current_directives_[0],
-               MetaDirectiveResultStatus::kSucceeded);
   CommitResult(first, first.current_directives_[1],
+               MetaDirectiveResultStatus::kFailed);
+  ApplyPlanned();  // fence group-a
+  EXPECT_TRUE(stores_.grant_.GroupState("group-a")->fenced_);
+  EXPECT_FALSE(stores_.grant_.GroupState("group-b")->fenced_);
+  ApplyPlanned();  // abort group-a
+  ApplyPlanned();  // abort root
+  EXPECT_EQ(GroupOperation("group-a").lifecycle_,
+            MetaOperationLifecycle::kAborted);
+  EXPECT_EQ(stores_.operation_.FindOperation(root_)->lifecycle_,
+            MetaOperationLifecycle::kAborted);
+  EXPECT_FALSE(stores_.operation_.FindOperation(
+      detail::ClusterCreateV1GroupOperationId(root_, "group-b")));
+}
+
+TEST_F(ClusterCreateV1RecoveryTest,
+       SourceAuthorizationFailureFencesOnlyItsGroupAndAbortsRoot) {
+  StartFirstAuthorizationBatch();
+  auto first = GroupOperation("group-a");
+  ASSERT_EQ(first.current_directives_.size(), 1);
+  CommitResult(first, first.current_directives_.front(),
                MetaDirectiveResultStatus::kFailed);
   ApplyPlanned();  // fence group-a
   EXPECT_TRUE(stores_.grant_.GroupState("group-a")->fenced_);
@@ -469,16 +550,13 @@ TEST_F(ClusterCreateV1RecoveryTest,
 TEST_F(ClusterCreateV1RecoveryTest,
        ReplicaRestartBeforeResultFencesItsGroupAndAbortsRoot) {
   StartFirstReplicaBatch();
-  const auto child = GroupOperation("group-a");
-  CommitResult(child, child.current_directives_[0],
-               MetaDirectiveResultStatus::kSucceeded);
   runtime_.nodes_[1].boot_id_ = std::string(40, 'f');
   ExpectIncarnationFailure(std::string(40, '2'));
 }
 
 TEST_F(ClusterCreateV1RecoveryTest,
        SourceRestartBeforeAuthorizationFencesItsGroupAndAbortsRoot) {
-  StartFirstReplicaBatch();
+  StartFirstAuthorizationBatch();
   runtime_.nodes_[0].boot_id_ = std::string(40, 'f');
   ExpectIncarnationFailure(std::string(40, '1'));
 }
@@ -486,9 +564,6 @@ TEST_F(ClusterCreateV1RecoveryTest,
 TEST_F(ClusterCreateV1RecoveryTest,
        SourceHistoryChangeWhileRebuildingFencesItsGroupAndAbortsRoot) {
   StartFirstReplicaBatch();
-  const auto child = GroupOperation("group-a");
-  CommitResult(child, child.current_directives_[0],
-               MetaDirectiveResultStatus::kSucceeded);
   runtime_.nodes_[0].replication_history_id_.fill(99);
   ExpectIncarnationFailure(std::string(40, '1'));
 }
@@ -545,8 +620,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
        CommittedReplicaSuccessRemainsHistoryAfterBootChanges) {
   StartFirstReplicaBatch();
   const auto child = GroupOperation("group-a");
-  for (const auto& directive : child.current_directives_)
-    CommitResult(child, directive, MetaDirectiveResultStatus::kSucceeded);
+  CommitResult(child, child.current_directives_[1],
+               MetaDirectiveResultStatus::kSucceeded);
   const auto receipts = GroupOperation("group-a").terminal_receipts_;
   runtime_.nodes_[0].boot_id_ = std::string(40, 'e');
   runtime_.nodes_[1].boot_id_ = std::string(40, 'f');
@@ -581,8 +656,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
        LaterGroupFailureDoesNotRollbackCompletedGroup) {
   StartFirstReplicaBatch();
   auto first = GroupOperation("group-a");
-  for (const auto& directive : first.current_directives_)
-    CommitResult(first, directive, MetaDirectiveResultStatus::kSucceeded);
+  CommitResult(first, first.current_directives_[1],
+               MetaDirectiveResultStatus::kSucceeded);
   ApplyPlanned();  // group-a: population-ready
   ApplyPlanned();  // group-a: completed
   ApplyPlanned();  // group-b: submitted
@@ -590,11 +665,14 @@ TEST_F(ClusterCreateV1RecoveryTest,
   auto second = GroupOperation("group-b");
   CommitResult(second, second.current_directives_.front(),
                MetaDirectiveResultStatus::kSucceeded);
-  ApplyPlanned();  // group-b: replica batch
+  ApplyPlanned();  // group-b: source authorization
+  second = GroupOperation("group-b");
+  ASSERT_EQ(second.current_directives_.size(), 1);
+  CommitResult(second, second.current_directives_.front(),
+               MetaDirectiveResultStatus::kSucceeded);
+  ApplyPlanned();  // group-b: replica rebuild
   second = GroupOperation("group-b");
   ASSERT_EQ(second.current_directives_.size(), 2);
-  CommitResult(second, second.current_directives_[0],
-               MetaDirectiveResultStatus::kSucceeded);
   CommitResult(second, second.current_directives_[1],
                MetaDirectiveResultStatus::kFailed);
   ApplyPlanned();  // fence group-b

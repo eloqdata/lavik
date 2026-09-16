@@ -10,6 +10,7 @@
 // with read-path re-filtering, TTL expiry, entry/domain/byte capacity bounds,
 // exact resource accounting across every removal path, and the audit ring.
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -18,6 +19,7 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "absl/status/status.h"
 #include "gtest/gtest.h"
@@ -30,6 +32,7 @@ namespace {
 using keylane::meta::MetaAssignmentId;
 using keylane::meta::MetaBootIncarnation;
 using keylane::meta::MetaCandidateProgressObs;
+using keylane::meta::MetaCausallyConfirmedLease;
 using keylane::meta::MetaCommittedFacts;
 using keylane::meta::MetaFailureClass;
 using keylane::meta::MetaFailureClassOf;
@@ -40,6 +43,7 @@ using keylane::meta::MetaObsAuditKind;
 using keylane::meta::MetaObservation;
 using keylane::meta::MetaObservationIdentity;
 using keylane::meta::MetaObservationStore;
+using keylane::meta::MetaObservedOwnerProjection;
 using keylane::meta::MetaOperationEvidenceObs;
 using keylane::meta::MetaOperationId;
 using keylane::meta::MetaReplicationHistoryId;
@@ -134,6 +138,33 @@ MetaAssignmentId Assignment(std::uint8_t tag) {
   MetaAssignmentId id{};
   id.fill(tag);
   return id;
+}
+
+template <std::size_t N>
+std::string HexBytes(const std::array<std::uint8_t, N>& value) {
+  static constexpr char kDigits[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(N * 2);
+  for (const std::uint8_t byte : value) {
+    result.push_back(kDigits[byte >> 4]);
+    result.push_back(kDigits[byte & 0x0f]);
+  }
+  return result;
+}
+
+keylane::cluster::control::LeaseGranted GrantFor(
+    const MetaObservationIdentity& identity,
+    const MetaObservedOwnerProjection& projection) {
+  return {
+      .data_boot_id = HexBytes(identity.boot_incarnation_),
+      .projection_hash = projection.projection_hash_,
+      .group_id = projection.group_id_,
+      .assignment_id = projection.owner_assignment_id_,
+      .group_term = projection.group_term_,
+      .authority_version = projection.authority_version_,
+      .grant_revision = projection.grant_revision_,
+      .granted_duration_ms = projection.authority_lease_duration_ms_,
+  };
 }
 
 MetaObservationIdentity Ident(std::string node_id, std::uint8_t boot_tag,
@@ -327,6 +358,486 @@ TEST(MetaObservationStore,
 
   store.ResetForLeadershipChange();
   EXPECT_FALSE(store.SessionStateFor("n1").has_value());
+}
+
+TEST(MetaObservationStore,
+     OwnerObservationIsOneAtomicHeartbeatAndCausalLeaseCut) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  const auto identity = Ident("n1", 0x0a, 1);
+  ASSERT_TRUE(store.AdoptSession(identity, 1000, History(1)).ok());
+
+  MetaObservedOwnerProjection projection{
+      .group_id_ = "g1",
+      .owner_node_id_ = "n1",
+      .owner_assignment_id_ = Assignment(0x31),
+      .group_term_ = 3,
+      .authority_version_ = 4,
+      .grant_revision_ = 5,
+      .authority_lease_duration_ms_ = 3000,
+  };
+  projection.projection_hash_.fill(0x44);
+  MetaNodeHealthObs healthy{
+      .storage_ready_ = true,
+      .population_ready_ = true,
+      .draining_ = false,
+      .active_groups_ = 1,
+      .health_ = "ok",
+  };
+  auto first = store.ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                      std::nullopt, std::nullopt, projection, 1,
+                                      std::nullopt, facts, 1010, 2010);
+  ASSERT_TRUE(first.health_status_.ok()) << first.health_status_;
+
+  auto observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->heartbeat_sequence_, 1u);
+  EXPECT_EQ(observed->heartbeat_received_steady_ms_, 2010);
+  EXPECT_EQ(observed->owner_projection_, projection);
+  EXPECT_EQ(observed->causal_progress_received_steady_ms_, 2010);
+  EXPECT_EQ(observed->causal_confirmation_heartbeat_sequence_, 0u);
+  EXPECT_FALSE(observed->confirmed_lease_.has_value());
+
+  MetaCausallyConfirmedLease confirmation{
+      .projection_ = projection,
+      .acknowledged_heartbeat_sequence_ = 1,
+      .granted_duration_ms_ = 3000,
+  };
+  auto second = store.ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                       std::nullopt, std::nullopt, projection,
+                                       2, confirmation, facts, 1020, 2020);
+  ASSERT_TRUE(second.health_status_.ok()) << second.health_status_;
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->heartbeat_sequence_, 2u);
+  EXPECT_EQ(observed->causal_progress_received_steady_ms_, 2020);
+  EXPECT_EQ(observed->causal_confirmation_heartbeat_sequence_, 2u);
+  EXPECT_EQ(observed->confirmed_lease_, confirmation);
+
+  MetaCausallyConfirmedLease wrong_duration = confirmation;
+  --wrong_duration.granted_duration_ms_;
+  const auto rejected = store.ReplaceHeartbeat(
+      identity, healthy, std::nullopt, std::nullopt, std::nullopt, projection,
+      3, wrong_duration, facts, 1025, 2025);
+  for (const absl::Status* status :
+       {&rejected.boot_status_, &rejected.health_status_,
+        &rejected.candidate_status_, &rejected.failover_status_}) {
+    EXPECT_EQ(status->code(), absl::StatusCode::kFailedPrecondition);
+  }
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->heartbeat_sequence_, 2u);
+  EXPECT_EQ(observed->confirmed_lease_, confirmation);
+
+  MetaObservedOwnerProjection replacement = projection;
+  replacement.projection_hash_.fill(0x55);
+  auto replaced = store.ReplaceHeartbeat(
+      identity, healthy, std::nullopt, std::nullopt, std::nullopt, replacement,
+      3, std::nullopt, facts, 1030, 2030);
+  ASSERT_TRUE(replaced.health_status_.ok()) << replaced.health_status_;
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->owner_projection_, replacement);
+  EXPECT_EQ(observed->causal_progress_received_steady_ms_, 2030);
+  EXPECT_EQ(observed->causal_confirmation_heartbeat_sequence_, 0u);
+  EXPECT_FALSE(observed->confirmed_lease_.has_value());
+}
+
+TEST(MetaObservationStore,
+     PossibleOwnerLeaseSurvivesSameAuthorityProjectionReplacement) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  const auto identity = Ident("n1", 0x0a, 1);
+  ASSERT_TRUE(store.AdoptSession(identity, 1000, History(1)).ok());
+  MetaObservedOwnerProjection original{
+      .group_id_ = "g1",
+      .owner_node_id_ = "n1",
+      .owner_assignment_id_ = Assignment(0x31),
+      .group_term_ = 3,
+      .authority_version_ = 4,
+      .grant_revision_ = 5,
+      .authority_lease_duration_ms_ = 6000,
+  };
+  original.projection_hash_.fill(0x44);
+  const MetaNodeHealthObs healthy{.storage_ready_ = true,
+                                  .population_ready_ = true};
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, original, 1,
+                                    std::nullopt, facts, 1010, 10'000)
+                  .health_status_.ok());
+  ASSERT_TRUE(store
+                  .RecordOwnerLeaseDecisionAttempt(identity, 1,
+                                                   GrantFor(identity, original))
+                  .ok());
+
+  MetaObservedOwnerProjection replacement = original;
+  replacement.projection_hash_.fill(0x45);
+  replacement.authority_lease_duration_ms_ = 250;
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, replacement, 2,
+                                    std::nullopt, facts, 1020, 11'000)
+                  .health_status_.ok());
+  auto observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  ASSERT_TRUE(observed->possible_owner_lease_.has_value());
+  EXPECT_EQ(observed->possible_owner_lease_->projection_, original);
+  EXPECT_EQ(observed->possible_owner_lease_->granted_heartbeat_sequence_, 1u);
+
+  // A shorter possible Grant under the replacement cannot erase the longer
+  // old lease until Data causally proves that it installed the newer Ack.
+  ASSERT_TRUE(store
+                  .RecordOwnerLeaseDecisionAttempt(
+                      identity, 2, GrantFor(identity, replacement))
+                  .ok());
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed->possible_owner_lease_.has_value());
+  EXPECT_EQ(observed->possible_owner_lease_->projection_, original);
+
+  const MetaCausallyConfirmedLease confirmation{
+      .projection_ = replacement,
+      .acknowledged_heartbeat_sequence_ = 2,
+      .granted_duration_ms_ = 250,
+  };
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, replacement, 3,
+                                    confirmation, facts, 1030, 11'200)
+                  .health_status_.ok());
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_FALSE(observed->possible_owner_lease_.has_value());
+  ASSERT_TRUE(observed->installed_owner_lease_.has_value());
+  EXPECT_EQ(observed->installed_owner_lease_->projection_, replacement);
+  EXPECT_EQ(observed->installed_owner_lease_->granted_heartbeat_sequence_, 2u);
+  EXPECT_EQ(observed->confirmed_lease_, confirmation);
+  EXPECT_EQ(observed->causal_progress_received_steady_ms_, 11'200);
+}
+
+TEST(MetaObservationStore,
+     HandoffPendingSurvivesReplacementUntilLaterDecisionIsWritten) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  const auto identity = Ident("n1", 0x0a, 1);
+  ASSERT_TRUE(store.AdoptSession(identity, 1000, History(1)).ok());
+  MetaObservedOwnerProjection original{
+      .group_id_ = "g1",
+      .owner_node_id_ = "n1",
+      .owner_assignment_id_ = Assignment(0x31),
+      .group_term_ = 3,
+      .authority_version_ = 4,
+      .grant_revision_ = 5,
+      .authority_lease_duration_ms_ = 6000,
+  };
+  original.projection_hash_.fill(0x44);
+  const MetaNodeHealthObs healthy{.storage_ready_ = true,
+                                  .population_ready_ = true};
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, original, 1,
+                                    std::nullopt, facts, 1010, 10'000)
+                  .health_status_.ok());
+  const keylane::cluster::control::LeaseDenied pending{
+      .reason = keylane::cluster::control::LeaseDenialReason::
+          kAuthorityHandoffPending,
+  };
+  ASSERT_TRUE(store.RecordOwnerLeaseDecisionAttempt(identity, 1, pending).ok());
+
+  MetaObservedOwnerProjection replacement = original;
+  replacement.projection_hash_.fill(0x45);
+  replacement.authority_lease_duration_ms_ = 250;
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, replacement, 2,
+                                    std::nullopt, facts, 1020, 11'000)
+                  .health_status_.ok());
+  auto observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  ASSERT_TRUE(observed->authority_handoff_pending_.has_value());
+  EXPECT_EQ(observed->authority_handoff_pending_->projection_, original);
+  EXPECT_EQ(observed->authority_handoff_pending_->denied_heartbeat_sequence_,
+            1u);
+
+  // A different denial never proves that the handoff guard's 2D deadline
+  // elapsed; only an otherwise-valid Grant passes through that guard.
+  ASSERT_TRUE(store
+                  .RecordOwnerLeaseDecisionAttempt(
+                      identity, 2,
+                      keylane::cluster::control::LeaseDenied{
+                          .reason = keylane::cluster::control::
+                              LeaseDenialReason::kNodeNotReady,
+                      })
+                  .ok());
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed->authority_handoff_pending_.has_value());
+
+  ASSERT_TRUE(store
+                  .RecordOwnerLeaseDecisionWritten(
+                      identity, 2,
+                      keylane::cluster::control::LeaseDenied{
+                          .reason = keylane::cluster::control::
+                              LeaseDenialReason::kNodeNotReady,
+                      })
+                  .ok());
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_FALSE(observed->authority_handoff_pending_.has_value());
+}
+
+TEST(MetaObservationStore,
+     OwnerCausalProgressAdvancesOnlyForANewerConfirmedGrant) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  const auto identity = Ident("n1", 0x0a, 1);
+  ASSERT_TRUE(store.AdoptSession(identity, 1000, History(1)).ok());
+
+  MetaObservedOwnerProjection projection{
+      .group_id_ = "g1",
+      .owner_node_id_ = "n1",
+      .owner_assignment_id_ = Assignment(0x31),
+      .group_term_ = 3,
+      .authority_version_ = 4,
+      .grant_revision_ = 5,
+      .authority_lease_duration_ms_ = 3000,
+  };
+  projection.projection_hash_.fill(0x44);
+  const MetaNodeHealthObs healthy{
+      .storage_ready_ = true,
+      .population_ready_ = true,
+      .draining_ = false,
+      .active_groups_ = 1,
+      .health_ = "ok",
+  };
+
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, projection, 1,
+                                    std::nullopt, facts, 1010, 2010)
+                  .health_status_.ok());
+  auto observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->causal_progress_received_steady_ms_, 2010);
+  EXPECT_EQ(observed->causal_confirmation_heartbeat_sequence_, 0u);
+
+  // Ordinary heartbeat progress cannot keep a never-confirmed grant pending
+  // forever.
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, projection, 2,
+                                    std::nullopt, facts, 1020, 2020)
+                  .health_status_.ok());
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->causal_progress_received_steady_ms_, 2010);
+
+  MetaCausallyConfirmedLease confirmation{
+      .projection_ = projection,
+      .acknowledged_heartbeat_sequence_ = 1,
+      .granted_duration_ms_ = 3000,
+  };
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, projection, 3,
+                                    confirmation, facts, 1030, 2030)
+                  .health_status_.ok());
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->causal_progress_received_steady_ms_, 2030);
+  EXPECT_EQ(observed->causal_confirmation_heartbeat_sequence_, 3u);
+
+  // Re-reporting the same causal fact under a later ordinary heartbeat is not
+  // new progress and must retain the original receive time.
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, projection, 4,
+                                    confirmation, facts, 1040, 2040)
+                  .health_status_.ok());
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->causal_progress_received_steady_ms_, 2030);
+  EXPECT_EQ(observed->causal_confirmation_heartbeat_sequence_, 3u);
+
+  confirmation.acknowledged_heartbeat_sequence_ = 4;
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, projection, 5,
+                                    confirmation, facts, 1050, 2050)
+                  .health_status_.ok());
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->causal_progress_received_steady_ms_, 2050);
+  EXPECT_EQ(observed->causal_confirmation_heartbeat_sequence_, 5u);
+}
+
+TEST(MetaObservationStore,
+     OwnerCausalProgressResetsForEveryAuthorityIncarnationField) {
+  using Mutation = void (*)(MetaObservedOwnerProjection&);
+  const std::vector<Mutation> mutations{
+      +[](MetaObservedOwnerProjection& value) { value.group_id_ = "g2"; },
+      +[](MetaObservedOwnerProjection& value) { value.owner_node_id_ = "n2"; },
+      +[](MetaObservedOwnerProjection& value) {
+        value.owner_assignment_id_ = Assignment(0x32);
+      },
+      +[](MetaObservedOwnerProjection& value) { ++value.group_term_; },
+      +[](MetaObservedOwnerProjection& value) { ++value.authority_version_; },
+      +[](MetaObservedOwnerProjection& value) { ++value.grant_revision_; },
+      +[](MetaObservedOwnerProjection& value) {
+        value.projection_hash_.fill(0x45);
+      },
+      +[](MetaObservedOwnerProjection& value) {
+        ++value.authority_lease_duration_ms_;
+      },
+  };
+
+  for (std::size_t index = 0; index < mutations.size(); ++index) {
+    SCOPED_TRACE(index);
+    MetaObservationStore store;
+    FakeCommittedFacts facts = MakeFreshFacts();
+    const auto identity = Ident("n1", 0x0a, 1);
+    ASSERT_TRUE(store.AdoptSession(identity, 1000, History(1)).ok());
+    MetaObservedOwnerProjection projection{
+        .group_id_ = "g1",
+        .owner_node_id_ = "n1",
+        .owner_assignment_id_ = Assignment(0x31),
+        .group_term_ = 3,
+        .authority_version_ = 4,
+        .grant_revision_ = 5,
+        .authority_lease_duration_ms_ = 3000,
+    };
+    projection.projection_hash_.fill(0x44);
+    const MetaNodeHealthObs healthy{.storage_ready_ = true,
+                                    .population_ready_ = true};
+    ASSERT_TRUE(store
+                    .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                      std::nullopt, std::nullopt, projection, 1,
+                                      std::nullopt, facts, 1010, 2010)
+                    .health_status_.ok());
+    const MetaCausallyConfirmedLease confirmation{
+        .projection_ = projection,
+        .acknowledged_heartbeat_sequence_ = 1,
+        .granted_duration_ms_ = 3000,
+    };
+    ASSERT_TRUE(store
+                    .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                      std::nullopt, std::nullopt, projection, 2,
+                                      confirmation, facts, 1020, 2020)
+                    .health_status_.ok());
+
+    mutations[index](projection);
+    ASSERT_TRUE(store
+                    .ReplaceHeartbeat(identity, healthy, std::nullopt,
+                                      std::nullopt, std::nullopt, projection, 3,
+                                      std::nullopt, facts, 1030, 2030)
+                    .health_status_.ok());
+    const auto observed = store.OwnerObservationFor("n1");
+    ASSERT_TRUE(observed.has_value());
+    EXPECT_EQ(observed->causal_progress_received_steady_ms_, 2030);
+    EXPECT_EQ(observed->causal_confirmation_heartbeat_sequence_, 0u);
+    EXPECT_FALSE(observed->confirmed_lease_.has_value());
+  }
+}
+
+TEST(MetaObservationStore, OwnerCausalProgressIsScopedToSessionAndLeadership) {
+  MetaObservationStore store;
+  FakeCommittedFacts facts = MakeFreshFacts();
+  const auto first = Ident("n1", 0x0a, 1);
+  ASSERT_TRUE(store.AdoptSession(first, 1000, History(1)).ok());
+  MetaObservedOwnerProjection projection{
+      .group_id_ = "g1",
+      .owner_node_id_ = "n1",
+      .owner_assignment_id_ = Assignment(0x31),
+      .group_term_ = 3,
+      .authority_version_ = 4,
+      .grant_revision_ = 5,
+      .authority_lease_duration_ms_ = 3000,
+  };
+  projection.projection_hash_.fill(0x44);
+  const MetaNodeHealthObs healthy{.storage_ready_ = true,
+                                  .population_ready_ = true};
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(first, healthy, std::nullopt, std::nullopt,
+                                    std::nullopt, projection, 1, std::nullopt,
+                                    facts, 1010, 2010)
+                  .health_status_.ok());
+
+  const auto replacement = Ident("n1", 0x0b, 2);
+  ASSERT_TRUE(store.AdoptSession(replacement, 1020, History(2)).ok());
+  auto observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_FALSE(observed->causal_progress_received_steady_ms_.has_value());
+  EXPECT_EQ(observed->causal_confirmation_heartbeat_sequence_, 0u);
+  EXPECT_FALSE(observed->confirmed_lease_.has_value());
+  ASSERT_TRUE(store
+                  .ReplaceHeartbeat(replacement, healthy, std::nullopt,
+                                    std::nullopt, std::nullopt, projection, 1,
+                                    std::nullopt, facts, 1030, 2030)
+                  .health_status_.ok());
+  observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->causal_progress_received_steady_ms_, 2030);
+
+  store.ResetForLeadershipChange();
+  EXPECT_FALSE(store.OwnerObservationFor("n1").has_value());
+}
+
+TEST(MetaObservationStore,
+     OwnerCutDoesNotJoinRejectedDiagnosticHealthToNewCausalAck) {
+  MetaObservationStore::Limits limits;
+  limits.max_retained_bytes_total_ = 9;
+  limits.max_retained_bytes_per_node_ = 9;
+  MetaObservationStore store(limits);
+  FakeCommittedFacts facts = MakeFreshFacts();
+  const auto identity = Ident("n1", 0x0a, 1);
+  ASSERT_TRUE(store.AdoptSession(identity, 1000, History(1)).ok());
+
+  MetaObservedOwnerProjection projection{
+      .group_id_ = "g1",
+      .owner_node_id_ = "n1",
+      .owner_assignment_id_ = Assignment(0x31),
+      .group_term_ = 3,
+      .authority_version_ = 4,
+      .grant_revision_ = 5,
+      .authority_lease_duration_ms_ = 3000,
+  };
+  projection.projection_hash_.fill(0x44);
+  MetaNodeHealthObs unhealthy{
+      .storage_ready_ = false,
+      .population_ready_ = false,
+      .draining_ = false,
+      .active_groups_ = 1,
+      .health_ = "x",
+  };
+  auto first = store.ReplaceHeartbeat(identity, unhealthy, std::nullopt,
+                                      std::nullopt, std::nullopt, projection, 1,
+                                      std::nullopt, facts, 1010, 2010);
+  ASSERT_TRUE(first.health_status_.ok()) << first.health_status_;
+
+  MetaNodeHealthObs healthy = unhealthy;
+  healthy.storage_ready_ = true;
+  healthy.population_ready_ = true;
+  healthy.health_ = "xx";
+  MetaCausallyConfirmedLease confirmation{
+      .projection_ = projection,
+      .acknowledged_heartbeat_sequence_ = 1,
+      .granted_duration_ms_ = 3000,
+  };
+  const auto second = store.ReplaceHeartbeat(
+      identity, healthy, std::nullopt, std::nullopt, std::nullopt, projection,
+      2, confirmation, facts, 1020, 2020);
+  EXPECT_EQ(second.health_status_.code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  // The free-form diagnostic remains latest-wins under its byte budget, but
+  // Owner serviceability consumes the typed fields from heartbeat sequence 2.
+  const auto observed = store.OwnerObservationFor("n1");
+  ASSERT_TRUE(observed.has_value());
+  ASSERT_TRUE(observed->health_.has_value());
+  EXPECT_EQ(observed->heartbeat_sequence_, 2u);
+  EXPECT_EQ(observed->heartbeat_received_steady_ms_, 2020);
+  EXPECT_TRUE(observed->health_->storage_ready_);
+  EXPECT_TRUE(observed->health_->population_ready_);
+  EXPECT_EQ(observed->confirmed_lease_, confirmation);
 }
 
 TEST(MetaObservationStore,

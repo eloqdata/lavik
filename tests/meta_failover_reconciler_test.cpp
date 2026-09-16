@@ -80,7 +80,6 @@ struct Fixture {
   meta::MetaBootIncarnation candidate_boot = Bytes<20>(0x32);
   meta::MetaBootIncarnation alternate_boot = Bytes<20>(0x33);
   meta::MetaReplicationHistoryId source_history = Bytes<20>(0x41);
-  meta::MetaGrantSpec grant{5'000, "failover-policy", 0};
   meta::MetaOperationId operation_id = Bytes<16>(0x51);
   std::uint64_t next_index = 1;
   std::vector<meta::MetaCommand> committed_commands;
@@ -88,6 +87,14 @@ struct Fixture {
   Fixture() {
     const meta::MetaOperationId root = Bytes<16>(0x01);
     EXPECT_TRUE(stores.topology_.BeginClusterCreate(root, 1).ok());
+    meta::PutPolicy automatic;
+    automatic.request_id_ = Bytes<16>(0x0f);
+    automatic.policy_id_ =
+        std::string(meta::kAutomaticUncontrolledFailoverPolicyId);
+    automatic.version_ = 1;
+    automatic.content_ =
+        R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+    EXPECT_TRUE(stores.policy_.Apply(automatic).ok());
     EXPECT_TRUE(stores.topology_.CompleteClusterCreate(root).ok());
 
     Register(owner, meta::MetaNodeRole::kPrimary, 6379, 0x02);
@@ -121,10 +128,9 @@ struct Fixture {
 
     meta::PutPolicy policy;
     policy.request_id_ = Bytes<16>(0x07);
-    policy.policy_id_ = grant.policy_id_;
-    policy.version_ = grant.policy_version_;
-    policy.content_ = R"({"lease_ms":5000})";
-    policy.content_hash_ = meta::MetaPolicyStore::ContentHash(policy.content_);
+    policy.policy_id_ = std::string(meta::kAuthorityLeasePolicyId);
+    policy.version_ = 1;
+    policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
     Accept(policy);
 
     meta::BeginGroupTerm term;
@@ -139,7 +145,6 @@ struct Fixture {
     activate.group_id_ = "g1";
     activate.expected_term_ = 1;
     activate.new_owner_ = owner;
-    activate.grant_ = grant;
     activate.new_authority_version_ = 1;
     activate.new_topology_epoch_ = 4;
     activate.new_config_epoch_ = 1;
@@ -441,7 +446,6 @@ void BeginUncontrolled(Fixture& fixture,
   begin.group_id_ = "g1";
   begin.transition_id_ = Bytes<16>(static_cast<std::uint8_t>(first_id + 1));
   begin.target_term_ = group->record_.group_term_ + 1;
-  begin.successor_grant_ = grant->grant_->spec_;
   begin.expected_owner_node_id_ = group->record_.owner_;
   begin.expected_owner_assignment_id_ = owner->assignment_id_;
   begin.expected_membership_revision_ = group->revision_;
@@ -486,7 +490,6 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(command->operation_id_, fixture.operation_id);
   EXPECT_EQ(command->expected_operation_revision_, 0);
   EXPECT_EQ(command->target_term_, 2);
-  EXPECT_EQ(command->successor_grant_, fixture.grant);
   EXPECT_EQ(command->expected_owner_node_id_, fixture.owner);
   EXPECT_EQ(command->expected_owner_assignment_id_, fixture.owner_assignment);
   EXPECT_EQ(command->expected_membership_revision_, 3);
@@ -872,7 +875,6 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(commit->action_id_, authorized.candidate_action_->action_id_);
   EXPECT_EQ(commit->authorized_revision_,
             authorized.candidate_action_->authorization_->authorized_revision_);
-  EXPECT_EQ(commit->successor_grant_, fixture.grant);
   EXPECT_EQ(commit->new_authority_version_, 2);
   EXPECT_EQ(commit->new_topology_epoch_, 5);
   EXPECT_EQ(commit->new_config_epoch_, 2);
@@ -1888,6 +1890,20 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   create.intent_ = *creation_intent;
   create.intent_hash_ = meta::MetaSha256(create.intent_);
   commit(meta::MetaCommand{create});
+  meta::PutPolicy automatic;
+  automatic.request_id_ = Bytes<16>(0x0f);
+  automatic.policy_id_ =
+      std::string(meta::kAutomaticUncontrolledFailoverPolicyId);
+  automatic.version_ = 1;
+  automatic.content_ =
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+  commit(meta::MetaCommand{automatic});
+  meta::PutPolicy authority;
+  authority.request_id_ = Bytes<16>(0x07);
+  authority.policy_id_ = std::string(meta::kAuthorityLeasePolicyId);
+  authority.version_ = 1;
+  authority.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
+  commit(meta::MetaCommand{authority});
   meta::CompleteOperation complete;
   complete.request_id_ = Bytes<16>(0xe2);
   complete.operation_id_ = root;
@@ -2063,6 +2079,20 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   create.intent_ = *creation_intent;
   create.intent_hash_ = meta::MetaSha256(create.intent_);
   commit(meta::MetaCommand{create});
+  meta::PutPolicy automatic;
+  automatic.request_id_ = Bytes<16>(0x0f);
+  automatic.policy_id_ =
+      std::string(meta::kAutomaticUncontrolledFailoverPolicyId);
+  automatic.version_ = 1;
+  automatic.content_ =
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+  commit(meta::MetaCommand{automatic});
+  meta::PutPolicy authority;
+  authority.request_id_ = Bytes<16>(0x07);
+  authority.policy_id_ = std::string(meta::kAuthorityLeasePolicyId);
+  authority.version_ = 1;
+  authority.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
+  commit(meta::MetaCommand{authority});
   meta::CompleteOperation complete;
   complete.request_id_ = Bytes<16>(0xe6);
   complete.operation_id_ = root;

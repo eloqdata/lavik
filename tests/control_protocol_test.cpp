@@ -40,10 +40,17 @@ WireHash256 Sha256(std::string_view bytes) {
   return control::ComputeSha256(bytes);
 }
 
+void SetLeaseTiming(control::FullDesiredState* state) {
+  state->authority_lease_duration_ms = 3'000;
+  state->data_heartbeat_interval_ms = 1'000;
+}
+
 control::FullDesiredState FailoverFullState() {
   control::FullDesiredState state;
   state.source_meta_applied_index = 91;
   state.topology_epoch = 23;
+  state.authority_lease_duration_ms = 3'000;
+  state.data_heartbeat_interval_ms = 1'000;
   state.nodes = {
       {.node_id = std::string(40, 'a'), .host = "127.0.0.1", .port = 6379},
       {.node_id = std::string(40, 'b'), .host = "127.0.0.2", .port = 6380},
@@ -60,12 +67,9 @@ control::FullDesiredState FailoverFullState() {
   group.group_term = 7;
   group.authority_version = 9;
   group.grant_revision = 11;
-  group.grant_duration_ms = 3'000;
   group.grant_active = true;
   group.activation_action_id = Id(19);
   group.config_epoch = 13;
-  group.grant_policy_id = "current-grant";
-  group.grant_policy_version = 2;
   group.steady_replication_enabled = true;
   group.failover_transition = control::WireFailoverTransition{
       .transition_id = Id(20),
@@ -90,12 +94,6 @@ control::FullDesiredState FailoverFullState() {
                       .loss_if_cutover = control::WireFailoverLoss::kNone}},
   };
   state.groups.push_back(std::move(group));
-  state.policies = {
-      {.policy_id = "current-grant",
-       .version = 2,
-       .content_hash = Sha256("current"),
-       .content = "current"},
-  };
   state.directive_set_digest =
       *control::ComputeDirectiveSetDigest(state.current_directives);
   state.projection_hash = *control::ComputeProjectionHash(state);
@@ -326,6 +324,30 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
   decoded = control::DecodeMessage(MessageType::kHeartbeatAck, *encoded);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(std::get<control::HeartbeatAck>(*decoded), ack);
+}
+
+TEST(ControlProtocolCodecTest,
+     RoundTripsServerHelloWithoutIndependentHeartbeatCadence) {
+  control::ServerHello hello{
+      .disposition = control::ServerHelloDisposition::kAccepted,
+      .negotiated_version = control::kProtocolVersion,
+      .meta_server_id = 4,
+      .raft_term = 22,
+      .session_id = Id(1),
+      .session_generation = 5,
+      .leader_id = 4,
+      .directory = {{.server_id = 4, .host = "127.0.0.1", .port = 7400}},
+      .observation_ttl_ms = 600,
+      .session_progress_timeout_ms = 1'000,
+  };
+
+  auto encoded = control::EncodeMessage(control::WireMessage{hello});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded =
+      control::DecodeMessage(MessageType::kServerHello, std::move(*encoded));
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  ASSERT_TRUE(std::holds_alternative<control::ServerHello>(*decoded));
+  EXPECT_EQ(std::get<control::ServerHello>(*decoded), hello);
 }
 
 TEST(ControlProtocolCodecTest, RoundTripsTypedReplicaCandidate) {
@@ -926,6 +948,8 @@ TEST(ControlProtocolFullStateTest,
   control::FullDesiredState state;
   state.source_meta_applied_index = 91;
   state.topology_epoch = 23;
+  state.authority_lease_duration_ms = 3'000;
+  state.data_heartbeat_interval_ms = 1'000;
   state.projection_hash = Sha256("semantic projection");
   state.meta_directory.push_back(
       {.server_id = 1, .host = "127.0.0.1", .port = 7400});
@@ -940,7 +964,6 @@ TEST(ControlProtocolFullStateTest,
   group.group_term = 7;
   group.authority_version = 9;
   group.grant_revision = 11;
-  group.grant_duration_ms = 3'000;
   group.grant_active = true;
   group.config_epoch = 13;
   group.members.push_back(
@@ -949,18 +972,12 @@ TEST(ControlProtocolFullStateTest,
   group.manifest_revision = 15;
   group.manifest_digest = Sha256("manifest");
   group.partition_replication_epoch = 19;
-  group.grant_policy_id = "default-grant";
-  group.grant_policy_version = 2;
   state.groups.push_back(std::move(group));
   state.manifests.push_back(
       {.revision = 15,
        .digest = Sha256("manifest"),
        .entries = {{.partition_id = 0, .logical_epoch = 17},
                    {.partition_id = 1, .logical_epoch = 18}}});
-  state.policies.push_back({.policy_id = "default-grant",
-                            .version = 2,
-                            .content_hash = Sha256("policy"),
-                            .content = "policy"});
   state.current_directives.push_back(
       {.basis = {.source_meta_applied_index = 91,
                  .projection_hash = state.projection_hash},
@@ -1039,6 +1056,36 @@ TEST(ControlProtocolFullStateTest,
   EXPECT_NE(*activation_change, original_hash);
 }
 
+TEST(ControlProtocolFullStateTest,
+     RejectsLeaseTimingScalarsThatCannotShareOneCadence) {
+  control::FullDesiredState state = FailoverFullState();
+
+  auto valid = control::EncodeFullDesiredState(state);
+  ASSERT_TRUE(valid.ok()) << valid.status();
+  // Body prefix: version(2), applied index(8), topology epoch(8), lease(4),
+  // then heartbeat(4). Altering the final heartbeat byte must be rejected by
+  // the decoder itself, before accepting any projection hash.
+  (*valid)[25] ^= 0x01;
+  EXPECT_EQ(control::DecodeFullDesiredState(*valid).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  state.authority_lease_duration_ms = 0;
+  EXPECT_EQ(control::EncodeFullDesiredState(state).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  state.authority_lease_duration_ms = 3'000;
+  state.data_heartbeat_interval_ms = 999;
+  EXPECT_EQ(control::EncodeFullDesiredState(state).status().code(),
+            absl::StatusCode::kInvalidArgument);
+
+  state.authority_lease_duration_ms = 2;
+  state.data_heartbeat_interval_ms = 1;
+  auto projection_hash = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(projection_hash.ok()) << projection_hash.status();
+  state.projection_hash = *projection_hash;
+  EXPECT_TRUE(control::EncodeFullDesiredState(state).ok());
+}
+
 TEST(ControlProtocolFullStateTest, RejectsMalformedFailoverState) {
   control::FullDesiredState state = FailoverFullState();
   ASSERT_TRUE(state.groups[0].failover_transition.has_value());
@@ -1081,6 +1128,7 @@ TEST(ControlProtocolFullStateTest, RejectsMalformedFailoverState) {
 
 TEST(ControlProtocolFullStateTest, RoundTripsEmptyTopologyAtEpochZero) {
   control::FullDesiredState state;
+  SetLeaseTiming(&state);
   state.source_meta_applied_index = 1;
   state.topology_epoch = 0;
   auto directives =
@@ -1103,12 +1151,13 @@ TEST(ControlProtocolFullStateTest, RoundTripsEmptyTopologyAtEpochZero) {
 TEST(ControlProtocolFullStateTest,
      ConsumingDecodeReleasesTransferredWireStorage) {
   control::FullDesiredState state;
+  SetLeaseTiming(&state);
   state.source_meta_applied_index = 1;
-  control::WirePolicy policy{.policy_id = "large-enough-to-own-storage",
-                             .version = 1,
-                             .content = std::string(64 * 1024, 'p')};
-  policy.content_hash = Sha256(policy.content);
-  state.policies.push_back(std::move(policy));
+  state.meta_directory.reserve(512);
+  for (std::uint32_t id = 1; id <= 512; ++id) {
+    state.meta_directory.push_back(
+        {.server_id = id, .host = "127.0.0.1", .port = 7400});
+  }
   auto directives =
       control::ComputeDirectiveSetDigest(state.current_directives);
   ASSERT_TRUE(directives.ok()) << directives.status();
@@ -1126,8 +1175,7 @@ TEST(ControlProtocolFullStateTest,
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_TRUE(transfer.empty());
   EXPECT_EQ(transfer.capacity(), empty_capacity);
-  ASSERT_EQ(decoded->policies.size(), 1U);
-  EXPECT_EQ(decoded->policies.front().content.size(), 64U * 1024U);
+  EXPECT_EQ(decoded->meta_directory.size(), 512U);
 
   auto invalid_encoded = control::EncodeFullDesiredState(state);
   ASSERT_TRUE(invalid_encoded.ok()) << invalid_encoded.status();
@@ -1143,6 +1191,7 @@ TEST(ControlProtocolFullStateTest,
 TEST(ControlProtocolFullStateTest,
      FrameSizedProjectionRoundTripsAsTypedMessage) {
   control::FullDesiredState state;
+  SetLeaseTiming(&state);
   state.source_meta_applied_index = 1;
   auto directives =
       control::ComputeDirectiveSetDigest(state.current_directives);
@@ -1180,6 +1229,7 @@ TEST(ControlProtocolFullStateTest,
 TEST(ControlProtocolFullStateTest,
      ProjectionHashExcludesAppliedIndexButCoversSemantics) {
   control::FullDesiredState state;
+  SetLeaseTiming(&state);
   state.source_meta_applied_index = 10;
   state.topology_epoch = 1;
   state.nodes.push_back(
@@ -1210,6 +1260,13 @@ TEST(ControlProtocolFullStateTest,
   auto topology_change = control::ComputeProjectionHash(state);
   ASSERT_TRUE(topology_change.ok());
   EXPECT_NE(*topology_change, *original);
+
+  state.topology_epoch = 1;
+  state.authority_lease_duration_ms = 6'000;
+  state.data_heartbeat_interval_ms = 2'000;
+  auto lease_timing_change = control::ComputeProjectionHash(state);
+  ASSERT_TRUE(lease_timing_change.ok()) << lease_timing_change.status();
+  EXPECT_NE(*lease_timing_change, *original);
 }
 
 TEST(ControlProtocolFullStateTest,
@@ -1369,6 +1426,7 @@ TEST(ControlProtocolFullStateTest,
 
 TEST(ControlProtocolFullStateTest, RoundTripsCommittedGrantlessGroup) {
   control::FullDesiredState state;
+  SetLeaseTiming(&state);
   state.topology_epoch = 1;
   state.groups.push_back(
       {.group_id = "grantless",
@@ -1411,6 +1469,7 @@ TEST(ControlProtocolFullStateTest, RoundTripsCommittedGrantlessGroup) {
 
 TEST(ControlProtocolFullStateTest, RejectsNonCanonicalManifestDocuments) {
   control::FullDesiredState state;
+  SetLeaseTiming(&state);
   state.topology_epoch = 1;
   state.manifests.push_back(
       {.revision = 1,

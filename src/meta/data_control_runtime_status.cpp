@@ -1,6 +1,7 @@
 #include "keylane/meta/data_control_runtime_status.h"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace keylane::meta {
@@ -41,16 +42,30 @@ void ApplyProjection(MetaDataControlRuntimeNode& node,
   node.validated_committed_high_water_ = validated_committed_high_water;
   node.topology_epoch_ = projection.topology_epoch;
   node.projection_hash_ = projection.projection_hash;
+  node.authority_lease_duration_ms_ = projection.authority_lease_duration_ms;
   node.groups_ = ProjectedGroups(node.node_id_, projection);
   // A replacement invalidates observations and a previous lease until a
   // heartbeat under the new projection is successfully acknowledged.
   node.health_.reset();
   node.last_lease_decision_.reset();
   node.health_received_unix_ms_ = 0;
+  node.lease_decision_heartbeat_sequence_ = 0;
   node.lease_decision_written_unix_ms_ = 0;
 }
 
 }  // namespace
+
+MetaLeaderAuthorityEligibilityState AdvanceLeaderAuthorityEligibility(
+    MetaLeaderAuthorityEligibilityState current, bool eligible) noexcept {
+  if (current.eligible_ == eligible) return current;
+  if (current.revision_ == std::numeric_limits<std::uint64_t>::max()) {
+    current.eligible_ = false;
+    return current;
+  }
+  ++current.revision_;
+  current.eligible_ = eligible;
+  return current;
+}
 
 void MetaDataControlRuntimeStatus::BeginLeadership(
     std::uint64_t leadership_generation) {
@@ -60,13 +75,20 @@ void MetaDataControlRuntimeStatus::BeginLeadership(
   observed_nodes_.clear();
   leadership_generation_ = leadership_generation;
   leader_authority_eligible_ = false;
+  leader_authority_eligibility_revision_ = 0;
 }
 
-void MetaDataControlRuntimeStatus::SetLeaderAuthorityEligible(
+bool MetaDataControlRuntimeStatus::SetLeaderAuthorityEligible(
     std::uint64_t leadership_generation, bool eligible) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (leadership_generation_ != leadership_generation) return;
-  leader_authority_eligible_ = eligible;
+  if (leadership_generation_ != leadership_generation) return false;
+  const auto state = AdvanceLeaderAuthorityEligibility(
+      {.eligible_ = leader_authority_eligible_,
+       .revision_ = leader_authority_eligibility_revision_},
+      eligible);
+  leader_authority_eligible_ = state.eligible_;
+  leader_authority_eligibility_revision_ = state.revision_;
+  return state.eligible_;
 }
 
 void MetaDataControlRuntimeStatus::EndLeadership(
@@ -78,6 +100,7 @@ void MetaDataControlRuntimeStatus::EndLeadership(
   observed_nodes_.clear();
   leadership_generation_ = 0;
   leader_authority_eligible_ = false;
+  leader_authority_eligibility_revision_ = 0;
 }
 
 void MetaDataControlRuntimeStatus::NoteUnregisteredRetry(
@@ -88,8 +111,7 @@ void MetaDataControlRuntimeStatus::NoteUnregisteredRetry(
     return;
   }
   if (!unregistered_retries_.contains(node_id) &&
-      unregistered_retries_.size() >=
-          cluster::control::kMaxProjectedNodes) {
+      unregistered_retries_.size() >= cluster::control::kMaxProjectedNodes) {
     return;
   }
   unregistered_retries_[std::move(node_id)] = leadership_generation;
@@ -149,12 +171,14 @@ void MetaDataControlRuntimeStatus::RecordHealth(
 
 void MetaDataControlRuntimeStatus::RecordLeaseDecisionWritten(
     std::string_view node_id, const cluster::control::WireId128& session_id,
+    std::uint64_t heartbeat_sequence,
     const cluster::control::LeaseDecision& written_decision,
     std::int64_t written_unix_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto found = nodes_.find(std::string(node_id));
   if (found == nodes_.end() || found->second.session_id_ != session_id) return;
   found->second.last_lease_decision_ = written_decision;
+  found->second.lease_decision_heartbeat_sequence_ = heartbeat_sequence;
   found->second.lease_decision_written_unix_ms_ = written_unix_ms;
 }
 
@@ -174,6 +198,8 @@ MetaDataControlRuntimeSnapshot MetaDataControlRuntimeStatus::Snapshot() const {
   MetaDataControlRuntimeSnapshot snapshot;
   snapshot.leadership_generation_ = leadership_generation_;
   snapshot.leader_authority_eligible_ = leader_authority_eligible_;
+  snapshot.leader_authority_eligibility_revision_ =
+      leader_authority_eligibility_revision_;
   snapshot.nodes_.reserve(nodes_.size());
   for (const auto& [id, node] : nodes_) snapshot.nodes_.push_back(node);
   snapshot.unregistered_retries_.reserve(unregistered_retries_.size());
@@ -189,7 +215,9 @@ MetaDataControlLeadershipState MetaDataControlRuntimeStatus::LeadershipState()
     const {
   std::lock_guard<std::mutex> lock(mutex_);
   return {.leadership_generation_ = leadership_generation_,
-          .leader_authority_eligible_ = leader_authority_eligible_};
+          .leader_authority_eligible_ = leader_authority_eligible_,
+          .leader_authority_eligibility_revision_ =
+              leader_authority_eligibility_revision_};
 }
 
 }  // namespace keylane::meta

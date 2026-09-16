@@ -62,7 +62,6 @@ struct ProposalFixture {
   MetaBootIncarnation candidate_boot = Bytes<20>(0x32);
   MetaBootIncarnation alternate_boot = Bytes<20>(0x33);
   MetaReplicationHistoryId source_history = Bytes<20>(0x41);
-  MetaGrantSpec grant{5'000, "failover-policy", 0};
   MetaOperationId operation_id = Bytes<16>(0x51);
   std::uint64_t next_index = 1;
   std::uint8_t next_id = 0x80;
@@ -70,6 +69,13 @@ struct ProposalFixture {
   ProposalFixture() {
     const MetaOperationId root = Bytes<16>(0x01);
     EXPECT_TRUE(stores.topology_.BeginClusterCreate(root, 1).ok());
+    PutPolicy automatic;
+    automatic.request_id_ = Bytes<16>(0x0f);
+    automatic.policy_id_ = std::string(kAutomaticUncontrolledFailoverPolicyId);
+    automatic.version_ = 1;
+    automatic.content_ =
+        R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+    EXPECT_TRUE(stores.policy_.Apply(automatic).ok());
     EXPECT_TRUE(stores.topology_.CompleteClusterCreate(root).ok());
     Register(owner, MetaNodeRole::kPrimary, 6379, 0x02);
     Register(candidate, MetaNodeRole::kReplica, 6380, 0x03);
@@ -102,10 +108,9 @@ struct ProposalFixture {
 
     PutPolicy policy;
     policy.request_id_ = Bytes<16>(0x07);
-    policy.policy_id_ = grant.policy_id_;
-    policy.version_ = grant.policy_version_;
-    policy.content_ = R"({"lease_ms":5000})";
-    policy.content_hash_ = MetaPolicyStore::ContentHash(policy.content_);
+    policy.policy_id_ = std::string(kAuthorityLeasePolicyId);
+    policy.version_ = 1;
+    policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
     Apply(policy);
 
     BeginGroupTerm begin_term;
@@ -120,7 +125,6 @@ struct ProposalFixture {
     activate.group_id_ = "g1";
     activate.expected_term_ = 1;
     activate.new_owner_ = owner;
-    activate.grant_ = grant;
     activate.new_authority_version_ = 1;
     activate.new_topology_epoch_ = 4;
     activate.new_config_epoch_ = 1;
@@ -287,7 +291,6 @@ struct ProposalFixture {
     begin.group_id_ = "g1";
     begin.transition_id_ = Bytes<16>(0x54);
     begin.target_term_ = group->record_.group_term_ + 1;
-    begin.successor_grant_ = grant_state->grant_->spec_;
     if (with_candidate) {
       begin.candidate_action_ = MetaFailoverCandidateAction{
           .action_id_ = Bytes<16>(0x55),
@@ -458,13 +461,6 @@ TEST(MetaFailoverValidationTest, AcceptsOnlyCanonicalRequestOnlySubmit) {
   history_bound.replication_history_id_ = Bytes<20>(7);
   EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
                 MetaCommand(history_bound), MetaCommittedView(stores, 0),
-                observations, 1'000)),
-            MetaFailureClass::kDomainReject);
-
-  SubmitOperation policy_bound = submit;
-  policy_bound.policy_references_.push_back({"policy", 1});
-  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
-                MetaCommand(policy_bound), MetaCommittedView(stores, 0),
                 observations, 1'000)),
             MetaFailureClass::kDomainReject);
 }

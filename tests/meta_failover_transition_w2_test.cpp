@@ -98,7 +98,6 @@ struct Fixture {
       Filled<meta::kMetaBootIncarnationBytes>(0x32);
   meta::MetaReplicationHistoryId source_history =
       Filled<meta::kMetaReplicationHistoryIdBytes>(0x33);
-  meta::MetaGrantSpec successor_grant{5000, "failover-policy", 0};
   meta::MetaOperationId operation_id = Filled<16>(0x41);
   meta::MetaFailoverTransitionId transition_id = Filled<16>(0x42);
   std::uint64_t absolute_deadline_unix_ms = 2'000'000'000'000ULL;
@@ -163,6 +162,22 @@ std::unique_ptr<Fixture> MakeFixture() {
   const meta::SubmitOperation root = ClusterCreateRoot();
   AcceptFresh(fixture, meta::MetaCommand{root});
 
+  meta::PutPolicy automatic;
+  automatic.request_id_ = Filled<16>(0x0f);
+  automatic.policy_id_ =
+      std::string(meta::kAutomaticUncontrolledFailoverPolicyId);
+  automatic.version_ = 1;
+  automatic.content_ =
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+  EXPECT_TRUE(fixture.stores.policy_.Apply(automatic).ok());
+
+  meta::PutPolicy authority;
+  authority.request_id_ = Filled<16>(0x09);
+  authority.policy_id_ = std::string(meta::kAuthorityLeasePolicyId);
+  authority.version_ = 1;
+  authority.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
+  EXPECT_TRUE(fixture.stores.policy_.Apply(authority).ok());
+
   meta::CompleteOperation complete;
   complete.request_id_ = Filled<16>(0x03);
   complete.operation_id_ = root.operation_id_;
@@ -203,10 +218,9 @@ std::unique_ptr<Fixture> MakeFixture() {
 
   meta::PutPolicy policy;
   policy.request_id_ = Filled<16>(0x09);
-  policy.policy_id_ = fixture.successor_grant.policy_id_;
-  policy.version_ = fixture.successor_grant.policy_version_;
-  policy.content_ = R"({"lease_ms":5000})";
-  policy.content_hash_ = meta::MetaPolicyStore::ContentHash(policy.content_);
+  policy.policy_id_ = std::string(meta::kAuthorityLeasePolicyId);
+  policy.version_ = 1;
+  policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
   AcceptFresh(fixture, meta::MetaCommand{policy});
 
   meta::BeginGroupTerm begin_term;
@@ -221,7 +235,6 @@ std::unique_ptr<Fixture> MakeFixture() {
   activate.group_id_ = "g1";
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.owner;
-  activate.grant_ = fixture.successor_grant;
   activate.new_authority_version_ = 1;
   activate.new_topology_epoch_ = 4;
   activate.new_config_epoch_ = 1;
@@ -284,7 +297,6 @@ meta::BeginControlledFailover MakeBeginControlled(const Fixture& fixture) {
   begin.group_id_ = "g1";
   begin.transition_id_ = fixture.transition_id;
   begin.target_term_ = 2;
-  begin.successor_grant_ = fixture.successor_grant;
   begin.candidate_action_ = CandidateAction(fixture, 0x44);
   begin.operation_id_ = fixture.operation_id;
   begin.expected_operation_revision_ = 0;
@@ -300,7 +312,6 @@ meta::BeginUncontrolledFailover MakeBeginUncontrolled(
   begin.group_id_ = "g1";
   begin.transition_id_ = fixture.transition_id;
   begin.target_term_ = 2;
-  begin.successor_grant_ = fixture.successor_grant;
   if (include_candidate) {
     begin.candidate_action_ = CandidateAction(fixture, 0x46);
   }
@@ -364,7 +375,6 @@ meta::CommitControlledFailover MakeCommitControlled(
   commit.action_id_ = action.action_id_;
   commit.authorized_revision_ = authorized_revision;
   commit.expected_candidate_ = action.candidate_;
-  commit.successor_grant_ = fixture.successor_grant;
   SetGroupAnchors(commit, fixture, 1);
   commit.new_authority_version_ = 2;
   commit.new_topology_epoch_ = 5;
@@ -385,7 +395,6 @@ meta::CommitUncontrolledFailover MakeCommitUncontrolled(
   commit.authorized_revision_ = authorized_revision;
   commit.loss_if_cutover_ = loss;
   commit.expected_candidate_ = action.candidate_;
-  commit.successor_grant_ = fixture.successor_grant;
   SetGroupAnchors(commit, fixture, 2);
   commit.new_authority_version_ = 2;
   commit.new_topology_epoch_ = 5;
@@ -410,7 +419,6 @@ void ExpectAuthorityUnchanged(const Fixture& fixture) {
   EXPECT_EQ(state->last_authority_version_, 1u);
   EXPECT_EQ(state->last_grant_revision_, 10u);
   EXPECT_EQ(state->grant_->owner_, fixture.owner);
-  EXPECT_EQ(state->grant_->spec_, fixture.successor_grant);
   EXPECT_FALSE(state->grant_->activation_action_id_.has_value());
 }
 
@@ -436,7 +444,6 @@ void ExpectCutover(const Fixture& fixture, std::uint64_t commit_index,
   EXPECT_EQ(state->grant_->term_, 2u);
   EXPECT_EQ(state->grant_->authority_version_, 2u);
   EXPECT_EQ(state->grant_->grant_revision_, commit_index);
-  EXPECT_EQ(state->grant_->spec_, fixture.successor_grant);
   ASSERT_TRUE(state->grant_->activation_action_id_.has_value());
   EXPECT_EQ(*state->grant_->activation_action_id_, action_id);
 }
@@ -459,7 +466,6 @@ TEST(MetaFailoverTransitionW2,
   EXPECT_EQ(transition.revision_, begin_index);
   EXPECT_EQ(transition.mode_, meta::MetaFailoverMode::kControlled);
   EXPECT_EQ(transition.target_term_, 2u);
-  EXPECT_EQ(transition.successor_grant_, fixture.successor_grant);
   ASSERT_TRUE(transition.candidate_action_.has_value());
   EXPECT_EQ(*transition.candidate_action_, begin.candidate_action_);
   ASSERT_TRUE(transition.controlled_.has_value());

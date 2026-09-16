@@ -183,22 +183,49 @@ native session, aborts partial storage, and retires the proof before
 `FullStateApplied`. Control-session loss performs the same barrier for an
 in-progress attempt but retains an already completed matching `ReadyToken`, so
 a transient reconnect does not itself force a full rebuild.
+An ordinary steady FollowOwner FULL has no rebuild directive. Its exact live
+follow relationship, replica session, and rebuild context instead own the
+attempt; a forward term-only authority fence preserves that copy while group,
+assignment, immutable manifest, and partition replication epoch are unchanged.
+Replacing the Owner or any of those population anchors still cancels and joins
+the old ingress before another source can start.
 `AuthorizeClusterRebuildSource()` plus its revocation method control exact
 downstream export capabilities. `MetaControlClientService` receives and
 normalizes the wire directive, but only `NodeControlInstaller` may call this
-boundary after matching it to the installed projection and authority. A live
-FDS replacement, transient control-session refresh, or finite-lease expiry
-clears new export admission but may quarantine an already-ONLINE population
-session while write authority is closed. That session survives only while the
-replacement FDS proves the complete committed Group/member/population identity
-unchanged; fence, membership/population change, readiness loss, or storage loss
-uses the stronger join-and-revoke barrier. This lets a completed initialization
-operation retire its one-shot directives without interrupting the continuous
-replication session it established. Until a valid directive completes, a
-Meta-managed process remains LOADING. `PING` and the management/diagnostic
-surfaces needed to observe the process remain available, but recovered keyspace
-is not made readable or writable merely because storage initialization
-succeeded.
+boundary after matching it to the installed projection and authority. The
+capability ledger and finite-lease admission gate are separate. Installing an
+Owner lease opens new `POPULATION` handshakes only until that lease's absolute
+`CLOCK_BOOTTIME` deadline and only after request authority itself is installed.
+The native handler checks both the exact current capability and `now < deadline`
+under the same source mutex that publishes the session, so a late timer cannot
+admit work after expiry.
+
+Lease expiry closes only new admission. It retains current FDS capabilities and
+every population session already published across the mutex boundary, including
+a session that has not reached ONLINE; a later exact lease renewal reopens the
+gate in O(1). A live FDS replacement clears and replays capabilities while an
+unchanged, unexpired gate may remain open. The authenticated FDS supplies the
+number of local `authorize-source` capabilities its directive lane must replay.
+That pending count and every installed capability reserve the current source
+history; a source-valid handshake during the bounded replay gap is denied data
+with `KLLEASESUSPENDED` and uses the target's finite retry path. Each newly
+installed capability consumes one replay slot. An FDS with no such directive,
+or a strong revoke, drops the reservation. When the replacement proves the
+complete source/member/population scope unchanged, every already-published
+matching population session survives, including a session between
+`KLFULLRESYNC` admission and ONLINE. Control-session replacement instead closes
+the gate, carries the outstanding replay count into the replacement session,
+and may preserve only an exact already-ONLINE export while its identity is
+revalidated. Fence, committed revocation, membership/population change,
+readiness loss, or storage loss uses the stronger join-and-revoke barrier. This
+lets ordinary lease and projection convergence avoid aborting destructive
+population work without allowing a new source session to start
+outside finite authority. It also lets a completed initialization operation
+retire its one-shot directives without interrupting the continuous replication
+session it established. Until a valid directive completes, a Meta-managed
+process remains LOADING. `PING` and the management/diagnostic surfaces needed
+to observe the process remain available, but recovered keyspace is not made
+readable or writable merely because storage initialization succeeded.
 
 Population readiness itself remains boot-local and is never projected by Meta.
 A replacement FDS therefore treats its local `population_ready=false` value as
@@ -357,6 +384,16 @@ cancellation/join, proof invalidation, or abort enters a group-identity-bound
 current-boot failure latch: the process remains LOADING and accepts no later
 attempt until restart.
 
+Meta control-session replacement cancels an in-progress population directive
+because that session owned its terminal result channel. It preserves an exact
+active steady `FollowOwner` FULL, which is level-triggered by the installed FDS
+rather than a session-scoped directive. The FULL itself rotates the target's
+local replication history and therefore forces the Meta client to reconnect;
+cancelling the FDS relationship at that boundary would make a slow follower
+rebuild cancel itself. A later FDS owner, assignment, manifest, or partition
+epoch replacement still cancels and joins the attempt, and process shutdown
+never preserves it.
+
 First population follows the same destructive boundary without inventing a
 source. The accepted identity binds the current target replication history and
 requires zero flows and no safe-source assertion. The manager durably
@@ -436,7 +473,13 @@ returns its current boot identity and
 accepts the session only when that identity exactly matches its current ready
 population, an installed source authorization, and the connecting target node.
 A Meta-managed source rejects an anonymous or standalone native export and
-accepts only an exactly authorized `POPULATION` handshake.
+accepts only an exactly authorized `POPULATION` handshake inside its current
+finite-lease deadline. An exact authorization presented while that admission
+gate is closed receives the dedicated `KLLEASESUSPENDED` response before any
+target mutation. The target retries only that response, only while the same
+immutable rebuild context has no flow and has not crossed its destructive-root
+boundary, at one-second intervals for at most three retries; all other protocol
+or transport failures remain terminal for the attempt.
 
 The steady-state source path is:
 
@@ -510,11 +553,12 @@ session records the next LSN after its highest completely written socket batch
 on every flow; this is a conservative upper bound even when the final ACK is
 lost. Once one flow's floor advances beyond that upper bound, the all-flow
 native session can no longer continue. After every disconnected native replica
-reaches that state and no native session or Redis exporter is active, the
-manager closes and drains command admission, rechecks that the source is still
-idle, rotates the history ID, and disables all worker logs. Draining preserves
-events and fences already reserved by admitted commands. A later downstream
-must full-sync and re-enables a fresh history before its snapshot cut.
+reaches that state and no native session, Redis exporter, installed population
+capability, or FDS replay reservation is active, the manager closes and drains
+command admission, rechecks that the source is still idle, rotates the history
+ID, and disables all worker logs. Draining preserves events and fences already
+reserved by admitted commands. A later downstream must full-sync and re-enables
+a fresh history before its snapshot cut.
 
 A connected native downstream advertises its first unacknowledged LSN as a
 coverage claim. By default, the publisher waits at the hard backlog limit until

@@ -264,30 +264,31 @@ class SessionIo {
  public:
   SessionIo(celer::Worker& worker, celer::Connection* connection,
             celer::TcpStream& stream, std::size_t queue_bytes,
-            std::chrono::milliseconds progress_timeout)
+            std::chrono::milliseconds progress_timeout,
+            std::chrono::milliseconds established_read_timeout)
       : worker_(worker),
         connection_(connection),
-        progress_timeout_(progress_timeout),
+        established_read_timeout_(established_read_timeout),
         frames_(stream, progress_timeout),
         writer_(frames_, queue_bytes),
         read_deadline_(worker, [&worker, connection] {
           worker.BeginClose(connection,
                             absl::DeadlineExceededError(
-                                "control session read progress timed out"),
+                                "control session read idle/progress timed out"),
                             celer::CloseMode::kIdleTimeout);
         }) {}
 
   absl::Status Prepare() noexcept { return frames_.Prepare(); }
 
   celer::Task<absl::StatusOr<control::WireMessage>> Read() {
-    if (absl::Status armed = read_deadline_.Arm(progress_timeout_);
+    if (absl::Status armed = read_deadline_.Arm(established_read_timeout_);
         !armed.ok()) {
       co_return armed;
     }
     auto message = co_await frames_.ReadMessage();
     if (read_deadline_.Disarm()) {
       co_return absl::DeadlineExceededError(
-          "control session read progress timed out");
+          "control session read idle/progress timed out");
     }
     co_return message;
   }
@@ -326,7 +327,9 @@ class SessionIo {
  private:
   celer::Worker& worker_;
   celer::Connection* connection_;
-  const std::chrono::milliseconds progress_timeout_;
+  // Covers the permitted heartbeat-idle interval plus one complete fixed I/O
+  // progress budget. The frame stream retains its separate fixed write budget.
+  const std::chrono::milliseconds established_read_timeout_;
   control::ControlFrameStream frames_;
   control::ControlSessionWriter writer_;
   control::ControlDeadlineWatchdog read_deadline_;
@@ -670,6 +673,18 @@ detail::MetaPublisherTransferDisposition detail::ClassifyPublisherSupersession(
              : MetaPublisherTransferDisposition::kRetryBeforeApplyInSession;
 }
 
+void detail::MetaPublisherAdoptionGate::ObserveAppliedReceipt() noexcept {
+  pending_ = true;
+}
+
+void detail::MetaPublisherAdoptionGate::MarkProjectionAdopted() noexcept {
+  pending_ = false;
+}
+
+bool detail::MetaPublisherAdoptionGate::pending() const noexcept {
+  return pending_;
+}
+
 absl::StatusOr<std::optional<MetaObservedFailoverProjection>>
 detail::FailoverProjectionForHeartbeat(
     const control::FullDesiredState& installed, std::string_view node_id,
@@ -708,6 +723,99 @@ detail::FailoverProjectionForHeartbeat(
   return result;
 }
 
+absl::StatusOr<std::optional<MetaObservedOwnerProjection>>
+detail::OwnerProjectionForHeartbeat(const control::FullDesiredState& installed,
+                                    std::string_view node_id) {
+  std::optional<MetaObservedOwnerProjection> result;
+  for (const control::WireDesiredGroup& group : installed.groups) {
+    if (!group.owner_node_id.has_value() || *group.owner_node_id != node_id) {
+      continue;
+    }
+    if (!group.owner_assignment_id.has_value()) {
+      return absl::FailedPreconditionError(
+          "installed Owner is missing its assignment identity");
+    }
+    if (result.has_value()) {
+      return absl::FailedPreconditionError(
+          "installed FDS binds one Data node as Owner of multiple Groups");
+    }
+    result = MetaObservedOwnerProjection{
+        .group_id_ = group.group_id,
+        .owner_node_id_ = *group.owner_node_id,
+        .owner_assignment_id_ = *group.owner_assignment_id,
+        .group_term_ = group.group_term,
+        .authority_version_ = group.authority_version,
+        .grant_revision_ = group.grant_revision,
+        .projection_hash_ = installed.projection_hash,
+        .authority_lease_duration_ms_ = installed.authority_lease_duration_ms,
+    };
+  }
+  return result;
+}
+
+std::optional<MetaCausallyConfirmedLease> detail::ConfirmedLeaseForHeartbeat(
+    const std::optional<control::HeartbeatAck>& previous_ack,
+    std::uint64_t heartbeat_sequence, std::string_view authenticated_boot_id,
+    const std::optional<MetaObservedOwnerProjection>& owner_projection) {
+  if (!previous_ack.has_value() || !owner_projection.has_value() ||
+      heartbeat_sequence <= previous_ack->heartbeat_sequence) {
+    return std::nullopt;
+  }
+  const auto* granted =
+      std::get_if<control::LeaseGranted>(&previous_ack->lease_decision);
+  if (granted == nullptr || granted->granted_duration_ms == 0 ||
+      granted->data_boot_id != authenticated_boot_id ||
+      granted->projection_hash != owner_projection->projection_hash_ ||
+      granted->group_id != owner_projection->group_id_ ||
+      granted->assignment_id != owner_projection->owner_assignment_id_ ||
+      granted->group_term != owner_projection->group_term_ ||
+      granted->authority_version != owner_projection->authority_version_ ||
+      granted->grant_revision != owner_projection->grant_revision_) {
+    return std::nullopt;
+  }
+  if (granted->granted_duration_ms !=
+      owner_projection->authority_lease_duration_ms_) {
+    return std::nullopt;
+  }
+  return MetaCausallyConfirmedLease{
+      .projection_ = *owner_projection,
+      .acknowledged_heartbeat_sequence_ = previous_ack->heartbeat_sequence,
+      .granted_duration_ms_ = granted->granted_duration_ms,
+  };
+}
+
+absl::Status detail::ApplyLeadershipValidityLimit(
+    NodeControlBatch& batch, std::uint32_t leadership_validity_ms) {
+  if (leadership_validity_ms == 0 ||
+      batch.full_state.authority_lease_duration_ms == 0) {
+    return absl::FailedPreconditionError(
+        "authority lease and leadership-validity durations must be nonzero");
+  }
+  control::FullDesiredState& state = batch.full_state;
+  state.authority_lease_duration_ms =
+      std::min(state.authority_lease_duration_ms, leadership_validity_ms);
+  state.data_heartbeat_interval_ms =
+      std::max<std::uint32_t>(1, state.authority_lease_duration_ms / 3);
+
+  auto projection_hash = control::ComputeProjectionHash(state);
+  if (!projection_hash.ok()) return projection_hash.status();
+  state.projection_hash = *projection_hash;
+  for (control::WireProjectedDirective& directive : state.current_directives) {
+    directive.basis.source_meta_applied_index = state.source_meta_applied_index;
+    directive.basis.projection_hash = state.projection_hash;
+  }
+  // The object hash authenticates the exact encoded object and therefore
+  // becomes stale whenever the process-local lease ceiling changes the
+  // projection. Encode accepts an empty hash while rebuilding it, but rejects
+  // a nonzero stale hash as an inconsistent caller assertion.
+  state.object_hash = {};
+  auto encoded = control::EncodeFullDesiredState(state);
+  if (!encoded.ok()) return encoded.status();
+  state.object_hash = control::ComputeSha256(*encoded);
+  batch.encoded_full_state = std::move(*encoded);
+  return absl::OkStatus();
+}
+
 MetaHeartbeatObservationResult IngestHeartbeatObservations(
     MetaObservationStore& observations, const MetaCommittedFacts& facts,
     std::string_view node_id, const MetaBootIncarnation& boot,
@@ -742,6 +850,24 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
     const std::optional<control::FailoverObservation>& failover_observation,
     std::optional<MetaObservedFailoverProjection> failover_projection,
     std::int64_t now_unix_ms) {
+  return IngestHeartbeatObservations(
+      observations, facts, node_id, boot, session_history, generation, health,
+      role_information, failover_observation, std::move(failover_projection),
+      std::nullopt, 0, std::nullopt, now_unix_ms, /*now_steady_ms=*/0);
+}
+
+MetaHeartbeatObservationResult IngestHeartbeatObservations(
+    MetaObservationStore& observations, const MetaCommittedFacts& facts,
+    std::string_view node_id, const MetaBootIncarnation& boot,
+    const MetaReplicationHistoryId& session_history, std::uint64_t generation,
+    const control::HeartbeatHealth& health,
+    const control::HeartbeatRoleInformation& role_information,
+    const std::optional<control::FailoverObservation>& failover_observation,
+    std::optional<MetaObservedFailoverProjection> failover_projection,
+    std::optional<MetaObservedOwnerProjection> owner_projection,
+    std::uint64_t heartbeat_sequence,
+    std::optional<MetaCausallyConfirmedLease> confirmed_lease,
+    std::int64_t now_unix_ms, std::uint64_t now_steady_ms) {
   (void)observations.MaybeSweepExpired(now_unix_ms);
   const MetaObservationIdentity identity{std::string(node_id), boot,
                                          generation};
@@ -756,17 +882,15 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
     result.detail.append(status.message());
   };
 
-  std::string health_text = absl::StrCat(
-      "storage_ready=", health.storage_ready ? 1 : 0,
-      ",population_ready=", health.population_ready ? 1 : 0,
-      ",draining=", health.draining ? 1 : 0,
-      ",active_groups=", health.active_groups, ",summary=", health.summary);
   MetaNodeHealthObs health_observation{
       .storage_ready_ = health.storage_ready,
       .population_ready_ = health.population_ready,
       .draining_ = health.draining,
       .active_groups_ = health.active_groups,
-      .health_ = std::move(health_text),
+      // The typed fields already carry machine-readable health. Retain only
+      // Data's bounded diagnostic text here so a legal maximum-size summary
+      // cannot exceed the observation field cap through an internal prefix.
+      .health_ = health.summary,
   };
 
   std::optional<MetaCandidateProgressObs> candidate_observation;
@@ -899,11 +1023,12 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
         *failover_observation);
   }
   MetaObservationStore::HeartbeatReplaceResult replaced =
-      observations.ReplaceHeartbeat(identity, std::move(health_observation),
-                                    std::move(candidate_observation),
-                                    std::move(failover_observation_value),
-                                    std::move(failover_projection), facts,
-                                    now_unix_ms);
+      observations.ReplaceHeartbeat(
+          identity, std::move(health_observation),
+          std::move(candidate_observation),
+          std::move(failover_observation_value), std::move(failover_projection),
+          std::move(owner_projection), heartbeat_sequence,
+          std::move(confirmed_lease), facts, now_unix_ms, now_steady_ms);
   if (!replaced.boot_status_.ok()) {
     record_rejection("boot", replaced.boot_status_);
   }
@@ -1158,7 +1283,6 @@ BuildCommittedMetaDirectory(const MetaCommittedView& view) {
       .session_generation = 0,
       .leader_id = 1,
       .directory = std::move(directory),
-      .heartbeat_interval_ms = 1,
       .observation_ttl_ms = 1,
       .session_progress_timeout_ms = 1,
   };
@@ -1207,7 +1331,8 @@ control::LeaseDecision EvaluateLeaseChallenge(
                                 control::LeaseDenialReason::kAuthorityMismatch,
                                 current_hash};
   }
-  if (!group->grant_active || group->grant_duration_ms == 0) {
+  if (!group->grant_active ||
+      evaluation.desired_->authority_lease_duration_ms == 0) {
     return control::LeaseDenied{challenge->nonce,
                                 control::LeaseDenialReason::kGrantInactive,
                                 current_hash};
@@ -1218,7 +1343,8 @@ control::LeaseDecision EvaluateLeaseChallenge(
                                 current_hash};
   }
   const std::uint32_t duration =
-      std::min(group->grant_duration_ms, evaluation.leadership_validity_ms_);
+      std::min(evaluation.desired_->authority_lease_duration_ms,
+               evaluation.leadership_validity_ms_);
   if (duration == 0) {
     return control::LeaseDenied{
         challenge->nonce, control::LeaseDenialReason::kNotLeader, current_hash};
@@ -1290,6 +1416,36 @@ control::LeaseDecision MetaLeaseHandoffGuard::Enforce(
         .reason = control::LeaseDenialReason::kAuthorityHandoffPending,
         .current_projection_hash = grant->projection_hash,
     };
+  }
+  return decision;
+}
+
+control::LeaseDecision MetaLeaseHandoffGuard::Enforce(
+    control::LeaseDecision decision,
+    const std::optional<control::LeaseChallenge>& challenge,
+    const MetaLeaseEvaluation& evaluation, std::int64_t now_lease_clock_ms) {
+  const auto* denied = std::get_if<control::LeaseDenied>(&decision);
+  if (denied == nullptr ||
+      denied->reason != control::LeaseDenialReason::kNodeNotReady) {
+    return Enforce(std::move(decision), evaluation.node_id_,
+                   now_lease_clock_ms);
+  }
+
+  const control::HeartbeatHealth serviceable{
+      .storage_ready = true,
+      .population_ready = true,
+      .draining = false,
+      .active_groups = 0,
+      .summary = {},
+  };
+  control::LeaseDecision candidate =
+      EvaluateLeaseChallenge(challenge, serviceable, evaluation);
+  control::LeaseDecision guarded =
+      Enforce(std::move(candidate), evaluation.node_id_, now_lease_clock_ms);
+  const auto* handoff = std::get_if<control::LeaseDenied>(&guarded);
+  if (handoff != nullptr &&
+      handoff->reason == control::LeaseDenialReason::kAuthorityHandoffPending) {
+    return guarded;
   }
   return decision;
 }
@@ -1465,6 +1621,7 @@ struct LiveSessionState {
   std::unique_ptr<control::ControlDeadlineWatchdog> inbound_transfer_deadline_;
   bool fence_received_ = false;
   bool applied_received_ = false;
+  detail::MetaPublisherAdoptionGate publisher_adoption_gate_;
   celer::AsyncNotification response_changed_;
 
   std::optional<absl::Status> terminal_error_;
@@ -1611,10 +1768,10 @@ void CloseConnectionNow(celer::Worker& worker, celer::Connection* connection,
 
 bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
                               std::uint64_t generation) {
-  if (!StillLeader(core, generation) || !core.server_->is_leader_alive()) {
-    core.options_.runtime_status_->SetLeaderAuthorityEligible(generation,
-                                                              false);
-    return false;
+  if (!StillLeader(core, generation) || !core.leader_ready_for_data_ ||
+      !core.server_->is_leader_alive()) {
+    return core.options_.runtime_status_->SetLeaderAuthorityEligible(generation,
+                                                                     false);
   }
   const MetaLeaderRuntimeDisposition runtime =
       core.leader_runtime_guard_->Observe(cluster::LeaseClockMillis(),
@@ -1645,9 +1802,11 @@ bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
     }
   }
   const bool eligible = runtime == MetaLeaderRuntimeDisposition::kEligible;
-  core.options_.runtime_status_->SetLeaderAuthorityEligible(generation,
-                                                            eligible);
-  return eligible;
+  // Runtime status owns generation matching and fail-closed revision
+  // saturation, so authorization must use the effective stored result rather
+  // than the guard's requested value.
+  return core.options_.runtime_status_->SetLeaderAuthorityEligible(generation,
+                                                                   eligible);
 }
 
 struct BudgetedNodeControlBatch final : NodeControlBatch {
@@ -1673,6 +1832,11 @@ absl::StatusOr<BudgetedNodeControlBatch> ProjectNodeBounded(
   }
   auto projected = MetaControlProjector::ProjectNode(view, node_id);
   if (!projected.ok()) return projected.status();
+  if (absl::Status resolved = detail::ApplyLeadershipValidityLimit(
+          *projected, core.options_.leadership_validity_ms_);
+      !resolved.ok()) {
+    return resolved;
+  }
   if (absl::Status charged =
           permit->Resize(NodeControlBatchRetainedBytes(*projected));
       !charged.ok()) {
@@ -1792,7 +1956,7 @@ bool ActiveClusterCreateDeclaresNode(const MetaCommittedView& view,
 
 celer::Task<absl::Status> ReconcileLocalMetaMember(
     std::shared_ptr<MetaDataControlServer::Core> core,
-    MetaLeaderContext& context, std::uint64_t generation) {
+    std::uint64_t generation) {
   struct CompletionGuard {
     std::shared_ptr<MetaDataControlServer::Core> core_;
     std::uint64_t generation_;
@@ -1808,24 +1972,30 @@ celer::Task<absl::Status> ReconcileLocalMetaMember(
       // Membership reconciliation owns every BindMetaMember effect. The Data
       // publisher only opens after the complete config descriptor and
       // committed identity directory agree, including remote endpoints.
-      status = ValidateCommittedConfigBindings(config, context.CommittedView());
+      auto view =
+          CommittedViewAtLeast(*core, core->coordinator_->CommittedHighWater());
+      status = view.ok() ? ValidateCommittedConfigBindings(config, **view)
+                         : view.status();
     }
 
     if (status.ok()) {
       if (StillLeader(*core, generation)) {
-        // Membership reconciliation completes once per leader generation.
-        // A temporary quorum loss or suspend quarantine must not prevent this
-        // latch from opening: each Hello still rechecks live authority, which
-        // can recover without another membership reconciliation task.
+        // Membership validity opens the Data listener, but this leader-scoped
+        // task deliberately remains alive. An absent Owner produces no session
+        // traffic, so Hello/heartbeat checks alone cannot keep the automatic
+        // failover detector's authority bracket current across quorum loss or
+        // host suspend.
         core->leader_ready_for_data_ = true;
-        // NuRaft can announce leadership before its live-leader flag becomes
-        // true. Keep retrying until the observational bracket is initialized;
-        // a cluster with no Data sessions has no Hello/heartbeat to refresh it.
-        if (AuthoritySessionsAllowed(*core, generation)) {
-          co_return absl::OkStatus();
-        }
+        (void)AuthoritySessionsAllowed(*core, generation);
       }
     } else {
+      // A config/identity disagreement after an earlier valid cut revokes the
+      // same generation immediately. Session-side probes also consult
+      // leader_ready_for_data_, so they cannot race this failure by restoring
+      // eligibility from Raft liveness alone.
+      core->leader_ready_for_data_ = false;
+      core->options_.runtime_status_->SetLeaderAuthorityEligible(generation,
+                                                                 false);
       spdlog::warn("data-control leader membership reconciliation: {}",
                    status.message());
     }
@@ -1881,7 +2051,6 @@ control::ServerHello BuildServerHello(
       .session_generation = session_generation,
       .leader_id = leader_id,
       .directory = std::move(directory),
-      .heartbeat_interval_ms = core.options_.heartbeat_interval_ms_,
       .observation_ttl_ms = core.options_.observation_ttl_ms_,
       .session_progress_timeout_ms = core.options_.session_progress_timeout_ms_,
   };
@@ -2031,6 +2200,7 @@ absl::StatusOr<bool> HandlePublisherResponse(
     }
     (void)state->applied_ack_deadline_->Disarm();
     state->applied_received_ = true;
+    state->publisher_adoption_gate_.ObserveAppliedReceipt();
     state->response_changed_.NotifyAll(*state->worker_);
     return true;
   }
@@ -2475,6 +2645,8 @@ celer::Task<absl::Status> SessionPublisherBody(
     }
     state->core_->full_states_sent_.fetch_add(1, std::memory_order_relaxed);
     state->installed_ = RetainProjection(std::move(*latest));
+    state->publisher_adoption_gate_.MarkProjectionAdopted();
+    state->response_changed_.NotifyAll(*state->worker_);
     // The live installation now owns the replacement. Drop the publisher's
     // old-generation snapshot before reserving the stable-check build, or a
     // coroutine-local reference would turn the intended two-generation bound
@@ -2701,7 +2873,19 @@ celer::Task<absl::Status> RunEstablishedSession(
 
     auto publisher_response = HandlePublisherResponse(state, *incoming);
     if (!publisher_response.ok()) co_return publisher_response.status();
-    if (*publisher_response) continue;
+    if (*publisher_response) {
+      // FullStateApplied wakes the publisher but does not itself change the
+      // projection used below. Do not read a buffered heartbeat until the
+      // publisher has made the acknowledged object the session baseline.
+      while (!state->closing_ && state->publisher_adoption_gate_.pending()) {
+        co_await state->response_changed_.Wait();
+      }
+      if (state->closing_) {
+        co_return state->terminal_error_.value_or(
+            absl::CancelledError("data-control session closed"));
+      }
+      continue;
+    }
 
     const bool is_transfer = std::visit(
         [](const auto& message) {
@@ -2799,6 +2983,15 @@ celer::Task<absl::Status> RunEstablishedSession(
       if (!failover_projection.ok()) {
         co_return failover_projection.status();
       }
+      auto owner_projection = detail::OwnerProjectionForHeartbeat(
+          installed->full_state, state->node_id_);
+      if (!owner_projection.ok()) {
+        co_return owner_projection.status();
+      }
+      std::optional<MetaCausallyConfirmedLease> confirmed_lease =
+          detail::ConfirmedLeaseForHeartbeat(
+              cached_ack, heartbeat->heartbeat_sequence, state->boot_id_,
+              *owner_projection);
       const std::uint64_t committed_high_water =
           state->core_->coordinator_->CommittedHighWater();
       if (committed_high_water > state->validated_committed_high_water_ &&
@@ -2815,11 +3008,15 @@ celer::Task<absl::Status> RunEstablishedSession(
       const MetaCommittedView& latest_view = **cached_view;
       MetaStoresFacts facts(latest_view.stores());
       const std::int64_t heartbeat_received_unix_ms = NowUnixMillis();
+      const std::uint64_t heartbeat_received_steady_ms =
+          static_cast<std::uint64_t>(ActiveClockMillis());
       MetaHeartbeatObservationResult observation = IngestHeartbeatObservations(
           *state->core_->observations_, facts, state->node_id_, boot_id,
           replication_history_id, session_generation, heartbeat->health,
           heartbeat->role_information, heartbeat->failover_observation,
-          std::move(*failover_projection), heartbeat_received_unix_ms);
+          std::move(*failover_projection), std::move(*owner_projection),
+          heartbeat->heartbeat_sequence, std::move(confirmed_lease),
+          heartbeat_received_unix_ms, heartbeat_received_steady_ms);
       state->core_->options_.runtime_status_->RecordHealth(
           state->node_id_, state->session_id_, heartbeat->health,
           heartbeat_received_unix_ms);
@@ -2838,32 +3035,28 @@ celer::Task<absl::Status> RunEstablishedSession(
                          state->validated_committed_high_water_) &&
           !state->projection_superseded_ &&
           state->validated_committed_high_water_ >= committed_high_water;
+      std::optional<control::LeaseChallenge> challenge;
+      if (const auto* authority = std::get_if<control::AuthorityLeaseRequest>(
+              &heartbeat->role_information)) {
+        challenge = authority->challenge;
+      }
+      const MetaLeaseEvaluation lease_evaluation{
+          .leader_valid_ = leader_valid,
+          .server_id_ = state->core_->options_.server_id_,
+          .raft_term_ = state->core_->server_->get_term(),
+          .leadership_generation_ = state->leadership_generation_,
+          .leadership_validity_ms_ =
+              state->core_->options_.leadership_validity_ms_,
+          .node_id_ = state->node_id_,
+          .boot_id_ = state->boot_id_,
+          .applied_projection_hash_ = installed->full_state.projection_hash,
+          .desired_ = &installed->full_state,
+      };
       control::LeaseDecision lease =
           state->core_->lease_handoff_guard_->Enforce(
-              EvaluateLeaseChallenge(
-                  [&]() -> std::optional<control::LeaseChallenge> {
-                    if (const auto* authority =
-                            std::get_if<control::AuthorityLeaseRequest>(
-                                &heartbeat->role_information)) {
-                      return authority->challenge;
-                    }
-                    return std::nullopt;
-                  }(),
-                  heartbeat->health,
-                  MetaLeaseEvaluation{
-                      .leader_valid_ = leader_valid,
-                      .server_id_ = state->core_->options_.server_id_,
-                      .raft_term_ = state->core_->server_->get_term(),
-                      .leadership_generation_ = state->leadership_generation_,
-                      .leadership_validity_ms_ =
-                          state->core_->options_.leadership_validity_ms_,
-                      .node_id_ = state->node_id_,
-                      .boot_id_ = state->boot_id_,
-                      .applied_projection_hash_ =
-                          installed->full_state.projection_hash,
-                      .desired_ = &installed->full_state,
-                  }),
-              state->node_id_, cluster::LeaseClockMillis());
+              EvaluateLeaseChallenge(challenge, heartbeat->health,
+                                     lease_evaluation),
+              challenge, lease_evaluation, cluster::LeaseClockMillis());
       if (std::holds_alternative<control::LeaseGranted>(lease)) {
         state->core_->lease_grants_.fetch_add(1, std::memory_order_relaxed);
       } else if (!std::holds_alternative<control::NoChallenge>(lease)) {
@@ -2876,15 +3069,34 @@ celer::Task<absl::Status> RunEstablishedSession(
           .observation_detail = std::move(observation.detail),
           .lease_decision = std::move(lease),
       };
+      // A failed stream write may still have delivered the complete Ack.
+      // Publish a handoff marker or possible finite Grant before attempting
+      // the send, then let exact session/authority progress retire it.
+      if (absl::Status attempted =
+              state->core_->observations_->RecordOwnerLeaseDecisionAttempt(
+                  MetaObservationIdentity{state->node_id_, boot_id,
+                                          session_generation},
+                  cached_ack->heartbeat_sequence, cached_ack->lease_decision);
+          !attempted.ok()) {
+        co_return attempted;
+      }
       if (absl::Status sent =
               co_await state->io_->Send(control::MessagePriority::kAuthority,
                                         control::WireMessage(*cached_ack));
           !sent.ok()) {
         co_return sent;
       }
+      if (absl::Status written =
+              state->core_->observations_->RecordOwnerLeaseDecisionWritten(
+                  MetaObservationIdentity{state->node_id_, boot_id,
+                                          session_generation},
+                  cached_ack->heartbeat_sequence, cached_ack->lease_decision);
+          !written.ok()) {
+        co_return written;
+      }
       state->core_->options_.runtime_status_->RecordLeaseDecisionWritten(
-          state->node_id_, state->session_id_, cached_ack->lease_decision,
-          NowUnixMillis());
+          state->node_id_, state->session_id_, cached_ack->heartbeat_sequence,
+          cached_ack->lease_decision, NowUnixMillis());
       continue;
     }
 
@@ -2949,6 +3161,19 @@ celer::Task<absl::Status> RunEstablishedSession(
 }
 
 }  // namespace
+
+std::chrono::milliseconds detail::EstablishedSessionReadTimeout(
+    std::uint32_t observation_ttl_ms,
+    std::uint32_t session_progress_timeout_ms) noexcept {
+  const std::uint64_t total_ms =
+      static_cast<std::uint64_t>(observation_ttl_ms) +
+      static_cast<std::uint64_t>(session_progress_timeout_ms);
+  static_assert(
+      std::numeric_limits<std::chrono::milliseconds::rep>::digits >= 33,
+      "milliseconds must represent two uint32 millisecond intervals");
+  return std::chrono::milliseconds(
+      static_cast<std::chrono::milliseconds::rep>(total_ms));
+}
 
 class MetaDataControlServer::SessionConnectionBorrow {
  public:
@@ -3116,11 +3341,12 @@ absl::Status MetaDataControlServer::ValidateOptions(
     return absl::InvalidArgumentError(
         "data-control mTLS requires CA, certificate, and key together");
   }
-  if (options.heartbeat_interval_ms_ == 0 ||
-      options.observation_ttl_ms_ < options.heartbeat_interval_ms_ ||
+  const std::uint32_t maximum_heartbeat_interval_ms =
+      std::max<std::uint32_t>(1, options.leadership_validity_ms_ / 3);
+  if (options.observation_ttl_ms_ == 0 ||
+      maximum_heartbeat_interval_ms > options.observation_ttl_ms_ ||
       options.session_progress_timeout_ms_ == 0 ||
       options.session_progress_timeout_ms_ > kMaxSessionProgressTimeoutMs ||
-      options.heartbeat_interval_ms_ >= options.session_progress_timeout_ms_ ||
       options.leadership_validity_ms_ == 0 ||
       options.lease_handoff_safety_margin_ms_ <
           options.leadership_validity_ms_ ||
@@ -3358,8 +3584,8 @@ void MetaDataControlServer::StartOnExecutor(MetaLeaderContext* context) {
         core->leader_active_ = true;
         core->leader_ready_for_data_ = false;
         StartLeaderTask(*core, core->leadership_generation_);
-        worker->Spawn(ReconcileLocalMetaMember(core, *context,
-                                               core->leadership_generation_));
+        worker->Spawn(
+            ReconcileLocalMetaMember(core, core->leadership_generation_));
       })) {
     // The coordinator has already committed this reconciler's Start edge and
     // will not replay it during the same leader epoch. Returning here would
@@ -3509,7 +3735,10 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
                &handshake_permit};
   SessionIo io(
       *core->worker_, connection, stream, core->options_.max_write_queue_bytes_,
-      std::chrono::milliseconds(core->options_.session_progress_timeout_ms_));
+      std::chrono::milliseconds(core->options_.session_progress_timeout_ms_),
+      detail::EstablishedSessionReadTimeout(
+          core->options_.observation_ttl_ms_,
+          core->options_.session_progress_timeout_ms_));
   const auto finish = [&](absl::Status status, bool protocol_error = false) {
     if (protocol_error) {
       core->protocol_errors_.fetch_add(1, std::memory_order_relaxed);

@@ -732,7 +732,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     keylane::meta::MetaOperationId operation_id_ = MakeOperationId(0xa3);
     keylane::meta::MetaFailoverTransitionId transition_id_ =
         MakeFixedId<16>(0xa4);
-    keylane::meta::MetaGrantSpec grant_{5000, "fail-safe-policy", 0};
     keylane::meta::MetaFailoverCandidateAction action_;
     std::uint64_t deadline_unix_ms_ = 2'000'000'000'000ULL;
     std::uint64_t grant_revision_ = 0;
@@ -901,6 +900,22 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
     ProposeAccepted(root);
 
+    keylane::meta::PutPolicy automatic;
+    automatic.request_id_ = MakeRequestId(0x96);
+    automatic.policy_id_ =
+        std::string(keylane::meta::kAutomaticUncontrolledFailoverPolicyId);
+    automatic.version_ = 1;
+    automatic.content_ =
+        R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+    ProposeAccepted(automatic);
+
+    keylane::meta::PutPolicy policy;
+    policy.request_id_ = MakeRequestId(0x9b);
+    policy.policy_id_ = std::string(keylane::meta::kAuthorityLeasePolicyId);
+    policy.version_ = 1;
+    policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
+    ProposeAccepted(policy);
+
     keylane::meta::CompleteOperation complete_root;
     complete_root.request_id_ = MakeRequestId(0x92);
     complete_root.operation_id_ = root.operation_id_;
@@ -946,15 +961,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     assign_candidate.new_topology_epoch_ = 3;
     ProposeAccepted(assign_candidate);
 
-    keylane::meta::PutPolicy policy;
-    policy.request_id_ = MakeRequestId(0x96);
-    policy.policy_id_ = state.grant_.policy_id_;
-    policy.version_ = state.grant_.policy_version_;
-    policy.content_ = R"({"lease_ms":5000})";
-    policy.content_hash_ =
-        keylane::meta::MetaPolicyStore::ContentHash(policy.content_);
-    ProposeAccepted(policy);
-
     BeginGroupTerm term;
     term.request_id_ = MakeRequestId(0x97);
     term.group_id_ = "g1";
@@ -967,7 +973,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     activate.group_id_ = "g1";
     activate.expected_term_ = 1;
     activate.new_owner_ = state.owner_;
-    activate.grant_ = state.grant_;
     activate.new_authority_version_ = 1;
     activate.new_topology_epoch_ = 4;
     activate.new_config_epoch_ = 1;
@@ -1006,7 +1011,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     begin.group_id_ = "g1";
     begin.transition_id_ = state.transition_id_;
     begin.target_term_ = 2;
-    begin.successor_grant_ = state.grant_;
     begin.candidate_action_ = state.action_;
     begin.operation_id_ = state.operation_id_;
     begin.expected_operation_revision_ = 0;
@@ -1324,7 +1328,6 @@ TEST_F(MetaCoordinatorServerTest,
   commit.action_id_ = failover.action_.action_id_;
   commit.authorized_revision_ = failover.transition_revision_;
   commit.expected_candidate_ = failover.action_.candidate_;
-  commit.successor_grant_ = failover.grant_;
   commit.expected_owner_node_id_ = failover.owner_;
   commit.expected_owner_assignment_id_ = failover.owner_assignment_;
   commit.expected_membership_revision_ = 3;

@@ -45,6 +45,7 @@
 
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/cluster/control_transport.h"
+#include "keylane/meta/automatic_failover_detector.h"
 #include "keylane/meta/cluster_create.h"
 #include "keylane/meta/cluster_create_reconciler.h"
 #include "keylane/meta/cluster_status.h"
@@ -108,7 +109,38 @@ bool detail::IsStableClusterStatusBracket(
          after.config_server_ids_ == before.config_server_ids_ &&
          after.active_meta_members_ == before.active_meta_members_ &&
          after.leadership_.leadership_generation_ ==
-             before.leadership_.leadership_generation_;
+             before.leadership_.leadership_generation_ &&
+         after.leadership_.leader_authority_eligibility_revision_ ==
+             before.leadership_.leader_authority_eligibility_revision_;
+}
+
+bool detail::IsCurrentAutomaticFailoverDiagnostics(
+    const MetaDataControlRuntimeSnapshot& runtime,
+    const MetaAutomaticFailoverDiagnosticsSnapshot& detector,
+    std::uint64_t committed_applied_index) {
+  return detector.leadership_generation_ == runtime.leadership_generation_ &&
+         detector.leader_authority_eligibility_revision_ ==
+             runtime.leader_authority_eligibility_revision_ &&
+         detector.evaluated_applied_index_ == committed_applied_index;
+}
+
+bool detail::ParseAdminPolicyVersion(std::string_view text,
+                                     std::uint64_t* version) {
+  if (version == nullptr || text.empty() || text == "0" ||
+      text.front() == '0') {
+    return false;
+  }
+  std::uint64_t value = 0;
+  for (const char c : text) {
+    if (c < '0' || c > '9') return false;
+    const std::uint64_t digit = static_cast<std::uint64_t>(c - '0');
+    if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+      return false;
+    }
+    value = value * 10 + digit;
+  }
+  *version = value;
+  return true;
 }
 
 std::string_view detail::ClusterCreateMissingSessionBlocker(
@@ -362,6 +394,8 @@ std::string BuildClusterStatusReply(
     const nuraft::ptr<nuraft::raft_server>& server,
     const nuraft::ptr<MetaStateMachine>& state_machine,
     const std::shared_ptr<MetaDataControlRuntimeStatus>& runtime_status,
+    const std::shared_ptr<MetaAutomaticFailoverDiagnosticsRegistry>&
+        automatic_failover_diagnostics,
     std::uint32_t observation_ttl_ms) {
   const bool before_is_leader = server->is_leader();
   const bool before_leader_alive = server->is_leader_alive();
@@ -384,9 +418,15 @@ std::string BuildClusterStatusReply(
       runtime.leadership_generation_ == 0) {
     return "ERR leader_not_caught_up";
   }
+  const MetaAutomaticFailoverDiagnosticsSnapshot detector =
+      automatic_failover_diagnostics->Snapshot();
   const MetaCommittedStatusView view = state_machine->StatusSnapshot();
   if (view.applied_index_ < server->get_committed_log_idx()) {
     return "ERR leader_not_caught_up";
+  }
+  if (!detail::IsCurrentAutomaticFailoverDiagnostics(runtime, detector,
+                                                     view.applied_index_)) {
+    return "ERR cut_changed";
   }
   const auto active_meta_members = ActiveMetaMembers(view);
   if (std::none_of(active_meta_members.begin(), active_meta_members.end(),
@@ -405,7 +445,9 @@ std::string BuildClusterStatusReply(
       .active_meta_members_ = active_meta_members,
       .leadership_ = {.leadership_generation_ = runtime.leadership_generation_,
                       .leader_authority_eligible_ =
-                          runtime.leader_authority_eligible_},
+                          runtime.leader_authority_eligible_,
+                      .leader_authority_eligibility_revision_ =
+                          runtime.leader_authority_eligibility_revision_},
   };
 
   ClusterStatusWireV1 status;
@@ -626,8 +668,57 @@ std::string BuildClusterStatusReply(
       group.owner_node_id_ = source.topology_.record_.owner_;
     }
     group.config_epoch_ = source.topology_.config_epoch_;
+    group.effective_threshold_ms_ = view.automatic_failover_threshold_ms_;
     if (source.grant_.grant_.has_value()) {
       group.grant_revision_ = source.grant_.grant_->grant_revision_;
+    }
+
+    const auto detector_status =
+        std::find_if(detector.statuses_.begin(), detector.statuses_.end(),
+                     [&](const MetaAutomaticFailoverStatus& item) {
+                       return item.anchor_.group_id_ == group.group_id_;
+                     });
+    if (detector_status != detector.statuses_.end()) {
+      switch (detector_status->state_) {
+        case MetaAutomaticFailoverState::kDisabled:
+          group.automatic_failover_state_ =
+              ClusterAutomaticFailoverState::kDisabled;
+          break;
+        case MetaAutomaticFailoverState::kHealthy:
+          group.automatic_failover_state_ =
+              ClusterAutomaticFailoverState::kHealthy;
+          break;
+        case MetaAutomaticFailoverState::kSuspect:
+          group.automatic_failover_state_ =
+              ClusterAutomaticFailoverState::kSuspect;
+          break;
+        case MetaAutomaticFailoverState::kBlocked:
+          group.automatic_failover_state_ =
+              ClusterAutomaticFailoverState::kBlocked;
+          break;
+        case MetaAutomaticFailoverState::kTriggering:
+          group.automatic_failover_state_ =
+              ClusterAutomaticFailoverState::kTriggering;
+          break;
+      }
+      if (detector_status->current_reason_ !=
+          MetaOwnerServiceabilityReason::kNone) {
+        group.current_reason_ = std::string(MetaOwnerServiceabilityReasonName(
+            detector_status->current_reason_));
+      }
+      group.suspect_elapsed_ms_ = detector_status->accumulated_suspect_ms_;
+      group.effective_threshold_ms_ = detector_status->effective_threshold_ms_;
+      if (detector_status->blocker_ != MetaAutomaticFailoverBlocker::kNone) {
+        group.blocked_reason_ = std::string(
+            MetaAutomaticFailoverBlockerName(detector_status->blocker_));
+      }
+    } else if (view.cluster_lifecycle_.state_ ==
+               MetaClusterLifecycle::kCreated) {
+      // A newly opened diagnostics bracket may precede its first complete
+      // detector publication. Report a conservative transient state instead
+      // of claiming that automatic failover is disabled.
+      group.automatic_failover_state_ = ClusterAutomaticFailoverState::kBlocked;
+      group.blocked_reason_ = "indeterminate_evidence";
     }
     group.topology_converged_ = true;
     for (const MetaGroupMember& member : source.topology_.members_) {
@@ -1045,10 +1136,10 @@ const char* ObsAuditKindName(MetaObsAuditKind kind) {
 
 using CmdResult = nuraft::cmd_result<nuraft::ptr<nuraft::buffer>>;
 
-// Proposes one encoded meta command and resolves to "OK <log_idx>" once the
-// entry commits (the commit result payload is the state machine commit()'s
-// return, so OK also means THIS leader has applied it), or "ERR <token>".
-// The apply verdict is a separate question — callers verify the effect.
+// Proposes one encoded meta command and resolves to "OK <log_idx>" only when
+// the entry commits and this leader's state machine reports an accepted apply
+// verdict. Some callers additionally verify a stable post-state when their
+// effect cannot be removed by a later valid command.
 celer::Task<std::string> ProposeCommand(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, MetaCommand command) {
@@ -1441,7 +1532,6 @@ celer::Task<std::string> HandleBeginGroupTerm(
 // guess commits in unrelated groups.
 celer::Task<std::string> HandlePutPolicy(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& policy_id,
     std::uint64_t version, const std::string& content) {
   PutPolicy command;
@@ -1449,19 +1539,24 @@ celer::Task<std::string> HandlePutPolicy(
   command.policy_id_ = policy_id;
   command.version_ = version;
   command.content_ = content;
-  command.content_hash_ = MetaPolicyStore::ContentHash(content);
   std::string reply =
       co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) co_return reply;
-
-  const auto installed =
-      state_machine->StoresSnapshot().policy_.FindVersion(policy_id, version);
-  if (!installed.has_value() || installed->retired_ ||
-      installed->content_ != content ||
-      installed->content_hash_ != command.content_hash_) {
-    co_return "ERR rejected";
-  }
+  // The committed apply verdict is authoritative. A later burst may install
+  // enough consecutive versions to evict this immutable version before this
+  // coroutine resumes; absence from the retained newest-32 window cannot turn
+  // an accepted write into a rejection.
   co_return reply;
+}
+
+std::string HandleGetPolicy(nuraft::ptr<MetaStateMachine> state_machine,
+                            const std::string& policy_id) {
+  const MetaPolicyStore& policy = state_machine->StoresSnapshot().policy_;
+  const auto version = policy.LatestVersion(policy_id);
+  if (!version.has_value()) return "ERR not-found";
+  const auto current = policy.FindVersion(policy_id, *version);
+  if (!current.has_value()) return "ERR state_corrupt";
+  return absl::StrCat("OK version=", current->version_,
+                      " content=", current->content_);
 }
 
 celer::Task<std::string> HandleSetSlotMap(
@@ -1502,18 +1597,13 @@ celer::Task<std::string> HandleActivateAuthority(
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     std::uint64_t expected_term, const std::string& owner_node_id,
-    std::uint64_t lease_duration_ms, const std::string& policy_id,
-    std::uint64_t policy_version, std::uint64_t authority_version,
-    std::uint64_t config_epoch) {
+    std::uint64_t authority_version, std::uint64_t config_epoch) {
   const MetaStores before = state_machine->StoresSnapshot();
   ActivateAuthority command;
   command.request_id_ = MakeRequestId();
   command.group_id_ = group_id;
   command.expected_term_ = expected_term;
   command.new_owner_ = owner_node_id;
-  command.grant_.lease_duration_ms_ = lease_duration_ms;
-  command.grant_.policy_id_ = policy_id;
-  command.grant_.policy_version_ = policy_version;
   command.new_authority_version_ = authority_version;
   command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
   command.new_config_epoch_ = config_epoch;
@@ -1528,7 +1618,6 @@ celer::Task<std::string> HandleActivateAuthority(
       !grant->grant_.has_value() || grant->grant_->owner_ != owner_node_id ||
       grant->grant_->term_ != expected_term ||
       grant->grant_->authority_version_ != authority_version ||
-      grant->grant_->spec_ != command.grant_ ||
       topology->record_.owner_ != owner_node_id ||
       topology->record_.group_term_ != expected_term ||
       topology->record_.authority_version_ != authority_version ||
@@ -2170,13 +2259,12 @@ celer::Task<std::string> DispatchMutationVerb(
     std::uint64_t version = 0;
     if (tokens.size() != 4 || tokens[1].empty() ||
         tokens[1].size() > kMaxMetaPolicyIdBytes ||
-        !ParseU64(tokens[2], version) || version == 0 || tokens[3].empty() ||
-        tokens[3].size() > kMaxMetaPayloadBytes) {
+        !detail::ParseAdminPolicyVersion(tokens[2], &version) ||
+        tokens[3].empty() || tokens[3].size() > kMaxMetaPayloadBytes) {
       co_return "ERR bad-request";
     }
-    co_return co_await HandlePutPolicy(coordinator, std::move(state_machine),
-                                       std::move(principal), tokens[1], version,
-                                       tokens[3]);
+    co_return co_await HandlePutPolicy(coordinator, std::move(principal),
+                                       tokens[1], version, tokens[3]);
   }
   if (command == "setslotmap") {
     std::uint64_t first = 0;
@@ -2195,25 +2283,18 @@ celer::Task<std::string> DispatchMutationVerb(
   }
   if (command == "activateauthority") {
     std::uint64_t expected_term = 0;
-    std::uint64_t lease_duration_ms = 0;
-    std::uint64_t policy_version = 0;
     std::uint64_t authority_version = 0;
     std::uint64_t config_epoch = 0;
-    if (tokens.size() != 9 || tokens[1].empty() ||
+    if (tokens.size() != 6 || tokens[1].empty() ||
         tokens[1].size() > kMaxMetaGroupIdBytes ||
         !ParseU64(tokens[2], expected_term) || !IsNodeId(tokens[3]) ||
-        !ParseU64(tokens[4], lease_duration_ms) || lease_duration_ms == 0 ||
-        lease_duration_ms > std::numeric_limits<std::uint32_t>::max() ||
-        tokens[5].empty() || tokens[5].size() > kMaxMetaPolicyIdBytes ||
-        !ParseU64(tokens[6], policy_version) || policy_version == 0 ||
-        !ParseU64(tokens[7], authority_version) || authority_version == 0 ||
-        !ParseU64(tokens[8], config_epoch) || config_epoch == 0) {
+        !ParseU64(tokens[4], authority_version) || authority_version == 0 ||
+        !ParseU64(tokens[5], config_epoch) || config_epoch == 0) {
       co_return "ERR bad-request";
     }
     co_return co_await HandleActivateAuthority(
         coordinator, std::move(state_machine), std::move(principal), tokens[1],
-        expected_term, tokens[3], lease_duration_ms, tokens[5], policy_version,
-        authority_version, config_epoch);
+        expected_term, tokens[3], authority_version, config_epoch);
   }
   if (command == "fencegroup") {
     std::uint64_t expected_term = 0;
@@ -2321,6 +2402,8 @@ celer::Task<std::string> DispatchCommand(
     std::string_view local_data_control_endpoint,
     std::shared_ptr<MetaClusterStatusService> cluster_status_service,
     std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status,
+    std::shared_ptr<MetaAutomaticFailoverDiagnosticsRegistry>
+        automatic_failover_diagnostics,
     std::uint32_t observation_ttl_ms, std::size_t* retained_status_bytes,
     std::string_view line, const bool* shutdown, bool creation_enabled,
     bool membership_enabled) {
@@ -2363,13 +2446,14 @@ celer::Task<std::string> DispatchCommand(
     if (!cluster_status_service->TryBeginCapture()) co_return "ERR busy";
     auto reply = std::make_shared<AsyncReply>();
     const absl::Status submitted = proposal_executor.Submit(
-        [server, state_machine, data_control_runtime_status, observation_ttl_ms,
+        [server, state_machine, data_control_runtime_status,
+         automatic_failover_diagnostics, observation_ttl_ms,
          cluster_status_service, foreign_executor, reply]() mutable {
           std::string result;
           try {
-            result = BuildClusterStatusReply(server, state_machine,
-                                             data_control_runtime_status,
-                                             observation_ttl_ms);
+            result = BuildClusterStatusReply(
+                server, state_machine, data_control_runtime_status,
+                automatic_failover_diagnostics, observation_ttl_ms);
           } catch (...) {
             result = "ERR state_corrupt";
           }
@@ -2456,6 +2540,17 @@ celer::Task<std::string> DispatchCommand(
       co_return "ERR bad-request";
     }
     co_return HandleGetNode(std::move(state_machine), tokens[1]);
+  }
+  if (command == "getpolicy") {
+    if (tokens.size() != 2 || tokens[1].empty() ||
+        tokens[1].size() > kMaxMetaPolicyIdBytes) {
+      co_return "ERR bad-request";
+    }
+    if (!server->is_leader() || !server->is_leader_alive() ||
+        !server->is_leader_sm_fully_caught_up()) {
+      co_return "ERR not-leader";
+    }
+    co_return HandleGetPolicy(std::move(state_machine), tokens[1]);
   }
   if (command == "adoptsession") {
     if (tokens.size() != 4) {
@@ -2778,6 +2873,10 @@ absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
     core->options_.data_control_runtime_status_ =
         std::make_shared<MetaDataControlRuntimeStatus>();
   }
+  if (core->options_.automatic_failover_diagnostics_ == nullptr) {
+    core->options_.automatic_failover_diagnostics_ =
+        std::make_shared<MetaAutomaticFailoverDiagnosticsRegistry>();
+  }
   if (core->options_.transport_ == MetaCtlServerOptions::Transport::kTcpMtls) {
     celer::TlsServerOptions tls;
     tls.cert_file_ = core->options_.tls_cert_file_;
@@ -3020,6 +3119,7 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
           core->options_.local_data_control_endpoint_,
           core->options_.cluster_status_service_,
           core->options_.data_control_runtime_status_,
+          core->options_.automatic_failover_diagnostics_,
           core->options_.observation_ttl_ms_, &retained_status_bytes, line,
           &core->shutdown_,
           core->options_.cluster_create_reconciler_ != nullptr &&

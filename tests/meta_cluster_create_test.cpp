@@ -110,6 +110,44 @@ TEST(ClusterCreateManifestTest, NormalizesMultipleGroupsAndAllocatesSlots) {
             (ClusterCreateManifestV1::SlotRange{0, 8191, "group-1"}));
   EXPECT_EQ(manifest->slot_ranges_[1],
             (ClusterCreateManifestV1::SlotRange{8192, 16383, "group-2"}));
+  EXPECT_TRUE(
+      manifest->bootstrap_policy_.automatic_uncontrolled_failover_enabled_);
+  EXPECT_EQ(manifest->bootstrap_policy_
+                .automatic_uncontrolled_failover_suspect_after_ms_,
+            5000u);
+  EXPECT_EQ(manifest->bootstrap_policy_.authority_lease_duration_ms_, 5000u);
+}
+
+TEST(ClusterCreateManifestTest, ParsesStrictBootstrapPolicyOverrides) {
+  const std::string configured = std::string(kValidManifest) +
+                                 R"toml(
+[bootstrap_policy]
+automatic_uncontrolled_failover_enabled = false
+automatic_uncontrolled_failover_suspect_after_ms = 9000
+authority_lease_duration_ms = 3000
+)toml";
+
+  auto manifest = ParseClusterCreateManifest(configured);
+
+  ASSERT_TRUE(manifest.ok()) << manifest.status();
+  EXPECT_FALSE(
+      manifest->bootstrap_policy_.automatic_uncontrolled_failover_enabled_);
+  EXPECT_EQ(manifest->bootstrap_policy_
+                .automatic_uncontrolled_failover_suspect_after_ms_,
+            9000u);
+  EXPECT_EQ(manifest->bootstrap_policy_.authority_lease_duration_ms_, 3000u);
+
+  for (const std::string& invalid : {
+           configured + "unknown = 1\n",
+           ReplaceOnce(configured, "false", "1"),
+           ReplaceOnce(configured, "9000", "999"),
+           ReplaceOnce(configured, "3000", "99"),
+           configured +
+               "\n[bootstrap_policy]\nauthority_lease_duration_ms = 4000\n",
+       }) {
+    SCOPED_TRACE(invalid);
+    EXPECT_FALSE(ParseClusterCreateManifest(invalid).ok());
+  }
 }
 
 TEST(ClusterCreateManifestTest, AllocatesNonDivisorGroupCountsExactly) {
@@ -123,7 +161,7 @@ TEST(ClusterCreateManifestTest, AllocatesNonDivisorGroupCountsExactly) {
            {6553, 9829},
            {9830, 13106},
            {13107, 16383}},
-      };
+  };
   const std::vector<std::size_t> counts = {1, 2, 3, 5};
   for (std::size_t case_index = 0; case_index < counts.size(); ++case_index) {
     auto manifest =
@@ -428,8 +466,7 @@ TEST(ClusterCreateProtocolTest, RoundTripsOnlyCanonicalV1Requests) {
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(*decoded, manifest);
   EXPECT_EQ(decoded_root, root);
-  EXPECT_FALSE(
-      DecodeClusterCreateRequest(*request + "00", &decoded_root).ok());
+  EXPECT_FALSE(DecodeClusterCreateRequest(*request + "00", &decoded_root).ok());
   EXPECT_FALSE(
       DecodeClusterCreateRequest("clustercreate 2 00", &decoded_root).ok());
 }
@@ -450,7 +487,7 @@ TEST(ClusterCreateManifestTest, RoundTripsDualAndTlsOnlyListeners) {
       EXPECT_EQ(manifest->data_nodes_[0].tls_endpoint_, tls);
       auto request = EncodeClusterCreateRequest(*manifest, OperationId(7));
       ASSERT_TRUE(request.ok()) << request.status();
-      EXPECT_TRUE(request->starts_with("clustercreate 1 0004"));
+      EXPECT_TRUE(request->starts_with("clustercreate 1 0005"));
       MetaOperationId root{};
       auto decoded = DecodeClusterCreateRequest(*request, &root);
       ASSERT_TRUE(decoded.ok()) << decoded.status();
@@ -461,34 +498,34 @@ TEST(ClusterCreateManifestTest, RoundTripsDualAndTlsOnlyListeners) {
 }
 
 TEST(ClusterCreateManifestTest, RejectsInvalidOrConflictingTlsListeners) {
-  for (const std::string tls : {
-           "", "tcp://127.0.0.1:16379", "tls://localhost:16379",
-           "tls://127.0.0.1:0", "tls://127.0.0.1:65536",
-           "tls://127.0.0.1:016379", "tls://127.0.0.2:16379",
-           "tls://127.0.0.1:6379", "tls://127.0.0.1:6380"}) {
+  for (const std::string tls :
+       {"", "tcp://127.0.0.1:16379", "tls://localhost:16379",
+        "tls://127.0.0.1:0", "tls://127.0.0.1:65536", "tls://127.0.0.1:016379",
+        "tls://127.0.0.2:16379", "tls://127.0.0.1:6379",
+        "tls://127.0.0.1:6380"}) {
     SCOPED_TRACE(tls);
-    EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-        std::string(kValidManifest),
-        "client_endpoint = \"tcp://127.0.0.1:6379\"",
-        "client_endpoint = \"tcp://127.0.0.1:6379\"\ntls_endpoint = \"" +
-            tls + "\""))
+    EXPECT_FALSE(ParseClusterCreateManifest(
+                     ReplaceOnce(std::string(kValidManifest),
+                                 "client_endpoint = \"tcp://127.0.0.1:6379\"",
+                                 "client_endpoint = "
+                                 "\"tcp://127.0.0.1:6379\"\ntls_endpoint = \"" +
+                                     tls + "\""))
                      .ok());
   }
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-      std::string(kValidManifest),
-      "client_endpoint = \"tcp://127.0.0.1:6379\"",
-      "tls_endpoint = \"tls://127.0.0.1:16379\"\n"
-      "tls_endpoint = \"tls://127.0.0.1:16380\""))
+  EXPECT_FALSE(ParseClusterCreateManifest(
+                   ReplaceOnce(std::string(kValidManifest),
+                               "client_endpoint = \"tcp://127.0.0.1:6379\"",
+                               "tls_endpoint = \"tls://127.0.0.1:16379\"\n"
+                               "tls_endpoint = \"tls://127.0.0.1:16380\""))
                    .ok());
-  EXPECT_FALSE(ParseClusterCreateManifest(ReplaceOnce(
-      std::string(kValidManifest),
-      "client_endpoint = \"tcp://127.0.0.1:6379\"", ""))
-                   .ok());
+  EXPECT_FALSE(
+      ParseClusterCreateManifest(
+          ReplaceOnce(std::string(kValidManifest),
+                      "client_endpoint = \"tcp://127.0.0.1:6379\"", ""))
+          .ok());
 }
 
-TEST(ClusterCreateProtocolTest, ReadsPersistedV3IntentWithoutTlsEndpoints) {
-  // Frozen pre-TLS intent: decoding must not reinterpret its Group count as
-  // a TLS string length or prevent a stored Genesis from being recovered.
+TEST(ClusterCreateProtocolTest, RejectsOldPersistedIntentFormat) {
   constexpr std::string_view request =
       "clustercreate 1 "
       "0003070707070707070707070707070707070000000100000001000000147463703a2f2f"
@@ -497,19 +534,10 @@ TEST(ClusterCreateProtocolTest, ReadsPersistedV3IntentWithoutTlsEndpoints) {
       "303132333435363738396162636465663031323334353637383961626364656630313233"
       "34353637000000147463703a2f2f3132372e302e302e313a363337390000000100000006"
       "6c6567616379000000283031323334353637383961626364656630313233343536373839"
-      "6162636465663031323334353637000000000000000100003fff000000066c6567616379";
+      "6162636465663031323334353637000000000000000100003fff000000066c656761637"
+      "9";
   MetaOperationId root{};
-  auto decoded = DecodeClusterCreateRequest(request, &root);
-  ASSERT_TRUE(decoded.ok()) << decoded.status();
-  EXPECT_EQ(root, OperationId(7));
-  ASSERT_EQ(decoded->data_nodes_.size(), 1U);
-  EXPECT_EQ(decoded->data_nodes_[0].node_id_, kNodeA);
-  EXPECT_EQ(decoded->data_nodes_[0].client_endpoint_, "tcp://127.0.0.1:6379");
-  EXPECT_TRUE(decoded->data_nodes_[0].tls_endpoint_.empty());
-  ASSERT_EQ(decoded->groups_.size(), 1U);
-  EXPECT_EQ(decoded->groups_[0].group_id_, "legacy");
-  EXPECT_EQ(decoded->slot_ranges_,
-            (std::vector<ClusterCreateManifestV1::SlotRange>{{0, 16383, "legacy"}}));
+  EXPECT_FALSE(DecodeClusterCreateRequest(request, &root).ok());
 }
 
 TEST(ClusterCreateProtocolTest, DecodesGenesisOutcome) {
@@ -518,8 +546,7 @@ TEST(ClusterCreateProtocolTest, DecodesGenesisOutcome) {
 
   ASSERT_TRUE(outcome.ok()) << outcome.status();
   EXPECT_EQ(outcome->genesis_commit_index_, 25U);
-  EXPECT_EQ(outcome->operation_id_,
-            "00112233445566778899aabbccddeeff");
+  EXPECT_EQ(outcome->operation_id_, "00112233445566778899aabbccddeeff");
 }
 
 ClusterStatusWireV1 EmptyStatus(const ClusterHeadWireV1& head) {
@@ -570,7 +597,8 @@ ClusterStatusWireV1 ReadyStatus(const ClusterCreateManifestV1& manifest,
                               .config_epoch_ = 1,
                               .grant_revision_ = 18,
                               .serving_ready_ = true,
-                              .topology_converged_ = true});
+                              .topology_converged_ = true,
+                              .effective_threshold_ms_ = 1'000});
   }
   for (const auto& range : manifest.slot_ranges_) {
     status.slot_ranges_.push_back({range.first_, range.last_, range.group_id_});
