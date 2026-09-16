@@ -13,7 +13,7 @@ namespace {
 
 namespace meta = keylane::meta;
 
-constexpr std::uint64_t kGrantRevision = 10;
+constexpr std::uint64_t kBaseRevision = 10;
 
 template <std::size_t N>
 std::array<std::uint8_t, N> Filled(std::uint8_t seed) {
@@ -155,17 +155,13 @@ void PopulateActivatedFixture(Fixture& fixture,
   activate.group_id_ = "g1";
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.owner;
-  activate.new_authority_version_ = 1;
   activate.new_topology_epoch_ = 4;
   activate.new_config_epoch_ = 1;
-  ASSERT_TRUE(
-      fixture.stores.grant_.ValidateActivate(activate, kGrantRevision).ok());
+  ASSERT_TRUE(fixture.stores.grant_.ValidateActivate(activate).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetOwner("g1", fixture.owner).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetAuthorityVersion("g1", 1).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetTopologyEpoch(4).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetGroupConfigEpoch("g1", 1).ok());
-  ASSERT_TRUE(
-      fixture.stores.grant_.ApplyGrantPart(activate, kGrantRevision).ok());
+  ASSERT_TRUE(fixture.stores.grant_.ApplyGrantPart(activate).ok());
 }
 
 void InstallControlledTransition(Fixture& fixture, std::uint64_t operation_seq,
@@ -220,19 +216,6 @@ absl::StatusOr<meta::MetaStores> Restore(const meta::MetaStores& stores) {
 }
 
 TEST(MetaFailoverAggregateRevision,
-     RestoreRejectsTransitionNotAfterFrozenGrantRevision) {
-  Fixture fixture;
-  PopulateActivatedFixture(fixture);
-  InstallControlledTransition(fixture, kGrantRevision - 1, kGrantRevision);
-
-  const auto restored = Restore(fixture.stores);
-
-  ASSERT_FALSE(restored.ok());
-  EXPECT_EQ(meta::MetaFailureClassOf(restored.status()),
-            meta::MetaFailureClass::kFailStop);
-}
-
-TEST(MetaFailoverAggregateRevision,
      RestoreRejectsCreatedClusterMissingEitherRequiredCurrentPolicy) {
   {
     SCOPED_TRACE("automatic uncontrolled failover Policy missing");
@@ -260,7 +243,7 @@ TEST(MetaFailoverAggregateRevision,
      RestoreRejectsControlledTransitionNotAfterOperationSubmission) {
   Fixture fixture;
   PopulateActivatedFixture(fixture);
-  InstallControlledTransition(fixture, kGrantRevision + 1, kGrantRevision + 1);
+  InstallControlledTransition(fixture, kBaseRevision + 1, kBaseRevision + 1);
 
   const auto restored = Restore(fixture.stores);
 
@@ -273,7 +256,7 @@ TEST(MetaFailoverAggregateRevision,
      RestoreAcceptsStrictlyOrderedControlledTransition) {
   Fixture fixture;
   PopulateActivatedFixture(fixture);
-  InstallControlledTransition(fixture, kGrantRevision + 1, kGrantRevision + 2);
+  InstallControlledTransition(fixture, kBaseRevision + 1, kBaseRevision + 2);
 
   const auto restored = Restore(fixture.stores);
 
@@ -281,7 +264,7 @@ TEST(MetaFailoverAggregateRevision,
   const auto group = restored->topology_.FindGroup("g1");
   ASSERT_TRUE(group.has_value());
   ASSERT_TRUE(group->failover_transition_.has_value());
-  EXPECT_EQ(group->failover_transition_->revision_, kGrantRevision + 2);
+  EXPECT_EQ(group->failover_transition_->revision_, kBaseRevision + 2);
 }
 
 }  // namespace

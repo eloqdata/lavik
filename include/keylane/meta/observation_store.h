@@ -100,43 +100,12 @@ struct MetaObservedOwnerProjection {
   std::string owner_node_id_;
   MetaAssignmentId owner_assignment_id_{};
   std::uint64_t group_term_ = 0;
-  std::uint64_t authority_version_ = 0;
-  std::uint64_t grant_revision_ = 0;
   MetaHash256 projection_hash_{};
   // Effective duration from this installed FDS after the Meta Leader's local
   // validity cap. Retaining it with the projection lets a later snapshot tear
   // distinguish a known-expired old lease from unknown runtime evidence.
   std::uint32_t authority_lease_duration_ms_ = 0;
   bool operator==(const MetaObservedOwnerProjection&) const = default;
-};
-
-// Receipt of heartbeat N+1 proves that the stop-and-wait Data client finished
-// processing Ack N. Only a granted Ack matching the still-installed Owner
-// projection is retained as this causal confirmation.
-struct MetaCausallyConfirmedLease {
-  MetaObservedOwnerProjection projection_;
-  std::uint64_t acknowledged_heartbeat_sequence_ = 0;
-  std::uint32_t granted_duration_ms_ = 0;
-  bool operator==(const MetaCausallyConfirmedLease&) const = default;
-};
-
-// A Grant Ack whose delivery is possible but has not yet been proved by a
-// higher-sequence heartbeat. Its conservative window starts at the matching
-// heartbeat's Meta receive time, which is no earlier than Data's challenge
-// send time. The observation store retains the latest possible deadline for
-// one Owner authority across same-session FDS replacements.
-struct MetaPossibleOwnerLease {
-  MetaObservedOwnerProjection projection_;
-  std::uint64_t granted_heartbeat_sequence_ = 0;
-  std::uint64_t heartbeat_received_steady_ms_ = 0;
-
-  bool operator==(const MetaPossibleOwnerLease&) const = default;
-};
-
-struct MetaAuthorityHandoffPending {
-  MetaObservedOwnerProjection projection_;
-  std::uint64_t denied_heartbeat_sequence_ = 0;
-  bool operator==(const MetaAuthorityHandoffPending&) const = default;
 };
 
 // Leader-local authenticated session fact used to distinguish a node that has
@@ -183,6 +152,17 @@ struct MetaNodeHealthObs {
 // session incarnation is known; connected_ and the optional heartbeat fields
 // distinguish disconnect from an adopted session that has not yet reported.
 struct MetaObservedOwnerState {
+  // A Grant Ack whose delivery is possible but has not yet been proved by a
+  // higher-sequence heartbeat. The same value type also retains the exact
+  // causally installed Grant window across same-authority FDS replacements.
+  struct LeaseWindow {
+    MetaObservedOwnerProjection projection_;
+    std::uint64_t granted_heartbeat_sequence_ = 0;
+    std::uint64_t heartbeat_received_steady_ms_ = 0;
+
+    bool operator==(const LeaseWindow&) const = default;
+  };
+
   MetaObservationIdentity identity_;
   bool connected_ = false;
   std::uint64_t heartbeat_sequence_ = 0;
@@ -196,22 +176,22 @@ struct MetaObservedOwnerState {
   // that same projection. Ordinary heartbeats deliberately do not refresh
   // it: callers use its monotonic age to bound causal-lease uncertainty.
   std::optional<std::uint64_t> causal_progress_received_steady_ms_;
-  // The heartbeat that first carried confirmed_lease_. A later heartbeat may
-  // reuse the retained proof, but cannot make that proof appear newer.
-  std::uint64_t causal_confirmation_heartbeat_sequence_ = 0;
-  std::optional<MetaCausallyConfirmedLease> confirmed_lease_;
+  // Receipt of a higher-sequence heartbeat proves that Data processed the
+  // named Grant Ack. The projection is the atomic owner_projection_ in this
+  // same cut, so retaining another copy would create an invalid state.
+  std::optional<std::uint64_t> confirmed_grant_sequence_;
   // Maximum deadline among unconfirmed Grants this leader may have delivered
   // for the current Owner authority.
-  std::optional<MetaPossibleOwnerLease> possible_owner_lease_;
+  std::optional<LeaseWindow> possible_owner_lease_;
   // Exact attempt that produced the newest causally confirmed installed
   // lease. It survives a same-authority FDS replacement, while confirmation
   // of a later Grant replaces it because Data processes Acks in order.
-  std::optional<MetaPossibleOwnerLease> installed_owner_lease_;
+  std::optional<LeaseWindow> installed_owner_lease_;
   // Present after this leader's handoff guard denied an otherwise healthy
   // exact Owner challenge. Same-authority projection replacement does not
   // prove the 2D quarantine finished; a later Grant attempt or a same/newer
   // NodeNotReady Ack evaluated after that deadline supersedes it.
-  std::optional<MetaAuthorityHandoffPending> authority_handoff_pending_;
+  std::optional<std::uint64_t> authority_handoff_pending_sequence_;
   bool operator==(const MetaObservedOwnerState&) const = default;
 };
 
@@ -557,7 +537,7 @@ class MetaObservationStore {
       std::optional<MetaObservedFailoverProjection> failover_projection,
       std::optional<MetaObservedOwnerProjection> owner_projection,
       std::uint64_t heartbeat_sequence,
-      std::optional<MetaCausallyConfirmedLease> confirmed_lease,
+      std::optional<std::uint64_t> confirmed_grant_sequence,
       const MetaCommittedFacts& facts, int64_t now_unix_ms,
       std::uint64_t now_steady_ms);
 

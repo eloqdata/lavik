@@ -104,11 +104,7 @@ class MetaPolicyStore {
   static absl::StatusOr<MetaPolicyStore> Deserialize(std::string_view bytes);
 
  private:
-  struct VersionState {
-    std::string content_;
-  };
-
-  std::map<std::string, std::map<std::uint64_t, VersionState>> policies_;
+  std::map<std::string, std::map<std::uint64_t, std::string>> policies_;
   std::uint64_t total_content_bytes_ = 0;
 };
 

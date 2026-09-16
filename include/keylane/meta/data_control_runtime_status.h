@@ -21,8 +21,6 @@ struct MetaDataControlRuntimeGroup {
   std::string group_id_;
   cluster::control::WireId128 assignment_id_{};
   std::uint64_t group_term_ = 0;
-  std::uint64_t authority_version_ = 0;
-  std::uint64_t grant_revision_ = 0;
   std::uint64_t manifest_revision_ = 0;
   cluster::control::WireHash256 manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
@@ -44,10 +42,6 @@ struct MetaDataControlRuntimeNode {
   std::uint64_t validated_committed_high_water_ = 0;
   std::uint64_t topology_epoch_ = 0;
   cluster::control::WireHash256 projection_hash_{};
-  // Already bounded by the Meta leader's local leadership-validity limit in
-  // the published FDS. Causal-progress consumers must use this effective
-  // duration rather than the possibly longer global Policy value.
-  std::uint32_t authority_lease_duration_ms_ = 0;
   // Lexicographically sorted by group_id_ in every published snapshot.
   std::vector<MetaDataControlRuntimeGroup> groups_;
   std::optional<cluster::control::HeartbeatHealth> health_;
@@ -87,17 +81,6 @@ struct MetaDataControlLeadershipState {
   std::uint64_t leader_authority_eligibility_revision_ = 0;
 };
 
-struct MetaLeaderAuthorityEligibilityState {
-  bool eligible_ = false;
-  std::uint64_t revision_ = 0;
-};
-
-// Advances the same-generation continuity marker for one observed eligibility
-// value. Once revision space is exhausted, the state stays ineligible so a
-// later edge cannot wrap and hide an authority interruption.
-MetaLeaderAuthorityEligibilityState AdvanceLeaderAuthorityEligibility(
-    MetaLeaderAuthorityEligibilityState current, bool eligible) noexcept;
-
 class MetaDataControlRuntimeStatus {
  public:
   // Starts a new leader-owned observation epoch. Status capture uses this
@@ -122,8 +105,7 @@ class MetaDataControlRuntimeStatus {
   void NoteUnregisteredRetry(std::string node_id,
                              std::uint64_t leadership_generation);
   // Publishes a fully validated Hello/FDS session for the current eligible
-  // leader generation, including the Authority Lease duration after the local
-  // leadership-validity cap. Replacing a node session atomically discards all
+  // leader generation. Replacing a node session atomically discards all
   // heartbeat and lease observations belonging to its predecessor.
   void PublishCurrent(std::string node_id, std::string boot_id,
                       const cluster::control::WireId128& session_id,

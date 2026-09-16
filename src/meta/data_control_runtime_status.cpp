@@ -21,8 +21,6 @@ std::vector<MetaDataControlRuntimeGroup> ProjectedGroups(
         .group_id_ = group.group_id,
         .assignment_id_ = member->assignment_id,
         .group_term_ = group.group_term,
-        .authority_version_ = group.authority_version,
-        .grant_revision_ = group.grant_revision,
         .manifest_revision_ = group.manifest_revision,
         .manifest_digest_ = group.manifest_digest,
         .partition_replication_epoch_ = group.partition_replication_epoch,
@@ -42,7 +40,6 @@ void ApplyProjection(MetaDataControlRuntimeNode& node,
   node.validated_committed_high_water_ = validated_committed_high_water;
   node.topology_epoch_ = projection.topology_epoch;
   node.projection_hash_ = projection.projection_hash;
-  node.authority_lease_duration_ms_ = projection.authority_lease_duration_ms;
   node.groups_ = ProjectedGroups(node.node_id_, projection);
   // A replacement invalidates observations and a previous lease until a
   // heartbeat under the new projection is successfully acknowledged.
@@ -54,18 +51,6 @@ void ApplyProjection(MetaDataControlRuntimeNode& node,
 }
 
 }  // namespace
-
-MetaLeaderAuthorityEligibilityState AdvanceLeaderAuthorityEligibility(
-    MetaLeaderAuthorityEligibilityState current, bool eligible) noexcept {
-  if (current.eligible_ == eligible) return current;
-  if (current.revision_ == std::numeric_limits<std::uint64_t>::max()) {
-    current.eligible_ = false;
-    return current;
-  }
-  ++current.revision_;
-  current.eligible_ = eligible;
-  return current;
-}
 
 void MetaDataControlRuntimeStatus::BeginLeadership(
     std::uint64_t leadership_generation) {
@@ -82,13 +67,17 @@ bool MetaDataControlRuntimeStatus::SetLeaderAuthorityEligible(
     std::uint64_t leadership_generation, bool eligible) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (leadership_generation_ != leadership_generation) return false;
-  const auto state = AdvanceLeaderAuthorityEligibility(
-      {.eligible_ = leader_authority_eligible_,
-       .revision_ = leader_authority_eligibility_revision_},
-      eligible);
-  leader_authority_eligible_ = state.eligible_;
-  leader_authority_eligibility_revision_ = state.revision_;
-  return state.eligible_;
+  if (leader_authority_eligible_ == eligible) {
+    return leader_authority_eligible_;
+  }
+  if (leader_authority_eligibility_revision_ ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    leader_authority_eligible_ = false;
+    return false;
+  }
+  ++leader_authority_eligibility_revision_;
+  leader_authority_eligible_ = eligible;
+  return leader_authority_eligible_;
 }
 
 void MetaDataControlRuntimeStatus::EndLeadership(

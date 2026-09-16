@@ -5,21 +5,14 @@
 #include <map>
 #include <string>
 #include <utility>
+#include <variant>
 
 #include "absl/strings/str_cat.h"
 
 namespace keylane::meta {
 namespace {
 
-enum class JsonValueKind { kString, kBool, kUnsigned };
-
-struct JsonValue {
-  JsonValueKind kind_ = JsonValueKind::kString;
-  std::string string_;
-  bool bool_ = false;
-  std::uint64_t unsigned_ = 0;
-};
-
+using JsonValue = std::variant<std::string, bool, std::uint64_t>;
 using JsonObject = std::map<std::string, JsonValue>;
 
 class CompactJsonObjectParser {
@@ -86,25 +79,18 @@ class CompactJsonObjectParser {
   }
 
   absl::StatusOr<JsonValue> ParseValue() {
-    JsonValue value;
     if (!AtEnd() && raw_[offset_] == '"') {
       auto string = ParseString();
       if (!string.ok()) return string.status();
-      value.kind_ = JsonValueKind::kString;
-      value.string_ = std::move(*string);
-      return value;
+      return JsonValue(std::in_place_type<std::string>, std::move(*string));
     }
     if (raw_.substr(offset_).starts_with("true")) {
       offset_ += 4;
-      value.kind_ = JsonValueKind::kBool;
-      value.bool_ = true;
-      return value;
+      return JsonValue(true);
     }
     if (raw_.substr(offset_).starts_with("false")) {
       offset_ += 5;
-      value.kind_ = JsonValueKind::kBool;
-      value.bool_ = false;
-      return value;
+      return JsonValue(false);
     }
     if (AtEnd() || raw_[offset_] < '0' || raw_[offset_] > '9') {
       return Error("unsupported policy JSON value");
@@ -113,18 +99,17 @@ class CompactJsonObjectParser {
         raw_[offset_ + 1] >= '0' && raw_[offset_ + 1] <= '9') {
       return Error("leading zero in policy integer");
     }
-    value.kind_ = JsonValueKind::kUnsigned;
+    std::uint64_t value = 0;
     while (!AtEnd() && raw_[offset_] >= '0' && raw_[offset_] <= '9') {
       const std::uint64_t digit =
           static_cast<std::uint64_t>(raw_[offset_] - '0');
-      if (value.unsigned_ >
-          (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+      if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
         return Error("policy integer overflow");
       }
-      value.unsigned_ = value.unsigned_ * 10 + digit;
+      value = value * 10 + digit;
       ++offset_;
     }
-    return value;
+    return JsonValue(value);
   }
 
   std::string_view raw_;
@@ -146,7 +131,8 @@ absl::Status RequireExactFields(const JsonObject& object,
 
 absl::Status RequireKind(const JsonObject& object, std::string_view expected) {
   const JsonValue& kind = object.at("kind");
-  if (kind.kind_ != JsonValueKind::kString || kind.string_ != expected) {
+  const auto* value = std::get_if<std::string>(&kind);
+  if (value == nullptr || *value != expected) {
     return MetaDomainRejectError("policy kind does not match policy family");
   }
   return absl::OkStatus();
@@ -187,18 +173,19 @@ DecodeAutomaticUncontrolledFailoverPolicy(std::string_view raw) {
   }
   const JsonValue& enabled = object->at("enabled");
   const JsonValue& suspect_after = object->at("suspect_after_ms");
-  if (enabled.kind_ != JsonValueKind::kBool ||
-      suspect_after.kind_ != JsonValueKind::kUnsigned) {
+  const auto* enabled_value = std::get_if<bool>(&enabled);
+  const auto* suspect_after_value = std::get_if<std::uint64_t>(&suspect_after);
+  if (enabled_value == nullptr || suspect_after_value == nullptr) {
     return MetaDomainRejectError(
         "automatic failover policy field type mismatch");
   }
-  if (suspect_after.unsigned_ < kMinimumAutomaticFailoverSuspectAfterMs ||
-      suspect_after.unsigned_ > kMaximumAutomaticFailoverSuspectAfterMs) {
+  if (*suspect_after_value < kMinimumAutomaticFailoverSuspectAfterMs ||
+      *suspect_after_value > kMaximumAutomaticFailoverSuspectAfterMs) {
     return MetaDomainRejectError("suspect_after_ms outside supported range");
   }
   return MetaAutomaticUncontrolledFailoverPolicy{
-      .enabled_ = enabled.bool_,
-      .suspect_after_ms_ = suspect_after.unsigned_,
+      .enabled_ = *enabled_value,
+      .suspect_after_ms_ = *suspect_after_value,
   };
 }
 
@@ -214,14 +201,15 @@ absl::StatusOr<MetaAuthorityLeasePolicy> DecodeAuthorityLeasePolicy(
     return status;
   }
   const JsonValue& duration = object->at("duration_ms");
-  if (duration.kind_ != JsonValueKind::kUnsigned) {
+  const auto* duration_value = std::get_if<std::uint64_t>(&duration);
+  if (duration_value == nullptr) {
     return MetaDomainRejectError("authority lease policy field type mismatch");
   }
-  if (duration.unsigned_ < kMinimumAuthorityLeaseDurationMs ||
-      duration.unsigned_ > kMaximumAuthorityLeaseDurationMs) {
+  if (*duration_value < kMinimumAuthorityLeaseDurationMs ||
+      *duration_value > kMaximumAuthorityLeaseDurationMs) {
     return MetaDomainRejectError("duration_ms outside supported range");
   }
-  return MetaAuthorityLeasePolicy{.duration_ms_ = duration.unsigned_};
+  return MetaAuthorityLeasePolicy{.duration_ms_ = *duration_value};
 }
 
 absl::Status MetaPolicyStore::Apply(const PutPolicy& cmd) {
@@ -241,7 +229,7 @@ absl::Status MetaPolicyStore::Apply(const PutPolicy& cmd) {
     const auto& versions = policy_it->second;
     if (const auto existing = versions.find(cmd.version_);
         existing != versions.end()) {
-      if (existing->second.content_ == cmd.content_) return absl::OkStatus();
+      if (existing->second == cmd.content_) return absl::OkStatus();
       return MetaDomainRejectError(
           "policy version already has different raw content");
     }
@@ -258,7 +246,7 @@ absl::Status MetaPolicyStore::Apply(const PutPolicy& cmd) {
   std::uint64_t evicted_bytes = 0;
   if (policy_it != policies_.end() &&
       policy_it->second.size() == kMaxMetaPolicyVersionsPerPolicy) {
-    evicted_bytes = policy_it->second.begin()->second.content_.size();
+    evicted_bytes = policy_it->second.begin()->second.size();
   }
   if (total_content_bytes_ - evicted_bytes + cmd.content_.size() >
       kMaxMetaPolicyTotalBytes) {
@@ -266,10 +254,10 @@ absl::Status MetaPolicyStore::Apply(const PutPolicy& cmd) {
   }
 
   auto& versions = policies_[cmd.policy_id_];
-  versions.emplace(cmd.version_, VersionState{cmd.content_});
+  versions.emplace(cmd.version_, cmd.content_);
   total_content_bytes_ += cmd.content_.size();
   if (versions.size() > kMaxMetaPolicyVersionsPerPolicy) {
-    total_content_bytes_ -= versions.begin()->second.content_.size();
+    total_content_bytes_ -= versions.begin()->second.size();
     versions.erase(versions.begin());
   }
   return absl::OkStatus();
@@ -281,7 +269,7 @@ std::optional<MetaPolicyVersionView> MetaPolicyStore::FindVersion(
   if (policy == policies_.end()) return std::nullopt;
   const auto entry = policy->second.find(version);
   if (entry == policy->second.end()) return std::nullopt;
-  return MetaPolicyVersionView{policy_id, version, entry->second.content_};
+  return MetaPolicyVersionView{policy_id, version, entry->second};
 }
 
 std::optional<std::uint64_t> MetaPolicyStore::LatestVersion(
@@ -295,7 +283,7 @@ std::vector<MetaPolicyVersionView> MetaPolicyStore::Versions() const {
   std::vector<MetaPolicyVersionView> result;
   for (const auto& [policy_id, versions] : policies_) {
     for (const auto& [version, state] : versions) {
-      result.push_back({policy_id, version, state.content_});
+      result.push_back({policy_id, version, state});
     }
   }
   return result;
@@ -307,7 +295,7 @@ MetaPolicyStore::CurrentAutomaticUncontrolledFailover() const {
       policies_.find(std::string(kAutomaticUncontrolledFailoverPolicyId));
   if (policy == policies_.end() || policy->second.empty()) return std::nullopt;
   const auto& [version, state] = *policy->second.rbegin();
-  auto decoded = DecodeAutomaticUncontrolledFailoverPolicy(state.content_);
+  auto decoded = DecodeAutomaticUncontrolledFailoverPolicy(state);
   if (!decoded.ok()) return std::nullopt;
   decoded->version_ = version;
   return *decoded;
@@ -318,7 +306,7 @@ std::optional<MetaAuthorityLeasePolicy> MetaPolicyStore::CurrentAuthorityLease()
   const auto policy = policies_.find(std::string(kAuthorityLeasePolicyId));
   if (policy == policies_.end() || policy->second.empty()) return std::nullopt;
   const auto& [version, state] = *policy->second.rbegin();
-  auto decoded = DecodeAuthorityLeasePolicy(state.content_);
+  auto decoded = DecodeAuthorityLeasePolicy(state);
   if (!decoded.ok()) return std::nullopt;
   decoded->version_ = version;
   return *decoded;
@@ -333,7 +321,7 @@ std::string MetaPolicyStore::Serialize() const {
     writer.WriteCount(static_cast<std::uint32_t>(versions.size()));
     for (const auto& [version, state] : versions) {
       writer.WriteU64(version);
-      writer.WriteString(state.content_);
+      writer.WriteString(state);
     }
   }
   return writer.TakeBuffer();
@@ -367,7 +355,7 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
       return MetaFailStopError("policy family has no versions in snapshot");
     }
 
-    std::map<std::uint64_t, VersionState> versions;
+    std::map<std::uint64_t, std::string> versions;
     std::uint64_t previous = 0;
     std::uint64_t first = 0;
     for (std::uint32_t v = 0; v < *version_count; ++v) {
@@ -388,7 +376,7 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
           !status.ok()) {
         return SnapshotFailure(status);
       }
-      versions.emplace(*version, VersionState{std::string(*content)});
+      versions.emplace(*version, std::string(*content));
       store.total_content_bytes_ += content->size();
       previous = *version;
     }

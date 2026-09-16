@@ -3393,20 +3393,17 @@ class FollowOwnerReconcileService final : public celer::Service {
   absl::Status result_ = absl::OkStatus();
 };
 
-struct SourceAuthorizationFaultBarrierPaths {
-  std::filesystem::path admission_entered_;
-  std::filesystem::path revocation_closed_;
-};
-
 class FollowOwnerSourceAuthorizationService final : public celer::Service {
  public:
   FollowOwnerSourceAuthorizationService(
       keylane::storage::StorageEngine* storage,
       keylane::ReplicationManager* replication,
-      SourceAuthorizationFaultBarrierPaths fault_barriers = {})
+      std::filesystem::path admission_entered = {},
+      std::filesystem::path revocation_closed = {})
       : storage_(storage),
         replication_(replication),
-        fault_barriers_(std::move(fault_barriers)) {}
+        admission_entered_(std::move(admission_entered)),
+        revocation_closed_(std::move(revocation_closed)) {}
 
   void Prepare(unsigned thread_count) override {
     if (thread_count != 1) {
@@ -3678,7 +3675,7 @@ class FollowOwnerSourceAuthorizationService final : public celer::Service {
           "1",
       };
     };
-    if (!fault_barriers_.admission_entered_.empty()) {
+    if (!admission_entered_.empty()) {
       // Hold one authorized KLPSYNC after its optimistic gate check but before
       // registry publication. Strong revoke must close the shared gate, wait
       // for that unpublished control, and force its second check to return the
@@ -3697,7 +3694,7 @@ class FollowOwnerSourceAuthorizationService final : public celer::Service {
                                     population_control_args(), 96,
                                     crossing_result.get()));
       absl::Status barrier = co_await AwaitFaultBarrier(
-          fault_barriers_.admission_entered_,
+          admission_entered_,
           "population source admission publication barrier");
       if (!barrier.ok()) {
         (void)::shutdown(crossing->peer_fd_, SHUT_RDWR);
@@ -3710,8 +3707,7 @@ class FollowOwnerSourceAuthorizationService final : public celer::Service {
       // Discard any earlier acknowledgement so the next file creation proves
       // that this exact concurrently spawned revoker closed the gate.
       std::error_code stale_ack_error;
-      (void)std::filesystem::remove(fault_barriers_.revocation_closed_,
-                                    stale_ack_error);
+      (void)std::filesystem::remove(revocation_closed_, stale_ack_error);
       if (stale_ack_error) {
         co_return absl::InternalError(absl::StrCat(
             "could not reset population source revocation barrier: ",
@@ -3721,16 +3717,15 @@ class FollowOwnerSourceAuthorizationService final : public celer::Service {
       retained_requests_.push_back(revocation_result);
       worker.Spawn(RunSourceRevocation(revocation_result.get()));
       barrier = co_await AwaitFaultBarrier(
-          fault_barriers_.revocation_closed_,
-          "population source revocation gate barrier");
+          revocation_closed_, "population source revocation gate barrier");
       if (!barrier.ok()) co_return barrier;
       if (revocation_result->done_) {
         co_return TestFailure(
             "source revocation did not join the unpublished KLPSYNC");
       }
       std::error_code release_error;
-      const bool released = std::filesystem::remove(
-          fault_barriers_.admission_entered_, release_error);
+      const bool released =
+          std::filesystem::remove(admission_entered_, release_error);
       if (!released || release_error) {
         co_return absl::InternalError(absl::StrCat(
             "could not release population source admission barrier: ",
@@ -4081,7 +4076,8 @@ class FollowOwnerSourceAuthorizationService final : public celer::Service {
 
   keylane::storage::StorageEngine* storage_ = nullptr;
   keylane::ReplicationManager* replication_ = nullptr;
-  SourceAuthorizationFaultBarrierPaths fault_barriers_;
+  std::filesystem::path admission_entered_;
+  std::filesystem::path revocation_closed_;
   std::vector<std::shared_ptr<RequestResult>> retained_requests_;
   std::vector<int> peer_fds_;
   absl::Status result_ = absl::OkStatus();
@@ -4891,15 +4887,15 @@ TEST(ReplicationManagerIntegrationTest,
 #endif
   keylane::test::TempDirectory directory(
       "population-source-revoke-admission-crossing");
-  SourceAuthorizationFaultBarrierPaths fault_barriers{
-      .admission_entered_ = directory.path() / "admission-entered",
-      .revocation_closed_ = directory.path() / "revocation-closed",
-  };
+  const std::filesystem::path admission_entered =
+      directory.path() / "admission-entered";
+  const std::filesystem::path revocation_closed =
+      directory.path() / "revocation-closed";
   ASSERT_EQ(::setenv("KEYLANE_REPLICATION_SOURCE_ADMISSION_BARRIER_PATH",
-                     fault_barriers.admission_entered_.c_str(), 1),
+                     admission_entered.c_str(), 1),
             0);
   ASSERT_EQ(::setenv("KEYLANE_REPLICATION_SOURCE_REVOCATION_BARRIER_ACK_PATH",
-                     fault_barriers.revocation_closed_.c_str(), 1),
+                     revocation_closed.c_str(), 1),
             0);
   struct FaultReset {
     ~FaultReset() {
@@ -4929,8 +4925,8 @@ TEST(ReplicationManagerIntegrationTest,
   keylane::InitStorage(&storage, &replication);
   EnsureTxRuntime();
 
-  FollowOwnerSourceAuthorizationService service(&storage, &replication,
-                                                fault_barriers);
+  FollowOwnerSourceAuthorizationService service(
+      &storage, &replication, admission_entered, revocation_closed);
   celer::Server server;
   server.AddService(&service);
   celer::ServerOptions runtime;

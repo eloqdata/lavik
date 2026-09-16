@@ -37,14 +37,14 @@
 //     ordering enforced here. Whether a changed slot owner or config epoch is
 //     covered by an active grant is a cross-store fact: MetaStateApply rejects
 //     that transition until every affected group is fenced.
-//   - MetaGroupRecord fields (owner, group_term, authority_version,
+//   - MetaGroupRecord fields (owner, group_term,
 //     population manifest revision/digest, partition_replication_epoch) and
 //     per-group config_epoch change ONLY through the granular primitives below.
 //     The term/grant semantics and the atomicity of owner switches (failover /
 //     ActivateAuthority) span the grant store and are orchestrated by the
 //     apply dispatcher. The primitives therefore validate group existence and
 //     absolute-value/idempotency only; ordering rules (term raised once via
-//     BeginGroupTerm, authority_version bumps, ...) live in the grant layer.
+//     BeginGroupTerm and authority installation) live in the grant layer.
 //   - Membership does not cascade: removing the node named by record.owner_
 //     from the member table leaves owner_ untouched. The apply dispatcher
 //     reads the fact and decides.
@@ -168,8 +168,6 @@ class MetaTopologyStore {
   absl::Status SetOwner(const std::string& group_id,
                         const std::string& new_owner);
   absl::Status SetGroupTerm(const std::string& group_id, std::uint64_t term);
-  absl::Status SetAuthorityVersion(const std::string& group_id,
-                                   std::uint64_t authority_version);
   absl::Status SetPopulationManifest(const std::string& group_id,
                                      std::uint64_t manifest_revision,
                                      const MetaHash256& manifest_digest);

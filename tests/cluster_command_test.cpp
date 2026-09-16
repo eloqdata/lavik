@@ -563,8 +563,6 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
       .group_id_ = group->group_id_,
       .assignment_id_ = group->assignment_id_,
       .group_term_ = group->group_term_,
-      .authority_version_ = group->authority_version_,
-      .grant_revision_ = group->grant_revision_,
   };
   const auto now = cluster::LeaseClockNow();
   ASSERT_TRUE(runtime->node_control_installer_

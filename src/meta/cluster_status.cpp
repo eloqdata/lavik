@@ -23,7 +23,7 @@ namespace keylane::meta {
 namespace {
 
 constexpr std::uint16_t kHeadWireVersion = 1;
-constexpr std::uint16_t kStatusWireVersion = 3;
+constexpr std::uint16_t kStatusWireVersion = 4;
 constexpr std::size_t kMaxItems = 65'536;
 constexpr std::size_t kMaxString = 64 * 1024;
 constexpr std::size_t kMaxWireReply = 256 * 1024 * 1024;
@@ -481,8 +481,7 @@ absl::Status ValidateStatusIdentity(const ClusterStatusWireV1& status) {
           "clusterstatus group owner is absent from data nodes");
     }
     if (group.serving_ready_) {
-      if (!group.owner_node_id_.has_value() ||
-          !group.grant_revision_.has_value()) {
+      if (!group.owner_node_id_.has_value()) {
         return absl::InvalidArgumentError(
             "clusterstatus serving group lacks an owner grant");
       }
@@ -995,7 +994,6 @@ absl::StatusOr<std::string> EncodeClusterStatusReply(
         !wrote.ok())
       return wrote;
     writer.U64(group.config_epoch_);
-    OptionalU64(writer, group.grant_revision_);
     writer.Bool(group.serving_ready_);
     writer.Bool(group.topology_converged_);
     writer.U8(static_cast<std::uint8_t>(group.automatic_failover_state_));
@@ -1148,9 +1146,6 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
     auto config_epoch = reader.U64();
     if (!config_epoch.ok()) return config_epoch.status();
     group.config_epoch_ = *config_epoch;
-    auto grant = OptionalU64(reader);
-    if (!grant.ok()) return grant.status();
-    group.grant_revision_ = *grant;
     if (absl::Status read = read_bool(&group.serving_ready_); !read.ok())
       return read;
     if (absl::Status read = read_bool(&group.topology_converged_); !read.ok())
@@ -1394,7 +1389,7 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::CaptureStatus(
 absl::StatusOr<std::string> RenderClusterStatusJson(
     const ClusterStatusOutcome& outcome) {
   std::string json =
-      "{\"schema_version\":2,\"result\":" + Quote(ResultName(outcome.result_)) +
+      "{\"schema_version\":3,\"result\":" + Quote(ResultName(outcome.result_)) +
       ",\"readiness_basis\":\"meta_observed_v1\"";
   if (!outcome.status_.has_value()) {
     json += ",\"meta_available\":false,\"meta_membership_stable\":false";
@@ -1490,7 +1485,6 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
     json += ",\"term\":" + U64Json(group.term_);
     json += ",\"owner_node_id\":" + OptionalStringJson(group.owner_node_id_);
     json += ",\"config_epoch\":" + U64Json(group.config_epoch_);
-    json += ",\"grant_revision\":" + OptionalU64Json(group.grant_revision_);
     json += ",\"serving_ready\":" + BoolJson(group.serving_ready_);
     json += ",\"topology_converged\":" + BoolJson(group.topology_converged_);
     json += ",\"automatic_failover_state\":" +

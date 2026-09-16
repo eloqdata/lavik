@@ -597,7 +597,6 @@ TEST_F(MetaStateMachineTest,
   activate.group_id_ = group_id;
   activate.expected_term_ = 1;
   activate.new_owner_ = owner;
-  activate.new_authority_version_ = 1;
   activate.new_topology_epoch_ = 3;
   activate.new_config_epoch_ = 1;
   Commit(*machine, 9, activate);
@@ -612,8 +611,6 @@ TEST_F(MetaStateMachineTest,
   begin.expected_owner_assignment_id_ = owner_assignment;
   begin.expected_membership_revision_ = 2;
   begin.expected_group_term_ = 1;
-  begin.expected_authority_version_ = 1;
-  begin.expected_grant_revision_ = 9;
   begin.expected_population_manifest_revision_ = 0;
   begin.expected_population_manifest_digest_.fill(0);
   begin.expected_partition_replication_epoch_ = 0;
@@ -636,7 +633,6 @@ TEST_F(MetaStateMachineTest,
   const auto committed_grant = committed.grant_.GroupState(group_id);
   ASSERT_TRUE(committed_grant.has_value());
   EXPECT_EQ(committed_grant->group_term_, 2u);
-  EXPECT_TRUE(committed_grant->fenced_);
   EXPECT_FALSE(committed_grant->grant_.has_value());
 
   CreateSnapshot(*machine, /*log_idx=*/10, /*log_term=*/4);
@@ -656,7 +652,6 @@ TEST_F(MetaStateMachineTest,
   const auto restored_grant = restored.grant_.GroupState(group_id);
   ASSERT_TRUE(restored_grant.has_value());
   EXPECT_EQ(restored_grant->group_term_, 2u);
-  EXPECT_TRUE(restored_grant->fenced_);
   EXPECT_FALSE(restored_grant->grant_.has_value());
 
   // If the Raft core presents the snapshot's final entry again, exact-index

@@ -163,7 +163,6 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     std::string owner_ = Node(1);
     MetaAssignmentId owner_assignment_ = Bytes<16>(0x21);
     MetaOperationId controlled_operation_id_ = Bytes<16>(0x31);
-    std::uint64_t grant_revision_ = 0;
   };
 
   void SetUp() override {
@@ -271,14 +270,12 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     std::filesystem::remove_all(dir_, ignored);
   }
 
-  void ProposeAccepted(const MetaCommand& command,
-                       std::uint64_t* log_index = nullptr) {
+  void ProposeAccepted(const MetaCommand& command) {
     auto result = RunTaskSync(coordinator_->Propose(
         command,
         MetaCoordinatorTestPeer::Make("keylane://operator/automatic-test")));
     ASSERT_TRUE(result.ok()) << result.status();
     ASSERT_EQ(result->verdict_, MetaAuditVerdict::kAccepted) << result->detail_;
-    if (log_index != nullptr) *log_index = result->log_index_;
   }
 
   SeedState SeedCluster(bool controlled_request = false) {
@@ -355,10 +352,9 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     activate.group_id_ = "g1";
     activate.expected_term_ = 1;
     activate.new_owner_ = state.owner_;
-    activate.new_authority_version_ = 1;
     activate.new_topology_epoch_ = 3;
     activate.new_config_epoch_ = 1;
-    ProposeAccepted(activate, &state.grant_revision_);
+    ProposeAccepted(activate);
 
     // Created is a durable aggregate invariant, not permission to provision
     // the remaining state afterward. Complete only after both required
@@ -478,8 +474,6 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
         .owner_node_id_ = *group->owner_node_id,
         .owner_assignment_id_ = *group->owner_assignment_id,
         .group_term_ = group->group_term,
-        .authority_version_ = group->authority_version,
-        .grant_revision_ = group->grant_revision,
         .projection_hash_ = projected->full_state.projection_hash,
         .authority_lease_duration_ms_ =
             projected->full_state.authority_lease_duration_ms,
@@ -496,15 +490,11 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     }
     if (!causally_confirm_lease) return absl::OkStatus();
 
-    const MetaCausallyConfirmedLease confirmation{
-        .projection_ = owner_projection,
-        .acknowledged_heartbeat_sequence_ = 1,
-        .granted_duration_ms_ = effective_lease_duration_ms,
-    };
     auto confirmed = observations_.ReplaceHeartbeat(
         identity, std::move(health), std::nullopt, std::nullopt, std::nullopt,
-        owner_projection, /*heartbeat_sequence=*/2, confirmation, facts,
-        observed_at_unix_ms, observed_at_steady_ms);
+        owner_projection, /*heartbeat_sequence=*/2,
+        /*confirmed_grant_sequence=*/1, facts, observed_at_unix_ms,
+        observed_at_steady_ms);
     for (const absl::Status* status :
          {&confirmed.boot_status_, &confirmed.health_status_,
           &confirmed.candidate_status_, &confirmed.failover_status_}) {
@@ -545,20 +535,10 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
         .owner_node_id_ = *group->owner_node_id,
         .owner_assignment_id_ = *group->owner_assignment_id,
         .group_term_ = group->group_term,
-        .authority_version_ = group->authority_version,
-        .grant_revision_ = group->grant_revision,
         .projection_hash_ = projected->full_state.projection_hash,
         .authority_lease_duration_ms_ =
             projected->full_state.authority_lease_duration_ms,
     };
-    std::optional<MetaCausallyConfirmedLease> confirmation;
-    if (confirmed_ack_sequence.has_value()) {
-      confirmation = MetaCausallyConfirmedLease{
-          .projection_ = owner_projection,
-          .acknowledged_heartbeat_sequence_ = *confirmed_ack_sequence,
-          .granted_duration_ms_ = effective_lease_duration_ms,
-      };
-    }
     const MetaObservationIdentity identity{seed.owner_, Bytes<20>(0x11), 1};
     const MetaStoresFacts facts(view.stores());
     auto result = observations_.ReplaceHeartbeat(
@@ -568,7 +548,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
                           .draining_ = draining,
                           .active_groups_ = 1},
         std::nullopt, std::nullopt, std::nullopt, owner_projection,
-        heartbeat_sequence, std::move(confirmation), facts, observed_at_unix_ms,
+        heartbeat_sequence, confirmed_ack_sequence, facts, observed_at_unix_ms,
         observed_at_steady_ms);
     for (const absl::Status* status :
          {&result.boot_status_, &result.health_status_,
@@ -614,8 +594,6 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
             .group_id = projection.group_id_,
             .assignment_id = projection.owner_assignment_id_,
             .group_term = projection.group_term_,
-            .authority_version = projection.authority_version_,
-            .grant_revision = projection.grant_revision_,
             .granted_duration_ms = projection.authority_lease_duration_ms_,
         });
   }
@@ -1397,9 +1375,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
           .group_id = replacement_group.group_id_,
           .assignment_id = replacement_group.assignment_id_,
           .group_term = replacement_group.group_term_,
-          .authority_version = replacement_group.authority_version_,
-          .grant_revision = replacement_group.grant_revision_,
-          .granted_duration_ms = replacement_owner.authority_lease_duration_ms_,
+          .granted_duration_ms = 250,
       },
       /*written_unix_ms=*/1'012'100);
   ASSERT_TRUE(WaitUntil([&] {
@@ -1550,9 +1526,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
           .group_id = group.group_id_,
           .assignment_id = group.assignment_id_,
           .group_term = group.group_term_,
-          .authority_version = group.authority_version_,
-          .grant_revision = group.grant_revision_,
-          .granted_duration_ms = owner.authority_lease_duration_ms_,
+          .granted_duration_ms = 6'000,
       },
       /*written_unix_ms=*/1'012'000);
 

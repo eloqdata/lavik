@@ -113,7 +113,6 @@ struct Fixture {
   keylane::meta::MetaBootIncarnation target_boot = Bytes<20>(0x71);
   keylane::meta::MetaBootIncarnation source_boot = Bytes<20>(0x81);
   keylane::meta::MetaReplicationHistoryId source_history = Bytes<20>(0x91);
-  std::uint64_t grant_revision = 0;
   std::uint64_t directive_revision = 0;
 };
 
@@ -217,10 +216,8 @@ Fixture CompleteFixture(std::string operation_kind = "population-rebuild") {
   activate.group_id_ = "group-a";
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.target;
-  activate.new_authority_version_ = 1;
   activate.new_topology_epoch_ = 6;
   activate.new_config_epoch_ = 12;
-  fixture.grant_revision = index;
   Commit(fixture.stores, index++, activate);
 
   keylane::meta::CreateGroup create_empty;
@@ -251,8 +248,6 @@ Fixture CompleteFixture(std::string operation_kind = "population-rebuild") {
   directive.source_replication_history_id_ = fixture.source_history;
   directive.group_id_ = "group-a";
   directive.group_term_ = 1;
-  directive.authority_version_ = 1;
-  directive.grant_revision_ = fixture.grant_revision;
   directive.population_manifest_revision_ = 1;
   directive.population_manifest_digest_ = fixture.manifest_digest;
   directive.partition_replication_epoch_ = 1;
@@ -290,7 +285,9 @@ TEST(MetaControlProjector, ProjectsRegisteredNodeBeforeAnyGroupExists) {
   ASSERT_TRUE(projected.ok()) << projected.status();
   EXPECT_EQ(projected->full_state.topology_epoch, 0u);
   EXPECT_EQ(projected->full_state.authority_lease_duration_ms, 3000u);
-  EXPECT_EQ(projected->full_state.data_heartbeat_interval_ms, 1000u);
+  EXPECT_EQ(control::DataHeartbeatIntervalMs(
+                projected->full_state.authority_lease_duration_ms),
+            1000u);
   EXPECT_TRUE(projected->full_state.groups.empty());
   ASSERT_EQ(projected->full_state.nodes.size(), 1u);
   EXPECT_EQ(projected->full_state.nodes.front().node_id, registration.node_id_);
@@ -321,7 +318,8 @@ TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   EXPECT_EQ(state.source_meta_applied_index, 99u);
   EXPECT_EQ(state.topology_epoch, 7u);
   EXPECT_EQ(state.authority_lease_duration_ms, 5000u);
-  EXPECT_EQ(state.data_heartbeat_interval_ms, 1666u);
+  EXPECT_EQ(control::DataHeartbeatIntervalMs(state.authority_lease_duration_ms),
+            1666u);
   ASSERT_EQ(state.meta_directory.size(), 2u);
   EXPECT_EQ(
       state.meta_directory[0],
@@ -347,8 +345,6 @@ TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   EXPECT_EQ(group.owner_node_id, fixture.target);
   EXPECT_EQ(group.owner_assignment_id, fixture.target_assignment);
   EXPECT_EQ(group.group_term, 1u);
-  EXPECT_EQ(group.authority_version, 1u);
-  EXPECT_EQ(group.grant_revision, fixture.grant_revision);
   EXPECT_TRUE(group.grant_active);
   EXPECT_EQ(group.config_epoch, 12u);
   EXPECT_EQ(group.slot_ranges,
@@ -378,8 +374,6 @@ TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   EXPECT_EQ(directive.authority.group_id, "group-a");
   EXPECT_EQ(directive.authority.assignment_id, fixture.target_assignment);
   EXPECT_EQ(directive.authority.group_term, 1u);
-  EXPECT_EQ(directive.authority.authority_version, 1u);
-  EXPECT_EQ(directive.authority.grant_revision, fixture.grant_revision);
   EXPECT_EQ(directive.identity.operation_id, fixture.operation_id);
   EXPECT_EQ(directive.identity.directive_id, fixture.directive_id);
   EXPECT_EQ(directive.identity.attempt_id, fixture.attempt_id);
@@ -494,17 +488,13 @@ TEST(MetaControlProjector, ProjectsCurrentGrantActivationActionIdentity) {
   activate.group_id_ = "group-a";
   activate.expected_term_ = 2;
   activate.new_owner_ = fixture.target;
-  activate.new_authority_version_ = 2;
   activate.new_topology_epoch_ = 8;
   activate.new_config_epoch_ = 13;
   const keylane::meta::MetaFailoverActionId action_id = Bytes<16>(0xb1);
-  ASSERT_TRUE(
-      fixture.stores.grant_.ValidateActivate(activate, 100, action_id).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetAuthorityVersion("group-a", 2).ok());
+  ASSERT_TRUE(fixture.stores.grant_.ValidateActivate(activate, action_id).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetTopologyEpoch(8).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetGroupConfigEpoch("group-a", 13).ok());
-  ASSERT_TRUE(
-      fixture.stores.grant_.ApplyGrantPart(activate, 100, action_id).ok());
+  ASSERT_TRUE(fixture.stores.grant_.ApplyGrantPart(activate, action_id).ok());
 
   // Project the other member so the fixture's deliberately old target-only
   // directive is outside this node-specific batch.
@@ -588,7 +578,9 @@ TEST(MetaControlProjector,
   EXPECT_NE(changed->full_state.projection_hash,
             first->full_state.projection_hash);
   EXPECT_EQ(changed->full_state.authority_lease_duration_ms, 6000u);
-  EXPECT_EQ(changed->full_state.data_heartbeat_interval_ms, 2000u);
+  EXPECT_EQ(control::DataHeartbeatIntervalMs(
+                changed->full_state.authority_lease_duration_ms),
+            2000u);
 }
 
 TEST(MetaControlProjector,
@@ -612,11 +604,12 @@ TEST(MetaControlProjector,
      GrantlessGroupDoesNotProjectHistoricalOwnerAfterMemberRemoval) {
   Fixture fixture = CompleteFixture();
 
-  keylane::meta::RevokeGrant revoke;
-  revoke.request_id_ = Bytes<16>(0x78);
-  revoke.group_id_ = "group-a";
-  revoke.expected_term_ = 1;
-  Commit(fixture.stores, 21, revoke);
+  keylane::meta::FenceGroup fence;
+  fence.request_id_ = Bytes<16>(0x78);
+  fence.group_id_ = "group-a";
+  fence.expected_term_ = 1;
+  fence.new_term_ = 2;
+  Commit(fixture.stores, 21, fence);
 
   keylane::meta::RemoveNodeFromGroup remove;
   remove.request_id_ = Bytes<16>(0x79);
@@ -641,11 +634,12 @@ TEST(MetaControlProjector,
      FencedGroupProjectsCommittedOwnerRoleWithoutAnActiveGrant) {
   Fixture fixture = CompleteFixture();
 
-  keylane::meta::RevokeGrant revoke;
-  revoke.request_id_ = Bytes<16>(0x78);
-  revoke.group_id_ = "group-a";
-  revoke.expected_term_ = 1;
-  Commit(fixture.stores, 21, revoke);
+  keylane::meta::FenceGroup fence;
+  fence.request_id_ = Bytes<16>(0x78);
+  fence.group_id_ = "group-a";
+  fence.expected_term_ = 1;
+  fence.new_term_ = 2;
+  Commit(fixture.stores, 21, fence);
 
   const auto projected = MetaControlProjector::ProjectNode(
       MetaCommittedView(std::move(fixture.stores), 21), fixture.source);

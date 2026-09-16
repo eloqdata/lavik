@@ -43,14 +43,7 @@ AuthorityAnchor AnchorFor(const GroupView& group) {
       .group_id_ = group.group_id_,
       .assignment_id_ = group.assignment_id_,
       .group_term_ = group.group_term_,
-      .authority_version_ = group.authority_version_,
-      .grant_revision_ = group.grant_revision_,
   };
-}
-
-auto CounterTuple(const AuthorityAnchor& anchor) {
-  return std::tuple{anchor.group_term_, anchor.authority_version_,
-                    anchor.grant_revision_};
 }
 
 bool SameLocalAssignment(const ServingState& state, const GroupView& group) {
@@ -502,9 +495,6 @@ NodeControlInstaller::ValidateLeaseGrantContext(const AuthorityMessage& message,
   // cannot describe different lease contracts.
   if (control.identity_.group_id_ != message.anchor_.group_id_ ||
       control.identity_.group_term_ != message.anchor_.group_term_ ||
-      control.identity_.authority_version_ !=
-          message.anchor_.authority_version_ ||
-      control.identity_.grant_revision_ != message.anchor_.grant_revision_ ||
       !control.owner_.has_value() ||
       control.owner_->node_id_ != current->Self()->node_id_ ||
       control.owner_->assignment_id_ != message.anchor_.assignment_id_ ||
@@ -523,17 +513,13 @@ NodeControlInstaller::ValidateLeaseGrantContext(const AuthorityMessage& message,
         "lease grant disagrees with committed desired owner authority: ",
         "message={group=", message.anchor_.group_id_,
         ",assignment=", message.anchor_.assignment_id_.ToHexString(),
-        ",term=", message.anchor_.group_term_,
-        ",authority=", message.anchor_.authority_version_,
-        ",grant=", message.anchor_.grant_revision_, ",duration_ms=",
+        ",term=", message.anchor_.group_term_, ",duration_ms=",
         std::chrono::duration_cast<std::chrono::milliseconds>(
             message.granted_duration_)
             .count(),
         "} desired={group=", control.identity_.group_id_,
         ",owner=", desired_owner, ",owner_assignment=", desired_assignment,
         ",term=", control.identity_.group_term_,
-        ",authority=", control.identity_.authority_version_,
-        ",grant=", control.identity_.grant_revision_,
         ",grant_active=", control.grant_active_ ? "true" : "false",
         ",effective_duration_ms=", authority_lease_duration_ms_,
         "} local_node=", current->Self()->node_id_.ToHexString()));
@@ -620,13 +606,10 @@ absl::Status NodeControlInstaller::ValidateDirectiveAnchor(
         "directive group is absent from the installed FDS identities");
   }
   if (control_group->group_term_ != directive.anchor_.group_term_ ||
-      control_group->authority_version_ !=
-          directive.anchor_.authority_version_ ||
-      control_group->grant_revision_ != directive.anchor_.grant_revision_ ||
       control_group->partition_replication_epoch_ !=
           directive.partition_replication_epoch_) {
     return absl::FailedPreconditionError(
-        "directive authority counters are not current");
+        "directive authority identity is not current");
   }
   const PreparedMemberAssignment* target =
       FindMemberAssignment(*control_group, directive.target_node_id_);
@@ -912,9 +895,7 @@ bool NodeControlInstaller::RejectedByFence(
       it->second.assignment_id_ != anchor.assignment_id_) {
     return false;
   }
-  return CounterTuple(anchor) <= std::tuple{it->second.group_term_,
-                                            it->second.authority_version_,
-                                            it->second.grant_revision_};
+  return anchor.group_term_ <= it->second.group_term_;
 }
 
 std::shared_ptr<const ServingState> NodeControlInstaller::WithStorageReady(
@@ -929,8 +910,6 @@ std::shared_ptr<const ServingState> NodeControlInstaller::WithFence(
     if (group.group_id_ != anchor.group_id_) return;
     group.assignment_id_ = anchor.assignment_id_;
     group.group_term_ = anchor.group_term_;
-    group.authority_version_ = anchor.authority_version_;
-    group.grant_revision_ = anchor.grant_revision_;
     group.granted_ = false;
   });
 }
@@ -1021,9 +1000,6 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
           prepared_state.serving_state_->FindGroup(control_group.group_id_);
       if (serving_group != nullptr &&
           (serving_group->group_term_ != control_group.group_term_ ||
-           serving_group->authority_version_ !=
-               control_group.authority_version_ ||
-           serving_group->grant_revision_ != control_group.grant_revision_ ||
            serving_group->config_epoch_ != control_group.config_epoch_ ||
            serving_group->manifest_revision_ !=
                control_group.manifest_revision_)) {
@@ -1177,8 +1153,6 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
       if (shares_member_incarnation &&
           (new_group->config_epoch_ < old_group.config_epoch_ ||
            new_group->group_term_ < old_group.group_term_ ||
-           new_group->authority_version_ < old_group.authority_version_ ||
-           new_group->grant_revision_ < old_group.grant_revision_ ||
            new_group->manifest_revision_ < old_group.manifest_revision_)) {
         return absl::FailedPreconditionError(absl::StrCat(
             "same-membership control counter regressed for group '",
@@ -1200,8 +1174,6 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
       }
       if (new_group->config_epoch_ < old_group.config_epoch_ ||
           new_group->group_term_ < old_group.group_term_ ||
-          new_group->authority_version_ < old_group.authority_version_ ||
-          new_group->grant_revision_ < old_group.grant_revision_ ||
           new_group->manifest_revision_ < old_group.manifest_revision_) {
         return absl::FailedPreconditionError(absl::StrCat(
             "same-assignment control counter regressed for group '",
@@ -1701,13 +1673,10 @@ absl::StatusOr<bool> NodeControlInstaller::ApplyFenceLocal(
 
   RejectThrough& floor = reject_through_[message.anchor_.group_id_];
   if (floor.assignment_id_ != message.anchor_.assignment_id_ ||
-      std::tuple{floor.group_term_, floor.authority_version_,
-                 floor.grant_revision_} < CounterTuple(message.anchor_)) {
+      floor.group_term_ < message.anchor_.group_term_) {
     floor = RejectThrough{
         .assignment_id_ = message.anchor_.assignment_id_,
         .group_term_ = message.anchor_.group_term_,
-        .authority_version_ = message.anchor_.authority_version_,
-        .grant_revision_ = message.anchor_.grant_revision_,
     };
   }
 

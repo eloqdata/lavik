@@ -62,7 +62,6 @@ ClusterStatusWireV1 ReadyStatus(std::vector<ClusterMetaMemberWireV1> members,
        .term_ = 4,
        .owner_node_id_ = "data-1",
        .config_epoch_ = 8,
-       .grant_revision_ = 12,
        .serving_ready_ = true,
        .topology_converged_ = true,
        .automatic_failover_state_ = ClusterAutomaticFailoverState::kHealthy,
@@ -109,7 +108,7 @@ TEST(MetaClusterStatusWireTest, RoundTripsStrictBoundedV1Messages) {
   ASSERT_TRUE(encoded_status.ok()) << encoded_status.status();
   EXPECT_EQ(
       encoded_status->substr(std::string("OK clusterstatus 1 ").size(), 4),
-      "0003");
+      "0004");
   auto decoded_status = DecodeClusterStatusReply(*encoded_status);
   ASSERT_TRUE(decoded_status.ok()) << decoded_status.status();
   EXPECT_EQ(*decoded_status, status);
@@ -229,9 +228,6 @@ TEST(MetaClusterStatusWireTest, EnforcesReadinessBasisAndReadyTopology) {
   ClusterStatusWireV1 no_slots = ready;
   no_slots.slot_ranges_.clear();
   EXPECT_FALSE(EncodeClusterStatusReply(no_slots).ok());
-  ClusterStatusWireV1 no_grant = ready;
-  no_grant.groups_.front().grant_revision_.reset();
-  EXPECT_FALSE(EncodeClusterStatusReply(no_grant).ok());
   ClusterStatusWireV1 stale_owner = ready;
   stale_owner.data_nodes_.front().health_fresh_ = false;
   EXPECT_FALSE(EncodeClusterStatusReply(stale_owner).ok());
@@ -656,7 +652,7 @@ TEST(MetaClusterStatusRenderTest, JsonUsesStableArraysAndStringU64) {
   auto json = RenderClusterStatusJson(outcome);
   ASSERT_TRUE(json.ok()) << json.status();
   EXPECT_TRUE(
-      json->starts_with("{\"schema_version\":2,\"result\":\"not_ready\""));
+      json->starts_with("{\"schema_version\":3,\"result\":\"not_ready\""));
   EXPECT_NE(json->find("\"committed_index\":\"50\""), std::string::npos);
   EXPECT_LT(json->find("\"code\":\"a\""), json->find("\"code\":\"z\""));
 }

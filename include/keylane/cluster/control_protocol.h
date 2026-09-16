@@ -290,8 +290,6 @@ struct WireAuthorityAnchor {
   std::string group_id;
   WireId128 assignment_id{};
   std::uint64_t group_term = 0;
-  std::uint64_t authority_version = 0;
-  std::uint64_t grant_revision = 0;
 
   friend bool operator==(const WireAuthorityAnchor&,
                          const WireAuthorityAnchor&) = default;
@@ -338,8 +336,6 @@ struct LeaseChallenge {
   std::string group_id;
   WireId128 assignment_id{};
   std::uint64_t group_term = 0;
-  std::uint64_t authority_version = 0;
-  std::uint64_t grant_revision = 0;
 
   friend bool operator==(const LeaseChallenge&,
                          const LeaseChallenge&) = default;
@@ -473,8 +469,6 @@ struct LeaseGranted {
   std::string group_id;
   WireId128 assignment_id{};
   std::uint64_t group_term = 0;
-  std::uint64_t authority_version = 0;
-  std::uint64_t grant_revision = 0;
   std::uint32_t granted_duration_ms = 0;
 
   friend bool operator==(const LeaseGranted&, const LeaseGranted&) = default;
@@ -820,8 +814,6 @@ struct WireDesiredGroup {
   std::optional<std::string> owner_node_id;
   std::optional<WireId128> owner_assignment_id;
   std::uint64_t group_term = 0;
-  std::uint64_t authority_version = 0;
-  std::uint64_t grant_revision = 0;
   bool grant_active = false;
   // Present only on a failover-installed current grant. Data may activate a
   // prepared promotion only when this matches its boot-local action context.
@@ -905,11 +897,10 @@ struct WireProjectedDirective {
 struct FullDesiredState {
   std::uint64_t source_meta_applied_index = 0;
   std::uint64_t topology_epoch = 0;
-  // These are resolved by the current Meta Leader from one global Policy and
-  // its local leadership-validity limit. Data consumes only these scalars and
-  // never interprets Policy identity or documents.
+  // Resolved by the current Meta Leader from one global Policy and its local
+  // leadership-validity limit. Data never interprets Policy identity or
+  // documents; it derives heartbeat cadence from this effective duration.
   std::uint32_t authority_lease_duration_ms = 0;
-  std::uint32_t data_heartbeat_interval_ms = 0;
   WireHash256 projection_hash{};
   WireHash256 object_hash{};
   std::vector<WireMetaEndpoint> meta_directory;
@@ -922,6 +913,15 @@ struct FullDesiredState {
   friend bool operator==(const FullDesiredState&,
                          const FullDesiredState&) = default;
 };
+
+// Data has no independent heartbeat setting. Keeping this derivation at the
+// protocol seam prevents Meta and Data from carrying two values that must
+// always agree.
+constexpr std::uint32_t DataHeartbeatIntervalMs(
+    std::uint32_t authority_lease_duration_ms) noexcept {
+  const std::uint32_t divided = authority_lease_duration_ms / 3;
+  return divided == 0 ? 1 : divided;
+}
 
 // Canonical semantic body used as the FullDesiredState transfer payload.
 // Decode derives object_hash as SHA-256 over these exact bytes.

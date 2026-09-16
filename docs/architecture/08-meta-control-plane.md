@@ -48,7 +48,7 @@ stores:
 | Identity | Data-node certificate principal bindings and retired identities; Meta-member principal bindings |
 | Topology | Single-Data-cluster lifecycle, Groups, membership, owners, epochs, manifest references, slot ranges, and one optional failover transition per Group |
 | Policy | Registered cluster-wide Policy families and their immutable consecutive raw JSON versions, exposed through typed current-value accessors |
-| Grant | Group terms, authority grants and revisions, activation actions, and fencing |
+| Grant | One optional authority Grant per Group Term, activation actions, and fencing |
 | Operation | Idempotent operation lifecycle, current directives, durable terminal receipts, and exported/prunable terminal summaries |
 | Population manifest | Immutable, content-addressed partition/epoch documents and explicit pruning |
 | Audit | Log-index-ordered command verdicts in a bounded hash chain |
@@ -56,15 +56,17 @@ stores:
 `ApplyCommitted` is the only mutation path. It dispatches absolute-value and
 revision-checked commands and enforces cross-store invariants such as unique
 principals, one data group per node, monotonic terms and epochs, required
-current Policy families for a Created cluster, and valid grant/operation
-anchors. Group membership, owner, slot, population-
+current Policy families for a Created cluster, and valid authority/operation
+anchors. Each Group Term may install at most one Grant. Fencing advances to a
+fresh grantless term, so replacing or reauthorizing an Owner cannot reuse an
+authority identity. Group membership, owner, slot, population-
 manifest, partition-replication, and `UpdateNode` endpoint changes advance the
 cluster topology epoch. `SetSlotMap` validates a complete candidate before
 publication and rejects any ownership or config-epoch change involving an
 active grant. Every affected source and destination group must first be
 fenced, preventing a lease for the old projection from spanning the cut.
 An active Group failover transition locks its owner, membership, term,
-authority, grant, manifest, population epoch, and config epoch against ordinary
+grant, manifest, population epoch, and config epoch against ordinary
 mutations. Only a typed failover command carrying the exact transition id and
 latest transition revision may advance that aggregate.
 Initial identity registration can be projected at
@@ -82,11 +84,11 @@ summary rather than being reconstructed from the node's membership at apply.
 Directive validity is a continuously maintained committed invariant, not only
 an admission check. After every accepted command, apply deterministically
 rechecks each bounded live directive against the exact active source and
-target assignments, group term, authority and grant revisions, and population
+target assignments, Group Term, and population
 manifest/partition epoch. It removes only the stale attempts and advances each
 affected operation's phase revision once, forcing reconcilers with an older
 CAS view to reload. This catches source or target removal/reassignment,
-term/authority/grant changes, fencing or revocation, and population changes
+term changes, fencing, and population changes
 without a command-specific cleanup list. Replaying the anchor mutation sees
 the directive already absent and is a no-op; snapshot decode rejects a stale
 directive as corrupt aggregate state.
@@ -194,11 +196,13 @@ A running Controlled transition, an advanced operation, or a mismatched named
 witness cannot be preempted.
 
 Commit requires the exact authorized prepared action and atomically activates
-its candidate as owner with a fresh grant, advances authority, topology, and
-config epochs, places the action id on the grant for Data activation, and
-clears the transition. Controlled Commit also completes its operation with
-`failover-completed` and requires loss `none`; uncontrolled Commit records the
-transition's latched loss policy: `none` only for an exact healthy action
+its candidate as owner with the target term's sole Grant, advances topology and
+config epochs, places the action id on the Grant for Data activation, and
+clears the transition. Controlled Commit advances to that term and installs
+the Grant in the same cutover; Uncontrolled Commit installs into the grantless
+term already reserved by Begin. Controlled Commit also completes its operation
+with `failover-completed` and requires loss `none`; Uncontrolled Commit records
+the transition's latched loss policy: `none` only for an exact healthy action
 retained from lossless controlled authorization, otherwise `unknown`.
 Controlled Abort terminates the operation and clears its matching transition.
 Its pre-Begin form gives a submitted operation a terminal path when planning
@@ -331,7 +335,7 @@ source fails; independently, the Automatic Failover Detector can begin an
 uncontrolled transition for an exactly unserviceable Owner.
 
 Owner Serviceability is one pure classification over a self-contained cut: the
-committed Owner, assignment, Group term, authority and grant; the current
+committed Owner, assignment, and Group Term; the current
 authenticated session generation and boot; the FDS installed on that session;
 TTL freshness, draining, storage and population health; and causal lease
 confirmation. The exact Unserviceable reason precedence is `session_missing`,
@@ -358,8 +362,8 @@ refreshes it. The store keeps the maximum unconfirmed deadline for the same
 Owner authority across projection or duration replacement. Confirmation of
 the latest ordered Grant collapses older possibilities into that exact
 installed window; the installed window itself survives later same-authority
-FDS replacement. A session/boot or Owner, assignment, term, authority, or
-grant change clears both. Thus a Policy/FDS replacement cannot erase a lease
+FDS replacement. A session/boot, Owner, assignment, or Group Term change
+clears both. Thus a Policy/FDS replacement cannot erase a lease
 Data may still retain, while confirmation of a shorter replacement Grant does
 not unnecessarily preserve an older longer deadline.
 
@@ -385,7 +389,7 @@ Indeterminate evidence for the same complete anchor freezes and later resumes
 it; Serviceable evidence clears it. A change
 to leadership generation or any revisioned eligibility interruption (including
 false-to-true entirely between detector polls), Owner/assignment, Group term,
-authority/grant revision, either current Policy version, enabled value, or
+either current Policy version, enabled value, or
 threshold discards it. A new or newly eligible leader first completes the
 normal observation warmup and then gives absence or failure a complete fresh
 debounce interval. Silent loss therefore needs the observation TTL plus that
@@ -412,10 +416,10 @@ inherits SUSPECT time.
 `MetaControlProjector` is a pure function over one atomic committed view. It
 produces a canonical node-specific `FullDesiredState`: the global Meta/Data
 directories and topology, each group's partition replication epoch, the
-resolved Authority Lease duration and derived heartbeat cadence, referenced
-population manifests, the optional Group failover transition and grant
-activation action, the complete steady owner/membership relationship, and live
-directives whose explicit recipient is that node. Each Group's
+resolved Authority Lease duration, referenced population manifests, the
+optional Group failover transition and grant activation action, the complete
+steady owner/membership relationship, and live directives whose explicit
+recipient is that node. Each Group's
 `steady_replication_enabled` bit
 is true only when the committed cluster lifecycle is `Created`; Genesis leaves
 explicit population directives as the sole ingress owner. Data defers the
@@ -427,10 +431,11 @@ wire seam. The source applied index is an
 ordering/diagnostic watermark; SHA-256 of the canonical semantic projection is
 the dependency used by leases and directives. The projector takes the current
 typed Authority Lease Policy, the leader publisher may only reduce its
-duration to the local leadership-validity bound, and the heartbeat interval is
-deterministically `max(1 ms, duration / 3)`. Both resolved scalars are covered
-by the projection hash and validated by Data. The publisher sends a full
-projection on session acceptance and whenever that hash changes. Control
+duration to the local leadership-validity bound, and that effective duration
+is covered by the projection hash and validated by Data. Data derives the
+heartbeat interval deterministically as `max(1 ms, duration / 3)`; cadence is
+not an independently encoded FDS scalar. The publisher sends a full projection
+on session acceptance and whenever that hash changes. Control
 protocol v1 has no delta format, so an index advance with identical content
 does not create network
 churn and a reconnect never depends on retained incremental history.
@@ -445,9 +450,9 @@ out of candidate-disconnect semantics without weakening real session-loss
 handling.
 
 Control v1 is unreleased and its schema is replaced in place. Data and Meta
-must use matching layouts; a Policy-bearing FDS, missing resolved lease or
-heartbeat cadence, missing Hello flow counts, and untyped rebuild payloads fail
-validation rather than being inferred or defaulted locally.
+must use matching layouts; a Policy-bearing FDS, missing resolved lease,
+missing Hello flow counts, and untyped rebuild payloads fail validation rather
+than being inferred or defaulted locally.
 
 The Data-control wire protocol has a fixed versioned header, per-direction
 sequence, payload length, and CRC32C. Frames are bounded to 16 KiB. Larger
@@ -514,7 +519,7 @@ of the previous heartbeat; an exact replay gets the cached exact ack. Because
 Data sends the next sequence only after processing the preceding Ack, receipt
 of heartbeat `N+1` is causal confirmation of Ack `N`. Meta retains that proof
 only when `N` granted a nonzero lease for the same authenticated session/boot
-and exact installed Owner projection, assignment, term, authority and grant.
+and exact installed Owner projection, assignment, and Group Term.
 Ack write completion alone is not confirmation, and cached Ack replay does not
 advance it. Data
 quiesces heartbeat projection reads during an FDS replacement. Any outstanding
@@ -819,24 +824,26 @@ the operation's stable idempotency key.
 ## Format compatibility
 
 The Meta/Data control wire uses protocol v1 with the current pre-release
-layout. FDS carries resolved Authority Lease duration and heartbeat cadence,
-and stop-and-wait heartbeat sequencing supplies the causal Ack confirmation
-used by Owner Serviceability. Both peers must use the same layout; earlier
-Policy-bearing layouts have no compatibility or negotiation path. This wire
-version is independent of the durable schemas below.
+layout. FDS carries the resolved Authority Lease duration; Data derives its
+heartbeat interval as `max(1 ms, duration / 3)`. Stop-and-wait heartbeat
+sequencing supplies the causal Ack confirmation used by Owner Serviceability.
+Both peers must use the same layout; earlier Policy-bearing layouts have no
+compatibility or negotiation path. This wire version is independent of the
+durable schemas below.
 
 Commands, stores, records, exports, snapshots, and the physical segmented WAL
 carry independent exact format markers. The command envelope and topology
 store are respectively v4 and v2; the aggregate snapshot envelope, other
 persisted stores, and segmented-WAL container retain their existing v1
 markers. Command v4 removes Policy retirement, content hashes, Policy
-references, and durable successor-grant specification, and adds
-automatic `BeginUncontrolledFailover` provenance and a pristine-operation CAS
-witness; apply preempts the complete bounded set for the Group. Policy snapshots
-retain only registered-family raw histories and
-typed-decodable current values. None of these unreleased layouts has a legacy
-decoder, so development directories from a different same-marker or older
-layout are not interchangeable. Every configured Meta identity has one
+references, durable successor-grant specification, separate authority/Grant
+revision counters, and term-preserving Grant revocation. It adds automatic
+`BeginUncontrolledFailover` provenance and a pristine-operation CAS witness;
+apply preempts the complete bounded set for the Group. Policy snapshots retain
+only registered-family raw histories and typed-decodable current values. None
+of these unreleased layouts has a legacy decoder, so development directories
+from a different same-marker or older layout are not interchangeable. Every
+configured Meta identity has one
 canonical concrete numeric Data-control endpoint and one canonical concrete
 numeric Admin endpoint. The
 NuRaft `srv_config::aux` `KMI2` descriptor carries the server id, derived
@@ -1012,8 +1019,8 @@ after Hello, FDS application, and a current-view validation; replacement,
 disconnect, demotion, and shutdown remove them. Health is timestamped on
 receipt, while a lease decision becomes observable only after its Ack is
 written, and replaying a cached Ack does not refresh it. Merging requires the
-session, projection, assignment, group term, authority, grant, manifest, and
-population anchors to match the committed cut. The result then passes a second
+session, projection, assignment, Group Term, manifest, and population anchors
+to match the committed cut. The result then passes a second
 leader-alive, term, leadership-generation/eligibility/revision, Raft-config,
 and committed Meta-directory check; a changed bracket returns `cut_changed`
 instead of mixed state. Captures are single-flight across both Admin listeners.
@@ -1028,8 +1035,8 @@ Data ids needed for diagnostics; it does not scan operation kinds. The
 non-terminal. The server also exposes specific `meta_catching_up`,
 `data_unregistered`, `data_unregistered_retrying`, `data_unobserved`, and
 `data_session_missing` blockers. The public command remains `clusterstatus 1`;
-its incompatible strict inner payload is version 3, and JSON rendering is
-schema 2. Every Group includes `automatic_failover_state`, optional
+its incompatible strict inner payload is version 4, and JSON rendering is
+schema 3. Every Group includes `automatic_failover_state`, optional
 `current_reason`, `suspect_elapsed_ms`, `effective_threshold_ms`, and optional
 `blocked_reason`. The state itself records when a Begin is being triggered;
 the threshold is a derived scalar rather than Policy identity or content.
@@ -1254,7 +1261,7 @@ audit chain rather than replacing it.
 | Registered typed durable Policy families, strict raw JSON admission/history, and current-value accessors | `include/keylane/meta/policy_store.h`, `src/meta/policy_store.cpp`, `tests/meta_stores_test.cpp` |
 | Pure Owner Serviceability cut, causal lease confirmation, leader-local detector state, automatic Begin adapter, and generation-bracketed diagnostics | `include/keylane/meta/owner_serviceability.h`, `src/meta/owner_serviceability.cpp`, `include/keylane/meta/automatic_failover_detector.h`, `src/meta/automatic_failover_detector.cpp`, `include/keylane/meta/automatic_failover_reconciler.h`, `src/meta/automatic_failover_reconciler.cpp` |
 | Volatile candidate/failover observations and deterministic compatibility-domain plan selection | `include/keylane/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/keylane/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
-| Pure per-node projection including resolved lease/cadence and failover/activation/follow-owner state, plus the leader-scoped Data-session publisher and causal heartbeat admission | `include/keylane/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/keylane/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
+| Pure per-node projection including resolved lease duration, Data-derived heartbeat cadence, and failover/activation/follow-owner state, plus the leader-scoped Data-session publisher and causal heartbeat admission | `include/keylane/meta/control_projector.h`, `src/meta/control_projector.cpp`, `include/keylane/meta/data_control_server.h`, `src/meta/data_control_server.cpp` |
 | Manifest-bootstrapped initial Meta configuration, persistent restart/waiting-joiner classification, and Raft durability | `include/keylane/meta/nuraft_state_mgr.h`, `src/meta/nuraft_state_mgr.cpp`, `app/keylane_meta.cpp`, `tests/meta_integration/gate_initial_meta.py` |
 | Atomic Genesis lifecycle, strict Bootstrap Policy Defaults, durable creation admission, Meta catch-up barrier, and leader-owned recovery | `include/keylane/meta/cluster_create.h`, `src/meta/cluster_create.cpp`, `include/keylane/meta/topology_store.h`, `src/meta/topology_store.cpp`, `src/meta/state_apply.cpp`, `src/meta/ctl_server.cpp`, `include/keylane/meta/cluster_create_reconciler.h`, `src/meta/cluster_create_reconciler.cpp`, `app/keylane_meta.cpp` |
 | Durable post-genesis Meta membership intent, exact-config recovery, leadership handoff, and identity retirement | `include/keylane/meta/membership_reconciler.h`, `src/meta/membership_reconciler.cpp`, `src/meta/ctl_server.cpp`, `src/meta/state_apply.cpp`, `tests/meta_integration/gate_membership_recovery.py` |

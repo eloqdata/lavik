@@ -131,8 +131,6 @@ std::uint64_t ComputeGroupToken(const GroupView& group,
   HashNodeReference(hash, nodes, group.primary_node_index_);
   HashAssignmentId(hash, group.assignment_id_);
   HashU64(hash, group.group_term_);
-  HashU64(hash, group.authority_version_);
-  HashU64(hash, group.grant_revision_);
   HashU64(hash, group.manifest_revision_);
   HashBool(hash, group.granted_);
   HashBool(hash, group.population_ready_);
@@ -197,8 +195,6 @@ std::uint64_t ComputeContentHash(
     HashU64(hash, replicas.size());
     for (const NodeId& replica : replicas) HashNodeId(hash, replica);
     HashU64(hash, group->group_term_);
-    HashU64(hash, group->authority_version_);
-    HashU64(hash, group->grant_revision_);
     HashU64(hash, group->manifest_revision_);
     HashBool(hash, group->granted_);
     HashBool(hash, group->population_ready_);

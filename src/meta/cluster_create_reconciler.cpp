@@ -96,18 +96,18 @@ Plan Abort(const MetaOperationRecord& operation, std::string reason) {
 }
 
 std::string AutomaticFailoverPolicyContent(
-    const ClusterCreateManifestV1::BootstrapPolicy& policy) {
+    const ClusterCreateManifestV1& manifest) {
   return absl::StrCat(
       R"({"kind":"automatic-uncontrolled-failover-v1","enabled":)",
-      policy.automatic_uncontrolled_failover_enabled_ ? "true" : "false",
+      manifest.automatic_uncontrolled_failover_enabled_ ? "true" : "false",
       R"(,"suspect_after_ms":)",
-      policy.automatic_uncontrolled_failover_suspect_after_ms_, "}");
+      manifest.automatic_uncontrolled_failover_suspect_after_ms_, "}");
 }
 
 std::string AuthorityLeasePolicyContent(
-    const ClusterCreateManifestV1::BootstrapPolicy& policy) {
+    const ClusterCreateManifestV1& manifest) {
   return absl::StrCat(R"({"kind":"authority-lease-v1","duration_ms":)",
-                      policy.authority_lease_duration_ms_, "}");
+                      manifest.authority_lease_duration_ms_, "}");
 }
 
 // ClusterCreateManifestV1 is normalized before persistence; comparisons below
@@ -203,8 +203,6 @@ bool ProjectionMatches(const MetaDataControlRuntimeNode& runtime,
   return projected.group_id_ == group.group_id_ &&
          projected.assignment_id_ == member->assignment_id_ &&
          projected.group_term_ == group.record_.group_term_ &&
-         projected.authority_version_ == group.record_.authority_version_ &&
-         projected.grant_revision_ == grant.grant_->grant_revision_ &&
          projected.manifest_revision_ ==
              group.record_.population_manifest_revision_ &&
          projected.manifest_digest_ ==
@@ -388,7 +386,9 @@ absl::Status ValidateV1FinalTopology(const MetaStores& stores,
     const auto grant = stores.grant_.GroupState(declaration.group_id_);
     const auto population =
         V1PopulationManifest(manifest, declaration.group_id_);
-    if (!group.has_value() || group->record_.group_term_ != 1 ||
+    if (!group.has_value() ||
+        (group->record_.group_term_ != 1 &&
+         !(allow_failed_group && group->record_.group_term_ == 2)) ||
         group->config_epoch_ != 1 ||
         group->record_.population_manifest_revision_ != 1 ||
         group->record_.population_manifest_digest_ !=
@@ -400,12 +400,12 @@ absl::Status ValidateV1FinalTopology(const MetaStores& stores,
           absl::StrCat("creation Group anchors differ from intent: group=",
                        declaration.group_id_));
     }
-    const bool active = grant->grant_.has_value() && !grant->fenced_ &&
+    const bool active = grant->grant_.has_value() &&
                         grant->grant_->owner_ == declaration.primary_node_id_ &&
-                        grant->grant_->term_ == 1 &&
-                        grant->grant_->authority_version_ == 1;
-    const bool failed = allow_failed_group && grant->fenced_ &&
-                        group->record_.authority_version_ == 1;
+                        grant->group_term_ == 1 &&
+                        group->record_.group_term_ == 1;
+    const bool failed = allow_failed_group && !grant->grant_.has_value() &&
+                        group->record_.group_term_ == 2;
     if (!active && !failed)
       return absl::FailedPreconditionError(
           absl::StrCat("creation authority differs from intent: group=",
@@ -499,10 +499,11 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
                                            " node=", node_id, " ", reason));
   };
   auto fence_or_abort = [&](std::string reason) -> Plan {
-    if (grant->grant_.has_value() && !grant->fenced_) {
+    if (grant->grant_.has_value()) {
       FenceGroup fence;
       fence.group_id_ = declaration.group_id_;
       fence.expected_term_ = 1;
+      fence.new_term_ = 2;
       return Emit(std::move(fence));
     }
     return Abort(operation, std::move(reason));
@@ -515,7 +516,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
   if (operation.lifecycle_ == MetaOperationLifecycle::kSubmitted) {
     if (!operation.current_directives_.empty() || primary_receipt.has_value())
       return Conflict("submitted Group operation contains progress");
-    if (!grant->grant_.has_value() || grant->fenced_)
+    if (!grant->grant_.has_value())
       return Conflict(absl::StrCat("group=", declaration.group_id_,
                                    " authority is unavailable"));
     if (source_incarnation_changed)
@@ -532,8 +533,6 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
     initialize.source_node_id_ = std::string(kMetaNodeIdBytes, '0');
     initialize.group_id_ = declaration.group_id_;
     initialize.group_term_ = 1;
-    initialize.authority_version_ = 1;
-    initialize.grant_revision_ = grant->grant_->grant_revision_;
     initialize.population_manifest_revision_ = 1;
     initialize.population_manifest_digest_ = population.manifest_digest_;
     initialize.partition_replication_epoch_ = 1;
@@ -550,7 +549,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
 
   if (operation.kind_phase_blob_ == kGroupPhaseInitialize) {
     if (!primary_receipt.has_value()) {
-      if (!grant->grant_.has_value() || grant->fenced_)
+      if (!grant->grant_.has_value())
         return Conflict(
             absl::StrCat("group=", declaration.group_id_,
                          " authority changed during initialization"));
@@ -574,7 +573,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
                        " primary initialization: ", primary_receipt->result_));
     if (declaration.replica_node_ids_.empty())
       return Advance(operation, kGroupPhaseReady);
-    if (!grant->grant_.has_value() || grant->fenced_)
+    if (!grant->grant_.has_value())
       return Conflict(absl::StrCat("group=", declaration.group_id_,
                                    " authority changed before replication"));
     if (source_incarnation_changed)
@@ -634,8 +633,6 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
           operation.replication_history_id_;
       authorize.group_id_ = declaration.group_id_;
       authorize.group_term_ = 1;
-      authorize.authority_version_ = 1;
-      authorize.grant_revision_ = grant->grant_->grant_revision_;
       authorize.population_manifest_revision_ = 1;
       authorize.population_manifest_digest_ = population.manifest_digest_;
       authorize.partition_replication_epoch_ = 1;
@@ -649,7 +646,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
   if (operation.kind_phase_blob_ == kGroupPhaseAuthorize) {
     const std::size_t expected_directives =
         declaration.replica_node_ids_.size();
-    if (grant->fenced_) {
+    if (!grant->grant_.has_value()) {
       for (const std::string& replica : declaration.replica_node_ids_) {
         const std::string purpose = absl::StrCat("replica/", replica, "/");
         const auto receipt = ReceiptFor(
@@ -771,7 +768,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
   if (operation.kind_phase_blob_ == kGroupPhaseReplicate) {
     const std::size_t expected_directives =
         declaration.replica_node_ids_.size() * 2;
-    if (grant->fenced_) {
+    if (!grant->grant_.has_value()) {
       for (const std::string& replica : declaration.replica_node_ids_) {
         const std::string purpose = absl::StrCat("replica/", replica, "/");
         for (const std::string_view kind : {"authorize", "rebuild"}) {
@@ -945,16 +942,14 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
       PutPolicy command;
       command.policy_id_ = kAutomaticUncontrolledFailoverPolicyId;
       command.version_ = 1;
-      command.content_ =
-          AutomaticFailoverPolicyContent(manifest->bootstrap_policy_);
+      command.content_ = AutomaticFailoverPolicyContent(*manifest);
       return Emit(std::move(command));
     }
     if (!stores.policy_.CurrentAuthorityLease().has_value()) {
       PutPolicy command;
       command.policy_id_ = kAuthorityLeasePolicyId;
       command.version_ = 1;
-      command.content_ =
-          AuthorityLeasePolicyContent(manifest->bootstrap_policy_);
+      command.content_ = AuthorityLeasePolicyContent(*manifest);
       return Emit(std::move(command));
     }
     return Advance(operation, kRootPhaseRegisterData);
@@ -986,8 +981,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
         command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
         return Emit(std::move(command));
       }
-      if (group->record_.group_term_ > 1 ||
-          group->record_.authority_version_ != 0 || group->config_epoch_ != 0 ||
+      if (group->record_.group_term_ > 1 || group->config_epoch_ != 0 ||
           group->record_.population_manifest_revision_ != 0 ||
           group->record_.partition_replication_epoch_ != 0 ||
           !group->record_.owner_.empty())
@@ -1036,7 +1030,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
     for (const auto& declaration : manifest->groups_) {
       const auto group = stores.topology_.FindGroup(declaration.group_id_);
       if (!group.has_value() || group->record_.group_term_ != 1 ||
-          group->record_.authority_version_ != 0)
+          !group->record_.owner_.empty())
         return Conflict(absl::StrCat("creation Group is not ready for Slots: ",
                                      declaration.group_id_));
       epochs_zero &= group->config_epoch_ == 0;
@@ -1092,18 +1086,17 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
             absl::StrCat("creation population differs from intent: group=",
                          declaration.group_id_));
       const bool authority_matches =
-          grant->grant_.has_value() && !grant->fenced_ &&
+          grant->grant_.has_value() &&
           grant->grant_->owner_ == declaration.primary_node_id_ &&
-          grant->grant_->term_ == 1 && grant->grant_->authority_version_ == 1;
+          grant->group_term_ == 1;
       if (!authority_matches) {
-        if (group->record_.authority_version_ != 0 || grant->grant_.has_value())
+        if (!group->record_.owner_.empty() || grant->grant_.has_value())
           return Conflict(absl::StrCat("creation authority changed: group=",
                                        declaration.group_id_));
         ActivateAuthority command;
         command.group_id_ = declaration.group_id_;
         command.expected_term_ = 1;
         command.new_owner_ = declaration.primary_node_id_;
-        command.new_authority_version_ = 1;
         command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
         command.new_config_epoch_ = 1;
         return Emit(std::move(command));

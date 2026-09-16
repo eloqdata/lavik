@@ -23,49 +23,9 @@ struct MetaOwnerAuthorityAnchor {
   std::string owner_node_id_;
   MetaAssignmentId owner_assignment_id_{};
   std::uint64_t group_term_ = 0;
-  std::uint64_t authority_version_ = 0;
-  std::uint64_t grant_revision_ = 0;
   MetaHash256 projection_hash_{};
 
   bool operator==(const MetaOwnerAuthorityAnchor&) const = default;
-};
-
-// Authenticated leader-local session incarnation. Generation values are
-// equality anchors only; the evaluator never infers ordering from them.
-struct MetaOwnerObservationIdentity {
-  std::string node_id_;
-  MetaBootIncarnation boot_id_{};
-  std::uint64_t session_generation_ = 0;
-  std::uint64_t leadership_generation_ = 0;
-
-  bool operator==(const MetaOwnerObservationIdentity&) const = default;
-};
-
-// Latest Owner heartbeat and the exact installed FDS that underlay it.
-// Freshness is computed by the observation Adapter from its clock before it
-// crosses this seam, keeping time units and wraparound out of this module.
-struct MetaOwnerHeartbeatCut {
-  MetaOwnerObservationIdentity identity_;
-  MetaOwnerAuthorityAnchor installed_anchor_;
-  std::uint64_t sequence_ = 0;
-  bool fresh_ = false;
-  bool draining_ = false;
-  bool storage_ready_ = false;
-  bool population_ready_ = false;
-
-  bool operator==(const MetaOwnerHeartbeatCut&) const = default;
-};
-
-// A higher-sequence heartbeat is causal evidence that Data processed the
-// named grant Ack. Both identities and both authority anchors must remain
-// exact; an Ack merely written by Meta is not a confirmation.
-struct MetaCausalLeaseConfirmation {
-  MetaOwnerObservationIdentity identity_;
-  MetaOwnerAuthorityAnchor confirmed_anchor_;
-  std::uint64_t granted_heartbeat_sequence_ = 0;
-  std::uint64_t confirming_heartbeat_sequence_ = 0;
-
-  bool operator==(const MetaCausalLeaseConfirmation&) const = default;
 };
 
 // Whether the Adapter can prove that the last possible causal Owner lease is
@@ -78,36 +38,53 @@ enum class MetaCausalProgressFreshness : std::uint8_t {
   kExpired = 2,
 };
 
-// One atomic observation-store result. Absence or `connected_ == false`
-// means the current leader has no live authenticated Owner session.
-struct MetaOwnerSessionCut {
-  MetaOwnerObservationIdentity identity_;
-  bool connected_ = false;
-  std::optional<MetaOwnerHeartbeatCut> heartbeat_;
-  // The Adapter bounds both a pending grant-confirmation window and a
-  // confirmed lease that has stopped advancing. Expiry is classified with
-  // heartbeat expiry so ordinary health traffic cannot hide loss of causal
-  // authority progress.
-  MetaCausalProgressFreshness causal_progress_freshness_ =
-      MetaCausalProgressFreshness::kUnknown;
-  std::optional<MetaCausalLeaseConfirmation> causal_lease_confirmation_;
-
-  bool operator==(const MetaOwnerSessionCut&) const = default;
-};
-
 // Self-contained, anchor-validated input cut for one Group. Each source
 // snapshot is internally coherent; cross-source mismatch remains represented
 // for fail-closed evaluation. Blockers are deliberately included beside
 // observations so a caller cannot accidentally evaluate runtime health under
 // an ineligible leader or during an authority handoff.
 struct MetaOwnerServiceabilityCut {
-  std::uint64_t leadership_generation_ = 0;
+  // One connected authenticated session from the observation Adapter. The
+  // Adapter reduces the runtime/session join to `current_`; boot and session
+  // generations do not cross this pure evaluation seam only to be copied and
+  // compared again.
+  struct Session {
+    // Latest Owner heartbeat and the exact installed FDS that underlay it.
+    // Freshness is computed before crossing this seam, keeping clock units and
+    // wraparound out of the evaluator.
+    struct Heartbeat {
+      MetaOwnerAuthorityAnchor installed_anchor_;
+      std::uint64_t sequence_ = 0;
+      bool fresh_ = false;
+      bool draining_ = false;
+      bool storage_ready_ = false;
+      bool population_ready_ = false;
+
+      bool operator==(const Heartbeat&) const = default;
+    };
+
+    bool current_ = false;
+    std::optional<Heartbeat> heartbeat_;
+    // The Adapter bounds both a pending grant-confirmation window and a
+    // confirmed lease that has stopped advancing. Expiry is classified with
+    // heartbeat expiry so ordinary health traffic cannot hide loss of causal
+    // authority progress.
+    MetaCausalProgressFreshness causal_progress_freshness_ =
+        MetaCausalProgressFreshness::kUnknown;
+    // Presence means a higher-sequence heartbeat proved that Data processed
+    // this Grant Ack. The current heartbeat sequence remains in Heartbeat, so
+    // a second confirming-sequence field would carry no additional evidence.
+    std::optional<std::uint64_t> confirmed_grant_sequence_;
+
+    bool operator==(const Session&) const = default;
+  };
+
   bool leader_authority_eligible_ = false;
   bool leadership_warmup_complete_ = false;
   bool authority_handoff_complete_ = false;
   bool failover_transition_active_ = false;
   MetaOwnerAuthorityAnchor committed_anchor_;
-  std::optional<MetaOwnerSessionCut> session_;
+  std::optional<Session> session_;
 
   bool operator==(const MetaOwnerServiceabilityCut&) const = default;
 };

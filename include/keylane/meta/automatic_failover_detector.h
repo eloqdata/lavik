@@ -30,8 +30,6 @@ struct MetaAutomaticFailoverAnchor {
   std::string owner_node_id_;
   MetaAssignmentId owner_assignment_id_{};
   std::uint64_t group_term_ = 0;
-  std::uint64_t authority_version_ = 0;
-  std::uint64_t grant_revision_ = 0;
   std::uint64_t automatic_failover_policy_version_ = 0;
   std::uint64_t authority_lease_policy_version_ = 0;
 
@@ -60,18 +58,6 @@ enum class MetaAutomaticFailoverBlocker : std::uint8_t {
   kIndeterminateEvidence = 7,
 };
 
-struct MetaAutomaticFailoverInput {
-  MetaAutomaticFailoverAnchor anchor_;
-  // Eligibility is repeated explicitly because losing it discards SUSPECT
-  // time even before a formal leadership-generation change.
-  bool leader_authority_eligible_ = false;
-  bool automatic_failover_enabled_ = false;
-  std::uint64_t suspect_after_ms_ = 0;
-  MetaOwnerServiceabilityDecision owner_serviceability_;
-
-  bool operator==(const MetaAutomaticFailoverInput&) const = default;
-};
-
 struct MetaAutomaticFailoverStatus {
   MetaAutomaticFailoverAnchor anchor_;
   MetaAutomaticFailoverState state_ = MetaAutomaticFailoverState::kDisabled;
@@ -84,15 +70,6 @@ struct MetaAutomaticFailoverStatus {
   std::uint64_t effective_threshold_ms_ = 0;
 
   bool operator==(const MetaAutomaticFailoverStatus&) const = default;
-};
-
-struct MetaAutomaticFailoverUpdate {
-  MetaAutomaticFailoverStatus status_;
-  // True only on the edge that first enters TRIGGERING for this anchor. The
-  // caller may create stable proposal identities only on this edge.
-  bool trigger_now_ = false;
-
-  bool operator==(const MetaAutomaticFailoverUpdate&) const = default;
 };
 
 struct MetaAutomaticFailoverDiagnosticsSnapshot {
@@ -154,6 +131,27 @@ class MetaAutomaticFailoverDiagnosticsRegistry {
 // Module is caller-serialized and deliberately has no internal synchronization.
 class MetaAutomaticFailoverStateMachine {
  public:
+  // One complete current input cut for a Group. This type belongs to the
+  // detector API; callers cannot persist or publish it independently.
+  struct Input {
+    MetaAutomaticFailoverAnchor anchor_;
+    // Eligibility is repeated explicitly because losing it discards SUSPECT
+    // time even before a formal leadership-generation change.
+    bool leader_authority_eligible_ = false;
+    bool automatic_failover_enabled_ = false;
+    std::uint64_t suspect_after_ms_ = 0;
+    MetaOwnerServiceabilityDecision owner_serviceability_;
+  };
+
+  // Result of one Advance call. The edge is deliberately separate from the
+  // retained diagnostic status because it is true only for the first call
+  // that enters TRIGGERING.
+  struct AdvanceResult {
+    MetaAutomaticFailoverStatus status_;
+    // The caller may create stable proposal identities only on this edge.
+    bool trigger_now_ = false;
+  };
+
   // Tests may choose a smaller capacity; larger values are clamped to the
   // committed topology's absolute Group bound.
   explicit MetaAutomaticFailoverStateMachine(
@@ -165,19 +163,17 @@ class MetaAutomaticFailoverStateMachine {
   // After `trigger_now_`, the same input anchor remains TRIGGERING so later
   // health cannot retract an in-flight Begin; a definitive non-commit may be
   // restarted with EraseGroup, while committed-anchor changes reset naturally.
-  [[nodiscard]] absl::StatusOr<MetaAutomaticFailoverUpdate> Advance(
-      const MetaAutomaticFailoverInput& input, std::uint64_t now_steady_ms);
+  [[nodiscard]] absl::StatusOr<AdvanceResult> Advance(
+      const Input& input, std::uint64_t now_steady_ms);
 
   // Explicit Group/lifecycle cleanup. Neither operation emits trigger edges.
   void EraseGroup(std::string_view group_id);
   void Clear();
   // Returns Group-id-sorted diagnostic state without altering timers.
   std::vector<MetaAutomaticFailoverStatus> Snapshot() const;
-  std::size_t size() const noexcept { return groups_.size(); }
 
  private:
   struct GroupRuntime {
-    MetaAutomaticFailoverAnchor anchor_;
     bool leader_authority_eligible_ = false;
     bool automatic_failover_enabled_ = false;
     std::uint64_t suspect_after_ms_ = 0;

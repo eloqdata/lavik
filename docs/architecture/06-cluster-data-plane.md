@@ -291,19 +291,21 @@ ownership.
 Control protocol v1 has no delta format. Initial connection, reconnection, and
 every semantic projection change transfer a complete `FullDesiredState`. The
 object contains global topology plus each group's partition replication epoch
-and the cluster-wide resolved Authority Lease duration and heartbeat cadence,
-immutable population manifests, current directives, optional failover
-transition, optional grant activation action, complete membership/owner
-relationship, and `steady_replication_enabled`. Policy ids, versions, and raw
-documents remain in Meta Committed State and never cross this Seam. Meta may
-cap the typed Policy duration by its leadership-validity bound, then derives
-cadence as exactly `max(1 ms, duration / 3)` before computing the projection
-hash. Data rejects zero duration, a different cadence, or a cadence beyond the
+and the cluster-wide resolved Authority Lease duration, immutable population
+manifests, current directives, optional failover transition, optional grant
+activation action, complete membership/owner relationship, and
+`steady_replication_enabled`. Policy ids, versions, and raw documents remain
+in Meta Committed State and never cross this Seam. Meta may cap the typed
+Policy duration by its leadership-validity bound before computing the
+projection hash. Data derives its heartbeat interval from that effective
+duration as exactly `max(1 ms, duration / 3)`; cadence is not an independent
+FDS field. Data rejects zero duration or a derived cadence beyond the
 negotiated observation TTL rather than applying a local Policy interpretation.
-Replacing FDS changes future renewal and cadence but does not retroactively
-shorten an already installed finite lease. That old lease may bridge normal
-projection convergence; if its remaining time is insufficient, local expiry
-self-fences until a valid lease under the replacement is installed.
+Replacing FDS changes future renewal and the derived cadence but does not
+retroactively shorten an already installed finite lease. That old lease may
+bridge normal projection convergence; if its remaining time is insufficient,
+local expiry self-fences until a valid lease under the replacement is
+installed.
 An exact Grant that reaches Data at or after its local deadline is consumed but
 not installed, and Data ends that Meta control session. Reusing the session for
 the next heartbeat would falsely make its higher sequence a causal confirmation
@@ -364,8 +366,8 @@ not send heartbeat `N+1` until it has processed Ack `N`, so `N+1` is causal
 evidence that the immediately preceding lease decision reached Data. Meta
 retains it as a confirmed Authority Lease only when Ack `N` granted a nonzero
 lease for this authenticated session/boot and the exact installed Owner,
-assignment, Group term, authority, grant, and projection. Ack write alone and
-a cached Ack replay do not confirm authority. Meta records Owner heartbeat and
+assignment, Group Term, and projection. Ack write alone and a cached Ack replay
+do not confirm authority. Meta records Owner heartbeat and
 causal-progress receive times on the same steady clock used by detector
 debounce, retains the original time when later heartbeats repeat a confirmation,
 and advances it only for a strictly higher confirmed Ack. Once that causal
@@ -449,7 +451,7 @@ an old lease while the destination begins serving the same slot.
 
 Finite leases are required only for a Meta-managed local primary. Admission
 and the final mutation recheck both prove the current session, group
-assignment, term, authority/grant revision, projection, and unexpired
+assignment, Group Term, projection, and unexpired
 monotonic deadline. Session loss, expiry, committed authority change, local
 storage loss, or an explicit fence invalidates memory authority immediately.
 Startup-not-ready and runtime storage loss are distinct controller states:
@@ -565,11 +567,10 @@ admission and preserves current capabilities plus sessions already published
 by the source. Thus a directive cannot appear behind the cleanup represented by
 `FullStateApplied` or `FenceAck` even when its action adapter suspended after
 validation. A
-boot-local fence floor also rejects directives through the
-fenced counter tuple: rebuilds compare the local target assignment, while
-source authorize/revoke compares the local source assignment. A fresh
-assignment or a strictly newer committed counter tuple is therefore
-distinguishable from replay of fenced authority.
+boot-local fence floor also rejects directives through the fenced Group Term:
+rebuilds compare the local target assignment, while source authorize/revoke
+compares the local source assignment. A fresh assignment or strictly newer
+term is therefore distinguishable from replay of fenced authority.
 The bounded worker timer may still be queued briefly after a host resume, so a
 renewal also compares the old deadline with `CLOCK_BOOTTIME` synchronously. If
 the old lease is already due, the renewal path runs that exact expiration
@@ -593,7 +594,7 @@ receipt channel; its action is embedded in the Group transition in FDS.
 Initialization reuses the ordinary directive, FDS, operation receipt, and
 population-proof lifecycles. NodeControl first closes readiness and serving,
 then passes a source-less `RebuildIdentity` to `ReplicationManager` only after
-the current session, boot, target assignment/history, authority, grant,
+the current session, boot, target assignment/history, Group Term, projection,
 manifest, and partition epoch all match. The manager reuses the durable
 full-sync fence, resets and hands off every physical partition, installs an
 empty Function catalog, promotes the candidate root, and publishes a
@@ -678,10 +679,10 @@ manifest, or partition-epoch replacement still retires it. Grantless groups have
 no `ServingState` owner or bound slots, but their committed membership remains
 in the controller identity view so this preservation is possible. For any
 member incarnation retained across projections, NodeControl also requires the
-group's config epoch, term, authority version, grant revision, manifest
-revision/digest, and partition replication epoch to be monotonic even while
-the group is ownerless; a full remove-and-reassign identity is the explicit
-boundary at which a new incarnation may reset those counters. Once Meta
+group's config epoch, Group Term, manifest revision/digest, and partition
+replication epoch to be monotonic even while the group is
+ownerless; a full remove-and-reassign identity is the explicit boundary at
+which a new incarnation may reset those counters. Once Meta
 activates the candidate, the next FDS can publish the retained proof; if no
 proof survived (for example after a reboot), the granted-but-unready target may
 run a rebuild while it remains unable to serve or obtain a lease.
@@ -793,9 +794,10 @@ no-key mutations, and the remaining `CLUSTER` management subcommands
 ## Verification
 
 The admission decision matrix, builder and parser validation, content-hash
-publication semantics, resolved lease/cadence validation, causal heartbeat
-sequencing, finite lease self-fencing, controlled mutation pause, failover
-action/activation, follow-owner reconciliation, frame and
+publication semantics, resolved lease validation and derived-cadence
+enforcement, causal heartbeat sequencing, finite lease self-fencing,
+controlled mutation pause, failover action/activation, follow-owner
+reconciliation, frame and
 complete-object codecs, projection validation, drain behavior, TLS-aware
 endpoint selection, in-flight counter concurrency and cell sharing, and the
 CLUSTER wire texts and reply shapes are unit-tested through pure seams and the
@@ -821,7 +823,7 @@ incomplete-full-sync fence without a local topology source.
 | ServingState model, builder validation, topology cache, content hash, striped in-flight cells, and routing functions | `include/keylane/cluster/topology.h`, `src/cluster/topology.cpp` |
 | Admission decision and owner-side authority re-check | `include/keylane/cluster/authority.h`, `src/cluster/authority.cpp` |
 | Final logical-mutation precondition and WATCH/publication seam | `include/keylane/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp` |
-| Meta/Data protocol framing, resolved Authority Lease/cadence fields, independent failover observations, transition/activation projection, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
+| Meta/Data protocol framing, resolved Authority Lease field and derived heartbeat cadence, independent failover observations, transition/activation projection, complete-object transfer, and bounded writer scheduling | `include/keylane/cluster/control_protocol.h`, `include/keylane/cluster/control_transport.h`, `src/cluster/control_protocol.cpp`, `src/cluster/control_transport.cpp` |
 | Node controller, full-state validation, controlled pause, provisional activation, finite authority, drain, follow-owner reconciliation, and typed replication adaptation | `include/keylane/cluster/node_control.h`, `include/keylane/cluster/meta_control.h`, `src/cluster/node_control.cpp`, `src/cluster/meta_control.cpp`, `include/keylane/replication.h`, `src/replication/replication.cpp` |
 | Meta discovery, outbound Data control session, stop-and-wait causal heartbeat cadence, and finite-lease expiry | `include/keylane/cluster/meta_client.h`, `src/cluster/meta_client.cpp` |
 | Process-wide runtime installation | `include/keylane/cluster/runtime.h`, `src/cluster/runtime.cpp` |

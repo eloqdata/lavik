@@ -112,7 +112,7 @@ absl::Status ValidateCommittedDirectiveAnchorImpl(
   if (!group.has_value() || !grant.has_value()) {
     return MetaDomainRejectError("directive group does not exist");
   }
-  if (grant->fenced_ || !grant->grant_.has_value()) {
+  if (!grant->grant_.has_value()) {
     return MetaDomainRejectError("directive group has no active authority");
   }
   if (!HasAssignment(*group, directive.target_node_id_,
@@ -123,10 +123,7 @@ absl::Status ValidateCommittedDirectiveAnchorImpl(
   }
   const bool authority_matches =
       group->record_.group_term_ == directive.group_term_ &&
-      group->record_.authority_version_ == directive.authority_version_ &&
-      grant->grant_->term_ == directive.group_term_ &&
-      grant->grant_->authority_version_ == directive.authority_version_ &&
-      grant->grant_->grant_revision_ == directive.grant_revision_;
+      grant->group_term_ == directive.group_term_;
   if (!authority_matches) {
     return MetaDomainRejectError("directive authority anchor is stale");
   }
@@ -342,8 +339,7 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
       return MetaFailStopError(absl::StrCat("topology group ", group.group_id_,
                                             " has no grant-store entry"));
     }
-    if (group.record_.group_term_ != grant->group_term_ ||
-        group.record_.authority_version_ != grant->last_authority_version_) {
+    if (group.record_.group_term_ != grant->group_term_) {
       return MetaFailStopError(absl::StrCat(
           "topology/grant anchors disagree for group ", group.group_id_));
     }
@@ -380,24 +376,16 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
       if (group.record_.owner_.empty() ||
           !stores.identity_.IsActiveNode(group.record_.owner_) ||
           !IsMember(group, group.record_.owner_) ||
-          group.record_.authority_version_ == 0 ||
-          grant->last_grant_revision_ == 0 || group.config_epoch_ == 0) {
+          group.record_.group_term_ == 0 || group.config_epoch_ == 0) {
         return MetaFailStopError(
             "active failover transition lacks its exact historical owner "
             "authority");
-      }
-      // Begin freezes the pre-transition authority, so its committed revision
-      // must follow the grant revision that the transition preserves.
-      if (transition.revision_ <= grant->last_grant_revision_) {
-        return MetaFailStopError(
-            "active failover transition revision does not follow its frozen "
-            "grant revision");
       }
       if (transition.mode_ == MetaFailoverMode::kControlled) {
         if (group.record_.group_term_ ==
                 std::numeric_limits<std::uint64_t>::max() ||
             transition.target_term_ != group.record_.group_term_ + 1 ||
-            grant->fenced_ || !grant->grant_.has_value()) {
+            !grant->grant_.has_value()) {
           return MetaFailStopError(
               "controlled failover transition disagrees with current "
               "authority");
@@ -449,7 +437,7 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
               "controlled failover transition and operation intent disagree");
         }
       } else if (transition.target_term_ != group.record_.group_term_ ||
-                 !grant->fenced_ || grant->grant_.has_value()) {
+                 grant->grant_.has_value()) {
         return MetaFailStopError(
             "uncontrolled failover transition disagrees with fenced target "
             "term");
@@ -469,9 +457,7 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
 
     if (!grant->grant_.has_value()) continue;
     const MetaGroupGrant& active = *grant->grant_;
-    if (grant->fenced_ || group.record_.group_term_ == 0 ||
-        group.record_.authority_version_ == 0 ||
-        grant->last_grant_revision_ == 0 || group.config_epoch_ == 0 ||
+    if (group.record_.group_term_ == 0 || group.config_epoch_ == 0 ||
         group.record_.owner_.empty() || group.record_.owner_ != active.owner_ ||
         !stores.identity_.IsActiveNode(active.owner_) ||
         !IsMember(group, active.owner_)) {
@@ -602,7 +588,7 @@ bool NodeHoldsActiveGrant(const MetaStores& stores,
 
 bool GroupHasActiveGrant(const MetaStores& stores, std::string_view group_id) {
   const auto state = stores.grant_.GroupState(group_id);
-  return state.has_value() && !state->fenced_ && state->grant_.has_value();
+  return state.has_value() && state->grant_.has_value();
 }
 
 bool GroupHasActiveFailover(const MetaStores& stores,
@@ -648,7 +634,7 @@ std::set<std::string> GroupRecipients(const MetaTopologyGroupView& group) {
 }
 
 absl::Status ApplyAuthorityActivationKernel(
-    MetaStores& stores, std::uint64_t log_index, const ActivateAuthority& cmd,
+    MetaStores& stores, const ActivateAuthority& cmd,
     std::optional<MetaFailoverActionId> activation_action_id);
 
 bool TransitionMatches(const MetaFailoverTransition& transition,
@@ -838,7 +824,6 @@ absl::Status ValidateFailoverBeginAnchors(
                      cmd.expected_owner_assignment_id_) ||
       group.revision_ != cmd.expected_membership_revision_ ||
       group.record_.group_term_ != cmd.expected_group_term_ ||
-      group.record_.authority_version_ != cmd.expected_authority_version_ ||
       group.record_.population_manifest_revision_ !=
           cmd.expected_population_manifest_revision_ ||
       group.record_.population_manifest_digest_ !=
@@ -852,16 +837,11 @@ absl::Status ValidateFailoverBeginAnchors(
     return MetaDomainRejectError("failover owner is not an active node");
   }
   if (grant_state.group_term_ != cmd.expected_group_term_ ||
-      grant_state.last_authority_version_ != cmd.expected_authority_version_ ||
-      grant_state.last_grant_revision_ != cmd.expected_grant_revision_ ||
-      grant_state.fenced_ || !grant_state.grant_.has_value()) {
+      !grant_state.grant_.has_value()) {
     return MetaDomainRejectError("failover grant anchor is stale");
   }
   const MetaGroupGrant& active = *grant_state.grant_;
-  if (active.owner_ != cmd.expected_owner_node_id_ ||
-      active.term_ != cmd.expected_group_term_ ||
-      active.authority_version_ != cmd.expected_authority_version_ ||
-      active.grant_revision_ != cmd.expected_grant_revision_) {
+  if (active.owner_ != cmd.expected_owner_node_id_) {
     return MetaDomainRejectError(
         "failover authority does not match the active grant");
   }
@@ -915,7 +895,6 @@ bool BeginControlledEffectPresent(const MetaStores& stores,
                      cmd.expected_owner_assignment_id_) ||
       group->revision_ != cmd.expected_membership_revision_ ||
       group->record_.group_term_ != cmd.expected_group_term_ ||
-      group->record_.authority_version_ != cmd.expected_authority_version_ ||
       group->record_.population_manifest_revision_ !=
           cmd.expected_population_manifest_revision_ ||
       group->record_.population_manifest_digest_ !=
@@ -923,17 +902,12 @@ bool BeginControlledEffectPresent(const MetaStores& stores,
       group->record_.partition_replication_epoch_ !=
           cmd.expected_partition_replication_epoch_ ||
       group->config_epoch_ != cmd.expected_config_epoch_ ||
-      grant->group_term_ != cmd.expected_group_term_ || grant->fenced_ ||
-      !grant->grant_.has_value() ||
-      grant->last_authority_version_ != cmd.expected_authority_version_ ||
-      grant->last_grant_revision_ != cmd.expected_grant_revision_) {
+      grant->group_term_ != cmd.expected_group_term_ ||
+      !grant->grant_.has_value()) {
     return false;
   }
   const MetaGroupGrant& active = *grant->grant_;
   return active.owner_ == cmd.expected_owner_node_id_ &&
-         active.term_ == cmd.expected_group_term_ &&
-         active.authority_version_ == cmd.expected_authority_version_ &&
-         active.grant_revision_ == cmd.expected_grant_revision_ &&
          ValidateFailoverCandidateAgainstGroup(stores, *group,
                                                cmd.candidate_action_)
              .ok() &&
@@ -973,7 +947,6 @@ bool BeginUncontrolledEffectPresent(const MetaStores& stores,
                      cmd.expected_owner_assignment_id_) ||
       group->revision_ != cmd.expected_membership_revision_ ||
       group->record_.group_term_ != cmd.target_term_ ||
-      group->record_.authority_version_ != cmd.expected_authority_version_ ||
       group->record_.population_manifest_revision_ !=
           cmd.expected_population_manifest_revision_ ||
       group->record_.population_manifest_digest_ !=
@@ -981,10 +954,7 @@ bool BeginUncontrolledEffectPresent(const MetaStores& stores,
       group->record_.partition_replication_epoch_ !=
           cmd.expected_partition_replication_epoch_ ||
       group->config_epoch_ != cmd.expected_config_epoch_ ||
-      grant->group_term_ != cmd.target_term_ ||
-      grant->last_authority_version_ != cmd.expected_authority_version_ ||
-      grant->last_grant_revision_ != cmd.expected_grant_revision_ ||
-      !grant->fenced_ || grant->grant_.has_value()) {
+      grant->group_term_ != cmd.target_term_ || grant->grant_.has_value()) {
     return false;
   }
   const bool candidate_valid = !cmd.candidate_action_.has_value() ||
@@ -1007,8 +977,7 @@ std::uint64_t FailoverCommitTargetTerm(const CommitCommand& command) {
 
 template <typename CommitCommand>
 bool FailoverCommitEffectPresent(const MetaStores& stores,
-                                 const CommitCommand& command,
-                                 std::uint64_t log_index) {
+                                 const CommitCommand& command) {
   if (!ClusterLifecycleAllowsFailover(stores) ||
       (std::is_same_v<CommitCommand, CommitControlledFailover> &&
        command.expected_group_term_ ==
@@ -1029,7 +998,6 @@ bool FailoverCommitEffectPresent(const MetaStores& stores,
                      command.expected_owner_assignment_id_) ||
       group->revision_ != command.expected_membership_revision_ ||
       group->record_.group_term_ != target_term ||
-      group->record_.authority_version_ != command.new_authority_version_ ||
       group->record_.population_manifest_revision_ !=
           command.expected_population_manifest_revision_ ||
       group->record_.population_manifest_digest_ !=
@@ -1038,17 +1006,11 @@ bool FailoverCommitEffectPresent(const MetaStores& stores,
           command.expected_partition_replication_epoch_ ||
       group->config_epoch_ != command.new_config_epoch_ ||
       stores.topology_.TopologyEpoch() != command.new_topology_epoch_ ||
-      grant->group_term_ != target_term || grant->fenced_ ||
-      !grant->grant_.has_value() ||
-      grant->last_authority_version_ != command.new_authority_version_ ||
-      grant->last_grant_revision_ != log_index) {
+      grant->group_term_ != target_term || !grant->grant_.has_value()) {
     return false;
   }
   const MetaGroupGrant& active = *grant->grant_;
   if (active.owner_ != command.expected_candidate_.node_id_ ||
-      active.term_ != target_term ||
-      active.authority_version_ != command.new_authority_version_ ||
-      active.grant_revision_ != log_index ||
       active.activation_action_id_ != command.action_id_ ||
       !AllCurrentDirectivesHaveCommittedAnchors(stores)) {
     return false;
@@ -1109,7 +1071,6 @@ absl::Status ValidateFailoverCommitPrestate(
       !stores.identity_.IsActiveNode(command.expected_candidate_.node_id_) ||
       group.revision_ != command.expected_membership_revision_ ||
       group.record_.group_term_ != command.expected_group_term_ ||
-      group.record_.authority_version_ != command.expected_authority_version_ ||
       group.record_.population_manifest_revision_ !=
           command.expected_population_manifest_revision_ ||
       group.record_.population_manifest_digest_ !=
@@ -1117,20 +1078,15 @@ absl::Status ValidateFailoverCommitPrestate(
       group.record_.partition_replication_epoch_ !=
           command.expected_partition_replication_epoch_ ||
       group.config_epoch_ != command.expected_config_epoch_ ||
-      grant_state.group_term_ != command.expected_group_term_ ||
-      grant_state.last_authority_version_ !=
-          command.expected_authority_version_ ||
-      grant_state.last_grant_revision_ != command.expected_grant_revision_) {
+      grant_state.group_term_ != command.expected_group_term_) {
     return MetaDomainRejectError("failover commit group anchor is stale");
   }
   if constexpr (kControlled) {
     if (!transition.controlled_.has_value() ||
         transition.controlled_->operation_id_ != command.operation_id_ ||
         transition.target_term_ != command.expected_group_term_ + 1 ||
-        grant_state.fenced_ || !grant_state.grant_.has_value() ||
-        grant_state.grant_->owner_ != command.expected_owner_node_id_ ||
-        grant_state.grant_->grant_revision_ !=
-            command.expected_grant_revision_) {
+        !grant_state.grant_.has_value() ||
+        grant_state.grant_->owner_ != command.expected_owner_node_id_) {
       return MetaDomainRejectError(
           "controlled failover current authority is stale");
     }
@@ -1142,7 +1098,7 @@ absl::Status ValidateFailoverCommitPrestate(
       return status;
     }
   } else if (transition.target_term_ != command.expected_group_term_ ||
-             !grant_state.fenced_ || grant_state.grant_.has_value()) {
+             grant_state.grant_.has_value()) {
     return MetaDomainRejectError(
         "uncontrolled failover is not fenced in its target term");
   }
@@ -1167,7 +1123,7 @@ ApplyOutcome ApplyFailoverCommit(MetaStores& stores, std::uint64_t log_index,
     return Rejected("failover requires cluster lifecycle Created",
                     std::move(summary));
   }
-  if (FailoverCommitEffectPresent(stores, command, log_index)) {
+  if (FailoverCommitEffectPresent(stores, command)) {
     return Accepted(std::move(summary));
   }
   const auto group = stores.topology_.FindGroup(command.group_id_);
@@ -1200,11 +1156,10 @@ ApplyOutcome ApplyFailoverCommit(MetaStores& stores, std::uint64_t log_index,
   activate.group_id_ = command.group_id_;
   activate.expected_term_ = target_term;
   activate.new_owner_ = command.expected_candidate_.node_id_;
-  activate.new_authority_version_ = command.new_authority_version_;
   activate.new_topology_epoch_ = command.new_topology_epoch_;
   activate.new_config_epoch_ = command.new_config_epoch_;
-  if (absl::Status status = ApplyAuthorityActivationKernel(
-          candidate, log_index, activate, command.action_id_);
+  if (absl::Status status = ApplyAuthorityActivationKernel(candidate, activate,
+                                                           command.action_id_);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
@@ -1302,22 +1257,20 @@ absl::Status ValidateSlotMapAuthorityTransition(
 
 // The replay predicate of ActivateAuthority: BOTH halves already carry
 // exactly this command's post-effect (grant half: the same predicate the
-// grant store's GrantMatches uses; topology half: owner, authority_version,
-// config_epoch, and the cluster topology_epoch).
+// grant store's GrantMatches uses; topology half: owner, config_epoch, and the
+// cluster topology_epoch).
 bool ActivateEffectPresent(
     const MetaStores& stores, const ActivateAuthority& cmd,
     const MetaTopologyGroupView& view, const MetaGroupGrantState& grant_state,
     const std::optional<MetaFailoverActionId>& activation_action_id =
         std::nullopt) {
-  if (grant_state.fenced_ || !grant_state.grant_.has_value()) return false;
+  if (!grant_state.grant_.has_value()) return false;
   const MetaGroupGrant& grant = *grant_state.grant_;
-  const bool grant_half =
-      grant.owner_ == cmd.new_owner_ && grant.term_ == cmd.expected_term_ &&
-      grant.authority_version_ == cmd.new_authority_version_ &&
-      grant.activation_action_id_ == activation_action_id;
+  const bool grant_half = grant_state.group_term_ == cmd.expected_term_ &&
+                          grant.owner_ == cmd.new_owner_ &&
+                          grant.activation_action_id_ == activation_action_id;
   const bool topology_half =
       view.record_.owner_ == cmd.new_owner_ &&
-      view.record_.authority_version_ == cmd.new_authority_version_ &&
       view.config_epoch_ == cmd.new_config_epoch_ &&
       stores.topology_.TopologyEpoch() == cmd.new_topology_epoch_;
   return grant_half && topology_half;
@@ -1328,16 +1281,11 @@ bool ActivateEffectPresent(
 // installed grant is action-bound and perform any workflow-specific transition
 // or Operation mutation around this bounded aggregate copy.
 absl::Status ApplyAuthorityActivationKernel(
-    MetaStores& stores, std::uint64_t log_index, const ActivateAuthority& cmd,
+    MetaStores& stores, const ActivateAuthority& cmd,
     std::optional<MetaFailoverActionId> activation_action_id) {
   if (cmd.new_config_epoch_ == 0) {
     return MetaDomainRejectError(
         "authority activation requires a nonzero config epoch");
-  }
-  if (absl::Status status =
-          stores.grant_.ValidateActivate(cmd, log_index, activation_action_id);
-      !status.ok()) {
-    return status;
   }
   const auto view = stores.topology_.FindGroup(cmd.group_id_);
   const auto grant_state = stores.grant_.GroupState(cmd.group_id_);
@@ -1346,6 +1294,18 @@ absl::Status ApplyAuthorityActivationKernel(
   }
   const bool effect_present = ActivateEffectPresent(
       stores, cmd, *view, *grant_state, activation_action_id);
+  // The Grant is the one-shot marker for the current term. Only the complete
+  // aggregate post-effect is a replay; matching just its Grant half must not
+  // permit an active command to rewrite topology or config epochs.
+  if (grant_state->grant_.has_value() && !effect_present) {
+    return MetaDomainRejectError(
+        "group term already has a different authority effect");
+  }
+  if (absl::Status status =
+          stores.grant_.ValidateActivate(cmd, activation_action_id);
+      !status.ok()) {
+    return status;
+  }
   if (!effect_present) {
     const std::uint64_t epoch = stores.topology_.TopologyEpoch();
     if (epoch == std::numeric_limits<std::uint64_t>::max() ||
@@ -1362,18 +1322,13 @@ absl::Status ApplyAuthorityActivationKernel(
           "new owner ", cmd.new_owner_, " is not a registered active node"));
     }
   }
-  if (absl::Status status = stores.grant_.ApplyGrantPart(
-          cmd, log_index, std::move(activation_action_id));
+  if (absl::Status status =
+          stores.grant_.ApplyGrantPart(cmd, std::move(activation_action_id));
       !status.ok()) {
     return status;
   }
   if (absl::Status status =
           stores.topology_.SetOwner(cmd.group_id_, cmd.new_owner_);
-      !status.ok()) {
-    return status;
-  }
-  if (absl::Status status = stores.topology_.SetAuthorityVersion(
-          cmd.group_id_, cmd.new_authority_version_);
       !status.ok()) {
     return status;
   }
@@ -1719,7 +1674,6 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   std::string summary = absl::StrCat(
       "ActivateAuthority group=", cmd.group_id_, " owner=", cmd.new_owner_,
       " expected_term=", cmd.expected_term_,
-      " authority_version=", cmd.new_authority_version_,
       " topology_epoch=", cmd.new_topology_epoch_,
       " config_epoch=", cmd.new_config_epoch_);
   const auto view = stores.topology_.FindGroup(cmd.group_id_);
@@ -1735,8 +1689,8 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   }
 
   MetaStores candidate = stores;
-  if (absl::Status status = ApplyAuthorityActivationKernel(candidate, log_index,
-                                                           cmd, std::nullopt);
+  if (absl::Status status =
+          ApplyAuthorityActivationKernel(candidate, cmd, std::nullopt);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
@@ -1757,33 +1711,38 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
-                      const RevokeGrant& cmd) {
-  (void)log_index;
-  const std::string summary =
-      absl::StrCat("RevokeGrant group=", cmd.group_id_,
-                   " expected_term=", cmd.expected_term_);
-  if (GroupHasActiveFailover(stores, cmd.group_id_)) {
-    return Rejected(
-        "grant revocation is blocked by an active failover transition",
-        summary);
-  }
-  // Grant-store local (term CAS, drop grant, fence); the topology record's
-  // owner field is deliberately left stale (no cascade — see the topology
-  // store header).
-  return FromStatus(stores.grant_.RevokeGrant(cmd), summary);
-}
-
-ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                       const FenceGroup& cmd) {
-  (void)log_index;
-  const std::string summary =
+  std::string summary =
       absl::StrCat("FenceGroup group=", cmd.group_id_,
-                   " expected_term=", cmd.expected_term_);
+                   " term=", cmd.expected_term_, "->", cmd.new_term_);
   if (GroupHasActiveFailover(stores, cmd.group_id_)) {
     return Rejected("fencing is blocked by an active failover transition",
-                    summary);
+                    std::move(summary));
   }
-  return FromStatus(stores.grant_.FenceGroup(cmd), summary);
+  MetaStores candidate = stores;
+  BeginGroupTerm begin;
+  begin.group_id_ = cmd.group_id_;
+  begin.expected_term_ = cmd.expected_term_;
+  begin.new_term_ = cmd.new_term_;
+  if (absl::Status status = ApplyBeginGroupTermKernel(candidate, begin);
+      !status.ok()) {
+    return Rejected(status, std::move(summary));
+  }
+  InvalidateStaleCurrentDirectives(candidate);
+  const auto group = stores.topology_.FindGroup(cmd.group_id_);
+  std::set<std::string> recipients;
+  if (group.has_value()) {
+    for (const MetaGroupMember& member : group->members_) {
+      recipients.insert(member.node_id_);
+    }
+  }
+  if (absl::Status status = ValidateAffectedFullStateProjections(
+          candidate, log_index, recipients);
+      !status.ok()) {
+    return Rejected(status, std::move(summary));
+  }
+  stores = std::move(candidate);
+  return Accepted(std::move(summary));
 }
 
 // ---------------------------------------------------------------------------
@@ -1994,7 +1953,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       current.revision_ == log_index &&
       current.mode_ == MetaFailoverMode::kUncontrolled &&
       current.candidate_action_ == cmd.candidate_action_ &&
-      current.target_term_ == group->record_.group_term_ && grant->fenced_ &&
+      current.target_term_ == group->record_.group_term_ &&
       !grant->grant_.has_value() &&
       ValidateMetaFailoverTransition(current).ok() &&
       ValidateDecodedAggregate(stores).ok();
@@ -2238,7 +2197,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       group->failover_transition_->candidate_action_ == expected_post_action &&
       group->record_.group_term_ == group->failover_transition_->target_term_ &&
       grant->group_term_ == group->failover_transition_->target_term_ &&
-      grant->fenced_ && !grant->grant_.has_value() &&
+      !grant->grant_.has_value() &&
       AllCurrentDirectivesHaveCommittedAnchors(stores) &&
       ValidateMetaFailoverTransition(*group->failover_transition_).ok() &&
       ValidateDecodedAggregate(stores).ok();
@@ -2270,7 +2229,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       current.candidate_action_ != cmd.expected_candidate_action_ ||
       group->record_.group_term_ == std::numeric_limits<std::uint64_t>::max() ||
       current.target_term_ != group->record_.group_term_ + 1 ||
-      grant->group_term_ != group->record_.group_term_ || grant->fenced_ ||
+      grant->group_term_ != group->record_.group_term_ ||
       !grant->grant_.has_value()) {
     return Rejected("controlled failover degrade CAS mismatch",
                     std::move(summary));

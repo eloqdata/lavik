@@ -218,7 +218,7 @@ bool MetaStoresFacts::MayReportFencedOwnerCandidate(
           std::numeric_limits<std::uint64_t>::max() ||
       candidate.source_group_term_ + 1 != candidate.group_term_ ||
       group->record_.owner_ != candidate.node_id_ ||
-      grant->group_term_ != group->record_.group_term_ || !grant->fenced_ ||
+      grant->group_term_ != group->record_.group_term_ ||
       grant->grant_.has_value()) {
     return false;
   }

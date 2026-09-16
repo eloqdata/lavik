@@ -144,12 +144,11 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
       node.source_meta_applied_index_ = index_;
       node.validated_committed_high_water_ =
           std::numeric_limits<std::uint64_t>::max();
-      node.groups_.push_back(
-          {group->group_id_, member->assignment_id_, group->record_.group_term_,
-           group->record_.authority_version_, grant->grant_->grant_revision_,
-           group->record_.population_manifest_revision_,
-           group->record_.population_manifest_digest_,
-           group->record_.partition_replication_epoch_});
+      node.groups_.push_back({group->group_id_, member->assignment_id_,
+                              group->record_.group_term_,
+                              group->record_.population_manifest_revision_,
+                              group->record_.population_manifest_digest_,
+                              group->record_.partition_replication_epoch_});
       runtime_.nodes_.push_back(std::move(node));
     }
   }
@@ -232,8 +231,8 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
     // models a Meta restart after detection but before fencing the Group.
     runtime_ = {};
     ApplyPlanned();  // fence group-a
-    EXPECT_TRUE(stores_.grant_.GroupState("group-a")->fenced_);
-    EXPECT_FALSE(stores_.grant_.GroupState("group-b")->fenced_);
+    EXPECT_FALSE(stores_.grant_.GroupState("group-a")->grant_.has_value());
+    EXPECT_TRUE(stores_.grant_.GroupState("group-b")->grant_.has_value());
     ApplyPlanned();  // abort group-a
     ApplyPlanned();  // abort root
     EXPECT_EQ(GroupOperation("group-a").lifecycle_,
@@ -474,8 +473,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
   CommitResult(first, first.current_directives_[1],
                MetaDirectiveResultStatus::kFailed);
   ApplyPlanned();  // fence group-a
-  EXPECT_TRUE(stores_.grant_.GroupState("group-a")->fenced_);
-  EXPECT_FALSE(stores_.grant_.GroupState("group-b")->fenced_);
+  EXPECT_FALSE(stores_.grant_.GroupState("group-a")->grant_.has_value());
+  EXPECT_TRUE(stores_.grant_.GroupState("group-b")->grant_.has_value());
   ApplyPlanned();  // abort group-a
   ApplyPlanned();  // abort root
   EXPECT_EQ(GroupOperation("group-a").lifecycle_,
@@ -494,8 +493,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
   CommitResult(first, first.current_directives_.front(),
                MetaDirectiveResultStatus::kFailed);
   ApplyPlanned();  // fence group-a
-  EXPECT_TRUE(stores_.grant_.GroupState("group-a")->fenced_);
-  EXPECT_FALSE(stores_.grant_.GroupState("group-b")->fenced_);
+  EXPECT_FALSE(stores_.grant_.GroupState("group-a")->grant_.has_value());
+  EXPECT_TRUE(stores_.grant_.GroupState("group-b")->grant_.has_value());
   ApplyPlanned();  // abort group-a
   ApplyPlanned();  // abort root
   EXPECT_EQ(GroupOperation("group-a").lifecycle_,
@@ -517,8 +516,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
 
   ApplyPlanned();  // retain the deterministic failure reason
   ApplyPlanned();  // fence group-a
-  EXPECT_TRUE(stores_.grant_.GroupState("group-a")->fenced_);
-  EXPECT_FALSE(stores_.grant_.GroupState("group-b")->fenced_);
+  EXPECT_FALSE(stores_.grant_.GroupState("group-a")->grant_.has_value());
+  EXPECT_TRUE(stores_.grant_.GroupState("group-b")->grant_.has_value());
   ApplyPlanned();  // abort group-a
   ApplyPlanned();  // abort root
 
@@ -539,6 +538,7 @@ TEST_F(ClusterCreateV1RecoveryTest,
   FenceGroup fence;
   fence.group_id_ = "group-a";
   fence.expected_term_ = 1;
+  fence.new_term_ = 2;
   Apply(fence);
 
   const auto next = Plan();
@@ -630,7 +630,7 @@ TEST_F(ClusterCreateV1RecoveryTest,
   EXPECT_EQ(GroupOperation("group-a").lifecycle_,
             MetaOperationLifecycle::kCompleted);
   EXPECT_EQ(GroupOperation("group-a").terminal_receipts_, receipts);
-  EXPECT_FALSE(stores_.grant_.GroupState("group-a")->fenced_);
+  EXPECT_TRUE(stores_.grant_.GroupState("group-a")->grant_.has_value());
 }
 
 TEST_F(ClusterCreateV1RecoveryTest,
@@ -681,8 +681,8 @@ TEST_F(ClusterCreateV1RecoveryTest,
 
   EXPECT_EQ(GroupOperation("group-a").lifecycle_,
             MetaOperationLifecycle::kCompleted);
-  EXPECT_FALSE(stores_.grant_.GroupState("group-a")->fenced_);
-  EXPECT_TRUE(stores_.grant_.GroupState("group-b")->fenced_);
+  EXPECT_TRUE(stores_.grant_.GroupState("group-a")->grant_.has_value());
+  EXPECT_FALSE(stores_.grant_.GroupState("group-b")->grant_.has_value());
   EXPECT_EQ(stores_.operation_.FindOperation(root_)->lifecycle_,
             MetaOperationLifecycle::kAborted);
 }

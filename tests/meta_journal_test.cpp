@@ -314,7 +314,6 @@ using keylane::meta::ActivateAuthority;
 using keylane::meta::BeginGroupTerm;
 using keylane::meta::MetaFailoverActionId;
 using keylane::meta::MetaGrantStore;
-using keylane::meta::RevokeGrant;
 
 BeginGroupTerm MakeBeginTerm(std::string group_id, std::uint64_t expected,
                              std::uint64_t new_term) {
@@ -328,13 +327,11 @@ BeginGroupTerm MakeBeginTerm(std::string group_id, std::uint64_t expected,
 // An activation carries no new term; only BeginGroupTerm advances it.
 ActivateAuthority MakeActivate(std::string group_id,
                                std::uint64_t expected_term,
-                               std::string new_owner,
-                               std::uint64_t new_authority_version) {
+                               std::string new_owner) {
   ActivateAuthority cmd;
   cmd.group_id_ = std::move(group_id);
   cmd.expected_term_ = expected_term;
   cmd.new_owner_ = std::move(new_owner);
-  cmd.new_authority_version_ = new_authority_version;
   cmd.new_topology_epoch_ = 100;
   cmd.new_config_epoch_ = 200;
   return cmd;
@@ -344,12 +341,8 @@ TEST(MetaGrantStore, CommandsOnUnknownGroupReject) {
   MetaGrantStore store;
   EXPECT_EQ(MetaFailureClassOf(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1))),
             MetaFailureClass::kDomainReject);
-  ActivateAuthority activate = MakeActivate("g1", 0, "node-a", 1);
-  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate, 1)),
-            MetaFailureClass::kDomainReject);
-  RevokeGrant revoke;
-  revoke.group_id_ = "g1";
-  EXPECT_EQ(MetaFailureClassOf(store.RevokeGrant(revoke)),
+  ActivateAuthority activate = MakeActivate("g1", 0, "node-a");
+  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate)),
             MetaFailureClass::kDomainReject);
   EXPECT_FALSE(store.GroupState("g1").has_value());
   EXPECT_FALSE(store.CurrentGroupTerm("g1").has_value());
@@ -362,7 +355,6 @@ TEST(MetaGrantStore, AddGroupCreatesFencedGrantlessState) {
   ASSERT_TRUE(state.has_value());
   EXPECT_EQ(state->group_term_, 0);
   EXPECT_FALSE(state->grant_.has_value());
-  EXPECT_TRUE(state->fenced_);
   EXPECT_EQ(store.CurrentGroupTerm("g1"), 0);
   // Idempotent: re-adding an existing group is a no-op.
   ASSERT_TRUE(store.AddGroup("g1").ok());
@@ -379,7 +371,6 @@ TEST(MetaGrantStore, BeginGroupTermPromotesOnceAndFences) {
   auto state = store.GroupState("g1");
   ASSERT_TRUE(state.has_value());
   EXPECT_EQ(state->group_term_, 1);
-  EXPECT_TRUE(state->fenced_);  // promotion enters the no-grant/fenced state
   EXPECT_FALSE(state->grant_.has_value());
   // Replay of the same command: the effect exists and the content is
   // consistent — idempotent no-op accept.
@@ -401,22 +392,16 @@ TEST(MetaGrantStore, ActivateInstallsGrantWithoutMovingTerm) {
   MetaGrantStore store;
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
-  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
+  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a");
   // The split primitives: the dispatcher validates, writes the topology part,
   // then applies the grant part atomically.
-  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
+  ASSERT_TRUE(store.ValidateActivate(activate).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
   const auto state = store.GroupState("g1");
   ASSERT_TRUE(state.has_value());
   EXPECT_EQ(state->group_term_, 1);  // unchanged by activation
-  EXPECT_FALSE(state->fenced_);
   ASSERT_TRUE(state->grant_.has_value());
   EXPECT_EQ(state->grant_->owner_, "node-a");
-  EXPECT_EQ(state->grant_->term_, 1);
-  EXPECT_EQ(state->grant_->authority_version_, 1);
-  EXPECT_EQ(state->grant_->grant_revision_, 10);
-  EXPECT_EQ(state->last_authority_version_, 1);
-  EXPECT_EQ(state->last_grant_revision_, 10);
 }
 
 TEST(MetaGrantStore, ActivationActionIdentityIsInstalledPreservedAndCleared) {
@@ -426,9 +411,9 @@ TEST(MetaGrantStore, ActivationActionIdentityIsInstalledPreservedAndCleared) {
 
   MetaFailoverActionId action_id{};
   action_id.fill(0x5a);
-  ActivateAuthority failover = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(failover, 10, action_id).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(failover, 10, action_id).ok());
+  ActivateAuthority failover = MakeActivate("g1", 1, "node-a");
+  ASSERT_TRUE(store.ValidateActivate(failover, action_id).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(failover, action_id).ok());
   ASSERT_EQ(store.GroupState("g1")->grant_->activation_action_id_, action_id);
 
   const auto encoded = store.Serialize();
@@ -438,9 +423,15 @@ TEST(MetaGrantStore, ActivationActionIdentityIsInstalledPreservedAndCleared) {
   ASSERT_EQ(restored->GroupState("g1")->grant_->activation_action_id_,
             action_id);
 
-  ActivateAuthority ordinary = MakeActivate("g1", 1, "node-a", 2);
-  ASSERT_TRUE(store.ValidateActivate(ordinary, 12).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(ordinary, 12).ok());
+  // An action-bound grant cannot be replaced by an ordinary activation in
+  // the same term, even when owner and term match.
+  ActivateAuthority ordinary = MakeActivate("g1", 1, "node-a");
+  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(ordinary)),
+            MetaFailureClass::kDomainReject);
+  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 1, 2)).ok());
+  ordinary.expected_term_ = 2;
+  ASSERT_TRUE(store.ValidateActivate(ordinary).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(ordinary).ok());
   EXPECT_FALSE(
       store.GroupState("g1")->grant_->activation_action_id_.has_value());
 }
@@ -449,13 +440,12 @@ TEST(MetaGrantStore, RejectsZeroPresentActivationActionIdentity) {
   MetaGrantStore store;
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
-  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
+  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a");
   const MetaFailoverActionId zero_action{};
 
-  EXPECT_EQ(
-      MetaFailureClassOf(store.ValidateActivate(activate, 10, zero_action)),
-      MetaFailureClass::kDomainReject);
-  EXPECT_DEATH(store.ApplyGrantPart(activate, 10, zero_action), "");
+  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate, zero_action)),
+            MetaFailureClass::kDomainReject);
+  EXPECT_DEATH(store.ApplyGrantPart(activate, zero_action), "");
 }
 
 TEST(MetaGrantStore, DeserializeRejectsZeroPresentActivationActionIdentity) {
@@ -464,9 +454,9 @@ TEST(MetaGrantStore, DeserializeRejectsZeroPresentActivationActionIdentity) {
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   MetaFailoverActionId action_id{};
   action_id.fill(0x5a);
-  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate, 10, action_id).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate, 10, action_id).ok());
+  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a");
+  ASSERT_TRUE(store.ValidateActivate(activate, action_id).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate, action_id).ok());
 
   auto bytes = store.Serialize();
   ASSERT_TRUE(bytes.ok()) << bytes.status();
@@ -484,11 +474,25 @@ TEST(MetaGrantStore, ActivateRejectsZeroServingTerm) {
   MetaGrantStore store;
   ASSERT_TRUE(store.AddGroup("g1").ok());
 
-  const ActivateAuthority activate = MakeActivate("g1", 0, "node-a", 1);
-  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate, 10)),
+  const ActivateAuthority activate = MakeActivate("g1", 0, "node-a");
+  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(activate)),
             MetaFailureClass::kDomainReject);
-  EXPECT_TRUE(store.GroupState("g1")->fenced_);
   EXPECT_FALSE(store.GroupState("g1")->grant_.has_value());
+}
+
+TEST(MetaGrantStore, DeserializeRejectsActiveGrantInZeroTerm) {
+  keylane::meta::MetaWriter writer;
+  writer.WriteU16(keylane::meta::kMetaFormatVersion);
+  writer.WriteCount(1);
+  writer.WriteString("g1");
+  writer.WriteU64(0);
+  writer.WriteU8(1);  // Grant present in an invalid term.
+  writer.WriteString("node-a");
+  writer.WriteU8(0);  // No activation action.
+
+  const auto restored = MetaGrantStore::Deserialize(writer.buffer());
+  ASSERT_FALSE(restored.ok());
+  EXPECT_EQ(MetaFailureClassOf(restored.status()), MetaFailureClass::kFailStop);
 }
 
 TEST(MetaGrantStore, ActivateWithStaleTermRejects) {
@@ -496,78 +500,40 @@ TEST(MetaGrantStore, ActivateWithStaleTermRejects) {
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   // A candidate from the previous term can never activate.
-  EXPECT_EQ(MetaFailureClassOf(
-                store.ValidateActivate(MakeActivate("g1", 0, "n", 1), 10)),
-            MetaFailureClass::kDomainReject);
+  EXPECT_EQ(
+      MetaFailureClassOf(store.ValidateActivate(MakeActivate("g1", 0, "n"))),
+      MetaFailureClass::kDomainReject);
   // A future term equally cannot.
-  EXPECT_EQ(MetaFailureClassOf(
-                store.ValidateActivate(MakeActivate("g1", 2, "n", 1), 10)),
-            MetaFailureClass::kDomainReject);
-  EXPECT_TRUE(store.GroupState("g1")->fenced_);
+  EXPECT_EQ(
+      MetaFailureClassOf(store.ValidateActivate(MakeActivate("g1", 2, "n"))),
+      MetaFailureClass::kDomainReject);
 }
 
-TEST(MetaGrantStore, ActivateReplayIdempotentAndVersionConflictRejected) {
+TEST(MetaGrantStore, EachTermInstallsAtMostOneGrant) {
   MetaGrantStore store;
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
-  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
+  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a");
+  ASSERT_TRUE(store.ValidateActivate(activate).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
   // Replay of the same activation: identical content already installed —
   // idempotent no-op accept through both primitives.
-  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
+  ASSERT_TRUE(store.ValidateActivate(activate).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
   EXPECT_EQ(store.GroupState("g1")->grant_->owner_, "node-a");
-  // Same term, same authority version, different content: conflict reject.
-  ActivateAuthority conflict = MakeActivate("g1", 1, "node-b", 1);
-  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(conflict, 11)),
+  // Any different active effect is rejected; same-term owner replacement is
+  // impossible even though the candidate is otherwise well formed.
+  ActivateAuthority conflict = MakeActivate("g1", 1, "node-b");
+  EXPECT_EQ(MetaFailureClassOf(store.ValidateActivate(conflict)),
             MetaFailureClass::kDomainReject);
-  // An older authority version never installs.
-  EXPECT_EQ(MetaFailureClassOf(
-                store.ValidateActivate(MakeActivate("g1", 1, "node-b", 0), 11)),
-            MetaFailureClass::kDomainReject);
-  // A newer authority version in the same term replaces the grant (planned
-  // migration commits through the same atomic point).
-  const ActivateAuthority migration = MakeActivate("g1", 1, "node-b", 2);
-  ASSERT_TRUE(store.ValidateActivate(migration, 11).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(migration, 11).ok());
-  const auto state = store.GroupState("g1");
-  EXPECT_EQ(state->grant_->owner_, "node-b");
-  EXPECT_EQ(state->grant_->authority_version_, 2);
-  EXPECT_EQ(state->group_term_, 1);
-}
 
-TEST(MetaGrantStore, RevokeAndFenceDropTheGrant) {
-  MetaGrantStore store;
-  ASSERT_TRUE(store.AddGroup("g1").ok());
-  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
-  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
-
-  RevokeGrant revoke;
-  revoke.group_id_ = "g1";
-  revoke.expected_term_ = 2;  // stale term rejects
-  EXPECT_EQ(MetaFailureClassOf(store.RevokeGrant(revoke)),
-            MetaFailureClass::kDomainReject);
-  revoke.expected_term_ = 1;
-  ASSERT_TRUE(store.RevokeGrant(revoke).ok());
-  EXPECT_TRUE(store.GroupState("g1")->fenced_);
+  // Only a new grantless term creates another installation opportunity.
+  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 1, 2)).ok());
   EXPECT_FALSE(store.GroupState("g1")->grant_.has_value());
-  // The authority version survives revocation so a stale activation still
-  // cannot install (checked against last_authority_version_).
-  EXPECT_EQ(store.GroupState("g1")->last_authority_version_, 1);
-  EXPECT_EQ(store.GroupState("g1")->last_grant_revision_, 10);
-  // Replay: already revoked — idempotent no-op accept.
-  ASSERT_TRUE(store.RevokeGrant(revoke).ok());
-
-  keylane::meta::FenceGroup fence;
-  fence.group_id_ = "g1";
-  fence.expected_term_ = 1;
-  ASSERT_TRUE(store.FenceGroup(fence).ok());  // already fenced: no-op accept
-  fence.expected_term_ = 9;
-  EXPECT_EQ(MetaFailureClassOf(store.FenceGroup(fence)),
-            MetaFailureClass::kDomainReject);
+  const ActivateAuthority next = MakeActivate("g1", 2, "node-b");
+  ASSERT_TRUE(store.ValidateActivate(next).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(next).ok());
+  EXPECT_EQ(store.GroupState("g1")->grant_->owner_, "node-b");
 }
 
 TEST(MetaGrantStore, FactQueriesTrackGrantState) {
@@ -575,18 +541,14 @@ TEST(MetaGrantStore, FactQueriesTrackGrantState) {
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   EXPECT_EQ(store.CurrentGroupTerm("g1"), 1);
-  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
+  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a");
+  ASSERT_TRUE(store.ValidateActivate(activate).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
   const auto active = store.GroupState("g1");
   ASSERT_TRUE(active.has_value());
   ASSERT_TRUE(active->grant_.has_value());
   EXPECT_EQ(active->grant_->owner_, "node-a");
-  EXPECT_EQ(active->grant_->grant_revision_, 10);
-  RevokeGrant revoke;
-  revoke.group_id_ = "g1";
-  revoke.expected_term_ = 1;
-  ASSERT_TRUE(store.RevokeGrant(revoke).ok());
+  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 1, 2)).ok());
   EXPECT_FALSE(store.GroupState("g1")->grant_.has_value());
 }
 
@@ -594,16 +556,13 @@ TEST(MetaGrantStore, RemoveGroupLifecycle) {
   MetaGrantStore store;
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
-  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
-  // A live grant must be revoked before the group record can go.
+  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a");
+  ASSERT_TRUE(store.ValidateActivate(activate).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
+  // A live grant must move to a new grantless term before the group can go.
   EXPECT_EQ(MetaFailureClassOf(store.RemoveGroup("g1")),
             MetaFailureClass::kDomainReject);
-  RevokeGrant revoke;
-  revoke.group_id_ = "g1";
-  revoke.expected_term_ = 1;
-  ASSERT_TRUE(store.RevokeGrant(revoke).ok());
+  ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 1, 2)).ok());
   ASSERT_TRUE(store.RemoveGroup("g1").ok());
   EXPECT_FALSE(store.GroupState("g1").has_value());
   ASSERT_TRUE(store.RemoveGroup("g1").ok());  // idempotent no-op
@@ -624,10 +583,8 @@ TEST(MetaGrantStore, ApplyGrantPartWithoutValidateFailsStop) {
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   // Applying the grant part against a term the validation could not have
   // accepted is an apply-layer contract violation: fail-stop.
-  EXPECT_DEATH(store.ApplyGrantPart(MakeActivate("g1", 2, "node-a", 1), 10),
-               "");
-  EXPECT_DEATH(store.ApplyGrantPart(MakeActivate("g9", 1, "node-a", 1), 10),
-               "");
+  EXPECT_DEATH(store.ApplyGrantPart(MakeActivate("g1", 2, "node-a")), "");
+  EXPECT_DEATH(store.ApplyGrantPart(MakeActivate("g9", 1, "node-a")), "");
 }
 
 TEST(MetaGrantStore, SerializationRoundTripPreservesState) {
@@ -635,9 +592,9 @@ TEST(MetaGrantStore, SerializationRoundTripPreservesState) {
   ASSERT_TRUE(store.AddGroup("g1").ok());
   ASSERT_TRUE(store.AddGroup("g2").ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
-  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
-  ASSERT_TRUE(store.ValidateActivate(activate, 10).ok());
-  ASSERT_TRUE(store.ApplyGrantPart(activate, 10).ok());
+  const ActivateAuthority activate = MakeActivate("g1", 1, "node-a");
+  ASSERT_TRUE(store.ValidateActivate(activate).ok());
+  ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g2", 0, 1)).ok());
 
   const auto bytes = store.Serialize();
@@ -649,7 +606,7 @@ TEST(MetaGrantStore, SerializationRoundTripPreservesState) {
   EXPECT_EQ(restored->GroupCount(), 2);
   // Behavior continues identically after restore: replay idempotency and CAS
   // checks are unaffected by a snapshot round-trip.
-  ASSERT_TRUE(restored->ValidateActivate(activate, 10).ok());  // replay no-op
+  ASSERT_TRUE(restored->ValidateActivate(activate).ok());  // replay no-op
   ASSERT_TRUE(restored->BeginGroupTerm(MakeBeginTerm("g2", 1, 2)).ok());
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g2", 1, 2)).ok());
   // Replay of that same command against the restored state: idempotent.
@@ -823,8 +780,6 @@ TEST(MetaOperationStore, DirectiveRevisionTracksOnlySemanticChanges) {
   directive.source_replication_history_id_.fill(6);
   directive.group_id_ = "g1";
   directive.group_term_ = 7;
-  directive.authority_version_ = 8;
-  directive.grant_revision_ = 9;
   directive.partition_replication_epoch_ = 10;
   directive.kind_ = "rebuild";
   directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
@@ -897,8 +852,6 @@ TEST(MetaOperationStore,
   directive.source_replication_history_id_.fill(6);
   directive.group_id_ = "g1";
   directive.group_term_ = 7;
-  directive.authority_version_ = 8;
-  directive.grant_revision_ = 9;
   directive.partition_replication_epoch_ = 10;
   directive.kind_ = "authorize-source";
   directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
@@ -984,8 +937,6 @@ TEST(MetaOperationStore,
   directive.source_replication_history_id_.fill(6);
   directive.group_id_ = "g1";
   directive.group_term_ = 7;
-  directive.authority_version_ = 8;
-  directive.grant_revision_ = 9;
   directive.partition_replication_epoch_ = 10;
   directive.kind_ = "rebuild";
   directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
@@ -1063,8 +1014,6 @@ TEST(MetaOperationStore, TerminalReceiptRetentionIsBoundedPerOperation) {
   first.source_replication_history_id_.fill(6);
   first.group_id_ = "g1";
   first.group_term_ = 7;
-  first.authority_version_ = 8;
-  first.grant_revision_ = 9;
   first.partition_replication_epoch_ = 10;
   first.kind_ = "rebuild";
   first.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});

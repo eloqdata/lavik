@@ -82,7 +82,6 @@ struct ClusterGroupWireV1 {
   std::uint64_t term_ = 0;
   std::optional<std::string> owner_node_id_;
   std::uint64_t config_epoch_ = 0;
-  std::optional<std::uint64_t> grant_revision_;
   bool serving_ready_ = false;
   bool topology_converged_ = false;
   // Leader-local automatic-failover diagnostics for this Group.
@@ -160,7 +159,7 @@ struct ClusterStatusWireV1 {
 
 // `clusterhead 1` and `clusterstatus 1` name the outer Admin verb revision;
 // their lowercase-hex binary payloads have independent leading schema markers
-// (currently head v1 and status v3). The WireV1 suffix names that outer
+// (currently head v1 and status v4). The WireV1 suffix names that outer
 // contract, not the inner payload marker. The human-inspectable line envelope
 // also lets typed transient errors use the normal `ERR <kind>` form.
 absl::StatusOr<std::string> EncodeClusterHeadReply(
@@ -231,7 +230,7 @@ class ClusterOperator {
   MetaAdminRoundTrip round_trip_;
 };
 
-// Deterministic public renderers. JSON has its own schema v2, independent of
+// Deterministic public renderers. JSON has its own schema v3, independent of
 // both Admin verb and binary payload revisions. JSON u64 values are decimal
 // strings and all arrays are sorted independently of server iteration order.
 absl::StatusOr<std::string> RenderClusterStatusJson(

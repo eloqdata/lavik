@@ -729,7 +729,7 @@ putpolicy <policy-id> <version> <content>
 getpolicy <policy-id>
 setslotmap <first> <last> <group-id> <config-epoch>
 activateauthority <group-id> <expected-term> <owner-node-id> \
-                  <new-authority-version> <new-config-epoch>
+                  <new-config-epoch>
 fencegroup <group-id> <expected-term>
 ```
 
@@ -762,19 +762,26 @@ after the complete replacement commits.
 
 `activateauthority` is the atomic owner/grant commit. The term must already
 have been established with `begingroupterm`, and the owner must hold a current
-assignment. Term, authority version, and config epoch are absolute values, not
-increments. Raft apply checks them against committed state, rejects stale or
-conflicting transitions without changing authority, and may accept an
-identical domain effect idempotently. The Data projection resolves lease
-duration from the current global Authority Lease Policy and caps it by the
-local Meta leadership-validity interval; grants do not store a duration or
-Policy reference. Only the cluster-wide topology epoch is derived by the
+assignment. It can install the sole Grant of a still-grantless term; it cannot
+replace an active Grant. Removing a Grant advances the term, so even
+reauthorizing the same Owner requires the new term. Use the typed failover
+workflow for normal Owner changes: it advances the Group Term and prepares the
+Candidate before activation. This low-level primitive only installs authority
+in a previously reserved grantless term; it does not perform that preparation.
+The expected term and config epoch are absolute values, not increments. Raft
+apply rejects stale or conflicting transitions without changing authority and
+may accept an identical domain effect idempotently. The Data projection resolves
+lease duration from the current global Authority Lease Policy and caps it by the
+local Meta leadership-validity interval. Data derives its heartbeat interval
+from that effective duration as `max(1 ms, duration / 3)`; heartbeat cadence is
+not configured or transmitted independently. Grants do not store a duration
+or Policy reference. Only the cluster-wide topology epoch is derived by the
 leader from its committed snapshot.
-`fencegroup` removes the grant under the explicit expected-term CAS. Treat
-`setslotmap`, `activateauthority`, and `fencegroup` as dangerous: verify the
+`fencegroup` removes the Grant under the explicit expected-term CAS and
+atomically advances the Group Term by one, leaving that new term grantless.
+Treat `setslotmap`, `activateauthority`, and `fencegroup` as dangerous: verify the
 current leader and intended group/owner before issuing them, and do not retry
-an uncertain result with newly invented version values until the committed
-state has been checked.
+an uncertain result until the committed state has been checked.
 
 These commits alone do not make a newly assigned Data node population-ready.
 Until a reconciliation workflow installs a matching ReadyToken, heartbeats

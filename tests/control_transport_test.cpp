@@ -63,7 +63,6 @@ absl::StatusOr<std::string> FullStatePayload(std::size_t padding_bytes) {
   control::FullDesiredState state;
   state.source_meta_applied_index = 1;
   state.authority_lease_duration_ms = 3000;
-  state.data_heartbeat_interval_ms = 1000;
   if (padding_bytes != 0) {
     control::WireManifestDocument manifest;
     manifest.revision = 1;

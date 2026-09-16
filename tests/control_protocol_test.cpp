@@ -42,7 +42,6 @@ WireHash256 Sha256(std::string_view bytes) {
 
 void SetLeaseTiming(control::FullDesiredState* state) {
   state->authority_lease_duration_ms = 3'000;
-  state->data_heartbeat_interval_ms = 1'000;
 }
 
 control::FullDesiredState FailoverFullState() {
@@ -50,7 +49,6 @@ control::FullDesiredState FailoverFullState() {
   state.source_meta_applied_index = 91;
   state.topology_epoch = 23;
   state.authority_lease_duration_ms = 3'000;
-  state.data_heartbeat_interval_ms = 1'000;
   state.nodes = {
       {.node_id = std::string(40, 'a'), .host = "127.0.0.1", .port = 6379},
       {.node_id = std::string(40, 'b'), .host = "127.0.0.2", .port = 6380},
@@ -65,8 +63,6 @@ control::FullDesiredState FailoverFullState() {
   group.owner_node_id = state.nodes[0].node_id;
   group.owner_assignment_id = Id(5);
   group.group_term = 7;
-  group.authority_version = 9;
-  group.grant_revision = 11;
   group.grant_active = true;
   group.activation_action_id = Id(19);
   group.config_epoch = 13;
@@ -276,8 +272,6 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
       .group_id = "group-a",
       .assignment_id = Id(3),
       .group_term = 7,
-      .authority_version = 8,
-      .grant_revision = 11,
   };
   heartbeat.role_information =
       control::AuthorityLeaseRequest{.challenge = challenge};
@@ -304,8 +298,6 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
       .group_id = challenge.group_id,
       .assignment_id = challenge.assignment_id,
       .group_term = challenge.group_term,
-      .authority_version = challenge.authority_version,
-      .grant_revision = challenge.grant_revision,
       .granted_duration_ms = 3'000,
   };
   encoded = control::EncodeMessage(control::WireMessage{ack});
@@ -491,9 +483,7 @@ TEST(ControlProtocolCodecTest,
                     .projection_hash = Sha256("projection"),
                     .group_id = "group-a",
                     .assignment_id = Id(3),
-                    .group_term = 7,
-                    .authority_version = 8,
-                    .grant_revision = 9}};
+                    .group_term = 7}};
   heartbeat.failover_observation =
       control::SourcePaused{.transition_id = Id(4),
                             .source_node_id = std::string(40, 'a'),
@@ -646,9 +636,7 @@ TEST(ControlProtocolCodecTest,
                 .projection_hash = Sha256("projection")},
       .authority = {.group_id = "group-a",
                     .assignment_id = Id(2),
-                    .group_term = 3,
-                    .authority_version = 4,
-                    .grant_revision = 5},
+                    .group_term = 3},
       .identity = {.operation_id = Id(6),
                    .directive_id = Id(7),
                    .attempt_id = Id(8),
@@ -744,9 +732,7 @@ TEST(ControlProtocolCodecTest, RoundTripsSourceLessPopulationInitialization) {
                 .projection_hash = Sha256("projection")},
       .authority = {.group_id = "group-a",
                     .assignment_id = Id(2),
-                    .group_term = 3,
-                    .authority_version = 4,
-                    .grant_revision = 5},
+                    .group_term = 3},
       .identity = {.operation_id = Id(6),
                    .directive_id = Id(7),
                    .attempt_id = Id(8),
@@ -901,8 +887,6 @@ TEST(ControlProtocolLeaseTest, GrantMatchesOnceAndUsesOriginalSendTime) {
       .group_id = "group-a",
       .assignment_id = Id(3),
       .group_term = 7,
-      .authority_version = 8,
-      .grant_revision = 11,
   };
   const WireId128 session_id = Id(1);
   constexpr std::int64_t kSentAtMs = 10'000;
@@ -922,8 +906,6 @@ TEST(ControlProtocolLeaseTest, GrantMatchesOnceAndUsesOriginalSendTime) {
       .group_id = challenge.group_id,
       .assignment_id = challenge.assignment_id,
       .group_term = challenge.group_term,
-      .authority_version = challenge.authority_version,
-      .grant_revision = challenge.grant_revision,
       .granted_duration_ms = 3'000,
   };
   auto deadline = tracker.AcceptGrant(session_id, grant, kSentAtMs + 2'999);
@@ -949,7 +931,6 @@ TEST(ControlProtocolFullStateTest,
   state.source_meta_applied_index = 91;
   state.topology_epoch = 23;
   state.authority_lease_duration_ms = 3'000;
-  state.data_heartbeat_interval_ms = 1'000;
   state.projection_hash = Sha256("semantic projection");
   state.meta_directory.push_back(
       {.server_id = 1, .host = "127.0.0.1", .port = 7400});
@@ -962,8 +943,6 @@ TEST(ControlProtocolFullStateTest,
   group.owner_node_id = state.nodes[0].node_id;
   group.owner_assignment_id = Id(5);
   group.group_term = 7;
-  group.authority_version = 9;
-  group.grant_revision = 11;
   group.grant_active = true;
   group.config_epoch = 13;
   group.members.push_back(
@@ -983,9 +962,7 @@ TEST(ControlProtocolFullStateTest,
                  .projection_hash = state.projection_hash},
        .authority = {.group_id = "group-a",
                      .assignment_id = Id(5),
-                     .group_term = 7,
-                     .authority_version = 9,
-                     .grant_revision = 11},
+                     .group_term = 7},
        .identity = {.operation_id = Id(6),
                     .directive_id = Id(8),
                     .attempt_id = Id(7),
@@ -1056,34 +1033,20 @@ TEST(ControlProtocolFullStateTest,
   EXPECT_NE(*activation_change, original_hash);
 }
 
-TEST(ControlProtocolFullStateTest,
-     RejectsLeaseTimingScalarsThatCannotShareOneCadence) {
+TEST(ControlProtocolFullStateTest, RejectsZeroLeaseAndDerivesHeartbeatCadence) {
   control::FullDesiredState state = FailoverFullState();
-
-  auto valid = control::EncodeFullDesiredState(state);
-  ASSERT_TRUE(valid.ok()) << valid.status();
-  // Body prefix: version(2), applied index(8), topology epoch(8), lease(4),
-  // then heartbeat(4). Altering the final heartbeat byte must be rejected by
-  // the decoder itself, before accepting any projection hash.
-  (*valid)[25] ^= 0x01;
-  EXPECT_EQ(control::DecodeFullDesiredState(*valid).status().code(),
-            absl::StatusCode::kInvalidArgument);
 
   state.authority_lease_duration_ms = 0;
   EXPECT_EQ(control::EncodeFullDesiredState(state).status().code(),
             absl::StatusCode::kInvalidArgument);
 
-  state.authority_lease_duration_ms = 3'000;
-  state.data_heartbeat_interval_ms = 999;
-  EXPECT_EQ(control::EncodeFullDesiredState(state).status().code(),
-            absl::StatusCode::kInvalidArgument);
-
   state.authority_lease_duration_ms = 2;
-  state.data_heartbeat_interval_ms = 1;
   auto projection_hash = control::ComputeProjectionHash(state);
   ASSERT_TRUE(projection_hash.ok()) << projection_hash.status();
   state.projection_hash = *projection_hash;
   EXPECT_TRUE(control::EncodeFullDesiredState(state).ok());
+  EXPECT_EQ(control::DataHeartbeatIntervalMs(2), 1u);
+  EXPECT_EQ(control::DataHeartbeatIntervalMs(3'000), 1'000u);
 }
 
 TEST(ControlProtocolFullStateTest, RejectsMalformedFailoverState) {
@@ -1263,7 +1226,6 @@ TEST(ControlProtocolFullStateTest,
 
   state.topology_epoch = 1;
   state.authority_lease_duration_ms = 6'000;
-  state.data_heartbeat_interval_ms = 2'000;
   auto lease_timing_change = control::ComputeProjectionHash(state);
   ASSERT_TRUE(lease_timing_change.ok()) << lease_timing_change.status();
   EXPECT_NE(*lease_timing_change, *original);
@@ -1276,9 +1238,7 @@ TEST(ControlProtocolFullStateTest,
                 .projection_hash = Sha256("old projection")},
       .authority = {.group_id = "group-a",
                     .assignment_id = Id(1),
-                    .group_term = 2,
-                    .authority_version = 3,
-                    .grant_revision = 4},
+                    .group_term = 2},
       .identity = {.operation_id = Id(5),
                    .directive_id = Id(6),
                    .attempt_id = Id(7),
@@ -1351,9 +1311,7 @@ TEST(ControlProtocolFullStateTest,
                 .projection_hash = Sha256("projection")},
       .authority = {.group_id = "group-a",
                     .assignment_id = Id(1),
-                    .group_term = 2,
-                    .authority_version = 3,
-                    .grant_revision = 4},
+                    .group_term = 2},
       .identity = {.operation_id = Id(5),
                    .directive_id = Id(6),
                    .attempt_id = Id(7),
@@ -1385,8 +1343,6 @@ TEST(ControlProtocolFullStateTest,
   add([](auto& value) { value.authority.group_id = "z"; });
   add([](auto& value) { value.authority.assignment_id = Id(2); });
   add([](auto& value) { value.authority.group_term = 12; });
-  add([](auto& value) { value.authority.authority_version = 13; });
-  add([](auto& value) { value.authority.grant_revision = 14; });
   add([](auto& value) { value.identity.operation_id = Id(15); });
   add([](auto& value) { value.identity.directive_id = Id(16); });
   add([](auto& value) { value.identity.attempt_id = Id(17); });
@@ -1431,8 +1387,6 @@ TEST(ControlProtocolFullStateTest, RoundTripsCommittedGrantlessGroup) {
   state.groups.push_back(
       {.group_id = "grantless",
        .group_term = 3,
-       .authority_version = 4,
-       .grant_revision = 5,
        .grant_active = false,
        .config_epoch = 6,
        .failover_transition = control::WireFailoverTransition{

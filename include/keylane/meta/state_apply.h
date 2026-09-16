@@ -40,8 +40,8 @@
 //      topology-side check (topology_epoch exactly current+1, new owner is a
 //      group member and registered active) all run BEFORE any write; only then
 //      the grant half (ApplyGrantPart) and
-//      the topology half (owner, authority_version, topology_epoch,
-//      config_epoch) are written in order. Any rejection leaves both halves
+//      the topology half (owner, topology_epoch, config_epoch) are written in
+//      order. Any rejection leaves both halves
 //      untouched.
 //   3. one-node-one-group cross-store half: an AssignNodeToGroup that would
 //      move a node into a group it is not currently a member of requires the
@@ -63,7 +63,7 @@
 //      operation store unchanged.
 //   7. Live directives remain valid after later committed mutations. After
 //      every accepted command, apply rechecks their exact source/target
-//      assignments, active term/authority/grant revision, and population
+//      assignments, active Group Term, and population
 //      identity, removes stale attempts, and bumps each affected operation's
 //      CAS revision once. CommitDirectiveResult repeats the same check before
 //      first commit; snapshot recovery and projection reject any stale entry

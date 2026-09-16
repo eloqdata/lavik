@@ -177,9 +177,9 @@ MetaAutomaticFailoverStateMachine::MetaAutomaticFailoverStateMachine(
     : max_groups_(
           std::min(max_groups, static_cast<std::size_t>(kMaxMetaGroups))) {}
 
-absl::StatusOr<MetaAutomaticFailoverUpdate>
-MetaAutomaticFailoverStateMachine::Advance(
-    const MetaAutomaticFailoverInput& input, std::uint64_t now_steady_ms) {
+absl::StatusOr<MetaAutomaticFailoverStateMachine::AdvanceResult>
+MetaAutomaticFailoverStateMachine::Advance(const Input& input,
+                                           std::uint64_t now_steady_ms) {
   if (input.suspect_after_ms_ == 0) {
     return absl::InvalidArgumentError(
         "automatic failover suspect threshold must be nonzero");
@@ -199,13 +199,12 @@ MetaAutomaticFailoverStateMachine::Advance(
     runtime.frozen_suspect_ms_ = 0;
   };
   const bool input_changed =
-      runtime.anchor_ != input.anchor_ ||
+      runtime.status_.anchor_ != input.anchor_ ||
       runtime.leader_authority_eligible_ != input.leader_authority_eligible_ ||
       runtime.automatic_failover_enabled_ !=
           input.automatic_failover_enabled_ ||
       runtime.suspect_after_ms_ != input.suspect_after_ms_;
   if (input_changed) {
-    runtime.anchor_ = input.anchor_;
     runtime.leader_authority_eligible_ = input.leader_authority_eligible_;
     runtime.automatic_failover_enabled_ = input.automatic_failover_enabled_;
     runtime.suspect_after_ms_ = input.suspect_after_ms_;
@@ -213,7 +212,7 @@ MetaAutomaticFailoverStateMachine::Advance(
     clear_suspect_clock();
   }
   if (runtime.status_.state_ == MetaAutomaticFailoverState::kTriggering) {
-    return MetaAutomaticFailoverUpdate{.status_ = runtime.status_};
+    return AdvanceResult{.status_ = runtime.status_};
   }
   if (now_steady_ms < runtime.last_now_ms_) {
     runtime.status_ = {};
@@ -229,18 +228,18 @@ MetaAutomaticFailoverStateMachine::Advance(
   if (!input.automatic_failover_enabled_) {
     runtime.status_.state_ = MetaAutomaticFailoverState::kDisabled;
     clear_suspect_clock();
-    return MetaAutomaticFailoverUpdate{.status_ = runtime.status_};
+    return AdvanceResult{.status_ = runtime.status_};
   }
   if (!input.leader_authority_eligible_) {
     runtime.status_.blocker_ = MetaAutomaticFailoverBlocker::kLeaderIneligible;
     clear_suspect_clock();
-    return MetaAutomaticFailoverUpdate{.status_ = runtime.status_};
+    return AdvanceResult{.status_ = runtime.status_};
   }
   if (input.owner_serviceability_.state_ ==
       MetaOwnerServiceabilityState::kServiceable) {
     runtime.status_.state_ = MetaAutomaticFailoverState::kHealthy;
     clear_suspect_clock();
-    return MetaAutomaticFailoverUpdate{.status_ = runtime.status_};
+    return AdvanceResult{.status_ = runtime.status_};
   }
   if (input.owner_serviceability_.state_ !=
           MetaOwnerServiceabilityState::kUnserviceable ||
@@ -253,7 +252,7 @@ MetaAutomaticFailoverStateMachine::Advance(
     }
     runtime.status_.blocker_ = BlockerFor(input.owner_serviceability_);
     runtime.status_.accumulated_suspect_ms_ = runtime.frozen_suspect_ms_;
-    return MetaAutomaticFailoverUpdate{.status_ = runtime.status_};
+    return AdvanceResult{.status_ = runtime.status_};
   }
 
   if (!runtime.active_since_ms_.has_value()) {
@@ -266,10 +265,9 @@ MetaAutomaticFailoverStateMachine::Advance(
   runtime.status_.accumulated_suspect_ms_ = elapsed;
   if (elapsed >= input.suspect_after_ms_) {
     runtime.status_.state_ = MetaAutomaticFailoverState::kTriggering;
-    return MetaAutomaticFailoverUpdate{.status_ = runtime.status_,
-                                       .trigger_now_ = true};
+    return AdvanceResult{.status_ = runtime.status_, .trigger_now_ = true};
   }
-  return MetaAutomaticFailoverUpdate{.status_ = runtime.status_};
+  return AdvanceResult{.status_ = runtime.status_};
 }
 
 void MetaAutomaticFailoverStateMachine::EraseGroup(std::string_view group_id) {

@@ -24,8 +24,8 @@ class TestTopologyInstaller {
     session_ = SessionIdentity{
         .session_id_ = SessionId::FromBytes(session_bytes),
         .generation_ = 1,
-        .data_boot_id_ = *NodeId::Parse(
-            "dddddddddddddddddddddddddddddddddddddddd"),
+        .data_boot_id_ =
+            *NodeId::Parse("dddddddddddddddddddddddddddddddddddddddd"),
     };
   }
 
@@ -76,8 +76,6 @@ class TestTopologyInstaller {
           .group_id_ = group.group_id_,
           .assignment_id_ = group.assignment_id_,
           .group_term_ = group.group_term_,
-          .authority_version_ = group.authority_version_,
-          .grant_revision_ = group.grant_revision_,
       };
       if (absl::Status granted = installer_.ApplyAuthority(
               AuthorityMessage{

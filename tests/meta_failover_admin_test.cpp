@@ -107,7 +107,6 @@ ClusterStatusWireV1 ReadyStatus() {
                             .term_ = 4,
                             .owner_node_id_ = "data-1",
                             .config_epoch_ = 8,
-                            .grant_revision_ = 12,
                             .serving_ready_ = true,
                             .topology_converged_ = true,
                             .effective_threshold_ms_ = 1'000});

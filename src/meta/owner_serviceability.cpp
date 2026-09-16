@@ -20,7 +20,7 @@ MetaOwnerServiceabilityDecision EvaluateOwnerServiceability(
   if (!cut.authority_handoff_complete_) {
     return blocked(MetaOwnerServiceabilityBlocker::kAuthorityHandoff);
   }
-  if (!cut.session_.has_value() || !cut.session_->connected_) {
+  if (!cut.session_.has_value()) {
     return {.state_ = MetaOwnerServiceabilityState::kUnserviceable,
             .reason_ = MetaOwnerServiceabilityReason::kSessionMissing};
   }
@@ -29,19 +29,16 @@ MetaOwnerServiceabilityDecision EvaluateOwnerServiceability(
         .state_ = MetaOwnerServiceabilityState::kIndeterminate,
         .reason_ = reason};
   };
-  const MetaOwnerSessionCut& session = *cut.session_;
-  if (session.identity_.node_id_ != cut.committed_anchor_.owner_node_id_ ||
-      session.identity_.leadership_generation_ != cut.leadership_generation_) {
+  const MetaOwnerServiceabilityCut::Session& session = *cut.session_;
+  if (!session.current_) {
     return indeterminate(MetaOwnerServiceabilityReason::kStaleOwnerAnchor);
   }
   if (!session.heartbeat_.has_value()) {
     return {.state_ = MetaOwnerServiceabilityState::kUnserviceable,
             .reason_ = MetaOwnerServiceabilityReason::kHeartbeatExpired};
   }
-  const MetaOwnerHeartbeatCut& heartbeat = *session.heartbeat_;
-  if (heartbeat.identity_ != session.identity_) {
-    return indeterminate(MetaOwnerServiceabilityReason::kStaleOwnerAnchor);
-  }
+  const MetaOwnerServiceabilityCut::Session::Heartbeat& heartbeat =
+      *session.heartbeat_;
   const auto unserviceable = [](MetaOwnerServiceabilityReason reason) {
     return MetaOwnerServiceabilityDecision{
         .state_ = MetaOwnerServiceabilityState::kUnserviceable,
@@ -73,19 +70,11 @@ MetaOwnerServiceabilityDecision EvaluateOwnerServiceability(
       MetaCausalProgressFreshness::kFresh) {
     return indeterminate(MetaOwnerServiceabilityReason::kCausalLeasePending);
   }
-  if (!session.causal_lease_confirmation_.has_value()) {
+  if (!session.confirmed_grant_sequence_.has_value()) {
     return indeterminate(MetaOwnerServiceabilityReason::kCausalLeasePending);
   }
-  const MetaCausalLeaseConfirmation& confirmation =
-      *session.causal_lease_confirmation_;
-  if (confirmation.identity_ != session.identity_ ||
-      confirmation.confirmed_anchor_ != cut.committed_anchor_) {
-    return indeterminate(MetaOwnerServiceabilityReason::kStaleOwnerAnchor);
-  }
-  if (confirmation.granted_heartbeat_sequence_ == 0 ||
-      heartbeat.sequence_ < confirmation.confirming_heartbeat_sequence_ ||
-      confirmation.confirming_heartbeat_sequence_ <=
-          confirmation.granted_heartbeat_sequence_) {
+  if (*session.confirmed_grant_sequence_ == 0 ||
+      heartbeat.sequence_ <= *session.confirmed_grant_sequence_) {
     return indeterminate(MetaOwnerServiceabilityReason::kCausalLeasePending);
   }
   return {.state_ = MetaOwnerServiceabilityState::kServiceable};

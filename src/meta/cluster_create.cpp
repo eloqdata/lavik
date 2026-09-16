@@ -105,18 +105,16 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
       manifest->slot_ranges_.size() > kMaxManifestItems) {
     return Invalid("clustercreate manifest is not a supported v1 topology");
   }
-  if (manifest->bootstrap_policy_
-              .automatic_uncontrolled_failover_suspect_after_ms_ <
+  if (manifest->automatic_uncontrolled_failover_suspect_after_ms_ <
           kMinimumAutomaticFailoverSuspectAfterMs ||
-      manifest->bootstrap_policy_
-              .automatic_uncontrolled_failover_suspect_after_ms_ >
+      manifest->automatic_uncontrolled_failover_suspect_after_ms_ >
           kMaximumAutomaticFailoverSuspectAfterMs) {
     return Invalid(
         "automatic_uncontrolled_failover_suspect_after_ms is out of range");
   }
-  if (manifest->bootstrap_policy_.authority_lease_duration_ms_ <
+  if (manifest->authority_lease_duration_ms_ <
           kMinimumAuthorityLeaseDurationMs ||
-      manifest->bootstrap_policy_.authority_lease_duration_ms_ >
+      manifest->authority_lease_duration_ms_ >
           kMaximumAuthorityLeaseDurationMs) {
     return Invalid("authority_lease_duration_ms is out of range");
   }
@@ -581,18 +579,16 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
         if (item.name == "automatic_uncontrolled_failover_enabled") {
           auto value = ParseBool(item);
           if (!value.ok()) return value.status();
-          result.bootstrap_policy_.automatic_uncontrolled_failover_enabled_ =
-              *value;
+          result.automatic_uncontrolled_failover_enabled_ = *value;
         } else if (item.name ==
                    "automatic_uncontrolled_failover_suspect_after_ms") {
           auto value = ParseUnsigned<std::uint64_t>(item);
           if (!value.ok()) return value.status();
-          result.bootstrap_policy_
-              .automatic_uncontrolled_failover_suspect_after_ms_ = *value;
+          result.automatic_uncontrolled_failover_suspect_after_ms_ = *value;
         } else if (item.name == "authority_lease_duration_ms") {
           auto value = ParseUnsigned<std::uint64_t>(item);
           if (!value.ok()) return value.status();
-          result.bootstrap_policy_.authority_lease_duration_ms_ = *value;
+          result.authority_lease_duration_ms_ = *value;
         } else {
           return Invalid("unknown bootstrap_policy field");
         }
@@ -708,14 +704,10 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
   writer.Raw(
       std::string_view(reinterpret_cast<const char*>(root_operation_id.data()),
                        root_operation_id.size()));
-  writer.U16(manifest.bootstrap_policy_.automatic_uncontrolled_failover_enabled_
-                 ? 1
-                 : 0);
+  writer.U16(manifest.automatic_uncontrolled_failover_enabled_ ? 1 : 0);
   writer.U32(static_cast<std::uint32_t>(
-      manifest.bootstrap_policy_
-          .automatic_uncontrolled_failover_suspect_after_ms_));
-  writer.U32(static_cast<std::uint32_t>(
-      manifest.bootstrap_policy_.authority_lease_duration_ms_));
+      manifest.automatic_uncontrolled_failover_suspect_after_ms_));
+  writer.U32(static_cast<std::uint32_t>(manifest.authority_lease_duration_ms_));
   writer.U32(static_cast<std::uint32_t>(manifest.meta_members_.size()));
   for (const auto& member : manifest.meta_members_) {
     writer.U32(member.server_id_);
@@ -800,12 +792,10 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
       !suspect_after_ms.ok() || !authority_lease_duration_ms.ok()) {
     return Invalid("invalid bootstrap Policy defaults");
   }
-  manifest.bootstrap_policy_.automatic_uncontrolled_failover_enabled_ =
-      *automatic_enabled == 1;
-  manifest.bootstrap_policy_.automatic_uncontrolled_failover_suspect_after_ms_ =
+  manifest.automatic_uncontrolled_failover_enabled_ = *automatic_enabled == 1;
+  manifest.automatic_uncontrolled_failover_suspect_after_ms_ =
       *suspect_after_ms;
-  manifest.bootstrap_policy_.authority_lease_duration_ms_ =
-      *authority_lease_duration_ms;
+  manifest.authority_lease_duration_ms_ = *authority_lease_duration_ms;
   auto meta_count = reader.U32();
   if (!meta_count.ok() || *meta_count == 0 || *meta_count > kMaxManifestItems) {
     return Invalid("invalid Meta member count");

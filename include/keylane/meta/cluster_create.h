@@ -20,16 +20,6 @@ namespace keylane::meta {
 // vectors are in canonical order and slot_ranges_ is the complete derived
 // table even when the manifest requested automatic allocation.
 struct ClusterCreateManifestV1 {
-  struct BootstrapPolicy {
-    bool automatic_uncontrolled_failover_enabled_ =
-        kDefaultAutomaticFailoverEnabled;
-    std::uint64_t automatic_uncontrolled_failover_suspect_after_ms_ =
-        kDefaultAutomaticFailoverSuspectAfterMs;
-    std::uint64_t authority_lease_duration_ms_ =
-        kDefaultAuthorityLeaseDurationMs;
-    bool operator==(const BootstrapPolicy&) const = default;
-  };
-
   struct MetaMember {
     std::uint32_t server_id_ = 0;
     std::string raft_endpoint_;
@@ -62,7 +52,11 @@ struct ClusterCreateManifestV1 {
   };
 
   std::uint32_t schema_version_ = 0;
-  BootstrapPolicy bootstrap_policy_;
+  bool automatic_uncontrolled_failover_enabled_ =
+      kDefaultAutomaticFailoverEnabled;
+  std::uint64_t automatic_uncontrolled_failover_suspect_after_ms_ =
+      kDefaultAutomaticFailoverSuspectAfterMs;
+  std::uint64_t authority_lease_duration_ms_ = kDefaultAuthorityLeaseDurationMs;
   std::vector<MetaMember> meta_members_;
   bool slots_generated_ = false;
   std::vector<DataNode> data_nodes_;

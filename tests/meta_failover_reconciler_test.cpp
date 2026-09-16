@@ -145,7 +145,6 @@ struct Fixture {
     activate.group_id_ = "g1";
     activate.expected_term_ = 1;
     activate.new_owner_ = owner;
-    activate.new_authority_version_ = 1;
     activate.new_topology_epoch_ = 4;
     activate.new_config_epoch_ = 1;
     Accept(activate);
@@ -450,8 +449,6 @@ void BeginUncontrolled(Fixture& fixture,
   begin.expected_owner_assignment_id_ = owner->assignment_id_;
   begin.expected_membership_revision_ = group->revision_;
   begin.expected_group_term_ = group->record_.group_term_;
-  begin.expected_authority_version_ = group->record_.authority_version_;
-  begin.expected_grant_revision_ = grant->last_grant_revision_;
   begin.expected_population_manifest_revision_ =
       group->record_.population_manifest_revision_;
   begin.expected_population_manifest_digest_ =
@@ -494,8 +491,6 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(command->expected_owner_assignment_id_, fixture.owner_assignment);
   EXPECT_EQ(command->expected_membership_revision_, 3);
   EXPECT_EQ(command->expected_group_term_, 1);
-  EXPECT_EQ(command->expected_authority_version_, 1);
-  EXPECT_EQ(command->expected_grant_revision_, 8);
   EXPECT_EQ(command->expected_config_epoch_, 1);
   EXPECT_EQ(command->candidate_action_.candidate_.node_id_, fixture.candidate);
   EXPECT_EQ(command->candidate_action_.candidate_.assignment_id_,
@@ -875,7 +870,6 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(commit->action_id_, authorized.candidate_action_->action_id_);
   EXPECT_EQ(commit->authorized_revision_,
             authorized.candidate_action_->authorization_->authorized_revision_);
-  EXPECT_EQ(commit->new_authority_version_, 2);
   EXPECT_EQ(commit->new_topology_epoch_, 5);
   EXPECT_EQ(commit->new_config_epoch_, 2);
   fixture.Accept(**planned);
@@ -1030,7 +1024,6 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_FALSE(transition.candidate_action_.has_value());
   const auto grant = fixture.stores.grant_.GroupState("g1");
   ASSERT_TRUE(grant.has_value());
-  EXPECT_TRUE(grant->fenced_);
   EXPECT_FALSE(grant->grant_.has_value());
   const auto operation =
       fixture.stores.operation_.FindOperation(fixture.operation_id);
@@ -1276,11 +1269,12 @@ TEST(MetaFailoverReconcilerPlannerTest,
   {
     Fixture fixture;
     fixture.SubmitControlled();
-    meta::RevokeGrant revoke;
-    revoke.request_id_ = Bytes<16>(0x8a);
-    revoke.group_id_ = "g1";
-    revoke.expected_term_ = 1;
-    fixture.Accept(revoke);
+    meta::FenceGroup fence;
+    fence.request_id_ = Bytes<16>(0x8a);
+    fence.group_id_ = "g1";
+    fence.expected_term_ = 1;
+    fence.new_term_ = 2;
+    fixture.Accept(fence);
     IdSequence ids{0x8b};
     const auto planned = meta::PlanFailoverStep(
         meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
@@ -1790,7 +1784,6 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(group->record_.group_term_, 3);
   const auto grant = fixture.stores.grant_.GroupState("g1");
   ASSERT_TRUE(grant.has_value());
-  EXPECT_TRUE(grant->fenced_);
   EXPECT_FALSE(grant->grant_.has_value());
   EXPECT_FALSE(group->failover_transition_->candidate_action_.has_value());
 }

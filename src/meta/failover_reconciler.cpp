@@ -78,15 +78,12 @@ std::optional<MetaAssignmentId> AssignmentFor(
 }
 
 template <typename Command>
-void SetGroupAnchors(Command& command, const MetaTopologyGroupView& group,
-                     const MetaGroupGrantState& grant) {
+void SetGroupAnchors(Command& command, const MetaTopologyGroupView& group) {
   command.expected_owner_node_id_ = group.record_.owner_;
   command.expected_owner_assignment_id_ =
       *AssignmentFor(group, group.record_.owner_);
   command.expected_membership_revision_ = group.revision_;
   command.expected_group_term_ = group.record_.group_term_;
-  command.expected_authority_version_ = group.record_.authority_version_;
-  command.expected_grant_revision_ = grant.last_grant_revision_;
   command.expected_population_manifest_revision_ =
       group.record_.population_manifest_revision_;
   command.expected_population_manifest_digest_ =
@@ -113,12 +110,9 @@ absl::StatusOr<MetaRequestId> NextId(
 
 bool ActiveGrantMatchesGroup(const MetaTopologyGroupView& group,
                              const MetaGroupGrantState& grant) {
-  return grant.grant_.has_value() && !grant.fenced_ &&
+  return grant.grant_.has_value() &&
          grant.group_term_ == group.record_.group_term_ &&
-         grant.grant_->owner_ == group.record_.owner_ &&
-         grant.grant_->term_ == group.record_.group_term_ &&
-         grant.grant_->authority_version_ == group.record_.authority_version_ &&
-         grant.grant_->grant_revision_ == grant.last_grant_revision_;
+         grant.grant_->owner_ == group.record_.owner_;
 }
 
 bool ControlledDomainMatchesOwner(const MetaFailoverCompatibilityDomain& domain,
@@ -379,7 +373,7 @@ absl::StatusOr<std::optional<MetaCommand>> Authorize(
 
 absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
     const MetaCommittedView& view, const MetaTopologyGroupView& group,
-    const MetaGroupGrantState& grant, const MetaFailoverTransition& transition,
+    const MetaFailoverTransition& transition,
     const MetaOperationRecord& operation,
     const MetaFailoverPlannerContext& context) {
   const auto& action = *transition.candidate_action_;
@@ -392,8 +386,6 @@ absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
     return absl::FailedPreconditionError(
         "controlled commit owner assignment is absent");
   }
-  auto authority = Increment(group.record_.authority_version_, "authority");
-  if (!authority.ok()) return authority.status();
   auto topology = Increment(view.topology().TopologyEpoch(), "topology epoch");
   if (!topology.ok()) return topology.status();
   auto config = Increment(group.config_epoch_, "config epoch");
@@ -410,8 +402,7 @@ absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
   command.action_id_ = action.action_id_;
   command.authorized_revision_ = action.authorization_->authorized_revision_;
   command.expected_candidate_ = action.candidate_;
-  SetGroupAnchors(command, group, grant);
-  command.new_authority_version_ = *authority;
+  SetGroupAnchors(command, group);
   command.new_topology_epoch_ = *topology;
   command.new_config_epoch_ = *config;
   return MetaCommand{std::move(command)};
@@ -419,7 +410,7 @@ absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
 
 absl::StatusOr<std::optional<MetaCommand>> CommitUncontrolled(
     const MetaCommittedView& view, const MetaTopologyGroupView& group,
-    const MetaGroupGrantState& grant, const MetaFailoverTransition& transition,
+    const MetaFailoverTransition& transition,
     const MetaFailoverPlannerContext& context) {
   const auto& action = *transition.candidate_action_;
   if (!action.authorization_.has_value()) {
@@ -430,8 +421,6 @@ absl::StatusOr<std::optional<MetaCommand>> CommitUncontrolled(
     return absl::FailedPreconditionError(
         "uncontrolled commit owner assignment is absent");
   }
-  auto authority = Increment(group.record_.authority_version_, "authority");
-  if (!authority.ok()) return authority.status();
   auto topology = Increment(view.topology().TopologyEpoch(), "topology epoch");
   if (!topology.ok()) return topology.status();
   auto config = Increment(group.config_epoch_, "config epoch");
@@ -447,8 +436,7 @@ absl::StatusOr<std::optional<MetaCommand>> CommitUncontrolled(
   command.authorized_revision_ = action.authorization_->authorized_revision_;
   command.loss_if_cutover_ = action.authorization_->loss_if_cutover_;
   command.expected_candidate_ = action.candidate_;
-  SetGroupAnchors(command, group, grant);
-  command.new_authority_version_ = *authority;
+  SetGroupAnchors(command, group);
   command.new_topology_epoch_ = *topology;
   command.new_config_epoch_ = *config;
   return MetaCommand{std::move(command)};
@@ -547,7 +535,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanControlledTransition(
     return absl::FailedPreconditionError(
         "controlled transition grant state is absent");
   }
-  return CommitControlled(view, group, *grant, transition, *operation, context);
+  return CommitControlled(view, group, transition, *operation, context);
 }
 
 absl::StatusOr<std::optional<MetaCommand>> SetUncontrolledAction(
@@ -619,7 +607,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanUncontrolledTransition(
     return absl::FailedPreconditionError(
         "uncontrolled transition grant state is absent");
   }
-  return CommitUncontrolled(view, group, *grant, transition, context);
+  return CommitUncontrolled(view, group, transition, context);
 }
 
 bool OperationOwnsControlledTransition(const MetaCommittedView& view,
@@ -746,7 +734,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanSubmittedControlled(
   command.operation_id_ = operation.operation_id_;
   command.expected_operation_revision_ = operation.revision_;
   command.absolute_deadline_unix_ms_ = intent->absolute_deadline_unix_ms_;
-  SetGroupAnchors(command, *group, *grant);
+  SetGroupAnchors(command, *group);
   return MetaCommand{std::move(command)};
 }
 

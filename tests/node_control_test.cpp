@@ -94,7 +94,6 @@ T RunTaskSync(celer::Task<T> task) {
 std::shared_ptr<const ServingState> MakeState(
     AssignmentId assignment = Assignment(1), std::uint64_t topology_epoch = 1,
     std::uint64_t config_epoch = 1, std::uint64_t term = 1,
-    std::uint64_t authority_version = 1, std::uint64_t grant_revision = 1,
     std::uint64_t manifest_revision = 1, bool granted = true,
     bool population_ready = true, bool mutations_paused = false) {
   ServingStateBuilder builder;
@@ -107,8 +106,6 @@ std::shared_ptr<const ServingState> MakeState(
   group.primary_node_index_ = 0;
   group.assignment_id_ = assignment;
   group.group_term_ = term;
-  group.authority_version_ = authority_version;
-  group.grant_revision_ = grant_revision;
   group.manifest_revision_ = manifest_revision;
   group.config_epoch_ = config_epoch;
   group.granted_ = granted;
@@ -138,8 +135,6 @@ std::shared_ptr<const ServingState> MakeReplicaState(
   group.primary_node_index_ = 0;
   group.assignment_id_ = owner_assignment;
   group.group_term_ = 1;
-  group.authority_version_ = 1;
-  group.grant_revision_ = 1;
   group.manifest_revision_ = manifest_revision;
   group.config_epoch_ = 1;
   group.granted_ = true;
@@ -169,8 +164,6 @@ std::shared_ptr<const ServingState> MakeLocalSourceState(
   group.primary_node_index_ = 1;
   group.assignment_id_ = target_assignment;
   group.group_term_ = 1;
-  group.authority_version_ = 1;
-  group.grant_revision_ = 1;
   group.manifest_revision_ = 1;
   group.config_epoch_ = topology_epoch;
   group.granted_ = true;
@@ -226,8 +219,6 @@ PreparedFullState FullState(
     prepared.control_groups_.push_back(PreparedGroupControlIdentity{
         .group_id_ = group->group_id_,
         .group_term_ = group->group_term_,
-        .authority_version_ = group->authority_version_,
-        .grant_revision_ = group->grant_revision_,
         .config_epoch_ = group->config_epoch_,
         .manifest_revision_ = group->manifest_revision_,
         .manifest_digest_ = Digest(4),
@@ -256,8 +247,6 @@ PreparedFullState LocalSourceFullState(
     prepared.control_groups_.push_back(PreparedGroupControlIdentity{
         .group_id_ = group->group_id_,
         .group_term_ = group->group_term_,
-        .authority_version_ = group->authority_version_,
-        .grant_revision_ = group->grant_revision_,
         .config_epoch_ = group->config_epoch_,
         .manifest_revision_ = group->manifest_revision_,
         .manifest_digest_ = Digest(4),
@@ -278,8 +267,6 @@ AuthorityAnchor Anchor(const ServingState& state) {
       .group_id_ = "group-a",
       .assignment_id_ = group->assignment_id_,
       .group_term_ = group->group_term_,
-      .authority_version_ = group->authority_version_,
-      .grant_revision_ = group->grant_revision_,
   };
 }
 
@@ -549,8 +536,6 @@ DesiredClusterControl DesiredControl(std::string group_id = "group-a") {
           {
               .group_id_ = std::move(group_id),
               .group_term_ = 7,
-              .authority_version_ = 8,
-              .grant_revision_ = 9,
               .config_epoch_ = 10,
               .manifest_revision_ = 11,
               .manifest_digest_ = Digest(4),
@@ -607,7 +592,7 @@ PreparedFullState ControlledPauseFullState(bool paused,
   // Match PrepareMetaFullState: Meta never projects the boot-local ReadyToken
   // back to Data, even when only failover control changes between snapshots.
   PreparedFullState prepared = WithDesiredControl(
-      FullState(MakeState(Assignment(1), topology_epoch, 1, 1, 1, 1, 1,
+      FullState(MakeState(Assignment(1), topology_epoch, 1, 1, 1,
                           /*granted=*/true, /*population_ready=*/false, paused),
                 object_hash));
   if (paused) {
@@ -726,8 +711,6 @@ TEST(EstablishedExportScopeTest,
 
   DesiredClusterControl control_only = established;
   ++control_only.identity_.group_term_;
-  ++control_only.identity_.authority_version_;
-  ++control_only.identity_.grant_revision_;
   ++control_only.identity_.config_epoch_;
   control_only.grant_active_ = false;
   control_only.activation_action_id_ = ShortId<FailoverActionId>(1);
@@ -787,7 +770,7 @@ TEST(NodeControlInstallerTest,
                   ->population_transition_expected_);
 
   PreparedFullState changed =
-      WithDesiredControl(FullState(MakeState(Assignment(1), 2, 2, 2, 2), 4));
+      WithDesiredControl(FullState(MakeState(Assignment(1), 2, 2, 2), 4));
   changed.desired_cluster_controls_.front().failover_transition_ =
       PreparedFailoverTransition{
           .transition_id_ = ShortId<FailoverTransitionId>(2),
@@ -817,8 +800,6 @@ TEST(NodeControlInstallerTest,
   EXPECT_FALSE(control.actions.preserve_established_exports_.back());
 
   ++fenced.identity_.group_term_;
-  ++fenced.identity_.authority_version_;
-  ++fenced.identity_.grant_revision_;
   ++fenced.identity_.config_epoch_;
   fenced.grant_active_ = false;
   fenced.failover_transition_ = PreparedFailoverTransition{
@@ -959,7 +940,7 @@ TEST(NodeControlInstallerTest,
 
   PreparedFullState changed_term = ControlledPauseFullState(true, 2, 4);
   changed_term.serving_state_ =
-      MakeState(Assignment(1), 2, 1, 2, 1, 1, 1,
+      MakeState(Assignment(1), 2, 1, 2, 1,
                 /*granted=*/true, /*population_ready=*/false,
                 /*mutations_paused=*/true);
   changed_term.control_groups_.front().group_term_ = 2;
@@ -969,7 +950,7 @@ TEST(NodeControlInstallerTest,
 
   PreparedFullState changed_manifest = ControlledPauseFullState(true, 2, 4);
   changed_manifest.serving_state_ =
-      MakeState(Assignment(1), 2, 1, 1, 1, 1, 2,
+      MakeState(Assignment(1), 2, 1, 1, 2,
                 /*granted=*/true, /*population_ready=*/false,
                 /*mutations_paused=*/true);
   changed_manifest.control_groups_.front().manifest_revision_ = 2;
@@ -988,7 +969,7 @@ TEST(NodeControlInstallerTest,
   PreparedFullState changed_local_assignment =
       ControlledPauseFullState(true, 2, 4);
   changed_local_assignment.serving_state_ =
-      MakeState(Assignment(2), 2, 1, 1, 1, 1, 1,
+      MakeState(Assignment(2), 2, 1, 1, 1,
                 /*granted=*/true, /*population_ready=*/false,
                 /*mutations_paused=*/true);
   changed_local_assignment.control_groups_.front()
@@ -1182,7 +1163,7 @@ class ProvisionalActivationService final : public celer::Service {
       // projection still names that historical activation action, while
       // readiness is deliberately established below for this new boot.
       prepared.serving_state_ =
-          MakeState(Assignment(1), 1, 1, 1, 1, 1, 1,
+          MakeState(Assignment(1), 1, 1, 1, 1,
                     /*granted=*/true, /*population_ready=*/false);
     }
     if (scenario_ == Scenario::kMismatchedDesiredAuthority) {
@@ -1262,8 +1243,8 @@ class ProvisionalActivationService final : public celer::Service {
           control_.actions.expiration_authority_enables_ == 0;
       if (scenario_ == Scenario::kProjectionReplacement ||
           scenario_ == Scenario::kReplacementDuringExpirationEnable) {
-        PreparedFullState replacement = WithDesiredControl(
-            FullState(MakeState(Assignment(1), 2, 2, 2, 2, 2), 4));
+        PreparedFullState replacement =
+            WithDesiredControl(FullState(MakeState(Assignment(1), 2, 2, 2), 4));
         replacement_result_ =
             co_await control_.installer.InstallFullStateTransition(
                 std::move(replacement), Basis(11, 4));
@@ -1830,7 +1811,7 @@ class FenceDirectiveAdmissionService final : public celer::Service {
       co_return result_;
     }
     if (absl::Status installed = control_.installer.InstallFullState(
-            FullState(MakeState(Assignment(1), 1, 1, 1, 1, 1, 1,
+            FullState(MakeState(Assignment(1), 1, 1, 1, 1,
                                 /*granted=*/true,
                                 /*population_ready=*/false),
                       3),
@@ -1965,9 +1946,7 @@ class ReadinessAdmissionInvalidationService final : public celer::Service {
         .projection_ = Basis(10, 2),
         .anchor_ = {.group_id_ = "group-a",
                     .assignment_id_ = replica_assignment,
-                    .group_term_ = 1,
-                    .authority_version_ = 1,
-                    .grant_revision_ = 1},
+                    .group_term_ = 1},
         .operation_id_ = ShortId<OperationId>(1),
         .directive_id_ = ShortId<DirectiveId>(2),
         .attempt_id_ = ShortId<AttemptId>(3),
@@ -2051,7 +2030,7 @@ class StorageLossAdmissionService final : public celer::Service {
       co_return result_;
     }
     if (absl::Status installed = control_.installer.InstallFullState(
-            FullState(MakeState(Assignment(1), 1, 1, 1, 1, 1, 1,
+            FullState(MakeState(Assignment(1), 1, 1, 1, 1,
                                 /*granted=*/true,
                                 /*population_ready=*/false),
                       3),
@@ -2852,7 +2831,7 @@ TEST(NodeControlInstallerTest, FullStateRejectsIndexAndDomainRegressions) {
       absl::StatusCode::kOutOfRange);
   EXPECT_EQ(
       control.installer
-          .InstallFullState(FullState(MakeState(Assignment(1), 2, 1, 1, 0), 5),
+          .InstallFullState(FullState(MakeState(Assignment(1), 2, 1, 0), 5),
                             Basis(11, 5))
           .code(),
       absl::StatusCode::kFailedPrecondition);
@@ -2866,10 +2845,10 @@ TEST(NodeControlInstallerTest, FullStateRejectsIndexAndDomainRegressions) {
           .code(),
       absl::StatusCode::kFailedPrecondition);
 
-  // A fresh assignment is a new incarnation; its counters may restart.
+  // A fresh assignment is a new incarnation; its term may restart.
   EXPECT_TRUE(
       control.installer
-          .InstallFullState(FullState(MakeState(Assignment(2), 2, 1, 1, 0), 6),
+          .InstallFullState(FullState(MakeState(Assignment(2), 2, 1, 0), 6),
                             Basis(12, 6))
           .ok());
 }
@@ -2882,8 +2861,6 @@ TEST(NodeControlInstallerTest,
       .object_hash_ = Digest(3),
       .control_groups_ = {{.group_id_ = "group-a",
                            .group_term_ = 5,
-                           .authority_version_ = 5,
-                           .grant_revision_ = 5,
                            .config_epoch_ = 5,
                            .manifest_revision_ = 5,
                            .manifest_digest_ = Digest(4),
@@ -2907,20 +2884,14 @@ TEST(NodeControlInstallerTest,
   candidate.control_groups_[0].group_term_ = 4;
   expect_rejected(std::move(candidate), 3);
   candidate = ownerless;
-  candidate.control_groups_[0].authority_version_ = 4;
+  candidate.control_groups_[0].config_epoch_ = 4;
   expect_rejected(std::move(candidate), 4);
   candidate = ownerless;
-  candidate.control_groups_[0].grant_revision_ = 4;
+  candidate.control_groups_[0].manifest_revision_ = 4;
   expect_rejected(std::move(candidate), 5);
   candidate = ownerless;
-  candidate.control_groups_[0].config_epoch_ = 4;
-  expect_rejected(std::move(candidate), 6);
-  candidate = ownerless;
-  candidate.control_groups_[0].manifest_revision_ = 4;
-  expect_rejected(std::move(candidate), 7);
-  candidate = ownerless;
   candidate.control_groups_[0].partition_replication_epoch_ = 4;
-  expect_rejected(std::move(candidate), 8);
+  expect_rejected(std::move(candidate), 6);
 
   candidate = ownerless;
   candidate.object_hash_ = Digest(9);
@@ -2970,7 +2941,7 @@ TEST(NodeControlInstallerTest,
 
   ASSERT_TRUE(
       control.installer
-          .InstallFullState(FullState(MakeState(Assignment(1), 2, 1, 1, 2), 4),
+          .InstallFullState(FullState(MakeState(Assignment(1), 2, 1, 2), 4),
                             Basis(11, 3))
           .ok());
   const std::shared_ptr<const ServingState> current = control.cache.Current();
@@ -3024,14 +2995,13 @@ TEST(NodeControlInstallerTest,
   // A replacement FDS omits the boot-local ReadyToken. The installer carries
   // an already verified bit across an exact population anchor, and the same
   // replacement must not tear down its already-online export.
-  ASSERT_TRUE(
-      RunTaskSync(control.installer.InstallFullStateTransition(
-                      FullState(MakeState(Assignment(1), 1, 1, 1, 1, 1, 1,
-                                          /*granted=*/true,
-                                          /*population_ready=*/false),
-                                4),
-                      Basis(11, 3)))
-          .ok());
+  ASSERT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              FullState(MakeState(Assignment(1), 1, 1, 1, 1,
+                                                  /*granted=*/true,
+                                                  /*population_ready=*/false),
+                                        4),
+                              Basis(11, 3)))
+                  .ok());
   EXPECT_TRUE(control.cache.Current()->FindGroup("group-a")->population_ready_);
   EXPECT_EQ(control.actions.session_clears_, 3);
   ASSERT_EQ(control.actions.preserve_established_exports_.size(), 3U);
@@ -3044,11 +3014,10 @@ TEST(NodeControlInstallerTest,
   std::optional<InFlightGuard> in_flight;
   in_flight.emplace(*cell, 0);
   control.actions.on_async_revocation_ = [&] { in_flight.reset(); };
-  EXPECT_TRUE(
-      RunTaskSync(
-          control.installer.InstallFullStateTransition(
-              FullState(MakeState(Assignment(1), 2, 1, 1, 2), 5), Basis(12, 4)))
-          .ok());
+  EXPECT_TRUE(RunTaskSync(control.installer.InstallFullStateTransition(
+                              FullState(MakeState(Assignment(1), 2, 1, 2), 5),
+                              Basis(12, 4)))
+                  .ok());
   EXPECT_EQ(control.actions.session_clears_, 4);
   ASSERT_EQ(control.actions.preserve_established_exports_.size(), 4U);
   EXPECT_FALSE(control.actions.preserve_established_exports_.back());
@@ -3064,8 +3033,6 @@ TEST(NodeControlInstallerTest,
       .object_hash_ = Digest(3),
       .control_groups_ = {{.group_id_ = "group-a",
                            .group_term_ = 2,
-                           .authority_version_ = 1,
-                           .grant_revision_ = 1,
                            .manifest_revision_ = 1,
                            .manifest_digest_ = Digest(4),
                            .partition_replication_epoch_ =
@@ -3236,7 +3203,7 @@ TEST(NodeControlInstallerTest, DirectiveRequiresCurrentProjectionAndAuthority) {
   ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
   ASSERT_TRUE(
       control.installer
-          .InstallFullState(FullState(MakeState(Assignment(1), 1, 1, 1, 1, 1, 1,
+          .InstallFullState(FullState(MakeState(Assignment(1), 1, 1, 1, 1,
                                                 /*granted=*/true,
                                                 /*population_ready=*/false),
                                       3),
@@ -3307,11 +3274,11 @@ TEST(NodeControlInstallerTest, DirectiveRequiresCurrentProjectionAndAuthority) {
             absl::StatusCode::kFailedPrecondition);
   EXPECT_EQ(control.actions.directives_.size(), 1U);
 
-  // The floor fences one assignment through one counter tuple, not the group
-  // forever. A committed higher tuple for the same incarnation is distinct.
+  // The floor fences one assignment through one term, not the group forever.
+  // A committed higher term for the same incarnation is distinct.
   ASSERT_TRUE(
       control.installer
-          .InstallFullState(FullState(MakeState(Assignment(1), 2, 2, 2, 2, 2, 1,
+          .InstallFullState(FullState(MakeState(Assignment(1), 2, 2, 2, 1,
                                                 /*granted=*/true,
                                                 /*population_ready=*/false),
                                       4),
@@ -3329,7 +3296,7 @@ TEST(NodeControlInstallerTest,
   ASSERT_TRUE(control.installer.SetStorageReady(true).ok());
   ASSERT_TRUE(
       control.installer
-          .InstallFullState(FullState(MakeState(Assignment(1), 1, 1, 1, 1, 1, 1,
+          .InstallFullState(FullState(MakeState(Assignment(1), 1, 1, 1, 1,
                                                 /*granted=*/true,
                                                 /*population_ready=*/false),
                                       3),
@@ -3359,11 +3326,10 @@ TEST(NodeControlInstallerTest,
       RunTaskSync(control.installer.ApplyDirective(stale_assignment)).code(),
       absl::StatusCode::kFailedPrecondition);
 
-  NodeDirective stale_authority = directive;
-  ++stale_authority.anchor_.authority_version_;
-  EXPECT_EQ(
-      RunTaskSync(control.installer.ApplyDirective(stale_authority)).code(),
-      absl::StatusCode::kFailedPrecondition);
+  NodeDirective stale_term = directive;
+  ++stale_term.anchor_.group_term_;
+  EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(stale_term)).code(),
+            absl::StatusCode::kFailedPrecondition);
 
   NodeDirective stale_population = directive;
   ++stale_population.partition_replication_epoch_;
@@ -3399,7 +3365,7 @@ TEST(NodeControlInstallerTest,
   EXPECT_EQ(control.cache.Current(), before_replay);
   EXPECT_EQ(control.actions.directives_.size(), 1U);
   NodeDirective stale_replay = directive;
-  ++stale_replay.anchor_.authority_version_;
+  ++stale_replay.anchor_.group_term_;
   control.actions.completed_population_ = stale_replay;
   EXPECT_EQ(RunTaskSync(control.installer.ApplyDirective(stale_replay)).code(),
             absl::StatusCode::kFailedPrecondition);
@@ -3447,9 +3413,7 @@ TEST(NodeControlInstallerTest,
       .projection_ = Basis(11, 3),
       .anchor_ = {.group_id_ = "group-a",
                   .assignment_id_ = target_assignment,
-                  .group_term_ = 1,
-                  .authority_version_ = 1,
-                  .grant_revision_ = 1},
+                  .group_term_ = 1},
       .operation_id_ = ShortId<OperationId>(1),
       .directive_id_ = ShortId<DirectiveId>(2),
       .attempt_id_ = ShortId<AttemptId>(3),
@@ -3554,9 +3518,7 @@ TEST(NodeControlInstallerTest,
       .projection_ = Basis(10, 2),
       .anchor_ = {.group_id_ = "group-a",
                   .assignment_id_ = replica_assignment,
-                  .group_term_ = 1,
-                  .authority_version_ = 1,
-                  .grant_revision_ = 1},
+                  .group_term_ = 1},
       .operation_id_ = ShortId<OperationId>(1),
       .directive_id_ = ShortId<DirectiveId>(2),
       .attempt_id_ = ShortId<AttemptId>(3),

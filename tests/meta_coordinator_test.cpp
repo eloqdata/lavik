@@ -734,7 +734,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
         MakeFixedId<16>(0xa4);
     keylane::meta::MetaFailoverCandidateAction action_;
     std::uint64_t deadline_unix_ms_ = 2'000'000'000'000ULL;
-    std::uint64_t grant_revision_ = 0;
     std::uint64_t transition_revision_ = 0;
   };
 
@@ -973,10 +972,9 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     activate.group_id_ = "g1";
     activate.expected_term_ = 1;
     activate.new_owner_ = state.owner_;
-    activate.new_authority_version_ = 1;
     activate.new_topology_epoch_ = 4;
     activate.new_config_epoch_ = 1;
-    ProposeAccepted(activate, &state.grant_revision_);
+    ProposeAccepted(activate);
 
     keylane::meta::FailoverOperationIntent intent;
     intent.group_id_ = "g1";
@@ -1019,8 +1017,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     begin.expected_owner_assignment_id_ = state.owner_assignment_;
     begin.expected_membership_revision_ = 3;
     begin.expected_group_term_ = 1;
-    begin.expected_authority_version_ = 1;
-    begin.expected_grant_revision_ = state.grant_revision_;
     begin.expected_population_manifest_revision_ = 0;
     begin.expected_population_manifest_digest_.fill(0);
     begin.expected_partition_replication_epoch_ = 0;
@@ -1332,13 +1328,10 @@ TEST_F(MetaCoordinatorServerTest,
   commit.expected_owner_assignment_id_ = failover.owner_assignment_;
   commit.expected_membership_revision_ = 3;
   commit.expected_group_term_ = 1;
-  commit.expected_authority_version_ = 1;
-  commit.expected_grant_revision_ = failover.grant_revision_;
   commit.expected_population_manifest_revision_ = 0;
   commit.expected_population_manifest_digest_.fill(0);
   commit.expected_partition_replication_epoch_ = 0;
   commit.expected_config_epoch_ = 1;
-  commit.new_authority_version_ = 2;
   commit.new_topology_epoch_ = 5;
   commit.new_config_epoch_ = 2;
   const std::uint64_t before_commit = machine_->last_commit_index();

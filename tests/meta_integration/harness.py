@@ -424,10 +424,10 @@ class Node:
             timeout=timeout)
 
     def activateauthority(self, group_id, expected_term, owner_node_id,
-                          authority_version, config_epoch, timeout=5.0):
+                          config_epoch, timeout=5.0):
         return self.ctl(
             f"activateauthority {group_id} {expected_term} {owner_node_id} "
-            f"{authority_version} {config_epoch}", timeout=timeout)
+            f"{config_epoch}", timeout=timeout)
 
     def fencegroup(self, group_id, expected_term, timeout=5.0):
         return self.ctl(f"fencegroup {group_id} {expected_term}",

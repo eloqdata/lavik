@@ -505,16 +505,6 @@ absl::Status MetaTopologyStore::SetGroupTerm(const std::string& group_id,
   return absl::OkStatus();
 }
 
-absl::Status MetaTopologyStore::SetAuthorityVersion(
-    const std::string& group_id, std::uint64_t authority_version) {
-  const auto it = groups_.find(group_id);
-  if (it == groups_.end()) {
-    return MetaDomainRejectError(absl::StrCat("unknown group ", group_id));
-  }
-  it->second.record_.authority_version_ = authority_version;
-  return absl::OkStatus();
-}
-
 absl::Status MetaTopologyStore::SetPopulationManifest(
     const std::string& group_id, std::uint64_t manifest_revision,
     const MetaHash256& manifest_digest) {
@@ -741,7 +731,6 @@ std::string MetaTopologyStore::Serialize() const {
     w.WriteString(group_id);
     w.WriteString(group.record_.owner_);
     w.WriteU64(group.record_.group_term_);
-    w.WriteU64(group.record_.authority_version_);
     w.WriteU64(group.record_.population_manifest_revision_);
     WriteFixedArray(w, group.record_.population_manifest_digest_);
     w.WriteU64(group.record_.partition_replication_epoch_);
@@ -844,8 +833,6 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     if (!owner.ok()) return owner.status();
     auto group_term = r.ReadU64();
     if (!group_term.ok()) return group_term.status();
-    auto authority_version = r.ReadU64();
-    if (!authority_version.ok()) return authority_version.status();
     auto manifest_revision = r.ReadU64();
     if (!manifest_revision.ok()) return manifest_revision.status();
     auto manifest_digest = ReadFixedArray<32>(r);
@@ -890,7 +877,6 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     GroupState group;
     group.record_.owner_ = std::string(*owner);
     group.record_.group_term_ = *group_term;
-    group.record_.authority_version_ = *authority_version;
     group.record_.population_manifest_revision_ = *manifest_revision;
     group.record_.population_manifest_digest_ = *manifest_digest;
     group.record_.partition_replication_epoch_ = *partition_epoch;

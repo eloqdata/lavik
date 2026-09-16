@@ -1523,10 +1523,12 @@ class DirectiveBarrier(H.Proxy):
                 if kind == (14 if self.result else 12):
                     blocked, release = self.blocked, self.release
                     if self.recipients:
-                        # Directive's fixed session/basis precede the variable
-                        # Group id, then authority and directive identities.
+                        # Skip session/basis, the length-prefixed Group id,
+                        # assignment id/term, and operation/directive/attempt
+                        # ids plus directive revision. Keep these field sizes
+                        # aligned with Encode(Directive)'s term-only authority.
                         group_size = struct.unpack_from(">I", payload, 56)[0]
-                        recipient_offset = 156 + group_size
+                        recipient_offset = 56 + 4 + group_size + 16 + 8 + 3 * 16 + 8
                         recipient = payload[recipient_offset:recipient_offset + 40].decode()
                         events = self.recipients.get(recipient)
                         if events is None or events[0].is_set():

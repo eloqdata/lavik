@@ -222,7 +222,7 @@ OwnerProjectionForHeartbeat(const cluster::control::FullDesiredState& installed,
 // Convert that receipt into trusted lease evidence only when the granted Ack
 // names the same authenticated boot and exact Owner projection that still
 // underlies the new heartbeat.
-std::optional<MetaCausallyConfirmedLease> ConfirmedLeaseForHeartbeat(
+std::optional<std::uint64_t> ConfirmedLeaseForHeartbeat(
     const std::optional<cluster::control::HeartbeatAck>& previous_ack,
     std::uint64_t heartbeat_sequence, std::string_view authenticated_boot_id,
     const std::optional<MetaObservedOwnerProjection>& owner_projection);
@@ -298,7 +298,7 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
     std::optional<MetaObservedFailoverProjection> failover_projection,
     std::optional<MetaObservedOwnerProjection> owner_projection,
     std::uint64_t heartbeat_sequence,
-    std::optional<MetaCausallyConfirmedLease> confirmed_lease,
+    std::optional<std::uint64_t> confirmed_grant_sequence,
     std::int64_t now_unix_ms, std::uint64_t now_steady_ms);
 
 // Validates a typed operation-evidence envelope against the authenticated

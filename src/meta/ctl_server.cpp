@@ -199,11 +199,7 @@ void detail::ApplyClusterRuntimeObservation(
               runtime_node.leadership_generation_ &&
           granted->data_boot_id == runtime_node.boot_id_ &&
           granted->projection_hash == runtime_node.projection_hash_ &&
-          granted->group_term == committed_group->grant_.group_term_ &&
-          granted->authority_version ==
-              committed_group->topology_.record_.authority_version_ &&
-          granted->grant_revision ==
-              committed_group->grant_.grant_->grant_revision_;
+          granted->group_term == committed_group->grant_.group_term_;
       // Health arrives before the corresponding Ack finishes writing. An old
       // successful grant is not current readiness evidence after health drops,
       // even while that Ack is queued or when heartbeat freshness expires.
@@ -637,8 +633,6 @@ std::string BuildClusterStatusReply(
                 committed_member->assignment_id_ &&
             projected_group->group_term_ ==
                 committed_group->grant_.group_term_ &&
-            projected_group->authority_version_ ==
-                committed_group->topology_.record_.authority_version_ &&
             projected_group->manifest_revision_ ==
                 committed_group->topology_.record_
                     .population_manifest_revision_ &&
@@ -669,9 +663,6 @@ std::string BuildClusterStatusReply(
     }
     group.config_epoch_ = source.topology_.config_epoch_;
     group.effective_threshold_ms_ = view.automatic_failover_threshold_ms_;
-    if (source.grant_.grant_.has_value()) {
-      group.grant_revision_ = source.grant_.grant_->grant_revision_;
-    }
 
     const auto detector_status =
         std::find_if(detector.statuses_.begin(), detector.statuses_.end(),
@@ -1597,14 +1588,13 @@ celer::Task<std::string> HandleActivateAuthority(
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     std::uint64_t expected_term, const std::string& owner_node_id,
-    std::uint64_t authority_version, std::uint64_t config_epoch) {
+    std::uint64_t config_epoch) {
   const MetaStores before = state_machine->StoresSnapshot();
   ActivateAuthority command;
   command.request_id_ = MakeRequestId();
   command.group_id_ = group_id;
   command.expected_term_ = expected_term;
   command.new_owner_ = owner_node_id;
-  command.new_authority_version_ = authority_version;
   command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
   command.new_config_epoch_ = config_epoch;
   std::string reply =
@@ -1614,13 +1604,11 @@ celer::Task<std::string> HandleActivateAuthority(
   const MetaStores after = state_machine->StoresSnapshot();
   const auto topology = after.topology_.FindGroup(group_id);
   const auto grant = after.grant_.GroupState(group_id);
-  if (!topology.has_value() || !grant.has_value() || grant->fenced_ ||
+  if (!topology.has_value() || !grant.has_value() ||
       !grant->grant_.has_value() || grant->grant_->owner_ != owner_node_id ||
-      grant->grant_->term_ != expected_term ||
-      grant->grant_->authority_version_ != authority_version ||
+      grant->group_term_ != expected_term ||
       topology->record_.owner_ != owner_node_id ||
       topology->record_.group_term_ != expected_term ||
-      topology->record_.authority_version_ != authority_version ||
       topology->config_epoch_ != config_epoch ||
       after.topology_.TopologyEpoch() != command.new_topology_epoch_) {
     co_return "ERR rejected";
@@ -1637,14 +1625,17 @@ celer::Task<std::string> HandleFenceGroup(
   command.request_id_ = MakeRequestId();
   command.group_id_ = group_id;
   command.expected_term_ = expected_term;
+  command.new_term_ = expected_term + 1;
   std::string reply =
       co_await ProposeCommand(coordinator, std::move(principal), command);
   if (reply.rfind("OK ", 0) != 0) co_return reply;
 
-  const auto state =
-      state_machine->StoresSnapshot().grant_.GroupState(group_id);
-  if (!state.has_value() || state->group_term_ != expected_term ||
-      !state->fenced_ || state->grant_.has_value()) {
+  const MetaStores after = state_machine->StoresSnapshot();
+  const auto state = after.grant_.GroupState(group_id);
+  const auto topology = after.topology_.FindGroup(group_id);
+  if (!state.has_value() || !topology.has_value() ||
+      state->group_term_ != command.new_term_ || state->grant_.has_value() ||
+      topology->record_.group_term_ != command.new_term_) {
     co_return "ERR rejected";
   }
   co_return reply;
@@ -2283,24 +2274,23 @@ celer::Task<std::string> DispatchMutationVerb(
   }
   if (command == "activateauthority") {
     std::uint64_t expected_term = 0;
-    std::uint64_t authority_version = 0;
     std::uint64_t config_epoch = 0;
-    if (tokens.size() != 6 || tokens[1].empty() ||
+    if (tokens.size() != 5 || tokens[1].empty() ||
         tokens[1].size() > kMaxMetaGroupIdBytes ||
         !ParseU64(tokens[2], expected_term) || !IsNodeId(tokens[3]) ||
-        !ParseU64(tokens[4], authority_version) || authority_version == 0 ||
-        !ParseU64(tokens[5], config_epoch) || config_epoch == 0) {
+        !ParseU64(tokens[4], config_epoch) || config_epoch == 0) {
       co_return "ERR bad-request";
     }
     co_return co_await HandleActivateAuthority(
         coordinator, std::move(state_machine), std::move(principal), tokens[1],
-        expected_term, tokens[3], authority_version, config_epoch);
+        expected_term, tokens[3], config_epoch);
   }
   if (command == "fencegroup") {
     std::uint64_t expected_term = 0;
     if (tokens.size() != 3 || tokens[1].empty() ||
         tokens[1].size() > kMaxMetaGroupIdBytes ||
-        !ParseU64(tokens[2], expected_term)) {
+        !ParseU64(tokens[2], expected_term) ||
+        expected_term == std::numeric_limits<std::uint64_t>::max()) {
       co_return "ERR bad-request";
     }
     co_return co_await HandleFenceGroup(coordinator, std::move(state_machine),

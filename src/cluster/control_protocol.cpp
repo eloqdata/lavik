@@ -524,8 +524,6 @@ absl::Status WriteAuthorityAnchor(Writer& writer,
   }
   writer.Fixed(anchor.assignment_id);
   writer.U64(anchor.group_term);
-  writer.U64(anchor.authority_version);
-  writer.U64(anchor.grant_revision);
   return absl::OkStatus();
 }
 
@@ -540,12 +538,6 @@ absl::StatusOr<WireAuthorityAnchor> ReadAuthorityAnchor(Reader& reader) {
   auto term = reader.U64();
   if (!term.ok()) return term.status();
   anchor.group_term = *term;
-  auto version = reader.U64();
-  if (!version.ok()) return version.status();
-  anchor.authority_version = *version;
-  auto revision = reader.U64();
-  if (!revision.ok()) return revision.status();
-  anchor.grant_revision = *revision;
   return anchor;
 }
 
@@ -952,9 +944,7 @@ absl::StatusOr<std::int64_t> LeaseChallengeTracker::AcceptGrant(
       grant.projection_hash != challenge.projection_hash ||
       grant.group_id != challenge.group_id ||
       grant.assignment_id != challenge.assignment_id ||
-      grant.group_term != challenge.group_term ||
-      grant.authority_version != challenge.authority_version ||
-      grant.grant_revision != challenge.grant_revision) {
+      grant.group_term != challenge.group_term) {
     return absl::FailedPreconditionError(
         "lease grant does not exactly match the pending challenge");
   }
@@ -1032,8 +1022,6 @@ absl::Status WriteLeaseChallenge(Writer& writer,
   }
   writer.Fixed(challenge.assignment_id);
   writer.U64(challenge.group_term);
-  writer.U64(challenge.authority_version);
-  writer.U64(challenge.grant_revision);
   return absl::OkStatus();
 }
 
@@ -1054,12 +1042,6 @@ absl::StatusOr<LeaseChallenge> ReadLeaseChallenge(Reader& reader) {
   auto term = reader.U64();
   if (!term.ok()) return term.status();
   challenge.group_term = *term;
-  auto version = reader.U64();
-  if (!version.ok()) return version.status();
-  challenge.authority_version = *version;
-  auto revision = reader.U64();
-  if (!revision.ok()) return revision.status();
-  challenge.grant_revision = *revision;
   return challenge;
 }
 
@@ -1330,8 +1312,6 @@ absl::Status WriteLeaseGranted(Writer& writer, const LeaseGranted& grant) {
   }
   writer.Fixed(grant.assignment_id);
   writer.U64(grant.group_term);
-  writer.U64(grant.authority_version);
-  writer.U64(grant.grant_revision);
   writer.U32(grant.granted_duration_ms);
   return absl::OkStatus();
 }
@@ -1365,12 +1345,6 @@ absl::StatusOr<LeaseGranted> ReadLeaseGranted(Reader& reader) {
   auto term = reader.U64();
   if (!term.ok()) return term.status();
   grant.group_term = *term;
-  auto version = reader.U64();
-  if (!version.ok()) return version.status();
-  grant.authority_version = *version;
-  auto revision = reader.U64();
-  if (!revision.ok()) return revision.status();
-  grant.grant_revision = *revision;
   auto duration = reader.U32();
   if (!duration.ok()) return duration.status();
   grant.granted_duration_ms = *duration;
@@ -2840,8 +2814,6 @@ absl::Status WriteDesiredGroup(Writer& writer, const WireDesiredGroup& group) {
     writer.Fixed(*group.owner_assignment_id);
   }
   writer.U64(group.group_term);
-  writer.U64(group.authority_version);
-  writer.U64(group.grant_revision);
   writer.Bool(group.grant_active);
   if (group.activation_action_id.has_value() &&
       (!group.grant_active || IsZeroId(*group.activation_action_id))) {
@@ -2903,12 +2875,6 @@ absl::StatusOr<WireDesiredGroup> ReadDesiredGroup(Reader& reader) {
   auto group_term = reader.U64();
   if (!group_term.ok()) return group_term.status();
   group.group_term = *group_term;
-  auto authority_version = reader.U64();
-  if (!authority_version.ok()) return authority_version.status();
-  group.authority_version = *authority_version;
-  auto grant_revision = reader.U64();
-  if (!grant_revision.ok()) return grant_revision.status();
-  group.grant_revision = *grant_revision;
   auto grant_active = reader.Bool();
   if (!grant_active.ok()) return grant_active.status();
   group.grant_active = *grant_active;
@@ -3225,10 +3191,6 @@ bool CanonicalProjectedDirectiveLess(
                                          right.authority.assignment_id));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareScalar(left.authority.group_term, right.authority.group_term));
-  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.authority_version,
-                                          right.authority.authority_version));
-  KEYLANE_COMPARE_DIRECTIVE(CompareScalar(left.authority.grant_revision,
-                                          right.authority.grant_revision));
   KEYLANE_COMPARE_DIRECTIVE(
       CompareFixed(left.identity.operation_id, right.identity.operation_id));
   KEYLANE_COMPARE_DIRECTIVE(
@@ -3340,18 +3302,13 @@ absl::Status WriteFullDesiredStateBody(Writer& writer,
                                        const WireHash256& projection_hash,
                                        const WireHash256& directive_set_digest,
                                        bool normalize_directive_basis) {
-  const std::uint32_t expected_heartbeat_interval =
-      std::max(std::uint32_t{1}, state.authority_lease_duration_ms / 3);
-  if (state.authority_lease_duration_ms == 0 ||
-      state.data_heartbeat_interval_ms != expected_heartbeat_interval) {
-    return ProtocolError(
-        "FullDesiredState lease duration and heartbeat cadence are invalid");
+  if (state.authority_lease_duration_ms == 0) {
+    return ProtocolError("FullDesiredState lease duration is invalid");
   }
   writer.U16(kProtocolVersion);
   writer.U64(source_meta_applied_index);
   writer.U64(state.topology_epoch);
   writer.U32(state.authority_lease_duration_ms);
-  writer.U32(state.data_heartbeat_interval_ms);
   writer.Fixed(projection_hash);
 
   if (absl::Status status = WriteCount(writer, state.meta_directory.size(),
@@ -3514,11 +3471,6 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
     return authority_lease_duration_ms.status();
   }
   state.authority_lease_duration_ms = *authority_lease_duration_ms;
-  auto data_heartbeat_interval_ms = reader.U32();
-  if (!data_heartbeat_interval_ms.ok()) {
-    return data_heartbeat_interval_ms.status();
-  }
-  state.data_heartbeat_interval_ms = *data_heartbeat_interval_ms;
   auto projection_hash = reader.Fixed<32>();
   if (!projection_hash.ok()) return projection_hash.status();
   state.projection_hash = *projection_hash;

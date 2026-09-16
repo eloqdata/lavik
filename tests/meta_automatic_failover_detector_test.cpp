@@ -20,7 +20,7 @@ std::array<std::uint8_t, N> Bytes(std::uint8_t value) {
   return result;
 }
 
-MetaAutomaticFailoverInput UnserviceableInput() {
+MetaAutomaticFailoverStateMachine::Input UnserviceableInput() {
   return {
       .anchor_ =
           {
@@ -29,8 +29,6 @@ MetaAutomaticFailoverInput UnserviceableInput() {
               .owner_node_id_ = std::string(40, '1'),
               .owner_assignment_id_ = Bytes<16>(0x21),
               .group_term_ = 5,
-              .authority_version_ = 7,
-              .grant_revision_ = 11,
               .automatic_failover_policy_version_ = 13,
               .authority_lease_policy_version_ = 17,
           },
@@ -378,8 +376,6 @@ TEST(MetaAutomaticFailoverStateMachineTest,
   expect_reset(
       [](auto& anchor) { anchor.owner_assignment_id_ = Bytes<16>(0x22); });
   expect_reset([](auto& anchor) { ++anchor.group_term_; });
-  expect_reset([](auto& anchor) { ++anchor.authority_version_; });
-  expect_reset([](auto& anchor) { ++anchor.grant_revision_; });
   expect_reset([](auto& anchor) { ++anchor.leadership_generation_; });
   expect_reset(
       [](auto& anchor) { ++anchor.automatic_failover_policy_version_; });
@@ -482,10 +478,10 @@ TEST(MetaAutomaticFailoverStateMachineTest,
   EXPECT_EQ(at_capacity.status().code(), absl::StatusCode::kResourceExhausted);
 
   machine.EraseGroup("group-a");
-  EXPECT_EQ(machine.size(), 1u);
+  EXPECT_EQ(machine.Snapshot().size(), 1u);
   EXPECT_TRUE(machine.Advance(group_c, 60'000).ok());
   machine.Clear();
-  EXPECT_EQ(machine.size(), 0u);
+  EXPECT_EQ(machine.Snapshot().size(), 0u);
   EXPECT_TRUE(machine.Snapshot().empty());
 }
 
@@ -497,7 +493,7 @@ TEST(MetaAutomaticFailoverStateMachineTest,
   auto invalid = machine.Advance(input, 10'000);
   ASSERT_FALSE(invalid.ok());
   EXPECT_EQ(invalid.status().code(), absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(machine.size(), 0u);
+  EXPECT_EQ(machine.Snapshot().size(), 0u);
 }
 
 TEST(MetaAutomaticFailoverStateMachineTest, DiagnosticCodesAreStable) {

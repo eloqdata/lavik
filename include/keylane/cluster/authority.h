@@ -133,8 +133,6 @@ struct AuthorityAnchor {
   std::string group_id_;
   AssignmentId assignment_id_;
   std::uint64_t group_term_ = 0;
-  std::uint64_t authority_version_ = 0;
-  std::uint64_t grant_revision_ = 0;
 
   friend bool operator==(const AuthorityAnchor&,
                          const AuthorityAnchor&) = default;

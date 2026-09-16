@@ -845,8 +845,6 @@ absl::Status ValidateFailoverGroupAnchors(const Command& command) {
       IsZero(command.expected_owner_assignment_id_) ||
       command.expected_membership_revision_ == 0 ||
       command.expected_group_term_ == 0 ||
-      command.expected_authority_version_ == 0 ||
-      command.expected_grant_revision_ == 0 ||
       ((command.expected_population_manifest_revision_ == 0) !=
        manifest_digest_is_zero) ||
       command.expected_config_epoch_ == 0) {
@@ -862,8 +860,6 @@ void WriteFailoverGroupAnchorsUnchecked(MetaWriter& writer,
   WriteFixedArray(writer, command.expected_owner_assignment_id_);
   writer.WriteU64(command.expected_membership_revision_);
   writer.WriteU64(command.expected_group_term_);
-  writer.WriteU64(command.expected_authority_version_);
-  writer.WriteU64(command.expected_grant_revision_);
   writer.WriteU64(command.expected_population_manifest_revision_);
   WriteFixedArray(writer, command.expected_population_manifest_digest_);
   writer.WriteU64(command.expected_partition_replication_epoch_);
@@ -880,10 +876,6 @@ absl::Status ReadFailoverGroupAnchors(MetaReader& reader, Command& command) {
   if (!membership_revision.ok()) return membership_revision.status();
   auto group_term = reader.ReadU64();
   if (!group_term.ok()) return group_term.status();
-  auto authority_version = reader.ReadU64();
-  if (!authority_version.ok()) return authority_version.status();
-  auto grant_revision = reader.ReadU64();
-  if (!grant_revision.ok()) return grant_revision.status();
   auto manifest_revision = reader.ReadU64();
   if (!manifest_revision.ok()) return manifest_revision.status();
   auto manifest_digest = ReadFixedArray<32>(reader);
@@ -897,8 +889,6 @@ absl::Status ReadFailoverGroupAnchors(MetaReader& reader, Command& command) {
   command.expected_owner_assignment_id_ = *owner_assignment_id;
   command.expected_membership_revision_ = *membership_revision;
   command.expected_group_term_ = *group_term;
-  command.expected_authority_version_ = *authority_version;
-  command.expected_grant_revision_ = *grant_revision;
   command.expected_population_manifest_revision_ = *manifest_revision;
   command.expected_population_manifest_digest_ = *manifest_digest;
   command.expected_partition_replication_epoch_ = *partition_epoch;
@@ -1148,11 +1138,7 @@ absl::Status ValidateFailoverCommitBase(const Command& command) {
   if (auto status = ValidateFailoverGroupAnchors(command); !status.ok()) {
     return status;
   }
-  if (command.expected_authority_version_ ==
-          std::numeric_limits<std::uint64_t>::max() ||
-      command.new_authority_version_ !=
-          command.expected_authority_version_ + 1 ||
-      command.expected_config_epoch_ ==
+  if (command.expected_config_epoch_ ==
           std::numeric_limits<std::uint64_t>::max() ||
       command.new_config_epoch_ != command.expected_config_epoch_ + 1 ||
       command.new_topology_epoch_ == 0) {
@@ -1200,7 +1186,6 @@ void WriteFailoverCommitBaseUnchecked(MetaWriter& writer,
   writer.WriteU64(command.authorized_revision_);
   WriteFailoverCandidateUnchecked(writer, command.expected_candidate_);
   WriteFailoverGroupAnchorsUnchecked(writer, command);
-  writer.WriteU64(command.new_authority_version_);
   writer.WriteU64(command.new_topology_epoch_);
   writer.WriteU64(command.new_config_epoch_);
 }
@@ -1225,13 +1210,10 @@ absl::Status ReadFailoverCommitBase(MetaReader& reader, Command& command) {
   if (auto status = ReadFailoverGroupAnchors(reader, command); !status.ok()) {
     return status;
   }
-  auto authority_version = reader.ReadU64();
-  if (!authority_version.ok()) return authority_version.status();
   auto topology_epoch = reader.ReadU64();
   if (!topology_epoch.ok()) return topology_epoch.status();
   auto config_epoch = reader.ReadU64();
   if (!config_epoch.ok()) return config_epoch.status();
-  command.new_authority_version_ = *authority_version;
   command.new_topology_epoch_ = *topology_epoch;
   command.new_config_epoch_ = *config_epoch;
   return absl::OkStatus();
@@ -1645,19 +1627,6 @@ absl::StatusOr<CommitUncontrolledFailover> ReadCommitUncontrolledFailoverBody(
 }
 
 // Shared codec for the {group_id, expected_term} command pair.
-absl::Status WriteGroupTermGate(MetaWriter& w, MetaCommandTag tag,
-                                const MetaRequestId& request_id,
-                                const ActorContext& actor,
-                                const std::string& group_id,
-                                std::uint64_t expected_term) {
-  if (auto st = WriteCommandHeader(w, tag, request_id, actor); !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, group_id); !st.ok()) return st;
-  w.WriteU64(expected_term);
-  return absl::OkStatus();
-}
-
 template <typename Cmd>
 absl::StatusOr<Cmd> ReadGroupTermGate(MetaReader& r) {
   auto header = ReadCommandHeader(r);
@@ -1704,7 +1673,6 @@ absl::Status WriteCommandBody(MetaWriter& w, const ActivateAuthority& cmd) {
   if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
   w.WriteU64(cmd.expected_term_);
   if (auto st = WriteNodeId(w, cmd.new_owner_); !st.ok()) return st;
-  w.WriteU64(cmd.new_authority_version_);
   w.WriteU64(cmd.new_topology_epoch_);
   w.WriteU64(cmd.new_config_epoch_);
   return absl::OkStatus();
@@ -1719,8 +1687,6 @@ absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
   if (!expected_term.ok()) return expected_term.status();
   auto new_owner = ReadNodeId(r);
   if (!new_owner.ok()) return new_owner.status();
-  auto authority_version = r.ReadU64();
-  if (!authority_version.ok()) return authority_version.status();
   auto topology_epoch = r.ReadU64();
   if (!topology_epoch.ok()) return topology_epoch.status();
   auto config_epoch = r.ReadU64();
@@ -1731,28 +1697,30 @@ absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
   cmd.group_id_ = std::move(*group_id);
   cmd.expected_term_ = *expected_term;
   cmd.new_owner_ = std::move(*new_owner);
-  cmd.new_authority_version_ = *authority_version;
   cmd.new_topology_epoch_ = *topology_epoch;
   cmd.new_config_epoch_ = *config_epoch;
   return cmd;
 }
 
-absl::Status WriteCommandBody(MetaWriter& w, const RevokeGrant& cmd) {
-  return WriteGroupTermGate(w, MetaCommandTag::kRevokeGrant, cmd.request_id_,
-                            cmd.actor_, cmd.group_id_, cmd.expected_term_);
-}
-
-absl::StatusOr<RevokeGrant> ReadRevokeGrantBody(MetaReader& r) {
-  return ReadGroupTermGate<RevokeGrant>(r);
-}
-
 absl::Status WriteCommandBody(MetaWriter& w, const FenceGroup& cmd) {
-  return WriteGroupTermGate(w, MetaCommandTag::kFenceGroup, cmd.request_id_,
-                            cmd.actor_, cmd.group_id_, cmd.expected_term_);
+  if (auto st = WriteCommandHeader(w, MetaCommandTag::kFenceGroup,
+                                   cmd.request_id_, cmd.actor_);
+      !st.ok()) {
+    return st;
+  }
+  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
+  w.WriteU64(cmd.expected_term_);
+  w.WriteU64(cmd.new_term_);
+  return absl::OkStatus();
 }
 
 absl::StatusOr<FenceGroup> ReadFenceGroupBody(MetaReader& r) {
-  return ReadGroupTermGate<FenceGroup>(r);
+  auto cmd = ReadGroupTermGate<FenceGroup>(r);
+  if (!cmd.ok()) return cmd.status();
+  auto new_term = r.ReadU64();
+  if (!new_term.ok()) return new_term.status();
+  cmd->new_term_ = *new_term;
+  return cmd;
 }
 
 // ---------------------------------------------------------------------------
@@ -2469,11 +2437,12 @@ absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command) {
 }
 
 MetaCommandTag MetaCommandTagOf(const MetaCommand& command) noexcept {
-  static_assert(std::variant_size_v<MetaCommand> == 35);
+  static_assert(std::variant_size_v<MetaCommand> == 34);
   const std::size_t index = command.index();
   if (index < 8) return static_cast<MetaCommandTag>(index + 1);
-  if (index < 12) return static_cast<MetaCommandTag>(index + 2);
-  return static_cast<MetaCommandTag>(index + 3);
+  if (index == 8) return MetaCommandTag::kActivateAuthority;
+  if (index < 11) return static_cast<MetaCommandTag>(index + 3);
+  return static_cast<MetaCommandTag>(index + 4);
 }
 
 absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
@@ -2541,12 +2510,6 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
     }
     case MetaCommandTag::kActivateAuthority: {
       auto body = ReadActivateAuthorityBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
-      break;
-    }
-    case MetaCommandTag::kRevokeGrant: {
-      auto body = ReadRevokeGrantBody(r);
       if (!body.ok()) return body.status();
       command = std::move(*body);
       break;
@@ -2725,7 +2688,6 @@ absl::StatusOr<std::string> EncodeMetaGroupRecord(
   w.WriteU16(kMetaFormatVersion);
   w.WriteString(record.owner_);
   w.WriteU64(record.group_term_);
-  w.WriteU64(record.authority_version_);
   w.WriteU64(record.population_manifest_revision_);
   WriteFixedArray(w, record.population_manifest_digest_);
   w.WriteU64(record.partition_replication_epoch_);
@@ -2746,9 +2708,6 @@ absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes) {
   auto group_term = r.ReadU64();
   if (!group_term.ok()) return group_term.status();
   record.group_term_ = *group_term;
-  auto authority_version = r.ReadU64();
-  if (!authority_version.ok()) return authority_version.status();
-  record.authority_version_ = *authority_version;
   auto population_manifest_revision = r.ReadU64();
   if (!population_manifest_revision.ok()) {
     return population_manifest_revision.status();

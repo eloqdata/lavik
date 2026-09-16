@@ -190,10 +190,11 @@ enum class MetaAuditPolicy : std::uint8_t {
 
 // Version of the Raft command/WAL envelope, independent from individual
 // store codecs. Version 4 removes retired Policy commands, caller-supplied
-// Policy content hashes and references, and the durable grant specification,
-// records automatic-failover trigger provenance on uncontrolled begins, and
-// optionally carries a CAS witness for the pristine Submitted Controlled
-// requests that apply preempts atomically for the affected Group.
+// Policy content hashes and references, redundant authority/grant revisions,
+// and the durable grant specification; records automatic-failover trigger
+// provenance on uncontrolled begins; and optionally carries a CAS witness for
+// the pristine Submitted Controlled requests that apply preempts atomically
+// for the affected Group.
 // Older WALs fail stop at decode; Keylane has no compatibility path for these
 // pre-release formats. Removed command-tag values remain reserved.
 inline constexpr std::uint16_t kMetaCommandFormatVersion = 4;
@@ -210,7 +211,7 @@ enum class MetaCommandTag : std::uint16_t {
   kBeginGroupTerm = 8,
   // 9 was GrantAuthority and remains reserved.
   kActivateAuthority = 10,
-  kRevokeGrant = 11,
+  // 11 was RevokeGrant and remains reserved.
   kFenceGroup = 12,
   kPutPolicy = 13,
   // 14 was RetirePolicy and remains reserved.
@@ -375,7 +376,6 @@ struct SetGroupReplicationState {
 struct MetaGroupRecord {
   std::string owner_;  // node_id
   std::uint64_t group_term_ = 0;
-  std::uint64_t authority_version_ = 0;
   // Revision is the monotonic freshness anchor; digest identifies immutable
   // content. They are deliberately separate so A -> B -> A still advances
   // freshness even though the final content hash returns to A.
@@ -391,11 +391,12 @@ absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes);
 
 // ---------------------------------------------------------------------------
 // term/grant: BeginGroupTerm(T) raises group_term exactly once and enters the
-// no-grant/fenced state. ActivateAuthority is the direct authority-install
-// command. It validates expected_term and reuses the same atomic owner + grant
-// + authority_version + epochs kernel as typed failover Commit, while
-// deliberately carrying NO new term. Lease configuration is current global
-// Policy and is not retained in an authority command or grant.
+// no-grant/fenced state. ActivateAuthority installs the one Grant allowed in
+// the current grantless term and reuses the same atomic owner + grant + epochs
+// kernel as typed failover Commit. FenceGroup also advances exactly one term,
+// so an authority that was ever installed can never be reinstalled in that
+// term. Lease configuration is current global Policy and is not retained in
+// an authority command or Grant.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -529,8 +530,6 @@ struct BeginControlledFailover {
   MetaAssignmentId expected_owner_assignment_id_{};
   std::uint64_t expected_membership_revision_ = 0;
   std::uint64_t expected_group_term_ = 0;
-  std::uint64_t expected_authority_version_ = 0;
-  std::uint64_t expected_grant_revision_ = 0;
   std::uint64_t expected_population_manifest_revision_ = 0;
   MetaHash256 expected_population_manifest_digest_{};
   std::uint64_t expected_partition_replication_epoch_ = 0;
@@ -595,8 +594,6 @@ struct BeginUncontrolledFailover {
   MetaAssignmentId expected_owner_assignment_id_{};
   std::uint64_t expected_membership_revision_ = 0;
   std::uint64_t expected_group_term_ = 0;
-  std::uint64_t expected_authority_version_ = 0;
-  std::uint64_t expected_grant_revision_ = 0;
   std::uint64_t expected_population_manifest_revision_ = 0;
   MetaHash256 expected_population_manifest_digest_{};
   std::uint64_t expected_partition_replication_epoch_ = 0;
@@ -670,13 +667,10 @@ struct CommitControlledFailover {
   MetaAssignmentId expected_owner_assignment_id_{};
   std::uint64_t expected_membership_revision_ = 0;
   std::uint64_t expected_group_term_ = 0;
-  std::uint64_t expected_authority_version_ = 0;
-  std::uint64_t expected_grant_revision_ = 0;
   std::uint64_t expected_population_manifest_revision_ = 0;
   MetaHash256 expected_population_manifest_digest_{};
   std::uint64_t expected_partition_replication_epoch_ = 0;
   std::uint64_t expected_config_epoch_ = 0;
-  std::uint64_t new_authority_version_ = 0;
   std::uint64_t new_topology_epoch_ = 0;
   std::uint64_t new_config_epoch_ = 0;
   bool operator==(const CommitControlledFailover&) const = default;
@@ -697,13 +691,10 @@ struct CommitUncontrolledFailover {
   MetaAssignmentId expected_owner_assignment_id_{};
   std::uint64_t expected_membership_revision_ = 0;
   std::uint64_t expected_group_term_ = 0;
-  std::uint64_t expected_authority_version_ = 0;
-  std::uint64_t expected_grant_revision_ = 0;
   std::uint64_t expected_population_manifest_revision_ = 0;
   MetaHash256 expected_population_manifest_digest_{};
   std::uint64_t expected_partition_replication_epoch_ = 0;
   std::uint64_t expected_config_epoch_ = 0;
-  std::uint64_t new_authority_version_ = 0;
   std::uint64_t new_topology_epoch_ = 0;
   std::uint64_t new_config_epoch_ = 0;
   bool operator==(const CommitUncontrolledFailover&) const = default;
@@ -724,25 +715,17 @@ struct ActivateAuthority {
   std::string group_id_;
   std::uint64_t expected_term_ = 0;  // CAS on the current term; no new term
   std::string new_owner_;            // node_id
-  std::uint64_t new_authority_version_ = 0;
   std::uint64_t new_topology_epoch_ = 0;
   std::uint64_t new_config_epoch_ = 0;
   bool operator==(const ActivateAuthority&) const = default;
-};
-
-struct RevokeGrant {
-  MetaRequestId request_id_{};
-  ActorContext actor_;
-  std::string group_id_;
-  std::uint64_t expected_term_ = 0;
-  bool operator==(const RevokeGrant&) const = default;
 };
 
 struct FenceGroup {
   MetaRequestId request_id_{};
   ActorContext actor_;
   std::string group_id_;
-  std::uint64_t expected_term_ = 0;
+  std::uint64_t expected_term_ = 0;  // T-1
+  std::uint64_t new_term_ = 0;       // T
   bool operator==(const FenceGroup&) const = default;
 };
 
@@ -829,8 +812,6 @@ struct MetaDirectiveSpec {
   MetaReplicationHistoryId source_replication_history_id_{};
   std::string group_id_;
   std::uint64_t group_term_ = 0;
-  std::uint64_t authority_version_ = 0;
-  std::uint64_t grant_revision_ = 0;
   std::uint64_t population_manifest_revision_ = 0;
   MetaHash256 population_manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;
@@ -1015,12 +996,12 @@ struct PrunePopulationManifest {
 using MetaCommand = std::variant<
     RegisterNode, UpdateNode, RetireNode, CreateGroup, AssignNodeToGroup,
     RemoveNodeFromGroup, SetSlotMap, BeginGroupTerm, ActivateAuthority,
-    RevokeGrant, FenceGroup, PutPolicy, SubmitOperation,
-    TransitionOperationPhase, CompleteOperation, AbortOperation,
-    ArchiveOperations, PruneAudit, PruneOperationArchive, BindMetaMember,
-    RetireMetaMember, SetGroupReplicationState, SetAuditPolicy,
-    PutPopulationManifest, PrunePopulationManifest, CommitDirectiveResult,
-    PruneTerminalReceipts, BeginControlledFailover, BeginUncontrolledFailover,
+    FenceGroup, PutPolicy, SubmitOperation, TransitionOperationPhase,
+    CompleteOperation, AbortOperation, ArchiveOperations, PruneAudit,
+    PruneOperationArchive, BindMetaMember, RetireMetaMember,
+    SetGroupReplicationState, SetAuditPolicy, PutPopulationManifest,
+    PrunePopulationManifest, CommitDirectiveResult, PruneTerminalReceipts,
+    BeginControlledFailover, BeginUncontrolledFailover,
     SetUncontrolledCandidate, AuthorizeFailoverPrepare, AbortControlledFailover,
     DegradeControlledFailover, CommitControlledFailover,
     CommitUncontrolledFailover>;

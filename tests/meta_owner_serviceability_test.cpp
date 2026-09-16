@@ -23,18 +23,9 @@ MetaOwnerServiceabilityCut ServiceableCut() {
       .owner_node_id_ = std::string(40, '1'),
       .owner_assignment_id_ = Bytes<16>(0x21),
       .group_term_ = 7,
-      .authority_version_ = 11,
-      .grant_revision_ = 13,
       .projection_hash_ = Bytes<32>(0x31),
   };
-  MetaOwnerObservationIdentity identity{
-      .node_id_ = anchor.owner_node_id_,
-      .boot_id_ = Bytes<20>(0x41),
-      .session_generation_ = 17,
-      .leadership_generation_ = 19,
-  };
-  MetaOwnerHeartbeatCut heartbeat{
-      .identity_ = identity,
+  MetaOwnerServiceabilityCut::Session::Heartbeat heartbeat{
       .installed_anchor_ = anchor,
       .sequence_ = 23,
       .fresh_ = true,
@@ -42,26 +33,18 @@ MetaOwnerServiceabilityCut ServiceableCut() {
       .storage_ready_ = true,
       .population_ready_ = true,
   };
-  MetaCausalLeaseConfirmation lease{
-      .identity_ = identity,
-      .confirmed_anchor_ = anchor,
-      .granted_heartbeat_sequence_ = 22,
-      .confirming_heartbeat_sequence_ = 23,
-  };
   return {
-      .leadership_generation_ = identity.leadership_generation_,
       .leader_authority_eligible_ = true,
       .leadership_warmup_complete_ = true,
       .authority_handoff_complete_ = true,
       .failover_transition_active_ = false,
       .committed_anchor_ = anchor,
       .session_ =
-          MetaOwnerSessionCut{
-              .identity_ = identity,
-              .connected_ = true,
+          MetaOwnerServiceabilityCut::Session{
+              .current_ = true,
               .heartbeat_ = heartbeat,
               .causal_progress_freshness_ = MetaCausalProgressFreshness::kFresh,
-              .causal_lease_confirmation_ = lease,
+              .confirmed_grant_sequence_ = 22,
           },
   };
 }
@@ -73,7 +56,7 @@ TEST(MetaOwnerServiceabilityTest,
                 .state_ = MetaOwnerServiceabilityState::kServiceable}));
 }
 
-TEST(MetaOwnerServiceabilityTest, MissingOrDisconnectedSessionIsUnserviceable) {
+TEST(MetaOwnerServiceabilityTest, MissingSessionIsUnserviceable) {
   auto missing = ServiceableCut();
   missing.session_.reset();
   const MetaOwnerServiceabilityDecision expected{
@@ -81,10 +64,6 @@ TEST(MetaOwnerServiceabilityTest, MissingOrDisconnectedSessionIsUnserviceable) {
       .reason_ = MetaOwnerServiceabilityReason::kSessionMissing,
   };
   EXPECT_EQ(EvaluateOwnerServiceability(missing), expected);
-
-  auto disconnected = ServiceableCut();
-  disconnected.session_->connected_ = false;
-  EXPECT_EQ(EvaluateOwnerServiceability(disconnected), expected);
 }
 
 TEST(MetaOwnerServiceabilityTest,
@@ -138,21 +117,17 @@ TEST(MetaOwnerServiceabilityTest,
     EXPECT_EQ(EvaluateOwnerServiceability(cut), expected);
   };
 
-  auto wrong_owner = ServiceableCut();
-  wrong_owner.session_->identity_.node_id_ = std::string(40, '2');
-  expect_stale(std::move(wrong_owner));
-
-  auto old_leader = ServiceableCut();
-  --old_leader.session_->identity_.leadership_generation_;
-  expect_stale(std::move(old_leader));
-
-  auto wrong_boot = ServiceableCut();
-  wrong_boot.session_->heartbeat_->identity_.boot_id_ = Bytes<20>(0x42);
-  expect_stale(std::move(wrong_boot));
+  auto stale_session = ServiceableCut();
+  stale_session.session_->current_ = false;
+  expect_stale(std::move(stale_session));
 
   auto wrong_group = ServiceableCut();
   wrong_group.session_->heartbeat_->installed_anchor_.group_id_ = "group-b";
   expect_stale(std::move(wrong_group));
+
+  auto wrong_owner = ServiceableCut();
+  wrong_owner.session_->heartbeat_->installed_anchor_.owner_node_id_[0] = '2';
+  expect_stale(std::move(wrong_owner));
 
   auto wrong_assignment = ServiceableCut();
   wrong_assignment.session_->heartbeat_->installed_anchor_
@@ -163,14 +138,6 @@ TEST(MetaOwnerServiceabilityTest,
   ++wrong_term.session_->heartbeat_->installed_anchor_.group_term_;
   expect_stale(std::move(wrong_term));
 
-  auto wrong_authority = ServiceableCut();
-  ++wrong_authority.session_->heartbeat_->installed_anchor_.authority_version_;
-  expect_stale(std::move(wrong_authority));
-
-  auto wrong_grant = ServiceableCut();
-  ++wrong_grant.session_->heartbeat_->installed_anchor_.grant_revision_;
-  expect_stale(std::move(wrong_grant));
-
   auto wrong_fds = ServiceableCut();
   wrong_fds.session_->heartbeat_->installed_anchor_.projection_hash_ =
       Bytes<32>(0x32);
@@ -180,7 +147,8 @@ TEST(MetaOwnerServiceabilityTest,
 TEST(MetaOwnerServiceabilityTest,
      DefiniteCausalExpiryOverridesAStaleHeartbeatAnchor) {
   auto cut = ServiceableCut();
-  ++cut.session_->heartbeat_->installed_anchor_.grant_revision_;
+  cut.session_->heartbeat_->installed_anchor_.projection_hash_ =
+      Bytes<32>(0x32);
   cut.session_->causal_progress_freshness_ =
       MetaCausalProgressFreshness::kExpired;
 
@@ -207,9 +175,6 @@ TEST(MetaOwnerServiceabilityTest,
               }));
   };
 
-  cut.session_->connected_ = false;
-  expect_reason(MetaOwnerServiceabilityReason::kSessionMissing);
-  cut.session_->connected_ = true;
   expect_reason(MetaOwnerServiceabilityReason::kHeartbeatExpired);
   cut.session_->heartbeat_->fresh_ = true;
   expect_reason(MetaOwnerServiceabilityReason::kDraining);
@@ -234,7 +199,8 @@ TEST(MetaOwnerServiceabilityTest,
   EXPECT_EQ(EvaluateOwnerServiceability(exact), pending);
 
   auto stale = std::move(exact);
-  ++stale.session_->heartbeat_->installed_anchor_.grant_revision_;
+  stale.session_->heartbeat_->installed_anchor_.projection_hash_ =
+      Bytes<32>(0x32);
   EXPECT_EQ(EvaluateOwnerServiceability(stale),
             (MetaOwnerServiceabilityDecision{
                 .state_ = MetaOwnerServiceabilityState::kIndeterminate,
@@ -250,22 +216,15 @@ TEST(MetaOwnerServiceabilityTest,
   };
 
   auto absent = ServiceableCut();
-  absent.session_->causal_lease_confirmation_.reset();
+  absent.session_->confirmed_grant_sequence_.reset();
   EXPECT_EQ(EvaluateOwnerServiceability(absent), pending);
 
   auto same_sequence = ServiceableCut();
-  same_sequence.session_->causal_lease_confirmation_
-      ->granted_heartbeat_sequence_ = 23;
+  same_sequence.session_->confirmed_grant_sequence_ = 23;
   EXPECT_EQ(EvaluateOwnerServiceability(same_sequence), pending);
 
-  auto not_current = ServiceableCut();
-  not_current.session_->causal_lease_confirmation_
-      ->confirming_heartbeat_sequence_ = 24;
-  EXPECT_EQ(EvaluateOwnerServiceability(not_current), pending);
-
   auto zero_grant_sequence = ServiceableCut();
-  zero_grant_sequence.session_->causal_lease_confirmation_
-      ->granted_heartbeat_sequence_ = 0;
+  zero_grant_sequence.session_->confirmed_grant_sequence_ = 0;
   EXPECT_EQ(EvaluateOwnerServiceability(zero_grant_sequence), pending);
 }
 
@@ -280,35 +239,12 @@ TEST(MetaOwnerServiceabilityTest, ExpiredCausalProgressIsAHeartbeatFailure) {
             }));
 
   // The same finite bound applies before the first Ack is causally confirmed.
-  cut.session_->causal_lease_confirmation_.reset();
+  cut.session_->confirmed_grant_sequence_.reset();
   EXPECT_EQ(EvaluateOwnerServiceability(cut),
             (MetaOwnerServiceabilityDecision{
                 .state_ = MetaOwnerServiceabilityState::kUnserviceable,
                 .reason_ = MetaOwnerServiceabilityReason::kHeartbeatExpired,
             }));
-}
-
-TEST(MetaOwnerServiceabilityTest,
-     LeaseConfirmationFromAnotherIncarnationOrAnchorIsIndeterminate) {
-  const MetaOwnerServiceabilityDecision stale{
-      .state_ = MetaOwnerServiceabilityState::kIndeterminate,
-      .reason_ = MetaOwnerServiceabilityReason::kStaleOwnerAnchor,
-  };
-
-  auto wrong_session = ServiceableCut();
-  ++wrong_session.session_->causal_lease_confirmation_->identity_
-        .session_generation_;
-  EXPECT_EQ(EvaluateOwnerServiceability(wrong_session), stale);
-
-  auto wrong_boot = ServiceableCut();
-  wrong_boot.session_->causal_lease_confirmation_->identity_.boot_id_ =
-      Bytes<20>(0x42);
-  EXPECT_EQ(EvaluateOwnerServiceability(wrong_boot), stale);
-
-  auto wrong_anchor = ServiceableCut();
-  ++wrong_anchor.session_->causal_lease_confirmation_->confirmed_anchor_
-        .grant_revision_;
-  EXPECT_EQ(EvaluateOwnerServiceability(wrong_anchor), stale);
 }
 
 TEST(MetaOwnerServiceabilityTest,

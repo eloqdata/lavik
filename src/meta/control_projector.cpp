@@ -290,8 +290,6 @@ absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
   result.authority.group_id = source.group_id_;
   result.authority.assignment_id = source.assignment_id_;
   result.authority.group_term = source.group_term_;
-  result.authority.authority_version = source.authority_version_;
-  result.authority.grant_revision = source.grant_revision_;
   result.identity.operation_id = operation.operation_id_;
   result.identity.directive_id = source.directive_id_;
   result.identity.attempt_id = source.attempt_id_;
@@ -329,8 +327,6 @@ bool SameClusterCreateRebuildScope(const MetaDirectiveSpec& authorize,
              rebuild.source_replication_history_id_ &&
          authorize.group_id_ == rebuild.group_id_ &&
          authorize.group_term_ == rebuild.group_term_ &&
-         authorize.authority_version_ == rebuild.authority_version_ &&
-         authorize.grant_revision_ == rebuild.grant_revision_ &&
          authorize.population_manifest_revision_ ==
              rebuild.population_manifest_revision_ &&
          authorize.population_manifest_digest_ ==
@@ -399,8 +395,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
   }
   state.authority_lease_duration_ms =
       static_cast<std::uint32_t>(authority_lease->duration_ms_);
-  state.data_heartbeat_interval_ms =
-      std::max(std::uint32_t{1}, state.authority_lease_duration_ms / 3);
 
   for (const MetaMemberRecord& member : view.identity().MetaMembers()) {
     if (member.retired_) continue;
@@ -432,8 +426,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
       return Inconsistent(
           absl::StrCat("group ", source.group_id_, " has no grant state"));
     }
-    if (source.record_.group_term_ != grant->group_term_ ||
-        source.record_.authority_version_ != grant->last_authority_version_) {
+    if (source.record_.group_term_ != grant->group_term_) {
       return Inconsistent(absl::StrCat("group ", source.group_id_,
                                        " topology/grant anchors disagree"));
     }
@@ -441,8 +434,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     control::WireDesiredGroup projected;
     projected.group_id = source.group_id_;
     projected.group_term = source.record_.group_term_;
-    projected.authority_version = source.record_.authority_version_;
-    projected.grant_revision = grant->last_grant_revision_;
     projected.config_epoch = source.config_epoch_;
     projected.manifest_revision = source.record_.population_manifest_revision_;
     projected.manifest_digest = source.record_.population_manifest_digest_;
@@ -487,17 +478,12 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
 
     if (grant->grant_.has_value()) {
       const MetaGroupGrant& active = *grant->grant_;
-      if (grant->fenced_ || source.record_.owner_.empty() ||
-          active.owner_ != source.record_.owner_ ||
-          active.term_ != source.record_.group_term_ ||
-          active.authority_version_ != source.record_.authority_version_ ||
-          active.grant_revision_ != grant->last_grant_revision_) {
+      if (source.record_.owner_.empty() ||
+          active.owner_ != source.record_.owner_) {
         return Inconsistent(absl::StrCat("group ", source.group_id_,
                                          " active grant is inconsistent"));
       }
-      if (source.record_.group_term_ == 0 ||
-          source.record_.authority_version_ == 0 ||
-          active.grant_revision_ == 0 || source.config_epoch_ == 0) {
+      if (source.record_.group_term_ == 0 || source.config_epoch_ == 0) {
         return Inconsistent(
             absl::StrCat("group ", source.group_id_,
                          " active grant has incomplete serving authority"));
@@ -508,10 +494,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
       }
       projected.grant_active = true;
       projected.activation_action_id = active.activation_action_id_;
-      projected.grant_revision = active.grant_revision_;
-    } else if (!grant->fenced_) {
-      return Inconsistent(absl::StrCat("group ", source.group_id_,
-                                       " is grantless but not fenced"));
     }
 
     if (source.failover_transition_.has_value()) {

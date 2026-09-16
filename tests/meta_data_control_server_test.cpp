@@ -39,7 +39,6 @@ class MetaDataControlServerTestPeer {
 namespace {
 
 namespace control = keylane::cluster::control;
-using keylane::meta::AdvanceLeaderAuthorityEligibility;
 using keylane::meta::BuildCommittedMetaDirectory;
 using keylane::meta::ClassifyDirectiveDelivery;
 using keylane::meta::EvaluateLeaseChallenge;
@@ -54,7 +53,6 @@ using keylane::meta::MetaDataControlServerOptions;
 using keylane::meta::MetaDataControlServerTestPeer;
 using keylane::meta::MetaDirectiveDelivery;
 using keylane::meta::MetaDirectiveReceiptTracker;
-using keylane::meta::MetaLeaderAuthorityEligibilityState;
 using keylane::meta::MetaLeaderRuntimeDisposition;
 using keylane::meta::MetaLeaderRuntimeGuard;
 using keylane::meta::MetaLeaseEvaluation;
@@ -103,8 +101,6 @@ TEST(MetaDataControlRuntimeStatusTest,
       .owner_node_id = Identity('1'),
       .owner_assignment_id = Bytes<16>(0x11),
       .group_term = 4,
-      .authority_version = 5,
-      .grant_revision = 6,
       .manifest_revision = 8,
       .manifest_digest = Bytes<32>(0x32),
       .partition_replication_epoch = 9,
@@ -121,7 +117,6 @@ TEST(MetaDataControlRuntimeStatusTest,
             std::vector<std::string>({Identity('1')}));
   EXPECT_EQ(snapshot.nodes_[0].replication_history_id_, Bytes<20>(0x51));
   EXPECT_EQ(snapshot.nodes_[0].replication_flow_count_, 3);
-  EXPECT_EQ(snapshot.nodes_[0].authority_lease_duration_ms_, 250u);
   EXPECT_FALSE(snapshot.nodes_[0].health_.has_value());
   EXPECT_EQ(snapshot.nodes_[0].groups_.size(), 1u);
 
@@ -247,22 +242,6 @@ TEST(MetaDataControlRuntimeStatusTest,
   EXPECT_EQ(snapshot.leadership_generation_, 11u);
   EXPECT_TRUE(snapshot.leader_authority_eligible_);
   EXPECT_EQ(snapshot.nodes_[0].health_received_unix_ms_, 100);
-}
-
-TEST(MetaDataControlRuntimeStatusTest,
-     EligibilityRevisionSaturationPermanentlyFailsClosed) {
-  MetaLeaderAuthorityEligibilityState state{
-      .eligible_ = true,
-      .revision_ = std::numeric_limits<std::uint64_t>::max(),
-  };
-
-  state = AdvanceLeaderAuthorityEligibility(state, false);
-  EXPECT_FALSE(state.eligible_);
-  EXPECT_EQ(state.revision_, std::numeric_limits<std::uint64_t>::max());
-
-  state = AdvanceLeaderAuthorityEligibility(state, true);
-  EXPECT_FALSE(state.eligible_);
-  EXPECT_EQ(state.revision_, std::numeric_limits<std::uint64_t>::max());
 }
 
 TEST(MetaDataControlRuntimeStatusTest,
@@ -399,15 +378,12 @@ TEST(MetaPublisherAdoptionGateTest,
 control::FullDesiredState Desired() {
   control::FullDesiredState desired;
   desired.authority_lease_duration_ms = 5000;
-  desired.data_heartbeat_interval_ms = 1666;
   desired.projection_hash = Bytes<32>(0x42);
   control::WireDesiredGroup group;
   group.group_id = "group-a";
   group.owner_node_id = Identity('1');
   group.owner_assignment_id = Bytes<16>(0x22);
   group.group_term = 7;
-  group.authority_version = 8;
-  group.grant_revision = 9;
   group.grant_active = true;
   group.partition_replication_epoch = 4;
   desired.groups.push_back(group);
@@ -421,8 +397,6 @@ control::LeaseChallenge Challenge() {
       .group_id = "group-a",
       .assignment_id = Bytes<16>(0x22),
       .group_term = 7,
-      .authority_version = 8,
-      .grant_revision = 9,
   };
 }
 
@@ -895,7 +869,6 @@ TEST(MetaDataControlLeaseTest,
   control::FullDesiredState state;
   state.source_meta_applied_index = 7;
   state.authority_lease_duration_ms = 900;
-  state.data_heartbeat_interval_ms = 300;
   ASSERT_TRUE(
       control::ComputeDirectiveSetDigest(state.current_directives).ok());
   state.directive_set_digest =
@@ -909,11 +882,15 @@ TEST(MetaDataControlLeaseTest,
   const absl::Status limited = ApplyLeadershipValidityLimit(batch, 250);
   ASSERT_TRUE(limited.ok()) << limited;
   EXPECT_EQ(batch.full_state.authority_lease_duration_ms, 250u);
-  EXPECT_EQ(batch.full_state.data_heartbeat_interval_ms, 83u);
+  EXPECT_EQ(control::DataHeartbeatIntervalMs(
+                batch.full_state.authority_lease_duration_ms),
+            83u);
   auto decoded = control::DecodeFullDesiredState(batch.encoded_full_state);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(decoded->authority_lease_duration_ms, 250u);
-  EXPECT_EQ(decoded->data_heartbeat_interval_ms, 83u);
+  EXPECT_EQ(
+      control::DataHeartbeatIntervalMs(decoded->authority_lease_duration_ms),
+      83u);
   EXPECT_EQ(decoded->projection_hash, batch.full_state.projection_hash);
   EXPECT_EQ(decoded->object_hash, batch.full_state.object_hash);
 }
@@ -1142,7 +1119,7 @@ TEST(MetaDataControlLeaseTest, InvalidChallengeDoesNotBecomeAGrant) {
       .desired_ = &desired,
   };
   control::LeaseChallenge challenge = Challenge();
-  ++challenge.authority_version;
+  ++challenge.group_term;
   const auto mismatch = EvaluateLeaseChallenge(
       challenge,
       control::HeartbeatHealth{.storage_ready = true, .population_ready = true},
@@ -1275,8 +1252,6 @@ TEST(MetaHeartbeatObservationTest,
       .owner_node_id_ = Identity('1'),
       .owner_assignment_id_ = Bytes<16>(0x22),
       .group_term_ = 7,
-      .authority_version_ = 8,
-      .grant_revision_ = 9,
       .projection_hash_ = Bytes<32>(0x42),
       .authority_lease_duration_ms_ = 5000,
   };
@@ -1286,8 +1261,6 @@ TEST(MetaHeartbeatObservationTest,
       .group_id = owner.group_id_,
       .assignment_id = owner.owner_assignment_id_,
       .group_term = owner.group_term_,
-      .authority_version = owner.authority_version_,
-      .grant_revision = owner.grant_revision_,
       .granted_duration_ms = 5000,
   };
   control::HeartbeatAck ack{
@@ -1298,9 +1271,7 @@ TEST(MetaHeartbeatObservationTest,
   const auto exact = ConfirmedLeaseForHeartbeat(ack, /*heartbeat_sequence=*/5,
                                                 Identity('2'), owner);
   ASSERT_TRUE(exact.has_value());
-  EXPECT_EQ(exact->projection_, owner);
-  EXPECT_EQ(exact->acknowledged_heartbeat_sequence_, 4u);
-  EXPECT_EQ(exact->granted_duration_ms_, 5000u);
+  EXPECT_EQ(*exact, 4u);
 
   EXPECT_FALSE(ConfirmedLeaseForHeartbeat(ack, /*heartbeat_sequence=*/4,
                                           Identity('2'), owner)
@@ -1309,13 +1280,13 @@ TEST(MetaHeartbeatObservationTest,
                                           Identity('3'), owner)
                    .has_value());
 
-  granted.grant_revision++;
+  ++granted.assignment_id[0];
   ack.lease_decision = granted;
   EXPECT_FALSE(ConfirmedLeaseForHeartbeat(ack, /*heartbeat_sequence=*/5,
                                           Identity('2'), owner)
                    .has_value());
 
-  granted.grant_revision = owner.grant_revision_;
+  granted.assignment_id = owner.owner_assignment_id_;
   granted.granted_duration_ms = 4999;
   ack.lease_decision = granted;
   EXPECT_FALSE(ConfirmedLeaseForHeartbeat(ack, /*heartbeat_sequence=*/5,
@@ -1756,9 +1727,7 @@ TEST(MetaDataControlDirectiveTest, OversizedEnvelopeUsesObjectTransfer) {
                 .projection_hash = Bytes<32>(0x10)},
       .authority = {.group_id = "group-a",
                     .assignment_id = Bytes<16>(0x11),
-                    .group_term = 2,
-                    .authority_version = 3,
-                    .grant_revision = 4},
+                    .group_term = 2},
       .identity = {.operation_id = Bytes<16>(0x12),
                    .directive_id = Bytes<16>(0x13),
                    .attempt_id = Bytes<16>(0x14),

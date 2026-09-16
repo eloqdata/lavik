@@ -93,8 +93,6 @@ void WriteMetaDirectiveSpec(MetaWriter& writer,
   WriteFixedArray(writer, directive.source_replication_history_id_);
   writer.WriteString(directive.group_id_);
   writer.WriteU64(directive.group_term_);
-  writer.WriteU64(directive.authority_version_);
-  writer.WriteU64(directive.grant_revision_);
   writer.WriteU64(directive.population_manifest_revision_);
   WriteFixedArray(writer, directive.population_manifest_digest_);
   writer.WriteU64(directive.partition_replication_epoch_);
@@ -143,12 +141,6 @@ absl::StatusOr<MetaDirectiveSpec> ReadMetaDirectiveSpec(MetaReader& reader) {
   auto group_term = reader.ReadU64();
   if (!group_term.ok()) return group_term.status();
   directive.group_term_ = *group_term;
-  auto authority_version = reader.ReadU64();
-  if (!authority_version.ok()) return authority_version.status();
-  directive.authority_version_ = *authority_version;
-  auto grant_revision = reader.ReadU64();
-  if (!grant_revision.ok()) return grant_revision.status();
-  directive.grant_revision_ = *grant_revision;
   auto manifest_revision = reader.ReadU64();
   if (!manifest_revision.ok()) return manifest_revision.status();
   directive.population_manifest_revision_ = *manifest_revision;

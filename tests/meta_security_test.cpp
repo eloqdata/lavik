@@ -228,14 +228,10 @@ TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
   MetaCommittedStatusView view;
   MetaCommittedStatusGroup group;
   group.topology_.group_id_ = "group-a";
-  group.topology_.record_.authority_version_ = 5;
   group.topology_.members_.push_back(
       {.node_id_ = node_id, .assignment_id_ = assignment});
   group.grant_.group_term_ = 4;
-  group.grant_.grant_ = MetaGroupGrant{.owner_ = node_id,
-                                       .term_ = 4,
-                                       .authority_version_ = 5,
-                                       .grant_revision_ = 6};
+  group.grant_.grant_ = MetaGroupGrant{.owner_ = node_id};
   view.groups_.push_back(std::move(group));
   const ClusterCaptureWireV1 capture{.responder_id_ = 1,
                                      .term_ = 7,
@@ -258,8 +254,6 @@ TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
                             .group_id = "group-a",
                             .assignment_id = assignment,
                             .group_term = 4,
-                            .authority_version = 5,
-                            .grant_revision = 6,
                             .granted_duration_ms = 500};
   runtime.lease_decision_written_unix_ms_ = 1001;
   auto observe = [&](std::int64_t now_unix_ms) {
@@ -286,7 +280,6 @@ TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
                               .term_ = 4,
                               .owner_node_id_ = node_id,
                               .config_epoch_ = 8,
-                              .grant_revision_ = 6,
                               .effective_threshold_ms_ = 1'000});
     const auto encoded = EncodeClusterStatusReply(status);
     ASSERT_TRUE(encoded.ok()) << encoded.status();

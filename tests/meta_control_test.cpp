@@ -38,7 +38,6 @@ control::FullDesiredState DesiredState() {
   desired.source_meta_applied_index = 42;
   desired.topology_epoch = 17;
   desired.authority_lease_duration_ms = 1'000;
-  desired.data_heartbeat_interval_ms = 333;
   desired.nodes = {
       {.node_id = kNode1, .host = "10.0.0.1", .port = 7001, .tls_port = 17001},
       {.node_id = kNode2, .host = "10.0.0.2", .port = 7002, .tls_port = 17002},
@@ -50,8 +49,6 @@ control::FullDesiredState DesiredState() {
       .owner_node_id = kNode1,
       .owner_assignment_id = assignment,
       .group_term = 7,
-      .authority_version = 8,
-      .grant_revision = 40,
       .grant_active = true,
       .config_epoch = 12,
       .slot_ranges = {{0, 8191}},
@@ -84,8 +81,6 @@ TEST(MetaControlMapperTest, BuildsCompleteImmutableServingState) {
       prepared->serving_state_->FindGroup("group-a");
   ASSERT_NE(group, nullptr);
   EXPECT_EQ(group->group_term_, 7);
-  EXPECT_EQ(group->authority_version_, 8);
-  EXPECT_EQ(group->grant_revision_, 40);
   EXPECT_EQ(group->manifest_revision_, 5);
   EXPECT_TRUE(group->granted_);
   EXPECT_FALSE(group->population_ready_);
@@ -137,7 +132,6 @@ TEST(MetaControlMapperTest, InstallsInitialEmptyTopologyAtEpochZero) {
   desired.source_meta_applied_index = 1;
   desired.topology_epoch = 0;
   desired.authority_lease_duration_ms = 1'000;
-  desired.data_heartbeat_interval_ms = 333;
   desired.nodes = {
       {.node_id = kNode1, .host = "10.0.0.1", .port = 7001, .tls_port = 17001}};
   Rehash(&desired);
@@ -165,7 +159,6 @@ TEST(MetaControlMapperTest, AcceptsCommittedOwnerlessGroupBeforeActivation) {
   desired.source_meta_applied_index = 2;
   desired.topology_epoch = 1;
   desired.authority_lease_duration_ms = 1'000;
-  desired.data_heartbeat_interval_ms = 333;
   desired.nodes = {
       {.node_id = kNode1, .host = "10.0.0.1", .port = 7001, .tls_port = 17001}};
   desired.groups = {{.group_id = "group-pending"}};
@@ -178,12 +171,9 @@ TEST(MetaControlMapperTest, AcceptsCommittedOwnerlessGroupBeforeActivation) {
   ASSERT_EQ(prepared->control_groups_.size(), 1U);
   EXPECT_EQ(prepared->control_groups_.front().group_id_, "group-pending");
   EXPECT_EQ(prepared->control_groups_.front().group_term_, 0U);
-  EXPECT_EQ(prepared->control_groups_.front().authority_version_, 0U);
-  EXPECT_EQ(prepared->control_groups_.front().grant_revision_, 0U);
 }
 
-TEST(MetaControlMapperTest,
-     AcceptsFencedGroupWithOwnerIntentAndHistoricalAuthorityCounters) {
+TEST(MetaControlMapperTest, AcceptsGrantlessGroupWithOwnerIntent) {
   auto desired = DesiredState();
   auto& group = desired.groups.front();
   group.grant_active = false;
@@ -194,10 +184,6 @@ TEST(MetaControlMapperTest,
   EXPECT_TRUE(prepared->serving_state_->Groups().empty());
   ASSERT_EQ(prepared->control_groups_.size(), 1U);
   EXPECT_EQ(prepared->control_groups_.front().group_term_, group.group_term);
-  EXPECT_EQ(prepared->control_groups_.front().authority_version_,
-            group.authority_version);
-  EXPECT_EQ(prepared->control_groups_.front().grant_revision_,
-            group.grant_revision);
 }
 
 TEST(MetaControlMapperTest, RejectsOwnerAssignmentMismatch) {
@@ -247,16 +233,6 @@ TEST(MetaControlMapperTest, RejectsNonNumericOrNonCanonicalNodeHosts) {
   desired.nodes[0].host = "2001:db8::1";
   Rehash(&desired);
   EXPECT_TRUE(cluster::PrepareMetaFullState(desired, kNode1, 1).ok());
-}
-
-TEST(MetaControlMapperTest, RejectsInconsistentGlobalLeaseTimingScalars) {
-  auto desired = DesiredState();
-  desired.data_heartbeat_interval_ms = 334;
-
-  const auto prepared = cluster::PrepareMetaFullState(desired, kNode1, 1);
-  EXPECT_EQ(prepared.status().code(), absl::StatusCode::kInvalidArgument);
-  EXPECT_NE(prepared.status().message().find("heartbeat cadence"),
-            std::string_view::npos);
 }
 
 TEST(MetaControlMapperTest, RejectsMalformedMemberIncarnationsAndConfigEpoch) {

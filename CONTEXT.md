@@ -16,6 +16,15 @@ The Group member named by committed topology as its current primary. Being the
 Owner does not by itself grant serving authority.
 _Avoid_: Leader
 
+**Group Term**:
+The monotonically increasing committed authority epoch of a Group. Cluster
+creation reserves term one before installing the initial Grant. Each term may
+install at most one serving Grant; fencing advances to the next grantless term,
+and every later authorization—including reauthorizing the same Owner—uses that
+new term. Owner assignment plus Group Term is therefore the complete committed
+identity of an active authority.
+_Avoid_: Authority version, Grant revision
+
 **Candidate**:
 A compatible Group member selected to receive the next serving authority.
 After an Uncontrolled fence, it may be the same node still named as Owner by

@@ -87,12 +87,9 @@ std::optional<MetaAssignmentId> AssignmentFor(
 
 bool ActiveGrantMatches(const MetaTopologyGroupView& group,
                         const MetaGroupGrantState& grant) {
-  return grant.grant_.has_value() && !grant.fenced_ &&
+  return grant.grant_.has_value() &&
          grant.group_term_ == group.record_.group_term_ &&
-         grant.grant_->owner_ == group.record_.owner_ &&
-         grant.grant_->term_ == group.record_.group_term_ &&
-         grant.grant_->authority_version_ == group.record_.authority_version_ &&
-         grant.grant_->grant_revision_ == grant.last_grant_revision_;
+         grant.grant_->owner_ == group.record_.owner_;
 }
 
 const MetaDataControlRuntimeNode* RuntimeNodeFor(
@@ -119,7 +116,7 @@ const MetaDataControlRuntimeGroup* RuntimeGroupFor(
 
 bool RuntimeProjectionIsCurrent(
     const MetaCommittedView& view, const MetaTopologyGroupView& group,
-    const MetaGroupGrantState& grant, const MetaAssignmentId& assignment,
+    const MetaAssignmentId& assignment,
     const MetaDataControlRuntimeNode& runtime_node) {
   const MetaDataControlRuntimeGroup* runtime_group =
       RuntimeGroupFor(runtime_node, group.group_id_);
@@ -129,9 +126,6 @@ bool RuntimeProjectionIsCurrent(
          runtime_group != nullptr &&
          runtime_group->assignment_id_ == assignment &&
          runtime_group->group_term_ == group.record_.group_term_ &&
-         runtime_group->authority_version_ ==
-             group.record_.authority_version_ &&
-         runtime_group->grant_revision_ == grant.last_grant_revision_ &&
          runtime_group->manifest_revision_ ==
              group.record_.population_manifest_revision_ &&
          runtime_group->manifest_digest_ ==
@@ -141,16 +135,13 @@ bool RuntimeProjectionIsCurrent(
 }
 
 MetaOwnerAuthorityAnchor OwnerAnchor(
-    const MetaTopologyGroupView& group, const MetaGroupGrantState& grant,
-    const MetaAssignmentId& assignment,
+    const MetaTopologyGroupView& group, const MetaAssignmentId& assignment,
     const MetaDataControlRuntimeNode* runtime_node, bool projection_current) {
   MetaOwnerAuthorityAnchor result{
       .group_id_ = group.group_id_,
       .owner_node_id_ = group.record_.owner_,
       .owner_assignment_id_ = assignment,
       .group_term_ = group.record_.group_term_,
-      .authority_version_ = group.record_.authority_version_,
-      .grant_revision_ = grant.last_grant_revision_,
   };
   if (runtime_node != nullptr && projection_current) {
     result.projection_hash_ = runtime_node->projection_hash_;
@@ -165,8 +156,6 @@ MetaOwnerAuthorityAnchor ObservedAnchor(
       .owner_node_id_ = observed.owner_node_id_,
       .owner_assignment_id_ = observed.owner_assignment_id_,
       .group_term_ = observed.group_term_,
-      .authority_version_ = observed.authority_version_,
-      .grant_revision_ = observed.grant_revision_,
       .projection_hash_ = observed.projection_hash_,
   };
 }
@@ -176,9 +165,7 @@ bool SameOwnerAuthority(const MetaObservedOwnerProjection& possible,
   return possible.group_id_ == committed.group_id_ &&
          possible.owner_node_id_ == committed.owner_node_id_ &&
          possible.owner_assignment_id_ == committed.owner_assignment_id_ &&
-         possible.group_term_ == committed.group_term_ &&
-         possible.authority_version_ == committed.authority_version_ &&
-         possible.grant_revision_ == committed.grant_revision_;
+         possible.group_term_ == committed.group_term_;
 }
 
 bool ConservativelyFreshAt(std::optional<std::uint64_t> received_steady_ms,
@@ -222,7 +209,7 @@ MetaCausalProgressFreshness PossibleCausalProgressFreshness(
 }
 
 std::optional<MetaCausalProgressFreshness> OwnerLeaseWindowFreshness(
-    const std::optional<MetaPossibleOwnerLease>& lease,
+    const std::optional<MetaObservedOwnerState::LeaseWindow>& lease,
     const MetaOwnerAuthorityAnchor& committed, std::uint64_t now_steady_ms) {
   if (!lease.has_value() ||
       !SameOwnerAuthority(lease->projection_, committed)) {
@@ -238,29 +225,28 @@ bool HandoffComplete(const MetaDataControlRuntimeNode* runtime_node,
                      const std::optional<MetaObservedOwnerState>& observed,
                      const MetaOwnerAuthorityAnchor& committed,
                      std::uint64_t leadership_generation) {
-  const MetaAuthorityHandoffPending* pending = nullptr;
+  const std::uint64_t* pending_sequence = nullptr;
   if (observed.has_value() && observed->connected_ &&
-      observed->authority_handoff_pending_.has_value() &&
-      SameOwnerAuthority(observed->authority_handoff_pending_->projection_,
-                         committed) &&
+      observed->authority_handoff_pending_sequence_.has_value() &&
+      observed->owner_projection_.has_value() &&
+      SameOwnerAuthority(*observed->owner_projection_, committed) &&
       runtime_node != nullptr &&
       runtime_node->session_generation_ ==
           observed->identity_.session_generation_ &&
       runtime_node->leadership_generation_ == leadership_generation &&
       runtime_node->boot_id_ == Hex(observed->identity_.boot_incarnation_)) {
-    pending = &*observed->authority_handoff_pending_;
+    pending_sequence = &*observed->authority_handoff_pending_sequence_;
   }
   if (runtime_node != nullptr && projection_current &&
       runtime_node->last_lease_decision_.has_value()) {
     const auto* denied = std::get_if<cluster::control::LeaseDenied>(
         &*runtime_node->last_lease_decision_);
-    if (pending == nullptr) {
+    if (pending_sequence == nullptr) {
       return denied == nullptr ||
              denied->reason !=
                  cluster::control::LeaseDenialReason::kAuthorityHandoffPending;
     }
-    if (runtime_node->lease_decision_heartbeat_sequence_ >=
-        pending->denied_heartbeat_sequence_) {
+    if (runtime_node->lease_decision_heartbeat_sequence_ >= *pending_sequence) {
       // Grant proves that the suspend-aware handoff deadline elapsed. The
       // only non-Grant proof is NodeNotReady: the server's handoff guard runs
       // before publishing that health denial and keeps returning Pending
@@ -275,7 +261,7 @@ bool HandoffComplete(const MetaDataControlRuntimeNode* runtime_node,
       }
     }
   }
-  if (pending != nullptr) {
+  if (pending_sequence != nullptr) {
     // FDS publication clears runtime's projection-local latest decision. The
     // pre-send marker closes that replacement window until this session
     // writes a later decision or the handoff guard produces a Grant.
@@ -287,7 +273,7 @@ bool HandoffComplete(const MetaDataControlRuntimeNode* runtime_node,
   return true;
 }
 
-absl::StatusOr<MetaAutomaticFailoverInput> BuildInput(
+absl::StatusOr<MetaAutomaticFailoverStateMachine::Input> BuildInput(
     const MetaCommittedView& view, const MetaTopologyGroupView& group,
     const MetaAutomaticUncontrolledFailoverPolicy& automatic,
     const MetaAuthorityLeasePolicy& lease,
@@ -309,14 +295,12 @@ absl::StatusOr<MetaAutomaticFailoverInput> BuildInput(
       RuntimeNodeFor(runtime, group.record_.owner_);
   const bool projection_current =
       runtime_node != nullptr &&
-      RuntimeProjectionIsCurrent(view, group, *grant, *assignment,
-                                 *runtime_node);
+      RuntimeProjectionIsCurrent(view, group, *assignment, *runtime_node);
   const MetaOwnerAuthorityAnchor committed =
-      OwnerAnchor(group, *grant, *assignment, runtime_node, projection_current);
+      OwnerAnchor(group, *assignment, runtime_node, projection_current);
   const auto observed = observations.OwnerObservationFor(group.record_.owner_);
 
   MetaOwnerServiceabilityCut cut{
-      .leadership_generation_ = runtime.leadership_generation_,
       .leader_authority_eligible_ = runtime.leader_authority_eligible_,
       .leadership_warmup_complete_ = warmup_complete,
       .authority_handoff_complete_ =
@@ -328,15 +312,8 @@ absl::StatusOr<MetaAutomaticFailoverInput> BuildInput(
       .session_ = std::nullopt,
   };
 
-  if (observed.has_value()) {
-    MetaOwnerSessionCut session;
-    session.identity_ = {
-        .node_id_ = observed->identity_.node_id_,
-        .boot_id_ = observed->identity_.boot_incarnation_,
-        .session_generation_ = observed->identity_.session_generation_,
-        .leadership_generation_ = runtime.leadership_generation_,
-    };
-    session.connected_ = observed->connected_;
+  if (observed.has_value() && observed->connected_) {
+    MetaOwnerServiceabilityCut::Session session;
     const bool runtime_identity_current =
         runtime_node != nullptr &&
         runtime_node->session_generation_ ==
@@ -344,15 +321,13 @@ absl::StatusOr<MetaAutomaticFailoverInput> BuildInput(
         runtime_node->leadership_generation_ ==
             runtime.leadership_generation_ &&
         runtime_node->boot_id_ == Hex(observed->identity_.boot_incarnation_);
-    if (session.connected_ && !runtime_identity_current) {
-      // Make a torn or superseded runtime/session join explicitly stale rather
-      // than interpreting it as an Owner failure.
-      session.identity_.leadership_generation_ = 0;
-    }
+    // Keep the cross-source join result, not a second copy of each identity
+    // field. A torn or superseded runtime/session join remains explicit and
+    // cannot be interpreted as Owner failure.
+    session.current_ = runtime_identity_current;
     if (observed->health_.has_value() &&
         observed->heartbeat_received_steady_ms_.has_value()) {
-      MetaOwnerHeartbeatCut heartbeat{
-          .identity_ = session.identity_,
+      MetaOwnerServiceabilityCut::Session::Heartbeat heartbeat{
           .installed_anchor_ = {},
           .sequence_ = observed->heartbeat_sequence_,
           .fresh_ =
@@ -369,14 +344,8 @@ absl::StatusOr<MetaAutomaticFailoverInput> BuildInput(
       session.heartbeat_ = std::move(heartbeat);
     }
     std::optional<std::uint32_t> observed_effective_lease_duration_ms;
-    if (observed->confirmed_lease_.has_value() &&
-        observed->confirmed_lease_->granted_duration_ms_ != 0) {
-      // The granted duration is the exact possible authority window Data may
-      // still hold, including after runtime has advanced to a newer FDS.
-      observed_effective_lease_duration_ms =
-          observed->confirmed_lease_->granted_duration_ms_;
-    } else if (observed->owner_projection_.has_value() &&
-               observed->owner_projection_->authority_lease_duration_ms_ != 0) {
+    if (observed->owner_projection_.has_value() &&
+        observed->owner_projection_->authority_lease_duration_ms_ != 0) {
       // Before the first causal confirmation, the trusted projection marker
       // still carries the effective duration used for its pending interval.
       observed_effective_lease_duration_ms =
@@ -400,21 +369,11 @@ absl::StatusOr<MetaAutomaticFailoverInput> BuildInput(
         causal_progress_freshness,
         OwnerLeaseWindowFreshness(observed->installed_owner_lease_, committed,
                                   now_steady_ms));
-    if (observed->confirmed_lease_.has_value()) {
-      session.causal_lease_confirmation_ = MetaCausalLeaseConfirmation{
-          .identity_ = session.identity_,
-          .confirmed_anchor_ =
-              ObservedAnchor(observed->confirmed_lease_->projection_),
-          .granted_heartbeat_sequence_ =
-              observed->confirmed_lease_->acknowledged_heartbeat_sequence_,
-          .confirming_heartbeat_sequence_ =
-              observed->causal_confirmation_heartbeat_sequence_,
-      };
-    }
+    session.confirmed_grant_sequence_ = observed->confirmed_grant_sequence_;
     cut.session_ = std::move(session);
   }
 
-  return MetaAutomaticFailoverInput{
+  return MetaAutomaticFailoverStateMachine::Input{
       .anchor_ =
           MetaAutomaticFailoverAnchor{
               .group_id_ = group.group_id_,
@@ -424,8 +383,6 @@ absl::StatusOr<MetaAutomaticFailoverInput> BuildInput(
               .owner_node_id_ = group.record_.owner_,
               .owner_assignment_id_ = *assignment,
               .group_term_ = group.record_.group_term_,
-              .authority_version_ = group.record_.authority_version_,
-              .grant_revision_ = grant->last_grant_revision_,
               .automatic_failover_policy_version_ = automatic.version_,
               .authority_lease_policy_version_ = lease.version_,
           },
@@ -470,14 +427,11 @@ absl::StatusOr<MetaRequestId> NextId(
 
 void SetGroupAnchors(BeginUncontrolledFailover& command,
                      const MetaTopologyGroupView& group,
-                     const MetaGroupGrantState& grant,
                      const MetaAssignmentId& owner_assignment) {
   command.expected_owner_node_id_ = group.record_.owner_;
   command.expected_owner_assignment_id_ = owner_assignment;
   command.expected_membership_revision_ = group.revision_;
   command.expected_group_term_ = group.record_.group_term_;
-  command.expected_authority_version_ = group.record_.authority_version_;
-  command.expected_grant_revision_ = grant.last_grant_revision_;
   command.expected_population_manifest_revision_ =
       group.record_.population_manifest_revision_;
   command.expected_population_manifest_digest_ =
@@ -528,8 +482,8 @@ bool WarmupComplete(std::optional<std::uint64_t> started_ms,
 struct MetaAutomaticFailoverReconciler::Core {
   struct Admission {
     MetaAutomaticFailoverAnchor anchor_;
-    MetaOwnerServiceabilityReason reason_ =
-        MetaOwnerServiceabilityReason::kNone;
+    MetaAutomaticFailoverReason trigger_reason_ =
+        MetaAutomaticFailoverReason::kManual;
     std::uint64_t suspect_duration_ms_ = 0;
     bool uncertain_append_ = false;
   };
@@ -537,8 +491,6 @@ struct MetaAutomaticFailoverReconciler::Core {
   struct Pending {
     BeginUncontrolledFailover command_;
     MetaAutomaticFailoverAnchor anchor_;
-    MetaOwnerServiceabilityReason reason_ =
-        MetaOwnerServiceabilityReason::kNone;
     std::uint64_t next_attempt_steady_ms_ = 0;
     std::size_t backoff_index_ = 0;
     bool uncertain_append_ = false;
@@ -603,7 +555,7 @@ void ArmAdmission(
   std::lock_guard<std::mutex> lock(core->admission_mu_);
   core->admissions_[pending.command_.transition_id_] = {
       .anchor_ = pending.anchor_,
-      .reason_ = pending.reason_,
+      .trigger_reason_ = pending.command_.trigger_reason_,
       .suspect_duration_ms_ = pending.command_.suspect_duration_ms_,
       .uncertain_append_ = pending.uncertain_append_,
   };
@@ -637,7 +589,7 @@ absl::Status ValidateAutomaticProposal(
     admission = found->second;
   }
   if (admission.suspect_duration_ms_ != command->suspect_duration_ms_ ||
-      CommandReason(admission.reason_) != command->trigger_reason_) {
+      admission.trigger_reason_ != command->trigger_reason_) {
     return absl::FailedPreconditionError(
         "automatic failover Begin disagrees with detector admission");
   }
@@ -727,11 +679,10 @@ void LogStatusEdge(const std::optional<MetaAutomaticFailoverStatus>& before,
     return;
   }
   spdlog::info(
-      "automatic failover detector group={} owner={} term={} authority={} "
+      "automatic failover detector group={} owner={} term={} "
       "state={} reason={} blocker={} suspect_ms={} threshold_ms={}",
       after.anchor_.group_id_, after.anchor_.owner_node_id_,
-      after.anchor_.group_term_, after.anchor_.authority_version_,
-      MetaAutomaticFailoverStateName(after.state_),
+      after.anchor_.group_term_, MetaAutomaticFailoverStateName(after.state_),
       MetaOwnerServiceabilityReasonName(after.current_reason_),
       MetaAutomaticFailoverBlockerName(after.blocker_),
       after.accumulated_suspect_ms_, after.effective_threshold_ms_);
@@ -1032,12 +983,11 @@ celer::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
           command.preempted_operation_id_ = preempted->operation_id_;
           command.expected_preempted_operation_revision_ = preempted->revision_;
         }
-        SetGroupAnchors(command, group, *grant, *assignment);
+        SetGroupAnchors(command, group, *assignment);
 
         Core::Pending pending{
             .command_ = std::move(command),
             .anchor_ = update->status_.anchor_,
-            .reason_ = update->status_.current_reason_,
             .next_attempt_steady_ms_ = now_steady,
         };
         auto [inserted, fresh] =
@@ -1048,7 +998,8 @@ celer::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
             "automatic failover threshold reached group={} owner={} reason={} "
             "suspect_ms={} transition={}",
             group.group_id_, group.record_.owner_,
-            MetaOwnerServiceabilityReasonName(inserted->second.reason_),
+            MetaAutomaticFailoverReasonName(
+                inserted->second.command_.trigger_reason_),
             inserted->second.command_.suspect_duration_ms_,
             Hex(inserted->second.command_.transition_id_));
       }

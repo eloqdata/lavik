@@ -229,8 +229,8 @@ class [[nodiscard]] InFlightGuard {
 struct GroupView {
   std::string group_id_;
   NodeIndex primary_node_index_ = kNoNodeIndex;
-  // Meta creates a fresh assignment incarnation on remove/re-add. Monotonic
-  // authority counters are compared only while this identity is unchanged.
+  // Meta creates a fresh assignment incarnation on remove/re-add. Authority
+  // terms are compared only while this identity is unchanged.
   AssignmentId assignment_id_;
   // This is the committed desired grant, not a live lease. A Meta-managed
   // primary serves only while AuthorityGuard also holds an unexpired lease.
@@ -243,8 +243,6 @@ struct GroupView {
   // drains requests admitted before the pause publication.
   bool mutations_paused_ = false;
   std::uint64_t group_term_ = 0;
-  std::uint64_t authority_version_ = 0;
-  std::uint64_t grant_revision_ = 0;
   std::uint64_t manifest_revision_ = 0;
   std::uint64_t config_epoch_ = 0;
   std::vector<NodeIndex> replica_node_indices_;

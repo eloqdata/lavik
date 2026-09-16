@@ -161,8 +161,6 @@ AuthorityAnchor ToDomain(const control::WireAuthorityAnchor& anchor) {
       .group_id_ = anchor.group_id,
       .assignment_id_ = AssignmentId::FromBytes(anchor.assignment_id),
       .group_term_ = anchor.group_term,
-      .authority_version_ = anchor.authority_version,
-      .grant_revision_ = anchor.grant_revision,
   };
 }
 
@@ -176,8 +174,6 @@ control::LeaseChallenge ChallengeFor(
       .group_id = group.group_id,
       .assignment_id = *group.owner_assignment_id,
       .group_term = group.group_term,
-      .authority_version = group.authority_version,
-      .grant_revision = group.grant_revision,
   };
 }
 
@@ -246,7 +242,7 @@ RebuildDirective NativePopulationDirective(const NodeDirective& directive,
   // Replication's native population handshake predates the structured Meta
   // anchor. Give both source and target the same canonical string identity
   // over every committed authority field so neither side can accidentally
-  // collapse two assignments or grant revisions into one authorization.
+  // collapse two assignments or terms into one authorization.
   const std::string authority_id =
       EncodeRebuildAuthorityIdentity(directive.anchor_);
   const bool initializes_empty =
@@ -969,8 +965,6 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
                    });
   if (group == desired.groups.end() ||
       group->group_term != directive.authority.group_term ||
-      group->authority_version != directive.authority.authority_version ||
-      group->grant_revision != directive.authority.grant_revision ||
       group->partition_replication_epoch !=
           directive.partition_replication_epoch) {
     return absl::FailedPreconditionError(
@@ -1126,8 +1120,7 @@ std::string EncodeRebuildAuthorityIdentity(const AuthorityAnchor& anchor) {
   }
   return absl::StrCat("v1/", group_hex, "/",
                       anchor.assignment_id_.ToHexString(), "/",
-                      anchor.group_term_, "/", anchor.authority_version_, "/",
-                      anchor.grant_revision_);
+                      anchor.group_term_);
 }
 
 std::chrono::milliseconds MetaReconnectBackoff::Next(
@@ -2220,7 +2213,8 @@ struct MetaControlClientService::Impl {
       const std::shared_ptr<SessionState>& state,
       control::ControlSessionWriter& writer,
       control::FullDesiredState replacement) {
-    if (std::chrono::milliseconds(replacement.data_heartbeat_interval_ms) >
+    if (std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
+            replacement.authority_lease_duration_ms)) >
         state->observation_ttl_) {
       co_return absl::InvalidArgumentError(
           "replacement FDS heartbeat interval exceeds observation TTL");
@@ -2251,7 +2245,8 @@ struct MetaControlClientService::Impl {
     state->desired_ =
         std::make_shared<control::FullDesiredState>(std::move(replacement));
     state->heartbeat_interval_ =
-        std::chrono::milliseconds(state->desired_->data_heartbeat_interval_ms);
+        std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
+            state->desired_->authority_lease_duration_ms));
     state->accepted_directives_.clear();
     state->challenge_rotation_.Reset();
     if (absl::Status applied = co_await SendApplied(writer, *state->desired_);
@@ -2715,8 +2710,6 @@ struct MetaControlClientService::Impl {
                       .assignment_id_ =
                           AssignmentId::FromBytes(grant->assignment_id),
                       .group_term_ = grant->group_term,
-                      .authority_version_ = grant->authority_version,
-                      .grant_revision_ = grant->grant_revision,
                   },
               .sent_at_ = grant_sent_at,
               .granted_duration_ =
@@ -2920,7 +2913,9 @@ struct MetaControlClientService::Impl {
       auto initial =
           co_await ReceiveFullState(frames, socket_deadline, progress_timeout);
       if (!initial.ok()) co_return initial.status();
-      if (initial->data_heartbeat_interval_ms > hello->observation_ttl_ms) {
+      if (control::DataHeartbeatIntervalMs(
+              initial->authority_lease_duration_ms) >
+          hello->observation_ttl_ms) {
         co_return absl::InvalidArgumentError(
             "initial FDS heartbeat interval exceeds observation TTL");
       }
@@ -2945,8 +2940,9 @@ struct MetaControlClientService::Impl {
       state->replication_identity_ = replication_identity;
       state->desired_ =
           std::make_shared<control::FullDesiredState>(std::move(*initial));
-      state->heartbeat_interval_ = std::chrono::milliseconds(
-          state->desired_->data_heartbeat_interval_ms);
+      state->heartbeat_interval_ =
+          std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
+              state->desired_->authority_lease_duration_ms));
       state->observation_ttl_ =
           std::chrono::milliseconds(hello->observation_ttl_ms);
       state->progress_timeout_ = progress_timeout;

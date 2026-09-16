@@ -86,12 +86,11 @@ bool SameOwnerAuthority(const MetaObservedOwnerProjection& left,
   return left.group_id_ == right.group_id_ &&
          left.owner_node_id_ == right.owner_node_id_ &&
          left.owner_assignment_id_ == right.owner_assignment_id_ &&
-         left.group_term_ == right.group_term_ &&
-         left.authority_version_ == right.authority_version_ &&
-         left.grant_revision_ == right.grant_revision_;
+         left.group_term_ == right.group_term_;
 }
 
-std::uint64_t PossibleLeaseDeadline(const MetaPossibleOwnerLease& lease) {
+std::uint64_t PossibleLeaseDeadline(
+    const MetaObservedOwnerState::LeaseWindow& lease) {
   const std::uint64_t duration = lease.projection_.authority_lease_duration_ms_;
   return lease.heartbeat_received_steady_ms_ >
                  std::numeric_limits<std::uint64_t>::max() - duration
@@ -107,8 +106,6 @@ bool GrantMatchesProjection(const cluster::control::LeaseGranted& grant,
          grant.group_id == projection.group_id_ &&
          grant.assignment_id == projection.owner_assignment_id_ &&
          grant.group_term == projection.group_term_ &&
-         grant.authority_version == projection.authority_version_ &&
-         grant.grant_revision == projection.grant_revision_ &&
          grant.granted_duration_ms == projection.authority_lease_duration_ms_;
 }
 
@@ -247,13 +244,13 @@ struct MetaObservationStore::Impl {
     std::optional<MetaObservedFailoverProjection>
         heartbeat_failover_projection_;
     std::optional<MetaObservedOwnerProjection> heartbeat_owner_projection_;
-    std::optional<MetaCausallyConfirmedLease> confirmed_lease_;
-    std::optional<MetaPossibleOwnerLease> possible_owner_lease_;
-    std::optional<MetaPossibleOwnerLease> latest_owner_lease_attempt_;
-    std::optional<MetaPossibleOwnerLease> installed_owner_lease_;
-    std::optional<MetaAuthorityHandoffPending> authority_handoff_pending_;
+    std::optional<std::uint64_t> confirmed_grant_sequence_;
+    std::optional<MetaObservedOwnerState::LeaseWindow> possible_owner_lease_;
+    std::optional<MetaObservedOwnerState::LeaseWindow>
+        latest_owner_lease_attempt_;
+    std::optional<MetaObservedOwnerState::LeaseWindow> installed_owner_lease_;
+    std::optional<std::uint64_t> authority_handoff_pending_sequence_;
     std::optional<std::uint64_t> causal_progress_received_steady_ms_;
-    std::uint64_t causal_confirmation_heartbeat_sequence_ = 0;
     // Owner serviceability depends only on fixed-size typed health. Keep it
     // in the same session cut as the projection and causal acknowledgement so
     // diagnostic-text admission cannot splice two heartbeat sequences.
@@ -792,13 +789,12 @@ absl::Status MetaObservationStore::AdoptSession(
                             .disconnected_generation_ = std::nullopt,
                             .heartbeat_failover_projection_ = std::nullopt,
                             .heartbeat_owner_projection_ = std::nullopt,
-                            .confirmed_lease_ = std::nullopt,
+                            .confirmed_grant_sequence_ = std::nullopt,
                             .possible_owner_lease_ = std::nullopt,
                             .latest_owner_lease_attempt_ = std::nullopt,
                             .installed_owner_lease_ = std::nullopt,
-                            .authority_handoff_pending_ = std::nullopt,
+                            .authority_handoff_pending_sequence_ = std::nullopt,
                             .causal_progress_received_steady_ms_ = std::nullopt,
-                            .causal_confirmation_heartbeat_sequence_ = 0,
                             .heartbeat_health_ = std::nullopt,
                             .heartbeat_received_steady_ms_ = std::nullopt,
                             .heartbeat_sequence_ = 0};
@@ -1096,7 +1092,7 @@ MetaObservationStore::ReplaceHeartbeat(
     std::optional<MetaObservedFailoverProjection> failover_projection,
     std::optional<MetaObservedOwnerProjection> owner_projection,
     std::uint64_t heartbeat_sequence,
-    std::optional<MetaCausallyConfirmedLease> confirmed_lease,
+    std::optional<std::uint64_t> confirmed_grant_sequence,
     const MetaCommittedFacts& facts, int64_t now_unix_ms,
     std::uint64_t now_steady_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -1113,7 +1109,7 @@ MetaObservationStore::ReplaceHeartbeat(
             .failover_status_ = rejected};
   }
 
-  if ((owner_projection.has_value() || confirmed_lease.has_value()) &&
+  if ((owner_projection.has_value() || confirmed_grant_sequence.has_value()) &&
       heartbeat_sequence == 0) {
     const absl::Status rejected =
         MetaDomainRejectError("owner heartbeat sequence is zero");
@@ -1131,15 +1127,9 @@ MetaObservationStore::ReplaceHeartbeat(
             .candidate_status_ = rejected,
             .failover_status_ = rejected};
   }
-  if (confirmed_lease.has_value() &&
-      (!owner_projection.has_value() ||
-       confirmed_lease->projection_ != *owner_projection ||
-       confirmed_lease->acknowledged_heartbeat_sequence_ == 0 ||
-       confirmed_lease->acknowledged_heartbeat_sequence_ >=
-           heartbeat_sequence ||
-       confirmed_lease->granted_duration_ms_ == 0 ||
-       confirmed_lease->granted_duration_ms_ !=
-           owner_projection->authority_lease_duration_ms_)) {
+  if (confirmed_grant_sequence.has_value() &&
+      (!owner_projection.has_value() || *confirmed_grant_sequence == 0 ||
+       *confirmed_grant_sequence >= heartbeat_sequence)) {
     const absl::Status rejected =
         MetaDomainRejectError("causal lease does not match owner heartbeat");
     return {.boot_status_ = rejected,
@@ -1178,16 +1168,16 @@ MetaObservationStore::ReplaceHeartbeat(
     session.installed_owner_lease_.reset();
   }
   if (!owner_projection.has_value() ||
-      (session.authority_handoff_pending_.has_value() &&
-       !SameOwnerAuthority(session.authority_handoff_pending_->projection_,
-                           *owner_projection))) {
-    session.authority_handoff_pending_.reset();
+      (session.authority_handoff_pending_sequence_.has_value() &&
+       (!session.heartbeat_owner_projection_.has_value() ||
+        !SameOwnerAuthority(*session.heartbeat_owner_projection_,
+                            *owner_projection)))) {
+    session.authority_handoff_pending_sequence_.reset();
   }
-  if (confirmed_lease.has_value() &&
+  if (confirmed_grant_sequence.has_value() &&
       session.latest_owner_lease_attempt_.has_value() &&
-      confirmed_lease->projection_ ==
-          session.latest_owner_lease_attempt_->projection_ &&
-      confirmed_lease->acknowledged_heartbeat_sequence_ >=
+      *owner_projection == session.latest_owner_lease_attempt_->projection_ &&
+      *confirmed_grant_sequence >=
           session.latest_owner_lease_attempt_->granted_heartbeat_sequence_) {
     // Stop-and-wait proves Data processed every preceding Ack and installed
     // this latest Grant. It supersedes all older same-authority possibilities,
@@ -1198,27 +1188,22 @@ MetaObservationStore::ReplaceHeartbeat(
     session.possible_owner_lease_.reset();
   }
   if (!owner_projection.has_value()) {
-    session.confirmed_lease_.reset();
+    session.confirmed_grant_sequence_.reset();
     session.causal_progress_received_steady_ms_.reset();
-    session.causal_confirmation_heartbeat_sequence_ = 0;
   } else if (session.heartbeat_owner_projection_ != owner_projection) {
     // Every field of the trusted projection participates in this equality.
-    // A new Owner/assignment/term/authority/grant/projection begins a fresh,
-    // finite pending interval rather than inheriting causal progress.
-    session.confirmed_lease_ = std::move(confirmed_lease);
+    // A new Owner/assignment/term/projection begins a fresh, finite pending
+    // interval rather than inheriting causal progress.
+    session.confirmed_grant_sequence_ = confirmed_grant_sequence;
     session.causal_progress_received_steady_ms_ = now_steady_ms;
-    session.causal_confirmation_heartbeat_sequence_ =
-        session.confirmed_lease_.has_value() ? heartbeat_sequence : 0;
-  } else if (confirmed_lease.has_value() &&
-             (!session.confirmed_lease_.has_value() ||
-              confirmed_lease->acknowledged_heartbeat_sequence_ >
-                  session.confirmed_lease_->acknowledged_heartbeat_sequence_)) {
+  } else if (confirmed_grant_sequence.has_value() &&
+             (!session.confirmed_grant_sequence_.has_value() ||
+              *confirmed_grant_sequence > *session.confirmed_grant_sequence_)) {
     // Heartbeat sequence alone is liveness, not proof that a newer lease Ack
     // reached Data. Only a strictly advancing acknowledged sequence extends
     // the causal-progress deadline.
-    session.confirmed_lease_ = std::move(confirmed_lease);
+    session.confirmed_grant_sequence_ = confirmed_grant_sequence;
     session.causal_progress_received_steady_ms_ = now_steady_ms;
-    session.causal_confirmation_heartbeat_sequence_ = heartbeat_sequence;
   }
   session.heartbeat_owner_projection_ = std::move(owner_projection);
   session.heartbeat_health_ = std::move(owner_health);
@@ -1326,10 +1311,7 @@ absl::Status MetaObservationStore::RecordOwnerLeaseDecisionAttempt(
   const MetaObservedOwnerProjection& projection =
       *session.heartbeat_owner_projection_;
   if (handoff_pending) {
-    session.authority_handoff_pending_ = MetaAuthorityHandoffPending{
-        .projection_ = projection,
-        .denied_heartbeat_sequence_ = heartbeat_sequence,
-    };
+    session.authority_handoff_pending_sequence_ = heartbeat_sequence;
     return absl::OkStatus();
   }
   if (projection.authority_lease_duration_ms_ == 0 ||
@@ -1338,8 +1320,8 @@ absl::Status MetaObservationStore::RecordOwnerLeaseDecisionAttempt(
         "Owner lease Grant does not match the current projection");
   }
 
-  session.authority_handoff_pending_.reset();
-  MetaPossibleOwnerLease possible{
+  session.authority_handoff_pending_sequence_.reset();
+  MetaObservedOwnerState::LeaseWindow possible{
       .projection_ = projection,
       .granted_heartbeat_sequence_ = heartbeat_sequence,
       .heartbeat_received_steady_ms_ = *session.heartbeat_received_steady_ms_,
@@ -1376,9 +1358,8 @@ absl::Status MetaObservationStore::RecordOwnerLeaseDecisionWritten(
     return absl::FailedPreconditionError(
         "written Owner lease decision does not match the current heartbeat");
   }
-  if (!session.authority_handoff_pending_.has_value() ||
-      heartbeat_sequence <
-          session.authority_handoff_pending_->denied_heartbeat_sequence_) {
+  if (!session.authority_handoff_pending_sequence_.has_value() ||
+      heartbeat_sequence < *session.authority_handoff_pending_sequence_) {
     return absl::OkStatus();
   }
   const auto* denied = std::get_if<cluster::control::LeaseDenied>(&decision);
@@ -1386,7 +1367,7 @@ absl::Status MetaObservationStore::RecordOwnerLeaseDecisionWritten(
       denied->reason != cluster::control::LeaseDenialReason::kNodeNotReady) {
     return absl::OkStatus();
   }
-  session.authority_handoff_pending_.reset();
+  session.authority_handoff_pending_sequence_.reset();
   return absl::OkStatus();
 }
 
@@ -1820,12 +1801,11 @@ std::optional<MetaObservedOwnerState> MetaObservationStore::OwnerObservationFor(
       .owner_projection_ = session->second.heartbeat_owner_projection_,
       .causal_progress_received_steady_ms_ =
           session->second.causal_progress_received_steady_ms_,
-      .causal_confirmation_heartbeat_sequence_ =
-          session->second.causal_confirmation_heartbeat_sequence_,
-      .confirmed_lease_ = session->second.confirmed_lease_,
+      .confirmed_grant_sequence_ = session->second.confirmed_grant_sequence_,
       .possible_owner_lease_ = session->second.possible_owner_lease_,
       .installed_owner_lease_ = session->second.installed_owner_lease_,
-      .authority_handoff_pending_ = session->second.authority_handoff_pending_,
+      .authority_handoff_pending_sequence_ =
+          session->second.authority_handoff_pending_sequence_,
   };
   return result;
 }

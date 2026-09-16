@@ -235,7 +235,6 @@ std::unique_ptr<Fixture> MakeFixture() {
   activate.group_id_ = "g1";
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.owner;
-  activate.new_authority_version_ = 1;
   activate.new_topology_epoch_ = 4;
   activate.new_config_epoch_ = 1;
   AcceptFresh(fixture, meta::MetaCommand{activate});
@@ -267,8 +266,6 @@ void SetGroupAnchors(Command& command, const Fixture& fixture,
   command.expected_owner_assignment_id_ = fixture.owner_assignment;
   command.expected_membership_revision_ = 3;
   command.expected_group_term_ = expected_term;
-  command.expected_authority_version_ = 1;
-  command.expected_grant_revision_ = 10;
   command.expected_population_manifest_revision_ = 0;
   command.expected_population_manifest_digest_.fill(0);
   command.expected_partition_replication_epoch_ = 0;
@@ -376,7 +373,6 @@ meta::CommitControlledFailover MakeCommitControlled(
   commit.authorized_revision_ = authorized_revision;
   commit.expected_candidate_ = action.candidate_;
   SetGroupAnchors(commit, fixture, 1);
-  commit.new_authority_version_ = 2;
   commit.new_topology_epoch_ = 5;
   commit.new_config_epoch_ = 2;
   return commit;
@@ -396,7 +392,6 @@ meta::CommitUncontrolledFailover MakeCommitUncontrolled(
   commit.loss_if_cutover_ = loss;
   commit.expected_candidate_ = action.candidate_;
   SetGroupAnchors(commit, fixture, 2);
-  commit.new_authority_version_ = 2;
   commit.new_topology_epoch_ = 5;
   commit.new_config_epoch_ = 2;
   return commit;
@@ -407,43 +402,32 @@ void ExpectAuthorityUnchanged(const Fixture& fixture) {
   ASSERT_TRUE(group.has_value());
   EXPECT_EQ(group->record_.owner_, fixture.owner);
   EXPECT_EQ(group->record_.group_term_, 1u);
-  EXPECT_EQ(group->record_.authority_version_, 1u);
   EXPECT_EQ(group->config_epoch_, 1u);
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 4u);
 
   const auto state = fixture.stores.grant_.GroupState("g1");
   ASSERT_TRUE(state.has_value());
   ASSERT_TRUE(state->grant_.has_value());
-  EXPECT_FALSE(state->fenced_);
   EXPECT_EQ(state->group_term_, 1u);
-  EXPECT_EQ(state->last_authority_version_, 1u);
-  EXPECT_EQ(state->last_grant_revision_, 10u);
   EXPECT_EQ(state->grant_->owner_, fixture.owner);
   EXPECT_FALSE(state->grant_->activation_action_id_.has_value());
 }
 
-void ExpectCutover(const Fixture& fixture, std::uint64_t commit_index,
+void ExpectCutover(const Fixture& fixture,
                    const meta::MetaFailoverActionId& action_id) {
   const auto group = fixture.stores.topology_.FindGroup("g1");
   ASSERT_TRUE(group.has_value());
   EXPECT_EQ(group->record_.owner_, fixture.candidate);
   EXPECT_EQ(group->record_.group_term_, 2u);
-  EXPECT_EQ(group->record_.authority_version_, 2u);
   EXPECT_EQ(group->config_epoch_, 2u);
   EXPECT_FALSE(group->failover_transition_.has_value());
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 5u);
 
   const auto state = fixture.stores.grant_.GroupState("g1");
   ASSERT_TRUE(state.has_value());
-  EXPECT_FALSE(state->fenced_);
   EXPECT_EQ(state->group_term_, 2u);
-  EXPECT_EQ(state->last_authority_version_, 2u);
-  EXPECT_EQ(state->last_grant_revision_, commit_index);
   ASSERT_TRUE(state->grant_.has_value());
   EXPECT_EQ(state->grant_->owner_, fixture.candidate);
-  EXPECT_EQ(state->grant_->term_, 2u);
-  EXPECT_EQ(state->grant_->authority_version_, 2u);
-  EXPECT_EQ(state->grant_->grant_revision_, commit_index);
   ASSERT_TRUE(state->grant_->activation_action_id_.has_value());
   EXPECT_EQ(*state->grant_->activation_action_id_, action_id);
 }
@@ -535,7 +519,7 @@ TEST(MetaFailoverTransitionW2,
   EXPECT_FALSE(transition->candidate_action_.has_value());
   EXPECT_EQ(transition->mode_, meta::MetaFailoverMode::kUncontrolled);
   EXPECT_EQ(transition->target_term_, 2u);
-  EXPECT_TRUE(fixture.stores.grant_.GroupState("g1")->fenced_);
+  EXPECT_FALSE(fixture.stores.grant_.GroupState("g1")->grant_.has_value());
 }
 
 TEST(MetaFailoverTransitionW2,
@@ -734,13 +718,10 @@ TEST(MetaFailoverTransitionW2,
   const auto group = fixture.stores.topology_.FindGroup("g1");
   EXPECT_EQ(group->record_.owner_, fixture.owner);
   EXPECT_EQ(group->record_.group_term_, 2u);
-  EXPECT_EQ(group->record_.authority_version_, 1u);
   EXPECT_EQ(group->config_epoch_, 1u);
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 4u);
   const auto grant = fixture.stores.grant_.GroupState("g1");
-  EXPECT_TRUE(grant->fenced_);
   EXPECT_FALSE(grant->grant_.has_value());
-  EXPECT_EQ(grant->last_grant_revision_, 10u);
 
   const auto operation =
       fixture.stores.operation_.FindOperation(fixture.operation_id);
@@ -803,7 +784,7 @@ TEST(MetaFailoverTransitionW2,
 
   const std::uint64_t commit_index =
       AcceptFresh(fixture, meta::MetaCommand{commit});
-  ExpectCutover(fixture, commit_index, begin.candidate_action_.action_id_);
+  ExpectCutover(fixture, begin.candidate_action_.action_id_);
   const auto operation =
       fixture.stores.operation_.FindOperation(fixture.operation_id);
   ASSERT_TRUE(operation.has_value());
@@ -816,7 +797,9 @@ TEST(MetaFailoverTransitionW2,
   EXPECT_NE(audit->record_.command_summary_.find("loss=none"),
             std::string::npos);
   ExpectExactReplay(fixture, commit_index, meta::MetaCommand{commit});
-  RejectFresh(fixture, meta::MetaCommand{commit});
+  const auto committed = DomainBytes(fixture.stores);
+  AcceptFresh(fixture, meta::MetaCommand{commit});
+  EXPECT_EQ(DomainBytes(fixture.stores), committed);
 }
 
 TEST(MetaFailoverTransitionW2,
@@ -845,7 +828,6 @@ TEST(MetaFailoverTransitionW2,
 
   const auto group = fixture.stores.topology_.FindGroup("g1");
   EXPECT_EQ(group->record_.owner_, fixture.owner);
-  EXPECT_EQ(group->record_.authority_version_, 1u);
   EXPECT_TRUE(group->failover_transition_.has_value());
   EXPECT_EQ(
       fixture.stores.operation_.FindOperation(fixture.operation_id)->lifecycle_,
@@ -875,7 +857,7 @@ TEST(MetaFailoverTransitionW2,
   const std::uint64_t commit_index =
       AcceptFresh(fixture, meta::MetaCommand{commit});
 
-  ExpectCutover(fixture, commit_index, action.action_id_);
+  ExpectCutover(fixture, action.action_id_);
   EXPECT_EQ(fixture.stores.operation_.LiveCount(), live_operations);
   EXPECT_EQ(fixture.stores.operation_.ActiveCount(), 0u);
   const auto audit = fixture.stores.audit_.Find(commit_index);
@@ -883,7 +865,9 @@ TEST(MetaFailoverTransitionW2,
   EXPECT_NE(audit->record_.command_summary_.find("loss=unknown"),
             std::string::npos);
   ExpectExactReplay(fixture, commit_index, meta::MetaCommand{commit});
-  RejectFresh(fixture, meta::MetaCommand{commit});
+  const auto committed = DomainBytes(fixture.stores);
+  AcceptFresh(fixture, meta::MetaCommand{commit});
+  EXPECT_EQ(DomainBytes(fixture.stores), committed);
 }
 
 TEST(MetaFailoverTransitionW2,
@@ -938,13 +922,13 @@ TEST(MetaFailoverTransitionW2,
         "controlled failover operation is not pristine Submitted state");
   }
   {
-    SCOPED_TRACE("BeginUncontrolledFailover/stale-authority-anchor");
+    SCOPED_TRACE("BeginUncontrolledFailover/stale-owner-anchor");
     auto fixture_owner = MakeFixture();
     Fixture& fixture = *fixture_owner;
     meta::BeginUncontrolledFailover command = MakeBeginUncontrolled(fixture);
-    ++command.expected_grant_revision_;
+    command.expected_owner_node_id_ = fixture.candidate;
     RejectFreshWithDetail(fixture, meta::MetaCommand{command},
-                          "failover grant anchor is stale");
+                          "failover group anchor is stale");
   }
 
   {
@@ -1111,7 +1095,7 @@ TEST(MetaFailoverTransitionW2,
                           "failover commit group anchor is stale");
   }
   {
-    SCOPED_TRACE("CommitControlledFailover/stale-authority-anchor");
+    SCOPED_TRACE("CommitControlledFailover/stale-owner-anchor");
     auto fixture_owner = MakeFixture();
     Fixture& fixture = *fixture_owner;
     const auto attempt = install_controlled(fixture);
@@ -1120,7 +1104,7 @@ TEST(MetaFailoverTransitionW2,
     meta::CommitControlledFailover command =
         MakeCommitControlled(fixture, authorized_revision, authorized_revision,
                              attempt.first.candidate_action_);
-    ++command.expected_grant_revision_;
+    command.expected_owner_node_id_ = fixture.candidate;
     RejectFreshWithDetail(fixture, meta::MetaCommand{command},
                           "failover commit group anchor is stale");
   }
@@ -1181,7 +1165,7 @@ TEST(MetaFailoverTransitionW2,
                           "failover commit group anchor is stale");
   }
   {
-    SCOPED_TRACE("CommitUncontrolledFailover/stale-authority-anchor");
+    SCOPED_TRACE("CommitUncontrolledFailover/stale-owner-anchor");
     auto fixture_owner = MakeFixture();
     Fixture& fixture = *fixture_owner;
     const auto attempt = install_uncontrolled(fixture);
@@ -1190,7 +1174,7 @@ TEST(MetaFailoverTransitionW2,
     meta::CommitUncontrolledFailover command = MakeCommitUncontrolled(
         fixture, authorized_revision, authorized_revision,
         *attempt.first.candidate_action_, meta::MetaFailoverLoss::kUnknown);
-    ++command.expected_grant_revision_;
+    command.expected_owner_node_id_ = fixture.candidate;
     RejectFreshWithDetail(fixture, meta::MetaCommand{command},
                           "failover commit group anchor is stale");
   }

@@ -194,8 +194,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     }
     std::optional<NodeIndex> owner_index;
     if (group.owner_node_id.has_value()) {
-      if (group.group_term == 0 || group.authority_version == 0 ||
-          group.grant_revision == 0 || group.config_epoch == 0) {
+      if (group.group_term == 0 || group.config_epoch == 0) {
         return Invalid(absl::StrCat("group ", group.group_id,
                                     " has an incomplete owner authority"));
       }
@@ -205,13 +204,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
             absl::StrCat("group ", group.group_id, " names an unknown owner"));
       }
       owner_index = owner->second;
-    } else if ((group.authority_version == 0) != (group.grant_revision == 0) ||
-               (group.authority_version != 0 && group.group_term == 0)) {
-      // Ownerless groups cover both pre-activation and fenced states. The
-      // latter retains its last authority anchors for directive/lease
-      // fencing, but it never exposes that history as a serving owner.
-      return Invalid(absl::StrCat("ownerless group ", group.group_id,
-                                  " has partial historical authority"));
     }
     bool owner_member = false;
     for (const control::WireDesiredMember& member : group.members) {
@@ -259,8 +251,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     PreparedGroupControlIdentity control_group{
         .group_id_ = source.group_id,
         .group_term_ = source.group_term,
-        .authority_version_ = source.authority_version,
-        .grant_revision_ = source.grant_revision,
         .config_epoch_ = source.config_epoch,
         .manifest_revision_ = source.manifest_revision,
         .manifest_digest_ = source.manifest_digest,
@@ -340,8 +330,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
                               source.failover_transition->mode ==
                                   control::WireFailoverMode::kControlled;
     group.group_term_ = source.group_term;
-    group.authority_version_ = source.authority_version;
-    group.grant_revision_ = source.grant_revision;
     group.manifest_revision_ = source.manifest_revision;
     group.config_epoch_ = source.config_epoch;
     for (const control::WireDesiredMember& member : source.members) {

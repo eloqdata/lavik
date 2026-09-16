@@ -139,8 +139,7 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
          !IsZero(directive.assignment_id_) && source_valid &&
          !directive.group_id_.empty() &&
          directive.group_id_.size() <= kMaxMetaGroupIdBytes &&
-         directive.group_term_ != 0 && directive.authority_version_ != 0 &&
-         directive.grant_revision_ != 0 &&
+         directive.group_term_ != 0 &&
          ((directive.population_manifest_revision_ == 0) == zero_manifest) &&
          !directive.kind_.empty() &&
          directive.kind_.size() <= kMaxMetaDirectiveKindBytes &&

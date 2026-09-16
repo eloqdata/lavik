@@ -73,15 +73,18 @@
 //                             epoch. This deliberately narrow bootstrap form
 //                             does not imply incremental slot mutation.
 //   activateauthority <group_id> <expected_term> <owner_node_id>
-//                     <new_authority_version> <new_config_epoch>
+//                     <new_config_epoch>
 //                          -> atomically activate the committed owner/grant;
 //                             the topology epoch is derived from the local
-//                             committed snapshot and every other CAS/absolute
-//                             value remains explicit operator input.
+//                             committed snapshot. A term can acquire at most
+//                             one Grant. Normal Owner changes use typed
+//                             failover; this primitive requires a previously
+//                             reserved grantless term.
 //   fencegroup <group_id> <expected_term>
-//                          -> commit FenceGroup under the current term. Data
-//                             sessions fence and drain the superseded anchor
-//                             before acknowledging its replacement FDS.
+//                          -> atomically fence the current Grant and advance
+//                             the Group Term by one. Data sessions fence and
+//                             drain the superseded anchor before acknowledging
+//                             its replacement FDS.
 //   status                 -> "OK leader=<0|1> id=<n> committed=<idx>
 //                             snapshot_idx=<idx> term=<n>".
 //   clusterhead 1          -> bounded versioned responder/role/term/leader/

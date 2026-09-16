@@ -110,12 +110,9 @@ TEST(ClusterCreateManifestTest, NormalizesMultipleGroupsAndAllocatesSlots) {
             (ClusterCreateManifestV1::SlotRange{0, 8191, "group-1"}));
   EXPECT_EQ(manifest->slot_ranges_[1],
             (ClusterCreateManifestV1::SlotRange{8192, 16383, "group-2"}));
-  EXPECT_TRUE(
-      manifest->bootstrap_policy_.automatic_uncontrolled_failover_enabled_);
-  EXPECT_EQ(manifest->bootstrap_policy_
-                .automatic_uncontrolled_failover_suspect_after_ms_,
-            5000u);
-  EXPECT_EQ(manifest->bootstrap_policy_.authority_lease_duration_ms_, 5000u);
+  EXPECT_TRUE(manifest->automatic_uncontrolled_failover_enabled_);
+  EXPECT_EQ(manifest->automatic_uncontrolled_failover_suspect_after_ms_, 5000u);
+  EXPECT_EQ(manifest->authority_lease_duration_ms_, 5000u);
 }
 
 TEST(ClusterCreateManifestTest, ParsesStrictBootstrapPolicyOverrides) {
@@ -130,12 +127,9 @@ authority_lease_duration_ms = 3000
   auto manifest = ParseClusterCreateManifest(configured);
 
   ASSERT_TRUE(manifest.ok()) << manifest.status();
-  EXPECT_FALSE(
-      manifest->bootstrap_policy_.automatic_uncontrolled_failover_enabled_);
-  EXPECT_EQ(manifest->bootstrap_policy_
-                .automatic_uncontrolled_failover_suspect_after_ms_,
-            9000u);
-  EXPECT_EQ(manifest->bootstrap_policy_.authority_lease_duration_ms_, 3000u);
+  EXPECT_FALSE(manifest->automatic_uncontrolled_failover_enabled_);
+  EXPECT_EQ(manifest->automatic_uncontrolled_failover_suspect_after_ms_, 9000u);
+  EXPECT_EQ(manifest->authority_lease_duration_ms_, 3000u);
 
   for (const std::string& invalid : {
            configured + "unknown = 1\n",
@@ -595,7 +589,6 @@ ClusterStatusWireV1 ReadyStatus(const ClusterCreateManifestV1& manifest,
                               .term_ = 1,
                               .owner_node_id_ = group.primary_node_id_,
                               .config_epoch_ = 1,
-                              .grant_revision_ = 18,
                               .serving_ready_ = true,
                               .topology_converged_ = true,
                               .effective_threshold_ms_ = 1'000});

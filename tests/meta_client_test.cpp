@@ -496,9 +496,7 @@ TEST(MetaDirectiveValidationTest,
                 .projection_hash = control::ComputeSha256("projection")},
       .authority = {.group_id = "group-a",
                     .assignment_id = {},
-                    .group_term = 3,
-                    .authority_version = 4,
-                    .grant_revision = 5},
+                    .group_term = 3},
       .identity = {.operation_id = {},
                    .directive_id = {},
                    .attempt_id = {},
@@ -561,8 +559,6 @@ TEST(MetaDirectiveValidationTest,
       .owner_node_id = kRemote,
       .owner_assignment_id = remote_assignment,
       .group_term = projected.authority.group_term,
-      .authority_version = projected.authority.authority_version,
-      .grant_revision = projected.authority.grant_revision,
       .partition_replication_epoch = projected.partition_replication_epoch,
   });
   desired.current_directives.push_back(projected);
@@ -679,14 +675,14 @@ TEST(MetaDirectiveValidationTest,
   desired.current_directives.front().recipient_boot_id = kLocalBoot;
   desired.current_directives.front().target_boot_id = kLocalBoot;
 
-  control::Directive stale_initialize_authority = initialize;
-  --stale_initialize_authority.authority.authority_version;
+  control::Directive stale_initialize_term = initialize;
+  --stale_initialize_term.authority.group_term;
   desired.current_directives.front().authority =
-      stale_initialize_authority.authority;
-  EXPECT_EQ(ValidateLiveDirective(stale_initialize_authority, desired, kLocal,
-                                  kLocalBoot)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
+      stale_initialize_term.authority;
+  EXPECT_EQ(
+      ValidateLiveDirective(stale_initialize_term, desired, kLocal, kLocalBoot)
+          .code(),
+      absl::StatusCode::kFailedPrecondition);
   desired.current_directives.front().authority = initialize.authority;
 
   initialize.source_node_id = kRemote;
@@ -743,8 +739,6 @@ TEST(MetaFailoverControlAdapterTest,
           {
               .group_id_ = "group-a",
               .group_term_ = 8,
-              .authority_version_ = 12,
-              .grant_revision_ = 14,
               .config_epoch_ = 16,
               .manifest_revision_ = 18,
               .manifest_digest_ = manifest,
@@ -1315,8 +1309,6 @@ TEST(MetaFailoverHeartbeatTest,
       .owner_node_id = std::string(kSource),
       .owner_assignment_id = source_assignment,
       .group_term = 8,
-      .authority_version = 3,
-      .grant_revision = 4,
       .grant_active = true,
       .manifest_revision = 10,
       .manifest_digest = manifest,
@@ -1510,8 +1502,6 @@ TEST(MetaAuthorityIdentityTest, UsesVersionedUnambiguousEncoding) {
       .group_id_ = "group:/with:separators",
       .assignment_id_ = AssignmentId::FromBytes({}),
       .group_term_ = 1,
-      .authority_version_ = 23,
-      .grant_revision_ = 4,
   };
   AuthorityAnchor second = first;
   second.group_id_ = "group";

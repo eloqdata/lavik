@@ -125,7 +125,6 @@ struct ProposalFixture {
     activate.group_id_ = "g1";
     activate.expected_term_ = 1;
     activate.new_owner_ = owner;
-    activate.new_authority_version_ = 1;
     activate.new_topology_epoch_ = 4;
     activate.new_config_epoch_ = 1;
     Apply(activate);
@@ -301,8 +300,6 @@ struct ProposalFixture {
     begin.expected_owner_assignment_id_ = owner_assignment;
     begin.expected_membership_revision_ = group->revision_;
     begin.expected_group_term_ = group->record_.group_term_;
-    begin.expected_authority_version_ = group->record_.authority_version_;
-    begin.expected_grant_revision_ = grant_state->last_grant_revision_;
     begin.expected_population_manifest_revision_ =
         group->record_.population_manifest_revision_;
     begin.expected_population_manifest_digest_ =

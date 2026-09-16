@@ -621,7 +621,6 @@ TEST(MetaTopologyStore, CreateGroupCreatesQueryableGroup) {
   // Freshly created GroupRecord: no owner, all counters zero.
   EXPECT_EQ(view->record_.owner_, "");
   EXPECT_EQ(view->record_.group_term_, 0u);
-  EXPECT_EQ(view->record_.authority_version_, 0u);
   EXPECT_EQ(view->record_.population_manifest_revision_, 0u);
   EXPECT_EQ(view->record_.partition_replication_epoch_, 0u);
 
@@ -1134,7 +1133,6 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
 
   ASSERT_TRUE(store.SetOwner("group-a", MakeNodeId(0x30)).ok());
   ASSERT_TRUE(store.SetGroupTerm("group-a", 7).ok());
-  ASSERT_TRUE(store.SetAuthorityVersion("group-a", 3).ok());
   keylane::meta::MetaHash256 manifest_digest{};
   manifest_digest.fill(0x55);
   ASSERT_TRUE(
@@ -1145,7 +1143,6 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   const auto view = store.FindGroup("group-a");
   EXPECT_EQ(view->record_.owner_, MakeNodeId(0x30));
   EXPECT_EQ(view->record_.group_term_, 7u);
-  EXPECT_EQ(view->record_.authority_version_, 3u);
   EXPECT_EQ(view->record_.population_manifest_revision_, 555u);
   EXPECT_EQ(view->record_.population_manifest_digest_, manifest_digest);
   EXPECT_EQ(view->record_.partition_replication_epoch_, 2u);
@@ -1156,7 +1153,6 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   // Setting the value already held is an idempotent no-op accept.
   ASSERT_TRUE(store.SetOwner("group-a", MakeNodeId(0x30)).ok());
   ASSERT_TRUE(store.SetGroupTerm("group-a", 7).ok());
-  ASSERT_TRUE(store.SetAuthorityVersion("group-a", 3).ok());
   ASSERT_TRUE(
       store.SetPopulationManifest("group-a", 555, manifest_digest).ok());
   ASSERT_TRUE(store.SetPartitionReplicationEpoch("group-a", 2).ok());
@@ -1165,7 +1161,6 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   // Unknown groups are rejected by every primitive.
   ExpectDomainReject(store.SetOwner("group-ghost", MakeNodeId(0x30)));
   ExpectDomainReject(store.SetGroupTerm("group-ghost", 7));
-  ExpectDomainReject(store.SetAuthorityVersion("group-ghost", 3));
   ExpectDomainReject(
       store.SetPopulationManifest("group-ghost", 555, manifest_digest));
   ExpectDomainReject(store.SetPartitionReplicationEpoch("group-ghost", 2));
@@ -1228,7 +1223,6 @@ MetaTopologyStore MakePopulatedTopology() {
                   .ok());
   EXPECT_TRUE(store.SetOwner("group-a", MakeNodeId(0x10)).ok());
   EXPECT_TRUE(store.SetGroupTerm("group-a", 7).ok());
-  EXPECT_TRUE(store.SetAuthorityVersion("group-a", 3).ok());
   keylane::meta::MetaHash256 manifest_digest{};
   manifest_digest.fill(0x55);
   EXPECT_TRUE(
@@ -1363,7 +1357,6 @@ std::string MakeTopologyBlob(
     w.WriteString(group.group_id);
     w.WriteString(group.owner);
     w.WriteU64(0);  // group_term
-    w.WriteU64(0);  // authority_version
     w.WriteU64(0);  // population_manifest_revision
     keylane::meta::WriteFixedArray(w, keylane::meta::MetaHash256{});
     w.WriteU64(0);  // partition_replication_epoch

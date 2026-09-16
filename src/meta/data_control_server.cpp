@@ -448,8 +448,6 @@ control::WireAuthorityAnchor GroupAnchor(
       .group_id = group.group_id,
       .assignment_id = *group.owner_assignment_id,
       .group_term = group.group_term,
-      .authority_version = group.authority_version,
-      .grant_revision = group.grant_revision,
   };
 }
 
@@ -744,8 +742,6 @@ detail::OwnerProjectionForHeartbeat(const control::FullDesiredState& installed,
         .owner_node_id_ = *group.owner_node_id,
         .owner_assignment_id_ = *group.owner_assignment_id,
         .group_term_ = group.group_term,
-        .authority_version_ = group.authority_version,
-        .grant_revision_ = group.grant_revision,
         .projection_hash_ = installed.projection_hash,
         .authority_lease_duration_ms_ = installed.authority_lease_duration_ms,
     };
@@ -753,7 +749,7 @@ detail::OwnerProjectionForHeartbeat(const control::FullDesiredState& installed,
   return result;
 }
 
-std::optional<MetaCausallyConfirmedLease> detail::ConfirmedLeaseForHeartbeat(
+std::optional<std::uint64_t> detail::ConfirmedLeaseForHeartbeat(
     const std::optional<control::HeartbeatAck>& previous_ack,
     std::uint64_t heartbeat_sequence, std::string_view authenticated_boot_id,
     const std::optional<MetaObservedOwnerProjection>& owner_projection) {
@@ -768,20 +764,14 @@ std::optional<MetaCausallyConfirmedLease> detail::ConfirmedLeaseForHeartbeat(
       granted->projection_hash != owner_projection->projection_hash_ ||
       granted->group_id != owner_projection->group_id_ ||
       granted->assignment_id != owner_projection->owner_assignment_id_ ||
-      granted->group_term != owner_projection->group_term_ ||
-      granted->authority_version != owner_projection->authority_version_ ||
-      granted->grant_revision != owner_projection->grant_revision_) {
+      granted->group_term != owner_projection->group_term_) {
     return std::nullopt;
   }
   if (granted->granted_duration_ms !=
       owner_projection->authority_lease_duration_ms_) {
     return std::nullopt;
   }
-  return MetaCausallyConfirmedLease{
-      .projection_ = *owner_projection,
-      .acknowledged_heartbeat_sequence_ = previous_ack->heartbeat_sequence,
-      .granted_duration_ms_ = granted->granted_duration_ms,
-  };
+  return previous_ack->heartbeat_sequence;
 }
 
 absl::Status detail::ApplyLeadershipValidityLimit(
@@ -794,8 +784,6 @@ absl::Status detail::ApplyLeadershipValidityLimit(
   control::FullDesiredState& state = batch.full_state;
   state.authority_lease_duration_ms =
       std::min(state.authority_lease_duration_ms, leadership_validity_ms);
-  state.data_heartbeat_interval_ms =
-      std::max<std::uint32_t>(1, state.authority_lease_duration_ms / 3);
 
   auto projection_hash = control::ComputeProjectionHash(state);
   if (!projection_hash.ok()) return projection_hash.status();
@@ -866,7 +854,7 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
     std::optional<MetaObservedFailoverProjection> failover_projection,
     std::optional<MetaObservedOwnerProjection> owner_projection,
     std::uint64_t heartbeat_sequence,
-    std::optional<MetaCausallyConfirmedLease> confirmed_lease,
+    std::optional<std::uint64_t> confirmed_grant_sequence,
     std::int64_t now_unix_ms, std::uint64_t now_steady_ms) {
   (void)observations.MaybeSweepExpired(now_unix_ms);
   const MetaObservationIdentity identity{std::string(node_id), boot,
@@ -1028,7 +1016,7 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
           std::move(candidate_observation),
           std::move(failover_observation_value), std::move(failover_projection),
           std::move(owner_projection), heartbeat_sequence,
-          std::move(confirmed_lease), facts, now_unix_ms, now_steady_ms);
+          confirmed_grant_sequence, facts, now_unix_ms, now_steady_ms);
   if (!replaced.boot_status_.ok()) {
     record_rejection("boot", replaced.boot_status_);
   }
@@ -1324,9 +1312,7 @@ control::LeaseDecision EvaluateLeaseChallenge(
       !group->owner_assignment_id.has_value() ||
       *group->owner_node_id != evaluation.node_id_ ||
       *group->owner_assignment_id != challenge->assignment_id ||
-      group->group_term != challenge->group_term ||
-      group->authority_version != challenge->authority_version ||
-      group->grant_revision != challenge->grant_revision) {
+      group->group_term != challenge->group_term) {
     return control::LeaseDenied{challenge->nonce,
                                 control::LeaseDenialReason::kAuthorityMismatch,
                                 current_hash};
@@ -1359,8 +1345,6 @@ control::LeaseDecision EvaluateLeaseChallenge(
       .group_id = challenge->group_id,
       .assignment_id = challenge->assignment_id,
       .group_term = challenge->group_term,
-      .authority_version = challenge->authority_version,
-      .grant_revision = challenge->grant_revision,
       .granted_duration_ms = duration,
   };
 }
@@ -1375,8 +1359,6 @@ control::LeaseDecision MetaLeaseHandoffGuard::Enforce(
       .group_id = grant->group_id,
       .assignment_id = grant->assignment_id,
       .group_term = grant->group_term,
-      .authority_version = grant->authority_version,
-      .grant_revision = grant->grant_revision,
   };
   auto entry = std::find_if(
       entries_.begin(), entries_.end(), [&](const Entry& candidate) {
@@ -2988,7 +2970,7 @@ celer::Task<absl::Status> RunEstablishedSession(
       if (!owner_projection.ok()) {
         co_return owner_projection.status();
       }
-      std::optional<MetaCausallyConfirmedLease> confirmed_lease =
+      std::optional<std::uint64_t> confirmed_grant_sequence =
           detail::ConfirmedLeaseForHeartbeat(
               cached_ack, heartbeat->heartbeat_sequence, state->boot_id_,
               *owner_projection);
@@ -3015,7 +2997,7 @@ celer::Task<absl::Status> RunEstablishedSession(
           replication_history_id, session_generation, heartbeat->health,
           heartbeat->role_information, heartbeat->failover_observation,
           std::move(*failover_projection), std::move(*owner_projection),
-          heartbeat->heartbeat_sequence, std::move(confirmed_lease),
+          heartbeat->heartbeat_sequence, confirmed_grant_sequence,
           heartbeat_received_unix_ms, heartbeat_received_steady_ms);
       state->core_->options_.runtime_status_->RecordHealth(
           state->node_id_, state->session_id_, heartbeat->health,

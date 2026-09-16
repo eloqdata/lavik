@@ -3,18 +3,14 @@
 // MetaGrantStore owns the metadata control plane's committed per-group
 // term, grant, and fence state.
 //
-// Per group the store keeps: the current group_term, the current grant
-// (owner, term, authority_version, grant revision, optional activation action),
-// and the fenced flag. INVARIANT: fenced_ == (no grant). A group is created
-// fenced and grantless; BeginGroupTerm(T) is the only term-advancing store
-// primitive and re-enters the fenced/grantless state; typed failover aggregate
-// commands reuse it. ActivateAuthority is the shared grant-install primitive:
-// it uses the CURRENT nonzero term, deliberately carries no new term, and
-// unfences. RevokeGrant/FenceGroup drop the grant and fence.
-//
-// authority_version strictly increases per group across activations and
-// survives revocation (last_authority_version_ is kept when the grant is
-// dropped), so a stale activation can never re-install an older authority.
+// Per group the store keeps the current group_term and optional current grant
+// (owner and optional activation action). A missing grant is the fenced
+// state. A group is created fenced and grantless; BeginGroupTerm(T) is the
+// only term-advancing store primitive and re-enters that state; typed failover
+// and FenceGroup reuse it.
+// ActivateAuthority installs the one grant permitted in the CURRENT nonzero
+// term and unfences. A grant can only be removed by advancing the term, so an
+// authority can never be reinstalled in a term that already carried one.
 //
 // Command semantics (all absolute values, with CAS via expected_* fields):
 //   - BeginGroupTerm(expected=T-1, new=T): T must be exactly expected+1 and
@@ -24,25 +20,22 @@
 //     rejections) and ApplyGrantPart (the install) so the apply dispatcher can
 //     atomically write the topology-store part (owner, topology_epoch, and
 //     config_epoch) between the two. expected_term must equal the current term;
-//     the term does not move. ApplyGrantPart assumes successful validation and
-//     FAILS STOP on a term mismatch (contract violation = apply-layer bug).
-//   - RevokeGrant/FenceGroup: CAS on the current term; drop the grant, fence.
+//     the term does not move. A different active grant in the same term is
+//     rejected. ApplyGrantPart assumes successful validation and FAILS STOP on
+//     a contract violation.
 //
 // Replay idempotency: re-applying a command at the same log index
 // must reproduce the same verdict and state. Each command first checks
 // whether its post-effect is already present with identical content and then
 // accepts as a no-op; only genuinely conflicting content is rejected (a
 // kDomainReject absl::Status). A semantic no-op never moves a CAS token.
-// RevokeGrant/FenceGroup do not advance term or authority-version tokens;
-// BeginGroupTerm and ActivateAuthority carry explicit already-applied checks.
 //
 // Cross-store invariants (grant vs topology owner/epochs and
 // principal-vs-grant) are NOT enforced here: the store exposes
 // fact queries and the apply dispatcher orchestrates. Apply is a pure
 // in-memory function: no IO, no locks, no clock, no observation access.
-// Snapshot serialization is the versioned strict
-// encoding of encoding.h; decode failures (including a violated
-// fenced/no-grant invariant) are MetaFailureClass::kFailStop.
+// Snapshot serialization is the versioned strict encoding of encoding.h;
+// decode failures are MetaFailureClass::kFailStop.
 
 #include <cstdint>
 #include <map>
@@ -57,16 +50,10 @@
 
 namespace keylane::meta {
 
-// The current grant of one group. term_ always equals the group's current
-// term and authority_version_ the group's last authority version while the
-// grant is installed (see the file header).
+// The current grant of one group. Its term is the containing state's
+// group_term_; keeping another copy here would permit contradictory snapshots.
 struct MetaGroupGrant {
   std::string owner_;  // node_id
-  std::uint64_t term_ = 0;
-  std::uint64_t authority_version_ = 0;
-  // Raft apply index of the activation that installed this grant.
-  // Heartbeat lease renewal is ephemeral and never changes this value.
-  std::uint64_t grant_revision_ = 0;
   // Set only by failover cutover. Data activation must match this committed
   // action to the boot-local prepared context; ordinary authority activation
   // clears it.
@@ -77,13 +64,7 @@ struct MetaGroupGrant {
 // Read-only view of one group's term/grant state (fact query result).
 struct MetaGroupGrantState {
   std::uint64_t group_term_ = 0;
-  // Survives revocation; strictly increases on each ActivateAuthority.
-  std::uint64_t last_authority_version_ = 0;
-  // Retained while fenced so any later activation must advance beyond the
-  // rejected authority anchor.
-  std::uint64_t last_grant_revision_ = 0;
-  std::optional<MetaGroupGrant> grant_;  // absent == fenced (invariant)
-  bool fenced_ = true;
+  std::optional<MetaGroupGrant> grant_;  // absent == fenced
   bool operator==(const MetaGroupGrantState&) const = default;
 };
 
@@ -95,7 +76,8 @@ class MetaGrantStore {
   // Group lifecycle primitives; the apply dispatcher orchestrates them with
   // the topology store's CreateGroup/group-removal path. AddGroup is
   // idempotent. RemoveGroup rejects while a grant exists (the group must be
-  // revoked/fenced first) and is an idempotent no-op once the group is gone.
+  // moved to a new grantless term first) and is an idempotent no-op once the
+  // group is gone.
   absl::Status AddGroup(std::string_view group_id);
   absl::Status RemoveGroup(std::string_view group_id);
 
@@ -105,19 +87,16 @@ class MetaGrantStore {
   // prepared context authorizes this cutover. It participates in exact replay
   // matching; nullopt denotes an ordinary activation and clears the binding.
   absl::Status ValidateActivate(const ActivateAuthority& command,
-                                std::uint64_t committed_index,
                                 std::optional<MetaFailoverActionId>
                                     activation_action_id = std::nullopt) const;
-  // Installs the grant part of ActivateAuthority, using committed_index as
-  // the new grant_revision and persisting activation_action_id on the grant.
+  // Installs the grant part of ActivateAuthority and persists
+  // activation_action_id on the grant.
   // Caller must have run ValidateActivate successfully with the same command,
-  // index, and optional action binding against the current state; a term
-  // mismatch here is an apply-layer bug and fails stop.
+  // and optional action binding against the current state; a mismatch here is
+  // an apply-layer bug and fails stop.
   absl::Status ApplyGrantPart(
-      const ActivateAuthority& command, std::uint64_t committed_index,
+      const ActivateAuthority& command,
       std::optional<MetaFailoverActionId> activation_action_id = std::nullopt);
-  absl::Status RevokeGrant(const RevokeGrant& command);
-  absl::Status FenceGroup(const FenceGroup& command);
 
   // Fact queries used by observation freshness and aggregate validation.
   std::optional<MetaGroupGrantState> GroupState(
@@ -126,30 +105,20 @@ class MetaGrantStore {
       std::string_view group_id) const;
   std::size_t GroupCount() const { return groups_.size(); }
 
-  // Snapshot serialization: versioned strict encoding; decode enforces caps
-  // and the fenced/no-grant invariant (a violation is corruption: fail-stop).
+  // Snapshot serialization: versioned strict encoding with bounded fields.
   absl::StatusOr<std::string> Serialize() const;
   static absl::StatusOr<MetaGrantStore> Deserialize(
       std::string_view bytes, std::uint32_t max_groups = kMaxMetaGroups);
 
  private:
-  struct Entry {
-    std::uint64_t group_term_ = 0;
-    std::uint64_t last_authority_version_ = 0;
-    std::uint64_t last_grant_revision_ = 0;
-    std::optional<MetaGroupGrant> grant_;
-    bool fenced_ = true;
-  };
-
   // The already-applied check of ActivateAuthority: the installed grant is
   // exactly what the command asks for.
   static bool GrantMatches(
-      const Entry& entry, const ActivateAuthority& command,
-      std::uint64_t committed_index,
+      const MetaGroupGrantState& entry, const ActivateAuthority& command,
       const std::optional<MetaFailoverActionId>& activation_action_id);
 
   std::uint32_t max_groups_;
-  std::map<std::string, Entry> groups_;
+  std::map<std::string, MetaGroupGrantState> groups_;
 };
 
 }  // namespace keylane::meta
