@@ -1,0 +1,6 @@
+{
+  "utc": "2026-09-16T03:47:35Z",
+  "traceback": "Traceback (most recent call last):\n  File \"/mnt/dev/ycsb-default-host-rerun-20260916/runner.py\", line 334, in main\n    if mode == 'hreplace': host.apply_keylane()\n                           ^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/dev/ycsb-default-host-rerun-20260916/host_policy.py\", line 120, in apply_keylane\n    assert_keylane()\n  File \"/mnt/dev/ycsb-default-host-rerun-20260916/host_policy.py\", line 132, in assert_keylane\n    assert value['configured'] == value['effective'] and value['effective'] in ('12', '13', '14', '15')\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+  "mode": null,
+  "completed": 8
+}

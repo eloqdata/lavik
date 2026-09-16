@@ -1,0 +1,158 @@
+{
+  "mode": "aerospike",
+  "workload": "C",
+  "workers": 256,
+  "phase": "warmup",
+  "label": "fresh100m-20260916",
+  "requested_duration_seconds": 0,
+  "d_insert_start": null,
+  "target_ops_sec": 100000,
+  "measurement_interval": "both",
+  "command": [
+    "/mnt/dev/YCSB-aerospike-dist/bin/ycsb",
+    "run",
+    "aerospike",
+    "-s",
+    "-threads",
+    "256",
+    "-P",
+    "/mnt/dev/YCSB-aerospike-dist/workloads/workloada",
+    "-target",
+    "100000",
+    "-p",
+    "recordcount=100000000",
+    "-p",
+    "operationcount=1000000",
+    "-p",
+    "fieldcount=10",
+    "-p",
+    "fieldlength=128",
+    "-p",
+    "fieldlengthdistribution=constant",
+    "-p",
+    "readallfields=true",
+    "-p",
+    "writeallfields=true",
+    "-p",
+    "insertorder=hashed",
+    "-p",
+    "requestdistribution=uniform",
+    "-p",
+    "readproportion=1",
+    "-p",
+    "updateproportion=0",
+    "-p",
+    "insertproportion=0",
+    "-p",
+    "scanproportion=0",
+    "-p",
+    "readmodifywriteproportion=0",
+    "-p",
+    "measurementtype=hdrhistogram",
+    "-p",
+    "measurement.interval=both",
+    "-p",
+    "hdrhistogram.percentiles=50,95,99,99.9,99.99",
+    "-p",
+    "status.interval=10",
+    "-p",
+    "as.host=172.16.0.4",
+    "-p",
+    "as.port=3000",
+    "-p",
+    "as.namespace=ycsb",
+    "-p",
+    "as.timeout=10000"
+  ],
+  "start_utc": "2026-09-16T03:05:42Z",
+  "runtime_ms": 10294,
+  "attempted": 1000000,
+  "succeeded": 1000000,
+  "failed": 0,
+  "success_qps": 97143.96735962697,
+  "metrics": {
+    "OVERALL": {
+      "RunTime(ms)": 10294,
+      "Throughput(ops/sec)": 97143.96735962697
+    },
+    "TOTAL_GCS_G1_Young_Generation": {
+      "Count": 17
+    },
+    "TOTAL_GC_TIME_G1_Young_Generation": {
+      "Time(ms)": 37
+    },
+    "TOTAL_GC_TIME_%_G1_Young_Generation": {
+      "Time(%)": 0.3594326792306198
+    },
+    "TOTAL_GCS_G1_Old_Generation": {
+      "Count": 0
+    },
+    "TOTAL_GC_TIME_G1_Old_Generation": {
+      "Time(ms)": 0
+    },
+    "TOTAL_GC_TIME_%_G1_Old_Generation": {
+      "Time(%)": 0.0
+    },
+    "TOTAL_GCs": {
+      "Count": 17
+    },
+    "TOTAL_GC_TIME": {
+      "Time(ms)": 37
+    },
+    "TOTAL_GC_TIME_%": {
+      "Time(%)": 0.3594326792306198
+    },
+    "READ": {
+      "Operations": 1000000,
+      "AverageLatency(us)": 308.09596,
+      "MinLatency(us)": 177,
+      "MaxLatency(us)": 46751,
+      "50thPercentileLatency(us)": 289,
+      "95thPercentileLatency(us)": 398,
+      "99thPercentileLatency(us)": 466,
+      "99.9PercentileLatency(us)": 788,
+      "99.99PercentileLatency(us)": 22495,
+      "Return=OK": 1000000
+    },
+    "CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 43.80859375,
+      "MinLatency(us)": 19,
+      "MaxLatency(us)": 424,
+      "50thPercentileLatency(us)": 34,
+      "95thPercentileLatency(us)": 83,
+      "99thPercentileLatency(us)": 163,
+      "99.9PercentileLatency(us)": 424,
+      "99.99PercentileLatency(us)": 424
+    },
+    "Intended-READ": {
+      "Operations": 1000000,
+      "AverageLatency(us)": 403.613838,
+      "MinLatency(us)": 227,
+      "MaxLatency(us)": 49823,
+      "50thPercentileLatency(us)": 349,
+      "95thPercentileLatency(us)": 464,
+      "99thPercentileLatency(us)": 598,
+      "99.9PercentileLatency(us)": 15095,
+      "99.99PercentileLatency(us)": 23535
+    },
+    "Intended-CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 44.01953125,
+      "MinLatency(us)": 19,
+      "MaxLatency(us)": 425,
+      "50thPercentileLatency(us)": 34,
+      "95thPercentileLatency(us)": 83,
+      "99thPercentileLatency(us)": 163,
+      "99.9PercentileLatency(us)": 425,
+      "99.99PercentileLatency(us)": 425
+    }
+  },
+  "sha256": "3a4f939a018deac600c33420d9af799340a5137360cf443cf867ea2ecc412466",
+  "exit_code": 0,
+  "end_utc": "2026-09-16T03:05:53Z",
+  "before_records": 100000000,
+  "after_records": 100000000,
+  "host_before": "fresh100m-20260916-aerospike-c-c256-target100000-warmup.host-before.json",
+  "host_after": "fresh100m-20260916-aerospike-c-c256-target100000-warmup.host-after.json"
+}

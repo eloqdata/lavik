@@ -223,17 +223,15 @@ Redis-style configuration file as its first argument.
 ## Benchmark
 
 The [Keylane–Aerospike YCSB report](perf_reports/ycsb-rerun-2026-09-13/README.md)
-records the server and client hardware, actual dataset sizes, database
-parameters, QPS, and p99/p99.9/p99.99 latency for A/B/C/D workloads with 256
-YCSB threads. It includes the raw measurements and an offline verification
-script.
+records a fresh 100-million-record dataset for each database, ten 128-byte
+fields per record, and 256 YCSB threads. It includes the server/client hardware,
+database settings, QPS, and p99/p99.9/p99.99 latency for A/B/C/D at 100K ops/s
+and without a rate limit, with raw evidence and an offline verification script.
 
-Both databases read from the same 100-million-key range with ten 128-byte
-fields per record. Actual total record counts, CPU allocations, and measurement
-windows differ; the report lists these conditions beside the results.
-The Aerospike runs retained Keylane's host housekeeping and NIC IRQ tuning,
-with irqbalance inactive. They do not establish Aerospike performance on an
-untuned host; that baseline has not been measured.
+Aerospike uses server performance defaults and the host's original CPU and
+IRQ policy. Keylane uses 12 pinned workers with housekeeping and NIC IRQs on
+the remaining four logical CPUs. The report compares these explicitly chosen
+deployments, which have different CPU allocations and database settings.
 
 ## Durability and compatibility notes
 

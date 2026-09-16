@@ -1,0 +1,41 @@
+Sep 16 2026 02:59:37 GMT: WARNING (hardware): (hardware.c:552) bad or missing /proc/self/cpuset file
+Sep 16 2026 02:59:37 GMT: WARNING (hardware): (hardware.c:552) bad or missing /proc/self/cpuset file
+Sep 16 2026 02:59:37 GMT: INFO (as): (as.c:336) <><><><><><><><><><>  Aerospike Community Edition build 8.1.2.4-4  <><><><><><><><><><>
+Sep 16 2026 02:59:37 GMT: INFO (as): (as.c:338) starting Aerospike Community Edition build 8.1.2.4-4 os ubuntu24.04 arch x86_64 sha 634ac90
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764) # Single-node YCSB device namespace. Performance settings use server defaults.
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764) service {
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764) }
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764) logging {
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     console {
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         context any info
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     }
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764) }
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764) network {
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     service {
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         address 172.16.0.4
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         port 3000
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     }
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     heartbeat {
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         mode mesh
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         port 3002
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     }
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     fabric {
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         port 3001
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     }
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     admin {
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         port 3003
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     }
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764) }
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764) namespace ycsb {
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     replication-factor 1
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     storage-engine device {
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)         device /dev/md127p3
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764)     }
+Sep 16 2026 02:59:37 GMT: INFO (config): (cfg.c:4764) }
+Sep 16 2026 02:59:37 GMT: CRITICAL (config): (cfg.c:4774) must configure 'cluster-name'
+Sep 16 2026 02:59:37 GMT: WARNING (as): (signal.c:245) SIGINT received, aborting Aerospike Community Edition build 8.1.2.4-4 os ubuntu24.04 arch x86_64 sha 634ac90
+Sep 16 2026 02:59:37 GMT: WARNING (as): (signal.c:276) si_code SI_TKILL (-6)
+Sep 16 2026 02:59:37 GMT: WARNING (as): (signal.c:206) startup was not complete, exiting immediately

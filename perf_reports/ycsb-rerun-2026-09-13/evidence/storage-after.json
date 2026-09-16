@@ -1,0 +1,58 @@
+{
+  "table": {
+    "label": "gpt",
+    "id": "0E39CBB3-4B3E-48BE-A6DA-DB454B52E156",
+    "device": "/dev/md127",
+    "unit": "sectors",
+    "firstlba": 34,
+    "lastlba": 22496661470,
+    "grain": "3145728",
+    "sectorsize": 512,
+    "partitions": [
+      {
+        "node": "/dev/md127p1",
+        "start": 12288,
+        "size": 268435456,
+        "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        "uuid": "33F27D15-2EAD-4A86-94B0-F858D315334F",
+        "name": "aerospike-bench80"
+      },
+      {
+        "node": "/dev/md127p2",
+        "start": 268449792,
+        "size": 4294967296,
+        "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        "uuid": "6AE73491-1ED8-4633-8CC6-03063E710483",
+        "name": "keylane-uring-bench80"
+      },
+      {
+        "node": "/dev/md127p3",
+        "start": 4563419136,
+        "size": 2147450880,
+        "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        "uuid": "4311A3E6-5D02-466C-9A46-79AB2095AF42",
+        "name": "aerospike-ycsb-default-20260916"
+      },
+      {
+        "node": "/dev/md127p4",
+        "start": 6710870016,
+        "size": 2147450880,
+        "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        "uuid": "EE9AA26C-17F2-4738-B802-DA0AFC292C0C",
+        "name": "keylane-ycsb-tuned-20260916"
+      }
+    ]
+  },
+  "preserved_boundaries": {
+    "/dev/md127p1": {
+      "0": "6d14741d62054ac314f82e6fc1f10395b969e28d184e14cf57020a4dfb546fc4",
+      "68719476736": "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58",
+      "137437904896": "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58"
+    },
+    "/dev/md127p2": {
+      "0": "7e185fbaa51ed11e3151766090f4651e64eeae24f4e7c4a14547761181fd72b9",
+      "1099511627776": "70c3d30f0ef15f66246c662bb2c4ceba16116421db065f2974205df1a0bde807",
+      "2199022206976": "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58"
+    }
+  }
+}

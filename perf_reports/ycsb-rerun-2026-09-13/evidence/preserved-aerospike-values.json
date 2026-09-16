@@ -1,0 +1,106 @@
+[
+  {
+    "key": 0,
+    "metadata": {
+      "ttl": 4294967295,
+      "gen": 1
+    },
+    "bins": {
+      "value": {
+        "bytes": 2048,
+        "sha256": "6d7406d65f111978ecc3ea12c986d7d1e20ee8afe8cf83cdeb28e3baba6a6cee"
+      }
+    }
+  },
+  {
+    "key": 1,
+    "metadata": {
+      "ttl": 4294967295,
+      "gen": 1
+    },
+    "bins": {
+      "value": {
+        "bytes": 2048,
+        "sha256": "d805681f78fae4a8fe51a36a133ef7ed39d066397808cb9a49acf1bae832485f"
+      }
+    }
+  },
+  {
+    "key": 17,
+    "metadata": {
+      "ttl": 4294967295,
+      "gen": 1
+    },
+    "bins": {
+      "value": {
+        "bytes": 2048,
+        "sha256": "18ffc23f5abb67f11881cd8fee4880ce4cb459a7d9ad0d4caf6b43928519947c"
+      }
+    }
+  },
+  {
+    "key": 999,
+    "metadata": {
+      "ttl": 4294967295,
+      "gen": 1
+    },
+    "bins": {
+      "value": {
+        "bytes": 2048,
+        "sha256": "94623b248e1d5bdfe4ae76ece0356d548e68ba1c57f84cc67b60a7a4d841158c"
+      }
+    }
+  },
+  {
+    "key": 99999,
+    "metadata": {
+      "ttl": 4294967295,
+      "gen": 1
+    },
+    "bins": {
+      "value": {
+        "bytes": 2048,
+        "sha256": "7ddd92546e5595b5820914cd8bb8e75b2e138c22041fb19e61d934fece2834ee"
+      }
+    }
+  },
+  {
+    "key": 1234567,
+    "metadata": {
+      "ttl": 4294967295,
+      "gen": 1
+    },
+    "bins": {
+      "value": {
+        "bytes": 2048,
+        "sha256": "cab9a6a15f6f828d117b5a337ebba296f8b89db2e2f23a6e411a47a8b917cdff"
+      }
+    }
+  },
+  {
+    "key": 5000000,
+    "metadata": {
+      "ttl": 4294967295,
+      "gen": 1
+    },
+    "bins": {
+      "value": {
+        "bytes": 2048,
+        "sha256": "a57d13c707057f1d7bb5ce9440741023b6d3d7fbb06dda70eb680afe8a7b3ded"
+      }
+    }
+  },
+  {
+    "key": 9999999,
+    "metadata": {
+      "ttl": 4294967295,
+      "gen": 1
+    },
+    "bins": {
+      "value": {
+        "bytes": 2048,
+        "sha256": "a795635f27d9941be3789d1bf9b2ffabc5ec846553538b9dd51d2e8643107499"
+      }
+    }
+  }
+]

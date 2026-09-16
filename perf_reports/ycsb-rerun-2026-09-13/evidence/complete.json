@@ -1,0 +1,10 @@
+{
+  "utc": "2026-09-16T04:39:37Z",
+  "complete": 16,
+  "phases": 32,
+  "host_restored": true,
+  "aerospike_final_records": 108328377,
+  "keylane_final_records": 109699918,
+  "aerospike_default_service_running": true,
+  "keylane_stopped": true
+}

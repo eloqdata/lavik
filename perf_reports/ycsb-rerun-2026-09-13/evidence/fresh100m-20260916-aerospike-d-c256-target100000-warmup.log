@@ -1,0 +1,77 @@
+java -cp /mnt/dev/YCSB-aerospike-dist/aerospike-binding/conf:/mnt/dev/YCSB-aerospike-dist/conf:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-client-3.1.2.jar:/mnt/dev/YCSB-aerospike-dist/lib/htrace-core4-4.1.0-incubating.jar:/mnt/dev/YCSB-aerospike-dist/lib/jbcrypt-0.3m.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-mapper-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/aerospike-binding-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/HdrHistogram-2.1.12.jar:/mnt/dev/YCSB-aerospike-dist/lib/jackson-core-asl-1.9.4.jar:/mnt/dev/YCSB-aerospike-dist/lib/core-0.18.0-SNAPSHOT.jar:/mnt/dev/YCSB-aerospike-dist/lib/luaj-jse-3.0.jar:/mnt/dev/YCSB-aerospike-dist/lib/gnu-crypto-2.0.1.jar site.ycsb.Client -db site.ycsb.db.AerospikeClient -s -threads 256 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -target 100000 -p recordcount=2000000000 -p operationcount=1000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.95 -p updateproportion=0 -p insertproportion=0.05 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=both -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p insertstart=0 -p insertcount=100000000 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000 -t
+Command line: -db site.ycsb.db.AerospikeClient -s -threads 256 -P /mnt/dev/YCSB-aerospike-dist/workloads/workloada -target 100000 -p recordcount=2000000000 -p operationcount=1000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.95 -p updateproportion=0 -p insertproportion=0.05 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=both -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p insertstart=0 -p insertcount=100000000 -p as.host=172.16.0.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000 -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+2026-09-16 03:37:07:617 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-09-16 03:37:17:537 10 sec: 973133 operations; 97313.3 current ops/sec; est completion in 1 second [READ: Count=924278, Max=54911, Min=157, Avg=294.34, 50=282, 90=343, 99=442, 99.9=1002, 99.99=16207] [INSERT: Count=48944, Max=29567, Min=153, Avg=224.94, 50=212, 90=277, 99=382, 99.9=948, 99.99=4959] [Intended-READ: Count=924878, Max=136447, Min=186, Avg=465.89, 50=341, 90=404, 99=556, 99.9=40127, 99.99=106815] [Intended-INSERT: Count=48966, Max=113791, Min=174, Avg=387.71, 50=272, 90=338, 99=484, 99.9=37311, 99.99=104639] 
+2026-09-16 03:37:17:849 10 sec: 1000000 operations; 86389.07 current ops/sec; [READ: Count=25472, Max=925, Min=173, Avg=286.59, 50=280, 90=332, 99=412, 99.9=486, 99.99=625] [CLEANUP: Count=256, Max=485, Min=19, Avg=43.23, 50=35, 90=60, 99=209, 99.9=485, 99.99=485] [INSERT: Count=1306, Max=428, Min=152, Avg=217.01, 50=211, 90=262, 99=339, 99.9=411, 99.99=428] [Intended-READ: Count=24872, Max=988, Min=232, Avg=345.01, 50=339, 90=392, 99=475, 99.9=558, 99.99=697] [Intended-CLEANUP: Count=256, Max=486, Min=19, Avg=43.43, 50=35, 90=60, 99=209, 99.9=486, 99.99=486] [Intended-INSERT: Count=1284, Max=488, Min=184, Avg=275.04, 50=269, 90=323, 99=398, 99.9=487, 99.99=488] 
+[OVERALL], RunTime(ms), 10311
+[OVERALL], Throughput(ops/sec), 96983.8037047813
+[TOTAL_GCS_G1_Young_Generation], Count, 16
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 23
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.223062748520997
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 16
+[TOTAL_GC_TIME], Time(ms), 23
+[TOTAL_GC_TIME_%], Time(%), 0.223062748520997
+[READ], Operations, 949750
+[READ], AverageLatency(us), 294.13064280073706
+[READ], MinLatency(us), 157
+[READ], MaxLatency(us), 54911
+[READ], 50thPercentileLatency(us), 281
+[READ], 95thPercentileLatency(us), 370
+[READ], 99thPercentileLatency(us), 441
+[READ], 99.9PercentileLatency(us), 972
+[READ], 99.99PercentileLatency(us), 16151
+[READ], Return=OK, 949750
+[CLEANUP], Operations, 256
+[CLEANUP], AverageLatency(us), 43.2265625
+[CLEANUP], MinLatency(us), 19
+[CLEANUP], MaxLatency(us), 485
+[CLEANUP], 50thPercentileLatency(us), 35
+[CLEANUP], 95thPercentileLatency(us), 75
+[CLEANUP], 99thPercentileLatency(us), 209
+[CLEANUP], 99.9PercentileLatency(us), 485
+[CLEANUP], 99.99PercentileLatency(us), 485
+[INSERT], Operations, 50250
+[INSERT], AverageLatency(us), 224.73806965174128
+[INSERT], MinLatency(us), 152
+[INSERT], MaxLatency(us), 29567
+[INSERT], 50thPercentileLatency(us), 212
+[INSERT], 95thPercentileLatency(us), 306
+[INSERT], 99thPercentileLatency(us), 380
+[INSERT], 99.9PercentileLatency(us), 921
+[INSERT], 99.99PercentileLatency(us), 4627
+[INSERT], Return=OK, 50250
+[Intended-READ], Operations, 949750
+[Intended-READ], AverageLatency(us), 462.7287780994999
+[Intended-READ], MinLatency(us), 186
+[Intended-READ], MaxLatency(us), 136447
+[Intended-READ], 50thPercentileLatency(us), 341
+[Intended-READ], 95thPercentileLatency(us), 434
+[Intended-READ], 99thPercentileLatency(us), 550
+[Intended-READ], 99.9PercentileLatency(us), 38847
+[Intended-READ], 99.99PercentileLatency(us), 106687
+[Intended-CLEANUP], Operations, 256
+[Intended-CLEANUP], AverageLatency(us), 43.4296875
+[Intended-CLEANUP], MinLatency(us), 19
+[Intended-CLEANUP], MaxLatency(us), 486
+[Intended-CLEANUP], 50thPercentileLatency(us), 35
+[Intended-CLEANUP], 95thPercentileLatency(us), 75
+[Intended-CLEANUP], 99thPercentileLatency(us), 209
+[Intended-CLEANUP], 99.9PercentileLatency(us), 486
+[Intended-CLEANUP], 99.99PercentileLatency(us), 486
+[Intended-INSERT], Operations, 50250
+[Intended-INSERT], AverageLatency(us), 384.83092537313433
+[Intended-INSERT], MinLatency(us), 174
+[Intended-INSERT], MaxLatency(us), 113791
+[Intended-INSERT], 50thPercentileLatency(us), 272
+[Intended-INSERT], 95thPercentileLatency(us), 369
+[Intended-INSERT], 99thPercentileLatency(us), 481
+[Intended-INSERT], 99.9PercentileLatency(us), 36191
+[Intended-INSERT], 99.99PercentileLatency(us), 104447

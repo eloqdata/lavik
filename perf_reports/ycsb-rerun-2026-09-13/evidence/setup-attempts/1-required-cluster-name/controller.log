@@ -1,0 +1,21 @@
+Traceback (most recent call last):
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/runner.py", line 403, in <module>
+    main()
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/runner.py", line 317, in main
+    no_client()
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/runner.py", line 101, in no_client
+    assert result.returncode == 1, result.stdout + result.stderr
+           ^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Host key verification failed.
+
+{"utc": "2026-09-16T02:59:37Z", "state": "starting-load", "mode": "aerospike", "complete": 0, "total": 16}
+{"utc": "2026-09-16T02:59:40Z", "state": "failed", "complete": 0, "total": 16}
+Traceback (most recent call last):
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/runner.py", line 403, in <module>
+    main()
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/runner.py", line 338, in main
+    start(mode, 'load')
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/runner.py", line 191, in start
+    assert unit_state in ('active', 'activating'), (mode, unit_state)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ('aerospike', 'inactive')

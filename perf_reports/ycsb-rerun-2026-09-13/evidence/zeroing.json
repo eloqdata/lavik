@@ -1,0 +1,36 @@
+[
+  {
+    "device": "/dev/md127p3",
+    "bytes": 1099494850560,
+    "argv": [
+      "dd",
+      "if=/dev/zero",
+      "of=/dev/md127p3",
+      "bs=16M",
+      "count=65535",
+      "oflag=direct",
+      "conv=fdatasync",
+      "status=progress"
+    ],
+    "start_epoch": 1789526999.3466017,
+    "end_epoch": 1789527250.2719672,
+    "exit_code": 0
+  },
+  {
+    "device": "/dev/md127p4",
+    "bytes": 1099494850560,
+    "argv": [
+      "dd",
+      "if=/dev/zero",
+      "of=/dev/md127p4",
+      "bs=16M",
+      "count=65535",
+      "oflag=direct",
+      "conv=fdatasync",
+      "status=progress"
+    ],
+    "start_epoch": 1789527250.2889693,
+    "end_epoch": 1789527501.2315032,
+    "exit_code": 0
+  }
+]

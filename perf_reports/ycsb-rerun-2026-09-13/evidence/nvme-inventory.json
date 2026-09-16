@@ -1,0 +1,464 @@
+{
+   "blockdevices": [
+      {
+         "name": "nvme0n1",
+         "path": "/dev/nvme0n1",
+         "size": 549755813888,
+         "model": "MSFT NVMe Accelerator v1.0",
+         "serial": "SN: 00000",
+         "type": "disk",
+         "mountpoints": [
+             "/mnt/dev"
+         ]
+      },{
+         "name": "nvme0n2",
+         "path": "/dev/nvme0n2",
+         "size": 32213303296,
+         "model": "MSFT NVMe Accelerator v1.0",
+         "serial": "SN: 00000",
+         "type": "disk",
+         "mountpoints": [
+             null
+         ],
+         "children": [
+            {
+               "name": "nvme0n2p1",
+               "path": "/dev/nvme0n2p1",
+               "size": 31138496000,
+               "model": null,
+               "serial": null,
+               "type": "part",
+               "mountpoints": [
+                   "/"
+               ]
+            },{
+               "name": "nvme0n2p14",
+               "path": "/dev/nvme0n2p14",
+               "size": 4194304,
+               "model": null,
+               "serial": null,
+               "type": "part",
+               "mountpoints": [
+                   null
+               ]
+            },{
+               "name": "nvme0n2p15",
+               "path": "/dev/nvme0n2p15",
+               "size": 111149056,
+               "model": null,
+               "serial": null,
+               "type": "part",
+               "mountpoints": [
+                   "/boot/efi"
+               ]
+            },{
+               "name": "nvme0n2p16",
+               "path": "/dev/nvme0n2p16",
+               "size": 957350400,
+               "model": null,
+               "serial": null,
+               "type": "part",
+               "mountpoints": [
+                   "/boot"
+               ]
+            }
+         ]
+      },{
+         "name": "nvme1n1",
+         "path": "/dev/nvme1n1",
+         "size": 1919850381312,
+         "model": "Microsoft NVMe Direct Disk v2",
+         "serial": "41dec024a53e1c440001",
+         "type": "disk",
+         "mountpoints": [
+             null
+         ],
+         "children": [
+            {
+               "name": "md127",
+               "path": "/dev/md127",
+               "size": 11518290690048,
+               "model": null,
+               "serial": null,
+               "type": "raid0",
+               "mountpoints": [
+                   null
+               ],
+               "children": [
+                  {
+                     "name": "md127p1",
+                     "path": "/dev/md127p1",
+                     "size": 137438953472,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p2",
+                     "path": "/dev/md127p2",
+                     "size": 2199023255552,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p3",
+                     "path": "/dev/md127p3",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p4",
+                     "path": "/dev/md127p4",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "nvme2n1",
+         "path": "/dev/nvme2n1",
+         "size": 1919850381312,
+         "model": "Microsoft NVMe Direct Disk v2",
+         "serial": "41dec024a53e1c440003",
+         "type": "disk",
+         "mountpoints": [
+             null
+         ],
+         "children": [
+            {
+               "name": "md127",
+               "path": "/dev/md127",
+               "size": 11518290690048,
+               "model": null,
+               "serial": null,
+               "type": "raid0",
+               "mountpoints": [
+                   null
+               ],
+               "children": [
+                  {
+                     "name": "md127p1",
+                     "path": "/dev/md127p1",
+                     "size": 137438953472,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p2",
+                     "path": "/dev/md127p2",
+                     "size": 2199023255552,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p3",
+                     "path": "/dev/md127p3",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p4",
+                     "path": "/dev/md127p4",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "nvme3n1",
+         "path": "/dev/nvme3n1",
+         "size": 1919850381312,
+         "model": "Microsoft NVMe Direct Disk v2",
+         "serial": "41dec024a53e1c440002",
+         "type": "disk",
+         "mountpoints": [
+             null
+         ],
+         "children": [
+            {
+               "name": "md127",
+               "path": "/dev/md127",
+               "size": 11518290690048,
+               "model": null,
+               "serial": null,
+               "type": "raid0",
+               "mountpoints": [
+                   null
+               ],
+               "children": [
+                  {
+                     "name": "md127p1",
+                     "path": "/dev/md127p1",
+                     "size": 137438953472,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p2",
+                     "path": "/dev/md127p2",
+                     "size": 2199023255552,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p3",
+                     "path": "/dev/md127p3",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p4",
+                     "path": "/dev/md127p4",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "nvme4n1",
+         "path": "/dev/nvme4n1",
+         "size": 1919850381312,
+         "model": "Microsoft NVMe Direct Disk v2",
+         "serial": "41dec024a53e1c440004",
+         "type": "disk",
+         "mountpoints": [
+             null
+         ],
+         "children": [
+            {
+               "name": "md127",
+               "path": "/dev/md127",
+               "size": 11518290690048,
+               "model": null,
+               "serial": null,
+               "type": "raid0",
+               "mountpoints": [
+                   null
+               ],
+               "children": [
+                  {
+                     "name": "md127p1",
+                     "path": "/dev/md127p1",
+                     "size": 137438953472,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p2",
+                     "path": "/dev/md127p2",
+                     "size": 2199023255552,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p3",
+                     "path": "/dev/md127p3",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p4",
+                     "path": "/dev/md127p4",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "nvme5n1",
+         "path": "/dev/nvme5n1",
+         "size": 1919850381312,
+         "model": "Microsoft NVMe Direct Disk v2",
+         "serial": "41dec024a53e1c440006",
+         "type": "disk",
+         "mountpoints": [
+             null
+         ],
+         "children": [
+            {
+               "name": "md127",
+               "path": "/dev/md127",
+               "size": 11518290690048,
+               "model": null,
+               "serial": null,
+               "type": "raid0",
+               "mountpoints": [
+                   null
+               ],
+               "children": [
+                  {
+                     "name": "md127p1",
+                     "path": "/dev/md127p1",
+                     "size": 137438953472,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p2",
+                     "path": "/dev/md127p2",
+                     "size": 2199023255552,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p3",
+                     "path": "/dev/md127p3",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p4",
+                     "path": "/dev/md127p4",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "nvme6n1",
+         "path": "/dev/nvme6n1",
+         "size": 1919850381312,
+         "model": "Microsoft NVMe Direct Disk v2",
+         "serial": "41dec024a53e1c440005",
+         "type": "disk",
+         "mountpoints": [
+             null
+         ],
+         "children": [
+            {
+               "name": "md127",
+               "path": "/dev/md127",
+               "size": 11518290690048,
+               "model": null,
+               "serial": null,
+               "type": "raid0",
+               "mountpoints": [
+                   null
+               ],
+               "children": [
+                  {
+                     "name": "md127p1",
+                     "path": "/dev/md127p1",
+                     "size": 137438953472,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p2",
+                     "path": "/dev/md127p2",
+                     "size": 2199023255552,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p3",
+                     "path": "/dev/md127p3",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  },{
+                     "name": "md127p4",
+                     "path": "/dev/md127p4",
+                     "size": 1099494850560,
+                     "model": null,
+                     "serial": null,
+                     "type": "part",
+                     "mountpoints": [
+                         null
+                     ]
+                  }
+               ]
+            }
+         ]
+      }
+   ]
+}

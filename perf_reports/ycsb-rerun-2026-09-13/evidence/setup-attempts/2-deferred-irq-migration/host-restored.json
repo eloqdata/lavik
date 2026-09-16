@@ -1,0 +1,7100 @@
+{
+  "restored_tids": [
+    1,
+    2,
+    3,
+    15,
+    16,
+    17,
+    111,
+    113,
+    114,
+    115,
+    116,
+    117,
+    121,
+    122,
+    123,
+    127,
+    153,
+    156,
+    157,
+    160,
+    187,
+    202,
+    251,
+    319,
+    325,
+    326,
+    327,
+    328,
+    329,
+    330,
+    322,
+    334,
+    478,
+    497,
+    640,
+    655,
+    686,
+    713,
+    771,
+    817,
+    822,
+    825,
+    913,
+    914,
+    916,
+    831,
+    839,
+    852,
+    853,
+    855,
+    932,
+    1040,
+    841,
+    876,
+    963,
+    889,
+    978,
+    979,
+    980,
+    897,
+    905,
+    984,
+    991,
+    992,
+    996,
+    987,
+    1001,
+    1008,
+    1071,
+    1117,
+    1118,
+    1119,
+    1120,
+    1121,
+    1137,
+    1402,
+    1403,
+    1479,
+    1480,
+    1481,
+    1497,
+    1498,
+    1499,
+    1500,
+    1501,
+    1502,
+    1503,
+    1504,
+    1505,
+    1506,
+    1507,
+    1508,
+    1509,
+    1510,
+    1511,
+    1512,
+    1513,
+    1514,
+    1572,
+    1573,
+    1574,
+    1580,
+    1697,
+    1762,
+    1766,
+    214374,
+    214560,
+    215697,
+    215926,
+    216130,
+    217581,
+    217748,
+    3099,
+    3102,
+    3103,
+    3104,
+    3105,
+    3106,
+    3107,
+    3108,
+    3109,
+    3110,
+    3111,
+    3112,
+    3113,
+    3114,
+    3115,
+    3116,
+    217677,
+    25743,
+    180301,
+    180302,
+    180303,
+    180304,
+    206944,
+    207062,
+    207065,
+    207125,
+    211087,
+    217730,
+    217854
+  ],
+  "skipped": [],
+  "after": {
+    "utc": "2026-09-16T03:47:35Z",
+    "boot_id": "27962773-1d7c-46ed-9966-577bb4fce389",
+    "units": {
+      "system.slice": "",
+      "user.slice": "",
+      "init.scope": ""
+    },
+    "workqueue": "ffff",
+    "irqbalance": "inactive",
+    "irqbalance_enabled": "not-found",
+    "irqs": {
+      "143": {
+        "name": "mlx5_async0@pci:0cba:00:02.0",
+        "configured": "0-15",
+        "effective": "8"
+      },
+      "144": {
+        "name": "mlx5_comp0@pci:0cba:00:02.0",
+        "configured": "0",
+        "effective": "0"
+      },
+      "145": {
+        "name": "mlx5_async0@pci:1641:00:02.0",
+        "configured": "0-15",
+        "effective": "10"
+      },
+      "146": {
+        "name": "mlx5_comp0@pci:1641:00:02.0",
+        "configured": "0",
+        "effective": "0"
+      },
+      "147": {
+        "name": "mlx5_comp1@pci:0cba:00:02.0",
+        "configured": "1",
+        "effective": "1"
+      },
+      "148": {
+        "name": "mlx5_comp2@pci:0cba:00:02.0",
+        "configured": "2",
+        "effective": "2"
+      },
+      "149": {
+        "name": "mlx5_comp3@pci:0cba:00:02.0",
+        "configured": "3",
+        "effective": "3"
+      },
+      "150": {
+        "name": "mlx5_comp4@pci:0cba:00:02.0",
+        "configured": "4",
+        "effective": "4"
+      },
+      "151": {
+        "name": "mlx5_comp5@pci:0cba:00:02.0",
+        "configured": "5",
+        "effective": "5"
+      },
+      "152": {
+        "name": "mlx5_comp6@pci:0cba:00:02.0",
+        "configured": "6",
+        "effective": "6"
+      },
+      "153": {
+        "name": "mlx5_comp7@pci:0cba:00:02.0",
+        "configured": "7",
+        "effective": "7"
+      },
+      "154": {
+        "name": "mlx5_comp8@pci:0cba:00:02.0",
+        "configured": "8",
+        "effective": "8"
+      },
+      "155": {
+        "name": "mlx5_comp9@pci:0cba:00:02.0",
+        "configured": "9",
+        "effective": "9"
+      },
+      "156": {
+        "name": "mlx5_comp10@pci:0cba:00:02.0",
+        "configured": "10",
+        "effective": "10"
+      },
+      "157": {
+        "name": "mlx5_comp11@pci:0cba:00:02.0",
+        "configured": "11",
+        "effective": "11"
+      },
+      "158": {
+        "name": "mlx5_comp12@pci:0cba:00:02.0",
+        "configured": "12",
+        "effective": "12"
+      },
+      "159": {
+        "name": "mlx5_comp13@pci:0cba:00:02.0",
+        "configured": "13",
+        "effective": "14"
+      },
+      "160": {
+        "name": "mlx5_comp14@pci:0cba:00:02.0",
+        "configured": "14",
+        "effective": "14"
+      },
+      "161": {
+        "name": "mlx5_comp15@pci:0cba:00:02.0",
+        "configured": "15",
+        "effective": "15"
+      },
+      "162": {
+        "name": "mlx5_comp1@pci:1641:00:02.0",
+        "configured": "1",
+        "effective": "1"
+      },
+      "163": {
+        "name": "mlx5_comp2@pci:1641:00:02.0",
+        "configured": "2",
+        "effective": "2"
+      },
+      "164": {
+        "name": "mlx5_comp3@pci:1641:00:02.0",
+        "configured": "3",
+        "effective": "3"
+      },
+      "165": {
+        "name": "mlx5_comp4@pci:1641:00:02.0",
+        "configured": "4",
+        "effective": "4"
+      },
+      "166": {
+        "name": "mlx5_comp5@pci:1641:00:02.0",
+        "configured": "5",
+        "effective": "5"
+      },
+      "167": {
+        "name": "mlx5_comp6@pci:1641:00:02.0",
+        "configured": "6",
+        "effective": "6"
+      },
+      "168": {
+        "name": "mlx5_comp7@pci:1641:00:02.0",
+        "configured": "7",
+        "effective": "7"
+      },
+      "169": {
+        "name": "mlx5_comp8@pci:1641:00:02.0",
+        "configured": "8",
+        "effective": "8"
+      },
+      "170": {
+        "name": "mlx5_comp9@pci:1641:00:02.0",
+        "configured": "9",
+        "effective": "9"
+      },
+      "171": {
+        "name": "mlx5_comp10@pci:1641:00:02.0",
+        "configured": "10",
+        "effective": "10"
+      },
+      "172": {
+        "name": "mlx5_comp11@pci:1641:00:02.0",
+        "configured": "11",
+        "effective": "11"
+      },
+      "173": {
+        "name": "mlx5_comp12@pci:1641:00:02.0",
+        "configured": "12",
+        "effective": "12"
+      },
+      "174": {
+        "name": "mlx5_comp13@pci:1641:00:02.0",
+        "configured": "13",
+        "effective": "13"
+      },
+      "175": {
+        "name": "mlx5_comp14@pci:1641:00:02.0",
+        "configured": "14",
+        "effective": "14"
+      },
+      "176": {
+        "name": "mlx5_comp15@pci:1641:00:02.0",
+        "configured": "15",
+        "effective": "15"
+      }
+    },
+    "queue_masks": {
+      "/sys/class/net/eth0/queues/rx-13/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-9/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-11/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-7/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-5/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-3/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-1/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-14/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-12/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-8/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-10/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-6/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-4/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-2/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-15/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-0/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-6/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-12/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-4/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-10/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-2/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-0/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-9/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-15/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-7/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-13/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-5/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-11/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-3/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-1/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-8/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-14/xps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-13/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-9/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-11/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-7/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-5/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-3/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-1/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-14/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-12/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-8/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-10/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-6/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-4/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-2/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-15/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-0/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/tx-6/xps_cpus": "0040",
+      "/sys/class/net/enP3258s1/queues/tx-12/xps_cpus": "1000",
+      "/sys/class/net/enP3258s1/queues/tx-4/xps_cpus": "0010",
+      "/sys/class/net/enP3258s1/queues/tx-10/xps_cpus": "0400",
+      "/sys/class/net/enP3258s1/queues/tx-2/xps_cpus": "0004",
+      "/sys/class/net/enP3258s1/queues/tx-0/xps_cpus": "0001",
+      "/sys/class/net/enP3258s1/queues/tx-9/xps_cpus": "0200",
+      "/sys/class/net/enP3258s1/queues/tx-15/xps_cpus": "8000",
+      "/sys/class/net/enP3258s1/queues/tx-7/xps_cpus": "0080",
+      "/sys/class/net/enP3258s1/queues/tx-13/xps_cpus": "2000",
+      "/sys/class/net/enP3258s1/queues/tx-5/xps_cpus": "0020",
+      "/sys/class/net/enP3258s1/queues/tx-11/xps_cpus": "0800",
+      "/sys/class/net/enP3258s1/queues/tx-3/xps_cpus": "0008",
+      "/sys/class/net/enP3258s1/queues/tx-1/xps_cpus": "0002",
+      "/sys/class/net/enP3258s1/queues/tx-8/xps_cpus": "0100",
+      "/sys/class/net/enP3258s1/queues/tx-14/xps_cpus": "4000",
+      "/sys/class/net/eth1/queues/rx-13/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-9/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-11/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-7/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-5/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-3/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-1/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-14/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-12/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-8/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-10/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-6/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-4/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-2/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-15/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-0/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-6/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-12/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-4/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-10/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-2/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-0/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-9/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-15/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-7/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-13/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-5/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-11/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-3/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-1/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-8/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-14/xps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-13/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-9/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-11/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-7/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-5/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-3/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-1/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-14/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-12/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-8/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-10/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-6/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-4/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-2/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-15/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-0/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/tx-6/xps_cpus": "0040",
+      "/sys/class/net/enP5697s2/queues/tx-12/xps_cpus": "1000",
+      "/sys/class/net/enP5697s2/queues/tx-4/xps_cpus": "0010",
+      "/sys/class/net/enP5697s2/queues/tx-10/xps_cpus": "0400",
+      "/sys/class/net/enP5697s2/queues/tx-2/xps_cpus": "0004",
+      "/sys/class/net/enP5697s2/queues/tx-0/xps_cpus": "0001",
+      "/sys/class/net/enP5697s2/queues/tx-9/xps_cpus": "0200",
+      "/sys/class/net/enP5697s2/queues/tx-15/xps_cpus": "8000",
+      "/sys/class/net/enP5697s2/queues/tx-7/xps_cpus": "0080",
+      "/sys/class/net/enP5697s2/queues/tx-13/xps_cpus": "2000",
+      "/sys/class/net/enP5697s2/queues/tx-5/xps_cpus": "0020",
+      "/sys/class/net/enP5697s2/queues/tx-11/xps_cpus": "0800",
+      "/sys/class/net/enP5697s2/queues/tx-3/xps_cpus": "0008",
+      "/sys/class/net/enP5697s2/queues/tx-1/xps_cpus": "0002",
+      "/sys/class/net/enP5697s2/queues/tx-8/xps_cpus": "0100",
+      "/sys/class/net/enP5697s2/queues/tx-14/xps_cpus": "4000"
+    },
+    "threads": [
+      {
+        "pid": 1,
+        "tid": 1,
+        "comm": "systemd",
+        "flags": 4194560,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 2,
+        "tid": 2,
+        "comm": "kthreadd",
+        "flags": 2129984,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3,
+        "tid": 3,
+        "comm": "pool_workqueue_release",
+        "flags": 2129984,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 4,
+        "tid": 4,
+        "comm": "kworker/R-rcu_gp",
+        "flags": 69238880,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 5,
+        "tid": 5,
+        "comm": "kworker/R-sync_wq",
+        "flags": 69238880,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 6,
+        "tid": 6,
+        "comm": "kworker/R-kvfree_rcu_reclaim",
+        "flags": 69238880,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 7,
+        "tid": 7,
+        "comm": "kworker/R-slub_flushwq",
+        "flags": 69238880,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 8,
+        "tid": 8,
+        "comm": "kworker/R-netns",
+        "flags": 69238880,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 10,
+        "tid": 10,
+        "comm": "kworker/0:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 62,
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "pid": 13,
+        "tid": 13,
+        "comm": "kworker/R-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 14,
+        "tid": 14,
+        "comm": "ksoftirqd/0",
+        "flags": 69238848,
+        "starttime": 62,
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "pid": 15,
+        "tid": 15,
+        "comm": "rcu_sched",
+        "flags": 2129984,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 16,
+        "tid": 16,
+        "comm": "rcu_exp_par_gp_kthread_worker/0",
+        "flags": 2129984,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 17,
+        "tid": 17,
+        "comm": "rcu_exp_gp_kthread_worker",
+        "flags": 2129984,
+        "starttime": 62,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 18,
+        "tid": 18,
+        "comm": "migration/0",
+        "flags": 69238848,
+        "starttime": 62,
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "pid": 19,
+        "tid": 19,
+        "comm": "idle_inject/0",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "pid": 20,
+        "tid": 20,
+        "comm": "cpuhp/0",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "pid": 21,
+        "tid": 21,
+        "comm": "cpuhp/2",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "pid": 22,
+        "tid": 22,
+        "comm": "idle_inject/2",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "pid": 23,
+        "tid": 23,
+        "comm": "migration/2",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "pid": 24,
+        "tid": 24,
+        "comm": "ksoftirqd/2",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "pid": 26,
+        "tid": 26,
+        "comm": "kworker/2:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "pid": 27,
+        "tid": 27,
+        "comm": "cpuhp/4",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "pid": 28,
+        "tid": 28,
+        "comm": "idle_inject/4",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "pid": 29,
+        "tid": 29,
+        "comm": "migration/4",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "pid": 30,
+        "tid": 30,
+        "comm": "ksoftirqd/4",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "pid": 32,
+        "tid": 32,
+        "comm": "kworker/4:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "pid": 33,
+        "tid": 33,
+        "comm": "cpuhp/6",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "pid": 34,
+        "tid": 34,
+        "comm": "idle_inject/6",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "pid": 35,
+        "tid": 35,
+        "comm": "migration/6",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "pid": 36,
+        "tid": 36,
+        "comm": "ksoftirqd/6",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "pid": 38,
+        "tid": 38,
+        "comm": "kworker/6:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "pid": 39,
+        "tid": 39,
+        "comm": "cpuhp/8",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "pid": 40,
+        "tid": 40,
+        "comm": "idle_inject/8",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "pid": 41,
+        "tid": 41,
+        "comm": "migration/8",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "pid": 42,
+        "tid": 42,
+        "comm": "ksoftirqd/8",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "pid": 44,
+        "tid": 44,
+        "comm": "kworker/8:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "pid": 45,
+        "tid": 45,
+        "comm": "cpuhp/10",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "pid": 46,
+        "tid": 46,
+        "comm": "idle_inject/10",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "pid": 47,
+        "tid": 47,
+        "comm": "migration/10",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "pid": 48,
+        "tid": 48,
+        "comm": "ksoftirqd/10",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "pid": 50,
+        "tid": 50,
+        "comm": "kworker/10:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "pid": 51,
+        "tid": 51,
+        "comm": "cpuhp/12",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          12
+        ]
+      },
+      {
+        "pid": 52,
+        "tid": 52,
+        "comm": "idle_inject/12",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          12
+        ]
+      },
+      {
+        "pid": 53,
+        "tid": 53,
+        "comm": "migration/12",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          12
+        ]
+      },
+      {
+        "pid": 54,
+        "tid": 54,
+        "comm": "ksoftirqd/12",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          12
+        ]
+      },
+      {
+        "pid": 56,
+        "tid": 56,
+        "comm": "kworker/12:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          12
+        ]
+      },
+      {
+        "pid": 57,
+        "tid": 57,
+        "comm": "cpuhp/14",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          14
+        ]
+      },
+      {
+        "pid": 58,
+        "tid": 58,
+        "comm": "idle_inject/14",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          14
+        ]
+      },
+      {
+        "pid": 59,
+        "tid": 59,
+        "comm": "migration/14",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          14
+        ]
+      },
+      {
+        "pid": 60,
+        "tid": 60,
+        "comm": "ksoftirqd/14",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          14
+        ]
+      },
+      {
+        "pid": 62,
+        "tid": 62,
+        "comm": "kworker/14:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          14
+        ]
+      },
+      {
+        "pid": 63,
+        "tid": 63,
+        "comm": "cpuhp/1",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "pid": 64,
+        "tid": 64,
+        "comm": "idle_inject/1",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "pid": 65,
+        "tid": 65,
+        "comm": "migration/1",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "pid": 66,
+        "tid": 66,
+        "comm": "ksoftirqd/1",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "pid": 68,
+        "tid": 68,
+        "comm": "kworker/1:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "pid": 69,
+        "tid": 69,
+        "comm": "cpuhp/3",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "pid": 70,
+        "tid": 70,
+        "comm": "idle_inject/3",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "pid": 71,
+        "tid": 71,
+        "comm": "migration/3",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "pid": 72,
+        "tid": 72,
+        "comm": "ksoftirqd/3",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "pid": 74,
+        "tid": 74,
+        "comm": "kworker/3:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "pid": 75,
+        "tid": 75,
+        "comm": "cpuhp/5",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "pid": 76,
+        "tid": 76,
+        "comm": "idle_inject/5",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "pid": 77,
+        "tid": 77,
+        "comm": "migration/5",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "pid": 78,
+        "tid": 78,
+        "comm": "ksoftirqd/5",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "pid": 80,
+        "tid": 80,
+        "comm": "kworker/5:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "pid": 81,
+        "tid": 81,
+        "comm": "cpuhp/7",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "pid": 82,
+        "tid": 82,
+        "comm": "idle_inject/7",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "pid": 83,
+        "tid": 83,
+        "comm": "migration/7",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "pid": 84,
+        "tid": 84,
+        "comm": "ksoftirqd/7",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "pid": 86,
+        "tid": 86,
+        "comm": "kworker/7:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "pid": 87,
+        "tid": 87,
+        "comm": "cpuhp/9",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "pid": 88,
+        "tid": 88,
+        "comm": "idle_inject/9",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "pid": 89,
+        "tid": 89,
+        "comm": "migration/9",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "pid": 90,
+        "tid": 90,
+        "comm": "ksoftirqd/9",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "pid": 92,
+        "tid": 92,
+        "comm": "kworker/9:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "pid": 93,
+        "tid": 93,
+        "comm": "cpuhp/11",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "pid": 94,
+        "tid": 94,
+        "comm": "idle_inject/11",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "pid": 95,
+        "tid": 95,
+        "comm": "migration/11",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "pid": 96,
+        "tid": 96,
+        "comm": "ksoftirqd/11",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "pid": 98,
+        "tid": 98,
+        "comm": "kworker/11:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "pid": 99,
+        "tid": 99,
+        "comm": "cpuhp/13",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          13
+        ]
+      },
+      {
+        "pid": 100,
+        "tid": 100,
+        "comm": "idle_inject/13",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          13
+        ]
+      },
+      {
+        "pid": 101,
+        "tid": 101,
+        "comm": "migration/13",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          13
+        ]
+      },
+      {
+        "pid": 102,
+        "tid": 102,
+        "comm": "ksoftirqd/13",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          13
+        ]
+      },
+      {
+        "pid": 104,
+        "tid": 104,
+        "comm": "kworker/13:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          13
+        ]
+      },
+      {
+        "pid": 105,
+        "tid": 105,
+        "comm": "cpuhp/15",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          15
+        ]
+      },
+      {
+        "pid": 106,
+        "tid": 106,
+        "comm": "idle_inject/15",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          15
+        ]
+      },
+      {
+        "pid": 107,
+        "tid": 107,
+        "comm": "migration/15",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          15
+        ]
+      },
+      {
+        "pid": 108,
+        "tid": 108,
+        "comm": "ksoftirqd/15",
+        "flags": 69238848,
+        "starttime": 63,
+        "affinity": [
+          15
+        ]
+      },
+      {
+        "pid": 110,
+        "tid": 110,
+        "comm": "kworker/15:0H-events_highpri",
+        "flags": 69238880,
+        "starttime": 63,
+        "affinity": [
+          15
+        ]
+      },
+      {
+        "pid": 111,
+        "tid": 111,
+        "comm": "kdevtmpfs",
+        "flags": 2130240,
+        "starttime": 64,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 112,
+        "tid": 112,
+        "comm": "kworker/R-inet_frag_wq",
+        "flags": 69238880,
+        "starttime": 64,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 113,
+        "tid": 113,
+        "comm": "rcu_tasks_rude_kthread",
+        "flags": 2129984,
+        "starttime": 65,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 114,
+        "tid": 114,
+        "comm": "rcu_tasks_trace_kthread",
+        "flags": 2129984,
+        "starttime": 65,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 115,
+        "tid": 115,
+        "comm": "kauditd",
+        "flags": 2097216,
+        "starttime": 66,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 116,
+        "tid": 116,
+        "comm": "khungtaskd",
+        "flags": 2129984,
+        "starttime": 67,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 117,
+        "tid": 117,
+        "comm": "oom_reaper",
+        "flags": 2097216,
+        "starttime": 67,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 120,
+        "tid": 120,
+        "comm": "kworker/R-writeback",
+        "flags": 69238880,
+        "starttime": 67,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 121,
+        "tid": 121,
+        "comm": "kcompactd0",
+        "flags": 2162752,
+        "starttime": 67,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 122,
+        "tid": 122,
+        "comm": "ksmd",
+        "flags": 2097216,
+        "starttime": 68,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 123,
+        "tid": 123,
+        "comm": "khugepaged",
+        "flags": 2097216,
+        "starttime": 68,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 124,
+        "tid": 124,
+        "comm": "kworker/R-kblockd",
+        "flags": 69238880,
+        "starttime": 68,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 125,
+        "tid": 125,
+        "comm": "kworker/R-blkcg_punt_bio",
+        "flags": 69238880,
+        "starttime": 68,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 126,
+        "tid": 126,
+        "comm": "kworker/R-kintegrityd",
+        "flags": 69238880,
+        "starttime": 68,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 127,
+        "tid": 127,
+        "comm": "irq/9-acpi",
+        "flags": 2129984,
+        "starttime": 72,
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "pid": 143,
+        "tid": 143,
+        "comm": "kworker/R-tpm_dev_wq",
+        "flags": 69238880,
+        "starttime": 73,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 144,
+        "tid": 144,
+        "comm": "kworker/R-ata_sff",
+        "flags": 69238880,
+        "starttime": 73,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 145,
+        "tid": 145,
+        "comm": "kworker/R-md",
+        "flags": 69238880,
+        "starttime": 74,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 146,
+        "tid": 146,
+        "comm": "kworker/R-md_bitmap",
+        "flags": 69238880,
+        "starttime": 74,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 147,
+        "tid": 147,
+        "comm": "kworker/R-edac-poller",
+        "flags": 69238880,
+        "starttime": 74,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 148,
+        "tid": 148,
+        "comm": "kworker/R-hv_vmbus_con",
+        "flags": 69238880,
+        "starttime": 74,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 149,
+        "tid": 149,
+        "comm": "kworker/R-hv_vmbus_rescind",
+        "flags": 69238880,
+        "starttime": 74,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 150,
+        "tid": 150,
+        "comm": "kworker/R-hv_pri_chan",
+        "flags": 69238880,
+        "starttime": 74,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 151,
+        "tid": 151,
+        "comm": "kworker/R-hv_sub_chan",
+        "flags": 69238880,
+        "starttime": 74,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 152,
+        "tid": 152,
+        "comm": "kworker/R-devfreq_wq",
+        "flags": 69238880,
+        "starttime": 75,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 153,
+        "tid": 153,
+        "comm": "watchdogd",
+        "flags": 2129984,
+        "starttime": 78,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 154,
+        "tid": 154,
+        "comm": "kworker/R-quota_events_unbound",
+        "flags": 69238880,
+        "starttime": 78,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 155,
+        "tid": 155,
+        "comm": "kworker/0:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 82,
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "pid": 156,
+        "tid": 156,
+        "comm": "kswapd0",
+        "flags": 2230336,
+        "starttime": 89,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 157,
+        "tid": 157,
+        "comm": "ecryptfs-kthread",
+        "flags": 2097216,
+        "starttime": 90,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 158,
+        "tid": 158,
+        "comm": "kworker/R-kthrotld",
+        "flags": 69238880,
+        "starttime": 92,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 159,
+        "tid": 159,
+        "comm": "kworker/R-nfit",
+        "flags": 69238880,
+        "starttime": 163,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 160,
+        "tid": 160,
+        "comm": "scsi_eh_0",
+        "flags": 2129984,
+        "starttime": 173,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 161,
+        "tid": 161,
+        "comm": "kworker/R-scsi_tmf_0",
+        "flags": 69238880,
+        "starttime": 173,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 163,
+        "tid": 163,
+        "comm": "kworker/R-nvme-wq",
+        "flags": 69238880,
+        "starttime": 174,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 164,
+        "tid": 164,
+        "comm": "kworker/R-nvme-reset-wq",
+        "flags": 69238880,
+        "starttime": 174,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 165,
+        "tid": 165,
+        "comm": "kworker/R-nvme-delete-wq",
+        "flags": 69238880,
+        "starttime": 174,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 166,
+        "tid": 166,
+        "comm": "kworker/R-nvme-auth-wq",
+        "flags": 69238880,
+        "starttime": 174,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 182,
+        "tid": 182,
+        "comm": "kworker/R-mld",
+        "flags": 69238880,
+        "starttime": 192,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 184,
+        "tid": 184,
+        "comm": "kworker/6:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 192,
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "pid": 185,
+        "tid": 185,
+        "comm": "kworker/R-ipv6_addrconf",
+        "flags": 69238880,
+        "starttime": 192,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 187,
+        "tid": 187,
+        "comm": "hv_balloon",
+        "flags": 2129984,
+        "starttime": 193,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 188,
+        "tid": 188,
+        "comm": "kworker/R-kstrp",
+        "flags": 69238880,
+        "starttime": 194,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 202,
+        "tid": 202,
+        "comm": "jbd2/nvme0n2p1-8",
+        "flags": 2359360,
+        "starttime": 278,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 203,
+        "tid": 203,
+        "comm": "kworker/R-ext4-rsv-conversion",
+        "flags": 69238880,
+        "starttime": 278,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 204,
+        "tid": 204,
+        "comm": "kworker/7:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 287,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "pid": 207,
+        "tid": 207,
+        "comm": "kworker/5:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 289,
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "pid": 208,
+        "tid": 208,
+        "comm": "kworker/1:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 291,
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "pid": 232,
+        "tid": 232,
+        "comm": "kworker/13:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 293,
+        "affinity": [
+          13
+        ]
+      },
+      {
+        "pid": 239,
+        "tid": 239,
+        "comm": "kworker/2:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 294,
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "pid": 243,
+        "tid": 243,
+        "comm": "kworker/8:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 318,
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "pid": 246,
+        "tid": 246,
+        "comm": "kworker/10:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 329,
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "pid": 249,
+        "tid": 249,
+        "comm": "kworker/15:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 330,
+        "affinity": [
+          15
+        ]
+      },
+      {
+        "pid": 251,
+        "tid": 251,
+        "comm": "systemd-journal",
+        "flags": 4194560,
+        "starttime": 331,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 266,
+        "tid": 266,
+        "comm": "kworker/4:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 334,
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "pid": 269,
+        "tid": 269,
+        "comm": "kworker/12:1H-events_highpri",
+        "flags": 69238880,
+        "starttime": 335,
+        "affinity": [
+          12
+        ]
+      },
+      {
+        "pid": 276,
+        "tid": 276,
+        "comm": "kworker/R-kmpathd",
+        "flags": 69238880,
+        "starttime": 337,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 277,
+        "tid": 277,
+        "comm": "kworker/R-kmpath_handlerd",
+        "flags": 69238880,
+        "starttime": 337,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 319,
+        "tid": 319,
+        "comm": "multipathd",
+        "flags": 4194560,
+        "starttime": 357,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 319,
+        "tid": 325,
+        "comm": "multipathd",
+        "flags": 4194624,
+        "starttime": 359,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 319,
+        "tid": 326,
+        "comm": "multipathd",
+        "flags": 4194624,
+        "starttime": 359,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 319,
+        "tid": 327,
+        "comm": "multipathd",
+        "flags": 4194624,
+        "starttime": 359,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 319,
+        "tid": 328,
+        "comm": "multipathd",
+        "flags": 4194624,
+        "starttime": 359,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 319,
+        "tid": 329,
+        "comm": "multipathd",
+        "flags": 4194624,
+        "starttime": 359,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 319,
+        "tid": 330,
+        "comm": "multipathd",
+        "flags": 4194624,
+        "starttime": 359,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 322,
+        "tid": 322,
+        "comm": "systemd-udevd",
+        "flags": 4194560,
+        "starttime": 357,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 334,
+        "tid": 334,
+        "comm": "psimon",
+        "flags": 2129984,
+        "starttime": 364,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 341,
+        "tid": 341,
+        "comm": "kworker/14:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 364,
+        "affinity": [
+          14
+        ]
+      },
+      {
+        "pid": 345,
+        "tid": 345,
+        "comm": "kworker/9:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 364,
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "pid": 348,
+        "tid": 348,
+        "comm": "kworker/11:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 365,
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "pid": 355,
+        "tid": 355,
+        "comm": "kworker/3:1H-kblockd",
+        "flags": 69238880,
+        "starttime": 365,
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "pid": 478,
+        "tid": 478,
+        "comm": "hv_kvp_daemon",
+        "flags": 4194560,
+        "starttime": 382,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 481,
+        "tid": 481,
+        "comm": "kworker/R-tls-strp",
+        "flags": 69238880,
+        "starttime": 387,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 497,
+        "tid": 497,
+        "comm": "jbd2/nvme0n2p16-8",
+        "flags": 2359360,
+        "starttime": 391,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 498,
+        "tid": 498,
+        "comm": "kworker/R-ext4-rsv-conversion",
+        "flags": 69238880,
+        "starttime": 391,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 640,
+        "tid": 640,
+        "comm": "systemd-resolve",
+        "flags": 4194560,
+        "starttime": 398,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 655,
+        "tid": 655,
+        "comm": "jbd2/nvme0n1-8",
+        "flags": 2359360,
+        "starttime": 405,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 656,
+        "tid": 656,
+        "comm": "kworker/R-ext4-rsv-conversion",
+        "flags": 69238880,
+        "starttime": 405,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 658,
+        "tid": 658,
+        "comm": "kworker/R-mlx5_cmd_0cba:00:02.0",
+        "flags": 69238880,
+        "starttime": 407,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 659,
+        "tid": 659,
+        "comm": "kworker/R-mlx5_health0cba:00:02.0",
+        "flags": 69238880,
+        "starttime": 407,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 660,
+        "tid": 660,
+        "comm": "kworker/R-mlx5_page_allocator",
+        "flags": 69238880,
+        "starttime": 407,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 661,
+        "tid": 661,
+        "comm": "kworker/R-mlx5_events",
+        "flags": 69238880,
+        "starttime": 407,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 686,
+        "tid": 686,
+        "comm": "ptp1",
+        "flags": 2129984,
+        "starttime": 418,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 687,
+        "tid": 687,
+        "comm": "kworker/R-mlx5_fc",
+        "flags": 69238880,
+        "starttime": 418,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 688,
+        "tid": 688,
+        "comm": "kworker/R-mlx5_hv_vhca",
+        "flags": 69238880,
+        "starttime": 418,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 689,
+        "tid": 689,
+        "comm": "kworker/R-mlx5e",
+        "flags": 69238880,
+        "starttime": 419,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 690,
+        "tid": 690,
+        "comm": "kworker/R-mlx5e_arfs",
+        "flags": 69238880,
+        "starttime": 421,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 691,
+        "tid": 691,
+        "comm": "kworker/R-mlx5_cmd_1641:00:02.0",
+        "flags": 69238880,
+        "starttime": 425,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 692,
+        "tid": 692,
+        "comm": "kworker/R-mlx5_health1641:00:02.0",
+        "flags": 69238880,
+        "starttime": 425,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 693,
+        "tid": 693,
+        "comm": "kworker/R-mlx5_page_allocator",
+        "flags": 69238880,
+        "starttime": 425,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 694,
+        "tid": 694,
+        "comm": "kworker/R-mlx5_events",
+        "flags": 69238880,
+        "starttime": 425,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 713,
+        "tid": 713,
+        "comm": "ptp2",
+        "flags": 2129984,
+        "starttime": 436,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 714,
+        "tid": 714,
+        "comm": "kworker/R-mlx5_fc",
+        "flags": 69238880,
+        "starttime": 436,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 715,
+        "tid": 715,
+        "comm": "kworker/R-mlx5_hv_vhca",
+        "flags": 69238880,
+        "starttime": 436,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 719,
+        "tid": 719,
+        "comm": "kworker/R-mlx5e",
+        "flags": 69238880,
+        "starttime": 437,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 720,
+        "tid": 720,
+        "comm": "kworker/R-mlx5e_arfs",
+        "flags": 69238880,
+        "starttime": 439,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 728,
+        "tid": 728,
+        "comm": "kworker/R-ib-comp-wq",
+        "flags": 69238880,
+        "starttime": 445,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 729,
+        "tid": 729,
+        "comm": "kworker/R-ib-comp-unb-wq",
+        "flags": 69238880,
+        "starttime": 445,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 730,
+        "tid": 730,
+        "comm": "kworker/R-ib_mcast",
+        "flags": 69238880,
+        "starttime": 445,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 731,
+        "tid": 731,
+        "comm": "kworker/R-ib_nl_sa_wq",
+        "flags": 69238880,
+        "starttime": 445,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 732,
+        "tid": 732,
+        "comm": "kworker/R-mkey_cache",
+        "flags": 69238880,
+        "starttime": 447,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 733,
+        "tid": 733,
+        "comm": "kworker/R-mkey_cache",
+        "flags": 69238880,
+        "starttime": 447,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 771,
+        "tid": 771,
+        "comm": "systemd-network",
+        "flags": 4194560,
+        "starttime": 611,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 817,
+        "tid": 817,
+        "comm": "dbus-daemon",
+        "flags": 4194560,
+        "starttime": 664,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 822,
+        "tid": 822,
+        "comm": "networkd-dispat",
+        "flags": 4194560,
+        "starttime": 666,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 825,
+        "tid": 825,
+        "comm": "polkitd",
+        "flags": 4194560,
+        "starttime": 666,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 825,
+        "tid": 913,
+        "comm": "gmain",
+        "flags": 4194368,
+        "starttime": 675,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 825,
+        "tid": 914,
+        "comm": "pool-spawner",
+        "flags": 4194368,
+        "starttime": 675,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 825,
+        "tid": 916,
+        "comm": "gdbus",
+        "flags": 4194368,
+        "starttime": 675,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 831,
+        "tid": 831,
+        "comm": "systemd-logind",
+        "flags": 4194560,
+        "starttime": 668,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 839,
+        "tid": 839,
+        "comm": "udisksd",
+        "flags": 4194560,
+        "starttime": 669,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 839,
+        "tid": 852,
+        "comm": "gmain",
+        "flags": 4194368,
+        "starttime": 670,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 839,
+        "tid": 853,
+        "comm": "pool-spawner",
+        "flags": 4194368,
+        "starttime": 670,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 839,
+        "tid": 855,
+        "comm": "gdbus",
+        "flags": 4194368,
+        "starttime": 670,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 839,
+        "tid": 932,
+        "comm": "probing-thread",
+        "flags": 4194368,
+        "starttime": 676,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 839,
+        "tid": 1040,
+        "comm": "cleanup",
+        "flags": 4194368,
+        "starttime": 731,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 841,
+        "tid": 841,
+        "comm": "python3",
+        "flags": 4194560,
+        "starttime": 669,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 876,
+        "tid": 876,
+        "comm": "unattended-upgr",
+        "flags": 4194560,
+        "starttime": 673,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 876,
+        "tid": 963,
+        "comm": "gmain",
+        "flags": 4194368,
+        "starttime": 678,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 889,
+        "tid": 889,
+        "comm": "rsyslogd",
+        "flags": 4194560,
+        "starttime": 673,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 889,
+        "tid": 978,
+        "comm": "in:imuxsock",
+        "flags": 4194368,
+        "starttime": 680,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 889,
+        "tid": 979,
+        "comm": "in:imklog",
+        "flags": 4194368,
+        "starttime": 680,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 889,
+        "tid": 980,
+        "comm": "rs:main Q:Reg",
+        "flags": 4194368,
+        "starttime": 680,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 897,
+        "tid": 897,
+        "comm": "chronyd",
+        "flags": 4194624,
+        "starttime": 674,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 905,
+        "tid": 905,
+        "comm": "chronyd",
+        "flags": 4194368,
+        "starttime": 675,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 984,
+        "tid": 984,
+        "comm": "ModemManager",
+        "flags": 4194560,
+        "starttime": 680,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 984,
+        "tid": 991,
+        "comm": "gmain",
+        "flags": 4194368,
+        "starttime": 683,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 984,
+        "tid": 992,
+        "comm": "pool-spawner",
+        "flags": 4194368,
+        "starttime": 683,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 984,
+        "tid": 996,
+        "comm": "gdbus",
+        "flags": 4194368,
+        "starttime": 683,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 987,
+        "tid": 987,
+        "comm": "cron",
+        "flags": 4194560,
+        "starttime": 682,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1001,
+        "tid": 1001,
+        "comm": "agetty",
+        "flags": 4194560,
+        "starttime": 684,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1008,
+        "tid": 1008,
+        "comm": "agetty",
+        "flags": 4194560,
+        "starttime": 686,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1071,
+        "tid": 1071,
+        "comm": "python3",
+        "flags": 4194560,
+        "starttime": 758,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1071,
+        "tid": 1117,
+        "comm": "python3",
+        "flags": 4194368,
+        "starttime": 825,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1071,
+        "tid": 1118,
+        "comm": "python3",
+        "flags": 4194624,
+        "starttime": 825,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1071,
+        "tid": 1119,
+        "comm": "python3",
+        "flags": 4194368,
+        "starttime": 825,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1071,
+        "tid": 1120,
+        "comm": "python3",
+        "flags": 4194368,
+        "starttime": 825,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1071,
+        "tid": 1121,
+        "comm": "python3",
+        "flags": 4194368,
+        "starttime": 825,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1137,
+        "tid": 1137,
+        "comm": "sshd",
+        "flags": 4194560,
+        "starttime": 1566,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1402,
+        "tid": 1402,
+        "comm": "systemd",
+        "flags": 4194560,
+        "starttime": 5895,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1403,
+        "tid": 1403,
+        "comm": "(sd-pam)",
+        "flags": 4194624,
+        "starttime": 5896,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1479,
+        "tid": 1479,
+        "comm": "tmux: server",
+        "flags": 4194368,
+        "starttime": 14854,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1480,
+        "tid": 1480,
+        "comm": "bash",
+        "flags": 4194304,
+        "starttime": 14854,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1481,
+        "tid": 1481,
+        "comm": "dbus-daemon",
+        "flags": 4194304,
+        "starttime": 14854,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1497,
+        "comm": "codex",
+        "flags": 4194304,
+        "starttime": 15476,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1498,
+        "comm": "codex-main",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1499,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1500,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1501,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1502,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1503,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1504,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1505,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1506,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1507,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1508,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1509,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1510,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1511,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1512,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1513,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15494,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1514,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 15495,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1572,
+        "comm": "reqwest-interna",
+        "flags": 4194368,
+        "starttime": 15504,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1573,
+        "comm": "OpenTelemetry.M",
+        "flags": 4194368,
+        "starttime": 15505,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1574,
+        "comm": "codex-otel-shut",
+        "flags": 4194368,
+        "starttime": 15505,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1580,
+        "comm": "sqlx-sqlite-wor",
+        "flags": 4194368,
+        "starttime": 15508,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1697,
+        "comm": "codex-main",
+        "flags": 4194368,
+        "starttime": 15515,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1762,
+        "comm": "notify-rs inoti",
+        "flags": 4194368,
+        "starttime": 15599,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 1766,
+        "comm": "notify-rs inoti",
+        "flags": 4194368,
+        "starttime": 15599,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 214374,
+        "comm": "sqlx-sqlite-wor",
+        "flags": 4194368,
+        "starttime": 7385510,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 214560,
+        "comm": "sqlx-sqlite-wor",
+        "flags": 4194368,
+        "starttime": 7395670,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 215697,
+        "comm": "sqlx-sqlite-wor",
+        "flags": 4194368,
+        "starttime": 7458073,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 215926,
+        "comm": "sqlx-sqlite-wor",
+        "flags": 4194368,
+        "starttime": 7460098,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 216130,
+        "comm": "sqlx-sqlite-wor",
+        "flags": 4194368,
+        "starttime": 7471415,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 217581,
+        "comm": "sqlx-sqlite-wor",
+        "flags": 4194368,
+        "starttime": 7540129,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 1497,
+        "tid": 217748,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 7551717,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3099,
+        "comm": "codex-code-mode",
+        "flags": 4194304,
+        "starttime": 26774,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3102,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3103,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3104,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3105,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3106,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3107,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3108,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3109,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3110,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3111,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3112,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3113,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3114,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3115,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 3116,
+        "comm": "V8 DefaultWorke",
+        "flags": 4194368,
+        "starttime": 26780,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 3099,
+        "tid": 217677,
+        "comm": "tokio-rt-worker",
+        "flags": 4194368,
+        "starttime": 7548391,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 11785,
+        "tid": 11785,
+        "comm": "kworker/R-vfio-irqfd-cleanup",
+        "flags": 69238880,
+        "starttime": 52000,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 25743,
+        "tid": 25743,
+        "comm": "bash",
+        "flags": 4194304,
+        "starttime": 321380,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 42925,
+        "tid": 42925,
+        "comm": "kworker/R-dio/nvme0n2p1",
+        "flags": 69238880,
+        "starttime": 954851,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 139556,
+        "tid": 139556,
+        "comm": "kworker/R-xfsalloc",
+        "flags": 69238880,
+        "starttime": 2752502,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 139557,
+        "tid": 139557,
+        "comm": "kworker/R-xfs_mru_cache",
+        "flags": 69238880,
+        "starttime": 2752502,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 180301,
+        "tid": 180301,
+        "comm": "fwupd",
+        "flags": 4194560,
+        "starttime": 3538959,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 180301,
+        "tid": 180302,
+        "comm": "gmain",
+        "flags": 4194368,
+        "starttime": 3538966,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 180301,
+        "tid": 180303,
+        "comm": "pool-spawner",
+        "flags": 4194368,
+        "starttime": 3538967,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 180301,
+        "tid": 180304,
+        "comm": "gdbus",
+        "flags": 4194368,
+        "starttime": 3538967,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 182271,
+        "tid": 182271,
+        "comm": "kworker/3:0-events",
+        "flags": 69238880,
+        "starttime": 3677302,
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "pid": 206944,
+        "tid": 206944,
+        "comm": "sshd",
+        "flags": 4194560,
+        "starttime": 7000279,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 207062,
+        "tid": 207062,
+        "comm": "sshd",
+        "flags": 4194624,
+        "starttime": 7000395,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 207065,
+        "tid": 207065,
+        "comm": "bash",
+        "flags": 4194304,
+        "starttime": 7000411,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 207125,
+        "tid": 207125,
+        "comm": "tmux: client",
+        "flags": 4194304,
+        "starttime": 7001919,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 211087,
+        "tid": 211087,
+        "comm": "python",
+        "flags": 4194560,
+        "starttime": 7268529,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 212890,
+        "tid": 212890,
+        "comm": "kworker/14:0-events",
+        "flags": 69238880,
+        "starttime": 7301292,
+        "affinity": [
+          14
+        ]
+      },
+      {
+        "pid": 214732,
+        "tid": 214732,
+        "comm": "kworker/12:0-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7399648,
+        "affinity": [
+          12
+        ]
+      },
+      {
+        "pid": 214733,
+        "tid": 214733,
+        "comm": "kworker/5:2-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7399680,
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "pid": 214802,
+        "tid": 214802,
+        "comm": "kworker/0:1-events",
+        "flags": 69238880,
+        "starttime": 7403064,
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "pid": 214960,
+        "tid": 214960,
+        "comm": "kworker/11:1-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7414575,
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "pid": 215325,
+        "tid": 215325,
+        "comm": "kworker/4:0-events",
+        "flags": 69238880,
+        "starttime": 7429151,
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "pid": 215386,
+        "tid": 215386,
+        "comm": "kworker/10:0-events",
+        "flags": 69238880,
+        "starttime": 7432475,
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "pid": 215425,
+        "tid": 215425,
+        "comm": "kworker/0:0-events",
+        "flags": 69238880,
+        "starttime": 7435784,
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "pid": 216043,
+        "tid": 216043,
+        "comm": "kworker/1:1-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7465775,
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "pid": 216044,
+        "tid": 216044,
+        "comm": "kworker/7:0-events",
+        "flags": 69238880,
+        "starttime": 7465792,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "pid": 216061,
+        "tid": 216061,
+        "comm": "kworker/2:1-events",
+        "flags": 69238880,
+        "starttime": 7466222,
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "pid": 216064,
+        "tid": 216064,
+        "comm": "kworker/13:2-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7467431,
+        "affinity": [
+          13
+        ]
+      },
+      {
+        "pid": 216065,
+        "tid": 216065,
+        "comm": "kworker/0:2-events",
+        "flags": 69238880,
+        "starttime": 7468398,
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "pid": 216133,
+        "tid": 216133,
+        "comm": "kworker/6:2-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7471801,
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "pid": 216134,
+        "tid": 216134,
+        "comm": "kworker/9:1-events",
+        "flags": 69238880,
+        "starttime": 7471849,
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "pid": 216174,
+        "tid": 216174,
+        "comm": "kworker/8:1-events",
+        "flags": 69238880,
+        "starttime": 7474734,
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "pid": 216255,
+        "tid": 216255,
+        "comm": "kworker/15:0-events",
+        "flags": 69238880,
+        "starttime": 7478549,
+        "affinity": [
+          15
+        ]
+      },
+      {
+        "pid": 216682,
+        "tid": 216682,
+        "comm": "kworker/4:1-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7494650,
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "pid": 216683,
+        "tid": 216683,
+        "comm": "kworker/3:3-events",
+        "flags": 69238880,
+        "starttime": 7495732,
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "pid": 216728,
+        "tid": 216728,
+        "comm": "kworker/2:2-events",
+        "flags": 69238880,
+        "starttime": 7497899,
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "pid": 216729,
+        "tid": 216729,
+        "comm": "kworker/13:1-events",
+        "flags": 69238880,
+        "starttime": 7497959,
+        "affinity": [
+          13
+        ]
+      },
+      {
+        "pid": 216730,
+        "tid": 216730,
+        "comm": "kworker/7:2-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7498032,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "pid": 216731,
+        "tid": 216731,
+        "comm": "kworker/1:2-events",
+        "flags": 69238880,
+        "starttime": 7498034,
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "pid": 216732,
+        "tid": 216732,
+        "comm": "kworker/10:2-events",
+        "flags": 69238880,
+        "starttime": 7498137,
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "pid": 216733,
+        "tid": 216733,
+        "comm": "kworker/5:0-events",
+        "flags": 69238880,
+        "starttime": 7498424,
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "pid": 216822,
+        "tid": 216822,
+        "comm": "kworker/12:2-events",
+        "flags": 69238880,
+        "starttime": 7501170,
+        "affinity": [
+          12
+        ]
+      },
+      {
+        "pid": 216878,
+        "tid": 216878,
+        "comm": "kworker/6:0-events",
+        "flags": 69238880,
+        "starttime": 7504470,
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "pid": 216879,
+        "tid": 216879,
+        "comm": "kworker/9:2-events",
+        "flags": 69238880,
+        "starttime": 7504584,
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "pid": 216914,
+        "tid": 216914,
+        "comm": "kworker/8:2-events",
+        "flags": 69238880,
+        "starttime": 7507927,
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "pid": 216955,
+        "tid": 216955,
+        "comm": "kworker/14:2-cgroup_free",
+        "flags": 69238880,
+        "starttime": 7511006,
+        "affinity": [
+          14
+        ]
+      },
+      {
+        "pid": 216956,
+        "tid": 216956,
+        "comm": "kworker/11:0-events",
+        "flags": 69238880,
+        "starttime": 7511020,
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "pid": 216957,
+        "tid": 216957,
+        "comm": "kworker/15:2-events",
+        "flags": 69238880,
+        "starttime": 7511268,
+        "affinity": [
+          15
+        ]
+      },
+      {
+        "pid": 217397,
+        "tid": 217397,
+        "comm": "kworker/4:2-events",
+        "flags": 69238880,
+        "starttime": 7527995,
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "pid": 217415,
+        "tid": 217415,
+        "comm": "kworker/3:1-events",
+        "flags": 69238880,
+        "starttime": 7528802,
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "pid": 217434,
+        "tid": 217434,
+        "comm": "kworker/10:1-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7530688,
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "pid": 217435,
+        "tid": 217435,
+        "comm": "kworker/13:0-events",
+        "flags": 69238880,
+        "starttime": 7530877,
+        "affinity": [
+          13
+        ]
+      },
+      {
+        "pid": 217436,
+        "tid": 217436,
+        "comm": "kworker/1:0-events",
+        "flags": 69238880,
+        "starttime": 7530932,
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "pid": 217437,
+        "tid": 217437,
+        "comm": "kworker/5:1-events",
+        "flags": 69238880,
+        "starttime": 7530982,
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "pid": 217459,
+        "tid": 217459,
+        "comm": "kworker/2:0-events",
+        "flags": 69238880,
+        "starttime": 7531866,
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "pid": 217517,
+        "tid": 217517,
+        "comm": "kworker/12:1-events",
+        "flags": 69238880,
+        "starttime": 7536334,
+        "affinity": [
+          12
+        ]
+      },
+      {
+        "pid": 217538,
+        "tid": 217538,
+        "comm": "kworker/9:0-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7537270,
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "pid": 217559,
+        "tid": 217559,
+        "comm": "kworker/7:1-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7537967,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "pid": 217560,
+        "tid": 217560,
+        "comm": "kworker/6:1-events",
+        "flags": 69238880,
+        "starttime": 7538513,
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "pid": 217598,
+        "tid": 217598,
+        "comm": "kworker/8:0-mm_percpu_wq",
+        "flags": 69238880,
+        "starttime": 7541055,
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "pid": 217637,
+        "tid": 217637,
+        "comm": "kworker/15:1-events",
+        "flags": 69238880,
+        "starttime": 7543977,
+        "affinity": [
+          15
+        ]
+      },
+      {
+        "pid": 217654,
+        "tid": 217654,
+        "comm": "kworker/11:2-events",
+        "flags": 69238880,
+        "starttime": 7545338,
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "pid": 217672,
+        "tid": 217672,
+        "comm": "kworker/14:1-events",
+        "flags": 69238880,
+        "starttime": 7546312,
+        "affinity": [
+          14
+        ]
+      },
+      {
+        "pid": 217730,
+        "tid": 217730,
+        "comm": "sshd",
+        "flags": 4194560,
+        "starttime": 7549658,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 217854,
+        "tid": 217854,
+        "comm": "(udev-worker)",
+        "flags": 4194624,
+        "starttime": 7552130,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 217899,
+        "tid": 217899,
+        "comm": "kworker/u64:0-events_power_efficient",
+        "flags": 69238880,
+        "starttime": 7552159,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 217900,
+        "tid": 217900,
+        "comm": "kworker/u65:0",
+        "flags": 69238880,
+        "starttime": 7552159,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 217902,
+        "tid": 217902,
+        "comm": "kworker/u64:1-events_unbound",
+        "flags": 69238880,
+        "starttime": 7552160,
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      {
+        "pid": 217903,
+        "tid": 217903,
+        "comm": "psimon",
+        "flags": 2129984,
+        "starttime": 7552161,
+        "affinity": [
+          12,
+          13,
+          14,
+          15
+        ]
+      }
+    ]
+  }
+}

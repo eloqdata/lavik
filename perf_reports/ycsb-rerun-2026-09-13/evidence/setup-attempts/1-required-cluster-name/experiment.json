@@ -1,0 +1,40 @@
+{
+  "start_utc": "2026-09-16T02:59:37Z",
+  "keylane_commit": "f666837b0038ab65564a17cb3a0bca8530f8e1be",
+  "keylane_sha256": "9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266",
+  "aerospike_sha256": "6e1b2bd6deebd5816f4f369ac1db4151217ed0be3b66578bdd6f15c24e6af8d0",
+  "order": [
+    "aerospike",
+    "hreplace"
+  ],
+  "workload_order": [
+    "C",
+    "A",
+    "B",
+    "D"
+  ],
+  "rates": [
+    100000,
+    0
+  ],
+  "threads": 256,
+  "measurement_seconds": 300,
+  "warmup_operations": 1000000,
+  "fresh_records_each": 100000000,
+  "fieldcount": 10,
+  "fieldlength": 128,
+  "server": "172.16.0.4",
+  "client": "172.16.0.5",
+  "D_insert_starts": {
+    "100000-warmup": 2000000000,
+    "100000-measured": 4000000000,
+    "0-warmup": 6000000000,
+    "0-measured": 8000000000
+  },
+  "aerospike_configuration": "# Single-node YCSB device namespace. Performance settings use server defaults.\nservice {\n}\nlogging {\n    console {\n        context any info\n    }\n}\nnetwork {\n    service {\n        address 172.16.0.4\n        port 3000\n    }\n    heartbeat {\n        address 127.0.0.1\n        mode mesh\n        port 3002\n    }\n    fabric {\n        address 127.0.0.1\n        port 3001\n    }\n    admin {\n        address 127.0.0.1\n        port 3003\n    }\n}\nnamespace ycsb {\n    replication-factor 1\n    storage-engine device {\n        device /dev/md127p3\n    }\n}\n",
+  "script_sha256": {
+    "runner.py": "78b0eb6d35ca42e1c5684781f72546301ed66f0b90bcef6dc637f5288d576751",
+    "host_policy.py": "68b8b96db0af81c43408b19d88feb191daeee57ad41871e8ad02a72208f0b095",
+    "ycsb_client.py": "4672a5d73718e4fc3ea154d9d714f2f911d80e3e8ed36127ab551d7e61034d37"
+  }
+}

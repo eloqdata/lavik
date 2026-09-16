@@ -1,0 +1,22 @@
+{
+  "utc": "2026-09-16T03:00:19Z",
+  "argv": [
+    "systemd-run",
+    "--unit",
+    "aerospike-ycsb-default-20260916.service",
+    "--collect",
+    "-p",
+    "TimeoutStopSec=300",
+    "-p",
+    "StandardOutput=append:/mnt/dev/ycsb-default-host-rerun-20260916/aerospike-server.stdout",
+    "-p",
+    "StandardError=inherit",
+    "-p",
+    "LimitNOFILE=100000",
+    "/usr/bin/asd",
+    "--config-file",
+    "/mnt/dev/ycsb-default-host-rerun-20260916/aerospike.conf",
+    "--foreground"
+  ],
+  "binary_sha256": "6e1b2bd6deebd5816f4f369ac1db4151217ed0be3b66578bdd6f15c24e6af8d0"
+}

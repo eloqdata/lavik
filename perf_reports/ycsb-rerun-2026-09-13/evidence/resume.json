@@ -1,0 +1,11 @@
+{
+  "utc": "2026-09-16T03:51:07Z",
+  "retained_formal_windows": 8,
+  "retained_phases": 16,
+  "failed_transition": "setup-attempts/2-deferred-irq-migration",
+  "reason": "effective IRQ affinity is deferred until the next interrupt; validate completion queues under traffic",
+  "script_sha256": {
+    "resume_keylane.py": "01ea8a95d89b310b557d1033274a0814bf30b92039aa8779a99d5c58a0b3df88",
+    "host_policy_v2.py": "49707a764059afd709b7050506709931c349247748cbd67fe341c9ec9858b2a0"
+  }
+}

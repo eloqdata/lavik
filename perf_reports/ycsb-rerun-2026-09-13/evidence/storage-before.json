@@ -1,0 +1,76 @@
+{
+  "table": {
+    "label": "gpt",
+    "id": "0E39CBB3-4B3E-48BE-A6DA-DB454B52E156",
+    "device": "/dev/md127",
+    "unit": "sectors",
+    "firstlba": 34,
+    "lastlba": 22496661470,
+    "grain": "3145728",
+    "sectorsize": 512,
+    "partitions": [
+      {
+        "node": "/dev/md127p1",
+        "start": 12288,
+        "size": 268435456,
+        "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        "uuid": "33F27D15-2EAD-4A86-94B0-F858D315334F",
+        "name": "aerospike-bench80"
+      },
+      {
+        "node": "/dev/md127p2",
+        "start": 268449792,
+        "size": 4294967296,
+        "type": "0FC63DAF-8483-4772-8E79-3D69D8477DE4",
+        "uuid": "6AE73491-1ED8-4633-8CC6-03063E710483",
+        "name": "keylane-uring-bench80"
+      }
+    ]
+  },
+  "members": [
+    {
+      "name": "nvme1n1",
+      "serial": "41dec024a53e1c440001",
+      "sysfs": "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0004:00/MSFT1000:00/84b9cbc9-6943-49b4-8618-0f2323dca37d/pci6943:00/6943:00:00.0/nvme/nvme1/nvme1n1"
+    },
+    {
+      "name": "nvme2n1",
+      "serial": "41dec024a53e1c440003",
+      "sysfs": "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0004:00/MSFT1000:00/e8cfd39c-0490-4ec0-afbc-15b8a8e52ebf/pci0490:00/0490:00:00.0/nvme/nvme2/nvme2n1"
+    },
+    {
+      "name": "nvme3n1",
+      "serial": "41dec024a53e1c440002",
+      "sysfs": "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0004:00/MSFT1000:00/9071af50-2b6b-4bf7-89f3-3ad52eb58cd2/pci2b6b:00/2b6b:00:00.0/nvme/nvme3/nvme3n1"
+    },
+    {
+      "name": "nvme4n1",
+      "serial": "41dec024a53e1c440004",
+      "sysfs": "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0004:00/MSFT1000:00/d56219e5-06a5-4e01-b4bd-30ae096d220b/pci06a5:00/06a5:00:00.0/nvme/nvme4/nvme4n1"
+    },
+    {
+      "name": "nvme5n1",
+      "serial": "41dec024a53e1c440006",
+      "sysfs": "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0004:00/MSFT1000:00/b60223dc-7138-4939-995d-824c5493b72f/pci7138:00/7138:00:00.0/nvme/nvme5/nvme5n1"
+    },
+    {
+      "name": "nvme6n1",
+      "serial": "41dec024a53e1c440005",
+      "sysfs": "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/ACPI0004:00/MSFT1000:00/a3497e23-44e8-4874-91fe-b825a7dbd341/pci44e8:00/44e8:00:00.0/nvme/nvme6/nvme6n1"
+    }
+  ],
+  "detail": "/dev/md127:\n           Version : 1.2\n     Creation Time : Tue Sep 15 14:27:37 2026\n        Raid Level : raid0\n        Array Size : 11248330752 (10.48 TiB 11.52 TB)\n      Raid Devices : 6\n     Total Devices : 6\n       Persistence : Superblock is persistent\n\n       Update Time : Tue Sep 15 14:27:37 2026\n             State : clean \n    Active Devices : 6\n   Working Devices : 6\n    Failed Devices : 0\n     Spare Devices : 0\n\n            Layout : original\n        Chunk Size : 512K\n\nConsistency Policy : none\n\n              Name : dragonfly-tiered\n              UUID : ea9bc790:01bcea07:35f053d1:cb4fa74e\n            Events : 0\n\n    Number   Major   Minor   RaidDevice State\n       0     259        6        0      active sync   /dev/nvme1n1\n       1     259        8        1      active sync   /dev/nvme3n1\n       2     259        7        2      active sync   /dev/nvme2n1\n       3     259        9        3      active sync   /dev/nvme4n1\n       4     259       11        4      active sync   /dev/nvme6n1\n       5     259       10        5      active sync   /dev/nvme5n1\n",
+  "preserved_boundaries": {
+    "/dev/md127p1": {
+      "0": "6d14741d62054ac314f82e6fc1f10395b969e28d184e14cf57020a4dfb546fc4",
+      "68719476736": "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58",
+      "137437904896": "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58"
+    },
+    "/dev/md127p2": {
+      "0": "7e185fbaa51ed11e3151766090f4651e64eeae24f4e7c4a14547761181fd72b9",
+      "1099511627776": "70c3d30f0ef15f66246c662bb2c4ceba16116421db065f2974205df1a0bde807",
+      "2199022206976": "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58"
+    }
+  },
+  "paused_pid": 182889
+}

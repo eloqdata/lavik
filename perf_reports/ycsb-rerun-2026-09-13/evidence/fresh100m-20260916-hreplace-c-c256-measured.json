@@ -1,0 +1,162 @@
+{
+  "mode": "hreplace",
+  "workload": "C",
+  "workers": 256,
+  "phase": "measured",
+  "label": "fresh100m-20260916",
+  "requested_duration_seconds": 300,
+  "d_insert_start": null,
+  "target_ops_sec": 0,
+  "measurement_interval": "both",
+  "command": [
+    "/mnt/dev/YCSB-hreplace-dist/bin/ycsb",
+    "run",
+    "redis",
+    "-s",
+    "-threads",
+    "256",
+    "-P",
+    "/mnt/dev/YCSB-hreplace-dist/workloads/workloada",
+    "-p",
+    "recordcount=100000000",
+    "-p",
+    "operationcount=2000000000",
+    "-p",
+    "fieldcount=10",
+    "-p",
+    "fieldlength=128",
+    "-p",
+    "fieldlengthdistribution=constant",
+    "-p",
+    "readallfields=true",
+    "-p",
+    "writeallfields=true",
+    "-p",
+    "insertorder=hashed",
+    "-p",
+    "requestdistribution=uniform",
+    "-p",
+    "readproportion=1",
+    "-p",
+    "updateproportion=0",
+    "-p",
+    "insertproportion=0",
+    "-p",
+    "scanproportion=0",
+    "-p",
+    "readmodifywriteproportion=0",
+    "-p",
+    "measurementtype=hdrhistogram",
+    "-p",
+    "measurement.interval=both",
+    "-p",
+    "hdrhistogram.percentiles=50,95,99,99.9,99.99",
+    "-p",
+    "status.interval=10",
+    "-p",
+    "maxexecutiontime=300",
+    "-p",
+    "redis.host=172.16.0.4",
+    "-p",
+    "redis.port=16379",
+    "-p",
+    "redis.scanindex=none",
+    "-p",
+    "redis.timeout=10000",
+    "-p",
+    "redis.cluster=false",
+    "-p",
+    "redis.updatecommand=keylane.hreplace"
+  ],
+  "start_utc": "2026-09-16T03:59:43Z",
+  "runtime_ms": 300066,
+  "attempted": 165212292,
+  "succeeded": 165212292,
+  "failed": 0,
+  "success_qps": 550586.5109675871,
+  "metrics": {
+    "OVERALL": {
+      "RunTime(ms)": 300066,
+      "Throughput(ops/sec)": 550586.5109675871
+    },
+    "TOTAL_GCS_G1_Young_Generation": {
+      "Count": 2048
+    },
+    "TOTAL_GC_TIME_G1_Young_Generation": {
+      "Time(ms)": 1663
+    },
+    "TOTAL_GC_TIME_%_G1_Young_Generation": {
+      "Time(%)": 0.5542114068238321
+    },
+    "TOTAL_GCS_G1_Old_Generation": {
+      "Count": 0
+    },
+    "TOTAL_GC_TIME_G1_Old_Generation": {
+      "Time(ms)": 0
+    },
+    "TOTAL_GC_TIME_%_G1_Old_Generation": {
+      "Time(%)": 0.0
+    },
+    "TOTAL_GCs": {
+      "Count": 2048
+    },
+    "TOTAL_GC_TIME": {
+      "Time(ms)": 1663
+    },
+    "TOTAL_GC_TIME_%": {
+      "Time(%)": 0.5542114068238321
+    },
+    "READ": {
+      "Operations": 165212292,
+      "AverageLatency(us)": 463.15897662142476,
+      "MinLatency(us)": 215,
+      "MaxLatency(us)": 74815,
+      "50thPercentileLatency(us)": 447,
+      "95thPercentileLatency(us)": 612,
+      "99thPercentileLatency(us)": 740,
+      "99.9PercentileLatency(us)": 2719,
+      "99.99PercentileLatency(us)": 4411,
+      "Return=OK": 165212292
+    },
+    "CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 2503.48828125,
+      "MinLatency(us)": 326,
+      "MaxLatency(us)": 5327,
+      "50thPercentileLatency(us)": 2343,
+      "95thPercentileLatency(us)": 4899,
+      "99thPercentileLatency(us)": 5267,
+      "99.9PercentileLatency(us)": 5327,
+      "99.99PercentileLatency(us)": 5327
+    },
+    "Intended-READ": {
+      "Operations": 165212292,
+      "AverageLatency(us)": 463.1946260935597,
+      "MinLatency(us)": 215,
+      "MaxLatency(us)": 74815,
+      "50thPercentileLatency(us)": 447,
+      "95thPercentileLatency(us)": 612,
+      "99thPercentileLatency(us)": 740,
+      "99.9PercentileLatency(us)": 2719,
+      "99.99PercentileLatency(us)": 4411
+    },
+    "Intended-CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 2503.609375,
+      "MinLatency(us)": 327,
+      "MaxLatency(us)": 5327,
+      "50thPercentileLatency(us)": 2343,
+      "95thPercentileLatency(us)": 4899,
+      "99thPercentileLatency(us)": 5267,
+      "99.9PercentileLatency(us)": 5327,
+      "99.99PercentileLatency(us)": 5327
+    }
+  },
+  "sha256": "9da2fa41311e1cfa1d2a9599eb6364cba70ea0862d98ab68d8f273233b0e44d4",
+  "exit_code": 0,
+  "end_utc": "2026-09-16T04:04:43Z",
+  "before_records": 100000000,
+  "after_records": 100000000,
+  "host_before": "fresh100m-20260916-hreplace-c-c256-measured.host-before.json",
+  "host_after": "fresh100m-20260916-hreplace-c-c256-measured.host-after.json"
+}

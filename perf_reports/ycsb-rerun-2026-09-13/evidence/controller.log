@@ -1,0 +1,117 @@
+{"utc": "2026-09-16T03:00:19Z", "state": "starting-load", "mode": "aerospike", "complete": 0, "total": 16}
+{"utc": "2026-09-16T03:00:21Z", "state": "loading", "mode": "aerospike", "complete": 0, "total": 16}
+{"utc": "2026-09-16T03:03:22Z", "state": "recovering", "mode": "aerospike", "complete": 0, "total": 16}
+{"utc": "2026-09-16T03:05:41Z", "state": "warmup", "mode": "aerospike", "workload": "C", "target": 100000, "complete": 0, "total": 16}
+START fresh100m-20260916-aerospike-c-c256-target100000-warmup
+DONE fresh100m-20260916-aerospike-c-c256-target100000-warmup qps=97144 errors=0
+{"utc": "2026-09-16T03:05:55Z", "state": "measured", "mode": "aerospike", "workload": "C", "target": 100000, "complete": 0, "total": 16}
+START fresh100m-20260916-aerospike-c-c256-target100000-measured
+DONE fresh100m-20260916-aerospike-c-c256-target100000-measured qps=99882 errors=0
+{"utc": "2026-09-16T03:10:59Z", "state": "warmup", "mode": "aerospike", "workload": "C", "target": 0, "complete": 1, "total": 16}
+START fresh100m-20260916-aerospike-c-c256-warmup
+DONE fresh100m-20260916-aerospike-c-c256-warmup qps=353982 errors=0
+{"utc": "2026-09-16T03:11:05Z", "state": "measured", "mode": "aerospike", "workload": "C", "target": 0, "complete": 1, "total": 16}
+START fresh100m-20260916-aerospike-c-c256-measured
+DONE fresh100m-20260916-aerospike-c-c256-measured qps=445698 errors=0
+{"utc": "2026-09-16T03:16:09Z", "state": "warmup", "mode": "aerospike", "workload": "A", "target": 100000, "complete": 2, "total": 16}
+START fresh100m-20260916-aerospike-a-c256-target100000-warmup
+DONE fresh100m-20260916-aerospike-a-c256-target100000-warmup qps=98058 errors=0
+{"utc": "2026-09-16T03:16:23Z", "state": "measured", "mode": "aerospike", "workload": "A", "target": 100000, "complete": 2, "total": 16}
+START fresh100m-20260916-aerospike-a-c256-target100000-measured
+DONE fresh100m-20260916-aerospike-a-c256-target100000-measured qps=99905 errors=0
+{"utc": "2026-09-16T03:21:27Z", "state": "warmup", "mode": "aerospike", "workload": "A", "target": 0, "complete": 3, "total": 16}
+START fresh100m-20260916-aerospike-a-c256-warmup
+DONE fresh100m-20260916-aerospike-a-c256-warmup qps=358680 errors=0
+{"utc": "2026-09-16T03:21:33Z", "state": "measured", "mode": "aerospike", "workload": "A", "target": 0, "complete": 3, "total": 16}
+START fresh100m-20260916-aerospike-a-c256-measured
+DONE fresh100m-20260916-aerospike-a-c256-measured qps=489819 errors=0
+{"utc": "2026-09-16T03:26:37Z", "state": "warmup", "mode": "aerospike", "workload": "B", "target": 100000, "complete": 4, "total": 16}
+START fresh100m-20260916-aerospike-b-c256-target100000-warmup
+DONE fresh100m-20260916-aerospike-b-c256-target100000-warmup qps=94697 errors=0
+{"utc": "2026-09-16T03:26:51Z", "state": "measured", "mode": "aerospike", "workload": "B", "target": 100000, "complete": 4, "total": 16}
+START fresh100m-20260916-aerospike-b-c256-target100000-measured
+DONE fresh100m-20260916-aerospike-b-c256-target100000-measured qps=99874 errors=0
+{"utc": "2026-09-16T03:31:55Z", "state": "warmup", "mode": "aerospike", "workload": "B", "target": 0, "complete": 5, "total": 16}
+START fresh100m-20260916-aerospike-b-c256-warmup
+DONE fresh100m-20260916-aerospike-b-c256-warmup qps=333778 errors=0
+{"utc": "2026-09-16T03:32:02Z", "state": "measured", "mode": "aerospike", "workload": "B", "target": 0, "complete": 5, "total": 16}
+START fresh100m-20260916-aerospike-b-c256-measured
+DONE fresh100m-20260916-aerospike-b-c256-measured qps=445515 errors=0
+{"utc": "2026-09-16T03:37:05Z", "state": "warmup", "mode": "aerospike", "workload": "D", "target": 100000, "complete": 6, "total": 16}
+START fresh100m-20260916-aerospike-d-c256-target100000-warmup
+DONE fresh100m-20260916-aerospike-d-c256-target100000-warmup qps=96984 errors=0
+{"utc": "2026-09-16T03:37:19Z", "state": "measured", "mode": "aerospike", "workload": "D", "target": 100000, "complete": 6, "total": 16}
+START fresh100m-20260916-aerospike-d-c256-target100000-measured
+DONE fresh100m-20260916-aerospike-d-c256-target100000-measured qps=99911 errors=0
+{"utc": "2026-09-16T03:42:23Z", "state": "warmup", "mode": "aerospike", "workload": "D", "target": 0, "complete": 7, "total": 16}
+START fresh100m-20260916-aerospike-d-c256-warmup
+DONE fresh100m-20260916-aerospike-d-c256-warmup qps=331675 errors=0
+{"utc": "2026-09-16T03:42:30Z", "state": "measured", "mode": "aerospike", "workload": "D", "target": 0, "complete": 7, "total": 16}
+START fresh100m-20260916-aerospike-d-c256-measured
+DONE fresh100m-20260916-aerospike-d-c256-measured qps=448832 errors=0
+{"utc": "2026-09-16T03:47:35Z", "state": "failed", "complete": 8, "total": 16}
+Traceback (most recent call last):
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/runner.py", line 403, in <module>
+    main()
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/runner.py", line 334, in main
+    if mode == 'hreplace': host.apply_keylane()
+                           ^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/host_policy.py", line 120, in apply_keylane
+    assert_keylane()
+  File "/mnt/dev/ycsb-default-host-rerun-20260916/host_policy.py", line 132, in assert_keylane
+    assert value['configured'] == value['effective'] and value['effective'] in ('12', '13', '14', '15')
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+{"utc": "2026-09-16T03:51:07Z", "state": "starting-load", "mode": "hreplace", "complete": 8, "total": 16}
+{"utc": "2026-09-16T03:51:10Z", "state": "loading", "mode": "hreplace", "complete": 8, "total": 16}
+{"utc": "2026-09-16T03:54:25Z", "state": "recovering", "mode": "hreplace", "complete": 8, "total": 16}
+{"utc": "2026-09-16T03:54:27Z", "state": "warmup", "mode": "hreplace", "workload": "C", "target": 100000, "complete": 8, "total": 16}
+START fresh100m-20260916-hreplace-c-c256-target100000-warmup
+DONE fresh100m-20260916-hreplace-c-c256-target100000-warmup qps=98990 errors=0
+{"utc": "2026-09-16T03:54:38Z", "state": "measured", "mode": "hreplace", "workload": "C", "target": 100000, "complete": 8, "total": 16}
+START fresh100m-20260916-hreplace-c-c256-target100000-measured
+DONE fresh100m-20260916-hreplace-c-c256-target100000-measured qps=99956 errors=0
+{"utc": "2026-09-16T03:59:39Z", "state": "warmup", "mode": "hreplace", "workload": "C", "target": 0, "complete": 9, "total": 16}
+START fresh100m-20260916-hreplace-c-c256-warmup
+DONE fresh100m-20260916-hreplace-c-c256-warmup qps=415455 errors=0
+{"utc": "2026-09-16T03:59:43Z", "state": "measured", "mode": "hreplace", "workload": "C", "target": 0, "complete": 9, "total": 16}
+START fresh100m-20260916-hreplace-c-c256-measured
+DONE fresh100m-20260916-hreplace-c-c256-measured qps=550587 errors=0
+{"utc": "2026-09-16T04:04:43Z", "state": "warmup", "mode": "hreplace", "workload": "A", "target": 100000, "complete": 10, "total": 16}
+START fresh100m-20260916-hreplace-a-c256-target100000-warmup
+DONE fresh100m-20260916-hreplace-a-c256-target100000-warmup qps=99118 errors=0
+{"utc": "2026-09-16T04:04:54Z", "state": "measured", "mode": "hreplace", "workload": "A", "target": 100000, "complete": 10, "total": 16}
+START fresh100m-20260916-hreplace-a-c256-target100000-measured
+DONE fresh100m-20260916-hreplace-a-c256-target100000-measured qps=99963 errors=0
+{"utc": "2026-09-16T04:09:55Z", "state": "warmup", "mode": "hreplace", "workload": "A", "target": 0, "complete": 11, "total": 16}
+START fresh100m-20260916-hreplace-a-c256-warmup
+DONE fresh100m-20260916-hreplace-a-c256-warmup qps=414594 errors=0
+{"utc": "2026-09-16T04:09:59Z", "state": "measured", "mode": "hreplace", "workload": "A", "target": 0, "complete": 11, "total": 16}
+START fresh100m-20260916-hreplace-a-c256-measured
+DONE fresh100m-20260916-hreplace-a-c256-measured qps=511169 errors=0
+{"utc": "2026-09-16T04:14:59Z", "state": "warmup", "mode": "hreplace", "workload": "B", "target": 100000, "complete": 12, "total": 16}
+START fresh100m-20260916-hreplace-b-c256-target100000-warmup
+DONE fresh100m-20260916-hreplace-b-c256-target100000-warmup qps=99088 errors=0
+{"utc": "2026-09-16T04:15:10Z", "state": "measured", "mode": "hreplace", "workload": "B", "target": 100000, "complete": 12, "total": 16}
+START fresh100m-20260916-hreplace-b-c256-target100000-measured
+DONE fresh100m-20260916-hreplace-b-c256-target100000-measured qps=99973 errors=0
+{"utc": "2026-09-16T04:20:11Z", "state": "warmup", "mode": "hreplace", "workload": "B", "target": 0, "complete": 13, "total": 16}
+START fresh100m-20260916-hreplace-b-c256-warmup
+DONE fresh100m-20260916-hreplace-b-c256-warmup qps=430849 errors=0
+{"utc": "2026-09-16T04:20:14Z", "state": "measured", "mode": "hreplace", "workload": "B", "target": 0, "complete": 13, "total": 16}
+START fresh100m-20260916-hreplace-b-c256-measured
+DONE fresh100m-20260916-hreplace-b-c256-measured qps=540102 errors=0
+{"utc": "2026-09-16T04:25:15Z", "state": "warmup", "mode": "hreplace", "workload": "D", "target": 100000, "complete": 14, "total": 16}
+START fresh100m-20260916-hreplace-d-c256-target100000-warmup
+DONE fresh100m-20260916-hreplace-d-c256-target100000-warmup qps=98853 errors=0
+{"utc": "2026-09-16T04:25:26Z", "state": "measured", "mode": "hreplace", "workload": "D", "target": 100000, "complete": 14, "total": 16}
+START fresh100m-20260916-hreplace-d-c256-target100000-measured
+DONE fresh100m-20260916-hreplace-d-c256-target100000-measured qps=99970 errors=0
+{"utc": "2026-09-16T04:30:27Z", "state": "warmup", "mode": "hreplace", "workload": "D", "target": 0, "complete": 15, "total": 16}
+START fresh100m-20260916-hreplace-d-c256-warmup
+DONE fresh100m-20260916-hreplace-d-c256-warmup qps=345901 errors=0
+{"utc": "2026-09-16T04:30:31Z", "state": "measured", "mode": "hreplace", "workload": "D", "target": 0, "complete": 15, "total": 16}
+START fresh100m-20260916-hreplace-d-c256-measured
+DONE fresh100m-20260916-hreplace-d-c256-measured qps=540275 errors=0
+{"utc": "2026-09-16T04:35:35Z", "state": "final-recovery", "mode": "aerospike", "complete": 16, "total": 16}
+{"utc": "2026-09-16T04:39:37Z", "state": "complete", "complete": 16, "total": 16}

@@ -1,0 +1,564 @@
+{
+  "utc": "2026-09-16T03:54:38Z",
+  "monotonic": 75945.126327558,
+  "host": {
+    "utc": "2026-09-16T03:54:38Z",
+    "boot_id": "27962773-1d7c-46ed-9966-577bb4fce389",
+    "units": {
+      "system.slice": "12-15",
+      "user.slice": "12-15",
+      "init.scope": "12-15"
+    },
+    "workqueue": "f000",
+    "irqbalance": "inactive",
+    "irqbalance_enabled": "not-found",
+    "irqs": {
+      "143": {
+        "name": "mlx5_async0@pci:0cba:00:02.0",
+        "configured": "12",
+        "effective": "12"
+      },
+      "144": {
+        "name": "mlx5_comp0@pci:0cba:00:02.0",
+        "configured": "13",
+        "effective": "13"
+      },
+      "145": {
+        "name": "mlx5_async0@pci:1641:00:02.0",
+        "configured": "0-15",
+        "effective": "10"
+      },
+      "146": {
+        "name": "mlx5_comp0@pci:1641:00:02.0",
+        "configured": "0",
+        "effective": "0"
+      },
+      "147": {
+        "name": "mlx5_comp1@pci:0cba:00:02.0",
+        "configured": "14",
+        "effective": "14"
+      },
+      "148": {
+        "name": "mlx5_comp2@pci:0cba:00:02.0",
+        "configured": "15",
+        "effective": "15"
+      },
+      "149": {
+        "name": "mlx5_comp3@pci:0cba:00:02.0",
+        "configured": "12",
+        "effective": "12"
+      },
+      "150": {
+        "name": "mlx5_comp4@pci:0cba:00:02.0",
+        "configured": "13",
+        "effective": "13"
+      },
+      "151": {
+        "name": "mlx5_comp5@pci:0cba:00:02.0",
+        "configured": "14",
+        "effective": "14"
+      },
+      "152": {
+        "name": "mlx5_comp6@pci:0cba:00:02.0",
+        "configured": "15",
+        "effective": "15"
+      },
+      "153": {
+        "name": "mlx5_comp7@pci:0cba:00:02.0",
+        "configured": "12",
+        "effective": "12"
+      },
+      "154": {
+        "name": "mlx5_comp8@pci:0cba:00:02.0",
+        "configured": "13",
+        "effective": "13"
+      },
+      "155": {
+        "name": "mlx5_comp9@pci:0cba:00:02.0",
+        "configured": "14",
+        "effective": "14"
+      },
+      "156": {
+        "name": "mlx5_comp10@pci:0cba:00:02.0",
+        "configured": "15",
+        "effective": "15"
+      },
+      "157": {
+        "name": "mlx5_comp11@pci:0cba:00:02.0",
+        "configured": "12",
+        "effective": "12"
+      },
+      "158": {
+        "name": "mlx5_comp12@pci:0cba:00:02.0",
+        "configured": "13",
+        "effective": "13"
+      },
+      "159": {
+        "name": "mlx5_comp13@pci:0cba:00:02.0",
+        "configured": "14",
+        "effective": "14"
+      },
+      "160": {
+        "name": "mlx5_comp14@pci:0cba:00:02.0",
+        "configured": "15",
+        "effective": "15"
+      },
+      "161": {
+        "name": "mlx5_comp15@pci:0cba:00:02.0",
+        "configured": "12",
+        "effective": "12"
+      },
+      "162": {
+        "name": "mlx5_comp1@pci:1641:00:02.0",
+        "configured": "1",
+        "effective": "1"
+      },
+      "163": {
+        "name": "mlx5_comp2@pci:1641:00:02.0",
+        "configured": "2",
+        "effective": "2"
+      },
+      "164": {
+        "name": "mlx5_comp3@pci:1641:00:02.0",
+        "configured": "3",
+        "effective": "3"
+      },
+      "165": {
+        "name": "mlx5_comp4@pci:1641:00:02.0",
+        "configured": "4",
+        "effective": "4"
+      },
+      "166": {
+        "name": "mlx5_comp5@pci:1641:00:02.0",
+        "configured": "5",
+        "effective": "5"
+      },
+      "167": {
+        "name": "mlx5_comp6@pci:1641:00:02.0",
+        "configured": "6",
+        "effective": "6"
+      },
+      "168": {
+        "name": "mlx5_comp7@pci:1641:00:02.0",
+        "configured": "7",
+        "effective": "7"
+      },
+      "169": {
+        "name": "mlx5_comp8@pci:1641:00:02.0",
+        "configured": "8",
+        "effective": "8"
+      },
+      "170": {
+        "name": "mlx5_comp9@pci:1641:00:02.0",
+        "configured": "9",
+        "effective": "9"
+      },
+      "171": {
+        "name": "mlx5_comp10@pci:1641:00:02.0",
+        "configured": "10",
+        "effective": "10"
+      },
+      "172": {
+        "name": "mlx5_comp11@pci:1641:00:02.0",
+        "configured": "11",
+        "effective": "11"
+      },
+      "173": {
+        "name": "mlx5_comp12@pci:1641:00:02.0",
+        "configured": "12",
+        "effective": "12"
+      },
+      "174": {
+        "name": "mlx5_comp13@pci:1641:00:02.0",
+        "configured": "13",
+        "effective": "13"
+      },
+      "175": {
+        "name": "mlx5_comp14@pci:1641:00:02.0",
+        "configured": "14",
+        "effective": "14"
+      },
+      "176": {
+        "name": "mlx5_comp15@pci:1641:00:02.0",
+        "configured": "15",
+        "effective": "15"
+      }
+    },
+    "queue_masks": {
+      "/sys/class/net/eth0/queues/rx-13/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-9/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-11/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-7/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-5/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-3/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-1/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-14/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-12/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-8/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-10/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-6/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-4/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-2/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-15/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/rx-0/rps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-6/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-12/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-4/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-10/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-2/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-0/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-9/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-15/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-7/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-13/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-5/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-11/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-3/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-1/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-8/xps_cpus": "0000",
+      "/sys/class/net/eth0/queues/tx-14/xps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-13/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-9/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-11/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-7/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-5/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-3/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-1/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-14/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-12/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-8/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-10/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-6/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-4/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-2/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-15/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/rx-0/rps_cpus": "0000",
+      "/sys/class/net/enP3258s1/queues/tx-6/xps_cpus": "0040",
+      "/sys/class/net/enP3258s1/queues/tx-12/xps_cpus": "1000",
+      "/sys/class/net/enP3258s1/queues/tx-4/xps_cpus": "0010",
+      "/sys/class/net/enP3258s1/queues/tx-10/xps_cpus": "0400",
+      "/sys/class/net/enP3258s1/queues/tx-2/xps_cpus": "0004",
+      "/sys/class/net/enP3258s1/queues/tx-0/xps_cpus": "0001",
+      "/sys/class/net/enP3258s1/queues/tx-9/xps_cpus": "0200",
+      "/sys/class/net/enP3258s1/queues/tx-15/xps_cpus": "8000",
+      "/sys/class/net/enP3258s1/queues/tx-7/xps_cpus": "0080",
+      "/sys/class/net/enP3258s1/queues/tx-13/xps_cpus": "2000",
+      "/sys/class/net/enP3258s1/queues/tx-5/xps_cpus": "0020",
+      "/sys/class/net/enP3258s1/queues/tx-11/xps_cpus": "0800",
+      "/sys/class/net/enP3258s1/queues/tx-3/xps_cpus": "0008",
+      "/sys/class/net/enP3258s1/queues/tx-1/xps_cpus": "0002",
+      "/sys/class/net/enP3258s1/queues/tx-8/xps_cpus": "0100",
+      "/sys/class/net/enP3258s1/queues/tx-14/xps_cpus": "4000",
+      "/sys/class/net/eth1/queues/rx-13/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-9/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-11/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-7/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-5/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-3/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-1/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-14/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-12/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-8/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-10/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-6/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-4/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-2/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-15/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/rx-0/rps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-6/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-12/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-4/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-10/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-2/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-0/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-9/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-15/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-7/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-13/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-5/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-11/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-3/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-1/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-8/xps_cpus": "0000",
+      "/sys/class/net/eth1/queues/tx-14/xps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-13/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-9/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-11/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-7/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-5/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-3/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-1/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-14/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-12/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-8/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-10/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-6/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-4/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-2/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-15/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/rx-0/rps_cpus": "0000",
+      "/sys/class/net/enP5697s2/queues/tx-6/xps_cpus": "0040",
+      "/sys/class/net/enP5697s2/queues/tx-12/xps_cpus": "1000",
+      "/sys/class/net/enP5697s2/queues/tx-4/xps_cpus": "0010",
+      "/sys/class/net/enP5697s2/queues/tx-10/xps_cpus": "0400",
+      "/sys/class/net/enP5697s2/queues/tx-2/xps_cpus": "0004",
+      "/sys/class/net/enP5697s2/queues/tx-0/xps_cpus": "0001",
+      "/sys/class/net/enP5697s2/queues/tx-9/xps_cpus": "0200",
+      "/sys/class/net/enP5697s2/queues/tx-15/xps_cpus": "8000",
+      "/sys/class/net/enP5697s2/queues/tx-7/xps_cpus": "0080",
+      "/sys/class/net/enP5697s2/queues/tx-13/xps_cpus": "2000",
+      "/sys/class/net/enP5697s2/queues/tx-5/xps_cpus": "0020",
+      "/sys/class/net/enP5697s2/queues/tx-11/xps_cpus": "0800",
+      "/sys/class/net/enP5697s2/queues/tx-3/xps_cpus": "0008",
+      "/sys/class/net/enP5697s2/queues/tx-1/xps_cpus": "0002",
+      "/sys/class/net/enP5697s2/queues/tx-8/xps_cpus": "0100",
+      "/sys/class/net/enP5697s2/queues/tx-14/xps_cpus": "4000"
+    }
+  },
+  "process": {
+    "pid": 218697,
+    "argv": [
+      "/mnt/dev/keylane-main-f666837.siARSe/keylane",
+      "--bind",
+      "172.16.0.4",
+      "--port",
+      "16379",
+      "--metrics-port",
+      "19100",
+      "--threads",
+      "12",
+      "--pin-workers",
+      "--shutdown-checkpoint",
+      "--data-file",
+      "/dev/md127p4",
+      "--flush-max-ms",
+      "100",
+      "--log-dir",
+      "/mnt/dev/ycsb-default-host-rerun-20260916/keylane-server-logs"
+    ],
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "threads": [
+      {
+        "tid": 218697,
+        "comm": "keylane",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ]
+      },
+      {
+        "tid": 218702,
+        "comm": "keylane",
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "tid": 218703,
+        "comm": "keylane",
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "tid": 218704,
+        "comm": "keylane",
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "tid": 218705,
+        "comm": "keylane",
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "tid": 218706,
+        "comm": "keylane",
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "tid": 218707,
+        "comm": "keylane",
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "tid": 218708,
+        "comm": "keylane",
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "tid": 218709,
+        "comm": "keylane",
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "tid": 218710,
+        "comm": "keylane",
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "tid": 218711,
+        "comm": "keylane",
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "tid": 218712,
+        "comm": "keylane",
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "tid": 218713,
+        "comm": "keylane",
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "tid": 218714,
+        "comm": "iou-wrk-218702",
+        "affinity": [
+          0
+        ]
+      },
+      {
+        "tid": 218715,
+        "comm": "iou-wrk-218708",
+        "affinity": [
+          6
+        ]
+      },
+      {
+        "tid": 218716,
+        "comm": "iou-wrk-218705",
+        "affinity": [
+          3
+        ]
+      },
+      {
+        "tid": 218717,
+        "comm": "iou-wrk-218711",
+        "affinity": [
+          9
+        ]
+      },
+      {
+        "tid": 218718,
+        "comm": "iou-wrk-218704",
+        "affinity": [
+          2
+        ]
+      },
+      {
+        "tid": 218719,
+        "comm": "iou-wrk-218713",
+        "affinity": [
+          11
+        ]
+      },
+      {
+        "tid": 218720,
+        "comm": "iou-wrk-218707",
+        "affinity": [
+          5
+        ]
+      },
+      {
+        "tid": 218721,
+        "comm": "iou-wrk-218703",
+        "affinity": [
+          1
+        ]
+      },
+      {
+        "tid": 218722,
+        "comm": "iou-wrk-218710",
+        "affinity": [
+          8
+        ]
+      },
+      {
+        "tid": 218723,
+        "comm": "iou-wrk-218712",
+        "affinity": [
+          10
+        ]
+      },
+      {
+        "tid": 218724,
+        "comm": "iou-wrk-218706",
+        "affinity": [
+          4
+        ]
+      },
+      {
+        "tid": 218725,
+        "comm": "iou-wrk-218709",
+        "affinity": [
+          7
+        ]
+      }
+    ],
+    "cgroup": "0::/keylane.slice/keylane-bench.slice/keylane-ycsb-tuned-20260916.service\n",
+    "sha256": "9162d45032c34a9ddffffd1ef8137495237256173092aa931b65890dc12b7266",
+    "stat": "218697 (keylane) S 1 218697 218697 0 -1 4194560 2306783 0 0 0 6120 2406 0 0 20 0 25 0 7593185 13818753024 2274162 18446744073709551615 102099780067328 102099792098953 140723059063008 0 0 0 0 4096 16386 0 0 0 17 1 0 0 0 0 0 102099794418016 102099794920440 102100854722560 140723059064168 140723059064430 140723059064430 140723059064779 0\n",
+    "limits": "Limit                     Soft Limit           Hard Limit           Units     \nMax cpu time              unlimited            unlimited            seconds   \nMax file size             unlimited            unlimited            bytes     \nMax data size             unlimited            unlimited            bytes     \nMax stack size            8388608              unlimited            bytes     \nMax core file size        0                    unlimited            bytes     \nMax resident set          unlimited            unlimited            bytes     \nMax processes             515053               515053               processes \nMax open files            20000                20000                files     \nMax locked memory         8388608              8388608              bytes     \nMax address space         unlimited            unlimited            bytes     \nMax file locks            unlimited            unlimited            locks     \nMax pending signals       515053               515053               signals   \nMax msgqueue size         819200               819200               bytes     \nMax nice priority         0                    0                    \nMax realtime priority     0                    0                    \nMax realtime timeout      unlimited            unlimited            us        \n"
+  },
+  "diskstats": "   7       0 loop0 11 0 28 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n   7       1 loop1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n   7       2 loop2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n   7       3 loop3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n   7       4 loop4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n   7       5 loop5 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n   7       6 loop6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n   7       7 loop7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n 259       0 nvme0n1 59667 20308 3097120 3250909 72962 295302 14314752 698180 0 221070 3949808 0 0 0 0 6445 718\n 259       1 nvme0n2 34419 7683 4908141 124595 157337 80766 6241828 175173 0 72942 340939 7460 0 56337288 20510 8950 20660\n 259       2 nvme0n2p1 33242 7052 4864063 124306 157310 80746 6241600 175151 0 142646 319961 7457 0 56267640 20503 0 0\n 259       3 nvme0n2p14 649 0 5440 131 0 0 0 0 0 131 131 0 0 0 0 0 0\n 259       4 nvme0n2p15 291 597 23358 98 2 0 2 0 0 30 98 0 0 0 0 0 0\n 259       5 nvme0n2p16 189 34 13312 47 25 20 226 20 0 65 75 3 0 69648 7 0 0\n 259       6 nvme1n1 207537524 145 1202837790 14128444 14209795 504142 2782574974 1542407448 0 6135539 1556535893 0 0 0 0 0 0\n 259       7 nvme2n1 207446424 131 1202375753 14091195 14193472 503774 2782718864 1534024823 0 5843285 1548116018 0 0 0 0 0 0\n 259       8 nvme3n1 207314190 1791 1200155516 14186021 14188109 502715 2782601016 1538435899 0 5916504 1552621921 0 0 0 0 0 0\n 259       9 nvme4n1 207245734 1896 1200131677 14106646 14174794 502157 2782508072 1538630808 0 5915809 1552737454 0 0 0 0 0 0\n 259      10 nvme5n1 207263864 1841 1200000170 14191536 14188974 502331 2782238496 1538440445 0 5983392 1552631982 0 0 0 0 0 0\n 259      11 nvme6n1 207474696 154 1202297333 14100406 14191611 503742 2782339712 1537400670 0 5989649 1551501077 0 0 0 0 0 0\n   9     127 md127 1244286852 0 7207755663 84474519 88165610 0 16694981086 213057125 0 6776568 297531644 0 0 0 0 0 0\n 259      12 md127p1 173 0 26784 49 0 0 0 0 0 22 49 0 0 0 0 0 0\n 259      15 md127p2 172 0 26784 20 0 0 0 0 0 13 20 0 0 0 0 0 0\n 259      16 md127p3 573124990 0 2824044396 37937553 5644404 0 2889916690 4512468 0 2678900 42450021 0 0 0 0 0 0\n 259      17 md127p4 1053441 0 18262572 74495 5742339 0 2465039696 4479286 0 271236 4553781 0 0 0 0 0 0\n",
+  "interrupts": "           CPU0       CPU1       CPU2       CPU3       CPU4       CPU5       CPU6       CPU7       CPU8       CPU9       CPU10      CPU11      CPU12      CPU13      CPU14      CPU15      \n  4:          0          0          0          0          0          0       2999          0          0          0          0          0          0          0          0          0  IO-APIC   4-edge      ttyS0\n  8:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0  IO-APIC   8-edge      rtc0\n  9:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0  IO-APIC   9-fasteoi   acpi\n 24:          0          0          0          0        441          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0   0-edge      nvme0q0\n 25:          0          0        460          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0   0-edge      nvme1q0\n 26:   15852571          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0   1-edge      nvme1q1\n 27:          0   15082151          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0   2-edge      nvme1q2\n 28:          0          0   15859330          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0   3-edge      nvme1q3\n 29:          0          0          0   15121474          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0   4-edge      nvme1q4\n 30:          0          0          0          0   15819114          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0   5-edge      nvme1q5\n 31:          0          0          0          0          0   15246342          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0   6-edge      nvme1q6\n 32:          0          0          0          0          0          0   16463674          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0   7-edge      nvme1q7\n 33:          0          0          0          0          0          0          0   15496500          0          0          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0   8-edge      nvme1q8\n 34:          0          0          0          0          0          0          0          0   16237024          0          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0   9-edge      nvme1q9\n 35:          0          0          0          0          0          0          0          0          0   15258233          0          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0  10-edge      nvme1q10\n 36:          0          0          0          0          0          0          0          0          0          0   15767500          0          0          0          0          0 HV-PCI-MSIX-6943:00:00.0  11-edge      nvme1q11\n 37:          0          0          0          0          0          0          0          0          0          0          0   15263148          0          0          0          0 HV-PCI-MSIX-6943:00:00.0  12-edge      nvme1q12\n 38:          0          0          0          0          0          0          0          0          0          0          0          0    6880006          0          0          0 HV-PCI-MSIX-6943:00:00.0  13-edge      nvme1q13\n 39:          0          0          0          0          0          0          0          0          0          0          0          0          0    6226096          0          0 HV-PCI-MSIX-6943:00:00.0  14-edge      nvme1q14\n 40:          0          0          0          0          0          0          0          0          0          0          0          0          0          0    7108992          0 HV-PCI-MSIX-6943:00:00.0  15-edge      nvme1q15\n 41:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0    6532956 HV-PCI-MSIX-6943:00:00.0  16-edge      nvme1q16\n 42:          0          0          0        454          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0   0-edge      nvme2q0\n 43:   15846314          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0   1-edge      nvme2q1\n 44:          0   15105498          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0   2-edge      nvme2q2\n 45:          0          0   15839325          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0   3-edge      nvme2q3\n 46:          0          0          0   15119543          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0   4-edge      nvme2q4\n 47:          0          0          0          0   15867244          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0   5-edge      nvme2q5\n 48:          0          0          0          0          0   15236779          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0   6-edge      nvme2q6\n 49:          0          0          0          0          0          0   16451895          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0   7-edge      nvme2q7\n 50:          0          0          0          0          0          0          0   15502133          0          0          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0   8-edge      nvme2q8\n 51:          0          0          0          0          0          0          0          0   16190516          0          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0   9-edge      nvme2q9\n 52:          0          0          0          0          0          0          0          0          0   15282420          0          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0  10-edge      nvme2q10\n 53:          0          0          0          0          0          0          0          0          0          0   15824760          0          0          0          0          0 HV-PCI-MSIX-0490:00:00.0  11-edge      nvme2q11\n 54:          0          0          0          0          0          0          0          0          0          0          0   15206103          0          0          0          0 HV-PCI-MSIX-0490:00:00.0  12-edge      nvme2q12\n 55:          0          0          0          0          0          0          0          0          0          0          0          0    6886493          0          0          0 HV-PCI-MSIX-0490:00:00.0  13-edge      nvme2q13\n 56:          0          0          0          0          0          0          0          0          0          0          0          0          0    6229369          0          0 HV-PCI-MSIX-0490:00:00.0  14-edge      nvme2q14\n 57:          0          0          0          0          0          0          0          0          0          0          0          0          0          0    7115265          0 HV-PCI-MSIX-0490:00:00.0  15-edge      nvme2q15\n 58:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0    6536884 HV-PCI-MSIX-0490:00:00.0  16-edge      nvme2q16\n 59:          0          0          0          0          0        454          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0   0-edge      nvme3q0\n 60:   15835323          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0   1-edge      nvme3q1\n 61:          0   15062638          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0   2-edge      nvme3q2\n 62:          0          0   15817285          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0   3-edge      nvme3q3\n 63:      16908          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0   1-edge      nvme0q1\n 64:          0      12993          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0   2-edge      nvme0q2\n 65:          0          0      21352          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0   3-edge      nvme0q3\n 66:          0          0          0       6930          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0   4-edge      nvme0q4\n 67:          0          0          0          0      19152          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0   5-edge      nvme0q5\n 68:          0          0          0          0          0       9704          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0   6-edge      nvme0q6\n 69:          0          0          0          0          0          0      15416          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0   7-edge      nvme0q7\n 70:          0          0          0          0          0          0          0      11259          0          0          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0   8-edge      nvme0q8\n 71:          0          0          0          0          0          0          0          0      18278          0          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0   9-edge      nvme0q9\n 72:          0          0          0          0          0          0          0          0          0       7767          0          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0  10-edge      nvme0q10\n 73:          0          0          0          0          0          0          0          0          0          0      24844          0          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0  11-edge      nvme0q11\n 74:          0          0          0          0          0          0          0          0          0          0          0       4142          0          0          0          0 HV-PCI-MSIX-c05b:00:00.0  12-edge      nvme0q12\n 75:          0          0          0          0          0          0          0          0          0          0          0          0      29315          0          0          0 HV-PCI-MSIX-c05b:00:00.0  13-edge      nvme0q13\n 76:          0          0          0          0          0          0          0          0          0          0          0          0          0      18441          0          0 HV-PCI-MSIX-c05b:00:00.0  14-edge      nvme0q14\n 77:          0          0          0          0          0          0          0          0          0          0          0          0          0          0      30984          0 HV-PCI-MSIX-c05b:00:00.0  15-edge      nvme0q15\n 78:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0      41572 HV-PCI-MSIX-c05b:00:00.0  16-edge      nvme0q16\n 79:          0          0          0   15115545          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0   4-edge      nvme3q4\n 80:          0          0          0          0   15811418          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0   5-edge      nvme3q5\n 81:          0          0          0          0          0   15208337          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0   6-edge      nvme3q6\n 82:          0          0          0          0          0          0   16463936          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0   7-edge      nvme3q7\n 83:          0          0          0          0          0          0          0   15486420          0          0          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0   8-edge      nvme3q8\n 84:          0          0          0          0          0          0          0          0   16199677          0          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0   9-edge      nvme3q9\n 85:          0          0          0          0          0          0          0          0          0   15253499          0          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0  10-edge      nvme3q10\n 86:          0          0          0          0          0          0          0          0          0          0   15772929          0          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0  11-edge      nvme3q11\n 87:          0          0          0          0          0          0          0          0          0          0          0   15229574          0          0          0          0 HV-PCI-MSIX-2b6b:00:00.0  12-edge      nvme3q12\n 88:          0          0          0          0          0          0          0          0          0          0          0          0    6868552          0          0          0 HV-PCI-MSIX-2b6b:00:00.0  13-edge      nvme3q13\n 89:          0          0          0          0          0          0          0          0          0          0          0          0          0    6218385          0          0 HV-PCI-MSIX-2b6b:00:00.0  14-edge      nvme3q14\n 90:          0          0          0          0          0          0          0          0          0          0          0          0          0          0    7095875          0 HV-PCI-MSIX-2b6b:00:00.0  15-edge      nvme3q15\n 91:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0    6517109 HV-PCI-MSIX-2b6b:00:00.0  16-edge      nvme3q16\n 92:          0          0          0          0          0          0          0        454          0          0          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0   0-edge      nvme4q0\n 93:   15832642          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0   1-edge      nvme4q1\n 94:          0   15058914          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0   2-edge      nvme4q2\n 95:          0          0   15832561          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0   3-edge      nvme4q3\n 96:          0          0          0   15115472          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0   4-edge      nvme4q4\n 97:          0          0          0          0   15825664          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0   5-edge      nvme4q5\n 98:          0          0          0          0          0   15233318          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0   6-edge      nvme4q6\n 99:          0          0          0          0          0          0   16437145          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0   7-edge      nvme4q7\n100:          0          0          0          0          0          0          0   15466911          0          0          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0   8-edge      nvme4q8\n101:          0          0          0          0          0          0          0          0   16197812          0          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0   9-edge      nvme4q9\n102:          0          0          0          0          0          0          0          0          0   15282060          0          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0  10-edge      nvme4q10\n103:          0          0          0          0          0          0          0          0          0          0   15772133          0          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0  11-edge      nvme4q11\n104:          0          0          0          0          0          0          0          0          0          0          0   15203987          0          0          0          0 HV-PCI-MSIX-06a5:00:00.0  12-edge      nvme4q12\n105:          0          0          0          0          0          0          0          0          0          0          0          0    6866931          0          0          0 HV-PCI-MSIX-06a5:00:00.0  13-edge      nvme4q13\n106:          0          0          0          0          0          0          0          0          0          0          0          0          0    6222873          0          0 HV-PCI-MSIX-06a5:00:00.0  14-edge      nvme4q14\n107:          0          0          0          0          0          0          0          0          0          0          0          0          0          0    7098002          0 HV-PCI-MSIX-06a5:00:00.0  15-edge      nvme4q15\n108:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0    6519856 HV-PCI-MSIX-06a5:00:00.0  16-edge      nvme4q16\n109:          0          0          0          0          0          0          0          0          0        454          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0   0-edge      nvme5q0\n110:   15817612          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0   1-edge      nvme5q1\n111:          0   15066831          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0   2-edge      nvme5q2\n112:          0          0   15823733          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0   3-edge      nvme5q3\n113:          0          0          0   15122054          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0   4-edge      nvme5q4\n114:          0          0          0          0   15838306          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0   5-edge      nvme5q5\n115:          0          0          0          0          0   15209360          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0   6-edge      nvme5q6\n116:          0          0          0          0          0          0   16473022          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0   7-edge      nvme5q7\n117:          0          0          0          0          0          0          0   15460222          0          0          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0   8-edge      nvme5q8\n118:          0          0          0          0          0          0          0          0   16197883          0          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0   9-edge      nvme5q9\n119:          0          0          0          0          0          0          0          0          0   15251400          0          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0  10-edge      nvme5q10\n120:          0          0          0          0          0          0          0          0          0          0   15789625          0          0          0          0          0 HV-PCI-MSIX-7138:00:00.0  11-edge      nvme5q11\n121:          0          0          0          0          0          0          0          0          0          0          0   15243482          0          0          0          0 HV-PCI-MSIX-7138:00:00.0  12-edge      nvme5q12\n122:          0          0          0          0          0          0          0          0          0          0          0          0    6865064          0          0          0 HV-PCI-MSIX-7138:00:00.0  13-edge      nvme5q13\n123:          0          0          0          0          0          0          0          0          0          0          0          0          0    6217747          0          0 HV-PCI-MSIX-7138:00:00.0  14-edge      nvme5q14\n124:          0          0          0          0          0          0          0          0          0          0          0          0          0          0    7093020          0 HV-PCI-MSIX-7138:00:00.0  15-edge      nvme5q15\n125:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0    6511245 HV-PCI-MSIX-7138:00:00.0  16-edge      nvme5q16\n126:          0          0          0          0          0          0          0          0          0          0          0        454          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0   0-edge      nvme6q0\n127:   15875577          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0   1-edge      nvme6q1\n128:          0   15073901          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0   2-edge      nvme6q2\n129:          0          0   15829651          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0   3-edge      nvme6q3\n130:          0          0          0   15167832          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0   4-edge      nvme6q4\n131:          0          0          0          0   15861981          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0   5-edge      nvme6q5\n132:          0          0          0          0          0   15219404          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0   6-edge      nvme6q6\n133:          0          0          0          0          0          0   16523899          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0   7-edge      nvme6q7\n134:          0          0          0          0          0          0          0   15479430          0          0          0          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0   8-edge      nvme6q8\n135:          0          0          0          0          0          0          0          0   16211694          0          0          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0   9-edge      nvme6q9\n136:          0          0          0          0          0          0          0          0          0   15305200          0          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0  10-edge      nvme6q10\n137:          0          0          0          0          0          0          0          0          0          0   15808101          0          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0  11-edge      nvme6q11\n138:          0          0          0          0          0          0          0          0          0          0          0   15248186          0          0          0          0 HV-PCI-MSIX-44e8:00:00.0  12-edge      nvme6q12\n139:          0          0          0          0          0          0          0          0          0          0          0          0    6871765          0          0          0 HV-PCI-MSIX-44e8:00:00.0  13-edge      nvme6q13\n140:          0          0          0          0          0          0          0          0          0          0          0          0          0    6223143          0          0 HV-PCI-MSIX-44e8:00:00.0  14-edge      nvme6q14\n141:          0          0          0          0          0          0          0          0          0          0          0          0          0          0    7104633          0 HV-PCI-MSIX-44e8:00:00.0  15-edge      nvme6q15\n142:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0    6529731 HV-PCI-MSIX-44e8:00:00.0  16-edge      nvme6q16\n143:          0          0          0          0          0          0          0          0    4833701          0          0          0     345894          0          0          0 HV-PCI-MSIX-0cba:00:02.0   0-edge      mlx5_async0@pci:0cba:00:02.0\n144:   38481814          0          0          0          0          0          0          0          0          0          0          0          0    3780413          0          0 HV-PCI-MSIX-0cba:00:02.0   1-edge      mlx5_comp0@pci:0cba:00:02.0\n145:          0          0          0          0          0          0          0          0          0          0   14527341          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0   0-edge      mlx5_async0@pci:1641:00:02.0\n146:  148597893          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0   1-edge      mlx5_comp0@pci:1641:00:02.0\n147:          0   37147098          0          0          0          0          0          0          0          0          0          0          0          0    3196398          0 HV-PCI-MSIX-0cba:00:02.0   2-edge      mlx5_comp1@pci:0cba:00:02.0\n148:          0          0   38987695          0          0          0          0          0          0          0          0          0          0          0          0    3199839 HV-PCI-MSIX-0cba:00:02.0   3-edge      mlx5_comp2@pci:0cba:00:02.0\n149:          0          0          0   36943527          0          0          0          0          0          0          0          0    3282578          0          0          0 HV-PCI-MSIX-0cba:00:02.0   4-edge      mlx5_comp3@pci:0cba:00:02.0\n150:          0          0          0          0   39033284          0          0          0          0          0          0          0          0    3942700          0          0 HV-PCI-MSIX-0cba:00:02.0   5-edge      mlx5_comp4@pci:0cba:00:02.0\n151:          0          0          0          0          0   36831763          0          0          0          0          0          0          0          0    3229404          0 HV-PCI-MSIX-0cba:00:02.0   6-edge      mlx5_comp5@pci:0cba:00:02.0\n152:          0          0          0          0          0          0   39027234          0          0          0          0          0          0          0          0    3228912 HV-PCI-MSIX-0cba:00:02.0   7-edge      mlx5_comp6@pci:0cba:00:02.0\n153:          0          0          0          0          0          0          0   33475475          0          0          0          0    3288157          0          0          0 HV-PCI-MSIX-0cba:00:02.0   8-edge      mlx5_comp7@pci:0cba:00:02.0\n154:          0          0          0          0          0          0          0          0   38281363          0          0          0          0    3783627          0          0 HV-PCI-MSIX-0cba:00:02.0   9-edge      mlx5_comp8@pci:0cba:00:02.0\n155:          0          0          0          0          0          0          0          0          0   37617932          0          0          0          0    3427980          0 HV-PCI-MSIX-0cba:00:02.0  10-edge      mlx5_comp9@pci:0cba:00:02.0\n156:          0          0          0          0          0          0          0          0          0          0   39177944          0          0          0          0    2931883 HV-PCI-MSIX-0cba:00:02.0  11-edge      mlx5_comp10@pci:0cba:00:02.0\n157:          0          0          0          0          0          0          0          0          0          0          0   35871402    3156996          0          0          0 HV-PCI-MSIX-0cba:00:02.0  12-edge      mlx5_comp11@pci:0cba:00:02.0\n158:          0          0          0          0          0          0          0          0          0          0          0          0   40053540    2526012          0          0 HV-PCI-MSIX-0cba:00:02.0  13-edge      mlx5_comp12@pci:0cba:00:02.0\n159:          0          0          0          0          0          0          0          0          0          0          0          0          0   36100295    2196245          0 HV-PCI-MSIX-0cba:00:02.0  14-edge      mlx5_comp13@pci:0cba:00:02.0\n160:          0          0          0          0          0          0          0          0          0          0          0          0          0          0   38004955    2151682 HV-PCI-MSIX-0cba:00:02.0  15-edge      mlx5_comp14@pci:0cba:00:02.0\n161:          0          0          0          0          0          0          0          0          0          0          0          0    2365218          0          0   37458467 HV-PCI-MSIX-0cba:00:02.0  16-edge      mlx5_comp15@pci:0cba:00:02.0\n162:          0  147615107          0          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0   2-edge      mlx5_comp1@pci:1641:00:02.0\n163:          0          0  144967781          0          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0   3-edge      mlx5_comp2@pci:1641:00:02.0\n164:          0          0          0  150039968          0          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0   4-edge      mlx5_comp3@pci:1641:00:02.0\n165:          0          0          0          0  150198578          0          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0   5-edge      mlx5_comp4@pci:1641:00:02.0\n166:          0          0          0          0          0  147999012          0          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0   6-edge      mlx5_comp5@pci:1641:00:02.0\n167:          0          0          0          0          0          0  147466919          0          0          0          0          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0   7-edge      mlx5_comp6@pci:1641:00:02.0\n168:          0          0          0          0          0          0          0  147983716          0          0          0          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0   8-edge      mlx5_comp7@pci:1641:00:02.0\n169:          0          0          0          0          0          0          0          0  150435244          0          0          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0   9-edge      mlx5_comp8@pci:1641:00:02.0\n170:          0          0          0          0          0          0          0          0          0  146104277          0          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0  10-edge      mlx5_comp9@pci:1641:00:02.0\n171:          0          0          0          0          0          0          0          0          0          0  148569870          0          0          0          0          0 HV-PCI-MSIX-1641:00:02.0  11-edge      mlx5_comp10@pci:1641:00:02.0\n172:          0          0          0          0          0          0          0          0          0          0          0  146984017          0          0          0          0 HV-PCI-MSIX-1641:00:02.0  12-edge      mlx5_comp11@pci:1641:00:02.0\n173:          0          0          0          0          0          0          0          0          0          0          0          0  125711009          0          0          0 HV-PCI-MSIX-1641:00:02.0  13-edge      mlx5_comp12@pci:1641:00:02.0\n174:          0          0          0          0          0          0          0          0          0          0          0          0          0  121032575          0          0 HV-PCI-MSIX-1641:00:02.0  14-edge      mlx5_comp13@pci:1641:00:02.0\n175:          0          0          0          0          0          0          0          0          0          0          0          0          0          0  116872449          0 HV-PCI-MSIX-1641:00:02.0  15-edge      mlx5_comp14@pci:1641:00:02.0\n176:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0  131018041 HV-PCI-MSIX-1641:00:02.0  16-edge      mlx5_comp15@pci:1641:00:02.0\nNMI:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Non-maskable interrupts\nLOC:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Local timer interrupts\nSPU:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Spurious interrupts\nPMI:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Performance monitoring interrupts\nIWI:         26       3407         32          0          0          1          0          0          0          0          1          0          1        105          1          0   IRQ work interrupts\nRTR:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   APIC ICR read retries\nRES:    2728710    2793802    2718752    2961760    2947891    2821037    2694257    2638710    2843852    2802323    2110678    2665285    1305209    1160804    1137955    1217446   Rescheduling interrupts\nCAL:   45256936   37689417   42709174   36991526   42801790   36709484   42878542   38808266   43128615   37473872   42557790   36716246   24755018   13422705   20026909   15404899   Function call interrupts\nTLB:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   TLB shootdowns\nTRM:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Thermal event interrupts\nTHR:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Threshold APIC interrupts\nDFR:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Deferred Error APIC interrupts\nMCE:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Machine check exceptions\nMCP:        232        232        232        232        232        232        232        232        232        232        232        232        232        232        232        232   Machine check polls\nHYP:     298691       3150         52         11         12         22          2          0         18         12          8          4         18          6         10         24   Hypervisor callback interrupts\nHRE:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Hyper-V reenlightenment interrupts\nHVS:   24251809   23052653   25591298   23192903   25772469   23132475   25056137   22666498   25423388   22884024   25317752   22383474   13660520   12908667   13477645    8581781   Hyper-V stimer0 interrupts\nERR:          0\nMIS:          0\nPIN:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Posted-interrupt notification event\nNPI:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Nested posted-interrupt event\nPIW:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0   Posted-interrupt wakeup event\n",
+  "meminfo": "MemTotal:       131900976 kB\nMemFree:        116266300 kB\nMemAvailable:   119897636 kB\nBuffers:          312648 kB\nCached:          4241948 kB\nSwapCached:            0 kB\nActive:         11462540 kB\nInactive:        2898936 kB\nActive(anon):    9817312 kB\nInactive(anon):     2668 kB\nActive(file):    1645228 kB\nInactive(file):  2896268 kB\nUnevictable:       30724 kB\nMlocked:           27652 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              1228 kB\nWriteback:             0 kB\nAnonPages:       9789580 kB\nMapped:           276940 kB\nShmem:              4340 kB\nKReclaimable:     295044 kB\nSlab:             556004 kB\nSReclaimable:     295044 kB\nSUnreclaim:       260960 kB\nKernelStack:        6720 kB\nPageTables:        28388 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    65950488 kB\nCommitted_AS:     895084 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       63036 kB\nVmallocChunk:          0 kB\nPercpu:            11392 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:    233472 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:    393216 kB\nFilePmdMapped:         0 kB\nCmaTotal:              0 kB\nCmaFree:               0 kB\nUnaccepted:            0 kB\nBalloon:               0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:      203800 kB\nDirectMap2M:    11325440 kB\nDirectMap1G:    124780544 kB\n",
+  "dbsize": 100000000,
+  "metrics": "# HELP keylane_server_ready Whether storage recovery is complete and Redis requests are being accepted.\n# TYPE keylane_server_ready gauge\nkeylane_server_ready 1\n# HELP keylane_commands_total Completed Redis commands.\n# TYPE keylane_commands_total counter\nkeylane_commands_total 1000022\n# HELP keylane_command_calls_total Completed Redis commands by command.\n# TYPE keylane_command_calls_total counter\nkeylane_command_calls_total{command=\"ping\"} 1\nkeylane_command_calls_total{command=\"dbsize\"} 4\nkeylane_command_calls_total{command=\"hgetall\"} 1000008\nkeylane_command_calls_total{command=\"config\"} 3\nkeylane_command_calls_total{command=\"info\"} 3\nkeylane_command_calls_total{command=\"defrag\"} 3\n# HELP keylane_command_duration_seconds Redis command execution latency, excluding socket response writes.\n# TYPE keylane_command_duration_seconds histogram\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.000001\"} 0\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.000002\"} 0\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.000004\"} 0\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.000008\"} 0\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.000016\"} 0\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.000032\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.000064\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.000128\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.000256\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.000512\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.001\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.00125\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.0015\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.002\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.0025\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.003\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.0035\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.004\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.005\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.006\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.008\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.016\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.032\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.064\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.128\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.256\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"0.512\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"1\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"2\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"4\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"8\"} 1\nkeylane_command_duration_seconds_bucket{command=\"ping\",le=\"+Inf\"} 1\nkeylane_command_duration_seconds_sum{command=\"ping\"} 2.26135e-05\nkeylane_command_duration_seconds_count{command=\"ping\"} 1\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.000001\"} 0\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.000002\"} 0\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.000004\"} 0\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.000008\"} 0\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.000016\"} 0\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.000032\"} 0\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.000064\"} 0\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.000128\"} 0\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.000256\"} 0\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.000512\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.001\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.00125\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.0015\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.002\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.0025\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.003\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.0035\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.004\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.005\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.006\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.008\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.016\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.032\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.064\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.128\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.256\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"0.512\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"1\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"2\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"4\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"8\"} 4\nkeylane_command_duration_seconds_bucket{command=\"dbsize\",le=\"+Inf\"} 4\nkeylane_command_duration_seconds_sum{command=\"dbsize\"} 0.00136101\nkeylane_command_duration_seconds_count{command=\"dbsize\"} 4\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.000001\"} 0\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.000002\"} 0\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.000004\"} 0\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.000008\"} 0\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.000016\"} 0\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.000032\"} 0\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.000064\"} 14461\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.000128\"} 992450\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.000256\"} 999894\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.000512\"} 1000001\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.001\"} 1000007\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.00125\"} 1000007\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.0015\"} 1000007\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.002\"} 1000007\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.0025\"} 1000007\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.003\"} 1000007\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.0035\"} 1000007\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.004\"} 1000007\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.005\"} 1000007\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.006\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.008\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.016\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.032\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.064\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.128\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.256\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"0.512\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"1\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"2\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"4\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"8\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"hgetall\",le=\"+Inf\"} 1000008\nkeylane_command_duration_seconds_sum{command=\"hgetall\"} 89.3466\nkeylane_command_duration_seconds_count{command=\"hgetall\"} 1000008\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.000001\"} 0\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.000002\"} 0\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.000004\"} 0\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.000008\"} 1\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.000016\"} 2\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.000032\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.000064\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.000128\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.000256\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.000512\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.001\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.00125\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.0015\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.002\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.0025\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.003\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.0035\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.004\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.005\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.006\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.008\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.016\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.032\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.064\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.128\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.256\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"0.512\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"1\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"2\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"4\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"8\"} 3\nkeylane_command_duration_seconds_bucket{command=\"config\",le=\"+Inf\"} 3\nkeylane_command_duration_seconds_sum{command=\"config\"} 3.26584e-05\nkeylane_command_duration_seconds_count{command=\"config\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.000001\"} 0\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.000002\"} 0\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.000004\"} 0\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.000008\"} 0\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.000016\"} 0\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.000032\"} 0\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.000064\"} 0\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.000128\"} 0\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.000256\"} 0\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.000512\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.001\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.00125\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.0015\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.002\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.0025\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.003\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.0035\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.004\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.005\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.006\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.008\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.016\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.032\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.064\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.128\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.256\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"0.512\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"1\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"2\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"4\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"8\"} 3\nkeylane_command_duration_seconds_bucket{command=\"info\",le=\"+Inf\"} 3\nkeylane_command_duration_seconds_sum{command=\"info\"} 0.00108608\nkeylane_command_duration_seconds_count{command=\"info\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.000001\"} 0\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.000002\"} 0\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.000004\"} 0\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.000008\"} 2\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.000016\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.000032\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.000064\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.000128\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.000256\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.000512\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.001\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.00125\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.0015\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.002\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.0025\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.003\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.0035\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.004\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.005\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.006\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.008\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.016\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.032\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.064\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.128\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.256\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"0.512\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"1\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"2\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"4\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"8\"} 3\nkeylane_command_duration_seconds_bucket{command=\"defrag\",le=\"+Inf\"} 3\nkeylane_command_duration_seconds_sum{command=\"defrag\"} 2.025e-05\nkeylane_command_duration_seconds_count{command=\"defrag\"} 3\n# HELP keylane_storage_io_operations_total Completed storage I/O operations.\n# TYPE keylane_storage_io_operations_total counter\nkeylane_storage_io_operations_total{operation=\"read\"} 1022092\nkeylane_storage_io_operations_total{operation=\"write\"} 14\nkeylane_storage_io_operations_total{operation=\"fdatasync\"} 14\n# HELP keylane_storage_io_bytes_total Bytes completed by storage reads and writes, or covered by successful fdatasync barriers.\n# TYPE keylane_storage_io_bytes_total counter\nkeylane_storage_io_bytes_total{operation=\"read\"} 9325590528\nkeylane_storage_io_bytes_total{operation=\"write\"} 57344\nkeylane_storage_io_bytes_total{operation=\"fdatasync\"} 57344\n# HELP keylane_connections Current TCP connections, including Redis clients, metrics scrapes, and replication.\n# TYPE keylane_connections gauge\nkeylane_connections 2\n# HELP keylane_connected_clients Current Redis client connections.\n# TYPE keylane_connected_clients gauge\nkeylane_connected_clients 1\n# HELP keylane_blocked_clients Redis clients waiting in blocking commands.\n# TYPE keylane_blocked_clients gauge\nkeylane_blocked_clients 0\n# HELP keylane_replication_control_connections Current native replication control connections.\n# TYPE keylane_replication_control_connections gauge\nkeylane_replication_control_connections 0\n# HELP keylane_replication_flow_connections Current native replication data-flow connections.\n# TYPE keylane_replication_flow_connections gauge\nkeylane_replication_flow_connections 0\n# HELP keylane_cluster_control_connected Whether worker 0 currently holds an accepted Meta control session.\n# TYPE keylane_cluster_control_connected gauge\nkeylane_cluster_control_connected 0\n# HELP keylane_cluster_control_reconnects_total Meta control reconnect rounds after the initial attempt.\n# TYPE keylane_cluster_control_reconnects_total counter\nkeylane_cluster_control_reconnects_total 0\n# HELP keylane_cluster_control_protocol_errors_total Control sessions closed for invalid framing or protocol state.\n# TYPE keylane_cluster_control_protocol_errors_total counter\nkeylane_cluster_control_protocol_errors_total 0\n# HELP keylane_cluster_control_full_states_applied_total Complete Meta projections installed by the data node.\n# TYPE keylane_cluster_control_full_states_applied_total counter\nkeylane_cluster_control_full_states_applied_total 0\n# HELP keylane_cluster_control_lease_decisions_total Lease decisions received from Meta.\n# TYPE keylane_cluster_control_lease_decisions_total counter\nkeylane_cluster_control_lease_decisions_total{decision=\"granted\"} 0\nkeylane_cluster_control_lease_decisions_total{decision=\"denied\"} 0\n# HELP keylane_cluster_control_lease_expirations_total Locally detected control lease expirations.\n# TYPE keylane_cluster_control_lease_expirations_total counter\nkeylane_cluster_control_lease_expirations_total 0\n# HELP keylane_cluster_control_directive_results_total Data-side directive execution results.\n# TYPE keylane_cluster_control_directive_results_total counter\nkeylane_cluster_control_directive_results_total{result=\"success\"} 0\nkeylane_cluster_control_directive_results_total{result=\"failure\"} 0\n# HELP keylane_storage_defrag_runs_total Completed defrag attempts.\n# TYPE keylane_storage_defrag_runs_total counter\nkeylane_storage_defrag_runs_total{result=\"success\"} 0\nkeylane_storage_defrag_runs_total{result=\"resource_exhausted\"} 0\nkeylane_storage_defrag_runs_total{result=\"error\"} 0\n# HELP keylane_storage_defrag_active Currently running defrag jobs.\n# TYPE keylane_storage_defrag_active gauge\nkeylane_storage_defrag_active 0\n# HELP keylane_storage_defrag_pending Queued defrag jobs.\n# TYPE keylane_storage_defrag_pending gauge\nkeylane_storage_defrag_pending 0\n# HELP keylane_storage_defrag_paused Whether relocation jobs are paused while candidates remain queued.\n# TYPE keylane_storage_defrag_paused gauge\nkeylane_storage_defrag_paused 0\n# HELP keylane_storage_defrag_max_active_per_device Runtime maximum concurrent relocations per device.\n# TYPE keylane_storage_defrag_max_active_per_device gauge\nkeylane_storage_defrag_max_active_per_device 8\n# HELP keylane_storage_defrag_block_sleep_seconds Runtime cooldown after each relocated block.\n# TYPE keylane_storage_defrag_block_sleep_seconds gauge\nkeylane_storage_defrag_block_sleep_seconds 0\n# HELP keylane_storage_defrag_record_sleep_seconds Runtime pause after each record examined by defrag.\n# TYPE keylane_storage_defrag_record_sleep_seconds gauge\nkeylane_storage_defrag_record_sleep_seconds 0\n# HELP keylane_memory_current_bytes Current process memory used for limit enforcement.\n# TYPE keylane_memory_current_bytes gauge\nkeylane_memory_current_bytes 6466459104\n# HELP keylane_memory_used_bytes Allocator usable bytes used for limit enforcement.\n# TYPE keylane_memory_used_bytes gauge\nkeylane_memory_used_bytes 6466459104\n# HELP keylane_memory_rss_bytes Resident process memory.\n# TYPE keylane_memory_rss_bytes gauge\nkeylane_memory_rss_bytes 9316016128\n# HELP keylane_memory_committed_bytes Memory committed by the configured allocator.\n# TYPE keylane_memory_committed_bytes gauge\nkeylane_memory_committed_bytes 10837491712\n# HELP keylane_memory_reserved_bytes Address space reserved by the configured allocator.\n# TYPE keylane_memory_reserved_bytes gauge\nkeylane_memory_reserved_bytes 12888637440\n# HELP keylane_memory_max_bytes Configured process memory limit.\n# TYPE keylane_memory_max_bytes gauge\nkeylane_memory_max_bytes 108053279540\n# HELP keylane_client_request_buffer_limit_bytes Effective ordinary client request-buffer limit.\n# TYPE keylane_client_request_buffer_limit_bytes gauge\nkeylane_client_request_buffer_limit_bytes 5402663977\n# HELP keylane_client_buffered_request_bytes Ordinary client request bytes read but not yet retired.\n# TYPE keylane_client_buffered_request_bytes gauge\nkeylane_client_buffered_request_bytes 0\n# HELP keylane_fullsync_reserved_memory_bytes Memory headroom reserved for active full-sync coverage maps.\n# TYPE keylane_fullsync_reserved_memory_bytes gauge\nkeylane_fullsync_reserved_memory_bytes 0\n# HELP keylane_memory_admission_pending_bytes Worker-local headroom held while slow-path allocations become allocator-visible.\n# TYPE keylane_memory_admission_pending_bytes gauge\nkeylane_memory_admission_pending_bytes 0\n# HELP keylane_memory_rejected_commands_total Commands rejected by the memory limit.\n# TYPE keylane_memory_rejected_commands_total counter\nkeylane_memory_rejected_commands_total 0\n# HELP keylane_storage_capacity_bytes Usable data capacity.\n# TYPE keylane_storage_capacity_bytes gauge\n# HELP keylane_storage_available_bytes Space available to foreground writes after preserving the defrag reserve.\n# TYPE keylane_storage_available_bytes gauge\n# HELP keylane_filesystem_available_bytes Space available on the data file's filesystem.\n# TYPE keylane_filesystem_available_bytes gauge\n# HELP keylane_worker_retained_memory_bytes Retained bytes charged to this worker's admission share.\n# TYPE keylane_worker_retained_memory_bytes gauge\n# HELP keylane_worker_memory_admission_pending_bytes Headroom held by this worker while retained allocations become visible.\n# TYPE keylane_worker_memory_admission_pending_bytes gauge\n# HELP keylane_worker_fullsync_reserved_memory_bytes Retained headroom reserved by this worker's active full-sync coverage maps.\n# TYPE keylane_worker_fullsync_reserved_memory_bytes gauge\n# HELP keylane_worker_client_buffered_request_bytes Client request bytes currently charged to this worker's separate buffer quota.\n# TYPE keylane_worker_client_buffered_request_bytes gauge\n# HELP keylane_worker_memory_limit_bytes Retained-memory admission limit assigned to this worker.\n# TYPE keylane_worker_memory_limit_bytes gauge\nkeylane_worker_retained_memory_bytes{worker=\"0\"} 539854032\nkeylane_worker_memory_admission_pending_bytes{worker=\"0\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"0\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"0\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"0\"} 8103995966\nkeylane_worker_retained_memory_bytes{worker=\"1\"} 538739776\nkeylane_worker_memory_admission_pending_bytes{worker=\"1\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"1\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"1\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"1\"} 8103995966\nkeylane_worker_retained_memory_bytes{worker=\"2\"} 538724880\nkeylane_worker_memory_admission_pending_bytes{worker=\"2\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"2\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"2\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"2\"} 8103995966\nkeylane_worker_retained_memory_bytes{worker=\"3\"} 538734448\nkeylane_worker_memory_admission_pending_bytes{worker=\"3\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"3\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"3\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"3\"} 8103995966\nkeylane_worker_retained_memory_bytes{worker=\"4\"} 538662904\nkeylane_worker_memory_admission_pending_bytes{worker=\"4\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"4\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"4\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"4\"} 8103995966\nkeylane_worker_retained_memory_bytes{worker=\"5\"} 538659792\nkeylane_worker_memory_admission_pending_bytes{worker=\"5\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"5\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"5\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"5\"} 8103995966\nkeylane_worker_retained_memory_bytes{worker=\"6\"} 538685008\nkeylane_worker_memory_admission_pending_bytes{worker=\"6\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"6\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"6\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"6\"} 8103995965\nkeylane_worker_retained_memory_bytes{worker=\"7\"} 539757272\nkeylane_worker_memory_admission_pending_bytes{worker=\"7\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"7\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"7\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"7\"} 8103995965\nkeylane_worker_retained_memory_bytes{worker=\"8\"} 538645592\nkeylane_worker_memory_admission_pending_bytes{worker=\"8\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"8\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"8\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"8\"} 8103995965\nkeylane_worker_retained_memory_bytes{worker=\"9\"} 538664736\nkeylane_worker_memory_admission_pending_bytes{worker=\"9\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"9\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"9\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"9\"} 8103995965\nkeylane_worker_retained_memory_bytes{worker=\"10\"} 538663848\nkeylane_worker_memory_admission_pending_bytes{worker=\"10\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"10\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"10\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"10\"} 8103995965\nkeylane_worker_retained_memory_bytes{worker=\"11\"} 538666816\nkeylane_worker_memory_admission_pending_bytes{worker=\"11\"} 0\nkeylane_worker_fullsync_reserved_memory_bytes{worker=\"11\"} 0\nkeylane_worker_client_buffered_request_bytes{worker=\"11\"} 0\nkeylane_worker_memory_limit_bytes{worker=\"11\"} 8103995965\n# HELP keylane_replication_backlog_bytes Allocated shared in-memory replication backlog bytes.\n# TYPE keylane_replication_backlog_bytes gauge\n# HELP keylane_replication_backlog_capacity_bytes Configured shared in-memory replication backlog capacity.\n# TYPE keylane_replication_backlog_capacity_bytes gauge\n# HELP keylane_replication_backlog_chunks Allocated 8 MiB replication backlog chunks.\n# TYPE keylane_replication_backlog_chunks gauge\n# HELP keylane_replication_backlog_floor_lsn Oldest retained flow LSN.\n# TYPE keylane_replication_backlog_floor_lsn gauge\n# HELP keylane_replication_backlog_tail_lsn Newest published flow LSN.\n# TYPE keylane_replication_backlog_tail_lsn gauge\n# HELP keylane_replication_backlog_pinned_cursors Live replica ACK coverage claims.\n# TYPE keylane_replication_backlog_pinned_cursors gauge\n# HELP keylane_replication_backlog_active Whether this worker's shared replication history is active.\n# TYPE keylane_replication_backlog_active gauge\n# HELP keylane_replication_backlog_coverage_revocations_total Lagging coverage claims revoked at the hard cap when backpressure is disabled.\n# TYPE keylane_replication_backlog_coverage_revocations_total counter\n# HELP keylane_replication_backlog_backpressure_waits_total Backlog capacity conflicts that waited for retained cursor progress.\n# TYPE keylane_replication_backlog_backpressure_waits_total counter\n# HELP keylane_replication_backlog_backpressured Whether this worker is currently waiting for retained cursor progress.\n# TYPE keylane_replication_backlog_backpressured gauge\n# HELP keylane_replication_publish_queue_bytes Commands staged before the shared backlog.\n# TYPE keylane_replication_publish_queue_bytes gauge\n# HELP keylane_replication_publish_queue_capacity_bytes Configured publisher staging capacity.\n# TYPE keylane_replication_publish_queue_capacity_bytes gauge\n# HELP keylane_fullsync_publish_queue_bytes Commands awaiting durable target ACK in active full-sync sessions.\n# TYPE keylane_fullsync_publish_queue_bytes gauge\n# HELP keylane_fullsync_publish_queue_admitted_bytes Bytes reserved by writes that have not finished publication.\n# TYPE keylane_fullsync_publish_queue_admitted_bytes gauge\n# HELP keylane_fullsync_publish_queue_capacity_bytes Aggregate configured capacity of active full-sync session queues.\n# TYPE keylane_fullsync_publish_queue_capacity_bytes gauge\n# HELP keylane_fullsync_sessions Active full-sync sessions on this worker.\n# TYPE keylane_fullsync_sessions gauge\n# HELP keylane_fullsync_publish_queue_backpressure_waits_total Writes that waited for full-sync queue credit.\n# TYPE keylane_fullsync_publish_queue_backpressure_waits_total counter\nkeylane_replication_backlog_bytes{worker=\"0\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"0\"} 0\nkeylane_replication_backlog_chunks{worker=\"0\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"0\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"0\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"0\"} 0\nkeylane_replication_backlog_active{worker=\"0\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"0\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"0\"} 0\nkeylane_replication_backlog_backpressured{worker=\"0\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"0\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"0\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"0\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"0\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"0\"} 0\nkeylane_fullsync_sessions{worker=\"0\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"0\"} 0\nkeylane_replication_backlog_bytes{worker=\"1\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"1\"} 0\nkeylane_replication_backlog_chunks{worker=\"1\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"1\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"1\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"1\"} 0\nkeylane_replication_backlog_active{worker=\"1\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"1\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"1\"} 0\nkeylane_replication_backlog_backpressured{worker=\"1\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"1\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"1\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"1\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"1\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"1\"} 0\nkeylane_fullsync_sessions{worker=\"1\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"1\"} 0\nkeylane_replication_backlog_bytes{worker=\"2\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"2\"} 0\nkeylane_replication_backlog_chunks{worker=\"2\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"2\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"2\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"2\"} 0\nkeylane_replication_backlog_active{worker=\"2\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"2\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"2\"} 0\nkeylane_replication_backlog_backpressured{worker=\"2\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"2\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"2\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"2\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"2\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"2\"} 0\nkeylane_fullsync_sessions{worker=\"2\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"2\"} 0\nkeylane_replication_backlog_bytes{worker=\"3\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"3\"} 0\nkeylane_replication_backlog_chunks{worker=\"3\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"3\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"3\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"3\"} 0\nkeylane_replication_backlog_active{worker=\"3\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"3\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"3\"} 0\nkeylane_replication_backlog_backpressured{worker=\"3\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"3\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"3\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"3\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"3\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"3\"} 0\nkeylane_fullsync_sessions{worker=\"3\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"3\"} 0\nkeylane_replication_backlog_bytes{worker=\"4\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"4\"} 0\nkeylane_replication_backlog_chunks{worker=\"4\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"4\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"4\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"4\"} 0\nkeylane_replication_backlog_active{worker=\"4\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"4\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"4\"} 0\nkeylane_replication_backlog_backpressured{worker=\"4\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"4\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"4\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"4\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"4\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"4\"} 0\nkeylane_fullsync_sessions{worker=\"4\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"4\"} 0\nkeylane_replication_backlog_bytes{worker=\"5\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"5\"} 0\nkeylane_replication_backlog_chunks{worker=\"5\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"5\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"5\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"5\"} 0\nkeylane_replication_backlog_active{worker=\"5\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"5\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"5\"} 0\nkeylane_replication_backlog_backpressured{worker=\"5\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"5\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"5\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"5\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"5\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"5\"} 0\nkeylane_fullsync_sessions{worker=\"5\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"5\"} 0\nkeylane_replication_backlog_bytes{worker=\"6\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"6\"} 0\nkeylane_replication_backlog_chunks{worker=\"6\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"6\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"6\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"6\"} 0\nkeylane_replication_backlog_active{worker=\"6\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"6\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"6\"} 0\nkeylane_replication_backlog_backpressured{worker=\"6\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"6\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"6\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"6\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"6\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"6\"} 0\nkeylane_fullsync_sessions{worker=\"6\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"6\"} 0\nkeylane_replication_backlog_bytes{worker=\"7\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"7\"} 0\nkeylane_replication_backlog_chunks{worker=\"7\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"7\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"7\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"7\"} 0\nkeylane_replication_backlog_active{worker=\"7\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"7\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"7\"} 0\nkeylane_replication_backlog_backpressured{worker=\"7\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"7\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"7\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"7\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"7\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"7\"} 0\nkeylane_fullsync_sessions{worker=\"7\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"7\"} 0\nkeylane_replication_backlog_bytes{worker=\"8\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"8\"} 0\nkeylane_replication_backlog_chunks{worker=\"8\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"8\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"8\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"8\"} 0\nkeylane_replication_backlog_active{worker=\"8\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"8\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"8\"} 0\nkeylane_replication_backlog_backpressured{worker=\"8\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"8\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"8\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"8\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"8\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"8\"} 0\nkeylane_fullsync_sessions{worker=\"8\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"8\"} 0\nkeylane_replication_backlog_bytes{worker=\"9\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"9\"} 0\nkeylane_replication_backlog_chunks{worker=\"9\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"9\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"9\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"9\"} 0\nkeylane_replication_backlog_active{worker=\"9\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"9\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"9\"} 0\nkeylane_replication_backlog_backpressured{worker=\"9\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"9\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"9\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"9\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"9\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"9\"} 0\nkeylane_fullsync_sessions{worker=\"9\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"9\"} 0\nkeylane_replication_backlog_bytes{worker=\"10\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"10\"} 0\nkeylane_replication_backlog_chunks{worker=\"10\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"10\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"10\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"10\"} 0\nkeylane_replication_backlog_active{worker=\"10\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"10\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"10\"} 0\nkeylane_replication_backlog_backpressured{worker=\"10\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"10\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"10\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"10\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"10\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"10\"} 0\nkeylane_fullsync_sessions{worker=\"10\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"10\"} 0\nkeylane_replication_backlog_bytes{worker=\"11\"} 0\nkeylane_replication_backlog_capacity_bytes{worker=\"11\"} 0\nkeylane_replication_backlog_chunks{worker=\"11\"} 0\nkeylane_replication_backlog_floor_lsn{worker=\"11\"} 1\nkeylane_replication_backlog_tail_lsn{worker=\"11\"} 0\nkeylane_replication_backlog_pinned_cursors{worker=\"11\"} 0\nkeylane_replication_backlog_active{worker=\"11\"} 0\nkeylane_replication_backlog_coverage_revocations_total{worker=\"11\"} 0\nkeylane_replication_backlog_backpressure_waits_total{worker=\"11\"} 0\nkeylane_replication_backlog_backpressured{worker=\"11\"} 0\nkeylane_replication_publish_queue_bytes{worker=\"11\"} 0\nkeylane_replication_publish_queue_capacity_bytes{worker=\"11\"} 16777216\nkeylane_fullsync_publish_queue_bytes{worker=\"11\"} 0\nkeylane_fullsync_publish_queue_admitted_bytes{worker=\"11\"} 0\nkeylane_fullsync_publish_queue_capacity_bytes{worker=\"11\"} 0\nkeylane_fullsync_sessions{worker=\"11\"} 0\nkeylane_fullsync_publish_queue_backpressure_waits_total{worker=\"11\"} 0\nkeylane_storage_capacity_bytes{device=\"0\",path=\"/dev/md127p4\"} 1099486461952\nkeylane_storage_available_bytes{device=\"0\",path=\"/dev/md127p4\"} 943961669632\n",
+  "defrag": "paused=0 max_active_per_device=8 block_sleep_ms=0 record_sleep_us=0 active_total=0 pending_total=0",
+  "info": "# Commandstats\r\ncmdstat_ping:calls=1,usec=22,usec_per_call=22.61,rejected_calls=0,failed_calls=0\r\ncmdstat_dbsize:calls=4,usec=1361,usec_per_call=340.25,rejected_calls=0,failed_calls=0\r\ncmdstat_hgetall:calls=1000008,usec=89346621,usec_per_call=89.35,rejected_calls=0,failed_calls=0\r\ncmdstat_config:calls=3,usec=32,usec_per_call=10.89,rejected_calls=0,failed_calls=0\r\ncmdstat_info:calls=3,usec=1086,usec_per_call=362.03,rejected_calls=0,failed_calls=0\r\ncmdstat_defrag:calls=4,usec=25,usec_per_call=6.25,rejected_calls=0,failed_calls=0\r\n\r\n",
+  "active_expiration": [
+    "active-expiration-interval-ms",
+    "10",
+    "active-expiration-map-steps-per-cycle",
+    "256",
+    "active-expiration-deletes-per-cycle",
+    "64",
+    "active-expiration-index-maintenance-steps-per-cycle",
+    "256"
+  ],
+  "worker_candidates": []
+}

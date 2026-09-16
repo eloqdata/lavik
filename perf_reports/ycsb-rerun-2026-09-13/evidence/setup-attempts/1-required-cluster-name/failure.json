@@ -1,0 +1,6 @@
+{
+  "utc": "2026-09-16T02:59:39Z",
+  "traceback": "Traceback (most recent call last):\n  File \"/mnt/dev/ycsb-default-host-rerun-20260916/runner.py\", line 338, in main\n    start(mode, 'load')\n  File \"/mnt/dev/ycsb-default-host-rerun-20260916/runner.py\", line 191, in start\n    assert unit_state in ('active', 'activating'), (mode, unit_state)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: ('aerospike', 'inactive')\n",
+  "mode": "aerospike",
+  "completed": 0
+}
