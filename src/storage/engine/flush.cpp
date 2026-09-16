@@ -32,6 +32,24 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
 
     if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
       status = co_await FlushWorkerForShutdown(store);
+      if (!status.ok())
+        shutdown_flush_failed_.store(true, std::memory_order_release);
+      // This all-worker boundary is independent of the optional index cache.
+      // Once the proof commits, only semantics-preserving checkpoint work may
+      // run; no accepted client, replication, expiry or transaction work
+      // remains.
+      absl::Status recovery_barrier =
+          co_await shutdown_recovery_ready_barrier_->Wait(*store->worker_);
+      if (recovery_barrier.ok() && store->worker_->id() == 0 && status.ok()) {
+        status = co_await PublishCleanShutdownProof();
+        if (!status.ok())
+          shutdown_flush_failed_.store(true, std::memory_order_release);
+      }
+      if (recovery_barrier.ok()) {
+        recovery_barrier = co_await shutdown_recovery_published_barrier_->Wait(
+            *store->worker_);
+      }
+      if (!recovery_barrier.ok() && status.ok()) status = recovery_barrier;
       if (shutdown_checkpoint_for_flush_) {
         // Stop ordinary append activity before worker 0 promotes every
         // committed transaction-tagged winner. All workers must observe that

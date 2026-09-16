@@ -613,6 +613,17 @@ the system-state writer and globally fences request serving. Restart resolves
 the result through the highest common generation before service becomes
 available again.
 
+The manifest also retains an opaque Replication-owned population identity and
+an optional Clean Shutdown Proof. The proof is committed with the final catalog
+and population tokens after all workers cross a shutdown durability barrier.
+Startup consumes it through the same common-root commit before permitting
+mutations. A destructive FULL clears both identity and proof before any reset;
+readable records or a PromotionBase alone cannot restore automatic candidacy.
+The bounded shutdown metadata allocator can publish this certificate after
+foreground allocation closes, without starting refill work or waiting for
+reclamation. Optional index checkpoint construction follows this logical
+shutdown boundary and does not substitute for the certificate.
+
 The first flush durably clears the header slot not selected for the new
 allocation before committing the selected slot. Later header writes alternate
 slots. A dirty tail appended while a snapshot is in flight is requeued at the
@@ -625,14 +636,15 @@ flushes, and pending transaction decisions for operators and tests that need a
 durability fence. Graceful shutdown closes request admission and all
 replication target/source transports first; source flow teardown releases
 retained backlog cursors that could otherwise keep an accepted publisher
-suspended. It then joins the Meta control client when configured, drains
-accepted requests, joins target apply work, aborts partial replacement roots,
+suspended. It drains accepted requests, joins the Meta control client when
+configured, joins target apply work, aborts partial replacement roots,
 and drains source handshakes, exports, and history. No accepted directive,
 replication apply, or source-log transition can therefore mutate storage behind
 the checkpoint boundary. Accepted queued and explicitly background transaction
-commits still receive up to five seconds to append their decisions.
+commits receive up to five seconds to append their decisions; timeout fails
+shutdown and prohibits a clean certificate.
 
-Storage then performs two freeze-and-drain rounds around transaction cleaning.
+For the optional index checkpoint, storage performs two freeze-and-drain rounds around transaction cleaning.
 The first resets even header-only active streams and drains flushes, extent
 reclaims, expiration, and retirement accounting. Worker 0 next forces
 transaction cleaning to promote all committed tagged winners into durable
@@ -930,9 +942,9 @@ Current test evidence includes:
   reach its quiesce boundary through native FULL, while Meta-managed startup
   withholds authority from the outset. Any authority transition that bypasses
   those replication paths must invoke the same boundary.
-- Storage persists partition and database epochs, not the Meta-managed
-  `ReplicationGroup`, its ready token, Data control state, or the process-global
-  Function catalog proof. Meta control reconnects after every boot, but neither
+- Storage persists partition/database epochs, population scope and a one-use
+  shutdown certificate, but not a Meta-managed ready token or Data control
+  authority. Meta control reconnects after every boot, but neither
   its full desired state nor its leases are restored from the data device;
   recovered records alone never authorize cluster serving. A durable
   incomplete-full-sync fence also survives recovery and prevents a mixed
@@ -979,7 +991,7 @@ current source code are authoritative for present storage behavior.
 | Compact physical index representation shared by user-key and group-location indexes | `include/lavik/storage/detail/record_index.h` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |
 | Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |
-| System-state manifest, catalog COW extents, full-sync fence, population token, and promotion base | `src/storage/engine/system_state.cpp`, `include/lavik/storage/engine.h` |
+| System-state manifest, catalog COW extents, full-sync fence, population token, promotion base, and one-use shutdown certificate | `src/storage/engine/system_state.cpp`, `include/lavik/storage/engine.h` |
 | Aligned buffer ownership, registered-I/O fallback, oversized reads, and cross-worker lease return | `include/lavik/storage/buffer_pool.h`, `src/storage/buffer_pool.cpp` |
 | Storage-path probing, device-set validation and expansion, controller/qpair affinity, metadata load, worker initialization and native-thread finalization, recovery barriers, and shutdown flush | `src/storage/engine/init.cpp`, `src/storage/engine/device_affinity.h`, `src/storage/engine/impl.h` |
 | Device-owner allocation, bitmap activation and cold-free retirement, epoch mirroring, reserves, and allocator fail-stop behavior | `src/storage/engine/alloc.cpp` |

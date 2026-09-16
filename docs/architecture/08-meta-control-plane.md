@@ -172,6 +172,21 @@ observations and must be reported again after Meta leadership changes. The
 transition revision is its latest mutating Raft index and is independent of the
 Group membership revision.
 
+An explicit operator-recovery action instead carries no source compatibility
+domain and permits only `loss=unknown`. The operator selects a current member
+with readable recovered data when no automatic Candidate exists. Admission
+rechecks current observations and rejects a serving Owner or replacement of a
+healthy action. An unfenced Group enters through uncontrolled Begin; an already
+fenced, candidate-less transition uses SetUncontrolledCandidate. Both continue
+through ordinary committed authorization, preparation, Cutover and lease
+quarantine. No local command can bypass Meta quorum or establish authority.
+
+Candidate heartbeats distinguish a clean recovered frontier from a live
+frontier, preserving the old source boot/history separately from the newly
+authenticated reporter. Recovery without a certificate advertises only scoped
+operator availability and is excluded from automatic selection. Neither kind
+of recovery restores the prior Owner's lease or serving readiness.
+
 The generic operation store retains only the controlled request's stable
 `(group, absolute deadline)` intent and terminal operator result. It supplies
 idempotency and `getop`, but carries no failover phase, directive, receipt, or

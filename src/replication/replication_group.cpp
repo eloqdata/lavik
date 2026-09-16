@@ -491,6 +491,26 @@ class ReplicationGroup::Impl {
     return absl::OkStatus();
   }
 
+  absl::StatusOr<ReadyToken> RecoverPopulation(
+      RebuildIdentity identity, std::vector<std::uint64_t> frontier) {
+    if (state_ != ReplicationGroupState::kNotReady ||
+        identity.target_node_id_ != local_node_id_ ||
+        identity.target_boot_id_ != local_boot_id_ ||
+        identity.group_id_.empty() || identity.assignment_id_.empty() ||
+        identity.term_ == 0 || frontier.empty() ||
+        std::ranges::any_of(frontier,
+                            [](auto cursor) { return cursor == 0; })) {
+      return absl::FailedPreconditionError(
+          "recovered population is incomplete or already installed");
+    }
+    last_directive_ = RebuildDirective{
+        .identity_ = identity,
+        .flow_count_ = static_cast<std::uint32_t>(frontier.size())};
+    ready_token_ = ReadyToken(std::move(identity), std::move(frontier));
+    state_ = ReplicationGroupState::kReady;
+    return *ready_token_;
+  }
+
   absl::StatusOr<ReadyToken> PublishReady(const RebuildIdentity& identity) {
     if (state_ == ReplicationGroupState::kReady && ready_token_.has_value()) {
       if (ready_token_->identity() == identity) return *ready_token_;
@@ -684,6 +704,11 @@ absl::Status ReplicationGroup::MarkFunctionCatalogComplete(
 absl::Status ReplicationGroup::MarkStoragePromoted(
     const RebuildIdentity& identity) {
   return impl_->MarkStoragePromoted(identity);
+}
+
+absl::StatusOr<ReadyToken> ReplicationGroup::RecoverPopulation(
+    RebuildIdentity identity, std::vector<std::uint64_t> frontier) {
+  return impl_->RecoverPopulation(std::move(identity), std::move(frontier));
 }
 
 absl::StatusOr<ReadyToken> ReplicationGroup::PublishReady(

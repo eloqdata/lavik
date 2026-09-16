@@ -116,7 +116,7 @@ class DataProcess:
     def advertised_endpoint(self):
         return f"tcp://127.0.0.1:{self.redis_port}"
 
-    def start(self):
+    def start(self, wait_ready=True):
         os.makedirs(self.workdir, exist_ok=True)
         allocate_data_file(self.data_path, DATA_FILE_BYTES * self.workers)
         args = [
@@ -151,9 +151,10 @@ class DataProcess:
             args, stdout=self.log_file, stderr=subprocess.STDOUT)
         H.log(f"Data node {self.node_id[:8]} started "
               f"(pid {self.proc.pid}, seed {self.seed})")
-        H.wait_until(
-            f"Data node {self.node_id[:8]} metrics listener", 20,
-            lambda: self.alive() and self._metrics_ready())
+        if wait_ready:
+            H.wait_until(
+                f"Data node {self.node_id[:8]} metrics listener", 20,
+                lambda: self.alive() and self._metrics_ready())
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None

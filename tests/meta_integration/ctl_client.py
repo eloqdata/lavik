@@ -793,6 +793,13 @@ def admin_slow_reader_gate(node):
                     raise H.Failure(
                         f"slow-reader fixture node {index}: {reply!r}")
 
+    # Diagnostics may lag the last registration and yield ERR cut_changed.
+    # That short reply has no send watchdog; require a successful capture
+    # before testing the deadline on a parked large response.
+    H.wait_until("slow-reader status snapshot catches up", 10,
+                 lambda: node.ctl("clusterstatus 1").startswith(
+                     "OK clusterstatus 1 "))
+
     slow = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1_024)
     slow.settimeout(2)

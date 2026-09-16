@@ -1464,8 +1464,22 @@ absl::StatusOr<std::string> Encode(const Heartbeat& heartbeat) {
     writer.U8(static_cast<std::uint8_t>(HeartbeatRoleKind::kReplicaCandidate));
     const CandidateProgress& candidate =
         std::get<ReplicaCandidate>(heartbeat.role_information).progress;
-    if (candidate.source_group_term == 0 ||
-        candidate.source_group_term > candidate.group_term) {
+    // Unknown-frontier recovery carries scope only. Reject hidden lineage
+    // rather than silently dropping it during encoding.
+    if (candidate.operator_recovery &&
+        (candidate.recovered || candidate.source_group_term != 0 ||
+         !candidate.source_node_id.empty() ||
+         candidate.source_assignment_id != WireId128{} ||
+         !candidate.source_boot_id.empty() ||
+         !candidate.source_history_id.empty() ||
+         !candidate.applied_next_lsns.empty())) {
+      return ProtocolError("operator recovery cannot claim source progress");
+    }
+    writer.Bool(candidate.recovered);
+    writer.Bool(candidate.operator_recovery);
+    if (!candidate.operator_recovery &&
+        (candidate.source_group_term == 0 ||
+         candidate.source_group_term > candidate.group_term)) {
       return ProtocolError(
           "candidate source term must be nonzero and not exceed group term");
     }
@@ -1480,34 +1494,36 @@ absl::StatusOr<std::string> Encode(const Heartbeat& heartbeat) {
     writer.U64(candidate.manifest_revision);
     writer.Fixed(candidate.manifest_digest);
     writer.U64(candidate.partition_replication_epoch);
-    if (!IsCanonicalIdentity160(candidate.source_node_id) ||
-        !IsCanonicalIdentity160(candidate.source_boot_id) ||
-        !IsCanonicalIdentity160(candidate.source_history_id)) {
-      return ProtocolError("candidate source lineage is not canonical");
-    }
-    if (absl::Status status =
-            writer.String(candidate.source_node_id, kMaxIdentifierBytes,
-                          "candidate source node id");
-        !status.ok()) {
-      return status;
-    }
-    writer.Fixed(candidate.source_assignment_id);
-    if (absl::Status status =
-            writer.String(candidate.source_boot_id, kMaxIdentifierBytes,
-                          "candidate source boot id");
-        !status.ok()) {
-      return status;
-    }
-    if (absl::Status status =
-            writer.String(candidate.source_history_id, kMaxIdentifierBytes,
-                          "candidate source history id");
-        !status.ok()) {
-      return status;
-    }
-    if (absl::Status status = WriteHeartbeatFlowVector(
-            writer, candidate.applied_next_lsns, "candidate flow vector");
-        !status.ok()) {
-      return status;
+    if (!candidate.operator_recovery) {
+      if (!IsCanonicalIdentity160(candidate.source_node_id) ||
+          !IsCanonicalIdentity160(candidate.source_boot_id) ||
+          !IsCanonicalIdentity160(candidate.source_history_id)) {
+        return ProtocolError("candidate source lineage is not canonical");
+      }
+      if (absl::Status status =
+              writer.String(candidate.source_node_id, kMaxIdentifierBytes,
+                            "candidate source node id");
+          !status.ok()) {
+        return status;
+      }
+      writer.Fixed(candidate.source_assignment_id);
+      if (absl::Status status =
+              writer.String(candidate.source_boot_id, kMaxIdentifierBytes,
+                            "candidate source boot id");
+          !status.ok()) {
+        return status;
+      }
+      if (absl::Status status =
+              writer.String(candidate.source_history_id, kMaxIdentifierBytes,
+                            "candidate source history id");
+          !status.ok()) {
+        return status;
+      }
+      if (absl::Status status = WriteHeartbeatFlowVector(
+              writer, candidate.applied_next_lsns, "candidate flow vector");
+          !status.ok()) {
+        return status;
+      }
     }
   }
   writer.Bool(heartbeat.failover_observation.has_value());
@@ -1559,6 +1575,14 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
   } else if (*role_kind ==
              static_cast<std::uint8_t>(HeartbeatRoleKind::kReplicaCandidate)) {
     CandidateProgress candidate;
+    auto recovered = reader.Bool();
+    if (!recovered.ok()) return recovered.status();
+    candidate.recovered = *recovered;
+    auto operator_recovery = reader.Bool();
+    if (!operator_recovery.ok()) return operator_recovery.status();
+    candidate.operator_recovery = *operator_recovery;
+    if (candidate.operator_recovery && candidate.recovered)
+      return ProtocolError("conflicting recovery kinds");
     auto group_id = reader.String(kMaxIdentifierBytes);
     if (!group_id.ok()) return group_id.status();
     candidate.group_id = std::move(*group_id);
@@ -1571,8 +1595,12 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
     auto source_group_term = reader.U64();
     if (!source_group_term.ok()) return source_group_term.status();
     candidate.source_group_term = *source_group_term;
-    if (candidate.source_group_term == 0 ||
-        candidate.source_group_term > candidate.group_term) {
+    if (candidate.operator_recovery && candidate.source_group_term != 0) {
+      return ProtocolError("operator recovery cannot claim a source term");
+    }
+    if (!candidate.operator_recovery &&
+        (candidate.source_group_term == 0 ||
+         candidate.source_group_term > candidate.group_term)) {
       return ProtocolError(
           "candidate source term must be nonzero and not exceed group term");
     }
@@ -1587,26 +1615,28 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
       return partition_replication_epoch.status();
     }
     candidate.partition_replication_epoch = *partition_replication_epoch;
-    auto source_node_id = reader.String(kMaxIdentifierBytes);
-    if (!source_node_id.ok()) return source_node_id.status();
-    auto source_assignment_id = reader.Fixed<16>();
-    if (!source_assignment_id.ok()) return source_assignment_id.status();
-    candidate.source_assignment_id = *source_assignment_id;
-    auto source_boot_id = reader.String(kMaxIdentifierBytes);
-    if (!source_boot_id.ok()) return source_boot_id.status();
-    auto source_history_id = reader.String(kMaxIdentifierBytes);
-    if (!source_history_id.ok()) return source_history_id.status();
-    if (!IsCanonicalIdentity160(*source_node_id) ||
-        !IsCanonicalIdentity160(*source_boot_id) ||
-        !IsCanonicalIdentity160(*source_history_id)) {
-      return ProtocolError("candidate source lineage is not canonical");
+    if (!candidate.operator_recovery) {
+      auto source_node_id = reader.String(kMaxIdentifierBytes);
+      if (!source_node_id.ok()) return source_node_id.status();
+      auto source_assignment_id = reader.Fixed<16>();
+      if (!source_assignment_id.ok()) return source_assignment_id.status();
+      candidate.source_assignment_id = *source_assignment_id;
+      auto source_boot_id = reader.String(kMaxIdentifierBytes);
+      if (!source_boot_id.ok()) return source_boot_id.status();
+      auto source_history_id = reader.String(kMaxIdentifierBytes);
+      if (!source_history_id.ok()) return source_history_id.status();
+      if (!IsCanonicalIdentity160(*source_node_id) ||
+          !IsCanonicalIdentity160(*source_boot_id) ||
+          !IsCanonicalIdentity160(*source_history_id)) {
+        return ProtocolError("candidate source lineage is not canonical");
+      }
+      candidate.source_node_id = std::move(*source_node_id);
+      candidate.source_boot_id = std::move(*source_boot_id);
+      candidate.source_history_id = std::move(*source_history_id);
+      auto next_lsns = ReadHeartbeatFlowVector(reader, "candidate flow vector");
+      if (!next_lsns.ok()) return next_lsns.status();
+      candidate.applied_next_lsns = std::move(*next_lsns);
     }
-    candidate.source_node_id = std::move(*source_node_id);
-    candidate.source_boot_id = std::move(*source_boot_id);
-    candidate.source_history_id = std::move(*source_history_id);
-    auto next_lsns = ReadHeartbeatFlowVector(reader, "candidate flow vector");
-    if (!next_lsns.ok()) return next_lsns.status();
-    candidate.applied_next_lsns = std::move(*next_lsns);
     heartbeat.role_information =
         ReplicaCandidate{.progress = std::move(candidate)};
   } else if (*role_kind !=
@@ -2293,18 +2323,29 @@ absl::Status ValidateFailoverTransition(
         !IsCanonicalIdentity160(action.candidate.node_id) ||
         IsZeroId(action.candidate.assignment_id) ||
         !IsCanonicalIdentity160(action.candidate.boot_id) ||
-        action.domain.source_group_term == 0 ||
-        action.domain.source_group_term >= transition.target_term ||
-        !IsCanonicalIdentity160(action.domain.source_node_id) ||
-        IsZeroId(action.domain.source_assignment_id) ||
-        !IsCanonicalIdentity160(action.domain.source_boot_id) ||
-        !IsCanonicalIdentity160(action.domain.source_history_id)) {
+        (!action.operator_recovery &&
+         (action.domain.source_group_term == 0 ||
+          action.domain.source_group_term >= transition.target_term ||
+          !IsCanonicalIdentity160(action.domain.source_node_id) ||
+          IsZeroId(action.domain.source_assignment_id) ||
+          !IsCanonicalIdentity160(action.domain.source_boot_id) ||
+          !IsCanonicalIdentity160(action.domain.source_history_id)))) {
       return ProtocolError("failover candidate action is invalid");
     }
-    if (action.domain.flow_count == 0 ||
-        action.domain.flow_count > kMaxCandidateFlows) {
+    if (!action.operator_recovery &&
+        (action.domain.flow_count == 0 ||
+         action.domain.flow_count > kMaxCandidateFlows)) {
       return ResourceLimit(
           "failover compatibility flow count is outside its protocol cap");
+    }
+    if (action.operator_recovery &&
+        (transition.mode != WireFailoverMode::kUncontrolled ||
+         action.domain != WireFailoverCompatibilityDomain{} ||
+         (action.authorization.has_value() &&
+          action.authorization->loss_if_cutover !=
+              WireFailoverLoss::kUnknown))) {
+      return ProtocolError(
+          "operator recovery must have unknown loss and no source domain");
     }
     const auto candidate =
         std::find_if(group.members.begin(), group.members.end(),
@@ -2379,25 +2420,28 @@ absl::Status WriteFailoverTransition(Writer& writer,
         !status.ok()) {
       return status;
     }
-    writer.U64(action.domain.source_group_term);
-    if (absl::Status status = WriteIdentity(
-            writer, action.domain.source_node_id, "failover source node id");
-        !status.ok()) {
-      return status;
+    writer.Bool(action.operator_recovery);
+    if (!action.operator_recovery) {
+      writer.U64(action.domain.source_group_term);
+      if (absl::Status status = WriteIdentity(
+              writer, action.domain.source_node_id, "failover source node id");
+          !status.ok()) {
+        return status;
+      }
+      writer.Fixed(action.domain.source_assignment_id);
+      if (absl::Status status = WriteIdentity(
+              writer, action.domain.source_boot_id, "failover source boot id");
+          !status.ok()) {
+        return status;
+      }
+      if (absl::Status status =
+              WriteIdentity(writer, action.domain.source_history_id,
+                            "failover source history id");
+          !status.ok()) {
+        return status;
+      }
+      writer.U32(action.domain.flow_count);
     }
-    writer.Fixed(action.domain.source_assignment_id);
-    if (absl::Status status = WriteIdentity(
-            writer, action.domain.source_boot_id, "failover source boot id");
-        !status.ok()) {
-      return status;
-    }
-    if (absl::Status status =
-            WriteIdentity(writer, action.domain.source_history_id,
-                          "failover source history id");
-        !status.ok()) {
-      return status;
-    }
-    writer.U32(action.domain.flow_count);
     writer.Bool(action.authorization.has_value());
     if (action.authorization.has_value()) {
       writer.U64(action.authorization->authorized_revision);
@@ -2439,24 +2483,29 @@ absl::StatusOr<WireFailoverTransition> ReadFailoverTransition(
     auto candidate_boot = ReadIdentity(reader, "failover candidate boot id");
     if (!candidate_boot.ok()) return candidate_boot.status();
     action.candidate.boot_id = std::move(*candidate_boot);
-    auto source_group_term = reader.U64();
-    if (!source_group_term.ok()) return source_group_term.status();
-    action.domain.source_group_term = *source_group_term;
-    auto source_node = ReadIdentity(reader, "failover source node id");
-    if (!source_node.ok()) return source_node.status();
-    action.domain.source_node_id = std::move(*source_node);
-    auto source_assignment = reader.Fixed<16>();
-    if (!source_assignment.ok()) return source_assignment.status();
-    action.domain.source_assignment_id = *source_assignment;
-    auto source_boot = ReadIdentity(reader, "failover source boot id");
-    if (!source_boot.ok()) return source_boot.status();
-    action.domain.source_boot_id = std::move(*source_boot);
-    auto source_history = ReadIdentity(reader, "failover source history id");
-    if (!source_history.ok()) return source_history.status();
-    action.domain.source_history_id = std::move(*source_history);
-    auto flow_count = reader.U32();
-    if (!flow_count.ok()) return flow_count.status();
-    action.domain.flow_count = *flow_count;
+    auto operator_recovery = reader.Bool();
+    if (!operator_recovery.ok()) return operator_recovery.status();
+    action.operator_recovery = *operator_recovery;
+    if (!action.operator_recovery) {
+      auto source_group_term = reader.U64();
+      if (!source_group_term.ok()) return source_group_term.status();
+      action.domain.source_group_term = *source_group_term;
+      auto source_node = ReadIdentity(reader, "failover source node id");
+      if (!source_node.ok()) return source_node.status();
+      action.domain.source_node_id = std::move(*source_node);
+      auto source_assignment = reader.Fixed<16>();
+      if (!source_assignment.ok()) return source_assignment.status();
+      action.domain.source_assignment_id = *source_assignment;
+      auto source_boot = ReadIdentity(reader, "failover source boot id");
+      if (!source_boot.ok()) return source_boot.status();
+      action.domain.source_boot_id = std::move(*source_boot);
+      auto source_history = ReadIdentity(reader, "failover source history id");
+      if (!source_history.ok()) return source_history.status();
+      action.domain.source_history_id = std::move(*source_history);
+      auto flow_count = reader.U32();
+      if (!flow_count.ok()) return flow_count.status();
+      action.domain.flow_count = *flow_count;
+    }
     auto has_authorization = reader.Bool();
     if (!has_authorization.ok()) return has_authorization.status();
     if (*has_authorization) {

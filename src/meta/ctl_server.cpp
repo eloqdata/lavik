@@ -1396,6 +1396,98 @@ bycorf::Task<std::string> HandleFailover(
           request.operation_id_.size())));
 }
 
+// This command selects one current boot. It never invents a source cursor;
+// the ordinary committed transition reconciler authorizes, prepares and cuts
+// over with loss=unknown. Proposal validation repeats volatile checks at
+// append.
+bycorf::Task<std::string> HandlePromote(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    nuraft::ptr<MetaStateMachine> state_machine,
+    const std::shared_ptr<MetaObservationStore>& observations,
+    AuthenticatedPrincipal principal, const std::string& group_id,
+    const std::string& node_id) {
+  const MetaStores before = state_machine->StoresSnapshot();
+  if (before.topology_.ClusterLifecycle().state_ !=
+      MetaClusterLifecycle::kCreated) {
+    co_return "ERR promote cluster-not-created";
+  }
+  const auto group = before.topology_.FindGroup(group_id);
+  if (!group.has_value()) co_return "ERR promote group-not-found";
+  const MetaStoresFacts facts(before);
+  const auto now = NowUnixMs();
+  if (!observations->LiveCandidateProgressFor(group_id, facts, now).empty()) {
+    co_return "ERR promote eligible-candidate-exists";
+  }
+  const auto populations =
+      observations->LiveCandidateProgressFor(group_id, facts, now, true);
+  const auto population =
+      std::ranges::find_if(populations, [&](const auto& item) {
+        return item.node_id_ == node_id && item.operator_recovery_;
+      });
+  if (population == populations.end())
+    co_return "ERR promote no-readable-recovered-population";
+  MetaFailoverCandidateAction action{
+      .action_id_ = MakeRequiredId("operator recovery action"),
+      .candidate_ = {.node_id_ = node_id,
+                     .assignment_id_ = population->assignment_id_,
+                     .boot_id_ = population->boot_incarnation_},
+      .operator_recovery_ = true,
+  };
+  MetaCommand command;
+  if (group->failover_transition_.has_value()) {
+    const auto& transition = *group->failover_transition_;
+    if (transition.mode_ != MetaFailoverMode::kUncontrolled ||
+        transition.candidate_action_.has_value()) {
+      co_return "ERR promote transition-already-has-action";
+    }
+    command = SetUncontrolledCandidate{
+        .request_id_ = MakeRequestId(),
+        .group_id_ = group_id,
+        .expected_transition_ = {transition.transition_id_,
+                                 transition.revision_},
+        .candidate_action_ = action};
+  } else {
+    const auto owner =
+        std::ranges::find_if(group->members_, [&](const auto& member) {
+          return member.node_id_ == group->record_.owner_;
+        });
+    if (owner == group->members_.end() ||
+        group->record_.group_term_ ==
+            std::numeric_limits<std::uint64_t>::max()) {
+      co_return "ERR promote invalid-group-authority";
+    }
+    command = BeginUncontrolledFailover{
+        .request_id_ = MakeRequestId(),
+        .group_id_ = group_id,
+        .transition_id_ = MakeRequiredId("operator recovery transition"),
+        .target_term_ = group->record_.group_term_ + 1,
+        .candidate_action_ = action,
+        .expected_owner_node_id_ = owner->node_id_,
+        .expected_owner_assignment_id_ = owner->assignment_id_,
+        .expected_membership_revision_ = group->revision_,
+        .expected_group_term_ = group->record_.group_term_,
+        .expected_population_manifest_revision_ =
+            group->record_.population_manifest_revision_,
+        .expected_population_manifest_digest_ =
+            group->record_.population_manifest_digest_,
+        .expected_partition_replication_epoch_ =
+            group->record_.partition_replication_epoch_,
+    };
+  }
+  const MetaCommittedView view(before, state_machine->last_commit_index());
+  const absl::Status valid =
+      ValidateFailoverProposal(command, view, *observations, now);
+  if (!valid.ok()) co_return absl::StrCat("ERR promote ", valid.message());
+  const std::string reply = co_await ProposeCommand(
+      coordinator, std::move(principal), std::move(command));
+  if (!reply.starts_with("OK ")) co_return reply;
+  co_return absl::StrCat(
+      reply, " promote loss=unknown action=",
+      HexEncode(std::string_view(
+          reinterpret_cast<const char*>(action.action_id_.data()),
+          action.action_id_.size())));
+}
+
 bycorf::Task<std::string> HandleRegisterNode(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
@@ -2410,7 +2502,8 @@ bycorf::Task<std::string> DispatchCommand(
   if (command == "status") {
     access = MetaAccess::kStatus;
   } else if (command == "clusterhead" || command == "clusterstatus" ||
-             command == "clustercreate" || command == "failover") {
+             command == "clustercreate" || command == "failover" ||
+             command == "promote") {
     // Cluster-wide topology and readiness are operator-only even though the
     // legacy local status verb is also visible to a Data-node identity.
     if (identity.role_ != MetaPrincipalRole::kOperator) {
@@ -2494,6 +2587,17 @@ bycorf::Task<std::string> DispatchCommand(
     co_return co_await HandleClusterCreate(
         server, state_machine, coordinator, membership_gate,
         std::move(principal), *manifest, root_operation_id, shutdown);
+  }
+  if (command == "promote") {
+    if (tokens.size() != 5 || tokens[2] != "--node" ||
+        tokens[4] != "--accept-data-loss" || tokens[1].empty() ||
+        tokens[1].size() > kMaxMetaGroupIdBytes ||
+        !cluster::control::IsCanonicalIdentity160(tokens[3])) {
+      co_return "ERR promote expected: promote GROUP --node NODE --accept-data-loss";
+    }
+    co_return co_await HandlePromote(coordinator, state_machine, obs_store,
+                                     std::move(principal), tokens[1],
+                                     tokens[3]);
   }
   if (command == "failover") {
     if (tokens.size() != 3 || tokens[1] != "1") {

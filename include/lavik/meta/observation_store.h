@@ -242,6 +242,8 @@ struct MetaCandidateProgressObs {
   bool draining_ = false;
   std::int64_t received_unix_ms_ = 0;
   std::int64_t expires_unix_ms_ = 0;
+  bool recovered_ = false;
+  bool operator_recovery_ = false;
   bool operator==(const MetaCandidateProgressObs&) const = default;
 };
 
@@ -552,12 +554,13 @@ class MetaObservationStore {
       std::string_view group_id, const MetaCommittedFacts& facts) const;
   std::vector<MetaCandidateProgressObs> CandidateProgressFor(
       std::string_view group_id, const MetaCommittedFacts& facts) const;
-  // Selector-only view. Unlike the compatibility diagnostics above, this
-  // applies TTL at the caller's fixed planning instant without mutating the
-  // deadline or depending on a global observation revision.
+  // Applies TTL at the caller's fixed planning instant without mutating the
+  // deadline or depending on a global observation revision. Automatic
+  // selectors use the default, which excludes unknown-frontier populations;
+  // explicit operator actions may request those scoped availability reports.
   std::vector<MetaCandidateProgressObs> LiveCandidateProgressFor(
       std::string_view group_id, const MetaCommittedFacts& facts,
-      int64_t now_unix_ms) const;
+      int64_t now_unix_ms, bool include_operator_recovery = false) const;
   // Passing a fixed decision time applies the store-wide observation TTL.
   // Omitting it returns the committed-anchor-matching observation so a caller
   // can apply its own freshness window, such as failover source grace;

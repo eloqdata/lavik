@@ -280,7 +280,7 @@ CandidateState CurrentCandidateState(
       heartbeat_saw_exact_action && !action.authorization_.has_value();
 
   const auto candidates = observations.LiveCandidateProgressFor(
-      group_id, facts, context.now_unix_ms_);
+      group_id, facts, context.now_unix_ms_, action.operator_recovery_);
   const auto same_node = std::ranges::find_if(
       candidates, [&](const MetaCandidateProgressObs& candidate) {
         return candidate.node_id_ == action.candidate_.node_id_;
@@ -289,7 +289,9 @@ CandidateState CurrentCandidateState(
     const bool exact =
         same_node->assignment_id_ == action.candidate_.assignment_id_ &&
         same_node->boot_incarnation_ == action.candidate_.boot_id_ &&
-        CandidateCompatibilityDomain(*same_node) == action.domain_;
+        same_node->operator_recovery_ == action.operator_recovery_ &&
+        (action.operator_recovery_ ||
+         CandidateCompatibilityDomain(*same_node) == action.domain_);
     if (!exact) {
       // A generic role belongs to whichever FDS Data had fully applied when
       // it produced this heartbeat. Only an exact, still-unauthorized action

@@ -1057,6 +1057,8 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
 
   if (worker.id() == 0) {
     absl::Status imported = co_await GlobalFunctionCatalog().RecoverAtStartup();
+    if (imported.ok())
+      imported = co_await replication_->RecoverClusterPopulation();
     if (imported.ok() && !load_rdb_file_.empty()) {
       imported = co_await ImportRdb();
     }
@@ -2572,6 +2574,7 @@ int RunServer(ServerOptions options) {
     // the Meta-control join or request drain; worker-zero cleanup and history
     // retirement remain deferred until accepted control/client work is done.
     replication.RequestShutdown();
+    redis.WaitForRequestsDrained();
     absl::Status control_quiesce = absl::OkStatus();
     if (meta_control_client != nullptr) {
       // The shutdown checkpoint must describe a state after all accepted Meta
@@ -2589,7 +2592,6 @@ int RunServer(ServerOptions options) {
         spdlog::info("Meta control client quiesced before storage flush");
       }
     }
-    redis.WaitForRequestsDrained();
     absl::Status replication_quiesce = redis.WaitForReplicationQuiesced();
     if (!replication_quiesce.ok()) {
       spdlog::error(

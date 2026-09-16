@@ -228,8 +228,8 @@ absl::StatusOr<std::string> StorageEngine::Impl::EncodeSystemStateManifest(
   PutU64(&output, state.population_token_.digest_);
   PutU32(&output, static_cast<std::uint32_t>(ref_count));
   PutU32(&output, static_cast<std::uint32_t>(promotion.size()));
-  PutU64(&output, 0);
-  PutU64(&output, 0);
+  PutU64(&output, state.population_identity_.size());
+  PutU64(&output, state.clean_shutdown_proof_.size());
   if (output.size() != kSystemStateManifestHeaderBytes) {
     return absl::InternalError("system-state header size mismatch");
   }
@@ -242,6 +242,8 @@ absl::StatusOr<std::string> StorageEngine::Impl::EncodeSystemStateManifest(
     }
   }
   output.append(promotion);
+  output.append(state.population_identity_);
+  output.append(state.clean_shutdown_proof_);
   if (output.size() > kExtentPayloadBytes) {
     return absl::OutOfRangeError(
         "system-state manifest exceeds one storage extent");
@@ -260,7 +262,8 @@ StorageEngine::Impl::DecodeSystemStateManifest(std::string_view encoded) {
   std::uint32_t flags = 0;
   std::uint32_t ref_count = 0;
   std::uint32_t promotion_bytes = 0;
-  std::uint64_t reserved = 0;
+  std::uint64_t identity_bytes = 0;
+  std::uint64_t proof_bytes = 0;
   DurableSystemState state;
   if (!GetU64(encoded, &offset, &magic) || magic != kSystemStateManifestMagic ||
       !GetU32(encoded, &offset, &version) || version != kStorageFormatVersion ||
@@ -276,9 +279,10 @@ StorageEngine::Impl::DecodeSystemStateManifest(std::string_view encoded) {
       !GetU64(encoded, &offset, &state.population_token_.digest_) ||
       !GetU32(encoded, &offset, &ref_count) ||
       !GetU32(encoded, &offset, &promotion_bytes) ||
-      !GetU64(encoded, &offset, &reserved) || reserved != 0 ||
-      !GetU64(encoded, &offset, &reserved) || reserved != 0 ||
-      ref_count > kMaxStringExtents ||
+      !GetU64(encoded, &offset, &identity_bytes) ||
+      !GetU64(encoded, &offset, &proof_bytes) ||
+      identity_bytes > kExtentPayloadBytes ||
+      proof_bytes > kExtentPayloadBytes || ref_count > kMaxStringExtents ||
       ref_count > (encoded.size() - offset) / 24) {
     return absl::InternalError("invalid durable system-state manifest");
   }
@@ -308,13 +312,28 @@ StorageEngine::Impl::DecodeSystemStateManifest(std::string_view encoded) {
     }
   }
   if (promotion_bytes > encoded.size() - offset ||
-      encoded.size() - offset != promotion_bytes) {
+      encoded.size() - offset !=
+          promotion_bytes + identity_bytes + proof_bytes) {
     return absl::InternalError("durable promotion base length mismatch");
   }
   if (promotion_bytes != 0) {
-    auto promotion = DecodePromotionBase(encoded.substr(offset));
+    auto promotion =
+        DecodePromotionBase(encoded.substr(offset, promotion_bytes));
     if (!promotion.ok()) return promotion.status();
     state.promotion_base_ = std::move(*promotion);
+  }
+  offset += promotion_bytes;
+  state.population_identity_ = encoded.substr(offset, identity_bytes);
+  offset += identity_bytes;
+  state.clean_shutdown_proof_ = encoded.substr(offset, proof_bytes);
+  if ((!state.clean_shutdown_proof_.empty() &&
+       state.population_identity_.empty()) ||
+      (!state.population_identity_.empty() &&
+       (state.full_sync_session_id_ != 0 || (flags & kCatalogReady) == 0 ||
+        state.population_token_.generation_ == 0 ||
+        state.catalog_token_.catalog_generation_ == 0))) {
+    return absl::DataLossError(
+        "recovery proof has no complete population/catalog");
   }
   const bool has_catalog = (flags & kCatalogPresent) != 0;
   if (state.generation_ == 0 ||
@@ -536,7 +555,7 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
 
 Task<absl::Status> StorageEngine::Impl::CommitSystemState(
     DurableSystemState next, std::string_view catalog_dump,
-    bool replace_catalog) {
+    bool replace_catalog, bool shutdown_metadata) {
   // The caller holds system_state_mutex_ on worker zero.
   if (system_state_failure_.has_value()) co_return *system_state_failure_;
   if (system_state_.generation_ == std::numeric_limits<std::uint64_t>::max()) {
@@ -565,8 +584,8 @@ Task<absl::Status> StorageEngine::Impl::CommitSystemState(
     if (new_catalog != nullptr) SpawnExtentReclaim(store, new_catalog);
     co_return manifest_body.status();
   }
-  auto manifest_written =
-      co_await WriteExtentValueLocked(store, *manifest_body);
+  auto manifest_written = co_await WriteExtentValueLocked(
+      store, *manifest_body, {}, nullptr, {}, shutdown_metadata);
   if (!manifest_written.ok()) {
     if (new_catalog != nullptr) SpawnExtentReclaim(store, new_catalog);
     co_return manifest_written.status();
@@ -742,6 +761,89 @@ StorageEngine::Impl::RecoverPromotionBase() const {
   return system_state_.promotion_base_;
 }
 
+Task<absl::Status> StorageEngine::Impl::CommitPopulationIdentity(
+    std::string identity) {
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
+        0, [this, identity = std::move(identity)]() mutable {
+          return CommitPopulationIdentity(std::move(identity));
+        });
+  }
+  co_await system_state_mutex_.Lock();
+  UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);
+  if (identity.empty() || system_state_.full_sync_session_id_ != 0 ||
+      system_state_.population_token_.generation_ == 0 ||
+      !system_state_.catalog_ready_ || RuntimeFailureLatched()) {
+    co_return absl::FailedPreconditionError(
+        "recovery identity requires a complete population");
+  }
+  DurableSystemState next = system_state_;
+  next.population_identity_ = std::move(identity);
+  next.clean_shutdown_proof_.clear();
+  staged_clean_shutdown_proof_.clear();
+  co_return co_await CommitSystemState(std::move(next), {}, false);
+}
+
+Task<absl::StatusOr<std::optional<PopulationRecoveryRecord>>>
+StorageEngine::Impl::ConsumePopulationRecovery() {
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
+        0, [this] { return ConsumePopulationRecovery(); });
+  }
+  co_await system_state_mutex_.Lock();
+  UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);
+  if (system_state_failure_.has_value()) co_return *system_state_failure_;
+  if (system_state_.population_identity_.empty()) {
+    co_return std::optional<PopulationRecoveryRecord>{};
+  }
+  PopulationRecoveryRecord record{
+      .identity_ = system_state_.population_identity_,
+      .clean_proof_ = system_state_.clean_shutdown_proof_,
+      .population_token_ = system_state_.population_token_,
+      .catalog_token_ = system_state_.catalog_token_,
+  };
+  if (!record.clean_proof_.empty()) {
+    LAVIK_MAYBE_CRASH_AT("recovery_before_proof_consume");
+    DurableSystemState next = system_state_;
+    next.clean_shutdown_proof_.clear();
+    absl::Status consumed =
+        co_await CommitSystemState(std::move(next), {}, false);
+    if (!consumed.ok()) co_return consumed;
+    LAVIK_MAYBE_CRASH_AT("recovery_after_proof_consume");
+  }
+  co_return std::optional<PopulationRecoveryRecord>(std::move(record));
+}
+
+void StorageEngine::Impl::StageCleanShutdownProof(std::string proof) {
+  assert(bycorf::ThisWorker().id_ == 0);
+  staged_clean_shutdown_proof_ = std::move(proof);
+}
+
+Task<absl::Status> StorageEngine::Impl::PublishCleanShutdownProof() {
+  if (staged_clean_shutdown_proof_.empty()) co_return absl::OkStatus();
+  co_await system_state_mutex_.Lock();
+  UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);
+  if (RuntimeFailureLatched() ||
+      shutdown_flush_failed_.load(std::memory_order_acquire) ||
+      active_tx_commits_.load(std::memory_order_acquire) != 0 ||
+      system_state_.full_sync_session_id_ != 0 ||
+      system_state_.population_identity_.empty() ||
+      !system_state_.catalog_ready_) {
+    co_return absl::FailedPreconditionError(
+        "clean shutdown proof requires fully drained storage");
+  }
+  LAVIK_MAYBE_CRASH_AT("recovery_before_proof_publish");
+  DurableSystemState next = system_state_;
+  next.clean_shutdown_proof_ = std::move(staged_clean_shutdown_proof_);
+  absl::Status result =
+      co_await CommitSystemState(std::move(next), {}, false, true);
+  if (result.ok()) {
+    LAVIK_MAYBE_CRASH_AT("recovery_after_proof_publish");
+    spdlog::info("published clean shutdown recovery proof");
+  }
+  co_return result;
+}
+
 absl::StatusOr<PopulationToken> StorageEngine::Impl::RecoverPopulationToken()
     const {
   if (system_state_failure_.has_value()) return *system_state_failure_;
@@ -772,6 +874,9 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
   next.catalog_ready_ = false;
   next.population_token_ = {};
   next.promotion_base_.reset();
+  next.population_identity_.clear();
+  next.clean_shutdown_proof_.clear();
+  staged_clean_shutdown_proof_.clear();
   absl::Status committed =
       co_await CommitSystemState(std::move(next), {}, false);
   if (!committed.ok()) co_return committed;

@@ -551,7 +551,17 @@ absl::Status ValidateFailoverAction(const MetaFailoverCandidateAction& action) {
       !status.ok()) {
     return status;
   }
-  if (auto status = ValidateFailoverDomain(action.domain_); !status.ok()) {
+  if (action.operator_recovery_) {
+    if (action.domain_ != MetaFailoverCompatibilityDomain{} ||
+        (action.authorization_.has_value() &&
+         action.authorization_->loss_if_cutover_ !=
+             MetaFailoverLoss::kUnknown)) {
+      return MetaDomainRejectError(
+          "operator recovery cannot claim a source frontier or lossless "
+          "cutover");
+    }
+  } else if (auto status = ValidateFailoverDomain(action.domain_);
+             !status.ok()) {
     return status;
   }
   if (action.authorization_.has_value()) {
@@ -619,7 +629,8 @@ absl::Status ValidateFailoverTransitionImpl(
       return status;
     }
     const MetaFailoverCandidateAction& action = *transition.candidate_action_;
-    if (action.candidate_.node_id_ == action.domain_.source_node_id_) {
+    if (action.operator_recovery_ ||
+        action.candidate_.node_id_ == action.domain_.source_node_id_) {
       return MetaDomainRejectError(
           "controlled failover candidate must differ from source");
     }
@@ -726,7 +737,9 @@ void WriteFailoverActionUnchecked(MetaWriter& writer,
                                   const MetaFailoverCandidateAction& action) {
   WriteFixedArray(writer, action.action_id_);
   WriteFailoverCandidateUnchecked(writer, action.candidate_);
-  WriteFailoverDomainUnchecked(writer, action.domain_);
+  writer.WriteU8(action.operator_recovery_ ? 1 : 0);
+  if (!action.operator_recovery_)
+    WriteFailoverDomainUnchecked(writer, action.domain_);
   writer.WriteOptional(
       action.authorization_,
       [](MetaWriter& nested, const MetaFailoverAuthorization& authorization) {
@@ -740,14 +753,21 @@ absl::StatusOr<MetaFailoverCandidateAction> ReadFailoverAction(
   if (!action_id.ok()) return action_id.status();
   auto candidate = ReadFailoverCandidate(reader);
   if (!candidate.ok()) return candidate.status();
-  auto domain = ReadFailoverDomain(reader);
+  auto operator_recovery = reader.ReadU8();
+  if (!operator_recovery.ok()) return operator_recovery.status();
+  if (*operator_recovery > 1)
+    return FailStopDecodedFailover(
+        MetaDomainRejectError("invalid operator recovery flag"));
+  absl::StatusOr<MetaFailoverCompatibilityDomain> domain =
+      MetaFailoverCompatibilityDomain{};
+  if (*operator_recovery == 0) domain = ReadFailoverDomain(reader);
   if (!domain.ok()) return domain.status();
   auto authorization = reader.ReadOptional<MetaFailoverAuthorization>(
       [](MetaReader& nested) { return ReadFailoverAuthorization(nested); });
   if (!authorization.ok()) return authorization.status();
-  MetaFailoverCandidateAction action{*action_id, std::move(*candidate),
-                                     std::move(*domain),
-                                     std::move(*authorization)};
+  MetaFailoverCandidateAction action{
+      *action_id, std::move(*candidate), std::move(*domain),
+      std::move(*authorization), *operator_recovery != 0};
   if (auto status = FailStopDecodedFailover(ValidateFailoverAction(action));
       !status.ok()) {
     return status;

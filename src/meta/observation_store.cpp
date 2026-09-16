@@ -378,11 +378,25 @@ struct MetaObservationStore::Impl {
                                    candidate->assignment_id_)) {
         return MetaDomainRejectError("assignment-mismatch");
       }
+      if (candidate->operator_recovery_ &&
+          (!candidate->storage_ready_ || candidate->draining_ ||
+           candidate->recovered_ || candidate->source_group_term_ != 0 ||
+           !candidate->source_node_id_.empty() ||
+           candidate->source_assignment_id_ != MetaAssignmentId{} ||
+           candidate->source_boot_incarnation_ != MetaBootIncarnation{} ||
+           candidate->source_replication_history_id_ !=
+               MetaReplicationHistoryId{} ||
+           !candidate->applied_next_lsns_.empty() ||
+           candidate->population_manifest_digest_ !=
+               facts.CurrentPopulationManifestDigest(candidate->group_id_))) {
+        return MetaDomainRejectError("invalid-operator-recovery-population");
+      }
       // The legacy ctl observation surface may retain an opaque vector for
       // diagnostics. Only typed heartbeat candidates populate this vector and
       // source lineage, and only those enter LiveCandidateProgressFor.
       if (!candidate->applied_next_lsns_.empty()) {
-        if (!candidate->storage_ready_ || !candidate->population_ready_ ||
+        if (!candidate->storage_ready_ ||
+            (!candidate->population_ready_ && !candidate->recovered_) ||
             candidate->draining_) {
           return MetaDomainRejectError("candidate-not-ready");
         }
@@ -412,7 +426,7 @@ struct MetaObservationStore::Impl {
             candidate->source_group_term_ > candidate->group_term_) {
           return MetaDomainRejectError("empty-candidate-source-lineage");
         }
-        if (candidate_is_owner) {
+        if (candidate_is_owner && !candidate->recovered_) {
           const auto session = sessions_.find(observation.identity_.node_id_);
           if (session == sessions_.end() ||
               !session->second.replication_history_id_.has_value() ||
@@ -1374,9 +1388,9 @@ MetaObservationStore::CandidateProgressFor(
 }
 
 std::vector<MetaCandidateProgressObs>
-MetaObservationStore::LiveCandidateProgressFor(std::string_view group_id,
-                                               const MetaCommittedFacts& facts,
-                                               int64_t now_unix_ms) const {
+MetaObservationStore::LiveCandidateProgressFor(
+    std::string_view group_id, const MetaCommittedFacts& facts,
+    int64_t now_unix_ms, bool include_operator_recovery) const {
   std::lock_guard<std::mutex> lock(mutex_);
   const Impl& impl = *impl_;
   std::vector<MetaCandidateProgressObs> out;
@@ -1386,8 +1400,12 @@ MetaObservationStore::LiveCandidateProgressFor(std::string_view group_id,
     const std::int64_t age = now_unix_ms - observation.received_unix_ms_;
     const auto& stored =
         std::get<MetaCandidateProgressObs>(observation.payload_);
-    if (age > limits_.ttl_ms_ || stored.applied_next_lsns_.empty() ||
-        !stored.storage_ready_ || !stored.population_ready_ ||
+    if (age > limits_.ttl_ms_ ||
+        (stored.operator_recovery_ ? !include_operator_recovery
+                                   : stored.applied_next_lsns_.empty()) ||
+        !stored.storage_ready_ ||
+        (!stored.population_ready_ && !stored.recovered_ &&
+         !stored.operator_recovery_) ||
         stored.draining_ || !impl.Validate(observation, facts).ok()) {
       continue;
     }

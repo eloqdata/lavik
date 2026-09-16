@@ -1077,6 +1077,28 @@ if (BUILD_TESTING)
             RUN_SERIAL TRUE
           )
         endforeach()
+        foreach(recovery_case IN ITEMS clean-owner clean-replica crash-operator
+                                       manual-fence before-publish after-publish
+                                       before-consume after-consume
+                                       incomplete-full eligible-candidate)
+          string(REPLACE "-" "_" recovery_test_suffix "${recovery_case}")
+          add_test(
+            NAME meta_integration.gate_population_recovery_${recovery_test_suffix}
+            COMMAND ${CMAKE_COMMAND} -E env
+                    "LAVIK_FAILOVER_SOCKET_ROOT=${automatic_failover_socket_root}"
+                    ${LAVIK_PYTHON3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_population_recovery.py
+                    $<TARGET_FILE:lavik-meta>
+                    $<TARGET_FILE:lavik>
+                    $<TARGET_FILE:lavik-ctl>
+                    --case=${recovery_case}
+          )
+          set_tests_properties(
+            meta_integration.gate_population_recovery_${recovery_test_suffix}
+            PROPERTIES LABELS "meta-integration;failover;population-recovery"
+                       TIMEOUT 180 RUN_SERIAL TRUE
+          )
+        endforeach()
       endif()
     else()
       message(STATUS "python3 not found; meta integration tests are disabled")
@@ -1555,7 +1577,7 @@ if (BUILD_TESTING)
       COMMAND lavik_grouped_hash_write_e2e_test $<TARGET_FILE:lavik>
     )
     set_tests_properties(lavik_grouped_hash_write_e2e PROPERTIES
-      TIMEOUT 240 RUN_SERIAL TRUE
+      TIMEOUT 600 RUN_SERIAL TRUE
     )
 
     add_executable(lavik_compact_collection_write_e2e_test

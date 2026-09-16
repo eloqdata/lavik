@@ -665,7 +665,10 @@ detail::TranslateClusterFailoverControl(
             PopulationManifestId{desired.identity_.manifest_digest_},
         .partition_replication_epoch_ =
             desired.identity_.partition_replication_epoch_,
+        .operator_recovery_ = action.operator_recovery_,
+        .manifest_entries_ = desired.manifest_entries_,
     };
+    if (action.operator_recovery_) translated.candidate_action_->domain_ = {};
   }
 
   const std::optional<PreparedMemberAssignment>& owner = desired.owner_;
@@ -758,8 +761,8 @@ detail::ProjectClusterFailoverObservation(
   const ClusterFailoverPreparedContext& prepared = *status.prepared_;
   if (prepared.transition_id_ != action.transition_id_ ||
       prepared.action_id_ != action.action_id_ ||
-      prepared.promotion_.parent_history_id_ !=
-          action.domain_.source_history_id_) {
+      (!action.operator_recovery_ && prepared.promotion_.parent_history_id_ !=
+                                         action.domain_.source_history_id_)) {
     return absl::FailedPreconditionError(
         "prepared failover context does not match its committed action");
   }
@@ -868,13 +871,15 @@ bool detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
       wire_action.candidate.boot_id == action.candidate_boot_id_ &&
       action.candidate_node_id_ == latest.local_node_id_ &&
       action.candidate_boot_id_ == latest.boot_id_ &&
-      wire_domain.source_group_term == domain.source_group_term_ &&
-      wire_domain.source_node_id == domain.source_node_id_ &&
-      AssignmentId::FromBytes(wire_domain.source_assignment_id).ToHexString() ==
-          domain.source_assignment_id_ &&
-      wire_domain.source_boot_id == domain.source_boot_id_ &&
-      wire_domain.source_history_id == domain.source_history_id_ &&
-      wire_domain.flow_count == domain.flow_count_ &&
+      wire_action.operator_recovery == action.operator_recovery_ &&
+      (action.operator_recovery_ ||
+       (wire_domain.source_group_term == domain.source_group_term_ &&
+        wire_domain.source_node_id == domain.source_node_id_ &&
+        AssignmentId::FromBytes(wire_domain.source_assignment_id)
+                .ToHexString() == domain.source_assignment_id_ &&
+        wire_domain.source_boot_id == domain.source_boot_id_ &&
+        wire_domain.source_history_id == domain.source_history_id_ &&
+        wire_domain.flow_count == domain.flow_count_)) &&
       group->manifest_revision == action.manifest_revision_ &&
       group->manifest_digest == action.manifest_id_.bytes_ &&
       group->partition_replication_epoch == action.partition_replication_epoch_;
@@ -890,8 +895,8 @@ bool detail::FailoverActionAllowsHistoryTransitionOnCurrentMetaSession(
   const ClusterFailoverPreparedContext& prepared = *status.prepared_;
   return prepared.transition_id_ == action.transition_id_ &&
          prepared.action_id_ == action.action_id_ &&
-         prepared.promotion_.parent_history_id_ ==
-             action.domain_.source_history_id_ &&
+         (action.operator_recovery_ || prepared.promotion_.parent_history_id_ ==
+                                           action.domain_.source_history_id_) &&
          prepared.promotion_.child_history_id_ == latest.local_history_id_;
 }
 
@@ -1256,7 +1261,7 @@ detail::ProjectReplicaCandidateProgress(
     std::string_view local_node_id, const ReplicationIdentity& current_identity,
     const PopulationReadiness& readiness, const RebuildIdentity& identity,
     std::span<const std::uint64_t> applied_next_lsns,
-    bool failover_candidate_eligible) {
+    bool failover_candidate_eligible, bool recovered) {
   if (!failover_candidate_eligible) {
     return std::optional<control::CandidateProgress>{};
   }
@@ -1319,7 +1324,7 @@ detail::ProjectReplicaCandidateProgress(
   control::WireId128 source_assignment_id{};
   std::string source_boot_id = identity.source_boot_id_;
   std::string source_history_id = identity.source_history_id_;
-  if (fenced_historical_owner) {
+  if (fenced_historical_owner && !recovered) {
     if (readiness.group_term_ <= 1 ||
         !control::IsCanonicalIdentity160(current_identity.boot_id_) ||
         !control::IsCanonicalIdentity160(current_identity.local_history_id_)) {
@@ -1355,6 +1360,7 @@ detail::ProjectReplicaCandidateProgress(
       .source_history_id = std::move(source_history_id),
       .applied_next_lsns = std::vector<std::uint64_t>(applied_next_lsns.begin(),
                                                       applied_next_lsns.end()),
+      .recovered = recovered,
   });
 }
 
@@ -2328,7 +2334,9 @@ struct MetaControlClientService::Impl {
         DisableDirectiveDispatch(state);
       }
       const std::optional<PopulationReadiness> proof =
-          readiness.ok() ? *readiness : std::optional<PopulationReadiness>{};
+          readiness.ok() && !population.recovered_
+              ? *readiness
+              : std::optional<PopulationReadiness>{};
       result = co_await installer_.SetPopulationReadinessTransition(proof);
       if (!result.ok()) break;
       if (state->heartbeat_projection_gate_.pause_requested()) continue;
@@ -2408,7 +2416,8 @@ struct MetaControlClientService::Impl {
                                });
           }));
       heartbeat.health.storage_ready = installer_.storage_ready();
-      heartbeat.health.population_ready = readiness->has_value();
+      heartbeat.health.population_ready =
+          readiness->has_value() && !population.recovered_;
       heartbeat.health.summary = population.failure_reason_;
       const bool local_is_committed_owner =
           MetaLeaseChallengeRotation::IsCommittedOwner(
@@ -2419,7 +2428,9 @@ struct MetaControlClientService::Impl {
       std::uint32_t challenged_authority_lease_duration_ms = 0;
       std::optional<control::LeaseChallenge> heartbeat_challenge;
       if (!identity_decision.suppress_ordinary_role_ &&
-          local_group_index.has_value()) {
+          local_group_index.has_value() &&
+          (!population.operator_recovery_identity_.has_value() ||
+           heartbeat_sequence % 2 != 0)) {
         const control::WireDesiredGroup& local_group =
             state->desired_->local.groups[*local_group_index];
         auto nonce = control::GenerateId128();
@@ -2446,7 +2457,7 @@ struct MetaControlClientService::Impl {
             state->desired_->local.groups, options_.node_id_,
             after_failover_status, **readiness,
             population.ready_token_->identity(), *population.applied_next_lsns_,
-            population.failover_candidate_eligible_);
+            population.failover_candidate_eligible_, population.recovered_);
         if (!candidate.ok()) {
           result = candidate.status();
           break;
@@ -2454,6 +2465,44 @@ struct MetaControlClientService::Impl {
         if (candidate->has_value()) {
           heartbeat.role_information =
               control::ReplicaCandidate{.progress = std::move(**candidate)};
+        }
+      }
+      if (!identity_decision.suppress_ordinary_role_ &&
+          population.operator_recovery_identity_.has_value()) {
+        const auto& scope = *population.operator_recovery_identity_;
+        for (const auto& group : state->desired_->local.groups) {
+          if (group.group_id != scope.group_id_ ||
+              group.group_term < scope.term_ ||
+              group.manifest_revision != scope.manifest_revision_ ||
+              group.manifest_digest != scope.manifest_id_.bytes_ ||
+              group.partition_replication_epoch !=
+                  scope.partition_replication_epoch_)
+            continue;
+          for (const auto& member : group.members) {
+            if (member.node_id != options_.node_id_ ||
+                AssignmentId::FromBytes(member.assignment_id).ToHexString() !=
+                    scope.assignment_id_)
+              continue;
+            // Availability never doubles as a lease challenge. Alternating
+            // these reports lets Meta observe an unready former Owner and
+            // lets an operator start a fence when automatic failover is off.
+            if (heartbeat_challenge.has_value()) continue;
+            heartbeat.role_information = control::ReplicaCandidate{
+                .progress = {.group_id = group.group_id,
+                             .assignment_id = member.assignment_id,
+                             .group_term = group.group_term,
+                             .manifest_revision = group.manifest_revision,
+                             .manifest_digest = group.manifest_digest,
+                             .partition_replication_epoch =
+                                 group.partition_replication_epoch,
+                             .source_node_id = {},
+                             .source_boot_id = {},
+                             .source_history_id = {},
+                             .applied_next_lsns = {},
+                             .operator_recovery = true}};
+            heartbeat.health.summary =
+                "rebuild-required: operator recovery available";
+          }
         }
       }
       result = FitHeartbeatToSingleFrame(heartbeat);

@@ -329,6 +329,11 @@ struct CandidateProgress {
   std::string source_boot_id;
   std::string source_history_id;
   std::vector<std::uint64_t> applied_next_lsns;
+  // A consumed clean-shutdown proof reports historical progress while the
+  // current boot is still fenced. Operator recovery instead has no source
+  // progress and is never an automatic candidate. The flags are exclusive.
+  bool recovered = false;
+  bool operator_recovery = false;
 
   friend bool operator==(const CandidateProgress&,
                          const CandidateProgress&) = default;
@@ -747,6 +752,8 @@ struct WireFailoverCandidateAction {
   WireFailoverCandidate candidate;
   WireFailoverCompatibilityDomain domain;
   std::optional<WireFailoverAuthorization> authorization;
+
+  bool operator_recovery = false;
 
   friend bool operator==(const WireFailoverCandidateAction&,
                          const WireFailoverCandidateAction&) = default;

@@ -964,6 +964,10 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       std::make_unique<CoroutineBarrier>(worker_count);
   free_list_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
   orphan_extent_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
+  shutdown_recovery_ready_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
+  shutdown_recovery_published_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
   shutdown_checkpoint_ready_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
   shutdown_checkpoint_tx_cleaned_barrier_ =
@@ -1894,16 +1898,17 @@ absl::Status StorageEngine::Impl::FlushForShutdown() {
     return absl::FailedPreconditionError(
         "runtime storage failure forbids a clean-shutdown checkpoint");
   }
-  // Give in-flight commit chains a chance to append their commit records
-  // before the flush order freezes the append streams: an acknowledged
-  // multi-key write whose commit misses the shutdown flush is dropped whole
-  // at recovery. Bounded — a stuck chain costs only its own transaction,
-  // never the shutdown. Runs on the shutdown thread, not a worker.
+  // Shutdown must not certify a population while acknowledged transactions
+  // still lack durable decisions. A bounded wait fails closed on timeout.
   const auto commit_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (active_tx_commits_.load(std::memory_order_acquire) != 0 &&
          std::chrono::steady_clock::now() < commit_deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (active_tx_commits_.load(std::memory_order_acquire) != 0) {
+    return absl::DeadlineExceededError(
+        "transaction commits did not drain for shutdown");
   }
   // Request admission is already closed and drained, so CONFIG can no longer
   // change this process's policy. Publish one latched decision to every worker;
@@ -1943,6 +1948,8 @@ void StorageEngine::Impl::Fail(const absl::Status& status) {
   recovery_accounting_barrier_->Abort(status);
   free_list_barrier_->Abort(status);
   orphan_extent_barrier_->Abort(status);
+  shutdown_recovery_ready_barrier_->Abort(status);
+  shutdown_recovery_published_barrier_->Abort(status);
   shutdown_checkpoint_ready_barrier_->Abort(status);
   shutdown_checkpoint_tx_cleaned_barrier_->Abort(status);
   shutdown_checkpoint_refrozen_barrier_->Abort(status);
@@ -2247,6 +2254,7 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
 
 void StorageEngine::Impl::CompleteShutdownFlush(const absl::Status& status) {
   if (!status.ok()) {
+    spdlog::error("shutdown durability failed: {}", status.ToString());
     shutdown_flush_failed_.store(true, std::memory_order_release);
   }
   shutdown_flush_completed_.fetch_add(1, std::memory_order_acq_rel);

@@ -109,15 +109,23 @@ absl::StatusOr<MetaCandidateProgressObs> ExactCandidateProgress(
                                  std::optional(action.candidate_.boot_id_)) {
     return Invalid("failover candidate action was disconnected");
   }
-  const auto candidates =
-      observations.LiveCandidateProgressFor(group_id, facts, now_unix_ms);
+  if (action.operator_recovery_ && !action_is_committed &&
+      !observations.LiveCandidateProgressFor(group_id, facts, now_unix_ms)
+           .empty()) {
+    return Invalid(
+        "operator recovery requires no eligible automatic candidate");
+  }
+  const auto candidates = observations.LiveCandidateProgressFor(
+      group_id, facts, now_unix_ms, action.operator_recovery_);
   const auto candidate = std::ranges::find_if(
       candidates, [&](const MetaCandidateProgressObs& progress) {
         return progress.node_id_ == action.candidate_.node_id_ &&
                progress.assignment_id_ == action.candidate_.assignment_id_ &&
                progress.boot_incarnation_ == action.candidate_.boot_id_ &&
                progress.session_generation_ == session->current_generation_ &&
-               CandidateCompatibilityDomain(progress) == action.domain_;
+               progress.operator_recovery_ == action.operator_recovery_ &&
+               (action.operator_recovery_ ||
+                CandidateCompatibilityDomain(progress) == action.domain_);
       });
   if (candidate == candidates.end()) {
     return Invalid(
@@ -356,6 +364,19 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
     const auto group = view.topology().FindGroup(begin->group_id_);
     if (!group.has_value() || group->failover_transition_.has_value()) {
       return Invalid("uncontrolled failover begin pre-state is stale");
+    }
+    if (begin->candidate_action_.has_value() &&
+        begin->candidate_action_->operator_recovery_) {
+      const auto owner =
+          observations.OwnerObservationFor(group->record_.owner_);
+      if (owner.has_value() && owner->connected_ &&
+          (!owner->health_.has_value() ||
+           (owner->health_->population_ready_ &&
+            owner->health_->storage_ready_ && !owner->health_->draining_))) {
+        return Invalid(
+            "operator recovery cannot replace a serving or unobserved "
+            "connected Owner");
+      }
     }
     if (begin->candidate_action_.has_value()) {
       MetaStoresFacts facts(view.stores());

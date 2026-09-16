@@ -1438,7 +1438,8 @@ Task<absl::Status> StorageEngine::Impl::PrefetchStandbyBlock(
 Task<absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
 StorageEngine::Impl::WriteExtentValueLocked(
     WorkerStore& store, std::string_view first, std::string_view second,
-    RecordPayloadCursor* cursor, [[maybe_unused]] std::string_view fault_key) {
+    RecordPayloadCursor* cursor, [[maybe_unused]] std::string_view fault_key,
+    bool shutdown_metadata) {
   if (cursor != nullptr && (!first.empty() || !second.empty())) {
     co_return absl::InvalidArgumentError(
         "extent writer requires either spans or a payload cursor");
@@ -1463,8 +1464,20 @@ StorageEngine::Impl::WriteExtentValueLocked(
   std::uint64_t payload_offset = 0;
   std::uint32_t extent_index = 0;
   while (payload_offset < logical_bytes) {
-    auto reserved =
-        co_await AcquireWriteBlock(store, false, /*unlock_writer=*/true);
+    absl::StatusOr<ReservedBlock> reserved =
+        absl::UnknownError("allocation not dispatched");
+    if (shutdown_metadata) {
+      // Only the final system-state certificate uses this bounded allocation
+      // after foreground admission closes. It cannot reopen a record stream,
+      // wait for defrag, or start allocator prefetch behind the shutdown drain.
+      store.store_state_mutex_.Unlock(*store.worker_);
+      reserved =
+          co_await AllocateBlock(store, AllocationPurpose::kShutdownMetadata);
+      co_await store.store_state_mutex_.Lock();
+    } else {
+      reserved =
+          co_await AcquireWriteBlock(store, false, /*unlock_writer=*/true);
+    }
     if (!reserved.ok()) {
       reclaim_allocated();
       co_return reserved.status();

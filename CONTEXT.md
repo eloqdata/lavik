@@ -57,19 +57,48 @@ _Avoid_: Failover workflow, recovery record
 **Compatibility Domain**:
 The Source Group Term, source incarnation, parent replication history, flow
 count, and immutable Group replication configuration within which Candidate
-progress may be compared. Each Candidate Action pins exactly one domain.
+progress may be compared. Each ordinary Candidate Action pins exactly one
+domain. Operator Recovery has no historical domain or comparable frontier.
 
 **Source Group Term**:
 The committed Owner generation from which a population most recently derives.
 It orders recovery domains by topology recency but does not prove that a newer
 domain contains every write from an older or sibling domain.
 
+**Recovered Population**:
+A node's logical dataset reconstructed from durable storage after restart,
+whether that node previously served as an Owner or a replica. Automatic
+failover candidacy without a new rebuild requires a verified Clean Shutdown
+Proof; reconstruction alone restores neither eligibility nor serving authority.
+_Avoid_: Restored primary, recovered lease
+
+**Clean Shutdown Proof**:
+Durable evidence that a complete population and its Compatibility Domain and
+Recovered Frontier were preserved by a successfully completed graceful
+shutdown. It permits automatic failover candidacy after validation, not reuse
+of the previous boot's serving authority.
+_Avoid_: Shutdown request, successful process exit, index checkpoint
+
+**Recovered Frontier**:
+The complete per-flow logical boundary within a Compatibility Domain preserved
+by a Clean Shutdown Proof and validated against the recovered population. It
+grants neither serving authority nor permission to continue an old replication
+session.
+_Avoid_: Last acknowledged cursor, maximum disk LSN
+
+**Operator Recovery**:
+An explicit operator selection of a Group member as the recovery source when
+the Group has no automatically eligible Candidate. Selection is not evidence
+of a complete prior replication frontier and grants no serving authority by
+itself.
+_Avoid_: Controlled Failover, automatic candidate selection
+
 **Loss Assessment**:
 The terminal statement of whether a failover discarded Source data. `none`
 means the handoff is known to cover the Source's controlled pause boundary or
 did not change authority; `unknown` means surviving observations cannot bound
-an unavailable Owner's unreplicated tail. It is not a claim of global linear
-consistency.
+an unavailable Owner's unreplicated or non-durable tail. It is not a claim of
+global linear consistency.
 _Avoid_: Exact proof, bounded loss
 
 **Node Incarnation**:
@@ -172,8 +201,10 @@ prepared primary population. It grants no serving authority.
 _Avoid_: Promotion, cutover
 
 **Candidate Action**:
-One selection of a Candidate and its Compatibility Domain within a Failover
-Transition. Every selection, including reselection of the same Node
+One selection of a Candidate within a Failover Transition. An ordinary action
+pins its Compatibility Domain; an Operator Recovery action instead pins the
+selected member and population scope and accepts unknown loss, without claiming
+a historical frontier. Every selection, including reselection of the same Node
 Incarnation, receives a new immutable action identity.
 
 **Action Failure**:

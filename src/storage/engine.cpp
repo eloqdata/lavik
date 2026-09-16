@@ -77,6 +77,20 @@ StorageEngine::RecoverPromotionBase() const {
   return impl_->RecoverPromotionBase();
 }
 
+Task<absl::Status> StorageEngine::CommitPopulationIdentity(
+    std::string identity) {
+  return impl_->CommitPopulationIdentity(std::move(identity));
+}
+
+Task<absl::StatusOr<std::optional<PopulationRecoveryRecord>>>
+StorageEngine::ConsumePopulationRecovery() {
+  return impl_->ConsumePopulationRecovery();
+}
+
+void StorageEngine::StageCleanShutdownProof(std::string proof) {
+  impl_->StageCleanShutdownProof(std::move(proof));
+}
+
 absl::StatusOr<PopulationToken> StorageEngine::RecoverPopulationToken() const {
   return impl_->RecoverPopulationToken();
 }

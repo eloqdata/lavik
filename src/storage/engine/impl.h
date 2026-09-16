@@ -1001,10 +1001,10 @@ struct ReservedBlock {
 enum class AllocationPurpose : std::uint8_t {
   kForeground,
   kDefrag,
-  // A clean-shutdown checkpoint may allocate after foreground writes have
-  // been frozen, but it never waits for reclamation or consumes the reserve
-  // that guarantees defrag can make progress.
-  kCheckpoint,
+  // Shutdown recovery proof and checkpoint metadata may allocate after writes
+  // have been frozen, but it never waits for reclamation or consumes the
+  // reserve that guarantees defrag can make progress.
+  kShutdownMetadata,
 };
 
 struct CheckpointRoot {
@@ -2724,6 +2724,11 @@ class StorageEngine::Impl {
                                  std::string_view opaque_accumulator);
   Task<absl::Status> CommitPromotionBase(PromotionBase base);
   absl::StatusOr<std::optional<PromotionBase>> RecoverPromotionBase() const;
+  Task<absl::Status> CommitPopulationIdentity(std::string identity);
+  Task<absl::StatusOr<std::optional<PopulationRecoveryRecord>>>
+  ConsumePopulationRecovery();
+  void StageCleanShutdownProof(std::string proof);
+  Task<absl::Status> PublishCleanShutdownProof();
   absl::StatusOr<PopulationToken> RecoverPopulationToken() const;
   Task<absl::Status> BeginReplicaFullSync(std::uint64_t session_id);
   Task<absl::Status> CompleteReplicaFullSync(std::uint64_t session_id,
@@ -2765,6 +2770,8 @@ class StorageEngine::Impl {
     ExtentManifest catalog_extents_;
     ExtentManifest manifest_extents_;
     std::optional<PromotionBase> promotion_base_;
+    std::string population_identity_;
+    std::string clean_shutdown_proof_;
     PopulationToken population_token_{};
     std::uint64_t full_sync_session_id_ = 0;
     bool catalog_ready_ = false;
@@ -2773,7 +2780,8 @@ class StorageEngine::Impl {
   absl::Status LoadSystemState();
   Task<absl::Status> CommitSystemState(DurableSystemState next,
                                        std::string_view catalog_dump,
-                                       bool replace_catalog);
+                                       bool replace_catalog,
+                                       bool shutdown_metadata = false);
   Task<absl::Status> WriteSystemStateRootOnDeviceLocal(
       std::size_t device_index, const SystemStateRoot& root,
       std::uint8_t target_slot);
@@ -3341,7 +3349,8 @@ class StorageEngine::Impl {
   WriteExtentValueLocked(WorkerStore& store, std::string_view first,
                          std::string_view second = {},
                          RecordPayloadCursor* cursor = nullptr,
-                         std::string_view fault_key = {});
+                         std::string_view fault_key = {},
+                         bool shutdown_metadata = false);
 
   struct GroupMutationWrite;
   Task<absl::Status> AppendLocked(
@@ -3815,6 +3824,7 @@ class StorageEngine::Impl {
   // field update cannot erase the other.
   AsyncMutex system_state_mutex_;
   DurableSystemState system_state_;
+  std::string staged_clean_shutdown_proof_;
   std::optional<std::string> recovered_catalog_dump_;
   std::optional<absl::Status> system_state_failure_;
   std::atomic<bool> system_state_root_failure_injected_{false};
@@ -3891,6 +3901,8 @@ class StorageEngine::Impl {
   std::unique_ptr<CoroutineBarrier> recovery_accounting_barrier_;
   std::unique_ptr<CoroutineBarrier> free_list_barrier_;
   std::unique_ptr<CoroutineBarrier> orphan_extent_barrier_;
+  std::unique_ptr<CoroutineBarrier> shutdown_recovery_ready_barrier_;
+  std::unique_ptr<CoroutineBarrier> shutdown_recovery_published_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_tx_cleaned_barrier_;
   std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_refrozen_barrier_;

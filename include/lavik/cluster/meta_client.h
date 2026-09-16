@@ -282,15 +282,16 @@ MetaSessionReplicationIdentityDecision EvaluateMetaSessionReplicationIdentity(
 
 // Builds ordinary replica progress from the current Ready population. During
 // an exact uncontrolled fence, the retained historical owner reports a
-// boot-local self-origin lineage; active owners and terminally failed
-// populations remain ineligible.
+// boot-local self-origin lineage. A clean recovered population instead keeps
+// the certificate's historical source lineage; active owners and terminally
+// failed populations remain ineligible.
 absl::StatusOr<std::optional<control::CandidateProgress>>
 ProjectReplicaCandidateProgress(
     std::span<const control::WireDesiredGroup> groups,
     std::string_view local_node_id, const ReplicationIdentity& current_identity,
     const PopulationReadiness& readiness, const RebuildIdentity& ready_identity,
     std::span<const std::uint64_t> applied_next_lsns,
-    bool failover_candidate_eligible);
+    bool failover_candidate_eligible, bool recovered = false);
 
 // Separates a retriable connection/session failure from failure of the local
 // authority and population cleanup that followed an accepted session. A stop

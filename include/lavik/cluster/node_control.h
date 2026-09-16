@@ -146,6 +146,8 @@ struct PreparedFailoverAction {
   PreparedFailoverCompatibilityDomain domain_;
   std::optional<PreparedFailoverAuthorization> authorization_;
 
+  bool operator_recovery_ = false;
+
   friend bool operator==(const PreparedFailoverAction&,
                          const PreparedFailoverAction&) = default;
 };

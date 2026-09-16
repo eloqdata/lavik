@@ -195,6 +195,7 @@ absl::StatusOr<control::WireFailoverTransition> ProjectFailoverTransition(
         .assignment_id = action.candidate_.assignment_id_,
         .boot_id = Hex(action.candidate_.boot_id_),
     };
+    projected_action.operator_recovery = action.operator_recovery_;
     projected_action.domain = {
         .source_group_term = action.domain_.source_group_term_,
         .source_node_id = action.domain_.source_node_id_,
@@ -203,6 +204,7 @@ absl::StatusOr<control::WireFailoverTransition> ProjectFailoverTransition(
         .source_history_id = Hex(action.domain_.source_history_id_),
         .flow_count = action.domain_.flow_count_,
     };
+    if (action.operator_recovery_) projected_action.domain = {};
     if (action.authorization_.has_value()) {
       control::WireFailoverLoss loss;
       switch (action.authorization_->loss_if_cutover_) {

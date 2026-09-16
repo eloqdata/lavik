@@ -359,14 +359,20 @@ could disagree with them.
 Heartbeat carries common health followed by exactly one tagged steady-state
 role payload: no role information, an authority lease request, or replica
 candidate progress. A committed owner with an active renewable grant sends
-only the lease request. An inactive topology owner normally sends no role
+lease requests. A restarted member without a clean shutdown proof alternates
+lease requests with operator-recovery availability when it still occupies the
+owner assignment; its unready health cannot renew authority. An inactive topology owner normally sends no role
 information. The narrow exception is the historical owner retained by an
 active uncontrolled target-term fence: with no grant and a coherent live Ready
 frontier, it may report candidate progress using its authenticated current
 boot/history and its own assignment at the preceding term as source lineage.
-This lets the best surviving population re-enter selection without treating a
-fenced owner as active authority. Other non-owner members with coherent live
-Ready frontiers also send only candidate progress. Candidate
+Recovered candidates instead retain the exact historical source boot/history
+from a consumed clean shutdown proof, while their current boot remains fenced.
+Operator-recovery availability contains only the completed local population's
+scope, with no source lineage or vector; it cannot enter automatic selection.
+This lets a surviving population re-enter selection without treating a
+fenced owner as active authority. Other non-owner members with coherent
+Ready frontiers also send candidate progress. Candidate
 progress includes the exact local membership assignment, manifest revision and
 digest, partition replication epoch, completed rebuild source lineage, and a
 typed bounded next-LSN vector sampled after successful apply. Candidate and
@@ -535,9 +541,11 @@ short directive admission lane plus the final fail-closed session-loss
 transition. Terminal rebuild observation is separately session-scoped, so
 abandoning a dead wire cannot block reconnection; shutdown still cancels and
 joins the underlying native attempt before storage teardown.
-Only after the control barrier may the process finish draining client requests.
-It then joins the already-cancelled replication work and creates its storage
-shutdown checkpoint. This ordering prevents a completed control-side mutation
+The process drains admitted client requests before joining the control barrier,
+so the retained final population frontier includes every accepted write. It
+then joins the already-cancelled replication work and durably flushes storage
+before publishing a clean shutdown proof and the optional index checkpoint.
+This ordering prevents a completed control-side mutation
 from landing after the checkpoint that is supposed to describe the clean
 shutdown. If native-flow cancellation, source revocation, or candidate root
 retirement has an uncertain outcome, the barrier returns that failure; the
@@ -640,8 +648,10 @@ worker-local and independently sampled.
 
 The local Group failover transition is a separate level-triggered control object. It
 names the transition/revision, controlled or uncontrolled mode, target term,
-and optional candidate action with exact candidate boot, compatibility domain,
-and one-way authorization. NodeControl derives source pause only for the exact
+and optional candidate action with exact candidate boot and one-way
+authorization. Ordinary actions pin a compatibility domain; Operator Recovery
+pins the selected member and population scope with unknown loss and no
+historical domain or frontier. NodeControl derives source pause only for the exact
 controlled owner and derives candidate work only for the exact named candidate.
 The manager catches up through the existing native coordinator and returns a
 boot-local prepared-context identity or a typed failure observation. A
@@ -848,4 +858,4 @@ incomplete-full-sync fence without a local topology source.
 | Startup wiring, storage-ready publication, and Meta control client ownership | `src/redis/server.cpp` |
 | Cluster configuration directives and validation | `include/lavik/server.h`, `src/config.cpp`, `app/lavik.cpp` |
 | Decision matrix, parser, publication, finite-lease test installation, failover projection/activation, and concurrency unit tests | `tests/cluster_authority_test.cpp`, `tests/cluster/test_topology_installer.h`, `tests/cluster_topology_test.cpp`, `tests/cluster_command_test.cpp`, `tests/control_protocol_test.cpp`, `tests/meta_client_test.cpp`, `tests/meta_control_test.cpp`, `tests/node_control_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp` |
-| Real-process Meta/Data discovery, committed failover, mTLS, initial creation, and shutdown gates | `tests/meta_integration/gate_data_control.py`, `tests/meta_integration/gate_cluster_create.py`, `tests/meta_integration/gate_failover.py` |
+| Real-process Meta/Data discovery, committed failover, mTLS, initial creation, shutdown proof consumption and operator recovery gates | `tests/meta_integration/gate_data_control.py`, `tests/meta_integration/gate_cluster_create.py`, `tests/meta_integration/gate_failover.py`, `tests/meta_integration/gate_population_recovery.py` |

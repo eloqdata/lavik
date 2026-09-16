@@ -854,7 +854,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
       [this, &store, generation, &result, &write_slots, &payload_slot,
        &payload](std::uint32_t record_count) -> Task<absl::Status> {
     auto reserved =
-        co_await AllocateBlock(store, AllocationPurpose::kCheckpoint);
+        co_await AllocateBlock(store, AllocationPurpose::kShutdownMetadata);
     if (!reserved.ok()) co_return reserved.status();
     const std::size_t write_bytes = payload->Finalize(
         reserved->block_id_, reserved->allocation_epoch_, generation,

@@ -17,7 +17,7 @@ limitations under the License.
 # Meta control plane operations
 
 Lavik clusters require Lavik binaries and certificates with `lavik://` URI
-SANs on every member. Recreate data and Meta directories from earlier Keylane
+SANs on every member. Recreate data and Meta directories from earlier Lavik
 development builds; mixed identifiers and rolling upgrades from those builds
 are unsupported.
 
@@ -486,6 +486,40 @@ proposal latency. A Meta Leader replacement intentionally discards accumulated
 suspicion, reacquires observations, and gives the failure a fresh full
 debounce. Inspect the per-Group detector fields in `cluster-status` when
 diagnosing RTO rather than inferring progress from process reachability.
+
+### Restart and operator recovery
+
+A member that completes graceful shutdown publishes a one-use Clean Shutdown
+Proof after its data and transaction decisions are durable. On restart it
+consumes that proof and can report its recovered frontier for ordinary automatic
+selection without rebuilding. It remains fenced until Meta commits promotion
+and grants a fresh lease. This applies to the first Owner and ordinary replicas
+as well as later Owners; `shutdown-checkpoint` is not required.
+
+A crash or interrupted shutdown without a published proof requires FULL before
+automatic candidacy. When the Group has no eligible Candidate and no usable
+Owner can supply FULL, select one readable recovered member explicitly:
+
+```bash
+lavik-ctl --socket /path/to/leader.sock \
+  promote group-1 --node 2222222222222222222222222222222222222222 \
+  --accept-data-loss
+```
+
+This direct Admin command must reach the Meta leader and requires operator
+credentials and Meta quorum. `OK <index> promote loss=unknown action=<id>` means
+the selection committed; use `cluster-status` to observe Cutover and readiness.
+The selected node establishes a new history over its recovered local data.
+Acknowledged writes may be missing; `--accept-data-loss` is required and the
+committed action records the recovery choice. The command rejects an eligible
+automatic Candidate, a serving Owner, an occupied transition, stale membership,
+and absent readable recovery evidence. Corrupt storage/catalog or incomplete
+destructive FULL must be repaired or rebuilt, and cannot be promoted.
+
+For a whole-cluster outage, make this choice separately for each affected
+Group. There is no automatic selection of arbitrary crash-recovered data. If a
+request times out, inspect the Group's transition/action and audit before
+issuing another mutation; a timeout does not prove rejection.
 
 For postmortems, search Meta logs for `failover event=`. Accepted transition
 commits carry `mode`, `group`, `transition`, `action`, `loss`, and

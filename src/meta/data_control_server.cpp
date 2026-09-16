@@ -784,13 +784,16 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
         ParseIdentity<20>(candidate.source_boot_id, "candidate source boot id");
     auto source_history = ParseIdentity<20>(candidate.source_history_id,
                                             "candidate source history id");
-    if (!health.storage_ready || !health.population_ready || health.draining) {
+    if (!health.storage_ready ||
+        (!health.population_ready && !candidate.recovered &&
+         !candidate.operator_recovery) ||
+        health.draining) {
       record_rejection("candidate",
                        absl::FailedPreconditionError(
                            "candidate heartbeat is not ready and healthy"));
-    } else if (!source_boot.ok()) {
+    } else if (!source_boot.ok() && !candidate.operator_recovery) {
       record_rejection("candidate", source_boot.status());
-    } else if (!source_history.ok()) {
+    } else if (!source_history.ok() && !candidate.operator_recovery) {
       record_rejection("candidate", source_history.status());
     } else {
       MetaCandidateProgressObs progress{
@@ -807,13 +810,19 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
           .source_group_term_ = candidate.source_group_term,
           .source_node_id_ = candidate.source_node_id,
           .source_assignment_id_ = candidate.source_assignment_id,
-          .source_boot_incarnation_ = *source_boot,
-          .source_replication_history_id_ = *source_history,
+          .source_boot_incarnation_ = candidate.operator_recovery
+                                          ? MetaBootIncarnation{}
+                                          : *source_boot,
+          .source_replication_history_id_ = candidate.operator_recovery
+                                                ? MetaReplicationHistoryId{}
+                                                : *source_history,
           .applied_next_lsns_ = candidate.applied_next_lsns,
 
           .storage_ready_ = health.storage_ready,
           .population_ready_ = health.population_ready,
           .draining_ = health.draining,
+          .recovered_ = candidate.recovered,
+          .operator_recovery_ = candidate.operator_recovery,
       };
       candidate_observation = std::move(progress);
     }

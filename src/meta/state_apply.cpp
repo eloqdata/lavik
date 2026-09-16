@@ -1818,7 +1818,11 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   std::string summary = absl::StrCat(
       "BeginUncontrolledFailover group=", cmd.group_id_,
       " transition=", HexBytes(cmd.transition_id_),
-      " target_term=", cmd.target_term_,
+      " target_term=", cmd.target_term_, " operator_recovery=",
+      cmd.candidate_action_.has_value() &&
+              cmd.candidate_action_->operator_recovery_
+          ? 1
+          : 0,
       " trigger=", MetaAutomaticFailoverReasonName(cmd.trigger_reason_),
       " suspect_ms=", cmd.suspect_duration_ms_, " preempted_operation=",
       cmd.preempted_operation_id_.has_value()
@@ -1943,6 +1947,11 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       cmd.candidate_action_.has_value()
           ? HexBytes(cmd.candidate_action_->action_id_)
           : std::string("none"),
+      " operator_recovery=",
+      cmd.candidate_action_.has_value() &&
+              cmd.candidate_action_->operator_recovery_
+          ? 1
+          : 0,
       " index=", log_index);
   if (!ClusterLifecycleAllowsFailover(stores)) {
     return Rejected("failover requires cluster lifecycle Created",

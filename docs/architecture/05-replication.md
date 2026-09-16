@@ -46,9 +46,41 @@ disabled.
 The source backlog is deliberately not durable. It is process-local memory
 used for connected downstreams and bounded reconnects. Target records,
 Function catalog, full-sync invalidation, population eligibility, and
-promotion base are durable, but native flow cursors and Redis replid/offset
-state are process-local. Every process boot creates a new boot ID, history ID,
-and replica incarnation; a restart therefore requires whole-group full sync.
+promotion base are durable. A completed graceful shutdown also certifies its
+final source-domain frontier. Startup consumes that certificate durably before
+mutation and may reconstruct a fenced Candidate for any former Group role.
+Without that proof, automatic eligibility requires whole-group full sync.
+Every boot creates a new boot ID, history ID, and replica incarnation; neither
+native continuation nor Redis replid/offset state resumes across restart.
+
+## Population recovery
+
+Completed Bootstrap and replica FULL populations commit their Group/member
+assignment, manifest revision/digest, partition epoch and local population scope
+through Storage's system-state writer. These records establish where readable
+local data belongs; they do not certify replication progress.
+
+Graceful shutdown drains accepted commands and target apply before capturing
+source history and the complete per-flow frontier. Storage publishes the Clean
+Shutdown Proof only after all workers have flushed ordinary and transactional
+records and all transaction decisions have drained. The certificate is
+independent of the optional index checkpoint. Startup validates the selected
+catalog and population, durably consumes the certificate, then rebinds the
+recovered population to the new reporter boot while preserving historical
+source provenance. A later crash cannot reuse the consumed certificate.
+
+Recovered candidates advertise no serving readiness until an authorized
+promotion preparation creates a new durable base and history. An authority-only
+term fence preserves their unchanged population scope. Bootstrap assignment,
+election ordering, committed Cutover and finite lease activation remain Meta's
+responsibility. Downstreams rebuild from the new history.
+
+Readable recovered populations without a clean certificate report operator
+recovery availability without a source cursor. A committed operator-recovery
+action can establish a fresh base over that population with `loss=unknown`;
+its new base cursor never enters automatic historical-domain ranking. Missing
+scope, corruption and incomplete destructive FULL are not recoverable through
+this action.
 
 ## Runtime ownership
 
@@ -568,7 +600,10 @@ replica can still resume from the circular reconnect window. Each online native
 session records the next LSN after its highest completely written socket batch
 on every flow; this is a conservative upper bound even when the final ACK is
 lost. Once one flow's floor advances beyond that upper bound, the all-flow
-native session can no longer continue. After every disconnected native replica
+native session can no longer continue. Meta-managed Owners keep their source
+sequence active even without consumers so a clean shutdown can certify the
+final all-flow frontier; unpinned log entries remain bounded and evictable.
+For standalone sources, after every disconnected native replica
 reaches that state and no native session, Redis exporter, installed population
 capability, or FDS replay reservation is active, the manager closes and drains
 command admission, rechecks that the source is still idle, rotates the history
@@ -1090,8 +1125,9 @@ connection metrics.
   Durable target data does not imply crash-resumable replication history.
 - A Meta-managed `ReplicationGroup`, its reset capability, and its ready token
   are current-boot state. Every such restart constructs a new `NOT_READY`
-  group and remains LOADING even when storage recovered records written by a
-  prior boot; old directives and proof tokens cannot reactivate them.
+  group and remains LOADING. A consumed Clean Shutdown Proof permits fresh
+  candidate evidence, while records alone require rebuild or explicit operator
+  recovery; old directives, leases and ready tokens cannot reactivate serving.
 - The callable `ReplicationManager` adapter does not receive or authenticate
   Meta messages and does not itself publish candidate state to a quorum.
   `MetaControlClientService` owns the authenticated session, while
@@ -1142,7 +1178,7 @@ FLUSH/full-sync interleavings. Two legacy replication tests in
 | Claim | Repository source |
 |---|---|
 | Public roles, options, status, and manager boundary | `include/lavik/replication.h` |
-| Single-group rebuild identity, safe-source authorization, logical/local epoch mapping, manifest/reset proof, readiness, restart invalidation, and fail-stop contract | `include/lavik/replication_group.h`, `src/replication/replication_group.cpp` |
+| Single-group rebuild identity, safe-source authorization, logical/local epoch mapping, manifest/reset proof, readiness, clean recovery, and fail-stop contract | `include/lavik/replication_group.h`, `src/replication/replication_group.cpp`, `src/replication/population_recovery.h` |
 | Callable cluster directive/status/source-authorization, failover prepare/activation, source pause, and follow-owner adapters; native control/data protocol, duplex online flow, role lifecycle, Redis follower/export, topology, Function full sync, and reconnect behavior | `include/lavik/replication.h`, `src/replication/replication.cpp` |
 | Lock-free live target Applied frontier and coherent cross-flow snapshots | `src/replication/replica_applied_frontier.h`, `src/replication/replica_applied_frontier.cpp` |
 | Canonical command format and deterministic expiration effects | `include/lavik/replication_command.h`, `src/replication/command.cpp` |

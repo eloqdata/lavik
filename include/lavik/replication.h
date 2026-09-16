@@ -221,6 +221,12 @@ struct ClusterPopulationStatus {
   // compatibility domain from candidate selection. A changed population or
   // domain is eligible again; a process restart naturally drops the latch.
   bool failover_candidate_eligible_ = true;
+  // Recovery may nominate a candidate but cannot renew a previous Owner
+  // grant. Cleared after fresh action-scoped promotion preparation succeeds.
+  bool recovered_ = false;
+  // Readable persisted scope without a certified frontier is exposed only to
+  // an explicit operator-recovery action, never automatic candidate ranking.
+  std::optional<RebuildIdentity> operator_recovery_identity_;
   // Nonempty exactly while state_ is kFailedStopped.
   std::string failure_reason_;
 };
@@ -313,6 +319,9 @@ struct DesiredClusterFailoverAction {
   std::uint64_t manifest_revision_ = 0;
   PopulationManifestId manifest_id_;
   std::uint64_t partition_replication_epoch_ = 0;
+
+  bool operator_recovery_ = false;
+  std::vector<PopulationManifestEntry> manifest_entries_;
 
   bool operator==(const DesiredClusterFailoverAction&) const = default;
 };
@@ -645,6 +654,10 @@ class ReplicationManager {
   // coordinator has joined its flows and retired any partial candidate root.
   // This must run while the Bycorf runtime and StorageEngine are still alive.
   bycorf::Task<absl::Status> CancelClusterRebuildForShutdown();
+
+  // Consumes durable recovery evidence after all storage/catalog recovery,
+  // before announcing storage readiness to Meta. Every boot remains fenced.
+  bycorf::Task<absl::Status> RecoverClusterPopulation();
 
   // Thread-safe first half of process shutdown. It closes outbound target
   // handshakes/sessions and inbound native/Redis source sockets immediately.

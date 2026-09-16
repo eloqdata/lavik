@@ -462,6 +462,8 @@ struct MetaFailoverCandidateAction {
   MetaFailoverCandidate candidate_;
   MetaFailoverCompatibilityDomain domain_;
   std::optional<MetaFailoverAuthorization> authorization_;
+  // Explicit loss=unknown recovery; domain is empty and never ranked.
+  bool operator_recovery_ = false;
   bool operator==(const MetaFailoverCandidateAction&) const = default;
 };
 

@@ -190,6 +190,18 @@ struct PromotionBase {
   bool operator==(const PromotionBase&) const = default;
 };
 
+// Durable population scope and a one-use clean-shutdown certificate. Both
+// payloads belong to Replication; Storage binds them to its atomically selected
+// population/catalog roots. An empty proof permits operator recovery only.
+struct PopulationRecoveryRecord {
+  std::string identity_;
+  std::string clean_proof_;
+  PopulationToken population_token_{};
+  CatalogDurabilityToken catalog_token_{};
+
+  bool operator==(const PopulationRecoveryRecord&) const = default;
+};
+
 enum class TombRaiderMode : std::uint8_t {
   kOff,
   kInterval,
@@ -1048,6 +1060,18 @@ class StorageEngine {
   // Recovery returns absence when this storage lineage has never committed a
   // promotion base or when full-sync invalidation cleared it.
   absl::StatusOr<std::optional<PromotionBase>> RecoverPromotionBase() const;
+  // Records a completed cluster population's immutable scope. This never
+  // certifies a cursor and invalidates any previous clean-shutdown proof.
+  bycorf::Task<absl::Status> CommitPopulationIdentity(std::string identity);
+  // Consumes the clean proof durably before returning it to a new boot. Call
+  // once after storage/catalog recovery and before admitting any mutations.
+  bycorf::Task<absl::StatusOr<std::optional<PopulationRecoveryRecord>>>
+  ConsumePopulationRecovery();
+  // Stages a quiesced replication frontier on worker zero. Final shutdown
+  // publishes it only after all workers have drained their durable writes.
+  // An empty value withdraws a previously staged proof.
+  void StageCleanShutdownProof(std::string proof);
+
   // Returns the currently promotion-eligible population; absence is reported
   // as FailedPrecondition rather than a zero token.
   absl::StatusOr<PopulationToken> RecoverPopulationToken() const;

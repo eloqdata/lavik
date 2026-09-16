@@ -199,6 +199,13 @@ class ReplicationGroup {
   ReplicationGroup& operator=(const ReplicationGroup&) = delete;
   ~ReplicationGroup();
 
+  // Rebinds a recovered complete population to this boot without authorizing
+  // destructive reset. The caller must have validated and consumed Storage's
+  // clean certificate, or hold a committed operator-recovery action. This
+  // token grants no lease; the manager keeps serving fenced until promotion.
+  absl::StatusOr<ReadyToken> RecoverPopulation(
+      RebuildIdentity identity, std::vector<std::uint64_t> frontier);
+
   // Checks whether a directive could be accepted without consuming its
   // attempt identity or changing the current proof. A newer directive may
   // validate while another attempt is active, but the caller must cancel and

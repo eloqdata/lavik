@@ -88,15 +88,24 @@ PreparedFailoverTransition ToPreparedFailoverTransition(
       .domain_ =
           {
               .source_group_term_ = action.domain.source_group_term,
-              .source_node_id_ = *NodeId::Parse(action.domain.source_node_id),
+              .source_node_id_ =
+                  action.operator_recovery
+                      ? NodeId{}
+                      : *NodeId::Parse(action.domain.source_node_id),
               .source_assignment_id_ =
                   AssignmentId::FromBytes(action.domain.source_assignment_id),
-              .source_boot_id_ = *NodeId::Parse(action.domain.source_boot_id),
+              .source_boot_id_ =
+                  action.operator_recovery
+                      ? NodeId{}
+                      : *NodeId::Parse(action.domain.source_boot_id),
               .source_history_id_ =
-                  *NodeId::Parse(action.domain.source_history_id),
+                  action.operator_recovery
+                      ? NodeId{}
+                      : *NodeId::Parse(action.domain.source_history_id),
               .flow_count_ = action.domain.flow_count,
           },
       .authorization_ = std::nullopt,
+      .operator_recovery_ = action.operator_recovery,
   };
   if (action.authorization.has_value()) {
     prepared.candidate_action_->authorization_ = PreparedFailoverAuthorization{
