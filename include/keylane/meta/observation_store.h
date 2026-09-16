@@ -91,6 +91,23 @@ struct MetaObservedFailoverProjection {
   bool operator==(const MetaObservedFailoverProjection&) const = default;
 };
 
+// Exact Owner authority contained in the FDS that underlay one authenticated
+// heartbeat. The marker is supplied by the trusted session publisher, never
+// by Data, so a detector can compare health and authority without joining a
+// client claim to a different projection.
+struct MetaObservedOwnerProjection {
+  std::string group_id_;
+  std::string owner_node_id_;
+  MetaAssignmentId owner_assignment_id_{};
+  std::uint64_t group_term_ = 0;
+  MetaHash256 projection_hash_{};
+  // Effective duration from this installed FDS after the Meta Leader's local
+  // validity cap. Retaining it with the projection lets a later snapshot tear
+  // distinguish a known-expired old lease from unknown runtime evidence.
+  std::uint32_t authority_lease_duration_ms_ = 0;
+  bool operator==(const MetaObservedOwnerProjection&) const = default;
+};
+
 // Leader-local authenticated session fact used to distinguish a node that has
 // not re-reported after a Meta leadership change from an exact session that
 // this leader observed disconnecting. The last-disconnect latch survives a
@@ -127,6 +144,55 @@ struct MetaNodeHealthObs {
   std::uint32_t active_groups_ = 0;
   std::string health_;  // bounded free-form diagnostic summary
   bool operator==(const MetaNodeHealthObs&) const = default;
+};
+
+// One atomic session/health/projection cut for Owner serviceability. health_
+// retains only the fixed-size typed fields; the independently budgeted
+// diagnostic string is intentionally empty. Presence means an authenticated
+// session incarnation is known; connected_ and the optional heartbeat fields
+// distinguish disconnect from an adopted session that has not yet reported.
+struct MetaObservedOwnerState {
+  // A Grant Ack whose delivery is possible but has not yet been proved by a
+  // higher-sequence heartbeat. The same value type also retains the exact
+  // causally installed Grant window across same-authority FDS replacements.
+  struct LeaseWindow {
+    MetaObservedOwnerProjection projection_;
+    std::uint64_t granted_heartbeat_sequence_ = 0;
+    std::uint64_t heartbeat_received_steady_ms_ = 0;
+
+    bool operator==(const LeaseWindow&) const = default;
+  };
+
+  MetaObservationIdentity identity_;
+  bool connected_ = false;
+  std::uint64_t heartbeat_sequence_ = 0;
+  std::optional<MetaNodeHealthObs> health_;
+  // Owner failure detection uses the same monotonic clock as detector
+  // debounce; wall-clock corrections cannot manufacture stale health.
+  std::optional<std::uint64_t> heartbeat_received_steady_ms_;
+  std::optional<MetaObservedOwnerProjection> owner_projection_;
+  // Starts when this exact session first reports an Owner projection and
+  // advances only when a heartbeat proves a strictly newer granted Ack for
+  // that same projection. Ordinary heartbeats deliberately do not refresh
+  // it: callers use its monotonic age to bound causal-lease uncertainty.
+  std::optional<std::uint64_t> causal_progress_received_steady_ms_;
+  // Receipt of a higher-sequence heartbeat proves that Data processed the
+  // named Grant Ack. The projection is the atomic owner_projection_ in this
+  // same cut, so retaining another copy would create an invalid state.
+  std::optional<std::uint64_t> confirmed_grant_sequence_;
+  // Maximum deadline among unconfirmed Grants this leader may have delivered
+  // for the current Owner authority.
+  std::optional<LeaseWindow> possible_owner_lease_;
+  // Exact attempt that produced the newest causally confirmed installed
+  // lease. It survives a same-authority FDS replacement, while confirmation
+  // of a later Grant replaces it because Data processes Acks in order.
+  std::optional<LeaseWindow> installed_owner_lease_;
+  // Present after this leader's handoff guard denied an otherwise healthy
+  // exact Owner challenge. Same-authority projection replacement does not
+  // prove the 2D quarantine finished; a later Grant attempt or a same/newer
+  // NodeNotReady Ack evaluated after that deadline supersedes it.
+  std::optional<std::uint64_t> authority_handoff_pending_sequence_;
+  bool operator==(const MetaObservedOwnerState&) const = default;
 };
 
 struct MetaCandidateProgressObs {
@@ -173,8 +239,7 @@ struct MetaOperationEvidenceObs {
   MetaAssignmentId assignment_id_{};
   MetaOperationId operation_id_;
   std::string kind_phase_;  // bounded; the phase this evidence supports
-  MetaHash256 evidence_hash_;
-  std::string evidence_;  // bounded normalized evidence payload
+  std::string evidence_;    // bounded normalized evidence payload
   // Committed population and operation-history anchors for this evidence:
   std::string group_id_;
   uint64_t group_term_ = 0;
@@ -215,7 +280,6 @@ struct MetaCandidatePreparedObs {
   MetaAssignmentId candidate_assignment_id_{};
   MetaBootIncarnation candidate_boot_id_{};
   MetaRequestId prepared_context_id_{};
-  MetaHash256 prepared_context_hash_{};
   std::int64_t received_unix_ms_ = 0;
   std::int64_t expires_unix_ms_ = 0;
   bool operator==(const MetaCandidatePreparedObs&) const = default;
@@ -436,16 +500,19 @@ class MetaObservationStore {
   absl::Status Ingest(MetaObservation observation,
                       const MetaCommittedFacts& facts, int64_t now_unix_ms);
 
-  // Replaces common liveness/health and the role-derived candidate state under
-  // one lock. After identity/current-generation admission, candidate and
-  // transition evidence are replace-or-clear: absence or component rejection
-  // clears the corresponding older observation, so a promotion or failed
-  // report cannot preserve a stale role/action fact. Rejecting the heartbeat's
-  // identity leaves the replacement session's state untouched. The final
-  // overload also atomically replaces the session's trusted installed-FDS
-  // projection marker; nullopt clears it. The shorter overloads deliberately
-  // supply nullopt for fields they do not carry and therefore clear them.
-  // Component statuses report partial admission independently.
+  // Replaces common liveness/diagnostic health and the role-derived candidate
+  // state under one lock. The fixed-size typed health used by Owner
+  // serviceability is stored with the heartbeat sequence, installed-FDS
+  // marker, and causal lease confirmation as one session cut; diagnostic text
+  // capacity cannot splice that cut across frames. Candidate and transition
+  // evidence remain replace-or-clear: absence or component rejection clears
+  // the corresponding older fact. Rejecting the heartbeat identity leaves the
+  // replacement session untouched. The shorter overloads deliberately supply
+  // nullopt for fields they cannot carry and therefore clear them. Component
+  // statuses report diagnostic and role-evidence admission independently.
+  // The full overload takes both clock cuts: Unix time retains the existing
+  // generic observation TTL/audit semantics, while steady time is stored only
+  // for Owner heartbeat and causal-lease freshness.
   HeartbeatReplaceResult ReplaceHeartbeat(
       const MetaObservationIdentity& identity, MetaNodeHealthObs health,
       std::optional<MetaCandidateProgressObs> candidate,
@@ -461,6 +528,34 @@ class MetaObservationStore {
       std::optional<MetaFailoverObservationObs> failover,
       std::optional<MetaObservedFailoverProjection> failover_projection,
       const MetaCommittedFacts& facts, int64_t now_unix_ms);
+  HeartbeatReplaceResult ReplaceHeartbeat(
+      const MetaObservationIdentity& identity, MetaNodeHealthObs health,
+      std::optional<MetaCandidateProgressObs> candidate,
+      std::optional<MetaFailoverObservationObs> failover,
+      std::optional<MetaObservedFailoverProjection> failover_projection,
+      std::optional<MetaObservedOwnerProjection> owner_projection,
+      std::uint64_t heartbeat_sequence,
+      std::optional<std::uint64_t> confirmed_grant_sequence,
+      const MetaCommittedFacts& facts, int64_t now_unix_ms,
+      std::uint64_t now_steady_ms);
+
+  // Records the handoff or Grant consequence immediately before the Ack's
+  // first send attempt. A failed network write can be ambiguous, so a Grant
+  // attempt may delay failure by at most one finite lease but cannot forget
+  // authority that Data might have installed. The exact current session and
+  // heartbeat must match; a Grant must also match the installed projection.
+  absl::Status RecordOwnerLeaseDecisionAttempt(
+      const MetaObservationIdentity& identity, std::uint64_t heartbeat_sequence,
+      const cluster::control::LeaseDecision& decision);
+
+  // Retires an older handoff denial only after a later NodeNotReady Ack has
+  // been written successfully. The server evaluates handoff quarantine
+  // before publishing that denial, so it proves the deadline elapsed. Other
+  // denial kinds bypass the guard and cannot retire the marker. Grant
+  // attempts already clear it and enter the possible-lease envelope above.
+  absl::Status RecordOwnerLeaseDecisionWritten(
+      const MetaObservationIdentity& identity, std::uint64_t heartbeat_sequence,
+      const cluster::control::LeaseDecision& decision);
 
   // Commit-driven invalidation: drop observations whose node, assignment,
   // term, manifest, or partition-epoch bindings no longer match committed
@@ -524,6 +619,8 @@ class MetaObservationStore {
   // volatile and are reset at a Meta leadership edge.
   std::optional<uint64_t> CurrentGeneration(std::string_view node_id) const;
   std::optional<MetaObservedSessionState> SessionStateFor(
+      std::string_view node_id) const;
+  std::optional<MetaObservedOwnerState> OwnerObservationFor(
       std::string_view node_id) const;
 
   std::vector<MetaObsAuditEvent> AuditRing() const;

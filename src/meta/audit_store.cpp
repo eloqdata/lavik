@@ -1,84 +1,48 @@
 #include "keylane/meta/audit_store.h"
 
 #include <cstdlib>
-#include <cstring>
 #include <string>
 
-#include "keylane/meta/hash.h"
 #include "spdlog/spdlog.h"
 
 namespace keylane::meta {
 
-// The shared SHA-256 lives in keylane/meta/hash.h (header-only; the meta plane
-// links no crypto library — see that header).
-
 namespace {
 
-// Canonical encoding of one record for chain-hashing: the strict
-// encoding.h field layout without a schema-version envelope (the hash
-// input is internal, not a wire format).
-std::string CanonicalRecordBytes(const MetaAuditRecord& record) {
-  MetaWriter w;
-  w.WriteU64(record.log_index_);
-  w.WriteString(record.actor_principal_);
-  w.WriteString(record.command_summary_);
-  w.WriteU8(static_cast<std::uint8_t>(record.verdict_));
-  w.WriteString(record.verdict_detail_);
-  w.WriteString(record.readable_time_);
-  return w.TakeBuffer();
+// Canonical record encoding shared by snapshots and exports.
+void WriteRecord(MetaWriter& w, const MetaAuditRecord& entry) {
+  w.WriteU64(entry.log_index_);
+  w.WriteString(entry.actor_principal_);
+  w.WriteString(entry.command_summary_);
+  w.WriteU8(static_cast<std::uint8_t>(entry.verdict_));
+  w.WriteString(entry.verdict_detail_);
+  w.WriteString(entry.readable_time_);
 }
 
-// Chain hash of one record: SHA-256(previous hash || canonical encoding).
-MetaHash256 ComputeChainHash(const MetaHash256& previous,
-                             const MetaAuditRecord& record) {
-  const std::string canonical = CanonicalRecordBytes(record);
-  std::string input;
-  input.reserve(previous.size() + canonical.size());
-  input.append(reinterpret_cast<const char*>(previous.data()), previous.size());
-  input.append(canonical);
-  return MetaSha256(input);
-}
-
-// Wire layout of one window entry (snapshot and export blobs):
-//   log_index u64 | principal str | summary str | verdict u8 |
-//   detail str | readable_time str | chain_hash 32B
-void WriteChainEntry(MetaWriter& w, const MetaAuditChainEntry& entry) {
-  w.WriteU64(entry.record_.log_index_);
-  w.WriteString(entry.record_.actor_principal_);
-  w.WriteString(entry.record_.command_summary_);
-  w.WriteU8(static_cast<std::uint8_t>(entry.record_.verdict_));
-  w.WriteString(entry.record_.verdict_detail_);
-  w.WriteString(entry.record_.readable_time_);
-  WriteFixedArray(w, entry.chain_hash_);
-}
-
-absl::StatusOr<MetaAuditChainEntry> ReadChainEntry(MetaReader& r) {
-  MetaAuditChainEntry entry;
+absl::StatusOr<MetaAuditRecord> ReadRecord(MetaReader& r) {
+  MetaAuditRecord entry;
   auto index = r.ReadU64();
   if (!index.ok()) return index.status();
-  entry.record_.log_index_ = *index;
+  entry.log_index_ = *index;
   auto principal = r.ReadString(kMaxMetaPrincipalBytes);
   if (!principal.ok()) return principal.status();
-  entry.record_.actor_principal_ = std::string(*principal);
+  entry.actor_principal_ = std::string(*principal);
   auto summary = r.ReadString(kMaxMetaAuditSummaryBytes);
   if (!summary.ok()) return summary.status();
-  entry.record_.command_summary_ = std::string(*summary);
+  entry.command_summary_ = std::string(*summary);
   auto verdict = r.ReadU8();
   if (!verdict.ok()) return verdict.status();
   if (*verdict != static_cast<std::uint8_t>(MetaAuditVerdict::kAccepted) &&
       *verdict != static_cast<std::uint8_t>(MetaAuditVerdict::kRejected)) {
     return MetaFailStopError("unknown audit verdict tag");
   }
-  entry.record_.verdict_ = static_cast<MetaAuditVerdict>(*verdict);
+  entry.verdict_ = static_cast<MetaAuditVerdict>(*verdict);
   auto detail = r.ReadString(kMaxMetaAuditDetailBytes);
   if (!detail.ok()) return detail.status();
-  entry.record_.verdict_detail_ = std::string(*detail);
+  entry.verdict_detail_ = std::string(*detail);
   auto time = r.ReadString(kMaxMetaAuditReadableTimeBytes);
   if (!time.ok()) return time.status();
-  entry.record_.readable_time_ = std::string(*time);
-  auto hash = ReadFixedArray<32>(r);
-  if (!hash.ok()) return hash.status();
-  entry.chain_hash_ = *hash;
+  entry.readable_time_ = std::string(*time);
   return entry;
 }
 
@@ -108,7 +72,7 @@ absl::Status MetaAuditStore::Append(const MetaAuditRecord& record,
   }
   const auto existing = window_.find(record.log_index_);
   if (existing != window_.end()) {
-    if (existing->second.record_ == record) {
+    if (existing->second == record) {
       return absl::OkStatus();  // replay of the same log entry: no-op
     }
     FatalAuditCorruption("same index with different content",
@@ -135,14 +99,11 @@ absl::Status MetaAuditStore::Append(const MetaAuditRecord& record,
     // A forced policy-change record while disabled follows bounded rotation
     // so the transition itself cannot disappear.
     const auto oldest = window_.begin();
-    anchor_ = oldest->second.chain_hash_;
     dropped_through_ = oldest->first;
     ++dropped_total_;
     window_.erase(oldest);
   }
-  const MetaHash256 hash = ComputeChainHash(chain_head_, record);
-  window_.emplace(record.log_index_, MetaAuditChainEntry{record, hash});
-  chain_head_ = hash;
+  window_.emplace(record.log_index_, record);
   return absl::OkStatus();
 }
 
@@ -162,28 +123,17 @@ absl::Status MetaAuditStore::SetPolicy(MetaAuditPolicy policy) {
   return absl::OkStatus();
 }
 
-std::optional<MetaAuditChainEntry> MetaAuditStore::Find(
+std::optional<MetaAuditRecord> MetaAuditStore::Find(
     std::uint64_t log_index) const {
   const auto it = window_.find(log_index);
   if (it == window_.end()) return std::nullopt;
   return it->second;
 }
 
-bool MetaAuditStore::VerifyChain() const {
-  MetaHash256 previous = anchor_;
-  for (const auto& [index, entry] : window_) {
-    const MetaHash256 recomputed = ComputeChainHash(previous, entry.record_);
-    if (recomputed != entry.chain_hash_) return false;
-    previous = recomputed;
-  }
-  return previous == chain_head_;
-}
-
 absl::StatusOr<std::string> MetaAuditStore::ExportThrough(
     std::uint64_t through) const {
   MetaWriter w;
   w.WriteU16(kMetaFormatVersion);
-  WriteFixedArray(w, anchor_);
   w.WriteU64(dropped_total_);
   w.WriteU64(dropped_through_);
   // Count the records at/below the watermark first (the writer is
@@ -196,7 +146,7 @@ absl::StatusOr<std::string> MetaAuditStore::ExportThrough(
   w.WriteCount(count);
   for (const auto& [index, entry] : window_) {
     if (index > through) break;
-    WriteChainEntry(w, entry);
+    WriteRecord(w, entry);
   }
   return w.TakeBuffer();
 }
@@ -207,29 +157,25 @@ absl::Status MetaAuditStore::PruneThrough(std::uint64_t through) {
   }
   const auto it = window_.find(through);
   if (it == window_.end()) {
-    // The anchor advances to the pruned record's hash, so the watermark must
-    // name a live record (gaps between audited indexes are normal).
+    // Require a live record so an operator cannot prune beyond this window.
     return MetaDomainRejectError(
         "prune watermark must name a record in the window");
   }
-  anchor_ = it->second.chain_hash_;
   window_.erase(window_.begin(), std::next(it));
   pruned_floor_ = through;
-  if (window_.empty()) chain_head_ = anchor_;
   return absl::OkStatus();
 }
 
 absl::StatusOr<std::string> MetaAuditStore::Serialize() const {
   MetaWriter w;
   w.WriteU16(kMetaFormatVersion);
-  WriteFixedArray(w, anchor_);
   w.WriteU64(pruned_floor_);
   w.WriteU8(static_cast<std::uint8_t>(policy_));
   w.WriteU64(dropped_total_);
   w.WriteU64(dropped_through_);
   w.WriteCount(static_cast<std::uint32_t>(window_.size()));
   for (const auto& [index, entry] : window_) {
-    WriteChainEntry(w, entry);
+    WriteRecord(w, entry);
   }
   return w.TakeBuffer();
 }
@@ -242,8 +188,6 @@ absl::StatusOr<MetaAuditStore> MetaAuditStore::Deserialize(
   if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unsupported audit blob schema version");
   }
-  auto anchor = ReadFixedArray<32>(r);
-  if (!anchor.ok()) return anchor.status();
   auto floor = r.ReadU64();
   if (!floor.ok()) return floor.status();
   MetaAuditPolicy policy = MetaAuditPolicy::kBoundedRotate;
@@ -261,13 +205,12 @@ absl::StatusOr<MetaAuditStore> MetaAuditStore::Deserialize(
   auto dropped_floor = r.ReadU64();
   if (!dropped_floor.ok()) return dropped_floor.status();
   dropped_through = *dropped_floor;
-  auto entries = r.ReadList<MetaAuditChainEntry>(
-      window_capacity, [](MetaReader& rr) { return ReadChainEntry(rr); });
+  auto entries = r.ReadList<MetaAuditRecord>(
+      window_capacity, [](MetaReader& rr) { return ReadRecord(rr); });
   if (!entries.ok()) return entries.status();
   if (absl::Status status = r.Finish(); !status.ok()) return status;
 
   MetaAuditStore store(window_capacity);
-  store.anchor_ = *anchor;
   store.pruned_floor_ = *floor;
   store.policy_ = policy;
   store.dropped_total_ = dropped_total;
@@ -276,19 +219,12 @@ absl::StatusOr<MetaAuditStore> MetaAuditStore::Deserialize(
   for (const auto& entry : *entries) {
     // Strictly increasing indexes above the floor; the map insert would
     // silently drop a duplicate, so check before emplacing.
-    if (entry.record_.log_index_ <= previous_index ||
-        entry.record_.log_index_ <= store.pruned_floor_) {
+    if (entry.log_index_ <= previous_index ||
+        entry.log_index_ <= store.pruned_floor_) {
       return MetaFailStopError("audit window indexes are not increasing");
     }
-    previous_index = entry.record_.log_index_;
-    store.chain_head_ = entry.chain_hash_;
-    store.window_.emplace(entry.record_.log_index_, entry);
-  }
-  if (store.window_.empty()) store.chain_head_ = store.anchor_;
-  // A snapshot whose chain does not recompute is corruption: fail-stop,
-  // identical on every node.
-  if (!store.VerifyChain()) {
-    return MetaFailStopError("audit window hash chain does not recompute");
+    previous_index = entry.log_index_;
+    store.window_.emplace(entry.log_index_, entry);
   }
   return store;
 }
@@ -300,8 +236,6 @@ absl::StatusOr<MetaAuditExport> DecodeMetaAuditExport(std::string_view bytes) {
   if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unsupported audit export schema version");
   }
-  auto anchor = ReadFixedArray<32>(r);
-  if (!anchor.ok()) return anchor.status();
   std::uint64_t dropped_total = 0;
   std::uint64_t dropped_through = 0;
   auto count = r.ReadU64();
@@ -310,29 +244,21 @@ absl::StatusOr<MetaAuditExport> DecodeMetaAuditExport(std::string_view bytes) {
   auto through = r.ReadU64();
   if (!through.ok()) return through.status();
   dropped_through = *through;
-  auto entries = r.ReadList<MetaAuditChainEntry>(
+  auto entries = r.ReadList<MetaAuditRecord>(
       kMaxMetaAuditWindowRecords,
-      [](MetaReader& rr) { return ReadChainEntry(rr); });
+      [](MetaReader& rr) { return ReadRecord(rr); });
   if (!entries.ok()) return entries.status();
   if (absl::Status status = r.Finish(); !status.ok()) return status;
 
   MetaAuditExport out;
-  out.anchor_before_ = *anchor;
   out.dropped_total_ = dropped_total;
   out.dropped_through_ = dropped_through;
-  // Verify continuity inside the blob: each entry must chain from the
-  // previous one, starting at the anchor.
-  MetaHash256 previous = *anchor;
   std::uint64_t previous_index = 0;
   for (const auto& entry : *entries) {
-    if (ComputeChainHash(previous, entry.record_) != entry.chain_hash_) {
-      return MetaFailStopError("audit export hash chain does not recompute");
-    }
-    if (!out.records_.empty() && entry.record_.log_index_ <= previous_index) {
+    if (entry.log_index_ <= previous_index) {
       return MetaFailStopError("audit export indexes are not increasing");
     }
-    previous_index = entry.record_.log_index_;
-    previous = entry.chain_hash_;
+    previous_index = entry.log_index_;
     out.records_.push_back(entry);
   }
   return out;

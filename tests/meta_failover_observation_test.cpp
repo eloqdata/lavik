@@ -92,7 +92,6 @@ meta::MetaFailoverTransition Controlled(const FailoverFacts& facts) {
   transition.revision_ = 20;
   transition.mode_ = meta::MetaFailoverMode::kControlled;
   transition.target_term_ = 8;
-  transition.successor_grant_ = {5000, "p", 0};
   transition.candidate_action_ = action;
   transition.controlled_ = meta::MetaControlledFailover{Bytes<16>(0x55), 9999};
   return transition;
@@ -128,7 +127,6 @@ meta::MetaFailoverObservationObs CandidatePrepared(const FailoverFacts& facts) {
               .candidate_assignment_id_ = Bytes<16>(0x22),
               .candidate_boot_id_ = Bytes<20>(0xb2),
               .prepared_context_id_ = Bytes<16>(0x66),
-              .prepared_context_hash_ = Bytes<32>(0x77),
           }};
 }
 

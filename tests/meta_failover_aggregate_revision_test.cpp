@@ -13,7 +13,7 @@ namespace {
 
 namespace meta = keylane::meta;
 
-constexpr std::uint64_t kGrantRevision = 10;
+constexpr std::uint64_t kBaseRevision = 10;
 
 template <std::size_t N>
 std::array<std::uint8_t, N> Filled(std::uint8_t seed) {
@@ -57,7 +57,6 @@ struct Fixture {
   std::string candidate = NodeId(2);
   meta::MetaAssignmentId owner_assignment = Filled<16>(0x21);
   meta::MetaAssignmentId candidate_assignment = Filled<16>(0x22);
-  meta::MetaGrantSpec successor_grant{5000, "failover-policy", 0};
   meta::MetaOperationId operation_id = Filled<16>(0x41);
 };
 
@@ -73,7 +72,9 @@ void RegisterNode(Fixture& fixture, const std::string& node_id,
   ASSERT_TRUE(fixture.stores.identity_.Apply(node).ok());
 }
 
-void PopulateActivatedFixture(Fixture& fixture) {
+void PopulateActivatedFixture(Fixture& fixture,
+                              bool install_automatic_policy = true,
+                              bool install_authority_lease_policy = true) {
   // Build through the individual stores so the test can manufacture revision
   // orderings that a correctly sequenced ApplyCommitted stream cannot emit.
   const meta::SubmitOperation root = ClusterCreateRoot();
@@ -122,13 +123,24 @@ void PopulateActivatedFixture(Fixture& fixture) {
   assign_candidate.new_topology_epoch_ = 3;
   ASSERT_TRUE(fixture.stores.topology_.Apply(assign_candidate).ok());
 
-  meta::PutPolicy policy;
-  policy.request_id_ = Filled<16>(0x09);
-  policy.policy_id_ = fixture.successor_grant.policy_id_;
-  policy.version_ = fixture.successor_grant.policy_version_;
-  policy.content_ = R"({"lease_ms":5000})";
-  policy.content_hash_ = meta::MetaPolicyStore::ContentHash(policy.content_);
-  ASSERT_TRUE(fixture.stores.policy_.Apply(policy).ok());
+  if (install_automatic_policy) {
+    meta::PutPolicy automatic;
+    automatic.request_id_ = Filled<16>(0x09);
+    automatic.policy_id_ =
+        std::string(meta::kAutomaticUncontrolledFailoverPolicyId);
+    automatic.version_ = 1;
+    automatic.content_ =
+        R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+    ASSERT_TRUE(fixture.stores.policy_.Apply(automatic).ok());
+  }
+  if (install_authority_lease_policy) {
+    meta::PutPolicy lease;
+    lease.request_id_ = Filled<16>(0x0c);
+    lease.policy_id_ = std::string(meta::kAuthorityLeasePolicyId);
+    lease.version_ = 1;
+    lease.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
+    ASSERT_TRUE(fixture.stores.policy_.Apply(lease).ok());
+  }
 
   meta::BeginGroupTerm begin_term;
   begin_term.request_id_ = Filled<16>(0x0a);
@@ -143,18 +155,11 @@ void PopulateActivatedFixture(Fixture& fixture) {
   activate.group_id_ = "g1";
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.owner;
-  activate.grant_ = fixture.successor_grant;
-  activate.new_authority_version_ = 1;
   activate.new_topology_epoch_ = 4;
-  activate.new_config_epoch_ = 1;
-  ASSERT_TRUE(
-      fixture.stores.grant_.ValidateActivate(activate, kGrantRevision).ok());
+  ASSERT_TRUE(fixture.stores.grant_.ValidateActivate(activate).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetOwner("g1", fixture.owner).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetAuthorityVersion("g1", 1).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetTopologyEpoch(4).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetGroupConfigEpoch("g1", 1).ok());
-  ASSERT_TRUE(
-      fixture.stores.grant_.ApplyGrantPart(activate, kGrantRevision).ok());
+  ASSERT_TRUE(fixture.stores.grant_.ApplyGrantPart(activate).ok());
 }
 
 void InstallControlledTransition(Fixture& fixture, std::uint64_t operation_seq,
@@ -192,7 +197,6 @@ void InstallControlledTransition(Fixture& fixture, std::uint64_t operation_seq,
   transition.transition_id_ = Filled<16>(0x46);
   transition.mode_ = meta::MetaFailoverMode::kControlled;
   transition.target_term_ = 2;
-  transition.successor_grant_ = fixture.successor_grant;
   transition.candidate_action_ = action;
   transition.controlled_ = meta::MetaControlledFailover{
       fixture.operation_id, intent.absolute_deadline_unix_ms_};
@@ -210,23 +214,34 @@ absl::StatusOr<meta::MetaStores> Restore(const meta::MetaStores& stores) {
 }
 
 TEST(MetaFailoverAggregateRevision,
-     RestoreRejectsTransitionNotAfterFrozenGrantRevision) {
-  Fixture fixture;
-  PopulateActivatedFixture(fixture);
-  InstallControlledTransition(fixture, kGrantRevision - 1, kGrantRevision);
-
-  const auto restored = Restore(fixture.stores);
-
-  ASSERT_FALSE(restored.ok());
-  EXPECT_EQ(meta::MetaFailureClassOf(restored.status()),
-            meta::MetaFailureClass::kFailStop);
+     RestoreRejectsCreatedClusterMissingEitherRequiredCurrentPolicy) {
+  {
+    SCOPED_TRACE("automatic uncontrolled failover Policy missing");
+    Fixture fixture;
+    PopulateActivatedFixture(fixture, /*install_automatic_policy=*/false,
+                             /*install_authority_lease_policy=*/true);
+    const auto restored = Restore(fixture.stores);
+    ASSERT_FALSE(restored.ok());
+    EXPECT_EQ(meta::MetaFailureClassOf(restored.status()),
+              meta::MetaFailureClass::kFailStop);
+  }
+  {
+    SCOPED_TRACE("Authority Lease Policy missing");
+    Fixture fixture;
+    PopulateActivatedFixture(fixture, /*install_automatic_policy=*/true,
+                             /*install_authority_lease_policy=*/false);
+    const auto restored = Restore(fixture.stores);
+    ASSERT_FALSE(restored.ok());
+    EXPECT_EQ(meta::MetaFailureClassOf(restored.status()),
+              meta::MetaFailureClass::kFailStop);
+  }
 }
 
 TEST(MetaFailoverAggregateRevision,
      RestoreRejectsControlledTransitionNotAfterOperationSubmission) {
   Fixture fixture;
   PopulateActivatedFixture(fixture);
-  InstallControlledTransition(fixture, kGrantRevision + 1, kGrantRevision + 1);
+  InstallControlledTransition(fixture, kBaseRevision + 1, kBaseRevision + 1);
 
   const auto restored = Restore(fixture.stores);
 
@@ -239,7 +254,7 @@ TEST(MetaFailoverAggregateRevision,
      RestoreAcceptsStrictlyOrderedControlledTransition) {
   Fixture fixture;
   PopulateActivatedFixture(fixture);
-  InstallControlledTransition(fixture, kGrantRevision + 1, kGrantRevision + 2);
+  InstallControlledTransition(fixture, kBaseRevision + 1, kBaseRevision + 2);
 
   const auto restored = Restore(fixture.stores);
 
@@ -247,7 +262,7 @@ TEST(MetaFailoverAggregateRevision,
   const auto group = restored->topology_.FindGroup("g1");
   ASSERT_TRUE(group.has_value());
   ASSERT_TRUE(group->failover_transition_.has_value());
-  EXPECT_EQ(group->failover_transition_->revision_, kGrantRevision + 2);
+  EXPECT_EQ(group->failover_transition_->revision_, kBaseRevision + 2);
 }
 
 }  // namespace

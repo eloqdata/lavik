@@ -161,8 +161,6 @@ AuthorityAnchor ToDomain(const control::WireAuthorityAnchor& anchor) {
       .group_id_ = anchor.group_id,
       .assignment_id_ = AssignmentId::FromBytes(anchor.assignment_id),
       .group_term_ = anchor.group_term,
-      .authority_version_ = anchor.authority_version,
-      .grant_revision_ = anchor.grant_revision,
   };
 }
 
@@ -176,8 +174,6 @@ control::LeaseChallenge ChallengeFor(
       .group_id = group.group_id,
       .assignment_id = *group.owner_assignment_id,
       .group_term = group.group_term,
-      .authority_version = group.authority_version,
-      .grant_revision = group.grant_revision,
   };
 }
 
@@ -246,7 +242,7 @@ RebuildDirective NativePopulationDirective(const NodeDirective& directive,
   // Replication's native population handshake predates the structured Meta
   // anchor. Give both source and target the same canonical string identity
   // over every committed authority field so neither side can accidentally
-  // collapse two assignments or grant revisions into one authorization.
+  // collapse two assignments or terms into one authorization.
   const std::string authority_id =
       EncodeRebuildAuthorityIdentity(directive.anchor_);
   const bool initializes_empty =
@@ -313,6 +309,15 @@ class ReplicationNodeControlActions final : public NodeControlActions {
             preserve_established_exports);
   }
 
+  celer::Task<absl::Status> RefreshSourceAuthorizationsForFdsReplacementAndWait(
+      bool preserve_current_population_exports,
+      std::size_t expected_authorization_replays) override {
+    co_return co_await replication_
+        .RefreshClusterRebuildSourceAuthorizationsForFdsReplacement(
+            preserve_current_population_exports,
+            expected_authorization_replays);
+  }
+
   celer::Task<absl::Status> ReconcileClusterControl(
       std::optional<DesiredClusterControl> desired) override {
     if (!desired.has_value()) {
@@ -363,6 +368,12 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         deadline.time_since_epoch());
   }
 
+  celer::Task<absl::Status> EnableSourceAdmissionForLease(
+      MonotonicTime deadline) override {
+    co_return co_await replication_.EnableClusterRebuildSourceAdmissionUntil(
+        deadline.time_since_epoch());
+  }
+
   celer::Task<absl::Status> RevokeExpirationAuthority() override {
     co_return co_await replication_.RevokeClusterExpirationAuthority();
   }
@@ -386,8 +397,10 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         std::move(translated));
   }
 
-  celer::Task<absl::Status> CancelInProgressPopulation() override {
-    co_return co_await replication_.CancelInProgressClusterPopulation();
+  celer::Task<absl::Status> CancelInProgressPopulation(
+      bool preserve_current_follow_attempt) override {
+    co_return co_await replication_.CancelInProgressClusterPopulation(
+        preserve_current_follow_attempt);
   }
 
   celer::Task<absl::Status> CancelPopulationForShutdown() override {
@@ -717,7 +730,6 @@ detail::ProjectClusterFailoverObservation(
       .candidate_assignment_id = candidate_assignment->bytes(),
       .candidate_boot_id = candidate_boot->ToHexString(),
       .prepared_context_id = prepared.context_id_,
-      .prepared_context_hash = prepared.context_hash_,
   });
 }
 
@@ -952,8 +964,6 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
                    });
   if (group == desired.groups.end() ||
       group->group_term != directive.authority.group_term ||
-      group->authority_version != directive.authority.authority_version ||
-      group->grant_revision != directive.authority.grant_revision ||
       group->partition_replication_epoch !=
           directive.partition_replication_epoch) {
     return absl::FailedPreconditionError(
@@ -1018,6 +1028,18 @@ control::DirectiveResultStatus ClassifyDirectiveResultStatus(
   // distinguishes a rejected request from work that ran and failed.
   return started ? control::DirectiveResultStatus::kFailed
                  : control::DirectiveResultStatus::kRejected;
+}
+
+absl::Status detail::ValidateResolvedLeaseGrantDuration(
+    std::uint32_t granted_duration_ms, std::uint32_t challenged_duration_ms) {
+  if (challenged_duration_ms == 0 ||
+      granted_duration_ms != challenged_duration_ms) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "lease grant duration does not equal the challenged FDS duration: ",
+        "granted_ms=", granted_duration_ms,
+        ",challenged_ms=", challenged_duration_ms));
+  }
+  return absl::OkStatus();
 }
 
 absl::Status FitHeartbeatToSingleFrame(control::Heartbeat& heartbeat) {
@@ -1097,8 +1119,7 @@ std::string EncodeRebuildAuthorityIdentity(const AuthorityAnchor& anchor) {
   }
   return absl::StrCat("v1/", group_hex, "/",
                       anchor.assignment_id_.ToHexString(), "/",
-                      anchor.group_term_, "/", anchor.authority_version_, "/",
-                      anchor.grant_revision_);
+                      anchor.group_term_);
 }
 
 std::chrono::milliseconds MetaReconnectBackoff::Next(
@@ -1399,12 +1420,7 @@ struct MetaControlClientService::Impl {
   struct PendingHeartbeat {
     std::uint64_t sequence_ = 0;
     std::optional<control::LeaseChallenge> challenge_;
-    std::uint32_t challenged_grant_duration_ms_ = 0;
-  };
-
-  struct PendingResult {
-    control::WireDirectiveIdentity identity_;
-    control::WireHash256 result_hash_{};
+    std::uint32_t challenged_authority_lease_duration_ms_ = 0;
   };
 
   // Every field is worker-zero-owned. Detached session tasks retain this
@@ -1419,6 +1435,7 @@ struct MetaControlClientService::Impl {
     ReplicationIdentity replication_identity_;
     std::shared_ptr<const control::FullDesiredState> desired_;
     std::chrono::milliseconds heartbeat_interval_{};
+    std::chrono::milliseconds observation_ttl_{};
     std::chrono::milliseconds progress_timeout_{};
     std::uint32_t meta_server_id_ = 0;
     std::uint64_t raft_term_ = 0;
@@ -1437,7 +1454,7 @@ struct MetaControlClientService::Impl {
         inbound_transfer_deadline_;
     std::deque<DirectiveWork> directive_queue_;
     std::vector<control::WireDirectiveIdentity> accepted_directives_;
-    std::vector<PendingResult> pending_results_;
+    std::vector<control::WireDirectiveIdentity> pending_results_;
     std::optional<absl::Status> terminal_error_;
     celer::AsyncNotification heartbeat_changed_;
     celer::AsyncNotification tasks_changed_;
@@ -1696,8 +1713,17 @@ struct MetaControlClientService::Impl {
                  directive.recipient_node_id == options_.node_id_ &&
                  directive.recipient_boot_id == local_boot_id;
         });
+    const std::size_t expected_source_authorization_replays = std::count_if(
+        desired.current_directives.begin(), desired.current_directives.end(),
+        [&](const control::WireProjectedDirective& directive) {
+          return directive.kind ==
+                     control::WireDirectiveKind::kAuthorizeSource &&
+                 directive.recipient_node_id == options_.node_id_ &&
+                 directive.recipient_boot_id == local_boot_id;
+        });
     absl::Status installed = co_await installer_.InstallFullStateTransition(
-        std::move(*prepared), basis, local_population_transition_expected);
+        std::move(*prepared), basis, local_population_transition_expected,
+        expected_source_authorization_replays);
     if (!installed.ok()) co_return installed;
     directory_ = std::move(refreshed_directory);
     RecordClusterControlFullStateApplied();
@@ -1712,7 +1738,6 @@ struct MetaControlClientService::Impl {
         control::WireMessage(control::FullStateApplied{
             .source_meta_applied_index = desired.source_meta_applied_index,
             .projection_hash = desired.projection_hash,
-            .object_hash = desired.object_hash,
         }));
   }
 
@@ -1790,7 +1815,6 @@ struct MetaControlClientService::Impl {
                                             : directive.source_assignment_id,
         .operation_id = directive.identity.operation_id,
         .kind_phase = kind_phase,
-        .evidence_hash = control::ComputeSha256(evidence),
         .evidence = std::move(evidence),
         .group_id = directive.authority.group_id,
         .group_term = directive.authority.group_term,
@@ -2002,17 +2026,15 @@ struct MetaControlClientService::Impl {
         .assignment_id = directive.authority.assignment_id,
         .identity = directive.identity,
         .status = ClassifyDirectiveResultStatus(applied, started),
-        .result_hash = control::ComputeSha256(result),
         .result = result,
     };
     if (state->pending_results_.size() >= control::kMaxProjectedDirectives) {
       co_return absl::ResourceExhaustedError(
           "too many unacknowledged directive results");
     }
-    state->pending_results_.push_back(PendingResult{
-        .identity_ = response.identity,
-        .result_hash_ = response.result_hash,
-    });
+    // The completion is immutable for this attempt; Meta checks duplicate
+    // result bodies against its durable receipt before acknowledging identity.
+    state->pending_results_.push_back(response.identity);
     RecordClusterControlDirectiveResult(applied.ok());
     co_return co_await SendDirectiveResult(writer, response);
   }
@@ -2181,6 +2203,12 @@ struct MetaControlClientService::Impl {
       const std::shared_ptr<SessionState>& state,
       control::ControlSessionWriter& writer,
       control::FullDesiredState replacement) {
+    if (std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
+            replacement.authority_lease_duration_ms)) >
+        state->observation_ttl_) {
+      co_return absl::InvalidArgumentError(
+          "replacement FDS heartbeat interval exceeds observation TTL");
+    }
     DisableDirectiveDispatch(state);
     RequestHeartbeatPause(state);
     if (absl::Status quiesced = co_await WaitForHeartbeatQuiesced(state);
@@ -2206,6 +2234,9 @@ struct MetaControlClientService::Impl {
     }
     state->desired_ =
         std::make_shared<control::FullDesiredState>(std::move(replacement));
+    state->heartbeat_interval_ =
+        std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
+            state->desired_->authority_lease_duration_ms));
     state->accepted_directives_.clear();
     state->challenge_rotation_.Reset();
     if (absl::Status applied = co_await SendApplied(writer, *state->desired_);
@@ -2223,7 +2254,6 @@ struct MetaControlClientService::Impl {
   absl::Status HandleResultAck(const std::shared_ptr<SessionState>& state,
                                const control::WireMessage& message) {
     const control::WireDirectiveIdentity* identity = nullptr;
-    const control::WireHash256* result_hash = nullptr;
     if (const auto* committed =
             std::get_if<control::ResultCommitted>(&message)) {
       if (committed->session_id != state->session_.session_id_.bytes() ||
@@ -2233,7 +2263,6 @@ struct MetaControlClientService::Impl {
             "ResultCommitted does not name this session or a commit");
       }
       identity = &committed->identity;
-      result_hash = &committed->result_hash;
     } else if (const auto* forgotten =
                    std::get_if<control::ResultNoLongerTracked>(&message)) {
       if (forgotten->session_id != state->session_.session_id_.bytes() ||
@@ -2245,13 +2274,8 @@ struct MetaControlClientService::Impl {
     } else {
       return absl::InternalError("non-result acknowledgement was dispatched");
     }
-    const auto pending = std::find_if(
-        state->pending_results_.begin(), state->pending_results_.end(),
-        [&](const PendingResult& result) {
-          return result.identity_ == *identity &&
-                 (result_hash == nullptr ||
-                  result.result_hash_ == *result_hash);
-        });
+    const auto pending = std::find(state->pending_results_.begin(),
+                                   state->pending_results_.end(), *identity);
     if (pending == state->pending_results_.end()) {
       return absl::FailedPreconditionError(
           "directive result acknowledgement is unknown or conflicts");
@@ -2471,7 +2495,7 @@ struct MetaControlClientService::Impl {
       const std::optional<std::size_t> local_group_index =
           state->challenge_rotation_.Next(state->desired_->groups,
                                           options_.node_id_);
-      std::uint32_t challenged_grant_duration_ms = 0;
+      std::uint32_t challenged_authority_lease_duration_ms = 0;
       std::optional<control::LeaseChallenge> heartbeat_challenge;
       if (!identity_decision.suppress_ordinary_role_ &&
           local_group_index.has_value()) {
@@ -2487,7 +2511,8 @@ struct MetaControlClientService::Impl {
         heartbeat.role_information = control::AuthorityLeaseRequest{
             .challenge = *heartbeat_challenge,
         };
-        challenged_grant_duration_ms = local_group.grant_duration_ms;
+        challenged_authority_lease_duration_ms =
+            state->desired_->authority_lease_duration_ms;
         result = state->challenge_tracker_.Begin(
             state->session_.session_id_.bytes(), state->boot_id_,
             *heartbeat_challenge);
@@ -2518,7 +2543,8 @@ struct MetaControlClientService::Impl {
       state->pending_heartbeat_ = PendingHeartbeat{
           .sequence_ = heartbeat_sequence,
           .challenge_ = heartbeat_challenge,
-          .challenged_grant_duration_ms_ = challenged_grant_duration_ms,
+          .challenged_authority_lease_duration_ms_ =
+              challenged_authority_lease_duration_ms,
       };
       state->heartbeat_ack_observed_ = false;
       auto sent_at_ms = std::make_shared<std::optional<std::int64_t>>();
@@ -2617,13 +2643,24 @@ struct MetaControlClientService::Impl {
           grant->leader_id != state->meta_server_id_ ||
           grant->raft_term != state->raft_term_ ||
           grant->leadership_generation == 0 ||
-          grant->data_boot_id != state->boot_id_ ||
-          grant->granted_duration_ms > pending.challenged_grant_duration_ms_) {
+          grant->data_boot_id != state->boot_id_) {
         co_return absl::InvalidArgumentError(
-            "lease grant does not match the accepted leader or policy");
+            "lease grant does not match the accepted leader or FDS authority");
+      }
+      if (absl::Status exact_duration =
+              detail::ValidateResolvedLeaseGrantDuration(
+                  grant->granted_duration_ms,
+                  pending.challenged_authority_lease_duration_ms_);
+          !exact_duration.ok()) {
+        co_return exact_duration;
       }
       auto deadline_ms = state->challenge_tracker_.AcceptGrant(
           state->session_.session_id_.bytes(), *grant, LeaseClockMillis());
+      // An exact but expired Grant is consumed by the tracker and must still
+      // end this session. Continuing with heartbeat N+1 would make Meta treat
+      // it as causal proof that Data installed Ack N. Session invalidation
+      // revokes any older retained authority before reauthentication starts a
+      // new causal sequence whose first valid Grant can safely restore service.
       if (!deadline_ms.ok()) co_return deadline_ms.status();
       const std::int64_t grant_ms = grant->granted_duration_ms;
       const auto grant_sent_at =
@@ -2656,8 +2693,6 @@ struct MetaControlClientService::Impl {
                       .assignment_id_ =
                           AssignmentId::FromBytes(grant->assignment_id),
                       .group_term_ = grant->group_term,
-                      .authority_version_ = grant->authority_version,
-                      .grant_revision_ = grant->grant_revision,
                   },
               .sent_at_ = grant_sent_at,
               .granted_duration_ =
@@ -2836,8 +2871,7 @@ struct MetaControlClientService::Impl {
     if (!hello->leader_id.has_value() ||
         *hello->leader_id != hello->meta_server_id ||
         IsZero(hello->session_id) || hello->session_generation == 0 ||
-        hello->heartbeat_interval_ms == 0 ||
-        hello->observation_ttl_ms < hello->heartbeat_interval_ms ||
+        hello->observation_ttl_ms == 0 ||
         hello->session_progress_timeout_ms == 0) {
       co_return absl::InvalidArgumentError("invalid accepted ServerHello");
     }
@@ -2862,6 +2896,12 @@ struct MetaControlClientService::Impl {
       auto initial =
           co_await ReceiveFullState(frames, socket_deadline, progress_timeout);
       if (!initial.ok()) co_return initial.status();
+      if (control::DataHeartbeatIntervalMs(
+              initial->authority_lease_duration_ms) >
+          hello->observation_ttl_ms) {
+        co_return absl::InvalidArgumentError(
+            "initial FDS heartbeat interval exceeds observation TTL");
+      }
       if (stopping_.load(std::memory_order_acquire)) {
         co_return absl::CancelledError("Meta control client stopped");
       }
@@ -2884,7 +2924,10 @@ struct MetaControlClientService::Impl {
       state->desired_ =
           std::make_shared<control::FullDesiredState>(std::move(*initial));
       state->heartbeat_interval_ =
-          std::chrono::milliseconds(hello->heartbeat_interval_ms);
+          std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
+              state->desired_->authority_lease_duration_ms));
+      state->observation_ttl_ =
+          std::chrono::milliseconds(hello->observation_ttl_ms);
       state->progress_timeout_ = progress_timeout;
       state->meta_server_id_ = hello->meta_server_id;
       state->raft_term_ = hello->raft_term;

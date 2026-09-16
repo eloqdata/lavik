@@ -198,7 +198,6 @@ absl::Status MetaTopologyStore::Apply(const CreateGroup& cmd) {
     // accept. Anything else under this group_id is a conflict.
     const GroupState& group = it->second;
     const bool pristine = group.revision_ == 1 && group.members_.empty() &&
-                          group.config_epoch_ == 0 &&
                           group.record_ == MetaGroupRecord{};
     if (pristine && topology_epoch_ == cmd.new_topology_epoch_) {
       return absl::OkStatus();
@@ -319,8 +318,7 @@ absl::Status MetaTopologyStore::Apply(const RemoveNodeFromGroup& cmd) {
 }
 
 absl::Status MetaTopologyStore::Apply(const SetSlotMap& cmd) {
-  if (cmd.ranges_.size() > kMaxMetaSlotRangeCount ||
-      cmd.config_epochs_.size() > kMaxMetaGroups) {
+  if (cmd.ranges_.size() > kMaxMetaSlotRangeCount) {
     return MetaDomainRejectError("slot map field count over cap");
   }
   // Structural re-validation (the codec enforces it on the wire; the store
@@ -345,12 +343,7 @@ absl::Status MetaTopologyStore::Apply(const SetSlotMap& cmd) {
       }
     }
   }
-  for (const MetaGroupConfigEpoch& entry : cmd.config_epochs_) {
-    if (auto st = CheckGroupId(entry.group_id_); !st.ok()) return st;
-  }
-
-  // Replay: slot map, topology epoch, and every listed config
-  // epoch already carry this command's effect -> no-op accept.
+  // Replay: slot map and topology epoch already carry the command's effect.
   if (topology_epoch_ == cmd.new_topology_epoch_) {
     std::array<std::string, kMetaSlotCount> target;
     for (const MetaSlotAssignment& range : cmd.ranges_) {
@@ -359,16 +352,7 @@ absl::Status MetaTopologyStore::Apply(const SetSlotMap& cmd) {
         target[slot] = range.group_id_;
       }
     }
-    if (target == slots_) {
-      const bool config_epochs_match =
-          std::all_of(cmd.config_epochs_.begin(), cmd.config_epochs_.end(),
-                      [this](const MetaGroupConfigEpoch& entry) {
-                        const auto it = groups_.find(entry.group_id_);
-                        return it != groups_.end() &&
-                               it->second.config_epoch_ == entry.config_epoch_;
-                      });
-      if (config_epochs_match) return absl::OkStatus();
-    }
+    if (target == slots_) return absl::OkStatus();
   }
 
   if (auto st =
@@ -382,19 +366,6 @@ absl::Status MetaTopologyStore::Apply(const SetSlotMap& cmd) {
           "slot range references unknown group ", range.group_id_));
     }
   }
-  {
-    std::set<std::string> seen;
-    for (const MetaGroupConfigEpoch& entry : cmd.config_epochs_) {
-      if (!groups_.contains(entry.group_id_)) {
-        return MetaDomainRejectError(absl::StrCat(
-            "config_epoch references unknown group ", entry.group_id_));
-      }
-      if (!seen.insert(entry.group_id_).second) {
-        return MetaDomainRejectError(
-            absl::StrCat("duplicate config_epoch entry for ", entry.group_id_));
-      }
-    }
-  }
 
   // Absolute replacement: the whole map is rewritten from the ranges.
   slots_.fill(std::string());
@@ -403,9 +374,6 @@ absl::Status MetaTopologyStore::Apply(const SetSlotMap& cmd) {
          ++slot) {
       slots_[slot] = range.group_id_;
     }
-  }
-  for (const MetaGroupConfigEpoch& entry : cmd.config_epochs_) {
-    groups_.find(entry.group_id_)->second.config_epoch_ = entry.config_epoch_;
   }
   topology_epoch_ = cmd.new_topology_epoch_;
   return absl::OkStatus();
@@ -505,16 +473,6 @@ absl::Status MetaTopologyStore::SetGroupTerm(const std::string& group_id,
   return absl::OkStatus();
 }
 
-absl::Status MetaTopologyStore::SetAuthorityVersion(
-    const std::string& group_id, std::uint64_t authority_version) {
-  const auto it = groups_.find(group_id);
-  if (it == groups_.end()) {
-    return MetaDomainRejectError(absl::StrCat("unknown group ", group_id));
-  }
-  it->second.record_.authority_version_ = authority_version;
-  return absl::OkStatus();
-}
-
 absl::Status MetaTopologyStore::SetPopulationManifest(
     const std::string& group_id, std::uint64_t manifest_revision,
     const MetaHash256& manifest_digest) {
@@ -544,16 +502,6 @@ absl::Status MetaTopologyStore::SetPartitionReplicationEpoch(
     return MetaDomainRejectError(absl::StrCat("unknown group ", group_id));
   }
   it->second.record_.partition_replication_epoch_ = epoch;
-  return absl::OkStatus();
-}
-
-absl::Status MetaTopologyStore::SetGroupConfigEpoch(
-    const std::string& group_id, std::uint64_t config_epoch) {
-  const auto it = groups_.find(group_id);
-  if (it == groups_.end()) {
-    return MetaDomainRejectError(absl::StrCat("unknown group ", group_id));
-  }
-  it->second.config_epoch_ = config_epoch;
   return absl::OkStatus();
 }
 
@@ -683,7 +631,6 @@ std::optional<MetaTopologyGroupView> MetaTopologyStore::FindGroup(
   view.group_id_ = group_id;
   view.record_ = group.record_;
   view.failover_transition_ = group.failover_transition_;
-  view.config_epoch_ = group.config_epoch_;
   view.revision_ = group.revision_;
   view.members_.reserve(group.members_.size());
   for (const auto& [node_id, member] : group.members_) {
@@ -741,11 +688,9 @@ std::string MetaTopologyStore::Serialize() const {
     w.WriteString(group_id);
     w.WriteString(group.record_.owner_);
     w.WriteU64(group.record_.group_term_);
-    w.WriteU64(group.record_.authority_version_);
     w.WriteU64(group.record_.population_manifest_revision_);
     WriteFixedArray(w, group.record_.population_manifest_digest_);
     w.WriteU64(group.record_.partition_replication_epoch_);
-    w.WriteU64(group.config_epoch_);
     w.WriteU64(group.revision_);
     w.WriteOptional(
         group.failover_transition_,
@@ -844,16 +789,12 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     if (!owner.ok()) return owner.status();
     auto group_term = r.ReadU64();
     if (!group_term.ok()) return group_term.status();
-    auto authority_version = r.ReadU64();
-    if (!authority_version.ok()) return authority_version.status();
     auto manifest_revision = r.ReadU64();
     if (!manifest_revision.ok()) return manifest_revision.status();
     auto manifest_digest = ReadFixedArray<32>(r);
     if (!manifest_digest.ok()) return manifest_digest.status();
     auto partition_epoch = r.ReadU64();
     if (!partition_epoch.ok()) return partition_epoch.status();
-    auto config_epoch = r.ReadU64();
-    if (!config_epoch.ok()) return config_epoch.status();
     auto revision = r.ReadU64();
     if (!revision.ok()) return revision.status();
     auto failover_transition = r.ReadOptional<MetaFailoverTransition>(
@@ -890,11 +831,9 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     GroupState group;
     group.record_.owner_ = std::string(*owner);
     group.record_.group_term_ = *group_term;
-    group.record_.authority_version_ = *authority_version;
     group.record_.population_manifest_revision_ = *manifest_revision;
     group.record_.population_manifest_digest_ = *manifest_digest;
     group.record_.partition_replication_epoch_ = *partition_epoch;
-    group.config_epoch_ = *config_epoch;
     group.revision_ = *revision;
     group.failover_transition_ = std::move(*failover_transition);
     if ((group.record_.population_manifest_revision_ == 0) !=

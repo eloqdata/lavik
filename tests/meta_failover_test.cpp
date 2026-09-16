@@ -62,7 +62,6 @@ struct ProposalFixture {
   MetaBootIncarnation candidate_boot = Bytes<20>(0x32);
   MetaBootIncarnation alternate_boot = Bytes<20>(0x33);
   MetaReplicationHistoryId source_history = Bytes<20>(0x41);
-  MetaGrantSpec grant{5'000, "failover-policy", 0};
   MetaOperationId operation_id = Bytes<16>(0x51);
   std::uint64_t next_index = 1;
   std::uint8_t next_id = 0x80;
@@ -70,6 +69,13 @@ struct ProposalFixture {
   ProposalFixture() {
     const MetaOperationId root = Bytes<16>(0x01);
     EXPECT_TRUE(stores.topology_.BeginClusterCreate(root, 1).ok());
+    PutPolicy automatic;
+    automatic.request_id_ = Bytes<16>(0x0f);
+    automatic.policy_id_ = std::string(kAutomaticUncontrolledFailoverPolicyId);
+    automatic.version_ = 1;
+    automatic.content_ =
+        R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+    EXPECT_TRUE(stores.policy_.Apply(automatic).ok());
     EXPECT_TRUE(stores.topology_.CompleteClusterCreate(root).ok());
     Register(owner, MetaNodeRole::kPrimary, 6379, 0x02);
     Register(candidate, MetaNodeRole::kReplica, 6380, 0x03);
@@ -102,10 +108,9 @@ struct ProposalFixture {
 
     PutPolicy policy;
     policy.request_id_ = Bytes<16>(0x07);
-    policy.policy_id_ = grant.policy_id_;
-    policy.version_ = grant.policy_version_;
-    policy.content_ = R"({"lease_ms":5000})";
-    policy.content_hash_ = MetaPolicyStore::ContentHash(policy.content_);
+    policy.policy_id_ = std::string(kAuthorityLeasePolicyId);
+    policy.version_ = 1;
+    policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
     Apply(policy);
 
     BeginGroupTerm begin_term;
@@ -120,10 +125,7 @@ struct ProposalFixture {
     activate.group_id_ = "g1";
     activate.expected_term_ = 1;
     activate.new_owner_ = owner;
-    activate.grant_ = grant;
-    activate.new_authority_version_ = 1;
     activate.new_topology_epoch_ = 4;
-    activate.new_config_epoch_ = 1;
     Apply(activate);
   }
 
@@ -287,7 +289,6 @@ struct ProposalFixture {
     begin.group_id_ = "g1";
     begin.transition_id_ = Bytes<16>(0x54);
     begin.target_term_ = group->record_.group_term_ + 1;
-    begin.successor_grant_ = grant_state->grant_->spec_;
     if (with_candidate) {
       begin.candidate_action_ = MetaFailoverCandidateAction{
           .action_id_ = Bytes<16>(0x55),
@@ -298,15 +299,12 @@ struct ProposalFixture {
     begin.expected_owner_assignment_id_ = owner_assignment;
     begin.expected_membership_revision_ = group->revision_;
     begin.expected_group_term_ = group->record_.group_term_;
-    begin.expected_authority_version_ = group->record_.authority_version_;
-    begin.expected_grant_revision_ = grant_state->last_grant_revision_;
     begin.expected_population_manifest_revision_ =
         group->record_.population_manifest_revision_;
     begin.expected_population_manifest_digest_ =
         group->record_.population_manifest_digest_;
     begin.expected_partition_replication_epoch_ =
         group->record_.partition_replication_epoch_;
-    begin.expected_config_epoch_ = group->config_epoch_;
     return begin;
   }
 
@@ -347,8 +345,7 @@ struct ProposalFixture {
         .candidate_node_id_ = action.candidate_.node_id_,
         .candidate_assignment_id_ = action.candidate_.assignment_id_,
         .candidate_boot_id_ = action.candidate_.boot_id_,
-        .prepared_context_id_ = Bytes<16>(0x61),
-        .prepared_context_hash_ = Bytes<32>(0x62)};
+        .prepared_context_id_ = Bytes<16>(0x61)};
     ReportCandidate(now, MetaFailoverObservationObs{.payload_ = prepared},
                     generation);
   }
@@ -458,13 +455,6 @@ TEST(MetaFailoverValidationTest, AcceptsOnlyCanonicalRequestOnlySubmit) {
   history_bound.replication_history_id_ = Bytes<20>(7);
   EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
                 MetaCommand(history_bound), MetaCommittedView(stores, 0),
-                observations, 1'000)),
-            MetaFailureClass::kDomainReject);
-
-  SubmitOperation policy_bound = submit;
-  policy_bound.policy_references_.push_back({"policy", 1});
-  EXPECT_EQ(MetaFailureClassOf(ValidateFailoverProposal(
-                MetaCommand(policy_bound), MetaCommittedView(stores, 0),
                 observations, 1'000)),
             MetaFailureClass::kDomainReject);
 }

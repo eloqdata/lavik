@@ -176,7 +176,6 @@ absl::Status ValidateActiveMetaDirectory(
       .session_generation = 1,
       .leader_id = 1,
       .directory = std::move(directory),
-      .heartbeat_interval_ms = 1,
       .observation_ttl_ms = 1,
       .session_progress_timeout_ms = 1,
   };

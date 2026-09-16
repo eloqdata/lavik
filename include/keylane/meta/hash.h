@@ -3,13 +3,9 @@
 // MetaHash: the meta plane's shared SHA-256 (FIPS 180-4), one-shot over a
 // byte string. Header-only and self-contained: keylane_meta_core deliberately
 // does not link OpenSSL (the meta-plane link surface carries no crypto
-// library), and the hash values it feeds — policy content addressing, the
-// audit rolling hash chain — are deterministic opaque digests that must be
-// reproducible by external archive-verification tooling, so the standard
-// algorithm is implemented locally. Verified against the standard
-// known-answer vectors in tests/meta_stores_test.cpp
-// (MetaPolicyStore.ContentHashMatchesSha256KnownAnswer, via
-// MetaPolicyStore::ContentHash).
+// library). Its callers need reproducible opaque digests for durable identity,
+// content addressing and integrity checks, so the standard algorithm
+// is implemented locally rather than using a process-specific token.
 
 #include <array>
 #include <cstdint>
@@ -92,7 +88,7 @@ inline void Sha256Compress(std::array<std::uint32_t, 8>& state,
 }  // namespace meta_hash_detail
 
 // SHA-256 of `data` (FIPS 180-4). One-shot; callers hashing a concatenation
-// (e.g. the audit chain's previous-hash || record-bytes) concatenate first.
+// concatenate their domain separator and canonical fields first.
 inline MetaHash256 MetaSha256(std::string_view data) {
   // Initial state: first 32 bits of the fractional parts of the square roots
   // of the first 8 primes.

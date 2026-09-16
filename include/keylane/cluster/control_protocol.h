@@ -53,7 +53,6 @@ inline constexpr std::size_t kMaxIdentifierBytes = 1024;
 inline constexpr std::size_t kMaxProjectedNodes = 4096;
 inline constexpr std::size_t kMaxProjectedGroups = 512;
 inline constexpr std::size_t kMaxManifestEntries = 16384;
-inline constexpr std::size_t kMaxProjectedPolicies = 4096;
 inline constexpr std::size_t kMaxProjectedDirectives = 4096;
 inline constexpr std::size_t kMaxCandidateFlows = 1024;
 inline constexpr std::size_t kMaxFailoverFailureClassBytes = 64;
@@ -183,7 +182,6 @@ struct ServerHello {
   std::uint64_t session_generation = 0;
   std::optional<std::uint32_t> leader_id;
   std::vector<WireMetaEndpoint> directory;
-  std::uint32_t heartbeat_interval_ms = 0;
   std::uint32_t observation_ttl_ms = 0;
   std::uint32_t session_progress_timeout_ms = 0;
 
@@ -274,7 +272,6 @@ class LargeObjectReassembler {
 struct FullStateApplied {
   std::uint64_t source_meta_applied_index = 0;
   WireHash256 projection_hash{};
-  WireHash256 object_hash{};
 
   friend bool operator==(const FullStateApplied&,
                          const FullStateApplied&) = default;
@@ -292,8 +289,6 @@ struct WireAuthorityAnchor {
   std::string group_id;
   WireId128 assignment_id{};
   std::uint64_t group_term = 0;
-  std::uint64_t authority_version = 0;
-  std::uint64_t grant_revision = 0;
 
   friend bool operator==(const WireAuthorityAnchor&,
                          const WireAuthorityAnchor&) = default;
@@ -340,8 +335,6 @@ struct LeaseChallenge {
   std::string group_id;
   WireId128 assignment_id{};
   std::uint64_t group_term = 0;
-  std::uint64_t authority_version = 0;
-  std::uint64_t grant_revision = 0;
 
   friend bool operator==(const LeaseChallenge&,
                          const LeaseChallenge&) = default;
@@ -398,7 +391,6 @@ struct CandidatePrepared {
   WireId128 candidate_assignment_id{};
   std::string candidate_boot_id;
   WireId128 prepared_context_id{};
-  WireHash256 prepared_context_hash{};
 
   friend bool operator==(const CandidatePrepared&,
                          const CandidatePrepared&) = default;
@@ -442,7 +434,6 @@ struct OperationEvidence {
   WireId128 assignment_id{};
   WireId128 operation_id{};
   std::string kind_phase;
-  WireHash256 evidence_hash{};
   std::string evidence;
   std::string group_id;
   std::uint64_t group_term = 0;
@@ -475,8 +466,6 @@ struct LeaseGranted {
   std::string group_id;
   WireId128 assignment_id{};
   std::uint64_t group_term = 0;
-  std::uint64_t authority_version = 0;
-  std::uint64_t grant_revision = 0;
   std::uint32_t granted_duration_ms = 0;
 
   friend bool operator==(const LeaseGranted&, const LeaseGranted&) = default;
@@ -520,23 +509,16 @@ struct HeartbeatAck {
   friend bool operator==(const HeartbeatAck&, const HeartbeatAck&) = default;
 };
 
-enum class HeartbeatSequenceDisposition : std::uint8_t {
-  kAcceptNew,
-  kReplayCachedAck,
-};
-
-// Meta-side business-sequence guard. Frame sequence numbers are transport
-// scoped and never replay; this separate sequence permits only an exact
-// duplicate heartbeat to retrieve its cached application Ack.
+// Meta-side stop-and-wait business sequence. Data never retries a heartbeat
+// within a session: a lost Ack closes the session. Reject duplicates as well
+// as gaps so a sequence always identifies one request and its causal Ack.
 class HeartbeatSequenceWindow {
  public:
-  absl::StatusOr<HeartbeatSequenceDisposition> Observe(
-      std::uint64_t sequence, const WireHash256& message_hash);
+  absl::Status Observe(std::uint64_t sequence);
   void Reset() noexcept;
 
  private:
   std::uint64_t last_sequence_ = 0;
-  WireHash256 last_hash_{};
 };
 
 // Pure client-side challenge state. MarkWritten must be called immediately
@@ -671,24 +653,26 @@ enum class DirectiveResultStatus : std::uint8_t {
   kRejected = 3,
 };
 
+// One immutable terminal outcome per directive attempt. Meta rejects a retry
+// whose status or result bytes differ from its committed receipt.
 struct DirectiveResult {
   WireId128 session_id{};
   std::string recipient_boot_id;
   WireId128 assignment_id{};
   WireDirectiveIdentity identity;
   DirectiveResultStatus status = DirectiveResultStatus::kSucceeded;
-  WireHash256 result_hash{};
   std::string result;
 
   friend bool operator==(const DirectiveResult&,
                          const DirectiveResult&) = default;
 };
 
+// Acknowledges the exact attempt, after comparing the complete result on Meta.
+// No content digest is needed because an attempt cannot change its outcome.
 struct ResultCommitted {
   WireId128 session_id{};
   std::string recipient_boot_id;
   WireDirectiveIdentity identity;
-  WireHash256 result_hash{};
   std::uint64_t committed_index = 0;
 
   friend bool operator==(const ResultCommitted&,
@@ -798,9 +782,10 @@ struct WireFailoverCandidateAction {
 // Data execution subset of the committed transition. This is a replaceable
 // FDS projection, not Data-owned durable state, and is resent after reconnect
 // or Meta leadership change. Meta-only workflow data such as the Controlled
-// operation/deadline and successor grant stay out of this protocol; after
-// cutover the successor is the ordinary current grant. Volatile
-// source/candidate progress is likewise deliberately absent.
+// operation/deadline stays out of this protocol; after cutover the
+// failover-installed Grant is represented by the ordinary current Grant and
+// its optional activation action. Volatile source/candidate progress is
+// likewise deliberately absent.
 struct WireFailoverTransition {
   WireId128 transition_id{};
   std::uint64_t revision = 0;
@@ -821,14 +806,10 @@ struct WireDesiredGroup {
   std::optional<std::string> owner_node_id;
   std::optional<WireId128> owner_assignment_id;
   std::uint64_t group_term = 0;
-  std::uint64_t authority_version = 0;
-  std::uint64_t grant_revision = 0;
-  std::uint32_t grant_duration_ms = 0;
   bool grant_active = false;
   // Present only on a failover-installed current grant. Data may activate a
   // prepared promotion only when this matches its boot-local action context.
   std::optional<WireId128> activation_action_id;
-  std::uint64_t config_epoch = 0;
   std::vector<WireSlotRange> slot_ranges;
   std::uint64_t manifest_revision = 0;
   WireHash256 manifest_digest{};
@@ -836,8 +817,6 @@ struct WireDesiredGroup {
   // part of population identity even when immutable manifest content stays
   // unchanged.
   std::uint64_t partition_replication_epoch = 0;
-  std::string grant_policy_id;
-  std::uint64_t grant_policy_version = 0;
   // Genesis population directives exclusively own replication ingress.
   // Meta enables this only after the committed cluster lifecycle is Created;
   // failover and population actions may still temporarily supersede it.
@@ -865,15 +844,6 @@ struct WireManifestDocument {
 
   friend bool operator==(const WireManifestDocument&,
                          const WireManifestDocument&) = default;
-};
-
-struct WirePolicy {
-  std::string policy_id;
-  std::uint64_t version = 0;
-  WireHash256 content_hash{};
-  std::string content;
-
-  friend bool operator==(const WirePolicy&, const WirePolicy&) = default;
 };
 
 // Session-independent form used inside a projection. The live Directive
@@ -912,28 +882,34 @@ struct WireProjectedDirective {
 
 // Complete node-specific semantic projection sent either as one typed frame
 // or as a FullDesiredState large object after each accepted session.
-// `object_hash` is derived from the canonical bytes: it is not encoded (which
-// would be self-referential), is ignored when encoding, and is populated by
-// DecodeFullDesiredState.
 struct FullDesiredState {
   std::uint64_t source_meta_applied_index = 0;
   std::uint64_t topology_epoch = 0;
+  // Resolved by the current Meta Leader from one global Policy and its local
+  // leadership-validity limit. Data never interprets Policy identity or
+  // documents; it derives heartbeat cadence from this effective duration.
+  std::uint32_t authority_lease_duration_ms = 0;
   WireHash256 projection_hash{};
-  WireHash256 object_hash{};
   std::vector<WireMetaEndpoint> meta_directory;
   std::vector<WireDataEndpoint> nodes;
   std::vector<WireDesiredGroup> groups;
   std::vector<WireManifestDocument> manifests;
-  std::vector<WirePolicy> policies;
   std::vector<WireProjectedDirective> current_directives;
-  WireHash256 directive_set_digest{};
 
   friend bool operator==(const FullDesiredState&,
                          const FullDesiredState&) = default;
 };
 
+// Data has no independent heartbeat setting. Keeping this derivation at the
+// protocol seam prevents Meta and Data from carrying two values that must
+// always agree.
+constexpr std::uint32_t DataHeartbeatIntervalMs(
+    std::uint32_t authority_lease_duration_ms) noexcept {
+  const std::uint32_t divided = authority_lease_duration_ms / 3;
+  return divided == 0 ? 1 : divided;
+}
+
 // Canonical semantic body used as the FullDesiredState transfer payload.
-// Decode derives object_hash as SHA-256 over these exact bytes.
 absl::StatusOr<std::string> EncodeFullDesiredState(
     const FullDesiredState& state);
 absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
@@ -943,15 +919,10 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
 // complete representation alive during installation.
 absl::StatusOr<FullDesiredState> DecodeFullDesiredState(std::string&& encoded);
 // Hashes only node-specific semantic content. Diagnostic applied indices,
-// derived hashes, and directive projection-basis copies are normalized out,
+// the hash itself, and directive projection-basis copies are normalized out,
 // so an unrelated Raft commit cannot invalidate an installed projection.
 absl::StatusOr<WireHash256> ComputeProjectionHash(
     const FullDesiredState& state);
-// Returns a stable digest for the semantic directive set. Input order and the
-// enclosing projection-basis copies do not affect the result; all other wire
-// fields do. Duplicate directives remain observable through the encoded count.
-absl::StatusOr<WireHash256> ComputeDirectiveSetDigest(
-    const std::vector<WireProjectedDirective>& directives);
 
 using WireMessage =
     std::variant<ClientHello, ServerHello, TransferStart, TransferChunk,

@@ -7,7 +7,6 @@
 #include <tuple>
 
 #include "keylane/cluster/control_protocol.h"
-#include "keylane/meta/hash.h"
 #include "keylane/meta/value_codec.h"
 #include "spdlog/spdlog.h"
 
@@ -139,8 +138,7 @@ bool DirectiveWellFormed(const MetaDirectiveSpec& directive) {
          !IsZero(directive.assignment_id_) && source_valid &&
          !directive.group_id_.empty() &&
          directive.group_id_.size() <= kMaxMetaGroupIdBytes &&
-         directive.group_term_ != 0 && directive.authority_version_ != 0 &&
-         directive.grant_revision_ != 0 &&
+         directive.group_term_ != 0 &&
          ((directive.population_manifest_revision_ == 0) == zero_manifest) &&
          !directive.kind_.empty() &&
          directive.kind_.size() <= kMaxMetaDirectiveKindBytes &&
@@ -179,7 +177,6 @@ bool TerminalReceiptWellFormed(const MetaTerminalReceipt& receipt) {
          !IsZero(receipt.assignment_id_) &&
          ValidResultStatus(receipt.status_) &&
          receipt.result_.size() <= kMaxMetaPayloadBytes &&
-         MetaSha256(receipt.result_) == receipt.result_hash_ &&
          receipt.committed_index_ != 0;
 }
 
@@ -199,7 +196,6 @@ bool ReceiptMatches(const MetaTerminalReceipt& receipt,
          receipt.recipient_boot_id_ == command.recipient_boot_id_ &&
          receipt.assignment_id_ == command.assignment_id_ &&
          receipt.status_ == command.status_ &&
-         receipt.result_hash_ == command.result_hash_ &&
          receipt.result_ == command.result_;
 }
 
@@ -214,21 +210,6 @@ absl::StatusOr<MetaSubmitResult> MetaOperationStore::SubmitOperation(
   }
   if (command.intent_.size() > kMaxMetaPayloadBytes) {
     return MetaDomainRejectError("operation intent exceeds its cap");
-  }
-  if (command.policy_references_.size() >
-      kMaxMetaPolicyReferencesPerOperation) {
-    return MetaDomainRejectError("operation policy reference cap exceeded");
-  }
-  std::set<std::pair<std::string, std::uint64_t>> references;
-  for (const MetaPolicyReference& reference : command.policy_references_) {
-    if (reference.policy_id_.empty() ||
-        reference.policy_id_.size() > kMaxMetaPolicyIdBytes ||
-        reference.version_ == 0) {
-      return MetaDomainRejectError("invalid operation policy reference");
-    }
-    if (!references.emplace(reference.policy_id_, reference.version_).second) {
-      return MetaDomainRejectError("duplicate operation policy reference");
-    }
   }
   // Retention-window idempotency on the client-provided id, across live
   // records and archive tombstones.
@@ -272,7 +253,6 @@ absl::StatusOr<MetaSubmitResult> MetaOperationStore::SubmitOperation(
   record.intent_ = command.intent_;
   record.intent_hash_ = command.intent_hash_;
   record.replication_history_id_ = command.replication_history_id_;
-  record.policy_references_ = command.policy_references_;
   record.actor_ = command.actor_;
   live_.emplace(command.operation_id_, std::move(record));
   live_by_seq_.emplace(operation_seq, command.operation_id_);
@@ -358,20 +338,6 @@ bool MetaOperationStore::TransitionAlreadyApplied(
          DirectiveSpecsMatch(record.current_directives_,
                              command.current_directives_) &&
          EvidenceTailMatches(record, command.evidence_);
-}
-
-bool MetaOperationStore::PolicyInUse(std::string_view policy_id,
-                                     std::uint64_t version) const {
-  for (const auto& [id, record] : live_) {
-    (void)id;
-    if (IsTerminal(record.lifecycle_)) continue;
-    for (const MetaPolicyReference& reference : record.policy_references_) {
-      if (reference.policy_id_ == policy_id && reference.version_ == version) {
-        return true;
-      }
-    }
-  }
-  return false;
 }
 
 bool MetaOperationStore::PopulationManifestInUse(
@@ -599,8 +565,7 @@ absl::Status MetaOperationStore::CommitDirectiveResult(
       command.recipient_node_id_.size() != kMetaNodeIdBytes ||
       IsZero(command.recipient_boot_id_) || IsZero(command.assignment_id_) ||
       !ValidResultStatus(command.status_) ||
-      command.result_.size() > kMaxMetaPayloadBytes ||
-      MetaSha256(command.result_) != command.result_hash_) {
+      command.result_.size() > kMaxMetaPayloadBytes) {
     return MetaDomainRejectError("invalid directive result");
   }
 
@@ -644,7 +609,6 @@ absl::Status MetaOperationStore::CommitDirectiveResult(
   receipt.recipient_boot_id_ = command.recipient_boot_id_;
   receipt.assignment_id_ = command.assignment_id_;
   receipt.status_ = command.status_;
-  receipt.result_hash_ = command.result_hash_;
   receipt.result_ = command.result_;
   receipt.committed_index_ = committed_index;
   record.terminal_receipts_.push_back(std::move(receipt));
@@ -807,15 +771,6 @@ absl::Status ReadStoreSchemaVersion(MetaReader& r) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<MetaPolicyReference> ReadStoredPolicyReference(MetaReader& r) {
-  auto reference = ReadMetaPolicyReference(r);
-  if (!reference.ok()) return reference.status();
-  if (reference->policy_id_.empty() || reference->version_ == 0) {
-    return MetaFailStopError("invalid operation policy reference");
-  }
-  return reference;
-}
-
 absl::Status ReadLifecycle(MetaReader& r, MetaOperationLifecycle& out) {
   auto tag = r.ReadU8();
   if (!tag.ok()) return tag.status();
@@ -836,7 +791,6 @@ void WriteTerminalReceipt(MetaWriter& w, const MetaTerminalReceipt& receipt) {
   WriteFixedArray(w, receipt.recipient_boot_id_);
   WriteFixedArray(w, receipt.assignment_id_);
   w.WriteU8(static_cast<std::uint8_t>(receipt.status_));
-  WriteFixedArray(w, receipt.result_hash_);
   w.WriteString(receipt.result_);
   w.WriteU64(receipt.committed_index_);
 }
@@ -870,9 +824,6 @@ absl::StatusOr<MetaTerminalReceipt> ReadTerminalReceipt(MetaReader& r) {
   if (!ValidResultStatus(receipt.status_)) {
     return MetaFailStopError("unknown terminal receipt status");
   }
-  auto result_hash = ReadFixedArray<32>(r);
-  if (!result_hash.ok()) return result_hash.status();
-  receipt.result_hash_ = *result_hash;
   auto result = r.ReadString(kMaxMetaPayloadBytes);
   if (!result.ok()) return result.status();
   receipt.result_ = std::string(*result);
@@ -889,7 +840,6 @@ void WriteRecord(MetaWriter& w, const MetaOperationRecord& record) {
   w.WriteString(record.intent_);
   WriteFixedArray(w, record.intent_hash_);
   WriteFixedArray(w, record.replication_history_id_);
-  w.WriteList(record.policy_references_, WriteMetaPolicyReference);
   w.WriteU8(static_cast<std::uint8_t>(record.lifecycle_));
   w.WriteString(record.kind_phase_blob_);
   w.WriteList(record.current_directives_,
@@ -925,11 +875,6 @@ absl::StatusOr<MetaOperationRecord> ReadRecord(MetaReader& r) {
   auto replication_history = ReadFixedArray<kMetaReplicationHistoryIdBytes>(r);
   if (!replication_history.ok()) return replication_history.status();
   record.replication_history_id_ = *replication_history;
-  auto policy_references = r.ReadList<MetaPolicyReference>(
-      kMaxMetaPolicyReferencesPerOperation,
-      [](MetaReader& rr) { return ReadStoredPolicyReference(rr); });
-  if (!policy_references.ok()) return policy_references.status();
-  record.policy_references_ = std::move(*policy_references);
   if (absl::Status status = ReadLifecycle(r, record.lifecycle_); !status.ok()) {
     return status;
   }
@@ -1087,14 +1032,6 @@ absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
     if (store.live_by_seq_.contains(record.operation_seq_) ||
         store.archived_by_seq_.contains(record.operation_seq_)) {
       return MetaFailStopError("duplicate operation_seq in snapshot");
-    }
-    std::set<std::pair<std::string, std::uint64_t>> policy_references;
-    for (const MetaPolicyReference& reference : record.policy_references_) {
-      if (!policy_references.emplace(reference.policy_id_, reference.version_)
-               .second) {
-        return MetaFailStopError(
-            "duplicate operation policy reference in snapshot");
-      }
     }
     for (const MetaEvidenceSummary& evidence : record.evidence_) {
       if (!EvidenceSummaryWellFormed(evidence) ||

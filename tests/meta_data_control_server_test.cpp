@@ -1,5 +1,7 @@
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -57,11 +59,15 @@ using keylane::meta::MetaLeaseEvaluation;
 using keylane::meta::MetaLeaseHandoffGuard;
 using keylane::meta::MetaNodeHealthObs;
 using keylane::meta::MetaObservationStore;
+using keylane::meta::MetaObservedOwnerProjection;
 using keylane::meta::MetaOperationEvidenceObs;
 using keylane::meta::MetaReplacementDisposition;
 using keylane::meta::MetaStores;
 using keylane::meta::UnfencedSupersededAuthorities;
+using keylane::meta::detail::ApplyLeadershipValidityLimit;
 using keylane::meta::detail::BoundNodeSessionRegistry;
+using keylane::meta::detail::ConfirmedLeaseForHeartbeat;
+using keylane::meta::detail::EstablishedSessionReadTimeout;
 using keylane::meta::detail::FailoverProjectionForHeartbeat;
 using keylane::meta::detail::MetaCommittedViewCache;
 using keylane::meta::detail::PendingHandshakeLimiter;
@@ -87,6 +93,7 @@ TEST(MetaDataControlRuntimeStatusTest,
   projection.source_meta_applied_index = 7;
   projection.topology_epoch = 3;
   projection.projection_hash = Bytes<32>(0x31);
+  projection.authority_lease_duration_ms = 250;
   projection.groups.push_back({
       .group_id = "group-a",
       .members = {{.node_id = Identity('1'), .assignment_id = Bytes<16>(0x11)},
@@ -94,8 +101,6 @@ TEST(MetaDataControlRuntimeStatusTest,
       .owner_node_id = Identity('1'),
       .owner_assignment_id = Bytes<16>(0x11),
       .group_term = 4,
-      .authority_version = 5,
-      .grant_revision = 6,
       .manifest_revision = 8,
       .manifest_digest = Bytes<32>(0x32),
       .partition_replication_epoch = 9,
@@ -133,11 +138,13 @@ TEST(MetaDataControlRuntimeStatusTest,
       {.storage_ready = true, .population_ready = false, .draining = false},
       /*received_unix_ms=*/100);
   status.RecordLeaseDecisionWritten(Identity('1'), session,
+                                    /*heartbeat_sequence=*/17,
                                     control::LeaseDecision(denied),
                                     /*written_unix_ms=*/101);
   snapshot = status.Snapshot();
   ASSERT_TRUE(snapshot.nodes_[0].health_.has_value());
   EXPECT_TRUE(snapshot.nodes_[0].last_lease_decision_.has_value());
+  EXPECT_EQ(snapshot.nodes_[0].lease_decision_heartbeat_sequence_, 17u);
   EXPECT_EQ(snapshot.nodes_[0].lease_decision_written_unix_ms_, 101);
 
   const auto stale_session = Bytes<16>(0x42);
@@ -179,6 +186,7 @@ TEST(MetaDataControlRuntimeStatusTest,
   MetaDataControlRuntimeStatus status;
   MetaLeaderRuntimeGuard guard(/*leadership_validity_ms=*/250);
   status.BeginLeadership(/*leadership_generation=*/11);
+  EXPECT_EQ(status.Snapshot().leader_authority_eligibility_revision_, 0u);
   guard.Reset(/*now_suspend_clock_ms=*/1'000,
               /*now_active_clock_ms=*/2'000);
   const auto session = Bytes<16>(0x41);
@@ -197,6 +205,7 @@ TEST(MetaDataControlRuntimeStatusTest,
                                      /*now_active_clock_ms=*/2'000);
   ASSERT_EQ(initial, MetaLeaderRuntimeDisposition::kQuarantineStarted);
   status.SetLeaderAuthorityEligible(11, false);
+  EXPECT_EQ(status.Snapshot().leader_authority_eligibility_revision_, 0u);
   publish();
   EXPECT_FALSE(status.LeadershipState().leader_authority_eligible_);
   EXPECT_TRUE(status.Snapshot().nodes_.empty());
@@ -205,16 +214,26 @@ TEST(MetaDataControlRuntimeStatusTest,
                                        /*now_active_clock_ms=*/2'250);
   ASSERT_EQ(recovered, MetaLeaderRuntimeDisposition::kEligible);
   status.SetLeaderAuthorityEligible(11, true);
+  EXPECT_EQ(status.Snapshot().leader_authority_eligibility_revision_, 1u);
   publish();
-  EXPECT_TRUE(status.LeadershipState().leader_authority_eligible_);
+  auto leadership = status.LeadershipState();
+  EXPECT_TRUE(leadership.leader_authority_eligible_);
+  EXPECT_EQ(leadership.leader_authority_eligibility_revision_, 1u);
   ASSERT_EQ(status.Snapshot().nodes_.size(), 1u);
 
   // A later transient authority loss changes the status bracket, without
   // destroying the established session or requiring a new leader generation.
   status.SetLeaderAuthorityEligible(11, false);
-  EXPECT_FALSE(status.LeadershipState().leader_authority_eligible_);
+  EXPECT_EQ(status.Snapshot().leader_authority_eligibility_revision_, 2u);
+  leadership = status.LeadershipState();
+  EXPECT_FALSE(leadership.leader_authority_eligible_);
+  EXPECT_EQ(leadership.leader_authority_eligibility_revision_, 2u);
   EXPECT_EQ(status.Snapshot().nodes_.size(), 1u);
   status.SetLeaderAuthorityEligible(11, true);
+  EXPECT_EQ(status.Snapshot().leader_authority_eligibility_revision_, 3u);
+  leadership = status.LeadershipState();
+  EXPECT_TRUE(leadership.leader_authority_eligible_);
+  EXPECT_EQ(leadership.leader_authority_eligibility_revision_, 3u);
   status.RecordHealth(Identity('1'), session,
                       {.storage_ready = true, .population_ready = true},
                       /*received_unix_ms=*/100);
@@ -223,6 +242,21 @@ TEST(MetaDataControlRuntimeStatusTest,
   EXPECT_EQ(snapshot.leadership_generation_, 11u);
   EXPECT_TRUE(snapshot.leader_authority_eligible_);
   EXPECT_EQ(snapshot.nodes_[0].health_received_unix_ms_, 100);
+}
+
+TEST(MetaDataControlRuntimeStatusTest,
+     EligibilityMutationReportsTheCurrentGenerationEffectiveState) {
+  MetaDataControlRuntimeStatus status;
+  status.BeginLeadership(/*leadership_generation=*/11);
+
+  EXPECT_FALSE(
+      status.SetLeaderAuthorityEligible(/*leadership_generation=*/10, true));
+  EXPECT_TRUE(
+      status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true));
+  EXPECT_TRUE(
+      status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true));
+  EXPECT_FALSE(
+      status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, false));
 }
 
 TEST(MetaDataControlRuntimeStatusTest,
@@ -327,17 +361,29 @@ TEST(MetaTransferBoundaryTest,
                 kAwaitExactAppliedAndRetryInSession);
 }
 
+TEST(MetaPublisherAdoptionGateTest,
+     HoldsFollowingHeartbeatUntilPublisherAdoptsAppliedProjection) {
+  keylane::meta::detail::MetaPublisherAdoptionGate gate;
+  EXPECT_FALSE(gate.pending());
+
+  // Deterministically model the scheduling gap: the reader consumes Applied,
+  // then gets another turn before the awakened publisher updates installed_.
+  gate.ObserveAppliedReceipt();
+  EXPECT_TRUE(gate.pending());
+
+  gate.MarkProjectionAdopted();
+  EXPECT_FALSE(gate.pending());
+}
+
 control::FullDesiredState Desired() {
   control::FullDesiredState desired;
+  desired.authority_lease_duration_ms = 5000;
   desired.projection_hash = Bytes<32>(0x42);
   control::WireDesiredGroup group;
   group.group_id = "group-a";
   group.owner_node_id = Identity('1');
   group.owner_assignment_id = Bytes<16>(0x22);
   group.group_term = 7;
-  group.authority_version = 8;
-  group.grant_revision = 9;
-  group.grant_duration_ms = 5000;
   group.grant_active = true;
   group.partition_replication_epoch = 4;
   desired.groups.push_back(group);
@@ -351,8 +397,6 @@ control::LeaseChallenge Challenge() {
       .group_id = "group-a",
       .assignment_id = Bytes<16>(0x22),
       .group_term = 7,
-      .authority_version = 8,
-      .grant_revision = 9,
   };
 }
 
@@ -426,7 +470,6 @@ class FailoverHeartbeatFacts final : public HeartbeatFacts {
     transition.revision_ = 8;
     transition.mode_ = keylane::meta::MetaFailoverMode::kUncontrolled;
     transition.target_term_ = 7;
-    transition.successor_grant_ = {5000, "p", 0};
     transition.candidate_action_ = action;
     return FailoverTransitionView{"group-a", std::move(transition)};
   }
@@ -618,10 +661,6 @@ TEST(MetaDataControlOptionsTest, TlsIsAllOrNone) {
   options.max_pending_handshakes_ = control::kMaxProjectedNodes;
   EXPECT_TRUE(MetaDataControlServer::ValidateOptions(options).ok());
 
-  options.heartbeat_interval_ms_ = 10'000;
-  EXPECT_EQ(MetaDataControlServer::ValidateOptions(options).code(),
-            absl::StatusCode::kInvalidArgument);
-  options.heartbeat_interval_ms_ = 1000;
   options.session_progress_timeout_ms_ = 10'001;
   EXPECT_EQ(MetaDataControlServer::ValidateOptions(options).code(),
             absl::StatusCode::kInvalidArgument);
@@ -630,6 +669,49 @@ TEST(MetaDataControlOptionsTest, TlsIsAllOrNone) {
       2 * static_cast<std::size_t>(control::kMaxFullDesiredStateBytes) - 1;
   EXPECT_EQ(MetaDataControlServer::ValidateOptions(options).code(),
             absl::StatusCode::kInvalidArgument);
+}
+
+TEST(MetaDataControlOptionsTest,
+     EstablishedReadTimeoutCoversLongResolvedLeaseCadenceWithoutWrapping) {
+  using namespace std::chrono_literals;
+  constexpr std::uint32_t lease_duration_ms = 60'000;
+  constexpr std::uint32_t observation_ttl_ms = 60'001;
+  constexpr std::uint32_t progress_timeout_ms = 10'000;
+
+  const auto timeout =
+      EstablishedSessionReadTimeout(observation_ttl_ms, progress_timeout_ms);
+  EXPECT_EQ(timeout, 70'001ms);
+  EXPECT_GT(timeout, std::chrono::milliseconds(lease_duration_ms / 3));
+
+  const auto maximum =
+      EstablishedSessionReadTimeout(std::numeric_limits<std::uint32_t>::max(),
+                                    /*session_progress_timeout_ms=*/10'000);
+  EXPECT_EQ(
+      static_cast<std::uint64_t>(maximum.count()),
+      static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) +
+          10'000);
+}
+
+TEST(MetaDataControlOptionsTest,
+     ObservationTtlCoversMaximumDerivedHeartbeatCadence) {
+  MetaDataControlServerOptions options;
+  options.server_id_ = 1;
+  options.bind_host_ = "127.0.0.1";
+  options.port_ = 7000;
+  options.observation_ttl_ms_ = 100;
+  options.leadership_validity_ms_ = 302;
+  options.lease_handoff_safety_margin_ms_ = 302;
+  EXPECT_TRUE(MetaDataControlServer::ValidateOptions(options).ok());
+
+  options.leadership_validity_ms_ = 303;
+  options.lease_handoff_safety_margin_ms_ = 303;
+  EXPECT_EQ(MetaDataControlServer::ValidateOptions(options).code(),
+            absl::StatusCode::kInvalidArgument);
+
+  options.observation_ttl_ms_ = 1;
+  options.leadership_validity_ms_ = 1;
+  options.lease_handoff_safety_margin_ms_ = 1;
+  EXPECT_TRUE(MetaDataControlServer::ValidateOptions(options).ok());
 }
 
 TEST(MetaDataControlDirectoryTest, UsesOnlyCommittedActiveMembersInIdOrder) {
@@ -783,6 +865,31 @@ TEST(MetaDataControlLeaseTest, ExactCommittedAnchorGetsBoundedGrant) {
 }
 
 TEST(MetaDataControlLeaseTest,
+     LeaderLocalValidityRebuildsTheResolvedProjectionWithoutCommittedInput) {
+  control::FullDesiredState state;
+  state.source_meta_applied_index = 7;
+  state.authority_lease_duration_ms = 900;
+  state.projection_hash = *control::ComputeProjectionHash(state);
+  auto encoded = control::EncodeFullDesiredState(state);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  keylane::meta::NodeControlBatch batch{state, *encoded};
+
+  const absl::Status limited = ApplyLeadershipValidityLimit(batch, 250);
+  ASSERT_TRUE(limited.ok()) << limited;
+  EXPECT_EQ(batch.full_state.authority_lease_duration_ms, 250u);
+  EXPECT_EQ(control::DataHeartbeatIntervalMs(
+                batch.full_state.authority_lease_duration_ms),
+            83u);
+  auto decoded = control::DecodeFullDesiredState(batch.encoded_full_state);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->authority_lease_duration_ms, 250u);
+  EXPECT_EQ(
+      control::DataHeartbeatIntervalMs(decoded->authority_lease_duration_ms),
+      83u);
+  EXPECT_EQ(decoded->projection_hash, batch.full_state.projection_hash);
+}
+
+TEST(MetaDataControlLeaseTest,
      NewAuthorityWaitsOutPriorLeaseAndEqualSafetyMarginBeforeGrant) {
   const control::FullDesiredState desired = Desired();
   const MetaLeaseEvaluation evaluation{
@@ -821,6 +928,51 @@ TEST(MetaDataControlLeaseTest,
                     evaluation.node_id_,
                     /*now_lease_clock_ms=*/10'500);
   EXPECT_NE(std::get_if<control::LeaseGranted>(&decision), nullptr);
+}
+
+TEST(MetaDataControlLeaseTest,
+     UnhealthyOwnerCannotBypassButAlsoDoesNotOutliveHandoffWait) {
+  const control::FullDesiredState desired = Desired();
+  const MetaLeaseEvaluation evaluation{
+      .leader_valid_ = true,
+      .server_id_ = 3,
+      .raft_term_ = 12,
+      .leadership_generation_ = 4,
+      .leadership_validity_ms_ = 250,
+      .node_id_ = Identity('1'),
+      .boot_id_ = Identity('2'),
+      .applied_projection_hash_ = desired.projection_hash,
+      .desired_ = &desired,
+  };
+  const control::HeartbeatHealth unhealthy{
+      .storage_ready = false,
+      .population_ready = true,
+  };
+  MetaLeaseHandoffGuard guard(/*maximum_prior_lease_ms=*/250,
+                              /*safety_margin_ms=*/250);
+  const auto evaluate = [&] {
+    return EvaluateLeaseChallenge(Challenge(), unhealthy, evaluation);
+  };
+
+  auto decision = guard.Enforce(evaluate(), Challenge(), evaluation,
+                                /*now_lease_clock_ms=*/10'000);
+  const auto* denied = std::get_if<control::LeaseDenied>(&decision);
+  ASSERT_NE(denied, nullptr);
+  EXPECT_EQ(denied->reason,
+            control::LeaseDenialReason::kAuthorityHandoffPending);
+
+  decision = guard.Enforce(evaluate(), Challenge(), evaluation,
+                           /*now_lease_clock_ms=*/10'499);
+  denied = std::get_if<control::LeaseDenied>(&decision);
+  ASSERT_NE(denied, nullptr);
+  EXPECT_EQ(denied->reason,
+            control::LeaseDenialReason::kAuthorityHandoffPending);
+
+  decision = guard.Enforce(evaluate(), Challenge(), evaluation,
+                           /*now_lease_clock_ms=*/10'500);
+  denied = std::get_if<control::LeaseDenied>(&decision);
+  ASSERT_NE(denied, nullptr);
+  EXPECT_EQ(denied->reason, control::LeaseDenialReason::kNodeNotReady);
 }
 
 TEST(MetaDataControlLeaseTest, NewBootAndLeaderResetRestartHandoffWait) {
@@ -961,7 +1113,7 @@ TEST(MetaDataControlLeaseTest, InvalidChallengeDoesNotBecomeAGrant) {
       .desired_ = &desired,
   };
   control::LeaseChallenge challenge = Challenge();
-  ++challenge.authority_version;
+  ++challenge.group_term;
   const auto mismatch = EvaluateLeaseChallenge(
       challenge,
       control::HeartbeatHealth{.storage_ready = true, .population_ready = true},
@@ -1088,6 +1240,97 @@ TEST(MetaHeartbeatObservationTest,
 }
 
 TEST(MetaHeartbeatObservationTest,
+     HigherSequenceConfirmsOnlyTheExactPriorGrantedOwnerLease) {
+  MetaObservedOwnerProjection owner{
+      .group_id_ = "group-a",
+      .owner_node_id_ = Identity('1'),
+      .owner_assignment_id_ = Bytes<16>(0x22),
+      .group_term_ = 7,
+      .projection_hash_ = Bytes<32>(0x42),
+      .authority_lease_duration_ms_ = 5000,
+  };
+  control::LeaseGranted granted{
+      .data_boot_id = Identity('2'),
+      .projection_hash = owner.projection_hash_,
+      .group_id = owner.group_id_,
+      .assignment_id = owner.owner_assignment_id_,
+      .group_term = owner.group_term_,
+      .granted_duration_ms = 5000,
+  };
+  control::HeartbeatAck ack{
+      .heartbeat_sequence = 4,
+      .lease_decision = granted,
+  };
+
+  const auto exact = ConfirmedLeaseForHeartbeat(ack, /*heartbeat_sequence=*/5,
+                                                Identity('2'), owner);
+  ASSERT_TRUE(exact.has_value());
+  EXPECT_EQ(*exact, 4u);
+
+  EXPECT_FALSE(ConfirmedLeaseForHeartbeat(ack, /*heartbeat_sequence=*/4,
+                                          Identity('2'), owner)
+                   .has_value());
+  EXPECT_FALSE(ConfirmedLeaseForHeartbeat(ack, /*heartbeat_sequence=*/5,
+                                          Identity('3'), owner)
+                   .has_value());
+
+  ++granted.assignment_id[0];
+  ack.lease_decision = granted;
+  EXPECT_FALSE(ConfirmedLeaseForHeartbeat(ack, /*heartbeat_sequence=*/5,
+                                          Identity('2'), owner)
+                   .has_value());
+
+  granted.assignment_id = owner.owner_assignment_id_;
+  granted.granted_duration_ms = 4999;
+  ack.lease_decision = granted;
+  EXPECT_FALSE(ConfirmedLeaseForHeartbeat(ack, /*heartbeat_sequence=*/5,
+                                          Identity('2'), owner)
+                   .has_value());
+  ack.lease_decision = control::LeaseDenied{};
+  EXPECT_FALSE(ConfirmedLeaseForHeartbeat(ack, /*heartbeat_sequence=*/5,
+                                          Identity('2'), owner)
+                   .has_value());
+}
+
+TEST(MetaHeartbeatObservationTest,
+     MaximumLegalSummaryDoesNotSuppressTypedOwnerHealth) {
+  MetaObservationStore observations;
+  HeartbeatFacts facts;
+  const auto boot = Bytes<20>(0x22);
+  ASSERT_TRUE(observations
+                  .AdoptSession({Identity('1'), boot, 1},
+                                /*now_unix_ms=*/1000)
+                  .ok());
+  auto owner = keylane::meta::detail::OwnerProjectionForHeartbeat(
+      Desired(), Identity('1'));
+  ASSERT_TRUE(owner.ok()) << owner.status();
+  ASSERT_TRUE(owner->has_value());
+  const control::HeartbeatHealth health{
+      .storage_ready = true,
+      .population_ready = true,
+      .draining = false,
+      .active_groups = 1,
+      .summary = std::string(control::kMaxOpaqueFieldBytes, 's'),
+  };
+
+  const auto result = IngestHeartbeatObservations(
+      observations, facts, Identity('1'), boot, Bytes<20>(0x55), 1, health,
+      control::NoRoleInformation{}, std::nullopt, std::nullopt,
+      std::move(*owner), /*heartbeat_sequence=*/1, std::nullopt,
+      /*now_unix_ms=*/1010, /*now_steady_ms=*/2010);
+  EXPECT_EQ(result.status, control::ObservationStatus::kAccepted)
+      << result.detail;
+
+  const auto observed = observations.OwnerObservationFor(Identity('1'));
+  ASSERT_TRUE(observed.has_value());
+  ASSERT_TRUE(observed->health_.has_value());
+  EXPECT_EQ(observed->heartbeat_sequence_, 1u);
+  EXPECT_TRUE(observed->health_->storage_ready_);
+  EXPECT_TRUE(observed->health_->population_ready_);
+  EXPECT_FALSE(observed->health_->draining_);
+}
+
+TEST(MetaHeartbeatObservationTest,
      ReporterHistoryIsIndependentAndRoleReplacementClearsCandidate) {
   MetaObservationStore observations;
   HeartbeatFacts facts;
@@ -1211,7 +1454,6 @@ TEST(MetaHeartbeatObservationTest,
       .candidate_assignment_id = Bytes<16>(0x22),
       .candidate_boot_id = Identity('2'),
       .prepared_context_id = Bytes<16>(0x41),
-      .prepared_context_hash = Bytes<32>(0x42),
   };
 
   const auto result = IngestHeartbeatObservations(
@@ -1249,7 +1491,6 @@ TEST(MetaOperationEvidenceTest,
       .partition_replication_epoch = 4,
       .replication_history_id = Identity('4'),
   };
-  evidence.evidence_hash = control::ComputeSha256(evidence.evidence);
 
   EXPECT_TRUE(IngestOperationEvidenceObservation(
                   observations, facts, Identity('1'), boot, 1, session_id,
@@ -1293,12 +1534,12 @@ TEST(MetaOperationEvidenceTest,
                 .code(),
             absl::StatusCode::kFailedPrecondition);
   invalid = evidence;
+  // Observation bodies are replaceable reports, not durable content identities.
   invalid.evidence.push_back('!');
-  EXPECT_EQ(IngestOperationEvidenceObservation(
-                observations, facts, Identity('1'), boot, 1, session_id,
-                invalid, /*now_unix_ms=*/1002)
-                .code(),
-            absl::StatusCode::kDataLoss);
+  EXPECT_TRUE(IngestOperationEvidenceObservation(
+                  observations, facts, Identity('1'), boot, 1, session_id,
+                  invalid, /*now_unix_ms=*/1002)
+                  .ok());
 }
 
 TEST(MetaDirectiveReceiptTrackerTest,
@@ -1478,9 +1719,7 @@ TEST(MetaDataControlDirectiveTest, OversizedEnvelopeUsesObjectTransfer) {
                 .projection_hash = Bytes<32>(0x10)},
       .authority = {.group_id = "group-a",
                     .assignment_id = Bytes<16>(0x11),
-                    .group_term = 2,
-                    .authority_version = 3,
-                    .grant_revision = 4},
+                    .group_term = 2},
       .identity = {.operation_id = Bytes<16>(0x12),
                    .directive_id = Bytes<16>(0x13),
                    .attempt_id = Bytes<16>(0x14),

@@ -218,7 +218,7 @@ bool MetaStoresFacts::MayReportFencedOwnerCandidate(
           std::numeric_limits<std::uint64_t>::max() ||
       candidate.source_group_term_ + 1 != candidate.group_term_ ||
       group->record_.owner_ != candidate.node_id_ ||
-      grant->group_term_ != group->record_.group_term_ || !grant->fenced_ ||
+      grant->group_term_ != group->record_.group_term_ ||
       grant->grant_.has_value()) {
     return false;
   }
@@ -415,19 +415,6 @@ void FailProposeDispatch(const std::shared_ptr<ProposeWaiter>& waiter) {
     waiter->recovery_reservation_.reset();
   }
   ScheduleProposeResume(*waiter, to_resume);
-}
-
-MetaCommandTag CommandTagOf(const MetaCommand& command) {
-  // The MetaCommand variant is declared in tag order (commands.h:
-  // kRegisterNode=1 .. kCommitUncontrolledFailover=37); pin both ends and the
-  // size so a future reorder breaks the build here instead of mislabeling
-  // results.
-  static_assert(std::variant_size_v<MetaCommand> == 37);
-  static_assert(
-      std::is_same_v<std::variant_alternative_t<0, MetaCommand>, RegisterNode>);
-  static_assert(std::is_same_v<std::variant_alternative_t<36, MetaCommand>,
-                               CommitUncontrolledFailover>);
-  return static_cast<MetaCommandTag>(command.index() + 1);
 }
 
 // UTC "YYYY-MM-DDTHH:MM:SS.mmmZ" — far under kMaxMetaActorReadableTimeBytes.
@@ -1285,8 +1272,8 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   // snapshot independently and keeps every validation on one exact cut.
   std::uint64_t applied_index = 0;
   std::uint64_t high_water = 0;
-  MetaCommittedView view(AtomicStoresSnapshot(applied_index, high_water),
-                         applied_index);
+  MetaStores stores = AtomicStoresSnapshot(applied_index, high_water);
+  MetaCommittedView view(std::move(stores), applied_index);
   // All semantic hooks evaluate volatile observations against one proposal
   // instant. Re-reading wall time in individual hooks could otherwise make
   // command admission depend on hook order around the same TTL boundary.
@@ -1454,7 +1441,7 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
     co_return UncertainOutcome(absl::StatusCode::kInternal,
                                "committed without an apply result");
   }
-  if (waiter->apply_result_->command_tag_ != CommandTagOf(command)) {
+  if (waiter->apply_result_->command_tag_ != MetaCommandTagOf(command)) {
     co_return absl::Status(
         absl::StatusCode::kInternal,
         "meta: committed apply result has a mismatched command tag");

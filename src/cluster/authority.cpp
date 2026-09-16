@@ -230,8 +230,6 @@ std::optional<AuthorityAnchor> AuthorityGuard::LocalPrimaryAnchor(
       .group_id_ = group->group_id_,
       .assignment_id_ = group->assignment_id_,
       .group_term_ = group->group_term_,
-      .authority_version_ = group->authority_version_,
-      .grant_revision_ = group->grant_revision_,
   };
 }
 
@@ -409,6 +407,18 @@ absl::Status AuthorityGuard::RenewLease(const SessionIdentity& session,
                            Lease{session, anchor, deadline, false});
   ++generation_;
   return absl::OkStatus();
+}
+
+bool AuthorityGuard::HasExactLease(const SessionIdentity& session,
+                                   const AuthorityAnchor& anchor,
+                                   MonotonicTime deadline,
+                                   MonotonicTime now) const {
+  const std::lock_guard lock(mutex_);
+  if (!session_.has_value() || *session_ != session) return false;
+  const auto lease = leases_.find(anchor.group_id_);
+  return lease != leases_.end() && lease->second.session_ == session &&
+         lease->second.anchor_ == anchor &&
+         lease->second.deadline_ == deadline && deadline > now;
 }
 
 bool AuthorityGuard::ExpireLease(const SessionIdentity& session,

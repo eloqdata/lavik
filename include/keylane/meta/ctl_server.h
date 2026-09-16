@@ -63,24 +63,26 @@
 //                             same non-linearizable read semantics as getop.
 //   putpolicy <policy_id> <version> <content>
 //                          -> commit one immutable policy version; content is
-//                             a whitespace-free token and its SHA-256 is
-//                             computed by this trusted proposer.
-//   setslotmap <first> <last> <group_id> <config_epoch>
+//                             a strict compact JSON token in a registered
+//                             family.
+//   getpolicy <policy_id>  -> leader-only current raw Policy as
+//                             "OK version=<n> content=<json>" or not-found.
+//   setslotmap <first> <last> <group_id>
 //                          -> replace the absolute slot map with one inclusive
-//                             range and set that group's absolute config
-//                             epoch. This deliberately narrow bootstrap form
+//                             range. This deliberately narrow bootstrap form
 //                             does not imply incremental slot mutation.
 //   activateauthority <group_id> <expected_term> <owner_node_id>
-//                     <lease_ms> <policy_id> <policy_version>
-//                     <new_authority_version> <new_config_epoch>
 //                          -> atomically activate the committed owner/grant;
 //                             the topology epoch is derived from the local
-//                             committed snapshot and every other CAS/absolute
-//                             value remains explicit operator input.
+//                             committed snapshot. A term can acquire at most
+//                             one Grant. Normal Owner changes use typed
+//                             failover; this primitive requires a previously
+//                             reserved grantless term.
 //   fencegroup <group_id> <expected_term>
-//                          -> commit FenceGroup under the current term. Data
-//                             sessions fence and drain the superseded anchor
-//                             before acknowledging its replacement FDS.
+//                          -> atomically fence the current Grant and advance
+//                             the Group Term by one. Data sessions fence and
+//                             drain the superseded anchor before acknowledging
+//                             its replacement FDS.
 //   status                 -> "OK leader=<0|1> id=<n> committed=<idx>
 //                             snapshot_idx=<idx> term=<n>".
 //   clusterhead 1          -> bounded versioned responder/role/term/leader/
@@ -120,7 +122,7 @@
 //   removesrv <id>         -> the same durable workflow/wait contract. Only a
 //                             committed removal retires the committed
 //                             member identity.
-//   exportaudit <through>  -> "OK <hex>" versioned, hash-chained export.
+//   exportaudit <through>  -> "OK <hex>" versioned, ordered record export.
 //   pruneaudit <through>   -> replicated prefix prune; callers must durably
 //                             store the matching export first.
 //   exportoperations      -> "OK <hex>" versioned archived-operation export.
@@ -164,7 +166,6 @@
 //                             candidate reporter/assignment identity is
 //                             derived from the trusted session identity and
 //                             the same committed snapshot used for admission;
-//                             evidence_hash is computed as SHA-256(evidence)
 //                             by the ctl, not taken from the wire). "OK" on
 //                             admission, "ERR <detail>" on rejection — every
 //                             rejection also lands in the audit ring.
@@ -247,6 +248,9 @@ class raft_server;
 
 namespace keylane::meta {
 
+class MetaAutomaticFailoverDiagnosticsRegistry;
+struct MetaAutomaticFailoverDiagnosticsSnapshot;
+
 class MetaMembershipGate;
 class MetaProposalExecutor;
 
@@ -270,6 +274,19 @@ struct MetaClusterStatusBracket {
 
 bool IsStableClusterStatusBracket(const MetaClusterStatusBracket& before,
                                   const MetaClusterStatusBracket& after);
+
+// Requires detector diagnostics, volatile authority continuity, and the
+// committed status view to describe one evaluation cut before they are joined
+// into clusterstatus.
+bool IsCurrentAutomaticFailoverDiagnostics(
+    const MetaDataControlRuntimeSnapshot& runtime,
+    const MetaAutomaticFailoverDiagnosticsSnapshot& detector,
+    std::uint64_t committed_applied_index);
+
+// Parses the canonical positive decimal representation accepted by the
+// putpolicy Admin Adapter. Leading zeroes are rejected so one version has one
+// wire spelling; overflow and a null output are also rejected.
+bool ParseAdminPolicyVersion(std::string_view text, std::uint64_t* version);
 
 // Classifies a registered node with no current session. Prior parsed Hello or
 // accepted-session evidence distinguishes a missing session from a process
@@ -356,6 +373,11 @@ struct MetaCtlServerOptions {
   std::string local_ctl_endpoint_;
   std::shared_ptr<MetaClusterStatusService> cluster_status_service_;
   std::shared_ptr<MetaDataControlRuntimeStatus> data_control_runtime_status_;
+  // Complete, generation-bracketed detector cuts published by the
+  // leader-scoped automatic failover reconciler. The Admin server owns no
+  // detector timers and exposes no Policy contents through status.
+  std::shared_ptr<MetaAutomaticFailoverDiagnosticsRegistry>
+      automatic_failover_diagnostics_;
   // Shared background owner; listeners submit durable intent and only wait.
   std::shared_ptr<MetaClusterCreateReconciler> cluster_create_reconciler_;
   std::shared_ptr<class MetaMembershipReconciler> membership_reconciler_;

@@ -290,11 +290,10 @@ TEST_F(MetaStateMachineTest, CommitAppliesRealCommands) {
     // fields verbatim off the wire (see the file header).
     const auto audit = stores.audit_.Find(1);
     ASSERT_TRUE(audit.has_value());
-    EXPECT_EQ(audit->record_.verdict_, MetaAuditVerdict::kAccepted);
-    EXPECT_NE(audit->record_.command_summary_.find("RegisterNode"),
-              std::string::npos);
-    EXPECT_EQ(audit->record_.actor_principal_, kEntryPrincipal);
-    EXPECT_EQ(audit->record_.readable_time_, kEntryReadableTime);
+    EXPECT_EQ(audit->verdict_, MetaAuditVerdict::kAccepted);
+    EXPECT_NE(audit->command_summary_.find("RegisterNode"), std::string::npos);
+    EXPECT_EQ(audit->actor_principal_, kEntryPrincipal);
+    EXPECT_EQ(audit->readable_time_, kEntryReadableTime);
   }
   EXPECT_EQ(machine->last_commit_index(), 1u);
 
@@ -341,8 +340,8 @@ TEST_F(MetaStateMachineTest, DomainRejectConsumesIndexWithoutStateChange) {
   EXPECT_FALSE(stores.identity_.FindNode(MakeNodeId(0x22)).has_value());
   const auto audit = stores.audit_.Find(2);
   ASSERT_TRUE(audit.has_value());
-  EXPECT_EQ(audit->record_.verdict_, MetaAuditVerdict::kRejected);
-  EXPECT_FALSE(audit->record_.verdict_detail_.empty());
+  EXPECT_EQ(audit->verdict_, MetaAuditVerdict::kRejected);
+  EXPECT_FALSE(audit->verdict_detail_.empty());
   EXPECT_EQ(machine->last_commit_index(), 2u);
 }
 
@@ -395,6 +394,86 @@ TEST_F(MetaStateMachineTest, RestartWithoutSnapshotReplaysFromScratch) {
   EXPECT_EQ(machine->last_commit_index(), 2u);
 }
 
+TEST_F(MetaStateMachineTest,
+       ClusterCreateCompletionWithoutBothPoliciesRejectsOnLiveAndWalReplay) {
+  keylane::meta::ClusterCreateManifestV1 manifest;
+  manifest.schema_version_ = 1;
+  manifest.meta_members_ = {{1, "tcp://127.0.0.1:7101", "tcp://127.0.0.1:7301",
+                             "tcp://127.0.0.1:7201"}};
+  manifest.data_nodes_ = {{MakeNodeId(0x11), "tcp://127.0.0.1:6379"}};
+  manifest.groups_ = {{"g1", MakeNodeId(0x11), {}}};
+  manifest.slot_ranges_ = {{0, 16383, "g1"}};
+
+  SubmitOperation root;
+  root.request_id_ = MakeRequestId(0x01);
+  root.actor_.principal_ = std::string(kEntryPrincipal);
+  root.actor_.readable_time_ = std::string(kEntryReadableTime);
+  root.operation_id_ = MakeRequestId(0x02);
+  root.kind_ = std::string(keylane::meta::kMetaClusterCreateOperationKind);
+  const auto intent =
+      keylane::meta::EncodeClusterCreateRequest(manifest, root.operation_id_);
+  ASSERT_TRUE(intent.ok()) << intent.status();
+  root.intent_ = *intent;
+  root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
+
+  keylane::meta::PutPolicy automatic;
+  automatic.request_id_ = MakeRequestId(0x03);
+  automatic.actor_ = root.actor_;
+  automatic.policy_id_ =
+      std::string(keylane::meta::kAutomaticUncontrolledFailoverPolicyId);
+  automatic.version_ = 1;
+  automatic.content_ =
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+
+  keylane::meta::CompleteOperation complete;
+  complete.request_id_ = MakeRequestId(0x04);
+  complete.actor_ = root.actor_;
+  complete.operation_id_ = root.operation_id_;
+  complete.expected_revision_ = 0;
+  complete.result_ = "cluster-created";
+
+  const nuraft::ptr<nuraft::buffer> root_bytes = EncodeOrDie(root);
+  const nuraft::ptr<nuraft::buffer> automatic_bytes = EncodeOrDie(automatic);
+  const nuraft::ptr<nuraft::buffer> complete_bytes = EncodeOrDie(complete);
+  ASSERT_NE(root_bytes, nullptr);
+  ASSERT_NE(automatic_bytes, nullptr);
+  ASSERT_NE(complete_bytes, nullptr);
+
+  const auto apply_and_expect_rejected = [&](MetaStateMachine& machine) {
+    ASSERT_NE(machine.commit(1, *root_bytes), nullptr);
+    ASSERT_NE(machine.commit(2, *automatic_bytes), nullptr);
+    ASSERT_NE(machine.commit(3, *complete_bytes), nullptr);
+    const MetaStores stores = machine.StoresSnapshot();
+    EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
+              keylane::meta::MetaClusterLifecycle::kCreating);
+    ASSERT_TRUE(
+        stores.operation_.FindOperation(root.operation_id_).has_value());
+    EXPECT_EQ(stores.operation_.FindOperation(root.operation_id_)->lifecycle_,
+              keylane::meta::MetaOperationLifecycle::kSubmitted);
+    const auto audit = stores.audit_.Find(3);
+    ASSERT_TRUE(audit.has_value());
+    EXPECT_EQ(audit->verdict_, MetaAuditVerdict::kRejected);
+    EXPECT_NE(audit->verdict_detail_.find("both current global Policies"),
+              std::string::npos);
+    EXPECT_EQ(machine.last_commit_index(), 3u);
+  };
+
+  {
+    auto opened = Open();
+    ASSERT_TRUE(opened.ok()) << opened.status();
+    std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
+    apply_and_expect_rejected(*machine);
+  }
+
+  // Without a snapshot the state machine reopens at zero; replaying the
+  // durable WAL prefix must produce the same rejection and Creating state.
+  auto reopened = Open();
+  ASSERT_TRUE(reopened.ok()) << reopened.status();
+  std::unique_ptr<MetaStateMachine> machine = std::move(*reopened);
+  EXPECT_EQ(machine->last_commit_index(), 0u);
+  apply_and_expect_rejected(*machine);
+}
+
 TEST_F(MetaStateMachineTest, SnapshotIsDurableAcrossRestart) {
   {
     auto opened = Open();
@@ -423,7 +502,6 @@ TEST_F(MetaStateMachineTest, SnapshotIsDurableAcrossRestart) {
   EXPECT_TRUE(stores.topology_.GroupExists("g1"));
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 1u);
   EXPECT_EQ(stores.audit_.size(), 3u);
-  EXPECT_TRUE(stores.audit_.VerifyChain());
 }
 
 TEST_F(MetaStateMachineTest,
@@ -435,7 +513,6 @@ TEST_F(MetaStateMachineTest,
   const std::string owner = MakeNodeId(0x11);
   const std::string group_id = "g1\ntransition=forged value";
   const keylane::meta::MetaAssignmentId owner_assignment = MakeRequestId(0x31);
-  const keylane::meta::MetaGrantSpec successor_grant{5000, "p", 0};
 
   keylane::meta::ClusterCreateManifestV1 manifest;
   manifest.schema_version_ = 1;
@@ -458,21 +535,39 @@ TEST_F(MetaStateMachineTest,
   root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
   Commit(*machine, 1, root);
 
+  keylane::meta::PutPolicy automatic;
+  automatic.request_id_ = MakeRequestId(0x06);
+  automatic.actor_ = root.actor_;
+  automatic.policy_id_ =
+      std::string(keylane::meta::kAutomaticUncontrolledFailoverPolicyId);
+  automatic.version_ = 1;
+  automatic.content_ =
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+  Commit(*machine, 2, automatic);
+
+  keylane::meta::PutPolicy policy;
+  policy.request_id_ = MakeRequestId(0x0a);
+  policy.actor_ = root.actor_;
+  policy.policy_id_ = std::string(keylane::meta::kAuthorityLeasePolicyId);
+  policy.version_ = 1;
+  policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
+  Commit(*machine, 3, policy);
+
   keylane::meta::CompleteOperation complete;
   complete.request_id_ = MakeRequestId(0x03);
   complete.actor_ = root.actor_;
   complete.operation_id_ = root.operation_id_;
   complete.expected_revision_ = 0;
   complete.result_ = "cluster-created";
-  Commit(*machine, 2, complete);
+  Commit(*machine, 4, complete);
 
   RegisterNode node = MakeRegister(0x11);
   node.role_ = keylane::meta::MetaNodeRole::kPrimary;
-  Commit(*machine, 3, node);
+  Commit(*machine, 5, node);
 
   CreateGroup group = MakeCreateGroup(group_id, 1);
   group.actor_ = root.actor_;
-  Commit(*machine, 4, group);
+  Commit(*machine, 6, group);
 
   keylane::meta::AssignNodeToGroup assign;
   assign.request_id_ = MakeRequestId(0x05);
@@ -483,17 +578,7 @@ TEST_F(MetaStateMachineTest,
   assign.role_ = keylane::meta::MetaNodeRole::kPrimary;
   assign.expected_revision_ = 1;
   assign.new_topology_epoch_ = 2;
-  Commit(*machine, 5, assign);
-
-  keylane::meta::PutPolicy policy;
-  policy.request_id_ = MakeRequestId(0x06);
-  policy.actor_ = root.actor_;
-  policy.policy_id_ = successor_grant.policy_id_;
-  policy.version_ = successor_grant.policy_version_;
-  policy.content_ = R"({"lease_ms":5000})";
-  policy.content_hash_ =
-      keylane::meta::MetaPolicyStore::ContentHash(policy.content_);
-  Commit(*machine, 6, policy);
+  Commit(*machine, 7, assign);
 
   keylane::meta::BeginGroupTerm begin_term;
   begin_term.request_id_ = MakeRequestId(0x07);
@@ -501,7 +586,7 @@ TEST_F(MetaStateMachineTest,
   begin_term.group_id_ = group_id;
   begin_term.expected_term_ = 0;
   begin_term.new_term_ = 1;
-  Commit(*machine, 7, begin_term);
+  Commit(*machine, 8, begin_term);
 
   keylane::meta::ActivateAuthority activate;
   activate.request_id_ = MakeRequestId(0x08);
@@ -509,11 +594,8 @@ TEST_F(MetaStateMachineTest,
   activate.group_id_ = group_id;
   activate.expected_term_ = 1;
   activate.new_owner_ = owner;
-  activate.grant_ = successor_grant;
-  activate.new_authority_version_ = 1;
   activate.new_topology_epoch_ = 3;
-  activate.new_config_epoch_ = 1;
-  Commit(*machine, 8, activate);
+  Commit(*machine, 9, activate);
 
   keylane::meta::BeginUncontrolledFailover begin;
   begin.request_id_ = MakeRequestId(0x09);
@@ -521,18 +603,14 @@ TEST_F(MetaStateMachineTest,
   begin.group_id_ = group_id;
   begin.transition_id_ = MakeRequestId(0x41);
   begin.target_term_ = 2;
-  begin.successor_grant_ = successor_grant;
   begin.expected_owner_node_id_ = owner;
   begin.expected_owner_assignment_id_ = owner_assignment;
   begin.expected_membership_revision_ = 2;
   begin.expected_group_term_ = 1;
-  begin.expected_authority_version_ = 1;
-  begin.expected_grant_revision_ = 8;
   begin.expected_population_manifest_revision_ = 0;
   begin.expected_population_manifest_digest_.fill(0);
   begin.expected_partition_replication_epoch_ = 0;
-  begin.expected_config_epoch_ = 1;
-  Commit(*machine, 9, begin);
+  Commit(*machine, 10, begin);
 
   const MetaStores committed = machine->StoresSnapshot();
   ASSERT_EQ(committed.topology_.ClusterLifecycle().state_,
@@ -543,23 +621,22 @@ TEST_F(MetaStateMachineTest,
   const keylane::meta::MetaFailoverTransition committed_transition =
       *committed_group->failover_transition_;
   EXPECT_EQ(committed_transition.transition_id_, begin.transition_id_);
-  EXPECT_EQ(committed_transition.revision_, 9u);
+  EXPECT_EQ(committed_transition.revision_, 10u);
   EXPECT_EQ(committed_transition.target_term_, 2u);
   EXPECT_FALSE(committed_transition.candidate_action_.has_value());
 
   const auto committed_grant = committed.grant_.GroupState(group_id);
   ASSERT_TRUE(committed_grant.has_value());
   EXPECT_EQ(committed_grant->group_term_, 2u);
-  EXPECT_TRUE(committed_grant->fenced_);
   EXPECT_FALSE(committed_grant->grant_.has_value());
 
-  CreateSnapshot(*machine, /*log_idx=*/9, /*log_term=*/4);
+  CreateSnapshot(*machine, /*log_idx=*/10, /*log_term=*/4);
   machine.reset();
 
   auto reopened = Open();
   ASSERT_TRUE(reopened.ok()) << reopened.status();
   machine = std::move(*reopened);
-  EXPECT_EQ(machine->last_commit_index(), 9u);
+  EXPECT_EQ(machine->last_commit_index(), 10u);
 
   const MetaStores restored = machine->StoresSnapshot();
   const auto restored_group = restored.topology_.FindGroup(group_id);
@@ -570,21 +647,20 @@ TEST_F(MetaStateMachineTest,
   const auto restored_grant = restored.grant_.GroupState(group_id);
   ASSERT_TRUE(restored_grant.has_value());
   EXPECT_EQ(restored_grant->group_term_, 2u);
-  EXPECT_TRUE(restored_grant->fenced_);
   EXPECT_FALSE(restored_grant->grant_.has_value());
 
   // If the Raft core presents the snapshot's final entry again, exact-index
   // replay must validate the installed post-state instead of advancing the
   // term or transition revision a second time.
-  Commit(*machine, 9, begin);
+  Commit(*machine, 10, begin);
   const MetaStores replayed = machine->StoresSnapshot();
   const auto replayed_group = replayed.topology_.FindGroup(group_id);
   ASSERT_TRUE(replayed_group.has_value());
   ASSERT_TRUE(replayed_group->failover_transition_.has_value());
   EXPECT_EQ(*replayed_group->failover_transition_, committed_transition);
   EXPECT_EQ(replayed_group->record_.group_term_, 2u);
-  EXPECT_EQ(replayed.audit_.size(), 9u);
-  EXPECT_EQ(machine->last_commit_index(), 9u);
+  EXPECT_EQ(replayed.audit_.size(), 10u);
+  EXPECT_EQ(machine->last_commit_index(), 10u);
 
   keylane::meta::MetaBootIncarnation boot{};
   boot.fill(0x61);
@@ -600,11 +676,11 @@ TEST_F(MetaStateMachineTest,
   keylane::meta::SetUncontrolledCandidate select;
   select.request_id_ = MakeRequestId(0x52);
   select.group_id_ = group_id;
-  select.expected_transition_ = {begin.transition_id_, 9};
+  select.expected_transition_ = {begin.transition_id_, 10};
   select.candidate_action_ = selected_action;
 
   ScopedLogCapture logs;
-  Commit(*machine, 10, select);
+  Commit(*machine, 11, select);
   const std::string selected_log = logs.Take();
   EXPECT_NE(selected_log.find("failover event=candidate-selected"),
             std::string::npos);
@@ -616,9 +692,9 @@ TEST_F(MetaStateMachineTest,
 
   // State-dependent candidate event classification cannot be reconstructed
   // after the previous action is overwritten. Exact post-effect replay is
-  // therefore intentionally silent instead of relabelling index 10 as a
+  // therefore intentionally silent instead of relabelling index 11 as a
   // replacement.
-  Commit(*machine, 10, select);
+  Commit(*machine, 11, select);
   EXPECT_EQ(logs.Take().find("failover event="), std::string::npos);
 
   keylane::meta::MetaFailoverCandidateAction fallback_action = selected_action;
@@ -626,12 +702,12 @@ TEST_F(MetaStateMachineTest,
   fallback_action.domain_.source_history_id_.fill(0x63);
   keylane::meta::SetUncontrolledCandidate fallback = select;
   fallback.request_id_ = MakeRequestId(0x54);
-  fallback.expected_transition_.revision_ = 10;
+  fallback.expected_transition_.revision_ = 11;
   fallback.candidate_action_ = fallback_action;
-  Commit(*machine, 11, fallback);
+  Commit(*machine, 12, fallback);
   EXPECT_NE(logs.Take().find("failover event=domain-fallback"),
             std::string::npos);
-  Commit(*machine, 11, fallback);
+  Commit(*machine, 12, fallback);
   EXPECT_EQ(logs.Take().find("failover event="), std::string::npos);
 }
 
@@ -678,7 +754,7 @@ TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
   ASSERT_NE(c5, nullptr);
 
   keylane::meta::MetaAuditRecord record4_before;
-  keylane::meta::MetaHash256 chain_head_before{};
+  std::string audit_before;
   {
     auto opened = Open();
     ASSERT_TRUE(opened.ok()) << opened.status();
@@ -693,8 +769,8 @@ TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
     ASSERT_EQ(stores.audit_.size(), 5u);
     const auto record4 = stores.audit_.Find(4);
     ASSERT_TRUE(record4.has_value());
-    record4_before = record4->record_;
-    chain_head_before = stores.audit_.chain_head();
+    record4_before = *record4;
+    audit_before = *stores.audit_.Serialize();
   }
 
   // Crash without a newer snapshot: reopen restores @3; the core replays 4..5.
@@ -713,9 +789,8 @@ TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
   EXPECT_EQ(stores.audit_.size(), 5u);
   const auto record4 = stores.audit_.Find(4);
   ASSERT_TRUE(record4.has_value());
-  EXPECT_EQ(record4->record_, record4_before);
-  EXPECT_EQ(stores.audit_.chain_head(), chain_head_before);
-  EXPECT_TRUE(stores.audit_.VerifyChain());
+  EXPECT_EQ(*record4, record4_before);
+  EXPECT_EQ(*stores.audit_.Serialize(), audit_before);
 }
 
 TEST_F(MetaStateMachineTest, LogicalSnapshotTransmissionRoundTrip) {
@@ -765,9 +840,8 @@ TEST_F(MetaStateMachineTest, LogicalSnapshotTransmissionRoundTrip) {
     EXPECT_TRUE(follower_stores.topology_.GroupExists("g1"));
     EXPECT_EQ(follower_stores.topology_.TopologyEpoch(), 1u);
     EXPECT_EQ(follower_stores.audit_.size(), 3u);
-    EXPECT_EQ(follower_stores.audit_.chain_head(),
-              leader_stores.audit_.chain_head());
-    EXPECT_TRUE(follower_stores.audit_.VerifyChain());
+    EXPECT_EQ(follower_stores.audit_.Serialize(),
+              leader_stores.audit_.Serialize());
   }
   EXPECT_EQ(follower->last_commit_index(), 3u);
 
@@ -1103,7 +1177,6 @@ TEST_F(MetaServerIntegrationTest, SnapshotCompactionAndRestart) {
   OpenStorage();
   EXPECT_EQ(machine_->last_commit_index(), snapshot_index);
   EXPECT_EQ(NodeCount(), 9u);
-  EXPECT_TRUE(machine_->StoresSnapshot().audit_.VerifyChain());
   nuraft::ptr<nuraft::log_store> reopened_store = mgr_->load_log_store();
   EXPECT_EQ(reopened_store->start_index(), snapshot_index + 1);
 

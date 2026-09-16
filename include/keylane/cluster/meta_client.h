@@ -172,6 +172,13 @@ class MetaLeaseChallengeRotation {
 
 namespace detail {
 
+// A lease challenge names the exact resolved duration in the installed FDS.
+// Meta must echo that scalar unchanged; accepting a shorter value would make
+// the installed projection and Data's finite authority describe different
+// contracts.
+absl::Status ValidateResolvedLeaseGrantDuration(
+    std::uint32_t granted_duration_ms, std::uint32_t challenged_duration_ms);
+
 enum class MetaTransferAbortDisposition : std::uint8_t {
   kFailSession,
   kContinueAuthenticatedSession,

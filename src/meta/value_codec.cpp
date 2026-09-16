@@ -17,21 +17,6 @@ absl::StatusOr<ActorContext> ReadActorContext(MetaReader& reader) {
   return ActorContext{std::string(*principal), std::string(*readable_time)};
 }
 
-void WriteMetaPolicyReference(MetaWriter& writer,
-                              const MetaPolicyReference& reference) {
-  writer.WriteString(reference.policy_id_);
-  writer.WriteU64(reference.version_);
-}
-
-absl::StatusOr<MetaPolicyReference> ReadMetaPolicyReference(
-    MetaReader& reader) {
-  auto policy_id = reader.ReadString(kMaxMetaPolicyIdBytes);
-  if (!policy_id.ok()) return policy_id.status();
-  auto version = reader.ReadU64();
-  if (!version.ok()) return version.status();
-  return MetaPolicyReference{std::string(*policy_id), *version};
-}
-
 void WriteMetaEvidenceSummary(MetaWriter& writer,
                               const MetaEvidenceSummary& evidence) {
   writer.WriteString(evidence.node_id_);
@@ -44,7 +29,6 @@ void WriteMetaEvidenceSummary(MetaWriter& writer,
   writer.WriteU64(evidence.partition_replication_epoch_);
   WriteFixedArray(writer, evidence.replication_history_id_);
   WriteFixedArray(writer, evidence.operation_id_);
-  WriteFixedArray(writer, evidence.kind_hash_);
 }
 
 absl::StatusOr<MetaEvidenceSummary> ReadMetaEvidenceSummary(
@@ -76,8 +60,6 @@ absl::StatusOr<MetaEvidenceSummary> ReadMetaEvidenceSummary(
   if (!replication_history_id.ok()) return replication_history_id.status();
   auto operation_id = ReadFixedArray<16>(reader);
   if (!operation_id.ok()) return operation_id.status();
-  auto kind_hash = ReadFixedArray<32>(reader);
-  if (!kind_hash.ok()) return kind_hash.status();
 
   MetaEvidenceSummary evidence;
   evidence.node_id_ = std::string(*node_id);
@@ -90,7 +72,6 @@ absl::StatusOr<MetaEvidenceSummary> ReadMetaEvidenceSummary(
   evidence.partition_replication_epoch_ = *partition_replication_epoch;
   evidence.replication_history_id_ = *replication_history_id;
   evidence.operation_id_ = *operation_id;
-  evidence.kind_hash_ = *kind_hash;
   return evidence;
 }
 
@@ -108,8 +89,6 @@ void WriteMetaDirectiveSpec(MetaWriter& writer,
   WriteFixedArray(writer, directive.source_replication_history_id_);
   writer.WriteString(directive.group_id_);
   writer.WriteU64(directive.group_term_);
-  writer.WriteU64(directive.authority_version_);
-  writer.WriteU64(directive.grant_revision_);
   writer.WriteU64(directive.population_manifest_revision_);
   WriteFixedArray(writer, directive.population_manifest_digest_);
   writer.WriteU64(directive.partition_replication_epoch_);
@@ -158,12 +137,6 @@ absl::StatusOr<MetaDirectiveSpec> ReadMetaDirectiveSpec(MetaReader& reader) {
   auto group_term = reader.ReadU64();
   if (!group_term.ok()) return group_term.status();
   directive.group_term_ = *group_term;
-  auto authority_version = reader.ReadU64();
-  if (!authority_version.ok()) return authority_version.status();
-  directive.authority_version_ = *authority_version;
-  auto grant_revision = reader.ReadU64();
-  if (!grant_revision.ok()) return grant_revision.status();
-  directive.grant_revision_ = *grant_revision;
   auto manifest_revision = reader.ReadU64();
   if (!manifest_revision.ok()) return manifest_revision.status();
   directive.population_manifest_revision_ = *manifest_revision;

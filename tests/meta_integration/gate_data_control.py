@@ -47,7 +47,6 @@ DATA_NODE = "1111111111111111111111111111111111111111"
 BAD_DATA_NODE = "2222222222222222222222222222222222222222"
 OTHER_DATA_NODE = "3333333333333333333333333333333333333333"
 GROUP = "gate-group"
-POLICY = "gate-lease"
 DATA_FILE_BYTES = 128 * 1024 * 1024
 
 
@@ -209,6 +208,7 @@ class DataProcess:
         if not self.alive():
             self._close_log()
             return
+        self.resume()
         self.proc.send_signal(signal.SIGINT)
         try:
             code = self.proc.wait(timeout=30)
@@ -229,8 +229,20 @@ class DataProcess:
                 "flush")
         H.log(f"Data node {self.node_id[:8]}: clean exit 0")
 
+    def pause(self):
+        if not self.alive():
+            raise H.Failure(
+                f"Data node {self.node_id[:8]} is not running")
+        H.log(f"Data node {self.node_id[:8]}: SIGSTOP")
+        self.proc.send_signal(signal.SIGSTOP)
+
+    def resume(self):
+        if self.alive():
+            self.proc.send_signal(signal.SIGCONT)
+
     def force_kill(self):
         if self.alive():
+            self.resume()
             self.proc.kill()
             self.proc.wait(timeout=10)
         self._close_log()
@@ -268,13 +280,10 @@ def seed_assigned_authority(leader, data):
     expect_commit(leader.assignnode(GROUP, data.node_id),
                   "assign Data node")
     expect_commit(leader.begingroupterm(GROUP, 0, 1), "begin group term")
-    expect_commit(leader.putpolicy(POLICY, 1, "lease-v1"),
-                  "commit lease policy")
-    expect_commit(leader.setslotmap(0, 16383, GROUP, 1),
+    expect_commit(leader.setslotmap(0, 16383, GROUP),
                   "assign all slots")
     return expect_commit(
-        leader.activateauthority(GROUP, 1, data.node_id, 5000,
-                                 POLICY, 1, 1, 1),
+        leader.activateauthority(GROUP, 1, data.node_id),
         "activate authority")
 
 
@@ -349,6 +358,8 @@ def run_plaintext(meta_binary, data_binary, workdir):
         follower = next(node for node in nodes if node.id != leader.id)
         data = DataProcess(data_binary, os.path.join(scenario, "data"),
                            DATA_NODE, follower.data_control_endpoint)
+        expect_commit(leader.put_authority_lease_policy(1),
+                      "commit Authority Lease Policy")
         register_data_node(leader, data)
         seeded_through = seed_assigned_authority(leader, data)
         H.wait_until(
@@ -548,6 +559,8 @@ def run_mtls(meta_binary, data_binary, workdir):
     try:
         meta.start(bootstrap=True)
         meta.wait_leader()
+        expect_commit(meta.put_authority_lease_policy(1),
+                      "commit Authority Lease Policy")
 
         bad_data = DataProcess(
             data_binary, os.path.join(scenario, "data-wrong-uri"),

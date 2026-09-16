@@ -300,6 +300,16 @@ TEST(MetaLeaseChallengeRotationTest, HandlesProjectionReplacementAndNoOwner) {
       replacement, "2222222222222222222222222222222222222222"));
 }
 
+TEST(MetaLeaseGrantValidationTest, RequiresExactResolvedFdsDuration) {
+  EXPECT_TRUE(detail::ValidateResolvedLeaseGrantDuration(5000, 5000).ok());
+  EXPECT_EQ(detail::ValidateResolvedLeaseGrantDuration(300, 5000).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(detail::ValidateResolvedLeaseGrantDuration(6000, 5000).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(detail::ValidateResolvedLeaseGrantDuration(0, 0).code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
 TEST(MetaLeaseChallengeRotationTest,
      FencedUncontrolledHistoricalOwnerMayReportCandidateProgress) {
   constexpr char kLocal[] = "1111111111111111111111111111111111111111";
@@ -486,9 +496,7 @@ TEST(MetaDirectiveValidationTest,
                 .projection_hash = control::ComputeSha256("projection")},
       .authority = {.group_id = "group-a",
                     .assignment_id = {},
-                    .group_term = 3,
-                    .authority_version = 4,
-                    .grant_revision = 5},
+                    .group_term = 3},
       .identity = {.operation_id = {},
                    .directive_id = {},
                    .attempt_id = {},
@@ -551,8 +559,6 @@ TEST(MetaDirectiveValidationTest,
       .owner_node_id = kRemote,
       .owner_assignment_id = remote_assignment,
       .group_term = projected.authority.group_term,
-      .authority_version = projected.authority.authority_version,
-      .grant_revision = projected.authority.grant_revision,
       .partition_replication_epoch = projected.partition_replication_epoch,
   });
   desired.current_directives.push_back(projected);
@@ -669,14 +675,14 @@ TEST(MetaDirectiveValidationTest,
   desired.current_directives.front().recipient_boot_id = kLocalBoot;
   desired.current_directives.front().target_boot_id = kLocalBoot;
 
-  control::Directive stale_initialize_authority = initialize;
-  --stale_initialize_authority.authority.authority_version;
+  control::Directive stale_initialize_term = initialize;
+  --stale_initialize_term.authority.group_term;
   desired.current_directives.front().authority =
-      stale_initialize_authority.authority;
-  EXPECT_EQ(ValidateLiveDirective(stale_initialize_authority, desired, kLocal,
-                                  kLocalBoot)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
+      stale_initialize_term.authority;
+  EXPECT_EQ(
+      ValidateLiveDirective(stale_initialize_term, desired, kLocal, kLocalBoot)
+          .code(),
+      absl::StatusCode::kFailedPrecondition);
   desired.current_directives.front().authority = initialize.authority;
 
   initialize.source_node_id = kRemote;
@@ -733,9 +739,6 @@ TEST(MetaFailoverControlAdapterTest,
           {
               .group_id_ = "group-a",
               .group_term_ = 8,
-              .authority_version_ = 12,
-              .grant_revision_ = 14,
-              .config_epoch_ = 16,
               .manifest_revision_ = 18,
               .manifest_digest_ = manifest,
               .partition_replication_epoch_ = 20,
@@ -752,9 +755,6 @@ TEST(MetaFailoverControlAdapterTest,
               .assignment_id_ = AssignmentId::FromBytes(source_assignment),
           },
       .grant_active_ = true,
-      .grant_duration_ms_ = 5000,
-      .grant_policy_id_ = "default",
-      .grant_policy_version_ = 3,
       // A prior failover's action remains bound to the current owner's grant
       // while this new candidate action is prepared.
       .activation_action_id_ =
@@ -1097,8 +1097,6 @@ TEST(MetaFailoverHeartbeatTest, ProjectsExactPreparedContext) {
   action_id[0] = 0x22;
   ClusterPreparedContextId context_id{};
   context_id[0] = 0x33;
-  ClusterPreparedContextHash context_hash{};
-  context_hash[0] = 0x44;
   control::WireId128 assignment{};
   assignment[0] = 0x55;
   constexpr char kCandidate[] = "2222222222222222222222222222222222222222";
@@ -1121,7 +1119,6 @@ TEST(MetaFailoverHeartbeatTest, ProjectsExactPreparedContext) {
               .transition_id_ = transition_id,
               .action_id_ = action_id,
               .context_id_ = context_id,
-              .context_hash_ = context_hash,
               .promotion_ = {.parent_history_id_ = kSourceHistory},
           },
   };
@@ -1138,7 +1135,6 @@ TEST(MetaFailoverHeartbeatTest, ProjectsExactPreparedContext) {
   EXPECT_EQ(prepared->candidate_assignment_id, assignment);
   EXPECT_EQ(prepared->candidate_boot_id, kCandidateBoot);
   EXPECT_EQ(prepared->prepared_context_id, context_id);
-  EXPECT_EQ(prepared->prepared_context_hash, context_hash);
 }
 
 TEST(MetaFailoverHeartbeatTest, ProjectsOnlyAnExactStableSourcePause) {
@@ -1210,7 +1206,7 @@ TEST(MetaFailoverHeartbeatTest, ProjectsFailureFromTheExactActionPopulation) {
   action_id[0] = 0x62;
   control::WireId128 assignment{};
   assignment[0] = 0x63;
-  ClusterPreparedContextHash manifest{};
+  control::WireHash256 manifest{};
   manifest[0] = 0x64;
   constexpr char kCandidate[] = "6666666666666666666666666666666666666666";
   constexpr char kCandidateBoot[] = "7777777777777777777777777777777777777777";
@@ -1308,9 +1304,6 @@ TEST(MetaFailoverHeartbeatTest,
       .owner_node_id = std::string(kSource),
       .owner_assignment_id = source_assignment,
       .group_term = 8,
-      .authority_version = 3,
-      .grant_revision = 4,
-      .grant_duration_ms = 5000,
       .grant_active = true,
       .manifest_revision = 10,
       .manifest_digest = manifest,
@@ -1504,8 +1497,6 @@ TEST(MetaAuthorityIdentityTest, UsesVersionedUnambiguousEncoding) {
       .group_id_ = "group:/with:separators",
       .assignment_id_ = AssignmentId::FromBytes({}),
       .group_term_ = 1,
-      .authority_version_ = 23,
-      .grant_revision_ = 4,
   };
   AuthorityAnchor second = first;
   second.group_id_ = "group";

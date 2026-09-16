@@ -69,6 +69,8 @@ def main():
         history = H.CommittedHistory()
 
         # --- phase 1: committed anchors ----------------------------------
+        expect_ok(leader.put_authority_lease_policy(1),
+                  "put Authority Lease Policy")
         expect_ok(leader.registernode(DATA_NODE, f"keylane://node/{DATA_NODE}",
                                       "primary",
                                       endpoints=("tcp://127.0.0.1:6379",)),

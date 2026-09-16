@@ -53,6 +53,34 @@ class Failure(Exception):
 _TAG = "meta-integration"
 _ALLOCATED_PORTS = set()
 
+AUTOMATIC_UNCONTROLLED_FAILOVER_POLICY_ID = (
+    "keylane.automatic-uncontrolled-failover-v1")
+AUTHORITY_LEASE_POLICY_ID = "keylane.authority-lease-v1"
+
+
+def automatic_uncontrolled_failover_policy(enabled=True,
+                                           suspect_after_ms=5000):
+    """Return the strict compact JSON accepted by the registered family."""
+    if not isinstance(enabled, bool):
+        raise ValueError("automatic failover enabled must be bool")
+    if (not isinstance(suspect_after_ms, int) or
+            isinstance(suspect_after_ms, bool) or
+            not 1000 <= suspect_after_ms <= 86_400_000):
+        raise ValueError("automatic failover suspect_after_ms is out of range")
+    enabled_json = "true" if enabled else "false"
+    return ("{\"kind\":\"automatic-uncontrolled-failover-v1\","
+            f"\"enabled\":{enabled_json},"
+            f"\"suspect_after_ms\":{suspect_after_ms}}}")
+
+
+def authority_lease_policy(duration_ms=5000):
+    """Return the strict compact JSON accepted by the registered family."""
+    if (not isinstance(duration_ms, int) or isinstance(duration_ms, bool) or
+            not 100 <= duration_ms <= 86_400_000):
+        raise ValueError("authority lease duration_ms is out of range")
+    return ("{\"kind\":\"authority-lease-v1\","
+            f"\"duration_ms\":{duration_ms}}}")
+
 
 def set_tag(tag):
     global _TAG
@@ -372,18 +400,34 @@ class Node:
         return self.ctl(f"putpolicy {policy_id} {version} {content}",
                         timeout=timeout)
 
-    def setslotmap(self, first, last, group_id, config_epoch, timeout=5.0):
+    def put_automatic_uncontrolled_failover_policy(
+            self, version, enabled=True, suspect_after_ms=5000,
+            timeout=5.0):
+        return self.putpolicy(
+            AUTOMATIC_UNCONTROLLED_FAILOVER_POLICY_ID, version,
+            automatic_uncontrolled_failover_policy(
+                enabled=enabled, suspect_after_ms=suspect_after_ms),
+            timeout=timeout)
+
+    def put_authority_lease_policy(self, version, duration_ms=5000,
+                                   timeout=5.0):
+        return self.putpolicy(
+            AUTHORITY_LEASE_POLICY_ID, version,
+            authority_lease_policy(duration_ms), timeout=timeout)
+
+    def getpolicy(self, policy_id):
+        return self.ctl(f"getpolicy {policy_id}")
+
+    def setslotmap(self, first, last, group_id, timeout=5.0):
         return self.ctl(
-            f"setslotmap {first} {last} {group_id} {config_epoch}",
+            f"setslotmap {first} {last} {group_id}",
             timeout=timeout)
 
     def activateauthority(self, group_id, expected_term, owner_node_id,
-                          lease_ms, policy_id, policy_version,
-                          authority_version, config_epoch, timeout=5.0):
+                          timeout=5.0):
         return self.ctl(
-            f"activateauthority {group_id} {expected_term} {owner_node_id} "
-            f"{lease_ms} {policy_id} {policy_version} "
-            f"{authority_version} {config_epoch}", timeout=timeout)
+            f"activateauthority {group_id} {expected_term} {owner_node_id}",
+            timeout=timeout)
 
     def fencegroup(self, group_id, expected_term, timeout=5.0):
         return self.ctl(f"fencegroup {group_id} {expected_term}",

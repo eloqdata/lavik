@@ -600,6 +600,8 @@ if (KEYLANE_BUILD_META)
   # peer transport and timers.
   set(KEYLANE_META_CORE_SOURCES
     src/meta/audit_store.cpp
+    src/meta/automatic_failover_detector.cpp
+    src/meta/automatic_failover_reconciler.cpp
     src/meta/candidate_plan.cpp
     src/meta/cluster_create_reconciler.cpp
     src/meta/commands.cpp
@@ -616,6 +618,7 @@ if (KEYLANE_BUILD_META)
     src/meta/identity_store.cpp
     src/meta/membership_reconciler.cpp
     src/meta/observation_store.cpp
+    src/meta/owner_serviceability.cpp
     src/meta/operation_store.cpp
     src/meta/policy_store.cpp
     src/meta/population_manifest_store.cpp
@@ -824,6 +827,9 @@ if (BUILD_TESTING)
     # test binary stays Raft-free, while this binary also links the data module
     # for explicit Meta-projection-to-Data-validation contract tests.
     add_executable(keylane_meta_tests
+      tests/meta_automatic_failover_detector_test.cpp
+      tests/meta_automatic_failover_reconciler_test.cpp
+      tests/meta_hash_test.cpp
       tests/meta_cluster_create_reconciler_test.cpp
       tests/meta_membership_reconciler_test.cpp
       tests/meta_coordinator_test.cpp
@@ -839,6 +845,7 @@ if (BUILD_TESTING)
       tests/meta_journal_test.cpp
       tests/meta_model_test.cpp
       tests/meta_observation_test.cpp
+      tests/meta_owner_serviceability_test.cpp
       tests/meta_security_test.cpp
       tests/meta_state_machine_test.cpp
       tests/meta_store_test.cpp
@@ -1012,6 +1019,51 @@ if (BUILD_TESTING)
             )
           endforeach()
         endif()
+      endif()
+
+      # Automatic failover does not invoke redis-cli. Register its real-process
+      # matrix independently so a build without that optional executable still
+      # exercises detection and transition recovery.
+      if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(automatic_failover_socket_root "${CMAKE_CURRENT_BINARY_DIR}/afs")
+        file(MAKE_DIRECTORY "${automatic_failover_socket_root}")
+        set(KEYLANE_AUTOMATIC_FAILOVER_INTEGRATION_CASES
+          owner-kill
+          owner-pause
+          one-way-partition
+          two-way-partition
+          leader-threshold
+          leader-proposal
+          leader-commit
+        )
+        foreach(automatic_case IN LISTS
+                KEYLANE_AUTOMATIC_FAILOVER_INTEGRATION_CASES)
+          string(REPLACE "-" "_" automatic_test_suffix
+                 "${automatic_case}")
+          set(automatic_workdir
+            "${CMAKE_CURRENT_BINARY_DIR}/meta-integration/automatic-failover/${automatic_case}")
+          file(MAKE_DIRECTORY "${automatic_workdir}")
+          add_test(
+            NAME meta_integration.gate_automatic_failover_${automatic_test_suffix}
+            COMMAND ${CMAKE_COMMAND} -E env
+                    "PYTHONPYCACHEPREFIX=${automatic_workdir}/pycache"
+                    "KEYLANE_FAILOVER_SOCKET_ROOT=${automatic_failover_socket_root}"
+                    ${KEYLANE_PYTHON3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_automatic_failover.py
+                    $<TARGET_FILE:keylane-meta>
+                    $<TARGET_FILE:keylane>
+                    $<TARGET_FILE:keylane-ctl>
+                    --case=${automatic_case}
+                    --require-fault-hook
+          )
+          set_tests_properties(
+            meta_integration.gate_automatic_failover_${automatic_test_suffix}
+            PROPERTIES
+            LABELS "meta-integration;failover;automatic-failover"
+            TIMEOUT 180
+            RUN_SERIAL TRUE
+          )
+        endforeach()
       endif()
     else()
       message(STATUS "python3 not found; meta integration tests are disabled")

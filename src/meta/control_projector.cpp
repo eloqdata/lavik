@@ -244,7 +244,6 @@ absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
 }
 
 using ManifestReference = std::pair<std::uint64_t, MetaHash256>;
-using PolicyReference = std::pair<std::string, std::uint64_t>;
 
 absl::Status AddManifestReference(std::uint64_t revision,
                                   const MetaHash256& digest,
@@ -291,8 +290,6 @@ absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
   result.authority.group_id = source.group_id_;
   result.authority.assignment_id = source.assignment_id_;
   result.authority.group_term = source.group_term_;
-  result.authority.authority_version = source.authority_version_;
-  result.authority.grant_revision = source.grant_revision_;
   result.identity.operation_id = operation.operation_id_;
   result.identity.directive_id = source.directive_id_;
   result.identity.attempt_id = source.attempt_id_;
@@ -330,8 +327,6 @@ bool SameClusterCreateRebuildScope(const MetaDirectiveSpec& authorize,
              rebuild.source_replication_history_id_ &&
          authorize.group_id_ == rebuild.group_id_ &&
          authorize.group_term_ == rebuild.group_term_ &&
-         authorize.authority_version_ == rebuild.authority_version_ &&
-         authorize.grant_revision_ == rebuild.grant_revision_ &&
          authorize.population_manifest_revision_ ==
              rebuild.population_manifest_revision_ &&
          authorize.population_manifest_digest_ ==
@@ -341,10 +336,10 @@ bool SameClusterCreateRebuildScope(const MetaDirectiveSpec& authorize,
          authorize.payload_ == rebuild.payload_;
 }
 
-// Cluster creation commits source authorization and target rebuild together
-// so both carry the revision checked by the source handshake. Delivery is
-// nevertheless ordered: the target cannot dial until Meta has durably
-// observed that the source installed the matching authorization.
+// Cluster creation retains the acknowledged source authorization when it
+// commits target rebuilds in a later phase. Their directive revisions are
+// therefore deliberately different; scope equality plus the authorization's
+// own exact terminal-receipt key proves that the target may dial.
 bool ClusterCreateDirectiveReady(const MetaOperationRecord& operation,
                                  const MetaCurrentDirective& current) {
   if (operation.kind_ != kMetaClusterCreateV1GroupOperationKind ||
@@ -356,7 +351,6 @@ bool ClusterCreateDirectiveReady(const MetaOperationRecord& operation,
       operation.current_directives_.end(),
       [&](const MetaCurrentDirective& candidate) {
         return candidate.spec_.kind_ == kMetaDirectiveAuthorizeSource &&
-               candidate.directive_revision_ == current.directive_revision_ &&
                SameClusterCreateRebuildScope(candidate.spec_, current.spec_);
       });
   if (authorize == operation.current_directives_.end()) return false;
@@ -388,6 +382,19 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
   control::FullDesiredState state;
   state.source_meta_applied_index = view.applied_index();
   state.topology_epoch = view.topology().TopologyEpoch();
+  const std::optional<MetaAuthorityLeasePolicy> authority_lease =
+      view.policy().CurrentAuthorityLease();
+  if (!authority_lease.has_value()) {
+    return Inconsistent("current Authority Lease Policy is missing");
+  }
+  if (authority_lease->duration_ms_ == 0 ||
+      authority_lease->duration_ms_ >
+          std::numeric_limits<std::uint32_t>::max()) {
+    return Inconsistent(
+        "current Authority Lease Policy duration is not wire-representable");
+  }
+  state.authority_lease_duration_ms =
+      static_cast<std::uint32_t>(authority_lease->duration_ms_);
 
   for (const MetaMemberRecord& member : view.identity().MetaMembers()) {
     if (member.retired_) continue;
@@ -412,7 +419,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
   }
 
   std::set<ManifestReference> manifest_references;
-  std::set<PolicyReference> policy_references;
   std::map<std::string, std::size_t> group_indices;
   for (const MetaTopologyGroupView& source : view.topology().Groups()) {
     const auto grant = view.grant().GroupState(source.group_id_);
@@ -420,8 +426,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
       return Inconsistent(
           absl::StrCat("group ", source.group_id_, " has no grant state"));
     }
-    if (source.record_.group_term_ != grant->group_term_ ||
-        source.record_.authority_version_ != grant->last_authority_version_) {
+    if (source.record_.group_term_ != grant->group_term_) {
       return Inconsistent(absl::StrCat("group ", source.group_id_,
                                        " topology/grant anchors disagree"));
     }
@@ -429,9 +434,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     control::WireDesiredGroup projected;
     projected.group_id = source.group_id_;
     projected.group_term = source.record_.group_term_;
-    projected.authority_version = source.record_.authority_version_;
-    projected.grant_revision = grant->last_grant_revision_;
-    projected.config_epoch = source.config_epoch_;
     projected.manifest_revision = source.record_.population_manifest_revision_;
     projected.manifest_digest = source.record_.population_manifest_digest_;
     projected.partition_replication_epoch =
@@ -475,17 +477,12 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
 
     if (grant->grant_.has_value()) {
       const MetaGroupGrant& active = *grant->grant_;
-      if (grant->fenced_ || source.record_.owner_.empty() ||
-          active.owner_ != source.record_.owner_ ||
-          active.term_ != source.record_.group_term_ ||
-          active.authority_version_ != source.record_.authority_version_ ||
-          active.grant_revision_ != grant->last_grant_revision_) {
+      if (source.record_.owner_.empty() ||
+          active.owner_ != source.record_.owner_) {
         return Inconsistent(absl::StrCat("group ", source.group_id_,
                                          " active grant is inconsistent"));
       }
-      if (source.record_.group_term_ == 0 ||
-          source.record_.authority_version_ == 0 ||
-          active.grant_revision_ == 0 || source.config_epoch_ == 0) {
+      if (source.record_.group_term_ == 0) {
         return Inconsistent(
             absl::StrCat("group ", source.group_id_,
                          " active grant has incomplete serving authority"));
@@ -494,25 +491,8 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
         return Inconsistent(absl::StrCat("group ", source.group_id_,
                                          " active grant has no owner"));
       }
-      if (active.spec_.lease_duration_ms_ == 0 ||
-          active.spec_.lease_duration_ms_ >
-              std::numeric_limits<std::uint32_t>::max()) {
-        return Invalid(
-            absl::StrCat("group ", source.group_id_,
-                         " lease duration is not wire-representable"));
-      }
       projected.grant_active = true;
       projected.activation_action_id = active.activation_action_id_;
-      projected.grant_revision = active.grant_revision_;
-      projected.grant_duration_ms =
-          static_cast<std::uint32_t>(active.spec_.lease_duration_ms_);
-      projected.grant_policy_id = active.spec_.policy_id_;
-      projected.grant_policy_version = active.spec_.policy_version_;
-      policy_references.emplace(active.spec_.policy_id_,
-                                active.spec_.policy_version_);
-    } else if (!grant->fenced_) {
-      return Inconsistent(absl::StrCat("group ", source.group_id_,
-                                       " is grantless but not fenced"));
     }
 
     if (source.failover_transition_.has_value()) {
@@ -562,11 +542,9 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
 
   for (const MetaOperationRecord& operation :
        view.operation().LiveOperations()) {
-    bool has_directive_for_requested_node = false;
     for (const MetaCurrentDirective& current : operation.current_directives_) {
       if (current.spec_.recipient_node_id_ != node_id) continue;
       if (!ClusterCreateDirectiveReady(operation, current)) continue;
-      has_directive_for_requested_node = true;
       if (const absl::Status anchor =
               ValidateCommittedDirectiveAnchor(view.stores(), current.spec_);
           !anchor.ok()) {
@@ -582,12 +560,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
         return status;
       }
       state.current_directives.push_back(std::move(*directive));
-    }
-    if (has_directive_for_requested_node) {
-      for (const MetaPolicyReference& reference :
-           operation.policy_references_) {
-        policy_references.emplace(reference.policy_id_, reference.version_);
-      }
     }
   }
   std::sort(
@@ -626,26 +598,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     state.manifests.push_back(std::move(projected));
   }
 
-  for (const auto& [policy_id, version] : policy_references) {
-    const auto policy = view.policy().FindVersion(policy_id, version);
-    if (!policy.has_value() || policy->retired_) {
-      return Inconsistent(absl::StrCat("referenced policy ", policy_id,
-                                       " version ", version,
-                                       " is missing or retired"));
-    }
-    if (MetaPolicyStore::ContentHash(policy->content_) !=
-        policy->content_hash_) {
-      return Inconsistent("policy content hash is invalid");
-    }
-    state.policies.push_back({policy->policy_id_, policy->version_,
-                              policy->content_hash_, policy->content_});
-  }
-
-  auto directive_digest =
-      control::ComputeDirectiveSetDigest(state.current_directives);
-  if (!directive_digest.ok()) return directive_digest.status();
-  state.directive_set_digest = *directive_digest;
-
   auto projection_hash = control::ComputeProjectionHash(state);
   if (!projection_hash.ok()) return projection_hash.status();
   state.projection_hash = *projection_hash;
@@ -656,7 +608,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
 
   auto encoded = control::EncodeFullDesiredState(state);
   if (!encoded.ok()) return encoded.status();
-  state.object_hash = control::ComputeSha256(*encoded);
   return NodeControlBatch{std::move(state), std::move(*encoded)};
 }
 
@@ -708,7 +659,6 @@ std::size_t NodeControlBatchRetainedBytes(
     }
     if (group.owner_node_id.has_value()) add_string(*group.owner_node_id);
     add_array(group.slot_ranges.capacity(), sizeof(control::WireSlotRange));
-    add_string(group.grant_policy_id);
     if (group.failover_transition.has_value()) {
       const control::WireFailoverTransition& transition =
           *group.failover_transition;
@@ -727,12 +677,6 @@ std::size_t NodeControlBatchRetainedBytes(
   add_array(state.manifests.capacity(), sizeof(control::WireManifestDocument));
   for (const control::WireManifestDocument& manifest : state.manifests) {
     add_array(manifest.entries.capacity(), sizeof(control::WireManifestEntry));
-  }
-
-  add_array(state.policies.capacity(), sizeof(control::WirePolicy));
-  for (const control::WirePolicy& policy : state.policies) {
-    add_string(policy.policy_id);
-    add_string(policy.content);
   }
 
   add_array(state.current_directives.capacity(),

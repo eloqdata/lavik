@@ -1,54 +1,24 @@
 #pragma once
 
-// MetaPolicyStore is the metadata control plane's committed policy store. It
-// holds versioned policy documents addressed by
-// content hash: policy_id -> version -> {content, content_hash, retired}.
+// MetaPolicyStore owns the small set of versioned, global cluster policies
+// that are part of Meta Committed State. Policy families are compiled in: a
+// caller cannot create a new schema by choosing an arbitrary policy id.
 //
-// Invariants:
-//   - content_hash_ is verified at apply: it must equal SHA-256(content), or
-//     the command is rejected. The
-//     same check runs at snapshot load, fail-stop on mismatch.
-//   - Versions are strictly monotonic per policy_id: a PutPolicy must carry a
-//     version greater than every existing version of that policy (gaps are
-//     legal). An existing version slot is immutable: re-putting the same
-//     version with identical content is an idempotent accept, different
-//     content is a rejection.
-//   - Retired is terminal and content-retaining: RetirePolicy flips the
-//     flag; the version keeps its content (tombstone), still counts against
-//     every cap, and can never be re-put or reactivated.
-//   - State is size-bounded: at most
-//     kMaxMetaPolicyVersionsPerPolicy versions per policy_id and
-//     kMaxMetaPolicyTotalBytes content bytes across all policies (active +
-//     retired). Content must be non-empty so the byte cap also bounds the
-//     version count. Over-cap applies are rejected, never silently
-//     truncated.
+// The raw compact JSON is retained unchanged for administration and exact
+// replay identity. Admission and snapshot restore validate it; consumers use
+// typed current-policy accessors and never parse JSON themselves.
+// Versions start at 1 and are consecutive. Each family retains the newest 32
+// versions; admitting a later version evicts the oldest atomically.
 //
-// Cross-store scope: whether a version is still referenced by an active
-// grant or a non-terminal operation is NOT known here — those references
-// live in the grant and operation stores. This store exposes the facts the
-// apply dispatcher needs for the RetirePolicy guard (IsVersionPresent /
-// IsVersionActive / FindVersion); it performs the cross-store check.
-//
-// Replay idempotency: re-applying a command
-// whose exact post-effect is already present (PutPolicy: same version slot,
-// same content, active; RetirePolicy: version already retired) is an
-// idempotent accept (no-op); conflicting content is a domain rejection.
-//
-// Failure classes: domain rejections return MetaDomainRejectError
-// (kDomainReject); deserialization failures are fail-stop (kFailStop).
-//
-// Scope: pure in-memory function of command + committed state — no IO, no
-// locks, never reads the local clock, never touches observation state.
-//
-// Serialization: u16 schema_version envelope; policies sorted by policy_id,
-// versions ascending; byte output is deterministic so equal states
-// serialize to equal bytes.
+// Failure classes: command validation returns MetaDomainRejectError; corrupt
+// or invariant-breaking snapshot bytes return MetaFailStopError.
 
 #include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -56,65 +26,85 @@
 
 namespace keylane::meta {
 
-// Read view of one policy version.
+inline constexpr std::string_view kAutomaticUncontrolledFailoverPolicyId =
+    "keylane.automatic-uncontrolled-failover-v1";
+inline constexpr std::string_view kAuthorityLeasePolicyId =
+    "keylane.authority-lease-v1";
+
+inline constexpr std::uint64_t kMinimumAutomaticFailoverSuspectAfterMs = 1'000;
+inline constexpr std::uint64_t kMaximumAutomaticFailoverSuspectAfterMs =
+    86'400'000;
+inline constexpr std::uint64_t kDefaultAutomaticFailoverSuspectAfterMs = 5'000;
+inline constexpr bool kDefaultAutomaticFailoverEnabled = true;
+
+inline constexpr std::uint64_t kMinimumAuthorityLeaseDurationMs = 100;
+inline constexpr std::uint64_t kMaximumAuthorityLeaseDurationMs = 86'400'000;
+inline constexpr std::uint64_t kDefaultAuthorityLeaseDurationMs = 5'000;
+
+struct MetaAutomaticUncontrolledFailoverPolicy {
+  std::uint64_t version_ = 0;
+  bool enabled_ = false;
+  std::uint64_t suspect_after_ms_ = 0;
+  bool operator==(const MetaAutomaticUncontrolledFailoverPolicy&) const =
+      default;
+};
+
+struct MetaAuthorityLeasePolicy {
+  std::uint64_t version_ = 0;
+  std::uint64_t duration_ms_ = 0;
+  bool operator==(const MetaAuthorityLeasePolicy&) const = default;
+};
+
+// Strict decoders for the two registered raw formats. They accept field
+// reordering but reject whitespace, missing/duplicate/unknown fields, escaped
+// names and values, non-integer numbers, overflow, and values outside the
+// documented range. The returned version is zero until installed in a store.
+absl::StatusOr<MetaAutomaticUncontrolledFailoverPolicy>
+DecodeAutomaticUncontrolledFailoverPolicy(std::string_view raw);
+absl::StatusOr<MetaAuthorityLeasePolicy> DecodeAuthorityLeasePolicy(
+    std::string_view raw);
+
 struct MetaPolicyVersionView {
   std::string policy_id_;
   std::uint64_t version_ = 0;
   std::string content_;
-  MetaHash256 content_hash_{};
-  bool retired_ = false;
   bool operator==(const MetaPolicyVersionView&) const = default;
 };
 
 class MetaPolicyStore {
  public:
-  // SHA-256 of a policy document. Proposers use it to build PutPolicy
-  // commands; the store uses the same function to verify content_hash_ at
-  // apply and snapshot load.
-  static MetaHash256 ContentHash(std::string_view content);
-
-  // Domain-validated apply of the policy commands. Each returns
-  // absl::OkStatus() on apply or idempotent accept, and a kDomainReject
-  // status otherwise; state is unchanged on rejection.
+  // Applies a fully validated document, or accepts an exact same-version raw
+  // replay. Every rejection leaves history and byte accounting unchanged.
   absl::Status Apply(const PutPolicy& cmd);
-  absl::Status Apply(const RetirePolicy& cmd);
 
-  // Fact queries for the apply dispatcher's RetirePolicy reference guard and
-  // for reads. "Present" means the version slot exists, active or
-  // retired; "active" means present and not retired.
-  bool IsVersionPresent(const std::string& policy_id,
-                        std::uint64_t version) const;
-  bool IsVersionActive(const std::string& policy_id,
-                       std::uint64_t version) const;
+  // Historical lookup covers only retained versions; an evicted, unknown, or
+  // absent family returns nullopt. Versions() is family-id then version ordered
+  // and returns independent raw-document copies.
   std::optional<MetaPolicyVersionView> FindVersion(const std::string& policy_id,
                                                    std::uint64_t version) const;
-  // Highest version of the policy, any status; nullopt when unknown.
   std::optional<std::uint64_t> LatestVersion(
       const std::string& policy_id) const;
   std::vector<MetaPolicyVersionView> Versions() const;
-  // Content bytes across all versions of all policies, including retired
-  // tombstones (they occupy state until the state itself is compacted).
+
+  // Decodes the newest retained raw document into its registered schema.
+  // nullopt means the required family is absent or internal state is invalid;
+  // Created-state validation treats either condition as fail-stop corruption.
+  std::optional<MetaAutomaticUncontrolledFailoverPolicy>
+  CurrentAutomaticUncontrolledFailover() const;
+  std::optional<MetaAuthorityLeasePolicy> CurrentAuthorityLease() const;
+
+  // Aggregate retained raw bytes and number of installed registered families.
   std::uint64_t TotalContentBytes() const { return total_content_bytes_; }
   std::size_t PolicyCount() const { return policies_.size(); }
 
-  // Snapshot support: u16 schema_version envelope, deterministic bytes.
-  // Serialize cannot fail (state is bounded and hash-valid by
-  // construction). Deserialize is strict and every failure is fail-stop,
-  // including in-byte invariant violations (hash mismatch, non-increasing
-  // versions, cap overflow).
+  // Current snapshot format: schema marker, sorted registered families, and
+  // ascending (version, raw) history. No content hash or retired tombstone is
+  // encoded. Old layouts are intentionally unsupported.
   std::string Serialize() const;
   static absl::StatusOr<MetaPolicyStore> Deserialize(std::string_view bytes);
 
  private:
-  struct VersionState {
-    std::string content_;
-    MetaHash256 content_hash_{};
-    bool retired_ = false;
-  };
-
-  // policy_id -> (version -> state); both maps sorted for deterministic
-  // serialization.
-  std::map<std::string, std::map<std::uint64_t, VersionState>> policies_;
+  std::map<std::string, std::map<std::uint64_t, std::string>> policies_;
   std::uint64_t total_content_bytes_ = 0;
 };
 

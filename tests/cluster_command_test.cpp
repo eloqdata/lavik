@@ -44,7 +44,7 @@ cluster::NodeId ParseNodeId(std::string_view id) {
 cluster::NodeDescriptor MakeNode(std::string_view id, std::string_view host,
                                  std::uint16_t port, std::uint16_t tls_port,
                                  cluster::NodeIndex primary_node_index,
-                                 std::uint64_t config_epoch,
+                                 std::uint64_t group_term,
                                  bool link_connected = true) {
   cluster::NodeDescriptor node;
   node.node_id_ = ParseNodeId(id);
@@ -52,18 +52,20 @@ cluster::NodeDescriptor MakeNode(std::string_view id, std::string_view host,
   node.port_ = port;
   node.tls_port_ = tls_port;
   node.primary_node_index_ = primary_node_index;
-  node.config_epoch_ = config_epoch;
+  node.group_term_ = group_term;
   node.link_connected_ = link_connected;
   return node;
 }
 
 cluster::GroupView MakeGroup(std::string_view group_id,
                              cluster::NodeIndex primary_node_index,
+                             std::uint64_t group_term,
                              std::vector<cluster::NodeIndex> replica_indices,
                              std::vector<cluster::SlotRange> ranges) {
   cluster::GroupView group;
   group.group_id_ = std::string(group_id);
   group.primary_node_index_ = primary_node_index;
+  group.group_term_ = group_term;
   group.replica_node_indices_ = std::move(replica_indices);
   group.slot_ranges_ = std::move(ranges);
   return group;
@@ -89,15 +91,15 @@ std::shared_ptr<const cluster::ServingState> BuildThreeNodeState(
   builder.AddNode(
       MakeNode(kNodeB, "127.0.0.2", 7001, 17002, cluster::kNoNodeIndex, 2));
   builder.AddNode(MakeNode(kNodeR, "127.0.0.3", 7002, 17003, kNodeAIndex, 1));
-  cluster::GroupView group_a = MakeGroup("group-a", kNodeAIndex, {kNodeRIndex},
-                                         {cluster::SlotRange{0, 100}});
+  cluster::GroupView group_a = MakeGroup(
+      "group-a", kNodeAIndex, 1, {kNodeRIndex}, {cluster::SlotRange{0, 100}});
   group_a.mutations_paused_ = pause_group_a;
   builder.AddGroup(std::move(group_a));
   const std::uint16_t last =
       full_coverage ? static_cast<std::uint16_t>(cluster::kSlotCount - 1)
                     : static_cast<std::uint16_t>(200);
-  builder.AddGroup(
-      MakeGroup("group-b", kNodeBIndex, {}, {cluster::SlotRange{101, last}}));
+  builder.AddGroup(MakeGroup("group-b", kNodeBIndex, 2, {},
+                             {cluster::SlotRange{101, last}}));
   auto state = builder.Build();
   EXPECT_TRUE(state.ok()) << state.status();
   return state.ok() ? std::move(*state) : nullptr;
@@ -114,10 +116,10 @@ std::shared_ptr<const cluster::ServingState> BuildCompactionState() {
   builder.AddNode(MakeNode(kNodeB, "127.0.0.2", 7001, 17002,
                            cluster::kNoNodeIndex, 2, false));
   builder.AddGroup(
-      MakeGroup("group-a", kNodeAIndex, {},
+      MakeGroup("group-a", kNodeAIndex, 1, {},
                 {cluster::SlotRange{10, 10}, cluster::SlotRange{5, 5},
                  cluster::SlotRange{7, 9}}));
-  builder.AddGroup(MakeGroup("group-b", kNodeBIndex, {},
+  builder.AddGroup(MakeGroup("group-b", kNodeBIndex, 2, {},
                              {cluster::SlotRange{16383, 16383}}));
   auto state = builder.Build();
   EXPECT_TRUE(state.ok()) << state.status();
@@ -531,8 +533,6 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
   ASSERT_TRUE(runtime->node_control_installer_.SetStorageReady(true).ok());
   cluster::Sha256Digest projection_hash{};
   projection_hash.fill(0x11);
-  cluster::Sha256Digest object_hash{};
-  object_hash.fill(0x22);
   const cluster::ProjectionBasis projection{
       .source_meta_applied_index_ = 7,
       .projection_hash_ = projection_hash,
@@ -541,7 +541,6 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
                   .InstallFullState(
                       cluster::PreparedFullState{
                           .serving_state_ = state,
-                          .object_hash_ = object_hash,
                           .control_groups_ = {},
                       },
                       projection)
@@ -563,8 +562,6 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
       .group_id_ = group->group_id_,
       .assignment_id_ = group->assignment_id_,
       .group_term_ = group->group_term_,
-      .authority_version_ = group->authority_version_,
-      .grant_revision_ = group->grant_revision_,
   };
   const auto now = cluster::LeaseClockNow();
   ASSERT_TRUE(runtime->node_control_installer_

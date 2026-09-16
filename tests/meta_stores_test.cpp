@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "gtest/gtest.h"
 #include "keylane/meta/encoding.h"
 #include "keylane/meta/identity_store.h"
@@ -535,7 +536,6 @@ MetaFailoverTransition MakeUncontrolledTransition(std::uint8_t seed) {
   transition.revision_ = 999;  // The store replaces this with the apply index.
   transition.mode_ = MetaFailoverMode::kUncontrolled;
   transition.target_term_ = 8;
-  transition.successor_grant_ = {5000, "failover-policy", 3};
   return transition;
 }
 
@@ -616,12 +616,10 @@ TEST(MetaTopologyStore, CreateGroupCreatesQueryableGroup) {
   ASSERT_TRUE(view.has_value());
   EXPECT_EQ(view->group_id_, "group-a");
   EXPECT_EQ(view->revision_, 1u);
-  EXPECT_EQ(view->config_epoch_, 0u);
   EXPECT_TRUE(view->members_.empty());
   // Freshly created GroupRecord: no owner, all counters zero.
   EXPECT_EQ(view->record_.owner_, "");
   EXPECT_EQ(view->record_.group_term_, 0u);
-  EXPECT_EQ(view->record_.authority_version_, 0u);
   EXPECT_EQ(view->record_.population_manifest_revision_, 0u);
   EXPECT_EQ(view->record_.partition_replication_epoch_, 0u);
 
@@ -714,7 +712,7 @@ TEST(MetaTopologyStore, ReplaceFailoverTransitionUsesExactRevisionCas) {
 
   const MetaFailoverTransitionRef initial_ref{initial.transition_id_, 42};
   MetaFailoverTransition replacement = initial;
-  replacement.successor_grant_.lease_duration_ms_ = 6000;
+  replacement.target_term_ = 9;
   ASSERT_TRUE(
       store.ReplaceFailoverTransition("group-a", initial_ref, replacement, 50)
           .ok());
@@ -728,7 +726,7 @@ TEST(MetaTopologyStore, ReplaceFailoverTransitionUsesExactRevisionCas) {
           .ok());
 
   MetaFailoverTransition conflict = replacement;
-  conflict.successor_grant_.lease_duration_ms_ = 7000;
+  conflict.target_term_ = 10;
   ExpectDomainReject(store.ReplaceFailoverTransition(
       "group-a", MetaFailoverTransitionRef{initial.transition_id_, 49},
       conflict, 51));
@@ -995,15 +993,12 @@ TEST(MetaTopologyStore, RemoveNodeFromGroupRejects) {
 
 using keylane::meta::SetSlotMap;
 
-SetSlotMap MakeSlotMap(
-    std::vector<keylane::meta::MetaSlotAssignment> ranges,
-    std::uint64_t new_topology_epoch,
-    std::vector<keylane::meta::MetaGroupConfigEpoch> config_epochs = {}) {
+SetSlotMap MakeSlotMap(std::vector<keylane::meta::MetaSlotAssignment> ranges,
+                       std::uint64_t new_topology_epoch) {
   SetSlotMap cmd;
   cmd.request_id_ = MakeRequestId(0x90);
   cmd.ranges_ = std::move(ranges);
   cmd.new_topology_epoch_ = new_topology_epoch;
-  cmd.config_epochs_ = std::move(config_epochs);
   return cmd;
 }
 
@@ -1013,12 +1008,12 @@ void MakeTwoGroups(MetaTopologyStore& store) {
   ASSERT_TRUE(store.Apply(MakeCreateGroup("group-b", 2)).ok());
 }
 
-TEST(MetaTopologyStore, SetSlotMapAssignsSlotsAndEpochs) {
+TEST(MetaTopologyStore, SetSlotMapAssignsSlotsAndTopologyEpoch) {
   MetaTopologyStore store;
   MakeTwoGroups(store);
   const SetSlotMap cmd =
       MakeSlotMap({{0, 100, "group-a"}, {200, 300, "group-b"}},
-                  /*new_topology_epoch=*/3, {{"group-a", 11}});
+                  /*new_topology_epoch=*/3);
   ASSERT_TRUE(store.Apply(cmd).ok());
 
   EXPECT_EQ(store.TopologyEpoch(), 3u);
@@ -1030,8 +1025,6 @@ TEST(MetaTopologyStore, SetSlotMapAssignsSlotsAndEpochs) {
   EXPECT_FALSE(store.SlotOwner(301).has_value());
   EXPECT_FALSE(store.SlotOwner(keylane::meta::kMetaSlotCount)
                    .has_value());  // out-of-range query
-  EXPECT_EQ(store.FindGroup("group-a")->config_epoch_, 11u);
-  EXPECT_EQ(store.FindGroup("group-b")->config_epoch_, 0u);
 }
 
 TEST(MetaTopologyStore, SetSlotMapRequiresExactNextEpoch) {
@@ -1071,17 +1064,8 @@ TEST(MetaTopologyStore, SetSlotMapRejectsUnknownGroups) {
   MetaTopologyStore store;
   MakeTwoGroups(store);
   ExpectDomainReject(store.Apply(MakeSlotMap({{0, 100, "group-ghost"}}, 3)));
-  ExpectDomainReject(
-      store.Apply(MakeSlotMap({{0, 100, "group-a"}}, 3, {{"group-ghost", 7}})));
   EXPECT_EQ(store.TopologyEpoch(), 2u);
   EXPECT_FALSE(store.SlotOwner(0).has_value());
-}
-
-TEST(MetaTopologyStore, SetSlotMapRejectsDuplicateConfigEpochEntries) {
-  MetaTopologyStore store;
-  MakeTwoGroups(store);
-  ExpectDomainReject(store.Apply(
-      MakeSlotMap({{0, 100, "group-a"}}, 3, {{"group-a", 7}, {"group-a", 8}})));
 }
 
 TEST(MetaTopologyStore, SetSlotMapIsAbsolute) {
@@ -1107,20 +1091,16 @@ TEST(MetaTopologyStore, SetSlotMapEmptyRangesClearMap) {
 TEST(MetaTopologyStore, SetSlotMapReplayIdempotentAndConflictRejected) {
   MetaTopologyStore store;
   MakeTwoGroups(store);
-  const SetSlotMap cmd =
-      MakeSlotMap({{0, 100, "group-a"}}, 3, {{"group-a", 11}});
+  const SetSlotMap cmd = MakeSlotMap({{0, 100, "group-a"}}, 3);
   ASSERT_TRUE(store.Apply(cmd).ok());
-  // Replay: slot map, epoch, and config epochs already carry this command's
+  // Replay: slot map and topology epoch already carry this command's
   // effect -> idempotent accept.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.TopologyEpoch(), 3u);
 
   // Same epoch, different content -> conflict rejection.
   ExpectDomainReject(store.Apply(MakeSlotMap({{0, 99, "group-a"}}, 3)));
-  ExpectDomainReject(
-      store.Apply(MakeSlotMap({{0, 100, "group-a"}}, 3, {{"group-a", 12}})));
   EXPECT_EQ(store.SlotOwner(100), std::optional<std::string>("group-a"));
-  EXPECT_EQ(store.FindGroup("group-a")->config_epoch_, 11u);
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,42 +1114,34 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
 
   ASSERT_TRUE(store.SetOwner("group-a", MakeNodeId(0x30)).ok());
   ASSERT_TRUE(store.SetGroupTerm("group-a", 7).ok());
-  ASSERT_TRUE(store.SetAuthorityVersion("group-a", 3).ok());
   keylane::meta::MetaHash256 manifest_digest{};
   manifest_digest.fill(0x55);
   ASSERT_TRUE(
       store.SetPopulationManifest("group-a", 555, manifest_digest).ok());
   ASSERT_TRUE(store.SetPartitionReplicationEpoch("group-a", 2).ok());
-  ASSERT_TRUE(store.SetGroupConfigEpoch("group-a", 9).ok());
 
   const auto view = store.FindGroup("group-a");
   EXPECT_EQ(view->record_.owner_, MakeNodeId(0x30));
   EXPECT_EQ(view->record_.group_term_, 7u);
-  EXPECT_EQ(view->record_.authority_version_, 3u);
   EXPECT_EQ(view->record_.population_manifest_revision_, 555u);
   EXPECT_EQ(view->record_.population_manifest_digest_, manifest_digest);
   EXPECT_EQ(view->record_.partition_replication_epoch_, 2u);
-  EXPECT_EQ(view->config_epoch_, 9u);
   // Membership CAS revision untouched by record-field changes.
   EXPECT_EQ(view->revision_, 1u);
 
   // Setting the value already held is an idempotent no-op accept.
   ASSERT_TRUE(store.SetOwner("group-a", MakeNodeId(0x30)).ok());
   ASSERT_TRUE(store.SetGroupTerm("group-a", 7).ok());
-  ASSERT_TRUE(store.SetAuthorityVersion("group-a", 3).ok());
   ASSERT_TRUE(
       store.SetPopulationManifest("group-a", 555, manifest_digest).ok());
   ASSERT_TRUE(store.SetPartitionReplicationEpoch("group-a", 2).ok());
-  ASSERT_TRUE(store.SetGroupConfigEpoch("group-a", 9).ok());
 
   // Unknown groups are rejected by every primitive.
   ExpectDomainReject(store.SetOwner("group-ghost", MakeNodeId(0x30)));
   ExpectDomainReject(store.SetGroupTerm("group-ghost", 7));
-  ExpectDomainReject(store.SetAuthorityVersion("group-ghost", 3));
   ExpectDomainReject(
       store.SetPopulationManifest("group-ghost", 555, manifest_digest));
   ExpectDomainReject(store.SetPartitionReplicationEpoch("group-ghost", 2));
-  ExpectDomainReject(store.SetGroupConfigEpoch("group-ghost", 9));
 }
 
 TEST(MetaTopologyStore, SetTopologyEpochRules) {
@@ -1228,7 +1200,6 @@ MetaTopologyStore MakePopulatedTopology() {
                   .ok());
   EXPECT_TRUE(store.SetOwner("group-a", MakeNodeId(0x10)).ok());
   EXPECT_TRUE(store.SetGroupTerm("group-a", 7).ok());
-  EXPECT_TRUE(store.SetAuthorityVersion("group-a", 3).ok());
   keylane::meta::MetaHash256 manifest_digest{};
   manifest_digest.fill(0x55);
   EXPECT_TRUE(
@@ -1237,8 +1208,7 @@ MetaTopologyStore MakePopulatedTopology() {
   EXPECT_TRUE(
       store
           .Apply(MakeSlotMap({{0, 100, "group-a"}, {200, 300, "group-b"}},
-                             /*new_topology_epoch=*/6,
-                             {{"group-a", 11}, {"group-b", 12}}))
+                             /*new_topology_epoch=*/6))
           .ok());
   return store;
 }
@@ -1363,11 +1333,9 @@ std::string MakeTopologyBlob(
     w.WriteString(group.group_id);
     w.WriteString(group.owner);
     w.WriteU64(0);  // group_term
-    w.WriteU64(0);  // authority_version
     w.WriteU64(0);  // population_manifest_revision
     keylane::meta::WriteFixedArray(w, keylane::meta::MetaHash256{});
     w.WriteU64(0);  // partition_replication_epoch
-    w.WriteU64(0);  // config_epoch
     w.WriteU64(group.revision);
     w.WriteOptional(
         group.encoded_failover_transition,
@@ -1514,19 +1482,10 @@ TEST(MetaTopologyStore, DeserializeRejectsInvariantViolations) {
 // Policy store.
 // ===========================================================================
 
-using keylane::meta::MetaHash256;
+using keylane::meta::kAuthorityLeasePolicyId;
+using keylane::meta::kAutomaticUncontrolledFailoverPolicyId;
 using keylane::meta::MetaPolicyStore;
 using keylane::meta::PutPolicy;
-
-// SHA-256 of `hex`, as bytes, for known-answer tests.
-MetaHash256 HashFromHex(const std::string& hex) {
-  MetaHash256 out{};
-  for (std::size_t i = 0; i < out.size(); ++i) {
-    out[i] = static_cast<std::uint8_t>(
-        std::stoul(hex.substr(i * 2, 2), nullptr, 16));
-  }
-  return out;
-}
 
 PutPolicy MakePut(const std::string& policy_id, std::uint64_t version,
                   std::string content) {
@@ -1535,71 +1494,79 @@ PutPolicy MakePut(const std::string& policy_id, std::uint64_t version,
   cmd.policy_id_ = policy_id;
   cmd.version_ = version;
   cmd.content_ = std::move(content);
-  cmd.content_hash_ = MetaPolicyStore::ContentHash(cmd.content_);
   return cmd;
 }
 
-TEST(MetaPolicyStore, ContentHashMatchesSha256KnownAnswer) {
-  // FIPS 180-4 / RFC 6234 known-answer vectors: the store's hash check is
-  // SHA-256, not an opaque proposer token.
-  EXPECT_EQ(MetaPolicyStore::ContentHash(""),
-            HashFromHex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934c"
-                        "a495991b7852b855"));
-  EXPECT_EQ(MetaPolicyStore::ContentHash("abc"),
-            HashFromHex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9c"
-                        "b410ff61f20015ad"));
-  EXPECT_EQ(MetaPolicyStore::ContentHash(std::string(1000000, 'a')),
-            HashFromHex("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e"
-                        "046d39ccc7112cd0"));
+std::string AutomaticPolicy(bool enabled, std::uint64_t suspect_after_ms) {
+  return absl::StrCat(
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":)",
+      enabled ? "true" : "false", R"(,"suspect_after_ms":)", suspect_after_ms,
+      "}");
 }
 
-TEST(MetaPolicyStore, PutPolicyStoresQueryableVersion) {
+std::string LeasePolicy(std::uint64_t duration_ms) {
+  return absl::StrCat(R"({"kind":"authority-lease-v1","duration_ms":)",
+                      duration_ms, "}");
+}
+
+TEST(MetaPolicyStore, StoresTypedPoliciesAndReturnsOriginalRawBytes) {
   MetaPolicyStore store;
-  const PutPolicy cmd = MakePut("migration-policy", /*version=*/1,
-                                "{\"phases\":[\"prepare\",\"cutover\"]}");
-  ASSERT_TRUE(store.Apply(cmd).ok());
+  const std::string reordered =
+      R"({"suspect_after_ms":7000,"enabled":false,"kind":"automatic-uncontrolled-failover-v1"})";
+  ASSERT_TRUE(
+      store
+          .Apply(MakePut(std::string(kAutomaticUncontrolledFailoverPolicyId), 1,
+                         reordered))
+          .ok());
+  ASSERT_TRUE(store
+                  .Apply(MakePut(std::string(kAuthorityLeasePolicyId), 1,
+                                 LeasePolicy(3000)))
+                  .ok());
 
-  EXPECT_TRUE(store.IsVersionPresent("migration-policy", 1));
-  EXPECT_TRUE(store.IsVersionActive("migration-policy", 1));
-  EXPECT_FALSE(store.IsVersionPresent("migration-policy", 2));
-  EXPECT_EQ(store.LatestVersion("migration-policy"),
-            std::optional<std::uint64_t>(1));
-  EXPECT_EQ(store.PolicyCount(), 1u);
-  EXPECT_EQ(store.TotalContentBytes(), cmd.content_.size());
+  EXPECT_TRUE(
+      store.FindVersion(std::string(kAutomaticUncontrolledFailoverPolicyId), 1)
+          .has_value());
+  EXPECT_FALSE(
+      store.FindVersion(std::string(kAutomaticUncontrolledFailoverPolicyId), 2)
+          .has_value());
+  EXPECT_EQ(
+      store.LatestVersion(std::string(kAutomaticUncontrolledFailoverPolicyId)),
+      std::optional<std::uint64_t>(1));
+  EXPECT_EQ(store.PolicyCount(), 2u);
 
-  const auto view = store.FindVersion("migration-policy", 1);
+  const auto view =
+      store.FindVersion(std::string(kAutomaticUncontrolledFailoverPolicyId), 1);
   ASSERT_TRUE(view.has_value());
-  EXPECT_EQ(view->policy_id_, "migration-policy");
+  EXPECT_EQ(view->policy_id_, kAutomaticUncontrolledFailoverPolicyId);
   EXPECT_EQ(view->version_, 1u);
-  EXPECT_EQ(view->content_, cmd.content_);
-  EXPECT_EQ(view->content_hash_, cmd.content_hash_);
-  EXPECT_FALSE(view->retired_);
+  EXPECT_EQ(view->content_, reordered);
+
+  const auto automatic = store.CurrentAutomaticUncontrolledFailover();
+  ASSERT_TRUE(automatic.has_value());
+  EXPECT_EQ(automatic->version_, 1u);
+  EXPECT_FALSE(automatic->enabled_);
+  EXPECT_EQ(automatic->suspect_after_ms_, 7000u);
+
+  const auto lease = store.CurrentAuthorityLease();
+  ASSERT_TRUE(lease.has_value());
+  EXPECT_EQ(lease->version_, 1u);
+  EXPECT_EQ(lease->duration_ms_, 3000u);
 }
 
-TEST(MetaPolicyStore, PutPolicyRejectsHashMismatch) {
-  MetaPolicyStore store;
-  PutPolicy cmd = MakePut("migration-policy", 1, "content-v1");
-  cmd.content_hash_ = MetaPolicyStore::ContentHash("different-content");
-  ExpectDomainReject(store.Apply(cmd));
-  EXPECT_FALSE(store.IsVersionPresent("migration-policy", 1));
-}
-
-TEST(MetaPolicyStore, PutPolicyRejectsInvalidFields) {
+TEST(MetaPolicyStore, RejectsUnregisteredPolicyAndInvalidCommandFields) {
   MetaPolicyStore store;
   {
-    PutPolicy cmd = MakePut("", 1, "content");  // empty policy_id
+    PutPolicy cmd = MakePut("", 1, AutomaticPolicy(true, 5000));
     ExpectDomainReject(store.Apply(cmd));
   }
   {
-    // Empty content: a zero-byte policy document has no meaning, and the
-    // byte cap could not bound the version count (see header).
-    PutPolicy cmd = MakePut("p", 1, "");
+    PutPolicy cmd = MakePut("unknown-policy", 1, AutomaticPolicy(true, 5000));
     ExpectDomainReject(store.Apply(cmd));
   }
   {
     PutPolicy cmd =
         MakePut(std::string(keylane::meta::kMaxMetaPolicyIdBytes + 1, 'p'), 1,
-                "content");
+                AutomaticPolicy(true, 5000));
     ExpectDomainReject(store.Apply(cmd));
   }
   {
@@ -1608,18 +1575,63 @@ TEST(MetaPolicyStore, PutPolicyRejectsInvalidFields) {
     cmd.policy_id_ = "p";
     cmd.version_ = 1;
     cmd.content_ = std::string(keylane::meta::kMaxMetaPayloadBytes + 1, 'x');
-    cmd.content_hash_ = MetaPolicyStore::ContentHash(cmd.content_);
     ExpectDomainReject(store.Apply(cmd));
   }
   EXPECT_EQ(store.PolicyCount(), 0u);
 }
 
+TEST(MetaPolicyStore, AutomaticFailoverSchemaIsStrict) {
+  const std::vector<std::string> invalid = {
+      "",
+      R"({})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})",
+      R"({"kind":"wrong","enabled":true,"suspect_after_ms":5000})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":1,"suspect_after_ms":5000})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":"5000"})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":999})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":86400001})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":18446744073709551616})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"enabled":false,"suspect_after_ms":5000})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000,"extra":1})",
+      R"({ "kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})",
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000} trailing)",
+  };
+  for (const std::string& content : invalid) {
+    SCOPED_TRACE(content);
+    MetaPolicyStore store;
+    ExpectDomainReject(store.Apply(MakePut(
+        std::string(kAutomaticUncontrolledFailoverPolicyId), 1, content)));
+  }
+}
+
+TEST(MetaPolicyStore, AuthorityLeaseSchemaIsStrict) {
+  const std::vector<std::string> invalid = {
+      R"({})",
+      R"({"kind":"wrong","duration_ms":5000})",
+      R"({"kind":"authority-lease-v1"})",
+      R"({"kind":"authority-lease-v1","duration_ms":99})",
+      R"({"kind":"authority-lease-v1","duration_ms":86400001})",
+      R"({"kind":"authority-lease-v1","duration_ms":-1})",
+      R"({"kind":"authority-lease-v1","duration_ms":1.5})",
+      R"({"kind":"authority-lease-v1","duration_ms":05000})",
+      R"({"kind":"authority-lease-v1","duration_ms":5000,"duration_ms":6000})",
+      R"({"kind":"authority-lease-v1","duration_ms":5000,"extra":true})",
+  };
+  for (const std::string& content : invalid) {
+    SCOPED_TRACE(content);
+    MetaPolicyStore store;
+    ExpectDomainReject(
+        store.Apply(MakePut(std::string(kAuthorityLeasePolicyId), 1, content)));
+  }
+}
+
 TEST(MetaPolicyStore, PutPolicyReplayIsIdempotentAccept) {
   MetaPolicyStore store;
-  const PutPolicy cmd = MakePut("migration-policy", 1, "content-v1");
+  const PutPolicy cmd =
+      MakePut(std::string(kAutomaticUncontrolledFailoverPolicyId), 1,
+              AutomaticPolicy(true, 5000));
   ASSERT_TRUE(store.Apply(cmd).ok());
-  // Replay of the same log index: same version slot, same content, still
-  // active -> idempotent accept.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.PolicyCount(), 1u);
   EXPECT_EQ(store.TotalContentBytes(), cmd.content_.size());
@@ -1627,145 +1639,68 @@ TEST(MetaPolicyStore, PutPolicyReplayIsIdempotentAccept) {
 
 TEST(MetaPolicyStore, PutPolicySameVersionDifferentContentRejected) {
   MetaPolicyStore store;
-  ASSERT_TRUE(store.Apply(MakePut("migration-policy", 1, "content-v1")).ok());
+  const std::string policy_id(kAutomaticUncontrolledFailoverPolicyId);
+  ASSERT_TRUE(
+      store.Apply(MakePut(policy_id, 1, AutomaticPolicy(true, 5000))).ok());
   ExpectDomainReject(
-      store.Apply(MakePut("migration-policy", 1, "content-OTHER")));
-  EXPECT_EQ(store.FindVersion("migration-policy", 1)->content_, "content-v1");
+      store.Apply(MakePut(policy_id, 1, AutomaticPolicy(false, 5000))));
+  EXPECT_EQ(store.FindVersion(policy_id, 1)->content_,
+            AutomaticPolicy(true, 5000));
 }
 
-TEST(MetaPolicyStore, PutPolicyRequiresMonotonicVersion) {
+TEST(MetaPolicyStore, PutPolicyRequiresFirstAndConsecutiveVersions) {
   MetaPolicyStore store;
-  ASSERT_TRUE(store.Apply(MakePut("p", 5, "v5")).ok());
-  // Strictly greater than the latest existing version (gaps are legal).
-  ASSERT_TRUE(store.Apply(MakePut("p", 9, "v9")).ok());
-  ExpectDomainReject(store.Apply(MakePut("p", 4, "v4")));
-  ExpectDomainReject(store.Apply(MakePut("p", 5, "v5-different")));
-  ExpectDomainReject(store.Apply(MakePut("p", 9, "v9-different")));
-  ASSERT_TRUE(store.Apply(MakePut("p", 10, "v10")).ok());
-  EXPECT_EQ(store.LatestVersion("p"), std::optional<std::uint64_t>(10));
-  // Independent version sequences per policy_id.
-  ASSERT_TRUE(store.Apply(MakePut("q", 1, "v1")).ok());
-  EXPECT_EQ(store.LatestVersion("q"), std::optional<std::uint64_t>(1));
+  const std::string policy_id(kAutomaticUncontrolledFailoverPolicyId);
+  ExpectDomainReject(
+      store.Apply(MakePut(policy_id, 2, AutomaticPolicy(true, 5000))));
+  ASSERT_TRUE(
+      store.Apply(MakePut(policy_id, 1, AutomaticPolicy(true, 5000))).ok());
+  ExpectDomainReject(
+      store.Apply(MakePut(policy_id, 3, AutomaticPolicy(true, 7000))));
+  ASSERT_TRUE(
+      store.Apply(MakePut(policy_id, 2, AutomaticPolicy(true, 6000))).ok());
+  ExpectDomainReject(
+      store.Apply(MakePut(policy_id, 1, AutomaticPolicy(true, 4000))));
+  EXPECT_EQ(store.LatestVersion(policy_id), std::optional<std::uint64_t>(2));
 }
 
-// ---------------------------------------------------------------------------
-// Caps: kMaxMetaPolicyVersionsPerPolicy per policy,
-// kMaxMetaPolicyTotalBytes across all policies. Over-cap = rejection, never
-// silent truncation.
-// ---------------------------------------------------------------------------
-
-TEST(MetaPolicyStore, PutPolicyEnforcesVersionsPerPolicyCap) {
+TEST(MetaPolicyStore, PutPolicyEvictsOldestVersionAfterHistoryCap) {
   MetaPolicyStore store;
+  const std::string policy_id(kAutomaticUncontrolledFailoverPolicyId);
   for (std::uint32_t v = 1; v <= keylane::meta::kMaxMetaPolicyVersionsPerPolicy;
        ++v) {
     ASSERT_TRUE(
-        store.Apply(MakePut("p", v, "content-" + std::to_string(v))).ok())
+        store.Apply(MakePut(policy_id, v, AutomaticPolicy(true, 1000 + v)))
+            .ok())
         << v;
   }
-  ExpectDomainReject(store.Apply(MakePut(
-      "p", keylane::meta::kMaxMetaPolicyVersionsPerPolicy + 1, "over")));
-  EXPECT_EQ(store.LatestVersion("p"),
-            std::optional<std::uint64_t>(
-                keylane::meta::kMaxMetaPolicyVersionsPerPolicy));
-  // The cap is per policy: another policy still accepts versions.
-  ASSERT_TRUE(store.Apply(MakePut("q", 1, "fine")).ok());
-}
-
-TEST(MetaPolicyStore, PutPolicyEnforcesTotalBytesCap) {
-  MetaPolicyStore store;
-  // Fill the budget exactly: 64 policies x 256 KiB = 16 MiB.
-  const std::string chunk(keylane::meta::kMaxMetaPayloadBytes, 'x');
-  constexpr std::uint32_t kChunks = keylane::meta::kMaxMetaPolicyTotalBytes /
-                                    keylane::meta::kMaxMetaPayloadBytes;
-  for (std::uint32_t i = 0; i < kChunks; ++i) {
-    ASSERT_TRUE(
-        store.Apply(MakePut("policy-" + std::to_string(i), 1, chunk)).ok())
-        << i;
-  }
-  EXPECT_EQ(store.TotalContentBytes(), keylane::meta::kMaxMetaPolicyTotalBytes);
-  // One more byte is rejected; state unchanged.
-  ExpectDomainReject(store.Apply(MakePut("policy-over", 1, "y")));
-  EXPECT_FALSE(store.IsVersionPresent("policy-over", 1));
-  EXPECT_EQ(store.TotalContentBytes(), keylane::meta::kMaxMetaPolicyTotalBytes);
-}
-
-// ---------------------------------------------------------------------------
-// RetirePolicy: terminal tombstone, content retained, replay idempotent.
-// The guard against retiring a version still referenced by an active
-// grant or non-terminal operation is cross-store (grant/operation stores)
-// and enforced by the apply dispatcher; the store exposes the facts.
-// ---------------------------------------------------------------------------
-
-using keylane::meta::RetirePolicy;
-
-RetirePolicy MakeRetirePolicy(const std::string& policy_id,
-                              std::uint64_t version) {
-  RetirePolicy cmd;
-  cmd.request_id_ = MakeRequestId(0xB0);
-  cmd.policy_id_ = policy_id;
-  cmd.version_ = version;
-  return cmd;
-}
-
-TEST(MetaPolicyStore, RetirePolicyRetires) {
-  MetaPolicyStore store;
-  const PutPolicy put = MakePut("p", 1, "content-v1");
-  ASSERT_TRUE(store.Apply(put).ok());
-  ASSERT_TRUE(store.Apply(MakeRetirePolicy("p", 1)).ok());
-
-  EXPECT_TRUE(store.IsVersionPresent("p", 1));  // tombstone stays
-  EXPECT_FALSE(store.IsVersionActive("p", 1));
-  const auto view = store.FindVersion("p", 1);
-  ASSERT_TRUE(view.has_value());
-  EXPECT_TRUE(view->retired_);
-  EXPECT_EQ(view->content_, put.content_);  // content retained
-  EXPECT_EQ(store.LatestVersion("p"), std::optional<std::uint64_t>(1));
-  EXPECT_EQ(store.TotalContentBytes(), put.content_.size());
-}
-
-TEST(MetaPolicyStore, RetirePolicyReplayIsIdempotentAccept) {
-  MetaPolicyStore store;
-  ASSERT_TRUE(store.Apply(MakePut("p", 1, "content-v1")).ok());
-  const RetirePolicy cmd = MakeRetirePolicy("p", 1);
-  ASSERT_TRUE(store.Apply(cmd).ok());
-  // Replay: the version is already retired -> idempotent accept.
-  ASSERT_TRUE(store.Apply(cmd).ok());
-  EXPECT_FALSE(store.IsVersionActive("p", 1));
-}
-
-TEST(MetaPolicyStore, RetirePolicyUnknownRejected) {
-  MetaPolicyStore store;
-  ASSERT_TRUE(store.Apply(MakePut("p", 1, "content-v1")).ok());
-  ExpectDomainReject(store.Apply(MakeRetirePolicy("p", 2)));
-  ExpectDomainReject(store.Apply(MakeRetirePolicy("ghost", 1)));
-  EXPECT_TRUE(store.IsVersionActive("p", 1));
-}
-
-TEST(MetaPolicyStore, RetiredVersionIsTerminal) {
-  MetaPolicyStore store;
-  ASSERT_TRUE(store.Apply(MakePut("p", 1, "content-v1")).ok());
-  ASSERT_TRUE(store.Apply(MakeRetirePolicy("p", 1)).ok());
-  // Re-putting the retired version slot is rejected even with identical
-  // content: retired is terminal (the replay path is RetirePolicy itself).
-  ExpectDomainReject(store.Apply(MakePut("p", 1, "content-v1")));
-  // A newer version of the same policy is fine.
-  ASSERT_TRUE(store.Apply(MakePut("p", 2, "content-v2")).ok());
-  EXPECT_TRUE(store.IsVersionActive("p", 2));
-  EXPECT_FALSE(store.IsVersionActive("p", 1));
+  const std::uint64_t next = keylane::meta::kMaxMetaPolicyVersionsPerPolicy + 1;
+  ASSERT_TRUE(
+      store.Apply(MakePut(policy_id, next, AutomaticPolicy(true, 1000 + next)))
+          .ok());
+  EXPECT_FALSE(store.FindVersion(policy_id, 1).has_value());
+  EXPECT_TRUE(store.FindVersion(policy_id, 2).has_value());
+  EXPECT_TRUE(store.FindVersion(policy_id, next).has_value());
+  EXPECT_EQ(store.Versions().size(),
+            keylane::meta::kMaxMetaPolicyVersionsPerPolicy);
 }
 
 // ---------------------------------------------------------------------------
 // Policy serialization: u16 schema_version envelope, deterministic sorted
-// output, strict fail-stop decode including in-byte invariant violations
-// (hash mismatch, cap overflow, ...).
+// output and strict fail-stop decode of the new hash-free current format.
 // ---------------------------------------------------------------------------
 
 MetaPolicyStore MakePopulatedPolicies() {
   MetaPolicyStore store;
-  EXPECT_TRUE(store.Apply(MakePut("migration-policy", 1, "v1-content")).ok());
-  EXPECT_TRUE(store.Apply(MakePut("migration-policy", 3, "v3-content")).ok());
-  EXPECT_TRUE(store.Apply(MakePut("failover-policy", 2, "v2-content")).ok());
-  EXPECT_TRUE(store.Apply(MakeRetirePolicy("migration-policy", 1)).ok());
+  EXPECT_TRUE(
+      store
+          .Apply(MakePut(std::string(kAutomaticUncontrolledFailoverPolicyId), 1,
+                         AutomaticPolicy(true, 5000)))
+          .ok());
+  EXPECT_TRUE(store
+                  .Apply(MakePut(std::string(kAuthorityLeasePolicyId), 1,
+                                 LeasePolicy(5000)))
+                  .ok());
   return store;
 }
 
@@ -1781,16 +1716,10 @@ TEST(MetaPolicyStore, SerializationRoundTrip) {
   ASSERT_TRUE(loaded.ok()) << loaded.status();
   EXPECT_EQ(loaded->PolicyCount(), 2u);
   EXPECT_EQ(loaded->TotalContentBytes(), store.TotalContentBytes());
-  EXPECT_EQ(loaded->FindVersion("migration-policy", 1),
-            store.FindVersion("migration-policy", 1));
-  EXPECT_EQ(loaded->FindVersion("migration-policy", 3),
-            store.FindVersion("migration-policy", 3));
-  EXPECT_EQ(loaded->FindVersion("failover-policy", 2),
-            store.FindVersion("failover-policy", 2));
-  EXPECT_TRUE(loaded->IsVersionPresent("migration-policy", 1));
-  EXPECT_FALSE(loaded->IsVersionActive("migration-policy", 1));
-  EXPECT_EQ(loaded->LatestVersion("migration-policy"),
-            std::optional<std::uint64_t>(3));
+  EXPECT_EQ(loaded->Versions(), store.Versions());
+  EXPECT_EQ(loaded->CurrentAutomaticUncontrolledFailover(),
+            store.CurrentAutomaticUncontrolledFailover());
+  EXPECT_EQ(loaded->CurrentAuthorityLease(), store.CurrentAuthorityLease());
   EXPECT_EQ(loaded->Serialize(), bytes);  // fixed point
 }
 
@@ -1806,10 +1735,15 @@ TEST(MetaPolicyStore, SerializationIsDeterministic) {
   // Equal states serialize to equal bytes regardless of apply order.
   MetaPolicyStore a;
   MetaPolicyStore b;
-  ASSERT_TRUE(a.Apply(MakePut("policy-a", 1, "a1")).ok());
-  ASSERT_TRUE(a.Apply(MakePut("policy-b", 1, "b1")).ok());
-  ASSERT_TRUE(b.Apply(MakePut("policy-b", 1, "b1")).ok());
-  ASSERT_TRUE(b.Apply(MakePut("policy-a", 1, "a1")).ok());
+  const PutPolicy automatic =
+      MakePut(std::string(kAutomaticUncontrolledFailoverPolicyId), 1,
+              AutomaticPolicy(true, 5000));
+  const PutPolicy lease =
+      MakePut(std::string(kAuthorityLeasePolicyId), 1, LeasePolicy(5000));
+  ASSERT_TRUE(a.Apply(automatic).ok());
+  ASSERT_TRUE(a.Apply(lease).ok());
+  ASSERT_TRUE(b.Apply(lease).ok());
+  ASSERT_TRUE(b.Apply(automatic).ok());
   EXPECT_EQ(a.Serialize(), b.Serialize());
 }
 
@@ -1829,13 +1763,10 @@ TEST(MetaPolicyStore, DeserializeRejectsCorruption) {
   ExpectStoreFailStop(MetaPolicyStore::Deserialize(bad_version).status());
 }
 
-// Hand-builds a policy blob. Layout mirrors the store's serialization
-// contract; hash override exists so a mismatch can be expressed.
+// Hand-builds a policy blob using the current hash-free snapshot layout.
 struct PolicyBlobVersion {
   std::uint64_t version;
   std::string content;
-  bool retired = false;
-  std::optional<MetaHash256> hash_override;
 };
 
 std::string MakePolicyBlob(
@@ -1849,81 +1780,59 @@ std::string MakePolicyBlob(
     w.WriteCount(static_cast<std::uint32_t>(versions.size()));
     for (const PolicyBlobVersion& version : versions) {
       w.WriteU64(version.version);
-      w.WriteU8(version.retired ? 1 : 0);
       w.WriteString(version.content);
-      const MetaHash256 hash = version.hash_override.value_or(
-          MetaPolicyStore::ContentHash(version.content));
-      keylane::meta::WriteFixedArray(w, hash);
     }
   }
   return w.buffer();
 }
 
 TEST(MetaPolicyStore, DeserializeRejectsInvariantViolations) {
-  // Hash mismatch: content does not match content_hash.
-  {
-    MetaHash256 wrong{};
-    ExpectStoreFailStop(
-        MetaPolicyStore::Deserialize(
-            MakePolicyBlob(
-                {{"p", {PolicyBlobVersion{1, "content", false, wrong}}}}))
-            .status());
-  }
   // Version count over the per-policy cap.
   {
     std::vector<PolicyBlobVersion> versions;
     for (std::uint32_t v = 1;
          v <= keylane::meta::kMaxMetaPolicyVersionsPerPolicy + 1; ++v) {
-      versions.push_back(PolicyBlobVersion{v, "c" + std::to_string(v)});
+      versions.push_back(PolicyBlobVersion{v, AutomaticPolicy(true, 1000 + v)});
     }
     ExpectStoreFailStop(
-        MetaPolicyStore::Deserialize(MakePolicyBlob({{"p", versions}}))
+        MetaPolicyStore::Deserialize(
+            MakePolicyBlob(
+                {{std::string(kAutomaticUncontrolledFailoverPolicyId),
+                  versions}}))
             .status());
   }
   // Duplicate version within one policy.
   ExpectStoreFailStop(
       MetaPolicyStore::Deserialize(
-          MakePolicyBlob(
-              {{"p", {PolicyBlobVersion{1, "a"}, PolicyBlobVersion{1, "b"}}}}))
+          MakePolicyBlob({{std::string(kAuthorityLeasePolicyId),
+                           {PolicyBlobVersion{1, LeasePolicy(5000)},
+                            PolicyBlobVersion{1, LeasePolicy(6000)}}}}))
           .status());
-  // Retired tag other than 0/1: hand-encode (the blob helper writes 0/1).
-  {
-    keylane::meta::MetaWriter w;
-    w.WriteU16(keylane::meta::kMetaFormatVersion);
-    w.WriteCount(1);
-    w.WriteString("p");
-    w.WriteCount(1);
-    w.WriteU64(1);
-    w.WriteU8(2);  // invalid retired tag
-    w.WriteString("content");
-    keylane::meta::WriteFixedArray(w, MetaPolicyStore::ContentHash("content"));
-    ExpectStoreFailStop(MetaPolicyStore::Deserialize(w.buffer()).status());
-  }
-  // Empty content / empty policy_id / zero-version policy entry.
-  ExpectStoreFailStop(MetaPolicyStore::Deserialize(
-                          MakePolicyBlob({{"p", {PolicyBlobVersion{1, ""}}}}))
-                          .status());
+  // A gap, malformed content, unknown id, empty id, or zero-version family.
   ExpectStoreFailStop(
       MetaPolicyStore::Deserialize(
-          MakePolicyBlob({{"", {PolicyBlobVersion{1, "content"}}}}))
+          MakePolicyBlob({{std::string(kAuthorityLeasePolicyId),
+                           {PolicyBlobVersion{1, LeasePolicy(5000)},
+                            PolicyBlobVersion{3, LeasePolicy(6000)}}}}))
           .status());
   ExpectStoreFailStop(
-      MetaPolicyStore::Deserialize(MakePolicyBlob({{"p", {}}})).status());
-  // Total content bytes over the global cap.
-  {
-    const std::string chunk(keylane::meta::kMaxMetaPayloadBytes, 'x');
-    constexpr std::uint32_t kChunks = keylane::meta::kMaxMetaPolicyTotalBytes /
-                                          keylane::meta::kMaxMetaPayloadBytes +
-                                      1;
-    std::vector<std::pair<std::string, std::vector<PolicyBlobVersion>>>
-        policies;
-    for (std::uint32_t i = 0; i < kChunks; ++i) {
-      policies.push_back(
-          {"policy-" + std::to_string(i), {PolicyBlobVersion{1, chunk}}});
-    }
-    ExpectStoreFailStop(
-        MetaPolicyStore::Deserialize(MakePolicyBlob(policies)).status());
-  }
+      MetaPolicyStore::Deserialize(
+          MakePolicyBlob({{std::string(kAuthorityLeasePolicyId),
+                           {PolicyBlobVersion{1, "not-json"}}}}))
+          .status());
+  ExpectStoreFailStop(
+      MetaPolicyStore::Deserialize(
+          MakePolicyBlob(
+              {{"unknown", {PolicyBlobVersion{1, LeasePolicy(5000)}}}}))
+          .status());
+  ExpectStoreFailStop(
+      MetaPolicyStore::Deserialize(
+          MakePolicyBlob({{"", {PolicyBlobVersion{1, LeasePolicy(5000)}}}}))
+          .status());
+  ExpectStoreFailStop(
+      MetaPolicyStore::Deserialize(
+          MakePolicyBlob({{std::string(kAuthorityLeasePolicyId), {}}}))
+          .status());
 }
 
 TEST(MetaPopulationManifestStore,

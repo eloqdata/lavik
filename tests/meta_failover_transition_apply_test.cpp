@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "absl/strings/str_cat.h"
 #include "gtest/gtest.h"
@@ -18,6 +19,8 @@ namespace meta = keylane::meta;
 
 constexpr std::string_view kActor = "keylane://operator/failover-test";
 constexpr std::string_view kTime = "2026-09-13T00:00:00Z";
+constexpr std::string_view kAutomaticPreemptionReason =
+    "preempted by automatic uncontrolled failover";
 
 template <std::size_t N>
 std::array<std::uint8_t, N> Filled(std::uint8_t seed) {
@@ -83,13 +86,32 @@ meta::SubmitOperation ClusterCreateRoot() {
   return root;
 }
 
-meta::SubmitOperation FailoverSubmit(std::uint8_t seed) {
+void SeedRequiredCurrentPolicies(meta::MetaStores& stores) {
+  meta::PutPolicy automatic;
+  automatic.request_id_ = Filled<16>(0x0f);
+  automatic.policy_id_ =
+      std::string(meta::kAutomaticUncontrolledFailoverPolicyId);
+  automatic.version_ = 1;
+  automatic.content_ =
+      R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+  ASSERT_TRUE(stores.policy_.Apply(automatic).ok());
+
+  meta::PutPolicy authority;
+  authority.request_id_ = Filled<16>(0x07);
+  authority.policy_id_ = std::string(meta::kAuthorityLeasePolicyId);
+  authority.version_ = 1;
+  authority.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
+  ASSERT_TRUE(stores.policy_.Apply(authority).ok());
+}
+
+meta::SubmitOperation FailoverSubmit(std::uint8_t seed,
+                                     std::string group_id = "g1") {
   meta::SubmitOperation submit;
   submit.request_id_ = Filled<16>(seed);
   submit.operation_id_ = Filled<16>(static_cast<std::uint8_t>(seed + 1));
   submit.kind_ = "failover";
   const auto intent = meta::EncodeFailoverOperationIntent(
-      {.group_id_ = "g1", .absolute_deadline_unix_ms_ = 1000});
+      {.group_id_ = std::move(group_id), .absolute_deadline_unix_ms_ = 1000});
   EXPECT_TRUE(intent.ok()) << intent.status();
   submit.intent_ = intent.value_or("");
   submit.intent_hash_ = meta::MetaSha256(submit.intent_);
@@ -100,7 +122,6 @@ struct ActivatedGroupFixture {
   meta::MetaStores stores;
   std::string owner = NodeId(1);
   meta::MetaAssignmentId owner_assignment = Filled<16>(0x31);
-  meta::MetaGrantSpec grant{5000, "p", 0};
 };
 
 void PopulateActivatedGroup(ActivatedGroupFixture& fixture,
@@ -131,10 +152,9 @@ void PopulateActivatedGroup(ActivatedGroupFixture& fixture,
 
   meta::PutPolicy policy;
   policy.request_id_ = Filled<16>(0x07);
-  policy.policy_id_ = fixture.grant.policy_id_;
-  policy.version_ = fixture.grant.policy_version_;
-  policy.content_ = R"({"lease_ms":5000})";
-  policy.content_hash_ = meta::MetaPolicyStore::ContentHash(policy.content_);
+  policy.policy_id_ = std::string(meta::kAuthorityLeasePolicyId);
+  policy.version_ = 1;
+  policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
   ExpectAccepted(fixture.stores, first_index + 3, meta::MetaCommand{policy});
 
   meta::BeginGroupTerm begin;
@@ -149,10 +169,7 @@ void PopulateActivatedGroup(ActivatedGroupFixture& fixture,
   activate.group_id_ = "g1";
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.owner;
-  activate.grant_ = fixture.grant;
-  activate.new_authority_version_ = 1;
   activate.new_topology_epoch_ = 3;
-  activate.new_config_epoch_ = 1;
   ExpectAccepted(fixture.stores, first_index + 5, meta::MetaCommand{activate});
 }
 
@@ -160,6 +177,8 @@ ActivatedGroupFixture MakeActivatedGroup() {
   ActivatedGroupFixture fixture;
   meta::SubmitOperation root = ClusterCreateRoot();
   ExpectAccepted(fixture.stores, 1, meta::MetaCommand{root});
+
+  SeedRequiredCurrentPolicies(fixture.stores);
 
   meta::CompleteOperation complete;
   complete.request_id_ = Filled<16>(0x03);
@@ -179,17 +198,13 @@ meta::BeginUncontrolledFailover MakeBeginUncontrolled(
   begin.group_id_ = "g1";
   begin.transition_id_ = Filled<16>(0x41);
   begin.target_term_ = 2;
-  begin.successor_grant_ = fixture.grant;
   begin.expected_owner_node_id_ = fixture.owner;
   begin.expected_owner_assignment_id_ = fixture.owner_assignment;
   begin.expected_membership_revision_ = 2;
   begin.expected_group_term_ = 1;
-  begin.expected_authority_version_ = 1;
-  begin.expected_grant_revision_ = 8;
   begin.expected_population_manifest_revision_ = 0;
   begin.expected_population_manifest_digest_.fill(0);
   begin.expected_partition_replication_epoch_ = 0;
-  begin.expected_config_epoch_ = 1;
   return begin;
 }
 
@@ -216,8 +231,6 @@ meta::MetaOperationId InstallCurrentAuthorityDirective(
       Filled<meta::kMetaReplicationHistoryIdBytes>(0x85);
   directive.group_id_ = "g1";
   directive.group_term_ = 1;
-  directive.authority_version_ = 1;
-  directive.grant_revision_ = 8;
   directive.kind_ = std::string(meta::kMetaDirectiveRebuild);
   directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
   directive.storage_mutating_ = true;
@@ -244,7 +257,6 @@ void InstallUncontrolledPostStateDirectly(ActivatedGroupFixture& fixture,
   transition.transition_id_ = begin.transition_id_;
   transition.mode_ = meta::MetaFailoverMode::kUncontrolled;
   transition.target_term_ = begin.target_term_;
-  transition.successor_grant_ = begin.successor_grant_;
   ASSERT_TRUE(fixture.stores.topology_
                   .InstallFailoverTransition("g1", transition, revision)
                   .ok());
@@ -270,26 +282,20 @@ TEST(MetaFailoverTransitionApply,
   ASSERT_TRUE(group.has_value());
   EXPECT_EQ(group->record_.owner_, fixture.owner);
   EXPECT_EQ(group->record_.group_term_, 2u);
-  EXPECT_EQ(group->record_.authority_version_, 1u);
   ASSERT_TRUE(group->failover_transition_.has_value());
   EXPECT_EQ(group->failover_transition_->transition_id_, begin.transition_id_);
   EXPECT_EQ(group->failover_transition_->revision_, 9u);
   EXPECT_EQ(group->failover_transition_->mode_,
             meta::MetaFailoverMode::kUncontrolled);
   EXPECT_EQ(group->failover_transition_->target_term_, 2u);
-  EXPECT_EQ(group->failover_transition_->successor_grant_, fixture.grant);
   EXPECT_FALSE(group->failover_transition_->candidate_action_.has_value());
   EXPECT_FALSE(group->failover_transition_->controlled_.has_value());
   EXPECT_EQ(group->revision_, 2u);
-  EXPECT_EQ(group->config_epoch_, 1u);
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 3u);
 
   const auto grant = fixture.stores.grant_.GroupState("g1");
   ASSERT_TRUE(grant.has_value());
   EXPECT_EQ(grant->group_term_, 2u);
-  EXPECT_EQ(grant->last_authority_version_, 1u);
-  EXPECT_EQ(grant->last_grant_revision_, 8u);
-  EXPECT_TRUE(grant->fenced_);
   EXPECT_FALSE(grant->grant_.has_value());
 
   const auto serialized = fixture.stores.Serialize();
@@ -306,10 +312,211 @@ TEST(MetaFailoverTransitionApply,
 }
 
 TEST(MetaFailoverTransitionApply,
-     BeginUncontrolledRejectsStaleGrantAnchorWithoutMutation) {
+     AutomaticBeginAtomicallyPreemptsPristineControlledRequest) {
+  ActivatedGroupFixture fixture = MakeActivatedGroup();
+  const meta::SubmitOperation controlled = FailoverSubmit(0xa0);
+  ExpectAccepted(fixture.stores, 9, meta::MetaCommand{controlled});
+
+  meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
+  begin.trigger_reason_ = meta::MetaAutomaticFailoverReason::kHeartbeatExpired;
+  begin.suspect_duration_ms_ = 5000;
+  begin.preempted_operation_id_ = controlled.operation_id_;
+  begin.expected_preempted_operation_revision_ = 0;
+  ExpectAccepted(fixture.stores, 10, meta::MetaCommand{begin});
+
+  const auto operation =
+      fixture.stores.operation_.FindOperation(controlled.operation_id_);
+  ASSERT_TRUE(operation.has_value());
+  EXPECT_EQ(operation->lifecycle_, meta::MetaOperationLifecycle::kAborted);
+  EXPECT_EQ(operation->revision_, 1u);
+  EXPECT_EQ(operation->terminal_result_, kAutomaticPreemptionReason);
+  EXPECT_FALSE(operation->data_loss_possible_);
+
+  const auto group = fixture.stores.topology_.FindGroup("g1");
+  ASSERT_TRUE(group.has_value());
+  ASSERT_TRUE(group->failover_transition_.has_value());
+  EXPECT_EQ(group->failover_transition_->mode_,
+            meta::MetaFailoverMode::kUncontrolled);
+  EXPECT_EQ(group->failover_transition_->revision_, 10u);
+  EXPECT_EQ(group->record_.group_term_, 2u);
+  const auto grant = fixture.stores.grant_.GroupState("g1");
+  ASSERT_TRUE(grant.has_value());
+  EXPECT_FALSE(grant->grant_.has_value());
+
+  const std::string post_state = DomainBytes(fixture.stores);
+  const std::size_t audit_size = fixture.stores.audit_.size();
+  ExpectAccepted(fixture.stores, 10, meta::MetaCommand{begin});
+  EXPECT_EQ(DomainBytes(fixture.stores), post_state);
+  EXPECT_EQ(fixture.stores.audit_.size(), audit_size);
+}
+
+TEST(MetaFailoverTransitionApply,
+     AutomaticBeginRejectsCandidateWithoutDomainMutation) {
   ActivatedGroupFixture fixture = MakeActivatedGroup();
   meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
-  begin.expected_grant_revision_ = 7;
+  begin.trigger_reason_ = meta::MetaAutomaticFailoverReason::kHeartbeatExpired;
+  begin.suspect_duration_ms_ = 5'000;
+  begin.candidate_action_ = meta::MetaFailoverCandidateAction{
+      .action_id_ = Filled<16>(0xc0),
+      .candidate_ =
+          {
+              .node_id_ = fixture.owner,
+              .assignment_id_ = fixture.owner_assignment,
+              .boot_id_ = Filled<meta::kMetaBootIncarnationBytes>(0xc1),
+          },
+      .domain_ =
+          {
+              .source_group_term_ = 1,
+              .source_node_id_ = fixture.owner,
+              .source_assignment_id_ = fixture.owner_assignment,
+              .source_boot_id_ = Filled<meta::kMetaBootIncarnationBytes>(0xc2),
+              .source_history_id_ =
+                  Filled<meta::kMetaReplicationHistoryIdBytes>(0xc3),
+              .flow_count_ = 1,
+          },
+  };
+  const std::string before = DomainBytes(fixture.stores);
+
+  const meta::MetaApplyResult result =
+      ExpectRejected(fixture.stores, 9, meta::MetaCommand{begin});
+
+  EXPECT_NE(result.detail_.find("automatic uncontrolled failover"),
+            std::string::npos);
+  EXPECT_EQ(DomainBytes(fixture.stores), before);
+  EXPECT_EQ(fixture.stores.topology_.FindGroup("g1")->record_.group_term_, 1u);
+  EXPECT_FALSE(fixture.stores.topology_.FindGroup("g1")
+                   ->failover_transition_.has_value());
+}
+
+TEST(MetaFailoverTransitionApply,
+     AutomaticBeginPreemptsAllRequestsPresentAtApplyNotOnlyItsHint) {
+  ActivatedGroupFixture fixture = MakeActivatedGroup();
+  const meta::SubmitOperation hinted = FailoverSubmit(0xb0);
+  ExpectAccepted(fixture.stores, 9, meta::MetaCommand{hinted});
+
+  meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
+  begin.trigger_reason_ = meta::MetaAutomaticFailoverReason::kSessionMissing;
+  begin.suspect_duration_ms_ = 5000;
+  begin.preempted_operation_id_ = hinted.operation_id_;
+  begin.expected_preempted_operation_revision_ = 0;
+
+  // This request commits after the leader built Begin and is therefore absent
+  // from its CAS hint, but it is present before Begin reaches deterministic
+  // apply. The command must not leave this race winner behind.
+  const meta::SubmitOperation racing = FailoverSubmit(0xb2);
+  ExpectAccepted(fixture.stores, 10, meta::MetaCommand{racing});
+  const meta::SubmitOperation other_group = FailoverSubmit(0xb4, "g2");
+  ExpectAccepted(fixture.stores, 11, meta::MetaCommand{other_group});
+
+  ExpectAccepted(fixture.stores, 12, meta::MetaCommand{begin});
+
+  for (const meta::MetaOperationId& operation_id :
+       {hinted.operation_id_, racing.operation_id_}) {
+    const auto operation =
+        fixture.stores.operation_.FindOperation(operation_id);
+    ASSERT_TRUE(operation.has_value());
+    EXPECT_EQ(operation->lifecycle_, meta::MetaOperationLifecycle::kAborted);
+    EXPECT_EQ(operation->revision_, 1u);
+    EXPECT_EQ(operation->terminal_result_, kAutomaticPreemptionReason);
+    EXPECT_FALSE(operation->data_loss_possible_);
+  }
+  const auto unrelated =
+      fixture.stores.operation_.FindOperation(other_group.operation_id_);
+  ASSERT_TRUE(unrelated.has_value());
+  EXPECT_EQ(unrelated->lifecycle_, meta::MetaOperationLifecycle::kSubmitted);
+}
+
+TEST(MetaFailoverTransitionApply,
+     ActiveTransitionRejectsNewControlledRequestButPreservesSubmitReplay) {
+  ActivatedGroupFixture fixture = MakeActivatedGroup();
+  const meta::SubmitOperation existing = FailoverSubmit(0xb6);
+  ExpectAccepted(fixture.stores, 9, meta::MetaCommand{existing});
+
+  meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
+  begin.trigger_reason_ = meta::MetaAutomaticFailoverReason::kDraining;
+  begin.suspect_duration_ms_ = 5000;
+  begin.preempted_operation_id_ = existing.operation_id_;
+  begin.expected_preempted_operation_revision_ = 0;
+  ExpectAccepted(fixture.stores, 10, meta::MetaCommand{begin});
+
+  // Retrying the durable Submit identity remains an idempotent lookup of the
+  // now-aborted record; only a new controlled request is barred.
+  ExpectAccepted(fixture.stores, 11, meta::MetaCommand{existing});
+  const meta::SubmitOperation late = FailoverSubmit(0xb8);
+  const meta::MetaApplyResult rejected =
+      ExpectRejected(fixture.stores, 12, meta::MetaCommand{late});
+  EXPECT_NE(rejected.detail_.find("active failover transition"),
+            std::string::npos);
+  EXPECT_FALSE(fixture.stores.operation_.OperationKnown(late.operation_id_));
+}
+
+TEST(MetaFailoverTransitionApply,
+     AutomaticBeginRejectsPreemptionForAnotherGroupWithoutMutation) {
+  ActivatedGroupFixture fixture = MakeActivatedGroup();
+  const meta::SubmitOperation controlled = FailoverSubmit(0xa2, "g2");
+  ExpectAccepted(fixture.stores, 9, meta::MetaCommand{controlled});
+
+  meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
+  begin.trigger_reason_ = meta::MetaAutomaticFailoverReason::kSessionMissing;
+  begin.suspect_duration_ms_ = 5000;
+  begin.preempted_operation_id_ = controlled.operation_id_;
+  begin.expected_preempted_operation_revision_ = 0;
+  const std::string before = DomainBytes(fixture.stores);
+
+  const meta::MetaApplyResult result =
+      ExpectRejected(fixture.stores, 10, meta::MetaCommand{begin});
+
+  EXPECT_NE(result.detail_.find("another group"), std::string::npos);
+  EXPECT_EQ(DomainBytes(fixture.stores), before);
+}
+
+TEST(MetaFailoverTransitionApply,
+     AutomaticBeginRejectsOperationOnlyReplayHalfWithoutRepair) {
+  ActivatedGroupFixture fixture = MakeActivatedGroup();
+  const meta::SubmitOperation controlled = FailoverSubmit(0xa4);
+  ExpectAccepted(fixture.stores, 9, meta::MetaCommand{controlled});
+
+  meta::AbortOperation abort;
+  abort.operation_id_ = controlled.operation_id_;
+  abort.expected_revision_ = 0;
+  abort.reason_ = std::string(kAutomaticPreemptionReason);
+  ASSERT_TRUE(fixture.stores.operation_.AbortOperation(abort).ok());
+
+  meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
+  begin.trigger_reason_ = meta::MetaAutomaticFailoverReason::kStorageUnready;
+  begin.suspect_duration_ms_ = 5000;
+  begin.preempted_operation_id_ = controlled.operation_id_;
+  begin.expected_preempted_operation_revision_ = 0;
+  const std::string before = DomainBytes(fixture.stores);
+
+  ExpectRejected(fixture.stores, 10, meta::MetaCommand{begin});
+
+  EXPECT_EQ(DomainBytes(fixture.stores), before);
+  EXPECT_EQ(fixture.stores.topology_.FindGroup("g1")->record_.group_term_, 1u);
+  EXPECT_FALSE(fixture.stores.topology_.FindGroup("g1")
+                   ->failover_transition_.has_value());
+}
+
+TEST(MetaFailoverTransitionApply, ManualBeginCannotPreemptControlledRequest) {
+  ActivatedGroupFixture fixture = MakeActivatedGroup();
+  const meta::SubmitOperation controlled = FailoverSubmit(0xa6);
+  ExpectAccepted(fixture.stores, 9, meta::MetaCommand{controlled});
+
+  meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
+  begin.preempted_operation_id_ = controlled.operation_id_;
+  begin.expected_preempted_operation_revision_ = 0;
+  const std::string before = DomainBytes(fixture.stores);
+
+  ExpectRejected(fixture.stores, 10, meta::MetaCommand{begin});
+
+  EXPECT_EQ(DomainBytes(fixture.stores), before);
+}
+
+TEST(MetaFailoverTransitionApply,
+     BeginUncontrolledRejectsStaleTermAnchorWithoutMutation) {
+  ActivatedGroupFixture fixture = MakeActivatedGroup();
+  meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
+  begin.expected_group_term_ = 0;
   const std::string before = DomainBytes(fixture.stores);
 
   ExpectRejected(fixture.stores, 9, meta::MetaCommand{begin});
@@ -396,7 +603,6 @@ TEST(MetaFailoverTransitionApply,
   partial.transition_id_ = begin.transition_id_;
   partial.mode_ = meta::MetaFailoverMode::kUncontrolled;
   partial.target_term_ = begin.target_term_;
-  partial.successor_grant_ = begin.successor_grant_;
   ASSERT_TRUE(
       fixture.stores.topology_.InstallFailoverTransition("g1", partial, 9)
           .ok());
@@ -407,26 +613,6 @@ TEST(MetaFailoverTransitionApply,
   EXPECT_EQ(DomainBytes(fixture.stores), before);
   EXPECT_EQ(fixture.stores.grant_.GroupState("g1")->group_term_, 1u);
   EXPECT_TRUE(fixture.stores.grant_.GroupState("g1")->grant_.has_value());
-}
-
-TEST(MetaFailoverTransitionApply,
-     SuccessorPolicyCannotRetireWhileTransitionIsActive) {
-  ActivatedGroupFixture fixture = MakeActivatedGroup();
-  ExpectAccepted(fixture.stores, 9,
-                 meta::MetaCommand{MakeBeginUncontrolled(fixture)});
-  meta::RetirePolicy retire;
-  retire.request_id_ = Filled<16>(0x0b);
-  retire.policy_id_ = fixture.grant.policy_id_;
-  retire.version_ = fixture.grant.policy_version_;
-  const std::string before = DomainBytes(fixture.stores);
-
-  const meta::MetaApplyResult result =
-      ExpectRejected(fixture.stores, 10, meta::MetaCommand{retire});
-
-  EXPECT_NE(result.detail_.find("failover transition"), std::string::npos);
-  EXPECT_EQ(DomainBytes(fixture.stores), before);
-  EXPECT_TRUE(fixture.stores.policy_.IsVersionActive(
-      fixture.grant.policy_id_, fixture.grant.policy_version_));
 }
 
 TEST(MetaFailoverTransitionApply,
@@ -465,6 +651,7 @@ TEST(MetaFailoverTransitionApply,
     meta::MetaStores created;
     const meta::SubmitOperation root = ClusterCreateRoot();
     ExpectAccepted(created, 1, meta::MetaCommand{root});
+    SeedRequiredCurrentPolicies(created);
     meta::CompleteOperation complete;
     complete.request_id_ = Filled<16>(0x58);
     complete.operation_id_ = root.operation_id_;
@@ -493,10 +680,7 @@ TEST(MetaFailoverTransitionApply,
   activate.group_id_ = "g1";
   activate.expected_term_ = 2;
   activate.new_owner_ = NodeId(1);
-  activate.grant_ = meta::MetaGrantSpec{5000, "p", 0};
-  activate.new_authority_version_ = 2;
   activate.new_topology_epoch_ = 4;
-  activate.new_config_epoch_ = 2;
   expect_blocked(meta::MetaCommand{activate});
 
   meta::RemoveNodeFromGroup remove;
@@ -530,7 +714,6 @@ TEST(MetaFailoverTransitionApply,
   slots.request_id_ = Filled<16>(0x65);
   slots.ranges_ = {{0, 16383, "g1"}};
   slots.new_topology_epoch_ = 4;
-  slots.config_epochs_ = {{"g1", 2}};
   expect_blocked(meta::MetaCommand{slots});
 }
 

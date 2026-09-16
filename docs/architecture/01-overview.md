@@ -88,7 +88,7 @@ operator --> keylane-ctl cluster-status / failover / getop
 | Function catalog | Stage one complete process-global Function definition set on every worker, commit its existing `FUNCTION DUMP` encoding, swap runtimes, and recover it before service readiness | `FunctionCatalog` |
 | Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, prepare and activate a Meta-selected successor, follow the committed owner, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
 | Cluster data plane | Admit, redirect, pause, or refuse requests by Meta-projected slot ownership, failover state, and finite authority; reconcile failover actions and owner following; serve Redis Cluster discovery | `cluster::AuthorityGuard::CaptureAndAdmit` / `RegisterAndRecheck`, `cluster::TopologyCache`, `cluster::NodeControlInstaller`, `cluster::MetaControlClientService` |
-| Meta control plane | Replicate metadata commands, project node-specific desired state, publish leader-scoped Data sessions, reconcile committed failover transitions from fresh observations, and expose authenticated administration plus stable cluster readiness | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer`, `meta::MetaFailoverReconciler` |
+| Meta control plane | Replicate metadata commands and typed global Policy, project node-specific desired state, publish leader-scoped Data sessions, detect sustained current-Owner failure, reconcile committed failover transitions, and expose authenticated administration plus stable cluster readiness | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaControlProjector`, `meta::MetaDataControlServer`, `meta::MetaAutomaticFailoverReconciler`, `meta::MetaFailoverReconciler` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
 ## Process lifecycle
@@ -168,6 +168,16 @@ The metrics service can exist during startup but receives the same readiness
 state explicitly.
 
 ### Meta-managed failover
+
+For each Group, the caught-up Meta leader joins the current typed automatic
+failover Policy and committed Owner authority to current authenticated Data
+observations. `MetaAutomaticFailoverReconciler` treats stale or causally
+incomplete evidence as indeterminate, debounces only exact Owner failures on a
+monotonic leader-local clock, and submits one candidate-less automatic
+uncontrolled Begin. That Begin's Raft commit atomically advances and fences the
+Group term and installs the durable transition. A replacement Meta leader
+discards pre-commit detector time; after Begin commits, it needs only the
+durable transition described below.
 
 Each Group may carry one committed `FailoverTransition` beside its current
 topology and authority. A leader-scoped, level-triggered reconciler derives the

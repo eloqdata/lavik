@@ -36,6 +36,10 @@ struct MetaCommittedStatusView {
   // admission condition, not snapshot corruption.
   bool cluster_non_pristine_ = false;
   bool active_cluster_create_operation_ = false;
+  // Derived scalar only: cluster status intentionally excludes Policy
+  // identities and raw documents while still reporting the detector's
+  // effective threshold during a transient publication gap.
+  std::uint64_t automatic_failover_threshold_ms_ = 0;
   // The compact creation projection retains only diagnostic routing facts,
   // never the complete operation intent or destructive workflow evidence.
   std::string active_cluster_create_phase_;

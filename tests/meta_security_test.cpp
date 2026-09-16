@@ -1,11 +1,13 @@
 #include <sys/types.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "keylane/meta/automatic_failover_detector.h"
 #include "keylane/meta/commands.h"
 #include "keylane/meta/ctl_server.h"
 #include "keylane/meta/identity_store.h"
@@ -183,6 +185,22 @@ TEST(MetaIdentitySecurity, UnixAdminRequiresPathAndExplicitUid) {
   EXPECT_TRUE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
 }
 
+TEST(MetaCtlPolicyAdmin, PolicyVersionRequiresCanonicalPositiveDecimal) {
+  std::uint64_t version = 0;
+  EXPECT_TRUE(keylane::meta::detail::ParseAdminPolicyVersion("1", &version));
+  EXPECT_EQ(version, 1u);
+  EXPECT_TRUE(keylane::meta::detail::ParseAdminPolicyVersion(
+      "18446744073709551615", &version));
+  EXPECT_EQ(version, std::numeric_limits<std::uint64_t>::max());
+
+  EXPECT_FALSE(keylane::meta::detail::ParseAdminPolicyVersion("0", &version));
+  EXPECT_FALSE(keylane::meta::detail::ParseAdminPolicyVersion("01", &version));
+  EXPECT_FALSE(
+      keylane::meta::detail::ParseAdminPolicyVersion("0001", &version));
+  EXPECT_FALSE(keylane::meta::detail::ParseAdminPolicyVersion(
+      "18446744073709551616", &version));
+}
+
 TEST(MetaClusterStatusServiceTest, EnforcesSingleFlightAndRetainedBudget) {
   keylane::meta::MetaClusterStatusService service;
   EXPECT_TRUE(service.TryBeginCapture());
@@ -210,14 +228,10 @@ TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
   MetaCommittedStatusView view;
   MetaCommittedStatusGroup group;
   group.topology_.group_id_ = "group-a";
-  group.topology_.record_.authority_version_ = 5;
   group.topology_.members_.push_back(
       {.node_id_ = node_id, .assignment_id_ = assignment});
   group.grant_.group_term_ = 4;
-  group.grant_.grant_ = MetaGroupGrant{.owner_ = node_id,
-                                       .term_ = 4,
-                                       .authority_version_ = 5,
-                                       .grant_revision_ = 6};
+  group.grant_.grant_ = MetaGroupGrant{.owner_ = node_id};
   view.groups_.push_back(std::move(group));
   const ClusterCaptureWireV1 capture{.responder_id_ = 1,
                                      .term_ = 7,
@@ -240,8 +254,6 @@ TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
                             .group_id = "group-a",
                             .assignment_id = assignment,
                             .group_term = 4,
-                            .authority_version = 5,
-                            .grant_revision = 6,
                             .granted_duration_ms = 500};
   runtime.lease_decision_written_unix_ms_ = 1001;
   auto observe = [&](std::int64_t now_unix_ms) {
@@ -267,8 +279,7 @@ TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
     status.groups_.push_back({.group_id_ = "group-a",
                               .term_ = 4,
                               .owner_node_id_ = node_id,
-                              .config_epoch_ = 8,
-                              .grant_revision_ = 6});
+                              .effective_threshold_ms_ = 1'000});
     const auto encoded = EncodeClusterStatusReply(status);
     ASSERT_TRUE(encoded.ok()) << encoded.status();
     const auto decoded = DecodeClusterStatusReply(*encoded);
@@ -314,7 +325,8 @@ TEST(MetaClusterStatusBracketTest, RejectsEveryMixedAuthorityCut) {
                .ctl_endpoint_ = "127.0.0.1:7101"},
           },
       .leadership_ = {.leadership_generation_ = 5,
-                      .leader_authority_eligible_ = true},
+                      .leader_authority_eligible_ = true,
+                      .leader_authority_eligibility_revision_ = 9},
   };
   EXPECT_TRUE(IsStableClusterStatusBracket(before, before));
 
@@ -336,6 +348,31 @@ TEST(MetaClusterStatusBracketTest, RejectsEveryMixedAuthorityCut) {
   expect_changed([](auto& value) {
     value.leadership_.leader_authority_eligible_ = false;
   });
+  expect_changed([](auto& value) {
+    ++value.leadership_.leader_authority_eligibility_revision_;
+  });
+}
+
+TEST(MetaClusterStatusBracketTest,
+     RejectsDetectorStateFromBeforeAnEligibilityAba) {
+  keylane::meta::MetaDataControlRuntimeSnapshot runtime{
+      .leadership_generation_ = 5,
+      .leader_authority_eligible_ = true,
+      .leader_authority_eligibility_revision_ = 3,
+  };
+  keylane::meta::MetaAutomaticFailoverDiagnosticsSnapshot detector{
+      .leadership_generation_ = 5,
+      .leader_authority_eligibility_revision_ = 1,
+      .evaluated_applied_index_ = 17,
+  };
+  EXPECT_FALSE(keylane::meta::detail::IsCurrentAutomaticFailoverDiagnostics(
+      runtime, detector, /*committed_applied_index=*/17));
+  detector.leader_authority_eligibility_revision_ = 3;
+  EXPECT_TRUE(keylane::meta::detail::IsCurrentAutomaticFailoverDiagnostics(
+      runtime, detector, /*committed_applied_index=*/17));
+  ++detector.evaluated_applied_index_;
+  EXPECT_FALSE(keylane::meta::detail::IsCurrentAutomaticFailoverDiagnostics(
+      runtime, detector, /*committed_applied_index=*/17));
 }
 
 TEST(MetaIdentitySecurity, RegistrationRejectsPrincipalForAnotherNode) {

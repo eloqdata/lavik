@@ -732,10 +732,8 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     keylane::meta::MetaOperationId operation_id_ = MakeOperationId(0xa3);
     keylane::meta::MetaFailoverTransitionId transition_id_ =
         MakeFixedId<16>(0xa4);
-    keylane::meta::MetaGrantSpec grant_{5000, "fail-safe-policy", 0};
     keylane::meta::MetaFailoverCandidateAction action_;
     std::uint64_t deadline_unix_ms_ = 2'000'000'000'000ULL;
-    std::uint64_t grant_revision_ = 0;
     std::uint64_t transition_revision_ = 0;
   };
 
@@ -901,6 +899,22 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     root.intent_hash_ = keylane::meta::MetaSha256(root.intent_);
     ProposeAccepted(root);
 
+    keylane::meta::PutPolicy automatic;
+    automatic.request_id_ = MakeRequestId(0x96);
+    automatic.policy_id_ =
+        std::string(keylane::meta::kAutomaticUncontrolledFailoverPolicyId);
+    automatic.version_ = 1;
+    automatic.content_ =
+        R"({"kind":"automatic-uncontrolled-failover-v1","enabled":true,"suspect_after_ms":5000})";
+    ProposeAccepted(automatic);
+
+    keylane::meta::PutPolicy policy;
+    policy.request_id_ = MakeRequestId(0x9b);
+    policy.policy_id_ = std::string(keylane::meta::kAuthorityLeasePolicyId);
+    policy.version_ = 1;
+    policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
+    ProposeAccepted(policy);
+
     keylane::meta::CompleteOperation complete_root;
     complete_root.request_id_ = MakeRequestId(0x92);
     complete_root.operation_id_ = root.operation_id_;
@@ -946,15 +960,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     assign_candidate.new_topology_epoch_ = 3;
     ProposeAccepted(assign_candidate);
 
-    keylane::meta::PutPolicy policy;
-    policy.request_id_ = MakeRequestId(0x96);
-    policy.policy_id_ = state.grant_.policy_id_;
-    policy.version_ = state.grant_.policy_version_;
-    policy.content_ = R"({"lease_ms":5000})";
-    policy.content_hash_ =
-        keylane::meta::MetaPolicyStore::ContentHash(policy.content_);
-    ProposeAccepted(policy);
-
     BeginGroupTerm term;
     term.request_id_ = MakeRequestId(0x97);
     term.group_id_ = "g1";
@@ -967,11 +972,8 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     activate.group_id_ = "g1";
     activate.expected_term_ = 1;
     activate.new_owner_ = state.owner_;
-    activate.grant_ = state.grant_;
-    activate.new_authority_version_ = 1;
     activate.new_topology_epoch_ = 4;
-    activate.new_config_epoch_ = 1;
-    ProposeAccepted(activate, &state.grant_revision_);
+    ProposeAccepted(activate);
 
     keylane::meta::FailoverOperationIntent intent;
     intent.group_id_ = "g1";
@@ -1006,7 +1008,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     begin.group_id_ = "g1";
     begin.transition_id_ = state.transition_id_;
     begin.target_term_ = 2;
-    begin.successor_grant_ = state.grant_;
     begin.candidate_action_ = state.action_;
     begin.operation_id_ = state.operation_id_;
     begin.expected_operation_revision_ = 0;
@@ -1015,12 +1016,9 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     begin.expected_owner_assignment_id_ = state.owner_assignment_;
     begin.expected_membership_revision_ = 3;
     begin.expected_group_term_ = 1;
-    begin.expected_authority_version_ = 1;
-    begin.expected_grant_revision_ = state.grant_revision_;
     begin.expected_population_manifest_revision_ = 0;
     begin.expected_population_manifest_digest_.fill(0);
     begin.expected_partition_replication_epoch_ = 0;
-    begin.expected_config_epoch_ = 1;
     ProposeAccepted(begin, &state.transition_revision_);
   }
 
@@ -1055,9 +1053,9 @@ TEST_F(MetaCoordinatorServerTest, ProposeInjectsActorAndReturnsAuditVerdict) {
   ASSERT_TRUE(stores.identity_.FindNode(MakeNodeId(0x11)).has_value());
   const auto audit = stores.audit_.Find(accepted->log_index_);
   ASSERT_TRUE(audit.has_value());
-  EXPECT_EQ(audit->record_.actor_principal_, kTestPrincipal);
-  EXPECT_FALSE(audit->record_.readable_time_.empty());
-  EXPECT_NE(audit->record_.readable_time_.find('T'), std::string::npos);
+  EXPECT_EQ(audit->actor_principal_, kTestPrincipal);
+  EXPECT_FALSE(audit->readable_time_.empty());
+  EXPECT_NE(audit->readable_time_.find('T'), std::string::npos);
 
   // A domain rejection surfaces as the apply VERDICT (from the audit store),
   // not as a propose-level error: the index was committed and consumed.
@@ -1324,20 +1322,14 @@ TEST_F(MetaCoordinatorServerTest,
   commit.action_id_ = failover.action_.action_id_;
   commit.authorized_revision_ = failover.transition_revision_;
   commit.expected_candidate_ = failover.action_.candidate_;
-  commit.successor_grant_ = failover.grant_;
   commit.expected_owner_node_id_ = failover.owner_;
   commit.expected_owner_assignment_id_ = failover.owner_assignment_;
   commit.expected_membership_revision_ = 3;
   commit.expected_group_term_ = 1;
-  commit.expected_authority_version_ = 1;
-  commit.expected_grant_revision_ = failover.grant_revision_;
   commit.expected_population_manifest_revision_ = 0;
   commit.expected_population_manifest_digest_.fill(0);
   commit.expected_partition_replication_epoch_ = 0;
-  commit.expected_config_epoch_ = 1;
-  commit.new_authority_version_ = 2;
   commit.new_topology_epoch_ = 5;
-  commit.new_config_epoch_ = 2;
   const std::uint64_t before_commit = machine_->last_commit_index();
   auto committed = ProposeSync(commit);
   ASSERT_FALSE(committed.ok());
@@ -1377,8 +1369,8 @@ TEST_F(MetaCoordinatorServerTest,
 
   const auto abort_audit = after.audit_.Find(aborted->log_index_);
   ASSERT_TRUE(abort_audit.has_value());
-  abort.actor_.principal_ = abort_audit->record_.actor_principal_;
-  abort.actor_.readable_time_ = abort_audit->record_.readable_time_;
+  abort.actor_.principal_ = abort_audit->actor_principal_;
+  abort.actor_.readable_time_ = abort_audit->readable_time_;
   auto encoded_abort = MetaStateMachine::EncodeCommand(MetaCommand{abort});
   ASSERT_TRUE(encoded_abort.ok()) << encoded_abort.status();
   machine_->commit(aborted->log_index_, **encoded_abort);
@@ -1976,7 +1968,6 @@ TEST_F(MetaCoordinatorServerTest,
   const auto stores = machine_->StoresSnapshot();
   EXPECT_EQ(stores.operation_.LiveCount(), 1u);
   EXPECT_EQ(stores.audit_.size(), 2u);
-  EXPECT_TRUE(stores.audit_.VerifyChain());
   EXPECT_GE(machine_->last_commit_index(), committed_before);
 
   // The committed stream is alive on the new leader: a fresh subscription

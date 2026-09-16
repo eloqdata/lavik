@@ -27,11 +27,7 @@ namespace {
 constexpr std::size_t kMaxManifestBytes = 64 * 1024;
 constexpr std::size_t kMaxAdminCommandBytes = 64 * 1024;
 constexpr std::size_t kMaxWireString = 64 * 1024;
-// Version 1 encoded one scalar Meta id; version 2 carried a server wait budget.
-// Version 3 added the caller-generated root id; keep decoding it so persisted
-// creation operations can recover. Version 4 adds each Data TLS endpoint.
-// Versions 1/2 lack the atomic Genesis contract and remain unsupported.
-constexpr std::uint16_t kWireVersion = 4;
+constexpr std::uint16_t kWireVersion = 5;
 constexpr std::uint32_t kMaxManifestItems = 16'384;
 
 absl::Status Invalid(std::string message) {
@@ -73,6 +69,13 @@ absl::StatusOr<std::string> ParseString(const CLI::ConfigItem& item) {
   return item.inputs.front();
 }
 
+absl::StatusOr<bool> ParseBool(const CLI::ConfigItem& item) {
+  if (item.inputs.size() != 1) return Invalid("duplicate manifest field");
+  if (item.inputs.front() == "true") return true;
+  if (item.inputs.front() == "false") return false;
+  return Invalid("manifest boolean must be true or false");
+}
+
 absl::StatusOr<std::vector<std::string>> ParseStringList(
     const CLI::ConfigItem& item) {
   std::vector<std::string> values;
@@ -101,6 +104,19 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
       manifest->groups_.size() > kMaxManifestItems ||
       manifest->slot_ranges_.size() > kMaxManifestItems) {
     return Invalid("clustercreate manifest is not a supported v1 topology");
+  }
+  if (manifest->automatic_uncontrolled_failover_suspect_after_ms_ <
+          kMinimumAutomaticFailoverSuspectAfterMs ||
+      manifest->automatic_uncontrolled_failover_suspect_after_ms_ >
+          kMaximumAutomaticFailoverSuspectAfterMs) {
+    return Invalid(
+        "automatic_uncontrolled_failover_suspect_after_ms is out of range");
+  }
+  if (manifest->authority_lease_duration_ms_ <
+          kMinimumAuthorityLeaseDurationMs ||
+      manifest->authority_lease_duration_ms_ >
+          kMaximumAuthorityLeaseDurationMs) {
+    return Invalid("authority_lease_duration_ms is out of range");
   }
 
   std::sort(manifest->meta_members_.begin(), manifest->meta_members_.end(),
@@ -449,16 +465,19 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
     return Invalid(std::string("invalid TOML: ") + error.what());
   }
 
-  enum class Section { kNone, kMeta, kData, kGroup, kSlot };
+  enum class Section { kNone, kBootstrapPolicy, kMeta, kData, kGroup, kSlot };
   ClusterCreateManifestV1 result;
   Section section = Section::kNone;
   std::set<std::string> section_fields;
   std::set<std::string> top_fields;
+  bool saw_bootstrap_policy = false;
 
   const auto finish_section = [&]() -> absl::Status {
     switch (section) {
       case Section::kNone:
         return absl::OkStatus();
+      case Section::kBootstrapPolicy:
+        break;
       case Section::kMeta:
         if (section_fields != std::set<std::string>{"ctl_endpoint",
                                                     "data_control_endpoint",
@@ -500,7 +519,13 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
       }
       section_fields.clear();
       const std::string& name = item.parents.front();
-      if (name == "meta_members") {
+      if (name == "bootstrap_policy") {
+        if (saw_bootstrap_policy) {
+          return Invalid("duplicate bootstrap_policy section");
+        }
+        saw_bootstrap_policy = true;
+        section = Section::kBootstrapPolicy;
+      } else if (name == "meta_members") {
         section = Section::kMeta;
         result.meta_members_.emplace_back();
       } else if (name == "data_nodes") {
@@ -550,6 +575,24 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
     }
 
     switch (section) {
+      case Section::kBootstrapPolicy:
+        if (item.name == "automatic_uncontrolled_failover_enabled") {
+          auto value = ParseBool(item);
+          if (!value.ok()) return value.status();
+          result.automatic_uncontrolled_failover_enabled_ = *value;
+        } else if (item.name ==
+                   "automatic_uncontrolled_failover_suspect_after_ms") {
+          auto value = ParseUnsigned<std::uint64_t>(item);
+          if (!value.ok()) return value.status();
+          result.automatic_uncontrolled_failover_suspect_after_ms_ = *value;
+        } else if (item.name == "authority_lease_duration_ms") {
+          auto value = ParseUnsigned<std::uint64_t>(item);
+          if (!value.ok()) return value.status();
+          result.authority_lease_duration_ms_ = *value;
+        } else {
+          return Invalid("unknown bootstrap_policy field");
+        }
+        break;
       case Section::kMeta: {
         if (item.name == "id") {
           auto value = ParseUnsigned<std::uint32_t>(item);
@@ -658,9 +701,13 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
 
   Writer writer;
   writer.U16(kWireVersion);
-  writer.Raw(std::string_view(
-      reinterpret_cast<const char*>(root_operation_id.data()),
-      root_operation_id.size()));
+  writer.Raw(
+      std::string_view(reinterpret_cast<const char*>(root_operation_id.data()),
+                       root_operation_id.size()));
+  writer.U16(manifest.automatic_uncontrolled_failover_enabled_ ? 1 : 0);
+  writer.U32(static_cast<std::uint32_t>(
+      manifest.automatic_uncontrolled_failover_suspect_after_ms_));
+  writer.U32(static_cast<std::uint32_t>(manifest.authority_lease_duration_ms_));
   writer.U32(static_cast<std::uint32_t>(manifest.meta_members_.size()));
   for (const auto& member : manifest.meta_members_) {
     writer.U32(member.server_id_);
@@ -728,7 +775,7 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
   Reader reader(*bytes);
   auto version = reader.U16();
   if (!version.ok()) return version.status();
-  if (*version != 3 && *version != kWireVersion)
+  if (*version != kWireVersion)
     return Invalid("unsupported clustercreate version");
   auto root = reader.Raw(root_operation_id->size());
   if (!root.ok()) return root.status();
@@ -738,6 +785,17 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
 
   ClusterCreateManifestV1 manifest;
   manifest.schema_version_ = 1;
+  auto automatic_enabled = reader.U16();
+  auto suspect_after_ms = reader.U32();
+  auto authority_lease_duration_ms = reader.U32();
+  if (!automatic_enabled.ok() || *automatic_enabled > 1 ||
+      !suspect_after_ms.ok() || !authority_lease_duration_ms.ok()) {
+    return Invalid("invalid bootstrap Policy defaults");
+  }
+  manifest.automatic_uncontrolled_failover_enabled_ = *automatic_enabled == 1;
+  manifest.automatic_uncontrolled_failover_suspect_after_ms_ =
+      *suspect_after_ms;
+  manifest.authority_lease_duration_ms_ = *authority_lease_duration_ms;
   auto meta_count = reader.U32();
   if (!meta_count.ok() || *meta_count == 0 || *meta_count > kMaxManifestItems) {
     return Invalid("invalid Meta member count");
@@ -776,11 +834,9 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
     auto endpoint = reader.String();
     if (!endpoint.ok()) return endpoint.status();
     node.client_endpoint_ = std::move(*endpoint);
-    if (*version >= 4) {
-      auto tls_endpoint = reader.String();
-      if (!tls_endpoint.ok()) return tls_endpoint.status();
-      node.tls_endpoint_ = std::move(*tls_endpoint);
-    }
+    auto tls_endpoint = reader.String();
+    if (!tls_endpoint.ok()) return tls_endpoint.status();
+    node.tls_endpoint_ = std::move(*tls_endpoint);
     manifest.data_nodes_.push_back(std::move(node));
   }
 
@@ -903,9 +959,9 @@ absl::StatusOr<ClusterCreateOutcome> ClusterOperator::Create(
   }
   auto root_operation_id = GenerateOperationId();
   if (!root_operation_id.ok()) return root_operation_id.status();
-  const std::string expected_id = Hex(std::string_view(
-      reinterpret_cast<const char*>(root_operation_id->data()),
-      root_operation_id->size()));
+  const std::string expected_id = Hex(
+      std::string_view(reinterpret_cast<const char*>(root_operation_id->data()),
+                       root_operation_id->size()));
   auto request = EncodeClusterCreateRequest(manifest, *root_operation_id);
   if (!request.ok()) return request.status();
   auto reply = round_trip_(leader, *request, options.deadline_);

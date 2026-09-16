@@ -304,8 +304,7 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
     if (submit->kind_ != kFailoverOperationKind) return absl::OkStatus();
     const auto intent = DecodeFailoverOperationIntent(submit->intent_);
     if (!intent.ok() || submit->intent_hash_ != MetaSha256(submit->intent_) ||
-        !IsZero(submit->replication_history_id_) ||
-        !submit->policy_references_.empty()) {
+        !IsZero(submit->replication_history_id_)) {
       return Invalid("failover submit requires canonical request-only intent");
     }
     return absl::OkStatus();

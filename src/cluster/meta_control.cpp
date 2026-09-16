@@ -24,10 +24,6 @@
 namespace keylane::cluster {
 namespace {
 
-// Projected policy ids retain the durable Meta command cap even though the
-// generic protocol identifier codec also serves longer endpoint fields.
-constexpr std::size_t kMaxProjectedPolicyIdBytes = 128;
-
 bool IsZero(const control::WireId128& value) {
   return std::all_of(value.begin(), value.end(),
                      [](std::uint8_t byte) { return byte == 0; });
@@ -112,8 +108,8 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   if (desired.source_meta_applied_index == 0) {
     return Invalid("source Meta applied index is zero");
   }
-  if (IsZero(desired.projection_hash) || IsZero(desired.object_hash)) {
-    return Invalid("projection or object hash is empty");
+  if (IsZero(desired.projection_hash)) {
+    return Invalid("projection hash is empty");
   }
   auto semantic_hash = control::ComputeProjectionHash(desired);
   if (!semantic_hash.ok()) {
@@ -140,18 +136,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
                       std::move(entries))
              .second) {
       return Invalid("manifest document is non-canonical or duplicated");
-    }
-  }
-
-  std::set<std::pair<std::string, std::uint64_t>> policies;
-  for (const control::WirePolicy& policy : desired.policies) {
-    if (policy.policy_id.empty() ||
-        policy.policy_id.size() > kMaxProjectedPolicyIdBytes ||
-        policy.version == 0 || policy.content.empty() ||
-        policy.content.size() > control::kMaxOpaqueFieldBytes ||
-        control::ComputeSha256(policy.content) != policy.content_hash ||
-        !policies.emplace(policy.policy_id, policy.version).second) {
-      return Invalid("policy document is non-canonical or duplicated");
     }
   }
 
@@ -189,23 +173,8 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   // untrusted boundary rechecks it instead of relying on the sender.
   std::set<std::string> assigned_nodes;
   for (const control::WireDesiredGroup& group : desired.groups) {
+    builder.IncludeGroupTerm(group.group_term);
     if (group.group_id.empty()) return Invalid("group id is empty");
-    if (group.grant_active) {
-      if (group.grant_duration_ms == 0 || group.grant_policy_id.empty() ||
-          group.grant_policy_version == 0) {
-        return Invalid(absl::StrCat("active grant for group ", group.group_id,
-                                    " has no duration or policy identity"));
-      }
-      if (!policies.contains(
-              {group.grant_policy_id, group.grant_policy_version})) {
-        return Invalid(absl::StrCat("active grant for group ", group.group_id,
-                                    " references an absent policy"));
-      }
-    } else if (group.grant_duration_ms != 0 || !group.grant_policy_id.empty() ||
-               group.grant_policy_version != 0) {
-      return Invalid(absl::StrCat("inactive grant for group ", group.group_id,
-                                  " carries live lease parameters"));
-    }
     if ((group.manifest_revision == 0) != IsZero(group.manifest_digest)) {
       return Invalid(absl::StrCat("group ", group.group_id,
                                   " has a partial manifest identity"));
@@ -226,8 +195,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     }
     std::optional<NodeIndex> owner_index;
     if (group.owner_node_id.has_value()) {
-      if (group.group_term == 0 || group.authority_version == 0 ||
-          group.grant_revision == 0 || group.config_epoch == 0) {
+      if (group.group_term == 0) {
         return Invalid(absl::StrCat("group ", group.group_id,
                                     " has an incomplete owner authority"));
       }
@@ -237,13 +205,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
             absl::StrCat("group ", group.group_id, " names an unknown owner"));
       }
       owner_index = owner->second;
-    } else if ((group.authority_version == 0) != (group.grant_revision == 0) ||
-               (group.authority_version != 0 && group.group_term == 0)) {
-      // Ownerless groups cover both pre-activation and fenced states. The
-      // latter retains its last authority anchors for directive/lease
-      // fencing, but it never exposes that history as a serving owner.
-      return Invalid(absl::StrCat("ownerless group ", group.group_id,
-                                  " has partial historical authority"));
     }
     bool owner_member = false;
     for (const control::WireDesiredMember& member : group.members) {
@@ -270,7 +231,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
       } else if (group.grant_active && owner_index.has_value()) {
         nodes[node->second].primary_node_index_ = *owner_index;
       }
-      nodes[node->second].config_epoch_ = group.config_epoch;
+      nodes[node->second].group_term_ = group.group_term;
     }
     if (group.owner_node_id.has_value() &&
         (!owner_member || IsZero(*group.owner_assignment_id))) {
@@ -291,9 +252,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     PreparedGroupControlIdentity control_group{
         .group_id_ = source.group_id,
         .group_term_ = source.group_term,
-        .authority_version_ = source.authority_version,
-        .grant_revision_ = source.grant_revision,
-        .config_epoch_ = source.config_epoch,
         .manifest_revision_ = source.manifest_revision,
         .manifest_digest_ = source.manifest_digest,
         .partition_replication_epoch_ = source.partition_replication_epoch,
@@ -310,9 +268,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
         .identity_ = control_group,
         .owner_ = std::nullopt,
         .grant_active_ = source.grant_active,
-        .grant_duration_ms_ = source.grant_duration_ms,
-        .grant_policy_id_ = source.grant_policy_id,
-        .grant_policy_version_ = source.grant_policy_version,
         .activation_action_id_ = std::nullopt,
         .failover_transition_ = std::nullopt,
         .owner_endpoint_ = std::nullopt,
@@ -375,10 +330,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
                               source.failover_transition->mode ==
                                   control::WireFailoverMode::kControlled;
     group.group_term_ = source.group_term;
-    group.authority_version_ = source.authority_version;
-    group.grant_revision_ = source.grant_revision;
     group.manifest_revision_ = source.manifest_revision;
-    group.config_epoch_ = source.config_epoch;
     for (const control::WireDesiredMember& member : source.members) {
       if (member.node_id != *source.owner_node_id) {
         group.replica_node_indices_.push_back(node_indices.at(member.node_id));
@@ -394,7 +346,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   if (!state.ok()) return Invalid(std::string(state.status().message()));
   return PreparedFullState{
       .serving_state_ = std::move(*state),
-      .object_hash_ = desired.object_hash,
+      .authority_lease_duration_ms_ = desired.authority_lease_duration_ms,
       .control_groups_ = std::move(control_groups),
       .desired_cluster_controls_ = std::move(desired_cluster_controls),
   };

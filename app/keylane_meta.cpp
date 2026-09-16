@@ -74,6 +74,7 @@
 #pragma GCC diagnostic pop
 
 #include "keylane/cluster/meta_client.h"
+#include "keylane/meta/automatic_failover_reconciler.h"
 #include "keylane/meta/cluster_create.h"
 #include "keylane/meta/cluster_create_reconciler.h"
 #include "keylane/meta/coordinator.h"
@@ -856,6 +857,8 @@ int main(int argc, char** argv) {
       std::make_shared<keylane::meta::MetaClusterStatusService>();
   auto data_control_runtime_status =
       std::make_shared<keylane::meta::MetaDataControlRuntimeStatus>();
+  auto automatic_failover_diagnostics = std::make_shared<
+      keylane::meta::MetaAutomaticFailoverDiagnosticsRegistry>();
   nuraft::ptr<nuraft::log_store> raft_log_store = state_mgr->load_log_store();
   auto* wal = static_cast<keylane::meta::NuraftLogStore*>(raft_log_store.get());
   MetaCoordinatorOptions coordinator_options;
@@ -874,6 +877,25 @@ int main(int argc, char** argv) {
       std::make_shared<keylane::meta::MetaMembershipReconciler>(
           foreign_executor, *proposal_executor, server, state_machine,
           state_mgr, membership_gate);
+  const std::uint64_t leader_observation_grace_ms =
+      static_cast<std::uint64_t>(std::max<std::int64_t>(
+          observation_ttl_ms,
+          static_cast<std::int64_t>(options.election_ms_high_) +
+              keylane::cluster::MetaReconnectBackoff::MaximumWindow().count()));
+  keylane::meta::MetaAutomaticFailoverReconcilerOptions
+      automatic_failover_options;
+  automatic_failover_options.data_control_runtime_status_ =
+      data_control_runtime_status;
+  automatic_failover_options.diagnostics_ = automatic_failover_diagnostics;
+  automatic_failover_options.observation_ttl_ms_ = observation_ttl_ms;
+  automatic_failover_options.observation_grace_ms_ =
+      leader_observation_grace_ms;
+  auto automatic_failover_reconciler =
+      std::make_shared<keylane::meta::MetaAutomaticFailoverReconciler>(
+          foreign_executor, std::move(automatic_failover_options));
+  coordinator->AddValidateHook(
+      automatic_failover_reconciler->validation_hook());
+
   keylane::meta::MetaFailoverReconcilerOptions failover_options;
   // A replacement leader starts with no volatile observations. Its absence
   // warmup must span both the Raft election and Data's longest reconnect
@@ -881,10 +903,7 @@ int main(int argc, char** argv) {
   // it redials the new leader. Candidate disconnect and typed action-failure
   // evidence remain immediate; an exact source disconnect uses its independent
   // recovery grace.
-  failover_options.observation_grace_ms_ = std::max<std::int64_t>(
-      observation_ttl_ms,
-      static_cast<std::int64_t>(options.election_ms_high_) +
-          keylane::cluster::MetaReconnectBackoff::MaximumWindow().count());
+  failover_options.observation_grace_ms_ = leader_observation_grace_ms;
   auto failover_reconciler =
       std::make_shared<keylane::meta::MetaFailoverReconciler>(
           foreign_executor, std::move(failover_options));
@@ -899,10 +918,6 @@ int main(int argc, char** argv) {
     control_options.tls_key_file_ = options.tls_key_;
     control_options.local_ctl_endpoint_ = ctl_endpoint_text;
     control_options.runtime_status_ = data_control_runtime_status;
-    // Couple transport cadence and authority lifetime to the configured Raft
-    // liveness bounds instead of introducing unrelated control-plane knobs.
-    control_options.heartbeat_interval_ms_ =
-        static_cast<std::uint32_t>(options.heartbeat_ms_);
     control_options.observation_ttl_ms_ = observation_ttl_ms;
     control_options.leadership_validity_ms_ =
         static_cast<std::uint32_t>(options.election_ms_low_);
@@ -931,6 +946,8 @@ int main(int argc, char** argv) {
       ctl_options.local_ctl_endpoint_ = ctl_endpoint_text;
       ctl_options.cluster_status_service_ = cluster_status_service;
       ctl_options.data_control_runtime_status_ = data_control_runtime_status;
+      ctl_options.automatic_failover_diagnostics_ =
+          automatic_failover_diagnostics;
       ctl_options.cluster_create_reconciler_ = cluster_create_reconciler;
       ctl_options.membership_reconciler_ = membership_reconciler;
       ctl_options.observation_ttl_ms_ = observation_ttl_ms;
@@ -945,6 +962,8 @@ int main(int argc, char** argv) {
       ctl_options.local_ctl_endpoint_ = ctl_endpoint_text;
       ctl_options.cluster_status_service_ = cluster_status_service;
       ctl_options.data_control_runtime_status_ = data_control_runtime_status;
+      ctl_options.automatic_failover_diagnostics_ =
+          automatic_failover_diagnostics;
       ctl_options.cluster_create_reconciler_ = cluster_create_reconciler;
       ctl_options.membership_reconciler_ = membership_reconciler;
       ctl_options.observation_ttl_ms_ = observation_ttl_ms;
@@ -1017,6 +1036,7 @@ int main(int argc, char** argv) {
     coordinator->RunAsLeader(membership_reconciler);
     coordinator->RunAsLeader(cluster_create_reconciler);
     coordinator->RunAsLeader(data_control);
+    coordinator->RunAsLeader(automatic_failover_reconciler);
     coordinator->RunAsLeader(failover_reconciler);
   }
 
@@ -1044,6 +1064,7 @@ int main(int argc, char** argv) {
   // proposals/API entries may finish, but no remote Data or membership result
   // is needed to join; the next leader reconstructs work from committed state.
   failover_reconciler->Shutdown();
+  automatic_failover_reconciler->Shutdown();
   cluster_create_reconciler->Shutdown();
   membership_reconciler->Shutdown();
   // Stop both ingress surfaces first, then synchronously revoke the

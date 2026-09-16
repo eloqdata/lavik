@@ -1,11 +1,15 @@
 #include "../src/replication/source_authorization.h"
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
 #include "gtest/gtest.h"
 
 namespace {
+
+constexpr auto kLeaseNow = std::chrono::nanoseconds(100);
+constexpr auto kLeaseDeadline = std::chrono::nanoseconds(200);
 
 keylane::RebuildDirective Directive(std::uint64_t term, std::uint64_t revision,
                                     std::string target, std::string operation,
@@ -101,10 +105,12 @@ TEST(SourceAuthorizationLedgerTest,
   sibling.identity_.target_boot_id_ = "target-boot-b";
   ASSERT_TRUE(ledger.Authorize(first).ok());
   ASSERT_TRUE(ledger.Authorize(sibling).ok());
+  EXPECT_TRUE(ledger.RetainsSourceHistory());
 
   ledger.ClearActiveForSessionReplacement();
   EXPECT_FALSE(ledger.IsAuthorized(first.identity_));
   EXPECT_FALSE(ledger.IsAuthorized(sibling.identity_));
+  EXPECT_TRUE(ledger.RetainsSourceHistory());
   auto replay = ledger.Authorize(first);
   ASSERT_TRUE(replay.ok()) << replay.status();
   EXPECT_EQ(*replay, keylane::detail::SourceAuthorizationAction::kAuthorized);
@@ -113,6 +119,7 @@ TEST(SourceAuthorizationLedgerTest,
   // A committed revocation remains authoritative even if a later transport
   // session performs its ordinary cleanup before replaying its FDS.
   ledger.RevokeAll();
+  EXPECT_FALSE(ledger.RetainsSourceHistory());
   ledger.ClearActiveForSessionReplacement();
   EXPECT_EQ(ledger.Authorize(first).status().code(),
             absl::StatusCode::kFailedPrecondition);
@@ -204,34 +211,187 @@ TEST(SourceAuthorizationLedgerTest,
   keylane::RebuildIdentity rebuild = authorize.identity_;
   rebuild.directive_id_ = "rebuild-directive";
   rebuild.attempt_id_ = "rebuild-attempt";
+  ++rebuild.directive_revision_;
+  ledger.EnableLeaseAdmissionUntil(kLeaseDeadline);
   EXPECT_FALSE(ledger.IsAuthorized(rebuild));
   EXPECT_TRUE(ledger.MatchesAuthorizedRebuild(rebuild, authorize.flow_count_,
-                                              authorize.safe_source_active_));
+                                              authorize.safe_source_active_,
+                                              kLeaseNow));
+
+  auto same_revision = rebuild;
+  same_revision.directive_revision_ = authorize.identity_.directive_revision_;
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(
+      same_revision, authorize.flow_count_, true, kLeaseNow));
+  auto earlier_revision = rebuild;
+  earlier_revision.directive_revision_ =
+      authorize.identity_.directive_revision_ - 1;
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(
+      earlier_revision, authorize.flow_count_, true, kLeaseNow));
 
   auto wrong_manifest_revision = rebuild;
   ++wrong_manifest_revision.manifest_revision_;
-  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(wrong_manifest_revision,
-                                               authorize.flow_count_, true));
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(
+      wrong_manifest_revision, authorize.flow_count_, true, kLeaseNow));
   auto wrong_population_epoch = rebuild;
   ++wrong_population_epoch.partition_replication_epoch_;
-  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(wrong_population_epoch,
-                                               authorize.flow_count_, true));
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(
+      wrong_population_epoch, authorize.flow_count_, true, kLeaseNow));
   auto wrong_target = rebuild;
   wrong_target.target_node_id_ = "target-b";
-  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(wrong_target,
-                                               authorize.flow_count_, true));
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(
+      wrong_target, authorize.flow_count_, true, kLeaseNow));
   auto wrong_operation = rebuild;
   wrong_operation.operation_id_ = "operation-b";
-  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(wrong_operation,
-                                               authorize.flow_count_, true));
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(
+      wrong_operation, authorize.flow_count_, true, kLeaseNow));
+  auto wrong_authority = rebuild;
+  wrong_authority.authority_id_ = "authority-b";
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(
+      wrong_authority, authorize.flow_count_, true, kLeaseNow));
   auto stale_source_incarnation = rebuild;
   stale_source_incarnation.source_assignment_id_ = "source-assignment-b";
-  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(stale_source_incarnation,
-                                               authorize.flow_count_, true));
   EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(
-      rebuild, authorize.flow_count_ + 1, true));
-  EXPECT_FALSE(
-      ledger.MatchesAuthorizedRebuild(rebuild, authorize.flow_count_, false));
+      stale_source_incarnation, authorize.flow_count_, true, kLeaseNow));
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(
+      rebuild, authorize.flow_count_ + 1, true, kLeaseNow));
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                               false, kLeaseNow));
+}
+
+TEST(SourceAuthorizationLedgerTest,
+     LeaseGateSuspendsAdmissionWithoutLosingCurrentFdsCapability) {
+  keylane::detail::SourceAuthorizationLedger ledger;
+  const keylane::RebuildDirective authorize =
+      Directive(7, 11, "target-a", "operation-a", "authorize-attempt");
+  ASSERT_TRUE(ledger.Authorize(authorize).ok());
+  keylane::RebuildIdentity rebuild = authorize.identity_;
+  rebuild.directive_id_ = "rebuild-directive";
+  rebuild.attempt_id_ = "rebuild-attempt";
+  ++rebuild.directive_revision_;
+
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kLeaseSuspended);
+  EXPECT_FALSE(ledger.MatchesAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                               true, kLeaseNow));
+
+  ledger.EnableLeaseAdmissionUntil(kLeaseDeadline);
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kAuthorized);
+  EXPECT_TRUE(ledger.MatchesAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                              true, kLeaseNow));
+
+  ledger.SuspendLeaseAdmission();
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kLeaseSuspended);
+
+  // Session replacement removes the capability but marks its replay pending,
+  // so handshakes remain transiently suspended rather than terminally denied.
+  // A fresh lease still cannot reopen export until exact FDS replay restores
+  // the capability.
+  ledger.ClearActiveForSessionReplacement();
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kLeaseSuspended);
+  ASSERT_TRUE(ledger.Authorize(authorize).ok());
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kLeaseSuspended);
+  ledger.EnableLeaseAdmissionUntil(kLeaseDeadline);
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kAuthorized);
+  ledger.RevokeAll();
+  const keylane::RebuildDirective next_authorize =
+      Directive(8, 12, "target-a", "operation-a", "authorize-next-attempt");
+  ASSERT_TRUE(ledger.Authorize(next_authorize).ok());
+  keylane::RebuildIdentity next_rebuild = next_authorize.identity_;
+  next_rebuild.directive_id_ = "rebuild-next-directive";
+  next_rebuild.attempt_id_ = "rebuild-next-attempt";
+  ++next_rebuild.directive_revision_;
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(
+                next_rebuild, authorize.flow_count_, true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kLeaseSuspended);
+  ledger.EnableLeaseAdmissionUntil(kLeaseDeadline);
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(
+                next_rebuild, authorize.flow_count_, true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kAuthorized);
+}
+
+TEST(SourceAuthorizationLedgerTest,
+     LiveFdsReplacementMayReplayUnderTheStillValidLease) {
+  keylane::detail::SourceAuthorizationLedger ledger;
+  const keylane::RebuildDirective authorize =
+      Directive(7, 11, "target-a", "operation-a", "authorize-attempt");
+  ASSERT_TRUE(ledger.Authorize(authorize).ok());
+  ledger.EnableLeaseAdmissionUntil(kLeaseDeadline);
+  ledger.ClearActiveForFdsReplacement(/*expected_replays=*/1);
+  EXPECT_TRUE(ledger.RetainsSourceHistory());
+
+  keylane::RebuildIdentity rebuild = authorize.identity_;
+  rebuild.directive_id_ = "rebuild-directive";
+  rebuild.attempt_id_ = "rebuild-attempt";
+  ++rebuild.directive_revision_;
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kLeaseSuspended);
+  ASSERT_TRUE(ledger.Authorize(authorize).ok());
+
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kAuthorized);
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(rebuild, authorize.flow_count_,
+                                             true, kLeaseDeadline),
+            keylane::detail::SourceAuthorizationDisposition::kLeaseSuspended);
+}
+
+TEST(SourceAuthorizationLedgerTest,
+     FdsReplayGapRemainsSuspendedUntilEveryExpectedCapabilityArrives) {
+  keylane::detail::SourceAuthorizationLedger ledger;
+  const keylane::RebuildDirective first =
+      Directive(7, 11, "target-a", "operation-a", "attempt-a");
+  keylane::RebuildDirective second =
+      Directive(7, 11, "target-b", "operation-b", "attempt-b");
+  second.identity_.assignment_id_ = "assignment-b";
+  second.identity_.authority_id_ = "authority-b";
+  second.identity_.target_boot_id_ = "target-boot-b";
+  ledger.ClearActiveForFdsReplacement(/*expected_replays=*/2);
+
+  auto first_rebuild = first.identity_;
+  first_rebuild.directive_id_ = "rebuild-a";
+  ++first_rebuild.directive_revision_;
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(first_rebuild, first.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kLeaseSuspended);
+  ASSERT_TRUE(ledger.Authorize(first).ok());
+
+  auto second_rebuild = second.identity_;
+  second_rebuild.directive_id_ = "rebuild-b";
+  ++second_rebuild.directive_revision_;
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(second_rebuild, second.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kLeaseSuspended);
+  ASSERT_TRUE(ledger.Authorize(second).ok());
+  auto unknown_rebuild = second_rebuild;
+  unknown_rebuild.target_node_id_ = "target-c";
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(
+                unknown_rebuild, second.flow_count_, true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kNotAuthorized);
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(second_rebuild, second.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kLeaseSuspended);
+
+  ledger.EnableLeaseAdmissionUntil(kLeaseDeadline);
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(second_rebuild, second.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kAuthorized);
+  ledger.ClearActiveForFdsReplacement(/*expected_replays=*/0);
+  EXPECT_FALSE(ledger.RetainsSourceHistory());
+  EXPECT_EQ(ledger.ClassifyAuthorizedRebuild(second_rebuild, second.flow_count_,
+                                             true, kLeaseNow),
+            keylane::detail::SourceAuthorizationDisposition::kNotAuthorized);
 }
 
 TEST(SourceAuthorizationLedgerTest, EmptyRevocationIsAnIdempotentNoOp) {

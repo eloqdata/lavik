@@ -133,8 +133,6 @@ struct AuthorityAnchor {
   std::string group_id_;
   AssignmentId assignment_id_;
   std::uint64_t group_term_ = 0;
-  std::uint64_t authority_version_ = 0;
-  std::uint64_t grant_revision_ = 0;
 
   friend bool operator==(const AuthorityAnchor&,
                          const AuthorityAnchor&) = default;
@@ -245,6 +243,11 @@ class AuthorityGuard {
   absl::Status RenewLease(const SessionIdentity& session,
                           const AuthorityAnchor& anchor, MonotonicTime deadline,
                           MonotonicTime now);
+  // NodeControl uses this after an awaited dependent activation to prove that
+  // the exact lease it installed still exists and remains live.
+  bool HasExactLease(const SessionIdentity& session,
+                     const AuthorityAnchor& anchor, MonotonicTime deadline,
+                     MonotonicTime now) const;
   // Removes only the exact lease instance named by its original deadline.
   // A renewal changes that deadline, so a stale timer cannot revoke the
   // replacement lease. Returns true exactly once for a due lease.

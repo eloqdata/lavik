@@ -10,22 +10,24 @@
 
 namespace {
 
+using keylane::meta::ClusterAutomaticFailoverState;
 using keylane::meta::ClusterBlockerWireV1;
 using keylane::meta::ClusterDataNodeRole;
 using keylane::meta::ClusterHeadWireV1;
 using keylane::meta::ClusterMetaMemberWireV1;
 using keylane::meta::ClusterMetaRole;
 using keylane::meta::ClusterOperator;
+using keylane::meta::ClusterStateWireV1;
 using keylane::meta::ClusterStatusOptions;
 using keylane::meta::ClusterStatusResult;
 using keylane::meta::ClusterStatusWireV1;
-using keylane::meta::ClusterStateWireV1;
 using keylane::meta::DecodeClusterHeadReply;
 using keylane::meta::DecodeClusterStatusReply;
 using keylane::meta::EncodeClusterHeadReply;
 using keylane::meta::EncodeClusterStatusReply;
 using keylane::meta::MetaAdminTarget;
 using keylane::meta::RenderClusterStatusJson;
+using keylane::meta::RenderClusterStatusText;
 
 ClusterStatusWireV1 ReadyStatus(std::vector<ClusterMetaMemberWireV1> members,
                                 std::uint32_t responder_id = 1) {
@@ -55,13 +57,14 @@ ClusterStatusWireV1 ReadyStatus(std::vector<ClusterMetaMemberWireV1> members,
       .population_current_ = true,
       .lease_status_ = keylane::meta::ClusterLeaseStatus::kRecentlyGranted,
   });
-  status.groups_.push_back({.group_id_ = "group-1",
-                            .term_ = 4,
-                            .owner_node_id_ = "data-1",
-                            .config_epoch_ = 8,
-                            .grant_revision_ = 12,
-                            .serving_ready_ = true,
-                            .topology_converged_ = true});
+  status.groups_.push_back(
+      {.group_id_ = "group-1",
+       .term_ = 4,
+       .owner_node_id_ = "data-1",
+       .serving_ready_ = true,
+       .topology_converged_ = true,
+       .automatic_failover_state_ = ClusterAutomaticFailoverState::kHealthy,
+       .effective_threshold_ms_ = 1'000});
   status.slot_ranges_.push_back(
       {.first_ = 0, .last_ = 16'383, .group_id_ = "group-1"});
   return status;
@@ -102,15 +105,100 @@ TEST(MetaClusterStatusWireTest, RoundTripsStrictBoundedV1Messages) {
       .code_ = "slots_unassigned", .scope_ = "cluster", .detail_ = "0..16383"});
   auto encoded_status = EncodeClusterStatusReply(status);
   ASSERT_TRUE(encoded_status.ok()) << encoded_status.status();
-  EXPECT_EQ(encoded_status->substr(
-                std::string("OK clusterstatus 1 ").size(), 4),
-            "0002");
+  EXPECT_EQ(
+      encoded_status->substr(std::string("OK clusterstatus 1 ").size(), 4),
+      "0004");
   auto decoded_status = DecodeClusterStatusReply(*encoded_status);
   ASSERT_TRUE(decoded_status.ok()) << decoded_status.status();
   EXPECT_EQ(*decoded_status, status);
+  std::string old_status_payload = *encoded_status;
+  old_status_payload.replace(std::string("OK clusterstatus 1 ").size(), 4,
+                             "0002");
+  EXPECT_FALSE(DecodeClusterStatusReply(old_status_payload).ok());
   EXPECT_FALSE(DecodeClusterStatusReply("OK clusterstatus 2 00").ok());
   status.data_nodes_.front().role_ = static_cast<ClusterDataNodeRole>(2);
   EXPECT_FALSE(EncodeClusterStatusReply(status).ok());
+}
+
+TEST(MetaClusterStatusWireTest,
+     RoundTripsRequiredAutomaticFailoverDiagnostics) {
+  ClusterStatusWireV1 status = ReadyStatus({{.server_id_ = 1,
+                                             .ctl_endpoint_ = "127.0.0.1:7101",
+                                             .is_leader_ = true}});
+  auto& group = status.groups_.front();
+  group.automatic_failover_state_ = ClusterAutomaticFailoverState::kSuspect;
+  group.current_reason_ = "heartbeat_expired";
+  group.suspect_elapsed_ms_ = 750;
+  group.effective_threshold_ms_ = 1'000;
+  group.blocked_reason_.reset();
+
+  auto encoded = EncodeClusterStatusReply(status);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded = DecodeClusterStatusReply(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, status);
+
+  group.automatic_failover_state_ =
+      static_cast<ClusterAutomaticFailoverState>(255);
+  EXPECT_FALSE(EncodeClusterStatusReply(status).ok());
+}
+
+TEST(MetaClusterStatusWireTest,
+     RejectsContradictoryAutomaticFailoverDiagnostics) {
+  const ClusterStatusWireV1 valid =
+      ReadyStatus({{.server_id_ = 1,
+                    .ctl_endpoint_ = "127.0.0.1:7101",
+                    .is_leader_ = true}});
+
+  const auto rejected = [&](auto mutate) {
+    ClusterStatusWireV1 status = valid;
+    mutate(status.groups_.front());
+    EXPECT_FALSE(EncodeClusterStatusReply(status).ok());
+  };
+  rejected([](auto& group) {
+    group.automatic_failover_state_ = ClusterAutomaticFailoverState::kDisabled;
+    group.effective_threshold_ms_ = 0;
+  });
+  rejected([](auto& group) { group.effective_threshold_ms_ = 0; });
+  rejected([](auto& group) { group.current_reason_ = "heartbeat_expired"; });
+  rejected([](auto& group) { group.blocked_reason_ = "leadership_warmup"; });
+
+  rejected([](auto& group) {
+    group.automatic_failover_state_ = ClusterAutomaticFailoverState::kSuspect;
+  });
+  rejected([](auto& group) {
+    group.automatic_failover_state_ = ClusterAutomaticFailoverState::kBlocked;
+  });
+  rejected([](auto& group) {
+    group.automatic_failover_state_ =
+        ClusterAutomaticFailoverState::kTriggering;
+    group.current_reason_ = "heartbeat_expired";
+    group.suspect_elapsed_ms_ = 999;
+  });
+  rejected([](auto& group) {
+    group.automatic_failover_state_ = ClusterAutomaticFailoverState::kSuspect;
+    group.current_reason_ = "free_form_reason";
+  });
+  rejected([](auto& group) {
+    group.automatic_failover_state_ = ClusterAutomaticFailoverState::kBlocked;
+    group.blocked_reason_ = "free_form_blocker";
+  });
+}
+
+TEST(MetaClusterStatusWireTest,
+     AllowsDisabledPrePolicyDiagnosticsForNonPristineGroup) {
+  ClusterStatusWireV1 status;
+  status.capture_ = {.responder_id_ = 1, .term_ = 2, .committed_index_ = 3};
+  status.cluster_state_ = ClusterStateWireV1::kNonPristine;
+  status.meta_available_ = true;
+  status.meta_members_.push_back({.server_id_ = 1, .is_leader_ = true});
+  status.groups_.push_back({.group_id_ = "group-before-genesis"});
+
+  auto encoded = EncodeClusterStatusReply(status);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded = DecodeClusterStatusReply(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, status);
 }
 
 TEST(MetaClusterStatusWireTest, EnforcesReadinessBasisAndReadyTopology) {
@@ -139,9 +227,6 @@ TEST(MetaClusterStatusWireTest, EnforcesReadinessBasisAndReadyTopology) {
   ClusterStatusWireV1 no_slots = ready;
   no_slots.slot_ranges_.clear();
   EXPECT_FALSE(EncodeClusterStatusReply(no_slots).ok());
-  ClusterStatusWireV1 no_grant = ready;
-  no_grant.groups_.front().grant_revision_.reset();
-  EXPECT_FALSE(EncodeClusterStatusReply(no_grant).ok());
   ClusterStatusWireV1 stale_owner = ready;
   stale_owner.data_nodes_.front().health_fresh_ = false;
   EXPECT_FALSE(EncodeClusterStatusReply(stale_owner).ok());
@@ -168,8 +253,7 @@ TEST(MetaClusterStatusWireTest, ReportsCreatingAndFailedLifecycle) {
       .result_ = ClusterStatusResult::kNotReady, .status_ = status};
   auto json = RenderClusterStatusJson(outcome);
   ASSERT_TRUE(json.ok()) << json.status();
-  EXPECT_NE(json->find("\"cluster_state\":\"creating\""),
-            std::string::npos);
+  EXPECT_NE(json->find("\"cluster_state\":\"creating\""), std::string::npos);
   EXPECT_NE(json->find("\"next_action\":"), std::string::npos);
 
   status.cluster_create_phase_.reset();
@@ -567,9 +651,48 @@ TEST(MetaClusterStatusRenderTest, JsonUsesStableArraysAndStringU64) {
   auto json = RenderClusterStatusJson(outcome);
   ASSERT_TRUE(json.ok()) << json.status();
   EXPECT_TRUE(
-      json->starts_with("{\"schema_version\":1,\"result\":\"not_ready\""));
+      json->starts_with("{\"schema_version\":3,\"result\":\"not_ready\""));
   EXPECT_NE(json->find("\"committed_index\":\"50\""), std::string::npos);
   EXPECT_LT(json->find("\"code\":\"a\""), json->find("\"code\":\"z\""));
+}
+
+TEST(MetaClusterStatusRenderTest,
+     RendersAutomaticFailoverDiagnosticsWithoutPolicyData) {
+  ClusterStatusWireV1 status = ReadyStatus({{.server_id_ = 1,
+                                             .ctl_endpoint_ = "127.0.0.1:7101",
+                                             .is_leader_ = true}});
+  auto& group = status.groups_.front();
+  group.automatic_failover_state_ = ClusterAutomaticFailoverState::kBlocked;
+  group.current_reason_.reset();
+  group.suspect_elapsed_ms_ = 375;
+  group.effective_threshold_ms_ = 1'000;
+  group.blocked_reason_ = "leadership_warmup";
+  keylane::meta::ClusterStatusOutcome outcome{
+      .result_ = ClusterStatusResult::kReady, .status_ = status};
+
+  auto json = RenderClusterStatusJson(outcome);
+  ASSERT_TRUE(json.ok()) << json.status();
+  EXPECT_NE(json->find("\"automatic_failover_state\":\"blocked\""),
+            std::string::npos);
+  EXPECT_NE(json->find("\"current_reason\":null"), std::string::npos);
+  EXPECT_NE(json->find("\"suspect_elapsed_ms\":\"375\""), std::string::npos);
+  EXPECT_NE(json->find("\"effective_threshold_ms\":\"1000\""),
+            std::string::npos);
+  EXPECT_NE(json->find("\"blocked_reason\":\"leadership_warmup\""),
+            std::string::npos);
+  EXPECT_EQ(json->find("remaining_ms"), std::string::npos);
+  EXPECT_EQ(json->find("\"triggering\""), std::string::npos);
+  EXPECT_EQ(json->find("policy"), std::string::npos);
+
+  auto text = RenderClusterStatusText(outcome);
+  ASSERT_TRUE(text.ok()) << text.status();
+  EXPECT_NE(text->find("automatic_failover group=group-1 state=blocked"),
+            std::string::npos);
+  EXPECT_NE(text->find("current_reason=- suspect_elapsed_ms=375 "
+                       "effective_threshold_ms=1000 "
+                       "blocked_reason=leadership_warmup"),
+            std::string::npos);
+  EXPECT_EQ(text->find("policy"), std::string::npos);
 }
 
 TEST(MetaClusterStatusRenderTest, RejectsInconsistentLifecycleInput) {

@@ -219,7 +219,6 @@ using ClusterFailoverActionId = std::array<std::uint8_t, 16>;
 // are observations rather than durable identities and are discarded on
 // restart or action replacement.
 using ClusterPreparedContextId = std::array<std::uint8_t, 16>;
-using ClusterPreparedContextHash = std::array<std::uint8_t, 32>;
 
 // Wire-independent execution semantics derived from committed state.
 // Controlled actions prepare while the old owner remains authoritative;
@@ -312,7 +311,6 @@ struct ClusterPromotionPrepareDirective {
   std::string parent_history_id_;
   std::vector<std::uint64_t> required_applied_next_lsns_;
   std::uint64_t excluded_group_term_ = 0;
-  std::array<std::uint8_t, 32> old_authority_exclusion_hash_{};
 
   bool operator==(const ClusterPromotionPrepareDirective&) const = default;
 };
@@ -333,13 +331,12 @@ struct ClusterPromotionPrepared {
 };
 
 // Boot-local proof that the exact transition action completed promotion
-// preparation. The opaque id/hash bind activation to the retained replication
-// resources without exposing their representation across NodeControl.
+// preparation. The action identifies the retained replication resources;
+// the opaque context id distinguishes this boot-local preparation report.
 struct ClusterFailoverPreparedContext {
   ClusterFailoverTransitionId transition_id_{};
   ClusterFailoverActionId action_id_{};
   ClusterPreparedContextId context_id_{};
-  ClusterPreparedContextHash context_hash_{};
   ClusterPromotionPrepared promotion_;
 
   bool operator==(const ClusterFailoverPreparedContext&) const = default;
@@ -391,9 +388,10 @@ struct ClusterFailoverActionStatus {
 // FDS-owned subset of population identity. Assignment and immutable manifest
 // plus the Meta partition-replication epoch decide whether a completed local
 // population still belongs to the group; a term additionally scopes an
-// in-progress attempt. BeginGroupTerm fences authority but does not mutate
-// bytes, so a completed population may be re-anchored to a later committed
-// term without another destructive rebuild.
+// in-progress population-transition directive. BeginGroupTerm fences authority
+// but does not mutate bytes, so a completed population or the exact live
+// steady FollowOwner copy may be re-anchored to a later committed term without
+// another destructive rebuild.
 struct DesiredClusterPopulation {
   std::string group_id_;
   std::string assignment_id_;
@@ -653,10 +651,12 @@ class ReplicationManager {
   celer::Task<absl::Status> ReconcileClusterPopulation(
       std::optional<DesiredClusterPopulation> desired);
 
-  // Transport loss cannot leave an unobserved destructive attempt running.
-  // A completed Ready population is retained so reconnecting with the same
-  // FDS does not force another full rebuild.
-  celer::Task<absl::Status> CancelInProgressClusterPopulation();
+  // Transport loss cannot leave an unobserved destructive directive running.
+  // A completed Ready population is retained. The caller may additionally
+  // preserve the exact live level-triggered FollowOwner attempt whose history
+  // rotation caused a Meta-session replacement; strong fences pass false.
+  celer::Task<absl::Status> CancelInProgressClusterPopulation(
+      bool preserve_current_follow_attempt);
 
   // Returns one coherent boot-scoped population snapshot for heartbeat
   // candidate reporting and directive validation.
@@ -681,15 +681,32 @@ class ReplicationManager {
   // downstream replication sessions.
   celer::Task<absl::Status> RevokeClusterRebuildSourceAuthorizations();
 
+  // Opens the O(1) lease gate for new POPULATION handshakes. This never
+  // creates a capability; the exact current FDS must already authorize one or
+  // replay it after a live projection refresh.
+  celer::Task<absl::Status> EnableClusterRebuildSourceAdmissionUntil(
+      std::chrono::nanoseconds deadline_since_boot);
+
   // Clears capabilities inherited from an older desired-state projection
-  // without advancing the committed revoke floor. A live FDS replacement may
-  // preserve already-online population exports when its topology and authority
-  // are unchanged. A disconnected control session may also preserve only those
-  // established exports: source admission is still cleared, and NodeControl
-  // invalidates the write lease until a replacement FDS validates their group.
+  // without advancing the committed revoke floor. A disconnected control
+  // session may preserve only already-ONLINE exports: source admission is
+  // still cleared, and NodeControl invalidates the write lease until a
+  // replacement FDS validates their group. Live FDS replacement has a
+  // separate, stronger retention rule below.
   celer::Task<absl::Status>
   ClearClusterRebuildSourceAuthorizationsForSessionReplacement(
       bool preserve_established_exports = false);
+
+  // Clears capabilities for one live FDS refresh without closing an otherwise
+  // unchanged lease-admission gate. The expected replay count keeps the
+  // projection-to-directive gap retryable and retains the named history until
+  // all current capabilities arrive. When the replacement proves the exact
+  // export scope unchanged, every already-published POPULATION session is
+  // retained, including sessions between control admission and ONLINE.
+  celer::Task<absl::Status>
+  RefreshClusterRebuildSourceAuthorizationsForFdsReplacement(
+      bool preserve_current_population_exports = false,
+      std::size_t expected_authorization_replays = 0);
 
   // Current runtime settings; all mutations enter through ApplyDirective.
   unsigned snapshot_read_concurrency() const noexcept;

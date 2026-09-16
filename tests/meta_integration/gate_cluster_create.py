@@ -29,6 +29,7 @@ GROUPS = {
     "group-1": (PRIMARY_1, REPLICA_1, 0, 8191),
     "group-2": (PRIMARY_2, REPLICA_2, 8192, 16383),
 }
+TRANSIENT_SELF_FENCE = "CLUSTERDOWN Hash slot not served"
 
 
 def meta_manifest_lines(*metas):
@@ -93,7 +94,7 @@ def wait_cluster_ready(meta, description, timeout, admin=None):
         last = cluster_status(meta, admin=admin)
         if (last.get("result") == "ready" and
                 last.get("cluster_state") == "created"):
-            return
+            return last
         if last.get("cluster_state") == "provisioning-failed":
             root = last.get("root_operation_id")
             detail = meta.getop(root) if root else "root operation unavailable"
@@ -110,9 +111,11 @@ def create_request(meta, node_id, endpoint, group_id, meta_id=None,
     """Send a normalized public v1 envelope so CLI cannot hide races."""
     metas = meta if isinstance(meta, (list, tuple)) else [meta]
     operation_id = operation_id or os.urandom(16)
-    # Keep these direct admission/recovery cases on the persisted v3 format;
-    # real CLI cases exercise v4, which adds the Data TLS endpoint.
-    payload = struct.pack(">H", 3) + operation_id + struct.pack(">I", len(metas))
+    # Direct admission/recovery cases construct the same current v5 durable
+    # intent as the CLI. Older persisted layouts are deliberately unsupported.
+    payload = struct.pack(">H", 5) + operation_id
+    payload += struct.pack(">HII", 1, 5000, 5000)
+    payload += struct.pack(">I", len(metas))
     for member in sorted(metas, key=lambda item: item.id):
         member_id = member.id if meta_id is None else meta_id
         payload += struct.pack(">I", member_id)
@@ -126,7 +129,7 @@ def create_request(meta, node_id, endpoint, group_id, meta_id=None,
             encoded = value.encode()
             payload += struct.pack(">I", len(encoded)) + encoded
     payload += struct.pack(">HI", 0, 1)
-    for value in (node_id, endpoint):
+    for value in (node_id, endpoint, ""):
         encoded = value.encode()
         payload += struct.pack(">I", len(encoded)) + encoded
     payload += struct.pack(">I", 1)
@@ -215,8 +218,9 @@ def run_unrelated_commit_case(workdir):
             raise H.Failure(
                 f"unrelated commit did not admit Genesis: {accepted}")
         operation_id = accepted.split()[-1]
-        # Complete all topology/authority commits before starting Data, so
-        # the only later metadata change is the unreferenced policy below.
+        # Complete all topology/authority commits before starting Data. The
+        # only later metadata change is a new version of the automatic
+        # failover Policy, which is intentionally absent from Data's FDS.
         H.wait_until("creation committed its authority", 5,
                      lambda: any(group.get("owner_node_id") == DATA_NODE
                                  for group in cluster_status(meta)["groups"]))
@@ -226,10 +230,18 @@ def run_unrelated_commit_case(workdir):
             raise H.Failure(f"initial FDS was not held: {proxy.error}")
 
         before = meta.committed()
-        reply = meta.putpolicy("unreferenced-policy", 1, "unused-content")
+        content = H.automatic_uncontrolled_failover_policy()
+        reply = meta.put_automatic_uncontrolled_failover_policy(2)
         match = re.fullmatch(r"OK (\d+)", reply)
         if match is None or int(match.group(1)) <= before:
-            raise H.Failure(f"unrelated policy did not advance Meta: {reply}")
+            raise H.Failure(
+                f"non-projected policy did not advance Meta: {reply}")
+        current = meta.getpolicy(H.AUTOMATIC_UNCONTROLLED_FAILOVER_POLICY_ID)
+        expected = f"OK version=2 content={content}"
+        if current != expected:
+            raise H.Failure(
+                f"getpolicy did not return current raw Policy: {current!r}, "
+                f"want {expected!r}")
         held = cluster_status(meta)
         if any(node["current_session"] or node["projection_current"]
                for node in held["data_nodes"]):
@@ -468,16 +480,13 @@ def run_case(workdir, interactive):
             raise H.Failure(
                 f"{name} cluster-create omitted its operation id: {created!r}")
 
-        wait_cluster_ready(meta, f"{name} cluster reaches READY", 20)
-        status_text = command(
-            environment,
-            [CTL, "cluster-status", "--socket", meta.ctl_path, "--json"])
-        status = json.loads(status_text)
+        status = wait_cluster_ready(
+            meta, f"{name} cluster reaches READY", 20)
+        status_text = json.dumps(status, sort_keys=True)
         expected_group = {
             "group_id": "group-1",
             "term": "1",
             "owner_node_id": DATA_NODE,
-            "config_epoch": "1",
             "serving_ready": True,
             "topology_converged": True,
         }
@@ -641,10 +650,8 @@ def run_manifest_bootstrapped_multi_meta_case(workdir, count, late_voter):
                 raise H.Failure(
                     "initial Meta barrier did not release Cluster Create: "
                     f"{reply}")
-        H.wait_until(
-            f"{count}-Meta cluster reaches serving readiness", 20,
-            lambda: cluster_status(leader)["result"] == "ready")
-        status = cluster_status(leader)
+        status = wait_cluster_ready(
+            leader, f"{count}-Meta cluster reaches serving readiness", 20)
         if (status["result"] != "ready" or
                 not status["meta_membership_stable"] or
                 len(status["meta_members"]) != count):
@@ -675,8 +682,7 @@ def run_manifest_bootstrapped_multi_meta_case(workdir, count, late_voter):
             minority = next(meta for meta in metas if meta is not leader)
             minority.terminate()
             before = leader.committed()
-            reply = leader.putpolicy("post-create-majority", 1,
-                                     "barrier-released")
+            reply = leader.put_automatic_uncontrolled_failover_policy(2)
             match = re.fullmatch(r"OK (\d+)", reply)
             if match is None or int(match.group(1)) <= before:
                 raise H.Failure(
@@ -873,22 +879,65 @@ def redis_connection(data):
         raise
 
 
+def retry_clusterdown(description, operation, timeout=2.0):
+    """Retry only the finite-lease self-fence admitted by this gate.
+
+    Cluster READY can precede causal confirmation of the latest Grant. With
+    the deliberately short process-test lease, Data may therefore reject one
+    command while it reconnects for a fresh causal sequence. Every other
+    transport or Redis error remains an immediate assertion failure.
+    """
+    deadline = time.monotonic() + timeout
+    attempts = 0
+    last_reply = None
+    while attempts == 0 or time.monotonic() < deadline:
+        if attempts != 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.05, remaining))
+            if time.monotonic() >= deadline:
+                break
+        attempts += 1
+        try:
+            reply = operation()
+        except H.Failure as error:
+            reply = str(error)
+            if reply != TRANSIENT_SELF_FENCE:
+                raise
+        if reply != TRANSIENT_SELF_FENCE:
+            return reply
+        last_reply = reply
+    raise H.Failure(
+        f"{description} remained self-fenced after {attempts} attempts: "
+        f"{last_reply}")
+
+
 def redis_call(data, arguments):
-    with redis_connection(data) as sock:
-        sock.settimeout(3.0)
-        sock.sendall(encode_resp(arguments))
-        return read_resp(sock.makefile("rb"))
+    def call_once():
+        with redis_connection(data) as sock:
+            sock.settimeout(3.0)
+            sock.sendall(encode_resp(arguments))
+            return read_resp(sock.makefile("rb"))
+
+    return retry_clusterdown(
+        f"Redis {arguments[0]} on {data.node_id}", call_once)
 
 
 def redis_error(data, arguments):
-    with redis_connection(data) as sock:
-        sock.settimeout(3.0)
-        sock.sendall(encode_resp(arguments))
-        line = sock.makefile("rb").readline()
-        if not line.startswith(b"-") or not line.endswith(b"\r\n"):
-            raise H.Failure(
-                f"expected Redis error for {arguments}, received {line!r}")
-        return line[1:-2].decode(errors="replace")
+    def call_once():
+        with redis_connection(data) as sock:
+            sock.settimeout(3.0)
+            sock.sendall(encode_resp(arguments))
+            line = sock.makefile("rb").readline()
+            if not line.startswith(b"-") or not line.endswith(b"\r\n"):
+                raise H.Failure(
+                    f"expected Redis error for {arguments}, "
+                    f"received {line!r}")
+            return line[1:-2].decode(errors="replace")
+
+    return retry_clusterdown(
+        f"Redis {arguments[0]} error on {data.node_id}", call_once)
 
 
 def readonly_get(data, key):
@@ -901,11 +950,8 @@ def readonly_get(data, key):
         return read_resp(reader)
 
 
-def assert_multi_status(environment, meta, nodes):
-    status_text = command(
-        environment,
-        [CTL, "cluster-status", "--socket", meta.ctl_path, "--json"])
-    status = json.loads(status_text)
+def assert_multi_status(status, nodes):
+    status_text = json.dumps(status, sort_keys=True)
     actual_groups = {item.get("group_id"): item
                      for item in status.get("groups", [])}
     actual_nodes = {item.get("node_id"): item
@@ -914,7 +960,6 @@ def assert_multi_status(environment, meta, nodes):
         group = actual_groups.get(group_id, {})
         if (group.get("term") != "1" or
                 group.get("owner_node_id") != primary or
-                group.get("config_epoch") != "1" or
                 not group.get("serving_ready") or
                 not group.get("topology_converged")):
             raise H.Failure(f"{group_id} status is not ready: {status_text}")
@@ -1027,10 +1072,12 @@ def assert_redis_topology_and_replication(nodes):
         raise H.Failure("rejected FUNCTION LOAD changed the catalog")
 
     source_host, source_port = endpoint_tuple(by_id[PRIMARY_1])
-    followed = command(
-        os.environ.copy(),
-        [REDIS_CLI, "-c", "--raw", "-h", source_host,
-         "-p", str(source_port), "GET", keys["group-2"]]).strip()
+    followed_arguments = [
+        REDIS_CLI, "-c", "--raw", "-h", source_host,
+        "-p", str(source_port), "GET", keys["group-2"]]
+    followed = retry_clusterdown(
+        "redis-cli MOVED follow",
+        lambda: command(os.environ.copy(), followed_arguments).strip())
     if followed != "ongoing-group-2":
         raise H.Failure(
             f"redis-cli did not follow MOVED to group-2: {followed!r}")
@@ -1269,9 +1316,9 @@ def run_multi_group_case(workdir, automatic, interactive,
         positions = [created.find(marker) for marker in markers]
         if -1 in positions or positions != sorted(positions):
             raise H.Failure(f"{name} preview was not normalized: {created!r}")
-        wait_cluster_ready(
+        status = wait_cluster_ready(
             meta, f"{name}: background create reaches READY", 90)
-        assert_multi_status(environment, meta, nodes)
+        assert_multi_status(status, nodes)
         operation_id = operation_match.group(1)
         if meta.getop(operation_id) != "OK completed cluster-created":
             raise H.Failure("root ClusterCreate operation did not complete")
@@ -1424,8 +1471,8 @@ def run_group_id_probe_case(workdir):
             meta.ctl_path, "--yes", "--timeout-ms", "20000"], timeout=25)
         if "Cluster create accepted:" not in result:
             raise H.Failure(f"unusual Group id was not accepted: {result}")
-        wait_cluster_ready(meta, "unusual Group id reaches READY", 20)
-        status = cluster_status(meta)
+        status = wait_cluster_ready(
+            meta, "unusual Group id reaches READY", 20)
         if "group-2}" not in {group["group_id"] for group in status["groups"]}:
             raise H.Failure(f"unusual Group id was not preserved: {status}")
         H.log("Group id containing '}' survives async creation")
@@ -1474,10 +1521,12 @@ class DirectiveBarrier(H.Proxy):
                 if kind == (14 if self.result else 12):
                     blocked, release = self.blocked, self.release
                     if self.recipients:
-                        # Directive's fixed session/basis precede the variable
-                        # Group id, then authority and directive identities.
+                        # Skip session/basis, the length-prefixed Group id,
+                        # assignment id/term, and operation/directive/attempt
+                        # ids plus directive revision. Keep these field sizes
+                        # aligned with Encode(Directive)'s term-only authority.
                         group_size = struct.unpack_from(">I", payload, 56)[0]
-                        recipient_offset = 156 + group_size
+                        recipient_offset = 56 + 4 + group_size + 16 + 8 + 3 * 16 + 8
                         recipient = payload[recipient_offset:recipient_offset + 40].decode()
                         events = self.recipients.get(recipient)
                         if events is None or events[0].is_set():
@@ -1601,13 +1650,15 @@ def run_recovery_case(workdir, phase, snapshot=False, wire=None, crash=False):
             data.start()
         H.wait_until(f"{name}: original operation completes after restart", 25,
                      lambda: meta.getop(operation_id) == "OK completed cluster-created")
-        H.wait_until(f"{name}: recovered cluster READY", 20,
-                     lambda: cluster_status(meta)["result"] == "ready")
+        wait_cluster_ready(meta, f"{name}: recovered cluster READY", 20)
         if sentinel:
-            value = command(os.environ.copy(), [
+            arguments = [
                 REDIS_CLI, "--raw", "-p", str(data.redis_port),
-                "GET", "recovery-sentinel"])
-            if value.strip() != "keep":
+                "GET", "recovery-sentinel"]
+            value = retry_clusterdown(
+                f"{name} recovery sentinel read",
+                lambda: command(os.environ.copy(), arguments).strip())
+            if value != "keep":
                 raise H.Failure(f"{name}: recovery repeated destructive initialization")
         if meta.ctl("removesrv 1") != "ERR cannot-remove-leader":
             raise H.Failure(f"{name}: completed task retained admission")

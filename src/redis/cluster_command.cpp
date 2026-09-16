@@ -174,9 +174,11 @@ void BuildClusterSlotsReply(const cluster::ServingState& state,
 
 // CLUSTER NODES: one nodes.conf-format line per node —
 //   <id> <host>:<port>@0 <flags> <master-id> 0 0 <config_epoch> <link> [slots]
-// The ping/pong fields stay 0 (no gossip); the link state is whatever the
-// topology source recorded. Primaries carry their group's compact slot
-// ranges; replicas name their primary and carry no slots.
+// config_epoch is derived from the member Group's term, including fenced
+// groups. It is a compatibility display, not Redis's cross-Group election or
+// slot-conflict clock. The ping/pong fields stay 0 (no gossip); the link state
+// is whatever the topology source recorded. Primaries carry their group's
+// compact slot ranges; replicas name their primary and carry no slots.
 std::string BuildClusterNodes(const cluster::ServingState& state,
                               const cluster::ClusterRuntime& runtime,
                               bool connection_tls) {
@@ -202,7 +204,7 @@ std::string BuildClusterNodes(const cluster::ServingState& state,
     } else {
       nodes.push_back('-');
     }
-    absl::StrAppend(&nodes, " 0 0 ", node.config_epoch_, " ",
+    absl::StrAppend(&nodes, " 0 0 ", node.group_term_, " ",
                     node.link_connected_ ? "connected" : "disconnected");
     if (node.is_primary()) {
       for (const cluster::GroupView& group : state.Groups()) {
@@ -225,7 +227,10 @@ std::string BuildClusterNodes(const cluster::ServingState& state,
 // CLUSTER INFO with the field set pinned for v1. v1 has no
 // gossip: pfail/fail and the message counters are always 0, cluster_state
 // only reflects slot coverage, and cluster_size counts primaries that
-// actually serve slots. A null state (nothing published yet) reports
+// actually serve slots. Epochs are derived from Group Terms: my_epoch is the
+// local membership's term and current_epoch is the view's maximum. Neither
+// replaces topology_epoch as the ordering for whole-cluster topology.
+// A null state (nothing published yet) reports
 // cluster_state:fail with every counter at 0.
 std::string BuildClusterInfo(const cluster::ServingState* state) {
   std::uint32_t slots_assigned = 0;
@@ -238,9 +243,7 @@ std::string BuildClusterInfo(const cluster::ServingState* state) {
     coverage_complete = state->CoverageComplete();
     slots_assigned = state->CoveredSlotCount();
     known_nodes = state->Nodes().size();
-    for (const cluster::NodeDescriptor& node : state->Nodes()) {
-      current_epoch = std::max(current_epoch, node.config_epoch_);
-    }
+    current_epoch = state->max_group_term();
     for (const cluster::GroupView& group : state->Groups()) {
       if (!group.slot_ranges_.empty() &&
           state->NodeAt(group.primary_node_index_) != nullptr) {
@@ -248,7 +251,7 @@ std::string BuildClusterInfo(const cluster::ServingState* state) {
       }
     }
     if (const cluster::NodeDescriptor* self = state->Self()) {
-      my_epoch = self->config_epoch_;
+      my_epoch = self->group_term_;
     }
   }
   return absl::StrCat(

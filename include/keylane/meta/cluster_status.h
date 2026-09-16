@@ -66,14 +66,36 @@ struct ClusterDataNodeWireV1 {
   bool operator==(const ClusterDataNodeWireV1&) const = default;
 };
 
+// Stable public detector states. This status enum deliberately belongs to the
+// Raft-free Admin model so status clients do not depend on the leader-local
+// detector Module or its timer state.
+enum class ClusterAutomaticFailoverState : std::uint8_t {
+  kDisabled = 0,
+  kHealthy = 1,
+  kSuspect = 2,
+  kBlocked = 3,
+  kTriggering = 4,
+};
+
 struct ClusterGroupWireV1 {
   std::string group_id_;
   std::uint64_t term_ = 0;
   std::optional<std::string> owner_node_id_;
-  std::uint64_t config_epoch_ = 0;
-  std::optional<std::uint64_t> grant_revision_;
   bool serving_ready_ = false;
   bool topology_converged_ = false;
+  // Leader-local automatic-failover diagnostics for this Group.
+  // `current_reason_` is present only for exact Unserviceable
+  // SUSPECT/TRIGGERING classifications; `blocked_reason_` is present only for
+  // BLOCKED. Durations are milliseconds: elapsed suspicion may freeze while
+  // BLOCKED, while `effective_threshold_ms_` is the threshold resolved from the
+  // current global Policy for this cut. It is zero only for DISABLED Groups
+  // that legally predate Genesis Policy installation in a non-pristine cluster.
+  ClusterAutomaticFailoverState automatic_failover_state_ =
+      ClusterAutomaticFailoverState::kDisabled;
+  std::optional<std::string> current_reason_;
+  std::uint64_t suspect_elapsed_ms_ = 0;
+  std::uint64_t effective_threshold_ms_ = 0;
+  std::optional<std::string> blocked_reason_;
   bool operator==(const ClusterGroupWireV1&) const = default;
 };
 
@@ -134,9 +156,11 @@ struct ClusterStatusWireV1 {
   bool operator==(const ClusterStatusWireV1&) const = default;
 };
 
-// Reply payloads are lowercase hex around a bounded binary schema. The outer
-// line envelope remains human-inspectable and lets typed transient errors use
-// the normal `ERR <kind>` form.
+// `clusterhead 1` and `clusterstatus 1` name the outer Admin verb revision;
+// their lowercase-hex binary payloads have independent leading schema markers
+// (currently head v1 and status v4). The WireV1 suffix names that outer
+// contract, not the inner payload marker. The human-inspectable line envelope
+// also lets typed transient errors use the normal `ERR <kind>` form.
 absl::StatusOr<std::string> EncodeClusterHeadReply(
     const ClusterHeadWireV1& head);
 absl::StatusOr<ClusterHeadWireV1> DecodeClusterHeadReply(
@@ -205,8 +229,9 @@ class ClusterOperator {
   MetaAdminRoundTrip round_trip_;
 };
 
-// Deterministic public renderers. JSON u64 values are decimal strings and all
-// arrays are sorted independently of server iteration order.
+// Deterministic public renderers. JSON has its own schema v3, independent of
+// both Admin verb and binary payload revisions. JSON u64 values are decimal
+// strings and all arrays are sorted independently of server iteration order.
 absl::StatusOr<std::string> RenderClusterStatusJson(
     const ClusterStatusOutcome& outcome);
 absl::StatusOr<std::string> RenderClusterStatusText(

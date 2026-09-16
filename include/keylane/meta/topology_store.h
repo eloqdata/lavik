@@ -31,20 +31,19 @@
 //     creation rejection never depends on operation retention.
 //   - Slot map is absolute: SetSlotMap replaces the whole map; ranges must be
 //     in bounds [0, kMetaSlotCount) and pairwise non-overlapping, and every
-//     referenced group (ranges and config_epochs) must exist. Partial
-//     coverage is legal (unassigned slots have no owner); an empty range list
-//     clears the map. config_epoch values are absolute assignments, no
-//     ordering enforced here. Whether a changed slot owner or config epoch is
-//     covered by an active grant is a cross-store fact: MetaStateApply rejects
-//     that transition until every affected group is fenced.
-//   - MetaGroupRecord fields (owner, group_term, authority_version,
-//     population manifest revision/digest, partition_replication_epoch) and
-//     per-group config_epoch change ONLY through the granular primitives below.
+//     referenced group must exist. Partial coverage is legal (unassigned
+//     slots have no owner); an empty range list clears the map. Whether a
+//     changed slot owner is covered by an active grant is a cross-store fact:
+//     MetaStateApply rejects that transition until every affected group is
+//     fenced.
+//   - MetaGroupRecord fields (owner, group_term,
+//     population manifest revision/digest, partition_replication_epoch)
+//     change ONLY through the granular primitives below.
 //     The term/grant semantics and the atomicity of owner switches (failover /
 //     ActivateAuthority) span the grant store and are orchestrated by the
 //     apply dispatcher. The primitives therefore validate group existence and
 //     absolute-value/idempotency only; ordering rules (term raised once via
-//     BeginGroupTerm, authority_version bumps, ...) live in the grant layer.
+//     BeginGroupTerm and authority installation) live in the grant layer.
 //   - Membership does not cascade: removing the node named by record.owner_
 //     from the member table leaves owner_ untouched. The apply dispatcher
 //     reads the fact and decides.
@@ -125,13 +124,12 @@ struct MetaGroupMember {
 };
 
 // Read view of one group: the committed GroupRecord, any active failover
-// transition, and the topology store's own bookkeeping (config_epoch,
-// membership CAS revision, members).
+// transition, and the topology store's membership CAS revision and members.
+// Members are sorted by node_id_.
 struct MetaTopologyGroupView {
   std::string group_id_;
   MetaGroupRecord record_;
   std::optional<MetaFailoverTransition> failover_transition_;
-  std::uint64_t config_epoch_ = 0;
   std::uint64_t revision_ = 0;  // 1 at creation, +1 per membership change
   std::vector<MetaGroupMember> members_;
   bool operator==(const MetaTopologyGroupView&) const = default;
@@ -168,16 +166,12 @@ class MetaTopologyStore {
   absl::Status SetOwner(const std::string& group_id,
                         const std::string& new_owner);
   absl::Status SetGroupTerm(const std::string& group_id, std::uint64_t term);
-  absl::Status SetAuthorityVersion(const std::string& group_id,
-                                   std::uint64_t authority_version);
   absl::Status SetPopulationManifest(const std::string& group_id,
                                      std::uint64_t manifest_revision,
                                      const MetaHash256& manifest_digest);
   bool PopulationManifestInUse(const MetaHash256& manifest_digest) const;
   absl::Status SetPartitionReplicationEpoch(const std::string& group_id,
                                             std::uint64_t epoch);
-  absl::Status SetGroupConfigEpoch(const std::string& group_id,
-                                   std::uint64_t config_epoch);
   // Installs the only active transition for a group. committed_index becomes
   // the transition revision regardless of the caller's input value. An exact
   // replay at that index is a no-op; another active transition conflicts.
@@ -229,7 +223,6 @@ class MetaTopologyStore {
   struct GroupState {
     MetaGroupRecord record_;
     std::optional<MetaFailoverTransition> failover_transition_;
-    std::uint64_t config_epoch_ = 0;
     std::uint64_t revision_ = 0;
     struct MemberState {
       MetaAssignmentId assignment_id_{};
