@@ -209,7 +209,6 @@ absl::Status MetaIdentityStore::Apply(const RegisterNode& cmd) {
     const bool identical = !record.retired_ && record.revision_ == 1 &&
                            record.principal_ == cmd.principal_ &&
                            record.endpoints_ == cmd.endpoints_ &&
-                           record.capability_mask_ == cmd.capability_mask_ &&
                            record.role_ == cmd.role_;
     if (identical) return absl::OkStatus();
     return MetaDomainRejectError(
@@ -228,7 +227,7 @@ absl::Status MetaIdentityStore::Apply(const RegisterNode& cmd) {
   record.node_id_ = cmd.node_id_;
   record.principal_ = cmd.principal_;
   record.endpoints_ = cmd.endpoints_;
-  record.capability_mask_ = cmd.capability_mask_;
+
   record.role_ = cmd.role_;
   record.revision_ = 1;
   nodes_.emplace(cmd.node_id_, std::move(record));
@@ -255,8 +254,7 @@ absl::Status MetaIdentityStore::Apply(const UpdateNode& cmd) {
   // principal field; rotation unimplemented), so it is not compared.
   const bool is_replay = !record.retired_ &&
                          record.revision_ == cmd.expected_revision_ + 1 &&
-                         record.endpoints_ == cmd.endpoints_ &&
-                         record.capability_mask_ == cmd.capability_mask_;
+                         record.endpoints_ == cmd.endpoints_;
   if (is_replay) return absl::OkStatus();
   if (record.retired_) {
     return MetaDomainRejectError(
@@ -267,7 +265,7 @@ absl::Status MetaIdentityStore::Apply(const UpdateNode& cmd) {
         absl::StrCat("expected_revision CAS conflict on ", cmd.node_id_));
   }
   record.endpoints_ = cmd.endpoints_;
-  record.capability_mask_ = cmd.capability_mask_;
+
   record.revision_ = cmd.expected_revision_ + 1;
   return absl::OkStatus();
 }
@@ -448,9 +446,8 @@ std::vector<MetaMemberRecord> MetaIdentityStore::MetaMembers() const {
 // records | Meta-member count u32 | sorted (server_id, principal,
 // data_control_endpoint, optional ctl_endpoint, retired) records. See the
 // header for strictness.
-std::string MetaIdentityStore::Serialize() const {
-  MetaWriter w;
-  w.WriteU16(kMetaFormatVersion);
+void MetaIdentityStore::WriteSnapshot(MetaWriter& w) const {
+  w.WriteU16(kMetaIdentityStoreFormatVersion);
   w.WriteCount(static_cast<std::uint32_t>(nodes_.size()));
   for (const auto& [node_id, record] : nodes_) {
     w.WriteString(node_id);
@@ -458,7 +455,7 @@ std::string MetaIdentityStore::Serialize() const {
     w.WriteList(record.endpoints_, [](MetaWriter& ww, const std::string& ep) {
       ww.WriteString(ep);
     });
-    w.WriteU64(record.capability_mask_);
+
     w.WriteU8(static_cast<std::uint8_t>(record.role_));
     w.WriteU64(record.revision_);
     w.WriteBool(record.retired_);
@@ -472,7 +469,18 @@ std::string MetaIdentityStore::Serialize() const {
     if (record.ctl_endpoint_.has_value()) w.WriteString(*record.ctl_endpoint_);
     w.WriteBool(record.retired_);
   }
-  return w.TakeBuffer();
+}
+
+std::string MetaIdentityStore::Serialize() const {
+  MetaWriter writer;
+  WriteSnapshot(writer);
+  return writer.TakeBuffer();
+}
+
+std::uint64_t MetaIdentityStore::SerializedSize() const {
+  MetaWriter counter(false);
+  WriteSnapshot(counter);
+  return counter.size();
 }
 
 absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
@@ -480,7 +488,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
   MetaReader r(bytes);
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version != kMetaFormatVersion) {
+  if (*version != kMetaIdentityStoreFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   auto count = r.ReadCount(kMaxMetaNodes);
@@ -500,8 +508,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
           return std::string(*raw);
         });
     if (!endpoints.ok()) return endpoints.status();
-    auto capability_mask = r.ReadU64();
-    if (!capability_mask.ok()) return capability_mask.status();
+
     auto role = r.ReadU8();
     if (!role.ok()) return role.status();
     if (*role != static_cast<std::uint8_t>(MetaNodeRole::kPrimary) &&
@@ -542,7 +549,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     MetaNodeRecord record;
     record.node_id_ = node_id_str;
     record.principal_ = principal_str;
-    record.capability_mask_ = *capability_mask;
+
     record.role_ = static_cast<MetaNodeRole>(*role);
     record.revision_ = *revision;
     record.retired_ = *retired;

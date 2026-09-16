@@ -12,12 +12,81 @@
 #include <vector>
 
 #include "absl/strings/str_cat.h"
+#include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/cluster_create.h"
-#include "keylane/meta/control_projector.h"
 #include "keylane/meta/failover.h"
 #include "keylane/meta/hash.h"
 
 namespace keylane::meta {
+
+// Apply owns the state-machine write lock. Aggregate commands can therefore
+// validate their prospective result in place without publishing intermediate
+// state. Retain only affected Group/Operation records for domain rejection;
+// identity, policy, manifests, audit, and unrelated groups are never copied.
+// This guard covers authority/failover and operation/lifecycle transitions;
+// those transitions do not change membership indexes or archive records.
+class MetaApplyRollback {
+ public:
+  template <typename Command>
+  MetaApplyRollback(MetaStores& stores, const Command& command)
+      : stores_(stores),
+        topology_epoch_(stores.topology_.topology_epoch_),
+        lifecycle_(stores.topology_.cluster_lifecycle_),
+        active_count_(stores.operation_.active_count_) {
+    if constexpr (requires { command.group_id_; }) {
+      group_id_ = command.group_id_;
+      const auto group = stores.topology_.groups_.find(command.group_id_);
+      if (group != stores.topology_.groups_.end()) {
+        group_ = group->second;
+      }
+    }
+    if constexpr (requires { command.operation_id_; }) {
+      WatchOperation(command.operation_id_);
+    }
+  }
+
+  MetaApplyRollback(const MetaApplyRollback&) = delete;
+  MetaApplyRollback& operator=(const MetaApplyRollback&) = delete;
+
+  void WatchOperation(const MetaOperationId& id) {
+    if (operations_.contains(id)) return;
+    operations_.emplace(id, stores_.operation_.FindOperation(id));
+  }
+
+  void Commit() { committed_ = true; }
+
+  ~MetaApplyRollback() {
+    if (committed_) return;
+    stores_.topology_.topology_epoch_ = topology_epoch_;
+    stores_.topology_.cluster_lifecycle_ = std::move(lifecycle_);
+    if (group_.has_value()) {
+      stores_.topology_.groups_.at(group_id_) = std::move(*group_);
+    }
+    for (auto& [id, before] : operations_) {
+      auto current = stores_.operation_.live_.find(id);
+      if (before.has_value()) {
+        // Existing operation transitions preserve their sequence index and
+        // map entry. Only the record's lifecycle/directives/results change.
+        stores_.operation_.live_.at(id) = std::move(*before);
+      } else if (current != stores_.operation_.live_.end()) {
+        stores_.operation_.live_by_seq_.erase(current->second.operation_seq_);
+        stores_.operation_.live_.erase(current);
+      }
+    }
+    stores_.operation_.active_count_ = active_count_;
+  }
+
+ private:
+  MetaStores& stores_;
+  std::uint64_t topology_epoch_;
+  MetaClusterLifecycleState lifecycle_;
+  std::uint32_t active_count_;
+  std::string group_id_;
+  std::optional<MetaTopologyStore::GroupState> group_;
+  std::map<MetaOperationId, std::optional<MetaOperationRecord>> operations_;
+  bool committed_ = false;
+};
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -108,7 +177,7 @@ absl::Status ValidateCommittedDirectiveAnchorImpl(
         "directive recipient, source, or target is not active");
   }
   const auto group = stores.topology_.FindGroup(directive.group_id_);
-  const auto grant = stores.grant_.GroupState(directive.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(directive.group_id_);
   if (!group.has_value() || !grant.has_value()) {
     return MetaDomainRejectError("directive group does not exist");
   }
@@ -138,14 +207,17 @@ absl::Status ValidateCommittedDirectiveAnchorImpl(
   return absl::OkStatus();
 }
 
-void InvalidateStaleCurrentDirectives(MetaStores& stores) {
+void InvalidateStaleCurrentDirectives(MetaStores& stores,
+                                      MetaApplyRollback* rollback = nullptr) {
   std::vector<MetaTerminalReceiptKey> invalidated;
   for (const MetaOperationRecord& operation :
-       stores.operation_.LiveOperations()) {
+       stores.operation_.LiveOperationsView()) {
     for (const MetaCurrentDirective& current : operation.current_directives_) {
       if (ValidateCommittedDirectiveAnchorImpl(stores, current.spec_).ok()) {
         continue;
       }
+      if (rollback != nullptr)
+        rollback->WatchOperation(operation.operation_id_);
       invalidated.push_back(MetaTerminalReceiptKey{
           operation.operation_id_, current.spec_.directive_id_,
           current.spec_.attempt_id_, current.directive_revision_});
@@ -156,7 +228,7 @@ void InvalidateStaleCurrentDirectives(MetaStores& stores) {
 
 bool AllCurrentDirectivesHaveCommittedAnchors(const MetaStores& stores) {
   for (const MetaOperationRecord& operation :
-       stores.operation_.LiveOperations()) {
+       stores.operation_.LiveOperationsView()) {
     for (const MetaCurrentDirective& current : operation.current_directives_) {
       if (!ValidateCommittedDirectiveAnchorImpl(stores, current.spec_).ok()) {
         return false;
@@ -168,26 +240,16 @@ bool AllCurrentDirectivesHaveCommittedAnchors(const MetaStores& stores) {
 
 // A PutPopulationManifest is the only unbounded-history insertion into the
 // content-addressed store. Charge it against the exact bytes currently used
-// by all seven snapshot blobs, with room for the audit record ApplyCommitted
+// by all six snapshot blobs, with room for the audit record ApplyCommitted
 // appends after dispatch. This is an abuse ceiling tied to the durable format,
 // not a workload-sizing guess.
-absl::StatusOr<std::uint64_t> SnapshotBytesWithPopulationManifest(
+std::uint64_t SnapshotBytesWithPopulationManifest(
     const MetaStores& stores,
     const MetaPopulationManifestStore& population_manifest) {
-  const std::string identity = stores.identity_.Serialize();
-  const std::string topology = stores.topology_.Serialize();
-  const std::string policy = stores.policy_.Serialize();
-  const auto grant = stores.grant_.Serialize();
-  if (!grant.ok()) return grant.status();
-  const auto operation = stores.operation_.Serialize();
-  if (!operation.ok()) return operation.status();
-  const std::string population = population_manifest.Serialize();
-  const auto audit = stores.audit_.Serialize();
-  if (!audit.ok()) return audit.status();
-
-  // Aggregate schema u16 plus seven u32 length prefixes.
-  return 2u + (7u * 4u) + identity.size() + topology.size() + policy.size() +
-         grant->size() + operation->size() + population.size() + audit->size();
+  return 2u + 6u * 4u + stores.identity_.SerializedSize() +
+         stores.topology_.SerializedSize() + stores.policy_.SerializedSize() +
+         stores.operation_.SerializedSize() +
+         population_manifest.SerializedSize() + stores.audit_.SerializedSize();
 }
 
 constexpr std::uint64_t kMaximumAuditSnapshotGrowth =
@@ -269,7 +331,7 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
       stores.operation_.FindOperation(lifecycle.root_operation_id_);
   const auto archived_root =
       stores.operation_.FindArchived(lifecycle.root_operation_id_);
-  const auto live_operations = stores.operation_.LiveOperations();
+  const auto live_operations = stores.operation_.LiveOperationsView();
   if (lifecycle.state_ == MetaClusterLifecycle::kCreating) {
     if (!root.has_value() ||
         !LiveClusterCreateRootMatchesLifecycle(*root, lifecycle) ||
@@ -326,23 +388,11 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
         "Created cluster lacks a registered current global Policy");
   }
 
-  if (stores.topology_.GroupCount() != stores.grant_.GroupCount()) {
-    return MetaFailStopError(
-        "topology and grant stores have different group sets");
-  }
 
   std::set<MetaOperationId> controlled_transition_operations;
   std::set<MetaFailoverTransitionId> failover_transition_ids;
   for (const MetaTopologyGroupView& group : stores.topology_.Groups()) {
-    const auto grant = stores.grant_.GroupState(group.group_id_);
-    if (!grant.has_value()) {
-      return MetaFailStopError(absl::StrCat("topology group ", group.group_id_,
-                                            " has no grant-store entry"));
-    }
-    if (group.record_.group_term_ != grant->group_term_) {
-      return MetaFailStopError(absl::StrCat(
-          "topology/grant anchors disagree for group ", group.group_id_));
-    }
+    const auto grant = stores.topology_.AuthorityFor(group.group_id_);
     for (const MetaGroupMember& member : group.members_) {
       if (!stores.identity_.IsActiveNode(member.node_id_)) {
         return MetaFailStopError(absl::StrCat("group ", group.group_id_,
@@ -412,7 +462,6 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
             !operation->kind_phase_blob_.empty() ||
             !operation->current_directives_.empty() ||
             !operation->terminal_receipts_.empty() ||
-            !operation->evidence_.empty() ||
             std::any_of(operation->replication_history_id_.begin(),
                         operation->replication_history_id_.end(),
                         [](std::uint8_t byte) { return byte != 0; })) {
@@ -456,9 +505,8 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
     }
 
     if (!grant->grant_.has_value()) continue;
-    const MetaGroupGrant& active = *grant->grant_;
+    const MetaActiveAuthorityView& active = *grant->grant_;
     if (group.record_.group_term_ == 0 || group.record_.owner_.empty() ||
-        group.record_.owner_ != active.owner_ ||
         !stores.identity_.IsActiveNode(active.owner_) ||
         !IsMember(group, active.owner_)) {
       return MetaFailStopError(absl::StrCat(
@@ -467,7 +515,7 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
   }
 
   for (const MetaOperationRecord& operation :
-       stores.operation_.LiveOperations()) {
+       stores.operation_.LiveOperationsView()) {
     if (operation.kind_ == kFailoverOperationKind) {
       const bool zero_history =
           std::all_of(operation.replication_history_id_.begin(),
@@ -479,7 +527,7 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
           operation.intent_hash_ == MetaSha256(operation.intent_) &&
           zero_history && operation.kind_phase_blob_.empty() &&
           operation.current_directives_.empty() &&
-          operation.terminal_receipts_.empty() && operation.evidence_.empty();
+          operation.terminal_receipts_.empty();
       const bool submitted =
           operation.lifecycle_ == MetaOperationLifecycle::kSubmitted &&
           operation.revision_ == 0 && operation.terminal_result_.empty() &&
@@ -502,35 +550,6 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
         operation.lifecycle_ == MetaOperationLifecycle::kAborted) {
       continue;
     }
-    for (const MetaEvidenceSummary& evidence : operation.evidence_) {
-      const auto evidence_group =
-          stores.topology_.FindGroup(evidence.group_id_);
-      if (!evidence_group.has_value()) {
-        return MetaFailStopError(
-            "non-terminal operation evidence references a missing group");
-      }
-      // Evidence is immutable history, so an older anchor remains valid after
-      // the group advances. A future anchor, or a digest inconsistent with the
-      // same manifest revision, could never have passed committed apply.
-      if (evidence.group_term_ > evidence_group->record_.group_term_ ||
-          evidence.population_manifest_revision_ >
-              evidence_group->record_.population_manifest_revision_ ||
-          evidence.partition_replication_epoch_ >
-              evidence_group->record_.partition_replication_epoch_ ||
-          (evidence.population_manifest_revision_ ==
-               evidence_group->record_.population_manifest_revision_ &&
-           evidence.population_manifest_digest_ !=
-               evidence_group->record_.population_manifest_digest_)) {
-        return MetaFailStopError(
-            "non-terminal operation evidence contains impossible anchors");
-      }
-      if (evidence.population_manifest_revision_ != 0 &&
-          !stores.population_manifest_.Contains(
-              evidence.population_manifest_digest_)) {
-        return MetaFailStopError(
-            "non-terminal operation evidence references a missing manifest");
-      }
-    }
     for (const MetaCurrentDirective& directive :
          operation.current_directives_) {
       if (const absl::Status anchor =
@@ -551,43 +570,55 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
   return absl::OkStatus();
 }
 
-// Validate the exact wire projection before publishing an operation phase.
-// Per-operation bounds alone are insufficient because one data node can be
-// the recipient of directives from many live operations.  The projector is
-// deliberately reused here so this guard cannot drift from protocol field,
-// entry-count, or total-object limits.
-absl::Status ValidateAffectedFullStateProjections(
-    const MetaStores& candidate, std::uint64_t log_index,
-    const std::set<std::string>& affected_recipients) {
-  if (affected_recipients.empty()) return absl::OkStatus();
-
-  const MetaCommittedView view(candidate, log_index);
-  for (const std::string& recipient : affected_recipients) {
-    const auto projected = MetaControlProjector::ProjectNode(view, recipient);
-    if (!projected.ok()) {
-      return MetaDomainRejectError(absl::StrCat(
-          "operation phase makes FullDesiredState unprojectable for node ",
-          recipient, ": ", projected.status().message()));
+// Apply validates domain bounds directly. Network projection/encoding belongs
+// to the publisher and must never allocate a full FDS during a Raft transition.
+absl::Status ValidateAffectedNodeControls(
+    const MetaStores& stores, std::uint64_t /*log_index*/,
+    const std::set<std::string>& recipients) {
+  if (recipients.empty()) return absl::OkStatus();
+  if (!stores.policy_.CurrentAuthorityLease().has_value()) {
+    return MetaDomainRejectError(
+        "node control requires the Authority Lease policy");
+  }
+  std::map<std::string, std::size_t> counts;
+  std::map<std::string, std::uint64_t> bytes;
+  for (const auto& operation : stores.operation_.LiveOperationsView()) {
+    if (IsTerminal(operation.lifecycle_)) continue;
+    for (const auto& current : operation.current_directives_) {
+      const auto& spec = current.spec_;
+      if (!recipients.contains(spec.recipient_node_id_)) continue;
+      if (++counts[spec.recipient_node_id_] >
+          cluster::control::kMaxProjectedDirectives)
+        return MetaDomainRejectError(
+            "current directives exceeds its entry cap");
+      // Reserve fixed identity/label overhead per task; bootstrap routing
+      // and manifests retain half the object budget. Tasks travel individually
+      // after initialization, so no wire projection is needed to check this.
+      auto& used = bytes[spec.recipient_node_id_];
+      used += spec.payload_.size() + spec.group_id_.size() + 1024u;
+      if (used > cluster::control::kMaxFullDesiredStateBytes / 2)
+        return MetaDomainRejectError(
+            "current directives exceeds its byte budget");
     }
   }
   return absl::OkStatus();
 }
 
-// Whether the node owns an active grant. The grant store has no per-node
-// index; the "grant owner => member of the group" invariant (maintained by
-// the ActivateAuthority member check and by rejecting RemoveNodeFromGroup of
-// a grant owner) lets the fact be read through the node's current group.
+// Whether the node owns active authority. The "grant owner => member of the
+// group" invariant (maintained by the ActivateAuthority member check and by
+// rejecting RemoveNodeFromGroup of a grant owner) lets the fact be read through
+// the node's current group.
 bool NodeHoldsActiveGrant(const MetaStores& stores,
                           const std::string& node_id) {
   const auto group = stores.topology_.FindGroupOfNode(node_id);
   if (!group.has_value()) return false;
-  const auto state = stores.grant_.GroupState(*group);
+  const auto state = stores.topology_.AuthorityFor(*group);
   return state.has_value() && state->grant_.has_value() &&
          state->grant_->owner_ == node_id;
 }
 
 bool GroupHasActiveGrant(const MetaStores& stores, std::string_view group_id) {
-  const auto state = stores.grant_.GroupState(group_id);
+  const auto state = stores.topology_.AuthorityFor(group_id);
   return state.has_value() && state->grant_.has_value();
 }
 
@@ -599,11 +630,7 @@ bool GroupHasActiveFailover(const MetaStores& stores,
 
 absl::Status ApplyBeginGroupTermKernel(MetaStores& stores,
                                        const BeginGroupTerm& command) {
-  if (absl::Status status = stores.grant_.BeginGroupTerm(command);
-      !status.ok()) {
-    return status;
-  }
-  return stores.topology_.SetGroupTerm(command.group_id_, command.new_term_);
+  return stores.topology_.BeginGroupTerm(command);
 }
 
 bool ClusterLifecycleAllowsFailover(const MetaStores& stores) {
@@ -655,7 +682,7 @@ bool IsPristineSubmittedFailoverOperation(
          operation.intent_hash_ == MetaSha256(operation.intent_) &&
          operation.kind_phase_blob_.empty() &&
          operation.current_directives_.empty() &&
-         operation.terminal_receipts_.empty() && operation.evidence_.empty() &&
+         operation.terminal_receipts_.empty() &&
          std::all_of(operation.replication_history_id_.begin(),
                      operation.replication_history_id_.end(),
                      [](std::uint8_t byte) { return byte == 0; });
@@ -684,7 +711,7 @@ std::vector<MetaOperationRecord> PreemptableControlledRequests(
     const MetaStores& stores, std::string_view group_id) {
   std::vector<MetaOperationRecord> requests;
   for (const MetaOperationRecord& operation :
-       stores.operation_.LiveOperations()) {
+       stores.operation_.LiveOperationsView()) {
     if (IsPristineSubmittedFailoverOperation(operation) &&
         FailoverOperationIntentMatches(operation, group_id)) {
       requests.push_back(operation);
@@ -809,7 +836,8 @@ absl::Status ValidateControlledFailoverOperation(
 template <typename BeginCommand>
 absl::Status ValidateFailoverBeginAnchors(
     const MetaStores& stores, const BeginCommand& cmd,
-    const MetaTopologyGroupView& group, const MetaGroupGrantState& grant_state,
+    const MetaTopologyGroupView& group,
+    const MetaGroupAuthorityView& grant_state,
     const MetaFailoverCandidateAction* candidate_action) {
   if (group.failover_transition_.has_value()) {
     return MetaDomainRejectError("group already has a failover transition");
@@ -839,7 +867,7 @@ absl::Status ValidateFailoverBeginAnchors(
       !grant_state.grant_.has_value()) {
     return MetaDomainRejectError("failover grant anchor is stale");
   }
-  const MetaGroupGrant& active = *grant_state.grant_;
+  const MetaActiveAuthorityView& active = *grant_state.grant_;
   if (active.owner_ != cmd.expected_owner_node_id_) {
     return MetaDomainRejectError(
         "failover authority does not match the active grant");
@@ -884,7 +912,7 @@ bool BeginControlledEffectPresent(const MetaStores& stores,
                                   std::uint64_t log_index) {
   if (!ClusterLifecycleAllowsFailover(stores)) return false;
   const auto group = stores.topology_.FindGroup(cmd.group_id_);
-  const auto grant = stores.grant_.GroupState(cmd.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(cmd.group_id_);
   if (!group.has_value() || !grant.has_value() ||
       !group->failover_transition_.has_value() ||
       *group->failover_transition_ !=
@@ -904,7 +932,7 @@ bool BeginControlledEffectPresent(const MetaStores& stores,
       !grant->grant_.has_value()) {
     return false;
   }
-  const MetaGroupGrant& active = *grant->grant_;
+  const MetaActiveAuthorityView& active = *grant->grant_;
   return active.owner_ == cmd.expected_owner_node_id_ &&
          ValidateFailoverCandidateAgainstGroup(stores, *group,
                                                cmd.candidate_action_)
@@ -932,7 +960,7 @@ bool BeginUncontrolledEffectPresent(const MetaStores& stores,
                                     std::uint64_t log_index) {
   if (!ClusterLifecycleAllowsFailover(stores)) return false;
   const auto group = stores.topology_.FindGroup(cmd.group_id_);
-  const auto grant = stores.grant_.GroupState(cmd.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(cmd.group_id_);
   if (!group.has_value() || !grant.has_value() ||
       !group->failover_transition_.has_value()) {
     return false;
@@ -982,7 +1010,7 @@ bool FailoverCommitEffectPresent(const MetaStores& stores,
     return false;
   }
   const auto group = stores.topology_.FindGroup(command.group_id_);
-  const auto grant = stores.grant_.GroupState(command.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(command.group_id_);
   if (!group.has_value() || !grant.has_value() ||
       group->failover_transition_.has_value()) {
     return false;
@@ -1005,7 +1033,7 @@ bool FailoverCommitEffectPresent(const MetaStores& stores,
       grant->group_term_ != target_term || !grant->grant_.has_value()) {
     return false;
   }
-  const MetaGroupGrant& active = *grant->grant_;
+  const MetaActiveAuthorityView& active = *grant->grant_;
   if (active.owner_ != command.expected_candidate_.node_id_ ||
       active.activation_action_id_ != command.action_id_ ||
       !AllCurrentDirectivesHaveCommittedAnchors(stores)) {
@@ -1030,7 +1058,8 @@ bool FailoverCommitEffectPresent(const MetaStores& stores,
 template <typename CommitCommand>
 absl::Status ValidateFailoverCommitPrestate(
     const MetaStores& stores, const CommitCommand& command,
-    const MetaTopologyGroupView& group, const MetaGroupGrantState& grant_state,
+    const MetaTopologyGroupView& group,
+    const MetaGroupAuthorityView& grant_state,
     const MetaFailoverTransition& transition) {
   constexpr bool kControlled =
       std::is_same_v<CommitCommand, CommitControlledFailover>;
@@ -1122,7 +1151,7 @@ ApplyOutcome ApplyFailoverCommit(MetaStores& stores, std::uint64_t log_index,
     return Accepted(std::move(summary));
   }
   const auto group = stores.topology_.FindGroup(command.group_id_);
-  const auto grant = stores.grant_.GroupState(command.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(command.group_id_);
   if (!group.has_value() || !grant.has_value() ||
       !group->failover_transition_.has_value()) {
     return Rejected("failover commit transition is absent", std::move(summary));
@@ -1134,14 +1163,14 @@ ApplyOutcome ApplyFailoverCommit(MetaStores& stores, std::uint64_t log_index,
     return Rejected(status, std::move(summary));
   }
 
-  MetaStores candidate = stores;
+  MetaApplyRollback rollback(stores, command);
   const std::uint64_t target_term = transition.target_term_;
   if constexpr (kControlled) {
     BeginGroupTerm begin;
     begin.group_id_ = command.group_id_;
     begin.expected_term_ = command.expected_group_term_;
     begin.new_term_ = target_term;
-    if (absl::Status status = ApplyBeginGroupTermKernel(candidate, begin);
+    if (absl::Status status = ApplyBeginGroupTermKernel(stores, begin);
         !status.ok()) {
       return Rejected(status, std::move(summary));
     }
@@ -1152,12 +1181,12 @@ ApplyOutcome ApplyFailoverCommit(MetaStores& stores, std::uint64_t log_index,
   activate.expected_term_ = target_term;
   activate.new_owner_ = command.expected_candidate_.node_id_;
   activate.new_topology_epoch_ = command.new_topology_epoch_;
-  if (absl::Status status = ApplyAuthorityActivationKernel(candidate, activate,
-                                                           command.action_id_);
+  if (absl::Status status =
+          ApplyAuthorityActivationKernel(stores, activate, command.action_id_);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  if (absl::Status status = candidate.topology_.ClearFailoverTransition(
+  if (absl::Status status = stores.topology_.ClearFailoverTransition(
           command.group_id_, command.expected_transition_);
       !status.ok()) {
     return Rejected(status, std::move(summary));
@@ -1168,18 +1197,18 @@ ApplyOutcome ApplyFailoverCommit(MetaStores& stores, std::uint64_t log_index,
     complete.expected_revision_ = command.expected_operation_revision_;
     complete.result_ = std::string(kFailoverCompletedResult);
     complete.data_loss_possible_ = false;
-    if (absl::Status status = candidate.operation_.CompleteOperation(complete);
+    if (absl::Status status = stores.operation_.CompleteOperation(complete);
         !status.ok()) {
       return Rejected(status, std::move(summary));
     }
   }
-  InvalidateStaleCurrentDirectives(candidate);
-  if (absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, GroupRecipients(*group));
+  InvalidateStaleCurrentDirectives(stores, &rollback);
+  if (absl::Status status = ValidateAffectedNodeControls(
+          stores, log_index, GroupRecipients(*group));
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores = std::move(candidate);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -1190,11 +1219,10 @@ ApplyOutcome ApplyFailoverCommit(MetaStores& stores, std::uint64_t log_index,
 // field, so live legacy create operations are also treated as artifacts.
 bool HasDataClusterArtifactsImpl(const MetaStores& stores) {
   if (stores.identity_.NodeCount() != 0 || stores.topology_.GroupCount() != 0 ||
-      stores.grant_.GroupCount() != 0 ||
       stores.population_manifest_.Size() != 0) {
     return true;
   }
-  const auto operations = stores.operation_.LiveOperations();
+  const auto operations = stores.operation_.LiveOperationsView();
   return std::any_of(
       operations.begin(), operations.end(), [](const auto& operation) {
         return operation.kind_ == kMetaClusterCreateOperationKind ||
@@ -1214,19 +1242,32 @@ std::string ClusterFailureSummary(const MetaOperationId& operation_id) {
 // A live lease names the projection that granted it. Moving a slot into or
 // out of that projection cannot ride the same authority: the old and new
 // owners could otherwise accept the same slot
-// until both sessions consume their replacement FullDesiredState. Build the
-// complete candidate first so malformed absolute maps are rejected without
-// duplicating topology-store validation, then require every affected group to
-// be grantless/fenced before publishing any part of the replacement.
-absl::Status ValidateSlotMapAuthorityTransition(
-    const MetaStores& current, const MetaTopologyStore& candidate) {
+// until both sessions consume their replacement FullDesiredState. Inspect the
+// command's absolute slot map before mutation; only a slot-sized table of
+// borrowed group ids is needed, never a copy of the topology store.
+absl::Status ValidateSlotMapAuthorityTransition(const MetaStores& current,
+                                                const SetSlotMap& command) {
+  std::array<std::string_view, kMetaSlotCount> target{};
+  for (const MetaSlotAssignment& range : command.ranges_) {
+    if (range.first_slot_ > range.last_slot_ ||
+        range.last_slot_ >= kMetaSlotCount) {
+      return MetaDomainRejectError("slot range out of bounds");
+    }
+    for (std::uint32_t slot = range.first_slot_; slot <= range.last_slot_;
+         ++slot) {
+      if (!target[slot].empty()) {
+        return MetaDomainRejectError("overlapping slot ranges");
+      }
+      target[slot] = range.group_id_;
+    }
+  }
   std::set<std::string> affected_groups;
   for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
     const auto before = current.topology_.SlotOwner(slot);
-    const auto after = candidate.SlotOwner(slot);
-    if (before == after) continue;
+    const std::string_view after = target[slot];
+    if (before.value_or("") == after) continue;
     if (before.has_value()) affected_groups.insert(*before);
-    if (after.has_value()) affected_groups.insert(*after);
+    if (!after.empty()) affected_groups.insert(std::string(after));
   }
   for (const std::string& group_id : affected_groups) {
     if (GroupHasActiveFailover(current, group_id)) {
@@ -1243,35 +1284,32 @@ absl::Status ValidateSlotMapAuthorityTransition(
   return absl::OkStatus();
 }
 
-// The replay predicate of ActivateAuthority: BOTH halves already carry
-// exactly this command's post-effect (grant half: the same predicate the
-// grant store's GrantMatches uses; topology half: owner and the
-// cluster topology_epoch).
-bool ActivateEffectPresent(
-    const MetaStores& stores, const ActivateAuthority& cmd,
-    const MetaTopologyGroupView& view, const MetaGroupGrantState& grant_state,
-    const std::optional<MetaFailoverActionId>& activation_action_id =
-        std::nullopt) {
+// Replay requires the Group authority and cluster epoch to match the command.
+bool ActivateEffectPresent(const MetaStores& stores,
+                           const ActivateAuthority& cmd,
+                           const MetaTopologyGroupView& /*view*/,
+                           const MetaGroupAuthorityView& grant_state,
+                           const std::optional<MetaFailoverActionId>&
+                               activation_action_id = std::nullopt) {
   if (!grant_state.grant_.has_value()) return false;
-  const MetaGroupGrant& grant = *grant_state.grant_;
-  const bool grant_half = grant_state.group_term_ == cmd.expected_term_ &&
-                          grant.owner_ == cmd.new_owner_ &&
-                          grant.activation_action_id_ == activation_action_id;
-  const bool topology_half =
-      view.record_.owner_ == cmd.new_owner_ &&
-      stores.topology_.TopologyEpoch() == cmd.new_topology_epoch_;
-  return grant_half && topology_half;
+  const MetaActiveAuthorityView& grant = *grant_state.grant_;
+  const bool authority_matches =
+      grant_state.group_term_ == cmd.expected_term_ &&
+      grant.owner_ == cmd.new_owner_ &&
+      grant.activation_action_id_ == activation_action_id;
+  return authority_matches &&
+         stores.topology_.TopologyEpoch() == cmd.new_topology_epoch_;
 }
 
 // Shared authority cutover kernel. It owns the same cross-store invariants for
 // ordinary activation and failover activation; callers choose whether the
 // installed grant is action-bound and perform any workflow-specific transition
-// or Operation mutation around this bounded aggregate copy.
+// or Operation mutation within the same record-level rollback boundary.
 absl::Status ApplyAuthorityActivationKernel(
     MetaStores& stores, const ActivateAuthority& cmd,
     std::optional<MetaFailoverActionId> activation_action_id) {
   const auto view = stores.topology_.FindGroup(cmd.group_id_);
-  const auto grant_state = stores.grant_.GroupState(cmd.group_id_);
+  const auto grant_state = stores.topology_.AuthorityFor(cmd.group_id_);
   if (!view.has_value() || !grant_state.has_value()) {
     return MetaDomainRejectError(absl::StrCat("unknown group ", cmd.group_id_));
   }
@@ -1285,7 +1323,7 @@ absl::Status ApplyAuthorityActivationKernel(
         "group term already has a different authority effect");
   }
   if (absl::Status status =
-          stores.grant_.ValidateActivate(cmd, activation_action_id);
+          stores.topology_.ValidateActivate(cmd, activation_action_id);
       !status.ok()) {
     return status;
   }
@@ -1305,13 +1343,8 @@ absl::Status ApplyAuthorityActivationKernel(
           "new owner ", cmd.new_owner_, " is not a registered active node"));
     }
   }
-  if (absl::Status status =
-          stores.grant_.ApplyGrantPart(cmd, std::move(activation_action_id));
-      !status.ok()) {
-    return status;
-  }
-  if (absl::Status status =
-          stores.topology_.SetOwner(cmd.group_id_, cmd.new_owner_);
+  if (absl::Status status = stores.topology_.ActivateAuthority(
+          cmd, std::move(activation_action_id));
       !status.ok()) {
     return status;
   }
@@ -1345,8 +1378,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       current_node.has_value() && !current_node->retired_ &&
       cmd.expected_revision_ != UINT64_MAX &&
       current_node->revision_ == cmd.expected_revision_ + 1 &&
-      current_node->endpoints_ == cmd.endpoints_ &&
-      current_node->capability_mask_ == cmd.capability_mask_;
+      current_node->endpoints_ == cmd.endpoints_;
   const bool topology_effect_present =
       stores.topology_.TopologyEpoch() == cmd.new_topology_epoch_;
   if (identity_effect_present != topology_effect_present) {
@@ -1385,8 +1417,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 // ---------------------------------------------------------------------------
-// topology. CreateGroup is the group lifecycle point for BOTH stores: the
-// topology table and the grant store's per-group entry must move together.
+// Topology owns the complete Group lifecycle, including its authority.
 // ---------------------------------------------------------------------------
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -1395,15 +1426,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   const std::string summary =
       absl::StrCat("CreateGroup group=", cmd.group_id_,
                    " topology_epoch=", cmd.new_topology_epoch_);
-  // Topology first: it carries the strictly-more failure modes (epoch rule,
-  // pristine replay check) and validates the id caps the grant store repeats.
-  const absl::Status status = stores.topology_.Apply(cmd);
-  if (!status.ok()) return Rejected(status, std::move(summary));
-  // Lockstep invariant: the grant store mirrors the group set. This cannot
-  // fail — same id validation, equal group cap, the group was absent until
-  // now; a failure means the stores were wired out of sync, so surface it
-  // instead of proceeding desynchronized.
-  return FromStatus(stores.grant_.AddGroup(cmd.group_id_), std::move(summary));
+  return FromStatus(stores.topology_.Apply(cmd), std::move(summary));
 }
 
 // ---------------------------------------------------------------------------
@@ -1482,7 +1505,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   // cannot leave the membership while the grant stands (revoke/fence first).
   // This is what makes the AssignNodeToGroup obligation check sound without a
   // grant-by-node index.
-  const auto grant_state = stores.grant_.GroupState(cmd.group_id_);
+  const auto grant_state = stores.topology_.AuthorityFor(cmd.group_id_);
   if (grant_state.has_value() && grant_state->grant_.has_value() &&
       grant_state->grant_->owner_ == cmd.node_id_) {
     return Rejected(absl::StrCat("node ", cmd.node_id_,
@@ -1517,17 +1540,11 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   std::string summary =
       absl::StrCat("SetSlotMap ranges=", cmd.ranges_.size(),
                    " topology_epoch=", cmd.new_topology_epoch_);
-  MetaTopologyStore candidate = stores.topology_;
-  if (const absl::Status applied = candidate.Apply(cmd); !applied.ok()) {
-    return Rejected(applied, std::move(summary));
-  }
-  if (const absl::Status safe =
-          ValidateSlotMapAuthorityTransition(stores, candidate);
+  if (const absl::Status safe = ValidateSlotMapAuthorityTransition(stores, cmd);
       !safe.ok()) {
     return Rejected(safe, std::move(summary));
   }
-  stores.topology_ = std::move(candidate);
-  return Accepted(std::move(summary));
+  return FromStatus(stores.topology_.Apply(cmd), std::move(summary));
 }
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -1574,20 +1591,22 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     return FromStatus(stores.population_manifest_.Put(cmd), std::move(summary));
   }
 
-  MetaPopulationManifestStore candidate = stores.population_manifest_;
-  if (absl::Status put = candidate.Put(cmd); !put.ok()) {
-    return Rejected(put, std::move(summary));
+  if (cmd.entries_.size() > kMaxMetaPopulationManifestEntries) {
+    return Rejected("population manifest entry cap exceeded",
+                    std::move(summary));
   }
-  auto bytes = SnapshotBytesWithPopulationManifest(stores, candidate);
-  if (!bytes.ok()) return Rejected(bytes.status(), std::move(summary));
-  if (*bytes > kMaxMetaSnapshotBytes ||
-      kMaximumAuditSnapshotGrowth > kMaxMetaSnapshotBytes - *bytes) {
+  // The only growth is this new digest/count/entry sequence. Check its exact
+  // durable size before Put validates and inserts the immutable document.
+  auto bytes =
+      SnapshotBytesWithPopulationManifest(stores, stores.population_manifest_);
+  const std::uint64_t growth = 32u + 4u + 12u * cmd.entries_.size();
+  if (bytes > kMaxMetaSnapshotBytes ||
+      growth + kMaximumAuditSnapshotGrowth > kMaxMetaSnapshotBytes - bytes) {
     return Rejected(
         "population manifest exceeds the remaining snapshot byte budget",
         std::move(summary));
   }
-  stores.population_manifest_ = std::move(candidate);
-  return Accepted(std::move(summary));
+  return FromStatus(stores.population_manifest_.Put(cmd), std::move(summary));
 }
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -1608,9 +1627,9 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 
 // ---------------------------------------------------------------------------
 // term/grant. BeginGroupTerm and ActivateAuthority are shared aggregate
-// kernels: they update the grant store together with the committed GroupRecord
-// in the topology store. Typed failover commands reuse the same kernels for
-// fencing and cutover (file header item 3).
+// kernels: they update authority inside the committed Topology Group. Typed
+// failover commands reuse the same kernels for fencing and cutover (file header
+// item 3).
 // ---------------------------------------------------------------------------
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -1624,12 +1643,12 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
         "group term change is blocked by an active failover transition",
         std::move(summary));
   }
-  MetaStores candidate = stores;
-  if (absl::Status status = ApplyBeginGroupTermKernel(candidate, cmd);
+  MetaApplyRollback rollback(stores, cmd);
+  if (absl::Status status = ApplyBeginGroupTermKernel(stores, cmd);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  InvalidateStaleCurrentDirectives(candidate);
+  InvalidateStaleCurrentDirectives(stores, &rollback);
   const auto group = stores.topology_.FindGroup(cmd.group_id_);
   std::set<std::string> recipients;
   if (group.has_value()) {
@@ -1637,12 +1656,12 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       recipients.insert(member.node_id_);
     }
   }
-  if (absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, recipients);
+  if (absl::Status status =
+          ValidateAffectedNodeControls(stores, log_index, recipients);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores = std::move(candidate);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -1653,7 +1672,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       " expected_term=", cmd.expected_term_,
       " topology_epoch=", cmd.new_topology_epoch_);
   const auto view = stores.topology_.FindGroup(cmd.group_id_);
-  const auto grant_state = stores.grant_.GroupState(cmd.group_id_);
+  const auto grant_state = stores.topology_.AuthorityFor(cmd.group_id_);
   const bool effect_present =
       view.has_value() && grant_state.has_value() &&
       ActivateEffectPresent(stores, cmd, *view, *grant_state);
@@ -1664,25 +1683,25 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
         std::move(summary));
   }
 
-  MetaStores candidate = stores;
+  MetaApplyRollback rollback(stores, cmd);
   if (absl::Status status =
-          ApplyAuthorityActivationKernel(candidate, cmd, std::nullopt);
+          ApplyAuthorityActivationKernel(stores, cmd, std::nullopt);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  InvalidateStaleCurrentDirectives(candidate);
+  InvalidateStaleCurrentDirectives(stores, &rollback);
   std::set<std::string> recipients;
   if (view.has_value()) {
     for (const MetaGroupMember& member : view->members_) {
       recipients.insert(member.node_id_);
     }
   }
-  if (absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, recipients);
+  if (absl::Status status =
+          ValidateAffectedNodeControls(stores, log_index, recipients);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores = std::move(candidate);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -1695,16 +1714,16 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     return Rejected("fencing is blocked by an active failover transition",
                     std::move(summary));
   }
-  MetaStores candidate = stores;
+  MetaApplyRollback rollback(stores, cmd);
   BeginGroupTerm begin;
   begin.group_id_ = cmd.group_id_;
   begin.expected_term_ = cmd.expected_term_;
   begin.new_term_ = cmd.new_term_;
-  if (absl::Status status = ApplyBeginGroupTermKernel(candidate, begin);
+  if (absl::Status status = ApplyBeginGroupTermKernel(stores, begin);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  InvalidateStaleCurrentDirectives(candidate);
+  InvalidateStaleCurrentDirectives(stores, &rollback);
   const auto group = stores.topology_.FindGroup(cmd.group_id_);
   std::set<std::string> recipients;
   if (group.has_value()) {
@@ -1712,12 +1731,12 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       recipients.insert(member.node_id_);
     }
   }
-  if (absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, recipients);
+  if (absl::Status status =
+          ValidateAffectedNodeControls(stores, log_index, recipients);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores = std::move(candidate);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -1742,7 +1761,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   }
 
   const auto group = stores.topology_.FindGroup(cmd.group_id_);
-  const auto grant = stores.grant_.GroupState(cmd.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(cmd.group_id_);
   if (!group.has_value() || !grant.has_value()) {
     return Rejected(absl::StrCat("unknown group ", cmd.group_id_),
                     std::move(summary));
@@ -1764,18 +1783,18 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  MetaStores candidate = stores;
-  if (absl::Status status = candidate.topology_.InstallFailoverTransition(
+  MetaApplyRollback rollback(stores, cmd);
+  if (absl::Status status = stores.topology_.InstallFailoverTransition(
           cmd.group_id_, transition, log_index);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  if (absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, GroupRecipients(*group));
+  if (absl::Status status = ValidateAffectedNodeControls(
+          stores, log_index, GroupRecipients(*group));
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores = std::move(candidate);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -1821,7 +1840,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   }
 
   const auto group = stores.topology_.FindGroup(cmd.group_id_);
-  const auto grant = stores.grant_.GroupState(cmd.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(cmd.group_id_);
   if (!group.has_value() || !grant.has_value()) {
     return Rejected(absl::StrCat("unknown group ", cmd.group_id_),
                     std::move(summary));
@@ -1841,20 +1860,21 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     return Rejected(status, std::move(summary));
   }
 
-  // Build and validate the entire replacement aggregate before publishing
-  // either half. BeginGroupTerm is the existing grant-state kernel: it moves
-  // T -> T+1 and fences. Topology mirrors the term and owns the transition;
-  // the historical owner remains unchanged until cutover.
-  MetaStores candidate = stores;
+  // Apply only the affected records under the state-machine write lock;
+  // rollback retains those records until post-state validation succeeds.
+  // BeginGroupTerm is the existing grant-state kernel: it moves T -> T+1 and
+  // fences. Topology mirrors the term and owns the transition; the historical
+  // owner remains unchanged until cutover.
+  MetaApplyRollback rollback(stores, cmd);
   BeginGroupTerm begin_term;
   begin_term.group_id_ = cmd.group_id_;
   begin_term.expected_term_ = cmd.expected_group_term_;
   begin_term.new_term_ = cmd.target_term_;
-  if (absl::Status status = ApplyBeginGroupTermKernel(candidate, begin_term);
+  if (absl::Status status = ApplyBeginGroupTermKernel(stores, begin_term);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  if (absl::Status status = candidate.topology_.InstallFailoverTransition(
+  if (absl::Status status = stores.topology_.InstallFailoverTransition(
           cmd.group_id_, transition, log_index);
       !status.ok()) {
     return Rejected(status, std::move(summary));
@@ -1862,15 +1882,16 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   // The optional command pair is a proposer-observed CAS witness, not the
   // complete mutation set. Apply scans the bounded journal so any pristine
   // request that won the append race after proposal construction is aborted
-  // in the same candidate aggregate as the emergency transition.
+  // in the same atomic delta as the emergency transition.
   if (cmd.trigger_reason_ != MetaAutomaticFailoverReason::kManual) {
     for (const MetaOperationRecord& operation :
-         PreemptableControlledRequests(candidate, cmd.group_id_)) {
+         PreemptableControlledRequests(stores, cmd.group_id_)) {
       AbortOperation abort;
       abort.operation_id_ = operation.operation_id_;
       abort.expected_revision_ = operation.revision_;
       abort.reason_ = std::string(kAutomaticFailoverPreemptionReason);
-      if (absl::Status status = candidate.operation_.AbortOperation(abort);
+      rollback.WatchOperation(abort.operation_id_);
+      if (absl::Status status = stores.operation_.AbortOperation(abort);
           !status.ok()) {
         return Rejected(status, std::move(summary));
       }
@@ -1878,23 +1899,23 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   }
 
   // Advancing the group term invalidates every directive anchored to the old
-  // authority. Remove those directives in the same candidate aggregate before
+  // authority. Remove those directives in the same atomic delta before
   // projecting FDS: otherwise projection correctly rejects the stale anchor
   // and an emergency failover can never commit while old work is installed.
   // Publishing operation_ together with topology_/grant_ also makes the
   // invalidation atomic across a Meta leader restart.
-  InvalidateStaleCurrentDirectives(candidate);
+  InvalidateStaleCurrentDirectives(stores, &rollback);
 
   std::set<std::string> affected_recipients;
   for (const MetaGroupMember& member : group->members_) {
     affected_recipients.insert(member.node_id_);
   }
-  if (absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, affected_recipients);
+  if (absl::Status status =
+          ValidateAffectedNodeControls(stores, log_index, affected_recipients);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores = std::move(candidate);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -1917,7 +1938,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                     std::move(summary));
   }
   const auto group = stores.topology_.FindGroup(cmd.group_id_);
-  const auto grant = stores.grant_.GroupState(cmd.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(cmd.group_id_);
   if (!group.has_value() || !grant.has_value() ||
       !group->failover_transition_.has_value()) {
     return Rejected("uncontrolled failover transition is absent",
@@ -1968,18 +1989,18 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  MetaStores candidate = stores;
-  if (absl::Status status = candidate.topology_.ReplaceFailoverTransition(
+  MetaApplyRollback rollback(stores, cmd);
+  if (absl::Status status = stores.topology_.ReplaceFailoverTransition(
           cmd.group_id_, cmd.expected_transition_, replacement, log_index);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  if (absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, GroupRecipients(*group));
+  if (absl::Status status = ValidateAffectedNodeControls(
+          stores, log_index, GroupRecipients(*group));
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores = std::move(candidate);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -2037,18 +2058,18 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  MetaStores candidate = stores;
-  if (absl::Status status = candidate.topology_.ReplaceFailoverTransition(
+  MetaApplyRollback rollback(stores, cmd);
+  if (absl::Status status = stores.topology_.ReplaceFailoverTransition(
           cmd.group_id_, cmd.expected_transition_, replacement, log_index);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  if (absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, GroupRecipients(*group));
+  if (absl::Status status = ValidateAffectedNodeControls(
+          stores, log_index, GroupRecipients(*group));
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores = std::move(candidate);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -2104,17 +2125,17 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     }
   }
 
-  MetaStores candidate = stores;
+  MetaApplyRollback rollback(stores, cmd);
   AbortOperation abort;
   abort.operation_id_ = cmd.operation_id_;
   abort.expected_revision_ = cmd.expected_operation_revision_;
   abort.reason_ = cmd.reason_;
-  if (absl::Status status = candidate.operation_.AbortOperation(abort);
+  if (absl::Status status = stores.operation_.AbortOperation(abort);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
   if (cmd.expected_transition_.has_value()) {
-    if (absl::Status status = candidate.topology_.ClearFailoverTransition(
+    if (absl::Status status = stores.topology_.ClearFailoverTransition(
             cmd.group_id_, *cmd.expected_transition_);
         !status.ok()) {
       return Rejected(status, std::move(summary));
@@ -2122,12 +2143,12 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   }
   const std::set<std::string> recipients =
       group.has_value() ? GroupRecipients(*group) : std::set<std::string>{};
-  if (absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, recipients);
+  if (absl::Status status =
+          ValidateAffectedNodeControls(stores, log_index, recipients);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores = std::move(candidate);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -2148,7 +2169,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   }
 
   const auto group = stores.topology_.FindGroup(cmd.group_id_);
-  const auto grant = stores.grant_.GroupState(cmd.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(cmd.group_id_);
   const auto operation = stores.operation_.FindOperation(cmd.operation_id_);
   const std::optional<MetaFailoverCandidateAction> expected_post_action =
       cmd.retain_candidate_action_ ? cmd.expected_candidate_action_
@@ -2211,12 +2232,12 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                     std::move(summary));
   }
 
-  MetaStores candidate = stores;
+  MetaApplyRollback rollback(stores, cmd);
   BeginGroupTerm begin;
   begin.group_id_ = cmd.group_id_;
   begin.expected_term_ = group->record_.group_term_;
   begin.new_term_ = current.target_term_;
-  if (absl::Status status = ApplyBeginGroupTermKernel(candidate, begin);
+  if (absl::Status status = ApplyBeginGroupTermKernel(stores, begin);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
@@ -2229,7 +2250,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  if (absl::Status status = candidate.topology_.ReplaceFailoverTransition(
+  if (absl::Status status = stores.topology_.ReplaceFailoverTransition(
           cmd.group_id_, cmd.expected_transition_, replacement, log_index);
       !status.ok()) {
     return Rejected(status, std::move(summary));
@@ -2238,17 +2259,17 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   abort.operation_id_ = cmd.operation_id_;
   abort.expected_revision_ = cmd.expected_operation_revision_;
   abort.reason_ = cmd.reason_;
-  if (absl::Status status = candidate.operation_.AbortOperation(abort);
+  if (absl::Status status = stores.operation_.AbortOperation(abort);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  InvalidateStaleCurrentDirectives(candidate);
-  if (absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, GroupRecipients(*group));
+  InvalidateStaleCurrentDirectives(stores, &rollback);
+  if (absl::Status status = ValidateAffectedNodeControls(
+          stores, log_index, GroupRecipients(*group));
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores = std::move(candidate);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -2278,10 +2299,8 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 
 // ---------------------------------------------------------------------------
 // operation journal. The operation store owns the lifecycle
-// machine. The dispatcher supplies the log index and actor and rechecks
-// evidence against committed identity,
-// topology, term, manifest, partition-replication, and history anchors before
-// each transition.
+// machine. The dispatcher supplies the log index and actor and validates
+// each current directive against committed membership and population anchors.
 // ---------------------------------------------------------------------------
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -2350,19 +2369,17 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     }
     SubmitOperation injected = cmd;
     injected.actor_ = actor;
-    MetaStores candidate = stores;
-    const auto result =
-        candidate.operation_.SubmitOperation(injected, log_index);
+    MetaApplyRollback rollback(stores, cmd);
+    const auto result = stores.operation_.SubmitOperation(injected, log_index);
     if (!result.ok()) return Rejected(result.status(), std::move(summary));
     if (creation) {
-      if (const absl::Status status = candidate.topology_.BeginClusterCreate(
-              cmd.operation_id_, log_index);
+      if (const absl::Status status =
+              stores.topology_.BeginClusterCreate(cmd.operation_id_, log_index);
           !status.ok()) {
         return Rejected(status, std::move(summary));
       }
     }
-    stores.operation_ = std::move(candidate.operation_);
-    stores.topology_ = std::move(candidate.topology_);
+    rollback.Commit();
     return Accepted(std::move(summary));
   }
   // Begin and Submit may be adjacent in either Raft order. Begin preempts all
@@ -2409,18 +2426,17 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   // parameter keeps the dispatch contract independent of the wire path.)
   SubmitOperation injected = cmd;
   injected.actor_ = actor;
-  MetaStores candidate = stores;
-  const auto result = candidate.operation_.SubmitOperation(injected, log_index);
+  MetaApplyRollback rollback(stores, cmd);
+  const auto result = stores.operation_.SubmitOperation(injected, log_index);
   if (!result.ok()) return Rejected(result.status(), std::move(summary));
   if (creation) {
-    if (const absl::Status status = candidate.topology_.BeginClusterCreate(
-            cmd.operation_id_, log_index);
+    if (const absl::Status status =
+            stores.topology_.BeginClusterCreate(cmd.operation_id_, log_index);
         !status.ok()) {
       return Rejected(status, std::move(summary));
     }
   }
-  stores.operation_ = std::move(candidate.operation_);
-  stores.topology_ = std::move(candidate.topology_);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -2428,8 +2444,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                       const TransitionOperationPhase& cmd) {
   std::string summary =
       absl::StrCat("TransitionOperationPhase id=", HexBytes(cmd.operation_id_),
-                   " expected_revision=", cmd.expected_revision_,
-                   " evidence=", cmd.evidence_.size());
+                   " expected_revision=", cmd.expected_revision_);
   if (stores.operation_.TransitionAlreadyApplied(cmd)) {
     return FromStatus(
         stores.operation_.TransitionOperationPhase(cmd, log_index),
@@ -2454,48 +2469,11 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
         return Rejected(anchor, std::move(summary));
       }
     }
-    for (const MetaEvidenceSummary& evidence : cmd.evidence_) {
-      if (evidence.operation_id_ != cmd.operation_id_) {
-        return Rejected("evidence references a different operation",
-                        std::move(summary));
-      }
-      if (std::all_of(operation->replication_history_id_.begin(),
-                      operation->replication_history_id_.end(),
-                      [](std::uint8_t byte) { return byte == 0; }) ||
-          evidence.replication_history_id_ !=
-              operation->replication_history_id_) {
-        return Rejected("evidence replication history is not committed",
-                        std::move(summary));
-      }
-      if (!stores.identity_.IsActiveNode(evidence.node_id_)) {
-        return Rejected("evidence node is not active", std::move(summary));
-      }
-      const auto group = stores.topology_.FindGroup(evidence.group_id_);
-      if (!group.has_value()) {
-        return Rejected("evidence group does not exist", std::move(summary));
-      }
-      if (!HasAssignment(*group, evidence.node_id_, evidence.assignment_id_)) {
-        return Rejected("evidence membership or assignment is stale",
-                        std::move(summary));
-      }
-      const auto term = stores.grant_.CurrentGroupTerm(evidence.group_id_);
-      if (!term.has_value() || *term != evidence.group_term_ ||
-          group->record_.population_manifest_revision_ !=
-              evidence.population_manifest_revision_ ||
-          group->record_.population_manifest_digest_ !=
-              evidence.population_manifest_digest_ ||
-          group->record_.partition_replication_epoch_ !=
-              evidence.partition_replication_epoch_) {
-        return Rejected("evidence term or population identity is stale",
-                        std::move(summary));
-      }
-    }
   }
 
-  // Apply to a candidate aggregate first. A command may satisfy every local
-  // operation-store cap while pushing one recipient over the aggregate FDS
-  // directive-count or byte limit. Nothing in committed domain state changes
-  // until the exact node projections remain encodable.
+  // A command can satisfy per-operation caps while exceeding a recipient's
+  // aggregate projection limits. Retain only this operation's previous record
+  // until the count/size validation succeeds under the apply write lock.
   std::set<std::string> affected_recipients;
   if (operation.has_value()) {
     for (const MetaCurrentDirective& current : operation->current_directives_) {
@@ -2506,18 +2484,18 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     affected_recipients.insert(directive.recipient_node_id_);
   }
 
-  MetaStores candidate = stores;
+  MetaApplyRollback rollback(stores, cmd);
   if (const absl::Status status =
-          candidate.operation_.TransitionOperationPhase(cmd, log_index);
+          stores.operation_.TransitionOperationPhase(cmd, log_index);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  if (const absl::Status status = ValidateAffectedFullStateProjections(
-          candidate, log_index, affected_recipients);
+  if (const absl::Status status =
+          ValidateAffectedNodeControls(stores, log_index, affected_recipients);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores.operation_ = std::move(candidate.operation_);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -2571,26 +2549,23 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       operation->data_loss_possible_ == cmd.data_loss_possible_;
   const bool lifecycle_effect_applied =
       lifecycle.state_ == MetaClusterLifecycle::kCreated &&
-      lifecycle.revision_ == 2 &&
       lifecycle.root_operation_id_ == cmd.operation_id_ &&
-      lifecycle.terminal_outcome_ == MetaClusterTerminalOutcome::kCreated &&
       lifecycle.failure_summary_.empty();
   if (operation_effect_applied != lifecycle_effect_applied) {
     return Rejected("cluster-create completion replay halves do not agree",
                     std::move(summary));
   }
-  MetaStores candidate = stores;
-  if (const absl::Status status = candidate.operation_.CompleteOperation(cmd);
+  MetaApplyRollback rollback(stores, cmd);
+  if (const absl::Status status = stores.operation_.CompleteOperation(cmd);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
   if (const absl::Status status =
-          candidate.topology_.CompleteClusterCreate(cmd.operation_id_);
+          stores.topology_.CompleteClusterCreate(cmd.operation_id_);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores.operation_ = std::move(candidate.operation_);
-  stores.topology_ = std::move(candidate.topology_);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -2628,27 +2603,23 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       operation->terminal_result_ == cmd.reason_;
   const bool lifecycle_effect_applied =
       lifecycle.state_ == MetaClusterLifecycle::kProvisioningFailed &&
-      lifecycle.revision_ == 2 &&
       lifecycle.root_operation_id_ == cmd.operation_id_ &&
-      lifecycle.terminal_outcome_ ==
-          MetaClusterTerminalOutcome::kProvisioningFailed &&
       lifecycle.failure_summary_ == failure_summary;
   if (operation_effect_applied != lifecycle_effect_applied) {
     return Rejected("cluster-create abort replay halves do not agree",
                     std::move(summary));
   }
-  MetaStores candidate = stores;
-  if (const absl::Status status = candidate.operation_.AbortOperation(cmd);
+  MetaApplyRollback rollback(stores, cmd);
+  if (const absl::Status status = stores.operation_.AbortOperation(cmd);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  if (const absl::Status status = candidate.topology_.FailClusterCreate(
+  if (const absl::Status status = stores.topology_.FailClusterCreate(
           cmd.operation_id_, failure_summary);
       !status.ok()) {
     return Rejected(status, std::move(summary));
   }
-  stores.operation_ = std::move(candidate.operation_);
-  stores.topology_ = std::move(candidate.topology_);
+  rollback.Commit();
   return Accepted(std::move(summary));
 }
 
@@ -2775,9 +2746,6 @@ absl::StatusOr<std::string> MetaStores::Serialize() const {
   w.WriteString(identity_.Serialize());
   w.WriteString(topology_.Serialize());
   w.WriteString(policy_.Serialize());
-  const auto grant = grant_.Serialize();
-  if (!grant.ok()) return grant.status();
-  w.WriteString(*grant);
   const auto operation = operation_.Serialize();
   if (!operation.ok()) return operation.status();
   w.WriteString(*operation);
@@ -2814,8 +2782,6 @@ absl::StatusOr<MetaStores> MetaStores::Deserialize(std::string_view bytes) {
   if (!topology.ok()) return topology.status();
   const auto policy = r.ReadString(kBlobCap);
   if (!policy.ok()) return policy.status();
-  const auto grant = r.ReadString(kBlobCap);
-  if (!grant.ok()) return grant.status();
   const auto operation = r.ReadString(kBlobCap);
   if (!operation.ok()) return operation.status();
   const auto population_manifest = r.ReadString(kBlobCap);
@@ -2834,9 +2800,6 @@ absl::StatusOr<MetaStores> MetaStores::Deserialize(std::string_view bytes) {
   auto policy_store = MetaPolicyStore::Deserialize(*policy);
   if (!policy_store.ok()) return policy_store.status();
   stores.policy_ = std::move(*policy_store);
-  auto grant_store = MetaGrantStore::Deserialize(*grant);
-  if (!grant_store.ok()) return grant_store.status();
-  stores.grant_ = std::move(*grant_store);
   auto operation_store = MetaOperationStore::Deserialize(*operation);
   if (!operation_store.ok()) return operation_store.status();
   stores.operation_ = std::move(*operation_store);

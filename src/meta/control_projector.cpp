@@ -211,33 +211,19 @@ absl::StatusOr<control::WireDirectiveKind> ProjectDirectiveKind(
     const MetaDirectiveSpec& directive) {
   if ((directive.kind_ == kMetaDirectiveRebuild ||
        directive.kind_ == kMetaDirectiveAuthorizeSource) &&
-      (!control::DecodeRebuildRequest(directive.payload_).ok() ||
-       !directive.preconditions_.empty())) {
+      !control::DecodeRebuildRequest(directive.payload_).ok()) {
     return Invalid("rebuild/source authorization has an invalid typed body");
   }
   if (directive.kind_ == kMetaDirectiveRebuild) {
-    if (!directive.storage_mutating_) {
-      return Invalid("rebuild directive must be storage-mutating");
-    }
     return control::WireDirectiveKind::kRebuild;
   }
   if (directive.kind_ == kMetaDirectiveInitializeEmptyPopulation) {
-    if (!directive.storage_mutating_) {
-      return Invalid(
-          "initialize-empty-population directive must be storage-mutating");
-    }
     return control::WireDirectiveKind::kInitializeEmptyPopulation;
   }
   if (directive.kind_ == kMetaDirectiveAuthorizeSource) {
-    if (directive.storage_mutating_) {
-      return Invalid("authorize-source directive must not be storage-mutating");
-    }
     return control::WireDirectiveKind::kAuthorizeSource;
   }
   if (directive.kind_ == kMetaDirectiveRevokeSources) {
-    if (directive.storage_mutating_) {
-      return Invalid("revoke-sources directive must not be storage-mutating");
-    }
     return control::WireDirectiveKind::kRevokeSources;
   }
   return Invalid(absl::StrCat("unknown directive kind ", directive.kind_));
@@ -309,9 +295,7 @@ absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
   result.partition_replication_epoch = source.partition_replication_epoch_;
   result.kind = *kind;
   result.payload = source.payload_;
-  result.preconditions = source.preconditions_;
-  result.storage_mutating = source.storage_mutating_;
-  result.force = source.force_;
+
   return result;
 }
 
@@ -368,22 +352,25 @@ bool ClusterCreateDirectiveReady(const MetaOperationRecord& operation,
 
 }  // namespace
 
-absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
-    const MetaCommittedView& view, std::string_view node_id) {
+namespace {
+
+absl::StatusOr<control::FullDesiredState> ProjectNodeState(
+    const MetaStores& stores, std::uint64_t applied_index,
+    std::string_view node_id) {
   if (!control::IsCanonicalIdentity160(node_id)) {
     return Invalid("requested data node id is not canonical");
   }
-  if (!view.identity().IsActiveNode(std::string(node_id))) {
+  if (!stores.identity_.IsActiveNode(std::string(node_id))) {
     return absl::NotFoundError("requested data node is not active");
   }
-  if (view.applied_index() == 0) {
+  if (applied_index == 0) {
     return Inconsistent("committed view has applied index zero");
   }
   control::FullDesiredState state;
-  state.source_meta_applied_index = view.applied_index();
-  state.topology_epoch = view.topology().TopologyEpoch();
+  state.control_revision = applied_index;
+  state.topology_epoch = stores.topology_.TopologyEpoch();
   const std::optional<MetaAuthorityLeasePolicy> authority_lease =
-      view.policy().CurrentAuthorityLease();
+      stores.policy_.CurrentAuthorityLease();
   if (!authority_lease.has_value()) {
     return Inconsistent("current Authority Lease Policy is missing");
   }
@@ -396,7 +383,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
   state.authority_lease_duration_ms =
       static_cast<std::uint32_t>(authority_lease->duration_ms_);
 
-  for (const MetaMemberRecord& member : view.identity().MetaMembers()) {
+  for (const MetaMemberRecord& member : stores.identity_.MetaMembers()) {
     if (member.retired_) continue;
     auto endpoint = ParseNumericHostPort(member.data_control_endpoint_,
                                          "Meta data-control endpoint");
@@ -407,7 +394,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
   }
 
   std::set<std::string> active_nodes;
-  for (const MetaNodeRecord& node : view.identity().Nodes()) {
+  for (const MetaNodeRecord& node : stores.identity_.Nodes()) {
     if (node.retired_) continue;
     auto endpoint = ProjectDataEndpoint(node);
     if (!endpoint.ok()) return endpoint.status();
@@ -420,8 +407,8 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
 
   std::set<ManifestReference> manifest_references;
   std::map<std::string, std::size_t> group_indices;
-  for (const MetaTopologyGroupView& source : view.topology().Groups()) {
-    const auto grant = view.grant().GroupState(source.group_id_);
+  for (const MetaTopologyGroupView& source : stores.topology_.Groups()) {
+    const auto grant = stores.topology_.AuthorityFor(source.group_id_);
     if (!grant.has_value()) {
       return Inconsistent(
           absl::StrCat("group ", source.group_id_, " has no grant state"));
@@ -439,7 +426,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     projected.partition_replication_epoch =
         source.record_.partition_replication_epoch_;
     projected.steady_replication_enabled =
-        view.topology().ClusterLifecycle().state_ ==
+        stores.topology_.ClusterLifecycle().state_ ==
         MetaClusterLifecycle::kCreated;
 
     for (const MetaGroupMember& member : source.members_) {
@@ -476,7 +463,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     }
 
     if (grant->grant_.has_value()) {
-      const MetaGroupGrant& active = *grant->grant_;
+      const MetaActiveAuthorityView& active = *grant->grant_;
       if (source.record_.owner_.empty() ||
           active.owner_ != source.record_.owner_) {
         return Inconsistent(absl::StrCat("group ", source.group_id_,
@@ -519,7 +506,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
   // intentionally coalesced here.
   std::optional<std::string> previous_group;
   for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
-    const std::optional<std::string> owner = view.topology().SlotOwner(slot);
+    const std::optional<std::string> owner = stores.topology_.SlotOwner(slot);
     if (!owner.has_value()) {
       previous_group.reset();
       continue;
@@ -541,12 +528,12 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
   }
 
   for (const MetaOperationRecord& operation :
-       view.operation().LiveOperations()) {
+       stores.operation_.LiveOperationsView()) {
     for (const MetaCurrentDirective& current : operation.current_directives_) {
       if (current.spec_.recipient_node_id_ != node_id) continue;
       if (!ClusterCreateDirectiveReady(operation, current)) continue;
       if (const absl::Status anchor =
-              ValidateCommittedDirectiveAnchor(view.stores(), current.spec_);
+              ValidateCommittedDirectiveAnchor(stores, current.spec_);
           !anchor.ok()) {
         return Inconsistent(
             absl::StrCat("stale current directive anchor: ", anchor.message()));
@@ -575,15 +562,14 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
       });
 
   for (const auto& [revision, digest] : manifest_references) {
-    const auto document = view.population_manifest().Find(digest);
+    const auto document = stores.population_manifest_.Find(digest);
     if (!document.has_value()) {
       return Inconsistent(absl::StrCat("referenced population manifest at ",
                                        "revision ", revision, " is missing"));
     }
-    if (MetaPopulationManifestStore::CanonicalDigest(document->entries_) !=
-        digest) {
-      return Inconsistent("population manifest content digest is invalid");
-    }
+    // Put and snapshot recovery validate immutable manifest content. A
+    // projection only resolves its content-addressed reference, never rehashes
+    // it.
     control::WireManifestDocument projected;
     projected.revision = revision;
     projected.digest = digest;
@@ -598,17 +584,18 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     state.manifests.push_back(std::move(projected));
   }
 
-  auto projection_hash = control::ComputeProjectionHash(state);
-  if (!projection_hash.ok()) return projection_hash.status();
-  state.projection_hash = *projection_hash;
-  for (control::WireProjectedDirective& directive : state.current_directives) {
-    directive.basis.source_meta_applied_index = view.applied_index();
-    directive.basis.projection_hash = state.projection_hash;
-  }
+  return state;
+}
 
-  auto encoded = control::EncodeFullDesiredState(state);
+}  // namespace
+
+absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
+    const MetaCommittedView& view, std::string_view node_id) {
+  auto state = ProjectNodeState(view.stores(), view.applied_index(), node_id);
+  if (!state.ok()) return state.status();
+  auto encoded = control::EncodeFullDesiredState(*state);
   if (!encoded.ok()) return encoded.status();
-  return NodeControlBatch{std::move(state), std::move(*encoded)};
+  return NodeControlBatch{std::move(*state), std::move(*encoded)};
 }
 
 std::size_t NodeControlBatchRetainedBytes(
@@ -692,7 +679,6 @@ std::size_t NodeControlBatchRetainedBytes(
     add_string(directive.source_boot_id);
     add_string(directive.source_replication_history_id);
     add_string(directive.payload);
-    add_string(directive.preconditions);
   }
   return total;
 }

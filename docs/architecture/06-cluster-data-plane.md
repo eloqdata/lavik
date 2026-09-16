@@ -89,7 +89,7 @@ group is not "still loading", it has no safe owner. Keyed requests consult
 only the groups their slots map to, so one group's recovery does not stall
 traffic owned by healthy groups; keyless commands consult the aggregate.
 Meta does not serialize a Data process's boot-local population proof. During
-an FDS replacement, NodeControl carries an existing positive proof only across
+a local control update, NodeControl carries an existing positive proof only across
 an exact match of the Group, local and Owner assignments, Group term, manifest,
 and partition replication epoch. Explicit readiness loss or any changed anchor
 clears it before publication. Consequently a Controlled Failover pause can
@@ -259,12 +259,12 @@ The session uses control protocol v1 with framing independent of TCP packets.
 A fixed header carries type, length, per-direction sequence, and CRC32C. Frames
 are at most 16 KiB. A frame-sized `FullDesiredState` is sent directly as one
 typed frame. Complete objects that exceed one frame use Start/Chunk/End plus
-total length and SHA-256; chunks stream without per-frame application
-acknowledgements. A complete FDS gets `FullStateApplied`, directives get typed
-receipt stages, and terminal results get `ResultCommitted` or
-`NoLongerTracked`; soft `OperationEvidence` has no application ack.
-The complete desired-state cap is 512 MiB, while each opaque directive,
-result, or operation-evidence field is capped at 256 KiB. These are abuse
+a declared total length, object identity, and ordered chunk offsets; chunks
+stream without per-frame application acknowledgements. Bootstrap and control updates get `FullStateApplied` (updates correlate by
+request ID), tasks get `DirectiveResponse`, and final results get
+`ResultCommitted` or `ResultNoLongerTracked`.
+The complete desired-state cap is 512 MiB, while each opaque directive
+or result field is capped at 256 KiB. These are abuse
 ceilings, not normal sizing goals:
 16 KiB keeps one authority frame cheap and indivisible; 256 KiB matches the
 durable Meta payload-field bound; 512 MiB matches Meta's snapshot hard ceiling;
@@ -288,24 +288,31 @@ structural object can therefore be rejected below its wire cap, and aggregate
 normal projections cannot multiply the global topology into TiB-scale output
 ownership.
 
-Control protocol v1 has no delta format. Initial connection, reconnection, and
-every semantic projection change transfer a complete `FullDesiredState`. The
-object contains global topology plus each group's partition replication epoch
-and the cluster-wide resolved Authority Lease duration, immutable population
-manifests, current directives, optional failover transition, optional grant
-activation action, complete membership/owner relationship, and
-`steady_replication_enabled`. Policy ids, versions, and raw documents remain
-in Meta Committed State and never cross this Seam. Meta may cap the typed
-Policy duration by its leadership-validity bound before computing the
-projection hash. Data derives its heartbeat interval from that effective
-duration as exactly `max(1 ms, duration / 3)`; cadence is not an independent
-FDS field. Data rejects zero duration or a derived cadence beyond the
-negotiated observation TTL rather than applying a local Policy interpretation.
-Replacing FDS changes future renewal and the derived cadence but does not
-retroactively shorten an already installed finite lease. That old lease may
-bridge normal projection convergence; if its remaining time is insufficient,
-local expiry self-fences until a valid lease under the replacement is
-installed.
+FullDesiredState is only an initialization input after connect or reconnect.
+Data selects global routing/discovery, its local Group control and referenced
+manifest, the Meta directory, and its own tasks, then releases the full input.
+It retains no remote full membership-assignment table, manifest, or failover workflow and tracks no
+shared FDS applied index. `NodeControlUpdate` replaces changed routing, local
+control, or directory objects at their own session revisions and applies task
+upserts/removals with a base and target revision. Older complete objects are
+ignored; conflicting equal revisions and task gaps are rejected. A reconnect
+bootstraps current state rather than replaying incremental history.
+
+Task bodies enter execution directly from bootstrap or an upsert. The sole
+local `DesiredClusterControl` owns Group identity, owner/authority, population
+and failover control; ServingState is derived for requests. Remote routes keep
+only members/endpoints, slots, term, and current serving owner/assignment.
+A remote Group's internal rebuild or failover preparation does not trigger an
+update here. Routing-only publication preserves local tasks, source exports,
+readiness and leases. The local control revision binds lease challenges and
+fencing; task/action identities and Group term/assignment fence execution.
+Local endpoint changes also advance local control because replication consumes
+those endpoints.
+
+Policy documents stay in Meta. Data uses the resolved lease duration, with
+heartbeat cadence `max(1 ms, duration / 3)`, and rejects a zero duration or a
+cadence beyond the negotiated observation TTL. A duration update affects
+future grants without shortening an already installed finite lease.
 An exact Grant that reaches Data at or after its local deadline is consumed but
 not installed, and Data ends that Meta control session. Reusing the session for
 the next heartbeat would falsely make its higher sequence a causal confirmation
@@ -316,22 +323,13 @@ Meta sets that bit only when the committed cluster lifecycle is `Created`;
 Genesis keeps it false so explicit population directives exclusively own
 ingress. Even when true, Data defers follow-owner reconciliation while an
 active failover transition or a current local initialize/rebuild directive owns
-ingress, then consumes the later complete FDS after that blocker disappears.
-When a newer committed projection supersedes an incomplete object transfer,
-Meta aborts only that matching FDS object and retries on the same authenticated
-session. Data treats only the named FDS-supersession reason for its exact active
-object as non-terminal; an unknown reason, another object kind, or a mismatched
-object fails the session. If a direct FDS frame or streamed `TransferEnd` is
-already visible, Meta instead consumes that object's exact `FullStateApplied`
-and adopts the intermediate projection as the actual session baseline before
-retrying the newest projection. Normal projection churn therefore does not
-manufacture a candidate disconnect, while a real session loss remains terminal
-for a selected action.
-The source applied index is a diagnostic/order watermark; the projection
-SHA-256 is the semantic dependency for leases and directives. A higher index
-with identical semantic content is therefore harmless. Lower indexes reject,
-equal index/projection pairs are idempotent, and one index naming different
-semantic content invalidates memory authority and closes the session.
+ingress, then consumes local control after that blocker disappears.
+Superseded incomplete updates abort by exact object ID within the same session.
+If a direct update or TransferEnd can already be applied, Meta first consumes
+its exact acknowledgement and adopts that state as the baseline before sending
+the next delta. A partial transfer never mutates serving state. Requests and
+acknowledgements do not require an unrelated Meta commit to advance any local
+version. Replaying identical state preserves readiness and serving state.
 Installation validates and builds the entire immutable state before one
 publication; partial transfer never changes serving state. A
 group's partition replication epoch cannot regress even when the global
@@ -416,7 +414,7 @@ session close, leadership loss, and shutdown remove the record. This is a
 one-way observational feed: Data authority and lease evaluation never read
 status state back.
 
-An FDS replacement quiesces the heartbeat producer before publishing the new
+A local control or task update quiesces the heartbeat producer before publishing the new
 controller projection. A heartbeat already written under the old projection
 is detached from lease authority; its exact ack may still be consumed for wire
 progress, but its lease decision is ignored. Heartbeats resume only after the
@@ -424,19 +422,11 @@ new desired object is installed and `FullStateApplied` is written, so an old
 Ack cannot causally confirm the replacement projection and an old Ready proof
 cannot be evaluated against a new assignment, manifest, or population epoch.
 
-Directive execution also emits typed, volatile `OperationEvidence` for the
-started and completed phases. Each report is bound to the current session and
-boot, authenticated reporter, exact local assignment, operation, population
-anchor, and replication history, and carries its bounded evidence body.
-Reports that fit one frame use the soft-message lane; larger reports use
-the same Start/Chunk/End object-transfer machinery under an evidence-specific
-cap. All reports require schema validation; streamed reports additionally
-require the transfer-level whole-object digest to match. Meta
-audits and discards a well-formed report that has become stale without closing
-the authority session; malformed session, boot, or framing fails the session.
-Meta's typed candidate/evidence query results retain that authenticated boot
-beside the reporter and assignment, so later directive/evidence construction
-never has to race a second session lookup.
+Task admission replies with `DirectiveResponse.started`; the asynchronous
+`DirectiveResult` is accepted independently of that response. There is no
+generic evidence message, receipt-stage chain, or evidence cache. SourcePaused,
+CandidatePrepared and ActionFailed remain concrete heartbeat observations,
+with authenticated reporter boot and assignment retained for reconciliation.
 Reporter-local history remains the compatibility diagnostic `history` value.
 The candidate's source boot, assignment, and history are independent fields;
 only equal source lineages and equal population anchors/flow dimensions form a
@@ -493,7 +483,7 @@ Grant Ack, Meta records a delivery-ambiguous finite window from the exact
 heartbeat receive cut. A higher-sequence heartbeat confirming the Grant makes
 the Owner serviceable and collapses preceding ordered possibilities into that
 exact installed lease window. Meta retains both an unconfirmed maximum and
-the confirmed installed window across a same-authority FDS or duration
+the confirmed installed window across a same-authority local control or duration
 replacement because Data deliberately keeps that lease. Confirmation of a
 later shorter Grant replaces the older installed window; a session or
 authority change clears both windows.
@@ -501,7 +491,7 @@ If confirmation never arrives, the last possible window expires to
 `heartbeat_expired`.
 
 The corresponding handoff-pending marker is also session-, authority-, and
-heartbeat-sequence-bound and survives same-authority FDS replacement. Health
+heartbeat-sequence-bound and survives same-authority local control update. Health
 denials cannot bypass the wait: exact unhealthy challenges mature the same
 suspend-aware guard and remain handoff-pending until `2D`; only then may a
 written `NodeNotReady` retire the marker. This avoids both a pre-send ABA
@@ -513,7 +503,7 @@ that clock with `CLOCK_BOOTTIME`. Once their accumulated divergence reaches
 `D`, it closes the leadership generation's authority sessions and requests an
 immediate NuRaft resignation. A sole member, for which resignation is a no-op,
 must run for another full `D` of active monotonic time before authority can be
-eligible; a further suspend extends that wait. All FDS boundaries, directives,
+eligible; a further suspend extends that wait. All control boundaries, directives,
 results, and lease grants pass this gate. Thus an old multi-member leader
 cannot resume after a replacement election and refresh the same stale identity
 through a handoff entry that had already matured before suspension.
@@ -556,7 +546,7 @@ epoch, and one-group constraint before calling `ReplicationManager`. A
 directive that passes the first check holds an admission token across readiness
 publication and the possibly suspending manager registration, then rechecks
 its generation and all anchors immediately before crossing that action seam.
-FDS replacement, fencing, session invalidation, lease expiry, and externally
+local control update, fencing, session invalidation, lease expiry, and externally
 observed population proof loss advance the generation before publishing their
 invalidating boundary. Their async transition waits for every older token to
 reject or finish registration. Fencing, population identity loss, and explicit
@@ -581,16 +571,16 @@ drains retired requests before considering the replacement grant. A
 same-anchor heartbeat can extend only a lease that never expired, so pre-expiry
 admissions cannot be revived by a delayed timer.
 
-The encoded population-directive schema retains bounded `payload`,
-`preconditions`, and `force` fields. `initialize-empty-population` uses its
+Population directives carry a kind-specific bounded `payload`; their mutation
+classification follows kind and has no independently supplied flag. `initialize-empty-population` uses its
 payload for exactly one canonical target replication-history id and has no
 source node, source authorization, or replication connection; zero-valued wire
 source fields normalize to an empty domain source. Rebuild and
 source-authorization payloads freeze the source flow count reported by its
 authenticated boot. Meta and NodeControl repeat the typed checks before the
-action seam, so the native adapter never treats an unknown predicate or forced
-operation as satisfied. Failover preparation does not use this directive or
-receipt channel; its action is embedded in the Group transition in FDS.
+action seam. Empty-population initialization and rebuild require a non-serving
+target and retain the existing in-flight drain and mutation exclusion checks. Failover preparation does not use this directive or
+receipt channel; its action is embedded in the local Group transition.
 
 Initialization reuses the ordinary directive, FDS, operation receipt, and
 population-proof lifecycles. NodeControl first closes readiness and serving,
@@ -600,22 +590,18 @@ manifest, and partition epoch all match. The manager reuses the durable
 full-sync fence, resets and hands off every physical partition, installs an
 empty Function catalog, promotes the candidate root, and publishes a
 ReadyToken with an empty flow cut. The token remains valid when the completed
-directive disappears from otherwise matching FDS. A definite pre-promotion
+directive disappears from the otherwise matching task state. A definite pre-promotion
 failure stays LOADING and lets Meta abort/fence the operation; an uncertain
 reset, abort, or promotion latches fail-stop until restart and never enables
 lease admission.
 
-Receipt stages distinguish acceptance, execution start, and completion. A
-controller rejection moves directly from
-`Accepted` to `Completed` and reports a rejected result without started
-evidence; admitted work emits `Started`, and any later non-success is a failed
-execution. For admitted work, completed evidence is written after `Completed`
-but before the terminal result, while the operation is still live at Meta.
-Rebuild admission returns before readiness so a newer current rebuild can enter
-ReplicationManager and supersede the old attempt; an exact completion observer
-alone emits `Completed` and the result. The rebuild's own transition to
+An idempotent request receives one response after admission. Rejection before
+start and failure after start are distinct final statuses. Rebuild admission
+returns before readiness, allowing a newer attempt to supersede ongoing work;
+a completion observer emits the terminal result without extra completion
+receipts or generic evidence. The rebuild's own transition to
 not-ready does not invalidate its admission token; concurrent external control
-transitions still do. FDS then cancels prior completion observers and reconciles
+transitions still do. A local control or task update cancels prior completion observers and reconciles
 the native target population before its applied acknowledgement; a fence also
 cancels any in-progress target attempt and joins its completion observer before
 `FenceAck`. A lease grant is admitted only after these cleanup counters clear
@@ -636,7 +622,7 @@ state mutex. Other workers request population observations through the
 replication owner's asynchronous API, while data-flow progress remains
 worker-local and independently sampled.
 
-The FDS failover transition is a separate level-triggered control object. It
+The local Group failover transition is a separate level-triggered control object. It
 names the transition/revision, controlled or uncontrolled mode, target term,
 and optional candidate action with exact candidate boot, compatibility domain,
 and one-way authorization. NodeControl derives source pause only for the exact
@@ -650,14 +636,14 @@ context changes to the fenced target term, preserving any prepared child
 history for uncontrolled cutover. Any changed candidate, source lineage, or
 population anchor still replaces and cleans up the attempt.
 
-After Meta atomically cuts over, FDS clears the transition and carries its
+After Meta atomically cuts over, local control clears the transition and carries its
 action id on the new grant. NodeControl retains only that action's prepared
 context and activates it provisionally on the first matching finite lease. It
 rechecks FDS/session/deadline around role activation and expiration capability
 installation before publishing the request lease. Exact replay is a no-op and
 any mismatch remains fenced. There is no separate activation directive or RPC.
 
-The same post-cutover FDS projects the complete owner, endpoint, membership,
+The same post-cutover local control supplies the complete owner, endpoint, membership,
 manifest, and population epoch as a steady follow-owner relationship. The new
 owner authorizes the exact replicas; every non-owner connects directly and the
 native handshake chooses CONTINUE or FULL. A former owner fences its role,
@@ -684,7 +670,7 @@ group's Group Term, manifest revision/digest, and partition
 replication epoch to be monotonic even while the group is
 ownerless; a full remove-and-reassign identity is the explicit boundary at
 which a new incarnation may reset those counters. Once Meta
-activates the candidate, the next FDS can publish the retained proof; if no
+activates the candidate, the next local control update can publish the retained proof; if no
 proof survived (for example after a reboot), the granted-but-unready target may
 run a rebuild while it remains unable to serve or obtain a lease.
 

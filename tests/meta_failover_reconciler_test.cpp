@@ -431,7 +431,7 @@ void BeginUncontrolled(Fixture& fixture,
                            candidate_action = std::nullopt,
                        std::uint8_t first_id = 0x90) {
   const auto group = fixture.stores.topology_.FindGroup("g1");
-  const auto grant = fixture.stores.grant_.GroupState("g1");
+  const auto grant = fixture.stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(group.has_value());
   ASSERT_TRUE(grant.has_value());
   ASSERT_TRUE(grant->grant_.has_value());
@@ -1017,7 +1017,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
   const auto transition = fixture.Transition();
   EXPECT_EQ(transition.mode_, meta::MetaFailoverMode::kUncontrolled);
   EXPECT_FALSE(transition.candidate_action_.has_value());
-  const auto grant = fixture.stores.grant_.GroupState("g1");
+  const auto grant = fixture.stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(grant.has_value());
   EXPECT_FALSE(grant->grant_.has_value());
   const auto operation =
@@ -1777,7 +1777,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
   ASSERT_TRUE(group->failover_transition_.has_value());
   EXPECT_EQ(group->record_.owner_, fixture.candidate);
   EXPECT_EQ(group->record_.group_term_, 3);
-  const auto grant = fixture.stores.grant_.GroupState("g1");
+  const auto grant = fixture.stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(grant.has_value());
   EXPECT_FALSE(grant->grant_.has_value());
   EXPECT_FALSE(group->failover_transition_->candidate_action_.has_value());

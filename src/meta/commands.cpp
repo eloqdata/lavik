@@ -158,7 +158,7 @@ absl::Status WriteCommandBody(MetaWriter& w, const RegisterNode& cmd) {
   if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
   w.WriteString(cmd.principal_);
   if (auto st = WriteEndpoints(w, cmd.endpoints_); !st.ok()) return st;
-  w.WriteU64(cmd.capability_mask_);
+
   return WriteRole(w, cmd.role_);
 }
 
@@ -171,8 +171,7 @@ absl::StatusOr<RegisterNode> ReadRegisterNodeBody(MetaReader& r) {
   if (!principal.ok()) return principal.status();
   auto endpoints = ReadEndpoints(r);
   if (!endpoints.ok()) return endpoints.status();
-  auto capability_mask = r.ReadU64();
-  if (!capability_mask.ok()) return capability_mask.status();
+
   auto role = ReadRole(r);
   if (!role.ok()) return role.status();
   RegisterNode cmd;
@@ -181,7 +180,7 @@ absl::StatusOr<RegisterNode> ReadRegisterNodeBody(MetaReader& r) {
   cmd.node_id_ = std::move(*node_id);
   cmd.principal_ = std::move(*principal);
   cmd.endpoints_ = std::move(*endpoints);
-  cmd.capability_mask_ = *capability_mask;
+
   cmd.role_ = *role;
   return cmd;
 }
@@ -195,7 +194,7 @@ absl::Status WriteCommandBody(MetaWriter& w, const UpdateNode& cmd) {
   if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
   w.WriteU64(cmd.expected_revision_);
   if (auto st = WriteEndpoints(w, cmd.endpoints_); !st.ok()) return st;
-  w.WriteU64(cmd.capability_mask_);
+
   w.WriteU64(cmd.new_topology_epoch_);
   return absl::OkStatus();
 }
@@ -209,8 +208,7 @@ absl::StatusOr<UpdateNode> ReadUpdateNodeBody(MetaReader& r) {
   if (!expected_revision.ok()) return expected_revision.status();
   auto endpoints = ReadEndpoints(r);
   if (!endpoints.ok()) return endpoints.status();
-  auto capability_mask = r.ReadU64();
-  if (!capability_mask.ok()) return capability_mask.status();
+
   auto topology_epoch = r.ReadU64();
   if (!topology_epoch.ok()) return topology_epoch.status();
   UpdateNode cmd;
@@ -219,7 +217,7 @@ absl::StatusOr<UpdateNode> ReadUpdateNodeBody(MetaReader& r) {
   cmd.node_id_ = std::move(*node_id);
   cmd.expected_revision_ = *expected_revision;
   cmd.endpoints_ = std::move(*endpoints);
-  cmd.capability_mask_ = *capability_mask;
+
   cmd.new_topology_epoch_ = *topology_epoch;
   return cmd;
 }
@@ -1726,24 +1724,6 @@ absl::StatusOr<PutPolicy> ReadPutPolicyBody(MetaReader& r) {
 // operation codecs.
 // ---------------------------------------------------------------------------
 
-absl::Status WriteEvidenceSummary(MetaWriter& w,
-                                  const MetaEvidenceSummary& ev) {
-  if (auto st = CheckCap("node_id", ev.node_id_.size(), kMetaNodeIdBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (ev.group_id_.empty()) {
-    return MetaDomainRejectError("evidence group_id is empty");
-  }
-  if (auto st = CheckCap("evidence group_id", ev.group_id_.size(),
-                         kMaxMetaGroupIdBytes);
-      !st.ok()) {
-    return st;
-  }
-  WriteMetaEvidenceSummary(w, ev);
-  return absl::OkStatus();
-}
-
 absl::Status WriteCommandBody(MetaWriter& w, const SubmitOperation& cmd) {
   if (auto st = CheckCap("kind", cmd.kind_.size(), kMaxMetaOperationKindBytes);
       !st.ok()) {
@@ -1797,11 +1777,6 @@ absl::Status WriteCommandBody(MetaWriter& w,
       !st.ok()) {
     return st;
   }
-  if (auto st = CheckCap("evidence", cmd.evidence_.size(),
-                         kMaxMetaEvidenceSummariesPerCommand);
-      !st.ok()) {
-    return st;
-  }
   if (auto st = CheckCap("current_directives", cmd.current_directives_.size(),
                          kMaxMetaDirectivesPerOperation);
       !st.ok()) {
@@ -1818,24 +1793,8 @@ absl::Status WriteCommandBody(MetaWriter& w,
         directive.group_id_.size() > kMaxMetaGroupIdBytes ||
         directive.kind_.empty() ||
         directive.kind_.size() > kMaxMetaDirectiveKindBytes ||
-        directive.payload_.size() > kMaxMetaPayloadBytes ||
-        directive.preconditions_.size() > kMaxMetaDirectivePreconditionsBytes) {
+        directive.payload_.size() > kMaxMetaPayloadBytes) {
       return MetaDomainRejectError("invalid directive field size");
-    }
-  }
-  for (const MetaEvidenceSummary& ev : cmd.evidence_) {
-    if (auto st =
-            CheckCap("evidence node_id", ev.node_id_.size(), kMetaNodeIdBytes);
-        !st.ok()) {
-      return st;
-    }
-    if (ev.group_id_.empty()) {
-      return MetaDomainRejectError("evidence group_id is empty");
-    }
-    if (auto st = CheckCap("evidence group_id", ev.group_id_.size(),
-                           kMaxMetaGroupIdBytes);
-        !st.ok()) {
-      return st;
     }
   }
   if (auto st = WriteCommandHeader(w, MetaCommandTag::kTransitionOperationPhase,
@@ -1847,10 +1806,6 @@ absl::Status WriteCommandBody(MetaWriter& w,
   w.WriteU64(cmd.expected_revision_);
   w.WriteString(cmd.kind_phase_blob_);
   w.WriteList(cmd.current_directives_, WriteMetaDirectiveSpec);
-  w.WriteList(cmd.evidence_, [](MetaWriter& ww, const MetaEvidenceSummary& ev) {
-    // Element bounds were validated above, so this cannot fail.
-    (void)WriteEvidenceSummary(ww, ev);
-  });
   return absl::OkStatus();
 }
 
@@ -1868,10 +1823,6 @@ absl::StatusOr<TransitionOperationPhase> ReadTransitionOperationPhaseBody(
       kMaxMetaDirectivesPerOperation,
       [](MetaReader& reader) { return ReadMetaDirectiveSpec(reader); });
   if (!directives.ok()) return directives.status();
-  auto evidence = r.ReadList<MetaEvidenceSummary>(
-      kMaxMetaEvidenceSummariesPerCommand,
-      [](MetaReader& rr) { return ReadMetaEvidenceSummary(rr); });
-  if (!evidence.ok()) return evidence.status();
   TransitionOperationPhase cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -1879,7 +1830,6 @@ absl::StatusOr<TransitionOperationPhase> ReadTransitionOperationPhaseBody(
   cmd.expected_revision_ = *expected_revision;
   cmd.kind_phase_blob_ = std::move(*blob);
   cmd.current_directives_ = std::move(*directives);
-  cmd.evidence_ = std::move(*evidence);
   return cmd;
 }
 

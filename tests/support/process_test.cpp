@@ -64,9 +64,8 @@ TEST(ProcessSupportTest, AcceptsConfiguredRootWithTrailingSeparator) {
 
 TEST(ProcessSupportTest, DefaultsToTmpForEmptyConfiguredRoot) {
   ScopedEnvironment environment("KEYLANE_TEST_DATA_DIR", "");
-  TempDirectory directory("empty-root");
-  EXPECT_TRUE(std::filesystem::equivalent(directory.path().parent_path(),
-                                         "/tmp"));
+  // Verify the fallback without writing outside the configured test volume.
+  EXPECT_EQ(TestDataDirectory(), std::filesystem::path("/tmp"));
 }
 
 TEST(ProcessSupportTest, SpawnsWithEnvironmentAndControlsLifecycle) {

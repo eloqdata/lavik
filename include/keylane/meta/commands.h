@@ -76,7 +76,7 @@ using MetaDirectiveId = std::array<std::uint8_t, 16>;
 using MetaFailoverTransitionId = std::array<std::uint8_t, 16>;
 using MetaFailoverActionId = std::array<std::uint8_t, 16>;
 
-// Content-addressing hashes (intent, evidence, manifests, projections):
+// Content-addressing hashes (intent and manifests):
 // SHA-256. Policy replay identity is its bounded exact raw document.
 using MetaHash256 = std::array<std::uint8_t, 32>;
 
@@ -124,7 +124,6 @@ inline constexpr std::string_view kMetaClusterCreateV1GroupOperationKind =
     "cluster-create-v1";
 inline constexpr std::string_view kMetaMembershipOperationKind =
     "meta-membership-workflow-v1";
-inline constexpr std::uint32_t kMaxMetaEvidenceSummariesPerCommand = 64;
 // A declarative create installs source authorization first, then retains each
 // acknowledged authorization while adding the replica's rebuild at a later
 // operation revision. The resulting maximum of two current directives per
@@ -160,12 +159,9 @@ inline constexpr bool IsKnownMetaDirective(std::string_view kind) {
 
 // Directive kinds define their own bounded payload contracts.
 // initialize-empty-population carries the authenticated target history ID;
-// rebuild and authorize-source carry the source layout. Every kind rejects
-// force=true at Meta transition apply and again at Data admission.
-inline constexpr std::uint32_t kMaxMetaDirectivePreconditionsBytes =
-    kMaxMetaPayloadBytes;
-// Receipt retention shares the operation evidence horizon: both are
-// historical phase facts accumulated until explicit terminal cleanup.
+// rebuild and authorize-source carry the source layout. Storage mutation is
+// derived from IsMetaPopulationDirective(), never supplied by the sender.
+// Terminal receipts retain exact historical results until replicated cleanup.
 inline constexpr std::uint32_t kMaxMetaTerminalReceiptsPerOperation = 1024;
 inline constexpr std::uint32_t kMaxMetaTerminalReceiptPrunesPerCommand = 1024;
 // Slot ranges per SetSlotMap; bounded by the Redis Cluster slot count
@@ -247,7 +243,7 @@ struct RegisterNode {
   std::string node_id_;
   std::string principal_;  // canonical SAN principal, globally 1:1
   std::vector<std::string> endpoints_;
-  std::uint64_t capability_mask_ = 0;
+
   MetaNodeRole role_ = MetaNodeRole::kPrimary;
   bool operator==(const RegisterNode&) const = default;
 };
@@ -261,7 +257,7 @@ struct UpdateNode {
   std::string node_id_;
   std::uint64_t expected_revision_ = 0;
   std::vector<std::string> endpoints_;
-  std::uint64_t capability_mask_ = 0;
+
   std::uint64_t new_topology_epoch_ = 0;  // endpoint visibility, absolute
   bool operator==(const UpdateNode&) const = default;
 };
@@ -727,27 +723,6 @@ struct PutPolicy {
 // schema therefore treats kind and phase blobs as opaque bounded values.
 // ---------------------------------------------------------------------------
 
-// Immutable evidence summary baked into a command by the leader after
-// ValidateProposal. The journal and
-// audit trail persist these summaries, never observation references.
-// boot_incarnation_ is opaque and never ordered by magnitude.
-struct MetaEvidenceSummary {
-  std::string node_id_;
-  // Preserve the exact membership incarnation that admitted the volatile
-  // observation. Apply must not reinterpret a stable node id through whatever
-  // group or assignment happens to be current when the Raft entry arrives.
-  std::string group_id_;
-  MetaAssignmentId assignment_id_{};
-  MetaBootIncarnation boot_incarnation_{};
-  std::uint64_t group_term_ = 0;
-  std::uint64_t population_manifest_revision_ = 0;
-  MetaHash256 population_manifest_digest_{};
-  std::uint64_t partition_replication_epoch_ = 0;
-  MetaReplicationHistoryId replication_history_id_{};
-  MetaOperationId operation_id_{};
-  bool operator==(const MetaEvidenceSummary&) const = default;
-};
-
 struct SubmitOperation {
   MetaRequestId request_id_{};
   ActorContext actor_;
@@ -755,8 +730,8 @@ struct SubmitOperation {
   std::string kind_;
   std::string intent_;  // bounded by kMaxMetaPayloadBytes
   MetaHash256 intent_hash_{};
-  // All-zero means no replication-history binding. Evidence carrying a
-  // history id is accepted only when it matches this committed anchor.
+  // All-zero means no replication-history binding. Population tasks use
+  // this committed history to bind their target identity.
   MetaReplicationHistoryId replication_history_id_{};
   bool operator==(const SubmitOperation&) const = default;
 };
@@ -795,15 +770,8 @@ struct MetaDirectiveSpec {
   std::string kind_;
   // V1 uses payload for initialize-empty-population's authenticated target
   // history and versioned bodies for rebuild/authorize-source source layouts.
-  // No executable V1 directive carries preconditions.
   std::string payload_;
-  std::string preconditions_;
-  // Active classification used to exclude concurrent mutations of the same
-  // target assignment. The executable V1 projector requires it for population
-  // directives and forbids it for source authorization or revocation.
-  bool storage_mutating_ = false;
-  // Reserved execution override; executable V1 directives require false.
-  bool force_ = false;
+
   bool operator==(const MetaDirectiveSpec&) const = default;
 };
 
@@ -816,7 +784,6 @@ struct TransitionOperationPhase {
   // structured list below so the durable model has one source of truth.
   std::string kind_phase_blob_;  // bounded by kMaxMetaPayloadBytes
   std::vector<MetaDirectiveSpec> current_directives_;
-  std::vector<MetaEvidenceSummary> evidence_;
   bool operator==(const TransitionOperationPhase&) const = default;
 };
 

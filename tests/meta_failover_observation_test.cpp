@@ -56,14 +56,6 @@ class FailoverFacts final : public meta::MetaCommittedFacts {
     return group_id == "g" && node_id == source_ &&
            AssignmentMatches(group_id, node_id, assignment);
   }
-  bool OperationNonTerminal(const meta::MetaOperationId&) const override {
-    return false;
-  }
-  bool HistoryBoundToOperation(
-      const meta::MetaOperationId&,
-      const meta::MetaReplicationHistoryId&) const override {
-    return false;
-  }
   std::optional<FailoverTransitionView> FailoverTransitionById(
       const meta::MetaFailoverTransitionId& id) const override {
     if (transition_.has_value() && transition_->transition_id_ == id) {

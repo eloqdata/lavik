@@ -151,8 +151,7 @@ class SocketDeadline {
 
 ProjectionBasis ToDomain(const control::WireProjectionBasis& basis) {
   return ProjectionBasis{
-      .source_meta_applied_index_ = basis.source_meta_applied_index,
-      .projection_hash_ = basis.projection_hash,
+      .control_revision_ = basis.control_revision,
   };
 }
 
@@ -164,16 +163,40 @@ AuthorityAnchor ToDomain(const control::WireAuthorityAnchor& anchor) {
   };
 }
 
-control::LeaseChallenge ChallengeFor(
-    const control::WireDesiredGroup& group,
-    const control::WireHash256& projection_hash,
-    const control::WireId128& nonce) {
+control::LeaseChallenge ChallengeFor(const control::WireDesiredGroup& group,
+                                     std::uint64_t control_revision,
+                                     const control::WireId128& nonce) {
   return control::LeaseChallenge{
       .nonce = nonce,
-      .projection_hash = projection_hash,
+      .control_revision = control_revision,
       .group_id = group.group_id,
       .assignment_id = *group.owner_assignment_id,
       .group_term = group.group_term,
+  };
+}
+
+control::Directive LiveDirective(const control::WireProjectedDirective& source,
+                                 const control::WireId128& session_id,
+                                 std::uint64_t source_index) {
+  return control::Directive{
+      .session_id = session_id,
+      .basis = {.control_revision = source_index},
+      .authority = source.authority,
+      .identity = source.identity,
+      .recipient_node_id = source.recipient_node_id,
+      .recipient_boot_id = source.recipient_boot_id,
+      .target_node_id = source.target_node_id,
+      .target_boot_id = source.target_boot_id,
+      .source_node_id = source.source_node_id,
+      .source_assignment_id = source.source_assignment_id,
+      .source_boot_id = source.source_boot_id,
+      .source_replication_history_id = source.source_replication_history_id,
+      .manifest_revision = source.manifest_revision,
+      .manifest_digest = source.manifest_digest,
+      .partition_replication_epoch = source.partition_replication_epoch,
+      .kind = source.kind,
+      .payload = source.payload,
+
   };
 }
 
@@ -181,9 +204,9 @@ class StringTransferSink final : public control::LargeObjectSink {
  public:
   absl::Status Begin(const control::TransferStart& start) override {
     if (start.kind != control::TransferKind::kFullDesiredState &&
-        start.kind != control::TransferKind::kDirectivePayload) {
+        start.kind != control::TransferKind::kNodeControlUpdate) {
       return absl::InvalidArgumentError(
-          "Data accepts only FullDesiredState or Directive transfers");
+          "Data accepts only bootstrap or control update transfers");
     }
     bytes_.clear();
     kind_ = start.kind;
@@ -921,9 +944,13 @@ absl::Status ValidateDialedMetaIdentity(
 }
 
 absl::Status ValidateLiveDirective(const control::Directive& directive,
-                                   const control::FullDesiredState& desired,
+                                   const control::NodeControlState& desired,
                                    std::string_view local_node_id,
                                    std::string_view local_boot_id) {
+  if (directive.basis.control_revision != desired.local.revision) {
+    return absl::FailedPreconditionError(
+        "directive does not name the installed local control");
+  }
   if (directive.recipient_node_id != local_node_id ||
       directive.recipient_boot_id != local_boot_id) {
     return absl::FailedPreconditionError(
@@ -958,16 +985,16 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
   }
 
   const auto group =
-      std::find_if(desired.groups.begin(), desired.groups.end(),
+      std::find_if(desired.local.groups.begin(), desired.local.groups.end(),
                    [&](const control::WireDesiredGroup& candidate) {
                      return candidate.group_id == directive.authority.group_id;
                    });
-  if (group == desired.groups.end() ||
+  if (group == desired.local.groups.end() ||
       group->group_term != directive.authority.group_term ||
       group->partition_replication_epoch !=
           directive.partition_replication_epoch) {
     return absl::FailedPreconditionError(
-        "directive authority is not current in the installed FDS");
+        "directive authority is not current in the installed local control");
   }
   const auto target = std::find_if(
       group->members.begin(), group->members.end(),
@@ -977,7 +1004,8 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
       });
   if (target == group->members.end()) {
     return absl::FailedPreconditionError(
-        "directive target assignment is not current in the installed FDS");
+        "directive target assignment is not current in the installed local "
+        "control");
   }
   if (directive.kind !=
           control::WireDirectiveKind::kInitializeEmptyPopulation &&
@@ -988,36 +1016,10 @@ absl::Status ValidateLiveDirective(const control::Directive& directive,
                                 directive.source_assignment_id;
                    })) {
     return absl::FailedPreconditionError(
-        "directive source assignment is not current in the installed FDS");
+        "directive source assignment is not current in the installed local "
+        "control");
   }
 
-  const control::WireProjectedDirective projected{
-      .basis = directive.basis,
-      .authority = directive.authority,
-      .identity = directive.identity,
-      .recipient_node_id = directive.recipient_node_id,
-      .recipient_boot_id = directive.recipient_boot_id,
-      .target_node_id = directive.target_node_id,
-      .target_boot_id = directive.target_boot_id,
-      .source_node_id = directive.source_node_id,
-      .source_assignment_id = directive.source_assignment_id,
-      .source_boot_id = directive.source_boot_id,
-      .source_replication_history_id = directive.source_replication_history_id,
-      .manifest_revision = directive.manifest_revision,
-      .manifest_digest = directive.manifest_digest,
-      .partition_replication_epoch = directive.partition_replication_epoch,
-      .kind = directive.kind,
-      .payload = directive.payload,
-      .preconditions = directive.preconditions,
-      .storage_mutating = directive.storage_mutating,
-      .force = directive.force,
-  };
-  if (std::find(desired.current_directives.begin(),
-                desired.current_directives.end(),
-                projected) == desired.current_directives.end()) {
-    return absl::FailedPreconditionError(
-        "live directive is not an exact member of the installed FDS");
-  }
   return absl::OkStatus();
 }
 
@@ -1034,10 +1036,11 @@ absl::Status detail::ValidateResolvedLeaseGrantDuration(
     std::uint32_t granted_duration_ms, std::uint32_t challenged_duration_ms) {
   if (challenged_duration_ms == 0 ||
       granted_duration_ms != challenged_duration_ms) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "lease grant duration does not equal the challenged FDS duration: ",
-        "granted_ms=", granted_duration_ms,
-        ",challenged_ms=", challenged_duration_ms));
+    return absl::InvalidArgumentError(
+        absl::StrCat("lease grant duration does not equal the challenged local "
+                     "control duration: ",
+                     "granted_ms=", granted_duration_ms,
+                     ",challenged_ms=", challenged_duration_ms));
   }
   return absl::OkStatus();
 }
@@ -1250,7 +1253,7 @@ detail::ProjectReplicaCandidateProgress(
       group->partition_replication_epoch !=
           readiness.partition_replication_epoch_) {
     return absl::FailedPreconditionError(
-        "candidate readiness does not match the installed FDS");
+        "candidate readiness does not match the installed local control");
   }
   const auto local_member = std::ranges::find_if(
       group->members, [&](const control::WireDesiredMember& member) {
@@ -1365,7 +1368,8 @@ detail::MetaTransferAbortDisposition detail::ClassifyMetaTransferAbort(
     std::optional<control::TransferKind> active_kind) noexcept {
   return abort.reason == control::TransferAbortReason::
                              kFullDesiredStateSuperseded &&
-                 active_kind == control::TransferKind::kFullDesiredState
+                 (active_kind == control::TransferKind::kFullDesiredState ||
+                  active_kind == control::TransferKind::kNodeControlUpdate)
              ? MetaTransferAbortDisposition::kContinueAuthenticatedSession
              : MetaTransferAbortDisposition::kFailSession;
 }
@@ -1433,7 +1437,7 @@ struct MetaControlClientService::Impl {
     SessionIdentity session_;
     std::string boot_id_;
     ReplicationIdentity replication_identity_;
-    std::shared_ptr<const control::FullDesiredState> desired_;
+    std::shared_ptr<const control::NodeControlState> desired_;
     std::chrono::milliseconds heartbeat_interval_{};
     std::chrono::milliseconds observation_ttl_{};
     std::chrono::milliseconds progress_timeout_{};
@@ -1549,7 +1553,8 @@ struct MetaControlClientService::Impl {
     state->directive_queue_.clear();
     // A runner may be asleep behind a long-lived completion. Wake it so the
     // barrier observes dispatch=false and exits without waiting for work that
-    // the FDS/fence/session transition is about to reconcile or cancel.
+    // the local control/fence/session transition is about to reconcile or
+    // cancel.
     state->tasks_changed_.NotifyAll(*state->worker_);
   }
 
@@ -1559,7 +1564,8 @@ struct MetaControlClientService::Impl {
     if (state->pending_heartbeat_.has_value()) {
       // The peer may already have emitted this Ack behind TransferEnd. Forget
       // its authority decision now, but retain the sequence so the sole reader
-      // can consume that exact stale response after the FDS transition.
+      // can consume that exact stale response after the local control
+      // transition.
       outstanding = state->pending_heartbeat_->sequence_;
       state->pending_heartbeat_.reset();
       state->heartbeat_ack_observed_ = false;
@@ -1686,26 +1692,25 @@ struct MetaControlClientService::Impl {
     co_return control::DecodeFullDesiredState(std::move(transfer->bytes_));
   }
 
-  celer::Task<absl::Status> Install(const control::FullDesiredState& desired,
+  celer::Task<absl::Status> Install(const control::NodeControlState& desired,
                                     std::string_view local_boot_id) {
-    auto prepared = PrepareMetaFullState(desired, options_.node_id_,
-                                         options_.request_worker_count_);
+    auto prepared = PrepareNodeControlState(desired, options_.node_id_,
+                                            options_.request_worker_count_);
     if (!prepared.ok()) co_return prepared.status();
-    // Directory parsing is part of the all-or-nothing FDS boundary. Validate
-    // into a private copy before publishing topology; committing the copy after
-    // the awaited installer transition cannot fail.
+    // Directory parsing is part of the all-or-nothing local control boundary.
+    // Validate into a private copy before publishing topology; committing the
+    // copy after the awaited installer transition cannot fail.
     MetaEndpointDirectory refreshed_directory = directory_;
     if (absl::Status refreshed =
-            refreshed_directory.Refresh(desired.meta_directory);
+            refreshed_directory.Refresh(desired.directory.endpoints);
         !refreshed.ok()) {
       co_return refreshed;
     }
     const ProjectionBasis basis{
-        .source_meta_applied_index_ = desired.source_meta_applied_index,
-        .projection_hash_ = desired.projection_hash,
+        .control_revision_ = desired.local.revision,
     };
     const bool local_population_transition_expected = std::any_of(
-        desired.current_directives.begin(), desired.current_directives.end(),
+        desired.tasks.begin(), desired.tasks.end(),
         [&](const control::WireProjectedDirective& directive) {
           return (directive.kind == control::WireDirectiveKind::kRebuild ||
                   directive.kind ==
@@ -1714,7 +1719,7 @@ struct MetaControlClientService::Impl {
                  directive.recipient_boot_id == local_boot_id;
         });
     const std::size_t expected_source_authorization_replays = std::count_if(
-        desired.current_directives.begin(), desired.current_directives.end(),
+        desired.tasks.begin(), desired.tasks.end(),
         [&](const control::WireProjectedDirective& directive) {
           return directive.kind ==
                      control::WireDirectiveKind::kAuthorizeSource &&
@@ -1732,12 +1737,13 @@ struct MetaControlClientService::Impl {
 
   celer::Task<absl::Status> SendApplied(
       control::ControlSessionWriter& writer,
-      const control::FullDesiredState& desired) {
+      const control::NodeControlState& desired,
+      control::WireId128 request_id = {}) {
     co_return co_await writer.Write(
         control::MessagePriority::kReliable,
         control::WireMessage(control::FullStateApplied{
-            .source_meta_applied_index = desired.source_meta_applied_index,
-            .projection_hash = desired.projection_hash,
+            .request_id = request_id,
+            .control_revision = desired.local.revision,
         }));
   }
 
@@ -1753,7 +1759,7 @@ struct MetaControlClientService::Impl {
     }
 
     // The transfer contains the ordinary DirectiveResult payload, so the
-    // receiver runs the exact same schema validation after SHA verification.
+    // receiver runs the exact same schema validation after transfer validation.
     // There is no per-chunk acknowledgement; ResultCommitted remains the
     // application-level acknowledgement for the completed result.
     auto object_id = control::GenerateId128();
@@ -1761,72 +1767,6 @@ struct MetaControlClientService::Impl {
     auto owned = std::make_shared<const std::string>(std::move(*encoded));
     co_return co_await writer.WriteTransfer(
         control::TransferKind::kDirectiveResult, *object_id, std::move(owned));
-  }
-
-  celer::Task<absl::Status> SendOperationEvidence(
-      control::ControlSessionWriter& writer,
-      const control::OperationEvidence& evidence) {
-    const control::WireMessage message(evidence);
-    auto encoded = control::EncodeMessage(message);
-    if (!encoded.ok()) co_return encoded.status();
-    if (encoded->size() > control::kMaxOperationEvidenceTransferBytes) {
-      co_return absl::ResourceExhaustedError(
-          "encoded operation evidence exceeds its transfer cap");
-    }
-    if (encoded->size() <= control::kMaxFramePayloadBytes) {
-      co_return co_await writer.Write(control::MessagePriority::kSoft, message);
-    }
-    auto object_id = control::GenerateId128();
-    if (!object_id.ok()) co_return object_id.status();
-    auto owned = std::make_shared<const std::string>(std::move(*encoded));
-    co_return co_await writer.WriteTransfer(
-        control::TransferKind::kObservationEvidence, *object_id,
-        std::move(owned));
-  }
-
-  static std::string_view DirectiveKindName(
-      control::WireDirectiveKind kind) noexcept {
-    switch (kind) {
-      case control::WireDirectiveKind::kRebuild:
-        return "rebuild";
-      case control::WireDirectiveKind::kAuthorizeSource:
-        return "authorize-source";
-      case control::WireDirectiveKind::kRevokeSources:
-        return "revoke-sources";
-      case control::WireDirectiveKind::kInitializeEmptyPopulation:
-        return "initialize-empty-population";
-    }
-    return "unknown";
-  }
-
-  control::OperationEvidence EvidenceForDirective(
-      const control::Directive& directive, std::string_view phase,
-      std::string evidence) const {
-    const bool executes_on_target =
-        directive.kind == control::WireDirectiveKind::kRebuild ||
-        directive.kind ==
-            control::WireDirectiveKind::kInitializeEmptyPopulation;
-    const std::string kind_phase =
-        absl::StrCat(DirectiveKindName(directive.kind), ":", phase);
-    control::OperationEvidence report{
-        .session_id = directive.session_id,
-        .reporter_boot_id = directive.recipient_boot_id,
-        .assignment_id = executes_on_target ? directive.authority.assignment_id
-                                            : directive.source_assignment_id,
-        .operation_id = directive.identity.operation_id,
-        .kind_phase = kind_phase,
-        .evidence = std::move(evidence),
-        .group_id = directive.authority.group_id,
-        .group_term = directive.authority.group_term,
-        .manifest_revision = directive.manifest_revision,
-        .partition_replication_epoch = directive.partition_replication_epoch,
-        .replication_history_id =
-            directive.kind ==
-                    control::WireDirectiveKind::kInitializeEmptyPopulation
-                ? directive.payload
-                : directive.source_replication_history_id,
-    };
-    return report;
   }
 
   celer::Task<absl::Status> HandleFence(const control::Fence& fence,
@@ -1850,7 +1790,7 @@ struct MetaControlClientService::Impl {
   absl::StatusOr<NodeDirective> NormalizeDirective(
       const control::Directive& directive, const SessionIdentity& session,
       std::string_view boot_id, std::string_view local_history_id,
-      const control::FullDesiredState& desired) const {
+      const control::NodeControlState& desired) const {
     if (directive.session_id != session.session_id_.bytes()) {
       return absl::FailedPreconditionError(
           "directive does not name the current session");
@@ -1907,11 +1847,11 @@ struct MetaControlClientService::Impl {
     std::string source_host;
     std::uint16_t source_port = 0;
     const auto source_endpoint =
-        std::find_if(desired.nodes.begin(), desired.nodes.end(),
+        std::find_if(desired.routing.nodes.begin(), desired.routing.nodes.end(),
                      [&](const control::WireDataEndpoint& endpoint) {
                        return endpoint.node_id == directive.source_node_id;
                      });
-    if (source_endpoint != desired.nodes.end()) {
+    if (source_endpoint != desired.routing.nodes.end()) {
       source_host = source_endpoint->host;
       source_port = options_.tls_context_ == nullptr
                         ? source_endpoint->port
@@ -1921,12 +1861,12 @@ struct MetaControlClientService::Impl {
     std::vector<NodeManifestEntry> manifest_entries;
     if (kind != NodeDirective::Kind::kRevokeSources) {
       const auto manifest = std::find_if(
-          desired.manifests.begin(), desired.manifests.end(),
+          desired.local.manifests.begin(), desired.local.manifests.end(),
           [&](const control::WireManifestDocument& candidate) {
             return candidate.revision == directive.manifest_revision &&
                    candidate.digest == directive.manifest_digest;
           });
-      if (manifest == desired.manifests.end()) {
+      if (manifest == desired.local.manifests.end()) {
         return absl::FailedPreconditionError(
             "directive references a manifest outside the installed projection");
       }
@@ -1975,42 +1915,8 @@ struct MetaControlClientService::Impl {
         .partition_replication_epoch_ = directive.partition_replication_epoch,
         .manifest_entries_ = std::move(manifest_entries),
         .payload_ = rebuild ? std::string{} : directive.payload,
-        .preconditions_ = directive.preconditions,
-        .storage_mutating_ = directive.storage_mutating,
-        .force_ = directive.force,
+
     };
-  }
-
-  celer::Task<absl::StatusOr<NodeDirectiveCompletion>> StartDirective(
-      control::ControlSessionWriter& writer,
-      const control::Directive& directive, NodeDirective normalized) {
-    NodeDirectiveCompletion completion =
-        co_await installer_.StartDirective(std::move(normalized));
-    if (!completion.started()) co_return completion;
-
-    absl::Status sent = co_await writer.Write(
-        control::MessagePriority::kReliable,
-        control::WireMessage(control::DirectiveReceipt{
-            .session_id = directive.session_id,
-            .recipient_boot_id = directive.recipient_boot_id,
-            .identity = directive.identity,
-            .stage = control::DirectiveReceiptStage::kStarted,
-        }));
-    if (!sent.ok()) co_return sent;
-    co_return completion;
-  }
-
-  celer::Task<absl::Status> SendDirectiveCompleted(
-      control::ControlSessionWriter& writer,
-      const control::Directive& directive) {
-    co_return co_await writer.Write(
-        control::MessagePriority::kReliable,
-        control::WireMessage(control::DirectiveReceipt{
-            .session_id = directive.session_id,
-            .recipient_boot_id = directive.recipient_boot_id,
-            .identity = directive.identity,
-            .stage = control::DirectiveReceiptStage::kCompleted,
-        }));
   }
 
   celer::Task<absl::Status> SendTerminalDirectiveResult(
@@ -2044,29 +1950,12 @@ struct MetaControlClientService::Impl {
       NodeDirectiveCompletion completion, std::uint64_t generation,
       bool target_population_work) {
     absl::Status result = absl::OkStatus();
-    if (completion.started()) {
-      result = co_await SendOperationEvidence(
-          *state->writer_,
-          EvidenceForDirective(directive, "started", "started"));
-    }
     while (result.ok() && !state->closing_ &&
            generation == state->directive_generation_) {
       std::optional<absl::Status> terminal = completion.result();
       if (terminal.has_value()) {
-        result = co_await SendDirectiveCompleted(*state->writer_, directive);
-        if (result.ok() && completion.started()) {
-          std::string terminal_evidence =
-              terminal->ok() ? "succeeded" : std::string(terminal->message());
-          result = co_await SendOperationEvidence(
-              *state->writer_,
-              EvidenceForDirective(directive, "completed",
-                                   std::move(terminal_evidence)));
-        }
-        if (result.ok()) {
-          result = co_await SendTerminalDirectiveResult(*state->writer_, state,
-                                                        directive, *terminal,
-                                                        completion.started());
-        }
+        result = co_await SendTerminalDirectiveResult(
+            *state->writer_, state, directive, *terminal, completion.started());
         break;
       }
       result = co_await celer::SleepFor(*state->worker_, 10ms);
@@ -2106,12 +1995,17 @@ struct MetaControlClientService::Impl {
         co_await state->tasks_changed_.Wait();
       }
       if (state->closing_ || !state->directive_dispatch_enabled_) break;
-      auto started = co_await StartDirective(*state->writer_, work.wire_,
-                                             std::move(work.normalized_));
-      if (!started.ok()) {
-        result = started.status();
-        break;
-      }
+      NodeDirectiveCompletion started =
+          co_await installer_.StartDirective(std::move(work.normalized_));
+      result = co_await state->writer_->Write(
+          control::MessagePriority::kReliable,
+          control::WireMessage(control::DirectiveResponse{
+              .session_id = work.wire_.session_id,
+              .recipient_boot_id = work.wire_.recipient_boot_id,
+              .identity = work.wire_.identity,
+              .started = started.started(),
+          }));
+      if (!result.ok()) break;
       ++state->directive_completion_tasks_;
       if (target_population_work) {
         ++state->target_population_completion_tasks_;
@@ -2120,7 +2014,7 @@ struct MetaControlClientService::Impl {
       }
       ++state->active_tasks_;
       state->worker_->Spawn(ObserveDirectiveCompletion(
-          state, std::move(work.wire_), std::move(*started),
+          state, std::move(work.wire_), std::move(started),
           state->directive_generation_, target_population_work));
     }
     if (state->closing_ || !state->directive_dispatch_enabled_) {
@@ -2140,31 +2034,20 @@ struct MetaControlClientService::Impl {
       co_return absl::FailedPreconditionError(
           "directive arrived while authority replacement is pending");
     }
+    if (std::find(state->accepted_directives_.begin(),
+                  state->accepted_directives_.end(),
+                  directive.identity) != state->accepted_directives_.end()) {
+      co_return absl::OkStatus();
+    }
     if (state->accepted_directives_.size() >=
         control::kMaxProjectedDirectives) {
       co_return absl::ResourceExhaustedError(
           "too many directives were delivered in one session projection");
     }
-    if (std::find(state->accepted_directives_.begin(),
-                  state->accepted_directives_.end(),
-                  directive.identity) != state->accepted_directives_.end()) {
-      co_return absl::AlreadyExistsError(
-          "directive identity was delivered twice in one projection");
-    }
     auto normalized = NormalizeDirective(
         directive, state->session_, state->boot_id_,
         state->replication_identity_.local_history_id_, *state->desired_);
     if (!normalized.ok()) co_return normalized.status();
-    absl::Status accepted = co_await state->writer_->Write(
-        control::MessagePriority::kReliable,
-        control::WireMessage(control::DirectiveReceipt{
-            .session_id = directive.session_id,
-            .recipient_boot_id = directive.recipient_boot_id,
-            .identity = directive.identity,
-            .stage = control::DirectiveReceiptStage::kAccepted,
-        }));
-    if (!accepted.ok()) co_return accepted;
-
     state->accepted_directives_.push_back(directive.identity);
     state->directive_queue_.push_back(DirectiveWork{
         .wire_ = directive, .normalized_ = std::move(*normalized)});
@@ -2199,56 +2082,76 @@ struct MetaControlClientService::Impl {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ApplyFullStateReplacement(
+  celer::Task<absl::Status> QueueCurrentTasks(
+      const std::shared_ptr<SessionState>& state) {
+    // Copy only this request's execution envelopes: QueueDirective may await
+    // transport backpressure while the immutable selected state remains live.
+    for (const auto& task : state->desired_->tasks) {
+      if (task.recipient_boot_id != state->boot_id_) continue;
+      auto directive = LiveDirective(task, state->session_.session_id_.bytes(),
+                                     state->desired_->local.revision);
+      if (auto status = co_await QueueDirective(state, directive); !status.ok())
+        co_return status;
+    }
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> ApplyControlUpdate(
       const std::shared_ptr<SessionState>& state,
       control::ControlSessionWriter& writer,
-      control::FullDesiredState replacement) {
+      const control::NodeControlUpdate& update) {
+    auto next = std::make_shared<control::NodeControlState>(*state->desired_);
+    if (auto status = control::ApplyNodeControlUpdate(*next, update);
+        !status.ok())
+      co_return status;
+    MetaEndpointDirectory directory = directory_;
+    if (auto status = directory.Refresh(next->directory.endpoints);
+        !status.ok())
+      co_return status;
+    const bool local_changed = next->local != state->desired_->local;
+    const bool tasks_changed =
+        next->tasks_revision != state->desired_->tasks_revision;
+    const bool routing_changed = next->routing != state->desired_->routing;
     if (std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
-            replacement.authority_lease_duration_ms)) >
-        state->observation_ttl_) {
+            next->local.lease_duration_ms)) > state->observation_ttl_)
       co_return absl::InvalidArgumentError(
-          "replacement FDS heartbeat interval exceeds observation TTL");
+          "heartbeat interval exceeds observation TTL");
+    if (local_changed || tasks_changed) {
+      DisableDirectiveDispatch(state);
+      RequestHeartbeatPause(state);
+      if (auto status = co_await WaitForHeartbeatQuiesced(state); !status.ok())
+        co_return status;
+      if (auto status = co_await WaitForDirectiveExecutor(state); !status.ok())
+        co_return status;
+      // Cancel only completion observers. Matching native operations survive
+      // reconciliation and their idempotent requests attach new observers.
+      if (auto status = co_await CancelAndWaitForDirectiveCompletions(state);
+          !status.ok())
+        co_return status;
+      if (auto status = co_await Install(*next, state->boot_id_); !status.ok())
+        co_return status;
+      state->accepted_directives_.clear();
+      state->challenge_rotation_.Reset();
+    } else if (routing_changed) {
+      auto prepared = PrepareNodeControlState(*next, options_.node_id_,
+                                              options_.request_worker_count_);
+      if (!prepared.ok()) co_return prepared.status();
+      if (auto status = installer_.InstallRouting(std::move(*prepared));
+          !status.ok())
+        co_return status;
     }
-    DisableDirectiveDispatch(state);
-    RequestHeartbeatPause(state);
-    if (absl::Status quiesced = co_await WaitForHeartbeatQuiesced(state);
-        !quiesced.ok()) {
-      co_return quiesced;
-    }
-    if (absl::Status joined = co_await WaitForDirectiveExecutor(state);
-        !joined.ok()) {
-      co_return joined;
-    }
-    // Completion belongs to the projection under which its directive was
-    // accepted. Stop only the wire observers here; the FDS transition below
-    // either preserves the matching native population or retires it before
-    // FullStateApplied.
-    if (absl::Status cancelled =
-            co_await CancelAndWaitForDirectiveCompletions(state);
-        !cancelled.ok()) {
-      co_return cancelled;
-    }
-    if (absl::Status installed = co_await Install(replacement, state->boot_id_);
-        !installed.ok()) {
-      co_return installed;
-    }
-    state->desired_ =
-        std::make_shared<control::FullDesiredState>(std::move(replacement));
+    directory_ = std::move(directory);
+    state->desired_ = std::move(next);
     state->heartbeat_interval_ =
         std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
-            state->desired_->authority_lease_duration_ms));
-    state->accepted_directives_.clear();
-    state->challenge_rotation_.Reset();
-    if (absl::Status applied = co_await SendApplied(writer, *state->desired_);
-        !applied.ok()) {
-      co_return applied;
-    }
-    // Both producers resume only after the replacement acknowledgement is
-    // completely written. Every subsequent admission, readiness proof, and
-    // challenge then derives from the same desired object.
+            state->desired_->local.lease_duration_ms));
+    if (auto status =
+            co_await SendApplied(writer, *state->desired_, update.request_id);
+        !status.ok())
+      co_return status;
     state->directive_dispatch_enabled_ = true;
     ResumeHeartbeat(state);
-    co_return absl::OkStatus();
+    co_return co_await QueueCurrentTasks(state);
   }
 
   absl::Status HandleResultAck(const std::shared_ptr<SessionState>& state,
@@ -2304,14 +2207,14 @@ struct MetaControlClientService::Impl {
 
   absl::StatusOr<std::optional<PopulationReadiness>> PopulationProof(
       const ClusterPopulationStatus& population,
-      const control::FullDesiredState& desired) const {
+      const control::NodeControlState& desired) const {
     if (population.state_ != ReplicationGroupState::kReady ||
         !population.ready_token_.has_value()) {
       return std::optional<PopulationReadiness>{};
     }
     const RebuildIdentity& ready = population.ready_token_->identity();
     const auto group = std::find_if(
-        desired.groups.begin(), desired.groups.end(),
+        desired.local.groups.begin(), desired.local.groups.end(),
         [&](const control::WireDesiredGroup& candidate) {
           return candidate.group_id == ready.group_id_ &&
                  population.ready_token_->CanCarryForwardToTerm(
@@ -2321,11 +2224,11 @@ struct MetaControlClientService::Impl {
                  candidate.partition_replication_epoch ==
                      ready.partition_replication_epoch_;
         });
-    if (group == desired.groups.end() ||
+    if (group == desired.local.groups.end() ||
         population.local_node_id_ != options_.node_id_ ||
         ready.target_node_id_ != options_.node_id_) {
       return absl::FailedPreconditionError(
-          "local population proof does not match the installed FDS");
+          "local population proof does not match the installed local control");
     }
     const auto local_member =
         std::find_if(group->members.begin(), group->members.end(),
@@ -2387,7 +2290,7 @@ struct MetaControlClientService::Impl {
         if (state->heartbeat_projection_gate_.pause_requested()) continue;
         if (detail::EvaluateMetaSessionReplicationIdentity(
                 state->replication_identity_, latest,
-                identity_transition_status, state->desired_->groups)
+                identity_transition_status, state->desired_->local.groups)
                 .requires_reconnect_) {
           result = absl::FailedPreconditionError(
               "replication boot or history changed during the Meta session");
@@ -2441,7 +2344,7 @@ struct MetaControlClientService::Impl {
       const detail::MetaSessionReplicationIdentityDecision identity_decision =
           detail::EvaluateMetaSessionReplicationIdentity(
               state->replication_identity_, after_failover_status,
-              failover_status, state->desired_->groups);
+              failover_status, state->desired_->local.groups);
       if (identity_decision.requires_reconnect_) {
         result = absl::FailedPreconditionError(
             "replication boot or history changed during failover heartbeat "
@@ -2479,7 +2382,8 @@ struct MetaControlClientService::Impl {
           .failover_observation = std::move(*failover_observation),
       };
       heartbeat.health.active_groups = static_cast<std::uint32_t>(std::count_if(
-          state->desired_->groups.begin(), state->desired_->groups.end(),
+          state->desired_->local.groups.begin(),
+          state->desired_->local.groups.end(),
           [&](const control::WireDesiredGroup& group) {
             return std::any_of(group.members.begin(), group.members.end(),
                                [&](const control::WireDesiredMember& member) {
@@ -2490,29 +2394,29 @@ struct MetaControlClientService::Impl {
       heartbeat.health.population_ready = readiness->has_value();
       heartbeat.health.summary = population.failure_reason_;
       const bool local_is_committed_owner =
-          MetaLeaseChallengeRotation::IsCommittedOwner(state->desired_->groups,
-                                                       options_.node_id_);
+          MetaLeaseChallengeRotation::IsCommittedOwner(
+              state->desired_->local.groups, options_.node_id_);
       const std::optional<std::size_t> local_group_index =
-          state->challenge_rotation_.Next(state->desired_->groups,
+          state->challenge_rotation_.Next(state->desired_->local.groups,
                                           options_.node_id_);
       std::uint32_t challenged_authority_lease_duration_ms = 0;
       std::optional<control::LeaseChallenge> heartbeat_challenge;
       if (!identity_decision.suppress_ordinary_role_ &&
           local_group_index.has_value()) {
         const control::WireDesiredGroup& local_group =
-            state->desired_->groups[*local_group_index];
+            state->desired_->local.groups[*local_group_index];
         auto nonce = control::GenerateId128();
         if (!nonce.ok()) {
           result = nonce.status();
           break;
         }
         heartbeat_challenge =
-            ChallengeFor(local_group, state->desired_->projection_hash, *nonce);
+            ChallengeFor(local_group, state->desired_->local.revision, *nonce);
         heartbeat.role_information = control::AuthorityLeaseRequest{
             .challenge = *heartbeat_challenge,
         };
         challenged_authority_lease_duration_ms =
-            state->desired_->authority_lease_duration_ms;
+            state->desired_->local.lease_duration_ms;
         result = state->challenge_tracker_.Begin(
             state->session_.session_id_.bytes(), state->boot_id_,
             *heartbeat_challenge);
@@ -2522,9 +2426,9 @@ struct MetaControlClientService::Impl {
                  population.ready_token_.has_value() &&
                  population.applied_next_lsns_.has_value()) {
         auto candidate = detail::ProjectReplicaCandidateProgress(
-            state->desired_->groups, options_.node_id_, after_failover_status,
-            **readiness, population.ready_token_->identity(),
-            *population.applied_next_lsns_,
+            state->desired_->local.groups, options_.node_id_,
+            after_failover_status, **readiness,
+            population.ready_token_->identity(), *population.applied_next_lsns_,
             population.failover_candidate_eligible_);
         if (!candidate.ok()) {
           result = candidate.status();
@@ -2619,12 +2523,13 @@ struct MetaControlClientService::Impl {
         state->heartbeat_projection_gate_.ConsumeSupersededAck(
             ack.heartbeat_sequence)) {
       // TransferEnd may overtake the response to the last heartbeat derived
-      // from the previous FDS. RequestHeartbeatPause detached that sequence
-      // from the authority tracker before the replacement was installed, so
-      // consume the response for wire progress without applying its stale
-      // lease decision to the new projection. The old watchdog was disarmed
-      // by RequestHeartbeatPause; touching it here could disarm the watchdog
-      // already armed for the first heartbeat under the replacement FDS.
+      // from the previous local control. RequestHeartbeatPause detached that
+      // sequence from the authority tracker before the replacement was
+      // installed, so consume the response for wire progress without applying
+      // its stale lease decision to the new projection. The old watchdog was
+      // disarmed by RequestHeartbeatPause; touching it here could disarm the
+      // watchdog already armed for the first heartbeat under the replacement
+      // local control.
       *state->valid_heartbeat_ack_ = true;
       co_return absl::OkStatus();
     }
@@ -2645,7 +2550,8 @@ struct MetaControlClientService::Impl {
           grant->leadership_generation == 0 ||
           grant->data_boot_id != state->boot_id_) {
         co_return absl::InvalidArgumentError(
-            "lease grant does not match the accepted leader or FDS authority");
+            "lease grant does not match the accepted leader or local control "
+            "authority");
       }
       if (absl::Status exact_duration =
               detail::ValidateResolvedLeaseGrantDuration(
@@ -2683,9 +2589,7 @@ struct MetaControlClientService::Impl {
               .session_ = state->session_,
               .projection_ =
                   ProjectionBasis{
-                      .source_meta_applied_index_ =
-                          state->desired_->source_meta_applied_index,
-                      .projection_hash_ = grant->projection_hash,
+                      .control_revision_ = grant->control_revision,
                   },
               .anchor_ =
                   AuthorityAnchor{
@@ -2721,11 +2625,12 @@ struct MetaControlClientService::Impl {
         co_return absl::InvalidArgumentError(
             "out-of-date decision does not match the pending challenge");
       }
-      // A commit can overtake the heartbeat projected from the preceding FDS.
-      // The publisher on this same session will deliver the replacement; do
-      // not tear the session down and thereby revoke source exports needed by
-      // that very transition. The old finite lease is not renewed and normal
-      // FDS installation still invalidates stale authority before Ack.
+      // A commit can overtake the heartbeat projected from the preceding local
+      // control. The publisher on this same session will deliver the
+      // replacement; do not tear the session down and thereby revoke source
+      // exports needed by that very transition. The old finite lease is not
+      // renewed and normal local control installation still invalidates stale
+      // authority before Ack.
       state->challenge_tracker_.Cancel();
       RecordClusterControlLeaseDenial();
     } else if (pending.challenge_.has_value()) {
@@ -2900,17 +2805,20 @@ struct MetaControlClientService::Impl {
               initial->authority_lease_duration_ms) >
           hello->observation_ttl_ms) {
         co_return absl::InvalidArgumentError(
-            "initial FDS heartbeat interval exceeds observation TTL");
+            "initial local control heartbeat interval exceeds observation TTL");
       }
       if (stopping_.load(std::memory_order_acquire)) {
         co_return absl::CancelledError("Meta control client stopped");
       }
+      auto selected =
+          control::SelectNodeControlState(*initial, options_.node_id_);
+      initial = control::FullDesiredState{};
       if (absl::Status installed =
-              co_await Install(*initial, replication_identity.boot_id_);
+              co_await Install(selected, replication_identity.boot_id_);
           !installed.ok()) {
         co_return installed;
       }
-      if (absl::Status applied = co_await SendApplied(writer, *initial);
+      if (absl::Status applied = co_await SendApplied(writer, selected);
           !applied.ok()) {
         co_return applied;
       }
@@ -2922,10 +2830,10 @@ struct MetaControlClientService::Impl {
       state->boot_id_ = replication_identity.boot_id_;
       state->replication_identity_ = replication_identity;
       state->desired_ =
-          std::make_shared<control::FullDesiredState>(std::move(*initial));
+          std::make_shared<control::NodeControlState>(std::move(selected));
       state->heartbeat_interval_ =
           std::chrono::milliseconds(control::DataHeartbeatIntervalMs(
-              state->desired_->authority_lease_duration_ms));
+              state->desired_->local.lease_duration_ms));
       state->observation_ttl_ =
           std::chrono::milliseconds(hello->observation_ttl_ms);
       state->progress_timeout_ = progress_timeout;
@@ -2955,6 +2863,8 @@ struct MetaControlClientService::Impl {
       ++state->active_tasks_;
       worker.Spawn(RunHeartbeatProducer(state));
       SetClusterControlConnected(true);
+      if (auto status = co_await QueueCurrentTasks(state); !status.ok())
+        co_return status;
 
       StringTransferSink transfer_sink;
       control::LargeObjectReassembler transfer_reassembler(transfer_sink);
@@ -3027,8 +2937,8 @@ struct MetaControlClientService::Impl {
                 detail::MetaTransferAbortDisposition::
                     kContinueAuthenticatedSession) {
               // The old projection remains installed. Heartbeat production is
-              // intentionally untouched while Meta retries the latest FDS on
-              // this authenticated session.
+              // intentionally untouched while Meta retries the latest local
+              // control on this authenticated session.
               continue;
             }
             co_return absl::AbortedError(
@@ -3044,30 +2954,14 @@ struct MetaControlClientService::Impl {
               .kind_ = *transfer_sink.kind(),
               .bytes_ = transfer_sink.TakeBytes(),
           };
-          if (transfer.kind_ == control::TransferKind::kFullDesiredState) {
+          if (transfer.kind_ == control::TransferKind::kNodeControlUpdate) {
             auto replacement =
-                control::DecodeFullDesiredState(std::move(transfer.bytes_));
+                control::DecodeNodeControlUpdate(std::move(transfer.bytes_));
             if (!replacement.ok()) co_return replacement.status();
-            if (absl::Status applied = co_await ApplyFullStateReplacement(
+            if (absl::Status applied = co_await ApplyControlUpdate(
                     state, writer, std::move(*replacement));
                 !applied.ok()) {
               co_return applied;
-            }
-            continue;
-          }
-          if (transfer.kind_ == control::TransferKind::kDirectivePayload) {
-            auto decoded = control::DecodeMessage(
-                control::MessageType::kDirective, transfer.bytes_);
-            if (!decoded.ok()) co_return decoded.status();
-            const auto* directive = std::get_if<control::Directive>(&*decoded);
-            if (directive == nullptr) {
-              co_return absl::InternalError(
-                  "Directive transfer decoded as the wrong message type");
-            }
-            if (absl::Status queued =
-                    co_await QueueDirective(state, *directive);
-                !queued.ok()) {
-              co_return queued;
             }
             continue;
           }
@@ -3079,15 +2973,15 @@ struct MetaControlClientService::Impl {
         // is being reassembled. The one reader therefore never makes an
         // authority frame wait behind every bulk chunk.
         if (auto* replacement =
-                std::get_if<control::FullDesiredState>(&*incoming)) {
+                std::get_if<control::NodeControlUpdate>(&*incoming)) {
           // Meta serializes complete-object senders. A direct projection in
           // the middle of another object would otherwise publish new control
           // state while retaining an incomplete old payload, so fail closed.
           if (transfer_active) {
             co_return absl::FailedPreconditionError(
-                "direct FullDesiredState interrupted an inbound transfer");
+                "direct control update interrupted an inbound transfer");
           }
-          if (absl::Status applied = co_await ApplyFullStateReplacement(
+          if (absl::Status applied = co_await ApplyControlUpdate(
                   state, writer, std::move(*replacement));
               !applied.ok()) {
             co_return applied;
@@ -3131,14 +3025,6 @@ struct MetaControlClientService::Impl {
                   }));
               !acknowledged.ok()) {
             co_return acknowledged;
-          }
-          continue;
-        }
-        if (const auto* directive =
-                std::get_if<control::Directive>(&*incoming)) {
-          if (absl::Status queued = co_await QueueDirective(state, *directive);
-              !queued.ok()) {
-            co_return queued;
           }
           continue;
         }

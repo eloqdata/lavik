@@ -186,11 +186,11 @@ bool MetaBarrierSatisfied(const MetaOperationRecord& operation,
 
 bool ProjectionMatches(const MetaDataControlRuntimeNode& runtime,
                        const MetaTopologyGroupView& group,
-                       const MetaGroupGrantState& grant,
+                       const MetaGroupAuthorityView& grant,
                        std::uint64_t required_applied_index) {
   // Runtime is published only after Data acknowledges the installed FDS.
   // Unrelated commits advance validated high-water without resending an
-  // unchanged projection. Requiring source_meta_applied_index to catch up
+  // unchanged projection. Requiring control_revision to catch up
   // would therefore wait forever for an already-current projection.
   if (runtime.validated_committed_high_water_ < required_applied_index ||
       runtime.groups_.size() != 1 || !grant.grant_.has_value())
@@ -383,7 +383,7 @@ absl::Status ValidateV1FinalTopology(const MetaStores& stores,
   }
   for (const auto& declaration : manifest.groups_) {
     const auto group = stores.topology_.FindGroup(declaration.group_id_);
-    const auto grant = stores.grant_.GroupState(declaration.group_id_);
+    const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
     const auto population =
         V1PopulationManifest(manifest, declaration.group_id_);
     if (!group.has_value() ||
@@ -448,7 +448,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
                      const MetaDataControlRuntimeSnapshot& runtime) {
   const auto& stores = view.stores();
   const auto group = stores.topology_.FindGroup(declaration.group_id_);
-  const auto grant = stores.grant_.GroupState(declaration.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
   const auto population = V1PopulationManifest(manifest, declaration.group_id_);
   if (!group.has_value() || !grant.has_value())
     return Conflict(absl::StrCat("group=", declaration.group_id_,
@@ -537,7 +537,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
     initialize.partition_replication_epoch_ = 1;
     initialize.kind_ = kMetaDirectiveInitializeEmptyPopulation;
     initialize.payload_ = Hex(operation.replication_history_id_);
-    initialize.storage_mutating_ = true;
+
     TransitionOperationPhase transition;
     transition.operation_id_ = operation.operation_id_;
     transition.expected_revision_ = operation.revision_;
@@ -758,7 +758,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
           DerivedV1Id(operation.operation_id_, purpose + "rebuild-attempt");
       rebuild.recipient_node_id_ = replica;
       rebuild.kind_ = kMetaDirectiveRebuild;
-      rebuild.storage_mutating_ = true;
+
       transition.current_directives_.push_back(std::move(rebuild));
     }
     return Emit(std::move(transition));
@@ -813,7 +813,7 @@ Plan PlanV1GroupStep(const MetaCommittedView& view,
           DerivedV1Id(operation.operation_id_, purpose + "rebuild-attempt");
       expected_rebuild.recipient_node_id_ = replica;
       expected_rebuild.kind_ = kMetaDirectiveRebuild;
-      expected_rebuild.storage_mutating_ = true;
+
       if (authorization_revision == 0 || rebuild_revision == 0 ||
           rebuild_revision <= authorization_revision ||
           authorize.directive_revision_ != authorization_revision ||
@@ -1052,7 +1052,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
       if (!stores.population_manifest_.Contains(population.manifest_digest_))
         return Emit(population);
       const auto group = stores.topology_.FindGroup(declaration.group_id_);
-      const auto grant = stores.grant_.GroupState(declaration.group_id_);
+      const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
       if (!group.has_value() || !grant.has_value())
         return Conflict(absl::StrCat("creation Group disappeared: group=",
                                      declaration.group_id_));
@@ -1108,7 +1108,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
     if (!runtime.leader_authority_eligible_) return std::nullopt;
     for (const auto& declaration : manifest->groups_) {
       const auto group = stores.topology_.FindGroup(declaration.group_id_);
-      const auto grant = stores.grant_.GroupState(declaration.group_id_);
+      const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
       for (const auto& [node_id, role] : DeclaredMembers(declaration)) {
         (void)role;
         const auto node = std::find_if(
@@ -1132,7 +1132,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
             absl::StrCat("creation Group operation was archived: group=",
                          declaration.group_id_));
       const auto group = stores.topology_.FindGroup(declaration.group_id_);
-      const auto grant = stores.grant_.GroupState(declaration.group_id_);
+      const auto grant = stores.topology_.AuthorityFor(declaration.group_id_);
       const auto primary = std::find_if(
           runtime.nodes_.begin(), runtime.nodes_.end(), [&](const auto& node) {
             return node.node_id_ == declaration.primary_node_id_;

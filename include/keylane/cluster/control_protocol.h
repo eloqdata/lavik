@@ -32,21 +32,15 @@ inline constexpr std::size_t kMaxFramePayloadBytes =
     kMaxFrameBytes - kFrameHeaderBytes;
 // This is a cap for each opaque schema field, not for an entire message.
 inline constexpr std::size_t kMaxOpaqueFieldBytes = 256u * 1024u;
-// This caps canonical wire bytes, not the decoded object graph. Decode must
-// temporarily retain the input plus its owning fields; digest/projection
-// validation is therefore required to use only O(directive-count) references
-// and constant-size hashing state, never another projection-sized buffer.
+// This caps canonical wire bytes, not the decoded object graph. Validation
+// must not allocate another projection-sized serialized buffer.
 inline constexpr std::uint64_t kMaxFullDesiredStateBytes = 512ull << 20;
-// A streamed Directive contains two independently bounded opaque fields plus
+// A streamed Directive contains one bounded opaque payload plus
 // fixed and identifier envelopes that themselves fit in one frame.
 inline constexpr std::uint64_t kMaxDirectiveTransferBytes =
-    2ull * kMaxOpaqueFieldBytes + kMaxFrameBytes;
+    kMaxOpaqueFieldBytes + kMaxFrameBytes;
 // DirectiveResult has one opaque result plus its fixed/identifier envelope.
 inline constexpr std::uint64_t kMaxDirectiveResultTransferBytes =
-    kMaxOpaqueFieldBytes + kMaxFrameBytes;
-// OperationEvidence has one opaque evidence body; its fixed identities and
-// bounded phase/group labels fit inside the remaining frame-sized envelope.
-inline constexpr std::uint64_t kMaxOperationEvidenceTransferBytes =
     kMaxOpaqueFieldBytes + kMaxFrameBytes;
 inline constexpr std::size_t kMaxDirectoryEntries = 4096;
 inline constexpr std::size_t kMaxIdentifierBytes = 1024;
@@ -70,9 +64,6 @@ absl::StatusOr<std::string> GenerateIdentity160();
 absl::StatusOr<WireId128> GenerateId128();
 bool IsCanonicalIdentity160(std::string_view identity) noexcept;
 
-// SHA-256 is the object-integrity algorithm fixed by this protocol family.
-WireHash256 ComputeSha256(std::string_view bytes) noexcept;
-
 enum class MessageType : std::uint16_t {
   kClientHello = 1,
   kServerHello = 2,
@@ -86,14 +77,14 @@ enum class MessageType : std::uint16_t {
   kFence = 10,
   kFenceAck = 11,
   kDirective = 12,
-  kDirectiveReceipt = 13,
+  kDirectiveResponse = 13,
   kDirectiveResult = 14,
   kResultCommitted = 15,
   kResultNoLongerTracked = 16,
-  kOperationEvidence = 17,
   // Frame-sized canonical FullDesiredState. Larger projections use the
   // existing TransferKind::kFullDesiredState Start/Chunk/End form.
   kFullDesiredState = 18,
+  kNodeControlUpdate = 19,
 };
 
 struct Frame {
@@ -190,18 +181,17 @@ struct ServerHello {
 
 enum class TransferKind : std::uint16_t {
   kFullDesiredState = 1,
-  kObservationEvidence = 2,
   // Bytes are the canonical EncodeMessage payload for the named message
   // type; receivers feed the committed object back through DecodeMessage.
   kDirectivePayload = 3,
   kDirectiveResult = 4,
+  kNodeControlUpdate = 5,
 };
 
 struct TransferStart {
   TransferKind kind = TransferKind::kFullDesiredState;
   WireId128 object_id{};
   std::uint64_t total_length = 0;
-  WireHash256 sha256{};
 
   friend bool operator==(const TransferStart&, const TransferStart&) = default;
 };
@@ -222,9 +212,9 @@ struct TransferEnd {
 
 enum class TransferAbortReason : std::uint16_t {
   kUnspecified = 0,
-  // The sender found a newer committed FullDesiredState before this object
-  // became installable. The receiver may discard only the matching active FDS
-  // object and keep the authenticated session for its replacement.
+  // The sender found newer committed control state before this object became
+  // installable. The receiver may discard the matching active control object
+  // and keep the authenticated session for its replacement.
   kFullDesiredStateSuperseded = 1,
 };
 
@@ -235,7 +225,7 @@ struct TransferAbort {
   friend bool operator==(const TransferAbort&, const TransferAbort&) = default;
 };
 
-// The reassembler itself retains only counters and incremental SHA-256 state.
+// The reassembler itself retains only transfer identity and byte counters.
 // The sink chooses how bytes are staged (file, bounded buffer, decoder, ...),
 // so an attacker-controlled total_length never causes eager allocation here.
 class LargeObjectSink {
@@ -270,16 +260,15 @@ class LargeObjectReassembler {
 };
 
 struct FullStateApplied {
-  std::uint64_t source_meta_applied_index = 0;
-  WireHash256 projection_hash{};
+  WireId128 request_id{};
+  std::uint64_t control_revision = 0;
 
   friend bool operator==(const FullStateApplied&,
                          const FullStateApplied&) = default;
 };
 
 struct WireProjectionBasis {
-  std::uint64_t source_meta_applied_index = 0;
-  WireHash256 projection_hash{};
+  std::uint64_t control_revision = 0;
 
   friend bool operator==(const WireProjectionBasis&,
                          const WireProjectionBasis&) = default;
@@ -331,7 +320,7 @@ struct CandidateProgress {
 
 struct LeaseChallenge {
   WireId128 nonce{};
-  WireHash256 projection_hash{};
+  std::uint64_t control_revision = 0;
   std::string group_id;
   WireId128 assignment_id{};
   std::uint64_t group_term = 0;
@@ -424,27 +413,6 @@ struct Heartbeat {
   friend bool operator==(const Heartbeat&, const Heartbeat&) = default;
 };
 
-// Boot/session-scoped soft evidence for one committed operation. Meta derives
-// the reporter node from the authenticated connection; the explicit member
-// assignment, population counters, and history prevent reuse after any
-// reassignment, rebuild generation, operation, or process incarnation change.
-struct OperationEvidence {
-  WireId128 session_id{};
-  std::string reporter_boot_id;
-  WireId128 assignment_id{};
-  WireId128 operation_id{};
-  std::string kind_phase;
-  std::string evidence;
-  std::string group_id;
-  std::uint64_t group_term = 0;
-  std::uint64_t manifest_revision = 0;
-  std::uint64_t partition_replication_epoch = 0;
-  std::string replication_history_id;
-
-  friend bool operator==(const OperationEvidence&,
-                         const OperationEvidence&) = default;
-};
-
 enum class ObservationStatus : std::uint8_t {
   kNotIncluded = 0,
   kAccepted = 1,
@@ -462,7 +430,7 @@ struct LeaseGranted {
   std::uint64_t raft_term = 0;
   std::uint64_t leadership_generation = 0;
   std::string data_boot_id;
-  WireHash256 projection_hash{};
+  std::uint64_t control_revision = 0;
   std::string group_id;
   WireId128 assignment_id{};
   std::uint64_t group_term = 0;
@@ -483,14 +451,14 @@ enum class LeaseDenialReason : std::uint16_t {
 struct LeaseDenied {
   WireId128 nonce{};
   LeaseDenialReason reason = LeaseDenialReason::kAuthorityMismatch;
-  WireHash256 current_projection_hash{};
+  std::uint64_t current_control_revision = 0;
 
   friend bool operator==(const LeaseDenied&, const LeaseDenied&) = default;
 };
 
 struct LeaseStateOutOfDate {
   WireId128 nonce{};
-  WireHash256 current_projection_hash{};
+  std::uint64_t current_control_revision = 0;
 
   friend bool operator==(const LeaseStateOutOfDate&,
                          const LeaseStateOutOfDate&) = default;
@@ -618,33 +586,22 @@ struct Directive {
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
   // V1 uses typed payloads for rebuild/authorize-source source layouts and a
-  // target history id for initialize-empty-population. Preconditions remain
-  // reserved.
+  // target history id for initialize-empty-population.
   std::string payload;
-  std::string preconditions;
-  // Active V1 classification: population mutations set it; source
-  // authorization and revocation do not. Data admission enforces the split.
-  bool storage_mutating = false;
-  // Reserved execution override; Data admission requires false in V1.
-  bool force = false;
 
   friend bool operator==(const Directive&, const Directive&) = default;
 };
 
-enum class DirectiveReceiptStage : std::uint8_t {
-  kAccepted = 1,
-  kStarted = 2,
-  kCompleted = 3,
-};
-
-struct DirectiveReceipt {
+// Request response emitted after local execution admission. Final results
+// are independent messages and do not require this response to be retained.
+struct DirectiveResponse {
   WireId128 session_id{};
   std::string recipient_boot_id;
   WireDirectiveIdentity identity;
-  DirectiveReceiptStage stage = DirectiveReceiptStage::kAccepted;
+  bool started = false;
 
-  friend bool operator==(const DirectiveReceipt&,
-                         const DirectiveReceipt&) = default;
+  friend bool operator==(const DirectiveResponse&,
+                         const DirectiveResponse&) = default;
 };
 
 enum class DirectiveResultStatus : std::uint8_t {
@@ -846,10 +803,9 @@ struct WireManifestDocument {
                          const WireManifestDocument&) = default;
 };
 
-// Session-independent form used inside a projection. The live Directive
-// envelope adds the current session id only when it is sent.
+// Task body carried once in bootstrap or a task upsert. Data adds its current
+// session and local control version when admitting the work.
 struct WireProjectedDirective {
-  WireProjectionBasis basis;
   WireAuthorityAnchor authority;
   WireDirectiveIdentity identity;
   std::string recipient_node_id;
@@ -866,15 +822,8 @@ struct WireProjectedDirective {
   std::uint64_t partition_replication_epoch = 0;
   WireDirectiveKind kind = WireDirectiveKind::kRebuild;
   // V1 uses typed payloads for rebuild/authorize-source source layouts and a
-  // target history id for initialize-empty-population. Preconditions remain
-  // reserved.
+  // target history id for initialize-empty-population.
   std::string payload;
-  std::string preconditions;
-  // Active V1 classification: population mutations set it; source
-  // authorization and revocation do not. Data admission enforces the split.
-  bool storage_mutating = false;
-  // Reserved execution override; Data admission requires false in V1.
-  bool force = false;
 
   friend bool operator==(const WireProjectedDirective&,
                          const WireProjectedDirective&) = default;
@@ -883,13 +832,14 @@ struct WireProjectedDirective {
 // Complete node-specific semantic projection sent either as one typed frame
 // or as a FullDesiredState large object after each accepted session.
 struct FullDesiredState {
-  std::uint64_t source_meta_applied_index = 0;
+  // Bootstrap seed for local control and routing revisions. Later updates
+  // advance each object independently; Data does not follow a Meta log index.
+  std::uint64_t control_revision = 0;
   std::uint64_t topology_epoch = 0;
   // Resolved by the current Meta Leader from one global Policy and its local
   // leadership-validity limit. Data never interprets Policy identity or
   // documents; it derives heartbeat cadence from this effective duration.
   std::uint32_t authority_lease_duration_ms = 0;
-  WireHash256 projection_hash{};
   std::vector<WireMetaEndpoint> meta_directory;
   std::vector<WireDataEndpoint> nodes;
   std::vector<WireDesiredGroup> groups;
@@ -900,6 +850,90 @@ struct FullDesiredState {
                          const FullDesiredState&) = default;
 };
 
+// Routing retains only discovery and serving information for remote Groups.
+// Member assignments, population and failover details belong to local control;
+// routing keeps only the owner's assignment as part of its serving identity.
+struct WireRoutingGroup {
+  std::string group_id;
+  std::uint64_t term = 0;
+  std::optional<std::string> owner;
+  WireId128 owner_assignment{};
+  bool available = false;
+  std::vector<std::string> members;
+  std::vector<WireSlotRange> slots;
+  bool operator==(const WireRoutingGroup&) const = default;
+};
+
+struct RoutingState {
+  std::uint64_t revision = 0;
+  std::vector<WireDataEndpoint> nodes;
+  std::vector<WireRoutingGroup> groups;
+  bool operator==(const RoutingState&) const = default;
+};
+
+struct LocalGroupState {
+  std::uint64_t revision = 0;
+  std::uint32_t lease_duration_ms = 0;
+  // Zero or one Group for the current single-population Data process.
+  std::vector<WireDesiredGroup> groups;
+  std::vector<WireManifestDocument> manifests;
+  bool operator==(const LocalGroupState&) const = default;
+};
+
+struct MetaDirectoryState {
+  std::uint64_t revision = 0;
+  std::vector<WireMetaEndpoint> endpoints;
+  bool operator==(const MetaDirectoryState&) const = default;
+};
+
+struct TaskChanges {
+  std::uint64_t base_revision = 0;
+  std::uint64_t revision = 0;
+  std::vector<WireProjectedDirective> upserts;
+  std::vector<WireDirectiveIdentity> removed;
+  bool operator==(const TaskChanges&) const = default;
+};
+
+// A request may atomically change related objects, but each object owns its
+// version. request_id correlates the acknowledgement; it is not a state
+// version.
+struct NodeControlUpdate {
+  WireId128 request_id{};
+  std::optional<RoutingState> routing;
+  std::optional<LocalGroupState> local;
+  std::optional<MetaDirectoryState> directory;
+  std::optional<TaskChanges> tasks;
+  bool operator==(const NodeControlUpdate&) const = default;
+};
+
+// Data's retained control state. FullDesiredState is a bootstrap input only.
+struct NodeControlState {
+  RoutingState routing;
+  LocalGroupState local;
+  MetaDirectoryState directory;
+  std::uint64_t tasks_revision = 0;
+  std::vector<WireProjectedDirective> tasks;
+};
+
+// Extracts node-owned control and lean global routes from a bootstrap input.
+NodeControlState SelectNodeControlState(const FullDesiredState& bootstrap,
+                                        std::string_view node_id);
+// Sets only changed object versions in next. A semantic no-op yields an empty
+// request and retains every installed version, even after unrelated Raft logs.
+NodeControlUpdate DiffNodeControlState(const NodeControlState& previous,
+                                       NodeControlState& next);
+// Validates all object versions and task dependencies before replacing any
+// retained state. Older objects are ignored, exact replay is idempotent, and
+// same-version conflicting content or a task delta gap is rejected.
+absl::Status ApplyNodeControlUpdate(NodeControlState& state,
+                                    const NodeControlUpdate& update);
+// Encodes the bounded object update; oversized frames use object transfer.
+absl::StatusOr<std::string> EncodeNodeControlUpdate(
+    const NodeControlUpdate& update);
+// Decodes one complete update without changing installed state.
+absl::StatusOr<NodeControlUpdate> DecodeNodeControlUpdate(
+    std::string_view bytes);
+
 // Data has no independent heartbeat setting. Keeping this derivation at the
 // protocol seam prevents Meta and Data from carrying two values that must
 // always agree.
@@ -908,6 +942,11 @@ constexpr std::uint32_t DataHeartbeatIntervalMs(
   const std::uint32_t divided = authority_lease_duration_ms / 3;
   return divided == 0 ? 1 : divided;
 }
+
+// Checks schema, relationships encoded by the wire types, and size bounds
+// without materializing bytes. This also admits constructed values at the
+// Data adapter seam; it performs no content-integrity hashing.
+absl::Status ValidateFullDesiredState(const FullDesiredState& state);
 
 // Canonical semantic body used as the FullDesiredState transfer payload.
 absl::StatusOr<std::string> EncodeFullDesiredState(
@@ -918,18 +957,18 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
 // every return path so a decoded owning projection does not keep a second
 // complete representation alive during installation.
 absl::StatusOr<FullDesiredState> DecodeFullDesiredState(std::string&& encoded);
-// Hashes only node-specific semantic content. Diagnostic applied indices,
-// the hash itself, and directive projection-basis copies are normalized out,
-// so an unrelated Raft commit cannot invalidate an installed projection.
-absl::StatusOr<WireHash256> ComputeProjectionHash(
-    const FullDesiredState& state);
+// Compares executable/routing content without the source applied index.
+// Unrelated Raft commits therefore do not cause FDS replacement; messages still
+// reference the index actually installed.
+bool SameDesiredState(const FullDesiredState& left,
+                      const FullDesiredState& right);
 
 using WireMessage =
     std::variant<ClientHello, ServerHello, TransferStart, TransferChunk,
                  TransferEnd, TransferAbort, FullStateApplied, Heartbeat,
-                 HeartbeatAck, OperationEvidence, Fence, FenceAck, Directive,
-                 DirectiveReceipt, DirectiveResult, ResultCommitted,
-                 ResultNoLongerTracked, FullDesiredState>;
+                 HeartbeatAck, Fence, FenceAck, Directive, DirectiveResponse,
+                 DirectiveResult, ResultCommitted, ResultNoLongerTracked,
+                 FullDesiredState, NodeControlUpdate>;
 
 MessageType MessageTypeOf(const WireMessage& message) noexcept;
 

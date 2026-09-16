@@ -234,7 +234,7 @@ TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
   group.topology_.members_.push_back(
       {.node_id_ = node_id, .assignment_id_ = assignment});
   group.grant_.group_term_ = 4;
-  group.grant_.grant_ = MetaGroupGrant{.owner_ = node_id};
+  group.grant_.grant_ = MetaActiveAuthorityView{.owner_ = node_id};
   view.groups_.push_back(std::move(group));
   const ClusterCaptureWireV1 capture{.responder_id_ = 1,
                                      .term_ = 7,
@@ -253,7 +253,7 @@ TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
                             .raft_term = 7,
                             .leadership_generation = 11,
                             .data_boot_id = runtime.boot_id_,
-                            .projection_hash = runtime.projection_hash_,
+                            .control_revision = runtime.control_revision_,
                             .group_id = "group-a",
                             .assignment_id = assignment,
                             .group_term = 4,

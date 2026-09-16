@@ -105,18 +105,11 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   if (request_worker_count == 0) {
     return Invalid("request worker count is zero");
   }
-  if (desired.source_meta_applied_index == 0) {
-    return Invalid("source Meta applied index is zero");
+  if (desired.control_revision == 0) {
+    return Invalid("local control revision is zero");
   }
-  if (IsZero(desired.projection_hash)) {
-    return Invalid("projection hash is empty");
-  }
-  auto semantic_hash = control::ComputeProjectionHash(desired);
-  if (!semantic_hash.ok()) {
-    return Invalid(std::string(semantic_hash.status().message()));
-  }
-  if (*semantic_hash != desired.projection_hash) {
-    return Invalid("projection hash does not match the semantic content");
+  if (auto status = control::ValidateFullDesiredState(desired); !status.ok()) {
+    return Invalid(std::string(status.message()));
   }
 
   std::map<std::pair<std::uint64_t, Sha256Digest>,
@@ -244,8 +237,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
       .SetSelfNodeIndex(self->second);
   for (NodeDescriptor& node : nodes) builder.AddNode(std::move(node));
 
-  std::vector<PreparedGroupControlIdentity> control_groups;
-  control_groups.reserve(desired.groups.size());
   std::vector<DesiredClusterControl> desired_cluster_controls;
   desired_cluster_controls.reserve(desired.groups.size());
   for (const control::WireDesiredGroup& source : desired.groups) {
@@ -265,7 +256,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
       });
     }
     DesiredClusterControl desired_control{
-        .identity_ = control_group,
+        .identity_ = std::move(control_group),
         .owner_ = std::nullopt,
         .grant_active_ = source.grant_active,
         .activation_action_id_ = std::nullopt,
@@ -303,7 +294,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
           ToPreparedFailoverTransition(*source.failover_transition);
     }
     desired_cluster_controls.push_back(std::move(desired_control));
-    control_groups.push_back(std::move(control_group));
 
     // Durable owner intent remains available for heartbeat role
     // classification while fenced. Its slots remain unbound until Meta
@@ -347,9 +337,122 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   return PreparedFullState{
       .serving_state_ = std::move(*state),
       .authority_lease_duration_ms_ = desired.authority_lease_duration_ms,
-      .control_groups_ = std::move(control_groups),
       .desired_cluster_controls_ = std::move(desired_cluster_controls),
   };
+}
+
+absl::StatusOr<PreparedFullState> PrepareNodeControlState(
+    const control::NodeControlState& state, std::string_view local_node_id,
+    std::size_t request_worker_count) {
+  if (state.local.groups.size() > 1 || state.local.manifests.size() > 1) {
+    return Invalid("Data supports one local Group population");
+  }
+  // Reuse local population/authority validation without retaining remote
+  // assignments, manifests or failover workflows in the Data control model.
+  control::FullDesiredState local{
+      .control_revision = state.local.revision,
+      .topology_epoch = state.routing.revision,
+      .authority_lease_duration_ms = state.local.lease_duration_ms,
+      .meta_directory = state.directory.endpoints,
+      .nodes = state.routing.nodes,
+      .groups = state.local.groups,
+      .manifests = state.local.manifests,
+      .current_directives = state.tasks,
+  };
+  for (const auto& group : local.groups) {
+    if (std::none_of(group.members.begin(), group.members.end(),
+                     [&](const auto& member) {
+                       return member.node_id == local_node_id;
+                     }))
+      return Invalid("local control names a remote Group");
+    const auto route =
+        std::find_if(state.routing.groups.begin(), state.routing.groups.end(),
+                     [&](const auto& candidate) {
+                       return candidate.group_id == group.group_id;
+                     });
+    if (route == state.routing.groups.end() ||
+        route->term != group.group_term ||
+        route->owner != group.owner_node_id ||
+        route->available != group.grant_active ||
+        route->owner_assignment !=
+            group.owner_assignment_id.value_or(control::WireId128{}) ||
+        route->slots != group.slot_ranges ||
+        route->members.size() != group.members.size())
+      return Invalid("local control and routing disagree");
+    for (std::size_t i = 0; i < route->members.size(); ++i) {
+      if (route->members[i] != group.members[i].node_id)
+        return Invalid("local routing membership disagrees");
+    }
+  }
+  auto prepared =
+      PrepareMetaFullState(local, local_node_id, request_worker_count);
+  if (!prepared.ok()) return prepared.status();
+  ServingStateBuilder builder;
+  builder.SetInFlightStripeCount(request_worker_count);
+  builder.SetTopologyEpoch(state.routing.revision);
+  builder.SetSelfNodeIndex(prepared->serving_state_->SelfNodeIndex());
+  auto nodes = prepared->serving_state_->Nodes();
+  std::vector<NodeDescriptor> descriptors(nodes.begin(), nodes.end());
+  std::map<std::string, NodeIndex> indices;
+  for (std::size_t i = 0; i < descriptors.size(); ++i)
+    indices.emplace(descriptors[i].node_id_.ToHexString(),
+                    static_cast<NodeIndex>(i));
+  std::set<std::string> members;
+  std::set<std::string> groups;
+  for (const auto& route : state.routing.groups) {
+    if (route.group_id.empty() || !groups.insert(route.group_id).second)
+      return Invalid("routing Group is empty or duplicated");
+    builder.IncludeGroupTerm(route.term);
+    const auto owner = route.owner ? indices.find(*route.owner) : indices.end();
+    if (route.owner && (owner == indices.end() || route.term == 0 ||
+                        IsZero(route.owner_assignment)))
+      return Invalid("routing owner is invalid");
+    if (route.available && !route.owner)
+      return Invalid("available route has no owner");
+    bool owner_member = false;
+    for (const auto& member : route.members) {
+      const auto found = indices.find(member);
+      if (found == indices.end() || !members.insert(member).second)
+        return Invalid("routing member is unknown or duplicated");
+      owner_member |= route.owner == member;
+      auto& node = descriptors[found->second];
+      node.group_term_ = route.term;
+      node.primary_node_index_ = route.available && route.owner != member
+                                     ? owner->second
+                                     : kNoNodeIndex;
+    }
+    if (route.owner && !owner_member)
+      return Invalid("routing owner is not a member");
+    const bool is_local = std::find(route.members.begin(), route.members.end(),
+                                    local_node_id) != route.members.end();
+    if (is_local && (local.groups.empty() ||
+                     local.groups.front().group_id != route.group_id))
+      return Invalid("routing assigns local node without local control");
+    if (!route.available) continue;
+    if (is_local) {
+      for (const auto& group : prepared->serving_state_->Groups())
+        builder.AddGroup(group);
+      continue;
+    }
+    GroupView group;
+    group.group_id_ = route.group_id;
+    group.primary_node_index_ = owner->second;
+    group.assignment_id_ = AssignmentId::FromBytes(route.owner_assignment);
+    group.granted_ = true;
+    group.population_ready_ = true;
+    group.group_term_ = route.term;
+    for (const auto& member : route.members)
+      if (member != *route.owner)
+        group.replica_node_indices_.push_back(indices.at(member));
+    for (const auto& slot : route.slots)
+      group.slot_ranges_.push_back({slot.first, slot.last});
+    builder.AddGroup(std::move(group));
+  }
+  for (auto& node : descriptors) builder.AddNode(std::move(node));
+  auto serving = builder.Build();
+  if (!serving.ok()) return serving.status();
+  prepared->serving_state_ = std::move(*serving);
+  return prepared;
 }
 
 }  // namespace keylane::cluster

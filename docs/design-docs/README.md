@@ -34,6 +34,7 @@ them.
 | [Large-key redesign constraints](large-key-design.md) | Constraints for a future redesign; explicitly not a description of the current representation |
 | [Transaction design](transaction-design.md) | Original transaction proposal, decisions, milestones, and chronological extensions |
 | [Cross-shard architecture design](sharding-design.md) | Historical worker/shard plan; current ownership is documented elsewhere |
+| [Meta / Data control simplification](meta-data-control-simplification.md) | Requested 2026-09-16 record of nine findings, redundant fields and SHA uses, completed removals, and the proposed directive/local-state redesign |
 
 ## Maintenance
 

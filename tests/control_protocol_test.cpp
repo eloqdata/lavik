@@ -35,17 +35,14 @@ WireId128 Id(std::uint8_t last) {
   return id;
 }
 
-WireHash256 Sha256(std::string_view bytes) {
-  return control::ComputeSha256(bytes);
-}
-
 void SetLeaseTiming(control::FullDesiredState* state) {
+  state->control_revision = 1;
   state->authority_lease_duration_ms = 3'000;
 }
 
 control::FullDesiredState FailoverFullState() {
   control::FullDesiredState state;
-  state.source_meta_applied_index = 91;
+  state.control_revision = 91;
   state.topology_epoch = 23;
   state.authority_lease_duration_ms = 3'000;
   state.nodes = {
@@ -88,7 +85,6 @@ control::FullDesiredState FailoverFullState() {
                       .loss_if_cutover = control::WireFailoverLoss::kNone}},
   };
   state.groups.push_back(std::move(group));
-  state.projection_hash = *control::ComputeProjectionHash(state);
   return state;
 }
 
@@ -96,17 +92,6 @@ void AppendBe32(std::string* bytes, std::uint32_t value) {
   for (int shift = 24; shift >= 0; shift -= 8) {
     bytes->push_back(static_cast<char>(value >> shift));
   }
-}
-
-std::string Hex(const WireHash256& bytes) {
-  constexpr std::string_view digits = "0123456789abcdef";
-  std::string result;
-  result.reserve(bytes.size() * 2);
-  for (std::uint8_t byte : bytes) {
-    result.push_back(digits[byte >> 4]);
-    result.push_back(digits[byte & 0x0f]);
-  }
-  return result;
 }
 
 class RecordingSink final : public LargeObjectSink {
@@ -207,7 +192,7 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
   heartbeat.health.active_groups = 3;
   const control::LeaseChallenge challenge{
       .nonce = Id(2),
-      .projection_hash = Sha256("projection"),
+      .control_revision = 42,
       .group_id = "group-a",
       .assignment_id = Id(3),
       .group_term = 7,
@@ -233,7 +218,7 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
       .raft_term = 22,
       .leadership_generation = 5,
       .data_boot_id = std::string(40, 'a'),
-      .projection_hash = challenge.projection_hash,
+      .control_revision = challenge.control_revision,
       .group_id = challenge.group_id,
       .assignment_id = challenge.assignment_id,
       .group_term = challenge.group_term,
@@ -248,7 +233,7 @@ TEST(ControlProtocolCodecTest, RoundTripsHeartbeatChallengeAndGrant) {
   ack.lease_decision = control::LeaseDenied{
       .nonce = challenge.nonce,
       .reason = control::LeaseDenialReason::kAuthorityHandoffPending,
-      .current_projection_hash = challenge.projection_hash,
+      .current_control_revision = challenge.control_revision,
   };
   encoded = control::EncodeMessage(control::WireMessage{ack});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
@@ -295,7 +280,7 @@ TEST(ControlProtocolCodecTest, RoundTripsTypedReplicaCandidate) {
               .group_term = 7,
               .source_group_term = 6,
               .manifest_revision = 12,
-              .manifest_digest = Sha256("manifest"),
+              .manifest_digest = WireHash256{1},
               .partition_replication_epoch = 13,
               .source_node_id = std::string(40, 'a'),
               .source_assignment_id = Id(5),
@@ -323,7 +308,7 @@ TEST(ControlProtocolCodecTest, RejectsMalformedTypedCandidateAndRoleTag) {
               .group_term = 7,
               .source_group_term = 6,
               .manifest_revision = 12,
-              .manifest_digest = Sha256("manifest"),
+              .manifest_digest = WireHash256{1},
               .partition_replication_epoch = 13,
               .source_node_id = std::string(40, 'a'),
               .source_assignment_id = Id(5),
@@ -394,7 +379,7 @@ TEST(ControlProtocolCodecTest, MaximumCandidateProgressStillFitsOneFrame) {
               .group_term = 7,
               .source_group_term = 6,
               .manifest_revision = 8,
-              .manifest_digest = Sha256("manifest"),
+              .manifest_digest = WireHash256{1},
               .partition_replication_epoch = 9,
               .source_node_id = std::string(40, 'a'),
               .source_assignment_id = Id(3),
@@ -417,12 +402,12 @@ TEST(ControlProtocolCodecTest,
   control::Heartbeat heartbeat;
   heartbeat.session_id = Id(1);
   heartbeat.heartbeat_sequence = 1;
-  heartbeat.role_information = control::AuthorityLeaseRequest{
-      .challenge = {.nonce = Id(2),
-                    .projection_hash = Sha256("projection"),
-                    .group_id = "group-a",
-                    .assignment_id = Id(3),
-                    .group_term = 7}};
+  heartbeat.role_information =
+      control::AuthorityLeaseRequest{.challenge = {.nonce = Id(2),
+                                                   .control_revision = 42,
+                                                   .group_id = "group-a",
+                                                   .assignment_id = Id(3),
+                                                   .group_term = 7}};
   heartbeat.failover_observation =
       control::SourcePaused{.transition_id = Id(4),
                             .source_node_id = std::string(40, 'a'),
@@ -442,17 +427,17 @@ TEST(ControlProtocolCodecTest,
                                      .candidate_boot_id = std::string(40, 'e'),
                                      .prepared_context_id = Id(7)};
     } else if (kind == 2) {
-      heartbeat.failover_observation = control::ActionFailed{
-          .transition_id = Id(4),
-          .action_id = Id(5),
-          .candidate_node_id = std::string(40, 'd'),
-          .candidate_assignment_id = Id(6),
-          .candidate_boot_id = std::string(40, 'e'),
-          .population_manifest_revision = 10,
-          .population_manifest_digest = Sha256("manifest"),
-          .partition_replication_epoch = 11,
-          .failure_class = "durability",
-          .failure_detail = "storage barrier failed"};
+      heartbeat.failover_observation =
+          control::ActionFailed{.transition_id = Id(4),
+                                .action_id = Id(5),
+                                .candidate_node_id = std::string(40, 'd'),
+                                .candidate_assignment_id = Id(6),
+                                .candidate_boot_id = std::string(40, 'e'),
+                                .population_manifest_revision = 10,
+                                .population_manifest_digest = WireHash256{1},
+                                .partition_replication_epoch = 11,
+                                .failure_class = "durability",
+                                .failure_detail = "storage barrier failed"};
     }
     const auto encoded =
         control::EncodeMessage(control::WireMessage{heartbeat});
@@ -506,7 +491,7 @@ TEST(ControlProtocolCodecTest,
                    .group_term = 8,
                    .source_group_term = 7,
                    .manifest_revision = 10,
-                   .manifest_digest = Sha256("manifest"),
+                   .manifest_digest = WireHash256{1},
                    .partition_replication_epoch = 11,
                    .source_node_id = std::string(40, 'a'),
                    .source_assignment_id = Id(3),
@@ -525,7 +510,7 @@ TEST(ControlProtocolCodecTest,
       .candidate_assignment_id = Id(4),
       .candidate_boot_id = std::string(40, 'e'),
       .population_manifest_revision = 10,
-      .population_manifest_digest = Sha256("manifest"),
+      .population_manifest_digest = WireHash256{1},
       .partition_replication_epoch = 11,
       .failure_class = std::string(control::kMaxFailoverFailureClassBytes, 'f'),
       .failure_detail =
@@ -566,8 +551,7 @@ TEST(ControlProtocolCodecTest,
      DirectiveLifecycleKeepsRecipientDistinctFromRebuildTarget) {
   control::Directive directive{
       .session_id = Id(1),
-      .basis = {.source_meta_applied_index = 19,
-                .projection_hash = Sha256("projection")},
+      .basis = {.control_revision = 19},
       .authority = {.group_id = "group-a",
                     .assignment_id = Id(2),
                     .group_term = 3},
@@ -584,13 +568,11 @@ TEST(ControlProtocolCodecTest,
       .source_boot_id = std::string(40, 'b'),
       .source_replication_history_id = std::string(40, 'e'),
       .manifest_revision = 21,
-      .manifest_digest = Sha256("manifest"),
+      .manifest_digest = WireHash256{1},
       .partition_replication_epoch = 22,
       .kind = control::WireDirectiveKind::kAuthorizeSource,
       .payload = "authorize",
-      .preconditions = "ready",
-      .storage_mutating = false,
-      .force = false,
+
   };
   auto encoded = control::EncodeMessage(control::WireMessage{directive});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
@@ -606,17 +588,17 @@ TEST(ControlProtocolCodecTest,
       absl::StatusCode::kInvalidArgument);
   directive.kind = control::WireDirectiveKind::kAuthorizeSource;
 
-  control::DirectiveReceipt receipt{
+  control::DirectiveResponse receipt{
       .session_id = directive.session_id,
       .recipient_boot_id = directive.recipient_boot_id,
       .identity = directive.identity,
-      .stage = control::DirectiveReceiptStage::kAccepted,
+      .started = true,
   };
   encoded = control::EncodeMessage(control::WireMessage{receipt});
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  decoded = control::DecodeMessage(MessageType::kDirectiveReceipt, *encoded);
+  decoded = control::DecodeMessage(MessageType::kDirectiveResponse, *encoded);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
-  EXPECT_EQ(std::get<control::DirectiveReceipt>(*decoded), receipt);
+  EXPECT_EQ(std::get<control::DirectiveResponse>(*decoded), receipt);
 
   control::DirectiveResult result{
       .session_id = directive.session_id,
@@ -660,8 +642,7 @@ TEST(ControlProtocolCodecTest,
 TEST(ControlProtocolCodecTest, RoundTripsSourceLessPopulationInitialization) {
   control::Directive directive{
       .session_id = Id(1),
-      .basis = {.source_meta_applied_index = 19,
-                .projection_hash = Sha256("projection")},
+      .basis = {.control_revision = 19},
       .authority = {.group_id = "group-a",
                     .assignment_id = Id(2),
                     .group_term = 3},
@@ -677,14 +658,14 @@ TEST(ControlProtocolCodecTest, RoundTripsSourceLessPopulationInitialization) {
       .source_boot_id = std::string(40, '0'),
       .source_replication_history_id = std::string(40, '0'),
       .manifest_revision = 1,
-      .manifest_digest = Sha256("manifest"),
+      .manifest_digest = WireHash256{1},
       .partition_replication_epoch = 1,
       .kind = control::WireDirectiveKind::kInitializeEmptyPopulation,
       // The existing payload binds the history advertised by the target's
       // current Hello. Zero wire identities denote the absent source and can
       // never authorize a replication connection.
       .payload = std::string(40, 'c'),
-      .storage_mutating = true,
+
   };
 
   auto encoded = control::EncodeMessage(control::WireMessage{directive});
@@ -745,75 +726,13 @@ TEST(ControlProtocolCodecTest,
   EXPECT_FALSE(control::DecodeRebuildRequest(*encoded).ok());
 }
 
-TEST(ControlProtocolCodecTest,
-     OperationEvidenceCarriesSessionBootAssignmentAndFreshnessAnchors) {
-  const std::string evidence_body = "flow-0=41,flow-1=52";
-  control::OperationEvidence evidence{
-      .session_id = Id(1),
-      .reporter_boot_id = std::string(40, 'b'),
-      .assignment_id = Id(2),
-      .operation_id = Id(3),
-      .kind_phase = "promotion:durability-ready",
-      .evidence = evidence_body,
-      .group_id = "group-a",
-      .group_term = 7,
-      .manifest_revision = 11,
-      .partition_replication_epoch = 13,
-      .replication_history_id = std::string(40, 'c'),
-  };
 
-  auto encoded = control::EncodeMessage(control::WireMessage{evidence});
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  auto decoded =
-      control::DecodeMessage(MessageType::kOperationEvidence, *encoded);
-  ASSERT_TRUE(decoded.ok()) << decoded.status();
-  ASSERT_TRUE(std::holds_alternative<control::OperationEvidence>(*decoded));
-  EXPECT_EQ(std::get<control::OperationEvidence>(*decoded), evidence);
-
-  evidence.evidence.push_back('!');
-  encoded = control::EncodeMessage(control::WireMessage{evidence});
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  decoded = control::DecodeMessage(MessageType::kOperationEvidence, *encoded);
-  ASSERT_TRUE(decoded.ok()) << decoded.status();
-  EXPECT_EQ(std::get<control::OperationEvidence>(*decoded), evidence);
-  evidence.reporter_boot_id = "not-an-incarnation";
-  EXPECT_EQ(
-      control::EncodeMessage(control::WireMessage{evidence}).status().code(),
-      absl::StatusCode::kInvalidArgument);
-}
-
-TEST(ControlProtocolCodecTest, OperationEvidenceUsesObjectTransferWhenLarge) {
-  control::OperationEvidence evidence{
-      .session_id = Id(1),
-      .reporter_boot_id = std::string(40, 'b'),
-      .assignment_id = Id(2),
-      .operation_id = Id(3),
-      .kind_phase = "full-sync:progress",
-      .evidence = std::string(control::kMaxFramePayloadBytes, 'x'),
-      .group_id = "group-a",
-      .group_term = 7,
-      .manifest_revision = 11,
-      .partition_replication_epoch = 13,
-      .replication_history_id = std::string(40, 'c'),
-  };
-
-  auto encoded = control::EncodeMessage(control::WireMessage{evidence});
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  EXPECT_GT(encoded->size(), control::kMaxFramePayloadBytes);
-  EXPECT_LE(encoded->size(), control::kMaxOperationEvidenceTransferBytes);
-
-  evidence.evidence.push_back('x');
-  evidence.evidence.resize(control::kMaxOpaqueFieldBytes + 1, 'x');
-  EXPECT_EQ(
-      control::EncodeMessage(control::WireMessage{evidence}).status().code(),
-      absl::StatusCode::kResourceExhausted);
-}
 
 TEST(ControlProtocolLeaseTest, GrantMatchesOnceAndUsesOriginalSendTime) {
   control::LeaseChallengeTracker tracker;
   control::LeaseChallenge challenge{
       .nonce = Id(2),
-      .projection_hash = Sha256("projection"),
+      .control_revision = 42,
       .group_id = "group-a",
       .assignment_id = Id(3),
       .group_term = 7,
@@ -832,7 +751,7 @@ TEST(ControlProtocolLeaseTest, GrantMatchesOnceAndUsesOriginalSendTime) {
       .raft_term = 22,
       .leadership_generation = 5,
       .data_boot_id = std::string(40, 'a'),
-      .projection_hash = challenge.projection_hash,
+      .control_revision = challenge.control_revision,
       .group_id = challenge.group_id,
       .assignment_id = challenge.assignment_id,
       .group_term = challenge.group_term,
@@ -855,13 +774,11 @@ TEST(ControlProtocolLeaseTest, GrantMatchesOnceAndUsesOriginalSendTime) {
             absl::StatusCode::kDeadlineExceeded);
 }
 
-TEST(ControlProtocolFullStateTest,
-     RoundTripsTypedProjectionAndDerivesObjectHash) {
+TEST(ControlProtocolFullStateTest, RoundTripsTypedProjectionWithoutObjectHash) {
   control::FullDesiredState state;
-  state.source_meta_applied_index = 91;
+  state.control_revision = 91;
   state.topology_epoch = 23;
   state.authority_lease_duration_ms = 3'000;
-  state.projection_hash = Sha256("semantic projection");
   state.meta_directory.push_back(
       {.server_id = 1, .host = "127.0.0.1", .port = 7400});
   state.nodes.push_back({.node_id = std::string(40, 'a'),
@@ -878,18 +795,16 @@ TEST(ControlProtocolFullStateTest,
       {.node_id = state.nodes[0].node_id, .assignment_id = Id(5)});
   group.slot_ranges.push_back({.first = 0, .last = 100});
   group.manifest_revision = 15;
-  group.manifest_digest = Sha256("manifest");
+  group.manifest_digest = WireHash256{1};
   group.partition_replication_epoch = 19;
   state.groups.push_back(std::move(group));
   state.manifests.push_back(
       {.revision = 15,
-       .digest = Sha256("manifest"),
+       .digest = WireHash256{1},
        .entries = {{.partition_id = 0, .logical_epoch = 17},
                    {.partition_id = 1, .logical_epoch = 18}}});
   state.current_directives.push_back(
-      {.basis = {.source_meta_applied_index = 91,
-                 .projection_hash = state.projection_hash},
-       .authority = {.group_id = "group-a",
+      {.authority = {.group_id = "group-a",
                      .assignment_id = Id(5),
                      .group_term = 7},
        .identity = {.operation_id = Id(6),
@@ -905,18 +820,10 @@ TEST(ControlProtocolFullStateTest,
        .source_boot_id = std::string(40, 'd'),
        .source_replication_history_id = std::string(40, 'e'),
        .manifest_revision = 15,
-       .manifest_digest = Sha256("manifest"),
+       .manifest_digest = WireHash256{1},
        .partition_replication_epoch = 19,
        .kind = control::WireDirectiveKind::kRebuild,
-       .payload = "rebuild",
-       .preconditions = "empty target",
-       .storage_mutating = true,
-       .force = false});
-
-  auto projection_hash = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(projection_hash.ok()) << projection_hash.status();
-  state.projection_hash = *projection_hash;
-  state.current_directives[0].basis.projection_hash = *projection_hash;
+       .payload = "rebuild"});
 
   auto encoded = control::EncodeFullDesiredState(state);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
@@ -924,25 +831,19 @@ TEST(ControlProtocolFullStateTest,
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(*decoded, state);
 
-  // The single projection digest covers directives directly; there is no
-  // second digest that a caller must remember to recompute.
   state.current_directives[0].payload = "different rebuild";
-  auto changed = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(changed.ok()) << changed.status();
-  EXPECT_NE(*changed, *projection_hash);
-  EXPECT_EQ(control::EncodeFullDesiredState(state).status().code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_FALSE(control::SameDesiredState(state, *decoded));
+  EXPECT_TRUE(control::EncodeFullDesiredState(state).ok());
   state.current_directives[0].payload = "rebuild";
-  ++state.current_directives[0].basis.source_meta_applied_index;
-  EXPECT_EQ(control::ComputeProjectionHash(state), projection_hash);
-  EXPECT_EQ(control::EncodeFullDesiredState(state).status().code(),
-            absl::StatusCode::kInvalidArgument);
+  ++state.control_revision;
+  EXPECT_TRUE(control::SameDesiredState(state, *decoded));
+  EXPECT_TRUE(control::EncodeFullDesiredState(state).ok());
 }
 
 TEST(ControlProtocolFullStateTest,
-     RoundTripsTypedFailoverStateAndCoversItInProjectionHash) {
+     RoundTripsTypedFailoverStateAndComparesItsSemantics) {
   control::FullDesiredState state = FailoverFullState();
-  const auto original_hash = state.projection_hash;
+  const auto original = state;
 
   auto encoded = control::EncodeFullDesiredState(state);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
@@ -952,22 +853,16 @@ TEST(ControlProtocolFullStateTest,
   EXPECT_EQ(*decoded, state);
 
   state.groups[0].steady_replication_enabled = false;
-  const auto lifecycle_change = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(lifecycle_change.ok()) << lifecycle_change.status();
-  EXPECT_NE(*lifecycle_change, original_hash);
+  EXPECT_FALSE(control::SameDesiredState(state, original));
   state.groups[0].steady_replication_enabled = true;
 
   ASSERT_TRUE(state.groups[0].failover_transition.has_value());
   ++state.groups[0].failover_transition->revision;
-  const auto transition_change = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(transition_change.ok()) << transition_change.status();
-  EXPECT_NE(*transition_change, original_hash);
+  EXPECT_FALSE(control::SameDesiredState(state, original));
 
   state.groups[0].failover_transition.reset();
   state.groups[0].activation_action_id = Id(21);
-  const auto activation_change = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(activation_change.ok()) << activation_change.status();
-  EXPECT_NE(*activation_change, original_hash);
+  EXPECT_FALSE(control::SameDesiredState(state, original));
 }
 
 TEST(ControlProtocolFullStateTest, RejectsZeroLeaseAndDerivesHeartbeatCadence) {
@@ -978,9 +873,6 @@ TEST(ControlProtocolFullStateTest, RejectsZeroLeaseAndDerivesHeartbeatCadence) {
             absl::StatusCode::kInvalidArgument);
 
   state.authority_lease_duration_ms = 2;
-  auto projection_hash = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(projection_hash.ok()) << projection_hash.status();
-  state.projection_hash = *projection_hash;
   EXPECT_TRUE(control::EncodeFullDesiredState(state).ok());
   EXPECT_EQ(control::DataHeartbeatIntervalMs(2), 1u);
   EXPECT_EQ(control::DataHeartbeatIntervalMs(3'000), 1'000u);
@@ -992,48 +884,45 @@ TEST(ControlProtocolFullStateTest, RejectsMalformedFailoverState) {
   auto& transition = *state.groups[0].failover_transition;
 
   transition.mode = static_cast<control::WireFailoverMode>(99);
-  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+  EXPECT_EQ(control::ValidateFullDesiredState(state).code(),
             absl::StatusCode::kInvalidArgument);
   transition.mode = control::WireFailoverMode::kControlled;
 
   ASSERT_TRUE(transition.candidate_action.has_value());
   transition.candidate_action->domain.source_group_term =
       transition.target_term;
-  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+  EXPECT_EQ(control::ValidateFullDesiredState(state).code(),
             absl::StatusCode::kInvalidArgument);
   transition.candidate_action->domain.source_group_term = 7;
 
   transition.candidate_action->authorization->loss_if_cutover =
       control::WireFailoverLoss::kUnknown;
-  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+  EXPECT_EQ(control::ValidateFullDesiredState(state).code(),
             absl::StatusCode::kInvalidArgument);
   transition.candidate_action->authorization->loss_if_cutover =
       control::WireFailoverLoss::kNone;
 
   transition.candidate_action.reset();
-  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+  EXPECT_EQ(control::ValidateFullDesiredState(state).code(),
             absl::StatusCode::kInvalidArgument);
 
   state = FailoverFullState();
   state.groups[0].failover_transition.reset();
   state.groups[0].activation_action_id = WireId128{};
-  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+  EXPECT_EQ(control::ValidateFullDesiredState(state).code(),
             absl::StatusCode::kInvalidArgument);
 
   state.groups[0].activation_action_id = Id(1);
   state.groups[0].grant_active = false;
-  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+  EXPECT_EQ(control::ValidateFullDesiredState(state).code(),
             absl::StatusCode::kInvalidArgument);
 }
 
 TEST(ControlProtocolFullStateTest, RoundTripsEmptyTopologyAtEpochZero) {
   control::FullDesiredState state;
   SetLeaseTiming(&state);
-  state.source_meta_applied_index = 1;
+  state.control_revision = 1;
   state.topology_epoch = 0;
-  auto projection = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(projection.ok()) << projection.status();
-  state.projection_hash = *projection;
 
   auto encoded = control::EncodeFullDesiredState(state);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
@@ -1048,15 +937,12 @@ TEST(ControlProtocolFullStateTest,
      ConsumingDecodeReleasesTransferredWireStorage) {
   control::FullDesiredState state;
   SetLeaseTiming(&state);
-  state.source_meta_applied_index = 1;
+  state.control_revision = 1;
   state.meta_directory.reserve(512);
   for (std::uint32_t id = 1; id <= 512; ++id) {
     state.meta_directory.push_back(
         {.server_id = id, .host = "127.0.0.1", .port = 7400});
   }
-  auto projection = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(projection.ok()) << projection.status();
-  state.projection_hash = *projection;
 
   auto encoded = control::EncodeFullDesiredState(state);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
@@ -1084,10 +970,7 @@ TEST(ControlProtocolFullStateTest,
      FrameSizedProjectionRoundTripsAsTypedMessage) {
   control::FullDesiredState state;
   SetLeaseTiming(&state);
-  state.source_meta_applied_index = 1;
-  auto projection = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(projection.ok()) << projection.status();
-  state.projection_hash = *projection;
+  state.control_revision = 1;
 
   control::WireMessage message = state;
   EXPECT_EQ(control::MessageTypeOf(message),
@@ -1114,45 +997,34 @@ TEST(ControlProtocolFullStateTest,
 }
 
 TEST(ControlProtocolFullStateTest,
-     ProjectionHashExcludesAppliedIndexButCoversSemantics) {
+     SemanticEqualityExcludesAppliedIndexButCoversDesiredState) {
   control::FullDesiredState state;
   SetLeaseTiming(&state);
-  state.source_meta_applied_index = 10;
+  state.control_revision = 10;
   state.topology_epoch = 1;
   state.nodes.push_back(
       {.node_id = std::string(40, 'a'), .host = "127.0.0.1", .port = 6379});
   state.groups.push_back(
       {.group_id = "group-a", .partition_replication_epoch = 4});
-  auto original = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(original.ok()) << original.status();
+  const auto original = state;
 
-  state.source_meta_applied_index = 11;  // unrelated Meta commit
-  auto unrelated_commit = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(unrelated_commit.ok());
-  EXPECT_EQ(*unrelated_commit, *original);
+  state.control_revision = 11;  // unrelated Meta commit
+  EXPECT_TRUE(control::SameDesiredState(state, original));
 
   state.groups[0].partition_replication_epoch = 5;
-  auto population_epoch_change = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(population_epoch_change.ok());
-  EXPECT_NE(*population_epoch_change, *original);
+  EXPECT_FALSE(control::SameDesiredState(state, original));
   state.groups[0].partition_replication_epoch = 4;
 
   state.nodes[0].port = 6380;  // node-specific semantic change
-  auto semantic_change = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(semantic_change.ok());
-  EXPECT_NE(*semantic_change, *original);
+  EXPECT_FALSE(control::SameDesiredState(state, original));
 
   state.nodes[0].port = 6379;
   state.topology_epoch = 2;
-  auto topology_change = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(topology_change.ok());
-  EXPECT_NE(*topology_change, *original);
+  EXPECT_FALSE(control::SameDesiredState(state, original));
 
   state.topology_epoch = 1;
   state.authority_lease_duration_ms = 6'000;
-  auto lease_timing_change = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(lease_timing_change.ok()) << lease_timing_change.status();
-  EXPECT_NE(*lease_timing_change, *original);
+  EXPECT_FALSE(control::SameDesiredState(state, original));
 }
 
 TEST(ControlProtocolFullStateTest, RoundTripsCommittedGrantlessGroup) {
@@ -1168,9 +1040,6 @@ TEST(ControlProtocolFullStateTest, RoundTripsCommittedGrantlessGroup) {
            .revision = 7,
            .mode = control::WireFailoverMode::kUncontrolled,
            .target_term = 3}});
-  auto projection_hash = control::ComputeProjectionHash(state);
-  ASSERT_TRUE(projection_hash.ok()) << projection_hash.status();
-  state.projection_hash = *projection_hash;
 
   auto encoded = control::EncodeFullDesiredState(state);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
@@ -1187,7 +1056,7 @@ TEST(ControlProtocolFullStateTest, RoundTripsCommittedGrantlessGroup) {
       decoded->groups[0].failover_transition->candidate_action.has_value());
 
   state.groups[0].grant_active = true;
-  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+  EXPECT_EQ(control::ValidateFullDesiredState(state).code(),
             absl::StatusCode::kInvalidArgument);
 }
 
@@ -1199,11 +1068,11 @@ TEST(ControlProtocolFullStateTest, RejectsNonCanonicalManifestDocuments) {
       {.revision = 1,
        .entries = {{.partition_id = 9, .logical_epoch = 1},
                    {.partition_id = 8, .logical_epoch = 2}}});
-  EXPECT_EQ(control::ComputeProjectionHash(state).status().code(),
+  EXPECT_EQ(control::ValidateFullDesiredState(state).code(),
             absl::StatusCode::kInvalidArgument);
 }
 
-TEST(ControlProtocolTransferTest, StreamsOneBoundedObjectAndChecksDigest) {
+TEST(ControlProtocolTransferTest, StreamsOneBoundedObject) {
   RecordingSink sink;
   LargeObjectReassembler reassembler(sink);
   const std::string contents = "large desired state";
@@ -1211,7 +1080,6 @@ TEST(ControlProtocolTransferTest, StreamsOneBoundedObjectAndChecksDigest) {
       .kind = TransferKind::kFullDesiredState,
       .object_id = Id(7),
       .total_length = contents.size(),
-      .sha256 = Sha256(contents),
   };
 
   ASSERT_TRUE(reassembler.Accept(start).ok());
@@ -1242,7 +1110,6 @@ TEST(ControlProtocolTransferTest,
       .kind = TransferKind::kFullDesiredState,
       .object_id = Id(7),
       .total_length = 3,
-      .sha256 = Sha256("old"),
   };
   ASSERT_TRUE(reassembler.Accept(first).ok());
   ASSERT_TRUE(reassembler
@@ -1284,7 +1151,6 @@ TEST(ControlProtocolTransferTest,
       .kind = TransferKind::kFullDesiredState,
       .object_id = Id(9),
       .total_length = 3,
-      .sha256 = Sha256("new"),
   };
   ASSERT_TRUE(reassembler.Accept(latest).ok());
   ASSERT_TRUE(
@@ -1297,38 +1163,36 @@ TEST(ControlProtocolTransferTest,
   EXPECT_EQ(sink.commit_count_, 1);
 }
 
-TEST(ControlProtocolTransferTest, RejectsOversizeAndAbortsDigestMismatch) {
+TEST(ControlProtocolTransferTest, RejectsOversizeAndIncompleteObjects) {
   RecordingSink sink;
   LargeObjectReassembler reassembler(sink);
   TransferStart start{
       .kind = TransferKind::kFullDesiredState,
       .object_id = Id(9),
       .total_length = control::kMaxFullDesiredStateBytes + 1,
-      .sha256 = {},
   };
   EXPECT_EQ(reassembler.Accept(start).code(),
             absl::StatusCode::kResourceExhausted);
   EXPECT_EQ(sink.begin_count_, 0);
 
   start.total_length = 3;
-  start.sha256 = Sha256("good");
   ASSERT_TRUE(reassembler.Accept(start).ok());
-  ASSERT_TRUE(
-      reassembler
-          .Accept(TransferChunk{
-              .object_id = start.object_id, .offset = 0, .bytes = "bad"})
-          .ok());
+  ASSERT_TRUE(reassembler
+                  .Accept(TransferChunk{
+                      .object_id = start.object_id, .offset = 0, .bytes = "ba"})
+                  .ok());
   EXPECT_EQ(reassembler.Accept(TransferEnd{start.object_id}).code(),
-            absl::StatusCode::kDataLoss);
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(sink.commit_count_, 0);
+  EXPECT_TRUE(reassembler.active());
+  ASSERT_TRUE(reassembler.Accept(control::TransferAbort{start.object_id}).ok());
   EXPECT_EQ(sink.abort_count_, 1);
   EXPECT_FALSE(reassembler.active());
 }
 
 TEST(ControlProtocolTransferTest, EnforcesPerEnvelopeTransferCaps) {
-  const std::array<std::pair<TransferKind, std::uint64_t>, 4> cases{{
+  const std::array<std::pair<TransferKind, std::uint64_t>, 3> cases{{
       {TransferKind::kFullDesiredState, control::kMaxFullDesiredStateBytes},
-      {TransferKind::kObservationEvidence,
-       control::kMaxOperationEvidenceTransferBytes},
       {TransferKind::kDirectivePayload, control::kMaxDirectiveTransferBytes},
       {TransferKind::kDirectiveResult,
        control::kMaxDirectiveResultTransferBytes},
@@ -1362,9 +1226,76 @@ TEST(ControlProtocolIdentityTest, GeneratesCanonicalIndependentIdentities) {
   EXPECT_NE(*id128_a, *id128_b);
 }
 
-TEST(ControlProtocolIdentityTest, UsesStandardSha256) {
-  EXPECT_EQ(Hex(Sha256("abc")),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+TEST(ControlNodeStateTest, RemoteWorkDoesNotAdvanceLocalControl) {
+  control::FullDesiredState bootstrap;
+  bootstrap.control_revision = 42;
+  bootstrap.groups = {{.group_id = "local", .members = {{"self", Id(1)}}},
+                      {.group_id = "remote", .members = {{"other", Id(2)}}}};
+  auto before = control::SelectNodeControlState(bootstrap, "self");
+  ASSERT_EQ(before.local.groups.size(), 1);
+  bootstrap.control_revision = 900;
+  bootstrap.groups.back().failover_transition =
+      control::WireFailoverTransition{};
+  bootstrap.groups.back().manifest_revision = 5;
+  auto after = control::SelectNodeControlState(bootstrap, "self");
+  auto update = control::DiffNodeControlState(before, after);
+  EXPECT_FALSE(update.local);
+  EXPECT_FALSE(update.routing);
+  EXPECT_FALSE(update.tasks);
+  EXPECT_EQ(after.local.revision, 42);
+  bootstrap.groups.back().group_term = 2;
+  after = control::SelectNodeControlState(bootstrap, "self");
+  update = control::DiffNodeControlState(before, after);
+  EXPECT_TRUE(update.routing);
+  EXPECT_FALSE(update.local);
+}
+
+TEST(ControlNodeStateTest, TaskDeltaIsAtomicIdempotentAndIndependent) {
+  control::NodeControlState state;
+  state.local.revision = 7;
+  state.tasks_revision = 1;
+  control::NodeControlUpdate update;
+  control::WireProjectedDirective task;
+  task.identity = {Id(1), Id(2), Id(3), 1};
+  update.tasks = control::TaskChanges{1, 2, {task}, {}};
+  ASSERT_TRUE(control::ApplyNodeControlUpdate(state, update).ok());
+  ASSERT_TRUE(control::ApplyNodeControlUpdate(state, update).ok());
+  EXPECT_EQ(state.tasks.size(), 1);
+  EXPECT_EQ(state.local.revision, 7);
+  auto invalid = update;
+  invalid.local = control::LocalGroupState{.revision = 8};
+  invalid.tasks->revision = 4;
+  EXPECT_FALSE(control::ApplyNodeControlUpdate(state, invalid).ok());
+  EXPECT_EQ(state.local.revision, 7);
+  auto next = state;
+  next.tasks.clear();
+  auto removal = control::DiffNodeControlState(state, next);
+  ASSERT_TRUE(removal.tasks);
+  EXPECT_TRUE(removal.tasks->upserts.empty());
+  ASSERT_TRUE(control::ApplyNodeControlUpdate(state, removal).ok());
+  EXPECT_TRUE(state.tasks.empty());
+  ASSERT_TRUE(control::ApplyNodeControlUpdate(state, update).ok());
+  EXPECT_TRUE(state.tasks.empty());
+}
+
+TEST(ControlNodeStateTest, UpdateRoundTripAndConflictingRevision) {
+  control::NodeControlUpdate update;
+  update.request_id = Id(1);
+  update.local =
+      control::LocalGroupState{.revision = 3, .lease_duration_ms = 5000};
+  update.directory = control::MetaDirectoryState{.revision = 2};
+  auto bytes = control::EncodeNodeControlUpdate(update);
+  ASSERT_TRUE(bytes.ok()) << bytes.status();
+  auto decoded = control::DecodeNodeControlUpdate(*bytes);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, update);
+  control::NodeControlState state;
+  ASSERT_TRUE(control::ApplyNodeControlUpdate(state, update).ok());
+  update.local->lease_duration_ms = 1000;
+  EXPECT_FALSE(control::ApplyNodeControlUpdate(state, update).ok());
+  update.local->revision = 2;
+  ASSERT_TRUE(control::ApplyNodeControlUpdate(state, update).ok());
+  EXPECT_EQ(state.local.lease_duration_ms, 5000);
 }
 
 }  // namespace

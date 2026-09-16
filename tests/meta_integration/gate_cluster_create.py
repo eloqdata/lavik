@@ -1518,15 +1518,21 @@ class DirectiveBarrier(H.Proxy):
                 if magic != 0x4b4c4350 or version != 1 or size > (1 << 20):
                     raise H.Failure("unexpected control frame")
                 payload = exact(size)
-                if kind == (14 if self.result else 12):
+                # NodeControlUpdate starts with request id and optional task delta.
+                # The barrier holds the actual task delivery, whose body is no
+                # longer resent as a separate Directive after FDS installation.
+                task_offset = None
+                if kind == 19 and len(payload) >= 37 and payload[16]:
+                    upserts = struct.unpack_from(">I", payload, 33)[0]
+                    if upserts:
+                        task_offset = 37
+                if (self.result and kind == 14) or (not self.result and task_offset is not None):
                     blocked, release = self.blocked, self.release
                     if self.recipients:
-                        # Skip session/basis, the length-prefixed Group id,
-                        # assignment id/term, and operation/directive/attempt
-                        # ids plus directive revision. Keep these field sizes
-                        # aligned with Encode(Directive)'s term-only authority.
-                        group_size = struct.unpack_from(">I", payload, 56)[0]
-                        recipient_offset = 56 + 4 + group_size + 16 + 8 + 3 * 16 + 8
+                        # A task starts with the Group authority anchor and
+                        # operation/directive/attempt identity, then recipient.
+                        group_size = struct.unpack_from(">I", payload, task_offset)[0]
+                        recipient_offset = task_offset + 4 + group_size + 16 + 8 + 3 * 16 + 8
                         recipient = payload[recipient_offset:recipient_offset + 40].decode()
                         events = self.recipients.get(recipient)
                         if events is None or events[0].is_set():

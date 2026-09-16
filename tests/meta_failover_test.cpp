@@ -280,7 +280,7 @@ struct ProposalFixture {
 
   BeginUncontrolledFailover UncontrolledBegin(bool with_candidate) const {
     const auto group = stores.topology_.FindGroup("g1");
-    const auto grant_state = stores.grant_.GroupState("g1");
+    const auto grant_state = stores.topology_.AuthorityFor("g1");
     EXPECT_TRUE(group.has_value());
     EXPECT_TRUE(grant_state.has_value());
     EXPECT_TRUE(grant_state->grant_.has_value());

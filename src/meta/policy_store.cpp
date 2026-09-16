@@ -312,8 +312,7 @@ std::optional<MetaAuthorityLeasePolicy> MetaPolicyStore::CurrentAuthorityLease()
   return *decoded;
 }
 
-std::string MetaPolicyStore::Serialize() const {
-  MetaWriter writer;
+void MetaPolicyStore::WriteSnapshot(MetaWriter& writer) const {
   writer.WriteU16(kMetaFormatVersion);
   writer.WriteCount(static_cast<std::uint32_t>(policies_.size()));
   for (const auto& [policy_id, versions] : policies_) {
@@ -324,7 +323,18 @@ std::string MetaPolicyStore::Serialize() const {
       writer.WriteString(state);
     }
   }
+}
+
+std::string MetaPolicyStore::Serialize() const {
+  MetaWriter writer;
+  WriteSnapshot(writer);
   return writer.TakeBuffer();
+}
+
+std::uint64_t MetaPolicyStore::SerializedSize() const {
+  MetaWriter counter(false);
+  WriteSnapshot(counter);
+  return counter.size();
 }
 
 absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(

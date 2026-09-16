@@ -21,21 +21,29 @@ MetaFailureClass MetaFailureClassOf(const absl::Status& status) {
 }
 
 void MetaWriter::WriteU8(std::uint8_t v) {
+  size_ += 1;
+  if (!retain_bytes_) return;
   buffer_.push_back(static_cast<char>(v));
 }
 
 void MetaWriter::WriteU16(std::uint16_t v) {
+  size_ += 2;
+  if (!retain_bytes_) return;
   buffer_.push_back(static_cast<char>(v & 0xFF));
   buffer_.push_back(static_cast<char>((v >> 8) & 0xFF));
 }
 
 void MetaWriter::WriteU32(std::uint32_t v) {
+  size_ += 4;
+  if (!retain_bytes_) return;
   for (unsigned shift = 0; shift < 32; shift += 8) {
     buffer_.push_back(static_cast<char>((v >> shift) & 0xFF));
   }
 }
 
 void MetaWriter::WriteU64(std::uint64_t v) {
+  size_ += 8;
+  if (!retain_bytes_) return;
   for (unsigned shift = 0; shift < 64; shift += 8) {
     buffer_.push_back(static_cast<char>((v >> shift) & 0xFF));
   }
@@ -43,11 +51,14 @@ void MetaWriter::WriteU64(std::uint64_t v) {
 
 void MetaWriter::WriteBool(bool value) { WriteU8(value ? 1 : 0); }
 
-void MetaWriter::WriteRaw(std::string_view bytes) { buffer_.append(bytes); }
+void MetaWriter::WriteRaw(std::string_view bytes) {
+  size_ += bytes.size();
+  if (retain_bytes_) buffer_.append(bytes);
+}
 
 void MetaWriter::WriteString(std::string_view bytes) {
   WriteU32(static_cast<std::uint32_t>(bytes.size()));
-  buffer_.append(bytes);
+  WriteRaw(bytes);
 }
 
 void MetaWriter::WriteCount(std::uint32_t count) { WriteU32(count); }

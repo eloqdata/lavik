@@ -34,7 +34,10 @@ and Celer's [network architecture](../../celer/docs/architecture/networking.md).
 A separate `keylane-meta` executable runs the [Raft-backed meta control
 plane](08-meta-control-plane.md). It owns committed cluster metadata,
 leader-local observations, authenticated administration, and coordination
-plus process-lifetime Data-control sessions. Initial creation, Meta-member
+plus process-lifetime Data-control sessions. Six durable stores share one Raft
+state machine; Topology owns each Group's sole term, owner, authority and
+failover state. Data consumes a complete bootstrap once, then independent
+routing, local control and task updates. Initial creation, Meta-member
 addition/removal, and per-Group failover are recovered by the current leader,
 independent of an Admin client's connection or wait deadline. It links the
 pinned NuRaft submodule, whose native Asio service owns Raft peer communication;
@@ -248,9 +251,9 @@ cleanup as another durable phase.
   manifest, or partition replication epoch anchor becomes stale. Failover
   source-pause, prepared-candidate, and action-failure observations remain
   independent of the steady-state heartbeat role and are re-reported after a
-  Meta leader change. Operation evidence additionally binds committed
-  operation/history state; candidate history is instead checked against the
-  authenticated `ClientHello` session.
+  Meta leader change. Candidate history is checked against the authenticated
+  `ClientHello` session; task completion uses an idempotent terminal result
+  and Raft commit acknowledgement.
 - Data nodes restore no positive serving authority, desired-state checkpoint,
   or directive outcome from their data files. Each restart begins fenced with
   a new boot identity; only a current Meta session and unexpired in-memory

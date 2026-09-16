@@ -170,8 +170,8 @@ class ControlSessionWriter {
   // Sends canonical EncodeFullDesiredState output through the reliable lane
   // when it fits one frame. Only an oversized object enters the serialized
   // Start/Chunk/End transfer path, where bulk chunks remain preemptible by
-  // authority and reliable frames. Every FDS validates its semantic projection
-  // hash; streamed objects additionally validate the transfer digest.
+  // authority and reliable frames. FDS schema validation precedes installation;
+  // streamed objects also require contiguous offsets and exact total length.
   celer::Task<absl::Status> WriteFullDesiredState(
       std::shared_ptr<const std::string> encoded);
 

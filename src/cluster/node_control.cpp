@@ -72,20 +72,27 @@ struct BootLocalPopulationAnchor {
                          const BootLocalPopulationAnchor&) = default;
 };
 
+const PreparedGroupControlIdentity* FindControlIdentity(
+    std::span<const DesiredClusterControl> controls,
+    std::string_view group_id) {
+  const auto found =
+      std::find_if(controls.begin(), controls.end(),
+                   [group_id](const DesiredClusterControl& control) {
+                     return control.identity_.group_id_ == group_id;
+                   });
+  return found == controls.end() ? nullptr : &found->identity_;
+}
+
 std::optional<BootLocalPopulationAnchor> PopulationAnchorFor(
     const ServingState& state, const GroupView& group,
-    std::span<const PreparedGroupControlIdentity> control_groups) {
+    std::span<const DesiredClusterControl> controls) {
   const NodeDescriptor* self = state.Self();
   const NodeDescriptor* owner = state.NodeAt(group.primary_node_index_);
   if (self == nullptr || owner == nullptr || !LocalMember(state, group)) {
     return std::nullopt;
   }
-  const auto control_group =
-      std::find_if(control_groups.begin(), control_groups.end(),
-                   [&](const PreparedGroupControlIdentity& candidate) {
-                     return candidate.group_id_ == group.group_id_;
-                   });
-  if (control_group == control_groups.end()) return std::nullopt;
+  const auto* control_group = FindControlIdentity(controls, group.group_id_);
+  if (control_group == nullptr) return std::nullopt;
   const auto local_member = std::find_if(
       control_group->members_.begin(), control_group->members_.end(),
       [&](const PreparedMemberAssignment& member) {
@@ -323,14 +330,9 @@ absl::Status NodeControlInstaller::ValidateProjection(
     return absl::FailedPreconditionError(
         "no full desired state has been installed");
   }
-  if (basis.source_meta_applied_index_ >
-      projection_basis_->source_meta_applied_index_) {
+  if (basis.control_revision_ != projection_basis_->control_revision_) {
     return absl::FailedPreconditionError(
-        "control message depends on a future Meta projection");
-  }
-  if (basis.projection_hash_ != projection_basis_->projection_hash_) {
-    return absl::FailedPreconditionError(
-        "control message projection hash is not current");
+        "control message does not reference the installed Meta projection");
   }
   return absl::OkStatus();
 }
@@ -360,12 +362,7 @@ absl::Status NodeControlInstaller::ValidateAnchor(
 
 const PreparedGroupControlIdentity* NodeControlInstaller::FindControlGroup(
     std::string_view group_id) const {
-  const auto group =
-      std::find_if(control_groups_.begin(), control_groups_.end(),
-                   [group_id](const PreparedGroupControlIdentity& candidate) {
-                     return candidate.group_id_ == group_id;
-                   });
-  return group == control_groups_.end() ? nullptr : &*group;
+  return FindControlIdentity(desired_cluster_controls_, group_id);
 }
 
 const PreparedMemberAssignment* NodeControlInstaller::FindMemberAssignment(
@@ -385,7 +382,8 @@ NodeControlInstaller::DesiredLocalPopulation() const {
     return std::optional<PopulationReadiness>{};
   }
   std::optional<PopulationReadiness> desired;
-  for (const PreparedGroupControlIdentity& control_group : control_groups_) {
+  for (const auto& control : desired_cluster_controls_) {
+    const auto& control_group = control.identity_;
     const PreparedMemberAssignment* local_member =
         FindMemberAssignment(control_group, current->Self()->node_id_);
     if (local_member == nullptr) continue;
@@ -490,9 +488,9 @@ NodeControlInstaller::ValidateLeaseGrantContext(const AuthorityMessage& message,
   // stronger committed owner/action validation below.
   if (!desired->has_value()) return *desired;
   const DesiredClusterControl& control = **desired;
-  // The FDS carries the duration already resolved from the current global
-  // Policy and the Meta Leader's leadership-validity limit. The grant must
-  // repeat that scalar exactly so projection identity and finite authority
+  // The local control carries the duration already resolved from the current
+  // global Policy and the Meta Leader's leadership-validity limit. The grant
+  // must repeat that scalar exactly so projection identity and finite authority
   // cannot describe different lease contracts.
   if (control.identity_.group_id_ != message.anchor_.group_id_ ||
       control.identity_.group_term_ != message.anchor_.group_term_ ||
@@ -604,7 +602,8 @@ absl::Status NodeControlInstaller::ValidateDirectiveAnchor(
       FindControlGroup(directive.anchor_.group_id_);
   if (control_group == nullptr) {
     return absl::FailedPreconditionError(
-        "directive group is absent from the installed FDS identities");
+        "directive group is absent from the installed local control "
+        "identities");
   }
   if (control_group->group_term_ != directive.anchor_.group_term_ ||
       control_group->partition_replication_epoch_ !=
@@ -657,10 +656,6 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
   }
   const bool initializes_empty =
       directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation;
-  if (directive.force_) {
-    return absl::InvalidArgumentError(
-        "directive force is reserved in control protocol v1");
-  }
   const bool initialization_payload_valid =
       directive.payload_.size() == 40 &&
       std::all_of(directive.payload_.begin(), directive.payload_.end(),
@@ -668,10 +663,8 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
                     return (value >= '0' && value <= '9') ||
                            (value >= 'a' && value <= 'f');
                   });
-  if (initializes_empty
-          ? (!initialization_payload_valid || !directive.preconditions_.empty())
-          : (!directive.payload_.empty() ||
-             !directive.preconditions_.empty())) {
+  if (initializes_empty ? !initialization_payload_valid
+                        : !directive.payload_.empty()) {
     return absl::InvalidArgumentError(
         "directive kind does not match its opaque field schema");
   }
@@ -725,8 +718,7 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
         group != nullptr &&
         group->primary_node_index_ == current->SelfNodeIndex() &&
         group->granted_ && group->population_ready_ && group->storage_ready_;
-    if (!directive.storage_mutating_ ||
-        (!replay_lookup && local_serving_owner)) {
+    if (!replay_lookup && local_serving_owner) {
       return absl::FailedPreconditionError(
           "population mutation requires a non-serving local target assignment");
     }
@@ -740,9 +732,6 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
              DrainPending(directive.anchor_.group_id_)) {
     return absl::UnavailableError(
         "source authorization waits for the retired assignment to drain");
-  } else if (directive.storage_mutating_) {
-    return absl::InvalidArgumentError(
-        "only population directives may mutate storage");
   }
   if (directive.kind_ != NodeDirective::Kind::kRevokeSources &&
       ((initializes_empty ? directive.flow_count_ != 0
@@ -972,14 +961,15 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
   if (prepared_state.serving_state_ == nullptr) {
     return absl::InvalidArgumentError("full desired state is empty");
   }
-  if (!prepared_state.control_groups_.empty()) {
+  if (!prepared_state.desired_cluster_controls_.empty()) {
     std::set<std::string> group_ids;
-    for (const PreparedGroupControlIdentity& control_group :
-         prepared_state.control_groups_) {
+    for (const auto& control : prepared_state.desired_cluster_controls_) {
+      const auto& control_group = control.identity_;
       if (control_group.group_id_.empty() ||
           !group_ids.insert(control_group.group_id_).second) {
         return absl::InvalidArgumentError(
-            "prepared FDS control group identity is empty or duplicated");
+            "prepared local control control group identity is empty or "
+            "duplicated");
       }
       const bool empty_manifest =
           std::all_of(control_group.manifest_digest_.begin(),
@@ -987,14 +977,15 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
                       [](std::uint8_t byte) { return byte == 0; });
       if ((control_group.manifest_revision_ == 0) != empty_manifest) {
         return absl::InvalidArgumentError(
-            "prepared FDS manifest identity is partial");
+            "prepared local control manifest identity is partial");
       }
       std::set<NodeId> member_ids;
       for (const PreparedMemberAssignment& member : control_group.members_) {
         if (member.node_id_.empty() || member.assignment_id_.empty() ||
             !member_ids.insert(member.node_id_).second) {
           return absl::InvalidArgumentError(
-              "prepared FDS member identity is incomplete or duplicated");
+              "prepared local control member identity is incomplete or "
+              "duplicated");
         }
       }
       const GroupView* serving_group =
@@ -1004,21 +995,16 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
            serving_group->manifest_revision_ !=
                control_group.manifest_revision_)) {
         return absl::InvalidArgumentError(
-            "prepared FDS control identity disagrees with its serving group");
-      }
-    }
-    for (const GroupView& serving_group :
-         prepared_state.serving_state_->Groups()) {
-      if (!group_ids.contains(serving_group.group_id_)) {
-        return absl::InvalidArgumentError(
-            "prepared FDS serving group has no control identity");
+            "prepared local control control identity disagrees with its "
+            "serving group");
       }
     }
   }
   if (!prepared_state.desired_cluster_controls_.empty()) {
     if (prepared_state.authority_lease_duration_ms_ == 0) {
       return absl::InvalidArgumentError(
-          "prepared Meta FDS has no effective Authority Lease duration");
+          "prepared Meta local control has no effective Authority Lease "
+          "duration");
     }
     std::set<std::string> desired_group_ids;
     for (const DesiredClusterControl& desired :
@@ -1027,17 +1013,6 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
           !desired_group_ids.insert(desired.identity_.group_id_).second) {
         return absl::InvalidArgumentError(
             "prepared desired cluster control is empty or duplicated");
-      }
-      const auto identity = std::find_if(
-          prepared_state.control_groups_.begin(),
-          prepared_state.control_groups_.end(),
-          [&](const PreparedGroupControlIdentity& candidate) {
-            return candidate.group_id_ == desired.identity_.group_id_;
-          });
-      if (identity == prepared_state.control_groups_.end() ||
-          *identity != desired.identity_) {
-        return absl::InvalidArgumentError(
-            "prepared desired cluster control disagrees with group identity");
       }
       if (desired.owner_.has_value() &&
           std::find(desired.identity_.members_.begin(),
@@ -1053,28 +1028,13 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
     }
   }
   if (projection_basis_.has_value()) {
-    if (projection_basis.source_meta_applied_index_ <
-        projection_basis_->source_meta_applied_index_) {
+    if (projection_basis.control_revision_ <
+        projection_basis_->control_revision_) {
       return absl::OutOfRangeError("full desired state source index regressed");
     }
-    if (projection_basis.source_meta_applied_index_ ==
-        projection_basis_->source_meta_applied_index_) {
-      if (projection_basis == *projection_basis_) {
-        // Semantic replay can follow a control-session refresh. Source
-        // admission was cleared at disconnect, but a population export that was
-        // already ONLINE remains safe while the old lease is invalid and the
-        // same semantic desired state is being re-established.
-        effects->preserve_current_population_exports_ = true;
-        return absl::OkStatus();
-      }
-      // One applied index cannot name two semantic projections. Drop all memory
-      // authority; retaining the connection would let a corrupt or Byzantine
-      // peer keep extending a lease after equivocation.
-      authority_.InvalidateAll();
-      effects->revoke_sources_ = true;
-      return absl::DataLossError(
-          "full desired state equivocated at one Meta applied index");
-    }
+    // An equal committed index may be reinstalled after reconnect. Its local
+    // lease ceiling can differ on the new Meta leader, so run the ordinary
+    // replacement path rather than restoring the prior session's lease context.
   }
 
   const bool readiness_already_normalized =
@@ -1098,10 +1058,11 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
       if (!old_group.population_ready_) continue;
       const GroupView* new_group = next->FindGroup(old_group.group_id_);
       if (new_group == nullptr || new_group->population_ready_) continue;
-      const auto old_anchor =
-          PopulationAnchorFor(*before, old_group, std::span(control_groups_));
+      const auto old_anchor = PopulationAnchorFor(
+          *before, old_group, std::span(desired_cluster_controls_));
       const auto new_anchor = PopulationAnchorFor(
-          *next, *new_group, std::span(prepared_state.control_groups_));
+          *next, *new_group,
+          std::span(prepared_state.desired_cluster_controls_));
       if (old_anchor.has_value() && old_anchor == new_anchor) {
         carried_ready_groups.insert(old_group.group_id_);
       }
@@ -1126,14 +1087,11 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
     if (next->topology_epoch() < before->topology_epoch()) {
       return absl::FailedPreconditionError("topology epoch regressed");
     }
-    for (const PreparedGroupControlIdentity& old_group : control_groups_) {
-      const auto new_group = std::find_if(
-          prepared_state.control_groups_.begin(),
-          prepared_state.control_groups_.end(),
-          [&old_group](const PreparedGroupControlIdentity& candidate) {
-            return candidate.group_id_ == old_group.group_id_;
-          });
-      if (new_group == prepared_state.control_groups_.end()) continue;
+    for (const auto& old_control : desired_cluster_controls_) {
+      const auto& old_group = old_control.identity_;
+      const auto* new_group = FindControlIdentity(
+          prepared_state.desired_cluster_controls_, old_group.group_id_);
+      if (new_group == nullptr) continue;
       if (new_group->partition_replication_epoch_ <
           old_group.partition_replication_epoch_) {
         return absl::FailedPreconditionError(
@@ -1218,12 +1176,8 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
       const GroupView* new_group = next->FindGroup(old_group.group_id_);
       const PreparedGroupControlIdentity* old_control =
           FindControlGroup(old_group.group_id_);
-      const auto new_control =
-          std::find_if(prepared_state.control_groups_.begin(),
-                       prepared_state.control_groups_.end(),
-                       [&](const PreparedGroupControlIdentity& candidate) {
-                         return candidate.group_id_ == old_group.group_id_;
-                       });
+      const auto* new_control = FindControlIdentity(
+          prepared_state.desired_cluster_controls_, old_group.group_id_);
       // Desired-state projection excludes the boot-local ReadyToken. The
       // installer above reattaches it only for an equal population anchor;
       // legacy export retention is stricter and additionally requires the
@@ -1237,8 +1191,7 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
             new_group->primary_node_index_ == next->SelfNodeIndex() &&
             new_group->granted_ == old_group.granted_ &&
             new_group->storage_ready_ == old_group.storage_ready_ &&
-            old_control != nullptr &&
-            new_control != prepared_state.control_groups_.end() &&
+            old_control != nullptr && new_control != nullptr &&
             *old_control == *new_control;
       }
       const bool authority_changed =
@@ -1277,7 +1230,6 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
   topology_.Publish(next);
   projection_basis_ = projection_basis;
   authority_lease_duration_ms_ = prepared_state.authority_lease_duration_ms_;
-  control_groups_ = std::move(prepared_state.control_groups_);
   desired_cluster_controls_ =
       std::move(prepared_state.desired_cluster_controls_);
   for (const AuthorityAnchor& anchor : retired) {
@@ -1291,6 +1243,18 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
       preserve_current_population_exports;
   effects->retired_ = std::move(retired);
   return absl::OkStatus();
+}
+
+absl::Status NodeControlInstaller::InstallRouting(PreparedFullState prepared) {
+  if (!projection_basis_ ||
+      prepared.desired_cluster_controls_ != desired_cluster_controls_ ||
+      prepared.authority_lease_duration_ms_ != authority_lease_duration_ms_) {
+    return absl::FailedPreconditionError(
+        "routing update changes local control");
+  }
+  FullStateEffects effects;
+  return InstallFullStateLocal(std::move(prepared), *projection_basis_,
+                               &effects);
 }
 
 celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
@@ -1315,14 +1279,15 @@ celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
       std::optional<DesiredClusterControl>{});
   if (local.ok()) desired_cluster_control = DesiredLocalClusterControl();
 
-  // Every replacement clears current export capabilities. An exact live FDS
-  // may keep every already-published POPULATION export, including one not yet
-  // ONLINE, because the replacement has proven the same source/population
-  // scope. Any stronger transition joins and revokes the old session. The
-  // async seam makes FullStateApplied a real join boundary instead of an
-  // enqueue receipt. Target population reconciliation runs under the same
-  // exclusion counter: no directive may start after FDS publication but
-  // before an invalidated native session and partial storage root are joined.
+  // Every replacement clears current export capabilities. An exact live local
+  // control may keep every already-published POPULATION export, including one
+  // not yet ONLINE, because the replacement has proven the same
+  // source/population scope. Any stronger transition joins and revokes the old
+  // session. The async seam makes FullStateApplied a real join boundary instead
+  // of an enqueue receipt. Target population reconciliation runs under the same
+  // exclusion counter: no directive may start after local control publication
+  // but before an invalidated native session and partial storage root are
+  // joined.
   absl::Status actions = co_await WaitForDirectiveAdmissions();
   if (effects.revoke_sources_) {
     RetireAllLeaseSchedules();
@@ -1359,12 +1324,12 @@ celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
     }
     actions = FirstFailure(std::move(actions), std::move(reconciled));
   }
-  // Even an internally inconsistent FDS must leave the local population
-  // fail-closed and join the old session's work before the failed transfer
-  // tears down its socket.
-  // Storage loss may have raced the preceding session-clear await. The FDS is
-  // still useful as fail-closed topology truth, but this boot must never feed
-  // a non-empty desired population back into ReplicationManager afterwards.
+  // Even an internally inconsistent local control must leave the local
+  // population fail-closed and join the old session's work before the failed
+  // transfer tears down its socket. Storage loss may have raced the preceding
+  // session-clear await. The local control is still useful as fail-closed
+  // topology truth, but this boot must never feed a non-empty desired
+  // population back into ReplicationManager afterwards.
   const std::optional<PopulationReadiness> reconciled_population =
       !storage_failed_ && desired_population.ok()
           ? *desired_population
@@ -1653,7 +1618,7 @@ celer::Task<absl::Status> NodeControlInstaller::FinishExpiredLeaseTransition(
   result =
       FirstFailure(std::move(result), co_await WaitForDirectiveAdmissions());
   // Expiration closes new source admission inside RevokeExpirationAuthority,
-  // but retains current FDS capabilities and every already-published
+  // but retains current local control capabilities and every already-published
   // POPULATION session. A committed fence, session loss, or population
   // identity change uses the stronger capability/session cleanup path.
   result = FirstFailure(std::move(result), actions_.DrainAssignment(anchor));
@@ -1740,9 +1705,10 @@ celer::Task<NodeDirectiveCompletion> NodeControlInstaller::StartDirective(
     return NodeDirectiveCompletion::Rejected(std::move(status));
   };
   // Re-reporting an exact completed result is not a storage mutation. Keep
-  // all session/FDS/fence/identity checks, but do not require an already-Ready
-  // owner to stop serving or drain client writes merely to repeat its result.
-  // The adapter's lookup cannot start work; no match uses every normal guard.
+  // all session/local control/fence/identity checks, but do not require an
+  // already-Ready owner to stop serving or drain client writes merely to repeat
+  // its result. The adapter's lookup cannot start work; no match uses every
+  // normal guard.
   if (directive.kind_ == NodeDirective::Kind::kReplication ||
       directive.kind_ == NodeDirective::Kind::kInitializeEmptyPopulation) {
     if (auto valid =
@@ -1779,7 +1745,8 @@ celer::Task<NodeDirectiveCompletion> NodeControlInstaller::StartDirective(
   }
   // Both readiness publication and NodeControlActions admission can suspend.
   // Recheck immediately before crossing into the action adapter; a fence,
-  // FDS, or session-loss generation observed in between owns this attempt.
+  // local control, or session-loss generation observed in between owns this
+  // attempt.
   if (admission_generation != directive_admission_generation_) {
     co_return terminal(absl::FailedPreconditionError(
         "directive admission was invalidated by a control transition"));
@@ -1951,7 +1918,7 @@ NodeControlInstaller::SetPopulationReadinessTransitionImpl(
     co_return matched
         ? absl::OkStatus()
         : absl::FailedPreconditionError(
-              "population proof does not match the installed FDS");
+              "population proof does not match the installed local control");
   }
   const bool revoking = readiness_lost;
   if (revoking) {
@@ -1970,9 +1937,10 @@ NodeControlInstaller::SetPopulationReadinessTransitionImpl(
   }
 
   absl::Status result =
-      matched ? absl::OkStatus()
-              : absl::FailedPreconditionError(
-                    "population proof does not match the installed FDS");
+      matched
+          ? absl::OkStatus()
+          : absl::FailedPreconditionError(
+                "population proof does not match the installed local control");
   if (revoking) {
     if (invalidate_directive_admissions) {
       result = FirstFailure(std::move(result),

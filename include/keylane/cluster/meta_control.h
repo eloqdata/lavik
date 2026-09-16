@@ -18,4 +18,9 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     const control::FullDesiredState& desired, std::string_view local_node_id,
     std::size_t request_worker_count);
 
+// Validates selected node state and derives routing plus local execution state.
+absl::StatusOr<PreparedFullState> PrepareNodeControlState(
+    const control::NodeControlState& state, std::string_view local_node_id,
+    std::size_t request_worker_count);
+
 }  // namespace keylane::cluster

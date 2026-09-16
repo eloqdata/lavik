@@ -56,15 +56,12 @@
 // escape valve, keeping every collection bounded), archive summaries
 // by max_archived (ArchiveOperations rejects at the cap; the operator exports
 // a read-only versioned snapshot via ctl and then explicitly prunes the
-// externally retained summaries), and a
-// record's accumulated evidence summaries by
-// kMaxMetaOperationEvidencePerRecord. Live records and archive summaries each
+// externally retained summaries). Live records and archive summaries each
 // retain at most max_terminal_receipts_per_operation exact result receipts.
 //
 // Apply is a pure in-memory function: no IO, no locks, NO CLOCK (the stored
-// actor context is command-carried text), no observation access; evidence
-// summaries are persisted, never observation references. Domain rejections
-// return absl::Status of MetaFailureClass::kDomainReject. Snapshot
+// actor context is command-carried text), and no observation access. Domain
+// rejections return absl::Status of MetaFailureClass::kDomainReject. Snapshot
 // serialization is the versioned strict encoding of encoding.h; decode
 // failures (unknown version, cap violation, broken identity invariants) are
 // MetaFailureClass::kFailStop.
@@ -72,6 +69,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -83,8 +81,7 @@
 
 namespace keylane::meta {
 
-// Per-record accumulated evidence cap (deployment policy; bounded state).
-inline constexpr std::uint32_t kMaxMetaOperationEvidencePerRecord = 1024;
+inline constexpr std::uint16_t kMetaOperationStoreFormatVersion = 1;
 
 enum class MetaOperationLifecycle : std::uint8_t {
   kSubmitted = 1,
@@ -132,7 +129,6 @@ struct MetaOperationRecord {
   // commit of each authoritative directive result (exact receipt replay does
   // not bump it again).
   std::uint64_t revision_ = 0;
-  std::vector<MetaEvidenceSummary> evidence_;  // persisted summaries, in order
   std::string terminal_result_;  // Completed: result; Aborted: reason
   bool data_loss_possible_ = false;
   ActorContext actor_;  // submitter, copied from the command
@@ -219,19 +215,22 @@ class MetaOperationStore {
   std::optional<MetaTerminalReceipt> FindTerminalReceipt(
       const MetaTerminalReceiptKey& key) const;
   std::vector<MetaOperationRecord> LiveOperations() const;
+  // Borrowed records for synchronous apply/projection under the caller's
+  // immutable-view or state-machine lock. The store must outlive the range.
+  auto LiveOperationsView() const { return std::views::values(live_); }
+
   // True only for a non-terminal live record of the requested durable kind.
   // Status callers use this bounded fact instead of copying the operation
-  // journal and its evidence payloads.
+  // journal and its directive payloads.
   bool HasActiveKind(std::string_view kind) const;
   bool OperationKnown(const MetaOperationId& id) const {
     return live_.contains(id) || archived_.contains(id);
   }
   // True when the command's exact post-effect is already the record's current
-  // state. Apply uses this to preserve replay after committed evidence anchors
-  // have legitimately advanced.
+  // state. Apply preserves exact replay after committed anchors advance.
   bool TransitionAlreadyApplied(
       const keylane::meta::TransitionOperationPhase& command) const;
-  // Active operation evidence/directives retain manifest documents needed to
+  // Active directives retain manifest documents needed to
   // validate or resume their current phase.
   bool PopulationManifestInUse(const MetaHash256& digest) const;
   std::size_t ActiveCount() const { return active_count_; }  // non-terminal
@@ -247,6 +246,8 @@ class MetaOperationStore {
   // and identity invariants (unique ids/seqs, terminal-only archive) with
   // MetaFailureClass::kFailStop on violation.
   absl::StatusOr<std::string> Serialize() const;
+  // Exact durable size without allocating or copying snapshot bytes.
+  std::uint64_t SerializedSize() const;
   static absl::StatusOr<MetaOperationStore> Deserialize(
       std::string_view bytes,
       std::uint32_t max_active = kMaxMetaActiveOperations,
@@ -255,6 +256,9 @@ class MetaOperationStore {
           kMaxMetaTerminalReceiptsPerOperation);
 
  private:
+  void WriteSnapshot(MetaWriter& writer) const;
+  friend class MetaApplyRollback;
+
   std::uint32_t max_active_;
   std::uint32_t max_archived_;
   std::uint32_t max_terminal_receipts_per_operation_;

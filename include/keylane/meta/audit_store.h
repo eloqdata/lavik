@@ -131,11 +131,14 @@ class MetaAuditStore {
   // Snapshot serialization: versioned strict encoding; decode enforces caps,
   // strictly increasing indexes above the prune floor.
   absl::StatusOr<std::string> Serialize() const;
+  // Exact durable size without allocating or copying snapshot bytes.
+  std::uint64_t SerializedSize() const;
   static absl::StatusOr<MetaAuditStore> Deserialize(
       std::string_view bytes,
       std::uint32_t window_capacity = kMaxMetaAuditWindowRecords);
 
  private:
+  void WriteSnapshot(MetaWriter& writer) const;
   std::uint32_t window_capacity_;
   MetaAuditPolicy policy_ = MetaAuditPolicy::kBoundedRotate;
   std::map<std::uint64_t, MetaAuditRecord> window_;  // keyed by log index

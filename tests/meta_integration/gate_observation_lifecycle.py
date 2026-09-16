@@ -14,18 +14,16 @@ One 3-node cluster; serial phases:
    term, stale partition replication epoch, old boot incarnation under the
    current generation, and an unregistered node. The generation bump itself
    purged the earlier candidate (superseded-by-generation audit event).
-4. Operation evidence lifecycle: a history binding committed via
-   transitionop lets evidence be ACCEPTED while the operation is live;
-   forged evidence (unbound history) is rejected and the operation never
-   advances on it; after completeop retires the operation the same
-   well-formed evidence is rejected (operation-unknown-or-terminal) and the
-   commit-driven RevalidateAll drop appears as commit-stale in the ring.
+4. Committed term advancement invalidates the previously accepted candidate;
+   the old term is rejected and commit-driven RevalidateAll records the purge.
+   Reporting at the new term restores the candidate without changing durable
+   operation state.
 5. Leader-local semantics: kill -9 the leader; the NEW leader's store is
    empty (candidate query returns zero) until the node re-reports through a
    fresh session on the new leader. Committed history is verified
    unaffected by all observation traffic.
 
-Usage: gate_stale_evidence.py /path/to/keylane-meta [workdir]
+Usage: gate_observation_lifecycle.py /path/to/keylane-meta [workdir]
 """
 
 import os
@@ -61,7 +59,7 @@ def candidate_count(node, group):
 
 
 def main():
-    workdir, keep = H.make_workdir(sys.argv, "meta_integration_stale_evidence_")
+    workdir, keep = H.make_workdir(sys.argv, "meta_observations_")
     nodes = H.make_nodes(BINARY, workdir, 3)
     started = H.time.monotonic()
     try:
@@ -133,60 +131,25 @@ def main():
         H.log("phase 3: forged generation/term/epoch/boot/node all rejected "
               "and audited")
 
-        # --- phase 4: operation evidence lifecycle ------------------------
-        op_id = leader.new_op_id()
-        expect_ok(leader.submitop(op_id, "migration", "ev1", history=55),
-                  "submitop")
-        # Forged evidence (history never bound to the operation) is rejected
-        # and the operation must not advance on it.
+        # --- phase 4: commit-driven observation invalidation -------------
+        expect_ok(leader.begingroupterm(GROUP, 1, 2), "begingroupterm 1->2")
+        if candidate_count(leader, GROUP) != 0:
+            raise H.Failure("term advancement did not invalidate candidate")
         expect_err(
-            leader.obs_evidence(DATA_NODE, BOOT_A, 2, op_id, "phase1",
-                                "forged", GROUP, term=1, manifest=0,
-                                history=99),
-            "unbound-history evidence", "history-not-bound")
-        if leader.getop(op_id) != "OK submitted":
-            raise H.Failure(f"operation advanced on forged evidence: "
-                            f"{leader.getop(op_id)}")
-
-        # The submit committed history 55; well-formed evidence is accepted
-        # after the operation enters its running phase.
-        expect_ok(leader.transitionop(op_id, "phase1", 55), "transitionop")
-        expect_err(
-            leader.obs_evidence(DATA_NODE, BOOT_A, 2, op_id, "phase1",
-                                "old-generation", GROUP, term=1, manifest=0,
-                                history=55, partition_epoch=1),
-            "wrong-population-epoch evidence", "partition-epoch-mismatch")
-        expect_ok(
-            leader.obs_evidence(DATA_NODE, BOOT_A, 2, op_id, "phase1",
-                                "proof", GROUP, term=1, manifest=0,
-                                history=55),
-            "bound-history evidence while live")
-        expect_err(
-            leader.obs_evidence(DATA_NODE, BOOT_A, 2, op_id, "phase1",
-                                "forged2", GROUP, term=1, manifest=0,
-                                history=54),
-            "still-unbound history", "history-not-bound")
-        if leader.getop(op_id) != "OK running":
-            raise H.Failure(f"operation advanced on stale evidence: "
-                            f"{leader.getop(op_id)}")
-
-        # Retire the operation: the ctl's post-commit RevalidateAll purges
-        # the now-stale evidence, and re-ingestion rejects it.
-        expect_ok(leader.completeop(op_id, "done"), "completeop")
-        expect_err(
-            leader.obs_evidence(DATA_NODE, BOOT_A, 2, op_id, "phase1",
-                                "proof", GROUP, term=1, manifest=0,
-                                history=55),
-            "evidence after terminal", "operation-unknown-or-terminal")
+            leader.obs_candidate(DATA_NODE, BOOT_A, 2, GROUP,
+                                 term=1, manifest=0, history=7),
+            "candidate from previous term", "term-mismatch")
         audit = leader.obsaudit()
-        for needle in ("detail=history-not-bound",
-                       "detail=partition-epoch-mismatch",
-                       "detail=commit-stale:operation-unknown-or-terminal",
-                       "detail=operation-unknown-or-terminal"):
-            if needle not in audit:
-                raise H.Failure(f"obsaudit missing {needle!r}: {audit}")
-        H.log("phase 4: evidence accepted while live, purged and rejected "
-              "after terminal")
+        if "detail=commit-stale:term-mismatch" not in audit:
+            raise H.Failure(f"term advancement did not audit purge: {audit}")
+        expect_ok(
+            leader.obs_candidate(DATA_NODE, BOOT_A, 2, GROUP,
+                                 term=2, manifest=0, history=7),
+            "candidate from current term")
+        if candidate_count(leader, GROUP) != 1:
+            raise H.Failure("current-term candidate not visible")
+        H.log("phase 4: committed term advancement purged stale candidate; "
+              "current-term report restored it")
 
         # --- phase 5: leader-local obs, committed history unaffected ------
         for value in ("pre-kill-1", "pre-kill-2"):
@@ -210,7 +173,7 @@ def main():
                   "re-adopt on new leader")
         expect_ok(
             new_leader.obs_candidate(DATA_NODE, BOOT_A, 1, GROUP,
-                                     term=1, manifest=0, history=7),
+                                     term=2, manifest=0, history=7),
             "re-report on new leader")
         if candidate_count(new_leader, GROUP) != 1:
             raise H.Failure("re-reported candidate not visible")
@@ -232,7 +195,7 @@ def main():
         H.log(f"PASS in {elapsed:.1f}s")
         return 0
     except Exception as exc:  # noqa: BLE001 - dump everything on failure
-        print(f"[gate-stale-evidence] FAIL: {exc}", file=sys.stderr)
+        print(f"[gate-observation-lifecycle] FAIL: {exc}", file=sys.stderr)
         H.dump_node_logs(nodes)
         return 1
     finally:
@@ -246,5 +209,5 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(2)
     BINARY = sys.argv[1]
-    H.set_tag("gate-stale-evidence")
+    H.set_tag("gate-observation-lifecycle")
     sys.exit(main())

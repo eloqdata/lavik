@@ -1,3 +1,5 @@
+#include "meta_topology_test_access.h"
+
 // Store-level tests for the committed stores:
 // meta_identity_store (identity/enrollment), meta_topology_store (topology),
 // meta_policy_store (policy).
@@ -63,7 +65,7 @@ RegisterNode MakeRegister(std::uint8_t seed) {
   cmd.node_id_ = MakeNodeId(seed);
   cmd.principal_ = MakePrincipal(seed);
   cmd.endpoints_ = {"10.0.0.1:7000", "10.0.0.1:17000"};
-  cmd.capability_mask_ = 0x5;
+
   cmd.role_ = MetaNodeRole::kReplica;
   return cmd;
 }
@@ -89,7 +91,7 @@ TEST(MetaIdentityStore, RegisterNodeCreatesQueryableRecord) {
   EXPECT_EQ(record->node_id_, cmd.node_id_);
   EXPECT_EQ(record->principal_, cmd.principal_);
   EXPECT_EQ(record->endpoints_, cmd.endpoints_);
-  EXPECT_EQ(record->capability_mask_, cmd.capability_mask_);
+
   EXPECT_EQ(record->role_, cmd.role_);
   EXPECT_EQ(record->revision_, 1u);
   EXPECT_FALSE(record->retired_);
@@ -222,7 +224,7 @@ UpdateNode MakeUpdate(std::uint8_t seed, std::uint64_t expected_revision) {
   cmd.node_id_ = MakeNodeId(seed);
   cmd.expected_revision_ = expected_revision;
   cmd.endpoints_ = {"10.0.9.9:7000"};
-  cmd.capability_mask_ = 0x77;
+
   return cmd;
 }
 
@@ -236,7 +238,7 @@ TEST(MetaIdentityStore, UpdateNodeAppliesWithCas) {
   ASSERT_TRUE(record.has_value());
   EXPECT_EQ(record->revision_, 2u);
   EXPECT_EQ(record->endpoints_, cmd.endpoints_);
-  EXPECT_EQ(record->capability_mask_, cmd.capability_mask_);
+
   // Principal binding untouched because UpdateNode has no principal field.
   EXPECT_EQ(record->principal_, MakePrincipal(0x30));
   EXPECT_FALSE(record->retired_);
@@ -248,7 +250,6 @@ TEST(MetaIdentityStore, UpdateNodeCasConflictRejected) {
   ExpectDomainReject(store.Apply(MakeUpdate(0x31, /*expected_revision=*/7)));
   const auto record = store.FindNode(MakeNodeId(0x31));
   EXPECT_EQ(record->revision_, 1u);  // unchanged
-  EXPECT_EQ(record->capability_mask_, 0x5u);
 }
 
 TEST(MetaIdentityStore, UpdateNodeUnknownNodeRejected) {
@@ -268,9 +269,8 @@ TEST(MetaIdentityStore, UpdateNodeReplayIsIdempotentAccept) {
 
   // A DIFFERENT update colliding with the consumed revision is a conflict.
   UpdateNode conflict = MakeUpdate(0x33, /*expected_revision=*/1);
-  conflict.capability_mask_ = 0x11;
+  conflict.endpoints_ = {"tcp://127.0.0.1:7999"};
   ExpectDomainReject(store.Apply(conflict));
-  EXPECT_EQ(store.FindNode(cmd.node_id_)->capability_mask_, 0x77u);
 }
 
 TEST(MetaIdentityStore, UpdateNodeRetiredNodeRejected) {
@@ -365,7 +365,7 @@ TEST(MetaIdentityStore, SerializationRoundTrip) {
   ASSERT_GE(bytes.size(), 2u);
   const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
   EXPECT_EQ(static_cast<std::uint16_t>(p[0] | (p[1] << 8)),
-            keylane::meta::kMetaFormatVersion);
+            keylane::meta::kMetaIdentityStoreFormatVersion);
 
   const auto loaded = MetaIdentityStore::Deserialize(bytes);
   ASSERT_TRUE(loaded.ok()) << loaded.status();
@@ -435,14 +435,13 @@ TEST(MetaIdentityStore, DeserializeRejectsInvariantViolations) {
     w.WriteString(node_id);
     w.WriteString(prin);
     w.WriteCount(0);  // endpoints
-    w.WriteU64(0x5);  // capability_mask
     w.WriteU8(static_cast<std::uint8_t>(MetaNodeRole::kReplica));
     w.WriteU64(revision);
     w.WriteU8(0);  // active
   };
   auto make_blob = [&](auto write_body) {
     MetaWriter w;
-    w.WriteU16(keylane::meta::kMetaFormatVersion);
+    w.WriteU16(keylane::meta::kMetaIdentityStoreFormatVersion);
     write_body(w);
     return w.buffer();
   };
@@ -503,7 +502,7 @@ TEST(MetaIdentityStore, DeserializeRejectsInvariantViolations) {
 
 using keylane::meta::CreateGroup;
 using keylane::meta::MetaClusterLifecycle;
-using keylane::meta::MetaClusterTerminalOutcome;
+
 using keylane::meta::MetaFailoverMode;
 using keylane::meta::MetaFailoverTransition;
 using keylane::meta::MetaFailoverTransitionRef;
@@ -550,32 +549,30 @@ TEST(MetaTopologyStore, ClusterLifecycleBeginsAndCompletesIndependently) {
 
   EXPECT_EQ(store.ClusterLifecycle().state_,
             MetaClusterLifecycle::kUninitialized);
-  EXPECT_EQ(store.ClusterLifecycle().revision_, 0u);
+  EXPECT_EQ(store.ClusterLifecycle().Revision(), 0u);
   EXPECT_EQ(store.TopologyEpoch(), 0u);
 
   ASSERT_TRUE(store.BeginClusterCreate(root, 42).ok());
   EXPECT_EQ(store.ClusterLifecycle().state_, MetaClusterLifecycle::kCreating);
-  EXPECT_EQ(store.ClusterLifecycle().revision_, 1u);
+  EXPECT_EQ(store.ClusterLifecycle().Revision(), 1u);
   EXPECT_EQ(store.ClusterLifecycle().root_operation_id_, root);
   EXPECT_EQ(store.ClusterLifecycle().genesis_commit_index_, 42u);
-  EXPECT_EQ(store.ClusterLifecycle().terminal_outcome_,
-            MetaClusterTerminalOutcome::kNone);
+
   EXPECT_EQ(store.TopologyEpoch(), 0u);
 
   ASSERT_TRUE(store.BeginClusterCreate(root, 42).ok());
-  EXPECT_EQ(store.ClusterLifecycle().revision_, 1u);
+  EXPECT_EQ(store.ClusterLifecycle().Revision(), 1u);
   ExpectDomainReject(store.BeginClusterCreate(MakeOperationId(0x92), 43));
 
   ASSERT_TRUE(store.CompleteClusterCreate(root).ok());
   EXPECT_EQ(store.ClusterLifecycle().state_, MetaClusterLifecycle::kCreated);
-  EXPECT_EQ(store.ClusterLifecycle().revision_, 2u);
-  EXPECT_EQ(store.ClusterLifecycle().terminal_outcome_,
-            MetaClusterTerminalOutcome::kCreated);
+  EXPECT_EQ(store.ClusterLifecycle().Revision(), 2u);
+
   EXPECT_TRUE(store.ClusterLifecycle().failure_summary_.empty());
   EXPECT_EQ(store.TopologyEpoch(), 0u);
 
   ASSERT_TRUE(store.CompleteClusterCreate(root).ok());
-  EXPECT_EQ(store.ClusterLifecycle().revision_, 2u);
+  EXPECT_EQ(store.ClusterLifecycle().Revision(), 2u);
   ExpectDomainReject(store.FailClusterCreate(root, "too late"));
 }
 
@@ -603,6 +600,33 @@ TEST(MetaTopologyStore, ClusterLifecycleFailureIsBoundedAndSerialized) {
 // CreateGroup: absolute topology_epoch (exactly current+1), pristine replay
 // idempotency, group cap.
 // ---------------------------------------------------------------------------
+
+TEST(MetaTopologyStore, AuthorityAndOwnerShareTheGroupLifetime) {
+  MetaTopologyStore store;
+  ASSERT_TRUE(store.Apply(MakeCreateGroup("g1", 1)).ok());
+  keylane::meta::BeginGroupTerm begin;
+  begin.group_id_ = "g1";
+  begin.new_term_ = 1;
+  ASSERT_TRUE(store.BeginGroupTerm(begin).ok());
+  keylane::meta::ActivateAuthority activate;
+  activate.group_id_ = "g1";
+  activate.expected_term_ = 1;
+  activate.new_owner_ = std::string(40, 'a');
+  ASSERT_TRUE(store.ActivateAuthority(activate).ok());
+  EXPECT_EQ(store.FindGroup("g1")->record_.owner_, activate.new_owner_);
+  EXPECT_TRUE(store.AuthorityFor("g1")->grant_.has_value());
+  const auto bytes = store.Serialize();
+  auto restored = MetaTopologyStore::Deserialize(bytes);
+  ASSERT_TRUE(restored.ok());
+  EXPECT_EQ(restored->AuthorityFor("g1"), store.AuthorityFor("g1"));
+  begin.expected_term_ = 1;
+  begin.new_term_ = 2;
+  ASSERT_TRUE(restored->BeginGroupTerm(begin).ok());
+  EXPECT_EQ(restored->FindGroup("g1")->record_.group_term_, 2u);
+  EXPECT_EQ(restored->FindGroup("g1")->record_.owner_, activate.new_owner_);
+  EXPECT_FALSE(restored->AuthorityFor("g1")->grant_.has_value());
+  EXPECT_FALSE(restored->ActivateAuthority(activate).ok());
+}
 
 TEST(MetaTopologyStore, CreateGroupCreatesQueryableGroup) {
   MetaTopologyStore store;
@@ -1112,8 +1136,12 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   MetaTopologyStore store;
   ASSERT_TRUE(store.Apply(MakeCreateGroup("group-a", 1)).ok());
 
-  ASSERT_TRUE(store.SetOwner("group-a", MakeNodeId(0x30)).ok());
-  ASSERT_TRUE(store.SetGroupTerm("group-a", 7).ok());
+  ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetOwner(store, "group-a",
+                                                              MakeNodeId(0x30))
+                  .ok());
+  ASSERT_TRUE(
+      keylane::meta::MetaTopologyTestAccess::SetGroupTerm(store, "group-a", 7)
+          .ok());
   keylane::meta::MetaHash256 manifest_digest{};
   manifest_digest.fill(0x55);
   ASSERT_TRUE(
@@ -1130,15 +1158,21 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   EXPECT_EQ(view->revision_, 1u);
 
   // Setting the value already held is an idempotent no-op accept.
-  ASSERT_TRUE(store.SetOwner("group-a", MakeNodeId(0x30)).ok());
-  ASSERT_TRUE(store.SetGroupTerm("group-a", 7).ok());
+  ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetOwner(store, "group-a",
+                                                              MakeNodeId(0x30))
+                  .ok());
+  ASSERT_TRUE(
+      keylane::meta::MetaTopologyTestAccess::SetGroupTerm(store, "group-a", 7)
+          .ok());
   ASSERT_TRUE(
       store.SetPopulationManifest("group-a", 555, manifest_digest).ok());
   ASSERT_TRUE(store.SetPartitionReplicationEpoch("group-a", 2).ok());
 
   // Unknown groups are rejected by every primitive.
-  ExpectDomainReject(store.SetOwner("group-ghost", MakeNodeId(0x30)));
-  ExpectDomainReject(store.SetGroupTerm("group-ghost", 7));
+  ExpectDomainReject(keylane::meta::MetaTopologyTestAccess::SetOwner(
+      store, "group-ghost", MakeNodeId(0x30)));
+  ExpectDomainReject(keylane::meta::MetaTopologyTestAccess::SetGroupTerm(
+      store, "group-ghost", 7));
   ExpectDomainReject(
       store.SetPopulationManifest("group-ghost", 555, manifest_digest));
   ExpectDomainReject(store.SetPartitionReplicationEpoch("group-ghost", 2));
@@ -1168,7 +1202,9 @@ TEST(MetaTopologyStore, RemoveOwnerDoesNotCascade) {
                   .Apply(MakeAssign("group-a", 0x30, MetaNodeRole::kPrimary,
                                     /*expected=*/1))
                   .ok());
-  ASSERT_TRUE(store.SetOwner("group-a", MakeNodeId(0x30)).ok());
+  ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetOwner(store, "group-a",
+                                                              MakeNodeId(0x30))
+                  .ok());
   ASSERT_TRUE(store.Apply(MakeRemove("group-a", 0x30, /*expected=*/2)).ok());
   // Membership is independent of the owner fact: the store exposes it, the
   // apply dispatcher reacts.
@@ -1198,8 +1234,12 @@ MetaTopologyStore MakePopulatedTopology() {
                   .Apply(MakeAssign("group-b", 0x12, MetaNodeRole::kPrimary,
                                     /*expected=*/1, /*topology_epoch=*/5))
                   .ok());
-  EXPECT_TRUE(store.SetOwner("group-a", MakeNodeId(0x10)).ok());
-  EXPECT_TRUE(store.SetGroupTerm("group-a", 7).ok());
+  EXPECT_TRUE(keylane::meta::MetaTopologyTestAccess::SetOwner(store, "group-a",
+                                                              MakeNodeId(0x10))
+                  .ok());
+  EXPECT_TRUE(
+      keylane::meta::MetaTopologyTestAccess::SetGroupTerm(store, "group-a", 7)
+          .ok());
   keylane::meta::MetaHash256 manifest_digest{};
   manifest_digest.fill(0x55);
   EXPECT_TRUE(
@@ -1324,10 +1364,8 @@ std::string MakeTopologyBlob(
   keylane::meta::MetaWriter w;
   w.WriteU16(keylane::meta::kMetaTopologyStoreFormatVersion);
   w.WriteU8(static_cast<std::uint8_t>(MetaClusterLifecycle::kUninitialized));
-  w.WriteU64(0);
   keylane::meta::WriteFixedArray(w, MetaOperationId{});
   w.WriteU64(0);
-  w.WriteU8(static_cast<std::uint8_t>(MetaClusterTerminalOutcome::kNone));
   w.WriteString("");
   w.WriteU64(topology_epoch);
   w.WriteCount(static_cast<std::uint32_t>(groups.size()));
@@ -1335,6 +1373,8 @@ std::string MakeTopologyBlob(
     w.WriteString(group.group_id);
     w.WriteString(group.owner);
     w.WriteU64(0);  // group_term
+    w.WriteBool(false);  // fenced
+    w.WriteBool(false);  // no activation action
     w.WriteU64(0);  // population_manifest_revision
     keylane::meta::WriteFixedArray(w, keylane::meta::MetaHash256{});
     w.WriteU64(0);  // partition_replication_epoch

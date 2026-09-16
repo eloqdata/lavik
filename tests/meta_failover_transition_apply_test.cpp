@@ -12,6 +12,7 @@
 #include "keylane/meta/failover.h"
 #include "keylane/meta/hash.h"
 #include "keylane/meta/state_apply.h"
+#include "meta_topology_test_access.h"
 
 namespace {
 
@@ -59,7 +60,6 @@ std::string DomainBytes(const meta::MetaStores& stores) {
   std::string bytes = stores.identity_.Serialize();
   bytes += stores.topology_.Serialize();
   bytes += stores.policy_.Serialize();
-  bytes += stores.grant_.Serialize().value_or("invalid-grant");
   bytes += stores.operation_.Serialize().value_or("invalid-operation");
   bytes += stores.population_manifest_.Serialize();
   return bytes;
@@ -233,7 +233,6 @@ meta::MetaOperationId InstallCurrentAuthorityDirective(
   directive.group_term_ = 1;
   directive.kind_ = std::string(meta::kMetaDirectiveRebuild);
   directive.payload_ = *keylane::cluster::control::EncodeRebuildRequest({3});
-  directive.storage_mutating_ = true;
 
   meta::TransitionOperationPhase phase;
   phase.operation_id_ = submit.operation_id_;
@@ -249,8 +248,10 @@ void InstallUncontrolledPostStateDirectly(ActivatedGroupFixture& fixture,
   begin_term.group_id_ = "g1";
   begin_term.expected_term_ = 1;
   begin_term.new_term_ = 2;
-  ASSERT_TRUE(fixture.stores.grant_.BeginGroupTerm(begin_term).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetGroupTerm("g1", 2).ok());
+  ASSERT_TRUE(fixture.stores.topology_.BeginGroupTerm(begin_term).ok());
+  ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetGroupTerm(
+                  fixture.stores.topology_, "g1", 2)
+                  .ok());
 
   const meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
   meta::MetaFailoverTransition transition;
@@ -293,7 +294,7 @@ TEST(MetaFailoverTransitionApply,
   EXPECT_EQ(group->revision_, 2u);
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 3u);
 
-  const auto grant = fixture.stores.grant_.GroupState("g1");
+  const auto grant = fixture.stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(grant.has_value());
   EXPECT_EQ(grant->group_term_, 2u);
   EXPECT_FALSE(grant->grant_.has_value());
@@ -339,7 +340,7 @@ TEST(MetaFailoverTransitionApply,
             meta::MetaFailoverMode::kUncontrolled);
   EXPECT_EQ(group->failover_transition_->revision_, 10u);
   EXPECT_EQ(group->record_.group_term_, 2u);
-  const auto grant = fixture.stores.grant_.GroupState("g1");
+  const auto grant = fixture.stores.topology_.AuthorityFor("g1");
   ASSERT_TRUE(grant.has_value());
   EXPECT_FALSE(grant->grant_.has_value());
 
@@ -348,6 +349,46 @@ TEST(MetaFailoverTransitionApply,
   ExpectAccepted(fixture.stores, 10, meta::MetaCommand{begin});
   EXPECT_EQ(DomainBytes(fixture.stores), post_state);
   EXPECT_EQ(fixture.stores.audit_.size(), audit_size);
+}
+
+TEST(
+    MetaFailoverTransitionApply,
+    ControlValidationRejectionRestoresAuthorityPreemptedOperationAndDirectives) {
+  ActivatedGroupFixture fixture = MakeActivatedGroup();
+  const meta::SubmitOperation controlled = FailoverSubmit(0xa0);
+  ExpectAccepted(fixture.stores, 9, meta::MetaCommand{controlled});
+  const auto population_operation = InstallCurrentAuthorityDirective(fixture);
+
+  // Force a post-mutation control validation failure. The earlier
+  // term/transition, preemption, and stale-directive cleanup must all be rolled
+  // back together.
+  fixture.stores.policy_ = meta::MetaPolicyStore{};
+  const std::string before = DomainBytes(fixture.stores);
+  const auto active_before = fixture.stores.operation_.ActiveCount();
+  meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
+  begin.trigger_reason_ = meta::MetaAutomaticFailoverReason::kHeartbeatExpired;
+  begin.suspect_duration_ms_ = 5000;
+  begin.preempted_operation_id_ = controlled.operation_id_;
+  begin.expected_preempted_operation_revision_ = 0;
+  const auto rejected =
+      ExpectRejected(fixture.stores, 90, meta::MetaCommand{begin});
+  EXPECT_NE(rejected.detail_.find("Authority Lease policy"), std::string::npos);
+  EXPECT_EQ(DomainBytes(fixture.stores), before);
+  EXPECT_EQ(fixture.stores.operation_.ActiveCount(), active_before);
+  ASSERT_EQ(fixture.stores.operation_.FindOperation(population_operation)
+                ->current_directives_.size(),
+            1u);
+
+  // A fresh command succeeds after repairing the injected fault: rejection
+  // did not consume the Group term, operation revision, or task identity.
+  SeedRequiredCurrentPolicies(fixture.stores);
+  ExpectAccepted(fixture.stores, 91, meta::MetaCommand{begin});
+  EXPECT_EQ(fixture.stores.topology_.FindGroup("g1")->record_.group_term_, 2u);
+  EXPECT_TRUE(fixture.stores.operation_.FindOperation(population_operation)
+                  ->current_directives_.empty());
+  EXPECT_EQ(fixture.stores.operation_.FindOperation(controlled.operation_id_)
+                ->lifecycle_,
+            meta::MetaOperationLifecycle::kAborted);
 }
 
 TEST(MetaFailoverTransitionApply,
@@ -576,29 +617,32 @@ TEST(MetaFailoverTransitionApply,
 }
 
 TEST(MetaFailoverTransitionApply,
-     BeginUncontrolledRejectsGrantOnlyPartialStateWithoutRepair) {
+     BeginUncontrolledRejectsTermAdvanceWithoutTransition) {
   ActivatedGroupFixture fixture = MakeActivatedGroup();
   const meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
   meta::BeginGroupTerm partial;
   partial.group_id_ = "g1";
   partial.expected_term_ = 1;
   partial.new_term_ = 2;
-  ASSERT_TRUE(fixture.stores.grant_.BeginGroupTerm(partial).ok());
+  ASSERT_TRUE(fixture.stores.topology_.BeginGroupTerm(partial).ok());
   const std::string before = DomainBytes(fixture.stores);
 
   ExpectRejected(fixture.stores, 9, meta::MetaCommand{begin});
 
   EXPECT_EQ(DomainBytes(fixture.stores), before);
-  EXPECT_EQ(fixture.stores.topology_.FindGroup("g1")->record_.group_term_, 1u);
+  EXPECT_EQ(fixture.stores.topology_.FindGroup("g1")->record_.group_term_, 2u);
+  EXPECT_FALSE(fixture.stores.topology_.AuthorityFor("g1")->grant_);
   EXPECT_FALSE(fixture.stores.topology_.FindGroup("g1")
                    ->failover_transition_.has_value());
 }
 
 TEST(MetaFailoverTransitionApply,
-     BeginUncontrolledRejectsTopologyOnlyPartialStateWithoutRepair) {
+     BeginUncontrolledRejectsTransitionWithoutFencing) {
   ActivatedGroupFixture fixture = MakeActivatedGroup();
   const meta::BeginUncontrolledFailover begin = MakeBeginUncontrolled(fixture);
-  ASSERT_TRUE(fixture.stores.topology_.SetGroupTerm("g1", 2).ok());
+  ASSERT_TRUE(keylane::meta::MetaTopologyTestAccess::SetGroupTerm(
+                  fixture.stores.topology_, "g1", 2)
+                  .ok());
   meta::MetaFailoverTransition partial;
   partial.transition_id_ = begin.transition_id_;
   partial.mode_ = meta::MetaFailoverMode::kUncontrolled;
@@ -611,8 +655,8 @@ TEST(MetaFailoverTransitionApply,
   ExpectRejected(fixture.stores, 9, meta::MetaCommand{begin});
 
   EXPECT_EQ(DomainBytes(fixture.stores), before);
-  EXPECT_EQ(fixture.stores.grant_.GroupState("g1")->group_term_, 1u);
-  EXPECT_TRUE(fixture.stores.grant_.GroupState("g1")->grant_.has_value());
+  EXPECT_EQ(fixture.stores.topology_.AuthorityFor("g1")->group_term_, 2u);
+  EXPECT_TRUE(fixture.stores.topology_.AuthorityFor("g1")->grant_.has_value());
 }
 
 TEST(MetaFailoverTransitionApply,

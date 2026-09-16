@@ -40,19 +40,15 @@ namespace {
 
 namespace control = keylane::cluster::control;
 using keylane::meta::BuildCommittedMetaDirectory;
-using keylane::meta::ClassifyDirectiveDelivery;
 using keylane::meta::EvaluateLeaseChallenge;
 using keylane::meta::EvaluateReplacementDisposition;
 using keylane::meta::IngestHeartbeatObservations;
-using keylane::meta::IngestOperationEvidenceObservation;
 using keylane::meta::MetaCommittedFacts;
 using keylane::meta::MetaCommittedView;
 using keylane::meta::MetaDataControlRuntimeStatus;
 using keylane::meta::MetaDataControlServer;
 using keylane::meta::MetaDataControlServerOptions;
 using keylane::meta::MetaDataControlServerTestPeer;
-using keylane::meta::MetaDirectiveDelivery;
-using keylane::meta::MetaDirectiveReceiptTracker;
 using keylane::meta::MetaLeaderRuntimeDisposition;
 using keylane::meta::MetaLeaderRuntimeGuard;
 using keylane::meta::MetaLeaseEvaluation;
@@ -60,7 +56,6 @@ using keylane::meta::MetaLeaseHandoffGuard;
 using keylane::meta::MetaNodeHealthObs;
 using keylane::meta::MetaObservationStore;
 using keylane::meta::MetaObservedOwnerProjection;
-using keylane::meta::MetaOperationEvidenceObs;
 using keylane::meta::MetaReplacementDisposition;
 using keylane::meta::MetaStores;
 using keylane::meta::UnfencedSupersededAuthorities;
@@ -90,9 +85,8 @@ TEST(MetaDataControlRuntimeStatusTest,
   status.BeginLeadership(/*leadership_generation=*/11);
   status.SetLeaderAuthorityEligible(/*leadership_generation=*/11, true);
   control::FullDesiredState projection;
-  projection.source_meta_applied_index = 7;
+  projection.control_revision = 7;
   projection.topology_epoch = 3;
-  projection.projection_hash = Bytes<32>(0x31);
   projection.authority_lease_duration_ms = 250;
   projection.groups.push_back({
       .group_id = "group-a",
@@ -128,8 +122,7 @@ TEST(MetaDataControlRuntimeStatusTest,
   status.MarkValidated(Identity('1'), session, 8);
   snapshot = status.Snapshot();
   EXPECT_EQ(snapshot.nodes_[0].validated_committed_high_water_, 9u);
-  EXPECT_EQ(snapshot.nodes_[0].source_meta_applied_index_, 7u);
-  EXPECT_EQ(snapshot.nodes_[0].projection_hash_, projection.projection_hash);
+  EXPECT_EQ(snapshot.nodes_[0].control_revision_, 7u);
 
   control::LeaseDenied denied;
   denied.reason = control::LeaseDenialReason::kNodeNotReady;
@@ -378,7 +371,7 @@ TEST(MetaPublisherAdoptionGateTest,
 control::FullDesiredState Desired() {
   control::FullDesiredState desired;
   desired.authority_lease_duration_ms = 5000;
-  desired.projection_hash = Bytes<32>(0x42);
+  desired.control_revision = 0x42;
   control::WireDesiredGroup group;
   group.group_id = "group-a";
   group.owner_node_id = Identity('1');
@@ -393,7 +386,7 @@ control::FullDesiredState Desired() {
 control::LeaseChallenge Challenge() {
   return control::LeaseChallenge{
       .nonce = Bytes<16>(0x11),
-      .projection_hash = Bytes<32>(0x42),
+      .control_revision = 0x42,
       .group_id = "group-a",
       .assignment_id = Bytes<16>(0x22),
       .group_term = 7,
@@ -431,28 +424,10 @@ class HeartbeatFacts : public MetaCommittedFacts {
       const keylane::meta::MetaAssignmentId&) const override {
     return false;
   }
-  bool OperationNonTerminal(
-      const keylane::meta::MetaOperationId&) const override {
-    return false;
-  }
-  bool HistoryBoundToOperation(
-      const keylane::meta::MetaOperationId&,
-      const keylane::meta::MetaReplicationHistoryId&) const override {
-    return false;
-  }
 };
 
 class EvidenceFacts final : public HeartbeatFacts {
  public:
-  bool OperationNonTerminal(
-      const keylane::meta::MetaOperationId& id) const override {
-    return id == Bytes<16>(0x33);
-  }
-  bool HistoryBoundToOperation(
-      const keylane::meta::MetaOperationId& id,
-      const keylane::meta::MetaReplicationHistoryId& history) const override {
-    return id == Bytes<16>(0x33) && history == Bytes<20>(0x44);
-  }
 };
 
 class FailoverHeartbeatFacts final : public HeartbeatFacts {
@@ -847,7 +822,7 @@ TEST(MetaDataControlLeaseTest, ExactCommittedAnchorGetsBoundedGrant) {
       .leadership_validity_ms_ = 250,
       .node_id_ = Identity('1'),
       .boot_id_ = Identity('2'),
-      .applied_projection_hash_ = desired.projection_hash,
+      .applied_projection_index_ = desired.control_revision,
       .desired_ = &desired,
   };
   control::HeartbeatHealth health{.storage_ready = true,
@@ -867,9 +842,8 @@ TEST(MetaDataControlLeaseTest, ExactCommittedAnchorGetsBoundedGrant) {
 TEST(MetaDataControlLeaseTest,
      LeaderLocalValidityRebuildsTheResolvedProjectionWithoutCommittedInput) {
   control::FullDesiredState state;
-  state.source_meta_applied_index = 7;
+  state.control_revision = 7;
   state.authority_lease_duration_ms = 900;
-  state.projection_hash = *control::ComputeProjectionHash(state);
   auto encoded = control::EncodeFullDesiredState(state);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   keylane::meta::NodeControlBatch batch{state, *encoded};
@@ -886,7 +860,7 @@ TEST(MetaDataControlLeaseTest,
   EXPECT_EQ(
       control::DataHeartbeatIntervalMs(decoded->authority_lease_duration_ms),
       83u);
-  EXPECT_EQ(decoded->projection_hash, batch.full_state.projection_hash);
+  EXPECT_EQ(decoded->control_revision, batch.full_state.control_revision);
 }
 
 TEST(MetaDataControlLeaseTest,
@@ -900,7 +874,7 @@ TEST(MetaDataControlLeaseTest,
       .leadership_validity_ms_ = 250,
       .node_id_ = Identity('1'),
       .boot_id_ = Identity('2'),
-      .applied_projection_hash_ = desired.projection_hash,
+      .applied_projection_index_ = desired.control_revision,
       .desired_ = &desired,
   };
   const control::HeartbeatHealth health{.storage_ready = true,
@@ -941,7 +915,7 @@ TEST(MetaDataControlLeaseTest,
       .leadership_validity_ms_ = 250,
       .node_id_ = Identity('1'),
       .boot_id_ = Identity('2'),
-      .applied_projection_hash_ = desired.projection_hash,
+      .applied_projection_index_ = desired.control_revision,
       .desired_ = &desired,
   };
   const control::HeartbeatHealth unhealthy{
@@ -985,7 +959,7 @@ TEST(MetaDataControlLeaseTest, NewBootAndLeaderResetRestartHandoffWait) {
       .leadership_validity_ms_ = 250,
       .node_id_ = Identity('1'),
       .boot_id_ = Identity('2'),
-      .applied_projection_hash_ = desired.projection_hash,
+      .applied_projection_index_ = desired.control_revision,
       .desired_ = &desired,
   };
   const control::HeartbeatHealth health{.storage_ready = true,
@@ -1090,7 +1064,7 @@ TEST(MetaDataControlLeaseTest, StaleProjectionIsOutOfDate) {
       .leadership_validity_ms_ = 250,
       .node_id_ = Identity('1'),
       .boot_id_ = Identity('2'),
-      .applied_projection_hash_ = Bytes<32>(0x99),
+      .applied_projection_index_ = 0x99,
       .desired_ = &desired,
   };
   const auto decision = EvaluateLeaseChallenge(
@@ -1099,7 +1073,7 @@ TEST(MetaDataControlLeaseTest, StaleProjectionIsOutOfDate) {
       evaluation);
   const auto* stale = std::get_if<control::LeaseStateOutOfDate>(&decision);
   ASSERT_NE(stale, nullptr);
-  EXPECT_EQ(stale->current_projection_hash, desired.projection_hash);
+  EXPECT_EQ(stale->current_control_revision, desired.control_revision);
 }
 
 TEST(MetaDataControlLeaseTest, InvalidChallengeDoesNotBecomeAGrant) {
@@ -1109,7 +1083,7 @@ TEST(MetaDataControlLeaseTest, InvalidChallengeDoesNotBecomeAGrant) {
       .leadership_validity_ms_ = 250,
       .node_id_ = Identity('1'),
       .boot_id_ = Identity('2'),
-      .applied_projection_hash_ = desired.projection_hash,
+      .applied_projection_index_ = desired.control_revision,
       .desired_ = &desired,
   };
   control::LeaseChallenge challenge = Challenge();
@@ -1167,7 +1141,7 @@ TEST(MetaDataControlFenceTest,
   const control::FullDesiredState installed = Desired();
 
   control::FullDesiredState intermediate = installed;
-  intermediate.projection_hash = Bytes<32>(0x43);
+  ++intermediate.control_revision;
   intermediate.groups.front().owner_assignment_id = Bytes<16>(0x31);
   intermediate.current_directives.push_back(control::WireProjectedDirective{
       .identity = {.operation_id = Bytes<16>(0x40),
@@ -1179,11 +1153,11 @@ TEST(MetaDataControlFenceTest,
       .target_node_id = node_id,
       .target_boot_id = Identity('2'),
       .kind = control::WireDirectiveKind::kRebuild,
-      .storage_mutating = true,
+
   });
 
   control::FullDesiredState latest = installed;
-  latest.projection_hash = Bytes<32>(0x44);
+  latest.control_revision += 2;
   latest.groups.front().grant_active = false;
 
   EXPECT_EQ(EvaluateReplacementDisposition(intermediate, latest),
@@ -1195,7 +1169,8 @@ TEST(MetaDataControlFenceTest,
   ASSERT_EQ(fences.size(), 1u);
   EXPECT_EQ(fences.front().assignment_id, Bytes<16>(0x22));
 
-  latest.projection_hash = intermediate.projection_hash;
+  latest = intermediate;
+  ++latest.control_revision;
   EXPECT_EQ(EvaluateReplacementDisposition(intermediate, latest),
             MetaReplacementDisposition::kContinue);
 }
@@ -1246,12 +1221,12 @@ TEST(MetaHeartbeatObservationTest,
       .owner_node_id_ = Identity('1'),
       .owner_assignment_id_ = Bytes<16>(0x22),
       .group_term_ = 7,
-      .projection_hash_ = Bytes<32>(0x42),
+      .control_revision_ = 0x42,
       .authority_lease_duration_ms_ = 5000,
   };
   control::LeaseGranted granted{
       .data_boot_id = Identity('2'),
-      .projection_hash = owner.projection_hash_,
+      .control_revision = owner.control_revision_,
       .group_id = owner.group_id_,
       .assignment_id = owner.owner_assignment_id_,
       .group_term = owner.group_term_,
@@ -1293,7 +1268,7 @@ TEST(MetaHeartbeatObservationTest,
 }
 
 TEST(MetaHeartbeatObservationTest,
-     MaximumLegalSummaryDoesNotSuppressTypedOwnerHealth) {
+     RejectedDiagnosticSummaryDoesNotSuppressTypedOwnerHealth) {
   MetaObservationStore observations;
   HeartbeatFacts facts;
   const auto boot = Bytes<20>(0x22);
@@ -1318,7 +1293,9 @@ TEST(MetaHeartbeatObservationTest,
       control::NoRoleInformation{}, std::nullopt, std::nullopt,
       std::move(*owner), /*heartbeat_sequence=*/1, std::nullopt,
       /*now_unix_ms=*/1010, /*now_steady_ms=*/2010);
-  EXPECT_EQ(result.status, control::ObservationStatus::kAccepted)
+  // Diagnostic text can exceed the per-node cache budget; typed health is
+  // still authoritative for this heartbeat and must survive that rejection.
+  EXPECT_EQ(result.status, control::ObservationStatus::kRejected)
       << result.detail;
 
   const auto observed = observations.OwnerObservationFor(Identity('1'));
@@ -1422,7 +1399,8 @@ TEST(MetaHeartbeatObservationTest,
   EXPECT_EQ(progress.front().source_replication_history_id_, Bytes<20>(0x55));
   EXPECT_EQ(progress.front().applied_next_lsns_,
             (std::vector<std::uint64_t>{10}));
-  EXPECT_EQ(progress.front().applied_flow_vector_, "1:10");
+  EXPECT_EQ(progress.front().applied_next_lsns_,
+            (std::vector<std::uint64_t>{10}));
 
   const auto authority = IngestHeartbeatObservations(
       observations, facts, Identity('1'), boot, Bytes<20>(0x55), 1, health,
@@ -1468,284 +1446,8 @@ TEST(MetaHeartbeatObservationTest,
   EXPECT_EQ(observed->prepared_context_id_, prepared.prepared_context_id);
 }
 
-TEST(MetaOperationEvidenceTest,
-     IngestsExactSessionBootAssignmentOperationAndContentAnchors) {
-  MetaObservationStore observations;
-  EvidenceFacts facts;
-  const auto boot = Bytes<20>(0x22);
-  const auto session_id = Bytes<16>(0x11);
-  ASSERT_TRUE(observations
-                  .AdoptSession({Identity('1'), boot, 1},
-                                /*now_unix_ms=*/1000)
-                  .ok());
-  control::OperationEvidence evidence{
-      .session_id = session_id,
-      .reporter_boot_id = Identity('2'),
-      .assignment_id = Bytes<16>(0x22),
-      .operation_id = Bytes<16>(0x33),
-      .kind_phase = "promotion:durability-ready",
-      .evidence = "frontier=41,52",
-      .group_id = "group-a",
-      .group_term = 7,
-      .manifest_revision = 9,
-      .partition_replication_epoch = 4,
-      .replication_history_id = Identity('4'),
-  };
 
-  EXPECT_TRUE(IngestOperationEvidenceObservation(
-                  observations, facts, Identity('1'), boot, 1, session_id,
-                  evidence, /*now_unix_ms=*/1001)
-                  .ok());
-  const auto accepted =
-      observations.EvidenceForOperation(Bytes<16>(0x33), facts, 1001);
-  ASSERT_EQ(accepted.size(), 1u);
-  EXPECT_EQ(accepted.front().node_id_, Identity('1'));
-  EXPECT_EQ(accepted.front().boot_incarnation_, boot);
-  EXPECT_EQ(accepted.front().assignment_id_, Bytes<16>(0x22));
-  EXPECT_EQ(accepted.front().kind_phase_, evidence.kind_phase);
-  EXPECT_EQ(accepted.front().evidence_, evidence.evidence);
 
-  control::OperationEvidence invalid = evidence;
-  invalid.session_id = Bytes<16>(0x12);
-  EXPECT_EQ(IngestOperationEvidenceObservation(
-                observations, facts, Identity('1'), boot, 1, session_id,
-                invalid, /*now_unix_ms=*/1002)
-                .code(),
-            absl::StatusCode::kInvalidArgument);
-  invalid = evidence;
-  invalid.reporter_boot_id = Identity('3');
-  EXPECT_EQ(IngestOperationEvidenceObservation(
-                observations, facts, Identity('1'), boot, 1, session_id,
-                invalid, /*now_unix_ms=*/1002)
-                .code(),
-            absl::StatusCode::kInvalidArgument);
-  invalid = evidence;
-  invalid.assignment_id = Bytes<16>(0x23);
-  EXPECT_EQ(IngestOperationEvidenceObservation(
-                observations, facts, Identity('1'), boot, 1, session_id,
-                invalid, /*now_unix_ms=*/1002)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
-  invalid = evidence;
-  invalid.operation_id = Bytes<16>(0x34);
-  EXPECT_EQ(IngestOperationEvidenceObservation(
-                observations, facts, Identity('1'), boot, 1, session_id,
-                invalid, /*now_unix_ms=*/1002)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
-  invalid = evidence;
-  // Observation bodies are replaceable reports, not durable content identities.
-  invalid.evidence.push_back('!');
-  EXPECT_TRUE(IngestOperationEvidenceObservation(
-                  observations, facts, Identity('1'), boot, 1, session_id,
-                  invalid, /*now_unix_ms=*/1002)
-                  .ok());
-}
 
-TEST(MetaDirectiveReceiptTrackerTest,
-     RequiresMonotonicStagesAndResetsOnProjectionReplacement) {
-  const std::string node_id = Identity('1');
-  const std::string boot_id = Identity('2');
-  control::WireProjectedDirective first{
-      .identity = {.operation_id = Bytes<16>(0x10),
-                   .directive_id = Bytes<16>(0x11),
-                   .attempt_id = Bytes<16>(0x12),
-                   .directive_revision = 3},
-      .recipient_node_id = node_id,
-      .recipient_boot_id = boot_id,
-  };
-  control::WireProjectedDirective prior_boot = first;
-  prior_boot.identity.directive_id = Bytes<16>(0x20);
-  prior_boot.recipient_boot_id = Identity('3');
-  control::WireProjectedDirective rejected = first;
-  rejected.identity.directive_id = Bytes<16>(0x21);
-  const std::array initial{first, rejected, prior_boot};
-
-  MetaDirectiveReceiptTracker tracker;
-  ASSERT_TRUE(tracker.Rebuild(initial, node_id, boot_id).ok());
-  EXPECT_EQ(tracker.size(), 2u);
-  EXPECT_EQ(
-      tracker.Observe(first.identity, control::DirectiveReceiptStage::kStarted)
-          .code(),
-      absl::StatusCode::kFailedPrecondition);
-  EXPECT_TRUE(
-      tracker.Observe(first.identity, control::DirectiveReceiptStage::kAccepted)
-          .ok());
-  EXPECT_TRUE(
-      tracker.Observe(first.identity, control::DirectiveReceiptStage::kAccepted)
-          .ok());
-  EXPECT_TRUE(
-      tracker.Observe(first.identity, control::DirectiveReceiptStage::kStarted)
-          .ok());
-  EXPECT_EQ(
-      tracker.Observe(first.identity, control::DirectiveReceiptStage::kAccepted)
-          .code(),
-      absl::StatusCode::kFailedPrecondition);
-  EXPECT_TRUE(
-      tracker
-          .Observe(first.identity, control::DirectiveReceiptStage::kCompleted)
-          .ok());
-  EXPECT_TRUE(tracker
-                  .ValidateResult(first.identity,
-                                  control::DirectiveResultStatus::kSucceeded)
-                  .ok());
-  EXPECT_TRUE(tracker
-                  .ValidateResult(first.identity,
-                                  control::DirectiveResultStatus::kFailed)
-                  .ok());
-  EXPECT_EQ(tracker
-                .ValidateResult(first.identity,
-                                control::DirectiveResultStatus::kRejected)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
-
-  // A controller precondition rejection never starts native work. Its terminal
-  // sequence therefore moves directly from Accepted to Completed, while later
-  // attempts to fabricate a Started observation remain invalid.
-  ASSERT_TRUE(
-      tracker
-          .Observe(rejected.identity, control::DirectiveReceiptStage::kAccepted)
-          .ok());
-  EXPECT_EQ(tracker
-                .ValidateResult(rejected.identity,
-                                control::DirectiveResultStatus::kRejected)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
-  EXPECT_TRUE(tracker
-                  .Observe(rejected.identity,
-                           control::DirectiveReceiptStage::kCompleted)
-                  .ok());
-  EXPECT_TRUE(tracker
-                  .ValidateResult(rejected.identity,
-                                  control::DirectiveResultStatus::kRejected)
-                  .ok());
-  EXPECT_EQ(tracker
-                .ValidateResult(rejected.identity,
-                                control::DirectiveResultStatus::kSucceeded)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
-  EXPECT_EQ(tracker
-                .ValidateResult(rejected.identity,
-                                control::DirectiveResultStatus::kFailed)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
-  EXPECT_EQ(
-      tracker
-          .Observe(rejected.identity, control::DirectiveReceiptStage::kStarted)
-          .code(),
-      absl::StatusCode::kFailedPrecondition);
-  EXPECT_TRUE(tracker
-                  .Observe(rejected.identity,
-                           control::DirectiveReceiptStage::kCompleted)
-                  .ok());
-  EXPECT_TRUE(
-      tracker
-          .Observe(first.identity, control::DirectiveReceiptStage::kCompleted)
-          .ok());
-
-  control::WireProjectedDirective replacement = first;
-  replacement.identity.directive_id = Bytes<16>(0x30);
-  ASSERT_TRUE(tracker
-                  .Rebuild(std::span<const control::WireProjectedDirective>(
-                               &replacement, 1),
-                           node_id, boot_id)
-                  .ok());
-  EXPECT_EQ(
-      tracker.Observe(first.identity, control::DirectiveReceiptStage::kAccepted)
-          .code(),
-      absl::StatusCode::kFailedPrecondition);
-  EXPECT_EQ(tracker
-                .Observe(replacement.identity,
-                         control::DirectiveReceiptStage::kStarted)
-                .code(),
-            absl::StatusCode::kFailedPrecondition);
-  EXPECT_TRUE(tracker
-                  .Observe(replacement.identity,
-                           control::DirectiveReceiptStage::kAccepted)
-                  .ok());
-}
-
-TEST(MetaDirectiveReceiptTrackerTest,
-     SameProjectionCommitPreservesSentPrefixAndResumesUnsentSuffix) {
-  const std::string node_id = Identity('1');
-  const std::string boot_id = Identity('2');
-  control::WireProjectedDirective first{
-      .identity = {.operation_id = Bytes<16>(0x10),
-                   .directive_id = Bytes<16>(0x11),
-                   .attempt_id = Bytes<16>(0x12),
-                   .directive_revision = 3},
-      .recipient_node_id = node_id,
-      .recipient_boot_id = boot_id,
-  };
-  control::WireProjectedDirective second = first;
-  second.identity.directive_id = Bytes<16>(0x20);
-  const std::array directives{first, second};
-
-  MetaDirectiveReceiptTracker tracker;
-  ASSERT_TRUE(tracker.Rebuild(directives, node_id, boot_id).ok());
-  ASSERT_TRUE(tracker.NeedsDispatch(first.identity).ok());
-  EXPECT_TRUE(*tracker.NeedsDispatch(first.identity));
-  EXPECT_TRUE(tracker.HasUndispatched());
-
-  ASSERT_TRUE(tracker.MarkDispatched(first.identity).ok());
-  EXPECT_FALSE(*tracker.NeedsDispatch(first.identity));
-  EXPECT_TRUE(*tracker.NeedsDispatch(second.identity));
-  EXPECT_TRUE(tracker.HasUndispatched());
-
-  control::FullDesiredState installed;
-  installed.projection_hash = Bytes<32>(0x42);
-  control::FullDesiredState same_projection = installed;
-  same_projection.source_meta_applied_index = 99;
-  EXPECT_EQ(EvaluateReplacementDisposition(installed, same_projection),
-            MetaReplacementDisposition::kContinue);
-
-  // kContinue deliberately keeps this tracker instead of rebuilding it. The
-  // resumed sender skips the completed prefix and writes only the second item.
-  ASSERT_TRUE(tracker.MarkDispatched(second.identity).ok());
-  EXPECT_FALSE(tracker.HasUndispatched());
-  EXPECT_FALSE(*tracker.NeedsDispatch(first.identity));
-  EXPECT_FALSE(*tracker.NeedsDispatch(second.identity));
-
-  // A genuinely different projection rebuilds session dispatch state.
-  ASSERT_TRUE(tracker.Rebuild(directives, node_id, boot_id).ok());
-  EXPECT_TRUE(tracker.HasUndispatched());
-  EXPECT_TRUE(*tracker.NeedsDispatch(first.identity));
-  EXPECT_TRUE(*tracker.NeedsDispatch(second.identity));
-}
-
-TEST(MetaDataControlDirectiveTest, OversizedEnvelopeUsesObjectTransfer) {
-  control::WireProjectedDirective directive{
-      .basis = {.source_meta_applied_index = 1,
-                .projection_hash = Bytes<32>(0x10)},
-      .authority = {.group_id = "group-a",
-                    .assignment_id = Bytes<16>(0x11),
-                    .group_term = 2},
-      .identity = {.operation_id = Bytes<16>(0x12),
-                   .directive_id = Bytes<16>(0x13),
-                   .attempt_id = Bytes<16>(0x14),
-                   .directive_revision = 5},
-      .recipient_node_id = Identity('1'),
-      .recipient_boot_id = Identity('2'),
-      .target_node_id = Identity('1'),
-      .target_boot_id = Identity('2'),
-      .source_node_id = Identity('3'),
-      .source_assignment_id = Bytes<16>(0x17),
-      .source_boot_id = Identity('4'),
-      .source_replication_history_id = Identity('5'),
-      .manifest_revision = 6,
-      .manifest_digest = Bytes<32>(0x15),
-      .kind = control::WireDirectiveKind::kRebuild,
-      .payload = "small",
-      .storage_mutating = true,
-  };
-  auto delivery = ClassifyDirectiveDelivery(directive, Bytes<16>(0x16));
-  ASSERT_TRUE(delivery.ok()) << delivery.status();
-  EXPECT_EQ(*delivery, MetaDirectiveDelivery::kFrame);
-
-  directive.payload.assign(control::kMaxFrameBytes, 'x');
-  delivery = ClassifyDirectiveDelivery(directive, Bytes<16>(0x16));
-  ASSERT_TRUE(delivery.ok()) << delivery.status();
-  EXPECT_EQ(*delivery, MetaDirectiveDelivery::kTransfer);
-}
 
 }  // namespace

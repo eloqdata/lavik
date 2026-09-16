@@ -198,7 +198,7 @@ void detail::ApplyClusterRuntimeObservation(
           granted->leadership_generation ==
               runtime_node.leadership_generation_ &&
           granted->data_boot_id == runtime_node.boot_id_ &&
-          granted->projection_hash == runtime_node.projection_hash_ &&
+          granted->control_revision == runtime_node.control_revision_ &&
           granted->group_term == committed_group->grant_.group_term_;
       // Health arrives before the corresponding Ack finishes writing. An old
       // successful grant is not current readiness evidence after health drops,
@@ -454,7 +454,7 @@ std::string BuildClusterStatusReply(
       .committed_index_ = view.applied_index_,
       .topology_epoch_ = view.topology_epoch_,
   };
-  status.lifecycle_revision_ = view.cluster_lifecycle_.revision_;
+  status.lifecycle_revision_ = view.cluster_lifecycle_.Revision();
   switch (view.cluster_lifecycle_.state_) {
     case MetaClusterLifecycle::kUninitialized:
       status.cluster_state_ = view.cluster_non_pristine_
@@ -1391,7 +1391,7 @@ celer::Task<std::string> HandleRegisterNode(
   command.node_id_ = node_id;
   command.principal_ = principal;
   command.endpoints_ = std::move(endpoints);
-  command.role_ = role;  // capability mask 0
+  command.role_ = role;
   const std::vector<std::string> expected_endpoints = command.endpoints_;
   std::string reply =
       co_await ProposeCommand(coordinator, std::move(authenticated), command);
@@ -1403,7 +1403,7 @@ celer::Task<std::string> HandleRegisterNode(
   const std::optional<MetaNodeRecord> record = state_machine->FindNode(node_id);
   if (!record.has_value() || record->principal_ != principal ||
       record->endpoints_ != expected_endpoints || record->role_ != role ||
-      record->capability_mask_ != 0 || record->retired_) {
+      record->retired_) {
     co_return "ERR rejected";
   }
   co_return reply;
@@ -1508,7 +1508,7 @@ celer::Task<std::string> HandleBeginGroupTerm(
     co_return reply;
   }
   const std::optional<std::uint64_t> term =
-      state_machine->StoresSnapshot().grant_.CurrentGroupTerm(group_id);
+      state_machine->StoresSnapshot().topology_.CurrentGroupTerm(group_id);
   if (!term.has_value() || *term != next) {
     co_return "ERR rejected";
   }
@@ -1598,7 +1598,7 @@ celer::Task<std::string> HandleActivateAuthority(
 
   const MetaStores after = state_machine->StoresSnapshot();
   const auto topology = after.topology_.FindGroup(group_id);
-  const auto grant = after.grant_.GroupState(group_id);
+  const auto grant = after.topology_.AuthorityFor(group_id);
   if (!topology.has_value() || !grant.has_value() ||
       !grant->grant_.has_value() || grant->grant_->owner_ != owner_node_id ||
       grant->group_term_ != expected_term ||
@@ -1625,7 +1625,7 @@ celer::Task<std::string> HandleFenceGroup(
   if (reply.rfind("OK ", 0) != 0) co_return reply;
 
   const MetaStores after = state_machine->StoresSnapshot();
-  const auto state = after.grant_.GroupState(group_id);
+  const auto state = after.topology_.AuthorityFor(group_id);
   const auto topology = after.topology_.FindGroup(group_id);
   if (!state.has_value() || !topology.has_value() ||
       state->group_term_ != command.new_term_ || state->grant_.has_value() ||
@@ -1903,12 +1903,8 @@ std::string HandleObsIngest(
     bind_reporter_assignment(candidate->group_id_, &candidate->node_id_,
                              &candidate->assignment_id_);
     candidate->boot_incarnation_ = observation.identity_.boot_incarnation_;
-  } else if (auto* evidence =
-                 std::get_if<MetaOperationEvidenceObs>(&observation.payload_)) {
-    bind_reporter_assignment(evidence->group_id_, &evidence->node_id_,
-                             &evidence->assignment_id_);
-    evidence->boot_incarnation_ = observation.identity_.boot_incarnation_;
   }
+
   const MetaStoresFacts facts(stores);
   const absl::Status status =
       obs_store->Ingest(std::move(observation), facts, now);
@@ -1940,7 +1936,8 @@ std::string HandleObservations(
         ",partition_epoch=" +
         std::to_string(candidate.partition_replication_epoch_) + ",history=" +
         ReplicationHistoryIdText(candidate.replication_history_id_) +
-        ",readiness=" + candidate.readiness_;
+        ",storage_ready=" + (candidate.storage_ready_ ? "true" : "false") +
+        ",population_ready=" + (candidate.population_ready_ ? "true" : "false");
   }
   return reply;
 }
@@ -2560,34 +2557,13 @@ celer::Task<std::string> DispatchCommand(
       MetaNodeHealthObs payload;
       payload.health_ = tokens[5];
       observation.payload_ = std::move(payload);
-    } else if (kind == "candidate" && tokens.size() == 13) {
+    } else if (kind == "candidate" && tokens.size() == 10) {
       MetaCandidateProgressObs payload;
       payload.group_id_ = tokens[5];
       if (!ParseU64(tokens[6], payload.group_term_) ||
           !ParseU64(tokens[7], payload.population_manifest_revision_) ||
           !ParseU64(tokens[8], payload.partition_replication_epoch_) ||
           !ParseReplicationHistoryId(tokens[9],
-                                     payload.replication_history_id_)) {
-        co_return "ERR bad-request";
-      }
-      payload.applied_flow_vector_ = tokens[10];
-      payload.backlog_coverage_ = tokens[11];
-      payload.readiness_ = tokens[12];
-      observation.payload_ = std::move(payload);
-    } else if (kind == "evidence" && tokens.size() == 13) {
-      MetaOperationEvidenceObs payload;
-      if (!ParseOperationId(tokens[5], payload.operation_id_)) {
-        co_return "ERR bad-request";
-      }
-      payload.kind_phase_ = tokens[6];
-      payload.evidence_ = tokens[7];
-      // The digest of the normalized payload is computed at ingestion; the
-      // wire never carries a self-reported hash.
-      payload.group_id_ = tokens[8];
-      if (!ParseU64(tokens[9], payload.group_term_) ||
-          !ParseU64(tokens[10], payload.population_manifest_revision_) ||
-          !ParseU64(tokens[11], payload.partition_replication_epoch_) ||
-          !ParseReplicationHistoryId(tokens[12],
                                      payload.replication_history_id_)) {
         co_return "ERR bad-request";
       }

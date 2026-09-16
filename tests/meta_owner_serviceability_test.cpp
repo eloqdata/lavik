@@ -23,7 +23,7 @@ MetaOwnerServiceabilityCut ServiceableCut() {
       .owner_node_id_ = std::string(40, '1'),
       .owner_assignment_id_ = Bytes<16>(0x21),
       .group_term_ = 7,
-      .projection_hash_ = Bytes<32>(0x31),
+      .control_revision_ = 0x31,
   };
   MetaOwnerServiceabilityCut::Session::Heartbeat heartbeat{
       .installed_anchor_ = anchor,
@@ -139,16 +139,14 @@ TEST(MetaOwnerServiceabilityTest,
   expect_stale(std::move(wrong_term));
 
   auto wrong_fds = ServiceableCut();
-  wrong_fds.session_->heartbeat_->installed_anchor_.projection_hash_ =
-      Bytes<32>(0x32);
+  wrong_fds.session_->heartbeat_->installed_anchor_.control_revision_ = 0x32;
   expect_stale(std::move(wrong_fds));
 }
 
 TEST(MetaOwnerServiceabilityTest,
      DefiniteCausalExpiryOverridesAStaleHeartbeatAnchor) {
   auto cut = ServiceableCut();
-  cut.session_->heartbeat_->installed_anchor_.projection_hash_ =
-      Bytes<32>(0x32);
+  cut.session_->heartbeat_->installed_anchor_.control_revision_ = 0x32;
   cut.session_->causal_progress_freshness_ =
       MetaCausalProgressFreshness::kExpired;
 
@@ -199,8 +197,7 @@ TEST(MetaOwnerServiceabilityTest,
   EXPECT_EQ(EvaluateOwnerServiceability(exact), pending);
 
   auto stale = std::move(exact);
-  stale.session_->heartbeat_->installed_anchor_.projection_hash_ =
-      Bytes<32>(0x32);
+  stale.session_->heartbeat_->installed_anchor_.control_revision_ = 0x32;
   EXPECT_EQ(EvaluateOwnerServiceability(stale),
             (MetaOwnerServiceabilityDecision{
                 .state_ = MetaOwnerServiceabilityState::kIndeterminate,

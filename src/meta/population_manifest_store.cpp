@@ -102,15 +102,25 @@ MetaPopulationManifestStore::Documents() const {
 // Snapshot envelope described on the public API. WriteEntries is also the
 // entry layout used by the canonical digest, but that digest prepends its own
 // domain separator rather than hashing this store envelope.
-std::string MetaPopulationManifestStore::Serialize() const {
-  MetaWriter writer;
+void MetaPopulationManifestStore::WriteSnapshot(MetaWriter& writer) const {
   writer.WriteU16(kMetaFormatVersion);
   writer.WriteCount(static_cast<std::uint32_t>(documents_.size()));
   for (const auto& [digest, document] : documents_) {
     WriteFixedArray(writer, digest);
     WriteEntries(writer, document.entries_);
   }
+}
+
+std::string MetaPopulationManifestStore::Serialize() const {
+  MetaWriter writer;
+  WriteSnapshot(writer);
   return writer.TakeBuffer();
+}
+
+std::uint64_t MetaPopulationManifestStore::SerializedSize() const {
+  MetaWriter counter(false);
+  WriteSnapshot(counter);
+  return counter.size();
 }
 
 absl::StatusOr<MetaPopulationManifestStore>
