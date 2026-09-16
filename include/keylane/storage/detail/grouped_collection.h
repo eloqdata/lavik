@@ -39,9 +39,10 @@ struct OrderedCollectionRoot {
   // independent revision so repeated mutations in one replayed command are
   // distinguishable. Zero denotes the command sequence for standalone codecs.
   std::uint64_t revision_ = 0;
-  // Version 2 Sorted Set roots bind a second, prefix-routed member -> score
-  // graph. Its revision may lag when only ordered links changed. Version 1
-  // roots remain readable/writable without silently inventing an index.
+  // Indexed Sorted Set roots bind a second, prefix-routed member -> score
+  // graph. Its revision may lag when only ordered links changed. The v1 root
+  // header explicitly records its presence; ordered-only roots never invent
+  // an index during decoding.
   std::optional<GroupedHashRoot> member_index_ = std::nullopt;
   bool operator==(const OrderedCollectionRoot&) const noexcept = default;
 };
@@ -180,7 +181,7 @@ class OrderedGroupDirectory {
   // candidates at/before that root sequence can participate; missing links,
   // cycles, disconnected pages and aggregate count mismatches are corruption.
   // Indexed roots additionally require an already-recovered member directory
-  // matching their embedded Hash root exactly; legacy/List roots forbid it.
+  // matching their embedded Hash root exactly; ordered-only roots forbid it.
   static absl::StatusOr<OrderedGroupDirectory> Recover(
       const OrderedCollectionRoot& root, std::uint64_t root_sequence,
       std::span<const RecoveredOrderedGroup> candidates,

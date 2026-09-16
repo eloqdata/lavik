@@ -38,7 +38,7 @@ def run_cluster(args, expected, timeout=10, input_text=None, env=None):
 
 
 def disabled_automatic_failover_status():
-    """Encode the clusterstatus v4 Group diagnostics for a disabled detector."""
+    """Encode the clusterstatus v1 Group diagnostics for a disabled detector."""
     # state, current_reason presence, suspect/threshold ms,
     # blocked_reason presence.
     return struct.pack(">BBQQB", 0, 0, 0, 1000, 0)
@@ -214,7 +214,7 @@ def scripted_cluster_gate(workdir):
         disabled_automatic_failover_status())
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     status_payload = (
-        struct.pack(">HIQQQQ", 4, 1, 1, 1, 1, 1) +
+        struct.pack(">HIQQQQ", 1, 1, 1, 1, 1, 1) +
         lifecycle(2, 2, "00112233445566778899aabbccddeeff", 1) +
         bytes([1, 1, 1, 1, 1]) + struct.pack(">I", 1) + member +
         struct.pack(">I", 1) + data_node +
@@ -396,7 +396,7 @@ def scripted_cluster_create_gate(workdir):
     head_payload = (
         struct.pack(">HIBQBIQI", 1, 1, 1, 1, 1, 1, 1, 1) + member)
     empty_status = (
-        struct.pack(">HIQQQQ", 4, 1, 1, 1, 2, 0) +
+        struct.pack(">HIQQQQ", 1, 1, 1, 1, 2, 0) +
         lifecycle(0, 0) +
         bytes([1, 1, 0, 0, 0]) + struct.pack(">I", 1) + member +
         struct.pack(">I", 0) * 4)
@@ -409,7 +409,7 @@ def scripted_cluster_create_gate(workdir):
         disabled_automatic_failover_status())
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     ready_status = (
-        struct.pack(">HIQQQQ", 4, 1, 1, 1, 22, 5) +
+        struct.pack(">HIQQQQ", 1, 1, 1, 1, 22, 5) +
         lifecycle(2, 2, "00112233445566778899aabbccddeeff", 3) +
         bytes([1, 1, 1, 1, 1]) + struct.pack(">I", 1) + member +
         struct.pack(">I", 1) + data_node +
@@ -560,7 +560,7 @@ def scripted_failover_gate(workdir):
         disabled_automatic_failover_status())
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     status_payload = (
-        struct.pack(">HIQQQQ", 4, 1, 1, 1, 50, 3) +
+        struct.pack(">HIQQQQ", 1, 1, 1, 1, 50, 3) +
         lifecycle(2, 2, "00112233445566778899aabbccddeeff", 3) +
         bytes([1, 1, 1, 1, 1]) + struct.pack(">I", 1) + member +
         struct.pack(">I", 1) + data_node +

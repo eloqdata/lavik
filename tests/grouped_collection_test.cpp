@@ -107,12 +107,20 @@ TEST(GroupedCollectionTest, RootAndPageRoundTripBothKinds) {
   }
 }
 
-TEST(GroupedCollectionTest, IndexedSortedSetRootBindsBothGraphsAndKeepsV1) {
+TEST(GroupedCollectionTest, BothRootShapesUseV1AndCheckMemberIndexPresence) {
   auto root = Root({Page(1, 3, OrderedCollectionKind::kSortedSet)}, 2);
   root.revision_ = 9;
-  const auto legacy = EncodeOrderedCollectionRoot(root);
-  ASSERT_TRUE(legacy.ok());
-  EXPECT_EQ(legacy->size(), kOrderedCollectionRootBytes);
+  const auto ordered_only = EncodeOrderedCollectionRoot(root);
+  ASSERT_TRUE(ordered_only.ok());
+  EXPECT_EQ(ordered_only->size(), kOrderedCollectionRootBytes);
+  EXPECT_EQ(ordered_only->substr(8, 4), std::string("\x01\0\0\0", 4));
+  EXPECT_EQ((*ordered_only)[13], '\0');
+  auto decoded_ordered_only = DecodeOrderedCollectionRoot(*ordered_only);
+  ASSERT_TRUE(decoded_ordered_only.ok());
+  EXPECT_EQ(*decoded_ordered_only, root);
+  auto wrong_presence = *ordered_only;
+  wrong_presence[13] = 1;
+  EXPECT_FALSE(DecodeOrderedCollectionRoot(wrong_presence).ok());
   root.member_index_ = GroupedHashRoot{.incarnation_ = root.incarnation_,
                                        .field_count_ = 3,
                                        .group_count_ = 1,
@@ -120,6 +128,8 @@ TEST(GroupedCollectionTest, IndexedSortedSetRootBindsBothGraphsAndKeepsV1) {
   auto bytes = EncodeOrderedCollectionRoot(root);
   ASSERT_TRUE(bytes.ok()) << bytes.status();
   EXPECT_EQ(bytes->size(), kIndexedSortedSetRootBytes);
+  EXPECT_EQ(bytes->substr(8, 4), std::string("\x01\0\0\0", 4));
+  EXPECT_EQ((*bytes)[13], '\x01');
   auto decoded = DecodeOrderedCollectionRoot(*bytes);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(*decoded, root);
@@ -127,8 +137,13 @@ TEST(GroupedCollectionTest, IndexedSortedSetRootBindsBothGraphsAndKeepsV1) {
     EXPECT_FALSE(DecodeOrderedCollectionRoot(bytes->substr(0, n)).ok()) << n;
   EXPECT_FALSE(DecodeOrderedCollectionRoot(*bytes + "x").ok());
   auto malformed = *bytes;
-  malformed[8] = 1;
+  malformed[8] = 2;
   EXPECT_FALSE(DecodeOrderedCollectionRoot(malformed).ok());
+  for (unsigned char flag : {0, 2, 255}) {
+    malformed = *bytes;
+    malformed[13] = static_cast<char>(flag);
+    EXPECT_FALSE(DecodeOrderedCollectionRoot(malformed).ok());
+  }
   root.member_index_->field_count_ = 2;
   EXPECT_FALSE(EncodeOrderedCollectionRoot(root).ok());
   root.member_index_->field_count_ = 3;

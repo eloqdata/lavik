@@ -271,7 +271,7 @@ Keep certificate paths and keys in process configuration. Meta and Admin
 descriptors retain their `tcp://` address spelling; their TLS mode comes from
 the process TLS options, independently of these Data listener tags.
 
-The CLI and Meta use only the current binary version 5 creation intent. Older
+The CLI and Meta use only the current binary version 1 creation intent. Earlier
 intent layouts have no decoder or mixed-version recovery contract; run the
 updated Meta and CLI together.
 
@@ -989,15 +989,14 @@ cluster; startup intentionally refuses to guess at a conversion.
 
 ## Binary replacement and format compatibility
 
-The physical segmented-WAL container remains v1 while the first release is
-unpublished. The current Raft command envelope is v4 and the
-`MetaTopologyStore` codec is v2; cluster-create intents are v5. These formats
-remove Policy hashes/references and grant-local lease configuration, and add
-the automatic Begin provenance described above. There is no decoder for the
-superseded pre-release layouts; development directories from another layout
-fail loudly or must be rebuilt. Other durable stores retain their own exact
-version markers. Equal version numbers in any one layer do not make
-incompatible builds safe to mix.
+All Keylane-owned durable and control formats use v1 while the first release
+is unpublished, including the Raft command envelope, topology store,
+segmented-WAL container, membership descriptors and intents, cluster-create
+intents, and cluster-status binary/JSON payloads. There is no decoder for
+superseded pre-release layouts. Development directories from an incompatible
+layout must be rebuilt even when their markers are also v1; marker checks
+cannot detect every same-marker schema change. Equal version numbers do not
+make incompatible builds safe to mix.
 There is no mixed-format window or in-band format switch. For a binary-only
 change that preserves every durable format, replace one follower at a time,
 wait for catch-up, and replace the leader last. Before any replacement, back

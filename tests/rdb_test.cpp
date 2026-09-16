@@ -85,7 +85,7 @@ TEST(RdbTest, StreamEncoderSupportsRedisSevenCompatibilityHeader) {
   EXPECT_EQ(streamed, RdbFile({}, 10));
 }
 
-TEST(RdbTest, UpgradesLegacyKeylaneStreamEncoding) {
+TEST(RdbTest, KeylaneStreamV1RequiresMacroNodeCounts) {
   std::string encoded = "KXS1";
   PutLe64(&encoded, 1);  // last ID milliseconds
   PutLe64(&encoded, 0);  // last ID sequence
@@ -100,18 +100,29 @@ TEST(RdbTest, UpgradesLegacyKeylaneStreamEncoding) {
   encoded += "f";
   PutLe32(&encoded, 1);
   encoded += "v";
+  const auto node_offset = encoded.size();
+  PutLe32(&encoded, 1);  // macro nodes
+  PutLe32(&encoded, 1);  // entries in the first macro node
   PutLe32(&encoded, 0);  // consumer groups
 
-  storage::RawValue legacy{.encoded_ = std::move(encoded),
-                           .logical_size_ = 1,
-                           .value_type_ = storage::ValueType::kStream};
-  auto dump = EncodeDump(legacy);
+  storage::RawValue raw{.encoded_ = std::move(encoded),
+                        .logical_size_ = 1,
+                        .value_type_ = storage::ValueType::kStream};
+  auto dump = EncodeDump(raw);
   ASSERT_TRUE(dump.ok()) << dump.status();
   auto restored = DecodeDump(*dump);
   ASSERT_TRUE(restored.ok()) << restored.status();
   EXPECT_EQ(restored->value_type_, storage::ValueType::kStream);
   EXPECT_EQ(restored->logical_size_, 1);
-  EXPECT_TRUE(restored->encoded_.starts_with("KXS2"));
+  EXPECT_TRUE(restored->encoded_.starts_with("KXS1"));
+  EXPECT_EQ(restored->encoded_, raw.encoded_);
+
+  auto unsupported = raw;
+  unsupported.encoded_[3] = '2';
+  EXPECT_FALSE(EncodeDump(unsupported).ok());
+  // A same-marker development layout without node counts is not upgraded.
+  raw.encoded_.erase(node_offset, 8);
+  EXPECT_FALSE(EncodeDump(raw).ok());
 }
 
 class TempFile {

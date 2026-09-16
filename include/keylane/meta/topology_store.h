@@ -86,7 +86,7 @@
 
 namespace keylane::meta {
 
-inline constexpr std::uint16_t kMetaTopologyStoreFormatVersion = 2;
+inline constexpr std::uint16_t kMetaTopologyStoreFormatVersion = 1;
 inline constexpr std::uint32_t kMaxMetaClusterFailureSummaryBytes = 512;
 
 // Durable lifecycle of the one logical Data cluster owned by a Meta Raft

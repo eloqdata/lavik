@@ -92,7 +92,10 @@ TEST(MetaIdentitySecurity, MemberDescriptorRoundTrips) {
       keylane::meta::MetaMemberIdentity::DecodeAux(member.EncodeAux());
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(*decoded, member);
-  EXPECT_TRUE(member.EncodeAux().starts_with("KMI2|"));
+  EXPECT_TRUE(member.EncodeAux().starts_with("KMI1|"));
+  std::string unsupported = member.EncodeAux();
+  unsupported[3] = '2';
+  EXPECT_FALSE(keylane::meta::MetaMemberIdentity::DecodeAux(unsupported).ok());
   EXPECT_FALSE(
       keylane::meta::MetaMemberIdentity::DecodeAux("KMI1|7|keylane://meta/7")
           .ok());

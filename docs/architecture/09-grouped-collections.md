@@ -98,19 +98,20 @@ incarnation, group identity, field count, retirement state and a nested batch
 decision when present. Auxiliary records never enter the user-key winner merge
 or Redis key/expiry counts.
 
-The ordered-root payload has two checked versions: version 1 is 72 bytes and
-describes only the ordered graph; version 2 is 136 bytes and appends the
-64-byte Hash root for an indexed Sorted Set. Ordered auxiliary identifiers
-have zero prefix bits and a nonzero opaque page number. Member auxiliaries
-use canonical Hash prefixes (including the unsplit `{0, 0}` root), a disjoint
+The version-1 ordered-root payload has two checked shapes: 72 bytes describe
+only the ordered graph; 136 bytes append the 64-byte Hash root for an indexed
+Sorted Set. A member-index presence flag must agree with the payload length,
+so a truncated indexed root cannot decode as an ordered-only root.
+Ordered auxiliary identifiers have zero prefix bits and a nonzero opaque page
+number. Member auxiliaries use canonical Hash prefixes (including the unsplit
+`{0, 0}` root), a disjoint
 identity space under the same Sorted Set type and incarnation. Recovery
 bounds each graph by its own root revision.
 
-Version-1 Sorted Sets remain readable and writable through the scan-based
-member path. New keys, compact promotions and streaming imports build
-version-2 roots; startup does not rewrite legacy objects. Older binaries
-cannot read the new dual-index format; logical export/import is required to
-move such data back to an older format.
+Ordered-only Sorted Sets use the scan-based member path. New keys, compact
+promotions and streaming imports build indexed roots; decoding never invents
+an absent member index. Both shapes use the current unreleased v1 schema,
+without compatibility decoders or migration for earlier development layouts.
 
 Page score bounds are derived runtime metadata, not new durable fields. Writes
 derive them from complete replacement pages and publish them with the same

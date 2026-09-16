@@ -27,7 +27,7 @@ namespace {
 constexpr std::size_t kMaxManifestBytes = 64 * 1024;
 constexpr std::size_t kMaxAdminCommandBytes = 64 * 1024;
 constexpr std::size_t kMaxWireString = 64 * 1024;
-constexpr std::uint16_t kWireVersion = 5;
+constexpr std::uint16_t kWireVersion = 1;
 constexpr std::uint32_t kMaxManifestItems = 16'384;
 
 absl::Status Invalid(std::string message) {

@@ -1300,8 +1300,10 @@ TEST(MetaTopologyStore, DeserializeRejectsCorruption) {
   std::string bad_version = bytes;
   bad_version[0] = '\x7F';
   ExpectStoreFailStop(MetaTopologyStore::Deserialize(bad_version).status());
+  EXPECT_EQ(bytes[0], '\x01');
+  EXPECT_EQ(bytes[1], '\x00');
   std::string old_development_version = bytes;
-  old_development_version[0] = '\x01';
+  old_development_version[0] = '\x02';
   ExpectStoreFailStop(
       MetaTopologyStore::Deserialize(old_development_version).status());
 }

@@ -111,9 +111,9 @@ def create_request(meta, node_id, endpoint, group_id, meta_id=None,
     """Send a normalized public v1 envelope so CLI cannot hide races."""
     metas = meta if isinstance(meta, (list, tuple)) else [meta]
     operation_id = operation_id or os.urandom(16)
-    # Direct admission/recovery cases construct the same current v5 durable
+    # Direct admission/recovery cases construct the same current v1 durable
     # intent as the CLI. Older persisted layouts are deliberately unsupported.
-    payload = struct.pack(">H", 5) + operation_id
+    payload = struct.pack(">H", 1) + operation_id
     payload += struct.pack(">HII", 1, 5000, 5000)
     payload += struct.pack(">I", len(metas))
     for member in sorted(metas, key=lambda item: item.id):

@@ -16,7 +16,7 @@ namespace {
 constexpr std::string_view kNodePrefix = "keylane://node/";
 constexpr std::string_view kMetaPrefix = "keylane://meta/";
 constexpr std::string_view kOperatorPrefix = "keylane://operator/";
-constexpr std::string_view kAuxPrefix = "KMI2|";
+constexpr std::string_view kAuxPrefix = "KMI1|";
 
 bool IsLowerHex(std::string_view text) {
   for (const char c : text) {
@@ -142,14 +142,14 @@ std::string MetaMemberIdentity::EncodeAux() const {
 absl::StatusOr<MetaMemberIdentity> MetaMemberIdentity::DecodeAux(
     std::string_view aux) {
   if (!aux.starts_with(kAuxPrefix)) {
-    return absl::InvalidArgumentError("missing KMI2 member identity prefix");
+    return absl::InvalidArgumentError("missing KMI1 member identity prefix");
   }
   aux.remove_prefix(kAuxPrefix.size());
   std::array<std::string_view, 4> fields;
   for (std::size_t index = 0; index < fields.size() - 1; ++index) {
     const std::size_t separator = aux.find('|');
     if (separator == std::string_view::npos) {
-      return absl::InvalidArgumentError("truncated KMI2 member identity");
+      return absl::InvalidArgumentError("truncated KMI1 member identity");
     }
     fields[index] = aux.substr(0, separator);
     aux.remove_prefix(separator + 1);
