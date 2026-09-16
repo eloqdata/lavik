@@ -4,6 +4,8 @@
 
 **两库读取的范围同为 1 亿个 key，每条 10 × 128 字节；库内实际总记录数不同。** 两库保留历史写入数据，CPU 配额和测量时间也不同。下文完整列出这些差异，结果适用于这里记录的部署配置。
 
+**本报告的 Aerospike 数据来自沿用 Keylane 宿主调优的环境，不能作为“系统保持原样”的 Aerospike 基线。** 切换到 Aerospike 时仅将其进程可用 CPU 放开为 0–15，housekeeping、网卡 IRQ 和 irqbalance 状态没有恢复。未调优宿主上的 Aerospike QPS 与长尾尚未测得，现有记录无法量化这项设置的性能影响。
+
 ## 机型与资源配置
 
 | 项目 | 配置 |
@@ -14,11 +16,16 @@
 | 数据链路 | 客户端 `172.16.0.5` → 服务端 `172.16.0.4`；内核网络 |
 | 物理存储 | 六块 NVMe 组成 Linux RAID0 `/dev/md0`；总容量约 10.48 TiB，chunk=512 KiB |
 | Keylane CPU | CPU 0–11：12 个逻辑 CPU、6 个物理核；12 个固定 worker，独立 benchmark slice |
-| Aerospike CPU | CPU 0–15：16 个逻辑 CPU、8 个物理核；独立 benchmark slice |
-| 系统与网卡 IRQ | housekeeping 和 mlx5 IRQ 使用 CPU 12–15；irqbalance 关闭 |
+| Aerospike CPU | CPU 0–15：16 个逻辑 CPU、8 个物理核；自定义 benchmark slice，宿主保留 Keylane 调优 |
+| 系统任务（两库测量期间） | `system.slice`、`user.slice`、`init.scope` 限制到 CPU 12–15；unbound workqueue 掩码 `f000` |
+| 网卡 IRQ（两库测量期间） | 快照中的 17 个 mlx5 IRQ 有效亲和性均在 CPU 12–15；irqbalance 状态为 `inactive` |
 | 后台监控 | 客户端保留 Prometheus / Grafana；测量时未运行 perf/BPF 或编译 |
 
 CPU 12–15 同时在 Aerospike 的可用范围内，两库 CPU 配额和隔离条件不同。固定 per-CPU 内核线程与 managed NVMe IRQ 不保证全部迁移。两库串行测量，没有同时争用该 RAID0。硬件与放置记录见[机器清单](verified-update-matrix/machine-inventory.json)、[Keylane 环境](verified-update-matrix/flush100-abcd-20260914-environment.json)和[Aerospike 环境](verified-update-matrix/main-f666837-abcd-20260914-environment.json)。
+
+Aerospike 原批次环境的 `affinity_before` 保存了上述宿主状态，8 个正式窗口的 `server_before` / `server_after` 均记录进程可用 CPU 0–15。[实际启动函数](verified-update-matrix/connection_matrix.py)设置 `AllowedCPUs=0-15`、`CPUAffinity=0-15`，没有恢复系统任务、workqueue 或 IRQ 策略。测量进程能使用全部 CPU，并不表示宿主配置保持原样。
+
+未调优的 Aerospike 基线应保留主机原有的任务调度、IRQ 分布和 irqbalance 状态，不额外套用 Keylane 的隔离策略。需要在该环境中重新测量后，才能给出对应成绩。
 
 ## 数据量
 
@@ -91,7 +98,7 @@ Keylane 测量窗口为 **2026-09-14 16:01:47–16:42:38 UTC**；Aerospike 为 *
 
 每格：**该操作 QPS；p99 / p999 / p9999（ms）**。各项独立四舍五入，显示的操作 QPS 之和可能与总 QPS 相差 1。
 
-| Workload | 限速 | 操作 | Aerospike CE | Keylane HREPLACE（100ms） |
+| Workload | 限速 | 操作 | Aerospike CE（宿主保留 Keylane 调优） | Keylane HREPLACE（100ms） |
 |---|---|---|---:|---:|
 | A | 不限速 | 总 QPS | 485,671 | 473,477 |
 | A | 不限速 | READ | 242,840；3.223 / 13.247 / 29.311 | 236,730；2.953 / 4.967 / 6.759 |
@@ -115,7 +122,7 @@ Keylane 测量窗口为 **2026-09-14 16:01:47–16:42:38 UTC**；Aerospike 为 *
 | D | 100K | INSERT | 5,001；0.382 / 0.507 / 1.226 | 4,998；0.393 / 0.557 / 1.280 |
 
 
-不限速下，Keylane 的 B/C/D 吞吐分别高 28.92% / 35.91% / 31.81%，A 吞吐低 2.51%；表内各操作长尾均更低。100K 下，A 的 Keylane 读写长尾更高，B/C/D 的小差异不作确定优劣判断。上述差异包含 CPU 配额、历史数据状态和测量时间等因素。
+在上述历史配置下，Keylane 的不限速 B/C/D 吞吐分别高 28.92% / 35.91% / 31.81%，A 吞吐低 2.51%；表内各操作长尾均更低。100K 下，A 的 Keylane 读写长尾更高，B/C/D 的小差异不作确定优劣判断。上述差异包含宿主调优、CPU 配额、历史数据状态和测量时间等因素，不能外推为相对未调优 Aerospike 基线的收益。
 
 ## 原始结果与离线复核
 

@@ -231,6 +231,9 @@ script.
 Both databases read from the same 100-million-key range with ten 128-byte
 fields per record. Actual total record counts, CPU allocations, and measurement
 windows differ; the report lists these conditions beside the results.
+The Aerospike runs retained Keylane's host housekeeping and NIC IRQ tuning,
+with irqbalance inactive. They do not establish Aerospike performance on an
+untuned host; that baseline has not been measured.
 
 ## Durability and compatibility notes
 
