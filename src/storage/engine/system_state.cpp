@@ -10,8 +10,8 @@ namespace keylane::storage {
 namespace {
 
 constexpr std::uint64_t kSystemStateManifestMagic =
-    0x324d5453534c4bULL;                                            // KLSSTM2
-constexpr std::uint64_t kPromotionBaseMagic = 0x32455341424c4bULL;  // KLB ASE2
+    0x314d5453534c4bULL;                                            // KLSSTM1
+constexpr std::uint64_t kPromotionBaseMagic = 0x31455341424c4bULL;  // KLBASE1
 constexpr std::size_t kSystemStateManifestHeaderBytes = 96;
 constexpr std::size_t kMaxPromotionBaseBytes = 1024 * 1024;
 

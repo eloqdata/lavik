@@ -188,17 +188,10 @@ enum class MetaAuditPolicy : std::uint8_t {
   kStrictExport = 2,
 };
 
-// Version of the Raft command/WAL envelope, independent from individual
-// store codecs. Version 4 removes retired Policy commands, caller-supplied
-// Policy content hashes and references, redundant authority/grant revisions,
-// independently stored configuration epochs,
-// and the durable grant specification; records automatic-failover trigger
-// provenance on uncontrolled begins; and optionally carries a CAS witness for
-// the pristine Submitted Controlled requests that apply preempts atomically
-// for the affected Group.
-// Older WALs fail stop at decode; Keylane has no compatibility path for these
-// pre-release formats. Removed command-tag values remain reserved.
-inline constexpr std::uint16_t kMetaCommandFormatVersion = 4;
+// The Raft command/WAL envelope uses the current unreleased v1 layout only.
+// Equal markers do not promise compatibility with earlier development WALs;
+// incompatible data directories must be recreated. Removed tags stay reserved.
+inline constexpr std::uint16_t kMetaCommandFormatVersion = 1;
 
 // Wire tag per command. Tags are append-only and never reused.
 enum class MetaCommandTag : std::uint16_t {

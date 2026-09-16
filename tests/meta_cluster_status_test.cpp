@@ -107,7 +107,7 @@ TEST(MetaClusterStatusWireTest, RoundTripsStrictBoundedV1Messages) {
   ASSERT_TRUE(encoded_status.ok()) << encoded_status.status();
   EXPECT_EQ(
       encoded_status->substr(std::string("OK clusterstatus 1 ").size(), 4),
-      "0004");
+      "0001");
   auto decoded_status = DecodeClusterStatusReply(*encoded_status);
   ASSERT_TRUE(decoded_status.ok()) << decoded_status.status();
   EXPECT_EQ(*decoded_status, status);
@@ -651,7 +651,7 @@ TEST(MetaClusterStatusRenderTest, JsonUsesStableArraysAndStringU64) {
   auto json = RenderClusterStatusJson(outcome);
   ASSERT_TRUE(json.ok()) << json.status();
   EXPECT_TRUE(
-      json->starts_with("{\"schema_version\":3,\"result\":\"not_ready\""));
+      json->starts_with("{\"schema_version\":1,\"result\":\"not_ready\""));
   EXPECT_NE(json->find("\"committed_index\":\"50\""), std::string::npos);
   EXPECT_LT(json->find("\"code\":\"a\""), json->find("\"code\":\"z\""));
 }

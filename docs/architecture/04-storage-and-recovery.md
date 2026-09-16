@@ -185,14 +185,22 @@ envelope leaves framing space within the 1 GiB record-payload limit while
 preserving the independent 512 MiB limit for each field and value. Hash and Set
 use persisted-seed hash prefixes; List uses stable ordered page identities.
 Indexed Sorted Sets use both disjoint identity spaces under their collection
-type. Their version-2 ordered-root payload appends the member Hash root, while
-version-1 ordered-only payloads remain readable. Roots preserve an independent
+type. The version-1 ordered-root payload has a checked presence flag for the
+optional appended member Hash root. Roots preserve an independent
 group revision, distinct from the source command sequence shared by mutations
 in a replay envelope.
 Header length is derived from
 those flags and key length; total record length is derived from header and
 payload length. Neither derived length is stored. The decoded `RecordHeader`
 is a runtime view rather than a persisted C++ object representation.
+
+The compact Stream payload uses the current `KXS1` layout, including persisted
+macro-node entry counts that preserve approximate-trim boundaries across
+restart and RDB export/import. It does not reconstruct those boundaries from
+current settings or accept earlier development layouts without node counts.
+Keylane-owned storage schemas remain at v1 while unreleased; incompatible
+development media is recreated, not migrated. Redis RDB versions follow the
+external Redis format independently.
 
 The current version-1 format also includes checkpoint metadata and the
 system-state root and manifest. During pre-deployment development this layout

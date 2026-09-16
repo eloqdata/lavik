@@ -185,7 +185,7 @@ absl::StatusOr<std::string> EncodeMembershipIntent(
       plan.bindings_.size() > kMaxMetaNodes)
     return Conflict("membership intent exceeds member bound");
   MetaWriter w;
-  w.WriteU16(2);
+  w.WriteU16(kMetaFormatVersion);
   w.WriteBool(plan.add_);
   WritePeer(w, plan.target_);
   WriteBinding(w, plan.binding_);
@@ -210,8 +210,9 @@ absl::StatusOr<MetaMembershipIntent> DecodeMembershipIntent(
   auto binding = ReadBinding(r);
   auto before = r.ReadList<MetaMembershipPeer>(kMaxMetaNodes, ReadPeer);
   auto bindings = r.ReadList<MetaMemberRecord>(kMaxMetaNodes, ReadBinding);
-  if (!version.ok() || *version != 2 || !add.ok() || !target.ok() ||
-      !binding.ok() || !before.ok() || !bindings.ok() || !r.Finish().ok())
+  if (!version.ok() || *version != kMetaFormatVersion || !add.ok() ||
+      !target.ok() || !binding.ok() || !before.ok() || !bindings.ok() ||
+      !r.Finish().ok())
     return Conflict("invalid membership intent encoding");
   if (before->empty() || binding->server_id_ != target->id_ ||
       binding->principal_ != target->principal_ ||
@@ -501,8 +502,8 @@ celer::Task<absl::Status> MetaMembershipReconciler::Run(
         // Clear transport grace only after the complete identity projection
         // is authoritative. The marker is durable so a crash or another
         // election-time config copy cannot strand an unfinished genesis.
-        if (absl::Status status = core->state_mgr_->CompleteInitialBindings(
-                view.applied_index());
+        if (absl::Status status =
+                core->state_mgr_->CompleteInitialBindings(view.applied_index());
             !status.ok()) {
           if (last_cut != status.message()) {
             spdlog::critical(

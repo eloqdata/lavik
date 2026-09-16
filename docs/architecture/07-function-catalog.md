@@ -38,7 +38,7 @@ complete target
      native-event limit
   -> hidden stage and cross-worker validation
   -> use the pre-mutation replication publication admission
-  -> commit the complete dump to system-state v2
+  -> commit the complete dump to system-state v1
   -> non-failing worker-runtime and process-global metadata swaps
   -> publish the original Redis Function command
   -> client reply
@@ -70,7 +70,7 @@ the dump CRC64. It is a reference for local recovery and promotion; it is not
 exchanged as replication identity and does not make two nodes' generations
 comparable.
 
-Storage system-state v2 has one worker-zero writer shared by catalog and
+Storage system-state v1 has one worker-zero writer shared by catalog and
 promotion updates. A copy-on-write manifest retains the catalog extent list,
 catalog token, full-sync readiness, population token, and optional promotion
 base. Each update starts from the complete previous manifest, so a catalog

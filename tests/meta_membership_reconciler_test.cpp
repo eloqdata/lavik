@@ -241,6 +241,12 @@ TEST_F(MembershipRecoveryTest, CodecIsBoundedStrictAndCanonical) {
   auto bytes = EncodeMembershipIntent(intent_);
   ASSERT_TRUE(bytes.ok());
   EXPECT_EQ(*DecodeMembershipIntent(*bytes), intent_);
+  ASSERT_GE(bytes->size(), 2u);
+  EXPECT_EQ((*bytes)[0], '\x01');
+  EXPECT_EQ((*bytes)[1], '\x00');
+  auto unsupported = *bytes;
+  unsupported[0] = '\x02';
+  EXPECT_FALSE(DecodeMembershipIntent(unsupported).ok());
   EXPECT_FALSE(DecodeMembershipIntent(*bytes + "x").ok());
   EXPECT_FALSE(
       DecodeMembershipIntent(bytes->substr(0, bytes->size() - 1)).ok());

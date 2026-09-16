@@ -481,12 +481,18 @@ TEST(ClusterCreateManifestTest, RoundTripsDualAndTlsOnlyListeners) {
       EXPECT_EQ(manifest->data_nodes_[0].tls_endpoint_, tls);
       auto request = EncodeClusterCreateRequest(*manifest, OperationId(7));
       ASSERT_TRUE(request.ok()) << request.status();
-      EXPECT_TRUE(request->starts_with("clustercreate 1 0005"));
+      EXPECT_TRUE(request->starts_with("clustercreate 1 0001"));
       MetaOperationId root{};
       auto decoded = DecodeClusterCreateRequest(*request, &root);
       ASSERT_TRUE(decoded.ok()) << decoded.status();
       EXPECT_EQ(*decoded, *manifest);
       EXPECT_EQ(root, OperationId(7));
+      for (const auto marker :
+           {"0000", "0002", "0003", "0004", "0005", "ffff"}) {
+        auto unsupported = *request;
+        unsupported.replace(std::string("clustercreate 1 ").size(), 4, marker);
+        EXPECT_FALSE(DecodeClusterCreateRequest(unsupported, &root).ok());
+      }
     }
   }
 }

@@ -23,7 +23,7 @@ namespace keylane::meta {
 namespace {
 
 constexpr std::uint16_t kHeadWireVersion = 1;
-constexpr std::uint16_t kStatusWireVersion = 4;
+constexpr std::uint16_t kStatusWireVersion = 1;
 constexpr std::size_t kMaxItems = 65'536;
 constexpr std::size_t kMaxString = 64 * 1024;
 constexpr std::size_t kMaxWireReply = 256 * 1024 * 1024;
@@ -1385,7 +1385,7 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::CaptureStatus(
 absl::StatusOr<std::string> RenderClusterStatusJson(
     const ClusterStatusOutcome& outcome) {
   std::string json =
-      "{\"schema_version\":3,\"result\":" + Quote(ResultName(outcome.result_)) +
+      "{\"schema_version\":1,\"result\":" + Quote(ResultName(outcome.result_)) +
       ",\"readiness_basis\":\"meta_observed_v1\"";
   if (!outcome.status_.has_value()) {
     json += ",\"meta_available\":false,\"meta_membership_stable\":false";

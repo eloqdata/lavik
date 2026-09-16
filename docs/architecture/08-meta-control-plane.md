@@ -834,22 +834,18 @@ Both peers must use the same layout; earlier Policy-bearing layouts have no
 compatibility or negotiation path. This wire version is independent of the
 durable schemas below.
 
-Commands, stores, records, exports, snapshots, and the physical segmented WAL
-carry independent exact format markers. The command envelope and topology
-store are respectively v4 and v2; the aggregate snapshot envelope, other
-persisted stores, and segmented-WAL container retain their existing v1
-markers. Command v4 removes Policy retirement, content hashes, Policy
-references, durable successor-grant specification, separate authority/Grant
-revision counters, and term-preserving Grant revocation. It adds automatic
-`BeginUncontrolledFailover` provenance and a pristine-operation CAS witness;
-apply preempts the complete bounded set for the Group. Policy snapshots retain
-only registered-family raw histories and typed-decodable current values. None
-of these unreleased layouts has a legacy decoder, so development directories
-from a different same-marker or older layout are not interchangeable. Every
-configured Meta identity has one
-canonical concrete numeric Data-control endpoint and one canonical concrete
-numeric Admin endpoint. The
-NuRaft `srv_config::aux` `KMI2` descriptor carries the server id, derived
+Commands, stores, records, operation intents, exports, snapshots, and the
+physical segmented WAL carry exact v1 format markers. Admin binary payloads
+and the cluster-status JSON schema also use v1. Before Keylane's first stable
+release, these development schemas are replaced in place without a legacy
+decoder or mixed-layout negotiation. Equal markers do not make earlier
+development state interchangeable.
+Policy snapshots retain only registered-family raw histories and
+typed-decodable current values.
+
+Every configured Meta identity has one canonical concrete numeric
+Data-control endpoint and one canonical concrete numeric Admin endpoint. The
+NuRaft `srv_config::aux` `KMI1` descriptor carries the server id, derived
 principal, and both endpoints; Raft keeps its endpoint in the native field.
 The descriptor and committed identity binding must agree exactly. Advertised
 Data-control and Admin addresses may route through an explicit proxy instead
@@ -857,23 +853,21 @@ of equaling their local process binds; restart can likewise rebind a Raft
 listener behind a transport proxy without changing its durable advertised
 endpoint. Endpoints are immutable, unique within their
 respective directories, and change only through retirement and replacement
-with a fresh server id. The previous partial `KMI1` development descriptor is
-rejected and is not migrated. Durable
-operation evidence includes its exact group id, reporter assignment and boot,
-population identity, history, and operation id. These summaries retain identity
+with a fresh server id. Partial member descriptors are rejected rather than
+migrated. Durable operation evidence includes its exact group id, reporter
+assignment and boot, population identity, history, and operation id. These
+summaries retain identity
 anchors, not a fingerprint of the discarded observation body. Snapshot decoding
 rejects malformed identity anchors and evidence that names a missing group or an
 impossible future group/population epoch; older committed evidence remains
 valid history after a group legitimately advances or the reporter moves.
-These unreleased formats evolve independently in place. A shared version
-number in one layer does not guarantee compatibility with earlier development
-layouts: their data directories are recreated rather than migrated. Keylane
-Meta does not negotiate durable formats between mixed binary versions and has
-no in-band schema-switch command. Incompatible changes require coordinated
-replacement of the Meta cluster.
-Readers reject unknown markers and trailing bytes so incompatible state fails
-at startup or replay instead of being interpreted approximately. The
-independent segmented-WAL marker follows the same fail-loudly rule.
+
+Incompatible development data directories are recreated rather than migrated.
+Keylane Meta does not negotiate durable formats between mixed binary versions
+and has no in-band schema-switch command. Incompatible changes require
+coordinated replacement of the Meta cluster. Readers reject unknown markers,
+malformed fields, and trailing bytes, including in the segmented WAL; these
+checks do not guarantee detection of every incompatible same-marker layout.
 
 ## Authentication, membership, and audit
 
@@ -1039,8 +1033,8 @@ Data ids needed for diagnostics; it does not scan operation kinds. The
 non-terminal. The server also exposes specific `meta_catching_up`,
 `data_unregistered`, `data_unregistered_retrying`, `data_unobserved`, and
 `data_session_missing` blockers. The public command remains `clusterstatus 1`;
-its incompatible strict inner payload is version 4, and JSON rendering is
-schema 3. Every Group includes `automatic_failover_state`, optional
+its strict inner payload and JSON rendering both use schema v1. Every Group
+includes `automatic_failover_state`, optional
 `current_reason`, `suspect_elapsed_ms`, `effective_threshold_ms`, and optional
 `blocked_reason`. The state itself records when a Begin is being triggered;
 the threshold is a derived scalar rather than Policy identity or content.
@@ -1102,10 +1096,9 @@ Defaults for `automatic_uncontrolled_failover_enabled`,
 rejects unknown TOML structure and files over 64 KiB, then
 sorts nodes, Groups, replicas and ranges and merges adjacent ranges belonging
 to the same Group. The CLI renders that canonical plan and requires exact
-lowercase `yes` unless `--yes` is present. Only this normalized multi-Group
-and multi-Meta shape is accepted under version 1; the earlier scalar-Meta
-payload has no compatibility decoder. The request and persisted intent use
-binary version 5 only. Older binary intents are intentionally unsupported.
+lowercase `yes` unless `--yes` is present. The manifest, request, and persisted
+intent use version 1 with this normalized multi-Group and multi-Meta shape
+only; earlier development layouts have no compatibility decoder.
 
 After an `Uninitialized` and pristine client check, the CLI generates a root
 operation id and sends one `clustercreate 1` request to the discovered leader.

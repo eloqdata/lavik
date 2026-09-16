@@ -20,8 +20,9 @@
 namespace keylane {
 namespace {
 
-constexpr std::string_view kMagicV1 = "KXS1";
-constexpr std::string_view kMagicV2 = "KXS2";
+// The current unreleased v1 layout includes macro-node counts. Earlier
+// development layouts are not decoded or reconstructed from live settings.
+constexpr std::string_view kMagic = "KXS1";
 constexpr std::string_view kGroupStateMagic = "KXG1";
 constexpr std::string_view kRestoreGroupSubcommand =
     "__keylane_restore_group_v1";
@@ -71,19 +72,6 @@ struct Stream {
   std::vector<std::uint32_t> node_entries_;
   std::vector<Group> groups_;
 };
-
-void SynthesizeStreamNodes(Stream* stream) {
-  stream->node_entries_.clear();
-  const std::uint32_t maximum =
-      g_stream_node_max_entries.load(std::memory_order_relaxed);
-  std::size_t remaining = stream->entries_.size();
-  while (remaining != 0) {
-    const auto count =
-        static_cast<std::uint32_t>(std::min<std::size_t>(remaining, maximum));
-    stream->node_entries_.push_back(count);
-    remaining -= count;
-  }
-}
 
 bool ValidStreamNodes(const Stream& stream) {
   std::size_t total = 0;
@@ -332,10 +320,9 @@ absl::StatusOr<Stream> Decode(
     const std::optional<storage::CompactValueView>& value) {
   if (!value) return Stream{};
   const std::string_view in = value->encoded_;
-  const bool version_two = in.starts_with(kMagicV2);
-  if (!version_two && !in.starts_with(kMagicV1))
+  if (!in.starts_with(kMagic))
     return absl::InternalError("invalid persisted Stream");
-  std::size_t at = kMagicV1.size();
+  std::size_t at = kMagic.size();
   Stream stream;
   std::uint32_t entry_count = 0, group_count = 0;
   if (!GetId(in, &at, &stream.last_id_) ||
@@ -362,23 +349,19 @@ absl::StatusOr<Stream> Decode(
     }
     stream.entries_.push_back(std::move(entry));
   }
-  if (version_two) {
-    std::uint32_t node_count = 0;
-    if (!Get32(in, &at, &node_count) || node_count > stream.entries_.size()) {
-      return absl::InternalError("invalid persisted Stream nodes");
-    }
-    stream.node_entries_.reserve(node_count);
-    for (std::uint32_t i = 0; i < node_count; ++i) {
-      std::uint32_t count = 0;
-      if (!Get32(in, &at, &count))
-        return absl::InternalError("truncated persisted Stream nodes");
-      stream.node_entries_.push_back(count);
-    }
-    if (!ValidStreamNodes(stream))
-      return absl::InternalError("invalid persisted Stream node counts");
-  } else {
-    SynthesizeStreamNodes(&stream);
+  std::uint32_t node_count = 0;
+  if (!Get32(in, &at, &node_count) || node_count > stream.entries_.size()) {
+    return absl::InternalError("invalid persisted Stream nodes");
   }
+  stream.node_entries_.reserve(node_count);
+  for (std::uint32_t i = 0; i < node_count; ++i) {
+    std::uint32_t count = 0;
+    if (!Get32(in, &at, &count))
+      return absl::InternalError("truncated persisted Stream nodes");
+    stream.node_entries_.push_back(count);
+  }
+  if (!ValidStreamNodes(stream))
+    return absl::InternalError("invalid persisted Stream node counts");
   if (!Get32(in, &at, &group_count))
     return absl::InternalError("truncated persisted Stream groups");
   constexpr std::size_t kMinimumGroupBytes =
@@ -434,7 +417,7 @@ absl::StatusOr<std::string> Encode(const Stream& stream) {
   if (!fits32(stream.entries_.size()) || !fits32(stream.node_entries_.size()) ||
       !fits32(stream.groups_.size()) || !ValidStreamNodes(stream))
     return absl::OutOfRangeError("Stream exceeds storage limits");
-  std::uint64_t encoded_bytes = kMagicV2.size() + 2 * 16 + 8 + 4;
+  std::uint64_t encoded_bytes = kMagic.size() + 2 * 16 + 8 + 4;
   auto add_bytes = [&](std::uint64_t bytes) {
     if (bytes > storage::kMaxStringBytes - encoded_bytes) return false;
     encoded_bytes += bytes;
@@ -477,7 +460,7 @@ absl::StatusOr<std::string> Encode(const Stream& stream) {
   }
   std::string out;
   out.reserve(static_cast<std::size_t>(encoded_bytes));
-  out.append(kMagicV2);
+  out.append(kMagic);
   PutId(&out, stream.last_id_);
   PutId(&out, stream.max_deleted_id_);
   Put64(&out, stream.entries_added_);
@@ -1080,7 +1063,7 @@ Task<CommandReply> ExecuteRead(
              initialize, group_read, group_name, consumer_name,
              is_new = new_messages[k], noack, count, locked_digest, local_tx,
              request_ptr = &attempt_request]() mutable
-            -> Task<absl::StatusOr<ReadOneResult>> {
+                -> Task<absl::StatusOr<ReadOneResult>> {
               co_return co_await ReadOneLocal(
                   db, std::move(key), cursor, initialize, group_read,
                   std::move(group_name), std::move(consumer_name), is_new,

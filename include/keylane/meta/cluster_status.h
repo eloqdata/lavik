@@ -158,8 +158,8 @@ struct ClusterStatusWireV1 {
 
 // `clusterhead 1` and `clusterstatus 1` name the outer Admin verb revision;
 // their lowercase-hex binary payloads have independent leading schema markers
-// (currently head v1 and status v4). The WireV1 suffix names that outer
-// contract, not the inner payload marker. The human-inspectable line envelope
+// (both v1). The WireV1 suffix names the outer contract, not the inner payload
+// marker. The human-inspectable line envelope
 // also lets typed transient errors use the normal `ERR <kind>` form.
 absl::StatusOr<std::string> EncodeClusterHeadReply(
     const ClusterHeadWireV1& head);
@@ -229,7 +229,7 @@ class ClusterOperator {
   MetaAdminRoundTrip round_trip_;
 };
 
-// Deterministic public renderers. JSON has its own schema v3, independent of
+// Deterministic public renderers. JSON has its own schema v1, independent of
 // both Admin verb and binary payload revisions. JSON u64 values are decimal
 // strings and all arrays are sorted independently of server iteration order.
 absl::StatusOr<std::string> RenderClusterStatusJson(

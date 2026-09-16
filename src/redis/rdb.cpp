@@ -72,8 +72,9 @@ constexpr std::uint64_t kCrcPolynomial = 0xad93d23594c935a9ULL;
 constexpr std::string_view kListMagic = "KLL1";
 
 constexpr std::string_view kZSetMagic = "KZS1";
-constexpr std::string_view kStreamMagicV1 = "KXS1";
-constexpr std::string_view kStreamMagicV2 = "KXS2";
+// Keylane's v1 Stream layout includes macro-node counts; it is independent of
+// the standard Redis RDB version and has no legacy development decoder.
+constexpr std::string_view kStreamMagic = "KXS1";
 constexpr std::uint32_t kDefaultStreamNodeMaxEntries = 100;
 
 absl::Status Bad(std::string_view detail = {}) {
@@ -1602,9 +1603,7 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
     return LogicalValue{raw.value_type_, std::move(values)};
   }
   if (raw.value_type_ == storage::ValueType::kStream) {
-    const bool version_two = input.starts_with(kStreamMagicV2);
-    if ((!version_two && !input.starts_with(kStreamMagicV1)) ||
-        input.size() < 48)
+    if (!input.starts_with(kStreamMagic) || input.size() < 48)
       return Bad("invalid Keylane Stream");
     Reader reader(input.substr(4));
     Stream stream;
@@ -1635,21 +1634,17 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
       }
       stream.entries.push_back(std::move(entry));
     }
-    if (version_two) {
-      std::uint32_t nodes = 0;
-      if (!reader.Le32(&nodes) || nodes > stream.entries.size())
-        return Bad("invalid Keylane Stream nodes");
-      stream.node_entries.reserve(nodes);
-      for (std::uint32_t i = 0; i < nodes; ++i) {
-        std::uint32_t count = 0;
-        if (!reader.Le32(&count)) return Bad("truncated Keylane Stream nodes");
-        stream.node_entries.push_back(count);
-      }
-      if (!ValidStreamNodes(stream))
-        return Bad("invalid Keylane Stream node counts");
-    } else {
-      SynthesizeStreamNodes(&stream);
+    std::uint32_t nodes = 0;
+    if (!reader.Le32(&nodes) || nodes > stream.entries.size())
+      return Bad("invalid Keylane Stream nodes");
+    stream.node_entries.reserve(nodes);
+    for (std::uint32_t i = 0; i < nodes; ++i) {
+      std::uint32_t count = 0;
+      if (!reader.Le32(&count)) return Bad("truncated Keylane Stream nodes");
+      stream.node_entries.push_back(count);
     }
+    if (!ValidStreamNodes(stream))
+      return Bad("invalid Keylane Stream node counts");
     if (!reader.Le32(&groups)) return Bad("truncated Keylane Stream groups");
     for (std::uint32_t i = 0; i < groups; ++i) {
       Group group;
@@ -1816,7 +1811,7 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
       }
     }
     raw.logical_size_ = stream.entries.size();
-    raw.encoded_ = std::string(kStreamMagicV2);
+    raw.encoded_ = std::string(kStreamMagic);
     raw.encoded_.reserve(bytes);
     PutLe64(&raw.encoded_, stream.last.ms);
     PutLe64(&raw.encoded_, stream.last.seq);

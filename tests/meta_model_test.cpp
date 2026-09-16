@@ -360,7 +360,7 @@ TEST(MetaModelCommands, EnvelopeStartsWithFormatVersionThenTag) {
   const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
   const std::uint16_t version = static_cast<std::uint16_t>(p[0] | (p[1] << 8));
   const std::uint16_t tag = static_cast<std::uint16_t>(p[2] | (p[3] << 8));
-  EXPECT_EQ(version, 4);
+  EXPECT_EQ(version, 1);
   EXPECT_EQ(version, keylane::meta::kMetaCommandFormatVersion);
   EXPECT_EQ(tag, static_cast<std::uint16_t>(
                      keylane::meta::MetaCommandTag::kRegisterNode));
@@ -368,9 +368,9 @@ TEST(MetaModelCommands, EnvelopeStartsWithFormatVersionThenTag) {
 
 TEST(MetaModelCommands, UnknownFormatVersionFails) {
   const std::string bytes = MustEncode(MakeRegisterNode());
-  // Earlier development WAL envelopes retain removed fields. There is no
-  // compatibility decoder for those pre-release formats.
-  for (const std::uint16_t bad_version : {0, 1, 2, 3, 5, 0x7FFF, 0xFFFF}) {
+  // Only the current v1 envelope is supported; larger markers are not a
+  // compatibility path for earlier development layouts.
+  for (const std::uint16_t bad_version : {0, 2, 3, 4, 5, 0x7FFF, 0xFFFF}) {
     std::string corrupt = bytes;
     corrupt[0] = static_cast<char>(bad_version & 0xFF);
     corrupt[1] = static_cast<char>((bad_version >> 8) & 0xFF);
@@ -1029,7 +1029,7 @@ TEST(MetaModelCommands, DirectiveResultReceiptCommandsRoundTrip) {
 
 TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
   EXPECT_EQ(keylane::meta::kMetaFormatVersion, 1);
-  EXPECT_EQ(keylane::meta::kMetaCommandFormatVersion, 4);
+  EXPECT_EQ(keylane::meta::kMetaCommandFormatVersion, 1);
   // Removed command tags are permanent holes: 9 was GrantAuthority and 14
   // was RetirePolicy. Later tags must never shift into those values.
   EXPECT_EQ(static_cast<std::uint16_t>(

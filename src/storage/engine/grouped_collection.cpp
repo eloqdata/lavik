@@ -149,8 +149,11 @@ absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
     return absl::InvalidArgumentError("invalid ordered collection root");
   std::string bytes(kRootBytes, '\0');
   bytes.replace(0, kRootMagic.size(), kRootMagic);
-  Store(bytes, 8, root.member_index_ ? 2 : 1, 4);
+  Store(bytes, 8, 1, 4);
   Store(bytes, 12, static_cast<unsigned>(root.kind_), 1);
+  // Both shapes are v1. An explicit presence flag, rather than length alone,
+  // prevents a truncated indexed root from becoming a valid ordered-only root.
+  Store(bytes, 13, root.member_index_.has_value(), 1);
   Store(bytes, 16, root.incarnation_, 8);
   Store(bytes, 24, root.item_count_, 8);
   Store(bytes, 32, root.first_group_, 8);
@@ -170,9 +173,9 @@ absl::StatusOr<OrderedCollectionRoot> DecodeOrderedCollectionRoot(
     std::string_view bytes) {
   if ((bytes.size() != kRootBytes &&
        bytes.size() != kIndexedSortedSetRootBytes) ||
-      !bytes.starts_with(kRootMagic) ||
-      Load(bytes, 8, 4) != (bytes.size() == kRootBytes ? 1 : 2) ||
-      Load(bytes, 13, 3) != 0 || Load(bytes, 60, 4) != 0) {
+      !bytes.starts_with(kRootMagic) || Load(bytes, 8, 4) != 1 ||
+      Load(bytes, 13, 1) != (bytes.size() == kIndexedSortedSetRootBytes) ||
+      Load(bytes, 14, 2) != 0 || Load(bytes, 60, 4) != 0) {
     return absl::DataLossError("invalid ordered root encoding");
   }
   OrderedCollectionRoot root{
