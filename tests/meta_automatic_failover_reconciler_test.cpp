@@ -165,6 +165,10 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     MetaOperationId controlled_operation_id_ = Bytes<16>(0x31);
   };
 
+  // Ordinary fixture writes need the normal completion budget under parallel
+  // load. Only the explicit proposal-timeout test shortens it.
+  virtual std::uint64_t ProposeTimeoutMs() const { return 5'000; }
+
   void SetUp() override {
     const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
     dir_ = test::TestDataDirectory() /
@@ -234,7 +238,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     wal_ = static_cast<NuraftLogStore*>(store.get());
     MetaCoordinatorOptions coordinator_options;
     coordinator_options.foreign_executor_ = executor_;
-    coordinator_options.propose_timeout_ms_ = 100;
+    coordinator_options.propose_timeout_ms_ = ProposeTimeoutMs();
     coordinator_options.proposal_executor_ = &proposal_executor_;
     coordinator_ = std::make_unique<MetaCoordinator>(
         server_, *machine_, *wal_, observations_, coordinator_options);
@@ -413,6 +417,31 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     };
   }
 
+  // Poll one atomic cut without treating the async first publication (or a
+  // leadership reset) as a failed assertion or a default detector state.
+  bool WaitForGroupStatus(
+      const std::function<bool(const MetaAutomaticFailoverStatus&)>& predicate,
+      std::chrono::milliseconds timeout = 5s) const {
+    return WaitUntil(
+        [&] {
+          const auto snapshot = diagnostics_->Snapshot();
+          return snapshot.statuses_.size() == 1 &&
+                 predicate(snapshot.statuses_.front());
+        },
+        timeout);
+  }
+
+  // Warmup starts when the worker observes eligibility, not when the test
+  // publishes it. Keep the manual clock fixed until that observation is made.
+  bool WaitForLeadershipWarmup(std::uint64_t generation) const {
+    return WaitForGroupStatus([generation](const auto& status) {
+      return status.anchor_.leadership_generation_ == generation &&
+             status.blocker_ == MetaAutomaticFailoverBlocker::kLeadershipWarmup;
+    });
+  }
+
+  // Use only after publication is established, including invariant checks
+  // where losing the previously observed diagnostic is itself a failure.
   MetaAutomaticFailoverStatus GroupStatus() const {
     const auto snapshot = diagnostics_->Snapshot();
     EXPECT_EQ(snapshot.statuses_.size(), 1u);
@@ -694,52 +723,51 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
   bool release_reconciler_block_ = false;
 };
 
+class MetaAutomaticFailoverReconcilerTimeoutTest
+    : public MetaAutomaticFailoverReconcilerTest {
+ protected:
+  std::uint64_t ProposeTimeoutMs() const override { return 100; }
+};
+
 TEST_F(MetaAutomaticFailoverReconcilerTest,
        NewGenerationRepeatsWarmupAndAFullDebounce) {
   SeedCluster();
   std::atomic<int> generated_ids{0};
+  BlockReconcilerExecutor();
   InstallReconciler(CountingIds(generated_ids));
   StartEligibleGeneration(1);
 
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto snapshot = diagnostics_->Snapshot();
-    return snapshot.leadership_generation_ == 1 &&
-           snapshot.statuses_.size() == 1 &&
-           snapshot.statuses_[0].blocker_ ==
-               MetaAutomaticFailoverBlocker::kLeadershipWarmup;
-  }));
+  // Force the pre-publication window regardless of worker scheduling. Even an
+  // unconditional predicate must keep waiting while no Group cut exists.
+  EXPECT_FALSE(WaitForGroupStatus([](const auto&) { return true; }, 0ms));
+  ReleaseReconcilerExecutor();
+  ASSERT_TRUE(WaitForLeadershipWarmup(1));
 
   now_steady_ms_.store(10'100, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.accumulated_suspect_ms_ == 0;
   }));
   now_steady_ms_.store(11'099, std::memory_order_release);
-  ASSERT_TRUE(
-      WaitUntil([&] { return GroupStatus().accumulated_suspect_ms_ == 999; }));
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.accumulated_suspect_ms_ == 999;
+  }));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 0);
 
   // A new leadership generation discards both the old warmup and its 999 ms
   // suspicion; neither interval is allowed to leak into the new bracket.
   now_steady_ms_.store(20'000, std::memory_order_release);
   StartEligibleGeneration(2);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto snapshot = diagnostics_->Snapshot();
-    return snapshot.leadership_generation_ == 2 &&
-           snapshot.statuses_.size() == 1 &&
-           snapshot.statuses_[0].blocker_ ==
-               MetaAutomaticFailoverBlocker::kLeadershipWarmup;
-  }));
+  ASSERT_TRUE(WaitForLeadershipWarmup(2));
   now_steady_ms_.store(20'100, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.accumulated_suspect_ms_ == 0;
   }));
   now_steady_ms_.store(21'099, std::memory_order_release);
-  ASSERT_TRUE(
-      WaitUntil([&] { return GroupStatus().accumulated_suspect_ms_ == 999; }));
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.accumulated_suspect_ms_ == 999;
+  }));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 0);
 
   now_steady_ms_.store(21'100, std::memory_order_release);
@@ -757,22 +785,16 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   InstallReconciler(CountingIds(generated_ids));
   StartEligibleGeneration(1);
 
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto snapshot = diagnostics_->Snapshot();
-    return snapshot.leadership_generation_ == 1 &&
-           snapshot.statuses_.size() == 1 &&
-           snapshot.statuses_[0].blocker_ ==
-               MetaAutomaticFailoverBlocker::kLeadershipWarmup;
-  }));
+  ASSERT_TRUE(WaitForLeadershipWarmup(1));
   now_steady_ms_.store(10'100, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.accumulated_suspect_ms_ == 0;
   }));
   now_steady_ms_.store(11'099, std::memory_order_release);
-  ASSERT_TRUE(
-      WaitUntil([&] { return GroupStatus().accumulated_suspect_ms_ == 999; }));
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.accumulated_suspect_ms_ == 999;
+  }));
 
   // Hold the detector worker so the false -> true eligibility interruption is
   // entirely between two snapshots. A boolean-only status loses this ABA edge
@@ -807,14 +829,14 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 0);
 
   now_steady_ms_.store(11'200, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.accumulated_suspect_ms_ == 0;
   }));
   now_steady_ms_.store(12'199, std::memory_order_release);
-  ASSERT_TRUE(
-      WaitUntil([&] { return GroupStatus().accumulated_suspect_ms_ == 999; }));
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.accumulated_suspect_ms_ == 999;
+  }));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 0);
 
   now_steady_ms_.store(12'200, std::memory_order_release);
@@ -1060,7 +1082,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 2);
 }
 
-TEST_F(MetaAutomaticFailoverReconcilerTest,
+TEST_F(MetaAutomaticFailoverReconcilerTimeoutTest,
        UncertainRetryBackoffStartsAfterProposalReturns) {
   SeedCluster();
   std::atomic<int> generated_ids{0};
@@ -1152,9 +1174,9 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                     /*effective_lease_duration_ms=*/250)
                   .ok());
 
+  ASSERT_TRUE(WaitForLeadershipWarmup(1));
   now_steady_ms_.store(10'100, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kBlocked &&
            status.blocker_ == MetaAutomaticFailoverBlocker::kCausalLeasePending;
   }));
@@ -1167,8 +1189,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                      /*observed_at_steady_ms=*/10'250,
                                      /*draining=*/true)
                   .ok());
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ == MetaOwnerServiceabilityReason::kDraining;
   })) << "causal progress remains fresh at the exact lease boundary";
@@ -1180,8 +1201,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                      /*observed_at_unix_ms=*/1'000'251,
                                      /*observed_at_steady_ms=*/10'251)
                   .ok());
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ ==
                MetaOwnerServiceabilityReason::kHeartbeatExpired;
@@ -1206,9 +1226,10 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                     /*effective_lease_duration_ms=*/5'000)
                   .ok());
 
+  ASSERT_TRUE(WaitForLeadershipWarmup(1));
   now_steady_ms_.store(10'100, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    return GroupStatus().state_ == MetaAutomaticFailoverState::kHealthy;
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.state_ == MetaAutomaticFailoverState::kHealthy;
   }));
 
   // Advance the committed and runtime FDS without another Owner heartbeat.
@@ -1233,8 +1254,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
       projected->full_state);
 
   now_steady_ms_.store(10'250, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kBlocked &&
            status.blocker_ == MetaAutomaticFailoverBlocker::kStaleOwnerAnchor;
   })) << "the replacement duration cannot shorten the old lease at its "
@@ -1242,22 +1262,19 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 0);
 
   now_steady_ms_.store(10'251, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kBlocked &&
            status.blocker_ == MetaAutomaticFailoverBlocker::kStaleOwnerAnchor;
   })) << "a Policy update cannot retroactively shorten an installed lease";
 
   now_steady_ms_.store(15'000, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kBlocked &&
            status.blocker_ == MetaAutomaticFailoverBlocker::kStaleOwnerAnchor;
   })) << "the old lease remains possibly active at received + D";
 
   now_steady_ms_.store(15'001, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ ==
                MetaOwnerServiceabilityReason::kHeartbeatExpired &&
@@ -1265,8 +1282,9 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
   })) << "known expiry must outrank the ordinary cross-source anchor tear";
 
   now_steady_ms_.store(16'000, std::memory_order_release);
-  ASSERT_TRUE(
-      WaitUntil([&] { return GroupStatus().accumulated_suspect_ms_ == 999; }));
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.accumulated_suspect_ms_ == 999;
+  }));
   EXPECT_FALSE(machine_->StoresSnapshot()
                    .topology_.FindGroup("g1")
                    ->failover_transition_.has_value());
@@ -1352,9 +1370,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                      /*observed_at_unix_ms=*/1'012'100,
                                      /*observed_at_steady_ms=*/22'100)
                   .ok());
-  ASSERT_TRUE(WaitUntil([&] {
-    return GroupStatus().blocker_ ==
-           MetaAutomaticFailoverBlocker::kAuthorityHandoff;
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.blocker_ == MetaAutomaticFailoverBlocker::kAuthorityHandoff;
   })) << "same-authority FDS replacement must retain the handoff marker";
 
   const auto replacement_runtime = data_runtime_->Snapshot();
@@ -1377,9 +1394,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
           .granted_duration_ms = 250,
       },
       /*written_unix_ms=*/1'012'100);
-  ASSERT_TRUE(WaitUntil([&] {
-    return GroupStatus().blocker_ !=
-           MetaAutomaticFailoverBlocker::kAuthorityHandoff;
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.blocker_ != MetaAutomaticFailoverBlocker::kAuthorityHandoff;
   }));
   ASSERT_EQ(GroupStatus().state_, MetaAutomaticFailoverState::kBlocked);
   EXPECT_EQ(GroupStatus().blocker_,
@@ -1407,8 +1423,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                      /*observed_at_unix_ms=*/1'012'300,
                                      /*observed_at_steady_ms=*/22'300)
                   .ok());
-  ASSERT_TRUE(WaitUntil([&] {
-    return GroupStatus().state_ == MetaAutomaticFailoverState::kHealthy;
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.state_ == MetaAutomaticFailoverState::kHealthy;
   }));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 0);
 }
@@ -1472,8 +1488,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
       seed.owner_, Bytes<16>(0x33), /*heartbeat_sequence=*/3, node_not_ready,
       /*written_unix_ms=*/1'000'020);
 
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ ==
                MetaOwnerServiceabilityReason::kStorageUnready;
@@ -1566,8 +1581,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
          "possibly-live Grant at received + D";
 
   now_steady_ms_.store(28'001, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ ==
                MetaOwnerServiceabilityReason::kHeartbeatExpired;
@@ -1602,9 +1616,10 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                     /*observed_at_steady_ms=*/10'000,
                                     /*effective_lease_duration_ms=*/250)
                   .ok());
+  ASSERT_TRUE(WaitForLeadershipWarmup(1));
   now_steady_ms_.store(10'100, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    return GroupStatus().state_ == MetaAutomaticFailoverState::kHealthy;
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.state_ == MetaAutomaticFailoverState::kHealthy;
   }));
 
   now_unix_ms_.store(1'000'250, std::memory_order_release);
@@ -1615,8 +1630,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                      /*observed_at_steady_ms=*/10'250,
                                      /*draining=*/true)
                   .ok());
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ == MetaOwnerServiceabilityReason::kDraining;
   })) << "repeated confirmation remains fresh at the exact lease boundary";
@@ -1628,8 +1642,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                      /*observed_at_unix_ms=*/1'000'251,
                                      /*observed_at_steady_ms=*/10'251)
                   .ok());
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ ==
                MetaOwnerServiceabilityReason::kHeartbeatExpired;
@@ -1653,12 +1666,13 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                     /*effective_lease_duration_ms=*/250)
                   .ok());
 
+  ASSERT_TRUE(WaitForLeadershipWarmup(1));
   // Owner freshness shares the detector's monotonic clock. Moving the wall
   // clock backwards while steady time advances by 100 ms cannot age it.
   now_unix_ms_.store(999'000, std::memory_order_release);
   now_steady_ms_.store(10'100, std::memory_order_release);
-  ASSERT_TRUE(WaitUntil([&] {
-    return GroupStatus().state_ == MetaAutomaticFailoverState::kHealthy;
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.state_ == MetaAutomaticFailoverState::kHealthy;
   }));
   EXPECT_EQ(generated_ids.load(std::memory_order_acquire), 0);
 
@@ -1671,8 +1685,8 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                      /*observed_at_unix_ms=*/999'000,
                                      /*observed_at_steady_ms=*/10'100)
                   .ok());
-  ASSERT_TRUE(WaitUntil([&] {
-    return GroupStatus().state_ == MetaAutomaticFailoverState::kHealthy;
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
+    return status.state_ == MetaAutomaticFailoverState::kHealthy;
   }));
 
   now_unix_ms_.store(1'000'001, std::memory_order_release);
@@ -1692,8 +1706,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                      /*observed_at_steady_ms=*/10'350,
                                      /*draining=*/true)
                   .ok());
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ == MetaOwnerServiceabilityReason::kDraining;
   })) << "causal progress remains fresh at received + effective lease TTL";
@@ -1705,8 +1718,7 @@ TEST_F(MetaAutomaticFailoverReconcilerTest,
                                      /*observed_at_unix_ms=*/1'000'251,
                                      /*observed_at_steady_ms=*/10'351)
                   .ok());
-  ASSERT_TRUE(WaitUntil([&] {
-    const auto status = GroupStatus();
+  ASSERT_TRUE(WaitForGroupStatus([](const auto& status) {
     return status.state_ == MetaAutomaticFailoverState::kSuspect &&
            status.current_reason_ ==
                MetaOwnerServiceabilityReason::kHeartbeatExpired;
