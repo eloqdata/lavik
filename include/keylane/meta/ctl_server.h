@@ -122,7 +122,7 @@
 //   removesrv <id>         -> the same durable workflow/wait contract. Only a
 //                             committed removal retires the committed
 //                             member identity.
-//   exportaudit <through>  -> "OK <hex>" versioned, hash-chained export.
+//   exportaudit <through>  -> "OK <hex>" versioned, ordered record export.
 //   pruneaudit <through>   -> replicated prefix prune; callers must durably
 //                             store the matching export first.
 //   exportoperations      -> "OK <hex>" versioned archived-operation export.
@@ -166,7 +166,6 @@
 //                             candidate reporter/assignment identity is
 //                             derived from the trusted session identity and
 //                             the same committed snapshot used for admission;
-//                             evidence_hash is computed as SHA-256(evidence)
 //                             by the ctl, not taken from the wire). "OK" on
 //                             admission, "ERR <detail>" on rejection — every
 //                             rejection also lands in the audit ring.

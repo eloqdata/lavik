@@ -183,7 +183,6 @@ class ClusterCreateV1RecoveryTest : public testing::Test {
     result.status_ = status;
     result.result_ =
         status == MetaDirectiveResultStatus::kSucceeded ? "ready" : "failed";
-    result.result_hash_ = MetaSha256(result.result_);
     return result;
   }
 

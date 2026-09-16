@@ -404,15 +404,13 @@ bool SameApplied(const control::FullStateApplied& applied,
                  const NodeControlBatch& batch) {
   return applied.source_meta_applied_index ==
              batch.full_state.source_meta_applied_index &&
-         applied.projection_hash == batch.full_state.projection_hash &&
-         applied.object_hash == batch.full_state.object_hash;
+         applied.projection_hash == batch.full_state.projection_hash;
 }
 
 control::FullStateApplied AppliedReceipt(const NodeControlBatch& batch) {
   return control::FullStateApplied{
       .source_meta_applied_index = batch.full_state.source_meta_applied_index,
       .projection_hash = batch.full_state.projection_hash,
-      .object_hash = batch.full_state.object_hash,
   };
 }
 
@@ -600,8 +598,7 @@ bool ReceiptMatches(const MetaTerminalReceipt& receipt,
   return receipt.recipient_node_id_ == node_id &&
          receipt.recipient_boot_id_ == boot_id &&
          receipt.assignment_id_ == result.assignment_id &&
-         status == wire_status && receipt.result_hash_ == result.result_hash &&
-         receipt.result_ == result.result;
+         status == wire_status && receipt.result_ == result.result;
 }
 
 control::ResultCommitted ResultAck(const control::DirectiveResult& result,
@@ -610,7 +607,6 @@ control::ResultCommitted ResultAck(const control::DirectiveResult& result,
       .session_id = result.session_id,
       .recipient_boot_id = result.recipient_boot_id,
       .identity = result.identity,
-      .result_hash = result.result_hash,
       .committed_index = receipt.committed_index_,
   };
 }
@@ -792,14 +788,8 @@ absl::Status detail::ApplyLeadershipValidityLimit(
     directive.basis.source_meta_applied_index = state.source_meta_applied_index;
     directive.basis.projection_hash = state.projection_hash;
   }
-  // The object hash authenticates the exact encoded object and therefore
-  // becomes stale whenever the process-local lease ceiling changes the
-  // projection. Encode accepts an empty hash while rebuilding it, but rejects
-  // a nonzero stale hash as an inconsistent caller assertion.
-  state.object_hash = {};
   auto encoded = control::EncodeFullDesiredState(state);
   if (!encoded.ok()) return encoded.status();
-  state.object_hash = control::ComputeSha256(*encoded);
   batch.encoded_full_state = std::move(*encoded);
   return absl::OkStatus();
 }
@@ -985,7 +975,6 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
                       .candidate_assignment_id_ = wire.candidate_assignment_id,
                       .candidate_boot_id_ = *candidate_boot,
                       .prepared_context_id_ = wire.prepared_context_id,
-                      .prepared_context_hash_ = wire.prepared_context_hash,
                   }};
             } else {
               failover_observation_value = MetaFailoverObservationObs{
@@ -1047,9 +1036,6 @@ absl::Status IngestOperationEvidenceObservation(
     return absl::InvalidArgumentError(
         "operation evidence reporter boot mismatch");
   }
-  if (evidence.evidence_hash != control::ComputeSha256(evidence.evidence)) {
-    return absl::DataLossError("operation evidence content hash mismatch");
-  }
   auto history = ParseIdentity<20>(evidence.replication_history_id,
                                    "evidence replication history id");
   if (!history.ok()) return history.status();
@@ -1061,7 +1047,6 @@ absl::Status IngestOperationEvidenceObservation(
       .assignment_id_ = evidence.assignment_id,
       .operation_id_ = evidence.operation_id,
       .kind_phase_ = evidence.kind_phase,
-      .evidence_hash_ = evidence.evidence_hash,
       .evidence_ = evidence.evidence,
       .group_id_ = evidence.group_id,
       .group_term_ = evidence.group_term,
@@ -2699,10 +2684,9 @@ celer::Task<absl::Status> HandleDirectiveResult(
   auto parsed_boot = ParseIdentity<20>(result.recipient_boot_id,
                                        "directive result recipient boot id");
   if (!parsed_boot.ok() || *parsed_boot != boot_id ||
-      result.session_id != session_id ||
-      result.result_hash != control::ComputeSha256(result.result)) {
+      result.session_id != session_id) {
     co_return absl::InvalidArgumentError(
-        "directive result session, boot, or content hash mismatch");
+        "directive result session or boot mismatch");
   }
 
   const MetaTerminalReceiptKey key{
@@ -2794,7 +2778,6 @@ celer::Task<absl::Status> HandleDirectiveResult(
       .recipient_boot_id_ = boot_id,
       .assignment_id_ = result.assignment_id,
       .status_ = status,
-      .result_hash_ = result.result_hash,
       .result_ = result.result,
   };
   MetaLeaderContext* context = core->leader_context_;
@@ -2936,23 +2919,10 @@ celer::Task<absl::Status> RunEstablishedSession(
       if (heartbeat->session_id != state->session_id_) {
         co_return absl::InvalidArgumentError("heartbeat session id mismatch");
       }
-      auto encoded = control::EncodeMessage(control::WireMessage(*heartbeat));
-      if (!encoded.ok()) co_return encoded.status();
-      auto sequence = heartbeat_window.Observe(
-          heartbeat->heartbeat_sequence, control::ComputeSha256(*encoded));
-      if (!sequence.ok()) co_return sequence.status();
-      if (*sequence ==
-          control::HeartbeatSequenceDisposition::kReplayCachedAck) {
-        if (!cached_ack.has_value()) {
-          co_return absl::InternalError("heartbeat ack cache is empty");
-        }
-        if (absl::Status sent =
-                co_await state->io_->Send(control::MessagePriority::kAuthority,
-                                          control::WireMessage(*cached_ack));
-            !sent.ok()) {
-          co_return sent;
-        }
-        continue;
+      if (absl::Status sequence =
+              heartbeat_window.Observe(heartbeat->heartbeat_sequence);
+          !sequence.ok()) {
+        co_return sequence;
       }
 
       // Observation ingestion is independent from publisher progress and

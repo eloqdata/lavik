@@ -2583,7 +2583,6 @@ celer::Task<std::string> DispatchCommand(
       payload.evidence_ = tokens[7];
       // The digest of the normalized payload is computed at ingestion; the
       // wire never carries a self-reported hash.
-      payload.evidence_hash_ = MetaSha256(payload.evidence_);
       payload.group_id_ = tokens[8];
       if (!ParseU64(tokens[9], payload.group_term_) ||
           !ParseU64(tokens[10], payload.population_manifest_revision_) ||

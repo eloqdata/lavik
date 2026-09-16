@@ -2657,8 +2657,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   std::string summary = absl::StrCat(
       "CommitDirectiveResult operation=", HexBytes(cmd.operation_id_),
       " attempt=", HexBytes(cmd.attempt_id_),
-      " directive_revision=", cmd.directive_revision_,
-      " result_hash=", HexBytes(cmd.result_hash_));
+      " directive_revision=", cmd.directive_revision_);
   const MetaTerminalReceiptKey key{cmd.operation_id_, cmd.directive_id_,
                                    cmd.attempt_id_, cmd.directive_revision_};
   // A receipt is immutable committed history: an exact retry must still

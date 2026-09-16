@@ -108,8 +108,8 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   if (desired.source_meta_applied_index == 0) {
     return Invalid("source Meta applied index is zero");
   }
-  if (IsZero(desired.projection_hash) || IsZero(desired.object_hash)) {
-    return Invalid("projection or object hash is empty");
+  if (IsZero(desired.projection_hash)) {
+    return Invalid("projection hash is empty");
   }
   auto semantic_hash = control::ComputeProjectionHash(desired);
   if (!semantic_hash.ok()) {
@@ -347,7 +347,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   return PreparedFullState{
       .serving_state_ = std::move(*state),
       .authority_lease_duration_ms_ = desired.authority_lease_duration_ms,
-      .object_hash_ = desired.object_hash,
       .control_groups_ = std::move(control_groups),
       .desired_cluster_controls_ = std::move(desired_cluster_controls),
   };

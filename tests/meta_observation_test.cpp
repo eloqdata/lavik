@@ -228,7 +228,6 @@ MetaObservation EvidenceObs(MetaObservationIdentity identity,
   payload.operation_id_ = operation_id;
   payload.kind_phase_ = std::move(phase);
   payload.evidence_ = "evidence-bytes";
-  payload.evidence_hash_ = keylane::meta::MetaSha256(payload.evidence_);
   payload.group_id_ = std::move(group_id);
   payload.group_term_ = term;
   payload.population_manifest_revision_ = manifest;
@@ -1346,13 +1345,6 @@ TEST(MetaObservationStore,
   EXPECT_TRUE(
       RingHas(store, MetaObsAuditKind::kRejected, "assignment-mismatch"));
 
-  MetaObservation bad_hash =
-      EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 7, 42);
-  std::get<MetaOperationEvidenceObs>(bad_hash.payload_).evidence_hash_.fill(0);
-  ExpectDomainReject(store.Ingest(std::move(bad_hash), facts, 1003));
-  EXPECT_TRUE(
-      RingHas(store, MetaObsAuditKind::kRejected, "evidence-hash-mismatch"));
-
   EXPECT_TRUE(store
                   .Ingest(EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1",
                                       "g1", 3, 7, 42),
@@ -1406,7 +1398,6 @@ TEST(MetaObservationStore, EvidenceLatestWinsPerNodeAndPhase) {
   auto& replaced_evidence =
       std::get<MetaOperationEvidenceObs>(replaced.payload_);
   replaced_evidence.evidence_ = "v2";
-  replaced_evidence.evidence_hash_ = keylane::meta::MetaSha256("v2");
   ASSERT_TRUE(store.Ingest(replaced, facts, 1002).ok());
   ASSERT_TRUE(store
                   .Ingest(EvidenceObs(Ident("n2", 0x0a, 1), OpId(0x51), "p1",
@@ -1430,7 +1421,6 @@ TEST(MetaObservationStore, EvidenceLatestWinsPerNodeAndPhase) {
   EXPECT_EQ(summary.group_id_, evidence[0].group_id_);
   EXPECT_EQ(summary.assignment_id_, evidence[0].assignment_id_);
   EXPECT_EQ(summary.population_manifest_digest_, manifest_digest);
-  EXPECT_EQ(summary.kind_hash_, evidence[0].evidence_hash_);
   EXPECT_EQ(store.EvidenceForOperation(OpId(0x77), facts, 1003).size(), 0);
   EXPECT_EQ(store.size(), 3);
 }
@@ -1471,7 +1461,6 @@ TEST(MetaObservationStore,
       EvidenceObs(Ident("n1", 0x0a, 1), OpId(0x51), "p1", "g1", 3, 7, 42);
   auto& payload = std::get<MetaOperationEvidenceObs>(replacement.payload_);
   payload.evidence_ = "replacement-is-longer";
-  payload.evidence_hash_ = keylane::meta::MetaSha256(payload.evidence_);
   ASSERT_TRUE(store.Ingest(std::move(replacement), facts, 1003).ok());
   EXPECT_EQ(store.size(), 2u);
   EXPECT_GT(store.retained_bytes(), before_reject);

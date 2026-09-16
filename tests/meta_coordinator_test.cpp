@@ -1053,9 +1053,9 @@ TEST_F(MetaCoordinatorServerTest, ProposeInjectsActorAndReturnsAuditVerdict) {
   ASSERT_TRUE(stores.identity_.FindNode(MakeNodeId(0x11)).has_value());
   const auto audit = stores.audit_.Find(accepted->log_index_);
   ASSERT_TRUE(audit.has_value());
-  EXPECT_EQ(audit->record_.actor_principal_, kTestPrincipal);
-  EXPECT_FALSE(audit->record_.readable_time_.empty());
-  EXPECT_NE(audit->record_.readable_time_.find('T'), std::string::npos);
+  EXPECT_EQ(audit->actor_principal_, kTestPrincipal);
+  EXPECT_FALSE(audit->readable_time_.empty());
+  EXPECT_NE(audit->readable_time_.find('T'), std::string::npos);
 
   // A domain rejection surfaces as the apply VERDICT (from the audit store),
   // not as a propose-level error: the index was committed and consumed.
@@ -1369,8 +1369,8 @@ TEST_F(MetaCoordinatorServerTest,
 
   const auto abort_audit = after.audit_.Find(aborted->log_index_);
   ASSERT_TRUE(abort_audit.has_value());
-  abort.actor_.principal_ = abort_audit->record_.actor_principal_;
-  abort.actor_.readable_time_ = abort_audit->record_.readable_time_;
+  abort.actor_.principal_ = abort_audit->actor_principal_;
+  abort.actor_.readable_time_ = abort_audit->readable_time_;
   auto encoded_abort = MetaStateMachine::EncodeCommand(MetaCommand{abort});
   ASSERT_TRUE(encoded_abort.ok()) << encoded_abort.status();
   machine_->commit(aborted->log_index_, **encoded_abort);
@@ -1968,7 +1968,6 @@ TEST_F(MetaCoordinatorServerTest,
   const auto stores = machine_->StoresSnapshot();
   EXPECT_EQ(stores.operation_.LiveCount(), 1u);
   EXPECT_EQ(stores.audit_.size(), 2u);
-  EXPECT_TRUE(stores.audit_.VerifyChain());
   EXPECT_GE(machine_->last_commit_index(), committed_before);
 
   // The committed stream is alive on the new leader: a fresh subscription

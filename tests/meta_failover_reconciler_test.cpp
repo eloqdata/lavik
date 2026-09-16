@@ -351,8 +351,7 @@ struct Fixture {
         .candidate_node_id_ = action.candidate_.node_id_,
         .candidate_assignment_id_ = action.candidate_.assignment_id_,
         .candidate_boot_id_ = action.candidate_.boot_id_,
-        .prepared_context_id_ = Bytes<16>(0x71),
-        .prepared_context_hash_ = Bytes<32>(0x72)};
+        .prepared_context_id_ = Bytes<16>(0x71)};
     ReportCandidate(action.candidate_.node_id_,
                     action.candidate_.assignment_id_,
                     action.candidate_.boot_id_, now, std::move(frontier),
@@ -1856,8 +1855,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
     ASSERT_NE(machine->commit(++committed_index, **encoded), nullptr);
     const auto audit = machine->StoresSnapshot().audit_.Find(committed_index);
     ASSERT_TRUE(audit.has_value());
-    ASSERT_EQ(audit->record_.verdict_, meta::MetaAuditVerdict::kAccepted)
-        << audit->record_.verdict_detail_;
+    ASSERT_EQ(audit->verdict_, meta::MetaAuditVerdict::kAccepted)
+        << audit->verdict_detail_;
   };
 
   const meta::MetaOperationId root = Bytes<16>(0xe0);
@@ -2045,8 +2044,8 @@ TEST(MetaFailoverReconcilerLifecycleTest,
     ASSERT_NE(machine->commit(++committed_index, **encoded), nullptr);
     const auto audit = machine->StoresSnapshot().audit_.Find(committed_index);
     ASSERT_TRUE(audit.has_value());
-    ASSERT_EQ(audit->record_.verdict_, meta::MetaAuditVerdict::kAccepted)
-        << audit->record_.verdict_detail_;
+    ASSERT_EQ(audit->verdict_, meta::MetaAuditVerdict::kAccepted)
+        << audit->verdict_detail_;
   };
 
   const meta::MetaOperationId root = Bytes<16>(0xe4);
@@ -2182,8 +2181,7 @@ TEST(MetaFailoverReconcilerLifecycleTest,
       .candidate_node_id_ = action.candidate_.node_id_,
       .candidate_assignment_id_ = action.candidate_.assignment_id_,
       .candidate_boot_id_ = action.candidate_.boot_id_,
-      .prepared_context_id_ = Bytes<16>(0xeb),
-      .prepared_context_hash_ = Bytes<32>(0xec)};
+      .prepared_context_id_ = Bytes<16>(0xeb)};
   candidate_result = observations.ReplaceHeartbeat(
       candidate_identity,
       {.storage_ready_ = true, .population_ready_ = true, .active_groups_ = 1},

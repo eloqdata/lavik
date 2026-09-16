@@ -49,7 +49,7 @@ MetaAuditRecord MakeAuditRecord(
 }
 
 // ---------------------------------------------------------------------------
-// MetaAuditStore: append, keyed idempotency, rolling hash chain.
+// MetaAuditStore: append, keyed idempotency, ordered records.
 // ---------------------------------------------------------------------------
 
 TEST(MetaAuditStore, AppendAndFindByLogIndex) {
@@ -59,51 +59,37 @@ TEST(MetaAuditStore, AppendAndFindByLogIndex) {
 
   auto first = store.Find(1);
   ASSERT_TRUE(first.has_value());
-  EXPECT_EQ(first->record_, MakeAuditRecord(1));
+  EXPECT_EQ(*first, MakeAuditRecord(1));
   auto second = store.Find(2);
   ASSERT_TRUE(second.has_value());
-  EXPECT_EQ(second->record_.command_summary_, "FenceGroup(g1)");
+  EXPECT_EQ(second->command_summary_, "FenceGroup(g1)");
   EXPECT_FALSE(store.Find(3).has_value());
   EXPECT_EQ(store.size(), 2);
 }
 
-TEST(MetaAuditStore, ChainHashIsDeterministicAndLinksAcrossRecords) {
+TEST(MetaAuditStore, IndependentStoresSerializeTheSameOrderedRecords) {
   MetaAuditStore a;
   MetaAuditStore b;
   for (std::uint64_t i = 1; i <= 3; ++i) {
     ASSERT_TRUE(a.Append(MakeAuditRecord(i)).ok());
     ASSERT_TRUE(b.Append(MakeAuditRecord(i)).ok());
   }
-  // Same input sequence on two independent stores yields the identical chain.
-  EXPECT_EQ(a.chain_head(), b.chain_head());
-  // Every record's hash differs from its predecessor's (chaining, not a
-  // constant), and the all-zero hash never occurs naturally.
-  MetaHash256 previous{};
+  EXPECT_EQ(a.Serialize(), b.Serialize());
   for (std::uint64_t i = 1; i <= 3; ++i) {
-    auto entry = a.Find(i);
-    ASSERT_TRUE(entry.has_value());
-    EXPECT_NE(entry->chain_hash_, previous);
-    previous = entry->chain_hash_;
+    EXPECT_EQ(a.Find(i), MakeAuditRecord(i));
   }
-  // Content anywhere in the chain changes the head.
-  MetaAuditStore c;
-  for (std::uint64_t i = 1; i <= 2; ++i) {
-    ASSERT_TRUE(c.Append(MakeAuditRecord(i)).ok());
-  }
-  ASSERT_TRUE(c.Append(MakeAuditRecord(3, "SetSlotMap(...)")).ok());
-  EXPECT_NE(a.chain_head(), c.chain_head());
 }
 
 TEST(MetaAuditStore, ReplaySameIndexSameContentIsNoOp) {
   MetaAuditStore store;
   ASSERT_TRUE(store.Append(MakeAuditRecord(1)).ok());
   ASSERT_TRUE(store.Append(MakeAuditRecord(2)).ok());
-  const MetaHash256 head = store.chain_head();
+  const auto before = store.Serialize();
   // Replay rewrites the identical record at the same index: no-op.
   ASSERT_TRUE(store.Append(MakeAuditRecord(1)).ok());
   ASSERT_TRUE(store.Append(MakeAuditRecord(2)).ok());
   EXPECT_EQ(store.size(), 2);
-  EXPECT_EQ(store.chain_head(), head);
+  EXPECT_EQ(store.Serialize(), before);
 }
 
 TEST(MetaAuditStore, SameIndexDifferentContentFailsStop) {
@@ -147,7 +133,6 @@ TEST(MetaAuditStore, DefaultBoundedWindowRotatesAndReportsLoss) {
   EXPECT_TRUE(store.Find(2).has_value());
   EXPECT_EQ(store.dropped_total(), 1u);
   EXPECT_EQ(store.dropped_through(), 1u);
-  EXPECT_TRUE(store.VerifyChain());
 }
 
 TEST(MetaAuditStore, StrictExportFullWindowFailsStopIfGateIsBypassed) {
@@ -171,7 +156,7 @@ TEST(MetaAuditStore, DisabledSuppressesOrdinaryRecordsButForcedRecordRemains) {
   EXPECT_TRUE(store.Find(2).has_value());
 }
 
-TEST(MetaAuditStore, ExportDrainsRecordsWithTheirChainContext) {
+TEST(MetaAuditStore, ExportContainsCompleteOrderedRecords) {
   MetaAuditStore store;
   for (std::uint64_t i = 1; i <= 3; ++i) {
     ASSERT_TRUE(store.Append(MakeAuditRecord(i)).ok());
@@ -181,15 +166,12 @@ TEST(MetaAuditStore, ExportDrainsRecordsWithTheirChainContext) {
   const auto decoded = keylane::meta::DecodeMetaAuditExport(*bytes);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   ASSERT_EQ(decoded->records_.size(), 2);
-  // The export chains from the genesis anchor and carries per-record hashes,
-  // so an external archive can verify continuity and, within its own
-  // deployment namespace, deduplicate by (raft_log_index, record_hash).
-  EXPECT_EQ(decoded->anchor_before_, MetaHash256{});
+  // Each export is independently readable and includes complete records.
   EXPECT_EQ(decoded->records_[0], *store.Find(1));
   EXPECT_EQ(decoded->records_[1], *store.Find(2));
 }
 
-TEST(MetaAuditStore, PruneKeepsRemainingChainVerifiable) {
+TEST(MetaAuditStore, PrunePreservesRemainingRecords) {
   MetaAuditStore pruned;
   MetaAuditStore full;
   for (std::uint64_t i = 1; i <= 3; ++i) {
@@ -200,14 +182,10 @@ TEST(MetaAuditStore, PruneKeepsRemainingChainVerifiable) {
   EXPECT_FALSE(pruned.Find(1).has_value());
   EXPECT_FALSE(pruned.Find(2).has_value());
   EXPECT_EQ(pruned.pruned_floor(), 2);
-  EXPECT_TRUE(pruned.VerifyChain());
-  // Window truncation does not perturb the chain: the retained record keeps
-  // the hash it had in the untruncated window, and both stores extend it
-  // identically.
-  EXPECT_EQ(pruned.Find(3)->chain_hash_, full.Find(3)->chain_hash_);
+  EXPECT_EQ(pruned.Find(3), full.Find(3));
   ASSERT_TRUE(pruned.Append(MakeAuditRecord(4)).ok());
   ASSERT_TRUE(full.Append(MakeAuditRecord(4)).ok());
-  EXPECT_EQ(pruned.chain_head(), full.chain_head());
+  EXPECT_EQ(pruned.Find(4), full.Find(4));
 }
 
 TEST(MetaOperationStore, PruneArchiveFreesCapacityAfterExternalExport) {
@@ -263,7 +241,7 @@ TEST(MetaAuditStore, AppendAtOrBelowPrunedFloorFailsStop) {
   EXPECT_DEATH(store.Append(MakeAuditRecord(1)), "");
 }
 
-TEST(MetaAuditStore, SerializationRoundTripPreservesWindowAndChain) {
+TEST(MetaAuditStore, SerializationRoundTripPreservesWindow) {
   MetaAuditStore store;
   for (std::uint64_t i = 1; i <= 3; ++i) {
     ASSERT_TRUE(store.Append(MakeAuditRecord(i)).ok());
@@ -276,17 +254,16 @@ TEST(MetaAuditStore, SerializationRoundTripPreservesWindowAndChain) {
   EXPECT_EQ(restored->pruned_floor(), store.pruned_floor());
   EXPECT_EQ(restored->policy(), store.policy());
   EXPECT_EQ(restored->dropped_total(), store.dropped_total());
-  EXPECT_EQ(restored->chain_head(), store.chain_head());
+  EXPECT_EQ(restored->Serialize(), store.Serialize());
   EXPECT_EQ(restored->size(), store.size());
   EXPECT_EQ(restored->Find(2), store.Find(2));
-  EXPECT_TRUE(restored->VerifyChain());
-  // Appends continue the restored chain identically.
+  // Appending after restore preserves the same ordered record window.
   ASSERT_TRUE(restored->Append(MakeAuditRecord(4)).ok());
   ASSERT_TRUE(store.Append(MakeAuditRecord(4)).ok());
-  EXPECT_EQ(restored->chain_head(), store.chain_head());
+  EXPECT_EQ(restored->Serialize(), store.Serialize());
 }
 
-TEST(MetaAuditStore, DeserializeRejectsCorruptionAndChainBreaks) {
+TEST(MetaAuditStore, DeserializeRejectsMalformedEncoding) {
   MetaAuditStore store;
   ASSERT_TRUE(store.Append(MakeAuditRecord(1)).ok());
   auto bytes = store.Serialize();
@@ -298,11 +275,6 @@ TEST(MetaAuditStore, DeserializeRejectsCorruptionAndChainBreaks) {
             MetaFailureClass::kFailStop);
   std::string trailing = *bytes + '\x00';
   EXPECT_EQ(MetaFailureClassOf(MetaAuditStore::Deserialize(trailing).status()),
-            MetaFailureClass::kFailStop);
-  // A tampered stored hash breaks the recomputed chain: fail-stop class.
-  std::string tampered = *bytes;
-  tampered[tampered.size() - 5] ^= '\x01';
-  EXPECT_EQ(MetaFailureClassOf(MetaAuditStore::Deserialize(tampered).status()),
             MetaFailureClass::kFailStop);
 }
 
@@ -869,7 +841,6 @@ TEST(MetaOperationStore,
   commit.assignment_id_ = directive.assignment_id_;
   commit.status_ = keylane::meta::MetaDirectiveResultStatus::kSucceeded;
   commit.result_ = "installed";
-  commit.result_hash_ = keylane::meta::MetaSha256(commit.result_);
   auto wrong_role_boot = commit;
   wrong_role_boot.recipient_boot_id_ = directive.target_boot_id_;
   EXPECT_EQ(keylane::meta::MetaFailureClassOf(
@@ -954,11 +925,18 @@ TEST(MetaOperationStore,
   commit.assignment_id_ = directive.assignment_id_;
   commit.status_ = keylane::meta::MetaDirectiveResultStatus::kSucceeded;
   commit.result_ = "installed";
-  commit.result_hash_ = keylane::meta::MetaSha256(commit.result_);
   ASSERT_TRUE(store.CommitDirectiveResult(commit, 102).ok());
   EXPECT_EQ(store.FindOperation(id)->revision_, 2u);
 
   keylane::meta::CommitDirectiveResult conflict = commit;
+  // An attempt has one immutable result, even without a result digest.
+  conflict.result_ = "different terminal result";
+  EXPECT_EQ(keylane::meta::MetaFailureClassOf(
+                store.CommitDirectiveResult(conflict, 103)),
+            keylane::meta::MetaFailureClass::kDomainReject);
+  EXPECT_EQ(store.FindOperation(id)->terminal_receipts_.front().result_,
+            "installed");
+  conflict = commit;
   conflict.status_ = keylane::meta::MetaDirectiveResultStatus::kFailed;
   EXPECT_EQ(keylane::meta::MetaFailureClassOf(
                 store.CommitDirectiveResult(conflict, 103)),
@@ -1034,7 +1012,6 @@ TEST(MetaOperationStore, TerminalReceiptRetentionIsBoundedPerOperation) {
     result.recipient_node_id_ = spec.recipient_node_id_;
     result.recipient_boot_id_ = spec.target_boot_id_;
     result.assignment_id_ = spec.assignment_id_;
-    result.result_hash_ = keylane::meta::MetaSha256(result.result_);
     return result;
   };
   ASSERT_TRUE(store.CommitDirectiveResult(make_result(first), 102).ok());

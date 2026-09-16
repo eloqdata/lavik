@@ -1059,18 +1059,17 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
     }
     if (projection_basis.source_meta_applied_index_ ==
         projection_basis_->source_meta_applied_index_) {
-      if (projection_basis == *projection_basis_ && object_hash_.has_value() &&
-          prepared_state.object_hash_ == *object_hash_) {
-        // Exact replay can follow a control-session refresh. Source admission
-        // was cleared at disconnect, but a population export that was already
-        // ONLINE remains safe while the old lease is invalid and this byte-
-        // exact desired state is being re-established.
+      if (projection_basis == *projection_basis_) {
+        // Semantic replay can follow a control-session refresh. Source
+        // admission was cleared at disconnect, but a population export that was
+        // already ONLINE remains safe while the old lease is invalid and the
+        // same semantic desired state is being re-established.
         effects->preserve_current_population_exports_ = true;
         return absl::OkStatus();
       }
-      // One applied index cannot name two objects. Drop all memory authority;
-      // retaining the connection would let a corrupt or Byzantine peer keep
-      // extending a lease after equivocation.
+      // One applied index cannot name two semantic projections. Drop all memory
+      // authority; retaining the connection would let a corrupt or Byzantine
+      // peer keep extending a lease after equivocation.
       authority_.InvalidateAll();
       effects->revoke_sources_ = true;
       return absl::DataLossError(
@@ -1277,7 +1276,6 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
   authority_.InvalidateAnchorsChanged(before.get(), *next);
   topology_.Publish(next);
   projection_basis_ = projection_basis;
-  object_hash_ = prepared_state.object_hash_;
   authority_lease_duration_ms_ = prepared_state.authority_lease_duration_ms_;
   control_groups_ = std::move(prepared_state.control_groups_);
   desired_cluster_controls_ =

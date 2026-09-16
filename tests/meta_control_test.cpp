@@ -22,17 +22,11 @@ constexpr char kNode1[] = "1111111111111111111111111111111111111111";
 constexpr char kNode2[] = "2222222222222222222222222222222222222222";
 
 void Rehash(control::FullDesiredState* desired) {
-  desired->object_hash = {};
-  auto directive_digest =
-      control::ComputeDirectiveSetDigest(desired->current_directives);
-  ASSERT_TRUE(directive_digest.ok()) << directive_digest.status();
-  desired->directive_set_digest = *directive_digest;
   auto projection_hash = control::ComputeProjectionHash(*desired);
   ASSERT_TRUE(projection_hash.ok()) << projection_hash.status();
   desired->projection_hash = *projection_hash;
   auto encoded = control::EncodeFullDesiredState(*desired);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  desired->object_hash = control::ComputeSha256(*encoded);
 }
 
 control::FullDesiredState DesiredState() {
@@ -88,7 +82,6 @@ TEST(MetaControlMapperTest, BuildsCompleteImmutableServingState) {
   EXPECT_TRUE(group->granted_);
   EXPECT_FALSE(group->population_ready_);
   ASSERT_EQ(group->replica_node_indices_.size(), 1);
-  EXPECT_EQ(prepared->object_hash_, DesiredState().object_hash);
   ASSERT_EQ(prepared->control_groups_.size(), 1U);
   ASSERT_EQ(prepared->control_groups_[0].members_.size(), 2U);
   EXPECT_EQ(prepared->control_groups_[0].members_[0].assignment_id_,
@@ -117,13 +110,11 @@ TEST(MetaControlMapperTest, BuildsCompleteImmutableServingState) {
 TEST(MetaControlMapperTest, SourceIndexDoesNotBecomeTopologyEpoch) {
   auto desired = DesiredState();
   desired.source_meta_applied_index = 100;
-  desired.object_hash = {};
   auto projection_hash = control::ComputeProjectionHash(desired);
   ASSERT_TRUE(projection_hash.ok()) << projection_hash.status();
   desired.projection_hash = *projection_hash;
   auto encoded = control::EncodeFullDesiredState(desired);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  desired.object_hash = control::ComputeSha256(*encoded);
 
   auto prepared = cluster::PrepareMetaFullState(desired, kNode1, 1);
   ASSERT_TRUE(prepared.ok()) << prepared.status();
@@ -280,13 +271,13 @@ TEST(MetaControlMapperTest, RejectsNodeAssignedToMultipleGroups) {
             absl::StatusCode::kInvalidArgument);
 }
 
-TEST(MetaControlMapperTest, RejectsMissingLocalNodeAndZeroHashes) {
+TEST(MetaControlMapperTest, RejectsMissingLocalNodeAndZeroProjectionHash) {
   auto desired = DesiredState();
   EXPECT_EQ(cluster::PrepareMetaFullState(desired, std::string(40, '3'), 1)
                 .status()
                 .code(),
             absl::StatusCode::kInvalidArgument);
-  desired.object_hash = {};
+  desired.projection_hash = {};
   EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
             absl::StatusCode::kInvalidArgument);
 }

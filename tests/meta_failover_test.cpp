@@ -345,8 +345,7 @@ struct ProposalFixture {
         .candidate_node_id_ = action.candidate_.node_id_,
         .candidate_assignment_id_ = action.candidate_.assignment_id_,
         .candidate_boot_id_ = action.candidate_.boot_id_,
-        .prepared_context_id_ = Bytes<16>(0x61),
-        .prepared_context_hash_ = Bytes<32>(0x62)};
+        .prepared_context_id_ = Bytes<16>(0x61)};
     ReportCandidate(now, MetaFailoverObservationObs{.payload_ = prepared},
                     generation);
   }

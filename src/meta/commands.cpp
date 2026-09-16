@@ -1929,7 +1929,6 @@ absl::Status WriteCommandBody(MetaWriter& w, const CommitDirectiveResult& cmd) {
   WriteFixedArray(w, cmd.recipient_boot_id_);
   WriteFixedArray(w, cmd.assignment_id_);
   w.WriteU8(status);
-  WriteFixedArray(w, cmd.result_hash_);
   w.WriteString(cmd.result_);
   return absl::OkStatus();
 }
@@ -1960,8 +1959,6 @@ absl::StatusOr<CommitDirectiveResult> ReadCommitDirectiveResultBody(
           static_cast<std::uint8_t>(MetaDirectiveResultStatus::kRejected)) {
     return MetaFailStopError("unknown directive result status");
   }
-  auto result_hash = ReadFixedArray<32>(r);
-  if (!result_hash.ok()) return result_hash.status();
   auto result = ReadBoundedString(r, kMaxMetaPayloadBytes);
   if (!result.ok()) return result.status();
 
@@ -1976,7 +1973,6 @@ absl::StatusOr<CommitDirectiveResult> ReadCommitDirectiveResultBody(
   cmd.recipient_boot_id_ = *recipient_boot;
   cmd.assignment_id_ = *assignment_id;
   cmd.status_ = static_cast<MetaDirectiveResultStatus>(*status);
-  cmd.result_hash_ = *result_hash;
   cmd.result_ = std::move(*result);
   return cmd;
 }

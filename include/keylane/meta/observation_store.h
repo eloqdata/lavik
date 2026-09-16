@@ -239,8 +239,7 @@ struct MetaOperationEvidenceObs {
   MetaAssignmentId assignment_id_{};
   MetaOperationId operation_id_;
   std::string kind_phase_;  // bounded; the phase this evidence supports
-  MetaHash256 evidence_hash_;
-  std::string evidence_;  // bounded normalized evidence payload
+  std::string evidence_;    // bounded normalized evidence payload
   // Committed population and operation-history anchors for this evidence:
   std::string group_id_;
   uint64_t group_term_ = 0;
@@ -281,7 +280,6 @@ struct MetaCandidatePreparedObs {
   MetaAssignmentId candidate_assignment_id_{};
   MetaBootIncarnation candidate_boot_id_{};
   MetaRequestId prepared_context_id_{};
-  MetaHash256 prepared_context_hash_{};
   std::int64_t received_unix_ms_ = 0;
   std::int64_t expires_unix_ms_ = 0;
   bool operator==(const MetaCandidatePreparedObs&) const = default;
@@ -546,7 +544,6 @@ class MetaObservationStore {
   // attempt may delay failure by at most one finite lease but cannot forget
   // authority that Data might have installed. The exact current session and
   // heartbeat must match; a Grant must also match the installed projection.
-  // Cached Ack replay never refreshes either observation.
   absl::Status RecordOwnerLeaseDecisionAttempt(
       const MetaObservationIdentity& identity, std::uint64_t heartbeat_sequence,
       const cluster::control::LeaseDecision& decision);

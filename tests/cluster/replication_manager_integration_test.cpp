@@ -1731,7 +1731,6 @@ class PromotionPrepareService final : public celer::Service {
         .required_applied_next_lsns_ = {1, 3},
         .excluded_group_term_ = identity.term_,
     };
-    directive.old_authority_exclusion_hash_.fill(1);
 
     auto started =
         co_await replication_->StartClusterPromotionPrepareDirective(directive);
@@ -2433,9 +2432,6 @@ class FailoverActionReconcileService final : public celer::Service {
         status.prepared_->action_id_ != action.action_id_ ||
         std::all_of(status.prepared_->context_id_.begin(),
                     status.prepared_->context_id_.end(),
-                    [](std::uint8_t byte) { return byte == 0; }) ||
-        std::all_of(status.prepared_->context_hash_.begin(),
-                    status.prepared_->context_hash_.end(),
                     [](std::uint8_t byte) { return byte == 0; })) {
       co_return TestFailure(
           "authorized action did not publish action-bound prepared context");

@@ -290,11 +290,10 @@ TEST_F(MetaStateMachineTest, CommitAppliesRealCommands) {
     // fields verbatim off the wire (see the file header).
     const auto audit = stores.audit_.Find(1);
     ASSERT_TRUE(audit.has_value());
-    EXPECT_EQ(audit->record_.verdict_, MetaAuditVerdict::kAccepted);
-    EXPECT_NE(audit->record_.command_summary_.find("RegisterNode"),
-              std::string::npos);
-    EXPECT_EQ(audit->record_.actor_principal_, kEntryPrincipal);
-    EXPECT_EQ(audit->record_.readable_time_, kEntryReadableTime);
+    EXPECT_EQ(audit->verdict_, MetaAuditVerdict::kAccepted);
+    EXPECT_NE(audit->command_summary_.find("RegisterNode"), std::string::npos);
+    EXPECT_EQ(audit->actor_principal_, kEntryPrincipal);
+    EXPECT_EQ(audit->readable_time_, kEntryReadableTime);
   }
   EXPECT_EQ(machine->last_commit_index(), 1u);
 
@@ -341,8 +340,8 @@ TEST_F(MetaStateMachineTest, DomainRejectConsumesIndexWithoutStateChange) {
   EXPECT_FALSE(stores.identity_.FindNode(MakeNodeId(0x22)).has_value());
   const auto audit = stores.audit_.Find(2);
   ASSERT_TRUE(audit.has_value());
-  EXPECT_EQ(audit->record_.verdict_, MetaAuditVerdict::kRejected);
-  EXPECT_FALSE(audit->record_.verdict_detail_.empty());
+  EXPECT_EQ(audit->verdict_, MetaAuditVerdict::kRejected);
+  EXPECT_FALSE(audit->verdict_detail_.empty());
   EXPECT_EQ(machine->last_commit_index(), 2u);
 }
 
@@ -453,10 +452,9 @@ TEST_F(MetaStateMachineTest,
               keylane::meta::MetaOperationLifecycle::kSubmitted);
     const auto audit = stores.audit_.Find(3);
     ASSERT_TRUE(audit.has_value());
-    EXPECT_EQ(audit->record_.verdict_, MetaAuditVerdict::kRejected);
-    EXPECT_NE(
-        audit->record_.verdict_detail_.find("both current global Policies"),
-        std::string::npos);
+    EXPECT_EQ(audit->verdict_, MetaAuditVerdict::kRejected);
+    EXPECT_NE(audit->verdict_detail_.find("both current global Policies"),
+              std::string::npos);
     EXPECT_EQ(machine.last_commit_index(), 3u);
   };
 
@@ -504,7 +502,6 @@ TEST_F(MetaStateMachineTest, SnapshotIsDurableAcrossRestart) {
   EXPECT_TRUE(stores.topology_.GroupExists("g1"));
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 1u);
   EXPECT_EQ(stores.audit_.size(), 3u);
-  EXPECT_TRUE(stores.audit_.VerifyChain());
 }
 
 TEST_F(MetaStateMachineTest,
@@ -757,7 +754,7 @@ TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
   ASSERT_NE(c5, nullptr);
 
   keylane::meta::MetaAuditRecord record4_before;
-  keylane::meta::MetaHash256 chain_head_before{};
+  std::string audit_before;
   {
     auto opened = Open();
     ASSERT_TRUE(opened.ok()) << opened.status();
@@ -772,8 +769,8 @@ TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
     ASSERT_EQ(stores.audit_.size(), 5u);
     const auto record4 = stores.audit_.Find(4);
     ASSERT_TRUE(record4.has_value());
-    record4_before = record4->record_;
-    chain_head_before = stores.audit_.chain_head();
+    record4_before = *record4;
+    audit_before = *stores.audit_.Serialize();
   }
 
   // Crash without a newer snapshot: reopen restores @3; the core replays 4..5.
@@ -792,9 +789,8 @@ TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
   EXPECT_EQ(stores.audit_.size(), 5u);
   const auto record4 = stores.audit_.Find(4);
   ASSERT_TRUE(record4.has_value());
-  EXPECT_EQ(record4->record_, record4_before);
-  EXPECT_EQ(stores.audit_.chain_head(), chain_head_before);
-  EXPECT_TRUE(stores.audit_.VerifyChain());
+  EXPECT_EQ(*record4, record4_before);
+  EXPECT_EQ(*stores.audit_.Serialize(), audit_before);
 }
 
 TEST_F(MetaStateMachineTest, LogicalSnapshotTransmissionRoundTrip) {
@@ -844,9 +840,8 @@ TEST_F(MetaStateMachineTest, LogicalSnapshotTransmissionRoundTrip) {
     EXPECT_TRUE(follower_stores.topology_.GroupExists("g1"));
     EXPECT_EQ(follower_stores.topology_.TopologyEpoch(), 1u);
     EXPECT_EQ(follower_stores.audit_.size(), 3u);
-    EXPECT_EQ(follower_stores.audit_.chain_head(),
-              leader_stores.audit_.chain_head());
-    EXPECT_TRUE(follower_stores.audit_.VerifyChain());
+    EXPECT_EQ(follower_stores.audit_.Serialize(),
+              leader_stores.audit_.Serialize());
   }
   EXPECT_EQ(follower->last_commit_index(), 3u);
 
@@ -1182,7 +1177,6 @@ TEST_F(MetaServerIntegrationTest, SnapshotCompactionAndRestart) {
   OpenStorage();
   EXPECT_EQ(machine_->last_commit_index(), snapshot_index);
   EXPECT_EQ(NodeCount(), 9u);
-  EXPECT_TRUE(machine_->StoresSnapshot().audit_.VerifyChain());
   nuraft::ptr<nuraft::log_store> reopened_store = mgr_->load_log_store();
   EXPECT_EQ(reopened_store->start_index(), snapshot_index + 1);
 

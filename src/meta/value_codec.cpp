@@ -29,7 +29,6 @@ void WriteMetaEvidenceSummary(MetaWriter& writer,
   writer.WriteU64(evidence.partition_replication_epoch_);
   WriteFixedArray(writer, evidence.replication_history_id_);
   WriteFixedArray(writer, evidence.operation_id_);
-  WriteFixedArray(writer, evidence.kind_hash_);
 }
 
 absl::StatusOr<MetaEvidenceSummary> ReadMetaEvidenceSummary(
@@ -61,8 +60,6 @@ absl::StatusOr<MetaEvidenceSummary> ReadMetaEvidenceSummary(
   if (!replication_history_id.ok()) return replication_history_id.status();
   auto operation_id = ReadFixedArray<16>(reader);
   if (!operation_id.ok()) return operation_id.status();
-  auto kind_hash = ReadFixedArray<32>(reader);
-  if (!kind_hash.ok()) return kind_hash.status();
 
   MetaEvidenceSummary evidence;
   evidence.node_id_ = std::string(*node_id);
@@ -75,7 +72,6 @@ absl::StatusOr<MetaEvidenceSummary> ReadMetaEvidenceSummary(
   evidence.partition_replication_epoch_ = *partition_replication_epoch;
   evidence.replication_history_id_ = *replication_history_id;
   evidence.operation_id_ = *operation_id;
-  evidence.kind_hash_ = *kind_hash;
   return evidence;
 }
 

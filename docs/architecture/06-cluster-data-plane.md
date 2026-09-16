@@ -330,10 +330,10 @@ for a selected action.
 The source applied index is a diagnostic/order watermark; the projection
 SHA-256 is the semantic dependency for leases and directives. A higher index
 with identical semantic content is therefore harmless. Lower indexes reject,
-exact index/object replays are
-idempotent, and one index naming different bytes invalidates memory authority
-and closes the session. Installation validates and builds the entire immutable
-state before one publication; partial transfer never changes serving state. A
+equal index/projection pairs are idempotent, and one index naming different
+semantic content invalidates memory authority and closes the session.
+Installation validates and builds the entire immutable state before one
+publication; partial transfer never changes serving state. A
 group's partition replication epoch cannot regress even when the global
 topology epoch advances.
 Membership entries carry node and assignment identities only. The committed
@@ -360,14 +360,15 @@ health are volatile Meta observations, not Raft commands. The challenge names th
 exact projection and complete group authority anchor. `sent_at` is captured
 immediately before the first socket write, and the granted duration is applied
 to that monotonic timestamp, so a delayed response cannot extend authority.
-Business heartbeat sequences accept only the next message or an exact replay
-of the preceding message; the latter receives the cached exact ack. Data does
+Business heartbeat sequences accept only the next message; duplicates, gaps,
+and regressions close the session. Data does not retry within a session: a
+missing Ack ends it, and reauthentication begins a new sequence. Data does
 not send heartbeat `N+1` until it has processed Ack `N`, so `N+1` is causal
 evidence that the immediately preceding lease decision reached Data. Meta
 retains it as a confirmed Authority Lease only when Ack `N` granted a nonzero
 lease for this authenticated session/boot and the exact installed Owner,
-assignment, Group Term, and projection. Ack write alone and a cached Ack replay
-do not confirm authority. Meta records Owner heartbeat and
+assignment, Group Term, and projection. Ack write alone does not confirm
+authority. Meta records Owner heartbeat and
 causal-progress receive times on the same steady clock used by detector
 debounce, retains the original time when later heartbeats repeat a confirmation,
 and advances it only for a strictly higher confirmed Ack. Once that causal
@@ -397,7 +398,7 @@ An independent optional failover observation accompanies that role payload.
 next-LSN vector while the same heartbeat still renews its lease. A candidate
 may suppress its ordinary role while rotating history after authorization;
 `CandidatePrepared` then reports the exact action and boot-local prepared-
-context identity/hash independently. `ActionFailed` reports a bounded class
+context identity independently. `ActionFailed` reports a bounded class
 and detail for that exact action. Candidate action observations are withdrawn
 on candidate disconnect or an incompatible projection/incarnation change.
 `SourcePaused` is source-lineage scoped and may survive an exact source
@@ -410,7 +411,7 @@ compact leader-local runtime record for cluster status and leader-owned
 workflows. The record follows the current session and FDS incarnation, retains
 the replication-history id authenticated by `ClientHello`, timestamps health
 at receive, and records a lease decision only after the corresponding Ack
-write succeeds. Cached Ack replay does not renew that timestamp. Replacement,
+write succeeds. Replacement,
 session close, leadership loss, and shutdown remove the record. This is a
 one-way observational feed: Data authority and lease evaluation never read
 status state back.
@@ -426,13 +427,13 @@ cannot be evaluated against a new assignment, manifest, or population epoch.
 Directive execution also emits typed, volatile `OperationEvidence` for the
 started and completed phases. Each report is bound to the current session and
 boot, authenticated reporter, exact local assignment, operation, population
-anchor, and replication history, and carries a SHA-256 of its bounded evidence
-body. Reports that fit one frame use the soft-message lane; larger reports use
+anchor, and replication history, and carries its bounded evidence body.
+Reports that fit one frame use the soft-message lane; larger reports use
 the same Start/Chunk/End object-transfer machinery under an evidence-specific
-cap and are admitted only after whole-object hash and schema validation. Meta
+cap. All reports require schema validation; streamed reports additionally
+require the transfer-level whole-object digest to match. Meta
 audits and discards a well-formed report that has become stale without closing
-the authority session; malformed session, boot, framing, or content-hash data
-fails the session.
+the authority session; malformed session, boot, or framing fails the session.
 Meta's typed candidate/evidence query results retain that authenticated boot
 beside the reporter and assignment, so later directive/evidence construction
 never has to race a second session lookup.
@@ -494,8 +495,8 @@ the Owner serviceable and collapses preceding ordered possibilities into that
 exact installed lease window. Meta retains both an unconfirmed maximum and
 the confirmed installed window across a same-authority FDS or duration
 replacement because Data deliberately keeps that lease. Confirmation of a
-later shorter Grant replaces the older installed window. Cached-Ack replay
-does not refresh either deadline; a session or authority change clears them.
+later shorter Grant replaces the older installed window; a session or
+authority change clears both windows.
 If confirmation never arrives, the last possible window expires to
 `heartbeat_expired`.
 
@@ -641,7 +642,7 @@ and optional candidate action with exact candidate boot, compatibility domain,
 and one-way authorization. NodeControl derives source pause only for the exact
 controlled owner and derives candidate work only for the exact named candidate.
 The manager catches up through the existing native coordinator and returns a
-boot-local prepared-context identity/hash or a typed failure observation. A
+boot-local prepared-context identity or a typed failure observation. A
 changed action cancels and joins the old candidate before the replacement can
 report progress. The one legal exception is a retained controlled degradation:
 the exact same authorized action survives while its installed authority

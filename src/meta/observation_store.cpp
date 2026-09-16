@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "keylane/meta/encoding.h"
-#include "keylane/meta/hash.h"
 
 namespace keylane::meta {
 
@@ -33,7 +32,6 @@ MetaEvidenceSummary SummarizeOperationEvidence(
   summary.partition_replication_epoch_ = evidence.partition_replication_epoch_;
   summary.replication_history_id_ = evidence.replication_history_id_;
   summary.operation_id_ = evidence.operation_id_;
-  summary.kind_hash_ = evidence.evidence_hash_;
   return summary;
 }
 
@@ -551,8 +549,7 @@ struct MetaObservationStore::Impl {
                     "failover-candidate-anchor-mismatch");
               }
               if constexpr (std::is_same_v<Fact, MetaCandidatePreparedObs>) {
-                if (IsZeroIdentity(fact.prepared_context_id_) ||
-                    IsZeroIdentity(fact.prepared_context_hash_)) {
+                if (IsZeroIdentity(fact.prepared_context_id_)) {
                   return MetaDomainRejectError(
                       "prepared-context-identity-missing");
                 }
@@ -620,9 +617,6 @@ struct MetaObservationStore::Impl {
             CheckFieldSize(evidence.evidence_, kMaxObsFieldBytes, "evidence");
         !size.ok()) {
       return size;
-    }
-    if (evidence.evidence_hash_ != MetaSha256(evidence.evidence_)) {
-      return MetaDomainRejectError("evidence-hash-mismatch");
     }
     return absl::OkStatus();
   }

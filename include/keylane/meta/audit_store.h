@@ -1,7 +1,6 @@
 #pragma once
 
-// MetaAuditStore is the metadata control plane's bounded, hash-chained audit
-// window.
+// MetaAuditStore is the metadata control plane's bounded audit window.
 //
 // One record per privileged command application, keyed by the command's raft
 // log index; window order is log-index order. Each record carries the actor
@@ -10,15 +9,10 @@
 // trusted entry wrote. THE STORE NEVER READS A CLOCK: readable_time_ is
 // command-carried text the store copies verbatim.
 //
-// Rolling hash chain: every record's chain hash is
-//   SHA-256(previous record's chain hash || canonical record encoding)
-// over the all-zero genesis hash for the first record after a prune anchor.
-// Pruning a prefix does not break verification of what remains: the store
-// keeps the hash of the last pruned record as the new anchor, and exported
-// bytes carry the anchor they chain from, so an external archive can verify
-// continuity across exports. Keylane deliberately has no persisted cluster
-// identity; an external archive supplies its own deployment namespace and
-// deduplicates records within it by (raft_log_index, record_hash).
+// Exported records are ordered by Raft log index. An external archive supplies
+// its own deployment namespace and deduplicates within it by log index,
+// comparing the complete record on duplicate exports. This is an operational
+// record, not a cryptographic tamper-evident log.
 //
 // Replay idempotency: appending an index already in the window with identical
 // content is a no-op. Append of an existing index with DIFFERENT content, an
@@ -30,11 +24,11 @@
 // same index, so this cannot fork the group.
 //
 // Capacity behavior is a replicated policy. Bounded-rotate (the default)
-// advances the chain anchor and drops the oldest record before appending at a
+// drops the oldest record before appending at a
 // full window; durable drop watermarks make archival gaps observable.
 // Strict-export instead makes NeedsExport() gate privileged proposals until
 // an operator archives and prunes a prefix. Disabled suppresses ordinary
-// records, but policy changes are always forced into the chain so disabling
+// records, but policy changes are always recorded so disabling
 // or re-enabling audit is visible. Append beyond capacity in strict mode
 // FAILS STOP: a committed command's audit write cannot be refused without
 // desynchronizing the state machine, so reaching it means the proposal gate
@@ -44,9 +38,8 @@
 // lives in the state machine above), no clock, no observation access. Domain
 // rejections (over-cap fields) return absl::Status of MetaFailureClass
 // kDomainReject. Snapshot serialization is the versioned strict encoding of
-// encoding.h; decode failures are MetaFailureClass::kFailStop, and a
-// loaded window whose chain does not recompute is corruption and fails
-// decoding the same way.
+// encoding.h; decode failures are MetaFailureClass::kFailStop. Decoding checks
+// field bounds and strictly increasing indexes above the prune floor.
 
 #include <cstdint>
 #include <map>
@@ -75,8 +68,7 @@ enum class MetaAuditVerdict : std::uint8_t {
   kRejected = 2,  // domain rejection: index consumed, state unchanged
 };
 
-// One audit record, keyed by raft log index. The chain hash is derived by the
-// store and exposed via MetaAuditChainEntry; it is not part of the input.
+// One audit record, keyed by Raft log index.
 struct MetaAuditRecord {
   std::uint64_t log_index_ = 0;
   std::string actor_principal_;
@@ -85,13 +77,6 @@ struct MetaAuditRecord {
   std::string verdict_detail_;  // e.g. the rejection message
   std::string readable_time_;   // trusted-entry propose time; copied verbatim
   bool operator==(const MetaAuditRecord&) const = default;
-};
-
-// A window entry: the record plus its store-computed rolling chain hash.
-struct MetaAuditChainEntry {
-  MetaAuditRecord record_;
-  MetaHash256 chain_hash_{};
-  bool operator==(const MetaAuditChainEntry&) const = default;
 };
 
 class MetaAuditStore {
@@ -112,7 +97,7 @@ class MetaAuditStore {
   absl::Status SetPolicy(MetaAuditPolicy policy);
   MetaAuditPolicy policy() const { return policy_; }
 
-  std::optional<MetaAuditChainEntry> Find(std::uint64_t log_index) const;
+  std::optional<MetaAuditRecord> Find(std::uint64_t log_index) const;
   std::size_t size() const { return window_.size(); }
   std::uint32_t capacity() const { return window_capacity_; }
 
@@ -127,34 +112,24 @@ class MetaAuditStore {
   std::uint64_t dropped_total() const { return dropped_total_; }
   std::uint64_t dropped_through() const { return dropped_through_; }
 
-  // Hash of the newest record, or the prune anchor when the window is empty
-  // (all-zero before any append).
-  const MetaHash256& chain_head() const { return chain_head_; }
-
-  // Recomputes the chain from the prune anchor through the window; false on
-  // mismatch (never happens through the public API; a corruption tripwire for
-  // tests and diagnostics).
-  bool VerifyChain() const;
-
   // Highest pruned log index (0 = nothing pruned). Appends at or below the
   // floor fail stop (see Append).
   std::uint64_t pruned_floor() const { return pruned_floor_; }
 
   // Read-only versioned encoding of every window record with
   // log_index <= through for ctl-side external archival. The
-  // blob carries the anchor it chains from plus per-record chain hashes.
+  // blob includes drop watermarks and complete records.
   absl::StatusOr<std::string> ExportThrough(std::uint64_t through) const;
 
-  // Removes every record with log_index <= through and advances the anchor
-  // to that record's chain hash. `through` must name a record still in the
-  // window; re-pruning at/below the floor is an idempotent no-op. The caller
-  // must have durably archived the exported bytes first — the store does not
-  // track export acknowledgements (that bookkeeping is the ctl layer's).
+  // Removes every record with log_index <= through. `through` must name a
+  // record still in the window; re-pruning at/below the floor is an idempotent
+  // no-op. The caller must have durably archived the exported bytes first — the
+  // store does not track export acknowledgements (that bookkeeping is the ctl
+  // layer's).
   absl::Status PruneThrough(std::uint64_t through);
 
   // Snapshot serialization: versioned strict encoding; decode enforces caps,
-  // strictly increasing indexes, and recomputes the chain (a break is
-  // corruption and fails with MetaFailureClass::kFailStop).
+  // strictly increasing indexes above the prune floor.
   absl::StatusOr<std::string> Serialize() const;
   static absl::StatusOr<MetaAuditStore> Deserialize(
       std::string_view bytes,
@@ -163,12 +138,7 @@ class MetaAuditStore {
  private:
   std::uint32_t window_capacity_;
   MetaAuditPolicy policy_ = MetaAuditPolicy::kBoundedRotate;
-  std::map<std::uint64_t, MetaAuditChainEntry> window_;  // keyed by log index
-  // Hash the first window record chains from: all-zero genesis, or the chain
-  // hash of the last pruned record (prefix truncation keeps the remaining
-  // chain verifiable from this anchor).
-  MetaHash256 anchor_{};
-  MetaHash256 chain_head_{};        // == anchor_ when the window is empty
+  std::map<std::uint64_t, MetaAuditRecord> window_;  // keyed by log index
   std::uint64_t pruned_floor_ = 0;  // highest pruned log index (0 = none)
   // Automatic bounded-rotate loss is distinct from an operator-confirmed
   // prune. These fields let status/export surface an archival gap.
@@ -176,14 +146,12 @@ class MetaAuditStore {
   std::uint64_t dropped_through_ = 0;
 };
 
-// Decoded export blob (see MetaAuditStore::ExportThrough): the chain anchor
-// the first exported record chains from, plus the exported entries in log
-// index order. Decode verifies the chain inside the blob.
+// Decoded export with drop watermarks and records in strictly increasing
+// log-index order. No content authenticity is implied by this format.
 struct MetaAuditExport {
-  MetaHash256 anchor_before_{};
   std::uint64_t dropped_total_ = 0;
   std::uint64_t dropped_through_ = 0;
-  std::vector<MetaAuditChainEntry> records_;
+  std::vector<MetaAuditRecord> records_;
   bool operator==(const MetaAuditExport&) const = default;
 };
 

@@ -752,7 +752,6 @@ struct MetaEvidenceSummary {
   std::uint64_t partition_replication_epoch_ = 0;
   MetaReplicationHistoryId replication_history_id_{};
   MetaOperationId operation_id_{};
-  MetaHash256 kind_hash_{};  // kind-specific evidence hash
   bool operator==(const MetaEvidenceSummary&) const = default;
 };
 
@@ -858,8 +857,7 @@ struct CommitDirectiveResult {
   MetaBootIncarnation recipient_boot_id_{};
   MetaAssignmentId assignment_id_{};
   MetaDirectiveResultStatus status_ = MetaDirectiveResultStatus::kSucceeded;
-  MetaHash256 result_hash_{};  // SHA-256 of result_
-  std::string result_;         // bounded by kMaxMetaPayloadBytes
+  std::string result_;  // bounded by kMaxMetaPayloadBytes
   bool operator==(const CommitDirectiveResult&) const = default;
 };
 

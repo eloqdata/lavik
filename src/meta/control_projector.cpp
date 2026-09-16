@@ -598,11 +598,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     state.manifests.push_back(std::move(projected));
   }
 
-  auto directive_digest =
-      control::ComputeDirectiveSetDigest(state.current_directives);
-  if (!directive_digest.ok()) return directive_digest.status();
-  state.directive_set_digest = *directive_digest;
-
   auto projection_hash = control::ComputeProjectionHash(state);
   if (!projection_hash.ok()) return projection_hash.status();
   state.projection_hash = *projection_hash;
@@ -613,7 +608,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
 
   auto encoded = control::EncodeFullDesiredState(state);
   if (!encoded.ok()) return encoded.status();
-  state.object_hash = control::ComputeSha256(*encoded);
   return NodeControlBatch{std::move(state), std::move(*encoded)};
 }
 

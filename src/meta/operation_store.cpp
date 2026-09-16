@@ -7,7 +7,6 @@
 #include <tuple>
 
 #include "keylane/cluster/control_protocol.h"
-#include "keylane/meta/hash.h"
 #include "keylane/meta/value_codec.h"
 #include "spdlog/spdlog.h"
 
@@ -178,7 +177,6 @@ bool TerminalReceiptWellFormed(const MetaTerminalReceipt& receipt) {
          !IsZero(receipt.assignment_id_) &&
          ValidResultStatus(receipt.status_) &&
          receipt.result_.size() <= kMaxMetaPayloadBytes &&
-         MetaSha256(receipt.result_) == receipt.result_hash_ &&
          receipt.committed_index_ != 0;
 }
 
@@ -198,7 +196,6 @@ bool ReceiptMatches(const MetaTerminalReceipt& receipt,
          receipt.recipient_boot_id_ == command.recipient_boot_id_ &&
          receipt.assignment_id_ == command.assignment_id_ &&
          receipt.status_ == command.status_ &&
-         receipt.result_hash_ == command.result_hash_ &&
          receipt.result_ == command.result_;
 }
 
@@ -568,8 +565,7 @@ absl::Status MetaOperationStore::CommitDirectiveResult(
       command.recipient_node_id_.size() != kMetaNodeIdBytes ||
       IsZero(command.recipient_boot_id_) || IsZero(command.assignment_id_) ||
       !ValidResultStatus(command.status_) ||
-      command.result_.size() > kMaxMetaPayloadBytes ||
-      MetaSha256(command.result_) != command.result_hash_) {
+      command.result_.size() > kMaxMetaPayloadBytes) {
     return MetaDomainRejectError("invalid directive result");
   }
 
@@ -613,7 +609,6 @@ absl::Status MetaOperationStore::CommitDirectiveResult(
   receipt.recipient_boot_id_ = command.recipient_boot_id_;
   receipt.assignment_id_ = command.assignment_id_;
   receipt.status_ = command.status_;
-  receipt.result_hash_ = command.result_hash_;
   receipt.result_ = command.result_;
   receipt.committed_index_ = committed_index;
   record.terminal_receipts_.push_back(std::move(receipt));
@@ -796,7 +791,6 @@ void WriteTerminalReceipt(MetaWriter& w, const MetaTerminalReceipt& receipt) {
   WriteFixedArray(w, receipt.recipient_boot_id_);
   WriteFixedArray(w, receipt.assignment_id_);
   w.WriteU8(static_cast<std::uint8_t>(receipt.status_));
-  WriteFixedArray(w, receipt.result_hash_);
   w.WriteString(receipt.result_);
   w.WriteU64(receipt.committed_index_);
 }
@@ -830,9 +824,6 @@ absl::StatusOr<MetaTerminalReceipt> ReadTerminalReceipt(MetaReader& r) {
   if (!ValidResultStatus(receipt.status_)) {
     return MetaFailStopError("unknown terminal receipt status");
   }
-  auto result_hash = ReadFixedArray<32>(r);
-  if (!result_hash.ok()) return result_hash.status();
-  receipt.result_hash_ = *result_hash;
   auto result = r.ReadString(kMaxMetaPayloadBytes);
   if (!result.ok()) return result.status();
   receipt.result_ = std::string(*result);

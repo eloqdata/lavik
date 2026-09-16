@@ -17,7 +17,7 @@ namespace keylane::meta {
 
 // Exact committed authority and node-specific Full Desired State projection
 // against which every volatile observation is checked. `projection_hash_` is
-// the semantic FDS projection hash, not its transport object hash.
+// the semantic FDS projection hash.
 struct MetaOwnerAuthorityAnchor {
   std::string group_id_;
   std::string owner_node_id_;

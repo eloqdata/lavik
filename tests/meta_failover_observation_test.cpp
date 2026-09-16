@@ -127,7 +127,6 @@ meta::MetaFailoverObservationObs CandidatePrepared(const FailoverFacts& facts) {
               .candidate_assignment_id_ = Bytes<16>(0x22),
               .candidate_boot_id_ = Bytes<20>(0xb2),
               .prepared_context_id_ = Bytes<16>(0x66),
-              .prepared_context_hash_ = Bytes<32>(0x77),
           }};
 }
 

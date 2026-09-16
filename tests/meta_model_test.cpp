@@ -933,7 +933,6 @@ keylane::meta::MetaEvidenceSummary MakeEvidence(std::uint8_t seed) {
   ev.partition_replication_epoch_ = 778;
   ev.replication_history_id_.fill(seed);
   ev.operation_id_ = MakeOperationId(seed);
-  ev.kind_hash_ = MakeHash(seed);
   return ev;
 }
 
@@ -1019,7 +1018,6 @@ TEST(MetaModelCommands, DirectiveResultReceiptCommandsRoundTrip) {
   commit.assignment_id_.fill(0x23);
   commit.status_ = keylane::meta::MetaDirectiveResultStatus::kFailed;
   commit.result_ = "source rejected the replication handshake";
-  commit.result_hash_ = keylane::meta::MetaSha256(commit.result_);
   ExpectRoundTrip(commit);
 
   keylane::meta::PruneTerminalReceipts prune;
@@ -1280,13 +1278,12 @@ TEST(MetaStateApply, RegisterNodeAcceptedAndAudited) {
   ASSERT_EQ(stores.audit_.size(), 1u);
   const auto entry = stores.audit_.Find(1);
   ASSERT_TRUE(entry.has_value());
-  EXPECT_EQ(entry->record_.log_index_, 1u);
-  EXPECT_EQ(entry->record_.actor_principal_, kActorPrincipal);
-  EXPECT_EQ(entry->record_.readable_time_, kReadableTime);
-  EXPECT_EQ(entry->record_.verdict_, MetaAuditVerdict::kAccepted);
-  EXPECT_TRUE(entry->record_.verdict_detail_.empty());
-  EXPECT_NE(entry->record_.command_summary_.find(cmd.node_id_),
-            std::string::npos);
+  EXPECT_EQ(entry->log_index_, 1u);
+  EXPECT_EQ(entry->actor_principal_, kActorPrincipal);
+  EXPECT_EQ(entry->readable_time_, kReadableTime);
+  EXPECT_EQ(entry->verdict_, MetaAuditVerdict::kAccepted);
+  EXPECT_TRUE(entry->verdict_detail_.empty());
+  EXPECT_NE(entry->command_summary_.find(cmd.node_id_), std::string::npos);
 }
 
 TEST(MetaStateApply, ReplaySameIndexProducesSameVerdictStateAndAudit) {
@@ -1303,7 +1300,7 @@ TEST(MetaStateApply, ReplaySameIndexProducesSameVerdictStateAndAudit) {
   EXPECT_EQ(second, first);
   EXPECT_EQ(MustSerialize(stores), state_after_first);
   ASSERT_EQ(stores.audit_.size(), 1u);
-  EXPECT_EQ(stores.audit_.Find(1)->record_, record_after_first->record_);
+  EXPECT_EQ(*stores.audit_.Find(1), *record_after_first);
 }
 
 TEST(MetaStateApply, RejectedCommandIsAuditedAndLeavesStateUnchanged) {
@@ -1323,12 +1320,11 @@ TEST(MetaStateApply, RejectedCommandIsAuditedAndLeavesStateUnchanged) {
   ASSERT_EQ(stores.audit_.size(), 2u);
   const auto entry = stores.audit_.Find(2);
   ASSERT_TRUE(entry.has_value());
-  EXPECT_EQ(entry->record_.verdict_, MetaAuditVerdict::kRejected);
-  EXPECT_EQ(entry->record_.verdict_detail_, result.detail_);
-  EXPECT_EQ(entry->record_.actor_principal_, kActorPrincipal);
+  EXPECT_EQ(entry->verdict_, MetaAuditVerdict::kRejected);
+  EXPECT_EQ(entry->verdict_detail_, result.detail_);
+  EXPECT_EQ(entry->actor_principal_, kActorPrincipal);
   // The rejection consumes the log index: the chain advanced over both
   // records.
-  EXPECT_TRUE(stores.audit_.VerifyChain());
 }
 
 TEST(MetaStateApply, UpdateAndRetireNodeThroughDispatcher) {
@@ -1422,7 +1418,6 @@ TEST(MetaStateApply, MetaStoresSnapshotRoundTrip) {
   EXPECT_TRUE(restored->topology_.GroupExists("g1"));
   EXPECT_TRUE(restored->grant_.GroupState("g1").has_value());
   EXPECT_EQ(restored->audit_.size(), 2u);
-  EXPECT_TRUE(restored->audit_.VerifyChain());
   const auto* envelope = reinterpret_cast<const unsigned char*>(bytes.data());
   EXPECT_EQ(static_cast<std::uint16_t>(envelope[0] | (envelope[1] << 8)), 1);
   EXPECT_EQ(static_cast<std::uint16_t>(envelope[0] | (envelope[1] << 8)),
@@ -1715,7 +1710,6 @@ TEST(MetaStateApply, TransitionEvidenceMustMatchCommittedAnchors) {
   evidence.population_manifest_revision_ = 0;
   evidence.replication_history_id_.fill(55);
   evidence.operation_id_ = submit.operation_id_;
-  evidence.kind_hash_ = keylane::meta::MetaSha256("proof");
   transition.evidence_ = {evidence};
   ApplyOk(stores, 7, transition);
 
@@ -1802,7 +1796,6 @@ TEST(MetaStateApply,
         evidence.group_term_ = 1;
         evidence.replication_history_id_.fill(55);
         evidence.operation_id_ = operation_id;
-        evidence.kind_hash_ = keylane::meta::MetaSha256("proof");
         transition.evidence_ = {evidence};
         return transition;
       };
@@ -2943,7 +2936,6 @@ TEST(MetaStateApply, DirectiveResultCommitUsesFirstRaftIndexOnReplay) {
   commit.recipient_boot_id_ = directive.target_boot_id_;
   commit.assignment_id_ = directive.assignment_id_;
   commit.result_ = "installed";
-  commit.result_hash_ = keylane::meta::MetaSha256(commit.result_);
 
   const auto applied = ApplyOk(stores, 11, MetaCommand{commit});
   EXPECT_EQ(applied.command_tag_,
@@ -3070,7 +3062,6 @@ keylane::meta::CommitDirectiveResult MakeDirectiveResult(
   result.recipient_boot_id_ = fixture.directive.target_boot_id_;
   result.assignment_id_ = fixture.directive.assignment_id_;
   result.result_ = "installed";
-  result.result_hash_ = keylane::meta::MetaSha256(result.result_);
   return result;
 }
 
@@ -3643,11 +3634,10 @@ TEST(MetaStateApply, CommandMatrixConsecutiveReplayLocksVerdictStateAudit) {
     EXPECT_EQ(DomainStateBytes(stores), domain_after_first)
         << "index " << index;
     EXPECT_EQ(stores.audit_.size(), index) << "index " << index;
-    EXPECT_EQ(stores.audit_.Find(index)->record_, audit_after_first->record_)
+    EXPECT_EQ(stores.audit_.Find(index), audit_after_first)
         << "index " << index;
   }
   EXPECT_EQ(stores.audit_.size(), script.size());
-  EXPECT_TRUE(stores.audit_.VerifyChain());
 }
 
 TEST(MetaStateApply, WholeLogReplayFromEmptyReproducesStateAndAudit) {
@@ -3663,7 +3653,7 @@ TEST(MetaStateApply, WholeLogReplayFromEmptyReproducesStateAndAudit) {
 
   // Replay the identical byte stream from an empty state (the recovery path
   // with no snapshot): identical verdicts and byte-identical final state,
-  // audit window and hash chain included.
+  // ordered audit window included.
   MetaStores second_run;
   index = 0;
   for (const ScriptedCommand& step : script) {
@@ -3674,11 +3664,10 @@ TEST(MetaStateApply, WholeLogReplayFromEmptyReproducesStateAndAudit) {
   EXPECT_EQ(MustSerialize(second_run), MustSerialize(first_run));
 
   // A snapshot round-trip of the fully populated aggregate preserves
-  // everything, including the audit chain.
+  // everything, including the audit window.
   const auto restored = MetaStores::Deserialize(MustSerialize(first_run));
   ASSERT_TRUE(restored.ok()) << restored.status();
   EXPECT_EQ(MustSerialize(*restored), MustSerialize(first_run));
-  EXPECT_TRUE(restored->audit_.VerifyChain());
 }
 
 }  // namespace

@@ -533,8 +533,6 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
   ASSERT_TRUE(runtime->node_control_installer_.SetStorageReady(true).ok());
   cluster::Sha256Digest projection_hash{};
   projection_hash.fill(0x11);
-  cluster::Sha256Digest object_hash{};
-  object_hash.fill(0x22);
   const cluster::ProjectionBasis projection{
       .source_meta_applied_index_ = 7,
       .projection_hash_ = projection_hash,
@@ -543,7 +541,6 @@ TEST(ClusterRequestAuthorityTest, SessionLossRevokesCapturedWriteAdmission) {
                   .InstallFullState(
                       cluster::PreparedFullState{
                           .serving_state_ = state,
-                          .object_hash_ = object_hash,
                           .control_groups_ = {},
                       },
                       projection)

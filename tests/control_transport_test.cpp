@@ -75,10 +75,6 @@ absl::StatusOr<std::string> FullStatePayload(std::size_t padding_bytes) {
     }
     state.manifests.push_back(std::move(manifest));
   }
-  auto directives =
-      control::ComputeDirectiveSetDigest(state.current_directives);
-  if (!directives.ok()) return directives.status();
-  state.directive_set_digest = *directives;
   auto projection = control::ComputeProjectionHash(state);
   if (!projection.ok()) return projection.status();
   state.projection_hash = *projection;
@@ -650,8 +646,9 @@ TEST(ControlSessionWriterTest,
   const auto* direct =
       std::get_if<control::FullDesiredState>(&scenario->frames_.front());
   ASSERT_NE(direct, nullptr);
-  EXPECT_EQ(direct->object_hash,
-            control::ComputeSha256(scenario->small_bytes_));
+  const auto direct_bytes = control::EncodeFullDesiredState(*direct);
+  ASSERT_TRUE(direct_bytes.ok()) << direct_bytes.status();
+  EXPECT_EQ(*direct_bytes, scenario->small_bytes_);
 
   const auto* start =
       std::get_if<control::TransferStart>(&scenario->frames_[1]);

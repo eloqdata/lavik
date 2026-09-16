@@ -128,8 +128,7 @@ class MetaDataControlRuntimeStatus {
                     std::int64_t received_unix_ms);
   // Records a lease decision only after its Ack was written successfully. The
   // heartbeat sequence is atomically bound to that decision in the same
-  // runtime update. Cached Ack replay deliberately does not call this method
-  // or refresh time.
+  // runtime update.
   void RecordLeaseDecisionWritten(
       std::string_view node_id, const cluster::control::WireId128& session_id,
       std::uint64_t heartbeat_sequence,

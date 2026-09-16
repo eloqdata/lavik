@@ -395,11 +395,7 @@ TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   EXPECT_TRUE(directive.storage_mutating);
   EXPECT_FALSE(directive.force);
 
-  EXPECT_TRUE(NonZero(state.directive_set_digest));
   EXPECT_TRUE(NonZero(state.projection_hash));
-  EXPECT_TRUE(NonZero(state.object_hash));
-  EXPECT_EQ(state.object_hash,
-            control::ComputeSha256(projected->encoded_full_state));
   const auto decoded =
       control::DecodeFullDesiredState(projected->encoded_full_state);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
@@ -550,9 +546,6 @@ TEST(MetaControlProjector,
 
   EXPECT_EQ(first->full_state.projection_hash,
             later->full_state.projection_hash);
-  EXPECT_EQ(first->full_state.directive_set_digest,
-            later->full_state.directive_set_digest);
-  EXPECT_NE(first->full_state.object_hash, later->full_state.object_hash);
   EXPECT_NE(first->encoded_full_state, later->encoded_full_state);
   ASSERT_EQ(later->full_state.current_directives.size(), 1u);
   EXPECT_EQ(
@@ -769,13 +762,11 @@ TEST(MetaControlProjector,
     result.assignment_id_ = fixture.target_assignment;
     result.status_ = keylane::meta::MetaDirectiveResultStatus::kSucceeded;
     result.result_ = "source-authorized";
-    result.result_hash_ = keylane::meta::MetaSha256(result.result_);
 
     keylane::meta::MetaStores failed_stores = fixture.stores;
     keylane::meta::CommitDirectiveResult failed = result;
     failed.status_ = keylane::meta::MetaDirectiveResultStatus::kFailed;
     failed.result_ = "source-rejected";
-    failed.result_hash_ = keylane::meta::MetaSha256(failed.result_);
     Commit(failed_stores, 22, failed);
     const auto target_after_failure = MetaControlProjector::ProjectNode(
         MetaCommittedView(std::move(failed_stores), 105), fixture.target);

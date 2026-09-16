@@ -304,7 +304,7 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
 // Validates a typed operation-evidence envelope against the authenticated
 // session, then ingests it as volatile leader-local evidence. The reporter
 // node is derived from the connection; self-reported boot, assignment,
-// operation, population, history, and content hash are all exact anchors.
+// operation, population, and history are all exact identity anchors.
 absl::Status IngestOperationEvidenceObservation(
     MetaObservationStore& observations, const MetaCommittedFacts& facts,
     std::string_view node_id, const MetaBootIncarnation& boot,

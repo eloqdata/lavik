@@ -121,7 +121,7 @@ meta::MetaApplyResult RejectFresh(Fixture& fixture,
   const auto audit = fixture.stores.audit_.Find(index);
   EXPECT_TRUE(audit.has_value());
   if (audit.has_value()) {
-    EXPECT_EQ(audit->record_.verdict_, meta::MetaAuditVerdict::kRejected);
+    EXPECT_EQ(audit->verdict_, meta::MetaAuditVerdict::kRejected);
   }
   return result;
 }
@@ -787,8 +787,7 @@ TEST(MetaFailoverTransitionW2,
   EXPECT_FALSE(operation->data_loss_possible_);
   const auto audit = fixture.stores.audit_.Find(commit_index);
   ASSERT_TRUE(audit.has_value());
-  EXPECT_NE(audit->record_.command_summary_.find("loss=none"),
-            std::string::npos);
+  EXPECT_NE(audit->command_summary_.find("loss=none"), std::string::npos);
   ExpectExactReplay(fixture, commit_index, meta::MetaCommand{commit});
   const auto committed = DomainBytes(fixture.stores);
   AcceptFresh(fixture, meta::MetaCommand{commit});
@@ -855,8 +854,7 @@ TEST(MetaFailoverTransitionW2,
   EXPECT_EQ(fixture.stores.operation_.ActiveCount(), 0u);
   const auto audit = fixture.stores.audit_.Find(commit_index);
   ASSERT_TRUE(audit.has_value());
-  EXPECT_NE(audit->record_.command_summary_.find("loss=unknown"),
-            std::string::npos);
+  EXPECT_NE(audit->command_summary_.find("loss=unknown"), std::string::npos);
   ExpectExactReplay(fixture, commit_index, meta::MetaCommand{commit});
   const auto committed = DomainBytes(fixture.stores);
   AcceptFresh(fixture, meta::MetaCommand{commit});

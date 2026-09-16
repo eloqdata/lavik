@@ -108,7 +108,6 @@ struct MetaTerminalReceipt {
   MetaBootIncarnation recipient_boot_id_{};
   MetaAssignmentId assignment_id_{};
   MetaDirectiveResultStatus status_ = MetaDirectiveResultStatus::kSucceeded;
-  MetaHash256 result_hash_{};
   std::string result_;
   std::uint64_t committed_index_ = 0;
   bool operator==(const MetaTerminalReceipt&) const = default;

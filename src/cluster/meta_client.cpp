@@ -730,7 +730,6 @@ detail::ProjectClusterFailoverObservation(
       .candidate_assignment_id = candidate_assignment->bytes(),
       .candidate_boot_id = candidate_boot->ToHexString(),
       .prepared_context_id = prepared.context_id_,
-      .prepared_context_hash = prepared.context_hash_,
   });
 }
 
@@ -1424,11 +1423,6 @@ struct MetaControlClientService::Impl {
     std::uint32_t challenged_authority_lease_duration_ms_ = 0;
   };
 
-  struct PendingResult {
-    control::WireDirectiveIdentity identity_;
-    control::WireHash256 result_hash_{};
-  };
-
   // Every field is worker-zero-owned. Detached session tasks retain this
   // object, while RunSession joins those tasks before destroying the writer
   // and stream they reference.
@@ -1460,7 +1454,7 @@ struct MetaControlClientService::Impl {
         inbound_transfer_deadline_;
     std::deque<DirectiveWork> directive_queue_;
     std::vector<control::WireDirectiveIdentity> accepted_directives_;
-    std::vector<PendingResult> pending_results_;
+    std::vector<control::WireDirectiveIdentity> pending_results_;
     std::optional<absl::Status> terminal_error_;
     celer::AsyncNotification heartbeat_changed_;
     celer::AsyncNotification tasks_changed_;
@@ -1744,7 +1738,6 @@ struct MetaControlClientService::Impl {
         control::WireMessage(control::FullStateApplied{
             .source_meta_applied_index = desired.source_meta_applied_index,
             .projection_hash = desired.projection_hash,
-            .object_hash = desired.object_hash,
         }));
   }
 
@@ -1822,7 +1815,6 @@ struct MetaControlClientService::Impl {
                                             : directive.source_assignment_id,
         .operation_id = directive.identity.operation_id,
         .kind_phase = kind_phase,
-        .evidence_hash = control::ComputeSha256(evidence),
         .evidence = std::move(evidence),
         .group_id = directive.authority.group_id,
         .group_term = directive.authority.group_term,
@@ -2034,17 +2026,15 @@ struct MetaControlClientService::Impl {
         .assignment_id = directive.authority.assignment_id,
         .identity = directive.identity,
         .status = ClassifyDirectiveResultStatus(applied, started),
-        .result_hash = control::ComputeSha256(result),
         .result = result,
     };
     if (state->pending_results_.size() >= control::kMaxProjectedDirectives) {
       co_return absl::ResourceExhaustedError(
           "too many unacknowledged directive results");
     }
-    state->pending_results_.push_back(PendingResult{
-        .identity_ = response.identity,
-        .result_hash_ = response.result_hash,
-    });
+    // The completion is immutable for this attempt; Meta checks duplicate
+    // result bodies against its durable receipt before acknowledging identity.
+    state->pending_results_.push_back(response.identity);
     RecordClusterControlDirectiveResult(applied.ok());
     co_return co_await SendDirectiveResult(writer, response);
   }
@@ -2264,7 +2254,6 @@ struct MetaControlClientService::Impl {
   absl::Status HandleResultAck(const std::shared_ptr<SessionState>& state,
                                const control::WireMessage& message) {
     const control::WireDirectiveIdentity* identity = nullptr;
-    const control::WireHash256* result_hash = nullptr;
     if (const auto* committed =
             std::get_if<control::ResultCommitted>(&message)) {
       if (committed->session_id != state->session_.session_id_.bytes() ||
@@ -2274,7 +2263,6 @@ struct MetaControlClientService::Impl {
             "ResultCommitted does not name this session or a commit");
       }
       identity = &committed->identity;
-      result_hash = &committed->result_hash;
     } else if (const auto* forgotten =
                    std::get_if<control::ResultNoLongerTracked>(&message)) {
       if (forgotten->session_id != state->session_.session_id_.bytes() ||
@@ -2286,13 +2274,8 @@ struct MetaControlClientService::Impl {
     } else {
       return absl::InternalError("non-result acknowledgement was dispatched");
     }
-    const auto pending = std::find_if(
-        state->pending_results_.begin(), state->pending_results_.end(),
-        [&](const PendingResult& result) {
-          return result.identity_ == *identity &&
-                 (result_hash == nullptr ||
-                  result.result_hash_ == *result_hash);
-        });
+    const auto pending = std::find(state->pending_results_.begin(),
+                                   state->pending_results_.end(), *identity);
     if (pending == state->pending_results_.end()) {
       return absl::FailedPreconditionError(
           "directive result acknowledgement is unknown or conflicts");

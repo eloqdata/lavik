@@ -2210,43 +2210,6 @@ bool IsRetainedControlledDegrade(
   return current_copy == replacement_copy;
 }
 
-void AppendHashU64(std::string& bytes, std::uint64_t value) {
-  for (int shift = 56; shift >= 0; shift -= 8) {
-    bytes.push_back(static_cast<char>(value >> shift));
-  }
-}
-
-void AppendHashBytes(std::string& bytes, std::span<const std::uint8_t> value) {
-  AppendHashU64(bytes, value.size());
-  bytes.append(reinterpret_cast<const char*>(value.data()), value.size());
-}
-
-void AppendHashString(std::string& bytes, std::string_view value) {
-  AppendHashU64(bytes, value.size());
-  bytes.append(value);
-}
-
-ClusterPreparedContextHash ComputePreparedContextHash(
-    const DesiredClusterFailoverAction& desired,
-    const ClusterPreparedContextId& context_id,
-    const ClusterPromotionPrepared& prepared) {
-  std::string bytes("KEYLANE_FAILOVER_PREPARED_V1");
-  AppendHashBytes(bytes, desired.transition_id_);
-  AppendHashBytes(bytes, desired.action_id_);
-  AppendHashBytes(bytes, context_id);
-  AppendHashString(bytes, prepared.parent_history_id_);
-  AppendHashU64(bytes, prepared.frozen_applied_next_lsns_.size());
-  for (std::uint64_t cursor : prepared.frozen_applied_next_lsns_) {
-    AppendHashU64(bytes, cursor);
-  }
-  AppendHashU64(bytes, prepared.population_generation_);
-  AppendHashU64(bytes, prepared.population_digest_);
-  AppendHashU64(bytes, prepared.catalog_generation_);
-  AppendHashU64(bytes, prepared.catalog_dump_crc64_);
-  AppendHashString(bytes, prepared.child_history_id_);
-  return cluster::control::ComputeSha256(bytes);
-}
-
 ClusterPromotionPrepareDirective BuildFailoverPrepareDirective(
     const DesiredClusterFailoverAction& desired,
     std::vector<std::uint64_t> current_frontier) {
@@ -2279,11 +2242,6 @@ ClusterPromotionPrepareDirective BuildFailoverPrepareDirective(
       .required_applied_next_lsns_ = std::move(current_frontier),
       .excluded_group_term_ = desired.target_term_,
   };
-  const std::string authorization =
-      absl::StrCat("KEYLANE_FAILOVER_ACTION_V1", transition, action, ":",
-                   *desired.authorized_revision_);
-  directive.old_authority_exclusion_hash_ =
-      cluster::control::ComputeSha256(authorization);
   return directive;
 }
 
@@ -4296,10 +4254,6 @@ class ReplicationManager::ReplicationGroup {
           "promotion prepare requires Meta-managed population mode");
     }
     const RebuildIdentity& identity = directive.identity_;
-    const bool zero_exclusion =
-        std::all_of(directive.old_authority_exclusion_hash_.begin(),
-                    directive.old_authority_exclusion_hash_.end(),
-                    [](std::uint8_t byte) { return byte == 0; });
     if (identity.group_id_.empty() || identity.assignment_id_.empty() ||
         identity.term_ == 0 || identity.directive_revision_ == 0 ||
         identity.authority_id_.empty() || identity.source_node_id_.empty() ||
@@ -4317,7 +4271,7 @@ class ReplicationManager::ReplicationGroup {
         std::any_of(directive.required_applied_next_lsns_.begin(),
                     directive.required_applied_next_lsns_.end(),
                     [](std::uint64_t cursor) { return cursor == 0; }) ||
-        directive.excluded_group_term_ != identity.term_ || zero_exclusion) {
+        directive.excluded_group_term_ != identity.term_) {
       co_return absl::InvalidArgumentError(
           "cluster promotion-prepare identity is incomplete");
     }
@@ -5039,8 +4993,6 @@ class ReplicationManager::ReplicationGroup {
             .transition_id_ = context->desired_.transition_id_,
             .action_id_ = context->desired_.action_id_,
             .context_id_ = *context_id,
-            .context_hash_ = ComputePreparedContextHash(context->desired_,
-                                                        *context_id, **result),
             .promotion_ = **result,
         };
         context->state_ = ClusterFailoverActionState::kPrepared;

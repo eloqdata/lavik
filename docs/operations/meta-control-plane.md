@@ -481,7 +481,7 @@ post-effect replay suppresses the state-dependent event for
 `SetUncontrolledCandidate` and post-Begin `AbortControlledFailover`, because
 their original candidate classification or action identifier is no longer in
 the post-state. Correlate the resulting sequence with the authoritative durable
-audit chain and the terminal `getop` result.
+audit history and the terminal `getop` result.
 
 For plaintext remote administration, configure a listener and connect without
 TLS arguments:
@@ -1023,12 +1023,14 @@ operational exception; the missing ordinary records are intentional.
 Strict-export is the fail-safe retention mode. Before selecting it, ensure the
 window has room for the policy-change record. Choose an index still in the
 window and request `exportaudit <through-index>`. Decode and verify the
-versioned hash-chain blob and its drop watermarks in the external archival
+versioned record blob and its drop watermarks in the external archival
 system, store it durably under an archive-defined deployment namespace, and
-deduplicate by Raft log index and record hash. Keylane does not persist a
-separate cluster identity. Only after that acknowledgement should an operator
-issue `pruneaudit <through-index>`. The prune is replicated and advances the
-chain anchor; there is no in-process record of the external acknowledgement.
+deduplicate by Raft log index, comparing full records on duplicate exports.
+The export has no cryptographic chain or tamper-evidence guarantee. Keylane
+does not persist a separate cluster identity. Only after that acknowledgement
+should an operator issue `pruneaudit <through-index>`. The prune is replicated
+and advances the prune floor; there is no in-process record of the external
+acknowledgement.
 At a full window, overlapping prune attempts are rejected until the outstanding
 prune's Raft outcome resolves, including when its client has already timed out.
 

@@ -1097,8 +1097,6 @@ TEST(MetaFailoverHeartbeatTest, ProjectsExactPreparedContext) {
   action_id[0] = 0x22;
   ClusterPreparedContextId context_id{};
   context_id[0] = 0x33;
-  ClusterPreparedContextHash context_hash{};
-  context_hash[0] = 0x44;
   control::WireId128 assignment{};
   assignment[0] = 0x55;
   constexpr char kCandidate[] = "2222222222222222222222222222222222222222";
@@ -1121,7 +1119,6 @@ TEST(MetaFailoverHeartbeatTest, ProjectsExactPreparedContext) {
               .transition_id_ = transition_id,
               .action_id_ = action_id,
               .context_id_ = context_id,
-              .context_hash_ = context_hash,
               .promotion_ = {.parent_history_id_ = kSourceHistory},
           },
   };
@@ -1138,7 +1135,6 @@ TEST(MetaFailoverHeartbeatTest, ProjectsExactPreparedContext) {
   EXPECT_EQ(prepared->candidate_assignment_id, assignment);
   EXPECT_EQ(prepared->candidate_boot_id, kCandidateBoot);
   EXPECT_EQ(prepared->prepared_context_id, context_id);
-  EXPECT_EQ(prepared->prepared_context_hash, context_hash);
 }
 
 TEST(MetaFailoverHeartbeatTest, ProjectsOnlyAnExactStableSourcePause) {
@@ -1210,7 +1206,7 @@ TEST(MetaFailoverHeartbeatTest, ProjectsFailureFromTheExactActionPopulation) {
   action_id[0] = 0x62;
   control::WireId128 assignment{};
   assignment[0] = 0x63;
-  ClusterPreparedContextHash manifest{};
+  control::WireHash256 manifest{};
   manifest[0] = 0x64;
   constexpr char kCandidate[] = "6666666666666666666666666666666666666666";
   constexpr char kCandidateBoot[] = "7777777777777777777777777777777777777777";

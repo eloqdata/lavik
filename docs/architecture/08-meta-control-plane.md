@@ -51,7 +51,7 @@ stores:
 | Grant | One optional authority Grant per Group Term, activation actions, and fencing |
 | Operation | Idempotent operation lifecycle, current directives, durable terminal receipts, and exported/prunable terminal summaries |
 | Population manifest | Immutable, content-addressed partition/epoch documents and explicit pruning |
-| Audit | Log-index-ordered command verdicts in a bounded hash chain |
+| Audit | Log-index-ordered command verdicts in a bounded audit window |
 
 `ApplyCommitted` is the only mutation path. It dispatches absolute-value and
 revision-checked commands and enforces cross-store invariants such as unique
@@ -93,7 +93,7 @@ without a command-specific cleanup list. Replaying the anchor mutation sees
 the directive already absent and is a no-op; snapshot decode rejects a stale
 directive as corrupt aggregate state.
 A domain-invalid command consumes its Raft index, leaves the requested domain
-state unchanged, and records the rejection in the audit chain. Unknown
+state unchanged, and records the rejection in the audit window. Unknown
 commands, corrupt durable bytes, contradictory replay at an existing index,
 and impossible apply ordering fail stop. Replaying the same entry at the same
 index is idempotent and produces the same verdict and audit record;
@@ -357,9 +357,9 @@ lease already installed by Data.
 After a new Leader's `2D` authority-handoff quarantine, every first-send Grant
 attempt enters a finite possible-lease envelope before the socket write. A
 failed write is delivery-ambiguous, so the envelope uses that heartbeat's
-steady receive time and the exact effective duration; cached-Ack replay never
-refreshes it. The store keeps the maximum unconfirmed deadline for the same
-Owner authority across projection or duration replacement. Confirmation of
+steady receive time and the exact effective duration. The store keeps the
+maximum unconfirmed deadline for the same Owner authority across projection
+or duration replacement. Confirmation of
 the latest ordered Grant collapses older possibilities into that exact
 installed window; the installed window itself survives later same-authority
 FDS replacement. A session/boot, Owner, assignment, or Group Term change
@@ -514,14 +514,14 @@ Heartbeat is the periodic Data-to-Meta observation message. Protocol v1 carries
 common health followed by exactly one tagged steady-state role payload: no role
 information, an authority lease request, or replica candidate progress, plus
 an independent optional failover observation. A session accepts
-only the next business sequence or an exact replay
-of the previous heartbeat; an exact replay gets the cached exact ack. Because
+only the next business sequence. Data never retries within a session;
+timeout closes it, and a new session starts a fresh sequence. Duplicate,
+regressing, and skipped sequences close the session. Because
 Data sends the next sequence only after processing the preceding Ack, receipt
 of heartbeat `N+1` is causal confirmation of Ack `N`. Meta retains that proof
 only when `N` granted a nonzero lease for the same authenticated session/boot
 and exact installed Owner projection, assignment, and Group Term.
-Ack write completion alone is not confirmation, and cached Ack replay does not
-advance it. Data
+Ack write completion alone is not confirmation. Data
 quiesces heartbeat projection reads during an FDS replacement. Any outstanding
 ack for the old object is consumed without applying its lease decision, and
 production resumes only after the new object is acknowledged, so a prior
@@ -634,8 +634,10 @@ only after Meta commits an exact `MetaTerminalReceipt` through Raft and responds
 `ResultCommitted`. That first commit advances the live operation revision, so
 an already-issued phase mutation cannot pass its old CAS after the terminal
 result becomes durable; an identical result replay is idempotent and does not
-advance it again, while conflicting content fails closed. Before a first result
-is committed, apply revalidates the
+advance it again, while conflicting status or result bytes fail closed.
+`ResultCommitted` acknowledges the exact directive attempt identity and original
+commit index; the Data-side attempt completion is immutable. Before a first
+result is committed, apply revalidates the
 matching live directive against that same current aggregate anchor; a result
 racing an anchor mutation is therefore rejected even if a future mutation
 path were to miss eager cleanup. An already committed receipt remains
@@ -645,14 +647,15 @@ through an explicit replicated command after the retry-retention window.
 
 Data sends typed `OperationEvidence` when directive execution starts and
 completes. The envelope carries the session and boot, exact reporter
-assignment, operation, population and history anchors, phase, and a SHA-256 of
-the evidence body. A report that fits one frame uses the soft lane; a larger
+assignment, operation, population and history anchors, phase, and the bounded
+evidence body. A report that fits one frame uses the soft lane; a larger
 report uses the `ObservationEvidence` Start/Chunk/End transfer with a bounded
-256 KiB body plus envelope. Meta performs whole-object hash and schema checks
-before admission. A report that is structurally valid but stale against the
-latest committed view is audited and discarded without disrupting an
-otherwise current authority session; malformed session, boot, framing, or
-content-hash data closes it.
+256 KiB body plus envelope. Meta validates the schema before admission;
+streamed transfers additionally validate their whole-object digest. A report
+that is structurally valid but stale against the latest committed view is
+audited and discarded without disrupting an
+otherwise current authority session; malformed session, boot, or framing
+closes it.
 
 Failover does not use operation evidence or terminal receipts. Its three typed
 heartbeat observations are volatile inputs to a typed transition command. The
@@ -857,8 +860,9 @@ respective directories, and change only through retirement and replacement
 with a fresh server id. The previous partial `KMI1` development descriptor is
 rejected and is not migrated. Durable
 operation evidence includes its exact group id, reporter assignment and boot,
-population identity, history, operation id, and evidence hash. Snapshot decoding rejects
-malformed identity anchors and evidence that names a missing group or an
+population identity, history, and operation id. These summaries retain identity
+anchors, not a fingerprint of the discarded observation body. Snapshot decoding
+rejects malformed identity anchors and evidence that names a missing group or an
 impossible future group/population epoch; older committed evidence remains
 valid history after a group legitimately advances or the reporter moves.
 These unreleased formats evolve independently in place. A shared version
@@ -1224,11 +1228,12 @@ status contract.
 
 Every privileged committed command creates a deterministic audit record keyed
 by Raft log index. Records include the injected actor, proposal time, command
-summary, verdict, and a rolling hash linked to the previous record. Exports
-carry the preceding anchor and record hashes so an external archive can verify
-continuity and deduplicate by log index and record hash within its own
-deployment namespace; Keylane persists no separate cluster identity. Pruning
-advances the committed chain anchor only through an explicitly named record.
+summary, and verdict. Exports carry complete records and drop watermarks.
+An external archive uses its own deployment namespace and deduplicates by log
+index, checking complete record equality on duplicate exports; Keylane persists
+no separate cluster identity. Pruning removes a prefix through an explicitly
+named record and advances the committed prune floor. Audit is an operational
+record, not a cryptographically tamper-evident chain.
 `SetAuditPolicy` is itself replicated and always audited, including a
 transition into or out of disabled mode.
 
@@ -1249,7 +1254,7 @@ cannot recover whether the original event selected or replaced a candidate,
 and a post-Begin `AbortControlledFailover` cannot recover the cleared action
 identifier. The deterministic committed audit record remains authoritative,
 and the process log reconstructs the election/cutover sequence alongside that
-audit chain rather than replacing it.
+audit history rather than replacing it.
 
 ## Source map
 

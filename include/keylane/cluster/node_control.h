@@ -220,10 +220,6 @@ struct PreparedFullState {
   // Exact effective duration for every Authority Lease issued against this
   // FDS. Policy identity and Meta-local leadership limits stay outside Data.
   std::uint32_t authority_lease_duration_ms_ = 0;
-  // SHA-256 of the complete wire object, including its diagnostic source
-  // index. This detects same-index equivocation independently of the semantic
-  // projection hash.
-  Sha256Digest object_hash_{};
   // Exact member incarnations and manifest binding from the same decoded FDS.
   // Test-only projections may leave this empty when they exercise routing and
   // authority without directives or boot-local population proof.
@@ -722,7 +718,6 @@ class NodeControlInstaller {
   // repeated call can never manufacture a successful barrier.
   std::optional<absl::Status> storage_loss_result_;
   std::optional<ProjectionBasis> projection_basis_;
-  std::optional<Sha256Digest> object_hash_;
   std::uint32_t authority_lease_duration_ms_ = 0;
   std::vector<PreparedGroupControlIdentity> control_groups_;
   std::vector<DesiredClusterControl> desired_cluster_controls_;

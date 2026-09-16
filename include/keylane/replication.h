@@ -219,7 +219,6 @@ using ClusterFailoverActionId = std::array<std::uint8_t, 16>;
 // are observations rather than durable identities and are discarded on
 // restart or action replacement.
 using ClusterPreparedContextId = std::array<std::uint8_t, 16>;
-using ClusterPreparedContextHash = std::array<std::uint8_t, 32>;
 
 // Wire-independent execution semantics derived from committed state.
 // Controlled actions prepare while the old owner remains authoritative;
@@ -312,7 +311,6 @@ struct ClusterPromotionPrepareDirective {
   std::string parent_history_id_;
   std::vector<std::uint64_t> required_applied_next_lsns_;
   std::uint64_t excluded_group_term_ = 0;
-  std::array<std::uint8_t, 32> old_authority_exclusion_hash_{};
 
   bool operator==(const ClusterPromotionPrepareDirective&) const = default;
 };
@@ -333,13 +331,12 @@ struct ClusterPromotionPrepared {
 };
 
 // Boot-local proof that the exact transition action completed promotion
-// preparation. The opaque id/hash bind activation to the retained replication
-// resources without exposing their representation across NodeControl.
+// preparation. The action identifies the retained replication resources;
+// the opaque context id distinguishes this boot-local preparation report.
 struct ClusterFailoverPreparedContext {
   ClusterFailoverTransitionId transition_id_{};
   ClusterFailoverActionId action_id_{};
   ClusterPreparedContextId context_id_{};
-  ClusterPreparedContextHash context_hash_{};
   ClusterPromotionPrepared promotion_;
 
   bool operator==(const ClusterFailoverPreparedContext&) const = default;

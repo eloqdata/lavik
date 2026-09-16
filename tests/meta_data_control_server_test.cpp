@@ -869,14 +869,9 @@ TEST(MetaDataControlLeaseTest,
   control::FullDesiredState state;
   state.source_meta_applied_index = 7;
   state.authority_lease_duration_ms = 900;
-  ASSERT_TRUE(
-      control::ComputeDirectiveSetDigest(state.current_directives).ok());
-  state.directive_set_digest =
-      *control::ComputeDirectiveSetDigest(state.current_directives);
   state.projection_hash = *control::ComputeProjectionHash(state);
   auto encoded = control::EncodeFullDesiredState(state);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  state.object_hash = control::ComputeSha256(*encoded);
   keylane::meta::NodeControlBatch batch{state, *encoded};
 
   const absl::Status limited = ApplyLeadershipValidityLimit(batch, 250);
@@ -892,7 +887,6 @@ TEST(MetaDataControlLeaseTest,
       control::DataHeartbeatIntervalMs(decoded->authority_lease_duration_ms),
       83u);
   EXPECT_EQ(decoded->projection_hash, batch.full_state.projection_hash);
-  EXPECT_EQ(decoded->object_hash, batch.full_state.object_hash);
 }
 
 TEST(MetaDataControlLeaseTest,
@@ -1460,7 +1454,6 @@ TEST(MetaHeartbeatObservationTest,
       .candidate_assignment_id = Bytes<16>(0x22),
       .candidate_boot_id = Identity('2'),
       .prepared_context_id = Bytes<16>(0x41),
-      .prepared_context_hash = Bytes<32>(0x42),
   };
 
   const auto result = IngestHeartbeatObservations(
@@ -1498,7 +1491,6 @@ TEST(MetaOperationEvidenceTest,
       .partition_replication_epoch = 4,
       .replication_history_id = Identity('4'),
   };
-  evidence.evidence_hash = control::ComputeSha256(evidence.evidence);
 
   EXPECT_TRUE(IngestOperationEvidenceObservation(
                   observations, facts, Identity('1'), boot, 1, session_id,
@@ -1542,12 +1534,12 @@ TEST(MetaOperationEvidenceTest,
                 .code(),
             absl::StatusCode::kFailedPrecondition);
   invalid = evidence;
+  // Observation bodies are replaceable reports, not durable content identities.
   invalid.evidence.push_back('!');
-  EXPECT_EQ(IngestOperationEvidenceObservation(
-                observations, facts, Identity('1'), boot, 1, session_id,
-                invalid, /*now_unix_ms=*/1002)
-                .code(),
-            absl::StatusCode::kDataLoss);
+  EXPECT_TRUE(IngestOperationEvidenceObservation(
+                  observations, facts, Identity('1'), boot, 1, session_id,
+                  invalid, /*now_unix_ms=*/1002)
+                  .ok());
 }
 
 TEST(MetaDirectiveReceiptTrackerTest,
