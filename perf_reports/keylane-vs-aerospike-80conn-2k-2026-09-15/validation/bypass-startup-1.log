@@ -1,6 +1,0 @@
-VMBUS_BUS: vmbus_scan_one(): 7ced8deb-25f2-7ced-8deb-25f27ced8deb already registered
-VMBUS_BUS: vmbus_scan_one(): 000d3a52-b2f1-000d-3a52-b2f1000d3a52 already registered
-DPDK net_ring: 2 workers, 2 RX/TX pairs, poll, IPv4 198.18.0.2, RX steering hash
-[2026-09-15 16:32:17.681] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596159012 Hz (2596.159 MHz) ticks-per-us=2596.159
-[2026-09-15 16:32:17.681] [info] provided-buffer ring disabled; using per-connection receive buffers
-startup failure released both workers

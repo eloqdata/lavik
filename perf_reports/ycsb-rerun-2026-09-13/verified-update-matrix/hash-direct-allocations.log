@@ -1,4 +1,0 @@
-read mode=move payload=1452 allocations=12 requested_bytes=2810
-read mode=direct payload=1452 allocations=11 requested_bytes=2090
-arguments reserve=0 allocations=10 requested_bytes=992 capacity=16/16
-arguments reserve=1 allocations=2 requested_bytes=320 capacity=10/10

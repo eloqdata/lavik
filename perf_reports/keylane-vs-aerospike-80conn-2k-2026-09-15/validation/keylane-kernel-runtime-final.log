@@ -1,2 +1,0 @@
-kernel 0 PASS: data, recovery, 2 workers / 2 rings, clean shutdown
-kernel 1 PASS: data, recovery, 2 workers / 2 rings, clean shutdown

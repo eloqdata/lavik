@@ -1,5 +1,0 @@
-# Preserve recorded bytes across checkouts so SHA256SUMS remains meaningful.
-* -text
-# Blank context lines in source patches and captured log spacing are evidence.
-*.diff -whitespace
-validation/*.log -whitespace

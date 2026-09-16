@@ -1,8 +1,0 @@
-{
-  "utc": "2026-09-14T17:31:55.432220+00:00",
-  "client_sha256": "68fbf912ddd469e621025e35b5b42cb658ed0daef476bf725a9d1e37cf0a538f",
-  "ssh_host": "172.16.0.5",
-  "command": "test ! -e /mnt/dev/dfly-flush-spdk-20260914/smoke-r3-mixed.json && ulimit -n 8192 && exec taskset -c 0-15 /mnt/dev/dfly-get-issue20-20260909/dfly_bench-x86_64 --h=172.16.0.4 --p=6379 --proactor_threads=16 --c=40 --n=10000 --test_time=3 --ratio=1:1 --pipeline=1 --qps=0 --key_prefix= --key_minimum=0 --key_maximum=1000000000 --key_dist=U --d=1024 --tcp_nodelay=true --seed=42 --json_out_file=/mnt/dev/dfly-flush-spdk-20260914/smoke-r3-mixed.json --vmodule=dfly_bench=1 --logtostderr=true",
-  "seconds": 3,
-  "expected_requests": null
-}

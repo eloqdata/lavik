@@ -222,37 +222,15 @@ Redis-style configuration file as its first argument.
 
 ## Benchmark
 
-Read-only measurements on one server and one client, with **80 connections,
-one outstanding request per connection, and 2 KiB (2,048-byte) values**.
-Each configuration ran three 300-second rounds; the server CPU budget was
-12 logical CPUs (6 physical cores with SMT).
+The [Keylane–Aerospike YCSB report](perf_reports/ycsb-rerun-2026-09-13/README.md)
+records the server and client hardware, actual dataset sizes, database
+parameters, QPS, and p99/p99.9/p99.99 latency for A/B/C/D workloads with 256
+YCSB threads. It includes the raw measurements and an offline verification
+script.
 
-| Configuration | Records | GET/s | Mean latency (µs) |
-|---|---:|---:|---:|
-| Keylane: kernel network + io_uring, raw RAID0 | 500 million | 218,223 | 366.23 |
-| Keylane: kernel network + SPDK | 500 million | 237,099 | 337.04 |
-| Keylane: DPDK + SPDK | 500 million | 303,841 | 262.93 |
-| Aerospike CE: kernel network, raw RAID0 | 10 million | 212,075 | 376.80 |
-
-Keylane used 1.024 TB of values and memtier/RESP; Aerospike used 20.48 GB
-and asbench/native protocol with its read caches disabled. Dataset size,
-record layout, storage topology, and client tools differ. The figures compare
-these specific configurations; all formal rounds completed with zero errors
-and misses. The io_uring row uses the default build with kernel bypass disabled.
-
-See the [Keylane–Aerospike report](perf_reports/keylane-vs-aerospike-80conn-2k-2026-09-15/README.md)
-for per-round results, versions, commands, raw evidence, and an offline
-verification script.
-
-### One million QPS on a 16-vCPU server
-
-On a server with 16 logical CPUs and 16 pinned workers, Keylane served random
-GETs from a one-billion-key SPDK dataset at **1,007,197 QPS** with 1,024-byte
-values, 640 connections, and pipeline depth 1. All 64 million measured GETs
-found an existing key, and no errors were reported. The 128-, 256-, and
-512-byte workloads also exceeded one million QPS. See the
-[one-billion-key, 16-worker benchmark report](perf_reports/keylane-spdk-dfly-bench-1b-value-size-limit-16worker-2026-08-31.md)
-for the complete setup, latency measurements, and reproduction commands.
+Both databases read from the same 100-million-key range with ten 128-byte
+fields per record. Actual total record counts, CPU allocations, and measurement
+windows differ; the report lists these conditions beside the results.
 
 ## Durability and compatibility notes
 
@@ -285,7 +263,7 @@ Useful references:
 - [Operations](docs/operations/README.md)
 - [Prometheus metrics](docs/operations/metrics.md)
 - [Network IRQ affinity tuning](docs/operations/irq-affinity-tuning.md)
-- [Performance reports](perf_reports/)
+- [Performance report](perf_reports/ycsb-rerun-2026-09-13/README.md)
 
 ---
 

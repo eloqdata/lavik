@@ -1,9 +1,0 @@
-START hmset-c-c256-target100000-warmup
-DONE hmset-c-c256-target100000-warmup qps=99059 errors=0
-START hmset-c-c256-target100000-measured
-DONE hmset-c-c256-target100000-measured qps=99808 errors=0
-START aerospike-c-c256-target100000-warmup
-DONE aerospike-c-c256-target100000-warmup qps=97295 errors=0
-START aerospike-c-c256-target100000-measured
-DONE aerospike-c-c256-target100000-measured qps=99518 errors=0
-COMPLETE rate-limit 100000: two databases

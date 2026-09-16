@@ -1,7 +1,0 @@
-[2026-09-15 16:31:08.183] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596147542 Hz (2596.148 MHz) ticks-per-us=2596.148
-PASS arm real pending receive
-PASS storage borrow allows immediate transport close
-PASS closed storage survives suspended session
-PASS receive cancellation drains while storage stays borrowed
-PASS one remaining borrower prevents reclaim
-PASS last release permits worker reclamation
