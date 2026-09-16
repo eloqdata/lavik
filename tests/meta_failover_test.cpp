@@ -126,7 +126,6 @@ struct ProposalFixture {
     activate.expected_term_ = 1;
     activate.new_owner_ = owner;
     activate.new_topology_epoch_ = 4;
-    activate.new_config_epoch_ = 1;
     Apply(activate);
   }
 
@@ -306,7 +305,6 @@ struct ProposalFixture {
         group->record_.population_manifest_digest_;
     begin.expected_partition_replication_epoch_ =
         group->record_.partition_replication_epoch_;
-    begin.expected_config_epoch_ = group->config_epoch_;
     return begin;
   }
 

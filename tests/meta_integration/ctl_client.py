@@ -210,7 +210,7 @@ def scripted_cluster_gate(workdir):
         wire_string("group-1") + bytes([1, 1, 1, 1, 0]))
     group = (
         wire_string("group-1") + struct.pack(">Q", 4) + bytes([1]) +
-        wire_string("data-1") + struct.pack(">QBB", 8, 1, 1) +
+        wire_string("data-1") + struct.pack(">BB", 1, 1) +
         disabled_automatic_failover_status())
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     status_payload = (
@@ -405,7 +405,7 @@ def scripted_cluster_create_gate(workdir):
         wire_string("group-1") + bytes([1, 1, 1, 1, 0]))
     group = (
         wire_string("group-1") + struct.pack(">Q", 1) + bytes([1]) +
-        wire_string(node_id) + struct.pack(">QBB", 1, 1, 1) +
+        wire_string(node_id) + struct.pack(">BB", 1, 1) +
         disabled_automatic_failover_status())
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     ready_status = (
@@ -556,7 +556,7 @@ def scripted_failover_gate(workdir):
         wire_string("group-1") + bytes([1, 1, 1, 1, 0]))
     group = (
         wire_string("group-1") + struct.pack(">Q", 4) + bytes([1]) +
-        wire_string(node_id) + struct.pack(">QBB", 8, 1, 1) +
+        wire_string(node_id) + struct.pack(">BB", 1, 1) +
         disabled_automatic_failover_status())
     slot_range = struct.pack(">II", 0, 16_383) + wire_string("group-1")
     status_payload = (

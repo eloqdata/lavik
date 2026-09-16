@@ -418,16 +418,16 @@ class Node:
     def getpolicy(self, policy_id):
         return self.ctl(f"getpolicy {policy_id}")
 
-    def setslotmap(self, first, last, group_id, config_epoch, timeout=5.0):
+    def setslotmap(self, first, last, group_id, timeout=5.0):
         return self.ctl(
-            f"setslotmap {first} {last} {group_id} {config_epoch}",
+            f"setslotmap {first} {last} {group_id}",
             timeout=timeout)
 
     def activateauthority(self, group_id, expected_term, owner_node_id,
-                          config_epoch, timeout=5.0):
+                          timeout=5.0):
         return self.ctl(
-            f"activateauthority {group_id} {expected_term} {owner_node_id} "
-            f"{config_epoch}", timeout=timeout)
+            f"activateauthority {group_id} {expected_term} {owner_node_id}",
+            timeout=timeout)
 
     def fencegroup(self, group_id, expected_term, timeout=5.0):
         return self.ctl(f"fencegroup {group_id} {expected_term}",

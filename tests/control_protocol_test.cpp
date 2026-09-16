@@ -65,7 +65,6 @@ control::FullDesiredState FailoverFullState() {
   group.group_term = 7;
   group.grant_active = true;
   group.activation_action_id = Id(19);
-  group.config_epoch = 13;
   group.steady_replication_enabled = true;
   group.failover_transition = control::WireFailoverTransition{
       .transition_id = Id(20),
@@ -944,7 +943,6 @@ TEST(ControlProtocolFullStateTest,
   group.owner_assignment_id = Id(5);
   group.group_term = 7;
   group.grant_active = true;
-  group.config_epoch = 13;
   group.members.push_back(
       {.node_id = state.nodes[0].node_id, .assignment_id = Id(5)});
   group.slot_ranges.push_back({.first = 0, .last = 100});
@@ -1388,7 +1386,6 @@ TEST(ControlProtocolFullStateTest, RoundTripsCommittedGrantlessGroup) {
       {.group_id = "grantless",
        .group_term = 3,
        .grant_active = false,
-       .config_epoch = 6,
        .failover_transition = control::WireFailoverTransition{
            .transition_id = Id(1),
            .revision = 7,

@@ -18,8 +18,8 @@
 //   - ActivateAuthority: the authority-install kernel used directly and by
 //     typed failover cutover. It is split into ValidateActivate (pure, all
 //     rejections) and ApplyGrantPart (the install) so the apply dispatcher can
-//     atomically write the topology-store part (owner, topology_epoch, and
-//     config_epoch) between the two. expected_term must equal the current term;
+//     atomically write the topology-store part (owner and topology_epoch)
+//     between the two. expected_term must equal the current term;
 //     the term does not move. A different active grant in the same term is
 //     rejected. ApplyGrantPart assumes successful validation and FAILS STOP on
 //     a contract violation.

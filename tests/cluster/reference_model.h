@@ -29,7 +29,6 @@ using GroupId = StrongId<struct GroupIdTag>;
 using GroupTerm = StrongId<struct GroupTermTag>;
 using GrantId = StrongId<struct GrantIdTag>;
 using TopologyEpoch = StrongId<struct TopologyEpochTag>;
-using ConfigEpoch = StrongId<struct ConfigEpochTag>;
 using ManifestId = StrongId<struct ManifestIdTag>;
 using PartitionEpoch = StrongId<struct PartitionEpochTag>;
 using HistoryId = StrongId<struct HistoryIdTag>;

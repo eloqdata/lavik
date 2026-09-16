@@ -661,7 +661,6 @@ std::string BuildClusterStatusReply(
     if (!source.topology_.record_.owner_.empty()) {
       group.owner_node_id_ = source.topology_.record_.owner_;
     }
-    group.config_epoch_ = source.topology_.config_epoch_;
     group.effective_threshold_ms_ = view.automatic_failover_threshold_ms_;
 
     const auto detector_status =
@@ -1554,21 +1553,19 @@ celer::Task<std::string> HandleSetSlotMap(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, std::uint16_t first_slot,
-    std::uint16_t last_slot, const std::string& group_id,
-    std::uint64_t config_epoch) {
+    std::uint16_t last_slot, const std::string& group_id) {
   const MetaStores before = state_machine->StoresSnapshot();
   SetSlotMap command;
   command.request_id_ = MakeRequestId();
   command.ranges_.push_back({first_slot, last_slot, group_id});
   command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
-  command.config_epochs_.push_back({group_id, config_epoch});
   std::string reply =
       co_await ProposeCommand(coordinator, std::move(principal), command);
   if (reply.rfind("OK ", 0) != 0) co_return reply;
 
   const MetaStores after = state_machine->StoresSnapshot();
   const auto group = after.topology_.FindGroup(group_id);
-  if (!group.has_value() || group->config_epoch_ != config_epoch ||
+  if (!group.has_value() ||
       after.topology_.TopologyEpoch() != command.new_topology_epoch_) {
     co_return "ERR rejected";
   }
@@ -1587,8 +1584,7 @@ celer::Task<std::string> HandleActivateAuthority(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     nuraft::ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
-    std::uint64_t expected_term, const std::string& owner_node_id,
-    std::uint64_t config_epoch) {
+    std::uint64_t expected_term, const std::string& owner_node_id) {
   const MetaStores before = state_machine->StoresSnapshot();
   ActivateAuthority command;
   command.request_id_ = MakeRequestId();
@@ -1596,7 +1592,6 @@ celer::Task<std::string> HandleActivateAuthority(
   command.expected_term_ = expected_term;
   command.new_owner_ = owner_node_id;
   command.new_topology_epoch_ = before.topology_.TopologyEpoch() + 1;
-  command.new_config_epoch_ = config_epoch;
   std::string reply =
       co_await ProposeCommand(coordinator, std::move(principal), command);
   if (reply.rfind("OK ", 0) != 0) co_return reply;
@@ -1609,7 +1604,6 @@ celer::Task<std::string> HandleActivateAuthority(
       grant->group_term_ != expected_term ||
       topology->record_.owner_ != owner_node_id ||
       topology->record_.group_term_ != expected_term ||
-      topology->config_epoch_ != config_epoch ||
       after.topology_.TopologyEpoch() != command.new_topology_epoch_) {
     co_return "ERR rejected";
   }
@@ -2260,30 +2254,26 @@ celer::Task<std::string> DispatchMutationVerb(
   if (command == "setslotmap") {
     std::uint64_t first = 0;
     std::uint64_t last = 0;
-    std::uint64_t config_epoch = 0;
-    if (tokens.size() != 5 || !ParseU64(tokens[1], first) ||
+    if (tokens.size() != 4 || !ParseU64(tokens[1], first) ||
         !ParseU64(tokens[2], last) || first > last || last >= kMetaSlotCount ||
-        tokens[3].empty() || tokens[3].size() > kMaxMetaGroupIdBytes ||
-        !ParseU64(tokens[4], config_epoch)) {
+        tokens[3].empty() || tokens[3].size() > kMaxMetaGroupIdBytes) {
       co_return "ERR bad-request";
     }
     co_return co_await HandleSetSlotMap(
         coordinator, std::move(state_machine), std::move(principal),
         static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last),
-        tokens[3], config_epoch);
+        tokens[3]);
   }
   if (command == "activateauthority") {
     std::uint64_t expected_term = 0;
-    std::uint64_t config_epoch = 0;
-    if (tokens.size() != 5 || tokens[1].empty() ||
+    if (tokens.size() != 4 || tokens[1].empty() ||
         tokens[1].size() > kMaxMetaGroupIdBytes ||
-        !ParseU64(tokens[2], expected_term) || !IsNodeId(tokens[3]) ||
-        !ParseU64(tokens[4], config_epoch) || config_epoch == 0) {
+        !ParseU64(tokens[2], expected_term) || !IsNodeId(tokens[3])) {
       co_return "ERR bad-request";
     }
     co_return co_await HandleActivateAuthority(
         coordinator, std::move(state_machine), std::move(principal), tokens[1],
-        expected_term, tokens[3], config_epoch);
+        expected_term, tokens[3]);
   }
   if (command == "fencegroup") {
     std::uint64_t expected_term = 0;

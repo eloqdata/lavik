@@ -598,7 +598,6 @@ TEST_F(MetaStateMachineTest,
   activate.expected_term_ = 1;
   activate.new_owner_ = owner;
   activate.new_topology_epoch_ = 3;
-  activate.new_config_epoch_ = 1;
   Commit(*machine, 9, activate);
 
   keylane::meta::BeginUncontrolledFailover begin;
@@ -614,7 +613,6 @@ TEST_F(MetaStateMachineTest,
   begin.expected_population_manifest_revision_ = 0;
   begin.expected_population_manifest_digest_.fill(0);
   begin.expected_partition_replication_epoch_ = 0;
-  begin.expected_config_epoch_ = 1;
   Commit(*machine, 10, begin);
 
   const MetaStores committed = machine->StoresSnapshot();

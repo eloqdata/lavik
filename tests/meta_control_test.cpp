@@ -5,9 +5,13 @@
 #include <string>
 #include <string_view>
 
+#include "../src/redis/cluster_command.h"
+#include "absl/cleanup/cleanup.h"
 #include "gtest/gtest.h"
 #include "keylane/cluster/control_protocol.h"
+#include "keylane/cluster/runtime.h"
 #include "keylane/replication_group.h"
+#include "keylane/resp.h"
 
 namespace {
 
@@ -50,7 +54,6 @@ control::FullDesiredState DesiredState() {
       .owner_assignment_id = assignment,
       .group_term = 7,
       .grant_active = true,
-      .config_epoch = 12,
       .slot_ranges = {{0, 8191}},
       .manifest_revision = 5,
       .partition_replication_epoch = 13,
@@ -125,6 +128,78 @@ TEST(MetaControlMapperTest, SourceIndexDoesNotBecomeTopologyEpoch) {
   auto prepared = cluster::PrepareMetaFullState(desired, kNode1, 1);
   ASSERT_TRUE(prepared.ok()) << prepared.status();
   EXPECT_EQ(prepared->serving_state_->topology_epoch(), 17);
+}
+
+TEST(MetaControlMapperTest,
+     RedisEpochsFollowGroupTermsIncludingFencedAndEmptyGroups) {
+  constexpr char kNode3[] = "3333333333333333333333333333333333333333";
+  auto desired = DesiredState();
+  desired.nodes.push_back(
+      {.node_id = kNode3, .host = "10.0.0.3", .port = 7003});
+  auto other = desired.groups.front();
+  other.group_id = "group-b";
+  other.members = {{.node_id = kNode3, .assignment_id = control::WireId128{4}}};
+  other.owner_node_id = kNode3;
+  other.owner_assignment_id = other.members.front().assignment_id;
+  other.group_term = 11;
+  other.slot_ranges = {{8192, 16383}};
+  desired.groups.push_back(std::move(other));
+  // A fenced Group can lose its last member without losing its durable term.
+  // It has no node row or routing entry but still contributes to INFO's max.
+  desired.groups.push_back({.group_id = "empty-group", .group_term = 13});
+
+  const auto command = [](std::string subcommand) {
+    keylane::CommandRequest request;
+    request.kind_ = keylane::CommandKind::kCluster;
+    request.args_ = {"CLUSTER", std::move(subcommand)};
+    keylane::ReplyBuilder reply;
+    auto task = keylane::ExecuteClusterModeCommand(request, reply);
+    auto handle = std::move(task).ReleaseHandle();
+    handle.resume();
+    EXPECT_TRUE(handle.done());
+    const std::string result(handle.promise().value_.encoded_);
+    handle.destroy();
+    return result;
+  };
+  for (bool fenced : {false, true}) {
+    // An uncontrolled Begin advances term before installing a new Owner.
+    // The compatibility epoch still reflects that term without advertising
+    // serving authority or depending on an active routing GroupView.
+    desired.groups.front().group_term = fenced ? 8 : 7;
+    desired.groups.front().grant_active = !fenced;
+    Rehash(&desired);
+    for (const char* self : {kNode1, kNode2}) {
+      auto prepared = cluster::PrepareMetaFullState(desired, self, 1);
+      ASSERT_TRUE(prepared.ok()) << prepared.status();
+      auto runtime = std::make_unique<cluster::ClusterRuntime>();
+      ASSERT_TRUE(
+          runtime->node_control_installer_
+              .InstallFullState(std::move(*prepared),
+                                {.source_meta_applied_index_ =
+                                     desired.source_meta_applied_index,
+                                 .projection_hash_ = desired.projection_hash})
+              .ok());
+      // Local readiness publication rebuilds the routing view. It must retain
+      // the derived maximum even for Groups absent from that routing view.
+      ASSERT_TRUE(runtime->node_control_installer_.SetStorageReady(true).ok());
+      cluster::InstallClusterRuntime(std::move(runtime));
+      absl::Cleanup reset_runtime = [] {
+        cluster::InstallClusterRuntime(nullptr);
+      };
+      const std::string info = command("INFO");
+      EXPECT_NE(info.find("cluster_current_epoch:13\r\n"), std::string::npos);
+      EXPECT_NE(info.find(fenced ? "cluster_my_epoch:8\r\n"
+                                 : "cluster_my_epoch:7\r\n"),
+                std::string::npos);
+      const std::string nodes = command("NODES");
+      const std::string epoch =
+          fenced ? " 0 0 8 connected" : " 0 0 7 connected";
+      const auto first = nodes.find(epoch);
+      ASSERT_NE(first, std::string::npos);
+      EXPECT_NE(nodes.find(epoch, first + epoch.size()), std::string::npos);
+      EXPECT_NE(nodes.find(" 0 0 11 connected"), std::string::npos);
+    }
+  }
 }
 
 TEST(MetaControlMapperTest, InstallsInitialEmptyTopologyAtEpochZero) {
@@ -235,7 +310,8 @@ TEST(MetaControlMapperTest, RejectsNonNumericOrNonCanonicalNodeHosts) {
   EXPECT_TRUE(cluster::PrepareMetaFullState(desired, kNode1, 1).ok());
 }
 
-TEST(MetaControlMapperTest, RejectsMalformedMemberIncarnationsAndConfigEpoch) {
+TEST(MetaControlMapperTest,
+     RejectsMalformedMemberIncarnationsAndZeroOwnerTerm) {
   auto desired = DesiredState();
   desired.groups[0].members[1].assignment_id = {};
   Rehash(&desired);
@@ -249,7 +325,7 @@ TEST(MetaControlMapperTest, RejectsMalformedMemberIncarnationsAndConfigEpoch) {
             absl::StatusCode::kInvalidArgument);
 
   desired = DesiredState();
-  desired.groups[0].config_epoch = 0;
+  desired.groups[0].group_term = 0;
   Rehash(&desired);
   EXPECT_EQ(cluster::PrepareMetaFullState(desired, kNode1, 1).status().code(),
             absl::StatusCode::kInvalidArgument);

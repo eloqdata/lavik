@@ -123,6 +123,7 @@ std::shared_ptr<const ServingState> RebuildState(const ServingState& state,
                                                  Mutate&& mutate) {
   ServingStateBuilder builder;
   builder.SetTopologyEpoch(state.topology_epoch())
+      .IncludeGroupTerm(state.max_group_term())
       .SetSelfNodeIndex(state.SelfNodeIndex())
       .SetInFlightStripeCount(state.InFlightStripeCount());
   for (const NodeDescriptor& node : state.Nodes()) builder.AddNode(node);
@@ -1000,7 +1001,6 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
           prepared_state.serving_state_->FindGroup(control_group.group_id_);
       if (serving_group != nullptr &&
           (serving_group->group_term_ != control_group.group_term_ ||
-           serving_group->config_epoch_ != control_group.config_epoch_ ||
            serving_group->manifest_revision_ !=
                control_group.manifest_revision_)) {
         return absl::InvalidArgumentError(
@@ -1151,8 +1151,7 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
                                });
           });
       if (shares_member_incarnation &&
-          (new_group->config_epoch_ < old_group.config_epoch_ ||
-           new_group->group_term_ < old_group.group_term_ ||
+          (new_group->group_term_ < old_group.group_term_ ||
            new_group->manifest_revision_ < old_group.manifest_revision_)) {
         return absl::FailedPreconditionError(absl::StrCat(
             "same-membership control counter regressed for group '",
@@ -1172,8 +1171,7 @@ absl::Status NodeControlInstaller::InstallFullStateLocal(
           new_group->assignment_id_ != old_group.assignment_id_) {
         continue;
       }
-      if (new_group->config_epoch_ < old_group.config_epoch_ ||
-          new_group->group_term_ < old_group.group_term_ ||
+      if (new_group->group_term_ < old_group.group_term_ ||
           new_group->manifest_revision_ < old_group.manifest_revision_) {
         return absl::FailedPreconditionError(absl::StrCat(
             "same-assignment control counter regressed for group '",

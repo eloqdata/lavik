@@ -67,13 +67,11 @@
 //                             family.
 //   getpolicy <policy_id>  -> leader-only current raw Policy as
 //                             "OK version=<n> content=<json>" or not-found.
-//   setslotmap <first> <last> <group_id> <config_epoch>
+//   setslotmap <first> <last> <group_id>
 //                          -> replace the absolute slot map with one inclusive
-//                             range and set that group's absolute config
-//                             epoch. This deliberately narrow bootstrap form
+//                             range. This deliberately narrow bootstrap form
 //                             does not imply incremental slot mutation.
 //   activateauthority <group_id> <expected_term> <owner_node_id>
-//                     <new_config_epoch>
 //                          -> atomically activate the committed owner/grant;
 //                             the topology epoch is derived from the local
 //                             committed snapshot. A term can acquire at most

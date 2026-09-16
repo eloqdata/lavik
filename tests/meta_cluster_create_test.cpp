@@ -588,7 +588,6 @@ ClusterStatusWireV1 ReadyStatus(const ClusterCreateManifestV1& manifest,
     status.groups_.push_back({.group_id_ = group.group_id_,
                               .term_ = 1,
                               .owner_node_id_ = group.primary_node_id_,
-                              .config_epoch_ = 1,
                               .serving_ready_ = true,
                               .topology_converged_ = true,
                               .effective_threshold_ms_ = 1'000});

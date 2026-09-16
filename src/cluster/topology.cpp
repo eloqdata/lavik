@@ -135,7 +135,6 @@ std::uint64_t ComputeGroupToken(const GroupView& group,
   HashBool(hash, group.granted_);
   HashBool(hash, group.population_ready_);
   HashBool(hash, group.storage_ready_);
-  HashU64(hash, group.config_epoch_);
   return hash == 0 ? 1 : hash;
 }
 
@@ -147,12 +146,13 @@ std::uint64_t ComputeGroupToken(const GroupView& group,
 // GroupView::slot_ranges_ (differently partitioned but equivalent ranges —
 // e.g. [0,9] versus [0,4]+[5,9] — describe the same state).
 std::uint64_t ComputeContentHash(
-    std::uint64_t topology_epoch, NodeIndex self_node_index,
-    const std::vector<NodeDescriptor>& nodes,
+    std::uint64_t topology_epoch, std::uint64_t max_group_term,
+    NodeIndex self_node_index, const std::vector<NodeDescriptor>& nodes,
     const std::vector<GroupView>& groups,
     const std::array<GroupIndex, kSlotCount>& slot_to_group) {
   std::uint64_t hash = kFnv1aOffsetBasis;
   HashU64(hash, topology_epoch);
+  HashU64(hash, max_group_term);
   HashNodeReference(hash, nodes, self_node_index);
 
   std::vector<const NodeDescriptor*> sorted_nodes;
@@ -170,7 +170,7 @@ std::uint64_t ComputeContentHash(
     HashU64(hash, node->tls_port_);
     HashBool(hash, node->is_primary());
     HashNodeReference(hash, nodes, node->primary_node_index_);
-    HashU64(hash, node->config_epoch_);
+    HashU64(hash, node->group_term_);
     HashBool(hash, node->link_connected_);
   }
 
@@ -200,7 +200,6 @@ std::uint64_t ComputeContentHash(
     HashBool(hash, group->population_ready_);
     HashBool(hash, group->storage_ready_);
     HashBool(hash, group->mutations_paused_);
-    HashU64(hash, group->config_epoch_);
   }
 
   for (int slot = 0; slot < kSlotCount; ++slot) {
@@ -311,6 +310,11 @@ ServingStateBuilder& ServingStateBuilder::SetSelfNodeIndex(
   return *this;
 }
 
+ServingStateBuilder& ServingStateBuilder::IncludeGroupTerm(std::uint64_t term) {
+  max_group_term_ = std::max(max_group_term_, term);
+  return *this;
+}
+
 ServingStateBuilder& ServingStateBuilder::SetInFlightStripeCount(
     std::size_t stripe_count) {
   in_flight_stripe_count_ = stripe_count;
@@ -318,11 +322,13 @@ ServingStateBuilder& ServingStateBuilder::SetInFlightStripeCount(
 }
 
 ServingStateBuilder& ServingStateBuilder::AddNode(NodeDescriptor node) {
+  IncludeGroupTerm(node.group_term_);
   nodes_.push_back(std::move(node));
   return *this;
 }
 
 ServingStateBuilder& ServingStateBuilder::AddGroup(GroupView group) {
+  IncludeGroupTerm(group.group_term_);
   groups_.push_back(std::move(group));
   return *this;
 }
@@ -460,6 +466,7 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
 
   auto state = std::make_shared<ServingState>();
   state->topology_epoch_ = topology_epoch_;
+  state->max_group_term_ = max_group_term_;
   state->self_node_index_ = self_node_index_;
   state->nodes_ = nodes_;
   state->groups_ = groups_;
@@ -476,8 +483,9 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
   for (std::size_t i = 0; i < state->groups_.size(); ++i) {
     state->in_flight_cells_.emplace_back(in_flight_stripe_count_);
   }
-  state->content_hash_ = ComputeContentHash(topology_epoch_, self_node_index_,
-                                            nodes_, groups_, slot_to_group);
+  state->content_hash_ =
+      ComputeContentHash(topology_epoch_, max_group_term_, self_node_index_,
+                         nodes_, groups_, slot_to_group);
   return state;
 }
 

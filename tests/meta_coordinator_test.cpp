@@ -973,7 +973,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     activate.expected_term_ = 1;
     activate.new_owner_ = state.owner_;
     activate.new_topology_epoch_ = 4;
-    activate.new_config_epoch_ = 1;
     ProposeAccepted(activate);
 
     keylane::meta::FailoverOperationIntent intent;
@@ -1020,7 +1019,6 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     begin.expected_population_manifest_revision_ = 0;
     begin.expected_population_manifest_digest_.fill(0);
     begin.expected_partition_replication_epoch_ = 0;
-    begin.expected_config_epoch_ = 1;
     ProposeAccepted(begin, &state.transition_revision_);
   }
 
@@ -1331,9 +1329,7 @@ TEST_F(MetaCoordinatorServerTest,
   commit.expected_population_manifest_revision_ = 0;
   commit.expected_population_manifest_digest_.fill(0);
   commit.expected_partition_replication_epoch_ = 0;
-  commit.expected_config_epoch_ = 1;
   commit.new_topology_epoch_ = 5;
-  commit.new_config_epoch_ = 2;
   const std::uint64_t before_commit = machine_->last_commit_index();
   auto committed = ProposeSync(commit);
   ASSERT_FALSE(committed.ok());

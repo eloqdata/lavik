@@ -442,7 +442,7 @@ only equal source lineages and equal population anchors/flow dimensions form a
 comparison domain.
 
 A committed slot-map cut cannot reuse an existing grant. Meta rejects a slot
-ownership or config-epoch change while any affected source or destination
+ownership change while any affected source or destination
 group still has an active grant. The controller must fence all affected
 groups, commit the complete replacement map, and then activate fresh
 authorities. This committed-state precondition complements the per-session
@@ -679,7 +679,7 @@ manifest, or partition-epoch replacement still retires it. Grantless groups have
 no `ServingState` owner or bound slots, but their committed membership remains
 in the controller identity view so this preservation is possible. For any
 member incarnation retained across projections, NodeControl also requires the
-group's config epoch, Group Term, manifest revision/digest, and partition
+group's Group Term, manifest revision/digest, and partition
 replication epoch to be monotonic even while the group is
 ownerless; a full remove-and-reassign identity is the explicit boundary at
 which a new incarnation may reset those counters. Once Meta
@@ -740,10 +740,21 @@ committed state; every other subcommand receives Redis's unknown-subcommand
 error. `KEYSLOT` is a pure function of the key and answers even before the
 first state is published. `CLUSTER INFO` reports `cluster_state:ok` exactly
 when slot coverage is complete, the assigned/ok slot counts, the known-node
-count, the number of slot-serving primaries as `cluster_size`, and the
-configuration epochs; with no gossip, the pfail/fail and message counters are
+count, and the number of slot-serving primaries as `cluster_size`; with no
+gossip, the pfail/fail and message counters are
 always zero. `CLUSTER NODES` emits nodes.conf-format lines with the `myself`
 mark on the local entry and no bus-port semantics (`@0`).
+
+Redis epoch fields are derived from Group Terms, not independently stored
+configuration counters. `CLUSTER NODES` reports each member's Group Term in
+the `config-epoch` field, including replicas and fenced Groups with no Grant.
+`CLUSTER INFO` reports the local member's Group Term as `cluster_my_epoch`
+and the maximum Group Term in the complete projection, including empty
+Groups, as `cluster_current_epoch`. These are
+discovery compatibility fields: Group Terms do not order slot conflicts
+between different Groups. Meta owns slot assignment and orders projections
+with its separate cluster-wide `topology_epoch`; Keylane does not participate
+in Redis gossip or Redis elections.
 
 `HELLO` reports `mode:cluster`, `INFO` reports `redis_mode:cluster` in its
 Server section, and a `# Cluster` section carries `cluster_enabled:1`, so

@@ -208,7 +208,6 @@ Fixture CompleteFixture(std::string operation_kind = "population-rebuild") {
   slots.request_id_ = Bytes<16>(0x19);
   slots.ranges_ = {{0, 9, "group-a"}, {20, 29, "group-a"}, {30, 30, "group-a"}};
   slots.new_topology_epoch_ = 5;
-  slots.config_epochs_ = {{"group-a", 11}};
   Commit(fixture.stores, index++, slots);
 
   keylane::meta::ActivateAuthority activate;
@@ -217,7 +216,6 @@ Fixture CompleteFixture(std::string operation_kind = "population-rebuild") {
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.target;
   activate.new_topology_epoch_ = 6;
-  activate.new_config_epoch_ = 12;
   Commit(fixture.stores, index++, activate);
 
   keylane::meta::CreateGroup create_empty;
@@ -346,7 +344,6 @@ TEST(MetaControlProjector, ProjectsCompleteCanonicalStateForOneNode) {
   EXPECT_EQ(group.owner_assignment_id, fixture.target_assignment);
   EXPECT_EQ(group.group_term, 1u);
   EXPECT_TRUE(group.grant_active);
-  EXPECT_EQ(group.config_epoch, 12u);
   EXPECT_EQ(group.slot_ranges,
             (std::vector<control::WireSlotRange>{{0, 9}, {20, 30}}));
   EXPECT_EQ(group.manifest_revision, 1u);
@@ -489,11 +486,9 @@ TEST(MetaControlProjector, ProjectsCurrentGrantActivationActionIdentity) {
   activate.expected_term_ = 2;
   activate.new_owner_ = fixture.target;
   activate.new_topology_epoch_ = 8;
-  activate.new_config_epoch_ = 13;
   const keylane::meta::MetaFailoverActionId action_id = Bytes<16>(0xb1);
   ASSERT_TRUE(fixture.stores.grant_.ValidateActivate(activate, action_id).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetTopologyEpoch(8).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetGroupConfigEpoch("group-a", 13).ok());
   ASSERT_TRUE(fixture.stores.grant_.ApplyGrantPart(activate, action_id).ok());
 
   // Project the other member so the fixture's deliberately old target-only

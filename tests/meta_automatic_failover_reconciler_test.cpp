@@ -353,7 +353,6 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     activate.expected_term_ = 1;
     activate.new_owner_ = state.owner_;
     activate.new_topology_epoch_ = 3;
-    activate.new_config_epoch_ = 1;
     ProposeAccepted(activate);
 
     // Created is a durable aggregate invariant, not permission to provision

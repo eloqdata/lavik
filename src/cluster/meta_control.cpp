@@ -173,6 +173,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
   // untrusted boundary rechecks it instead of relying on the sender.
   std::set<std::string> assigned_nodes;
   for (const control::WireDesiredGroup& group : desired.groups) {
+    builder.IncludeGroupTerm(group.group_term);
     if (group.group_id.empty()) return Invalid("group id is empty");
     if ((group.manifest_revision == 0) != IsZero(group.manifest_digest)) {
       return Invalid(absl::StrCat("group ", group.group_id,
@@ -194,7 +195,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     }
     std::optional<NodeIndex> owner_index;
     if (group.owner_node_id.has_value()) {
-      if (group.group_term == 0 || group.config_epoch == 0) {
+      if (group.group_term == 0) {
         return Invalid(absl::StrCat("group ", group.group_id,
                                     " has an incomplete owner authority"));
       }
@@ -230,7 +231,7 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
       } else if (group.grant_active && owner_index.has_value()) {
         nodes[node->second].primary_node_index_ = *owner_index;
       }
-      nodes[node->second].config_epoch_ = group.config_epoch;
+      nodes[node->second].group_term_ = group.group_term;
     }
     if (group.owner_node_id.has_value() &&
         (!owner_member || IsZero(*group.owner_assignment_id))) {
@@ -251,7 +252,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
     PreparedGroupControlIdentity control_group{
         .group_id_ = source.group_id,
         .group_term_ = source.group_term,
-        .config_epoch_ = source.config_epoch,
         .manifest_revision_ = source.manifest_revision,
         .manifest_digest_ = source.manifest_digest,
         .partition_replication_epoch_ = source.partition_replication_epoch,
@@ -331,7 +331,6 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
                                   control::WireFailoverMode::kControlled;
     group.group_term_ = source.group_term;
     group.manifest_revision_ = source.manifest_revision;
-    group.config_epoch_ = source.config_epoch;
     for (const control::WireDesiredMember& member : source.members) {
       if (member.node_id != *source.owner_node_id) {
         group.replica_node_indices_.push_back(node_indices.at(member.node_id));

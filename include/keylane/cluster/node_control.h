@@ -53,7 +53,6 @@ struct PreparedReplicationEndpoint {
 struct PreparedGroupControlIdentity {
   std::string group_id_;
   std::uint64_t group_term_ = 0;
-  std::uint64_t config_epoch_ = 0;
   std::uint64_t manifest_revision_ = 0;
   Sha256Digest manifest_digest_{};
   std::uint64_t partition_replication_epoch_ = 0;

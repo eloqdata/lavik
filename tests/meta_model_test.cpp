@@ -543,10 +543,6 @@ TEST(MetaModelCommands, SetSlotMapRoundTrip) {
       {10923, 16383, "456789abcdef0123456789abcdef0123456789ab"},
   };
   cmd.new_topology_epoch_ = 101;  // absolute value
-  cmd.config_epochs_ = {
-      {"0123456789abcdef0123456789abcdef01234567", 11},
-      {"89abcdef0123456789abcdef0123456789abcdef", 22},
-  };
   ExpectRoundTrip(cmd);
 }
 
@@ -599,7 +595,6 @@ TEST(MetaModelCommands, ActivateAuthorityRoundTrip) {
   cmd.expected_term_ = 42;
   cmd.new_owner_ = "89abcdef0123456789abcdef0123456789abcdef";
   cmd.new_topology_epoch_ = 102;
-  cmd.new_config_epoch_ = 12;
   ExpectRoundTrip(cmd);
 }
 
@@ -665,7 +660,6 @@ void SetFailoverGroupAnchors(Command& command) {
   command.expected_population_manifest_revision_ = 9;
   command.expected_population_manifest_digest_.fill(0x44);
   command.expected_partition_replication_epoch_ = 11;
-  command.expected_config_epoch_ = 13;
 }
 
 template <typename Command>
@@ -817,7 +811,6 @@ TEST(MetaModelCommands, TypedFailoverCommandsRoundTrip) {
       degrade.expected_candidate_action_->candidate_;
   SetFailoverGroupAnchors(commit_controlled);
   commit_controlled.new_topology_epoch_ = 101;
-  commit_controlled.new_config_epoch_ = 14;
   ExpectFailoverCommandRoundTrip(
       commit_controlled,
       keylane::meta::MetaCommandTag::kCommitControlledFailover);
@@ -835,7 +828,6 @@ TEST(MetaModelCommands, TypedFailoverCommandsRoundTrip) {
   SetFailoverGroupAnchors(commit_uncontrolled);
   commit_uncontrolled.expected_group_term_ = 42;
   commit_uncontrolled.new_topology_epoch_ = 101;
-  commit_uncontrolled.new_config_epoch_ = 14;
   ExpectFailoverCommandRoundTrip(
       commit_uncontrolled,
       keylane::meta::MetaCommandTag::kCommitUncontrolledFailover);
@@ -1539,15 +1531,13 @@ keylane::meta::AssignNodeToGroup MakeAssign(const std::string& group_id,
 keylane::meta::ActivateAuthority MakeActivate(const std::string& group_id,
                                               std::uint64_t expected_term,
                                               std::uint32_t owner_node,
-                                              std::uint64_t topology_epoch,
-                                              std::uint64_t config_epoch) {
+                                              std::uint64_t topology_epoch) {
   keylane::meta::ActivateAuthority cmd;
   cmd.request_id_ = MakeRequestId(0x42);
   cmd.group_id_ = group_id;
   cmd.expected_term_ = expected_term;
   cmd.new_owner_ = MakeNodeId(owner_node);
   cmd.new_topology_epoch_ = topology_epoch;
-  cmd.new_config_epoch_ = config_epoch;
   return cmd;
 }
 
@@ -1645,7 +1635,7 @@ TEST(MetaStateApply, RetireNodeWithMembershipRejected) {
 TEST(MetaStateApply, RemoveNodeFromGroupOfGrantOwnerRejected) {
   MetaStores stores;
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3, 1)});
+  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3)});
 
   keylane::meta::RemoveNodeFromGroup remove;
   remove.request_id_ = MakeRequestId(0x32);
@@ -1672,7 +1662,7 @@ TEST(MetaStateApply, RemoveNodeFromGroupOfGrantOwnerRejected) {
 TEST(MetaStateApply, BeginGroupTermRaisesTermInBothStores) {
   MetaStores stores;
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3, 1)});
+  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3)});
 
   keylane::meta::BeginGroupTerm begin;
   begin.request_id_ = MakeRequestId(0x41);
@@ -1697,7 +1687,7 @@ TEST(MetaStateApply, BeginGroupTermRaisesTermInBothStores) {
   EXPECT_EQ(stores.audit_.size(), 7u);
 
   // A stale-term activation is now rejected on both paths: the term moved on.
-  ApplyRejected(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4, 2)});
+  ApplyRejected(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4)});
 }
 
 TEST(MetaStateApply, TransitionEvidenceMustMatchCommittedAnchors) {
@@ -1956,7 +1946,6 @@ TEST(MetaStateApply, SetSlotMapThroughDispatcher) {
   slots.request_id_ = MakeRequestId(0x33);
   slots.ranges_ = {{0, 9999, "g1"}, {10000, 16383, "g2"}};
   slots.new_topology_epoch_ = 4;
-  slots.config_epochs_ = {{"g1", 10}, {"g2", 20}};
   ApplyOk(stores, 7, slots);
   EXPECT_EQ(stores.topology_.SlotOwner(0), std::optional<std::string>("g1"));
   EXPECT_EQ(stores.topology_.SlotOwner(16383),
@@ -1977,18 +1966,23 @@ TEST(MetaStateApply, SetSlotMapThroughDispatcher) {
   EXPECT_EQ(stores.topology_.SlotOwner(0), std::optional<std::string>("g1"));
 }
 
-TEST(MetaStateApply, SetSlotMapCannotClearAnActiveGrantConfigEpoch) {
+TEST(MetaStateApply, SetSlotMapCannotClearSlotsCoveredByAnActiveGrant) {
   MetaStores stores;
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3, 7)});
+  keylane::meta::SetSlotMap initial;
+  initial.request_id_ = MakeRequestId(0x82);
+  initial.ranges_ = {{0, 16383, "g1"}};
+  initial.new_topology_epoch_ = 3;
+  ApplyOk(stores, 6, MetaCommand{initial});
+  ApplyOk(stores, 7, MetaCommand{MakeActivate("g1", 1, 1, 4)});
 
-  keylane::meta::SetSlotMap clear_config;
-  clear_config.request_id_ = MakeRequestId(0x83);
-  clear_config.new_topology_epoch_ = 4;
-  clear_config.config_epochs_ = {{"g1", 0}};
-  ApplyRejected(stores, 7, MetaCommand{clear_config});
-  EXPECT_EQ(stores.topology_.FindGroup("g1")->config_epoch_, 7u);
-  EXPECT_EQ(stores.topology_.TopologyEpoch(), 3u);
+  keylane::meta::SetSlotMap clear;
+  clear.request_id_ = MakeRequestId(0x83);
+  clear.new_topology_epoch_ = 5;
+  const std::string before = DomainStateBytes(stores);
+  ApplyRejected(stores, 8, MetaCommand{clear});
+  EXPECT_EQ(DomainStateBytes(stores), before);
+  EXPECT_EQ(stores.topology_.SlotOwner(0), std::optional<std::string>("g1"));
 }
 
 TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
@@ -2009,16 +2003,14 @@ TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
   initial.request_id_ = MakeRequestId(0x85);
   initial.ranges_ = {{0, 8191, "g1"}, {8192, 16383, "g2"}};
   initial.new_topology_epoch_ = 5;
-  initial.config_epochs_ = {{"g1", 1}, {"g2", 1}};
   ApplyOk(stores, 10, MetaCommand{initial});
-  ApplyOk(stores, 11, MetaCommand{MakeActivate("g1", 1, 1, 6, 1)});
-  ApplyOk(stores, 12, MetaCommand{MakeActivate("g2", 1, 2, 7, 1)});
+  ApplyOk(stores, 11, MetaCommand{MakeActivate("g1", 1, 1, 6)});
+  ApplyOk(stores, 12, MetaCommand{MakeActivate("g2", 1, 2, 7)});
 
   keylane::meta::SetSlotMap moved = initial;
   moved.request_id_ = MakeRequestId(0x86);
   moved.ranges_ = {{0, 4095, "g1"}, {4096, 16383, "g2"}};
   moved.new_topology_epoch_ = 8;
-  moved.config_epochs_ = {{"g1", 2}, {"g2", 2}};
   const std::string before = DomainStateBytes(stores);
   MetaApplyResult source_live = ApplyRejected(stores, 13, MetaCommand{moved});
   EXPECT_NE(source_live.detail_.find("fenced"), std::string::npos);
@@ -2032,7 +2024,7 @@ TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
   ApplyOk(stores, 14, MetaCommand{fence_g1});
 
   // Fencing only the source is insufficient: the destination's old lease was
-  // issued for a different slot/config projection and must not span the cut.
+  // issued for a different slot projection and must not span the cut.
   MetaApplyResult destination_live =
       ApplyRejected(stores, 15, MetaCommand{moved});
   EXPECT_NE(destination_live.detail_.find("g2"), std::string::npos);
@@ -2047,34 +2039,7 @@ TEST(MetaStateApply, SetSlotMapRequiresEveryAffectedGrantToBeFenced) {
   ApplyOk(stores, 16, MetaCommand{fence_g2});
   ApplyOk(stores, 17, MetaCommand{moved});
   EXPECT_EQ(stores.topology_.SlotOwner(5000), std::optional<std::string>("g2"));
-  EXPECT_EQ(stores.topology_.FindGroup("g1")->config_epoch_, 2u);
-  EXPECT_EQ(stores.topology_.FindGroup("g2")->config_epoch_, 2u);
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 8u);
-}
-
-TEST(MetaStateApply, SetSlotMapCannotChangeActiveGrantConfigEpoch) {
-  MetaStores stores;
-  SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3, 7)});
-
-  keylane::meta::SetSlotMap change_config;
-  change_config.request_id_ = MakeRequestId(0x89);
-  change_config.new_topology_epoch_ = 4;
-  change_config.config_epochs_ = {{"g1", 8}};
-  const std::string before = DomainStateBytes(stores);
-  MetaApplyResult active = ApplyRejected(stores, 7, MetaCommand{change_config});
-  EXPECT_NE(active.detail_.find("fenced"), std::string::npos);
-  EXPECT_EQ(DomainStateBytes(stores), before);
-
-  keylane::meta::FenceGroup fence;
-  fence.request_id_ = MakeRequestId(0x8a);
-  fence.group_id_ = "g1";
-  fence.expected_term_ = 1;
-  fence.new_term_ = 2;
-  ApplyOk(stores, 8, MetaCommand{fence});
-  ApplyOk(stores, 9, MetaCommand{change_config});
-  EXPECT_EQ(stores.topology_.FindGroup("g1")->config_epoch_, 8u);
-  EXPECT_EQ(stores.topology_.TopologyEpoch(), 4u);
 }
 
 // ---------------------------------------------------------------------------
@@ -2092,7 +2057,6 @@ void ExpectPreActivationState(const MetaStores& stores,
   const auto view = stores.topology_.FindGroup(group_id);
   ASSERT_TRUE(view.has_value());
   EXPECT_TRUE(view->record_.owner_.empty());
-  EXPECT_EQ(view->config_epoch_, 0u);
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 2u);
 }
 
@@ -2110,19 +2074,17 @@ TEST(MetaStateApply, ActivateAuthorityRejectionLeavesBothHalvesUntouched) {
       };
 
   // Wrong expected_term (grant store CAS).
-  expect_rejected_untouched(MakeActivate("g1", 0, 1, 3, 1));
+  expect_rejected_untouched(MakeActivate("g1", 0, 1, 3));
   // topology_epoch not exactly current+1.
-  expect_rejected_untouched(MakeActivate("g1", 1, 1, 5, 1));
+  expect_rejected_untouched(MakeActivate("g1", 1, 1, 5));
   // New owner not a member of the group.
-  expect_rejected_untouched(MakeActivate("g1", 1, 2, 3, 1));
+  expect_rejected_untouched(MakeActivate("g1", 1, 2, 3));
   // New owner not registered at all.
   {
-    keylane::meta::ActivateAuthority cmd = MakeActivate("g1", 1, 1, 3, 1);
+    keylane::meta::ActivateAuthority cmd = MakeActivate("g1", 1, 1, 3);
     cmd.new_owner_ = MakeNodeId(99);
     expect_rejected_untouched(std::move(cmd));
   }
-  // A serving owner must have a nonzero configuration epoch on the wire.
-  expect_rejected_untouched(MakeActivate("g1", 1, 1, 3, 0));
 }
 
 TEST(MetaStateApply, ActivateAuthorityRequiresABegunNonzeroTerm) {
@@ -2135,7 +2097,7 @@ TEST(MetaStateApply, ActivateAuthorityRequiresABegunNonzeroTerm) {
       MakePutPolicy(std::string(keylane::meta::kAuthorityLeasePolicyId), 1,
                     "{\"kind\":\"authority-lease-v1\",\"duration_ms\":5000}"));
 
-  ApplyRejected(stores, 5, MetaCommand{MakeActivate("g1", 0, 1, 3, 1)});
+  ApplyRejected(stores, 5, MetaCommand{MakeActivate("g1", 0, 1, 3)});
   const auto grant = stores.grant_.GroupState("g1");
   ASSERT_TRUE(grant.has_value());
   EXPECT_EQ(grant->group_term_, 0u);
@@ -2151,7 +2113,7 @@ TEST(MetaStateApply, ActivateAuthorityAcceptedWritesBothHalvesAtomically) {
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
 
   const MetaApplyResult result =
-      ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3, 7)});
+      ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3)});
   EXPECT_EQ(result.command_tag_,
             keylane::meta::MetaCommandTag::kActivateAuthority);
 
@@ -2163,18 +2125,17 @@ TEST(MetaStateApply, ActivateAuthorityAcceptedWritesBothHalvesAtomically) {
   EXPECT_EQ(grant_state->group_term_, 1u);
   EXPECT_EQ(grant_state->grant_->owner_, MakeNodeId(1));
 
-  // Topology half: owner, config_epoch, topology_epoch.
+  // Topology half: owner and topology_epoch.
   const auto view = stores.topology_.FindGroup("g1");
   ASSERT_TRUE(view.has_value());
   EXPECT_EQ(view->record_.owner_, MakeNodeId(1));
-  EXPECT_EQ(view->config_epoch_, 7u);
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 3u);
 }
 
 TEST(MetaStateApply, ActivateAuthorityReplaySameIndexIsIdempotent) {
   MetaStores stores;
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  const keylane::meta::ActivateAuthority cmd = MakeActivate("g1", 1, 1, 3, 7);
+  const keylane::meta::ActivateAuthority cmd = MakeActivate("g1", 1, 1, 3);
   const MetaApplyResult first = ApplyOk(stores, 6, MetaCommand{cmd});
   const std::string state_after_first = MustSerialize(stores);
 
@@ -2193,12 +2154,12 @@ TEST(MetaStateApply, ActivateAuthorityReplaySameIndexIsIdempotent) {
   EXPECT_EQ(stores.grant_.GroupState("g1")->grant_->owner_, MakeNodeId(1));
 
   // A genuinely different activation is rejected: the term already has its
-  // one Grant and a changed config epoch is not its exact post-effect.
+  // one Grant and a changed topology epoch is not its exact post-effect.
   keylane::meta::ActivateAuthority different = cmd;
   different.request_id_ = MakeRequestId(0x45);
-  different.new_config_epoch_ = 8;
+  different.new_topology_epoch_ = 4;
   ApplyRejected(stores, 8, MetaCommand{different});
-  EXPECT_EQ(stores.topology_.FindGroup("g1")->config_epoch_, 7u);
+  EXPECT_EQ(stores.topology_.TopologyEpoch(), 3u);
 }
 
 TEST(MetaStateApply, FenceRequiresNewTermBeforeSameOwnerReauthorization) {
@@ -2206,13 +2167,13 @@ TEST(MetaStateApply, FenceRequiresNewTermBeforeSameOwnerReauthorization) {
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
   ApplyOk(stores, 6, MakeRegisterFor(2));
   ApplyOk(stores, 7, MakeAssign("g1", 2, 2, 3));
-  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4, 7)});
+  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4)});
 
-  // Even otherwise-valid next epochs cannot replace an active Grant, whether
+  // Even a valid next topology epoch cannot replace an active Grant, whether
   // the proposal chooses a different Owner or reauthorizes the current one.
   const std::string active = DomainStateBytes(stores);
-  ApplyRejected(stores, 9, MetaCommand{MakeActivate("g1", 1, 2, 5, 8)});
-  ApplyRejected(stores, 10, MetaCommand{MakeActivate("g1", 1, 1, 5, 8)});
+  ApplyRejected(stores, 9, MetaCommand{MakeActivate("g1", 1, 2, 5)});
+  ApplyRejected(stores, 10, MetaCommand{MakeActivate("g1", 1, 1, 5)});
   EXPECT_EQ(DomainStateBytes(stores), active);
 
   keylane::meta::FenceGroup fence;
@@ -2231,8 +2192,8 @@ TEST(MetaStateApply, FenceRequiresNewTermBeforeSameOwnerReauthorization) {
   // cannot regain authority; the same Owner can receive only term two's Grant.
   auto restored = MetaStores::Deserialize(MustSerialize(stores));
   ASSERT_TRUE(restored.ok()) << restored.status();
-  ApplyRejected(*restored, 13, MetaCommand{MakeActivate("g1", 1, 1, 5, 8)});
-  const auto activate = MakeActivate("g1", 2, 1, 5, 8);
+  ApplyRejected(*restored, 13, MetaCommand{MakeActivate("g1", 1, 1, 5)});
+  const auto activate = MakeActivate("g1", 2, 1, 5);
   ApplyOk(*restored, 14, MetaCommand{activate});
   ASSERT_TRUE(restored->grant_.GroupState("g1")->grant_.has_value());
   EXPECT_EQ(restored->grant_.GroupState("g1")->grant_->owner_, MakeNodeId(1));
@@ -2857,8 +2818,8 @@ TEST(MetaStateApply,
      MetaStoresDeserializeRejectsUnprojectableActiveGrantAnchors) {
   MetaStores stores;
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3, 1)});
-  ASSERT_TRUE(stores.topology_.SetGroupConfigEpoch("g1", 0).ok());
+  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3)});
+  ASSERT_TRUE(stores.topology_.SetGroupTerm("g1", 0).ok());
   ExpectAggregateSnapshotFailStop(stores);
 }
 
@@ -2948,7 +2909,7 @@ TEST(MetaStateApply, DirectiveResultCommitUsesFirstRaftIndexOnReplay) {
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
   ApplyOk(stores, 6, MakeRegisterFor(2));
   ApplyOk(stores, 7, MakeAssign("g1", 2, 2, 3));
-  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4, 1)});
+  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4)});
   const keylane::meta::SubmitOperation submit = MakeSubmit(0x68, 0x41);
   ApplyOk(stores, 9, MetaCommand{submit});
 
@@ -3010,7 +2971,7 @@ TEST(MetaStateApply, DirectiveIntentMustMatchCommittedAuthorityAndAssignment) {
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
   ApplyOk(stores, 6, MakeRegisterFor(2));
   ApplyOk(stores, 7, MakeAssign("g1", 2, 2, 3));
-  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4, 1)});
+  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4)});
   const keylane::meta::SubmitOperation submit = MakeSubmit(0x69, 0x42);
   ApplyOk(stores, 9, MetaCommand{submit});
 
@@ -3069,7 +3030,7 @@ InstalledDirectiveFixture MakeInstalledDirectiveFixture() {
   ApplyOk(fixture.stores, 7, MakeAssign("g1", 2, 2, 3));
   ApplyOk(fixture.stores, 8, MakeRegisterFor(3));
   ApplyOk(fixture.stores, 9, MakeAssign("g1", 3, 3, 4));
-  ApplyOk(fixture.stores, 10, MetaCommand{MakeActivate("g1", 1, 3, 5, 1)});
+  ApplyOk(fixture.stores, 10, MetaCommand{MakeActivate("g1", 1, 3, 5)});
 
   fixture.submit = MakeSubmit(0x6d, 0x44);
   ApplyOk(fixture.stores, 11, MetaCommand{fixture.submit});
@@ -3289,7 +3250,7 @@ TEST(MetaStateApply, DirectiveRejectsSourceAssignmentFromBeforeRemoveAndReadd) {
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
   ApplyOk(stores, 6, MakeRegisterFor(2));
   ApplyOk(stores, 7, MakeAssign("g1", 2, 2, 3));
-  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4, 1)});
+  ApplyOk(stores, 8, MetaCommand{MakeActivate("g1", 1, 1, 4)});
   const keylane::meta::SubmitOperation submit = MakeSubmit(0x6a, 0x43);
   ApplyOk(stores, 9, MetaCommand{submit});
 
@@ -3343,7 +3304,7 @@ TEST(MetaStateApply,
 
   MetaStores stores;
   SetupActivatedGroupPrerequisites(stores, 1, "g1");
-  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3, 1)});
+  ApplyOk(stores, 6, MetaCommand{MakeActivate("g1", 1, 1, 3)});
 
   const auto make_directive = [](std::size_t ordinal) {
     keylane::meta::MetaDirectiveSpec directive;
@@ -3552,8 +3513,7 @@ std::vector<ScriptedCommand> MakeCommandScript() {
     push(begin, reject);
   }
   // activation
-  const keylane::meta::ActivateAuthority activate =
-      MakeActivate("g1", 1, 1, 5, 1);
+  const keylane::meta::ActivateAuthority activate = MakeActivate("g1", 1, 1, 5);
   push(activate, accept);
   push(activate, accept);  // same content, new index: idempotent path
   // operation lifecycle
@@ -3588,7 +3548,7 @@ std::vector<ScriptedCommand> MakeCommandScript() {
     push(archive, accept);  // already archived: idempotent
   }
   // Fence the current authority into a new term before changing its
-  // slot/config projection. This placement also proves the accepted
+  // slot projection. This placement also proves the accepted
   // SetSlotMap path in the full matrix.
   {
     keylane::meta::FenceGroup fence;
@@ -3604,7 +3564,6 @@ std::vector<ScriptedCommand> MakeCommandScript() {
     slots.request_id_ = MakeRequestId(0x33);
     slots.ranges_ = {{0, 16383, "g1"}};
     slots.new_topology_epoch_ = 6;
-    slots.config_epochs_ = {{"g1", 7}};
     push(slots, accept);
   }
   {

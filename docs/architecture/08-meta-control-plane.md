@@ -62,11 +62,11 @@ fresh grantless term, so replacing or reauthorizing an Owner cannot reuse an
 authority identity. Group membership, owner, slot, population-
 manifest, partition-replication, and `UpdateNode` endpoint changes advance the
 cluster topology epoch. `SetSlotMap` validates a complete candidate before
-publication and rejects any ownership or config-epoch change involving an
+publication and rejects any slot ownership change involving an
 active grant. Every affected source and destination group must first be
 fenced, preventing a lease for the old projection from spanning the cut.
 An active Group failover transition locks its owner, membership, term,
-grant, manifest, population epoch, and config epoch against ordinary
+grant, manifest, and population epoch against ordinary
 mutations. Only a typed failover command carrying the exact transition id and
 latest transition revision may advance that aggregate.
 Initial identity registration can be projected at
@@ -196,8 +196,8 @@ A running Controlled transition, an advanced operation, or a mismatched named
 witness cannot be preempted.
 
 Commit requires the exact authorized prepared action and atomically activates
-its candidate as owner with the target term's sole Grant, advances topology and
-config epochs, places the action id on the Grant for Data activation, and
+its candidate as owner with the target term's sole Grant, advances the topology
+epoch, places the action id on the Grant for Data activation, and
 clears the transition. Controlled Commit advances to that term and installs
 the Grant in the same cutover; Uncontrolled Commit installs into the grantless
 term already reserved by Begin. Controlled Commit also completes its operation
@@ -236,8 +236,8 @@ the snapshot/WAL pressure rather than Data-local state synthesizing authority.
 Snapshot decode revalidates group-set and authority-anchor lockstep, active
 identities, the required current registered Policy families, and retained
 manifest references before exposing the recovered aggregate. An active
-authority additionally requires nonzero term and config
-epochs, matching the Data-control serving representation.
+authority additionally requires a nonzero Group Term, matching the
+Data-control serving representation.
 Audit retention is replicated: the default bounded-rotate mode evicts the
 oldest entry and records durable loss watermarks, disabled mode suppresses
 ordinary records while retaining audit-mode transitions, and strict-export mode
@@ -1151,8 +1151,8 @@ barrier or the retained creation intent.
 
 The reconciler registers Data in node-id order, creates Groups in Group-id
 order, assigns primary before sorted replicas, begins term 1, and replaces the
-whole Slot map with one `SetSlotMap` carrying every canonical range and each
-Group's config epoch. Before Data topology exists, it installs version 1 of
+whole Slot map with one `SetSlotMap` carrying every canonical range.
+Before Data topology exists, it installs version 1 of
 each registered global Policy family from the retained Bootstrap Policy
 Defaults only when that family has no current value; an operator-preseeded
 family is never overwritten and Policy state alone does not make an

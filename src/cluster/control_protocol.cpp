@@ -2824,7 +2824,6 @@ absl::Status WriteDesiredGroup(Writer& writer, const WireDesiredGroup& group) {
   if (group.activation_action_id.has_value()) {
     writer.Fixed(*group.activation_action_id);
   }
-  writer.U64(group.config_epoch);
   if (absl::Status status =
           WriteCount(writer, group.slot_ranges.size(), kMaxManifestEntries,
                      "group slot ranges");
@@ -2892,9 +2891,6 @@ absl::StatusOr<WireDesiredGroup> ReadDesiredGroup(Reader& reader) {
     }
     group.activation_action_id = *action_id;
   }
-  auto config_epoch = reader.U64();
-  if (!config_epoch.ok()) return config_epoch.status();
-  group.config_epoch = *config_epoch;
   auto range_count =
       ReadCount(reader, kMaxManifestEntries, "group slot ranges");
   if (!range_count.ok()) return range_count.status();

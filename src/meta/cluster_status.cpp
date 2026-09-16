@@ -993,7 +993,6 @@ absl::StatusOr<std::string> EncodeClusterStatusReply(
     if (absl::Status wrote = OptionalString(writer, group.owner_node_id_);
         !wrote.ok())
       return wrote;
-    writer.U64(group.config_epoch_);
     writer.Bool(group.serving_ready_);
     writer.Bool(group.topology_converged_);
     writer.U8(static_cast<std::uint8_t>(group.automatic_failover_state_));
@@ -1143,9 +1142,6 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
     auto owner = OptionalString(reader);
     if (!owner.ok()) return owner.status();
     group.owner_node_id_ = std::move(*owner);
-    auto config_epoch = reader.U64();
-    if (!config_epoch.ok()) return config_epoch.status();
-    group.config_epoch_ = *config_epoch;
     if (absl::Status read = read_bool(&group.serving_ready_); !read.ok())
       return read;
     if (absl::Status read = read_bool(&group.topology_converged_); !read.ok())
@@ -1484,7 +1480,6 @@ absl::StatusOr<std::string> RenderClusterStatusJson(
     json += "{\"group_id\":" + Quote(group.group_id_);
     json += ",\"term\":" + U64Json(group.term_);
     json += ",\"owner_node_id\":" + OptionalStringJson(group.owner_node_id_);
-    json += ",\"config_epoch\":" + U64Json(group.config_epoch_);
     json += ",\"serving_ready\":" + BoolJson(group.serving_ready_);
     json += ",\"topology_converged\":" + BoolJson(group.topology_converged_);
     json += ",\"automatic_failover_state\":" +

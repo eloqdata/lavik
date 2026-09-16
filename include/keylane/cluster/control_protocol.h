@@ -818,7 +818,6 @@ struct WireDesiredGroup {
   // Present only on a failover-installed current grant. Data may activate a
   // prepared promotion only when this matches its boot-local action context.
   std::optional<WireId128> activation_action_id;
-  std::uint64_t config_epoch = 0;
   std::vector<WireSlotRange> slot_ranges;
   std::uint64_t manifest_revision = 0;
   WireHash256 manifest_digest{};

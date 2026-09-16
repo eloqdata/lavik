@@ -739,7 +739,6 @@ TEST(MetaFailoverControlAdapterTest,
           {
               .group_id_ = "group-a",
               .group_term_ = 8,
-              .config_epoch_ = 16,
               .manifest_revision_ = 18,
               .manifest_digest_ = manifest,
               .partition_replication_epoch_ = 20,

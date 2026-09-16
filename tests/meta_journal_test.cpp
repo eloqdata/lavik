@@ -333,7 +333,6 @@ ActivateAuthority MakeActivate(std::string group_id,
   cmd.expected_term_ = expected_term;
   cmd.new_owner_ = std::move(new_owner);
   cmd.new_topology_epoch_ = 100;
-  cmd.new_config_epoch_ = 200;
   return cmd;
 }
 

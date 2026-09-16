@@ -331,8 +331,6 @@ TEST_F(ClusterCreateV1RecoveryTest,
       EXPECT_EQ(slot_map->ranges_,
                 (std::vector<MetaSlotAssignment>{{0, 8191, "group-a"},
                                                  {8192, 16'383, "group-b"}}));
-      EXPECT_EQ(slot_map->config_epochs_, (std::vector<MetaGroupConfigEpoch>{
-                                              {"group-a", 1}, {"group-b", 1}}));
     }
     Apply(std::move(**next));
     ASSERT_FALSE(HasFatalFailure());

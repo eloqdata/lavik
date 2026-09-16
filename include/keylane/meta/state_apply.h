@@ -40,7 +40,7 @@
 //      topology-side check (topology_epoch exactly current+1, new owner is a
 //      group member and registered active) all run BEFORE any write; only then
 //      the grant half (ApplyGrantPart) and
-//      the topology half (owner, topology_epoch, config_epoch) are written in
+//      the topology half (owner, topology_epoch) are written in
 //      order. Any rejection leaves both halves
 //      untouched.
 //   3. one-node-one-group cross-store half: an AssignNodeToGroup that would
@@ -69,7 +69,7 @@
 //      first commit; snapshot recovery and projection reject any stale entry
 //      that bypassed this invariant.
 //   8. SetSlotMap first constructs the complete candidate topology and rejects
-//      any slot-ownership or config-epoch change that affects a group with an
+//      any slot-ownership change that affects a group with an
 //      active grant. Source and destination groups must be fenced before the
 //      cut, so no lease issued for the old projection can span a slot move.
 //   9. A root ClusterCreate submission and the topology store's transition

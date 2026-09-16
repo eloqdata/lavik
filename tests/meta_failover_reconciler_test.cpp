@@ -146,7 +146,6 @@ struct Fixture {
     activate.expected_term_ = 1;
     activate.new_owner_ = owner;
     activate.new_topology_epoch_ = 4;
-    activate.new_config_epoch_ = 1;
     Accept(activate);
   }
 
@@ -455,7 +454,6 @@ void BeginUncontrolled(Fixture& fixture,
       group->record_.population_manifest_digest_;
   begin.expected_partition_replication_epoch_ =
       group->record_.partition_replication_epoch_;
-  begin.expected_config_epoch_ = group->config_epoch_;
   begin.candidate_action_ = std::move(candidate_action);
   fixture.Accept(begin);
 }
@@ -491,7 +489,6 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(command->expected_owner_assignment_id_, fixture.owner_assignment);
   EXPECT_EQ(command->expected_membership_revision_, 3);
   EXPECT_EQ(command->expected_group_term_, 1);
-  EXPECT_EQ(command->expected_config_epoch_, 1);
   EXPECT_EQ(command->candidate_action_.candidate_.node_id_, fixture.candidate);
   EXPECT_EQ(command->candidate_action_.candidate_.assignment_id_,
             fixture.candidate_assignment);
@@ -871,7 +868,6 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(commit->authorized_revision_,
             authorized.candidate_action_->authorization_->authorized_revision_);
   EXPECT_EQ(commit->new_topology_epoch_, 5);
-  EXPECT_EQ(commit->new_config_epoch_, 2);
   fixture.Accept(**planned);
 
   const auto group = fixture.stores.topology_.FindGroup("g1");

@@ -380,18 +380,6 @@ absl::Status WriteCommandBody(MetaWriter& w, const SetSlotMap& cmd) {
       return st;
     }
   }
-  if (auto st =
-          CheckCap("config_epochs", cmd.config_epochs_.size(), kMaxMetaGroups);
-      !st.ok()) {
-    return st;
-  }
-  for (const MetaGroupConfigEpoch& entry : cmd.config_epochs_) {
-    if (auto st = CheckCap("config_epoch group_id", entry.group_id_.size(),
-                           kMaxMetaGroupIdBytes);
-        !st.ok()) {
-      return st;
-    }
-  }
   if (auto st = WriteCommandHeader(w, MetaCommandTag::kSetSlotMap,
                                    cmd.request_id_, cmd.actor_);
       !st.ok()) {
@@ -403,11 +391,6 @@ absl::Status WriteCommandBody(MetaWriter& w, const SetSlotMap& cmd) {
     ww.WriteString(range.group_id_);
   });
   w.WriteU64(cmd.new_topology_epoch_);
-  w.WriteList(cmd.config_epochs_,
-              [](MetaWriter& ww, const MetaGroupConfigEpoch& entry) {
-                ww.WriteString(entry.group_id_);
-                ww.WriteU64(entry.config_epoch_);
-              });
   return absl::OkStatus();
 }
 
@@ -433,22 +416,11 @@ absl::StatusOr<SetSlotMap> ReadSetSlotMapBody(MetaReader& r) {
   if (!ranges.ok()) return ranges.status();
   auto topology_epoch = r.ReadU64();
   if (!topology_epoch.ok()) return topology_epoch.status();
-  auto config_epochs = r.ReadList<MetaGroupConfigEpoch>(
-      kMaxMetaGroups,
-      [](MetaReader& rr) -> absl::StatusOr<MetaGroupConfigEpoch> {
-        auto group_id = ReadGroupId(rr);
-        if (!group_id.ok()) return group_id.status();
-        auto epoch = rr.ReadU64();
-        if (!epoch.ok()) return epoch.status();
-        return MetaGroupConfigEpoch{std::move(*group_id), *epoch};
-      });
-  if (!config_epochs.ok()) return config_epochs.status();
   SetSlotMap cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.ranges_ = std::move(*ranges);
   cmd.new_topology_epoch_ = *topology_epoch;
-  cmd.config_epochs_ = std::move(*config_epochs);
   return cmd;
 }
 
@@ -846,8 +818,7 @@ absl::Status ValidateFailoverGroupAnchors(const Command& command) {
       command.expected_membership_revision_ == 0 ||
       command.expected_group_term_ == 0 ||
       ((command.expected_population_manifest_revision_ == 0) !=
-       manifest_digest_is_zero) ||
-      command.expected_config_epoch_ == 0) {
+       manifest_digest_is_zero)) {
     return MetaDomainRejectError("invalid failover group anchors");
   }
   return absl::OkStatus();
@@ -863,7 +834,6 @@ void WriteFailoverGroupAnchorsUnchecked(MetaWriter& writer,
   writer.WriteU64(command.expected_population_manifest_revision_);
   WriteFixedArray(writer, command.expected_population_manifest_digest_);
   writer.WriteU64(command.expected_partition_replication_epoch_);
-  writer.WriteU64(command.expected_config_epoch_);
 }
 
 template <typename Command>
@@ -882,8 +852,6 @@ absl::Status ReadFailoverGroupAnchors(MetaReader& reader, Command& command) {
   if (!manifest_digest.ok()) return manifest_digest.status();
   auto partition_epoch = reader.ReadU64();
   if (!partition_epoch.ok()) return partition_epoch.status();
-  auto config_epoch = reader.ReadU64();
-  if (!config_epoch.ok()) return config_epoch.status();
 
   command.expected_owner_node_id_ = std::move(*owner_node_id);
   command.expected_owner_assignment_id_ = *owner_assignment_id;
@@ -892,7 +860,6 @@ absl::Status ReadFailoverGroupAnchors(MetaReader& reader, Command& command) {
   command.expected_population_manifest_revision_ = *manifest_revision;
   command.expected_population_manifest_digest_ = *manifest_digest;
   command.expected_partition_replication_epoch_ = *partition_epoch;
-  command.expected_config_epoch_ = *config_epoch;
   return absl::OkStatus();
 }
 
@@ -1138,11 +1105,8 @@ absl::Status ValidateFailoverCommitBase(const Command& command) {
   if (auto status = ValidateFailoverGroupAnchors(command); !status.ok()) {
     return status;
   }
-  if (command.expected_config_epoch_ ==
-          std::numeric_limits<std::uint64_t>::max() ||
-      command.new_config_epoch_ != command.expected_config_epoch_ + 1 ||
-      command.new_topology_epoch_ == 0) {
-    return MetaDomainRejectError("invalid failover cutover epochs");
+  if (command.new_topology_epoch_ == 0) {
+    return MetaDomainRejectError("invalid failover cutover topology epoch");
   }
   return absl::OkStatus();
 }
@@ -1187,7 +1151,6 @@ void WriteFailoverCommitBaseUnchecked(MetaWriter& writer,
   WriteFailoverCandidateUnchecked(writer, command.expected_candidate_);
   WriteFailoverGroupAnchorsUnchecked(writer, command);
   writer.WriteU64(command.new_topology_epoch_);
-  writer.WriteU64(command.new_config_epoch_);
 }
 
 template <typename Command>
@@ -1212,10 +1175,7 @@ absl::Status ReadFailoverCommitBase(MetaReader& reader, Command& command) {
   }
   auto topology_epoch = reader.ReadU64();
   if (!topology_epoch.ok()) return topology_epoch.status();
-  auto config_epoch = reader.ReadU64();
-  if (!config_epoch.ok()) return config_epoch.status();
   command.new_topology_epoch_ = *topology_epoch;
-  command.new_config_epoch_ = *config_epoch;
   return absl::OkStatus();
 }
 
@@ -1674,7 +1634,6 @@ absl::Status WriteCommandBody(MetaWriter& w, const ActivateAuthority& cmd) {
   w.WriteU64(cmd.expected_term_);
   if (auto st = WriteNodeId(w, cmd.new_owner_); !st.ok()) return st;
   w.WriteU64(cmd.new_topology_epoch_);
-  w.WriteU64(cmd.new_config_epoch_);
   return absl::OkStatus();
 }
 
@@ -1689,8 +1648,6 @@ absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
   if (!new_owner.ok()) return new_owner.status();
   auto topology_epoch = r.ReadU64();
   if (!topology_epoch.ok()) return topology_epoch.status();
-  auto config_epoch = r.ReadU64();
-  if (!config_epoch.ok()) return config_epoch.status();
   ActivateAuthority cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -1698,7 +1655,6 @@ absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
   cmd.expected_term_ = *expected_term;
   cmd.new_owner_ = std::move(*new_owner);
   cmd.new_topology_epoch_ = *topology_epoch;
-  cmd.new_config_epoch_ = *config_epoch;
   return cmd;
 }
 

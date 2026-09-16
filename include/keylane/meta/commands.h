@@ -191,6 +191,7 @@ enum class MetaAuditPolicy : std::uint8_t {
 // Version of the Raft command/WAL envelope, independent from individual
 // store codecs. Version 4 removes retired Policy commands, caller-supplied
 // Policy content hashes and references, redundant authority/grant revisions,
+// independently stored configuration epochs,
 // and the durable grant specification; records automatic-failover trigger
 // provenance on uncontrolled begins; and optionally carries a CAS witness for
 // the pristine Submitted Controlled requests that apply preempts atomically
@@ -282,8 +283,7 @@ struct RetireNode {
 
 // ---------------------------------------------------------------------------
 // topology. Every topology-visible change carries the new topology_epoch
-// as an absolute value; owner-visible changes additionally carry the affected
-// groups' new config_epoch values.
+// as an absolute value. Authority changes are identified by Group Term.
 // ---------------------------------------------------------------------------
 
 struct CreateGroup {
@@ -330,21 +330,13 @@ struct MetaSlotAssignment {
   bool operator==(const MetaSlotAssignment&) const = default;
 };
 
-// New config_epoch (absolute) for one affected group.
-struct MetaGroupConfigEpoch {
-  std::string group_id_;
-  std::uint64_t config_epoch_ = 0;
-  bool operator==(const MetaGroupConfigEpoch&) const = default;
-};
-
 struct SetSlotMap {
   MetaRequestId request_id_{};
   ActorContext actor_;
   // Absolute replacement. MetaStateApply requires every group whose slot
-  // coverage or config epoch changes to be fenced before this can commit.
+  // coverage changes to be fenced before this can commit.
   std::vector<MetaSlotAssignment> ranges_;
   std::uint64_t new_topology_epoch_ = 0;  // absolute
-  std::vector<MetaGroupConfigEpoch> config_epochs_;
   bool operator==(const SetSlotMap&) const = default;
 };
 
@@ -533,7 +525,6 @@ struct BeginControlledFailover {
   std::uint64_t expected_population_manifest_revision_ = 0;
   MetaHash256 expected_population_manifest_digest_{};
   std::uint64_t expected_partition_replication_epoch_ = 0;
-  std::uint64_t expected_config_epoch_ = 0;
   bool operator==(const BeginControlledFailover&) const = default;
 };
 
@@ -597,7 +588,6 @@ struct BeginUncontrolledFailover {
   std::uint64_t expected_population_manifest_revision_ = 0;
   MetaHash256 expected_population_manifest_digest_{};
   std::uint64_t expected_partition_replication_epoch_ = 0;
-  std::uint64_t expected_config_epoch_ = 0;
   bool operator==(const BeginUncontrolledFailover&) const = default;
 };
 
@@ -670,9 +660,7 @@ struct CommitControlledFailover {
   std::uint64_t expected_population_manifest_revision_ = 0;
   MetaHash256 expected_population_manifest_digest_{};
   std::uint64_t expected_partition_replication_epoch_ = 0;
-  std::uint64_t expected_config_epoch_ = 0;
   std::uint64_t new_topology_epoch_ = 0;
-  std::uint64_t new_config_epoch_ = 0;
   bool operator==(const CommitControlledFailover&) const = default;
 };
 
@@ -694,9 +682,7 @@ struct CommitUncontrolledFailover {
   std::uint64_t expected_population_manifest_revision_ = 0;
   MetaHash256 expected_population_manifest_digest_{};
   std::uint64_t expected_partition_replication_epoch_ = 0;
-  std::uint64_t expected_config_epoch_ = 0;
   std::uint64_t new_topology_epoch_ = 0;
-  std::uint64_t new_config_epoch_ = 0;
   bool operator==(const CommitUncontrolledFailover&) const = default;
 };
 
@@ -716,7 +702,6 @@ struct ActivateAuthority {
   std::uint64_t expected_term_ = 0;  // CAS on the current term; no new term
   std::string new_owner_;            // node_id
   std::uint64_t new_topology_epoch_ = 0;
-  std::uint64_t new_config_epoch_ = 0;
   bool operator==(const ActivateAuthority&) const = default;
 };
 

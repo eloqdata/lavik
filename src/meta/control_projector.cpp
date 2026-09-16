@@ -434,7 +434,6 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     control::WireDesiredGroup projected;
     projected.group_id = source.group_id_;
     projected.group_term = source.record_.group_term_;
-    projected.config_epoch = source.config_epoch_;
     projected.manifest_revision = source.record_.population_manifest_revision_;
     projected.manifest_digest = source.record_.population_manifest_digest_;
     projected.partition_replication_epoch =
@@ -483,7 +482,7 @@ absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
         return Inconsistent(absl::StrCat("group ", source.group_id_,
                                          " active grant is inconsistent"));
       }
-      if (source.record_.group_term_ == 0 || source.config_epoch_ == 0) {
+      if (source.record_.group_term_ == 0) {
         return Inconsistent(
             absl::StrCat("group ", source.group_id_,
                          " active grant has incomplete serving authority"));

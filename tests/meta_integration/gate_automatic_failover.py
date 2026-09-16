@@ -391,7 +391,13 @@ def run_leader_cut(meta, data, ctl, workdir, phase, require_fault_hook):
         require_fault_hook)
     try:
         start_with_automatic_failover_disabled(fixture)
-        configure_fast_policies(fixture)
+        # This gate requires exactly one Begin across Meta recovery. Promotion
+        # rotates replication history and reconnects the new Owner's session;
+        # a 1s debounce can legitimately declare that reconnect a second Owner
+        # failure. Use the bootstrap-default debounce for this recovery gate,
+        # retaining the exact term/unique-Begin assertions below. The dedicated
+        # Owner-loss and partition gates still exercise the 1s threshold.
+        configure_fast_policies(fixture, suspect_after_ms=5000)
         fixture.by_id[F.OWNER].force_kill()
         paused = kill_logged_meta(fixture, marker, timeout=30)
         if phase == "proposal":

@@ -170,7 +170,6 @@ void PopulateActivatedGroup(ActivatedGroupFixture& fixture,
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.owner;
   activate.new_topology_epoch_ = 3;
-  activate.new_config_epoch_ = 1;
   ExpectAccepted(fixture.stores, first_index + 5, meta::MetaCommand{activate});
 }
 
@@ -206,7 +205,6 @@ meta::BeginUncontrolledFailover MakeBeginUncontrolled(
   begin.expected_population_manifest_revision_ = 0;
   begin.expected_population_manifest_digest_.fill(0);
   begin.expected_partition_replication_epoch_ = 0;
-  begin.expected_config_epoch_ = 1;
   return begin;
 }
 
@@ -293,7 +291,6 @@ TEST(MetaFailoverTransitionApply,
   EXPECT_FALSE(group->failover_transition_->candidate_action_.has_value());
   EXPECT_FALSE(group->failover_transition_->controlled_.has_value());
   EXPECT_EQ(group->revision_, 2u);
-  EXPECT_EQ(group->config_epoch_, 1u);
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 3u);
 
   const auto grant = fixture.stores.grant_.GroupState("g1");
@@ -684,7 +681,6 @@ TEST(MetaFailoverTransitionApply,
   activate.expected_term_ = 2;
   activate.new_owner_ = NodeId(1);
   activate.new_topology_epoch_ = 4;
-  activate.new_config_epoch_ = 2;
   expect_blocked(meta::MetaCommand{activate});
 
   meta::RemoveNodeFromGroup remove;
@@ -718,7 +714,6 @@ TEST(MetaFailoverTransitionApply,
   slots.request_id_ = Filled<16>(0x65);
   slots.ranges_ = {{0, 16383, "g1"}};
   slots.new_topology_epoch_ = 4;
-  slots.config_epochs_ = {{"g1", 2}};
   expect_blocked(meta::MetaCommand{slots});
 }
 

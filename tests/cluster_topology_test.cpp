@@ -412,8 +412,8 @@ TEST(ServingStateTest, AuthorityToken) {
   // Stable for identical content.
   EXPECT_EQ(MakeState()->AuthorityToken("g1"), token);
 
-  // Changes in every covered dimension: owner identity, term, grant, both
-  // readiness flags, config epoch.
+  // Changes in every covered dimension: owner identity, term, grant, and both
+  // readiness flags.
   ServingStateBuilder other_primary;
   other_primary.SetTopologyEpoch(1)
       .SetSelfNodeIndex(0)
@@ -434,9 +434,6 @@ TEST(ServingStateTest, AuthorityToken) {
                 ->AuthorityToken("g1"),
             token);
   EXPECT_NE(MakeState(1, [](GroupView& g) { g.storage_ready_ = false; })
-                ->AuthorityToken("g1"),
-            token);
-  EXPECT_NE(MakeState(1, [](GroupView& g) { g.config_epoch_ = 42; })
                 ->AuthorityToken("g1"),
             token);
 }
@@ -482,6 +479,26 @@ TEST(TopologyCacheTest, PublishSharesCellsOnlyForTokenUnchangedGroups) {
   // publisher drains.
   EXPECT_EQ(current->GroupInFlightCount("g2"), 0);
   EXPECT_EQ(replaced->GroupInFlightCount("g2"), 1);
+}
+
+TEST(TopologyCacheTest, EmptyGroupTermChangesDiscoveryButNotServingAuthority) {
+  ServingStateBuilder builder = MakeTwoGroupBuilder();
+  builder.IncludeGroupTerm(11);
+  auto first = builder.Build();
+  ASSERT_TRUE(first.ok()) << first.status();
+  TopologyCache cache;
+  EXPECT_EQ(cache.Publish(*first), 1U);
+
+  // Only an unrepresented Group's term advances; every routable Group stays
+  // identical. Publication must still refresh Redis's cluster_current_epoch.
+  builder.IncludeGroupTerm(13).IncludeGroupTerm(2);
+  auto second = builder.Build();
+  ASSERT_TRUE(second.ok()) << second.status();
+  EXPECT_EQ((*second)->max_group_term(), 13U);
+  EXPECT_NE((*first)->content_hash(), (*second)->content_hash());
+  EXPECT_EQ((*first)->AuthorityToken("g1"), (*second)->AuthorityToken("g1"));
+  EXPECT_EQ(cache.Publish(*second), 2U);
+  EXPECT_EQ(cache.Current()->max_group_term(), 13U);
 }
 
 TEST(TopologyCacheTest, ContentIdenticalRepublishKeepsInFlightCells) {

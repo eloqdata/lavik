@@ -106,7 +106,10 @@ struct alignas(64) NodeDescriptor {
   // kNoNodeIndex identifies a primary; replicas point at their primary in
   // the same ServingState::Nodes() table.
   NodeIndex primary_node_index_ = kNoNodeIndex;
-  std::uint64_t config_epoch_ = 0;
+  // Read-only projection of the member Group's term for Redis discovery.
+  // Retained even when fencing removes the Group from the routing table;
+  // this is neither an independent counter nor proof of serving authority.
+  std::uint64_t group_term_ = 0;
 
   // Most advertised addresses (including every IPv4 literal) stay inside the
   // descriptor. Longer hostnames and IPv6 literals retain their full value by
@@ -244,7 +247,6 @@ struct GroupView {
   bool mutations_paused_ = false;
   std::uint64_t group_term_ = 0;
   std::uint64_t manifest_revision_ = 0;
-  std::uint64_t config_epoch_ = 0;
   std::vector<NodeIndex> replica_node_indices_;
   std::vector<SlotRange> slot_ranges_;  // owned slots, validated at Build
 };
@@ -253,6 +255,9 @@ struct GroupView {
 class ServingState {
  public:
   std::uint64_t topology_epoch() const { return topology_epoch_; }
+  // Derived Redis discovery value over every projected Group, including
+  // grantless Groups with no members/routing entry. Not an authority clock.
+  std::uint64_t max_group_term() const { return max_group_term_; }
   // Content identity: two states with equal hashes are interchangeable, and
   // TopologyCache::Publish drops the newer one without bumping the version.
   std::uint64_t content_hash() const { return content_hash_; }
@@ -302,6 +307,7 @@ class ServingState {
  private:
   friend class ServingStateBuilder;
   std::uint64_t topology_epoch_ = 0;
+  std::uint64_t max_group_term_ = 0;
   std::uint64_t content_hash_ = 0;
   std::vector<NodeDescriptor> nodes_;
   std::vector<GroupView> groups_;
@@ -331,6 +337,9 @@ class ServingState {
 class ServingStateBuilder {
  public:
   ServingStateBuilder& SetTopologyEpoch(std::uint64_t epoch);
+  // Includes non-routing/empty Groups in the derived maximum. AddNode and
+  // AddGroup also include their terms; callers never increment this value.
+  ServingStateBuilder& IncludeGroupTerm(std::uint64_t term);
   ServingStateBuilder& SetSelfNodeIndex(NodeIndex node_index);
   // Configures one in-flight stripe per request worker. The default keeps
   // standalone model construction convenient; production adapters must pass
@@ -352,6 +361,7 @@ class ServingStateBuilder {
 
  private:
   std::uint64_t topology_epoch_ = 0;
+  std::uint64_t max_group_term_ = 0;
   NodeIndex self_node_index_ = kNoNodeIndex;
   std::size_t in_flight_stripe_count_ = 1;
   std::vector<NodeDescriptor> nodes_;

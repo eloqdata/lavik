@@ -156,11 +156,9 @@ void PopulateActivatedFixture(Fixture& fixture,
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.owner;
   activate.new_topology_epoch_ = 4;
-  activate.new_config_epoch_ = 1;
   ASSERT_TRUE(fixture.stores.grant_.ValidateActivate(activate).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetOwner("g1", fixture.owner).ok());
   ASSERT_TRUE(fixture.stores.topology_.SetTopologyEpoch(4).ok());
-  ASSERT_TRUE(fixture.stores.topology_.SetGroupConfigEpoch("g1", 1).ok());
   ASSERT_TRUE(fixture.stores.grant_.ApplyGrantPart(activate).ok());
 }
 

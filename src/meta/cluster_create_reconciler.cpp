@@ -389,7 +389,6 @@ absl::Status ValidateV1FinalTopology(const MetaStores& stores,
     if (!group.has_value() ||
         (group->record_.group_term_ != 1 &&
          !(allow_failed_group && group->record_.group_term_ == 2)) ||
-        group->config_epoch_ != 1 ||
         group->record_.population_manifest_revision_ != 1 ||
         group->record_.population_manifest_digest_ !=
             population.manifest_digest_ ||
@@ -981,7 +980,7 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
         command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
         return Emit(std::move(command));
       }
-      if (group->record_.group_term_ > 1 || group->config_epoch_ != 0 ||
+      if (group->record_.group_term_ > 1 ||
           group->record_.population_manifest_revision_ != 0 ||
           group->record_.partition_replication_epoch_ != 0 ||
           !group->record_.owner_.empty())
@@ -1025,28 +1024,21 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
   if (phase == kRootPhaseSlotMap) {
     bool slots_empty = false;
     const bool slots_match = V1SlotMapMatches(stores, *manifest, &slots_empty);
-    bool epochs_zero = true;
-    bool epochs_one = true;
     for (const auto& declaration : manifest->groups_) {
       const auto group = stores.topology_.FindGroup(declaration.group_id_);
       if (!group.has_value() || group->record_.group_term_ != 1 ||
           !group->record_.owner_.empty())
         return Conflict(absl::StrCat("creation Group is not ready for Slots: ",
                                      declaration.group_id_));
-      epochs_zero &= group->config_epoch_ == 0;
-      epochs_one &= group->config_epoch_ == 1;
     }
-    if (slots_empty && epochs_zero) {
+    if (slots_empty) {
       SetSlotMap command;
       for (const auto& range : manifest->slot_ranges_)
         command.ranges_.push_back({range.first_, range.last_, range.group_id_});
-      for (const auto& declaration : manifest->groups_)
-        command.config_epochs_.push_back({declaration.group_id_, 1});
       command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
       return Emit(std::move(command));
     }
-    if (!slots_match || !epochs_one)
-      return Conflict("creation Slot map or config epoch differs from intent");
+    if (!slots_match) return Conflict("creation Slot map differs from intent");
     return Advance(operation, kRootPhasePopulation);
   }
 
@@ -1098,7 +1090,6 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
         command.expected_term_ = 1;
         command.new_owner_ = declaration.primary_node_id_;
         command.new_topology_epoch_ = stores.topology_.TopologyEpoch() + 1;
-        command.new_config_epoch_ = 1;
         return Emit(std::move(command));
       }
     }

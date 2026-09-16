@@ -376,7 +376,7 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
       if (group.record_.owner_.empty() ||
           !stores.identity_.IsActiveNode(group.record_.owner_) ||
           !IsMember(group, group.record_.owner_) ||
-          group.record_.group_term_ == 0 || group.config_epoch_ == 0) {
+          group.record_.group_term_ == 0) {
         return MetaFailStopError(
             "active failover transition lacks its exact historical owner "
             "authority");
@@ -457,8 +457,8 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
 
     if (!grant->grant_.has_value()) continue;
     const MetaGroupGrant& active = *grant->grant_;
-    if (group.record_.group_term_ == 0 || group.config_epoch_ == 0 ||
-        group.record_.owner_.empty() || group.record_.owner_ != active.owner_ ||
+    if (group.record_.group_term_ == 0 || group.record_.owner_.empty() ||
+        group.record_.owner_ != active.owner_ ||
         !stores.identity_.IsActiveNode(active.owner_) ||
         !IsMember(group, active.owner_)) {
       return MetaFailStopError(absl::StrCat(
@@ -829,8 +829,7 @@ absl::Status ValidateFailoverBeginAnchors(
       group.record_.population_manifest_digest_ !=
           cmd.expected_population_manifest_digest_ ||
       group.record_.partition_replication_epoch_ !=
-          cmd.expected_partition_replication_epoch_ ||
-      group.config_epoch_ != cmd.expected_config_epoch_) {
+          cmd.expected_partition_replication_epoch_) {
     return MetaDomainRejectError("failover group anchor is stale");
   }
   if (!stores.identity_.IsActiveNode(cmd.expected_owner_node_id_)) {
@@ -901,7 +900,6 @@ bool BeginControlledEffectPresent(const MetaStores& stores,
           cmd.expected_population_manifest_digest_ ||
       group->record_.partition_replication_epoch_ !=
           cmd.expected_partition_replication_epoch_ ||
-      group->config_epoch_ != cmd.expected_config_epoch_ ||
       grant->group_term_ != cmd.expected_group_term_ ||
       !grant->grant_.has_value()) {
     return false;
@@ -953,7 +951,6 @@ bool BeginUncontrolledEffectPresent(const MetaStores& stores,
           cmd.expected_population_manifest_digest_ ||
       group->record_.partition_replication_epoch_ !=
           cmd.expected_partition_replication_epoch_ ||
-      group->config_epoch_ != cmd.expected_config_epoch_ ||
       grant->group_term_ != cmd.target_term_ || grant->grant_.has_value()) {
     return false;
   }
@@ -1004,7 +1001,6 @@ bool FailoverCommitEffectPresent(const MetaStores& stores,
           command.expected_population_manifest_digest_ ||
       group->record_.partition_replication_epoch_ !=
           command.expected_partition_replication_epoch_ ||
-      group->config_epoch_ != command.new_config_epoch_ ||
       stores.topology_.TopologyEpoch() != command.new_topology_epoch_ ||
       grant->group_term_ != target_term || !grant->grant_.has_value()) {
     return false;
@@ -1077,7 +1073,6 @@ absl::Status ValidateFailoverCommitPrestate(
           command.expected_population_manifest_digest_ ||
       group.record_.partition_replication_epoch_ !=
           command.expected_partition_replication_epoch_ ||
-      group.config_epoch_ != command.expected_config_epoch_ ||
       grant_state.group_term_ != command.expected_group_term_) {
     return MetaDomainRejectError("failover commit group anchor is stale");
   }
@@ -1157,7 +1152,6 @@ ApplyOutcome ApplyFailoverCommit(MetaStores& stores, std::uint64_t log_index,
   activate.expected_term_ = target_term;
   activate.new_owner_ = command.expected_candidate_.node_id_;
   activate.new_topology_epoch_ = command.new_topology_epoch_;
-  activate.new_config_epoch_ = command.new_config_epoch_;
   if (absl::Status status = ApplyAuthorityActivationKernel(candidate, activate,
                                                            command.action_id_);
       !status.ok()) {
@@ -1218,8 +1212,8 @@ std::string ClusterFailureSummary(const MetaOperationId& operation_id) {
 }
 
 // A live lease names the projection that granted it. Moving a slot into or
-// out of that projection, or changing its config epoch, cannot ride the same
-// authority: the old and new owners could otherwise accept the same slot
+// out of that projection cannot ride the same authority: the old and new
+// owners could otherwise accept the same slot
 // until both sessions consume their replacement FullDesiredState. Build the
 // complete candidate first so malformed absolute maps are rejected without
 // duplicating topology-store validation, then require every affected group to
@@ -1234,22 +1228,16 @@ absl::Status ValidateSlotMapAuthorityTransition(
     if (before.has_value()) affected_groups.insert(*before);
     if (after.has_value()) affected_groups.insert(*after);
   }
-  for (const MetaTopologyGroupView& before : current.topology_.Groups()) {
-    const auto after = candidate.FindGroup(before.group_id_);
-    if (after.has_value() && before.config_epoch_ != after->config_epoch_) {
-      affected_groups.insert(before.group_id_);
-    }
-  }
   for (const std::string& group_id : affected_groups) {
     if (GroupHasActiveFailover(current, group_id)) {
-      return MetaDomainRejectError(absl::StrCat(
-          "slot ownership or config epoch change for group ", group_id,
-          " is blocked by its active failover transition"));
+      return MetaDomainRejectError(
+          absl::StrCat("slot ownership change for group ", group_id,
+                       " is blocked by its active failover transition"));
     }
     if (GroupHasActiveGrant(current, group_id)) {
-      return MetaDomainRejectError(absl::StrCat(
-          "slot ownership or config epoch change for group ", group_id,
-          " requires its active grant to be fenced first"));
+      return MetaDomainRejectError(
+          absl::StrCat("slot ownership change for group ", group_id,
+                       " requires its active grant to be fenced first"));
     }
   }
   return absl::OkStatus();
@@ -1257,7 +1245,7 @@ absl::Status ValidateSlotMapAuthorityTransition(
 
 // The replay predicate of ActivateAuthority: BOTH halves already carry
 // exactly this command's post-effect (grant half: the same predicate the
-// grant store's GrantMatches uses; topology half: owner, config_epoch, and the
+// grant store's GrantMatches uses; topology half: owner and the
 // cluster topology_epoch).
 bool ActivateEffectPresent(
     const MetaStores& stores, const ActivateAuthority& cmd,
@@ -1271,7 +1259,6 @@ bool ActivateEffectPresent(
                           grant.activation_action_id_ == activation_action_id;
   const bool topology_half =
       view.record_.owner_ == cmd.new_owner_ &&
-      view.config_epoch_ == cmd.new_config_epoch_ &&
       stores.topology_.TopologyEpoch() == cmd.new_topology_epoch_;
   return grant_half && topology_half;
 }
@@ -1283,10 +1270,6 @@ bool ActivateEffectPresent(
 absl::Status ApplyAuthorityActivationKernel(
     MetaStores& stores, const ActivateAuthority& cmd,
     std::optional<MetaFailoverActionId> activation_action_id) {
-  if (cmd.new_config_epoch_ == 0) {
-    return MetaDomainRejectError(
-        "authority activation requires a nonzero config epoch");
-  }
   const auto view = stores.topology_.FindGroup(cmd.group_id_);
   const auto grant_state = stores.grant_.GroupState(cmd.group_id_);
   if (!view.has_value() || !grant_state.has_value()) {
@@ -1296,7 +1279,7 @@ absl::Status ApplyAuthorityActivationKernel(
       stores, cmd, *view, *grant_state, activation_action_id);
   // The Grant is the one-shot marker for the current term. Only the complete
   // aggregate post-effect is a replay; matching just its Grant half must not
-  // permit an active command to rewrite topology or config epochs.
+  // permit an active command to rewrite the topology epoch.
   if (grant_state->grant_.has_value() && !effect_present) {
     return MetaDomainRejectError(
         "group term already has a different authority effect");
@@ -1329,11 +1312,6 @@ absl::Status ApplyAuthorityActivationKernel(
   }
   if (absl::Status status =
           stores.topology_.SetOwner(cmd.group_id_, cmd.new_owner_);
-      !status.ok()) {
-    return status;
-  }
-  if (absl::Status status = stores.topology_.SetGroupConfigEpoch(
-          cmd.group_id_, cmd.new_config_epoch_);
       !status.ok()) {
     return status;
   }
@@ -1538,8 +1516,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   (void)log_index;
   std::string summary =
       absl::StrCat("SetSlotMap ranges=", cmd.ranges_.size(),
-                   " topology_epoch=", cmd.new_topology_epoch_,
-                   " config_epochs=", cmd.config_epochs_.size());
+                   " topology_epoch=", cmd.new_topology_epoch_);
   MetaTopologyStore candidate = stores.topology_;
   if (const absl::Status applied = candidate.Apply(cmd); !applied.ok()) {
     return Rejected(applied, std::move(summary));
@@ -1674,8 +1651,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   std::string summary = absl::StrCat(
       "ActivateAuthority group=", cmd.group_id_, " owner=", cmd.new_owner_,
       " expected_term=", cmd.expected_term_,
-      " topology_epoch=", cmd.new_topology_epoch_,
-      " config_epoch=", cmd.new_config_epoch_);
+      " topology_epoch=", cmd.new_topology_epoch_);
   const auto view = stores.topology_.FindGroup(cmd.group_id_);
   const auto grant_state = stores.grant_.GroupState(cmd.group_id_);
   const bool effect_present =

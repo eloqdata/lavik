@@ -81,7 +81,6 @@ struct ClusterGroupWireV1 {
   std::string group_id_;
   std::uint64_t term_ = 0;
   std::optional<std::string> owner_node_id_;
-  std::uint64_t config_epoch_ = 0;
   bool serving_ready_ = false;
   bool topology_converged_ = false;
   // Leader-local automatic-failover diagnostics for this Group.

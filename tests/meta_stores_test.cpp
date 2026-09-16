@@ -616,7 +616,6 @@ TEST(MetaTopologyStore, CreateGroupCreatesQueryableGroup) {
   ASSERT_TRUE(view.has_value());
   EXPECT_EQ(view->group_id_, "group-a");
   EXPECT_EQ(view->revision_, 1u);
-  EXPECT_EQ(view->config_epoch_, 0u);
   EXPECT_TRUE(view->members_.empty());
   // Freshly created GroupRecord: no owner, all counters zero.
   EXPECT_EQ(view->record_.owner_, "");
@@ -994,15 +993,12 @@ TEST(MetaTopologyStore, RemoveNodeFromGroupRejects) {
 
 using keylane::meta::SetSlotMap;
 
-SetSlotMap MakeSlotMap(
-    std::vector<keylane::meta::MetaSlotAssignment> ranges,
-    std::uint64_t new_topology_epoch,
-    std::vector<keylane::meta::MetaGroupConfigEpoch> config_epochs = {}) {
+SetSlotMap MakeSlotMap(std::vector<keylane::meta::MetaSlotAssignment> ranges,
+                       std::uint64_t new_topology_epoch) {
   SetSlotMap cmd;
   cmd.request_id_ = MakeRequestId(0x90);
   cmd.ranges_ = std::move(ranges);
   cmd.new_topology_epoch_ = new_topology_epoch;
-  cmd.config_epochs_ = std::move(config_epochs);
   return cmd;
 }
 
@@ -1012,12 +1008,12 @@ void MakeTwoGroups(MetaTopologyStore& store) {
   ASSERT_TRUE(store.Apply(MakeCreateGroup("group-b", 2)).ok());
 }
 
-TEST(MetaTopologyStore, SetSlotMapAssignsSlotsAndEpochs) {
+TEST(MetaTopologyStore, SetSlotMapAssignsSlotsAndTopologyEpoch) {
   MetaTopologyStore store;
   MakeTwoGroups(store);
   const SetSlotMap cmd =
       MakeSlotMap({{0, 100, "group-a"}, {200, 300, "group-b"}},
-                  /*new_topology_epoch=*/3, {{"group-a", 11}});
+                  /*new_topology_epoch=*/3);
   ASSERT_TRUE(store.Apply(cmd).ok());
 
   EXPECT_EQ(store.TopologyEpoch(), 3u);
@@ -1029,8 +1025,6 @@ TEST(MetaTopologyStore, SetSlotMapAssignsSlotsAndEpochs) {
   EXPECT_FALSE(store.SlotOwner(301).has_value());
   EXPECT_FALSE(store.SlotOwner(keylane::meta::kMetaSlotCount)
                    .has_value());  // out-of-range query
-  EXPECT_EQ(store.FindGroup("group-a")->config_epoch_, 11u);
-  EXPECT_EQ(store.FindGroup("group-b")->config_epoch_, 0u);
 }
 
 TEST(MetaTopologyStore, SetSlotMapRequiresExactNextEpoch) {
@@ -1070,17 +1064,8 @@ TEST(MetaTopologyStore, SetSlotMapRejectsUnknownGroups) {
   MetaTopologyStore store;
   MakeTwoGroups(store);
   ExpectDomainReject(store.Apply(MakeSlotMap({{0, 100, "group-ghost"}}, 3)));
-  ExpectDomainReject(
-      store.Apply(MakeSlotMap({{0, 100, "group-a"}}, 3, {{"group-ghost", 7}})));
   EXPECT_EQ(store.TopologyEpoch(), 2u);
   EXPECT_FALSE(store.SlotOwner(0).has_value());
-}
-
-TEST(MetaTopologyStore, SetSlotMapRejectsDuplicateConfigEpochEntries) {
-  MetaTopologyStore store;
-  MakeTwoGroups(store);
-  ExpectDomainReject(store.Apply(
-      MakeSlotMap({{0, 100, "group-a"}}, 3, {{"group-a", 7}, {"group-a", 8}})));
 }
 
 TEST(MetaTopologyStore, SetSlotMapIsAbsolute) {
@@ -1106,20 +1091,16 @@ TEST(MetaTopologyStore, SetSlotMapEmptyRangesClearMap) {
 TEST(MetaTopologyStore, SetSlotMapReplayIdempotentAndConflictRejected) {
   MetaTopologyStore store;
   MakeTwoGroups(store);
-  const SetSlotMap cmd =
-      MakeSlotMap({{0, 100, "group-a"}}, 3, {{"group-a", 11}});
+  const SetSlotMap cmd = MakeSlotMap({{0, 100, "group-a"}}, 3);
   ASSERT_TRUE(store.Apply(cmd).ok());
-  // Replay: slot map, epoch, and config epochs already carry this command's
+  // Replay: slot map and topology epoch already carry this command's
   // effect -> idempotent accept.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.TopologyEpoch(), 3u);
 
   // Same epoch, different content -> conflict rejection.
   ExpectDomainReject(store.Apply(MakeSlotMap({{0, 99, "group-a"}}, 3)));
-  ExpectDomainReject(
-      store.Apply(MakeSlotMap({{0, 100, "group-a"}}, 3, {{"group-a", 12}})));
   EXPECT_EQ(store.SlotOwner(100), std::optional<std::string>("group-a"));
-  EXPECT_EQ(store.FindGroup("group-a")->config_epoch_, 11u);
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,7 +1119,6 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   ASSERT_TRUE(
       store.SetPopulationManifest("group-a", 555, manifest_digest).ok());
   ASSERT_TRUE(store.SetPartitionReplicationEpoch("group-a", 2).ok());
-  ASSERT_TRUE(store.SetGroupConfigEpoch("group-a", 9).ok());
 
   const auto view = store.FindGroup("group-a");
   EXPECT_EQ(view->record_.owner_, MakeNodeId(0x30));
@@ -1146,7 +1126,6 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   EXPECT_EQ(view->record_.population_manifest_revision_, 555u);
   EXPECT_EQ(view->record_.population_manifest_digest_, manifest_digest);
   EXPECT_EQ(view->record_.partition_replication_epoch_, 2u);
-  EXPECT_EQ(view->config_epoch_, 9u);
   // Membership CAS revision untouched by record-field changes.
   EXPECT_EQ(view->revision_, 1u);
 
@@ -1156,7 +1135,6 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   ASSERT_TRUE(
       store.SetPopulationManifest("group-a", 555, manifest_digest).ok());
   ASSERT_TRUE(store.SetPartitionReplicationEpoch("group-a", 2).ok());
-  ASSERT_TRUE(store.SetGroupConfigEpoch("group-a", 9).ok());
 
   // Unknown groups are rejected by every primitive.
   ExpectDomainReject(store.SetOwner("group-ghost", MakeNodeId(0x30)));
@@ -1164,7 +1142,6 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
   ExpectDomainReject(
       store.SetPopulationManifest("group-ghost", 555, manifest_digest));
   ExpectDomainReject(store.SetPartitionReplicationEpoch("group-ghost", 2));
-  ExpectDomainReject(store.SetGroupConfigEpoch("group-ghost", 9));
 }
 
 TEST(MetaTopologyStore, SetTopologyEpochRules) {
@@ -1231,8 +1208,7 @@ MetaTopologyStore MakePopulatedTopology() {
   EXPECT_TRUE(
       store
           .Apply(MakeSlotMap({{0, 100, "group-a"}, {200, 300, "group-b"}},
-                             /*new_topology_epoch=*/6,
-                             {{"group-a", 11}, {"group-b", 12}}))
+                             /*new_topology_epoch=*/6))
           .ok());
   return store;
 }
@@ -1360,7 +1336,6 @@ std::string MakeTopologyBlob(
     w.WriteU64(0);  // population_manifest_revision
     keylane::meta::WriteFixedArray(w, keylane::meta::MetaHash256{});
     w.WriteU64(0);  // partition_replication_epoch
-    w.WriteU64(0);  // config_epoch
     w.WriteU64(group.revision);
     w.WriteOptional(
         group.encoded_failover_transition,

@@ -487,7 +487,6 @@ def run_case(workdir, interactive):
             "group_id": "group-1",
             "term": "1",
             "owner_node_id": DATA_NODE,
-            "config_epoch": "1",
             "serving_ready": True,
             "topology_converged": True,
         }
@@ -961,7 +960,6 @@ def assert_multi_status(status, nodes):
         group = actual_groups.get(group_id, {})
         if (group.get("term") != "1" or
                 group.get("owner_node_id") != primary or
-                group.get("config_epoch") != "1" or
                 not group.get("serving_ready") or
                 not group.get("topology_converged")):
             raise H.Failure(f"{group_id} status is not ready: {status_text}")

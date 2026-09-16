@@ -727,9 +727,8 @@ operations intended for controlled bootstrap and recovery workflows:
 ```text
 putpolicy <policy-id> <version> <content>
 getpolicy <policy-id>
-setslotmap <first> <last> <group-id> <config-epoch>
-activateauthority <group-id> <expected-term> <owner-node-id> \
-                  <new-config-epoch>
+setslotmap <first> <last> <group-id>
+activateauthority <group-id> <expected-term> <owner-node-id>
 fencegroup <group-id> <expected-term>
 ```
 
@@ -752,10 +751,9 @@ The same 1,000–86,400,000 ms automatic threshold and 100–86,400,000 ms lease
 range apply to runtime updates. Field reordering is accepted, but whitespace,
 missing/duplicate/unknown fields, other ids or `kind` values, type mismatches,
 and non-consecutive versions are rejected. `setslotmap` replaces the entire
-slot map with one inclusive
-range—it is not an incremental assignment command—and sets the named group's
-absolute config epoch. Both slot endpoints must be within 0–16383. If the
-replacement changes a group's slot coverage or config epoch, every affected
+slot map with one inclusive range—it is not an incremental assignment command.
+Both slot endpoints must be within 0–16383. If the
+replacement changes a group's slot coverage, every affected
 source and destination group must first be fenced; apply rejects the whole map
 while any such group has an active grant. Activate fresh authorities only
 after the complete replacement commits.
@@ -768,7 +766,7 @@ reauthorizing the same Owner requires the new term. Use the typed failover
 workflow for normal Owner changes: it advances the Group Term and prepares the
 Candidate before activation. This low-level primitive only installs authority
 in a previously reserved grantless term; it does not perform that preparation.
-The expected term and config epoch are absolute values, not increments. Raft
+The expected term is an absolute value, not an increment. Raft
 apply rejects stale or conflicting transitions without changing authority and
 may accept an identical domain effect idempotently. The Data projection resolves
 lease duration from the current global Authority Lease Policy and caps it by the

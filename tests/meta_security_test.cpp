@@ -279,7 +279,6 @@ TEST(MetaClusterStatusRuntimeTest, HealthLossBeforeAckRemainsEncodable) {
     status.groups_.push_back({.group_id_ = "group-a",
                               .term_ = 4,
                               .owner_node_id_ = node_id,
-                              .config_epoch_ = 8,
                               .effective_threshold_ms_ = 1'000});
     const auto encoded = EncodeClusterStatusReply(status);
     ASSERT_TRUE(encoded.ok()) << encoded.status();

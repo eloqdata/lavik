@@ -280,10 +280,10 @@ def seed_assigned_authority(leader, data):
     expect_commit(leader.assignnode(GROUP, data.node_id),
                   "assign Data node")
     expect_commit(leader.begingroupterm(GROUP, 0, 1), "begin group term")
-    expect_commit(leader.setslotmap(0, 16383, GROUP, 1),
+    expect_commit(leader.setslotmap(0, 16383, GROUP),
                   "assign all slots")
     return expect_commit(
-        leader.activateauthority(GROUP, 1, data.node_id, 1),
+        leader.activateauthority(GROUP, 1, data.node_id),
         "activate authority")
 
 

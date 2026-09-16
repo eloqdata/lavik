@@ -438,7 +438,6 @@ void SetGroupAnchors(BeginUncontrolledFailover& command,
       group.record_.population_manifest_digest_;
   command.expected_partition_replication_epoch_ =
       group.record_.partition_replication_epoch_;
-  command.expected_config_epoch_ = group.config_epoch_;
 }
 
 std::optional<MetaOperationRecord> PreemptableControlledRequest(

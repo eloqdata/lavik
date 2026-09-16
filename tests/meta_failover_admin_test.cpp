@@ -106,7 +106,6 @@ ClusterStatusWireV1 ReadyStatus() {
   status.groups_.push_back({.group_id_ = "group-a",
                             .term_ = 4,
                             .owner_node_id_ = "data-1",
-                            .config_epoch_ = 8,
                             .serving_ready_ = true,
                             .topology_converged_ = true,
                             .effective_threshold_ms_ = 1'000});

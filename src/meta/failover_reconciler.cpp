@@ -90,7 +90,6 @@ void SetGroupAnchors(Command& command, const MetaTopologyGroupView& group) {
       group.record_.population_manifest_digest_;
   command.expected_partition_replication_epoch_ =
       group.record_.partition_replication_epoch_;
-  command.expected_config_epoch_ = group.config_epoch_;
 }
 
 absl::StatusOr<MetaRequestId> NextId(
@@ -388,8 +387,6 @@ absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
   }
   auto topology = Increment(view.topology().TopologyEpoch(), "topology epoch");
   if (!topology.ok()) return topology.status();
-  auto config = Increment(group.config_epoch_, "config epoch");
-  if (!config.ok()) return config.status();
   auto request_id = NextId(context);
   if (!request_id.ok()) return request_id.status();
 
@@ -404,7 +401,6 @@ absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
   command.expected_candidate_ = action.candidate_;
   SetGroupAnchors(command, group);
   command.new_topology_epoch_ = *topology;
-  command.new_config_epoch_ = *config;
   return MetaCommand{std::move(command)};
 }
 
@@ -423,8 +419,6 @@ absl::StatusOr<std::optional<MetaCommand>> CommitUncontrolled(
   }
   auto topology = Increment(view.topology().TopologyEpoch(), "topology epoch");
   if (!topology.ok()) return topology.status();
-  auto config = Increment(group.config_epoch_, "config epoch");
-  if (!config.ok()) return config.status();
   auto request_id = NextId(context);
   if (!request_id.ok()) return request_id.status();
 
@@ -438,7 +432,6 @@ absl::StatusOr<std::optional<MetaCommand>> CommitUncontrolled(
   command.expected_candidate_ = action.candidate_;
   SetGroupAnchors(command, group);
   command.new_topology_epoch_ = *topology;
-  command.new_config_epoch_ = *config;
   return MetaCommand{std::move(command)};
 }
 

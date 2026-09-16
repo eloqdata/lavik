@@ -236,7 +236,6 @@ std::unique_ptr<Fixture> MakeFixture() {
   activate.expected_term_ = 1;
   activate.new_owner_ = fixture.owner;
   activate.new_topology_epoch_ = 4;
-  activate.new_config_epoch_ = 1;
   AcceptFresh(fixture, meta::MetaCommand{activate});
 
   EXPECT_EQ(fixture.next_index, 11u);
@@ -269,7 +268,6 @@ void SetGroupAnchors(Command& command, const Fixture& fixture,
   command.expected_population_manifest_revision_ = 0;
   command.expected_population_manifest_digest_.fill(0);
   command.expected_partition_replication_epoch_ = 0;
-  command.expected_config_epoch_ = 1;
 }
 
 void SubmitControlledOperation(Fixture& fixture) {
@@ -374,7 +372,6 @@ meta::CommitControlledFailover MakeCommitControlled(
   commit.expected_candidate_ = action.candidate_;
   SetGroupAnchors(commit, fixture, 1);
   commit.new_topology_epoch_ = 5;
-  commit.new_config_epoch_ = 2;
   return commit;
 }
 
@@ -393,7 +390,6 @@ meta::CommitUncontrolledFailover MakeCommitUncontrolled(
   commit.expected_candidate_ = action.candidate_;
   SetGroupAnchors(commit, fixture, 2);
   commit.new_topology_epoch_ = 5;
-  commit.new_config_epoch_ = 2;
   return commit;
 }
 
@@ -402,7 +398,6 @@ void ExpectAuthorityUnchanged(const Fixture& fixture) {
   ASSERT_TRUE(group.has_value());
   EXPECT_EQ(group->record_.owner_, fixture.owner);
   EXPECT_EQ(group->record_.group_term_, 1u);
-  EXPECT_EQ(group->config_epoch_, 1u);
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 4u);
 
   const auto state = fixture.stores.grant_.GroupState("g1");
@@ -419,7 +414,6 @@ void ExpectCutover(const Fixture& fixture,
   ASSERT_TRUE(group.has_value());
   EXPECT_EQ(group->record_.owner_, fixture.candidate);
   EXPECT_EQ(group->record_.group_term_, 2u);
-  EXPECT_EQ(group->config_epoch_, 2u);
   EXPECT_FALSE(group->failover_transition_.has_value());
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 5u);
 
@@ -718,7 +712,6 @@ TEST(MetaFailoverTransitionW2,
   const auto group = fixture.stores.topology_.FindGroup("g1");
   EXPECT_EQ(group->record_.owner_, fixture.owner);
   EXPECT_EQ(group->record_.group_term_, 2u);
-  EXPECT_EQ(group->config_epoch_, 1u);
   EXPECT_EQ(fixture.stores.topology_.TopologyEpoch(), 4u);
   const auto grant = fixture.stores.grant_.GroupState("g1");
   EXPECT_FALSE(grant->grant_.has_value());
