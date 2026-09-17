@@ -238,6 +238,14 @@ def run(args, workdir):
                 before = target.metric(metric, labels)
                 target.wait_metric(metric, lambda value: value > before,
                                    "next lease heartbeat is denied", labels=labels)
+            if short_threshold:
+                # The one-second threshold accelerates the initial fence above.
+                # Operator recovery creates a fresh source history and reconnects
+                # Meta. Restore the default detection window for that handoff so a
+                # normal reconnect cannot immediately fence the recovered Owner.
+                reply = fixture.leader.put_automatic_uncontrolled_failover_policy(3)
+                if not reply.startswith("OK "):
+                    raise H.Failure(f"could not restore recovery detector: {reply}")
             promote(fixture, target)
         wait_serving(fixture, target, 2)
         require_data(target)
