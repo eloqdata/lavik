@@ -25,6 +25,8 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -38,6 +40,7 @@
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/worker.h"
 #include "lavik/cluster/control_protocol.h"
+#include "lavik/cluster/lease_clock.h"
 #include "lavik/fault_injection.h"
 #include "lavik/meta/candidate_plan.h"
 #include "lavik/meta/failover.h"
@@ -600,10 +603,51 @@ absl::StatusOr<std::optional<MetaCommand>> PlanUncontrolledTransition(
 
   const auto& action = *transition.candidate_action_;
   if (!action.authorization_.has_value()) {
-    // Authorization freezes a data-loss classification from an exact progress
-    // report; a bare Prepared observation is never upgraded into that loss
-    // assessment.
     if (!candidate.progress_.has_value()) return std::nullopt;
+    // Explicit operator recovery has no historical domain or donor frontier.
+    // Preserve its separate unknown-loss authorization over readable storage.
+    if (action.operator_recovery_)
+      return Authorize(group.group_id_, transition, MetaFailoverLoss::kUnknown,
+                       context);
+    if (!transition.recovery_deadline_unix_ms_.has_value()) {
+      if (!context.authority_excluded_ ||
+          !context.authority_excluded_(group.group_id_,
+                                       transition.target_term_)) {
+        return std::nullopt;
+      }
+      const auto policy = view.stores().policy_.CurrentCandidateRecovery();
+      if (!policy.has_value())
+        return absl::FailedPreconditionError("recovery policy is missing");
+      if (context.now_unix_ms_ <= 0 ||
+          policy->budget_ms_ > static_cast<std::uint64_t>(
+                                   std::numeric_limits<std::int64_t>::max() -
+                                   context.now_unix_ms_)) {
+        return absl::InvalidArgumentError(
+            "recovery deadline overflows Unix milliseconds");
+      }
+      auto id = NextId(context);
+      if (!id.ok()) return id.status();
+      StartCandidateRecovery start;
+      start.request_id_ = *id;
+      start.group_id_ = group.group_id_;
+      start.expected_transition_ = TransitionRef(transition);
+      start.action_id_ = action.action_id_;
+      start.recovery_deadline_unix_ms_ =
+          static_cast<std::uint64_t>(context.now_unix_ms_) + policy->budget_ms_;
+      return MetaCommand{std::move(start)};
+    }
+    // Only the drained complete Applied cut can authorize prepare. A timeout
+    // or a donor's advertised endpoint is never local population evidence.
+    const auto complete = observations.CandidateRecoveryCompleteFor(
+        transition.transition_id_, action.action_id_, facts,
+        context.now_unix_ms_);
+    if (!complete.has_value() ||
+        complete->session_generation_ !=
+            candidate.progress_->session_generation_ ||
+        complete->applied_next_lsns_ !=
+            candidate.progress_->applied_next_lsns_) {
+      return std::nullopt;
+    }
     return Authorize(group.group_id_, transition, MetaFailoverLoss::kUnknown,
                      context);
   }
@@ -796,9 +840,41 @@ absl::StatusOr<std::optional<MetaCommand>> PlanFailoverStep(
   return std::nullopt;
 }
 
+bool MetaFencedAuthorityGuard::ObserveFence(std::string_view group_id,
+                                            std::uint64_t target_term,
+                                            std::int64_t now_lease_clock_ms) {
+  if (group_id.empty() || target_term == 0 || now_lease_clock_ms < 0)
+    return false;
+  auto entry = std::ranges::find(entries_, group_id, &Entry::group_id_);
+  if (entry == entries_.end()) {
+    // Losing an entry only restarts a wait, never permits authority early.
+    if (entries_.size() >= cluster::control::kMaxProjectedGroups)
+      entries_.erase(entries_.begin());
+    entries_.push_back(
+        {std::string(group_id), target_term, now_lease_clock_ms});
+    entry = std::prev(entries_.end());
+  } else if (entry->target_term_ != target_term ||
+             now_lease_clock_ms < entry->since_ms_) {
+    *entry = {std::string(group_id), target_term, now_lease_clock_ms};
+  }
+  return static_cast<std::uint64_t>(now_lease_clock_ms - entry->since_ms_) >=
+         quarantine_ms_;
+}
+
 struct MetaFailoverReconciler::Core {
   bycorf::ForeignExecutor executor_;
   MetaFailoverReconcilerOptions options_;
+  // Proposal hooks run on the coordinator thread; planning runs on Bycorf.
+  std::mutex recovery_mutex_;
+  bool recovery_active_ = false;
+  std::unique_ptr<MetaFencedAuthorityGuard> authority_guard_;
+  struct RecoveryStart {
+    MetaFailoverTransitionId transition_id_;
+    std::uint64_t deadline_unix_ms_;
+  };
+  // Latches the first proposed cutoff even when append times out or policy
+  // changes before commit. Entries are bounded by current committed groups.
+  std::map<std::string, RecoveryStart> recovery_starts_;
   // Start/stop state is owned by the executor worker. Atomics are limited to
   // the cross-thread fast paths used when Notify can no longer be accepted.
   bool running_ = false;
@@ -843,11 +919,46 @@ MetaFailoverReconciler::MetaFailoverReconciler(
   if (!options.next_id_) {
     options.next_id_ = [] { return cluster::control::GenerateId128(); };
   }
+  if (!options.now_lease_clock_ms_)
+    options.now_lease_clock_ms_ = cluster::LeaseClockMillis;
+  core_->authority_guard_ = std::make_unique<MetaFencedAuthorityGuard>(
+      options.authority_exclusion_ms_);
   core_->executor_ = std::move(executor);
   core_->options_ = std::move(options);
 }
 
 MetaFailoverReconciler::~MetaFailoverReconciler() { Shutdown(); }
+
+MetaValidateHook MetaFailoverReconciler::validation_hook() const {
+  return [core = core_](
+             const MetaCommand& command, const MetaCommittedView& view,
+             const MetaObservationStore&, std::int64_t) -> absl::Status {
+    const auto* start = std::get_if<StartCandidateRecovery>(&command);
+    if (start == nullptr) return absl::OkStatus();
+    const auto group = view.topology().FindGroup(start->group_id_);
+    const auto grant = view.topology().AuthorityFor(start->group_id_);
+    if (!group.has_value() || !grant.has_value() || grant->grant_.has_value() ||
+        !group->failover_transition_.has_value()) {
+      return MetaDomainRejectError(
+          "recovery requires a committed authority fence");
+    }
+    std::lock_guard lock(core->recovery_mutex_);
+    const auto pending = core->recovery_starts_.find(start->group_id_);
+    if (!core->recovery_active_ ||
+        !core->authority_guard_->ObserveFence(
+            start->group_id_, group->record_.group_term_,
+            core->options_.now_lease_clock_ms_()) ||
+        pending == core->recovery_starts_.end() ||
+        pending->second.transition_id_ !=
+            start->expected_transition_.transition_id_ ||
+        pending->second.deadline_unix_ms_ !=
+            start->recovery_deadline_unix_ms_) {
+      return MetaDomainRejectError(
+          "recovery prior authority exclusion is pending");
+    }
+    return absl::OkStatus();
+  };
+}
 
 void MetaFailoverReconciler::Start(MetaLeaderContext& context) {
   const auto core = core_;
@@ -858,6 +969,12 @@ void MetaFailoverReconciler::Start(MetaLeaderContext& context) {
             if (core->running_) std::terminate();
             core->cancelled_ = false;
             core->running_ = true;
+            {
+              std::lock_guard lock(core->recovery_mutex_);
+              core->authority_guard_->Reset();
+              core->recovery_starts_.clear();
+              core->recovery_active_ = true;
+            }
             bycorf::ThisWorker().self_->Spawn(
                 Run(core, context, leadership_started));
           })) {
@@ -874,6 +991,12 @@ void MetaFailoverReconciler::Stop(bool permanent) {
   if (!core->executor_.Notify([core, waiter, permanent]() noexcept {
         core->shutdown_ |= permanent;
         core->cancelled_ = true;
+        {
+          std::lock_guard lock(core->recovery_mutex_);
+          core->recovery_active_ = false;
+          core->authority_guard_->Reset();
+          core->recovery_starts_.clear();
+        }
         if (core->running_) {
           core->waiters_.push_back(waiter);
         } else {
@@ -1072,13 +1195,31 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
     }
 #endif
 
+    {
+      std::lock_guard lock(core->recovery_mutex_);
+      std::erase_if(core->recovery_starts_, [&](const auto& entry) {
+        const auto group = subscribed.view_.topology().FindGroup(entry.first);
+        return !group.has_value() || !group->failover_transition_.has_value() ||
+               group->failover_transition_->transition_id_ !=
+                   entry.second.transition_id_ ||
+               group->failover_transition_->recovery_deadline_unix_ms_
+                   .has_value();
+      });
+    }
     const std::int64_t now = core->options_.now_unix_ms_();
     auto planned = PlanFailoverStep(
         subscribed.view_, context->Observations(),
         {.now_unix_ms_ = now,
          .leadership_started_unix_ms_ = leadership_started_unix_ms,
          .observation_grace_ms_ = core->options_.observation_grace_ms_,
-         .next_id_ = core->options_.next_id_});
+         .next_id_ = core->options_.next_id_,
+         .authority_excluded_ = [core](std::string_view group,
+                                       std::uint64_t term) {
+           std::lock_guard lock(core->recovery_mutex_);
+           return core->recovery_active_ &&
+                  core->authority_guard_->ObserveFence(
+                      group, term, core->options_.now_lease_clock_ms_());
+         }});
     if (!planned.ok()) {
       if (last_error != planned.status().message()) {
         spdlog::warn("failover reconciliation blocked: {}",
@@ -1087,6 +1228,19 @@ bycorf::Task<absl::Status> MetaFailoverReconciler::Run(
       }
     } else if (planned->has_value() && !core->cancelled_) {
       last_error.clear();
+      if (auto* start = std::get_if<StartCandidateRecovery>(&**planned)) {
+        std::lock_guard lock(core->recovery_mutex_);
+        auto [it, inserted] = core->recovery_starts_.try_emplace(
+            start->group_id_,
+            Core::RecoveryStart{start->expected_transition_.transition_id_,
+                                start->recovery_deadline_unix_ms_});
+        if (!inserted && it->second.transition_id_ !=
+                             start->expected_transition_.transition_id_) {
+          it->second = {start->expected_transition_.transition_id_,
+                        start->recovery_deadline_unix_ms_};
+        }
+        start->recovery_deadline_unix_ms_ = it->second.deadline_unix_ms_;
+      }
       const auto applied = co_await context->Propose(std::move(**planned));
       if (core->cancelled_) break;
       // A timeout, rejection, or accepted reply is never interpreted as

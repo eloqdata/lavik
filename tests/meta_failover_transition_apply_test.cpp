@@ -118,6 +118,11 @@ void SeedRequiredCurrentPolicies(meta::MetaStores& stores) {
   authority.version_ = 1;
   authority.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
   ASSERT_TRUE(stores.policy_.Apply(authority).ok());
+  meta::PutPolicy recovery;
+  recovery.policy_id_ = std::string(meta::kCandidateRecoveryPolicyId);
+  recovery.version_ = 1;
+  recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+  ASSERT_TRUE(stores.policy_.Apply(recovery).ok());
 }
 
 meta::SubmitOperation FailoverSubmit(std::uint8_t seed,
@@ -222,6 +227,53 @@ meta::BeginUncontrolledFailover MakeBeginUncontrolled(
   begin.expected_population_manifest_digest_.fill(0);
   begin.expected_partition_replication_epoch_ = 0;
   return begin;
+}
+
+TEST(MetaFailoverTransitionApply,
+     RecoveryDeadlineSurvivesReplacementAndRestore) {
+  ActivatedGroupFixture fixture = MakeActivatedGroup();
+  auto begin = MakeBeginUncontrolled(fixture);
+  begin.candidate_action_ = meta::MetaFailoverCandidateAction{
+      .action_id_ = Filled<16>(0xd0),
+      .candidate_ = {fixture.owner, fixture.owner_assignment,
+                     Filled<meta::kMetaBootIncarnationBytes>(0xd1)},
+      .domain_ = {1, fixture.owner, fixture.owner_assignment,
+                  Filled<meta::kMetaBootIncarnationBytes>(0xd2),
+                  Filled<meta::kMetaReplicationHistoryIdBytes>(0xd3), 1}};
+  ExpectAccepted(fixture.stores, 9, meta::MetaCommand{begin});
+  meta::StartCandidateRecovery start;
+  start.request_id_ = Filled<16>(0xd4);
+  start.group_id_ = "g1";
+  start.expected_transition_ = {begin.transition_id_, 9};
+  start.action_id_ = begin.candidate_action_->action_id_;
+  start.recovery_deadline_unix_ms_ = 3000;
+  const auto encoded = meta::EncodeMetaCommand(meta::MetaCommand{start});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  const auto decoded = meta::DecodeMetaCommand(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(std::get<meta::StartCandidateRecovery>(*decoded), start);
+  ExpectAccepted(fixture.stores, 10, *decoded);
+  ExpectAccepted(fixture.stores, 10, *decoded);
+  auto conflicting = start;
+  conflicting.expected_transition_.revision_ = 10;
+  conflicting.recovery_deadline_unix_ms_ = 9000;
+  ExpectRejected(fixture.stores, 11, meta::MetaCommand{conflicting});
+  meta::SetUncontrolledCandidate replacement;
+  replacement.request_id_ = Filled<16>(0xd5);
+  replacement.group_id_ = "g1";
+  replacement.expected_transition_ = {begin.transition_id_, 10};
+  replacement.candidate_action_ = begin.candidate_action_;
+  replacement.candidate_action_->action_id_ = Filled<16>(0xd6);
+  ExpectAccepted(fixture.stores, 12, meta::MetaCommand{replacement});
+  auto bytes = fixture.stores.Serialize();
+  ASSERT_TRUE(bytes.ok()) << bytes.status();
+  auto restored = meta::MetaStores::Deserialize(*bytes);
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  const auto transition =
+      restored->topology_.FindGroup("g1")->failover_transition_;
+  ASSERT_TRUE(transition.has_value());
+  EXPECT_EQ(transition->recovery_deadline_unix_ms_, 3000u);
+  EXPECT_EQ(transition->candidate_action_, replacement.candidate_action_);
 }
 
 meta::MetaOperationId InstallCurrentAuthorityDirective(

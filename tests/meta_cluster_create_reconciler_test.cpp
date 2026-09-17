@@ -332,6 +332,14 @@ TEST_F(ClusterCreateV1RecoveryTest,
   EXPECT_EQ(phase->kind_phase_blob_, "policy");
 }
 
+TEST_F(ClusterCreateV1RecoveryTest, InstallsRecoveryPolicyBeforeDataTopology) {
+  AdvanceToProjectionWait();
+  const auto policy = stores_.policy_.CurrentCandidateRecovery();
+  ASSERT_TRUE(policy.has_value());
+  EXPECT_EQ(policy->version_, 1u);
+  EXPECT_EQ(policy->budget_ms_, 2000u);
+}
+
 TEST_F(ClusterCreateV1RecoveryTest,
        CommitsOneSlotMapAndSparsePopulationPerGroup) {
   std::size_t slot_map_commands = 0;

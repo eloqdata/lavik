@@ -1577,6 +1577,39 @@ TEST(MetaPolicyStore, AutomaticFailoverNeedsOnlySuspectThreshold) {
             5000u);
 }
 
+TEST(MetaPolicyStore,
+     RecoveryBudgetAcceptsZeroAndSurvivesAlongsideOtherPolicies) {
+  MetaPolicyStore store;
+  const std::string id = "lavik.candidate-recovery-v1";
+  ASSERT_TRUE(store
+                  .Apply(MakePut(std::string(kAuthorityLeasePolicyId), 1,
+                                 LeasePolicy(3000)))
+                  .ok());
+  ASSERT_TRUE(
+      store
+          .Apply(MakePut(std::string(kAutomaticUncontrolledFailoverPolicyId), 1,
+                         AutomaticPolicy(5000)))
+          .ok());
+  ASSERT_TRUE(
+      store
+          .Apply(MakePut(
+              id, 1, R"({"kind":"candidate-recovery-v1","budget_ms":2000})"))
+          .ok());
+  ASSERT_TRUE(
+      store
+          .Apply(MakePut(id, 2,
+                         R"({"kind":"candidate-recovery-v1","budget_ms":0})"))
+          .ok());
+  auto restored = MetaPolicyStore::Deserialize(store.Serialize());
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  ASSERT_EQ(restored->PolicyCount(), 3u);
+  EXPECT_EQ(restored->FindVersion(id, 2)->content_,
+            R"({"kind":"candidate-recovery-v1","budget_ms":0})");
+  EXPECT_EQ(restored->CurrentAutomaticUncontrolledFailover()->suspect_after_ms_,
+            5000u);
+  EXPECT_EQ(restored->CurrentAuthorityLease()->duration_ms_, 3000u);
+}
+
 TEST(MetaPolicyStore, StoresTypedPoliciesAndReturnsOriginalRawBytes) {
   MetaPolicyStore store;
   const std::string reordered =

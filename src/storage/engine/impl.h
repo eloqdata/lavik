@@ -60,6 +60,7 @@
 #include "bycorf/runtime/worker.h"
 #include "lavik/fault_injection.h"
 #include "lavik/memory.h"
+#include "lavik/replication_history.h"
 #include "lavik/storage/detail/compact_write.h"
 #include "lavik/storage/detail/grouped_object_index.h"
 #include "lavik/storage/detail/hash_codec.h"
@@ -1379,6 +1380,7 @@ class StorageEngine::Impl {
                 RetainedAllocator<ReplicationSparseOffset>(domain)) {}
 
       ByteOwner bytes_;
+      ReplicationHistory::PrimaryCharge history_charge_;
       std::uint64_t first_lsn_ = 0;
       std::uint64_t last_lsn_ = 0;
       std::uint32_t committed_bytes_ = 0;
@@ -2596,6 +2598,10 @@ class StorageEngine::Impl {
 
   Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
                                           std::size_t capacity_bytes);
+  void SetReplicationHistory(
+      std::shared_ptr<lavik::ReplicationHistory> history) {
+    replication_history_.store(std::move(history), std::memory_order_release);
+  }
   Task<absl::Status> SetReplicationLogCapacity(std::size_t capacity_bytes);
   Task<absl::Status> SetReplicationBacklogBackpressure(bool enabled);
   Task<absl::Status> SetReplicationPublishQueueCapacity(
@@ -3769,6 +3775,7 @@ class StorageEngine::Impl {
   // The append path samples this only at an 8 MiB block rollover. CONFIG
   // visits each worker after changing it so a disabled policy wakes sleepers.
   std::atomic<bool> replication_backlog_backpressure_{true};
+  std::atomic<std::shared_ptr<lavik::ReplicationHistory>> replication_history_;
   unsigned worker_count_ = 0;
   std::uint64_t total_data_blocks_ = 0;
   std::vector<StorageDevice> devices_;

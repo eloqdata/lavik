@@ -204,6 +204,7 @@ slot_strategy = "contiguous-even"
 [bootstrap_policy]
 automatic_uncontrolled_failover_suspect_after_ms = 5000
 authority_lease_duration_ms = 5000
+candidate_recovery_budget_ms = 2000
 
 [[meta_members]]
 id = 1
@@ -238,13 +239,14 @@ primary = "3333333333333333333333333333333333333333"
 replicas = ["4444444444444444444444444444444444444444"]
 ```
 
-The optional `[bootstrap_policy]` section supplies version-1 values for either
+The optional `[bootstrap_policy]` section supplies version-1 values for each
 registered Policy family when that family has not been pre-seeded. Omitted
 fields use the values above. These values are creation defaults only: a valid
 pre-seeded current Policy is preserved, and changing the manifest later does
 not reconfigure a created cluster. Automatic failover `suspect_after_ms` must
 be 1,000–86,400,000; Authority Lease `duration_ms` must be
-100–86,400,000. Unknown fields, malformed values, and out-of-range values make
+100–86,400,000; Candidate Recovery `budget_ms` must be 0–86,400,000.
+Unknown fields, malformed values, and out-of-range values make
 the manifest invalid.
 
 To choose Slots explicitly, omit `slot_strategy` and add a complete table:
@@ -432,21 +434,23 @@ Failover in progress`. Work admitted before the pause drains before Meta uses
 the stable source frontier. The chosen candidate must catch up through that
 frontier and prepare before the atomic cutover, so a completed controlled
 failover records `loss=none`. After cutover, full desired state makes every
-non-owner follow the new owner through native CONTINUE or FULL. The former
-owner retires its old source backlog locally when it consumes that relationship;
-no separate cleanup command is required.
+non-owner follow the new Owner through native CONTINUE, direct-parent replay
+and HistorySwitch, or a FULL replacement intent. The former Owner fences and
+drains accepted writes and expiration, then freezes its own source-domain
+cursor before retiring that backlog; no separate cleanup command is required.
 
-Post-cutover reconciliation may start destructive FULL on several followers
-concurrently when none can CONTINUE from the new owner. Those followers
-withdraw their old Ready and Candidate observations until FULL finishes. If
-the new owner fails during that window, Meta may report no eligible Candidate
-and an uncontrolled transition will wait rather than cut over without a
-current recovery observation. Node count alone does not show that a
-recoverable population remains: monitor follower population readiness and
-candidate observations before planned work on a newly promoted owner, and
-treat simultaneous FULL activity as a second-failure availability risk. There
-is no Meta rebuild queue or Data admission controller to serialize these
-replacements.
+A trustworthy complete Active population remains Ready and candidate-eligible
+while reparent is incomplete. Its reported cursor stays in the actual parent
+domain until HistorySwitch atomically installs the child domain and complete
+origin vector. A disconnect or retention gap selects FULL without first
+resetting Active. The adapter exposes a preserving replacement intent;
+isolated staged storage transfer and replacement remain the separate staged-
+population integration. Until that integration is available, such a target
+waits with Active preserved. Initial or already-unready FULL still uses the
+destructive rebuild path. Inspect actual population readiness and candidate
+progress when diagnosing recovery; neither node count nor partial transfer
+progress proves a complete population. There is no all-replica completion
+barrier or Meta queue serializing these independent relationships.
 
 If the candidate is confirmed unavailable while the old owner is still usable,
 Meta aborts the controlled operation immediately and service remains on the old
@@ -472,6 +476,23 @@ selects the strongest candidate inside one comparable domain, and records
 authorized lossless may instead retain `loss=none` across controlled
 degradation. Writes acknowledged only by the failed owner may be absent on an
 unknown-loss cutover.
+Before prepare authorization, an ordinary uncontrolled Candidate with a
+comparable history uses a bounded recovery budget to gather retained original
+events from compatible members. Explicit operator recovery has no historical
+frontier and skips this gathering phase. The default
+is 2000 ms; zero skips active gathering while retention and partial reparent
+remain enabled. After old write authority is excluded, Meta's recovery-start
+proposal carries an absolute deadline calculated at proposal time; commit,
+dispatch, discovery, connection, and transfer consume the budget. The proposing
+leader preserves this cutoff across retries. Once committed, the transition
+shares that deadline across Candidate and Meta Leader replacement. An
+uncommitted proposal lost with its leader cannot preserve its cutoff. A policy
+update affects only transitions whose cutoff has not been fixed, and does not
+reset automatic failure suspicion. Expiry safely drains accepted apply and prepares from the
+actual complete frontier; it does not make the outcome lossless or terminate a
+transition waiting for a Candidate. Data logs `candidate recovery completed`
+with action, reason, and actual Applied vector.
+
 The current Meta Leader also runs an Automatic Failover Detector for every
 Created Group. Only a current authenticated Owner heartbeat matching the exact
 boot, assignment, projection, term, authority, grant, storage, population, and
@@ -799,6 +820,9 @@ lavik-ctl --socket /var/lib/lavik/meta-1/meta-admin.sock \
 lavik-ctl --socket /var/lib/lavik/meta-1/meta-admin.sock \
   putpolicy lavik.authority-lease-v1 2 \
   '{"kind":"authority-lease-v1","duration_ms":5000}'
+lavik-ctl --socket /var/lib/lavik/meta-1/meta-admin.sock \
+  putpolicy lavik.candidate-recovery-v1 2 \
+  '{"kind":"candidate-recovery-v1","budget_ms":2000}'
 ```
 
 Automatic failover is always active. Its Policy configures only the finite
@@ -808,7 +832,7 @@ until a candidate becomes eligible or an operator explicitly accepts data loss
 and selects a recovered population with `promote`.
 
 The same 1,000–86,400,000 ms automatic threshold and 100–86,400,000 ms lease
-range apply to runtime updates. Field reordering is accepted, but whitespace,
+range, plus the 0–86,400,000 ms recovery budget, apply to runtime updates. Field reordering is accepted, but whitespace,
 missing/duplicate/unknown fields, other ids or `kind` values, type mismatches,
 and non-consecutive versions are rejected. `setslotmap` replaces the entire
 slot map with one inclusive range—it is not an incremental assignment command.

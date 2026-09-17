@@ -882,6 +882,22 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
                       .candidate_boot_id_ = *candidate_boot,
                       .prepared_context_id_ = wire.prepared_context_id,
                   }};
+            } else if constexpr (std::is_same_v<
+                                     Wire,
+                                     control::CandidateRecoveryComplete>) {
+              failover_observation_value = MetaFailoverObservationObs{
+                  .payload_ = MetaCandidateRecoveryCompleteObs{
+                      .group_id_ = committed->group_id_,
+                      .transition_id_ = wire.transition_id,
+                      .action_id_ = wire.action_id,
+                      .candidate_node_id_ = wire.candidate_node_id,
+                      .candidate_assignment_id_ = wire.candidate_assignment_id,
+                      .candidate_boot_id_ = *candidate_boot,
+                      .recovery_deadline_unix_ms_ =
+                          wire.recovery_deadline_unix_ms,
+                      .applied_next_lsns_ = wire.applied_next_lsns,
+                      .completion_reason_ = wire.completion_reason,
+                  }};
             } else {
               failover_observation_value = MetaFailoverObservationObs{
                   .payload_ = MetaActionFailedObs{

@@ -191,6 +191,14 @@ def run_owner_loss(meta, data, ctl, workdir, mode, require_fault_hook):
                 "resumed old Owner follows successor", 30,
                 lambda: F.readonly_get(fixture.by_id[F.OWNER], key) == after)
 
+        with open(fixture.by_id[successor].log_path, encoding="utf-8") as log:
+            if "candidate recovery completed" not in log.read():
+                raise H.Failure("uncontrolled successor prepared without bounded recovery")
+        remaining_replica = next(node_id for node_id in (F.CANDIDATE, F.FOLLOWER)
+                                 if node_id != successor)
+        H.wait_until(
+            "remaining replica follows the recovered child history", 30,
+            lambda: F.readonly_get(fixture.by_id[remaining_replica], key) == after)
         begin = require_automatic_begin(fixture)
         if begin["reason"] != expected_reason:
             raise H.Failure(

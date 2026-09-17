@@ -139,6 +139,13 @@ void PopulateActivatedFixture(Fixture& fixture,
   assign_candidate.new_topology_epoch_ = 3;
   ASSERT_TRUE(fixture.stores.topology_.Apply(assign_candidate).ok());
 
+  meta::PutPolicy recovery;
+  recovery.request_id_ = Filled<16>(0x0e);
+  recovery.policy_id_ = std::string(meta::kCandidateRecoveryPolicyId);
+  recovery.version_ = 1;
+  recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+  EXPECT_TRUE(fixture.stores.policy_.Apply(recovery).ok());
+
   if (install_automatic_policy) {
     meta::PutPolicy automatic;
     automatic.request_id_ = Filled<16>(0x09);

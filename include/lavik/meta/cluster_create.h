@@ -71,6 +71,8 @@ struct ClusterCreateManifestV1 {
   std::uint64_t automatic_uncontrolled_failover_suspect_after_ms_ =
       kDefaultAutomaticFailoverSuspectAfterMs;
   std::uint64_t authority_lease_duration_ms_ = kDefaultAuthorityLeaseDurationMs;
+  std::uint64_t candidate_recovery_budget_ms_ =
+      kDefaultCandidateRecoveryBudgetMs;
   std::vector<MetaMember> meta_members_;
   bool slots_generated_ = false;
   std::vector<DataNode> data_nodes_;

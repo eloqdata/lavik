@@ -465,6 +465,36 @@ TEST(ControlProtocolCodecTest,
   }
 }
 
+TEST(ControlProtocolCodecTest, RecoveryCompletionRoundTripsActualFrontier) {
+  control::Heartbeat heartbeat;
+  heartbeat.session_id = Id(1);
+  heartbeat.heartbeat_sequence = 1;
+  control::CandidateRecoveryComplete complete{
+      .transition_id = Id(4),
+      .action_id = Id(5),
+      .candidate_node_id = std::string(40, 'd'),
+      .candidate_assignment_id = Id(6),
+      .candidate_boot_id = std::string(40, 'e'),
+      .recovery_deadline_unix_ms = 3000,
+      .applied_next_lsns = {12, 9},
+      .completion_reason = "coverage-unavailable",
+  };
+  heartbeat.failover_observation = complete;
+  auto encoded = control::EncodeMessage(control::WireMessage{heartbeat});
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded =
+      control::DecodeMessage(control::MessageType::kHeartbeat, *encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(std::get<control::Heartbeat>(*decoded), heartbeat);
+  complete.applied_next_lsns = {12, 0};
+  heartbeat.failover_observation = complete;
+  EXPECT_FALSE(control::EncodeMessage(control::WireMessage{heartbeat}).ok());
+  complete.applied_next_lsns = {12, 9};
+  complete.recovery_deadline_unix_ms = 0;
+  heartbeat.failover_observation = complete;
+  EXPECT_FALSE(control::EncodeMessage(control::WireMessage{heartbeat}).ok());
+}
+
 TEST(ControlProtocolCodecTest,
      FailoverObservationValidationAndSingleFrameBudgetAreStrict) {
   control::Heartbeat heartbeat;

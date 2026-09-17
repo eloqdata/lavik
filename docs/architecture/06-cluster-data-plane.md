@@ -420,7 +420,12 @@ the action watchdog, or disconnect instead of interpreting that gap as loss.
 
 An independent optional failover observation accompanies that role payload.
 `SourcePaused` reports the controlled source's exact history and stable
-next-LSN vector while the same heartbeat still renews its lease. A candidate
+next-LSN vector while the same heartbeat still renews its lease.
+`CandidateRecoveryComplete` accompanies current Candidate Progress and names the
+exact unauthorized uncontrolled action, shared deadline, complete actual
+Applied vector, and bounded completion reason. Donor endpoints and recovery
+scope come from that action's current FDS; recovery does not grant serving
+authority or require all members to reply. A candidate
 may suppress its ordinary role while rotating history after authorization;
 `CandidatePrepared` then reports the exact action and boot-local prepared-
 context identity independently. `ActionFailed` reports a bounded class
@@ -688,8 +693,13 @@ any mismatch remains fenced. There is no separate activation directive or RPC.
 The same post-cutover local control supplies the complete owner, endpoint, membership,
 manifest, and population epoch as a steady follow-owner relationship. The new
 owner authorizes the exact replicas; every non-owner connects directly and the
-native handshake chooses CONTINUE or FULL. A former owner fences its role,
-revokes export, and retires its old backlog locally before it begins following.
+native protocol chooses current-history CONTINUE, direct-parent replay and
+HistorySwitch, or FULL. A former owner fences its role, revokes export, drains
+accepted writes and expiration, and freezes its own source-domain cursor before
+retiring its old backlog. Complete Ready remains candidate evidence during
+reparent; HistorySwitch atomically changes its whole domain and cursor. A FULL
+replacement intent preserves trustworthy Active while awaiting isolated staged
+replacement; an incomplete target uses the existing initial FULL path.
 This relation is resent after reconnect or Meta leadership change, so cleanup
 and replica attachment do not depend on an ephemeral post-commit message.
 

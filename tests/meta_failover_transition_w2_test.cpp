@@ -177,6 +177,13 @@ std::unique_ptr<Fixture> MakeFixture() {
   const meta::SubmitOperation root = ClusterCreateRoot();
   AcceptFresh(fixture, meta::MetaCommand{root});
 
+  meta::PutPolicy recovery;
+  recovery.request_id_ = Filled<16>(0x0e);
+  recovery.policy_id_ = std::string(meta::kCandidateRecoveryPolicyId);
+  recovery.version_ = 1;
+  recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+  EXPECT_TRUE(fixture.stores.policy_.Apply(recovery).ok());
+
   meta::PutPolicy automatic;
   automatic.request_id_ = Filled<16>(0x0f);
   automatic.policy_id_ =
@@ -327,6 +334,18 @@ meta::BeginUncontrolledFailover MakeBeginUncontrolled(
   }
   SetGroupAnchors(begin, fixture, 1);
   return begin;
+}
+
+std::uint64_t StartRecovery(Fixture& fixture, std::uint64_t revision) {
+  const auto action = *fixture.stores.topology_.FindGroup("g1")
+                           ->failover_transition_->candidate_action_;
+  meta::StartCandidateRecovery start;
+  start.request_id_ = Filled<16>(0xe0);
+  start.group_id_ = "g1";
+  start.expected_transition_ = {fixture.transition_id, revision};
+  start.action_id_ = action.action_id_;
+  start.recovery_deadline_unix_ms_ = 3000;
+  return AcceptFresh(fixture, meta::MetaCommand{start});
 }
 
 meta::AuthorizeFailoverPrepare MakeAuthorize(
@@ -596,8 +615,9 @@ TEST(MetaFailoverTransitionW2,
     RejectFresh(fixture, meta::MetaCommand{
                              MakeAuthorize(fixture, begin_index, action,
                                            meta::MetaFailoverLoss::kNone)});
-    const meta::AuthorizeFailoverPrepare authorize = MakeAuthorize(
-        fixture, begin_index, action, meta::MetaFailoverLoss::kUnknown);
+    const meta::AuthorizeFailoverPrepare authorize =
+        MakeAuthorize(fixture, StartRecovery(fixture, begin_index), action,
+                      meta::MetaFailoverLoss::kUnknown);
     const std::uint64_t authorize_index =
         AcceptFresh(fixture, meta::MetaCommand{authorize});
     ExpectExactReplay(fixture, authorize_index, meta::MetaCommand{authorize});
@@ -851,8 +871,9 @@ TEST(MetaFailoverTransitionW2,
   const std::uint64_t begin_index =
       AcceptFresh(fixture, meta::MetaCommand{begin});
   const meta::MetaFailoverCandidateAction action = *begin.candidate_action_;
-  const meta::AuthorizeFailoverPrepare authorize = MakeAuthorize(
-      fixture, begin_index, action, meta::MetaFailoverLoss::kUnknown);
+  const meta::AuthorizeFailoverPrepare authorize =
+      MakeAuthorize(fixture, StartRecovery(fixture, begin_index), action,
+                    meta::MetaFailoverLoss::kUnknown);
   const std::uint64_t authorize_index =
       AcceptFresh(fixture, meta::MetaCommand{authorize});
 
@@ -902,9 +923,9 @@ TEST(MetaFailoverTransitionW2,
   };
   const auto authorize_uncontrolled = [](Fixture& fixture,
                                          const auto& attempt) {
-    const meta::AuthorizeFailoverPrepare authorize =
-        MakeAuthorize(fixture, attempt.second, *attempt.first.candidate_action_,
-                      meta::MetaFailoverLoss::kUnknown);
+    const meta::AuthorizeFailoverPrepare authorize = MakeAuthorize(
+        fixture, StartRecovery(fixture, attempt.second),
+        *attempt.first.candidate_action_, meta::MetaFailoverLoss::kUnknown);
     return AcceptFresh(fixture, meta::MetaCommand{authorize});
   };
 

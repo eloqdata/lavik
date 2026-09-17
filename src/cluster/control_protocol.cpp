@@ -58,6 +58,7 @@ enum class HeartbeatRoleKind : std::uint8_t {
 enum class FailoverObservationKind : std::uint8_t {
   kSourcePaused = 1,
   kCandidatePrepared = 2,
+  kCandidateRecoveryComplete = 4,
   kActionFailed = 3,
 };
 
@@ -965,6 +966,43 @@ absl::Status WriteFailoverObservation(Writer& writer,
     return absl::OkStatus();
   }
 
+  if (const auto* complete =
+          std::get_if<CandidateRecoveryComplete>(&observation)) {
+    if (IsZeroId(complete->transition_id) || IsZeroId(complete->action_id) ||
+        IsZeroId(complete->candidate_assignment_id) ||
+        (complete->recovery_deadline_unix_ms == 0 ||
+         complete->recovery_deadline_unix_ms >
+             static_cast<std::uint64_t>(
+                 std::numeric_limits<std::int64_t>::max()) ||
+         !IsRecoveryCompletionReason(complete->completion_reason))) {
+      return ProtocolError(
+          "candidate-complete observation has an empty anchor");
+    }
+    writer.U8(static_cast<std::uint8_t>(
+        FailoverObservationKind::kCandidateRecoveryComplete));
+    writer.Fixed(complete->transition_id);
+    writer.Fixed(complete->action_id);
+    if (absl::Status status = WriteIdentity(writer, complete->candidate_node_id,
+                                            "complete candidate node id");
+        !status.ok()) {
+      return status;
+    }
+    writer.Fixed(complete->candidate_assignment_id);
+    if (absl::Status status = WriteIdentity(writer, complete->candidate_boot_id,
+                                            "complete candidate boot id");
+        !status.ok()) {
+      return status;
+    }
+    writer.U64(complete->recovery_deadline_unix_ms);
+    if (auto status =
+            writer.String(complete->completion_reason, kMaxIdentifierBytes,
+                          "recovery completion reason");
+        !status.ok())
+      return status;
+    return WriteHeartbeatFlowVector(writer, complete->applied_next_lsns,
+                                    "recovery applied frontier");
+  }
+
   const ActionFailed& failed = std::get<ActionFailed>(observation);
   if (IsZeroId(failed.transition_id) || IsZeroId(failed.action_id) ||
       IsZeroId(failed.candidate_assignment_id) ||
@@ -1064,6 +1102,47 @@ absl::StatusOr<FailoverObservation> ReadFailoverObservation(Reader& reader) {
           "candidate-prepared observation has an empty anchor");
     }
     return FailoverObservation{std::move(prepared)};
+  }
+
+  if (*kind == static_cast<std::uint8_t>(
+                   FailoverObservationKind::kCandidateRecoveryComplete)) {
+    CandidateRecoveryComplete complete;
+    auto transition_id = reader.Fixed<16>();
+    if (!transition_id.ok()) return transition_id.status();
+    complete.transition_id = *transition_id;
+    auto action_id = reader.Fixed<16>();
+    if (!action_id.ok()) return action_id.status();
+    complete.action_id = *action_id;
+    auto node_id = ReadIdentity(reader, "complete candidate node id");
+    if (!node_id.ok()) return node_id.status();
+    complete.candidate_node_id = std::move(*node_id);
+    auto assignment_id = reader.Fixed<16>();
+    if (!assignment_id.ok()) return assignment_id.status();
+    complete.candidate_assignment_id = *assignment_id;
+    auto boot_id = ReadIdentity(reader, "complete candidate boot id");
+    if (!boot_id.ok()) return boot_id.status();
+    complete.candidate_boot_id = std::move(*boot_id);
+    auto deadline = reader.U64();
+    if (!deadline.ok()) return deadline.status();
+    complete.recovery_deadline_unix_ms = *deadline;
+    auto reason = reader.String(kMaxIdentifierBytes);
+    if (!reason.ok()) return reason.status();
+    complete.completion_reason = std::move(*reason);
+    auto frontier =
+        ReadHeartbeatFlowVector(reader, "recovery applied frontier");
+    if (!frontier.ok()) return frontier.status();
+    complete.applied_next_lsns = std::move(*frontier);
+    if (IsZeroId(complete.transition_id) || IsZeroId(complete.action_id) ||
+        IsZeroId(complete.candidate_assignment_id) ||
+        (complete.recovery_deadline_unix_ms == 0 ||
+         complete.recovery_deadline_unix_ms >
+             static_cast<std::uint64_t>(
+                 std::numeric_limits<std::int64_t>::max()) ||
+         !IsRecoveryCompletionReason(complete.completion_reason))) {
+      return ProtocolError(
+          "candidate-complete observation has an empty anchor");
+    }
+    return FailoverObservation{std::move(complete)};
   }
 
   if (*kind ==
@@ -2317,6 +2396,14 @@ absl::Status ValidateFailoverTransition(
       transition.mode != WireFailoverMode::kUncontrolled) {
     return ProtocolError("unknown failover transition mode");
   }
+  if (transition.recovery_deadline_unix_ms.has_value() &&
+      (transition.mode != WireFailoverMode::kUncontrolled ||
+       *transition.recovery_deadline_unix_ms == 0 ||
+       *transition.recovery_deadline_unix_ms >
+           static_cast<std::uint64_t>(
+               std::numeric_limits<std::int64_t>::max()))) {
+    return ProtocolError("recovery deadline is invalid");
+  }
   if (transition.candidate_action.has_value()) {
     const WireFailoverCandidateAction& action = *transition.candidate_action;
     if (IsZeroId(action.action_id) ||
@@ -2449,6 +2536,9 @@ absl::Status WriteFailoverTransition(Writer& writer,
           static_cast<std::uint8_t>(action.authorization->loss_if_cutover));
     }
   }
+  writer.Bool(transition.recovery_deadline_unix_ms.has_value());
+  if (transition.recovery_deadline_unix_ms.has_value())
+    writer.U64(*transition.recovery_deadline_unix_ms);
   return absl::OkStatus();
 }
 
@@ -2519,6 +2609,13 @@ absl::StatusOr<WireFailoverTransition> ReadFailoverTransition(
       action.authorization = authorization;
     }
     transition.candidate_action = std::move(action);
+  }
+  auto has_deadline = reader.Bool();
+  if (!has_deadline.ok()) return has_deadline.status();
+  if (*has_deadline) {
+    auto deadline = reader.U64();
+    if (!deadline.ok()) return deadline.status();
+    transition.recovery_deadline_unix_ms = *deadline;
   }
   if (absl::Status status = ValidateFailoverTransition(transition, group);
       !status.ok()) {

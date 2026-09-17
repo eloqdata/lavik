@@ -47,6 +47,11 @@ inline constexpr std::string_view kAutomaticUncontrolledFailoverPolicyId =
     "lavik.automatic-uncontrolled-failover-v1";
 inline constexpr std::string_view kAuthorityLeasePolicyId =
     "lavik.authority-lease-v1";
+inline constexpr std::string_view kCandidateRecoveryPolicyId =
+    "lavik.candidate-recovery-v1";
+
+inline constexpr std::uint64_t kDefaultCandidateRecoveryBudgetMs = 2'000;
+inline constexpr std::uint64_t kMaximumCandidateRecoveryBudgetMs = 86'400'000;
 
 inline constexpr std::uint64_t kMinimumAutomaticFailoverSuspectAfterMs = 1'000;
 inline constexpr std::uint64_t kMaximumAutomaticFailoverSuspectAfterMs =
@@ -70,13 +75,23 @@ struct MetaAuthorityLeasePolicy {
   bool operator==(const MetaAuthorityLeasePolicy&) const = default;
 };
 
-// Strict decoders for the two registered raw formats. They accept field
+// This budget governs optional collection before Uncontrolled preparation,
+// including manual failover. Zero leaves retention and partial reparent on.
+struct MetaCandidateRecoveryPolicy {
+  std::uint64_t version_ = 0;
+  std::uint64_t budget_ms_ = kDefaultCandidateRecoveryBudgetMs;
+  bool operator==(const MetaCandidateRecoveryPolicy&) const = default;
+};
+
+// Strict decoders for the registered raw formats. They accept field
 // reordering but reject whitespace, missing/duplicate/unknown fields, escaped
 // names and values, non-integer numbers, overflow, and values outside the
 // documented range. The returned version is zero until installed in a store.
 absl::StatusOr<MetaAutomaticUncontrolledFailoverPolicy>
 DecodeAutomaticUncontrolledFailoverPolicy(std::string_view raw);
 absl::StatusOr<MetaAuthorityLeasePolicy> DecodeAuthorityLeasePolicy(
+    std::string_view raw);
+absl::StatusOr<MetaCandidateRecoveryPolicy> DecodeCandidateRecoveryPolicy(
     std::string_view raw);
 
 struct MetaPolicyVersionView {
@@ -107,6 +122,7 @@ class MetaPolicyStore {
   std::optional<MetaAutomaticUncontrolledFailoverPolicy>
   CurrentAutomaticUncontrolledFailover() const;
   std::optional<MetaAuthorityLeasePolicy> CurrentAuthorityLease() const;
+  std::optional<MetaCandidateRecoveryPolicy> CurrentCandidateRecovery() const;
 
   // Aggregate retained raw bytes and number of installed registered families.
   std::uint64_t TotalContentBytes() const { return total_content_bytes_; }

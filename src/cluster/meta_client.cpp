@@ -361,6 +361,8 @@ class ReplicationNodeControlActions final : public NodeControlActions {
   bycorf::Task<absl::Status> ReconcileClusterControl(
       std::optional<DesiredClusterControl> desired) override {
     if (!desired.has_value()) {
+      absl::Status recovery_status =
+          co_await replication_.ReconcileClusterRecovery(std::nullopt);
       absl::Status result =
           co_await replication_.ReconcileClusterFailoverAction(std::nullopt,
                                                                std::nullopt);
@@ -370,6 +372,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
       absl::Status follow_status =
           co_await replication_.ReconcileClusterFollowOwner(std::nullopt);
       if (result.ok()) result = std::move(follow_status);
+      if (result.ok()) result = std::move(recovery_status);
       co_return result;
     }
     const ReplicationIdentity local_identity =
@@ -377,9 +380,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
     auto translated = detail::TranslateClusterFailoverControl(
         *desired, local_identity, use_tls_);
     if (!translated.ok()) co_return translated.status();
-    absl::Status result = co_await replication_.ReconcileClusterFailoverAction(
-        std::move(translated->candidate_action_),
-        translated->pending_activation_action_id_);
+    absl::Status result = absl::OkStatus();
     // Always attempt every applicable level-triggered intent so replacement
     // or removal cannot strand cleanup behind another subsystem's failure.
     // Returning the first failure keeps FullStateApplied fail closed.
@@ -393,6 +394,15 @@ class ReplicationNodeControlActions final : public NodeControlActions {
               std::move(translated->follow_owner_));
       if (result.ok()) result = std::move(follow_status);
     }
+    absl::Status recovery_status =
+        co_await replication_.ReconcileClusterRecovery(
+            std::move(translated->recovery_));
+    if (result.ok()) result = std::move(recovery_status);
+    absl::Status action_status =
+        co_await replication_.ReconcileClusterFailoverAction(
+            std::move(translated->candidate_action_),
+            translated->pending_activation_action_id_);
+    if (result.ok()) result = std::move(action_status);
     co_return result;
   }
 
@@ -626,49 +636,76 @@ detail::TranslateClusterFailoverControl(
   }
   const PreparedFailoverTransition& transition = *desired.failover_transition_;
   const PreparedFailoverAction& action = *transition.candidate_action_;
-  if (action.candidate_.node_id_.ToHexString() ==
-          local_identity.local_node_id_ &&
-      action.candidate_.boot_id_.ToHexString() == local_identity.boot_id_) {
-    translated.candidate_action_ = DesiredClusterFailoverAction{
-        .transition_id_ = transition.transition_id_.bytes(),
-        .action_id_ = action.action_id_.bytes(),
-        .transition_revision_ = transition.revision_,
-        .mode_ = transition.mode_ == PreparedFailoverMode::kControlled
-                     ? ClusterFailoverMode::kControlled
-                     : ClusterFailoverMode::kUncontrolled,
-        .target_term_ = transition.target_term_,
-        .committed_group_term_ = desired.identity_.group_term_,
-        .committed_grant_active_ = desired.grant_active_,
-        .authorized_revision_ =
-            action.authorization_.has_value()
-                ? std::optional<std::uint64_t>(
-                      action.authorization_->authorized_revision_)
-                : std::nullopt,
-        .group_id_ = desired.identity_.group_id_,
-        .candidate_node_id_ = action.candidate_.node_id_.ToHexString(),
-        .candidate_assignment_id_ =
-            action.candidate_.assignment_id_.ToHexString(),
-        .candidate_boot_id_ = action.candidate_.boot_id_.ToHexString(),
-        .domain_ =
-            {
-                .source_group_term_ = action.domain_.source_group_term_,
-                .source_node_id_ = action.domain_.source_node_id_.ToHexString(),
-                .source_assignment_id_ =
-                    action.domain_.source_assignment_id_.ToHexString(),
-                .source_boot_id_ = action.domain_.source_boot_id_.ToHexString(),
-                .source_history_id_ =
-                    action.domain_.source_history_id_.ToHexString(),
-                .flow_count_ = action.domain_.flow_count_,
-            },
-        .manifest_revision_ = desired.identity_.manifest_revision_,
-        .manifest_id_ =
-            PopulationManifestId{desired.identity_.manifest_digest_},
-        .partition_replication_epoch_ =
-            desired.identity_.partition_replication_epoch_,
-        .operator_recovery_ = action.operator_recovery_,
-        .manifest_entries_ = desired.manifest_entries_,
-    };
-    if (action.operator_recovery_) translated.candidate_action_->domain_ = {};
+  DesiredClusterFailoverAction candidate_action{
+      .transition_id_ = transition.transition_id_.bytes(),
+      .action_id_ = action.action_id_.bytes(),
+      .transition_revision_ = transition.revision_,
+      .mode_ = transition.mode_ == PreparedFailoverMode::kControlled
+                   ? ClusterFailoverMode::kControlled
+                   : ClusterFailoverMode::kUncontrolled,
+      .target_term_ = transition.target_term_,
+      .committed_group_term_ = desired.identity_.group_term_,
+      .committed_grant_active_ = desired.grant_active_,
+      .authorized_revision_ =
+          action.authorization_.has_value()
+              ? std::optional<std::uint64_t>(
+                    action.authorization_->authorized_revision_)
+              : std::nullopt,
+      .group_id_ = desired.identity_.group_id_,
+      .candidate_node_id_ = action.candidate_.node_id_.ToHexString(),
+      .candidate_assignment_id_ =
+          action.candidate_.assignment_id_.ToHexString(),
+      .candidate_boot_id_ = action.candidate_.boot_id_.ToHexString(),
+      .domain_ =
+          {
+              .source_group_term_ = action.domain_.source_group_term_,
+              .source_node_id_ = action.domain_.source_node_id_.ToHexString(),
+              .source_assignment_id_ =
+                  action.domain_.source_assignment_id_.ToHexString(),
+              .source_boot_id_ = action.domain_.source_boot_id_.ToHexString(),
+              .source_history_id_ =
+                  action.domain_.source_history_id_.ToHexString(),
+              .flow_count_ = action.domain_.flow_count_,
+          },
+      .manifest_revision_ = desired.identity_.manifest_revision_,
+      .manifest_id_ = PopulationManifestId{desired.identity_.manifest_digest_},
+      .partition_replication_epoch_ =
+          desired.identity_.partition_replication_epoch_,
+      .operator_recovery_ = action.operator_recovery_,
+      .manifest_entries_ = desired.manifest_entries_,
+      .recovery_deadline_unix_ms_ = transition.recovery_deadline_unix_ms_,
+  };
+  if (action.operator_recovery_) candidate_action.domain_ = {};
+  if (candidate_action.candidate_node_id_ == local_identity.local_node_id_ &&
+      candidate_action.candidate_boot_id_ == local_identity.boot_id_) {
+    translated.candidate_action_ = candidate_action;
+  }
+  if (transition.mode_ == PreparedFailoverMode::kUncontrolled &&
+      transition.recovery_deadline_unix_ms_.has_value() &&
+      !action.authorization_.has_value() && !action.operator_recovery_) {
+    DesiredClusterRecovery recovery;
+    recovery.action_ = candidate_action;
+    recovery.local_node_id_ = local_identity.local_node_id_;
+    recovery.local_boot_id_ = local_identity.boot_id_;
+    for (const auto& member : desired.identity_.members_) {
+      ClusterRecoveryPeer peer;
+      peer.member_ = {member.node_id_.ToHexString(),
+                      member.assignment_id_.ToHexString()};
+      if (peer.member_.node_id_ == local_identity.local_node_id_)
+        recovery.local_assignment_id_ = peer.member_.assignment_id_;
+      const auto endpoint =
+          std::ranges::find(desired.member_endpoints_, member.node_id_,
+                            &PreparedReplicationEndpoint::node_id_);
+      if (endpoint != desired.member_endpoints_.end()) {
+        peer.endpoint_ = {endpoint->host_,
+                          use_tls ? endpoint->tls_port_ : endpoint->port_};
+      }
+      recovery.members_.push_back(std::move(peer));
+    }
+    if (recovery.local_assignment_id_.empty())
+      return absl::FailedPreconditionError(
+          "recovery recipient is not a current Group member");
+    translated.recovery_ = std::move(recovery);
   }
 
   const std::optional<PreparedMemberAssignment>& owner = desired.owner_;
@@ -721,7 +758,8 @@ absl::StatusOr<std::optional<control::FailoverObservation>>
 detail::ProjectClusterFailoverObservation(
     const ClusterFailoverActionStatus& status) {
   if (status.state_ != ClusterFailoverActionState::kPrepared &&
-      status.state_ != ClusterFailoverActionState::kFailed) {
+      status.state_ != ClusterFailoverActionState::kFailed &&
+      status.state_ != ClusterFailoverActionState::kRecoveryComplete) {
     return std::optional<control::FailoverObservation>{};
   }
   if (!status.action_.has_value()) {
@@ -739,6 +777,31 @@ detail::ProjectClusterFailoverObservation(
         "terminal failover action has a non-canonical candidate identity");
   }
 
+  if (status.state_ == ClusterFailoverActionState::kRecoveryComplete) {
+    if (action.mode_ != ClusterFailoverMode::kUncontrolled ||
+        !action.recovery_deadline_unix_ms_.has_value() ||
+        !status.recovery_.has_value() ||
+        status.recovery_->applied_next_lsns_.size() !=
+            action.domain_.flow_count_ ||
+        std::ranges::any_of(status.recovery_->applied_next_lsns_,
+                            [](std::uint64_t lsn) { return lsn == 0; }) ||
+        !control::IsRecoveryCompletionReason(
+            status.recovery_->completion_reason_)) {
+      return absl::FailedPreconditionError(
+          "recovery completion lacks a complete drained cut");
+    }
+    return std::optional<control::FailoverObservation>(
+        control::CandidateRecoveryComplete{
+            .transition_id = action.transition_id_,
+            .action_id = action.action_id_,
+            .candidate_node_id = candidate_node->ToHexString(),
+            .candidate_assignment_id = candidate_assignment->bytes(),
+            .candidate_boot_id = candidate_boot->ToHexString(),
+            .recovery_deadline_unix_ms = *action.recovery_deadline_unix_ms_,
+            .applied_next_lsns = status.recovery_->applied_next_lsns_,
+            .completion_reason = status.recovery_->completion_reason_,
+        });
+  }
   if (status.state_ == ClusterFailoverActionState::kFailed) {
     return std::optional<control::FailoverObservation>(control::ActionFailed{
         .transition_id = action.transition_id_,

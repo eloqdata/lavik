@@ -283,6 +283,24 @@ struct MetaCandidatePreparedObs {
   bool operator==(const MetaCandidatePreparedObs&) const = default;
 };
 
+// Session-bound terminal recovery evidence. This does not authorize prepare;
+// the planner also requires matching current CandidateProgress and FDS proof.
+struct MetaCandidateRecoveryCompleteObs {
+  std::uint64_t session_generation_ = 0;
+  std::string group_id_;
+  MetaFailoverTransitionId transition_id_{};
+  MetaFailoverActionId action_id_{};
+  std::string candidate_node_id_;
+  MetaAssignmentId candidate_assignment_id_{};
+  MetaBootIncarnation candidate_boot_id_{};
+  std::uint64_t recovery_deadline_unix_ms_ = 0;
+  std::vector<std::uint64_t> applied_next_lsns_;
+  std::string completion_reason_;
+  std::int64_t received_unix_ms_ = 0;
+  std::int64_t expires_unix_ms_ = 0;
+  bool operator==(const MetaCandidateRecoveryCompleteObs&) const = default;
+};
+
 struct MetaActionFailedObs {
   std::string group_id_;
   MetaFailoverTransitionId transition_id_{};
@@ -302,7 +320,7 @@ struct MetaActionFailedObs {
 
 using MetaFailoverObservationPayload =
     std::variant<MetaSourcePausedObs, MetaCandidatePreparedObs,
-                 MetaActionFailedObs>;
+                 MetaActionFailedObs, MetaCandidateRecoveryCompleteObs>;
 
 struct MetaFailoverObservationObs {
   MetaFailoverObservationPayload payload_;
@@ -581,6 +599,10 @@ class MetaObservationStore {
       const MetaFailoverTransitionId& transition_id,
       const MetaCommittedFacts& facts, int64_t now_unix_ms) const;
   std::optional<MetaCandidatePreparedObs> CandidatePreparedFor(
+      const MetaFailoverTransitionId& transition_id,
+      const MetaFailoverActionId& action_id, const MetaCommittedFacts& facts,
+      int64_t now_unix_ms) const;
+  std::optional<MetaCandidateRecoveryCompleteObs> CandidateRecoveryCompleteFor(
       const MetaFailoverTransitionId& transition_id,
       const MetaFailoverActionId& action_id, const MetaCommittedFacts& facts,
       int64_t now_unix_ms) const;

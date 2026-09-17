@@ -92,6 +92,12 @@ struct ProposalFixture {
     automatic.content_ =
         R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})";
     EXPECT_TRUE(stores.policy_.Apply(automatic).ok());
+    PutPolicy recovery;
+    recovery.request_id_ = Bytes<16>(0x0e);
+    recovery.policy_id_ = std::string(kCandidateRecoveryPolicyId);
+    recovery.version_ = 1;
+    recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+    EXPECT_TRUE(stores.policy_.Apply(recovery).ok());
     EXPECT_TRUE(stores.topology_.CompleteClusterCreate(root).ok());
     Register(owner, MetaNodeRole::kPrimary, 6379, 0x02);
     Register(candidate, MetaNodeRole::kReplica, 6380, 0x03);
@@ -349,6 +355,30 @@ struct ProposalFixture {
         .source_group_term_ = domain.source_group_term_,
         .stable_next_lsns_ = std::move(stable)};
     ReportOwner(now, MetaFailoverObservationObs{.payload_ = paused});
+  }
+
+  void CompleteRecovery(std::int64_t now) {
+    auto transition = Transition();
+    const auto action = *transition.candidate_action_;
+    StartCandidateRecovery start;
+    start.request_id_ = Bytes<16>(0xe0);
+    start.group_id_ = "g1";
+    start.expected_transition_ = {transition.transition_id_,
+                                  transition.revision_};
+    start.action_id_ = action.action_id_;
+    start.recovery_deadline_unix_ms_ = 3000;
+    Apply(start);
+    MetaCandidateRecoveryCompleteObs complete{
+        .group_id_ = "g1",
+        .transition_id_ = transition.transition_id_,
+        .action_id_ = action.action_id_,
+        .candidate_node_id_ = action.candidate_.node_id_,
+        .candidate_assignment_id_ = action.candidate_.assignment_id_,
+        .candidate_boot_id_ = action.candidate_.boot_id_,
+        .recovery_deadline_unix_ms_ = 3000,
+        .applied_next_lsns_ = {10, 20},
+        .completion_reason_ = "coverage-unavailable"};
+    ReportCandidate(now, MetaFailoverObservationObs{complete});
   }
 
   void ReportPrepared(std::int64_t now, std::uint64_t generation = 1) {
@@ -627,7 +657,7 @@ TEST(MetaFailoverValidationTest,
   ASSERT_NE(std::get_if<SetUncontrolledCandidate>(&**planned), nullptr);
   fixture.Apply(**planned);
 
-  fixture.ReportCandidate(1'020);
+  fixture.CompleteRecovery(1'020);
   planned = fixture.Plan(1'021);
   ASSERT_TRUE(planned.ok()) << planned.status();
   ASSERT_TRUE(planned->has_value());
@@ -918,7 +948,7 @@ TEST(MetaFailoverValidationTest,
   ASSERT_NE(std::get_if<SetUncontrolledCandidate>(&**planned), nullptr);
   fixture.Apply(**planned);
 
-  fixture.ReportCandidate(1'020);
+  fixture.CompleteRecovery(1'020);
   planned = fixture.Plan(1'021);
   ASSERT_TRUE(planned.ok()) << planned.status();
   ASSERT_TRUE(planned->has_value());

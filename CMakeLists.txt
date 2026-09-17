@@ -464,6 +464,10 @@ add_library(lavik_module
   src/replication/command.cpp
   src/replication/replica_applied_frontier.cpp
   src/replication/replication_group.cpp
+  src/replication/replication_history.cpp
+  src/replication/native_replay.cpp
+  src/replication/native_recovery.cpp
+  src/replication/native_reparent.cpp
   src/replication/replication.cpp
   src/redis/resp.cpp
   src/redis/rdb.cpp
@@ -1354,6 +1358,9 @@ if (BUILD_TESTING)
     tests/request_gate_test.cpp
     tests/replication_command_test.cpp
     tests/replication_group_test.cpp
+    tests/replication_history_test.cpp
+    tests/native_replay_test.cpp
+    tests/native_reparent_test.cpp
     tests/replica_applied_frontier_test.cpp
     tests/ring_buffer_test.cpp
     tests/tx_lock_test.cpp

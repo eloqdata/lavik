@@ -245,6 +245,7 @@ enum class MetaCommandTag : std::uint16_t {
   kDegradeControlledFailover = 35,
   kCommitControlledFailover = 36,
   kCommitUncontrolledFailover = 37,
+  kStartCandidateRecovery = 38,
 };
 
 // ---------------------------------------------------------------------------
@@ -486,6 +487,10 @@ struct MetaFailoverTransition {
   std::uint64_t target_term_ = 0;
   std::optional<MetaFailoverCandidateAction> candidate_action_;
   std::optional<MetaControlledFailover> controlled_;
+  // The optional gathering cutoff belongs to the transition, so replacing
+  // its Candidate cannot replenish the allowance. No policy snapshot or
+  // per-donor progress is retained here.
+  std::optional<std::uint64_t> recovery_deadline_unix_ms_;
   bool operator==(const MetaFailoverTransition&) const = default;
 };
 
@@ -607,6 +612,19 @@ struct SetUncontrolledCandidate {
   // authorization can only be installed by AuthorizeFailoverPrepare.
   std::optional<MetaFailoverCandidateAction> candidate_action_;
   bool operator==(const SetUncontrolledCandidate&) const = default;
+};
+
+// First admission to pre-promotion collection after old write authority is
+// excluded. The proposer chooses the absolute cutoff; deterministic apply
+// never reads a clock. Subsequent Candidate actions inherit that cutoff.
+struct StartCandidateRecovery {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  std::string group_id_;
+  MetaFailoverTransitionRef expected_transition_;
+  MetaFailoverActionId action_id_{};
+  std::uint64_t recovery_deadline_unix_ms_ = 0;
+  bool operator==(const StartCandidateRecovery&) const = default;
 };
 
 struct AuthorizeFailoverPrepare {
@@ -965,7 +983,7 @@ using MetaCommand = std::variant<
     BeginControlledFailover, BeginUncontrolledFailover,
     SetUncontrolledCandidate, AuthorizeFailoverPrepare, AbortControlledFailover,
     DegradeControlledFailover, CommitControlledFailover,
-    CommitUncontrolledFailover>;
+    CommitUncontrolledFailover, StartCandidateRecovery>;
 
 // Returns the append-only wire tag for a command alternative. The variant is
 // kept in tag order, while removed tag values remain permanent holes; callers

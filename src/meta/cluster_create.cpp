@@ -127,6 +127,10 @@ absl::Status ValidateAndNormalize(ClusterCreateManifestV1* manifest) {
           kMaximumAuthorityLeaseDurationMs) {
     return Invalid("authority_lease_duration_ms is out of range");
   }
+  if (manifest->candidate_recovery_budget_ms_ >
+      kMaximumCandidateRecoveryBudgetMs) {
+    return Invalid("candidate_recovery_budget_ms is out of range");
+  }
 
   std::sort(manifest->meta_members_.begin(), manifest->meta_members_.end(),
             [](const auto& left, const auto& right) {
@@ -589,6 +593,10 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
           auto value = ParseUnsigned<std::uint64_t>(item);
           if (!value.ok()) return value.status();
           result.automatic_uncontrolled_failover_suspect_after_ms_ = *value;
+        } else if (item.name == "candidate_recovery_budget_ms") {
+          auto value = ParseUnsigned<std::uint64_t>(item);
+          if (!value.ok()) return value.status();
+          result.candidate_recovery_budget_ms_ = *value;
         } else if (item.name == "authority_lease_duration_ms") {
           auto value = ParseUnsigned<std::uint64_t>(item);
           if (!value.ok()) return value.status();
@@ -711,6 +719,8 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
   writer.U32(static_cast<std::uint32_t>(
       manifest.automatic_uncontrolled_failover_suspect_after_ms_));
   writer.U32(static_cast<std::uint32_t>(manifest.authority_lease_duration_ms_));
+  writer.U32(
+      static_cast<std::uint32_t>(manifest.candidate_recovery_budget_ms_));
   writer.U32(static_cast<std::uint32_t>(manifest.meta_members_.size()));
   for (const auto& member : manifest.meta_members_) {
     writer.U32(member.server_id_);
@@ -790,12 +800,15 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
   manifest.schema_version_ = 1;
   auto suspect_after_ms = reader.U32();
   auto authority_lease_duration_ms = reader.U32();
-  if (!suspect_after_ms.ok() || !authority_lease_duration_ms.ok()) {
+  auto candidate_recovery_budget_ms = reader.U32();
+  if (!suspect_after_ms.ok() || !authority_lease_duration_ms.ok() ||
+      !candidate_recovery_budget_ms.ok()) {
     return Invalid("invalid bootstrap Policy defaults");
   }
   manifest.automatic_uncontrolled_failover_suspect_after_ms_ =
       *suspect_after_ms;
   manifest.authority_lease_duration_ms_ = *authority_lease_duration_ms;
+  manifest.candidate_recovery_budget_ms_ = *candidate_recovery_budget_ms;
   auto meta_count = reader.U32();
   if (!meta_count.ok() || *meta_count == 0 || *meta_count > kMaxManifestItems) {
     return Invalid("invalid Meta member count");

@@ -42,6 +42,7 @@
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/replication_command.h"
+#include "lavik/replication_history.h"
 #include "lavik/resp.h"
 #include "lavik/storage/engine.h"
 #include "lavik/storage/format.h"
@@ -228,6 +229,34 @@ class ReplicationLogService final : public bycorf::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
+  bycorf::Task<absl::Status> ExerciseSharedHistoryQuota() {
+    auto history = std::make_shared<lavik::ReplicationHistory>(8 * kMiB);
+    auto reset = history->Reset("parent", 2);
+    if (!reset.ok()) co_return reset;
+    storage_->SetReplicationHistory(history);
+    auto enabled = co_await storage_->EnableReplicationLog(900, 8 * kMiB);
+    if (!enabled.ok()) co_return enabled;
+    Check(history->TryRetain("parent", {{0, 10, "payload"}, {1, 20, "marker"}}),
+          "secondary effect was not admitted before child publication");
+    auto appended = co_await storage_->AppendReplicationLog(
+        ReplicationLogAppend{.partition_id_ = 3,
+                             .partition_sequence_ = 1,
+                             .payload_ = "child",
+                             .payload_source_ = nullptr});
+    if (!appended.ok()) co_return appended.status();
+    Check(
+        history->primary_bytes() == 8 * kMiB && history->secondary_bytes() == 0,
+        "published child block did not reclaim the shared secondary quota");
+    Check(!history->TryRetain("parent", {{0, 11, "tail"}}),
+          "secondary retention overspent quota held by a child block");
+    auto disabled = co_await storage_->DisableReplicationLog();
+    if (!disabled.ok()) co_return disabled;
+    Check(history->primary_bytes() == 0,
+          "retired child block leaked its history charge");
+    storage_->SetReplicationHistory(nullptr);
+    co_return absl::OkStatus();
+  }
+
   bycorf::Task<absl::Status> ExerciseMutationPrecondition() {
     auto rejected_probe = std::make_shared<MutationPreconditionProbe>();
     const lavik::storage::MutationPrecondition rejected_precondition(
@@ -2661,7 +2690,9 @@ class ReplicationLogService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> Exercise() {
-    absl::Status status = co_await ExerciseMutationPrecondition();
+    absl::Status status = co_await ExerciseSharedHistoryQuota();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseMutationPrecondition();
     if (!status.ok()) co_return status;
 
     status = co_await ExerciseAdmissionAndOrdering();

@@ -1000,6 +1000,50 @@ TEST(MetaFailoverControlAdapterTest,
 }
 
 TEST(MetaFailoverControlAdapterTest,
+     RecoveryDirectoryUsesCurrentFdsMembersAndTransport) {
+  const auto candidate = *NodeId::Parse(std::string(40, '1'));
+  const auto donor = *NodeId::Parse(std::string(40, '2'));
+  const auto boot = *NodeId::Parse(std::string(40, '3'));
+  control::WireId128 id{};
+  id[0] = 1;
+  const auto assignment = AssignmentId::FromBytes(id);
+  DesiredClusterControl desired;
+  desired.identity_.group_id_ = "g";
+  desired.identity_.group_term_ = 2;
+  desired.identity_.members_ = {{candidate, assignment}, {donor, assignment}};
+  desired.member_endpoints_ = {{candidate, "127.0.0.1", 6001, 7001},
+                               {donor, "127.0.0.2", 6002, 7002}};
+  PreparedFailoverTransition transition;
+  transition.transition_id_ = FailoverTransitionId::FromBytes(id);
+  transition.revision_ = 4;
+  transition.mode_ = PreparedFailoverMode::kUncontrolled;
+  transition.target_term_ = 2;
+  PreparedFailoverAction action;
+  action.action_id_ = FailoverActionId::FromBytes(id);
+  action.candidate_ = {candidate, assignment, boot};
+  action.domain_ = {1, donor, assignment, boot, boot, 2};
+  transition.candidate_action_ = action;
+  transition.recovery_deadline_unix_ms_ = 3000;
+  desired.failover_transition_ = transition;
+  ReplicationIdentity local{.local_node_id_ = donor.ToHexString(),
+                            .boot_id_ = boot.ToHexString()};
+  auto translated =
+      detail::TranslateClusterFailoverControl(desired, local, true);
+  ASSERT_TRUE(translated.ok()) << translated.status();
+  ASSERT_TRUE(translated->recovery_.has_value());
+  EXPECT_FALSE(translated->candidate_action_.has_value());
+  EXPECT_EQ(translated->recovery_->local_node_id_, donor.ToHexString());
+  ASSERT_EQ(translated->recovery_->members_.size(), 2);
+  EXPECT_EQ(translated->recovery_->members_[1].endpoint_.port_, 7002);
+  EXPECT_EQ(translated->recovery_->action_.recovery_deadline_unix_ms_, 3000);
+  desired.failover_transition_->candidate_action_->authorization_ =
+      PreparedFailoverAuthorization{5, PreparedFailoverLoss::kUnknown};
+  translated = detail::TranslateClusterFailoverControl(desired, local, true);
+  ASSERT_TRUE(translated.ok());
+  EXPECT_FALSE(translated->recovery_.has_value());
+}
+
+TEST(MetaFailoverControlAdapterTest,
      ReconcilesSteadyOwnerOnlyAfterTransitionFinishes) {
   constexpr char kOwner[] = "1111111111111111111111111111111111111111";
   constexpr char kReplica[] = "2222222222222222222222222222222222222222";

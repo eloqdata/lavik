@@ -920,9 +920,12 @@ int main(int argc, char** argv) {
   // evidence remain immediate; an exact source disconnect uses its independent
   // recovery grace.
   failover_options.observation_grace_ms_ = leader_observation_grace_ms;
+  failover_options.authority_exclusion_ms_ =
+      2 * static_cast<std::uint64_t>(options.election_ms_low_);
   auto failover_reconciler =
       std::make_shared<lavik::meta::MetaFailoverReconciler>(
           foreign_executor, std::move(failover_options));
+  coordinator->AddValidateHook(failover_reconciler->validation_hook());
 
   if (exit_code == 0) {
     MetaDataControlServerOptions control_options;

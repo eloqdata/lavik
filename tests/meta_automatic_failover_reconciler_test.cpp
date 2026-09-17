@@ -360,6 +360,13 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     lease.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
     ProposeAccepted(lease);
 
+    PutPolicy recovery;
+    recovery.request_id_ = Bytes<16>(0x0e);
+    recovery.policy_id_ = std::string(kCandidateRecoveryPolicyId);
+    recovery.version_ = 1;
+    recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+    ProposeAccepted(recovery);
+
     BeginGroupTerm term;
     term.request_id_ = Bytes<16>(0x09);
     term.group_id_ = "g1";
@@ -376,7 +383,7 @@ class MetaAutomaticFailoverReconcilerTest : public ::testing::Test {
     ProposeAccepted(activate);
 
     // Created is a durable aggregate invariant, not permission to provision
-    // the remaining state afterward. Complete only after both required
+    // the remaining state afterward. Complete only after all required
     // Policies and the current Owner authority are present so every prefix of
     // this fixture can survive snapshot round-trip validation.
     CompleteOperation complete;

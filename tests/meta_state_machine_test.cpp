@@ -412,8 +412,9 @@ TEST_F(MetaStateMachineTest, RestartWithoutSnapshotReplaysFromScratch) {
   EXPECT_EQ(machine->last_commit_index(), 2u);
 }
 
-TEST_F(MetaStateMachineTest,
-       ClusterCreateCompletionWithoutBothPoliciesRejectsOnLiveAndWalReplay) {
+TEST_F(
+    MetaStateMachineTest,
+    ClusterCreateCompletionWithoutRequiredPoliciesRejectsOnLiveAndWalReplay) {
   lavik::meta::ClusterCreateManifestV1 manifest;
   manifest.schema_version_ = 1;
   manifest.meta_members_ = {{1, "tcp://127.0.0.1:7101", "tcp://127.0.0.1:7301",
@@ -471,7 +472,7 @@ TEST_F(MetaStateMachineTest,
     const auto audit = stores.audit_.Find(3);
     ASSERT_TRUE(audit.has_value());
     EXPECT_EQ(audit->verdict_, MetaAuditVerdict::kRejected);
-    EXPECT_NE(audit->verdict_detail_.find("both current global Policies"),
+    EXPECT_NE(audit->verdict_detail_.find("all current global Policies"),
               std::string::npos);
     EXPECT_EQ(machine.last_commit_index(), 3u);
   };
@@ -571,21 +572,29 @@ TEST_F(MetaStateMachineTest,
   policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
   Commit(*machine, 3, policy);
 
+  lavik::meta::PutPolicy recovery;
+  recovery.request_id_ = MakeRequestId(0x0b);
+  recovery.actor_ = root.actor_;
+  recovery.policy_id_ = std::string(lavik::meta::kCandidateRecoveryPolicyId);
+  recovery.version_ = 1;
+  recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+  Commit(*machine, 4, recovery);
+
   lavik::meta::CompleteOperation complete;
   complete.request_id_ = MakeRequestId(0x03);
   complete.actor_ = root.actor_;
   complete.operation_id_ = root.operation_id_;
   complete.expected_revision_ = 0;
   complete.result_ = "cluster-created";
-  Commit(*machine, 4, complete);
+  Commit(*machine, 5, complete);
 
   RegisterNode node = MakeRegister(0x11);
   node.role_ = lavik::meta::MetaNodeRole::kPrimary;
-  Commit(*machine, 5, node);
+  Commit(*machine, 6, node);
 
   CreateGroup group = MakeCreateGroup(group_id, 1);
   group.actor_ = root.actor_;
-  Commit(*machine, 6, group);
+  Commit(*machine, 7, group);
 
   lavik::meta::AssignNodeToGroup assign;
   assign.request_id_ = MakeRequestId(0x05);
@@ -596,7 +605,7 @@ TEST_F(MetaStateMachineTest,
   assign.role_ = lavik::meta::MetaNodeRole::kPrimary;
   assign.expected_revision_ = 1;
   assign.new_topology_epoch_ = 2;
-  Commit(*machine, 7, assign);
+  Commit(*machine, 8, assign);
 
   lavik::meta::BeginGroupTerm begin_term;
   begin_term.request_id_ = MakeRequestId(0x07);
@@ -604,7 +613,7 @@ TEST_F(MetaStateMachineTest,
   begin_term.group_id_ = group_id;
   begin_term.expected_term_ = 0;
   begin_term.new_term_ = 1;
-  Commit(*machine, 8, begin_term);
+  Commit(*machine, 9, begin_term);
 
   lavik::meta::ActivateAuthority activate;
   activate.request_id_ = MakeRequestId(0x08);
@@ -613,7 +622,7 @@ TEST_F(MetaStateMachineTest,
   activate.expected_term_ = 1;
   activate.new_owner_ = owner;
   activate.new_topology_epoch_ = 3;
-  Commit(*machine, 9, activate);
+  Commit(*machine, 10, activate);
 
   lavik::meta::BeginUncontrolledFailover begin;
   begin.request_id_ = MakeRequestId(0x09);
@@ -628,7 +637,7 @@ TEST_F(MetaStateMachineTest,
   begin.expected_population_manifest_revision_ = 0;
   begin.expected_population_manifest_digest_.fill(0);
   begin.expected_partition_replication_epoch_ = 0;
-  Commit(*machine, 10, begin);
+  Commit(*machine, 11, begin);
 
   const MetaStores committed = machine->StoresSnapshot();
   ASSERT_EQ(committed.topology_.ClusterLifecycle().state_,
@@ -639,7 +648,7 @@ TEST_F(MetaStateMachineTest,
   const lavik::meta::MetaFailoverTransition committed_transition =
       *committed_group->failover_transition_;
   EXPECT_EQ(committed_transition.transition_id_, begin.transition_id_);
-  EXPECT_EQ(committed_transition.revision_, 10u);
+  EXPECT_EQ(committed_transition.revision_, 11u);
   EXPECT_EQ(committed_transition.target_term_, 2u);
   EXPECT_FALSE(committed_transition.candidate_action_.has_value());
 
@@ -648,13 +657,13 @@ TEST_F(MetaStateMachineTest,
   EXPECT_EQ(committed_grant->group_term_, 2u);
   EXPECT_FALSE(committed_grant->grant_.has_value());
 
-  CreateSnapshot(*machine, /*log_idx=*/10, /*log_term=*/4);
+  CreateSnapshot(*machine, /*log_idx=*/11, /*log_term=*/4);
   machine.reset();
 
   auto reopened = Open();
   ASSERT_TRUE(reopened.ok()) << reopened.status();
   machine = std::move(*reopened);
-  EXPECT_EQ(machine->last_commit_index(), 10u);
+  EXPECT_EQ(machine->last_commit_index(), 11u);
 
   const MetaStores restored = machine->StoresSnapshot();
   const auto restored_group = restored.topology_.FindGroup(group_id);
@@ -670,15 +679,15 @@ TEST_F(MetaStateMachineTest,
   // If the Raft core presents the snapshot's final entry again, exact-index
   // replay must validate the installed post-state instead of advancing the
   // term or transition revision a second time.
-  Commit(*machine, 10, begin);
+  Commit(*machine, 11, begin);
   const MetaStores replayed = machine->StoresSnapshot();
   const auto replayed_group = replayed.topology_.FindGroup(group_id);
   ASSERT_TRUE(replayed_group.has_value());
   ASSERT_TRUE(replayed_group->failover_transition_.has_value());
   EXPECT_EQ(*replayed_group->failover_transition_, committed_transition);
   EXPECT_EQ(replayed_group->record_.group_term_, 2u);
-  EXPECT_EQ(replayed.audit_.size(), 10u);
-  EXPECT_EQ(machine->last_commit_index(), 10u);
+  EXPECT_EQ(replayed.audit_.size(), 11u);
+  EXPECT_EQ(machine->last_commit_index(), 11u);
 
   lavik::meta::MetaBootIncarnation boot{};
   boot.fill(0x61);
@@ -694,11 +703,11 @@ TEST_F(MetaStateMachineTest,
   lavik::meta::SetUncontrolledCandidate select;
   select.request_id_ = MakeRequestId(0x52);
   select.group_id_ = group_id;
-  select.expected_transition_ = {begin.transition_id_, 10};
+  select.expected_transition_ = {begin.transition_id_, 11};
   select.candidate_action_ = selected_action;
 
   ScopedLogCapture logs;
-  Commit(*machine, 11, select);
+  Commit(*machine, 12, select);
   const std::string selected_log = logs.Take();
   EXPECT_NE(selected_log.find("failover event=candidate-selected"),
             std::string::npos);
@@ -710,9 +719,9 @@ TEST_F(MetaStateMachineTest,
 
   // State-dependent candidate event classification cannot be reconstructed
   // after the previous action is overwritten. Exact post-effect replay is
-  // therefore intentionally silent instead of relabelling index 11 as a
+  // therefore intentionally silent instead of relabelling index 12 as a
   // replacement.
-  Commit(*machine, 11, select);
+  Commit(*machine, 12, select);
   EXPECT_EQ(logs.Take().find("failover event="), std::string::npos);
 
   lavik::meta::MetaFailoverCandidateAction fallback_action = selected_action;
@@ -720,12 +729,12 @@ TEST_F(MetaStateMachineTest,
   fallback_action.domain_.source_history_id_.fill(0x63);
   lavik::meta::SetUncontrolledCandidate fallback = select;
   fallback.request_id_ = MakeRequestId(0x54);
-  fallback.expected_transition_.revision_ = 11;
+  fallback.expected_transition_.revision_ = 12;
   fallback.candidate_action_ = fallback_action;
-  Commit(*machine, 12, fallback);
+  Commit(*machine, 13, fallback);
   EXPECT_NE(logs.Take().find("failover event=domain-fallback"),
             std::string::npos);
-  Commit(*machine, 12, fallback);
+  Commit(*machine, 13, fallback);
   EXPECT_EQ(logs.Take().find("failover event="), std::string::npos);
 }
 

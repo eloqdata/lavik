@@ -93,6 +93,33 @@ of a complete prior replication frontier and grants no serving authority by
 itself.
 _Avoid_: Controlled Failover, automatic candidate selection
 
+**Resume Cursor**:
+A population's next unapplied logical-event position on each source flow,
+interpreted within its exact Compatibility Domain. Positions in different
+domains are not directly comparable.
+_Avoid_: Global replication offset
+
+**Secondary History**:
+The promoted Owner's retained, bounded suffix of its direct parent replication
+history, ending at the promotion frontier. It is the event history available
+to compatible replicas that have not yet adopted the child history.
+
+**HistorySwitch**:
+The explicit transition of a replica's Resume Cursor from a complete parent
+frontier to the corresponding child-history starting position, completed by
+the target's atomic adoption of the child domain and proof. Each history has
+its own flow layout.
+
+**Active Population**:
+A node's complete current population, together with the Compatibility Domain
+and progress that describe it. Its validity is independent of the progress
+of a replacement population.
+
+**Staging Population**:
+An isolated prospective replacement for the Active Population. It is not a
+source of serving or Candidate evidence before complete replacement is
+validated and activated.
+
 **Loss Assessment**:
 The terminal statement of whether a failover discarded Source data. `none`
 means the handoff is known to cover the Source's controlled pause boundary or
@@ -206,6 +233,31 @@ pins its Compatibility Domain; an Operator Recovery action instead pins the
 selected member and population scope and accepts unknown loss, without claiming
 a historical frontier. Every selection, including reselection of the same Node
 Incarnation, receives a new immutable action identity.
+
+**Candidate Recovery**:
+A bounded attempt to advance the selected Candidate using retained canonical
+events from compatible Group members before Promotion Preparation.
+
+**Recovery Donor**:
+A Group member supplying retained events from the same Compatibility Domain
+for Candidate Recovery. This role grants no Owner serving authority.
+
+**Recovery Target Frontier**:
+The complete same-domain frontier chosen as the goal of a Candidate Recovery
+attempt. It does not prove that the required events remain available or that
+any node has reached it.
+_Avoid_: Global latest frontier
+
+**Recovery Coverage**:
+The canonical-event ranges currently provable as available from compatible
+Recovery Donors or validated local buffers. Coverage may shrink without
+invalidating the Candidate's already completed Applied frontier.
+
+**Recovery Deadline**:
+The single cutoff for optional Candidate Recovery within a Failover
+Transition, fixed when recovery first starts and unchanged by Candidate,
+Recovery Donor, or Meta Leader replacement. Expiry ends optional gathering,
+not the Failover Transition or its required safety work.
 
 **Action Failure**:
 A terminal, boot-scoped statement that one Candidate Action cannot safely

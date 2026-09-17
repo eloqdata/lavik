@@ -130,6 +130,24 @@ TEST(ClusterCreateManifestTest, NormalizesMultipleGroupsAndAllocatesSlots) {
   EXPECT_EQ(manifest->authority_lease_duration_ms_, 5000u);
 }
 
+TEST(ClusterCreateManifestTest,
+     RecoveryBudgetOverrideSurvivesRequestRoundTrip) {
+  const std::string input =
+      std::string(kValidManifest) +
+      "\n[bootstrap_policy]\ncandidate_recovery_budget_ms = 0\n";
+  const auto manifest = ParseClusterCreateManifest(input);
+  ASSERT_TRUE(manifest.ok()) << manifest.status();
+  const auto encoded = EncodeClusterCreateRequest(*manifest, OperationId(1));
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  MetaOperationId root;
+  const auto decoded = DecodeClusterCreateRequest(*encoded, &root);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, *manifest);
+  const auto defaults = ParseClusterCreateManifest(kValidManifest);
+  ASSERT_TRUE(defaults.ok());
+  EXPECT_NE(*defaults, *decoded);
+}
+
 TEST(ClusterCreateManifestTest, ParsesStrictBootstrapPolicyOverrides) {
   const std::string configured = std::string(kValidManifest) +
                                  R"toml(

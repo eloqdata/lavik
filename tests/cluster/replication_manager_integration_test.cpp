@@ -32,12 +32,14 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "absl/crc/crc32c.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "bycorf/net/connection.h"
@@ -50,8 +52,10 @@
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/replication.h"
+#include "lavik/replication_command.h"
 #include "lavik/storage/engine.h"
 #include "lavik/tx/tx_shard.h"
+#include "src/replication/native_recovery.h"
 #include "tests/support/process.h"
 
 namespace {
@@ -539,7 +543,8 @@ class FollowOwnerSource {
           return;
         }
         request.append(buffer, static_cast<std::size_t>(received));
-        if (!control && request.find("LVPSYNC") != std::string::npos) {
+        if (!control && (request.find("LVPSYNC") != std::string::npos ||
+                         request.find("LVPARENT") != std::string::npos)) {
           control = true;
           controls_.fetch_add(1, std::memory_order_acq_rel);
         } else if (request.find("LVFLOW") != std::string::npos) {
@@ -558,6 +563,18 @@ class FollowOwnerSource {
         }
       }
       if (!control || replied || !export_ready_) continue;
+      if (request.find("LVPARENT") != std::string::npos) {
+        saw_follow_scope_.store(true, std::memory_order_release);
+        const std::string response = "-LVPARENTFULL " + source_node_id_ + " " +
+                                     source_boot_id_ + " " +
+                                     source_history_id_ + "\r\n";
+        if (::send(connection, response.data(), response.size(),
+                   MSG_NOSIGNAL) != static_cast<ssize_t>(response.size())) {
+          error_.store(errno == 0 ? EIO : errno, std::memory_order_release);
+        }
+        replied = true;
+        continue;
+      }
       constexpr std::string_view kFollow = "$6\r\nFOLLOW\r\n";
       if (request.find(kFollow) == std::string::npos) continue;
       saw_follow_scope_.store(true, std::memory_order_release);
@@ -2672,6 +2689,1071 @@ enum class NativeActionDisposition {
   kShutdownWhilePreparing,
 };
 
+// A real TCP boundary peer exports canonical records. Faults interrupt only
+// transport; candidate storage, replay, FDS reconciliation and prepare are
+// real.
+class RecoveryBoundaryDonor {
+ public:
+  enum class Fault { kNone, kStallDiscovery, kStallPayload, kPartialPayload };
+  RecoveryBoundaryDonor(
+      lavik::detail::NativeRecoveryAdvertisement report,
+      std::vector<std::vector<lavik::NativeHistoryRecord>> effects,
+      Fault fault = Fault::kNone, unsigned parent_mode = 0)
+      : report_(std::move(report)),
+        effects_(std::move(effects)),
+        fault_(fault),
+        parent_mode_(parent_mode) {
+    listener_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener_ < 0) return;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(listener_, reinterpret_cast<sockaddr*>(&address),
+               sizeof(address)) != 0 ||
+        ::listen(listener_, 8) != 0)
+      return;
+    socklen_t size = sizeof(address);
+    if (::getsockname(listener_, reinterpret_cast<sockaddr*>(&address),
+                      &size) != 0)
+      return;
+    port_ = ntohs(address.sin_port);
+    thread_ = std::jthread([this](std::stop_token stop) { Run(stop); });
+  }
+  ~RecoveryBoundaryDonor() {
+    thread_.request_stop();
+
+    if (listener_ >= 0) (void)::shutdown(listener_, SHUT_RDWR);
+    if (thread_.joinable()) thread_.join();
+    {
+      std::lock_guard lock(connections_mutex_);
+      for (int fd : connections_) (void)::shutdown(fd, SHUT_RDWR);
+    }
+    for (auto& handler : handlers_) handler.request_stop();
+    for (auto& handler : handlers_)
+      if (handler.joinable()) handler.join();
+    if (listener_ >= 0) (void)::close(listener_);
+  }
+  std::uint16_t port() const { return port_; }
+  unsigned requests() const { return requests_.load(); }
+  bool continued() const { return continued_.load(); }
+  bool proved_origin() const { return proved_origin_.load(); }
+
+ private:
+  bool Write(int fd, std::string_view value) {
+    while (!value.empty()) {
+      const auto size = ::send(fd, value.data(), value.size(), MSG_NOSIGNAL);
+      if (size <= 0) return false;
+      value.remove_prefix(size);
+    }
+    return true;
+  }
+  bool Read(int fd, std::string& value, std::size_t bytes) {
+    value.resize(bytes);
+    for (std::size_t offset = 0; offset < bytes;) {
+      const auto size = ::recv(fd, value.data() + offset, bytes - offset, 0);
+      if (size <= 0) return false;
+      offset += size;
+    }
+    return true;
+  }
+  bool Line(int fd, std::string& value) {
+    value.clear();
+    while (value.size() < 65536) {
+      char byte;
+      if (::recv(fd, &byte, 1, 0) != 1) return false;
+      value.push_back(byte);
+      if (value.ends_with("\r\n")) {
+        value.resize(value.size() - 2);
+        return true;
+      }
+    }
+    return false;
+  }
+  bool Frame(int fd, std::string_view value) {
+    return Write(fd, absl::StrCat(
+                         "+LVR ", value.size(), " ",
+                         static_cast<std::uint32_t>(absl::ComputeCrc32c(value)),
+                         "\r\n")) &&
+           Write(fd, value);
+  }
+  void Stall(int fd, std::stop_token stop) {
+    while (!stop.stop_requested()) {
+      pollfd event{fd, POLLIN, 0};
+      if (::poll(&event, 1, 10) > 0) {
+        char byte;
+        if (::recv(fd, &byte, 1, 0) <= 0) return;
+      }
+    }
+  }
+  void Serve(int fd, std::stop_token stop) {
+    std::string line;
+    if (!Line(fd, line) || !line.starts_with('*')) return;
+    const unsigned count = std::stoul(line.substr(1));
+    if (count > 32) return;
+    std::vector<std::string> args;
+    for (unsigned i = 0; i < count; ++i) {
+      if (!Line(fd, line) || !line.starts_with('$')) return;
+      const auto size = std::stoul(line.substr(1));
+      if (size > 65536 || !Read(fd, line, size + 2)) return;
+      line.resize(size);
+      args.push_back(line);
+    }
+    if (parent_mode_ != 0) {
+      if (args[0] == "LVPSYNC") {
+        proved_origin_.store(args.size() == 19 &&
+                             args[4] == std::string(40, 'f') &&
+                             args[7] == "1" && args[17] == "ORIGIN" &&
+                             args[18] == std::string(40, '7'));
+        const bool unchanged_owner = parent_mode_ == 7;
+        if (!Write(fd, "+LVFULLRESYNC 1 " +
+                           std::string(40, unchanged_owner ? 'a' : '1') + " " +
+                           HexString(std::string(40, 'd')) + " " +
+                           (unchanged_owner ? std::string(40, 'b')
+                                            : report_.boot_id_) +
+                           " " + std::string(40, unchanged_owner ? 'c' : 'f') +
+                           (unchanged_owner ? " 2 " : " 1 ") +
+                           std::string(40, '8') + "\r\n"))
+          return;
+        Stall(fd, stop);
+        return;
+      }
+      if (args[0] == "LVFLOW") {
+        if (parent_mode_ == 7) {
+          Write(fd, "+LVFLOW 1 " + args[3] + " FULL\r\n");
+          Stall(fd, stop);
+          return;
+        }
+        if (args.size() >= 6 && args[4] == "1" &&
+            Write(fd, "+LVFLOW 1 0 CONTINUE\r\n"))
+          continued_.store(true);
+        Stall(fd, stop);
+        return;
+      }
+      if (args[0] != "LVPARENT" || args.size() != 19) return;
+      std::string cut;
+      for (auto lsn : report_.applied_) {
+        if (!cut.empty()) cut += ',';
+        cut += std::to_string(lsn);
+      }
+      if (!Write(fd, "+LVPARENT " + std::string(40, '6') + " " +
+                         std::string(40, '1') + " " + report_.boot_id_ + " " +
+                         std::string(40, 'f') + " " + args[16] + " " + cut +
+                         " 1\r\n"))
+        return;
+    } else if (args.size() != 21 || args[0] != "LVRECOVER")
+      return;
+    if (fault_ == Fault::kStallDiscovery) {
+      Stall(fd, stop);
+      return;
+    }
+    auto encoded = lavik::detail::EncodeRecoveryAdvertisement(report_);
+    if (!encoded.ok() || !Frame(fd, *encoded)) return;
+    while (!stop.stop_requested() && Line(fd, line)) {
+      if (parent_mode_ != 0 && line.starts_with("SWITCH ")) {
+        if (parent_mode_ == 4) return;
+        if (!Write(fd, "+LVSWITCH " + std::string(40, '7') + "\r\n")) return;
+        if (parent_mode_ == 3)
+          return;  // Close without ever consuming the final ACK.
+        (void)Line(fd, line);
+        return;
+      }
+      unsigned flow = 0;
+      unsigned long long lsn = 0;
+      if (std::sscanf(line.c_str(), "%u %llu", &flow, &lsn) != 2) return;
+      ++requests_;
+      auto found = std::ranges::find_if(effects_, [&](const auto& effect) {
+        return std::ranges::any_of(effect, [&](const auto& record) {
+          return record.flow_id_ == flow && record.lsn_ == lsn;
+        });
+      });
+      if (found == effects_.end()) return;
+      std::vector<lavik::NativeHistoryRecordInfo> manifest;
+      for (const auto& record : *found)
+        manifest.push_back(
+            {record.flow_id_, record.lsn_, record.canonical_.size()});
+      auto wire = lavik::detail::EncodeRecoveryEffectManifest(manifest);
+      if (!wire.ok() || !Frame(fd, *wire)) return;
+      if (fault_ == Fault::kStallPayload) {
+        Stall(fd, stop);
+        return;
+      }
+      for (std::size_t i = 0; i < found->size(); ++i) {
+        const auto& bytes = (*found)[i].canonical_;
+        if (fault_ == Fault::kPartialPayload && i + 1 == found->size()) {
+          (void)Write(fd, absl::StrCat("+LVR ", bytes.size(), " ",
+                                       static_cast<std::uint32_t>(
+                                           absl::ComputeCrc32c(bytes)),
+                                       "\r\n"));
+          (void)Write(fd, std::string_view(bytes).substr(0, bytes.size() / 2));
+          return;
+        }
+        if (!Frame(fd, bytes)) return;
+      }
+    }
+  }
+  void Run(std::stop_token stop) {
+    while (!stop.stop_requested()) {
+      pollfd event{listener_, POLLIN, 0};
+      if (::poll(&event, 1, 10) <= 0) continue;
+      const int fd = ::accept4(listener_, nullptr, nullptr, SOCK_CLOEXEC);
+      if (fd < 0) continue;
+      {
+        std::lock_guard lock(connections_mutex_);
+        connections_.push_back(fd);
+      }
+      handlers_.emplace_back([this, fd](std::stop_token handler_stop) {
+        timeval timeout{2, 0};
+        (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                           sizeof(timeout));
+        (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                           sizeof(timeout));
+        Serve(fd, handler_stop);
+        {
+          std::lock_guard lock(connections_mutex_);
+          std::erase(connections_, fd);
+        }
+        (void)::close(fd);
+      });
+    }
+  }
+  lavik::detail::NativeRecoveryAdvertisement report_;
+  std::vector<std::vector<lavik::NativeHistoryRecord>> effects_;
+  Fault fault_;
+  int listener_ = -1;
+  std::uint16_t port_ = 0;
+  unsigned parent_mode_ = 0;
+  std::atomic<bool> continued_{false}, proved_origin_{false};
+  std::mutex connections_mutex_;
+  std::vector<int> connections_;
+  std::vector<std::jthread> handlers_;
+  std::atomic<unsigned> requests_{0};
+  std::jthread thread_;
+};
+
+std::string RecoveryCommand(std::initializer_list<std::string> args) {
+  std::string raw = "LRC1";
+  raw.push_back(1);
+  raw.push_back(0);
+  raw.push_back(static_cast<char>(args.size()));
+  raw.push_back(0);
+  for (const auto& arg : args)
+    for (unsigned shift = 0; shift < 32; shift += 8)
+      raw.push_back(static_cast<char>(arg.size() >> shift));
+  for (const auto& arg : args) raw.append(arg);
+  return raw;
+}
+
+struct NativeProtocolProbe {
+  std::shared_ptr<bycorf::TcpStream> stream_;
+  int peer_fd_ = -1;
+  bool done_ = false;
+  absl::Status status_;
+  ~NativeProtocolProbe() {
+    if (peer_fd_ >= 0) (void)::close(peer_fd_);
+  }
+};
+
+absl::StatusOr<std::shared_ptr<NativeProtocolProbe>> OpenNativeProbe(
+    bycorf::Worker& worker) {
+  const int listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (listener < 0) return absl::ErrnoToStatus(errno, "socket");
+  struct ListenerGuard {
+    int fd_;
+    ~ListenerGuard() { (void)::close(fd_); }
+  } listener_guard{listener};
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = 0;
+  if (::bind(listener, reinterpret_cast<const sockaddr*>(&address),
+             sizeof(address)) != 0 ||
+      ::listen(listener, 1) != 0) {
+    return absl::ErrnoToStatus(errno, "bind/listen");
+  }
+  socklen_t size = sizeof(address);
+  if (::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) !=
+      0) {
+    return absl::ErrnoToStatus(errno, "getsockname");
+  }
+  const int peer = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (peer < 0) return absl::ErrnoToStatus(errno, "peer socket");
+  if (::connect(peer, reinterpret_cast<const sockaddr*>(&address),
+                sizeof(address)) != 0) {
+    const absl::Status failure = absl::ErrnoToStatus(errno, "connect");
+    (void)::close(peer);
+    return failure;
+  }
+  const int accepted =
+      ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+  if (accepted < 0) {
+    const absl::Status failure = absl::ErrnoToStatus(errno, "accept");
+    (void)::close(peer);
+    return failure;
+  }
+  const int flags = ::fcntl(peer, F_GETFL, 0);
+  if (flags < 0 || ::fcntl(peer, F_SETFL, flags | O_NONBLOCK) != 0) {
+    const absl::Status failure = absl::ErrnoToStatus(errno, "fcntl");
+    (void)::close(peer);
+    (void)::close(accepted);
+    return failure;
+  }
+  bycorf::Connection connection;
+  connection.worker_ = &worker;
+  connection.file_.fd_ = accepted;
+  connection.closed_ = false;
+  bycorf::Connection* registered = worker.AddConnection(std::move(connection));
+  if (registered == nullptr) {
+    (void)::close(peer);
+    (void)::close(accepted);
+    return absl::InternalError("could not register native test connection");
+  }
+  auto probe = std::make_shared<NativeProtocolProbe>();
+  probe->stream_ = std::make_shared<bycorf::TcpStream>(registered);
+  probe->peer_fd_ = peer;
+  return probe;
+}
+
+bycorf::Task<absl::Status> ServeNativeProbe(
+    lavik::ReplicationManager* replication,
+    std::shared_ptr<NativeProtocolProbe> probe, std::vector<std::string> args) {
+  static std::atomic<std::uint64_t> client_id{1234};
+  probe->status_ = co_await replication->ServeNativeConnection(
+      *probe->stream_, std::move(args), client_id.fetch_add(1), "127.0.0.1",
+      false);
+  probe->stream_->Close().IgnoreError();
+  probe->done_ = true;
+  co_return absl::OkStatus();
+}
+
+bycorf::Task<absl::StatusOr<std::string>> ReadNativeProbe(
+    const std::shared_ptr<NativeProtocolProbe>& probe, std::size_t bytes = 0) {
+  std::string value;
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (bytes == 0 ? !value.ends_with("\r\n") : value.size() < bytes) {
+    char buffer[4096];
+    const auto count = ::recv(
+        probe->peer_fd_, buffer,
+        bytes == 0 ? 1 : std::min(sizeof(buffer), bytes - value.size()), 0);
+    if (count > 0) {
+      value.append(buffer, count);
+      continue;
+    }
+    if (count == 0)
+      co_return absl::UnavailableError("native protocol probe closed");
+    if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+      co_return absl::ErrnoToStatus(errno, "native probe recv");
+    if (std::chrono::steady_clock::now() >= deadline)
+      co_return absl::DeadlineExceededError("native protocol probe stalled");
+    auto status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, 1ms);
+    if (!status.ok()) co_return status;
+  }
+  if (bytes == 0) value.resize(value.size() - 2);
+  co_return value;
+}
+
+bycorf::Task<absl::StatusOr<std::string>> ReadNativeProbeFrame(
+    const std::shared_ptr<NativeProtocolProbe>& probe) {
+  auto header = co_await ReadNativeProbe(probe);
+  if (!header.ok()) co_return header.status();
+  unsigned long long bytes = 0;
+  unsigned crc = 0;
+  if (std::sscanf(header->c_str(), "+LVR %llu %u", &bytes, &crc) != 2 ||
+      bytes == 0 || bytes > 256 * 1024)
+    co_return TestFailure("invalid native probe frame");
+  auto payload = co_await ReadNativeProbe(probe, bytes);
+  if (!payload.ok()) co_return payload.status();
+  if (static_cast<std::uint32_t>(absl::ComputeCrc32c(*payload)) != crc)
+    co_return TestFailure("native probe frame CRC mismatch");
+  co_return *payload;
+}
+
+bycorf::Task<absl::Status> JoinNativeProbe(
+    const std::shared_ptr<NativeProtocolProbe>& probe) {
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (!probe->done_) {
+    if (std::chrono::steady_clock::now() >= deadline)
+      co_return absl::DeadlineExceededError(
+          "native protocol probe did not join");
+    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, 1ms);
+    if (!waited.ok()) co_return waited;
+  }
+  co_return absl::OkStatus();
+}
+
+class CandidateRecoveryService final : public bycorf::Service {
+ public:
+  CandidateRecoveryService(lavik::storage::StorageEngine* storage,
+                           lavik::ReplicationManager* replication,
+                           std::vector<lavik::ClusterRecoveryPeer> donors,
+                           std::vector<std::uint64_t> expected, bool replace,
+                           bool expired, bool stall,
+                           RecoveryBoundaryDonor* parent = nullptr,
+                           unsigned parent_mode = 0, unsigned protocol_mode = 0)
+      : storage_(storage),
+        replication_(replication),
+        donors_(std::move(donors)),
+        expected_(std::move(expected)),
+        replace_(replace),
+        expired_(expired),
+        stall_(stall),
+        parent_(parent),
+        parent_mode_(parent_mode),
+        protocol_mode_(protocol_mode) {}
+  void Prepare(unsigned) override {}
+  void Stop() noexcept override {}
+  const absl::Status& result() const { return result_; }
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
+                                 bycorf::ServiceContext) override {
+    lavik::BindMemoryAccountingShard(worker.id());
+    lavik::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
+    result_ = co_await storage_->InitializeWorker(worker);
+    if (result_.ok()) {
+      replication_->StorageReady(worker);
+      result_ = co_await Exercise();
+    }
+    replication_->RequestShutdown();
+    auto joined = co_await replication_->QuiesceForShutdown();
+    if (result_.ok()) result_ = joined;
+    worker.RequestStop();
+    co_return result_;
+  }
+
+ private:
+  bycorf::Task<absl::Status> Exercise() {
+    const auto local = co_await replication_->ObserveIdentity();
+    const auto manifest = lavik::PopulationManifest::Create({});
+    if (!manifest.ok()) co_return manifest.status();
+    lavik::DesiredClusterFailoverAction action;
+    action.transition_id_.fill(1);
+    action.action_id_.fill(2);
+    action.transition_revision_ = 7;
+    action.mode_ = lavik::ClusterFailoverMode::kUncontrolled;
+    action.target_term_ = action.committed_group_term_ = 2;
+    action.group_id_ = std::string(40, 'd');
+    action.candidate_node_id_ = local.local_node_id_;
+    action.candidate_assignment_id_ = "candidate-assignment";
+    action.candidate_boot_id_ = local.boot_id_;
+    action.domain_ = {1,
+                      std::string(40, 'a'),
+                      "source-assignment",
+                      std::string(40, 'b'),
+                      std::string(40, 'c'),
+                      2};
+    action.manifest_revision_ = 1;
+    action.manifest_id_ = manifest->id();
+    action.partition_replication_epoch_ = 23;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    action.recovery_deadline_unix_ms_ =
+        now + (expired_ ? 0 : (stall_ ? 300 : 1500));
+    auto members = donors_;
+    members.push_back(
+        {{local.local_node_id_, action.candidate_assignment_id_}, {}});
+    lavik::DesiredClusterRecovery scope{action, local.local_node_id_,
+                                        action.candidate_assignment_id_,
+                                        local.boot_id_, members};
+    auto status = co_await replication_->ReconcileClusterRecovery(scope);
+    if (!status.ok()) co_return status;
+    status = co_await replication_->ReconcileClusterFailoverAction(action);
+    if (!status.ok()) co_return status;
+    if (replace_) {
+      status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, 70ms);
+      if (!status.ok()) co_return status;
+      action.action_id_.fill(3);
+      ++action.transition_revision_;
+      scope.action_ = action;
+      status = co_await replication_->ReconcileClusterRecovery(scope);
+      if (!status.ok()) co_return status;
+      status = co_await replication_->ReconcileClusterFailoverAction(action);
+      if (!status.ok()) co_return status;
+    }
+    const auto wait_until = std::chrono::steady_clock::now() + 5s;
+    lavik::ClusterFailoverActionStatus observed;
+    do {
+      observed = co_await replication_->cluster_failover_action_status();
+      if (observed.state_ ==
+          lavik::ClusterFailoverActionState::kRecoveryComplete)
+        break;
+      if (observed.state_ == lavik::ClusterFailoverActionState::kFailed)
+        co_return TestFailure(observed.failure_detail_);
+      status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, 1ms);
+      if (!status.ok()) co_return status;
+    } while (std::chrono::steady_clock::now() < wait_until);
+    if (observed.state_ !=
+            lavik::ClusterFailoverActionState::kRecoveryComplete ||
+        !observed.recovery_.has_value())
+      co_return TestFailure("candidate did not finish bounded recovery");
+    if (observed.action_->action_id_ != action.action_id_ ||
+        observed.action_->recovery_deadline_unix_ms_ !=
+            action.recovery_deadline_unix_ms_)
+      co_return TestFailure(
+          "replacement changed cutoff or retained the old action report");
+    if (observed.recovery_->applied_next_lsns_ != expected_)
+      co_return TestFailure(
+          absl::StrCat("candidate reported wrong complete cut: ",
+                       observed.recovery_->applied_next_lsns_[0], ",",
+                       observed.recovery_->applied_next_lsns_[1]));
+    if ((stall_ || expired_) &&
+        observed.recovery_->completion_reason_ != "deadline")
+      co_return TestFailure("stalled recovery did not use its shared deadline");
+
+    if (protocol_mode_ == 8) {
+      status = co_await ExerciseDonor(action);
+      if (!status.ok()) co_return status;
+    }
+    // Meta authorization is modeled only after the actual terminal recovery
+    // report. The real durability kernel must freeze A_final, including when
+    // E was unreachable, and create a child with a different local flow count.
+    status = co_await replication_->ReconcileClusterRecovery(std::nullopt);
+    if (!status.ok()) co_return status;
+    if (parent_ != nullptr) co_return co_await ExercisePartial(action);
+    action.authorized_revision_ = 9;
+    action.transition_revision_ = 9;
+    status = co_await replication_->ReconcileClusterFailoverAction(action);
+    if (!status.ok()) co_return status;
+    do {
+      observed = co_await replication_->cluster_failover_action_status();
+      if (observed.state_ == lavik::ClusterFailoverActionState::kPrepared)
+        break;
+      if (observed.state_ == lavik::ClusterFailoverActionState::kFailed)
+        co_return TestFailure(observed.failure_detail_);
+      status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, 1ms);
+      if (!status.ok()) co_return status;
+    } while (std::chrono::steady_clock::now() < wait_until);
+    if (!observed.prepared_.has_value() ||
+        observed.prepared_->promotion_.frozen_applied_next_lsns_ != expected_)
+      co_return TestFailure("promotion did not freeze actual recovery Applied");
+    if (protocol_mode_ == 9) co_return co_await ExerciseParentSource(action);
+    co_return absl::OkStatus();
+  }
+  bycorf::Task<absl::Status> ExerciseDonor(
+      const lavik::DesiredClusterFailoverAction& candidate) {
+    auto action = candidate;
+    action.candidate_node_id_ = std::string(40, '1');
+    action.candidate_assignment_id_ = "donor-a";
+    action.candidate_boot_id_ = std::string(40, '4');
+    action.action_id_.fill(7);
+    action.recovery_deadline_unix_ms_ =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count() +
+        2000;
+    auto members = donors_;
+    members.push_back(
+        {{candidate.candidate_node_id_, candidate.candidate_assignment_id_},
+         {}});
+    lavik::DesiredClusterRecovery scope{action, candidate.candidate_node_id_,
+                                        candidate.candidate_assignment_id_,
+                                        candidate.candidate_boot_id_, members};
+    auto status = co_await replication_->ReconcileClusterRecovery(scope);
+    if (!status.ok()) co_return status;
+    const auto args = std::vector<std::string>{
+        "LVRECOVER",
+        "1",
+        action.group_id_,
+        "2",
+        "01010101010101010101010101010101",
+        "07070707070707070707070707070707",
+        action.candidate_node_id_,
+        action.candidate_assignment_id_,
+        action.candidate_boot_id_,
+        candidate.candidate_node_id_,
+        candidate.candidate_assignment_id_,
+        "1",
+        action.domain_.source_node_id_,
+        action.domain_.source_assignment_id_,
+        action.domain_.source_boot_id_,
+        action.domain_.source_history_id_,
+        "2",
+        "1",
+        action.manifest_id_.Hex(),
+        "23",
+        std::to_string(*action.recovery_deadline_unix_ms_)};
+    auto& worker = *bycorf::ThisWorker().self_;
+    auto denied = OpenNativeProbe(worker);
+    if (!denied.ok()) co_return denied.status();
+    auto stale = args;
+    stale[5] = "08080808080808080808080808080808";
+    worker.Spawn(ServeNativeProbe(replication_, *denied, stale));
+    status = co_await JoinNativeProbe(*denied);
+    if (!status.ok()) co_return status;
+    if ((*denied)->status_.code() != absl::StatusCode::kPermissionDenied)
+      co_return TestFailure("donor accepted a stale recovery action");
+    auto probe = OpenNativeProbe(worker);
+    if (!probe.ok()) co_return probe.status();
+    worker.Spawn(ServeNativeProbe(replication_, *probe, args));
+    auto frame = co_await ReadNativeProbeFrame(*probe);
+    if (!frame.ok()) co_return frame.status();
+    auto report = lavik::detail::DecodeRecoveryAdvertisement(*frame);
+    if (!report.ok() || report->applied_ != expected_ ||
+        report->boot_id_ != candidate.candidate_boot_id_ ||
+        !lavik::detail::RecoveryCovers(*report, 0, 1))
+      co_return TestFailure(
+          "real donor did not advertise its complete applied retained history");
+    if (::send((*probe)->peer_fd_, "0 1\r\n", 5, MSG_NOSIGNAL) != 5)
+      co_return TestFailure("donor request failed");
+    frame = co_await ReadNativeProbeFrame(*probe);
+    if (!frame.ok()) co_return frame.status();
+    auto effect = lavik::detail::DecodeRecoveryEffectManifest(*frame);
+    if (!effect.ok() || effect->size() != 1 || effect->front().lsn_ != 1 ||
+        effect->front().flow_id_ != 0)
+      co_return TestFailure(
+          "real donor returned the wrong complete effect manifest");
+    frame = co_await ReadNativeProbeFrame(*probe);
+    if (!frame.ok()) co_return frame.status();
+    if (*frame != RecoveryCommand({"SET", "recovery-a", "value"}))
+      co_return TestFailure("real donor changed original canonical bytes");
+    // No serving lease was granted: ordinary native cascading remains closed.
+    auto ordinary = OpenNativeProbe(worker);
+    if (!ordinary.ok()) co_return ordinary.status();
+    worker.Spawn(
+        ServeNativeProbe(replication_, *ordinary,
+                         {"LVPSYNC", "1", "?", "?", "?", "?", "?", "?"}));
+    status = co_await JoinNativeProbe(*ordinary);
+    if (!status.ok()) co_return status;
+    if ((*ordinary)->status_.ok())
+      co_return TestFailure(
+          "read-only donor capability opened ordinary source export");
+    status = co_await replication_->ReconcileClusterRecovery(std::nullopt);
+    if (!status.ok()) co_return status;
+    status = co_await JoinNativeProbe(*probe);
+    if (!status.ok()) co_return status;
+    const auto population = co_await replication_->cluster_population_status();
+    if (!population.failover_candidate_eligible_ ||
+        population.applied_next_lsns_ != expected_)
+      co_return TestFailure("donor revocation changed its candidate proof");
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> ExerciseParentSource(
+      const lavik::DesiredClusterFailoverAction& action) {
+    auto status = co_await replication_->ReconcileClusterFailoverAction(
+        std::nullopt, action.action_id_);
+    if (!status.ok()) co_return status;
+    lavik::ClusterFailoverActivation activation{
+        .action_id_ = action.action_id_,
+        .group_id_ = action.group_id_,
+        .candidate_node_id_ = action.candidate_node_id_,
+        .candidate_assignment_id_ = action.candidate_assignment_id_,
+        .candidate_boot_id_ = action.candidate_boot_id_,
+        .target_term_ = 2,
+        .manifest_revision_ = 1,
+        .manifest_id_ = action.manifest_id_,
+        .partition_replication_epoch_ = 23,
+    };
+    status =
+        co_await replication_->ActivateClusterPreparedPromotion(activation);
+    if (!status.ok()) co_return status;
+    lavik::DesiredClusterUpstream follow{
+        .group_id_ = action.group_id_,
+        .group_term_ = 2,
+        .local_node_id_ = action.candidate_node_id_,
+        .local_assignment_id_ = action.candidate_assignment_id_,
+        .local_boot_id_ = action.candidate_boot_id_,
+        .owner_node_id_ = action.candidate_node_id_,
+        .owner_assignment_id_ = action.candidate_assignment_id_,
+        .manifest_revision_ = 1,
+        .manifest_id_ = action.manifest_id_,
+        .partition_replication_epoch_ = 23,
+        .members_ = {{action.candidate_node_id_,
+                      action.candidate_assignment_id_},
+                     {std::string(40, '1'), "target-assignment"}},
+    };
+    status = co_await replication_->ReconcileClusterFollowOwner(follow);
+    if (!status.ok()) co_return status;
+    auto& worker = *bycorf::ThisWorker().self_;
+    auto args = std::vector<std::string>{"LVPARENT",
+                                         "1",
+                                         action.group_id_,
+                                         "2",
+                                         std::string(40, '1'),
+                                         "target-assignment",
+                                         std::string(40, '4'),
+                                         action.candidate_node_id_,
+                                         action.candidate_assignment_id_,
+                                         "1",
+                                         action.manifest_id_.Hex(),
+                                         "23",
+                                         "1",
+                                         action.domain_.source_node_id_,
+                                         action.domain_.source_assignment_id_,
+                                         action.domain_.source_boot_id_,
+                                         action.domain_.source_history_id_,
+                                         "2",
+                                         "1,1"};
+    auto denied = OpenNativeProbe(worker);
+    if (!denied.ok()) co_return denied.status();
+    worker.Spawn(ServeNativeProbe(replication_, *denied, args));
+    status = co_await JoinNativeProbe(*denied);
+    if (!status.ok()) co_return status;
+    if ((*denied)->status_.code() != absl::StatusCode::kPermissionDenied)
+      co_return TestFailure(
+          "parent export ignored its finite source lease gate");
+    status = co_await replication_->EnableClusterRebuildSourceAdmissionUntil(
+        (lavik::cluster::LeaseClockNow() + 5s).time_since_epoch());
+    if (!status.ok()) co_return status;
+    auto probe = OpenNativeProbe(worker);
+    if (!probe.ok()) co_return probe.status();
+    worker.Spawn(ServeNativeProbe(replication_, *probe, args));
+    auto hello = co_await ReadNativeProbe(*probe);
+    if (!hello.ok()) co_return hello.status();
+    if (!hello->starts_with("+LVPARENT ") || !hello->ends_with(" 2,2 1"))
+      co_return TestFailure(
+          absl::StrCat("promoted Owner did not expose actual parent boundary "
+                       "and independent child layout: ",
+                       *hello));
+    auto frame = co_await ReadNativeProbeFrame(*probe);
+    if (!frame.ok()) co_return frame.status();
+    auto report = lavik::detail::DecodeRecoveryAdvertisement(*frame);
+    if (!report.ok() || !lavik::detail::RecoveryCovers(*report, 0, 1))
+      co_return TestFailure(
+          "promotion discarded usable parent effects before child activation");
+    if (::send((*probe)->peer_fd_, "0 1\r\n", 5, MSG_NOSIGNAL) != 5)
+      co_return TestFailure("parent replay request failed");
+    frame = co_await ReadNativeProbeFrame(*probe);
+    if (!frame.ok()) co_return frame.status();
+    frame = co_await ReadNativeProbeFrame(*probe);
+    if (!frame.ok()) co_return frame.status();
+    if (*frame != RecoveryCommand({"SET", "recovery-a", "value"}))
+      co_return TestFailure("parent replay changed original canonical bytes");
+    if (::send((*probe)->peer_fd_, "SWITCH 2,2\r\n", 12, MSG_NOSIGNAL) != 12)
+      co_return TestFailure("switch request failed");
+    auto switched = co_await ReadNativeProbe(*probe);
+    if (!switched.ok()) co_return switched.status();
+    if (!switched->starts_with("+LVSWITCH "))
+      co_return TestFailure("parent switch was not accepted");
+    const auto capability = switched->substr(10);
+    // Drop the final ACK. The same boot can still prove the untouched child
+    // origin through the ordinary native control and flow handshake.
+    (void)::shutdown((*probe)->peer_fd_, SHUT_RDWR);
+    status = co_await JoinNativeProbe(*probe);
+    if (!status.ok()) co_return status;
+    const auto local = co_await replication_->ObserveIdentity();
+    auto control = OpenNativeProbe(worker);
+    if (!control.ok()) co_return control.status();
+    worker.Spawn(ServeNativeProbe(
+        replication_, *control,
+        {"LVPSYNC", "1", "?" + std::string(40, '1') + ":6380",
+         HexString(action.group_id_), local.local_history_id_,
+         std::string(40, '5'), std::string(40, '4'), "1", "FOLLOW",
+         action.group_id_, "target-assignment", action.candidate_assignment_id_,
+         "2", action.candidate_node_id_, "1", action.manifest_id_.Hex(), "23",
+         "ORIGIN", capability}));
+    hello = co_await ReadNativeProbe(*control);
+    if (!hello.ok()) co_return hello.status();
+    std::vector<std::string> words;
+    std::istringstream parsed(*hello);
+    for (std::string word; parsed >> word;) words.push_back(word);
+    if (words.size() != 8)
+      co_return TestFailure("child control handshake failed");
+    auto flow = OpenNativeProbe(worker);
+    if (!flow.ok()) co_return flow.status();
+    worker.Spawn(
+        ServeNativeProbe(replication_, *flow,
+                         {"LVFLOW", "1", words[1], "0", "1", "0", words[7]}));
+    auto selected = co_await ReadNativeProbe(*flow);
+    if (!selected.ok()) co_return selected.status();
+    if (!selected->ends_with(" CONTINUE"))
+      co_return TestFailure(
+          "proved child origin fell back to FULL after ACK loss");
+    status = co_await replication_->RevokeClusterRebuildSourceAuthorizations();
+    if (!status.ok()) co_return status;
+    status = co_await JoinNativeProbe(*control);
+    if (!status.ok()) co_return status;
+    status = co_await JoinNativeProbe(*flow);
+    if (!status.ok()) co_return status;
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> ExercisePartial(
+      const lavik::DesiredClusterFailoverAction& action) {
+    auto status =
+        co_await replication_->ReconcileClusterFailoverAction(std::nullopt);
+    if (!status.ok()) co_return status;
+    lavik::DesiredClusterUpstream follow{
+        .group_id_ = action.group_id_,
+        .group_term_ = 2,
+        .local_node_id_ = action.candidate_node_id_,
+        .local_assignment_id_ = action.candidate_assignment_id_,
+        .local_boot_id_ = action.candidate_boot_id_,
+        .owner_node_id_ = std::string(40, '1'),
+        .owner_assignment_id_ = "new-owner",
+        .owner_endpoint_ = lavik::ReplicaOfConfig{"localhost", parent_->port()},
+        .manifest_revision_ = action.manifest_revision_,
+        .manifest_id_ = action.manifest_id_,
+        .partition_replication_epoch_ = action.partition_replication_epoch_,
+        .members_ = {{action.candidate_node_id_,
+                      action.candidate_assignment_id_},
+                     {std::string(40, '1'), "new-owner"}},
+    };
+    if (parent_mode_ == 7) {
+      follow.group_term_ = 1;
+      follow.owner_node_id_ = action.domain_.source_node_id_;
+      follow.owner_assignment_id_ = action.domain_.source_assignment_id_;
+      follow.members_.back() = {follow.owner_node_id_,
+                                follow.owner_assignment_id_};
+    }
+    status = co_await replication_->ReconcileClusterFollowOwner(follow);
+    if (!status.ok()) co_return status;
+    const bool switched = parent_mode_ <= 3;
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    lavik::ClusterPopulationStatus population;
+    do {
+      population = co_await replication_->cluster_population_status();
+      if (switched ? parent_->continued()
+                   : population.replacement_intent_.has_value())
+        break;
+      status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, 1ms);
+      if (!status.ok()) co_return status;
+    } while (std::chrono::steady_clock::now() < deadline);
+    if (switched && (!parent_->continued() || !parent_->proved_origin()))
+      co_return TestFailure(
+          "HistorySwitch did not continue at its proved initial child cursor");
+    if (!switched && !population.replacement_intent_.has_value())
+      co_return TestFailure(
+          "incomplete partial attempt did not select staged FULL");
+    status = co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
+    if (!status.ok()) co_return status;
+    population = co_await replication_->cluster_population_status();
+    const auto expected = switched ? std::vector<std::uint64_t>{1}
+                          : parent_mode_ == 4
+                              ? std::vector<std::uint64_t>{2, 2}
+                              : std::vector<std::uint64_t>{1, 1};
+    const auto history =
+        switched ? std::string(40, 'f') : action.domain_.source_history_id_;
+    if (!population.ready_token_.has_value() ||
+        population.state_ != lavik::ReplicationGroupState::kReady ||
+        population.ready_token_->identity().source_history_id_ != history ||
+        population.applied_next_lsns_ != expected ||
+        !population.failover_candidate_eligible_ ||
+        storage_->ReplicaRecoveryFenced()) {
+      co_return TestFailure(
+          "Owner loss during reparent did not retain the exact complete domain "
+          "and cursor");
+    }
+    if (switched) {
+      if (population.recovered_)
+        co_return TestFailure(
+            "completed HistorySwitch retained old recovery state");
+      // The next canonical child event uses the live population, never a
+      // stale FULL staging apply context left by clean recovery.
+      lavik::ReplicatedCommand child;
+      child.args_ = {"SET", "child-after-switch", "value"};
+      status = co_await lavik::ApplyReplicatedCommand(child);
+      if (!status.ok()) co_return status;
+    }
+    co_return absl::OkStatus();
+  }
+  lavik::storage::StorageEngine* storage_;
+  lavik::ReplicationManager* replication_;
+  std::vector<lavik::ClusterRecoveryPeer> donors_;
+  std::vector<std::uint64_t> expected_;
+  bool replace_, expired_, stall_;
+  RecoveryBoundaryDonor* parent_ = nullptr;
+  unsigned parent_mode_ = 0;
+  unsigned protocol_mode_ = 0;
+  absl::Status result_;
+};
+
+void RunCandidateRecoveryCase(unsigned mode, unsigned parent_mode = 0,
+                              bool recovered = false) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires the complete-population seed fault seam";
+#endif
+  ASSERT_EQ(::setenv("LAVIK_REPLICATION_SEED_READY_RECOVERY_CANDIDATE",
+                     "02020202020202020202020202020202", 1),
+            0);
+  if (recovered)
+    ASSERT_EQ(::setenv("LAVIK_REPLICATION_SEED_CLEAN_RECOVERED_CANDIDATE",
+                       "02020202020202020202020202020202", 1),
+              0);
+  struct Reset {
+    ~Reset() {
+      (void)::unsetenv("LAVIK_REPLICATION_SEED_CLEAN_RECOVERED_CANDIDATE");
+      (void)::unsetenv("LAVIK_REPLICATION_SEED_READY_RECOVERY_CANDIDATE");
+    }
+  } reset;
+  using Fault = RecoveryBoundaryDonor::Fault;
+  const bool tx = mode == 6 || mode == 7;
+  auto envelope = lavik::EncodeReplicationTransactionEnvelope({17, 0, {0, 1}});
+  ASSERT_TRUE(envelope.ok());
+  std::vector<std::vector<lavik::NativeHistoryRecord>> first_effects;
+  if (tx)
+    first_effects = {
+        {{0, 1, RecoveryCommand({*envelope, "SET", "recovery-tx", "value"})},
+         {1, 1, RecoveryCommand({*envelope})}}};
+  else
+    first_effects = {{{0, 1, RecoveryCommand({"SET", "recovery-a", "value"})}}};
+  lavik::detail::NativeRecoveryAdvertisement first_report{
+      std::string(40, '4'),
+      tx ? std::vector<std::uint64_t>{2, 2} : std::vector<std::uint64_t>{2, 1},
+      {{{1, 2}},
+       tx ? std::vector<lavik::NativeHistoryRange>{{1, 2}}
+          : std::vector<lavik::NativeHistoryRange>{}}};
+  RecoveryBoundaryDonor first(
+      first_report, first_effects,
+      mode == 7 ? Fault::kPartialPayload : Fault::kNone);
+  const auto second_fault = mode == 1 || mode == 4 ? Fault::kStallPayload
+                            : mode == 2            ? Fault::kPartialPayload
+                                                   : Fault::kNone;
+  RecoveryBoundaryDonor second(
+      {std::string(40, '5'),
+       {1, tx ? 1U : 2U},
+       {{},
+        tx ? std::vector<lavik::NativeHistoryRange>{}
+           : std::vector<lavik::NativeHistoryRange>{{1, 2}}}},
+      {{{1, 1, RecoveryCommand({"SET", "recovery-b", "value"})}}},
+      second_fault);
+  RecoveryBoundaryDonor silent({std::string(40, '6'), {9, 9}, {{}, {}}}, {},
+                               Fault::kStallDiscovery);
+  ASSERT_NE(first.port(), 0);
+  ASSERT_NE(second.port(), 0);
+  ASSERT_NE(silent.port(), 0);
+  std::vector<lavik::ClusterRecoveryPeer> donors{
+      {{std::string(40, '1'), "donor-a"}, {"localhost", first.port()}},
+      {{std::string(40, '2'), "donor-b"}, {"127.0.0.1", second.port()}}};
+  if (mode == 3)
+    donors.push_back(
+        {{std::string(40, '3'), "silent"}, {"127.0.0.1", silent.port()}});
+  lavik::test::TempDirectory directory("candidate-recovery");
+  const auto data = directory.path() / "node.data";
+  lavik::test::CreateDataFile(data, 128 * kMiB);
+  lavik::storage::StorageEngineOptions storage_options;
+  storage_options.data_files_ = {data.string()};
+  storage_options.expiration_authority_ = false;
+  storage_options.buffers_.registered_bytes_ = 64 * kMiB;
+  storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
+  lavik::storage::StorageEngine storage(std::move(storage_options));
+  lavik::InitWorkerMetrics(1);
+  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(storage.Prepare(1).ok());
+  lavik::ReplicationOptions options;
+  options.cluster_enabled_ = true;
+  options.node_id_override_ = std::string(40, '9');
+  lavik::ReplicationManager replication(&storage, std::move(options),
+                                        std::nullopt);
+  lavik::InitStorage(&storage, &replication);
+  EnsureTxRuntime();
+  std::vector<std::uint64_t> expected =
+      mode == 5 || mode == 7                ? std::vector<std::uint64_t>{1, 1}
+      : mode == 1 || mode == 2 || mode == 4 ? std::vector<std::uint64_t>{2, 1}
+                                            : std::vector<std::uint64_t>{2, 2};
+  std::unique_ptr<RecoveryBoundaryDonor> parent;
+  if (parent_mode != 0) {
+    lavik::detail::NativeRecoveryAdvertisement report{
+        std::string(40, '4'),
+        parent_mode == 1 ? std::vector<std::uint64_t>{1, 1}
+                         : std::vector<std::uint64_t>{2, 2},
+        {{}, {}}};
+    std::vector<std::vector<lavik::NativeHistoryRecord>> effects;
+    if (parent_mode != 1 && parent_mode != 6) {
+      report.coverage_ = {{{1, 2}}, {{1, 2}}};
+      effects = {
+          {{0, 1, RecoveryCommand({*envelope, "SET", "partial-tx", "value"})},
+           {1, 1, RecoveryCommand({*envelope})}}};
+    }
+    parent = std::make_unique<RecoveryBoundaryDonor>(
+        report, effects,
+        parent_mode == 5 ? Fault::kPartialPayload : Fault::kNone, parent_mode);
+  }
+  CandidateRecoveryService service(
+      &storage, &replication, std::move(donors), expected, mode == 4, mode == 5,
+      mode == 1 || mode == 4, parent.get(), parent_mode, mode);
+  bycorf::Server server;
+  server.AddService(&service);
+  bycorf::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(runtime).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     RecoveredCandidateAppliesAndRetainsDonorEvents) {
+  RunCandidateRecoveryCase(8, 0, true);
+}
+TEST(ReplicationManagerIntegrationTest,
+     RecoveredCandidateReplaysParentAndAppliesChild) {
+  RunCandidateRecoveryCase(5, 2, true);
+}
+TEST(ReplicationManagerIntegrationTest,
+     RecoveredCandidateSwitchesExactParentAndAppliesChild) {
+  RunCandidateRecoveryCase(5, 1, true);
+}
+TEST(ReplicationManagerIntegrationTest,
+     RecoveredCandidateFullIntentPreservesReady) {
+  RunCandidateRecoveryCase(5, 7, true);
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     CandidateRecoveryCombinesIncomparableDonors) {
+  RunCandidateRecoveryCase(0);
+}
+TEST(ReplicationManagerIntegrationTest,
+     CandidateRecoveryDeadlineFreezesActualCompleteApplied) {
+  RunCandidateRecoveryCase(1);
+}
+TEST(ReplicationManagerIntegrationTest,
+     CandidateRecoveryPartialDonorPayloadDoesNotAdvance) {
+  RunCandidateRecoveryCase(2);
+}
+TEST(ReplicationManagerIntegrationTest,
+     CandidateRecoveryDoesNotWaitForEveryDonor) {
+  RunCandidateRecoveryCase(3);
+}
+TEST(ReplicationManagerIntegrationTest,
+     CandidateRecoveryReplacementSharesDeadlineAndPreservesApplied) {
+  RunCandidateRecoveryCase(4);
+}
+TEST(ReplicationManagerIntegrationTest,
+     CandidateRecoveryExpiredBudgetStillPreparesCompletePopulation) {
+  RunCandidateRecoveryCase(5);
+}
+TEST(ReplicationManagerIntegrationTest,
+     CandidateRecoveryAppliesCompleteCrossFlowTransaction) {
+  RunCandidateRecoveryCase(6);
+}
+TEST(ReplicationManagerIntegrationTest,
+     CandidateRecoveryPartialTransactionKeepsBothCursors) {
+  RunCandidateRecoveryCase(7);
+}
+
+TEST(ReplicationManagerIntegrationTest,
+     RecoveryDonorExportsOnlyCurrentActionAndRetainedEffects) {
+  RunCandidateRecoveryCase(8);
+}
+TEST(ReplicationManagerIntegrationTest,
+     PartialOwnerExportsParentAndContinuesChildAfterAckLoss) {
+  RunCandidateRecoveryCase(9);
+}
+TEST(ReplicationManagerIntegrationTest,
+     PartialReparentExactBoundaryChangesFlowLayout) {
+  RunCandidateRecoveryCase(5, 1);
+}
+TEST(ReplicationManagerIntegrationTest,
+     PartialReparentReplaysWholeTransactionBeforeSwitch) {
+  RunCandidateRecoveryCase(5, 2);
+}
+TEST(ReplicationManagerIntegrationTest,
+     PartialReparentAckLossContinuesAtChildOrigin) {
+  RunCandidateRecoveryCase(5, 3);
+}
+TEST(ReplicationManagerIntegrationTest,
+     PartialReparentSwitchLossPreservesAppliedParent) {
+  RunCandidateRecoveryCase(5, 4);
+}
+TEST(ReplicationManagerIntegrationTest,
+     PartialReparentIncompleteTransactionPreservesBothParentCursors) {
+  RunCandidateRecoveryCase(5, 5);
+}
+TEST(ReplicationManagerIntegrationTest,
+     PartialReparentParentGapSelectsFullWithoutReset) {
+  RunCandidateRecoveryCase(5, 6);
+}
+
 class NativeFailoverActionService final : public bycorf::Service {
  public:
   NativeFailoverActionService(
@@ -3256,108 +4338,75 @@ class FollowOwnerReconcileService final : public bycorf::Service {
         "replacement source did not receive steady FOLLOW scope");
     if (!waited.ok()) co_return waited;
 
-    // The replacement source has published an authenticated/export-ready
-    // incarnation. Only now may the existing coordinator enter destructive
-    // FULL and withdraw the old Ready proof.
-    const auto destructive_deadline = std::chrono::steady_clock::now() + 5s;
+    // Authenticated source rejection selects staged FULL without withdrawing
+    // the former Owner's complete Active population or its frozen parent cut.
+    const auto intent_deadline = std::chrono::steady_clock::now() + 5s;
     lavik::ClusterPopulationStatus after_export_ready;
     do {
       after_export_ready = co_await replication_->cluster_population_status();
-      if (after_export_ready.state_ ==
-          lavik::ReplicationGroupState::kRebuilding) {
-        break;
-      }
+      if (after_export_ready.replacement_intent_.has_value()) break;
       waited = co_await bycorf::SleepFor(worker, 1ms);
       if (!waited.ok()) co_return waited;
-    } while (std::chrono::steady_clock::now() < destructive_deadline);
-    if (after_export_ready.state_ !=
-            lavik::ReplicationGroupState::kRebuilding ||
-        after_export_ready.ready_token_.has_value()) {
+    } while (std::chrono::steady_clock::now() < intent_deadline);
+    if (!after_export_ready.replacement_intent_.has_value() ||
+        after_export_ready.state_ != lavik::ReplicationGroupState::kReady ||
+        !after_export_ready.ready_token_.has_value() ||
+        !after_export_ready.applied_next_lsns_.has_value() ||
+        !after_export_ready.failover_candidate_eligible_ ||
+        storage_->ReplicaRecoveryFenced()) {
       co_return TestFailure(
-          "destructive FollowOwner FULL retained a Ready candidate proof");
+          "FULL fallback did not preserve the complete Active candidate");
     }
-
-    // A steady FollowOwner FULL rotates the local replication history, which
-    // deliberately makes the Data-to-Meta session reconnect. That session
-    // replacement must retire session-scoped population directives without
-    // cancelling the level-triggered FDS relationship that caused the
-    // rotation; otherwise every sufficiently slow FULL cancels itself before
-    // it can publish a replacement population.
-    const unsigned replacement_closed_at_control_loss = replacement_->closed();
+    const auto parent_identity = after_export_ready.ready_token_->identity();
+    const auto parent_cursor = after_export_ready.applied_next_lsns_;
+    if (parent_identity.source_node_id_ != local.local_node_id_ ||
+        parent_identity.source_boot_id_ != local.boot_id_ ||
+        parent_identity.term_ != 1 ||
+        parent_identity.source_history_id_.empty() ||
+        parent_cursor->size() != 1) {
+      co_return TestFailure(
+          "former Owner did not freeze its own source domain before retiring "
+          "history");
+    }
     reconciled = co_await replication_->CancelInProgressClusterPopulation(
         /*preserve_current_follow_attempt=*/true);
-    const lavik::ClusterPopulationStatus after_control_loss =
-        co_await replication_->cluster_population_status();
-    if (!reconciled.ok() ||
-        after_control_loss.state_ !=
-            lavik::ReplicationGroupState::kRebuilding ||
-        after_control_loss.ready_token_.has_value() ||
-        !replication_->upstream().has_value() ||
-        replacement_->closed() != replacement_closed_at_control_loss) {
-      co_return TestFailure(
-          "Meta session replacement cancelled its current steady "
-          "FollowOwner FULL");
-    }
-
-    // Every follower applies this decision independently: there is no Meta
-    // rebuild queue or Data-side admission controller that stages destructive
-    // FULL across members. Consequently all followers may reach this exact
-    // candidate-ineligible state together. If the new Owner fails before any
-    // FULL finishes, the next uncontrolled transition is deliberately allowed
-    // to remain fenced with candidate=null until some population becomes Ready.
-
-    // NodeControl applies steady replication before population readiness for
-    // one FDS. The ordinary FollowOwner FULL attempt is not backed by an
-    // operation directive, so the following population reconciliation must
-    // preserve it even though population_transition_expected is false. A
-    // candidate-less failover Begin advances only the authority term; it does
-    // not change the physical population being copied.
+    if (!reconciled.ok()) co_return reconciled;
     lavik::DesiredClusterPopulation desired_population{
         .group_id_ = desired.group_id_,
         .assignment_id_ = desired.local_assignment_id_,
-        .term_ = desired.group_term_,
+        .term_ = desired.group_term_ + 1,
         .manifest_revision_ = desired.manifest_revision_,
         .manifest_id_ = desired.manifest_id_,
         .partition_replication_epoch_ = desired.partition_replication_epoch_,
         .population_transition_expected_ = false,
     };
-    ++desired_population.term_;
     reconciled =
         co_await replication_->ReconcileClusterPopulation(desired_population);
-    const lavik::ClusterPopulationStatus after_population_reconcile =
-        co_await replication_->cluster_population_status();
-    if (!reconciled.ok() ||
-        after_population_reconcile.state_ !=
-            lavik::ReplicationGroupState::kRebuilding ||
-        !replication_->upstream().has_value() || replacement_->closed() != 0) {
+    if (!reconciled.ok()) co_return reconciled;
+    // The new Owner fails before any transfer replaces Active. Cancellation
+    // must finish independently and leave exact parent-domain evidence usable.
+    reconciled =
+        co_await replication_->ReconcileClusterFollowOwner(std::nullopt);
+    if (!reconciled.ok()) co_return reconciled;
+    const auto preserved = co_await replication_->cluster_population_status();
+    if (preserved.state_ != lavik::ReplicationGroupState::kReady ||
+        !preserved.ready_token_.has_value() ||
+        preserved.ready_token_->identity() != parent_identity ||
+        preserved.applied_next_lsns_ != parent_cursor ||
+        !preserved.failover_candidate_eligible_ ||
+        replication_->upstream().has_value()) {
       co_return TestFailure(
-          "candidate-less term fence retired its steady FollowOwner FULL "
-          "attempt");
+          "second Owner failure discarded the complete parent population");
     }
 
-    // The authority-only exception is deliberately narrow. Replacing the
-    // Owner still replaces the exact session/context ownership and must cancel
-    // the in-flight FULL before connecting to the new source.
-    const unsigned replacement_closed_before = replacement_->closed();
-    const unsigned unavailable_controls_before = unavailable_->controls();
-    reconciled = co_await replication_->ReconcileClusterFollowOwner(desired);
+    // An immutable population replacement still retires Active. Exercise the
+    // existing initial/unready FULL lifecycle after deliberately changing its
+    // assignment, so this destructive path never masquerades as staging.
+    auto changed_assignment = desired_population;
+    changed_assignment.assignment_id_ = "retire-active-assignment";
+    reconciled =
+        co_await replication_->ReconcileClusterPopulation(changed_assignment);
     if (!reconciled.ok()) co_return reconciled;
-    waited = co_await WaitUntil(
-        worker,
-        [&] {
-          return replacement_->closed() > replacement_closed_before &&
-                 unavailable_->controls() > unavailable_controls_before;
-        },
-        "owner replacement did not retire the in-flight steady FULL");
-    if (!waited.ok()) co_return waited;
-    const lavik::ClusterPopulationStatus after_owner_replacement =
-        co_await replication_->cluster_population_status();
-    if (after_owner_replacement.state_ !=
-            lavik::ReplicationGroupState::kNotReady ||
-        after_owner_replacement.ready_token_.has_value()) {
-      co_return TestFailure(
-          "owner replacement preserved a stale steady FollowOwner FULL");
-    }
     reconciled = co_await RestartSteadyFollowFull(worker, replacement);
     if (!reconciled.ok()) co_return reconciled;
 
@@ -4811,7 +5860,7 @@ TEST(ReplicationManagerIntegrationTest,
 }
 
 TEST(ReplicationManagerIntegrationTest,
-     FollowOwnerDestructiveFullRecordsAcceptedSecondFailureCandidateGap) {
+     FollowOwnerFullIntentPreservesFormerOwnerAcrossSecondFailure) {
   const std::string local_node_id(40, '9');
   constexpr std::uint16_t kReplicationPort = 6381;
   FollowOwnerSource unavailable(std::string(40, 'a'), std::string(40, 'c'),

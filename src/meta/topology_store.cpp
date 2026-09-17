@@ -544,6 +544,11 @@ absl::Status MetaTopologyStore::ReplaceFailoverTransition(
     return MetaDomainRejectError(
         "failover transition revision must strictly increase");
   }
+  if (current.recovery_deadline_unix_ms_.has_value() &&
+      installed.recovery_deadline_unix_ms_ !=
+          current.recovery_deadline_unix_ms_) {
+    return MetaDomainRejectError("failover recovery deadline is immutable");
+  }
   group.failover_transition_ = std::move(installed);
   return absl::OkStatus();
 }

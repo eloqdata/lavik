@@ -332,4 +332,55 @@ TEST(MetaFailoverObservationStore,
             kChargedBytes);
 }
 
+TEST(MetaFailoverObservationTest,
+     RecoveryCompletionRequiresExactDeadlineAndCompleteVector) {
+  FailoverFacts facts;
+  facts.transition_ = Controlled(facts);
+  facts.transition_->mode_ = meta::MetaFailoverMode::kUncontrolled;
+  facts.transition_->controlled_.reset();
+  facts.transition_->recovery_deadline_unix_ms_ = 3000;
+  meta::MetaObservationStore store;
+  const auto identity = CandidateIdentity(facts);
+  ASSERT_TRUE(store.AdoptSession(identity, 999).ok());
+  meta::MetaCandidateRecoveryCompleteObs complete{
+      .group_id_ = "g",
+      .transition_id_ = Bytes<16>(0x33),
+      .action_id_ = Bytes<16>(0x44),
+      .candidate_node_id_ = facts.candidate_,
+      .candidate_assignment_id_ = Bytes<16>(0x22),
+      .candidate_boot_id_ = Bytes<20>(0xb2),
+      .recovery_deadline_unix_ms_ = 3000,
+      .applied_next_lsns_ = {10, 20},
+      .completion_reason_ = "deadline",
+  };
+  auto ingest = [&] {
+    return store.Ingest(
+        {.identity_ = identity,
+         .payload_ = meta::MetaFailoverObservationObs{complete}},
+        facts, 1000);
+  };
+  ASSERT_TRUE(ingest().ok());
+  auto current = store.CandidateRecoveryCompleteFor(
+      complete.transition_id_, complete.action_id_, facts, 1001);
+  ASSERT_TRUE(current.has_value());
+  EXPECT_EQ(current->applied_next_lsns_, complete.applied_next_lsns_);
+  EXPECT_EQ(current->session_generation_, identity.session_generation_);
+  complete.recovery_deadline_unix_ms_ = 4000;
+  EXPECT_FALSE(ingest().ok());
+  complete.recovery_deadline_unix_ms_ = 3000;
+  complete.applied_next_lsns_ = {10};
+  EXPECT_FALSE(ingest().ok());
+  complete.applied_next_lsns_ = {10, 0};
+  EXPECT_FALSE(ingest().ok());
+  complete.applied_next_lsns_ = {10, 20};
+  complete.completion_reason_ = "still-receiving";
+  EXPECT_FALSE(ingest().ok());
+  facts.transition_->candidate_action_->action_id_ = Bytes<16>(0x45);
+  EXPECT_FALSE(store
+                   .CandidateRecoveryCompleteFor(complete.transition_id_,
+                                                 complete.action_id_, facts,
+                                                 1001)
+                   .has_value());
+}
+
 }  // namespace

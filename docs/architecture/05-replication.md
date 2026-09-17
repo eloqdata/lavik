@@ -79,7 +79,8 @@ Recovered candidates advertise no serving readiness until an authorized
 promotion preparation creates a new durable base and history. An authority-only
 term fence preserves their unchanged population scope. Bootstrap assignment,
 election ordering, committed Cutover and finite lease activation remain Meta's
-responsibility. Downstreams rebuild from the new history.
+responsibility. Compatible downstreams may adopt the promoted node's direct
+parent bridge; missing parent or child coverage requires FULL replacement.
 
 Readable recovered populations without a clean certificate report operator
 recovery availability without a source cursor. A committed operator-recovery
@@ -169,10 +170,10 @@ new upstream abandons that pending promotion and retires any partially prepared
 source history before the replacement full sync starts. No failure path opens
 the master write gate directly.
 
-Native cascading is not supported, so a candidate has no downstream session to
-reparent during promotion. Other replicas attach to the promoted node's child
-history through whole-group full sync. This version does not emit
-`HistorySwitch` or attempt partial reparent. Issuing `REPLICAOF NO ONE` while a
+Native cascading is not supported, so a candidate has no ordinary downstream
+session during promotion. Meta-managed replicas can adopt the promoted Owner's
+direct child through authenticated parent replay and `HistorySwitch`; standalone
+and Sentinel attachment continues to use the ordinary native FULL/CONTINUE path. Issuing `REPLICAOF NO ONE` while a
 full sync is incomplete does not resurrect the invalidated population; the
 node remains fenced rather than exposing the pre-sync state.
 
@@ -308,12 +309,14 @@ native next-LSN vector while the old owner continues reads, lease renewal, and
 already-established replication flows. Replacing the same pause transfers the
 hold; removing it releases that one level.
 
-On the selected candidate, `ReconcileClusterFailoverAction()` first waits for
-the exact Ready population and compatibility domain. Authorization is a
-one-way, action-scoped gate: after the candidate covers the required controlled
-frontier, or immediately under the explicit uncontrolled loss policy, the
-manager joins upstream apply and runs the shared durable promotion-preparation
-kernel. The resulting boot-local context freezes the parent frontier and
+On an ordinary selected candidate, `ReconcileClusterFailoverAction()` first
+waits for the exact Ready population and compatibility domain. Authorization is
+a one-way, action-scoped gate: controlled preparation requires the drained
+source frontier; an unauthorized uncontrolled action with historical lineage
+first completes bounded Candidate Recovery. Explicit operator recovery has no
+comparable historical domain and instead establishes its authorized fresh
+local base. Once authorized, the manager joins upstream apply and runs the shared
+durable promotion-preparation kernel. The resulting boot-local context freezes the parent frontier and
 population/catalog proof and creates the child history, but keeps the node
 `syncing`, LOADING, unable to expire, and closed to export. A replaced or
 removed action withdraws its observation and joins preparation; exact replay
@@ -343,26 +346,87 @@ authority. Any mismatch fails closed. No one-shot activation RPC can make an
 uncommitted candidate serve.
 
 An eligible steady FDS installs one `DesiredClusterUpstream` relationship. The
-owner authorizes the exact non-owner membership incarnations for native export;
-each non-owner connects directly to that owner. The ordinary native handshake
-learns the source boot/history and chooses CONTINUE when the retained population
-covers the live domain, otherwise FULL. A follower keeps its Ready population
-until an authenticated owner is actually able to export, avoiding destructive
-replacement merely because the endpoint is temporarily unavailable. Scope
-replacement cancels and joins the prior relationship. When an old owner becomes
-a follower, it first closes its role and expiration authority, revokes exports,
-and locally retires its former source history/backlog before following the new
-owner. This cleanup is a Data-owned consequence of desired topology, not
-another Meta failover phase.
+Owner authorizes exact non-Owner membership incarnations; each target connects
+directly. A former Owner first fences serving and expiration, revokes exports,
+drains accepted commands and expiration, and binds its complete population to
+its own frozen native source cut before retiring the source backlog. Its
+resume evidence therefore remains in that source domain until a local switch
+or complete replacement succeeds.
 
-Post-cutover replacements are not staged. Every follower may independently
-discover that CONTINUE is impossible and enter destructive FULL against the new
-owner at the same time. Once FULL withdraws those followers' old Ready proofs
-and before any replacement finishes, a second failure of the new owner can
-leave Meta with no eligible Candidate. An uncontrolled transition then waits
-for an eligible population instead of manufacturing recovery proof. There is
-no Meta rebuild queue or Data-side admission controller that preserves one
-follower while the others replace their populations.
+### Retained history and Candidate Recovery
+
+Every native follower retains an optional bounded suffix of original canonical
+logical effects after complete apply. Initial FULL contributes no fabricated
+history: retention begins with subsequent online events. The boot-local
+`ReplicationHistory` owns this cache and the accounting for published child
+blocks under one `repl-backlog-size` quota. Child publication has priority and
+may evict the secondary cache to zero without waiting for readers. A complete cluster Owner retains its current native domain across transient
+downstream disconnections; bounded log eviction still applies. Publisher,
+receive/reassembly, and transport memory have separate bounded process-memory
+charges. Readers copy bounded chunks without pinning cache entries; eviction
+withdraws coverage, never application progress or Owner write admission.
+
+`ReconcileClusterRecovery` installs a read-only export scope from the current
+FDS's action and member endpoint directory. `LVRECOVER` binds the Group, target
+term, transition/action, both memberships and process boots, parent domain,
+manifest/epoch, permitted ranges, and committed finite deadline. This capability
+lets a fenced compatible replica donate retained events; it grants neither
+ordinary cascading export nor client serving authority. Supersession closes
+old I/O and joins accepted complete applies before a replacement population
+or action can consume data.
+
+Only an unauthorized uncontrolled Candidate gathers from donors. The Candidate
+freezes a target envelope `E` from complete same-domain Applied observations;
+actual local Applied `A` advances only after complete storage application, while
+available coverage `C` may shrink as donors disconnect or evict history. Normal
+streaming, recovery, and parent replay share canonical transaction/control
+validation, storage apply, and complete cursor publication. A complete received
+effect can survive donor loss; partial fragments or missing transaction
+participants cannot advance any participating cursor. There is no all-donor
+reply barrier or all-replica activation barrier.
+
+The one absolute recovery deadline includes discovery, DNS, connection, transfer,
+and retry. Reaching `E`, exhausting useful coverage, or expiry stops optional
+I/O and drains accepted apply; `CandidateRecoveryComplete` reports actual
+`A_final` for the current action. A healthy population can then prepare even
+when `E` was unreachable. Controlled failover and a retained already-authorized
+lossless action continue their existing lossless preparation path. Recovery
+ACKs are process-local progress, never a durable quorum checkpoint.
+
+### Direct-parent reparent and population preservation
+
+Before activation, promotion installs the child backlog and at most one direct
+parent descriptor, using its actual frozen Applied boundary and population/
+catalog evidence. Parent and child have independent layouts. The child origin
+is the boundary established by preparation, not the Owner's later tail. Missing
+secondary payload never delays activation.
+
+An authenticated, export-ready Owner accepts `LVPARENT` under current membership
+and finite source authority. An exact parent boundary permits a zero-data
+switch; a behind cursor requires continuous retained parent coverage and
+complete replay. Both cases require every child flow to retain its origin.
+Ahead coordinates, domain mismatch, gaps, and incomplete attempts select FULL
+for that target. No divergent tail is rolled back or merged.
+
+`HistorySwitch` atomically replaces the target's whole domain, child-origin
+vector, and Ready proof while retaining the same complete physical population.
+The Owner records a bounded target-boot continuation capability before replying;
+the target commits locally before sending its final ACK. ACK loss can therefore
+reconnect through ordinary child CONTINUE, including a proved initial LSN of
+one, subject to fresh authorization and all-flow coverage checks. Completed
+native FULL uses the same boot-local origin proof, including an empty FULL
+whose complete cut remains at one. Process
+restart invalidates the bridge and continuation proof.
+
+Until local switch, a complete target remains eligible in its actual parent
+domain; afterward it reports the child domain. Partial cancellation joins
+accepted apply without withdrawing trustworthy Ready. When FULL is necessary
+and Active remains trustworthy, the adapter exposes a population replacement
+intent and preserves Active. Isolated staged transfer and atomic storage
+replacement are the separate staged-population primitive; this adapter does
+not destructively reset Active while awaiting it. Initial or already-unready
+FULL continues to use the existing destructive rebuild path. Uncertain apply
+or proof outcomes still fail closed.
 
 ## Single-group population coordination contract
 
@@ -1103,12 +1167,13 @@ connection metrics.
   forces its full sync; neither policy can leave a successful primary write
   out of the source history.
 - Native cascading replication is unsupported. A node with an upstream rejects
-  native downstream handshakes and Redis export, and replica application never
-  republishes upstream events.
+  ordinary native downstream handshakes and Redis export. Recovery-only export
+  has a separate current FDS/action scope; replica apply never republishes
+  upstream effects as new events.
 - Meta-managed post-cutover topology asks every non-owner to follow the new
-  owner directly. It reuses native CONTINUE/FULL selection and does not depend
-  on cascading or a separate rebuild operation. A former owner retires its old
-  source history locally before beginning that relationship.
+  Owner directly. It uses native CONTINUE, direct-parent HistorySwitch, or a
+  FULL replacement intent, without a separate Meta rebuild operation. A former
+  Owner freezes its source-domain cursor before retiring its old history.
 - Storage record application during replica synchronization bypasses the
   command layer's database gates. The code records that this breaks the
   exclusive, still-keyspace assumption used by KEYS's two-pass response and by

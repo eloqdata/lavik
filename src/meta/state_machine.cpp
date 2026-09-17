@@ -134,6 +134,14 @@ std::optional<FailoverCommitLog> DescribeFailoverCommit(
                 " suspect_ms=", cmd.suspect_duration_ms_, " reason=",
                 LogToken(MetaAutomaticFailoverReasonName(cmd.trigger_reason_)));
           }
+        } else if constexpr (std::is_same_v<Command, StartCandidateRecovery>) {
+          event = "recovery-start";
+          mode = "uncontrolled";
+          group = cmd.group_id_;
+          transition = HexId(cmd.expected_transition_.transition_id_);
+          action = HexId(cmd.action_id_);
+          detail = absl::StrCat(" recovery_deadline_ms=",
+                                cmd.recovery_deadline_unix_ms_);
         } else if constexpr (std::is_same_v<Command,
                                             SetUncontrolledCandidate>) {
           mode = "uncontrolled";

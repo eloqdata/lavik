@@ -251,6 +251,12 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
       replication_publish_queue_bytes_.load(std::memory_order_acquire);
   auto staging = TryReserveMemory(staging_bytes);
   if (!staging.has_value()) {
+    if (auto history = replication_history_.load(std::memory_order_acquire)) {
+      history->ReclaimSecondary(staging_bytes);
+      staging = TryReserveMemory(staging_bytes);
+    }
+  }
+  if (!staging.has_value()) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError(
         "insufficient retained-memory budget for replication publisher "
@@ -1313,6 +1319,15 @@ auto StorageEngine::Impl::AllocateReplicationLogBlock()
   }
   auto reservation = TryReserveMemory(sparse_bytes + block_bytes);
   if (!reservation.has_value()) {
+    // Standby and publisher memory have priority under process pressure, but
+    // spare memory is not a reason to discard a usable direct-parent suffix.
+    // Publishing a primary block separately enforces the shared history quota.
+    if (auto history = replication_history_.load(std::memory_order_acquire)) {
+      history->ReclaimSecondary(sparse_bytes + block_bytes);
+      reservation = TryReserveMemory(sparse_bytes + block_bytes);
+    }
+  }
+  if (!reservation.has_value()) {
     RecordMemoryRejection();
     return absl::ResourceExhaustedError(
         "maxmemory cannot allocate an in-memory replication backlog block");
@@ -1472,6 +1487,9 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
     evict_event();
   }
 
+  ReplicationHistory::PrimaryCharge history_charge;
+  if (auto history = replication_history_.load(std::memory_order_acquire))
+    history_charge = history->ChargePrimary(kStorageBlockBytes);
   if (log.standby_block_.has_value()) {
     log.blocks_.push_back(std::move(*log.standby_block_));
     log.standby_block_.reset();
@@ -1480,6 +1498,7 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
     if (!allocated.ok()) co_return allocated.status();
     log.blocks_.push_back(std::move(*allocated));
   }
+  log.blocks_.back().history_charge_ = std::move(history_charge);
   EnsureReplicationLogStandby(store);
   co_return absl::OkStatus();
 }

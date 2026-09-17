@@ -399,7 +399,8 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
 
   if (lifecycle.state_ == MetaClusterLifecycle::kCreated &&
       (!stores.policy_.CurrentAutomaticUncontrolledFailover().has_value() ||
-       !stores.policy_.CurrentAuthorityLease().has_value())) {
+       !stores.policy_.CurrentAuthorityLease().has_value() ||
+       !stores.policy_.CurrentCandidateRecovery().has_value())) {
     return MetaFailStopError(
         "Created cluster lacks a registered current global Policy");
   }
@@ -2029,6 +2030,66 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
+                      const StartCandidateRecovery& cmd) {
+  std::string summary = absl::StrCat(
+      "StartCandidateRecovery group=", cmd.group_id_,
+      " transition=", HexBytes(cmd.expected_transition_.transition_id_),
+      " action=", HexBytes(cmd.action_id_),
+      " deadline=", cmd.recovery_deadline_unix_ms_, " index=", log_index);
+  if (!ClusterLifecycleAllowsFailover(stores) ||
+      log_index <= cmd.expected_transition_.revision_) {
+    return Rejected(
+        "recovery requires Created lifecycle and advancing revision",
+        std::move(summary));
+  }
+  const auto group = stores.topology_.FindGroup(cmd.group_id_);
+  const auto grant = stores.topology_.AuthorityFor(cmd.group_id_);
+  if (!group.has_value() || !grant.has_value() || grant->grant_.has_value() ||
+      !group->failover_transition_.has_value()) {
+    return Rejected("recovery requires a fenced failover transition",
+                    std::move(summary));
+  }
+  const auto& current = *group->failover_transition_;
+  if (current.mode_ != MetaFailoverMode::kUncontrolled ||
+      !current.candidate_action_.has_value() ||
+      current.candidate_action_->action_id_ != cmd.action_id_ ||
+      current.candidate_action_->operator_recovery_ ||
+      current.candidate_action_->authorization_.has_value()) {
+    return Rejected("recovery requires an unauthorized uncontrolled action",
+                    std::move(summary));
+  }
+  if (current.transition_id_ == cmd.expected_transition_.transition_id_ &&
+      current.revision_ == log_index &&
+      current.recovery_deadline_unix_ms_ == cmd.recovery_deadline_unix_ms_ &&
+      ValidateDecodedAggregate(stores).ok())
+    return Accepted(std::move(summary));
+  if (!TransitionMatches(current, cmd.expected_transition_) ||
+      current.recovery_deadline_unix_ms_.has_value()) {
+    return Rejected(
+        "recovery cutoff is already fixed or transition CAS is stale",
+        std::move(summary));
+  }
+  auto replacement = current;
+  replacement.revision_ = log_index;
+  replacement.recovery_deadline_unix_ms_ = cmd.recovery_deadline_unix_ms_;
+  if (auto status = ValidateMetaFailoverTransition(replacement); !status.ok()) {
+    return Rejected(status, std::move(summary));
+  }
+  MetaApplyRollback rollback(stores, cmd);
+  if (auto status = stores.topology_.ReplaceFailoverTransition(
+          cmd.group_id_, cmd.expected_transition_, replacement, log_index);
+      !status.ok()) {
+    return Rejected(status, std::move(summary));
+  }
+  if (auto status = ValidateAffectedNodeControls(stores, log_index,
+                                                 GroupRecipients(*group));
+      !status.ok())
+    return Rejected(status, std::move(summary));
+  rollback.Commit();
+  return Accepted(std::move(summary));
+}
+
+ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                       const AuthorizeFailoverPrepare& cmd) {
   std::string summary = absl::StrCat(
       "AuthorizeFailoverPrepare group=", cmd.group_id_,
@@ -2065,6 +2126,12 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   }
   if (current.candidate_action_->authorization_.has_value()) {
     return Rejected("failover action is already authorized",
+                    std::move(summary));
+  }
+  if (current.mode_ == MetaFailoverMode::kUncontrolled &&
+      !current.candidate_action_->operator_recovery_ &&
+      !current.recovery_deadline_unix_ms_.has_value()) {
+    return Rejected("uncontrolled prepare requires recovery start",
                     std::move(summary));
   }
   if ((current.mode_ == MetaFailoverMode::kControlled &&
@@ -2554,15 +2621,16 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
     return Rejected("cluster-create completion root anchor mismatch",
                     std::move(summary));
   }
-  // Creation installs both compiled-in global Policy families before any
+  // Creation installs all compiled-in global Policy families before any
   // authority. Keep that ordering as an apply invariant as well as a planner
   // convention: otherwise a malformed or stale trusted command can commit a
   // Created state that only fails closed after a snapshot restore, while WAL
   // replay alone would continue serving the invalid aggregate.
   if (!stores.policy_.CurrentAutomaticUncontrolledFailover().has_value() ||
-      !stores.policy_.CurrentAuthorityLease().has_value()) {
+      !stores.policy_.CurrentAuthorityLease().has_value() ||
+      !stores.policy_.CurrentCandidateRecovery().has_value()) {
     return Rejected(
-        "cluster-create completion requires both current global Policies",
+        "cluster-create completion requires all current global Policies",
         std::move(summary));
   }
   const bool operation_effect_applied =

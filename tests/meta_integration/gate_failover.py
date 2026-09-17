@@ -1165,6 +1165,11 @@ def run_controlled(meta_binary, data_binary, ctl, redis_cli, workdir,
         initial = "before-cutover"
         fixture.seed_and_wait_for_replicas(
             key, initial, (CANDIDATE, FOLLOWER))
+        full_admissions = {
+            node.node_id: open(node.log_path, encoding="utf-8").read().count(
+                "durably invalidated system state")
+            for node in fixture.data_nodes
+        }
         if fixture.hook_available:
             read_probe = ContinuousGetProbe(
                 fixture.by_id[OWNER], key, initial)
@@ -1284,8 +1289,14 @@ def run_controlled(meta_binary, data_binary, ctl, redis_cli, workdir,
                 lambda follower_id=follower_id:
                 readonly_get(fixture.by_id[follower_id], key) ==
                 repeated_value)
+        for node in fixture.data_nodes:
+            with open(node.log_path, encoding="utf-8") as log:
+                current_fulls = log.read().count("durably invalidated system state")
+            if current_fulls != full_admissions[node.node_id]:
+                raise H.Failure(
+                    f"compatible reparent destructively rebuilt {node.node_id[:8]}")
         H.log("repeated controlled cutover: term 3 served and every follower "
-              "converged")
+              "converged through partial reparent without another FULL")
         fixture.require_expected_processes_alive()
         fixture.clean_shutdown()
     except Exception:

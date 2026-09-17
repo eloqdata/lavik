@@ -406,6 +406,29 @@ struct CandidatePrepared {
                          const CandidatePrepared&) = default;
 };
 
+// Complete, drained Applied cut for one recovery attempt. The target envelope
+// and donor coverage are deliberately absent: neither proves local effects.
+struct CandidateRecoveryComplete {
+  WireId128 transition_id{};
+  WireId128 action_id{};
+  std::string candidate_node_id;
+  WireId128 candidate_assignment_id{};
+  std::string candidate_boot_id;
+  std::uint64_t recovery_deadline_unix_ms = 0;
+  std::vector<std::uint64_t> applied_next_lsns;
+  std::string completion_reason;
+
+  friend bool operator==(const CandidateRecoveryComplete&,
+                         const CandidateRecoveryComplete&) = default;
+};
+
+// Finite protocol vocabulary; completion says ingress has drained, not that
+// every visible donor's frontier was reached or that cutover is lossless.
+inline bool IsRecoveryCompletionReason(std::string_view reason) {
+  return reason == "target-reached" || reason == "coverage-unavailable" ||
+         reason == "deadline" || reason == "disabled";
+}
+
 struct ActionFailed {
   WireId128 transition_id{};
   WireId128 action_id{};
@@ -422,7 +445,8 @@ struct ActionFailed {
 };
 
 using FailoverObservation =
-    std::variant<SourcePaused, CandidatePrepared, ActionFailed>;
+    std::variant<SourcePaused, CandidatePrepared, ActionFailed,
+                 CandidateRecoveryComplete>;
 
 struct Heartbeat {
   WireId128 session_id{};
@@ -772,6 +796,9 @@ struct WireFailoverTransition {
   WireFailoverMode mode = WireFailoverMode::kUncontrolled;
   std::uint64_t target_term = 0;
   std::optional<WireFailoverCandidateAction> candidate_action;
+  // Fixed transition-wide cutoff for optional gathering; safety drain may
+  // outlive it.
+  std::optional<std::uint64_t> recovery_deadline_unix_ms;
 
   friend bool operator==(const WireFailoverTransition&,
                          const WireFailoverTransition&) = default;

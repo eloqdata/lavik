@@ -926,6 +926,13 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     policy.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
     ProposeAccepted(policy);
 
+    lavik::meta::PutPolicy recovery;
+    recovery.request_id_ = MakeRequestId(0x9c);
+    recovery.policy_id_ = std::string(lavik::meta::kCandidateRecoveryPolicyId);
+    recovery.version_ = 1;
+    recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+    ProposeAccepted(recovery);
+
     lavik::meta::CompleteOperation complete_root;
     complete_root.request_id_ = MakeRequestId(0x92);
     complete_root.operation_id_ = root.operation_id_;

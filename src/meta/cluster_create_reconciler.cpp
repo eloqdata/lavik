@@ -390,9 +390,10 @@ absl::Status ValidateV1FinalTopology(const MetaStores& stores,
     return absl::FailedPreconditionError(
         "creation Slot map differs from intent");
   if (!stores.policy_.CurrentAutomaticUncontrolledFailover().has_value() ||
-      !stores.policy_.CurrentAuthorityLease().has_value()) {
+      !stores.policy_.CurrentAuthorityLease().has_value() ||
+      !stores.policy_.CurrentCandidateRecovery().has_value()) {
     return absl::FailedPreconditionError(
-        "creation requires both registered global policies");
+        "creation requires all registered global policies");
   }
   for (const auto& declaration : manifest.groups_) {
     const auto group = stores.topology_.FindGroup(declaration.group_id_);
@@ -962,6 +963,15 @@ Plan PlanV1ClusterCreateStep(const MetaCommittedView& view,
       command.policy_id_ = kAuthorityLeasePolicyId;
       command.version_ = 1;
       command.content_ = AuthorityLeasePolicyContent(*manifest);
+      return Emit(std::move(command));
+    }
+    if (!stores.policy_.CurrentCandidateRecovery().has_value()) {
+      PutPolicy command;
+      command.policy_id_ = kCandidateRecoveryPolicyId;
+      command.version_ = 1;
+      command.content_ =
+          absl::StrCat("{\"kind\":\"candidate-recovery-v1\",\"budget_ms\":",
+                       manifest->candidate_recovery_budget_ms_, "}");
       return Emit(std::move(command));
     }
     return Advance(operation, kRootPhaseRegisterData);

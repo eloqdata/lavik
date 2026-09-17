@@ -164,6 +164,10 @@ absl::Status ValidateRegisteredDocument(std::string_view policy_id,
     auto decoded = DecodeAuthorityLeasePolicy(raw);
     return decoded.ok() ? absl::OkStatus() : decoded.status();
   }
+  if (policy_id == kCandidateRecoveryPolicyId) {
+    auto decoded = DecodeCandidateRecoveryPolicy(raw);
+    return decoded.ok() ? absl::OkStatus() : decoded.status();
+  }
   return MetaDomainRejectError("unregistered policy family");
 }
 
@@ -222,6 +226,22 @@ absl::StatusOr<MetaAuthorityLeasePolicy> DecodeAuthorityLeasePolicy(
     return MetaDomainRejectError("duration_ms outside supported range");
   }
   return MetaAuthorityLeasePolicy{.duration_ms_ = *duration_value};
+}
+
+absl::StatusOr<MetaCandidateRecoveryPolicy> DecodeCandidateRecoveryPolicy(
+    std::string_view raw) {
+  auto object = CompactJsonObjectParser(raw).Parse();
+  if (!object.ok()) return object.status();
+  if (auto status = RequireExactFields(*object, {"kind", "budget_ms"});
+      !status.ok())
+    return status;
+  if (auto status = RequireKind(*object, "candidate-recovery-v1"); !status.ok())
+    return status;
+  const auto* budget = std::get_if<std::uint64_t>(&object->at("budget_ms"));
+  if (budget == nullptr || *budget > kMaximumCandidateRecoveryBudgetMs) {
+    return MetaDomainRejectError("budget_ms outside supported range");
+  }
+  return MetaCandidateRecoveryPolicy{.budget_ms_ = *budget};
 }
 
 absl::Status MetaPolicyStore::Apply(const PutPolicy& cmd) {
@@ -324,6 +344,17 @@ std::optional<MetaAuthorityLeasePolicy> MetaPolicyStore::CurrentAuthorityLease()
   return *decoded;
 }
 
+std::optional<MetaCandidateRecoveryPolicy>
+MetaPolicyStore::CurrentCandidateRecovery() const {
+  const auto policy = policies_.find(std::string(kCandidateRecoveryPolicyId));
+  if (policy == policies_.end() || policy->second.empty()) return std::nullopt;
+  const auto& [version, state] = *policy->second.rbegin();
+  auto decoded = DecodeCandidateRecoveryPolicy(state);
+  if (!decoded.ok()) return std::nullopt;
+  decoded->version_ = version;
+  return *decoded;
+}
+
 void MetaPolicyStore::WriteSnapshot(MetaWriter& writer) const {
   writer.WriteU16(kMetaFormatVersion);
   writer.WriteCount(static_cast<std::uint32_t>(policies_.size()));
@@ -357,7 +388,7 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
   if (*schema != kMetaFormatVersion) {
     return MetaFailStopError("unknown policy snapshot schema_version");
   }
-  auto policy_count = reader.ReadCount(2);
+  auto policy_count = reader.ReadCount(3);
   if (!policy_count.ok()) return policy_count.status();
 
   MetaPolicyStore store;
@@ -365,7 +396,8 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
     auto policy_id = reader.ReadString(kMaxMetaPolicyIdBytes);
     if (!policy_id.ok()) return policy_id.status();
     if (*policy_id != kAutomaticUncontrolledFailoverPolicyId &&
-        *policy_id != kAuthorityLeasePolicyId) {
+        *policy_id != kAuthorityLeasePolicyId &&
+        *policy_id != kCandidateRecoveryPolicyId) {
       return MetaFailStopError("unregistered policy family in snapshot");
     }
     if (store.policies_.contains(std::string(*policy_id))) {

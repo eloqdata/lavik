@@ -341,6 +341,11 @@ void StorageEngine::ReleaseFullSyncValue(std::uint64_t session_id,
   impl_->ReleaseFullSyncValue(session_id, partition_id, source_id);
 }
 
+void StorageEngine::SetReplicationHistory(
+    std::shared_ptr<lavik::ReplicationHistory> history) {
+  impl_->SetReplicationHistory(std::move(history));
+}
+
 Task<absl::Status> StorageEngine::EnableReplicationLog(
     std::uint64_t log_epoch, std::size_t capacity_bytes) {
   return impl_->EnableReplicationLog(log_epoch, capacity_bytes);

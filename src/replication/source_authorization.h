@@ -154,6 +154,11 @@ class SourceAuthorizationLedger {
       std::chrono::nanoseconds deadline_since_boot) noexcept {
     lease_admission_deadline_ = deadline_since_boot;
   }
+  // Read-only partial export uses the same current finite Owner lease gate.
+  bool LeaseAdmissionOpen(
+      std::chrono::nanoseconds now_since_boot) const noexcept {
+    return now_since_boot < lease_admission_deadline_;
+  }
   void SuspendLeaseAdmission() noexcept {
     lease_admission_deadline_ = std::chrono::nanoseconds::zero();
   }

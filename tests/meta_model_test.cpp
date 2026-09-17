@@ -2076,6 +2076,12 @@ lavik::meta::PutPolicy MakeAuthorityLeasePolicy(std::uint64_t version = 1) {
 void SeedRequiredCurrentPolicies(MetaStores& stores) {
   ASSERT_TRUE(stores.policy_.Apply(MakeAutomaticFailoverPolicy()).ok());
   ASSERT_TRUE(stores.policy_.Apply(MakeAuthorityLeasePolicy()).ok());
+  ASSERT_TRUE(
+      stores.policy_
+          .Apply(MakePutPolicy(
+              std::string(lavik::meta::kCandidateRecoveryPolicyId), 1,
+              "{\"kind\":\"candidate-recovery-v1\",\"budget_ms\":2000}"))
+          .ok());
 }
 
 std::string ClusterCreateFailureSummaryForTest(
@@ -2149,23 +2155,27 @@ TEST(MetaStateApply, ClusterCreateRootAtomicallyOwnsLifecycle) {
 }
 
 TEST(MetaStateApply,
-     ClusterCreateCompletionRequiresBothCurrentPoliciesDuringWalApply) {
-  const auto expect_rejected = [](bool install_automatic) {
+     ClusterCreateCompletionRequiresEveryCurrentPolicyDuringWalApply) {
+  const std::array policies{
+      MakeAutomaticFailoverPolicy(), MakeAuthorityLeasePolicy(),
+      MakePutPolicy(std::string(lavik::meta::kCandidateRecoveryPolicyId), 1,
+                    "{\"kind\":\"candidate-recovery-v1\",\"budget_ms\":2000}")};
+  for (std::size_t missing = 0; missing < policies.size(); ++missing) {
+    SCOPED_TRACE(missing);
     MetaStores stores;
-    const auto root = MakeClusterCreateSubmit(
-        install_automatic ? std::uint8_t{0x6a} : std::uint8_t{0x6b});
+    const auto root = MakeClusterCreateSubmit(0x6a);
     ApplyOk(stores, 1, MetaCommand{root});
-    ApplyOk(stores, 2,
-            MetaCommand{install_automatic ? MakeAutomaticFailoverPolicy()
-                                          : MakeAuthorityLeasePolicy()});
-
+    std::uint64_t index = 2;
+    for (std::size_t policy = 0; policy < policies.size(); ++policy) {
+      if (policy != missing)
+        ApplyOk(stores, index++, MetaCommand{policies[policy]});
+    }
     lavik::meta::CompleteOperation complete;
     complete.request_id_ = MakeRequestId(0x6c);
     complete.operation_id_ = root.operation_id_;
     complete.expected_revision_ = 0;
     complete.result_ = "cluster-created";
-    ApplyRejected(stores, 3, MetaCommand{complete});
-
+    ApplyRejected(stores, index, MetaCommand{complete});
     EXPECT_EQ(stores.topology_.ClusterLifecycle().state_,
               lavik::meta::MetaClusterLifecycle::kCreating);
     ASSERT_TRUE(
@@ -2174,10 +2184,7 @@ TEST(MetaStateApply,
               lavik::meta::MetaOperationLifecycle::kSubmitted);
     const auto restored = MetaStores::Deserialize(MustSerialize(stores));
     EXPECT_TRUE(restored.ok()) << restored.status();
-  };
-
-  expect_rejected(/*install_automatic=*/true);
-  expect_rejected(/*install_automatic=*/false);
+  }
 }
 
 TEST(MetaStateApply,

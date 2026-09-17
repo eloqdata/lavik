@@ -280,6 +280,31 @@ class ReplicationGroup {
   // Repeating publication for the same ready identity is idempotent.
   absl::StatusOr<ReadyToken> PublishReady(const RebuildIdentity& identity);
 
+  // Adopts an authenticated direct-child history without replacing storage.
+  // The caller first drains ingress and proves that actual Applied equals the
+  // complete parent boundary advertised by the current Owner. Both layouts
+  // are independent; child cursors come from that boundary, never its tail.
+  // Publication stays READY and atomically replaces identity and whole cut.
+  absl::StatusOr<ReadyToken> SwitchHistory(
+      const ReadyToken& parent, const RebuildDirective& child,
+      const PopulationManifest& manifest,
+      std::span<const std::uint64_t> actual_parent,
+      std::span<const std::uint64_t> required_parent,
+      std::span<const std::uint64_t> child_origin);
+
+  // Reanchors a complete local Owner population to its own native publisher.
+  // The caller must fence writes, drain accepted commands and expiration, and
+  // capture the whole source cut before retiring that publisher. This may be
+  // the initial source-less population or a rotated boot-local source history;
+  // an explicitly authorized operator recovery may instead bind its fresh
+  // complete local base to the first publisher in that same term. That origin
+  // is not a recovered historical cursor. This is not a peer HistorySwitch
+  // and grants no serving or reset authority.
+  absl::StatusOr<ReadyToken> BindLocalSourceHistory(
+      const ReadyToken& population, const RebuildDirective& source,
+      const PopulationManifest& manifest,
+      std::span<const std::uint64_t> source_cut);
+
   // Abandons the matching partial attempt and returns to NOT_READY. A later
   // attempt must use a fresh attempt identity.
   absl::Status Abort(const RebuildIdentity& identity);

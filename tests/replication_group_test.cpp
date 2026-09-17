@@ -125,6 +125,104 @@ TEST(PopulationManifestTest,
   EXPECT_EQ(first->logical_epochs()[16'383], 11);
 }
 
+TEST(ReplicationGroupTest,
+     HistorySwitchPreservesReadyAndChangesTheWholeLayout) {
+  lavik::ReplicationGroup group("target-1", "target-boot-1");
+  auto parent = Directive();
+  ASSERT_TRUE(group.BeginRebuild(parent, Manifest()).ok());
+  RecordCompleteManifestProof(group, parent.identity_, Manifest());
+  ASSERT_TRUE(group.MarkFunctionCatalogComplete(parent.identity_).ok());
+  ASSERT_TRUE(group
+                  .RecordFlowCutVector(parent.identity_,
+                                       std::vector<std::uint64_t>{10, 20})
+                  .ok());
+  ASSERT_TRUE(group.MarkStoragePromoted(parent.identity_).ok());
+  auto ready = group.PublishReady(parent.identity_);
+  ASSERT_TRUE(ready.ok());
+  auto child = Directive("group-a", 8, "history-switch", true, 1);
+  child.identity_.source_node_id_ = "new-owner";
+  child.identity_.source_history_id_ = "child-history";
+  const std::vector<std::uint64_t> boundary{11, 21}, origin{1};
+  EXPECT_FALSE(group
+                   .SwitchHistory(*ready, child, Manifest(),
+                                  std::vector<std::uint64_t>{11, 20}, boundary,
+                                  origin)
+                   .ok());
+  EXPECT_EQ(group.state(), lavik::ReplicationGroupState::kReady);
+  EXPECT_TRUE(group.PublishReady(parent.identity_).ok());
+  EXPECT_FALSE(group
+                   .SwitchHistory(*ready, child, Manifest(),
+                                  std::vector<std::uint64_t>{12, 21}, boundary,
+                                  origin)
+                   .ok());
+  auto changed = child;
+  ++changed.identity_.partition_replication_epoch_;
+  EXPECT_FALSE(group
+                   .SwitchHistory(*ready, changed, Manifest(), boundary,
+                                  boundary, origin)
+                   .ok());
+  auto switched = group.SwitchHistory(*ready, child, Manifest(), boundary,
+                                      boundary, origin);
+  ASSERT_TRUE(switched.ok()) << switched.status();
+  EXPECT_EQ(group.state(), lavik::ReplicationGroupState::kReady);
+  EXPECT_EQ(switched->identity(), child.identity_);
+  EXPECT_EQ(std::vector<std::uint64_t>(switched->cut_vector().begin(),
+                                       switched->cut_vector().end()),
+            origin);
+  EXPECT_TRUE(
+      group.SwitchHistory(*ready, child, Manifest(), boundary, boundary, origin)
+          .ok());
+  EXPECT_FALSE(group.InvalidateProof(parent.identity_).ok());
+  EXPECT_EQ(group.state(), lavik::ReplicationGroupState::kReady);
+}
+
+TEST(ReplicationGroupTest, FencedLocalSourceBindingPreservesPopulationAnchors) {
+  lavik::ReplicationGroup group("target-1", "target-boot-1");
+  auto identity = Directive().identity_;
+  identity.source_node_id_.clear();
+  identity.source_assignment_id_.clear();
+  identity.source_boot_id_.clear();
+  identity.source_history_id_.clear();
+  identity.target_history_id_ = "initial-source-history";
+  ASSERT_TRUE(group.BeginEmptyPopulation(identity, Manifest()).ok());
+  RecordCompleteManifestProof(group, identity, Manifest());
+  ASSERT_TRUE(group.MarkFunctionCatalogComplete(identity).ok());
+  ASSERT_TRUE(group.MarkStoragePromoted(identity).ok());
+  auto ready = group.PublishReady(identity);
+  ASSERT_TRUE(ready.ok());
+  auto source = Directive();
+  source.identity_.directive_revision_ = 2;
+  source.identity_.attempt_id_ = "local-source";
+  source.identity_.source_node_id_ = identity.target_node_id_;
+  source.identity_.source_boot_id_ = identity.target_boot_id_;
+  source.identity_.source_assignment_id_ = identity.assignment_id_;
+  source.identity_.source_history_id_ = "live-source-history";
+  const std::vector<std::uint64_t> cut{31, 42};
+  auto invalid = source;
+  invalid.identity_.source_node_id_ = "another-node";
+  EXPECT_FALSE(
+      group.BindLocalSourceHistory(*ready, invalid, Manifest(), cut).ok());
+  invalid = source;
+  ++invalid.identity_.partition_replication_epoch_;
+  EXPECT_FALSE(
+      group.BindLocalSourceHistory(*ready, invalid, Manifest(), cut).ok());
+  auto bound = group.BindLocalSourceHistory(*ready, source, Manifest(), cut);
+  ASSERT_TRUE(bound.ok()) << bound.status();
+  EXPECT_EQ(bound->identity(), source.identity_);
+  EXPECT_EQ(std::vector<std::uint64_t>(bound->cut_vector().begin(),
+                                       bound->cut_vector().end()),
+            cut);
+  EXPECT_EQ(group.state(), lavik::ReplicationGroupState::kReady);
+  auto regressed = source;
+  ++regressed.identity_.directive_revision_;
+  regressed.identity_.attempt_id_ = "regression";
+  EXPECT_FALSE(group
+                   .BindLocalSourceHistory(*bound, regressed, Manifest(),
+                                           std::vector<std::uint64_t>{30, 42})
+                   .ok());
+  EXPECT_TRUE(group.PublishReady(source.identity_).ok());
+}
+
 TEST(PopulationManifestTest, SupportsEmptyAndFullDesiredPopulations) {
   auto empty = lavik::PopulationManifest::Create({});
   ASSERT_TRUE(empty.ok()) << empty.status();

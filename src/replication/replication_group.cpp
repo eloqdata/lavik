@@ -377,6 +377,8 @@ class ReplicationGroup::Impl {
     function_catalog_complete_ = false;
     storage_promoted_ = false;
     ready_token_.reset();
+    switched_parent_.reset();
+    switched_parent_boundary_.clear();
     state_ = ReplicationGroupState::kRebuilding;
     return DestructiveResetAuthorization(directive.identity_);
   }
@@ -511,6 +513,143 @@ class ReplicationGroup::Impl {
     return *ready_token_;
   }
 
+  absl::StatusOr<ReadyToken> SwitchHistory(
+      const ReadyToken& parent, const RebuildDirective& child,
+      const PopulationManifest& manifest,
+      std::span<const std::uint64_t> actual_parent,
+      std::span<const std::uint64_t> required_parent,
+      std::span<const std::uint64_t> child_origin) {
+    if (actual_parent.empty() || actual_parent.size() > 1024 ||
+        !std::ranges::equal(actual_parent, required_parent) ||
+        std::ranges::find(actual_parent, 0) != actual_parent.end() ||
+        child_origin.empty() || child_origin.size() != child.flow_count_ ||
+        std::ranges::find(child_origin, 0) != child_origin.end()) {
+      return absl::FailedPreconditionError(
+          "history switch has no exact complete parent boundary or child "
+          "origin");
+    }
+    if (state_ != ReplicationGroupState::kReady || !ready_token_.has_value()) {
+      return absl::FailedPreconditionError(
+          "history switch requires a complete current Ready population");
+    }
+    if (ready_token_->identity() == child.identity_ &&
+        switched_parent_.has_value() &&
+        switched_parent_->identity() == parent.identity() &&
+        std::ranges::equal(switched_parent_->cut_vector(),
+                           parent.cut_vector()) &&
+        std::ranges::equal(switched_parent_boundary_, required_parent) &&
+        std::ranges::equal(ready_token_->cut_vector(), child_origin))
+      return *ready_token_;
+    if (ready_token_->identity() != parent.identity() ||
+        !std::ranges::equal(ready_token_->cut_vector(), parent.cut_vector())) {
+      return absl::FailedPreconditionError(
+          "history switch parent proof is stale");
+    }
+    const auto& old = parent.identity();
+    const auto& next = child.identity_;
+    if (old.group_id_ != next.group_id_ ||
+        old.assignment_id_ != next.assignment_id_ ||
+        old.target_node_id_ != next.target_node_id_ ||
+        old.target_boot_id_ != next.target_boot_id_ ||
+        old.manifest_revision_ != next.manifest_revision_ ||
+        old.manifest_id_ != next.manifest_id_ ||
+        old.partition_replication_epoch_ != next.partition_replication_epoch_ ||
+        next.term_ <= old.term_ ||
+        next.source_history_id_ == old.source_history_id_ ||
+        next.source_history_id_ == old.target_history_id_) {
+      return absl::FailedPreconditionError(
+          "history switch changed population anchors or did not enter a child "
+          "domain");
+    }
+    if (!parent.cut_vector().empty()) {
+      if (actual_parent.size() != parent.cut_vector().size())
+        return absl::FailedPreconditionError(
+            "history switch parent layout differs from Ready proof");
+      for (std::size_t flow = 0; flow < actual_parent.size(); ++flow) {
+        if (actual_parent[flow] < parent.cut_vector()[flow])
+          return absl::FailedPreconditionError(
+              "history switch regressed below its population cut");
+      }
+    }
+    auto validated = ValidateRebuild(child, manifest);
+    if (!validated.ok()) return validated;
+    return CommitHistoryProof(parent, child, required_parent, child_origin);
+  }
+
+  absl::StatusOr<ReadyToken> BindLocalSourceHistory(
+      const ReadyToken& population, const RebuildDirective& source,
+      const PopulationManifest& manifest,
+      std::span<const std::uint64_t> source_cut) {
+    const auto& old = population.identity();
+    const auto& next = source.identity_;
+    if (state_ != ReplicationGroupState::kReady || !ready_token_.has_value() ||
+        ready_token_->identity() != old ||
+        !std::ranges::equal(ready_token_->cut_vector(),
+                            population.cut_vector()) ||
+        old.group_id_ != next.group_id_ ||
+        old.assignment_id_ != next.assignment_id_ ||
+        old.target_node_id_ != next.target_node_id_ ||
+        old.target_boot_id_ != next.target_boot_id_ ||
+        old.manifest_revision_ != next.manifest_revision_ ||
+        old.manifest_id_ != next.manifest_id_ ||
+        old.partition_replication_epoch_ != next.partition_replication_epoch_ ||
+        next.term_ < old.term_ || next.source_node_id_ != local_node_id_ ||
+        next.source_boot_id_ != local_boot_id_ ||
+        next.source_assignment_id_ != next.assignment_id_ ||
+        source_cut.empty() || source_cut.size() != source.flow_count_ ||
+        std::ranges::find(source_cut, 0) != source_cut.end()) {
+      return absl::FailedPreconditionError(
+          "local source binding requires the current complete local population "
+          "and source cut");
+    }
+    if (old.source_history_id_ == next.source_history_id_) {
+      if (population.cut_vector().size() != source_cut.size()) {
+        return absl::FailedPreconditionError(
+            "local source layout changed within one history");
+      }
+      for (std::size_t flow = 0; flow < source_cut.size(); ++flow) {
+        if (source_cut[flow] < population.cut_vector()[flow]) {
+          return absl::FailedPreconditionError(
+              "local source cut regressed below its population proof");
+        }
+      }
+    }
+    auto validated = ValidateRebuild(source, manifest);
+    if (!validated.ok()) return validated;
+    return CommitHistoryProof(population, source, source_cut, source_cut);
+  }
+
+  absl::StatusOr<ReadyToken> CommitHistoryProof(
+      const ReadyToken& parent, const RebuildDirective& child,
+      std::span<const std::uint64_t> required_parent,
+      std::span<const std::uint64_t> child_origin) {
+    const auto& next = child.identity_;
+    // Keep the completed physical partition/catalog proof. There is no reset,
+    // no transient REBUILDING state, and no opportunity to publish half of a
+    // new layout. The caller publishes its matching live cursor in the same
+    // coordinator turn before any observer or new flow can run.
+    // Allocate every fallible copy before the commit. The publication below
+    // only moves owned values; an allocation failure cannot expose half a
+    // domain to the manager that publishes the matching live frontier.
+    auto retained_parent = parent;
+    auto retained_boundary = std::vector<std::uint64_t>(required_parent.begin(),
+                                                        required_parent.end());
+    auto accepted = child;
+    auto current = child;
+    auto cut =
+        std::vector<std::uint64_t>(child_origin.begin(), child_origin.end());
+    auto published = ReadyToken(next, cut);
+    auto result = published;
+    used_attempts_.insert(AttemptKey{next.operation_id_, next.attempt_id_});
+    switched_parent_ = std::move(retained_parent);
+    switched_parent_boundary_ = std::move(retained_boundary);
+    last_directive_ = std::move(accepted);
+    current_directive_ = std::move(current);
+    flow_cut_vector_ = std::move(cut);
+    ready_token_ = std::move(published);
+    return result;
+  }
+
   absl::StatusOr<ReadyToken> PublishReady(const RebuildIdentity& identity) {
     if (state_ == ReplicationGroupState::kReady && ready_token_.has_value()) {
       if (ready_token_->identity() == identity) return *ready_token_;
@@ -635,6 +774,8 @@ class ReplicationGroup::Impl {
   bool function_catalog_complete_ = false;
   bool storage_promoted_ = false;
   std::optional<ReadyToken> ready_token_;
+  std::optional<ReadyToken> switched_parent_;
+  std::vector<std::uint64_t> switched_parent_boundary_;
 };
 
 ReplicationGroup::ReplicationGroup(std::string local_node_id,
@@ -709,6 +850,24 @@ absl::Status ReplicationGroup::MarkStoragePromoted(
 absl::StatusOr<ReadyToken> ReplicationGroup::RecoverPopulation(
     RebuildIdentity identity, std::vector<std::uint64_t> frontier) {
   return impl_->RecoverPopulation(std::move(identity), std::move(frontier));
+}
+
+absl::StatusOr<ReadyToken> ReplicationGroup::SwitchHistory(
+    const ReadyToken& parent, const RebuildDirective& child,
+    const PopulationManifest& manifest,
+    std::span<const std::uint64_t> actual_parent,
+    std::span<const std::uint64_t> required_parent,
+    std::span<const std::uint64_t> child_origin) {
+  return impl_->SwitchHistory(parent, child, manifest, actual_parent,
+                              required_parent, child_origin);
+}
+
+absl::StatusOr<ReadyToken> ReplicationGroup::BindLocalSourceHistory(
+    const ReadyToken& population, const RebuildDirective& source,
+    const PopulationManifest& manifest,
+    std::span<const std::uint64_t> source_cut) {
+  return impl_->BindLocalSourceHistory(population, source, manifest,
+                                       source_cut);
 }
 
 absl::StatusOr<ReadyToken> ReplicationGroup::PublishReady(

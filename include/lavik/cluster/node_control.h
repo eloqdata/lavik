@@ -152,14 +152,15 @@ struct PreparedFailoverAction {
                          const PreparedFailoverAction&) = default;
 };
 
-// Wire-independent committed execution subset. Operator/deadline workflow data
-// does not drive Data behavior and intentionally does not cross this seam.
+// Wire-independent execution subset. The recovery cutoff crosses this seam
+// because it bounds Data ingress; controlled operator workflow stays in Meta.
 struct PreparedFailoverTransition {
   FailoverTransitionId transition_id_;
   std::uint64_t revision_ = 0;
   PreparedFailoverMode mode_ = PreparedFailoverMode::kUncontrolled;
   std::uint64_t target_term_ = 0;
   std::optional<PreparedFailoverAction> candidate_action_;
+  std::optional<std::uint64_t> recovery_deadline_unix_ms_;
 
   friend bool operator==(const PreparedFailoverTransition&,
                          const PreparedFailoverTransition&) = default;
@@ -187,6 +188,8 @@ struct DesiredClusterControl {
   // exact population directive owns target ingress; ordinary Follow Owner is
   // held until a later complete local control removes the directive.
   bool population_transition_expected_ = false;
+  // Same-FDS member routes for optional read-only recovery discovery.
+  std::vector<PreparedReplicationEndpoint> member_endpoints_;
 
   friend bool operator==(const DesiredClusterControl&,
                          const DesiredClusterControl&) = default;

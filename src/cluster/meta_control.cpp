@@ -73,6 +73,7 @@ PreparedFailoverTransition ToPreparedFailoverTransition(
                    : PreparedFailoverMode::kUncontrolled,
       .target_term_ = source.target_term,
       .candidate_action_ = std::nullopt,
+      .recovery_deadline_unix_ms_ = source.recovery_deadline_unix_ms,
   };
   if (!source.candidate_action.has_value()) return prepared;
   const control::WireFailoverCandidateAction& action = *source.candidate_action;
@@ -291,6 +292,12 @@ absl::StatusOr<PreparedFullState> PrepareMetaFullState(
         .steady_replication_enabled_ = source.steady_replication_enabled,
         .population_transition_expected_ = false,
     };
+    for (const auto& member : source.members) {
+      const auto& endpoint = desired.nodes[node_indices.at(member.node_id)];
+      desired_control.member_endpoints_.push_back(
+          {*NodeId::Parse(member.node_id), endpoint.host, endpoint.port,
+           endpoint.tls_port});
+    }
     if (source.owner_node_id.has_value()) {
       desired_control.owner_ = PreparedMemberAssignment{
           .node_id_ = *NodeId::Parse(*source.owner_node_id),

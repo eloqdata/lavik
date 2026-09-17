@@ -195,6 +195,14 @@ std::uint64_t ChargedBytes(const MetaObservation& observation) {
                                           Payload, MetaCandidatePreparedObs>) {
                    return bytes(payload.group_id_) +
                           bytes(payload.candidate_node_id_);
+                 } else if constexpr (std::is_same_v<
+                                          Payload,
+                                          MetaCandidateRecoveryCompleteObs>) {
+                   return bytes(payload.group_id_) +
+                          bytes(payload.candidate_node_id_) +
+                          bytes(payload.completion_reason_) +
+                          payload.applied_next_lsns_.size() *
+                              sizeof(std::uint64_t);
                  } else {
                    return bytes(payload.group_id_) +
                           bytes(payload.candidate_node_id_) +
@@ -527,6 +535,24 @@ struct MetaObservationStore::Impl {
                       "prepared-context-identity-missing");
                 }
                 return absl::OkStatus();
+              } else if constexpr (std::is_same_v<
+                                       Fact,
+                                       MetaCandidateRecoveryCompleteObs>) {
+                if (transition.mode_ != MetaFailoverMode::kUncontrolled ||
+                    !transition.recovery_deadline_unix_ms_.has_value() ||
+                    fact.recovery_deadline_unix_ms_ !=
+                        *transition.recovery_deadline_unix_ms_ ||
+                    fact.applied_next_lsns_.size() !=
+                        transition.candidate_action_->domain_.flow_count_ ||
+                    std::ranges::any_of(
+                        fact.applied_next_lsns_,
+                        [](std::uint64_t lsn) { return lsn == 0; }) ||
+                    !cluster::control::IsRecoveryCompletionReason(
+                        fact.completion_reason_)) {
+                  return MetaDomainRejectError(
+                      "recovery-complete-frontier-or-deadline-invalid");
+                }
+                return absl::OkStatus();
               } else {
                 if (fact.population_manifest_revision_ !=
                         facts.CurrentPopulationManifestRevision(
@@ -760,6 +786,10 @@ absl::Status MetaObservationStore::IngestLocked(MetaObservation observation,
             std::get_if<MetaCandidatePreparedObs>(&failover->payload_)) {
       // This value is session-layer evidence, not a Data-supplied claim.
       prepared->session_generation_ = observation.identity_.session_generation_;
+    }
+    if (auto* complete = std::get_if<MetaCandidateRecoveryCompleteObs>(
+            &failover->payload_)) {
+      complete->session_generation_ = observation.identity_.session_generation_;
     }
   }
   const absl::Status valid = impl.Validate(observation, facts);
@@ -1524,6 +1554,36 @@ MetaObservationStore::CandidatePreparedFor(
       continue;
     }
     MetaCandidatePreparedObs result = *prepared;
+    result.received_unix_ms_ = observation.received_unix_ms_;
+    result.expires_unix_ms_ =
+        ObservationExpiry(observation.received_unix_ms_, limits_.ttl_ms_);
+    return result;
+  }
+  return std::nullopt;
+}
+
+std::optional<MetaCandidateRecoveryCompleteObs>
+MetaObservationStore::CandidateRecoveryCompleteFor(
+    const MetaFailoverTransitionId& transition_id,
+    const MetaFailoverActionId& action_id, const MetaCommittedFacts& facts,
+    int64_t now_unix_ms) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const Impl& impl = *impl_;
+  for (const auto& [node_id, observation] : impl.failover_by_node_) {
+    (void)node_id;
+    if (ObservationExpired(observation, now_unix_ms, limits_.ttl_ms_) ||
+        !impl.Validate(observation, facts).ok()) {
+      continue;
+    }
+    const auto& failover =
+        std::get<MetaFailoverObservationObs>(observation.payload_);
+    const auto* complete =
+        std::get_if<MetaCandidateRecoveryCompleteObs>(&failover.payload_);
+    if (complete == nullptr || complete->transition_id_ != transition_id ||
+        complete->action_id_ != action_id) {
+      continue;
+    }
+    MetaCandidateRecoveryCompleteObs result = *complete;
     result.received_unix_ms_ = observation.received_unix_ms_;
     result.expires_unix_ms_ =
         ObservationExpiry(observation.received_unix_ms_, limits_.ttl_ms_);

@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -83,6 +84,19 @@ std::unique_ptr<const meta::MetaStores> StoresSnapshotOnHeap(
       new const meta::MetaStores(machine.StoresSnapshot()));
 }
 
+TEST(MetaFencedAuthorityGuardTest,
+     FenceNeedsElapsedLeaseWindowAndResetsWithLeadership) {
+  meta::MetaFencedAuthorityGuard guard(600);
+  EXPECT_FALSE(guard.ObserveFence("g", 2, 1000));
+  EXPECT_FALSE(guard.ObserveFence("g", 2, 1599));
+  EXPECT_TRUE(guard.ObserveFence("g", 2, 1600));
+  EXPECT_FALSE(guard.ObserveFence("g", 3, 1600));
+  EXPECT_TRUE(guard.ObserveFence("g", 3, 2200));
+  guard.Reset();
+  EXPECT_FALSE(guard.ObserveFence("g", 3, 2300));
+  EXPECT_TRUE(guard.ObserveFence("g", 3, 2900));
+}
+
 struct Fixture {
   meta::MetaStores stores;
   meta::MetaObservationStore observations;
@@ -111,6 +125,12 @@ struct Fixture {
     automatic.content_ =
         R"({"kind":"automatic-uncontrolled-failover-v1","suspect_after_ms":5000})";
     EXPECT_TRUE(stores.policy_.Apply(automatic).ok());
+    meta::PutPolicy recovery;
+    recovery.request_id_ = Bytes<16>(0x0e);
+    recovery.policy_id_ = std::string(meta::kCandidateRecoveryPolicyId);
+    recovery.version_ = 1;
+    recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+    EXPECT_TRUE(stores.policy_.Apply(recovery).ok());
     EXPECT_TRUE(stores.topology_.CompleteClusterCreate(root).ok());
 
     Register(owner, meta::MetaNodeRole::kPrimary, 6379, 0x02);
@@ -375,6 +395,51 @@ struct Fixture {
                     action.domain_, generation);
   }
 
+  void CompleteRecovery(
+      std::int64_t now,
+      std::optional<std::vector<std::uint64_t>> frontier = std::nullopt) {
+    auto transition = Transition();
+    const auto action = *transition.candidate_action_;
+    if (!transition.recovery_deadline_unix_ms_.has_value()) {
+      meta::StartCandidateRecovery start;
+      start.request_id_ = Bytes<16>(0xe0);
+      start.group_id_ = "g1";
+      start.expected_transition_ = {transition.transition_id_,
+                                    transition.revision_};
+      start.action_id_ = action.action_id_;
+      start.recovery_deadline_unix_ms_ = 3000;
+      Accept(start);
+      transition = Transition();
+    }
+    if (!frontier.has_value()) {
+      auto progress = observations.LiveCandidateProgressFor(
+          "g1", meta::MetaStoresFacts(stores), now);
+      auto current =
+          std::ranges::find(progress, action.candidate_.node_id_,
+                            &meta::MetaCandidateProgressObs::node_id_);
+      ASSERT_NE(current, progress.end());
+      frontier = current->applied_next_lsns_;
+    }
+    meta::MetaCandidateRecoveryCompleteObs complete{
+        .group_id_ = "g1",
+        .transition_id_ = transition.transition_id_,
+        .action_id_ = action.action_id_,
+        .candidate_node_id_ = action.candidate_.node_id_,
+        .candidate_assignment_id_ = action.candidate_.assignment_id_,
+        .candidate_boot_id_ = action.candidate_.boot_id_,
+        .recovery_deadline_unix_ms_ = *transition.recovery_deadline_unix_ms_,
+        .applied_next_lsns_ = *frontier,
+        .completion_reason_ = "coverage-unavailable"};
+    auto generation =
+        observations.CurrentGeneration(action.candidate_.node_id_);
+    ASSERT_TRUE(generation.has_value());
+    ReportCandidate(action.candidate_.node_id_,
+                    action.candidate_.assignment_id_,
+                    action.candidate_.boot_id_, now, *frontier,
+                    meta::MetaFailoverObservationObs{complete}, action.domain_,
+                    *generation, CurrentFailoverProjection());
+  }
+
   void ReportActionFailed(std::int64_t now) {
     const auto transition = Transition();
     const auto& action = *transition.candidate_action_;
@@ -471,6 +536,132 @@ void BeginUncontrolled(Fixture& fixture,
       group->record_.partition_replication_epoch_;
   begin.candidate_action_ = std::move(candidate_action);
   fixture.Accept(begin);
+}
+
+TEST(MetaFailoverReconcilerPlannerTest,
+     RecoveryStartsAfterExclusionAndPrepareWaitsForDrain) {
+  Fixture fixture;
+  BeginUncontrolled(fixture);
+  fixture.ReportCandidate(1000);
+  std::uint8_t id = 0xc0;
+  bool excluded = false;
+  auto plan = [&](std::int64_t now) {
+    return meta::PlanFailoverStep(
+        meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
+        fixture.observations,
+        {.now_unix_ms_ = now,
+         .leadership_started_unix_ms_ = 900,
+         .observation_grace_ms_ = 100,
+         .next_id_ = [&]() -> absl::StatusOr<meta::MetaRequestId> {
+           return Bytes<16>(id++);
+         },
+         .authority_excluded_ =
+             [&](std::string_view group, std::uint64_t term) {
+               EXPECT_EQ(group, "g1");
+               EXPECT_EQ(term, 2);
+               return excluded;
+             }});
+  };
+  auto selected = plan(1001);
+  ASSERT_TRUE(selected.ok());
+  ASSERT_TRUE(selected->has_value());
+  ASSERT_NE(std::get_if<meta::SetUncontrolledCandidate>(&**selected), nullptr);
+  fixture.Accept(**selected);
+  auto pending = plan(1002);
+  ASSERT_TRUE(pending.ok());
+  EXPECT_FALSE(pending->has_value());
+  EXPECT_FALSE(fixture.Transition().recovery_deadline_unix_ms_.has_value());
+  excluded = true;
+  auto started = plan(1003);
+  ASSERT_TRUE(started.ok());
+  ASSERT_TRUE(started->has_value());
+  const auto* start = std::get_if<meta::StartCandidateRecovery>(&**started);
+  ASSERT_NE(start, nullptr);
+  EXPECT_EQ(start->recovery_deadline_unix_ms_, 3003);
+  fixture.Accept(**started);
+  fixture.ReportCandidate(3010);
+  auto expired = plan(3011);
+  ASSERT_TRUE(expired.ok());
+  EXPECT_FALSE(
+      expired->has_value());  // timeout never stands in for a safe drain
+  fixture.CompleteRecovery(3012);
+  auto authorized = plan(3013);
+  ASSERT_TRUE(authorized.ok());
+  ASSERT_TRUE(authorized->has_value());
+  const auto* authorize =
+      std::get_if<meta::AuthorizeFailoverPrepare>(&**authorized);
+  ASSERT_NE(authorize, nullptr);
+  EXPECT_EQ(authorize->loss_if_cutover_, meta::MetaFailoverLoss::kUnknown);
+  EXPECT_TRUE(
+      meta::ValidateFailoverProposal(
+          **authorized,
+          meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 3013)
+          .ok());
+  // A changed role update withdraws the terminal report before append.
+  fixture.ReportCandidate(3014);
+  EXPECT_FALSE(
+      meta::ValidateFailoverProposal(
+          **authorized,
+          meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
+          fixture.observations, 3014)
+          .ok());
+}
+
+TEST(MetaFailoverReconcilerPlannerTest,
+     ZeroBudgetStillRequiresRecoveryCompletionAndOverflowIsRejected) {
+  Fixture fixture;
+  BeginUncontrolled(fixture);
+  fixture.ReportCandidate(1000);
+  meta::PutPolicy recovery;
+  recovery.request_id_ = Bytes<16>(0xe1);
+  recovery.policy_id_ = std::string(meta::kCandidateRecoveryPolicyId);
+  recovery.version_ = 2;
+  recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":0})";
+  fixture.Accept(recovery);
+  std::uint8_t id = 0xc0;
+  auto plan = [&](std::int64_t now) {
+    return meta::PlanFailoverStep(
+        meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
+        fixture.observations,
+        {.now_unix_ms_ = now,
+         .leadership_started_unix_ms_ = 900,
+         .observation_grace_ms_ = 100,
+         .next_id_ = [&]() -> absl::StatusOr<meta::MetaRequestId> {
+           return Bytes<16>(id++);
+         },
+         .authority_excluded_ = [](std::string_view,
+                                   std::uint64_t) { return true; }});
+  };
+  auto selected = plan(1001);
+  ASSERT_TRUE(selected.ok());
+  ASSERT_TRUE(selected->has_value());
+  fixture.Accept(**selected);
+  auto started = plan(1002);
+  ASSERT_TRUE(started.ok());
+  ASSERT_TRUE(started->has_value());
+  const auto* start = std::get_if<meta::StartCandidateRecovery>(&**started);
+  ASSERT_NE(start, nullptr);
+  EXPECT_EQ(start->recovery_deadline_unix_ms_, 1002);
+
+  recovery.version_ = 3;
+  recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+  fixture.Accept(recovery);
+  constexpr auto late = std::numeric_limits<std::int64_t>::max() - 1000;
+  fixture.ReportCandidate(late);
+  EXPECT_FALSE(plan(late).ok());
+  // A policy change after proposal cannot alter the carried cutoff at apply.
+  fixture.Accept(**started);
+  EXPECT_EQ(fixture.Transition().recovery_deadline_unix_ms_, 1002);
+  auto pending = plan(late);
+  ASSERT_TRUE(pending.ok());
+  EXPECT_FALSE(pending->has_value());
+  fixture.CompleteRecovery(late);
+  auto authorized = plan(late);
+  ASSERT_TRUE(authorized.ok());
+  ASSERT_TRUE(authorized->has_value());
+  EXPECT_NE(std::get_if<meta::AuthorizeFailoverPrepare>(&**authorized),
+            nullptr);
 }
 
 TEST(MetaFailoverReconcilerPlannerTest,
@@ -1328,6 +1519,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
   ASSERT_NE(std::get_if<meta::SetUncontrolledCandidate>(&**planned), nullptr);
   fixture.Accept(**planned);
 
+  fixture.CompleteRecovery(1003);
   IdSequence authorize_ids{0x9c};
   planned = meta::PlanFailoverStep(
       meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
@@ -1380,6 +1572,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           fixture.candidate_boot, 1'002, {20, 20}, std::nullopt,
                           action.domain_, 1,
                           fixture.CurrentFailoverProjection());
+  fixture.CompleteRecovery(1002);
   IdSequence authorize_ids{0x9f};
   planned = meta::PlanFailoverStep(
       meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
@@ -1560,6 +1753,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_EQ(replacement->candidate_action_->domain_, former_owner_domain);
   fixture.Accept(**planned);
 
+  fixture.CompleteRecovery(1004);
   IdSequence authorize_ids{0xac};
   planned = meta::PlanFailoverStep(
       meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
@@ -1636,6 +1830,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
   EXPECT_FALSE(replacement->candidate_action_->authorization_.has_value());
   fixture.Accept(**planned);
 
+  fixture.CompleteRecovery(1005);
   IdSequence authorize_ids{0xa5};
   planned = meta::PlanFailoverStep(
       meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
@@ -1706,6 +1901,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           initial_action.domain_, 1,
                           fixture.CurrentFailoverProjection());
 
+  fixture.CompleteRecovery(1002);
   IdSequence authorize_ids{0xb1};
   auto planned = meta::PlanFailoverStep(
       meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
@@ -1830,6 +2026,7 @@ TEST(MetaFailoverReconcilerPlannerTest,
                           fixture.alternate_boot, 1'002, {100, 100},
                           std::nullopt, newer);
 
+  fixture.CompleteRecovery(1003);
   IdSequence authorize_ids{0xc2};
   planned = meta::PlanFailoverStep(
       meta::MetaCommittedView(fixture.stores, fixture.next_index - 1),
@@ -1908,6 +2105,12 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   authority.version_ = 1;
   authority.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
   commit(meta::MetaCommand{authority});
+  meta::PutPolicy recovery;
+  recovery.request_id_ = Bytes<16>(0x0e);
+  recovery.policy_id_ = std::string(meta::kCandidateRecoveryPolicyId);
+  recovery.version_ = 1;
+  recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+  commit(meta::MetaCommand{recovery});
   meta::CompleteOperation complete;
   complete.request_id_ = Bytes<16>(0xe2);
   complete.operation_id_ = root;
@@ -2097,6 +2300,12 @@ TEST(MetaFailoverReconcilerLifecycleTest,
   authority.version_ = 1;
   authority.content_ = R"({"kind":"authority-lease-v1","duration_ms":5000})";
   commit(meta::MetaCommand{authority});
+  meta::PutPolicy recovery;
+  recovery.request_id_ = Bytes<16>(0x0e);
+  recovery.policy_id_ = std::string(meta::kCandidateRecoveryPolicyId);
+  recovery.version_ = 1;
+  recovery.content_ = R"({"kind":"candidate-recovery-v1","budget_ms":2000})";
+  commit(meta::MetaCommand{recovery});
   meta::CompleteOperation complete;
   complete.request_id_ = Bytes<16>(0xe6);
   complete.operation_id_ = root;

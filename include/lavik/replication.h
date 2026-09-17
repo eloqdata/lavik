@@ -90,6 +90,15 @@ struct DesiredClusterUpstream {
   bool operator==(const DesiredClusterUpstream&) const = default;
 };
 
+// FULL selects a replacement operation, not permission to erase a trustworthy
+// Active population. The staged storage owner (#45) consumes this exact
+// current relationship; half-built replacement data never supplies Ready.
+struct ClusterPopulationReplacementIntent {
+  DesiredClusterUpstream desired_;
+  std::string reason_;
+  bool operator==(const ClusterPopulationReplacementIntent&) const = default;
+};
+
 struct ReplicationOptions {
   // Cluster mode is always Meta-managed. It disables standalone upstream
   // control and Redis PSYNC export; native export requires an exact population
@@ -227,6 +236,7 @@ struct ClusterPopulationStatus {
   // Readable persisted scope without a certified frontier is exposed only to
   // an explicit operator-recovery action, never automatic candidate ranking.
   std::optional<RebuildIdentity> operator_recovery_identity_;
+  std::optional<ClusterPopulationReplacementIntent> replacement_intent_;
   // Nonempty exactly while state_ is kFailedStopped.
   std::string failure_reason_;
 };
@@ -322,8 +332,28 @@ struct DesiredClusterFailoverAction {
 
   bool operator_recovery_ = false;
   std::vector<PopulationManifestEntry> manifest_entries_;
+  // Meta fixes this once for the entire transition, including replacements.
+  std::optional<std::uint64_t> recovery_deadline_unix_ms_;
 
   bool operator==(const DesiredClusterFailoverAction&) const = default;
+};
+
+struct ClusterRecoveryPeer {
+  ClusterReplicationMember member_;
+  ReplicaOfConfig endpoint_;  // An absent transport is represented by port 0.
+  bool operator==(const ClusterRecoveryPeer&) const = default;
+};
+
+// Read-only recovery scope installed on every member from one current FDS.
+// Donor boot and actual coverage are discovered directly; Meta owns no donor
+// inventory or transfer journal. It grants neither serving nor Owner export.
+struct DesiredClusterRecovery {
+  DesiredClusterFailoverAction action_;
+  std::string local_node_id_;
+  std::string local_assignment_id_;
+  std::string local_boot_id_;
+  std::vector<ClusterRecoveryPeer> members_;
+  bool operator==(const DesiredClusterRecovery&) const = default;
 };
 
 // Exact boot-local promotion-preparation input derived from an installed
@@ -397,6 +427,14 @@ enum class ClusterFailoverActionState : std::uint8_t {
   kRetrying,
   kPrepared,
   kFailed,
+  kRecovering,
+  kRecoveryComplete,
+};
+
+struct ClusterCandidateRecoveryResult {
+  std::vector<std::uint64_t> applied_next_lsns_;
+  std::string completion_reason_;
+  bool operator==(const ClusterCandidateRecoveryResult&) const = default;
 };
 
 // Boot-local heartbeat input for the current committed action. A replacement
@@ -408,6 +446,7 @@ struct ClusterFailoverActionStatus {
   std::optional<ClusterFailoverPreparedContext> prepared_;
   std::string failure_class_;
   std::string failure_detail_;
+  std::optional<ClusterCandidateRecoveryResult> recovery_;
 };
 
 // FDS-owned subset of population identity. Assignment and immutable manifest
@@ -603,9 +642,16 @@ class ReplicationManager {
       std::optional<ClusterFailoverActionId> pending_activation_action_id =
           std::nullopt);
 
-  // Returns a coherent boot-local action observation. Meta may publish only a
-  // matching Prepared or Failed terminal state; waiting/retrying states are
-  // local diagnostics and are never durable workflow progress.
+  // Installs or revokes the read-only donor scope from the same current FDS.
+  // Replacement closes old transfers and joins accepted candidate apply;
+  // it does not grant ordinary source admission or change the deadline.
+  bycorf::Task<absl::Status> ReconcileClusterRecovery(
+      std::optional<DesiredClusterRecovery> desired);
+
+  // Returns a coherent boot-local action observation. Meta may publish a
+  // matching RecoveryComplete (actual complete frontier after safe drain),
+  // Prepared, or Failed result. Waiting/retrying states are local diagnostics;
+  // no action observation is durable workflow progress.
   bycorf::Task<ClusterFailoverActionStatus> cluster_failover_action_status()
       const;
 
@@ -746,7 +792,8 @@ class ReplicationManager {
   std::size_t publish_queue_bytes_per_worker() const noexcept;
   unsigned replica_priority() const noexcept;
 
-  // LVPSYNC and LVFLOW arrive as RESP commands on the ordinary Redis port.
+  // Native control, flow, recovery and parent-export handshakes arrive as
+  // isolated RESP commands on the ordinary Redis port.
   static bool IsNativeHandshake(std::span<const std::string> args) noexcept;
   bycorf::Task<absl::Status> ServeNativeConnection(
       bycorf::TcpStream& stream, std::vector<std::string> args,

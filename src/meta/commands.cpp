@@ -614,6 +614,28 @@ absl::Status ValidateFailoverTransitionImpl(
     }
   }
 
+  if (transition.mode_ == MetaFailoverMode::kUncontrolled &&
+      transition.candidate_action_.has_value() &&
+      transition.candidate_action_->authorization_.has_value() &&
+      !transition.candidate_action_->operator_recovery_ &&
+      transition.candidate_action_->authorization_->loss_if_cutover_ ==
+          MetaFailoverLoss::kUnknown &&
+      !transition.recovery_deadline_unix_ms_.has_value()) {
+    return MetaDomainRejectError(
+        "uncontrolled authorization has no recovery cutoff");
+  }
+
+  if (transition.recovery_deadline_unix_ms_.has_value()) {
+    if (transition.mode_ != MetaFailoverMode::kUncontrolled) {
+      return MetaDomainRejectError(
+          "only uncontrolled failover may collect recovery events");
+    }
+    if (auto status =
+            ValidateFailoverDeadline(*transition.recovery_deadline_unix_ms_);
+        !status.ok())
+      return status;
+  }
+
   if (transition.mode_ == MetaFailoverMode::kControlled) {
     if (!transition.controlled_.has_value() ||
         !transition.candidate_action_.has_value()) {
@@ -813,6 +835,10 @@ void WriteFailoverTransitionUnchecked(
         WriteFixedArray(nested, controlled.operation_id_);
         nested.WriteU64(controlled.absolute_deadline_unix_ms_);
       });
+  writer.WriteOptional(transition.recovery_deadline_unix_ms_,
+                       [](MetaWriter& nested, std::uint64_t deadline) {
+                         nested.WriteU64(deadline);
+                       });
 }
 
 absl::StatusOr<MetaFailoverTransition> ReadFailoverTransitionUnchecked(
@@ -837,9 +863,17 @@ absl::StatusOr<MetaFailoverTransition> ReadFailoverTransitionUnchecked(
         return MetaControlledFailover{*operation_id, *deadline};
       });
   if (!controlled.ok()) return controlled.status();
+  auto recovery_deadline = reader.ReadOptional<std::uint64_t>(
+      [](MetaReader& nested) { return nested.ReadU64(); });
+  if (!recovery_deadline.ok()) return recovery_deadline.status();
   return MetaFailoverTransition{
-      *transition_id, *revision,          static_cast<MetaFailoverMode>(*mode),
-      *target_term,   std::move(*action), std::move(*controlled),
+      *transition_id,
+      *revision,
+      static_cast<MetaFailoverMode>(*mode),
+      *target_term,
+      std::move(*action),
+      std::move(*controlled),
+      *recovery_deadline,
   };
 }
 
@@ -1043,6 +1077,17 @@ absl::Status ValidateCommand(const SetUncontrolledCandidate& command) {
     }
   }
   return absl::OkStatus();
+}
+
+absl::Status ValidateCommand(const StartCandidateRecovery& command) {
+  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok())
+    return status;
+  if (auto status = ValidateFailoverTransitionRef(command.expected_transition_);
+      !status.ok())
+    return status;
+  if (IsZero(command.action_id_))
+    return MetaDomainRejectError("recovery action id is zero");
+  return ValidateFailoverDeadline(command.recovery_deadline_unix_ms_);
 }
 
 absl::Status ValidateCommand(const AuthorizeFailoverPrepare& command) {
@@ -1392,6 +1437,45 @@ absl::StatusOr<SetUncontrolledCandidate> ReadSetUncontrolledCandidateBody(
       !status.ok()) {
     return status;
   }
+  return command;
+}
+
+absl::Status WriteCommandBody(MetaWriter& writer,
+                              const StartCandidateRecovery& command) {
+  if (auto status = ValidateCommand(command); !status.ok()) return status;
+  if (auto status =
+          WriteCommandHeader(writer, MetaCommandTag::kStartCandidateRecovery,
+                             command.request_id_, command.actor_);
+      !status.ok())
+    return status;
+  writer.WriteString(command.group_id_);
+  WriteFailoverTransitionRefUnchecked(writer, command.expected_transition_);
+  WriteFixedArray(writer, command.action_id_);
+  writer.WriteU64(command.recovery_deadline_unix_ms_);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<StartCandidateRecovery> ReadStartCandidateRecoveryBody(
+    MetaReader& reader) {
+  auto header = ReadCommandHeader(reader);
+  if (!header.ok()) return header.status();
+  auto group = ReadGroupId(reader);
+  if (!group.ok()) return group.status();
+  auto transition = ReadFailoverTransitionRef(reader);
+  if (!transition.ok()) return transition.status();
+  auto action = ReadFixedArray<16>(reader);
+  if (!action.ok()) return action.status();
+  auto deadline = reader.ReadU64();
+  if (!deadline.ok()) return deadline.status();
+  StartCandidateRecovery command{header->request_id_,
+                                 std::move(header->actor_),
+                                 std::move(*group),
+                                 *transition,
+                                 *action,
+                                 *deadline};
+  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
+      !status.ok())
+    return status;
   return command;
 }
 
@@ -2375,7 +2459,7 @@ absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command) {
 }
 
 MetaCommandTag MetaCommandTagOf(const MetaCommand& command) noexcept {
-  static_assert(std::variant_size_v<MetaCommand> == 34);
+  static_assert(std::variant_size_v<MetaCommand> == 35);
   const std::size_t index = command.index();
   if (index < 8) return static_cast<MetaCommandTag>(index + 1);
   if (index == 8) return MetaCommandTag::kActivateAuthority;
@@ -2592,6 +2676,12 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
     }
     case MetaCommandTag::kCommitControlledFailover: {
       auto body = ReadCommitControlledFailoverBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kStartCandidateRecovery: {
+      auto body = ReadStartCandidateRecoveryBody(r);
       if (!body.ok()) return body.status();
       command = std::move(*body);
       break;

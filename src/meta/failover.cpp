@@ -442,6 +442,27 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
     return absl::OkStatus();
   }
 
+  if (const auto* start = std::get_if<StartCandidateRecovery>(&command)) {
+    const auto transition =
+        ExactTransition(view, start->group_id_, start->expected_transition_);
+    const auto grant = view.topology().AuthorityFor(start->group_id_);
+    if (!transition.has_value() ||
+        transition->mode_ != MetaFailoverMode::kUncontrolled ||
+        !grant.has_value() || grant->grant_.has_value() ||
+        transition->recovery_deadline_unix_ms_.has_value() ||
+        !transition->candidate_action_.has_value() ||
+        transition->candidate_action_->action_id_ != start->action_id_ ||
+        transition->candidate_action_->operator_recovery_ ||
+        transition->candidate_action_->authorization_.has_value()) {
+      return Invalid("candidate recovery start pre-state is stale");
+    }
+    MetaStoresFacts facts(view.stores());
+    const auto progress =
+        ExactCandidateProgress(start->group_id_, *transition->candidate_action_,
+                               facts, observations, proposal_now_unix_ms, true);
+    return progress.ok() ? absl::OkStatus() : progress.status();
+  }
+
   if (const auto* authorize = std::get_if<AuthorizeFailoverPrepare>(&command)) {
     const auto transition = ExactTransition(view, authorize->group_id_,
                                             authorize->expected_transition_);
@@ -476,6 +497,18 @@ absl::Status ValidateFailoverProposal(const MetaCommand& command,
                                            /*action_is_committed=*/true);
     if (!progress.ok()) return progress.status();
 
+    if (transition->mode_ == MetaFailoverMode::kUncontrolled &&
+        !action.operator_recovery_) {
+      const auto complete = observations.CandidateRecoveryCompleteFor(
+          transition->transition_id_, action.action_id_, facts,
+          proposal_now_unix_ms);
+      if (!complete.has_value() ||
+          complete->session_generation_ != progress->session_generation_ ||
+          complete->applied_next_lsns_ != progress->applied_next_lsns_) {
+        return Invalid(
+            "candidate recovery has no matching drained Applied cut");
+      }
+    }
     if (transition->mode_ == MetaFailoverMode::kControlled) {
       const auto paused = observations.SourcePausedFor(
           transition->transition_id_, facts, proposal_now_unix_ms);

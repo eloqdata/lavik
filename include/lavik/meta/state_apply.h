@@ -63,7 +63,8 @@
 //      check (2) and by rejecting RemoveNodeFromGroup of a grant owner, so
 //      the grant fact is read through the node's current group. Operation
 //      intents remain opaque and do not create implicit node obligations.
-//   4. A Created cluster always has both registered current global Policies.
+//   4. A Created cluster always has all required registered current global
+//      Policies.
 //   5. Remaining cross-domain facts: group existence and membership CAS live
 //      in the stores; RetireNode is additionally rejected while the node
 //      still holds group membership (which, by the invariant in (3), also

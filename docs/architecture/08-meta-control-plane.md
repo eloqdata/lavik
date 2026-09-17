@@ -121,8 +121,9 @@ correctness does not depend on apply running only once.
 Policy families are compiled into `MetaPolicyStore`; an arbitrary id cannot
 introduce a schema at runtime. The current families are
 `lavik.automatic-uncontrolled-failover-v1` (fixed matching `kind` and
-`suspect_after_ms`) and `lavik.authority-lease-v1` (fixed matching `kind`
-and `duration_ms`).
+`suspect_after_ms`), `lavik.authority-lease-v1` (fixed matching `kind`
+and `duration_ms`), and `lavik.candidate-recovery-v1` (fixed matching `kind`
+and `budget_ms`, default 2000 ms, range 0–86,400,000 ms).
 Each accepts only its exact compact JSON object and typed ranges, rejecting
 whitespace, missing, duplicate or unknown fields, alternate escaped spellings,
 wrong scalar kinds, and overflow. This deep Module owns its small family parser;
@@ -193,9 +194,9 @@ idempotency and `getop`, but carries no failover phase, directive, receipt, or
 candidate progress. All resumable execution state is the Group transition
 above.
 
-Eight typed commands are the complete durable transition language:
+Nine typed commands are the complete durable transition language:
 `BeginControlledFailover`, `BeginUncontrolledFailover`,
-`SetUncontrolledCandidate`, `AuthorizeFailoverPrepare`,
+`SetUncontrolledCandidate`, `StartCandidateRecovery`, `AuthorizeFailoverPrepare`,
 `AbortControlledFailover`, `DegradeControlledFailover`,
 `CommitControlledFailover`, and `CommitUncontrolledFailover`. Controlled Begin
 preserves the current owner, term, and grant while installing a candidate;
@@ -354,6 +355,31 @@ transition never aborts: a missing candidate waits. A failed, disconnected, or
 replaced action is removed immediately; Meta installs the best eligible
 replacement when one exists, or clears the candidate and waits without relying
 on the failed process to restart.
+
+Before an unauthorized uncontrolled action with a comparable source domain can
+prepare, Meta first excludes any old finite write lease using its
+suspend-aware authority guard. It then
+proposes `StartCandidateRecovery` with one absolute Unix-millisecond cutoff.
+The proposing leader latches the current recovery budget and preserves that
+cutoff across retries. The committed proposal carries its proposal-time cutoff,
+so commit and dispatch delay consume the budget. Deterministic apply records it
+on the Group transition without reading a clock. Once committed,
+Candidate/action replacement, donor loss, policy update, and Meta leadership
+replacement cannot extend it. An uncommitted proposal lost with its leader
+does not establish a recoverable cutoff. Zero budget skips active gathering,
+not normal retention or post-cutover partial reparent. A missing eligible
+Candidate continues to wait after expiry; expiry does not terminate failover.
+
+Data discovers donors from the exact FDS member directory and owns all transfer
+planning. Meta retains no coverage or transfer journal. Before prepare
+authorization, it requires a fresh, authenticated `CandidateRecoveryComplete`
+for this action/deadline whose actual complete vector equals current Candidate
+Progress. A retained already-authorized lossless action never reopens recovery.
+Explicit operator recovery has no historical frontier to compare or gather;
+it retains its separate unknown-loss authorization over readable local storage.
+The recovery policy is independent of automatic detection; changing only that
+family does not reset SUSPECT. Detailed event ownership and reparent semantics
+belong to [Replication](05-replication.md).
 
 The loss contract matches Redis Cluster's asynchronous replication tier.
 Controlled cutover reaches the old owner's drained frontier and records
@@ -579,7 +605,7 @@ and old assignment observations after remove/re-add; group queries retain the
 reporter identity with each observation. Reporter-local history is bound to the
 history announced in `ClientHello`; source history in candidate progress is an
 independent lineage anchor. The failover payload is one of `SourcePaused`,
-`CandidatePrepared`, or `ActionFailed`, bound to the exact transition/action and
+`CandidateRecoveryComplete`, `CandidatePrepared`, or `ActionFailed`, bound to the exact transition/action and
 current reporter boot. It can coexist with lease renewal or candidate progress,
 so transition evidence never suppresses steady role observation. Health
 ingestion is independent of challenge validation, so a bad renewal request
@@ -1103,9 +1129,10 @@ Slots are either generated with `contiguous-even` after sorting Group ids or sup
 complete, non-overlapping `0..16383` range table. All
 declared Data belongs to exactly one Group and every Group owns at least one
 slot. An optional strict `[bootstrap_policy]` table supplies Bootstrap Policy
-Defaults for `automatic_uncontrolled_failover_suspect_after_ms` and
-`authority_lease_duration_ms`; both omitted values default to 5000 ms and must
-satisfy the registered family ranges. The parser
+Defaults for `automatic_uncontrolled_failover_suspect_after_ms`,
+`authority_lease_duration_ms`, and `candidate_recovery_budget_ms`; omitted values
+default to 5000 ms, 5000 ms, and 2000 ms respectively and must satisfy the
+registered family ranges. The parser
 rejects unknown TOML structure and files over 64 KiB, then
 sorts nodes, Groups, replicas and ranges and merges adjacent ranges belonging
 to the same Group. The CLI renders that canonical plan and requires exact

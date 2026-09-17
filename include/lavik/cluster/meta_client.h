@@ -220,6 +220,7 @@ struct ClusterFailoverReconcileInput {
   // means follow_owner_ (including nullopt for removal) must be reconciled.
   bool reconcile_follow_owner_ = false;
   std::optional<DesiredClusterUpstream> follow_owner_;
+  std::optional<DesiredClusterRecovery> recovery_;
 
   friend bool operator==(const ClusterFailoverReconcileInput&,
                          const ClusterFailoverReconcileInput&) = default;

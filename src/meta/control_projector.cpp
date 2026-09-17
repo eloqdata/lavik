@@ -186,6 +186,7 @@ absl::StatusOr<control::WireFailoverTransition> ProjectFailoverTransition(
       break;
   }
   projected.target_term = source.target_term_;
+  projected.recovery_deadline_unix_ms = source.recovery_deadline_unix_ms_;
   if (source.candidate_action_.has_value()) {
     const MetaFailoverCandidateAction& action = *source.candidate_action_;
     control::WireFailoverCandidateAction projected_action;
