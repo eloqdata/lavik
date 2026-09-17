@@ -107,11 +107,11 @@ The standard io_uring build requires:
 - a C++23 compiler (GCC 13+ or a recent Clang is recommended)
 - GNU Make, Git, and OpenSSL development headers/static libraries
 
-On Ubuntu 24.04:
+On Ubuntu 24.04, install Git to obtain the source:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake git libssl-dev
+sudo apt-get install -y git
 ```
 
 ### Build from source
@@ -119,6 +119,7 @@ sudo apt-get install -y build-essential cmake git libssl-dev
 ```bash
 git clone https://github.com/eloqdata/lavik.git
 cd lavik
+./scripts/install_build_deps.sh
 git submodule update --init bycorf third_party/mimalloc third_party/nuraft
 git -C third_party/nuraft submodule update --init asio
 git -C bycorf submodule update --init third_party/liburing third_party/abseil
@@ -127,11 +128,31 @@ git -C bycorf submodule update --init third_party/liburing third_party/abseil
 sudo install -m 0755 build/lavik build/lavik-meta build/lavik-ctl /usr/local/bin/
 ```
 
+The dependency installer is shared with release CI. It supports Ubuntu 24.04
+on x86_64 and ARM64; `--dry-run` shows the packages without installing them.
+The commands above build with kernel TCP/io_uring. To include DPDK/SPDK in a
+local build, run these additional commands in the same checkout:
+
+```bash
+./scripts/install_build_deps.sh --with-bypass
+git -C bycorf submodule update --init third_party/spdk third_party/dpdk
+git -C bycorf/third_party/spdk submodule update --init isa-l isa-l-crypto
+CC=gcc-13 CXX=g++-13 ./scripts/build_release.sh -DLAVIK_KERNEL_BYPASS=ON
+```
+
+Local release builds use `-march=native`; use the packaging script below for
+portable artifacts. Bypass remains an explicit runtime choice via
+`--network=dpdk` and/or `--storage=spdk`.
+
 To create a portable archive for the current architecture, run:
 
 ```bash
 ./scripts/package_release.sh
 ```
+
+After installing the bypass dependencies, use
+`LAVIK_PACKAGE_KERNEL_BYPASS=ON ./scripts/package_release.sh` for a standard
+archive with DPDK/SPDK support.
 
 The archive contains `lavik`, `lavik-meta`, `lavik-ctl`, `LICENSE`, and notices
 under `dist/`. This command builds the `minimal` variant. Main-branch

@@ -40,11 +40,28 @@ CPU instruction-set and glibc requirements remain separate constraints.
 
 ## Local builds
 
+On Ubuntu 24.04 (x86_64 or ARM64), install build packages with the same script
+used by release CI:
+
+```bash
+./scripts/install_build_deps.sh
+```
+
+The script invokes `sudo` only for apt when needed. Add `--dry-run` to inspect
+the commands without changing the system. It does not initialize Git
+submodules; follow the complete source checkout steps in the
+[README](../../README.md#build-from-source). Other distributions require
+manual installation of equivalent dependencies.
+
 Optimized local builds use the current machine's instruction set by default:
 
 ```bash
 ./scripts/build_release.sh
 ```
+
+Additional arguments are forwarded to CMake, for example
+`./scripts/build_release.sh -DLAVIK_KERNEL_BYPASS=ON` after installing and
+initializing the bypass dependencies below.
 
 `LAVIK_KERNEL_BYPASS` defaults to `OFF`: Lavik and `lavik-meta` build
 with kernel networking and io_uring and do not configure or link DPDK, SPDK or
@@ -100,14 +117,16 @@ The downloadable release archive below includes all three executables.
 
 ### Experimental DPDK networking
 
-On Ubuntu, SPDK's RPC header generator requires `python3-jinja2` and
-`python3-tabulate` in addition to the native build dependencies. Install them
-explicitly; a preconfigured developer machine or CI image may already have
-them, but a clean machine need not:
+On Ubuntu 24.04, install the additional build dependencies before configuring
+bypass support:
 
 ```bash
-sudo apt-get install -y python3-jinja2 python3-tabulate
+./scripts/install_build_deps.sh --with-bypass
 ```
+
+This includes the native build tools and SPDK's RPC generator dependencies,
+`python3-jinja2` and `python3-tabulate`, without relying on preinstalled packages
+on a developer machine or CI image.
 
 The pinned Bycorf includes an optional FreeBSD/DPDK IPv4 TCP backend for
 AArch64 and x86-64. The default network backend remains Linux TCP/io_uring.
