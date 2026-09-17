@@ -19,7 +19,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/cluster/authority.h"
 #include "keylane/cluster/topology.h"
 #include "keylane/replication_group.h"
@@ -335,7 +335,7 @@ class NodeDirectiveCompletion {
   bool valid() const noexcept { return static_cast<bool>(poll_); }
   bool started() const noexcept { return started_; }
   std::optional<absl::Status> result() const;
-  celer::Task<absl::Status> Await() const;
+  bycorf::Task<absl::Status> Await() const;
 
  private:
   NodeDirectiveCompletion(Poll poll, bool started)
@@ -361,13 +361,13 @@ class NodeControlActions {
   // transition. The default preserves the synchronous test adapter;
   // adapters backed by asynchronous subsystems must override it rather than
   // detach work and report completion early.
-  virtual celer::Task<absl::Status> RevokeSourceAuthorizationsAndWait();
+  virtual bycorf::Task<absl::Status> RevokeSourceAuthorizationsAndWait();
   // Clears source admission without advancing the committed directive/fence
   // floor. A control-session replacement may preserve already-online population
   // exports while write authority is invalid and the installed topology and
   // authority are unchanged. New handshakes remain closed until an
   // authenticated replacement projection replays their admission.
-  virtual celer::Task<absl::Status>
+  virtual bycorf::Task<absl::Status>
   ClearSourceAuthorizationsForSessionReplacementAndWait(
       bool preserve_established_exports = false);
   // A live local control replacement replays source capabilities while an
@@ -377,7 +377,7 @@ class NodeControlActions {
   // scope survives the replacement; those sessions need not have reached ONLINE
   // yet. The expected replay count keeps the intervening admission gap
   // retryable.
-  virtual celer::Task<absl::Status>
+  virtual bycorf::Task<absl::Status>
   RefreshSourceAuthorizationsForFdsReplacementAndWait(
       bool preserve_current_population_exports = false,
       std::size_t expected_authorization_replays = 0);
@@ -386,31 +386,31 @@ class NodeControlActions {
   // by a changed value/nullopt, never by a one-shot cleanup directive. The
   // task must return only after superseded admission and result publication
   // can no longer escape the FullStateApplied barrier.
-  virtual celer::Task<absl::Status> ReconcileClusterControl(
+  virtual bycorf::Task<absl::Status> ReconcileClusterControl(
       std::optional<DesiredClusterControl> desired);
   // Opens the exact boot-local promotion prepared by `action_id`. This grants
   // neither a write lease nor active expiration authority; NodeControl does
   // both only after a post-await local control/session/deadline recheck.
-  virtual celer::Task<absl::Status> ActivatePreparedPromotion(
+  virtual bycorf::Task<absl::Status> ActivatePreparedPromotion(
       PreparedFailoverActivation activation);
   // Installs the same absolute CLOCK_BOOTTIME deadline used by the request
   // lease. Returning success means expiration can run only until that finite
   // cut; it does not imply request authority.
-  virtual celer::Task<absl::Status> EnableExpirationAuthorityUntil(
+  virtual bycorf::Task<absl::Status> EnableExpirationAuthorityUntil(
       MonotonicTime deadline);
   // Opens new POPULATION source handshakes after the request lease itself is
   // installed. Implementations must serialize this with native admission.
-  virtual celer::Task<absl::Status> EnableSourceAdmissionForLease(
+  virtual bycorf::Task<absl::Status> EnableSourceAdmissionForLease(
       MonotonicTime deadline);
   // Closes active expiration and joins work that entered before the close.
   // Every asynchronous authority-loss barrier invokes this before returning.
-  virtual celer::Task<absl::Status> RevokeExpirationAuthority();
+  virtual bycorf::Task<absl::Status> RevokeExpirationAuthority();
   // Retires an in-progress or ready target population unless it still names
   // the desired local assignment, term, manifest, and partition replication
   // epoch. Completion includes
   // native-flow join and partial-root abort, making FullStateApplied a real
   // population invalidation barrier.
-  virtual celer::Task<absl::Status> ReconcilePopulation(
+  virtual bycorf::Task<absl::Status> ReconcilePopulation(
       std::optional<PopulationReadiness> desired,
       bool population_transition_expected);
   // Cancels destructive target work after an authority transition. Session
@@ -419,18 +419,18 @@ class NodeControlActions {
   // FollowOwner attempt remains valid. FollowOwner FULL rotates local history
   // and therefore causes this same control-session replacement before it can
   // become Ready. Fences pass false and retain no such exception.
-  virtual celer::Task<absl::Status> CancelInProgressPopulation(
+  virtual bycorf::Task<absl::Status> CancelInProgressPopulation(
       bool preserve_current_follow_attempt);
   // Graceful process shutdown must resolve even an attempt whose directive
   // executor is waiting for terminal native cleanup. ReplicationManager uses
   // its stronger shutdown cancellation; other adapters may reuse ordinary
   // in-progress cancellation.
-  virtual celer::Task<absl::Status> CancelPopulationForShutdown();
+  virtual bycorf::Task<absl::Status> CancelPopulationForShutdown();
   // The default adapts actions whose admission and completion are one short
   // operation. ReplicationManager overrides this for population mutations so
   // admission returns a pollable exact-attempt completion without awaiting
   // readiness.
-  virtual celer::Task<NodeDirectiveCompletion> StartDirective(
+  virtual bycorf::Task<NodeDirectiveCompletion> StartDirective(
       NodeDirective directive);
   // Non-suspending, non-mutating lookup: only an exact, still-valid completed
   // population may return its original completion. A miss falls through to
@@ -439,7 +439,8 @@ class NodeControlActions {
       const NodeDirective& /*directive*/) const {
     return std::nullopt;
   }
-  virtual celer::Task<absl::Status> ApplyDirective(NodeDirective directive) = 0;
+  virtual bycorf::Task<absl::Status> ApplyDirective(
+      NodeDirective directive) = 0;
   // Optional post-counter hook for adapters that retain assignment-scoped
   // state outside ServingState. ReplicationManager currently needs no extra
   // work here because its source sessions were joined by async revocation and
@@ -451,14 +452,14 @@ class NullNodeControlActions final : public NodeControlActions {
  public:
   bool ReceivesDirectives() const noexcept override { return false; }
   absl::Status RevokeSourceAuthorizations() override;
-  celer::Task<absl::Status> ApplyDirective(NodeDirective directive) override;
+  bycorf::Task<absl::Status> ApplyDirective(NodeDirective directive) override;
   absl::Status DrainAssignment(const AuthorityAnchor& anchor) override;
 };
 
 class NodeControlInstaller {
  public:
   // Lease grants create worker-owned expiration tasks that retain this
-  // installer's references. The owner must destroy the Celer worker (and thus
+  // installer's references. The owner must destroy the Bycorf worker (and thus
   // its detached tasks) before destroying the installer; the destructor
   // asserts that contract in debug builds. ClusterRuntime satisfies it by
   // remaining installed until Server::WaitUntilStopped returns.
@@ -498,7 +499,7 @@ class NodeControlInstaller {
   // only that lease instance and closes new source admission. A POPULATION
   // session already published under the exact capability continues; authority
   // or desired-state replacement remains responsible for retiring it.
-  celer::Task<absl::Status> ApplyLeaseGrantTransition(
+  bycorf::Task<absl::Status> ApplyLeaseGrantTransition(
       const AuthorityMessage& authority_message);
 
   // Meta-only local control boundary. In addition to installing the immutable
@@ -508,7 +509,7 @@ class NodeControlInstaller {
   // changed scope joins the exports it invalidates. Authority-changing
   // snapshots also wait for mutations admitted through the replaced
   // ServingState before returning to the wire client.
-  celer::Task<absl::Status> InstallFullStateTransition(
+  bycorf::Task<absl::Status> InstallFullStateTransition(
       PreparedFullState prepared_state, ProjectionBasis projection_basis,
       bool local_population_transition_expected = false,
       std::size_t expected_source_authorization_replays = 0);
@@ -517,14 +518,14 @@ class NodeControlInstaller {
   // synchronously; success is returned only after earlier action registration,
   // final population cancellation, source capability cleanup, and mutations
   // admitted through every retired snapshot for the group have drained.
-  celer::Task<absl::Status> ApplyFenceTransition(
+  bycorf::Task<absl::Status> ApplyFenceTransition(
       const AuthorityMessage& authority_message);
 
   // Validates projection and authority before handing a storage mutation to
   // the ReplicationManager adapter. The admission token spans every await and
   // action registration so an invalidating control transition can join it.
-  celer::Task<NodeDirectiveCompletion> StartDirective(NodeDirective directive);
-  celer::Task<absl::Status> ApplyDirective(NodeDirective directive);
+  bycorf::Task<NodeDirectiveCompletion> StartDirective(NodeDirective directive);
+  bycorf::Task<absl::Status> ApplyDirective(NodeDirective directive);
 
   // Synchronous first half of session loss. Call as soon as transport loss is
   // known, before awaiting control tasks, so their cleanup cannot extend the
@@ -537,7 +538,7 @@ class NodeControlInstaller {
   // population (including Ready online tails). The control client may join
   // directive executors only after this returns. It is also safe when Stop
   // arrives between sessions and there is no current SessionIdentity.
-  celer::Task<absl::Status> CancelPopulationForShutdownTransition();
+  bycorf::Task<absl::Status> CancelPopulationForShutdownTransition();
 
   // Synchronous test session-loss path. Memory authority is invalidated
   // even when a directive-capable adapter rejects the remaining cleanup; Meta
@@ -553,19 +554,19 @@ class NodeControlInstaller {
   // population snapshots; a replacement local control must replay authorization
   // before new exports can start. Lease, rebuild, and new source authorization
   // remain blocked by the drains meanwhile.
-  celer::Task<absl::Status> LoseSessionTransition(
+  bycorf::Task<absl::Status> LoseSessionTransition(
       const SessionIdentity& session_identity, std::string_view reason);
 
   // Publishes the current ReplicationManager proof into ServingState. Losing
   // a previously ready proof invalidates leases synchronously and joins source
   // revocation before returning.
-  celer::Task<absl::Status> SetPopulationReadinessTransition(
+  bycorf::Task<absl::Status> SetPopulationReadinessTransition(
       std::optional<PopulationReadiness> readiness);
 
   // Idempotent async barrier used after a concurrently executing directive is
   // joined, ensuring it could not resurrect a capability behind a fence or
   // local proof loss.
-  celer::Task<absl::Status> RevokeSourceAuthorizationsTransition();
+  bycorf::Task<absl::Status> RevokeSourceAuthorizationsTransition();
 
   // Publishes initial local storage readiness together with the current
   // committed topology. Runtime true-to-false transitions must use
@@ -579,7 +580,7 @@ class NodeControlInstaller {
   // waits for older action registration, source revocation, target population
   // cancellation, and request drains. Repeating a successfully completed loss
   // is a no-op; an uncertain cleanup failure remains the result for this boot.
-  celer::Task<absl::Status> LoseStorageReadinessTransition();
+  bycorf::Task<absl::Status> LoseStorageReadinessTransition();
 
   const std::optional<ProjectionBasis>& projection_basis() const noexcept {
     return projection_basis_;
@@ -654,7 +655,7 @@ class NodeControlInstaller {
   DesiredLocalClusterControl() const;
   absl::StatusOr<std::optional<DesiredClusterControl>>
   ValidateLeaseGrantContext(const AuthorityMessage& message, MonotonicTime now);
-  celer::Task<absl::Status> FailClosedLeaseGrantTransition(
+  bycorf::Task<absl::Status> FailClosedLeaseGrantTransition(
       const AuthorityMessage& message, absl::Status failure);
   void RetireLeaseSchedule(std::string_view group_id);
   void RetireAllLeaseSchedules();
@@ -669,18 +670,18 @@ class NodeControlInstaller {
   // revalidation or finish registering with NodeControlActions. The final
   // revoke/cancel pass can therefore observe all work that crossed the seam.
   void InvalidateDirectiveAdmissions();
-  celer::Task<absl::Status> WaitForDirectiveAdmissions();
+  bycorf::Task<absl::Status> WaitForDirectiveAdmissions();
   // Storage loss is terminal for the boot. It waits only for transitions that
   // were already active at its cut, then performs one final cleanup pass; work
   // admitted after the cut is already constrained by storage_failed_.
-  celer::Task<absl::Status> WaitForControlTransitionsBefore(
+  bycorf::Task<absl::Status> WaitForControlTransitionsBefore(
       std::uint64_t transition_id);
-  celer::Task<absl::Status> SetPopulationReadinessTransitionImpl(
+  bycorf::Task<absl::Status> SetPopulationReadinessTransitionImpl(
       std::optional<PopulationReadiness> readiness,
       bool invalidate_directive_admissions);
-  celer::Task<absl::Status> WaitForPendingDrains(
+  bycorf::Task<absl::Status> WaitForPendingDrains(
       std::span<const AuthorityAnchor> anchors);
-  celer::Task<absl::Status> ExpireLeaseAt(
+  bycorf::Task<absl::Status> ExpireLeaseAt(
       std::shared_ptr<LeaseExpirySchedule> schedule,
       std::uint64_t timer_generation,
       std::shared_ptr<const LeaseTimerLifetime> lifetime);
@@ -689,7 +690,7 @@ class NodeControlInstaller {
   // closes new source admission, joins directive admission, and drains the
   // assignment. Current source capabilities and published exports remain for a
   // stronger fence, session-loss, or population-identity transition to retire.
-  celer::Task<absl::Status> FinishExpiredLeaseTransition(
+  bycorf::Task<absl::Status> FinishExpiredLeaseTransition(
       std::shared_ptr<LeaseExpirySchedule> schedule, MonotonicTime now);
   void RememberDrain(std::shared_ptr<const ServingState> state,
                      const AuthorityAnchor& anchor);

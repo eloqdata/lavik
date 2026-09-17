@@ -10,8 +10,8 @@
 
 #include "absl/container/inlined_vector.h"
 #include "absl/status/statusor.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/storage/format.h"
 #include "keylane/tx/fingerprint.h"
 #include "keylane/tx/tx_queue.h"
@@ -39,8 +39,8 @@ struct ShardSlice {
 // Shard callbacks are plain function pointers with a caller-owned context so
 // the hot path never heap-allocates a closure. They run on the owning shard
 // with all of the transaction's holds acquired and may suspend on disk I/O.
-using ShardCallback = celer::Task<absl::Status> (*)(void* ctx,
-                                                    const ShardSlice& slice);
+using ShardCallback = bycorf::Task<absl::Status> (*)(void* ctx,
+                                                     const ShardSlice& slice);
 
 // Runs once on every participating shard after this transaction has acquired
 // its holds and before its first shard callback. The hook must not suspend.
@@ -105,20 +105,20 @@ class Transaction {
   }
 
   // Multi-shard only; no-op for single-shard transactions.
-  celer::Task<absl::Status> Schedule();
+  bycorf::Task<absl::Status> Schedule();
 
   // Runs `cb` on every shard's slice. `release` drops all locks and queue
   // positions once the hop completes. Single-shard calls retain one owner-
   // local no-txid guard across non-releasing hops.
-  celer::Task<absl::Status> Execute(ShardCallback cb, void* ctx, bool release);
+  bycorf::Task<absl::Status> Execute(ShardCallback cb, void* ctx, bool release);
 
   // Final no-op hop that releases every shard's locks and queue position.
-  celer::Task<absl::Status> Release();
+  bycorf::Task<absl::Status> Release();
 
   bool releasing() const { return releasing_; }
 
   // Shard-side entry points (shard thread only).
-  celer::Task<absl::Status> InvokeCallback(std::uint16_t shard_slot);
+  bycorf::Task<absl::Status> InvokeCallback(std::uint16_t shard_slot);
   void CompleteShardRound();
   void SetShardStatus(std::uint16_t shard_slot, absl::Status status);
 
@@ -127,7 +127,7 @@ class Transaction {
 
   struct ShardData;
 
-  struct ShardMsg : celer::RemoteWork {
+  struct ShardMsg : bycorf::RemoteWork {
     ShardData* sd_ = nullptr;
   };
 
@@ -161,13 +161,13 @@ class Transaction {
 
   std::uint32_t RoundTargets(Phase phase) const;
   bool InRound(const ShardData& sd, Phase phase) const;
-  static void ShardPhaseEntry(celer::RemoteWork* base);
+  static void ShardPhaseEntry(bycorf::RemoteWork* base);
   static void RunShardPhase(ShardData* sd);
   static void ScheduleInShard(ShardData* sd);
   static void CancelInShard(ShardData* sd);
   static void ArmInShard(ShardData* sd);
   ShardSlice Slice(const ShardData& sd) const;
-  celer::Task<absl::Status> ExecuteSingleShard(bool release);
+  bycorf::Task<absl::Status> ExecuteSingleShard(bool release);
 
   bool releasing_ = false;
   bool scheduled_ = false;
@@ -188,7 +188,7 @@ class Transaction {
   // The only cross-thread words on the hop path.
   std::atomic<std::uint32_t> barrier_{0};
   std::coroutine_handle<> coord_handle_;
-  celer::WorkerId coord_worker_ = 0;
+  bycorf::WorkerId coord_worker_ = 0;
 };
 
 // Called by TxShard::Poll when an armed transaction entry reaches the head

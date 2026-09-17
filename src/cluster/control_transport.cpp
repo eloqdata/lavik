@@ -17,8 +17,8 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/io/storage.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/runtime/worker.h"
 
 namespace keylane::cluster::control {
 namespace {
@@ -43,10 +43,10 @@ std::uint64_t TransferLimit(TransferKind kind) {
 }  // namespace
 
 struct ControlDeadlineWatchdog::State {
-  celer::Worker* worker_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
   ExpireCallback expire_callback_;
   std::chrono::steady_clock::time_point deadline_{};
-  celer::TimerCancelHandle cancel_;
+  bycorf::TimerCancelHandle cancel_;
   std::uint64_t generation_ = 0;
   std::uint64_t task_starts_ = 0;
   bool armed_ = false;
@@ -54,8 +54,8 @@ struct ControlDeadlineWatchdog::State {
   bool expired_ = false;
 };
 
-ControlDeadlineWatchdog::ControlDeadlineWatchdog(
-    celer::Worker& worker, ExpireCallback expire_callback)
+ControlDeadlineWatchdog::ControlDeadlineWatchdog(bycorf::Worker& worker,
+                                                 ExpireCallback expire_callback)
     : state_(std::make_shared<State>()) {
   state_->worker_ = &worker;
   state_->expire_callback_ = std::move(expire_callback);
@@ -71,7 +71,7 @@ ControlDeadlineWatchdog::~ControlDeadlineWatchdog() {
   state_->cancel_.Cancel();
 }
 
-celer::Task<absl::Status> ControlDeadlineWatchdog::Watch(
+bycorf::Task<absl::Status> ControlDeadlineWatchdog::Watch(
     std::shared_ptr<State> state) {
   while (state->armed_) {
     const std::uint64_t generation = state->generation_;
@@ -82,8 +82,8 @@ celer::Task<absl::Status> ControlDeadlineWatchdog::Watch(
       if (state->expire_callback_) state->expire_callback_();
       break;
     }
-    auto timer = celer::CancellableSleepFor(*state->worker_,
-                                            state->deadline_ - now);
+    auto timer =
+        bycorf::CancellableSleepFor(*state->worker_, state->deadline_ - now);
     state->cancel_ = timer.CancelHandle();
     const absl::Status slept = co_await timer;
     state->cancel_ = {};
@@ -107,12 +107,11 @@ celer::Task<absl::Status> ControlDeadlineWatchdog::Watch(
   co_return absl::OkStatus();
 }
 
-absl::Status ControlDeadlineWatchdog::Arm(
-    std::chrono::nanoseconds timeout) {
+absl::Status ControlDeadlineWatchdog::Arm(std::chrono::nanoseconds timeout) {
   if (timeout.count() <= 0) {
     return absl::InvalidArgumentError("control deadline must be positive");
   }
-  if (celer::ThisWorker().self_ != state_->worker_) {
+  if (bycorf::ThisWorker().self_ != state_->worker_) {
     return absl::FailedPreconditionError(
         "control deadline must be armed on its owning worker");
   }
@@ -141,8 +140,8 @@ std::uint64_t ControlDeadlineWatchdog::TaskStartsForTest() const noexcept {
 }
 
 struct ControlFrameStream::WriteDeadlineState {
-  celer::TcpStream* stream_ = nullptr;
-  celer::Worker* worker_ = nullptr;
+  bycorf::TcpStream* stream_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
   std::chrono::steady_clock::time_point deadline_{};
   bool armed_ = false;
   bool running_ = false;
@@ -150,7 +149,7 @@ struct ControlFrameStream::WriteDeadlineState {
 };
 
 ControlFrameStream::ControlFrameStream(
-    celer::TcpStream& stream, std::chrono::nanoseconds write_progress_timeout)
+    bycorf::TcpStream& stream, std::chrono::nanoseconds write_progress_timeout)
     : stream_(stream),
       write_progress_timeout_(write_progress_timeout),
       write_deadline_(std::make_shared<WriteDeadlineState>()) {
@@ -165,13 +164,13 @@ ControlFrameStream::~ControlFrameStream() {
   write_deadline_->stream_ = nullptr;
 }
 
-celer::Task<absl::Status> ControlFrameStream::WatchWriteDeadline(
+bycorf::Task<absl::Status> ControlFrameStream::WatchWriteDeadline(
     std::shared_ptr<WriteDeadlineState> state) {
   while (state->armed_ && state->stream_ != nullptr) {
     const auto now = std::chrono::steady_clock::now();
     if (now < state->deadline_) {
       const absl::Status slept =
-          co_await celer::SleepFor(*state->worker_, state->deadline_ - now);
+          co_await bycorf::SleepFor(*state->worker_, state->deadline_ - now);
       if (!slept.ok()) {
         state->running_ = false;
         co_return absl::OkStatus();
@@ -188,10 +187,10 @@ celer::Task<absl::Status> ControlFrameStream::WatchWriteDeadline(
 
 absl::Status ControlFrameStream::ArmWriteDeadline() {
   if (write_progress_timeout_.count() <= 0) return absl::OkStatus();
-  celer::Worker* worker = celer::ThisWorker().self_;
+  bycorf::Worker* worker = bycorf::ThisWorker().self_;
   if (worker == nullptr) {
     return absl::FailedPreconditionError(
-        "control writes must run on a Celer worker");
+        "control writes must run on a Bycorf worker");
   }
   write_deadline_->worker_ = worker;
   write_deadline_->deadline_ =
@@ -245,7 +244,7 @@ absl::Status ControlFrameStream::Prepare() noexcept {
   return stream_.SetReadAhead(false);
 }
 
-celer::Task<absl::Status> ControlFrameStream::ReadExactly(
+bycorf::Task<absl::Status> ControlFrameStream::ReadExactly(
     std::span<std::byte> destination) {
   std::size_t read_bytes = 0;
   while (read_bytes < destination.size()) {
@@ -259,7 +258,7 @@ celer::Task<absl::Status> ControlFrameStream::ReadExactly(
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::StatusOr<Frame>> ControlFrameStream::ReadFrame() {
+bycorf::Task<absl::StatusOr<Frame>> ControlFrameStream::ReadFrame() {
   std::array<std::byte, kFrameHeaderBytes> header_bytes{};
   if (absl::Status read = co_await ReadExactly(header_bytes); !read.ok()) {
     co_return read;
@@ -282,13 +281,13 @@ celer::Task<absl::StatusOr<Frame>> ControlFrameStream::ReadFrame() {
   co_return decoder_.Decode(encoded);
 }
 
-celer::Task<absl::StatusOr<WireMessage>> ControlFrameStream::ReadMessage() {
+bycorf::Task<absl::StatusOr<WireMessage>> ControlFrameStream::ReadMessage() {
   auto frame = co_await ReadFrame();
   if (!frame.ok()) co_return frame.status();
   co_return DecodeMessage(frame->type, frame->payload);
 }
 
-celer::Task<absl::Status> ControlFrameStream::WriteEncoded(
+bycorf::Task<absl::Status> ControlFrameStream::WriteEncoded(
     std::string encoded, std::function<void()> before_write) {
   const std::span<const std::byte> bytes = Bytes(encoded);
   std::size_t written = 0;
@@ -314,7 +313,7 @@ celer::Task<absl::Status> ControlFrameStream::WriteEncoded(
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> ControlFrameStream::WriteMessage(
+bycorf::Task<absl::Status> ControlFrameStream::WriteMessage(
     const WireMessage& message, std::function<void()> before_write) {
   auto payload = EncodeMessage(message);
   if (!payload.ok()) co_return payload.status();
@@ -396,10 +395,10 @@ struct ControlSessionWriter::Impl {
   }
 
   absl::Status BindWorker() {
-    celer::Worker* current = celer::ThisWorker().self_;
+    bycorf::Worker* current = bycorf::ThisWorker().self_;
     if (current == nullptr) {
       return absl::FailedPreconditionError(
-          "control session writes require a Celer worker");
+          "control session writes require a Bycorf worker");
     }
     if (owner_worker_ == nullptr) {
       owner_worker_ = current;
@@ -555,7 +554,7 @@ struct ControlSessionWriter::Impl {
   // but do not enqueue Start until the preceding End completes.
   std::shared_ptr<Request> active_transfer_;
   std::deque<std::shared_ptr<Request>> pending_transfers_;
-  celer::Worker* owner_worker_ = nullptr;
+  bycorf::Worker* owner_worker_ = nullptr;
   std::shared_ptr<Request> active_request_;
   std::optional<absl::Status> terminal_error_;
   std::size_t outstanding_bytes_ = 0;
@@ -566,7 +565,7 @@ ControlSessionWriter::ControlSessionWriter(ControlFrameStream& frames,
                                            std::size_t max_queue_bytes)
     : ControlSessionWriter(
           [&frames](WireMessage message, std::function<void()> before_write)
-              -> celer::Task<absl::Status> {
+              -> bycorf::Task<absl::Status> {
             co_return co_await frames.WriteMessage(message,
                                                    std::move(before_write));
           },
@@ -578,7 +577,7 @@ ControlSessionWriter::ControlSessionWriter(WriteFunction write_frame,
 
 ControlSessionWriter::~ControlSessionWriter() = default;
 
-celer::Task<absl::Status> ControlSessionWriter::Write(
+bycorf::Task<absl::Status> ControlSessionWriter::Write(
     MessagePriority priority, WireMessage message,
     std::function<void()> before_write) {
   if (absl::Status bound = impl_->BindWorker(); !bound.ok()) co_return bound;
@@ -615,7 +614,7 @@ celer::Task<absl::Status> ControlSessionWriter::Write(
   co_return request->result_;
 }
 
-celer::Task<absl::Status> ControlSessionWriter::WriteFullDesiredState(
+bycorf::Task<absl::Status> ControlSessionWriter::WriteFullDesiredState(
     std::shared_ptr<const std::string> encoded) {
   if (encoded == nullptr) {
     co_return absl::InvalidArgumentError(
@@ -638,7 +637,7 @@ celer::Task<absl::Status> ControlSessionWriter::WriteFullDesiredState(
                                    std::move(encoded));
 }
 
-celer::Task<absl::Status> ControlSessionWriter::WriteTransfer(
+bycorf::Task<absl::Status> ControlSessionWriter::WriteTransfer(
     TransferKind kind, WireId128 object_id,
     std::shared_ptr<const std::string> bytes) {
   if (absl::Status bound = impl_->BindWorker(); !bound.ok()) co_return bound;
@@ -688,7 +687,7 @@ celer::Task<absl::Status> ControlSessionWriter::WriteTransfer(
   co_return request->result_;
 }
 
-celer::Task<absl::Status> ControlSessionWriter::Drive() {
+bycorf::Task<absl::Status> ControlSessionWriter::Drive() {
   struct DriveGuard {
     explicit DriveGuard(Impl* impl) : impl_(impl) {}
     ~DriveGuard() {

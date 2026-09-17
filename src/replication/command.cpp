@@ -244,7 +244,7 @@ ReplicationCommandPayloadSource::Create(std::uint8_t db_id,
   return absl::ResourceExhaustedError("replication command is too large");
 }
 
-celer::Task<absl::Status> ReplicationCommandPayloadSource::Read(
+bycorf::Task<absl::Status> ReplicationCommandPayloadSource::Read(
     std::uint64_t offset, std::span<std::byte> output) {
   if (offset > size_ || output.size() > size_ - offset) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,

@@ -19,13 +19,13 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
-#include "celer/io/storage.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/runtime/worker.h"
 
 namespace keylane::cluster {
 namespace {
 
-// Celer's relative sleep uses CLOCK_MONOTONIC, which pauses across host
+// Bycorf's relative sleep uses CLOCK_MONOTONIC, which pauses across host
 // suspend. Rechecking a CLOCK_BOOTTIME deadline in short slices bounds the
 // post-resume source-capability cleanup delay instead of preserving the
 // remainder of an arbitrarily long lease. Request admission itself checks
@@ -215,18 +215,18 @@ std::optional<absl::Status> NodeDirectiveCompletion::result() const {
   return poll_();
 }
 
-celer::Task<absl::Status> NodeDirectiveCompletion::Await() const {
+bycorf::Task<absl::Status> NodeDirectiveCompletion::Await() const {
   for (;;) {
     if (std::optional<absl::Status> terminal = result(); terminal.has_value()) {
       co_return *terminal;
     }
-    celer::Worker* worker = celer::ThisWorker().self_;
+    bycorf::Worker* worker = bycorf::ThisWorker().self_;
     if (worker == nullptr) {
       co_return absl::FailedPreconditionError(
-          "pending directive completion requires a Celer worker");
+          "pending directive completion requires a Bycorf worker");
     }
     const absl::Status waited =
-        co_await celer::SleepFor(*worker, std::chrono::milliseconds(10));
+        co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(10));
     if (!waited.ok()) co_return waited;
   }
 }
@@ -235,18 +235,18 @@ absl::Status NullNodeControlActions::RevokeSourceAuthorizations() {
   return absl::OkStatus();
 }
 
-celer::Task<absl::Status>
+bycorf::Task<absl::Status>
 NodeControlActions::RevokeSourceAuthorizationsAndWait() {
   co_return RevokeSourceAuthorizations();
 }
 
-celer::Task<absl::Status>
+bycorf::Task<absl::Status>
 NodeControlActions::ClearSourceAuthorizationsForSessionReplacementAndWait(
     bool /*preserve_established_exports*/) {
   co_return RevokeSourceAuthorizations();
 }
 
-celer::Task<absl::Status>
+bycorf::Task<absl::Status>
 NodeControlActions::RefreshSourceAuthorizationsForFdsReplacementAndWait(
     bool preserve_current_population_exports,
     std::size_t /*expected_authorization_replays*/) {
@@ -254,54 +254,54 @@ NodeControlActions::RefreshSourceAuthorizationsForFdsReplacementAndWait(
       preserve_current_population_exports);
 }
 
-celer::Task<absl::Status> NodeControlActions::ReconcileClusterControl(
+bycorf::Task<absl::Status> NodeControlActions::ReconcileClusterControl(
     std::optional<DesiredClusterControl> /*desired*/) {
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> NodeControlActions::ActivatePreparedPromotion(
+bycorf::Task<absl::Status> NodeControlActions::ActivatePreparedPromotion(
     PreparedFailoverActivation /*activation*/) {
   co_return absl::FailedPreconditionError(
       "the control adapter cannot activate a prepared promotion");
 }
 
-celer::Task<absl::Status> NodeControlActions::EnableExpirationAuthorityUntil(
+bycorf::Task<absl::Status> NodeControlActions::EnableExpirationAuthorityUntil(
     MonotonicTime /*deadline*/) {
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> NodeControlActions::EnableSourceAdmissionForLease(
+bycorf::Task<absl::Status> NodeControlActions::EnableSourceAdmissionForLease(
     MonotonicTime /*deadline*/) {
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> NodeControlActions::RevokeExpirationAuthority() {
+bycorf::Task<absl::Status> NodeControlActions::RevokeExpirationAuthority() {
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> NodeControlActions::ReconcilePopulation(
+bycorf::Task<absl::Status> NodeControlActions::ReconcilePopulation(
     std::optional<PopulationReadiness> /*desired*/,
     bool /*population_transition_expected*/) {
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> NodeControlActions::CancelInProgressPopulation(
+bycorf::Task<absl::Status> NodeControlActions::CancelInProgressPopulation(
     bool /*preserve_current_follow_attempt*/) {
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> NodeControlActions::CancelPopulationForShutdown() {
+bycorf::Task<absl::Status> NodeControlActions::CancelPopulationForShutdown() {
   co_return co_await CancelInProgressPopulation(
       /*preserve_current_follow_attempt=*/false);
 }
 
-celer::Task<NodeDirectiveCompletion> NodeControlActions::StartDirective(
+bycorf::Task<NodeDirectiveCompletion> NodeControlActions::StartDirective(
     NodeDirective directive) {
   co_return NodeDirectiveCompletion::StartedTerminal(
       co_await ApplyDirective(std::move(directive)));
 }
 
-celer::Task<absl::Status> NullNodeControlActions::ApplyDirective(
+bycorf::Task<absl::Status> NullNodeControlActions::ApplyDirective(
     NodeDirective /*directive*/) {
   co_return absl::FailedPreconditionError(
       "the test control adapter does not execute Meta directives");
@@ -556,7 +556,7 @@ void NodeControlInstaller::RetireAllLeaseSchedules() {
   lease_expiry_schedules_.clear();
 }
 
-celer::Task<absl::Status> NodeControlInstaller::FailClosedLeaseGrantTransition(
+bycorf::Task<absl::Status> NodeControlInstaller::FailClosedLeaseGrantTransition(
     const AuthorityMessage& message, absl::Status failure) {
   assert(!failure.ok());
   ControlTransitionGuard transition_guard(*this);
@@ -772,14 +772,14 @@ void NodeControlInstaller::InvalidateDirectiveAdmissions() {
   ++directive_admission_generation_;
 }
 
-celer::Task<absl::Status> NodeControlInstaller::WaitForDirectiveAdmissions() {
-  celer::Worker* worker = celer::ThisWorker().self_;
+bycorf::Task<absl::Status> NodeControlInstaller::WaitForDirectiveAdmissions() {
+  bycorf::Worker* worker = bycorf::ThisWorker().self_;
   if (worker == nullptr && directive_admissions_in_flight_ != 0) {
     co_return absl::FailedPreconditionError(
-        "directive admission drain requires a Celer worker");
+        "directive admission drain requires a Bycorf worker");
   }
   while (directive_admissions_in_flight_ != 0) {
-    co_await celer::Yield(*worker);
+    co_await bycorf::Yield(*worker);
   }
   co_return absl::OkStatus();
 }
@@ -812,16 +812,17 @@ NodeControlInstaller::ControlTransitionGuard::~ControlTransitionGuard() {
   --owner_->source_revocation_transitions_;
 }
 
-celer::Task<absl::Status> NodeControlInstaller::WaitForControlTransitionsBefore(
+bycorf::Task<absl::Status>
+NodeControlInstaller::WaitForControlTransitionsBefore(
     std::uint64_t transition_id) {
-  celer::Worker* worker = celer::ThisWorker().self_;
+  bycorf::Worker* worker = bycorf::ThisWorker().self_;
   while (!active_control_transitions_.empty() &&
          *active_control_transitions_.begin() < transition_id) {
     if (worker == nullptr) {
       co_return absl::FailedPreconditionError(
-          "control transition drain requires a Celer worker");
+          "control transition drain requires a Bycorf worker");
     }
-    co_await celer::Yield(*worker);
+    co_await bycorf::Yield(*worker);
   }
   co_return absl::OkStatus();
 }
@@ -846,19 +847,19 @@ void NodeControlInstaller::RememberDrain(
   }
 }
 
-celer::Task<absl::Status> NodeControlInstaller::WaitForPendingDrains(
+bycorf::Task<absl::Status> NodeControlInstaller::WaitForPendingDrains(
     std::span<const AuthorityAnchor> anchors) {
   while (std::any_of(anchors.begin(), anchors.end(),
                      [this](const AuthorityAnchor& anchor) {
                        return DrainPending(anchor.group_id_);
                      })) {
-    celer::Worker* worker = celer::ThisWorker().self_;
+    bycorf::Worker* worker = bycorf::ThisWorker().self_;
     if (worker == nullptr) {
       co_return absl::FailedPreconditionError(
-          "asynchronous assignment drain requires a Celer worker");
+          "asynchronous assignment drain requires a Bycorf worker");
     }
     const absl::Status waited =
-        co_await celer::SleepFor(*worker, std::chrono::milliseconds(1));
+        co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(1));
     if (!waited.ok()) co_return waited;
   }
   co_return absl::OkStatus();
@@ -1257,7 +1258,7 @@ absl::Status NodeControlInstaller::InstallRouting(PreparedFullState prepared) {
                                &effects);
 }
 
-celer::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
+bycorf::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
     PreparedFullState prepared_state, ProjectionBasis projection_basis,
     bool local_population_transition_expected,
     std::size_t expected_source_authorization_replays) {
@@ -1393,16 +1394,16 @@ absl::Status NodeControlInstaller::ApplyAuthority(
   return result;
 }
 
-celer::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
+bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
     const AuthorityMessage& message) {
   if (message.kind_ != AuthorityMessage::Kind::kLeaseGrant) {
     co_return absl::InvalidArgumentError(
         "Meta lease transition received a non-grant authority message");
   }
-  celer::Worker* worker = celer::ThisWorker().self_;
+  bycorf::Worker* worker = bycorf::ThisWorker().self_;
   if (worker == nullptr) {
     co_return absl::FailedPreconditionError(
-        "Meta lease transition requires a Celer worker");
+        "Meta lease transition requires a Bycorf worker");
   }
   const MonotonicTime deadline = SaturatingLeaseDeadline(message);
   MonotonicTime now = LeaseClockNow();
@@ -1553,7 +1554,7 @@ celer::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> NodeControlInstaller::ExpireLeaseAt(
+bycorf::Task<absl::Status> NodeControlInstaller::ExpireLeaseAt(
     std::shared_ptr<LeaseExpirySchedule> schedule,
     std::uint64_t timer_generation,
     std::shared_ptr<const LeaseTimerLifetime> lifetime) {
@@ -1561,16 +1562,16 @@ celer::Task<absl::Status> NodeControlInstaller::ExpireLeaseAt(
   // suspension. Its destruction makes the public outlive-worker contract
   // mechanically checkable without coupling this module to Worker shutdown.
   (void)lifetime;
-  celer::Worker* worker = celer::ThisWorker().self_;
+  bycorf::Worker* worker = bycorf::ThisWorker().self_;
   if (worker == nullptr) {
     co_return absl::FailedPreconditionError(
-        "lease expiration requires a Celer worker");
+        "lease expiration requires a Bycorf worker");
   }
   while (schedule->active_ && schedule->timer_generation_ == timer_generation) {
     const MonotonicTime deadline = schedule->deadline_;
     const MonotonicTime now = LeaseClockNow();
     if (now < deadline) {
-      const absl::Status slept = co_await celer::SleepFor(
+      const absl::Status slept = co_await bycorf::SleepFor(
           *worker, std::min(deadline - now, schedule->recheck_interval_));
       if (!slept.ok()) co_return slept;
       continue;
@@ -1587,7 +1588,7 @@ celer::Task<absl::Status> NodeControlInstaller::ExpireLeaseAt(
   co_return co_await FinishExpiredLeaseTransition(schedule, LeaseClockNow());
 }
 
-celer::Task<absl::Status> NodeControlInstaller::FinishExpiredLeaseTransition(
+bycorf::Task<absl::Status> NodeControlInstaller::FinishExpiredLeaseTransition(
     std::shared_ptr<LeaseExpirySchedule> schedule, MonotonicTime now) {
   if (!schedule->active_) co_return absl::OkStatus();
   if (now < schedule->deadline_) {
@@ -1657,7 +1658,7 @@ absl::StatusOr<bool> NodeControlInstaller::ApplyFenceLocal(
   return newly_fenced;
 }
 
-celer::Task<absl::Status> NodeControlInstaller::ApplyFenceTransition(
+bycorf::Task<absl::Status> NodeControlInstaller::ApplyFenceTransition(
     const AuthorityMessage& message) {
   if (message.kind_ != AuthorityMessage::Kind::kFence) {
     co_return absl::InvalidArgumentError(
@@ -1699,7 +1700,7 @@ celer::Task<absl::Status> NodeControlInstaller::ApplyFenceTransition(
   co_return result;
 }
 
-celer::Task<NodeDirectiveCompletion> NodeControlInstaller::StartDirective(
+bycorf::Task<NodeDirectiveCompletion> NodeControlInstaller::StartDirective(
     NodeDirective directive) {
   const auto terminal = [](absl::Status status) {
     return NodeDirectiveCompletion::Rejected(std::move(status));
@@ -1757,7 +1758,7 @@ celer::Task<NodeDirectiveCompletion> NodeControlInstaller::StartDirective(
   co_return co_await actions_.StartDirective(std::move(directive));
 }
 
-celer::Task<absl::Status> NodeControlInstaller::ApplyDirective(
+bycorf::Task<absl::Status> NodeControlInstaller::ApplyDirective(
     NodeDirective directive) {
   NodeDirectiveCompletion completion =
       co_await StartDirective(std::move(directive));
@@ -1797,7 +1798,7 @@ absl::Status NodeControlInstaller::InvalidateSessionNow(
   return absl::OkStatus();
 }
 
-celer::Task<absl::Status>
+bycorf::Task<absl::Status>
 NodeControlInstaller::CancelPopulationForShutdownTransition() {
   ControlTransitionGuard transition_guard(*this);
   InvalidateDirectiveAdmissions();
@@ -1810,7 +1811,7 @@ NodeControlInstaller::CancelPopulationForShutdownTransition() {
                          co_await actions_.CancelPopulationForShutdown());
 }
 
-celer::Task<absl::Status> NodeControlInstaller::LoseSessionTransition(
+bycorf::Task<absl::Status> NodeControlInstaller::LoseSessionTransition(
     const SessionIdentity& session, std::string_view /*reason*/) {
   if (absl::Status invalidated = InvalidateSessionNow(session);
       !invalidated.ok()) {
@@ -1837,7 +1838,7 @@ celer::Task<absl::Status> NodeControlInstaller::LoseSessionTransition(
   co_return result;
 }
 
-celer::Task<absl::Status>
+bycorf::Task<absl::Status>
 NodeControlInstaller::RevokeSourceAuthorizationsTransition() {
   ControlTransitionGuard transition_guard(*this);
   InvalidateDirectiveAdmissions();
@@ -1846,7 +1847,7 @@ NodeControlInstaller::RevokeSourceAuthorizationsTransition() {
                          co_await actions_.RevokeSourceAuthorizationsAndWait());
 }
 
-celer::Task<absl::Status>
+bycorf::Task<absl::Status>
 NodeControlInstaller::SetPopulationReadinessTransition(
     std::optional<PopulationReadiness> readiness) {
   absl::Status result = co_await SetPopulationReadinessTransitionImpl(
@@ -1854,7 +1855,7 @@ NodeControlInstaller::SetPopulationReadinessTransition(
   co_return result;
 }
 
-celer::Task<absl::Status>
+bycorf::Task<absl::Status>
 NodeControlInstaller::SetPopulationReadinessTransitionImpl(
     std::optional<PopulationReadiness> readiness,
     bool invalidate_directive_admissions) {
@@ -2004,7 +2005,7 @@ absl::Status NodeControlInstaller::SetStorageReady(bool ready) {
   return result;
 }
 
-celer::Task<absl::Status>
+bycorf::Task<absl::Status>
 NodeControlInstaller::LoseStorageReadinessTransition() {
   if (storage_failed_) {
     if (storage_loss_result_.has_value()) co_return *storage_loss_result_;

@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "../src/storage/engine/impl.h"
-#include "celer/net/server.h"
+#include "bycorf/net/server.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/storage/engine.h"
@@ -100,7 +100,7 @@ class ExpirationAuthorityTestPeer {
     storage.impl_->expiration_test_hook_ = std::move(hook);
   }
 
-  static celer::Task<absl::Status> ResumeAndExpireFront(
+  static bycorf::Task<absl::Status> ResumeAndExpireFront(
       StorageEngine& storage) {
     auto& store = storage.impl_->CurrentStore();
     if (store.expired_candidates_.empty()) {
@@ -174,10 +174,10 @@ constexpr std::chrono::nanoseconds FarFutureExpirationDeadline() {
   return std::chrono::nanoseconds::max() - std::chrono::nanoseconds(1);
 }
 
-class FiniteExpirationAuthorityService final : public celer::Service {
+class FiniteExpirationAuthorityService final : public bycorf::Service {
  public:
   FiniteExpirationAuthorityService(keylane::storage::StorageEngine* storage,
-                                   celer::Server* server)
+                                   bycorf::Server* server)
       : storage_(storage), server_(server) {}
 
   void Prepare(unsigned thread_count) override {
@@ -187,8 +187,8 @@ class FiniteExpirationAuthorityService final : public celer::Service {
     }
   }
 
-  celer::Task<absl::Status> Run(celer::Worker& worker,
-                                celer::ServiceContext) override {
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
+                                 bycorf::ServiceContext) override {
     keylane::BindMemoryAccountingShard(worker.id());
     keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
     result_ = co_await storage_->InitializeWorker(worker);
@@ -233,14 +233,14 @@ class FiniteExpirationAuthorityService final : public celer::Service {
 
   void Stop() noexcept override {}
 
-  void FinalizeWorker(celer::Worker& worker) noexcept override {
+  void FinalizeWorker(bycorf::Worker& worker) noexcept override {
     storage_->FinalizeWorker(worker);
   }
 
   const absl::Status& result() const noexcept { return result_; }
 
  private:
-  celer::Task<absl::Status> SeedExpired(std::string_view key) {
+  bycorf::Task<absl::Status> SeedExpired(std::string_view key) {
     auto seeded = co_await storage_->Set(
         0, key, "value", keylane::storage::SetOptions{.expire_at_ms_ = 1});
     if (!seeded.ok()) co_return seeded.status();
@@ -248,7 +248,7 @@ class FiniteExpirationAuthorityService final : public celer::Service {
   }
 
 #if KEYLANE_FAULTS_ENABLED
-  celer::Task<absl::Status> ExerciseDurableFinalPrecondition() {
+  bycorf::Task<absl::Status> ExerciseDurableFinalPrecondition() {
     constexpr std::string_view kKey = "expiration-final-{foo}";
     absl::Status prepared = co_await SeedExpired(kKey);
     if (!prepared.ok()) co_return prepared;
@@ -277,7 +277,7 @@ class FiniteExpirationAuthorityService final : public celer::Service {
         FarFutureExpirationDeadline());
   }
 
-  celer::Task<absl::Status> ExerciseUnrelatedDurableFailure() {
+  bycorf::Task<absl::Status> ExerciseUnrelatedDurableFailure() {
     constexpr std::string_view kKey = "expiration-internal-{foo}";
     absl::Status prepared = co_await SeedExpired(kKey);
     if (!prepared.ok()) co_return prepared;
@@ -308,7 +308,7 @@ class FiniteExpirationAuthorityService final : public celer::Service {
         FarFutureExpirationDeadline());
   }
 
-  celer::Task<absl::Status> ExerciseDiskFullFallbackPrecondition() {
+  bycorf::Task<absl::Status> ExerciseDiskFullFallbackPrecondition() {
     constexpr std::string_view kKey = "expiration-fallback-{foo}";
     absl::Status prepared = co_await SeedExpired(kKey);
     if (!prepared.ok()) co_return prepared;
@@ -340,7 +340,7 @@ class FiniteExpirationAuthorityService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExerciseCurrentGrant() {
+  bycorf::Task<absl::Status> ExerciseCurrentGrant() {
     constexpr std::string_view kKey = "expiration-current-{foo}";
     absl::Status granted =
         storage_->SetExpirationAuthorityUntil(FarFutureExpirationDeadline());
@@ -361,7 +361,7 @@ class FiniteExpirationAuthorityService final : public celer::Service {
   }
 #endif
 
-  celer::Task<absl::Status> QueueExpired(std::string_view key) {
+  bycorf::Task<absl::Status> QueueExpired(std::string_view key) {
     auto result = co_await storage_->Get(0, key);
     if (result.ok() || result.status().code() != absl::StatusCode::kNotFound) {
       co_return absl::FailedPreconditionError(
@@ -386,7 +386,7 @@ class FiniteExpirationAuthorityService final : public celer::Service {
   }
 
   keylane::storage::StorageEngine* storage_ = nullptr;
-  celer::Server* server_ = nullptr;
+  bycorf::Server* server_ = nullptr;
   bool expiration_paused_ = false;
   absl::Status result_ =
       absl::UnknownError("finite expiration authority test did not run");
@@ -481,10 +481,10 @@ TEST(StorageExpirationAuthorityTest,
   ASSERT_TRUE(storage.Prepare(1).ok());
   keylane::tx::TxRuntime::Create(1);
 
-  celer::Server server;
+  bycorf::Server server;
   FiniteExpirationAuthorityService service(&storage, &server);
   server.AddService(&service);
-  celer::ServerOptions runtime;
+  bycorf::ServerOptions runtime;
   runtime.thread_count_ = 1;
   runtime.pin_workers_ = false;
   runtime.recv_buffer_count_ = 0;

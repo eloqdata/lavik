@@ -19,7 +19,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/runtime/foreign_executor.h"
+#include "bycorf/runtime/foreign_executor.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/data_control_runtime_status.h"
@@ -28,10 +28,10 @@ namespace nuraft {
 class raft_server;
 }
 
-namespace celer {
+namespace bycorf {
 struct Connection;
 class TcpStream;
-}  // namespace celer
+}  // namespace bycorf
 
 namespace keylane::meta {
 
@@ -90,13 +90,13 @@ class PendingHandshakeLimiter {
 // erasing the incumbent's slot during coroutine cleanup.
 class BoundNodeSessionRegistry {
  public:
-  bool TryClaim(std::string_view node_id, celer::Connection* connection);
+  bool TryClaim(std::string_view node_id, bycorf::Connection* connection);
   void Release(std::string_view node_id,
-               celer::Connection* connection) noexcept;
+               bycorf::Connection* connection) noexcept;
   std::size_t size() const noexcept { return sessions_.size(); }
 
  private:
-  std::map<std::string, celer::Connection*, std::less<>> sessions_;
+  std::map<std::string, bycorf::Connection*, std::less<>> sessions_;
 };
 
 // Worker-local weighted budget for decoded-plus-encoded node projections.
@@ -147,7 +147,7 @@ class RetainedProjectionLimiter {
 // Worker-local immutable view cache shared by all Data sessions. A Meta
 // commit may wake thousands of sessions, but the six committed stores are
 // copied only once for each new applied high-water. Not thread-safe: the
-// data-control server owns and accesses it exclusively on its Celer worker.
+// data-control server owns and accesses it exclusively on its Bycorf worker.
 class MetaCommittedViewCache {
  public:
   using Loader = std::function<MetaCommittedView()>;
@@ -528,13 +528,13 @@ class MetaDataControlServer final : public MetaReconciler {
   // The coordinator is retained by reference and must outlive every session
   // and leader task, through a completed Shutdown/CancelAndWait drain.
   static absl::StatusOr<std::shared_ptr<MetaDataControlServer>> Create(
-      celer::ForeignExecutor foreign_executor,
+      bycorf::ForeignExecutor foreign_executor,
       nuraft::ptr<nuraft::raft_server> server, MetaCoordinator& coordinator,
       std::shared_ptr<MetaObservationStore> observations,
       MetaDataControlServerOptions options);
 
   // Destruction performs the same blocking drain as Shutdown. Unless a prior
-  // Shutdown completed, destroy this object outside its owning Celer worker
+  // Shutdown completed, destroy this object outside its owning Bycorf worker
   // while that worker's executor can still make progress.
   ~MetaDataControlServer() override;
   MetaDataControlServer(const MetaDataControlServer&) = delete;
@@ -542,7 +542,7 @@ class MetaDataControlServer final : public MetaReconciler {
 
   // Listener lifecycle. Start binds once and accepts on leaders and
   // followers; Shutdown synchronously closes ingress and live sessions. It
-  // must run outside the owning Celer worker while that worker's executor can
+  // must run outside the owning Bycorf worker while that worker's executor can
   // still make progress. An executor rejection before the drain completes is
   // fail-stop because returning would falsely advertise a safe process-
   // teardown boundary.
@@ -555,7 +555,7 @@ class MetaDataControlServer final : public MetaReconciler {
   // CancelAndWait does not return until the worker has revoked the context,
   // closed and joined every authority-bearing session from that leadership
   // epoch, and joined its leader-scoped tasks.
-  // It blocks and must run outside the owning Celer worker while that worker's
+  // It blocks and must run outside the owning Bycorf worker while that worker's
   // executor can still make progress. Failure to deliver either leader edge is
   // fail-stop; after a completed full Shutdown the cancellation barrier is
   // already satisfied and becomes a no-op.
@@ -573,16 +573,16 @@ class MetaDataControlServer final : public MetaReconciler {
   // never enters production assembly and avoids requiring tests to induce
   // allocation failure in ForeignExecutor::Notify.
   static std::shared_ptr<MetaDataControlServer> LifecycleHarnessForTest(
-      celer::ForeignExecutor foreign_executor, bool shutdown_complete);
+      bycorf::ForeignExecutor foreign_executor, bool shutdown_complete);
 
   // Shared by the public leader callback and the rejected-executor lifecycle
   // harness. Tests pass null only with an executor that cannot accept the
   // closure, so no synthetic MetaLeaderContext is needed to cover fail-stop.
   void StartOnExecutor(MetaLeaderContext* context);
 
-  static celer::Task<absl::Status> AcceptLoop(CorePtr core);
-  static celer::Task<absl::Status> SessionLoop(
-      CorePtr core, celer::TcpStream stream, celer::Connection* connection,
+  static bycorf::Task<absl::Status> AcceptLoop(CorePtr core);
+  static bycorf::Task<absl::Status> SessionLoop(
+      CorePtr core, bycorf::TcpStream stream, bycorf::Connection* connection,
       detail::PendingHandshakeLimiter::Permit handshake_permit,
       SessionConnectionBorrow borrow);
 

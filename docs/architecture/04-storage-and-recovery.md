@@ -71,7 +71,7 @@ allocation epoch form immutable identity after publication and are the only
 fields a key-index owner may read directly. The owner is published atomically
 after epoch initialization, so an acquire owner read makes the immutable epoch
 visible without an extra worker hop. Other state remains owner-local and other
-workers use Celer cross-core submissions to read or mutate it.
+workers use Bycorf cross-core submissions to read or mutate it.
 
 Append-stream creation and rollover are single-flight within each stream. A
 writer may release owner-local store state while physical allocation waits,
@@ -89,7 +89,7 @@ participates in that same arbitration boundary.
 ## Persistence backends and physical layout
 
 Active storage paths are existing regular files, Linux raw block devices, or
-Celer SPDK storage paths. `Prepare` probes and validates them; it does not
+Bycorf SPDK storage paths. `Prepare` probes and validates them; it does not
 create, extend, truncate, or preallocate a missing regular file. On the POSIX
 io_uring backend, every worker opens the complete configured path table for
 direct I/O; registered buffers are used when registration succeeds and the
@@ -219,7 +219,7 @@ root-to-child identity.
 
 ### Preparation
 
-`Prepare` runs before Celer workers start. It validates the worker count,
+`Prepare` runs before Bycorf workers start. It validates the worker count,
 inline-key limit, flush alignment, per-device defrag concurrency, configured
 paths, capacities, and membership. A fresh regular file must be an 8 MiB
 multiple. A raw device uses its complete 8 MiB blocks and ignores a shorter
@@ -875,7 +875,7 @@ metrics, filesystem free space for regular-file devices, and Defrag, Tomb
 Raider, transaction-cleaner, and transaction-commit coordinator totals. INFO
 STATS reports commit batch and transaction counts, input and merged fences,
 queue depth and peak, backpressure waits, and the 4096-receipt watermark.
-Prometheus also aggregates Celer's completed storage read, write, and
+Prometheus also aggregates Bycorf's completed storage read, write, and
 `fdatasync` counters and publishes server readiness; recovery reports periodic
 progress in the log. Runtime configuration can pause or pace defrag and select
 Tomb Raider off, interval, or daily scheduling. Engine snapshots are collected

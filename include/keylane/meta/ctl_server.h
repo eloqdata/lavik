@@ -1,7 +1,7 @@
 #pragma once
 
 // MetaCtlServer: authorized line-protocol administration and observation
-// surface of keylane-meta, served on its Celer control worker. NuRaft's Asio
+// surface of keylane-meta, served on its Bycorf control worker. NuRaft's Asio
 // peer transport has an independent runtime.
 //
 // Local administration defaults to a mode-0600 AF_UNIX socket and derives
@@ -184,7 +184,7 @@
 // THREAD MODEL
 //
 // Start()/Shutdown()/status() may be called from any thread. Lifecycle work
-// enters the owning worker through celer::ForeignExecutor. The accept loop
+// enters the owning worker through bycorf::ForeignExecutor. The accept loop
 // and one session coroutine per connection run on that worker. Committed
 // model mutations go through
 // MetaCoordinator; a bounded proposal executor invokes membership and
@@ -212,8 +212,8 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/runtime/foreign_executor.h"
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/foreign_executor.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/meta/cluster_status.h"
 #include "keylane/meta/committed_status_view.h"
 #include "keylane/meta/data_control_runtime_status.h"
@@ -224,11 +224,11 @@
 #include "libnuraft/ptr.hxx"
 #pragma GCC diagnostic pop
 
-namespace celer {
+namespace bycorf {
 struct Connection;
 class TcpStream;
 class Worker;
-}  // namespace celer
+}  // namespace bycorf
 
 namespace nuraft {
 class raft_server;
@@ -380,13 +380,13 @@ class MetaCtlServer {
   static absl::Status ValidateOptions(const MetaCtlServerOptions& options);
 
   static absl::StatusOr<std::shared_ptr<MetaCtlServer>> Create(
-      celer::ForeignExecutor foreign_executor,
+      bycorf::ForeignExecutor foreign_executor,
       nuraft::ptr<nuraft::raft_server> server,
       nuraft::ptr<MetaStateMachine> state_machine,
       std::shared_ptr<MetaCoordinator> coordinator,
       std::shared_ptr<MetaObservationStore> obs_store,
       // Non-owning: process assembly must keep the executor alive until the
-      // Celer worker and all ctl session coroutines have stopped.
+      // Bycorf worker and all ctl session coroutines have stopped.
       MetaProposalExecutor& proposal_executor,
       // All listeners for this Meta process must share the same gate, covering
       // both membership changes and the complete cluster-create workflow.
@@ -417,11 +417,11 @@ class MetaCtlServer {
 
   explicit MetaCtlServer(CorePtr core) : core_(std::move(core)) {}
 
-  static celer::Task<absl::Status> AcceptLoop(CorePtr core);
-  static celer::Task<absl::Status> SessionLoop(CorePtr core,
-                                               celer::TcpStream stream,
-                                               celer::Connection* connection,
-                                               SessionConnectionBorrow borrow);
+  static bycorf::Task<absl::Status> AcceptLoop(CorePtr core);
+  static bycorf::Task<absl::Status> SessionLoop(CorePtr core,
+                                                bycorf::TcpStream stream,
+                                                bycorf::Connection* connection,
+                                                SessionConnectionBorrow borrow);
 
   CorePtr core_;
 };

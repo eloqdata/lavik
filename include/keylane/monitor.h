@@ -7,9 +7,9 @@
 #include <string_view>
 
 #include "absl/status/status.h"
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/task.h"
 
-namespace celer {
+namespace bycorf {
 class TcpStream;
 }
 
@@ -41,7 +41,7 @@ void PublishExecMonitorCommands(const ConnectionContext& context,
 std::shared_ptr<MonitorSession> RegisterMonitorSession(int fd);
 void UnregisterMonitorSession(const std::shared_ptr<MonitorSession>& session);
 
-celer::Task<absl::Status> StreamMonitorMessages(
-    celer::TcpStream& stream, const std::shared_ptr<MonitorSession>& session);
+bycorf::Task<absl::Status> StreamMonitorMessages(
+    bycorf::TcpStream& stream, const std::shared_ptr<MonitorSession>& session);
 
 }  // namespace keylane

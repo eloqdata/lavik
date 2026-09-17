@@ -710,7 +710,7 @@ Task<absl::Status> StorageEngine::Impl::PublishEphemeralReplicationCommand(
     std::uint16_t partition_id, std::vector<std::string> args,
     MutationPrecondition mutation_precondition) {
   if (partition_id >= kLogicalStorageShards ||
-      partition_id % worker_count_ != celer::ThisWorker().id_) {
+      partition_id % worker_count_ != bycorf::ThisWorker().id_) {
     co_return absl::FailedPreconditionError(
         "ephemeral replication partition does not belong to this worker");
   }
@@ -756,7 +756,7 @@ StorageEngine::Impl::PrepareAdmittedReplicationCommand(
     std::uint16_t partition_id, std::vector<std::string> args,
     std::optional<std::vector<std::string>> fullsync_projection) {
   if (partition_id >= kLogicalStorageShards ||
-      partition_id % worker_count_ != celer::ThisWorker().id_ ||
+      partition_id % worker_count_ != bycorf::ThisWorker().id_ ||
       (kind != ReplicationEventKind::kCatalogMutation &&
        kind != ReplicationEventKind::kEphemeral) ||
       args.empty()) {
@@ -872,7 +872,7 @@ bool StorageEngine::Impl::TryEnqueueReplicationTransaction(
   }
 
   const auto staging_bytes =
-      TransactionStagingBytes(*transaction, celer::ThisWorker().id_);
+      TransactionStagingBytes(*transaction, bycorf::ThisWorker().id_);
   if (!staging_bytes.has_value()) {
     log.state_ = ReplicationLogState::kInvalid;
     spdlog::warn("replication transaction staging size overflow");
@@ -1035,7 +1035,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
       while (
           pending.transaction_->resolution_.load(std::memory_order_acquire) ==
           ReplicationTransactionResolution::kPending) {
-        co_await celer::Yield(*store->worker_);
+        co_await bycorf::Yield(*store->worker_);
       }
       const ReplicationTransactionResolution resolution =
           pending.transaction_->resolution_.load(std::memory_order_acquire);
@@ -1057,7 +1057,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
         break;
       }
       const auto final_staging_bytes = TransactionStagingBytes(
-          *pending.transaction_, celer::ThisWorker().id_);
+          *pending.transaction_, bycorf::ThisWorker().id_);
       if (!final_staging_bytes.has_value()) {
         log.state_ = ReplicationLogState::kInvalid;
         spdlog::warn("replication transaction queue size overflow");
@@ -1093,10 +1093,10 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
             .kind_ = ReplicationEventKind::kTransaction,
             .db_id_ = pending.transaction_->db_id_,
             .partition_id_ =
-                static_cast<std::uint16_t>(celer::ThisWorker().id_),
+                static_cast<std::uint16_t>(bycorf::ThisWorker().id_),
             .partition_sequence_ = pending.transaction_->id_,
             .args_ = BuildReplicationTransactionEnvelope(
-                *pending.transaction_, celer::ThisWorker().id_),
+                *pending.transaction_, bycorf::ThisWorker().id_),
         };
       } catch (const std::length_error&) {
         log.state_ = ReplicationLogState::kInvalid;
@@ -1211,10 +1211,10 @@ Task<absl::Status> StorageEngine::Impl::PublishFlushDbReplication(
       co_return absl::OkStatus();
     };
     absl::Status published;
-    if (target == celer::ThisWorker().id_) {
+    if (target == bycorf::ThisWorker().id_) {
       published = co_await publish();
     } else {
-      published = co_await celer::SubmitTaskTo(target, publish);
+      published = co_await bycorf::SubmitTaskTo(target, publish);
     }
     if (!published.ok()) co_return published;
   }
@@ -1258,10 +1258,10 @@ Task<absl::Status> StorageEngine::Impl::PublishFlushAllReplication(
       co_return absl::OkStatus();
     };
     absl::Status published;
-    if (target == celer::ThisWorker().id_) {
+    if (target == bycorf::ThisWorker().id_) {
       published = co_await publish();
     } else {
-      published = co_await celer::SubmitTaskTo(target, std::move(publish));
+      published = co_await bycorf::SubmitTaskTo(target, std::move(publish));
     }
     if (!published.ok()) co_return published;
   }
@@ -1870,7 +1870,7 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
     log.mutex_.Unlock(*store.worker_);
     if (!pending) break;
     absl::Status waited =
-        co_await celer::SleepFor(*store.worker_, std::chrono::milliseconds(1));
+        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
     if (!waited.ok()) co_return waited;
   }
   co_return absl::OkStatus();

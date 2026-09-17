@@ -8,8 +8,8 @@
 #include <memory>
 
 #include "absl/strings/str_cat.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/fault_injection.h"
 #include "keylane/rdb.h"
 #include "keylane/replication_command.h"
@@ -26,10 +26,10 @@ FunctionCatalogOperationGuard::~FunctionCatalogOperationGuard() {
   g_function_catalog_operation.clear(std::memory_order_release);
 }
 
-celer::Task<std::unique_ptr<FunctionCatalogOperationGuard>>
+bycorf::Task<std::unique_ptr<FunctionCatalogOperationGuard>>
 AcquireFunctionCatalogOperation() {
   while (g_function_catalog_operation.test_and_set(std::memory_order_acquire)) {
-    co_await celer::Yield(*celer::ThisWorker().self_);
+    co_await bycorf::Yield(*bycorf::ThisWorker().self_);
   }
   co_return std::unique_ptr<FunctionCatalogOperationGuard>(
       new FunctionCatalogOperationGuard());
@@ -70,7 +70,7 @@ std::vector<LuaFunctionLibrary> FunctionCatalog::LibrariesFromCodes(
   return libraries;
 }
 
-celer::Task<absl::StatusOr<FunctionCatalog::StagedCatalog>>
+bycorf::Task<absl::StatusOr<FunctionCatalog::StagedCatalog>>
 FunctionCatalog::StageCompleteCatalog(std::vector<LuaFunctionLibrary> target) {
   if (storage_ == nullptr) {
     co_return absl::FailedPreconditionError(
@@ -111,9 +111,9 @@ FunctionCatalog::StageCompleteCatalog(std::vector<LuaFunctionLibrary> target) {
       return StageCompleteLuaFunctionCatalogLocally(codes);
     };
     absl::StatusOr<std::vector<LuaFunctionLibrary>> result =
-        staged_workers == celer::ThisWorker().id_
+        staged_workers == bycorf::ThisWorker().id_
             ? stage()
-            : co_await celer::SubmitTo(staged_workers, std::move(stage));
+            : co_await bycorf::SubmitTo(staged_workers, std::move(stage));
     bool same = result.ok();
     if (same && canonical.has_value()) {
       same = result->size() == canonical->size();
@@ -133,10 +133,10 @@ FunctionCatalog::StageCompleteCatalog(std::vector<LuaFunctionLibrary> target) {
           AbortStagedLuaFunctionCatalogLocally();
           return true;
         };
-        if (worker == celer::ThisWorker().id_) {
+        if (worker == bycorf::ThisWorker().id_) {
           abort();
         } else {
-          (void)co_await celer::SubmitTo(worker, std::move(abort));
+          (void)co_await bycorf::SubmitTo(worker, std::move(abort));
         }
       }
       co_return failure;
@@ -153,7 +153,7 @@ FunctionCatalog::StageCompleteCatalog(std::vector<LuaFunctionLibrary> target) {
   };
 }
 
-celer::Task<absl::StatusOr<storage::CatalogDurabilityToken>>
+bycorf::Task<absl::StatusOr<storage::CatalogDurabilityToken>>
 FunctionCatalog::MakeStagedCatalogDurable(const StagedCatalog& staged) {
   if (!staged.active_) {
     co_return absl::FailedPreconditionError(
@@ -162,7 +162,7 @@ FunctionCatalog::MakeStagedCatalogDurable(const StagedCatalog& staged) {
   co_return co_await storage_->CommitFunctionCatalog(staged.dump_);
 }
 
-celer::Task<absl::Status> FunctionCatalog::CommitStagedCatalog(
+bycorf::Task<absl::Status> FunctionCatalog::CommitStagedCatalog(
     StagedCatalog staged, storage::CatalogDurabilityToken token,
     bool enable_crash_points) {
   if (!staged.active_ || token.catalog_generation_ == 0) {
@@ -177,10 +177,10 @@ celer::Task<absl::Status> FunctionCatalog::CommitStagedCatalog(
       CommitStagedLuaFunctionCatalogLocally();
       return true;
     };
-    if (worker == celer::ThisWorker().id_) {
+    if (worker == bycorf::ThisWorker().id_) {
       commit();
     } else {
-      (void)co_await celer::SubmitTo(worker, std::move(commit));
+      (void)co_await bycorf::SubmitTo(worker, std::move(commit));
     }
   }
   ReplaceStoredLuaFunctionCatalog(std::move(staged.libraries_));
@@ -191,7 +191,7 @@ celer::Task<absl::Status> FunctionCatalog::CommitStagedCatalog(
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> FunctionCatalog::AbortStagedCatalog(
+bycorf::Task<absl::Status> FunctionCatalog::AbortStagedCatalog(
     StagedCatalog* staged) {
   if (staged == nullptr || !staged->active_) co_return absl::OkStatus();
   for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
@@ -199,17 +199,17 @@ celer::Task<absl::Status> FunctionCatalog::AbortStagedCatalog(
       AbortStagedLuaFunctionCatalogLocally();
       return true;
     };
-    if (worker == celer::ThisWorker().id_) {
+    if (worker == bycorf::ThisWorker().id_) {
       abort();
     } else {
-      (void)co_await celer::SubmitTo(worker, std::move(abort));
+      (void)co_await bycorf::SubmitTo(worker, std::move(abort));
     }
   }
   staged->active_ = false;
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> FunctionCatalog::RecoverAtStartup() {
+bycorf::Task<absl::Status> FunctionCatalog::RecoverAtStartup() {
   auto recovered = storage_->RecoverFunctionCatalog();
   if (!recovered.ok()) co_return recovered.status();
   if (!recovered->has_value()) {
@@ -229,7 +229,7 @@ celer::Task<absl::Status> FunctionCatalog::RecoverAtStartup() {
                                          (**recovered).token_, false);
 }
 
-celer::Task<absl::Status> FunctionCatalog::ReplaceFromLibraryCodes(
+bycorf::Task<absl::Status> FunctionCatalog::ReplaceFromLibraryCodes(
     const std::vector<std::string>& library_codes) {
   auto staged =
       co_await StageCompleteCatalog(LibrariesFromCodes(library_codes));
@@ -242,7 +242,7 @@ celer::Task<absl::Status> FunctionCatalog::ReplaceFromLibraryCodes(
   co_return co_await CommitStagedCatalog(std::move(*staged), *token);
 }
 
-celer::Task<absl::Status> FunctionCatalog::ValidateLibraryCodes(
+bycorf::Task<absl::Status> FunctionCatalog::ValidateLibraryCodes(
     const std::vector<std::string>& library_codes) {
   auto staged =
       co_await StageCompleteCatalog(LibrariesFromCodes(library_codes));

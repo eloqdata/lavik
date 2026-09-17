@@ -18,33 +18,33 @@ struct StringExecKey {
 
 void InitStringCommandStorage(storage::StorageEngine* engine);
 
-celer::Task<CommandReply> ExecuteStringCommand(const CommandRequest& request,
-                                               ReplyBuilder& reply_builder);
+bycorf::Task<CommandReply> ExecuteStringCommand(const CommandRequest& request,
+                                                ReplyBuilder& reply_builder);
 
-celer::Task<CommandReply> ExecuteStringCommandLocked(
+bycorf::Task<CommandReply> ExecuteStringCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
     const storage::MutationPrecondition* mutation_precondition = nullptr);
 
-celer::Task<CommandReply> ExecuteBitmapCommand(const CommandRequest& request,
-                                               ReplyBuilder& reply_builder);
+bycorf::Task<CommandReply> ExecuteBitmapCommand(const CommandRequest& request,
+                                                ReplyBuilder& reply_builder);
 
-celer::Task<CommandReply> ExecuteBitmapCommandLocked(
+bycorf::Task<CommandReply> ExecuteBitmapCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
     const storage::MutationPrecondition* mutation_precondition = nullptr);
 
-celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
-                                              ReplyBuilder& reply_builder);
+bycorf::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
+                                               ReplyBuilder& reply_builder);
 
-celer::Task<std::string> ExecuteBitOpLocked(
+bycorf::Task<std::string> ExecuteBitOpLocked(
     const CommandRequest& request, std::span<const StringExecKey> locked_keys,
     std::vector<storage::TxShardWrites>& tx_writes);
 
-celer::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
-                                            ReplyBuilder& reply_builder);
+bycorf::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
+                                             ReplyBuilder& reply_builder);
 
-celer::Task<std::string> ExecuteLcsLocked(
+bycorf::Task<std::string> ExecuteLcsLocked(
     const CommandRequest& request, std::span<const StringExecKey> locked_keys);
 
 }  // namespace keylane

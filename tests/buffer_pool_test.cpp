@@ -5,22 +5,22 @@
 #include <vector>
 
 #include "absl/status/status.h"
-#include "celer/net/server.h"
-#include "celer/runtime/task.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/net/server.h"
+#include "bycorf/runtime/task.h"
+#include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
 
 namespace keylane::storage {
 namespace {
 
-class BufferPoolWaitService final : public celer::Service {
+class BufferPoolWaitService final : public bycorf::Service {
  public:
   void Prepare(unsigned thread_count) override {
     prepared_ = thread_count == 1;
   }
 
-  celer::Task<absl::Status> Run(celer::Worker& worker,
-                                celer::ServiceContext) override {
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
+                                 bycorf::ServiceContext) override {
     if (!prepared_) {
       result_ = absl::FailedPreconditionError(
           "buffer-pool wait test requires one worker");
@@ -47,7 +47,7 @@ class BufferPoolWaitService final : public celer::Service {
     storage_waiter_started_ = false;
     storage_waiter_acquired_ = false;
     worker.Spawn(AcquireStorageAfterRelease());
-    co_await celer::Yield(worker);
+    co_await bycorf::Yield(worker);
     if (!storage_waiter_started_ || storage_waiter_acquired_) {
       result_ = absl::FailedPreconditionError(
           "storage-buffer waiter did not suspend on storage exhaustion");
@@ -58,7 +58,7 @@ class BufferPoolWaitService final : public celer::Service {
     pool_.ReleaseWriteBuffer(held_storage);
     for (unsigned attempt = 0; attempt < 100 && !storage_waiter_acquired_;
          ++attempt) {
-      co_await celer::Yield(worker);
+      co_await bycorf::Yield(worker);
     }
     if (!storage_waiter_acquired_) {
       result_ = absl::DeadlineExceededError(
@@ -82,7 +82,7 @@ class BufferPoolWaitService final : public celer::Service {
     read_waiter_started_ = false;
     read_waiter_acquired_ = false;
     worker.Spawn(AcquireReadAfterRelease());
-    co_await celer::Yield(worker);
+    co_await bycorf::Yield(worker);
     if (!read_waiter_started_ || read_waiter_acquired_ ||
         pool_.overflow_read_buffer_count() != 0) {
       result_ = absl::FailedPreconditionError(
@@ -94,7 +94,7 @@ class BufferPoolWaitService final : public celer::Service {
     held_reads.pop_back();
     for (unsigned attempt = 0; attempt < 100 && !read_waiter_acquired_;
          ++attempt) {
-      co_await celer::Yield(worker);
+      co_await bycorf::Yield(worker);
     }
     if (!read_waiter_acquired_ || pool_.overflow_read_buffer_count() != 0) {
       result_ = absl::DeadlineExceededError(
@@ -131,7 +131,7 @@ class BufferPoolWaitService final : public celer::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
-  celer::Task<absl::Status> AcquireStorageAfterRelease() {
+  bycorf::Task<absl::Status> AcquireStorageAfterRelease() {
     storage_waiter_started_ = true;
     std::uint16_t acquired = 0;
     while (!pool_.TryAcquireWriteBuffer(&acquired)) {
@@ -142,7 +142,7 @@ class BufferPoolWaitService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> AcquireReadAfterRelease() {
+  bycorf::Task<absl::Status> AcquireReadAfterRelease() {
     read_waiter_started_ = true;
     auto acquired = co_await pool_.AcquireReadBuffer();
     if (!acquired.ok() || acquired->buffer_id() == 0) {
@@ -167,9 +167,9 @@ class BufferPoolWaitService final : public celer::Service {
 
 TEST(BufferPoolTest, StorageWriteBufferWaiterIsReusable) {
   BufferPoolWaitService service;
-  celer::Server server;
+  bycorf::Server server;
   server.AddService(&service);
-  celer::ServerOptions options;
+  bycorf::ServerOptions options;
   options.thread_count_ = 1;
   options.pin_workers_ = false;
   options.recv_buffer_count_ = 0;

@@ -38,11 +38,11 @@
 #include "absl/strings/str_join.h"
 #include "backup.h"
 #include "blocking_wait.h"
-#include "celer/net/server.h"
-#include "celer/net/tcp_service.h"
-#include "celer/net/tcp_stream.h"
-#include "celer/net/tls.h"
-#include "celer/runtime/sync.h"
+#include "bycorf/net/server.h"
+#include "bycorf/net/tcp_service.h"
+#include "bycorf/net/tcp_stream.h"
+#include "bycorf/net/tls.h"
+#include "bycorf/runtime/sync.h"
 #include "client_limit.h"
 #include "function_catalog.h"
 #include "keylane/cluster/meta_client.h"
@@ -67,11 +67,11 @@
 #include "spdlog/spdlog.h"
 
 namespace keylane {
-using namespace celer;
+using namespace bycorf;
 
 namespace {
 
-#if CELER_ENABLE_CROSS_CORE_LATENCY_TRACE
+#if BYCORF_ENABLE_CROSS_CORE_LATENCY_TRACE
 constexpr std::uint64_t kReadLatencyReportIntervalNs = 45'000'000'000ULL;
 #else
 constexpr std::uint64_t kReadLatencyReportIntervalNs = 10'000'000'000ULL;
@@ -318,7 +318,7 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       p9999(stats.total_), p9999(stats.io_), p9999(stats.route_out_),
       p9999(stats.lookup_), p9999(stats.buffer_), p9999(stats.decode_),
       p9999(stats.route_back_), p9999(stats.send_));
-#if CELER_ENABLE_CROSS_CORE_LATENCY_TRACE
+#if BYCORF_ENABLE_CROSS_CORE_LATENCY_TRACE
   const auto cross_core_stats = ThisWorker().self_->TakeCrossCoreLatencyStats();
   const auto log_cross_core = [&](std::string_view name,
                                   const Worker::LatencySampleStats& value) {
@@ -1423,7 +1423,7 @@ Task<absl::Status> RedisService::MonitorRuntimeHealth(Worker& worker) {
       }
     }
     absl::Status slept =
-        co_await celer::SleepFor(worker, std::chrono::milliseconds(100));
+        co_await bycorf::SleepFor(worker, std::chrono::milliseconds(100));
     if (!slept.ok()) {
       co_return absl::OkStatus();
     }
@@ -1559,7 +1559,7 @@ Task<absl::Status> BreakStalledStream(StreamStallRef state, int fd) {
       ::shutdown(fd, SHUT_RDWR);
       co_return absl::OkStatus();
     }
-    absl::Status slept = co_await celer::SleepFor(
+    absl::Status slept = co_await bycorf::SleepFor(
         *ThisWorker().self_,
         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now) +
             std::chrono::milliseconds(1));
@@ -2150,7 +2150,7 @@ int RunServer(ServerOptions options) {
     spdlog::error("configuration error: {}", validated.message());
     return 1;
   }
-  const auto backends = celer::ConfigureIoBackends(
+  const auto backends = bycorf::ConfigureIoBackends(
       {.dpdk_network = options.network_backend_ == "dpdk",
        .spdk_storage = options.storage_backend_ == "spdk"});
   if (!backends.ok()) {
@@ -2158,7 +2158,7 @@ int RunServer(ServerOptions options) {
     return 1;
   }
   // Freeze before metadata probes or DMA buffers, which can precede workers.
-  celer::FreezeIoBackends();
+  bycorf::FreezeIoBackends();
   spdlog::info("I/O backends: network={} storage={} rings=one-per-worker",
                options.network_backend_, options.storage_backend_);
   // Cluster mode delegates population lifecycle to Meta/NodeControl and
@@ -2227,7 +2227,7 @@ int RunServer(ServerOptions options) {
     storage_identities.reserve(options.data_files_.size());
     for (std::size_t i = 0; i < options.data_files_.size(); ++i) {
       const std::string& path = options.data_files_[i];
-      if (celer::IsSpdkStoragePath(path)) {
+      if (bycorf::IsSpdkStoragePath(path)) {
         if (std::find(options.data_files_.begin(),
                       options.data_files_.begin() + i,
                       path) != options.data_files_.begin() + i) {
@@ -2275,15 +2275,15 @@ int RunServer(ServerOptions options) {
   const std::uint16_t advertised_port =
       options.port_ != 0 ? options.port_ : options.tls_port_;
 
-  std::shared_ptr<celer::TlsContext> tls_server_context;
+  std::shared_ptr<bycorf::TlsContext> tls_server_context;
   if (options.tls_port_ != 0) {
-    celer::TlsClientAuth client_auth = celer::TlsClientAuth::kNo;
+    bycorf::TlsClientAuth client_auth = bycorf::TlsClientAuth::kNo;
     if (options.tls_auth_clients_ == "optional") {
-      client_auth = celer::TlsClientAuth::kOptional;
+      client_auth = bycorf::TlsClientAuth::kOptional;
     } else if (options.tls_auth_clients_ == "yes") {
-      client_auth = celer::TlsClientAuth::kRequired;
+      client_auth = bycorf::TlsClientAuth::kRequired;
     }
-    auto created = celer::TlsContext::CreateServer(celer::TlsServerOptions{
+    auto created = bycorf::TlsContext::CreateServer(bycorf::TlsServerOptions{
         .cert_file_ = options.tls_cert_file_,
         .key_file_ = options.tls_key_file_,
         .ca_cert_file_ = options.tls_ca_cert_file_,
@@ -2296,9 +2296,9 @@ int RunServer(ServerOptions options) {
     tls_server_context = std::move(*created);
   }
 
-  std::shared_ptr<celer::TlsContext> tls_client_context;
+  std::shared_ptr<bycorf::TlsContext> tls_client_context;
   if (options.tls_replication_) {
-    auto created = celer::TlsContext::CreateClient(celer::TlsClientOptions{
+    auto created = bycorf::TlsContext::CreateClient(bycorf::TlsClientOptions{
         .ca_cert_file_ = options.tls_ca_cert_file_,
         .cert_file_ = options.tls_cert_file_,
         .key_file_ = options.tls_key_file_,
@@ -2497,7 +2497,7 @@ int RunServer(ServerOptions options) {
     meta_control_client = std::move(*created);
   }
 
-  celer::ServerOptions runtime_options;
+  bycorf::ServerOptions runtime_options;
   runtime_options.bind_addresses_ = options.bind_addresses_;
   runtime_options.thread_count_ = options.thread_count_;
   runtime_options.pin_workers_ = options.pin_workers_;

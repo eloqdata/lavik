@@ -8,8 +8,8 @@
 
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
-#include "celer/io/storage.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/fault_injection.h"
 #include "keylane/meta/identity_verifier.h"
@@ -337,7 +337,7 @@ Plan PlanMembershipStep(const MetaCommittedView& view,
 }
 
 struct MetaMembershipReconciler::Core {
-  celer::ForeignExecutor executor_;
+  bycorf::ForeignExecutor executor_;
   MetaProposalExecutor* proposals_;
   nuraft::ptr<nuraft::raft_server> server_;
   nuraft::ptr<MetaStateMachine> state_machine_;
@@ -353,7 +353,7 @@ struct MetaMembershipReconciler::Core {
   };
 };
 MetaMembershipReconciler::MetaMembershipReconciler(
-    celer::ForeignExecutor executor, MetaProposalExecutor& proposals,
+    bycorf::ForeignExecutor executor, MetaProposalExecutor& proposals,
     nuraft::ptr<nuraft::raft_server> server,
     nuraft::ptr<MetaStateMachine> machine,
     nuraft::ptr<NuraftStateMgr> state_mgr,
@@ -374,7 +374,7 @@ void MetaMembershipReconciler::Start(MetaLeaderContext& context) {
         if (core->running_) std::terminate();
         core->running_ = true;
         core->cancelled_ = false;
-        celer::ThisWorker().self_->Spawn(Run(core, context));
+        bycorf::ThisWorker().self_->Spawn(Run(core, context));
       }))
     std::terminate();
 }
@@ -404,7 +404,7 @@ bool MetaMembershipReconciler::accepting() const {
   return !core_->stopping_.load(std::memory_order_acquire);
 }
 
-celer::Task<absl::Status> MetaMembershipReconciler::Run(
+bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
     std::shared_ptr<Core> core, MetaLeaderContext* context) {
   std::unique_ptr<MetaMembershipGate::Lease> lease;
   std::shared_ptr<Core::Attempt> attempt;
@@ -422,8 +422,8 @@ celer::Task<absl::Status> MetaMembershipReconciler::Run(
     // A committed effect may become visible before the local API returns.
     // Finish that bounded entry before discarding its lifetime/join handle.
     if (attempt && !attempt->entered_.load(std::memory_order_acquire)) {
-      auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                            std::chrono::milliseconds(5));
+      auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                             std::chrono::milliseconds(5));
       if (!slept.ok()) break;
       continue;
     }
@@ -493,8 +493,8 @@ celer::Task<absl::Status> MetaMembershipReconciler::Run(
             }
           }
         }
-        auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                              std::chrono::milliseconds(25));
+        auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                               std::chrono::milliseconds(25));
         if (!slept.ok()) break;
         continue;
       }
@@ -511,8 +511,8 @@ celer::Task<absl::Status> MetaMembershipReconciler::Run(
                 status.message());
             last_cut = std::string(status.message());
           }
-          auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                                std::chrono::milliseconds(25));
+          auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                 std::chrono::milliseconds(25));
           if (!slept.ok()) break;
           continue;
         }
@@ -652,14 +652,14 @@ celer::Task<absl::Status> MetaMembershipReconciler::Run(
         }
       }
     }
-    auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                          std::chrono::milliseconds(25));
+    auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                           std::chrono::milliseconds(25));
     if (!slept.ok()) break;
   }
   // Join only queued/local API entry, never the remote membership result.
   while (attempt && !attempt->entered_.load(std::memory_order_acquire))
-    (void)co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                   std::chrono::milliseconds(5));
+    (void)co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                    std::chrono::milliseconds(5));
   lease.reset();
   core->running_ = false;
   for (const auto& waiter : core->waiters_) waiter->set_value();

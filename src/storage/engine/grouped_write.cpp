@@ -41,8 +41,8 @@ Task<absl::Status> StorageEngine::Impl::AwaitGroupedDependencyLocked(
           "prior grouped transaction did not commit");
     }
     store.store_state_mutex_.Unlock(*store.worker_);
-    const auto waited =
-        co_await celer::SleepFor(*store.worker_, std::chrono::microseconds(50));
+    const auto waited = co_await bycorf::SleepFor(
+        *store.worker_, std::chrono::microseconds(50));
     co_await store.store_state_mutex_.Lock();
     if (!waited.ok()) co_return waited;
   }

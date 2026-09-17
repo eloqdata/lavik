@@ -106,7 +106,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
           if (shutdown_flush_requested_)
             co_return absl::CancelledError(
                 "List search interrupted by shutdown");
-          if (step != 0) co_await celer::Yield(*store.worker_);
+          if (step != 0) co_await bycorf::Yield(*store.worker_);
           const auto index =
               reverse ? directory.groups().size() - 1 - step : step;
           const HashGroupId id{directory.groups()[index].id_, 0};
@@ -290,7 +290,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     std::vector<LoadedOrderedGroup> loaded;
     loaded.reserve(end_page - begin_page);
     for (std::size_t i = begin_page; i < end_page; ++i) {
-      if (prepared != nullptr) co_await celer::Yield(*store.worker_);
+      if (prepared != nullptr) co_await bycorf::Yield(*store.worker_);
       auto page = co_await LoadOrderedGroupSnapshot(store, partition, db_id,
                                                     key, digest, object,
                                                     directory.groups()[i].id_);

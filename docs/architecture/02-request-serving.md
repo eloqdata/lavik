@@ -6,7 +6,7 @@ This subsystem owns the Redis-facing connection lifecycle: incremental command
 parsing, connection-level RESP2/RESP3 reply negotiation, per-connection state,
 authentication and replication handoff, command classification, admission and
 dispatch, Lua and Pub/Sub execution, Redis command handlers, and reply encoding
-or streaming. Celer owns sockets and worker scheduling below the boundary.
+or streaming. Bycorf owns sockets and worker scheduling below the boundary.
 Transaction coordination, durable records, and replication sessions remain
 separate modules reached through explicit interfaces.
 
@@ -17,7 +17,7 @@ storage calls, role control, and trusted replay.
 
 ## Connection lifecycle
 
-`RedisService` is a Celer `TcpService`. Each accepted connection gets one
+`RedisService` is a Bycorf `TcpService`. Each accepted connection gets one
 `ConnectionContext` in its serving coroutine. That context retains the selected
 logical database, authentication and cluster-read state, negotiated
 `RespVersion` in its reusable reply builder, `MULTI` queue, WATCH registrations,
@@ -31,7 +31,7 @@ WATCH state.
 
 `RedisService` applies one process-wide `maxclients` limit across its plaintext
 and TLS endpoints before registering an accepted socket or starting TLS. The
-limit and active count belong to the Redis protocol service; other Celer TCP
+limit and active count belong to the Redis protocol service; other Bycorf TCP
 services such as the metrics HTTP endpoint do not participate. A
 plaintext connection rejected at the limit receives Redis's max-clients error;
 a TLS connection is closed without plaintext output or handshake work. Pending
@@ -147,7 +147,7 @@ owner routing.
 
 The selected database is request data, never ambient worker state. Storage
 chooses an owner from the key's Redis hash-slot partition. Commands with one
-owner can execute locally or through one Celer cross-worker submission.
+owner can execute locally or through one Bycorf cross-worker submission.
 Commands needing atomic access to several keys build a `tx::Transaction` and
 execute one or more shard callbacks. Global commands explicitly collect from or
 coordinate all workers.
@@ -248,7 +248,7 @@ closed population.
 
 ## Lua scripts and Functions
 
-Each Celer worker lazily owns one persistent `LuaWorkerRuntime`. It retains the
+Each Bycorf worker lazily owns one persistent `LuaWorkerRuntime`. It retains the
 Lua VM, compiled script closures, and locally installed Function libraries;
 source bodies and canonical metadata have process-wide ownership. `SCRIPT
 LOAD`/`FLUSH` update every worker's script index. Script-cache mutations are
@@ -378,7 +378,7 @@ Replication publisher admission occurs before database gates and key locks so
 a slow replica cannot suspend a write while holding state required by
 `FLUSHDB` or a full-sync cut. Memory-growing commands use the sampled memory
 guard before execution. Graceful shutdown closes admission, drains active
-requests, and only then asks storage for its final durable flush. After Celer
+requests, and only then asks storage for its final durable flush. After Bycorf
 has torn down a worker's I/O and coroutine frames, its native-thread service
 finalizer releases that worker's remaining `StorageEngine` state; worker-owned
 indexes are never destroyed from the shutdown thread.
@@ -404,7 +404,7 @@ real server executable.
 
 | Claim | Repository source |
 |---|---|
-| Celer service integration, pre-TLS connection admission, connection setup/cleanup, parsing loop, batching, reply paths, and handshake transfer | `celer/include/celer/net/tcp_service.h`, `celer/src/net/tcp_service.cpp`, `src/redis/server.cpp` |
+| Bycorf service integration, pre-TLS connection admission, connection setup/cleanup, parsing loop, batching, reply paths, and handshake transfer | `bycorf/include/bycorf/net/tcp_service.h`, `bycorf/src/net/tcp_service.cpp`, `src/redis/server.cpp` |
 | Per-connection database, authentication, reply version, MULTI, WATCH, monitor, Pub/Sub, and client identity state | `include/keylane/session.h`, `include/keylane/resp_version.h` |
 | Incremental RESP parser and version-aware reusable reply builder | `include/keylane/resp.h`, `src/redis/resp.cpp` |
 | Command request/reply contracts, dispatch, replay, and gate interfaces | `include/keylane/command.h` |

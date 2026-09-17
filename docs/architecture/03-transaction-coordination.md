@@ -19,7 +19,7 @@ subsystems. Both kinds of identifier currently come from
 
 ## Interfaces and state
 
-`TxRuntime` is created once with one `TxShard` per Celer worker before the
+`TxRuntime` is created once with one `TxShard` per Bycorf worker before the
 workers start. Each worker binds its shard during `RedisService::Run`; recovery
 on worker 0 later advances the shared id counter above every transaction id
 found on disk. The shard's lock tables, queue, WATCH table, committed-id
@@ -86,7 +86,7 @@ of its keys share one worker.
 ## Multi-shard lifecycle
 
 1. `Schedule` allocates one scheduling id and starts a non-suspending schedule
-   phase on every owner through Celer cross-core requests, invoking the local
+   phase on every owner through Bycorf cross-core requests, invoking the local
    owner directly when applicable.
 2. Each shard rejects an id at or below its committed watermark. Otherwise it
    records the transaction's intents. A conflicting transaction also rejects
@@ -197,7 +197,7 @@ passive expiration or creation of the other key.
 - Holds are acquired only while compatible and are released before their
   corresponding intents; therefore holds remain a subset of intents.
 - Lock, queue, and WATCH mutations run on the owning worker. Cross-worker work
-  moves through Celer requests and notifications, and the coordinator resumes
+  moves through Bycorf requests and notifications, and the coordinator resumes
   on its origin worker.
 - Queued plain acquisitions and conflicting transaction participants start
   only from the ordered queue head. An uncontended plain acquisition instead

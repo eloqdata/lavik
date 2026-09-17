@@ -102,8 +102,8 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
   if (exists && !replace) co_return RestoreRawResult{.busy_ = true};
   if (expire_at_ms != 0 && expire_at_ms <= UnixTimeMillis()) {
     if (!exists) co_return RestoreRawResult{};
-    auto deleted = co_await DeleteLocked(db_id, key, digest, outer,
-                                         replication, mutation_precondition);
+    auto deleted = co_await DeleteLocked(db_id, key, digest, outer, replication,
+                                         mutation_precondition);
     if (!deleted.ok()) co_return deleted.status();
     co_return RestoreRawResult{.changed_ = *deleted, .deleted_ = *deleted};
   }
@@ -517,7 +517,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
           if (owner == store.worker_->id())
             (void)co_await release();
           else
-            (void)co_await celer::SubmitTaskTo(owner, release);
+            (void)co_await bycorf::SubmitTaskTo(owner, release);
         }
       }
       writes.retirements_.resize(kept);

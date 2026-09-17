@@ -229,8 +229,6 @@ bool MetaStoresFacts::MayReportFencedOwnerCandidate(
       });
 }
 
-
-
 bool MetaStoresFacts::IsCurrentFailoverCandidate(
     std::string_view node_id, const MetaBootIncarnation& boot_id) const {
   return std::ranges::any_of(
@@ -280,7 +278,7 @@ struct ProposeWaiter {
   nuraft::cmd_result_code code_ = nuraft::cmd_result_code::CANCELLED;
   std::optional<MetaApplyResult> apply_result_;
   bool has_exception_ = false;
-  celer::ForeignExecutor foreign_executor_;
+  bycorf::ForeignExecutor foreign_executor_;
   bool inline_resume_ = false;
   // Released only when NuRaft resolves the append, not when the caller's
   // local deadline wins. That distinction closes the uncertain-tail audit
@@ -1194,7 +1192,7 @@ void MetaLeadershipRelay::Attach(MetaCoordinator& coordinator) {
     target_ = &coordinator;
   }
   Drain();
-  // If the Celer worker won the single-drainer race, wait for it to finish the
+  // If the Bycorf worker won the single-drainer race, wait for it to finish the
   // retained pre-attach prefix before process assembly proceeds.
   std::unique_lock<std::mutex> lock(mu_);
   cv_.wait(lock, [&] { return !draining_; });
@@ -1218,7 +1216,7 @@ void MetaLeadershipRelay::Forward(MetaCoordinator& coordinator, Role role) {
   }
 }
 
-celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
+bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
     MetaCommand command, AuthenticatedPrincipal principal) {
   if (stopping_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kCancelled,
@@ -1420,7 +1418,7 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   co_return *waiter->apply_result_;
 }
 
-celer::Task<absl::StatusOr<MetaApplyResult>> MetaLeaderContext::Propose(
+bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaLeaderContext::Propose(
     MetaCommand command) {
   return coordinator_->Propose(std::move(command), actor_);
 }

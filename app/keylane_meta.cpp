@@ -8,25 +8,25 @@
 //   - main thread: CLI parse, assembly, startup waits, signal polling, and
 //     the ordered teardown. raft_server construction/teardown happen here;
 //     NuRaft's public API is thread-safe.
-//   - one celer Runtime worker: ctl/Data Node control transports, with
+//   - one bycorf Runtime worker: ctl/Data Node control transports, with
 //     authentication determined by the selected listener mode.
 //   - one bounded proposal-executor thread: synchronous entry into NuRaft's
-//     mutation/snapshot APIs, keeping their locks and WAL IO off Celer.
+//     mutation/snapshot APIs, keeping their locks and WAL IO off Bycorf.
 //   - NuRaft native Asio workers: peer RPC and timers. NuRaft commit/append
 //     threads perform synchronous durability IO; completion and role events
-//     return to Celer through the Runtime's foreign executor mailbox.
+//     return to Bycorf through the Runtime's foreign executor mailbox.
 //
 // Teardown order (main thread, on SIGTERM/SIGINT):
 //   workflow reconcilers Shutdown() -> ctl Shutdown() ->
 //   Data control Shutdown() -> coordinator demotion ->
 //   proposal executor drain -> raft_launcher::shutdown() ->
-//   MetaStateMachine::WaitForSnapshotWriterIdle() -> release Raft ref -> Celer
+//   MetaStateMachine::WaitForSnapshotWriterIdle() -> release Raft ref -> Bycorf
 //   Runtime stop + join -> coordinator release.
 // shutdown() joins the commit thread — the only producer of automatic
 // snapshot jobs — and the writer drain lets an in-flight when_done reach the
 // still-alive core before reset (the shutdown contract in
 // state_machine.h). Once those producers quiesce, ForeignExecutor drains its
-// accepted notifications before the generic Celer Runtime is stopped, and
+// accepted notifications before the generic Bycorf Runtime is stopped, and
 // raft_server owns the
 // nuraft::context through a unique_ptr member — the caller must never delete
 // the context itself.
@@ -54,7 +54,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/runtime/runtime.h"
+#include "bycorf/runtime/runtime.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
 // NuRaft's headers are not -Wpedantic-clean.
@@ -191,7 +191,7 @@ bool ParseInt(std::string_view text, int min_value, int max_value, int* out) {
   }
 }
 
-// "ip:port" with a numeric IPv4/IPv6 host (the celer transport does no DNS).
+// "ip:port" with a numeric IPv4/IPv6 host (the bycorf transport does no DNS).
 absl::StatusOr<EndpointParts> ParseEndpointArg(std::string_view text) {
   auto endpoint = keylane::ParseNumericEndpoint(text);
   if (!endpoint.has_value()) {
@@ -729,18 +729,18 @@ int main(int argc, char** argv) {
   }
   nuraft::asio_service::options asio_options = std::move(*asio_options_or);
 
-  // --- Celer runtime ---
+  // --- Bycorf runtime ---
   // One worker owns ctl/Data Node transport. Runtime owns its thread,
   // MPSC mailbox, and wake eventfd. NuRaft posts typed notifications directly
-  // through the worker's foreign executor without touching Celer TLS.
-  celer::Runtime celer_runtime;
+  // through the worker's foreign executor without touching Bycorf TLS.
+  bycorf::Runtime bycorf_runtime;
   std::promise<absl::Status> init_promise;
   std::future<absl::Status> init_future = init_promise.get_future();
-  celer_runtime.Start(
+  bycorf_runtime.Start(
       /*thread_count=*/
       1,
-      [&init_promise](unsigned, celer::Worker& worker) {
-        const absl::Status init = worker.Init(celer::WorkerOptions{});
+      [&init_promise](unsigned, bycorf::Worker& worker) {
+        const absl::Status init = worker.Init(bycorf::WorkerOptions{});
         init_promise.set_value(init);
         if (!init.ok()) {
           return 1;
@@ -753,12 +753,12 @@ int main(int argc, char** argv) {
         return 0;
       },
       /*pin_workers=*/false);
-  const celer::ForeignExecutor foreign_executor =
-      celer_runtime.GetForeignExecutor(/*worker_id=*/0);
+  const bycorf::ForeignExecutor foreign_executor =
+      bycorf_runtime.GetForeignExecutor(/*worker_id=*/0);
   const absl::Status worker_init = init_future.get();
   if (!worker_init.ok()) {
     spdlog::critical("worker init failed: {}", worker_init.message());
-    celer_runtime.WaitUntilStopped();
+    bycorf_runtime.WaitUntilStopped();
     return 1;
   }
 
@@ -800,7 +800,7 @@ int main(int argc, char** argv) {
   // Construction necessarily precedes MetaCoordinator assembly because the
   // coordinator needs the raft_server. The relay retains every role edge
   // from that window and remains the shutdown lifetime barrier for callbacks
-  // already accepted by Celer's foreign mailbox.
+  // already accepted by Bycorf's foreign mailbox.
   auto leadership_relay = std::make_shared<MetaLeadershipRelay>();
   init_opts.raft_callback_ = [foreign_executor, leadership_relay](
                                  nuraft::cb_func::Type type,
@@ -837,8 +837,8 @@ int main(int argc, char** argv) {
     spdlog::critical("failed to start NuRaft Asio listener on {}",
                      options.raft_addr_);
     foreign_executor.WaitUntilIdle();
-    celer_runtime.RequestStop();
-    celer_runtime.WaitUntilStopped();
+    bycorf_runtime.RequestStop();
+    bycorf_runtime.WaitUntilStopped();
     return 1;
   }
 
@@ -1068,7 +1068,7 @@ int main(int argc, char** argv) {
   cluster_create_reconciler->Shutdown();
   membership_reconciler->Shutdown();
   // Stop both ingress surfaces first, then synchronously revoke the
-  // leader-scoped publisher before quiescing NuRaft/Asio while the Celer
+  // leader-scoped publisher before quiescing NuRaft/Asio while the Bycorf
   // worker mailbox and snapshot writer remain alive.
   // Admin goes first so no new capture can race Data-control teardown.
   for (const auto& ctl : ctl_servers) {
@@ -1083,7 +1083,7 @@ int main(int argc, char** argv) {
   // this queued edge is consumed.
   leadership_relay->DetachAndStop();
   coordinator->BecomeFollower();
-  // No new Celer ingress or leader work is accepted. Drain queued NuRaft
+  // No new Bycorf ingress or leader work is accepted. Drain queued NuRaft
   // mutation/snapshot entry before stopping its Asio service; cmd_result
   // completions can still use the live foreign executor while shutdown
   // resolves rounds.
@@ -1099,11 +1099,11 @@ int main(int argc, char** argv) {
   server.reset();
   // Every foreign producer is now quiescent. Drain its accepted mailbox
   // prefix before stopping the generic Runtime, keeping this lifecycle policy
-  // out of Celer's data-plane Worker loop.
+  // out of Bycorf's data-plane Worker loop.
   foreign_executor.WaitUntilIdle();
-  celer_runtime.RequestStop();
-  celer_runtime.WaitUntilStopped();
-  if (celer_runtime.exit_code() != 0) exit_code = 1;
+  bycorf_runtime.RequestStop();
+  bycorf_runtime.WaitUntilStopped();
+  if (bycorf_runtime.exit_code() != 0) exit_code = 1;
   coordinator.reset();
 
   if (exit_code == 0) {

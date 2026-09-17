@@ -786,7 +786,7 @@ def admin_slow_reader_gate(node):
     started = time.monotonic()
     slow.sendall(b"clusterstatus 1\n")
     try:
-        # A parked large status write must not pin the Celer worker: unrelated
+        # A parked large status write must not pin the Bycorf worker: unrelated
         # Admin traffic still completes while the 5-second send watchdog owns
         # the slow connection.
         time.sleep(0.25)

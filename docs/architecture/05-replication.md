@@ -21,7 +21,7 @@ Replication moves deterministic logical commands, snapshot records, and the
 process-global Redis Function catalog, not physical block addresses or record
 offsets. The logical stream distinguishes durable keyspace mutations,
 Function-catalog mutations, cross-flow transactions and control barriers from
-runtime-only effects such as `PUBLISH`. Celer owns sockets, TLS, worker scheduling, and cross-core
+runtime-only effects such as `PUBLISH`. Bycorf owns sockets, TLS, worker scheduling, and cross-core
 submissions below this boundary. Normal storage and transaction paths remain
 authoritative for mutation ordering and durability. Replication-origin
 commands re-enter those paths with client role checks bypassed and publication
@@ -38,7 +38,7 @@ and replica incarnation; a restart therefore requires whole-group full sync.
 
 Worker zero owns mutable role, upstream configuration, target sessions,
 population proofs, source authorizations, and failure state. Control commands
-and observations from other workers enter through Celer submissions and resume
+and observations from other workers enter through Bycorf submissions and resume
 on their caller's worker. No process-thread mutex serializes this state.
 The node controller shares that owner, so validation and non-suspending exact
 completion lookup form one uninterrupted decision. Per-worker immutable
@@ -588,7 +588,7 @@ native-replica count.
 
 The source-side native session registry and history/continuation leases are
 shared by control and flow coroutines on different workers. They are protected
-by Celer's FIFO `CrossWorkerMutex`: contention suspends only the calling
+by Bycorf's FIFO `CrossWorkerMutex`: contention suspends only the calling
 coroutine and resumes it on its original worker, so an unrelated connection on
 that worker is never parked behind a process-thread mutex. The mutex's atomic
 guard covers only waiter-list handoff; no replication registry work or

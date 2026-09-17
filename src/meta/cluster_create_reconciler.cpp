@@ -12,8 +12,8 @@
 
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
-#include "celer/io/storage.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/fault_injection.h"
 #include "keylane/meta/cluster_create.h"
@@ -1192,7 +1192,7 @@ Plan detail::PlanClusterCreateStep(
 }
 
 struct MetaClusterCreateReconciler::Core {
-  celer::ForeignExecutor executor_;
+  bycorf::ForeignExecutor executor_;
   std::shared_ptr<MetaMembershipGate> membership_gate_;
   std::shared_ptr<MetaDataControlRuntimeStatus> runtime_status_;
   nuraft::ptr<nuraft::raft_server> server_;
@@ -1224,7 +1224,7 @@ bool IsWaitingAtMetaBarrier(const MetaOperationRecord& operation) {
 }
 
 MetaClusterCreateReconciler::MetaClusterCreateReconciler(
-    celer::ForeignExecutor executor, std::shared_ptr<MetaMembershipGate> gate,
+    bycorf::ForeignExecutor executor, std::shared_ptr<MetaMembershipGate> gate,
     std::shared_ptr<MetaDataControlRuntimeStatus> runtime,
     nuraft::ptr<nuraft::raft_server> server,
     std::uint64_t max_peer_response_age_us)
@@ -1255,7 +1255,7 @@ void MetaClusterCreateReconciler::Start(MetaLeaderContext& context) {
         if (core->running_) std::terminate();
         core->cancelled_ = false;
         core->running_ = true;
-        celer::ThisWorker().self_->Spawn(Run(core, context));
+        bycorf::ThisWorker().self_->Spawn(Run(core, context));
       }))
     std::terminate();
 }
@@ -1287,7 +1287,7 @@ bool MetaClusterCreateReconciler::accepting() const {
   return !core_->stopping_.load(std::memory_order_acquire);
 }
 
-celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
+bycorf::Task<absl::Status> MetaClusterCreateReconciler::Run(
     std::shared_ptr<Core> core, MetaLeaderContext* context) {
   std::unique_ptr<MetaMembershipGate::Lease> lease;
   std::string last_cut;
@@ -1427,8 +1427,8 @@ celer::Task<absl::Status> MetaClusterCreateReconciler::Run(
         }
       }
     }
-    const auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                                std::chrono::milliseconds(25));
+    const auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                 std::chrono::milliseconds(25));
     if (!slept.ok()) break;
   }
   lease.reset();

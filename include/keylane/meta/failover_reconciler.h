@@ -7,7 +7,7 @@
 #include <optional>
 
 #include "absl/status/statusor.h"
-#include "celer/runtime/foreign_executor.h"
+#include "bycorf/runtime/foreign_executor.h"
 #include "keylane/meta/coordinator.h"
 
 namespace keylane::meta {
@@ -57,7 +57,7 @@ struct MetaFailoverReconcilerOptions {
 // transition for the next Meta Leader.
 class MetaFailoverReconciler final : public MetaReconciler {
  public:
-  MetaFailoverReconciler(celer::ForeignExecutor executor,
+  MetaFailoverReconciler(bycorf::ForeignExecutor executor,
                          MetaFailoverReconcilerOptions options);
   ~MetaFailoverReconciler() override;
 
@@ -77,9 +77,9 @@ class MetaFailoverReconciler final : public MetaReconciler {
 
  private:
   struct Core;
-  static celer::Task<absl::Status> Run(std::shared_ptr<Core> core,
-                                       MetaLeaderContext* context,
-                                       std::int64_t leadership_started_unix_ms);
+  static bycorf::Task<absl::Status> Run(
+      std::shared_ptr<Core> core, MetaLeaderContext* context,
+      std::int64_t leadership_started_unix_ms);
   void Stop(bool permanent);
 
   std::shared_ptr<Core> core_;

@@ -20,7 +20,7 @@ Task<StorageDurabilityStats> StorageEngine::Impl::DurabilityStats() const {
   };
   for (unsigned target = 0; target < worker_count_; ++target) {
     result.dirty_staging_bytes_ +=
-        co_await celer::SubmitTo(target, [this, target] {
+        co_await bycorf::SubmitTo(target, [this, target] {
           const WorkerStore& store = *stores_[target];
           std::uint64_t dirty = 0;
           // This non-suspending callback runs on the owning worker, so no
@@ -53,9 +53,9 @@ Task<StorageMetricsSnapshot> StorageEngine::Impl::CollectMetrics() const {
   result.devices_.reserve(devices_.size());
   for (std::size_t index = 0; index < devices_.size(); ++index) {
     const StorageDevice& device = devices_[index];
-    const celer::WorkerId owner = device_allocators_[index]->owner_;
+    const bycorf::WorkerId owner = device_allocators_[index]->owner_;
     const AllocatorMetrics allocator =
-        co_await celer::SubmitTo(owner, [this, index] {
+        co_await bycorf::SubmitTo(owner, [this, index] {
           const DeviceAllocator& state = *device_allocators_[index];
           const StorageDevice& device = devices_[index];
           const std::uint64_t pristine =
@@ -92,7 +92,7 @@ Task<StorageMetricsSnapshot> StorageEngine::Impl::CollectMetrics() const {
   result.replication_logs_.reserve(worker_count_);
   for (unsigned target = 0; target < worker_count_; ++target) {
     result.replication_logs_.push_back(
-        co_await celer::SubmitTo(target, [this, target] {
+        co_await bycorf::SubmitTo(target, [this, target] {
           const ReplicationLogInfo log = LocalReplicationLogInfo();
           return StorageReplicationLogMetrics{
               .worker_id_ = target,

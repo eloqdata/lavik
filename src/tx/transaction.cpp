@@ -2,12 +2,12 @@
 
 #include <algorithm>
 
-#include "celer/runtime/worker.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/tx/tx_shard.h"
 
 namespace keylane::tx {
 
-using celer::Task;
+using bycorf::Task;
 
 void Transaction::AddKey(unsigned owner, std::uint8_t db,
                          const storage::Digest& digest, std::uint32_t arg_index,
@@ -103,23 +103,23 @@ bool Transaction::InRound(const ShardData& sd, Phase phase) const {
 
 void Transaction::RoundAwaiter::await_suspend(std::coroutine_handle<> handle) {
   tx_->coord_handle_ = handle;
-  tx_->coord_worker_ = celer::ThisWorker().id_;
+  tx_->coord_worker_ = bycorf::ThisWorker().id_;
   tx_->barrier_.store(tx_->RoundTargets(phase_), std::memory_order_release);
   for (ShardData& sd : tx_->shards_) {
     if (!tx_->InRound(sd, phase_)) {
       continue;
     }
     sd.phase_ = phase_;
-    if (sd.shard_id_ == celer::ThisWorker().id_) {
+    if (sd.shard_id_ == bycorf::ThisWorker().id_) {
       RunShardPhase(&sd);
     } else {
-      celer::PostRequest(celer::ThisWorker().cross_core_, sd.shard_id_,
-                         &sd.msg_);
+      bycorf::PostRequest(bycorf::ThisWorker().cross_core_, sd.shard_id_,
+                          &sd.msg_);
     }
   }
 }
 
-void Transaction::ShardPhaseEntry(celer::RemoteWork* base) {
+void Transaction::ShardPhaseEntry(bycorf::RemoteWork* base) {
   auto* msg = static_cast<ShardMsg*>(base);
   // Rounds complete through the transaction barrier, never through the
   // cross-core reply leg.
@@ -213,18 +213,18 @@ void Transaction::CompleteShardRound() {
   if (barrier_.fetch_sub(1, std::memory_order_acq_rel) != 1) {
     return;
   }
-  if (celer::ThisWorker().id_ == coord_worker_) {
-    celer::ThisWorker().self_->Enqueue(coord_handle_);
+  if (bycorf::ThisWorker().id_ == coord_worker_) {
+    bycorf::ThisWorker().self_->Enqueue(coord_handle_);
     return;
   }
-  celer::PostNotification(
-      celer::ThisWorker().cross_core_, coord_worker_,
-      celer::RemoteNotification{
+  bycorf::PostNotification(
+      bycorf::ThisWorker().cross_core_, coord_worker_,
+      bycorf::RemoteNotification{
           .context_ = this,
           .value_ = 0,
           .run_fn_ =
               [](void* context, std::uint64_t) noexcept {
-                celer::ThisWorker().self_->Enqueue(
+                bycorf::ThisWorker().self_->Enqueue(
                     static_cast<Transaction*>(context)->coord_handle_);
               },
       });
@@ -258,7 +258,7 @@ Task<absl::Status> Transaction::ExecuteSingleShard(bool release) {
   // key-set guard; a non-releasing hop leaves it resident on that owner for
   // the next callback. The final hop resets it there. No txid or queue entry.
   const unsigned owner = shards_[0].shard_id_;
-  co_return co_await celer::SubmitTaskTo(
+  co_return co_await bycorf::SubmitTaskTo(
       owner, [this, release]() -> Task<absl::Status> {
         ShardData& sd = shards_[0];
         if (!single_shard_guard_.has_value()) {

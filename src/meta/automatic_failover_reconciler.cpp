@@ -22,8 +22,8 @@
 #include <vector>
 
 #include "absl/status/status.h"
-#include "celer/io/storage.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/fault_injection.h"
 #include "keylane/meta/failover.h"
@@ -495,7 +495,7 @@ struct MetaAutomaticFailoverReconciler::Core {
     bool uncertain_append_ = false;
   };
 
-  celer::ForeignExecutor executor_;
+  bycorf::ForeignExecutor executor_;
   MetaAutomaticFailoverReconcilerOptions options_;
 
   // Worker-owned lifecycle/detector state.
@@ -527,14 +527,14 @@ struct MetaAutomaticFailoverReconciler::Core {
 namespace {
 
 #if KEYLANE_FAULTS_ENABLED
-celer::Task<absl::Status> TestPause(
+bycorf::Task<absl::Status> TestPause(
     const std::shared_ptr<MetaAutomaticFailoverReconciler::Core>& core,
     std::chrono::milliseconds delay) {
   constexpr auto kSlice = std::chrono::milliseconds(25);
   while (!core->cancelled_ && delay > std::chrono::milliseconds::zero()) {
     const auto slice = std::min(delay, kSlice);
     const auto slept =
-        co_await celer::SleepFor(*celer::ThisWorker().self_, slice);
+        co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, slice);
     if (!slept.ok()) co_return slept;
     delay -= slice;
   }
@@ -703,7 +703,7 @@ std::optional<MetaAutomaticFailoverStatus> FindStatus(
 }  // namespace
 
 MetaAutomaticFailoverReconciler::MetaAutomaticFailoverReconciler(
-    celer::ForeignExecutor executor,
+    bycorf::ForeignExecutor executor,
     MetaAutomaticFailoverReconcilerOptions options)
     : core_(std::make_shared<Core>()) {
   if (options.data_control_runtime_status_ == nullptr ||
@@ -758,7 +758,7 @@ void MetaAutomaticFailoverReconciler::Start(MetaLeaderContext& context) {
         core->test_pause_before_propose_applied_ = false;
 #endif
         ClearAdmissions(core);
-        celer::ThisWorker().self_->Spawn(Run(core, context));
+        bycorf::ThisWorker().self_->Spawn(Run(core, context));
       })) {
     std::terminate();
   }
@@ -794,7 +794,7 @@ void MetaAutomaticFailoverReconciler::CancelAndWait() { Stop(false); }
 
 void MetaAutomaticFailoverReconciler::Shutdown() { Stop(true); }
 
-celer::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
+bycorf::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
     std::shared_ptr<Core> core, MetaLeaderContext* context) {
   auto changed = std::make_shared<std::atomic<bool>>(false);
   auto subscribe = [&] {
@@ -1113,8 +1113,8 @@ celer::Task<absl::Status> MetaAutomaticFailoverReconciler::Run(
           pending.uncertain_append_, applied.status().message());
     }
 
-    const auto slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                                core->options_.poll_interval_);
+    const auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                 core->options_.poll_interval_);
     if (!slept.ok()) break;
   }
 

@@ -31,13 +31,13 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "celer/io/storage.h"
-#include "celer/net/connection.h"
-#include "celer/net/tcp_listener.h"
-#include "celer/net/tcp_stream.h"
-#include "celer/net/tls.h"
-#include "celer/runtime/sync.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/net/connection.h"
+#include "bycorf/net/tcp_listener.h"
+#include "bycorf/net/tcp_stream.h"
+#include "bycorf/net/tls.h"
+#include "bycorf/runtime/sync.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/cluster/control_transport.h"
 #include "keylane/cluster/lease_clock.h"
 #include "keylane/meta/cluster_create.h"
@@ -159,10 +159,10 @@ struct SessionCommitSignal {
   // projection index, so one fast publisher cannot clear another's work.
   std::atomic<std::uint64_t> published_index_{0};
   std::atomic<bool> delivery_failed_{false};
-  celer::AsyncNotification changed_;
+  bycorf::AsyncNotification changed_;
 };
 
-// Celer's current TcpListener::Close closes the listening fd but does not
+// Bycorf's current TcpListener::Close closes the listening fd but does not
 // cancel an already armed multishot accept. Wake that one waiter through the
 // listener before closing it so Meta can synchronously join its accept loop.
 absl::StatusOr<int> OpenShutdownAcceptWakeSocket(std::string_view bind_host,
@@ -232,23 +232,23 @@ bool CommitPending(const SessionCommitSignal& signal,
          validated_index;
 }
 
-celer::Task<absl::Status> CloseAtDeadline(celer::Worker& worker,
-                                          celer::Connection* connection,
-                                          std::shared_ptr<DeadlineState> state,
-                                          std::chrono::milliseconds timeout,
-                                          std::string operation) {
-  const absl::Status slept = co_await celer::SleepFor(worker, timeout);
+bycorf::Task<absl::Status> CloseAtDeadline(bycorf::Worker& worker,
+                                           bycorf::Connection* connection,
+                                           std::shared_ptr<DeadlineState> state,
+                                           std::chrono::milliseconds timeout,
+                                           std::string operation) {
+  const absl::Status slept = co_await bycorf::SleepFor(worker, timeout);
   if (slept.ok() && !state->complete_) {
     worker.BeginClose(
         connection,
         absl::DeadlineExceededError(absl::StrCat(operation, " timed out")),
-        celer::CloseMode::kIdleTimeout);
+        bycorf::CloseMode::kIdleTimeout);
   }
   co_return slept;
 }
 
-std::shared_ptr<DeadlineState> ArmDeadline(celer::Worker& worker,
-                                           celer::Connection* connection,
+std::shared_ptr<DeadlineState> ArmDeadline(bycorf::Worker& worker,
+                                           bycorf::Connection* connection,
                                            std::chrono::milliseconds timeout,
                                            std::string operation) {
   auto state = std::make_shared<DeadlineState>();
@@ -262,8 +262,8 @@ std::shared_ptr<DeadlineState> ArmDeadline(celer::Worker& worker,
 // assignment; large objects use the same path one chunk at a time.
 class SessionIo {
  public:
-  SessionIo(celer::Worker& worker, celer::Connection* connection,
-            celer::TcpStream& stream, std::size_t queue_bytes,
+  SessionIo(bycorf::Worker& worker, bycorf::Connection* connection,
+            bycorf::TcpStream& stream, std::size_t queue_bytes,
             std::chrono::milliseconds progress_timeout,
             std::chrono::milliseconds established_read_timeout)
       : worker_(worker),
@@ -275,12 +275,12 @@ class SessionIo {
           worker.BeginClose(connection,
                             absl::DeadlineExceededError(
                                 "control session read idle/progress timed out"),
-                            celer::CloseMode::kIdleTimeout);
+                            bycorf::CloseMode::kIdleTimeout);
         }) {}
 
   absl::Status Prepare() noexcept { return frames_.Prepare(); }
 
-  celer::Task<absl::StatusOr<control::WireMessage>> Read() {
+  bycorf::Task<absl::StatusOr<control::WireMessage>> Read() {
     if (absl::Status armed = read_deadline_.Arm(established_read_timeout_);
         !armed.ok()) {
       co_return armed;
@@ -295,12 +295,12 @@ class SessionIo {
 
   // TLS and ClientHello share one outer deadline, so arming a second timer
   // around the Hello would create two close owners for the same connection.
-  celer::Task<absl::StatusOr<control::WireMessage>> ReadHandshake() {
+  bycorf::Task<absl::StatusOr<control::WireMessage>> ReadHandshake() {
     co_return co_await frames_.ReadMessage();
   }
 
-  celer::Task<absl::Status> Send(control::MessagePriority priority,
-                                 control::WireMessage message) {
+  bycorf::Task<absl::Status> Send(control::MessagePriority priority,
+                                  control::WireMessage message) {
     co_return co_await writer_.Write(priority, std::move(message));
   }
 
@@ -308,12 +308,12 @@ class SessionIo {
     worker_.BeginClose(
         connection_,
         absl::DeadlineExceededError(absl::StrCat(operation, " timed out")),
-        celer::CloseMode::kIdleTimeout);
+        bycorf::CloseMode::kIdleTimeout);
   }
 
  private:
-  celer::Worker& worker_;
-  celer::Connection* connection_;
+  bycorf::Worker& worker_;
+  bycorf::Connection* connection_;
   // Covers the permitted heartbeat-idle interval plus one complete fixed I/O
   // progress budget. The frame stream retains its separate fixed write budget.
   const std::chrono::milliseconds established_read_timeout_;
@@ -410,7 +410,7 @@ bool SameLiveAuthority(const control::WireDesiredGroup& old_group,
          GroupAnchor(*current) == GroupAnchor(old_group);
 }
 
-celer::Task<absl::Status> FenceSupersededAuthority(
+bycorf::Task<absl::Status> FenceSupersededAuthority(
     SessionIo& io, const NodeControlBatch& installed,
     const control::FullDesiredState* latest, std::string_view node_id,
     std::string_view boot_id, const control::WireId128& session_id,
@@ -902,7 +902,6 @@ MetaHeartbeatObservationResult IngestHeartbeatObservations(
   return result;
 }
 
-
 std::vector<control::WireAuthorityAnchor> UnfencedSupersededAuthorities(
     const control::FullDesiredState& installed,
     const control::FullDesiredState* latest, std::string_view node_id,
@@ -1210,7 +1209,7 @@ MetaLeaderRuntimeDisposition MetaLeaderRuntimeGuard::Observe(
 }
 
 struct MetaDataControlServer::Core {
-  celer::ForeignExecutor foreign_executor_;
+  bycorf::ForeignExecutor foreign_executor_;
   nuraft::ptr<nuraft::raft_server> server_;
   // Non-owning. MetaCoordinator owns this reconciler and therefore outlives
   // every Core access; keeping this edge non-owning avoids a cycle.
@@ -1218,7 +1217,7 @@ struct MetaDataControlServer::Core {
   std::unique_ptr<detail::MetaCommittedViewCache> committed_view_cache_;
   std::shared_ptr<MetaObservationStore> observations_;
   MetaDataControlServerOptions options_;
-  std::shared_ptr<celer::TlsContext> tls_context_;
+  std::shared_ptr<bycorf::TlsContext> tls_context_;
   std::unique_ptr<MetaLeaseHandoffGuard> lease_handoff_guard_;
   std::unique_ptr<MetaLeaderRuntimeGuard> leader_runtime_guard_;
   std::unique_ptr<detail::PendingHandshakeLimiter> pending_handshakes_;
@@ -1248,8 +1247,8 @@ struct MetaDataControlServer::Core {
   std::atomic<bool> shutdown_complete_{false};
 
   // Worker-thread only below.
-  celer::Worker* worker_ = nullptr;
-  celer::TcpListener listener_;
+  bycorf::Worker* worker_ = nullptr;
+  bycorf::TcpListener listener_;
   int shutdown_accept_wake_fd_ = -1;
   bool listening_ = false;
   bool shutdown_ = false;
@@ -1260,8 +1259,8 @@ struct MetaDataControlServer::Core {
   MetaLeaderContext* leader_context_ = nullptr;
   std::shared_ptr<SessionCommitSignal> leader_commit_signal_;
   std::shared_ptr<MetaCommitSubscription> leader_commit_subscription_;
-  std::vector<celer::Connection*> sessions_;
-  std::map<celer::Connection*, std::uint64_t> authority_session_generation_;
+  std::vector<bycorf::Connection*> sessions_;
+  std::map<bycorf::Connection*, std::uint64_t> authority_session_generation_;
   std::map<std::uint64_t, std::size_t> authority_sessions_by_generation_;
   std::map<std::uint64_t, std::size_t> leader_tasks_by_generation_;
   std::map<std::uint64_t, std::vector<std::shared_ptr<std::promise<void>>>>
@@ -1273,7 +1272,7 @@ struct MetaDataControlServer::Core {
 
 std::shared_ptr<MetaDataControlServer>
 MetaDataControlServer::LifecycleHarnessForTest(
-    celer::ForeignExecutor foreign_executor, bool shutdown_complete) {
+    bycorf::ForeignExecutor foreign_executor, bool shutdown_complete) {
   auto core = std::make_shared<Core>();
   core->foreign_executor_ = foreign_executor;
   core->options_.runtime_status_ =
@@ -1290,8 +1289,8 @@ MetaDataControlServer::LifecycleHarnessForTest(
 // publisher acknowledgement.
 struct LiveSessionState {
   std::shared_ptr<MetaDataControlServer::Core> core_;
-  celer::Worker* worker_ = nullptr;
-  celer::Connection* connection_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
+  bycorf::Connection* connection_ = nullptr;
   SessionIo* io_ = nullptr;
   std::shared_ptr<MetaCommitSubscription> commit_subscription_;
   std::shared_ptr<SessionCommitSignal> commit_signal_;
@@ -1320,14 +1319,14 @@ struct LiveSessionState {
   bool fence_received_ = false;
   bool applied_received_ = false;
   detail::MetaPublisherAdoptionGate publisher_adoption_gate_;
-  celer::AsyncNotification response_changed_;
+  bycorf::AsyncNotification response_changed_;
 
   std::optional<absl::Status> terminal_error_;
   std::size_t active_tasks_ = 0;
   bool publisher_running_ = false;
   bool projection_superseded_ = false;
   bool closing_ = false;
-  celer::AsyncNotification tasks_changed_;
+  bycorf::AsyncNotification tasks_changed_;
 };
 
 namespace {
@@ -1385,7 +1384,7 @@ void NotifyShutdownDrained(MetaDataControlServer::Core& core) {
 }
 
 absl::Status BindAuthoritySession(MetaDataControlServer::Core& core,
-                                  celer::Connection* connection,
+                                  bycorf::Connection* connection,
                                   std::uint64_t generation) {
   if (!core.authority_session_generation_.emplace(connection, generation)
            .second) {
@@ -1414,7 +1413,7 @@ void FinishLeaderTask(MetaDataControlServer::Core& core,
 }
 
 void UnregisterSession(MetaDataControlServer::Core& core,
-                       celer::Connection* connection) {
+                       bycorf::Connection* connection) {
   const auto session =
       std::find(core.sessions_.begin(), core.sessions_.end(), connection);
   if (session != core.sessions_.end()) {
@@ -1425,7 +1424,7 @@ void UnregisterSession(MetaDataControlServer::Core& core,
 }
 
 void RemoveSessionBindings(MetaDataControlServer::Core& core,
-                           celer::Connection* connection,
+                           bycorf::Connection* connection,
                            std::string_view node_id,
                            const control::WireId128* session_id) {
   if (const auto authority =
@@ -1450,16 +1449,16 @@ void RemoveSessionBindings(MetaDataControlServer::Core& core,
   }
 }
 
-void CloseConnectionNow(celer::Worker& worker, celer::Connection* connection,
+void CloseConnectionNow(bycorf::Worker& worker, bycorf::Connection* connection,
                         absl::Status status) {
   // shutdown(2) makes the transport revocation externally visible before the
-  // reconciler acknowledges demotion. BeginClose then performs Celer's normal
+  // reconciler acknowledges demotion. BeginClose then performs Bycorf's normal
   // in-flight operation drain and connection retirement.
   if (connection != nullptr && connection->file_.fd_ >= 0) {
     (void)::shutdown(connection->file_.fd_, SHUT_RDWR);
   }
   worker.BeginClose(connection, std::move(status),
-                    celer::CloseMode::kLocalClose);
+                    bycorf::CloseMode::kLocalClose);
 }
 
 bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
@@ -1479,17 +1478,17 @@ bool AuthoritySessionsAllowed(MetaDataControlServer::Core& core,
         core.options_.leadership_validity_ms_);
     // NuRaft's cached live-leader flag may itself be stale after suspend.
     // Immediate resignation is synchronous for a multi-member cluster, so
-    // this generation cannot become eligible merely because the Celer worker
+    // this generation cannot become eligible merely because the Bycorf worker
     // runs before NuRaft's next heartbeat timer. NuRaft intentionally keeps a
     // sole member leader; the active-time guard safely covers that case.
     core.server_->yield_leadership(/*immediate_yield=*/true);
     if (core.worker_ != nullptr) {
-      std::vector<celer::Connection*> sessions;
+      std::vector<bycorf::Connection*> sessions;
       for (const auto& [connection, session_generation] :
            core.authority_session_generation_) {
         if (session_generation == generation) sessions.push_back(connection);
       }
-      for (celer::Connection* connection : sessions) {
+      for (bycorf::Connection* connection : sessions) {
         CloseConnectionNow(
             *core.worker_, connection,
             absl::UnavailableError(
@@ -1650,7 +1649,7 @@ bool ActiveClusterCreateDeclaresNode(const MetaCommittedView& view,
              [&](const auto& node) { return node.node_id_ == node_id; });
 }
 
-celer::Task<absl::Status> ReconcileLocalMetaMember(
+bycorf::Task<absl::Status> ReconcileLocalMetaMember(
     std::shared_ptr<MetaDataControlServer::Core> core,
     std::uint64_t generation) {
   struct CompletionGuard {
@@ -1695,7 +1694,8 @@ celer::Task<absl::Status> ReconcileLocalMetaMember(
       spdlog::warn("data-control leader membership reconciliation: {}",
                    status.message());
     }
-    const absl::Status waited = co_await celer::SleepFor(*core->worker_, 100ms);
+    const absl::Status waited =
+        co_await bycorf::SleepFor(*core->worker_, 100ms);
     if (!waited.ok()) co_return waited;
   }
   co_return absl::CancelledError(
@@ -1752,7 +1752,7 @@ control::ServerHello BuildServerHello(
   };
 }
 
-celer::Task<absl::Status> AwaitApplied(
+bycorf::Task<absl::Status> AwaitApplied(
     SessionIo& io, const NodeControlBatch& batch,
     std::deque<control::WireMessage>* deferred = nullptr,
     std::size_t max_deferred_messages = 0) {
@@ -1782,7 +1782,7 @@ celer::Task<absl::Status> AwaitApplied(
   }
 }
 
-celer::Task<absl::Status> SendFullState(
+bycorf::Task<absl::Status> SendFullState(
     const std::shared_ptr<MetaDataControlServer::Core>& core, SessionIo& io,
     std::shared_ptr<const NodeControlBatch> batch, std::string_view node_id,
     std::uint64_t generation) {
@@ -1842,7 +1842,7 @@ celer::Task<absl::Status> SendFullState(
       control::WireMessage(control::TransferEnd{*object_id}));
 }
 
-celer::Task<absl::Status> AbortSupersededReplacement(
+bycorf::Task<absl::Status> AbortSupersededReplacement(
     SessionIo& io, const control::WireId128& object_id, bool transfer_active) {
   if (transfer_active) {
     if (absl::Status aborted = co_await io.Send(
@@ -1859,7 +1859,7 @@ celer::Task<absl::Status> AbortSupersededReplacement(
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> ValidateBootstrapApplied(
+bycorf::Task<absl::Status> ValidateBootstrapApplied(
     const std::shared_ptr<MetaDataControlServer::Core>& core, SessionIo& io,
     const NodeControlBatch& installed, std::string_view node_id,
     std::string_view boot_id, const control::WireId128& session_id,
@@ -1948,7 +1948,7 @@ absl::StatusOr<bool> HandlePublisherResponse(
   return false;
 }
 
-celer::Task<absl::Status> AwaitPublisherFence(
+bycorf::Task<absl::Status> AwaitPublisherFence(
     const std::shared_ptr<LiveSessionState>& state) {
   if (!state->fence_received_) {
     const absl::Status armed =
@@ -1969,7 +1969,7 @@ celer::Task<absl::Status> AwaitPublisherFence(
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> AwaitPublisherApplied(
+bycorf::Task<absl::Status> AwaitPublisherApplied(
     const std::shared_ptr<LiveSessionState>& state) {
   while (!state->closing_ && !state->applied_received_) {
     co_await state->response_changed_.Wait();
@@ -1996,7 +1996,7 @@ void ClearPublisherApplied(const std::shared_ptr<LiveSessionState>& state) {
   state->expected_applied_.reset();
 }
 
-celer::Task<absl::Status> FenceSupersededAuthorityLive(
+bycorf::Task<absl::Status> FenceSupersededAuthorityLive(
     const std::shared_ptr<LiveSessionState>& state,
     const NodeControlBatch& installed,
     const control::FullDesiredState* latest) {
@@ -2045,7 +2045,7 @@ celer::Task<absl::Status> FenceSupersededAuthorityLive(
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::StatusOr<MetaReplacementDisposition>>
+bycorf::Task<absl::StatusOr<MetaReplacementDisposition>>
 CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
                           const NodeControlBatch& installed,
                           const NodeControlBatch& replacement) {
@@ -2093,7 +2093,7 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
   co_return disposition;
 }
 
-celer::Task<absl::StatusOr<detail::MetaPublisherTransferDisposition>>
+bycorf::Task<absl::StatusOr<detail::MetaPublisherTransferDisposition>>
 SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
                       const NodeControlBatch& installed,
                       const NodeControlBatch& replacement,
@@ -2257,7 +2257,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
   co_return detail::MetaPublisherTransferDisposition::kApplied;
 }
 
-celer::Task<absl::Status> SessionPublisherBody(
+bycorf::Task<absl::Status> SessionPublisherBody(
     const std::shared_ptr<LiveSessionState>& state) {
   while (
       !state->closing_ &&
@@ -2380,7 +2380,7 @@ celer::Task<absl::Status> SessionPublisherBody(
       "data-control publisher stopped with its leadership generation");
 }
 
-celer::Task<absl::Status> RunSessionPublisher(
+bycorf::Task<absl::Status> RunSessionPublisher(
     std::shared_ptr<LiveSessionState> state) {
   absl::Status status = co_await SessionPublisherBody(state);
   FinishLiveSessionTask(state, &state->publisher_running_);
@@ -2390,7 +2390,7 @@ celer::Task<absl::Status> RunSessionPublisher(
   co_return status;
 }
 
-celer::Task<absl::Status> HandleDirectiveResult(
+bycorf::Task<absl::Status> HandleDirectiveResult(
     const std::shared_ptr<MetaDataControlServer::Core>& core, SessionIo& io,
     const control::DirectiveResult& result, std::string_view node_id,
     const MetaBootIncarnation& boot_id, std::uint64_t leadership_generation,
@@ -2510,7 +2510,7 @@ celer::Task<absl::Status> HandleDirectiveResult(
                              control::WireMessage(ResultAck(result, *receipt)));
 }
 
-celer::Task<absl::Status> RunEstablishedSession(
+bycorf::Task<absl::Status> RunEstablishedSession(
     const std::shared_ptr<LiveSessionState>& state,
     const MetaBootIncarnation& boot_id,
     const MetaReplicationHistoryId& replication_history_id,
@@ -2746,7 +2746,6 @@ celer::Task<absl::Status> RunEstablishedSession(
       continue;
     }
 
-
     if (const auto* result =
             std::get_if<control::DirectiveResult>(&*incoming)) {
       if (absl::Status handled = co_await HandleDirectiveResult(
@@ -2791,11 +2790,11 @@ std::chrono::milliseconds detail::EstablishedSessionReadTimeout(
 
 class MetaDataControlServer::SessionConnectionBorrow {
  public:
-  SessionConnectionBorrow(CorePtr core, celer::Connection* connection)
+  SessionConnectionBorrow(CorePtr core, bycorf::Connection* connection)
       : core_(std::move(core)), connection_(connection) {
     core_->sessions_.push_back(connection_);
     core_->live_session_tasks_.fetch_add(1, std::memory_order_relaxed);
-    celer::BorrowConnectionStorage(connection_);
+    bycorf::BorrowConnectionStorage(connection_);
   }
 
   SessionConnectionBorrow(SessionConnectionBorrow&& other) noexcept
@@ -2809,13 +2808,13 @@ class MetaDataControlServer::SessionConnectionBorrow {
   ~SessionConnectionBorrow() {
     if (connection_ == nullptr) return;
     UnregisterSession(*core_, connection_);
-    celer::ReleaseConnectionStorage(connection_);
+    bycorf::ReleaseConnectionStorage(connection_);
     NotifyShutdownDrained(*core_);
   }
 
  private:
   CorePtr core_;
-  celer::Connection* connection_;
+  bycorf::Connection* connection_;
 };
 
 detail::PendingHandshakeLimiter::Permit::Permit(Permit&& other) noexcept
@@ -2908,13 +2907,13 @@ void detail::RetainedProjectionLimiter::Release(std::size_t bytes) noexcept {
   retained_bytes_ -= bytes;
 }
 
-bool detail::BoundNodeSessionRegistry::TryClaim(std::string_view node_id,
-                                                celer::Connection* connection) {
+bool detail::BoundNodeSessionRegistry::TryClaim(
+    std::string_view node_id, bycorf::Connection* connection) {
   return sessions_.emplace(node_id, connection).second;
 }
 
 void detail::BoundNodeSessionRegistry::Release(
-    std::string_view node_id, celer::Connection* connection) noexcept {
+    std::string_view node_id, bycorf::Connection* connection) noexcept {
   const auto session = sessions_.find(node_id);
   if (session != sessions_.end() && session->second == connection) {
     sessions_.erase(session);
@@ -2978,7 +2977,7 @@ absl::Status MetaDataControlServer::ValidateOptions(
 
 absl::StatusOr<std::shared_ptr<MetaDataControlServer>>
 MetaDataControlServer::Create(
-    celer::ForeignExecutor foreign_executor,
+    bycorf::ForeignExecutor foreign_executor,
     nuraft::ptr<nuraft::raft_server> server, MetaCoordinator& coordinator,
     std::shared_ptr<MetaObservationStore> observations,
     MetaDataControlServerOptions options) {
@@ -3012,11 +3011,11 @@ MetaDataControlServer::Create(
       std::make_unique<detail::RetainedProjectionLimiter>(
           core->options_.max_retained_projection_bytes_);
   if (!core->options_.tls_ca_cert_file_.empty()) {
-    auto tls = celer::TlsContext::CreateServer(celer::TlsServerOptions{
+    auto tls = bycorf::TlsContext::CreateServer(bycorf::TlsServerOptions{
         .cert_file_ = core->options_.tls_cert_file_,
         .key_file_ = core->options_.tls_key_file_,
         .ca_cert_file_ = core->options_.tls_ca_cert_file_,
-        .client_auth_ = celer::TlsClientAuth::kRequired,
+        .client_auth_ = bycorf::TlsClientAuth::kRequired,
     });
     if (!tls.ok()) return tls.status();
     core->tls_context_ = std::move(*tls);
@@ -3031,7 +3030,7 @@ void MetaDataControlServer::StartListener() {
   CorePtr core = core_;
   if (!core->foreign_executor_.Notify([core]() noexcept {
         if (core->shutdown_ || core->listening_) return;
-        core->worker_ = celer::ThisWorker().self_;
+        core->worker_ = bycorf::ThisWorker().self_;
         const absl::Status bound = core->listener_.Bind(
             core->worker_, core->options_.bind_host_, core->options_.port_,
             /*backlog=*/128, /*reuse_port=*/false);
@@ -3045,7 +3044,7 @@ void MetaDataControlServer::StartListener() {
         core->worker_->Spawn(AcceptLoop(core));
       })) {
     std::lock_guard<std::mutex> lock(core->status_mu_);
-    core->status_ = absl::UnavailableError("Celer worker is stopping");
+    core->status_ = absl::UnavailableError("Bycorf worker is stopping");
   }
 }
 
@@ -3100,8 +3099,8 @@ void MetaDataControlServer::Shutdown() {
             // Close callbacks may retire sessions once this mailbox turn
             // yields; iterate a stable snapshot instead of coupling
             // correctness to BeginClose's current non-reentrant behavior.
-            const std::vector<celer::Connection*> sessions = core->sessions_;
-            for (celer::Connection* connection : sessions) {
+            const std::vector<bycorf::Connection*> sessions = core->sessions_;
+            for (bycorf::Connection* connection : sessions) {
               CloseConnectionNow(*core->worker_, connection,
                                  absl::CancelledError("data-control shutdown"));
             }
@@ -3165,10 +3164,10 @@ void MetaDataControlServer::StartOnExecutor(MetaLeaderContext* context) {
   if (!core->foreign_executor_.Notify([core, context]() noexcept {
         if (core->shutdown_) return;
         if (context == nullptr) std::terminate();
-        celer::Worker* worker = celer::ThisWorker().self_;
+        bycorf::Worker* worker = bycorf::ThisWorker().self_;
         if (core->worker_ == nullptr) core->worker_ = worker;
         auto commit_signal = std::make_shared<SessionCommitSignal>();
-        celer::ForeignExecutor commit_executor = core->foreign_executor_;
+        bycorf::ForeignExecutor commit_executor = core->foreign_executor_;
         MetaSubscriptionStart commit_start = context->SubscribeCommitted(
             [commit_signal, commit_executor,
              worker](const MetaCommitEvent& event) mutable {
@@ -3227,14 +3226,14 @@ void MetaDataControlServer::CancelAndWait() {
         core->generation_drain_waiters_[cancelled_generation].push_back(
             complete);
         if (core->worker_ != nullptr) {
-          std::vector<celer::Connection*> sessions;
+          std::vector<bycorf::Connection*> sessions;
           for (const auto& [connection, generation] :
                core->authority_session_generation_) {
             if (generation == cancelled_generation) {
               sessions.push_back(connection);
             }
           }
-          for (celer::Connection* connection : sessions) {
+          for (bycorf::Connection* connection : sessions) {
             CloseConnectionNow(*core->worker_, connection,
                                absl::CancelledError("Meta leadership changed"));
           }
@@ -3250,16 +3249,17 @@ void MetaDataControlServer::CancelAndWait() {
   done.wait();
 }
 
-celer::Task<absl::Status> MetaDataControlServer::AcceptLoop(CorePtr core) {
+bycorf::Task<absl::Status> MetaDataControlServer::AcceptLoop(CorePtr core) {
   while (core->listening_) {
     auto accepted = co_await core->listener_.Accept();
     if (!accepted.ok()) {
       if (!core->listening_) break;
-      const absl::Status slept = co_await celer::SleepFor(*core->worker_, 10ms);
+      const absl::Status slept =
+          co_await bycorf::SleepFor(*core->worker_, 10ms);
       if (!slept.ok() && !core->listening_) break;
       continue;
     }
-    celer::Connection* connection = *accepted;
+    bycorf::Connection* connection = *accepted;
     if (!core->listening_) {
       CloseConnectionNow(
           *core->worker_, connection,
@@ -3284,7 +3284,7 @@ celer::Task<absl::Status> MetaDataControlServer::AcceptLoop(CorePtr core) {
     // the task before its body runs, destruction unregisters the session and
     // releases its storage borrow.
     core->worker_->Spawn(
-        SessionLoop(core, celer::TcpStream(connection), connection,
+        SessionLoop(core, bycorf::TcpStream(connection), connection,
                     std::move(*handshake_permit),
                     SessionConnectionBorrow(core, connection)));
   }
@@ -3299,8 +3299,8 @@ celer::Task<absl::Status> MetaDataControlServer::AcceptLoop(CorePtr core) {
   co_return absl::OkStatus();
 }
 
-celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
-    CorePtr core, celer::TcpStream stream, celer::Connection* connection,
+bycorf::Task<absl::Status> MetaDataControlServer::SessionLoop(
+    CorePtr core, bycorf::TcpStream stream, bycorf::Connection* connection,
     detail::PendingHandshakeLimiter::Permit handshake_permit,
     SessionConnectionBorrow borrow) {
   // This frame-owned parameter keeps the task registered and the Connection
@@ -3318,7 +3318,7 @@ celer::Task<absl::Status> MetaDataControlServer::SessionLoop(
   // the task registered through final suspend.
   struct SessionCompletionGuard {
     CorePtr core_;
-    celer::Connection* connection_;
+    bycorf::Connection* connection_;
     std::string* node_id_;
     std::optional<MetaObservationIdentity>* observation_identity_;
     std::optional<control::WireId128>* status_session_id_;

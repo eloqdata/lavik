@@ -69,7 +69,7 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
                                        original.db_epoch_);
     } else {
       const unsigned owner = location.block_owner();
-      loaded = co_await celer::SubmitTaskTo(
+      loaded = co_await bycorf::SubmitTaskTo(
           owner,
           [this, owner, db_id, owned_key = std::string(key), location,
            epoch = original.replication_epoch_,

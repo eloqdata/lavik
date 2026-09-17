@@ -66,7 +66,7 @@ absl::StatusOr<std::optional<MetaMembershipStep>> PlanMembershipStep(
 // completion; callbacks retain only their own inert result storage.
 class MetaMembershipReconciler final : public MetaReconciler {
  public:
-  MetaMembershipReconciler(celer::ForeignExecutor executor,
+  MetaMembershipReconciler(bycorf::ForeignExecutor executor,
                            MetaProposalExecutor& proposals,
                            nuraft::ptr<nuraft::raft_server> server,
                            nuraft::ptr<MetaStateMachine> state_machine,
@@ -81,8 +81,8 @@ class MetaMembershipReconciler final : public MetaReconciler {
 
  private:
   struct Core;
-  static celer::Task<absl::Status> Run(std::shared_ptr<Core>,
-                                       MetaLeaderContext*);
+  static bycorf::Task<absl::Status> Run(std::shared_ptr<Core>,
+                                        MetaLeaderContext*);
   void Stop(bool permanent);
   std::shared_ptr<Core> core_;
 };

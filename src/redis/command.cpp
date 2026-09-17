@@ -32,10 +32,10 @@
 #include "absl/strings/str_cat.h"
 #include "backup.h"
 #include "blocking_wait.h"
-#include "celer/io/storage.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/cycle_clock.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/cycle_clock.h"
+#include "bycorf/runtime/worker.h"
 #include "client_limit.h"
 #include "cluster_command.h"
 #include "cluster_gate.h"
@@ -75,7 +75,7 @@
 #include "zset_command.h"
 
 namespace keylane {
-using namespace celer;
+using namespace bycorf;
 
 namespace {
 
@@ -117,7 +117,7 @@ struct ClientConnectionRecord {
   bool closing_ = false;
 };
 
-// Each element is touched only by its matching celer worker. CLIENT is a rare
+// Each element is touched only by its matching bycorf worker. CLIENT is a rare
 // management command and visits the workers with cross-core messages; normal
 // request processing needs neither a lock nor an atomic lookup.
 std::array<std::vector<ClientConnectionRecord>, storage::kLogicalStorageShards>
@@ -510,7 +510,7 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
       replication_args[0] = "PUBLISH";
       storage::MutationPrecondition mutation_precondition =
           ClusterMutationPrecondition(request);
-      absl::Status published = co_await celer::SubmitTaskTo(
+      absl::Status published = co_await bycorf::SubmitTaskTo(
           source_worker,
           [partition_id, args = std::move(replication_args),
            mutation_precondition = std::move(
@@ -957,10 +957,10 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
   for (;;) {
     const std::shared_ptr<const cluster::AuthorityAdmission> admission =
         request.cluster_authority_admission_;
-    // Requests execute on stable Celer workers, so the worker id is the exact
+    // Requests execute on stable Bycorf workers, so the worker id is the exact
     // stripe identity required by the admitted ServingState.
     if (runtime->authority_guard_.RegisterAndRecheck(
-            *admission, celer::ThisWorker().id_, cluster::LeaseClockNow(),
+            *admission, bycorf::ThisWorker().id_, cluster::LeaseClockNow(),
             in_flights) == cluster::RecheckResult::kOk) {
       return std::nullopt;
     }
@@ -1488,7 +1488,7 @@ Task<absl::Status> ConfigureAllWorkerSchedulers(RuntimeConfigKey key,
        ++worker_id) {
     absl::Status configured =
         co_await SubmitTaskTo(worker_id, [key, value]() -> Task<absl::Status> {
-          celer::Worker* worker = celer::ThisWorker().self_;
+          bycorf::Worker* worker = bycorf::ThisWorker().self_;
           switch (key) {
             case RuntimeConfigKey::kForegroundBudget:
               co_return worker->SetForegroundBudgetUs(value);
@@ -1611,16 +1611,16 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           return g_storage->ShutdownCheckpointEnabled() ? "yes" : "no";
         case RuntimeConfigKey::kForegroundBudget:
           return std::to_string(
-              celer::ThisWorker().self_->foreground_budget_us());
+              bycorf::ThisWorker().self_->foreground_budget_us());
         case RuntimeConfigKey::kBackgroundBudget:
           return std::to_string(
-              celer::ThisWorker().self_->background_budget_us());
+              bycorf::ThisWorker().self_->background_budget_us());
         case RuntimeConfigKey::kBackgroundWarrant:
           return std::to_string(
-              celer::ThisWorker().self_->background_warrant_percent());
+              bycorf::ThisWorker().self_->background_warrant_percent());
         case RuntimeConfigKey::kSpdkMaxCompletions:
           return std::to_string(
-              celer::ThisWorker().self_->spdk_max_completions_per_poll());
+              bycorf::ThisWorker().self_->spdk_max_completions_per_poll());
         case RuntimeConfigKey::kStreamNodeMaxEntries:
           return std::to_string(StreamNodeMaxEntries());
         case RuntimeConfigKey::kSlowLogThreshold:
@@ -2125,7 +2125,7 @@ std::array<WorkerCommandGates, storage::kLogicalStorageShards>
 class ReplicationTransactionOrderGate {
  private:
   struct Waiter {
-    celer::Worker* worker_ = nullptr;
+    bycorf::Worker* worker_ = nullptr;
     std::coroutine_handle<> handle_{};
     Waiter* next_ = nullptr;
   };
@@ -2133,7 +2133,7 @@ class ReplicationTransactionOrderGate {
  public:
   class Awaiter {
    public:
-    Awaiter(ReplicationTransactionOrderGate* gate, celer::Worker* worker)
+    Awaiter(ReplicationTransactionOrderGate* gate, bycorf::Worker* worker)
         : gate_(gate) {
       waiter_.worker_ = worker;
     }
@@ -2149,7 +2149,7 @@ class ReplicationTransactionOrderGate {
     Waiter waiter_;
   };
 
-  Awaiter Acquire(celer::Worker& worker) noexcept {
+  Awaiter Acquire(bycorf::Worker& worker) noexcept {
     return Awaiter(this, &worker);
   }
 
@@ -2178,13 +2178,13 @@ class ReplicationTransactionOrderGate {
     // must queue behind it even if the resumed coroutine has not run yet.
     Unlock();
 
-    const celer::CurrentWorker& current = celer::ThisWorker();
+    const bycorf::CurrentWorker& current = bycorf::ThisWorker();
     if (wake->worker_->id() == current.id_) {
       wake->worker_->Enqueue(wake->handle_);
     } else {
-      celer::PostNotification(
+      bycorf::PostNotification(
           current.cross_core_, wake->worker_->id(),
-          celer::RemoteNotification{
+          bycorf::RemoteNotification{
               .context_ = wake->worker_,
               .value_ = static_cast<std::uint64_t>(
                   reinterpret_cast<std::uintptr_t>(wake->handle_.address())),
@@ -2195,7 +2195,7 @@ class ReplicationTransactionOrderGate {
 
  private:
   static void ResumeRemote(void* context, std::uint64_t value) noexcept {
-    static_cast<celer::Worker*>(context)->Enqueue(
+    static_cast<bycorf::Worker*>(context)->Enqueue(
         std::coroutine_handle<>::from_address(
             reinterpret_cast<void*>(static_cast<std::uintptr_t>(value))));
   }
@@ -2308,8 +2308,8 @@ Task<absl::Status> MaybePauseBeforeCommandDbAdmission() {
     co_return absl::OkStatus();
   }
   spdlog::info("client command admitted; pausing before database admission");
-  co_return co_await celer::SleepFor(*ThisWorker().self_,
-                                     std::chrono::milliseconds(milliseconds));
+  co_return co_await bycorf::SleepFor(*ThisWorker().self_,
+                                      std::chrono::milliseconds(milliseconds));
 }
 #endif
 
@@ -2742,7 +2742,7 @@ Task<absl::Status> BeginReplicationTransactionOrder(
               "KEYLANE_REPLICATION_ORDER_HOLD_MS holding the replication order "
               "gate for {} ms",
               hold_ms);
-          absl::Status held = co_await celer::SleepFor(
+          absl::Status held = co_await bycorf::SleepFor(
               *ThisWorker().self_, std::chrono::milliseconds(hold_ms));
           if (!held.ok()) {
             guard->Release();
@@ -2756,7 +2756,7 @@ Task<absl::Status> BeginReplicationTransactionOrder(
 Task<absl::Status> BeginSnapshotTransaction(
     SnapshotTransactionOperationGuard* guard) {
   while (!TryBeginSnapshotTransaction()) {
-    absl::Status waited = co_await celer::SleepFor(
+    absl::Status waited = co_await bycorf::SleepFor(
         *ThisWorker().self_, std::chrono::milliseconds(1));
     if (!waited.ok()) co_return waited;
   }
@@ -2901,7 +2901,7 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
 
     for (const std::uint8_t db_id : dbs) {
       while (DbGateHasActiveOperations(db_id)) {
-        absl::Status waited = co_await celer::SleepFor(
+        absl::Status waited = co_await bycorf::SleepFor(
             *ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) {
           co_return BuiltReply(reply_builder.AppendError(
@@ -3094,7 +3094,7 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request,
           static_cast<std::uint16_t>(partition_id), request.db_id_,
           local_cursor, remaining);
     } else {
-      scanned = co_await celer::SubmitTaskTo(
+      scanned = co_await bycorf::SubmitTaskTo(
           worker_id,
           [partition_id, db_id = request.db_id_, local_cursor,
            remaining]() -> Task<absl::StatusOr<storage::ScanBatch>> {
@@ -3198,7 +3198,7 @@ struct KeysWorkerBatch {
 Task<KeysWorkerBatch> KeysBatchOnWorker(
     std::uint8_t db, unsigned worker, unsigned partition, std::uint64_t cursor,
     std::uint64_t now_ms, const std::string* pattern, bool count_only) {
-  co_return co_await celer::SubmitTaskTo(
+  co_return co_await bycorf::SubmitTaskTo(
       worker, [=]() -> Task<KeysWorkerBatch> {
         constexpr std::size_t kChunkBytes = 64 * 1024;
         const unsigned stride = g_storage->worker_count();
@@ -3236,7 +3236,7 @@ Task<KeysWorkerBatch> KeysBatchOnWorker(
             batch.cursor_ = step.cursor_;
           }
           if (++scanned % 256 == 0) {
-            co_await celer::Yield(*ThisWorker().self_);
+            co_await bycorf::Yield(*ThisWorker().self_);
           }
         }
         batch.worker_done_ = batch.partition_ >= storage::kLogicalStorageShards;
@@ -3293,7 +3293,7 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
   // Drain in-flight commands, then freeze expiration writes: from here to the
   // end of the stream the keyspace cannot change, so the counted N is exact.
   while (DbGateHasActiveOperations(db)) {
-    absl::Status waited = co_await celer::SleepFor(
+    absl::Status waited = co_await bycorf::SleepFor(
         *ThisWorker().self_, std::chrono::milliseconds(1));
     if (!waited.ok()) {
       co_return BuiltReply(
@@ -3619,7 +3619,7 @@ Task<absl::StatusOr<std::uint64_t>> BeginNegativeRandomStream(
     }
   };
   if (state->owner_ != ThisWorker().id_) {
-    co_return co_await celer::SubmitTaskTo(state->owner_, std::move(begin));
+    co_return co_await bycorf::SubmitTaskTo(state->owner_, std::move(begin));
   }
   co_return co_await begin();
 }
@@ -4742,7 +4742,7 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     std::uint64_t command_cross_core_hops = 0;
     for (unsigned worker = 0; worker < g_server_threads; ++worker) {
       command_cross_core_hops += co_await SubmitTo(
-          worker, [] { return celer::LocalSubmitTaskCount(); });
+          worker, [] { return bycorf::LocalSubmitTaskCount(); });
     }
     info +=
         "command_cross_core_hops:" + std::to_string(command_cross_core_hops) +
@@ -5317,7 +5317,7 @@ Task<absl::Status> MultiKeyFinishCallback(void* context,
   if (ctx->rollback_) {
     co_return co_await g_storage->RollbackTxLocal(txid);
   }
-  storage::TxShardWrites& shard = ctx->tx_writes_[celer::ThisWorker().id_];
+  storage::TxShardWrites& shard = ctx->tx_writes_[bycorf::ThisWorker().id_];
   g_storage->PublishCommittedFullSyncEffects(&shard);
   co_return co_await g_storage->DiscardTxUndoLocal(txid);
 }
@@ -5337,7 +5337,7 @@ Task<absl::Status> TwoPhaseFinishCallback(void* opaque, const tx::ShardSlice&) {
   auto* context = static_cast<Context*>(opaque);
   const std::uint64_t txid = context->writes_.front().txid_;
   if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
-  storage::TxShardWrites& shard = context->writes_[celer::ThisWorker().id_];
+  storage::TxShardWrites& shard = context->writes_[bycorf::ThisWorker().id_];
   g_storage->PublishCommittedFullSyncEffects(&shard);
   co_return co_await g_storage->DiscardTxUndoLocal(txid);
 }
@@ -5428,7 +5428,8 @@ Task<absl::Status> RenameWriteCallback(void* opaque,
   auto* context = static_cast<RenameContext*>(opaque);
   for (const tx::TxKey& key : slice.keys_) {
     const std::string& name = context->request_->args_[key.arg_index_];
-    storage::TxShardWrites* writes = &context->writes_[celer::ThisWorker().id_];
+    storage::TxShardWrites* writes =
+        &context->writes_[bycorf::ThisWorker().id_];
     if (key.arg_index_ == 1) {
       auto deleted = co_await g_storage->DeleteLocked(
           context->request_->db_id_, name, key.digest_, writes);
@@ -5468,7 +5469,7 @@ Task<absl::Status> RenameSingleShardCallback(void* opaque,
     co_return absl::OkStatus();
   }
 
-  storage::TxShardWrites& writes = context->writes_[celer::ThisWorker().id_];
+  storage::TxShardWrites& writes = context->writes_[bycorf::ThisWorker().id_];
   absl::Status written = co_await g_storage->WriteValueForTransferLocked(
       context->request_->db_id_, args[2], destination_key->digest_,
       context->source_, &writes);
@@ -5504,7 +5505,7 @@ Task<absl::Status> PublishFullSyncEffectsCallback(void* opaque,
                                                   const tx::ShardSlice&) {
   auto* writes = static_cast<std::vector<storage::TxShardWrites>*>(opaque);
   g_storage->PublishCommittedFullSyncEffects(
-      &(*writes)[celer::ThisWorker().id_]);
+      &(*writes)[bycorf::ThisWorker().id_]);
   co_return absl::OkStatus();
 }
 
@@ -5675,7 +5676,8 @@ Task<absl::Status> CopyWriteCallback(void* opaque,
   auto* context = static_cast<CopyContext*>(opaque);
   for (const tx::TxKey& key : slice.keys_) {
     if (key.arg_index_ != 2) continue;
-    storage::TxShardWrites* writes = &context->writes_[celer::ThisWorker().id_];
+    storage::TxShardWrites* writes =
+        &context->writes_[bycorf::ThisWorker().id_];
     absl::Status status = co_await g_storage->WriteValueForTransferLocked(
         key.db_, context->request_->args_[2], key.digest_, *context->source_,
         writes);
@@ -5693,7 +5695,7 @@ Task<absl::Status> CopySingleShardCallback(void* opaque,
       (!context->destination_exists_ || context->options_.replace_)) {
     status = co_await CopyWriteCallback(opaque, slice);
   }
-  storage::TxShardWrites& writes = context->writes_[celer::ThisWorker().id_];
+  storage::TxShardWrites& writes = context->writes_[bycorf::ThisWorker().id_];
   writes.collect_undo_ = false;
   if (status.ok()) {
     g_storage->PublishCommittedFullSyncEffects(&writes);
@@ -5829,7 +5831,7 @@ Task<absl::Status> MSetNxSingleShardCallback(void* opaque,
     co_return checked;
   }
   absl::Status written = co_await MSetNxWriteLocal(context);
-  storage::TxShardWrites& writes = context->writes_[celer::ThisWorker().id_];
+  storage::TxShardWrites& writes = context->writes_[bycorf::ThisWorker().id_];
   writes.collect_undo_ = false;
   if (written.ok()) {
     g_storage->PublishCommittedFullSyncEffects(&writes);
@@ -8797,7 +8799,7 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
             absl::StrCat("ERR database admission failed: ", paused.message())));
       });
   while (!TryBeginDbOperation(request.db_id_)) {
-    absl::Status waited = co_await celer::SleepFor(
+    absl::Status waited = co_await bycorf::SleepFor(
         *ThisWorker().self_, std::chrono::milliseconds(1));
     if (!waited.ok()) {
       co_return BuiltReply(reply_builder.AppendError(
@@ -8825,7 +8827,7 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
     }
     const std::uint16_t owner =
         static_cast<std::uint16_t>(ShardForKey(request.args_[i]));
-    const bool live = co_await celer::SubmitTaskTo(
+    const bool live = co_await bycorf::SubmitTaskTo(
         owner,
         [key = std::string(request.args_[i]), db, digest, fp,
          conn = ctx.conn_id_]() -> Task<bool> {
@@ -8858,7 +8860,7 @@ Task<bool> CheckConnectionWatches(const ConnectionContext& ctx) {
         !g_replication->ServingGenerationMatches(watched.serving_generation_)) {
       co_return false;
     }
-    const bool clean = co_await celer::SubmitTaskTo(
+    const bool clean = co_await bycorf::SubmitTaskTo(
         watched.owner_,
         [key = watched.key_, db = watched.db_, digest = watched.digest_,
          fp = watched.fp_, live = watched.live_,
@@ -9090,7 +9092,7 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
     // gate; if WAIT concurrency becomes material, ACK fan-out can replace it
     // without changing the watermark contract.
     absl::Status slept =
-        co_await celer::SleepFor(*ThisWorker().self_, sleep_for);
+        co_await bycorf::SleepFor(*ThisWorker().self_, sleep_for);
     if (!slept.ok()) {
       co_return BuiltReply(reply_builder.AppendError(
           absl::StrCat("ERR WAIT interrupted: ", slept.message())));
@@ -9394,7 +9396,7 @@ Task<CommandReply> ExecuteExecBody(
           co_return reply;
         }
         if (runtime->authority_guard_.RegisterAndRecheck(
-                *candidate, celer::ThisWorker().id_, cluster::LeaseClockNow(),
+                *candidate, bycorf::ThisWorker().id_, cluster::LeaseClockNow(),
                 &exec_in_flights) != cluster::RecheckResult::kOk) {
           continue;
         }
@@ -9694,7 +9696,7 @@ Task<CommandReply> ExecuteExecBody(
                 !pause_used.exchange(true, std::memory_order_acq_rel)) {
               spdlog::info(
                   "catalog EXEC committed; pausing before replication fence");
-              absl::Status paused = co_await celer::SleepFor(
+              absl::Status paused = co_await bycorf::SleepFor(
                   *ThisWorker().self_, std::chrono::milliseconds(pause_ms));
               if (!paused.ok()) co_return paused;
             }
@@ -9812,7 +9814,7 @@ Task<CommandReply> ExecuteExecBody(
                 storage::StorageEngine::ValidateTxCommit(tx_writes);
             if (!valid.ok()) co_return valid;
             g_storage->PublishCommittedFullSyncEffects(
-                &tx_writes[celer::ThisWorker().id_]);
+                &tx_writes[bycorf::ThisWorker().id_]);
             co_return absl::OkStatus();
           });
       if (!status.ok()) {
@@ -10160,7 +10162,7 @@ Task<CommandReply> ExecuteExecBody(
       const storage::ReplicationEventKind event_kind =
           catalog_mutation ? storage::ReplicationEventKind::kCatalogMutation
                            : storage::ReplicationEventKind::kEphemeral;
-      absl::Status published = co_await celer::SubmitTo(
+      absl::Status published = co_await bycorf::SubmitTo(
           source_worker,
           [storage_admission = std::move(storage_admission), event_kind,
            partition_id, effects = std::move(effects),
@@ -10907,7 +10909,7 @@ void ReplicationTransactionGuard::SetParticipantsEnteredHook(
 }
 
 void ReplicationTransactionGuard::EnterCurrentShard() noexcept {
-  EnterShard(celer::ThisWorker().id_);
+  EnterShard(bycorf::ThisWorker().id_);
 }
 
 void ReplicationTransactionGuard::EnterShard(unsigned shard_id) noexcept {
@@ -10957,7 +10959,7 @@ void ConnectionClosed() noexcept { RecordConnectionClosed(); }
 void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
                               bool tls, bool replica,
                               std::uint64_t replication_session_id) {
-  const unsigned worker = celer::ThisWorker().id_;
+  const unsigned worker = bycorf::ThisWorker().id_;
   assert(worker < g_worker_clients.size());
   auto& clients = g_worker_clients[worker];
   const auto existing =
@@ -10987,7 +10989,7 @@ void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
 
 void SetClientReplicationSession(
     std::uint64_t id, std::uint64_t replication_session_id) noexcept {
-  const unsigned worker = celer::ThisWorker().id_;
+  const unsigned worker = bycorf::ThisWorker().id_;
   assert(worker < g_worker_clients.size());
   const auto found = std::find_if(
       g_worker_clients[worker].begin(), g_worker_clients[worker].end(),
@@ -10998,7 +11000,7 @@ void SetClientReplicationSession(
 }
 
 void SetClientName(std::uint64_t id, std::string name) noexcept {
-  const unsigned worker = celer::ThisWorker().id_;
+  const unsigned worker = bycorf::ThisWorker().id_;
   assert(worker < g_worker_clients.size());
   const auto found = std::find_if(
       g_worker_clients[worker].begin(), g_worker_clients[worker].end(),
@@ -11007,7 +11009,7 @@ void SetClientName(std::uint64_t id, std::string name) noexcept {
 }
 
 void SetClientRespVersion(std::uint64_t id, RespVersion version) noexcept {
-  const unsigned worker = celer::ThisWorker().id_;
+  const unsigned worker = bycorf::ThisWorker().id_;
   assert(worker < g_worker_clients.size());
   const auto found = std::find_if(
       g_worker_clients[worker].begin(), g_worker_clients[worker].end(),
@@ -11017,7 +11019,7 @@ void SetClientRespVersion(std::uint64_t id, RespVersion version) noexcept {
 
 void SetClientPubSubCounts(std::uint64_t id, std::size_t subscriptions,
                            std::size_t pattern_subscriptions) noexcept {
-  const unsigned worker = celer::ThisWorker().id_;
+  const unsigned worker = bycorf::ThisWorker().id_;
   assert(worker < g_worker_clients.size());
   const auto found = std::find_if(
       g_worker_clients[worker].begin(), g_worker_clients[worker].end(),
@@ -11033,7 +11035,7 @@ void SetClientPubSubCounts(std::uint64_t id, std::size_t subscriptions,
 }
 
 void SetClientBlocked(std::uint64_t id, bool blocked) noexcept {
-  const unsigned worker = celer::ThisWorker().id_;
+  const unsigned worker = bycorf::ThisWorker().id_;
   assert(worker < g_worker_clients.size());
   const auto found = std::find_if(
       g_worker_clients[worker].begin(), g_worker_clients[worker].end(),
@@ -11042,7 +11044,7 @@ void SetClientBlocked(std::uint64_t id, bool blocked) noexcept {
 }
 
 void UnregisterClientConnection(std::uint64_t id) noexcept {
-  const unsigned worker = celer::ThisWorker().id_;
+  const unsigned worker = bycorf::ThisWorker().id_;
   assert(worker < g_worker_clients.size());
   std::erase_if(g_worker_clients[worker],
                 [id](const auto& client) { return client.id_ == id; });
@@ -11976,7 +11978,7 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
   request.resp_version_ = ctx.resp_version();
   const bool may_block =
       request.spec_ != nullptr && (request.spec_->flags_ & kCmdMayBlock) != 0;
-  const std::uint64_t started = celer::ReadCycleCounter();
+  const std::uint64_t started = bycorf::ReadCycleCounter();
   CommandReply reply =
       co_await DispatchCommandImpl(ctx, request, reply_builder);
   if (cascade.has_value() && !cascade->empty()) {
@@ -11986,7 +11988,7 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
       reply.encoded_.front() != '-') {
     ctx.native_replication_watermark_dirty_ = true;
   }
-  const std::uint64_t elapsed_ticks = celer::ReadCycleCounter() - started;
+  const std::uint64_t elapsed_ticks = bycorf::ReadCycleCounter() - started;
   RecordCommandMetric(kind, elapsed_ticks);
   MaybeRecordSlowCommand(request.args_, ctx.peer_address_, ctx.client_name_,
                          elapsed_ticks, may_block);
@@ -12039,7 +12041,7 @@ Task<CommandReply> ExecuteCommandBody(
           }
         });
     while (!TryBeginDbOperation(request.db_id_)) {
-      absl::Status waited = co_await celer::SleepFor(
+      absl::Status waited = co_await bycorf::SleepFor(
           *ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         co_return BuiltReply(reply_builder.AppendError(
@@ -12797,7 +12799,7 @@ Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
     }
 
     while (!CloseAllCommandDbGates()) {
-      absl::Status waited = co_await celer::SleepFor(
+      absl::Status waited = co_await bycorf::SleepFor(
           *ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
@@ -12805,7 +12807,7 @@ Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
       ~ReplicatedFlushGateGuard() { OpenAllCommandDbGates(); }
     } reopen;
     while (CommandDbOperationsActive()) {
-      absl::Status waited = co_await celer::SleepFor(
+      absl::Status waited = co_await bycorf::SleepFor(
           *ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }

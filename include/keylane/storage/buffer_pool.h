@@ -10,13 +10,13 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
-#include "celer/io/storage.h"
-#include "celer/runtime/sync.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/runtime/sync.h"
 
-namespace celer {
+namespace bycorf {
 class CrossCore;
 class Worker;
-}  // namespace celer
+}  // namespace bycorf
 
 namespace keylane::storage {
 
@@ -62,12 +62,12 @@ class ReadBufferLease {
   }
 
   // Entire registered iovec, including framing/alignment headroom and tailroom.
-  celer::FixedBuffer registered_buffer() const noexcept {
+  bycorf::FixedBuffer registered_buffer() const noexcept {
     return {.data_ = data_, .size_ = size_, .index_ = buffer_id()};
   }
 
   // Aligned region intended as the destination of READ_FIXED.
-  celer::FixedBuffer io_buffer() const noexcept;
+  bycorf::FixedBuffer io_buffer() const noexcept;
 
   std::span<std::byte> bytes() const noexcept { return {data_, size_}; }
   std::size_t headroom_bytes() const noexcept { return headroom_bytes_; }
@@ -77,10 +77,10 @@ class ReadBufferLease {
 
  private:
   friend class RegisteredBufferPool;
-  ReadBufferLease(RegisteredBufferPool* pool, celer::FixedBuffer buffer,
+  ReadBufferLease(RegisteredBufferPool* pool, bycorf::FixedBuffer buffer,
                   std::size_t headroom_bytes,
                   std::size_t tailroom_bytes) noexcept;
-  ReadBufferLease(RegisteredBufferPool* pool, celer::FixedBuffer buffer,
+  ReadBufferLease(RegisteredBufferPool* pool, bycorf::FixedBuffer buffer,
                   std::size_t headroom_bytes, std::size_t tailroom_bytes,
                   std::size_t overflow_id) noexcept;
 
@@ -113,7 +113,7 @@ class RegisteredBufferPool {
   RegisteredBufferPool& operator=(const RegisteredBufferPool&) = delete;
   ~RegisteredBufferPool();
 
-  absl::Status Init(celer::Worker& worker,
+  absl::Status Init(bycorf::Worker& worker,
                     const RegisteredBufferPoolOptions& options = {});
 
   bool initialized() const noexcept { return worker_ != nullptr; }
@@ -137,19 +137,19 @@ class RegisteredBufferPool {
   std::size_t available_write_buffers() const noexcept {
     return free_write_buffers_.size();
   }
-  celer::FixedBuffer write_buffer(std::uint16_t buffer_id = 0) const noexcept {
+  bycorf::FixedBuffer write_buffer(std::uint16_t buffer_id = 0) const noexcept {
     if (buffer_id == 0) {
       return {};
     }
     const auto id = static_cast<std::size_t>(buffer_id);
     return id <= write_buffers_.size() && id != 0 ? write_buffers_[id - 1]
-                                                  : celer::FixedBuffer{};
+                                                  : bycorf::FixedBuffer{};
   }
 
   bool TryAcquireWriteBuffer(std::uint16_t* buffer_id) noexcept;
   // Foreground storage writers wait only for the statically reserved storage
   // pool. A backlog-buffer release cannot wake or satisfy this waiter.
-  celer::AsyncNotification::Awaiter WaitForWriteBuffer() noexcept {
+  bycorf::AsyncNotification::Awaiter WaitForWriteBuffer() noexcept {
     return storage_write_buffer_ready_.Wait();
   }
   void ReleaseWriteBuffer(std::uint16_t buffer_id) noexcept;
@@ -200,27 +200,27 @@ class RegisteredBufferPool {
   bool IsReadBufferId(std::uint16_t buffer_id) const noexcept;
   bool IsWriteBufferId(std::uint16_t buffer_id) const noexcept;
 
-  celer::Worker* worker_ = nullptr;
-  celer::CrossCore* cross_core_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
+  bycorf::CrossCore* cross_core_ = nullptr;
   unsigned owner_worker_ = 0;
   bool buffers_registered_ = false;
   RegisteredBufferPoolOptions options_{};
   std::byte* sentinel_buffer_ = nullptr;
   std::size_t sentinel_buffer_bytes_ = 0;
-  std::vector<celer::FixedBuffer> write_buffers_;
+  std::vector<bycorf::FixedBuffer> write_buffers_;
   std::vector<std::uint16_t> free_write_buffers_;
   std::vector<bool> write_buffer_in_use_;
-  celer::AsyncNotification storage_write_buffer_ready_;
+  bycorf::AsyncNotification storage_write_buffer_ready_;
   std::vector<std::byte*> heap_write_buffers_;
   std::vector<std::byte*> free_heap_write_buffers_;
-  std::vector<celer::FixedBuffer> read_buffers_;
+  std::vector<bycorf::FixedBuffer> read_buffers_;
   std::vector<std::uint16_t> free_read_buffers_;
   std::vector<bool> read_buffer_in_use_;
   std::deque<AcquireReadAwaiter*> read_waiters_;
   // SPDK and io_uring overflow reads grow this cache to the observed
   // concurrency high-water mark. Released DMA/aligned buffers are reused,
   // avoiding allocation and huge-page faults on every pool miss.
-  std::vector<celer::FixedBuffer> overflow_read_buffers_;
+  std::vector<bycorf::FixedBuffer> overflow_read_buffers_;
   std::vector<std::size_t> free_overflow_read_buffers_;
   std::vector<bool> overflow_read_buffer_in_use_;
 };

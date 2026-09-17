@@ -41,12 +41,12 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "celer/net/connection.h"
-#include "celer/net/tls.h"
-#include "celer/runtime/concurrentqueue.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/sync.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/net/connection.h"
+#include "bycorf/net/tls.h"
+#include "bycorf/runtime/concurrentqueue.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/sync.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/cluster/control_protocol.h"
 #include "keylane/cluster/lease_clock.h"
 #include "keylane/command.h"
@@ -83,11 +83,11 @@ class ClusterRebuildCompletionState {
     return result_;
   }
 
-  celer::Task<absl::Status> Await() const {
-    celer::Worker* worker = celer::ThisWorker().self_;
+  bycorf::Task<absl::Status> Await() const {
+    bycorf::Worker* worker = bycorf::ThisWorker().self_;
     if (worker == nullptr) {
       co_return absl::FailedPreconditionError(
-          "cluster rebuild completion requires a Celer worker");
+          "cluster rebuild completion requires a Bycorf worker");
     }
     for (;;) {
       if (std::optional<absl::Status> terminal = result();
@@ -98,7 +98,7 @@ class ClusterRebuildCompletionState {
       // cancellation-safe (no borrowed coroutine handle remains registered)
       // and there is at most one active target population per process.
       absl::Status waited =
-          co_await celer::SleepFor(*worker, std::chrono::milliseconds(10));
+          co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(10));
       if (!waited.ok()) co_return waited;
     }
   }
@@ -122,18 +122,18 @@ class ClusterPromotionPrepareCompletionState {
     return result_;
   }
 
-  celer::Task<Result> Await() const {
-    celer::Worker* worker = celer::ThisWorker().self_;
+  bycorf::Task<Result> Await() const {
+    bycorf::Worker* worker = bycorf::ThisWorker().self_;
     if (worker == nullptr) {
       co_return absl::FailedPreconditionError(
-          "cluster promotion completion requires a Celer worker");
+          "cluster promotion completion requires a Bycorf worker");
     }
     for (;;) {
       if (std::optional<Result> terminal = result(); terminal.has_value()) {
         co_return *terminal;
       }
       absl::Status waited =
-          co_await celer::SleepFor(*worker, std::chrono::milliseconds(10));
+          co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(10));
       if (!waited.ok()) co_return waited;
     }
   }
@@ -147,9 +147,9 @@ class ClusterPromotionPrepareCompletionState {
 
 namespace {
 
-using celer::Connection;
-using celer::Task;
-using celer::TcpStream;
+using bycorf::Connection;
+using bycorf::Task;
+using bycorf::TcpStream;
 using storage::PartitionFullSyncBatch;
 using storage::PartitionReplicationStart;
 using storage::PartitionSnapshotBatch;
@@ -221,8 +221,8 @@ Task<absl::Status> WaitAtSourceAdmissionFaultBarrier(
           absl::StrCat("could not observe source admission fault barrier: ",
                        std::strerror(errno)));
     }
-    absl::Status waited = co_await celer::SleepFor(
-        *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+    absl::Status waited = co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
     if (!waited.ok()) co_return waited;
   }
 }
@@ -1131,9 +1131,9 @@ class RedisRdbStreamQueue
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       auto context = std::make_unique<std::shared_ptr<RedisRdbStreamQueue>>(
           shared_from_this());
-      celer::PostNotification(
-          celer::ThisWorker().cross_core_, worker,
-          celer::RemoteNotification{
+      bycorf::PostNotification(
+          bycorf::ThisWorker().cross_core_, worker,
+          bycorf::RemoteNotification{
               .context_ = context.release(),
               .value_ = worker,
               .run_fn_ =
@@ -1178,7 +1178,7 @@ class RedisRdbStreamQueue
   }
 
   void SpawnWorker(unsigned worker_id) {
-    celer::ThisWorker().self_->SpawnBackground(
+    bycorf::ThisWorker().self_->SpawnBackground(
         RunOwned(shared_from_this(), worker_id));
   }
 
@@ -1227,8 +1227,8 @@ class RedisRdbStreamQueue
       while (!TryPush(&fragment, owner)) {
         if (aborted_.load(std::memory_order_acquire))
           co_return absl::CancelledError("Redis RDB export cancelled");
-        auto status = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                               std::chrono::milliseconds(1));
+        auto status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                std::chrono::milliseconds(1));
         if (!status.ok()) co_return status;
       }
       bytes.remove_prefix(piece.size());
@@ -1292,8 +1292,8 @@ class RedisRdbStreamQueue
               status = absl::CancelledError("Redis RDB export cancelled");
               break;
             }
-            status = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                              std::chrono::milliseconds(1));
+            status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                               std::chrono::milliseconds(1));
             if (!status.ok()) break;
           }
           if (!status.ok()) break;
@@ -1323,7 +1323,7 @@ class RedisRdbStreamQueue
         if (!status.ok() || batch->done_) break;
         if (++reads_since_yield == 64) {
           reads_since_yield = 0;
-          co_await celer::Yield(*celer::ThisWorker().self_);
+          co_await bycorf::Yield(*bycorf::ThisWorker().self_);
         }
       }
     } catch (const std::bad_alloc&) {
@@ -1589,7 +1589,7 @@ Task<absl::Status> FillRedisExportHeads(storage::StorageEngine* storage,
                                         RedisExportBacklogState* state) {
   for (unsigned worker = 0; worker < state->heads_.size(); ++worker) {
     if (state->heads_[worker].has_value()) continue;
-    auto event = co_await celer::SubmitTaskTo(
+    auto event = co_await bycorf::SubmitTaskTo(
         worker, [storage, worker, cursor = state->cursors_[worker]] {
           return ReadLocalRedisExportEvent(storage, worker, cursor);
         });
@@ -1606,7 +1606,7 @@ Task<absl::Status> AdvanceRedisExportCursor(
     storage::StorageEngine* storage, bool backpressure, unsigned worker,
     std::uint64_t session_id, storage::ReplicationLogCursor cursor) {
   if (!backpressure) co_return absl::OkStatus();
-  co_return co_await celer::SubmitTo(worker, [storage, session_id, cursor] {
+  co_return co_await bycorf::SubmitTo(worker, [storage, session_id, cursor] {
     return storage->RetainReplicationLog(session_id, cursor.lsn_);
   });
 }
@@ -1795,8 +1795,8 @@ Task<absl::Status> PingRedisExportBacklog(TcpStream& stream,
 }
 
 Task<absl::Status> SleepRedisExportBacklog(RedisExportBacklogState* state) {
-  absl::Status status = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                                 std::chrono::milliseconds(1));
+  absl::Status status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                                  std::chrono::milliseconds(1));
   if (status.ok()) state->phase_ = RedisExportBacklogState::Phase::kFill;
   co_return status;
 }
@@ -2019,7 +2019,8 @@ absl::Status ConfigureConnectedFd(int fd) {
 
 Task<absl::StatusOr<TcpStream>> ConnectTcp(
     std::string_view host, std::uint16_t port,
-    const std::shared_ptr<celer::TlsContext>& tls_context, SocketSet* sockets) {
+    const std::shared_ptr<bycorf::TlsContext>& tls_context,
+    SocketSet* sockets) {
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -2103,11 +2104,11 @@ Task<absl::StatusOr<TcpStream>> ConnectTcp(
     co_return absl::UnavailableError("replication connect failed");
   }
   Connection connection;
-  connection.worker_ = celer::ThisWorker().self_;
+  connection.worker_ = bycorf::ThisWorker().self_;
   connection.file_.fd_ = connected_fd;
   connection.closed_ = false;
   Connection* registered =
-      celer::ThisWorker().self_->AddConnection(std::move(connection));
+      bycorf::ThisWorker().self_->AddConnection(std::move(connection));
   if (registered == nullptr) {
     if (sockets != nullptr) sockets->Remove(connected_fd);
     ::close(connected_fd);
@@ -2335,7 +2336,7 @@ absl::StatusOr<std::vector<std::uint64_t>> DecodeAppliedVector(
 // worker without polling or blocking a runtime thread.
 class ReplicaCompletionLatch {
   struct Waiter {
-    celer::Worker* worker_ = nullptr;
+    bycorf::Worker* worker_ = nullptr;
     std::coroutine_handle<> handle_{};
     Waiter* next_ = nullptr;
   };
@@ -2343,7 +2344,7 @@ class ReplicaCompletionLatch {
  public:
   class Awaiter {
    public:
-    Awaiter(ReplicaCompletionLatch* latch, celer::Worker* worker) noexcept
+    Awaiter(ReplicaCompletionLatch* latch, bycorf::Worker* worker) noexcept
         : latch_(latch) {
       waiter_.worker_ = worker;
     }
@@ -2364,7 +2365,7 @@ class ReplicaCompletionLatch {
     Waiter waiter_;
   };
 
-  Awaiter Wait(celer::Worker& worker) noexcept {
+  Awaiter Wait(bycorf::Worker& worker) noexcept {
     return Awaiter(this, &worker);
   }
 
@@ -2391,16 +2392,16 @@ class ReplicaCompletionLatch {
     waiters_tail_ = nullptr;
     Unlock();
 
-    const celer::CurrentWorker& current = celer::ThisWorker();
+    const bycorf::CurrentWorker& current = bycorf::ThisWorker();
     while (wake != nullptr) {
       Waiter* waiter = wake;
       wake = wake->next_;
       if (waiter->worker_->id() == current.id_) {
         waiter->worker_->Enqueue(waiter->handle_);
       } else {
-        celer::PostNotification(
+        bycorf::PostNotification(
             current.cross_core_, waiter->worker_->id(),
-            celer::RemoteNotification{
+            bycorf::RemoteNotification{
                 .context_ = waiter->worker_,
                 .value_ =
                     static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(
@@ -2414,7 +2415,7 @@ class ReplicaCompletionLatch {
 
  private:
   static void ResumeRemote(void* context, std::uint64_t value) noexcept {
-    static_cast<celer::Worker*>(context)->Enqueue(
+    static_cast<bycorf::Worker*>(context)->Enqueue(
         std::coroutine_handle<>::from_address(
             reinterpret_cast<void*>(static_cast<std::uintptr_t>(value))));
   }
@@ -2506,7 +2507,7 @@ struct ReplicaControlArrival {
   bool applying_ = false;
   absl::Status status_ =
       absl::UnknownError("replicated control barrier has not completed");
-  celer::CoroutineBarrier completion_;
+  bycorf::CoroutineBarrier completion_;
 };
 
 struct ReplicaTransactionOwner {
@@ -2643,10 +2644,10 @@ struct ReplicaSession {
   // No flow may consume data until every KLFLOW response selected the same
   // session mode. FULL then has a second barrier: flow zero drains old client
   // work and maintenance before any flow can issue a destructive reset.
-  std::unique_ptr<celer::CoroutineBarrier> flow_modes_selected_;
-  std::unique_ptr<celer::CoroutineBarrier> fullsync_begin_complete_;
-  std::unique_ptr<celer::CoroutineBarrier> fullsync_cut_;
-  std::unique_ptr<celer::CoroutineBarrier> promotion_complete_;
+  std::unique_ptr<bycorf::CoroutineBarrier> flow_modes_selected_;
+  std::unique_ptr<bycorf::CoroutineBarrier> fullsync_begin_complete_;
+  std::unique_ptr<bycorf::CoroutineBarrier> fullsync_cut_;
+  std::unique_ptr<bycorf::CoroutineBarrier> promotion_complete_;
   // Flow coroutines are detached onto their owner workers. Track their whole
   // lifetime, including connect/handshake and storage apply, so a failed
   // session cannot start a replacement while old flows are still mutating
@@ -3089,8 +3090,8 @@ struct MasterSession {
     return all_flows_resume_possible_;
   }
 
-  celer::CoroutineBarrier::Awaiter WaitSnapshotReady() {
-    return snapshot_ready_.Wait(*celer::ThisWorker().self_);
+  bycorf::CoroutineBarrier::Awaiter WaitSnapshotReady() {
+    return snapshot_ready_.Wait(*bycorf::ThisWorker().self_);
   }
 
   void MarkSnapshotScanComplete() {
@@ -3102,16 +3103,16 @@ struct MasterSession {
            flows_.size();
   }
 
-  celer::CoroutineBarrier::Awaiter WaitSnapshotGateClosed() {
-    return snapshot_gate_closed_.Wait(*celer::ThisWorker().self_);
+  bycorf::CoroutineBarrier::Awaiter WaitSnapshotGateClosed() {
+    return snapshot_gate_closed_.Wait(*bycorf::ThisWorker().self_);
   }
 
-  celer::CoroutineBarrier::Awaiter WaitSnapshotFenced() {
-    return snapshot_fenced_.Wait(*celer::ThisWorker().self_);
+  bycorf::CoroutineBarrier::Awaiter WaitSnapshotFenced() {
+    return snapshot_fenced_.Wait(*bycorf::ThisWorker().self_);
   }
 
-  celer::CoroutineBarrier::Awaiter WaitSnapshotCaptureStopped() {
-    return snapshot_capture_stopped_.Wait(*celer::ThisWorker().self_);
+  bycorf::CoroutineBarrier::Awaiter WaitSnapshotCaptureStopped() {
+    return snapshot_capture_stopped_.Wait(*bycorf::ThisWorker().self_);
   }
 
   void AbortSnapshotCut(const absl::Status& status) {
@@ -3338,10 +3339,10 @@ struct MasterSession {
   std::vector<std::int8_t> flow_resume_possible_;
   std::size_t flow_modes_registered_ = 0;
   bool all_flows_resume_possible_ = true;
-  celer::CoroutineBarrier snapshot_ready_;
-  celer::CoroutineBarrier snapshot_gate_closed_;
-  celer::CoroutineBarrier snapshot_fenced_;
-  celer::CoroutineBarrier snapshot_capture_stopped_;
+  bycorf::CoroutineBarrier snapshot_ready_;
+  bycorf::CoroutineBarrier snapshot_gate_closed_;
+  bycorf::CoroutineBarrier snapshot_fenced_;
+  bycorf::CoroutineBarrier snapshot_capture_stopped_;
   std::atomic<unsigned> snapshot_scans_complete_{0};
   std::atomic<unsigned> connected_flows_{0};
   // Set only by the owning KLPSYNC coroutine after it has removed the session
@@ -3474,7 +3475,7 @@ class ReplicationManager::ReplicationGroup {
     PublishUpstreamSnapshot();
   }
 
-  void StorageReady(celer::Worker& worker) {
+  void StorageReady(bycorf::Worker& worker) {
     ready_workers_.fetch_add(1, std::memory_order_acq_rel);
     if (worker.id() == 0 && !ready_waiter_started_) {
       ready_waiter_started_ = true;
@@ -3486,8 +3487,8 @@ class ReplicationManager::ReplicationGroup {
   StartClusterRebuildDirective(ReplicaOfConfig upstream,
                                RebuildDirective directive,
                                PopulationManifest manifest) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, upstream = std::move(upstream),
               directive = std::move(directive),
               manifest = std::move(manifest)]() mutable {
@@ -3521,8 +3522,8 @@ class ReplicationManager::ReplicationGroup {
         teardown_running = replica_session_teardown_running_;
       }
       if (!teardown_running) break;
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     if (cluster_control_stopping_) {
@@ -3685,8 +3686,8 @@ class ReplicationManager::ReplicationGroup {
       // separately joinable task. Cancellation closes that socket; wait until
       // it observes the moved session and exits before starting its successor.
       while (coordinator_started_) {
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) {
           const std::string reason = absl::StrCat(
               "superseded replication coordinator could not be joined: ",
@@ -3764,8 +3765,8 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::StatusOr<std::shared_ptr<detail::ClusterRebuildCompletionState>>>
   StartEmptyPopulationInitialization(RebuildIdentity identity,
                                      PopulationManifest manifest) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, identity = std::move(identity),
               manifest = std::move(manifest)]() mutable {
             return StartEmptyPopulationInitialization(std::move(identity),
@@ -3789,8 +3790,8 @@ class ReplicationManager::ReplicationGroup {
           "empty population directive does not match its manifest");
     }
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       if (identity.target_history_id_ != history_id_) {
         co_return absl::FailedPreconditionError(
             "empty population directive uses stale target history");
@@ -3884,7 +3885,8 @@ class ReplicationManager::ReplicationGroup {
       LatchReplicationFailure(reason);
       co_return absl::AbortedError(reason);
     }
-    celer::ThisWorker().self_->Spawn(RunEmptyPopulationInitialization(context));
+    bycorf::ThisWorker().self_->Spawn(
+        RunEmptyPopulationInitialization(context));
     co_return context->completion_;
   }
 
@@ -4005,8 +4007,8 @@ class ReplicationManager::ReplicationGroup {
           cluster_failover_action_->prepare_directive_.has_value() &&
           *cluster_failover_action_->prepare_directive_ == context->directive_;
       if (!exact_action_current || context->cancellation_requested_) break;
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     co_return true;
@@ -4077,7 +4079,7 @@ class ReplicationManager::ReplicationGroup {
                !cancellation_requested()) {
           constexpr auto kSlice = std::chrono::milliseconds(1);
           absl::Status stalled =
-              co_await celer::SleepFor(*celer::ThisWorker().self_, kSlice);
+              co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, kSlice);
           if (!stalled.ok()) co_return fail_stop(stalled, "fault stall");
           remaining -= kSlice;
         }
@@ -4096,8 +4098,8 @@ class ReplicationManager::ReplicationGroup {
       }
     }
     while (coordinator_started_) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return fail_stop(waited, "coordinator join");
     }
     // Admission already detached the old target session. Even a cancellation
@@ -4107,8 +4109,8 @@ class ReplicationManager::ReplicationGroup {
 
     while (!CloseAllCommandDbGates()) {
       if (cancellation_requested()) co_return finish_cancelled();
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return fail_stop(waited, "command drain");
     }
     struct CommandGateGuard {
@@ -4117,8 +4119,8 @@ class ReplicationManager::ReplicationGroup {
     if (cancellation_requested()) co_return finish_cancelled();
     while (CommandDbOperationsActive()) {
       if (cancellation_requested()) co_return finish_cancelled();
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return fail_stop(waited, "command drain");
     }
     auto catalog_guard = co_await AcquireFunctionCatalogOperation();
@@ -4199,8 +4201,8 @@ class ReplicationManager::ReplicationGroup {
         co_return fail_stop(barrier.status(), "durability fault barrier");
       }
       if (!*barrier) {
-        absl::Status stalled = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(200));
+        absl::Status stalled = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(200));
         if (!stalled.ok()) {
           co_return fail_stop(stalled, "durability fault stall");
         }
@@ -4243,8 +4245,8 @@ class ReplicationManager::ReplicationGroup {
       std::shared_ptr<detail::ClusterPromotionPrepareCompletionState>>>
   StartClusterPromotionPrepareDirective(
       ClusterPromotionPrepareDirective directive) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, directive = std::move(directive)]() mutable {
             return StartClusterPromotionPrepareDirective(std::move(directive));
           });
@@ -4367,7 +4369,7 @@ class ReplicationManager::ReplicationGroup {
     storage_->SetReplicaLoading(true);
     storage_->SetExpirationAuthority(false);
     if (session != nullptr) session->Cancel();
-    celer::ThisWorker().self_->Spawn(RunClusterPromotionPrepare(
+    bycorf::ThisWorker().self_->Spawn(RunClusterPromotionPrepare(
         context, population, std::move(frontier), std::move(session),
         /*native_population=*/false));
     co_return context->completion_;
@@ -4429,7 +4431,7 @@ class ReplicationManager::ReplicationGroup {
     StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
     storage_->SetReplicaLoading(true);
     storage_->SetExpirationAuthority(false);
-    celer::ThisWorker().self_->Spawn(RunClusterPromotionPrepare(
+    bycorf::ThisWorker().self_->Spawn(RunClusterPromotionPrepare(
         context, std::move(population), nullptr, nullptr,
         /*native_population=*/true));
     co_return context->completion_;
@@ -4535,8 +4537,8 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> ReconcileClusterSourcePause(
       std::optional<DesiredClusterSourcePause> desired) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, desired = std::move(desired)]() mutable {
             return ReconcileClusterSourcePause(std::move(desired));
           });
@@ -4600,8 +4602,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<ClusterSourcePauseStatus> cluster_source_pause_status() const {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this] { return cluster_source_pause_status(); });
     }
     AssertStateOwner();
@@ -4764,7 +4766,7 @@ class ReplicationManager::ReplicationGroup {
       }
       const auto wait = std::min(remaining, kSlice);
       absl::Status waited =
-          co_await celer::SleepFor(*celer::ThisWorker().self_, wait);
+          co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, wait);
       if (!waited.ok()) co_return waited;
       remaining -= wait;
     }
@@ -4961,8 +4963,8 @@ class ReplicationManager::ReplicationGroup {
       std::optional<ClusterPromotionPrepareCompletion::Result> result;
       while (!(result = (*started)->result()).has_value()) {
         (void)watchdog_expired();
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(10));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(10));
         if (!waited.ok()) {
           finish();
           co_return waited;
@@ -5049,8 +5051,8 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> ReconcileClusterFailoverAction(
       std::optional<DesiredClusterFailoverAction> desired,
       std::optional<ClusterFailoverActionId> pending_activation_action_id) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, desired = std::move(desired),
               pending_activation_action_id]() mutable {
             return ReconcileClusterFailoverAction(std::move(desired),
@@ -5114,7 +5116,7 @@ class ReplicationManager::ReplicationGroup {
             ClusterFailoverActionState::kWaitingForPopulation;
         cluster_failover_action_->runner_started_ = true;
         cluster_failover_action_->runner_finished_ = false;
-        celer::ThisWorker().self_->Spawn(
+        bycorf::ThisWorker().self_->Spawn(
             RunClusterFailoverAction(cluster_failover_action_));
       }
       co_return absl::OkStatus();
@@ -5131,8 +5133,8 @@ class ReplicationManager::ReplicationGroup {
       cluster_failover_action_.reset();
       RequestFailoverPromotionCancellation(previous);
       while (!previous->runner_finished_) {
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) co_return waited;
       }
       const bool retain_for_activation =
@@ -5216,7 +5218,7 @@ class ReplicationManager::ReplicationGroup {
             ClusterFailoverActionState::kWaitingForPopulation;
         cluster_failover_action_->runner_started_ = true;
         cluster_failover_action_->runner_finished_ = false;
-        celer::ThisWorker().self_->Spawn(
+        bycorf::ThisWorker().self_->Spawn(
             RunClusterFailoverAction(cluster_failover_action_));
       }
     }
@@ -5224,8 +5226,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<ClusterFailoverActionStatus> cluster_failover_action_status() const {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this] { return cluster_failover_action_status(); });
     }
     AssertStateOwner();
@@ -5242,8 +5244,8 @@ class ReplicationManager::ReplicationGroup {
   Task<std::optional<ClusterFailoverPreparedContext>>
   FindClusterFailoverPreparedContext(
       const ClusterFailoverActionId& action_id) const {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(0, [this, action_id] {
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(0, [this, action_id] {
         return FindClusterFailoverPreparedContext(action_id);
       });
     }
@@ -5295,8 +5297,8 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> ActivateClusterPreparedPromotion(
       ClusterFailoverActivation activation) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, activation = std::move(activation)]() mutable {
             return ActivateClusterPreparedPromotion(std::move(activation));
           });
@@ -5394,8 +5396,8 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> EnableClusterExpirationAuthorityUntil(
       std::chrono::nanoseconds deadline_since_boot) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(0, [this, deadline_since_boot] {
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(0, [this, deadline_since_boot] {
         return EnableClusterExpirationAuthorityUntil(deadline_since_boot);
       });
     }
@@ -5418,8 +5420,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> RevokeClusterExpirationAuthority() {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this] { return RevokeClusterExpirationAuthority(); });
     }
     if (!cluster_enabled_ || cluster_group_ == nullptr) {
@@ -5427,8 +5429,8 @@ class ReplicationManager::ReplicationGroup {
           "expiration revocation requires Meta-managed population mode");
     }
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       // The lease gate and native POPULATION admission share this lock. Once
       // this critical section completes, no new session can publish;
       // already-published sessions remain owned by their current FDS
@@ -5597,8 +5599,8 @@ class ReplicationManager::ReplicationGroup {
       }
     }
     while (coordinator_started_) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     co_return absl::OkStatus();
@@ -5698,8 +5700,8 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> ReconcileClusterFollowOwner(
       std::optional<DesiredClusterUpstream> desired) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, desired = std::move(desired)]() mutable {
             return ReconcileClusterFollowOwner(std::move(desired));
           });
@@ -5822,8 +5824,8 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> RetireClusterPopulation(
       std::optional<DesiredClusterPopulation> desired, bool preserve_any_ready,
       bool preserve_current_follow_attempt, std::string_view reason) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, desired = std::move(desired), preserve_any_ready,
               preserve_current_follow_attempt,
               reason = std::string(reason)]() mutable {
@@ -5846,8 +5848,8 @@ class ReplicationManager::ReplicationGroup {
         teardown_running = replica_session_teardown_running_;
       }
       if (!teardown_running) break;
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
 
@@ -5866,8 +5868,8 @@ class ReplicationManager::ReplicationGroup {
               !cluster_promotion_prepare_->completion_->result().has_value();
         }
         if (!promotion_running) break;
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) co_return waited;
       }
     }
@@ -6016,8 +6018,8 @@ class ReplicationManager::ReplicationGroup {
       // coordinator observes the reconfiguration bit, aborts any known
       // candidate root, and exits before this owner retires the proof.
       while (coordinator_started_) {
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) co_return waited;
       }
     }
@@ -6033,8 +6035,8 @@ class ReplicationManager::ReplicationGroup {
     }
 
     while (coordinator_started_) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         const std::string failure =
             absl::StrCat("cluster population coordinator could not be joined: ",
@@ -6078,8 +6080,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> CancelClusterRebuildForShutdown() {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this]() { return CancelClusterRebuildForShutdown(); });
     }
     if (!cluster_enabled_ || cluster_group_ == nullptr) {
@@ -6119,8 +6121,8 @@ class ReplicationManager::ReplicationGroup {
     activated_failover_activation_.reset();
     activated_failover_prepared_context_.reset();
     while (action != nullptr && !action->runner_finished_) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
 
@@ -6142,8 +6144,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> QuiesceForShutdown() {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this]() { return QuiesceForShutdown(); });
     }
     RequestShutdown();
@@ -6201,8 +6203,8 @@ class ReplicationManager::ReplicationGroup {
         running = running || source->coordinator_started_;
       }
       if (!running) break;
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         if (result.ok()) result = waited;
         break;
@@ -6230,8 +6232,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<ClusterPopulationStatus> cluster_population_status() const {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this] { return cluster_population_status(); });
     }
     ClusterPopulationStatus result;
@@ -6279,8 +6281,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> AuthorizeClusterRebuildSource(RebuildDirective directive) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, directive = std::move(directive)]() mutable {
             return AuthorizeClusterRebuildSource(std::move(directive));
           });
@@ -6309,8 +6311,8 @@ class ReplicationManager::ReplicationGroup {
     for (;;) {
       detail::SourceAuthorizationAction action;
       {
-        co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-        celer::CrossWorkerMutex::Guard master_lock(&master_mutex_);
+        co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+        bycorf::CrossWorkerMutex::Guard master_lock(&master_mutex_);
         if (identity.source_history_id_ != history_id_) {
           co_return absl::FailedPreconditionError(
               "cluster source authorization uses stale source history");
@@ -6374,8 +6376,8 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> EnableClusterRebuildSourceAdmissionUntil(
       std::chrono::nanoseconds deadline_since_boot) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(0, [this, deadline_since_boot] {
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(0, [this, deadline_since_boot] {
         return EnableClusterRebuildSourceAdmissionUntil(deadline_since_boot);
       });
     }
@@ -6383,8 +6385,8 @@ class ReplicationManager::ReplicationGroup {
       co_return absl::FailedPreconditionError(
           "cluster source admission requires Meta-managed population mode");
     }
-    co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-    celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+    co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+    bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
     AssertStateOwner();
     if (cluster_control_stopping_ ||
         cluster_source_revocations_in_flight_ != 0 ||
@@ -6434,8 +6436,8 @@ class ReplicationManager::ReplicationGroup {
       SourceAuthorizationRetirementMode mode,
       bool preserve_current_population_exports,
       std::size_t expected_authorization_replays = 0) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, mode, preserve_current_population_exports,
               expected_authorization_replays] {
             return RetireClusterRebuildSourceAuthorizations(
@@ -6459,8 +6461,8 @@ class ReplicationManager::ReplicationGroup {
     } revocation_guard{&cluster_source_revocations_in_flight_};
     std::vector<std::shared_ptr<MasterSession>> sessions;
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       {
         AssertStateOwner();
         ++cluster_source_revocations_in_flight_;
@@ -6529,8 +6531,8 @@ class ReplicationManager::ReplicationGroup {
         std::any_of(sessions.begin(), sessions.end(), [](const auto& session) {
           return session->control_active() || session->connected_flows() != 0;
         })) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
       if (std::chrono::steady_clock::now() >= next_warning) {
         spdlog::warn(
@@ -6541,8 +6543,8 @@ class ReplicationManager::ReplicationGroup {
       }
     }
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       // Finalization normally creates reconnect leases for cleanly
       // disconnected online sessions. Authority revocation is stronger: no
       // session retired by this transition may preserve such a lease.
@@ -6594,7 +6596,7 @@ class ReplicationManager::ReplicationGroup {
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       const std::size_t flow_capacity = BacklogCapacityForFlow(
           worker, backlog_size_bytes_.load(std::memory_order_acquire));
-      absl::Status enabled = co_await celer::SubmitTaskTo(
+      absl::Status enabled = co_await bycorf::SubmitTaskTo(
           worker,
           [this, child_log_epoch, flow_capacity]() -> Task<absl::Status> {
             co_return co_await storage_->EnableReplicationLog(child_log_epoch,
@@ -6605,8 +6607,8 @@ class ReplicationManager::ReplicationGroup {
 
     std::string child_history;
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       child_history = history_id_;
     }
     co_return ClusterPromotionPrepared{
@@ -6650,8 +6652,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> SetUpstream(std::optional<ReplicaOfConfig> upstream) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, upstream = std::move(upstream)]() mutable {
             return SetUpstream(std::move(upstream));
           });
@@ -6704,8 +6706,8 @@ class ReplicationManager::ReplicationGroup {
         if (!teardown_running) replica_reconfiguration_running_ = true;
       }
       if (!teardown_running) break;
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     struct ReconfigurationGuard {
@@ -6784,16 +6786,16 @@ class ReplicationManager::ReplicationGroup {
     }
 
     while (!CloseAllCommandDbGates()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     struct RoleGateGuard {
       ~RoleGateGuard() { OpenAllCommandDbGates(); }
     } role_gate;
     while (CommandDbOperationsActive()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
 
@@ -7027,8 +7029,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> AddUpstream(ReplicaOfConfig upstream) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, upstream = std::move(upstream)]() mutable {
             return AddUpstream(std::move(upstream));
           });
@@ -7099,8 +7101,8 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::StatusOr<std::optional<NativeReplicationWatermark>>>
   CaptureNativeReplicationWatermark() {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this]() { return CaptureNativeReplicationWatermark(); });
     }
 
@@ -7111,8 +7113,8 @@ class ReplicationManager::ReplicationGroup {
 
     std::string history_id;
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       history_id = history_id_;
     }
     std::vector<std::uint64_t> next_lsns(storage_->worker_count());
@@ -7122,10 +7124,10 @@ class ReplicationManager::ReplicationGroup {
       auto fence = [this]() { return storage_->FenceReplicationLog(); };
       absl::StatusOr<std::uint64_t> next{
           absl::UnknownError("replication-log fence was not dispatched")};
-      if (worker == celer::ThisWorker().id_) {
+      if (worker == bycorf::ThisWorker().id_) {
         next = co_await fence();
       } else {
-        next = co_await celer::SubmitTaskTo(worker, fence);
+        next = co_await bycorf::SubmitTaskTo(worker, fence);
       }
       if (!next.ok()) {
         // With no native consumer the runtime backlog is intentionally
@@ -7140,8 +7142,8 @@ class ReplicationManager::ReplicationGroup {
       next_lsns[worker] = *next;
     }
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       if (history_id_ != history_id) {
         co_return std::optional<NativeReplicationWatermark>{};
       }
@@ -7153,8 +7155,8 @@ class ReplicationManager::ReplicationGroup {
 
   Task<std::optional<std::uint64_t>> CountAcknowledgedNativeReplicas(
       const NativeReplicationWatermark& watermark) const {
-    co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-    celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+    co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+    bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
     if (watermark.history_id_ != history_id_) co_return std::nullopt;
     std::uint64_t count = 0;
     for (const auto& [session_id, session] : master_sessions_) {
@@ -7165,16 +7167,16 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<std::uint64_t> CountOnlineNativeReplicas() const {
-    co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-    celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+    co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+    bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
     co_return static_cast<std::uint64_t>(std::count_if(
         master_sessions_.begin(), master_sessions_.end(),
         [](const auto& entry) { return entry.second->online(); }));
   }
 
   Task<ReplicationIdentity> identity() const {
-    co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-    celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+    co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+    bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
     co_return ReplicationIdentity{
         .local_node_id_ = node_id_,
         .boot_id_ = boot_id_,
@@ -7183,11 +7185,11 @@ class ReplicationManager::ReplicationGroup {
   }
 
   std::optional<ReplicaOfConfig> upstream() const {
-    if (celer::ThisWorker().self_ == nullptr) {
+    if (bycorf::ThisWorker().self_ == nullptr) {
       return published_upstream_.load(std::memory_order_acquire)->endpoint_;
     }
-    assert(celer::ThisWorker().id_ < storage_->worker_count());
-    auto& cached = upstream_caches_[celer::ThisWorker().id_];
+    assert(bycorf::ThisWorker().id_ < storage_->worker_count());
+    auto& cached = upstream_caches_[bycorf::ThisWorker().id_];
     if (cached.version_ != upstream_version_.load(std::memory_order_acquire)) {
       // Only a configuration change enters atomic shared_ptr's cold path.
       // Normal MOVED replies copy their worker's cached endpoint after one
@@ -7198,8 +7200,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<ReplicationStatus> status() const {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(0, [this] { return status(); });
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(0, [this] { return status(); });
     }
     ReplicationStatus result;
     result.role_ = role_.load(std::memory_order_acquire);
@@ -7279,8 +7281,8 @@ class ReplicationManager::ReplicationGroup {
       }
     }
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       result.local_history_id_ = history_id_;
       result.downstream_replicas_.reserve(master_sessions_.size());
       for (const auto& [session_id, session] : master_sessions_) {
@@ -7319,8 +7321,8 @@ class ReplicationManager::ReplicationGroup {
     // publish a role. These two stores cannot interleave with another role
     // transition because there is no suspension between them. Data-command
     // admission still reads only the packed atomic generation/open token.
-    assert(celer::ThisWorker().self_ == nullptr ||
-           celer::ThisWorker().id_ == 0);
+    assert(bycorf::ThisWorker().self_ == nullptr ||
+           bycorf::ThisWorker().id_ == 0);
     const ReplicationRole previous = role_.load(std::memory_order_relaxed);
     if (previous == next) {
       if (next == ReplicationRole::kOnline) {
@@ -7437,8 +7439,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> SetBacklogSizeBytes(std::size_t bytes) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, bytes]() { return SetBacklogSizeBytes(bytes); });
     }
     const std::size_t blocks = bytes / storage::kStorageBlockBytes;
@@ -7462,7 +7464,7 @@ class ReplicationManager::ReplicationGroup {
             co_await storage_->SetReplicationLogCapacity(flow_capacity);
       } else {
         configured =
-            co_await celer::SubmitTaskTo(worker, [this, flow_capacity]() {
+            co_await bycorf::SubmitTaskTo(worker, [this, flow_capacity]() {
               return storage_->SetReplicationLogCapacity(flow_capacity);
             });
       }
@@ -7477,8 +7479,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> SetBacklogBackpressure(bool enabled) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, enabled]() { return SetBacklogBackpressure(enabled); });
     }
     // Every log has a worker-local waiter. Apply the policy and wake each
@@ -7489,7 +7491,7 @@ class ReplicationManager::ReplicationGroup {
         configured =
             co_await storage_->SetReplicationBacklogBackpressure(enabled);
       } else {
-        configured = co_await celer::SubmitTaskTo(worker, [this, enabled]() {
+        configured = co_await bycorf::SubmitTaskTo(worker, [this, enabled]() {
           return storage_->SetReplicationBacklogBackpressure(enabled);
         });
       }
@@ -7504,8 +7506,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> SetPublishQueueBytesPerWorker(std::size_t bytes) {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this, bytes]() { return SetPublishQueueBytesPerWorker(bytes); });
     }
     if (bytes == 0) {
@@ -7518,7 +7520,7 @@ class ReplicationManager::ReplicationGroup {
         configured =
             co_await storage_->SetReplicationPublishQueueCapacity(bytes);
       } else {
-        configured = co_await celer::SubmitTaskTo(worker, [this, bytes]() {
+        configured = co_await bycorf::SubmitTaskTo(worker, [this, bytes]() {
           return storage_->SetReplicationPublishQueueCapacity(bytes);
         });
       }
@@ -7573,7 +7575,7 @@ class ReplicationManager::ReplicationGroup {
       // may share one local worker when the worker counts differ.
       owner = flow_id % storage_->worker_count();
     }
-    if (owner == celer::ThisWorker().id_) {
+    if (owner == bycorf::ThisWorker().id_) {
       RegisterClientConnection(client_id, stream.NativeFd(),
                                std::move(client_address), tls, true,
                                replication_session_id);
@@ -7585,7 +7587,7 @@ class ReplicationManager::ReplicationGroup {
 
     absl::Status paused = co_await stream.PauseRead();
     if (!paused.ok()) co_return paused;
-    std::shared_ptr<celer::TlsState> tls_state = stream.TakeTlsState();
+    std::shared_ptr<bycorf::TlsState> tls_state = stream.TakeTlsState();
     const int duplicate = ::fcntl(stream.NativeFd(), F_DUPFD_CLOEXEC, 0);
     if (duplicate < 0) {
       co_return absl::InternalError(
@@ -7601,27 +7603,27 @@ class ReplicationManager::ReplicationGroup {
     // Serve returns.  Returning lets RunSession close the original descriptor
     // safely; the duplicated descriptor has already transferred the byte
     // stream to the destination worker.
-    co_return co_await celer::SubmitTo(
+    co_return co_await bycorf::SubmitTo(
         owner, [this, duplicate, tls_state = std::move(tls_state),
                 args = std::move(args), client_id,
                 client_address = std::move(client_address), tls,
                 replication_session_id]() mutable {
           Connection connection;
-          connection.worker_ = celer::ThisWorker().self_;
+          connection.worker_ = bycorf::ThisWorker().self_;
           connection.file_.fd_ = duplicate;
           connection.closed_ = false;
           if (tls_state != nullptr) {
-            connection.recv_mode_ = celer::RecvMode::kOneShot;
+            connection.recv_mode_ = bycorf::RecvMode::kOneShot;
             connection.tls_state_ = std::move(tls_state);
           }
           Connection* registered =
-              celer::ThisWorker().self_->AddConnection(std::move(connection));
+              bycorf::ThisWorker().self_->AddConnection(std::move(connection));
           if (registered == nullptr) {
             ::close(duplicate);
             return absl::InternalError(
                 "failed to adopt replication connection");
           }
-          celer::ThisWorker().self_->Spawn(RunAdoptedConnection(
+          bycorf::ThisWorker().self_->Spawn(RunAdoptedConnection(
               registered, std::move(args), client_id, std::move(client_address),
               tls, replication_session_id));
           return absl::OkStatus();
@@ -7712,10 +7714,10 @@ class ReplicationManager::ReplicationGroup {
                 "node lost valid source state during PSYNC setup")
           : sent;
     }
-    if (celer::ThisWorker().id_ == 0) {
+    if (bycorf::ThisWorker().id_ == 0) {
       StartIdleReplicationHistoryMonitor();
     } else {
-      (void)co_await celer::SubmitTo(0, [this] {
+      (void)co_await bycorf::SubmitTo(0, [this] {
         StartIdleReplicationHistoryMonitor();
         return true;
       });
@@ -7738,7 +7740,7 @@ class ReplicationManager::ReplicationGroup {
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       const std::size_t flow_capacity = BacklogCapacityForFlow(
           worker, backlog_size_bytes_.load(std::memory_order_acquire));
-      status = co_await celer::SubmitTaskTo(
+      status = co_await bycorf::SubmitTaskTo(
           worker, [this, session_id, flow_capacity]() -> Task<absl::Status> {
             co_return co_await storage_->EnableReplicationLog(session_id,
                                                               flow_capacity);
@@ -7755,8 +7757,8 @@ class ReplicationManager::ReplicationGroup {
         co_return absl::CancelledError(
             "source role changed before Redis export snapshot admission");
       }
-      status = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                        std::chrono::milliseconds(1));
+      status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                         std::chrono::milliseconds(1));
       if (!status.ok()) co_return status;
     }
     bool gates_open = false;
@@ -7767,8 +7769,8 @@ class ReplicationManager::ReplicationGroup {
       }
     } gate_guard{&gates_open};
     while (CommandDbOperationsActive()) {
-      status = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                        std::chrono::milliseconds(1));
+      status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                         std::chrono::milliseconds(1));
       if (!status.ok()) co_return status;
     }
 
@@ -7779,7 +7781,7 @@ class ReplicationManager::ReplicationGroup {
         now > 0 ? static_cast<std::uint64_t>(now) : 1;
     unsigned snapshots_begun = 0;
     for (; snapshots_begun < storage_->worker_count(); ++snapshots_begun) {
-      status = co_await celer::SubmitTo(
+      status = co_await bycorf::SubmitTo(
           snapshots_begun, [this, session_id, snapshot_time_ms] {
             return storage_->BeginRdbSnapshot(session_id, snapshot_time_ms);
           });
@@ -7787,7 +7789,7 @@ class ReplicationManager::ReplicationGroup {
     }
     if (!status.ok()) {
       for (unsigned worker = 0; worker < snapshots_begun; ++worker) {
-        (void)co_await celer::SubmitTaskTo(worker, [this, session_id] {
+        (void)co_await bycorf::SubmitTaskTo(worker, [this, session_id] {
           return storage_->EndRdbSnapshot(session_id);
         });
       }
@@ -7797,7 +7799,7 @@ class ReplicationManager::ReplicationGroup {
     std::vector<storage::ReplicationLogCursor> cursors(
         storage_->worker_count());
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
-      auto fenced = co_await celer::SubmitTaskTo(
+      auto fenced = co_await bycorf::SubmitTaskTo(
           worker, [this]() { return storage_->FenceReplicationLog(); });
       if (!fenced.ok()) {
         status = fenced.status();
@@ -7806,7 +7808,7 @@ class ReplicationManager::ReplicationGroup {
       cursors[worker] =
           storage::ReplicationLogCursor{.lsn_ = *fenced, .fragment_index_ = 0};
       if (redis_export_backpressure_.load(std::memory_order_acquire)) {
-        status = co_await celer::SubmitTo(
+        status = co_await bycorf::SubmitTo(
             worker, [this, session_id, cursor = cursors[worker]] {
               return storage_->RetainReplicationLog(session_id, cursor.lsn_);
             });
@@ -7815,10 +7817,10 @@ class ReplicationManager::ReplicationGroup {
     }
     if (!status.ok()) {
       for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
-        (void)co_await celer::SubmitTaskTo(worker, [this, session_id] {
+        (void)co_await bycorf::SubmitTaskTo(worker, [this, session_id] {
           return storage_->EndRdbSnapshot(session_id);
         });
-        (void)co_await celer::SubmitTo(worker, [this, session_id] {
+        (void)co_await bycorf::SubmitTo(worker, [this, session_id] {
           storage_->ReleaseReplicationLogRetention(session_id);
           return true;
         });
@@ -7866,8 +7868,8 @@ class ReplicationManager::ReplicationGroup {
             status = rdb_queue->status();
             break;
           }
-          status = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
+          status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                             std::chrono::milliseconds(1));
         }
         if (status.ok() && rdb_queue->failed()) status = rdb_queue->status();
         if (status.ok()) {
@@ -7879,8 +7881,8 @@ class ReplicationManager::ReplicationGroup {
     }
     if (!status.ok() && !rdb_queue->done()) rdb_queue->Abort(status);
     while (!rdb_queue->done()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) break;
     }
     std::shared_ptr<RedisExportAckState> ack_state;
@@ -7888,7 +7890,7 @@ class ReplicationManager::ReplicationGroup {
       spdlog::info("Redis PSYNC export {} completed diskless RDB cut",
                    session_id);
       ack_state = std::make_shared<RedisExportAckState>();
-      celer::ThisWorker().self_->Spawn(
+      bycorf::ThisWorker().self_->Spawn(
           ConsumeRedisExportAcks(&stream, ack_state));
       auto backlog_state =
           std::make_shared<RedisExportBacklogState>(std::move(cursors));
@@ -7899,13 +7901,13 @@ class ReplicationManager::ReplicationGroup {
         !ack_state->done_.load(std::memory_order_acquire)) {
       (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
       while (!ack_state->done_.load(std::memory_order_acquire)) {
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) break;
       }
     }
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
-      (void)co_await celer::SubmitTo(worker, [this, session_id] {
+      (void)co_await bycorf::SubmitTo(worker, [this, session_id] {
         storage_->ReleaseReplicationLogRetention(session_id);
         return true;
       });
@@ -7925,8 +7927,8 @@ class ReplicationManager::ReplicationGroup {
 
  private:
   static void AssertStateOwner() noexcept {
-    assert(celer::ThisWorker().self_ != nullptr &&
-           celer::ThisWorker().id_ == 0);
+    assert(bycorf::ThisWorker().self_ != nullptr &&
+           bycorf::ThisWorker().id_ == 0);
   }
 
   void PublishUpstreamSnapshot() {
@@ -8019,16 +8021,16 @@ class ReplicationManager::ReplicationGroup {
     while (prepared.ok() && !CloseAllCommandDbGates()) {
       prepared = current_or_cancelled();
       if (!prepared.ok()) break;
-      prepared = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                          std::chrono::milliseconds(1));
+      prepared = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                           std::chrono::milliseconds(1));
     }
     const bool gates_closed = prepared.ok();
     if (gates_closed) {
       while (CommandDbOperationsActive()) {
         prepared = current_or_cancelled();
         if (!prepared.ok()) break;
-        prepared = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
+        prepared = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                             std::chrono::milliseconds(1));
         if (!prepared.ok()) break;
       }
     }
@@ -8080,7 +8082,7 @@ class ReplicationManager::ReplicationGroup {
       if (owner == 0) {
         reset = co_await storage_->ResetReplicaPartitions(session_id, resets);
       } else {
-        reset = co_await celer::SubmitTaskTo(
+        reset = co_await bycorf::SubmitTaskTo(
             owner, [this, session_id, resets = std::move(resets)]() mutable {
               return storage_->ResetReplicaPartitions(session_id, resets);
             });
@@ -8109,7 +8111,7 @@ class ReplicationManager::ReplicationGroup {
               session_id, partition.partition_id_,
               partition.replication_epoch_);
         } else {
-          handed_off = co_await celer::SubmitTaskTo(
+          handed_off = co_await bycorf::SubmitTaskTo(
               owner, [this, session_id, partition]() {
                 return storage_->HandoffReplicaPartition(
                     session_id, partition.partition_id_,
@@ -8172,7 +8174,7 @@ class ReplicationManager::ReplicationGroup {
     for (unsigned worker = 0; worker < worker_count; ++worker) {
       const std::size_t flow_capacity = BacklogCapacityForFlow(
           worker, backlog_size_bytes_.load(std::memory_order_acquire));
-      absl::Status enabled = co_await celer::SubmitTaskTo(
+      absl::Status enabled = co_await bycorf::SubmitTaskTo(
           worker,
           [this, child_log_epoch, flow_capacity]() -> Task<absl::Status> {
             co_return co_await storage_->EnableReplicationLog(child_log_epoch,
@@ -8338,8 +8340,8 @@ class ReplicationManager::ReplicationGroup {
         co_return absl::CancelledError(
             "replication startup stopped for process shutdown");
       }
-      absl::Status slept = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status slept = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!slept.ok()) co_return slept;
     }
     if (!replication_shutdown_requested_) StartCoordinator();
@@ -8347,7 +8349,7 @@ class ReplicationManager::ReplicationGroup {
   }
 
   void StartCoordinator() {
-    if (celer::ThisWorker().id_ != 0 || !StorageIsReady() ||
+    if (bycorf::ThisWorker().id_ != 0 || !StorageIsReady() ||
         replication_shutdown_requested_) {
       return;
     }
@@ -8362,7 +8364,7 @@ class ReplicationManager::ReplicationGroup {
     if (initial_protocol_probe_pending_) {
       if (coordinator_started_) return;
       coordinator_started_ = true;
-      celer::ThisWorker().self_->SpawnRoot(ProbeInitialUpstream());
+      bycorf::ThisWorker().self_->SpawnRoot(ProbeInitialUpstream());
       return;
     }
     if (redis_psync_.load(std::memory_order_acquire)) {
@@ -8386,7 +8388,7 @@ class ReplicationManager::ReplicationGroup {
       }
     }
     coordinator_started_ = true;
-    celer::ThisWorker().self_->Spawn(Coordinator());
+    bycorf::ThisWorker().self_->Spawn(Coordinator());
   }
 
   Task<absl::Status> ProbeInitialUpstream() {
@@ -8408,8 +8410,8 @@ class ReplicationManager::ReplicationGroup {
         spdlog::warn("replication protocol probe for {}:{} failed: {}",
                      upstream.host_, upstream.port_,
                      discovery.status().message());
-        absl::Status slept = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, kReconnectDelay);
+        absl::Status slept = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, kReconnectDelay);
         if (!slept.ok()) {
           coordinator_started_ = false;
           co_return slept;
@@ -8474,8 +8476,8 @@ class ReplicationManager::ReplicationGroup {
     absl::Status invalidated;
     {
       co_await redis_fullsync_mutex_.Lock();
-      celer::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
-                                         celer::ThisWorker().self_);
+      bycorf::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
+                                          bycorf::ThisWorker().self_);
       {
         AssertStateOwner();
         if (replication_shutdown_requested_ ||
@@ -8527,8 +8529,8 @@ class ReplicationManager::ReplicationGroup {
               "Redis full sync was cancelled before population activation");
         }
       }
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     co_return absl::OkStatus();
@@ -8567,7 +8569,7 @@ class ReplicationManager::ReplicationGroup {
     }
     redis_topology_monitor_started_ = true;
     const std::uint64_t epoch = role_epoch_.load(std::memory_order_acquire);
-    celer::ThisWorker().self_->SpawnRoot(RedisTopologyMonitor(epoch));
+    bycorf::ThisWorker().self_->SpawnRoot(RedisTopologyMonitor(epoch));
   }
 
   void FaultRedisTopology(std::string_view reason) {
@@ -8626,8 +8628,8 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> RedisTopologyMonitor(std::uint64_t role_epoch) {
     unsigned incompatible_observations = 0;
     while (true) {
-      absl::Status slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                                    kRedisTopologyPollInterval);
+      absl::Status slept = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, kRedisTopologyPollInterval);
       if (!slept.ok()) co_return slept;
       std::vector<ReplicaOfConfig> endpoints;
       {
@@ -8696,7 +8698,7 @@ class ReplicationManager::ReplicationGroup {
     source->coordinator_started_ = true;
     spdlog::info("starting Redis replication coordinator for {}:{}",
                  source->upstream_.host_, source->upstream_.port_);
-    celer::ThisWorker().self_->SpawnRoot(RedisCoordinator(source));
+    bycorf::ThisWorker().self_->SpawnRoot(RedisCoordinator(source));
   }
 
   Task<absl::Status> RedisCoordinator(std::shared_ptr<RedisSource> source) {
@@ -8773,8 +8775,8 @@ class ReplicationManager::ReplicationGroup {
       spdlog::warn("Redis replication connection to {}:{} ended: {}",
                    source->upstream_.host_, source->upstream_.port_,
                    connected.message());
-      absl::Status slept =
-          co_await celer::SleepFor(*celer::ThisWorker().self_, kReconnectDelay);
+      absl::Status slept = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, kReconnectDelay);
       if (!slept.ok()) {
         source->coordinator_started_ = false;
         co_return slept;
@@ -8823,7 +8825,7 @@ class ReplicationManager::ReplicationGroup {
     storage_->SetExpirationAuthority(false);
     StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
     if (cluster_enabled_) {
-      celer::ThisWorker().self_->Spawn(
+      bycorf::ThisWorker().self_->Spawn(
           RevokeClusterRebuildSourceAuthorizations());
     }
     spdlog::critical("replication failed-stopped until restart: {}",
@@ -9005,8 +9007,8 @@ class ReplicationManager::ReplicationGroup {
       StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
       spdlog::warn("replication connection to {}:{} ended: {}", upstream.host_,
                    upstream.port_, connected.message());
-      absl::Status slept =
-          co_await celer::SleepFor(*celer::ThisWorker().self_, kReconnectDelay);
+      absl::Status slept = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, kReconnectDelay);
       if (!slept.ok()) {
         coordinator_started_ = false;
         co_return slept;
@@ -9044,20 +9046,20 @@ class ReplicationManager::ReplicationGroup {
     reader->Rewind();
 
     co_await redis_fullsync_mutex_.Lock();
-    celer::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
-                                       celer::ThisWorker().self_);
+    bycorf::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
+                                        bycorf::ThisWorker().self_);
 
     while (!CloseAllCommandDbGates()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     struct CommandGateGuard {
       ~CommandGateGuard() { OpenAllCommandDbGates(); }
     } command_gate_guard;
     while (CommandDbOperationsActive()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     {
@@ -9197,19 +9199,19 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> ResetRedisSourceSlots(
       const std::shared_ptr<RedisSource>& source) {
     co_await redis_fullsync_mutex_.Lock();
-    celer::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
-                                       celer::ThisWorker().self_);
+    bycorf::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
+                                        bycorf::ThisWorker().self_);
     while (!CloseAllCommandDbGates()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     struct CommandGateGuard {
       ~CommandGateGuard() { OpenAllCommandDbGates(); }
     } reopen;
     while (CommandDbOperationsActive()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     {
@@ -9424,8 +9426,8 @@ class ReplicationManager::ReplicationGroup {
 
     {
       co_await redis_fullsync_mutex_.Lock();
-      celer::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
-                                         celer::ThisWorker().self_);
+      bycorf::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
+                                          bycorf::ThisWorker().self_);
       source->offset_.store(offset, std::memory_order_release);
       source->dataset_valid_ = true;
       bool population_complete = true;
@@ -9758,13 +9760,13 @@ class ReplicationManager::ReplicationGroup {
           std::make_unique<ReplicaTransactionOwner>());
     }
     session->fullsync_cut_ =
-        std::make_unique<celer::CoroutineBarrier>(source_workers);
+        std::make_unique<bycorf::CoroutineBarrier>(source_workers);
     session->promotion_complete_ =
-        std::make_unique<celer::CoroutineBarrier>(source_workers);
+        std::make_unique<bycorf::CoroutineBarrier>(source_workers);
     session->flow_modes_selected_ =
-        std::make_unique<celer::CoroutineBarrier>(source_workers);
+        std::make_unique<bycorf::CoroutineBarrier>(source_workers);
     session->fullsync_begin_complete_ =
-        std::make_unique<celer::CoroutineBarrier>(source_workers);
+        std::make_unique<bycorf::CoroutineBarrier>(source_workers);
     // Flow requests use one immutable control-handshake snapshot. A changed
     // layout never inherits an old prefix; it starts at the initial cursor and
     // the source selects FULL collectively.
@@ -9808,15 +9810,15 @@ class ReplicationManager::ReplicationGroup {
       const unsigned owner = flow_id % storage_->worker_count();
       auto start = [this, upstream, session, flow_id]() {
         session->active_flows_.fetch_add(1, std::memory_order_acq_rel);
-        celer::ThisWorker().self_->Spawn(
+        bycorf::ThisWorker().self_->Spawn(
             RunReplicaFlow(upstream, session, flow_id));
         return absl::OkStatus();
       };
       absl::Status started;
-      if (owner == celer::ThisWorker().id_) {
+      if (owner == bycorf::ThisWorker().id_) {
         started = start();
       } else {
-        started = co_await celer::SubmitTo(owner, start);
+        started = co_await bycorf::SubmitTo(owner, start);
       }
       if (!started.ok()) {
         session->sockets_.Remove(control_fd);
@@ -9908,10 +9910,10 @@ class ReplicationManager::ReplicationGroup {
         return absl::OkStatus();
       };
       absl::Status cancelled;
-      if (owner == celer::ThisWorker().id_) {
+      if (owner == bycorf::ThisWorker().id_) {
         cancelled = cancel_owner();
       } else {
-        cancelled = co_await celer::SubmitTo(owner, cancel_owner);
+        cancelled = co_await bycorf::SubmitTo(owner, cancel_owner);
       }
       if (!cancelled.ok()) {
         session->RequireFailStop(
@@ -9925,8 +9927,8 @@ class ReplicationManager::ReplicationGroup {
     while (session->active_flows_.load(std::memory_order_acquire) != 0 ||
            session->active_transaction_applies_.load(
                std::memory_order_acquire) != 0) {
-      absl::Status slept = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status slept = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!slept.ok()) {
         session->RequireFailStop(absl::StrCat(
             "replica cancellation could not join detached apply work: ",
@@ -9954,9 +9956,9 @@ class ReplicationManager::ReplicationGroup {
       return cluster_group_->ValidateResetAuthorization(
           context->authorization_);
     };
-    co_return celer::ThisWorker().id_ == 0
+    co_return bycorf::ThisWorker().id_ == 0
         ? validate()
-        : co_await celer::SubmitTo(0, std::move(validate));
+        : co_await bycorf::SubmitTo(0, std::move(validate));
   }
 
   Task<absl::Status> RecordClusterResetProof(
@@ -9972,9 +9974,9 @@ class ReplicationManager::ReplicationGroup {
       }
       return absl::OkStatus();
     };
-    co_return celer::ThisWorker().id_ == 0
+    co_return bycorf::ThisWorker().id_ == 0
         ? record()
-        : co_await celer::SubmitTo(0, std::move(record));
+        : co_await bycorf::SubmitTo(0, std::move(record));
   }
 
   Task<absl::Status> RecordClusterHandoffProof(
@@ -9987,16 +9989,16 @@ class ReplicationManager::ReplicationGroup {
           context->manifest_.logical_epochs()[partition_id],
           target_local_epoch);
     };
-    co_return celer::ThisWorker().id_ == 0
+    co_return bycorf::ThisWorker().id_ == 0
         ? record()
-        : co_await celer::SubmitTo(0, std::move(record));
+        : co_await bycorf::SubmitTo(0, std::move(record));
   }
 
   Task<absl::Status> PrepareReplicaFlowMode(
       const std::shared_ptr<ReplicaSession>& session, unsigned flow_id,
       bool fullsync) {
     absl::Status agreed = co_await session->flow_modes_selected_->Wait(
-        *celer::ThisWorker().self_);
+        *bycorf::ThisWorker().self_);
     if (!agreed.ok()) co_return agreed;
     if (!fullsync) co_return absl::OkStatus();
 
@@ -10041,8 +10043,8 @@ class ReplicationManager::ReplicationGroup {
               "replication session ended before full-sync admission closed");
           break;
         }
-        prepared = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
+        prepared = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                             std::chrono::milliseconds(1));
         if (!prepared.ok()) break;
       }
       const bool gates_closed = prepared.ok();
@@ -10053,8 +10055,8 @@ class ReplicationManager::ReplicationGroup {
                 "replication session ended while draining old commands");
             break;
           }
-          prepared = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                              std::chrono::milliseconds(1));
+          prepared = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                               std::chrono::milliseconds(1));
           if (!prepared.ok()) break;
         }
       }
@@ -10073,7 +10075,7 @@ class ReplicationManager::ReplicationGroup {
     }
 
     co_return co_await session->fullsync_begin_complete_->Wait(
-        *celer::ThisWorker().self_);
+        *bycorf::ThisWorker().self_);
   }
 
   Task<absl::Status> RunReplicaFlow(ReplicaOfConfig upstream,
@@ -10196,7 +10198,7 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> WaitForReplicaTransaction(
       const std::shared_ptr<ReplicaTransactionArrival>& arrival) {
     const storage::ReplicationTransactionResolution resolution =
-        co_await arrival->completion_.Wait(*celer::ThisWorker().self_);
+        co_await arrival->completion_.Wait(*bycorf::ThisWorker().self_);
     if (resolution == storage::ReplicationTransactionResolution::kDiscard &&
         arrival->status_.ok()) {
       co_return absl::CancelledError(
@@ -10336,7 +10338,7 @@ class ReplicationManager::ReplicationGroup {
   RegisterReplicaTransactionOnOwner(
       const std::shared_ptr<ReplicaSession>& session, unsigned owner,
       PreparedReplicaTransactionArrival prepared) {
-    assert(owner == celer::ThisWorker().id_);
+    assert(owner == bycorf::ThisWorker().id_);
     if (session->cancelled()) {
       return absl::CancelledError(
           "replication session ended before transaction arrival");
@@ -10391,7 +10393,7 @@ class ReplicationManager::ReplicationGroup {
     if (start_apply) {
       session->active_transaction_applies_.fetch_add(1,
                                                      std::memory_order_acq_rel);
-      celer::ThisWorker().self_->Spawn(
+      bycorf::ThisWorker().self_->Spawn(
           ApplyReadyReplicaTransaction(session, owner, arrival));
     }
     return arrival;
@@ -10416,7 +10418,7 @@ class ReplicationManager::ReplicationGroup {
       return RegisterReplicaTransactionOnOwner(session, owner,
                                                std::move(prepared));
     };
-    co_return co_await celer::SubmitTo(owner, std::move(register_on_owner));
+    co_return co_await bycorf::SubmitTo(owner, std::move(register_on_owner));
   }
 
   Task<absl::Status> ApplyReplicaControl(
@@ -10498,14 +10500,14 @@ class ReplicationManager::ReplicationGroup {
       }
       if (status.ok()) {
         status = session->applied_frontier_->AdvanceBatchAfterApply(
-            celer::ThisWorker().id_, frontier_updates);
+            bycorf::ThisWorker().id_, frontier_updates);
       }
       std::lock_guard lock(session->control_mutex_);
       arrival->status_ = std::move(status);
     }
 
     absl::Status completed =
-        co_await arrival->completion_.Wait(*celer::ThisWorker().self_);
+        co_await arrival->completion_.Wait(*bycorf::ThisWorker().self_);
     if (!completed.ok()) co_return completed;
 
     absl::Status result;
@@ -10533,12 +10535,12 @@ class ReplicationManager::ReplicationGroup {
   struct ReplicaOnlineApplyState {
     std::deque<ReplicaOnlineCommand> commands_;
     std::deque<ReplicaOnlineCompletion> completions_;
-    celer::AsyncNotification command_ready_;
-    celer::AsyncNotification capacity_ready_;
-    celer::AsyncNotification completion_ready_;
-    celer::AsyncNotification completion_capacity_ready_;
-    celer::AsyncNotification stage_done_ready_;
-    celer::AsyncNotification ack_done_ready_;
+    bycorf::AsyncNotification command_ready_;
+    bycorf::AsyncNotification capacity_ready_;
+    bycorf::AsyncNotification completion_ready_;
+    bycorf::AsyncNotification completion_capacity_ready_;
+    bycorf::AsyncNotification stage_done_ready_;
+    bycorf::AsyncNotification ack_done_ready_;
     absl::Status receiver_status_ =
         absl::UnknownError("replication flow receiver is running");
     absl::Status stage_status_ =
@@ -10595,7 +10597,7 @@ class ReplicationManager::ReplicationGroup {
 
       ReplicaOnlineCommand pending = std::move(state->commands_.front());
       state->commands_.pop_front();
-      state->capacity_ready_.NotifyAll(*celer::ThisWorker().self_);
+      state->capacity_ready_.NotifyAll(*bycorf::ThisWorker().self_);
       const bool transaction =
           !pending.command_.args_.empty() &&
           IsReplicationTransactionEnvelope(pending.command_.args_[0]);
@@ -10671,7 +10673,7 @@ class ReplicationManager::ReplicationGroup {
           .lsn_ = pending.lsn_,
           .transaction_ = std::move(transaction_arrival),
       });
-      state->completion_ready_.NotifyAll(*celer::ThisWorker().self_);
+      state->completion_ready_.NotifyAll(*bycorf::ThisWorker().self_);
     }
   }
 
@@ -10704,7 +10706,7 @@ class ReplicationManager::ReplicationGroup {
 
       ReplicaOnlineCompletion pending = std::move(state->completions_.front());
       state->completions_.pop_front();
-      state->completion_capacity_ready_.NotifyAll(*celer::ThisWorker().self_);
+      state->completion_capacity_ready_.NotifyAll(*bycorf::ThisWorker().self_);
       const bool transaction = pending.transaction_ != nullptr;
       absl::Status applied = absl::OkStatus();
       if (transaction) {
@@ -10737,8 +10739,8 @@ class ReplicationManager::ReplicationGroup {
     state->stage_status_ =
         co_await StageReplicaOnlineCommands(session, flow_id, state);
     state->stage_done_ = true;
-    state->stage_done_ready_.NotifyAll(*celer::ThisWorker().self_);
-    state->completion_ready_.NotifyAll(*celer::ThisWorker().self_);
+    state->stage_done_ready_.NotifyAll(*bycorf::ThisWorker().self_);
+    state->completion_ready_.NotifyAll(*bycorf::ThisWorker().self_);
     if (!state->stage_status_.ok()) {
       (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
     }
@@ -10751,8 +10753,8 @@ class ReplicationManager::ReplicationGroup {
     state->ack_status_ =
         co_await AckReplicaOnlineCommands(stream, session, flow_id, state);
     state->ack_done_ = true;
-    state->ack_done_ready_.NotifyAll(*celer::ThisWorker().self_);
-    state->completion_capacity_ready_.NotifyAll(*celer::ThisWorker().self_);
+    state->ack_done_ready_.NotifyAll(*bycorf::ThisWorker().self_);
+    state->completion_capacity_ready_.NotifyAll(*bycorf::ThisWorker().self_);
     if (!state->ack_status_.ok()) {
       (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
     }
@@ -10764,9 +10766,9 @@ class ReplicationManager::ReplicationGroup {
       unsigned flow_id, std::uint64_t first_expected_lsn,
       std::pair<DataFrameKind, std::string> first_frame) {
     auto state = std::make_shared<ReplicaOnlineApplyState>();
-    celer::ThisWorker().self_->Spawn(
+    bycorf::ThisWorker().self_->Spawn(
         TrackReplicaOnlineStage(stream, session, flow_id, state));
-    celer::ThisWorker().self_->Spawn(
+    bycorf::ThisWorker().self_->Spawn(
         TrackReplicaOnlineAcks(stream, session, flow_id, state));
 
     std::uint64_t staged_command_lsn = 0;
@@ -10869,7 +10871,7 @@ class ReplicationManager::ReplicationGroup {
           .lsn_ = lsn,
           .command_ = std::move(*command),
       });
-      state->command_ready_.NotifyAll(*celer::ThisWorker().self_);
+      state->command_ready_.NotifyAll(*bycorf::ThisWorker().self_);
       staged_command_lsn = 0;
       next_command_fragment = 0;
       staged_command.clear();
@@ -10883,7 +10885,7 @@ class ReplicationManager::ReplicationGroup {
       // of megabytes. Give the owner-local FIFO consumer a bounded scheduling
       // opportunity even when ingress never naturally suspends.
       if ((++received_commands % kFullSyncSchedulingItems) == 0) {
-        co_await celer::Yield(*celer::ThisWorker().self_);
+        co_await bycorf::Yield(*bycorf::ThisWorker().self_);
       }
     }
 
@@ -10902,7 +10904,7 @@ class ReplicationManager::ReplicationGroup {
     }
     state->receiver_status_ = receiver_status;
     state->receiver_done_ = true;
-    state->command_ready_.NotifyAll(*celer::ThisWorker().self_);
+    state->command_ready_.NotifyAll(*bycorf::ThisWorker().self_);
     if (!state->stage_done_ || !state->ack_done_) {
       // A broken ingress flow can strand staging, ACK, and predecessor tasks.
       // Cancel the whole session before joining so every cross-worker latch is
@@ -10980,7 +10982,7 @@ class ReplicationManager::ReplicationGroup {
         reset_proof.reserve(reset_count);
         for (unsigned owner = 0; owner < by_owner.size(); ++owner) {
           if (by_owner[owner].empty()) continue;
-          if (owner == celer::ThisWorker().id_) {
+          if (owner == bycorf::ThisWorker().id_) {
             auto reset = co_await storage_->ResetReplicaPartitions(
                 session->session_id_, by_owner[owner]);
             if (!reset.ok()) co_return reset.status();
@@ -10989,7 +10991,7 @@ class ReplicationManager::ReplicationGroup {
               reset_proof.push_back(result);
             }
           } else {
-            auto reset = co_await celer::SubmitTaskTo(
+            auto reset = co_await bycorf::SubmitTaskTo(
                 owner,
                 [this, session, resets = std::move(by_owner[owner])]() mutable {
                   return storage_->ResetReplicaPartitions(session->session_id_,
@@ -11022,7 +11024,7 @@ class ReplicationManager::ReplicationGroup {
         }
         const unsigned owner = partition_id % storage_->worker_count();
         const std::uint64_t epoch = epochs.at(partition_id);
-        absl::Status handed_off = co_await celer::SubmitTaskTo(
+        absl::Status handed_off = co_await bycorf::SubmitTaskTo(
             owner, [this, session, partition_id, epoch]() {
               return storage_->HandoffReplicaPartition(session->session_id_,
                                                        partition_id, epoch);
@@ -11109,7 +11111,7 @@ class ReplicationManager::ReplicationGroup {
               session->cluster_rebuild_->manifest_
                       .logical_epochs()[partition_id] != 0;
           if (!ephemeral && desired_partition) {
-            absl::Status begun = co_await celer::SubmitTaskTo(
+            absl::Status begun = co_await bycorf::SubmitTaskTo(
                 owner, [this, session, partition_id, partition_sequence]() {
                   return storage_->BeginReplicaTailCommand(
                       session->session_id_, partition_id, partition_sequence);
@@ -11136,7 +11138,7 @@ class ReplicationManager::ReplicationGroup {
           }
           absl::Status ended = absl::OkStatus();
           if (!ephemeral && desired_partition) {
-            ended = co_await celer::SubmitTaskTo(
+            ended = co_await bycorf::SubmitTaskTo(
                 owner, [this, session, partition_id, partition_sequence]() {
                   return storage_->EndReplicaTailCommand(
                       session->session_id_, partition_id, partition_sequence);
@@ -11175,7 +11177,7 @@ class ReplicationManager::ReplicationGroup {
             session->RecordFullSyncCut(flow_id, stable_next_lsn);
         if (!recorded.ok()) co_return recorded;
         absl::Status cut =
-            co_await session->fullsync_cut_->Wait(*celer::ThisWorker().self_);
+            co_await session->fullsync_cut_->Wait(*bycorf::ThisWorker().self_);
         if (!cut.ok()) co_return cut;
         if (flow_id == 0) {
           auto cut_vector = session->FullSyncCutVector();
@@ -11196,8 +11198,8 @@ class ReplicationManager::ReplicationGroup {
             }
           }
           while (!CloseAllCommandDbGates()) {
-            absl::Status waited = co_await celer::SleepFor(
-                *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+            absl::Status waited = co_await bycorf::SleepFor(
+                *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
             if (!waited.ok()) {
               session->promotion_complete_->Abort(waited);
               co_return waited;
@@ -11207,8 +11209,8 @@ class ReplicationManager::ReplicationGroup {
             ~PromotionGateGuard() { OpenAllCommandDbGates(); }
           } promotion_gate;
           while (CommandDbOperationsActive()) {
-            absl::Status waited = co_await celer::SleepFor(
-                *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+            absl::Status waited = co_await bycorf::SleepFor(
+                *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
             if (!waited.ok()) {
               session->promotion_complete_->Abort(waited);
               co_return waited;
@@ -11242,8 +11244,8 @@ class ReplicationManager::ReplicationGroup {
                       configured, configured + length, pause_ms);
                   if (parsed.ec == std::errc{} &&
                       parsed.ptr == configured + length && pause_ms != 0) {
-                    (void)co_await celer::SleepFor(
-                        *celer::ThisWorker().self_,
+                    (void)co_await bycorf::SleepFor(
+                        *bycorf::ThisWorker().self_,
                         std::chrono::milliseconds(pause_ms));
                   }
                 });
@@ -11338,7 +11340,7 @@ class ReplicationManager::ReplicationGroup {
           }
         }
         absl::Status finalized = co_await session->promotion_complete_->Wait(
-            *celer::ThisWorker().self_);
+            *bycorf::ThisWorker().self_);
         if (!finalized.ok()) co_return finalized;
         absl::Status acknowledged =
             co_await send_ack(kResetBatchAckPartition, sequence);
@@ -11396,7 +11398,7 @@ class ReplicationManager::ReplicationGroup {
                     .logical_epochs()[partition_id] != 0;
         absl::Status applied = absl::OkStatus();
         if (desired_partition) {
-          applied = co_await celer::SubmitTaskTo(
+          applied = co_await bycorf::SubmitTaskTo(
               owner, [this, session, partition_id, epoch,
                       records = std::move(records->second)]() mutable {
                 return storage_->ApplyReplicaRecords(
@@ -11567,12 +11569,12 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> InvalidateReplicaContinuation(
       const std::shared_ptr<ReplicaSession>& session,
       bool require_installed_cursor = true) {
-    if (celer::ThisWorker().id_ != 0) {
+    if (bycorf::ThisWorker().id_ != 0) {
       // This is an error path, never an online per-command owner hop. Join
       // the owner's exact-session invalidation before allowing flow teardown
       // to finish; otherwise promotion/reconnect could reuse the bad cursor.
-      co_return co_await celer::SubmitTaskTo(0, [this, session,
-                                                 require_installed_cursor] {
+      co_return co_await bycorf::SubmitTaskTo(0, [this, session,
+                                                  require_installed_cursor] {
         return InvalidateReplicaContinuation(session, require_installed_cursor);
       });
     }
@@ -11613,7 +11615,7 @@ class ReplicationManager::ReplicationGroup {
       native_dataset_valid_.store(false, std::memory_order_release);
       storage_->SetReplicaLoading(true);
       StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
-      celer::ThisWorker().self_->Spawn(
+      bycorf::ThisWorker().self_->Spawn(
           RevokeClusterRebuildSourceAuthorizations());
     }
     co_return absl::OkStatus();
@@ -11675,8 +11677,8 @@ class ReplicationManager::ReplicationGroup {
     }
     spdlog::info(
         "replication command admitted; pausing before database admission");
-    co_return co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                       std::chrono::milliseconds(milliseconds));
+    co_return co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(milliseconds));
   }
 
   Task<absl::Status> MaybePauseBeforeReplicaTransactionApply() {
@@ -11694,8 +11696,8 @@ class ReplicationManager::ReplicationGroup {
     }
     spdlog::info(
         "replication transaction complete; pausing before database apply");
-    co_return co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                       std::chrono::milliseconds(milliseconds));
+    co_return co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(milliseconds));
   }
 
   Task<absl::Status> MaybePauseBeforeReplicaControlApply() {
@@ -11713,8 +11715,8 @@ class ReplicationManager::ReplicationGroup {
     }
     spdlog::info(
         "replication control barrier complete; pausing before database apply");
-    co_return co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                       std::chrono::milliseconds(milliseconds));
+    co_return co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(milliseconds));
   }
 
   Task<absl::Status> MaybePauseBeforeRedisExportDbAdmission() {
@@ -11730,8 +11732,8 @@ class ReplicationManager::ReplicationGroup {
           !redis_export_gate_pause_used_.exchange(true,
                                                   std::memory_order_acq_rel)) {
         spdlog::info("Redis export active; pausing before database admission");
-        co_return co_await celer::SleepFor(
-            *celer::ThisWorker().self_,
+        co_return co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_,
             std::chrono::milliseconds(milliseconds));
       }
     }
@@ -12115,8 +12117,8 @@ class ReplicationManager::ReplicationGroup {
                                     std::chrono::milliseconds(pause_ms);
               while (!session->cancelled() &&
                      std::chrono::steady_clock::now() < deadline) {
-                absl::Status paused = co_await celer::SleepFor(
-                    *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+                absl::Status paused = co_await bycorf::SleepFor(
+                    *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
                 if (!paused.ok()) co_return paused;
               }
               if (session->cancelled()) {
@@ -12289,8 +12291,8 @@ class ReplicationManager::ReplicationGroup {
               "paused full sync after acknowledged handoff partition {} for "
               "{} ms",
               partition_id, pause_ms);
-          sent = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                          std::chrono::milliseconds(pause_ms));
+          sent = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
+                                           std::chrono::milliseconds(pause_ms));
         }
       });
       co_return sent;
@@ -12325,8 +12327,8 @@ class ReplicationManager::ReplicationGroup {
           co_return absl::CancelledError(
               "replication session ended while waiting for transaction gate");
         }
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) co_return waited;
       }
       gate_reopen.active_ = true;
@@ -12335,8 +12337,8 @@ class ReplicationManager::ReplicationGroup {
           co_return absl::CancelledError(
               "replication session ended while draining transactions");
         }
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) co_return waited;
       }
       co_return absl::OkStatus();
@@ -12384,9 +12386,9 @@ class ReplicationManager::ReplicationGroup {
                 std::from_chars(configured, configured + length, pause_ms);
             if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
                 pause_ms != 0) {
-              absl::Status paused =
-                  co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                           std::chrono::milliseconds(pause_ms));
+              absl::Status paused = co_await bycorf::SleepFor(
+                  *bycorf::ThisWorker().self_,
+                  std::chrono::milliseconds(pause_ms));
               if (!paused.ok()) {
                 cleanup();
                 co_return paused;
@@ -12410,8 +12412,8 @@ class ReplicationManager::ReplicationGroup {
             co_return sent;
           }
           if ((++processed_partitions & 63U) == 0) {
-            absl::Status yielded = co_await celer::SleepFor(
-                *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+            absl::Status yielded = co_await bycorf::SleepFor(
+                *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
             if (!yielded.ok()) {
               cleanup();
               co_return yielded;
@@ -12464,7 +12466,7 @@ class ReplicationManager::ReplicationGroup {
               cleanup();
               co_return db_started;
             }
-            co_await celer::Yield(*celer::ThisWorker().self_);
+            co_await bycorf::Yield(*bycorf::ThisWorker().self_);
           }
           if ((start->nonempty_db_mask_ & (std::uint16_t{1} << db_id)) != 0) {
             std::uint64_t cursor = 0;
@@ -12547,8 +12549,8 @@ class ReplicationManager::ReplicationGroup {
           }
         }
         if ((++processed_partitions & 63U) == 0) {
-          absl::Status yielded = co_await celer::SleepFor(
-              *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+          absl::Status yielded = co_await bycorf::SleepFor(
+              *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
           if (!yielded.ok()) {
             cleanup();
             co_return yielded;
@@ -12612,8 +12614,8 @@ class ReplicationManager::ReplicationGroup {
             "replication session ended while waiting for snapshot scans");
       }
       if (session->AllSnapshotScansComplete()) break;
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         cleanup();
         co_return waited;
@@ -12641,8 +12643,8 @@ class ReplicationManager::ReplicationGroup {
           co_return absl::CancelledError(
               "replication session ended while waiting for command gate");
         }
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) {
           cleanup();
           co_return waited;
@@ -12655,8 +12657,8 @@ class ReplicationManager::ReplicationGroup {
           co_return absl::CancelledError(
               "replication session ended while draining commands");
         }
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) {
           cleanup();
           co_return waited;
@@ -12737,9 +12739,9 @@ class ReplicationManager::ReplicationGroup {
                 std::from_chars(configured, configured + length, pause_ms);
             if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
                 pause_ms != 0) {
-              absl::Status paused =
-                  co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                           std::chrono::milliseconds(pause_ms));
+              absl::Status paused = co_await bycorf::SleepFor(
+                  *bycorf::ThisWorker().self_,
+                  std::chrono::milliseconds(pause_ms));
               if (!paused.ok()) co_return paused;
             }
           });
@@ -12809,7 +12811,7 @@ class ReplicationManager::ReplicationGroup {
     }
     session->SetBacklogCursor(flow_id, ReplicationPhase::kReady, cursor);
     session->SetHighestSentNextLsn(flow_id, cursor.lsn_);
-    celer::ThisWorker().self_->Spawn(
+    bycorf::ThisWorker().self_->Spawn(
         MonitorBacklogStall(session, flow_id, stream.NativeFd(),
                             session->ProgressGeneration(flow_id)));
     co_return co_await RunMasterFlowBacklog(stream, session, flow_id, cursor);
@@ -12817,8 +12819,8 @@ class ReplicationManager::ReplicationGroup {
 
   struct MasterBacklogDuplexState {
     std::deque<std::uint64_t> expected_acks_;
-    celer::AsyncNotification expected_ack_ready_;
-    celer::AsyncNotification receiver_done_ready_;
+    bycorf::AsyncNotification expected_ack_ready_;
+    bycorf::AsyncNotification receiver_done_ready_;
     absl::Status receiver_status_ =
         absl::UnknownError("replication backlog ACK receiver is running");
     bool sender_done_ = false;
@@ -12874,7 +12876,7 @@ class ReplicationManager::ReplicationGroup {
     duplex->receiver_status_ =
         co_await ReceiveMasterFlowBacklogAcks(stream, session, flow_id, duplex);
     duplex->receiver_done_ = true;
-    duplex->receiver_done_ready_.NotifyAll(*celer::ThisWorker().self_);
+    duplex->receiver_done_ready_.NotifyAll(*bycorf::ThisWorker().self_);
     if (!duplex->receiver_status_.ok()) {
       (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
     }
@@ -12886,8 +12888,8 @@ class ReplicationManager::ReplicationGroup {
                                          std::uint64_t observed_generation) {
     auto deadline = std::chrono::steady_clock::now() + kFullSyncStallTimeout;
     while (!session->cancelled()) {
-      absl::Status slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                                    std::chrono::seconds(1));
+      absl::Status slept = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::seconds(1));
       if (!slept.ok() || session->cancelled()) co_return slept;
       const auto retained = session->RetainedLsn(flow_id);
       if (!retained.has_value()) co_return absl::OkStatus();
@@ -12914,7 +12916,7 @@ class ReplicationManager::ReplicationGroup {
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
       unsigned flow_id, storage::ReplicationLogCursor cursor) {
     auto duplex = std::make_shared<MasterBacklogDuplexState>();
-    celer::ThisWorker().self_->Spawn(
+    bycorf::ThisWorker().self_->Spawn(
         TrackMasterFlowBacklogAcks(stream, session, flow_id, duplex));
     absl::Status sender_status = absl::OkStatus();
     while (stream.IsOpen()) {
@@ -12987,7 +12989,7 @@ class ReplicationManager::ReplicationGroup {
         // soon as the first complete frame reaches the peer.
         duplex->expected_acks_.insert(duplex->expected_acks_.end(),
                                       pending_acks.begin(), pending_acks.end());
-        duplex->expected_ack_ready_.NotifyAll(*celer::ThisWorker().self_);
+        duplex->expected_ack_ready_.NotifyAll(*bycorf::ThisWorker().self_);
         absl::Status sent = co_await stream.WriteAllV(wire_batch);
         if (!sent.ok()) {
           sender_status = sent;
@@ -13004,8 +13006,8 @@ class ReplicationManager::ReplicationGroup {
       // history as ACKs arrive while socket backpressure bounds wire output.
       cursor = batch->next_;
       if (batch->at_tail_) {
-        absl::Status slept = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status slept = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!slept.ok()) {
           sender_status = slept;
           break;
@@ -13018,7 +13020,7 @@ class ReplicationManager::ReplicationGroup {
       sender_status = absl::UnavailableError("replication backlog flow closed");
     }
     duplex->sender_done_ = true;
-    duplex->expected_ack_ready_.NotifyAll(*celer::ThisWorker().self_);
+    duplex->expected_ack_ready_.NotifyAll(*bycorf::ThisWorker().self_);
     if (!duplex->receiver_done_) {
       (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
       while (!duplex->receiver_done_) {
@@ -13042,12 +13044,12 @@ class ReplicationManager::ReplicationGroup {
     absl::Status status =
         co_await ServeOwnedNativeConnection(stream, std::move(args), client_id);
     UnregisterClientConnection(client_id);
-    if (connection->state_ == celer::ConnectionState::kActive &&
+    if (connection->state_ == bycorf::ConnectionState::kActive &&
         !connection->closing_) {
-      celer::ThisWorker().self_->BeginClose(
+      bycorf::ThisWorker().self_->BeginClose(
           connection, status,
-          status.ok() ? celer::CloseMode::kLocalClose
-                      : celer::CloseMode::kLocalError);
+          status.ok() ? bycorf::CloseMode::kLocalClose
+                      : bycorf::CloseMode::kLocalError);
     }
     if (!status.ok()) {
       spdlog::warn("replication native handshake failed: {}", status.message());
@@ -13254,8 +13256,8 @@ class ReplicationManager::ReplicationGroup {
     }
 #endif
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard master_lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard master_lock(&master_mutex_);
       {
         AssertStateOwner();
         // Pair this check with publication under master_mutex_. A revoker can
@@ -13398,7 +13400,7 @@ class ReplicationManager::ReplicationGroup {
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       const std::size_t flow_capacity = BacklogCapacityForFlow(
           worker, backlog_size_bytes_.load(std::memory_order_acquire));
-      absl::Status enabled = co_await celer::SubmitTaskTo(
+      absl::Status enabled = co_await bycorf::SubmitTaskTo(
           worker, [this, session_id, flow_capacity]() -> Task<absl::Status> {
             // Runtime backlog is bounded process memory and intentionally
             // disappears when the source history id changes.
@@ -13467,8 +13469,8 @@ class ReplicationManager::ReplicationGroup {
         }
       }
       if (stalled) break;
-      absl::Status slept = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status slept = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!slept.ok()) {
         (void)co_await RemoveMasterSession(session);
         co_return slept;
@@ -13501,8 +13503,8 @@ class ReplicationManager::ReplicationGroup {
     }
     session->MarkOnline();
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       const auto lease = disconnected_replica_leases_.find(session->node_id_);
       if (lease != disconnected_replica_leases_.end() &&
           lease->second.session_id_ < session->id_) {
@@ -13525,15 +13527,15 @@ class ReplicationManager::ReplicationGroup {
     if (args.size() != 7 || args[1] != kProtocolVersion ||
         !ParseUnsigned(args[2], &session_id) || session_id == 0 ||
         !ParseUnsigned(args[3], &flow_id) ||
-        flow_id != celer::ThisWorker().id_ ||
+        flow_id != bycorf::ThisWorker().id_ ||
         !ParseUnsigned(args[4], &next_lsn) || next_lsn == 0 ||
         !ParseUnsigned(args[5], &fragment_index) || !IsReplicationId(args[6])) {
       co_return absl::InvalidArgumentError("invalid KLFLOW handshake");
     }
     std::shared_ptr<MasterSession> session;
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       const auto found = master_sessions_.find(session_id);
       if (found != master_sessions_.end()) session = found->second;
     }
@@ -13563,8 +13565,8 @@ class ReplicationManager::ReplicationGroup {
     std::optional<bool> session_continue_mode;
     while (!session->cancelled() &&
            !(session_continue_mode = session->ContinueMode()).has_value()) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         session->ClearFlow(flow_id, stream.NativeFd());
         session->Cancel();
@@ -13623,8 +13625,8 @@ class ReplicationManager::ReplicationGroup {
   Task<absl::Status> RemoveMasterSession(
       const std::shared_ptr<MasterSession>& session) {
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       const auto found = master_sessions_.find(session->id_);
       if (found != master_sessions_.end() && found->second == session) {
         master_sessions_.erase(found);
@@ -13639,15 +13641,15 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> DrainSourceEgress() {
-    assert(celer::ThisWorker().id_ == 0);
+    assert(bycorf::ThisWorker().id_ == 0);
     // Demotion has already made the role non-master. Process shutdown closes
     // every registered source socket before request drain so retained history
     // cannot deadlock an admitted publisher; this coroutine performs the
     // worker-affine registry join before source history is disabled.
     std::vector<std::shared_ptr<MasterSession>> sessions;
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       sessions.reserve(master_sessions_.size() +
                        retired_master_sessions_.size());
       for (auto& [session_id, session] : master_sessions_) {
@@ -13675,8 +13677,8 @@ class ReplicationManager::ReplicationGroup {
       const int redis_export_fd =
           redis_export_fd_.load(std::memory_order_acquire);
       if (redis_export_fd >= 0) (void)::shutdown(redis_export_fd, SHUT_RDWR);
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     // Flow teardown performs any history reset before ClearFlow drops the
@@ -13687,7 +13689,7 @@ class ReplicationManager::ReplicationGroup {
 
   Task<absl::Status> DisableSourceHistory() {
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
-      absl::Status disabled = co_await celer::SubmitTaskTo(
+      absl::Status disabled = co_await bycorf::SubmitTaskTo(
           worker, [this]() { return storage_->DisableReplicationLog(); });
       if (!disabled.ok()) co_return disabled;
     }
@@ -13741,30 +13743,30 @@ class ReplicationManager::ReplicationGroup {
   }
 
   void StartIdleReplicationHistoryMonitor() {
-    assert(celer::ThisWorker().id_ == 0);
+    assert(bycorf::ThisWorker().id_ == 0);
     if (idle_history_monitor_running_) return;
     idle_history_monitor_running_ = true;
-    celer::ThisWorker().self_->Spawn(MonitorIdleReplicationHistory());
+    bycorf::ThisWorker().self_->Spawn(MonitorIdleReplicationHistory());
   }
 
   Task<absl::Status> MonitorIdleReplicationHistory() {
-    assert(celer::ThisWorker().id_ == 0);
+    assert(bycorf::ThisWorker().id_ == 0);
     struct MonitorGuard {
       bool* running_;
       ~MonitorGuard() { *running_ = false; }
     } monitor_guard{&idle_history_monitor_running_};
 
     for (;;) {
-      absl::Status slept = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(10));
+      absl::Status slept = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(10));
       if (!slept.ok()) co_return slept;
       if (is_replica()) co_return absl::OkStatus();
 
       std::string history_id;
       std::vector<storage::ReplicationLogInfo> logs;
       {
-        co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-        celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+        co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+        bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
         FinalizeRetiredMasterSessionsLocked();
         if (MasterHistoryHasConsumersLocked()) continue;
         history_id = history_id_;
@@ -13775,15 +13777,15 @@ class ReplicationManager::ReplicationGroup {
         if (worker == 0) {
           logs[worker] = storage_->LocalReplicationLogInfo();
         } else {
-          logs[worker] = co_await celer::SubmitTo(
+          logs[worker] = co_await bycorf::SubmitTo(
               worker, [this] { return storage_->LocalReplicationLogInfo(); });
         }
       }
 
       bool no_reconnectable_replica = false;
       {
-        co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-        celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+        co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+        bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
         FinalizeRetiredMasterSessionsLocked();
         if (MasterHistoryHasConsumersLocked()) continue;
         for (auto lease = disconnected_replica_leases_.begin();
@@ -13832,14 +13834,14 @@ class ReplicationManager::ReplicationGroup {
         }
       } idle_reset_guard{&history_reset_running_, &command_gates_closed};
       while (!CloseAllCommandDbGates()) {
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) co_return waited;
       }
       command_gates_closed = true;
       while (CommandDbOperationsActive()) {
-        absl::Status waited = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        absl::Status waited = co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) co_return waited;
       }
 
@@ -13847,8 +13849,8 @@ class ReplicationManager::ReplicationGroup {
       // the new history. One that became active before it is caught here.
       bool disable = false;
       {
-        co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-        celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+        co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+        bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
         FinalizeRetiredMasterSessionsLocked();
         disable = !is_replica() && !MasterHistoryHasConsumersLocked() &&
                   disconnected_replica_leases_.empty();
@@ -13860,7 +13862,7 @@ class ReplicationManager::ReplicationGroup {
 
       absl::Status disabled = absl::OkStatus();
       for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
-        disabled = co_await celer::SubmitTaskTo(
+        disabled = co_await bycorf::SubmitTaskTo(
             worker, [this]() { return storage_->DisableReplicationLog(); });
         if (!disabled.ok()) break;
       }
@@ -13873,8 +13875,8 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> ResetInvalidReplicationHistory() {
-    if (celer::ThisWorker().id_ != 0) {
-      co_return co_await celer::SubmitTaskTo(
+    if (bycorf::ThisWorker().id_ != 0) {
+      co_return co_await bycorf::SubmitTaskTo(
           0, [this]() { return EnsureReplicationHistoryReady(); });
     }
     co_return co_await EnsureReplicationHistoryReady();
@@ -13885,8 +13887,8 @@ class ReplicationManager::ReplicationGroup {
     // let another handshake yield while the first one performs storage IO;
     // there is no process-global lock on the write path.
     while (history_reset_running_) {
-      absl::Status waited = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      absl::Status waited = co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
     history_reset_running_ = true;
@@ -13897,10 +13899,10 @@ class ReplicationManager::ReplicationGroup {
     bool invalid = false;
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       storage::ReplicationLogInfo info;
-      if (worker == celer::ThisWorker().id_) {
+      if (worker == bycorf::ThisWorker().id_) {
         info = storage_->LocalReplicationLogInfo();
       } else {
-        info = co_await celer::SubmitTo(
+        info = co_await bycorf::SubmitTo(
             worker, [this] { return storage_->LocalReplicationLogInfo(); });
       }
       invalid |= info.state_ == storage::ReplicationLogState::kInvalid;
@@ -13908,8 +13910,8 @@ class ReplicationManager::ReplicationGroup {
     if (!invalid) co_return absl::OkStatus();
     std::vector<std::shared_ptr<MasterSession>> cancelled;
     {
-      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
-      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
+      bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
       cancelled.reserve(master_sessions_.size());
       for (auto& [id, session] : master_sessions_) {
         (void)id;
@@ -13922,7 +13924,7 @@ class ReplicationManager::ReplicationGroup {
     for (const auto& session : cancelled) session->Cancel();
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       absl::Status disabled =
-          co_await celer::SubmitTaskTo(worker, [this]() -> Task<absl::Status> {
+          co_await bycorf::SubmitTaskTo(worker, [this]() -> Task<absl::Status> {
             co_return co_await storage_->DisableReplicationLog();
           });
       if (!disabled.ok()) co_return disabled;
@@ -13942,7 +13944,7 @@ class ReplicationManager::ReplicationGroup {
   // heartbeat and progress never acquire its descriptor-lifetime mutex.
   SocketSet outbound_sockets_;
   // All mutable role/population/session state below is owned by worker zero.
-  // Foreign workers query or change it with Celer messages, never a native
+  // Foreign workers query or change it with Bycorf messages, never a native
   // thread lock. Flow-owned progress and command admission stay independent.
   std::optional<ReplicaOfConfig> upstream_;
   struct UpstreamSnapshot {
@@ -14088,7 +14090,7 @@ class ReplicationManager::ReplicationGroup {
   std::unique_ptr<keylane::ReplicationGroup> cluster_group_;
   std::string history_id_;  // guarded by master_mutex_
   const std::uint16_t listen_port_;
-  const std::shared_ptr<celer::TlsContext> tls_context_;
+  const std::shared_ptr<bycorf::TlsContext> tls_context_;
   const std::string masteruser_;
   const std::string masterauth_;
   std::atomic<bool> redis_psync_{false};
@@ -14109,14 +14111,14 @@ class ReplicationManager::ReplicationGroup {
   // of the worker-affine source session registry. Process shutdown cancels it
   // before request drain so transport teardown releases backlog retention.
   SocketSet source_sockets_;
-  celer::AsyncMutex redis_fullsync_mutex_;  // worker 0 only
+  bycorf::AsyncMutex redis_fullsync_mutex_;  // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};
   std::atomic<unsigned> active_master_controls_{0};
   // Controls that passed initial syntax validation but have not yet published
   // a MasterSession. Source retirement joins this exact set; preserved
   // sessions cannot mask it by disconnecting while the barrier waits.
   std::atomic<unsigned> active_unpublished_master_controls_{0};
-  mutable celer::CrossWorkerMutex master_mutex_;
+  mutable bycorf::CrossWorkerMutex master_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<MasterSession>>
       master_sessions_;
   std::vector<std::shared_ptr<MasterSession>> retired_master_sessions_;
@@ -14134,7 +14136,7 @@ ReplicationManager::ReplicationManager(
 
 ReplicationManager::~ReplicationManager() = default;
 
-void ReplicationManager::StorageReady(celer::Worker& worker) {
+void ReplicationManager::StorageReady(bycorf::Worker& worker) {
   group_->StorageReady(worker);
 }
 

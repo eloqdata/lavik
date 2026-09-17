@@ -14,8 +14,8 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/runtime/runtime.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/runtime/runtime.h"
+#include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
 
 namespace keylane::cluster::control {
@@ -78,10 +78,11 @@ absl::StatusOr<std::string> FullStatePayload(std::size_t padding_bytes) {
   return control::EncodeFullDesiredState(state);
 }
 
-using WriterScenario = std::function<celer::Task<absl::Status>(celer::Worker&)>;
+using WriterScenario =
+    std::function<bycorf::Task<absl::Status>(bycorf::Worker&)>;
 
-celer::Task<absl::Status> CompleteWriterScenario(
-    std::shared_ptr<WriterScenario> scenario, celer::Worker* worker,
+bycorf::Task<absl::Status> CompleteWriterScenario(
+    std::shared_ptr<WriterScenario> scenario, bycorf::Worker* worker,
     std::shared_ptr<std::promise<absl::Status>> completed) {
   absl::Status status = co_await (*scenario)(*worker);
   completed->set_value(status);
@@ -89,7 +90,7 @@ celer::Task<absl::Status> CompleteWriterScenario(
 }
 
 absl::Status RunWriterScenario(WriterScenario scenario) {
-  celer::Runtime runtime;
+  bycorf::Runtime runtime;
   auto initialized = std::make_shared<std::promise<absl::Status>>();
   std::future<absl::Status> init_result = initialized->get_future();
   auto completed = std::make_shared<std::promise<absl::Status>>();
@@ -98,7 +99,7 @@ absl::Status RunWriterScenario(WriterScenario scenario) {
   runtime.Start(
       1,
       [initialized, completed, owned_scenario](unsigned,
-                                               celer::Worker& worker) {
+                                               bycorf::Worker& worker) {
         const absl::Status status = worker.Init();
         initialized->set_value(status);
         if (!status.ok()) return 1;
@@ -131,7 +132,7 @@ absl::Status RunWriterScenario(WriterScenario scenario) {
 }
 
 struct DeadlineWatchdogScenario {
-  celer::Task<absl::Status> Run(celer::Worker& worker) {
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker) {
     {
       control::ControlDeadlineWatchdog watchdog(
           worker, [this] { ++expiration_callbacks_; });
@@ -146,7 +147,7 @@ struct DeadlineWatchdogScenario {
       }
       starts_during_rearm_ =
           control::ControlDeadlineWatchdogTestPeer::TaskStarts(watchdog);
-      if (absl::Status slept = co_await celer::SleepFor(worker, 50ms);
+      if (absl::Status slept = co_await bycorf::SleepFor(worker, 50ms);
           !slept.ok()) {
         co_return slept;
       }
@@ -156,7 +157,7 @@ struct DeadlineWatchdogScenario {
         co_return armed;
       }
       (void)watchdog.Disarm();
-      if (absl::Status slept = co_await celer::SleepFor(worker, 50ms);
+      if (absl::Status slept = co_await bycorf::SleepFor(worker, 50ms);
           !slept.ok()) {
         co_return slept;
       }
@@ -172,18 +173,18 @@ struct DeadlineWatchdogScenario {
       // Let the manager install the first native timer before cancelling it.
       // This exercises the generation check on the in-flight cancellation,
       // not just repeated Arm calls made before Watch first runs.
-      co_await celer::Yield(worker);
+      co_await bycorf::Yield(worker);
       if (absl::Status armed = rearmed.Arm(100ms); !armed.ok()) {
         co_return armed;
       }
       rearmed_starts_ =
           control::ControlDeadlineWatchdogTestPeer::TaskStarts(rearmed);
-      if (absl::Status slept = co_await celer::SleepFor(worker, 50ms);
+      if (absl::Status slept = co_await bycorf::SleepFor(worker, 50ms);
           !slept.ok()) {
         co_return slept;
       }
       rearmed_callbacks_after_old_deadline_ = rearmed_expiration_callbacks_;
-      if (absl::Status slept = co_await celer::SleepFor(worker, 100ms);
+      if (absl::Status slept = co_await bycorf::SleepFor(worker, 100ms);
           !slept.ok()) {
         co_return slept;
       }
@@ -196,9 +197,9 @@ struct DeadlineWatchdogScenario {
       if (absl::Status armed = destroyed.Arm(20ms); !armed.ok()) {
         co_return armed;
       }
-      co_await celer::Yield(worker);
+      co_await bycorf::Yield(worker);
     }
-    if (absl::Status slept = co_await celer::SleepFor(worker, 50ms);
+    if (absl::Status slept = co_await bycorf::SleepFor(worker, 50ms);
         !slept.ok()) {
       co_return slept;
     }
@@ -221,27 +222,27 @@ struct PriorityWriterScenario {
   explicit PriorityWriterScenario(std::size_t queue_bytes)
       : queue_bytes_(queue_bytes) {}
 
-  celer::Task<absl::Status> SendAuthority() {
+  bycorf::Task<absl::Status> SendAuthority() {
     authority_status_ = co_await writer_->Write(
         control::MessagePriority::kAuthority, Hello('d'));
     authority_done_ = true;
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> WriteFrame(control::WireMessage message,
-                                       std::function<void()> before_write) {
+  bycorf::Task<absl::Status> WriteFrame(control::WireMessage message,
+                                        std::function<void()> before_write) {
     if (before_write) before_write();
     const control::MessageType type = control::MessageTypeOf(message);
     trace_.push_back(type);
     if (type == control::MessageType::kTransferChunk && !injected_) {
       injected_ = true;
       worker_->Spawn(SendAuthority());
-      co_await celer::Yield(*worker_);
+      co_await bycorf::Yield(*worker_);
     }
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> Run(celer::Worker& worker) {
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker) {
     worker_ = &worker;
     control::ControlSessionWriter writer(
         [this](control::WireMessage message,
@@ -255,7 +256,7 @@ struct PriorityWriterScenario {
         control::TransferKind::kDirectiveResult, control::WireId128{0x42},
         std::move(bytes));
     for (unsigned attempt = 0; !authority_done_ && attempt < 100; ++attempt) {
-      co_await celer::Yield(worker);
+      co_await bycorf::Yield(worker);
     }
     writer_ = nullptr;
     if (!authority_done_) {
@@ -266,7 +267,7 @@ struct PriorityWriterScenario {
   }
 
   const std::size_t queue_bytes_;
-  celer::Worker* worker_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
   control::ControlSessionWriter* writer_ = nullptr;
   std::vector<control::MessageType> trace_;
   absl::Status transfer_status_ = absl::UnknownError("not run");
@@ -276,26 +277,26 @@ struct PriorityWriterScenario {
 };
 
 struct ErrorWriterScenario {
-  celer::Task<absl::Status> SendQueued() {
+  bycorf::Task<absl::Status> SendQueued() {
     queued_ = co_await writer_->Write(control::MessagePriority::kAuthority,
                                       Hello('2'));
     queued_done_ = true;
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> WriteFrame(control::WireMessage,
-                                       std::function<void()> before_write) {
+  bycorf::Task<absl::Status> WriteFrame(control::WireMessage,
+                                        std::function<void()> before_write) {
     ++sink_calls_;
     if (before_write) before_write();
     if (!injected_) {
       injected_ = true;
       worker_->Spawn(SendQueued());
-      co_await celer::Yield(*worker_);
+      co_await bycorf::Yield(*worker_);
     }
     co_return absl::UnavailableError("injected terminal write failure");
   }
 
-  celer::Task<absl::Status> Run(celer::Worker& worker) {
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker) {
     worker_ = &worker;
     control::ControlSessionWriter writer(
         [this](control::WireMessage message,
@@ -307,7 +308,7 @@ struct ErrorWriterScenario {
     first_ = co_await writer.Write(control::MessagePriority::kReliable,
                                    Hello('1'), [this] { ++before_calls_; });
     for (unsigned attempt = 0; !queued_done_ && attempt < 100; ++attempt) {
-      co_await celer::Yield(worker);
+      co_await bycorf::Yield(worker);
     }
     if (!queued_done_) {
       co_return absl::DeadlineExceededError(
@@ -321,7 +322,7 @@ struct ErrorWriterScenario {
     co_return absl::OkStatus();
   }
 
-  celer::Worker* worker_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
   control::ControlSessionWriter* writer_ = nullptr;
   absl::Status first_ = absl::UnknownError("not run");
   absl::Status queued_ = absl::UnknownError("not run");
@@ -342,7 +343,7 @@ struct SerializedTransfersScenario {
     friend bool operator==(const TraceEntry&, const TraceEntry&) = default;
   };
 
-  celer::Task<absl::Status> SendSecond(
+  bycorf::Task<absl::Status> SendSecond(
       std::shared_ptr<const std::string> payload) {
     second_status_ = co_await writer_->WriteTransfer(
         control::TransferKind::kDirectiveResult, control::WireId128{0x22},
@@ -351,8 +352,8 @@ struct SerializedTransfersScenario {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> WriteFrame(control::WireMessage message,
-                                       std::function<void()> before_write) {
+  bycorf::Task<absl::Status> WriteFrame(control::WireMessage message,
+                                        std::function<void()> before_write) {
     if (before_write) before_write();
     const control::MessageType type = control::MessageTypeOf(message);
     std::uint8_t object_tag = 0;
@@ -372,13 +373,13 @@ struct SerializedTransfersScenario {
       auto second = std::make_shared<const std::string>("second");
       second_owner_ = second;
       worker_->Spawn(SendSecond(std::move(second)));
-      co_await celer::Yield(*worker_);
+      co_await bycorf::Yield(*worker_);
       owner_retained_while_queued_ = !second_owner_.expired();
     }
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> Run(celer::Worker& worker) {
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker) {
     worker_ = &worker;
     control::ControlSessionWriter writer(
         [this](control::WireMessage message,
@@ -392,7 +393,7 @@ struct SerializedTransfersScenario {
         control::TransferKind::kDirectiveResult, control::WireId128{0x11},
         std::move(first));
     for (unsigned attempt = 0; !second_done_ && attempt < 100; ++attempt) {
-      co_await celer::Yield(worker);
+      co_await bycorf::Yield(worker);
     }
     writer_ = nullptr;
     if (!second_done_) {
@@ -402,7 +403,7 @@ struct SerializedTransfersScenario {
     co_return absl::OkStatus();
   }
 
-  celer::Worker* worker_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
   control::ControlSessionWriter* writer_ = nullptr;
   std::vector<TraceEntry> trace_;
   std::weak_ptr<const std::string> second_owner_;
@@ -414,13 +415,13 @@ struct SerializedTransfersScenario {
 };
 
 struct OversizedWriterScenario {
-  celer::Task<absl::Status> WriteFrame(control::WireMessage,
-                                       std::function<void()>) {
+  bycorf::Task<absl::Status> WriteFrame(control::WireMessage,
+                                        std::function<void()>) {
     ++sink_calls_;
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> Run(celer::Worker&) {
+  bycorf::Task<absl::Status> Run(bycorf::Worker&) {
     control::ControlSessionWriter writer(
         [this](control::WireMessage message,
                std::function<void()> before_write) {
@@ -439,14 +440,14 @@ struct OversizedWriterScenario {
 };
 
 struct FullStateWriterScenario {
-  celer::Task<absl::Status> WriteFrame(control::WireMessage message,
-                                       std::function<void()> before_write) {
+  bycorf::Task<absl::Status> WriteFrame(control::WireMessage message,
+                                        std::function<void()> before_write) {
     if (before_write) before_write();
     frames_.push_back(std::move(message));
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> Run(celer::Worker&) {
+  bycorf::Task<absl::Status> Run(bycorf::Worker&) {
     auto small = FullStatePayload(0);
     if (!small.ok()) co_return small.status();
     auto large = FullStatePayload(control::kMaxFramePayloadBytes);
@@ -539,7 +540,7 @@ TEST(ControlDeadlineWatchdogTest,
      RearmUsesOneLiveTaskAndDisarmOrDestructionSuppressesExpiry) {
   auto scenario = std::make_shared<DeadlineWatchdogScenario>();
   const absl::Status run = RunWriterScenario(
-      [scenario](celer::Worker& worker) { return scenario->Run(worker); });
+      [scenario](bycorf::Worker& worker) { return scenario->Run(worker); });
   ASSERT_TRUE(run.ok()) << run;
   EXPECT_EQ(scenario->starts_during_rearm_, 1u);
   EXPECT_EQ(scenario->callbacks_after_expiry_, 1u);
@@ -554,7 +555,7 @@ TEST(ControlSessionWriterTest, AuthorityOvertakesTransferBetweenBulkChunks) {
   auto scenario =
       std::make_shared<PriorityWriterScenario>(4 * control::kMaxFrameBytes);
   const absl::Status run = RunWriterScenario(
-      [scenario](celer::Worker& worker) { return scenario->Run(worker); });
+      [scenario](bycorf::Worker& worker) { return scenario->Run(worker); });
   ASSERT_TRUE(run.ok()) << run;
   EXPECT_TRUE(scenario->transfer_status_.ok()) << scenario->transfer_status_;
   EXPECT_TRUE(scenario->authority_status_.ok()) << scenario->authority_status_;
@@ -572,7 +573,7 @@ TEST(ControlSessionWriterTest, TransferReservationMakesQueueBoundReal) {
   auto scenario =
       std::make_shared<PriorityWriterScenario>(control::kMaxFrameBytes);
   const absl::Status run = RunWriterScenario(
-      [scenario](celer::Worker& worker) { return scenario->Run(worker); });
+      [scenario](bycorf::Worker& worker) { return scenario->Run(worker); });
   ASSERT_TRUE(run.ok()) << run;
   EXPECT_TRUE(scenario->transfer_status_.ok()) << scenario->transfer_status_;
   EXPECT_EQ(scenario->authority_status_.code(),
@@ -586,7 +587,7 @@ TEST(ControlSessionWriterTest,
      SerializesTransfersAndRetainsPendingPayloadOwner) {
   auto scenario = std::make_shared<SerializedTransfersScenario>();
   const absl::Status run = RunWriterScenario(
-      [scenario](celer::Worker& worker) { return scenario->Run(worker); });
+      [scenario](bycorf::Worker& worker) { return scenario->Run(worker); });
   ASSERT_TRUE(run.ok()) << run;
   EXPECT_TRUE(scenario->first_status_.ok()) << scenario->first_status_;
   EXPECT_TRUE(scenario->second_status_.ok()) << scenario->second_status_;
@@ -606,7 +607,7 @@ TEST(ControlSessionWriterTest,
 TEST(ControlSessionWriterTest, TerminalWriteErrorPoisonsQueuedAndFutureWork) {
   auto scenario = std::make_shared<ErrorWriterScenario>();
   const absl::Status run = RunWriterScenario(
-      [scenario](celer::Worker& worker) { return scenario->Run(worker); });
+      [scenario](bycorf::Worker& worker) { return scenario->Run(worker); });
   ASSERT_TRUE(run.ok()) << run;
   EXPECT_EQ(scenario->first_.code(), absl::StatusCode::kUnavailable);
   EXPECT_EQ(scenario->queued_.code(), absl::StatusCode::kUnavailable);
@@ -623,7 +624,7 @@ TEST(ControlSessionWriterTest,
      OversizedSingleFrameFailsWithoutPoisoningWriter) {
   auto scenario = std::make_shared<OversizedWriterScenario>();
   const absl::Status run = RunWriterScenario(
-      [scenario](celer::Worker& worker) { return scenario->Run(worker); });
+      [scenario](bycorf::Worker& worker) { return scenario->Run(worker); });
   ASSERT_TRUE(run.ok()) << run;
   EXPECT_EQ(scenario->status_.code(), absl::StatusCode::kResourceExhausted);
   EXPECT_EQ(scenario->sink_calls_, 0u);
@@ -634,7 +635,7 @@ TEST(ControlSessionWriterTest,
      FullDesiredStateUsesOneFrameUntilItsPayloadRequiresStreaming) {
   auto scenario = std::make_shared<FullStateWriterScenario>();
   const absl::Status run = RunWriterScenario(
-      [scenario](celer::Worker& worker) { return scenario->Run(worker); });
+      [scenario](bycorf::Worker& worker) { return scenario->Run(worker); });
   ASSERT_TRUE(run.ok()) << run;
   ASSERT_TRUE(scenario->small_status_.ok()) << scenario->small_status_;
   ASSERT_TRUE(scenario->large_status_.ok()) << scenario->large_status_;

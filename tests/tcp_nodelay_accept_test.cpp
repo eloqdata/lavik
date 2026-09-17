@@ -15,15 +15,15 @@
 #include <thread>
 
 #include "absl/status/status.h"
-#include "celer/net/server.h"
-#include "celer/net/service.h"
-#include "celer/net/tcp_listener.h"
-#include "celer/runtime/task.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/net/server.h"
+#include "bycorf/net/service.h"
+#include "bycorf/net/tcp_listener.h"
+#include "bycorf/runtime/task.h"
+#include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
 #include "support/test_data_path.h"
 
-namespace celer {
+namespace bycorf {
 namespace {
 
 // Serves one blocking client connect with AcceptUnregistered() and records the
@@ -209,7 +209,7 @@ class AcceptUnixService final : public Service {
 std::filesystem::path MakeSecureUnixTestDirectory(std::string_view suffix) {
   const std::filesystem::path directory =
       keylane::test::TestDataDirectory() /
-      ("keylane-celer-uds-" + std::to_string(::getpid()) + "-" +
+      ("keylane-bycorf-uds-" + std::to_string(::getpid()) + "-" +
        std::string(suffix));
   std::filesystem::remove_all(directory);
   std::filesystem::create_directory(directory);
@@ -300,4 +300,4 @@ TEST(TcpListenerAcceptTest, UnixClosePreservesReplacementPath) {
 }
 
 }  // namespace
-}  // namespace celer
+}  // namespace bycorf

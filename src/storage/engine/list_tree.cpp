@@ -218,7 +218,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
   // Handle private allocation failures inside this coroutine, before they
-  // reach Celer's fail-fast unhandled_exception boundary.
+  // reach Bycorf's fail-fast unhandled_exception boundary.
   try {
     assert(db_id < kLogicalDatabaseCount);
     WorkerStore& store = CurrentStore();
@@ -358,7 +358,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
         const auto parsed = std::from_chars(configured, end, milliseconds);
         if (parsed.ec == std::errc{} && parsed.ptr == end &&
             milliseconds != 0) {
-          absl::Status paused = co_await celer::SleepFor(
+          absl::Status paused = co_await bycorf::SleepFor(
               *store.worker_, std::chrono::milliseconds(milliseconds));
           if (!paused.ok()) co_return paused;
         }
@@ -408,7 +408,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
         for (std::string_view value : operation.values_) {
           if (unlocked_create && !elements.empty() &&
               elements.size() % 256 == 0)
-            co_await celer::Yield(*store.worker_);
+            co_await bycorf::Yield(*store.worker_);
           if (value.size() > kMaxStringBytes) {
             co_return absl::OutOfRangeError(
                 "List element exceeds Redis-compatible 512 MiB limit");

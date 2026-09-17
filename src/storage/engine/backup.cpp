@@ -222,10 +222,10 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
       co_return absl::OkStatus();
     };
     absl::Status status;
-    if (owner == celer::ThisWorker().id_) {
+    if (owner == bycorf::ThisWorker().id_) {
       status = co_await on_owner();
     } else {
-      status = co_await celer::SubmitTaskTo(owner, on_owner);
+      status = co_await bycorf::SubmitTaskTo(owner, on_owner);
     }
     co_return status;
   };
@@ -249,10 +249,10 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
       co_return absl::OkStatus();
     };
     absl::Status status;
-    if (owner == celer::ThisWorker().id_) {
+    if (owner == bycorf::ThisWorker().id_) {
       status = co_await on_owner();
     } else {
-      status = co_await celer::SubmitTaskTo(owner, on_owner);
+      status = co_await bycorf::SubmitTaskTo(owner, on_owner);
     }
     co_return status;
   };
@@ -301,10 +301,10 @@ Task<absl::Status> StorageEngine::Impl::ReleaseRdbSnapshotValue(
     };
     // Preserve the GCC 13 coroutine-frame invariant from the pin path above.
     absl::Status released;
-    if (owner == celer::ThisWorker().id_) {
+    if (owner == bycorf::ThisWorker().id_) {
       released = co_await on_owner();
     } else {
-      released = co_await celer::SubmitTaskTo(owner, on_owner);
+      released = co_await bycorf::SubmitTaskTo(owner, on_owner);
     }
     if (!released.ok()) co_return released;
   }
@@ -417,8 +417,8 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
           char* end = nullptr;
           const unsigned long pause_ms = std::strtoul(pause_text, &end, 10);
           if (end != pause_text && *end == '\0' && pause_ms != 0) {
-            (void)co_await celer::SleepFor(*store.worker_,
-                                           std::chrono::milliseconds(pause_ms));
+            (void)co_await bycorf::SleepFor(
+                *store.worker_, std::chrono::milliseconds(pause_ms));
           }
         });
     absl::Status pinned = co_await PinRdbSnapshotValue(&old);
@@ -745,7 +745,7 @@ StorageEngine::Impl::ReadRdbSnapshotBatch(std::uint64_t session_id,
             const auto parsed = std::from_chars(configured, end, delay_ms);
             if (parsed.ec == std::errc{} && parsed.ptr == end &&
                 delay_ms != 0 && delay_ms <= 10000) {
-              const absl::Status delayed = co_await celer::SleepFor(
+              const absl::Status delayed = co_await bycorf::SleepFor(
                   *store.worker_, std::chrono::milliseconds(delay_ms));
               if (!delayed.ok()) co_return delayed;
             }
@@ -822,7 +822,7 @@ StorageEngine::Impl::ReadRdbSnapshotBatch(std::uint64_t session_id,
       }
 
       if (capture->capture_admissions_ != 0) {
-        absl::Status yielded = co_await celer::SleepFor(
+        absl::Status yielded = co_await bycorf::SleepFor(
             *store.worker_, std::chrono::milliseconds(1));
         if (!yielded.ok()) co_return yielded;
         continue;
@@ -899,7 +899,7 @@ Task<absl::Status> StorageEngine::Impl::EndRdbSnapshot(
   while (store.rdb_snapshot_ && store.rdb_snapshot_->id_ == session_id &&
          store.rdb_snapshot_->ending_) {
     auto status =
-        co_await celer::SleepFor(*store.worker_, std::chrono::milliseconds(1));
+        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
     if (!status.ok()) co_return status;
   }
   if (!store.rdb_snapshot_ || store.rdb_snapshot_->id_ != session_id) {
@@ -917,7 +917,7 @@ Task<absl::Status> StorageEngine::Impl::EndRdbSnapshot(
   store.rdb_snapshot_->invalidated_ = true;
   while (store.rdb_snapshot_->readers_ != 0) {
     auto status =
-        co_await celer::SleepFor(*store.worker_, std::chrono::milliseconds(1));
+        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
     if (!status.ok()) co_return status;
   }
   // No page cursor can reference the dirty-map entries after this point.
@@ -929,7 +929,7 @@ Task<absl::Status> StorageEngine::Impl::EndRdbSnapshot(
     }
     partition.rdb_snapshot_->accepting_ = false;
     while (partition.rdb_snapshot_->capture_admissions_ != 0) {
-      absl::Status yielded = co_await celer::SleepFor(
+      absl::Status yielded = co_await bycorf::SleepFor(
           *store.worker_, std::chrono::milliseconds(1));
       if (!yielded.ok()) co_return yielded;
     }
@@ -1170,7 +1170,7 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
             if (physical_owner == owner->worker_->id()) {
               remaining += co_await count();
             } else {
-              remaining += co_await celer::SubmitTaskTo(physical_owner, count);
+              remaining += co_await bycorf::SubmitTaskTo(physical_owner, count);
             }
           }
           const auto after =
@@ -1192,8 +1192,8 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
         active_settlements_.fetch_add(1, std::memory_order_acq_rel);
         store.worker_->Spawn(
             cancel(this, &store, session_id, pins, before, retained_bytes));
-        auto paused = co_await celer::SleepFor(*store.worker_,
-                                               std::chrono::milliseconds(50));
+        auto paused = co_await bycorf::SleepFor(*store.worker_,
+                                                std::chrono::milliseconds(50));
         if (!paused.ok()) co_return paused;
         if (!store.rdb_snapshot_ || !store.rdb_snapshot_->ending_ ||
             store.rdb_snapshot_->readers_ == 0) {

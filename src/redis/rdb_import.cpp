@@ -1,20 +1,20 @@
-#include "celer/runtime/cross_core.h"
+#include "bycorf/runtime/cross_core.h"
 #include "keylane/rdb.h"
 
 namespace keylane::rdb {
 
-celer::Task<absl::StatusOr<storage::RestoreRawResult>> RestoreFileEntry(
+bycorf::Task<absl::StatusOr<storage::RestoreRawResult>> RestoreFileEntry(
     storage::StorageEngine* storage, FileReader* reader, const FileEntry& entry,
     bool replace) {
   const unsigned owner = storage->OwnerForKey(entry.key_);
   auto apply =
       [storage, reader, &entry,
-       replace]() -> celer::Task<absl::StatusOr<storage::RestoreRawResult>> {
+       replace]() -> bycorf::Task<absl::StatusOr<storage::RestoreRawResult>> {
     if (!entry.collection_stream_)
       co_return co_await storage->RestoreRawValue(
           entry.db_id_, entry.key_, entry.value_, replace, nullptr);
     storage::CollectionPageReader next =
-        [reader]() -> celer::Task<absl::StatusOr<storage::CollectionPage>> {
+        [reader]() -> bycorf::Task<absl::StatusOr<storage::CollectionPage>> {
       co_return reader->ReadCollectionPage();
     };
     auto result = co_await storage->RestoreCollectionValue(
@@ -32,8 +32,8 @@ celer::Task<absl::StatusOr<storage::RestoreRawResult>> RestoreFileEntry(
   // if/else, not ?:, to keep the two co_awaits in separate full expressions.
   // GCC 13 can reuse the wrong coroutine-frame slot when both arms of ?:
   // contain co_await, which can run the restore on the wrong worker.
-  if (owner == celer::ThisWorker().id_) co_return co_await apply();
-  co_return co_await celer::SubmitTaskTo(owner, apply);
+  if (owner == bycorf::ThisWorker().id_) co_return co_await apply();
+  co_return co_await bycorf::SubmitTaskTo(owner, apply);
 }
 
 }  // namespace keylane::rdb

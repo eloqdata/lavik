@@ -4,8 +4,8 @@ namespace keylane::storage {
 
 Task<absl::Status> StorageEngine::Impl::FlushDbDetach(std::uint8_t db_id) {
   assert(db_id < kLogicalDatabaseCount);
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, db_id]() -> Task<absl::Status> {
           co_return co_await FlushDbDetach(db_id);
         });
@@ -20,8 +20,8 @@ Task<absl::Status> StorageEngine::Impl::FlushDbDetach(std::uint8_t db_id) {
 }
 
 Task<absl::Status> StorageEngine::Impl::FlushAllDetach() {
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(0, [this]() -> Task<absl::Status> {
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(0, [this]() -> Task<absl::Status> {
       co_return co_await FlushAllDetach();
     });
   }
@@ -41,14 +41,15 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicatedFlushDb(
   if (db_id >= kLogicalDatabaseCount || source_db_epoch == 0) {
     co_return absl::InvalidArgumentError("invalid replicated database epoch");
   }
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(0, [this, db_id, source_db_epoch]() {
-      return ApplyReplicatedFlushDb(db_id, source_db_epoch);
-    });
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
+        0, [this, db_id, source_db_epoch]() {
+          return ApplyReplicatedFlushDb(db_id, source_db_epoch);
+        });
   }
   AsyncMutex& mutex = replica_db_epoch_mutexes_[db_id];
   co_await mutex.Lock();
-  UnlockGuard unlock(&mutex, celer::ThisWorker().self_);
+  UnlockGuard unlock(&mutex, bycorf::ThisWorker().self_);
   const std::uint64_t installed_source =
       replica_source_db_epochs_[db_id].load(std::memory_order_acquire);
   // Before a foreign root is promoted there is no source/local translation.
@@ -82,8 +83,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicatedFlushAll(
     co_return absl::InvalidArgumentError(
         "invalid replicated FLUSHALL database epochs");
   }
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(0, [this, source_epochs]() {
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(0, [this, source_epochs]() {
       return ApplyReplicatedFlushAll(source_epochs);
     });
   }
@@ -119,8 +120,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicatedFlushAll(
 
 Task<absl::Status> StorageEngine::Impl::DetachDbEpochs(
     const std::array<std::uint64_t, kLogicalDatabaseCount>& next) {
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, next]() -> Task<absl::Status> {
           co_return co_await DetachDbEpochs(next);
         });
@@ -160,7 +161,7 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpochs(
     if (target == 0) {
       detached = co_await detach();
     } else {
-      detached = co_await celer::SubmitTaskTo(target, detach);
+      detached = co_await bycorf::SubmitTaskTo(target, detach);
     }
     if (!detached.ok()) co_return detached;
   }
@@ -169,8 +170,8 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpochs(
 
 Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
                                                       std::uint64_t next) {
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, db_id, next]() -> Task<absl::Status> {
           co_return co_await DetachDbEpoch(db_id, next);
         });
@@ -203,7 +204,7 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
     if (target == 0) {
       detached = co_await detach();
     } else {
-      detached = co_await celer::SubmitTaskTo(target, detach);
+      detached = co_await bycorf::SubmitTaskTo(target, detach);
     }
     if (!detached.ok()) {
       co_return detached;
@@ -213,8 +214,8 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
 }
 
 Task<absl::Status> StorageEngine::Impl::ReclaimDetachedAllWorkers(bool wait) {
-  if (celer::ThisWorker().id_ != 0) {
-    co_return co_await celer::SubmitTaskTo(
+  if (bycorf::ThisWorker().id_ != 0) {
+    co_return co_await bycorf::SubmitTaskTo(
         0, [this, wait]() -> Task<absl::Status> {
           co_return co_await ReclaimDetachedAllWorkers(wait);
         });
@@ -232,7 +233,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedAllWorkers(bool wait) {
     if (target == 0) {
       reclaimed = co_await reclaim();
     } else {
-      reclaimed = co_await celer::SubmitTaskTo(target, reclaim);
+      reclaimed = co_await bycorf::SubmitTaskTo(target, reclaim);
     }
     if (!reclaimed.ok()) {
       co_return reclaimed;
@@ -444,7 +445,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     // Freeing the entries is the expensive part of this loop, and it happens
     // as `detached` goes out of scope. Yield so online work is polled between
     // populations.
-    co_await celer::Yield(*store.worker_);
+    co_await bycorf::Yield(*store.worker_);
   }
 
   co_await store.store_state_mutex_.Lock();
@@ -493,7 +494,7 @@ Task<absl::Status> StorageEngine::Impl::AwaitDetachedReclaim(
       break;
     }
     absl::Status waited =
-        co_await celer::SleepFor(*store.worker_, std::chrono::milliseconds(1));
+        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
     if (!waited.ok()) {
       co_return waited;
     }

@@ -26,11 +26,11 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "celer/io/storage.h"
-#include "celer/net/tcp_stream.h"
-#include "celer/net/tls.h"
-#include "celer/runtime/sync.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/io/storage.h"
+#include "bycorf/net/tcp_stream.h"
+#include "bycorf/net/tls.h"
+#include "bycorf/runtime/sync.h"
+#include "bycorf/runtime/worker.h"
 #include "keylane/cluster/control_transport.h"
 #include "keylane/cluster/meta_control.h"
 #include "keylane/cluster/node_control.h"
@@ -77,15 +77,15 @@ absl::StatusOr<std::uint64_t> Entropy64() {
 }
 
 struct SocketDeadlineState {
-  celer::TcpStream* stream_ = nullptr;
-  celer::Worker* worker_ = nullptr;
+  bycorf::TcpStream* stream_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
   std::chrono::steady_clock::time_point deadline_{};
   bool armed_ = false;
   bool running_ = false;
   bool expired_ = false;
 };
 
-celer::Task<absl::Status> WatchSocketDeadline(
+bycorf::Task<absl::Status> WatchSocketDeadline(
     std::shared_ptr<SocketDeadlineState> state) {
   while (state->armed_ && state->stream_ != nullptr) {
     const auto now = std::chrono::steady_clock::now();
@@ -95,7 +95,7 @@ celer::Task<absl::Status> WatchSocketDeadline(
       (void)state->stream_->Close();
       break;
     }
-    const absl::Status slept = co_await celer::SleepFor(
+    const absl::Status slept = co_await bycorf::SleepFor(
         *state->worker_,
         std::min(
             state->deadline_ - now,
@@ -112,7 +112,7 @@ celer::Task<absl::Status> WatchSocketDeadline(
 // timeout take effect even while the previous deadline's timer is asleep.
 class SocketDeadline {
  public:
-  SocketDeadline(celer::Worker& worker, celer::TcpStream& stream)
+  SocketDeadline(bycorf::Worker& worker, bycorf::TcpStream& stream)
       : state_(std::make_shared<SocketDeadlineState>()) {
     state_->stream_ = &stream;
     state_->worker_ = &worker;
@@ -320,11 +320,11 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         "NodeControl transition");
   }
 
-  celer::Task<absl::Status> RevokeSourceAuthorizationsAndWait() override {
+  bycorf::Task<absl::Status> RevokeSourceAuthorizationsAndWait() override {
     co_return co_await replication_.RevokeClusterRebuildSourceAuthorizations();
   }
 
-  celer::Task<absl::Status>
+  bycorf::Task<absl::Status>
   ClearSourceAuthorizationsForSessionReplacementAndWait(
       bool preserve_established_exports) override {
     co_return co_await replication_
@@ -332,7 +332,8 @@ class ReplicationNodeControlActions final : public NodeControlActions {
             preserve_established_exports);
   }
 
-  celer::Task<absl::Status> RefreshSourceAuthorizationsForFdsReplacementAndWait(
+  bycorf::Task<absl::Status>
+  RefreshSourceAuthorizationsForFdsReplacementAndWait(
       bool preserve_current_population_exports,
       std::size_t expected_authorization_replays) override {
     co_return co_await replication_
@@ -341,7 +342,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
             expected_authorization_replays);
   }
 
-  celer::Task<absl::Status> ReconcileClusterControl(
+  bycorf::Task<absl::Status> ReconcileClusterControl(
       std::optional<DesiredClusterControl> desired) override {
     if (!desired.has_value()) {
       absl::Status result =
@@ -379,29 +380,29 @@ class ReplicationNodeControlActions final : public NodeControlActions {
     co_return result;
   }
 
-  celer::Task<absl::Status> ActivatePreparedPromotion(
+  bycorf::Task<absl::Status> ActivatePreparedPromotion(
       PreparedFailoverActivation activation) override {
     co_return co_await replication_.ActivateClusterPreparedPromotion(
         detail::TranslateClusterFailoverActivation(activation));
   }
 
-  celer::Task<absl::Status> EnableExpirationAuthorityUntil(
+  bycorf::Task<absl::Status> EnableExpirationAuthorityUntil(
       MonotonicTime deadline) override {
     co_return co_await replication_.EnableClusterExpirationAuthorityUntil(
         deadline.time_since_epoch());
   }
 
-  celer::Task<absl::Status> EnableSourceAdmissionForLease(
+  bycorf::Task<absl::Status> EnableSourceAdmissionForLease(
       MonotonicTime deadline) override {
     co_return co_await replication_.EnableClusterRebuildSourceAdmissionUntil(
         deadline.time_since_epoch());
   }
 
-  celer::Task<absl::Status> RevokeExpirationAuthority() override {
+  bycorf::Task<absl::Status> RevokeExpirationAuthority() override {
     co_return co_await replication_.RevokeClusterExpirationAuthority();
   }
 
-  celer::Task<absl::Status> ReconcilePopulation(
+  bycorf::Task<absl::Status> ReconcilePopulation(
       std::optional<PopulationReadiness> desired,
       bool population_transition_expected) override {
     std::optional<DesiredClusterPopulation> translated;
@@ -420,13 +421,13 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         std::move(translated));
   }
 
-  celer::Task<absl::Status> CancelInProgressPopulation(
+  bycorf::Task<absl::Status> CancelInProgressPopulation(
       bool preserve_current_follow_attempt) override {
     co_return co_await replication_.CancelInProgressClusterPopulation(
         preserve_current_follow_attempt);
   }
 
-  celer::Task<absl::Status> CancelPopulationForShutdown() override {
+  bycorf::Task<absl::Status> CancelPopulationForShutdown() override {
     co_return co_await replication_.CancelClusterRebuildForShutdown();
   }
 
@@ -446,7 +447,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         [completion = std::move(*completed)] { return completion.result(); });
   }
 
-  celer::Task<NodeDirectiveCompletion> StartDirective(
+  bycorf::Task<NodeDirectiveCompletion> StartDirective(
       NodeDirective directive) override {
     if (directive.kind_ == NodeDirective::Kind::kRevokeSources) {
       co_return NodeDirectiveCompletion::StartedTerminal(
@@ -502,7 +503,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         [completion = std::move(*started)]() { return completion.result(); });
   }
 
-  celer::Task<absl::Status> ApplyDirective(NodeDirective directive) override {
+  bycorf::Task<absl::Status> ApplyDirective(NodeDirective directive) override {
     NodeDirectiveCompletion completion =
         co_await StartDirective(std::move(directive));
     co_return co_await completion.Await();
@@ -1431,8 +1432,8 @@ struct MetaControlClientService::Impl {
   // object, while RunSession joins those tasks before destroying the writer
   // and stream they reference.
   struct SessionState {
-    celer::Worker* worker_ = nullptr;
-    celer::TcpStream* stream_ = nullptr;
+    bycorf::Worker* worker_ = nullptr;
+    bycorf::TcpStream* stream_ = nullptr;
     control::ControlSessionWriter* writer_ = nullptr;
     SessionIdentity session_;
     std::string boot_id_;
@@ -1460,8 +1461,8 @@ struct MetaControlClientService::Impl {
     std::vector<control::WireDirectiveIdentity> accepted_directives_;
     std::vector<control::WireDirectiveIdentity> pending_results_;
     std::optional<absl::Status> terminal_error_;
-    celer::AsyncNotification heartbeat_changed_;
-    celer::AsyncNotification tasks_changed_;
+    bycorf::AsyncNotification heartbeat_changed_;
+    bycorf::AsyncNotification tasks_changed_;
     std::size_t active_tasks_ = 0;
     std::size_t directive_completion_tasks_ = 0;
     std::size_t target_population_completion_tasks_ = 0;
@@ -1528,7 +1529,7 @@ struct MetaControlClientService::Impl {
     stopping_.store(true, std::memory_order_release);
   }
 
-  celer::Task<absl::Status> CancelPopulationForShutdown() {
+  bycorf::Task<absl::Status> CancelPopulationForShutdown() {
     if (shutdown_population_result_.has_value()) {
       co_return *shutdown_population_result_;
     }
@@ -1576,7 +1577,7 @@ struct MetaControlClientService::Impl {
     state->heartbeat_changed_.NotifyAll(*state->worker_);
   }
 
-  celer::Task<absl::Status> WaitForHeartbeatQuiesced(
+  bycorf::Task<absl::Status> WaitForHeartbeatQuiesced(
       const std::shared_ptr<SessionState>& state) {
     while (!state->closing_ && state->heartbeat_running_ &&
            !state->heartbeat_projection_gate_.quiesced()) {
@@ -1593,7 +1594,7 @@ struct MetaControlClientService::Impl {
     state->heartbeat_changed_.NotifyAll(*state->worker_);
   }
 
-  celer::Task<bool> QuiesceHeartbeatIfRequested(
+  bycorf::Task<bool> QuiesceHeartbeatIfRequested(
       const std::shared_ptr<SessionState>& state) {
     if (!state->heartbeat_projection_gate_.pause_requested()) co_return false;
     state->heartbeat_projection_gate_.MarkQuiesced(true);
@@ -1609,7 +1610,7 @@ struct MetaControlClientService::Impl {
     co_return true;
   }
 
-  celer::Task<absl::StatusOr<control::WireMessage>> ReadWithDeadline(
+  bycorf::Task<absl::StatusOr<control::WireMessage>> ReadWithDeadline(
       control::ControlFrameStream& frames, SocketDeadline& deadline,
       std::chrono::milliseconds timeout, std::string_view phase) {
     if (absl::Status armed = deadline.Arm(timeout); !armed.ok()) {
@@ -1623,7 +1624,7 @@ struct MetaControlClientService::Impl {
     co_return message;
   }
 
-  celer::Task<absl::StatusOr<ReceivedTransfer>> ReceiveTransfer(
+  bycorf::Task<absl::StatusOr<ReceivedTransfer>> ReceiveTransfer(
       control::ControlFrameStream& frames, SocketDeadline& deadline,
       std::chrono::milliseconds progress_timeout,
       std::optional<control::WireMessage> first = std::nullopt) {
@@ -1669,7 +1670,7 @@ struct MetaControlClientService::Impl {
                                .bytes_ = sink.TakeBytes()};
   }
 
-  celer::Task<absl::StatusOr<control::FullDesiredState>> ReceiveFullState(
+  bycorf::Task<absl::StatusOr<control::FullDesiredState>> ReceiveFullState(
       control::ControlFrameStream& frames, SocketDeadline& deadline,
       std::chrono::milliseconds progress_timeout,
       std::optional<control::WireMessage> first = std::nullopt) {
@@ -1692,8 +1693,8 @@ struct MetaControlClientService::Impl {
     co_return control::DecodeFullDesiredState(std::move(transfer->bytes_));
   }
 
-  celer::Task<absl::Status> Install(const control::NodeControlState& desired,
-                                    std::string_view local_boot_id) {
+  bycorf::Task<absl::Status> Install(const control::NodeControlState& desired,
+                                     std::string_view local_boot_id) {
     auto prepared = PrepareNodeControlState(desired, options_.node_id_,
                                             options_.request_worker_count_);
     if (!prepared.ok()) co_return prepared.status();
@@ -1735,7 +1736,7 @@ struct MetaControlClientService::Impl {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> SendApplied(
+  bycorf::Task<absl::Status> SendApplied(
       control::ControlSessionWriter& writer,
       const control::NodeControlState& desired,
       control::WireId128 request_id = {}) {
@@ -1747,7 +1748,7 @@ struct MetaControlClientService::Impl {
         }));
   }
 
-  celer::Task<absl::Status> SendDirectiveResult(
+  bycorf::Task<absl::Status> SendDirectiveResult(
       control::ControlSessionWriter& writer,
       const control::DirectiveResult& result) {
     const control::WireMessage message(result);
@@ -1769,9 +1770,9 @@ struct MetaControlClientService::Impl {
         control::TransferKind::kDirectiveResult, *object_id, std::move(owned));
   }
 
-  celer::Task<absl::Status> HandleFence(const control::Fence& fence,
-                                        const SessionIdentity& session,
-                                        std::string_view boot_id) {
+  bycorf::Task<absl::Status> HandleFence(const control::Fence& fence,
+                                         const SessionIdentity& session,
+                                         std::string_view boot_id) {
     if (fence.session_id != session.session_id_.bytes() ||
         fence.target_boot_id != boot_id) {
       co_return absl::FailedPreconditionError(
@@ -1919,7 +1920,7 @@ struct MetaControlClientService::Impl {
     };
   }
 
-  celer::Task<absl::Status> SendTerminalDirectiveResult(
+  bycorf::Task<absl::Status> SendTerminalDirectiveResult(
       control::ControlSessionWriter& writer,
       const std::shared_ptr<SessionState>& state,
       const control::Directive& directive, const absl::Status& applied,
@@ -1945,7 +1946,7 @@ struct MetaControlClientService::Impl {
     co_return co_await SendDirectiveResult(writer, response);
   }
 
-  celer::Task<absl::Status> ObserveDirectiveCompletion(
+  bycorf::Task<absl::Status> ObserveDirectiveCompletion(
       std::shared_ptr<SessionState> state, control::Directive directive,
       NodeDirectiveCompletion completion, std::uint64_t generation,
       bool target_population_work) {
@@ -1958,7 +1959,7 @@ struct MetaControlClientService::Impl {
             *state->writer_, state, directive, *terminal, completion.started());
         break;
       }
-      result = co_await celer::SleepFor(*state->worker_, 10ms);
+      result = co_await bycorf::SleepFor(*state->worker_, 10ms);
       if (!result.ok()) break;
     }
     --state->directive_completion_tasks_;
@@ -1973,7 +1974,7 @@ struct MetaControlClientService::Impl {
     co_return result;
   }
 
-  celer::Task<absl::Status> RunDirectiveExecutor(
+  bycorf::Task<absl::Status> RunDirectiveExecutor(
       std::shared_ptr<SessionState> state) {
     absl::Status result = absl::OkStatus();
     while (!state->closing_ && state->directive_dispatch_enabled_ &&
@@ -2027,7 +2028,7 @@ struct MetaControlClientService::Impl {
     co_return result;
   }
 
-  celer::Task<absl::Status> QueueDirective(
+  bycorf::Task<absl::Status> QueueDirective(
       const std::shared_ptr<SessionState>& state,
       const control::Directive& directive) {
     if (!state->directive_dispatch_enabled_) {
@@ -2059,7 +2060,7 @@ struct MetaControlClientService::Impl {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> WaitForDirectiveExecutor(
+  bycorf::Task<absl::Status> WaitForDirectiveExecutor(
       const std::shared_ptr<SessionState>& state) {
     while (state->directive_runner_running_) {
       co_await state->tasks_changed_.Wait();
@@ -2070,7 +2071,7 @@ struct MetaControlClientService::Impl {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> CancelAndWaitForDirectiveCompletions(
+  bycorf::Task<absl::Status> CancelAndWaitForDirectiveCompletions(
       const std::shared_ptr<SessionState>& state) {
     ++state->directive_generation_;
     while (state->directive_completion_tasks_ != 0) {
@@ -2082,7 +2083,7 @@ struct MetaControlClientService::Impl {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> QueueCurrentTasks(
+  bycorf::Task<absl::Status> QueueCurrentTasks(
       const std::shared_ptr<SessionState>& state) {
     // Copy only this request's execution envelopes: QueueDirective may await
     // transport backpressure while the immutable selected state remains live.
@@ -2096,7 +2097,7 @@ struct MetaControlClientService::Impl {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ApplyControlUpdate(
+  bycorf::Task<absl::Status> ApplyControlUpdate(
       const std::shared_ptr<SessionState>& state,
       control::ControlSessionWriter& writer,
       const control::NodeControlUpdate& update) {
@@ -2255,7 +2256,7 @@ struct MetaControlClientService::Impl {
     });
   }
 
-  celer::Task<absl::Status> SleepHeartbeatInterval(
+  bycorf::Task<absl::Status> SleepHeartbeatInterval(
       const std::shared_ptr<SessionState>& state) {
     const auto deadline =
         std::chrono::steady_clock::now() + state->heartbeat_interval_;
@@ -2263,7 +2264,7 @@ struct MetaControlClientService::Impl {
            !state->heartbeat_projection_gate_.pause_requested()) {
       const auto now = std::chrono::steady_clock::now();
       if (now >= deadline) break;
-      const absl::Status slept = co_await celer::SleepFor(
+      const absl::Status slept = co_await bycorf::SleepFor(
           *state->worker_,
           std::min(
               deadline - now,
@@ -2274,7 +2275,7 @@ struct MetaControlClientService::Impl {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> RunHeartbeatProducer(
+  bycorf::Task<absl::Status> RunHeartbeatProducer(
       std::shared_ptr<SessionState> state) {
     absl::Status result = absl::OkStatus();
     std::uint64_t heartbeat_sequence = 1;
@@ -2516,7 +2517,7 @@ struct MetaControlClientService::Impl {
     co_return result;
   }
 
-  celer::Task<absl::Status> HandleHeartbeatAck(
+  bycorf::Task<absl::Status> HandleHeartbeatAck(
       const std::shared_ptr<SessionState>& state,
       const control::HeartbeatAck& ack) {
     if (ack.session_id == state->session_.session_id_.bytes() &&
@@ -2648,13 +2649,13 @@ struct MetaControlClientService::Impl {
     co_return absl::OkStatus();
   }
 
-  celer::Task<detail::MetaSessionRunResult> RunSession(
-      celer::Worker& worker, const MetaControlEndpoint& endpoint,
+  bycorf::Task<detail::MetaSessionRunResult> RunSession(
+      bycorf::Worker& worker, const MetaControlEndpoint& endpoint,
       bool* valid_heartbeat_ack) {
-    auto connected = co_await celer::ConnectTcp(
+    auto connected = co_await bycorf::ConnectTcp(
         worker, endpoint.host_, endpoint.port_, kConnectTimeout);
     if (!connected.ok()) co_return connected.status();
-    celer::TcpStream stream = std::move(*connected);
+    bycorf::TcpStream stream = std::move(*connected);
     if (stopping_.load(std::memory_order_acquire)) {
       (void)stream.Close();
       // No session state was installed, so this is successful quiescence.
@@ -2797,7 +2798,7 @@ struct MetaControlClientService::Impl {
     std::shared_ptr<SessionState> state;
     // Keep cleanup outside the body coroutine so every return path joins the
     // heartbeat/directive producers and then awaits source-session cleanup.
-    auto run_established = [&]() -> celer::Task<absl::Status> {
+    auto run_established = [&]() -> bycorf::Task<absl::Status> {
       auto initial =
           co_await ReceiveFullState(frames, socket_deadline, progress_timeout);
       if (!initial.ok()) co_return initial.status();
@@ -3145,8 +3146,8 @@ void MetaControlClientService::Prepare(unsigned thread_count) {
   impl_->prepared_thread_count_ = thread_count;
 }
 
-celer::Task<absl::Status> MetaControlClientService::Run(celer::Worker& worker,
-                                                        celer::ServiceContext) {
+bycorf::Task<absl::Status> MetaControlClientService::Run(
+    bycorf::Worker& worker, bycorf::ServiceContext) {
   if (worker.id() != 0) co_return absl::OkStatus();
   impl_->BeginRun();
   absl::Status run_status = absl::OkStatus();
@@ -3210,7 +3211,7 @@ celer::Task<absl::Status> MetaControlClientService::Run(celer::Worker& worker,
            !impl_->stopping_.load(std::memory_order_acquire) &&
            !worker.stop_requested()) {
       const auto slice = std::min(remaining, kDeadlinePollInterval);
-      const absl::Status slept = co_await celer::SleepFor(worker, slice);
+      const absl::Status slept = co_await bycorf::SleepFor(worker, slice);
       if (!slept.ok()) {
         if (impl_->stopping_.load(std::memory_order_acquire)) break;
         run_status = slept;

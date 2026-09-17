@@ -1,4 +1,4 @@
-#include "celer/runtime/foreign_executor.h"
+#include "bycorf/runtime/foreign_executor.h"
 
 #include <atomic>
 #include <chrono>
@@ -9,13 +9,13 @@
 #include <vector>
 
 #include "absl/status/status.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/runtime.h"
-#include "celer/runtime/task.h"
-#include "celer/runtime/worker.h"
+#include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/runtime.h"
+#include "bycorf/runtime/task.h"
+#include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
 
-namespace celer {
+namespace bycorf {
 namespace {
 using namespace std::chrono_literals;
 
@@ -155,4 +155,4 @@ TEST(ForeignExecutorTest, RejectsInvalidRuntimeAndWorker) {
 }
 
 }  // namespace
-}  // namespace celer
+}  // namespace bycorf

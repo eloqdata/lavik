@@ -204,11 +204,11 @@ Task<absl::Status> StorageEngine::Impl::QuiesceExpiration() {
   // flag before it checks the pause count, so it either sees the increment
   // above and abstains, or is seen here and waited out.
   for (unsigned target = 0; target < worker_count_; ++target) {
-    absl::Status drained = co_await celer::SubmitTaskTo(
+    absl::Status drained = co_await bycorf::SubmitTaskTo(
         target, [this, target]() -> Task<absl::Status> {
           WorkerStore& store = *stores_[target];
           while (store.expiry_cycle_running_) {
-            absl::Status waited = co_await celer::SleepFor(
+            absl::Status waited = co_await bycorf::SleepFor(
                 *store.worker_, std::chrono::milliseconds(1));
             if (!waited.ok()) {
               co_return waited;
@@ -448,7 +448,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
   while (!store->worker_->stop_requested()) {
     const auto interval = std::chrono::milliseconds(
         ActiveExpirationConfigValue(ActiveExpirationConfigKey::kIntervalMs));
-    absl::Status waited = co_await celer::SleepFor(*store->worker_, interval);
+    absl::Status waited = co_await bycorf::SleepFor(*store->worker_, interval);
     if (!waited.ok()) {
       co_return waited;
     }
@@ -575,7 +575,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
         // A populated index can run callbacks and external-key reads. Keep the
         // original per-map checkpoint for dense TTL workloads; only empty maps
         // use the bounded batching fast path below.
-        co_await celer::Yield(*store->worker_);
+        co_await bycorf::Yield(*store->worker_);
       }
     }
     // Empty maps are the common case across 16,384 partitions and 16 DBs.
@@ -584,7 +584,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     // remain uncollected for longer than a full-device reclaim can tolerate.
     // The per-cycle empty-map bound limits this batch while one yield
     // preserves fairness before candidate deletion begins.
-    co_await celer::Yield(*store->worker_);
+    co_await bycorf::Yield(*store->worker_);
 
     bool warned_failure = false;
     while (processed < deletes && !store->expired_candidates_.empty()) {
@@ -630,11 +630,11 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
           warned_failure = true;
         }
         ++processed;
-        co_await celer::Yield(*store->worker_);
+        co_await bycorf::Yield(*store->worker_);
         continue;
       }
       ++processed;
-      co_await celer::Yield(*store->worker_);
+      co_await bycorf::Yield(*store->worker_);
     }
   }
   co_return absl::OkStatus();

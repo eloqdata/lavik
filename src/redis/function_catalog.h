@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/storage/engine.h"
 #include "lua_eval.h"
 
@@ -19,14 +19,14 @@ class FunctionCatalogOperationGuard {
   ~FunctionCatalogOperationGuard();
 
  private:
-  friend celer::Task<std::unique_ptr<FunctionCatalogOperationGuard>>
+  friend bycorf::Task<std::unique_ptr<FunctionCatalogOperationGuard>>
   AcquireFunctionCatalogOperation();
   FunctionCatalogOperationGuard() = default;
 };
 
 // Serializes catalog observers/mutators with FCALL and promotion capture.
 // Holding the returned lease is the existing process-wide Function guard.
-celer::Task<std::unique_ptr<FunctionCatalogOperationGuard>>
+bycorf::Task<std::unique_ptr<FunctionCatalogOperationGuard>>
 AcquireFunctionCatalogOperation();
 
 // Owns the process-global Redis Function catalog lifecycle. A mutation builds
@@ -50,26 +50,26 @@ class FunctionCatalog {
   // are checked before cross-worker compilation. The returned complete catalog
   // is invisible until commit; any worker compile or metadata mismatch aborts
   // every hidden runtime before returning an error.
-  celer::Task<absl::StatusOr<StagedCatalog>> StageCompleteCatalog(
+  bycorf::Task<absl::StatusOr<StagedCatalog>> StageCompleteCatalog(
       std::vector<LuaFunctionLibrary> target);
   // Publishes only the durable dump/root. Runtime visibility is unchanged on
   // failure, so the staged catalog remains abortable.
-  celer::Task<absl::StatusOr<storage::CatalogDurabilityToken>>
+  bycorf::Task<absl::StatusOr<storage::CatalogDurabilityToken>>
   MakeStagedCatalogDurable(const StagedCatalog& staged);
   // Installs an already durable staged catalog with non-failing worker-local
   // runtime swaps, then replaces the process-global metadata.
-  celer::Task<absl::Status> CommitStagedCatalog(
+  bycorf::Task<absl::Status> CommitStagedCatalog(
       StagedCatalog staged, storage::CatalogDurabilityToken token,
       bool enable_crash_points = true);
-  celer::Task<absl::Status> AbortStagedCatalog(StagedCatalog* staged);
+  bycorf::Task<absl::Status> AbortStagedCatalog(StagedCatalog* staged);
 
   // Restores and validates the selected durable dump before service readiness.
   // A fresh set without one keeps the canonical empty runtime; corruption or
   // cross-worker compilation disagreement fails startup.
-  celer::Task<absl::Status> RecoverAtStartup();
-  celer::Task<absl::Status> ReplaceFromLibraryCodes(
+  bycorf::Task<absl::Status> RecoverAtStartup();
+  bycorf::Task<absl::Status> ReplaceFromLibraryCodes(
       const std::vector<std::string>& library_codes);
-  celer::Task<absl::Status> ValidateLibraryCodes(
+  bycorf::Task<absl::Status> ValidateLibraryCodes(
       const std::vector<std::string>& library_codes);
 
   std::string SnapshotDump() const;

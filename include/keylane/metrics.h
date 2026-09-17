@@ -9,7 +9,7 @@
 #include <string>
 #include <string_view>
 
-#include "celer/runtime/task.h"
+#include "bycorf/runtime/task.h"
 #include "keylane/command.h"
 
 namespace keylane {
@@ -121,25 +121,25 @@ enum class DefragMetricResult : std::uint8_t {
 void RecordDefragMetric(DefragMetricResult result) noexcept;
 void SetDefragActive(bool active) noexcept;
 void SetDefragPending(bool pending) noexcept;
-celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics();
+bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics();
 // Clears Redis command counters on their owning workers. Live gauges and
 // dataset persistence accounting are deliberately preserved.
-celer::Task<absl::Status> ResetCommandMetrics();
+bycorf::Task<absl::Status> ResetCommandMetrics();
 std::string_view CommandMetricName(CommandKind kind) noexcept;
 
-celer::Task<absl::Status> RenderPrometheusMetrics(
+bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
     std::string* output);
 
 }  // namespace keylane
 
-namespace celer {
+namespace bycorf {
 class Service;
 }
 
 namespace keylane {
 
-std::unique_ptr<celer::Service> CreateMetricsService(
+std::unique_ptr<bycorf::Service> CreateMetricsService(
     std::uint16_t port, const storage::StorageEngine* storage,
     std::function<bool()> server_ready);
 

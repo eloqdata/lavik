@@ -12,7 +12,7 @@
 #include <memory>
 
 #include "absl/status/statusor.h"
-#include "celer/runtime/foreign_executor.h"
+#include "bycorf/runtime/foreign_executor.h"
 #include "keylane/meta/automatic_failover_detector.h"
 #include "keylane/meta/coordinator.h"
 #include "keylane/meta/data_control_runtime_status.h"
@@ -46,7 +46,7 @@ class MetaAutomaticFailoverReconciler final : public MetaReconciler {
   struct Core;
 
   MetaAutomaticFailoverReconciler(
-      celer::ForeignExecutor executor,
+      bycorf::ForeignExecutor executor,
       MetaAutomaticFailoverReconcilerOptions options);
   ~MetaAutomaticFailoverReconciler() override;
 
@@ -72,8 +72,8 @@ class MetaAutomaticFailoverReconciler final : public MetaReconciler {
   void Shutdown();
 
  private:
-  static celer::Task<absl::Status> Run(std::shared_ptr<Core> core,
-                                       MetaLeaderContext* context);
+  static bycorf::Task<absl::Status> Run(std::shared_ptr<Core> core,
+                                        MetaLeaderContext* context);
   void Stop(bool permanent);
 
   std::shared_ptr<Core> core_;

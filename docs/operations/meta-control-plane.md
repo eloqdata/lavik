@@ -690,7 +690,7 @@ command.
 Do not mix plaintext and mTLS members. Enabling or disabling Raft TLS on an
 existing cluster requires a coordinated restart of all members; it does not
 change the WAL or snapshot format. `--raft-io-threads` sizes NuRaft's native
-Asio pool (default 2); it does not change the single Celer control-session
+Asio pool (default 2); it does not change the single Bycorf control-session
 worker or make WAL synchronization asynchronous.
 
 ## Configure Data nodes

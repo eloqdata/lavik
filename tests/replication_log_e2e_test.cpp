@@ -20,7 +20,7 @@
 #include "../src/redis/sort_command.h"
 #include "../src/redis/string_command.h"
 #include "../src/redis/zset_command.h"
-#include "celer/net/server.h"
+#include "bycorf/net/server.h"
 #include "keylane/command.h"
 #include "keylane/command_table.h"
 #include "keylane/memory.h"
@@ -170,8 +170,8 @@ class RepeatedByteSource final : public ReplicationLogPayloadSource {
 
   std::uint64_t size() const noexcept override { return size_; }
 
-  celer::Task<absl::Status> Read(std::uint64_t offset,
-                                 std::span<std::byte> output) override {
+  bycorf::Task<absl::Status> Read(std::uint64_t offset,
+                                  std::span<std::byte> output) override {
     if (offset > size_ || output.size() > size_ - offset) {
       co_return absl::Status(absl::StatusCode::kOutOfRange,
                              "test payload source read is out of range");
@@ -185,7 +185,7 @@ class RepeatedByteSource final : public ReplicationLogPayloadSource {
   char byte_ = 0;
 };
 
-class ReplicationLogService final : public celer::Service {
+class ReplicationLogService final : public bycorf::Service {
  public:
   ReplicationLogService(StorageEngine* storage, bool exercise)
       : storage_(storage), exercise_(exercise) {}
@@ -194,8 +194,8 @@ class ReplicationLogService final : public celer::Service {
     Check(thread_count == 1, "replication log test requires one worker");
   }
 
-  celer::Task<absl::Status> Run(celer::Worker& worker,
-                                celer::ServiceContext) override {
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
+                                 bycorf::ServiceContext) override {
     worker_ = &worker;
     keylane::BindMemoryAccountingShard(worker.id());
     keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
@@ -212,7 +212,7 @@ class ReplicationLogService final : public celer::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
-  celer::Task<absl::Status> ExerciseMutationPrecondition() {
+  bycorf::Task<absl::Status> ExerciseMutationPrecondition() {
     auto rejected_probe = std::make_shared<MutationPreconditionProbe>();
     const keylane::storage::MutationPrecondition rejected_precondition(
         std::shared_ptr<const void>(rejected_probe),
@@ -271,7 +271,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExecuteClientCommand(
+  bycorf::Task<absl::Status> ExecuteClientCommand(
       std::uint8_t db_id, std::vector<std::string> args,
       std::string_view expected_reply) {
     auto request = keylane::BuildCommandRequest(
@@ -316,7 +316,7 @@ class ReplicationLogService final : public celer::Service {
     return keylane::InitMemoryLimit(steady_target + steady_allowance, 1);
   }
 
-  celer::Task<absl::Status> ExerciseTransactionGuardAdmission(
+  bycorf::Task<absl::Status> ExerciseTransactionGuardAdmission(
       std::vector<std::string> args) {
     auto request = keylane::BuildCommandRequest(
         keylane::RespCommand{.args_ = std::move(args)}, 0);
@@ -359,7 +359,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExerciseBitOpPayloadAdmission() {
+  bycorf::Task<absl::Status> ExerciseBitOpPayloadAdmission() {
     std::vector<std::string> source_args{"SET", "bitop-admission-source",
                                          std::string(kMiB, 'B')};
     absl::Status status =
@@ -406,7 +406,7 @@ class ReplicationLogService final : public celer::Service {
         0, {"GET", "bitop-admission-destination"}, "$3\r\nold\r\n");
   }
 
-  celer::Task<absl::Status> WaitForReplicationTail(
+  bycorf::Task<absl::Status> WaitForReplicationTail(
       std::uint64_t expected_tail) {
     for (unsigned attempt = 0; attempt < 5'000; ++attempt) {
       const auto info = storage_->LocalReplicationLogInfo();
@@ -416,14 +416,14 @@ class ReplicationLogService final : public celer::Service {
       }
       if (info.tail_lsn_ >= expected_tail) co_return absl::OkStatus();
       absl::Status slept =
-          co_await celer::SleepFor(*worker_, std::chrono::milliseconds(1));
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(1));
       if (!slept.ok()) co_return slept;
     }
     co_return absl::Status(absl::StatusCode::kDeadlineExceeded,
                            "replication publisher did not reach the tail");
   }
 
-  celer::Task<absl::Status> ExerciseCanonicalTransactionGrowth() {
+  bycorf::Task<absl::Status> ExerciseCanonicalTransactionGrowth() {
     // A transaction can canonicalize to an after-image larger than both its
     // request and the queue waterline. Keep another command behind it: the
     // single publisher must process the admitted head even though the byte
@@ -500,7 +500,7 @@ class ReplicationLogService final : public celer::Service {
     co_return co_await storage_->DisableReplicationLog();
   }
 
-  celer::Task<absl::Status> PrepareSourceAfterImagesPartOne() {
+  bycorf::Task<absl::Status> PrepareSourceAfterImagesPartOne() {
     constexpr std::uint8_t kDb = 7;
     absl::Status status = co_await ExecuteClientCommand(
         kDb, {"RPUSH", "late-list-source", "left", "moved"}, ":2\r\n");
@@ -517,7 +517,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> PrepareSourceAfterImagesPartTwo() {
+  bycorf::Task<absl::Status> PrepareSourceAfterImagesPartTwo() {
     constexpr std::uint8_t kDb = 7;
     absl::Status status = co_await ExecuteClientCommand(
         kDb, {"SADD", "late-set-a", "a", "b"}, ":2\r\n");
@@ -532,7 +532,7 @@ class ReplicationLogService final : public celer::Service {
         kDb, {"ZADD", "late-zset-b", "2", "a", "4", "b"}, ":2\r\n");
   }
 
-  celer::Task<absl::Status> PrepareMultiPopAfterImages() {
+  bycorf::Task<absl::Status> PrepareMultiPopAfterImages() {
     constexpr std::uint8_t kDb = 7;
     absl::Status status = co_await ExecuteClientCommand(
         kDb, {"RPUSH", "late-pop-first", "a", "b"}, ":2\r\n");
@@ -547,7 +547,7 @@ class ReplicationLogService final : public celer::Service {
         kDb, {"ZADD", "late-zpop-second", "1", "x"}, ":1\r\n");
   }
 
-  celer::Task<absl::Status> ExpireSourceAfterImages() {
+  bycorf::Task<absl::Status> ExpireSourceAfterImages() {
     constexpr std::uint8_t kDb = 7;
     absl::Status status;
     constexpr std::array<std::string_view, 10> kSources{
@@ -562,7 +562,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> PrepareSourceAfterImages() {
+  bycorf::Task<absl::Status> PrepareSourceAfterImages() {
     absl::Status status = co_await PrepareSourceAfterImagesPartOne();
     if (!status.ok()) co_return status;
     status = co_await PrepareSourceAfterImagesPartTwo();
@@ -572,7 +572,7 @@ class ReplicationLogService final : public celer::Service {
     co_return co_await ExpireSourceAfterImages();
   }
 
-  celer::Task<absl::StatusOr<std::vector<ReplicatedCommand>>>
+  bycorf::Task<absl::StatusOr<std::vector<ReplicatedCommand>>>
   JournalSourceAfterImages() {
     constexpr std::uint8_t kDb = 7;
     absl::Status status = co_await storage_->EnableReplicationLog(25, 8 * kMiB);
@@ -674,7 +674,7 @@ class ReplicationLogService final : public celer::Service {
     co_return commands;
   }
 
-  celer::Task<absl::Status> ReplaySourceAfterImages(
+  bycorf::Task<absl::Status> ReplaySourceAfterImages(
       std::vector<ReplicatedCommand> commands) {
     constexpr std::uint8_t kDb = 7;
     absl::Status status = co_await storage_->DisableReplicationLog();
@@ -688,7 +688,7 @@ class ReplicationLogService final : public celer::Service {
       if (!removed.ok()) co_return removed.status();
     }
     status =
-        co_await celer::SleepFor(*worker_, std::chrono::milliseconds(2100));
+        co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(2100));
     if (!status.ok()) co_return status;
     for (const ReplicatedCommand& command : commands) {
       status = co_await keylane::ApplyReplicatedCommand(command);
@@ -719,7 +719,7 @@ class ReplicationLogService final : public celer::Service {
         kDb, {"ZSCORE", "late-zpop-second", "x"}, "$1\r\n1\r\n");
   }
 
-  celer::Task<absl::Status> ExerciseSourceAfterImages() {
+  bycorf::Task<absl::Status> ExerciseSourceAfterImages() {
     // Source-dependent writes publish deterministic destination after-images.
     // Replay after every source deadline has passed must still reproduce the
     // committed destination instead of silently becoming a replica no-op.
@@ -730,7 +730,7 @@ class ReplicationLogService final : public celer::Service {
     co_return co_await ReplaySourceAfterImages(std::move(*commands));
   }
 
-  celer::Task<absl::Status> ExerciseFullSyncOverrides() {
+  bycorf::Task<absl::Status> ExerciseFullSyncOverrides() {
     constexpr std::uint64_t kFirstSession = 101;
     constexpr std::uint64_t kSecondSession = 202;
     constexpr std::uint8_t kDb = 3;
@@ -1076,7 +1076,7 @@ class ReplicationLogService final : public celer::Service {
     bool race_read_finished = false;
     absl::Status race_read_status = absl::UnknownError("not started");
     std::optional<PartitionFullSyncBatch> race_batch;
-    auto read_racing_batch = [&]() -> celer::Task<absl::Status> {
+    auto read_racing_batch = [&]() -> bycorf::Task<absl::Status> {
       auto read = co_await storage_->ReadPartitionFullSyncOverrides(
           kReplacementRaceSession, race_partition, 16,
           keylane::storage::kReplicationTransferBytes);
@@ -1087,7 +1087,7 @@ class ReplicationLogService final : public celer::Service {
     };
     worker_->Spawn(read_racing_batch());
     for (unsigned spin = 0; spin < 32; ++spin) {
-      co_await celer::Yield(*worker_);
+      co_await bycorf::Yield(*worker_);
     }
     Check(!race_read_finished,
           "replacement race reader did not wait on the first key");
@@ -1095,7 +1095,7 @@ class ReplicationLogService final : public celer::Service {
         kDb, race_second, std::string(10 * kMiB, 'r'), {});
     if (!race_second_large.ok()) co_return race_second_large.status();
     race_lock.Reset();
-    while (!race_read_finished) co_await celer::Yield(*worker_);
+    while (!race_read_finished) co_await bycorf::Yield(*worker_);
     if (!race_read_status.ok()) co_return race_read_status;
     Check(race_batch.has_value() && race_batch->records_.size() == 1 &&
               race_batch->records_.front().key_ == race_first &&
@@ -1142,7 +1142,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExercisePartitionHandoff() {
+  bycorf::Task<absl::Status> ExercisePartitionHandoff() {
     constexpr std::uint64_t kSession = 404;
     constexpr std::uint8_t kDb = 4;
     const std::string key = "fullsync-handoff{ordered}";
@@ -1245,7 +1245,7 @@ class ReplicationLogService final : public celer::Service {
     bool admission_finished = false;
     absl::Status admission_status =
         absl::UnknownError("full-sync admission waiter did not run");
-    auto wait_for_fullsync_admission = [&]() -> celer::Task<absl::Status> {
+    auto wait_for_fullsync_admission = [&]() -> bycorf::Task<absl::Status> {
       auto admission = co_await storage_->AcquireReplicationPublisherAdmission(
           700 * 1024, keylane::storage::ReplicationPublisherTarget{
                           .partition_id_ = partition_id, .db_id_ = kDb});
@@ -1260,13 +1260,13 @@ class ReplicationLogService final : public celer::Service {
     };
     worker_->Spawn(wait_for_fullsync_admission());
     for (unsigned spin = 0; spin < 32; ++spin) {
-      co_await celer::Yield(*worker_);
+      co_await bycorf::Yield(*worker_);
     }
     Check(!admission_finished,
           "full-sync queue capacity did not backpressure the next writer");
     storage_->AcknowledgeFullSyncPublishItem(kSession,
                                              large_queued->front().id_);
-    while (!admission_finished) co_await celer::Yield(*worker_);
+    while (!admission_finished) co_await bycorf::Yield(*worker_);
     if (!admission_status.ok()) co_return admission_status;
     Check(storage_->LocalReplicationLogInfo().fullsync_backpressure_waits_ > 0,
           "full-sync queue backpressure wait was not observed");
@@ -1291,7 +1291,7 @@ class ReplicationLogService final : public celer::Service {
         small_admission;
     absl::Status oversized_status = absl::UnknownError("not started");
     absl::Status small_status = absl::UnknownError("not started");
-    auto wait_oversized = [&]() -> celer::Task<absl::Status> {
+    auto wait_oversized = [&]() -> bycorf::Task<absl::Status> {
       auto result = co_await storage_->AcquireReplicationPublisherAdmission(
           2 * kMiB, keylane::storage::ReplicationPublisherTarget{
                         .partition_id_ = partition_id, .db_id_ = kDb});
@@ -1300,7 +1300,7 @@ class ReplicationLogService final : public celer::Service {
       oversized_finished = true;
       co_return absl::OkStatus();
     };
-    auto wait_small = [&]() -> celer::Task<absl::Status> {
+    auto wait_small = [&]() -> bycorf::Task<absl::Status> {
       auto result = co_await storage_->AcquireReplicationPublisherAdmission(
           1, keylane::storage::ReplicationPublisherTarget{
                  .partition_id_ = partition_id, .db_id_ = kDb});
@@ -1312,18 +1312,18 @@ class ReplicationLogService final : public celer::Service {
     worker_->Spawn(wait_oversized());
     worker_->Spawn(wait_small());
     for (unsigned spin = 0; spin < 32; ++spin) {
-      co_await celer::Yield(*worker_);
+      co_await bycorf::Yield(*worker_);
     }
     Check(!oversized_finished && !small_finished,
           "publisher waiters bypassed occupied queue capacity");
     storage_->AcknowledgeFullSyncPublishItem(kSession, refill->front().id_);
-    while (!oversized_finished) co_await celer::Yield(*worker_);
+    while (!oversized_finished) co_await bycorf::Yield(*worker_);
     if (!oversized_status.ok()) co_return oversized_status;
     Check(!small_finished,
           "small publisher admission bypassed an earlier oversized waiter");
     storage_->ReleaseReplicationPublisherAdmission(*oversized_admission,
                                                    2 * kMiB);
-    while (!small_finished) co_await celer::Yield(*worker_);
+    while (!small_finished) co_await bycorf::Yield(*worker_);
     if (!small_status.ok()) co_return small_status;
     storage_->ReleaseReplicationPublisherAdmission(*small_admission, 1);
 
@@ -1366,11 +1366,11 @@ class ReplicationLogService final : public celer::Service {
     if (!queue_capacity.ok()) co_return queue_capacity;
 
     absl::Status slept =
-        co_await celer::SleepFor(*worker_, std::chrono::milliseconds(150));
+        co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(150));
     if (!slept.ok()) co_return slept;
     Check(!co_await storage_->Exists(kDb, expiring_key),
           "active-expiration test key did not become logically expired");
-    slept = co_await celer::SleepFor(*worker_, std::chrono::milliseconds(50));
+    slept = co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(50));
     if (!slept.ok()) co_return slept;
     absl::Status quiesced = co_await storage_->QuiesceExpiration();
     if (!quiesced.ok()) co_return quiesced;
@@ -1395,7 +1395,8 @@ class ReplicationLogService final : public celer::Service {
         expired_replacement.emplace(std::move(*batch));
         break;
       }
-      slept = co_await celer::SleepFor(*worker_, std::chrono::milliseconds(10));
+      slept =
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(10));
       if (!slept.ok()) co_return slept;
     }
     Check(expired_replacement.has_value() &&
@@ -1480,7 +1481,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExerciseHardBacklogCap() {
+  bycorf::Task<absl::Status> ExerciseHardBacklogCap() {
     // With backpressure explicitly disabled, the backlog is a hard reconnect
     // window. Filling it revokes lagging coverage and evicts only complete
     // events; the sender then observes a floor gap and forces whole-group full
@@ -1593,7 +1594,7 @@ class ReplicationLogService final : public celer::Service {
     co_return co_await storage_->SetReplicationBacklogBackpressure(true);
   }
 
-  celer::Task<absl::Status> ExerciseBacklogBackpressurePolicy() {
+  bycorf::Task<absl::Status> ExerciseBacklogBackpressurePolicy() {
     absl::Status status = co_await storage_->EnableReplicationLog(21, 8 * kMiB);
     if (!status.ok()) co_return status;
     status = storage_->RetainReplicationLog(80, 1);
@@ -1612,7 +1613,7 @@ class ReplicationLogService final : public celer::Service {
     bool append_finished = false;
     absl::Status append_status =
         absl::UnknownError("backpressured append did not run");
-    auto append = [&](std::uint64_t sequence) -> celer::Task<absl::Status> {
+    auto append = [&](std::uint64_t sequence) -> bycorf::Task<absl::Status> {
       auto result =
           co_await storage_->AppendReplicationLog(ReplicationLogAppend{
               .kind_ = ReplicationEventKind::kMutation,
@@ -1627,25 +1628,25 @@ class ReplicationLogService final : public celer::Service {
     };
 
     worker_->Spawn(append(2));
-    co_await celer::Yield(*worker_);
+    co_await bycorf::Yield(*worker_);
     Check(!append_finished &&
               storage_->LocalReplicationLogInfo().capacity_backpressured_,
           "default backlog policy did not wait for replica ACK");
     status = storage_->RetainReplicationLog(80, 2);
     if (!status.ok()) co_return status;
-    while (!append_finished) co_await celer::Yield(*worker_);
+    while (!append_finished) co_await bycorf::Yield(*worker_);
     if (!append_status.ok()) co_return append_status;
 
     append_finished = false;
     append_status = absl::UnknownError("policy-change append did not run");
     worker_->Spawn(append(3));
-    co_await celer::Yield(*worker_);
+    co_await bycorf::Yield(*worker_);
     Check(!append_finished &&
               storage_->LocalReplicationLogInfo().capacity_backpressured_,
           "second append did not enter backlog backpressure");
     status = co_await storage_->SetReplicationBacklogBackpressure(false);
     if (!status.ok()) co_return status;
-    while (!append_finished) co_await celer::Yield(*worker_);
+    while (!append_finished) co_await bycorf::Yield(*worker_);
     if (!append_status.ok()) co_return append_status;
 
     const auto info = storage_->LocalReplicationLogInfo();
@@ -1659,7 +1660,7 @@ class ReplicationLogService final : public celer::Service {
 
   // Keep the FLUSH control-barrier phase independent so failures leave the
   // surrounding replication-log exercise at a clear lifecycle boundary.
-  celer::Task<absl::Status> ExerciseFlushControlBarriers() {
+  bycorf::Task<absl::Status> ExerciseFlushControlBarriers() {
     auto flush_victim = co_await storage_->Set(2, "flush-victim", "gone", {});
     auto flush_survivor =
         co_await storage_->Set(3, "flush-survivor", "kept", {});
@@ -1824,7 +1825,7 @@ class ReplicationLogService final : public celer::Service {
           "single-shard MSET still took the replication order gate");
   }
 
-  celer::Task<absl::Status> ExercisePublisherTransactionAdmission() {
+  bycorf::Task<absl::Status> ExercisePublisherTransactionAdmission() {
     absl::Status status;
     keylane::RefreshMemoryStats();
     const std::uint64_t retained_before_publisher =
@@ -1855,7 +1856,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExerciseReplicationCopyOom() {
+  bycorf::Task<absl::Status> ExerciseReplicationCopyOom() {
     absl::Status status;
     // The parsed request already owns this value. Leave enough headroom for
     // command dispatch itself but not the replication journal's second copy;
@@ -1881,7 +1882,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExerciseAdmissionAndOrdering() {
+  bycorf::Task<absl::Status> ExerciseAdmissionAndOrdering() {
     absl::Status status = co_await ExerciseFullSyncOverrides();
     if (!status.ok()) co_return status;
 
@@ -1896,7 +1897,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExerciseBacklogStorage() {
+  bycorf::Task<absl::Status> ExerciseBacklogStorage() {
     absl::Status status;
     const auto before_oversized = storage_->LocalReplicationLogInfo();
     RepeatedByteSource too_large(9 * kMiB, 'x');
@@ -2177,7 +2178,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExercisePublishedStringCommands() {
+  bycorf::Task<absl::Status> ExercisePublishedStringCommands() {
     absl::Status status;
     // Client command dispatch transfers committed writes to the asynchronous
     // publisher. Large arguments may span replication frames, but decode and
@@ -2202,7 +2203,7 @@ class ReplicationLogService final : public celer::Service {
     bool waiter_finished = false;
     absl::Status waiter_status =
         absl::UnknownError("publisher admission waiter did not run");
-    auto wait_for_publisher_admission = [&]() -> celer::Task<absl::Status> {
+    auto wait_for_publisher_admission = [&]() -> bycorf::Task<absl::Status> {
       auto admitted =
           co_await storage_->AcquireReplicationPublisherAdmission(1);
       if (!admitted.ok()) {
@@ -2215,13 +2216,13 @@ class ReplicationLogService final : public celer::Service {
       co_return absl::OkStatus();
     };
     worker_->Spawn(wait_for_publisher_admission());
-    co_await celer::Yield(*worker_);
+    co_await bycorf::Yield(*worker_);
     Check(!waiter_finished,
           "publisher admission did not apply backpressure at the high-water "
           "mark");
     storage_->ReleaseReplicationPublisherAdmission(*exclusive_admission,
                                                    17 * kMiB);
-    while (!waiter_finished) co_await celer::Yield(*worker_);
+    while (!waiter_finished) co_await bycorf::Yield(*worker_);
     if (!waiter_status.ok()) co_return waiter_status;
 
     status = co_await storage_->SetReplicationPublishQueueCapacity(32 * kMiB);
@@ -2247,7 +2248,7 @@ class ReplicationLogService final : public celer::Service {
     status =
         co_await ExecuteClientCommand(2, std::move(skipped_args), "$-1\r\n");
     if (!status.ok()) co_return status;
-    co_await celer::Yield(*worker_);
+    co_await bycorf::Yield(*worker_);
     Check(storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
           "conditional SET no-op published a replication command");
 
@@ -2349,7 +2350,7 @@ class ReplicationLogService final : public celer::Service {
     status =
         co_await ExecuteClientCommand(2, std::move(missing_args), ":0\r\n");
     if (!status.ok()) co_return status;
-    co_await celer::Yield(*worker_);
+    co_await bycorf::Yield(*worker_);
     Check(storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
           "DEL publication did not follow its logical result");
     auto del_batch = co_await storage_->ReadReplicationLog({}, kMiB, 1);
@@ -2374,7 +2375,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExercisePublishedCollectionCommands() {
+  bycorf::Task<absl::Status> ExercisePublishedCollectionCommands() {
     absl::Status status;
     // Single-key writes from every value family are journaled at the storage
     // mutation ordering point and replay through the normal command path.
@@ -2504,7 +2505,8 @@ class ReplicationLogService final : public celer::Service {
           "collection mutation omitted its final absolute expiration");
     status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
-    status = co_await celer::SleepFor(*worker_, std::chrono::milliseconds(250));
+    status =
+        co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(250));
     if (!status.ok()) co_return status;
     status = co_await keylane::ApplyReplicatedCommand(late_command);
     if (!status.ok()) co_return status;
@@ -2533,7 +2535,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> ExerciseFullSyncDuringTombstoneReaping() {
+  bycorf::Task<absl::Status> ExerciseFullSyncDuringTombstoneReaping() {
     constexpr std::uint8_t kDb = 9;
     constexpr std::uint64_t kSession = 0x534852494e4b;
     constexpr std::size_t kKeys = 256;
@@ -2595,7 +2597,7 @@ class ReplicationLogService final : public celer::Service {
         {.action_ = keylane::storage::TombRaiderConfigAction::kOn});
     if (!status.ok()) co_return status;
     status =
-        co_await celer::SleepFor(*worker_, std::chrono::milliseconds(1100));
+        co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(1100));
     if (!status.ok()) co_return status;
     for (std::size_t i = kPermanent; i < keys.size(); ++i) {
       auto expired = co_await storage_->Get(kDb, keys[i]);
@@ -2608,7 +2610,7 @@ class ReplicationLogService final : public celer::Service {
       Check(std::chrono::steady_clock::now() < deadline,
             "TTL tombstones were not erased during full sync");
       status =
-          co_await celer::SleepFor(*worker_, std::chrono::milliseconds(10));
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(10));
       if (!status.ok()) co_return status;
     }
     std::uint64_t cursor = first->cursor_;
@@ -2645,7 +2647,7 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
-  celer::Task<absl::Status> Exercise() {
+  bycorf::Task<absl::Status> Exercise() {
     absl::Status status = co_await ExerciseMutationPrecondition();
     if (!status.ok()) co_return status;
 
@@ -2673,7 +2675,7 @@ class ReplicationLogService final : public celer::Service {
   }
 
   StorageEngine* storage_ = nullptr;
-  celer::Worker* worker_ = nullptr;
+  bycorf::Worker* worker_ = nullptr;
   bool exercise_ = false;
   absl::Status result_ = absl::UnknownError("test service did not run");
 };
@@ -2698,9 +2700,9 @@ int RunOnce(const std::string& path, bool exercise) {
   }
   keylane::tx::TxRuntime::Create(1);
   ReplicationLogService service(&storage, exercise);
-  celer::Server server;
+  bycorf::Server server;
   server.AddService(&service);
-  celer::ServerOptions runtime;
+  bycorf::ServerOptions runtime;
   runtime.thread_count_ = 1;
   runtime.pin_workers_ = false;
   runtime.recv_buffer_count_ = 0;

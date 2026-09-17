@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-#include "celer/net/server.h"
+#include "bycorf/net/server.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/storage/engine.h"
@@ -153,7 +153,7 @@ void CreateDataFile(const std::string& path, std::uint64_t bytes) {
   if (allocated != 0 || close_error != 0) Fail("failed to size data file");
 }
 
-class TombRaiderQuiesceService final : public celer::Service {
+class TombRaiderQuiesceService final : public bycorf::Service {
  public:
   explicit TombRaiderQuiesceService(keylane::storage::StorageEngine* storage)
       : storage_(storage) {}
@@ -164,8 +164,8 @@ class TombRaiderQuiesceService final : public celer::Service {
     }
   }
 
-  celer::Task<absl::Status> Run(celer::Worker& worker,
-                                celer::ServiceContext) override {
+  bycorf::Task<absl::Status> Run(bycorf::Worker& worker,
+                                 bycorf::ServiceContext) override {
     keylane::BindMemoryAccountingShard(worker.id());
     keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
     result_ = co_await storage_->InitializeWorker(worker);
@@ -177,7 +177,7 @@ class TombRaiderQuiesceService final : public celer::Service {
     const auto running_deadline = std::chrono::steady_clock::now() + 10s;
     while (result_.ok() && !storage_->TombRaiderStats().running_ &&
            std::chrono::steady_clock::now() < running_deadline) {
-      result_ = co_await celer::SleepFor(worker, 1ms);
+      result_ = co_await bycorf::SleepFor(worker, 1ms);
     }
     if (result_.ok() && !storage_->TombRaiderStats().running_) {
       result_ = absl::Status(absl::StatusCode::kDeadlineExceeded,
@@ -216,7 +216,7 @@ class TombRaiderQuiesceService final : public celer::Service {
           "quiesce did not forfeit the running round and disable scheduling");
     }
 
-    if (result_.ok()) result_ = co_await celer::SleepFor(worker, 100ms);
+    if (result_.ok()) result_ = co_await bycorf::SleepFor(worker, 100ms);
     const auto stayed_quiesced = storage_->TombRaiderStats();
     if (result_.ok() && (stayed_quiesced.enabled_ || stayed_quiesced.running_ ||
                          stayed_quiesced.rounds_ != rounds_before)) {
@@ -254,9 +254,9 @@ void VerifyReplicaQuiesce(const std::string& path) {
   keylane::tx::TxRuntime::Create(1);
 
   TombRaiderQuiesceService service(&storage);
-  celer::Server server;
+  bycorf::Server server;
   server.AddService(&service);
-  celer::ServerOptions runtime;
+  bycorf::ServerOptions runtime;
   runtime.thread_count_ = 1;
   runtime.pin_workers_ = false;
   runtime.recv_buffer_count_ = 0;

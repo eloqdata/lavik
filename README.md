@@ -120,9 +120,9 @@ sudo apt-get install -y build-essential cmake git libssl-dev
 ```bash
 git clone https://github.com/thweetkomputer/keylane.git
 cd keylane
-git submodule update --init celer third_party/mimalloc third_party/nuraft
+git submodule update --init bycorf third_party/mimalloc third_party/nuraft
 git -C third_party/nuraft submodule update --init asio
-git -C celer submodule update --init third_party/liburing third_party/abseil
+git -C bycorf submodule update --init third_party/liburing third_party/abseil
 
 ./scripts/build_release.sh
 sudo install -m 0755 build/keylane /usr/local/bin/keylane
